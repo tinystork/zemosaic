@@ -11267,3 +11267,887 @@
 2025-06-01 00:43:33,256 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_72: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
 2025-06-01 00:43:34,030 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
 2025-06-01 00:43:34,055 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:43:37,529 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:43:38,172 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:43:38,300 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:43:38,474 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:43:38,590 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 73})
+2025-06-01 00:43:38,593 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:38:31
+2025-06-01 00:43:38,597 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_73: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:43:38,658 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:43:38,663 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:43:39,385 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:43:39,472 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 4, 'tile_id': 74})
+2025-06-01 00:43:39,472 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:38:04
+2025-06-01 00:43:39,474 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_74: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:43:39,479 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:43:39,487 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:43:39,726 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:43:40,176 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:43:42,594 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:43:42,677 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 75})
+2025-06-01 00:43:42,678 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:37:44
+2025-06-01 00:43:42,683 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_75: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:43:42,689 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:43:42,694 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:43:43,777 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:43:44,133 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:43:44,480 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:43:46,271 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:43:46,369 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 76})
+2025-06-01 00:43:46,370 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:37:25
+2025-06-01 00:43:46,378 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_76: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:43:46,386 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:43:46,393 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:43:47,374 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:43:47,377 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:43:47,459 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 4, 'tile_id': 77})
+2025-06-01 00:43:47,460 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:36:59
+2025-06-01 00:43:47,465 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_77: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:43:47,474 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:43:47,570 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:43:48,006 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:43:48,711 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:43:50,131 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:43:51,629 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:43:54,883 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:43:54,884 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:43:55,063 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 78})
+2025-06-01 00:43:55,072 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 79})
+2025-06-01 00:43:55,073 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:36:51
+2025-06-01 00:43:55,074 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_78: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:43:55,074 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_79: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:43:55,291 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:43:55,294 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: Memory Usage (Phase 3 - Traité 72/181 tuiles): Proc RSS: 3847.5MB, VMS: 20940.1MB. Sys RAM: Avail 17636MB / Total 32469MB (45.7%% used). Sys Swap: Used 17819MB / Total 85374MB (20.9%% used).] (Args: {'prog': None, 'lvl': 'DEBUG'})
+2025-06-01 00:43:55,295 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:43:55,296 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:43:55,301 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:36:24
+2025-06-01 00:43:55,303 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:43:55,303 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:43:55,906 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:43:56,022 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 80})
+2025-06-01 00:43:56,025 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:35:59
+2025-06-01 00:43:56,027 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_80: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:43:56,060 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:43:56,061 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:43:56,601 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:43:56,788 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:43:56,894 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:43:57,273 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:43:59,538 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:44:00,008 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:44:00,360 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:44:00,462 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 81})
+2025-06-01 00:44:00,462 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:35:44
+2025-06-01 00:44:00,488 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_81: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:44:00,497 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:44:00,512 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:44:00,919 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:44:01,230 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:44:01,327 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 82})
+2025-06-01 00:44:01,327 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:35:19
+2025-06-01 00:44:01,333 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_82: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:44:01,356 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:44:01,362 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:44:01,775 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:44:02,061 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:44:02,180 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:44:04,714 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:44:04,942 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:44:05,195 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 83})
+2025-06-01 00:44:05,196 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:35:03
+2025-06-01 00:44:05,198 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_83: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:44:05,198 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:44:05,212 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:44:05,297 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:44:06,163 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:44:06,249 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 84})
+2025-06-01 00:44:06,249 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:34:40
+2025-06-01 00:44:06,591 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:44:06,876 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_84: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:44:06,972 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:44:06,977 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:44:07,017 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:44:08,077 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:44:08,317 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:44:09,803 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:44:09,882 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:44:09,967 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 3, 'tile_id': 85})
+2025-06-01 00:44:09,967 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:34:23
+2025-06-01 00:44:10,049 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 6, 'tile_id': 86})
+2025-06-01 00:44:10,049 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_85: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:44:10,050 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:33:59
+2025-06-01 00:44:10,051 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_86: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:44:10,148 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:44:10,154 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:44:10,169 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:44:10,221 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:44:10,245 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:44:10,942 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:44:11,507 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:44:11,608 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 87})
+2025-06-01 00:44:11,608 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:33:38
+2025-06-01 00:44:11,614 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_87: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:44:11,620 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:44:11,623 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:44:11,979 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:44:13,986 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:44:16,358 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:44:18,507 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:44:19,225 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 88})
+2025-06-01 00:44:19,225 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:33:31
+2025-06-01 00:44:20,208 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_88: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:44:20,216 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:44:20,222 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:44:21,083 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:44:21,171 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 3, 'tile_id': 89})
+2025-06-01 00:44:21,171 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:33:11
+2025-06-01 00:44:21,174 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_89: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:44:21,181 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:44:21,202 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:44:22,449 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:44:22,938 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:44:23,039 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 5, 'tile_id': 90})
+2025-06-01 00:44:23,039 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:32:51
+2025-06-01 00:44:23,044 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_90: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:44:23,054 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:44:23,062 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:44:23,667 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:44:23,748 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 91})
+2025-06-01 00:44:23,748 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:32:30
+2025-06-01 00:44:23,754 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_91: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:44:23,756 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:44:23,765 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:44:26,490 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:44:26,944 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:44:27,320 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:44:28,534 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:44:30,352 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:44:31,995 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:44:32,071 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:44:32,155 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 92})
+2025-06-01 00:44:32,156 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:32:24
+2025-06-01 00:44:32,160 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_92: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:44:32,161 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:44:32,166 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:44:33,429 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:44:34,786 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:44:34,899 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 6, 'tile_id': 93})
+2025-06-01 00:44:34,900 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:32:07
+2025-06-01 00:44:35,071 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:44:35,071 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_93: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:44:35,072 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:44:35,083 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:44:36,673 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:44:36,758 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 9, 'tile_id': 94})
+2025-06-01 00:44:36,758 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:31:48
+2025-06-01 00:44:36,814 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_94: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:44:36,830 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:44:36,838 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:44:38,017 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:44:38,992 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:44:39,793 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:44:40,056 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:44:40,153 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 95})
+2025-06-01 00:44:40,154 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:31:33
+2025-06-01 00:44:40,175 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_95: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:44:40,184 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:44:40,192 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:44:40,330 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:44:44,445 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:44:44,530 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 7, 'tile_id': 96})
+2025-06-01 00:44:44,530 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:31:19
+2025-06-01 00:44:44,564 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_96: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:44:44,567 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:44:44,570 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:44:46,976 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:44:47,724 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:44:51,363 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:44:53,246 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:44:53,348 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 97})
+2025-06-01 00:44:53,349 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:31:14
+2025-06-01 00:44:53,350 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_97: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:44:53,357 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:44:53,360 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:44:54,114 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:44:56,668 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:44:56,748 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 98})
+2025-06-01 00:44:56,749 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:30:59
+2025-06-01 00:44:57,366 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:44:57,441 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:44:57,447 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_98: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:44:57,519 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 99})
+2025-06-01 00:44:57,519 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:30:39
+2025-06-01 00:44:57,521 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_99: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:44:57,525 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:44:57,527 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:44:57,528 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:44:57,533 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:44:59,782 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:45:00,177 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:45:01,898 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:45:02,832 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:45:03,051 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:45:04,629 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:45:04,725 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 100})
+2025-06-01 00:45:04,725 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:30:31
+2025-06-01 00:45:04,820 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_100: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:45:04,828 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:45:04,831 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:45:07,379 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:45:07,920 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:45:08,036 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 3, 'tile_id': 101})
+2025-06-01 00:45:08,036 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:30:16
+2025-06-01 00:45:08,037 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_101: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:45:08,067 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:45:08,118 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:45:08,838 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:45:09,415 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:45:10,350 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:45:10,429 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 3, 'tile_id': 102})
+2025-06-01 00:45:10,430 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:29:59
+2025-06-01 00:45:10,430 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_102: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:45:10,437 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:45:10,439 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:45:11,040 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:45:12,880 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:45:12,960 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 10, 'tile_id': 103})
+2025-06-01 00:45:12,961 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:29:43
+2025-06-01 00:45:12,964 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_103: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:45:13,065 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:45:13,069 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:45:13,167 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 3, 'tile_id': 104})
+2025-06-01 00:45:13,168 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:29:23
+2025-06-01 00:45:13,172 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_104: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:45:13,172 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:45:13,174 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:45:13,176 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:45:14,293 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:45:15,904 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:45:19,182 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:45:19,268 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 105})
+2025-06-01 00:45:19,268 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:29:13
+2025-06-01 00:45:19,271 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_105: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:45:19,284 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:45:19,287 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:45:20,907 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:45:21,688 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:45:22,676 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:45:23,881 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:45:23,989 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 106})
+2025-06-01 00:45:23,991 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:29:01
+2025-06-01 00:45:23,995 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_106: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:45:24,009 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:45:24,026 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:45:24,379 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:45:24,547 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:45:25,651 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:45:25,737 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:45:27,118 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:45:29,281 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:45:30,066 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:45:30,548 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:45:30,641 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 107})
+2025-06-01 00:45:30,642 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:28:52
+2025-06-01 00:45:31,318 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:45:32,044 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_107: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:45:32,202 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:45:32,209 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:45:32,287 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 108})
+2025-06-01 00:45:32,288 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:28:35
+2025-06-01 00:45:32,312 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_108: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:45:32,340 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:45:32,341 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:45:32,378 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:45:33,502 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:45:35,105 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:45:35,985 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:45:36,738 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:45:36,915 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:45:37,729 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 6, 'tile_id': 109})
+2025-06-01 00:45:37,732 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:28:24
+2025-06-01 00:45:37,812 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 110})
+2025-06-01 00:45:37,815 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_109: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:45:37,821 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:28:05
+2025-06-01 00:45:37,821 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:45:37,821 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_110: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:45:38,532 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:45:40,163 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:45:40,163 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:45:40,351 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:45:40,361 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:45:40,361 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:45:40,443 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 111})
+2025-06-01 00:45:40,443 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:27:50
+2025-06-01 00:45:40,525 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 112})
+2025-06-01 00:45:40,618 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 113})
+2025-06-01 00:45:40,619 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:45:40,619 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_111: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:45:40,620 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:27:31
+2025-06-01 00:45:40,620 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_113: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:45:40,620 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_112: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:45:40,630 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:45:40,630 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:27:12
+2025-06-01 00:45:40,630 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:45:40,631 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:45:40,634 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:45:40,635 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:45:40,635 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:45:41,940 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:45:42,512 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:45:43,166 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:45:47,292 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:45:47,821 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:45:48,310 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:45:48,310 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:45:48,829 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:45:51,580 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 114})
+2025-06-01 00:45:51,580 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:27:10
+2025-06-01 00:45:52,328 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_114: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:45:52,331 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:45:52,337 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:45:52,431 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:45:52,753 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:45:52,844 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 115})
+2025-06-01 00:45:52,872 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: Memory Usage (Phase 3 - Traité 108/181 tuiles): Proc RSS: 2694.7MB, VMS: 19757.0MB. Sys RAM: Avail 18337MB / Total 32469MB (43.5%% used). Sys Swap: Used 17635MB / Total 85374MB (20.7%% used).] (Args: {'prog': None, 'lvl': 'DEBUG'})
+2025-06-01 00:45:52,879 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_115: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:45:52,880 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:26:53
+2025-06-01 00:45:53,314 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:45:53,528 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:45:53,541 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:45:53,545 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:45:55,433 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:45:55,522 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:45:55,611 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 7, 'tile_id': 116})
+2025-06-01 00:45:55,611 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:26:39
+2025-06-01 00:45:55,700 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 117})
+2025-06-01 00:45:55,701 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:26:21
+2025-06-01 00:45:55,701 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_116: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:45:55,706 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_117: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:45:55,711 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:45:55,711 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:45:55,716 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:45:55,720 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:45:56,253 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:45:56,349 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:45:56,643 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:45:58,008 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:45:58,401 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:45:59,261 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:46:00,687 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:46:00,933 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:46:01,015 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 6, 'tile_id': 118})
+2025-06-01 00:46:01,015 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:26:10
+2025-06-01 00:46:01,635 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_118: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:46:01,664 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:46:01,690 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:46:01,799 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:46:01,886 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 119})
+2025-06-01 00:46:01,886 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:25:54
+2025-06-01 00:46:01,892 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_119: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:46:01,895 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:46:02,000 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:46:04,457 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:46:06,382 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:46:06,472 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 120})
+2025-06-01 00:46:06,473 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:25:42
+2025-06-01 00:46:06,476 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_120: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:46:06,480 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:46:06,584 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:46:06,586 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:46:06,899 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:46:08,780 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:46:08,871 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:46:09,637 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 6, 'tile_id': 121})
+2025-06-01 00:46:09,638 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:25:29
+2025-06-01 00:46:09,641 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_121: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:46:09,826 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:46:10,438 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:46:10,840 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:46:15,518 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:46:16,881 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:46:17,002 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:46:17,694 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:46:20,810 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 4, 'tile_id': 122})
+2025-06-01 00:46:20,812 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:25:26
+2025-06-01 00:46:20,912 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 123})
+2025-06-01 00:46:20,912 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_122: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:46:20,913 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:25:09
+2025-06-01 00:46:20,913 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_123: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:46:20,913 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:46:20,921 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:46:20,921 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:46:20,927 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:46:23,289 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:46:23,450 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 3, 'tile_id': 124})
+2025-06-01 00:46:23,450 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:24:55
+2025-06-01 00:46:23,539 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:46:23,540 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_124: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:46:23,618 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:46:23,620 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:46:23,788 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 125})
+2025-06-01 00:46:23,789 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 126})
+2025-06-01 00:46:23,789 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:24:38
+2025-06-01 00:46:23,791 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:46:24,094 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_125: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:46:24,095 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_126: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:46:24,095 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:24:22
+2025-06-01 00:46:24,096 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:46:24,096 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:46:24,102 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:46:24,102 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:46:24,402 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:46:25,757 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:46:28,631 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:46:28,936 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:46:29,695 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:46:33,481 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:46:33,592 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 127})
+2025-06-01 00:46:33,593 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:24:17
+2025-06-01 00:46:33,599 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_127: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:46:33,600 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:46:33,609 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:46:33,979 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:46:34,416 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:46:34,549 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:46:35,896 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:46:35,987 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 128})
+2025-06-01 00:46:35,988 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:24:03
+2025-06-01 00:46:35,995 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_128: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:46:36,005 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:46:36,017 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:46:36,352 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:46:36,352 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:46:36,887 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:46:37,777 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:46:38,961 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:46:39,066 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:46:39,190 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:46:39,273 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 4, 'tile_id': 129})
+2025-06-01 00:46:39,274 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:23:50
+2025-06-01 00:46:39,288 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_129: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:46:39,298 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:46:39,303 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:46:39,626 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:46:41,351 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:46:43,351 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:46:43,457 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 130})
+2025-06-01 00:46:43,457 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:23:39
+2025-06-01 00:46:43,463 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_130: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:46:43,472 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:46:43,479 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:46:44,288 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:46:44,439 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:46:44,545 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 131})
+2025-06-01 00:46:44,546 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:23:24
+2025-06-01 00:46:44,552 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_131: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:46:44,557 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:46:44,559 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:46:45,935 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:46:47,196 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:46:48,095 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:46:49,884 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:46:50,071 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:46:50,079 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 132})
+2025-06-01 00:46:50,079 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:23:14
+2025-06-01 00:46:50,112 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_132: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:46:50,210 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 133})
+2025-06-01 00:46:50,242 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:22:58
+2025-06-01 00:46:50,242 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:46:50,275 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_133: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:46:50,278 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:46:50,305 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:46:50,354 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:46:51,088 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:46:51,436 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:46:52,953 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:46:53,068 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:46:53,198 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 134})
+2025-06-01 00:46:53,198 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:22:46
+2025-06-01 00:46:53,201 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_134: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:46:53,229 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:46:53,267 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:46:53,942 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:46:54,026 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 135})
+2025-06-01 00:46:54,027 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:22:31
+2025-06-01 00:46:54,030 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_135: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:46:54,031 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:46:54,050 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:46:54,640 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:46:54,761 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:46:55,594 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:46:56,265 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:46:56,593 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:46:56,700 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 5, 'tile_id': 136})
+2025-06-01 00:46:56,701 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:22:18
+2025-06-01 00:46:56,702 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_136: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:46:56,704 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:46:56,727 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:46:57,753 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:46:57,843 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 6, 'tile_id': 137})
+2025-06-01 00:46:57,852 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:22:04
+2025-06-01 00:46:57,873 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_137: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:46:57,883 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:46:57,888 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:46:58,627 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:46:58,868 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:46:59,640 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:46:59,945 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:47:00,445 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:47:07,082 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:47:07,621 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:47:09,454 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:47:09,999 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 138})
+2025-06-01 00:47:09,999 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:22:01
+2025-06-01 00:47:10,079 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 3, 'tile_id': 139})
+2025-06-01 00:47:10,081 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_138: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:47:10,081 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:21:46
+2025-06-01 00:47:10,081 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_139: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:47:10,085 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:47:10,085 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:47:10,088 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:47:10,088 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:47:11,482 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:47:12,603 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:47:13,403 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 4, 'tile_id': 140})
+2025-06-01 00:47:13,404 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:21:34
+2025-06-01 00:47:13,490 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:47:13,575 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_140: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:47:13,575 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:47:13,664 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:47:13,755 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 141})
+2025-06-01 00:47:13,755 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:21:19
+2025-06-01 00:47:13,755 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:47:13,844 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 142})
+2025-06-01 00:47:13,937 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 143})
+2025-06-01 00:47:13,942 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_141: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:47:13,942 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:21:04
+2025-06-01 00:47:13,942 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:47:14,174 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:47:14,745 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_142: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:47:14,747 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_143: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:47:14,748 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:47:14,748 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:20:50
+2025-06-01 00:47:14,749 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:47:14,750 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:47:14,750 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:47:14,750 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:47:14,750 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:47:16,103 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:47:17,276 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:47:18,004 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:47:18,967 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:47:19,629 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:47:20,740 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:47:21,443 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:47:22,456 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:47:24,106 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:47:24,831 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:47:25,005 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 144})
+2025-06-01 00:47:25,005 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:47:25,007 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:20:45
+2025-06-01 00:47:25,024 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_144: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:47:25,102 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 145})
+2025-06-01 00:47:25,109 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:20:30
+2025-06-01 00:47:25,112 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:47:25,112 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_145: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:47:25,158 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:47:25,174 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:47:25,262 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:47:25,267 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:47:26,177 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:47:28,660 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:47:28,793 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:47:29,500 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:47:29,763 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 5, 'tile_id': 146})
+2025-06-01 00:47:29,776 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:20:20
+2025-06-01 00:47:29,782 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:47:29,904 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 147})
+2025-06-01 00:47:29,904 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_146: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:47:29,904 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:20:06
+2025-06-01 00:47:29,916 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_147: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:47:29,955 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:47:29,987 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:47:30,017 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:47:30,032 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:47:30,614 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:47:31,619 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:47:31,708 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:47:32,966 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:47:33,325 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:47:33,430 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 5, 'tile_id': 148})
+2025-06-01 00:47:33,431 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:19:54
+2025-06-01 00:47:33,436 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_148: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:47:33,455 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:47:33,462 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:47:34,239 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:47:34,322 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 4, 'tile_id': 149})
+2025-06-01 00:47:34,322 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:19:41
+2025-06-01 00:47:34,326 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_149: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:47:35,085 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:47:35,362 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:47:35,362 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:47:35,715 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:47:41,713 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:47:41,872 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:47:46,484 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:47:46,593 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:47:46,804 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 150})
+2025-06-01 00:47:46,884 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 151})
+2025-06-01 00:47:46,884 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:19:38
+2025-06-01 00:47:46,887 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_150: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:47:46,887 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_151: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:47:46,915 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: Memory Usage (Phase 3 - Traité 144/181 tuiles): Proc RSS: 865.6MB, VMS: 17900.9MB. Sys RAM: Avail 19378MB / Total 32469MB (40.3%% used). Sys Swap: Used 17526MB / Total 85374MB (20.5%% used).] (Args: {'prog': None, 'lvl': 'DEBUG'})
+2025-06-01 00:47:46,920 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:47:46,921 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:47:46,921 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:19:23
+2025-06-01 00:47:46,930 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:47:46,930 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:47:48,518 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:47:48,602 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 152})
+2025-06-01 00:47:48,603 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:19:11
+2025-06-01 00:47:49,407 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:47:49,491 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:47:49,492 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_152: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:47:49,581 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 153})
+2025-06-01 00:47:49,581 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:18:58
+2025-06-01 00:47:49,665 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 154})
+2025-06-01 00:47:49,666 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:47:49,666 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_153: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:47:49,667 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:18:44
+2025-06-01 00:47:49,667 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_154: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:47:49,667 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:47:49,668 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:47:49,668 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:47:49,688 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:47:49,688 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:47:49,826 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:47:50,161 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:47:50,826 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:47:52,683 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:47:53,236 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:47:55,080 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:47:55,293 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:47:55,558 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:47:57,249 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:47:57,734 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:47:58,249 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:47:58,362 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:47:58,449 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:47:58,610 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 155})
+2025-06-01 00:47:58,611 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 156})
+2025-06-01 00:47:58,612 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:18:37
+2025-06-01 00:47:58,613 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_156: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:47:58,613 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_155: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:47:58,614 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:18:23
+2025-06-01 00:47:58,617 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:47:58,621 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:47:58,621 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:47:58,623 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:47:59,756 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:48:00,091 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:48:00,526 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:48:02,431 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:48:02,532 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:48:02,626 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:48:02,710 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 6, 'tile_id': 157})
+2025-06-01 00:48:02,710 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:18:13
+2025-06-01 00:48:02,803 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 158})
+2025-06-01 00:48:02,806 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:18:00
+2025-06-01 00:48:02,813 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_157: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:48:02,814 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_158: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:48:02,815 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:48:02,844 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:48:02,844 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:48:02,852 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:48:03,391 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:48:03,936 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:48:04,161 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:48:05,402 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:48:08,159 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:48:08,249 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 159})
+2025-06-01 00:48:08,249 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:17:50
+2025-06-01 00:48:08,256 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_159: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:48:08,770 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:48:09,054 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:48:09,055 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:48:09,134 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 160})
+2025-06-01 00:48:09,134 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:17:38
+2025-06-01 00:48:09,137 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:48:09,789 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_160: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:48:10,574 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:48:10,649 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:48:12,985 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:48:14,661 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:48:14,853 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:48:15,242 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:48:15,681 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:48:15,817 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:48:16,801 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 161})
+2025-06-01 00:48:16,801 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:17:30
+2025-06-01 00:48:16,806 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_161: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:48:16,882 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 162})
+2025-06-01 00:48:16,883 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:17:17
+2025-06-01 00:48:16,883 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:48:16,883 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_162: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:48:16,884 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:48:16,891 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:48:16,900 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:48:19,429 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:48:19,527 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:48:19,612 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:48:19,690 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 163})
+2025-06-01 00:48:19,691 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:17:06
+2025-06-01 00:48:19,775 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 164})
+2025-06-01 00:48:19,854 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_163: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:48:19,856 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 165})
+2025-06-01 00:48:19,856 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:16:53
+2025-06-01 00:48:20,190 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:48:20,191 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_164: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:48:20,191 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:48:20,191 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:16:40
+2025-06-01 00:48:20,191 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_165: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:48:20,192 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:48:20,195 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:48:20,195 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:48:20,195 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:48:20,195 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:48:20,861 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:48:21,367 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:48:21,928 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:48:22,738 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:48:23,178 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:48:24,175 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:48:24,418 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:48:24,510 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 166})
+2025-06-01 00:48:24,511 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:16:30
+2025-06-01 00:48:24,517 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_166: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:48:24,523 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:48:24,533 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:48:25,585 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:48:25,703 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:48:25,824 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:48:26,481 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:48:26,848 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:48:26,960 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 3, 'tile_id': 167})
+2025-06-01 00:48:26,960 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:16:19
+2025-06-01 00:48:26,963 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_167: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:48:27,081 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:48:27,130 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:48:28,278 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:48:28,976 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:48:29,061 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:48:29,410 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 4, 'tile_id': 168})
+2025-06-01 00:48:29,411 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:16:08
+2025-06-01 00:48:29,417 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_168: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:48:29,421 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:48:29,425 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:48:29,929 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:48:31,208 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:48:31,315 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 169})
+2025-06-01 00:48:31,315 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:15:56
+2025-06-01 00:48:31,321 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_169: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:48:31,991 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:48:32,050 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:48:34,017 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:48:34,466 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:48:36,588 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:48:37,080 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:48:37,159 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:48:38,935 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 170})
+2025-06-01 00:48:38,935 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:15:48
+2025-06-01 00:48:38,937 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 171})
+2025-06-01 00:48:38,940 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_170: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:48:38,944 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_171: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:48:38,944 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:48:38,947 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:48:38,947 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:15:36
+2025-06-01 00:48:38,951 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:48:38,978 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:48:39,646 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:48:40,439 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:48:40,763 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:48:40,857 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:48:40,938 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 172})
+2025-06-01 00:48:40,938 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:15:25
+2025-06-01 00:48:41,030 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 173})
+2025-06-01 00:48:41,031 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:15:13
+2025-06-01 00:48:41,031 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_172: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:48:41,033 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_173: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:48:41,033 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:48:41,039 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:48:41,040 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:48:41,042 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:48:42,525 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:48:42,609 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 174})
+2025-06-01 00:48:42,610 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:15:01
+2025-06-01 00:48:42,611 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_174: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:48:42,616 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:48:42,620 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:48:43,222 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:48:44,057 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:48:44,713 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:48:45,658 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:48:46,600 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:48:46,983 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:48:48,138 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:48:48,412 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:48:48,656 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:48:48,751 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:48:48,845 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 175})
+2025-06-01 00:48:48,845 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:14:53
+2025-06-01 00:48:48,922 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 176})
+2025-06-01 00:48:49,022 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:14:41
+2025-06-01 00:48:49,023 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_176: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:48:49,023 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_175: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:48:49,027 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:48:49,027 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:48:49,033 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:48:49,033 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:48:49,143 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:48:50,604 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:48:50,957 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:48:51,713 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:48:51,817 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 177})
+2025-06-01 00:48:51,818 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:14:30
+2025-06-01 00:48:51,839 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_177: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:48:51,845 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:48:51,853 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:48:52,558 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:48:53,551 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:48:53,552 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:48:53,722 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:48:54,925 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:48:55,005 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 178})
+2025-06-01 00:48:55,006 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:14:20
+2025-06-01 00:48:55,034 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_178: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:48:55,038 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:48:55,041 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:48:55,994 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:48:57,114 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:48:57,342 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:48:57,443 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 179})
+2025-06-01 00:48:57,443 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:14:09
+2025-06-01 00:48:57,444 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_179: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:48:57,806 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:48:57,915 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:48:57,921 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:48:58,885 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:48:59,665 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:49:01,143 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_finished
+2025-06-01 00:49:01,390 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:49:01,479 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:49:01,572 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:123 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 180})
+2025-06-01 00:49:01,572 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:14:00
+2025-06-01 00:49:01,666 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 -     mastertile_180: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='kappa_sigma', Combine='mean'
+2025-06-01 00:49:01,676 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:13:48
+2025-06-01 00:49:01,757 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_reference_set
+2025-06-01 00:49:01,758 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:49:01,836 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:13:36
+2025-06-01 00:49:01,841 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_loading_from_cache_started
+2025-06-01 00:49:03,045 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:49:03,138 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:13:26
+2025-06-01 00:49:05,591 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_stacking_started
+2025-06-01 00:49:06,546 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
+2025-06-01 00:49:06,629 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - ETA_UPDATE:00:13:16
+2025-06-01 00:49:08,610 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:123 - mastertile_info_saved
