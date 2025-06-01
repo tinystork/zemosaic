@@ -1,85 +1,109 @@
-ZeMosaic - README
+# 🌌 ZeMosaic
 
-English
+**ZeMosaic** is an open-source tool for assembling **large astronomical mosaics** from FITS images, with particular support for all-in-one sensors like the **Seestar S50**.
 
-Overview
+It was born out of a need from an astrophotography Discord community stacking **thousands of FITS images** into clean wide-field mosaics — a task where most existing tools struggled with scale, automation, or quality.
 
-ZeMosaic is a hierarchical mosaicker software tailored for astrophotography images, especially suited for managing large datasets captured by Seestar telescopes.
+---
 
-Installation
+## 🚀 Key Features
 
-Clone the repository:
+- Astrometric alignment using **ASTAP**
+- Smart tile grouping and automatic clustering
+- Configurable stacking with:
+  - **Noise-based weighting** (1/σ²)
+  - **Kappa-Sigma** and **Winsorized** rejection
+  - Radial feathering to blend tile borders
+- Two mosaic assembly modes:
+  - `Reproject & Coadd` (high quality, RAM-intensive)
+  - `Incremental` (low memory, scalable)
+- Stretch preview generation (ASIFits-style)
+- GUI built with **Tkinter**, fully translatable (EN/FR)
 
-git clone https://github.com/yourusername/ZeMosaic.git
-cd ZeMosaic
+---
 
-Set up Python environment:
+## 📷 Requirements
 
-python -m venv venv
-source venv/bin/activate  # On Windows use: venv\Scripts\activate
-pip install -r requirements.txt
+### Mandatory:
 
-Dependencies:
-Ensure you have installed:
+- Python ≥ 3.9  
+- [ASTAP](https://www.hnsky.org/astap.htm) installed with G17/H17 star catalogs
 
-Python 3.10+
+### Recommended Python packages:
 
-Astropy
+```bash
+pip install numpy astropy reproject opencv-python photutils scipy psutil
+No versions are pinned, but ZeMosaic is tested on Python 3.11+.
 
-Reproject
+🧠 Inspired by PixInsight
+ZeMosaic draws strong inspiration from the image integration strategies of PixInsight, developed by Juan Conejero at Pleiades Astrophoto.
 
-Astroalign
+Specifically, the implementations of:
 
-OpenCV
+Noise Variance Weighting (1/σ²)
 
-These dependencies are listed in the requirements.txt file.
+Kappa-Sigma and Winsorized Rejection
 
-Running ZeMosaic
+Radial feather blending
 
-To launch ZeMosaic, execute:
+...are adapted from methods described in:
 
+📖 PixInsight 1.6.1 – New ImageIntegration Features
+Juan Conejero, 2010
+Forum thread
+
+🙏 We gratefully acknowledge Juan Conejero's contributions to astronomical image processing.
+
+🛠 Dependencies
+ZeMosaic uses several powerful open-source Python libraries:
+
+numpy and scipy for numerical processing
+
+astropy for FITS I/O and WCS handling
+
+reproject for celestial reprojection
+
+opencv-python for debayering
+
+photutils for source detection and background estimation
+
+psutil for memory monitoring
+
+tkinter for the graphical user interface
+
+🖥️ How to Run
+After installing Python and dependencies:
+
+bash
+Copier
+Modifier
 python run_zemosaic.py
+Use the GUI to:
 
-A graphical user interface will open, enabling you to select your input and output directories, and configure various mosaicking parameters.
+Choose your input/output folders
 
-Français
+Configure ASTAP paths
 
-Présentation
+Select stacking and assembly options
 
-ZeMosaic est un logiciel de mosaïquage hiérarchique conçu pour les images d'astrophotographie, particulièrement adapté à la gestion de grands ensembles d'images capturées par des télescopes Seestar.
+Click Start Hierarchical Mosaic
 
-Installation
+🧪 Troubleshooting
+If astrometric solving fails:
 
-Cloner le dépôt :
+Check ASTAP path and data catalogs
 
-git clone https://github.com/yourusername/ZeMosaic.git
-cd ZeMosaic
+Ensure your images contain enough stars
 
-Configurer l'environnement Python :
+Use a Search Radius of ~3.0°
 
-python -m venv venv
-source venv/bin/activate  # Sur Windows utilisez : venv\Scripts\activate
-pip install -r requirements.txt
+Watch zemosaic_worker.log for full tracebacks
 
-Dépendances :
-Assurez-vous d'avoir installé :
+📎 License
+ZeMosaic is licensed under GPLv3 — feel free to use, adapt, and contribute.
 
-Python 3.10+
+🤝 Contributions
+Feature requests, bug reports, and pull requests are welcome!
+Please include log files and test data if possible when reporting issues.
 
-Astropy
-
-Reproject
-
-Astroalign
-
-OpenCV
-
-Ces dépendances sont listées dans le fichier requirements.txt.
-
-Lancer ZeMosaic
-
-Pour démarrer ZeMosaic, exécutez :
-
-python run_zemosaic.py
-
-Une interface graphique s'ouvrira, vous permettant de sélectionner vos dossiers d'entrée et de sortie, et de configurer divers paramètres de mosaïquage.
+🌠 Happy mosaicking!
