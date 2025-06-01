@@ -2,7 +2,7 @@
 
 **ZeMosaic** is an open-source tool for assembling **large astronomical mosaics** from FITS images, with particular support for all-in-one sensors like the **Seestar S50**.
 
-It was born out of a need from an astrophotography Discord community stacking **thousands of FITS images** into clean wide-field mosaics — a task where most existing tools struggled with scale, automation, or quality.
+It was born out of a need from an astrophotography Discord community called the seestar collective stacking tens of **thousands of FITS images** into clean wide-field mosaics — a task where most existing tools struggled with scale, automation, or quality.
 
 ---
 
@@ -71,12 +71,43 @@ psutil for memory monitoring
 
 tkinter for the graphical user interface
 
+📦 Installation & Usage
+1. 🔧 Install Python dependencies
+If you have a local clone of the repository, make sure you're in the project folder, then run:
+
+pip install -r requirements.txt
+💡 No versions are pinned in requirements.txt to maintain flexibility. ZeMosaic is tested with Python 3.11+.
+
+If you prefer to install manually:
+
+pip install numpy astropy reproject opencv-python photutils scipy psutil
+
+2. 🚀 Launch ZeMosaic
+Once the dependencies are installed:
+python run_zemosaic.py
+
+The GUI will open. From there:
+
+Select your input folder (with raw FITS images)
+
+Choose your output folder
+
+Configure ASTAP paths and options
+
+Adjust stacking & mosaic settings
+
+Click "Start Hierarchical Mosaic"
+
+📁 Requirements Summary
+✅ Python 3.9 or newer
+
+✅ ASTAP installed + star catalogs (G17 or H17)
+
+✅ FITS images (ideally calibrated, debayered or raw from Seestar)
+
 🖥️ How to Run
 After installing Python and dependencies:
 
-bash
-Copier
-Modifier
 python run_zemosaic.py
 Use the GUI to:
 
