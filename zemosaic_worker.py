@@ -1263,17 +1263,43 @@ def run_hierarchical_mosaic(
     # ... (génération preview PNG avec le stretch asinh) ...
     if final_mosaic_data_HWC is not None and ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils and zemosaic_utils.ASTROPY_VISUALIZATION_AVAILABLE:
         pcb("run_info_preview_stretch_started", prog=None, lvl="INFO_DETAIL")
+
+
         try:
-            m_stretched = zemosaic_utils.stretch_percentile_rgb(final_mosaic_data_HWC, p_low=0.5, p_high=99.9, independent_channels=False, asinh_a=0.03 ) # Ajuster asinh_a si besoin
-            if m_stretched is not None:
-                img_u8 = (np.clip(m_stretched.astype(np.float32), 0, 1) * 255).astype(np.uint8)
-                png_path = os.path.join(output_folder, f"{output_base_name}_preview.png"); import cv2
-                img_bgr = cv2.cvtColor(img_u8, cv2.COLOR_RGB2BGR)
-                if cv2.imwrite(png_path, img_bgr): pcb("run_success_preview_saved", prog=None, lvl="SUCCESS", filename=os.path.basename(png_path))
-                else: pcb("run_warn_preview_imwrite_failed", prog=None, lvl="WARN", filename=os.path.basename(png_path))
-        except ImportError: pcb("run_warn_preview_opencv_missing_stretch", prog=None, lvl="WARN")
-        except Exception as e_stretch_g: pcb("run_error_preview_stretch_unexpected", prog=None, lvl="ERROR", error=str(e_stretch_g)); logger.error("Erreur preview stretch:", exc_info=True)
-    del final_mosaic_data_HWC, final_mosaic_coverage_HW ; gc.collect()
+            if hasattr(zemosaic_utils, 'stretch_auto_asifits_like'):
+                pcb("run_info_preview_stretch_started", prog=None, lvl="INFO_DETAIL")
+
+                # Stretch intelligent proche ASIFitsViewer
+                m_stretched = zemosaic_utils.stretch_auto_asifits_like(
+                    final_mosaic_data_HWC,
+                    p_low=10.0, p_high=99.85,
+                    asinh_a=10.0,  # plus contrasté que 0.02
+                    apply_wb=True
+                )
+
+                if m_stretched is not None:
+                    img_u8 = (np.clip(m_stretched.astype(np.float32), 0, 1) * 255).astype(np.uint8)
+                    png_path = os.path.join(output_folder, f"{output_base_name}_preview.png")
+                    import cv2
+                    img_bgr = cv2.cvtColor(img_u8, cv2.COLOR_RGB2BGR)
+                    if cv2.imwrite(png_path, img_bgr):
+                        pcb("run_success_preview_saved", prog=None, lvl="SUCCESS", filename=os.path.basename(png_path))
+                    else:
+                        pcb("run_warn_preview_imwrite_failed", prog=None, lvl="WARN", filename=os.path.basename(png_path))
+                else:
+                    pcb("run_error_preview_stretch_none", prog=None, lvl="ERROR")
+            else:
+                pcb("run_warn_preview_stretch_missing", prog=None, lvl="WARN")
+
+        except Exception as e:
+            pcb("run_error_preview_stretch_unexpected", prog=None, lvl="ERROR", error=str(e))
+            logger.error("Erreur preview stretch:", exc_info=True)
+
+
+        del final_mosaic_data_HWC, final_mosaic_coverage_HW
+        gc.collect()
+
+
 
 
     # --- Phase 7 (Nettoyage) ---

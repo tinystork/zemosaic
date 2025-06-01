@@ -413,10 +413,39 @@ def make_radial_weight_map(height: int, width: int,
         
     return final_weight_map.astype(np.float32)
 
+def stretch_auto_asifits_like(img_hwc_adu, p_low=0.5, p_high=99.8, 
+                              asinh_a=0.01, apply_wb=True):
+    """
+    Étirement type ASIFitsViewer avec asinh et auto balance RVB.
+    Fallback vers du linéaire si dynamique trop faible.
+    """
+    img = img_hwc_adu.astype(np.float32, copy=False)
+    out = np.empty_like(img)
 
-def stretch_percentile_rgb(img_hwc_adu, p_low=1.0, p_high=99.9, 
+    for c in range(3):
+        chan = img[..., c]
+        vmin, vmax = np.percentile(chan, [p_low, p_high])
+        if vmax - vmin < 1e-3:
+            out[..., c] = np.zeros_like(chan)
+            continue
+        normed = np.clip((chan - vmin) / (vmax - vmin), 0, 1)
+        # stretch asinh
+        stretched = np.arcsinh(normed / asinh_a) / np.arcsinh(1 / asinh_a)
+        if np.nanmax(stretched) < 0.05:  # cas trop sombre
+            stretched = normed  # fallback linéaire
+        out[..., c] = stretched
+
+    if apply_wb:
+        avg_per_chan = np.mean(out, axis=(0, 1))
+        avg_per_chan /= np.max(avg_per_chan) + 1e-8
+        for c in range(3):
+            out[..., c] /= avg_per_chan[c]
+
+    return np.clip(out, 0, 1)
+
+def stretch_percentile_rgb(img_hwc_adu, p_low=0.5, p_high=99.8, 
                            independent_channels=False, 
-                           asinh_a=0.1, # 'a' parameter for AsinhStretch
+                           asinh_a=0.05, # 'a' parameter for AsinhStretch
                            progress_callback: callable = None):
     """
     Applique un stretch par percentiles avec une transformation asinh (via Astropy)
