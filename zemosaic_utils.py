@@ -687,16 +687,22 @@ def stretch_percentile_rgb(img_hwc_adu, p_low=0.5, p_high=99.8,
 
 
 
-def save_fits_image(image_data: np.ndarray, 
-                    output_path: str, 
-                    header = None, # Type hint peut être plus flexible: fits_module_for_utils.Header() | dict
-                    overwrite: bool = True, 
+def save_fits_image(image_data: np.ndarray,
+                    output_path: str,
+                    header = None,  # Type hint peut être plus flexible: fits_module_for_utils.Header() | dict
+                    overwrite: bool = True,
                     save_as_float: bool = False,
-                    progress_callback: callable = None):
+                    progress_callback: callable = None,
+                    axis_order: str = "HWC"):
     """
     Sauvegarde des données image NumPy dans un fichier FITS.
     Utilise ASTROPY_AVAILABLE_IN_UTILS défini localement.
     Version avec logs de débogage améliorés et gestion gc.
+    L'argument ``axis_order`` indique comment interpréter les tableaux couleur
+    en entrée.
+    - ``"HWC"`` (défaut) : ``Height x Width x Channels``. Les données sont
+      transposées en ``CxHxW`` pour l'écriture FITS.
+    - ``"CHW"`` : les données sont déjà dans l'ordre ``Channels x Height x Width``.
     """
 
     def _log_util_save(message, level="DEBUG_DETAIL", pcb=progress_callback):
@@ -743,6 +749,8 @@ def save_fits_image(image_data: np.ndarray,
     if save_as_float:
         data_to_write_temp = image_data.astype(np.float32)
         final_header_to_write['BITPIX'] = -32
+        final_header_to_write['BSCALE'] = 1.0
+        final_header_to_write['BZERO'] = 0.0
         _log_util_save(f"  SAVE_DEBUG: (Float) data_to_write_temp: Range [{np.nanmin(data_to_write_temp):.3g}, {np.nanmax(data_to_write_temp):.3g}], IsFinite: {np.all(np.isfinite(data_to_write_temp))}", "WARN")
     else:
         min_in, max_in = np.nanmin(image_data), np.nanmax(image_data)
@@ -759,10 +767,25 @@ def save_fits_image(image_data: np.ndarray,
     data_for_hdu_cxhxw = None
     is_color = data_to_write_temp.ndim == 3 and data_to_write_temp.shape[-1] == 3
     if is_color:
-        data_for_hdu_cxhxw = np.moveaxis(data_to_write_temp, -1, 0)
-        final_header_to_write['NAXIS'] = 3; final_header_to_write['NAXIS1'] = data_to_write_temp.shape[1]
-        final_header_to_write['NAXIS2'] = data_to_write_temp.shape[0]; final_header_to_write['NAXIS3'] = 3
-        if 'CTYPE3' not in final_header_to_write: final_header_to_write['CTYPE3'] = ('RGB', 'Color Format')
+        axis_order_upper = str(axis_order).upper()
+        if axis_order_upper == 'HWC':
+            h, w, c = data_to_write_temp.shape
+            data_for_hdu_cxhxw = np.moveaxis(data_to_write_temp, -1, 0)
+        elif axis_order_upper == 'CHW':
+            c, h, w = data_to_write_temp.shape
+            data_for_hdu_cxhxw = data_to_write_temp
+        else:
+            _log_util_save(f"Axis order '{axis_order}' non reconnu, utilisation 'HWC'", "WARN")
+            h, w, c = data_to_write_temp.shape
+            data_for_hdu_cxhxw = np.moveaxis(data_to_write_temp, -1, 0)
+        final_header_to_write['NAXIS'] = 3
+        final_header_to_write['NAXIS1'] = w
+        final_header_to_write['NAXIS2'] = h
+        final_header_to_write['NAXIS3'] = c
+        if 'CTYPE3' not in final_header_to_write:
+            final_header_to_write['CTYPE3'] = ('RGB', 'Color Format')
+        if 'EXTNAME' not in final_header_to_write:
+            final_header_to_write['EXTNAME'] = 'RGB'
     else: # HW (ou déjà CxHxW, par exemple une carte de couverture)
         if data_to_write_temp.ndim == 2: # Cas explicite HW pour monochrome
             data_for_hdu_cxhxw = data_to_write_temp
