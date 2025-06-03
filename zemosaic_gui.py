@@ -130,6 +130,7 @@ class ZeMosaicGUI:
         self.astap_downsample_var = tk.IntVar(value=self.config.get("astap_default_downsample", 2))
         self.astap_sensitivity_var = tk.IntVar(value=self.config.get("astap_default_sensitivity", 100))
         self.cluster_threshold_var = tk.DoubleVar(value=self.config.get("cluster_panel_threshold", 0.5))
+        self.save_final_uint16_var = tk.BooleanVar(value=self.config.get("save_final_as_uint16", False))
         
         self.is_processing = False
         self.processing_thread = None
@@ -374,6 +375,9 @@ class ZeMosaicGUI:
         ttk.Label(folders_frame, text="").grid(row=1, column=0, padx=5, pady=5, sticky="w"); self.translatable_widgets["output_folder_label"] = folders_frame.grid_slaves(row=1,column=0)[0]
         ttk.Entry(folders_frame, textvariable=self.output_dir_var, width=60).grid(row=1, column=1, padx=5, pady=5, sticky="ew")
         ttk.Button(folders_frame, text="", command=self._browse_output_dir).grid(row=1, column=2, padx=5, pady=5); self.translatable_widgets["browse_button_output"] = folders_frame.grid_slaves(row=1,column=2)[0]
+
+        ttk.Label(folders_frame, text="").grid(row=2, column=0, padx=5, pady=5, sticky="w"); self.translatable_widgets["save_final_16bit_label"] = folders_frame.grid_slaves(row=2,column=0)[0]
+        ttk.Checkbutton(folders_frame, variable=self.save_final_uint16_var).grid(row=2, column=1, padx=5, pady=5, sticky="w")
 
 
         # --- ASTAP Configuration Frame ---
@@ -1098,7 +1102,8 @@ class ZeMosaicGUI:
             num_base_workers_gui_val,
             # --- NOUVEAUX ARGUMENTS POUR LE ROGNAGE ---
             apply_master_tile_crop_val,
-            master_tile_crop_percent_val
+            master_tile_crop_percent_val,
+            self.save_final_uint16_var.get()
             # --- FIN NOUVEAUX ARGUMENTS ---
         )
         

@@ -4,6 +4,7 @@
     "folders_frame_title": "Dossiers",
     "input_folder_label": "Dossier d'Entrée (Brutes) :",
     "output_folder_label": "Dossier de Sortie :",
+    "save_final_16bit_label": "Sauvegarder la mosaïque finale en 16 bits :",
     "astap_config_frame_title": "Configuration ASTAP",
     "astap_exe_label": "Chemin Exécutable ASTAP :",
     "astap_data_dir_label": "Dossier Données ASTAP (G17/H17) :",

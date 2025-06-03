@@ -1111,8 +1111,9 @@ def run_hierarchical_mosaic(
     num_base_workers_config: int,
         # --- ARGUMENTS POUR LE ROGNAGE ---
     apply_master_tile_crop_config: bool,
-    master_tile_crop_percent_config: float
-    
+    master_tile_crop_percent_config: float,
+    save_final_as_uint16_config: bool
+
 ):
     """
     Orchestre le traitement de la mosaïque hiérarchique.
@@ -1540,7 +1541,7 @@ def run_hierarchical_mosaic(
             output_path=final_fits_path,
             header=final_header,
             overwrite=True,
-            save_as_float=True,
+            save_as_float=not save_final_as_uint16_config,
             progress_callback=progress_callback,
             axis_order="HWC",
         )
