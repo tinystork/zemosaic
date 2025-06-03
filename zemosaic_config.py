@@ -24,6 +24,7 @@ DEFAULT_CONFIG = {
     "radial_feather_fraction": 0.8,
     "radial_shape_power": 2.0,
     "final_assembly_method": "reproject_coadd", # Options: "reproject_coadd", "incremental",
+    "save_final_as_uint16": False,
     # --- CLES POUR LE ROGNAGE DES MASTER TUILES ---
     "apply_master_tile_crop": True,       # Désactivé par défaut
     "master_tile_crop_percent": 18.0      # Pourcentage par côté si activé (ex: 10%)

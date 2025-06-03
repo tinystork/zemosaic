@@ -4,6 +4,7 @@
     "folders_frame_title": "Folders",
     "input_folder_label": "Input Folder (Raws):",
     "output_folder_label": "Output Folder:",
+    "save_final_16bit_label": "Save Final Mosaic as 16-bit:",
     "astap_config_frame_title": "ASTAP Configuration",
     "astap_exe_label": "ASTAP Executable Path:",
     "astap_data_dir_label": "ASTAP Data Directory (G17/H17):",

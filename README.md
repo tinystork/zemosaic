@@ -21,6 +21,7 @@ It was born out of a need from an astrophotography Discord community called the 
 - GUI built with **Tkinter**, fully translatable (EN/FR)
 - Flexible FITS export with configurable `axis_order` (default `HWC`) and
   proper `BSCALE`/`BZERO` for float images
+- Option to save the final mosaic as 16-bit integer FITS
 
 ---
 
