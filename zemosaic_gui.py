@@ -9,6 +9,12 @@ import time
 import subprocess
 import sys
 
+try:
+    from PIL import Image, ImageTk # Importe depuis Pillow
+    PILLOW_AVAILABLE_FOR_ICON = True
+except ImportError:
+    PILLOW_AVAILABLE_FOR_ICON = False
+    print("AVERT GUI: Pillow (PIL) non installé. L'icône PNG ne peut pas être chargée.")
 # --- Import du module de localisation ---
 try:
     from locales.zemosaic_localization import ZeMosaicLocalization
@@ -41,6 +47,27 @@ except ImportError as e_worker:
 class ZeMosaicGUI:
     def __init__(self, root_window):
         self.root = root_window
+
+        # --- DÉFINIR L'ICÔNE DE LA FENÊTRE (AVEC PNG ET PILLOW) ---
+        if PILLOW_AVAILABLE_FOR_ICON:
+            try:
+                base_path = os.path.dirname(os.path.abspath(__file__))
+                icon_path = os.path.join(base_path, "icon", "zemosaic_icon.png") 
+
+                if os.path.exists(icon_path):
+                    img = Image.open(icon_path)
+                    photo_img = ImageTk.PhotoImage(img)
+                    self.root.iconphoto(False, photo_img) 
+                    # Garder une référence à photo_img pour éviter qu'elle ne soit garbage-collectée
+                    self.root.custom_icon = photo_img 
+                else:
+                    print(f"AVERT GUI: Fichier d'icône PNG non trouvé à {icon_path}")
+            except tk.TclError:
+                print("AVERT GUI: Impossible de définir l'icône PNG (TclError).")
+            except Exception as e_icon:
+                print(f"AVERT GUI: Erreur lors de la définition de l'icône PNG: {e_icon}")
+        # --- FIN DÉFINITION ICÔNE ---
+
         try:
             self.root.geometry("750x780") # Légère augmentation pour le nouveau widget
             self.root.minsize(700, 630) # Légère augmentation
@@ -81,7 +108,11 @@ class ZeMosaicGUI:
                 def get(self, key, default_text=None, **kwargs): return default_text if default_text is not None else f"_{key}_"
                 def set_language(self, lang_code): self.language_code = lang_code
             self.localizer = MockLocalizer(language_code=default_lang_from_config)
-
+        
+        # --- Variable compteur tuile phase 3
+        self.master_tile_count_var = tk.StringVar(value="") # Initialement vide
+        
+        
         # --- Définition des listes de clés pour les ComboBoxes ---
         self.norm_method_keys = ["none", "linear_fit", "sky_mean"]
         self.weight_method_keys = ["none", "noise_variance", "noise_fwhm"]
@@ -140,7 +171,15 @@ class ZeMosaicGUI:
             num_workers_from_config = 0 
         self.num_workers_var = tk.IntVar(value=num_workers_from_config)
         # --- FIN NOMBRE DE WORKERS ---
-        
+        # --- NOUVELLES VARIABLES TKINTER POUR LE ROGNAGE ---
+        self.apply_master_tile_crop_var = tk.BooleanVar(
+            value=self.config.get("apply_master_tile_crop", True) # Désactivé par défaut
+        )
+        self.master_tile_crop_percent_var = tk.DoubleVar(
+            value=self.config.get("master_tile_crop_percent", 18.0) # 18% par côté par défaut si activé
+        )
+        # ---  ---
+
         self.translatable_widgets = {}
         
         self._build_ui() 
@@ -460,8 +499,47 @@ class ZeMosaicGUI:
         num_workers_note = ttk.Label(perf_options_frame, text="")
         num_workers_note.grid(row=0, column=2, padx=(10,5), pady=5, sticky="ew") # Note avec un peu plus de marge
         self.translatable_widgets["num_workers_note"] = num_workers_note
-        # --- FIN AJOUT CADRE OPTIONS DE PERFORMANCE ---
+        # --- FIN CADRE OPTIONS DE PERFORMANCE ---
+        # --- NOUVEAU CADRE : OPTIONS DE ROGNAGE DES TUILES MAÎTRESSES ---
+        crop_options_frame = ttk.LabelFrame(self.scrollable_content_frame, text="", padding="10")
+        crop_options_frame.pack(fill=tk.X, pady=(5, 10), padx=0)
+        self.translatable_widgets["crop_options_frame_title"] = crop_options_frame
+        crop_options_frame.columnconfigure(1, weight=0) # Labels et spinbox de largeur fixe
+        crop_options_frame.columnconfigure(2, weight=1) # La note peut s'étendre
 
+        crop_opt_row = 0
+
+        # Checkbutton pour activer le rognage
+        self.apply_crop_label = ttk.Label(crop_options_frame, text="")
+        self.apply_crop_label.grid(row=crop_opt_row, column=0, padx=5, pady=3, sticky="w")
+        self.translatable_widgets["apply_master_tile_crop_label"] = self.apply_crop_label
+        
+        self.apply_crop_check = ttk.Checkbutton(
+            crop_options_frame, 
+            variable=self.apply_master_tile_crop_var,
+            command=self._update_crop_options_state # Pour griser le spinbox si décoché
+        )
+        self.apply_crop_check.grid(row=crop_opt_row, column=1, padx=5, pady=3, sticky="w")
+        crop_opt_row += 1
+
+        # Spinbox pour le pourcentage de rognage
+        self.crop_percent_label = ttk.Label(crop_options_frame, text="")
+        self.crop_percent_label.grid(row=crop_opt_row, column=0, padx=5, pady=3, sticky="w")
+        self.translatable_widgets["master_tile_crop_percent_label"] = self.crop_percent_label
+
+        self.crop_percent_spinbox = ttk.Spinbox(
+            crop_options_frame,
+            from_=0.0, to=25.0, increment=0.5, # Rogner de 0% à 25% par côté semble raisonnable
+            textvariable=self.master_tile_crop_percent_var,
+            width=8, format="%.1f"
+        )
+        self.crop_percent_spinbox.grid(row=crop_opt_row, column=1, padx=5, pady=3, sticky="w")
+        
+        crop_percent_note = ttk.Label(crop_options_frame, text="")
+        crop_percent_note.grid(row=crop_opt_row, column=2, padx=(10,5), pady=3, sticky="ew")
+        self.translatable_widgets["master_tile_crop_percent_note"] = crop_percent_note
+        crop_opt_row += 1
+        # --- FIN  CADRE DE ROGNAGE ---
 
         # --- Options d'Assemblage Final ---
         final_assembly_options_frame = ttk.LabelFrame(self.scrollable_content_frame, text="", padding="10")
@@ -496,8 +574,13 @@ class ZeMosaicGUI:
         self.eta_label_widget.pack(side=tk.LEFT, padx=(0,15))
         ttk.Label(time_display_subframe, text="").pack(side=tk.LEFT, padx=(0,2)); self.translatable_widgets["elapsed_text_label"] = time_display_subframe.pack_slaves()[2]
         self.elapsed_time_label_widget = ttk.Label(time_display_subframe, textvariable=self.elapsed_time_var, font=("Segoe UI", 9, "bold"), width=10)
-        self.elapsed_time_label_widget.pack(side=tk.LEFT)
-        
+        self.elapsed_time_label_widget.pack(side=tk.LEFT, padx=(0,10))
+        self.tile_count_text_label_widget = ttk.Label(time_display_subframe, text="") 
+        self.tile_count_text_label_widget.pack(side=tk.LEFT, padx=(0,2))
+        self.translatable_widgets["tiles_text_label"] = self.tile_count_text_label_widget # Pour la traduction "Tuiles :"
+
+        self.master_tile_count_label_widget = ttk.Label(time_display_subframe,textvariable=self.master_tile_count_var,font=("Segoe UI", 9, "bold"), width=12 )# Un peu plus large pour "XXX / XXX"    
+        self.master_tile_count_label_widget.pack(side=tk.LEFT, padx=(0,5))
         log_frame = ttk.LabelFrame(self.scrollable_content_frame, text="", padding="10")
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(5,5)); self.translatable_widgets["log_frame_title"] = log_frame
         self.log_text = tk.Text(log_frame, wrap=tk.WORD, height=10, state=tk.DISABLED, font=("Consolas", 9))
@@ -593,6 +676,21 @@ class ZeMosaicGUI:
                 print(f"DEBUG GUI: Erreur appel _update_rejection_params_state via after_idle: {e_uras}")
 
 
+    def _update_crop_options_state(self, *args):
+        """Active ou désactive le spinbox de pourcentage de rognage."""
+        if not all(hasattr(self, attr) for attr in [
+            'apply_master_tile_crop_var', 
+            'crop_percent_spinbox'
+        ]):
+            return # Widgets pas encore prêts
+
+        try:
+            if self.apply_master_tile_crop_var.get():
+                self.crop_percent_spinbox.config(state=tk.NORMAL)
+            else:
+                self.crop_percent_spinbox.config(state=tk.DISABLED)
+        except tk.TclError:
+            pass # Widget peut avoir été détruit
 
     def _update_rejection_params_state(self, event=None):
         """
@@ -720,15 +818,15 @@ class ZeMosaicGUI:
         log_text_content = ""
         is_control_message = False # Pour les messages ETA/CHRONO
 
-        # --- Gestion des messages de contrôle spéciaux (ETA, CHRONO) ---
+        # --- Gestion des messages de contrôle spéciaux (ETA, CHRONO, ET MAINTENANT TILE_COUNT) ---
         if isinstance(message_key_or_raw, str):
             if message_key_or_raw.startswith("ETA_UPDATE:"):
                 eta_string_from_worker = message_key_or_raw.split(":", 1)[1]
                 if hasattr(self, 'eta_var') and self.eta_var:
-                    def update_eta_label(): # Closure pour capturer eta_string_from_worker
+                    def update_eta_label():
                         if hasattr(self.eta_var,'set') and callable(self.eta_var.set):
                             try: self.eta_var.set(eta_string_from_worker)
-                            except tk.TclError: pass # Ignorer si fenêtre détruite
+                            except tk.TclError: pass 
                     if self.root.winfo_exists(): self.root.after_idle(update_eta_label)
                 is_control_message = True
             elif message_key_or_raw == "CHRONO_START_REQUEST":
@@ -737,6 +835,17 @@ class ZeMosaicGUI:
             elif message_key_or_raw == "CHRONO_STOP_REQUEST":
                 if self.root.winfo_exists(): self.root.after_idle(self._stop_gui_chrono)
                 is_control_message = True
+            # --- AJOUT POUR INTERCEPTER MASTER_TILE_COUNT_UPDATE ---
+            elif message_key_or_raw.startswith("MASTER_TILE_COUNT_UPDATE:"):
+                tile_count_string = message_key_or_raw.split(":", 1)[1]
+                if hasattr(self, 'master_tile_count_var') and self.master_tile_count_var:
+                    def update_tile_count_label(): # Closure pour capturer tile_count_string
+                        if hasattr(self.master_tile_count_var, 'set') and callable(self.master_tile_count_var.set):
+                            try: self.master_tile_count_var.set(tile_count_string)
+                            except tk.TclError: pass # Ignorer si fenêtre détruite
+                    if self.root.winfo_exists(): self.root.after_idle(update_tile_count_label)
+                is_control_message = True
+            # --- FIN AJOUT ---
         
         if is_control_message:
             return # Ne pas traiter plus loin ces messages de contrôle
@@ -871,7 +980,8 @@ class ZeMosaicGUI:
         
 
 
-# Dans la classe ZeMosaicGUI (zemosaic_gui.py)
+
+
 
     def _start_processing(self):
         if self.is_processing: 
@@ -907,14 +1017,16 @@ class ZeMosaicGUI:
 
             apply_radial_weight_val = self.apply_radial_weight_var.get()
             radial_feather_fraction_val = self.radial_feather_fraction_var.get()
-            min_radial_weight_floor_val = self.min_radial_weight_floor_var.get() # Ajouté
-            radial_shape_power_val = self.config.get("radial_shape_power", 2.0) 
+            min_radial_weight_floor_val = self.min_radial_weight_floor_var.get()
+            radial_shape_power_val = self.config.get("radial_shape_power", 2.0) # Toujours depuis config pour l'instant
             
             final_assembly_method_val = self.final_assembly_method_var.get()
-
-            # --- RÉCUPÉRATION DE LA NOUVELLE VALEUR POUR LE NOMBRE DE WORKERS ---
             num_base_workers_gui_val = self.num_workers_var.get()
-            # --- FIN RÉCUPÉRATION NOMBRE DE WORKERS ---
+
+            # --- RÉCUPÉRATION DES NOUVELLES VALEURS POUR LE ROGNAGE ---
+            apply_master_tile_crop_val = self.apply_master_tile_crop_var.get()
+            master_tile_crop_percent_val = self.master_tile_crop_percent_var.get()
+            # --- FIN RÉCUPÉRATION ROGNAGE ---
             
         except tk.TclError as e: 
             messagebox.showerror(self._tr("param_error_title"), 
@@ -922,7 +1034,8 @@ class ZeMosaicGUI:
                                  parent=self.root)
             return
 
-        # 2. VALIDATIONS (chemins, etc. - inchangées pour l'instant)
+        # 2. VALIDATIONS (chemins, etc.)
+        # ... (section de validation inchangée pour l'instant)
         if not (input_dir and os.path.isdir(input_dir)): 
             messagebox.showerror(self._tr("error_title"), self._tr("invalid_input_folder_error"), parent=self.root); return
         if not output_dir: 
@@ -934,7 +1047,6 @@ class ZeMosaicGUI:
         if not (astap_exe and os.path.isfile(astap_exe)): 
             messagebox.showerror(self._tr("error_title"), self._tr("invalid_astap_exe_error"), parent=self.root); return
         if not (astap_data and os.path.isdir(astap_data)): 
-            # Avertissement plutôt qu'erreur si ASTAP peut fonctionner sans (improbable mais pour être sûr)
             if not messagebox.askokcancel(self._tr("astap_data_dir_title", "ASTAP Data Directory"),
                                           self._tr("astap_data_dir_missing_or_invalid_continue_q", 
                                                    path=astap_data,
@@ -964,7 +1076,7 @@ class ZeMosaicGUI:
         
         self._log_message("CHRONO_START_REQUEST", None, "CHRONO_LEVEL") 
         self._log_message("log_key_processing_started", level="INFO")
-        # ... (autres logs d'info sur les chemins, etc.) ...
+        # ... (autres logs d'info) ...
 
         worker_args = (
             input_dir, output_dir, astap_exe, astap_data, 
@@ -981,11 +1093,13 @@ class ZeMosaicGUI:
             apply_radial_weight_val,
             radial_feather_fraction_val,
             radial_shape_power_val,
-            min_radial_weight_floor_val, # Ajouté
+            min_radial_weight_floor_val,
             final_assembly_method_val,
-            # --- NOUVEL ARGUMENT POUR LE NOMBRE DE WORKERS ---
-            num_base_workers_gui_val
-            # --- FIN NOUVEL ARGUMENT ---
+            num_base_workers_gui_val,
+            # --- NOUVEAUX ARGUMENTS POUR LE ROGNAGE ---
+            apply_master_tile_crop_val,
+            master_tile_crop_percent_val
+            # --- FIN NOUVEAUX ARGUMENTS ---
         )
         
         self.processing_thread = threading.Thread(
@@ -999,7 +1113,8 @@ class ZeMosaicGUI:
         if hasattr(self.root, 'winfo_exists') and self.root.winfo_exists():
             self.root.after(100, self._check_processing_thread)
 
-    # ... (le reste de la classe : _check_processing_thread, _on_closing, etc.)
+    
+
 
 
     def _check_processing_thread(self):

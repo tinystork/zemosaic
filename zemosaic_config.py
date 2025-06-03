@@ -23,7 +23,11 @@ DEFAULT_CONFIG = {
     "apply_radial_weight": False,
     "radial_feather_fraction": 0.8,
     "radial_shape_power": 2.0,
-    "final_assembly_method": "reproject_coadd" # Options: "reproject_coadd", "incremental" 
+    "final_assembly_method": "reproject_coadd", # Options: "reproject_coadd", "incremental",
+    # --- CLES POUR LE ROGNAGE DES MASTER TUILES ---
+    "apply_master_tile_crop": True,       # Désactivé par défaut
+    "master_tile_crop_percent": 18.0      # Pourcentage par côté si activé (ex: 10%)
+    # --- FIN CLES POUR LE ROGNAGE --- 
 }
 
 def get_config_path():

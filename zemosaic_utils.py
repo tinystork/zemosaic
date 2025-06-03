@@ -270,6 +270,140 @@ def load_and_validate_fits(filepath,
 
 
 
+def crop_image_and_wcs(
+    image_data_hwc: np.ndarray, 
+    wcs_obj, # Type hint générique pour éviter les problèmes avec Pylance si WCS n'est pas toujours AstropyWCSBase
+    crop_percentage_per_side: float,
+    progress_callback: callable = None
+) -> tuple[np.ndarray | None, object | None]: # Type de retour générique pour WCS
+    """
+    Rogne une image (HWC ou HW) d'un certain pourcentage sur chaque côté
+    et ajuste l'objet WCS Astropy correspondant.
+
+    Args:
+        image_data_hwc (np.ndarray): Tableau image (H, W, C) ou (H, W).
+        wcs_obj (astropy.wcs.WCS): Objet WCS original.
+        crop_percentage_per_side (float): Fraction (0.0 à <0.5) à rogner de chaque côté.
+        progress_callback (callable, optional): Fonction pour les logs.
+
+    Returns:
+        tuple: (cropped_image_data, cropped_wcs_obj) ou (None, None) si erreur,
+               ou (image_data_hwc, wcs_obj) si pas de rognage ou pas d'Astropy.
+    """
+    # Définir un logger local simple pour cette fonction si _internal_logger n'est pas souhaité/disponible
+    # ou utiliser progress_callback pour tous les messages.
+    # Pour simplifier, j'utilise progress_callback s'il est fourni.
+    def _pcb_crop(message, level="DEBUG_DETAIL", **kwargs):
+        if progress_callback and callable(progress_callback):
+            # Préfixer pour identifier l'origine du log si besoin
+            progress_callback(f"[CropUtil] {message}", None, level, **kwargs)
+        else:
+            # Fallback simple si pas de callback (pourrait arriver si utilisé ailleurs)
+            print(f"CROP_UTIL_LOG {level}: {message} {kwargs if kwargs else ''}")
+
+    if image_data_hwc is None:
+        _pcb_crop("Erreur: Données image en entrée est None.", lvl="ERROR")
+        return None, None
+    if wcs_obj is None : #  and ASTROPY_AVAILABLE_IN_UTILS (si wcs_obj peut être autre chose)
+        _pcb_crop("Erreur: Objet WCS en entrée est None.", lvl="ERROR")
+        return image_data_hwc, None # Retourner l'image, mais pas de WCS
+
+    if not ASTROPY_AVAILABLE_IN_UTILS:
+        _pcb_crop("AVERT: Astropy non disponible, impossible d'ajuster le WCS. Rognage de l'image seule effectué si demandé.", lvl="WARN")
+        # On pourrait choisir de rogner l'image quand même et retourner un WCS non modifié,
+        # ou retourner l'image et WCS originaux. Pour l'instant, on ne touche pas au WCS.
+        # Si on rogne l'image, le WCS ne correspondra plus. Il vaut mieux ne pas rogner.
+        if crop_percentage_per_side > 1e-4 :
+             _pcb_crop(" Rognage annulé car WCS ne peut être ajusté.", lvl="WARN")
+        return image_data_hwc, wcs_obj
+
+
+    if not (0.0 <= crop_percentage_per_side < 0.5):
+        if crop_percentage_per_side <= 1e-4 : # Pratiquement pas de rognage demandé
+            # _pcb_crop("Pas de rognage demandé (pourcentage nul ou négligeable).", lvl="DEBUG_VERY_DETAIL")
+            return image_data_hwc, wcs_obj
+        else:
+            _pcb_crop(f"Erreur: Pourcentage de rognage ({crop_percentage_per_side*100:.1f}%) hors limites [0, 50).", lvl="ERROR")
+            return None, None # Erreur critique si le pourcentage est vraiment invalide
+
+
+    original_shape = image_data_hwc.shape
+    h_orig, w_orig = original_shape[0], original_shape[1]
+
+    dh = int(h_orig * crop_percentage_per_side)
+    dw = int(w_orig * crop_percentage_per_side)
+
+    if (2 * dh >= h_orig) or (2 * dw >= w_orig):
+        _pcb_crop(f"AVERT: Rognage demandé ({crop_percentage_per_side*100:.1f}%) est trop important pour les dimensions de l'image ({h_orig}x{w_orig}). Rognage annulé.", lvl="WARN")
+        return image_data_hwc, wcs_obj
+
+    _pcb_crop(f"Rognage de {dh}px (Haut/Bas) et {dw}px (Gauche/Droite).", lvl="DEBUG_DETAIL")
+
+    if image_data_hwc.ndim == 3: # HWC
+        cropped_image_data = image_data_hwc[dh : h_orig - dh, dw : w_orig - dw, :]
+    elif image_data_hwc.ndim == 2: # HW
+        cropped_image_data = image_data_hwc[dh : h_orig - dh, dw : w_orig - dw]
+    else:
+        _pcb_crop(f"Erreur: Dimensions d'image non supportées pour le rognage ({image_data_hwc.ndim}D).", lvl="ERROR")
+        return None, None # Ou retourner l'original ? Mieux de signaler un échec.
+        
+    new_h, new_w = cropped_image_data.shape[0], cropped_image_data.shape[1]
+    # _pcb_crop(f"Nouvelle shape après rognage: {new_h}x{new_w}", lvl="DEBUG_VERY_DETAIL")
+
+    # Ajuster l'objet WCS
+    try:
+        # Tenter d'utiliser wcs.slice_like si l'objet WCS le supporte (Astropy >= 5.0)
+        # et si l'objet WCS est bien un objet Astropy WCS.
+        # Pour cela, il faudrait importer WCS d'Astropy ici.
+        # from astropy.wcs import WCS as AstropyWCS (à mettre en haut du fichier utils)
+        # if isinstance(wcs_obj, AstropyWCS) and hasattr(wcs_obj, 'slice_like'): # Nécessite l'import
+        
+        # Pour l'instant, faisons l'ajustement manuel de CRPIX, qui est plus universel
+        # mais moins précis pour les WCS complexes.
+        
+        # Vérifier si wcs_obj est bien un objet WCS d'Astropy avant d'accéder à .wcs
+        if not (hasattr(wcs_obj, 'wcs') and hasattr(wcs_obj.wcs, 'crpix')):
+            _pcb_crop("AVERT: l'objet WCS ne semble pas être un WCS Astropy standard (manque .wcs.crpix). Ajustement WCS manuel impossible.", lvl="WARN")
+            return cropped_image_data, wcs_obj # Retourner l'image rognée, mais le WCS original non modifié
+
+        cropped_wcs_obj = wcs_obj.copy() # Travailler sur une copie
+
+        if cropped_wcs_obj.wcs.crpix is not None:
+            # CRPIX est 1-based dans le header FITS, mais l'attribut .wcs.crpix d'un objet WCS Astropy
+            # est généralement interprété comme 1-based pour la manipulation via l'API haut niveau.
+            # Lorsqu'on soustrait, on soustrait le nombre de pixels rognés du côté "origine" (gauche/bas).
+            new_crpix1 = cropped_wcs_obj.wcs.crpix[0] - dw
+            new_crpix2 = cropped_wcs_obj.wcs.crpix[1] - dh
+            cropped_wcs_obj.wcs.crpix = [new_crpix1, new_crpix2]
+        else:
+            # Ce cas est peu probable si c'est un WCS valide, mais par sécurité.
+            _pcb_crop("AVERT: wcs_obj.wcs.crpix est None. Impossible d'ajuster CRPIX.", lvl="WARN")
+            # On pourrait essayer de retourner wcs_obj original, mais il ne correspondra plus.
+            # Renvoyer None pour le WCS est plus sûr pour indiquer un problème.
+            return cropped_image_data, None
+
+
+        # Mettre à jour la taille de l'image de référence dans l'objet WCS
+        # pixel_shape est (width, height) et 0-indexed pour l'API Python
+        # NAXIS1/2 dans le header sont 1-indexed et (width, height)
+        if hasattr(cropped_wcs_obj, 'pixel_shape'):
+             cropped_wcs_obj.pixel_shape = (new_w, new_h)
+        # Alternativement, si on manipule directement les clés FITS-like dans .wcs:
+        if hasattr(cropped_wcs_obj.wcs, 'naxis1'): cropped_wcs_obj.wcs.naxis1 = new_w
+        if hasattr(cropped_wcs_obj.wcs, 'naxis2'): cropped_wcs_obj.wcs.naxis2 = new_h
+        
+        # _pcb_crop("Ajustement WCS terminé.", lvl="DEBUG_DETAIL")
+        return cropped_image_data, cropped_wcs_obj
+
+    except Exception as e_wcs_crop:
+        _pcb_crop(f"Erreur lors de l'ajustement du WCS: {e_wcs_crop}", lvl="ERROR")
+        # Pas de logger global ici, on se fie au progress_callback
+        # logger.error(f"Erreur lors de l'ajustement du WCS pour l'image rognée:", exc_info=True)
+        return cropped_image_data, None # Retourner l'image rognée mais indiquer échec WCS
+
+
+
+
 
 def debayer_image(img_norm_01, bayer_pattern="GRBG", progress_callback=None):
     def _log_util_debayer(message, level="DEBUG_DETAIL"):

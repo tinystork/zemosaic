@@ -24,6 +24,13 @@
     "elapsed_text_label": "Écoulé :",
     "initial_eta_value": "--:--:--",
     "initial_elapsed_time": "00:00:00",
+    "tiles_text_label": "Tuiles :",
+
+    "crop_options_frame_title": "Options de Rognage des Tuiles Maîtresses",
+    "apply_master_tile_crop_label": "Rogner les Bords des Tuiles Maîtresses :",
+    "master_tile_crop_percent_label": "Pourcentage de Rognage par Côté (0-25%) :",
+    "master_tile_crop_percent_note": "(0.0 = pas de rognage)",    
+
 
     "config_warning_title": "Avertissement Configuration",
     "config_module_not_found_warning": "Module de configuration (zemosaic_config.py) non trouvé.\nLes chemins ASTAP ne seront pas sauvegardés entre les sessions.",
@@ -57,6 +64,7 @@
     "processing_finished_log_key": "Traitement terminé ou thread worker arrêté.",
     "completed_title": "Terminé",
     "msg_processing_completed": "Le traitement de la mosaïque est terminé.",
+    "dialog_title_completed": "Traitement Terminé",
     "msg_processing_completed_errors": "Le traitement s'est terminé avec des erreurs. Veuillez vérifier les logs.",
     "q_open_output_folder_title": "Ouvrir Dossier Sortie ?",
     "q_open_output_folder_msg": "Voulez-vous ouvrir le dossier de sortie '{folder}' ?",

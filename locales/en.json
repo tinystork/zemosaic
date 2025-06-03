@@ -24,6 +24,12 @@
     "elapsed_text_label": "Elapsed:",
     "initial_eta_value": "--:--:--",
     "initial_elapsed_time": "00:00:00",
+    "tiles_text_label": "Tiles:",
+    "crop_options_frame_title": "Master Tile Cropping Options",
+    "apply_master_tile_crop_label": "Crop Master Tile Edges:",
+    "master_tile_crop_percent_label": "Crop Percentage per Side (0-25%):",
+    "master_tile_crop_percent_note": "(0.0 = no crop)",
+
 
     "config_warning_title": "Config Warning",
     "config_module_not_found_warning": "Configuration module (zemosaic_config.py) not found.\nASTAP paths will not be saved between sessions.",
@@ -58,6 +64,7 @@
     "completed_title": "Completed",
     "msg_processing_completed": "Mosaic processing completed.",
     "msg_processing_completed_errors": "Processing completed with errors. Please check logs.",
+    "dialog_title_completed": "Processing Complete",
     "q_open_output_folder_title": "Open Output Folder?",
     "q_open_output_folder_msg": "Do you want to open the output folder '{folder}'?",
     "log_key_error_opening_folder": "Error opening output folder: {error}",
