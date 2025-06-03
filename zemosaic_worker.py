@@ -724,9 +724,15 @@ def create_master_tile(
             header_mt_save['NEXP_SUM']=(num_exposure_summed,'Number of exposures summed for EXPTOTAL')
 
 
-        zemosaic_utils.save_fits_image(image_data=master_tile_stacked_HWC, output_path=temp_fits_filepath, 
-                                      header=header_mt_save, overwrite=True, save_as_float=True, 
-                                      progress_callback=progress_callback)
+        zemosaic_utils.save_fits_image(
+            image_data=master_tile_stacked_HWC,
+            output_path=temp_fits_filepath,
+            header=header_mt_save,
+            overwrite=True,
+            save_as_float=True,
+            progress_callback=progress_callback,
+            axis_order="HWC",
+        )
         pcb_tile(f"{func_id_log_base}_info_saved", prog=None, lvl="INFO_DETAIL", tile_id=tile_id, format_type='float32', filename=os.path.basename(temp_fits_filepath))
         # pcb_tile(f"{func_id_log_base}_info_saving_finished", prog=None, lvl="DEBUG_DETAIL", tile_id=tile_id)
         return temp_fits_filepath, wcs_for_master_tile
@@ -1529,8 +1535,15 @@ def run_hierarchical_mosaic(
     try:
         if not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils): 
             raise RuntimeError("zemosaic_utils non disponible pour sauvegarde FITS.")
-        zemosaic_utils.save_fits_image(image_data=final_mosaic_data_HWC, output_path=final_fits_path, header=final_header, 
-                                      overwrite=True, save_as_float=True, progress_callback=progress_callback)
+        zemosaic_utils.save_fits_image(
+            image_data=final_mosaic_data_HWC,
+            output_path=final_fits_path,
+            header=final_header,
+            overwrite=True,
+            save_as_float=True,
+            progress_callback=progress_callback,
+            axis_order="HWC",
+        )
         
         if final_mosaic_coverage_HW is not None and np.any(final_mosaic_coverage_HW):
             coverage_path = os.path.join(output_folder, f"{output_base_name}_coverage.fits")
@@ -1540,8 +1553,15 @@ def run_hierarchical_mosaic(
                 except: pass 
             cov_hdr['EXTNAME']=('COVERAGE','Coverage Map') 
             cov_hdr['BUNIT']=('count','Pixel contributions or sum of weights')
-            zemosaic_utils.save_fits_image(final_mosaic_coverage_HW, coverage_path, header=cov_hdr, 
-                                          overwrite=True, save_as_float=True, progress_callback=progress_callback)
+            zemosaic_utils.save_fits_image(
+                final_mosaic_coverage_HW,
+                coverage_path,
+                header=cov_hdr,
+                overwrite=True,
+                save_as_float=True,
+                progress_callback=progress_callback,
+                axis_order="HWC",
+            )
             pcb("run_info_coverage_map_saved", prog=None, lvl="INFO_DETAIL", filename=os.path.basename(coverage_path))
         
         current_global_progress = base_progress_phase6 + PROGRESS_WEIGHT_PHASE6_SAVE

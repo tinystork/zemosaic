@@ -19,6 +19,8 @@ It was born out of a need from an astrophotography Discord community called the 
   - `Incremental` (low memory, scalable)
 - Stretch preview generation (ASIFits-style)
 - GUI built with **Tkinter**, fully translatable (EN/FR)
+- Flexible FITS export with configurable `axis_order` (default `HWC`) and
+  proper `BSCALE`/`BZERO` for float images
 
 ---
 
