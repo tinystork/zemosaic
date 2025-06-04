@@ -179,3 +179,5 @@ cython_debug/
 dist/
 build/
 
+# === ZeMosaic: configuration de innosetup ===
+*.iss
