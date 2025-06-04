@@ -48,25 +48,21 @@ class ZeMosaicGUI:
     def __init__(self, root_window):
         self.root = root_window
 
-        # --- DÉFINIR L'ICÔNE DE LA FENÊTRE (AVEC PNG ET PILLOW) ---
-        if PILLOW_AVAILABLE_FOR_ICON:
-            try:
-                base_path = os.path.dirname(os.path.abspath(__file__))
-                icon_path = os.path.join(base_path, "icon", "zemosaic_icon.png") 
+        # --- DÉFINIR L'ICÔNE DE LA FENÊTRE (AVEC .ICO NATIF) ---
+        try:
+            base_path = os.path.dirname(os.path.abspath(__file__))
+            icon_path = os.path.join(base_path, "icon", "zemosaic.ico")
 
-                if os.path.exists(icon_path):
-                    img = Image.open(icon_path)
-                    photo_img = ImageTk.PhotoImage(img)
-                    self.root.iconphoto(False, photo_img) 
-                    # Garder une référence à photo_img pour éviter qu'elle ne soit garbage-collectée
-                    self.root.custom_icon = photo_img 
-                else:
-                    print(f"AVERT GUI: Fichier d'icône PNG non trouvé à {icon_path}")
-            except tk.TclError:
-                print("AVERT GUI: Impossible de définir l'icône PNG (TclError).")
-            except Exception as e_icon:
-                print(f"AVERT GUI: Erreur lors de la définition de l'icône PNG: {e_icon}")
+            if os.path.exists(icon_path):
+                self.root.iconbitmap(default=icon_path)
+            else:
+                print(f"AVERT GUI: Fichier d'icône ICO non trouvé à {icon_path}")
+        except tk.TclError:
+            print("AVERT GUI: Impossible de définir l'icône ICO (TclError).")
+        except Exception as e_icon:
+            print(f"AVERT GUI: Erreur lors de la définition de l'icône ICO: {e_icon}")
         # --- FIN DÉFINITION ICÔNE ---
+
 
         try:
             self.root.geometry("750x780") # Légère augmentation pour le nouveau widget

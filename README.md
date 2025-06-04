@@ -104,7 +104,7 @@ Click "Start Hierarchical Mosaic"
 📁 Requirements Summary
 ✅ Python 3.9 or newer
 
-✅ ASTAP installed + star catalogs (G17 or H17)
+✅ ASTAP installed + star catalogs (D50 or H18)
 
 ✅ FITS images (ideally calibrated, debayered or raw from Seestar)
 
@@ -121,6 +121,56 @@ Configure ASTAP paths
 Select stacking and assembly options
 
 Click Start Hierarchical Mosaic
+
+🔧 Build & Compilation (Windows) / Compilation (Windows)
+🇬🇧 Instructions (English)
+To build the standalone executable version of ZeMosaic, follow these steps:
+
+Install Python 3.13 from python.org
+
+Create and activate a virtual environment (if not already done):
+
+powershell
+Copier
+Modifier
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+Build the .exe by running:
+
+powershell
+Copier
+Modifier
+compile\build_zemosaic.bat
+The final executable will be created in dist/zemosaic.exe.
+
+✅ Translations (locales/*.json) and application icons (icon/zemosaic.ico) are automatically included.
+
+🇫🇷 Instructions (Français)
+Pour créer l'exécutable autonome de ZeMosaic, suivez ces étapes :
+
+Installez Python 3.13 depuis python.org
+
+Créez et activez un environnement virtuel (si ce n’est pas déjà fait) :
+
+powershell
+Copier
+Modifier
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+Lancez la compilation de l’exécutable avec :
+
+powershell
+Copier
+Modifier
+compile\build_zemosaic.bat
+L’exécutable final se trouvera dans dist/zemosaic.exe.
+
+✅ Les fichiers de traduction (locales/*.json) et les icônes (icon/zemosaic.ico) sont inclus automatiquement.
+
+
+
 
 🧪 Troubleshooting
 If astrometric solving fails:

@@ -5,3 +5,4 @@ astroalign
 opencv-python-headless
 tk
 psutil
+Photutils
