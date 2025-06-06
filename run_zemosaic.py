@@ -50,7 +50,7 @@ except ImportError as e:
     ZeMosaicGUI = None
 
 print("--- run_zemosaic.py: FIN DES IMPORTS ---")
-print(f"DEBUG (run_zemosaic): sys.path complet: \n{'\n'.join(sys.path)}")
+print("DEBUG (run_zemosaic): sys.path complet:\n" + "\n".join(sys.path))
 print("-" * 50)
 
 
