@@ -159,6 +159,7 @@ class ZeMosaicGUI:
         self.final_assembly_method_var = tk.StringVar(
             value=self.config.get("final_assembly_method", self.assembly_method_keys[0])
         )
+        self.final_assembly_method_var.trace_add("write", self._on_assembly_method_change)
         
         # --- NOMBRE DE WORKERS ---
         # Utiliser 0 pour auto, comme convenu. La clé de config est "num_processing_workers".
@@ -175,6 +176,8 @@ class ZeMosaicGUI:
         self.master_tile_crop_percent_var = tk.DoubleVar(
             value=self.config.get("master_tile_crop_percent", 18.0) # 18% par côté par défaut si activé
         )
+        self.use_memmap_var = tk.BooleanVar(value=self.config.get("coadd_use_memmap", False))
+        self.mm_dir_var = tk.StringVar(value=self.config.get("coadd_memmap_dir", ""))
         # ---  ---
 
         self.translatable_widgets = {}
@@ -553,6 +556,15 @@ class ZeMosaicGUI:
         self.final_assembly_method_combo = ttk.Combobox(final_assembly_options_frame, values=[], state="readonly", width=40)
         self.final_assembly_method_combo.grid(row=asm_opt_row, column=1, padx=5, pady=5, sticky="ew")
         self.final_assembly_method_combo.bind("<<ComboboxSelected>>", lambda e, c=self.final_assembly_method_combo, v=self.final_assembly_method_var, k_list=self.assembly_method_keys, p="assembly_method": self._combo_to_key(e, c, v, k_list, p)); asm_opt_row += 1
+
+        self.memmap_frame = ttk.LabelFrame(self.scrollable_content_frame, text=self._tr("gui_memmap_title", "Options memmap (coadd)"))
+        self.memmap_frame.pack(fill=tk.X, pady=(0,10))
+        self.memmap_frame.columnconfigure(1, weight=1)
+        ttk.Checkbutton(self.memmap_frame, text=self._tr("gui_memmap_enable", "Use disk memmap"), variable=self.use_memmap_var).grid(row=0, column=0, sticky="w", padx=5, pady=3)
+        ttk.Label(self.memmap_frame, text=self._tr("gui_memmap_dir", "Memmap Folder")).grid(row=1, column=0, sticky="e", padx=5, pady=3)
+        ttk.Entry(self.memmap_frame, textvariable=self.mm_dir_var, width=45).grid(row=1, column=1, sticky="we", padx=5, pady=3)
+        ttk.Button(self.memmap_frame, text="…", command=self._browse_mm_dir).grid(row=1, column=2, padx=5, pady=3)
+        self._on_assembly_method_change()
         
 
         # --- Launch Button, Progress Bar, Log Frame ---
@@ -679,7 +691,7 @@ class ZeMosaicGUI:
     def _update_crop_options_state(self, *args):
         """Active ou désactive le spinbox de pourcentage de rognage."""
         if not all(hasattr(self, attr) for attr in [
-            'apply_master_tile_crop_var', 
+            'apply_master_tile_crop_var',
             'crop_percent_spinbox'
         ]):
             return # Widgets pas encore prêts
@@ -691,6 +703,18 @@ class ZeMosaicGUI:
                 self.crop_percent_spinbox.config(state=tk.DISABLED)
         except tk.TclError:
             pass # Widget peut avoir été détruit
+
+    def _on_assembly_method_change(self, *args):
+        method = self.final_assembly_method_var.get()
+        try:
+            if method == "reproject_coadd":
+                if not self.memmap_frame.winfo_ismapped():
+                    self.memmap_frame.pack(fill=tk.X, pady=(0,10))
+            else:
+                if self.memmap_frame.winfo_ismapped():
+                    self.memmap_frame.pack_forget()
+        except tk.TclError:
+            pass
 
     def _update_rejection_params_state(self, event=None):
         """
@@ -775,6 +799,11 @@ class ZeMosaicGUI:
     def _browse_output_dir(self):
         dir_path = filedialog.askdirectory(title=self._tr("browse_output_title", "Select Output Folder"))
         if dir_path: self.output_dir_var.set(dir_path)
+
+    def _browse_mm_dir(self):
+        dir_path = filedialog.askdirectory(title=self._tr("gui_memmap_dir", "Memmap Folder"))
+        if dir_path:
+            self.mm_dir_var.set(dir_path)
 
     def _browse_and_save_astap_exe(self):
         title = self._tr("select_astap_exe_title", "Select ASTAP Executable")
@@ -1099,7 +1128,10 @@ class ZeMosaicGUI:
             # --- NOUVEAUX ARGUMENTS POUR LE ROGNAGE ---
             apply_master_tile_crop_val,
             master_tile_crop_percent_val,
-            self.save_final_uint16_var.get()
+            self.save_final_uint16_var.get(),
+            self.use_memmap_var.get(),
+            self.mm_dir_var.get(),
+            self.config.get("coadd_cleanup_memmap", True)
             # --- FIN NOUVEAUX ARGUMENTS ---
         )
         

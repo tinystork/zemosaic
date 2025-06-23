@@ -8,6 +8,8 @@ import gc
 import logging
 import inspect # Pas utilisé directement ici, mais peut être utile pour des introspections futures
 import psutil
+import tempfile
+import glob
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -923,7 +925,10 @@ def assemble_final_mosaic_with_reproject_coadd(
     match_bg: bool = True,
     # --- NOUVEAUX PARAMÈTRES POUR LE ROGNAGE ---
     apply_crop: bool = False,
-    crop_percent: float = 0.0 # Pourcentage par côté, 0.0 = pas de rognage par défaut
+    crop_percent: float = 0.0, # Pourcentage par côté, 0.0 = pas de rognage par défaut
+    use_memmap: bool = False,
+    memmap_dir: str = "",
+    cleanup_memmap: bool = True
     # --- FIN NOUVEAUX PARAMÈTRES ---
 ):
     """
@@ -935,6 +940,11 @@ def assemble_final_mosaic_with_reproject_coadd(
 
     _log_memory_usage(progress_callback, "Début assemble_final_mosaic_with_reproject_coadd")
     _pcb(f"ASM_REPROJ_COADD: Options de rognage - Appliquer: {apply_crop}, Pourcentage: {crop_percent if apply_crop else 'N/A'}", lvl="DEBUG_DETAIL") # Log des options de rognage
+
+    mm_dir_path = None
+    if use_memmap:
+        mm_dir_path = memmap_dir or tempfile.gettempdir()
+        os.makedirs(mm_dir_path, exist_ok=True)
 
     # ... (Vérification des dépendances REPROJECT_AVAILABLE, ASTROPY_AVAILABLE - inchangée) ...
     if not (REPROJECT_AVAILABLE and reproject_and_coadd and reproject_interp and ASTROPY_AVAILABLE and fits):
@@ -1042,19 +1052,43 @@ def assemble_final_mosaic_with_reproject_coadd(
             _log_memory_usage(progress_callback, f"Phase 5 (reproject_coadd) - Fin canal {i_channel+1} (données manquantes)"); continue
 
         try:
-            _pcb(f"  Appel de reproject_and_coadd pour canal {i_channel+1} avec {len(current_channel_input_data)} images (potentiellement rognées). match_background={match_bg}", prog=None, lvl="DEBUG_DETAIL")
-            
-            stacked_channel_output, coverage_channel_output = reproject_and_coadd(
-                current_channel_input_data, # Contient (données_rognées_canal, wcs_rogné)
-                output_projection=final_output_wcs,
-                shape_out=final_output_shape_hw, 
-                reproject_function=reproject_interp, 
-                combine_function='mean', 
-                match_background=match_bg,
-                # block_size=(512,512) # Optionnel: pour tester si ça aide avec la mémoire, peut ralentir
-            )
-            final_mosaic_stacked_channels_list.append(stacked_channel_output.astype(np.float32))
-            if i_channel == 0: final_mosaic_coverage_map = coverage_channel_output.astype(np.float32)
+            if use_memmap:
+                mm_sum_path = os.path.join(mm_dir_path, f"sum_ch{i_channel}.dat")
+                mm_cov_path = os.path.join(mm_dir_path, f"cov_ch{i_channel}.dat")
+                mm_sum = np.memmap(mm_sum_path, dtype=np.float32, mode="w+", shape=final_output_shape_hw)
+                mm_cov = np.memmap(mm_cov_path, dtype=np.float32, mode="w+", shape=final_output_shape_hw)
+                mm_sum[:] = 0.0
+                mm_cov[:] = 0.0
+                for img_hw, wcs in current_channel_input_data:
+                    reproj, footprint = reproject_interp((img_hw, wcs), final_output_wcs, shape_out=final_output_shape_hw)
+                    if match_bg:
+                        pass
+                    mm_sum += np.nan_to_num(reproj, nan=0.0)
+                    mm_cov += np.nan_to_num(footprint, nan=0.0)
+                stacked_channel_output = np.divide(mm_sum, mm_cov, out=np.zeros_like(mm_sum, dtype=np.float32), where=mm_cov > 0)
+                coverage_channel_output = mm_cov.copy()
+                if cleanup_memmap:
+                    for f in [mm_sum_path, mm_cov_path]:
+                        try:
+                            os.remove(f)
+                        except OSError:
+                            pass
+                del mm_sum, mm_cov
+            else:
+                _pcb(f"  Appel de reproject_and_coadd pour canal {i_channel+1} avec {len(current_channel_input_data)} images (potentiellement rognées). match_background={match_bg}", prog=None, lvl="DEBUG_DETAIL")
+                stacked_channel_output, coverage_channel_output = reproject_and_coadd(
+                    current_channel_input_data,
+                    output_projection=final_output_wcs,
+                    shape_out=final_output_shape_hw,
+                    reproject_function=reproject_interp,
+                    combine_function='mean',
+                    match_background=match_bg,
+                )
+                stacked_channel_output = stacked_channel_output.astype(np.float32)
+                coverage_channel_output = coverage_channel_output.astype(np.float32)
+            final_mosaic_stacked_channels_list.append(stacked_channel_output)
+            if i_channel == 0:
+                final_mosaic_coverage_map = coverage_channel_output
             _pcb("assemble_info_channel_processed_reproject_coadd", prog=None, lvl="INFO_DETAIL", channel_num=i_channel + 1)
         
         except MemoryError as e_mem_reproject: # ... (gestion MemoryError comme avant) ...
@@ -1079,6 +1113,12 @@ def assemble_final_mosaic_with_reproject_coadd(
     try: final_mosaic_data_HWC = np.stack(final_mosaic_stacked_channels_list, axis=-1)
     except ValueError as e_stack_final: _pcb("assemble_error_final_channel_stack_failed_reproject_coadd", prog=None, lvl="ERROR", error=str(e_stack_final)); logger.error(f"Erreur stack final canaux. Shapes: {[ch.shape for ch in final_mosaic_stacked_channels_list if hasattr(ch, 'shape')]}", exc_info=True); return None, None
     finally: del final_mosaic_stacked_channels_list; gc.collect()
+    if use_memmap and cleanup_memmap and mm_dir_path:
+        for f in glob.glob(os.path.join(mm_dir_path, "sum_ch*.dat")) + glob.glob(os.path.join(mm_dir_path, "cov_ch*.dat")):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
     _log_memory_usage(progress_callback, "Fin assemble_final_mosaic_with_reproject_coadd")
     _pcb("assemble_info_finished_reproject_coadd", prog=None, lvl="INFO", shape=final_mosaic_data_HWC.shape if final_mosaic_data_HWC is not None else "N/A")
     return final_mosaic_data_HWC, final_mosaic_coverage_map
@@ -1112,8 +1152,11 @@ def run_hierarchical_mosaic(
         # --- ARGUMENTS POUR LE ROGNAGE ---
     apply_master_tile_crop_config: bool,
     master_tile_crop_percent_config: float,
-    save_final_as_uint16_config: bool
+    save_final_as_uint16_config: bool,
 
+    coadd_use_memmap_config: bool,
+    coadd_memmap_dir_config: str,
+    coadd_cleanup_memmap_config: bool
 ):
     """
     Orchestre le traitement de la mosaïque hiérarchique.
@@ -1462,11 +1505,6 @@ def run_hierarchical_mosaic(
             master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly, 
             final_output_wcs=final_output_wcs, 
             final_output_shape_hw=final_output_shape_hw,
-            progress_callback=progress_callback,
-            n_channels=3,
-            # --- PASSAGE DES PARAMÈTRES DE ROGNAGE ---
-            apply_crop=apply_master_tile_crop_config,
-            crop_percent=master_tile_crop_percent_config
             # --- FIN PASSAGE ---
         )
         log_key_phase5_failed = "run_error_phase5_assembly_failed_incremental"
@@ -1484,7 +1522,10 @@ def run_hierarchical_mosaic(
             match_bg=True,
             # --- PASSAGE DES PARAMÈTRES DE ROGNAGE ---
             apply_crop=apply_master_tile_crop_config,
-            crop_percent=master_tile_crop_percent_config
+            crop_percent=master_tile_crop_percent_config,
+            use_memmap=coadd_use_memmap_config,
+            memmap_dir=coadd_memmap_dir_config,
+            cleanup_memmap=coadd_cleanup_memmap_config
             # --- FIN PASSAGE ---
         )
         log_key_phase5_failed = "run_error_phase5_assembly_failed_reproject_coadd"
