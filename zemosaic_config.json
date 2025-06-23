@@ -17,5 +17,8 @@
     "radial_feather_fraction": 0.8,
     "radial_shape_power": 2.0,
     "final_assembly_method": "reproject_coadd",
-    "save_final_as_uint16": false
+    "save_final_as_uint16": false,
+    "coadd_use_memmap": false,
+    "coadd_memmap_dir": "",
+    "coadd_cleanup_memmap": true
 }

@@ -285,5 +285,8 @@
     "num_workers_note": "(0 = auto, basé sur les cœurs CPU)",
     "stacking_min_radial_floor_label": "Plancher Poids Radial Min (0.0-0.5) :", 
     "stacking_min_radial_floor_note": "(0.0 = pas de plancher)"              
+    "gui_memmap_title": "Options memmap (coadd)",
+    "gui_memmap_enable": "Utiliser memmap disque",
+    "gui_memmap_dir": "Dossier memmap"
     
 }

@@ -289,5 +289,8 @@
     "num_workers_note": "(0 = auto, based on CPU cores)",
     "stacking_min_radial_floor_label": "Min Radial Weight Floor (0.0-0.5):", 
     "stacking_min_radial_floor_note": "(0.0 = no floor)"
+    "gui_memmap_title": "Memmap Options (coadd)",
+    "gui_memmap_enable": "Use disk memmap",
+    "gui_memmap_dir": "Memmap Folder"
 
 }
