@@ -12,7 +12,9 @@ import tempfile
 import glob
 import uuid
 
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed, BrokenProcessPool
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+# BrokenProcessPool moved under concurrent.futures.process in modern Python
+from concurrent.futures.process import BrokenProcessPool
 
 
 # --- Configuration du Logging ---
