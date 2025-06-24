@@ -20,5 +20,6 @@
     "save_final_as_uint16": false,
     "coadd_use_memmap": true,
     "coadd_memmap_dir": "",
-    "coadd_cleanup_memmap": true
+    "coadd_cleanup_memmap": true,
+    "auto_limit_frames_per_master_tile": true
 }

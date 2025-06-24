@@ -139,6 +139,8 @@
     "clusterstacks_info_start": "ClusterStacks: Clustering {num_files} raw files (fine threshold: {threshold}°)...",
     "clusterstacks_warn_no_centers": "ClusterStacks WARN: No valid celestial centers found for clustering.",
     "clusterstacks_info_finished": "ClusterStacks: {num_groups} Seestar stacks (fine groups) formed.",
+    "clusterstacks_info_groups_split_auto_limit": "Auto limit enabled: groups split from {original} to {new}, max {limit} frames (sample {shape})",
+    "clusterstacks_warn_auto_limit_failed": "Auto limit estimation failed: {error}",
     
     "getwcs_error_utils_unavailable": "GetWCS_Pretreat ERROR: zemosaic_utils module not available.",
     "getwcs_error_load_failed": "GetWCS_Pretreat ERROR: Failed to load '{filename}'.",
@@ -292,6 +294,7 @@
     "gui_memmap_title": "Memmap Options (coadd)",
     "gui_memmap_enable": "Use disk memmap",
     "gui_memmap_dir": "Memmap Folder",
-    "gui_memmap_cleanup": "Delete *.dat when finished"
+    "gui_memmap_cleanup": "Delete *.dat when finished",
+    "gui_auto_limit_frames": "Auto limit frames per master tile (system stability)"
 
 }

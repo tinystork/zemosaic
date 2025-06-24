@@ -164,6 +164,8 @@
     "clusterstacks_info_start": "ClusterStacks : Groupement de {num_files} fichiers bruts (seuil fin : {threshold}°)...",
     "clusterstacks_warn_no_centers": "ClusterStacks AVERT : Aucun centre céleste valide trouvé pour le groupement.",
     "clusterstacks_info_finished": "ClusterStacks : {num_groups} stacks Seestar (groupes fins) formés.",
+    "clusterstacks_info_groups_split_auto_limit": "Limite auto activée : groupes divisés de {original} à {new}, max {limit} images (exemple {shape})",
+    "clusterstacks_warn_auto_limit_failed": "Échec estimation limite auto : {error}",
     
     "getwcs_error_utils_unavailable": "GetWCS_Pretreat ERREUR : Module zemosaic_utils non disponible.",
     "getwcs_error_load_failed": "GetWCS_Pretreat ERREUR : Échec chargement de '{filename}'.",
@@ -288,6 +290,7 @@
     "gui_memmap_title": "Options memmap (coadd)",
     "gui_memmap_enable": "Utiliser memmap disque",
     "gui_memmap_dir": "Dossier memmap",
-    "gui_memmap_cleanup": "Supprimer les *.dat à la fin"
+    "gui_memmap_cleanup": "Supprimer les *.dat à la fin",
+    "gui_auto_limit_frames": "Limiter automatiquement les images par master tile (stabilité système)"
     
 }
