@@ -1130,7 +1130,33 @@ def assemble_final_mosaic_with_reproject_coadd(
             for img_hw, hdr in ch_data:
                 reproj, footprint = reproject_interp((img_hw, WCS(hdr)), final_output_wcs, shape_out=final_output_shape_hw)
                 if match_bg:
-                    pass
+                    # --- Background matching for memmap path ---
+                    overlap_mask = (footprint > 0) & (mm_cov > 0)
+
+                    # Require a minimum number of overlapping samples for stability
+                    if np.count_nonzero(overlap_mask) >= 500:
+                        # Existing mosaic average in the overlap region
+                        mosaic_avg = np.divide(
+                            mm_sum[overlap_mask],
+                            mm_cov[overlap_mask],
+                            out=np.zeros_like(mm_sum[overlap_mask], dtype=np.float32),
+                            where=mm_cov[overlap_mask] > 0,
+                        )
+
+                        # Median offset between current mosaic and new reprojection
+                        delta = np.nanmedian(mosaic_avg - reproj[overlap_mask])
+
+                        # Apply the offset to the tile
+                        reproj = reproj + delta
+
+                        _pcb(
+                            "assemble_info_bg_matched_reproject_coadd",
+                            prog=None,
+                            lvl="DEBUG_DETAIL",
+                            delta=float(delta),
+                            num_overlap=int(np.count_nonzero(overlap_mask)),
+                        )
+                    # (sinon : trop peu de recouvrement, pas de correction)
                 mm_sum += np.nan_to_num(reproj, nan=0.0)
                 mm_cov += np.nan_to_num(footprint, nan=0.0)
                 mm_sum.flush(); mm_cov.flush(); gc.collect()
