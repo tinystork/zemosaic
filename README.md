@@ -23,6 +23,7 @@ It was born out of a need from an astrophotography Discord community called the 
   proper `BSCALE`/`BZERO` for float images
 - Option to save the final mosaic as 16-bit integer FITS
 - Phase-specific auto-tuning of worker threads (alignment capped at 50% of CPU threads)
+- Process-based parallelization for final mosaic assembly
 
 ---
 
@@ -108,6 +109,7 @@ Click "Start Hierarchical Mosaic"
 ✅ ASTAP installed + star catalogs (D50 or H18)
 
 ✅ FITS images (ideally calibrated, debayered or raw from Seestar)
+✅ Python multiprocessing enabled (ProcessPoolExecutor is used for assembly)
 
 🖥️ How to Run
 After installing Python and dependencies:

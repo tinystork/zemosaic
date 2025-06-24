@@ -12,7 +12,7 @@ import tempfile
 import glob
 import uuid
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
 # --- Configuration du Logging ---
 logger = logging.getLogger("ZeMosaicWorker")
@@ -929,6 +929,29 @@ def assemble_final_mosaic_incremental(
 
 
 
+def _reproject_and_coadd_channel_worker(channel_data_list, output_wcs_header, output_shape_hw, match_bg):
+    """Worker function to run reproject_and_coadd in a separate process."""
+    from astropy.wcs import WCS
+    from reproject.mosaicking import reproject_and_coadd
+    from reproject import reproject_interp
+    import numpy as np
+
+    final_wcs = WCS(output_wcs_header)
+    prepared_inputs = []
+    for arr, hdr in channel_data_list:
+        prepared_inputs.append((arr, WCS(hdr)))
+
+    stacked, coverage = reproject_and_coadd(
+        prepared_inputs,
+        output_projection=final_wcs,
+        shape_out=output_shape_hw,
+        reproject_function=reproject_interp,
+        combine_function="mean",
+        match_background=match_bg,
+    )
+    return stacked.astype(np.float32), coverage.astype(np.float32)
+
+
 def assemble_final_mosaic_with_reproject_coadd(
     master_tile_fits_with_wcs_list: list,
     final_output_wcs: WCS, # Type hint pour WCS d'Astropy
@@ -1020,7 +1043,9 @@ def assemble_final_mosaic_with_reproject_coadd(
                     _pcb(f"    ASM_REPROJ_COADD: AVERT - Option de rognage activée mais zemosaic_utils.crop_image_and_wcs non disponible.", lvl="WARN")
             # --- FIN APPLICATION DU ROGNAGE ---
 
-            input_data_all_tiles_HWC_processed.append((data_to_use_for_assembly, wcs_to_use_for_assembly))
+            input_data_all_tiles_HWC_processed.append(
+                (data_to_use_for_assembly, wcs_to_use_for_assembly.to_header())
+            )
 
         except MemoryError as e_mem_read: # ... (gestion MemoryError comme avant) ...
             _pcb("assemble_error_memory_reading_all_tiles", prog=None, lvl="ERROR", filename=os.path.basename(mt_path), error=str(e_mem_read)); logger.error(f"MemoryError lecture tuile {os.path.basename(mt_path)}:", exc_info=True); _log_memory_usage(progress_callback, f"MemoryError lecture tuile {i_tile_load+1}"); del input_data_all_tiles_HWC_processed; gc.collect(); return None, None 
@@ -1034,82 +1059,141 @@ def assemble_final_mosaic_with_reproject_coadd(
     _pcb("assemble_info_all_tiles_loaded_and_processed_reproject_coadd", prog=None, lvl="DEBUG", num_loaded_tiles=len(input_data_all_tiles_HWC_processed))
 
 
-    final_mosaic_stacked_channels_list = [] 
-    final_mosaic_coverage_map = None 
-    
-    for i_channel in range(n_channels):
-        # ... (log memory et info canal) ...
-        _log_memory_usage(progress_callback, f"Phase 5 (reproject_coadd) - Début canal {i_channel+1}")
-        _pcb("assemble_info_channel_processing_reproject_coadd", prog=None, lvl="INFO_DETAIL", channel_num=i_channel + 1, total_channels=n_channels)
-        
-        current_channel_input_data = []
-        # UTILISER input_data_all_tiles_HWC_processed ICI
-        for tile_data_hwc_processed, tile_wcs_processed in input_data_all_tiles_HWC_processed:
-            try:
-                # S'assurer que tile_data_hwc_processed a bien la dimension de canal
-                if tile_data_hwc_processed.ndim == 3 and tile_data_hwc_processed.shape[-1] > i_channel :
-                    channel_data_hw = tile_data_hwc_processed[..., i_channel].copy() # .copy() est important pour reproject
-                    current_channel_input_data.append((channel_data_hw, tile_wcs_processed))
-                elif tile_data_hwc_processed.ndim == 2 and i_channel == 0 : # Cas monochrome
-                    current_channel_input_data.append((tile_data_hwc_processed.copy(), tile_wcs_processed))
-                else:
-                    _pcb("assemble_error_channel_index_reproject_coadd_processed", lvl="ERROR", tile_shape=str(tile_data_hwc_processed.shape), channel_idx=i_channel)
-            except IndexError: # Devrait être attrapé par la condition de shape ci-dessus
-                _pcb("assemble_error_channel_index_reproject_coadd_indexerror", lvl="ERROR", tile_shape=str(tile_data_hwc_processed.shape), channel_idx=i_channel)
-                pass # Ne pas ajouter si le canal n'existe pas
-        
-        if not current_channel_input_data: # ... (gestion canal vide comme avant) ...
-            _pcb("assemble_warn_no_data_for_channel_reproject_coadd", lvl="WARN", channel_num=i_channel+1); black_channel = np.zeros(final_output_shape_hw, dtype=np.float32); final_mosaic_stacked_channels_list.append(black_channel)
-            if i_channel == 0 and final_mosaic_coverage_map is None: final_mosaic_coverage_map = np.zeros(final_output_shape_hw, dtype=np.float32)
-            _log_memory_usage(progress_callback, f"Phase 5 (reproject_coadd) - Fin canal {i_channel+1} (données manquantes)"); continue
+    final_mosaic_stacked_channels_list = [None] * n_channels
+    final_mosaic_coverage_map = None
 
-        try:
-            if use_memmap:
-                mm_sum = np.memmap(
-                    os.path.join(memmap_dir, f"sum_ch{i_channel}.dat"),
-                    dtype=np.float32, mode="w+", shape=final_output_shape_hw
+    # Préparation des données sérialisables par canal
+    per_channel_data = []
+    for i_channel in range(n_channels):
+        _log_memory_usage(progress_callback, f"Phase 5 (reproject_coadd) - Début canal {i_channel+1}")
+        _pcb(
+            "assemble_info_channel_processing_reproject_coadd",
+            prog=None,
+            lvl="INFO_DETAIL",
+            channel_num=i_channel + 1,
+            total_channels=n_channels,
+        )
+
+        ch_data = []
+        for tile_data_hwc_processed, tile_wcs_header in input_data_all_tiles_HWC_processed:
+            try:
+                if tile_data_hwc_processed.ndim == 3 and tile_data_hwc_processed.shape[-1] > i_channel:
+                    ch_data.append((tile_data_hwc_processed[..., i_channel].copy(), tile_wcs_header))
+                elif tile_data_hwc_processed.ndim == 2 and i_channel == 0:
+                    ch_data.append((tile_data_hwc_processed.copy(), tile_wcs_header))
+                else:
+                    _pcb(
+                        "assemble_error_channel_index_reproject_coadd_processed",
+                        lvl="ERROR",
+                        tile_shape=str(tile_data_hwc_processed.shape),
+                        channel_idx=i_channel,
+                    )
+            except IndexError:
+                _pcb(
+                    "assemble_error_channel_index_reproject_coadd_indexerror",
+                    lvl="ERROR",
+                    tile_shape=str(tile_data_hwc_processed.shape),
+                    channel_idx=i_channel,
                 )
-                mm_cov = np.memmap(
-                    os.path.join(memmap_dir, f"cov_ch{i_channel}.dat"),
-                    dtype=np.float32, mode="w+", shape=final_output_shape_hw
-                )
-                mm_sum[:] = 0.0
-                mm_cov[:] = 0.0
-                for img_hw, wcs in current_channel_input_data:
-                    reproj, footprint = reproject_interp((img_hw, wcs), final_output_wcs, shape_out=final_output_shape_hw)
-                    if match_bg:
-                        pass
-                    mm_sum += np.nan_to_num(reproj, nan=0.0)
-                    mm_cov += np.nan_to_num(footprint, nan=0.0)
-                    mm_sum.flush(); mm_cov.flush(); gc.collect()
-                stacked_channel_output = np.divide(mm_sum, mm_cov, out=np.zeros_like(mm_sum, dtype=np.float32), where=mm_cov > 0)
-                coverage_channel_output = mm_cov.copy()
-                mm_sum.flush(); mm_cov.flush(); del mm_sum, mm_cov
-            else:
-                _pcb(f"  Appel de reproject_and_coadd pour canal {i_channel+1} avec {len(current_channel_input_data)} images (potentiellement rognées). match_background={match_bg}", prog=None, lvl="DEBUG_DETAIL")
-                stacked_channel_output, coverage_channel_output = reproject_and_coadd(
-                    current_channel_input_data,
-                    output_projection=final_output_wcs,
-                    shape_out=final_output_shape_hw,
-                    reproject_function=reproject_interp,
-                    combine_function='mean',
-                    match_background=match_bg,
-                )
-                stacked_channel_output = stacked_channel_output.astype(np.float32)
-                coverage_channel_output = coverage_channel_output.astype(np.float32)
-            final_mosaic_stacked_channels_list.append(stacked_channel_output)
+        per_channel_data.append(ch_data)
+
+    final_output_wcs_header = final_output_wcs.to_header()
+
+    if use_memmap:
+        for i_channel, ch_data in enumerate(per_channel_data):
+            if not ch_data:
+                _pcb("assemble_warn_no_data_for_channel_reproject_coadd", lvl="WARN", channel_num=i_channel+1)
+                final_mosaic_stacked_channels_list[i_channel] = np.zeros(final_output_shape_hw, dtype=np.float32)
+                if i_channel == 0 and final_mosaic_coverage_map is None:
+                    final_mosaic_coverage_map = np.zeros(final_output_shape_hw, dtype=np.float32)
+                _log_memory_usage(progress_callback, f"Phase 5 (reproject_coadd) - Fin canal {i_channel+1} (données manquantes)")
+                continue
+
+            mm_sum = np.memmap(
+                os.path.join(memmap_dir, f"sum_ch{i_channel}.dat"),
+                dtype=np.float32,
+                mode="w+",
+                shape=final_output_shape_hw,
+            )
+            mm_cov = np.memmap(
+                os.path.join(memmap_dir, f"cov_ch{i_channel}.dat"),
+                dtype=np.float32,
+                mode="w+",
+                shape=final_output_shape_hw,
+            )
+            mm_sum[:] = 0.0
+            mm_cov[:] = 0.0
+            for img_hw, hdr in ch_data:
+                reproj, footprint = reproject_interp((img_hw, WCS(hdr)), final_output_wcs, shape_out=final_output_shape_hw)
+                if match_bg:
+                    pass
+                mm_sum += np.nan_to_num(reproj, nan=0.0)
+                mm_cov += np.nan_to_num(footprint, nan=0.0)
+                mm_sum.flush(); mm_cov.flush(); gc.collect()
+            stacked_channel_output = np.divide(
+                mm_sum,
+                mm_cov,
+                out=np.zeros_like(mm_sum, dtype=np.float32),
+                where=mm_cov > 0,
+            )
+            coverage_channel_output = mm_cov.copy()
+            mm_sum.flush(); mm_cov.flush(); del mm_sum, mm_cov
+
+            final_mosaic_stacked_channels_list[i_channel] = stacked_channel_output
             if i_channel == 0:
                 final_mosaic_coverage_map = coverage_channel_output
             _pcb("assemble_info_channel_processed_reproject_coadd", prog=None, lvl="INFO_DETAIL", channel_num=i_channel + 1)
-        
-        except MemoryError as e_mem_reproject: # ... (gestion MemoryError comme avant) ...
-            _pcb("assemble_error_memory_channel_reprojection_reproject_coadd", prog=None, lvl="ERROR", channel_num=i_channel + 1, error=str(e_mem_reproject)); logger.error(f"MemoryError reproject_and_coadd canal {i_channel + 1}:", exc_info=True); _log_memory_usage(progress_callback, f"MemoryError reproject_and_coadd canal {i_channel+1}"); del input_data_all_tiles_HWC_processed, current_channel_input_data, final_mosaic_stacked_channels_list, final_mosaic_coverage_map; gc.collect(); return None, None 
-        except Exception as e_reproject_ch: # ... (gestion autre Exception comme avant) ...
-            _pcb("assemble_error_channel_reprojection_failed_reproject_coadd", prog=None, lvl="ERROR", channel_num=i_channel + 1, error=str(e_reproject_ch)); logger.error(f"Erreur reproject_and_coadd canal {i_channel+1}:", exc_info=True); del input_data_all_tiles_HWC_processed, current_channel_input_data, final_mosaic_stacked_channels_list, final_mosaic_coverage_map; gc.collect(); return None, None
-        finally:
-            _log_memory_usage(progress_callback, f"Phase 5 (reproject_coadd) - Fin canal {i_channel+1} (avant del current_channel_input_data)")
-            del current_channel_input_data; gc.collect()
-            _log_memory_usage(progress_callback, f"Phase 5 (reproject_coadd) - Fin canal {i_channel+1} (après del current_channel_input_data)")
+            _log_memory_usage(progress_callback, f"Phase 5 (reproject_coadd) - Fin canal {i_channel+1} (après memmap)")
+    else:
+        with ProcessPoolExecutor(max_workers=min(os.cpu_count() or 1, n_channels)) as ex:
+            future_map = {}
+            for i_channel, ch_data in enumerate(per_channel_data):
+                if not ch_data:
+                    _pcb("assemble_warn_no_data_for_channel_reproject_coadd", lvl="WARN", channel_num=i_channel+1)
+                    final_mosaic_stacked_channels_list[i_channel] = np.zeros(final_output_shape_hw, dtype=np.float32)
+                    if i_channel == 0 and final_mosaic_coverage_map is None:
+                        final_mosaic_coverage_map = np.zeros(final_output_shape_hw, dtype=np.float32)
+                    _log_memory_usage(progress_callback, f"Phase 5 (reproject_coadd) - Fin canal {i_channel+1} (données manquantes)")
+                    continue
+                future = ex.submit(_reproject_and_coadd_channel_worker, ch_data, final_output_wcs_header, final_output_shape_hw, match_bg)
+                future_map[future] = i_channel
+
+            for fut in as_completed(future_map):
+                idx = future_map[fut]
+                try:
+                    stacked_channel_output, coverage_channel_output = fut.result()
+                except MemoryError as e_mem_reproject:
+                    _pcb(
+                        "assemble_error_memory_channel_reprojection_reproject_coadd",
+                        prog=None,
+                        lvl="ERROR",
+                        channel_num=idx + 1,
+                        error=str(e_mem_reproject),
+                    )
+                    logger.error(
+                        f"MemoryError reproject_and_coadd canal {idx + 1}:",
+                        exc_info=True,
+                    )
+                    return None, None
+                except Exception as e_reproject_ch:
+                    _pcb(
+                        "assemble_error_channel_reprojection_failed_reproject_coadd",
+                        prog=None,
+                        lvl="ERROR",
+                        channel_num=idx + 1,
+                        error=str(e_reproject_ch),
+                    )
+                    logger.error(
+                        f"Erreur reproject_and_coadd canal {idx + 1}:",
+                        exc_info=True,
+                    )
+                    return None, None
+
+                final_mosaic_stacked_channels_list[idx] = stacked_channel_output
+                if idx == 0:
+                    final_mosaic_coverage_map = coverage_channel_output
+                _pcb("assemble_info_channel_processed_reproject_coadd", prog=None, lvl="INFO_DETAIL", channel_num=idx + 1)
+                _log_memory_usage(progress_callback, f"Phase 5 (reproject_coadd) - Fin canal {idx+1}")
 
     _log_memory_usage(progress_callback, "Phase 5 (reproject_coadd) - Après traitement de tous les canaux")
     del input_data_all_tiles_HWC_processed # Supprimer la liste des données chargées
