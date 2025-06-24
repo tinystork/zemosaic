@@ -23,6 +23,8 @@ It was born out of a need from an astrophotography Discord community called the 
   proper `BSCALE`/`BZERO` for float images
 - Option to save the final mosaic as 16-bit integer FITS
 - Phase-specific auto-tuning of worker threads (alignment capped at 50% of CPU threads)
+- Process-based parallelization for final mosaic assembly
+- Configurable `assembly_process_workers` to tune process count for assembly
 
 ---
 
@@ -108,6 +110,9 @@ Click "Start Hierarchical Mosaic"
 ✅ ASTAP installed + star catalogs (D50 or H18)
 
 ✅ FITS images (ideally calibrated, debayered or raw from Seestar)
+✅ Python multiprocessing enabled (ProcessPoolExecutor is used for assembly)
+✅ `assembly_process_workers` can be set in `zemosaic_config.json` to control
+   how many processes handle final mosaic assembly (0 = auto)
 
 🖥️ How to Run
 After installing Python and dependencies:
@@ -178,6 +183,7 @@ L’exécutable final se trouvera dans dist/zemosaic.exe.
   "coadd_use_memmap": true,
   "coadd_memmap_dir": "D:/ZeMosaic_memmap",
   "coadd_cleanup_memmap": true
+  "assembly_process_workers": 0
 }
 ```
 A final mosaic of 20 000 × 20 000 px in RGB needs ≈ 4.8 GB
@@ -190,7 +196,8 @@ cache directory to further reduce memory usage.
 run_zemosaic.py \
   --final_assembly_method reproject_coadd \
   --coadd_memmap_dir D:/ZeMosaic_memmap \
-  --coadd_cleanup_memmap
+  --coadd_cleanup_memmap \
+  --assembly_process_workers 4
 ```
 
 

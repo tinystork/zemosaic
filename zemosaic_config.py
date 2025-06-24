@@ -28,6 +28,7 @@ DEFAULT_CONFIG = {
     "coadd_use_memmap": True,
     "coadd_memmap_dir": "",
     "coadd_cleanup_memmap": True,
+    "assembly_process_workers": 0,
     "auto_limit_frames_per_master_tile": True,
     # --- CLES POUR LE ROGNAGE DES MASTER TUILES ---
     "apply_master_tile_crop": True,       # Désactivé par défaut

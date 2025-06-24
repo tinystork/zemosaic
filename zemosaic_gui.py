@@ -1136,7 +1136,8 @@ class ZeMosaicGUI:
             self.use_memmap_var.get(),
             self.mm_dir_var.get(),
             self.cleanup_memmap_var.get(),
-            self.auto_limit_frames_var.get()
+            self.auto_limit_frames_var.get(),
+            self.config.get("assembly_process_workers", 0)
             # --- FIN NOUVEAUX ARGUMENTS ---
         )
         
