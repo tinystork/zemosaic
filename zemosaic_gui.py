@@ -179,6 +179,7 @@ class ZeMosaicGUI:
         self.use_memmap_var = tk.BooleanVar(value=self.config.get("coadd_use_memmap", False))
         self.mm_dir_var = tk.StringVar(value=self.config.get("coadd_memmap_dir", ""))
         self.cleanup_memmap_var = tk.BooleanVar(value=self.config.get("coadd_cleanup_memmap", True))
+        self.auto_limit_frames_var = tk.BooleanVar(value=self.config.get("auto_limit_frames_per_master_tile", True))
         # ---  ---
 
         self.translatable_widgets = {}
@@ -566,6 +567,7 @@ class ZeMosaicGUI:
         ttk.Entry(self.memmap_frame, textvariable=self.mm_dir_var, width=45).grid(row=1, column=1, sticky="we", padx=5, pady=3)
         ttk.Button(self.memmap_frame, text="…", command=self._browse_mm_dir).grid(row=1, column=2, padx=5, pady=3)
         ttk.Checkbutton(self.memmap_frame, text=self._tr("gui_memmap_cleanup", "Delete *.dat when finished"), variable=self.cleanup_memmap_var).grid(row=2, column=0, sticky="w", padx=5, pady=3)
+        ttk.Checkbutton(self.memmap_frame, text=self._tr("gui_auto_limit_frames", "Auto limit frames per master tile (system stability)"), variable=self.auto_limit_frames_var).grid(row=3, column=0, sticky="w", padx=5, pady=3, columnspan=2)
         self._on_assembly_method_change()
         
 
@@ -1133,7 +1135,8 @@ class ZeMosaicGUI:
             self.save_final_uint16_var.get(),
             self.use_memmap_var.get(),
             self.mm_dir_var.get(),
-            self.cleanup_memmap_var.get()
+            self.cleanup_memmap_var.get(),
+            self.auto_limit_frames_var.get()
             # --- FIN NOUVEAUX ARGUMENTS ---
         )
         

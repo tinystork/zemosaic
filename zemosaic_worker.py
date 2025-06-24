@@ -1167,7 +1167,8 @@ def run_hierarchical_mosaic(
 
     coadd_use_memmap_config: bool,
     coadd_memmap_dir_config: str,
-    coadd_cleanup_memmap_config: bool
+    coadd_cleanup_memmap_config: bool,
+    auto_limit_frames_per_master_tile_config: bool
 ):
     """
     Orchestre le traitement de la mosaïque hiérarchique.
@@ -1375,8 +1376,26 @@ def run_hierarchical_mosaic(
     pcb("run_info_phase2_started", prog=base_progress_phase2, lvl="INFO")
     seestar_stack_groups = cluster_seestar_stacks(all_raw_files_processed_info, SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG, progress_callback)
     if not seestar_stack_groups: pcb("run_error_phase2_no_groups", prog=(base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING), lvl="ERROR"); return
+    if auto_limit_frames_per_master_tile_config:
+        try:
+            sample_path = seestar_stack_groups[0][0].get('path_preprocessed_cache')
+            sample_arr = np.load(sample_path, mmap_mode='r')
+            bytes_per_frame = sample_arr.nbytes
+            sample_shape = sample_arr.shape
+            sample_arr = None
+            available_bytes = psutil.virtual_memory().available
+            limit = max(1, int((available_bytes * 0.5) // (bytes_per_frame * 6)))
+            new_groups = []
+            for g in seestar_stack_groups:
+                for i in range(0, len(g), limit):
+                    new_groups.append(g[i:i+limit])
+            if len(new_groups) != len(seestar_stack_groups):
+                pcb("clusterstacks_info_groups_split_auto_limit", prog=None, lvl="INFO_DETAIL", original=len(seestar_stack_groups), new=len(new_groups), limit=limit, shape=str(sample_shape))
+            seestar_stack_groups = new_groups
+        except Exception as e_auto:
+            pcb("clusterstacks_warn_auto_limit_failed", prog=None, lvl="WARN", error=str(e_auto))
     current_global_progress = base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING
-    num_seestar_stacks_to_process = len(seestar_stack_groups) 
+    num_seestar_stacks_to_process = len(seestar_stack_groups)
     _log_memory_usage(progress_callback, "Fin Phase 2"); pcb("run_info_phase2_finished", prog=current_global_progress, lvl="INFO", num_groups=num_seestar_stacks_to_process)
 
 
@@ -1761,6 +1780,8 @@ if __name__ == "__main__":
     parser.add_argument("--coadd_cleanup_memmap", action="store_true",
                         default=True,
                         help="Delete *.dat blocks when the run finishes")
+    parser.add_argument("--no_auto_limit_frames", action="store_true",
+                        help="Disable automatic frame limit per master tile")
     args = parser.parse_args()
 
     cfg = {}
@@ -1802,4 +1823,5 @@ if __name__ == "__main__":
         coadd_use_memmap_config=args.coadd_use_memmap or cfg.get("coadd_use_memmap", False),
         coadd_memmap_dir_config=args.coadd_memmap_dir or cfg.get("coadd_memmap_dir", None),
         coadd_cleanup_memmap_config=args.coadd_cleanup_memmap if args.coadd_cleanup_memmap else cfg.get("coadd_cleanup_memmap", True),
+        auto_limit_frames_per_master_tile_config=(not args.no_auto_limit_frames) and cfg.get("auto_limit_frames_per_master_tile", True),
     )
