@@ -1819,11 +1819,11 @@ def run_hierarchical_mosaic(
                 # ou les rendre configurables plus tard.
                 preview_p_low = 2.5  # Percentile pour le point noir (plus élevé que pour asinh seul)
                 preview_p_high = 99.8 # Percentile pour le point blanc initial
-                preview_asinh_a = 0.1 # Facteur 'a' pour le stretch asinh après la normalisation initiale
+                                      # Facteur 'a' pour le stretch asinh après la normalisation initiale
                                       # Pour un stretch plus "doux" similaire à ASIFitsView, 'a' peut être plus grand.
                                       # ASIFitsView utilise souvent un 'midtones balance' (gamma-like) aussi.
                                       # Un 'a' de 10 comme dans ton code de test est très doux. Essayons 0.5 ou 1.0.
-                preview_asinh_a = 1.0 # Test avec une valeur plus douce pour le 'a' de asinh
+                preview_asinh_a = 20.0 # Test avec une valeur plus douce pour le 'a' de asinh
 
                 m_stretched = zemosaic_utils.stretch_auto_asifits_like(
                     final_mosaic_data_HWC,
