@@ -22,6 +22,7 @@ It was born out of a need from an astrophotography Discord community called the 
 - Flexible FITS export with configurable `axis_order` (default `HWC`) and
   proper `BSCALE`/`BZERO` for float images
 - Option to save the final mosaic as 16-bit integer FITS
+- Phase-specific auto-tuning of worker threads (alignment capped at 50% of CPU threads)
 
 ---
 
