@@ -26,6 +26,13 @@ share/python-wheels/
 *.egg
 MANIFEST
 zemosaic_config.json
+# ▶︎ Artéfacts générés que l’on ne souhaite pas versionner
+Output/                    # dossier racine “Output” (tout son contenu)
+compile/Output/            # dossier “Output” situé dans compile/
+compile/ZeMosaic.exe       # exécutable Windows généré
+compile/LICENSE.txt        # LICENCE générée par l’outil de packaging
+compile/icon/              # icônes copiées lors du build
+compile/installnotes.txt   # note d’installation produite par le script
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
