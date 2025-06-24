@@ -12,7 +12,8 @@ import tempfile
 import glob
 import uuid
 
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed, BrokenProcessPool
+
 
 # --- Configuration du Logging ---
 logger = logging.getLogger("ZeMosaicWorker")
@@ -964,7 +965,8 @@ def assemble_final_mosaic_with_reproject_coadd(
     crop_percent: float = 0.0, # Pourcentage par côté, 0.0 = pas de rognage par défaut
     use_memmap: bool = False,
     memmap_dir: str | None = None,
-    cleanup_memmap: bool = True
+    cleanup_memmap: bool = True,
+    process_workers: int = 0
     # --- FIN NOUVEAUX PARAMÈTRES ---
 ):
     """
@@ -1145,7 +1147,11 @@ def assemble_final_mosaic_with_reproject_coadd(
             _pcb("assemble_info_channel_processed_reproject_coadd", prog=None, lvl="INFO_DETAIL", channel_num=i_channel + 1)
             _log_memory_usage(progress_callback, f"Phase 5 (reproject_coadd) - Fin canal {i_channel+1} (après memmap)")
     else:
-        with ProcessPoolExecutor(max_workers=min(os.cpu_count() or 1, n_channels)) as ex:
+
+        max_procs = process_workers if process_workers and process_workers > 0 else min(os.cpu_count() or 1, n_channels)
+        _pcb(f"ASM_REPROJ_COADD: Using {max_procs} process workers", lvl="DEBUG_DETAIL")
+        with ProcessPoolExecutor(max_workers=max_procs) as ex:
+
             future_map = {}
             for i_channel, ch_data in enumerate(per_channel_data):
                 if not ch_data:
@@ -1175,6 +1181,18 @@ def assemble_final_mosaic_with_reproject_coadd(
                         exc_info=True,
                     )
                     return None, None
+
+                except BrokenProcessPool as bpp:
+                    _pcb(
+                        "assemble_error_broken_process_pool_reproject_coadd",
+                        prog=None,
+                        lvl="ERROR",
+                        channel_num=idx + 1,
+                        error=str(bpp),
+                    )
+                    logger.error("BrokenProcessPool during channel reprojection", exc_info=True)
+                    return None, None
+
                 except Exception as e_reproject_ch:
                     _pcb(
                         "assemble_error_channel_reprojection_failed_reproject_coadd",
@@ -1252,6 +1270,7 @@ def run_hierarchical_mosaic(
     coadd_use_memmap_config: bool,
     coadd_memmap_dir_config: str,
     coadd_cleanup_memmap_config: bool,
+    assembly_process_workers_config: int,
     auto_limit_frames_per_master_tile_config: bool
 ):
     """
@@ -1664,7 +1683,8 @@ def run_hierarchical_mosaic(
             crop_percent=master_tile_crop_percent_config,
             use_memmap=coadd_use_memmap_config,
             memmap_dir=coadd_memmap_dir_config,
-            cleanup_memmap=coadd_cleanup_memmap_config
+            cleanup_memmap=coadd_cleanup_memmap_config,
+            process_workers=assembly_process_workers_config
             # --- FIN PASSAGE ---
         )
         log_key_phase5_failed = "run_error_phase5_assembly_failed_reproject_coadd"
@@ -1865,6 +1885,8 @@ if __name__ == "__main__":
                         help="Delete *.dat blocks when the run finishes")
     parser.add_argument("--no_auto_limit_frames", action="store_true",
                         help="Disable automatic frame limit per master tile")
+    parser.add_argument("--assembly_process_workers", type=int, default=None,
+                        help="Number of processes for final assembly (0=auto)")
     args = parser.parse_args()
 
     cfg = {}
@@ -1906,5 +1928,6 @@ if __name__ == "__main__":
         coadd_use_memmap_config=args.coadd_use_memmap or cfg.get("coadd_use_memmap", False),
         coadd_memmap_dir_config=args.coadd_memmap_dir or cfg.get("coadd_memmap_dir", None),
         coadd_cleanup_memmap_config=args.coadd_cleanup_memmap if args.coadd_cleanup_memmap else cfg.get("coadd_cleanup_memmap", True),
+        assembly_process_workers_config=args.assembly_process_workers if args.assembly_process_workers is not None else cfg.get("assembly_process_workers", 0),
         auto_limit_frames_per_master_tile_config=(not args.no_auto_limit_frames) and cfg.get("auto_limit_frames_per_master_tile", True),
     )
