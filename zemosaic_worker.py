@@ -6,10 +6,11 @@ import time
 import traceback
 import gc
 import logging
-import inspect # Pas utilisé directement ici, mais peut être utile pour des introspections futures
+import inspect  # Pas utilisé directement ici, mais peut être utile pour des introspections futures
 import psutil
 import tempfile
 import glob
+import uuid
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -310,10 +311,11 @@ def cluster_seestar_stacks(all_raw_files_with_info: list, stack_threshold_deg: f
     _log_and_callback("clusterstacks_info_finished", num_groups=len(groups), level="INFO", callback=progress_callback)
     return groups
 
-def get_wcs_and_pretreat_raw_file(file_path: str, astap_exe_path: str, astap_data_dir: str, 
-                                  astap_search_radius: float, astap_downsample: int, 
-                                  astap_sensitivity: int, astap_timeout_seconds: int, 
-                                  progress_callback: callable):
+def get_wcs_and_pretreat_raw_file(file_path: str, astap_exe_path: str, astap_data_dir: str,
+                                  astap_search_radius: float, astap_downsample: int,
+                                  astap_sensitivity: int, astap_timeout_seconds: int,
+                                  progress_callback: callable,
+                                  hotpix_mask_dir: str | None = None):
     filename = os.path.basename(file_path)
     # Utiliser une fonction helper pour les logs internes à cette fonction si _log_and_callback
     # est trop lié à la structure de run_hierarchical_mosaic
@@ -322,9 +324,11 @@ def get_wcs_and_pretreat_raw_file(file_path: str, astap_exe_path: str, astap_dat
 
     _pcb_local(f"GetWCS_Pretreat: Début pour '{filename}'.", lvl="DEBUG_DETAIL") # Niveau DEBUG_DETAIL pour être moins verbeux
 
+    hp_mask_path = None
+
     if not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils):
         _pcb_local("getwcs_error_utils_unavailable", lvl="ERROR")
-        return None, None, None
+        return None, None, None, None
         
     img_data_raw_adu, header_orig = zemosaic_utils.load_and_validate_fits(
         file_path, 
@@ -337,7 +341,7 @@ def get_wcs_and_pretreat_raw_file(file_path: str, astap_exe_path: str, astap_dat
         _pcb_local("getwcs_error_load_failed", lvl="ERROR", filename=filename)
         # Le fichier n'a pas pu être chargé, on ne peut pas le déplacer car on ne sait pas s'il existe ou est corrompu.
         # Ou on pourrait essayer de le déplacer s'il existe. Pour l'instant, on retourne None.
-        return None, None, None
+        return None, None, None, None
 
     # ... (log de post-load) ...
     _pcb_local(f"  Post-Load: '{filename}' - Shape: {img_data_raw_adu.shape}, Dtype: {img_data_raw_adu.dtype}", lvl="DEBUG_VERY_DETAIL")
@@ -379,11 +383,20 @@ def get_wcs_and_pretreat_raw_file(file_path: str, astap_exe_path: str, astap_dat
     
     if img_data_processed_adu.ndim != 3 or img_data_processed_adu.shape[-1] != 3:
         _pcb_local("getwcs_error_shape_after_debayer_final_check", lvl="ERROR", filename=filename, shape=str(img_data_processed_adu.shape))
-        return None, None, None
+        return None, None, None, None
 
     # --- Correction Hot Pixels ---
     _pcb_local(f"  Correction HP pour '{filename}'...", lvl="DEBUG_DETAIL")
-    img_data_hp_corrected_adu = zemosaic_utils.detect_and_correct_hot_pixels(img_data_processed_adu,3.,5,progress_callback=progress_callback)
+    if hotpix_mask_dir:
+        os.makedirs(hotpix_mask_dir, exist_ok=True)
+        hp_mask_path = os.path.join(hotpix_mask_dir, f"hp_mask_{os.path.splitext(filename)[0]}_{uuid.uuid4().hex}.npy")
+    img_data_hp_corrected_adu = zemosaic_utils.detect_and_correct_hot_pixels(
+        img_data_processed_adu,
+        3.0,
+        5,
+        progress_callback=progress_callback,
+        save_mask_path=hp_mask_path,
+    )
     if img_data_hp_corrected_adu is not None: 
         img_data_processed_adu = img_data_hp_corrected_adu
     else: _pcb_local("getwcs_warn_hp_returned_none_using_previous", lvl="WARN", filename=filename)
@@ -436,7 +449,7 @@ def get_wcs_and_pretreat_raw_file(file_path: str, astap_exe_path: str, astap_dat
         
         if wcs_brute and wcs_brute.is_celestial: # Re-vérifier après la tentative de set_pixel_shape
             _pcb_local("getwcs_info_pretreatment_wcs_ok", lvl="DEBUG", filename=filename)
-            return img_data_processed_adu, wcs_brute, header_orig # header_orig peut avoir été mis à jour par ASTAP
+            return img_data_processed_adu, wcs_brute, header_orig, hp_mask_path  # header_orig peut avoir été mis à jour par ASTAP
         # else: tombe dans le bloc de déplacement ci-dessous
 
     # Si on arrive ici, c'est que wcs_brute est None ou non céleste
@@ -468,7 +481,7 @@ def get_wcs_and_pretreat_raw_file(file_path: str, astap_exe_path: str, astap_dat
             
     if img_data_processed_adu is not None: del img_data_processed_adu 
     gc.collect()
-    return None, None, None # Indique l'échec pour ce fichier
+    return None, None, None, hp_mask_path  # Indique l'échec pour ce fichier
 
 
 
@@ -1277,8 +1290,9 @@ def run_hierarchical_mosaic(
                 astap_downsample_config, 
                 astap_sensitivity_config, 
                 180, # astap_timeout_seconds
-                progress_callback
-            ): f_path for f_path in fits_file_paths 
+                progress_callback,
+                temp_image_cache_dir
+            ): f_path for f_path in fits_file_paths
         }
         
         for future in as_completed(future_to_filepath_ph1):
@@ -1289,7 +1303,7 @@ def run_hierarchical_mosaic(
             
             try:
                 # Récupérer le résultat de la tâche
-                img_data_adu, wcs_obj_solved, header_obj_updated = future.result()
+                img_data_adu, wcs_obj_solved, header_obj_updated, hp_mask_path = future.result()
                 
                 # Si la tâche a réussi (ne retourne pas que des None)
                 if img_data_adu is not None and wcs_obj_solved is not None and header_obj_updated is not None:
@@ -1301,9 +1315,10 @@ def run_hierarchical_mosaic(
                         # Stocker les informations pour les phases suivantes
                         all_raw_files_processed_info_dict[file_path_original] = {
                             'path_raw': file_path_original, 
-                            'path_preprocessed_cache': cached_image_path, 
-                            'wcs': wcs_obj_solved, 
-                            'header': header_obj_updated 
+                            'path_preprocessed_cache': cached_image_path,
+                            'path_hotpix_mask': hp_mask_path,
+                            'wcs': wcs_obj_solved,
+                            'header': header_obj_updated
                         }
                         # pcb(f"Phase 1: Fichier '{os.path.basename(file_path_original)}' traité et mis en cache.", prog=prog_step_phase1, lvl="DEBUG_VERY_DETAIL") # Optionnel
                     except Exception as e_save_npy:
