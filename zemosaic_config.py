@@ -25,7 +25,7 @@ DEFAULT_CONFIG = {
     "radial_shape_power": 2.0,
     "final_assembly_method": "reproject_coadd", # Options: "reproject_coadd", "incremental",
     "save_final_as_uint16": False,
-    "coadd_use_memmap": False,
+    "coadd_use_memmap": True,
     "coadd_memmap_dir": "",
     "coadd_cleanup_memmap": True,
     # --- CLES POUR LE ROGNAGE DES MASTER TUILES ---

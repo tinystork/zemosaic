@@ -170,7 +170,7 @@ L’exécutable final se trouvera dans dist/zemosaic.exe.
 
 ✅ Les fichiers de traduction (locales/*.json) et les icônes (icon/zemosaic.ico) sont inclus automatiquement.
 
-### Memory-mapped coadd
+### Memory-mapped coadd (enabled by default)
 
 ```jsonc
 {
@@ -182,12 +182,13 @@ L’exécutable final se trouvera dans dist/zemosaic.exe.
 ```
 A final mosaic of 20 000 × 20 000 px in RGB needs ≈ 4.8 GB
 (4 × H × W × float32). Make sure the target disk/SSD has enough space.
+Hot pixel masks detected during preprocessing are also written to the temporary
+cache directory to further reduce memory usage.
 
 6 ▸ Quick CLI example
 ```bash
 run_zemosaic.py \
   --final_assembly_method reproject_coadd \
-  --coadd_use_memmap \
   --coadd_memmap_dir D:/ZeMosaic_memmap \
   --coadd_cleanup_memmap
 ```
