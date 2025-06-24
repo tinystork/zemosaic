@@ -14,6 +14,7 @@ import uuid
 
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed, BrokenProcessPool
 
+
 # --- Configuration du Logging ---
 logger = logging.getLogger("ZeMosaicWorker")
 if not logger.handlers:
@@ -1146,9 +1147,11 @@ def assemble_final_mosaic_with_reproject_coadd(
             _pcb("assemble_info_channel_processed_reproject_coadd", prog=None, lvl="INFO_DETAIL", channel_num=i_channel + 1)
             _log_memory_usage(progress_callback, f"Phase 5 (reproject_coadd) - Fin canal {i_channel+1} (après memmap)")
     else:
+
         max_procs = process_workers if process_workers and process_workers > 0 else min(os.cpu_count() or 1, n_channels)
         _pcb(f"ASM_REPROJ_COADD: Using {max_procs} process workers", lvl="DEBUG_DETAIL")
         with ProcessPoolExecutor(max_workers=max_procs) as ex:
+
             future_map = {}
             for i_channel, ch_data in enumerate(per_channel_data):
                 if not ch_data:
@@ -1178,6 +1181,7 @@ def assemble_final_mosaic_with_reproject_coadd(
                         exc_info=True,
                     )
                     return None, None
+
                 except BrokenProcessPool as bpp:
                     _pcb(
                         "assemble_error_broken_process_pool_reproject_coadd",
@@ -1188,6 +1192,7 @@ def assemble_final_mosaic_with_reproject_coadd(
                     )
                     logger.error("BrokenProcessPool during channel reprojection", exc_info=True)
                     return None, None
+
                 except Exception as e_reproject_ch:
                     _pcb(
                         "assemble_error_channel_reprojection_failed_reproject_coadd",

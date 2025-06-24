@@ -24,7 +24,9 @@ It was born out of a need from an astrophotography Discord community called the 
 - Option to save the final mosaic as 16-bit integer FITS
 - Phase-specific auto-tuning of worker threads (alignment capped at 50% of CPU threads)
 - Process-based parallelization for final mosaic assembly
+
 - Configurable `assembly_process_workers` to tune process count for assembly
+
 
 ---
 
@@ -111,8 +113,10 @@ Click "Start Hierarchical Mosaic"
 
 ✅ FITS images (ideally calibrated, debayered or raw from Seestar)
 ✅ Python multiprocessing enabled (ProcessPoolExecutor is used for assembly)
+
 ✅ `assembly_process_workers` can be set in `zemosaic_config.json` to control
    how many processes handle final mosaic assembly (0 = auto)
+
 
 🖥️ How to Run
 After installing Python and dependencies:
