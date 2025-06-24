@@ -287,6 +287,7 @@
     "stacking_min_radial_floor_note": "(0.0 = pas de plancher)",
     "gui_memmap_title": "Options memmap (coadd)",
     "gui_memmap_enable": "Utiliser memmap disque",
-    "gui_memmap_dir": "Dossier memmap"
+    "gui_memmap_dir": "Dossier memmap",
+    "gui_memmap_cleanup": "Supprimer les *.dat à la fin"
     
 }

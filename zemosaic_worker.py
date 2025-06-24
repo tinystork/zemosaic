@@ -927,7 +927,7 @@ def assemble_final_mosaic_with_reproject_coadd(
     apply_crop: bool = False,
     crop_percent: float = 0.0, # Pourcentage par côté, 0.0 = pas de rognage par défaut
     use_memmap: bool = False,
-    memmap_dir: str = "",
+    memmap_dir: str | None = None,
     cleanup_memmap: bool = True
     # --- FIN NOUVEAUX PARAMÈTRES ---
 ):
@@ -941,10 +941,9 @@ def assemble_final_mosaic_with_reproject_coadd(
     _log_memory_usage(progress_callback, "Début assemble_final_mosaic_with_reproject_coadd")
     _pcb(f"ASM_REPROJ_COADD: Options de rognage - Appliquer: {apply_crop}, Pourcentage: {crop_percent if apply_crop else 'N/A'}", lvl="DEBUG_DETAIL") # Log des options de rognage
 
-    mm_dir_path = None
     if use_memmap:
-        mm_dir_path = memmap_dir or tempfile.gettempdir()
-        os.makedirs(mm_dir_path, exist_ok=True)
+        assert memmap_dir, "memmap_dir must be provided when use_memmap=True"
+        os.makedirs(memmap_dir, exist_ok=True)
 
     # ... (Vérification des dépendances REPROJECT_AVAILABLE, ASTROPY_AVAILABLE - inchangée) ...
     if not (REPROJECT_AVAILABLE and reproject_and_coadd and reproject_interp and ASTROPY_AVAILABLE and fits):
@@ -968,7 +967,7 @@ def assemble_final_mosaic_with_reproject_coadd(
         try:
             _pcb(f"  ASM_REPROJ_COADD: Lecture et prétraitement (rognage si actif) Master Tile {i_tile_load+1}/{num_master_tiles} '{os.path.basename(mt_path)}'", prog=None, lvl="DEBUG_VERY_DETAIL")
             
-            with fits.open(mt_path, memmap=False, do_not_scale_image_data=True) as hdul: # Garder do_not_scale
+            with fits.open(mt_path, memmap=True, do_not_scale_image_data=True) as hdul:
                 if not hdul or hdul[0].data is None:
                     _pcb("assemble_warn_tile_empty_reproject_coadd", prog=None, lvl="WARN", filename=os.path.basename(mt_path))
                     continue
@@ -1053,10 +1052,14 @@ def assemble_final_mosaic_with_reproject_coadd(
 
         try:
             if use_memmap:
-                mm_sum_path = os.path.join(mm_dir_path, f"sum_ch{i_channel}.dat")
-                mm_cov_path = os.path.join(mm_dir_path, f"cov_ch{i_channel}.dat")
-                mm_sum = np.memmap(mm_sum_path, dtype=np.float32, mode="w+", shape=final_output_shape_hw)
-                mm_cov = np.memmap(mm_cov_path, dtype=np.float32, mode="w+", shape=final_output_shape_hw)
+                mm_sum = np.memmap(
+                    os.path.join(memmap_dir, f"sum_ch{i_channel}.dat"),
+                    dtype=np.float32, mode="w+", shape=final_output_shape_hw
+                )
+                mm_cov = np.memmap(
+                    os.path.join(memmap_dir, f"cov_ch{i_channel}.dat"),
+                    dtype=np.float32, mode="w+", shape=final_output_shape_hw
+                )
                 mm_sum[:] = 0.0
                 mm_cov[:] = 0.0
                 for img_hw, wcs in current_channel_input_data:
@@ -1065,15 +1068,10 @@ def assemble_final_mosaic_with_reproject_coadd(
                         pass
                     mm_sum += np.nan_to_num(reproj, nan=0.0)
                     mm_cov += np.nan_to_num(footprint, nan=0.0)
+                    mm_sum.flush(); mm_cov.flush(); gc.collect()
                 stacked_channel_output = np.divide(mm_sum, mm_cov, out=np.zeros_like(mm_sum, dtype=np.float32), where=mm_cov > 0)
                 coverage_channel_output = mm_cov.copy()
-                if cleanup_memmap:
-                    for f in [mm_sum_path, mm_cov_path]:
-                        try:
-                            os.remove(f)
-                        except OSError:
-                            pass
-                del mm_sum, mm_cov
+                mm_sum.flush(); mm_cov.flush(); del mm_sum, mm_cov
             else:
                 _pcb(f"  Appel de reproject_and_coadd pour canal {i_channel+1} avec {len(current_channel_input_data)} images (potentiellement rognées). match_background={match_bg}", prog=None, lvl="DEBUG_DETAIL")
                 stacked_channel_output, coverage_channel_output = reproject_and_coadd(
@@ -1113,10 +1111,10 @@ def assemble_final_mosaic_with_reproject_coadd(
     try: final_mosaic_data_HWC = np.stack(final_mosaic_stacked_channels_list, axis=-1)
     except ValueError as e_stack_final: _pcb("assemble_error_final_channel_stack_failed_reproject_coadd", prog=None, lvl="ERROR", error=str(e_stack_final)); logger.error(f"Erreur stack final canaux. Shapes: {[ch.shape for ch in final_mosaic_stacked_channels_list if hasattr(ch, 'shape')]}", exc_info=True); return None, None
     finally: del final_mosaic_stacked_channels_list; gc.collect()
-    if use_memmap and cleanup_memmap and mm_dir_path:
-        for f in glob.glob(os.path.join(mm_dir_path, "sum_ch*.dat")) + glob.glob(os.path.join(mm_dir_path, "cov_ch*.dat")):
+    if use_memmap and cleanup_memmap:
+        for fname in glob.glob(os.path.join(memmap_dir, "*.dat")):
             try:
-                os.remove(f)
+                os.remove(fname)
             except OSError:
                 pass
     _log_memory_usage(progress_callback, "Fin assemble_final_mosaic_with_reproject_coadd")
@@ -1709,3 +1707,61 @@ def run_hierarchical_mosaic(
 ####################################################################################################################################################################
 
 
+
+if __name__ == "__main__":
+    import argparse
+    import json
+
+    parser = argparse.ArgumentParser(description="ZeMosaic worker")
+    parser.add_argument("input_folder", help="Folder with input FITS")
+    parser.add_argument("output_folder", help="Destination folder")
+    parser.add_argument("--config", default=None, help="Optional config JSON")
+    parser.add_argument("--coadd_use_memmap", action="store_true",
+                        help="Write sum/cov arrays to disk via numpy.memmap")
+    parser.add_argument("--coadd_memmap_dir", default=None,
+                        help="Directory to store *.dat blocks")
+    parser.add_argument("--coadd_cleanup_memmap", action="store_true",
+                        default=True,
+                        help="Delete *.dat blocks when the run finishes")
+    args = parser.parse_args()
+
+    cfg = {}
+    if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
+        cfg.update(zemosaic_config.load_config())
+    if args.config:
+        try:
+            with open(args.config, "r", encoding="utf-8") as f:
+                cfg.update(json.load(f))
+        except Exception:
+            pass
+
+    run_hierarchical_mosaic(
+        input_folder=args.input_folder,
+        output_folder=args.output_folder,
+        astap_exe_path=cfg.get("astap_executable_path", ""),
+        astap_data_dir_param=cfg.get("astap_data_directory_path", ""),
+        astap_search_radius_config=cfg.get("astap_default_search_radius", 3.0),
+        astap_downsample_config=cfg.get("astap_default_downsample", 2),
+        astap_sensitivity_config=cfg.get("astap_default_sensitivity", 100),
+        cluster_threshold_config=cfg.get("cluster_threshold", 0.08),
+        progress_callback=None,
+        stack_norm_method=cfg.get("stacking_normalize_method", "linear_fit"),
+        stack_weight_method=cfg.get("stacking_weighting_method", "noise_variance"),
+        stack_reject_algo=cfg.get("stacking_rejection_algorithm", "winsorized_sigma_clip"),
+        stack_kappa_low=cfg.get("stacking_kappa_low", 3.0),
+        stack_kappa_high=cfg.get("stacking_kappa_high", 3.0),
+        parsed_winsor_limits=(0.05, 0.05),
+        stack_final_combine=cfg.get("stacking_final_combine_method", "mean"),
+        apply_radial_weight_config=cfg.get("apply_radial_weight", False),
+        radial_feather_fraction_config=cfg.get("radial_feather_fraction", 0.8),
+        radial_shape_power_config=cfg.get("radial_shape_power", 2.0),
+        min_radial_weight_floor_config=cfg.get("min_radial_weight_floor", 0.0),
+        final_assembly_method_config=cfg.get("final_assembly_method", "reproject_coadd"),
+        num_base_workers_config=cfg.get("num_processing_workers", 0),
+        apply_master_tile_crop_config=cfg.get("apply_master_tile_crop", True),
+        master_tile_crop_percent_config=cfg.get("master_tile_crop_percent", 18.0),
+        save_final_as_uint16_config=cfg.get("save_final_as_uint16", False),
+        coadd_use_memmap_config=args.coadd_use_memmap or cfg.get("coadd_use_memmap", False),
+        coadd_memmap_dir_config=args.coadd_memmap_dir or cfg.get("coadd_memmap_dir", None),
+        coadd_cleanup_memmap_config=args.coadd_cleanup_memmap if args.coadd_cleanup_memmap else cfg.get("coadd_cleanup_memmap", True),
+    )

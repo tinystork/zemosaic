@@ -291,6 +291,7 @@
     "stacking_min_radial_floor_note": "(0.0 = no floor)",
     "gui_memmap_title": "Memmap Options (coadd)",
     "gui_memmap_enable": "Use disk memmap",
-    "gui_memmap_dir": "Memmap Folder"
+    "gui_memmap_dir": "Memmap Folder",
+    "gui_memmap_cleanup": "Delete *.dat when finished"
 
 }
