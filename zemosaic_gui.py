@@ -1107,9 +1107,19 @@ class ZeMosaicGUI:
         self.launch_button.config(state=tk.DISABLED)
         self.log_text.config(state=tk.NORMAL); self.log_text.delete(1.0, tk.END); self.log_text.config(state=tk.DISABLED)
         
-        self._log_message("CHRONO_START_REQUEST", None, "CHRONO_LEVEL") 
+        self._log_message("CHRONO_START_REQUEST", None, "CHRONO_LEVEL")
         self._log_message("log_key_processing_started", level="INFO")
         # ... (autres logs d'info) ...
+
+        # -- Gestion du dossier memmap par défaut --
+        memmap_dir = self.mm_dir_var.get().strip()
+        if self.use_memmap_var.get() and not memmap_dir:
+            memmap_dir = self.output_dir_var.get().strip()
+            self.mm_dir_var.set(memmap_dir)
+            self._log_message(
+                f"[INFO] Aucun dossier memmap défini. Utilisation du dossier de sortie: {memmap_dir}",
+                level="INFO",
+            )
 
         worker_args = (
             input_dir, output_dir, astap_exe, astap_data, 
@@ -1134,7 +1144,7 @@ class ZeMosaicGUI:
             master_tile_crop_percent_val,
             self.save_final_uint16_var.get(),
             self.use_memmap_var.get(),
-            self.mm_dir_var.get(),
+            memmap_dir,
             self.cleanup_memmap_var.get(),
             self.auto_limit_frames_var.get(),
             self.config.get("assembly_process_workers", 0)
