@@ -1174,6 +1174,15 @@ def run_hierarchical_mosaic(
     PROGRESS_WEIGHT_PHASE3_MASTER_TILES = 35; PROGRESS_WEIGHT_PHASE4_GRID_CALC = 5
     PROGRESS_WEIGHT_PHASE5_ASSEMBLY = 15; PROGRESS_WEIGHT_PHASE6_SAVE = 8
     PROGRESS_WEIGHT_PHASE7_CLEANUP = 2
+
+    DEFAULT_PHASE_WORKER_RATIO = 1.0
+    ALIGNMENT_PHASE_WORKER_RATIO = 0.5  # Limit aggressive phases to 50% of base workers
+
+    def _compute_phase_workers(base_workers: int, num_tasks: int, ratio: float = DEFAULT_PHASE_WORKER_RATIO) -> int:
+        workers = max(1, int(base_workers * ratio))
+        if num_tasks > 0:
+            workers = min(workers, num_tasks)
+        return max(1, workers)
     current_global_progress = 0
     
     error_messages_deps = []
@@ -1242,8 +1251,16 @@ def run_hierarchical_mosaic(
         pcb(f"WORKERS_CONFIG: AVERT - effective_base_workers était <= 0, forcé à 1.", prog=None, lvl="WARN")
 
     # Calcul du nombre de workers pour la Phase 1
-    actual_num_workers_ph1 = max(1, min(effective_base_workers, num_total_raw_files if num_total_raw_files > 0 else 1))
-    pcb(f"WORKERS_PHASE1: Utilisation de {actual_num_workers_ph1} worker(s). (Base: {effective_base_workers}, Fichiers: {num_total_raw_files})", prog=None, lvl="INFO") # Log mis à jour pour plus de clarté
+    actual_num_workers_ph1 = _compute_phase_workers(
+        effective_base_workers,
+        num_total_raw_files,
+        DEFAULT_PHASE_WORKER_RATIO,
+    )
+    pcb(
+        f"WORKERS_PHASE1: Utilisation de {actual_num_workers_ph1} worker(s). (Base: {effective_base_workers}, Fichiers: {num_total_raw_files})",
+        prog=None,
+        lvl="INFO",
+    )  # Log mis à jour pour plus de clarté
     
     start_time_phase1 = time.monotonic()
     all_raw_files_processed_info_dict = {} # Pour stocker les infos des fichiers traités avec succès
@@ -1363,11 +1380,17 @@ def run_hierarchical_mosaic(
     master_tiles_results_list_temp = {}
     start_time_phase3 = time.monotonic()
     
-    # Calcul des workers pour la Phase 3 (déjà fait, en utilisant num_seestar_stacks_to_process de la Phase 2)
-    reduction_ph3 = 4 # Ta valeur
-    actual_num_workers_ph3_candidate = max(1, effective_base_workers - reduction_ph3)
-    actual_num_workers_ph3 = max(1, min(actual_num_workers_ph3_candidate, num_seestar_stacks_to_process if num_seestar_stacks_to_process > 0 else 1))
-    pcb(f"WORKERS_PHASE3: Utilisation de {actual_num_workers_ph3} worker(s). (Base: {effective_base_workers}, Réduc Candidat (-{reduction_ph3}): {actual_num_workers_ph3_candidate}, Groupes: {num_seestar_stacks_to_process})", prog=None, lvl="INFO") # Log mis à jour pour clarté
+    # Calcul des workers pour la Phase 3 (alignement/stacking des groupes)
+    actual_num_workers_ph3 = _compute_phase_workers(
+        effective_base_workers,
+        num_seestar_stacks_to_process,
+        ALIGNMENT_PHASE_WORKER_RATIO,
+    )
+    pcb(
+        f"WORKERS_PHASE3: Utilisation de {actual_num_workers_ph3} worker(s). (Base: {effective_base_workers}, Ratio {ALIGNMENT_PHASE_WORKER_RATIO*100:.0f}%, Groupes: {num_seestar_stacks_to_process})",
+        prog=None,
+        lvl="INFO",
+    )  # Log mis à jour pour clarté
 
     tiles_processed_count_ph3 = 0
     # Envoyer l'info initiale avant la boucle
