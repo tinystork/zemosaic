@@ -1125,10 +1125,9 @@ class ZeMosaicGUI:
             )
 
         worker_args = (
-            input_dir, output_dir, astap_exe, astap_data, 
-            astap_radius_val, astap_downsample_val, astap_sensitivity_val, 
-            cluster_thresh_val, 
-            self._log_message, 
+            input_dir, output_dir, astap_exe, astap_data,
+            astap_radius_val, astap_downsample_val, astap_sensitivity_val,
+            cluster_thresh_val,
             stack_norm_method,
             stack_weight_method,
             stack_reject_algo,
