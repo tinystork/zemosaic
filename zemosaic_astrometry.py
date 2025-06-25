@@ -206,21 +206,21 @@ def _update_fits_header_with_wcs_za(fits_header_to_update: fits.Header,
 
 
 def _write_wcs_to_fits(file_path: str, wcs_solution: AstropyWCS, progress_callback=None):
-    """Injecte un objet WCS dans l'en-tête d'un fichier FITS en place."""
+    """Injecte un objet WCS dans l'en-tête d'un fichier FITS en place en minimisant la RAM."""
     if not (file_path and os.path.isfile(file_path) and wcs_solution and wcs_solution.is_celestial):
         if progress_callback:
             progress_callback("  WriteWCS: paramètres invalides, opération annulée.", None, "WARN")
         return False
     try:
-        hdr_cards = wcs_solution.to_header(relax=True).cards
-        with fits.open(file_path, mode="update") as hdul:
+        wcs_header = wcs_solution.to_header(relax=True)
+        with fits.open(file_path, mode="update", memmap=True, do_not_scale_image_data=True) as hdul:
             hdr = hdul[0].header
-            for key in [k for k in hdr if k.startswith(("CRPIX", "CRVAL", "CTYPE", "CUNIT", "CD", "PC"))]:
+            for key in [k for k in hdr if k.startswith(("WCSAXES", "CRPIX", "CRVAL", "CTYPE", "CUNIT", "CD", "PC", "CDELT", "CROTA", "LONPOLE", "LATPOLE", "RADESYS", "EQUINOX", "PV"))]:
                 try:
                     del hdr[key]
                 except KeyError:
                     pass
-            hdr.extend(hdr_cards)
+            hdr.update(wcs_header)
             hdul.flush()
         if progress_callback:
             progress_callback(f"WCS écrit dans {os.path.basename(file_path)}", None, "INFO")
@@ -381,35 +381,30 @@ def solve_with_astap(image_fits_path: str,
                     cd21 = float(re.search(r"CD2_1\s*=\s*([\d\.\-E]+)", text).group(1))
                     cd22 = float(re.search(r"CD2_2\s*=\s*([\d\.\-E]+)", text).group(1))
 
-                    with fits.open(image_fits_path, mode="update") as hdul:
-                        hdr = hdul[0].header
-                        hdr["CRVAL1"] = crval1
-                        hdr["CRVAL2"] = crval2
-                        hdr["CRPIX1"] = crpix1
-                        hdr["CRPIX2"] = crpix2
-                        hdr["CD1_1"] = cd11
-                        hdr["CD1_2"] = cd12
-                        hdr["CD2_1"] = cd21
-                        hdr["CD2_2"] = cd22
-                        hdul.flush()
-                        updated_header = hdr.copy()
-                    gc.collect()
-
-                    for key in ["CRVAL1", "CRVAL2", "CRPIX1", "CRPIX2", "CD1_1", "CD1_2", "CD2_1", "CD2_2"]:
-                        original_fits_header[key] = updated_header[key]
-
-                    astap_success = True
-                    if progress_callback:
-                        progress_callback(
-                            "  ASTAP Solve: WCS mis à jour depuis log ASTAP.",
-                            None,
-                            "INFO_DETAIL",
-                        )
+                    wcs_header = fits.Header()
+                    for k, v in [
+                        ("CRVAL1", crval1), ("CRVAL2", crval2), ("CRPIX1", crpix1), ("CRPIX2", crpix2),
+                        ("CD1_1", cd11), ("CD1_2", cd12), ("CD2_1", cd21), ("CD2_2", cd22)
+                    ]:
+                        wcs_header[k] = v
 
                     if ASTROPY_AVAILABLE_ASTROMETRY:
                         with warnings.catch_warnings():
                             warnings.simplefilter("ignore", FITSFixedWarning)
-                            wcs_solved_obj = AstropyWCS(updated_header, naxis=2, relax=True)
+                            wcs_solved_obj = AstropyWCS(wcs_header, naxis=2, relax=True)
+                    else:
+                        wcs_solved_obj = None
+
+                    astap_success = True
+                    if wcs_solved_obj:
+                        _update_fits_header_with_wcs_za(original_fits_header, wcs_solved_obj,
+                                                        solver_name="ASTAP_ZeMosaic",
+                                                        progress_callback=progress_callback)
+                        if update_original_header_in_place:
+                            _write_wcs_to_fits(image_fits_path, wcs_solved_obj, progress_callback)
+                        if progress_callback:
+                            progress_callback("  ASTAP Solve: WCS mis à jour depuis log ASTAP.",
+                                              None, "INFO_DETAIL")
                 except Exception as e_parse:
                     if progress_callback:
                         progress_callback(
