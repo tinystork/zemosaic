@@ -8,7 +8,7 @@ import re
 # import tempfile # Plus utilisé directement si on nettoie manuellement
 import traceback
 import subprocess
-# import shutil # Plus utilisé directement si on nettoie manuellement
+import shutil
 import gc
 import logging
 import psutil
@@ -211,9 +211,9 @@ def solve_with_astap(image_fits_path: str,
                      original_fits_header: fits.Header,
                      astap_exe_path: str,
                      astap_data_dir: str,
-                     search_radius_deg: float | None = None,    # Depuis GUI
-                     downsample_factor: int | None = None,      # Depuis GUI (pour -z)
-                     sensitivity: int | None = None,            # Depuis GUI (pour -sens)
+                     search_radius_deg: float | None = None,    # Kept for compatibility
+                     downsample_factor: int | None = None,      # Kept for compatibility
+                     sensitivity: int | None = None,            # Kept for compatibility
                      timeout_sec: int = 120,
                      update_original_header_in_place: bool = False,
                      progress_callback: callable = None):
@@ -240,206 +240,74 @@ def solve_with_astap(image_fits_path: str,
         return None
 
     current_image_dir = os.path.dirname(image_fits_path)
-    base_image_name_no_ext = os.path.splitext(os.path.basename(image_fits_path))[0]
-    expected_wcs_file_path = os.path.join(current_image_dir, base_image_name_no_ext + ".wcs")
-    expected_ini_file_path = os.path.join(current_image_dir, base_image_name_no_ext + ".ini")
-    astap_log_file_path = os.path.join(
-        current_image_dir, f"{base_image_name_no_ext}_astap.log"
-    )
-    files_to_cleanup_by_astap = [expected_wcs_file_path, expected_ini_file_path]
 
-    for f_to_clean in files_to_cleanup_by_astap:
-        if os.path.exists(f_to_clean):
-            try: os.remove(f_to_clean)
-            except Exception as e_del_pre:
-                if progress_callback: progress_callback(f"  ASTAP Solve AVERT: Échec nettoyage pré-ASTAP '{os.path.basename(f_to_clean)}': {e_del_pre}", None, "WARN")
-    if os.path.exists(astap_log_file_path):
-        try: os.remove(astap_log_file_path)
-        except Exception as e_del_log_pre:
-            if progress_callback: progress_callback(f"  ASTAP Solve AVERT: Échec nettoyage pré-ASTAP log '{os.path.basename(astap_log_file_path)}': {e_del_log_pre}", None, "WARN")
+    raw_dir = os.path.join(current_image_dir, "raw_source")
+    os.makedirs(raw_dir, exist_ok=True)
+    moved_path = os.path.join(raw_dir, os.path.basename(image_fits_path))
+    try:
+        shutil.move(image_fits_path, moved_path)
+        image_fits_path = moved_path
+    except Exception as e_move:
+        if progress_callback:
+            progress_callback(f"ASTAP Solve ERREUR: déplacement vers raw_source échoué: {e_move}", None, "ERROR")
+        logger.error(f"Erreur déplacement fichier pour ASTAP: {e_move}", exc_info=True)
+        return None
 
-    cmd_list_astap = [astap_exe_path, "-f", image_fits_path, "-r", astap_log_file_path]
-    if astap_data_dir and os.path.isdir(astap_data_dir):
-         cmd_list_astap.extend(["-d", astap_data_dir])
+    solved_path = os.path.join(current_image_dir, "image_solved.fits")
+    if os.path.exists(solved_path):
+        try:
+            os.remove(solved_path)
+        except Exception:
+            pass
 
-    # --- MODIFICATION: Option -pxscale / -fov 0 temporairement enlevée pour test ---
-    # calculated_px_scale = _calculate_pixel_scale_from_header(original_fits_header, progress_callback)
-    # if calculated_px_scale and calculated_px_scale > 0.01 and calculated_px_scale < 50.0:
-    #     cmd_list_astap.extend(["-pxscale", f"{calculated_px_scale:.4f}"])
-    #     if progress_callback: progress_callback(f"  ASTAP Solve: Utilisation -pxscale {calculated_px_scale:.4f} arcsec/pix (calculé du header).", None, "DEBUG")
-    # else:
-    #     cmd_list_astap.extend(["-fov", "0"])
-    #     if progress_callback: progress_callback("  ASTAP Solve: -pxscale non calculable/utilisé. Utilisation -fov 0.", None, "DEBUG")
-    if progress_callback: progress_callback("  ASTAP Solve: Option -pxscale / -fov 0 non ajoutée explicitement (test). ASTAP estimera.", None, "DEBUG")
-
-
-    # Gestion du downsampling (-z)
-    if downsample_factor is not None and isinstance(downsample_factor, int) and downsample_factor >= 0:
-        cmd_list_astap.extend(["-z", str(downsample_factor)])
-        if progress_callback: progress_callback(f"  ASTAP Solve: Utilisation -z {downsample_factor} (configuré).", None, "DEBUG")
-    else:
-        if progress_callback: progress_callback(f"  ASTAP Solve: Downsample non spécifié ou invalide ({downsample_factor}). ASTAP utilisera son défaut pour -z.", None, "DEBUG_DETAIL")
-
-    # Gestion de la sensibilité (-sens)
-    if sensitivity is not None and isinstance(sensitivity, int): # Typiquement positif pour -sens 100
-        cmd_list_astap.extend(["-sens", str(sensitivity)])
-        if progress_callback: progress_callback(f"  ASTAP Solve: Utilisation -sens {sensitivity} (configuré).", None, "DEBUG")
-    else:
-        if progress_callback: progress_callback(f"  ASTAP Solve: Sensibilité non spécifiée ou invalide ({sensitivity}). ASTAP utilisera son défaut pour -sens.", None, "DEBUG_DETAIL")
-
-    # --- MODIFICATION: Gestion des hints RA/Dec et du rayon de recherche ---
-    # On n'ajoute plus -ra / -spd explicitement pour ce test, mais on ajoute -r si configuré
-    if search_radius_deg is not None and search_radius_deg > 0:
-        cmd_list_astap.extend(["-r", str(search_radius_deg)])
-        if progress_callback: progress_callback(f"  ASTAP Solve: Utilisation rayon de recherche -r {search_radius_deg}° (pas de hints RA/Dec explicites).", None, "DEBUG")
-    else:
-        # Si aucun rayon n'est spécifié, et qu'on n'utilise pas -fov 0 explicitement, ASTAP a son propre comportement.
-        # Si l'objectif est de forcer ASTAP à utiliser son mécanisme "blind" sans rayon, on ne met rien.
-        # Si on voulait forcer une recherche "full-sky" mais limitée par le fov, on aurait besoin de -fov 0 et -r (grand).
-        # Pour l'instant, on laisse ASTAP décider si -r n'est pas fourni.
-        if progress_callback: progress_callback(f"  ASTAP Solve: Pas de rayon de recherche explicite spécifié via -r. ASTAP utilisera ses valeurs par défaut pour la zone de recherche.", None, "DEBUG_DETAIL")
-
-
-    if progress_callback: progress_callback(f"  ASTAP Solve: Commande: {' '.join(cmd_list_astap)}", None, "DEBUG")
-    logger.info(f"Executing ASTAP for {img_basename_log}: {' '.join(cmd_list_astap)}")
     wcs_solved_obj = None
-    astap_success = False
 
     try:
-
-        astap_process_result = subprocess.run(
-            cmd_list_astap,
+        subprocess.run(
+            ["astap", "-s", "-w", image_fits_path],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             timeout=timeout_sec,
             cwd=current_image_dir
         )
 
-        logger.debug(f"ASTAP return code: {astap_process_result.returncode}")
+        if os.path.exists(solved_path):
+            with fits.open(solved_path) as hdul:
+                solved_header = hdul[0].header.copy()
+            if ASTROPY_AVAILABLE_ASTROMETRY:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", FITSFixedWarning)
+                    wcs_solved_obj = AstropyWCS(solved_header, naxis=2, relax=True)
 
-        rc_astap = astap_process_result.returncode
-        del astap_process_result
-        gc.collect()
-        _log_memory_usage(progress_callback, "Après GC post-ASTAP")
-
-        if rc_astap == 0:
-
-            log_path = astap_log_file_path
-
-            max_wait = 5.0  # seconds
-            wait_interval = 0.1
-            waited = 0.0
-            while waited < max_wait:
-                if os.path.exists(log_path):
-                    try:
-                        if os.path.getsize(log_path) > 0:
-                            break
-                    except OSError:
-                        pass
-                time.sleep(wait_interval)
-                waited += wait_interval
-
-            if os.path.exists(log_path):
+            if wcs_solved_obj and update_original_header_in_place:
+                _update_fits_header_with_wcs_za(original_fits_header, wcs_solved_obj, progress_callback=progress_callback)
                 try:
-                    with open(log_path, "r") as f:
-                        text = f.read()
-
-                    crval1 = float(re.search(r"CRVAL1\s*=\s*([\d\.\-E]+)", text).group(1))
-                    crval2 = float(re.search(r"CRVAL2\s*=\s*([\d\.\-E]+)", text).group(1))
-                    crpix1 = float(re.search(r"CRPIX1\s*=\s*([\d\.\-E]+)", text).group(1))
-                    crpix2 = float(re.search(r"CRPIX2\s*=\s*([\d\.\-E]+)", text).group(1))
-                    cd11 = float(re.search(r"CD1_1\s*=\s*([\d\.\-E]+)", text).group(1))
-                    cd12 = float(re.search(r"CD1_2\s*=\s*([\d\.\-E]+)", text).group(1))
-                    cd21 = float(re.search(r"CD2_1\s*=\s*([\d\.\-E]+)", text).group(1))
-                    cd22 = float(re.search(r"CD2_2\s*=\s*([\d\.\-E]+)", text).group(1))
-
-                    with fits.open(image_fits_path, mode="update") as hdul:
-                        hdr = hdul[0].header
-                        hdr["CRVAL1"] = crval1
-                        hdr["CRVAL2"] = crval2
-                        hdr["CRPIX1"] = crpix1
-                        hdr["CRPIX2"] = crpix2
-                        hdr["CD1_1"] = cd11
-                        hdr["CD1_2"] = cd12
-                        hdr["CD2_1"] = cd21
-                        hdr["CD2_2"] = cd22
-                        hdul.flush()
-                        updated_header = hdr.copy()
-                    gc.collect()
-
-                    for key in ["CRVAL1", "CRVAL2", "CRPIX1", "CRPIX2", "CD1_1", "CD1_2", "CD2_1", "CD2_2"]:
-                        original_fits_header[key] = updated_header[key]
-
-                    astap_success = True
+                    with fits.open(image_fits_path, mode="update") as hdul_upd:
+                        _update_fits_header_with_wcs_za(hdul_upd[0].header, wcs_solved_obj)
+                        hdul_upd.flush()
+                except Exception as e_upd:
                     if progress_callback:
-                        progress_callback(
-                            "  ASTAP Solve: WCS mis à jour depuis log ASTAP.",
-                            None,
-                            "INFO_DETAIL",
-                        )
-
-                    if ASTROPY_AVAILABLE_ASTROMETRY:
-                        with warnings.catch_warnings():
-                            warnings.simplefilter("ignore", FITSFixedWarning)
-                            wcs_solved_obj = AstropyWCS(updated_header, naxis=2, relax=True)
-                except Exception as e_parse:
-                    if progress_callback:
-                        progress_callback(
-                            f"  ASTAP Solve ERREUR: Échec parsing log ASTAP: {e_parse}",
-                            None,
-                            "ERROR",
-                        )
-                    logger.error(f"Erreur parsing ASTAP log: {e_parse}", exc_info=True)
-            else:
-                if progress_callback:
-                    progress_callback(
-                        "  ASTAP Solve ERREUR: log ASTAP absent.",
-                        None,
-                        "ERROR",
-                    )
+                        progress_callback(f"ASTAP Solve AVERT: MàJ fichier FITS échouée: {e_upd}", None, "WARN")
+                    logger.error(f"Erreur mise à jour FITS déplacé: {e_upd}", exc_info=True)
         else:
-            error_msg = f"ASTAP Solve Échec (code {rc_astap}) pour '{img_basename_log}'."
-            if rc_astap == 1:
-                error_msg += " (No solution found)."
-            elif rc_astap == 2:
-                error_msg += " (ASTAP FITS read error - vérifiez format/corruption)."
-            elif rc_astap == 10:
-                error_msg += " (ASTAP database not found - vérifiez -d)."
             if progress_callback:
-                progress_callback(f"  {error_msg}", None, "WARN")
-            logger.warning(error_msg)
-
+                progress_callback("ASTAP Solve ERREUR: fichier image_solved.fits manquant après ASTAP", None, "ERROR")
     except subprocess.TimeoutExpired:
         if progress_callback: progress_callback(f"ASTAP Solve ERREUR: Timeout ({timeout_sec}s) pour '{img_basename_log}'.", None, "ERROR")
         logger.error(f"ASTAP command timed out for {img_basename_log}", exc_info=False)
     except FileNotFoundError:
-        if progress_callback: progress_callback(f"ASTAP Solve ERREUR: Exécutable ASTAP '{astap_exe_path}' non trouvé.", None, "ERROR")
-        logger.error(f"ASTAP executable not found at '{astap_exe_path}'.", exc_info=False)
+        if progress_callback: progress_callback("ASTAP Solve ERREUR: exécutable 'astap' non trouvé.", None, "ERROR")
+        logger.error("ASTAP executable not found in PATH", exc_info=False)
     except Exception as e_astap_glob:
         if progress_callback: progress_callback(f"ASTAP Solve ERREUR Inattendue: {e_astap_glob}", None, "ERROR")
         logger.error(f"Unexpected error during ASTAP execution for {img_basename_log}: {e_astap_glob}", exc_info=True)
     finally:
-        if progress_callback: progress_callback(f"  ASTAP Solve: Nettoyage post-exécution (sauf log si échec) pour '{img_basename_log}'...", None, "DEBUG_DETAIL")
-        for f_clean_post in files_to_cleanup_by_astap: # .wcs, .ini
-            if os.path.exists(f_clean_post):
-                try:
-                    if f_clean_post == expected_wcs_file_path and astap_success and not update_original_header_in_place:
-                        if progress_callback: progress_callback(f"    ASTAP Clean: Conservation du .wcs: {os.path.basename(f_clean_post)} (succès, pas de MàJ header en place)", None, "DEBUG_DETAIL")
-                        continue
-                    os.remove(f_clean_post)
-                    if progress_callback: progress_callback(f"    ASTAP Clean: Fichier '{os.path.basename(f_clean_post)}' supprimé.", None, "DEBUG_DETAIL")
-                except Exception as e_del_post:
-                    if progress_callback: progress_callback(f"    ASTAP Clean AVERT: Échec nettoyage '{os.path.basename(f_clean_post)}': {e_del_post}", None, "WARN")
-
-        if astap_success and os.path.exists(astap_log_file_path):
+        astap_log = os.path.join(current_image_dir, "astap.log")
+        if os.path.exists(astap_log):
             try:
-                os.remove(astap_log_file_path)
-                if progress_callback: progress_callback(f"    ASTAP Clean: Fichier log ASTAP '{os.path.basename(astap_log_file_path)}' supprimé (succès).", None, "DEBUG_DETAIL")
-            except Exception as e_del_log_succ:
-                if progress_callback: progress_callback(f"    ASTAP Clean AVERT: Échec nettoyage log ASTAP (succès) '{os.path.basename(astap_log_file_path)}': {e_del_log_succ}", None, "WARN")
-        elif not astap_success and os.path.exists(astap_log_file_path):
-             if progress_callback: progress_callback(f"    ASTAP Clean: CONSERVATION du log ASTAP '{os.path.basename(astap_log_file_path)}' (échec solve).", None, "INFO_DETAIL")
-
+                os.remove(astap_log)
+            except Exception:
+                pass
         gc.collect()
 
     if wcs_solved_obj:
