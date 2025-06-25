@@ -295,6 +295,8 @@
     "gui_memmap_enable": "Use disk memmap",
     "gui_memmap_dir": "Memmap Folder",
     "gui_memmap_cleanup": "Delete *.dat when finished",
-    "gui_auto_limit_frames": "Auto limit frames per master tile (system stability)"
+    "gui_auto_limit_frames": "Auto limit frames per master tile (system stability)",
+    "reject_winsor_info_channel_progress": "Winsorized Sigma Clip processing channel {channel}...",
+    "reject_winsor_info_mono_progress": "Winsorized Sigma Clip processing monochrome data..."
 
 }
