@@ -7,6 +7,7 @@ import time
 # import tempfile # Plus utilisé directement si on nettoie manuellement
 import traceback
 import subprocess
+from concurrent.futures import ProcessPoolExecutor
 # import shutil # Plus utilisé directement si on nettoie manuellement
 import gc
 import logging
@@ -255,27 +256,40 @@ def solve_with_astap(image_fits_path: str,
     astap_success = False
 
     try:
-        astap_process_result = subprocess.run(
-            cmd_list_astap,
-            capture_output=True, text=True,
-            timeout=timeout_sec, check=False,
-            cwd=current_image_dir,
-            errors='replace'
-        )
-        logger.debug(f"ASTAP return code: {astap_process_result.returncode}")
-        if astap_process_result.stdout: logger.debug(f"ASTAP stdout:\n{astap_process_result.stdout[:1000]}")
-        if astap_process_result.stderr: logger.warning(f"ASTAP stderr:\n{astap_process_result.stderr[:1000]}")
+        def _run_astap(cmd, to, cwd_path):
+            return subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=to,
+                check=False,
+                cwd=cwd_path,
+            )
 
-        if astap_process_result.returncode == 0:
+        with ProcessPoolExecutor(max_workers=1) as exec_pool:
+            future_proc = exec_pool.submit(_run_astap, cmd_list_astap, timeout_sec, current_image_dir)
+            astap_process_result = future_proc.result()
+        logger.debug(f"ASTAP return code: {astap_process_result.returncode}")
+        astap_return_code = astap_process_result.returncode
+        del astap_process_result
+        import gc as _gc
+        _gc.collect()
+        try:
+            from zemosaic_worker import _log_memory_usage as _lmu
+            _lmu(progress_callback, "Après GC post-ASTAP")
+        except Exception:
+            pass
+
+        if astap_return_code == 0:
             if os.path.exists(expected_wcs_file_path) and os.path.getsize(expected_wcs_file_path) > 0:
                 if progress_callback: progress_callback(f"  ASTAP Solve: Résolution OK (code 0). Fichier WCS '{os.path.basename(expected_wcs_file_path)}' trouvé.", None, "INFO_DETAIL")
                 img_height = original_fits_header.get('NAXIS2', 0)
                 img_width = original_fits_header.get('NAXIS1', 0)
                 if img_height == 0 or img_width == 0:
                     try:
-                        with fits.open(image_fits_path, memmap=False) as hdul_shape:
+                        with fits.open(image_fits_path) as hdul_shape:
                             shape_from_file = hdul_shape[0].shape
-                            if len(shape_from_file) >=2 :
+                            if len(shape_from_file) >= 2:
                                 img_height = shape_from_file[-2]
                                 img_width = shape_from_file[-1]
                     except Exception as e_shape_read:
@@ -298,10 +312,10 @@ def solve_with_astap(image_fits_path: str,
             else:
                 if progress_callback: progress_callback(f"  ASTAP Solve ERREUR: Code 0 mais fichier .wcs manquant/vide ('{os.path.basename(expected_wcs_file_path)}').", None, "ERROR")
         else:
-            error_msg = f"ASTAP Solve Échec (code {astap_process_result.returncode}) pour '{img_basename_log}'."
-            if astap_process_result.returncode == 1: error_msg += " (No solution found)."
-            elif astap_process_result.returncode == 2: error_msg += " (ASTAP FITS read error - vérifiez format/corruption)."
-            elif astap_process_result.returncode == 10: error_msg += " (ASTAP database not found - vérifiez -d)."
+            error_msg = f"ASTAP Solve Échec (code {astap_return_code}) pour '{img_basename_log}'."
+            if astap_return_code == 1: error_msg += " (No solution found)."
+            elif astap_return_code == 2: error_msg += " (ASTAP FITS read error - vérifiez format/corruption)."
+            elif astap_return_code == 10: error_msg += " (ASTAP database not found - vérifiez -d)."
             if progress_callback: progress_callback(f"  {error_msg}", None, "WARN")
             logger.warning(error_msg)
 
