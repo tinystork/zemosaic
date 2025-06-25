@@ -903,9 +903,15 @@ def _reject_outliers_kappa_sigma(stacked_array_NHDWC, sigma_low, sigma_high, pro
 
 
 def _apply_winsor_single(args):
-    """Helper for parallel winsorization."""
+    """Helper for parallel winsorization.
+
+    Ensures winsorization is applied along the image axis (axis=0) to
+    preserve per-pixel statistics. ``scipy.stats.mstats.winsorize`` flattens
+    the array when no axis is provided which would incorrectly clip signal
+    across the entire stack.
+    """
     arr, limits = args
-    return winsorize_func(arr, limits)
+    return np.asarray(winsorize_func(arr, limits, axis=0))
 
 
 def parallel_rejwinsor(channels, limits, max_workers, progress_callback=None):
