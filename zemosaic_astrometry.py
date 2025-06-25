@@ -322,6 +322,12 @@ def solve_with_astap(image_fits_path: str,
 
         if rc_astap == 0:
             log_path = os.path.join(current_image_dir, "astap.log")
+            if not os.path.exists(log_path):
+                for _ in range(20):
+                    if os.path.exists(log_path):
+                        break
+                    time.sleep(0.1)
+
             if os.path.exists(log_path):
                 try:
                     with open(log_path, "r") as f:
