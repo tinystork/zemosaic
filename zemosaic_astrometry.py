@@ -243,7 +243,9 @@ def solve_with_astap(image_fits_path: str,
     base_image_name_no_ext = os.path.splitext(os.path.basename(image_fits_path))[0]
     expected_wcs_file_path = os.path.join(current_image_dir, base_image_name_no_ext + ".wcs")
     expected_ini_file_path = os.path.join(current_image_dir, base_image_name_no_ext + ".ini")
-    astap_log_file_path = os.path.join(current_image_dir, "astap.log")
+    astap_log_file_path = os.path.join(
+        current_image_dir, f"{base_image_name_no_ext}_astap.log"
+    )
     files_to_cleanup_by_astap = [expected_wcs_file_path, expected_ini_file_path]
 
     for f_to_clean in files_to_cleanup_by_astap:
@@ -256,7 +258,7 @@ def solve_with_astap(image_fits_path: str,
         except Exception as e_del_log_pre:
             if progress_callback: progress_callback(f"  ASTAP Solve AVERT: Échec nettoyage pré-ASTAP log '{os.path.basename(astap_log_file_path)}': {e_del_log_pre}", None, "WARN")
 
-    cmd_list_astap = [astap_exe_path, "-f", image_fits_path, "-log"]
+    cmd_list_astap = [astap_exe_path, "-f", image_fits_path, "-r", astap_log_file_path]
     if astap_data_dir and os.path.isdir(astap_data_dir):
          cmd_list_astap.extend(["-d", astap_data_dir])
 
@@ -321,7 +323,9 @@ def solve_with_astap(image_fits_path: str,
         _log_memory_usage(progress_callback, "Après GC post-ASTAP")
 
         if rc_astap == 0:
-            log_path = os.path.join(current_image_dir, "astap.log")
+
+            log_path = astap_log_file_path
+
             max_wait = 5.0  # seconds
             wait_interval = 0.1
             waited = 0.0
@@ -334,7 +338,6 @@ def solve_with_astap(image_fits_path: str,
                         pass
                 time.sleep(wait_interval)
                 waited += wait_interval
-
 
             if os.path.exists(log_path):
                 try:
@@ -369,7 +372,11 @@ def solve_with_astap(image_fits_path: str,
 
                     astap_success = True
                     if progress_callback:
-                        progress_callback("  ASTAP Solve: WCS mis à jour depuis astap.log.", None, "INFO_DETAIL")
+                        progress_callback(
+                            "  ASTAP Solve: WCS mis à jour depuis log ASTAP.",
+                            None,
+                            "INFO_DETAIL",
+                        )
 
                     if ASTROPY_AVAILABLE_ASTROMETRY:
                         with warnings.catch_warnings():
@@ -377,11 +384,19 @@ def solve_with_astap(image_fits_path: str,
                             wcs_solved_obj = AstropyWCS(updated_header, naxis=2, relax=True)
                 except Exception as e_parse:
                     if progress_callback:
-                        progress_callback(f"  ASTAP Solve ERREUR: Échec parsing astap.log: {e_parse}", None, "ERROR")
-                    logger.error(f"Erreur parsing astap.log: {e_parse}", exc_info=True)
+                        progress_callback(
+                            f"  ASTAP Solve ERREUR: Échec parsing log ASTAP: {e_parse}",
+                            None,
+                            "ERROR",
+                        )
+                    logger.error(f"Erreur parsing ASTAP log: {e_parse}", exc_info=True)
             else:
                 if progress_callback:
-                    progress_callback("  ASTAP Solve ERREUR: astap.log absent.", None, "ERROR")
+                    progress_callback(
+                        "  ASTAP Solve ERREUR: log ASTAP absent.",
+                        None,
+                        "ERROR",
+                    )
         else:
             error_msg = f"ASTAP Solve Échec (code {rc_astap}) pour '{img_basename_log}'."
             if rc_astap == 1:
