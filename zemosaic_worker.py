@@ -924,20 +924,32 @@ def assemble_final_mosaic_incremental(
 
 
             if apply_crop and crop_percent > 1e-3:  # Appliquer si crop_percent significatif
-
+                cropped_data, cropped_wcs = None, None
                 if ZEMOSAIC_UTILS_AVAILABLE and hasattr(zemosaic_utils, 'crop_image_and_wcs'):
                     pcb_asm(f"  ASM_INC: Rognage {crop_percent:.1f}% pour tuile {os.path.basename(tile_path)}", lvl="DEBUG_DETAIL")
                     cropped_data, cropped_wcs = zemosaic_utils.crop_image_and_wcs(
-                        current_tile_data_hwc, wcs_to_use_for_reproject, crop_percent / 100.0, progress_callback
+                        current_tile_data_hwc,
+                        wcs_to_use_for_reproject,
+                        crop_percent / 100.0,
+                        progress_callback,
                     )
-                if cropped_data is not None and cropped_wcs is not None:
-                    data_to_use_for_reproject = cropped_data
-                    wcs_to_use_for_reproject = cropped_wcs
-                    pcb_asm(f"    Nouvelle shape après rognage: {data_to_use_for_reproject.shape[:2]}", lvl="DEBUG_VERY_DETAIL")
+                    if cropped_data is not None and cropped_wcs is not None:
+                        data_to_use_for_reproject = cropped_data
+                        wcs_to_use_for_reproject = cropped_wcs
+                        pcb_asm(
+                            f"    Nouvelle shape après rognage: {data_to_use_for_reproject.shape[:2]}",
+                            lvl="DEBUG_VERY_DETAIL",
+                        )
+                    else:
+                        pcb_asm(
+                            f"  ASM_INC: AVERT - Rognage a échoué pour tuile {os.path.basename(tile_path)}. Utilisation tuile non rognée.",
+                            lvl="WARN",
+                        )
                 else:
-                    pcb_asm(f"  ASM_INC: AVERT - Rognage a échoué pour tuile {os.path.basename(tile_path)}. Utilisation tuile non rognée.", lvl="WARN")
-            else:
-                pcb_asm(f"  ASM_INC: AVERT - Option rognage activée mais zemosaic_utils.crop_image_and_wcs non dispo.", lvl="WARN")
+                    pcb_asm(
+                        f"  ASM_INC: AVERT - Option rognage activée mais zemosaic_utils.crop_image_and_wcs non dispo.",
+                        lvl="WARN",
+                    )
             
             if data_to_use_for_reproject is None or wcs_to_use_for_reproject is None: 
                 pcb_asm(f"  ASM_INC: Données ou WCS pour reprojection sont None pour tuile {os.path.basename(tile_path)}, ignorée.", lvl="WARN")
@@ -1847,10 +1859,13 @@ def run_hierarchical_mosaic(
             pcb("run_error_phase5_inc_func_missing", prog=None, lvl="CRITICAL"); return
         pcb("run_info_phase5_started_incremental", prog=base_progress_phase5, lvl="INFO")
         final_mosaic_data_HWC, final_mosaic_coverage_HW = assemble_final_mosaic_incremental(
-            master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly, 
-            final_output_wcs=final_output_wcs, 
+            master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly,
+            final_output_wcs=final_output_wcs,
             final_output_shape_hw=final_output_shape_hw,
-            # --- FIN PASSAGE ---
+            progress_callback=progress_callback,
+            n_channels=3,
+            apply_crop=apply_master_tile_crop_config,
+            crop_percent=master_tile_crop_percent_config,
         )
         log_key_phase5_failed = "run_error_phase5_assembly_failed_incremental"
         log_key_phase5_finished = "run_info_phase5_finished_incremental"
