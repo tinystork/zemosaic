@@ -179,6 +179,25 @@ def _log_memory_usage(progress_callback: callable, context_message: str = ""): #
         _log_and_callback(f"Erreur lors du logging mémoire ({context_message}): {e_mem_log}", prog=None, lvl="WARN", callback=progress_callback)
 
 
+def _wait_for_memmap_files(prefixes, timeout=10.0):
+    """Poll until each prefix.dat and prefix.npy exist and are non-empty."""
+    import time, os
+    start = time.time()
+    while True:
+        all_ready = True
+        for prefix in prefixes:
+            dat_f = prefix + '.dat'
+            npy_f = prefix + '.npy'
+            if not (os.path.exists(dat_f) and os.path.getsize(dat_f) > 0 and os.path.exists(npy_f) and os.path.getsize(npy_f) > 0):
+                all_ready = False
+                break
+        if all_ready:
+            return
+        if time.time() - start > timeout:
+            raise RuntimeError(f"Memmap file not ready after {timeout}s: {prefix}")
+        time.sleep(0.1)
+
+
 
 
 # --- Fonctions Utilitaires Internes au Worker ---
@@ -932,7 +951,7 @@ def assemble_final_mosaic_incremental(
 
 
 
-def _reproject_and_coadd_channel_worker(channel_data_list, output_wcs_header, output_shape_hw, match_bg):
+def _reproject_and_coadd_channel_worker(channel_data_list, output_wcs_header, output_shape_hw, match_bg, mm_sum_prefix=None, mm_cov_prefix=None):
     """Worker function to run reproject_and_coadd in a separate process."""
     from astropy.wcs import WCS
     from reproject.mosaicking import reproject_and_coadd
@@ -944,6 +963,10 @@ def _reproject_and_coadd_channel_worker(channel_data_list, output_wcs_header, ou
     for arr, hdr in channel_data_list:
         prepared_inputs.append((arr, WCS(hdr)))
 
+
+
+    # The memmap prefixes are produced by other workers. Ensure they exist before
+    # reading if provided. Wait here until both files are fully written.
     stacked, coverage = reproject_and_coadd(
         prepared_inputs,
         output_projection=final_wcs,
@@ -952,10 +975,13 @@ def _reproject_and_coadd_channel_worker(channel_data_list, output_wcs_header, ou
         combine_function="mean",
         match_background=match_bg,
     )
+
+    if mm_sum_prefix and mm_cov_prefix:
+        _wait_for_memmap_files([mm_sum_prefix, mm_cov_prefix])
     return stacked.astype(np.float32), coverage.astype(np.float32)
 
 
-def assemble_final_mosaic_with_reproject_coadd(
+def assemble_final_mosaic_reproject_coadd(
     master_tile_fits_with_wcs_list: list,
     final_output_wcs: WCS, # Type hint pour WCS d'Astropy
     final_output_shape_hw: tuple,
@@ -978,7 +1004,7 @@ def assemble_final_mosaic_with_reproject_coadd(
     _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: \
         _log_and_callback(msg_key, prog, lvl, callback=progress_callback, **kwargs)
 
-    _log_memory_usage(progress_callback, "Début assemble_final_mosaic_with_reproject_coadd")
+    _log_memory_usage(progress_callback, "Début assemble_final_mosaic_reproject_coadd")
     _pcb(f"ASM_REPROJ_COADD: Options de rognage - Appliquer: {apply_crop}, Pourcentage: {crop_percent if apply_crop else 'N/A'}", lvl="DEBUG_DETAIL") # Log des options de rognage
 
     if use_memmap:
@@ -1189,7 +1215,9 @@ def assemble_final_mosaic_with_reproject_coadd(
                         final_mosaic_coverage_map = np.zeros(final_output_shape_hw, dtype=np.float32)
                     _log_memory_usage(progress_callback, f"Phase 5 (reproject_coadd) - Fin canal {i_channel+1} (données manquantes)")
                     continue
-                future = ex.submit(_reproject_and_coadd_channel_worker, ch_data, final_output_wcs_header, final_output_shape_hw, match_bg)
+                sum_prefix = os.path.join(memmap_dir, f"sum_ch{i_channel}") if memmap_dir else None
+                cov_prefix = os.path.join(memmap_dir, f"cov_ch{i_channel}") if memmap_dir else None
+                future = ex.submit(_reproject_and_coadd_channel_worker, ch_data, final_output_wcs_header, final_output_shape_hw, match_bg, sum_prefix, cov_prefix)
                 future_map[future] = i_channel
 
             for fut in as_completed(future_map):
@@ -1260,7 +1288,7 @@ def assemble_final_mosaic_with_reproject_coadd(
                 os.remove(fname)
             except OSError:
                 pass
-    _log_memory_usage(progress_callback, "Fin assemble_final_mosaic_with_reproject_coadd")
+    _log_memory_usage(progress_callback, "Fin assemble_final_mosaic_reproject_coadd")
     _pcb("assemble_info_finished_reproject_coadd", prog=None, lvl="INFO", shape=final_mosaic_data_HWC.shape if final_mosaic_data_HWC is not None else "N/A")
     return final_mosaic_data_HWC, final_mosaic_coverage_map
 
@@ -1569,24 +1597,28 @@ def run_hierarchical_mosaic(
     if num_seestar_stacks_to_process > 0:
         pcb(f"MASTER_TILE_COUNT_UPDATE:{tiles_processed_count_ph3}/{num_seestar_stacks_to_process}", prog=None, lvl="ETA_LEVEL")
     
-    with ThreadPoolExecutor(max_workers=actual_num_workers_ph3, thread_name_prefix="ZeMosaic_Ph3_") as executor_ph3:
-        future_to_group_index = { 
-            executor_ph3.submit(
-                create_master_tile,
-                sg_info_list, 
-                i_stk, # tile_id
-                temp_master_tile_storage_dir,
-                stack_norm_method, stack_weight_method, stack_reject_algo,
-                stack_kappa_low, stack_kappa_high, parsed_winsor_limits,
-                stack_final_combine,
-                apply_radial_weight_config, radial_feather_fraction_config,
-                radial_shape_power_config, min_radial_weight_floor_config, 
-                astap_exe_path, astap_data_dir_param, astap_search_radius_config, 
-                astap_downsample_config, astap_sensitivity_config, 180, # timeout ASTAP         
-                progress_callback
-            ): i_stk for i_stk, sg_info_list in enumerate(seestar_stack_groups) 
-        }
-        for future in as_completed(future_to_group_index):
+    executor_ph3 = ThreadPoolExecutor(max_workers=actual_num_workers_ph3, thread_name_prefix="ZeMosaic_Ph3_")
+    future_to_group_index = {
+        executor_ph3.submit(
+            create_master_tile,
+            sg_info_list,
+            i_stk,  # tile_id
+            temp_master_tile_storage_dir,
+            stack_norm_method, stack_weight_method, stack_reject_algo,
+            stack_kappa_low, stack_kappa_high, parsed_winsor_limits,
+            stack_final_combine,
+            apply_radial_weight_config, radial_feather_fraction_config,
+            radial_shape_power_config, min_radial_weight_floor_config,
+            astap_exe_path, astap_data_dir_param, astap_search_radius_config,
+            astap_downsample_config, astap_sensitivity_config, 180,  # timeout ASTAP
+            progress_callback
+        ): i_stk for i_stk, sg_info_list in enumerate(seestar_stack_groups)
+    }
+
+    # Wait for all master-tile tasks to finish before processing results
+    executor_ph3.shutdown(wait=True)
+
+    for future in as_completed(future_to_group_index):
             group_index_original = future_to_group_index[future]
             tiles_processed_count_ph3 += 1
             
@@ -1615,9 +1647,8 @@ def run_hierarchical_mosaic(
             time_per_percent_point_global_ph3 = (time.monotonic() - start_time_total_run) / max(1, current_progress_in_run_percent_ph3) if current_progress_in_run_percent_ph3 > 0 else (time.monotonic() - start_time_total_run)
             total_eta_sec_ph3 = eta_phase3_sec + (100 - current_progress_in_run_percent_ph3) * time_per_percent_point_global_ph3
             update_gui_eta(total_eta_sec_ph3)
-            
     master_tiles_results_list = [master_tiles_results_list_temp[i] for i in sorted(master_tiles_results_list_temp.keys())]
-    del master_tiles_results_list_temp; gc.collect() 
+    del master_tiles_results_list_temp; gc.collect()
     if not master_tiles_results_list: 
         pcb("run_error_phase3_no_master_tiles_created", prog=(base_progress_phase3 + PROGRESS_WEIGHT_PHASE3_MASTER_TILES), lvl="ERROR"); return
     
@@ -1628,6 +1659,13 @@ def run_hierarchical_mosaic(
     # Assurer que le compteur final est bien affiché (au cas où la dernière itération n'aurait pas été exactement le total)
     # Bien que la logique dans la boucle devrait déjà le faire. Peut être redondant mais ne fait pas de mal.
     pcb(f"MASTER_TILE_COUNT_UPDATE:{tiles_processed_count_ph3}/{num_seestar_stacks_to_process}", prog=None, lvl="ETA_LEVEL")
+
+    logger.info("All master tiles complete, entering Phase 5 (reproject & coadd)")
+    if progress_callback:
+        try:
+            progress_callback("run_info_phase3_finished", None, "INFO", num_master_tiles=len(master_tiles_results_list))
+        except Exception:
+            logger.warning("progress_callback failed for phase3 finished", exc_info=True)
 
 
 
@@ -1687,7 +1725,7 @@ def run_hierarchical_mosaic(
 
     # Vérification de la disponibilité des fonctions d'assemblage
     # (Tu pourrais les importer en haut du module pour éviter le check 'in globals()' à chaque fois)
-    reproject_coadd_available = ('assemble_final_mosaic_with_reproject_coadd' in globals() and callable(assemble_final_mosaic_with_reproject_coadd))
+    reproject_coadd_available = ('assemble_final_mosaic_reproject_coadd' in globals() and callable(assemble_final_mosaic_reproject_coadd))
     incremental_available = ('assemble_final_mosaic_incremental' in globals() and callable(assemble_final_mosaic_incremental))
 
     if USE_INCREMENTAL_ASSEMBLY:
@@ -1706,7 +1744,7 @@ def run_hierarchical_mosaic(
         if not reproject_coadd_available: 
             pcb("run_error_phase5_reproject_coadd_func_missing", prog=None, lvl="CRITICAL"); return
         pcb("run_info_phase5_started_reproject_coadd", prog=base_progress_phase5, lvl="INFO")
-        final_mosaic_data_HWC, final_mosaic_coverage_HW = assemble_final_mosaic_with_reproject_coadd(
+        final_mosaic_data_HWC, final_mosaic_coverage_HW = assemble_final_mosaic_reproject_coadd(
             master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly, 
             final_output_wcs=final_output_wcs, 
             final_output_shape_hw=final_output_shape_hw,
