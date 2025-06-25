@@ -195,6 +195,13 @@ A final mosaic of 20 000 × 20 000 px in RGB needs ≈ 4.8 GB
 Hot pixel masks detected during preprocessing are also written to the temporary
 cache directory to further reduce memory usage.
 
+### ASTAP `-update` for low-memory solving
+
+Passing the `-update` switch to ASTAP lets the solver write the WCS solution
+directly into each FITS header. ZeMosaic now exposes this option during the
+astrometric phase to minimise RAM usage when processing tens of thousands of
+frames.
+
 6 ▸ Quick CLI example
 ```bash
 run_zemosaic.py \
