@@ -322,11 +322,19 @@ def solve_with_astap(image_fits_path: str,
 
         if rc_astap == 0:
             log_path = os.path.join(current_image_dir, "astap.log")
-            if not os.path.exists(log_path):
-                for _ in range(20):
-                    if os.path.exists(log_path):
-                        break
-                    time.sleep(0.1)
+            max_wait = 5.0  # seconds
+            wait_interval = 0.1
+            waited = 0.0
+            while waited < max_wait:
+                if os.path.exists(log_path):
+                    try:
+                        if os.path.getsize(log_path) > 0:
+                            break
+                    except OSError:
+                        pass
+                time.sleep(wait_interval)
+                waited += wait_interval
+
 
             if os.path.exists(log_path):
                 try:
