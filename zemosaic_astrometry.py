@@ -323,7 +323,9 @@ def solve_with_astap(image_fits_path: str,
         _log_memory_usage(progress_callback, "Après GC post-ASTAP")
 
         if rc_astap == 0:
+
             log_path = astap_log_file_path
+
             max_wait = 5.0  # seconds
             wait_interval = 0.1
             waited = 0.0
