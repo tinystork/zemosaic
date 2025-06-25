@@ -537,10 +537,11 @@ def create_master_tile(
     # Paramètres ASTAP (pourraient être enlevés si plus du tout utilisés ici)
     astap_exe_path_global: str, 
     astap_data_dir_global: str, 
-    astap_search_radius_global: float, 
-    astap_downsample_global: int, 
-    astap_sensitivity_global: int, 
-    astap_timeout_seconds_global: int, 
+    astap_search_radius_global: float,
+    astap_downsample_global: int,
+    astap_sensitivity_global: int,
+    astap_timeout_seconds_global: int,
+    winsor_pool_workers: int,
     progress_callback: callable
 ):
     """
@@ -664,6 +665,7 @@ def create_master_tile(
         apply_radial_weight=apply_radial_weight,
         radial_feather_fraction=radial_feather_fraction,
         radial_shape_power=radial_shape_power,
+        winsor_max_workers=winsor_pool_workers,
         # --- FIN TRANSMISSION ---
         progress_callback=progress_callback
     )
@@ -1538,6 +1540,7 @@ def run_hierarchical_mosaic(
     pcb("run_info_phase2_started", prog=base_progress_phase2, lvl="INFO")
     seestar_stack_groups = cluster_seestar_stacks(all_raw_files_processed_info, SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG, progress_callback)
     if not seestar_stack_groups: pcb("run_error_phase2_no_groups", prog=(base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING), lvl="ERROR"); return
+    winsor_worker_limit = os.cpu_count() or 1
     if auto_limit_frames_per_master_tile_config:
         try:
             sample_path = seestar_stack_groups[0][0].get('path_preprocessed_cache')
@@ -1553,6 +1556,7 @@ def run_hierarchical_mosaic(
                     // (bytes_per_frame * 6)
                 ),
             )
+            winsor_worker_limit = limit
             new_groups = []
             for g in seestar_stack_groups:
                 for i in range(0, len(g), limit):
@@ -1614,6 +1618,7 @@ def run_hierarchical_mosaic(
             radial_shape_power_config, min_radial_weight_floor_config,
             astap_exe_path, astap_data_dir_param, astap_search_radius_config,
             astap_downsample_config, astap_sensitivity_config, 180,  # timeout ASTAP
+            winsor_worker_limit,
             progress_callback
         ): i_stk for i_stk, sg_info_list in enumerate(seestar_stack_groups)
     }
