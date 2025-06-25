@@ -30,8 +30,8 @@ DEFAULT_CONFIG = {
     "coadd_cleanup_memmap": True,
     "assembly_process_workers": 0,
     "auto_limit_frames_per_master_tile": True,
-    "auto_limit_memory_fraction": 0.2,
-    "winsor_worker_limit": 6,
+    "auto_limit_memory_fraction": 0.1,
+    "winsor_worker_limit": 4,
     # --- CLES POUR LE ROGNAGE DES MASTER TUILES ---
     "apply_master_tile_crop": True,       # Désactivé par défaut
     "master_tile_crop_percent": 18.0      # Pourcentage par côté si activé (ex: 10%)
