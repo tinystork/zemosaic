@@ -572,7 +572,7 @@ class ZeMosaicGUI:
         
 
         # --- Launch Button, Progress Bar, Log Frame ---
-        self.launch_button = ttk.Button(self.scrollable_content_frame, text="", command=self._start_processing, style="Accent.TButton")
+        self.launch_button = ttk.Button(self.scrollable_content_frame, text="", command=self._on_start, style="Accent.TButton")
         # ... (contenu launch_button, progress_info_frame, log_frame) ...
         self.launch_button.pack(pady=15, ipady=5); self.translatable_widgets["launch_button"] = self.launch_button
         if not ZEMOSAIC_WORKER_AVAILABLE: self.launch_button.config(state=tk.DISABLED)
@@ -583,6 +583,21 @@ class ZeMosaicGUI:
         progress_info_frame.pack(fill=tk.X, pady=(5,0))
         self.progress_bar_widget = ttk.Progressbar(progress_info_frame, orient="horizontal", length=100, mode="determinate", variable=self.progress_bar_var)
         self.progress_bar_widget.pack(fill=tk.X, expand=True, padx=5, pady=(0,3))
+
+        control_frame = ttk.Frame(progress_info_frame)
+        control_frame.pack(pady=(10, 5))
+
+        self.start_button = ttk.Button(control_frame, text=self._tr("launch_button"), command=self._on_start)
+        self.start_button.pack(side=tk.LEFT, padx=5)
+
+        self.pause_button = ttk.Button(control_frame, text=self._tr("pause_button"), command=self._on_pause, state=tk.DISABLED)
+        self.pause_button.pack(side=tk.LEFT, padx=5)
+
+        self.resume_button = ttk.Button(control_frame, text=self._tr("resume_button"), command=self._on_resume, state=tk.DISABLED)
+        self.resume_button.pack(side=tk.LEFT, padx=5)
+
+        self.stop_button = ttk.Button(control_frame, text=self._tr("stop_button"), command=self._on_stop, state=tk.DISABLED)
+        self.stop_button.pack(side=tk.LEFT, padx=5)
         time_display_subframe = ttk.Frame(progress_info_frame)
         time_display_subframe.pack(fill=tk.X, padx=5)
         ttk.Label(time_display_subframe, text="").pack(side=tk.LEFT, padx=(0,2)); self.translatable_widgets["eta_text_label"] = time_display_subframe.pack_slaves()[0]
@@ -1010,7 +1025,33 @@ class ZeMosaicGUI:
             except tk.TclError: pass
         self._chrono_after_id = None
         print("DEBUG GUI: Chronomètre arrêté.")
-        
+
+
+    def _on_start(self):
+        print("DEBUG GUI: Start clicked")
+        if hasattr(self, 'start_button'): self.start_button.config(state=tk.DISABLED)
+        if hasattr(self, 'pause_button'): self.pause_button.config(state=tk.NORMAL)
+        if hasattr(self, 'resume_button'): self.resume_button.config(state=tk.DISABLED)
+        if hasattr(self, 'stop_button'): self.stop_button.config(state=tk.NORMAL)
+        self._start_processing()
+
+    def _on_pause(self):
+        print("DEBUG GUI: Pause clicked")
+        if hasattr(self, 'pause_button'): self.pause_button.config(state=tk.DISABLED)
+        if hasattr(self, 'resume_button'): self.resume_button.config(state=tk.NORMAL)
+
+    def _on_resume(self):
+        print("DEBUG GUI: Resume clicked")
+        if hasattr(self, 'resume_button'): self.resume_button.config(state=tk.DISABLED)
+        if hasattr(self, 'pause_button'): self.pause_button.config(state=tk.NORMAL)
+
+    def _on_stop(self):
+        print("DEBUG GUI: Stop clicked")
+        if hasattr(self, 'start_button'): self.start_button.config(state=tk.NORMAL)
+        if hasattr(self, 'pause_button'): self.pause_button.config(state=tk.DISABLED)
+        if hasattr(self, 'resume_button'): self.resume_button.config(state=tk.DISABLED)
+        if hasattr(self, 'stop_button'): self.stop_button.config(state=tk.DISABLED)
+
 
 
 
