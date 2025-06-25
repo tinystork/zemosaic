@@ -869,8 +869,21 @@ def assemble_final_mosaic_incremental(
         pcb_asm("assemble_error_allocating_accumulators", prog=None, lvl="ERROR", error=str(e_acc)); logger.error("Erreur allocation accumulateurs (incrémental).", exc_info=True); return None, None
     pcb_asm("assemble_info_accumulators_allocated", prog=None, lvl="DEBUG_DETAIL")
 
-    for tile_idx, tile_path in enumerate(master_tile_fits_with_wcs_list, 1):
-        pcb_asm("assemble_info_processing_tile", prog=None, lvl="INFO_DETAIL", tile_num=tile_idx, total_tiles=num_master_tiles, filename=os.path.basename(tile_path))
+    for tile_idx, tile_entry in enumerate(master_tile_fits_with_wcs_list, 1):
+        if isinstance(tile_entry, (list, tuple)) and len(tile_entry) == 2:
+            tile_path, mt_wcs_obj_original = tile_entry
+        else:
+            tile_path = tile_entry
+            mt_wcs_obj_original = None
+
+        pcb_asm(
+            "assemble_info_processing_tile",
+            prog=None,
+            lvl="INFO_DETAIL",
+            tile_num=tile_idx,
+            total_tiles=num_master_tiles,
+            filename=os.path.basename(tile_path),
+        )
         
         # Initialisation des variables pour ce scope de boucle
         current_tile_data_hwc = None
@@ -1075,9 +1088,19 @@ def assemble_final_mosaic_reproject_coadd(
     # Ces données et WCS seront potentiellement ceux des images rognées.
     input_data_all_tiles_HWC_processed = [] 
     
-    for i_tile_load, mt_path in enumerate(master_tile_fits_with_wcs_list):
+    for i_tile_load, tile_entry in enumerate(master_tile_fits_with_wcs_list):
+        if isinstance(tile_entry, (list, tuple)) and len(tile_entry) == 2:
+            mt_path, mt_wcs_obj_original = tile_entry
+        else:
+            mt_path = tile_entry
+            mt_wcs_obj_original = None
+
         try:
-            _pcb(f"  ASM_REPROJ_COADD: Lecture et prétraitement (rognage si actif) Master Tile {i_tile_load+1}/{num_master_tiles} '{os.path.basename(mt_path)}'", prog=None, lvl="DEBUG_VERY_DETAIL")
+            _pcb(
+                f"  ASM_REPROJ_COADD: Lecture et prétraitement (rognage si actif) Master Tile {i_tile_load+1}/{num_master_tiles} '{os.path.basename(mt_path)}'",
+                prog=None,
+                lvl="DEBUG_VERY_DETAIL",
+            )
             
             with fits.open(mt_path, memmap=True, do_not_scale_image_data=True) as hdul:
                 if not hdul or hdul[0].data is None:
