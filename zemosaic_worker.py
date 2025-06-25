@@ -599,6 +599,11 @@ def create_master_tile(
     
     ref_info_for_tile = seestar_stack_group_info[reference_image_index_in_group]
     wcs_for_master_tile = ref_info_for_tile.get('wcs')
+    if wcs_for_master_tile is None:
+        try:
+            wcs_for_master_tile = _load_wcs_from_fits(ref_info_for_tile.get('path_raw'))
+        except Exception:
+            wcs_for_master_tile = None
     # Le header est un dict venant du cache, il faut le convertir en objet fits.Header si besoin
     header_dict_for_master_tile_base = ref_info_for_tile.get('header') 
 
@@ -795,7 +800,7 @@ def create_master_tile(
         )
         pcb_tile(f"{func_id_log_base}_info_saved", prog=None, lvl="INFO_DETAIL", tile_id=tile_id, format_type='float32', filename=os.path.basename(temp_fits_filepath))
         # pcb_tile(f"{func_id_log_base}_info_saving_finished", prog=None, lvl="DEBUG_DETAIL", tile_id=tile_id)
-        return temp_fits_filepath, wcs_for_master_tile
+        return temp_fits_filepath
         
     except Exception as e_save_mt:
         pcb_tile(f"{func_id_log_base}_error_saving", prog=None, lvl="ERROR", tile_id=tile_id, error=str(e_save_mt))
@@ -857,7 +862,7 @@ def assemble_final_mosaic_incremental(
         pcb_asm("assemble_error_allocating_accumulators", prog=None, lvl="ERROR", error=str(e_acc)); logger.error("Erreur allocation accumulateurs (incrémental).", exc_info=True); return None, None
     pcb_asm("assemble_info_accumulators_allocated", prog=None, lvl="DEBUG_DETAIL")
 
-    for tile_idx, (tile_path, mt_wcs_obj_original) in enumerate(master_tile_fits_with_wcs_list, 1):
+    for tile_idx, tile_path in enumerate(master_tile_fits_with_wcs_list, 1):
         pcb_asm("assemble_info_processing_tile", prog=None, lvl="INFO_DETAIL", tile_num=tile_idx, total_tiles=num_master_tiles, filename=os.path.basename(tile_path))
         
         # Initialisation des variables pour ce scope de boucle
@@ -883,6 +888,7 @@ def assemble_final_mosaic_incremental(
             del data_tile_cxhxw; gc.collect()
 
             data_to_use_for_reproject = current_tile_data_hwc
+
             wcs_to_use_for_reproject = mt_wcs_obj_original
             if wcs_to_use_for_reproject is None:
                 try:
@@ -891,20 +897,22 @@ def assemble_final_mosaic_incremental(
                     pcb_asm("assemble_warn_tile_wcs_load_failed_inc", prog=None, lvl="WARN", filename=os.path.basename(tile_path))
                     continue
 
+
             if apply_crop and crop_percent > 1e-3:  # Appliquer si crop_percent significatif
+
                 if ZEMOSAIC_UTILS_AVAILABLE and hasattr(zemosaic_utils, 'crop_image_and_wcs'):
                     pcb_asm(f"  ASM_INC: Rognage {crop_percent:.1f}% pour tuile {os.path.basename(tile_path)}", lvl="DEBUG_DETAIL")
                     cropped_data, cropped_wcs = zemosaic_utils.crop_image_and_wcs(
-                        current_tile_data_hwc, mt_wcs_obj_original, crop_percent / 100.0, progress_callback
+                        current_tile_data_hwc, wcs_to_use_for_reproject, crop_percent / 100.0, progress_callback
                     )
-                    if cropped_data is not None and cropped_wcs is not None:
-                        data_to_use_for_reproject = cropped_data
-                        wcs_to_use_for_reproject = cropped_wcs
-                        pcb_asm(f"    Nouvelle shape après rognage: {data_to_use_for_reproject.shape[:2]}", lvl="DEBUG_VERY_DETAIL")
-                    else:
-                        pcb_asm(f"  ASM_INC: AVERT - Rognage a échoué pour tuile {os.path.basename(tile_path)}. Utilisation tuile non rognée.", lvl="WARN")
+                if cropped_data is not None and cropped_wcs is not None:
+                    data_to_use_for_reproject = cropped_data
+                    wcs_to_use_for_reproject = cropped_wcs
+                    pcb_asm(f"    Nouvelle shape après rognage: {data_to_use_for_reproject.shape[:2]}", lvl="DEBUG_VERY_DETAIL")
                 else:
-                    pcb_asm(f"  ASM_INC: AVERT - Option rognage activée mais zemosaic_utils.crop_image_and_wcs non dispo.", lvl="WARN")
+                    pcb_asm(f"  ASM_INC: AVERT - Rognage a échoué pour tuile {os.path.basename(tile_path)}. Utilisation tuile non rognée.", lvl="WARN")
+            else:
+                pcb_asm(f"  ASM_INC: AVERT - Option rognage activée mais zemosaic_utils.crop_image_and_wcs non dispo.", lvl="WARN")
             
             if data_to_use_for_reproject is None or wcs_to_use_for_reproject is None: 
                 pcb_asm(f"  ASM_INC: Données ou WCS pour reprojection sont None pour tuile {os.path.basename(tile_path)}, ignorée.", lvl="WARN")
@@ -1060,7 +1068,7 @@ def assemble_final_mosaic_reproject_coadd(
     # Ces données et WCS seront potentiellement ceux des images rognées.
     input_data_all_tiles_HWC_processed = [] 
     
-    for i_tile_load, (mt_path, mt_wcs_obj_original) in enumerate(master_tile_fits_with_wcs_list):
+    for i_tile_load, mt_path in enumerate(master_tile_fits_with_wcs_list):
         try:
             _pcb(f"  ASM_REPROJ_COADD: Lecture et prétraitement (rognage si actif) Master Tile {i_tile_load+1}/{num_master_tiles} '{os.path.basename(mt_path)}'", prog=None, lvl="DEBUG_VERY_DETAIL")
             
@@ -1083,6 +1091,7 @@ def assemble_final_mosaic_reproject_coadd(
             
             # --- APPLICATION DU ROGNAGE SI ACTIVÉ ---
             data_to_use_for_assembly = current_tile_data_hwc
+
             wcs_to_use_for_assembly = mt_wcs_obj_original
             if wcs_to_use_for_assembly is None:
                 try:
@@ -1091,12 +1100,15 @@ def assemble_final_mosaic_reproject_coadd(
                     _pcb("assemble_warn_tile_wcs_load_failed_reproject_coadd", prog=None, lvl="WARN", filename=os.path.basename(mt_path))
                     continue
 
+
             if apply_crop and crop_percent > 1e-3: # Appliquer si crop_percent > 0 (avec une petite tolérance)
                 if ZEMOSAIC_UTILS_AVAILABLE and hasattr(zemosaic_utils, 'crop_image_and_wcs'):
                     _pcb(f"    ASM_REPROJ_COADD: Rognage {crop_percent:.1f}% pour tuile {os.path.basename(mt_path)}", lvl="DEBUG_DETAIL")
                     cropped_data, cropped_wcs = zemosaic_utils.crop_image_and_wcs(
                         current_tile_data_hwc,
+
                         mt_wcs_obj_original,
+
                         crop_percent / 100.0, # La fonction attend une fraction (0.0 à 1.0)
                         progress_callback=progress_callback
                     )
@@ -1521,8 +1533,8 @@ def run_hierarchical_mosaic(
                             'path_raw': file_path_original,
                             'path_preprocessed_cache': cached_image_path,
                             'path_hotpix_mask': hp_mask_path,
-                            'wcs': wcs_obj_solved,
-                            'header': header_obj_updated
+                            'header': header_obj_updated,
+                            'shape_hw': img_data_adu.shape[:2]
                         }
                         # pcb(f"Phase 1: Fichier '{os.path.basename(file_path_original)}' traité et mis en cache.", prog=prog_step_phase1, lvl="DEBUG_VERY_DETAIL") # Optionnel
                     except Exception as e_save_npy:
@@ -1679,9 +1691,11 @@ def run_hierarchical_mosaic(
             
             prog_step_phase3 = base_progress_phase3 + int(PROGRESS_WEIGHT_PHASE3_MASTER_TILES * (tiles_processed_count_ph3 / max(1, num_seestar_stacks_to_process)))
             try:
+
                 mt_result_path, mt_result_wcs = future.result()
                 if mt_result_path and mt_result_wcs:
                     master_tiles_results_list_temp[group_index_original] = (mt_result_path, mt_result_wcs)
+
                 else:
                     pcb("run_warn_phase3_master_tile_creation_failed_thread", prog=prog_step_phase3, lvl="WARN", stack_num=group_index_original + 1)
             except Exception as exc_thread_ph3: 
@@ -1731,6 +1745,7 @@ def run_hierarchical_mosaic(
     pcb("run_info_phase4_started", prog=base_progress_phase4, lvl="INFO")
     wcs_list_for_final_grid = []
     shapes_list_for_final_grid_hw = []
+
     for mt_path_iter, mt_wcs_iter in master_tiles_results_list:
         if not (mt_path_iter and os.path.exists(mt_path_iter)):
             pcb("run_warn_phase4_invalid_master_tile_for_grid", prog=None, lvl="WARN", path=os.path.basename(mt_path_iter if mt_path_iter else "N/A_path"));
@@ -1741,6 +1756,7 @@ def run_hierarchical_mosaic(
             except Exception:
                 pcb("run_warn_phase4_invalid_master_tile_for_grid", prog=None, lvl="WARN", path=os.path.basename(mt_path_iter))
                 continue
+
         try:
             h_mt_loc,w_mt_loc=0,0
             if mt_wcs_iter.pixel_shape and mt_wcs_iter.pixel_shape[0] > 0 and mt_wcs_iter.pixel_shape[1] > 0 : h_mt_loc,w_mt_loc=mt_wcs_iter.pixel_shape[1],mt_wcs_iter.pixel_shape[0] 
@@ -1770,9 +1786,11 @@ def run_hierarchical_mosaic(
     _log_memory_usage(progress_callback, f"Début Phase 5 (Méthode: {final_assembly_method_config}, Rognage MT Appliqué: {apply_master_tile_crop_config}, %Rognage: {master_tile_crop_percent_config if apply_master_tile_crop_config else 'N/A'})") # Log mis à jour
     
     valid_master_tiles_for_assembly = []
+
     for mt_p, mt_w in master_tiles_results_list:
         if mt_p and os.path.exists(mt_p) and mt_w and mt_w.is_celestial:
             valid_master_tiles_for_assembly.append((mt_p, mt_w))
+
         else:
             pcb("run_warn_phase5_invalid_tile_skipped_for_assembly", prog=None, lvl="WARN", filename=os.path.basename(mt_p if mt_p else 'N/A')) # Clé de log plus spécifique
             
