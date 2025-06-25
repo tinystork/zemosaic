@@ -965,7 +965,11 @@ def _reject_outliers_winsorized_sigma_clip(
                 
                 # 1. Winsorization du canal actuel
                 # winsorize_func opère sur un axe. axis=0 pour winsoriser le long des N images.
-                winsorized_channel_data = winsorize_func(original_channel_data_NHW, limits=winsor_limits_tuple, axis=0)
+                winsorized_channel_data = np.asarray(
+                    winsorize_func(
+                        original_channel_data_NHW, limits=winsor_limits_tuple, axis=0
+                    )
+                )
                 # _pcb(f"    Canal {c_idx}: Winsorization terminée.", lvl="DEBUG_VERY_DETAIL")
 
                 # 2. Calcul des statistiques sur les données winsorisées
@@ -1003,7 +1007,9 @@ def _reject_outliers_winsorized_sigma_clip(
             _pcb("RejWinsor: Traitement image monochrome.", lvl="DEBUG_DETAIL")
             original_data_NHW = stacked_array_NHDWC.astype(np.float32, copy=False)
 
-            winsorized_data = winsorize_func(original_data_NHW, limits=winsor_limits_tuple, axis=0)
+            winsorized_data = np.asarray(
+                winsorize_func(original_data_NHW, limits=winsor_limits_tuple, axis=0)
+            )
             # _pcb("  Monochrome: Winsorization terminée.", lvl="DEBUG_VERY_DETAIL")
             
             try:
