@@ -11,6 +11,7 @@ import psutil
 import tempfile
 import glob
 import uuid
+import warnings
 
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 # BrokenProcessPool moved under concurrent.futures.process in modern Python
@@ -305,14 +306,30 @@ def _calculate_final_mosaic_grid(panel_wcs_list: list, panel_shapes_hw_list: lis
         return None, None
 
 
+def _load_wcs_from_fits(file_path: str) -> WCS:
+    """Lit l'en-tête d'un FITS et retourne un objet WCS léger."""
+    if not (file_path and os.path.isfile(file_path)):
+        raise FileNotFoundError(f"FITS not found: {file_path}")
+    hdr = fits.getheader(file_path, ext=0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return WCS(hdr, naxis=2, relax=True)
+
+
 def cluster_seestar_stacks(all_raw_files_with_info: list, stack_threshold_deg: float, progress_callback: callable):
     if not (ASTROPY_AVAILABLE and SkyCoord and u): _log_and_callback("clusterstacks_error_astropy_unavailable", level="ERROR", callback=progress_callback); return []
     if not all_raw_files_with_info: _log_and_callback("clusterstacks_warn_no_raw_info", level="WARN", callback=progress_callback); return []
     _log_and_callback("clusterstacks_info_start", num_files=len(all_raw_files_with_info), threshold=stack_threshold_deg, level="INFO", callback=progress_callback)
     panel_centers_sky = []; panel_data_for_clustering = []
     for i, info in enumerate(all_raw_files_with_info):
-        wcs_obj = info['wcs']
-        if not (wcs_obj and wcs_obj.is_celestial): continue
+        wcs_obj = info.get('wcs')
+        if wcs_obj is None:
+            try:
+                wcs_obj = _load_wcs_from_fits(info.get('path_raw'))
+            except Exception:
+                continue
+        if not (wcs_obj and wcs_obj.is_celestial):
+            continue
         try:
             if wcs_obj.pixel_shape: center_world = wcs_obj.pixel_to_world(wcs_obj.pixel_shape[0]/2.0, wcs_obj.pixel_shape[1]/2.0)
             elif hasattr(wcs_obj.wcs, 'crval'): center_world = SkyCoord(ra=wcs_obj.wcs.crval[0]*u.deg, dec=wcs_obj.wcs.crval[1]*u.deg, frame='icrs')
@@ -471,6 +488,10 @@ def get_wcs_and_pretreat_raw_file(file_path: str, astap_exe_path: str, astap_dat
         
         if wcs_brute and wcs_brute.is_celestial: # Re-vérifier après la tentative de set_pixel_shape
             _pcb_local("getwcs_info_pretreatment_wcs_ok", lvl="DEBUG", filename=filename)
+            try:
+                zemosaic_astrometry._write_wcs_to_fits(file_path, wcs_brute, progress_callback)
+            except Exception:
+                pass
             return img_data_processed_adu, wcs_brute, header_orig, hp_mask_path  # header_orig peut avoir été mis à jour par ASTAP
         # else: tombe dans le bloc de déplacement ci-dessous
 
@@ -846,11 +867,11 @@ def assemble_final_mosaic_incremental(
         tile_processed_successfully_this_iteration = False
 
         try:
-            with fits.open(tile_path, memmap=False, do_not_scale_image_data=True) as hdul: # memmap=False est plus sûr pour éviter problèmes de fichiers ouverts
-                if not hdul or not hasattr(hdul[0], 'data') or hdul[0].data is None: 
+            with fits.open(tile_path, memmap=False, do_not_scale_image_data=True) as hdul:  # memmap=False est plus sûr pour éviter problèmes de fichiers ouverts
+                if not hdul or not hasattr(hdul[0], 'data') or hdul[0].data is None:
                     pcb_asm("assemble_warn_tile_empty_or_no_data_inc", prog=None, lvl="WARN", filename=os.path.basename(tile_path))
-                    continue 
-                
+                    continue
+
                 data_tile_cxhxw = hdul[0].data.astype(np.float32)
                 if data_tile_cxhxw.ndim == 3 and data_tile_cxhxw.shape[0] == n_channels:
                     current_tile_data_hwc = np.moveaxis(data_tile_cxhxw, 0, -1)
@@ -863,8 +884,14 @@ def assemble_final_mosaic_incremental(
 
             data_to_use_for_reproject = current_tile_data_hwc
             wcs_to_use_for_reproject = mt_wcs_obj_original
+            if wcs_to_use_for_reproject is None:
+                try:
+                    wcs_to_use_for_reproject = _load_wcs_from_fits(tile_path)
+                except Exception:
+                    pcb_asm("assemble_warn_tile_wcs_load_failed_inc", prog=None, lvl="WARN", filename=os.path.basename(tile_path))
+                    continue
 
-            if apply_crop and crop_percent > 1e-3: # Appliquer si crop_percent significatif
+            if apply_crop and crop_percent > 1e-3:  # Appliquer si crop_percent significatif
                 if ZEMOSAIC_UTILS_AVAILABLE and hasattr(zemosaic_utils, 'crop_image_and_wcs'):
                     pcb_asm(f"  ASM_INC: Rognage {crop_percent:.1f}% pour tuile {os.path.basename(tile_path)}", lvl="DEBUG_DETAIL")
                     cropped_data, cropped_wcs = zemosaic_utils.crop_image_and_wcs(
@@ -1057,13 +1084,19 @@ def assemble_final_mosaic_reproject_coadd(
             # --- APPLICATION DU ROGNAGE SI ACTIVÉ ---
             data_to_use_for_assembly = current_tile_data_hwc
             wcs_to_use_for_assembly = mt_wcs_obj_original
+            if wcs_to_use_for_assembly is None:
+                try:
+                    wcs_to_use_for_assembly = _load_wcs_from_fits(mt_path)
+                except Exception:
+                    _pcb("assemble_warn_tile_wcs_load_failed_reproject_coadd", prog=None, lvl="WARN", filename=os.path.basename(mt_path))
+                    continue
 
             if apply_crop and crop_percent > 1e-3: # Appliquer si crop_percent > 0 (avec une petite tolérance)
                 if ZEMOSAIC_UTILS_AVAILABLE and hasattr(zemosaic_utils, 'crop_image_and_wcs'):
                     _pcb(f"    ASM_REPROJ_COADD: Rognage {crop_percent:.1f}% pour tuile {os.path.basename(mt_path)}", lvl="DEBUG_DETAIL")
                     cropped_data, cropped_wcs = zemosaic_utils.crop_image_and_wcs(
-                        current_tile_data_hwc, 
-                        mt_wcs_obj_original, 
+                        current_tile_data_hwc,
+                        mt_wcs_obj_original,
                         crop_percent / 100.0, # La fonction attend une fraction (0.0 à 1.0)
                         progress_callback=progress_callback
                     )
@@ -1483,9 +1516,9 @@ def run_hierarchical_mosaic(
                     cached_image_path = os.path.join(temp_image_cache_dir, cache_file_basename)
                     try:
                         np.save(cached_image_path, img_data_adu)
-                        # Stocker les informations pour les phases suivantes
+                        # Stocker les informations pour les phases suivantes (WCS écrit dans le FITS)
                         all_raw_files_processed_info_dict[file_path_original] = {
-                            'path_raw': file_path_original, 
+                            'path_raw': file_path_original,
                             'path_preprocessed_cache': cached_image_path,
                             'path_hotpix_mask': hp_mask_path,
                             'wcs': wcs_obj_solved,
@@ -1557,11 +1590,12 @@ def run_hierarchical_mosaic(
             sample_shape = sample_arr.shape
             sample_arr = None
             available_bytes = psutil.virtual_memory().available
+            expected_workers = max(1, int(effective_base_workers * ALIGNMENT_PHASE_WORKER_RATIO))
             limit = max(
                 1,
                 int(
                     (available_bytes * auto_limit_memory_fraction_config)
-                    // (bytes_per_frame * 6)
+                    // (expected_workers * bytes_per_frame * 6)
                 ),
             )
             winsor_worker_limit = min(winsor_worker_limit, limit)
@@ -1646,9 +1680,9 @@ def run_hierarchical_mosaic(
             prog_step_phase3 = base_progress_phase3 + int(PROGRESS_WEIGHT_PHASE3_MASTER_TILES * (tiles_processed_count_ph3 / max(1, num_seestar_stacks_to_process)))
             try:
                 mt_result_path, mt_result_wcs = future.result()
-                if mt_result_path and mt_result_wcs: 
+                if mt_result_path and mt_result_wcs:
                     master_tiles_results_list_temp[group_index_original] = (mt_result_path, mt_result_wcs)
-                else: 
+                else:
                     pcb("run_warn_phase3_master_tile_creation_failed_thread", prog=prog_step_phase3, lvl="WARN", stack_num=group_index_original + 1)
             except Exception as exc_thread_ph3: 
                 pcb("run_error_phase3_thread_exception", prog=prog_step_phase3, lvl="ERROR", stack_num=group_index_original + 1, error=str(exc_thread_ph3))
@@ -1695,10 +1729,18 @@ def run_hierarchical_mosaic(
     base_progress_phase4 = current_global_progress
     _log_memory_usage(progress_callback, "Début Phase 4 (Calcul Grille)")
     pcb("run_info_phase4_started", prog=base_progress_phase4, lvl="INFO")
-    wcs_list_for_final_grid = []; shapes_list_for_final_grid_hw = []
-    for mt_path_iter,mt_wcs_iter in master_tiles_results_list:
-        # ... (logique de récupération shape, inchangée) ...
-        if not (mt_path_iter and os.path.exists(mt_path_iter) and mt_wcs_iter and mt_wcs_iter.is_celestial): pcb("run_warn_phase4_invalid_master_tile_for_grid", prog=None, lvl="WARN", path=os.path.basename(mt_path_iter if mt_path_iter else "N/A_path")); continue
+    wcs_list_for_final_grid = []
+    shapes_list_for_final_grid_hw = []
+    for mt_path_iter, mt_wcs_iter in master_tiles_results_list:
+        if not (mt_path_iter and os.path.exists(mt_path_iter)):
+            pcb("run_warn_phase4_invalid_master_tile_for_grid", prog=None, lvl="WARN", path=os.path.basename(mt_path_iter if mt_path_iter else "N/A_path"));
+            continue
+        if mt_wcs_iter is None or not mt_wcs_iter.is_celestial:
+            try:
+                mt_wcs_iter = _load_wcs_from_fits(mt_path_iter)
+            except Exception:
+                pcb("run_warn_phase4_invalid_master_tile_for_grid", prog=None, lvl="WARN", path=os.path.basename(mt_path_iter))
+                continue
         try:
             h_mt_loc,w_mt_loc=0,0
             if mt_wcs_iter.pixel_shape and mt_wcs_iter.pixel_shape[0] > 0 and mt_wcs_iter.pixel_shape[1] > 0 : h_mt_loc,w_mt_loc=mt_wcs_iter.pixel_shape[1],mt_wcs_iter.pixel_shape[0] 
@@ -1729,7 +1771,7 @@ def run_hierarchical_mosaic(
     
     valid_master_tiles_for_assembly = []
     for mt_p, mt_w in master_tiles_results_list:
-        if mt_p and os.path.exists(mt_p) and mt_w and mt_w.is_celestial: 
+        if mt_p and os.path.exists(mt_p) and mt_w and mt_w.is_celestial:
             valid_master_tiles_for_assembly.append((mt_p, mt_w))
         else:
             pcb("run_warn_phase5_invalid_tile_skipped_for_assembly", prog=None, lvl="WARN", filename=os.path.basename(mt_p if mt_p else 'N/A')) # Clé de log plus spécifique
