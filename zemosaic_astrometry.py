@@ -285,7 +285,8 @@ def solve_with_astap(image_fits_path: str,
         except Exception as e_del_log_pre:
             if progress_callback: progress_callback(f"  ASTAP Solve AVERT: Échec nettoyage pré-ASTAP log '{os.path.basename(astap_log_file_path)}': {e_del_log_pre}", None, "WARN")
 
-    cmd_list_astap = [astap_exe_path, "-f", image_fits_path, "-r", astap_log_file_path]
+    # -log permet de spécifier le chemin du fichier log généré par ASTAP
+    cmd_list_astap = [astap_exe_path, "-f", image_fits_path, "-log", astap_log_file_path]
     if astap_data_dir and os.path.isdir(astap_data_dir):
          cmd_list_astap.extend(["-d", astap_data_dir])
 
