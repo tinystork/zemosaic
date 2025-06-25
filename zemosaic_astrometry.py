@@ -153,9 +153,9 @@ def _parse_wcs_file_content_za(wcs_file_path, image_shape_hw, progress_callback=
         return None
 
 
-def _update_fits_header_with_wcs_za(fits_header_to_update: fits.Header, 
-                                   wcs_object_solution: AstropyWCS, 
-                                   solver_name="ASTAP_ZeMosaic", 
+def _update_fits_header_with_wcs_za(fits_header_to_update: fits.Header,
+                                   wcs_object_solution: AstropyWCS,
+                                   solver_name="ASTAP_ZeMosaic",
                                    progress_callback=None):
     if not (fits_header_to_update is not None and wcs_object_solution and wcs_object_solution.is_celestial):
         if progress_callback: progress_callback("  ASTAP HeaderUpdate: MàJ header annulée: header/WCS invalide.", None, "WARN")
@@ -201,6 +201,33 @@ def _update_fits_header_with_wcs_za(fits_header_to_update: fits.Header,
     except Exception as e_upd:
         if progress_callback: progress_callback(f"  ASTAP HeaderUpdate ERREUR: {e_upd}", None, "ERROR")
         logger.error(f"Erreur MàJ header FITS avec WCS: {e_upd}", exc_info=True) # Log le traceback complet
+        return False
+
+
+
+def _write_wcs_to_fits(file_path: str, wcs_solution: AstropyWCS, progress_callback=None):
+    """Injecte un objet WCS dans l'en-tête d'un fichier FITS en place."""
+    if not (file_path and os.path.isfile(file_path) and wcs_solution and wcs_solution.is_celestial):
+        if progress_callback:
+            progress_callback("  WriteWCS: paramètres invalides, opération annulée.", None, "WARN")
+        return False
+    try:
+        hdr_cards = wcs_solution.to_header(relax=True).cards
+        with fits.open(file_path, mode="update") as hdul:
+            hdr = hdul[0].header
+            for key in [k for k in hdr if k.startswith(("CRPIX", "CRVAL", "CTYPE", "CUNIT", "CD", "PC"))]:
+                try:
+                    del hdr[key]
+                except KeyError:
+                    pass
+            hdr.extend(hdr_cards)
+            hdul.flush()
+        if progress_callback:
+            progress_callback(f"WCS écrit dans {os.path.basename(file_path)}", None, "INFO")
+        return True
+    except Exception as e_wcs_write:
+        if progress_callback:
+            progress_callback(f"Échec écriture WCS: {e_wcs_write}", None, "WARN")
         return False
 
 
