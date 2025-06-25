@@ -3,8 +3,9 @@
 import numpy as np
 import traceback
 import gc
-import logging # Added for logger fallback
+import logging  # Added for logger fallback
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # dépendance Photutils
 PHOTOUTILS_AVAILABLE = False
@@ -148,6 +149,37 @@ def _calculate_robust_stats_for_linear_fit(image_data_2d_float32: np.ndarray,
         # On retourne quand même ces valeurs, la logique appelante devra gérer cela (ex: a = 1, b = offset).
 
     return stat_low, stat_high
+
+
+def _apply_winsor_single(args):
+    """Helper for ProcessPoolExecutor to apply winsorize on a single array."""
+    arr, limits = args
+    clipped = winsorize_func(arr, limits=limits, axis=0)
+    # ``winsorize`` from scipy.mstats can return a MaskedArray.  Cast back to
+    # ndarray so the caller receives the same type as in the single-threaded
+    # path.
+    return np.asarray(clipped)
+
+
+def parallel_rejwinsor(channels: list[np.ndarray],
+                       limits: tuple[float, float],
+                       max_workers: int,
+                       progress_callback: callable | None = None) -> list[np.ndarray]:
+    """Apply winsorize on multiple channels in parallel."""
+    args_list = [(ch, limits) for ch in channels]
+    results: list[np.ndarray] = [None] * len(args_list)  # type: ignore
+    with ProcessPoolExecutor(max_workers=max_workers) as exe:
+        futures = {exe.submit(_apply_winsor_single, args): idx
+                   for idx, args in enumerate(args_list)}
+        total = len(futures)
+        done = 0
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            results[idx] = fut.result()
+            done += 1
+            if progress_callback:
+                progress_callback(done, total)
+    return results
 
 
 
@@ -902,11 +934,12 @@ def _reject_outliers_kappa_sigma(stacked_array_NHDWC, sigma_low, sigma_high, pro
 
 
 def _reject_outliers_winsorized_sigma_clip(
-    stacked_array_NHDWC: np.ndarray, 
+    stacked_array_NHDWC: np.ndarray,
     winsor_limits_tuple: tuple[float, float], # (low_cut_fraction, high_cut_fraction), ex: (0.05, 0.05)
-    sigma_low: float, 
-    sigma_high: float, 
-    progress_callback: callable = None
+    sigma_low: float,
+    sigma_high: float,
+    progress_callback: callable = None,
+    max_workers: int | None = None
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Rejette les outliers en utilisant un Winsorized Sigma Clip.
@@ -960,15 +993,23 @@ def _reject_outliers_winsorized_sigma_clip(
     try:
         if is_color:
             _pcb("RejWinsor: Traitement image couleur (par canal).", lvl="DEBUG_DETAIL")
-            for c_idx in range(stacked_array_NHDWC.shape[-1]): # Boucle sur les canaux R, G, B
-                _pcb("reject_winsor_info_channel_progress", lvl="INFO_DETAIL", channel=c_idx + 1)
-                _pcb(f"  RejWinsor: Canal {c_idx}...", lvl="DEBUG_VERY_DETAIL")
-                original_channel_data_NHW = stacked_array_NHDWC[..., c_idx].astype(np.float32, copy=False)
-                
-                # 1. Winsorization du canal actuel
-                # winsorize_func opère sur un axe. axis=0 pour winsoriser le long des N images.
-                winsorized_channel_data = winsorize_func(original_channel_data_NHW, limits=winsor_limits_tuple, axis=0)
-                # _pcb(f"    Canal {c_idx}: Winsorization terminée.", lvl="DEBUG_VERY_DETAIL")
+            channel_arrays = [stacked_array_NHDWC[..., c].astype(np.float32, copy=False)
+                              for c in range(stacked_array_NHDWC.shape[-1])]
+            if max_workers and max_workers > 1:
+                winsorized_list = parallel_rejwinsor(
+                    channel_arrays,
+                    winsor_limits_tuple,
+                    max_workers,
+                    progress_callback=lambda d, t: _pcb("reject_winsor_info_channel_progress", lvl="INFO_DETAIL", channel=d)
+                )
+            else:
+                winsorized_list = []
+                for c_idx, arr in enumerate(channel_arrays):
+                    _pcb("reject_winsor_info_channel_progress", lvl="INFO_DETAIL", channel=c_idx + 1)
+                    winsorized_list.append(winsorize_func(arr, limits=winsor_limits_tuple, axis=0))
+
+            for c_idx, winsorized_channel_data in enumerate(winsorized_list):
+                original_channel_data_NHW = channel_arrays[c_idx]
 
                 # 2. Calcul des statistiques sur les données winsorisées
                 # sigma_clipped_stats attend les données sous la forme où l'axe de stacking est le premier
