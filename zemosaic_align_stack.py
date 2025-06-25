@@ -5,7 +5,8 @@ import traceback
 import gc
 import logging  # Added for logger fallback
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
 # dépendance Photutils
 PHOTOUTILS_AVAILABLE = False
@@ -910,8 +911,24 @@ def _apply_winsor_single(args):
 def parallel_rejwinsor(channels, limits, max_workers, progress_callback=None):
     """Apply winsorization in parallel on a list of arrays."""
     args_list = [(ch, limits) for ch in channels]
+
+    if max_workers <= 1 or len(args_list) <= 1:
+        results = []
+        for idx, a in enumerate(args_list, start=1):
+            results.append(_apply_winsor_single(a))
+            if progress_callback:
+                progress_callback(idx, len(args_list))
+        return results
+
     results = [None] * len(args_list)
-    with ProcessPoolExecutor(max_workers=max_workers) as exe:
+
+    # Avoid spawning a new process pool when already running inside a
+    # multiprocessing worker as this would raise "daemonic processes are not
+    # allowed to have children". In that case fallback to threads.
+    parent_is_daemon = multiprocessing.current_process().daemon
+    Executor = ThreadPoolExecutor if parent_is_daemon else ProcessPoolExecutor
+
+    with Executor(max_workers=max_workers) as exe:
         futures = {exe.submit(_apply_winsor_single, a): i for i, a in enumerate(args_list)}
         total = len(futures)
         done = 0
@@ -921,6 +938,7 @@ def parallel_rejwinsor(channels, limits, max_workers, progress_callback=None):
             done += 1
             if progress_callback:
                 progress_callback(done, total)
+
     return results
 
 
