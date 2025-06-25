@@ -963,8 +963,11 @@ def _reproject_and_coadd_channel_worker(channel_data_list, output_wcs_header, ou
     for arr, hdr in channel_data_list:
         prepared_inputs.append((arr, WCS(hdr)))
 
-    if mm_sum_prefix and mm_cov_prefix:
-        _wait_for_memmap_files([mm_sum_prefix, mm_cov_prefix])
+
+
+
+    # The memmap prefixes are produced by other workers. Ensure they exist before
+    # reading if provided. Wait here until both files are fully written.
 
     stacked, coverage = reproject_and_coadd(
         prepared_inputs,
@@ -974,6 +977,9 @@ def _reproject_and_coadd_channel_worker(channel_data_list, output_wcs_header, ou
         combine_function="mean",
         match_background=match_bg,
     )
+
+    if mm_sum_prefix and mm_cov_prefix:
+        _wait_for_memmap_files([mm_sum_prefix, mm_cov_prefix])
     return stacked.astype(np.float32), coverage.astype(np.float32)
 
 
@@ -1594,24 +1600,29 @@ def run_hierarchical_mosaic(
         pcb(f"MASTER_TILE_COUNT_UPDATE:{tiles_processed_count_ph3}/{num_seestar_stacks_to_process}", prog=None, lvl="ETA_LEVEL")
     
     executor_ph3 = ThreadPoolExecutor(max_workers=actual_num_workers_ph3, thread_name_prefix="ZeMosaic_Ph3_")
-    try:
-        future_to_group_index = {
-            executor_ph3.submit(
-                create_master_tile,
-                sg_info_list,
-                i_stk, # tile_id
-                temp_master_tile_storage_dir,
-                stack_norm_method, stack_weight_method, stack_reject_algo,
-                stack_kappa_low, stack_kappa_high, parsed_winsor_limits,
-                stack_final_combine,
-                apply_radial_weight_config, radial_feather_fraction_config,
-                radial_shape_power_config, min_radial_weight_floor_config, 
-                astap_exe_path, astap_data_dir_param, astap_search_radius_config, 
-                astap_downsample_config, astap_sensitivity_config, 180, # timeout ASTAP         
-                progress_callback
-            ): i_stk for i_stk, sg_info_list in enumerate(seestar_stack_groups) 
-        }
-        for future in as_completed(future_to_group_index):
+
+    future_to_group_index = {
+        executor_ph3.submit(
+            create_master_tile,
+            sg_info_list,
+            i_stk,  # tile_id
+            temp_master_tile_storage_dir,
+            stack_norm_method, stack_weight_method, stack_reject_algo,
+            stack_kappa_low, stack_kappa_high, parsed_winsor_limits,
+            stack_final_combine,
+            apply_radial_weight_config, radial_feather_fraction_config,
+            radial_shape_power_config, min_radial_weight_floor_config,
+            astap_exe_path, astap_data_dir_param, astap_search_radius_config,
+            astap_downsample_config, astap_sensitivity_config, 180,  # timeout ASTAP
+            progress_callback
+        ): i_stk for i_stk, sg_info_list in enumerate(seestar_stack_groups)
+    }
+
+    # Wait for all master-tile tasks to finish before processing results
+    executor_ph3.shutdown(wait=True)
+
+    for future in as_completed(future_to_group_index):
+
             group_index_original = future_to_group_index[future]
             tiles_processed_count_ph3 += 1
             
@@ -1640,8 +1651,8 @@ def run_hierarchical_mosaic(
             time_per_percent_point_global_ph3 = (time.monotonic() - start_time_total_run) / max(1, current_progress_in_run_percent_ph3) if current_progress_in_run_percent_ph3 > 0 else (time.monotonic() - start_time_total_run)
             total_eta_sec_ph3 = eta_phase3_sec + (100 - current_progress_in_run_percent_ph3) * time_per_percent_point_global_ph3
             update_gui_eta(total_eta_sec_ph3)
-    finally:
-        executor_ph3.shutdown(wait=True)
+
+
     master_tiles_results_list = [master_tiles_results_list_temp[i] for i in sorted(master_tiles_results_list_temp.keys())]
     del master_tiles_results_list_temp; gc.collect()
     if not master_tiles_results_list: 
