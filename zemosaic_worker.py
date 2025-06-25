@@ -570,6 +570,13 @@ def create_master_tile(
     Lit les données image prétraitées depuis un cache disque (.npy).
     Utilise les WCS et Headers déjà résolus et stockés en mémoire.
     Transmet toutes les options de stacking, y compris la pondération radiale.
+
+    Returns
+    -------
+    tuple[str, WCS] | tuple[None, None]
+        Chemin du fichier FITS créé pour la tuile ainsi que son objet WCS
+        correspondant si la création est réussie, ou ``(None, None)`` en cas
+        d'échec.
     """
     pcb_tile = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(msg_key, prog, lvl, callback=progress_callback, **kwargs)
     func_id_log_base = "mastertile" 
@@ -800,7 +807,7 @@ def create_master_tile(
         )
         pcb_tile(f"{func_id_log_base}_info_saved", prog=None, lvl="INFO_DETAIL", tile_id=tile_id, format_type='float32', filename=os.path.basename(temp_fits_filepath))
         # pcb_tile(f"{func_id_log_base}_info_saving_finished", prog=None, lvl="DEBUG_DETAIL", tile_id=tile_id)
-        return temp_fits_filepath
+        return temp_fits_filepath, wcs_for_master_tile
         
     except Exception as e_save_mt:
         pcb_tile(f"{func_id_log_base}_error_saving", prog=None, lvl="ERROR", tile_id=tile_id, error=str(e_save_mt))
