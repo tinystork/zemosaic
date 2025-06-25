@@ -291,6 +291,8 @@
     "gui_memmap_enable": "Utiliser memmap disque",
     "gui_memmap_dir": "Dossier memmap",
     "gui_memmap_cleanup": "Supprimer les *.dat à la fin",
-    "gui_auto_limit_frames": "Limiter automatiquement les images par master tile (stabilité système)"
+    "gui_auto_limit_frames": "Limiter automatiquement les images par master tile (stabilité système)",
+    "reject_winsor_info_channel_progress": "Winsorized Sigma Clip : traitement du canal {channel}...",
+    "reject_winsor_info_mono_progress": "Winsorized Sigma Clip : traitement image monochrome..."
     
 }

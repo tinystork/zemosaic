@@ -1,9 +1,10 @@
 # zemosaic_align_stack.py
 
 import numpy as np
-import traceback 
+import traceback
 import gc
 import logging # Added for logger fallback
+import time
 
 # dépendance Photutils
 PHOTOUTILS_AVAILABLE = False
@@ -960,6 +961,7 @@ def _reject_outliers_winsorized_sigma_clip(
         if is_color:
             _pcb("RejWinsor: Traitement image couleur (par canal).", lvl="DEBUG_DETAIL")
             for c_idx in range(stacked_array_NHDWC.shape[-1]): # Boucle sur les canaux R, G, B
+                _pcb("reject_winsor_info_channel_progress", lvl="INFO_DETAIL", channel=c_idx + 1)
                 _pcb(f"  RejWinsor: Canal {c_idx}...", lvl="DEBUG_VERY_DETAIL")
                 original_channel_data_NHW = stacked_array_NHDWC[..., c_idx].astype(np.float32, copy=False)
                 
@@ -999,7 +1001,9 @@ def _reject_outliers_winsorized_sigma_clip(
                 
                 num_rejected_ch = np.sum(pixels_to_reject_this_channel)
                 _pcb(f"    RejWinsor: Canal {c_idx}, {num_rejected_ch} pixels rejetés.", lvl="DEBUG_DETAIL")
+                time.sleep(0)
         else: # Image monochrome (N, H, W)
+            _pcb("reject_winsor_info_mono_progress", lvl="INFO_DETAIL")
             _pcb("RejWinsor: Traitement image monochrome.", lvl="DEBUG_DETAIL")
             original_data_NHW = stacked_array_NHDWC.astype(np.float32, copy=False)
 
