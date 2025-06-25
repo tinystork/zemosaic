@@ -8,6 +8,7 @@ import gc
 import logging
 import inspect  # Pas utilisé directement ici, mais peut être utile pour des introspections futures
 import psutil
+import threading
 import tempfile
 import glob
 import uuid
@@ -1299,7 +1300,9 @@ def run_hierarchical_mosaic(
     coadd_memmap_dir_config: str,
     coadd_cleanup_memmap_config: bool,
     assembly_process_workers_config: int,
-    auto_limit_frames_per_master_tile_config: bool
+    auto_limit_frames_per_master_tile_config: bool,
+    pause_event: threading.Event | None = None,
+    stop_event: threading.Event | None = None
 ):
     """
     Orchestre le traitement de la mosaïque hiérarchique.
@@ -1329,6 +1332,20 @@ def run_hierarchical_mosaic(
             workers = min(workers, num_tasks)
         return max(1, workers)
     current_global_progress = 0
+
+    def _handle_pause_stop() -> bool:
+        if stop_event and stop_event.is_set():
+            pcb("run_info_stop_requested", prog=current_global_progress, lvl="INFO")
+            return False
+        if pause_event and pause_event.is_set():
+            pcb("run_info_paused", prog=current_global_progress, lvl="INFO")
+            while pause_event.is_set():
+                if stop_event and stop_event.is_set():
+                    pcb("run_info_stop_requested", prog=current_global_progress, lvl="INFO")
+                    return False
+                time.sleep(0.2)
+            pcb("run_info_resumed", prog=current_global_progress, lvl="INFO")
+        return True
     
     error_messages_deps = []
     if not (ASTROPY_AVAILABLE and WCS and SkyCoord and Angle and fits and u): error_messages_deps.append("Astropy")
@@ -1364,10 +1381,16 @@ def run_hierarchical_mosaic(
     pcb("run_info_phase1_started_cache", prog=base_progress_phase1, lvl="INFO")
     
     fits_file_paths = []
+    if not _handle_pause_stop():
+        return
     # Scan des fichiers FITS dans le dossier d'entrée et ses sous-dossiers
     for root_dir_iter, _, files_in_dir_iter in os.walk(input_folder):
+        if not _handle_pause_stop():
+            return
         for file_name_iter in files_in_dir_iter:
-            if file_name_iter.lower().endswith((".fit", ".fits")): 
+            if not _handle_pause_stop():
+                return
+            if file_name_iter.lower().endswith((".fit", ".fits")):
                 fits_file_paths.append(os.path.join(root_dir_iter, file_name_iter))
     
     if not fits_file_paths: 
@@ -1428,6 +1451,8 @@ def run_hierarchical_mosaic(
         }
         
         for future in as_completed(future_to_filepath_ph1):
+            if not _handle_pause_stop():
+                return
             file_path_original = future_to_filepath_ph1[future]
             files_processed_count_ph1 += 1 # Incrémenter pour chaque future terminée
             
@@ -1580,6 +1605,8 @@ def run_hierarchical_mosaic(
             ): i_stk for i_stk, sg_info_list in enumerate(seestar_stack_groups) 
         }
         for future in as_completed(future_to_group_index):
+            if not _handle_pause_stop():
+                return
             group_index_original = future_to_group_index[future]
             tiles_processed_count_ph3 += 1
             
@@ -1633,6 +1660,8 @@ def run_hierarchical_mosaic(
     pcb("run_info_phase4_started", prog=base_progress_phase4, lvl="INFO")
     wcs_list_for_final_grid = []; shapes_list_for_final_grid_hw = []
     for mt_path_iter,mt_wcs_iter in master_tiles_results_list:
+        if not _handle_pause_stop():
+            return
         # ... (logique de récupération shape, inchangée) ...
         if not (mt_path_iter and os.path.exists(mt_path_iter) and mt_wcs_iter and mt_wcs_iter.is_celestial): pcb("run_warn_phase4_invalid_master_tile_for_grid", prog=None, lvl="WARN", path=os.path.basename(mt_path_iter if mt_path_iter else "N/A_path")); continue
         try:
@@ -1665,7 +1694,9 @@ def run_hierarchical_mosaic(
     
     valid_master_tiles_for_assembly = []
     for mt_p, mt_w in master_tiles_results_list:
-        if mt_p and os.path.exists(mt_p) and mt_w and mt_w.is_celestial: 
+        if not _handle_pause_stop():
+            return
+        if mt_p and os.path.exists(mt_p) and mt_w and mt_w.is_celestial:
             valid_master_tiles_for_assembly.append((mt_p, mt_w))
         else:
             pcb("run_warn_phase5_invalid_tile_skipped_for_assembly", prog=None, lvl="WARN", filename=os.path.basename(mt_p if mt_p else 'N/A')) # Clé de log plus spécifique
@@ -1684,7 +1715,9 @@ def run_hierarchical_mosaic(
     incremental_available = ('assemble_final_mosaic_incremental' in globals() and callable(assemble_final_mosaic_incremental))
 
     if USE_INCREMENTAL_ASSEMBLY:
-        if not incremental_available: 
+        if not _handle_pause_stop():
+            return
+        if not incremental_available:
             pcb("run_error_phase5_inc_func_missing", prog=None, lvl="CRITICAL"); return
         pcb("run_info_phase5_started_incremental", prog=base_progress_phase5, lvl="INFO")
         final_mosaic_data_HWC, final_mosaic_coverage_HW = assemble_final_mosaic_incremental(
@@ -1696,7 +1729,9 @@ def run_hierarchical_mosaic(
         log_key_phase5_failed = "run_error_phase5_assembly_failed_incremental"
         log_key_phase5_finished = "run_info_phase5_finished_incremental"
     else: # Méthode Reproject & Coadd
-        if not reproject_coadd_available: 
+        if not _handle_pause_stop():
+            return
+        if not reproject_coadd_available:
             pcb("run_error_phase5_reproject_coadd_func_missing", prog=None, lvl="CRITICAL"); return
         pcb("run_info_phase5_started_reproject_coadd", prog=base_progress_phase5, lvl="INFO")
         final_mosaic_data_HWC, final_mosaic_coverage_HW = assemble_final_mosaic_with_reproject_coadd(
@@ -1762,7 +1797,9 @@ def run_hierarchical_mosaic(
     final_header['ZM_WORKERS'] = (num_base_workers_config, 'GUI: Base workers config (0=auto)')
 
     try:
-        if not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils): 
+        if not _handle_pause_stop():
+            return
+        if not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils):
             raise RuntimeError("zemosaic_utils non disponible pour sauvegarde FITS.")
         zemosaic_utils.save_fits_image(
             image_data=final_mosaic_data_HWC,
@@ -1809,6 +1846,8 @@ def run_hierarchical_mosaic(
 
     # --- MODIFIÉ : Génération de la Preview PNG avec stretch_auto_asifits_like ---
     if final_mosaic_data_HWC is not None and ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils:
+        if not _handle_pause_stop():
+            return
         pcb("run_info_preview_stretch_started_auto_asifits", prog=None, lvl="INFO_DETAIL") # Log mis à jour
         try:
             # Vérifier si la fonction stretch_auto_asifits_like existe dans zemosaic_utils
@@ -1879,6 +1918,8 @@ def run_hierarchical_mosaic(
     # --- Phase 7 (Nettoyage) ---
     # ... (contenu Phase 7 inchangé) ...
     base_progress_phase7 = current_global_progress
+    if not _handle_pause_stop():
+        return
     _log_memory_usage(progress_callback, "Début Phase 7 (Nettoyage)")
     pcb("run_info_phase7_cleanup_starting", prog=base_progress_phase7, lvl="INFO")
     try:
@@ -1958,4 +1999,6 @@ if __name__ == "__main__":
         coadd_cleanup_memmap_config=args.coadd_cleanup_memmap if args.coadd_cleanup_memmap else cfg.get("coadd_cleanup_memmap", True),
         assembly_process_workers_config=args.assembly_process_workers if args.assembly_process_workers is not None else cfg.get("assembly_process_workers", 0),
         auto_limit_frames_per_master_tile_config=(not args.no_auto_limit_frames) and cfg.get("auto_limit_frames_per_master_tile", True),
+        pause_event=None,
+        stop_event=None,
     )
