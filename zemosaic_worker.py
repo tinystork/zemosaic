@@ -503,7 +503,7 @@ def get_wcs_and_pretreat_raw_file(file_path: str, astap_exe_path: str, astap_dat
         unaligned_path = os.path.join(original_file_dir, unaligned_dir_name)
         
         if not os.path.exists(unaligned_path):
-            os.makedirs(unaligned_path)
+            os.makedirs(unaligned_path, exist_ok=True)
             _pcb_local(f"  Création dossier: '{unaligned_path}'", lvl="INFO_DETAIL")
         
         destination_path = os.path.join(unaligned_path, filename)
@@ -896,6 +896,7 @@ def assemble_final_mosaic_incremental(
                 except Exception:
                     pcb_asm("assemble_warn_tile_wcs_load_failed_inc", prog=None, lvl="WARN", filename=os.path.basename(tile_path))
                     continue
+
 
             if apply_crop and crop_percent > 1e-3:  # Appliquer si crop_percent significatif
 
