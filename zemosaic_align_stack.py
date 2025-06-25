@@ -5,7 +5,9 @@ import traceback
 import gc
 import logging  # Added for logger fallback
 import time
+
 from concurrent.futures import ProcessPoolExecutor, as_completed
+
 
 # dépendance Photutils
 PHOTOUTILS_AVAILABLE = False
@@ -929,6 +931,46 @@ def _reject_outliers_kappa_sigma(stacked_array_NHDWC, sigma_low, sigma_high, pro
     return output_data_with_nans, rejection_mask
 
 
+def _apply_winsor_single(args):
+    """Helper for parallel winsorization."""
+    arr, limits = args
+    return winsorize_func(arr, limits)
+
+
+def parallel_rejwinsor(channels, limits, max_workers, progress_callback=None):
+    """Apply winsorization in parallel on a list of arrays."""
+    args_list = [(ch, limits) for ch in channels]
+
+    if max_workers <= 1 or len(args_list) <= 1:
+        results = []
+        for idx, a in enumerate(args_list, start=1):
+            results.append(_apply_winsor_single(a))
+            if progress_callback:
+                progress_callback(idx, len(args_list))
+        return results
+
+    results = [None] * len(args_list)
+
+    # Avoid spawning a new process pool when already running inside a
+    # multiprocessing worker as this would raise "daemonic processes are not
+    # allowed to have children". In that case fallback to threads.
+    parent_is_daemon = multiprocessing.current_process().daemon
+    Executor = ThreadPoolExecutor if parent_is_daemon else ProcessPoolExecutor
+
+    with Executor(max_workers=max_workers) as exe:
+        futures = {exe.submit(_apply_winsor_single, a): i for i, a in enumerate(args_list)}
+        total = len(futures)
+        done = 0
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            results[idx] = fut.result()
+            done += 1
+            if progress_callback:
+                progress_callback(done, total)
+
+    return results
+
+
 
 def _reject_outliers_winsorized_sigma_clip(
     stacked_array_NHDWC: np.ndarray,
@@ -936,7 +978,9 @@ def _reject_outliers_winsorized_sigma_clip(
     sigma_low: float,
     sigma_high: float,
     progress_callback: callable = None,
+
     max_workers: int | None = None
+
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Rejette les outliers en utilisant un Winsorized Sigma Clip.
@@ -950,6 +994,7 @@ def _reject_outliers_winsorized_sigma_clip(
         sigma_low: Nombre de sigmas pour le seuil inférieur de rejet.
         sigma_high: Nombre de sigmas pour le seuil supérieur de rejet.
         progress_callback: Fonction de callback pour les logs.
+        max_workers: Nombre maximum de travailleurs parallèles pour la winsorisation.
 
     Returns:
         tuple[np.ndarray, np.ndarray]: 
@@ -990,6 +1035,7 @@ def _reject_outliers_winsorized_sigma_clip(
     try:
         if is_color:
             _pcb("RejWinsor: Traitement image couleur (par canal).", lvl="DEBUG_DETAIL")
+
             channel_arrays = [stacked_array_NHDWC[..., c].astype(np.float32, copy=False)
                               for c in range(stacked_array_NHDWC.shape[-1])]
             if max_workers and max_workers > 1:
@@ -1012,34 +1058,33 @@ def _reject_outliers_winsorized_sigma_clip(
                 # 2. Calcul des statistiques sur les données winsorisées
                 # sigma_clipped_stats attend les données sous la forme où l'axe de stacking est le premier
                 # Ici, winsorized_channel_data est (N, H, W), donc axis=0 est correct.
+
                 try:
-                    # Pour sigma_clipped_stats, sigma_lower et sigma_upper sont pour *ses propres* itérations de clipping
-                    # lors du calcul des stats. Utilisons des valeurs raisonnables ici (ex: 3-sigma)
-                    # pour obtenir une médiane et un stddev robustes DES DONNÉES WINSORISÉES.
                     _, median_winsorized, stddev_winsorized = sigma_clipped_stats_func(
                         winsorized_channel_data, sigma=3.0, axis=0, maxiters=5
                     )
-                except TypeError: # Ancienne version d'Astropy peut ne pas avoir sigma_lower/upper
-                     _, median_winsorized, stddev_winsorized = sigma_clipped_stats_func(
+                except TypeError:
+                    _, median_winsorized, stddev_winsorized = sigma_clipped_stats_func(
                         winsorized_channel_data, sigma_lower=3.0, sigma_upper=3.0, axis=0, maxiters=5
                     )
 
-                # _pcb(f"    Canal {c_idx}: Stats sur données winsorisées calculées.", lvl="DEBUG_VERY_DETAIL")
-
-                # 3. Rejet sur les données ORIGINALES en utilisant les stats des données winsorisées
-                # Les seuils de rejet (sigma_low, sigma_high) sont ceux passés en argument à la fonction.
                 lower_bound = median_winsorized - (sigma_low * stddev_winsorized)
                 upper_bound = median_winsorized + (sigma_high * stddev_winsorized)
-                
-                # `original_channel_data_NHW` vs `lower_bound` (HW) et `upper_bound` (HW)
-                pixels_to_reject_this_channel = (original_channel_data_NHW < lower_bound[np.newaxis, ...]) | \
-                                                (original_channel_data_NHW > upper_bound[np.newaxis, ...])
-                
+
+                pixels_to_reject_this_channel = (
+                    original_channel_data_NHW < lower_bound[np.newaxis, ...]
+                ) | (
+                    original_channel_data_NHW > upper_bound[np.newaxis, ...]
+                )
+
                 rejection_mask_final[..., c_idx] = ~pixels_to_reject_this_channel
                 output_data_with_nans[pixels_to_reject_this_channel, c_idx] = np.nan
-                
+
                 num_rejected_ch = np.sum(pixels_to_reject_this_channel)
-                _pcb(f"    RejWinsor: Canal {c_idx}, {num_rejected_ch} pixels rejetés.", lvl="DEBUG_DETAIL")
+                _pcb(
+                    f"    RejWinsor: Canal {c_idx}, {num_rejected_ch} pixels rejetés.",
+                    lvl="DEBUG_DETAIL",
+                )
                 time.sleep(0)
         else: # Image monochrome (N, H, W)
             _pcb("reject_winsor_info_mono_progress", lvl="INFO_DETAIL")
@@ -1142,11 +1187,14 @@ def stack_aligned_images(
     apply_radial_weight: bool = False,
     radial_feather_fraction: float = 0.8,
     radial_shape_power: float = 2.0,
+    winsor_max_workers: int = 1,
     progress_callback: callable = None
 ) -> np.ndarray | None:
     """
     Stacke une liste d'images alignées, appliquant normalisation, pondération (qualité + radiale),
     et rejet d'outliers optionnels. VERSION AVEC LOGS DE DEBUG INTENSIFS.
+    ``winsor_max_workers`` permet de paralléliser la phase de Winsorisation lors
+    du rejet Winsorized Sigma Clip.
     """
     _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: \
         progress_callback(msg_key, prog, lvl, **kwargs) if progress_callback else _internal_logger.debug(f"PCB_FALLBACK_{lvl}_{prog}: {msg_key} {kwargs}")
@@ -1362,7 +1410,14 @@ def stack_aligned_images(
     if rejection_algorithm == 'kappa_sigma':
         data_for_combine, rejection_mask = _reject_outliers_kappa_sigma(stacked_array_NHDWC, sigma_clip_low, sigma_clip_high, progress_callback)
     elif rejection_algorithm == 'winsorized_sigma_clip':
-        data_for_combine, rejection_mask = _reject_outliers_winsorized_sigma_clip(stacked_array_NHDWC, winsor_limits, sigma_clip_low, sigma_clip_high, progress_callback)
+        data_for_combine, rejection_mask = _reject_outliers_winsorized_sigma_clip(
+            stacked_array_NHDWC,
+            winsor_limits,
+            sigma_clip_low,
+            sigma_clip_high,
+            progress_callback,
+            winsor_max_workers,
+        )
     # ... (autres algos de rejet) ...
     _pcb(f"STACK_IMG_REJECT: Fin rejet. data_for_combine shape: {data_for_combine.shape}, range: [{np.nanmin(data_for_combine):.2g}-{np.nanmax(data_for_combine):.2g}] (contient NaN)", lvl="ERROR")
 
