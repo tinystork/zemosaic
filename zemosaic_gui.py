@@ -1147,7 +1147,8 @@ class ZeMosaicGUI:
             memmap_dir,
             self.cleanup_memmap_var.get(),
             self.auto_limit_frames_var.get(),
-            self.config.get("assembly_process_workers", 0)
+            self.config.get("assembly_process_workers", 0),
+            self.config.get("auto_limit_memory_fraction", 0.3)
             # --- FIN NOUVEAUX ARGUMENTS ---
         )
         

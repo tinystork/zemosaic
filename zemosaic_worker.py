@@ -1299,7 +1299,8 @@ def run_hierarchical_mosaic(
     coadd_memmap_dir_config: str,
     coadd_cleanup_memmap_config: bool,
     assembly_process_workers_config: int,
-    auto_limit_frames_per_master_tile_config: bool
+    auto_limit_frames_per_master_tile_config: bool,
+    auto_limit_memory_fraction_config: float
 ):
     """
     Orchestre le traitement de la mosaïque hiérarchique.
@@ -1515,7 +1516,13 @@ def run_hierarchical_mosaic(
             sample_shape = sample_arr.shape
             sample_arr = None
             available_bytes = psutil.virtual_memory().available
-            limit = max(1, int((available_bytes * 0.5) // (bytes_per_frame * 6)))
+            limit = max(
+                1,
+                int(
+                    (available_bytes * auto_limit_memory_fraction_config)
+                    // (bytes_per_frame * 6)
+                ),
+            )
             new_groups = []
             for g in seestar_stack_groups:
                 for i in range(0, len(g), limit):
@@ -1958,4 +1965,5 @@ if __name__ == "__main__":
         coadd_cleanup_memmap_config=args.coadd_cleanup_memmap if args.coadd_cleanup_memmap else cfg.get("coadd_cleanup_memmap", True),
         assembly_process_workers_config=args.assembly_process_workers if args.assembly_process_workers is not None else cfg.get("assembly_process_workers", 0),
         auto_limit_frames_per_master_tile_config=(not args.no_auto_limit_frames) and cfg.get("auto_limit_frames_per_master_tile", True),
+        auto_limit_memory_fraction_config=cfg.get("auto_limit_memory_fraction", 0.3),
     )
