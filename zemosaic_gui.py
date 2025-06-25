@@ -3,6 +3,7 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import threading
+import multiprocessing
 import os
 import traceback
 import time
@@ -35,11 +36,12 @@ except ImportError as e_config:
 
 # --- Worker Import ---
 try:
-    from zemosaic_worker import run_hierarchical_mosaic
+    from zemosaic_worker import run_hierarchical_mosaic, run_hierarchical_mosaic_process
     ZEMOSAIC_WORKER_AVAILABLE = True
 except ImportError as e_worker:
     ZEMOSAIC_WORKER_AVAILABLE = False
     run_hierarchical_mosaic = None
+    run_hierarchical_mosaic_process = None
     print(f"ERREUR (zemosaic_gui): 'run_hierarchical_mosaic' non trouvé: {e_worker}")
 
 
@@ -129,7 +131,8 @@ class ZeMosaicGUI:
         self.save_final_uint16_var = tk.BooleanVar(value=self.config.get("save_final_as_uint16", False))
         
         self.is_processing = False
-        self.processing_thread = None
+        self.worker_process = None
+        self.progress_queue = None
         self.progress_bar_var = tk.DoubleVar(value=0.0)
         self.eta_var = tk.StringVar(value=self._tr("initial_eta_value", "--:--:--"))
         self.elapsed_time_var = tk.StringVar(value=self._tr("initial_elapsed_time", "00:00:00"))
@@ -1152,50 +1155,82 @@ class ZeMosaicGUI:
             # --- FIN NOUVEAUX ARGUMENTS ---
         )
         
-        self.processing_thread = threading.Thread(
-            target=run_hierarchical_mosaic,
-            args=worker_args,
-            daemon=True, 
-            name="ZeMosaicWorkerThread"
+        self.progress_queue = multiprocessing.Queue()
+        self.worker_process = multiprocessing.Process(
+            target=run_hierarchical_mosaic_process,
+            args=(self.progress_queue,) + worker_args,
+            daemon=True,
+            name="ZeMosaicWorkerProcess"
         )
-        self.processing_thread.start()
-        
+        self.worker_process.start()
+
         if hasattr(self.root, 'winfo_exists') and self.root.winfo_exists():
-            self.root.after(100, self._check_processing_thread)
+            self.root.after(100, self._poll_worker_queue)
 
     
 
 
 
-    def _check_processing_thread(self):
+    def _poll_worker_queue(self):
         if not (hasattr(self.root, 'winfo_exists') and self.root.winfo_exists()):
-            if self.is_processing: self.is_processing = False
+            if self.is_processing:
+                self.is_processing = False
+                if self.worker_process and self.worker_process.is_alive():
+                    self.worker_process.terminate()
             return
-        if self.processing_thread and self.processing_thread.is_alive(): self.root.after(100, self._check_processing_thread)
-        else:
-            self._log_message("CHRONO_STOP_REQUEST", None, "CHRONO_LEVEL")
-            self.is_processing = False
-            if hasattr(self, 'launch_button') and self.launch_button.winfo_exists(): self.launch_button.config(state=tk.NORMAL)
-            if self.root.winfo_exists():
-                self._log_message("log_key_processing_finished", level="INFO")
-                success_status = True 
-                final_message = self._tr("msg_processing_completed")
-                if not success_status: final_message = self._tr("msg_processing_completed_errors")
-                messagebox.showinfo(self._tr("dialog_title_completed"), final_message, parent=self.root)
-                output_dir_final = self.output_dir_var.get()
-                if output_dir_final and os.path.isdir(output_dir_final):
-                    if messagebox.askyesno(self._tr("q_open_output_folder_title"), self._tr("q_open_output_folder_msg", folder=output_dir_final), parent=self.root):
-                        try:
-                            if os.name == 'nt': os.startfile(output_dir_final)
-                            elif sys.platform == 'darwin': subprocess.Popen(['open', output_dir_final])
-                            else: subprocess.Popen(['xdg-open', output_dir_final])
-                        except Exception as e_open_dir: self._log_message(self._tr("log_key_error_opening_folder", error=e_open_dir), level="ERROR"); messagebox.showerror(self._tr("error_title"), self._tr("error_cannot_open_folder", error=e_open_dir), parent=self.root)
+
+        if self.progress_queue:
+            while True:
+                try:
+                    msg_key, prog, lvl, kwargs = self.progress_queue.get_nowait()
+                except Exception:
+                    break
+                if msg_key == "PROCESS_DONE":
+                    if self.worker_process:
+                        self.worker_process.join(timeout=0.1)
+                        self.worker_process = None
+                    continue
+                self._log_message(msg_key, prog, lvl, **kwargs)
+
+        if self.worker_process and self.worker_process.is_alive():
+            self.root.after(100, self._poll_worker_queue)
+            return
+
+        self._log_message("CHRONO_STOP_REQUEST", None, "CHRONO_LEVEL")
+        self.is_processing = False
+        if hasattr(self, 'launch_button') and self.launch_button.winfo_exists():
+            self.launch_button.config(state=tk.NORMAL)
+        if self.root.winfo_exists():
+            self._log_message("log_key_processing_finished", level="INFO")
+            final_message = self._tr("msg_processing_completed")
+            messagebox.showinfo(self._tr("dialog_title_completed"), final_message, parent=self.root)
+            output_dir_final = self.output_dir_var.get()
+            if output_dir_final and os.path.isdir(output_dir_final):
+                if messagebox.askyesno(self._tr("q_open_output_folder_title"), self._tr("q_open_output_folder_msg", folder=output_dir_final), parent=self.root):
+                    try:
+                        if os.name == 'nt':
+                            os.startfile(output_dir_final)
+                        elif sys.platform == 'darwin':
+                            subprocess.Popen(['open', output_dir_final])
+                        else:
+                            subprocess.Popen(['xdg-open', output_dir_final])
+                    except Exception as e_open_dir:
+                        self._log_message(self._tr("log_key_error_opening_folder", error=e_open_dir), level="ERROR")
+                        messagebox.showerror(
+                            self._tr("error_title"),
+                            self._tr("error_cannot_open_folder", error=e_open_dir),
+                            parent=self.root,
+                        )
                         
     def _on_closing(self):
         if self.is_processing:
             if messagebox.askokcancel(self._tr("q_quit_title"), self._tr("q_quit_while_processing_msg"), icon='warning', parent=self.root):
-                self.is_processing = False; self._stop_gui_chrono(); self.root.destroy()
-            else: return 
+                self.is_processing = False
+                if self.worker_process and self.worker_process.is_alive():
+                    self.worker_process.terminate()
+                self._stop_gui_chrono()
+                self.root.destroy()
+            else: return
         else: self._stop_gui_chrono(); self.root.destroy()
 
 if __name__ == '__main__':

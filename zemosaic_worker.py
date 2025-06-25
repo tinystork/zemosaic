@@ -1947,6 +1947,19 @@ def run_hierarchical_mosaic(
 
 
 
+
+#--- Worker process helper ---
+def run_hierarchical_mosaic_process(progress_queue, *args, **kwargs):
+    """Execute run_hierarchical_mosaic in a separate process and relay progress."""
+    def queue_callback(message_key_or_raw, progress_value=None, level="INFO", **cb_kwargs):
+        progress_queue.put((message_key_or_raw, progress_value, level, cb_kwargs))
+    try:
+        run_hierarchical_mosaic(*args, progress_callback=queue_callback, **kwargs)
+    except Exception as e_proc:
+        progress_queue.put(("PROCESS_ERROR", None, "ERROR", {"error": str(e_proc)}))
+    finally:
+        progress_queue.put(("PROCESS_DONE", None, "INFO", {}))
+
 if __name__ == "__main__":
     import argparse
     import json
