@@ -1950,11 +1950,23 @@ def run_hierarchical_mosaic(
 
 #--- Worker process helper ---
 def run_hierarchical_mosaic_process(progress_queue, *args, **kwargs):
-    """Execute run_hierarchical_mosaic in a separate process and relay progress."""
+    """Execute :func:`run_hierarchical_mosaic` in a separate process.
+
+    Parameters are identical to :func:`run_hierarchical_mosaic` **except** for
+    ``progress_callback`` which is automatically provided so the caller should
+    omit it. Any log message produced by the worker will be sent back through
+    ``progress_queue``.
+    """
+
     def queue_callback(message_key_or_raw, progress_value=None, level="INFO", **cb_kwargs):
         progress_queue.put((message_key_or_raw, progress_value, level, cb_kwargs))
+
+    # Insert the queue callback at the expected position for progress_callback
+    # (after ``cluster_threshold_config`` and before stacking parameters).
+    full_args = args[:8] + (queue_callback,) + args[8:]
+
     try:
-        run_hierarchical_mosaic(*args, progress_callback=queue_callback, **kwargs)
+        run_hierarchical_mosaic(*full_args, **kwargs)
     except Exception as e_proc:
         progress_queue.put(("PROCESS_ERROR", None, "ERROR", {"error": str(e_proc)}))
     finally:
