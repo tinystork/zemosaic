@@ -2049,6 +2049,6 @@ if __name__ == "__main__":
         coadd_cleanup_memmap_config=args.coadd_cleanup_memmap if args.coadd_cleanup_memmap else cfg.get("coadd_cleanup_memmap", True),
         assembly_process_workers_config=args.assembly_process_workers if args.assembly_process_workers is not None else cfg.get("assembly_process_workers", 0),
         auto_limit_frames_per_master_tile_config=(not args.no_auto_limit_frames) and cfg.get("auto_limit_frames_per_master_tile", True),
-        auto_limit_memory_fraction_config=cfg.get("auto_limit_memory_fraction", 0.3),
-        winsor_worker_limit_config=args.winsor_workers if args.winsor_workers is not None else cfg.get("winsor_worker_limit", 6),
+        auto_limit_memory_fraction_config=cfg.get("auto_limit_memory_fraction", 0.2),
+        winsor_worker_limit_config=args.winsor_workers if args.winsor_workers is not None else cfg.get("winsor_worker_limit", 2),
     )
