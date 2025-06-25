@@ -22,5 +22,6 @@
     "coadd_memmap_dir": "",
     "coadd_cleanup_memmap": true,
     "assembly_process_workers": 0,
-    "auto_limit_frames_per_master_tile": true
+    "auto_limit_frames_per_master_tile": true,
+    "auto_limit_memory_fraction": 0.3
 }
