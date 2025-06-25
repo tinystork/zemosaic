@@ -1031,8 +1031,10 @@ class ZeMosaicGUI:
 
     def _on_start(self):
         print("DEBUG GUI: Start clicked")
+
         self.stop_event.clear()
         self.pause_event.clear()
+
         if hasattr(self, 'start_button'): self.start_button.config(state=tk.DISABLED)
         if hasattr(self, 'pause_button'): self.pause_button.config(state=tk.NORMAL)
         if hasattr(self, 'resume_button'): self.resume_button.config(state=tk.DISABLED)
@@ -1043,13 +1045,17 @@ class ZeMosaicGUI:
         print("DEBUG GUI: Pause clicked")
         if hasattr(self, 'pause_button'): self.pause_button.config(state=tk.DISABLED)
         if hasattr(self, 'resume_button'): self.resume_button.config(state=tk.NORMAL)
+
         self.pause_event.set()
+
 
     def _on_resume(self):
         print("DEBUG GUI: Resume clicked")
         if hasattr(self, 'resume_button'): self.resume_button.config(state=tk.DISABLED)
         if hasattr(self, 'pause_button'): self.pause_button.config(state=tk.NORMAL)
+
         self.pause_event.clear()
+
 
     def _on_stop(self):
         print("DEBUG GUI: Stop clicked")
@@ -1057,8 +1063,10 @@ class ZeMosaicGUI:
         if hasattr(self, 'pause_button'): self.pause_button.config(state=tk.DISABLED)
         if hasattr(self, 'resume_button'): self.resume_button.config(state=tk.DISABLED)
         if hasattr(self, 'stop_button'): self.stop_button.config(state=tk.DISABLED)
+
         self.pause_event.clear()
         self.stop_event.set()
+
 
 
 
