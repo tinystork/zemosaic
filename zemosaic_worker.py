@@ -1557,11 +1557,12 @@ def run_hierarchical_mosaic(
             sample_shape = sample_arr.shape
             sample_arr = None
             available_bytes = psutil.virtual_memory().available
+            expected_workers = max(1, int(effective_base_workers * ALIGNMENT_PHASE_WORKER_RATIO))
             limit = max(
                 1,
                 int(
                     (available_bytes * auto_limit_memory_fraction_config)
-                    // (bytes_per_frame * 6)
+                    // (expected_workers * bytes_per_frame * 6)
                 ),
             )
             winsor_worker_limit = min(winsor_worker_limit, limit)
@@ -1570,7 +1571,15 @@ def run_hierarchical_mosaic(
                 for i in range(0, len(g), limit):
                     new_groups.append(g[i:i+limit])
             if len(new_groups) != len(seestar_stack_groups):
-                pcb("clusterstacks_info_groups_split_auto_limit", prog=None, lvl="INFO_DETAIL", original=len(seestar_stack_groups), new=len(new_groups), limit=limit, shape=str(sample_shape))
+                pcb(
+                    "clusterstacks_info_groups_split_auto_limit",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                    original=len(seestar_stack_groups),
+                    new=len(new_groups),
+                    limit=limit,
+                    shape=str(sample_shape),
+                )
             seestar_stack_groups = new_groups
         except Exception as e_auto:
             pcb("clusterstacks_warn_auto_limit_failed", prog=None, lvl="WARN", error=str(e_auto))
