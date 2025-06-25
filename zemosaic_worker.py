@@ -965,8 +965,10 @@ def _reproject_and_coadd_channel_worker(channel_data_list, output_wcs_header, ou
 
 
 
+
     # The memmap prefixes are produced by other workers. Ensure they exist before
     # reading if provided. Wait here until both files are fully written.
+
     stacked, coverage = reproject_and_coadd(
         prepared_inputs,
         output_projection=final_wcs,
@@ -1598,6 +1600,7 @@ def run_hierarchical_mosaic(
         pcb(f"MASTER_TILE_COUNT_UPDATE:{tiles_processed_count_ph3}/{num_seestar_stacks_to_process}", prog=None, lvl="ETA_LEVEL")
     
     executor_ph3 = ThreadPoolExecutor(max_workers=actual_num_workers_ph3, thread_name_prefix="ZeMosaic_Ph3_")
+
     future_to_group_index = {
         executor_ph3.submit(
             create_master_tile,
@@ -1619,6 +1622,7 @@ def run_hierarchical_mosaic(
     executor_ph3.shutdown(wait=True)
 
     for future in as_completed(future_to_group_index):
+
             group_index_original = future_to_group_index[future]
             tiles_processed_count_ph3 += 1
             
@@ -1647,6 +1651,8 @@ def run_hierarchical_mosaic(
             time_per_percent_point_global_ph3 = (time.monotonic() - start_time_total_run) / max(1, current_progress_in_run_percent_ph3) if current_progress_in_run_percent_ph3 > 0 else (time.monotonic() - start_time_total_run)
             total_eta_sec_ph3 = eta_phase3_sec + (100 - current_progress_in_run_percent_ph3) * time_per_percent_point_global_ph3
             update_gui_eta(total_eta_sec_ph3)
+
+
     master_tiles_results_list = [master_tiles_results_list_temp[i] for i in sorted(master_tiles_results_list_temp.keys())]
     del master_tiles_results_list_temp; gc.collect()
     if not master_tiles_results_list: 
