@@ -1,8 +1,9 @@
 # zemosaic/run_zemosaic.py
-import sys # Ajout pour sys.path et sys.modules
+import sys  # Ajout pour sys.path et sys.modules
+import multiprocessing
 # import reproject # L'import direct ici n'est pas crucial, mais ne fait pas de mal
 import tkinter as tk
-from tkinter import messagebox # Nécessaire pour la messagebox d'erreur critique
+from tkinter import messagebox  # Nécessaire pour la messagebox d'erreur critique
 
 # --- Impression de débogage initiale ---
 print("--- run_zemosaic.py: DÉBUT DES IMPORTS ---")
@@ -88,6 +89,7 @@ def main():
     print("--- run_zemosaic.py: mainloop() terminée ---")
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     print("Lancement de ZeMosaic via run_zemosaic.py (__name__ == '__main__')...")
     main()
     print("ZeMosaic terminé (sortie de __main__).")
