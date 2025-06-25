@@ -169,8 +169,9 @@ class ZeMosaicGUI:
         # Si la valeur dans config est -1 (ancienne convention pour auto), on la met à 0.
         num_workers_from_config = self.config.get("num_processing_workers", 0)
         if num_workers_from_config == -1:
-            num_workers_from_config = 0 
+            num_workers_from_config = 0
         self.num_workers_var = tk.IntVar(value=num_workers_from_config)
+        self.winsor_workers_var = tk.IntVar(value=self.config.get("winsor_worker_limit", 6))
         # --- FIN NOMBRE DE WORKERS ---
         # --- NOUVELLES VARIABLES TKINTER POUR LE ROGNAGE ---
         self.apply_master_tile_crop_var = tk.BooleanVar(
@@ -495,18 +496,36 @@ class ZeMosaicGUI:
             if max_spin_workers > 32: max_spin_workers = 32 # Plafonner à 32 pour éviter des valeurs trop grandes
         
         self.num_workers_spinbox = ttk.Spinbox(
-            perf_options_frame, 
+            perf_options_frame,
             from_=0,  # 0 pour auto
-            to=max_spin_workers, 
+            to=max_spin_workers,
             increment=1,
-            textvariable=self.num_workers_var, 
+            textvariable=self.num_workers_var,
             width=8 # Largeur fixe pour le spinbox
         )
         self.num_workers_spinbox.grid(row=0, column=1, padx=5, pady=5, sticky="w")
-        
+
         num_workers_note = ttk.Label(perf_options_frame, text="")
         num_workers_note.grid(row=0, column=2, padx=(10,5), pady=5, sticky="ew") # Note avec un peu plus de marge
         self.translatable_widgets["num_workers_note"] = num_workers_note
+
+        winsor_workers_label = ttk.Label(perf_options_frame, text="")
+        winsor_workers_label.grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        self.translatable_widgets["winsor_workers_label"] = winsor_workers_label
+
+        self.winsor_workers_spinbox = ttk.Spinbox(
+            perf_options_frame,
+            from_=1,
+            to=16,
+            increment=1,
+            textvariable=self.winsor_workers_var,
+            width=8
+        )
+        self.winsor_workers_spinbox.grid(row=1, column=1, padx=5, pady=5, sticky="w")
+
+        winsor_workers_note = ttk.Label(perf_options_frame, text="")
+        winsor_workers_note.grid(row=1, column=2, padx=(10,5), pady=5, sticky="ew")
+        self.translatable_widgets["winsor_workers_note"] = winsor_workers_note
         # --- FIN CADRE OPTIONS DE PERFORMANCE ---
         # --- NOUVEAU CADRE : OPTIONS DE ROGNAGE DES TUILES MAÎTRESSES ---
         crop_options_frame = ttk.LabelFrame(self.scrollable_content_frame, text="", padding="10")
@@ -1124,6 +1143,10 @@ class ZeMosaicGUI:
                 level="INFO",
             )
 
+        self.config["winsor_worker_limit"] = self.winsor_workers_var.get()
+        if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
+            zemosaic_config.save_config(self.config)
+
         worker_args = (
             input_dir, output_dir, astap_exe, astap_data,
             astap_radius_val, astap_downsample_val, astap_sensitivity_val,
@@ -1150,7 +1173,8 @@ class ZeMosaicGUI:
             self.cleanup_memmap_var.get(),
             self.auto_limit_frames_var.get(),
             self.config.get("assembly_process_workers", 0),
-            self.config.get("auto_limit_memory_fraction", 0.3)
+            self.config.get("auto_limit_memory_fraction", 0.3),
+            self.winsor_workers_var.get()
             # --- FIN NOUVEAUX ARGUMENTS ---
         )
         

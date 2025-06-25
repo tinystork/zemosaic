@@ -969,7 +969,7 @@ def _reject_outliers_winsorized_sigma_clip(
         sigma_low: Nombre de sigmas pour le seuil inférieur de rejet.
         sigma_high: Nombre de sigmas pour le seuil supérieur de rejet.
         progress_callback: Fonction de callback pour les logs.
-        max_workers: Nombre maximum de travailleurs parallèles pour la winsorisation.
+        max_workers: Nombre maximum de travailleurs parallèles pour la winsorisation.\n            Typiquement issu de ``run_cfg.winsor_worker_limit``.
 
     Returns:
         tuple[np.ndarray, np.ndarray]: 
