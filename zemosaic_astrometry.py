@@ -4,6 +4,7 @@ import os
 import numpy as np
 import warnings
 import time
+import re
 # import tempfile # Plus utilisé directement si on nettoie manuellement
 import traceback
 import subprocess
@@ -242,7 +243,7 @@ def solve_with_astap(image_fits_path: str,
     base_image_name_no_ext = os.path.splitext(os.path.basename(image_fits_path))[0]
     expected_wcs_file_path = os.path.join(current_image_dir, base_image_name_no_ext + ".wcs")
     expected_ini_file_path = os.path.join(current_image_dir, base_image_name_no_ext + ".ini")
-    astap_log_file_path = os.path.join(current_image_dir, base_image_name_no_ext + ".log")
+    astap_log_file_path = os.path.join(current_image_dir, "astap.log")
     files_to_cleanup_by_astap = [expected_wcs_file_path, expected_ini_file_path]
 
     for f_to_clean in files_to_cleanup_by_astap:
@@ -304,18 +305,13 @@ def solve_with_astap(image_fits_path: str,
 
     try:
 
-        astap_process_result = None
-        try:
-            if not multiprocessing.current_process().daemon:
-                with ProcessPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(_run_astap_subprocess, cmd_list_astap, current_image_dir, timeout_sec)
-                    astap_process_result = future.result()
-            else:
-                raise RuntimeError("daemon process")
-        except (AssertionError, RuntimeError) as e_pool:
-            if progress_callback:
-                progress_callback(f"  ASTAP Solve: ProcessPoolExecutor indisponible ({e_pool}). Lancement direct.", None, "DEBUG_DETAIL")
-            astap_process_result = _run_astap_subprocess(cmd_list_astap, current_image_dir, timeout_sec)
+        astap_process_result = subprocess.run(
+            cmd_list_astap,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout_sec,
+            cwd=current_image_dir
+        )
 
         logger.debug(f"ASTAP return code: {astap_process_result.returncode}")
 
@@ -325,42 +321,63 @@ def solve_with_astap(image_fits_path: str,
         _log_memory_usage(progress_callback, "Après GC post-ASTAP")
 
         if rc_astap == 0:
-            if os.path.exists(expected_wcs_file_path) and os.path.getsize(expected_wcs_file_path) > 0:
-                if progress_callback: progress_callback(f"  ASTAP Solve: Résolution OK (code 0). Fichier WCS '{os.path.basename(expected_wcs_file_path)}' trouvé.", None, "INFO_DETAIL")
-                img_height = original_fits_header.get('NAXIS2', 0)
-                img_width = original_fits_header.get('NAXIS1', 0)
-                if img_height == 0 or img_width == 0:
-                    try:
-                        with fits.open(image_fits_path) as hdul_shape:
-                            shape_from_file = hdul_shape[0].shape
-                            if len(shape_from_file) >=2 :
-                                img_height = shape_from_file[-2]
-                                img_width = shape_from_file[-1]
-                    except Exception as e_shape_read:
-                         if progress_callback: progress_callback(f"  ASTAP Solve AVERT: Impossible de lire NAXIS1/2 du header ou du fichier FITS: {e_shape_read}. WCS parsing pourrait échouer.", None, "WARN")
-                if img_height > 0 and img_width > 0:
-                    wcs_solved_obj = _parse_wcs_file_content_za(expected_wcs_file_path, (img_height, img_width), progress_callback)
-                else:
-                    if progress_callback: progress_callback(f"  ASTAP Solve ERREUR: Dimensions image (NAXIS1/2) non trouvées pour '{img_basename_log}'. WCS non parsé.", None, "ERROR")
-                if wcs_solved_obj and wcs_solved_obj.is_celestial:
+            log_path = os.path.join(current_image_dir, "astap.log")
+            if os.path.exists(log_path):
+                try:
+                    with open(log_path, "r") as f:
+                        text = f.read()
+
+                    crval1 = float(re.search(r"CRVAL1\s*=\s*([\d\.\-E]+)", text).group(1))
+                    crval2 = float(re.search(r"CRVAL2\s*=\s*([\d\.\-E]+)", text).group(1))
+                    crpix1 = float(re.search(r"CRPIX1\s*=\s*([\d\.\-E]+)", text).group(1))
+                    crpix2 = float(re.search(r"CRPIX2\s*=\s*([\d\.\-E]+)", text).group(1))
+                    cd11 = float(re.search(r"CD1_1\s*=\s*([\d\.\-E]+)", text).group(1))
+                    cd12 = float(re.search(r"CD1_2\s*=\s*([\d\.\-E]+)", text).group(1))
+                    cd21 = float(re.search(r"CD2_1\s*=\s*([\d\.\-E]+)", text).group(1))
+                    cd22 = float(re.search(r"CD2_2\s*=\s*([\d\.\-E]+)", text).group(1))
+
+                    with fits.open(image_fits_path, mode="update") as hdul:
+                        hdr = hdul[0].header
+                        hdr["CRVAL1"] = crval1
+                        hdr["CRVAL2"] = crval2
+                        hdr["CRPIX1"] = crpix1
+                        hdr["CRPIX2"] = crpix2
+                        hdr["CD1_1"] = cd11
+                        hdr["CD1_2"] = cd12
+                        hdr["CD2_1"] = cd21
+                        hdr["CD2_2"] = cd22
+                        hdul.flush()
+                        updated_header = hdr.copy()
+                    gc.collect()
+
+                    for key in ["CRVAL1", "CRVAL2", "CRPIX1", "CRPIX2", "CD1_1", "CD1_2", "CD2_1", "CD2_2"]:
+                        original_fits_header[key] = updated_header[key]
+
                     astap_success = True
-                    if progress_callback: progress_callback(f"  ASTAP Solve: Objet WCS créé et céleste pour '{img_basename_log}'.", None, "INFO")
-                    if update_original_header_in_place and original_fits_header is not None:
-                        if _update_fits_header_with_wcs_za(original_fits_header, wcs_solved_obj, progress_callback=progress_callback):
-                             if progress_callback: progress_callback(f"  ASTAP Solve: Header FITS original mis à jour avec WCS pour '{img_basename_log}'.", None, "DEBUG_DETAIL")
-                        else:
-                             if progress_callback: progress_callback(f"  ASTAP Solve AVERT: Échec MàJ header FITS original avec WCS pour '{img_basename_log}'.", None, "WARN")
-                else:
-                    if progress_callback: progress_callback(f"  ASTAP Solve ERREUR: WCS parsé non valide ou non céleste pour '{img_basename_log}'.", None, "ERROR")
-                    wcs_solved_obj = None
+                    if progress_callback:
+                        progress_callback("  ASTAP Solve: WCS mis à jour depuis astap.log.", None, "INFO_DETAIL")
+
+                    if ASTROPY_AVAILABLE_ASTROMETRY:
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore", FITSFixedWarning)
+                            wcs_solved_obj = AstropyWCS(updated_header, naxis=2, relax=True)
+                except Exception as e_parse:
+                    if progress_callback:
+                        progress_callback(f"  ASTAP Solve ERREUR: Échec parsing astap.log: {e_parse}", None, "ERROR")
+                    logger.error(f"Erreur parsing astap.log: {e_parse}", exc_info=True)
             else:
-                if progress_callback: progress_callback(f"  ASTAP Solve ERREUR: Code 0 mais fichier .wcs manquant/vide ('{os.path.basename(expected_wcs_file_path)}').", None, "ERROR")
+                if progress_callback:
+                    progress_callback("  ASTAP Solve ERREUR: astap.log absent.", None, "ERROR")
         else:
             error_msg = f"ASTAP Solve Échec (code {rc_astap}) pour '{img_basename_log}'."
-            if rc_astap == 1: error_msg += " (No solution found)."
-            elif rc_astap == 2: error_msg += " (ASTAP FITS read error - vérifiez format/corruption)."
-            elif rc_astap == 10: error_msg += " (ASTAP database not found - vérifiez -d)."
-            if progress_callback: progress_callback(f"  {error_msg}", None, "WARN")
+            if rc_astap == 1:
+                error_msg += " (No solution found)."
+            elif rc_astap == 2:
+                error_msg += " (ASTAP FITS read error - vérifiez format/corruption)."
+            elif rc_astap == 10:
+                error_msg += " (ASTAP database not found - vérifiez -d)."
+            if progress_callback:
+                progress_callback(f"  {error_msg}", None, "WARN")
             logger.warning(error_msg)
 
     except subprocess.TimeoutExpired:
