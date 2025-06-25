@@ -457,12 +457,17 @@ def get_wcs_and_pretreat_raw_file(file_path: str, astap_exe_path: str, astap_dat
     if wcs_brute is None and ZEMOSAIC_ASTROMETRY_AVAILABLE and zemosaic_astrometry:
         _pcb_local(f"    WCS non trouvé/valide dans header. Appel solve_with_astap pour '{filename}'.", lvl="DEBUG_DETAIL")
         wcs_brute = zemosaic_astrometry.solve_with_astap(
-            image_fits_path=file_path, original_fits_header=header_orig, 
-            astap_exe_path=astap_exe_path, astap_data_dir=astap_data_dir, 
-            search_radius_deg=astap_search_radius, downsample_factor=astap_downsample, 
-            sensitivity=astap_sensitivity, timeout_sec=astap_timeout_seconds, 
-            update_original_header_in_place=True, # Important que le header soit mis à jour
-            progress_callback=progress_callback
+            image_fits_path=file_path,
+            original_fits_header=header_orig,
+            astap_exe_path=astap_exe_path,
+            astap_data_dir=astap_data_dir,
+            search_radius_deg=astap_search_radius,
+            downsample_factor=astap_downsample,
+            sensitivity=astap_sensitivity,
+            timeout_sec=astap_timeout_seconds,
+            update_original_header_in_place=True,
+            use_astap_update=True,
+            progress_callback=progress_callback,
         )
         if wcs_brute: _pcb_local("getwcs_info_astap_solved", lvl="INFO_DETAIL", filename=filename)
         else: _pcb_local("getwcs_warn_astap_failed", lvl="WARN", filename=filename)
