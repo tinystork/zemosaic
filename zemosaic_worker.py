@@ -926,7 +926,11 @@ def assemble_final_mosaic_incremental(
     fits.writeto("SOMME.fits", np.zeros(sum_shape, dtype=dtype_accumulator), overwrite=True)
     fits.writeto("WEIGHT.fits", np.zeros(weight_shape, dtype=dtype_norm), overwrite=True)
 
-    max_procs = process_workers if process_workers and process_workers > 0 else min(os.cpu_count() or 1, len(master_tile_fits_with_wcs_list))
+    try:
+        req_workers = int(process_workers)
+    except Exception:
+        req_workers = 0
+    max_procs = req_workers if req_workers > 0 else min(os.cpu_count() or 1, len(master_tile_fits_with_wcs_list))
     pcb_asm(f"ASM_INC: Using {max_procs} process workers", lvl="DEBUG_DETAIL")
 
     with ProcessPoolExecutor(max_workers=max_procs) as ex, \
@@ -1263,7 +1267,11 @@ def assemble_final_mosaic_reproject_coadd(
             _log_memory_usage(progress_callback, f"Phase 5 (reproject_coadd) - Fin canal {i_channel+1} (après memmap)")
     else:
 
-        max_procs = process_workers if process_workers and process_workers > 0 else min(os.cpu_count() or 1, n_channels)
+        try:
+            req_workers = int(process_workers)
+        except Exception:
+            req_workers = 0
+        max_procs = req_workers if req_workers > 0 else min(os.cpu_count() or 1, n_channels)
         _pcb(f"ASM_REPROJ_COADD: Using {max_procs} process workers", lvl="DEBUG_DETAIL")
         with ProcessPoolExecutor(max_workers=max_procs) as ex:
 
