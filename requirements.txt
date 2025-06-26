@@ -6,5 +6,5 @@ opencv-python-headless
 tk
 psutil
 Photutils
-zarr>=2
+zarr
 scikit-image

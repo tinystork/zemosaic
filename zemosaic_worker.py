@@ -40,7 +40,7 @@ import zarr
 try:
     # Zarr >=2.x
     from zarr.storage import LRUStoreCache
-except Exception:  # pragma: no cover - fallback for older Zarr versions or zarr>=3
+except ImportError:  # pragma: no cover - fallback for older Zarr versions
     class LRUStoreCache:
         """Fallback pass-through cache when LRUStoreCache is unavailable."""
 
@@ -51,20 +51,10 @@ except Exception:  # pragma: no cover - fallback for older Zarr versions or zarr
             return getattr(self.store, name)
 
 try:
-    # Prefer storage module first (zarr < 3)
+    # Prefer storage module first
     from zarr.storage import DirectoryStore
-except Exception:
-    try:  # pragma: no cover - zarr >= 3 uses LocalStore
-        from zarr.storage import LocalStore as DirectoryStore
-    except Exception:
-        try:
-            from zarr.storage import FsspecStore
-            import fsspec
-
-            def DirectoryStore(path):
-                return FsspecStore(fsspec.filesystem("file").get_mapper(path))
-        except Exception:  # pragma: no cover - ultimate fallback
-            DirectoryStore = None
+except ImportError:  # pragma: no cover - use API root as fallback
+    from zarr import DirectoryStore
 
 # now LRUStoreCache and DirectoryStore are defined
 
@@ -1238,10 +1228,6 @@ def assemble_final_mosaic_reproject_coadd(
         memmap_dir = tempfile.mkdtemp(prefix="zemosaic_zarr_")
     os.makedirs(memmap_dir, exist_ok=True)
 
-    if DirectoryStore is None:
-        raise ImportError(
-            "Compatible DirectoryStore implementation not found in zarr."
-        )
     store = LRUStoreCache(DirectoryStore(memmap_dir), max_size=512 * 1024 * 1024)
     root = zarr.open_group(store=store, mode="a")
     if n_channels > 1:
