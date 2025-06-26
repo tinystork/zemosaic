@@ -36,6 +36,23 @@ logger.info("Logging pour ZeMosaicWorker initialisé. Logs écrits dans: %s", lo
 # --- Third-Party Library Imports ---
 import numpy as np
 import zarr
+try:
+    from zarr.storage import LRUStoreCache, DirectoryStore
+except Exception:  # pragma: no cover - fallback for older Zarr versions
+    from zarr.storage import DirectoryStore
+
+    class LRUStoreCache:
+        """Fallback pass-through cache when LRUStoreCache is unavailable."""
+
+        def __init__(self, store, max_size=None):
+            self.store = store
+
+        def __getattr__(self, name):
+            return getattr(self.store, name)
+
+    logger.warning(
+        "LRUStoreCache import failed; using pass-through store without caching"
+    )
 
 # --- Astropy (critique) ---
 ASTROPY_AVAILABLE = False
@@ -1203,13 +1220,15 @@ def assemble_final_mosaic_reproject_coadd(
         memmap_dir = tempfile.mkdtemp(prefix="zemosaic_zarr_")
     os.makedirs(memmap_dir, exist_ok=True)
 
-    root = zarr.open_group(memmap_dir, mode="a")
+    store = LRUStoreCache(DirectoryStore(memmap_dir), max_size=512 * 1024 * 1024)
+    root = zarr.open_group(store=store, mode="a")
     if n_channels > 1:
         mosaic = root.require_dataset(
             "mosaic",
             shape=(h, w, n_channels),
             dtype=np.float32,
             chunks=(512, 512, 1),
+            fill_value=0,
         )
     else:
         mosaic = root.require_dataset(
@@ -1217,15 +1236,15 @@ def assemble_final_mosaic_reproject_coadd(
             shape=(h, w),
             dtype=np.float32,
             chunks=(512, 512),
+            fill_value=0,
         )
     weight = root.require_dataset(
         "weight",
         shape=(h, w),
         dtype=np.float32,
         chunks=(512, 512),
+        fill_value=0,
     )
-    mosaic[...] = 0
-    weight[...] = 0
 
     try:
         req_workers = int(process_workers)
