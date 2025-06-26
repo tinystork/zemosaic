@@ -176,6 +176,7 @@
     "getwcs_warn_header_wcs_read_failed": "GetWCS_Pretreat AVERT : Échec lecture WCS du header FITS de '{filename}' : {error}. Tentative ASTAP.",
     "getwcs_info_astap_solved": "GetWCS_Pretreat : ASTAP a résolu '{filename}'.",
     "getwcs_warn_astap_failed": "GetWCS_Pretreat AVERT : ASTAP n'a PAS résolu '{filename}'.",
+    "getwcs_error_astap_tempfile_write_failed": "GetWCS_Pretreat ERREUR : Échec d'écriture du FITS temporaire pour ASTAP pour '{filename}' : {error}.",
     "getwcs_warn_no_header_wcs_astap_unavailable": "GetWCS_Pretreat AVERT : Pas de WCS dans header et ASTAP non disponible/utilisé pour '{filename}'.",
     "getwcs_error_final_wcs_invalid": "GetWCS_Pretreat ERREUR : WCS final pour '{filename}' non valide ou non céleste.",
     "getwcs_error_set_pixel_shape_final": "GetWCS_Pretreat ERREUR : Échec de la définition du pixel_shape final : {error}.",
