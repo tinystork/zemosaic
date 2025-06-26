@@ -7,3 +7,4 @@ tk
 psutil
 Photutils
 zarr>=2
+scikit-image
