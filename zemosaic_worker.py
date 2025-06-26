@@ -955,7 +955,8 @@ def assemble_final_mosaic_incremental(
         max_procs = min(os.cpu_count() or 1, len(master_tile_fits_with_wcs_list))
     pcb_asm(f"ASM_INC: Using {max_procs} process workers", lvl="DEBUG_DETAIL")
 
-    Executor = ProcessPoolExecutor
+    parent_is_daemon = multiprocessing.current_process().daemon
+    Executor = ThreadPoolExecutor if parent_is_daemon else ProcessPoolExecutor
 
 
     try:
