@@ -1268,7 +1268,13 @@ def assemble_final_mosaic_reproject_coadd(
             lvl="ERROR",
         )
         return None, None
-    store = LRUStoreCache(DirectoryStore(memmap_dir), max_size=512 * 1024 * 1024)
+    # zarr>=3 removed ``LRUStoreCache`` and the API now rejects unknown store
+    # wrappers.  When LRUStoreCache is unavailable (or we're using the simple
+    # compatibility shim defined above), fall back to the raw DirectoryStore.
+    if LRUStoreCache is not None and getattr(zarr, "__version__", "2")[0] == "2":
+        store = LRUStoreCache(DirectoryStore(memmap_dir), max_size=512 * 1024 * 1024)
+    else:
+        store = DirectoryStore(memmap_dir)
     root = zarr.open_group(store=store, mode="a")
     if n_channels > 1:
         mosaic = root.require_dataset(
