@@ -752,7 +752,10 @@ def create_master_tile(
         # pcb_tile(f"    {func_id_log_base}_{tile_id}_Img{i}: Lecture cache '{os.path.basename(cached_image_file_path)}'", prog=None, lvl="DEBUG_VERY_DETAIL")
         
         try:
-            img_data_adu = np.load(cached_image_file_path) 
+            # Load cached image using memmap to avoid pulling the entire
+            # array into RAM at once. Only accessed pages will be read
+            # into memory on demand.
+            img_data_adu = np.load(cached_image_file_path, mmap_mode='r')
             if not (isinstance(img_data_adu, np.ndarray) and img_data_adu.dtype == np.float32 and img_data_adu.ndim == 3 and img_data_adu.shape[-1] == 3):
                 pcb_tile(f"{func_id_log_base}_warn_invalid_cached_data", prog=None, lvl="WARN", filename=os.path.basename(cached_image_file_path), 
                          shape=img_data_adu.shape if hasattr(img_data_adu, 'shape') else 'N/A', 
