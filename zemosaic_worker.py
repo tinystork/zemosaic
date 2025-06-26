@@ -959,72 +959,95 @@ def assemble_final_mosaic_incremental(
             fsum = hsum[0].data
             fwei = hwei[0].data
 
-
-        future_map = {}
-        for tile_idx, (tile_path, tile_wcs) in enumerate(master_tile_fits_with_wcs_list, 1):
-            pcb_asm(
-                "assemble_info_processing_tile",
-                prog=None,
-                lvl="INFO_DETAIL",
-                tile_num=tile_idx,
-                total_tiles=len(master_tile_fits_with_wcs_list),
-                filename=os.path.basename(tile_path),
-            )
-            # Les objets WCS peuvent poser problème lors de la sérialisation.
-            # On transmet donc leurs en-têtes et ils seront reconstruits dans le worker.
-            tile_wcs_hdr = tile_wcs.to_header() if hasattr(tile_wcs, "to_header") else tile_wcs
-            output_wcs_hdr = final_output_wcs.to_header() if hasattr(final_output_wcs, "to_header") else final_output_wcs
-            future = ex.submit(
-                reproject_tile_to_mosaic,
-                tile_path,
-                tile_wcs_hdr,
-                output_wcs_hdr,
-                final_output_shape_hw,
-                True,
-                apply_crop,
-                crop_percent,
-            )
-            future_map[future] = tile_idx
-
-        processed = 0
-        for fut in as_completed(future_map):
-            idx = future_map[fut]
-            try:
-                I_tile, W_tile, (i0, i1, j0, j1) = fut.result()
-            except MemoryError as e_mem:
-                pcb_asm("assemble_error_memory_tile_reprojection_inc", prog=None, lvl="ERROR", tile_num=idx,
-                        error=str(e_mem))
-                logger.error(f"MemoryError reproject_tile_to_mosaic tuile {idx}", exc_info=True)
-                processed += 1
-                continue
-            except BrokenProcessPool as bpp:
-                pcb_asm("assemble_error_broken_process_pool_incremental", prog=None, lvl="ERROR", tile_num=idx,
-                        error=str(bpp))
-                logger.error("BrokenProcessPool during tile reprojection", exc_info=True)
-                return None, None
-            except Exception as e_reproj:
-                pcb_asm("assemble_error_tile_reprojection_failed_inc", prog=None, lvl="ERROR", tile_num=idx,
-                        error=str(e_reproj))
-                logger.error(f"Erreur reproject_tile_to_mosaic tuile {idx}", exc_info=True)
-                processed += 1
-                continue
-
-            if I_tile is not None and W_tile is not None:
-                for c in range(n_channels):
-                    fsum[j0:j1, i0:i1, c] += I_tile[..., c] * W_tile
-                fwei[j0:j1, i0:i1] += W_tile
-                hsum.flush()
-                hwei.flush()
-
-            processed += 1
-            if processed % 10 == 0 or processed == len(master_tile_fits_with_wcs_list):
+            future_map = {}
+            for tile_idx, (tile_path, tile_wcs) in enumerate(master_tile_fits_with_wcs_list, 1):
                 pcb_asm(
-                    "assemble_progress_tiles_processed_inc",
+                    "assemble_info_processing_tile",
                     prog=None,
                     lvl="INFO_DETAIL",
-                    num_done=processed,
-                    total_num=len(master_tile_fits_with_wcs_list),
+                    tile_num=tile_idx,
+                    total_tiles=len(master_tile_fits_with_wcs_list),
+                    filename=os.path.basename(tile_path),
                 )
+                # Les objets WCS peuvent poser problème lors de la sérialisation.
+                # On transmet donc leurs en-têtes et ils seront reconstruits dans le worker.
+                tile_wcs_hdr = tile_wcs.to_header() if hasattr(tile_wcs, "to_header") else tile_wcs
+                output_wcs_hdr = final_output_wcs.to_header() if hasattr(final_output_wcs, "to_header") else final_output_wcs
+                future = ex.submit(
+                    reproject_tile_to_mosaic,
+                    tile_path,
+                    tile_wcs_hdr,
+                    output_wcs_hdr,
+                    final_output_shape_hw,
+                    True,
+                    apply_crop,
+                    crop_percent,
+                )
+                future_map[future] = tile_idx
+
+            processed = 0
+            for fut in as_completed(future_map):
+                idx = future_map[fut]
+                try:
+                    I_tile, W_tile, (i0, i1, j0, j1) = fut.result()
+                except MemoryError as e_mem:
+                    pcb_asm(
+                        "assemble_error_memory_tile_reprojection_inc",
+                        prog=None,
+                        lvl="ERROR",
+                        tile_num=idx,
+                        error=str(e_mem),
+                    )
+                    logger.error(
+                        f"MemoryError reproject_tile_to_mosaic tuile {idx}",
+                        exc_info=True,
+                    )
+                    processed += 1
+                    continue
+                except BrokenProcessPool as bpp:
+                    pcb_asm(
+                        "assemble_error_broken_process_pool_incremental",
+                        prog=None,
+                        lvl="ERROR",
+                        tile_num=idx,
+                        error=str(bpp),
+                    )
+                    logger.error(
+                        "BrokenProcessPool during tile reprojection",
+                        exc_info=True,
+                    )
+                    return None, None
+                except Exception as e_reproj:
+                    pcb_asm(
+                        "assemble_error_tile_reprojection_failed_inc",
+                        prog=None,
+                        lvl="ERROR",
+                        tile_num=idx,
+                        error=str(e_reproj),
+                    )
+                    logger.error(
+                        f"Erreur reproject_tile_to_mosaic tuile {idx}",
+                        exc_info=True,
+                    )
+                    processed += 1
+                    continue
+
+                if I_tile is not None and W_tile is not None:
+                    for c in range(n_channels):
+                        fsum[j0:j1, i0:i1, c] += I_tile[..., c] * W_tile
+                    fwei[j0:j1, i0:i1] += W_tile
+                    hsum.flush()
+                    hwei.flush()
+
+                processed += 1
+                if processed % 10 == 0 or processed == len(master_tile_fits_with_wcs_list):
+                    pcb_asm(
+                        "assemble_progress_tiles_processed_inc",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                        num_done=processed,
+                        total_num=len(master_tile_fits_with_wcs_list),
+                    )
     except Exception as e_pool:
         pcb_asm("assemble_error_incremental_pool_failed", prog=None, lvl="ERROR", error=str(e_pool))
         logger.error("Error during incremental assembly", exc_info=True)
