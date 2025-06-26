@@ -890,7 +890,7 @@ def assemble_final_mosaic_incremental(
     dtype_norm: np.dtype = np.float32,
     apply_crop: bool = False,
     crop_percent: float = 0.0,
-    process_workers: int = 0,
+    processing_threads: int = 0,
     memmap_dir: str | None = None,
     cleanup_memmap: bool = True,
 ):
@@ -946,14 +946,16 @@ def assemble_final_mosaic_incremental(
 
 
     try:
-        req_workers = int(process_workers)
+        req_workers = int(processing_threads)
     except Exception:
         req_workers = 0
-    max_procs = req_workers if req_workers > 0 else min(os.cpu_count() or 1, len(master_tile_fits_with_wcs_list))
+    if req_workers > 0:
+        max_procs = req_workers
+    else:
+        max_procs = min(os.cpu_count() or 1, len(master_tile_fits_with_wcs_list))
     pcb_asm(f"ASM_INC: Using {max_procs} process workers", lvl="DEBUG_DETAIL")
 
-    parent_is_daemon = multiprocessing.current_process().daemon
-    Executor = ThreadPoolExecutor if parent_is_daemon else ProcessPoolExecutor
+    Executor = ProcessPoolExecutor
 
 
     try:
@@ -1901,7 +1903,7 @@ def run_hierarchical_mosaic(
             n_channels=3,
             apply_crop=apply_master_tile_crop_config,
             crop_percent=master_tile_crop_percent_config,
-            process_workers=assembly_process_workers_config,
+            processing_threads=num_base_workers_config,
             memmap_dir=inc_memmap_dir,
             cleanup_memmap=True,
             # --- FIN PASSAGE ---
