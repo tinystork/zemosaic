@@ -41,7 +41,8 @@ It was born out of a need from an astrophotography Discord community called the 
 
 ```bash
 pip install numpy astropy reproject opencv-python photutils scipy psutil
-No versions are pinned, but ZeMosaic is tested on Python 3.11+.
+The only pinned dependency is `zarr<3` because newer 3.x releases removed
+`DirectoryStore`, which ZeMosaic relies on. ZeMosaic is tested on Python 3.11+.
 
 🧠 Inspired by PixInsight
 ZeMosaic draws strong inspiration from the image integration strategies of PixInsight, developed by Juan Conejero at Pleiades Astrophoto.
@@ -84,7 +85,9 @@ tkinter for the graphical user interface
 If you have a local clone of the repository, make sure you're in the project folder, then run:
 
 pip install -r requirements.txt
-💡 No versions are pinned in requirements.txt to maintain flexibility. ZeMosaic is tested with Python 3.11+.
+💡 Requirements are mostly flexible, but `zarr<3` is pinned because the worker
+code depends on the legacy `DirectoryStore` API. ZeMosaic is tested with
+Python 3.11+.
 
 If you prefer to install manually:
 
