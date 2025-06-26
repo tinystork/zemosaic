@@ -1761,9 +1761,13 @@ def run_hierarchical_mosaic(
             pcb("run_error_phase5_inc_func_missing", prog=None, lvl="CRITICAL"); return
         pcb("run_info_phase5_started_incremental", prog=base_progress_phase5, lvl="INFO")
         final_mosaic_data_HWC, final_mosaic_coverage_HW = assemble_final_mosaic_incremental(
-            master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly, 
-            final_output_wcs=final_output_wcs, 
+            master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly,
+            final_output_wcs=final_output_wcs,
             final_output_shape_hw=final_output_shape_hw,
+            progress_callback=progress_callback,
+            n_channels=3,
+            apply_crop=apply_master_tile_crop_config,
+            crop_percent=master_tile_crop_percent_config,
             # --- FIN PASSAGE ---
         )
         log_key_phase5_failed = "run_error_phase5_assembly_failed_incremental"
