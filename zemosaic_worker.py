@@ -201,9 +201,29 @@ def _wait_for_memmap_files(prefixes, timeout=10.0):
 def reproject_tile_to_mosaic(tile_path: str, tile_wcs, mosaic_wcs, mosaic_shape_hw,
                              feather: bool = True):
     """Reprojecte une tuile sur la grille finale et renvoie l'image et sa carte
-    de poids avec la bounding box utile."""
+    de poids avec la bounding box utile.
+
+    ``tile_wcs`` et ``mosaic_wcs`` peuvent être soit des objets :class:`WCS`
+    directement, soit des en-têtes FITS (``dict`` ou :class:`~astropy.io.fits.Header``).
+    Cela permet d'utiliser cette fonction avec :class:`concurrent.futures.ProcessPoolExecutor`
+    où les arguments doivent être sérialisables.
+    """
     if not (REPROJECT_AVAILABLE and reproject_interp and ASTROPY_AVAILABLE and fits):
         return None, None, (0, 0, 0, 0)
+
+    # Les objets WCS ne sont pas toujours sérialisables via multiprocessing.
+    # Si on reçoit des en-têtes (dict ou fits.Header), reconstruire les WCS ici.
+    if ASTROPY_AVAILABLE and WCS:
+        if not isinstance(tile_wcs, WCS):
+            try:
+                tile_wcs = WCS(tile_wcs)
+            except Exception:
+                return None, None, (0, 0, 0, 0)
+        if not isinstance(mosaic_wcs, WCS):
+            try:
+                mosaic_wcs = WCS(mosaic_wcs)
+            except Exception:
+                return None, None, (0, 0, 0, 0)
 
     with fits.open(tile_path, memmap=False) as hdul:
         data = hdul[0].data.astype(np.float32)
@@ -906,8 +926,18 @@ def assemble_final_mosaic_incremental(
                 total_tiles=len(master_tile_fits_with_wcs_list),
                 filename=os.path.basename(tile_path),
             )
-            future = ex.submit(reproject_tile_to_mosaic, tile_path, tile_wcs, final_output_wcs,
-                               final_output_shape_hw, True)
+            # Les objets WCS peuvent poser problème lors de la sérialisation.
+            # On transmet donc leurs en-têtes et ils seront reconstruits dans le worker.
+            tile_wcs_hdr = tile_wcs.to_header() if hasattr(tile_wcs, "to_header") else tile_wcs
+            output_wcs_hdr = final_output_wcs.to_header() if hasattr(final_output_wcs, "to_header") else final_output_wcs
+            future = ex.submit(
+                reproject_tile_to_mosaic,
+                tile_path,
+                tile_wcs_hdr,
+                output_wcs_hdr,
+                final_output_shape_hw,
+                True,
+            )
             future_map[future] = tile_idx
 
         processed = 0
