@@ -1,6 +1,7 @@
 # zemosaic_align_stack.py
 
 import numpy as np
+from skimage.transform import warp
 import traceback
 import gc
 import logging  # Added for logger fallback
@@ -210,7 +211,7 @@ def align_images_in_group(image_data_list: list,
         if source_image_adu.ndim == 3 and source_image_adu.shape[-1] == 3:
             source_gray = np.mean(source_image_adu, axis=2).astype(np.float32)
         else:
-            source_gray = source_image_adu
+            source_gray = source_image_adu.astype(np.float32, copy=False)
 
         try:
             transform, _ = astroalign_module.find_transform(
@@ -220,57 +221,44 @@ def align_images_in_group(image_data_list: list,
                 min_area=min_area,
             )
 
-            aligned_channels = []
-            footprint_mask = None
             if source_image_adu.ndim == 3 and source_image_adu.shape[-1] == 3:
-                for ch in range(3):
-                    aligned_ch, footprint_mask = astroalign_module.apply_transform(
+                channels = []
+                for c in range(source_image_adu.shape[-1]):
+                    ch = source_image_adu[..., c].astype(np.float32)
+                    aligned_ch = warp(
+                        ch,
                         transform,
-                        source_image_adu[..., ch],
-                        reference_gray,
-                        propagate_mask=propagate_mask,
-                    )
-                    aligned_channels.append(aligned_ch)
-                aligned_image_output = np.stack(aligned_channels, axis=2)
+                        output_shape=reference_gray.shape,
+                        preserve_range=True,
+                    ).astype(np.float32)
+                    channels.append(aligned_ch)
+                aligned_image_output = np.stack(channels, axis=2)
             else:
-                aligned_image_output, footprint_mask = astroalign_module.apply_transform(
-                    transform,
+                aligned_image_output = warp(
                     source_image_adu,
-                    reference_gray,
-                    propagate_mask=propagate_mask,
-                )
+                    transform,
+                    output_shape=reference_gray.shape,
+                    preserve_range=True,
+                ).astype(np.float32)
 
-            if aligned_image_output is not None:
-                if aligned_image_output.shape != reference_image_adu.shape:
-                    _pcb(
-                        "aligngroup_warn_shape_mismatch_after_align",
-                        lvl="WARN",
-                        img_idx=i,
-                        aligned_shape=aligned_image_output.shape,
-                        ref_shape=reference_image_adu.shape,
-                    )
-                    aligned_images[i] = None
-                else:
-                    aligned_images[i] = aligned_image_output.astype(np.float32)
-                    _pcb(f"AlignGroup: Image {i} alignée.", lvl="DEBUG_DETAIL")
-            else:
-                _pcb("aligngroup_warn_register_returned_none", lvl="WARN", img_idx=i)
+            if aligned_image_output.shape != reference_image_adu.shape:
+                _pcb(
+                    "aligngroup_warn_shape_mismatch_after_align",
+                    lvl="WARN",
+                    img_idx=i,
+                    aligned_shape=aligned_image_output.shape,
+                    ref_shape=reference_image_adu.shape,
+                )
                 aligned_images[i] = None
-        except astroalign_module.MaxIterError:
-            _pcb("aligngroup_warn_max_iter_error", lvl="WARN", img_idx=i)
-            aligned_images[i] = None
-        except ValueError as ve:
-            _pcb("aligngroup_warn_value_error", lvl="WARN", img_idx=i, error=str(ve))
-            aligned_images[i] = None
-        except Exception as e_align:
+            else:
+                aligned_images[i] = aligned_image_output
+                _pcb(f"AlignGroup: Image {i} alignée.", lvl="DEBUG_DETAIL")
+        except Exception as e:
             _pcb(
-                "aligngroup_error_exception_aligning",
-                lvl="ERROR",
+                f"aligngroup_warn_exception: {type(e).__name__} {e}",
+                lvl="WARN",
                 img_idx=i,
-                error_type=type(e_align).__name__,
-                error_msg=str(e_align),
             )
-            _pcb(f"AlignGroup Traceback: {traceback.format_exc()}", lvl="DEBUG_DETAIL")
             aligned_images[i] = None
     return aligned_images
 
