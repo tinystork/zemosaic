@@ -339,16 +339,34 @@ def reproject_tile_to_mosaic(file_path: str, tile_wcs: WCS, output_wcs: WCS,
         wx = np.ones(w, dtype=np.float32)
     weight_orig = np.outer(wy, wx).astype(np.float32)
 
-    proj_weight, _ = reproject_interp((weight_orig, tile_wcs), output_wcs,
-                                      shape_out=output_shape_hw, order='bilinear', parallel=False,
-                                      fill_value=np.nan)
+    # ``reproject_interp`` does not accept a ``fill_value`` argument in
+    # all versions of ``reproject``. To keep zeros outside the valid area
+    # but mark them as missing, we call the function without this argument
+    # and mask using the returned footprint.
+    proj_weight, footprint = reproject_interp(
+        (weight_orig, tile_wcs),
+        output_wcs,
+        shape_out=output_shape_hw,
+        order='bilinear',
+        parallel=False,
+        return_footprint=True,
+    )
+    proj_weight = np.where(footprint > 0, proj_weight, 0.0).astype(np.float32)
     proj_weight = np.nan_to_num(proj_weight, nan=0.0).astype(np.float32)
 
     reproj_stack = np.zeros((output_shape_hw[0], output_shape_hw[1], n_channels), dtype=np.float32)
     for i in range(n_channels):
-        reproj, _ = reproject_interp((data_hwc[..., i], tile_wcs), output_wcs,
-                                     shape_out=output_shape_hw, order='bilinear', parallel=False,
-                                     fill_value=np.nan)
+        reproj, footprint = reproject_interp(
+            (data_hwc[..., i], tile_wcs),
+            output_wcs,
+            shape_out=output_shape_hw,
+            order='bilinear',
+            parallel=False,
+            return_footprint=True,
+        )
+        # Replace values outside the footprint with NaN so that borders
+        # become transparent when stacked.
+        reproj = np.where(footprint > 0, reproj, np.nan)
         reproj_stack[..., i] = reproj.astype(np.float32)
 
     mask = proj_weight > 1e-6
@@ -1246,7 +1264,13 @@ def assemble_final_mosaic_reproject_coadd(
             mm_sum[:] = 0.0
             mm_cov[:] = 0.0
             for img_hw, hdr in ch_data:
-                reproj, footprint = reproject_interp((img_hw, WCS(hdr)), final_output_wcs, shape_out=final_output_shape_hw, fill_value=np.nan)
+                reproj, footprint = reproject_interp(
+                    (img_hw, WCS(hdr)),
+                    final_output_wcs,
+                    shape_out=final_output_shape_hw,
+                    return_footprint=True,
+                )
+                reproj = np.where(footprint > 0, reproj, np.nan)
                 if match_bg:
                     # --- Background matching for memmap path ---
                     overlap_mask = (footprint > 0) & (mm_cov > 0)
