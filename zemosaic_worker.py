@@ -199,7 +199,9 @@ def _wait_for_memmap_files(prefixes, timeout=10.0):
 
 
 def reproject_tile_to_mosaic(tile_path: str, tile_wcs, mosaic_wcs, mosaic_shape_hw,
-                             feather: bool = True):
+                             feather: bool = True,
+                             apply_crop: bool = False,
+                             crop_percent: float = 0.0):
     """Reprojecte une tuile sur la grille finale et renvoie l'image et sa carte
     de poids avec la bounding box utile.
 
@@ -231,6 +233,23 @@ def reproject_tile_to_mosaic(tile_path: str, tile_wcs, mosaic_wcs, mosaic_shape_
     if data.ndim == 2:
         data = data[..., np.newaxis]
     n_channels = data.shape[-1]
+
+    # Optional cropping of the tile before reprojection
+    if apply_crop and crop_percent > 1e-3 and ZEMOSAIC_UTILS_AVAILABLE \
+            and hasattr(zemosaic_utils, "crop_image_and_wcs"):
+        try:
+            cropped, cropped_wcs = zemosaic_utils.crop_image_and_wcs(
+                data,
+                tile_wcs,
+                crop_percent / 100.0,
+                progress_callback=None,
+            )
+            if cropped is not None and cropped_wcs is not None:
+                data = cropped
+                tile_wcs = cropped_wcs
+                n_channels = data.shape[-1]
+        except Exception:
+            pass
 
     base_weight = np.ones(data.shape[:2], dtype=np.float32)
     if feather and ZEMOSAIC_UTILS_AVAILABLE and hasattr(zemosaic_utils, 'make_radial_weight_map'):
@@ -937,6 +956,8 @@ def assemble_final_mosaic_incremental(
                 output_wcs_hdr,
                 final_output_shape_hw,
                 True,
+                apply_crop,
+                crop_percent,
             )
             future_map[future] = tile_idx
 
