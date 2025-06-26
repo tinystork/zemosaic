@@ -895,6 +895,7 @@ def assemble_final_mosaic_incremental(
     cleanup_memmap: bool = True,
 ):
     """Assemble les master tiles par co-addition sur disque."""
+    FLUSH_BATCH_SIZE = 10  # nombre de tuiles entre chaque flush sur le memmap
     pcb_asm = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
         msg_key, prog, lvl, callback=progress_callback, **kwargs
     )
@@ -965,6 +966,8 @@ def assemble_final_mosaic_incremental(
                 fits.open(weight_path, mode="update", memmap=True) as hwei:
             fsum = hsum[0].data
             fwei = hwei[0].data
+
+            tiles_since_flush = 0
 
             future_map = {}
             for tile_idx, (tile_path, tile_wcs) in enumerate(master_tile_fits_with_wcs_list, 1):
@@ -1043,8 +1046,11 @@ def assemble_final_mosaic_incremental(
                     for c in range(n_channels):
                         fsum[j0:j1, i0:i1, c] += I_tile[..., c] * W_tile
                     fwei[j0:j1, i0:i1] += W_tile
-                    hsum.flush()
-                    hwei.flush()
+                    tiles_since_flush += 1
+                    if tiles_since_flush >= FLUSH_BATCH_SIZE:
+                        hsum.flush()
+                        hwei.flush()
+                        tiles_since_flush = 0
 
                 processed += 1
                 if processed % 10 == 0 or processed == len(master_tile_fits_with_wcs_list):
@@ -1055,6 +1061,11 @@ def assemble_final_mosaic_incremental(
                         num_done=processed,
                         total_num=len(master_tile_fits_with_wcs_list),
                     )
+
+            if tiles_since_flush > 0:
+                hsum.flush()
+                hwei.flush()
+                tiles_since_flush = 0
     except Exception as e_pool:
         pcb_asm("assemble_error_incremental_pool_failed", prog=None, lvl="ERROR", error=str(e_pool))
         logger.error("Error during incremental assembly", exc_info=True)
