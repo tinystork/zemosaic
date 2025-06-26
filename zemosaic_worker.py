@@ -893,6 +893,7 @@ def assemble_final_mosaic_incremental(
     dtype_norm: np.dtype = np.float32,
     apply_crop: bool = False,
     crop_percent: float = 0.0,
+    temp_dir: str | None = None,
 ):
     """Assemble les master tuiles par co-addition incrémentale sur disque."""
 
@@ -918,8 +919,12 @@ def assemble_final_mosaic_incremental(
         pcb_asm("assemble_error_no_tiles_provided_incremental", prog=None, lvl="ERROR")
         return None, None
 
-    sum_path = "SOMME.fits"
-    weight_path = "WEIGHT.fits"
+    if temp_dir is None:
+        temp_dir = os.getcwd()
+    os.makedirs(temp_dir, exist_ok=True)
+
+    sum_path = os.path.join(temp_dir, "SOMME.fits")
+    weight_path = os.path.join(temp_dir, "WEIGHT.fits")
     pcb_asm("assemble_info_initializing_fits", prog=None, lvl="DEBUG_DETAIL", shape=str(final_output_shape_hw), channels=n_channels)
     fits.writeto(sum_path, np.zeros((final_output_shape_hw[0], final_output_shape_hw[1], n_channels), dtype=np.float64), overwrite=True)
     fits.writeto(weight_path, np.zeros(final_output_shape_hw, dtype=np.float32), overwrite=True)
@@ -981,10 +986,23 @@ def assemble_final_mosaic_incremental(
     with fits.open(sum_path, memmap=True) as hsum, fits.open(weight_path, memmap=True) as hwei:
         fsum = hsum[0].data
         fwei = hwei[0].data
-        final_mosaic_hwc = np.divide(fsum, fwei[..., np.newaxis], out=np.zeros_like(fsum, dtype=np.float32), where=fwei[..., np.newaxis] > 0)
+        final_mosaic_hwc = np.divide(
+            fsum,
+            fwei[..., np.newaxis],
+            out=np.zeros_like(fsum, dtype=np.float32),
+            where=fwei[..., np.newaxis] > 0,
+        )
     hdr_global = final_output_wcs.to_header() if final_output_wcs else fits.Header()
-    fits.writeto("MOSAIC_FINAL.fits", final_mosaic_hwc.astype(np.float32), header=hdr_global, overwrite=True)
+    final_mosaic_path = os.path.join(temp_dir, "MOSAIC_FINAL.fits")
+    fits.writeto(final_mosaic_path, final_mosaic_hwc.astype(np.float32), header=hdr_global, overwrite=True)
     pcb_asm("assemble_info_finished_incremental", prog=None, lvl="INFO", shape=str(final_mosaic_hwc.shape))
+
+    for _path in (sum_path, weight_path, final_mosaic_path):
+        try:
+            os.remove(_path)
+        except OSError:
+            pass
+
     return final_mosaic_hwc.astype(np.float32), fwei.astype(np.float32)
 
 
@@ -1841,6 +1859,7 @@ def run_hierarchical_mosaic(
             n_channels=3,
             apply_crop=apply_master_tile_crop_config,
             crop_percent=master_tile_crop_percent_config,
+            temp_dir=coadd_memmap_dir_config or input_folder,
         )
         log_key_phase5_failed = "run_error_phase5_assembly_failed_incremental"
         log_key_phase5_finished = "run_info_phase5_finished_incremental"
