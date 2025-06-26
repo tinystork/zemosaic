@@ -316,6 +316,49 @@ def _load_wcs_from_fits(file_path: str) -> WCS:
         return WCS(hdr, naxis=2, relax=True)
 
 
+def reproject_tile_to_mosaic(file_path: str, tile_wcs: WCS, output_wcs: WCS,
+                             output_shape_hw: tuple, n_channels: int,
+                             feather: bool = True):
+    """Reproject a tile onto the mosaic with optional feathering."""
+    with fits.open(file_path, memmap=True, do_not_scale_image_data=True) as hdul:
+        data = hdul[0].data.astype(np.float32)
+
+    if data.ndim == 3 and data.shape[0] == n_channels:
+        data_hwc = np.moveaxis(data, 0, -1)
+    elif data.ndim == 2 and n_channels == 1:
+        data_hwc = data[..., np.newaxis]
+    else:
+        raise ValueError("Tile channels mismatch")
+
+    h, w = data_hwc.shape[:2]
+    if feather:
+        wy = np.bartlett(h)
+        wx = np.bartlett(w)
+    else:
+        wy = np.ones(h, dtype=np.float32)
+        wx = np.ones(w, dtype=np.float32)
+    weight_orig = np.outer(wy, wx).astype(np.float32)
+
+    proj_weight, _ = reproject_interp((weight_orig, tile_wcs), output_wcs,
+                                      shape_out=output_shape_hw, order='bilinear', parallel=False)
+    proj_weight = np.nan_to_num(proj_weight, nan=0.0).astype(np.float32)
+
+    reproj_stack = np.zeros((output_shape_hw[0], output_shape_hw[1], n_channels), dtype=np.float32)
+    for i in range(n_channels):
+        reproj, _ = reproject_interp((data_hwc[..., i], tile_wcs), output_wcs,
+                                     shape_out=output_shape_hw, order='bilinear', parallel=False)
+        reproj_stack[..., i] = reproj.astype(np.float32)
+
+    mask = proj_weight > 1e-6
+    if not np.any(mask):
+        return None, None, (0, 0, 0, 0)
+    rows = np.where(mask.any(axis=1))[0]
+    cols = np.where(mask.any(axis=0))[0]
+    j0, j1 = rows.min(), rows.max() + 1
+    i0, i1 = cols.min(), cols.max() + 1
+    return reproj_stack[j0:j1, i0:i1, :], proj_weight[j0:j1, i0:i1], (i0, i1, j0, j1)
+
+
 def cluster_seestar_stacks(all_raw_files_with_info: list, stack_threshold_deg: float, progress_callback: callable):
     if not (ASTROPY_AVAILABLE and SkyCoord and u): _log_and_callback("clusterstacks_error_astropy_unavailable", level="ERROR", callback=progress_callback); return []
     if not all_raw_files_with_info: _log_and_callback("clusterstacks_warn_no_raw_info", level="WARN", callback=progress_callback); return []
@@ -823,56 +866,47 @@ def create_master_tile(
             del master_tile_stacked_HWC
         gc.collect()
 
-
-
-# Dans zemosaic_worker.py
-
-# ... (s'assurer que zemosaic_utils est importé et ZEMOSAIC_UTILS_AVAILABLE est défini)
-# ... (s'assurer que WCS, fits d'Astropy sont importés, ainsi que reproject_interp)
-# ... (définition de logger, _log_and_callback, etc.)
-
 def assemble_final_mosaic_incremental(
     master_tile_fits_with_wcs_list: list,
-    final_output_wcs: WCS, 
+    final_output_wcs: WCS,
     final_output_shape_hw: tuple,
     progress_callback: callable,
     n_channels: int = 3,
     dtype_accumulator: np.dtype = np.float64,
     dtype_norm: np.dtype = np.float32,
     apply_crop: bool = False,
-    crop_percent: float = 0.0
+    crop_percent: float = 0.0,
 ):
-    """
-    Assemble les master tuiles en une mosaïque finale de manière incrémentale.
-    Peut optionnellement rogner les master tuiles avant assemblage.
-    """
-    pcb_asm = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: \
-        _log_and_callback(msg_key, prog, lvl, callback=progress_callback, **kwargs)
+    """Assemble les master tuiles par co-addition incrémentale sur disque."""
 
-    pcb_asm(f"ASM_INC: Début. Options rognage - Appliquer: {apply_crop}, %: {crop_percent if apply_crop else 'N/A'}", lvl="DEBUG_DETAIL")
+    pcb_asm = lambda msg, prog=None, lvl="INFO_DETAIL", **kw: _log_and_callback(msg, prog, lvl, callback=progress_callback, **kw)
+
+    pcb_asm(
+        f"ASM_INC: Début. Options rognage - Appliquer: {apply_crop}, %: {crop_percent if apply_crop else 'N/A'}",
+        lvl="DEBUG_DETAIL",
+    )
 
     if not (REPROJECT_AVAILABLE and reproject_interp and ASTROPY_AVAILABLE and fits):
-        missing_deps = []
-        if not REPROJECT_AVAILABLE or not reproject_interp: missing_deps.append("Reproject (reproject_interp)")
-        if not ASTROPY_AVAILABLE or not fits : missing_deps.append("Astropy (fits)")
-        pcb_asm("assemble_error_core_deps_unavailable_incremental", prog=None, lvl="ERROR", missing=", ".join(missing_deps)); return None, None
+        missing = []
+        if not REPROJECT_AVAILABLE or not reproject_interp:
+            missing.append("Reproject (reproject_interp)")
+        if not ASTROPY_AVAILABLE or not fits:
+            missing.append("Astropy (fits)")
+        pcb_asm("assemble_error_core_deps_unavailable_incremental", prog=None, lvl="ERROR", missing=", ".join(missing))
+        return None, None
 
     num_master_tiles = len(master_tile_fits_with_wcs_list)
     pcb_asm("assemble_info_start_incremental", prog=None, lvl="INFO", num_tiles=num_master_tiles)
     if not master_tile_fits_with_wcs_list:
-        pcb_asm("assemble_error_no_tiles_provided_incremental", prog=None, lvl="ERROR"); return None, None
+        pcb_asm("assemble_error_no_tiles_provided_incremental", prog=None, lvl="ERROR")
+        return None, None
 
-    final_shape_for_accumulators_hwc = (final_output_shape_hw[0], final_output_shape_hw[1], n_channels)
-    pcb_asm("assemble_info_allocating_accumulators", prog=None, lvl="DEBUG_DETAIL", shape=str(final_shape_for_accumulators_hwc), dtype_sum=str(dtype_accumulator), dtype_norm=str(dtype_norm))
-    try:
-        running_sum_accumulator = np.zeros(final_shape_for_accumulators_hwc, dtype=dtype_accumulator)
-        running_norm_accumulator = np.zeros(final_shape_for_accumulators_hwc, dtype=dtype_norm)
-        final_pixel_contributions = np.zeros(final_output_shape_hw, dtype=np.float32) 
-    except MemoryError as e_mem_acc: 
-        pcb_asm("assemble_error_memory_allocating_accumulators", prog=None, lvl="ERROR", error=str(e_mem_acc)); logger.error("MemoryError allocation accumulateurs (incrémental).", exc_info=True); return None, None
-    except Exception as e_acc: 
-        pcb_asm("assemble_error_allocating_accumulators", prog=None, lvl="ERROR", error=str(e_acc)); logger.error("Erreur allocation accumulateurs (incrémental).", exc_info=True); return None, None
-    pcb_asm("assemble_info_accumulators_allocated", prog=None, lvl="DEBUG_DETAIL")
+    sum_path = "SOMME.fits"
+    weight_path = "WEIGHT.fits"
+    pcb_asm("assemble_info_initializing_fits", prog=None, lvl="DEBUG_DETAIL", shape=str(final_output_shape_hw), channels=n_channels)
+    fits.writeto(sum_path, np.zeros((final_output_shape_hw[0], final_output_shape_hw[1], n_channels), dtype=np.float64), overwrite=True)
+    fits.writeto(weight_path, np.zeros(final_output_shape_hw, dtype=np.float32), overwrite=True)
+    final_pixel_contributions = np.zeros(final_output_shape_hw, dtype=np.float32)
 
     for tile_idx, tile_entry in enumerate(master_tile_fits_with_wcs_list, 1):
         if isinstance(tile_entry, (list, tuple)) and len(tile_entry) == 2:
@@ -889,139 +923,60 @@ def assemble_final_mosaic_incremental(
             total_tiles=num_master_tiles,
             filename=os.path.basename(tile_path),
         )
-        
-        # Initialisation des variables pour ce scope de boucle
-        current_tile_data_hwc = None
-        data_to_use_for_reproject = None
-        wcs_to_use_for_reproject = None
-        tile_processed_successfully_this_iteration = False
 
-        try:
-            with fits.open(tile_path, memmap=False, do_not_scale_image_data=True) as hdul:  # memmap=False est plus sûr pour éviter problèmes de fichiers ouverts
-                if not hdul or not hasattr(hdul[0], 'data') or hdul[0].data is None:
-                    pcb_asm("assemble_warn_tile_empty_or_no_data_inc", prog=None, lvl="WARN", filename=os.path.basename(tile_path))
-                    continue
-
-                data_tile_cxhxw = hdul[0].data.astype(np.float32)
-                if data_tile_cxhxw.ndim == 3 and data_tile_cxhxw.shape[0] == n_channels:
-                    current_tile_data_hwc = np.moveaxis(data_tile_cxhxw, 0, -1)
-                elif data_tile_cxhxw.ndim == 2 and n_channels == 1:
-                    current_tile_data_hwc = data_tile_cxhxw[..., np.newaxis]
-                else:
-                    pcb_asm("assemble_warn_tile_shape_mismatch_inc", prog=None, lvl="WARN", filename=os.path.basename(tile_path), shape=str(data_tile_cxhxw.shape), expected_channels=n_channels)
-                    del data_tile_cxhxw; gc.collect(); continue
-            del data_tile_cxhxw; gc.collect()
-
-            data_to_use_for_reproject = current_tile_data_hwc
-
-            wcs_to_use_for_reproject = mt_wcs_obj_original
-            if wcs_to_use_for_reproject is None:
-                try:
-                    wcs_to_use_for_reproject = _load_wcs_from_fits(tile_path)
-                except Exception:
-                    pcb_asm("assemble_warn_tile_wcs_load_failed_inc", prog=None, lvl="WARN", filename=os.path.basename(tile_path))
-                    continue
-
-
-            if apply_crop and crop_percent > 1e-3:  # Appliquer si crop_percent significatif
-                cropped_data, cropped_wcs = None, None
-                if ZEMOSAIC_UTILS_AVAILABLE and hasattr(zemosaic_utils, 'crop_image_and_wcs'):
-                    pcb_asm(f"  ASM_INC: Rognage {crop_percent:.1f}% pour tuile {os.path.basename(tile_path)}", lvl="DEBUG_DETAIL")
-                    cropped_data, cropped_wcs = zemosaic_utils.crop_image_and_wcs(
-                        current_tile_data_hwc,
-                        wcs_to_use_for_reproject,
-                        crop_percent / 100.0,
-                        progress_callback,
-                    )
-                    if cropped_data is not None and cropped_wcs is not None:
-                        data_to_use_for_reproject = cropped_data
-                        wcs_to_use_for_reproject = cropped_wcs
-                        pcb_asm(
-                            f"    Nouvelle shape après rognage: {data_to_use_for_reproject.shape[:2]}",
-                            lvl="DEBUG_VERY_DETAIL",
-                        )
-                    else:
-                        pcb_asm(
-                            f"  ASM_INC: AVERT - Rognage a échoué pour tuile {os.path.basename(tile_path)}. Utilisation tuile non rognée.",
-                            lvl="WARN",
-                        )
-                else:
-                    pcb_asm(
-                        f"  ASM_INC: AVERT - Option rognage activée mais zemosaic_utils.crop_image_and_wcs non dispo.",
-                        lvl="WARN",
-                    )
-            
-            if data_to_use_for_reproject is None or wcs_to_use_for_reproject is None: 
-                pcb_asm(f"  ASM_INC: Données ou WCS pour reprojection sont None pour tuile {os.path.basename(tile_path)}, ignorée.", lvl="WARN")
+        wcs_to_use_for_reproject = mt_wcs_obj_original
+        if wcs_to_use_for_reproject is None:
+            try:
+                wcs_to_use_for_reproject = _load_wcs_from_fits(tile_path)
+            except Exception:
+                pcb_asm("assemble_warn_tile_wcs_load_failed_inc", prog=None, lvl="WARN", filename=os.path.basename(tile_path))
                 continue
 
-            tile_footprint_combined_for_coverage = np.zeros(final_output_shape_hw, dtype=bool)
-            for i_channel in range(n_channels):
-                channel_data_to_reproject = None
-                if data_to_use_for_reproject.ndim == 3 and data_to_use_for_reproject.shape[-1] > i_channel:
-                    channel_data_to_reproject = data_to_use_for_reproject[..., i_channel]
-                elif data_to_use_for_reproject.ndim == 2 and i_channel == 0:
-                    channel_data_to_reproject = data_to_use_for_reproject
-                
-                if channel_data_to_reproject is None:
-                    pcb_asm(f"  ASM_INC: Canal {i_channel} non trouvé pour reproj (tuile {tile_idx}), shape: {data_to_use_for_reproject.shape}", lvl="WARN"); continue
+        try:
+            I_tile, W_tile, (i0, i1, j0, j1) = reproject_tile_to_mosaic(
+                tile_path,
+                wcs_to_use_for_reproject,
+                final_output_wcs,
+                final_output_shape_hw,
+                n_channels,
+                feather=True,
+            )
+            if I_tile is None or W_tile is None:
+                continue
+            with fits.open(sum_path, mode="update", memmap=True) as hsum, fits.open(weight_path, mode="update", memmap=True) as hwei:
+                fsum = hsum[0].data
+                fwei = hwei[0].data
+                fsum[j0:j1, i0:i1, :] += I_tile * W_tile[..., np.newaxis]
+                fwei[j0:j1, i0:i1] += W_tile
+                hsum.flush(); hwei.flush()
+            final_pixel_contributions[j0:j1, i0:i1] += (W_tile > 0).astype(np.float32)
+        except MemoryError as me:
+            pcb_asm("assemble_error_memory_processing_tile_inc", prog=None, lvl="ERROR", filename=os.path.basename(tile_path), error=str(me))
+            logger.error(f"MemoryError traitement tuile {tile_path} (incrémental).", exc_info=True)
+        except Exception as e:
+            pcb_asm("assemble_error_processing_tile_inc", prog=None, lvl="WARN", filename=os.path.basename(tile_path), error=str(e))
+            logger.error(f"Erreur traitement tuile {tile_path} (incrémental).", exc_info=True)
 
-                input_for_reproject = (channel_data_to_reproject, wcs_to_use_for_reproject)
-                reprojected_channel_data, footprint_channel = reproject_interp(input_for_reproject, final_output_wcs, shape_out=final_output_shape_hw, order='bilinear', parallel=False)
-                valid_pixels_mask_footprint = footprint_channel > 0.01
-                if np.any(valid_pixels_mask_footprint):
-                    weights_for_channel = footprint_channel[valid_pixels_mask_footprint]; data_to_add = reprojected_channel_data[valid_pixels_mask_footprint]
-                    running_sum_accumulator[..., i_channel][valid_pixels_mask_footprint] += data_to_add * weights_for_channel
-                    running_norm_accumulator[..., i_channel][valid_pixels_mask_footprint] += weights_for_channel
-                    if i_channel == 0: tile_footprint_combined_for_coverage |= valid_pixels_mask_footprint
-                del reprojected_channel_data, footprint_channel, valid_pixels_mask_footprint
-                if 'weights_for_channel' in locals(): del weights_for_channel
-                if 'data_to_add' in locals(): del data_to_add
-                gc.collect()
-            
-            if np.any(tile_footprint_combined_for_coverage):
-                final_pixel_contributions[tile_footprint_combined_for_coverage] += 1.0
-            tile_processed_successfully_this_iteration = True # Marquer comme succès pour cette itération
-
-        except MemoryError as e_mem_tile:
-             pcb_asm("assemble_error_memory_processing_tile_inc", prog=None, lvl="ERROR", filename=os.path.basename(tile_path), error=str(e_mem_tile)); logger.error(f"MemoryError traitement tuile {tile_path} (incrémental).", exc_info=True)
-        except Exception as e_tile:
-            pcb_asm("assemble_error_processing_tile_inc", prog=None, lvl="WARN", filename=os.path.basename(tile_path), error=str(e_tile)); logger.error(f"Erreur traitement tuile {tile_path} (incrémental).", exc_info=True)
-        finally:
-            # current_tile_data_hwc a été chargé du FITS
-            if current_tile_data_hwc is not None:
-                del current_tile_data_hwc
-            
-            # data_to_use_for_reproject peut être le même objet que current_tile_data_hwc (pas de rognage)
-            # ou un nouvel objet (rognage appliqué). S'il est différent, il faut le supprimer aussi.
-            if 'data_to_use_for_reproject' in locals() and \
-               data_to_use_for_reproject is not None and \
-               (locals().get('current_tile_data_hwc_exists_before_del', False) and \
-                data_to_use_for_reproject is not current_tile_data_hwc): # current_tile_data_hwc n'existe plus si déjà supprimé
-                 del data_to_use_for_reproject
-            elif 'data_to_use_for_reproject' in locals() and data_to_use_for_reproject is not None and not locals().get('current_tile_data_hwc_exists_before_del', False):
-                 # Si current_tile_data_hwc a été del mais data_to_use_for_reproject est toujours là (devrait être le même objet dans ce cas)
-                 # cette condition est complexe, simplifions en s'assurant qu'ils sont initialisés à None.
-                 pass # La suppression de current_tile_data_hwc (si non None) devrait suffire si pas de rognage.
-
-            # Simplification du finally pour le nettoyage des données de tuile
-            # Les variables sont initialisées à None au début de la boucle.
-            # On s'assure juste de supprimer si elles ont été peuplées.
-            # gc.collect() est appelé à la fin.
-
-        # ... (log de progression) ...
-        if tile_idx % 10 == 0 or tile_idx == num_master_tiles : 
+        if tile_idx % 10 == 0 or tile_idx == num_master_tiles:
             pcb_asm("assemble_progress_tiles_processed_inc", prog=None, lvl="INFO_DETAIL", num_done=tile_idx, total_num=num_master_tiles)
 
     pcb_asm("assemble_info_final_normalization_inc", prog=None, lvl="DEBUG_DETAIL")
-    epsilon = 1e-9; final_mosaic_hwc = np.zeros_like(running_sum_accumulator, dtype=np.float32)
-    for i_channel in range(n_channels):
-        norm_channel_values = running_norm_accumulator[..., i_channel]; sum_channel_values = running_sum_accumulator[..., i_channel]
-        valid_norm_mask = norm_channel_values > epsilon
-        np.divide(sum_channel_values, norm_channel_values, out=final_mosaic_hwc[..., i_channel], where=valid_norm_mask)
-    del running_sum_accumulator, running_norm_accumulator; gc.collect()
-    pcb_asm("assemble_info_finished_incremental", prog=None, lvl="INFO", shape=str(final_mosaic_hwc.shape if final_mosaic_hwc is not None else "N/A"))
-    return final_mosaic_hwc, final_pixel_contributions.astype(np.float32)
+    with fits.open(sum_path, memmap=True) as hsum, fits.open(weight_path, memmap=True) as hwei:
+        fsum = hsum[0].data
+        fwei = hwei[0].data
+        final_mosaic_hwc = np.divide(fsum, fwei[..., np.newaxis], out=np.zeros_like(fsum, dtype=np.float32), where=fwei[..., np.newaxis] > 0)
+    hdr_global = final_output_wcs.to_header() if final_output_wcs else fits.Header()
+    fits.writeto("MOSAIC_FINAL.fits", final_mosaic_hwc.astype(np.float32), header=hdr_global, overwrite=True)
+    pcb_asm("assemble_info_finished_incremental", prog=None, lvl="INFO", shape=str(final_mosaic_hwc.shape))
+    return final_mosaic_hwc.astype(np.float32), fwei.astype(np.float32)
+
+
+# Dans zemosaic_worker.py
+
+# ... (s'assurer que zemosaic_utils est importé et ZEMOSAIC_UTILS_AVAILABLE est défini)
+# ... (s'assurer que WCS, fits d'Astropy sont importés, ainsi que reproject_interp)
+# ... (définition de logger, _log_and_callback, etc.)
+
 
 
 
