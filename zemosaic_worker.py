@@ -454,7 +454,6 @@ def get_wcs_and_pretreat_raw_file(file_path: str, astap_exe_path: str, astap_dat
     _pcb_local(f"  Post-Load: '{filename}' - Shape: {img_data_raw_adu.shape}, Dtype: {img_data_raw_adu.dtype}", lvl="DEBUG_VERY_DETAIL")
 
     img_data_processed_adu = img_data_raw_adu.astype(np.float32, copy=True)
-    del img_data_raw_adu; gc.collect()
 
     # --- Débayerisation ---
     if img_data_processed_adu.ndim == 2:
@@ -523,17 +522,45 @@ def get_wcs_and_pretreat_raw_file(file_path: str, astap_exe_path: str, astap_dat
             wcs_brute = None
             
     if wcs_brute is None and ZEMOSAIC_ASTROMETRY_AVAILABLE and zemosaic_astrometry:
-        _pcb_local(f"    WCS non trouvé/valide dans header. Appel solve_with_astap pour '{filename}'.", lvl="DEBUG_DETAIL")
-        wcs_brute = zemosaic_astrometry.solve_with_astap(
-            image_fits_path=file_path, original_fits_header=header_orig, 
-            astap_exe_path=astap_exe_path, astap_data_dir=astap_data_dir, 
-            search_radius_deg=astap_search_radius, downsample_factor=astap_downsample, 
-            sensitivity=astap_sensitivity, timeout_sec=astap_timeout_seconds, 
-            update_original_header_in_place=True, # Important que le header soit mis à jour
-            progress_callback=progress_callback
+        _pcb_local(
+            f"    WCS non trouvé/valide dans header. Appel solve_with_astap pour '{filename}'.",
+            lvl="DEBUG_DETAIL",
         )
-        if wcs_brute: _pcb_local("getwcs_info_astap_solved", lvl="INFO_DETAIL", filename=filename)
-        else: _pcb_local("getwcs_warn_astap_failed", lvl="WARN", filename=filename)
+
+        tempdir_astap = tempfile.mkdtemp(prefix="astap_")
+        basename = os.path.splitext(filename)[0]
+        temp_fits = os.path.join(tempdir_astap, f"{basename}_minimal.fits")
+        fits.writeto(temp_fits, img_data_raw_adu, header=header_orig, overwrite=True, memmap=True)
+
+        try:
+            wcs_brute = zemosaic_astrometry.solve_with_astap(
+                image_fits_path=temp_fits,
+                original_fits_header=header_orig,
+                astap_exe_path=astap_exe_path,
+                astap_data_dir=astap_data_dir,
+                search_radius_deg=astap_search_radius,
+                downsample_factor=astap_downsample,
+                sensitivity=astap_sensitivity,
+                timeout_sec=astap_timeout_seconds,
+                update_original_header_in_place=True,
+                progress_callback=progress_callback,
+            )
+            if wcs_brute:
+                _pcb_local("getwcs_info_astap_solved", lvl="INFO_DETAIL", filename=filename)
+            else:
+                _pcb_local("getwcs_warn_astap_failed", lvl="WARN", filename=filename)
+        except Exception as e_astap_call:
+            _pcb_local("getwcs_error_astap_exception", lvl="ERROR", filename=filename, error=str(e_astap_call))
+            logger.error(f"Erreur ASTAP pour {filename}", exc_info=True)
+            wcs_brute = None
+        finally:
+            del img_data_raw_adu
+            gc.collect()
+            try:
+                os.remove(temp_fits)
+                os.rmdir(tempdir_astap)
+            except Exception:
+                pass
     elif wcs_brute is None: # Ni header, ni ASTAP n'a fonctionné ou n'était dispo
         _pcb_local("getwcs_warn_no_wcs_source_available_or_failed", lvl="WARN", filename=filename)
         # Action de déplacement sera gérée par le check suivant
@@ -1597,77 +1624,121 @@ def run_hierarchical_mosaic(
     files_processed_count_ph1 = 0      # Compteur pour les fichiers soumis au ThreadPoolExecutor
 
     with ThreadPoolExecutor(max_workers=actual_num_workers_ph1, thread_name_prefix="ZeMosaic_Ph1_") as executor_ph1:
-        future_to_filepath_ph1 = { 
-            executor_ph1.submit(
-                get_wcs_and_pretreat_raw_file, 
-                f_path, 
-                astap_exe_path, 
-                astap_data_dir_param, 
-                astap_search_radius_config, 
-                astap_downsample_config, 
-                astap_sensitivity_config, 
-                180, # astap_timeout_seconds
-                progress_callback,
-                temp_image_cache_dir
-            ): f_path for f_path in fits_file_paths
-        }
-        
-        for future in as_completed(future_to_filepath_ph1):
-            file_path_original = future_to_filepath_ph1[future]
-            files_processed_count_ph1 += 1 # Incrémenter pour chaque future terminée
-            
-            prog_step_phase1 = base_progress_phase1 + int(PROGRESS_WEIGHT_PHASE1_RAW_SCAN * (files_processed_count_ph1 / max(1, num_total_raw_files)))
-            
-            try:
-                # Récupérer le résultat de la tâche
-                img_data_adu, wcs_obj_solved, header_obj_updated, hp_mask_path = future.result()
-                
-                # Si la tâche a réussi (ne retourne pas que des None)
-                if img_data_adu is not None and wcs_obj_solved is not None and header_obj_updated is not None:
-                    # Sauvegarder les données prétraitées en .npy
-                    cache_file_basename = f"preprocessed_{os.path.splitext(os.path.basename(file_path_original))[0]}_{files_processed_count_ph1}.npy"
-                    cached_image_path = os.path.join(temp_image_cache_dir, cache_file_basename)
-                    try:
-                        np.save(cached_image_path, img_data_adu)
-                        # Stocker les informations pour les phases suivantes
-                        all_raw_files_processed_info_dict[file_path_original] = {
-                            'path_raw': file_path_original, 
-                            'path_preprocessed_cache': cached_image_path,
-                            'path_hotpix_mask': hp_mask_path,
-                            'wcs': wcs_obj_solved,
-                            'header': header_obj_updated
-                        }
-                        # pcb(f"Phase 1: Fichier '{os.path.basename(file_path_original)}' traité et mis en cache.", prog=prog_step_phase1, lvl="DEBUG_VERY_DETAIL") # Optionnel
-                    except Exception as e_save_npy:
-                        pcb("run_error_phase1_save_npy_failed", prog=prog_step_phase1, lvl="ERROR", filename=os.path.basename(file_path_original), error=str(e_save_npy))
-                        logger.error(f"Erreur sauvegarde NPY pour {file_path_original}:", exc_info=True)
-                    finally: 
-                        # Libérer la mémoire des données image dès que possible
-                        del img_data_adu; gc.collect() 
-                else: 
-                    # Le fichier a échoué (ex: WCS non résolu et déplacé)
-                    # get_wcs_and_pretreat_raw_file a déjà loggué l'échec spécifique.
-                    pcb("run_warn_phase1_wcs_pretreat_failed_or_skipped_thread", prog=prog_step_phase1, lvl="WARN", filename=os.path.basename(file_path_original))
-                    # S'assurer que img_data_adu est bien None si le retour était None,None,None pour éviter del sur None
-                    if img_data_adu is not None: del img_data_adu; gc.collect()
+        batch_size = 200
+        for i in range(0, len(fits_file_paths), batch_size):
+            batch = fits_file_paths[i:i+batch_size]
+            future_to_filepath_ph1 = {
+                executor_ph1.submit(
+                    get_wcs_and_pretreat_raw_file,
+                    f_path,
+                    astap_exe_path,
+                    astap_data_dir_param,
+                    astap_search_radius_config,
+                    astap_downsample_config,
+                    astap_sensitivity_config,
+                    180,
+                    progress_callback,
+                    temp_image_cache_dir
+                ): f_path for f_path in batch
+            }
 
-            except Exception as exc_thread: 
-                # Erreur imprévue dans la future elle-même
-                pcb("run_error_phase1_thread_exception", prog=prog_step_phase1, lvl="ERROR", filename=os.path.basename(file_path_original), error=str(exc_thread))
-                logger.error(f"Exception non gérée dans le thread Phase 1 pour {file_path_original}:", exc_info=True)
-            
-            # Log de mémoire et ETA
-            if files_processed_count_ph1 % max(1, num_total_raw_files // 10) == 0 or files_processed_count_ph1 == num_total_raw_files: 
-                _log_memory_usage(progress_callback, f"Phase 1 - Traité {files_processed_count_ph1}/{num_total_raw_files}")
-            
-            elapsed_phase1 = time.monotonic() - start_time_phase1
-            if files_processed_count_ph1 > 0 : # Eviter division par zéro si aucun fichier traité (ne devrait pas arriver ici)
-                time_per_raw_file_wcs = elapsed_phase1 / files_processed_count_ph1
-                eta_phase1_sec = (num_total_raw_files - files_processed_count_ph1) * time_per_raw_file_wcs
-                current_progress_in_run_percent = base_progress_phase1 + (files_processed_count_ph1 / max(1, num_total_raw_files)) * PROGRESS_WEIGHT_PHASE1_RAW_SCAN
-                time_per_percent_point_global = (time.monotonic() - start_time_total_run) / max(1, current_progress_in_run_percent) if current_progress_in_run_percent > 0 else (time.monotonic() - start_time_total_run)
-                total_eta_sec = eta_phase1_sec + (100 - current_progress_in_run_percent) * time_per_percent_point_global
-                update_gui_eta(total_eta_sec)
+            for future in as_completed(future_to_filepath_ph1):
+                file_path_original = future_to_filepath_ph1[future]
+                files_processed_count_ph1 += 1  # Incrémenter pour chaque future terminée
+
+                prog_step_phase1 = base_progress_phase1 + int(
+                    PROGRESS_WEIGHT_PHASE1_RAW_SCAN * (files_processed_count_ph1 / max(1, num_total_raw_files))
+                )
+
+                try:
+                    # Récupérer le résultat de la tâche
+                    img_data_adu, wcs_obj_solved, header_obj_updated, hp_mask_path = future.result()
+
+                    # Si la tâche a réussi (ne retourne pas que des None)
+                    if (
+                        img_data_adu is not None
+                        and wcs_obj_solved is not None
+                        and header_obj_updated is not None
+                    ):
+                        # Sauvegarder les données prétraitées en .npy
+                        cache_file_basename = f"preprocessed_{os.path.splitext(os.path.basename(file_path_original))[0]}_{files_processed_count_ph1}.npy"
+                        cached_image_path = os.path.join(temp_image_cache_dir, cache_file_basename)
+                        try:
+                            np.save(cached_image_path, img_data_adu)
+                            # Stocker les informations pour les phases suivantes
+                            all_raw_files_processed_info_dict[file_path_original] = {
+                                'path_raw': file_path_original,
+                                'path_preprocessed_cache': cached_image_path,
+                                'path_hotpix_mask': hp_mask_path,
+                                'wcs': wcs_obj_solved,
+                                'header': header_obj_updated,
+                            }
+                        except Exception as e_save_npy:
+                            pcb(
+                                "run_error_phase1_save_npy_failed",
+                                prog=prog_step_phase1,
+                                lvl="ERROR",
+                                filename=os.path.basename(file_path_original),
+                                error=str(e_save_npy),
+                            )
+                            logger.error(f"Erreur sauvegarde NPY pour {file_path_original}:", exc_info=True)
+                        finally:
+                            # Libérer la mémoire des données image dès que possible
+                            del img_data_adu
+                            gc.collect()
+                    else:
+                        # Le fichier a échoué (ex: WCS non résolu et déplacé)
+                        # get_wcs_and_pretreat_raw_file a déjà loggué l'échec spécifique.
+                        pcb(
+                            "run_warn_phase1_wcs_pretreat_failed_or_skipped_thread",
+                            prog=prog_step_phase1,
+                            lvl="WARN",
+                            filename=os.path.basename(file_path_original),
+                        )
+                        if img_data_adu is not None:
+                            del img_data_adu
+                            gc.collect()
+
+                except Exception as exc_thread:
+                    # Erreur imprévue dans la future elle-même
+                    pcb(
+                        "run_error_phase1_thread_exception",
+                        prog=prog_step_phase1,
+                        lvl="ERROR",
+                        filename=os.path.basename(file_path_original),
+                        error=str(exc_thread),
+                    )
+                    logger.error(
+                        f"Exception non gérée dans le thread Phase 1 pour {file_path_original}:",
+                        exc_info=True,
+                    )
+
+                # Log de mémoire et ETA
+                if (
+                    files_processed_count_ph1 % max(1, num_total_raw_files // 10) == 0
+                    or files_processed_count_ph1 == num_total_raw_files
+                ):
+                    _log_memory_usage(
+                        progress_callback,
+                        f"Phase 1 - Traité {files_processed_count_ph1}/{num_total_raw_files}",
+                    )
+
+                elapsed_phase1 = time.monotonic() - start_time_phase1
+                if files_processed_count_ph1 > 0:
+                    time_per_raw_file_wcs = elapsed_phase1 / files_processed_count_ph1
+                    eta_phase1_sec = (num_total_raw_files - files_processed_count_ph1) * time_per_raw_file_wcs
+                    current_progress_in_run_percent = base_progress_phase1 + (
+                        files_processed_count_ph1 / max(1, num_total_raw_files)
+                    ) * PROGRESS_WEIGHT_PHASE1_RAW_SCAN
+                    time_per_percent_point_global = (
+                        (time.monotonic() - start_time_total_run) / max(1, current_progress_in_run_percent)
+                        if current_progress_in_run_percent > 0
+                        else (time.monotonic() - start_time_total_run)
+                    )
+                    total_eta_sec = eta_phase1_sec + (
+                        100 - current_progress_in_run_percent
+                    ) * time_per_percent_point_global
+                    update_gui_eta(total_eta_sec)
 
     # Construire la liste finale des informations des fichiers traités avec succès
     all_raw_files_processed_info = [
