@@ -10,10 +10,6 @@ import subprocess
 # import shutil # Plus utilisé directement si on nettoie manuellement
 import gc
 import logging
-import psutil
-from concurrent.futures import ProcessPoolExecutor
-
-import multiprocessing
 
 
 logger = logging.getLogger("ZeMosaicAstrometry")
@@ -34,40 +30,8 @@ except ImportError:
     class FITSFixedWarning(Warning): pass
     u = None
 
-
-def _log_memory_usage(progress_callback: callable, context_message: str = ""):
-    """Logue l'utilisation mémoire du processus courant."""
-    if not progress_callback or not callable(progress_callback):
-        return
-    try:
-        process = psutil.Process(os.getpid())
-        mem_info = process.memory_info()
-        rss_mb = mem_info.rss / (1024 * 1024)
-        vms_mb = mem_info.vms / (1024 * 1024)
-
-        virtual_mem = psutil.virtual_memory()
-        available_ram_mb = virtual_mem.available / (1024 * 1024)
-        total_ram_mb = virtual_mem.total / (1024 * 1024)
-        percent_ram_used = virtual_mem.percent
-
-        swap_mem = psutil.swap_memory()
-        used_swap_mb = swap_mem.used / (1024 * 1024)
-        total_swap_mb = swap_mem.total / (1024 * 1024)
-        percent_swap_used = swap_mem.percent
-
-        log_msg = (
-            f"Memory Usage ({context_message}): "
-            f"Proc RSS: {rss_mb:.1f}MB, VMS: {vms_mb:.1f}MB. "
-            f"Sys RAM: Avail {available_ram_mb:.0f}MB / Total {total_ram_mb:.0f}MB ({percent_ram_used}% used). "
-            f"Sys Swap: Used {used_swap_mb:.0f}MB / Total {total_swap_mb:.0f}MB ({percent_swap_used}% used)."
-        )
-        progress_callback(log_msg, None, "DEBUG")
-    except Exception as e_mem_log:
-        progress_callback(f"Erreur lors du logging mémoire ({context_message}): {e_mem_log}", None, "WARN")
-
-
 def _run_astap_subprocess(cmd_list: list, cwd: str, timeout_sec: int):
-    """Fonction exécutée dans un ProcessPoolExecutor pour lancer ASTAP."""
+    """Launch ASTAP using subprocess.run."""
     return subprocess.run(
         cmd_list,
         stdout=subprocess.DEVNULL,
@@ -304,25 +268,22 @@ def solve_with_astap(image_fits_path: str,
 
     try:
 
-        astap_process_result = None
-        try:
-            if not multiprocessing.current_process().daemon:
-                with ProcessPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(_run_astap_subprocess, cmd_list_astap, current_image_dir, timeout_sec)
-                    astap_process_result = future.result()
-            else:
-                raise RuntimeError("daemon process")
-        except (AssertionError, RuntimeError) as e_pool:
-            if progress_callback:
-                progress_callback(f"  ASTAP Solve: ProcessPoolExecutor indisponible ({e_pool}). Lancement direct.", None, "DEBUG_DETAIL")
-            astap_process_result = _run_astap_subprocess(cmd_list_astap, current_image_dir, timeout_sec)
-
+        astap_process_result = subprocess.run(
+            cmd_list_astap,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+            check=False,
+            cwd=current_image_dir,
+            errors='replace',
+        )
         logger.debug(f"ASTAP return code: {astap_process_result.returncode}")
+        if astap_process_result.stdout:
+            logger.debug(f"ASTAP stdout:\n{astap_process_result.stdout[:1000]}")
+        if astap_process_result.stderr:
+            logger.warning(f"ASTAP stderr:\n{astap_process_result.stderr[:1000]}")
 
         rc_astap = astap_process_result.returncode
-        del astap_process_result
-        gc.collect()
-        _log_memory_usage(progress_callback, "Après GC post-ASTAP")
 
         if rc_astap == 0:
             if os.path.exists(expected_wcs_file_path) and os.path.getsize(expected_wcs_file_path) > 0:
