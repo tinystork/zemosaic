@@ -890,6 +890,8 @@ def assemble_final_mosaic_incremental(
     apply_crop: bool = False,
     crop_percent: float = 0.0,
     process_workers: int = 0,
+    memmap_dir: str | None = None,
+    cleanup_memmap: bool = True,
 ):
     """Assemble les master tiles par co-addition sur disque."""
     pcb_asm = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
@@ -923,8 +925,22 @@ def assemble_final_mosaic_incremental(
     sum_shape = (h, w, n_channels)
     weight_shape = (h, w)
 
-    fits.writeto("SOMME.fits", np.zeros(sum_shape, dtype=dtype_accumulator), overwrite=True)
-    fits.writeto("WEIGHT.fits", np.zeros(weight_shape, dtype=dtype_norm), overwrite=True)
+    internal_temp_dir = False
+    if memmap_dir is None:
+        memmap_dir = tempfile.mkdtemp(prefix="zemosaic_memmap_")
+        internal_temp_dir = True
+    else:
+        os.makedirs(memmap_dir, exist_ok=True)
+    sum_path = os.path.join(memmap_dir, "SOMME.fits")
+    weight_path = os.path.join(memmap_dir, "WEIGHT.fits")
+
+    try:
+        fits.writeto(sum_path, np.zeros(sum_shape, dtype=dtype_accumulator), overwrite=True)
+        fits.writeto(weight_path, np.zeros(weight_shape, dtype=dtype_norm), overwrite=True)
+    except Exception as e_create:
+        pcb_asm("assemble_error_memmap_write_failed_inc", prog=None, lvl="ERROR", error=str(e_create))
+        logger.error("Failed to create memmap FITS", exc_info=True)
+        return None, None
 
     try:
         req_workers = int(process_workers)
@@ -933,11 +949,12 @@ def assemble_final_mosaic_incremental(
     max_procs = req_workers if req_workers > 0 else min(os.cpu_count() or 1, len(master_tile_fits_with_wcs_list))
     pcb_asm(f"ASM_INC: Using {max_procs} process workers", lvl="DEBUG_DETAIL")
 
-    with ProcessPoolExecutor(max_workers=max_procs) as ex, \
-            fits.open("SOMME.fits", mode="update", memmap=True) as hsum, \
-            fits.open("WEIGHT.fits", mode="update", memmap=True) as hwei:
-        fsum = hsum[0].data
-        fwei = hwei[0].data
+    try:
+        with ProcessPoolExecutor(max_workers=max_procs) as ex, \
+                fits.open(sum_path, mode="update", memmap=True) as hsum, \
+                fits.open(weight_path, mode="update", memmap=True) as hwei:
+            fsum = hsum[0].data
+            fwei = hwei[0].data
 
         future_map = {}
         for tile_idx, (tile_path, tile_wcs) in enumerate(master_tile_fits_with_wcs_list, 1):
@@ -1004,14 +1021,31 @@ def assemble_final_mosaic_incremental(
                     num_done=processed,
                     total_num=len(master_tile_fits_with_wcs_list),
                 )
+    except Exception as e_pool:
+        pcb_asm("assemble_error_incremental_pool_failed", prog=None, lvl="ERROR", error=str(e_pool))
+        logger.error("Error during incremental assembly", exc_info=True)
+        return None, None
 
-    with fits.open("SOMME.fits", memmap=True) as hsum, fits.open("WEIGHT.fits", memmap=True) as hwei:
+    with fits.open(sum_path, memmap=True) as hsum, fits.open(weight_path, memmap=True) as hwei:
         sum_data = hsum[0].data.astype(np.float32)
         weight_data = hwei[0].data.astype(np.float32)
         mosaic = np.zeros_like(sum_data, dtype=np.float32)
         np.divide(sum_data, weight_data[..., None], out=mosaic, where=weight_data[..., None] > 0)
 
     pcb_asm("assemble_info_finished_incremental", prog=None, lvl="INFO", shape=str(mosaic.shape))
+
+    if cleanup_memmap:
+        for p in (sum_path, weight_path):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        if internal_temp_dir:
+            try:
+                os.rmdir(memmap_dir)
+            except OSError:
+                pass
+
     return mosaic, weight_data
 
 def _reproject_and_coadd_channel_worker(channel_data_list, output_wcs_header, output_shape_hw, match_bg, mm_sum_prefix=None, mm_cov_prefix=None):
@@ -1825,6 +1859,7 @@ def run_hierarchical_mosaic(
         if not incremental_available: 
             pcb("run_error_phase5_inc_func_missing", prog=None, lvl="CRITICAL"); return
         pcb("run_info_phase5_started_incremental", prog=base_progress_phase5, lvl="INFO")
+        inc_memmap_dir = temp_master_tile_storage_dir or output_folder
         final_mosaic_data_HWC, final_mosaic_coverage_HW = assemble_final_mosaic_incremental(
             master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly,
             final_output_wcs=final_output_wcs,
@@ -1834,6 +1869,8 @@ def run_hierarchical_mosaic(
             apply_crop=apply_master_tile_crop_config,
             crop_percent=master_tile_crop_percent_config,
             process_workers=assembly_process_workers_config,
+            memmap_dir=inc_memmap_dir,
+            cleanup_memmap=True,
             # --- FIN PASSAGE ---
         )
         log_key_phase5_failed = "run_error_phase5_assembly_failed_incremental"
