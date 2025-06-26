@@ -36,13 +36,16 @@ logger.info("Logging pour ZeMosaicWorker initialisé. Logs écrits dans: %s", lo
 # --- Third-Party Library Imports ---
 import numpy as np
 import zarr
+from packaging.version import Version
 
 try:
-    # Zarr >=2.x
     from zarr.storage import LRUStoreCache
-except Exception:  # pragma: no cover - fallback for older Zarr versions or zarr>=3
+    if Version(zarr.__version__).major >= 3:
+        # In zarr>=3 LRUStoreCache was removed. Use a no-op wrapper
+        raise ImportError
+except Exception:  # pragma: no cover - fallback for zarr>=3 or missing cache
     class LRUStoreCache:
-        """Fallback pass-through cache when LRUStoreCache is unavailable."""
+        """Simple pass-through wrapper used when LRUStoreCache is unavailable."""
 
         def __init__(self, store, max_size=None):
             self.store = store
