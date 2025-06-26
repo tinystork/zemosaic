@@ -43,8 +43,9 @@ It was born out of a need from an astrophotography Discord community called the 
 pip install numpy astropy reproject opencv-python photutils scipy psutil
 ```
 The worker originally required `DirectoryStore`, removed in `zarr>=3`.
-ZeMosaic now falls back to `LocalStore`, so both zarr 2.x and 3.x are
-supported (tested on Python 3.11+).
+ZeMosaic now falls back to `LocalStore`, and skips the old
+`LRUStoreCache` wrapper when running against Zarr 3.
+Both Zarr 2.x and 3.x are supported (tested on Python 3.11+).
 
 🧠 Inspired by PixInsight
 ZeMosaic draws strong inspiration from the image integration strategies of PixInsight, developed by Juan Conejero at Pleiades Astrophoto.
