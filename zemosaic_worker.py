@@ -569,7 +569,6 @@ def get_wcs_and_pretreat_raw_file(file_path: str, astap_exe_path: str, astap_dat
                 img_data_raw_adu,
                 header=header_orig,
                 overwrite=True,
-                memmap=True,
             )
         except Exception as e_tmp_write:
             _pcb_local(
