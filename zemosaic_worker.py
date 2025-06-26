@@ -1260,9 +1260,11 @@ def assemble_final_mosaic_reproject_coadd(
     os.makedirs(memmap_dir, exist_ok=True)
 
     if DirectoryStore is None:
-        raise ImportError(
-            "Compatible DirectoryStore implementation not found in zarr."
+        _pcb(
+            "ASM_REPROJ_COADD ERROR: Zarr DirectoryStore unavailable. Install 'zarr' package.",
+            lvl="ERROR",
         )
+        return None, None
     store = LRUStoreCache(DirectoryStore(memmap_dir), max_size=512 * 1024 * 1024)
     root = zarr.open_group(store=store, mode="a")
     if n_channels > 1:
