@@ -553,29 +553,34 @@ def get_wcs_and_pretreat_raw_file(file_path: str, astap_exe_path: str, astap_dat
         tempdir_astap = tempfile.mkdtemp(prefix="astap_")
         basename = os.path.splitext(filename)[0]
         temp_fits = os.path.join(tempdir_astap, f"{basename}_minimal.fits")
-        fits.writeto(temp_fits, img_data_raw_adu, header=header_orig, overwrite=True, memmap=True)
-
         try:
-            wcs_brute = zemosaic_astrometry.solve_with_astap(
-                image_fits_path=temp_fits,
-                original_fits_header=header_orig,
-                astap_exe_path=astap_exe_path,
-                astap_data_dir=astap_data_dir,
-                search_radius_deg=astap_search_radius,
-                downsample_factor=astap_downsample,
-                sensitivity=astap_sensitivity,
-                timeout_sec=astap_timeout_seconds,
-                update_original_header_in_place=True,
-                progress_callback=progress_callback,
-            )
-            if wcs_brute:
-                _pcb_local("getwcs_info_astap_solved", lvl="INFO_DETAIL", filename=filename)
-            else:
-                _pcb_local("getwcs_warn_astap_failed", lvl="WARN", filename=filename)
-        except Exception as e_astap_call:
-            _pcb_local("getwcs_error_astap_exception", lvl="ERROR", filename=filename, error=str(e_astap_call))
-            logger.error(f"Erreur ASTAP pour {filename}", exc_info=True)
+            fits.writeto(temp_fits, img_data_raw_adu, header=header_orig, overwrite=True)
+        except Exception as e_write:
+            _pcb_local("getwcs_error_temp_fits_write_failed", lvl="ERROR", filename=filename, error=str(e_write))
+            logger.error(f"Erreur écriture fichier FITS temporaire pour ASTAP ({filename}): {e_write}", exc_info=True)
             wcs_brute = None
+        else:
+            try:
+                wcs_brute = zemosaic_astrometry.solve_with_astap(
+                    image_fits_path=temp_fits,
+                    original_fits_header=header_orig,
+                    astap_exe_path=astap_exe_path,
+                    astap_data_dir=astap_data_dir,
+                    search_radius_deg=astap_search_radius,
+                    downsample_factor=astap_downsample,
+                    sensitivity=astap_sensitivity,
+                    timeout_sec=astap_timeout_seconds,
+                    update_original_header_in_place=True,
+                    progress_callback=progress_callback,
+                )
+                if wcs_brute:
+                    _pcb_local("getwcs_info_astap_solved", lvl="INFO_DETAIL", filename=filename)
+                else:
+                    _pcb_local("getwcs_warn_astap_failed", lvl="WARN", filename=filename)
+            except Exception as e_astap_call:
+                _pcb_local("getwcs_error_astap_exception", lvl="ERROR", filename=filename, error=str(e_astap_call))
+                logger.error(f"Erreur ASTAP pour {filename}", exc_info=True)
+                wcs_brute = None
         finally:
             del img_data_raw_adu
             gc.collect()
