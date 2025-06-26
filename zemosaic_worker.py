@@ -38,10 +38,9 @@ import numpy as np
 import zarr
 
 try:
-    from zarr.storage import LRUStoreCache, DirectoryStore
-except Exception:  # pragma: no cover - fallback for older Zarr versions
-    from zarr.storage import DirectoryStore
-
+    # Zarr >=2.x
+    from zarr.storage import LRUStoreCache
+except ImportError:  # pragma: no cover - fallback for older Zarr versions
     class LRUStoreCache:
         """Fallback pass-through cache when LRUStoreCache is unavailable."""
 
@@ -51,9 +50,13 @@ except Exception:  # pragma: no cover - fallback for older Zarr versions
         def __getattr__(self, name):
             return getattr(self.store, name)
 
-    logger.warning(
-        "LRUStoreCache import failed; using pass-through store without caching"
-    )
+try:
+    # Prefer storage module first
+    from zarr.storage import DirectoryStore
+except ImportError:  # pragma: no cover - use API root as fallback
+    from zarr import DirectoryStore
+
+# now LRUStoreCache and DirectoryStore are defined
 
 
 # --- Astropy (critique) ---
