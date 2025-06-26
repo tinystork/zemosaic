@@ -36,6 +36,7 @@ logger.info("Logging pour ZeMosaicWorker initialisé. Logs écrits dans: %s", lo
 # --- Third-Party Library Imports ---
 import numpy as np
 import zarr
+
 try:
     from zarr.storage import LRUStoreCache, DirectoryStore
 except Exception:  # pragma: no cover - fallback for older Zarr versions
@@ -53,6 +54,7 @@ except Exception:  # pragma: no cover - fallback for older Zarr versions
     logger.warning(
         "LRUStoreCache import failed; using pass-through store without caching"
     )
+
 
 # --- Astropy (critique) ---
 ASTROPY_AVAILABLE = False
