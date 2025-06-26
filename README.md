@@ -23,9 +23,9 @@ It was born out of a need from an astrophotography Discord community called the 
   proper `BSCALE`/`BZERO` for float images
 - Option to save the final mosaic as 16-bit integer FITS
 - Phase-specific auto-tuning of worker threads (alignment capped at 50% of CPU threads)
-- Process-based parallelization for final mosaic assembly
+- Process-based parallelization for final mosaic assembly (both `reproject_coadd` and `incremental`)
 
-- Configurable `assembly_process_workers` to tune process count for assembly
+- Configurable `assembly_process_workers` to tune process count for assembly (used by both methods)
 
 
 ---
@@ -115,7 +115,7 @@ Click "Start Hierarchical Mosaic"
 ✅ Python multiprocessing enabled (ProcessPoolExecutor is used for assembly)
 
 ✅ `assembly_process_workers` can be set in `zemosaic_config.json` to control
-   how many processes handle final mosaic assembly (0 = auto)
+   how many processes handle final mosaic assembly (0 = auto, applies to both methods)
 
 
 🖥️ How to Run
@@ -190,6 +190,7 @@ L’exécutable final se trouvera dans dist/zemosaic.exe.
   "assembly_process_workers": 0
 }
 ```
+`assembly_process_workers` also defines how many workers the incremental method uses.
 A final mosaic of 20 000 × 20 000 px in RGB needs ≈ 4.8 GB
 (4 × H × W × float32). Make sure the target disk/SSD has enough space.
 Hot pixel masks detected during preprocessing are also written to the temporary

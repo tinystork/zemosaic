@@ -850,6 +850,7 @@ def assemble_final_mosaic_incremental(
     dtype_norm: np.dtype = np.float32,
     apply_crop: bool = False,
     crop_percent: float = 0.0,
+    process_workers: int = 0,
 ):
     """Assemble les master tiles par co-addition sur disque."""
     pcb_asm = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
@@ -886,44 +887,68 @@ def assemble_final_mosaic_incremental(
     fits.writeto("SOMME.fits", np.zeros(sum_shape, dtype=dtype_accumulator), overwrite=True)
     fits.writeto("WEIGHT.fits", np.zeros(weight_shape, dtype=dtype_norm), overwrite=True)
 
-    for tile_idx, (tile_path, tile_wcs) in enumerate(master_tile_fits_with_wcs_list, 1):
-        pcb_asm(
-            "assemble_info_processing_tile",
-            prog=None,
-            lvl="INFO_DETAIL",
-            tile_num=tile_idx,
-            total_tiles=len(master_tile_fits_with_wcs_list),
-            filename=os.path.basename(tile_path),
-        )
+    max_procs = process_workers if process_workers and process_workers > 0 else min(os.cpu_count() or 1, len(master_tile_fits_with_wcs_list))
+    pcb_asm(f"ASM_INC: Using {max_procs} process workers", lvl="DEBUG_DETAIL")
 
-        I_tile, W_tile, (i0, i1, j0, j1) = reproject_tile_to_mosaic(
-            tile_path, tile_wcs, final_output_wcs, final_output_shape_hw, feather=True
-        )
+    with ProcessPoolExecutor(max_workers=max_procs) as ex, \
+            fits.open("SOMME.fits", mode="update", memmap=True) as hsum, \
+            fits.open("WEIGHT.fits", mode="update", memmap=True) as hwei:
+        fsum = hsum[0].data
+        fwei = hwei[0].data
 
-        if I_tile is None or W_tile is None:
-            continue
-
-        with fits.open("SOMME.fits", mode="update", memmap=True) as hsum, fits.open(
-            "WEIGHT.fits", mode="update", memmap=True
-        ) as hwei:
-            fsum = hsum[0].data
-            fwei = hwei[0].data
-            for c in range(n_channels):
-                fsum[j0:j1, i0:i1, c] += I_tile[..., c] * W_tile
-            fwei[j0:j1, i0:i1] += W_tile
-            hsum.flush()
-            hwei.flush()
-
-        del I_tile, W_tile
-
-        if tile_idx % 10 == 0 or tile_idx == len(master_tile_fits_with_wcs_list):
+        future_map = {}
+        for tile_idx, (tile_path, tile_wcs) in enumerate(master_tile_fits_with_wcs_list, 1):
             pcb_asm(
-                "assemble_progress_tiles_processed_inc",
+                "assemble_info_processing_tile",
                 prog=None,
                 lvl="INFO_DETAIL",
-                num_done=tile_idx,
-                total_num=len(master_tile_fits_with_wcs_list),
+                tile_num=tile_idx,
+                total_tiles=len(master_tile_fits_with_wcs_list),
+                filename=os.path.basename(tile_path),
             )
+            future = ex.submit(reproject_tile_to_mosaic, tile_path, tile_wcs, final_output_wcs,
+                               final_output_shape_hw, True)
+            future_map[future] = tile_idx
+
+        processed = 0
+        for fut in as_completed(future_map):
+            idx = future_map[fut]
+            try:
+                I_tile, W_tile, (i0, i1, j0, j1) = fut.result()
+            except MemoryError as e_mem:
+                pcb_asm("assemble_error_memory_tile_reprojection_inc", prog=None, lvl="ERROR", tile_num=idx,
+                        error=str(e_mem))
+                logger.error(f"MemoryError reproject_tile_to_mosaic tuile {idx}", exc_info=True)
+                processed += 1
+                continue
+            except BrokenProcessPool as bpp:
+                pcb_asm("assemble_error_broken_process_pool_incremental", prog=None, lvl="ERROR", tile_num=idx,
+                        error=str(bpp))
+                logger.error("BrokenProcessPool during tile reprojection", exc_info=True)
+                return None, None
+            except Exception as e_reproj:
+                pcb_asm("assemble_error_tile_reprojection_failed_inc", prog=None, lvl="ERROR", tile_num=idx,
+                        error=str(e_reproj))
+                logger.error(f"Erreur reproject_tile_to_mosaic tuile {idx}", exc_info=True)
+                processed += 1
+                continue
+
+            if I_tile is not None and W_tile is not None:
+                for c in range(n_channels):
+                    fsum[j0:j1, i0:i1, c] += I_tile[..., c] * W_tile
+                fwei[j0:j1, i0:i1] += W_tile
+                hsum.flush()
+                hwei.flush()
+
+            processed += 1
+            if processed % 10 == 0 or processed == len(master_tile_fits_with_wcs_list):
+                pcb_asm(
+                    "assemble_progress_tiles_processed_inc",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                    num_done=processed,
+                    total_num=len(master_tile_fits_with_wcs_list),
+                )
 
     with fits.open("SOMME.fits", memmap=True) as hsum, fits.open("WEIGHT.fits", memmap=True) as hwei:
         sum_data = hsum[0].data.astype(np.float32)
@@ -1749,6 +1774,7 @@ def run_hierarchical_mosaic(
             n_channels=3,
             apply_crop=apply_master_tile_crop_config,
             crop_percent=master_tile_crop_percent_config,
+            process_workers=assembly_process_workers_config,
             # --- FIN PASSAGE ---
         )
         log_key_phase5_failed = "run_error_phase5_assembly_failed_incremental"
