@@ -501,7 +501,11 @@ def get_wcs_and_pretreat_raw_file(file_path: str, astap_exe_path: str, astap_dat
         try:
             with tempfile.TemporaryDirectory() as tempdir:
                 temp_fits = os.path.join(tempdir, f"{os.path.splitext(filename)[0]}_minimal.fits")
-                fits.writeto(temp_fits, img_data_raw_adu, header=header_orig, overwrite=True, memmap=True)
+                # Astropy's fits.writeto does not support the memmap argument in
+                # recent versions. Using it raises a TypeError which prevented
+                # WCS resolution through ASTAP. Simply omit this parameter to
+                # write the temporary file normally.
+                fits.writeto(temp_fits, img_data_raw_adu, header=header_orig, overwrite=True)
                 wcs_brute = zemosaic_astrometry.solve_with_astap(
                     image_fits_path=temp_fits,
                     original_fits_header=header_orig,
