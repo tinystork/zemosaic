@@ -429,7 +429,6 @@ def get_wcs_and_pretreat_raw_file(file_path: str, astap_exe_path: str, astap_dat
     _pcb_local(f"  Post-Load: '{filename}' - Shape: {img_data_raw_adu.shape}, Dtype: {img_data_raw_adu.dtype}", lvl="DEBUG_VERY_DETAIL")
 
     img_data_processed_adu = img_data_raw_adu.astype(np.float32, copy=True)
-    del img_data_raw_adu; gc.collect()
 
     # --- Débayerisation ---
     if img_data_processed_adu.ndim == 2:
@@ -499,24 +498,42 @@ def get_wcs_and_pretreat_raw_file(file_path: str, astap_exe_path: str, astap_dat
             
     if wcs_brute is None and ZEMOSAIC_ASTROMETRY_AVAILABLE and zemosaic_astrometry:
         _pcb_local(f"    WCS non trouvé/valide dans header. Appel solve_with_astap pour '{filename}'.", lvl="DEBUG_DETAIL")
-        wcs_brute = zemosaic_astrometry.solve_with_astap(
-            image_fits_path=file_path,
-            original_fits_header=header_orig,
-            astap_exe_path=astap_exe_path,
-            astap_data_dir=astap_data_dir,
-            search_radius_deg=astap_search_radius,
-            downsample_factor=astap_downsample,
-            sensitivity=astap_sensitivity,
-            timeout_sec=astap_timeout_seconds,
-            update_original_header_in_place=True,
-            use_astap_update=True,
-            progress_callback=progress_callback,
-        )
-        if wcs_brute: _pcb_local("getwcs_info_astap_solved", lvl="INFO_DETAIL", filename=filename)
-        else: _pcb_local("getwcs_warn_astap_failed", lvl="WARN", filename=filename)
+        try:
+            with tempfile.TemporaryDirectory() as tempdir:
+                temp_fits = os.path.join(tempdir, f"{os.path.splitext(filename)[0]}_minimal.fits")
+                fits.writeto(temp_fits, img_data_raw_adu, header=header_orig, overwrite=True, memmap=True)
+                wcs_brute = zemosaic_astrometry.solve_with_astap(
+                    image_fits_path=temp_fits,
+                    original_fits_header=header_orig,
+                    astap_exe_path=astap_exe_path,
+                    astap_data_dir=astap_data_dir,
+                    search_radius_deg=astap_search_radius,
+                    downsample_factor=astap_downsample,
+                    sensitivity=astap_sensitivity,
+                    timeout_sec=astap_timeout_seconds,
+                    update_original_header_in_place=True,
+                    use_astap_update=True,
+                    progress_callback=progress_callback,
+                )
+        except Exception as e_astap_call:
+            _pcb_local("getwcs_warn_astap_failed", lvl="WARN", filename=filename, error=str(e_astap_call))
+            logger.error(f"Erreur ASTAP pour {filename}", exc_info=True)
+            wcs_brute = None
+        finally:
+            del img_data_raw_adu
+            import gc; gc.collect()
+        if wcs_brute:
+            _pcb_local("getwcs_info_astap_solved", lvl="INFO_DETAIL", filename=filename)
+        else:
+            _pcb_local("getwcs_warn_astap_failed", lvl="WARN", filename=filename)
     elif wcs_brute is None: # Ni header, ni ASTAP n'a fonctionné ou n'était dispo
         _pcb_local("getwcs_warn_no_wcs_source_available_or_failed", lvl="WARN", filename=filename)
+        del img_data_raw_adu
+        import gc; gc.collect()
         # Action de déplacement sera gérée par le check suivant
+    else:
+        del img_data_raw_adu
+        import gc; gc.collect()
 
     # --- Vérification finale du WCS et action de déplacement si échec ---
     if wcs_brute and wcs_brute.is_celestial:
@@ -1498,24 +1515,27 @@ def run_hierarchical_mosaic(
     files_processed_count_ph1 = 0      # Compteur pour les fichiers soumis au ThreadPoolExecutor
 
     with ThreadPoolExecutor(max_workers=actual_num_workers_ph1, thread_name_prefix="ZeMosaic_Ph1_") as executor_ph1:
-        future_to_filepath_ph1 = { 
-            executor_ph1.submit(
-                get_wcs_and_pretreat_raw_file, 
-                f_path, 
-                astap_exe_path, 
-                astap_data_dir_param, 
-                astap_search_radius_config, 
-                astap_downsample_config, 
-                astap_sensitivity_config, 
-                180, # astap_timeout_seconds
-                progress_callback,
-                temp_image_cache_dir
-            ): f_path for f_path in fits_file_paths
-        }
-        
-        for future in as_completed(future_to_filepath_ph1):
-            file_path_original = future_to_filepath_ph1[future]
-            files_processed_count_ph1 += 1 # Incrémenter pour chaque future terminée
+        batch_size = 500
+        for i in range(0, len(fits_file_paths), batch_size):
+            batch = fits_file_paths[i:i + batch_size]
+            future_to_filepath_ph1 = {
+                executor_ph1.submit(
+                    get_wcs_and_pretreat_raw_file,
+                    f_path,
+                    astap_exe_path,
+                    astap_data_dir_param,
+                    astap_search_radius_config,
+                    astap_downsample_config,
+                    astap_sensitivity_config,
+                    180,
+                    progress_callback,
+                    temp_image_cache_dir
+                ): f_path for f_path in batch
+            }
+
+            for future in as_completed(future_to_filepath_ph1):
+                file_path_original = future_to_filepath_ph1[future]
+                files_processed_count_ph1 += 1  # Incrémenter pour chaque future terminée
             
             prog_step_phase1 = base_progress_phase1 + int(PROGRESS_WEIGHT_PHASE1_RAW_SCAN * (files_processed_count_ph1 / max(1, num_total_raw_files)))
             
