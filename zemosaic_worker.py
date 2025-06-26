@@ -11,6 +11,7 @@ import psutil
 import tempfile
 import glob
 import uuid
+import multiprocessing
 
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 # BrokenProcessPool moved under concurrent.futures.process in modern Python
@@ -951,9 +952,12 @@ def assemble_final_mosaic_incremental(
     max_procs = req_workers if req_workers > 0 else min(os.cpu_count() or 1, len(master_tile_fits_with_wcs_list))
     pcb_asm(f"ASM_INC: Using {max_procs} process workers", lvl="DEBUG_DETAIL")
 
+    parent_is_daemon = multiprocessing.current_process().daemon
+    Executor = ThreadPoolExecutor if parent_is_daemon else ProcessPoolExecutor
+
 
     try:
-        with ProcessPoolExecutor(max_workers=max_procs) as ex, \
+        with Executor(max_workers=max_procs) as ex, \
                 fits.open(sum_path, mode="update", memmap=True) as hsum, \
                 fits.open(weight_path, mode="update", memmap=True) as hwei:
             fsum = hsum[0].data
