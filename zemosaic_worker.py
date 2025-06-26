@@ -340,13 +340,15 @@ def reproject_tile_to_mosaic(file_path: str, tile_wcs: WCS, output_wcs: WCS,
     weight_orig = np.outer(wy, wx).astype(np.float32)
 
     proj_weight, _ = reproject_interp((weight_orig, tile_wcs), output_wcs,
-                                      shape_out=output_shape_hw, order='bilinear', parallel=False)
+                                      shape_out=output_shape_hw, order='bilinear', parallel=False,
+                                      fill_value=np.nan)
     proj_weight = np.nan_to_num(proj_weight, nan=0.0).astype(np.float32)
 
     reproj_stack = np.zeros((output_shape_hw[0], output_shape_hw[1], n_channels), dtype=np.float32)
     for i in range(n_channels):
         reproj, _ = reproject_interp((data_hwc[..., i], tile_wcs), output_wcs,
-                                     shape_out=output_shape_hw, order='bilinear', parallel=False)
+                                     shape_out=output_shape_hw, order='bilinear', parallel=False,
+                                     fill_value=np.nan)
         reproj_stack[..., i] = reproj.astype(np.float32)
 
     mask = proj_weight > 1e-6
@@ -1244,7 +1246,7 @@ def assemble_final_mosaic_reproject_coadd(
             mm_sum[:] = 0.0
             mm_cov[:] = 0.0
             for img_hw, hdr in ch_data:
-                reproj, footprint = reproject_interp((img_hw, WCS(hdr)), final_output_wcs, shape_out=final_output_shape_hw)
+                reproj, footprint = reproject_interp((img_hw, WCS(hdr)), final_output_wcs, shape_out=final_output_shape_hw, fill_value=np.nan)
                 if match_bg:
                     # --- Background matching for memmap path ---
                     overlap_mask = (footprint > 0) & (mm_cov > 0)
