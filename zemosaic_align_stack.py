@@ -721,7 +721,7 @@ def _calculate_image_weights_noise_fwhm(image_list: list[np.ndarray | None],
                 threshold_daofind_val = 5.0 * stddev_glob
 
             # S'assurer que threshold_daofind_val est un scalaire positif
-            if hasattr(threshold_daofind_val, 'mean'): threshold_daofind_val = np.abs(np.mean(threshold_daofind_val))
+            if hasattr(threshold_daofind_val, 'mean'): threshold_daofind_val = np.abs(np.nanmean(threshold_daofind_val))
             else: threshold_daofind_val = np.abs(threshold_daofind_val)
             if threshold_daofind_val < 1e-5 : threshold_daofind_val = 1e-5 # Minimum seuil
 
@@ -740,7 +740,7 @@ def _calculate_image_weights_noise_fwhm(image_list: list[np.ndarray | None],
 
             # Utilisation de SourceCatalog pour les propriétés morphologiques
             threshold_seg_val = 1.5 * (bkg_obj.background_rms if bkg_obj and hasattr(bkg_obj, 'background_rms') else np.nanstd(data_subtracted))
-            if hasattr(threshold_seg_val, 'mean'): threshold_seg_val = np.abs(np.mean(threshold_seg_val))
+            if hasattr(threshold_seg_val, 'mean'): threshold_seg_val = np.abs(np.nanmean(threshold_seg_val))
             else: threshold_seg_val = np.abs(threshold_seg_val)
             if threshold_seg_val < 1e-5 : threshold_seg_val = 1e-5
 
