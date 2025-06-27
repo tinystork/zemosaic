@@ -1228,7 +1228,7 @@ def assemble_final_mosaic_reproject_coadd(
     cleanup_memmap: bool = True,
     process_workers: int = 0,
 ):
-    """Assemble les master tiles en utilisant des datasets Zarr chunkés."""
+    """Assemble les master tiles en utilisant ``reproject_and_coadd``."""
     _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
         msg_key, prog, lvl, callback=progress_callback, **kwargs
     )
@@ -1239,9 +1239,9 @@ def assemble_final_mosaic_reproject_coadd(
         lvl="DEBUG_DETAIL",
     )
 
-    if not (REPROJECT_AVAILABLE and reproject_interp and ASTROPY_AVAILABLE and fits):
+    if not (REPROJECT_AVAILABLE and reproject_and_coadd and ASTROPY_AVAILABLE and fits):
         missing_deps = []
-        if not REPROJECT_AVAILABLE or not reproject_interp:
+        if not REPROJECT_AVAILABLE or not reproject_and_coadd:
             missing_deps.append("Reproject")
         if not ASTROPY_AVAILABLE or not fits:
             missing_deps.append("Astropy (fits)")
@@ -1257,124 +1257,47 @@ def assemble_final_mosaic_reproject_coadd(
         _pcb("assemble_error_no_tiles_provided_reproject_coadd", prog=None, lvl="ERROR")
         return None, None
 
-    h, w = final_output_shape_hw
-    if memmap_dir is None:
-        memmap_dir = tempfile.mkdtemp(prefix="zemosaic_zarr_")
-    os.makedirs(memmap_dir, exist_ok=True)
+    if use_memmap and memmap_dir is None:
+        memmap_dir = tempfile.mkdtemp(prefix="zemosaic_coadd_")
+    if memmap_dir:
+        os.makedirs(memmap_dir, exist_ok=True)
 
-    if DirectoryStore is None:
-        _pcb(
-            "ASM_REPROJ_COADD ERROR: Zarr DirectoryStore unavailable. Install 'zarr' package.",
-            lvl="ERROR",
-        )
-        return None, None
-    # zarr>=3 removed ``LRUStoreCache`` and the API now rejects unknown store
-    # wrappers.  When LRUStoreCache is unavailable (or we're using the simple
-    # compatibility shim defined above), fall back to the raw DirectoryStore.
-    if LRUStoreCache is not None and getattr(zarr, "__version__", "2")[0] == "2":
-        store = LRUStoreCache(DirectoryStore(memmap_dir), max_size=512 * 1024 * 1024)
-    else:
-        store = DirectoryStore(memmap_dir)
-    root = zarr.open_group(store=store, mode="a")
-    if n_channels > 1:
-        mosaic = root.require_dataset(
-            "mosaic",
-            shape=(h, w, n_channels),
-            dtype=np.float32,
-            chunks=(512, 512, 1),
-            fill_value=0,
-        )
-    else:
-        mosaic = root.require_dataset(
-            "mosaic",
-            shape=(h, w),
-            dtype=np.float32,
-            chunks=(512, 512),
-            fill_value=0,
-        )
-    weight = root.require_dataset(
-        "weight",
-        shape=(h, w),
-        dtype=np.float32,
-        chunks=(512, 512),
-        fill_value=0,
-    )
+    input_data_all_tiles_HWC_processed = []
+    for idx, (tile_path, tile_wcs) in enumerate(master_tile_fits_with_wcs_list, 1):
+        with fits.open(tile_path, memmap=False) as hdul:
+            data = hdul[0].data.astype(np.float32)
+        if data.ndim == 2:
+            data = data[..., np.newaxis]
+        input_data_all_tiles_HWC_processed.append((data, tile_wcs))
 
-    try:
-        req_workers = int(process_workers)
-    except Exception:
-        req_workers = 0
-    max_procs = req_workers if req_workers > 0 else min(os.cpu_count() or 1, len(master_tile_fits_with_wcs_list))
-    _pcb(f"ASM_REPROJ_COADD: Using {max_procs} process workers", lvl="DEBUG_DETAIL")
-    parent_is_daemon = multiprocessing.current_process().daemon
-    Executor = ThreadPoolExecutor if parent_is_daemon else ProcessPoolExecutor
-
-    output_wcs_hdr = final_output_wcs.to_header() if hasattr(final_output_wcs, "to_header") else final_output_wcs
-
-    with Executor(max_workers=max_procs) as ex:
-        future_map = {}
-        for tile_idx, (tile_path, tile_wcs) in enumerate(master_tile_fits_with_wcs_list, 1):
-            tile_wcs_hdr = tile_wcs.to_header() if hasattr(tile_wcs, "to_header") else tile_wcs
-            future = ex.submit(
-                reproject_tile_to_mosaic,
-                tile_path,
-                tile_wcs_hdr,
-                output_wcs_hdr,
-                final_output_shape_hw,
-                True,
-                apply_crop,
-                crop_percent,
+        if idx % 10 == 0 or idx == len(master_tile_fits_with_wcs_list):
+            _pcb(
+                "assemble_progress_tiles_processed_inc",
+                prog=None,
+                lvl="INFO_DETAIL",
+                num_done=idx,
+                total_num=len(master_tile_fits_with_wcs_list),
             )
-            future_map[future] = tile_idx
 
-        processed = 0
-        for fut in as_completed(future_map):
-            idx = future_map[fut]
-            try:
-                I_tile, W_tile, (i0, i1, j0, j1) = fut.result()
-            except Exception as e_reproj:
-                _pcb(
-                    "assemble_error_tile_reprojection_failed_reproject_coadd",
-                    prog=None,
-                    lvl="ERROR",
-                    tile_num=idx,
-                    error=str(e_reproj),
-                )
-                logger.error(
-                    f"Erreur reproject_tile_to_mosaic tuile {idx}",
-                    exc_info=True,
-                )
-                processed += 1
-                continue
+    assembly_process_workers = 0
+    try:
+        assembly_process_workers = int(process_workers)
+    except Exception:
+        assembly_process_workers = 0
+    if assembly_process_workers <= 0:
+        assembly_process_workers = None
 
-            if I_tile is not None and W_tile is not None:
-                if n_channels > 1:
-                    mosaic[j0:j1, i0:i1, :] += I_tile
-                else:
-                    mosaic[j0:j1, i0:i1] += I_tile[..., 0]
-                weight[j0:j1, i0:i1] += W_tile
-                if hasattr(mosaic.store, "flush"):
-                    mosaic.store.flush()
-                if hasattr(weight.store, "flush"):
-                    weight.store.flush()
-
-            processed += 1
-            if processed % 10 == 0 or processed == len(master_tile_fits_with_wcs_list):
-                _pcb(
-                    "assemble_progress_tiles_processed_inc",
-                    prog=None,
-                    lvl="INFO_DETAIL",
-                    num_done=processed,
-                    total_num=len(master_tile_fits_with_wcs_list),
-                )
-
-    final_mosaic_data = mosaic[...] if n_channels > 1 else mosaic[...][..., np.newaxis]
-    final_weight = weight[...]
-    np.divide(
-        final_mosaic_data,
-        final_weight[..., None],
-        out=final_mosaic_data,
-        where=final_weight[..., None] > 0,
+    mosaic_data, coverage = reproject_and_coadd(
+        input_data_all_tiles_HWC_processed,
+        final_output_wcs.to_header() if hasattr(final_output_wcs, "to_header") else final_output_wcs,
+        final_output_shape_hw,
+        match_bg=match_bg,
+        process_workers=assembly_process_workers,
+        use_memmap=use_memmap,
+        memmap_dir=memmap_dir,
+        cleanup_memmap=cleanup_memmap,
+        apply_crop=apply_crop,
+        crop_percent=crop_percent,
     )
 
     _log_memory_usage(progress_callback, "Fin assemble_final_mosaic_reproject_coadd")
@@ -1382,16 +1305,16 @@ def assemble_final_mosaic_reproject_coadd(
         "assemble_info_finished_reproject_coadd",
         prog=None,
         lvl="INFO",
-        shape=final_mosaic_data.shape if final_mosaic_data is not None else "N/A",
+        shape=mosaic_data.shape if mosaic_data is not None else "N/A",
     )
 
-    if cleanup_memmap:
+    if use_memmap and cleanup_memmap and memmap_dir:
         try:
             shutil.rmtree(memmap_dir)
         except OSError:
             pass
 
-    return final_mosaic_data.astype(np.float32), final_weight.astype(np.float32)
+    return mosaic_data.astype(np.float32), coverage.astype(np.float32)
 
 
 
@@ -1910,7 +1833,7 @@ def run_hierarchical_mosaic(
             n_channels=3,
             apply_crop=apply_master_tile_crop_config,
             crop_percent=master_tile_crop_percent_config,
-            processing_threads=num_base_workers_config,
+            processing_threads=assembly_process_workers_config,
             memmap_dir=inc_memmap_dir,
             cleanup_memmap=True,
             # --- FIN PASSAGE ---
