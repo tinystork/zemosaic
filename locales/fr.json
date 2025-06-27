@@ -165,6 +165,7 @@
     "clusterstacks_warn_no_centers": "ClusterStacks AVERT : Aucun centre céleste valide trouvé pour le groupement.",
     "clusterstacks_info_finished": "ClusterStacks : {num_groups} stacks Seestar (groupes fins) formés.",
     "clusterstacks_info_groups_split_auto_limit": "Limite auto activée : groupes divisés de {original} à {new}, max {limit} images (exemple {shape})",
+    "clusterstacks_info_groups_split_manual_limit": "Limite manuelle appliquée : groupes divisés de {original} à {new}, limite {limit} images",
     "clusterstacks_warn_auto_limit_failed": "Échec estimation limite auto : {error}",
     
     "getwcs_error_utils_unavailable": "GetWCS_Pretreat ERREUR : Module zemosaic_utils non disponible.",
@@ -176,6 +177,7 @@
     "getwcs_warn_header_wcs_read_failed": "GetWCS_Pretreat AVERT : Échec lecture WCS du header FITS de '{filename}' : {error}. Tentative ASTAP.",
     "getwcs_info_astap_solved": "GetWCS_Pretreat : ASTAP a résolu '{filename}'.",
     "getwcs_warn_astap_failed": "GetWCS_Pretreat AVERT : ASTAP n'a PAS résolu '{filename}'.",
+    "getwcs_error_astap_tempfile_write_failed": "GetWCS_Pretreat ERREUR : Échec d'écriture du FITS temporaire pour ASTAP pour '{filename}' : {error}.",
     "getwcs_warn_no_header_wcs_astap_unavailable": "GetWCS_Pretreat AVERT : Pas de WCS dans header et ASTAP non disponible/utilisé pour '{filename}'.",
     "getwcs_error_final_wcs_invalid": "GetWCS_Pretreat ERREUR : WCS final pour '{filename}' non valide ou non céleste.",
     "getwcs_error_set_pixel_shape_final": "GetWCS_Pretreat ERREUR : Échec de la définition du pixel_shape final : {error}.",
@@ -294,8 +296,12 @@
     "gui_memmap_dir": "Dossier memmap",
     "gui_memmap_cleanup": "Supprimer les *.dat à la fin",
     "gui_auto_limit_frames": "Limiter automatiquement les images par master tile (stabilité système)",
+    "max_raw_per_master_tile_label": "Brutes max par master-tuile",
+    "max_raw_per_master_tile_note": "0 = automatique (calculé). Valeur positive = nombre maximum d'images brutes par master-tuile.",
     "reject_winsor_info_channel_progress": "Winsorized Sigma Clip : traitement du canal {channel}...",
     "reject_winsor_info_mono_progress": "Winsorized Sigma Clip : traitement image monochrome...",
-    "run_info_memmap_dir_default_output": "Dossier memmap non défini. Utilisation du dossier de sortie '{directory}'."
-    
+
+    "assemble_error_invalid_final_shape_inc": "ERREUR assemblage incrémental : dimensions finales invalides {shape}.",
+    "assemble_warn_swapped_final_shape_inc": "AVERTISSEMENT assemblage incrémental : dimensions fournies {provided} inversées, attendu {expected}. Correction automatique.",
+    "assemble_error_mismatch_final_shape_inc": "ERREUR assemblage incrémental : dimensions fournies {provided} incompatibles avec la grille {expected}."
 }

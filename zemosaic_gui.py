@@ -184,6 +184,7 @@ class ZeMosaicGUI:
         self.mm_dir_var = tk.StringVar(value=self.config.get("coadd_memmap_dir", ""))
         self.cleanup_memmap_var = tk.BooleanVar(value=self.config.get("coadd_cleanup_memmap", True))
         self.auto_limit_frames_var = tk.BooleanVar(value=self.config.get("auto_limit_frames_per_master_tile", True))
+        self.max_raw_per_tile_var = tk.IntVar(value=self.config.get("max_raw_per_master_tile", 0))
         # ---  ---
 
         self.translatable_widgets = {}
@@ -473,6 +474,24 @@ class ZeMosaicGUI:
         self.min_radial_floor_spinbox = ttk.Spinbox(stacking_options_frame, from_=0.0, to=0.5, increment=0.01, textvariable=self.min_radial_weight_floor_var, width=8, format="%.2f")
         self.min_radial_floor_spinbox.grid(row=stk_opt_row, column=1, padx=5, pady=3, sticky="w")
         min_radial_floor_note = ttk.Label(stacking_options_frame, text=""); min_radial_floor_note.grid(row=stk_opt_row, column=2, padx=5, pady=3, sticky="w"); self.translatable_widgets["stacking_min_radial_floor_note"] = min_radial_floor_note; stk_opt_row += 1
+
+        # Max raw per master tile
+        self.max_raw_per_tile_label = ttk.Label(stacking_options_frame, text="")
+        self.max_raw_per_tile_label.grid(row=stk_opt_row, column=0, padx=5, pady=3, sticky="w")
+        self.translatable_widgets["max_raw_per_master_tile_label"] = self.max_raw_per_tile_label
+        self.max_raw_per_tile_spinbox = ttk.Spinbox(
+            stacking_options_frame,
+            from_=0,
+            to=9999,
+            increment=1,
+            textvariable=self.max_raw_per_tile_var,
+            width=8
+        )
+        self.max_raw_per_tile_spinbox.grid(row=stk_opt_row, column=1, padx=5, pady=3, sticky="w")
+        max_raw_note = ttk.Label(stacking_options_frame, text="")
+        max_raw_note.grid(row=stk_opt_row, column=2, padx=(10,5), pady=3, sticky="w")
+        self.translatable_widgets["max_raw_per_master_tile_note"] = max_raw_note
+        stk_opt_row += 1
 
 
         # --- AJOUT DU CADRE POUR LES OPTIONS DE PERFORMANCE (NOMBRE DE THREADS) ---
@@ -1144,6 +1163,7 @@ class ZeMosaicGUI:
             )
 
         self.config["winsor_worker_limit"] = self.winsor_workers_var.get()
+        self.config["max_raw_per_master_tile"] = self.max_raw_per_tile_var.get()
         if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
             zemosaic_config.save_config(self.config)
 
@@ -1174,7 +1194,8 @@ class ZeMosaicGUI:
             self.auto_limit_frames_var.get(),
             self.config.get("assembly_process_workers", 0),
             self.config.get("auto_limit_memory_fraction", 0.1),
-            self.winsor_workers_var.get()
+            self.winsor_workers_var.get(),
+            self.max_raw_per_tile_var.get()
             # --- FIN NOUVEAUX ARGUMENTS ---
         )
         

@@ -23,9 +23,9 @@ It was born out of a need from an astrophotography Discord community called the 
   proper `BSCALE`/`BZERO` for float images
 - Option to save the final mosaic as 16-bit integer FITS
 - Phase-specific auto-tuning of worker threads (alignment capped at 50% of CPU threads)
-- Process-based parallelization for final mosaic assembly
+- Process-based parallelization for final mosaic assembly (both `reproject_coadd` and `incremental`)
 
-- Configurable `assembly_process_workers` to tune process count for assembly
+- Configurable `assembly_process_workers` to tune process count for assembly (used by both methods)
 
 
 ---
@@ -41,7 +41,11 @@ It was born out of a need from an astrophotography Discord community called the 
 
 ```bash
 pip install numpy astropy reproject opencv-python photutils scipy psutil
-No versions are pinned, but ZeMosaic is tested on Python 3.11+.
+```
+The worker originally required `DirectoryStore`, removed in `zarr>=3`.
+ZeMosaic now falls back to `LocalStore`, and skips the old
+`LRUStoreCache` wrapper when running against Zarr 3.
+Both Zarr 2.x and 3.x are supported (tested on Python 3.11+).
 
 🧠 Inspired by PixInsight
 ZeMosaic draws strong inspiration from the image integration strategies of PixInsight, developed by Juan Conejero at Pleiades Astrophoto.
@@ -84,7 +88,9 @@ tkinter for the graphical user interface
 If you have a local clone of the repository, make sure you're in the project folder, then run:
 
 pip install -r requirements.txt
-💡 No versions are pinned in requirements.txt to maintain flexibility. ZeMosaic is tested with Python 3.11+.
+💡 Requirements are mostly flexible. ZeMosaic now supports both zarr 2.x and
+3.x, automatically falling back to `LocalStore` when `DirectoryStore` is
+unavailable. The project is tested with Python 3.11+.
 
 If you prefer to install manually:
 
@@ -115,7 +121,7 @@ Click "Start Hierarchical Mosaic"
 ✅ Python multiprocessing enabled (ProcessPoolExecutor is used for assembly)
 
 ✅ `assembly_process_workers` can be set in `zemosaic_config.json` to control
-   how many processes handle final mosaic assembly (0 = auto)
+   how many processes handle final mosaic assembly (0 = auto, applies to both methods)
 
 
 🖥️ How to Run
@@ -190,18 +196,20 @@ L’exécutable final se trouvera dans dist/zemosaic.exe.
   "assembly_process_workers": 0
 }
 ```
-(If `coadd_memmap_dir` is empty, ZeMosaic uses the chosen output folder.)
+`assembly_process_workers` also defines how many workers the incremental method uses.
 A final mosaic of 20 000 × 20 000 px in RGB needs ≈ 4.8 GB
 (4 × H × W × float32). Make sure the target disk/SSD has enough space.
 Hot pixel masks detected during preprocessing are also written to the temporary
 cache directory to further reduce memory usage.
 
-### ASTAP `-update` for low-memory solving
+### Memory-saving parameters
 
-Passing the `-update` switch to ASTAP lets the solver write the WCS solution
-directly into each FITS header. ZeMosaic now exposes this option during the
-astrometric phase to minimise RAM usage when processing tens of thousands of
-frames.
+The configuration file exposes a few options to control memory consumption:
+
+- `auto_limit_frames_per_master_tile` – automatically split raw stacks based on available RAM.
+- `max_raw_per_master_tile` – manual cap on raw frames stacked per master tile (0 disables).
+- `auto_limit_memory_fraction` – fraction of free memory considered by the auto limiter.
+- `winsor_worker_limit` – maximum parallel workers during the Winsorized rejection step.
 
 6 ▸ Quick CLI example
 ```bash

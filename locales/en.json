@@ -140,6 +140,7 @@
     "clusterstacks_warn_no_centers": "ClusterStacks WARN: No valid celestial centers found for clustering.",
     "clusterstacks_info_finished": "ClusterStacks: {num_groups} Seestar stacks (fine groups) formed.",
     "clusterstacks_info_groups_split_auto_limit": "Auto limit enabled: groups split from {original} to {new}, max {limit} frames (sample {shape})",
+    "clusterstacks_info_groups_split_manual_limit": "Manual limit applied: groups split from {original} to {new}, limit {limit} frames",
     "clusterstacks_warn_auto_limit_failed": "Auto limit estimation failed: {error}",
     
     "getwcs_error_utils_unavailable": "GetWCS_Pretreat ERROR: zemosaic_utils module not available.",
@@ -151,6 +152,7 @@
     "getwcs_warn_header_wcs_read_failed": "GetWCS_Pretreat WARN: Failed to read WCS from FITS header of '{filename}': {error}. Attempting ASTAP.",
     "getwcs_info_astap_solved": "GetWCS_Pretreat: ASTAP successfully solved '{filename}'.",
     "getwcs_warn_astap_failed": "GetWCS_Pretreat WARN: ASTAP did NOT solve '{filename}'.",
+    "getwcs_error_astap_tempfile_write_failed": "GetWCS_Pretreat ERROR: Failed to write temporary FITS for ASTAP for '{filename}': {error}.",
     "getwcs_warn_no_header_wcs_astap_unavailable": "GetWCS_Pretreat WARN: No WCS in header and ASTAP not available/used for '{filename}'.",
     "getwcs_error_final_wcs_invalid": "GetWCS_Pretreat ERROR: Final WCS for '{filename}' is invalid or not celestial.",
     "getwcs_error_set_pixel_shape_final": "GetWCS_Pretreat ERROR: Failed setting final pixel_shape: {error}.",
@@ -298,8 +300,12 @@
     "gui_memmap_dir": "Memmap Folder",
     "gui_memmap_cleanup": "Delete *.dat when finished",
     "gui_auto_limit_frames": "Auto limit frames per master tile (system stability)",
+    "max_raw_per_master_tile_label": "Max raw per master tile",
+    "max_raw_per_master_tile_note": "0 = automatic (calculated). Positive value = maximum raw images per master tile.",
     "reject_winsor_info_channel_progress": "Winsorized Sigma Clip processing channel {channel}...",
     "reject_winsor_info_mono_progress": "Winsorized Sigma Clip processing monochrome data...",
-    "run_info_memmap_dir_default_output": "Memmap directory not specified. Using output folder '{directory}'."
 
+    "assemble_error_invalid_final_shape_inc": "Incremental assembly ERROR: invalid final output shape {shape}.",
+    "assemble_warn_swapped_final_shape_inc": "Incremental assembly WARNING: provided dimensions {provided} were swapped, expected {expected}. Automatically corrected.",
+    "assemble_error_mismatch_final_shape_inc": "Incremental assembly ERROR: provided dimensions {provided} do not match mosaic grid {expected}."
 }
