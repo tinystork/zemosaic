@@ -624,9 +624,15 @@ def stretch_auto_asifits_like(img_hwc_adu, p_low=0.5, p_high=99.8,
 
     if apply_wb:
         avg_per_chan = np.mean(out, axis=(0, 1))
-        avg_per_chan /= np.max(avg_per_chan) + 1e-8
+        norm = np.max(avg_per_chan)
+        if norm > 0:
+            avg_per_chan /= norm
+        else:
+            avg_per_chan = np.ones_like(avg_per_chan)
         for c in range(3):
-            out[..., c] /= avg_per_chan[c]
+            denom = avg_per_chan[c]
+            if denom > 1e-8:
+                out[..., c] /= denom
 
     return np.clip(out, 0, 1)
 
