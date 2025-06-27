@@ -1223,6 +1223,10 @@ def assemble_final_mosaic_reproject_coadd(
     match_bg: bool = True,
     apply_crop: bool = False,
     crop_percent: float = 0.0,
+    use_memmap: bool = False,
+    memmap_dir: str | None = None,
+    cleanup_memmap: bool = True,
+    assembly_process_workers: int = 0,
 ):
     """Assemble les master tiles en utilisant ``reproject_and_coadd``."""
     _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
@@ -1252,6 +1256,21 @@ def assemble_final_mosaic_reproject_coadd(
     if not master_tile_fits_with_wcs_list:
         _pcb("assemble_error_no_tiles_provided_reproject_coadd", prog=None, lvl="ERROR")
         return None, None
+
+    if use_memmap and memmap_dir is None:
+        memmap_dir = tempfile.mkdtemp(prefix="zemosaic_coadd_")
+    if memmap_dir:
+        os.makedirs(memmap_dir, exist_ok=True)
+
+    if assembly_process_workers <= 0:
+        assembly_process_workers = None
+
+    # Convertir la sortie WCS en header FITS si possible une seule fois
+    output_header = (
+        final_output_wcs.to_header()
+        if hasattr(final_output_wcs, "to_header")
+        else final_output_wcs
+    )
 
 
     input_data_all_tiles_HWC_processed = []
@@ -1312,7 +1331,7 @@ def assemble_final_mosaic_reproject_coadd(
 
     mosaic_data, coverage = reproject_and_coadd(
         input_data_all_tiles_HWC_processed,
-        final_output_wcs.to_header() if hasattr(final_output_wcs, "to_header") else final_output_wcs,
+        output_header,
         final_output_shape_hw,
 
         **reproj_kwargs,
