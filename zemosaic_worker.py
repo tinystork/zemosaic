@@ -291,19 +291,57 @@ def reproject_tile_to_mosaic(tile_path: str, tile_wcs, mosaic_wcs, mosaic_shape_
     base_weight = np.ones(data.shape[:2], dtype=np.float32)
     if feather and ZEMOSAIC_UTILS_AVAILABLE and hasattr(zemosaic_utils, 'make_radial_weight_map'):
         try:
-            base_weight = zemosaic_utils.make_radial_weight_map(data.shape[0], data.shape[1],
-                                                               feather_fraction=0.9)
+            base_weight = zemosaic_utils.make_radial_weight_map(
+                data.shape[0], data.shape[1], feather_fraction=0.9
+            )
         except Exception:
             base_weight = np.ones(data.shape[:2], dtype=np.float32)
 
-    reproj_img = np.zeros((mosaic_shape_hw[0], mosaic_shape_hw[1], n_channels), dtype=np.float32)
-    reproj_weight = np.zeros(mosaic_shape_hw, dtype=np.float32)
+    # --- Determine bounding box covered by the tile on the mosaic
+    footprint_full, _ = reproject_interp(
+        (base_weight, tile_wcs),
+        mosaic_wcs,
+        shape_out=mosaic_shape_hw,
+        order='nearest',  # suffit, c'est binaire
+        parallel=False,
+    )
+
+    j_idx, i_idx = np.where(footprint_full > 0)
+    if j_idx.size == 0:
+        return None, None, (0, 0, 0, 0)
+
+    j0, j1 = int(j_idx.min()), int(j_idx.max()) + 1
+    i0, i1 = int(i_idx.min()), int(i_idx.max()) + 1
+    h, w = j1 - j0, i1 - i0
+
+    # Create a WCS for the sub-region
+    try:
+        sub_wcs = mosaic_wcs.deepcopy()
+        sub_wcs.wcs.crpix = [mosaic_wcs.wcs.crpix[0] - i0, mosaic_wcs.wcs.crpix[1] - j0]
+    except Exception:
+        sub_wcs = mosaic_wcs
+
+    # Allocate arrays only for the useful area
+    reproj_img = np.zeros((h, w, n_channels), dtype=np.float32)
+    reproj_weight = np.zeros((h, w), dtype=np.float32)
 
     for c in range(n_channels):
-        reproj_c, footprint = reproject_interp((data[..., c], tile_wcs), mosaic_wcs,
-                                               shape_out=mosaic_shape_hw, order='bilinear', parallel=False)
-        w_reproj, _ = reproject_interp((base_weight, tile_wcs), mosaic_wcs,
-                                       shape_out=mosaic_shape_hw, order='bilinear', parallel=False)
+        reproj_c, footprint = reproject_interp(
+            (data[..., c], tile_wcs),
+            sub_wcs,
+            shape_out=(h, w),
+            order='bilinear',
+            parallel=False,
+        )
+
+        w_reproj, _ = reproject_interp(
+            (base_weight, tile_wcs),
+            sub_wcs,
+            shape_out=(h, w),
+            order='bilinear',
+            parallel=False,
+        )
+
         total_w = footprint * w_reproj
         reproj_img[..., c] = reproj_c.astype(np.float32)
         reproj_weight += total_w.astype(np.float32)
@@ -312,11 +350,7 @@ def reproject_tile_to_mosaic(tile_path: str, tile_wcs, mosaic_wcs, mosaic_shape_
     if not np.any(valid):
         return None, None, (0, 0, 0, 0)
 
-    j_idx, i_idx = np.where(valid)
-    j0, j1 = int(j_idx.min()), int(j_idx.max()) + 1
-    i0, i1 = int(i_idx.min()), int(i_idx.max()) + 1
-
-    return reproj_img[j0:j1, i0:i1], reproj_weight[j0:j1, i0:i1], (i0, i1, j0, j1)
+    return reproj_img, reproj_weight, (i0, i1, j0, j1)
 
 
 
