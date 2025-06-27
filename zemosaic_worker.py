@@ -299,11 +299,19 @@ def reproject_tile_to_mosaic(tile_path: str, tile_wcs, mosaic_wcs, mosaic_shape_
             pass
 
     base_weight = np.ones(data.shape[:2], dtype=np.float32)
-    if feather and ZEMOSAIC_UTILS_AVAILABLE and hasattr(zemosaic_utils, 'make_radial_weight_map'):
+    if (
+        feather
+        and ZEMOSAIC_UTILS_AVAILABLE
+        and hasattr(zemosaic_utils, "make_radial_weight_map")
+    ):
         try:
             base_weight = zemosaic_utils.make_radial_weight_map(
-                data.shape[0], data.shape[1], feather_fraction=0.9
+                data.shape[0],
+                data.shape[1],
+                feather_fraction=0.92,
+                min_weight_floor=0.10,
             )
+            logger.debug("Feather applied with min_weight_floor=0.10")
         except Exception:
             base_weight = np.ones(data.shape[:2], dtype=np.float32)
 
@@ -1232,9 +1240,12 @@ def assemble_final_mosaic_incremental(
                     continue
 
                 if I_tile is not None and W_tile is not None:
+                    mask = W_tile > 0
+                    tgt_sum = fsum[ymin:ymax, xmin:xmax]
+                    tgt_wgt = fwei[ymin:ymax, xmin:xmax]
                     for c in range(n_channels):
-                        fsum[ymin:ymax, xmin:xmax, c] += I_tile[..., c] * W_tile
-                    fwei[ymin:ymax, xmin:xmax] += W_tile
+                        tgt_sum[..., c][mask] += I_tile[..., c][mask] * W_tile[mask]
+                    tgt_wgt[mask] += W_tile[mask]
                     tiles_since_flush += 1
                     if tiles_since_flush >= FLUSH_BATCH_SIZE:
                         hsum.flush()
