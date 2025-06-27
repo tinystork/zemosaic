@@ -2042,7 +2042,12 @@ def run_hierarchical_mosaic(
                 )
 
                 if m_stretched is not None:
-                    img_u8 = (np.clip(m_stretched.astype(np.float32), 0, 1) * 255).astype(np.uint8)
+                    img_u8 = (
+                        np.nan_to_num(
+                            np.clip(m_stretched.astype(np.float32), 0, 1)
+                        )
+                        * 255
+                    ).astype(np.uint8)
                     png_path = os.path.join(output_folder, f"{output_base_name}_preview.png")
                     try: 
                         import cv2 # Importer cv2 seulement si nécessaire
