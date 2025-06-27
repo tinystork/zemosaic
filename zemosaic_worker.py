@@ -1265,6 +1265,7 @@ def assemble_final_mosaic_reproject_coadd(
     if assembly_process_workers <= 0:
         assembly_process_workers = None
 
+
     # Convertir la sortie WCS en header FITS si possible une seule fois
     output_header = (
         final_output_wcs.to_header()
