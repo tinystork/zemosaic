@@ -1253,6 +1253,13 @@ def assemble_final_mosaic_reproject_coadd(
         _pcb("assemble_error_no_tiles_provided_reproject_coadd", prog=None, lvl="ERROR")
         return None, None
 
+    # Convertir la sortie WCS en header FITS si possible une seule fois
+    output_header = (
+        final_output_wcs.to_header()
+        if hasattr(final_output_wcs, "to_header")
+        else final_output_wcs
+    )
+
 
     input_data_all_tiles_HWC_processed = []
     for idx, (tile_path, tile_wcs) in enumerate(master_tile_fits_with_wcs_list, 1):
@@ -1312,7 +1319,7 @@ def assemble_final_mosaic_reproject_coadd(
 
     mosaic_data, coverage = reproject_and_coadd(
         input_data_all_tiles_HWC_processed,
-        final_output_wcs.to_header() if hasattr(final_output_wcs, "to_header") else final_output_wcs,
+        output_header,
         final_output_shape_hw,
 
         **reproj_kwargs,
