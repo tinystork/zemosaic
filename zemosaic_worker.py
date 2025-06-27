@@ -1327,8 +1327,12 @@ def assemble_final_mosaic_reproject_coadd(
             reproj_kwargs["process_workers"] = assembly_process_workers
         if "use_memmap" in sig.parameters:
             reproj_kwargs["use_memmap"] = use_memmap
+        elif "intermediate_memmap" in sig.parameters:
+            reproj_kwargs["intermediate_memmap"] = use_memmap
         if "memmap_dir" in sig.parameters:
             reproj_kwargs["memmap_dir"] = memmap_dir
+        if "cleanup_memmap" in sig.parameters:
+            reproj_kwargs["cleanup_memmap"] = False
     except Exception:
         # If introspection fails just fall back to basic arguments
         reproj_kwargs = {"match_background": match_bg}
@@ -1347,7 +1351,6 @@ def assemble_final_mosaic_reproject_coadd(
                 final_output_shape_hw,
                 reproject_function=reproject_interp,
                 combine_function="mean",
-                cleanup_memmap=False,
                 **reproj_kwargs,
             )
             mosaic_channels.append(chan_mosaic.astype(np.float32))
