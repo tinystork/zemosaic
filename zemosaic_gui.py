@@ -475,6 +475,24 @@ class ZeMosaicGUI:
         self.min_radial_floor_spinbox.grid(row=stk_opt_row, column=1, padx=5, pady=3, sticky="w")
         min_radial_floor_note = ttk.Label(stacking_options_frame, text=""); min_radial_floor_note.grid(row=stk_opt_row, column=2, padx=5, pady=3, sticky="w"); self.translatable_widgets["stacking_min_radial_floor_note"] = min_radial_floor_note; stk_opt_row += 1
 
+        # Max raw per master tile
+        self.max_raw_per_tile_label = ttk.Label(stacking_options_frame, text="")
+        self.max_raw_per_tile_label.grid(row=stk_opt_row, column=0, padx=5, pady=3, sticky="w")
+        self.translatable_widgets["max_raw_per_master_tile_label"] = self.max_raw_per_tile_label
+        self.max_raw_per_tile_spinbox = ttk.Spinbox(
+            stacking_options_frame,
+            from_=0,
+            to=9999,
+            increment=1,
+            textvariable=self.max_raw_per_tile_var,
+            width=8
+        )
+        self.max_raw_per_tile_spinbox.grid(row=stk_opt_row, column=1, padx=5, pady=3, sticky="w")
+        max_raw_note = ttk.Label(stacking_options_frame, text="")
+        max_raw_note.grid(row=stk_opt_row, column=2, padx=(10,5), pady=3, sticky="w")
+        self.translatable_widgets["max_raw_per_master_tile_note"] = max_raw_note
+        stk_opt_row += 1
+
 
         # --- AJOUT DU CADRE POUR LES OPTIONS DE PERFORMANCE (NOMBRE DE THREADS) ---
         perf_options_frame = ttk.LabelFrame(self.scrollable_content_frame, text="", padding="10")
@@ -591,21 +609,6 @@ class ZeMosaicGUI:
         ttk.Button(self.memmap_frame, text="…", command=self._browse_mm_dir).grid(row=1, column=2, padx=5, pady=3)
         ttk.Checkbutton(self.memmap_frame, text=self._tr("gui_memmap_cleanup", "Delete *.dat when finished"), variable=self.cleanup_memmap_var).grid(row=2, column=0, sticky="w", padx=5, pady=3)
         ttk.Checkbutton(self.memmap_frame, text=self._tr("gui_auto_limit_frames", "Auto limit frames per master tile (system stability)"), variable=self.auto_limit_frames_var).grid(row=3, column=0, sticky="w", padx=5, pady=3, columnspan=2)
-        self.max_raw_per_tile_label = ttk.Label(self.memmap_frame, text="")
-        self.max_raw_per_tile_label.grid(row=4, column=0, padx=5, pady=3, sticky="w")
-        self.translatable_widgets["max_raw_per_master_tile_label"] = self.max_raw_per_tile_label
-        self.max_raw_per_tile_spinbox = ttk.Spinbox(
-            self.memmap_frame,
-            from_=0,
-            to=9999,
-            increment=1,
-            textvariable=self.max_raw_per_tile_var,
-            width=8
-        )
-        self.max_raw_per_tile_spinbox.grid(row=4, column=1, padx=5, pady=3, sticky="w")
-        max_raw_note = ttk.Label(self.memmap_frame, text="")
-        max_raw_note.grid(row=4, column=2, padx=(10,5), pady=3, sticky="w")
-        self.translatable_widgets["max_raw_per_master_tile_note"] = max_raw_note
         self._on_assembly_method_change()
         
 
