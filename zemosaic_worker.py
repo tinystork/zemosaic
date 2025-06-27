@@ -1044,6 +1044,7 @@ def assemble_final_mosaic_incremental(
         pcb_asm("assemble_error_no_tiles_provided_incremental", prog=None, lvl="ERROR")
         return None, None
 
+    # final_output_shape_hw is in (height, width) order
     h, w = final_output_shape_hw
     sum_shape = (h, w, n_channels)
     weight_shape = (h, w)
