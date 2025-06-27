@@ -295,6 +295,7 @@
     "gui_memmap_cleanup": "Supprimer les *.dat à la fin",
     "gui_auto_limit_frames": "Limiter automatiquement les images par master tile (stabilité système)",
     "reject_winsor_info_channel_progress": "Winsorized Sigma Clip : traitement du canal {channel}...",
-    "reject_winsor_info_mono_progress": "Winsorized Sigma Clip : traitement image monochrome..."
+    "reject_winsor_info_mono_progress": "Winsorized Sigma Clip : traitement image monochrome...",
+    "run_info_memmap_dir_default_output": "Dossier memmap non défini. Utilisation du dossier de sortie '{directory}'."
     
 }
