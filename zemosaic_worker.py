@@ -1894,12 +1894,15 @@ def run_hierarchical_mosaic(
         log_key_phase5_failed = "run_error_phase5_assembly_failed_incremental"
         log_key_phase5_finished = "run_info_phase5_finished_incremental"
     else: # Méthode Reproject & Coadd
-        if not reproject_coadd_available: 
+        if not reproject_coadd_available:
             pcb("run_error_phase5_reproject_coadd_func_missing", prog=None, lvl="CRITICAL"); return
+        if coadd_use_memmap_config and not coadd_memmap_dir_config:
+            coadd_memmap_dir_config = output_folder
+            pcb("run_info_memmap_dir_default_output", prog=None, lvl="INFO_DETAIL", directory=coadd_memmap_dir_config)
         pcb("run_info_phase5_started_reproject_coadd", prog=base_progress_phase5, lvl="INFO")
         final_mosaic_data_HWC, final_mosaic_coverage_HW = assemble_final_mosaic_reproject_coadd(
-            master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly, 
-            final_output_wcs=final_output_wcs, 
+            master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly,
+            final_output_wcs=final_output_wcs,
             final_output_shape_hw=final_output_shape_hw,
             progress_callback=progress_callback,
             n_channels=3, 

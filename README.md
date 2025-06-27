@@ -190,6 +190,7 @@ L’exécutable final se trouvera dans dist/zemosaic.exe.
   "assembly_process_workers": 0
 }
 ```
+(If `coadd_memmap_dir` is empty, ZeMosaic uses the chosen output folder.)
 A final mosaic of 20 000 × 20 000 px in RGB needs ≈ 4.8 GB
 (4 × H × W × float32). Make sure the target disk/SSD has enough space.
 Hot pixel masks detected during preprocessing are also written to the temporary
