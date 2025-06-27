@@ -1321,25 +1321,33 @@ def assemble_final_mosaic_reproject_coadd(
 
     mosaic_channels = []
     coverage = None
-    for ch in range(n_channels):
-        channel_inputs = [
-            (arr[..., ch], wcs) for arr, wcs in input_data_all_tiles_HWC_processed
-        ]
-        chan_mosaic, chan_cov = reproject_and_coadd(
-            channel_inputs,
-            output_header,
-            final_output_shape_hw,
-            reproject_function=reproject_interp,
-            combine_function="mean",
-            match_bg=match_bg,
-            process_workers=assembly_process_workers,
-            use_memmap=use_memmap,
-            memmap_dir=memmap_dir,
-            cleanup_memmap=False,
+    try:
+        for ch in range(n_channels):
+            channel_inputs = [
+                (arr[..., ch], wcs) for arr, wcs in input_data_all_tiles_HWC_processed
+            ]
+            chan_mosaic, chan_cov = reproject_and_coadd(
+                channel_inputs,
+                output_header,
+                final_output_shape_hw,
+                reproject_function=reproject_interp,
+                combine_function="mean",
+                match_bg=match_bg,
+                process_workers=assembly_process_workers,
+                use_memmap=use_memmap,
+                memmap_dir=memmap_dir,
+                cleanup_memmap=False,
+            )
+            mosaic_channels.append(chan_mosaic.astype(np.float32))
+            if coverage is None:
+                coverage = chan_cov.astype(np.float32)
+    except Exception as e_reproject:
+        _pcb("assemble_error_reproject_coadd_call_failed", lvl="ERROR", error=str(e_reproject))
+        logger.error(
+            "Erreur fatale lors de l'appel à reproject_and_coadd:",
+            exc_info=True,
         )
-        mosaic_channels.append(chan_mosaic.astype(np.float32))
-        if coverage is None:
-            coverage = chan_cov.astype(np.float32)
+        return None, None
 
     mosaic_data = np.stack(mosaic_channels, axis=-1)
 
