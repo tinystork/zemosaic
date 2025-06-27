@@ -184,6 +184,7 @@ class ZeMosaicGUI:
         self.mm_dir_var = tk.StringVar(value=self.config.get("coadd_memmap_dir", ""))
         self.cleanup_memmap_var = tk.BooleanVar(value=self.config.get("coadd_cleanup_memmap", True))
         self.auto_limit_frames_var = tk.BooleanVar(value=self.config.get("auto_limit_frames_per_master_tile", True))
+        self.max_raw_per_tile_var = tk.IntVar(value=self.config.get("max_raw_per_master_tile", 0))
         # ---  ---
 
         self.translatable_widgets = {}
@@ -590,6 +591,21 @@ class ZeMosaicGUI:
         ttk.Button(self.memmap_frame, text="…", command=self._browse_mm_dir).grid(row=1, column=2, padx=5, pady=3)
         ttk.Checkbutton(self.memmap_frame, text=self._tr("gui_memmap_cleanup", "Delete *.dat when finished"), variable=self.cleanup_memmap_var).grid(row=2, column=0, sticky="w", padx=5, pady=3)
         ttk.Checkbutton(self.memmap_frame, text=self._tr("gui_auto_limit_frames", "Auto limit frames per master tile (system stability)"), variable=self.auto_limit_frames_var).grid(row=3, column=0, sticky="w", padx=5, pady=3, columnspan=2)
+        self.max_raw_per_tile_label = ttk.Label(self.memmap_frame, text="")
+        self.max_raw_per_tile_label.grid(row=4, column=0, padx=5, pady=3, sticky="w")
+        self.translatable_widgets["max_raw_per_tile_label"] = self.max_raw_per_tile_label
+        self.max_raw_per_tile_spinbox = ttk.Spinbox(
+            self.memmap_frame,
+            from_=0,
+            to=9999,
+            increment=1,
+            textvariable=self.max_raw_per_tile_var,
+            width=8
+        )
+        self.max_raw_per_tile_spinbox.grid(row=4, column=1, padx=5, pady=3, sticky="w")
+        max_raw_note = ttk.Label(self.memmap_frame, text="")
+        max_raw_note.grid(row=4, column=2, padx=(10,5), pady=3, sticky="w")
+        self.translatable_widgets["max_raw_per_tile_note"] = max_raw_note
         self._on_assembly_method_change()
         
 
@@ -1144,6 +1160,7 @@ class ZeMosaicGUI:
             )
 
         self.config["winsor_worker_limit"] = self.winsor_workers_var.get()
+        self.config["max_raw_per_master_tile"] = self.max_raw_per_tile_var.get()
         if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
             zemosaic_config.save_config(self.config)
 
@@ -1174,7 +1191,8 @@ class ZeMosaicGUI:
             self.auto_limit_frames_var.get(),
             self.config.get("assembly_process_workers", 0),
             self.config.get("auto_limit_memory_fraction", 0.1),
-            self.winsor_workers_var.get()
+            self.winsor_workers_var.get(),
+            self.max_raw_per_tile_var.get()
             # --- FIN NOUVEAUX ARGUMENTS ---
         )
         

@@ -295,6 +295,8 @@
     "gui_memmap_dir": "Dossier memmap",
     "gui_memmap_cleanup": "Supprimer les *.dat à la fin",
     "gui_auto_limit_frames": "Limiter automatiquement les images par master tile (stabilité système)",
+    "max_raw_per_tile_label": "Brutes max par master tile",
+    "max_raw_per_tile_note": "0 = automatique (calculé). Valeur positive = nombre maximum d'images brutes par master-tile.",
     "reject_winsor_info_channel_progress": "Winsorized Sigma Clip : traitement du canal {channel}...",
     "reject_winsor_info_mono_progress": "Winsorized Sigma Clip : traitement image monochrome..."
     
