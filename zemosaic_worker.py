@@ -1307,16 +1307,41 @@ def assemble_final_mosaic_reproject_coadd(
     if assembly_process_workers <= 0:
         assembly_process_workers = None
 
-    mosaic_data, coverage = reproject_and_coadd(
-        input_data_all_tiles_HWC_processed,
-        final_output_wcs.to_header() if hasattr(final_output_wcs, "to_header") else final_output_wcs,
-        final_output_shape_hw,
-        match_bg=match_bg,
-        process_workers=assembly_process_workers,
-        use_memmap=use_memmap,
-        memmap_dir=memmap_dir,
-        cleanup_memmap=cleanup_memmap,
+    output_header = (
+        final_output_wcs.to_header()
+        if hasattr(final_output_wcs, "to_header")
+        else final_output_wcs
     )
+
+    mosaic_channels = []
+    coverage = None
+    for ch in range(n_channels):
+        channel_inputs = [
+            (arr[..., ch], wcs) for arr, wcs in input_data_all_tiles_HWC_processed
+        ]
+        chan_mosaic, chan_cov = reproject_and_coadd(
+            channel_inputs,
+            output_header,
+            final_output_shape_hw,
+            reproject_function=reproject_interp,
+            combine_function="mean",
+            match_bg=match_bg,
+            process_workers=assembly_process_workers,
+            use_memmap=use_memmap,
+            memmap_dir=memmap_dir,
+            cleanup_memmap=False,
+        )
+        mosaic_channels.append(chan_mosaic.astype(np.float32))
+        if coverage is None:
+            coverage = chan_cov.astype(np.float32)
+
+    mosaic_data = np.stack(mosaic_channels, axis=-1)
+
+    if use_memmap and cleanup_memmap and memmap_dir:
+        try:
+            shutil.rmtree(memmap_dir)
+        except OSError:
+            pass
 
     _log_memory_usage(progress_callback, "Fin assemble_final_mosaic_reproject_coadd")
     _pcb(
@@ -1326,13 +1351,7 @@ def assemble_final_mosaic_reproject_coadd(
         shape=mosaic_data.shape if mosaic_data is not None else "N/A",
     )
 
-    if use_memmap and cleanup_memmap and memmap_dir:
-        try:
-            shutil.rmtree(memmap_dir)
-        except OSError:
-            pass
-
-    return mosaic_data.astype(np.float32), coverage.astype(np.float32)
+    return mosaic_data, coverage
 
 
 
