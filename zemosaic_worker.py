@@ -1200,14 +1200,22 @@ def _reproject_and_coadd_channel_worker(channel_data_list, output_wcs_header, ou
     # The memmap prefixes are produced by other workers. Ensure they exist before
     # reading if provided. Wait here until both files are fully written.
 
-    stacked, coverage = reproject_and_coadd(
-        prepared_inputs,
-        output_projection=final_wcs,
-        shape_out=output_shape_hw,
-        reproject_function=reproject_interp,
-        combine_function="mean",
-        match_background=match_bg,
+    import inspect
+    sig = inspect.signature(reproject_and_coadd)
+    bg_kw = "match_background" if "match_background" in sig.parameters else (
+        "match_bg" if "match_bg" in sig.parameters else None
     )
+
+    kwargs = {
+        "output_projection": final_wcs,
+        "shape_out": output_shape_hw,
+        "reproject_function": reproject_interp,
+        "combine_function": "mean",
+    }
+    if bg_kw:
+        kwargs[bg_kw] = match_bg
+
+    stacked, coverage = reproject_and_coadd(prepared_inputs, **kwargs)
 
     if mm_sum_prefix and mm_cov_prefix:
         _wait_for_memmap_files([mm_sum_prefix, mm_cov_prefix])
@@ -1306,22 +1314,24 @@ def assemble_final_mosaic_reproject_coadd(
 
 
 
-    # Build kwargs dynamically to remain compatible with older reproject
-    reproj_kwargs = {"match_bg": match_bg}
+    # Build kwargs dynamically to remain compatible with different reproject versions
+    reproj_kwargs = {}
     try:
         import inspect
         sig = inspect.signature(reproject_and_coadd)
+        if "match_background" in sig.parameters:
+            reproj_kwargs["match_background"] = match_bg
+        elif "match_bg" in sig.parameters:
+            reproj_kwargs["match_bg"] = match_bg
         if "process_workers" in sig.parameters:
             reproj_kwargs["process_workers"] = assembly_process_workers
         if "use_memmap" in sig.parameters:
             reproj_kwargs["use_memmap"] = use_memmap
         if "memmap_dir" in sig.parameters:
             reproj_kwargs["memmap_dir"] = memmap_dir
-        if "cleanup_memmap" in sig.parameters:
-            reproj_kwargs["cleanup_memmap"] = cleanup_memmap
     except Exception:
         # If introspection fails just fall back to basic arguments
-        reproj_kwargs = {"match_bg": match_bg}
+        reproj_kwargs = {"match_background": match_bg}
 
 
     mosaic_channels = []
@@ -1337,11 +1347,8 @@ def assemble_final_mosaic_reproject_coadd(
                 final_output_shape_hw,
                 reproject_function=reproject_interp,
                 combine_function="mean",
-                match_bg=match_bg,
-                process_workers=assembly_process_workers,
-                use_memmap=use_memmap,
-                memmap_dir=memmap_dir,
                 cleanup_memmap=False,
+                **reproj_kwargs,
             )
             mosaic_channels.append(chan_mosaic.astype(np.float32))
             if coverage is None:
