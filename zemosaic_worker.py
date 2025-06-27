@@ -1279,6 +1279,16 @@ def assemble_final_mosaic_reproject_coadd(
     for idx, (tile_path, tile_wcs) in enumerate(master_tile_fits_with_wcs_list, 1):
         with fits.open(tile_path, memmap=False) as hdul:
             data = hdul[0].data.astype(np.float32)
+
+        # Master tiles saved via ``save_fits_image`` use the ``HWC`` axis order
+        # which stores color images in ``C x H x W`` within the FITS file.  When
+        # reading them back for final assembly we expect ``H x W x C``.
+        # If the first axis has length 3 and differs from the last axis we
+        # convert back to ``HWC``.  This avoids passing arrays of shape
+        # ``(3, H, W)`` to ``reproject_and_coadd`` which would produce an
+        # invalid coverage map consisting of thin lines only.
+        if data.ndim == 3 and data.shape[0] == 3 and data.shape[-1] != 3:
+            data = np.moveaxis(data, 0, -1)
         if data.ndim == 2:
             data = data[..., np.newaxis]
 
