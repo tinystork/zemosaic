@@ -300,6 +300,8 @@
     "max_raw_per_master_tile_note": "0 = automatique (calculé). Valeur positive = nombre maximum d'images brutes par master-tuile.",
     "reject_winsor_info_channel_progress": "Winsorized Sigma Clip : traitement du canal {channel}...",
     "reject_winsor_info_mono_progress": "Winsorized Sigma Clip : traitement image monochrome...",
-    
-    "assemble_error_invalid_final_shape_inc": "ERREUR assemblage incrémental : dimensions finales invalides {shape}."
+
+    "assemble_error_invalid_final_shape_inc": "ERREUR assemblage incrémental : dimensions finales invalides {shape}.",
+    "assemble_warn_swapped_final_shape_inc": "AVERTISSEMENT assemblage incrémental : dimensions fournies {provided} inversées, attendu {expected}. Correction automatique.",
+    "assemble_error_mismatch_final_shape_inc": "ERREUR assemblage incrémental : dimensions fournies {provided} incompatibles avec la grille {expected}."
 }

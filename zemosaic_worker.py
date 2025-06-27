@@ -1058,6 +1058,36 @@ def assemble_final_mosaic_incremental(
         return None, None
 
     h, w = map(int, final_output_shape_hw)
+
+    # --- Extra validation to help catch swapped width/height ---
+    try:
+        w_wcs = int(getattr(final_output_wcs, "pixel_shape", (w, h))[0])
+        h_wcs = int(getattr(final_output_wcs, "pixel_shape", (w, h))[1])
+    except Exception:
+        w_wcs = int(getattr(final_output_wcs.wcs, "naxis1", w)) if hasattr(final_output_wcs, "wcs") else w
+        h_wcs = int(getattr(final_output_wcs.wcs, "naxis2", h)) if hasattr(final_output_wcs, "wcs") else h
+
+    expected_hw = (h_wcs, w_wcs)
+    if (h, w) != expected_hw:
+        if (w, h) == expected_hw:
+            pcb_asm(
+                "assemble_warn_swapped_final_shape_inc",
+                prog=None,
+                lvl="WARN",
+                provided=str(final_output_shape_hw),
+                expected=str(expected_hw),
+            )
+            h, w = expected_hw
+        else:
+            pcb_asm(
+                "assemble_error_mismatch_final_shape_inc",
+                prog=None,
+                lvl="ERROR",
+                provided=str(final_output_shape_hw),
+                expected=str(expected_hw),
+            )
+            return None, None
+
     sum_shape = (h, w, n_channels)
     weight_shape = (h, w)
 
