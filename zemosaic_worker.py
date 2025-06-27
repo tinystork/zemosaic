@@ -1268,6 +1268,26 @@ def assemble_final_mosaic_reproject_coadd(
             data = hdul[0].data.astype(np.float32)
         if data.ndim == 2:
             data = data[..., np.newaxis]
+
+        if (
+            apply_crop
+            and crop_percent > 1e-3
+            and ZEMOSAIC_UTILS_AVAILABLE
+            and hasattr(zemosaic_utils, "crop_image_and_wcs")
+        ):
+            try:
+                cropped, cropped_wcs = zemosaic_utils.crop_image_and_wcs(
+                    data,
+                    tile_wcs,
+                    crop_percent / 100.0,
+                    progress_callback=None,
+                )
+                if cropped is not None and cropped_wcs is not None:
+                    data = cropped
+                    tile_wcs = cropped_wcs
+            except Exception:
+                pass
+
         input_data_all_tiles_HWC_processed.append((data, tile_wcs))
 
         if idx % 10 == 0 or idx == len(master_tile_fits_with_wcs_list):
@@ -1296,8 +1316,6 @@ def assemble_final_mosaic_reproject_coadd(
         use_memmap=use_memmap,
         memmap_dir=memmap_dir,
         cleanup_memmap=cleanup_memmap,
-        apply_crop=apply_crop,
-        crop_percent=crop_percent,
     )
 
     _log_memory_usage(progress_callback, "Fin assemble_final_mosaic_reproject_coadd")
