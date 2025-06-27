@@ -1223,6 +1223,10 @@ def assemble_final_mosaic_reproject_coadd(
     match_bg: bool = True,
     apply_crop: bool = False,
     crop_percent: float = 0.0,
+    use_memmap: bool = False,
+    memmap_dir: str | None = None,
+    cleanup_memmap: bool = True,
+    assembly_process_workers: int = 0,
 ):
     """Assemble les master tiles en utilisant ``reproject_and_coadd``."""
     _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
@@ -1252,6 +1256,8 @@ def assemble_final_mosaic_reproject_coadd(
     if not master_tile_fits_with_wcs_list:
         _pcb("assemble_error_no_tiles_provided_reproject_coadd", prog=None, lvl="ERROR")
         return None, None
+
+
 
     # Convertir la sortie WCS en header FITS si possible une seule fois
     output_header = (
@@ -1316,6 +1322,7 @@ def assemble_final_mosaic_reproject_coadd(
     except Exception:
         # If introspection fails just fall back to basic arguments
         reproj_kwargs = {"match_bg": match_bg}
+
 
     mosaic_channels = []
     coverage = None
