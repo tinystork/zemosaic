@@ -374,6 +374,9 @@ def crop_image_and_wcs(
             # Lorsqu'on soustrait, on soustrait le nombre de pixels rognés du côté "origine" (gauche/bas).
             new_crpix1 = cropped_wcs_obj.wcs.crpix[0] - dw
             new_crpix2 = cropped_wcs_obj.wcs.crpix[1] - dh
+            # Clamp to positive values to avoid invalid WCS after heavy cropping
+            new_crpix1 = max(new_crpix1, 1.0)
+            new_crpix2 = max(new_crpix2, 1.0)
             cropped_wcs_obj.wcs.crpix = [new_crpix1, new_crpix2]
         else:
             # Ce cas est peu probable si c'est un WCS valide, mais par sécurité.
