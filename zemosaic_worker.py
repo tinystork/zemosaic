@@ -1293,12 +1293,29 @@ def assemble_final_mosaic_reproject_coadd(
 
 
 
+    # Build kwargs dynamically to remain compatible with older reproject
+    reproj_kwargs = {"match_bg": match_bg}
+    try:
+        import inspect
+        sig = inspect.signature(reproject_and_coadd)
+        if "process_workers" in sig.parameters:
+            reproj_kwargs["process_workers"] = assembly_process_workers
+        if "use_memmap" in sig.parameters:
+            reproj_kwargs["use_memmap"] = use_memmap
+        if "memmap_dir" in sig.parameters:
+            reproj_kwargs["memmap_dir"] = memmap_dir
+        if "cleanup_memmap" in sig.parameters:
+            reproj_kwargs["cleanup_memmap"] = cleanup_memmap
+    except Exception:
+        # If introspection fails just fall back to basic arguments
+        reproj_kwargs = {"match_bg": match_bg}
+
     mosaic_data, coverage = reproject_and_coadd(
         input_data_all_tiles_HWC_processed,
         final_output_wcs.to_header() if hasattr(final_output_wcs, "to_header") else final_output_wcs,
         final_output_shape_hw,
-        reproject_function=reproject_interp,
-        match_background=match_bg,
+
+        **reproj_kwargs,
 
     )
 
