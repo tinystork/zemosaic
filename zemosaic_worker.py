@@ -1720,10 +1720,33 @@ def run_hierarchical_mosaic(
     _log_memory_usage(progress_callback, "Début Phase 2 (Clustering)")
     pcb("run_info_phase2_started", prog=base_progress_phase2, lvl="INFO")
     seestar_stack_groups = cluster_seestar_stacks(all_raw_files_processed_info, SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG, progress_callback)
-    if not seestar_stack_groups: pcb("run_error_phase2_no_groups", prog=(base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING), lvl="ERROR"); return
+    if not seestar_stack_groups:
+        pcb("run_error_phase2_no_groups", prog=(base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING), lvl="ERROR")
+        return
+    if max_raw_per_master_tile_config and max_raw_per_master_tile_config > 0:
+        new_groups = []
+        for g in seestar_stack_groups:
+            for i in range(0, len(g), max_raw_per_master_tile_config):
+                new_groups.append(g[i:i + max_raw_per_master_tile_config])
+        if len(new_groups) != len(seestar_stack_groups):
+            pcb(
+                "clusterstacks_info_groups_split_manual_limit",
+                prog=None,
+                lvl="INFO_DETAIL",
+                original=len(seestar_stack_groups),
+                new=len(new_groups),
+                limit=max_raw_per_master_tile_config,
+            )
+        seestar_stack_groups = new_groups
     cpu_total = os.cpu_count() or 1
     winsor_worker_limit = max(1, min(int(winsor_worker_limit_config), cpu_total))
-    pcb(f"Winsor worker limit set to {winsor_worker_limit}" + (" (ProcessPoolExecutor enabled)" if winsor_worker_limit > 1 else ""), prog=None, lvl="INFO")
+    pcb(
+        f"Winsor worker limit set to {winsor_worker_limit}" + (
+            " (ProcessPoolExecutor enabled)" if winsor_worker_limit > 1 else ""
+        ),
+        prog=None,
+        lvl="INFO",
+    )
     manual_limit = max_raw_per_master_tile_config
     if auto_limit_frames_per_master_tile_config:
         try:

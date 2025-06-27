@@ -593,7 +593,7 @@ class ZeMosaicGUI:
         ttk.Checkbutton(self.memmap_frame, text=self._tr("gui_auto_limit_frames", "Auto limit frames per master tile (system stability)"), variable=self.auto_limit_frames_var).grid(row=3, column=0, sticky="w", padx=5, pady=3, columnspan=2)
         self.max_raw_per_tile_label = ttk.Label(self.memmap_frame, text="")
         self.max_raw_per_tile_label.grid(row=4, column=0, padx=5, pady=3, sticky="w")
-        self.translatable_widgets["max_raw_per_tile_label"] = self.max_raw_per_tile_label
+        self.translatable_widgets["max_raw_per_master_tile_label"] = self.max_raw_per_tile_label
         self.max_raw_per_tile_spinbox = ttk.Spinbox(
             self.memmap_frame,
             from_=0,
@@ -605,7 +605,7 @@ class ZeMosaicGUI:
         self.max_raw_per_tile_spinbox.grid(row=4, column=1, padx=5, pady=3, sticky="w")
         max_raw_note = ttk.Label(self.memmap_frame, text="")
         max_raw_note.grid(row=4, column=2, padx=(10,5), pady=3, sticky="w")
-        self.translatable_widgets["max_raw_per_tile_note"] = max_raw_note
+        self.translatable_widgets["max_raw_per_master_tile_note"] = max_raw_note
         self._on_assembly_method_change()
         
 
