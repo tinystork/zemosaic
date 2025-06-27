@@ -1463,7 +1463,8 @@ def run_hierarchical_mosaic(
     assembly_process_workers_config: int,
     auto_limit_frames_per_master_tile_config: bool,
     auto_limit_memory_fraction_config: float,
-    winsor_worker_limit_config: int
+    winsor_worker_limit_config: int,
+    max_raw_per_master_tile_config: int
 ):
     """
     Orchestre le traitement de la mosaïque hiérarchique.
@@ -1723,6 +1724,7 @@ def run_hierarchical_mosaic(
     cpu_total = os.cpu_count() or 1
     winsor_worker_limit = max(1, min(int(winsor_worker_limit_config), cpu_total))
     pcb(f"Winsor worker limit set to {winsor_worker_limit}" + (" (ProcessPoolExecutor enabled)" if winsor_worker_limit > 1 else ""), prog=None, lvl="INFO")
+    manual_limit = max_raw_per_master_tile_config
     if auto_limit_frames_per_master_tile_config:
         try:
             sample_path = seestar_stack_groups[0][0].get('path_preprocessed_cache')
@@ -1739,6 +1741,8 @@ def run_hierarchical_mosaic(
                     // (expected_workers * bytes_per_frame * 6)
                 ),
             )
+            if manual_limit > 0:
+                limit = min(limit, manual_limit)
             winsor_worker_limit = min(winsor_worker_limit, limit)
             new_groups = []
             for g in seestar_stack_groups:
@@ -1755,6 +1759,11 @@ def run_hierarchical_mosaic(
                     shape=str(sample_shape),
                 )
             seestar_stack_groups = new_groups
+            if manual_limit > 0 and limit != manual_limit:
+                logger.info(
+                    "Manual frame limit (%d) is lower than auto limit, using manual value.",
+                    manual_limit,
+                )
         except Exception as e_auto:
             pcb("clusterstacks_warn_auto_limit_failed", prog=None, lvl="WARN", error=str(e_auto))
     current_global_progress = base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING
@@ -2201,6 +2210,8 @@ if __name__ == "__main__":
                         help="Number of processes for final assembly (0=auto)")
     parser.add_argument("-W", "--winsor-workers", type=int, default=None,
                         help="Process workers for Winsorized rejection (1-16)")
+    parser.add_argument("--max-raw-per-master-tile", type=int, default=None,
+                        help="Cap raw frames per master tile (0=auto)")
     args = parser.parse_args()
 
     cfg = {}
@@ -2246,4 +2257,5 @@ if __name__ == "__main__":
         auto_limit_frames_per_master_tile_config=(not args.no_auto_limit_frames) and cfg.get("auto_limit_frames_per_master_tile", True),
         auto_limit_memory_fraction_config=cfg.get("auto_limit_memory_fraction", 0.2),
         winsor_worker_limit_config=args.winsor_workers if args.winsor_workers is not None else cfg.get("winsor_worker_limit", 2),
+        max_raw_per_master_tile_config=args.max_raw_per_master_tile if args.max_raw_per_master_tile is not None else cfg.get("max_raw_per_master_tile", 0),
     )
