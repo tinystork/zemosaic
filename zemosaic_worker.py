@@ -271,6 +271,12 @@ def reproject_tile_to_mosaic(tile_path: str, tile_wcs, mosaic_wcs, mosaic_shape_
     with fits.open(tile_path, memmap=False) as hdul:
         data = hdul[0].data.astype(np.float32)
 
+    # Les master tiles sauvegardées via ``save_fits_image`` utilisent l'ordre
+    # d'axes ``CxHxW``.  Pour l'assemblage incrémental nous attendons
+    # ``H x W x C``.  Effectuer la conversion si nécessaire.
+    if data.ndim == 3 and data.shape[0] == 3 and data.shape[-1] != 3:
+        data = np.moveaxis(data, 0, -1)
+
     if data.ndim == 2:
         data = data[..., np.newaxis]
     n_channels = data.shape[-1]
