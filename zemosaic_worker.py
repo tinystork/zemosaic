@@ -1223,10 +1223,6 @@ def assemble_final_mosaic_reproject_coadd(
     match_bg: bool = True,
     apply_crop: bool = False,
     crop_percent: float = 0.0,
-    use_memmap: bool = False,
-    memmap_dir: str | None = None,
-    cleanup_memmap: bool = True,
-    process_workers: int = 0,
 ):
     """Assemble les master tiles en utilisant ``reproject_and_coadd``."""
     _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
@@ -1257,10 +1253,6 @@ def assemble_final_mosaic_reproject_coadd(
         _pcb("assemble_error_no_tiles_provided_reproject_coadd", prog=None, lvl="ERROR")
         return None, None
 
-    if use_memmap and memmap_dir is None:
-        memmap_dir = tempfile.mkdtemp(prefix="zemosaic_coadd_")
-    if memmap_dir:
-        os.makedirs(memmap_dir, exist_ok=True)
 
     input_data_all_tiles_HWC_processed = []
     for idx, (tile_path, tile_wcs) in enumerate(master_tile_fits_with_wcs_list, 1):
@@ -1299,13 +1291,7 @@ def assemble_final_mosaic_reproject_coadd(
                 total_num=len(master_tile_fits_with_wcs_list),
             )
 
-    assembly_process_workers = 0
-    try:
-        assembly_process_workers = int(process_workers)
-    except Exception:
-        assembly_process_workers = 0
-    if assembly_process_workers <= 0:
-        assembly_process_workers = None
+
 
     # Build kwargs dynamically to remain compatible with older reproject
     reproj_kwargs = {"match_bg": match_bg}
@@ -1328,8 +1314,40 @@ def assemble_final_mosaic_reproject_coadd(
         input_data_all_tiles_HWC_processed,
         final_output_wcs.to_header() if hasattr(final_output_wcs, "to_header") else final_output_wcs,
         final_output_shape_hw,
+
         **reproj_kwargs,
+
     )
+
+    mosaic_channels = []
+    coverage = None
+    for ch in range(n_channels):
+        channel_inputs = [
+            (arr[..., ch], wcs) for arr, wcs in input_data_all_tiles_HWC_processed
+        ]
+        chan_mosaic, chan_cov = reproject_and_coadd(
+            channel_inputs,
+            output_header,
+            final_output_shape_hw,
+            reproject_function=reproject_interp,
+            combine_function="mean",
+            match_bg=match_bg,
+            process_workers=assembly_process_workers,
+            use_memmap=use_memmap,
+            memmap_dir=memmap_dir,
+            cleanup_memmap=False,
+        )
+        mosaic_channels.append(chan_mosaic.astype(np.float32))
+        if coverage is None:
+            coverage = chan_cov.astype(np.float32)
+
+    mosaic_data = np.stack(mosaic_channels, axis=-1)
+
+    if use_memmap and cleanup_memmap and memmap_dir:
+        try:
+            shutil.rmtree(memmap_dir)
+        except OSError:
+            pass
 
     _log_memory_usage(progress_callback, "Fin assemble_final_mosaic_reproject_coadd")
     _pcb(
@@ -1338,12 +1356,6 @@ def assemble_final_mosaic_reproject_coadd(
         lvl="INFO",
         shape=mosaic_data.shape if mosaic_data is not None else "N/A",
     )
-
-    if use_memmap and cleanup_memmap and memmap_dir:
-        try:
-            shutil.rmtree(memmap_dir)
-        except OSError:
-            pass
 
     return mosaic_data.astype(np.float32), coverage.astype(np.float32)
 
@@ -1885,10 +1897,7 @@ def run_hierarchical_mosaic(
             # --- PASSAGE DES PARAMÈTRES DE ROGNAGE ---
             apply_crop=apply_master_tile_crop_config,
             crop_percent=master_tile_crop_percent_config,
-            use_memmap=coadd_use_memmap_config,
-            memmap_dir=coadd_memmap_dir_config,
-            cleanup_memmap=coadd_cleanup_memmap_config,
-            process_workers=assembly_process_workers_config
+            # Memmap options removed for compatibility with standard reproject
             # --- FIN PASSAGE ---
         )
         log_key_phase5_failed = "run_error_phase5_assembly_failed_reproject_coadd"
