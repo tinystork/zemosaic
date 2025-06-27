@@ -1257,13 +1257,6 @@ def assemble_final_mosaic_reproject_coadd(
         _pcb("assemble_error_no_tiles_provided_reproject_coadd", prog=None, lvl="ERROR")
         return None, None
 
-    if use_memmap and memmap_dir is None:
-        memmap_dir = tempfile.mkdtemp(prefix="zemosaic_coadd_")
-    if memmap_dir:
-        os.makedirs(memmap_dir, exist_ok=True)
-
-    if assembly_process_workers <= 0:
-        assembly_process_workers = None
 
 
     # Convertir la sortie WCS en header FITS si possible une seule fois
@@ -1330,14 +1323,6 @@ def assemble_final_mosaic_reproject_coadd(
         # If introspection fails just fall back to basic arguments
         reproj_kwargs = {"match_bg": match_bg}
 
-    mosaic_data, coverage = reproject_and_coadd(
-        input_data_all_tiles_HWC_processed,
-        output_header,
-        final_output_shape_hw,
-
-        **reproj_kwargs,
-
-    )
 
     mosaic_channels = []
     coverage = None
