@@ -360,11 +360,13 @@ def reproject_tile_to_mosaic(tile_path: str, tile_wcs, mosaic_wcs, mosaic_shape_
     if not np.any(valid):
         return None, None, (0, 0, 0, 0)
 
-    # Soustraire un fond médian simple pour imiter match_background=True
+    # Soustraire un fond médian par canal pour imiter match_background=True
     try:
-        bg = np.nanmedian(reproj_img[valid])
-        if np.isfinite(bg):
-            reproj_img -= bg
+        for c in range(n_channels):
+            med_c = np.nanmedian(reproj_img[..., c][valid])
+            if np.isfinite(med_c):
+                reproj_img[..., c] -= med_c
+        reproj_img = np.clip(reproj_img, 0, None)
     except Exception:
         pass
 
