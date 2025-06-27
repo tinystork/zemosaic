@@ -240,7 +240,11 @@ def reproject_tile_to_mosaic(tile_path: str, tile_wcs, mosaic_wcs, mosaic_shape_
                              apply_crop: bool = False,
                              crop_percent: float = 0.0):
     """Reprojecte une tuile sur la grille finale et renvoie l'image et sa carte
-    de poids avec la bounding box utile.
+    de poids ainsi que la bounding box utile.
+
+    Les bornes sont retournées dans l'ordre ``(xmin, xmax, ymin, ymax)`` afin
+    de correspondre aux indices ``[ligne, colonne]`` lors de l'incrémentation
+    sur la mosaïque.
 
     ``tile_wcs`` et ``mosaic_wcs`` peuvent être soit des objets :class:`WCS`
     directement, soit des en-têtes FITS (``dict`` ou :class:`~astropy.io.fits.Header``).
@@ -350,6 +354,7 @@ def reproject_tile_to_mosaic(tile_path: str, tile_wcs, mosaic_wcs, mosaic_shape_
     if not np.any(valid):
         return None, None, (0, 0, 0, 0)
 
+    # Les indices sont retournés dans l'ordre (xmin, xmax, ymin, ymax)
     return reproj_img, reproj_weight, (i0, i1, j0, j1)
 
 
@@ -1163,7 +1168,10 @@ def assemble_final_mosaic_incremental(
             for fut in as_completed(future_map):
                 idx = future_map[fut]
                 try:
-                    I_tile, W_tile, (i0, i1, j0, j1) = fut.result()
+                    # reproject_tile_to_mosaic renvoie les bornes de la tuile
+                    # sous la forme (xmin, xmax, ymin, ymax) afin de
+                    # correspondre aux indices de colonne puis de ligne.
+                    I_tile, W_tile, (xmin, xmax, ymin, ymax) = fut.result()
                 except MemoryError as e_mem:
                     pcb_asm(
                         "assemble_error_memory_tile_reprojection_inc",
@@ -1208,8 +1216,8 @@ def assemble_final_mosaic_incremental(
 
                 if I_tile is not None and W_tile is not None:
                     for c in range(n_channels):
-                        fsum[j0:j1, i0:i1, c] += I_tile[..., c] * W_tile
-                    fwei[j0:j1, i0:i1] += W_tile
+                        fsum[ymin:ymax, xmin:xmax, c] += I_tile[..., c] * W_tile
+                    fwei[ymin:ymax, xmin:xmax] += W_tile
                     tiles_since_flush += 1
                     if tiles_since_flush >= FLUSH_BATCH_SIZE:
                         hsum.flush()
