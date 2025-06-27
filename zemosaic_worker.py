@@ -1111,9 +1111,9 @@ def assemble_final_mosaic_incremental(
                     tile_wcs_hdr,
                     output_wcs_hdr,
                     final_output_shape_hw,
-                    True,
-                    apply_crop,
-                    crop_percent,
+                    feather=True,
+                    apply_crop=apply_crop,
+                    crop_percent=crop_percent,
                 )
                 future_map[future] = tile_idx
 
