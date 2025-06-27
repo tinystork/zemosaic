@@ -303,6 +303,7 @@
     "max_raw_per_master_tile_label": "Max raw per master tile",
     "max_raw_per_master_tile_note": "0 = automatic (calculated). Positive value = maximum raw images per master tile.",
     "reject_winsor_info_channel_progress": "Winsorized Sigma Clip processing channel {channel}...",
-    "reject_winsor_info_mono_progress": "Winsorized Sigma Clip processing monochrome data..."
+    "reject_winsor_info_mono_progress": "Winsorized Sigma Clip processing monochrome data...",
 
+    "assemble_error_invalid_final_shape_inc": "Incremental assembly ERROR: invalid final output shape {shape}."
 }
