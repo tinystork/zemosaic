@@ -360,6 +360,14 @@ def reproject_tile_to_mosaic(tile_path: str, tile_wcs, mosaic_wcs, mosaic_shape_
     if not np.any(valid):
         return None, None, (0, 0, 0, 0)
 
+    # Soustraire un fond médian simple pour imiter match_background=True
+    try:
+        bg = np.nanmedian(reproj_img[valid])
+        if np.isfinite(bg):
+            reproj_img -= bg
+    except Exception:
+        pass
+
     # Les indices sont retournés dans l'ordre (xmin, xmax, ymin, ymax)
     return reproj_img, reproj_weight, (i0, i1, j0, j1)
 
@@ -1028,6 +1036,7 @@ def assemble_final_mosaic_incremental(
 ):
     """Assemble les master tiles par co-addition sur disque."""
     FLUSH_BATCH_SIZE = 10  # nombre de tuiles entre chaque flush sur le memmap
+    use_feather = False  # Désactivation du feathering par défaut
     pcb_asm = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
         msg_key, prog, lvl, callback=progress_callback, **kwargs
     )
@@ -1164,7 +1173,7 @@ def assemble_final_mosaic_incremental(
                     tile_wcs_hdr,
                     output_wcs_hdr,
                     final_output_shape_hw,
-                    feather=True,
+                    feather=use_feather,
                     apply_crop=apply_crop,
                     crop_percent=crop_percent,
                 )
