@@ -1320,70 +1320,103 @@ def assemble_final_mosaic_reproject_coadd(
 
         max_procs = process_workers if process_workers and process_workers > 0 else min(os.cpu_count() or 1, n_channels)
         _pcb(f"ASM_REPROJ_COADD: Using {max_procs} process workers", lvl="DEBUG_DETAIL")
-        with ProcessPoolExecutor(max_workers=max_procs) as ex:
 
-            future_map = {}
-            for i_channel, ch_data in enumerate(per_channel_data):
-                if not ch_data:
-                    _pcb("assemble_warn_no_data_for_channel_reproject_coadd", lvl="WARN", channel_num=i_channel+1)
-                    final_mosaic_stacked_channels_list[i_channel] = np.zeros(final_output_shape_hw, dtype=np.float32)
-                    if i_channel == 0 and final_mosaic_coverage_map is None:
-                        final_mosaic_coverage_map = np.zeros(final_output_shape_hw, dtype=np.float32)
-                    _log_memory_usage(progress_callback, f"Phase 5 (reproject_coadd) - Fin canal {i_channel+1} (données manquantes)")
-                    continue
-                sum_prefix = os.path.join(memmap_dir, f"sum_ch{i_channel}") if memmap_dir else None
-                cov_prefix = os.path.join(memmap_dir, f"cov_ch{i_channel}") if memmap_dir else None
-                future = ex.submit(_reproject_and_coadd_channel_worker, ch_data, final_output_wcs_header, final_output_shape_hw, match_bg, sum_prefix, cov_prefix)
-                future_map[future] = i_channel
+        if max_procs <= 1:
+            try:
+                for i_channel, ch_data in enumerate(per_channel_data):
+                    if not ch_data:
+                        _pcb("assemble_warn_no_data_for_channel_reproject_coadd", lvl="WARN", channel_num=i_channel+1)
+                        final_mosaic_stacked_channels_list[i_channel] = np.zeros(final_output_shape_hw, dtype=np.float32)
+                        if i_channel == 0 and final_mosaic_coverage_map is None:
+                            final_mosaic_coverage_map = np.zeros(final_output_shape_hw, dtype=np.float32)
+                        _log_memory_usage(progress_callback, f"Phase 5 (reproject_coadd) - Fin canal {i_channel+1} (données manquantes)")
+                        continue
 
-            for fut in as_completed(future_map):
-                idx = future_map[fut]
-                try:
-                    stacked_channel_output, coverage_channel_output = fut.result()
-                except MemoryError as e_mem_reproject:
-                    _pcb(
-                        "assemble_error_memory_channel_reprojection_reproject_coadd",
-                        prog=None,
-                        lvl="ERROR",
-                        channel_num=idx + 1,
-                        error=str(e_mem_reproject),
-                    )
-                    logger.error(
-                        f"MemoryError reproject_and_coadd canal {idx + 1}:",
-                        exc_info=True,
-                    )
-                    return None, None
+                    prepared_inputs = [(img_hw, WCS(hdr)) for img_hw, hdr in ch_data]
 
-                except BrokenProcessPool as bpp:
-                    _pcb(
-                        "assemble_error_broken_process_pool_reproject_coadd",
-                        prog=None,
-                        lvl="ERROR",
-                        channel_num=idx + 1,
-                        error=str(bpp),
+                    chan_mosaic, chan_cov = reproject_and_coadd(
+                        prepared_inputs,
+                        output_projection=final_output_wcs,
+                        shape_out=final_output_shape_hw,
+                        reproject_function=reproject_interp,
+                        combine_function="mean",
+                        match_background=match_bg,
                     )
-                    logger.error("BrokenProcessPool during channel reprojection", exc_info=True)
-                    return None, None
 
-                except Exception as e_reproject_ch:
-                    _pcb(
-                        "assemble_error_channel_reprojection_failed_reproject_coadd",
-                        prog=None,
-                        lvl="ERROR",
-                        channel_num=idx + 1,
-                        error=str(e_reproject_ch),
-                    )
-                    logger.error(
-                        f"Erreur reproject_and_coadd canal {idx + 1}:",
-                        exc_info=True,
-                    )
-                    return None, None
-
-                final_mosaic_stacked_channels_list[idx] = stacked_channel_output
-                if idx == 0:
-                    final_mosaic_coverage_map = coverage_channel_output
-                _pcb("assemble_info_channel_processed_reproject_coadd", prog=None, lvl="INFO_DETAIL", channel_num=idx + 1)
-                _log_memory_usage(progress_callback, f"Phase 5 (reproject_coadd) - Fin canal {idx+1}")
+                    final_mosaic_stacked_channels_list[i_channel] = chan_mosaic.astype(np.float32)
+                    if i_channel == 0:
+                        final_mosaic_coverage_map = chan_cov.astype(np.float32)
+                    _pcb("assemble_info_channel_processed_reproject_coadd", prog=None, lvl="INFO_DETAIL", channel_num=i_channel + 1)
+                    _log_memory_usage(progress_callback, f"Phase 5 (reproject_coadd) - Fin canal {i_channel+1}")
+            except Exception as e_reproject:
+                _pcb("assemble_error_reproject_coadd_call_failed", lvl="ERROR", error=str(e_reproject))
+                logger.error("Erreur fatale lors de l'appel à reproject_and_coadd:", exc_info=True)
+                return None, None
+        else:
+            with ProcessPoolExecutor(max_workers=max_procs) as ex:
+    
+                future_map = {}
+                for i_channel, ch_data in enumerate(per_channel_data):
+                    if not ch_data:
+                        _pcb("assemble_warn_no_data_for_channel_reproject_coadd", lvl="WARN", channel_num=i_channel+1)
+                        final_mosaic_stacked_channels_list[i_channel] = np.zeros(final_output_shape_hw, dtype=np.float32)
+                        if i_channel == 0 and final_mosaic_coverage_map is None:
+                            final_mosaic_coverage_map = np.zeros(final_output_shape_hw, dtype=np.float32)
+                        _log_memory_usage(progress_callback, f"Phase 5 (reproject_coadd) - Fin canal {i_channel+1} (données manquantes)")
+                        continue
+                    sum_prefix = os.path.join(memmap_dir, f"sum_ch{i_channel}") if memmap_dir else None
+                    cov_prefix = os.path.join(memmap_dir, f"cov_ch{i_channel}") if memmap_dir else None
+                    future = ex.submit(_reproject_and_coadd_channel_worker, ch_data, final_output_wcs_header, final_output_shape_hw, match_bg, sum_prefix, cov_prefix)
+                    future_map[future] = i_channel
+    
+                for fut in as_completed(future_map):
+                    idx = future_map[fut]
+                    try:
+                        stacked_channel_output, coverage_channel_output = fut.result()
+                    except MemoryError as e_mem_reproject:
+                        _pcb(
+                            "assemble_error_memory_channel_reprojection_reproject_coadd",
+                            prog=None,
+                            lvl="ERROR",
+                            channel_num=idx + 1,
+                            error=str(e_mem_reproject),
+                        )
+                        logger.error(
+                            f"MemoryError reproject_and_coadd canal {idx + 1}:",
+                            exc_info=True,
+                        )
+                        return None, None
+    
+                    except BrokenProcessPool as bpp:
+                        _pcb(
+                            "assemble_error_broken_process_pool_reproject_coadd",
+                            prog=None,
+                            lvl="ERROR",
+                            channel_num=idx + 1,
+                            error=str(bpp),
+                        )
+                        logger.error("BrokenProcessPool during channel reprojection", exc_info=True)
+                        return None, None
+    
+                    except Exception as e_reproject_ch:
+                        _pcb(
+                            "assemble_error_channel_reprojection_failed_reproject_coadd",
+                            prog=None,
+                            lvl="ERROR",
+                            channel_num=idx + 1,
+                            error=str(e_reproject_ch),
+                        )
+                        logger.error(
+                            f"Erreur reproject_and_coadd canal {idx + 1}:",
+                            exc_info=True,
+                        )
+                        return None, None
+    
+                    final_mosaic_stacked_channels_list[idx] = stacked_channel_output
+                    if idx == 0:
+                        final_mosaic_coverage_map = coverage_channel_output
+                    _pcb("assemble_info_channel_processed_reproject_coadd", prog=None, lvl="INFO_DETAIL", channel_num=idx + 1)
+                    _log_memory_usage(progress_callback, f"Phase 5 (reproject_coadd) - Fin canal {idx+1}")
 
     _log_memory_usage(progress_callback, "Phase 5 (reproject_coadd) - Après traitement de tous les canaux")
     del input_data_all_tiles_HWC_processed # Supprimer la liste des données chargées
