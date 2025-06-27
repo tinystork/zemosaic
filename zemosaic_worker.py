@@ -1844,8 +1844,10 @@ def run_hierarchical_mosaic(
             else: 
                 with fits.open(mt_path_iter,memmap=True, do_not_scale_image_data=True) as hdul_mt_s:
                     if hdul_mt_s[0].data is None: pcb("run_warn_phase4_no_data_in_tile_fits", prog=None, lvl="WARN", path=os.path.basename(mt_path_iter)); continue
-                    data_shape = hdul_mt_s[0].shape 
-                    if len(data_shape) == 3: h_mt_loc,w_mt_loc = data_shape[1],data_shape[2]
+                    data_shape = hdul_mt_s[0].shape
+                    if len(data_shape) == 3:
+                        # data_shape == (height, width, channels)
+                        h_mt_loc,w_mt_loc = data_shape[0],data_shape[1]
                     elif len(data_shape) == 2: h_mt_loc,w_mt_loc = data_shape[0],data_shape[1]
                     else: pcb("run_warn_phase4_unhandled_tile_shape", prog=None, lvl="WARN", path=os.path.basename(mt_path_iter), shape=data_shape); continue 
                     if mt_wcs_iter and mt_wcs_iter.is_celestial and mt_wcs_iter.pixel_shape is None:
