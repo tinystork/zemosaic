@@ -302,7 +302,7 @@ def reproject_tile_to_mosaic(tile_path: str, tile_wcs, mosaic_wcs, mosaic_shape_
         (base_weight, tile_wcs),
         mosaic_wcs,
         shape_out=mosaic_shape_hw,
-        order='nearest',  # suffit, c'est binaire
+        order='nearest-neighbor',  # suffit, c'est binaire
         parallel=False,
     )
 
