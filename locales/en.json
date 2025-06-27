@@ -305,5 +305,7 @@
     "reject_winsor_info_channel_progress": "Winsorized Sigma Clip processing channel {channel}...",
     "reject_winsor_info_mono_progress": "Winsorized Sigma Clip processing monochrome data...",
 
-    "assemble_error_invalid_final_shape_inc": "Incremental assembly ERROR: invalid final output shape {shape}."
+    "assemble_error_invalid_final_shape_inc": "Incremental assembly ERROR: invalid final output shape {shape}.",
+    "assemble_warn_swapped_final_shape_inc": "Incremental assembly WARNING: provided dimensions {provided} were swapped, expected {expected}. Automatically corrected.",
+    "assemble_error_mismatch_final_shape_inc": "Incremental assembly ERROR: provided dimensions {provided} do not match mosaic grid {expected}."
 }
