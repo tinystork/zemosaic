@@ -4,11 +4,10 @@ import os
 import numpy as np
 import warnings
 import time
-import re
-# import tempfile # Plus utilisé directement si on nettoie manuellement
+import tempfile
 import traceback
 import subprocess
-# import shutil # Plus utilisé directement si on nettoie manuellement
+import shutil
 import gc
 import logging
 import psutil
@@ -31,9 +30,21 @@ try:
 except ImportError:
     logger.error("Astropy non installée. Certaines fonctionnalités de zemosaic_astrometry seront limitées.")
     ASTROPY_AVAILABLE_ASTROMETRY = False
-    class AstropyWCS: pass 
+    class AstropyWCS: pass
     class FITSFixedWarning(Warning): pass
     u = None
+
+# --- Dépendances pour Astrometry.net web ---
+ASTROQUERY_AVAILABLE_ASTROMETRY = False
+AstrometryNet = None
+try:
+    from astroquery.astrometry_net import AstrometryNet as _AstrometryNetClass
+    AstrometryNet = _AstrometryNetClass
+    ASTROQUERY_AVAILABLE_ASTROMETRY = True
+except Exception:
+    logger.warning(
+        "AstrometrySolver: astroquery non installée. Plate-solving web Astrometry.net désactivé."
+    )
 
 
 def _log_memory_usage(progress_callback: callable, context_message: str = ""):
@@ -153,9 +164,9 @@ def _parse_wcs_file_content_za(wcs_file_path, image_shape_hw, progress_callback=
         return None
 
 
-def _update_fits_header_with_wcs_za(fits_header_to_update: fits.Header,
-                                   wcs_object_solution: AstropyWCS,
-                                   solver_name="ASTAP_ZeMosaic",
+def _update_fits_header_with_wcs_za(fits_header_to_update: fits.Header, 
+                                   wcs_object_solution: AstropyWCS, 
+                                   solver_name="ASTAP_ZeMosaic", 
                                    progress_callback=None):
     if not (fits_header_to_update is not None and wcs_object_solution and wcs_object_solution.is_celestial):
         if progress_callback: progress_callback("  ASTAP HeaderUpdate: MàJ header annulée: header/WCS invalide.", None, "WARN")
@@ -205,33 +216,6 @@ def _update_fits_header_with_wcs_za(fits_header_to_update: fits.Header,
 
 
 
-def _write_wcs_to_fits(file_path: str, wcs_solution: AstropyWCS, progress_callback=None):
-    """Injecte un objet WCS dans l'en-tête d'un fichier FITS en place en minimisant la RAM."""
-    if not (file_path and os.path.isfile(file_path) and wcs_solution and wcs_solution.is_celestial):
-        if progress_callback:
-            progress_callback("  WriteWCS: paramètres invalides, opération annulée.", None, "WARN")
-        return False
-    try:
-        wcs_header = wcs_solution.to_header(relax=True)
-        with fits.open(file_path, mode="update", memmap=True, do_not_scale_image_data=True) as hdul:
-            hdr = hdul[0].header
-            for key in [k for k in hdr if k.startswith(("WCSAXES", "CRPIX", "CRVAL", "CTYPE", "CUNIT", "CD", "PC", "CDELT", "CROTA", "LONPOLE", "LATPOLE", "RADESYS", "EQUINOX", "PV"))]:
-                try:
-                    del hdr[key]
-                except KeyError:
-                    pass
-            hdr.update(wcs_header)
-            hdul.flush()
-        if progress_callback:
-            progress_callback(f"WCS écrit dans {os.path.basename(file_path)}", None, "INFO")
-        return True
-    except Exception as e_wcs_write:
-        if progress_callback:
-            progress_callback(f"Échec écriture WCS: {e_wcs_write}", None, "WARN")
-        return False
-
-
-
 # DANS zemosaic_astrometry.py
 
 def solve_with_astap(image_fits_path: str,
@@ -243,36 +227,7 @@ def solve_with_astap(image_fits_path: str,
                      sensitivity: int | None = None,            # Depuis GUI (pour -sens)
                      timeout_sec: int = 120,
                      update_original_header_in_place: bool = False,
-                     use_astap_update: bool = False,
                      progress_callback: callable = None):
-    """Run ASTAP to solve astrometry for a FITS image.
-
-    Parameters
-    ----------
-    image_fits_path : str
-        Path to the FITS file to solve.
-    original_fits_header : fits.Header
-        Header object read from the FITS before solving.
-    astap_exe_path : str
-        Path to the ASTAP executable.
-    astap_data_dir : str
-        Path to ASTAP star database directory.
-    search_radius_deg : float | None, optional
-        Search radius in degrees for ASTAP (-r).
-    downsample_factor : int | None, optional
-        Downsampling factor for ASTAP (-z).
-    sensitivity : int | None, optional
-        Sensitivity setting for ASTAP (-sens).
-    timeout_sec : int, optional
-        Timeout in seconds for the ASTAP process.
-    update_original_header_in_place : bool, optional
-        If ``True``, the solved WCS is written back to ``image_fits_path``.
-    use_astap_update : bool, optional
-        If ``True``, pass ``-update`` to ASTAP so the program itself writes the
-        solution to the FITS file, reducing temporary memory usage.
-    progress_callback : callable, optional
-        Callback for progress logging.
-    """
 
     if not ASTROPY_AVAILABLE_ASTROMETRY:
         if progress_callback: progress_callback("ASTAP Solve ERREUR: Astropy non disponible, ASTAP solve annulé.", None, "ERROR")
@@ -299,9 +254,7 @@ def solve_with_astap(image_fits_path: str,
     base_image_name_no_ext = os.path.splitext(os.path.basename(image_fits_path))[0]
     expected_wcs_file_path = os.path.join(current_image_dir, base_image_name_no_ext + ".wcs")
     expected_ini_file_path = os.path.join(current_image_dir, base_image_name_no_ext + ".ini")
-    astap_log_file_path = os.path.join(
-        current_image_dir, f"{base_image_name_no_ext}_astap.log"
-    )
+    astap_log_file_path = os.path.join(current_image_dir, base_image_name_no_ext + ".log")
     files_to_cleanup_by_astap = [expected_wcs_file_path, expected_ini_file_path]
 
     for f_to_clean in files_to_cleanup_by_astap:
@@ -314,12 +267,9 @@ def solve_with_astap(image_fits_path: str,
         except Exception as e_del_log_pre:
             if progress_callback: progress_callback(f"  ASTAP Solve AVERT: Échec nettoyage pré-ASTAP log '{os.path.basename(astap_log_file_path)}': {e_del_log_pre}", None, "WARN")
 
-    # -log permet de spécifier le chemin du fichier log généré par ASTAP
-    cmd_list_astap = [astap_exe_path, "-f", image_fits_path, "-log", astap_log_file_path]
+    cmd_list_astap = [astap_exe_path, "-f", image_fits_path, "-log"]
     if astap_data_dir and os.path.isdir(astap_data_dir):
          cmd_list_astap.extend(["-d", astap_data_dir])
-    if use_astap_update or update_original_header_in_place:
-         cmd_list_astap.append("-update")
 
     # --- MODIFICATION: Option -pxscale / -fov 0 temporairement enlevée pour test ---
     # calculated_px_scale = _calculate_pixel_scale_from_header(original_fits_header, progress_callback)
@@ -366,13 +316,18 @@ def solve_with_astap(image_fits_path: str,
 
     try:
 
-        astap_process_result = subprocess.run(
-            cmd_list_astap,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=timeout_sec,
-            cwd=current_image_dir
-        )
+        astap_process_result = None
+        try:
+            if not multiprocessing.current_process().daemon:
+                with ProcessPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(_run_astap_subprocess, cmd_list_astap, current_image_dir, timeout_sec)
+                    astap_process_result = future.result()
+            else:
+                raise RuntimeError("daemon process")
+        except (AssertionError, RuntimeError) as e_pool:
+            if progress_callback:
+                progress_callback(f"  ASTAP Solve: ProcessPoolExecutor indisponible ({e_pool}). Lancement direct.", None, "DEBUG_DETAIL")
+            astap_process_result = _run_astap_subprocess(cmd_list_astap, current_image_dir, timeout_sec)
 
         logger.debug(f"ASTAP return code: {astap_process_result.returncode}")
 
@@ -382,129 +337,42 @@ def solve_with_astap(image_fits_path: str,
         _log_memory_usage(progress_callback, "Après GC post-ASTAP")
 
         if rc_astap == 0:
-            header_shape = (
-                int(original_fits_header.get("NAXIS2", 0)),
-                int(original_fits_header.get("NAXIS1", 0)),
-            )
-
-            if use_astap_update:
-                try:
-                    hdr_updated = fits.getheader(image_fits_path, ext=0)
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore", FITSFixedWarning)
-                        wcs_tmp = AstropyWCS(hdr_updated, naxis=2, relax=True)
-                    if wcs_tmp and wcs_tmp.is_celestial:
-                        wcs_solved_obj = wcs_tmp
-                        if progress_callback:
-                            progress_callback("  ASTAP Solve: WCS chargé du FITS mis à jour (-update).", None, "INFO_DETAIL")
-                except Exception as e_load_updated:
-                    if progress_callback:
-                        progress_callback(f"  ASTAP Solve AVERT: échec lecture WCS du FITS mis à jour: {e_load_updated}", None, "WARN")
-
-            if wcs_solved_obj is None and os.path.exists(expected_wcs_file_path):
-                wcs_solved_obj = _parse_wcs_file_content_za(
-                    expected_wcs_file_path,
-                    header_shape,
-                    progress_callback=progress_callback,
-                )
-                if wcs_solved_obj and progress_callback:
-                    progress_callback(
-                        "  ASTAP Solve: WCS extrait du fichier .wcs.", None, "INFO_DETAIL"
-                    )
-
-            if wcs_solved_obj is None:
-                # Fallback to parsing the ASTAP log if .wcs was not usable
-                log_path = astap_log_file_path
-                max_wait = 5.0
-                wait_interval = 0.1
-                waited = 0.0
-                while waited < max_wait:
-                    if os.path.exists(log_path):
-                        try:
-                            if os.path.getsize(log_path) > 0:
-                                break
-                        except OSError:
-                            pass
-                    time.sleep(wait_interval)
-                    waited += wait_interval
-
-                if os.path.exists(log_path):
+            if os.path.exists(expected_wcs_file_path) and os.path.getsize(expected_wcs_file_path) > 0:
+                if progress_callback: progress_callback(f"  ASTAP Solve: Résolution OK (code 0). Fichier WCS '{os.path.basename(expected_wcs_file_path)}' trouvé.", None, "INFO_DETAIL")
+                img_height = original_fits_header.get('NAXIS2', 0)
+                img_width = original_fits_header.get('NAXIS1', 0)
+                if img_height == 0 or img_width == 0:
                     try:
-                        with open(log_path, "r") as f:
-                            text = f.read()
-
-                        crval1 = float(re.search(r"CRVAL1\s*=\s*([\d\.\-E]+)", text).group(1))
-                        crval2 = float(re.search(r"CRVAL2\s*=\s*([\d\.\-E]+)", text).group(1))
-                        crpix1 = float(re.search(r"CRPIX1\s*=\s*([\d\.\-E]+)", text).group(1))
-                        crpix2 = float(re.search(r"CRPIX2\s*=\s*([\d\.\-E]+)", text).group(1))
-                        cd11 = float(re.search(r"CD1_1\s*=\s*([\d\.\-E]+)", text).group(1))
-                        cd12 = float(re.search(r"CD1_2\s*=\s*([\d\.\-E]+)", text).group(1))
-                        cd21 = float(re.search(r"CD2_1\s*=\s*([\d\.\-E]+)", text).group(1))
-                        cd22 = float(re.search(r"CD2_2\s*=\s*([\d\.\-E]+)", text).group(1))
-
-                        wcs_header = fits.Header()
-                        for k, v in [
-                            ("CRVAL1", crval1),
-                            ("CRVAL2", crval2),
-                            ("CRPIX1", crpix1),
-                            ("CRPIX2", crpix2),
-                            ("CD1_1", cd11),
-                            ("CD1_2", cd12),
-                            ("CD2_1", cd21),
-                            ("CD2_2", cd22),
-                        ]:
-                            wcs_header[k] = v
-
-                        if ASTROPY_AVAILABLE_ASTROMETRY:
-                            with warnings.catch_warnings():
-                                warnings.simplefilter("ignore", FITSFixedWarning)
-                                wcs_solved_obj = AstropyWCS(wcs_header, naxis=2, relax=True)
-                        else:
-                            wcs_solved_obj = None
-
-                        if wcs_solved_obj and progress_callback:
-                            progress_callback(
-                                "  ASTAP Solve: WCS extrait du log ASTAP.",
-                                None,
-                                "INFO_DETAIL",
-                            )
-                    except Exception as e_parse:
-                        if progress_callback:
-                            progress_callback(
-                                f"  ASTAP Solve ERREUR: Échec parsing log ASTAP: {e_parse}",
-                                None,
-                                "ERROR",
-                            )
-                        logger.error(f"Erreur parsing ASTAP log: {e_parse}", exc_info=True)
+                        with fits.open(image_fits_path) as hdul_shape:
+                            shape_from_file = hdul_shape[0].shape
+                            if len(shape_from_file) >=2 :
+                                img_height = shape_from_file[-2]
+                                img_width = shape_from_file[-1]
+                    except Exception as e_shape_read:
+                         if progress_callback: progress_callback(f"  ASTAP Solve AVERT: Impossible de lire NAXIS1/2 du header ou du fichier FITS: {e_shape_read}. WCS parsing pourrait échouer.", None, "WARN")
+                if img_height > 0 and img_width > 0:
+                    wcs_solved_obj = _parse_wcs_file_content_za(expected_wcs_file_path, (img_height, img_width), progress_callback)
                 else:
-                    if progress_callback:
-                        progress_callback(
-                            "  ASTAP Solve ERREUR: log ASTAP absent.",
-                            None,
-                            "ERROR",
-                        )
-
-            if wcs_solved_obj:
-                astap_success = True
-                if not use_astap_update:
-                    _update_fits_header_with_wcs_za(
-                        original_fits_header,
-                        wcs_solved_obj,
-                        solver_name="ASTAP_ZeMosaic",
-                        progress_callback=progress_callback,
-                    )
-                    if update_original_header_in_place:
-                        _write_wcs_to_fits(image_fits_path, wcs_solved_obj, progress_callback)
+                    if progress_callback: progress_callback(f"  ASTAP Solve ERREUR: Dimensions image (NAXIS1/2) non trouvées pour '{img_basename_log}'. WCS non parsé.", None, "ERROR")
+                if wcs_solved_obj and wcs_solved_obj.is_celestial:
+                    astap_success = True
+                    if progress_callback: progress_callback(f"  ASTAP Solve: Objet WCS créé et céleste pour '{img_basename_log}'.", None, "INFO")
+                    if update_original_header_in_place and original_fits_header is not None:
+                        if _update_fits_header_with_wcs_za(original_fits_header, wcs_solved_obj, progress_callback=progress_callback):
+                             if progress_callback: progress_callback(f"  ASTAP Solve: Header FITS original mis à jour avec WCS pour '{img_basename_log}'.", None, "DEBUG_DETAIL")
+                        else:
+                             if progress_callback: progress_callback(f"  ASTAP Solve AVERT: Échec MàJ header FITS original avec WCS pour '{img_basename_log}'.", None, "WARN")
+                else:
+                    if progress_callback: progress_callback(f"  ASTAP Solve ERREUR: WCS parsé non valide ou non céleste pour '{img_basename_log}'.", None, "ERROR")
+                    wcs_solved_obj = None
+            else:
+                if progress_callback: progress_callback(f"  ASTAP Solve ERREUR: Code 0 mais fichier .wcs manquant/vide ('{os.path.basename(expected_wcs_file_path)}').", None, "ERROR")
         else:
             error_msg = f"ASTAP Solve Échec (code {rc_astap}) pour '{img_basename_log}'."
-            if rc_astap == 1:
-                error_msg += " (No solution found)."
-            elif rc_astap == 2:
-                error_msg += " (ASTAP FITS read error - vérifiez format/corruption)."
-            elif rc_astap == 10:
-                error_msg += " (ASTAP database not found - vérifiez -d)."
-            if progress_callback:
-                progress_callback(f"  {error_msg}", None, "WARN")
+            if rc_astap == 1: error_msg += " (No solution found)."
+            elif rc_astap == 2: error_msg += " (ASTAP FITS read error - vérifiez format/corruption)."
+            elif rc_astap == 10: error_msg += " (ASTAP database not found - vérifiez -d)."
+            if progress_callback: progress_callback(f"  {error_msg}", None, "WARN")
             logger.warning(error_msg)
 
     except subprocess.TimeoutExpired:
@@ -547,4 +415,327 @@ def solve_with_astap(image_fits_path: str,
     return wcs_solved_obj
 
 
+def solve_with_ansvr(
+    image_fits_path: str,
+    original_fits_header: fits.Header,
+    ansvr_config_path: str,
+    timeout_sec: int = 120,
+    update_original_header_in_place: bool = False,
+    progress_callback: callable = None,
+):
+    """Solve WCS using a local ansvr installation."""
 
+    _pcb = (
+        lambda msg, lvl="INFO": progress_callback(msg, None, lvl)
+        if progress_callback
+        else None
+    )
+
+    if not (ASTROPY_AVAILABLE_ASTROMETRY and AstropyWCS):
+        if _pcb:
+            _pcb("Ansvr solve unavailable (missing deps).", "ERROR")
+        return None
+
+    if not (image_fits_path and os.path.isfile(image_fits_path) and ansvr_config_path):
+        if _pcb:
+            _pcb("Ansvr solve input invalid or path missing.", "ERROR")
+        return None
+
+    tmp_dir = tempfile.mkdtemp(prefix="ansvr_")
+    output_fits = os.path.join(tmp_dir, "solution.new")
+
+    cmd = [
+        "solve-field",
+        "--no-plots",
+        "--overwrite",
+        "--config",
+        ansvr_config_path,
+        "--dir",
+        tmp_dir,
+        "--new-fits",
+        output_fits,
+        image_fits_path,
+    ]
+
+    if original_fits_header:
+        ra = original_fits_header.get("RA", original_fits_header.get("CRVAL1"))
+        dec = original_fits_header.get("DEC", original_fits_header.get("CRVAL2"))
+        if isinstance(ra, (int, float)) and isinstance(dec, (int, float)):
+            cmd.extend(["--ra", str(ra), "--dec", str(dec)])
+
+    if _pcb:
+        _pcb(f"Ansvr: cmd={' '.join(cmd)}", "DEBUG")
+
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout_sec,
+            check=False,
+        )
+    except Exception as e_run:
+        if _pcb:
+            _pcb(f"Ansvr: execution error {e_run}", "ERROR")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return None
+
+    if result.returncode != 0 or not os.path.exists(output_fits):
+        if _pcb:
+            _pcb("Ansvr: solve-field failed", "WARN")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return None
+
+    try:
+        with fits.open(output_fits, memmap=False) as hdul:
+            wcs_header = hdul[0].header
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FITSFixedWarning)
+            wcs_obj = AstropyWCS(wcs_header, naxis=2)
+    except Exception as e_parse:
+        if _pcb:
+            _pcb(f"Ansvr: parse error {e_parse}", "ERROR")
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return None
+
+    if wcs_obj and wcs_obj.is_celestial and update_original_header_in_place and original_fits_header is not None:
+        _update_fits_header_with_wcs_za(
+            original_fits_header,
+            wcs_obj,
+            solver_name="Ansvr",
+            progress_callback=progress_callback,
+        )
+
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    return wcs_obj
+
+
+
+
+def solve_with_astrometry_net(
+    image_fits_path: str,
+    original_fits_header: fits.Header,
+    api_key: str,
+    timeout_sec: int = 60,
+    scale_est_arcsec_per_pix: float | None = None,
+    scale_tolerance_percent: float = 20.0,
+    downsample_factor: int | None = None,
+    update_original_header_in_place: bool = False,
+    progress_callback: callable = None,
+):
+    """Solve WCS using the astrometry.net web service."""
+
+    _pcb = (
+        lambda msg, lvl="INFO": progress_callback(msg, None, lvl)
+        if progress_callback
+        else None
+    )
+
+    if not (
+        ASTROPY_AVAILABLE_ASTROMETRY
+        and ASTROQUERY_AVAILABLE_ASTROMETRY
+        and AstrometryNet
+        and AstropyWCS
+    ):
+        if _pcb:
+            missing = []
+            if not (ASTROPY_AVAILABLE_ASTROMETRY and AstropyWCS):
+                missing.append("astropy")
+            if not (ASTROQUERY_AVAILABLE_ASTROMETRY and AstrometryNet):
+                missing.append("astroquery")
+            joined = ", ".join(missing) if missing else "unknown"
+            _pcb(
+                f"Astrometry.net solve unavailable (missing deps: {joined}).",
+                "ERROR",
+            )
+        return None
+
+    if not api_key:
+        api_key = os.environ.get("ASTROMETRY_API_KEY", "")
+    if not os.path.isfile(image_fits_path) or not api_key:
+        if _pcb:
+            path_ok = os.path.isfile(image_fits_path)
+            key_len = len(api_key) if isinstance(api_key, str) else 0
+
+            preview = (
+                f"{api_key[:4]}..." if isinstance(api_key, str) and key_len > 4 else api_key
+            )
+            _pcb(
+                "Astrometry.net solve input invalid or API key missing. "
+                f"Path ok={path_ok} Key len={key_len} Preview='{preview}'",
+
+                "ERROR",
+            )
+        return None
+
+    img_basename_log = os.path.basename(image_fits_path)
+    if _pcb:
+        _pcb(f"WebANET: Début solving pour '{img_basename_log}'", "INFO_DETAIL")
+
+    ast = AstrometryNet()
+    ast.api_key = api_key
+    original_timeout = None
+    if timeout_sec and timeout_sec > 0:
+        try:
+            original_timeout = getattr(ast, "TIMEOUT", None)
+            ast.TIMEOUT = timeout_sec
+            if _pcb:
+                _pcb(f"WebANET: Timeout configuré à {timeout_sec}s", "DEBUG")
+        except Exception as e:
+            if _pcb:
+                _pcb(f"WebANET: Erreur configuration timeout: {e}", "WARN")
+
+    temp_path = None
+    wcs_header = None
+    try:
+        with fits.open(image_fits_path, memmap=False) as hdul:
+            data = hdul[0].data
+
+        if data is None:
+            if _pcb:
+                _pcb("WebANET: Données image manquantes", "ERROR")
+            return None
+
+        if not np.all(np.isfinite(data)):
+            data = np.nan_to_num(data)
+
+        if data.ndim == 3:
+            # Convert color images to a single channel luminance image expected by
+            # astrometry.net.  Some FITS files store the RGB channels in the first
+            # axis (3, H, W) while others use the last axis (H, W, 3).  Handle both
+            # cases gracefully.
+            if data.shape[0] == 3:
+                data = np.moveaxis(data, 0, -1)
+
+            if data.shape[-1] == 3:
+                data = np.sum(
+                    data
+                    * np.array([0.299, 0.587, 0.114], dtype=np.float32).reshape(
+                        1, 1, 3
+                    ),
+                    axis=2,
+                )
+            else:
+                # Fallback: take the first plane if the dimensionality is
+                # unexpected.  This avoids passing a 3D array to photutils which
+                # would raise an error.
+                data = data[..., 0]
+
+        if downsample_factor and isinstance(downsample_factor, int) and downsample_factor > 1:
+            data = data[::downsample_factor, ::downsample_factor]
+
+        min_v, max_v = np.min(data), np.max(data)
+        norm_float = (data - min_v) / (max_v - min_v) if max_v > min_v else np.zeros_like(data)
+        data_uint16 = (np.clip(norm_float, 0.0, 1.0) * 65535.0).astype(np.uint16)
+        data_int16 = (data_uint16.astype(np.int32) - 32768).astype(np.int16)
+
+        header_tmp = fits.Header()
+        header_tmp["SIMPLE"] = True
+        header_tmp["BITPIX"] = 16
+        header_tmp["BSCALE"] = 1
+        header_tmp["BZERO"] = 32768
+        header_tmp["NAXIS"] = 2
+        header_tmp["NAXIS1"] = data_int16.shape[1]
+        header_tmp["NAXIS2"] = data_int16.shape[0]
+        for key in ["OBJECT", "DATE-OBS", "EXPTIME", "FILTER", "INSTRUME", "TELESCOP"]:
+            if original_fits_header and key in original_fits_header:
+                header_tmp[key] = original_fits_header[key]
+
+        with tempfile.NamedTemporaryFile(suffix=".fits", delete=False, mode="wb") as tf:
+            temp_path = tf.name
+        fits.writeto(
+            temp_path,
+            data_int16,
+            header=header_tmp,
+            overwrite=True,
+            output_verify="silentfix",
+        )
+
+        if header_tmp.get("BITPIX") == 16:
+            with fits.open(temp_path, mode="update", memmap=False) as hdul_fix:
+                hd0 = hdul_fix[0]
+                hd0.header["BSCALE"] = 1
+                hd0.header["BZERO"] = 32768
+                hdul_fix.flush()
+
+        solve_args = {
+            "allow_commercial_use": "n",
+            "allow_modifications": "n",
+            "publicly_visible": "n",
+        }
+
+        if scale_est_arcsec_per_pix and scale_est_arcsec_per_pix > 0:
+            try:
+                est_val = float(scale_est_arcsec_per_pix)
+                tol_val = float(scale_tolerance_percent)
+                solve_args["scale_units"] = "arcsecperpix"
+                solve_args["scale_lower"] = est_val * (1.0 - tol_val / 100.0)
+                solve_args["scale_upper"] = est_val * (1.0 + tol_val / 100.0)
+                if _pcb:
+                    _pcb(
+                        f"WebANET: Échelle contraint [{solve_args['scale_lower']:.2f}-{solve_args['scale_upper']:.2f}] asec/pix",
+                        "DEBUG",
+                    )
+            except Exception as e:
+                if _pcb:
+                    _pcb(f"WebANET: Erreur config échelle: {e}", "WARN")
+
+        if _pcb:
+            _pcb("WebANET: Soumission du job...", "INFO")
+
+            _pcb("WebANET: Contacting nova.astrometry.net", "DEBUG")
+        wcs_header = ast.solve_from_image(temp_path, **solve_args)
+
+        if _pcb:
+            if wcs_header:
+                _pcb("WebANET: Solving RÉUSSI", "INFO")
+            else:
+                _pcb("WebANET: Solving ÉCHOUÉ", "WARN")
+
+    except Exception as e:
+        if _pcb:
+            msg = f"WebANET: ERREUR solving: {e}"
+            if "timeout" in str(e).lower():
+                _pcb(msg, "ERROR")
+            else:
+                _pcb(msg, "ERROR")
+        logger.error("Astrometry.net solve exception", exc_info=True)
+        wcs_header = None
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except Exception:
+                pass
+        if original_timeout is not None:
+            try:
+                ast.TIMEOUT = original_timeout
+            except Exception:
+                pass
+
+    if not isinstance(wcs_header, fits.Header):
+        return None
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FITSFixedWarning)
+            wcs_obj = AstropyWCS(wcs_header)
+    except Exception as e:
+        if _pcb:
+            _pcb(f"WebANET: ERREUR conversion WCS: {e}", "ERROR")
+        return None
+
+    if (
+        wcs_obj
+        and wcs_obj.is_celestial
+        and update_original_header_in_place
+        and original_fits_header is not None
+    ):
+        _update_fits_header_with_wcs_za(
+            original_fits_header,
+            wcs_obj,
+            solver_name="AstrometryNet",
+            progress_callback=progress_callback,
+        )
+
+    return wcs_obj
