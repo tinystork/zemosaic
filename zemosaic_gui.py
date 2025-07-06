@@ -11,6 +11,18 @@ import subprocess
 import sys
 
 try:
+    import wmi
+except ImportError:  # pragma: no cover - wmi may be unavailable on non Windows
+    wmi = None
+
+import importlib.util
+
+CUPY_AVAILABLE = importlib.util.find_spec("cupy") is not None
+cupy = None
+getDeviceProperties = None
+getDeviceCount = None
+
+try:
     from PIL import Image, ImageTk # Importe depuis Pillow
     PILLOW_AVAILABLE_FOR_ICON = True
 except ImportError:
@@ -36,13 +48,20 @@ except ImportError as e_config:
 
 # --- Worker Import ---
 try:
-    from zemosaic_worker import run_hierarchical_mosaic, run_hierarchical_mosaic_process
+    # Import worker from the same package so relative imports inside it work
+    from .zemosaic_worker import (
+        run_hierarchical_mosaic,
+        run_hierarchical_mosaic_process,
+    )
     ZEMOSAIC_WORKER_AVAILABLE = True
 except ImportError as e_worker:
     ZEMOSAIC_WORKER_AVAILABLE = False
     run_hierarchical_mosaic = None
     run_hierarchical_mosaic_process = None
     print(f"ERREUR (zemosaic_gui): 'run_hierarchical_mosaic' non trouvé: {e_worker}")
+
+from dataclasses import asdict
+from .solver_settings import SolverSettings
 
 
 
@@ -97,6 +116,61 @@ class ZeMosaicGUI:
                 "num_processing_workers": 0 # 0 pour auto, anciennement -1
             }
 
+        # --- GPU Detection helper ---
+        def _detect_gpus():
+            """Return a list of detected GPUs as ``(display_name, index)`` tuples.
+
+            Detection tries multiple methods so it works on Windows, Linux and
+            macOS without requiring the optional ``wmi`` module.
+            """
+
+            controllers = []
+            if wmi:
+                try:
+                    obj = wmi.WMI()
+                    controllers = [c.Name for c in obj.Win32_VideoController()]
+                except Exception:
+                    controllers = []
+
+            if not controllers:
+                try:
+                    out = subprocess.check_output(
+                        ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                    )
+                    controllers = [l.strip() for l in out.splitlines() if l.strip()]
+                except Exception:
+                    controllers = []
+
+            nv_cuda = []
+            if CUPY_AVAILABLE:
+                try:
+                    import cupy
+                    from cupy.cuda.runtime import getDeviceCount, getDeviceProperties
+                    for i in range(getDeviceCount()):
+                        name = getDeviceProperties(i)["name"]
+                        if isinstance(name, bytes):
+                            name = name.decode()
+                        nv_cuda.append(name)
+                except Exception:
+                    nv_cuda = []
+
+            def _simplify(n: str) -> str:
+                return n.lower().replace("laptop gpu", "").strip()
+
+            simple_cuda = [_simplify(n) for n in nv_cuda]
+            gpus = []
+            for disp in controllers:
+                simp = _simplify(disp)
+                idx = simple_cuda.index(simp) if simp in simple_cuda else None
+                gpus.append((disp, idx))
+            if not gpus and nv_cuda:
+                gpus = [(name, idx) for idx, name in enumerate(nv_cuda)]
+
+            gpus.insert(0, ("CPU (no GPU)", None))
+            return gpus
+
         default_lang_from_config = self.config.get("language", 'en')
         if ZEMOSAIC_LOCALIZATION_AVAILABLE and ZeMosaicLocalization:
             self.localizer = ZeMosaicLocalization(language_code=default_lang_from_config)
@@ -129,6 +203,18 @@ class ZeMosaicGUI:
         self.astap_sensitivity_var = tk.IntVar(value=self.config.get("astap_default_sensitivity", 100))
         self.cluster_threshold_var = tk.DoubleVar(value=self.config.get("cluster_panel_threshold", 0.5))
         self.save_final_uint16_var = tk.BooleanVar(value=self.config.get("save_final_as_uint16", False))
+
+        # --- Solver Settings ---
+        try:
+            self.solver_settings = SolverSettings.load_default()
+        except Exception:
+            self.solver_settings = SolverSettings()
+        self.solver_choice_var = tk.StringVar(value=self.solver_settings.solver_choice)
+        self.solver_choice_var.trace_add("write", self._update_solver_frames)
+        self.astrometry_api_key_var = tk.StringVar(value=self.solver_settings.api_key)
+        self.astrometry_timeout_var = tk.IntVar(value=self.solver_settings.timeout)
+        self.astrometry_downsample_var = tk.IntVar(value=self.solver_settings.downsample)
+        self.force_lum_var = tk.BooleanVar(value=self.solver_settings.force_lum)
         
         self.is_processing = False
         self.worker_process = None
@@ -138,6 +224,7 @@ class ZeMosaicGUI:
         self.elapsed_time_var = tk.StringVar(value=self._tr("initial_elapsed_time", "00:00:00"))
         self._chrono_start_time = None
         self._chrono_after_id = None
+        self._stage_times = {}
         
         self.current_language_var = tk.StringVar(value=self.localizer.language_code)
         self.current_language_var.trace_add("write", self._on_language_change)
@@ -185,11 +272,17 @@ class ZeMosaicGUI:
         self.cleanup_memmap_var = tk.BooleanVar(value=self.config.get("coadd_cleanup_memmap", True))
         self.auto_limit_frames_var = tk.BooleanVar(value=self.config.get("auto_limit_frames_per_master_tile", True))
         self.max_raw_per_tile_var = tk.IntVar(value=self.config.get("max_raw_per_master_tile", 0))
+        self.use_gpu_phase5_var = tk.BooleanVar(value=self.config.get("use_gpu_phase5", False))
+        self._gpus = _detect_gpus()
+        self.gpu_selector_var = tk.StringVar(
+            value=self.config.get("gpu_selector", self._gpus[0][0] if self._gpus else "")
+        )
         # ---  ---
 
         self.translatable_widgets = {}
-        
-        self._build_ui() 
+
+        self._build_ui()
+        self._update_solver_frames()
         self.root.after_idle(self._update_ui_language) # Déplacé après _build_ui pour que les widgets existent
         #self.root.after_idle(self._update_assembly_dependent_options) # En prévision d'un forçage de combinaisons 
         self.root.after_idle(self._update_rejection_params_state) # Déjà présent, garder
@@ -301,6 +394,29 @@ class ZeMosaicGUI:
         # else:
             # print(f"WARN _combo_to_key: Clé non trouvée pour l'affichage '{displayed_text}' et le préfixe '{tr_prefix}'. tk_var non modifié.")
 
+    def _update_solver_frames(self, *args):
+        """Show or hide solver-specific frames based on the selected solver."""
+        choice = self.solver_choice_var.get()
+
+        if choice == "ASTAP":
+            # These frames use the ``pack`` geometry manager, so we must
+            # repack them when showing and use ``pack_forget`` to hide them.
+            self.astap_cfg_frame.pack(fill=tk.X, pady=(0, 10))
+            self.astap_params_frame.pack(fill=tk.X, pady=(0, 10))
+            self.astrometry_frame.grid_remove()
+        elif choice == "ASTROMETRY":
+            self.astap_cfg_frame.pack_forget()
+            self.astap_params_frame.pack_forget()
+            self.astrometry_frame.grid()
+        elif choice == "ANSVR":
+            self.astap_cfg_frame.pack_forget()
+            self.astap_params_frame.pack_forget()
+            self.astrometry_frame.grid_remove()
+        else:
+            self.astap_cfg_frame.pack_forget()
+            self.astap_params_frame.pack_forget()
+            self.astrometry_frame.grid_remove()
+
 # Dans la classe ZeMosaicGUI de zemosaic_gui.py
 
     def _build_ui(self):
@@ -390,6 +506,7 @@ class ZeMosaicGUI:
         astap_cfg_frame = ttk.LabelFrame(self.scrollable_content_frame, text="", padding="10")
         # ... (contenu de astap_cfg_frame) ...
         astap_cfg_frame.pack(fill=tk.X, pady=(0,10)); astap_cfg_frame.columnconfigure(1, weight=1)
+        self.astap_cfg_frame = astap_cfg_frame
         self.translatable_widgets["astap_config_frame_title"] = astap_cfg_frame
         ttk.Label(astap_cfg_frame, text="").grid(row=0, column=0, padx=5, pady=5, sticky="w"); self.translatable_widgets["astap_exe_label"] = astap_cfg_frame.grid_slaves(row=0,column=0)[0]
         ttk.Entry(astap_cfg_frame, textvariable=self.astap_exe_path_var, width=60).grid(row=0, column=1, padx=5, pady=5, sticky="ew")
@@ -402,6 +519,7 @@ class ZeMosaicGUI:
         params_frame = ttk.LabelFrame(self.scrollable_content_frame, text="", padding="10")
         # ... (contenu de params_frame) ...
         params_frame.pack(fill=tk.X, pady=(0,10))
+        self.astap_params_frame = params_frame
         self.translatable_widgets["mosaic_astap_params_frame_title"] = params_frame
         param_row_idx = 0 
         ttk.Label(params_frame, text="").grid(row=param_row_idx, column=0, padx=5, pady=3, sticky="w"); self.translatable_widgets["astap_search_radius_label"] = params_frame.grid_slaves(row=param_row_idx,column=0)[0]
@@ -414,7 +532,43 @@ class ZeMosaicGUI:
         ttk.Label(params_frame, text="").grid(row=param_row_idx, column=2, padx=5, pady=3, sticky="w"); self.translatable_widgets["astap_sensitivity_note"] = params_frame.grid_slaves(row=param_row_idx,column=2)[0]; param_row_idx+=1
         ttk.Label(params_frame, text="").grid(row=param_row_idx, column=0, padx=5, pady=3, sticky="w"); self.translatable_widgets["panel_clustering_threshold_label"] = params_frame.grid_slaves(row=param_row_idx,column=0)[0]
         ttk.Spinbox(params_frame, from_=0.01, to=5.0, increment=0.01, textvariable=self.cluster_threshold_var, width=8, format="%.2f").grid(row=param_row_idx, column=1, padx=5, pady=3, sticky="w")
-        
+        param_row_idx += 1
+        ttk.Label(params_frame, text=self._tr("force_lum_label", "Convert to Luminance (mono):")).grid(row=param_row_idx, column=0, padx=5, pady=3, sticky="w"); self.translatable_widgets["force_lum_label"] = params_frame.grid_slaves(row=param_row_idx,column=0)[0]
+        ttk.Checkbutton(params_frame, variable=self.force_lum_var).grid(row=param_row_idx, column=1, padx=5, pady=3, sticky="w")
+
+        # --- Solver Selection Frame ---
+        solver_frame = ttk.LabelFrame(self.scrollable_content_frame, text=self._tr("solver_frame_title", "Plate Solver"), padding="10")
+        solver_frame.pack(fill=tk.X, pady=(0, 10))
+        ttk.Label(solver_frame, text=self._tr("solver_choice_label", "Solver:"))\
+            .grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.solver_combo = ttk.Combobox(
+            solver_frame,
+            textvariable=self.solver_choice_var,
+            values=["ASTAP", "ASTROMETRY", "ANSVR", "NONE"],
+            state="readonly",
+            width=15,
+        )
+        self.solver_combo.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+        self.solver_combo.bind("<<ComboboxSelected>>", lambda e: self._update_solver_frames())
+
+        self.astrometry_frame = ttk.LabelFrame(solver_frame, text=self._tr("astrometry_group_title", "Astrometry.net"), padding="5")
+        self.astrometry_frame.grid(row=1, column=0, columnspan=2, padx=5, pady=(5, 0), sticky="ew")
+        self.astrometry_frame.columnconfigure(1, weight=1)
+        ttk.Label(self.astrometry_frame, text=self._tr("api_key_label", "API Key:"))\
+            .grid(row=0, column=0, padx=5, pady=3, sticky="w")
+        ttk.Entry(self.astrometry_frame, textvariable=self.astrometry_api_key_var)\
+            .grid(row=0, column=1, padx=5, pady=3, sticky="ew")
+        ttk.Label(self.astrometry_frame, text=self._tr("timeout_label", "Timeout (s):"))\
+            .grid(row=1, column=0, padx=5, pady=3, sticky="w")
+        ttk.Spinbox(self.astrometry_frame, from_=10, to=300, textvariable=self.astrometry_timeout_var, width=8)\
+            .grid(row=1, column=1, padx=5, pady=3, sticky="w")
+        ttk.Label(self.astrometry_frame, text=self._tr("downsample_label", "Blind-solve Downsample:"))\
+            .grid(row=2, column=0, padx=5, pady=3, sticky="w")
+        ttk.Spinbox(self.astrometry_frame, from_=1, to=8, textvariable=self.astrometry_downsample_var, width=8)\
+            .grid(row=2, column=1, padx=5, pady=3, sticky="w")
+
+        self._update_solver_frames()
+
         # --- Stacking Options Frame ---
         stacking_options_frame = ttk.LabelFrame(self.scrollable_content_frame, text="", padding="10") 
         # ... (contenu de stacking_options_frame avec Normalisation, Pondération, Rejet, Combinaison, Pondération Radiale, Plancher Poids Radial) ...
@@ -599,6 +753,45 @@ class ZeMosaicGUI:
         self.final_assembly_method_combo = ttk.Combobox(final_assembly_options_frame, values=[], state="readonly", width=40)
         self.final_assembly_method_combo.grid(row=asm_opt_row, column=1, padx=5, pady=5, sticky="ew")
         self.final_assembly_method_combo.bind("<<ComboboxSelected>>", lambda e, c=self.final_assembly_method_combo, v=self.final_assembly_method_var, k_list=self.assembly_method_keys, p="assembly_method": self._combo_to_key(e, c, v, k_list, p)); asm_opt_row += 1
+
+        gpu_chk = ttk.Checkbutton(
+            final_assembly_options_frame,
+            text=self._tr("use_gpu_phase5", "Use NVIDIA GPU for Phase 5"),
+            variable=self.use_gpu_phase5_var,
+        )
+        gpu_chk.grid(row=asm_opt_row, column=0, sticky="w", padx=5, pady=3, columnspan=2)
+        asm_opt_row += 1
+
+        ttk.Label(
+            final_assembly_options_frame,
+            text=self._tr("gpu_selector_label", "GPU selector:")
+        ).grid(row=asm_opt_row, column=0, sticky="e", padx=5, pady=2)
+        names = [d for d, _ in self._gpus]
+        self.gpu_selector_var.set(names[0] if names else "")
+        self.gpu_selector_cb = ttk.Combobox(
+            final_assembly_options_frame,
+            textvariable=self.gpu_selector_var,
+            values=names,
+            state="readonly",
+            width=30,
+        )
+        self.gpu_selector_cb.grid(row=asm_opt_row, column=1, sticky="w", padx=5, pady=2)
+        self._gpu_selector_label = final_assembly_options_frame.grid_slaves(row=asm_opt_row, column=0)[0]
+        self.translatable_widgets["gpu_selector_label"] = self._gpu_selector_label
+        self._gpu_selector_label.grid_remove()
+        self.gpu_selector_cb.grid_remove()
+        asm_opt_row += 1
+
+        def on_gpu_check(*_):
+            if self.use_gpu_phase5_var.get():
+                self._gpu_selector_label.grid()
+                self.gpu_selector_cb.grid()
+            else:
+                self._gpu_selector_label.grid_remove()
+                self.gpu_selector_cb.grid_remove()
+
+        self.use_gpu_phase5_var.trace_add("write", on_gpu_check)
+        on_gpu_check()
 
         self.memmap_frame = ttk.LabelFrame(self.scrollable_content_frame, text=self._tr("gui_memmap_title", "Options memmap (coadd)"))
         self.memmap_frame.pack(fill=tk.X, pady=(0,10))
@@ -1051,6 +1244,39 @@ class ZeMosaicGUI:
             except tk.TclError: pass
         self._chrono_after_id = None
         print("DEBUG GUI: Chronomètre arrêté.")
+
+    def on_worker_progress(self, stage: str, current: int, total: int):
+        """Handle progress updates for a specific processing stage."""
+        if stage not in self._stage_times:
+            self._stage_times[stage] = {
+                'start': time.monotonic(),
+                'last': time.monotonic(),
+                'steps': []
+            }
+        else:
+            now = time.monotonic()
+            last = self._stage_times[stage]['last']
+            self._stage_times[stage]['steps'].append(now - last)
+            self._stage_times[stage]['last'] = now
+
+        percent = (current / total * 100.0) if total else 0.0
+        try:
+            if hasattr(self, 'progress_bar_var'):
+                self.progress_bar_var.set(percent)
+        except tk.TclError:
+            pass
+
+        times = self._stage_times[stage]
+        if times['steps']:
+            avg = sum(times['steps']) / len(times['steps'])
+            remaining = max(0.0, (total - current) * avg)
+            h, rem = divmod(int(remaining), 3600)
+            m, s = divmod(rem, 60)
+            try:
+                if hasattr(self, 'eta_var') and self.eta_var:
+                    self.eta_var.set(f"{h:02d}:{m:02d}:{s:02d}")
+            except tk.TclError:
+                pass
         
 
 
@@ -1096,6 +1322,16 @@ class ZeMosaicGUI:
             
             final_assembly_method_val = self.final_assembly_method_var.get()
             num_base_workers_gui_val = self.num_workers_var.get()
+
+            self.solver_settings.solver_choice = self.solver_choice_var.get()
+            self.solver_settings.api_key = self.astrometry_api_key_var.get().strip()
+            self.solver_settings.timeout = self.astrometry_timeout_var.get()
+            self.solver_settings.downsample = self.astrometry_downsample_var.get()
+            self.solver_settings.force_lum = bool(self.force_lum_var.get())
+            try:
+                self.solver_settings.save_default()
+            except Exception:
+                pass
 
             # --- RÉCUPÉRATION DES NOUVELLES VALEURS POUR LE ROGNAGE ---
             apply_master_tile_crop_val = self.apply_master_tile_crop_var.get()
@@ -1144,6 +1380,9 @@ class ZeMosaicGUI:
                 return
         
         # 4. DÉMARRAGE du traitement
+        # Remise à zéro du compteur master-tiles
+        if hasattr(self, "master_tile_count_var"):
+            self.master_tile_count_var.set("")
         self.is_processing = True
         self.launch_button.config(state=tk.DISABLED)
         self.log_text.config(state=tk.NORMAL); self.log_text.delete(1.0, tk.END); self.log_text.config(state=tk.DISABLED)
@@ -1164,6 +1403,16 @@ class ZeMosaicGUI:
 
         self.config["winsor_worker_limit"] = self.winsor_workers_var.get()
         self.config["max_raw_per_master_tile"] = self.max_raw_per_tile_var.get()
+
+        self.config["use_gpu_phase5"] = self.use_gpu_phase5_var.get()
+        sel = self.gpu_selector_var.get()
+        gpu_id = None
+        for disp, idx in self._gpus:
+            if disp == sel:
+                self.config["gpu_selector"] = disp
+                self.config["gpu_id_phase5"] = idx
+                gpu_id = idx
+                break
         if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
             zemosaic_config.save_config(self.config)
 
@@ -1191,20 +1440,23 @@ class ZeMosaicGUI:
             self.use_memmap_var.get(),
             memmap_dir,
             self.cleanup_memmap_var.get(),
-            self.auto_limit_frames_var.get(),
             self.config.get("assembly_process_workers", 0),
-            self.config.get("auto_limit_memory_fraction", 0.1),
+            self.auto_limit_frames_var.get(),
             self.winsor_workers_var.get(),
-            self.max_raw_per_tile_var.get()
+            self.max_raw_per_tile_var.get(),
+            self.use_gpu_phase5_var.get(),
+            gpu_id,
+            asdict(self.solver_settings)
             # --- FIN NOUVEAUX ARGUMENTS ---
         )
         
         self.progress_queue = multiprocessing.Queue()
         self.worker_process = multiprocessing.Process(
             target=run_hierarchical_mosaic_process,
-            args=(self.progress_queue,) + worker_args,
+            args=(self.progress_queue,) + worker_args[:-1],
+            kwargs={"solver_settings_dict": worker_args[-1]},
             daemon=True,
-            name="ZeMosaicWorkerProcess"
+            name="ZeMosaicWorkerProcess",
         )
         self.worker_process.start()
 
@@ -1229,6 +1481,10 @@ class ZeMosaicGUI:
                     msg_key, prog, lvl, kwargs = self.progress_queue.get_nowait()
                 except Exception:
                     break
+                if msg_key == "STAGE_PROGRESS":
+                    stage, cur, tot = prog, lvl, kwargs.get('total', 0)
+                    self.on_worker_progress(stage, cur, tot)
+                    continue
                 if msg_key == "PROCESS_DONE":
                     if self.worker_process:
                         self.worker_process.join(timeout=0.1)
@@ -1248,6 +1504,9 @@ class ZeMosaicGUI:
             self._log_message("log_key_processing_finished", level="INFO")
             final_message = self._tr("msg_processing_completed")
             messagebox.showinfo(self._tr("dialog_title_completed"), final_message, parent=self.root)
+            # Nettoyage du compteur master-tiles affiché
+            if hasattr(self, "master_tile_count_var"):
+                self.master_tile_count_var.set("")
             output_dir_final = self.output_dir_var.get()
             if output_dir_final and os.path.isdir(output_dir_final):
                 if messagebox.askyesno(self._tr("q_open_output_folder_title"), self._tr("q_open_output_folder_msg", folder=output_dir_final), parent=self.root):
