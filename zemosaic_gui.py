@@ -118,13 +118,11 @@ class ZeMosaicGUI:
 
         # --- GPU Detection helper ---
         def _detect_gpus():
-
             """Return a list of detected GPUs as ``(display_name, index)`` tuples.
 
             Detection tries multiple methods so it works on Windows, Linux and
             macOS without requiring the optional ``wmi`` module.
             """
-
 
             controllers = []
             if wmi:
@@ -159,7 +157,6 @@ class ZeMosaicGUI:
                     nv_cuda = []
 
             def _simplify(n: str) -> str:
-
                 return n.lower().replace("laptop gpu", "").strip()
 
             simple_cuda = [_simplify(n) for n in nv_cuda]
@@ -168,10 +165,8 @@ class ZeMosaicGUI:
                 simp = _simplify(disp)
                 idx = simple_cuda.index(simp) if simp in simple_cuda else None
                 gpus.append((disp, idx))
-
             if not gpus and nv_cuda:
                 gpus = [(name, idx) for idx, name in enumerate(nv_cuda)]
-
 
             gpus.insert(0, ("CPU (no GPU)", None))
             return gpus
