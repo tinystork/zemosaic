@@ -1,12 +1,21 @@
 # zemosaic_utils.py
 
+# --- Standard Library Imports ---
 import os
 import numpy as np
 # L'import de astropy.io.fits est géré ci-dessous pour définir le flag
-import cv2 
+import cv2
+
 import warnings
-import traceback 
+import traceback
 import gc
+import importlib.util
+
+# --- GPU/CUDA Availability ----------------------------------------------------
+GPU_AVAILABLE = importlib.util.find_spec("cupy") is not None
+map_coordinates = None  # Lazily imported when needed
+
+from reproject.mosaicking import reproject_and_coadd as cpu_reproject_and_coadd
 
 # --- Définition locale du flag ASTROPY_AVAILABLE et du module fits pour ce fichier ---
 ASTROPY_AVAILABLE_IN_UTILS = False
@@ -136,9 +145,10 @@ def load_and_validate_fits(filepath,
 
     _log_util(f"Début chargement (V3 - BZERO/BSCALE affiné). Fichier: '{filename}'. NormalizeOutput01={normalize_to_float32}, FixNonFinite={attempt_fix_nonfinite}", "DEBUG")
 
-    data_raw_from_fits = None # Données telles que lues par fits.open
+    data_raw_from_fits = None  # Données telles que lues par fits.open
     header = None
     header_for_fallback = fits_module_for_utils.Header()
+    info = {}
 
     try:
         _log_util(f"Tentative fits_module_for_utils.open('{filepath}', do_not_scale_image_data=True)...", "DEBUG_DETAIL")
@@ -147,7 +157,7 @@ def load_and_validate_fits(filepath,
             _log_util(f"fits_module_for_utils.open OK. Nombre HDUs: {len(hdul) if hdul else 0}", "DEBUG_DETAIL")
             if not hdul:
                 _log_util(f"REJET: Fichier FITS vide ou corrompu (hdul est None/vide).", "WARN")
-                return None, header_for_fallback
+                return None, header_for_fallback, info
 
             hdu_img = None; img_hdu_idx = -1
             _log_util(f"Recherche HDU image...", "DEBUG_DETAIL")
@@ -171,7 +181,7 @@ def load_and_validate_fits(filepath,
                 _log_util(f"REJET: Aucune HDU image valide avec données.", "WARN")
                 if ASTROPY_AVAILABLE_IN_UTILS and len(hdul) > 0 and hasattr(hdul[0], 'header') and hdul[0].header:
                     header_for_fallback = hdul[0].header.copy()
-                return None, header_for_fallback
+                return None, header_for_fallback, info
 
             data_raw_from_fits = hdu_img.data # Peut être int16, uint16, float32, etc.
             header = hdu_img.header.copy(); header_for_fallback = header.copy()
@@ -201,17 +211,22 @@ def load_and_validate_fits(filepath,
 
             # --- Transposition si nécessaire ---
             data_transposed_f64 = data_scaled_f64
+            axis_orig = "HWC"
             if data_scaled_f64.ndim == 3:
                 if data_scaled_f64.shape[0] in [1, 3, 4] and data_scaled_f64.shape[1] > 4 and data_scaled_f64.shape[2] > 4:
                     _log_util(f"Shape 3D {data_scaled_f64.shape} type CxHxW. Transposition vers HxWxC...", "INFO_DETAIL")
                     data_transposed_f64 = np.moveaxis(data_scaled_f64, 0, -1)
+                    axis_orig = "CHW"
                     _log_util(f"  Shape après transposition: {data_transposed_f64.shape}", "DEBUG_DETAIL")
                 elif data_scaled_f64.shape[2] in [1, 3, 4] and data_scaled_f64.shape[0] > 4 and data_scaled_f64.shape[1] > 4:
                     _log_util(f"Shape 3D {data_scaled_f64.shape} déjà HxWxC.", "DEBUG_DETAIL")
+                    axis_orig = "HWC"
                 else:
-                    _log_util(f"REJET: Shape 3D non supportée ({data_scaled_f64.shape}).", "WARN"); return None, header
+                    _log_util(f"REJET: Shape 3D non supportée ({data_scaled_f64.shape}).", "WARN"); return None, header, info
             elif data_scaled_f64.ndim != 2:
-                _log_util(f"REJET: Shape {data_scaled_f64.ndim}D non supportée.", "WARN"); return None, header
+                _log_util(f"REJET: Shape {data_scaled_f64.ndim}D non supportée.", "WARN"); return None, header, info
+
+            info["axis_order_original"] = axis_orig
             
             _log_util(f"Après transposition (si 3D): Range [{np.min(data_transposed_f64):.1f}, {np.max(data_transposed_f64):.1f}], Dtype: {data_transposed_f64.dtype}", "DEBUG")
             
@@ -246,15 +261,18 @@ def load_and_validate_fits(filepath,
             else:
                 _log_util(f"Pas de normalisation 0-1 (ADU). Range final: [{np.nanmin(image_data_final_float32):.3g}, {np.nanmax(image_data_final_float32):.3g}]", "DEBUG_DETAIL")
 
-            _log_util(f"FIN chargement '{filename}'. Shape: {image_data_final_float32.shape}, Dtype: {image_data_final_float32.dtype}, "
-                      f"Range: [{np.nanmin(image_data_final_float32):.3g} - {np.nanmax(image_data_final_float32):.3g}], Mean: {np.nanmean(image_data_final_float32):.3g}", "INFO")
-            return image_data_final_float32, header
+            _log_util(
+                f"FIN chargement '{filename}'. Shape: {image_data_final_float32.shape}, Dtype: {image_data_final_float32.dtype}, "
+                f"Range: [{np.nanmin(image_data_final_float32):.3g} - {np.nanmax(image_data_final_float32):.3g}], Mean: {np.nanmean(image_data_final_float32):.3g}",
+                "INFO",
+            )
+            return image_data_final_float32, header, info
 
     except FileNotFoundError:
         _log_util(f"ERREUR CRITIQUE: Fichier non trouvé: '{filepath}'", "ERROR")
-        return None, header_for_fallback
+        return None, header_for_fallback, info
     except MemoryError as me:
-        _log_util(f"ERREUR CRITIQUE MÉMOIRE: {me}", "ERROR"); return None, header_for_fallback
+        _log_util(f"ERREUR CRITIQUE MÉMOIRE: {me}", "ERROR"); return None, header_for_fallback, info
     except Exception as e:
         _log_util(f"ERREUR INATTENDUE chargement/validation '{filename}': {type(e).__name__} - {e}", "ERROR")
         if progress_callback and hasattr(progress_callback.__self__ if hasattr(progress_callback, '__self__') else progress_callback, 'logger'):
@@ -264,7 +282,7 @@ def load_and_validate_fits(filepath,
              progress_callback(f"  [ZMU_LoadVal TRACEBACK] {traceback.format_exc(limit=3)}", None, "ERROR")
         else:
             traceback.print_exc(limit=3)
-        return None, header_for_fallback
+        return None, header_for_fallback, info
 
 
 
@@ -744,6 +762,54 @@ def stretch_percentile_rgb(img_hwc_adu, p_low=0.5, p_high=99.8,
         return img_float.astype(np.float32) # Retourner en float32 au cas où
 
 
+def save_numpy_to_fits(image_data: np.ndarray, header, output_path: str, *, axis_order: str = "HWC", overwrite: bool = True) -> None:
+    """Write a NumPy array to FITS without any scaling.
+
+    Parameters
+    ----------
+    image_data : np.ndarray
+        Array to save. Can be 2-D or 3-D.
+    header : fits.Header or dict
+        Header to write with the data.
+    output_path : str
+        Destination FITS path.
+    axis_order : {"HWC", "CHW"}
+        Interpretation of 3-D arrays. ``HWC`` means channels last and the array
+        will be transposed to ``CxHxW`` for saving.
+    overwrite : bool
+        Overwrite existing file if True.
+    """
+
+    current_fits = fits_module_for_utils
+    final_header = current_fits.Header()
+    if header is not None:
+        try:
+            if hasattr(header, "to_header"):
+                final_header.update(header.to_header(relax=True))
+            else:
+                final_header.update(header)
+        except Exception:
+            pass
+
+    for key in ["SIMPLE", "BITPIX", "NAXIS", "EXTEND", "BSCALE", "BZERO"]:
+        if key in final_header:
+            try:
+                del final_header[key]
+            except KeyError:
+                pass
+
+    data_to_write = image_data
+    if image_data.ndim == 3:
+        ao = str(axis_order).upper()
+        if ao == "HWC":
+            data_to_write = np.moveaxis(image_data, -1, 0)
+    hdu = current_fits.PrimaryHDU(data=data_to_write, header=final_header)
+    hdul = current_fits.HDUList([hdu])
+    hdul.writeto(output_path, overwrite=overwrite)
+    if hasattr(hdul, "close"):
+        hdul.close()
+
+
 
 
 def save_fits_image(image_data: np.ndarray,
@@ -897,7 +963,94 @@ def save_fits_image(image_data: np.ndarray,
         gc.collect() # gc doit être importé en haut du fichier zemosaic_utils.py
 
 
+def gpu_assemble_final_mosaic_reproject_coadd(*args, **kwargs):
+    """GPU accelerated final mosaic assembly (reproject & coadd).
+
+    This is a placeholder implementation. A full version would mirror the
+    NumPy implementation using CuPy arrays and CUDA kernels while minimizing
+    data transfers between host and device.
+    """
+    raise NotImplementedError("GPU implementation not available")
+
+
+def gpu_assemble_final_mosaic_incremental(*args, **kwargs):
+    """GPU accelerated incremental mosaic assembly placeholder."""
+    raise NotImplementedError("GPU implementation not available")
+
+
+def gpu_reproject_and_coadd(data_list, wcs_list, shape_out, **kwargs):
+    """Simplified GPU implementation using CuPy."""
+    import cupy as cp
+    data_gpu = [cp.asarray(d) for d in data_list]
+    mosaic_gpu = cp.zeros(shape_out, dtype=cp.float32)
+    weight_gpu = cp.zeros(shape_out, dtype=cp.float32)
+    for img in data_gpu:
+        # Placeholder for GPU interpolation logic
+        pass
+    return cp.asnumpy(mosaic_gpu), cp.asnumpy(weight_gpu)
+
+
+def reproject_and_coadd_wrapper(
+    data_list,
+    wcs_list,
+    shape_out,
+    use_gpu=False,
+    cpu_function=None,
+    **kwargs,
+):
+    if use_gpu and GPU_AVAILABLE:
+        try:
+            return gpu_reproject_and_coadd(data_list, wcs_list, shape_out, **kwargs)
+        except Exception as e:  # pragma: no cover - GPU failures
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "GPU reprojection failed (%s), fallback CPU", e
+            )
+    if cpu_function is None:
+        cpu_function = cpu_reproject_and_coadd
+    inputs = list(zip(data_list, wcs_list))
+    output_proj = kwargs.pop("output_projection")
+    return cpu_function(inputs, output_proj, shape_out, **kwargs)
+
+
+
+def gpu_reproject_and_coadd(data_list, wcs_list, shape_out, **kwargs):
+    """Simplified GPU version of ``reproject_and_coadd``.
+
+    Parameters match :func:`reproject_and_coadd_wrapper` but operate on CuPy
+    arrays. The implementation here is schematic and should be replaced with a
+    real CUDA accelerated routine.
+    """
+    import cupy as cp
+    data_gpu = [cp.asarray(d) for d in data_list]
+    mosaic_gpu = cp.zeros(shape_out, dtype=cp.float32)
+    weight_gpu = cp.zeros(shape_out, dtype=cp.float32)
+    for img in data_gpu:
+        # Placeholder for GPU interpolation step
+        pass
+    return cp.asnumpy(mosaic_gpu), cp.asnumpy(weight_gpu)
+
+
+def reproject_and_coadd_wrapper(data_list, wcs_list, shape_out, use_gpu=False, cpu_func=None, **kwargs):
+    """Dispatch to CPU or GPU ``reproject_and_coadd`` depending on availability."""
+    if use_gpu and GPU_AVAILABLE:
+        try:
+            return gpu_reproject_and_coadd(data_list, wcs_list, shape_out, **kwargs)
+        except Exception as e:  # pragma: no cover - GPU errors
+            import logging
+            logging.getLogger(__name__).warning(
+                "GPU reprojection failed (%s), fallback CPU", e
+            )
+    input_pairs = list(zip(data_list, wcs_list))
+    output_projection = kwargs.pop("output_projection", None)
+    func = cpu_func or cpu_reproject_and_coadd
+    return func(input_pairs, output_projection, shape_out, **kwargs)
+
+
+
 
 
 
 #####################################################################################################################
+
