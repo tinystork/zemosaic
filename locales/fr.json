@@ -18,6 +18,7 @@
     "astap_downsample_note": "(0=auto, 1=2x2, 2=4x4...)",
     "astap_sensitivity_label": "Sensibilité ASTAP (-sens) :",
     "astap_sensitivity_note": "(ex: 100, plus grand = plus sensible)",
+    "force_lum_label": "Convertir en Luminance (mono) :",
     "panel_clustering_threshold_label": "Seuil Clustering Panneaux (deg) :",
     "launch_button": "Lancer la Mosaïque Hiérarchique",
     "log_frame_title": "Logs de Traitement",
@@ -283,6 +284,10 @@
     "final_assembly_method_label": "Méthode d'Assemblage :",
     "assembly_method_reproject_coadd": "Reproject & Coadd (Haute Mémoire, Meilleure Qualité)",
     "assembly_method_incremental": "Incrémental (Basse Mémoire, Bon pour Grands Ensembles)",
+    "use_gpu_phase5": "Utiliser GPU NVIDIA pour la phase 5",
+    "gpu_selector_label": "Sélecteur de GPU :",
+    "no_gpu_title": "GPU non détecté",
+    "no_gpu_msg": "Aucun GPU NVIDIA détecté. Repli CPU activé.",
 
     "performance_options_frame_title": "Options de Performance",
     "num_workers_label": "Threads de Traitement :",
@@ -303,5 +308,8 @@
 
     "assemble_error_invalid_final_shape_inc": "ERREUR assemblage incrémental : dimensions finales invalides {shape}.",
     "assemble_warn_swapped_final_shape_inc": "AVERTISSEMENT assemblage incrémental : dimensions fournies {provided} inversées, attendu {expected}. Correction automatique.",
-    "assemble_error_mismatch_final_shape_inc": "ERREUR assemblage incrémental : dimensions fournies {provided} incompatibles avec la grille {expected}."
+    "assemble_error_mismatch_final_shape_inc": "ERREUR assemblage incrémental : dimensions fournies {provided} incompatibles avec la grille {expected}.",
+    "assemble_error_invalid_final_shape_reproj_coadd": "ERREUR Reproject & Coadd : dimensions finales invalides {shape}.",
+    "assemble_warn_swapped_final_shape_reproj_coadd": "AVERTISSEMENT Reproject & Coadd : dimensions fournies {provided} inversées, attendu {expected}. Correction automatique.",
+    "assemble_error_mismatch_final_shape_reproj_coadd": "ERREUR Reproject & Coadd : dimensions fournies {provided} incompatibles avec la grille {expected}."
 }
