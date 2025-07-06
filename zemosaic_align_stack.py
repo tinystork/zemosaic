@@ -164,104 +164,51 @@ def gpu_stack_linear(frames, *, sigma=3.0):
     return cp.asnumpy(result.astype(cp.float32)), float(rejected)
 
 
-def stack_winsorized_sigma_clip(frames, zconfig=None, progress_callback=None, **kwargs):
-    """Wrapper calling GPU or CPU winsorized sigma clip.
 
-    If neither GPU nor the external CPU implementation is available,
-    fall back to the pure NumPy routine used by ``stack_aligned_images``.
-    """
+def stack_winsorized_sigma_clip(frames, zconfig=None, **kwargs):
+    """Wrapper calling GPU or CPU winsorized sigma clip."""
+
     use_gpu = getattr(zconfig, 'use_gpu_phase5', False) if zconfig else False
     if use_gpu and GPU_AVAILABLE:
         try:
             return gpu_stack_winsorized(frames, **kwargs)
         except Exception:
-            _internal_logger.warning(
-                "GPU winsorized clip failed, fallback CPU", exc_info=True
-            )
 
+            _internal_logger.warning("GPU winsorized clip failed, fallback CPU", exc_info=True)
     if cpu_stack_winsorized:
         return cpu_stack_winsorized(frames, **kwargs)
-
-    _internal_logger.warning(
-        "CPU stack_winsorized function unavailable, using NumPy fallback"
-    )
-    stacked = stack_aligned_images(
-        aligned_image_data_list=frames,
-        normalize_method="none",
-        weighting_method="none",
-        rejection_algorithm="winsorized_sigma_clip",
-        final_combine_method="mean",
-        sigma_clip_low=kwargs.get("kappa", 3.0),
-        sigma_clip_high=kwargs.get("kappa", 3.0),
-        winsor_limits=kwargs.get("winsor_limits", (0.05, 0.05)),
-        progress_callback=progress_callback,
-    )
-    return stacked, 0.0
+    raise RuntimeError("CPU stack_winsorized function unavailable")
 
 
-def stack_kappa_sigma_clip(frames, zconfig=None, progress_callback=None, **kwargs):
-    """Wrapper calling GPU or CPU kappa-sigma clip.
+def stack_kappa_sigma_clip(frames, zconfig=None, **kwargs):
+    """Wrapper calling GPU or CPU kappa-sigma clip."""
 
-    Falls back to a NumPy implementation if the optimised version is missing.
-    """
     use_gpu = getattr(zconfig, 'use_gpu_phase5', False) if zconfig else False
     if use_gpu and GPU_AVAILABLE:
         try:
             return gpu_stack_kappa(frames, **kwargs)
         except Exception:
-            _internal_logger.warning(
-                "GPU kappa clip failed, fallback CPU", exc_info=True
-            )
 
+            _internal_logger.warning("GPU kappa clip failed, fallback CPU", exc_info=True)
     if cpu_stack_kappa:
         return cpu_stack_kappa(frames, **kwargs)
-
-    _internal_logger.warning(
-        "CPU stack_kappa function unavailable, using NumPy fallback"
-    )
-    stacked = stack_aligned_images(
-        aligned_image_data_list=frames,
-        normalize_method="none",
-        weighting_method="none",
-        rejection_algorithm="kappa_sigma",
-        final_combine_method="mean",
-        sigma_clip_low=kwargs.get("sigma", kwargs.get("sigma_low", 3.0)),
-        sigma_clip_high=kwargs.get("sigma", kwargs.get("sigma_high", 3.0)),
-        progress_callback=progress_callback,
-    )
-    return stacked, 0.0
+    raise RuntimeError("CPU stack_kappa function unavailable")
 
 
-def stack_linear_fit_clip(frames, zconfig=None, progress_callback=None, **kwargs):
-    """Wrapper calling GPU or CPU linear fit clip.
+def stack_linear_fit_clip(frames, zconfig=None, **kwargs):
+    """Wrapper calling GPU or CPU linear fit clip."""
 
-    If unavailable, use a very basic NumPy implementation.
-    """
     use_gpu = getattr(zconfig, 'use_gpu_phase5', False) if zconfig else False
     if use_gpu and GPU_AVAILABLE:
         try:
             return gpu_stack_linear(frames, **kwargs)
         except Exception:
-            _internal_logger.warning(
-                "GPU linear clip failed, fallback CPU", exc_info=True
-            )
 
+            _internal_logger.warning("GPU linear clip failed, fallback CPU", exc_info=True)
     if cpu_stack_linear:
         return cpu_stack_linear(frames, **kwargs)
+    raise RuntimeError("CPU stack_linear function unavailable")
 
-    _internal_logger.warning(
-        "CPU stack_linear function unavailable, using NumPy fallback"
-    )
-    stacked = stack_aligned_images(
-        aligned_image_data_list=frames,
-        normalize_method="none",
-        weighting_method="none",
-        rejection_algorithm="linear_fit_clip",
-        final_combine_method="mean",
-        sigma_clip_high=kwargs.get("sigma", 3.0),
-        progress_callback=progress_callback,
-    )
-    return stacked, 0.0
 
 
 # Fallback logger for cases where progress_callback might not be available
