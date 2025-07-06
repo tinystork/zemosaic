@@ -164,13 +164,16 @@ def gpu_stack_linear(frames, *, sigma=3.0):
     return cp.asnumpy(result.astype(cp.float32)), float(rejected)
 
 
+
 def stack_winsorized_sigma_clip(frames, zconfig=None, **kwargs):
     """Wrapper calling GPU or CPU winsorized sigma clip."""
+
     use_gpu = getattr(zconfig, 'use_gpu_phase5', False) if zconfig else False
     if use_gpu and GPU_AVAILABLE:
         try:
             return gpu_stack_winsorized(frames, **kwargs)
         except Exception:
+
             _internal_logger.warning("GPU winsorized clip failed, fallback CPU", exc_info=True)
     if cpu_stack_winsorized:
         return cpu_stack_winsorized(frames, **kwargs)
@@ -179,11 +182,13 @@ def stack_winsorized_sigma_clip(frames, zconfig=None, **kwargs):
 
 def stack_kappa_sigma_clip(frames, zconfig=None, **kwargs):
     """Wrapper calling GPU or CPU kappa-sigma clip."""
+
     use_gpu = getattr(zconfig, 'use_gpu_phase5', False) if zconfig else False
     if use_gpu and GPU_AVAILABLE:
         try:
             return gpu_stack_kappa(frames, **kwargs)
         except Exception:
+
             _internal_logger.warning("GPU kappa clip failed, fallback CPU", exc_info=True)
     if cpu_stack_kappa:
         return cpu_stack_kappa(frames, **kwargs)
@@ -192,15 +197,18 @@ def stack_kappa_sigma_clip(frames, zconfig=None, **kwargs):
 
 def stack_linear_fit_clip(frames, zconfig=None, **kwargs):
     """Wrapper calling GPU or CPU linear fit clip."""
+
     use_gpu = getattr(zconfig, 'use_gpu_phase5', False) if zconfig else False
     if use_gpu and GPU_AVAILABLE:
         try:
             return gpu_stack_linear(frames, **kwargs)
         except Exception:
+
             _internal_logger.warning("GPU linear clip failed, fallback CPU", exc_info=True)
     if cpu_stack_linear:
         return cpu_stack_linear(frames, **kwargs)
     raise RuntimeError("CPU stack_linear function unavailable")
+
 
 
 # Fallback logger for cases where progress_callback might not be available
