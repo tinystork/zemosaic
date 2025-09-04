@@ -164,16 +164,33 @@ def gpu_stack_linear(frames, *, sigma=3.0):
     return cp.asnumpy(result.astype(cp.float32)), float(rejected)
 
 
-def stack_winsorized_sigma_clip(frames, zconfig=None, **kwargs):
-    """Wrapper calling GPU or CPU winsorized sigma clip."""
+def stack_winsorized_sigma_clip(frames, weights=None, zconfig=None, **kwargs):
+    """Wrapper calling GPU or CPU winsorized sigma clip.
+
+    Parameters
+    ----------
+    frames : sequence
+        Images to stack.
+    weights : sequence or None, optional
+        Per-frame weights for the CPU implementation. GPU fallback currently
+        ignores this parameter.
+    zconfig : object, optional
+        Configuration object controlling GPU usage.
+    **kwargs : dict
+        Additional arguments forwarded to the underlying stack function.
+    """
     use_gpu = getattr(zconfig, 'use_gpu_phase5', False) if zconfig else False
     if use_gpu and GPU_AVAILABLE:
         try:
+            if weights is not None:
+                _internal_logger.warning(
+                    "GPU winsorized clip does not support weights; weights ignored"
+                )
             return gpu_stack_winsorized(frames, **kwargs)
         except Exception:
             _internal_logger.warning("GPU winsorized clip failed, fallback CPU", exc_info=True)
     if cpu_stack_winsorized:
-        return cpu_stack_winsorized(frames, **kwargs)
+        return cpu_stack_winsorized(frames, weights, **kwargs)
     raise RuntimeError("CPU stack_winsorized function unavailable")
 
 
