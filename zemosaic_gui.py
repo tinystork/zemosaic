@@ -756,7 +756,8 @@ class ZeMosaicGUI:
 
         gpu_chk = ttk.Checkbutton(
             final_assembly_options_frame,
-            text=self._tr("use_gpu_phase5", "Use NVIDIA GPU for Phase 5"),
+            # Keep translation key for backward compatibility, update default text
+            text=self._tr("use_gpu_phase5", "Use NVIDIA GPU"),
             variable=self.use_gpu_phase5_var,
         )
         gpu_chk.grid(row=asm_opt_row, column=0, sticky="w", padx=5, pady=3, columnspan=2)

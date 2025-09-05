@@ -897,6 +897,10 @@ def get_wcs_and_pretreat_raw_file(
     # --- Résolution WCS ---
     _pcb_local(f"  Résolution WCS pour '{filename}'...", lvl="DEBUG_DETAIL")
     wcs_brute = None
+    # Évite d'écrire le header FITS si le WCS est déjà présent dans le fichier d'origine.
+    # Nous ne réécrivons le header que si un solver externe (ASTAP/ASTROMETRY/ANSVR)
+    # a effectivement injecté/ajusté des clés WCS dans header_orig.
+    should_write_header_back = False
     if ASTROPY_AVAILABLE and WCS: # S'assurer que WCS est bien l'objet d'Astropy
         try:
             wcs_from_header = WCS(header_orig, naxis=2, relax=True) # Utiliser WCS d'Astropy
@@ -904,6 +908,8 @@ def get_wcs_and_pretreat_raw_file(
                (hasattr(wcs_from_header.wcs,'cdelt') or hasattr(wcs_from_header.wcs,'cd') or hasattr(wcs_from_header.wcs,'pc')):
                 wcs_brute = wcs_from_header
                 _pcb_local(f"    WCS trouvé dans header FITS de '{filename}'.", lvl="DEBUG_DETAIL")
+                # WCS déjà présent => pas besoin de réécrire le header
+                should_write_header_back = False
         except Exception as e_wcs_hdr:
             _pcb_local("getwcs_warn_header_wcs_read_failed", lvl="WARN", filename=filename, error=str(e_wcs_hdr))
             wcs_brute = None
@@ -957,6 +963,9 @@ def get_wcs_and_pretreat_raw_file(
                             update_original_header_in_place=True,
                             progress_callback=progress_callback,
                         )
+                    # Si un solver a réussi, le header_orig a potentiellement été mis à jour
+                    if wcs_brute:
+                        should_write_header_back = True
                     if wcs_brute:
                         _pcb_local("getwcs_info_astrometry_solved", lvl="INFO_DETAIL", filename=filename)
                 elif solver_choice_effective == "ANSVR":
@@ -982,6 +991,9 @@ def get_wcs_and_pretreat_raw_file(
                             update_original_header_in_place=True,
                             progress_callback=progress_callback,
                         )
+                    # Si ANSVR/ASTAP réussit, le header a été mis à jour par le solver
+                    if wcs_brute:
+                        should_write_header_back = True
                     if wcs_brute:
                         _pcb_local("getwcs_info_astrometry_solved", lvl="INFO_DETAIL", filename=filename)
                 else:
@@ -998,6 +1010,9 @@ def get_wcs_and_pretreat_raw_file(
                         update_original_header_in_place=True,
                         progress_callback=progress_callback,
                     )
+                    # ASTAP a potentiellement mis à jour le header_orig
+                    if wcs_brute:
+                        should_write_header_back = True
                     if wcs_brute:
                         _pcb_local("getwcs_info_astap_solved", lvl="INFO_DETAIL", filename=filename)
                     else:
@@ -1036,7 +1051,9 @@ def get_wcs_and_pretreat_raw_file(
         
         if wcs_brute and wcs_brute.is_celestial: # Re-vérifier après la tentative de set_pixel_shape
             _pcb_local("getwcs_info_pretreatment_wcs_ok", lvl="DEBUG", filename=filename)
-            _write_header_to_fits(file_path, header_orig, _pcb_local)
+            # Écriture du header uniquement si un solver a réellement mis à jour le header
+            if should_write_header_back:
+                _write_header_to_fits(file_path, header_orig, _pcb_local)
             return img_data_processed_adu, wcs_brute, header_orig, hp_mask_path
         # else: tombe dans le bloc de déplacement ci-dessous
 
@@ -1125,6 +1142,12 @@ def create_master_tile(
             zconfig = SimpleNamespace()
     else:
         zconfig = SimpleNamespace()
+    # Provide a generic alias for GPU usage so Phase 3 can honor the same toggle.
+    try:
+        if not hasattr(zconfig, 'use_gpu') and hasattr(zconfig, 'use_gpu_phase5'):
+            setattr(zconfig, 'use_gpu', getattr(zconfig, 'use_gpu_phase5'))
+    except Exception:
+        pass
     func_id_log_base = "mastertile"
 
     pcb_tile(f"{func_id_log_base}_info_creation_started_from_cache", prog=None, lvl="INFO", 

@@ -315,20 +315,9 @@ def solve_with_astap(image_fits_path: str,
     astap_success = False
 
     try:
-
-        astap_process_result = None
-        try:
-            if not multiprocessing.current_process().daemon:
-                with ProcessPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(_run_astap_subprocess, cmd_list_astap, current_image_dir, timeout_sec)
-                    astap_process_result = future.result()
-            else:
-                raise RuntimeError("daemon process")
-        except (AssertionError, RuntimeError) as e_pool:
-            if progress_callback:
-                progress_callback(f"  ASTAP Solve: ProcessPoolExecutor indisponible ({e_pool}). Lancement direct.", None, "DEBUG_DETAIL")
-            astap_process_result = _run_astap_subprocess(cmd_list_astap, current_image_dir, timeout_sec)
-
+        # Run ASTAP directly to avoid nested ProcessPoolExecutors from threads (can hang on Windows).
+        # We still enforce a strict timeout via subprocess.run inside _run_astap_subprocess.
+        astap_process_result = _run_astap_subprocess(cmd_list_astap, current_image_dir, timeout_sec)
         logger.debug(f"ASTAP return code: {astap_process_result.returncode}")
 
         rc_astap = astap_process_result.returncode
