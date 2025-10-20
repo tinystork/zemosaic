@@ -19,6 +19,7 @@
     "astap_sensitivity_label": "Sensibilité ASTAP (-sens) :",
     "astap_sensitivity_note": "(ex: 100, plus grand = plus sensible)",
     "panel_clustering_threshold_label": "Seuil Clustering Panneaux (deg) :",
+    "panel_clustering_threshold_note": "Seestar S50 typique : 0,05–0,12° (même session); jusqu’à 0,20° multi-nuits. Plus haut risque de fusionner des panneaux adjacents.",
     "launch_button": "Lancer la Mosaïque Hiérarchique",
     "stop_button": "Arrêter",
     "log_frame_title": "Logs de Traitement",

@@ -21,6 +21,97 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_compl
 from concurrent.futures.process import BrokenProcessPool
 
 
+def cluster_seestar_stacks_connected(all_raw_files_with_info: list, stack_threshold_deg: float, progress_callback: callable):
+    """Order-invariant clustering of Seestar raws using spherical proximity.
+
+    Builds a proximity graph (edges when separation < threshold) and returns
+    connected components. Deterministic across runs when input ordering is
+    stable (we sort file paths earlier).
+    """
+    # Deps imported later in module; they will be available at runtime
+    try:
+        ok_astropy = ASTROPY_AVAILABLE and (SkyCoord is not None) and (u is not None) and (Angle is not None)
+    except NameError:
+        ok_astropy = False
+    if not ok_astropy:
+        _log_and_callback("clusterstacks_error_astropy_unavailable", level="ERROR", callback=progress_callback)
+        return []
+    if not all_raw_files_with_info:
+        _log_and_callback("clusterstacks_warn_no_raw_info", level="WARN", callback=progress_callback)
+        return []
+    _log_and_callback(
+        "clusterstacks_info_start",
+        num_files=len(all_raw_files_with_info),
+        threshold=stack_threshold_deg,
+        level="INFO",
+        callback=progress_callback,
+    )
+    panel_centers_sky = []
+    panel_data_for_clustering = []
+    for info in all_raw_files_with_info:
+        wcs_obj = info.get("wcs")
+        if not (wcs_obj and getattr(wcs_obj, "is_celestial", False)):
+            continue
+        try:
+            if getattr(wcs_obj, "pixel_shape", None):
+                cx = wcs_obj.pixel_shape[0] / 2.0
+                cy = wcs_obj.pixel_shape[1] / 2.0
+                center_world = wcs_obj.pixel_to_world(cx, cy)
+            elif hasattr(wcs_obj, "wcs") and hasattr(wcs_obj.wcs, "crval"):
+                center_world = SkyCoord(
+                    ra=float(wcs_obj.wcs.crval[0]) * u.deg,
+                    dec=float(wcs_obj.wcs.crval[1]) * u.deg,
+                    frame="icrs",
+                )
+            else:
+                continue
+            panel_centers_sky.append(center_world)
+            panel_data_for_clustering.append(info)
+        except Exception:
+            continue
+    if not panel_centers_sky:
+        _log_and_callback("clusterstacks_warn_no_centers", level="WARN", callback=progress_callback)
+        return []
+    coords = SkyCoord(
+        ra=[c.ra for c in panel_centers_sky],
+        dec=[c.dec for c in panel_centers_sky],
+        frame="icrs",
+    )
+    max_sep = Angle(float(stack_threshold_deg), unit=u.deg)
+    try:
+        idx1, idx2, _, _ = coords.search_around_sky(coords, max_sep)
+    except Exception:
+        idx1, idx2 = np.array([], dtype=int), np.array([], dtype=int)
+    n = len(coords)
+    parent = list(range(n))
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+    for a, b in zip(idx1, idx2):
+        ia, ib = int(a), int(b)
+        if ia == ib:
+            continue
+        union(ia, ib)
+    groups_indices = {}
+    for i in range(n):
+        r = find(i)
+        groups_indices.setdefault(r, []).append(i)
+    ordered_roots = sorted(groups_indices.keys(), key=lambda r: min(groups_indices[r]))
+    groups = []
+    for r in ordered_roots:
+        members = groups_indices[r]
+        members.sort()
+        groups.append([panel_data_for_clustering[i] for i in members])
+    _log_and_callback("clusterstacks_info_finished", num_groups=len(groups), level="INFO", callback=progress_callback)
+    return groups
+
+
 # --- Configuration du Logging ---
 logger = logging.getLogger("ZeMosaicWorker")
 if not logger.handlers:
@@ -148,6 +239,12 @@ import importlib.util
 
 # Global semaphore to throttle concurrent *.npy cache reads in Phase 3
 _CACHE_IO_SEMAPHORE = threading.Semaphore(2 if os.name == 'nt' else 4)
+
+# Global semaphore to limit concurrent Phase 3 (master tile) tasks.
+# This allows runtime adaptation when other apps (e.g. a video read) are active.
+# It is initialized later inside run_hierarchical_mosaic and can be reassigned
+# by the runtime monitor to change the concurrency cap without restarting pools.
+_PH3_CONCURRENCY_SEMAPHORE = threading.Semaphore(2 if os.name == 'nt' else 4)
 
 # --- Basic IO throughput probing helpers (Windows-friendly, OS-agnostic) ---
 def _measure_sequential_read_mbps(file_path: str, bytes_to_read: int = 16 * 1024 * 1024, block_size: int = 1 * 1024 * 1024) -> float | None:
@@ -1271,6 +1368,13 @@ def create_master_tile(
     ref_path_raw = ref_info_for_tile.get('path_raw', 'UnknownRawRef')
     pcb_tile(f"{func_id_log_base}_info_reference_set", prog=None, lvl="DEBUG_DETAIL", ref_index=reference_image_index_in_group, ref_filename=os.path.basename(ref_path_raw), tile_id=tile_id)
 
+    # Acquire a dynamic Phase 3 I/O concurrency slot to avoid disk stalls
+    # when the system is busy (e.g., another app reading video files).
+    try:
+        _PH3_CONCURRENCY_SEMAPHORE.acquire()
+    except Exception:
+        pass
+
     pcb_tile(f"{func_id_log_base}_info_loading_from_cache_started", prog=None, lvl="DEBUG_DETAIL", num_images=len(seestar_stack_group_info), tile_id=tile_id)
     
     tile_images_data_HWC_adu = []
@@ -1313,12 +1417,23 @@ def create_master_tile(
             tile_original_raw_headers.append(raw_file_info.get('header')) 
         except MemoryError as e_mem_load_cache:
              pcb_tile(f"{func_id_log_base}_error_memory_loading_cache", prog=None, lvl="ERROR", filename=os.path.basename(cached_image_file_path), error=str(e_mem_load_cache), tile_id=tile_id)
+             # Release the concurrency slot before aborting
+             try:
+                 _PH3_CONCURRENCY_SEMAPHORE.release()
+             except Exception:
+                 pass
              del tile_images_data_HWC_adu, tile_original_raw_headers; gc.collect(); return None, None
         except Exception as e_load_cache:
             pcb_tile(f"{func_id_log_base}_error_loading_cache", prog=None, lvl="ERROR", filename=os.path.basename(cached_image_file_path), error=str(e_load_cache), tile_id=tile_id)
             logger.error(f"Erreur chargement cache {cached_image_file_path} pour tuile {tile_id}", exc_info=True)
             continue
             
+    # Release the concurrency slot as soon as disk reads are done for this tile
+    try:
+        _PH3_CONCURRENCY_SEMAPHORE.release()
+    except Exception:
+        pass
+
     if not tile_images_data_HWC_adu: 
         pcb_tile(f"{func_id_log_base}_error_no_valid_images_from_cache", prog=None, lvl="ERROR", tile_id=tile_id)
         return None,None
@@ -2360,9 +2475,19 @@ def run_hierarchical_mosaic(
     fits_file_paths = []
     # Scan des fichiers FITS dans le dossier d'entrée et ses sous-dossiers
     for root_dir_iter, _, files_in_dir_iter in os.walk(input_folder):
+        # Assurer un ordre déterministe quelle que soit la plateforme/FS
+        try:
+            files_in_dir_iter = sorted(files_in_dir_iter, key=lambda s: s.lower())
+        except Exception:
+            files_in_dir_iter = list(files_in_dir_iter)
         for file_name_iter in files_in_dir_iter:
-            if file_name_iter.lower().endswith((".fit", ".fits")): 
+            if file_name_iter.lower().endswith((".fit", ".fits")):
                 fits_file_paths.append(os.path.join(root_dir_iter, file_name_iter))
+    # Tri global déterministe
+    try:
+        fits_file_paths.sort(key=lambda p: p.lower())
+    except Exception:
+        fits_file_paths.sort()
     
     if not fits_file_paths: 
         pcb("run_error_no_fits_found_input", prog=current_global_progress, lvl="ERROR")
@@ -2544,7 +2669,8 @@ def run_hierarchical_mosaic(
     base_progress_phase2 = current_global_progress
     _log_memory_usage(progress_callback, "Début Phase 2 (Clustering)")
     pcb("run_info_phase2_started", prog=base_progress_phase2, lvl="INFO")
-    seestar_stack_groups = cluster_seestar_stacks(all_raw_files_processed_info, SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG, progress_callback)
+    # Use order-invariant connected-components clustering for robustness
+    seestar_stack_groups = cluster_seestar_stacks_connected(all_raw_files_processed_info, SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG, progress_callback)
     if not seestar_stack_groups:
         pcb("run_error_phase2_no_groups", prog=(base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING), lvl="ERROR")
         return
@@ -2730,6 +2856,106 @@ def run_hierarchical_mosaic(
         lvl="INFO",
     )  # Log mis à jour pour clarté
 
+    # Initialize adaptive concurrency controls for Phase 3 (I/O + tasks)
+    try:
+        global _PH3_CONCURRENCY_SEMAPHORE
+        _PH3_CONCURRENCY_SEMAPHORE = threading.Semaphore(int(actual_num_workers_ph3))
+    except Exception:
+        pass
+
+    # Start a lightweight real-time monitor to adapt concurrency while Phase 3 runs
+    monitor_stop_evt = threading.Event()
+
+    def _rt_adapt_concurrency():
+        try:
+            import psutil as _ps
+        except Exception:
+            return  # psutil absent; skip runtime adaptation
+        current_ph3_limit = int(actual_num_workers_ph3)
+        current_cache_slots = None
+        default_cache_slots = 2 if os.name == 'nt' else 3
+        last_io = None
+        last_t = None
+        try:
+            last_io = _ps.disk_io_counters()
+            last_t = time.perf_counter()
+        except Exception:
+            last_io, last_t = None, None
+        while not monitor_stop_evt.is_set():
+            time.sleep(1.25)
+            # CPU snapshot
+            try:
+                cpu_pct = _ps.cpu_percent(interval=None)
+            except Exception:
+                cpu_pct = None
+            # Disk read throughput MB/s
+            read_mbps = None
+            try:
+                if last_io is not None:
+                    now_io = _ps.disk_io_counters()
+                    now_t = time.perf_counter()
+                    dt = max(1e-3, (now_t - (last_t or now_t)))
+                    read_mbps = (max(0, now_io.read_bytes - last_io.read_bytes) / dt) / (1024 * 1024)
+                    last_io, last_t = now_io, now_t
+            except Exception:
+                pass
+
+            new_ph3_limit = current_ph3_limit
+            new_cache_slots = current_cache_slots if current_cache_slots is not None else default_cache_slots
+
+            if read_mbps is not None:
+                if os.name == 'nt':
+                    if read_mbps >= 120:
+                        new_ph3_limit = 1
+                        new_cache_slots = 1
+                    elif read_mbps >= 80:
+                        new_ph3_limit = min(new_ph3_limit, 2)
+                        new_cache_slots = 1
+                    elif read_mbps >= 40:
+                        new_cache_slots = 2
+                    else:
+                        new_cache_slots = default_cache_slots
+                else:
+                    if read_mbps >= 200:
+                        new_ph3_limit = max(1, min(new_ph3_limit, 2))
+                        new_cache_slots = 2
+                    elif read_mbps >= 120:
+                        new_cache_slots = 2
+                    else:
+                        new_cache_slots = default_cache_slots
+
+            if cpu_pct is not None:
+                if cpu_pct >= 90:
+                    new_ph3_limit = max(1, min(new_ph3_limit, 2 if os.name == 'nt' else 3))
+                elif cpu_pct <= 45:
+                    new_ph3_limit = max(new_ph3_limit, min(int(actual_num_workers_ph3), 3 if os.name == 'nt' else int(actual_num_workers_ph3)))
+
+            new_ph3_limit = max(1, min(int(actual_num_workers_ph3), int(new_ph3_limit)))
+            new_cache_slots = max(1, int(new_cache_slots))
+
+            try:
+                if new_ph3_limit != current_ph3_limit:
+                    current_ph3_limit = new_ph3_limit
+                    try:
+                        global _PH3_CONCURRENCY_SEMAPHORE
+                        _PH3_CONCURRENCY_SEMAPHORE = threading.Semaphore(int(current_ph3_limit))
+                        pcb(f"IO_ADAPT_RT: ph3_workers -> {current_ph3_limit}", prog=None, lvl="INFO_DETAIL")
+                    except Exception:
+                        pass
+                if (current_cache_slots is None) or (new_cache_slots != current_cache_slots):
+                    current_cache_slots = new_cache_slots
+                    try:
+                        global _CACHE_IO_SEMAPHORE
+                        _CACHE_IO_SEMAPHORE = threading.Semaphore(int(current_cache_slots))
+                        pcb(f"IO_ADAPT_RT: cache_read_slots -> {current_cache_slots}", prog=None, lvl="INFO_DETAIL")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+    monitor_thread = threading.Thread(target=_rt_adapt_concurrency, name="ZeMosaic_Ph3_RTAdapt", daemon=True)
+    monitor_thread.start()
+
     tiles_processed_count_ph3 = 0
     # Envoyer l'info initiale avant la boucle
     if num_seestar_stacks_to_process > 0:
@@ -2800,6 +3026,13 @@ def run_hierarchical_mosaic(
             update_gui_eta(total_eta_sec_ph3)
 
     # Toutes les futures sont terminées → fermeture propre
+    # Stop the runtime adaptation monitor for Phase 3
+    try:
+        monitor_stop_evt.set()
+        if monitor_thread and monitor_thread.is_alive():
+            monitor_thread.join(timeout=2.0)
+    except Exception:
+        pass
     executor_ph3.shutdown(wait=True)
 
     master_tiles_results_list = [master_tiles_results_list_temp[i] for i in sorted(master_tiles_results_list_temp.keys())]

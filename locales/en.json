@@ -19,6 +19,7 @@
     "astap_sensitivity_label": "ASTAP Sensitivity (-sens):",
     "astap_sensitivity_note": "(e.g., 100, higher = more sensitive)",
     "panel_clustering_threshold_label": "Panel Clustering Threshold (deg):",
+    "panel_clustering_threshold_note": "Typical Seestar S50: 0.05–0.12° same session; up to 0.20° multi-night. Larger values may merge adjacent panels.",
     "launch_button": "Start Hierarchical Mosaic",
     "stop_button": "Stop",
     "log_frame_title": "Processing Logs",

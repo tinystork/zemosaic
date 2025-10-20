@@ -117,7 +117,9 @@ class ZeMosaicGUI:
                 # Prétraitement GPU (facultatif) : suppression du gradient de fond
                 # DÉSACTIVÉE par défaut pour conserver le rendu antérieur
                 "preprocess_remove_background_gpu": False,
-                "preprocess_background_sigma": 24.0
+                "preprocess_background_sigma": 24.0,
+                # Valeur par défaut alignée avec le worker (0.08°)
+                "cluster_panel_threshold": 0.08
             }
 
         # --- GPU Detection helper ---
@@ -205,7 +207,7 @@ class ZeMosaicGUI:
         self.astap_search_radius_var = tk.DoubleVar(value=self.config.get("astap_default_search_radius", 3.0))
         self.astap_downsample_var = tk.IntVar(value=self.config.get("astap_default_downsample", 2))
         self.astap_sensitivity_var = tk.IntVar(value=self.config.get("astap_default_sensitivity", 100))
-        self.cluster_threshold_var = tk.DoubleVar(value=self.config.get("cluster_panel_threshold", 0.5))
+        self.cluster_threshold_var = tk.DoubleVar(value=self.config.get("cluster_panel_threshold", 0.08))
         self.save_final_uint16_var = tk.BooleanVar(value=self.config.get("save_final_as_uint16", False))
 
         # --- Solver Settings ---
@@ -535,6 +537,7 @@ class ZeMosaicGUI:
         ttk.Label(params_frame, text="").grid(row=param_row_idx, column=2, padx=5, pady=3, sticky="w"); self.translatable_widgets["astap_sensitivity_note"] = params_frame.grid_slaves(row=param_row_idx,column=2)[0]; param_row_idx+=1
         ttk.Label(params_frame, text="").grid(row=param_row_idx, column=0, padx=5, pady=3, sticky="w"); self.translatable_widgets["panel_clustering_threshold_label"] = params_frame.grid_slaves(row=param_row_idx,column=0)[0]
         ttk.Spinbox(params_frame, from_=0.01, to=5.0, increment=0.01, textvariable=self.cluster_threshold_var, width=8, format="%.2f").grid(row=param_row_idx, column=1, padx=5, pady=3, sticky="w")
+        ttk.Label(params_frame, text="").grid(row=param_row_idx, column=2, padx=5, pady=3, sticky="w"); self.translatable_widgets["panel_clustering_threshold_note"] = params_frame.grid_slaves(row=param_row_idx,column=2)[0]
         param_row_idx += 1
         # Removed: Force Luminance option (images are sent to ASTAP as-is)
 
@@ -1419,6 +1422,12 @@ class ZeMosaicGUI:
                 f"[INFO] Aucun dossier memmap défini. Utilisation du dossier de sortie: {memmap_dir}",
                 level="INFO",
             )
+
+        # Persist selected clustering threshold for next runs
+        try:
+            self.config["cluster_panel_threshold"] = float(cluster_thresh_val)
+        except Exception:
+            pass
 
         self.config["winsor_worker_limit"] = self.winsor_workers_var.get()
         self.config["max_raw_per_master_tile"] = self.max_raw_per_tile_var.get()
