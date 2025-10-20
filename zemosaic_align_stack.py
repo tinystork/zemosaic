@@ -1,6 +1,7 @@
 # zemosaic_align_stack.py
 
 import numpy as np
+import os
 import importlib.util
 
 GPU_AVAILABLE = importlib.util.find_spec("cupy") is not None
@@ -1154,13 +1155,15 @@ def parallel_rejwinsor(channels, limits, max_workers, progress_callback=None):
 
     results = [None] * len(args_list)
 
-    # Avoid spawning a new process pool when already running inside a
-    # multiprocessing worker as this would raise "daemonic processes are not
-    # allowed to have children". In that case fallback to threads.
+    # Avoid ProcessPool on Windows to prevent heavy memory duplication and startup overhead
     parent_is_daemon = multiprocessing.current_process().daemon
-    Executor = ThreadPoolExecutor if parent_is_daemon else ProcessPoolExecutor
+    use_threads = parent_is_daemon or (os.name == 'nt')
+    Executor = ThreadPoolExecutor if use_threads else ProcessPoolExecutor
 
-    with Executor(max_workers=max_workers) as exe:
+    # Clamp workers to number of channels
+    eff_workers = max(1, min(int(max_workers or 1), len(args_list)))
+
+    with Executor(max_workers=eff_workers) as exe:
         futures = {exe.submit(_apply_winsor_single, a): i for i, a in enumerate(args_list)}
         total = len(futures)
         done = 0
@@ -1412,8 +1415,19 @@ def stack_aligned_images(
     ``winsor_max_workers`` permet de paralléliser la phase de Winsorisation lors
     du rejet Winsorized Sigma Clip.
     """
-    _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: \
-        progress_callback(msg_key, prog, lvl, **kwargs) if progress_callback else _internal_logger.debug(f"PCB_FALLBACK_{lvl}_{prog}: {msg_key} {kwargs}")
+    # Wrapper: demote very verbose internal logs so they don't flood the GUI
+    def _pcb(msg_key, prog=None, lvl="INFO_DETAIL", **kwargs):
+        level = lvl
+        try:
+            if isinstance(msg_key, str) and msg_key.startswith("STACK_IMG"):
+                if isinstance(level, str) and level.upper() in ("ERROR", "INFO"):
+                    level = "DEBUG_DETAIL"
+        except Exception:
+            pass
+        if progress_callback:
+            return progress_callback(msg_key, prog, level, **kwargs)
+        else:
+            return _internal_logger.debug(f"PCB_FALLBACK_{level}_{prog}: {msg_key} {kwargs}")
 
     _pcb("STACK_IMG_ENTRY: Début stack_aligned_images.", lvl="ERROR") # Log d'entrée
 
