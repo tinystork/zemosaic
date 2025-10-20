@@ -15,6 +15,49 @@ import importlib.util
 GPU_AVAILABLE = importlib.util.find_spec("cupy") is not None
 map_coordinates = None  # Lazily imported when needed
 
+# --- Lightweight CuPy helpers -------------------------------------------------
+def gpu_is_available() -> bool:
+    if not GPU_AVAILABLE:
+        return False
+    try:
+        import cupy as cp  # type: ignore
+        return bool(cp.is_available())
+    except Exception:
+        return False
+
+
+def ensure_cupy_pool_initialized(device_id: int | None = None) -> None:
+    """Idempotently enable CuPy device + memory pools.
+
+    - Sets the current device (optional).
+    - Enables a default device memory pool and a pinned host memory pool.
+    """
+    if not gpu_is_available():
+        return
+    try:
+        ensure_cupy_pool_initialized._done  # type: ignore[attr-defined]
+        return
+    except AttributeError:
+        pass
+    import cupy as cp  # type: ignore
+    try:
+        if device_id is not None:
+            cp.cuda.Device(int(device_id)).use()
+    except Exception:
+        # Ignore invalid ids; rely on current device
+        pass
+    try:
+        mp = cp.cuda.MemoryPool(cp.cuda.malloc)
+        cp.cuda.set_allocator(mp.malloc)
+    except Exception:
+        pass
+    try:
+        pmp = cp.cuda.PinnedMemoryPool()
+        cp.cuda.set_pinned_memory_allocator(pmp.malloc)
+    except Exception:
+        pass
+    ensure_cupy_pool_initialized._done = True  # type: ignore[attr-defined]
+
 from reproject.mosaicking import reproject_and_coadd as cpu_reproject_and_coadd
 
 # --- Définition locale du flag ASTROPY_AVAILABLE et du module fits pour ce fichier ---
@@ -1046,6 +1089,154 @@ def reproject_and_coadd_wrapper(data_list, wcs_list, shape_out, use_gpu=False, c
     output_projection = kwargs.pop("output_projection", None)
     func = cpu_func or cpu_reproject_and_coadd
     return func(input_pairs, output_projection, shape_out, **kwargs)
+
+
+# --- GPU Percentiles, Hot-Pixels, and Background Map -------------------------
+def _percentiles_gpu(arr2d: np.ndarray, p_low: float, p_high: float) -> tuple[float, float]:
+    """Compute two percentiles on GPU; fall back to CPU if CuPy unavailable."""
+    if not gpu_is_available():
+        lo, hi = np.percentile(arr2d, [p_low, p_high])
+        return float(lo), float(hi)
+    import cupy as cp  # type: ignore
+    ensure_cupy_pool_initialized()
+    a = cp.asarray(arr2d)
+    lo = cp.percentile(a, p_low)
+    hi = cp.percentile(a, p_high)
+    return float(lo), float(hi)
+
+
+def detect_and_correct_hot_pixels_gpu(image,
+                                      threshold: float = 3.0,
+                                      neighborhood_size: int = 5,
+                                      progress_callback=None):
+    """GPU version of hot-pixel correction using median and local variance.
+
+    Works on HW or HWC images (float32 recommended). Falls back to CPU on error.
+    """
+    try:
+        if not gpu_is_available():
+            raise RuntimeError("GPU not available")
+        import cupy as cp  # type: ignore
+        from cupyx.scipy.ndimage import median_filter, uniform_filter  # type: ignore
+        ensure_cupy_pool_initialized()
+
+        if image is None:
+            return None
+        img = np.asarray(image, dtype=np.float32)
+        if img.ndim == 2:
+            img = img[:, :, None]
+        h, w, c = img.shape
+        k = int(neighborhood_size) if neighborhood_size % 2 == 1 else int(neighborhood_size + 1)
+        k = max(3, k)
+
+        out = np.empty_like(img, dtype=np.float32)
+        for ch in range(c):
+            g = cp.asarray(img[..., ch])
+            med = median_filter(g, size=k, mode="reflect")
+            mean = uniform_filter(g, size=k)
+            mean_sq = uniform_filter(g * g, size=k)
+            var = cp.maximum(mean_sq - mean * mean, 0.0)
+            std = cp.sqrt(var)
+            # floor the std to avoid zero-division; choose a small epsilon relative to dynamic range
+            eps = cp.maximum(1e-5, 1e-5 * cp.nanmax(cp.abs(g)))
+            std = cp.maximum(std, eps)
+            hot = g > (med + threshold * std)
+            g_corr = cp.where(hot, med, g)
+            out[..., ch] = cp.asnumpy(g_corr.astype(cp.float32))
+
+        if out.shape[2] == 1:
+            out = out[..., 0]
+        return out
+    except Exception:
+        # Fallback to CPU implementation
+        return detect_and_correct_hot_pixels(image, threshold=threshold,
+                                             neighborhood_size=neighborhood_size,
+                                             progress_callback=progress_callback)
+
+
+def estimate_background_map_gpu(image,
+                                method: str = "gaussian",
+                                sigma: float = 32.0,
+                                progress_callback=None) -> np.ndarray:
+    """Compute a smooth background map on GPU and return it on CPU.
+
+    - method: currently supports 'gaussian' (cupyx.scipy.ndimage.gaussian_filter)
+    - sigma: Gaussian sigma in pixels; typical 16–64 for wide background.
+    """
+    try:
+        if not gpu_is_available():
+            raise RuntimeError("GPU not available")
+        import cupy as cp  # type: ignore
+        from cupyx.scipy.ndimage import gaussian_filter  # type: ignore
+        ensure_cupy_pool_initialized()
+
+        img = np.asarray(image, dtype=np.float32)
+        is_color = img.ndim == 3 and img.shape[-1] == 3
+        if not is_color:
+            g = cp.asarray(img)
+            bg = gaussian_filter(g, sigma=float(sigma))
+            return cp.asnumpy(bg.astype(cp.float32))
+        else:
+            bg = np.empty_like(img, dtype=np.float32)
+            for ch in range(3):
+                g = cp.asarray(img[..., ch])
+                b = gaussian_filter(g, sigma=float(sigma))
+                bg[..., ch] = cp.asnumpy(b.astype(cp.float32))
+            return bg
+    except Exception:
+        # CPU fallback using OpenCV Gaussian blur as a coarse approximation
+        try:
+            k = max(3, int(2 * round(float(sigma) * 1.5) + 1))
+            if image.ndim == 2:
+                return cv2.GaussianBlur(image.astype(np.float32), (k, k), sigmaX=float(sigma))
+            else:
+                out = np.empty_like(image, dtype=np.float32)
+                for ch in range(image.shape[-1]):
+                    out[..., ch] = cv2.GaussianBlur(image[..., ch].astype(np.float32), (k, k), sigmaX=float(sigma))
+                return out
+        except Exception:
+            # As a last resort, return zeros so subtraction is a no-op
+            return np.zeros_like(image, dtype=np.float32)
+
+
+def stretch_auto_asifits_like_gpu(img_hwc_adu,
+                                  p_low: float = 0.5,
+                                  p_high: float = 99.8,
+                                  asinh_a: float = 0.01,
+                                  apply_wb: bool = True) -> np.ndarray:
+    """GPU variant of stretch_auto_asifits_like; falls back to CPU on error."""
+    try:
+        if not gpu_is_available():
+            raise RuntimeError("GPU not available")
+        import cupy as cp  # type: ignore
+        ensure_cupy_pool_initialized()
+        img = np.asarray(img_hwc_adu, dtype=np.float32)
+        out = np.empty_like(img, dtype=np.float32)
+        for c in range(3):
+            chan = cp.asarray(img[..., c])
+            vmin = cp.percentile(chan, p_low)
+            vmax = cp.percentile(chan, p_high)
+            if float(vmax - vmin) < 1e-3:
+                out[..., c] = 0.0
+                continue
+            normed = cp.clip((chan - vmin) / cp.maximum(vmax - vmin, 1e-6), 0, 1)
+            stretched = cp.arcsinh(normed / asinh_a) / cp.arcsinh(1.0 / asinh_a)
+            if float(cp.nanmax(stretched)) < 0.05:
+                stretched = normed
+            out[..., c] = cp.asnumpy(stretched.astype(cp.float32))
+        if apply_wb:
+            avg = out.mean(axis=(0, 1))
+            m = float(np.max(avg)) if np.all(np.isfinite(avg)) else 0.0
+            if m > 0:
+                avg /= m
+            else:
+                avg = np.ones_like(avg)
+            for c in range(3):
+                d = float(avg[c]) if np.isfinite(avg[c]) and avg[c] > 1e-8 else 1.0
+                out[..., c] = out[..., c] / d
+        return np.clip(out, 0, 1).astype(np.float32)
+    except Exception:
+        return stretch_auto_asifits_like(img_hwc_adu, p_low=p_low, p_high=p_high, asinh_a=asinh_a, apply_wb=apply_wb)
 
 
 

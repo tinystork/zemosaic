@@ -856,6 +856,16 @@ def get_wcs_and_pretreat_raw_file(
     if solver_settings is None:
         solver_settings = {}
 
+    # Charger configuration pour options de prétraitement (si disponible)
+    _cfg_pre = {}
+    try:
+        if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
+            _cfg_pre = zemosaic_config.load_config() or {}
+    except Exception:
+        _cfg_pre = {}
+    _bg_gpu_enabled = bool(_cfg_pre.get("preprocess_remove_background_gpu", False))
+    _bg_sigma = float(_cfg_pre.get("preprocess_background_sigma", 24.0))
+
     _pcb_local(f"GetWCS_Pretreat: Début pour '{filename}'.", lvl="DEBUG_DETAIL") # Niveau DEBUG_DETAIL pour être moins verbeux
 
     hp_mask_path = None
@@ -924,29 +934,68 @@ def get_wcs_and_pretreat_raw_file(
         _pcb_local("getwcs_error_shape_after_debayer_final_check", lvl="ERROR", filename=filename, shape=str(img_data_processed_adu.shape))
         return None, None, None, None
 
-    # --- Correction Hot Pixels ---
+    # --- Correction Hot Pixels + optional GPU background smoothing ---
     _pcb_local(f"  Correction HP pour '{filename}'...", lvl="DEBUG_DETAIL")
     if hotpix_mask_dir:
         os.makedirs(hotpix_mask_dir, exist_ok=True)
         hp_mask_path = os.path.join(hotpix_mask_dir, f"hp_mask_{os.path.splitext(filename)[0]}_{uuid.uuid4().hex}.npy")
-    if 'save_mask_path' in zemosaic_utils.detect_and_correct_hot_pixels.__code__.co_varnames:
-        img_data_hp_corrected_adu = zemosaic_utils.detect_and_correct_hot_pixels(
-            img_data_processed_adu,
-            3.0,
-            5,
-            progress_callback=progress_callback,
-            save_mask_path=hp_mask_path,
-        )
-    else:
-        img_data_hp_corrected_adu = zemosaic_utils.detect_and_correct_hot_pixels(
-            img_data_processed_adu,
-            3.0,
-            5,
-            progress_callback=progress_callback,
-        )
-    if img_data_hp_corrected_adu is not None: 
+
+    img_data_hp_corrected_adu = None
+    try:
+        # Prefer GPU hot-pixel correction when available
+        if hasattr(zemosaic_utils, 'detect_and_correct_hot_pixels_gpu') and zemosaic_utils.gpu_is_available():
+            img_data_hp_corrected_adu = zemosaic_utils.detect_and_correct_hot_pixels_gpu(
+                img_data_processed_adu,
+                threshold=3.0,
+                neighborhood_size=5,
+                progress_callback=progress_callback,
+            )
+        else:
+            raise RuntimeError('GPU HP not available')
+    except Exception:
+        if 'save_mask_path' in zemosaic_utils.detect_and_correct_hot_pixels.__code__.co_varnames:
+            img_data_hp_corrected_adu = zemosaic_utils.detect_and_correct_hot_pixels(
+                img_data_processed_adu,
+                3.0,
+                5,
+                progress_callback=progress_callback,
+                save_mask_path=hp_mask_path,
+            )
+        else:
+            img_data_hp_corrected_adu = zemosaic_utils.detect_and_correct_hot_pixels(
+                img_data_processed_adu,
+                3.0,
+                5,
+                progress_callback=progress_callback,
+            )
+
+    if img_data_hp_corrected_adu is not None:
         img_data_processed_adu = img_data_hp_corrected_adu
-    else: _pcb_local("getwcs_warn_hp_returned_none_using_previous", lvl="WARN", filename=filename)
+    else:
+        _pcb_local("getwcs_warn_hp_returned_none_using_previous", lvl="WARN", filename=filename)
+
+    # Optional GPU background smoothing (stabilize inter-batch photometry)
+    # IMPORTANT: remove only the low-frequency GRADIENT (bg - median(bg)) to avoid truncating
+    # histogram at zero and avoid dark rings around stars. Do NOT hard-clip to 0 here.
+    try:
+        if _bg_gpu_enabled and hasattr(zemosaic_utils, 'estimate_background_map_gpu') and zemosaic_utils.gpu_is_available():
+            bg = zemosaic_utils.estimate_background_map_gpu(img_data_processed_adu, method='gaussian', sigma=_bg_sigma)
+            if bg is not None and np.any(np.isfinite(bg)):
+                # Use luminance gradient so the subtraction is achromatic
+                if bg.ndim == 3 and bg.shape[-1] == 3:
+                    lum_bg = 0.299 * bg[..., 0].astype(np.float32) + 0.587 * bg[..., 1].astype(np.float32) + 0.114 * bg[..., 2].astype(np.float32)
+                else:
+                    lum_bg = bg.astype(np.float32)
+                med_lum = np.nanmedian(lum_bg) if np.any(np.isfinite(lum_bg)) else 0.0
+                grad = (lum_bg - med_lum).astype(np.float32)
+                if img_data_processed_adu.ndim == 3 and img_data_processed_adu.shape[-1] == 3:
+                    for c in range(3):
+                        img_data_processed_adu[..., c] = img_data_processed_adu[..., c].astype(np.float32) - grad
+                else:
+                    img_data_processed_adu = img_data_processed_adu.astype(np.float32) - grad
+                _pcb_local("  Background luminance gradient removed (achromatic), no hard clipping.", lvl="DEBUG_DETAIL")
+    except Exception:
+        pass
 
     # --- Résolution WCS ---
     _pcb_local(f"  Résolution WCS pour '{filename}'...", lvl="DEBUG_DETAIL")
@@ -1333,6 +1382,7 @@ def create_master_tile(
             radial_shape_power=radial_shape_power,
             winsor_max_workers=winsor_pool_workers,
             progress_callback=progress_callback,
+            zconfig=zconfig,
         )
     
     del valid_aligned_images; gc.collect() # valid_aligned_images a été passé par valeur (copie de la liste)
@@ -2260,6 +2310,13 @@ def run_hierarchical_mosaic(
     use_gpu_phase5_flag = (
         use_gpu_phase5 and gpu_id_phase5 is not None and gpu_is_available()
     )
+    if use_gpu_phase5_flag and ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils:
+        try:
+            # Initialize CuPy memory pools on the selected device (index 0 under the mask)
+            if hasattr(zemosaic_utils, 'ensure_cupy_pool_initialized'):
+                zemosaic_utils.ensure_cupy_pool_initialized(0)
+        except Exception:
+            pass
     def _compute_phase_workers(base_workers: int, num_tasks: int, ratio: float = DEFAULT_PHASE_WORKER_RATIO) -> int:
         workers = max(1, int(base_workers * ratio))
         if num_tasks > 0:
@@ -3071,13 +3128,23 @@ def run_hierarchical_mosaic(
                                       # Un 'a' de 10 comme dans ton code de test est très doux. Essayons 0.5 ou 1.0.
                 preview_asinh_a = 20.0 # Test avec une valeur plus douce pour le 'a' de asinh
 
-                m_stretched = zemosaic_utils.stretch_auto_asifits_like(
-                    final_mosaic_data_HWC,
-                    p_low=preview_p_low,
-                    p_high=preview_p_high,
-                    asinh_a=preview_asinh_a,
-                    apply_wb=True  # Applique une balance des blancs automatique
-                )
+                # Prefer GPU stretch when GPU is enabled/available
+                if use_gpu_phase5_flag and hasattr(zemosaic_utils, 'stretch_auto_asifits_like_gpu'):
+                    m_stretched = zemosaic_utils.stretch_auto_asifits_like_gpu(
+                        final_mosaic_data_HWC,
+                        p_low=preview_p_low,
+                        p_high=preview_p_high,
+                        asinh_a=preview_asinh_a,
+                        apply_wb=True,
+                    )
+                else:
+                    m_stretched = zemosaic_utils.stretch_auto_asifits_like(
+                        final_mosaic_data_HWC,
+                        p_low=preview_p_low,
+                        p_high=preview_p_high,
+                        asinh_a=preview_asinh_a,
+                        apply_wb=True  # Applique une balance des blancs automatique
+                    )
 
                 if m_stretched is not None:
                     img_u8 = (

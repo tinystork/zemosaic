@@ -113,7 +113,11 @@ class ZeMosaicGUI:
                 "radial_shape_power": 2.0,
                 "min_radial_weight_floor": 0.0, # Ajouté lors du test du plancher radial
                 "final_assembly_method": "reproject_coadd",
-                "num_processing_workers": 0 # 0 pour auto, anciennement -1
+                "num_processing_workers": 0, # 0 pour auto, anciennement -1
+                # Prétraitement GPU (facultatif) : suppression du gradient de fond
+                # DÉSACTIVÉE par défaut pour conserver le rendu antérieur
+                "preprocess_remove_background_gpu": False,
+                "preprocess_background_sigma": 24.0
             }
 
         # --- GPU Detection helper ---
@@ -870,7 +874,7 @@ class ZeMosaicGUI:
             # print("DEBUG GUI: Root window non existante dans _update_ui_language.")
             return
 
-        self.root.title(self._tr("window_title", "ZeMosaic V2.0 - Hierarchical Mosaicker"))
+        self.root.title(self._tr("window_title", "ZeMosaic V2.5 - Hierarchical Mosaicker"))
 
         # Traduction des widgets standards (Labels, Buttons, Titres de Frames, Onglets etc.)
         for key, widget_info in self.translatable_widgets.items():
