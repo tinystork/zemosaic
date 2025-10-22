@@ -3,7 +3,7 @@ Optional GUI filter for ZeMosaic Phase 1 results.
 
 This module exposes a single function:
 
-    launch_filter_interface(raw_files_with_wcs: list[dict]) -> list[dict]
+    launch_filter_interface(raw_files_with_wcs: list[dict]) -> tuple[list[dict], bool]
 
 It opens a small Tkinter window with a schematic sky map (RA/Dec, in degrees)
 showing the footprint of each WCS-resolved image as a polygon and a checkbox
@@ -14,6 +14,8 @@ Safety requirements:
 - If this module is missing or raises, the caller should continue unchanged.
 - If the window is closed or any error occurs, the original input list is
   returned unchanged.
+  In that case this function returns (original_list, False) so the caller can
+  decide to abort processing.
 
 Dependencies limited to tkinter, astropy, matplotlib, numpy; all optional.
 """
@@ -28,7 +30,7 @@ import datetime
 import importlib
 
 
-def launch_filter_interface(raw_files_with_wcs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def launch_filter_interface(raw_files_with_wcs: List[Dict[str, Any]]):
     """
     Display an optional Tkinter GUI to filter WCS-resolved images.
 
@@ -45,13 +47,13 @@ def launch_filter_interface(raw_files_with_wcs: List[Dict[str, Any]]) -> List[Di
 
     Returns
     -------
-    list[dict]
-        The filtered list (or the original list if no filtering performed or
-        if the user closes the window).
+    tuple[list[dict], bool]
+        (filtered_list, accepted) where accepted is True only when Validate is
+        clicked; False when Cancel is clicked or the window is closed.
     """
     # Early validation and fail-safe behavior
     if not isinstance(raw_files_with_wcs, list) or not raw_files_with_wcs:
-        return raw_files_with_wcs
+        return raw_files_with_wcs, False
 
     try:
         # --- Optional localization support (autonomous fallback) ---
@@ -202,7 +204,7 @@ def launch_filter_interface(raw_files_with_wcs: List[Dict[str, Any]]) -> List[Di
 
         # If virtually nothing to display, skip GUI
         if not any((it.center is not None) for it in items):
-            return raw_files_with_wcs
+            return raw_files_with_wcs, False
 
         # Compute robust global center via unit-vector average
         def average_skycoord(coords: list[SkyCoord]) -> SkyCoord:
@@ -256,6 +258,82 @@ def launch_filter_interface(raw_files_with_wcs: List[Dict[str, Any]]) -> List[Di
         canvas = FigureCanvasTkAgg(fig, master=main)
         canvas_widget = canvas.get_tk_widget()
         canvas_widget.grid(row=0, column=0, sticky="nsew")
+
+        # Enable mouse-wheel zoom on the plot for easier selection
+        def _setup_wheel_zoom(ax):
+            base_scale = 1.2  # zoom factor per wheel notch
+
+            def _orient_limits(lims):
+                a, b = lims
+                inv = a > b
+                mn, mx = (b, a) if inv else (a, b)
+                return mn, mx, inv
+
+            def _apply_limits(ax, xmin, xmax, xinv, ymin, ymax, yinv):
+                if xinv:
+                    ax.set_xlim(xmax, xmin)
+                else:
+                    ax.set_xlim(xmin, xmax)
+                if yinv:
+                    ax.set_ylim(ymax, ymin)
+                else:
+                    ax.set_ylim(ymin, ymax)
+
+            def on_scroll(event):
+                try:
+                    if event is None or event.inaxes is None:
+                        return
+                    ax_ = event.inaxes
+                    xdata = event.xdata if event.xdata is not None else sum(ax_.get_xlim()) / 2.0
+                    ydata = event.ydata if event.ydata is not None else sum(ax_.get_ylim()) / 2.0
+
+                    xmin0, xmax0, xinv = _orient_limits(ax_.get_xlim())
+                    ymin0, ymax0, yinv = _orient_limits(ax_.get_ylim())
+                    width = max(1e-9, (xmax0 - xmin0))
+                    height = max(1e-9, (ymax0 - ymin0))
+
+                    # Choose scale direction
+                    if getattr(event, 'button', 'up') in ('up', 4):
+                        # zoom in
+                        scale = 1.0 / base_scale
+                    else:
+                        # zoom out
+                        scale = base_scale
+
+                    new_w = width * scale
+                    new_h = height * scale
+
+                    # Compute relative position of mouse within current view
+                    # using oriented (min->max) extents
+                    relx = (xdata - xmin0) / max(1e-12, width)
+                    rely = (ydata - ymin0) / max(1e-12, height)
+                    relx = min(max(relx, 0.0), 1.0)
+                    rely = min(max(rely, 0.0), 1.0)
+
+                    xmin = xdata - relx * new_w
+                    xmax = xdata + (1.0 - relx) * new_w
+                    ymin = ydata - rely * new_h
+                    ymax = ydata + (1.0 - rely) * new_h
+
+                    # Avoid zero-span
+                    if (xmax - xmin) < 1e-9:
+                        pad = 5e-10
+                        xmin -= pad; xmax += pad
+                    if (ymax - ymin) < 1e-9:
+                        pad = 5e-10
+                        ymin -= pad; ymax += pad
+
+                    _apply_limits(ax_, xmin, xmax, xinv, ymin, ymax, yinv)
+                    canvas.draw_idle()
+                except Exception:
+                    pass
+
+            try:
+                canvas.mpl_connect('scroll_event', on_scroll)
+            except Exception:
+                pass
+
+        _setup_wheel_zoom(ax)
 
         # Right panel with controls
         right = ttk.Frame(main)
@@ -334,6 +412,42 @@ def launch_filter_interface(raw_files_with_wcs: List[Dict[str, Any]]) -> List[Di
         canvas_list.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
 
+        # Enable mouse-wheel scrolling over the right list (Windows/Linux/macOS)
+        def _on_list_mousewheel(event):
+            try:
+                if getattr(event, 'num', None) == 4:  # Linux scroll up
+                    canvas_list.yview_scroll(-1, "units")
+                elif getattr(event, 'num', None) == 5:  # Linux scroll down
+                    canvas_list.yview_scroll(1, "units")
+                else:  # Windows / macOS
+                    delta = int(-1 * (event.delta / 120)) if getattr(event, 'delta', 0) else 0
+                    if delta != 0:
+                        canvas_list.yview_scroll(delta, "units")
+            except Exception:
+                pass
+
+        def _bind_list_mousewheel(_):
+            try:
+                canvas_list.bind_all("<MouseWheel>", _on_list_mousewheel)
+                canvas_list.bind_all("<Button-4>", _on_list_mousewheel)
+                canvas_list.bind_all("<Button-5>", _on_list_mousewheel)
+            except Exception:
+                pass
+
+        def _unbind_list_mousewheel(_):
+            try:
+                canvas_list.unbind_all("<MouseWheel>")
+                canvas_list.unbind_all("<Button-4>")
+                canvas_list.unbind_all("<Button-5>")
+            except Exception:
+                pass
+
+        # Bind/unbind on enter/leave so the wheel affects only this list
+        inner.bind("<Enter>", _bind_list_mousewheel)
+        inner.bind("<Leave>", _unbind_list_mousewheel)
+        canvas_list.bind("<Enter>", _bind_list_mousewheel)
+        canvas_list.bind("<Leave>", _unbind_list_mousewheel)
+
         # Selection helpers
         actions = ttk.Frame(right)
         actions.grid(row=2, column=0, sticky="ew", padx=5, pady=5)
@@ -394,6 +508,8 @@ def launch_filter_interface(raw_files_with_wcs: List[Dict[str, Any]]) -> List[Di
         check_vars: list[tk.BooleanVar] = []
         patches: list[Polygon] = []
         center_pts: list[Any] = []  # matplotlib line2D handles
+        # Map matplotlib artists back to item indices for click-to-select
+        artist_to_index: dict[Any, int] = {}
 
         ref_ra = float(global_center.ra.to(u.deg).value)
         ref_dec = float(global_center.dec.to(u.deg).value)
@@ -424,15 +540,22 @@ def launch_filter_interface(raw_files_with_wcs: List[Dict[str, Any]]) -> List[Di
                 ra_wrapped = [wrap_ra_deg(float(ra), ref_ra) for ra in it.footprint[:, 0].tolist()]
                 decs = it.footprint[:, 1].tolist()
                 poly = Polygon(list(zip(ra_wrapped, decs)), closed=True, fill=False, edgecolor=color_sel, linewidth=1.0, alpha=0.9)
+                # Allow selection by clicking inside the footprint on the plot
+                try:
+                    poly.set_picker(True)
+                except Exception:
+                    pass
                 patches.append(poly)
                 ax.add_patch(poly)
+                artist_to_index[poly] = idx
                 all_ra_vals.extend(ra_wrapped)
                 all_dec_vals.extend(decs)
             elif it.center is not None:
                 ra_c = wrap_ra_deg(float(it.center.ra.to(u.deg).value), ref_ra)
                 dec_c = float(it.center.dec.to(u.deg).value)
-                ln, = ax.plot([ra_c], [dec_c], marker="o", markersize=3, color=color_sel, alpha=0.9)
+                ln, = ax.plot([ra_c], [dec_c], marker="o", markersize=3, color=color_sel, alpha=0.9, picker=8)
                 center_pts.append(ln)
+                artist_to_index[ln] = idx
                 all_ra_vals.append(ra_c)
                 all_dec_vals.append(dec_c)
             else:
@@ -465,6 +588,27 @@ def launch_filter_interface(raw_files_with_wcs: List[Dict[str, Any]]) -> List[Di
             canvas.draw_idle()
 
         update_visuals()
+
+        # Click-to-select/deselect via matplotlib pick events
+        def _on_pick(event):
+            try:
+                artist = getattr(event, 'artist', None)
+                if artist is None:
+                    return
+                i = artist_to_index.get(artist)
+                if i is None:
+                    return
+                # Toggle associated checkbox and refresh colors
+                curr = check_vars[i].get()
+                check_vars[i].set(not curr)
+                update_visuals(i)
+            except Exception:
+                pass
+
+        try:
+            canvas.mpl_connect('pick_event', _on_pick)
+        except Exception:
+            pass
 
         # On window close: treat as cancel (keep all)
         def on_close():
@@ -551,18 +695,17 @@ def launch_filter_interface(raw_files_with_wcs: List[Dict[str, Any]]) -> List[Di
                         # Non-fatal: keep going
                         print(f"WARN filter_gui: Failed to move '{src_path}' -> filtered_by_user: {e}")
 
-            return [raw_files_with_wcs[i] for i in sel]
+            return [raw_files_with_wcs[i] for i in sel], True
         else:
             # Keep all if canceled or closed
-            return raw_files_with_wcs
+            return raw_files_with_wcs, False
 
     except ImportError:
         # Any optional dependency missing — silently keep all
-        return raw_files_with_wcs
+        return raw_files_with_wcs, False
     except Exception:
         # Any unexpected error — fail safe and keep all
-        return raw_files_with_wcs
+        return raw_files_with_wcs, False
 
 
 __all__ = ["launch_filter_interface"]
-

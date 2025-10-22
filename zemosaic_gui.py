@@ -855,6 +855,11 @@ class ZeMosaicGUI:
         button_bar = ttk.Frame(self.scrollable_content_frame)
         button_bar.pack(pady=15)
 
+        # New: Open Filter button (does not start processing)
+        self.open_filter_button = ttk.Button(button_bar, text="", command=self._open_filter_only)
+        self.open_filter_button.pack(side=tk.LEFT, padx=(0, 10), ipady=5)
+        self.translatable_widgets["open_filter_button"] = self.open_filter_button
+
         self.launch_button = ttk.Button(button_bar, text="", command=self._start_processing, style="Accent.TButton")
         self.launch_button.pack(side=tk.LEFT, padx=(0, 10), ipady=5)
         self.translatable_widgets["launch_button"] = self.launch_button
@@ -868,6 +873,10 @@ class ZeMosaicGUI:
         if not ZEMOSAIC_WORKER_AVAILABLE:
             self.launch_button.config(state=tk.DISABLED)
             self.stop_button.config(state=tk.DISABLED)
+            try:
+                self.open_filter_button.config(state=tk.DISABLED)
+            except Exception:
+                pass
         try: style = ttk.Style(); style.configure("Accent.TButton", font=('Segoe UI', 10, 'bold'), padding=5)
         except tk.TclError: print("AVERT GUI: Style 'Accent.TButton' non disponible.")
 
@@ -1146,6 +1155,133 @@ class ZeMosaicGUI:
         if dir_path: self.astap_data_dir_var.set(dir_path)
 
 
+    def _open_filter_only(self):
+        """Open the optional filter UI without starting the processing.
+
+        - Scans the current input folder for FITS files (recursively)
+        - Builds lightweight header items (path, WCS/shape/center when possible)
+        - Launches zemosaic_filter_gui.launch_filter_interface
+        - Applies any file moves performed by the filter; does NOT start worker
+        """
+        if self.is_processing:
+            messagebox.showwarning(self._tr("processing_in_progress_title"), self._tr("processing_already_running_warning"), parent=self.root)
+            return
+
+        input_dir = self.input_dir_var.get().strip()
+        if not (input_dir and os.path.isdir(input_dir)):
+            messagebox.showerror(self._tr("error_title"), self._tr("invalid_input_folder_error"), parent=self.root)
+            return
+
+        # Collect FITS paths deterministically
+        fits_paths = []
+        for r, _dirs, files in os.walk(input_dir):
+            try:
+                files = sorted(files, key=lambda s: s.lower())
+            except Exception:
+                files = list(files)
+            for fn in files:
+                if fn.lower().endswith((".fit", ".fits")):
+                    fits_paths.append(os.path.join(r, fn))
+        try:
+            fits_paths.sort(key=lambda p: p.lower())
+        except Exception:
+            fits_paths.sort()
+
+        if not fits_paths:
+            messagebox.showwarning(self._tr("error_title"), self._tr("run_error_no_fits_found_input", "No FITS files found in input folder."), parent=self.root)
+            return
+
+        # Lightweight header scan (subset of worker logic)
+        header_items = []
+        try:
+            from astropy.io import fits
+            from astropy.wcs import WCS
+            from astropy.coordinates import SkyCoord
+            import astropy.units as u
+        except Exception:
+            # Launch filter anyway; it will fail-safe and return unchanged
+            fits = None; WCS = None; SkyCoord = None; u = None
+
+        for i, fpath in enumerate(fits_paths):
+            hdr = None; wcs0 = None; shp_hw = None; center_sc = None
+            try:
+                if fits is not None:
+                    hdr = fits.getheader(fpath, 0)
+                    try:
+                        nax1 = int(hdr.get("NAXIS1", 0)); nax2 = int(hdr.get("NAXIS2", 0))
+                        if nax1 > 0 and nax2 > 0:
+                            shp_hw = (nax2, nax1)
+                    except Exception:
+                        shp_hw = None
+                    try:
+                        w = WCS(hdr, naxis=2, relax=True) if WCS is not None else None
+                        if w and getattr(w, "is_celestial", False):
+                            wcs0 = w
+                    except Exception:
+                        wcs0 = None
+                    if wcs0 is None and hdr is not None and SkyCoord is not None and u is not None:
+                        try:
+                            crval = getattr(getattr(wcs0, 'wcs', None), 'crval', None)
+                            if crval is None and hdr is not None:
+                                ra = hdr.get('CRVAL1'); dec = hdr.get('CRVAL2')
+                                if ra is not None and dec is not None:
+                                    center_sc = SkyCoord(float(ra) * u.deg, float(dec) * u.deg, frame='icrs')
+                        except Exception:
+                            center_sc = None
+            except Exception:
+                pass
+            item = {"path": fpath, "index": i}
+            if hdr is not None:
+                item["header"] = hdr
+            if shp_hw is not None:
+                item["shape"] = shp_hw
+            if wcs0 is not None:
+                item["wcs"] = wcs0
+            if center_sc is not None:
+                item["center"] = center_sc
+            header_items.append(item)
+
+        # Import filter UI lazily and launch
+        try:
+            try:
+                from .zemosaic_filter_gui import launch_filter_interface
+            except Exception:
+                from zemosaic_filter_gui import launch_filter_interface
+        except Exception:
+            messagebox.showerror(self._tr("critical_error_title"), "Filter UI not available.", parent=self.root)
+            return
+
+        try:
+            result = launch_filter_interface(header_items)
+        except Exception as e:
+            self._log_message(f"[ZGUI] Filter UI error: {e}", level="WARN")
+            return
+
+        # Support both legacy (list) and new (list, accepted)
+        accepted = True; filtered_list = None
+        if isinstance(result, tuple) and len(result) >= 1:
+            filtered_list = result[0]
+            if len(result) >= 2:
+                try: accepted = bool(result[1])
+                except Exception: accepted = True
+        else:
+            filtered_list = result
+
+        # Log a small message; do not start processing
+        if accepted:
+            try:
+                kept = len(filtered_list) if isinstance(filtered_list, list) else 0
+                total = len(header_items)
+                self._log_message(self._tr("info", "Info"), level="INFO_DETAIL")
+                self._log_message(f"[ZGUI] Filter validated: kept {kept}/{total}. No processing started.", level="INFO_DETAIL")
+            except Exception:
+                pass
+        else:
+            # Mark cancelled to ensure GUI end-of-run messages behave consistently if used as pre-run stage
+            self._cancel_requested = True
+            self._log_message("log_key_processing_cancelled", level="WARN")
+
+
 
 # DANS zemosaic_gui.py
 # DANS la classe ZeMosaicGUI
@@ -1223,6 +1359,13 @@ class ZeMosaicGUI:
                 is_control_message = True
             # --- FIN AJOUT ---
         
+        # If worker signals cancellation, reflect it locally
+        try:
+            if isinstance(message_key_or_raw, str) and message_key_or_raw == "log_key_processing_cancelled":
+                self._cancel_requested = True
+        except Exception:
+            pass
+
         if is_control_message:
             return # Ne pas traiter plus loin ces messages de contrôle
 

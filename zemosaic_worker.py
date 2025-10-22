@@ -2643,7 +2643,25 @@ def run_hierarchical_mosaic(
         # Attempt to launch optional filter GUI on header-only items
         try:
             from zemosaic_filter_gui import launch_filter_interface
-            filtered_items = launch_filter_interface(header_items_for_filter)
+            filter_ret = launch_filter_interface(header_items_for_filter)
+            # New API: (filtered_items, accepted). Back-compat: may return only list.
+            accepted = True
+            filtered_items = None
+            if isinstance(filter_ret, tuple) and len(filter_ret) >= 1:
+                filtered_items = filter_ret[0]
+                if len(filter_ret) >= 2:
+                    try:
+                        accepted = bool(filter_ret[1])
+                    except Exception:
+                        accepted = True
+            else:
+                filtered_items = filter_ret
+
+            # If user cancelled/closed the filter UI, abort the run gracefully
+            if not accepted:
+                pcb("log_key_processing_cancelled", prog=None, lvl="WARN")
+                return
+
             # Guardrails: if UI returned nothing usable, keep original list
             if filtered_items and isinstance(filtered_items, list):
                 sel_paths = set()

@@ -527,8 +527,22 @@ def align_images_in_group(image_data_list: list,
                     _pcb(f"AlignGroup: FFT shift applied (dy={dy}, dx={dx}, conf={conf:.2f}).", lvl="DEBUG_DETAIL")
                     continue
             # Fall back to astroalign for fine/affine alignment
+            # Garantir des buffers writables/contigus pour astroalign afin d'éviter
+            # "ValueError: buffer source array is read-only" avec des memmaps read-only
+            src_for_aa = (
+                source_image_adu if (getattr(source_image_adu, 'flags', None)
+                                     and source_image_adu.flags.writeable
+                                     and source_image_adu.flags.c_contiguous)
+                else np.array(source_image_adu, dtype=np.float32, copy=True, order='C')
+            )
+            ref_for_aa = (
+                reference_image_adu if (getattr(reference_image_adu, 'flags', None)
+                                        and reference_image_adu.flags.writeable
+                                        and reference_image_adu.flags.c_contiguous)
+                else np.array(reference_image_adu, dtype=np.float32, copy=True, order='C')
+            )
             aligned_image_output, footprint_mask = astroalign_module.register(
-                source=source_image_adu, target=reference_image_adu,
+                source=src_for_aa, target=ref_for_aa,
                 detection_sigma=detection_sigma, min_area=min_area,
                 propagate_mask=propagate_mask
             )
