@@ -108,6 +108,8 @@ class ZeMosaicGUI:
                 "stacking_kappa_high": 3.0,
                 "stacking_winsor_limits": "0.05,0.05",
                 "stacking_final_combine_method": "mean",
+                # Logging
+                "logging_level": "INFO",
                 "apply_radial_weight": False,
                 "radial_feather_fraction": 0.8,
                 "radial_shape_power": 2.0,
@@ -189,6 +191,10 @@ class ZeMosaicGUI:
         
         # --- Variable compteur tuile phase 3
         self.master_tile_count_var = tk.StringVar(value="") # Initialement vide
+        # Compteur de fichiers bruts traités pendant la Phase 1
+        self.file_count_var = tk.StringVar(value="")
+        # Indicateur de phase courante (texte traduit)
+        self.phase_var = tk.StringVar(value="")
         
         
         # --- Définition des listes de clés pour les ComboBoxes ---
@@ -278,6 +284,9 @@ class ZeMosaicGUI:
         self.auto_limit_frames_var = tk.BooleanVar(value=self.config.get("auto_limit_frames_per_master_tile", True))
         self.max_raw_per_tile_var = tk.IntVar(value=self.config.get("max_raw_per_master_tile", 0))
         self.use_gpu_phase5_var = tk.BooleanVar(value=self.config.get("use_gpu_phase5", False))
+        # Logging level var (keys are ERROR, WARN, INFO, DEBUG)
+        self.logging_level_keys = ["ERROR", "WARN", "INFO", "DEBUG"]
+        self.logging_level_var = tk.StringVar(value=str(self.config.get("logging_level", "INFO")).upper())
         self._gpus = _detect_gpus()
         self.gpu_selector_var = tk.StringVar(
             value=self.config.get("gpu_selector", self._gpus[0][0] if self._gpus else "")
@@ -799,6 +808,36 @@ class ZeMosaicGUI:
         self.use_gpu_phase5_var.trace_add("write", on_gpu_check)
         on_gpu_check()
 
+        # --- Logging Options Frame ---
+        self.logging_frame = ttk.LabelFrame(self.scrollable_content_frame, text=self._tr("gui_logging_title", "Logging"))
+        self.logging_frame.pack(fill=tk.X, pady=(0,10))
+        self.logging_frame.columnconfigure(1, weight=1)
+        ttk.Label(self.logging_frame, text=self._tr("gui_logging_level", "Logging level:")).grid(row=0, column=0, sticky="w", padx=5, pady=3)
+        # Display values localized, but store keys
+        level_display = [
+            self._tr("logging_level_error", "Error"),
+            self._tr("logging_level_warn", "Warn"),
+            self._tr("logging_level_info", "Info"),
+            self._tr("logging_level_debug", "Debug"),
+        ]
+        # Map key -> display
+        self._logging_level_display_map = dict(zip(self.logging_level_keys, level_display))
+        # Map display -> key
+        self._logging_level_reverse_map = {v: k for k, v in self._logging_level_display_map.items()}
+        self.logging_level_combo = ttk.Combobox(self.logging_frame, values=level_display, state="readonly", width=15)
+        # Set display according to current key
+        try:
+            self.logging_level_combo.set(self._logging_level_display_map.get(self.logging_level_var.get(), level_display[2]))
+        except Exception:
+            self.logging_level_combo.set(level_display[2])
+        def _on_logging_level_selected(event=None):
+            disp = self.logging_level_combo.get()
+            key = self._logging_level_reverse_map.get(disp, "INFO")
+            self.logging_level_var.set(key)
+        self.logging_level_combo.bind("<<ComboboxSelected>>", _on_logging_level_selected)
+        self.logging_level_combo.grid(row=0, column=1, sticky="w", padx=5, pady=3)
+
+        # --- Memmap Options Frame ---
         self.memmap_frame = ttk.LabelFrame(self.scrollable_content_frame, text=self._tr("gui_memmap_title", "Options memmap (coadd)"))
         self.memmap_frame.pack(fill=tk.X, pady=(0,10))
         self.memmap_frame.columnconfigure(1, weight=1)
@@ -850,6 +889,19 @@ class ZeMosaicGUI:
 
         self.master_tile_count_label_widget = ttk.Label(time_display_subframe,textvariable=self.master_tile_count_var,font=("Segoe UI", 9, "bold"), width=12 )# Un peu plus large pour "XXX / XXX"    
         self.master_tile_count_label_widget.pack(side=tk.LEFT, padx=(0,5))
+
+        # Afficher aussi un compteur de fichiers bruts pour la Phase 1
+        files_text_label = ttk.Label(time_display_subframe, text=self._tr("files_text_label", "Files remaining:"))
+        files_text_label.pack(side=tk.LEFT, padx=(10,2))
+        self.translatable_widgets["files_text_label"] = files_text_label
+        self.file_count_label_widget = ttk.Label(time_display_subframe, textvariable=self.file_count_var, font=("Segoe UI", 9, "bold"), width=12)
+        self.file_count_label_widget.pack(side=tk.LEFT, padx=(0,5))
+        # Indicateur de phase courante
+        phase_text_label = ttk.Label(time_display_subframe, text=self._tr("phase_text_label", "Phase:"))
+        phase_text_label.pack(side=tk.LEFT, padx=(10,2))
+        self.translatable_widgets["phase_text_label"] = phase_text_label
+        self.phase_label_widget = ttk.Label(time_display_subframe, textvariable=self.phase_var, font=("Segoe UI", 9, "bold"))
+        self.phase_label_widget.pack(side=tk.LEFT, padx=(0,5))
         log_frame = ttk.LabelFrame(self.scrollable_content_frame, text="", padding="10")
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(5,5)); self.translatable_widgets["log_frame_title"] = log_frame
         self.log_text = tk.Text(log_frame, wrap=tk.WORD, height=10, state=tk.DISABLED, font=("Consolas", 9))
@@ -877,7 +929,7 @@ class ZeMosaicGUI:
             # print("DEBUG GUI: Root window non existante dans _update_ui_language.")
             return
 
-        self.root.title(self._tr("window_title", "ZeMosaic V2.5 - Hierarchical Mosaicker"))
+        self.root.title(self._tr("window_title", "ZeMosaic V2.7 - Hierarchical Mosaicker"))
 
         # Traduction des widgets standards (Labels, Buttons, Titres de Frames, Onglets etc.)
         for key, widget_info in self.translatable_widgets.items():
@@ -1121,6 +1173,25 @@ class ZeMosaicGUI:
             elif message_key_or_raw == "CHRONO_STOP_REQUEST":
                 if self.root.winfo_exists(): self.root.after_idle(self._stop_gui_chrono)
                 is_control_message = True
+            # --- Indicateur de phase courante ---
+            elif message_key_or_raw.startswith("PHASE_UPDATE:"):
+                phase_id = message_key_or_raw.split(":", 1)[1].strip()
+                def update_phase_label():
+                    try:
+                        phase_num = None
+                        if phase_id.isdigit():
+                            phase_num = int(phase_id)
+                        if phase_num is not None:
+                            phase_name = self._tr(f"phase_name_{phase_num}")
+                            display = self._tr("phase_display_format", "P{num} - {name}", num=phase_num, name=phase_name)
+                        else:
+                            display = str(phase_id)
+                        if hasattr(self.phase_var, 'set') and callable(self.phase_var.set):
+                            self.phase_var.set(display)
+                    except Exception:
+                        pass
+                if self.root.winfo_exists(): self.root.after_idle(update_phase_label)
+                is_control_message = True
             # --- AJOUT POUR INTERCEPTER MASTER_TILE_COUNT_UPDATE ---
             elif message_key_or_raw.startswith("MASTER_TILE_COUNT_UPDATE:"):
                 tile_count_string = message_key_or_raw.split(":", 1)[1]
@@ -1130,6 +1201,25 @@ class ZeMosaicGUI:
                             try: self.master_tile_count_var.set(tile_count_string)
                             except tk.TclError: pass # Ignorer si fenêtre détruite
                     if self.root.winfo_exists(): self.root.after_idle(update_tile_count_label)
+                is_control_message = True
+            # --- Compteur de fichiers bruts (Phase 1) ---
+            elif message_key_or_raw.startswith("RAW_FILE_COUNT_UPDATE:"):
+                files_count_string = message_key_or_raw.split(":", 1)[1]
+                # Convert "X/N" to remaining = N - X if possible
+                remaining_display = files_count_string
+                try:
+                    cur, tot = files_count_string.split("/")
+                    cur_i, tot_i = int(cur.strip()), int(tot.strip())
+                    remain = max(0, tot_i - cur_i)
+                    remaining_display = str(remain)
+                except Exception:
+                    pass
+                if hasattr(self, 'file_count_var') and self.file_count_var:
+                    def update_files_count_label():
+                        if hasattr(self.file_count_var, 'set') and callable(self.file_count_var.set):
+                            try: self.file_count_var.set(remaining_display)
+                            except tk.TclError: pass
+                    if self.root.winfo_exists(): self.root.after_idle(update_files_count_label)
                 is_control_message = True
             # --- FIN AJOUT ---
         
@@ -1402,6 +1492,10 @@ class ZeMosaicGUI:
         # Remise à zéro du compteur master-tiles
         if hasattr(self, "master_tile_count_var"):
             self.master_tile_count_var.set("")
+        if hasattr(self, "file_count_var"):
+            self.file_count_var.set("")
+        if hasattr(self, "phase_var"):
+            self.phase_var.set("")
         self.is_processing = True
         self._cancel_requested = False
         self.launch_button.config(state=tk.DISABLED)
@@ -1431,6 +1525,8 @@ class ZeMosaicGUI:
 
         self.config["winsor_worker_limit"] = self.winsor_workers_var.get()
         self.config["max_raw_per_master_tile"] = self.max_raw_per_tile_var.get()
+        # Persist logging level
+        self.config["logging_level"] = self.logging_level_var.get()
 
         self.config["use_gpu_phase5"] = self.use_gpu_phase5_var.get()
         sel = self.gpu_selector_var.get()
@@ -1474,6 +1570,7 @@ class ZeMosaicGUI:
             self.max_raw_per_tile_var.get(),
             self.use_gpu_phase5_var.get(),
             gpu_id,
+            self.logging_level_var.get(),
             asdict(self.solver_settings)
             # --- FIN NOUVEAUX ARGUMENTS ---
         )
@@ -1557,6 +1654,12 @@ class ZeMosaicGUI:
                 if hasattr(self, "master_tile_count_var"):
                     try: self.master_tile_count_var.set("")
                     except tk.TclError: pass
+                if hasattr(self, "file_count_var"):
+                    try: self.file_count_var.set("")
+                    except tk.TclError: pass
+                if hasattr(self, "phase_var"):
+                    try: self.phase_var.set("")
+                    except tk.TclError: pass
                 self._cancel_requested = False
             else:
                 self._log_message("log_key_processing_finished", level="INFO")
@@ -1565,6 +1668,10 @@ class ZeMosaicGUI:
                 # Nettoyage du compteur master-tiles affiché
                 if hasattr(self, "master_tile_count_var"):
                     self.master_tile_count_var.set("")
+                if hasattr(self, "file_count_var"):
+                    self.file_count_var.set("")
+                if hasattr(self, "phase_var"):
+                    self.phase_var.set("")
                 output_dir_final = self.output_dir_var.get()
                 if output_dir_final and os.path.isdir(output_dir_final):
                     if messagebox.askyesno(self._tr("q_open_output_folder_title"), self._tr("q_open_output_folder_msg", folder=output_dir_final), parent=self.root):

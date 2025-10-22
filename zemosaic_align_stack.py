@@ -1592,7 +1592,9 @@ def stack_aligned_images(
         current_img = img_adu 
         if current_img.dtype != np.float32:
             _pcb(f"StackImages: AVERT Image {idx} pas en float32 ({current_img.dtype}), conversion.", lvl="WARN")
-            current_img = current_img.astype(np.float32, copy=True)
+            current_img = current_img.astype(np.float32, copy=False)
+        if not current_img.flags.c_contiguous:
+            current_img = np.ascontiguousarray(current_img, dtype=np.float32)
         
         # Vérification des infinités DÈS LE DÉBUT
         if not np.all(np.isfinite(current_img)):

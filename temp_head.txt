@@ -1,0 +1,220 @@
+# zemosaic_gui.py
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import threading
+import multiprocessing
+import os
+import traceback
+import time
+import subprocess
+import sys
+
+try:
+    import wmi
+except ImportError:  # pragma: no cover - wmi may be unavailable on non Windows
+    wmi = None
+
+import importlib.util
+
+CUPY_AVAILABLE = importlib.util.find_spec("cupy") is not None
+cupy = None
+getDeviceProperties = None
+getDeviceCount = None
+
+try:
+    from PIL import Image, ImageTk # Importe depuis Pillow
+    PILLOW_AVAILABLE_FOR_ICON = True
+except ImportError:
+    PILLOW_AVAILABLE_FOR_ICON = False
+    print("AVERT GUI: Pillow (PIL) non installé. L'icône PNG ne peut pas être chargée.")
+# --- Import du module de localisation ---
+try:
+    from locales.zemosaic_localization import ZeMosaicLocalization
+    ZEMOSAIC_LOCALIZATION_AVAILABLE = True
+except ImportError as e_loc:
+    ZEMOSAIC_LOCALIZATION_AVAILABLE = False
+    ZeMosaicLocalization = None # Factice
+    print(f"ERREUR (zemosaic_gui): Impossible d'importer 'ZeMosaicLocalization': {e_loc}")
+
+# --- Configuration Import ---
+try:
+    import zemosaic_config 
+    ZEMOSAIC_CONFIG_AVAILABLE = True
+except ImportError as e_config:
+    ZEMOSAIC_CONFIG_AVAILABLE = False
+    zemosaic_config = None
+    print(f"AVERTISSEMENT (zemosaic_gui): 'zemosaic_config.py' non trouvé: {e_config}")
+
+# --- Worker Import ---
+try:
+    # Import worker from the same package so relative imports inside it work
+    from .zemosaic_worker import (
+        run_hierarchical_mosaic,
+        run_hierarchical_mosaic_process,
+    )
+    ZEMOSAIC_WORKER_AVAILABLE = True
+except ImportError as e_worker:
+    ZEMOSAIC_WORKER_AVAILABLE = False
+    run_hierarchical_mosaic = None
+    run_hierarchical_mosaic_process = None
+    print(f"ERREUR (zemosaic_gui): 'run_hierarchical_mosaic' non trouvé: {e_worker}")
+
+from dataclasses import asdict
+from .solver_settings import SolverSettings
+
+
+
+class ZeMosaicGUI:
+    def __init__(self, root_window):
+        self.root = root_window
+
+        # --- DÉFINIR L'ICÔNE DE LA FENÊTRE (AVEC .ICO NATIF) ---
+        try:
+            base_path = os.path.dirname(os.path.abspath(__file__))
+            icon_path = os.path.join(base_path, "icon", "zemosaic.ico")
+
+            if os.path.exists(icon_path):
+                self.root.iconbitmap(default=icon_path)
+            else:
+                print(f"AVERT GUI: Fichier d'icône ICO non trouvé à {icon_path}")
+        except tk.TclError:
+            print("AVERT GUI: Impossible de définir l'icône ICO (TclError).")
+        except Exception as e_icon:
+            print(f"AVERT GUI: Erreur lors de la définition de l'icône ICO: {e_icon}")
+        # --- FIN DÉFINITION ICÔNE ---
+
+
+        try:
+            self.root.geometry("750x780") # Légère augmentation pour le nouveau widget
+            self.root.minsize(700, 630) # Légère augmentation
+        except tk.TclError:
+            pass
+
+        self.config = {}
+        if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
+            self.config = zemosaic_config.load_config()
+        else:
+            # Dictionnaire de configuration de secours si zemosaic_config.py n'est pas trouvé
+            # ou si le chargement échoue.
+            self.config = { 
+                "astap_executable_path": "", "astap_data_directory_path": "",
+                "astap_default_search_radius": 3.0, "astap_default_downsample": 2,
+                "astap_default_sensitivity": 100, "language": "en",
+                "stacking_normalize_method": "none",
+                "stacking_weighting_method": "none",
+                "stacking_rejection_algorithm": "kappa_sigma",
+                "stacking_kappa_low": 3.0,
+                "stacking_kappa_high": 3.0,
+                "stacking_winsor_limits": "0.05,0.05",
+                "stacking_final_combine_method": "mean",
+                # Logging
+                "logging_level": "INFO",
+                "apply_radial_weight": False,
+                "radial_feather_fraction": 0.8,
+                "radial_shape_power": 2.0,
+                "min_radial_weight_floor": 0.0, # Ajouté lors du test du plancher radial
+                "final_assembly_method": "reproject_coadd",
+                "num_processing_workers": 0, # 0 pour auto, anciennement -1
+                # Prétraitement GPU (facultatif) : suppression du gradient de fond
+                # DÉSACTIVÉE par défaut pour conserver le rendu antérieur
+                "preprocess_remove_background_gpu": False,
+                "preprocess_background_sigma": 24.0,
+                # Valeur par défaut alignée avec le worker (0.08°)
+                "cluster_panel_threshold": 0.08
+            }
+
+        # --- GPU Detection helper ---
+        def _detect_gpus():
+            """Return a list of detected GPUs as ``(display_name, index)`` tuples.
+
+            Detection tries multiple methods so it works on Windows, Linux and
+            macOS without requiring the optional ``wmi`` module.
+            """
+
+            controllers = []
+            if wmi:
+                try:
+                    obj = wmi.WMI()
+                    controllers = [c.Name for c in obj.Win32_VideoController()]
+                except Exception:
+                    controllers = []
+
+            if not controllers:
+                try:
+                    out = subprocess.check_output(
+                        ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                        stderr=subprocess.STDOUT,
+                        text=True,
+                    )
+                    controllers = [l.strip() for l in out.splitlines() if l.strip()]
+                except Exception:
+                    controllers = []
+
+            nv_cuda = []
+            if CUPY_AVAILABLE:
+                try:
+                    import cupy
+                    from cupy.cuda.runtime import getDeviceCount, getDeviceProperties
+                    for i in range(getDeviceCount()):
+                        name = getDeviceProperties(i)["name"]
+                        if isinstance(name, bytes):
+                            name = name.decode()
+                        nv_cuda.append(name)
+                except Exception:
+                    nv_cuda = []
+
+            def _simplify(n: str) -> str:
+                return n.lower().replace("laptop gpu", "").strip()
+
+            simple_cuda = [_simplify(n) for n in nv_cuda]
+            gpus = []
+            for disp in controllers:
+                simp = _simplify(disp)
+                idx = simple_cuda.index(simp) if simp in simple_cuda else None
+                gpus.append((disp, idx))
+            if not gpus and nv_cuda:
+                gpus = [(name, idx) for idx, name in enumerate(nv_cuda)]
+
+            gpus.insert(0, ("CPU (no GPU)", None))
+            return gpus
+
+        default_lang_from_config = self.config.get("language", 'en')
+        if ZEMOSAIC_LOCALIZATION_AVAILABLE and ZeMosaicLocalization:
+            self.localizer = ZeMosaicLocalization(language_code=default_lang_from_config)
+        else:
+            class MockLocalizer:
+                def __init__(self, language_code='en'): self.language_code = language_code
+                def get(self, key, default_text=None, **kwargs): return default_text if default_text is not None else f"_{key}_"
+                def set_language(self, lang_code): self.language_code = lang_code
+            self.localizer = MockLocalizer(language_code=default_lang_from_config)
+        
+        # --- Variable compteur tuile phase 3
+        self.master_tile_count_var = tk.StringVar(value="") # Initialement vide
+        # Compteur de fichiers bruts traités pendant la Phase 1
+        self.file_count_var = tk.StringVar(value="")
+        
+        
+        # --- Définition des listes de clés pour les ComboBoxes ---
+        self.norm_method_keys = ["none", "linear_fit", "sky_mean"]
+        self.weight_method_keys = ["none", "noise_variance", "noise_fwhm"]
+        self.reject_algo_keys = ["none", "kappa_sigma", "winsorized_sigma_clip", "linear_fit_clip"]
+        self.combine_method_keys = ["mean", "median"]
+        self.assembly_method_keys = ["reproject_coadd", "incremental"]
+        # --- FIN Définition des listes de clés ---
+
+        # --- Tkinter Variables ---
+        self.input_dir_var = tk.StringVar()
+        self.output_dir_var = tk.StringVar()
+        self.astap_exe_path_var = tk.StringVar(value=self.config.get("astap_executable_path", ""))
+        self.astap_data_dir_var = tk.StringVar(value=self.config.get("astap_data_directory_path", ""))
+        self.astap_search_radius_var = tk.DoubleVar(value=self.config.get("astap_default_search_radius", 3.0))
+        self.astap_downsample_var = tk.IntVar(value=self.config.get("astap_default_downsample", 2))
+        self.astap_sensitivity_var = tk.IntVar(value=self.config.get("astap_default_sensitivity", 100))
+        self.cluster_threshold_var = tk.DoubleVar(value=self.config.get("cluster_panel_threshold", 0.08))
+        self.save_final_uint16_var = tk.BooleanVar(value=self.config.get("save_final_as_uint16", False))
+
+        # --- Solver Settings ---
+        try:
+            self.solver_settings = SolverSettings.load_default()
+        except Exception:

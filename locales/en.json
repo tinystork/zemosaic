@@ -1,5 +1,5 @@
 {
-    "window_title": "ZeMosaic V2.5 - Hierarchical Mosaicker",
+    "window_title": "ZeMosaic V2.7 - Hierarchical Mosaicker",
     "language_selector_label": "Language:",
     "folders_frame_title": "Folders",
     "input_folder_label": "Input Folder (Raws):",
@@ -28,10 +28,27 @@
     "initial_eta_value": "--:--:--",
     "initial_elapsed_time": "00:00:00",
     "tiles_text_label": "Tiles:",
+    "files_text_label": "Files remaining:",
+    "phase_text_label": "Phase:",
+    "phase_display_format": "P{num} - {name}",
+    "phase_name_1": "Astrometry/WCS",
+    "phase_name_2": "Clustering",
+    "phase_name_3": "Stacking (Master Tiles)",
+    "phase_name_4": "Grid",
+    "phase_name_5": "Assembly",
+    "phase_name_6": "Saving",
+    "phase_name_7": "Cleanup",
     "crop_options_frame_title": "Master Tile Cropping Options",
     "apply_master_tile_crop_label": "Crop Master Tile Edges:",
     "master_tile_crop_percent_label": "Crop Percentage per Side (0-25%):",
     "master_tile_crop_percent_note": "(0.0 = no crop)",
+
+    "gui_logging_title": "Logging",
+    "gui_logging_level": "Logging level:",
+    "logging_level_debug": "Debug",
+    "logging_level_info": "Info",
+    "logging_level_warn": "Warn",
+    "logging_level_error": "Error",
 
 
     "config_warning_title": "Config Warning",
@@ -363,5 +380,19 @@
     "run_success_preview_saved_fallback": "Preview saved (fallback): {filename}",
     "run_error_phase3_thread_exception": "ERROR P3: Exception in master tile creation thread.",
     "run_error_phase4_reading_tile_shape": "ERROR P4: Failed reading Master Tile shape.",
-    "run_error_preview_stretch_unexpected_main": "ERROR: Unexpected error during preview stretch: {error}"
+    "run_error_preview_stretch_unexpected_main": "ERROR: Unexpected error during preview stretch: {error}",
+
+    "filter_window_title": "ZeMosaic - Filter WCS images (optional)",
+    "filter_axis_ra_deg": "RA [deg]",
+    "filter_axis_dec_deg": "Dec [deg]",
+    "filter_exclude_by_distance_title": "Exclude by distance to center",
+    "filter_distance_label": "Distance (deg):",
+    "filter_exclude_gt_x": "Exclude > X°",
+    "filter_images_check_to_keep": "Images (check to keep)",
+    "filter_select_all": "Select all",
+    "filter_select_none": "Select none",
+    "filter_validate": "Validate",
+    "filter_cancel": "Cancel",
+    "filter_invalid_value_title": "Invalid value",
+    "filter_invalid_value_msg": "Please enter a distance in degrees (numeric)."
 }

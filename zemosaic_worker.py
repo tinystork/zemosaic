@@ -1401,16 +1401,12 @@ def create_master_tile(
                 del img_data_adu; gc.collect(); continue
             # Ensure writable, C-contiguous buffers (astroalign may require writeable arrays)
             try:
-                need_copy = False
-                if not getattr(img_data_adu, 'flags', None):
-                    need_copy = True
-                else:
-                    if (not img_data_adu.flags.writeable) or (not img_data_adu.flags.c_contiguous):
-                        need_copy = True
-                if need_copy:
-                    img_data_adu = np.array(img_data_adu, dtype=np.float32, copy=True, order='C')
+                # Avoid forcing writable copies; astroalign does not modify input arrays.
+                # Only ensure contiguity if needed.
+                if not getattr(img_data_adu, 'flags', None) or (not img_data_adu.flags.c_contiguous):
+                    img_data_adu = np.ascontiguousarray(img_data_adu, dtype=np.float32)
             except Exception:
-                img_data_adu = np.array(img_data_adu, dtype=np.float32, copy=True, order='C')
+                img_data_adu = np.ascontiguousarray(img_data_adu, dtype=np.float32)
             
             tile_images_data_HWC_adu.append(img_data_adu)
             # Stocker le dict de header, pas l'objet fits.Header, car c'est ce qui est dans raw_file_info
@@ -1440,6 +1436,11 @@ def create_master_tile(
     # pcb_tile(f"{func_id_log_base}_info_loading_from_cache_finished", prog=None, lvl="DEBUG_DETAIL", num_loaded=len(tile_images_data_HWC_adu), tile_id=tile_id)
 
     # pcb_tile(f"{func_id_log_base}_info_intra_tile_alignment_started", prog=None, lvl="DEBUG_DETAIL", num_to_align=len(tile_images_data_HWC_adu), tile_id=tile_id)
+    # Limit concurrency during alignment/stacking as well to reduce peak RAM
+    try:
+        _PH3_CONCURRENCY_SEMAPHORE.acquire()
+    except Exception:
+        pass
     aligned_images_for_stack = zemosaic_align_stack.align_images_in_group(
         image_data_list=tile_images_data_HWC_adu, 
         reference_image_index=reference_image_index_in_group, 
@@ -1455,6 +1456,10 @@ def create_master_tile(
     
     if not valid_aligned_images: 
         pcb_tile(f"{func_id_log_base}_error_no_images_after_alignment", prog=None, lvl="ERROR", tile_id=tile_id)
+        try:
+            _PH3_CONCURRENCY_SEMAPHORE.release()
+        except Exception:
+            pass
         return None,None
     
     pcb_tile(f"{func_id_log_base}_info_stacking_started", prog=None, lvl="DEBUG_DETAIL", 
@@ -1507,6 +1512,10 @@ def create_master_tile(
 
     if master_tile_stacked_HWC is None: 
         pcb_tile(f"{func_id_log_base}_error_stacking_failed", prog=None, lvl="ERROR", tile_id=tile_id)
+        try:
+            _PH3_CONCURRENCY_SEMAPHORE.release()
+        except Exception:
+            pass
         return None,None
     
     pcb_tile(f"{func_id_log_base}_info_stacking_finished", prog=None, lvl="DEBUG_DETAIL", tile_id=tile_id, 
@@ -1604,11 +1613,19 @@ def create_master_tile(
         )
         pcb_tile(f"{func_id_log_base}_info_saved", prog=None, lvl="INFO_DETAIL", tile_id=tile_id, format_type='float32', filename=os.path.basename(temp_fits_filepath))
         # pcb_tile(f"{func_id_log_base}_info_saving_finished", prog=None, lvl="DEBUG_DETAIL", tile_id=tile_id)
+        try:
+            _PH3_CONCURRENCY_SEMAPHORE.release()
+        except Exception:
+            pass
         return temp_fits_filepath, wcs_for_master_tile
         
     except Exception as e_save_mt:
         pcb_tile(f"{func_id_log_base}_error_saving", prog=None, lvl="ERROR", tile_id=tile_id, error=str(e_save_mt))
         logger.error(f"Traceback pour {func_id_log_base}_{tile_id} sauvegarde:", exc_info=True)
+        try:
+            _PH3_CONCURRENCY_SEMAPHORE.release()
+        except Exception:
+            pass
         return None,None
     finally:
         if 'master_tile_stacked_HWC' in locals() and master_tile_stacked_HWC is not None: 
@@ -2210,8 +2227,26 @@ def assemble_final_mosaic_reproject_coadd(
         reproj_kwargs = {"match_background": match_bg}
 
 
+    # Prepare output containers: either RAM lists or disk-backed memmaps
     mosaic_channels = []
     coverage = None
+    mosaic_memmap = None
+    coverage_memmap = None
+    mosaic_mm_path = None
+    coverage_mm_path = None
+    if use_memmap:
+        try:
+            mm_dir = memmap_dir or tempfile.mkdtemp(prefix="zemosaic_coadd_")
+            os.makedirs(mm_dir, exist_ok=True)
+            mosaic_mm_path = os.path.join(mm_dir, f"mosaic_{h}x{w}x{n_channels}.dat")
+            coverage_mm_path = os.path.join(mm_dir, f"coverage_{h}x{w}.dat")
+            mosaic_memmap = np.memmap(mosaic_mm_path, dtype=np.float32, mode='w+', shape=(h, w, n_channels))
+            coverage_memmap = np.memmap(coverage_mm_path, dtype=np.float32, mode='w+', shape=(h, w))
+            _pcb("assemble_debug_memmap_paths", prog=None, lvl="DEBUG_DETAIL", mosaic_path=mosaic_mm_path, coverage_path=coverage_mm_path)
+        except Exception as e_mm:
+            mosaic_memmap = None
+            coverage_memmap = None
+            _pcb("assemble_warn_memmap_create_failed", prog=None, lvl="WARN", error=str(e_mm))
     try:
         total_steps = n_channels
         start_time_loop = time.time()
@@ -2235,9 +2270,23 @@ def assemble_final_mosaic_reproject_coadd(
                 combine_function="mean",
                 **reproj_kwargs,
             )
-            mosaic_channels.append(chan_mosaic.astype(np.float32))
+            # Store channel result to memmap if enabled, else keep in RAM list
+            ch_f32 = chan_mosaic.astype(np.float32)
+            if mosaic_memmap is not None:
+                mosaic_memmap[..., ch] = ch_f32
+                mosaic_memmap.flush()
+                del ch_f32
+            else:
+                mosaic_channels.append(ch_f32)
+
             if coverage is None:
-                coverage = chan_cov.astype(np.float32)
+                cov_f32 = chan_cov.astype(np.float32)
+                if coverage_memmap is not None:
+                    coverage_memmap[:] = cov_f32
+                    coverage_memmap.flush()
+                    coverage = coverage_memmap
+                else:
+                    coverage = cov_f32
             now = time.time()
             step_times.append(now - last_time)
             last_time = now
@@ -2247,6 +2296,7 @@ def assemble_final_mosaic_reproject_coadd(
                 except Exception:
                     pass
             _update_eta(ch + 1)
+            _log_memory_usage(progress_callback, f"Phase5 Reproject: mémoire après canal {ch+1}")
     except Exception as e_reproject:
         _pcb("assemble_error_reproject_coadd_call_failed", lvl="ERROR", error=str(e_reproject))
         logger.error(
@@ -2255,7 +2305,10 @@ def assemble_final_mosaic_reproject_coadd(
         )
         return None, None
 
-    mosaic_data = np.stack(mosaic_channels, axis=-1)
+    if mosaic_memmap is not None:
+        mosaic_data = mosaic_memmap
+    else:
+        mosaic_data = np.stack(mosaic_channels, axis=-1)
     if step_times:
         avg_step = sum(step_times) / len(step_times)
         total_elapsed = time.time() - start_time_loop
@@ -2272,11 +2325,7 @@ def assemble_final_mosaic_reproject_coadd(
         except Exception:
             pass
 
-    if use_memmap and cleanup_memmap and memmap_dir:
-        try:
-            shutil.rmtree(memmap_dir)
-        except OSError:
-            pass
+    # Defer memmap cleanup to Phase 6 after final save
 
     _log_memory_usage(progress_callback, "Fin assemble_final_mosaic_reproject_coadd")
     _pcb(
@@ -2361,6 +2410,7 @@ def run_hierarchical_mosaic(
     max_raw_per_master_tile_config: int,
     use_gpu_phase5: bool = False,
     gpu_id_phase5: int | None = None,
+    logging_level_config: str = "INFO",
     solver_settings: dict | None = None
 ):
     """
@@ -2372,6 +2422,26 @@ def run_hierarchical_mosaic(
         Nombre maximal de workers pour la phase de rejet Winsorized.
     """
     pcb = lambda msg_key, prog=None, lvl="INFO", **kwargs: _log_and_callback(msg_key, prog, lvl, callback=progress_callback, **kwargs)
+
+    # --- Apply logging level from GUI/config ---
+    try:
+        level_map = {
+            "ERROR": logging.ERROR,
+            "WARN": logging.WARNING,
+            "WARNING": logging.WARNING,
+            "INFO": logging.INFO,
+            "DEBUG": logging.DEBUG,
+        }
+        lvl = level_map.get(str(logging_level_config).upper(), logging.INFO)
+        logger.setLevel(lvl)
+        for h in logger.handlers:
+            try:
+                h.setLevel(lvl)
+            except Exception:
+                pass
+        logger.info("Worker logging level set to %s", str(logging.getLevelName(lvl)))
+    except Exception:
+        pass
 
     # Reset alignment warning counters at start of run
     for k in ALIGN_WARNING_COUNTS:
@@ -2471,6 +2541,7 @@ def run_hierarchical_mosaic(
     base_progress_phase1 = current_global_progress
     _log_memory_usage(progress_callback, "Début Phase 1 (Prétraitement)")
     pcb("run_info_phase1_started_cache", prog=base_progress_phase1, lvl="INFO")
+    pcb("PHASE_UPDATE:1", prog=None, lvl="ETA_LEVEL")
     
     fits_file_paths = []
     # Scan des fichiers FITS dans le dossier d'entrée et ses sous-dossiers
@@ -2495,6 +2566,101 @@ def run_hierarchical_mosaic(
 
     num_total_raw_files = len(fits_file_paths)
     pcb("run_info_found_potential_fits", prog=base_progress_phase1, lvl="INFO_DETAIL", num_files=num_total_raw_files)
+    # Kick off a stage progress stream so the GUI progress bar animates
+    try:
+        if progress_callback and callable(progress_callback):
+            progress_callback("phase1_scan", 0, int(num_total_raw_files))
+        # Also update a dedicated raw files counter in the GUI
+        pcb(f"RAW_FILE_COUNT_UPDATE:0/{num_total_raw_files}", prog=None, lvl="ETA_LEVEL")
+    except Exception:
+        pass
+
+    # --- Phase 0 (Header-only scan + early filter) ---
+    early_filter_enabled = True
+    try:
+        if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
+            cfg0 = zemosaic_config.load_config() or {}
+            early_filter_enabled = bool(cfg0.get("enable_early_filter", True))
+    except Exception:
+        early_filter_enabled = True
+
+    if early_filter_enabled and ASTROPY_AVAILABLE and fits is not None:
+        pcb("Phase 0: header scan start", prog=None, lvl="INFO_DETAIL")
+        t0_hscan = time.monotonic()
+        header_items_for_filter = []
+        num_scanned = 0
+        for idx_file, fpath in enumerate(fits_file_paths):
+            hdr = None
+            wcs0 = None
+            shp_hw = None
+            center_sc = None
+            try:
+                # Read only primary header
+                hdr = fits.getheader(fpath, 0)
+                # Infer shape from header if present
+                try:
+                    nax1 = int(hdr.get("NAXIS1", 0))
+                    nax2 = int(hdr.get("NAXIS2", 0))
+                    if nax1 > 0 and nax2 > 0:
+                        shp_hw = (nax2, nax1)
+                except Exception:
+                    shp_hw = None
+                # Try to build a WCS
+                try:
+                    w = WCS(hdr, naxis=2, relax=True) if WCS is not None else None
+                    if w and getattr(w, "is_celestial", False):
+                        wcs0 = w
+                except Exception:
+                    wcs0 = None
+                # If no valid WCS, try to parse a center using existing astrometry logic
+                if wcs0 is None:
+                    try:
+                        if ZEMOSAIC_ASTROMETRY_AVAILABLE and zemosaic_astrometry and hasattr(zemosaic_astrometry, "extract_center_from_header"):
+                            center_sc = zemosaic_astrometry.extract_center_from_header(hdr)
+                    except Exception:
+                        center_sc = None
+                item = {
+                    "path": fpath,
+                    "header": hdr,
+                    "index": idx_file,
+                }
+                if shp_hw:
+                    item["shape"] = shp_hw
+                if wcs0 is not None:
+                    item["wcs"] = wcs0
+                if center_sc is not None:
+                    item["center"] = center_sc
+                header_items_for_filter.append(item)
+                num_scanned += 1
+            except Exception:
+                # Skip silently; the filter UI will ignore items with no displayable info
+                header_items_for_filter.append({"path": fpath, "index": idx_file})
+                num_scanned += 1
+        t1_hscan = time.monotonic()
+        avg_t = (t1_hscan - t0_hscan) / max(1, num_scanned)
+        pcb(f"Phase 0: header scan finished — files={num_scanned}, avg={avg_t:.4f}s/header", prog=None, lvl="DEBUG")
+
+        # Attempt to launch optional filter GUI on header-only items
+        try:
+            from zemosaic_filter_gui import launch_filter_interface
+            filtered_items = launch_filter_interface(header_items_for_filter)
+            # Guardrails: if UI returned nothing usable, keep original list
+            if filtered_items and isinstance(filtered_items, list):
+                sel_paths = set()
+                for it in filtered_items:
+                    p = it.get("path") or it.get("path_raw")
+                    if isinstance(p, str):
+                        sel_paths.add(p)
+                if sel_paths:
+                    # Preserve original ordering
+                    fits_file_paths = [p for p in fits_file_paths if p in sel_paths]
+                    num_total_raw_files = len(fits_file_paths)
+                    pcb(f"Phase 0: selection after filter = {num_total_raw_files} files", prog=None, lvl="INFO_DETAIL")
+        except ImportError:
+            # Optional UI absent: continue untouched
+            pass
+        except Exception as e_opt0:
+            logger.warning(f"Early filter UI disabled due to error: {e_opt0}")
     
     # --- Détermination du nombre de workers de BASE ---
     effective_base_workers = 0
@@ -2553,6 +2719,15 @@ def run_hierarchical_mosaic(
             for future in as_completed(future_to_filepath_ph1):
                 file_path_original = future_to_filepath_ph1[future]
                 files_processed_count_ph1 += 1  # Incrémenter pour chaque future terminée
+
+                # Update GUI stage progress (files read / total)
+                try:
+                    if progress_callback and callable(progress_callback):
+                        progress_callback("phase1_scan", int(files_processed_count_ph1), int(num_total_raw_files))
+                    # Mirror the count so the GUI can show X/N files
+                    pcb(f"RAW_FILE_COUNT_UPDATE:{files_processed_count_ph1}/{num_total_raw_files}", prog=None, lvl="ETA_LEVEL")
+                except Exception:
+                    pass
 
                 prog_step_phase1 = base_progress_phase1 + int(
                     PROGRESS_WEIGHT_PHASE1_RAW_SCAN * (files_processed_count_ph1 / max(1, num_total_raw_files))
@@ -2662,6 +2837,21 @@ def run_hierarchical_mosaic(
     current_global_progress = base_progress_phase1 + PROGRESS_WEIGHT_PHASE1_RAW_SCAN
     _log_memory_usage(progress_callback, "Fin Phase 1 (Prétraitement)")
     pcb("run_info_phase1_finished_cache", prog=current_global_progress, lvl="INFO", num_valid_raws=len(all_raw_files_processed_info))
+    # --- Optional interactive filtering between Phase 1 and Phase 2 ---
+    try:
+        raw_files_with_wcs = all_raw_files_processed_info
+        try:
+            raw_files_with_wcs = raw_files_with_wcs
+            # Keep the same variable name used by subsequent phases
+            all_raw_files_processed_info = raw_files_with_wcs
+        except ImportError:
+            # Optional module not present: silently skip
+            pass
+        except Exception as e_opt:
+            logger.warning(f"Filtrage facultatif désactivé suite à une erreur : {e_opt}")
+    except Exception as e_hook:
+        # Any unexpected issue in the hook wrapper: continue unchanged
+        logger.warning(f"Filtrage facultatif non appliqué: {e_hook}")
     if time_per_raw_file_wcs: 
         pcb(f"    Temps moyen/brute (P1): {time_per_raw_file_wcs:.2f}s", prog=None, lvl="DEBUG")
 
@@ -2669,6 +2859,7 @@ def run_hierarchical_mosaic(
     base_progress_phase2 = current_global_progress
     _log_memory_usage(progress_callback, "Début Phase 2 (Clustering)")
     pcb("run_info_phase2_started", prog=base_progress_phase2, lvl="INFO")
+    pcb("PHASE_UPDATE:2", prog=None, lvl="ETA_LEVEL")
     # Use order-invariant connected-components clustering for robustness
     seestar_stack_groups = cluster_seestar_stacks_connected(all_raw_files_processed_info, SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG, progress_callback)
     if not seestar_stack_groups:
@@ -2708,12 +2899,16 @@ def run_hierarchical_mosaic(
             sample_arr = None
             available_bytes = psutil.virtual_memory().available
             expected_workers = max(1, int(effective_base_workers * ALIGNMENT_PHASE_WORKER_RATIO))
+            # Be more conservative: align/stack create extra buffers; use a larger safety factor
             limit = max(
                 1,
                 int(
-                    available_bytes // (expected_workers * bytes_per_frame * 6)
+                    available_bytes // (expected_workers * bytes_per_frame * 12)
                 ),
             )
+            # Clamp to a reasonable upper bound if no manual cap is set
+            if manual_limit <= 0:
+                limit = min(limit, 100)
             if manual_limit > 0:
                 limit = min(limit, manual_limit)
             winsor_worker_limit = min(winsor_worker_limit, limit)
@@ -2818,6 +3013,7 @@ def run_hierarchical_mosaic(
     base_progress_phase3 = current_global_progress
     _log_memory_usage(progress_callback, "Début Phase 3 (Master Tuiles)")
     pcb("run_info_phase3_started_from_cache", prog=base_progress_phase3, lvl="INFO")
+    pcb("PHASE_UPDATE:3", prog=None, lvl="ETA_LEVEL")
     temp_master_tile_storage_dir = os.path.join(output_folder, "zemosaic_temp_master_tiles")
     try:
         if os.path.exists(temp_master_tile_storage_dir): shutil.rmtree(temp_master_tile_storage_dir)
@@ -3074,6 +3270,7 @@ def run_hierarchical_mosaic(
     base_progress_phase4 = current_global_progress
     _log_memory_usage(progress_callback, "Début Phase 4 (Calcul Grille)")
     pcb("run_info_phase4_started", prog=base_progress_phase4, lvl="INFO")
+    pcb("PHASE_UPDATE:4", prog=None, lvl="ETA_LEVEL")
     wcs_list_for_final_grid = []; shapes_list_for_final_grid_hw = []
     start_time_loop_ph4 = time.time(); last_time_loop_ph4 = start_time_loop_ph4; step_times_ph4 = []
     total_steps_ph4 = len(master_tiles_results_list)
@@ -3124,6 +3321,7 @@ def run_hierarchical_mosaic(
 
 # --- Phase 5 (Assemblage Final) ---
     base_progress_phase5 = current_global_progress
+    pcb("PHASE_UPDATE:5", prog=None, lvl="ETA_LEVEL")
     USE_INCREMENTAL_ASSEMBLY = (final_assembly_method_config == "incremental")
     _log_memory_usage(progress_callback, f"Début Phase 5 (Méthode: {final_assembly_method_config}, Rognage MT Appliqué: {apply_master_tile_crop_config}, %Rognage: {master_tile_crop_percent_config if apply_master_tile_crop_config else 'N/A'})") # Log mis à jour
     
@@ -3231,6 +3429,9 @@ def run_hierarchical_mosaic(
                     apply_crop=apply_master_tile_crop_config,
                     crop_percent=master_tile_crop_percent_config,
                     use_gpu=False,
+                    use_memmap=bool(coadd_use_memmap_config),
+                    memmap_dir=(coadd_memmap_dir_config or output_folder),
+                    cleanup_memmap=False,
                     base_progress_phase5=base_progress_phase5,
                     progress_weight_phase5=PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
                     start_time_total_run=start_time_total_run,
@@ -3246,6 +3447,9 @@ def run_hierarchical_mosaic(
                 apply_crop=apply_master_tile_crop_config,
                 crop_percent=master_tile_crop_percent_config,
                 use_gpu=use_gpu_phase5_flag,
+                use_memmap=bool(coadd_use_memmap_config),
+                memmap_dir=(coadd_memmap_dir_config or output_folder),
+                cleanup_memmap=False,
                 base_progress_phase5=base_progress_phase5,
                 progress_weight_phase5=PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
                 start_time_total_run=start_time_total_run,
@@ -3267,6 +3471,7 @@ def run_hierarchical_mosaic(
 
     # --- Phase 6 (Sauvegarde) ---
     base_progress_phase6 = current_global_progress
+    pcb("PHASE_UPDATE:6", prog=None, lvl="ETA_LEVEL")
     _log_memory_usage(progress_callback, "Début Phase 6 (Sauvegarde)")
     pcb("run_info_phase6_started", prog=base_progress_phase6, lvl="INFO")
     output_base_name = f"zemosaic_MT{len(master_tiles_results_list)}_R{len(all_raw_files_processed_info)}"
@@ -3347,6 +3552,21 @@ def run_hierarchical_mosaic(
     if final_mosaic_data_HWC is not None and ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils:
         pcb("run_info_preview_stretch_started_auto_asifits", prog=None, lvl="INFO_DETAIL") # Log mis à jour
         try:
+            # Downscale extremely large mosaics for preview to avoid OOM
+            try:
+                h_prev, w_prev = int(final_mosaic_data_HWC.shape[0]), int(final_mosaic_data_HWC.shape[1])
+                max_preview_dim = 4000  # cap the longest side for preview
+                step_h = max(1, h_prev // max_preview_dim)
+                step_w = max(1, w_prev // max_preview_dim)
+                step = max(step_h, step_w)
+                if step > 1:
+                    preview_view = final_mosaic_data_HWC[::step, ::step, :]
+                    pcb("run_info_preview_downscale", prog=None, lvl="INFO_DETAIL", downscale_step=step, src_shape=str(final_mosaic_data_HWC.shape), preview_shape=str(preview_view.shape))
+                else:
+                    preview_view = final_mosaic_data_HWC
+            except Exception:
+                preview_view = final_mosaic_data_HWC
+
             # Vérifier si la fonction stretch_auto_asifits_like existe dans zemosaic_utils
             if hasattr(zemosaic_utils, 'stretch_auto_asifits_like') and callable(zemosaic_utils.stretch_auto_asifits_like):
                 
@@ -3364,7 +3584,7 @@ def run_hierarchical_mosaic(
                 # Prefer GPU stretch when GPU is enabled/available
                 if use_gpu_phase5_flag and hasattr(zemosaic_utils, 'stretch_auto_asifits_like_gpu'):
                     m_stretched = zemosaic_utils.stretch_auto_asifits_like_gpu(
-                        final_mosaic_data_HWC,
+                        preview_view,
                         p_low=preview_p_low,
                         p_high=preview_p_high,
                         asinh_a=preview_asinh_a,
@@ -3372,7 +3592,7 @@ def run_hierarchical_mosaic(
                     )
                 else:
                     m_stretched = zemosaic_utils.stretch_auto_asifits_like(
-                        final_mosaic_data_HWC,
+                        preview_view,
                         p_low=preview_p_low,
                         p_high=preview_p_high,
                         asinh_a=preview_asinh_a,
@@ -3425,6 +3645,19 @@ def run_hierarchical_mosaic(
     if 'final_mosaic_coverage_HW' in locals() and final_mosaic_coverage_HW is not None: del final_mosaic_coverage_HW
     gc.collect()
 
+    # Cleanup memmap .dat files now that arrays are released (Windows requires handles closed)
+    try:
+        if bool(coadd_use_memmap_config) and bool(coadd_cleanup_memmap_config) and coadd_memmap_dir_config:
+            for _name in os.listdir(coadd_memmap_dir_config):
+                name_l = _name.lower()
+                if name_l.endswith('.dat') and (name_l.startswith('mosaic_') or name_l.startswith('coverage_') or name_l.startswith('zemosaic_')):
+                    try:
+                        os.remove(os.path.join(coadd_memmap_dir_config, _name))
+                    except OSError:
+                        pass
+    except Exception:
+        pass
+
 
 
     # --- Phase 7 (Nettoyage) ---
@@ -3432,6 +3665,7 @@ def run_hierarchical_mosaic(
     base_progress_phase7 = current_global_progress
     _log_memory_usage(progress_callback, "Début Phase 7 (Nettoyage)")
     pcb("run_info_phase7_cleanup_starting", prog=base_progress_phase7, lvl="INFO")
+    pcb("PHASE_UPDATE:7", prog=None, lvl="ETA_LEVEL")
     try:
         if os.path.exists(temp_image_cache_dir): shutil.rmtree(temp_image_cache_dir); pcb("run_info_temp_preprocessed_cache_cleaned", prog=None, lvl="INFO_DETAIL", directory=temp_image_cache_dir)
         if os.path.exists(temp_master_tile_storage_dir): shutil.rmtree(temp_master_tile_storage_dir); pcb("run_info_temp_master_tiles_fits_cleaned", prog=None, lvl="INFO_DETAIL", directory=temp_master_tile_storage_dir)

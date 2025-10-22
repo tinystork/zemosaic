@@ -667,24 +667,39 @@ def stretch_auto_asifits_like(img_hwc_adu, p_low=0.5, p_high=99.8,
     Étirement type ASIFitsViewer avec asinh et auto balance RVB.
     Fallback vers du linéaire si dynamique trop faible.
     """
-    img = img_hwc_adu.astype(np.float32, copy=False)
-    out = np.empty_like(img)
+    # Keep everything strictly in float32 to avoid huge float64 temporaries on large mosaics
+    img = np.asarray(img_hwc_adu, dtype=np.float32)
+    out = np.empty_like(img, dtype=np.float32)
+
+    a32 = np.float32(asinh_a) if asinh_a is not None else np.float32(0.01)
+    inv_asinh_den = np.float32(1.0) / np.arcsinh(np.float32(1.0) / a32)
 
     for c in range(3):
         chan = img[..., c]
-        vmin, vmax = np.percentile(chan, [p_low, p_high])
-        if vmax - vmin < 1e-3:
-            out[..., c] = np.zeros_like(chan)
+        # percentile returns python floats/float64; cast to float32 to avoid upcasting chan
+        vmin_f64, vmax_f64 = np.percentile(chan, [p_low, p_high])
+        vmin = np.float32(vmin_f64)
+        vmax = np.float32(vmax_f64)
+        dv = vmax - vmin
+        if not np.isfinite(dv) or dv < np.float32(1e-3):
+            out[..., c].fill(0.0)
             continue
-        normed = np.clip((chan - vmin) / (vmax - vmin), 0, 1)
-        # stretch asinh
-        stretched = np.arcsinh(normed / asinh_a) / np.arcsinh(1 / asinh_a)
-        if np.nanmax(stretched) < 0.05:  # cas trop sombre
-            stretched = normed  # fallback linéaire
-        out[..., c] = stretched
+        # In-place normalize into out[..., c] to avoid an extra full-size array
+        dst = out[..., c]
+        np.subtract(chan, vmin, out=dst, dtype=np.float32)
+        np.divide(dst, dv, out=dst)
+        np.clip(dst, 0.0, 1.0, out=dst)
+        # asinh stretch in-place, keeping float32
+        # tmp = arcsinh(dst / a32) * inv_arcsinh(1/a)
+        np.divide(dst, a32, out=dst)
+        np.arcsinh(dst, out=dst)
+        dst *= inv_asinh_den
+        if not np.isfinite(np.nanmax(dst)) or np.nanmax(dst) < np.float32(0.05):
+            # fallback to linear (already in dst)
+            pass
 
     if apply_wb:
-        avg_per_chan = np.mean(out, axis=(0, 1))
+        avg_per_chan = np.mean(out, axis=(0, 1)).astype(np.float32)
         norm = np.max(avg_per_chan)
         if norm > 0:
             avg_per_chan /= norm
@@ -693,7 +708,7 @@ def stretch_auto_asifits_like(img_hwc_adu, p_low=0.5, p_high=99.8,
         for c in range(3):
             denom = avg_per_chan[c]
             if denom > 1e-8:
-                out[..., c] /= denom
+                out[..., c] = (out[..., c] / np.float32(denom)).astype(np.float32, copy=False)
 
     return np.clip(out, 0, 1)
 
@@ -915,7 +930,11 @@ def save_fits_image(image_data: np.ndarray,
 
     data_to_write_temp = None
     if save_as_float:
-        data_to_write_temp = image_data.astype(np.float32)
+        # Avoid an extra full-size copy if already float32 (important for huge mosaics)
+        if isinstance(image_data, np.ndarray) and image_data.dtype == np.float32:
+            data_to_write_temp = image_data
+        else:
+            data_to_write_temp = image_data.astype(np.float32, copy=False)
         final_header_to_write['BITPIX'] = -32
         final_header_to_write['BSCALE'] = 1.0
         final_header_to_write['BZERO'] = 0.0
