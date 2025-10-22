@@ -86,8 +86,8 @@ class ZeMosaicGUI:
 
 
         try:
-            self.root.geometry("750x780") # Légère augmentation pour le nouveau widget
-            self.root.minsize(700, 630) # Légère augmentation
+            self.root.geometry("1050x950") # Légère augmentation pour le nouveau widget
+            self.root.minsize(800, 700) # Légère augmentation
         except tk.TclError:
             pass
 
@@ -120,8 +120,9 @@ class ZeMosaicGUI:
                 # DÉSACTIVÉE par défaut pour conserver le rendu antérieur
                 "preprocess_remove_background_gpu": False,
                 "preprocess_background_sigma": 24.0,
-                # Valeur par défaut alignée avec le worker (0.08°)
-                "cluster_panel_threshold": 0.08
+                # Valeur par défaut alignée avec le worker (0.18°)
+                "cluster_panel_threshold": 0.18,
+                "cluster_target_groups": 0
             }
 
         # --- GPU Detection helper ---
@@ -213,7 +214,8 @@ class ZeMosaicGUI:
         self.astap_search_radius_var = tk.DoubleVar(value=self.config.get("astap_default_search_radius", 3.0))
         self.astap_downsample_var = tk.IntVar(value=self.config.get("astap_default_downsample", 2))
         self.astap_sensitivity_var = tk.IntVar(value=self.config.get("astap_default_sensitivity", 100))
-        self.cluster_threshold_var = tk.DoubleVar(value=self.config.get("cluster_panel_threshold", 0.08))
+        self.cluster_threshold_var = tk.DoubleVar(value=self.config.get("cluster_panel_threshold", 0.18))
+        self.cluster_target_groups_var = tk.IntVar(value=self.config.get("cluster_target_groups", 0))
         self.save_final_uint16_var = tk.BooleanVar(value=self.config.get("save_final_as_uint16", False))
 
         # --- Solver Settings ---
@@ -547,6 +549,11 @@ class ZeMosaicGUI:
         ttk.Label(params_frame, text="").grid(row=param_row_idx, column=0, padx=5, pady=3, sticky="w"); self.translatable_widgets["panel_clustering_threshold_label"] = params_frame.grid_slaves(row=param_row_idx,column=0)[0]
         ttk.Spinbox(params_frame, from_=0.01, to=5.0, increment=0.01, textvariable=self.cluster_threshold_var, width=8, format="%.2f").grid(row=param_row_idx, column=1, padx=5, pady=3, sticky="w")
         ttk.Label(params_frame, text="").grid(row=param_row_idx, column=2, padx=5, pady=3, sticky="w"); self.translatable_widgets["panel_clustering_threshold_note"] = params_frame.grid_slaves(row=param_row_idx,column=2)[0]
+        param_row_idx += 1
+        # Target stacks (optional auto-threshold)
+        ttk.Label(params_frame, text="").grid(row=param_row_idx, column=0, padx=5, pady=3, sticky="w"); self.translatable_widgets["panel_clustering_target_label"] = params_frame.grid_slaves(row=param_row_idx,column=0)[0]
+        ttk.Spinbox(params_frame, from_=0, to=999, increment=1, textvariable=self.cluster_target_groups_var, width=8).grid(row=param_row_idx, column=1, padx=5, pady=3, sticky="w")
+        ttk.Label(params_frame, text="").grid(row=param_row_idx, column=2, padx=5, pady=3, sticky="w"); self.translatable_widgets["panel_clustering_target_note"] = params_frame.grid_slaves(row=param_row_idx,column=2)[0]
         param_row_idx += 1
         # Removed: Force Luminance option (images are sent to ASTAP as-is)
 
@@ -914,10 +921,24 @@ class ZeMosaicGUI:
         log_frame = ttk.LabelFrame(self.scrollable_content_frame, text="", padding="10")
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(5,5)); self.translatable_widgets["log_frame_title"] = log_frame
         self.log_text = tk.Text(log_frame, wrap=tk.WORD, height=10, state=tk.DISABLED, font=("Consolas", 9))
+        # Scrollbar verticale (à droite)
         log_scrollbar_y_text = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
-        log_scrollbar_x_text = ttk.Scrollbar(log_frame, orient="horizontal", command=self.log_text.xview)
+        # Sous-frame en bas pour accueillir la barre horizontale + le bouton Copier
+        log_bottom_frame = ttk.Frame(log_frame)
+        # Scrollbar horizontale (à gauche dans la sous-frame, prend tout l'espace disponible)
+        log_scrollbar_x_text = ttk.Scrollbar(log_bottom_frame, orient="horizontal", command=self.log_text.xview)
+        # Bouton pour copier le contenu du log dans le presse-papiers
+        copy_btn = ttk.Button(log_bottom_frame, text=self._tr("log_copy_button", "Copy"), command=self._copy_log_to_clipboard, width=8)
+        self.translatable_widgets["log_copy_button"] = copy_btn
+        # Lier les scrollbars au widget texte
         self.log_text.config(yscrollcommand=log_scrollbar_y_text.set, xscrollcommand=log_scrollbar_x_text.set)
-        log_scrollbar_y_text.pack(side=tk.RIGHT, fill=tk.Y); log_scrollbar_x_text.pack(side=tk.BOTTOM, fill=tk.X)
+        # Packing: d'abord la scrollbar verticale à droite, puis la sous-frame en bas,
+        # puis enfin la zone de texte qui occupe le reste.
+        log_scrollbar_y_text.pack(side=tk.RIGHT, fill=tk.Y)
+        # Dans la sous-frame du bas: la barre horizontale prend l'espace à gauche, le bouton à droite
+        log_bottom_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        log_scrollbar_x_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        copy_btn.pack(side=tk.RIGHT, padx=(5,0))
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
 
@@ -1252,18 +1273,30 @@ class ZeMosaicGUI:
             return
 
         try:
-            result = launch_filter_interface(header_items)
+            # Pass current clustering parameters so the filter UI reflects GUI state
+            _initial_overrides = None
+            try:
+                _initial_overrides = {
+                    "cluster_panel_threshold": float(self.cluster_threshold_var.get()) if hasattr(self, 'cluster_threshold_var') else float(self.config.get("cluster_panel_threshold", 0.18)),
+                    "cluster_target_groups": int(self.cluster_target_groups_var.get()) if hasattr(self, 'cluster_target_groups_var') else int(self.config.get("cluster_target_groups", 0)),
+                }
+            except Exception:
+                _initial_overrides = None
+            result = launch_filter_interface(header_items, _initial_overrides)
         except Exception as e:
             self._log_message(f"[ZGUI] Filter UI error: {e}", level="WARN")
             return
 
         # Support both legacy (list) and new (list, accepted)
-        accepted = True; filtered_list = None
+        accepted = True; filtered_list = None; overrides = None
         if isinstance(result, tuple) and len(result) >= 1:
             filtered_list = result[0]
             if len(result) >= 2:
                 try: accepted = bool(result[1])
                 except Exception: accepted = True
+            if len(result) >= 3:
+                try: overrides = result[2]
+                except Exception: overrides = None
         else:
             filtered_list = result
 
@@ -1274,6 +1307,28 @@ class ZeMosaicGUI:
                 total = len(header_items)
                 self._log_message(self._tr("info", "Info"), level="INFO_DETAIL")
                 self._log_message(f"[ZGUI] Filter validated: kept {kept}/{total}. No processing started.", level="INFO_DETAIL")
+            except Exception:
+                pass
+            # Apply clustering overrides if provided
+            try:
+                if isinstance(overrides, dict):
+                    if 'cluster_panel_threshold' in overrides and hasattr(self, 'cluster_threshold_var'):
+                        self.cluster_threshold_var.set(float(overrides['cluster_panel_threshold']))
+                    if 'cluster_target_groups' in overrides and hasattr(self, 'cluster_target_groups_var'):
+                        self.cluster_target_groups_var.set(int(overrides['cluster_target_groups']))
+                    # Persist to in-memory config so future opens keep it
+                    try:
+                        self.config["cluster_panel_threshold"] = float(self.cluster_threshold_var.get())
+                        self.config["cluster_target_groups"] = int(self.cluster_target_groups_var.get())
+                    except Exception:
+                        pass
+                    try:
+                        # Nudge UI refresh
+                        if hasattr(self.root, 'update_idletasks'):
+                            self.root.update_idletasks()
+                    except Exception:
+                        pass
+                    self._log_message("[ZGUI] Applied clustering overrides from filter UI.", level="INFO_DETAIL")
             except Exception:
                 pass
         else:
@@ -1308,6 +1363,49 @@ class ZeMosaicGUI:
                 is_control_message = True
             elif message_key_or_raw == "CHRONO_STOP_REQUEST":
                 if self.root.winfo_exists(): self.root.after_idle(self._stop_gui_chrono)
+                is_control_message = True
+            # --- Overrides from filter UI launched in worker ---
+            elif message_key_or_raw.startswith("CLUSTER_OVERRIDE:"):
+                payload = message_key_or_raw.split(":", 1)[1]
+                # Expected format: panel=<float>;target=<int>
+                new_thr = None; new_tgt = None
+                try:
+                    parts = [p.strip() for p in payload.split(';') if p.strip()]
+                    for p in parts:
+                        if p.startswith("panel="):
+                            try:
+                                new_thr = float(p.split("=", 1)[1])
+                            except Exception:
+                                pass
+                        elif p.startswith("target="):
+                            try:
+                                new_tgt = int(p.split("=", 1)[1])
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                def _apply_cluster_overrides():
+                    try:
+                        if new_thr is not None and hasattr(self, 'cluster_threshold_var'):
+                            self.cluster_threshold_var.set(float(new_thr))
+                        if new_tgt is not None and hasattr(self, 'cluster_target_groups_var'):
+                            self.cluster_target_groups_var.set(int(new_tgt))
+                        # Persist in-memory config
+                        try:
+                            if new_thr is not None:
+                                self.config["cluster_panel_threshold"] = float(self.cluster_threshold_var.get())
+                            if new_tgt is not None:
+                                self.config["cluster_target_groups"] = int(self.cluster_target_groups_var.get())
+                        except Exception:
+                            pass
+                        try:
+                            if hasattr(self.root, 'update_idletasks'):
+                                self.root.update_idletasks()
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                if self.root.winfo_exists(): self.root.after_idle(_apply_cluster_overrides)
                 is_control_message = True
             # --- Indicateur de phase courante ---
             elif message_key_or_raw.startswith("PHASE_UPDATE:"):
@@ -1498,6 +1596,23 @@ class ZeMosaicGUI:
         self._chrono_after_id = None
         print("DEBUG GUI: Chronomètre arrêté.")
 
+    def _copy_log_to_clipboard(self):
+        try:
+            if not hasattr(self, 'log_text') or not self.log_text.winfo_exists():
+                return
+            content = self.log_text.get("1.0", tk.END)
+        except tk.TclError:
+            content = ""
+        content = (content or "").strip()
+        if not content:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(content)
+            if hasattr(self.root, 'update'): self.root.update()
+        except Exception as e:
+            print(f"WARN GUI: clipboard copy failed: {e}")
+
     def on_worker_progress(self, stage: str, current: int, total: int):
         """Handle progress updates for a specific processing stage."""
         if stage not in self._stage_times:
@@ -1559,6 +1674,7 @@ class ZeMosaicGUI:
             astap_downsample_val = self.astap_downsample_var.get()
             astap_sensitivity_val = self.astap_sensitivity_var.get()
             cluster_thresh_val = self.cluster_threshold_var.get()
+            cluster_target_groups_val = self.cluster_target_groups_var.get()
             
             stack_norm_method = self.stacking_normalize_method_var.get()
             stack_weight_method = self.stacking_weighting_method_var.get()
@@ -1663,6 +1779,7 @@ class ZeMosaicGUI:
         # Persist selected clustering threshold for next runs
         try:
             self.config["cluster_panel_threshold"] = float(cluster_thresh_val)
+            self.config["cluster_target_groups"] = int(cluster_target_groups_val)
         except Exception:
             pass
 
@@ -1687,6 +1804,7 @@ class ZeMosaicGUI:
             input_dir, output_dir, astap_exe, astap_data,
             astap_radius_val, astap_downsample_val, astap_sensitivity_val,
             cluster_thresh_val,
+            cluster_target_groups_val,
             stack_norm_method,
             stack_weight_method,
             stack_reject_algo,

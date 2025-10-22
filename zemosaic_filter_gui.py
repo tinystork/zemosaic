@@ -3,7 +3,10 @@ Optional GUI filter for ZeMosaic Phase 1 results.
 
 This module exposes a single function:
 
-    launch_filter_interface(raw_files_with_wcs: list[dict]) -> tuple[list[dict], bool]
+    launch_filter_interface(
+        raw_files_with_wcs: list[dict],
+        initial_overrides: dict | None = None,
+    ) -> tuple[list[dict], bool, dict | None]
 
 It opens a small Tkinter window with a schematic sky map (RA/Dec, in degrees)
 showing the footprint of each WCS-resolved image as a polygon and a checkbox
@@ -30,7 +33,10 @@ import datetime
 import importlib
 
 
-def launch_filter_interface(raw_files_with_wcs: List[Dict[str, Any]]):
+def launch_filter_interface(
+    raw_files_with_wcs: List[Dict[str, Any]],
+    initial_overrides: Optional[Dict[str, Any]] = None,
+):
     """
     Display an optional Tkinter GUI to filter WCS-resolved images.
 
@@ -47,19 +53,22 @@ def launch_filter_interface(raw_files_with_wcs: List[Dict[str, Any]]):
 
     Returns
     -------
-    tuple[list[dict], bool]
-        (filtered_list, accepted) where accepted is True only when Validate is
-        clicked; False when Cancel is clicked or the window is closed.
+    tuple[list[dict], bool, dict | None]
+        (filtered_list, accepted, overrides) where accepted is True only when
+        Validate is clicked; False when Cancel is clicked or the window is closed.
+        overrides contains user-chosen clustering parameters (or None):
+          {"cluster_panel_threshold": float, "cluster_target_groups": int}
     """
     # Early validation and fail-safe behavior
     if not isinstance(raw_files_with_wcs, list) or not raw_files_with_wcs:
-        return raw_files_with_wcs, False
+        return raw_files_with_wcs, False, None
 
     try:
         # --- Optional localization support (autonomous fallback) ---
         # If running inside the ZeMosaic project folder structure, try to use
         # the existing localization system and the language set in main GUI.
         localizer = None
+        cfg_defaults: Dict[str, Any] = {}
         try:
             # Ensure project directory is on sys.path to import locales/* and config
             base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -70,12 +79,14 @@ def launch_filter_interface(raw_files_with_wcs: List[Dict[str, Any]]):
             locales_mod = importlib.import_module('locales.zemosaic_localization')
             ZeMosaicLocalization = getattr(locales_mod, 'ZeMosaicLocalization', None)
 
-            # Try import of config to get language preference
+            # Try import of config to get language preference and defaults
             lang_code = 'en'
             try:
                 zcfg = importlib.import_module('zemosaic_config')
                 cfg = zcfg.load_config()
                 lang_code = cfg.get('language', 'en')
+                cfg_defaults['cluster_panel_threshold'] = float(cfg.get('cluster_panel_threshold', 0.08))
+                cfg_defaults['cluster_target_groups'] = int(cfg.get('cluster_target_groups', 0))
             except Exception:
                 lang_code = 'en'
 
@@ -226,8 +237,25 @@ def launch_filter_interface(raw_files_with_wcs: List[Dict[str, Any]]):
             d = (d + 180.0) % 360.0 - 180.0
             return r + d
 
-        # Prepare Tkinter window
-        root = tk.Tk()
+        # Prepare Tkinter window (use Toplevel if a main Tk exists)
+        parent_root = getattr(tk, "_default_root", None)
+        root_is_toplevel = False
+        if parent_root is not None:
+            try:
+                root = tk.Toplevel(parent_root)
+                root_is_toplevel = True
+                try:
+                    root.transient(parent_root)
+                except Exception:
+                    pass
+                try:
+                    root.grab_set()  # modal
+                except Exception:
+                    pass
+            except Exception:
+                root = tk.Tk()
+        else:
+            root = tk.Tk()
         root.title(_tr(
             "filter_window_title",
             "ZeMosaic - Filtrer les images WCS (optionnel)" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "ZeMosaic - Filter WCS images (optional)"
@@ -338,7 +366,11 @@ def launch_filter_interface(raw_files_with_wcs: List[Dict[str, Any]]):
         # Right panel with controls
         right = ttk.Frame(main)
         right.grid(row=0, column=1, sticky="nsew")
-        right.rowconfigure(1, weight=1)
+        # The scrollable list lives at row=2 (row=1 reserved for clustering params)
+        try:
+            right.rowconfigure(2, weight=1)
+        except Exception:
+            right.rowconfigure(1, weight=1)
         right.columnconfigure(0, weight=1)
 
         # Threshold controls
@@ -391,6 +423,48 @@ def launch_filter_interface(raw_files_with_wcs: List[Dict[str, Any]]):
             command=apply_threshold,
         ).grid(row=0, column=2, padx=4, pady=4)
 
+        # Clustering parameter overrides (propagated back to main GUI)
+        clust_frame = ttk.LabelFrame(
+            right,
+            text=_tr(
+                "filter_cluster_params_title",
+                "Clustering parameters" if 'fr' not in str(locals().get('lang_code', 'en')).lower() else "Paramètres de clustering",
+            ),
+        )
+        clust_frame.grid(row=1, column=0, sticky="ew", padx=5, pady=(0,5))
+        ttk.Label(
+            clust_frame,
+            text=_tr("filter_cluster_target_label", "Target stacks:")
+        ).grid(row=0, column=0, padx=4, pady=2, sticky="w")
+        # Initial values from caller override current config defaults when provided
+        init_target = None
+        init_thresh = None
+        try:
+            if isinstance(initial_overrides, dict):
+                if 'cluster_target_groups' in initial_overrides:
+                    init_target = int(initial_overrides['cluster_target_groups'])
+                if 'cluster_panel_threshold' in initial_overrides:
+                    init_thresh = float(initial_overrides['cluster_panel_threshold'])
+        except Exception:
+            init_target = None; init_thresh = None
+
+        target_groups_var = tk.IntVar(value=int(
+            init_target if init_target is not None else cfg_defaults.get('cluster_target_groups', 0)
+        ))
+        ttk.Spinbox(clust_frame, from_=0, to=999, increment=1, textvariable=target_groups_var, width=8).grid(
+            row=0, column=1, padx=4, pady=2, sticky="w"
+        )
+        ttk.Label(
+            clust_frame,
+            text=_tr("filter_cluster_threshold_label", "Panel threshold (deg):")
+        ).grid(row=1, column=0, padx=4, pady=2, sticky="w")
+        panel_thresh_var = tk.DoubleVar(value=float(
+            init_thresh if init_thresh is not None else cfg_defaults.get('cluster_panel_threshold', 0.08)
+        ))
+        ttk.Spinbox(clust_frame, from_=0.01, to=5.0, increment=0.01, textvariable=panel_thresh_var, width=8, format="%.2f").grid(
+            row=1, column=1, padx=4, pady=2, sticky="w"
+        )
+
         # Scrollable checkboxes list
         list_frame = ttk.LabelFrame(
             right,
@@ -399,7 +473,7 @@ def launch_filter_interface(raw_files_with_wcs: List[Dict[str, Any]]):
                 "Images (cocher pour garder)" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Images (check to keep)",
             ),
         )
-        list_frame.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
+        list_frame.grid(row=2, column=0, sticky="nsew", padx=5, pady=5)
         list_frame.rowconfigure(0, weight=1)
         list_frame.columnconfigure(0, weight=1)
 
@@ -450,7 +524,7 @@ def launch_filter_interface(raw_files_with_wcs: List[Dict[str, Any]]):
 
         # Selection helpers
         actions = ttk.Frame(right)
-        actions.grid(row=2, column=0, sticky="ew", padx=5, pady=5)
+        actions.grid(row=3, column=0, sticky="ew", padx=5, pady=5)
         def select_all():
             for v in check_vars: v.set(True)
             update_visuals()
@@ -476,16 +550,31 @@ def launch_filter_interface(raw_files_with_wcs: List[Dict[str, Any]]):
 
         # Confirm/cancel buttons
         bottom = ttk.Frame(right)
-        bottom.grid(row=3, column=0, sticky="ew", padx=5, pady=5)
-        result: dict[str, Any] = {"accepted": False, "selected_indices": None}
+        bottom.grid(row=4, column=0, sticky="ew", padx=5, pady=5)
+        result: dict[str, Any] = {"accepted": False, "selected_indices": None, "overrides": None}
         def on_validate():
             sel = [i for i, v in enumerate(check_vars) if v.get()]
             result["accepted"] = True
             result["selected_indices"] = sel
+            try:
+                result["overrides"] = {
+                    "cluster_panel_threshold": float(panel_thresh_var.get()),
+                    "cluster_target_groups": int(target_groups_var.get()),
+                }
+            except Exception:
+                result["overrides"] = None
+            try:
+                root.quit()
+            except Exception:
+                pass
             root.destroy()
         def on_cancel():
             result["accepted"] = False
             result["selected_indices"] = None
+            try:
+                root.quit()
+            except Exception:
+                pass
             root.destroy()
         ttk.Button(
             bottom,
@@ -617,9 +706,17 @@ def launch_filter_interface(raw_files_with_wcs: List[Dict[str, Any]]):
             root.destroy()
         root.protocol("WM_DELETE_WINDOW", on_close)
 
-        # Start modal loop
+        # Start modal loop (use wait_window for Toplevel)
         try:
-            root.mainloop()
+            if root_is_toplevel:
+                parent = parent_root if parent_root is not None else root
+                try:
+                    parent.wait_window(root)
+                except Exception:
+                    # Fallback to simple update loop
+                    root.update(); root.update_idletasks()
+            else:
+                root.mainloop()
         except KeyboardInterrupt:
             # If interrupted, keep default behavior (keep all)
             pass
@@ -695,17 +792,17 @@ def launch_filter_interface(raw_files_with_wcs: List[Dict[str, Any]]):
                         # Non-fatal: keep going
                         print(f"WARN filter_gui: Failed to move '{src_path}' -> filtered_by_user: {e}")
 
-            return [raw_files_with_wcs[i] for i in sel], True
+            return [raw_files_with_wcs[i] for i in sel], True, result.get("overrides")
         else:
             # Keep all if canceled or closed
-            return raw_files_with_wcs, False
+            return raw_files_with_wcs, False, None
 
     except ImportError:
         # Any optional dependency missing — silently keep all
-        return raw_files_with_wcs, False
+        return raw_files_with_wcs, False, None
     except Exception:
         # Any unexpected error — fail safe and keep all
-        return raw_files_with_wcs, False
+        return raw_files_with_wcs, False, None
 
 
 __all__ = ["launch_filter_interface"]

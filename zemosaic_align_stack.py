@@ -118,14 +118,15 @@ cpu_stack_linear = None
 try:
     import importlib.util, os, pathlib
     _sm_path = pathlib.Path(__file__).resolve().parents[1] / 'seestar' / 'core' / 'stack_methods.py'
-    spec = importlib.util.spec_from_file_location('seestar_stack_methods', _sm_path)
-    _sm = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(_sm)  # type: ignore
-    cpu_stack_winsorized = _sm._stack_winsorized_sigma
-    cpu_stack_kappa = _sm._stack_kappa_sigma
-    cpu_stack_linear = _sm._stack_linear_fit_clip
+    if _sm_path.exists():
+        spec = importlib.util.spec_from_file_location('seestar_stack_methods', _sm_path)
+        _sm = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_sm)  # type: ignore
+        cpu_stack_winsorized = getattr(_sm, '_stack_winsorized_sigma', None)
+        cpu_stack_kappa = getattr(_sm, '_stack_kappa_sigma', None)
+        cpu_stack_linear = getattr(_sm, '_stack_linear_fit_clip', None)
 except Exception as e_import_stack:
-    print(f"AVERT (zemosaic_align_stack): Import stack methods failed: {e_import_stack}")
+    print(f"AVERT (zemosaic_align_stack): Optional import of external stack_methods failed: {e_import_stack}")
 
 # --- Implementations GPU simplifiées des méthodes de stack ---
 def gpu_stack_winsorized(frames, *, kappa=3.0, winsor_limits=(0.05, 0.05), apply_rewinsor=True):
@@ -266,7 +267,7 @@ def stack_kappa_sigma_clip(frames, zconfig=None, **kwargs):
             _internal_logger.warning("GPU kappa clip failed, fallback CPU", exc_info=True)
     if cpu_stack_kappa:
         return cpu_stack_kappa(frames, **kwargs)
-    raise RuntimeError("CPU stack_kappa function unavailable")
+    return _cpu_stack_kappa_fallback(frames, **kwargs)
 
 
 def stack_linear_fit_clip(frames, zconfig=None, **kwargs):
@@ -284,7 +285,7 @@ def stack_linear_fit_clip(frames, zconfig=None, **kwargs):
             _internal_logger.warning("GPU linear clip failed, fallback CPU", exc_info=True)
     if cpu_stack_linear:
         return cpu_stack_linear(frames, **kwargs)
-    raise RuntimeError("CPU stack_linear function unavailable")
+    return _cpu_stack_linear_fallback(frames, **kwargs)
 
 
 # Fallback logger for cases where progress_callback might not be available
@@ -1913,6 +1914,68 @@ def stack_aligned_images(
 
 
 # --- CPU fallback implementation appended (in case Seestar stack methods are unavailable) ---
+def _cpu_stack_kappa_fallback(
+    frames,
+    *,
+    sigma_low: float = 3.0,
+    sigma_high: float = 3.0,
+    progress_callback=None,
+):
+    """CPU kappa-sigma clip fallback.
+
+    Accepts frames of shape (N,H,W) or (N,H,W,C). Returns (stacked, rejected_pct).
+    """
+    _pcb = lambda m, lvl="DEBUG_DETAIL", **kw: (
+        progress_callback(m, None, lvl, **kw) if progress_callback else _internal_logger.debug(m)
+    )
+    frames_list = [np.asarray(f, dtype=np.float32) for f in frames]
+    if not frames_list:
+        raise ValueError("frames is empty")
+    arr = np.stack(frames_list, axis=0)
+    if arr.ndim not in (3, 4):
+        raise ValueError(f"frames must be (N,H,W) or (N,H,W,C); got {arr.shape}")
+    med = np.nanmedian(arr, axis=0)
+    std = np.nanstd(arr, axis=0)
+    low = med - float(sigma_low) * std
+    high = med + float(sigma_high) * std
+    mask = (arr >= low) & (arr <= high)
+    arr_clip = np.where(mask, arr, np.nan)
+    stacked = np.nanmean(arr_clip, axis=0).astype(np.float32)
+    rejected_pct = 100.0 * float(mask.size - np.count_nonzero(mask)) / float(mask.size) if mask.size else 0.0
+    _pcb("cpu_kappa_fallback_done", lvl="DEBUG_DETAIL")
+    return stacked, rejected_pct
+
+
+def _cpu_stack_linear_fallback(
+    frames,
+    *,
+    sigma: float = 3.0,
+    progress_callback=None,
+):
+    """CPU linear residual clipping fallback.
+
+    Compute per-pixel residuals to the median, clip within sigma*std of residuals,
+    and mean-combine. Returns (stacked, rejected_pct).
+    """
+    _pcb = lambda m, lvl="DEBUG_DETAIL", **kw: (
+        progress_callback(m, None, lvl, **kw) if progress_callback else _internal_logger.debug(m)
+    )
+    frames_list = [np.asarray(f, dtype=np.float32) for f in frames]
+    if not frames_list:
+        raise ValueError("frames is empty")
+    arr = np.stack(frames_list, axis=0)
+    if arr.ndim not in (3, 4):
+        raise ValueError(f"frames must be (N,H,W) or (N,H,W,C); got {arr.shape}")
+    med = np.nanmedian(arr, axis=0)
+    resid = arr - med
+    med_r = np.nanmedian(resid, axis=0)
+    std_r = np.nanstd(resid, axis=0)
+    mask = np.abs(resid - med_r) <= float(sigma) * std_r
+    arr_clip = np.where(mask, arr, np.nan)
+    stacked = np.nanmean(arr_clip, axis=0).astype(np.float32)
+    rejected_pct = 100.0 * float(mask.size - np.count_nonzero(mask)) / float(mask.size) if mask.size else 0.0
+    _pcb("cpu_linear_fallback_done", lvl="DEBUG_DETAIL")
+    return stacked, rejected_pct
 def _cpu_stack_winsorized_fallback(
     frames,
     *,
@@ -2038,3 +2101,18 @@ except NameError:
     cpu_stack_winsorized = None
 if cpu_stack_winsorized is None:
     cpu_stack_winsorized = _cpu_stack_winsorized_fallback
+
+# Bind other fallbacks when external Seestar stack methods are unavailable
+try:
+    cpu_stack_kappa
+except NameError:
+    cpu_stack_kappa = None
+if cpu_stack_kappa is None:
+    cpu_stack_kappa = _cpu_stack_kappa_fallback
+
+try:
+    cpu_stack_linear
+except NameError:
+    cpu_stack_linear = None
+if cpu_stack_linear is None:
+    cpu_stack_linear = _cpu_stack_linear_fallback

@@ -24,6 +24,7 @@
     "launch_button": "Start Hierarchical Mosaic",
     "stop_button": "Stop",
     "log_frame_title": "Processing Logs",
+    "log_copy_button": "Copy",
     "eta_text_label": "ETA:",
     "elapsed_text_label": "Elapsed:",
     "initial_eta_value": "--:--:--",
@@ -376,6 +377,13 @@
     "run_warn_phase4_no_data_in_tile_fits": "WARN P4: No data found in Master Tile FITS; skipped.",
     "run_warn_phase4_unhandled_tile_shape": "WARN P4: Unhandled Master Tile shape; skipped.",
     "run_warn_phase4_zero_dimensions_tile": "WARN P4: Master Tile has zero dimensions; skipped.",
+
+    "panel_clustering_target_label": "Target stacks (auto-threshold):",
+    "panel_clustering_target_note": "0 disables. Increase threshold to reach ~target groups.",
+
+    "filter_cluster_params_title": "Clustering parameters",
+    "filter_cluster_target_label": "Target stacks:",
+    "filter_cluster_threshold_label": "Panel threshold (deg):",
     "run_warn_phase3_master_tile_creation_failed_thread": "WARN P3: Master Tile creation failed in a worker thread.",
     "run_warn_phase6_wcs_to_header_failed": "WARN P6: Failed to convert WCS to FITS header: {error}",
     "run_success_preview_saved_fallback": "Preview saved (fallback): {filename}",

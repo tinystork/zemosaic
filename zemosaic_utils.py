@@ -1026,30 +1026,165 @@ def save_fits_image(image_data: np.ndarray,
 
 
 def gpu_assemble_final_mosaic_reproject_coadd(*args, **kwargs):
-    """GPU accelerated final mosaic assembly (reproject & coadd).
+    """Deprecated placeholder kept for compatibility.
 
-    This is a placeholder implementation. A full version would mirror the
-    NumPy implementation using CuPy arrays and CUDA kernels while minimizing
-    data transfers between host and device.
+    The worker now routes GPU usage via ``assemble_final_mosaic_reproject_coadd(..., use_gpu=True)``.
+    This function remains for backward compatibility and will raise to signal callers to switch.
     """
-    raise NotImplementedError("GPU implementation not available")
+    raise NotImplementedError(
+        "Call assemble_final_mosaic_reproject_coadd(use_gpu=True) from the worker instead."
+    )
 
 
 def gpu_assemble_final_mosaic_incremental(*args, **kwargs):
-    """GPU accelerated incremental mosaic assembly placeholder."""
-    raise NotImplementedError("GPU implementation not available")
+    """Deprecated placeholder for incremental GPU path.
+
+    Use the CPU incremental assembly; reprojection dominates and remains CPU-bound for now.
+    """
+    raise NotImplementedError(
+        "Incremental GPU path is not implemented; use CPU incremental assembly."
+    )
 
 
-def gpu_reproject_and_coadd(data_list, wcs_list, shape_out, **kwargs):
-    """Simplified GPU implementation using CuPy."""
-    import cupy as cp
-    data_gpu = [cp.asarray(d) for d in data_list]
-    mosaic_gpu = cp.zeros(shape_out, dtype=cp.float32)
-    weight_gpu = cp.zeros(shape_out, dtype=cp.float32)
-    for img in data_gpu:
-        # Placeholder for GPU interpolation logic
+def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
+    """CuPy-accelerated reprojection and mean coaddition for a single channel.
+
+    Notes
+    - Expects ``data_list`` as list of 2D NumPy arrays (single-channel tiles).
+    - ``wcs_list`` should be a list of WCS objects (or headers convertible to WCS).
+    - ``output_projection`` in ``kwargs`` must be a WCS or a FITS header for the final mosaic grid.
+    - ``match_background`` (or legacy ``match_bg``) subtracts tile median before sampling.
+    - Coverage is returned in [0, 1] as the fraction of inputs contributing per pixel.
+    - Implementation is chunked in rows to limit GPU memory usage.
+    """
+    # Import lazily to avoid importing cupy when GPU is not used
+    import cupy as cp  # type: ignore
+    from cupyx.scipy.ndimage import map_coordinates  # type: ignore
+    try:
+        from astropy.wcs import WCS as _WCS
+    except Exception:
+        _WCS = None
+
+    # Resolve final WCS from header or WCS instance
+    output_projection = kwargs.get("output_projection")
+    if output_projection is None:
+        raise ValueError("gpu_reproject_and_coadd requires 'output_projection' (WCS or header)")
+    if _WCS is not None and not hasattr(output_projection, "pixel_to_world"):
+        try:
+            output_wcs = _WCS(output_projection)
+        except Exception as e:
+            raise ValueError(f"Invalid output_projection for WCS: {e}")
+    else:
+        output_wcs = output_projection
+
+    H, W = int(shape_out[0]), int(shape_out[1])
+    n_inputs = len(data_list)
+    if len(wcs_list) != n_inputs:
+        raise ValueError("data_list and wcs_list must have the same length")
+
+    # Determine background match flag from either name
+    match_background = bool(kwargs.get("match_background", kwargs.get("match_bg", False)))
+
+    # Prepare output accumulators on GPU
+    mosaic_sum_gpu = cp.zeros((H, W), dtype=cp.float32)
+    weight_sum_gpu = cp.zeros((H, W), dtype=cp.float32)
+    tile_medians = []
+
+    # Row-chunking to bound memory; tune based on device memory
+    rows_per_chunk = int(kwargs.get("rows_per_chunk", 256))
+    rows_per_chunk = max(32, min(rows_per_chunk, H))
+
+    # Build an x-grid once (NumPy on CPU) and reuse
+    x_grid = cp.asarray(cp.arange(W, dtype=cp.float32))  # cp.arange works well; stays on GPU when meshed
+
+    # Iterate over tiles
+    for idx_tile, (img_np, tile_wcs) in enumerate(zip(data_list, wcs_list)):
+        # Basic input validation and convert to float32 without NaN side-effects
+        img = cp.asarray(img_np.astype("float32", copy=False))
+        if match_background:
+            try:
+                med = float(cp.nanmedian(img).get())
+            except Exception:
+                med = 0.0
+            tile_medians.append(med)
+            if med != 0.0:
+                img = img - cp.float32(med)
+
+        # Valid mask (1 for finite pixels, 0 otherwise); used for coverage and weighted mean
+        mask = cp.isfinite(img).astype(cp.float32)
+        img = cp.nan_to_num(img, copy=False, nan=0.0)
+
+        # Precompute per-tile: nothing yet; mapping is per-chunk
+        for r0 in range(0, H, rows_per_chunk):
+            r1 = min(H, r0 + rows_per_chunk)
+            # CPU grid for WCS conversion (faster on CPU for WCS than pushing to GPU)
+            # y in [r0, r1), x in [0, W)
+            y = cp.arange(r0, r1, dtype=cp.float32)
+            # Mesh on GPU for map_coordinates usage later
+            yy = y[:, None]
+            xx = x_grid[None, :]
+
+            # Convert output (x, y) -> world -> input (x_in, y_in) using CPU WCS
+            # Fetch to CPU minimal arrays (NumPy) for WCS; then back to GPU as coords
+            y_cpu = cp.asnumpy(yy)
+            x_cpu = cp.asnumpy(xx)
+            try:
+                # Astropy WCS expects x, y order
+                ra, dec = output_wcs.wcs_pix2world(x_cpu, y_cpu, 0)
+                x_in, y_in = tile_wcs.wcs_world2pix(ra, dec, 0)
+            except Exception:
+                # If any WCS conversion fails, skip this chunk for this tile
+                continue
+
+            x_in_gpu = cp.asarray(x_in, dtype=cp.float32)
+            y_in_gpu = cp.asarray(y_in, dtype=cp.float32)
+
+            # Build validity mask for in-bounds coordinates
+            h_in, w_in = img.shape
+            valid = (
+                (x_in_gpu >= -0.5)
+                & (x_in_gpu <= (w_in - 0.5))
+                & (y_in_gpu >= -0.5)
+                & (y_in_gpu <= (h_in - 0.5))
+            )
+
+            # Sample image and mask at mapped coordinates (bilinear, constant outside)
+            coords = cp.stack([y_in_gpu, x_in_gpu], axis=0)
+            sampled = map_coordinates(img, coords, order=1, mode="constant", cval=0.0)
+            sampled_mask = map_coordinates(mask, coords, order=1, mode="constant", cval=0.0)
+
+            # Zero out contributions where coords are outside or mask ~ 0
+            sampled = sampled * sampled_mask * valid.astype(cp.float32)
+            sampled_mask = sampled_mask * valid.astype(cp.float32)
+
+            # Accumulate
+            mosaic_sum_gpu[r0:r1, :] += sampled
+            weight_sum_gpu[r0:r1, :] += sampled_mask
+
+    # Finalize: mean combine where weight > 0
+    eps = cp.float32(1e-6)
+    mosaic_gpu = cp.where(weight_sum_gpu > eps, mosaic_sum_gpu / cp.maximum(weight_sum_gpu, eps), 0.0)
+    coverage_gpu = cp.clip(weight_sum_gpu / float(max(1, n_inputs)), 0.0, 1.0)
+
+    # Restore a sensible brightness baseline for FITS output when background matching
+    if match_background and tile_medians:
+        try:
+            baseline = float(np.median(tile_medians))
+        except Exception:
+            baseline = 0.0
+        if baseline != 0.0:
+            mosaic_gpu = mosaic_gpu + cp.float32(baseline)
+
+    # Ensure the low-end is non-negative for common FITS viewers
+    try:
+        p01 = float(cp.percentile(mosaic_gpu, 0.1).get())
+        if p01 < 0:
+            mosaic_gpu = mosaic_gpu - cp.float32(p01)
+    except Exception:
         pass
-    return cp.asnumpy(mosaic_gpu), cp.asnumpy(weight_gpu)
+
+    # Move back to CPU
+    return cp.asnumpy(mosaic_gpu).astype("float32"), cp.asnumpy(coverage_gpu).astype("float32")
 
 
 def reproject_and_coadd_wrapper(
@@ -1060,14 +1195,18 @@ def reproject_and_coadd_wrapper(
     cpu_function=None,
     **kwargs,
 ):
-    if use_gpu and GPU_AVAILABLE:
+    """Dispatch to GPU or CPU reproject+coadd.
+
+    - GPU path: uses ``gpu_reproject_and_coadd`` (CuPy). Falls back to CPU on any error.
+    - CPU path: calls astropy-reproject's ``reproject_and_coadd``.
+    """
+    if use_gpu and gpu_is_available():
         try:
-            return gpu_reproject_and_coadd(data_list, wcs_list, shape_out, **kwargs)
+            return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs)
         except Exception as e:  # pragma: no cover - GPU failures
             import logging
-
             logging.getLogger(__name__).warning(
-                "GPU reprojection failed (%s), fallback CPU", e
+                "GPU reprojection failed (%s), falling back to CPU", e
             )
     if cpu_function is None:
         cpu_function = cpu_reproject_and_coadd
@@ -1078,31 +1217,22 @@ def reproject_and_coadd_wrapper(
 
 
 def gpu_reproject_and_coadd(data_list, wcs_list, shape_out, **kwargs):
-    """Simplified GPU version of ``reproject_and_coadd``.
+    """Alias that forwards to the main GPU implementation.
 
-    Parameters match :func:`reproject_and_coadd_wrapper` but operate on CuPy
-    arrays. The implementation here is schematic and should be replaced with a
-    real CUDA accelerated routine.
+    Some import sites may reference this name; keep it as a thin wrapper.
     """
-    import cupy as cp
-    data_gpu = [cp.asarray(d) for d in data_list]
-    mosaic_gpu = cp.zeros(shape_out, dtype=cp.float32)
-    weight_gpu = cp.zeros(shape_out, dtype=cp.float32)
-    for img in data_gpu:
-        # Placeholder for GPU interpolation step
-        pass
-    return cp.asnumpy(mosaic_gpu), cp.asnumpy(weight_gpu)
+    return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs)
 
 
 def reproject_and_coadd_wrapper(data_list, wcs_list, shape_out, use_gpu=False, cpu_func=None, **kwargs):
-    """Dispatch to CPU or GPU ``reproject_and_coadd`` depending on availability."""
-    if use_gpu and GPU_AVAILABLE:
+    """Dispatch to CPU or GPU ``reproject_and_coadd`` depending on availability (duplicate alias)."""
+    if use_gpu and gpu_is_available():
         try:
-            return gpu_reproject_and_coadd(data_list, wcs_list, shape_out, **kwargs)
-        except Exception as e:  # pragma: no cover - GPU errors
+            return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs)
+        except Exception as e:  # pragma: no cover
             import logging
             logging.getLogger(__name__).warning(
-                "GPU reprojection failed (%s), fallback CPU", e
+                "GPU reprojection failed (%s), falling back to CPU", e
             )
     input_pairs = list(zip(data_list, wcs_list))
     output_projection = kwargs.pop("output_projection", None)

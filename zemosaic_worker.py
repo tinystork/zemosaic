@@ -2031,6 +2031,35 @@ def assemble_final_mosaic_reproject_coadd(
 
     start_time_phase = time.monotonic()
 
+    # Emit ETA during the preparation phase (before channels start)
+    def _update_eta_prepare(done_tiles: int, total_tiles_local: int):
+        if (
+            base_progress_phase5 is None
+            or progress_weight_phase5 is None
+            or start_time_total_run is None
+        ):
+            return
+        try:
+            prep_fraction = 0.0
+            if total_tiles_local > 0:
+                prep_fraction = max(0.0, min(1.0, float(done_tiles) / float(total_tiles_local)))
+            # Use a small pseudo progress for ETA only to avoid 0%% division
+            current_progress_pct = base_progress_phase5 + (0.1 * prep_fraction) * progress_weight_phase5
+            current_progress_pct = max(current_progress_pct, base_progress_phase5 + 0.01)
+            elapsed_phase_local = time.monotonic() - start_time_phase
+            eta_pre_sec = 0.0
+            if done_tiles > 0 and total_tiles_local > 0:
+                time_per_tile = elapsed_phase_local / float(done_tiles)
+                eta_pre_sec = max(0.0, (total_tiles_local - done_tiles) * time_per_tile)
+            elapsed_total = time.monotonic() - start_time_total_run
+            sec_per_pct = elapsed_total / max(1.0, current_progress_pct)
+            total_eta_sec = eta_pre_sec + (100 - current_progress_pct) * sec_per_pct
+            h, rem = divmod(int(total_eta_sec), 3600)
+            m, s = divmod(rem, 60)
+            _pcb(f"ETA_UPDATE:{h:02d}:{m:02d}:{s:02d}", prog=None, lvl="ETA_LEVEL")
+        except Exception:
+            pass
+
     def _update_eta(completed_channels: int):
         if (
             base_progress_phase5 is not None
@@ -2045,7 +2074,8 @@ def assemble_final_mosaic_reproject_coadd(
                 completed_channels / n_channels
             ) * progress_weight_phase5
             elapsed_total = time.monotonic() - start_time_total_run
-            sec_per_pct = elapsed_total / current_progress_pct if current_progress_pct > 0 else 0
+            # Avoid zero-division at early stage; use at least 1%% of run for denominator
+            sec_per_pct = elapsed_total / max(1.0, current_progress_pct)
             total_eta_sec = eta_ch_sec + (100 - current_progress_pct) * sec_per_pct
             h, rem = divmod(int(total_eta_sec), 3600)
             m, s = divmod(rem, 60)
@@ -2133,6 +2163,7 @@ def assemble_final_mosaic_reproject_coadd(
 
     input_data_all_tiles_HWC_processed = []
     hdr_for_output = None
+    total_tiles_for_prep = len(master_tile_fits_with_wcs_list)
     for idx, (tile_path, tile_wcs) in enumerate(master_tile_fits_with_wcs_list, 1):
         with fits.open(tile_path, memmap=False) as hdul:
             data = hdul[0].data.astype(np.float32)
@@ -2200,6 +2231,10 @@ def assemble_final_mosaic_reproject_coadd(
                 num_done=idx,
                 total_num=len(master_tile_fits_with_wcs_list),
             )
+
+        # Keep ETA responsive during preparation
+        if idx == 1 or (idx % 5 == 0) or (idx == total_tiles_for_prep):
+            _update_eta_prepare(idx, total_tiles_for_prep)
 
 
 
@@ -2382,6 +2417,7 @@ def run_hierarchical_mosaic(
     astap_downsample_config: int,
     astap_sensitivity_config: int,
     cluster_threshold_config: float,
+    cluster_target_groups_config: int,
     progress_callback: callable,
     stack_norm_method: str,
     stack_weight_method: str,
@@ -2456,13 +2492,13 @@ def run_hierarchical_mosaic(
             pcb(f"ETA_UPDATE:{eta_str}", prog=None, lvl="ETA_LEVEL") 
 
 
-    # Seuil de clustering : valeur de repli à 0.08° si l'option est absente ou non positive
+    # Seuil de clustering : valeur de repli à 0.18° si l'option est absente ou non positive
     try:
         cluster_threshold = float(cluster_threshold_config or 0)
     except (TypeError, ValueError):
         cluster_threshold = 0
     SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG = (
-        cluster_threshold if cluster_threshold > 0 else 0.08
+        cluster_threshold if cluster_threshold > 0 else 0.18
 
     )
     PROGRESS_WEIGHT_PHASE1_RAW_SCAN = 30; PROGRESS_WEIGHT_PHASE2_CLUSTERING = 5
@@ -2643,10 +2679,19 @@ def run_hierarchical_mosaic(
         # Attempt to launch optional filter GUI on header-only items
         try:
             from zemosaic_filter_gui import launch_filter_interface
-            filter_ret = launch_filter_interface(header_items_for_filter)
+            # Provide current clustering params so the filter UI reflects run settings
+            try:
+                _init_overrides = {
+                    "cluster_panel_threshold": float(cluster_threshold_config),
+                    "cluster_target_groups": int(cluster_target_groups_config),
+                }
+            except Exception:
+                _init_overrides = None
+            filter_ret = launch_filter_interface(header_items_for_filter, _init_overrides)
             # New API: (filtered_items, accepted). Back-compat: may return only list.
             accepted = True
             filtered_items = None
+            overrides = None
             if isinstance(filter_ret, tuple) and len(filter_ret) >= 1:
                 filtered_items = filter_ret[0]
                 if len(filter_ret) >= 2:
@@ -2654,6 +2699,11 @@ def run_hierarchical_mosaic(
                         accepted = bool(filter_ret[1])
                     except Exception:
                         accepted = True
+                if len(filter_ret) >= 3:
+                    try:
+                        overrides = filter_ret[2]
+                    except Exception:
+                        overrides = None
             else:
                 filtered_items = filter_ret
 
@@ -2674,6 +2724,29 @@ def run_hierarchical_mosaic(
                     fits_file_paths = [p for p in fits_file_paths if p in sel_paths]
                     num_total_raw_files = len(fits_file_paths)
                     pcb(f"Phase 0: selection after filter = {num_total_raw_files} files", prog=None, lvl="INFO_DETAIL")
+
+            # Apply clustering parameter overrides (and inform GUI)
+            if isinstance(overrides, dict):
+                try:
+                    if 'cluster_panel_threshold' in overrides:
+                        new_thr = float(overrides['cluster_panel_threshold'])
+                        # Update effective threshold used later
+                        SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG = new_thr  # noqa: F841 (referenced later)
+                    if 'cluster_target_groups' in overrides:
+                        cluster_target_groups_config = int(overrides['cluster_target_groups'])  # noqa: F841
+                    # Notify GUI to update its controls
+                    try:
+                        thr_str = f"{float(overrides.get('cluster_panel_threshold', SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG)):.6f}"
+                    except Exception:
+                        thr_str = ""
+                    try:
+                        tgt_str = str(int(overrides.get('cluster_target_groups', cluster_target_groups_config)))
+                    except Exception:
+                        tgt_str = ""
+                    if thr_str or tgt_str:
+                        pcb(f"CLUSTER_OVERRIDE:panel={thr_str};target={tgt_str}", prog=None, lvl="INFO_DETAIL")
+                except Exception:
+                    pass
         except ImportError:
             # Optional UI absent: continue untouched
             pass
@@ -2879,11 +2952,247 @@ def run_hierarchical_mosaic(
     pcb("run_info_phase2_started", prog=base_progress_phase2, lvl="INFO")
     pcb("PHASE_UPDATE:2", prog=None, lvl="ETA_LEVEL")
     # Use order-invariant connected-components clustering for robustness
-    seestar_stack_groups = cluster_seestar_stacks_connected(all_raw_files_processed_info, SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG, progress_callback)
+    seestar_stack_groups = cluster_seestar_stacks_connected(
+        all_raw_files_processed_info, SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG, progress_callback
+    )
+    # Diagnostic: nearest-neighbor separation percentiles to help tune eps
+    try:
+        panel_centers_sky_dbg = []
+        for info in all_raw_files_processed_info:
+            wcs_obj = info.get("wcs")
+            if not (wcs_obj and getattr(wcs_obj, "is_celestial", False)):
+                continue
+            try:
+                if getattr(wcs_obj, "pixel_shape", None):
+                    cx = wcs_obj.pixel_shape[0] / 2.0
+                    cy = wcs_obj.pixel_shape[1] / 2.0
+                    center_world = wcs_obj.pixel_to_world(cx, cy)
+                elif hasattr(wcs_obj, "wcs") and hasattr(wcs_obj.wcs, "crval"):
+                    center_world = SkyCoord(
+                        ra=float(wcs_obj.wcs.crval[0]) * u.deg,
+                        dec=float(wcs_obj.wcs.crval[1]) * u.deg,
+                        frame="icrs",
+                    )
+                else:
+                    continue
+                panel_centers_sky_dbg.append(center_world)
+            except Exception:
+                continue
+        if len(panel_centers_sky_dbg) >= 2:
+            coords_dbg = SkyCoord(ra=[c.ra for c in panel_centers_sky_dbg], dec=[c.dec for c in panel_centers_sky_dbg], frame="icrs")
+            try:
+                _, sep_nn, _ = coords_dbg.match_to_catalog_sky(coords_dbg, nthneighbor=1)
+                nn = np.asarray(sep_nn.deg, dtype=float)
+                p10 = float(np.nanpercentile(nn, 10.0))
+                p50 = float(np.nanpercentile(nn, 50.0))
+                p90 = float(np.nanpercentile(nn, 90.0))
+                _log_and_callback(
+                    f"Cluster NN stats (deg): P10={p10:.4f}, P50={p50:.4f}, P90={p90:.4f}",
+                    prog=None,
+                    lvl="DEBUG_DETAIL",
+                    callback=progress_callback,
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # If clustering is pathologically conservative (almost one group per image),
+    # auto-relax the threshold based on nearest-neighbor distances to avoid
+    # producing hundreds of master tiles for tightly-dithered panels.
+    try:
+        total_inputs_for_cluster = len(all_raw_files_processed_info)
+        groups_initial = len(seestar_stack_groups)
+        if total_inputs_for_cluster > 2 and groups_initial >= max(3, int(0.9 * total_inputs_for_cluster)):
+            # Compute a robust suggested threshold from the 90th percentile of
+            # nearest-neighbor separations between panel centers.
+            # Rebuild centers the same way as clustering helpers do.
+            panel_centers_sky = []
+            for info in all_raw_files_processed_info:
+                wcs_obj = info.get("wcs")
+                if not (wcs_obj and getattr(wcs_obj, "is_celestial", False)):
+                    continue
+                try:
+                    if getattr(wcs_obj, "pixel_shape", None):
+                        cx = wcs_obj.pixel_shape[0] / 2.0
+                        cy = wcs_obj.pixel_shape[1] / 2.0
+                        center_world = wcs_obj.pixel_to_world(cx, cy)
+                    elif hasattr(wcs_obj, "wcs") and hasattr(wcs_obj.wcs, "crval"):
+                        center_world = SkyCoord(
+                            ra=float(wcs_obj.wcs.crval[0]) * u.deg,
+                            dec=float(wcs_obj.wcs.crval[1]) * u.deg,
+                            frame="icrs",
+                        )
+                    else:
+                        continue
+                    panel_centers_sky.append(center_world)
+                except Exception:
+                    continue
+
+            if len(panel_centers_sky) >= 2:
+                coords = SkyCoord(
+                    ra=[c.ra for c in panel_centers_sky],
+                    dec=[c.dec for c in panel_centers_sky],
+                    frame="icrs",
+                )
+                try:
+                    # Nearest neighbor (excluding self). Astropy handles wrap.
+                    _, sep2d, _ = coords.match_to_catalog_sky(coords, nthneighbor=1)
+                    nn_deg = np.asarray(sep2d.deg, dtype=float)
+                    # Robust high-quantile of dithers; add a small headroom.
+                    p90 = float(np.nanpercentile(nn_deg, 90.0)) if nn_deg.size else 0.0
+                    # Propose a relaxed threshold within sane bounds.
+                    thr_initial = float(SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG)
+                    thr_candidate = max(thr_initial, p90 * 1.2)
+                    thr_candidate = float(min(max(thr_candidate, 0.01), 1.0))  # clamp 0.01°..1.0°
+
+                    if thr_candidate > thr_initial:
+                        _log_and_callback(
+                            f"Cluster AUTO: threshold {thr_initial:.3f}° too conservative -> {groups_initial}/{total_inputs_for_cluster} groups.",
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                            callback=progress_callback,
+                        )
+                        _log_and_callback(
+                            f"Cluster AUTO: relaxing to {thr_candidate:.3f}° (≈1.2×P90 NN={p90:.3f}°) and re-clustering...",
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                            callback=progress_callback,
+                        )
+                        seestar_stack_groups = cluster_seestar_stacks_connected(
+                            all_raw_files_processed_info, thr_candidate, progress_callback
+                        )
+                        groups_after = len(seestar_stack_groups)
+                        _log_and_callback(
+                            f"Cluster AUTO: re-clustered into {groups_after} groups (was {groups_initial}).",
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                            callback=progress_callback,
+                        )
+                except Exception as e_auto_relax:
+                    _log_and_callback(
+                        f"Cluster AUTO: failed to compute NN-based relax: {e_auto_relax}",
+                        prog=None,
+                        lvl="DEBUG_DETAIL",
+                        callback=progress_callback,
+                    )
+    except Exception as e_cluster_guard:
+        _log_and_callback(
+            f"Cluster AUTO: guard exception: {e_cluster_guard}", prog=None, lvl="DEBUG_DETAIL", callback=progress_callback
+        )
+
+    # Optional: drive clustering to a target number of groups by relaxing
+    # the threshold via a bounded search. Disabled when target <= 0.
+    try:
+        target_groups = int(cluster_target_groups_config or 0)
+    except Exception:
+        target_groups = 0
+    if target_groups > 0 and len(seestar_stack_groups) != target_groups:
+        try:
+            # Build coordinates array
+            panel_centers_sky = []
+            for info in all_raw_files_processed_info:
+                wcs_obj = info.get("wcs")
+                if not (wcs_obj and getattr(wcs_obj, "is_celestial", False)):
+                    continue
+                try:
+                    if getattr(wcs_obj, "pixel_shape", None):
+                        cx = wcs_obj.pixel_shape[0] / 2.0
+                        cy = wcs_obj.pixel_shape[1] / 2.0
+                        center_world = wcs_obj.pixel_to_world(cx, cy)
+                    elif hasattr(wcs_obj, "wcs") and hasattr(wcs_obj.wcs, "crval"):
+                        center_world = SkyCoord(
+                            ra=float(wcs_obj.wcs.crval[0]) * u.deg,
+                            dec=float(wcs_obj.wcs.crval[1]) * u.deg,
+                            frame="icrs",
+                        )
+                    else:
+                        continue
+                    panel_centers_sky.append(center_world)
+                except Exception:
+                    continue
+
+            if len(panel_centers_sky) >= 2:
+                coords = SkyCoord(
+                    ra=[c.ra for c in panel_centers_sky],
+                    dec=[c.dec for c in panel_centers_sky],
+                    frame="icrs",
+                )
+                # Establish an upper bound big enough that all panels connect
+                # (max pairwise separation). Clamp to 5 degrees to avoid
+                # pathological values.
+                try:
+                    sep_mat_deg = coords.separation(coords).deg
+                    max_pair_deg = float(np.nanmax(sep_mat_deg)) if np.size(sep_mat_deg) else 0.5
+                except Exception:
+                    max_pair_deg = 0.5
+                thr_current = float(SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG)
+                def _count_groups(thr: float) -> tuple[int, list]:
+                    g = cluster_seestar_stacks_connected(all_raw_files_processed_info, float(thr), None)
+                    return len(g), g
+                cnt_cur = len(seestar_stack_groups)
+                # Direction: if too many groups, increase threshold; if too few, decrease.
+                if cnt_cur > target_groups:
+                    lo = thr_current
+                    hi = float(min(max(max_pair_deg, lo * 2.0, 0.05), 5.0))
+                    cnt_hi, groups_hi = _count_groups(hi)
+                    # Expand hi until we get <= target (fewer groups) or cap
+                    expand_iter = 0
+                    while cnt_hi > target_groups and hi < 5.0 and expand_iter < 8:
+                        hi = min(hi * 1.5 + 1e-6, 5.0)
+                        cnt_hi, groups_hi = _count_groups(hi)
+                        expand_iter += 1
+                    best_thr = hi
+                    best_groups = groups_hi
+                    for _ in range(14):
+                        mid = 0.5 * (lo + hi)
+                        cnt_mid, groups_mid = _count_groups(mid)
+                        if cnt_mid > target_groups:
+                            lo = mid
+                        else:
+                            hi = mid
+                            best_thr = mid
+                            best_groups = groups_mid
+                else:
+                    # Need more groups ⇒ lower the threshold
+                    hi = thr_current
+                    lo = max(1e-6, hi / 2.0)
+                    cnt_lo, groups_lo = _count_groups(lo)
+                    shrink_iter = 0
+                    while cnt_lo < target_groups and lo > 1e-6 and shrink_iter < 12:
+                        hi = lo
+                        lo = max(1e-6, lo / 1.5)
+                        cnt_lo, groups_lo = _count_groups(lo)
+                        shrink_iter += 1
+                    best_thr = lo
+                    best_groups = groups_lo
+                    # Binary search upward to approach target from the high side (more stable)
+                    for _ in range(14):
+                        mid = 0.5 * (lo + hi)
+                        cnt_mid, groups_mid = _count_groups(mid)
+                        if cnt_mid < target_groups:
+                            # still too few groups ⇒ lower threshold more
+                            hi = mid
+                        else:
+                            lo = mid
+                            best_thr = mid
+                            best_groups = groups_mid
+                _log_and_callback(
+                    f"Cluster AUTO Target: threshold -> {best_thr:.4f}° for ≈{len(best_groups)} groups (target {target_groups}).",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                    callback=progress_callback,
+                )
+                seestar_stack_groups = best_groups
+        except Exception as e_target:
+            _log_and_callback(
+                f"Cluster AUTO Target: search failed: {e_target}", prog=None, lvl="DEBUG_DETAIL", callback=progress_callback
+            )
     if not seestar_stack_groups:
         pcb("run_error_phase2_no_groups", prog=(base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING), lvl="ERROR")
         return
-    if max_raw_per_master_tile_config and max_raw_per_master_tile_config > 0:
+    # Do not subdivide groups if a target group count is set; respect clustering first.
+    if (cluster_target_groups_config is None or int(cluster_target_groups_config) <= 0) and \
+       max_raw_per_master_tile_config and max_raw_per_master_tile_config > 0:
         new_groups = []
         for g in seestar_stack_groups:
             for i in range(0, len(g), max_raw_per_master_tile_config):
@@ -2908,7 +3217,7 @@ def run_hierarchical_mosaic(
         lvl="INFO",
     )
     manual_limit = max_raw_per_master_tile_config
-    if auto_limit_frames_per_master_tile_config:
+    if (cluster_target_groups_config is None or int(cluster_target_groups_config) <= 0) and auto_limit_frames_per_master_tile_config:
         try:
             sample_path = seestar_stack_groups[0][0].get('path_preprocessed_cache')
             sample_arr = np.load(sample_path, mmap_mode='r')
@@ -3372,7 +3681,8 @@ def run_hierarchical_mosaic(
             try:
                 import cupy
                 cupy.cuda.Device(0).use()
-                final_mosaic_data_HWC, final_mosaic_coverage_HW = zemosaic_utils.gpu_assemble_final_mosaic_incremental(
+                # Incremental GPU path not implemented; use CPU incremental assembly.
+                final_mosaic_data_HWC, final_mosaic_coverage_HW = assemble_final_mosaic_incremental(
                     master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly,
                     final_output_wcs=final_output_wcs,
                     final_output_shape_hw=final_output_shape_hw,
@@ -3422,7 +3732,8 @@ def run_hierarchical_mosaic(
             try:
                 import cupy
                 cupy.cuda.Device(0).use()
-                final_mosaic_data_HWC, final_mosaic_coverage_HW = zemosaic_utils.gpu_assemble_final_mosaic_reproject_coadd(
+                # Use the internal CPU/GPU wrapper with use_gpu=True
+                final_mosaic_data_HWC, final_mosaic_coverage_HW = assemble_final_mosaic_reproject_coadd(
                     master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly,
                     final_output_wcs=final_output_wcs,
                     final_output_shape_hw=final_output_shape_hw,
@@ -3431,6 +3742,7 @@ def run_hierarchical_mosaic(
                     match_bg=True,
                     apply_crop=apply_master_tile_crop_config,
                     crop_percent=master_tile_crop_percent_config,
+                    use_gpu=True,
                     base_progress_phase5=base_progress_phase5,
                     progress_weight_phase5=PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
                     start_time_total_run=start_time_total_run,
@@ -3500,7 +3812,7 @@ def run_hierarchical_mosaic(
         try: final_header.update(final_output_wcs.to_header(relax=True))
         except Exception as e_hdr_wcs: pcb("run_warn_phase6_wcs_to_header_failed", error=str(e_hdr_wcs), lvl="WARN")
     
-    final_header['SOFTWARE']=('ZeMosaic v0.9.4','Mosaic Software') # Incrémente la version si tu le souhaites
+    final_header['SOFTWARE']=('ZeMosaic v2.8.0','Mosaic Software') # Incrémente la version si tu le souhaites
     final_header['NMASTILE']=(len(master_tiles_results_list),"Master Tiles combined")
     final_header['NRAWINIT']=(num_total_raw_files,"Initial raw images found")
     final_header['NRAWPROC']=(len(all_raw_files_processed_info),"Raw images with WCS processed")
@@ -3741,7 +4053,9 @@ def run_hierarchical_mosaic_process(
             return
         progress_queue.put((message_key_or_raw, progress_value, level, cb_kwargs))
 
-    full_args = args[:8] + (queue_callback,) + args[8:]
+    # Insert the process queue callback in the expected position (after
+    # cluster threshold and optional target group count).
+    full_args = args[:9] + (queue_callback,) + args[9:]
     try:
         run_hierarchical_mosaic(*full_args, solver_settings=solver_settings_dict, **kwargs)
     except Exception as e_proc:
