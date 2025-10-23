@@ -37,12 +37,13 @@ DEFAULT_CONFIG = {
     "assembly_process_workers": 0,  # Worker count for final assembly (both methods)
     "auto_limit_frames_per_master_tile": True,
     "winsor_worker_limit": 4,
+    "winsor_max_frames_per_pass": 0,
     "max_raw_per_master_tile": 0,
     # Early GUI filter option (Phase 0 header-only scan)
     "enable_early_filter": True,
     # --- CLES POUR LE ROGNAGE DES MASTER TUILES ---
     "apply_master_tile_crop": True,       # Désactivé par défaut
-    "master_tile_crop_percent": 18.0      # Pourcentage par côté si activé (ex: 10%)
+    "master_tile_crop_percent": 10.0      # Pourcentage par côté si activé (ex: 10%)
     # --- FIN CLES POUR LE ROGNAGE --- 
 }
 
