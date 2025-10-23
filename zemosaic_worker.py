@@ -151,6 +151,219 @@ def cluster_seestar_stacks_connected(
     return groups
 
 
+# --- Helpers for RAM budget enforcement during stacking ---
+def _extract_hw_from_info(raw_info: dict) -> tuple[int, int]:
+    """Return (H, W) dimensions inferred from cached metadata."""
+
+    if not isinstance(raw_info, dict):
+        return 0, 0
+
+    shape = raw_info.get("preprocessed_shape")
+    if shape:
+        try:
+            # Accept either (H, W) or (H, W, C)
+            h = int(shape[0])
+            w = int(shape[1]) if len(shape) >= 2 else 0
+            if h > 0 and w > 0:
+                return h, w
+        except Exception:
+            pass
+
+    header_obj = raw_info.get("header")
+    if header_obj is not None:
+        try:
+            # fits.Header exposes .get, dict fallback to __getitem__
+            get = header_obj.get if hasattr(header_obj, "get") else header_obj.__getitem__
+            w = int(get("NAXIS1", 0)) if hasattr(header_obj, "get") else int(get("NAXIS1"))
+            h = int(get("NAXIS2", 0)) if hasattr(header_obj, "get") else int(get("NAXIS2"))
+            if h > 0 and w > 0:
+                return h, w
+        except Exception:
+            pass
+
+    wcs_obj = raw_info.get("wcs")
+    if wcs_obj is not None and getattr(wcs_obj, "pixel_shape", None):
+        try:
+            w = int(wcs_obj.pixel_shape[0])
+            h = int(wcs_obj.pixel_shape[1]) if len(wcs_obj.pixel_shape) > 1 else 0
+            if h > 0 and w > 0:
+                return h, w
+        except Exception:
+            pass
+
+    return 0, 0
+
+
+def _estimate_group_memory_bytes(group: list[dict]) -> tuple[int, int, int, int]:
+    """Estimate total memory footprint (bytes) for a stack group.
+
+    Returns ``(total_bytes, per_frame_bytes, max_h, max_w)``.
+    ``per_frame_bytes`` follows the simplified model ``H * W * 4``.
+    """
+
+    if not group:
+        return 0, 0, 0, 0
+
+    max_h = 0
+    max_w = 0
+    for info in group:
+        h, w = _extract_hw_from_info(info)
+        max_h = max(max_h, int(h))
+        max_w = max(max_w, int(w))
+
+    if max_h <= 0 or max_w <= 0:
+        return 0, 0, max_h, max_w
+
+    per_frame_bytes = int(max_h) * int(max_w) * 4
+    total_bytes = per_frame_bytes * len(group)
+    return total_bytes, per_frame_bytes, max_h, max_w
+
+
+def _split_group_temporally(group: list[dict], segment_size: int) -> list[list[dict]]:
+    """Split ``group`` into contiguous segments of ``segment_size`` (>=1)."""
+
+    if segment_size <= 0:
+        return [group]
+    return [group[i:i + segment_size] for i in range(0, len(group), segment_size)]
+
+
+def _attempt_recluster_for_budget(
+    group: list[dict],
+    budget_bytes: int,
+    base_threshold_deg: float,
+    orientation_split_threshold_deg: float,
+    cluster_func: Callable[..., list] = cluster_seestar_stacks_connected,
+    max_attempts: int = 6,
+) -> tuple[list[list[dict]], float, int] | None:
+    """Try to relax clustering threshold until all subgroups fit the RAM budget."""
+
+    if not group or len(group) <= 1:
+        return None
+    try:
+        current_thr = float(base_threshold_deg)
+    except Exception:
+        return None
+    if current_thr <= 0:
+        return None
+
+    for attempt in range(1, max_attempts + 1):
+        current_thr = max(current_thr * 0.7, 1e-5)
+        try:
+            reclustered = cluster_func(
+                group,
+                float(current_thr),
+                None,
+                orientation_split_threshold_deg=orientation_split_threshold_deg,
+            )
+        except Exception:
+            return None
+
+        if not reclustered or len(reclustered) <= 1:
+            continue
+
+        fits_budget = True
+        for sub in reclustered:
+            total_bytes, _, _, _ = _estimate_group_memory_bytes(sub)
+            if budget_bytes > 0 and total_bytes > budget_bytes:
+                fits_budget = False
+                break
+        if fits_budget:
+            return reclustered, float(current_thr), attempt
+
+    return None
+
+
+def _apply_ram_budget_to_groups(
+    groups: list[list[dict]],
+    budget_bytes: int,
+    base_threshold_deg: float,
+    orientation_split_threshold_deg: float,
+    cluster_func: Callable[..., list] = cluster_seestar_stacks_connected,
+) -> tuple[list[list[dict]], list[dict]]:
+    """Ensure each stack group fits in the RAM budget by splitting or re-clustering."""
+
+    if budget_bytes is None or budget_bytes <= 0:
+        return groups, []
+
+    final_groups: list[list[dict]] = []
+    adjustments: list[dict] = []
+    queue: list[tuple[int, list[dict]]] = [(idx + 1, grp) for idx, grp in enumerate(groups)]
+
+    while queue:
+        group_index, group = queue.pop(0)
+        total_bytes, per_frame_bytes, _, _ = _estimate_group_memory_bytes(group)
+
+        if total_bytes <= 0 or total_bytes <= budget_bytes:
+            final_groups.append(group)
+            continue
+
+        if len(group) == 1:
+            # Nothing else can be done; log and proceed.
+            adjustments.append(
+                {
+                    "method": "single_over_budget",
+                    "group_index": group_index,
+                    "original_frames": len(group),
+                    "estimated_mb": total_bytes / (1024 ** 2),
+                    "budget_mb": budget_bytes / (1024 ** 2),
+                }
+            )
+            final_groups.append(group)
+            continue
+
+        recluster_result = _attempt_recluster_for_budget(
+            group,
+            budget_bytes,
+            base_threshold_deg,
+            orientation_split_threshold_deg,
+            cluster_func=cluster_func,
+        )
+        if recluster_result:
+            reclustered_groups, new_threshold, attempts = recluster_result
+            adjustments.append(
+                {
+                    "method": "recluster",
+                    "group_index": group_index,
+                    "original_frames": len(group),
+                    "num_subgroups": len(reclustered_groups),
+                    "new_threshold_deg": new_threshold,
+                    "attempts": attempts,
+                    "estimated_mb": total_bytes / (1024 ** 2),
+                    "budget_mb": budget_bytes / (1024 ** 2),
+                }
+            )
+            queue = [(group_index, sub) for sub in reclustered_groups] + queue
+            continue
+
+        if per_frame_bytes <= 0:
+            # Unable to infer size; keep original group.
+            final_groups.append(group)
+            continue
+
+        max_frames = max(1, int(budget_bytes // per_frame_bytes))
+        if max_frames >= len(group):
+            final_groups.append(group)
+            continue
+
+        segmented = _split_group_temporally(group, max_frames)
+        still_over = any(_estimate_group_memory_bytes(seg)[0] > budget_bytes for seg in segmented)
+        adjustments.append(
+            {
+                "method": "split",
+                "group_index": group_index,
+                "original_frames": len(group),
+                "num_subgroups": len(segmented),
+                "segment_size": max_frames,
+                "estimated_mb": total_bytes / (1024 ** 2),
+                "budget_mb": budget_bytes / (1024 ** 2),
+                "still_over_budget": still_over,
+            }
+        )
+        queue = [(group_index, seg) for seg in segmented] + queue
+
+    return final_groups, adjustments
+
+
 # --- Configuration du Logging ---
 logger = logging.getLogger("ZeMosaicWorker")
 if not logger.handlers:
@@ -264,7 +477,10 @@ try: import zemosaic_astrometry; ZEMOSAIC_ASTROMETRY_AVAILABLE = True; logger.in
 except ImportError as e: logger.error(f"Import 'zemosaic_astrometry.py' échoué: {e}.")
 try: import zemosaic_align_stack; ZEMOSAIC_ALIGN_STACK_AVAILABLE = True; logger.info("Module 'zemosaic_align_stack' importé.")
 except ImportError as e: logger.error(f"Import 'zemosaic_align_stack.py' échoué: {e}.")
-from .solver_settings import SolverSettings
+try:
+    from .solver_settings import SolverSettings  # type: ignore
+except ImportError:
+    from solver_settings import SolverSettings  # type: ignore
 
 # Optional configuration import for GPU toggle
 try:
@@ -2573,6 +2789,7 @@ def run_hierarchical_mosaic(
     cluster_target_groups_config: int,
     cluster_orientation_split_deg_config: float,
     progress_callback: callable,
+    stack_ram_budget_gb_config: float,
     stack_norm_method: str,
     stack_weight_method: str,
     stack_reject_algo: str,
@@ -2614,6 +2831,8 @@ def run_hierarchical_mosaic(
         Limite du nombre d'images traitées simultanément par le rejet Winsorized (0 = illimité).
     winsor_worker_limit_config : int
         Nombre maximal de workers pour la phase de rejet Winsorized.
+    stack_ram_budget_gb_config : float
+        Budget RAM (en Gio) autorisé pour le chargement d'un groupe de stacking (0 = illimité).
     """
     pcb = lambda msg_key, prog=None, lvl="INFO", **kwargs: _log_and_callback(msg_key, prog, lvl, callback=progress_callback, **kwargs)
 
@@ -2665,6 +2884,11 @@ def run_hierarchical_mosaic(
     except (TypeError, ValueError):
         orientation_split_thr = 0.0
     ORIENTATION_SPLIT_THRESHOLD_DEG = orientation_split_thr if orientation_split_thr > 0 else 0.0
+    try:
+        stack_ram_budget_gb = float(stack_ram_budget_gb_config or 0.0)
+    except (TypeError, ValueError):
+        stack_ram_budget_gb = 0.0
+    STACK_RAM_BUDGET_BYTES = int(stack_ram_budget_gb * (1024 ** 3)) if stack_ram_budget_gb > 0 else 0
     PROGRESS_WEIGHT_PHASE1_RAW_SCAN = 30; PROGRESS_WEIGHT_PHASE2_CLUSTERING = 5
     PROGRESS_WEIGHT_PHASE3_MASTER_TILES = 35; PROGRESS_WEIGHT_PHASE4_GRID_CALC = 5
     PROGRESS_WEIGHT_PHASE5_ASSEMBLY = 15; PROGRESS_WEIGHT_PHASE6_SAVE = 8
@@ -3026,6 +3250,7 @@ def run_hierarchical_mosaic(
                                 'path_hotpix_mask': hp_mask_path,
                                 'wcs': wcs_obj_solved,
                                 'header': header_obj_updated,
+                                'preprocessed_shape': tuple(int(dim) for dim in getattr(img_data_adu, 'shape', []) or ()),
                             }
                         except Exception as e_save_npy:
                             pcb(
@@ -3138,6 +3363,62 @@ def run_hierarchical_mosaic(
         progress_callback,
         orientation_split_threshold_deg=ORIENTATION_SPLIT_THRESHOLD_DEG,
     )
+    if STACK_RAM_BUDGET_BYTES > 0 and seestar_stack_groups:
+        seestar_stack_groups, ram_budget_adjustments = _apply_ram_budget_to_groups(
+            seestar_stack_groups,
+            STACK_RAM_BUDGET_BYTES,
+            float(SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG),
+            float(ORIENTATION_SPLIT_THRESHOLD_DEG),
+        )
+        for adj in ram_budget_adjustments:
+            method = adj.get("method")
+            if method == "recluster":
+                _log_and_callback(
+                    "clusterstacks_warn_ram_budget_recluster",
+                    prog=None,
+                    lvl="WARN",
+                    callback=progress_callback,
+                    group_index=adj.get("group_index"),
+                    original_frames=adj.get("original_frames"),
+                    num_subgroups=adj.get("num_subgroups"),
+                    new_threshold_deg=adj.get("new_threshold_deg"),
+                    attempts=adj.get("attempts"),
+                    estimated_mb=adj.get("estimated_mb"),
+                    budget_mb=adj.get("budget_mb"),
+                )
+            elif method == "split":
+                _log_and_callback(
+                    "clusterstacks_warn_ram_budget_split",
+                    prog=None,
+                    lvl="WARN",
+                    callback=progress_callback,
+                    group_index=adj.get("group_index"),
+                    original_frames=adj.get("original_frames"),
+                    num_subgroups=adj.get("num_subgroups"),
+                    segment_size=adj.get("segment_size"),
+                    estimated_mb=adj.get("estimated_mb"),
+                    budget_mb=adj.get("budget_mb"),
+                )
+                if adj.get("still_over_budget"):
+                    _log_and_callback(
+                        "clusterstacks_warn_ram_budget_split_still_over",
+                        prog=None,
+                        lvl="WARN",
+                        callback=progress_callback,
+                        group_index=adj.get("group_index"),
+                        segment_size=adj.get("segment_size"),
+                        budget_mb=adj.get("budget_mb"),
+                    )
+            elif method == "single_over_budget":
+                _log_and_callback(
+                    "clusterstacks_warn_ram_budget_single_over",
+                    prog=None,
+                    lvl="WARN",
+                    callback=progress_callback,
+                    group_index=adj.get("group_index"),
+                    estimated_mb=adj.get("estimated_mb"),
+                    budget_mb=adj.get("budget_mb"),
+                )
     # Diagnostic: nearest-neighbor separation percentiles to help tune eps
     try:
         panel_centers_sky_dbg = []
