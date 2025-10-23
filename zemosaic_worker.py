@@ -514,6 +514,113 @@ def _log_alignment_warning_summary():
             logger.info("%d frame(s) - %s", count, human)
 
 
+def _auto_crop_mosaic_to_valid_region(
+    mosaic: np.ndarray,
+    coverage: np.ndarray | None,
+    output_wcs,
+    log_callback=None,
+    threshold: float = 1e-6,
+):
+    """Crop blank borders from the mosaic using the coverage map.
+
+    Parameters
+    ----------
+    mosaic : np.ndarray
+        Final stacked mosaic with shape ``(H, W, C)``.
+    coverage : np.ndarray | None
+        Coverage/weight map returned by ``reproject_and_coadd``.
+    output_wcs : astropy.wcs.WCS | Any
+        WCS object describing the mosaic; will be updated in-place if cropping occurs.
+    log_callback : callable | None
+        Optional callback used to emit log messages (same signature as ``_pcb``).
+    threshold : float
+        Minimum coverage value considered as valid data when computing the crop bounds.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray | None]
+        Cropped mosaic and coverage arrays. If no cropping is necessary the
+        original inputs are returned unchanged.
+    """
+
+    if mosaic is None or coverage is None:
+        return mosaic, coverage
+
+    try:
+        cov_array = np.asarray(coverage)
+    except Exception:
+        cov_array = coverage
+
+    if getattr(cov_array, "ndim", 0) != 2:
+        return mosaic, coverage
+
+    try:
+        valid_mask = np.asarray(cov_array) > float(threshold)
+    except Exception:
+        return mosaic, coverage
+
+    if not np.any(valid_mask):
+        return mosaic, coverage
+
+    rows = np.where(np.any(valid_mask, axis=1))[0]
+    cols = np.where(np.any(valid_mask, axis=0))[0]
+    if rows.size == 0 or cols.size == 0:
+        return mosaic, coverage
+
+    y_min, y_max = int(rows[0]), int(rows[-1]) + 1
+    x_min, x_max = int(cols[0]), int(cols[-1]) + 1
+
+    if (
+        y_min == 0
+        and x_min == 0
+        and y_max == mosaic.shape[0]
+        and x_max == mosaic.shape[1]
+    ):
+        return mosaic, coverage
+
+    cropped_mosaic = mosaic[y_min:y_max, x_min:x_max, ...]
+    cropped_coverage = coverage[y_min:y_max, x_min:x_max]
+
+    new_shape = tuple(int(v) for v in cropped_mosaic.shape)
+
+    if callable(log_callback):
+        try:
+            log_callback(
+                "ASM_REPROJ_COADD: Auto-cropped output to coverage bounds",
+                prog=None,
+                lvl="INFO_DETAIL",
+                y_bounds=f"{y_min}:{y_max}",
+                x_bounds=f"{x_min}:{x_max}",
+                new_shape=str(new_shape),
+            )
+        except Exception:
+            pass
+
+    try:
+        if hasattr(output_wcs, "wcs") and getattr(output_wcs, "wcs") is not None:
+            if hasattr(output_wcs.wcs, "crpix") and output_wcs.wcs.crpix is not None:
+                output_wcs.wcs.crpix[0] -= float(x_min)
+                output_wcs.wcs.crpix[1] -= float(y_min)
+            if hasattr(output_wcs.wcs, "naxis1"):
+                output_wcs.wcs.naxis1 = int(new_shape[1])
+            if hasattr(output_wcs.wcs, "naxis2"):
+                output_wcs.wcs.naxis2 = int(new_shape[0])
+    except Exception:
+        pass
+
+    for attr, val in (
+        ("pixel_shape", (int(new_shape[1]), int(new_shape[0]))),
+        ("array_shape", (int(new_shape[0]), int(new_shape[1]))),
+    ):
+        if hasattr(output_wcs, attr):
+            try:
+                setattr(output_wcs, attr, val)
+            except Exception:
+                pass
+
+    return cropped_mosaic, cropped_coverage
+
+
 def _wait_for_memmap_files(prefixes, timeout=10.0):
     """Poll until each prefix.dat and prefix.npy exist and are non-empty."""
     import time, os
@@ -2398,6 +2505,13 @@ def assemble_final_mosaic_reproject_coadd(
             fits.writeto("final_mosaic.fits", mosaic_data.astype(np.float32), hdr_for_output, overwrite=True)
         except Exception:
             pass
+
+    mosaic_data, coverage = _auto_crop_mosaic_to_valid_region(
+        mosaic_data,
+        coverage,
+        final_output_wcs,
+        log_callback=_pcb,
+    )
 
     # Defer memmap cleanup to Phase 6 after final save
 
