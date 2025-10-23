@@ -397,6 +397,8 @@
     "filter_cluster_threshold_label": "Panel threshold (deg):",
     "filter_orientation_split_label": "Split by orientation (deg) 0=off:",
     "run_warn_phase3_master_tile_creation_failed_thread": "WARN P3: Master Tile creation failed in a worker thread.",
+    "run_warn_phase3_alignment_retry_abandoned": "WARN P3: Alignment retry abandoned for tile {tile_id} frame {filename} after {attempts} attempt(s).",
+    "run_info_phase3_retry_submitted": "INFO P3: Retry stack scheduled from tile {origin_tile} -> new tile {new_tile} with {frames} frame(s).",
     "run_warn_phase6_wcs_to_header_failed": "WARN P6: Failed to convert WCS to FITS header: {error}",
     "run_success_preview_saved_fallback": "Preview saved (fallback): {filename}",
     "run_error_phase3_thread_exception": "ERROR P3: Exception in master tile creation thread.",
