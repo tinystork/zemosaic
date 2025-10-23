@@ -323,6 +323,8 @@
     "num_workers_note": "(0 = auto, basé sur les cœurs CPU)",
     "winsor_workers_label": "Limite workers Winsor :",
     "winsor_workers_note": "(1-16, rejet parallèle par canal)",
+    "winsor_frames_label": "Images Winsor par passe :",
+    "winsor_frames_note": "(0 désactive la limite de streaming)",
     "stacking_min_radial_floor_label": "Plancher Poids Radial Min (0.0-0.5) :",
     "stacking_min_radial_floor_note": "(0.0 = pas de plancher)",
     "gui_memmap_title": "Options memmap (coadd)",

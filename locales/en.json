@@ -324,6 +324,8 @@
     "num_workers_note": "(0 = auto, based on CPU cores)",
     "winsor_workers_label": "Winsor worker limit:",
     "winsor_workers_note": "(1-16, per-channel rejection)",
+    "winsor_frames_label": "Winsor frames per pass:",
+    "winsor_frames_note": "(0 disables streaming limit)",
     "stacking_min_radial_floor_label": "Min Radial Weight Floor (0.0-0.5):",
     "stacking_min_radial_floor_note": "(0.0 = no floor)",
     "gui_memmap_title": "Memmap Options (coadd)",
