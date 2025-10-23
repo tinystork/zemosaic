@@ -3,6 +3,7 @@
 import numpy as np
 import os
 import importlib.util
+import tempfile
 from typing import Optional
 
 GPU_AVAILABLE = importlib.util.find_spec("cupy") is not None
@@ -117,6 +118,31 @@ try:
     ZEMOSAIC_UTILS_AVAILABLE_FOR_RADIAL = True
 except ImportError as e_util_rad:
         print(f"AVERT (zemosaic_align_stack): Radial weighting: Erreur import make_radial_weight_map: {e_util_rad}")
+
+CPU_WINSOR_MEMMAP_THRESHOLD_BYTES = int(
+    os.environ.get("ZEMOSAIC_CPU_WINSOR_MEMMAP_THRESHOLD", 3 * 1024**3)
+)
+
+
+def _cleanup_memmap(arr: np.ndarray, path: Optional[str]) -> None:
+    """Release resources for a temporary memmap-backed array."""
+
+    if isinstance(arr, np.memmap):
+        try:
+            arr._mmap.close()  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    if path:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError:
+            _internal_logger.debug(
+                "CPU winsorized fallback: unable to delete memmap file",
+                exc_info=True,
+            )
+
 
 # Optional access to utils for GPU helpers
 ZU_AVAILABLE = False
@@ -2046,10 +2072,12 @@ def _cpu_stack_winsorized_fallback(
         Stacked image (H,W[,C]) as float32 and rejected percentage.
     """
     # Normalize and validate input frames without forcing a ragged ndarray
-    frames_list = []
+    frames_list: list[np.ndarray] = []
     first_shape = None
     dropped = 0
+    total_seen = 0
     for f in frames:
+        total_seen += 1
         a = np.asarray(f, dtype=np.float32)
         if first_shape is None:
             first_shape = a.shape
@@ -2071,68 +2099,106 @@ def _cpu_stack_winsorized_fallback(
     if not frames_list:
         raise ValueError("No frames with consistent shape to stack in CPU winsorized fallback")
 
-    if len(frames_list) < len(list(frames)):
+    if dropped:
+        total_frames = total_seen if total_seen else (dropped + len(frames_list))
         _internal_logger.warning(
-            f"Winsorized fallback: using {len(frames_list)} frames; dropped {len(list(frames)) - len(frames_list)} mismatched."
+            "Winsorized fallback: using %d frames; dropped %d mismatched (total input %d).",
+            len(frames_list),
+            dropped,
+            total_frames,
         )
 
-    arr = np.stack(frames_list, axis=0)
+    arr_shape = (len(frames_list),) + first_shape  # type: ignore[operator]
+    dtype = np.dtype(np.float32)
+    estimated_bytes = int(np.prod(arr_shape, dtype=np.int64)) * dtype.itemsize
+    memmap_path: Optional[str] = None
+    if estimated_bytes >= CPU_WINSOR_MEMMAP_THRESHOLD_BYTES:
+        tmp = tempfile.NamedTemporaryFile(prefix="zemosaic_winsor_", suffix=".dat", delete=False)
+        memmap_path = tmp.name
+        tmp.close()
+        arr = np.memmap(memmap_path, mode="w+", dtype=dtype, shape=arr_shape)
+        for idx, frame in enumerate(frames_list):
+            arr[idx] = frame
+        arr.flush()
+        _internal_logger.debug(
+            "CPU winsorized fallback: frames stored in memmap %s (~%.2f GiB).",
+            memmap_path,
+            estimated_bytes / (1024**3),
+        )
+    else:
+        arr = np.stack(frames_list, axis=0)
     # Libérer au plus tôt la mémoire retenue par la liste de frames individuelles.
     frames_list.clear()
     if arr.ndim not in (3, 4):
         raise ValueError(f"frames must be (N,H,W) or (N,H,W,C); got shape {arr.shape}")
 
-    # Compute reject mask and rewinsorized data using existing helper
-    data_with_nans, keep_mask = _reject_outliers_winsorized_sigma_clip(
-        stacked_array_NHDWC=arr,
-        winsor_limits_tuple=winsor_limits,
-        sigma_low=kappa,
-        sigma_high=kappa,
-        progress_callback=progress_callback,
-        max_workers=winsor_max_workers,
-        apply_rewinsor=apply_rewinsor,
-    )
+    result: np.ndarray
+    rejected_pct_value: float
+    try:
+        # Compute reject mask and rewinsorized data using existing helper
+        data_with_nans, keep_mask = _reject_outliers_winsorized_sigma_clip(
+            stacked_array_NHDWC=arr,
+            winsor_limits_tuple=winsor_limits,
+            sigma_low=kappa,
+            sigma_high=kappa,
+            progress_callback=progress_callback,
+            max_workers=winsor_max_workers,
+            apply_rewinsor=apply_rewinsor,
+        )
 
-    # Compute rejection percentage
-    if keep_mask is None:
-        total = data_with_nans.size
-        kept = np.count_nonzero(np.isfinite(data_with_nans))
-    else:
-        total = keep_mask.size
-        kept = np.count_nonzero(keep_mask)
-    rejected_pct = 100.0 * float(total - kept) / float(total) if total else 0.0
+        # Compute rejection percentage
+        if keep_mask is None:
+            total = data_with_nans.size
+            kept = np.count_nonzero(np.isfinite(data_with_nans))
+        else:
+            total = keep_mask.size
+            kept = np.count_nonzero(keep_mask)
+        rejected_pct = 100.0 * float(total - kept) / float(total) if total else 0.0
 
-    # Weighted or unweighted combine along axis 0
-    if weights is None:
-        stacked = np.nanmean(data_with_nans, axis=0)
-    else:
-        w = np.asarray(weights, dtype=np.float32)
-        # Normalize weight shape to broadcast over (N,H/W[,C])
-        if w.ndim == 1 and w.shape[0] == arr.shape[0]:
-            # reshape to (N,1,1[,1])
-            extra_dims = (1,) * (arr.ndim - 1)
-            w = w.reshape((arr.shape[0],) + extra_dims)
-        # If weights do not align to arr shape except for axis 0, attempt broadcast
+        # Weighted or unweighted combine along axis 0
+        if weights is None:
+            stacked = np.nanmean(data_with_nans, axis=0)
+        else:
+            w = np.asarray(weights, dtype=np.float32)
+            # Normalize weight shape to broadcast over (N,H/W[,C])
+            if w.ndim == 1 and w.shape[0] == arr.shape[0]:
+                # reshape to (N,1,1[,1])
+                extra_dims = (1,) * (arr.ndim - 1)
+                w = w.reshape((arr.shape[0],) + extra_dims)
+            # If weights do not align to arr shape except for axis 0, attempt broadcast
+            try:
+                bw = np.broadcast_to(w, data_with_nans.shape).astype(np.float32, copy=False)
+            except Exception:
+                raise ValueError(
+                    f"weights shape {w.shape} not compatible with frames shape {arr.shape}"
+                )
+            # Zero-out weights where value is NaN to exclude rejected pixels when apply_rewinsor=False
+            mask_finite = np.isfinite(data_with_nans)
+            bw = np.where(mask_finite, bw, 0.0)
+            num = np.nansum(bw * data_with_nans, axis=0)
+            den = np.sum(bw, axis=0)
+            # Avoid division by zero: fallback to nanmean of original frames where den==0
+            with np.errstate(invalid="ignore", divide="ignore"):
+                stacked = np.where(den > 0, num / den, np.nan)
+            # Fill any remaining NaNs with simple nanmean across original frames
+            if np.any(~np.isfinite(stacked)):
+                stacked_fallback = np.nanmean(arr, axis=0)
+                stacked = np.where(np.isfinite(stacked), stacked, stacked_fallback)
+
+        result = stacked.astype(np.float32)
+        rejected_pct_value = float(rejected_pct)
+    finally:
+        # Drop references before cleaning the backing file to ease GC on Windows.
         try:
-            bw = np.broadcast_to(w, data_with_nans.shape).astype(np.float32, copy=False)
-        except Exception:
-            raise ValueError(
-                f"weights shape {w.shape} not compatible with frames shape {arr.shape}"
-            )
-        # Zero-out weights where value is NaN to exclude rejected pixels when apply_rewinsor=False
-        mask_finite = np.isfinite(data_with_nans)
-        bw = np.where(mask_finite, bw, 0.0)
-        num = np.nansum(bw * data_with_nans, axis=0)
-        den = np.sum(bw, axis=0)
-        # Avoid division by zero: fallback to nanmean of original frames where den==0
-        with np.errstate(invalid="ignore", divide="ignore"):
-            stacked = np.where(den > 0, num / den, np.nan)
-        # Fill any remaining NaNs with simple nanmean across original frames
-        if np.any(~np.isfinite(stacked)):
-            stacked_fallback = np.nanmean(arr, axis=0)
-            stacked = np.where(np.isfinite(stacked), stacked, stacked_fallback)
-
-    return stacked.astype(np.float32), float(rejected_pct)
+            del data_with_nans
+        except UnboundLocalError:
+            pass
+        try:
+            del keep_mask
+        except UnboundLocalError:
+            pass
+        _cleanup_memmap(arr, memmap_path)
+    return result, rejected_pct_value
 
 # Bind fallback if seestar CPU implementation is unavailable
 try:
