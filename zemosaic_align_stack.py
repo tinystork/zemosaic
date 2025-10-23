@@ -4,6 +4,7 @@ import numpy as np
 import os
 import importlib.util
 import tempfile
+from dataclasses import dataclass
 from typing import Optional
 
 GPU_AVAILABLE = importlib.util.find_spec("cupy") is not None
@@ -144,6 +145,119 @@ def _cleanup_memmap(arr: np.ndarray, path: Optional[str]) -> None:
             )
 
 
+@dataclass
+class WinsorStreamingState:
+    """Accumulate streaming statistics for winsorized sigma clip."""
+
+    sum_values: np.ndarray
+    count_values: np.ndarray
+    fallback_sum: np.ndarray
+    fallback_count: np.ndarray
+    weighted_sum: Optional[np.ndarray] = None
+    weighted_weight: Optional[np.ndarray] = None
+    total_pixels: int = 0
+    kept_pixels: int = 0
+
+    @classmethod
+    def create(cls, spatial_shape: tuple[int, ...]) -> "WinsorStreamingState":
+        sum_values = np.zeros(spatial_shape, dtype=np.float64)
+        count_values = np.zeros(spatial_shape, dtype=np.int64)
+        fallback_sum = np.zeros(spatial_shape, dtype=np.float64)
+        fallback_count = np.zeros(spatial_shape, dtype=np.int64)
+        return cls(sum_values, count_values, fallback_sum, fallback_count)
+
+    def update(
+        self,
+        processed_chunk: np.ndarray,
+        fallback_sum_chunk: np.ndarray,
+        fallback_count_chunk: np.ndarray,
+        weights_chunk: Optional[np.ndarray] = None,
+    ) -> None:
+        processed_chunk = np.asarray(processed_chunk, dtype=np.float32)
+        chunk_mask = np.isfinite(processed_chunk)
+        self.sum_values += np.nansum(processed_chunk, axis=0, dtype=np.float64)
+        self.count_values += chunk_mask.sum(axis=0, dtype=np.int64)
+        self.total_pixels += int(processed_chunk.size)
+        self.kept_pixels += int(np.count_nonzero(chunk_mask))
+
+        self.fallback_sum += np.asarray(fallback_sum_chunk, dtype=np.float64)
+        self.fallback_count += np.asarray(fallback_count_chunk, dtype=np.int64)
+
+        if weights_chunk is not None:
+            weights_broadcast = _broadcast_weights_for_chunk(weights_chunk, processed_chunk.shape)
+            weights_broadcast = np.where(chunk_mask, weights_broadcast, 0.0)
+            if self.weighted_sum is None or self.weighted_weight is None:
+                self.weighted_sum = np.zeros(processed_chunk.shape[1:], dtype=np.float64)
+                self.weighted_weight = np.zeros(processed_chunk.shape[1:], dtype=np.float64)
+            self.weighted_sum += np.nansum(processed_chunk * weights_broadcast, axis=0, dtype=np.float64)
+            self.weighted_weight += np.sum(weights_broadcast, axis=0, dtype=np.float64)
+
+    def _fallback_mean(self) -> np.ndarray:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            fallback = np.divide(
+                self.fallback_sum,
+                self.fallback_count,
+                out=np.zeros_like(self.fallback_sum, dtype=np.float64),
+                where=self.fallback_count > 0,
+            )
+        return np.where(self.fallback_count > 0, fallback, np.nan)
+
+    def finalize(self, use_weights: bool) -> tuple[np.ndarray, float]:
+        fallback = self._fallback_mean()
+        stacked: np.ndarray
+        if use_weights and self.weighted_sum is not None and self.weighted_weight is not None:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                stacked = np.divide(
+                    self.weighted_sum,
+                    self.weighted_weight,
+                    out=np.zeros_like(fallback, dtype=np.float64),
+                    where=self.weighted_weight > 0,
+                )
+            needs_fallback = ~np.isfinite(stacked)
+            if np.any(needs_fallback):
+                stacked = np.where(needs_fallback, fallback, stacked)
+        else:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                stacked = np.divide(
+                    self.sum_values,
+                    self.count_values,
+                    out=np.zeros_like(fallback, dtype=np.float64),
+                    where=self.count_values > 0,
+                )
+            zero_mask = self.count_values <= 0
+            if np.any(zero_mask):
+                stacked = np.where(zero_mask, fallback, stacked)
+            needs_fallback = ~np.isfinite(stacked)
+            if np.any(needs_fallback):
+                stacked = np.where(needs_fallback, fallback, stacked)
+
+        rejected_pct = 0.0
+        if self.total_pixels > 0:
+            rejected_pct = 100.0 * (self.total_pixels - self.kept_pixels) / float(self.total_pixels)
+
+        return stacked.astype(np.float32, copy=False), float(rejected_pct)
+
+
+def _broadcast_weights_for_chunk(weights_chunk: np.ndarray, target_shape: tuple[int, ...]) -> np.ndarray:
+    """Broadcast per-frame weights to match a chunk of stack data."""
+
+    weights_chunk = np.asarray(weights_chunk, dtype=np.float32)
+    if weights_chunk.shape[0] != target_shape[0]:
+        raise ValueError(
+            f"weights shape {weights_chunk.shape} incompatible with chunk leading dimension {target_shape[0]}"
+        )
+    if weights_chunk.ndim == 1:
+        extra_dims = (1,) * (len(target_shape) - 1)
+        weights_chunk = weights_chunk.reshape((target_shape[0],) + extra_dims)
+    try:
+        broadcast = np.broadcast_to(weights_chunk, target_shape)
+    except ValueError as exc:
+        raise ValueError(
+            f"weights shape {weights_chunk.shape} not compatible with frames shape {target_shape}"
+        ) from exc
+    return broadcast.astype(np.float64, copy=False)
+
+
 # Optional access to utils for GPU helpers
 ZU_AVAILABLE = False
 zutils = None
@@ -246,6 +360,81 @@ def stack_winsorized_sigma_clip(frames, weights=None, zconfig=None, **kwargs):
             use_gpu = bool(getattr(zconfig, 'use_gpu', getattr(zconfig, 'use_gpu_phase5', False)))
         else:
             use_gpu = False
+
+    max_frames_per_pass = kwargs.pop("winsor_max_frames_per_pass", None)
+    if max_frames_per_pass is None and zconfig is not None:
+        max_frames_per_pass = getattr(zconfig, "winsor_max_frames_per_pass", 0)
+    try:
+        max_frames_per_pass = int(max_frames_per_pass)
+    except (TypeError, ValueError):
+        max_frames_per_pass = 0
+    if max_frames_per_pass < 0:
+        max_frames_per_pass = 0
+
+    def _stack_winsor_streaming(limit: int) -> tuple[_np.ndarray, float]:
+        nonlocal frames_list
+
+        if weights is not None:
+            weights_array_full = _np.asarray(weights, dtype=_np.float32)
+            if weights_array_full.shape[0] != len(frames_list):
+                raise ValueError(
+                    f"weights shape {weights_array_full.shape} incompatible with frame count {len(frames_list)}"
+                )
+        else:
+            weights_array_full = None
+
+        winsor_limits = kwargs.get("winsor_limits", (0.05, 0.05))
+        kappa = kwargs.get("kappa", 3.0)
+        apply_rewinsor = kwargs.get("apply_rewinsor", True)
+        winsor_max_workers = kwargs.get("winsor_max_workers", 1)
+        progress_callback = kwargs.get("progress_callback")
+
+        state = WinsorStreamingState.create(sample.shape)
+
+        total_frames = len(frames_list)
+        for start in range(0, total_frames, limit):
+            stop = min(total_frames, start + limit)
+            chunk = [_np.asarray(f, dtype=_np.float32) for f in frames_list[start:stop]]
+            if not chunk:
+                continue
+            chunk_arr = _np.stack(chunk, axis=0)
+            weights_chunk = None
+            if weights_array_full is not None:
+                weights_chunk = weights_array_full[start:stop]
+
+            state, _ = _reject_outliers_winsorized_sigma_clip(
+                stacked_array_NHDWC=chunk_arr,
+                winsor_limits_tuple=winsor_limits,
+                sigma_low=float(kappa),
+                sigma_high=float(kappa),
+                progress_callback=progress_callback,
+                max_workers=int(winsor_max_workers or 1),
+                apply_rewinsor=bool(apply_rewinsor),
+                weights_chunk=weights_chunk,
+                streaming_state=state,
+            )
+
+            # Libérer les références intermédiaires au plus tôt
+            del chunk_arr, chunk
+
+        stacked_stream, rejected_pct = state.finalize(weights_array_full is not None)
+        return stacked_stream, rejected_pct
+
+    if max_frames_per_pass and len(frames_list) > max_frames_per_pass:
+        if use_gpu:
+            _internal_logger.info(
+                "Winsorized streaming enabled for %d frames (limit %d); forcing CPU path.",
+                len(frames_list),
+                max_frames_per_pass,
+            )
+            use_gpu = False
+        else:
+            _internal_logger.info(
+                "Winsorized streaming enabled for %d frames (limit %d).",
+                len(frames_list),
+                max_frames_per_pass,
+            )
+        return _stack_winsor_streaming(max_frames_per_pass)
 
     # --- GPU path (poids ignorés) ---
     if use_gpu and GPU_AVAILABLE and callable(globals().get("gpu_stack_winsorized", None)):
@@ -1388,7 +1577,9 @@ def _reject_outliers_winsorized_sigma_clip(
     progress_callback: callable = None,
     max_workers: int = 1,
     apply_rewinsor: bool = True,
-) -> tuple[np.ndarray, Optional[np.ndarray]]:
+    weights_chunk: Optional[np.ndarray] = None,
+    streaming_state: Optional[WinsorStreamingState] = None,
+) -> tuple[np.ndarray | WinsorStreamingState, Optional[np.ndarray]]:
     """
     Rejette les outliers en utilisant un Winsorized Sigma Clip.
     1. Winsorize les données le long de l'axe des images.
@@ -1405,10 +1596,14 @@ def _reject_outliers_winsorized_sigma_clip(
             Typiquement issu de ``run_cfg.winsor_worker_limit``.
         apply_rewinsor: Si True, remplace les pixels rejetés par les valeurs winsorisées
             ("rewinsorisation"). Sinon, les pixels rejetés restent NaN.
+        weights_chunk: Poids optionnels pour les images du bloc courant (alignés sur l'axe 0).
+        streaming_state: Accumulateur de streaming. Si fourni, la fonction agrège les
+            statistiques dans cet objet et retourne ``streaming_state`` en première valeur
+            au lieu d'un tableau complet.
 
     Returns:
-        tuple[np.ndarray, Optional[np.ndarray]]:
-            - output_data_with_nans: Les données originales avec NaN où les pixels sont rejetés.
+        tuple[np.ndarray | WinsorStreamingState, Optional[np.ndarray]]:
+            - output_data_with_nans ou l'accumulateur de streaming si ``streaming_state`` est fourni.
             - rejection_mask: Masque booléen (True où les pixels sont gardés) ou ``None`` si le masque complet
               n'est pas construit pour réduire l'empreinte mémoire.
     """
@@ -1421,7 +1616,18 @@ def _reject_outliers_winsorized_sigma_clip(
         if not SIGMA_CLIP_AVAILABLE or not sigma_clipped_stats_func: missing_deps.append("Astropy.stats (sigma_clipped_stats)")
         _pcb("reject_winsor_warn_deps_unavailable", lvl="WARN", missing=", ".join(missing_deps))
         # Retourner les données originales sans rejet si les dépendances manquent
-        return stacked_array_NHDWC.astype(np.float32, copy=False), None
+        data_view = stacked_array_NHDWC.astype(np.float32, copy=False)
+        fallback_sum_chunk = np.nansum(data_view, axis=0, dtype=np.float64)
+        fallback_count_chunk = np.isfinite(data_view).sum(axis=0, dtype=np.int64)
+        if streaming_state is not None:
+            streaming_state.update(
+                processed_chunk=data_view,
+                fallback_sum_chunk=fallback_sum_chunk,
+                fallback_count_chunk=fallback_count_chunk,
+                weights_chunk=weights_chunk,
+            )
+            return streaming_state, None
+        return data_view, None
 
     _pcb(f"RejWinsor: Début Rejet Winsorized Sigma Clip. Limits={winsor_limits_tuple}, SigmaLow={sigma_low}, SigmaHigh={sigma_high}.", lvl="DEBUG",
          shape=stacked_array_NHDWC.shape)
@@ -1430,10 +1636,23 @@ def _reject_outliers_winsorized_sigma_clip(
     low_cut, high_cut = winsor_limits_tuple
     if not (0.0 <= low_cut < 0.5 and 0.0 <= high_cut < 0.5 and (low_cut + high_cut) < 1.0):
         _pcb("reject_winsor_error_invalid_limits", lvl="ERROR", limits=winsor_limits_tuple)
-        return stacked_array_NHDWC.astype(np.float32, copy=False), None
+        return _finalize_result(output_data_with_nans)
 
     # Copie des données originales pour y insérer les NaN pour les pixels rejetés
     output_data_with_nans = stacked_array_NHDWC.astype(np.float32, copy=False) # Travailler sur float32
+    fallback_sum_chunk = np.nansum(output_data_with_nans, axis=0, dtype=np.float64)
+    fallback_count_chunk = np.isfinite(output_data_with_nans).sum(axis=0, dtype=np.int64)
+
+    def _finalize_result(result_array: np.ndarray) -> tuple[np.ndarray | WinsorStreamingState, Optional[np.ndarray]]:
+        if streaming_state is not None:
+            streaming_state.update(
+                processed_chunk=result_array,
+                fallback_sum_chunk=fallback_sum_chunk,
+                fallback_count_chunk=fallback_count_chunk,
+                weights_chunk=weights_chunk,
+            )
+            return streaming_state, None
+        return result_array, None
     total_rejected_pixels = 0
 
     is_color = stacked_array_NHDWC.ndim == 4 and stacked_array_NHDWC.shape[-1] == 3
@@ -1441,7 +1660,7 @@ def _reject_outliers_winsorized_sigma_clip(
 
     if num_images_in_stack < 3: # Winsorize et sigma-clip ont besoin d'assez de données
         _pcb("reject_winsor_warn_not_enough_images", lvl="WARN", num_images=num_images_in_stack)
-        return output_data_with_nans, None # Pas de rejet si trop peu d'images
+        return _finalize_result(output_data_with_nans)
 
     try:
         if is_color:
@@ -1546,11 +1765,11 @@ def _reject_outliers_winsorized_sigma_clip(
         _internal_logger.error("MemoryError dans _reject_outliers_winsorized_sigma_clip", exc_info=True)
         # En cas de MemoryError, retourner une vue float32 sans duplication pour éviter un double échec.
         fallback_view = stacked_array_NHDWC.astype(np.float32, copy=False)
-        return fallback_view, None
+        return _finalize_result(fallback_view)
     except Exception as e_winsor:
         _pcb("reject_winsor_error_unexpected", lvl="ERROR", error=str(e_winsor))
         _internal_logger.error("Erreur inattendue dans _reject_outliers_winsorized_sigma_clip", exc_info=True)
-        return stacked_array_NHDWC.copy(), None
+        return _finalize_result(stacked_array_NHDWC.astype(np.float32, copy=True))
 
     _pcb("reject_winsor_info_finished", lvl="INFO_DETAIL", num_rejected=total_rejected_pixels)
 
@@ -1558,7 +1777,7 @@ def _reject_outliers_winsorized_sigma_clip(
     if apply_rewinsor:
         output_data_final = output_data_with_nans
 
-    return output_data_final, None
+    return _finalize_result(output_data_final)
 
 def _reject_outliers_linear_fit_clip(
     stacked_array_NHDWC: np.ndarray,

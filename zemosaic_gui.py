@@ -274,6 +274,7 @@ class ZeMosaicGUI:
             num_workers_from_config = 0
         self.num_workers_var = tk.IntVar(value=num_workers_from_config)
         self.winsor_workers_var = tk.IntVar(value=self.config.get("winsor_worker_limit", 6))
+        self.winsor_max_frames_var = tk.IntVar(value=self.config.get("winsor_max_frames_per_pass", 0))
         # --- FIN NOMBRE DE WORKERS ---
         # --- NOUVELLES VARIABLES TKINTER POUR LE ROGNAGE ---
         self.apply_master_tile_crop_var = tk.BooleanVar(
@@ -727,6 +728,24 @@ class ZeMosaicGUI:
         winsor_workers_note = ttk.Label(perf_options_frame, text="")
         winsor_workers_note.grid(row=1, column=2, padx=(10,5), pady=5, sticky="ew")
         self.translatable_widgets["winsor_workers_note"] = winsor_workers_note
+
+        winsor_frames_label = ttk.Label(perf_options_frame, text="")
+        winsor_frames_label.grid(row=2, column=0, padx=5, pady=5, sticky="w")
+        self.translatable_widgets["winsor_frames_label"] = winsor_frames_label
+
+        self.winsor_frames_spinbox = ttk.Spinbox(
+            perf_options_frame,
+            from_=0,
+            to=9999,
+            increment=1,
+            textvariable=self.winsor_max_frames_var,
+            width=8
+        )
+        self.winsor_frames_spinbox.grid(row=2, column=1, padx=5, pady=5, sticky="w")
+
+        winsor_frames_note = ttk.Label(perf_options_frame, text="")
+        winsor_frames_note.grid(row=2, column=2, padx=(10,5), pady=5, sticky="ew")
+        self.translatable_widgets["winsor_frames_note"] = winsor_frames_note
         # --- FIN CADRE OPTIONS DE PERFORMANCE ---
         # --- NOUVEAU CADRE : OPTIONS DE ROGNAGE DES TUILES MAÎTRESSES ---
         crop_options_frame = ttk.LabelFrame(self.scrollable_content_frame, text="", padding="10")
@@ -1816,6 +1835,7 @@ class ZeMosaicGUI:
             pass
 
         self.config["winsor_worker_limit"] = self.winsor_workers_var.get()
+        self.config["winsor_max_frames_per_pass"] = self.winsor_max_frames_var.get()
         self.config["max_raw_per_master_tile"] = self.max_raw_per_tile_var.get()
         # Persist logging level
         self.config["logging_level"] = self.logging_level_var.get()
@@ -1860,6 +1880,7 @@ class ZeMosaicGUI:
             self.cleanup_memmap_var.get(),
             self.config.get("assembly_process_workers", 0),
             self.auto_limit_frames_var.get(),
+            self.winsor_max_frames_var.get(),
             self.winsor_workers_var.get(),
             self.max_raw_per_tile_var.get(),
             self.use_gpu_phase5_var.get(),

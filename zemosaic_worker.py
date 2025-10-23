@@ -2596,6 +2596,7 @@ def run_hierarchical_mosaic(
     coadd_cleanup_memmap_config: bool,
     assembly_process_workers_config: int,
     auto_limit_frames_per_master_tile_config: bool,
+    winsor_max_frames_per_pass_config: int,
     winsor_worker_limit_config: int,
     max_raw_per_master_tile_config: int,
     use_gpu_phase5: bool = False,
@@ -2609,6 +2610,8 @@ def run_hierarchical_mosaic(
 
     Parameters
     ----------
+    winsor_max_frames_per_pass_config : int
+        Limite du nombre d'images traitées simultanément par le rejet Winsorized (0 = illimité).
     winsor_worker_limit_config : int
         Nombre maximal de workers pour la phase de rejet Winsorized.
     """
@@ -3394,6 +3397,7 @@ def run_hierarchical_mosaic(
         seestar_stack_groups = new_groups
     cpu_total = os.cpu_count() or 1
     winsor_worker_limit = max(1, min(int(winsor_worker_limit_config), cpu_total))
+    winsor_max_frames_per_pass = max(0, int(winsor_max_frames_per_pass_config))
     pcb(
         f"Winsor worker limit set to {winsor_worker_limit}" + (
             " (ProcessPoolExecutor enabled)" if winsor_worker_limit > 1 else ""
@@ -3401,6 +3405,12 @@ def run_hierarchical_mosaic(
         prog=None,
         lvl="INFO",
     )
+    if winsor_max_frames_per_pass > 0:
+        pcb(
+            f"Winsor streaming limit set to {winsor_max_frames_per_pass} frame(s) per pass",
+            prog=None,
+            lvl="INFO_DETAIL",
+        )
     manual_limit = max_raw_per_master_tile_config
     if (cluster_target_groups_config is None or int(cluster_target_groups_config) <= 0) and auto_limit_frames_per_master_tile_config:
         try:
@@ -3518,6 +3528,16 @@ def run_hierarchical_mosaic(
                 )
         except Exception:
             pass
+
+
+    try:
+        setattr(zconfig, "winsor_worker_limit", int(winsor_worker_limit))
+    except Exception:
+        pass
+    try:
+        setattr(zconfig, "winsor_max_frames_per_pass", int(winsor_max_frames_per_pass))
+    except Exception:
+        pass
 
 
 
