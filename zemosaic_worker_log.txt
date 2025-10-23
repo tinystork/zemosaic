@@ -1,0 +1,1170 @@
+[21:49:39] Starting hierarchical mosaic processing...
+[21:49:44] Starting mosaic processing (Master Tile Workflow)...
+[21:49:44] Phase 1: Scanning raw files, preprocessing, WCS, and caching image data...
+[21:50:05] WORKERS_PHASE1: Utilisation de 12 worker(s). (Base: 12, Fichiers: 874)
+[21:50:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-190131.fit'. Shape: (1920, 1080), Dtype: float32, Range: [143 - 6.55e+04], Mean: 646
+[21:50:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-191505.fit'. Shape: (1920, 1080), Dtype: float32, Range: [60 - 6.55e+04], Mean: 655
+[21:50:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-190613.fit'. Shape: (1920, 1080), Dtype: float32, Range: [156 - 6.55e+04], Mean: 675
+[21:50:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-191527.fit'. Shape: (1920, 1080), Dtype: float32, Range: [265 - 6.55e+04], Mean: 657
+[21:50:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-191601.fit'. Shape: (1920, 1080), Dtype: float32, Range: [188 - 6.55e+04], Mean: 655
+[21:50:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-191550.fit'. Shape: (1920, 1080), Dtype: float32, Range: [140 - 6.55e+04], Mean: 655
+[21:50:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-191612.fit'. Shape: (1920, 1080), Dtype: float32, Range: [172 - 6.55e+04], Mean: 656
+[21:50:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-191623.fit'. Shape: (1920, 1080), Dtype: float32, Range: [124 - 6.55e+04], Mean: 658
+[21:50:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-191720.fit'. Shape: (1920, 1080), Dtype: float32, Range: [207 - 6.55e+04], Mean: 674
+[21:50:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-191742.fit'. Shape: (1920, 1080), Dtype: float32, Range: [291 - 6.55e+04], Mean: 723
+[21:50:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-191646.fit'. Shape: (1920, 1080), Dtype: float32, Range: [236 - 6.55e+04], Mean: 714
+[21:50:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-191827.fit'. Shape: (1920, 1080), Dtype: float32, Range: [307 - 6.55e+04], Mean: 747
+[21:50:06] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-192418.fit'. Shape: (1920, 1080), Dtype: float32, Range: [284 - 6.55e+04], Mean: 715
+[21:50:06] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-193857.fit'. Shape: (1920, 1080), Dtype: float32, Range: [35 - 6.55e+04], Mean: 650
+[21:50:07] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-194329.fit'. Shape: (1920, 1080), Dtype: float32, Range: [127 - 6.55e+04], Mean: 641
+[21:50:07] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-194340.fit'. Shape: (1920, 1080), Dtype: float32, Range: [60 - 6.55e+04], Mean: 641
+[21:50:07] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-194352.fit'. Shape: (1920, 1080), Dtype: float32, Range: [51 - 6.55e+04], Mean: 640
+[21:50:07] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-194403.fit'. Shape: (1920, 1080), Dtype: float32, Range: [99 - 6.55e+04], Mean: 640
+[21:50:07] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-194448.fit'. Shape: (1920, 1080), Dtype: float32, Range: [92 - 6.55e+04], Mean: 641
+[21:50:07] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-194908.fit'. Shape: (1920, 1080), Dtype: float32, Range: [207 - 6.55e+04], Mean: 644
+[21:50:07] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-194426.fit'. Shape: (1920, 1080), Dtype: float32, Range: [172 - 6.55e+04], Mean: 641
+[21:50:07] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-194845.fit'. Shape: (1920, 1080), Dtype: float32, Range: [140 - 6.55e+04], Mean: 643
+[21:50:07] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-194919.fit'. Shape: (1920, 1080), Dtype: float32, Range: [115 - 6.55e+04], Mean: 642
+[21:50:07] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-194930.fit'. Shape: (1920, 1080), Dtype: float32, Range: [51 - 6.55e+04], Mean: 642
+[21:50:08] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-194942.fit'. Shape: (1920, 1080), Dtype: float32, Range: [111 - 6.55e+04], Mean: 642
+[21:50:08] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-195243.fit'. Shape: (1920, 1080), Dtype: float32, Range: [191 - 6.55e+04], Mean: 679
+[21:50:08] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-195328.fit'. Shape: (1920, 1080), Dtype: float32, Range: [236 - 6.55e+04], Mean: 658
+[21:50:09] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-195340.fit'. Shape: (1920, 1080), Dtype: float32, Range: [265 - 6.55e+04], Mean: 667
+[21:50:09] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-195436.fit'. Shape: (1920, 1080), Dtype: float32, Range: [281 - 6.55e+04], Mean: 688
+[21:50:09] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-195447.fit'. Shape: (1920, 1080), Dtype: float32, Range: [284 - 6.55e+04], Mean: 672
+[21:50:09] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-195521.fit'. Shape: (1920, 1080), Dtype: float32, Range: [307 - 6.55e+04], Mean: 667
+[21:50:09] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-195459.fit'. Shape: (1920, 1080), Dtype: float32, Range: [300 - 6.55e+04], Mean: 657
+[21:50:09] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-195544.fit'. Shape: (1920, 1080), Dtype: float32, Range: [281 - 6.55e+04], Mean: 664
+[21:50:09] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-195555.fit'. Shape: (1920, 1080), Dtype: float32, Range: [297 - 6.55e+04], Mean: 659
+[21:50:09] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-195606.fit'. Shape: (1920, 1080), Dtype: float32, Range: [278 - 6.55e+04], Mean: 668
+[21:50:09] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-195617.fit'. Shape: (1920, 1080), Dtype: float32, Range: [220 - 6.55e+04], Mean: 695
+[21:50:09] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-195640.fit'. Shape: (1920, 1080), Dtype: float32, Range: [291 - 6.55e+04], Mean: 733
+[21:50:10] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-195703.fit'. Shape: (1920, 1080), Dtype: float32, Range: [278 - 6.55e+04], Mean: 693
+[21:50:10] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-195725.fit'. Shape: (1920, 1080), Dtype: float32, Range: [223 - 6.55e+04], Mean: 674
+[21:50:10] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-195740.fit'. Shape: (1920, 1080), Dtype: float32, Range: [252 - 6.55e+04], Mean: 655
+[21:50:11] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-195847.fit'. Shape: (1920, 1080), Dtype: float32, Range: [255 - 6.55e+04], Mean: 645
+[21:50:11] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-195824.fit'. Shape: (1920, 1080), Dtype: float32, Range: [207 - 6.55e+04], Mean: 646
+[21:50:11] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-195909.fit'. Shape: (1920, 1080), Dtype: float32, Range: [239 - 6.55e+04], Mean: 644
+[21:50:11] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-195921.fit'. Shape: (1920, 1080), Dtype: float32, Range: [191 - 6.55e+04], Mean: 643
+[21:50:11] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-195932.fit'. Shape: (1920, 1080), Dtype: float32, Range: [207 - 6.55e+04], Mean: 643
+[21:50:11] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-195943.fit'. Shape: (1920, 1080), Dtype: float32, Range: [191 - 6.55e+04], Mean: 643
+[21:50:11] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-200006.fit'. Shape: (1920, 1080), Dtype: float32, Range: [111 - 6.55e+04], Mean: 643
+[21:50:11] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-200028.fit'. Shape: (1920, 1080), Dtype: float32, Range: [230 - 6.55e+04], Mean: 643
+[21:50:11] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-200051.fit'. Shape: (1920, 1080), Dtype: float32, Range: [233 - 6.55e+04], Mean: 644
+[21:50:12] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-200102.fit'. Shape: (1920, 1080), Dtype: float32, Range: [175 - 6.55e+04], Mean: 643
+[21:50:12] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-200113.fit'. Shape: (1920, 1080), Dtype: float32, Range: [159 - 6.55e+04], Mean: 642
+[21:50:13] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-200125.fit'. Shape: (1920, 1080), Dtype: float32, Range: [252 - 6.55e+04], Mean: 643
+[21:50:13] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-200547.fit'. Shape: (1920, 1080), Dtype: float32, Range: [127 - 6.55e+04], Mean: 636
+[21:50:13] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-200859.fit'. Shape: (1920, 1080), Dtype: float32, Range: [230 - 6.55e+04], Mean: 635
+[21:50:13] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-200837.fit'. Shape: (1920, 1080), Dtype: float32, Range: [179 - 6.55e+04], Mean: 634
+[21:50:13] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-200911.fit'. Shape: (1920, 1080), Dtype: float32, Range: [236 - 6.55e+04], Mean: 634
+[21:50:13] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-201659.fit'. Shape: (1920, 1080), Dtype: float32, Range: [255 - 6.55e+04], Mean: 633
+[21:50:13] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-201721.fit'. Shape: (1920, 1080), Dtype: float32, Range: [159 - 6.55e+04], Mean: 634
+[21:50:13] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-201744.fit'. Shape: (1920, 1080), Dtype: float32, Range: [175 - 6.55e+04], Mean: 634
+[21:50:13] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-201755.fit'. Shape: (1920, 1080), Dtype: float32, Range: [191 - 6.55e+04], Mean: 634
+[21:50:14] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-201807.fit'. Shape: (1920, 1080), Dtype: float32, Range: [207 - 6.55e+04], Mean: 635
+[21:50:14] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-201818.fit'. Shape: (1920, 1080), Dtype: float32, Range: [255 - 6.55e+04], Mean: 634
+[21:50:14] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-201840.fit'. Shape: (1920, 1080), Dtype: float32, Range: [175 - 6.55e+04], Mean: 634
+[21:50:16] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-202314.fit'. Shape: (1920, 1080), Dtype: float32, Range: [207 - 6.55e+04], Mean: 636
+[21:50:16] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-202326.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 636
+[21:50:16] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-202651.fit'. Shape: (1920, 1080), Dtype: float32, Range: [60 - 6.55e+04], Mean: 638
+[21:50:16] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-202713.fit'. Shape: (1920, 1080), Dtype: float32, Range: [108 - 6.55e+04], Mean: 639
+[21:50:16] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-202735.fit'. Shape: (1920, 1080), Dtype: float32, Range: [249 - 6.55e+04], Mean: 639
+[21:50:16] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-202747.fit'. Shape: (1920, 1080), Dtype: float32, Range: [249 - 6.55e+04], Mean: 640
+[21:50:16] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-202724.fit'. Shape: (1920, 1080), Dtype: float32, Range: [140 - 6.55e+04], Mean: 639
+[21:50:16] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-202807.fit'. Shape: (1920, 1080), Dtype: float32, Range: [67 - 6.55e+04], Mean: 638
+[21:50:16] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-202830.fit'. Shape: (1920, 1080), Dtype: float32, Range: [83 - 6.55e+04], Mean: 637
+[21:50:17] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-202841.fit'. Shape: (1920, 1080), Dtype: float32, Range: [99 - 6.55e+04], Mean: 637
+[21:50:17] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-202853.fit'. Shape: (1920, 1080), Dtype: float32, Range: [83 - 6.55e+04], Mean: 638
+[21:50:17] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-202904.fit'. Shape: (1920, 1080), Dtype: float32, Range: [131 - 6.55e+04], Mean: 638
+[21:50:18] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-202927.fit'. Shape: (1920, 1080), Dtype: float32, Range: [99 - 6.55e+04], Mean: 638
+[21:50:19] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-202950.fit'. Shape: (1920, 1080), Dtype: float32, Range: [131 - 6.55e+04], Mean: 639
+[21:50:19] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203001.fit'. Shape: (1920, 1080), Dtype: float32, Range: [51 - 6.55e+04], Mean: 639
+[21:50:19] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203024.fit'. Shape: (1920, 1080), Dtype: float32, Range: [163 - 6.55e+04], Mean: 637
+[21:50:19] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203013.fit'. Shape: (1920, 1080), Dtype: float32, Range: [35 - 6.55e+04], Mean: 639
+[21:50:19] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203109.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 637
+[21:50:19] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203046.fit'. Shape: (1920, 1080), Dtype: float32, Range: [67 - 6.55e+04], Mean: 638
+[21:50:19] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203143.fit'. Shape: (1920, 1080), Dtype: float32, Range: [111 - 6.55e+04], Mean: 636
+[21:50:19] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203132.fit'. Shape: (1920, 1080), Dtype: float32, Range: [131 - 6.55e+04], Mean: 637
+[21:50:19] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203120.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 636
+[21:50:19] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203205.fit'. Shape: (1920, 1080), Dtype: float32, Range: [19 - 6.55e+04], Mean: 637
+[21:50:20] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203228.fit'. Shape: (1920, 1080), Dtype: float32, Range: [99 - 6.55e+04], Mean: 637
+[21:50:20] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203239.fit'. Shape: (1920, 1080), Dtype: float32, Range: [140 - 6.55e+04], Mean: 637
+[21:50:20] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203251.fit'. Shape: (1920, 1080), Dtype: float32, Range: [211 - 6.55e+04], Mean: 637
+[21:50:21] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203302.fit'. Shape: (1920, 1080), Dtype: float32, Range: [255 - 6.55e+04], Mean: 636
+[21:50:21] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203444.fit'. Shape: (1920, 1080), Dtype: float32, Range: [271 - 6.55e+04], Mean: 635
+[21:50:22] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203506.fit'. Shape: (1920, 1080), Dtype: float32, Range: [259 - 6.55e+04], Mean: 636
+[21:50:22] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203518.fit'. Shape: (1920, 1080), Dtype: float32, Range: [172 - 6.55e+04], Mean: 637
+[21:50:22] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203529.fit'. Shape: (1920, 1080), Dtype: float32, Range: [227 - 6.55e+04], Mean: 637
+[21:50:22] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203603.fit'. Shape: (1920, 1080), Dtype: float32, Range: [220 - 6.55e+04], Mean: 635
+[21:50:22] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203540.fit'. Shape: (1920, 1080), Dtype: float32, Range: [230 - 6.55e+04], Mean: 637
+[21:50:22] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203649.fit'. Shape: (1920, 1080), Dtype: float32, Range: [143 - 6.55e+04], Mean: 637
+[21:50:22] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203626.fit'. Shape: (1920, 1080), Dtype: float32, Range: [246 - 6.55e+04], Mean: 636
+[21:50:22] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203700.fit'. Shape: (1920, 1080), Dtype: float32, Range: [76 - 6.55e+04], Mean: 637
+[21:50:22] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203711.fit'. Shape: (1920, 1080), Dtype: float32, Range: [243 - 6.55e+04], Mean: 637
+[21:50:23] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203723.fit'. Shape: (1920, 1080), Dtype: float32, Range: [220 - 6.55e+04], Mean: 637
+[21:50:23] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203745.fit'. Shape: (1920, 1080), Dtype: float32, Range: [127 - 6.55e+04], Mean: 637
+[21:50:24] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203810.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 637
+[21:50:24] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203833.fit'. Shape: (1920, 1080), Dtype: float32, Range: [271 - 6.55e+04], Mean: 638
+[21:50:24] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203844.fit'. Shape: (1920, 1080), Dtype: float32, Range: [159 - 6.55e+04], Mean: 637
+[21:50:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203907.fit'. Shape: (1920, 1080), Dtype: float32, Range: [175 - 6.55e+04], Mean: 636
+[21:50:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-204016.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:50:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203930.fit'. Shape: (1920, 1080), Dtype: float32, Range: [156 - 6.55e+04], Mean: 636
+[21:50:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-203953.fit'. Shape: (1920, 1080), Dtype: float32, Range: [239 - 6.55e+04], Mean: 636
+[21:50:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-204038.fit'. Shape: (1920, 1080), Dtype: float32, Range: [284 - 6.55e+04], Mean: 633
+[21:50:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-204027.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:50:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-204112.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:50:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-204135.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:50:26] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-204158.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:50:26] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-204209.fit'. Shape: (1920, 1080), Dtype: float32, Range: [255 - 6.55e+04], Mean: 635
+[21:50:26] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-204220.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 635
+[21:50:27] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-204232.fit'. Shape: (1920, 1080), Dtype: float32, Range: [284 - 6.55e+04], Mean: 635
+[21:50:27] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-204254.fit'. Shape: (1920, 1080), Dtype: float32, Range: [262 - 6.55e+04], Mean: 635
+[21:50:27] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-205055.fit'. Shape: (1920, 1080), Dtype: float32, Range: [246 - 6.55e+04], Mean: 638
+[21:50:27] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-205106.fit'. Shape: (1920, 1080), Dtype: float32, Range: [220 - 6.55e+04], Mean: 636
+[21:50:27] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-205044.fit'. Shape: (1920, 1080), Dtype: float32, Range: [268 - 6.55e+04], Mean: 638
+[21:50:27] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-205117.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 635
+[21:50:28] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-213204.fit'. Shape: (1920, 1080), Dtype: float32, Range: [172 - 6.55e+04], Mean: 622
+[21:50:28] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-213226.fit'. Shape: (1920, 1080), Dtype: float32, Range: [60 - 6.55e+04], Mean: 622
+[21:50:28] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-213140.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 623
+[21:50:28] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-213345.fit'. Shape: (1920, 1080), Dtype: float32, Range: [156 - 6.55e+04], Mean: 621
+[21:50:28] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-213408.fit'. Shape: (1920, 1080), Dtype: float32, Range: [124 - 6.55e+04], Mean: 621
+[21:50:28] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-213356.fit'. Shape: (1920, 1080), Dtype: float32, Range: [188 - 6.55e+04], Mean: 621
+[21:50:29] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-213419.fit'. Shape: (1920, 1080), Dtype: float32, Range: [140 - 6.55e+04], Mean: 622
+[21:50:29] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-213442.fit'. Shape: (1920, 1080), Dtype: float32, Range: [92 - 6.55e+04], Mean: 623
+[21:50:29] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-213505.fit'. Shape: (1920, 1080), Dtype: float32, Range: [188 - 6.55e+04], Mean: 622
+[21:50:30] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-213516.fit'. Shape: (1920, 1080), Dtype: float32, Range: [108 - 6.55e+04], Mean: 622
+[21:50:30] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-213527.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 622
+[21:50:30] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-213539.fit'. Shape: (1920, 1080), Dtype: float32, Range: [44 - 6.55e+04], Mean: 622
+[21:50:31] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-220707.fit'. Shape: (1920, 1080), Dtype: float32, Range: [124 - 6.55e+04], Mean: 633
+[21:50:31] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-213602.fit'. Shape: (1920, 1080), Dtype: float32, Range: [156 - 6.55e+04], Mean: 622
+[21:50:31] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-220937.fit'. Shape: (1920, 1080), Dtype: float32, Range: [220 - 6.55e+04], Mean: 633
+[21:50:31] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-221000.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:50:31] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-221011.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:50:31] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-221022.fit'. Shape: (1920, 1080), Dtype: float32, Range: [172 - 6.55e+04], Mean: 635
+[21:50:31] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-221034.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 636
+[21:50:32] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-221057.fit'. Shape: (1920, 1080), Dtype: float32, Range: [313 - 6.55e+04], Mean: 644
+[21:50:32] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-221119.fit'. Shape: (1920, 1080), Dtype: float32, Range: [115 - 6.55e+04], Mean: 636
+[21:50:32] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-221108.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 640
+[21:50:33] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-221216.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 636
+[21:50:33] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-221154.fit'. Shape: (1920, 1080), Dtype: float32, Range: [44 - 6.55e+04], Mean: 637
+[21:50:33] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-221131.fit'. Shape: (1920, 1080), Dtype: float32, Range: [124 - 6.55e+04], Mean: 636
+[21:50:33] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-221239.fit'. Shape: (1920, 1080), Dtype: float32, Range: [143 - 6.55e+04], Mean: 636
+[21:50:33] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-221227.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 636
+[21:50:33] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-221757.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 648
+[21:50:33] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-221250.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 637
+[21:50:33] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-221808.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 647
+[21:50:33] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-223112.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 658
+[21:50:33] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-223436.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 652
+[21:50:35] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-223544.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 643
+[21:50:35] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-223459.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 644
+[21:50:36] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-223607.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 644
+[21:50:36] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-223629.fit'. Shape: (1920, 1080), Dtype: float32, Range: [67 - 6.55e+04], Mean: 645
+[21:50:36] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-223618.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 645
+[21:50:36] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-223640.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 645
+[21:50:36] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-223919.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 647
+[21:50:36] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-223856.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 647
+[21:50:36] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-223930.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 649
+[21:50:36] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-225338.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 635
+[21:50:37] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-225401.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 635
+[21:50:37] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-225423.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 637
+[21:50:37] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-225520.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 639
+[21:50:37] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-225531.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 639
+[21:50:37] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-225542.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 640
+[21:50:38] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-225554.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 640
+[21:50:38] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-225616.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 640
+[21:50:38] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-225628.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 640
+[21:50:39] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-225639.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 641
+[21:50:39] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-225650.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 642
+[21:50:39] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-225713.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 647
+[21:50:39] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-225736.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 650
+[21:50:39] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-225725.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 648
+[21:50:39] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241029-225747.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 651
+[21:50:39] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-191216.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 643
+[21:50:40] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-191238.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 644
+[21:50:40] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-191301.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 644
+[21:50:41] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-191324.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 643
+[21:50:41] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-191312.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 644
+[21:50:41] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-191335.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 644
+[21:50:42] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-191902.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 640
+[21:50:42] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-191947.fit'. Shape: (1920, 1080), Dtype: float32, Range: [62 - 6.55e+04], Mean: 641
+[21:50:42] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-191925.fit'. Shape: (1920, 1080), Dtype: float32, Range: [30 - 6.55e+04], Mean: 640
+[21:50:42] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-191936.fit'. Shape: (1920, 1080), Dtype: float32, Range: [238 - 6.55e+04], Mean: 641
+[21:50:42] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-192021.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 642
+[21:50:42] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-191958.fit'. Shape: (1920, 1080), Dtype: float32, Range: [62 - 6.55e+04], Mean: 642
+[21:50:42] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-192032.fit'. Shape: (1920, 1080), Dtype: float32, Range: [46 - 6.55e+04], Mean: 642
+[21:50:42] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-192043.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 643
+[21:50:43] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-192129.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 642
+[21:50:43] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-192055.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 642
+[21:50:43] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-192117.fit'. Shape: (1920, 1080), Dtype: float32, Range: [30 - 6.55e+04], Mean: 642
+[21:50:43] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-192140.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 642
+[21:50:44] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-192151.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 642
+[21:50:44] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-192214.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 642
+[21:50:44] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-192236.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 643
+[21:50:45] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-192259.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 644
+[21:50:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-193139.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 645
+[21:50:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-192718.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 644
+[21:50:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-192815.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 643
+[21:50:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-192946.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 646
+[21:50:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-192826.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 643
+[21:50:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-192321.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 644
+[21:50:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-192838.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 644
+[21:50:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-192741.fit'. Shape: (1920, 1080), Dtype: float32, Range: [1 - 6.55e+04], Mean: 643
+[21:50:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-192804.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 643
+[21:50:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-193105.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 645
+[21:50:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-193128.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 645
+[21:50:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-192333.fit'. Shape: (1920, 1080), Dtype: float32, Range: [1 - 6.55e+04], Mean: 644
+[21:50:48] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-193151.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 645
+[21:50:48] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-193202.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 646
+[21:50:48] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-193440.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 641
+[21:50:49] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-193503.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 642
+[21:50:49] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-193514.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 643
+[21:50:49] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-193526.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 643
+[21:50:49] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-193622.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 642
+[21:50:49] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-193537.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 643
+[21:50:49] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-193644.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 643
+[21:50:49] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-193559.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 642
+[21:50:49] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-193707.fit'. Shape: (1920, 1080), Dtype: float32, Range: [49 - 6.55e+04], Mean: 642
+[21:50:49] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-193655.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 642
+[21:50:51] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-193718.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 642
+[21:50:51] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-194128.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 643
+[21:50:51] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-194202.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 645
+[21:50:51] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-194213.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 645
+[21:50:51] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-194225.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 645
+[21:50:51] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-194720.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 650
+[21:50:51] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-194151.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 644
+[21:50:51] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-194742.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 652
+[21:50:51] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-194948.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 649
+[21:50:51] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-194925.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 650
+[21:50:52] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-194936.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 649
+[21:50:52] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-194959.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 649
+[21:50:53] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195021.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 650
+[21:50:53] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195044.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 653
+[21:50:53] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195107.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 655
+[21:50:54] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195118.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 654
+[21:50:54] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195140.fit'. Shape: (1920, 1080), Dtype: float32, Range: [196 - 6.55e+04], Mean: 654
+[21:50:54] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195215.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 654
+[21:50:54] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195203.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 654
+[21:50:54] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195237.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 655
+[21:50:54] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195345.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 655
+[21:50:54] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195227.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 654
+[21:50:55] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195333.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 655
+[21:50:55] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195356.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 654
+[21:50:55] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195407.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 654
+[21:50:56] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195441.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 655
+[21:50:56] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195452.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 656
+[21:50:56] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195504.fit'. Shape: (1920, 1080), Dtype: float32, Range: [1 - 6.55e+04], Mean: 656
+[21:50:57] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195612.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 660
+[21:50:57] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195635.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 661
+[21:50:57] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195657.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 664
+[21:50:57] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195720.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 663
+[21:50:57] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195731.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 664
+[21:50:57] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195742.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 664
+[21:50:57] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195753.fit'. Shape: (1920, 1080), Dtype: float32, Range: [33 - 6.55e+04], Mean: 664
+[21:50:57] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195816.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 663
+[21:50:57] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195838.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 662
+[21:50:58] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195901.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 662
+[21:50:58] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195912.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 660
+[21:50:59] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195923.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 659
+[21:50:59] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195935.fit'. Shape: (1920, 1080), Dtype: float32, Range: [49 - 6.55e+04], Mean: 659
+[21:51:00] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-200020.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 660
+[21:51:00] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-200550.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 656
+[21:51:00] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-200613.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 657
+[21:51:00] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-195957.fit'. Shape: (1920, 1080), Dtype: float32, Range: [49 - 6.55e+04], Mean: 660
+[21:51:00] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-200635.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 653
+[21:51:00] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-200709.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 652
+[21:51:00] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-200721.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 653
+[21:51:00] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-200732.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 653
+[21:51:00] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-201618.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 659
+[21:51:01] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-201641.fit'. Shape: (1920, 1080), Dtype: float32, Range: [1 - 6.55e+04], Mean: 659
+[21:51:02] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-201704.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 660
+[21:51:02] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-201716.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 659
+[21:51:02] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-201728.fit'. Shape: (1920, 1080), Dtype: float32, Range: [1 - 6.55e+04], Mean: 660
+[21:51:02] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-202517.fit'. Shape: (1920, 1080), Dtype: float32, Range: [228 - 6.55e+04], Mean: 665
+[21:51:02] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-201738.fit'. Shape: (1920, 1080), Dtype: float32, Range: [1 - 6.55e+04], Mean: 660
+[21:51:02] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-202454.fit'. Shape: (1920, 1080), Dtype: float32, Range: [270 - 6.55e+04], Mean: 664
+[21:51:02] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-202528.fit'. Shape: (1920, 1080), Dtype: float32, Range: [286 - 6.55e+04], Mean: 665
+[21:51:02] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-202548.fit'. Shape: (1920, 1080), Dtype: float32, Range: [170 - 6.55e+04], Mean: 665
+[21:51:02] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-202539.fit'. Shape: (1920, 1080), Dtype: float32, Range: [282 - 6.55e+04], Mean: 665
+[21:51:02] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-202614.fit'. Shape: (1920, 1080), Dtype: float32, Range: [266 - 6.55e+04], Mean: 666
+[21:51:03] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-202637.fit'. Shape: (1920, 1080), Dtype: float32, Range: [1 - 6.55e+04], Mean: 667
+[21:51:03] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-202648.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 670
+[21:51:03] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-202700.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 670
+[21:51:04] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-202710.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 672
+[21:51:04] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-202734.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 674
+[21:51:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-202809.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 673
+[21:51:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-202757.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 674
+[21:51:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-202820.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 672
+[21:51:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-202832.fit'. Shape: (1920, 1080), Dtype: float32, Range: [33 - 6.55e+04], Mean: 673
+[21:51:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-202855.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 673
+[21:51:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-202917.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 673
+[21:51:06] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-202952.fit'. Shape: (1920, 1080), Dtype: float32, Range: [1 - 6.55e+04], Mean: 673
+[21:51:06] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-202940.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 673
+[21:51:06] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-202929.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 673
+[21:51:06] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203014.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 673
+[21:51:07] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203037.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 676
+[21:51:07] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203048.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 675
+[21:51:08] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203059.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 675
+[21:51:08] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203111.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 675
+[21:51:08] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203133.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 674
+[21:51:08] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203156.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 675
+[21:51:08] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203207.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 676
+[21:51:08] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203253.fit'. Shape: (1920, 1080), Dtype: float32, Range: [110 - 6.55e+04], Mean: 680
+[21:51:08] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203230.fit'. Shape: (1920, 1080), Dtype: float32, Range: [126 - 6.55e+04], Mean: 679
+[21:51:08] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203219.fit'. Shape: (1920, 1080), Dtype: float32, Range: [142 - 6.55e+04], Mean: 678
+[21:51:08] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203315.fit'. Shape: (1920, 1080), Dtype: float32, Range: [142 - 6.55e+04], Mean: 679
+[21:51:08] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203326.fit'. Shape: (1920, 1080), Dtype: float32, Range: [126 - 6.55e+04], Mean: 679
+[21:51:09] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203338.fit'. Shape: (1920, 1080), Dtype: float32, Range: [158 - 6.55e+04], Mean: 680
+[21:51:09] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203349.fit'. Shape: (1920, 1080), Dtype: float32, Range: [126 - 6.55e+04], Mean: 681
+[21:51:10] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203412.fit'. Shape: (1920, 1080), Dtype: float32, Range: [142 - 6.55e+04], Mean: 680
+[21:51:10] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203434.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 680
+[21:51:11] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203457.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 680
+[21:51:11] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203509.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 681
+[21:51:11] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203531.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 682
+[21:51:11] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203446.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 679
+[21:51:11] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203617.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 681
+[21:51:11] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203554.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 680
+[21:51:12] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203651.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 680
+[21:51:12] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203628.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 680
+[21:51:12] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203640.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 680
+[21:51:12] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203713.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 681
+[21:51:12] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-203907.fit'. Shape: (1920, 1080), Dtype: float32, Range: [17 - 6.55e+04], Mean: 685
+[21:51:13] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-204111.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 673
+[21:51:14] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-204910.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 668
+[21:51:14] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-204933.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 668
+[21:51:14] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-204921.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 667
+[21:51:14] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-205029.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 661
+[21:51:14] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-204944.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 668
+[21:51:14] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-205006.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 663
+[21:51:14] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-205041.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 661
+[21:51:14] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-205103.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 662
+[21:51:14] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-205052.fit'. Shape: (1920, 1080), Dtype: float32, Range: [17 - 6.55e+04], Mean: 662
+[21:51:14] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-211537.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 663
+[21:51:14] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-211559.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 663
+[21:51:15] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-211622.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 661
+[21:51:15] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-211644.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 661
+[21:51:17] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-211656.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 662
+[21:51:17] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-211707.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 661
+[21:51:17] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-211719.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 661
+[21:51:17] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-211804.fit'. Shape: (1920, 1080), Dtype: float32, Range: [33 - 6.55e+04], Mean: 661
+[21:51:17] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-211741.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 659
+[21:51:17] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-211815.fit'. Shape: (1920, 1080), Dtype: float32, Range: [65 - 6.55e+04], Mean: 660
+[21:51:17] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-211826.fit'. Shape: (1920, 1080), Dtype: float32, Range: [17 - 6.55e+04], Mean: 660
+[21:51:17] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-211838.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 659
+[21:51:17] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-211901.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 659
+[21:51:18] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-211935.fit'. Shape: (1920, 1080), Dtype: float32, Range: [33 - 6.55e+04], Mean: 663
+[21:51:18] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-211924.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 663
+[21:51:18] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-211947.fit'. Shape: (1920, 1080), Dtype: float32, Range: [161 - 6.55e+04], Mean: 662
+[21:51:19] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-211958.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 661
+[21:51:20] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-215442.fit'. Shape: (1920, 1080), Dtype: float32, Range: [17 - 6.55e+04], Mean: 655
+[21:51:20] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-215419.fit'. Shape: (1920, 1080), Dtype: float32, Range: [1 - 6.55e+04], Mean: 655
+[21:51:20] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-215517.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 655
+[21:51:20] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-215601.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 656
+[21:51:20] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-215539.fit'. Shape: (1920, 1080), Dtype: float32, Range: [1 - 6.55e+04], Mean: 656
+[21:51:20] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-215505.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 655
+[21:51:20] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-215624.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 655
+[21:51:20] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-215636.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 654
+[21:51:20] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-215528.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 655
+[21:51:20] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-215659.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 653
+[21:51:20] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-215648.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 654
+[21:51:21] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-215721.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 654
+[21:51:22] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-215744.fit'. Shape: (1920, 1080), Dtype: float32, Range: [1 - 6.55e+04], Mean: 655
+[21:51:22] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-215755.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 655
+[21:51:22] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-215807.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 655
+[21:51:22] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-215818.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 654
+[21:51:22] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-215904.fit'. Shape: (1920, 1080), Dtype: float32, Range: [17 - 6.55e+04], Mean: 654
+[21:51:22] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-215852.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 654
+[21:51:23] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-220153.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 660
+[21:51:23] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-220216.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 661
+[21:51:23] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-215915.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 653
+[21:51:23] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-220239.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 660
+[21:51:23] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-220228.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 660
+[21:51:24] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-220251.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 659
+[21:51:24] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-222355.fit'. Shape: (1920, 1080), Dtype: float32, Range: [17 - 6.55e+04], Mean: 665
+[21:51:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-222452.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 669
+[21:51:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-222503.fit'. Shape: (1920, 1080), Dtype: float32, Range: [33 - 6.55e+04], Mean: 673
+[21:51:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-222441.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 668
+[21:51:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-222538.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 670
+[21:51:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-222515.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 674
+[21:51:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-222601.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 670
+[21:51:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-222732.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 670
+[21:51:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-222721.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 669
+[21:51:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-222744.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 671
+[21:51:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-222755.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 670
+[21:51:26] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-223233.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 681
+[21:51:26] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-224451.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 717
+[21:51:27] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-224514.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 726
+[21:51:27] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-224536.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 721
+[21:51:27] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-224720.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 730
+[21:51:28] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-224731.fit'. Shape: (1920, 1080), Dtype: float32, Range: [33 - 6.55e+04], Mean: 725
+[21:51:28] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-224742.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 727
+[21:51:28] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241101-224754.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 734
+[21:51:28] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-191805.fit'. Shape: (1920, 1080), Dtype: float32, Range: [293 - 6.55e+04], Mean: 639
+[21:51:28] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-191227.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 660
+[21:51:28] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-191839.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 639
+[21:51:31] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-192032.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 641
+[21:51:31] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-192043.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 642
+[21:51:31] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-191958.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 641
+[21:51:31] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-191925.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 640
+[21:51:31] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-192140.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 641
+[21:51:31] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-191850.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 640
+[21:51:31] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-192055.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 642
+[21:51:31] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-191936.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 641
+[21:51:31] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-191947.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 642
+[21:51:31] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-192202.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 645
+[21:51:31] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-192117.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 642
+[21:51:31] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-192021.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 641
+[21:51:32] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-192213.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 646
+[21:51:33] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-192225.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 645
+[21:51:33] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-192502.fit'. Shape: (1920, 1080), Dtype: float32, Range: [280 - 6.55e+04], Mean: 642
+[21:51:33] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-192525.fit'. Shape: (1920, 1080), Dtype: float32, Range: [287 - 6.55e+04], Mean: 641
+[21:51:33] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-192610.fit'. Shape: (1920, 1080), Dtype: float32, Range: [248 - 6.55e+04], Mean: 642
+[21:51:33] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-192236.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 646
+[21:51:33] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-192621.fit'. Shape: (1920, 1080), Dtype: float32, Range: [226 - 6.55e+04], Mean: 643
+[21:51:33] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-192548.fit'. Shape: (1920, 1080), Dtype: float32, Range: [277 - 6.55e+04], Mean: 640
+[21:51:33] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-192814.fit'. Shape: (1920, 1080), Dtype: float32, Range: [277 - 6.55e+04], Mean: 636
+[21:51:33] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-192837.fit'. Shape: (1920, 1080), Dtype: float32, Range: [296 - 6.55e+04], Mean: 634
+[21:51:33] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-192633.fit'. Shape: (1920, 1080), Dtype: float32, Range: [271 - 6.55e+04], Mean: 648
+[21:51:33] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-192826.fit'. Shape: (1920, 1080), Dtype: float32, Range: [287 - 6.55e+04], Mean: 634
+[21:51:35] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-192848.fit'. Shape: (1920, 1080), Dtype: float32, Range: [216 - 6.55e+04], Mean: 634
+[21:51:35] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-192910.fit'. Shape: (1920, 1080), Dtype: float32, Range: [210 - 6.55e+04], Mean: 634
+[21:51:35] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-192922.fit'. Shape: (1920, 1080), Dtype: float32, Range: [271 - 6.55e+04], Mean: 634
+[21:51:35] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-192933.fit'. Shape: (1920, 1080), Dtype: float32, Range: [216 - 6.55e+04], Mean: 635
+[21:51:35] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-192956.fit'. Shape: (1920, 1080), Dtype: float32, Range: [277 - 6.55e+04], Mean: 634
+[21:51:35] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-193007.fit'. Shape: (1920, 1080), Dtype: float32, Range: [239 - 6.55e+04], Mean: 634
+[21:51:35] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-193247.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 628
+[21:51:35] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-193308.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 629
+[21:51:36] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-193331.fit'. Shape: (1920, 1080), Dtype: float32, Range: [216 - 6.55e+04], Mean: 630
+[21:51:36] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-193320.fit'. Shape: (1920, 1080), Dtype: float32, Range: [248 - 6.55e+04], Mean: 630
+[21:51:36] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-193342.fit'. Shape: (1920, 1080), Dtype: float32, Range: [248 - 6.55e+04], Mean: 630
+[21:51:36] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-193405.fit'. Shape: (1920, 1080), Dtype: float32, Range: [248 - 6.55e+04], Mean: 630
+[21:51:38] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-193428.fit'. Shape: (1920, 1080), Dtype: float32, Range: [248 - 6.55e+04], Mean: 629
+[21:51:38] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-193513.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 627
+[21:51:38] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-193450.fit'. Shape: (1920, 1080), Dtype: float32, Range: [245 - 6.55e+04], Mean: 628
+[21:51:38] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-193501.fit'. Shape: (1920, 1080), Dtype: float32, Range: [11 - 6.55e+04], Mean: 628
+[21:51:38] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-193525.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 627
+[21:51:38] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-193956.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 623
+[21:51:38] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-193935.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 623
+[21:51:38] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-194030.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 623
+[21:51:38] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-194019.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 623
+[21:51:38] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-194007.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 623
+[21:51:39] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-194631.fit'. Shape: (1920, 1080), Dtype: float32, Range: [271 - 6.55e+04], Mean: 623
+[21:51:39] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-194546.fit'. Shape: (1920, 1080), Dtype: float32, Range: [232 - 6.55e+04], Mean: 622
+[21:51:40] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-194716.fit'. Shape: (1920, 1080), Dtype: float32, Range: [264 - 6.55e+04], Mean: 624
+[21:51:41] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-194643.fit'. Shape: (1920, 1080), Dtype: float32, Range: [213 - 6.55e+04], Mean: 623
+[21:51:41] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-194728.fit'. Shape: (1920, 1080), Dtype: float32, Range: [184 - 6.55e+04], Mean: 623
+[21:51:41] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-194824.fit'. Shape: (1920, 1080), Dtype: float32, Range: [264 - 6.55e+04], Mean: 621
+[21:51:41] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-194739.fit'. Shape: (1920, 1080), Dtype: float32, Range: [191 - 6.55e+04], Mean: 622
+[21:51:41] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-194801.fit'. Shape: (1920, 1080), Dtype: float32, Range: [271 - 6.55e+04], Mean: 623
+[21:51:41] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-194835.fit'. Shape: (1920, 1080), Dtype: float32, Range: [261 - 6.55e+04], Mean: 621
+[21:51:41] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-194858.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 622
+[21:51:41] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-194920.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 623
+[21:51:41] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-194943.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 623
+[21:51:41] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-195005.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 623
+[21:51:41] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-194954.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 623
+[21:51:43] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-195016.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 623
+[21:51:43] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-195039.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:51:43] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-195101.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:51:43] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-195113.fit'. Shape: (1920, 1080), Dtype: float32, Range: [43 - 6.55e+04], Mean: 624
+[21:51:44] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-195158.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:51:44] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-195220.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:51:44] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-195232.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:51:44] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-195243.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:51:44] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-195254.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:51:44] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-195402.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 620
+[21:51:44] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-195317.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 620
+[21:51:44] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-195339.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 619
+[21:51:46] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-195425.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 620
+[21:51:46] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-195436.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 619
+[21:51:46] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-195447.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 618
+[21:51:46] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-195458.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 618
+[21:51:46] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-195543.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 618
+[21:51:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-195628.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 618
+[21:51:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-195521.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 618
+[21:51:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-195640.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 618
+[21:51:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-195606.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 618
+[21:51:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-195617.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 618
+[21:51:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-195725.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 619
+[21:51:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-195702.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 619
+[21:51:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-200111.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 620
+[21:51:48] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-200122.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 620
+[21:51:48] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-200134.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:51:48] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-200145.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:51:49] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-200208.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 620
+[21:51:49] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-200230.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 619
+[21:51:49] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-200243.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 619
+[21:51:50] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-200253.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 619
+[21:51:50] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-200403.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 618
+[21:51:50] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-200350.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 618
+[21:51:50] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-200305.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 619
+[21:51:50] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-200328.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 619
+[21:51:50] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-200413.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 618
+[21:51:51] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-200424.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 617
+[21:51:51] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-200447.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 616
+[21:51:51] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-201225.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 616
+[21:51:52] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-201235.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 616
+[21:51:52] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-201247.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 616
+[21:51:52] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-201258.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 616
+[21:51:52] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-201320.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 616
+[21:51:52] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-201343.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 616
+[21:51:52] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-201405.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 617
+[21:51:52] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-201417.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 617
+[21:51:52] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-201428.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 618
+[21:51:52] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-201439.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 618
+[21:51:52] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202205.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:51:52] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202240.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 622
+[21:51:52] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202250.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 622
+[21:51:54] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202301.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 622
+[21:51:55] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202324.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:51:55] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202347.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:51:56] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202358.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:51:56] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202420.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:51:56] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202410.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:51:56] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202444.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:51:56] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202506.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 622
+[21:51:56] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202519.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 622
+[21:51:56] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202540.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 622
+[21:51:56] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202529.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 622
+[21:51:56] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202603.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 622
+[21:51:57] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202625.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 622
+[21:51:57] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202637.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 622
+[21:51:57] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202648.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 622
+[21:51:58] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202722.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:51:58] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202700.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 622
+[21:51:59] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202807.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:51:59] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202756.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:51:59] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202745.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 622
+[21:51:59] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202842.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 622
+[21:51:59] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202905.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 622
+[21:51:59] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202820.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:51:59] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202916.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 622
+[21:51:59] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202928.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 622
+[21:51:59] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-202939.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:51:59] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-203002.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:52:01] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-203024.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:52:01] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-203035.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:52:01] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-203058.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:52:01] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-203155.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 620
+[21:52:01] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-203047.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 620
+[21:52:01] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-203121.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 620
+[21:52:01] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-203143.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 620
+[21:52:01] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-203218.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:52:01] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-203206.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:52:01] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-203240.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:52:01] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-203303.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:52:02] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-203326.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:52:04] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-203337.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:52:04] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-203348.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:52:04] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-203359.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:52:04] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-204556.fit'. Shape: (1920, 1080), Dtype: float32, Range: [216 - 6.55e+04], Mean: 624
+[21:52:04] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-204629.fit'. Shape: (1920, 1080), Dtype: float32, Range: [178 - 6.55e+04], Mean: 625
+[21:52:04] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-203811.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 625
+[21:52:04] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-204618.fit'. Shape: (1920, 1080), Dtype: float32, Range: [248 - 6.55e+04], Mean: 625
+[21:52:04] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-204652.fit'. Shape: (1920, 1080), Dtype: float32, Range: [267 - 6.55e+04], Mean: 625
+[21:52:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-204641.fit'. Shape: (1920, 1080), Dtype: float32, Range: [248 - 6.55e+04], Mean: 625
+[21:52:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-204715.fit'. Shape: (1920, 1080), Dtype: float32, Range: [280 - 6.55e+04], Mean: 624
+[21:52:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-204748.fit'. Shape: (1920, 1080), Dtype: float32, Range: [255 - 6.55e+04], Mean: 623
+[21:52:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-204737.fit'. Shape: (1920, 1080), Dtype: float32, Range: [232 - 6.55e+04], Mean: 623
+[21:52:06] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-204800.fit'. Shape: (1920, 1080), Dtype: float32, Range: [226 - 6.55e+04], Mean: 623
+[21:52:06] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-204811.fit'. Shape: (1920, 1080), Dtype: float32, Range: [235 - 6.55e+04], Mean: 622
+[21:52:07] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-210726.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 622
+[21:52:07] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-210704.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 622
+[21:52:07] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-210749.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:52:07] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-210811.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:52:07] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-210834.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:52:07] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-210845.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 621
+[21:52:07] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-210856.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 620
+[21:52:07] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-210930.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 619
+[21:52:08] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-211004.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 618
+[21:52:08] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-210953.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 618
+[21:52:09] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-211016.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 619
+[21:52:09] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-211027.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 619
+[21:52:10] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-211050.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 619
+[21:52:10] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-211124.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 618
+[21:52:10] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-211135.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 618
+[21:52:10] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-211147.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 618
+[21:52:10] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-211511.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 617
+[21:52:10] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-211533.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 616
+[21:52:10] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-211545.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 616
+[21:52:11] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-214331.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 614
+[21:52:11] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-214353.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 614
+[21:52:11] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-214246.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 614
+[21:52:12] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-214427.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 615
+[21:52:12] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-214405.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 614
+[21:52:13] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-214439.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 615
+[21:52:13] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-214450.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 614
+[21:52:13] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-214524.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 614
+[21:52:13] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-214547.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 615
+[21:52:13] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-214610.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 614
+[21:52:13] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-214513.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 614
+[21:52:13] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-214621.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 615
+[21:52:13] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-214706.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 616
+[21:52:13] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-214632.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 615
+[21:52:14] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-215115.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 619
+[21:52:14] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-215138.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 618
+[21:52:17] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-215201.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 619
+[21:52:17] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-221102.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 636
+[21:52:17] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-225803.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 635
+[21:52:17] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-225740.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 638
+[21:52:17] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-215235.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 617
+[21:52:17] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-225718.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 636
+[21:52:17] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-215212.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 619
+[21:52:17] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-215257.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 617
+[21:52:17] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-225825.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:52:17] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-221147.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 635
+[21:52:17] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-221210.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 633
+[21:52:17] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-221221.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 637
+[21:52:19] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-225837.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 635
+[21:52:19] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-191327.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 628
+[21:52:19] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-225900.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 636
+[21:52:19] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241102-225848.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 635
+[21:52:19] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-191304.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 628
+[21:52:19] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-191350.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 626
+[21:52:19] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-191401.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 626
+[21:52:19] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-191412.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 627
+[21:52:19] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-191424.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 627
+[21:52:19] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-191446.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 630
+[21:52:19] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-191457.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 631
+[21:52:19] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-191509.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 632
+[21:52:21] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-191520.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 629
+[21:52:22] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-191542.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 627
+[21:52:22] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-191605.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 626
+[21:52:22] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-191554.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 626
+[21:52:22] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-191650.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 625
+[21:52:22] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-191616.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 626
+[21:52:22] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-191712.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 626
+[21:52:22] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-191639.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 625
+[21:52:22] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-191701.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 626
+[21:52:22] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-191735.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:22] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-191758.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 626
+[21:52:22] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-191820.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 626
+[21:52:23] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-191831.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 625
+[21:52:23] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-191843.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 625
+[21:52:24] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-191854.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-192121.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-192143.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 626
+[21:52:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-192217.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 628
+[21:52:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-192240.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 628
+[21:52:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-192206.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 627
+[21:52:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-192228.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 628
+[21:52:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-192348.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 628
+[21:52:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-192410.fit'. Shape: (1920, 1080), Dtype: float32, Range: [47 - 6.55e+04], Mean: 628
+[21:52:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-192325.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 627
+[21:52:25] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-192422.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 628
+[21:52:26] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-192433.fit'. Shape: (1920, 1080), Dtype: float32, Range: [63 - 6.55e+04], Mean: 628
+[21:52:27] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-192444.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 628
+[21:52:27] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-192507.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 627
+[21:52:27] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-192518.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 627
+[21:52:28] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-192529.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 625
+[21:52:28] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-192541.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 625
+[21:52:28] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-192841.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:28] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-192852.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:28] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-192904.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 625
+[21:52:28] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-192915.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 625
+[21:52:28] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-192938.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 625
+[21:52:28] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-193000.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 626
+[21:52:29] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-193023.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 626
+[21:52:29] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-193034.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 626
+[21:52:29] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-193045.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 626
+[21:52:30] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-193057.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 627
+[21:52:30] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-193442.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:30] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-193505.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 625
+[21:52:31] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-193528.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:31] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-193539.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:31] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-193550.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 622
+[21:52:31] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194141.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 622
+[21:52:31] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194203.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 619
+[21:52:32] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194238.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 623
+[21:52:32] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194249.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 622
+[21:52:32] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194300.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 622
+[21:52:32] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194323.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 623
+[21:52:32] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194334.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:33] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194345.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:33] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194357.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 623
+[21:52:34] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194419.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:34] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194442.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:34] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194504.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:34] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194453.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:34] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194538.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 625
+[21:52:34] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194516.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:34] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194549.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 625
+[21:52:34] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194612.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 625
+[21:52:34] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194623.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 625
+[21:52:34] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194634.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:35] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194657.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:35] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194708.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:36] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194720.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:37] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194731.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:37] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194754.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:37] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194850.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:37] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194816.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:37] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194902.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 625
+[21:52:37] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194839.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 625
+[21:52:37] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194913.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 625
+[21:52:37] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194936.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:38] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-194958.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:38] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-195032.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:38] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-195044.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 625
+[21:52:39] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-195055.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:52:39] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-195129.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 626
+[21:52:39] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-195151.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 626
+[21:52:40] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-195225.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 627
+[21:52:40] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-195214.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 627
+[21:52:40] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-195935.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 631
+[21:52:40] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-195310.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 626
+[21:52:40] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-195248.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 627
+[21:52:40] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-195236.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 627
+[21:52:40] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-195658.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 626
+[21:52:40] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-195958.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 625
+[21:52:40] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-200009.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 626
+[21:52:41] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-200839.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 636
+[21:52:41] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-200936.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 636
+[21:52:42] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-200958.fit'. Shape: (1920, 1080), Dtype: float32, Range: [15 - 6.55e+04], Mean: 635
+[21:52:43] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-201021.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:52:43] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-201043.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:52:43] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-201418.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 641
+[21:52:43] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-201032.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 633
+[21:52:43] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-201804.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 642
+[21:52:43] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-201055.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:52:43] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-201344.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 640
+[21:52:43] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-201356.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 642
+[21:52:43] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-201826.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 644
+[21:52:43] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-201849.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 646
+[21:52:43] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-201923.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 647
+[21:52:45] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-201946.fit'. Shape: (1920, 1080), Dtype: float32, Range: [15 - 6.55e+04], Mean: 647
+[21:52:46] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202008.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 647
+[21:52:46] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202019.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 645
+[21:52:46] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202031.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 646
+[21:52:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202042.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 648
+[21:52:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202128.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 644
+[21:52:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202105.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 649
+[21:52:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202139.fit'. Shape: (1920, 1080), Dtype: float32, Range: [79 - 6.55e+04], Mean: 642
+[21:52:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202150.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 641
+[21:52:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202201.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 639
+[21:52:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202224.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 637
+[21:52:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202246.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 641
+[21:52:47] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202258.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 640
+[21:52:48] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202309.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 637
+[21:52:48] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202320.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 636
+[21:52:49] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202405.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 637
+[21:52:49] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202342.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 638
+[21:52:49] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202416.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 635
+[21:52:49] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202428.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 636
+[21:52:50] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202439.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 636
+[21:52:50] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202502.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:52:50] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202535.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 637
+[21:52:50] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202524.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:52:50] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202558.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 636
+[21:52:50] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202547.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 638
+[21:52:51] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202643.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 633
+[21:52:51] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202621.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 633
+[21:52:52] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202655.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:52:52] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202706.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:52:52] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202717.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:52:52] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202739.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:52:53] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202813.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 635
+[21:52:53] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202802.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 635
+[21:52:53] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202825.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 635
+[21:52:53] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202836.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 635
+[21:52:53] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202859.fit'. Shape: (1920, 1080), Dtype: float32, Range: [31 - 6.55e+04], Mean: 636
+[21:52:53] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202921.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 636
+[21:52:54] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202955.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 631
+[21:52:54] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-202944.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 632
+[21:52:55] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-203018.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 631
+[21:52:55] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-203126.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 631
+[21:52:55] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-203007.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 631
+[21:52:55] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-203149.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 630
+[21:52:56] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-203308.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:52:56] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-203319.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:52:56] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-203330.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:52:56] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-203404.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 633
+[21:52:56] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-203341.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:52:56] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-204150.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 636
+[21:52:56] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-204213.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:52:56] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-204224.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:52:57] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-204247.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 637
+[21:52:57] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-204236.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 636
+[21:52:58] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-204310.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 635
+[21:52:58] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-204332.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 633
+[21:52:58] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-204355.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:52:59] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-204406.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:52:59] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-210540.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 631
+[21:52:59] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-204417.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 635
+[21:52:59] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-210603.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 631
+[21:52:59] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-210625.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 631
+[21:52:59] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-210648.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 630
+[21:52:59] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-210659.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 631
+[21:52:59] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-210710.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 631
+[21:53:00] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-210721.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 631
+[21:53:00] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-210744.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 630
+[21:53:00] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-210807.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 631
+[21:53:01] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-210818.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 631
+[21:53:01] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-210841.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 630
+[21:53:02] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-210829.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 630
+[21:53:02] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-210904.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 629
+[21:53:04] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-215057.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 628
+[21:53:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-215035.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 627
+[21:53:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-210949.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 626
+[21:53:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-210927.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 627
+[21:53:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-215206.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 631
+[21:53:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-215120.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 628
+[21:53:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-211303.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 626
+[21:53:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-215154.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 630
+[21:53:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-211000.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 626
+[21:53:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-210938.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 625
+[21:53:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-215143.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 629
+[21:53:05] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-211326.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 626
+[21:53:06] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-215217.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 632
+[21:53:06] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-215239.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 632
+[21:53:06] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-215314.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 632
+[21:53:06] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-215302.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 632
+[21:53:06] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-215251.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 632
+[21:53:06] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-215336.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 633
+[21:53:06] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-215359.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 632
+[21:53:06] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-215422.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 632
+[21:53:06] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-215411.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 632
+[21:53:06] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-215433.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 631
+[21:53:06] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-215734.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 631
+[21:53:06] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-215757.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 630
+[21:53:08] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-215820.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 630
+[21:53:08] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-215854.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 632
+[21:53:08] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-215917.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 633
+[21:53:09] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-215928.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 633
+[21:53:09] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-222127.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 628
+[21:53:09] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-215939.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 633
+[21:53:09] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-215951.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 635
+[21:53:09] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-222149.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 628
+[21:53:09] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-222212.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 629
+[21:53:09] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-222223.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 629
+[21:53:09] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-222245.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 630
+[21:53:10] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-222234.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 630
+[21:53:11] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-222547.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 631
+[21:53:11] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-222621.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 632
+[21:53:11] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-222752.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:53:12] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-222803.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:53:12] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-222814.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:53:12] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-222934.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 637
+[21:53:12] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-222945.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 636
+[21:53:12] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-222956.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 636
+[21:53:12] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-223237.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 629
+[21:53:12] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-223008.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 636
+[21:53:12] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-223249.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 628
+[21:53:13] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-223300.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 626
+[21:53:13] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-223311.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 625
+[21:53:13] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-223334.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 625
+[21:53:13] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-223345.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 624
+[21:53:15] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-223408.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 623
+[21:53:15] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-224147.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 627
+[21:53:15] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-224210.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 626
+[21:53:15] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-224233.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 627
+[21:53:15] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-224643.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 627
+[21:53:15] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-224632.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 627
+[21:53:15] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-224729.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 629
+[21:53:15] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-224921.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 636
+[21:53:15] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-224932.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 636
+[21:53:15] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-224943.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 636
+[21:53:15] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-224955.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 635
+[21:53:15] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-225018.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 635
+[21:53:17] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-225029.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 636
+[21:53:18] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-225040.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 636
+[21:53:18] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-225052.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 636
+[21:53:18] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-225137.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 635
+[21:53:18] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-225148.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:53:18] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-225212.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 634
+[21:53:18] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-225235.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 633
+[21:53:18] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-225223.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 633
+[21:53:19] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-225309.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 632
+[21:53:19] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-225551.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 633
+[21:53:19] FIN chargement 'Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-225454.fit'. Shape: (1920, 1080), Dtype: float32, Range: [0 - 6.55e+04], Mean: 633
+[21:53:21] Phase 1 finished: 874 raw files preprocessed and cached.
+[21:53:21] Phase 2: Fine clustering of raws into 'Seestar Stacks'...
+[21:53:21] ClusterStacks: Clustering 874 raw files (fine threshold: 0.18°)...
+[21:53:24] ClusterStacks: 7 Seestar stacks (fine groups) formed.
+[21:53:48] Winsor worker limit set to 14 (ProcessPoolExecutor enabled)
+[21:53:48] Phase 2 finished: 30 'Seestar Stacks' identified.
+[21:53:48] Phase 3: Creating Master Tiles (reading from preprocessed image cache)...
+[21:53:48] WORKERS_PHASE3: Utilisation de 4 worker(s). (Base: 12, Ratio 50%, Groupes: 30)
+[21:53:48] MasterTile_0: Creation started from cache (1 raws)...
+[21:53:48] MasterTile_1: Creation started from cache (15 raws)...
+[21:53:48] MasterTile_2: Creation started from cache (578 raws)...
+[21:53:48] MasterTile_3: Creation started from cache (43 raws)...
+[21:53:49] Début sauvegarde FITS vers 'master_tile_000.fits'. SaveAsFloat=True
+[21:53:49] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [143 - 6.55e+04], IsFinite: True
+[21:53:49] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.54e+04], IsFinite: True
+[21:53:49] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.54e+04], IsFinite: True
+[21:53:49] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 65380.0, Mean: 491.07403564453125, Std: 227.31805419921875, Dtype: float32, Finite: True
+[21:53:49] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 65380.0, Mean: 491.07403564453125, Dtype: float32, Finite: True
+[21:53:49] Sauvegarde FITS vers 'master_tile_000.fits' RÉUSSIE.
+[21:53:50] MasterTile_4: Creation started from cache (33 raws)...
+[21:54:13] Début sauvegarde FITS vers 'master_tile_001.fits'. SaveAsFloat=True
+[21:54:13] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [502 - 6.55e+04], IsFinite: True
+[21:54:13] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.5e+04], IsFinite: True
+[21:54:13] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.5e+04], IsFinite: True
+[21:54:13] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 65018.2578125, Mean: 126.53872680664062, Std: 245.14698791503906, Dtype: float32, Finite: True
+[21:54:13] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 65018.2578125, Mean: 126.53872680664062, Dtype: float32, Finite: True
+[21:54:14] Sauvegarde FITS vers 'master_tile_001.fits' RÉUSSIE.
+[21:54:14] MasterTile_5: Creation started from cache (21 raws)...
+[21:54:47] Début sauvegarde FITS vers 'master_tile_004.fits'. SaveAsFloat=True
+[21:54:47] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [539 - 6.55e+04], IsFinite: True
+[21:54:47] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.5e+04], IsFinite: True
+[21:54:47] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.5e+04], IsFinite: True
+[21:54:47] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 64951.97265625, Mean: 82.32779693603516, Std: 207.04867553710938, Dtype: float32, Finite: True
+[21:54:48] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 64951.97265625, Mean: 82.32779693603516, Dtype: float32, Finite: True
+[21:54:48] Sauvegarde FITS vers 'master_tile_004.fits' RÉUSSIE.
+[21:54:48] MasterTile_6: Creation started from cache (16 raws)...
+[21:54:52] Début sauvegarde FITS vers 'master_tile_005.fits'. SaveAsFloat=True
+[21:54:52] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [528 - 6.55e+04], IsFinite: True
+[21:54:52] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.5e+04], IsFinite: True
+[21:54:52] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.5e+04], IsFinite: True
+[21:54:52] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 64994.921875, Mean: 93.64347076416016, Std: 242.86097717285156, Dtype: float32, Finite: True
+[21:54:52] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 64994.921875, Mean: 93.64347076416016, Dtype: float32, Finite: True
+[21:54:53] Sauvegarde FITS vers 'master_tile_005.fits' RÉUSSIE.
+[21:54:53] MasterTile_7: Creation started from cache (30 raws)...
+[21:55:13] Début sauvegarde FITS vers 'master_tile_003.fits'. SaveAsFloat=True
+[21:55:13] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [543 - 6.55e+04], IsFinite: True
+[21:55:13] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.5e+04], IsFinite: True
+[21:55:13] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.5e+04], IsFinite: True
+[21:55:14] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 64972.44921875, Mean: 78.71356201171875, Std: 188.76177978515625, Dtype: float32, Finite: True
+[21:55:14] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 64972.44921875, Mean: 78.71356201171875, Dtype: float32, Finite: True
+[21:55:14] Sauvegarde FITS vers 'master_tile_003.fits' RÉUSSIE.
+[21:55:14] MasterTile_8: Creation started from cache (5 raws)...
+[21:55:22] Début sauvegarde FITS vers 'master_tile_008.fits'. SaveAsFloat=True
+[21:55:22] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [460 - 6.55e+04], IsFinite: True
+[21:55:22] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.51e+04], IsFinite: True
+[21:55:22] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.51e+04], IsFinite: True
+[21:55:22] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 65060.05859375, Mean: 167.34768676757812, Std: 225.21112060546875, Dtype: float32, Finite: True
+[21:55:22] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 65060.05859375, Mean: 167.34768676757812, Dtype: float32, Finite: True
+[21:55:22] Sauvegarde FITS vers 'master_tile_008.fits' RÉUSSIE.
+[21:55:23] MasterTile_9: Creation started from cache (33 raws)...
+[21:55:23] Début sauvegarde FITS vers 'master_tile_006.fits'. SaveAsFloat=True
+[21:55:23] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [498 - 6.52e+04], IsFinite: True
+[21:55:23] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.47e+04], IsFinite: True
+[21:55:23] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.47e+04], IsFinite: True
+[21:55:23] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 64738.24609375, Mean: 121.86119079589844, Std: 219.2705841064453, Dtype: float32, Finite: True
+[21:55:23] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 64738.24609375, Mean: 121.86119079589844, Dtype: float32, Finite: True
+[21:55:24] Sauvegarde FITS vers 'master_tile_006.fits' RÉUSSIE.
+[21:55:24] MasterTile_10: Creation started from cache (5 raws)...
+[21:55:32] Début sauvegarde FITS vers 'master_tile_010.fits'. SaveAsFloat=True
+[21:55:33] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [450 - 6.02e+04], IsFinite: True
+[21:55:33] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 5.98e+04], IsFinite: True
+[21:55:33] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 5.98e+04], IsFinite: True
+[21:55:33] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 59752.4140625, Mean: 184.4099578857422, Std: 239.91748046875, Dtype: float32, Finite: True
+[21:55:33] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 59752.4140625, Mean: 184.4099578857422, Dtype: float32, Finite: True
+[21:55:33] Sauvegarde FITS vers 'master_tile_010.fits' RÉUSSIE.
+[21:55:33] MasterTile_11: Creation started from cache (2 raws)...
+[21:55:35] Début sauvegarde FITS vers 'master_tile_011.fits'. SaveAsFloat=True
+[21:55:35] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [404 - 6.55e+04], IsFinite: True
+[21:55:36] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.51e+04], IsFinite: True
+[21:55:36] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.51e+04], IsFinite: True
+[21:55:36] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 65112.25, Mean: 207.53582763671875, Std: 229.56350708007812, Dtype: float32, Finite: True
+[21:55:36] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 65112.25, Mean: 207.53582763671875, Dtype: float32, Finite: True
+[21:55:36] Sauvegarde FITS vers 'master_tile_011.fits' RÉUSSIE.
+[21:55:36] MasterTile_12: Creation started from cache (26 raws)...
+[21:55:55] Début sauvegarde FITS vers 'master_tile_007.fits'. SaveAsFloat=True
+[21:55:55] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [540 - 6.55e+04], IsFinite: True
+[21:55:55] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.49e+04], IsFinite: True
+[21:55:55] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.49e+04], IsFinite: True
+[21:55:55] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 64926.1171875, Mean: 81.99043273925781, Std: 208.19630432128906, Dtype: float32, Finite: True
+[21:55:55] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 64926.1171875, Mean: 81.99043273925781, Dtype: float32, Finite: True
+[21:55:56] Sauvegarde FITS vers 'master_tile_007.fits' RÉUSSIE.
+[21:55:56] MasterTile_13: Creation started from cache (7 raws)...
+[21:56:06] Début sauvegarde FITS vers 'master_tile_013.fits'. SaveAsFloat=True
+[21:56:06] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [475 - 6.55e+04], IsFinite: True
+[21:56:06] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.5e+04], IsFinite: True
+[21:56:06] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.5e+04], IsFinite: True
+[21:56:06] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 65036.8203125, Mean: 153.01197814941406, Std: 236.2926483154297, Dtype: float32, Finite: True
+[21:56:06] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 65036.8203125, Mean: 153.01197814941406, Dtype: float32, Finite: True
+[21:56:07] Sauvegarde FITS vers 'master_tile_013.fits' RÉUSSIE.
+[21:56:07] MasterTile_14: Creation started from cache (4 raws)...
+[21:56:13] Début sauvegarde FITS vers 'master_tile_014.fits'. SaveAsFloat=True
+[21:56:13] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [428 - 6.55e+04], IsFinite: True
+[21:56:13] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.51e+04], IsFinite: True
+[21:56:13] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.51e+04], IsFinite: True
+[21:56:14] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 65066.51171875, Mean: 214.11618041992188, Std: 233.12405395507812, Dtype: float32, Finite: True
+[21:56:14] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 65066.51171875, Mean: 214.11618041992188, Dtype: float32, Finite: True
+[21:56:14] Sauvegarde FITS vers 'master_tile_014.fits' RÉUSSIE.
+[21:56:14] MasterTile_15: Creation started from cache (1 raws)...
+[21:56:14] Début sauvegarde FITS vers 'master_tile_015.fits'. SaveAsFloat=True
+[21:56:14] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [0 - 6.55e+04], IsFinite: True
+[21:56:14] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.55e+04], IsFinite: True
+[21:56:14] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.55e+04], IsFinite: True
+[21:56:14] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 65516.0, Mean: 623.5730590820312, Std: 233.86874389648438, Dtype: float32, Finite: True
+[21:56:15] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 65516.0, Mean: 623.5730590820312, Dtype: float32, Finite: True
+[21:56:15] Sauvegarde FITS vers 'master_tile_015.fits' RÉUSSIE.
+[21:56:15] MasterTile_16: Creation started from cache (5 raws)...
+[21:56:23] Début sauvegarde FITS vers 'master_tile_016.fits'. SaveAsFloat=True
+[21:56:23] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [359 - 6.55e+04], IsFinite: True
+[21:56:23] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.52e+04], IsFinite: True
+[21:56:23] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.52e+04], IsFinite: True
+[21:56:23] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 65164.6796875, Mean: 268.8623352050781, Std: 237.310546875, Dtype: float32, Finite: True
+[21:56:23] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 65164.6796875, Mean: 268.8623352050781, Dtype: float32, Finite: True
+[21:56:23] Sauvegarde FITS vers 'master_tile_016.fits' RÉUSSIE.
+[21:56:24] MasterTile_17: Creation started from cache (14 raws)...
+[21:56:31] Début sauvegarde FITS vers 'master_tile_012.fits'. SaveAsFloat=True
+[21:56:31] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [487 - 6.55e+04], IsFinite: True
+[21:56:31] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.5e+04], IsFinite: True
+[21:56:31] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.5e+04], IsFinite: True
+[21:56:31] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 65027.56640625, Mean: 138.5719451904297, Std: 232.22154235839844, Dtype: float32, Finite: True
+[21:56:31] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 65027.56640625, Mean: 138.5719451904297, Dtype: float32, Finite: True
+[21:56:31] Sauvegarde FITS vers 'master_tile_012.fits' RÉUSSIE.
+[21:56:31] MasterTile_18: Creation started from cache (1 raws)...
+[21:56:32] Début sauvegarde FITS vers 'master_tile_018.fits'. SaveAsFloat=True
+[21:56:32] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [0 - 6.55e+04], IsFinite: True
+[21:56:32] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.55e+04], IsFinite: True
+[21:56:32] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.55e+04], IsFinite: True
+[21:56:32] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 65527.0, Mean: 638.3115844726562, Std: 287.0439147949219, Dtype: float32, Finite: True
+[21:56:32] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 65527.0, Mean: 638.3115844726562, Dtype: float32, Finite: True
+[21:56:33] Sauvegarde FITS vers 'master_tile_018.fits' RÉUSSIE.
+[21:56:33] MasterTile_19: Creation started from cache (3 raws)...
+[21:56:34] Début sauvegarde FITS vers 'master_tile_009.fits'. SaveAsFloat=True
+[21:56:34] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [540 - 6.55e+04], IsFinite: True
+[21:56:34] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.5e+04], IsFinite: True
+[21:56:34] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.5e+04], IsFinite: True
+[21:56:34] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 64975.8515625, Mean: 87.40023803710938, Std: 253.13119506835938, Dtype: float32, Finite: True
+[21:56:34] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 64975.8515625, Mean: 87.40023803710938, Dtype: float32, Finite: True
+[21:56:34] Sauvegarde FITS vers 'master_tile_009.fits' RÉUSSIE.
+[21:56:34] MasterTile_20: Creation started from cache (5 raws)...
+[21:56:38] Début sauvegarde FITS vers 'master_tile_019.fits'. SaveAsFloat=True
+[21:56:38] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [342 - 6.55e+04], IsFinite: True
+[21:56:38] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.52e+04], IsFinite: True
+[21:56:38] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.52e+04], IsFinite: True
+[21:56:38] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 65175.60546875, Mean: 284.9493713378906, Std: 257.2817687988281, Dtype: float32, Finite: True
+[21:56:38] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 65175.60546875, Mean: 284.9493713378906, Dtype: float32, Finite: True
+[21:56:39] Sauvegarde FITS vers 'master_tile_019.fits' RÉUSSIE.
+[21:56:39] MasterTile_21: Creation started from cache (1 raws)...
+[21:56:39] Début sauvegarde FITS vers 'master_tile_021.fits'. SaveAsFloat=True
+[21:56:39] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [0 - 6.55e+04], IsFinite: True
+[21:56:39] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.55e+04], IsFinite: True
+[21:56:39] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.55e+04], IsFinite: True
+[21:56:39] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 65516.0, Mean: 615.9757690429688, Std: 235.19561767578125, Dtype: float32, Finite: True
+[21:56:39] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 65516.0, Mean: 615.9757690429688, Dtype: float32, Finite: True
+[21:56:39] Sauvegarde FITS vers 'master_tile_021.fits' RÉUSSIE.
+[21:56:40] MasterTile_22: Creation started from cache (1 raws)...
+[21:56:40] Début sauvegarde FITS vers 'master_tile_022.fits'. SaveAsFloat=True
+[21:56:40] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [0 - 6.55e+04], IsFinite: True
+[21:56:40] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.55e+04], IsFinite: True
+[21:56:40] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.55e+04], IsFinite: True
+[21:56:40] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 65519.0, Mean: 619.6033935546875, Std: 236.0432891845703, Dtype: float32, Finite: True
+[21:56:40] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 65519.0, Mean: 619.6033935546875, Dtype: float32, Finite: True
+[21:56:40] Sauvegarde FITS vers 'master_tile_022.fits' RÉUSSIE.
+[21:56:41] MasterTile_23: Creation started from cache (8 raws)...
+[21:56:43] Début sauvegarde FITS vers 'master_tile_020.fits'. SaveAsFloat=True
+[21:56:43] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [363 - 6.55e+04], IsFinite: True
+[21:56:43] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.52e+04], IsFinite: True
+[21:56:43] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.52e+04], IsFinite: True
+[21:56:44] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 65160.1015625, Mean: 246.24581909179688, Std: 235.48147583007812, Dtype: float32, Finite: True
+[21:56:44] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 65160.1015625, Mean: 246.24581909179688, Dtype: float32, Finite: True
+[21:56:44] Sauvegarde FITS vers 'master_tile_020.fits' RÉUSSIE.
+[21:56:44] MasterTile_24: Creation started from cache (1 raws)...
+[21:56:46] Début sauvegarde FITS vers 'master_tile_024.fits'. SaveAsFloat=True
+[21:56:46] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [0 - 6.55e+04], IsFinite: True
+[21:56:46] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.55e+04], IsFinite: True
+[21:56:46] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.55e+04], IsFinite: True
+[21:56:46] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 65522.0, Mean: 617.269287109375, Std: 230.51206970214844, Dtype: float32, Finite: True
+[21:56:46] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 65522.0, Mean: 617.269287109375, Dtype: float32, Finite: True
+[21:56:46] Sauvegarde FITS vers 'master_tile_024.fits' RÉUSSIE.
+[21:56:46] MasterTile_25: Creation started from cache (4 raws)...
+[21:56:53] Début sauvegarde FITS vers 'master_tile_025.fits'. SaveAsFloat=True
+[21:56:53] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [132 - 6.55e+04], IsFinite: True
+[21:56:53] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.54e+04], IsFinite: True
+[21:56:53] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.54e+04], IsFinite: True
+[21:56:53] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 65369.83203125, Mean: 491.49359130859375, Std: 226.52931213378906, Dtype: float32, Finite: True
+[21:56:53] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 65369.83203125, Mean: 491.49359130859375, Dtype: float32, Finite: True
+[21:56:54] Sauvegarde FITS vers 'master_tile_025.fits' RÉUSSIE.
+[21:56:57] MasterTile_26: Creation started from cache (4 raws)...
+[21:56:57] Début sauvegarde FITS vers 'master_tile_017.fits'. SaveAsFloat=True
+[21:56:57] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [454 - 6.55e+04], IsFinite: True
+[21:56:57] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.5e+04], IsFinite: True
+[21:56:57] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.5e+04], IsFinite: True
+[21:56:57] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 65039.375, Mean: 170.16407775878906, Std: 218.75485229492188, Dtype: float32, Finite: True
+[21:56:58] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 65039.375, Mean: 170.16407775878906, Dtype: float32, Finite: True
+[21:56:58] Sauvegarde FITS vers 'master_tile_017.fits' RÉUSSIE.
+[21:56:58] MasterTile_27: Creation started from cache (2 raws)...
+[21:56:59] Début sauvegarde FITS vers 'master_tile_027.fits'. SaveAsFloat=True
+[21:56:59] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [199 - 6.55e+04], IsFinite: True
+[21:56:59] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.53e+04], IsFinite: True
+[21:57:00] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.53e+04], IsFinite: True
+[21:57:00] Début sauvegarde FITS vers 'master_tile_023.fits'. SaveAsFloat=True
+[21:57:00] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [385 - 6.43e+04], IsFinite: True
+[21:57:00] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.39e+04], IsFinite: True
+[21:57:00] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.39e+04], IsFinite: True
+[21:57:00] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 65312.78515625, Mean: 423.4893798828125, Std: 233.9578857421875, Dtype: float32, Finite: True
+[21:57:00] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 65312.78515625, Mean: 423.4893798828125, Dtype: float32, Finite: True
+[21:57:00] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 63882.3515625, Mean: 229.8368682861328, Std: 175.1181182861328, Dtype: float32, Finite: True
+[21:57:00] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 63882.3515625, Mean: 229.8368682861328, Dtype: float32, Finite: True
+[21:57:01] Sauvegarde FITS vers 'master_tile_027.fits' RÉUSSIE.
+[21:57:01] MasterTile_28: Creation started from cache (4 raws)...
+[21:57:01] Sauvegarde FITS vers 'master_tile_023.fits' RÉUSSIE.
+[21:57:02] MasterTile_29: Creation started from cache (1 raws)...
+[21:57:02] Début sauvegarde FITS vers 'master_tile_029.fits'. SaveAsFloat=True
+[21:57:02] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [0 - 6.55e+04], IsFinite: True
+[21:57:02] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.55e+04], IsFinite: True
+[21:57:02] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.55e+04], IsFinite: True
+[21:57:03] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 65508.00390625, Mean: 621.0908813476562, Std: 183.4740447998047, Dtype: float32, Finite: True
+[21:57:03] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 65508.00390625, Mean: 621.0908813476562, Dtype: float32, Finite: True
+[21:57:03] Sauvegarde FITS vers 'master_tile_029.fits' RÉUSSIE.
+[21:57:06] Début sauvegarde FITS vers 'master_tile_026.fits'. SaveAsFloat=True
+[21:57:06] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [161 - 6.55e+04], IsFinite: True
+[21:57:07] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.54e+04], IsFinite: True
+[21:57:07] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.54e+04], IsFinite: True
+[21:57:07] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 65354.765625, Mean: 462.694580078125, Std: 234.2268829345703, Dtype: float32, Finite: True
+[21:57:07] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 65354.765625, Mean: 462.694580078125, Dtype: float32, Finite: True
+[21:57:07] Sauvegarde FITS vers 'master_tile_026.fits' RÉUSSIE.
+[21:57:08] Début sauvegarde FITS vers 'master_tile_028.fits'. SaveAsFloat=True
+[21:57:08] SAVE_DEBUG: Données image_data reçues - Shape: (1920, 1080, 3), Dtype: float32, Range: [363 - 6.55e+04], IsFinite: True
+[21:57:08] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 6.52e+04], IsFinite: True
+[21:57:08] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 1920, 1080), Dtype: float32, Range: [0, 6.52e+04], IsFinite: True
+[21:57:08] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 65152.62109375, Mean: 257.832763671875, Std: 241.9314727783203, Dtype: float32, Finite: True
+[21:57:08] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 65152.62109375, Mean: 257.832763671875, Dtype: float32, Finite: True
+[21:57:09] Sauvegarde FITS vers 'master_tile_028.fits' RÉUSSIE.
+[21:57:45] AlignGroup WARNING: maximum iterations reached for image 125. Skipping.
+[21:57:47] AlignGroup WARNING: maximum iterations reached for image 126. Skipping.
+[21:57:49] AlignGroup WARNING: maximum iterations reached for image 127. Skipping.
+[21:57:51] AlignGroup WARNING: maximum iterations reached for image 128. Skipping.
+[21:57:54] AlignGroup WARNING: maximum iterations reached for image 131. Skipping.
+[21:57:56] AlignGroup WARNING: maximum iterations reached for image 132. Skipping.
+[22:00:13] AlignGroup WARNING: maximum iterations reached for image 281. Skipping.
+[22:00:15] AlignGroup WARNING: maximum iterations reached for image 282. Skipping.
+[22:00:16] AlignGroup WARNING: maximum iterations reached for image 283. Skipping.
+[22:00:18] AlignGroup WARNING: maximum iterations reached for image 284. Skipping.
+[22:00:19] AlignGroup WARNING: maximum iterations reached for image 285. Skipping.
+[22:01:12] AlignGroup WARNING: maximum iterations reached for image 343. Skipping.
+[22:02:24] AlignGroup WARNING: maximum iterations reached for image 421. Skipping.
+[22:02:26] AlignGroup WARNING: maximum iterations reached for image 422. Skipping.
+[22:02:27] AlignGroup WARNING: maximum iterations reached for image 423. Skipping.
+[22:02:29] AlignGroup WARNING: maximum iterations reached for image 424. Skipping.
+[22:02:30] AlignGroup WARNING: maximum iterations reached for image 425. Skipping.
+[22:04:49] AlignGroup WARNING: maximum iterations reached for image 575. Skipping.
+[22:04:50] AlignGroup WARNING: maximum iterations reached for image 576. Skipping.
+[22:04:52] AlignGroup WARNING: maximum iterations reached for image 577. Skipping.
+[22:09:32] ERROR P3: Exception in master tile creation thread.
+[22:09:35] Phase 3 finished: 29 Master Tiles successfully created (using cache).
+[22:09:35] Phase 3 finished: 29 Master Tiles successfully created.
+[22:09:35] Phase 4: Calculating final mosaic output grid (from Master Tiles)...
+[22:09:35] CalcGrid: Avg Input Scale: 2.376 arcsec/pix. Target Output Scale: 2.376 arcsec/pix.
+[22:09:35] CalcGrid: Optimal grid: Shape(H,W)=(5003, 3922), CRVAL=[314.99498248  68.48725327]
+[22:09:35] Phase 4 finished: Final grid: Shape(H,W)=(5003, 3922), CRVAL=[314.99498248  68.48725327]
+[22:09:35] Phase 5: Final assembly (Reproject & Coadd)...
+[22:17:22] assemble_info_finished_reproject_coadd
+[22:17:23] Phase 5 finished: Reproject & Coadd completed. Mosaic shape (HWC): (4533, 3212, 3)
+[22:17:23] Phase 6: Saving final mosaic...
+[22:17:23] Début sauvegarde FITS vers 'zemosaic_MT29_R874.fits'. SaveAsFloat=True
+[22:17:23] SAVE_DEBUG: Données image_data reçues - Shape: (4533, 3212, 3), Dtype: float32, Range: [-346 - 6.51e+04], IsFinite: True
+[22:17:23] SAVE_DEBUG: (Float) data_to_write_temp: Range [-346, 6.51e+04], IsFinite: True
+[22:17:23] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (3, 4533, 3212), Dtype: float32, Range: [-346, 6.51e+04], IsFinite: True
+[22:17:23] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: -345.50860595703125, Max: 65091.39453125, Mean: 228.81692504882812, Std: 156.52560424804688, Dtype: float32, Finite: True
+[22:17:23] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: -345.50860595703125, Max: 65091.39453125, Mean: 228.81692504882812, Dtype: float32, Finite: True
+[22:17:24] Sauvegarde FITS vers 'zemosaic_MT29_R874.fits' RÉUSSIE.
+[22:17:24] Début sauvegarde FITS vers 'zemosaic_MT29_R874_coverage.fits'. SaveAsFloat=True
+[22:17:24] SAVE_DEBUG: Données image_data reçues - Shape: (4533, 3212), Dtype: float32, Range: [0 - 0.276], IsFinite: True
+[22:17:24] SAVE_DEBUG: (Float) data_to_write_temp: Range [0, 0.276], IsFinite: True
+[22:17:24] SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: (4533, 3212), Dtype: float32, Range: [0, 0.276], IsFinite: True
+[22:17:24] SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: 0.0, Max: 0.27586206793785095, Mean: 0.05834294110536575, Std: 0.06135131046175957, Dtype: float32, Finite: True
+[22:17:24] SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: 0.0, Max: 0.27586206793785095, Mean: 0.05834294110536575, Dtype: float32, Finite: True
+[22:17:25] Sauvegarde FITS vers 'zemosaic_MT29_R874_coverage.fits' RÉUSSIE.
+[22:17:25] Final mosaic saved: zemosaic_MT29_R874.fits
+[22:17:27] Preview saved (auto ASI FITS-like): zemosaic_MT29_R874_preview.png
+[22:17:27] Phase 7: Cleaning up temporary files...
+[22:17:28] WARNING P7: Failed to clean up temporary Master Tile folder '{directory}': {error} [FORMAT_ARGS_MISSING: {'error': "[WinError 32] Le processus ne peut pas accéder au fichier car ce fichier est utilisé par un autre processus: 'C:/Users/TRISTAN/Desktop/astrophoto/NGC 7023_out\\\\.zemosaic_img_cache\\\\preprocessed_Light_mosaic_NGC 7023_10.0s_IRCUT_20241103-224643_855.npy'"}]
+[22:17:28] Hierarchical mosaic processing completed in 1663.63s.
+[22:17:28] log_key_processing_finished
