@@ -2,6 +2,10 @@
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+
+from core.tk_safe import patch_tk_variables
+
+patch_tk_variables()
 import threading
 import multiprocessing
 import os
