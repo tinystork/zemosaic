@@ -13,13 +13,16 @@ import glob
 import uuid
 import multiprocessing
 import threading
+import itertools
 from typing import Callable
 from types import SimpleNamespace
 
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, FIRST_COMPLETED
 # BrokenProcessPool moved under concurrent.futures.process in modern Python
 from concurrent.futures.process import BrokenProcessPool
 
+# Nombre maximum de tentatives d'alignement avant abandon définitif
+MAX_ALIGNMENT_RETRY_ATTEMPTS = 3
 
 def cluster_seestar_stacks_connected(
     all_raw_files_with_info: list,
@@ -1674,6 +1677,12 @@ def create_master_tile(
     Lit les données image prétraitées depuis un cache disque (.npy).
     Utilise les WCS et Headers déjà résolus et stockés en mémoire.
     Transmet toutes les options de stacking, y compris la pondération radiale.
+
+    Returns
+    -------
+    tuple[tuple[str | None, object | None], list[list[dict]]]
+        - ``(path, wcs)`` du master stack produit (``None`` si échec).
+        - Liste de sous-groupes à retraiter (copie des ``raw_info`` pour les images non alignées).
     """
     pcb_tile = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(msg_key, prog, lvl, callback=progress_callback, **kwargs)
     # Load persistent configuration to forward GPU preference
@@ -1692,8 +1701,9 @@ def create_master_tile(
         pass
     func_id_log_base = "mastertile"
 
-    pcb_tile(f"{func_id_log_base}_info_creation_started_from_cache", prog=None, lvl="INFO", 
+    pcb_tile(f"{func_id_log_base}_info_creation_started_from_cache", prog=None, lvl="INFO",
              num_raw=len(seestar_stack_group_info), tile_id=tile_id)
+    failed_groups_to_retry: list[list[dict]] = []
     pcb_tile(f"    {func_id_log_base}_{tile_id}: Options Stacking - Norm='{stack_norm_method}', "
              f"Weight='{stack_weight_method}' (RadialWeight={apply_radial_weight}), "
              f"Reject='{stack_reject_algo}', Combine='{stack_final_combine}'", prog=None, lvl="DEBUG")
@@ -1703,17 +1713,17 @@ def create_master_tile(
         if not ZEMOSAIC_UTILS_AVAILABLE: pcb_tile(f"{func_id_log_base}_error_utils_unavailable", prog=None, lvl="ERROR", tile_id=tile_id)
         if not ZEMOSAIC_ALIGN_STACK_AVAILABLE: pcb_tile(f"{func_id_log_base}_error_alignstack_unavailable", prog=None, lvl="ERROR", tile_id=tile_id)
         if not ASTROPY_AVAILABLE or not fits: pcb_tile(f"{func_id_log_base}_error_astropy_unavailable", prog=None, lvl="ERROR", tile_id=tile_id)
-        return None, None
+        return (None, None), failed_groups_to_retry
         
     if not seestar_stack_group_info: 
         pcb_tile(f"{func_id_log_base}_error_no_images_provided", prog=None, lvl="ERROR", tile_id=tile_id)
-        return None,None
+        return (None, None), failed_groups_to_retry
     
     # Choix de l'image de référence (généralement la première du groupe après tri ou la plus centrale)
     reference_image_index_in_group = 0 # Pourrait être plus sophistiqué à l'avenir
     if not (0 <= reference_image_index_in_group < len(seestar_stack_group_info)): 
         pcb_tile(f"{func_id_log_base}_error_invalid_ref_index", prog=None, lvl="ERROR", tile_id=tile_id, ref_idx=reference_image_index_in_group, group_size=len(seestar_stack_group_info))
-        return None,None
+        return (None, None), failed_groups_to_retry
     
     ref_info_for_tile = seestar_stack_group_info[reference_image_index_in_group]
     wcs_for_master_tile = ref_info_for_tile.get('wcs')
@@ -1722,7 +1732,7 @@ def create_master_tile(
 
     if not (wcs_for_master_tile and wcs_for_master_tile.is_celestial and header_dict_for_master_tile_base):
         pcb_tile(f"{func_id_log_base}_error_invalid_ref_wcs_header", prog=None, lvl="ERROR", tile_id=tile_id)
-        return None,None
+        return (None, None), failed_groups_to_retry
     
     # Conversion du dict en objet astropy.io.fits.Header pour la sauvegarde
     header_for_master_tile_base = fits.Header(header_dict_for_master_tile_base.cards if hasattr(header_dict_for_master_tile_base,'cards') else header_dict_for_master_tile_base)
@@ -1780,7 +1790,7 @@ def create_master_tile(
                  _PH3_CONCURRENCY_SEMAPHORE.release()
              except Exception:
                  pass
-             del tile_images_data_HWC_adu, tile_original_raw_headers; gc.collect(); return None, None
+             del tile_images_data_HWC_adu, tile_original_raw_headers; gc.collect(); return (None, None), failed_groups_to_retry
         except Exception as e_load_cache:
             pcb_tile(f"{func_id_log_base}_error_loading_cache", prog=None, lvl="ERROR", filename=os.path.basename(cached_image_file_path), error=str(e_load_cache), tile_id=tile_id)
             logger.error(f"Erreur chargement cache {cached_image_file_path} pour tuile {tile_id}", exc_info=True)
@@ -1792,9 +1802,9 @@ def create_master_tile(
     except Exception:
         pass
 
-    if not tile_images_data_HWC_adu: 
+    if not tile_images_data_HWC_adu:
         pcb_tile(f"{func_id_log_base}_error_no_valid_images_from_cache", prog=None, lvl="ERROR", tile_id=tile_id)
-        return None,None
+        return (None, None), failed_groups_to_retry
     # pcb_tile(f"{func_id_log_base}_info_loading_from_cache_finished", prog=None, lvl="DEBUG_DETAIL", num_loaded=len(tile_images_data_HWC_adu), tile_id=tile_id)
 
     # pcb_tile(f"{func_id_log_base}_info_intra_tile_alignment_started", prog=None, lvl="DEBUG_DETAIL", num_to_align=len(tile_images_data_HWC_adu), tile_id=tile_id)
@@ -1803,15 +1813,34 @@ def create_master_tile(
         _PH3_CONCURRENCY_SEMAPHORE.acquire()
     except Exception:
         pass
-    aligned_images_for_stack = zemosaic_align_stack.align_images_in_group(
-        image_data_list=tile_images_data_HWC_adu, 
-        reference_image_index=reference_image_index_in_group, 
+    aligned_images_for_stack, failed_alignment_indices = zemosaic_align_stack.align_images_in_group(
+        image_data_list=tile_images_data_HWC_adu,
+        reference_image_index=reference_image_index_in_group,
         progress_callback=progress_callback
     )
+    if failed_alignment_indices:
+        retry_group: list[dict] = []
+        for idx_fail in failed_alignment_indices:
+            if 0 <= idx_fail < len(seestar_stack_group_info):
+                raw_info = seestar_stack_group_info[idx_fail]
+                if isinstance(raw_info, dict):
+                    info_copy = dict(raw_info)
+                    current_retry = int(info_copy.get('retry_attempt', 0))
+                    info_copy['retry_attempt'] = current_retry + 1
+                    origin_chain = list(info_copy.get('retry_origin_chain', []))
+                    origin_chain.append(int(tile_id))
+                    info_copy['retry_origin_chain'] = origin_chain
+                else:
+                    info_copy = raw_info
+                retry_group.append(info_copy)
+        if retry_group:
+            failed_groups_to_retry.append(retry_group)
+
     del tile_images_data_HWC_adu; gc.collect()
-    
+
     valid_aligned_images = [img for img in aligned_images_for_stack if img is not None]
-    if aligned_images_for_stack: del aligned_images_for_stack # Libérer la liste originale après filtrage
+    if aligned_images_for_stack:
+        del aligned_images_for_stack # Libérer la liste originale après filtrage
 
     num_actually_aligned_for_header = len(valid_aligned_images)
     # pcb_tile(f"{func_id_log_base}_info_intra_tile_alignment_finished", prog=None, lvl="DEBUG_DETAIL", num_aligned=num_actually_aligned_for_header, tile_id=tile_id)
@@ -1822,7 +1851,7 @@ def create_master_tile(
             _PH3_CONCURRENCY_SEMAPHORE.release()
         except Exception:
             pass
-        return None,None
+        return (None, None), failed_groups_to_retry
     
     pcb_tile(f"{func_id_log_base}_info_stacking_started", prog=None, lvl="DEBUG_DETAIL", 
              num_to_stack=len(valid_aligned_images), tile_id=tile_id) # Les options sont loggées au début
@@ -1872,13 +1901,13 @@ def create_master_tile(
                                           # stack_aligned_images travaille sur ces arrays.
                                           # Il est bon de del ici.
 
-    if master_tile_stacked_HWC is None: 
+    if master_tile_stacked_HWC is None:
         pcb_tile(f"{func_id_log_base}_error_stacking_failed", prog=None, lvl="ERROR", tile_id=tile_id)
         try:
             _PH3_CONCURRENCY_SEMAPHORE.release()
         except Exception:
             pass
-        return None,None
+        return (None, None), failed_groups_to_retry
     
     pcb_tile(f"{func_id_log_base}_info_stacking_finished", prog=None, lvl="DEBUG_DETAIL", tile_id=tile_id, 
              shape=master_tile_stacked_HWC.shape)
@@ -1979,7 +2008,7 @@ def create_master_tile(
             _PH3_CONCURRENCY_SEMAPHORE.release()
         except Exception:
             pass
-        return temp_fits_filepath, wcs_for_master_tile
+        return (temp_fits_filepath, wcs_for_master_tile), failed_groups_to_retry
         
     except Exception as e_save_mt:
         pcb_tile(f"{func_id_log_base}_error_saving", prog=None, lvl="ERROR", tile_id=tile_id, error=str(e_save_mt))
@@ -1988,7 +2017,7 @@ def create_master_tile(
             _PH3_CONCURRENCY_SEMAPHORE.release()
         except Exception:
             pass
-        return None,None
+        return (None, None), failed_groups_to_retry
     finally:
         if 'master_tile_stacked_HWC' in locals() and master_tile_stacked_HWC is not None: 
             del master_tile_stacked_HWC
@@ -3972,11 +4001,15 @@ def run_hierarchical_mosaic(
     
     executor_ph3 = ThreadPoolExecutor(max_workers=actual_num_workers_ph3, thread_name_prefix="ZeMosaic_Ph3_")
 
-    future_to_group_index = {
-        executor_ph3.submit(
+    future_to_tile_id: dict = {}
+    pending_futures: set = set()
+    next_dynamic_tile_id = num_seestar_stacks_to_process
+
+    def _submit_master_tile_group(group_info_list: list[dict], assigned_tile_id: int) -> None:
+        future = executor_ph3.submit(
             create_master_tile,
-            sg_info_list,
-            i_stk,  # tile_id
+            group_info_list,
+            assigned_tile_id,
             temp_master_tile_storage_dir,
             stack_norm_method, stack_weight_method, stack_reject_algo,
             stack_kappa_low, stack_kappa_high, parsed_winsor_limits,
@@ -3984,26 +4017,34 @@ def run_hierarchical_mosaic(
             apply_radial_weight_config, radial_feather_fraction_config,
             radial_shape_power_config, min_radial_weight_floor_config,
             astap_exe_path, astap_data_dir_param, astap_search_radius_config,
-            astap_downsample_config, astap_sensitivity_config, 180,  # timeout ASTAP
+            astap_downsample_config, astap_sensitivity_config, 180,
             winsor_worker_limit,
-            progress_callback
-        ): i_stk for i_stk, sg_info_list in enumerate(seestar_stack_groups)
-    }
+            progress_callback,
+        )
+        future_to_tile_id[future] = assigned_tile_id
+        pending_futures.add(future)
+
+    for i_stk, sg_info_list in enumerate(seestar_stack_groups):
+        _submit_master_tile_group(sg_info_list, i_stk)
 
     start_time_loop_ph3 = time.time()
     last_time_loop_ph3 = start_time_loop_ph3
     step_times_ph3 = []
 
-    for future in as_completed(future_to_group_index):
-            
-            group_index_original = future_to_group_index[future]
+    while pending_futures:
+        done_futures, _ = wait(pending_futures, return_when=FIRST_COMPLETED)
+        for future in done_futures:
+            pending_futures.discard(future)
+            tile_id_for_future = future_to_tile_id.pop(future, None)
+            if tile_id_for_future is None:
+                continue
             tiles_processed_count_ph3 += 1
-            
-            # --- ENVOYER LA MISE À JOUR DU COMPTEUR DE TUILES ---
+
             pcb(f"MASTER_TILE_COUNT_UPDATE:{tiles_processed_count_ph3}/{num_seestar_stacks_to_process}", prog=None, lvl="ETA_LEVEL")
-            # --- FIN ENVOI MISE À JOUR ---
-            
-            prog_step_phase3 = base_progress_phase3 + int(PROGRESS_WEIGHT_PHASE3_MASTER_TILES * (tiles_processed_count_ph3 / max(1, num_seestar_stacks_to_process)))
+
+            prog_step_phase3 = base_progress_phase3 + int(
+                PROGRESS_WEIGHT_PHASE3_MASTER_TILES * (tiles_processed_count_ph3 / max(1, num_seestar_stacks_to_process))
+            )
             if progress_callback:
                 try:
                     progress_callback("phase3_master_tiles", tiles_processed_count_ph3, num_seestar_stacks_to_process)
@@ -4013,19 +4054,82 @@ def run_hierarchical_mosaic(
             now = time.time()
             step_times_ph3.append(now - last_time_loop_ph3)
             last_time_loop_ph3 = now
+
             try:
-                mt_result_path, mt_result_wcs = future.result()
-                if mt_result_path and mt_result_wcs: 
-                    master_tiles_results_list_temp[group_index_original] = (mt_result_path, mt_result_wcs)
-                else: 
-                    pcb("run_warn_phase3_master_tile_creation_failed_thread", prog=prog_step_phase3, lvl="WARN", stack_num=group_index_original + 1)
-            except Exception as exc_thread_ph3: 
-                pcb("run_error_phase3_thread_exception", prog=prog_step_phase3, lvl="ERROR", stack_num=group_index_original + 1, error=str(exc_thread_ph3))
-                logger.error(f"Exception Phase 3 pour stack {group_index_original + 1}:", exc_info=True)
-            
-            if tiles_processed_count_ph3 % max(1, num_seestar_stacks_to_process // 5) == 0 or tiles_processed_count_ph3 == num_seestar_stacks_to_process : 
+                main_result, retry_groups = future.result()
+                mt_result_path, mt_result_wcs = (main_result or (None, None))
+                if mt_result_path and mt_result_wcs:
+                    master_tiles_results_list_temp[tile_id_for_future] = (mt_result_path, mt_result_wcs)
+                else:
+                    pcb(
+                        "run_warn_phase3_master_tile_creation_failed_thread",
+                        prog=prog_step_phase3,
+                        lvl="WARN",
+                        stack_num=int(tile_id_for_future) + 1,
+                    )
+                if retry_groups:
+                    for retry_group in retry_groups:
+                        if not retry_group:
+                            continue
+                        filtered_retry_group: list[dict] = []
+                        dropped_infos: list[dict] = []
+                        for raw_info in retry_group:
+                            if isinstance(raw_info, dict):
+                                attempts = int(raw_info.get('retry_attempt', 0))
+                                if attempts > MAX_ALIGNMENT_RETRY_ATTEMPTS:
+                                    dropped_infos.append(raw_info)
+                                    continue
+                            filtered_retry_group.append(raw_info)
+                        for dropped in dropped_infos:
+                            try:
+                                filename = os.path.basename(dropped.get('path_raw', 'UnknownRaw'))
+                            except Exception:
+                                filename = str(dropped)
+                            pcb(
+                                "run_warn_phase3_alignment_retry_abandoned",
+                                prog=None,
+                                lvl="WARN",
+                                tile_id=int(tile_id_for_future),
+                                filename=filename,
+                                attempts=int(dropped.get('retry_attempt', 0)) if isinstance(dropped, dict) else None,
+                            )
+                        if not filtered_retry_group:
+                            continue
+                        new_tile_id = next_dynamic_tile_id
+                        next_dynamic_tile_id += 1
+                        num_seestar_stacks_to_process += 1
+                        pcb(
+                            "run_info_phase3_retry_submitted",
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                            origin_tile=int(tile_id_for_future),
+                            new_tile=new_tile_id,
+                            frames=len(filtered_retry_group),
+                        )
+                        _submit_master_tile_group(filtered_retry_group, new_tile_id)
+                        pcb(
+                            f"MASTER_TILE_COUNT_UPDATE:{tiles_processed_count_ph3}/{num_seestar_stacks_to_process}",
+                            prog=None,
+                            lvl="ETA_LEVEL",
+                        )
+                        if progress_callback:
+                            try:
+                                progress_callback("phase3_master_tiles", tiles_processed_count_ph3, num_seestar_stacks_to_process)
+                            except Exception:
+                                pass
+            except Exception as exc_thread_ph3:
+                pcb(
+                    "run_error_phase3_thread_exception",
+                    prog=prog_step_phase3,
+                    lvl="ERROR",
+                    stack_num=int(tile_id_for_future) + 1,
+                    error=str(exc_thread_ph3),
+                )
+                logger.error(f"Exception Phase 3 pour stack {int(tile_id_for_future) + 1}:", exc_info=True)
+
+            if tiles_processed_count_ph3 % max(1, num_seestar_stacks_to_process // 5) == 0 or tiles_processed_count_ph3 == num_seestar_stacks_to_process:
                  _log_memory_usage(progress_callback, f"Phase 3 - Traité {tiles_processed_count_ph3}/{num_seestar_stacks_to_process} tuiles")
-            
+
             elapsed_phase3 = time.monotonic() - start_time_phase3
             time_per_master_tile_creation = elapsed_phase3 / max(1, tiles_processed_count_ph3)
             eta_phase3_sec = (num_seestar_stacks_to_process - tiles_processed_count_ph3) * time_per_master_tile_creation

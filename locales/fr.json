@@ -388,6 +388,8 @@
     "run_warn_phase4_unhandled_tile_shape": "AVERT P4 : Shape de Master Tuile non gérée ; ignorée.",
     "run_warn_phase4_zero_dimensions_tile": "AVERT P4 : Master Tuile à dimensions nulles ; ignorée.",
     "run_warn_phase3_master_tile_creation_failed_thread": "AVERT P3 : Échec de création d'une Master Tuile dans un thread worker.",
+    "run_warn_phase3_alignment_retry_abandoned": "AVERT P3 : Nouvel essai abandonné pour la tuile {tile_id}, fichier {filename} après {attempts} tentative(s).",
+    "run_info_phase3_retry_submitted": "INFO P3 : Re-stack programmé depuis la tuile {origin_tile} vers la nouvelle tuile {new_tile} avec {frames} image(s).",
     "run_warn_phase6_wcs_to_header_failed": "AVERT P6 : Échec de conversion du WCS en entête FITS : {error}",
     "run_success_preview_saved_fallback": "Prévisualisation enregistrée (fallback) : {filename}",
     "run_error_phase3_thread_exception": "ERREUR P3 : Exception dans un thread de création de Master Tuile.",

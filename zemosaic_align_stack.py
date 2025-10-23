@@ -617,8 +617,8 @@ def align_images_in_group(image_data_list: list,
                           reference_image_index: int = 0,
                           detection_sigma: float = 3.0,
                           min_area: int = 5,
-                          propagate_mask: bool = False, 
-                          progress_callback: callable = None) -> list:
+                          propagate_mask: bool = False,
+                          progress_callback: callable = None) -> tuple[list, list[int]]:
     """
     Aligne une liste d'images (données NumPy HWC, float32, ADU) sur une image de référence
     de ce même groupe en utilisant astroalign.
@@ -695,10 +695,12 @@ def align_images_in_group(image_data_list: list,
         _pcb("aligngroup_error_astroalign_unavailable", lvl="WARN")
         # We'll still try FFT phase-correlation if possible
         if not image_data_list or not (0 <= reference_image_index < len(image_data_list)):
-            return [None] * len(image_data_list)
+            empty = [None] * len(image_data_list)
+            return empty, list(range(len(empty)))
         ref = image_data_list[reference_image_index]
         if ref is None:
-            return [None] * len(image_data_list)
+            empty = [None] * len(image_data_list)
+            return empty, list(range(len(empty)))
         if ref.ndim == 3 and ref.shape[-1] == 3:
             ref_lum = 0.299 * ref[..., 0] + 0.587 * ref[..., 1] + 0.114 * ref[..., 2]
         else:
@@ -716,16 +718,19 @@ def align_images_in_group(image_data_list: list,
                 aligned[i] = _apply_integer_shift_hw_or_hwc(src.astype(np.float32, copy=False), dy, dx)
             else:
                 aligned[i] = src.astype(np.float32, copy=True)
-        return aligned
+        failed_idx = [idx for idx, img in enumerate(aligned) if img is None]
+        return aligned, failed_idx
 
     if not image_data_list or not (0 <= reference_image_index < len(image_data_list)):
         _pcb("aligngroup_error_invalid_input_list_or_ref_index", lvl="ERROR", ref_idx=reference_image_index)
-        return [None] * len(image_data_list)
+        empty = [None] * len(image_data_list)
+        return empty, list(range(len(empty)))
 
     reference_image_adu = image_data_list[reference_image_index]
     if reference_image_adu is None:
         _pcb("aligngroup_error_ref_image_none", lvl="ERROR", ref_idx=reference_image_index)
-        return [None] * len(image_data_list)
+        empty = [None] * len(image_data_list)
+        return empty, list(range(len(empty)))
     
     if reference_image_adu.dtype != np.float32:
         _pcb(f"AlignGroup: Image de référence (index {reference_image_index}) convertie en float32.", lvl="DEBUG_DETAIL")
@@ -799,7 +804,8 @@ def align_images_in_group(image_data_list: list,
             _pcb("aligngroup_error_exception_aligning", lvl="ERROR", img_idx=i, error_type=type(e_align).__name__, error_msg=str(e_align))
             _pcb(f"AlignGroup Traceback: {traceback.format_exc()}", lvl="DEBUG_DETAIL")
             aligned_images[i] = None
-    return aligned_images
+    failed_indices = [idx for idx, img in enumerate(aligned_images) if img is None]
+    return aligned_images, failed_indices
 
 
 
