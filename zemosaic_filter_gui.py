@@ -111,6 +111,10 @@ def launch_filter_interface(
         # Imports kept inside to avoid import-time errors affecting pipeline
         import tkinter as tk
         from tkinter import ttk, messagebox
+
+        from core.tk_safe import patch_tk_variables
+
+        patch_tk_variables()
         import numpy as np
         from astropy.coordinates import SkyCoord
         import astropy.units as u
