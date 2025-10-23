@@ -1485,8 +1485,10 @@ def _reject_outliers_winsorized_sigma_clip(
     except MemoryError as e_mem:
         _pcb("reject_winsor_error_memory", lvl="ERROR", error=str(e_mem))
         _internal_logger.error("MemoryError dans _reject_outliers_winsorized_sigma_clip", exc_info=True)
-        # En cas de MemoryError, il vaut mieux retourner les données originales pour ne pas planter
-        return stacked_array_NHDWC.copy(), np.ones_like(stacked_array_NHDWC, dtype=bool)
+        # En cas de MemoryError, retourner une vue float32 sans duplication pour éviter un double échec.
+        fallback_view = stacked_array_NHDWC.astype(np.float32, copy=False)
+        fallback_mask = np.ones_like(stacked_array_NHDWC, dtype=bool)
+        return fallback_view, fallback_mask
     except Exception as e_winsor:
         _pcb("reject_winsor_error_unexpected", lvl="ERROR", error=str(e_winsor))
         _internal_logger.error("Erreur inattendue dans _reject_outliers_winsorized_sigma_clip", exc_info=True)
@@ -2043,6 +2045,8 @@ def _cpu_stack_winsorized_fallback(
         )
 
     arr = np.stack(frames_list, axis=0)
+    # Libérer au plus tôt la mémoire retenue par la liste de frames individuelles.
+    frames_list.clear()
     if arr.ndim not in (3, 4):
         raise ValueError(f"frames must be (N,H,W) or (N,H,W,C); got shape {arr.shape}")
 
