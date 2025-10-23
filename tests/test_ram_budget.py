@@ -1,4 +1,3 @@
-import math
 import pathlib
 import sys
 
@@ -8,85 +7,60 @@ ROOT_DIR = pathlib.Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from zemosaic_worker import _apply_ram_budget_to_groups
+from zemosaic_worker import _auto_split_groups, _compute_auto_tile_caps
 
 
-def _make_info(idx: int, height: int = 100, width: int = 100) -> dict:
-    return {
-        "path_raw": f"frame_{idx}.fits",
-        "preprocessed_shape": (height, width, 3),
-    }
+def _make_header(index: int) -> dict:
+    return {"DATE-OBS": f"2023-01-01T00:00:{index:02d}"}
 
 
-def _stub_cluster(groups_to_return):
-    """Return a clustering stub that yields ``groups_to_return`` when threshold is low enough."""
+def test_auto_caps_uses_ram_budget_and_minimum():
+    resource = {"usable_ram_mb": 1200.0, "ram_available_mb": 1500.0, "disk_free_mb": 2000.0}
+    per_frame = {"per_frame_mb": 50.0}
 
-    def _cluster(group, threshold, _callback, orientation_split_threshold_deg=0.0):
-        return groups_to_return(threshold, group)
+    caps = _compute_auto_tile_caps(resource, per_frame, policy_max=50, policy_min=8)
 
-    return _cluster
-
-
-def test_ram_budget_triggers_temporal_split():
-    group = [_make_info(i) for i in range(10)]
-    per_frame_bytes = 100 * 100 * 4
-    budget_bytes = per_frame_bytes * 3  # Force split into batches of 3 frames
-
-    new_groups, adjustments = _apply_ram_budget_to_groups(
-        [group],
-        budget_bytes,
-        base_threshold_deg=0.5,
-        orientation_split_threshold_deg=0.0,
-        cluster_func=_stub_cluster(lambda _thr, g: [g]),
-    )
-
-    # Expect four groups: 3 + 3 + 3 + 1 frames
-    sizes = sorted(len(g) for g in new_groups)
-    assert sizes == [1, 3, 3, 3]
-    split_adjustments = [adj for adj in adjustments if adj.get("method") == "split"]
-    assert split_adjustments, "Temporal split adjustment should be recorded"
-    assert split_adjustments[0]["segment_size"] == 3
+    assert caps["cap"] == 24  # floor(1200 / 50)
+    assert caps["frames_by_ram"] == 24
+    assert not caps["memmap"]
 
 
-def test_ram_budget_recluster_before_split():
-    group = [_make_info(i) for i in range(4)]
-    per_frame_bytes = 100 * 100 * 4
-    budget_bytes = per_frame_bytes * 2  # Enough for two frames, not four
+def test_auto_caps_enables_memmap_when_ram_tight():
+    resource = {"usable_ram_mb": 200.0, "ram_available_mb": 250.0, "disk_free_mb": 20000.0}
+    per_frame = {"per_frame_mb": 80.0}
 
-    def _groups_for_threshold(threshold, g):
-        if threshold < 0.2:
-            mid = len(g) // 2
-            return [g[:mid], g[mid:]]
-        return [g]
+    caps = _compute_auto_tile_caps(resource, per_frame, policy_max=50, policy_min=8)
 
-    new_groups, adjustments = _apply_ram_budget_to_groups(
-        [group],
-        budget_bytes,
-        base_threshold_deg=0.5,
-        orientation_split_threshold_deg=0.0,
-        cluster_func=_stub_cluster(_groups_for_threshold),
-    )
-
-    assert [len(g) for g in new_groups] == [2, 2]
-    recluster_events = [adj for adj in adjustments if adj.get("method") == "recluster"]
-    assert recluster_events, "Recluster adjustment should be recorded"
-    assert float(recluster_events[0]["new_threshold_deg"]) < 0.2
+    assert caps["cap"] == 8  # respects minimum when frames_by_ram < 8
+    assert caps["memmap"] is True
 
 
-def test_ram_budget_single_frame_over_budget():
-    group = [_make_info(0, height=1000, width=1000)]
-    total_bytes = 1000 * 1000 * 4
-    budget_bytes = total_bytes // 4  # Smaller than per-frame requirement
+def test_auto_split_groups_temporal_chunks():
+    group = [{"header": _make_header(i), "phase0_index": i} for i in range(10)]
 
-    new_groups, adjustments = _apply_ram_budget_to_groups(
-        [group],
-        budget_bytes,
-        base_threshold_deg=0.5,
-        orientation_split_threshold_deg=0.0,
-        cluster_func=_stub_cluster(lambda _thr, g: [g]),
-    )
+    result = _auto_split_groups([group], cap=3, min_cap=2)
+    sizes = [len(g) for g in result]
+    assert sizes == [3, 3, 3, 1]
 
-    assert len(new_groups) == 1
-    single_over = [adj for adj in adjustments if adj.get("method") == "single_over_budget"]
-    assert single_over, "Single-frame over-budget warning should be recorded"
-    assert math.isclose(single_over[0]["estimated_mb"], total_bytes / (1024 ** 2), rel_tol=1e-6)
+
+def test_auto_split_groups_spatial_prefers_clusters():
+    group = []
+    for i in range(4):
+        group.append({
+            "header": _make_header(i),
+            "phase0_center": (0.0, 0.0),
+            "phase0_fov_deg": 1.0,
+            "phase0_index": i,
+        })
+    for i in range(4, 8):
+        group.append({
+            "header": _make_header(i),
+            "phase0_center": (10.0, 0.0),
+            "phase0_fov_deg": 1.0,
+            "phase0_index": i,
+        })
+
+    result = _auto_split_groups([group], cap=4, min_cap=2)
+    assert [len(g) for g in result] == [4, 4]
+    # Ensure chronological order preserved within subgroups
+    assert [g[0]["phase0_index"] for g in result] == [0, 4]
