@@ -1852,12 +1852,20 @@ class ZeMosaicGUI:
         if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
             zemosaic_config.save_config(self.config)
 
+        stack_ram_budget_val = 0.0
+        try:
+            stack_ram_budget_val = float(self.config.get("stack_ram_budget_gb", 0.0))
+        except Exception:
+            stack_ram_budget_val = 0.0
+        self.config["stack_ram_budget_gb"] = stack_ram_budget_val
+
         worker_args = (
             input_dir, output_dir, astap_exe, astap_data,
             astap_radius_val, astap_downsample_val, astap_sensitivity_val,
             cluster_thresh_val,
             cluster_target_groups_val,
             cluster_orientation_split_val,
+            stack_ram_budget_val,
             stack_norm_method,
             stack_weight_method,
             stack_reject_algo,

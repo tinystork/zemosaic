@@ -169,7 +169,11 @@
     "clusterstacks_info_groups_split_auto_limit": "Auto limit enabled: groups split from {original} to {new}, max {limit} frames (sample {shape})",
     "clusterstacks_info_groups_split_manual_limit": "Manual limit applied: groups split from {original} to {new}, limit {limit} frames",
     "clusterstacks_warn_auto_limit_failed": "Auto limit estimation failed: {error}",
-    
+    "clusterstacks_warn_ram_budget_split": "RAM budget exceeded for group #{group_index}: {original_frames} frame(s) (~{estimated_mb:.1f} MiB) > budget {budget_mb:.1f} MiB. Split into {num_subgroups} subgroup(s) of <= {segment_size} frame(s).",
+    "clusterstacks_warn_ram_budget_split_still_over": "Even after splitting, subgroup(s) for group #{group_index} exceed the budget {budget_mb:.1f} MiB (segment size {segment_size}). Proceeding with caution.",
+    "clusterstacks_warn_ram_budget_recluster": "RAM budget exceeded for group #{group_index}: {original_frames} frame(s) (~{estimated_mb:.1f} MiB) > budget {budget_mb:.1f} MiB. Relaxed clustering threshold to {new_threshold_deg:.4f}° (attempt {attempts}) → {num_subgroups} subgroup(s).",
+    "clusterstacks_warn_ram_budget_single_over": "RAM budget warning for group #{group_index}: single frame still requires ~{estimated_mb:.1f} MiB > budget {budget_mb:.1f} MiB. No further split possible.",
+
     "getwcs_error_utils_unavailable": "GetWCS_Pretreat ERROR: zemosaic_utils module not available.",
     "getwcs_error_load_failed": "GetWCS_Pretreat ERROR: Failed to load '{filename}'.",
     "getwcs_warn_debayer_failed": "GetWCS_Pretreat WARN: Debayering failed for '{filename}': {error}. Attempting to stack as grayscale (replicated).",
