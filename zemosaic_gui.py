@@ -989,7 +989,7 @@ class ZeMosaicGUI:
             # print("DEBUG GUI: Root window non existante dans _update_ui_language.")
             return
 
-        self.root.title(self._tr("window_title", "ZeMosaic V2.8 - Hierarchical Mosaicker"))
+        self.root.title(self._tr("window_title", "ZeMosaic V2.9 - Hierarchical Mosaicker"))
 
         # Traduction des widgets standards (Labels, Buttons, Titres de Frames, Onglets etc.)
         for key, widget_info in self.translatable_widgets.items():
