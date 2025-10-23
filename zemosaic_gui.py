@@ -192,11 +192,11 @@ class ZeMosaicGUI:
             self.localizer = MockLocalizer(language_code=default_lang_from_config)
         
         # --- Variable compteur tuile phase 3
-        self.master_tile_count_var = tk.StringVar(value="") # Initialement vide
+        self.master_tile_count_var = tk.StringVar(master=self.root, value="") # Initialement vide
         # Compteur de fichiers bruts traités pendant la Phase 1
-        self.file_count_var = tk.StringVar(value="")
+        self.file_count_var = tk.StringVar(master=self.root, value="")
         # Indicateur de phase courante (texte traduit)
-        self.phase_var = tk.StringVar(value="")
+        self.phase_var = tk.StringVar(master=self.root, value="")
         
         
         # --- Définition des listes de clés pour les ComboBoxes ---
@@ -208,60 +208,60 @@ class ZeMosaicGUI:
         # --- FIN Définition des listes de clés ---
 
         # --- Tkinter Variables ---
-        self.input_dir_var = tk.StringVar()
-        self.output_dir_var = tk.StringVar()
-        self.astap_exe_path_var = tk.StringVar(value=self.config.get("astap_executable_path", ""))
-        self.astap_data_dir_var = tk.StringVar(value=self.config.get("astap_data_directory_path", ""))
-        self.astap_search_radius_var = tk.DoubleVar(value=self.config.get("astap_default_search_radius", 3.0))
-        self.astap_downsample_var = tk.IntVar(value=self.config.get("astap_default_downsample", 2))
-        self.astap_sensitivity_var = tk.IntVar(value=self.config.get("astap_default_sensitivity", 100))
-        self.cluster_threshold_var = tk.DoubleVar(value=self.config.get("cluster_panel_threshold", 0.18))
-        self.cluster_target_groups_var = tk.IntVar(value=self.config.get("cluster_target_groups", 0))
-        self.cluster_orientation_split_var = tk.DoubleVar(value=self.config.get("cluster_orientation_split_deg", 0.0))
-        self.save_final_uint16_var = tk.BooleanVar(value=self.config.get("save_final_as_uint16", False))
+        self.input_dir_var = tk.StringVar(master=self.root)
+        self.output_dir_var = tk.StringVar(master=self.root)
+        self.astap_exe_path_var = tk.StringVar(master=self.root, value=self.config.get("astap_executable_path", ""))
+        self.astap_data_dir_var = tk.StringVar(master=self.root, value=self.config.get("astap_data_directory_path", ""))
+        self.astap_search_radius_var = tk.DoubleVar(master=self.root, value=self.config.get("astap_default_search_radius", 3.0))
+        self.astap_downsample_var = tk.IntVar(master=self.root, value=self.config.get("astap_default_downsample", 2))
+        self.astap_sensitivity_var = tk.IntVar(master=self.root, value=self.config.get("astap_default_sensitivity", 100))
+        self.cluster_threshold_var = tk.DoubleVar(master=self.root, value=self.config.get("cluster_panel_threshold", 0.18))
+        self.cluster_target_groups_var = tk.IntVar(master=self.root, value=self.config.get("cluster_target_groups", 0))
+        self.cluster_orientation_split_var = tk.DoubleVar(master=self.root, value=self.config.get("cluster_orientation_split_deg", 0.0))
+        self.save_final_uint16_var = tk.BooleanVar(master=self.root, value=self.config.get("save_final_as_uint16", False))
 
         # --- Solver Settings ---
         try:
             self.solver_settings = SolverSettings.load_default()
         except Exception:
             self.solver_settings = SolverSettings()
-        self.solver_choice_var = tk.StringVar(value=self.solver_settings.solver_choice)
+        self.solver_choice_var = tk.StringVar(master=self.root, value=self.solver_settings.solver_choice)
         self.solver_choice_var.trace_add("write", self._update_solver_frames)
-        self.astrometry_api_key_var = tk.StringVar(value=self.solver_settings.api_key)
-        self.astrometry_timeout_var = tk.IntVar(value=self.solver_settings.timeout)
-        self.astrometry_downsample_var = tk.IntVar(value=self.solver_settings.downsample)
+        self.astrometry_api_key_var = tk.StringVar(master=self.root, value=self.solver_settings.api_key)
+        self.astrometry_timeout_var = tk.IntVar(master=self.root, value=self.solver_settings.timeout)
+        self.astrometry_downsample_var = tk.IntVar(master=self.root, value=self.solver_settings.downsample)
         
         self.is_processing = False
         self.worker_process = None
         self.progress_queue = None
-        self.progress_bar_var = tk.DoubleVar(value=0.0)
-        self.eta_var = tk.StringVar(value=self._tr("initial_eta_value", "--:--:--"))
-        self.elapsed_time_var = tk.StringVar(value=self._tr("initial_elapsed_time", "00:00:00"))
+        self.progress_bar_var = tk.DoubleVar(master=self.root, value=0.0)
+        self.eta_var = tk.StringVar(master=self.root, value=self._tr("initial_eta_value", "--:--:--"))
+        self.elapsed_time_var = tk.StringVar(master=self.root, value=self._tr("initial_elapsed_time", "00:00:00"))
         self._chrono_start_time = None
         self._chrono_after_id = None
         self._stage_times = {}
         
-        self.current_language_var = tk.StringVar(value=self.localizer.language_code)
+        self.current_language_var = tk.StringVar(master=self.root, value=self.localizer.language_code)
         self.current_language_var.trace_add("write", self._on_language_change)
         
         # --- Variables Tkinter pour les Options de Stacking ---
-        self.stacking_normalize_method_var = tk.StringVar(value=self.config.get("stacking_normalize_method", self.norm_method_keys[0]))
-        self.stacking_weighting_method_var = tk.StringVar(value=self.config.get("stacking_weighting_method", self.weight_method_keys[0]))
-        self.stacking_rejection_algorithm_var = tk.StringVar(value=self.config.get("stacking_rejection_algorithm", self.reject_algo_keys[1]))
+        self.stacking_normalize_method_var = tk.StringVar(master=self.root, value=self.config.get("stacking_normalize_method", self.norm_method_keys[0]))
+        self.stacking_weighting_method_var = tk.StringVar(master=self.root, value=self.config.get("stacking_weighting_method", self.weight_method_keys[0]))
+        self.stacking_rejection_algorithm_var = tk.StringVar(master=self.root, value=self.config.get("stacking_rejection_algorithm", self.reject_algo_keys[1]))
         
-        self.stacking_kappa_low_var = tk.DoubleVar(value=self.config.get("stacking_kappa_low", 3.0))
-        self.stacking_kappa_high_var = tk.DoubleVar(value=self.config.get("stacking_kappa_high", 3.0))
-        self.stacking_winsor_limits_str_var = tk.StringVar(value=self.config.get("stacking_winsor_limits", "0.05,0.05"))
-        self.stacking_final_combine_method_var = tk.StringVar(value=self.config.get("stacking_final_combine_method", self.combine_method_keys[0]))
+        self.stacking_kappa_low_var = tk.DoubleVar(master=self.root, value=self.config.get("stacking_kappa_low", 3.0))
+        self.stacking_kappa_high_var = tk.DoubleVar(master=self.root, value=self.config.get("stacking_kappa_high", 3.0))
+        self.stacking_winsor_limits_str_var = tk.StringVar(master=self.root, value=self.config.get("stacking_winsor_limits", "0.05,0.05"))
+        self.stacking_final_combine_method_var = tk.StringVar(master=self.root, value=self.config.get("stacking_final_combine_method", self.combine_method_keys[0]))
         
         # --- PONDÉRATION RADIALE ---
-        self.apply_radial_weight_var = tk.BooleanVar(value=self.config.get("apply_radial_weight", False))
-        self.radial_feather_fraction_var = tk.DoubleVar(value=self.config.get("radial_feather_fraction", 0.8))
-        self.min_radial_weight_floor_var = tk.DoubleVar(value=self.config.get("min_radial_weight_floor", 0.0)) # Ajouté
+        self.apply_radial_weight_var = tk.BooleanVar(master=self.root, value=self.config.get("apply_radial_weight", False))
+        self.radial_feather_fraction_var = tk.DoubleVar(master=self.root, value=self.config.get("radial_feather_fraction", 0.8))
+        self.min_radial_weight_floor_var = tk.DoubleVar(master=self.root, value=self.config.get("min_radial_weight_floor", 0.0)) # Ajouté
         # radial_shape_power est géré via self.config directement
         
         # --- METHODE D'ASSEMBLAGE ---
-        self.final_assembly_method_var = tk.StringVar(
+        self.final_assembly_method_var = tk.StringVar(master=self.root, 
             value=self.config.get("final_assembly_method", self.assembly_method_keys[0])
         )
         self.final_assembly_method_var.trace_add("write", self._on_assembly_method_change)
@@ -272,28 +272,28 @@ class ZeMosaicGUI:
         num_workers_from_config = self.config.get("num_processing_workers", 0)
         if num_workers_from_config == -1:
             num_workers_from_config = 0
-        self.num_workers_var = tk.IntVar(value=num_workers_from_config)
-        self.winsor_workers_var = tk.IntVar(value=self.config.get("winsor_worker_limit", 6))
-        self.winsor_max_frames_var = tk.IntVar(value=self.config.get("winsor_max_frames_per_pass", 0))
+        self.num_workers_var = tk.IntVar(master=self.root, value=num_workers_from_config)
+        self.winsor_workers_var = tk.IntVar(master=self.root, value=self.config.get("winsor_worker_limit", 6))
+        self.winsor_max_frames_var = tk.IntVar(master=self.root, value=self.config.get("winsor_max_frames_per_pass", 0))
         # --- FIN NOMBRE DE WORKERS ---
         # --- NOUVELLES VARIABLES TKINTER POUR LE ROGNAGE ---
-        self.apply_master_tile_crop_var = tk.BooleanVar(
+        self.apply_master_tile_crop_var = tk.BooleanVar(master=self.root, 
             value=self.config.get("apply_master_tile_crop", True) # Désactivé par défaut
         )
-        self.master_tile_crop_percent_var = tk.DoubleVar(
+        self.master_tile_crop_percent_var = tk.DoubleVar(master=self.root, 
             value=self.config.get("master_tile_crop_percent", 10.0) # 10% par côté par défaut si activé
         )
-        self.use_memmap_var = tk.BooleanVar(value=self.config.get("coadd_use_memmap", False))
-        self.mm_dir_var = tk.StringVar(value=self.config.get("coadd_memmap_dir", ""))
-        self.cleanup_memmap_var = tk.BooleanVar(value=self.config.get("coadd_cleanup_memmap", True))
-        self.auto_limit_frames_var = tk.BooleanVar(value=self.config.get("auto_limit_frames_per_master_tile", True))
-        self.max_raw_per_tile_var = tk.IntVar(value=self.config.get("max_raw_per_master_tile", 0))
-        self.use_gpu_phase5_var = tk.BooleanVar(value=self.config.get("use_gpu_phase5", False))
+        self.use_memmap_var = tk.BooleanVar(master=self.root, value=self.config.get("coadd_use_memmap", False))
+        self.mm_dir_var = tk.StringVar(master=self.root, value=self.config.get("coadd_memmap_dir", ""))
+        self.cleanup_memmap_var = tk.BooleanVar(master=self.root, value=self.config.get("coadd_cleanup_memmap", True))
+        self.auto_limit_frames_var = tk.BooleanVar(master=self.root, value=self.config.get("auto_limit_frames_per_master_tile", True))
+        self.max_raw_per_tile_var = tk.IntVar(master=self.root, value=self.config.get("max_raw_per_master_tile", 0))
+        self.use_gpu_phase5_var = tk.BooleanVar(master=self.root, value=self.config.get("use_gpu_phase5", False))
         # Logging level var (keys are ERROR, WARN, INFO, DEBUG)
         self.logging_level_keys = ["ERROR", "WARN", "INFO", "DEBUG"]
-        self.logging_level_var = tk.StringVar(value=str(self.config.get("logging_level", "INFO")).upper())
+        self.logging_level_var = tk.StringVar(master=self.root, value=str(self.config.get("logging_level", "INFO")).upper())
         self._gpus = _detect_gpus()
-        self.gpu_selector_var = tk.StringVar(
+        self.gpu_selector_var = tk.StringVar(master=self.root, 
             value=self.config.get("gpu_selector", self._gpus[0][0] if self._gpus else "")
         )
         # ---  ---
