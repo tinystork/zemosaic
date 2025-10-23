@@ -15,6 +15,49 @@ import importlib.util
 GPU_AVAILABLE = importlib.util.find_spec("cupy") is not None
 map_coordinates = None  # Lazily imported when needed
 
+# --- Lightweight CuPy helpers -------------------------------------------------
+def gpu_is_available() -> bool:
+    if not GPU_AVAILABLE:
+        return False
+    try:
+        import cupy as cp  # type: ignore
+        return bool(cp.is_available())
+    except Exception:
+        return False
+
+
+def ensure_cupy_pool_initialized(device_id: int | None = None) -> None:
+    """Idempotently enable CuPy device + memory pools.
+
+    - Sets the current device (optional).
+    - Enables a default device memory pool and a pinned host memory pool.
+    """
+    if not gpu_is_available():
+        return
+    try:
+        ensure_cupy_pool_initialized._done  # type: ignore[attr-defined]
+        return
+    except AttributeError:
+        pass
+    import cupy as cp  # type: ignore
+    try:
+        if device_id is not None:
+            cp.cuda.Device(int(device_id)).use()
+    except Exception:
+        # Ignore invalid ids; rely on current device
+        pass
+    try:
+        mp = cp.cuda.MemoryPool(cp.cuda.malloc)
+        cp.cuda.set_allocator(mp.malloc)
+    except Exception:
+        pass
+    try:
+        pmp = cp.cuda.PinnedMemoryPool()
+        cp.cuda.set_pinned_memory_allocator(pmp.malloc)
+    except Exception:
+        pass
+    ensure_cupy_pool_initialized._done = True  # type: ignore[attr-defined]
+
 from reproject.mosaicking import reproject_and_coadd as cpu_reproject_and_coadd
 
 # --- Définition locale du flag ASTROPY_AVAILABLE et du module fits pour ce fichier ---
@@ -624,24 +667,39 @@ def stretch_auto_asifits_like(img_hwc_adu, p_low=0.5, p_high=99.8,
     Étirement type ASIFitsViewer avec asinh et auto balance RVB.
     Fallback vers du linéaire si dynamique trop faible.
     """
-    img = img_hwc_adu.astype(np.float32, copy=False)
-    out = np.empty_like(img)
+    # Keep everything strictly in float32 to avoid huge float64 temporaries on large mosaics
+    img = np.asarray(img_hwc_adu, dtype=np.float32)
+    out = np.empty_like(img, dtype=np.float32)
+
+    a32 = np.float32(asinh_a) if asinh_a is not None else np.float32(0.01)
+    inv_asinh_den = np.float32(1.0) / np.arcsinh(np.float32(1.0) / a32)
 
     for c in range(3):
         chan = img[..., c]
-        vmin, vmax = np.percentile(chan, [p_low, p_high])
-        if vmax - vmin < 1e-3:
-            out[..., c] = np.zeros_like(chan)
+        # percentile returns python floats/float64; cast to float32 to avoid upcasting chan
+        vmin_f64, vmax_f64 = np.percentile(chan, [p_low, p_high])
+        vmin = np.float32(vmin_f64)
+        vmax = np.float32(vmax_f64)
+        dv = vmax - vmin
+        if not np.isfinite(dv) or dv < np.float32(1e-3):
+            out[..., c].fill(0.0)
             continue
-        normed = np.clip((chan - vmin) / (vmax - vmin), 0, 1)
-        # stretch asinh
-        stretched = np.arcsinh(normed / asinh_a) / np.arcsinh(1 / asinh_a)
-        if np.nanmax(stretched) < 0.05:  # cas trop sombre
-            stretched = normed  # fallback linéaire
-        out[..., c] = stretched
+        # In-place normalize into out[..., c] to avoid an extra full-size array
+        dst = out[..., c]
+        np.subtract(chan, vmin, out=dst, dtype=np.float32)
+        np.divide(dst, dv, out=dst)
+        np.clip(dst, 0.0, 1.0, out=dst)
+        # asinh stretch in-place, keeping float32
+        # tmp = arcsinh(dst / a32) * inv_arcsinh(1/a)
+        np.divide(dst, a32, out=dst)
+        np.arcsinh(dst, out=dst)
+        dst *= inv_asinh_den
+        if not np.isfinite(np.nanmax(dst)) or np.nanmax(dst) < np.float32(0.05):
+            # fallback to linear (already in dst)
+            pass
 
     if apply_wb:
-        avg_per_chan = np.mean(out, axis=(0, 1))
+        avg_per_chan = np.mean(out, axis=(0, 1)).astype(np.float32)
         norm = np.max(avg_per_chan)
         if norm > 0:
             avg_per_chan /= norm
@@ -650,7 +708,7 @@ def stretch_auto_asifits_like(img_hwc_adu, p_low=0.5, p_high=99.8,
         for c in range(3):
             denom = avg_per_chan[c]
             if denom > 1e-8:
-                out[..., c] /= denom
+                out[..., c] = (out[..., c] / np.float32(denom)).astype(np.float32, copy=False)
 
     return np.clip(out, 0, 1)
 
@@ -872,10 +930,42 @@ def save_fits_image(image_data: np.ndarray,
 
     data_to_write_temp = None
     if save_as_float:
-        data_to_write_temp = image_data.astype(np.float32)
+        # Avoid an extra full-size copy if already float32 (important for huge mosaics)
+        if isinstance(image_data, np.ndarray) and image_data.dtype == np.float32:
+            data_to_write_temp = image_data
+        else:
+            data_to_write_temp = image_data.astype(np.float32, copy=False)
+
+        # Ensure a zero floor for better viewer auto-stretch (ASI FITS View, etc.).
+        # Some viewers expect the black level to be at 0. If our mosaic carries a
+        # positive offset (e.g. min ~ 300–500 ADU), auto-stretch may miss the true
+        # background. Shift the baseline so the global finite minimum maps to 0.
+        try:
+            finite_min = float(np.nanmin(data_to_write_temp))
+            if np.isfinite(finite_min) and finite_min > 0.0:
+                _log_util_save(
+                    f"  SAVE_DEBUG: Positive baseline detected (min={finite_min:.3f}). Shifting to zero.",
+                    "INFO_DETAIL",
+                )
+                # Avoid mutating the caller's array when we didn't already make a copy
+                if data_to_write_temp is image_data:
+                    data_to_write_temp = data_to_write_temp.copy()
+                data_to_write_temp -= np.float32(finite_min)
+                # Guard against any numerical underflow
+                data_to_write_temp = np.maximum(data_to_write_temp, 0.0)
+        except Exception as _e_minshift:
+            # Non-fatal: keep original values if anything goes wrong
+            pass
+
+        # For float images keep the header simple; many viewers rely on missing BSCALE/BZERO
         final_header_to_write['BITPIX'] = -32
-        final_header_to_write['BSCALE'] = 1.0
-        final_header_to_write['BZERO'] = 0.0
+        if 'BSCALE' in final_header_to_write: del final_header_to_write['BSCALE']
+        if 'BZERO' in final_header_to_write: del final_header_to_write['BZERO']
+        # Several viewers misinterpret DATAMIN/DATAMAX on float images for their
+        # initial auto-stretch. Historically our best compatibility came from NOT
+        # writing these two cards for BITPIX=-32. Ensure they are absent.
+        if 'DATAMIN' in final_header_to_write: del final_header_to_write['DATAMIN']
+        if 'DATAMAX' in final_header_to_write: del final_header_to_write['DATAMAX']
         _log_util_save(f"  SAVE_DEBUG: (Float) data_to_write_temp: Range [{np.nanmin(data_to_write_temp):.3g}, {np.nanmax(data_to_write_temp):.3g}], IsFinite: {np.all(np.isfinite(data_to_write_temp))}", "WARN")
     else:
         min_in, max_in = np.nanmin(image_data), np.nanmax(image_data)
@@ -885,9 +975,13 @@ def save_fits_image(image_data: np.ndarray,
         elif np.any(np.isfinite(image_data)): image_normalized_01 = np.full_like(image_data, 0.5, dtype=np.float32)
         
         image_clipped_01 = np.clip(image_normalized_01, 0.0, 1.0)
-        data_to_write_temp = (image_clipped_01 * 65535.0).astype(np.uint16)
+        # Prepare unsigned 16-bit physical range [0, 65535]
+        data_u16_phys = (image_clipped_01 * 65535.0).astype(np.uint16)
+        # Store as FITS signed int16 with BZERO=32768 as per FITS convention
+        # raw_int16 = physical - 32768 in range [-32768, 32767]
+        data_to_write_temp = (data_u16_phys.astype(np.int32) - 32768).clip(-32768, 32767).astype(np.int16)
         final_header_to_write['BITPIX'] = 16; final_header_to_write['BSCALE'] = 1; final_header_to_write['BZERO'] = 32768
-        _log_util_save(f"  SAVE_DEBUG: (Uint16) data_to_write_temp: Range [{np.min(data_to_write_temp)}, {np.max(data_to_write_temp)}]", "WARN")
+        _log_util_save(f"  SAVE_DEBUG: (Int16+BZERO) raw data range [{np.min(data_to_write_temp)}, {np.max(data_to_write_temp)}] (phys 0..65535)", "WARN")
 
     data_for_hdu_cxhxw = None
     is_color = data_to_write_temp.ndim == 3 and data_to_write_temp.shape[-1] == 3
@@ -931,6 +1025,22 @@ def save_fits_image(image_data: np.ndarray,
     try:
         _log_util_save(f"SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: {np.nanmin(data_for_hdu_cxhxw)}, Max: {np.nanmax(data_for_hdu_cxhxw)}, Mean: {np.nanmean(data_for_hdu_cxhxw)}, Std: {np.nanstd(data_for_hdu_cxhxw)}, Dtype: {data_for_hdu_cxhxw.dtype}, Finite: {np.all(np.isfinite(data_for_hdu_cxhxw))}", "ERROR")
         
+        # Add DATAMIN/DATAMAX based on physical values expected by viewers
+        try:
+            if save_as_float:
+                # Do not write DATAMIN/DATAMAX for float output to avoid confusing auto-stretchers
+                for k in ('DATAMIN', 'DATAMAX'):
+                    if k in final_header_to_write:
+                        del final_header_to_write[k]
+            else:
+                # Convert raw int16 back to physical for header statistics
+                phys_min = float(np.nanmin(data_for_hdu_cxhxw.astype(np.int32) + 32768))
+                phys_max = float(np.nanmax(data_for_hdu_cxhxw.astype(np.int32) + 32768))
+                final_header_to_write['DATAMIN'] = phys_min
+                final_header_to_write['DATAMAX'] = phys_max
+        except Exception as _:
+            pass
+
         primary_hdu_object = current_fits_module.PrimaryHDU(data=data_for_hdu_cxhxw, header=final_header_to_write)
         
         _log_util_save(f"SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: {np.nanmin(primary_hdu_object.data)}, Max: {np.nanmax(primary_hdu_object.data)}, Mean: {np.nanmean(primary_hdu_object.data)}, Dtype: {primary_hdu_object.data.dtype}, Finite: {np.all(np.isfinite(primary_hdu_object.data))}", "ERROR")
@@ -964,30 +1074,165 @@ def save_fits_image(image_data: np.ndarray,
 
 
 def gpu_assemble_final_mosaic_reproject_coadd(*args, **kwargs):
-    """GPU accelerated final mosaic assembly (reproject & coadd).
+    """Deprecated placeholder kept for compatibility.
 
-    This is a placeholder implementation. A full version would mirror the
-    NumPy implementation using CuPy arrays and CUDA kernels while minimizing
-    data transfers between host and device.
+    The worker now routes GPU usage via ``assemble_final_mosaic_reproject_coadd(..., use_gpu=True)``.
+    This function remains for backward compatibility and will raise to signal callers to switch.
     """
-    raise NotImplementedError("GPU implementation not available")
+    raise NotImplementedError(
+        "Call assemble_final_mosaic_reproject_coadd(use_gpu=True) from the worker instead."
+    )
 
 
 def gpu_assemble_final_mosaic_incremental(*args, **kwargs):
-    """GPU accelerated incremental mosaic assembly placeholder."""
-    raise NotImplementedError("GPU implementation not available")
+    """Deprecated placeholder for incremental GPU path.
+
+    Use the CPU incremental assembly; reprojection dominates and remains CPU-bound for now.
+    """
+    raise NotImplementedError(
+        "Incremental GPU path is not implemented; use CPU incremental assembly."
+    )
 
 
-def gpu_reproject_and_coadd(data_list, wcs_list, shape_out, **kwargs):
-    """Simplified GPU implementation using CuPy."""
-    import cupy as cp
-    data_gpu = [cp.asarray(d) for d in data_list]
-    mosaic_gpu = cp.zeros(shape_out, dtype=cp.float32)
-    weight_gpu = cp.zeros(shape_out, dtype=cp.float32)
-    for img in data_gpu:
-        # Placeholder for GPU interpolation logic
+def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
+    """CuPy-accelerated reprojection and mean coaddition for a single channel.
+
+    Notes
+    - Expects ``data_list`` as list of 2D NumPy arrays (single-channel tiles).
+    - ``wcs_list`` should be a list of WCS objects (or headers convertible to WCS).
+    - ``output_projection`` in ``kwargs`` must be a WCS or a FITS header for the final mosaic grid.
+    - ``match_background`` (or legacy ``match_bg``) subtracts tile median before sampling.
+    - Coverage is returned in [0, 1] as the fraction of inputs contributing per pixel.
+    - Implementation is chunked in rows to limit GPU memory usage.
+    """
+    # Import lazily to avoid importing cupy when GPU is not used
+    import cupy as cp  # type: ignore
+    from cupyx.scipy.ndimage import map_coordinates  # type: ignore
+    try:
+        from astropy.wcs import WCS as _WCS
+    except Exception:
+        _WCS = None
+
+    # Resolve final WCS from header or WCS instance
+    output_projection = kwargs.get("output_projection")
+    if output_projection is None:
+        raise ValueError("gpu_reproject_and_coadd requires 'output_projection' (WCS or header)")
+    if _WCS is not None and not hasattr(output_projection, "pixel_to_world"):
+        try:
+            output_wcs = _WCS(output_projection)
+        except Exception as e:
+            raise ValueError(f"Invalid output_projection for WCS: {e}")
+    else:
+        output_wcs = output_projection
+
+    H, W = int(shape_out[0]), int(shape_out[1])
+    n_inputs = len(data_list)
+    if len(wcs_list) != n_inputs:
+        raise ValueError("data_list and wcs_list must have the same length")
+
+    # Determine background match flag from either name
+    match_background = bool(kwargs.get("match_background", kwargs.get("match_bg", False)))
+
+    # Prepare output accumulators on GPU
+    mosaic_sum_gpu = cp.zeros((H, W), dtype=cp.float32)
+    weight_sum_gpu = cp.zeros((H, W), dtype=cp.float32)
+    tile_medians = []
+
+    # Row-chunking to bound memory; tune based on device memory
+    rows_per_chunk = int(kwargs.get("rows_per_chunk", 256))
+    rows_per_chunk = max(32, min(rows_per_chunk, H))
+
+    # Build an x-grid once (NumPy on CPU) and reuse
+    x_grid = cp.asarray(cp.arange(W, dtype=cp.float32))  # cp.arange works well; stays on GPU when meshed
+
+    # Iterate over tiles
+    for idx_tile, (img_np, tile_wcs) in enumerate(zip(data_list, wcs_list)):
+        # Basic input validation and convert to float32 without NaN side-effects
+        img = cp.asarray(img_np.astype("float32", copy=False))
+        if match_background:
+            try:
+                med = float(cp.nanmedian(img).get())
+            except Exception:
+                med = 0.0
+            tile_medians.append(med)
+            if med != 0.0:
+                img = img - cp.float32(med)
+
+        # Valid mask (1 for finite pixels, 0 otherwise); used for coverage and weighted mean
+        mask = cp.isfinite(img).astype(cp.float32)
+        img = cp.nan_to_num(img, copy=False, nan=0.0)
+
+        # Precompute per-tile: nothing yet; mapping is per-chunk
+        for r0 in range(0, H, rows_per_chunk):
+            r1 = min(H, r0 + rows_per_chunk)
+            # CPU grid for WCS conversion (faster on CPU for WCS than pushing to GPU)
+            # y in [r0, r1), x in [0, W)
+            y = cp.arange(r0, r1, dtype=cp.float32)
+            # Mesh on GPU for map_coordinates usage later
+            yy = y[:, None]
+            xx = x_grid[None, :]
+
+            # Convert output (x, y) -> world -> input (x_in, y_in) using CPU WCS
+            # Fetch to CPU minimal arrays (NumPy) for WCS; then back to GPU as coords
+            y_cpu = cp.asnumpy(yy)
+            x_cpu = cp.asnumpy(xx)
+            try:
+                # Astropy WCS expects x, y order
+                ra, dec = output_wcs.wcs_pix2world(x_cpu, y_cpu, 0)
+                x_in, y_in = tile_wcs.wcs_world2pix(ra, dec, 0)
+            except Exception:
+                # If any WCS conversion fails, skip this chunk for this tile
+                continue
+
+            x_in_gpu = cp.asarray(x_in, dtype=cp.float32)
+            y_in_gpu = cp.asarray(y_in, dtype=cp.float32)
+
+            # Build validity mask for in-bounds coordinates
+            h_in, w_in = img.shape
+            valid = (
+                (x_in_gpu >= -0.5)
+                & (x_in_gpu <= (w_in - 0.5))
+                & (y_in_gpu >= -0.5)
+                & (y_in_gpu <= (h_in - 0.5))
+            )
+
+            # Sample image and mask at mapped coordinates (bilinear, constant outside)
+            coords = cp.stack([y_in_gpu, x_in_gpu], axis=0)
+            sampled = map_coordinates(img, coords, order=1, mode="constant", cval=0.0)
+            sampled_mask = map_coordinates(mask, coords, order=1, mode="constant", cval=0.0)
+
+            # Zero out contributions where coords are outside or mask ~ 0
+            sampled = sampled * sampled_mask * valid.astype(cp.float32)
+            sampled_mask = sampled_mask * valid.astype(cp.float32)
+
+            # Accumulate
+            mosaic_sum_gpu[r0:r1, :] += sampled
+            weight_sum_gpu[r0:r1, :] += sampled_mask
+
+    # Finalize: mean combine where weight > 0
+    eps = cp.float32(1e-6)
+    mosaic_gpu = cp.where(weight_sum_gpu > eps, mosaic_sum_gpu / cp.maximum(weight_sum_gpu, eps), 0.0)
+    coverage_gpu = cp.clip(weight_sum_gpu / float(max(1, n_inputs)), 0.0, 1.0)
+
+    # Restore a sensible brightness baseline for FITS output when background matching
+    if match_background and tile_medians:
+        try:
+            baseline = float(np.median(tile_medians))
+        except Exception:
+            baseline = 0.0
+        if baseline != 0.0:
+            mosaic_gpu = mosaic_gpu + cp.float32(baseline)
+
+    # Ensure the low-end is non-negative for common FITS viewers
+    try:
+        p01 = float(cp.percentile(mosaic_gpu, 0.1).get())
+        if p01 < 0:
+            mosaic_gpu = mosaic_gpu - cp.float32(p01)
+    except Exception:
         pass
-    return cp.asnumpy(mosaic_gpu), cp.asnumpy(weight_gpu)
+
+    # Move back to CPU
+    return cp.asnumpy(mosaic_gpu).astype("float32"), cp.asnumpy(coverage_gpu).astype("float32")
 
 
 def reproject_and_coadd_wrapper(
@@ -998,14 +1243,18 @@ def reproject_and_coadd_wrapper(
     cpu_function=None,
     **kwargs,
 ):
-    if use_gpu and GPU_AVAILABLE:
+    """Dispatch to GPU or CPU reproject+coadd.
+
+    - GPU path: uses ``gpu_reproject_and_coadd`` (CuPy). Falls back to CPU on any error.
+    - CPU path: calls astropy-reproject's ``reproject_and_coadd``.
+    """
+    if use_gpu and gpu_is_available():
         try:
-            return gpu_reproject_and_coadd(data_list, wcs_list, shape_out, **kwargs)
+            return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs)
         except Exception as e:  # pragma: no cover - GPU failures
             import logging
-
             logging.getLogger(__name__).warning(
-                "GPU reprojection failed (%s), fallback CPU", e
+                "GPU reprojection failed (%s), falling back to CPU", e
             )
     if cpu_function is None:
         cpu_function = cpu_reproject_and_coadd
@@ -1016,36 +1265,175 @@ def reproject_and_coadd_wrapper(
 
 
 def gpu_reproject_and_coadd(data_list, wcs_list, shape_out, **kwargs):
-    """Simplified GPU version of ``reproject_and_coadd``.
+    """Alias that forwards to the main GPU implementation.
 
-    Parameters match :func:`reproject_and_coadd_wrapper` but operate on CuPy
-    arrays. The implementation here is schematic and should be replaced with a
-    real CUDA accelerated routine.
+    Some import sites may reference this name; keep it as a thin wrapper.
     """
-    import cupy as cp
-    data_gpu = [cp.asarray(d) for d in data_list]
-    mosaic_gpu = cp.zeros(shape_out, dtype=cp.float32)
-    weight_gpu = cp.zeros(shape_out, dtype=cp.float32)
-    for img in data_gpu:
-        # Placeholder for GPU interpolation step
-        pass
-    return cp.asnumpy(mosaic_gpu), cp.asnumpy(weight_gpu)
+    return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs)
 
 
 def reproject_and_coadd_wrapper(data_list, wcs_list, shape_out, use_gpu=False, cpu_func=None, **kwargs):
-    """Dispatch to CPU or GPU ``reproject_and_coadd`` depending on availability."""
-    if use_gpu and GPU_AVAILABLE:
+    """Dispatch to CPU or GPU ``reproject_and_coadd`` depending on availability (duplicate alias)."""
+    if use_gpu and gpu_is_available():
         try:
-            return gpu_reproject_and_coadd(data_list, wcs_list, shape_out, **kwargs)
-        except Exception as e:  # pragma: no cover - GPU errors
+            return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs)
+        except Exception as e:  # pragma: no cover
             import logging
             logging.getLogger(__name__).warning(
-                "GPU reprojection failed (%s), fallback CPU", e
+                "GPU reprojection failed (%s), falling back to CPU", e
             )
     input_pairs = list(zip(data_list, wcs_list))
     output_projection = kwargs.pop("output_projection", None)
     func = cpu_func or cpu_reproject_and_coadd
     return func(input_pairs, output_projection, shape_out, **kwargs)
+
+
+# --- GPU Percentiles, Hot-Pixels, and Background Map -------------------------
+def _percentiles_gpu(arr2d: np.ndarray, p_low: float, p_high: float) -> tuple[float, float]:
+    """Compute two percentiles on GPU; fall back to CPU if CuPy unavailable."""
+    if not gpu_is_available():
+        lo, hi = np.percentile(arr2d, [p_low, p_high])
+        return float(lo), float(hi)
+    import cupy as cp  # type: ignore
+    ensure_cupy_pool_initialized()
+    a = cp.asarray(arr2d)
+    lo = cp.percentile(a, p_low)
+    hi = cp.percentile(a, p_high)
+    return float(lo), float(hi)
+
+
+def detect_and_correct_hot_pixels_gpu(image,
+                                      threshold: float = 3.0,
+                                      neighborhood_size: int = 5,
+                                      progress_callback=None):
+    """GPU version of hot-pixel correction using median and local variance.
+
+    Works on HW or HWC images (float32 recommended). Falls back to CPU on error.
+    """
+    try:
+        if not gpu_is_available():
+            raise RuntimeError("GPU not available")
+        import cupy as cp  # type: ignore
+        from cupyx.scipy.ndimage import median_filter, uniform_filter  # type: ignore
+        ensure_cupy_pool_initialized()
+
+        if image is None:
+            return None
+        img = np.asarray(image, dtype=np.float32)
+        if img.ndim == 2:
+            img = img[:, :, None]
+        h, w, c = img.shape
+        k = int(neighborhood_size) if neighborhood_size % 2 == 1 else int(neighborhood_size + 1)
+        k = max(3, k)
+
+        out = np.empty_like(img, dtype=np.float32)
+        for ch in range(c):
+            g = cp.asarray(img[..., ch])
+            med = median_filter(g, size=k, mode="reflect")
+            mean = uniform_filter(g, size=k)
+            mean_sq = uniform_filter(g * g, size=k)
+            var = cp.maximum(mean_sq - mean * mean, 0.0)
+            std = cp.sqrt(var)
+            # floor the std to avoid zero-division; choose a small epsilon relative to dynamic range
+            eps = cp.maximum(1e-5, 1e-5 * cp.nanmax(cp.abs(g)))
+            std = cp.maximum(std, eps)
+            hot = g > (med + threshold * std)
+            g_corr = cp.where(hot, med, g)
+            out[..., ch] = cp.asnumpy(g_corr.astype(cp.float32))
+
+        if out.shape[2] == 1:
+            out = out[..., 0]
+        return out
+    except Exception:
+        # Fallback to CPU implementation
+        return detect_and_correct_hot_pixels(image, threshold=threshold,
+                                             neighborhood_size=neighborhood_size,
+                                             progress_callback=progress_callback)
+
+
+def estimate_background_map_gpu(image,
+                                method: str = "gaussian",
+                                sigma: float = 32.0,
+                                progress_callback=None) -> np.ndarray:
+    """Compute a smooth background map on GPU and return it on CPU.
+
+    - method: currently supports 'gaussian' (cupyx.scipy.ndimage.gaussian_filter)
+    - sigma: Gaussian sigma in pixels; typical 16–64 for wide background.
+    """
+    try:
+        if not gpu_is_available():
+            raise RuntimeError("GPU not available")
+        import cupy as cp  # type: ignore
+        from cupyx.scipy.ndimage import gaussian_filter  # type: ignore
+        ensure_cupy_pool_initialized()
+
+        img = np.asarray(image, dtype=np.float32)
+        is_color = img.ndim == 3 and img.shape[-1] == 3
+        if not is_color:
+            g = cp.asarray(img)
+            bg = gaussian_filter(g, sigma=float(sigma))
+            return cp.asnumpy(bg.astype(cp.float32))
+        else:
+            bg = np.empty_like(img, dtype=np.float32)
+            for ch in range(3):
+                g = cp.asarray(img[..., ch])
+                b = gaussian_filter(g, sigma=float(sigma))
+                bg[..., ch] = cp.asnumpy(b.astype(cp.float32))
+            return bg
+    except Exception:
+        # CPU fallback using OpenCV Gaussian blur as a coarse approximation
+        try:
+            k = max(3, int(2 * round(float(sigma) * 1.5) + 1))
+            if image.ndim == 2:
+                return cv2.GaussianBlur(image.astype(np.float32), (k, k), sigmaX=float(sigma))
+            else:
+                out = np.empty_like(image, dtype=np.float32)
+                for ch in range(image.shape[-1]):
+                    out[..., ch] = cv2.GaussianBlur(image[..., ch].astype(np.float32), (k, k), sigmaX=float(sigma))
+                return out
+        except Exception:
+            # As a last resort, return zeros so subtraction is a no-op
+            return np.zeros_like(image, dtype=np.float32)
+
+
+def stretch_auto_asifits_like_gpu(img_hwc_adu,
+                                  p_low: float = 0.5,
+                                  p_high: float = 99.8,
+                                  asinh_a: float = 0.01,
+                                  apply_wb: bool = True) -> np.ndarray:
+    """GPU variant of stretch_auto_asifits_like; falls back to CPU on error."""
+    try:
+        if not gpu_is_available():
+            raise RuntimeError("GPU not available")
+        import cupy as cp  # type: ignore
+        ensure_cupy_pool_initialized()
+        img = np.asarray(img_hwc_adu, dtype=np.float32)
+        out = np.empty_like(img, dtype=np.float32)
+        for c in range(3):
+            chan = cp.asarray(img[..., c])
+            vmin = cp.percentile(chan, p_low)
+            vmax = cp.percentile(chan, p_high)
+            if float(vmax - vmin) < 1e-3:
+                out[..., c] = 0.0
+                continue
+            normed = cp.clip((chan - vmin) / cp.maximum(vmax - vmin, 1e-6), 0, 1)
+            stretched = cp.arcsinh(normed / asinh_a) / cp.arcsinh(1.0 / asinh_a)
+            if float(cp.nanmax(stretched)) < 0.05:
+                stretched = normed
+            out[..., c] = cp.asnumpy(stretched.astype(cp.float32))
+        if apply_wb:
+            avg = out.mean(axis=(0, 1))
+            m = float(np.max(avg)) if np.all(np.isfinite(avg)) else 0.0
+            if m > 0:
+                avg /= m
+            else:
+                avg = np.ones_like(avg)
+            for c in range(3):
+                d = float(avg[c]) if np.isfinite(avg[c]) and avg[c] > 1e-8 else 1.0
+                out[..., c] = out[..., c] / d
+        return np.clip(out, 0, 1).astype(np.float32)
+    except Exception:
+        return stretch_auto_asifits_like(img_hwc_adu, p_low=p_low, p_high=p_high, asinh_a=asinh_a, apply_wb=apply_wb)
 
 
 

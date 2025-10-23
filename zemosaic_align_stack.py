@@ -102,6 +102,15 @@ try:
 except ImportError as e_util_rad:
         print(f"AVERT (zemosaic_align_stack): Radial weighting: Erreur import make_radial_weight_map: {e_util_rad}")
 
+# Optional access to utils for GPU helpers
+ZU_AVAILABLE = False
+zutils = None
+try:
+    import zemosaic_utils as zutils  # type: ignore
+    ZU_AVAILABLE = True
+except Exception:
+    ZU_AVAILABLE = False
+
 # --- Import des méthodes de stack CPU provenant du projet Seestar ---
 cpu_stack_winsorized = None
 cpu_stack_kappa = None
@@ -109,14 +118,15 @@ cpu_stack_linear = None
 try:
     import importlib.util, os, pathlib
     _sm_path = pathlib.Path(__file__).resolve().parents[1] / 'seestar' / 'core' / 'stack_methods.py'
-    spec = importlib.util.spec_from_file_location('seestar_stack_methods', _sm_path)
-    _sm = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(_sm)  # type: ignore
-    cpu_stack_winsorized = _sm._stack_winsorized_sigma
-    cpu_stack_kappa = _sm._stack_kappa_sigma
-    cpu_stack_linear = _sm._stack_linear_fit_clip
+    if _sm_path.exists():
+        spec = importlib.util.spec_from_file_location('seestar_stack_methods', _sm_path)
+        _sm = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_sm)  # type: ignore
+        cpu_stack_winsorized = getattr(_sm, '_stack_winsorized_sigma', None)
+        cpu_stack_kappa = getattr(_sm, '_stack_kappa_sigma', None)
+        cpu_stack_linear = getattr(_sm, '_stack_linear_fit_clip', None)
 except Exception as e_import_stack:
-    print(f"AVERT (zemosaic_align_stack): Import stack methods failed: {e_import_stack}")
+    print(f"AVERT (zemosaic_align_stack): Optional import of external stack_methods failed: {e_import_stack}")
 
 # --- Implementations GPU simplifiées des méthodes de stack ---
 def gpu_stack_winsorized(frames, *, kappa=3.0, winsor_limits=(0.05, 0.05), apply_rewinsor=True):
@@ -257,7 +267,7 @@ def stack_kappa_sigma_clip(frames, zconfig=None, **kwargs):
             _internal_logger.warning("GPU kappa clip failed, fallback CPU", exc_info=True)
     if cpu_stack_kappa:
         return cpu_stack_kappa(frames, **kwargs)
-    raise RuntimeError("CPU stack_kappa function unavailable")
+    return _cpu_stack_kappa_fallback(frames, **kwargs)
 
 
 def stack_linear_fit_clip(frames, zconfig=None, **kwargs):
@@ -275,7 +285,7 @@ def stack_linear_fit_clip(frames, zconfig=None, **kwargs):
             _internal_logger.warning("GPU linear clip failed, fallback CPU", exc_info=True)
     if cpu_stack_linear:
         return cpu_stack_linear(frames, **kwargs)
-    raise RuntimeError("CPU stack_linear function unavailable")
+    return _cpu_stack_linear_fallback(frames, **kwargs)
 
 
 # Fallback logger for cases where progress_callback might not be available
@@ -291,7 +301,8 @@ if not _internal_logger.hasHandlers():
 def _calculate_robust_stats_for_linear_fit(image_data_2d_float32: np.ndarray,
                                            low_percentile: float = 25.0,
                                            high_percentile: float = 90.0,
-                                           progress_callback: callable = None):
+                                           progress_callback: callable = None,
+                                           use_gpu: bool = False):
     """
     Calcule des statistiques robustes (deux points de percentiles) pour une image 2D (un canal).
     Utilisé par la normalisation par ajustement linéaire pour estimer le fond de ciel et
@@ -329,9 +340,22 @@ def _calculate_robust_stats_for_linear_fit(image_data_2d_float32: np.ndarray,
         return 0.0, 1.0 # Pas de données valides pour calculer les percentiles
 
     try:
-        # np.nanpercentile est robuste aux NaNs
-        stat_low = float(np.nanpercentile(image_data_2d_float32, low_percentile))
-        stat_high = float(np.nanpercentile(image_data_2d_float32, high_percentile))
+        # Prefer GPU percentiles when requested and available
+        if use_gpu and GPU_AVAILABLE:
+            try:
+                if ZU_AVAILABLE and hasattr(zutils, "_percentiles_gpu"):
+                    stat_low, stat_high = zutils._percentiles_gpu(image_data_2d_float32, low_percentile, high_percentile)  # type: ignore[attr-defined]
+                else:
+                    import cupy as cp  # type: ignore
+                    a = cp.asarray(image_data_2d_float32)
+                    stat_low = float(cp.nanpercentile(a, low_percentile))
+                    stat_high = float(cp.nanpercentile(a, high_percentile))
+            except Exception:
+                stat_low = float(np.nanpercentile(image_data_2d_float32, low_percentile))
+                stat_high = float(np.nanpercentile(image_data_2d_float32, high_percentile))
+        else:
+            stat_low = float(np.nanpercentile(image_data_2d_float32, low_percentile))
+            stat_high = float(np.nanpercentile(image_data_2d_float32, high_percentile))
         # _pcb(f"stathelper_debug_percentiles_calculated: low_p={low_percentile}% -> {stat_low:.3g}, high_p={high_percentile}% -> {stat_high:.3g}", lvl="DEBUG_VERY_DETAIL")
 
     except Exception as e_perc:
@@ -372,9 +396,96 @@ def align_images_in_group(image_data_list: list,
     _pcb = lambda msg_key, lvl="INFO_DETAIL", **kwargs: \
         progress_callback(msg_key, None, lvl, **kwargs) if progress_callback else _internal_logger.debug(f"PCB_FALLBACK_{lvl}: {msg_key} {kwargs}")
 
+    # Internal GPU FFT phase-correlation aligner (translation only)
+    def _fft_phase_shift(src2d: np.ndarray, ref2d: np.ndarray) -> tuple[int, int, float]:
+        """Return (dy, dx, confidence_ratio). Uses CuPy if available, else NumPy."""
+        # Use luminance-like for safety (2D already)
+        if src2d.shape != ref2d.shape:
+            return 0, 0, 0.0
+        h, w = src2d.shape
+        use_gpu = GPU_AVAILABLE
+        try:
+            if use_gpu:
+                import cupy as cp  # type: ignore
+                a = cp.asarray(src2d, dtype=cp.float32)
+                b = cp.asarray(ref2d, dtype=cp.float32)
+                # Remove DC to help stability
+                a = a - cp.nanmean(a)
+                b = b - cp.nanmean(b)
+                Fa = cp.fft.fftn(a)
+                Fb = cp.fft.fftn(b)
+                R = Fa * cp.conj(Fb)
+                denom = cp.maximum(cp.abs(R), 1e-12)
+                Rn = R / denom
+                r = cp.fft.ifftn(Rn).real
+                peak_val = float(cp.max(r))
+                peak_idx = tuple(int(x) for x in cp.unravel_index(int(cp.argmax(r)), r.shape))
+                med_val = float(cp.median(r)) if r.size > 0 else 0.0
+                py, px = peak_idx
+                dy = py if py <= h // 2 else py - h
+                dx = px if px <= w // 2 else px - w
+                conf = (peak_val / max(1e-6, med_val + 1e-6)) if np.isfinite(med_val) else (peak_val / 1e-6)
+                return int(dy), int(dx), float(conf)
+            else:
+                a = src2d.astype(np.float32) - np.nanmean(src2d.astype(np.float32))
+                b = ref2d.astype(np.float32) - np.nanmean(ref2d.astype(np.float32))
+                Fa = np.fft.fftn(a)
+                Fb = np.fft.fftn(b)
+                R = Fa * np.conj(Fb)
+                denom = np.maximum(np.abs(R), 1e-12)
+                Rn = R / denom
+                r = np.fft.ifftn(Rn).real
+                peak_val = float(np.max(r))
+                py, px = np.unravel_index(int(np.argmax(r)), r.shape)
+                med_val = float(np.median(r)) if r.size > 0 else 0.0
+                dy = py if py <= h // 2 else py - h
+                dx = px if px <= w // 2 else px - w
+                conf = (peak_val / max(1e-6, med_val + 1e-6)) if np.isfinite(med_val) else (peak_val / 1e-6)
+                return int(dy), int(dx), float(conf)
+        except Exception:
+            return 0, 0, 0.0
+
+    def _apply_integer_shift_hw_or_hwc(img: np.ndarray, dy: int, dx: int) -> np.ndarray:
+        if dy == 0 and dx == 0:
+            return img.copy()
+        h, w = img.shape[:2]
+        out = np.zeros_like(img, dtype=np.float32)
+        ys = slice(max(0, dy), min(h, h + dy))
+        yt = slice(max(0, -dy), max(0, -dy) + (ys.stop - ys.start))
+        xs = slice(max(0, dx), min(w, w + dx))
+        xt = slice(max(0, -dx), max(0, -dx) + (xs.stop - xs.start))
+        if img.ndim == 2:
+            out[yt, xt] = img[ys, xs]
+        else:
+            out[yt, xt, :] = img[ys, xs, :]
+        return out
+
     if not ASTROALIGN_AVAILABLE or astroalign_module is None:
-        _pcb("aligngroup_error_astroalign_unavailable", lvl="ERROR")
-        return [None] * len(image_data_list)
+        _pcb("aligngroup_error_astroalign_unavailable", lvl="WARN")
+        # We'll still try FFT phase-correlation if possible
+        if not image_data_list or not (0 <= reference_image_index < len(image_data_list)):
+            return [None] * len(image_data_list)
+        ref = image_data_list[reference_image_index]
+        if ref is None:
+            return [None] * len(image_data_list)
+        if ref.ndim == 3 and ref.shape[-1] == 3:
+            ref_lum = 0.299 * ref[..., 0] + 0.587 * ref[..., 1] + 0.114 * ref[..., 2]
+        else:
+            ref_lum = ref.astype(np.float32, copy=False)
+        aligned = [None] * len(image_data_list)
+        for i, src in enumerate(image_data_list):
+            if src is None:
+                continue
+            if i == reference_image_index:
+                aligned[i] = ref.astype(np.float32, copy=True)
+                continue
+            src_lum = (0.299 * src[..., 0] + 0.587 * src[..., 1] + 0.114 * src[..., 2]).astype(np.float32) if (src.ndim == 3 and src.shape[-1] == 3) else src.astype(np.float32)
+            dy, dx, conf = _fft_phase_shift(src_lum, ref_lum)
+            if abs(dy) > 0 or abs(dx) > 0:
+                aligned[i] = _apply_integer_shift_hw_or_hwc(src.astype(np.float32, copy=False), dy, dx)
+            else:
+                aligned[i] = src.astype(np.float32, copy=True)
+        return aligned
 
     if not image_data_list or not (0 <= reference_image_index < len(image_data_list)):
         _pcb("aligngroup_error_invalid_input_list_or_ref_index", lvl="ERROR", ref_idx=reference_image_index)
@@ -406,8 +517,33 @@ def align_images_in_group(image_data_list: list,
 
         _pcb(f"AlignGroup: Alignement image {i} (shape {source_image_adu.shape}) sur référence...", lvl="DEBUG_DETAIL")
         try:
+            # Try GPU FFT phase correlation first for robust global translation
+            try_fft = True
+            if try_fft:
+                src_lum = (0.299 * source_image_adu[..., 0] + 0.587 * source_image_adu[..., 1] + 0.114 * source_image_adu[..., 2]).astype(np.float32) if (source_image_adu.ndim == 3 and source_image_adu.shape[-1] == 3) else source_image_adu
+                ref_lum = (0.299 * reference_image_adu[..., 0] + 0.587 * reference_image_adu[..., 1] + 0.114 * reference_image_adu[..., 2]).astype(np.float32) if (reference_image_adu.ndim == 3 and reference_image_adu.shape[-1] == 3) else reference_image_adu
+                dy, dx, conf = _fft_phase_shift(src_lum, ref_lum)
+                if abs(dy) + abs(dx) > 0 and conf >= 3.0:  # heuristic confidence
+                    aligned_images[i] = _apply_integer_shift_hw_or_hwc(source_image_adu, dy, dx)
+                    _pcb(f"AlignGroup: FFT shift applied (dy={dy}, dx={dx}, conf={conf:.2f}).", lvl="DEBUG_DETAIL")
+                    continue
+            # Fall back to astroalign for fine/affine alignment
+            # Garantir des buffers writables/contigus pour astroalign afin d'éviter
+            # "ValueError: buffer source array is read-only" avec des memmaps read-only
+            src_for_aa = (
+                source_image_adu if (getattr(source_image_adu, 'flags', None)
+                                     and source_image_adu.flags.writeable
+                                     and source_image_adu.flags.c_contiguous)
+                else np.array(source_image_adu, dtype=np.float32, copy=True, order='C')
+            )
+            ref_for_aa = (
+                reference_image_adu if (getattr(reference_image_adu, 'flags', None)
+                                        and reference_image_adu.flags.writeable
+                                        and reference_image_adu.flags.c_contiguous)
+                else np.array(reference_image_adu, dtype=np.float32, copy=True, order='C')
+            )
             aligned_image_output, footprint_mask = astroalign_module.register(
-                source=source_image_adu, target=reference_image_adu,
+                source=src_for_aa, target=ref_for_aa,
                 detection_sigma=detection_sigma, min_area=min_area,
                 propagate_mask=propagate_mask
             )
@@ -440,7 +576,8 @@ def _normalize_images_linear_fit(image_list_hwc_float32: list[np.ndarray],
                                  reference_index: int = 0,
                                  low_percentile: float = 25.0,
                                  high_percentile: float = 90.0,
-                                 progress_callback: callable = None):
+                                 progress_callback: callable = None,
+                                 use_gpu: bool = False):
     _pcb = lambda msg_key, lvl="INFO_DETAIL", **kwargs: \
         progress_callback(msg_key, None, lvl, **kwargs) if progress_callback else _internal_logger.debug(f"PCB_FALLBACK_{lvl}: {msg_key} {kwargs}")
     _pcb("norm_linear_fit_starting", lvl="DEBUG", num_images=len(image_list_hwc_float32), ref_idx=reference_index, low_p=low_percentile, high_p=high_percentile)
@@ -459,7 +596,7 @@ def _normalize_images_linear_fit(image_list_hwc_float32: list[np.ndarray],
     ref_stats_per_channel = []
     for c_idx_ref in range(num_channels):
         ref_channel_2d = ref_image_hwc_float32[..., c_idx_ref] if is_color else ref_image_hwc_float32
-        ref_low, ref_high = _calculate_robust_stats_for_linear_fit(ref_channel_2d, low_percentile, high_percentile, progress_callback)
+        ref_low, ref_high = _calculate_robust_stats_for_linear_fit(ref_channel_2d, low_percentile, high_percentile, progress_callback, use_gpu=use_gpu)
         ref_stats_per_channel.append((ref_low, ref_high))
         _pcb(f"NormLinFit: Réf. Canal {c_idx_ref}: StatLow={ref_low:.3g}, StatHigh={ref_high:.3g}", lvl="DEBUG_DETAIL")
         if abs(ref_high - ref_low) < 1e-5:
@@ -481,7 +618,7 @@ def _normalize_images_linear_fit(image_list_hwc_float32: list[np.ndarray],
         for c_idx_src in range(num_channels):
             src_channel_2d = src_image_hwc_float32[..., c_idx_src] if is_color else src_image_hwc_float32
             ref_low, ref_high = ref_stats_per_channel[c_idx_src]
-            src_low, src_high = _calculate_robust_stats_for_linear_fit(src_channel_2d, low_percentile, high_percentile, progress_callback)
+            src_low, src_high = _calculate_robust_stats_for_linear_fit(src_channel_2d, low_percentile, high_percentile, progress_callback, use_gpu=use_gpu)
             a = 1.0; b = 0.0
             delta_src = src_high - src_low; delta_ref = ref_high - ref_low
             if abs(delta_src) > 1e-5:
@@ -506,7 +643,8 @@ def _normalize_images_linear_fit(image_list_hwc_float32: list[np.ndarray],
 def _normalize_images_sky_mean(image_list: list[np.ndarray | None], 
                                reference_index: int = 0,
                                sky_percentile: float = 25.0, # Percentile pour estimer le fond de ciel
-                               progress_callback: callable = None) -> list[np.ndarray | None]:
+                               progress_callback: callable = None,
+                               use_gpu: bool = False) -> list[np.ndarray | None]:
     """
     Normalise une liste d'images en ajustant leur fond de ciel moyen (estimé par percentile)
     pour correspondre à celui de l'image de référence.
@@ -547,7 +685,15 @@ def _normalize_images_sky_mean(image_list: list[np.ndarray | None],
     if target_data_for_ref_sky is not None and target_data_for_ref_sky.size > 0:
         try:
             # Utiliser nanpercentile pour être robuste aux NaNs potentiels
-            ref_sky_level = np.nanpercentile(target_data_for_ref_sky, sky_percentile)
+            if use_gpu and GPU_AVAILABLE:
+                try:
+                    import cupy as cp  # type: ignore
+                    a = cp.asarray(target_data_for_ref_sky)
+                    ref_sky_level = float(cp.nanpercentile(a, sky_percentile))
+                except Exception:
+                    ref_sky_level = float(np.nanpercentile(target_data_for_ref_sky, sky_percentile))
+            else:
+                ref_sky_level = np.nanpercentile(target_data_for_ref_sky, sky_percentile)
             _pcb(f"NormSkyMean: Fond de ciel de référence (img idx {reference_index}) estimé à {ref_sky_level:.3g}", lvl="DEBUG_DETAIL")
         except Exception as e_perc_ref:
             _pcb(f"NormSkyMean: Erreur calcul percentile réf: {e_perc_ref}", lvl="WARN")
@@ -592,7 +738,15 @@ def _normalize_images_sky_mean(image_list: list[np.ndarray | None],
         current_sky_level = None
         if target_data_for_current_sky is not None and target_data_for_current_sky.size > 0 :
             try:
-                current_sky_level = np.nanpercentile(target_data_for_current_sky, sky_percentile)
+                if use_gpu and GPU_AVAILABLE:
+                    try:
+                        import cupy as cp  # type: ignore
+                        ac = cp.asarray(target_data_for_current_sky)
+                        current_sky_level = float(cp.nanpercentile(ac, sky_percentile))
+                    except Exception:
+                        current_sky_level = float(np.nanpercentile(target_data_for_current_sky, sky_percentile))
+                else:
+                    current_sky_level = np.nanpercentile(target_data_for_current_sky, sky_percentile)
             except Exception as e_perc_curr:
                  _pcb(f"NormSkyMean: Erreur calcul percentile image {i}: {e_perc_curr}. Image non normalisée.", lvl="WARN")
                  normalized_image_list[i] = img_to_normalize_float # Retourner la copie non modifiée
@@ -1407,7 +1561,8 @@ def stack_aligned_images(
     radial_feather_fraction: float = 0.8,
     radial_shape_power: float = 2.0,
     winsor_max_workers: int = 1,
-    progress_callback: callable = None
+    progress_callback: callable = None,
+    zconfig=None
 ) -> np.ndarray | None:
     """
     Stacke une liste d'images alignées, appliquant normalisation, pondération (qualité + radiale),
@@ -1452,7 +1607,9 @@ def stack_aligned_images(
         current_img = img_adu 
         if current_img.dtype != np.float32:
             _pcb(f"StackImages: AVERT Image {idx} pas en float32 ({current_img.dtype}), conversion.", lvl="WARN")
-            current_img = current_img.astype(np.float32, copy=True)
+            current_img = current_img.astype(np.float32, copy=False)
+        if not current_img.flags.c_contiguous:
+            current_img = np.ascontiguousarray(current_img, dtype=np.float32)
         
         # Vérification des infinités DÈS LE DÉBUT
         if not np.all(np.isfinite(current_img)):
@@ -1475,12 +1632,18 @@ def stack_aligned_images(
 
 
     # --- NORMALISATION ---
+    use_gpu_norm = False
+    try:
+        if zconfig is not None:
+            use_gpu_norm = bool(getattr(zconfig, 'use_gpu', getattr(zconfig, 'use_gpu_phase5', False)))
+    except Exception:
+        use_gpu_norm = False
     if normalize_method == 'linear_fit':
         _pcb("STACK_IMG_NORM: Appel _normalize_images_linear_fit.", lvl="ERROR")
-        current_images_data_list = _normalize_images_linear_fit(current_images_data_list, progress_callback=progress_callback) # Params par défaut pour percentiles
+        current_images_data_list = _normalize_images_linear_fit(current_images_data_list, progress_callback=progress_callback, use_gpu=use_gpu_norm) # GPU percentiles if enabled
     elif normalize_method == 'sky_mean':
         _pcb("STACK_IMG_NORM: Appel _normalize_images_sky_mean.", lvl="ERROR")
-        current_images_data_list = _normalize_images_sky_mean(current_images_data_list, progress_callback=progress_callback)
+        current_images_data_list = _normalize_images_sky_mean(current_images_data_list, progress_callback=progress_callback, use_gpu=use_gpu_norm)
     # ... (autres méthodes de normalisation si ajoutées) ...
     
     current_images_data_list = [img for img in current_images_data_list if img is not None] # Filtrer si normalisation a échoué pour certaines
@@ -1751,6 +1914,68 @@ def stack_aligned_images(
 
 
 # --- CPU fallback implementation appended (in case Seestar stack methods are unavailable) ---
+def _cpu_stack_kappa_fallback(
+    frames,
+    *,
+    sigma_low: float = 3.0,
+    sigma_high: float = 3.0,
+    progress_callback=None,
+):
+    """CPU kappa-sigma clip fallback.
+
+    Accepts frames of shape (N,H,W) or (N,H,W,C). Returns (stacked, rejected_pct).
+    """
+    _pcb = lambda m, lvl="DEBUG_DETAIL", **kw: (
+        progress_callback(m, None, lvl, **kw) if progress_callback else _internal_logger.debug(m)
+    )
+    frames_list = [np.asarray(f, dtype=np.float32) for f in frames]
+    if not frames_list:
+        raise ValueError("frames is empty")
+    arr = np.stack(frames_list, axis=0)
+    if arr.ndim not in (3, 4):
+        raise ValueError(f"frames must be (N,H,W) or (N,H,W,C); got {arr.shape}")
+    med = np.nanmedian(arr, axis=0)
+    std = np.nanstd(arr, axis=0)
+    low = med - float(sigma_low) * std
+    high = med + float(sigma_high) * std
+    mask = (arr >= low) & (arr <= high)
+    arr_clip = np.where(mask, arr, np.nan)
+    stacked = np.nanmean(arr_clip, axis=0).astype(np.float32)
+    rejected_pct = 100.0 * float(mask.size - np.count_nonzero(mask)) / float(mask.size) if mask.size else 0.0
+    _pcb("cpu_kappa_fallback_done", lvl="DEBUG_DETAIL")
+    return stacked, rejected_pct
+
+
+def _cpu_stack_linear_fallback(
+    frames,
+    *,
+    sigma: float = 3.0,
+    progress_callback=None,
+):
+    """CPU linear residual clipping fallback.
+
+    Compute per-pixel residuals to the median, clip within sigma*std of residuals,
+    and mean-combine. Returns (stacked, rejected_pct).
+    """
+    _pcb = lambda m, lvl="DEBUG_DETAIL", **kw: (
+        progress_callback(m, None, lvl, **kw) if progress_callback else _internal_logger.debug(m)
+    )
+    frames_list = [np.asarray(f, dtype=np.float32) for f in frames]
+    if not frames_list:
+        raise ValueError("frames is empty")
+    arr = np.stack(frames_list, axis=0)
+    if arr.ndim not in (3, 4):
+        raise ValueError(f"frames must be (N,H,W) or (N,H,W,C); got {arr.shape}")
+    med = np.nanmedian(arr, axis=0)
+    resid = arr - med
+    med_r = np.nanmedian(resid, axis=0)
+    std_r = np.nanstd(resid, axis=0)
+    mask = np.abs(resid - med_r) <= float(sigma) * std_r
+    arr_clip = np.where(mask, arr, np.nan)
+    stacked = np.nanmean(arr_clip, axis=0).astype(np.float32)
+    rejected_pct = 100.0 * float(mask.size - np.count_nonzero(mask)) / float(mask.size) if mask.size else 0.0
+    _pcb("cpu_linear_fallback_done", lvl="DEBUG_DETAIL")
+    return stacked, rejected_pct
 def _cpu_stack_winsorized_fallback(
     frames,
     *,
@@ -1876,3 +2101,18 @@ except NameError:
     cpu_stack_winsorized = None
 if cpu_stack_winsorized is None:
     cpu_stack_winsorized = _cpu_stack_winsorized_fallback
+
+# Bind other fallbacks when external Seestar stack methods are unavailable
+try:
+    cpu_stack_kappa
+except NameError:
+    cpu_stack_kappa = None
+if cpu_stack_kappa is None:
+    cpu_stack_kappa = _cpu_stack_kappa_fallback
+
+try:
+    cpu_stack_linear
+except NameError:
+    cpu_stack_linear = None
+if cpu_stack_linear is None:
+    cpu_stack_linear = _cpu_stack_linear_fallback
