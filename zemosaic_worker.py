@@ -2601,7 +2601,8 @@ def run_hierarchical_mosaic(
     use_gpu_phase5: bool = False,
     gpu_id_phase5: int | None = None,
     logging_level_config: str = "INFO",
-    solver_settings: dict | None = None
+    solver_settings: dict | None = None,
+    skip_filter_ui: bool = False,
 ):
     """
     Orchestre le traitement de la mosaïque hiérarchique.
@@ -2772,6 +2773,7 @@ def run_hierarchical_mosaic(
         pass
 
     # --- Phase 0 (Header-only scan + early filter) ---
+    skip_filter_ui = bool(skip_filter_ui)
     early_filter_enabled = True
     try:
         if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
@@ -2779,6 +2781,10 @@ def run_hierarchical_mosaic(
             early_filter_enabled = bool(cfg0.get("enable_early_filter", True))
     except Exception:
         early_filter_enabled = True
+
+    if skip_filter_ui:
+        early_filter_enabled = False
+        pcb("log_filter_ui_skipped", prog=None, lvl="INFO_DETAIL")
 
     if early_filter_enabled and ASTROPY_AVAILABLE and fits is not None:
         pcb("Phase 0: header scan start", prog=None, lvl="INFO_DETAIL")

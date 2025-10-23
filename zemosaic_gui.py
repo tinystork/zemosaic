@@ -1675,9 +1675,10 @@ class ZeMosaicGUI:
             return
 
         # 1. RÉCUPÉRER TOUTES les valeurs des variables Tkinter
+        skip_filter_ui_for_run = False
         input_dir = self.input_dir_var.get()
         output_dir = self.output_dir_var.get()
-        astap_exe = self.astap_exe_path_var.get() 
+        astap_exe = self.astap_exe_path_var.get()
         astap_data = self.astap_data_dir_var.get()
         
         try:
@@ -1736,17 +1737,33 @@ class ZeMosaicGUI:
             messagebox.showerror(self._tr("error_title"), self._tr("output_folder_creation_error", error=e), parent=self.root); return
         if not (astap_exe and os.path.isfile(astap_exe)): 
             messagebox.showerror(self._tr("error_title"), self._tr("invalid_astap_exe_error"), parent=self.root); return
-        if not (astap_data and os.path.isdir(astap_data)): 
+        if not (astap_data and os.path.isdir(astap_data)):
             if not messagebox.askokcancel(self._tr("astap_data_dir_title", "ASTAP Data Directory"),
-                                          self._tr("astap_data_dir_missing_or_invalid_continue_q", 
+                                          self._tr("astap_data_dir_missing_or_invalid_continue_q",
                                                    path=astap_data,
                                                    default_path=self.config.get("astap_data_directory_path","")),
                                           icon='warning', parent=self.root):
                 return
 
+        # 2bis. Choix utilisateur concernant l'ouverture du filtre
+        try:
+            wants_filter_window = messagebox.askyesno(
+                self._tr("filter_prompt_title", "Filter range and set clustering?"),
+                self._tr(
+                    "filter_prompt_message",
+                    "Do you want to open the filter window to adjust the range and clustering before processing?",
+                ),
+                parent=self.root,
+                icon='question',
+            )
+        except tk.TclError:
+            wants_filter_window = True
+        if wants_filter_window is False:
+            skip_filter_ui_for_run = True
+
 
         # 3. PARSING et VALIDATION des limites Winsor (inchangé)
-        parsed_winsor_limits = (0.05, 0.05) 
+        parsed_winsor_limits = (0.05, 0.05)
         if stack_reject_algo == "winsorized_sigma_clip":
             try:
                 low_str, high_str = stack_winsor_limits_str.split(',')
@@ -1777,6 +1794,8 @@ class ZeMosaicGUI:
         self._log_message("CHRONO_START_REQUEST", None, "CHRONO_LEVEL")
         self._log_message("log_key_processing_started", level="INFO")
         # ... (autres logs d'info) ...
+        if skip_filter_ui_for_run:
+            self._log_message("log_filter_ui_skipped", level="INFO_DETAIL")
 
         # -- Gestion du dossier memmap par défaut --
         memmap_dir = self.mm_dir_var.get().strip()
@@ -1849,12 +1868,16 @@ class ZeMosaicGUI:
             asdict(self.solver_settings)
             # --- FIN NOUVEAUX ARGUMENTS ---
         )
-        
+
+        worker_kwargs = {"solver_settings_dict": worker_args[-1]}
+        if skip_filter_ui_for_run:
+            worker_kwargs["skip_filter_ui"] = True
+
         self.progress_queue = multiprocessing.Queue()
         self.worker_process = multiprocessing.Process(
             target=run_hierarchical_mosaic_process,
             args=(self.progress_queue,) + worker_args[:-1],
-            kwargs={"solver_settings_dict": worker_args[-1]},
+            kwargs=worker_kwargs,
             daemon=True,
             name="ZeMosaicWorkerProcess",
         )
