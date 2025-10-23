@@ -433,7 +433,7 @@ def launch_filter_interface(
                 "Distance (deg) :" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Distance (deg):",
             ),
         ).grid(row=0, column=0, padx=4, pady=4)
-        thresh_var = tk.StringVar(value="5.0")
+        thresh_var = tk.StringVar(master=root, value="5.0")
         thresh_entry = ttk.Entry(thresh_frame, textvariable=thresh_var, width=8)
         thresh_entry.grid(row=0, column=1, padx=4, pady=4)
         def apply_threshold():
@@ -495,7 +495,7 @@ def launch_filter_interface(
         except Exception:
             init_target = None; init_thresh = None; init_orient = None
 
-        target_groups_var = tk.IntVar(value=int(
+        target_groups_var = tk.IntVar(master=root, value=int(
             init_target if init_target is not None else cfg_defaults.get('cluster_target_groups', 0)
         ))
         ttk.Spinbox(clust_frame, from_=0, to=999, increment=1, textvariable=target_groups_var, width=8).grid(
@@ -505,7 +505,7 @@ def launch_filter_interface(
             clust_frame,
             text=_tr("filter_cluster_threshold_label", "Panel threshold (deg):")
         ).grid(row=1, column=0, padx=4, pady=2, sticky="w")
-        panel_thresh_var = tk.DoubleVar(value=float(
+        panel_thresh_var = tk.DoubleVar(master=root, value=float(
             init_thresh if init_thresh is not None else cfg_defaults.get('cluster_panel_threshold', 0.08)
         ))
         ttk.Spinbox(clust_frame, from_=0.01, to=5.0, increment=0.01, textvariable=panel_thresh_var, width=8, format="%.2f").grid(
@@ -515,7 +515,7 @@ def launch_filter_interface(
             clust_frame,
             text=_tr("filter_orientation_split_label", "Split by orientation (deg) 0=off:")
         ).grid(row=2, column=0, padx=4, pady=2, sticky="w")
-        orient_split_var = tk.DoubleVar(value=float(
+        orient_split_var = tk.DoubleVar(master=root, value=float(
             init_orient if init_orient is not None else cfg_defaults.get('cluster_orientation_split_deg', 0.0)
         ))
         ttk.Spinbox(clust_frame, from_=0.0, to=180.0, increment=1.0, textvariable=orient_split_var, width=8, format="%.1f").grid(
@@ -666,7 +666,7 @@ def launch_filter_interface(
         all_dec_vals: list[float] = []
 
         for idx, it in enumerate(items):
-            var = tk.BooleanVar(value=True)
+            var = tk.BooleanVar(master=root, value=True)
             check_vars.append(var)
 
             # Label includes basename and optional separation
