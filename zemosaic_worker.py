@@ -4646,7 +4646,14 @@ def run_hierarchical_mosaic_process(
     # Insert the process queue callback in the expected position (after
     # cluster threshold, target group count, and orientation split parameter).
     # With the current signature, progress_callback is the 11th positional arg.
-    full_args = args[:10] + (queue_callback,) + args[10:]
+    if len(args) > 10:
+        # Replace the provided callback with our proxy to avoid shifting the
+        # remaining positional arguments (which would trigger a TypeError).
+        full_args = args[:10] + (queue_callback,) + args[11:]
+    else:
+        # Safety fallback: if the caller did not provide the progress
+        # callback, append ours so the worker still runs.
+        full_args = args + (queue_callback,)
     try:
         run_hierarchical_mosaic(*full_args, solver_settings=solver_settings_dict, **kwargs)
     except Exception as e_proc:
