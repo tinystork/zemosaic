@@ -2,6 +2,10 @@
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+
+from core.tk_safe import patch_tk_variables
+
+patch_tk_variables()
 import threading
 import multiprocessing
 import os
@@ -192,11 +196,11 @@ class ZeMosaicGUI:
             self.localizer = MockLocalizer(language_code=default_lang_from_config)
         
         # --- Variable compteur tuile phase 3
-        self.master_tile_count_var = tk.StringVar(value="") # Initialement vide
+        self.master_tile_count_var = tk.StringVar(master=self.root, value="") # Initialement vide
         # Compteur de fichiers bruts traités pendant la Phase 1
-        self.file_count_var = tk.StringVar(value="")
+        self.file_count_var = tk.StringVar(master=self.root, value="")
         # Indicateur de phase courante (texte traduit)
-        self.phase_var = tk.StringVar(value="")
+        self.phase_var = tk.StringVar(master=self.root, value="")
         
         
         # --- Définition des listes de clés pour les ComboBoxes ---
@@ -208,60 +212,60 @@ class ZeMosaicGUI:
         # --- FIN Définition des listes de clés ---
 
         # --- Tkinter Variables ---
-        self.input_dir_var = tk.StringVar()
-        self.output_dir_var = tk.StringVar()
-        self.astap_exe_path_var = tk.StringVar(value=self.config.get("astap_executable_path", ""))
-        self.astap_data_dir_var = tk.StringVar(value=self.config.get("astap_data_directory_path", ""))
-        self.astap_search_radius_var = tk.DoubleVar(value=self.config.get("astap_default_search_radius", 3.0))
-        self.astap_downsample_var = tk.IntVar(value=self.config.get("astap_default_downsample", 2))
-        self.astap_sensitivity_var = tk.IntVar(value=self.config.get("astap_default_sensitivity", 100))
-        self.cluster_threshold_var = tk.DoubleVar(value=self.config.get("cluster_panel_threshold", 0.18))
-        self.cluster_target_groups_var = tk.IntVar(value=self.config.get("cluster_target_groups", 0))
-        self.cluster_orientation_split_var = tk.DoubleVar(value=self.config.get("cluster_orientation_split_deg", 0.0))
-        self.save_final_uint16_var = tk.BooleanVar(value=self.config.get("save_final_as_uint16", False))
+        self.input_dir_var = tk.StringVar(master=self.root)
+        self.output_dir_var = tk.StringVar(master=self.root)
+        self.astap_exe_path_var = tk.StringVar(master=self.root, value=self.config.get("astap_executable_path", ""))
+        self.astap_data_dir_var = tk.StringVar(master=self.root, value=self.config.get("astap_data_directory_path", ""))
+        self.astap_search_radius_var = tk.DoubleVar(master=self.root, value=self.config.get("astap_default_search_radius", 3.0))
+        self.astap_downsample_var = tk.IntVar(master=self.root, value=self.config.get("astap_default_downsample", 2))
+        self.astap_sensitivity_var = tk.IntVar(master=self.root, value=self.config.get("astap_default_sensitivity", 100))
+        self.cluster_threshold_var = tk.DoubleVar(master=self.root, value=self.config.get("cluster_panel_threshold", 0.18))
+        self.cluster_target_groups_var = tk.IntVar(master=self.root, value=self.config.get("cluster_target_groups", 0))
+        self.cluster_orientation_split_var = tk.DoubleVar(master=self.root, value=self.config.get("cluster_orientation_split_deg", 0.0))
+        self.save_final_uint16_var = tk.BooleanVar(master=self.root, value=self.config.get("save_final_as_uint16", False))
 
         # --- Solver Settings ---
         try:
             self.solver_settings = SolverSettings.load_default()
         except Exception:
             self.solver_settings = SolverSettings()
-        self.solver_choice_var = tk.StringVar(value=self.solver_settings.solver_choice)
+        self.solver_choice_var = tk.StringVar(master=self.root, value=self.solver_settings.solver_choice)
         self.solver_choice_var.trace_add("write", self._update_solver_frames)
-        self.astrometry_api_key_var = tk.StringVar(value=self.solver_settings.api_key)
-        self.astrometry_timeout_var = tk.IntVar(value=self.solver_settings.timeout)
-        self.astrometry_downsample_var = tk.IntVar(value=self.solver_settings.downsample)
+        self.astrometry_api_key_var = tk.StringVar(master=self.root, value=self.solver_settings.api_key)
+        self.astrometry_timeout_var = tk.IntVar(master=self.root, value=self.solver_settings.timeout)
+        self.astrometry_downsample_var = tk.IntVar(master=self.root, value=self.solver_settings.downsample)
         
         self.is_processing = False
         self.worker_process = None
         self.progress_queue = None
-        self.progress_bar_var = tk.DoubleVar(value=0.0)
-        self.eta_var = tk.StringVar(value=self._tr("initial_eta_value", "--:--:--"))
-        self.elapsed_time_var = tk.StringVar(value=self._tr("initial_elapsed_time", "00:00:00"))
+        self.progress_bar_var = tk.DoubleVar(master=self.root, value=0.0)
+        self.eta_var = tk.StringVar(master=self.root, value=self._tr("initial_eta_value", "--:--:--"))
+        self.elapsed_time_var = tk.StringVar(master=self.root, value=self._tr("initial_elapsed_time", "00:00:00"))
         self._chrono_start_time = None
         self._chrono_after_id = None
         self._stage_times = {}
         
-        self.current_language_var = tk.StringVar(value=self.localizer.language_code)
+        self.current_language_var = tk.StringVar(master=self.root, value=self.localizer.language_code)
         self.current_language_var.trace_add("write", self._on_language_change)
         
         # --- Variables Tkinter pour les Options de Stacking ---
-        self.stacking_normalize_method_var = tk.StringVar(value=self.config.get("stacking_normalize_method", self.norm_method_keys[0]))
-        self.stacking_weighting_method_var = tk.StringVar(value=self.config.get("stacking_weighting_method", self.weight_method_keys[0]))
-        self.stacking_rejection_algorithm_var = tk.StringVar(value=self.config.get("stacking_rejection_algorithm", self.reject_algo_keys[1]))
+        self.stacking_normalize_method_var = tk.StringVar(master=self.root, value=self.config.get("stacking_normalize_method", self.norm_method_keys[0]))
+        self.stacking_weighting_method_var = tk.StringVar(master=self.root, value=self.config.get("stacking_weighting_method", self.weight_method_keys[0]))
+        self.stacking_rejection_algorithm_var = tk.StringVar(master=self.root, value=self.config.get("stacking_rejection_algorithm", self.reject_algo_keys[1]))
         
-        self.stacking_kappa_low_var = tk.DoubleVar(value=self.config.get("stacking_kappa_low", 3.0))
-        self.stacking_kappa_high_var = tk.DoubleVar(value=self.config.get("stacking_kappa_high", 3.0))
-        self.stacking_winsor_limits_str_var = tk.StringVar(value=self.config.get("stacking_winsor_limits", "0.05,0.05"))
-        self.stacking_final_combine_method_var = tk.StringVar(value=self.config.get("stacking_final_combine_method", self.combine_method_keys[0]))
+        self.stacking_kappa_low_var = tk.DoubleVar(master=self.root, value=self.config.get("stacking_kappa_low", 3.0))
+        self.stacking_kappa_high_var = tk.DoubleVar(master=self.root, value=self.config.get("stacking_kappa_high", 3.0))
+        self.stacking_winsor_limits_str_var = tk.StringVar(master=self.root, value=self.config.get("stacking_winsor_limits", "0.05,0.05"))
+        self.stacking_final_combine_method_var = tk.StringVar(master=self.root, value=self.config.get("stacking_final_combine_method", self.combine_method_keys[0]))
         
         # --- PONDÉRATION RADIALE ---
-        self.apply_radial_weight_var = tk.BooleanVar(value=self.config.get("apply_radial_weight", False))
-        self.radial_feather_fraction_var = tk.DoubleVar(value=self.config.get("radial_feather_fraction", 0.8))
-        self.min_radial_weight_floor_var = tk.DoubleVar(value=self.config.get("min_radial_weight_floor", 0.0)) # Ajouté
+        self.apply_radial_weight_var = tk.BooleanVar(master=self.root, value=self.config.get("apply_radial_weight", False))
+        self.radial_feather_fraction_var = tk.DoubleVar(master=self.root, value=self.config.get("radial_feather_fraction", 0.8))
+        self.min_radial_weight_floor_var = tk.DoubleVar(master=self.root, value=self.config.get("min_radial_weight_floor", 0.0)) # Ajouté
         # radial_shape_power est géré via self.config directement
         
         # --- METHODE D'ASSEMBLAGE ---
-        self.final_assembly_method_var = tk.StringVar(
+        self.final_assembly_method_var = tk.StringVar(master=self.root, 
             value=self.config.get("final_assembly_method", self.assembly_method_keys[0])
         )
         self.final_assembly_method_var.trace_add("write", self._on_assembly_method_change)
@@ -272,27 +276,28 @@ class ZeMosaicGUI:
         num_workers_from_config = self.config.get("num_processing_workers", 0)
         if num_workers_from_config == -1:
             num_workers_from_config = 0
-        self.num_workers_var = tk.IntVar(value=num_workers_from_config)
-        self.winsor_workers_var = tk.IntVar(value=self.config.get("winsor_worker_limit", 6))
+        self.num_workers_var = tk.IntVar(master=self.root, value=num_workers_from_config)
+        self.winsor_workers_var = tk.IntVar(master=self.root, value=self.config.get("winsor_worker_limit", 6))
+        self.winsor_max_frames_var = tk.IntVar(master=self.root, value=self.config.get("winsor_max_frames_per_pass", 0))
         # --- FIN NOMBRE DE WORKERS ---
         # --- NOUVELLES VARIABLES TKINTER POUR LE ROGNAGE ---
-        self.apply_master_tile_crop_var = tk.BooleanVar(
+        self.apply_master_tile_crop_var = tk.BooleanVar(master=self.root, 
             value=self.config.get("apply_master_tile_crop", True) # Désactivé par défaut
         )
-        self.master_tile_crop_percent_var = tk.DoubleVar(
-            value=self.config.get("master_tile_crop_percent", 18.0) # 18% par côté par défaut si activé
+        self.master_tile_crop_percent_var = tk.DoubleVar(master=self.root, 
+            value=self.config.get("master_tile_crop_percent", 10.0) # 10% par côté par défaut si activé
         )
-        self.use_memmap_var = tk.BooleanVar(value=self.config.get("coadd_use_memmap", False))
-        self.mm_dir_var = tk.StringVar(value=self.config.get("coadd_memmap_dir", ""))
-        self.cleanup_memmap_var = tk.BooleanVar(value=self.config.get("coadd_cleanup_memmap", True))
-        self.auto_limit_frames_var = tk.BooleanVar(value=self.config.get("auto_limit_frames_per_master_tile", True))
-        self.max_raw_per_tile_var = tk.IntVar(value=self.config.get("max_raw_per_master_tile", 0))
-        self.use_gpu_phase5_var = tk.BooleanVar(value=self.config.get("use_gpu_phase5", False))
+        self.use_memmap_var = tk.BooleanVar(master=self.root, value=self.config.get("coadd_use_memmap", False))
+        self.mm_dir_var = tk.StringVar(master=self.root, value=self.config.get("coadd_memmap_dir", ""))
+        self.cleanup_memmap_var = tk.BooleanVar(master=self.root, value=self.config.get("coadd_cleanup_memmap", True))
+        self.auto_limit_frames_var = tk.BooleanVar(master=self.root, value=self.config.get("auto_limit_frames_per_master_tile", True))
+        self.max_raw_per_tile_var = tk.IntVar(master=self.root, value=self.config.get("max_raw_per_master_tile", 0))
+        self.use_gpu_phase5_var = tk.BooleanVar(master=self.root, value=self.config.get("use_gpu_phase5", False))
         # Logging level var (keys are ERROR, WARN, INFO, DEBUG)
         self.logging_level_keys = ["ERROR", "WARN", "INFO", "DEBUG"]
-        self.logging_level_var = tk.StringVar(value=str(self.config.get("logging_level", "INFO")).upper())
+        self.logging_level_var = tk.StringVar(master=self.root, value=str(self.config.get("logging_level", "INFO")).upper())
         self._gpus = _detect_gpus()
-        self.gpu_selector_var = tk.StringVar(
+        self.gpu_selector_var = tk.StringVar(master=self.root, 
             value=self.config.get("gpu_selector", self._gpus[0][0] if self._gpus else "")
         )
         # ---  ---
@@ -727,6 +732,24 @@ class ZeMosaicGUI:
         winsor_workers_note = ttk.Label(perf_options_frame, text="")
         winsor_workers_note.grid(row=1, column=2, padx=(10,5), pady=5, sticky="ew")
         self.translatable_widgets["winsor_workers_note"] = winsor_workers_note
+
+        winsor_frames_label = ttk.Label(perf_options_frame, text="")
+        winsor_frames_label.grid(row=2, column=0, padx=5, pady=5, sticky="w")
+        self.translatable_widgets["winsor_frames_label"] = winsor_frames_label
+
+        self.winsor_frames_spinbox = ttk.Spinbox(
+            perf_options_frame,
+            from_=0,
+            to=9999,
+            increment=1,
+            textvariable=self.winsor_max_frames_var,
+            width=8
+        )
+        self.winsor_frames_spinbox.grid(row=2, column=1, padx=5, pady=5, sticky="w")
+
+        winsor_frames_note = ttk.Label(perf_options_frame, text="")
+        winsor_frames_note.grid(row=2, column=2, padx=(10,5), pady=5, sticky="ew")
+        self.translatable_widgets["winsor_frames_note"] = winsor_frames_note
         # --- FIN CADRE OPTIONS DE PERFORMANCE ---
         # --- NOUVEAU CADRE : OPTIONS DE ROGNAGE DES TUILES MAÎTRESSES ---
         crop_options_frame = ttk.LabelFrame(self.scrollable_content_frame, text="", padding="10")
@@ -966,7 +989,7 @@ class ZeMosaicGUI:
             # print("DEBUG GUI: Root window non existante dans _update_ui_language.")
             return
 
-        self.root.title(self._tr("window_title", "ZeMosaic V2.7 - Hierarchical Mosaicker"))
+        self.root.title(self._tr("window_title", "ZeMosaic V2.9 - Hierarchical Mosaicker"))
 
         # Traduction des widgets standards (Labels, Buttons, Titres de Frames, Onglets etc.)
         for key, widget_info in self.translatable_widgets.items():
@@ -1675,9 +1698,10 @@ class ZeMosaicGUI:
             return
 
         # 1. RÉCUPÉRER TOUTES les valeurs des variables Tkinter
+        skip_filter_ui_for_run = False
         input_dir = self.input_dir_var.get()
         output_dir = self.output_dir_var.get()
-        astap_exe = self.astap_exe_path_var.get() 
+        astap_exe = self.astap_exe_path_var.get()
         astap_data = self.astap_data_dir_var.get()
         
         try:
@@ -1736,17 +1760,33 @@ class ZeMosaicGUI:
             messagebox.showerror(self._tr("error_title"), self._tr("output_folder_creation_error", error=e), parent=self.root); return
         if not (astap_exe and os.path.isfile(astap_exe)): 
             messagebox.showerror(self._tr("error_title"), self._tr("invalid_astap_exe_error"), parent=self.root); return
-        if not (astap_data and os.path.isdir(astap_data)): 
+        if not (astap_data and os.path.isdir(astap_data)):
             if not messagebox.askokcancel(self._tr("astap_data_dir_title", "ASTAP Data Directory"),
-                                          self._tr("astap_data_dir_missing_or_invalid_continue_q", 
+                                          self._tr("astap_data_dir_missing_or_invalid_continue_q",
                                                    path=astap_data,
                                                    default_path=self.config.get("astap_data_directory_path","")),
                                           icon='warning', parent=self.root):
                 return
 
+        # 2bis. Choix utilisateur concernant l'ouverture du filtre
+        try:
+            wants_filter_window = messagebox.askyesno(
+                self._tr("filter_prompt_title", "Filter range and set clustering?"),
+                self._tr(
+                    "filter_prompt_message",
+                    "Do you want to open the filter window to adjust the range and clustering before processing?",
+                ),
+                parent=self.root,
+                icon='question',
+            )
+        except tk.TclError:
+            wants_filter_window = True
+        if wants_filter_window is False:
+            skip_filter_ui_for_run = True
+
 
         # 3. PARSING et VALIDATION des limites Winsor (inchangé)
-        parsed_winsor_limits = (0.05, 0.05) 
+        parsed_winsor_limits = (0.05, 0.05)
         if stack_reject_algo == "winsorized_sigma_clip":
             try:
                 low_str, high_str = stack_winsor_limits_str.split(',')
@@ -1777,6 +1817,8 @@ class ZeMosaicGUI:
         self._log_message("CHRONO_START_REQUEST", None, "CHRONO_LEVEL")
         self._log_message("log_key_processing_started", level="INFO")
         # ... (autres logs d'info) ...
+        if skip_filter_ui_for_run:
+            self._log_message("log_filter_ui_skipped", level="INFO_DETAIL")
 
         # -- Gestion du dossier memmap par défaut --
         memmap_dir = self.mm_dir_var.get().strip()
@@ -1797,6 +1839,7 @@ class ZeMosaicGUI:
             pass
 
         self.config["winsor_worker_limit"] = self.winsor_workers_var.get()
+        self.config["winsor_max_frames_per_pass"] = self.winsor_max_frames_var.get()
         self.config["max_raw_per_master_tile"] = self.max_raw_per_tile_var.get()
         # Persist logging level
         self.config["logging_level"] = self.logging_level_var.get()
@@ -1813,12 +1856,20 @@ class ZeMosaicGUI:
         if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
             zemosaic_config.save_config(self.config)
 
+        stack_ram_budget_val = 0.0
+        try:
+            stack_ram_budget_val = float(self.config.get("stack_ram_budget_gb", 0.0))
+        except Exception:
+            stack_ram_budget_val = 0.0
+        self.config["stack_ram_budget_gb"] = stack_ram_budget_val
+
         worker_args = (
             input_dir, output_dir, astap_exe, astap_data,
             astap_radius_val, astap_downsample_val, astap_sensitivity_val,
             cluster_thresh_val,
             cluster_target_groups_val,
             cluster_orientation_split_val,
+            stack_ram_budget_val,
             stack_norm_method,
             stack_weight_method,
             stack_reject_algo,
@@ -1841,6 +1892,7 @@ class ZeMosaicGUI:
             self.cleanup_memmap_var.get(),
             self.config.get("assembly_process_workers", 0),
             self.auto_limit_frames_var.get(),
+            self.winsor_max_frames_var.get(),
             self.winsor_workers_var.get(),
             self.max_raw_per_tile_var.get(),
             self.use_gpu_phase5_var.get(),
@@ -1849,12 +1901,16 @@ class ZeMosaicGUI:
             asdict(self.solver_settings)
             # --- FIN NOUVEAUX ARGUMENTS ---
         )
-        
+
+        worker_kwargs = {"solver_settings_dict": worker_args[-1]}
+        if skip_filter_ui_for_run:
+            worker_kwargs["skip_filter_ui"] = True
+
         self.progress_queue = multiprocessing.Queue()
         self.worker_process = multiprocessing.Process(
             target=run_hierarchical_mosaic_process,
             args=(self.progress_queue,) + worker_args[:-1],
-            kwargs={"solver_settings_dict": worker_args[-1]},
+            kwargs=worker_kwargs,
             daemon=True,
             name="ZeMosaicWorkerProcess",
         )

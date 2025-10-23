@@ -7,19 +7,24 @@ import traceback
 import gc
 import logging
 import inspect  # Pas utilisé directement ici, mais peut être utile pour des introspections futures
+import math
+from datetime import datetime
 import psutil
 import tempfile
 import glob
 import uuid
 import multiprocessing
 import threading
+import itertools
 from typing import Callable
 from types import SimpleNamespace
 
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, FIRST_COMPLETED, as_completed
 # BrokenProcessPool moved under concurrent.futures.process in modern Python
 from concurrent.futures.process import BrokenProcessPool
 
+# Nombre maximum de tentatives d'alignement avant abandon définitif
+MAX_ALIGNMENT_RETRY_ATTEMPTS = 3
 
 def cluster_seestar_stacks_connected(
     all_raw_files_with_info: list,
@@ -151,6 +156,725 @@ def cluster_seestar_stacks_connected(
     return groups
 
 
+# --- Helpers for RAM budget enforcement during stacking ---
+def _extract_hw_from_info(raw_info: dict) -> tuple[int, int]:
+    """Return (H, W) dimensions inferred from cached metadata."""
+
+    if not isinstance(raw_info, dict):
+        return 0, 0
+
+    shape = raw_info.get("preprocessed_shape")
+    if shape:
+        try:
+            # Accept either (H, W) or (H, W, C)
+            h = int(shape[0])
+            w = int(shape[1]) if len(shape) >= 2 else 0
+            if h > 0 and w > 0:
+                return h, w
+        except Exception:
+            pass
+
+    header_obj = raw_info.get("header")
+    if header_obj is not None:
+        try:
+            # fits.Header exposes .get, dict fallback to __getitem__
+            get = header_obj.get if hasattr(header_obj, "get") else header_obj.__getitem__
+            w = int(get("NAXIS1", 0)) if hasattr(header_obj, "get") else int(get("NAXIS1"))
+            h = int(get("NAXIS2", 0)) if hasattr(header_obj, "get") else int(get("NAXIS2"))
+            if h > 0 and w > 0:
+                return h, w
+        except Exception:
+            pass
+
+    wcs_obj = raw_info.get("wcs")
+    if wcs_obj is not None and getattr(wcs_obj, "pixel_shape", None):
+        try:
+            w = int(wcs_obj.pixel_shape[0])
+            h = int(wcs_obj.pixel_shape[1]) if len(wcs_obj.pixel_shape) > 1 else 0
+            if h > 0 and w > 0:
+                return h, w
+        except Exception:
+            pass
+
+    return 0, 0
+
+
+def _estimate_group_memory_bytes(group: list[dict]) -> tuple[int, int, int, int]:
+    """Estimate total memory footprint (bytes) for a stack group.
+
+    Returns ``(total_bytes, per_frame_bytes, max_h, max_w)``.
+    ``per_frame_bytes`` follows the simplified model ``H * W * 4``.
+    """
+
+    if not group:
+        return 0, 0, 0, 0
+
+    max_h = 0
+    max_w = 0
+    for info in group:
+        h, w = _extract_hw_from_info(info)
+        max_h = max(max_h, int(h))
+        max_w = max(max_w, int(w))
+
+    if max_h <= 0 or max_w <= 0:
+        return 0, 0, max_h, max_w
+
+    per_frame_bytes = int(max_h) * int(max_w) * 4
+    total_bytes = per_frame_bytes * len(group)
+    return total_bytes, per_frame_bytes, max_h, max_w
+
+
+def _split_group_temporally(group: list[dict], segment_size: int) -> list[list[dict]]:
+    """Split ``group`` into contiguous segments of ``segment_size`` (>=1)."""
+
+    if segment_size <= 0:
+        return [group]
+    return [group[i:i + segment_size] for i in range(0, len(group), segment_size)]
+
+
+def _estimate_per_frame_cost_mb(
+    header_items: list[dict] | None,
+    bytes_per_pixel: int = 4,
+    overhead_factor: float = 2.0,
+    sample_size: int = 32,
+) -> dict:
+    """Estimate per-frame memory usage from Phase 0 metadata.
+
+    Returns a dictionary containing ``per_frame_mb``, ``max_height`` and
+    ``max_width`` along with the inferred ``channels``.
+    """
+
+    if not header_items:
+        header_items = []
+
+    try:
+        overhead_factor = max(1.0, float(overhead_factor))
+    except Exception:
+        overhead_factor = 2.0
+
+    max_h = 0
+    max_w = 0
+    max_channels = 0
+
+    if header_items:
+        if sample_size > 0 and len(header_items) > sample_size:
+            step = max(1, len(header_items) // sample_size)
+            sampled_items = [header_items[i] for i in range(0, len(header_items), step)][:sample_size]
+        else:
+            sampled_items = list(header_items)
+    else:
+        sampled_items = []
+
+    for item in sampled_items:
+        try:
+            shape = item.get("shape") if isinstance(item, dict) else None
+            if shape:
+                h = int(shape[0]) if len(shape) >= 1 else 0
+                w = int(shape[1]) if len(shape) >= 2 else 0
+                c = int(shape[2]) if len(shape) >= 3 else 1
+            else:
+                header = item.get("header") if isinstance(item, dict) else None
+                h, w = 0, 0
+                c = 1
+                if header is not None:
+                    getter = header.get if hasattr(header, "get") else header.__getitem__
+                    try:
+                        w = int(getter("NAXIS1", 0)) if hasattr(header, "get") else int(getter("NAXIS1"))
+                        h = int(getter("NAXIS2", 0)) if hasattr(header, "get") else int(getter("NAXIS2"))
+                    except Exception:
+                        h, w = 0, 0
+                    try:
+                        if hasattr(header, "get"):
+                            naxis = int(header.get("NAXIS", 2))
+                        else:
+                            naxis = int(header["NAXIS"]) if "NAXIS" in header else 2
+                    except Exception:
+                        naxis = 2
+                    if naxis >= 3:
+                        try:
+                            if hasattr(header, "get"):
+                                c = int(header.get("NAXIS3", 1))
+                            else:
+                                c = int(header.get("NAXIS3", 1)) if hasattr(header, "get") else int(header["NAXIS3"])
+                        except Exception:
+                            c = 1
+                else:
+                    h, w, c = 0, 0, 1
+            if isinstance(item, dict):
+                if "BAYERPAT" in item.get("header", {}):
+                    c = max(1, c)
+            max_h = max(max_h, int(h))
+            max_w = max(max_w, int(w))
+            max_channels = max(max_channels, max(1, int(c)))
+        except Exception:
+            continue
+
+    if max_h <= 0 or max_w <= 0:
+        # Conservative fallback for unknown dimensions (~9MP mono sensor)
+        max_h = 3000
+        max_w = 3000
+    if max_channels <= 0:
+        max_channels = 1
+
+    per_frame_bytes = max_h * max_w * max_channels * max(1, int(bytes_per_pixel))
+    per_frame_mb = (per_frame_bytes / (1024 * 1024)) * overhead_factor
+
+    return {
+        "per_frame_mb": float(per_frame_mb),
+        "bytes_per_pixel": int(bytes_per_pixel),
+        "overhead_factor": float(overhead_factor),
+        "max_height": int(max_h),
+        "max_width": int(max_w),
+        "channels": int(max_channels),
+    }
+
+
+def _probe_system_resources(cache_dir: str | None = None) -> dict:
+    """Collect RAM, disk and GPU availability information."""
+
+    info: dict = {
+        "ram_total_mb": None,
+        "ram_available_mb": None,
+        "usable_ram_mb": None,
+        "disk_total_mb": None,
+        "disk_free_mb": None,
+        "usable_disk_mb": None,
+        "gpu_total_mb": None,
+        "gpu_free_mb": None,
+        "usable_vram_mb": None,
+    }
+
+    try:
+        if psutil is not None:
+            vm = psutil.virtual_memory()
+            info["ram_total_mb"] = vm.total / (1024 * 1024)
+            info["ram_available_mb"] = vm.available / (1024 * 1024)
+            info["usable_ram_mb"] = min(info["ram_total_mb"], info["ram_available_mb"] * 0.6) if info["ram_available_mb"] else None
+    except Exception:
+        pass
+
+    try:
+        target_dir = cache_dir if cache_dir and os.path.isdir(cache_dir) else os.getcwd()
+        du = shutil.disk_usage(target_dir)
+        disk_total_mb = du.total / (1024 * 1024)
+        disk_free_mb = du.free / (1024 * 1024)
+        info["disk_total_mb"] = disk_total_mb
+        info["disk_free_mb"] = disk_free_mb
+        info["usable_disk_mb"] = disk_free_mb * 0.7
+    except Exception:
+        pass
+
+    # GPU detection via CuPy first, then torch
+    try:
+        import importlib
+
+        if importlib.util.find_spec("cupy") is not None:
+            import cupy  # type: ignore
+
+            try:
+                cupy.cuda.Device().use()
+                free_bytes, total_bytes = cupy.cuda.runtime.memGetInfo()
+                free_mb = free_bytes / (1024 * 1024)
+                total_mb = total_bytes / (1024 * 1024)
+                info["gpu_total_mb"] = total_mb
+                info["gpu_free_mb"] = free_mb
+                info["usable_vram_mb"] = free_mb * 0.7
+            except Exception:
+                pass
+        elif importlib.util.find_spec("torch") is not None:
+            import torch  # type: ignore
+
+            if torch.cuda.is_available():
+                device = torch.cuda.current_device()
+                total_mb = torch.cuda.get_device_properties(device).total_memory / (1024 * 1024)
+                free_mb = torch.cuda.mem_get_info(device)[0] / (1024 * 1024)
+                info["gpu_total_mb"] = total_mb
+                info["gpu_free_mb"] = free_mb
+                info["usable_vram_mb"] = free_mb * 0.7
+    except Exception:
+        pass
+
+    return info
+
+
+def _compute_auto_tile_caps(
+    resource_info: dict,
+    per_frame_info: dict,
+    policy_max: int = 50,
+    policy_min: int = 8,
+    disk_threshold_mb: float = 8192.0,
+    user_max_override: int | None = None,
+) -> dict:
+    """Combine resource probes and per-frame costs into adaptive caps."""
+
+    per_frame_mb = float(per_frame_info.get("per_frame_mb", 0.0) or 0.0)
+    usable_ram_mb = float(resource_info.get("usable_ram_mb") or 0.0)
+    ram_available_mb = float(resource_info.get("ram_available_mb") or 0.0)
+
+    if user_max_override and user_max_override > 0:
+        policy_max = min(policy_max, int(user_max_override))
+
+    frames_by_ram = 0
+    if per_frame_mb > 0 and usable_ram_mb > 0:
+        frames_by_ram = max(0, int(math.floor(usable_ram_mb / per_frame_mb)))
+
+    cap_candidate = policy_max if policy_max > 0 else frames_by_ram or policy_min
+    if frames_by_ram > 0:
+        cap_candidate = min(cap_candidate, frames_by_ram)
+    cap_candidate = max(policy_min, cap_candidate)
+
+    disk_free_mb = float(resource_info.get("disk_free_mb") or 0.0)
+    usable_disk_mb = float(resource_info.get("usable_disk_mb") or 0.0)
+
+    memmap_enabled = False
+    memmap_budget_mb = None
+    if frames_by_ram < policy_min and disk_free_mb > disk_threshold_mb:
+        memmap_enabled = True
+        memmap_budget_mb = max(policy_min * per_frame_mb, usable_disk_mb * 0.2 if usable_disk_mb else disk_free_mb * 0.2)
+
+    gpu_hint = None
+    usable_vram_mb = float(resource_info.get("usable_vram_mb") or 0.0)
+    if per_frame_mb > 0 and usable_vram_mb > 0:
+        gpu_hint = max(1, min(cap_candidate, int(math.floor(usable_vram_mb / per_frame_mb))))
+
+    parallel_cap = 1
+    if frames_by_ram and cap_candidate > 0:
+        parallel_cap = max(1, frames_by_ram // max(1, cap_candidate))
+    if memmap_enabled:
+        parallel_cap = 1
+
+    return {
+        "per_frame_mb": per_frame_mb,
+        "frames_by_ram": frames_by_ram,
+        "cap": int(cap_candidate),
+        "min_cap": int(policy_min),
+        "memmap": bool(memmap_enabled),
+        "memmap_budget_mb": memmap_budget_mb,
+        "gpu_batch_hint": gpu_hint,
+        "ram_available_mb": ram_available_mb,
+        "parallel_groups": int(parallel_cap),
+    }
+
+
+def _extract_timestamp(info: dict, fallback: float) -> float:
+    header = info.get("header") if isinstance(info, dict) else None
+    if header is not None:
+        for key in ("DATE-OBS", "DATE-AVG", "DATE", "TIME-OBS"):
+            try:
+                if hasattr(header, "get"):
+                    value = header.get(key)
+                else:
+                    value = header[key] if key in header else None
+            except Exception:
+                value = None
+            if not value:
+                continue
+            try:
+                from astropy.time import Time  # type: ignore
+
+                return float(Time(value, format="isot", scale="utc").unix)
+            except Exception:
+                try:
+                    dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                    return dt.timestamp()
+                except Exception:
+                    continue
+    try:
+        idx = info.get("phase0_index")
+        if idx is not None:
+            return float(idx)
+    except Exception:
+        pass
+    return float(fallback)
+
+
+def _extract_ra_dec_deg(info: dict) -> tuple[float, float] | None:
+    wcs_obj = info.get("wcs") if isinstance(info, dict) else None
+    if wcs_obj and getattr(wcs_obj, "is_celestial", False):
+        try:
+            if getattr(wcs_obj, "pixel_shape", None):
+                cx = wcs_obj.pixel_shape[0] / 2.0
+                cy = wcs_obj.pixel_shape[1] / 2.0
+            else:
+                cx = cy = 0.0
+            center = wcs_obj.pixel_to_world(cx, cy)
+            if hasattr(center, "ra") and hasattr(center.ra, "deg"):
+                return float(center.ra.deg), float(center.dec.deg)
+        except Exception:
+            pass
+
+    if isinstance(info, dict):
+        phase0_center = info.get("phase0_center")
+        if phase0_center is not None:
+            try:
+                if hasattr(phase0_center, "ra") and hasattr(phase0_center.ra, "deg"):
+                    return float(phase0_center.ra.deg), float(phase0_center.dec.deg)
+                if isinstance(phase0_center, (list, tuple)) and len(phase0_center) >= 2:
+                    return float(phase0_center[0]), float(phase0_center[1])
+            except Exception:
+                pass
+
+        header = info.get("header")
+        if header is not None:
+            try:
+                getter = header.get if hasattr(header, "get") else header.__getitem__
+                ra = getter("CRVAL1", None)
+                dec = getter("CRVAL2", None)
+                if ra is not None and dec is not None:
+                    return float(ra), float(dec)
+            except Exception:
+                pass
+    return None
+
+
+def _estimate_frame_fov_deg(info: dict) -> float | None:
+    if isinstance(info, dict):
+        direct = info.get("phase0_fov_deg") or info.get("estimated_fov_deg")
+        if direct:
+            try:
+                return float(direct)
+            except Exception:
+                pass
+    wcs_obj = info.get("wcs") if isinstance(info, dict) else None
+    if wcs_obj and getattr(wcs_obj, "is_celestial", False):
+        try:
+            if getattr(wcs_obj, "pixel_shape", None):
+                width = float(wcs_obj.pixel_shape[0])
+                height = float(wcs_obj.pixel_shape[1]) if len(wcs_obj.pixel_shape) > 1 else width
+            else:
+                height, width = _extract_hw_from_info(info)
+            if width and height:
+                xs = [0.0, width, 0.0, width]
+                ys = [0.0, 0.0, height, height]
+                corners = wcs_obj.pixel_to_world(xs, ys)
+                if SkyCoord is not None and u is not None:
+                    sc = SkyCoord(ra=corners.ra, dec=corners.dec)
+                    seps = sc[:, None].separation(sc[None, :]).deg
+                    return float(np.nanmax(seps)) if np.size(seps) else None
+        except Exception:
+            pass
+
+    header = info.get("header") if isinstance(info, dict) else None
+    if header is not None:
+        try:
+            getter = header.get if hasattr(header, "get") else header.__getitem__
+            cd1 = abs(float(getter("CDELT1", 0)))
+            cd2 = abs(float(getter("CDELT2", 0)))
+            h, w = _extract_hw_from_info(info)
+            if cd1 and cd2 and h and w:
+                return math.hypot(cd1 * w, cd2 * h)
+        except Exception:
+            pass
+    return None
+
+
+def _unit_vector_from_ra_dec(ra_deg: float, dec_deg: float) -> tuple[float, float, float]:
+    ra_rad = math.radians(float(ra_deg))
+    dec_rad = math.radians(float(dec_deg))
+    x = math.cos(dec_rad) * math.cos(ra_rad)
+    y = math.cos(dec_rad) * math.sin(ra_rad)
+    z = math.sin(dec_rad)
+    return x, y, z
+
+
+def _compute_max_angular_separation_deg(coords: list[tuple[float, float]]) -> float:
+    if not coords or len(coords) < 2:
+        return 0.0
+    if SkyCoord is not None and u is not None:
+        try:
+            sc = SkyCoord(ra=[c[0] for c in coords] * u.deg, dec=[c[1] for c in coords] * u.deg)
+            seps = sc[:, None].separation(sc[None, :]).deg
+            return float(np.nanmax(seps)) if np.size(seps) else 0.0
+        except Exception:
+            pass
+    vectors = np.array([_unit_vector_from_ra_dec(*c) for c in coords], dtype=float)
+    max_sep = 0.0
+    for i in range(len(vectors)):
+        for j in range(i + 1, len(vectors)):
+            dot = float(np.dot(vectors[i], vectors[j]))
+            dot = min(1.0, max(-1.0, dot))
+            sep = math.degrees(math.acos(dot))
+            if sep > max_sep:
+                max_sep = sep
+    return max_sep
+
+
+def _cluster_unit_vectors(vectors: 'np.ndarray', k: int, max_iter: int = 25) -> list[int]:
+    if k <= 1 or vectors.shape[0] <= 1:
+        return [0] * vectors.shape[0]
+    k = min(k, vectors.shape[0])
+    centers = [vectors[0]]
+    for _ in range(1, k):
+        distances = 1 - np.dot(vectors, np.stack(centers, axis=0).T)
+        min_dist = np.min(distances, axis=1)
+        idx = int(np.argmax(min_dist))
+        centers.append(vectors[idx])
+    centers = np.array(centers, dtype=float)
+
+    assignments = np.zeros(vectors.shape[0], dtype=int)
+    for _ in range(max_iter):
+        distances = 1 - np.dot(vectors, centers.T)
+        new_assignments = np.argmin(distances, axis=1)
+        if np.array_equal(assignments, new_assignments):
+            break
+        assignments = new_assignments
+        for ci in range(k):
+            members = vectors[assignments == ci]
+            if members.size == 0:
+                # Reinitialize empty cluster to farthest point
+                idx = int(np.argmax(np.min(distances, axis=1)))
+                centers[ci] = vectors[idx]
+            else:
+                center = members.mean(axis=0)
+                norm = np.linalg.norm(center)
+                if norm > 0:
+                    centers[ci] = center / norm
+    return assignments.tolist()
+
+
+def _sort_group_chronologically(group: list[dict]) -> list[dict]:
+    ordered = []
+    for idx, info in enumerate(group):
+        ts = _extract_timestamp(info, idx)
+        ordered.append((ts, idx, info))
+    ordered.sort(key=lambda x: (x[0], x[1]))
+    return [item[2] for item in ordered]
+
+
+def _chunk_sequence(seq: list[dict], size: int) -> list[list[dict]]:
+    if size <= 0:
+        return [seq]
+    return [seq[i:i + size] for i in range(0, len(seq), size)]
+
+
+def _auto_split_single_group(
+    group: list[dict],
+    cap: int,
+    min_cap: int,
+    spatial_fraction: float = 0.25,
+) -> tuple[list[list[dict]], dict]:
+    n = len(group)
+    detail = {
+        "original_size": n,
+        "segment_sizes": [n],
+        "spatial_split": False,
+        "reason": "within_cap" if n <= cap else "ram_cap",
+        "dispersion_deg": None,
+        "fov_deg": None,
+    }
+
+    if n <= max(cap, min_cap):
+        return [group], detail
+
+    centers = []
+    indices = []
+    for idx, info in enumerate(group):
+        coord = _extract_ra_dec_deg(info)
+        if coord:
+            centers.append(coord)
+            indices.append(idx)
+
+    fov_deg = _estimate_frame_fov_deg(group[0]) if group else None
+    dispersion_deg = _compute_max_angular_separation_deg(centers) if centers else 0.0
+    detail["dispersion_deg"] = dispersion_deg
+    detail["fov_deg"] = fov_deg
+
+    base_clusters: list[list[tuple[int, dict]]] = []
+    if (
+        centers
+        and fov_deg
+        and dispersion_deg > float(fov_deg) * float(max(0.0, spatial_fraction))
+    ):
+        k = max(1, math.ceil(n / max(1, cap)))
+        vectors = np.array([_unit_vector_from_ra_dec(*c) for c in centers], dtype=float)
+        assignments = _cluster_unit_vectors(vectors, k)
+        cluster_map: dict[int, list[tuple[int, dict]]] = {i: [] for i in range(k)}
+        for pos, assignment in zip(indices, assignments):
+            cluster_map.setdefault(int(assignment), []).append((pos, group[pos]))
+        remaining_indices = [i for i in range(n) if i not in indices]
+        for idx in remaining_indices:
+            target = min(cluster_map.keys(), key=lambda key: (len(cluster_map[key]), key))
+            cluster_map[target].append((idx, group[idx]))
+        base_clusters = [sorted(items, key=lambda x: x[0]) for items in cluster_map.values() if items]
+        if len(base_clusters) > 1:
+            detail["spatial_split"] = True
+            detail["reason"] = "dispersion"
+    if not base_clusters:
+        base_clusters = [list(enumerate(group))]
+
+    output_groups: list[list[dict]] = []
+    for cluster in base_clusters:
+        ordered = _sort_group_chronologically([info for _idx, info in cluster])
+        output_groups.extend(_chunk_sequence(ordered, max(min_cap, cap)))
+
+    detail["segment_sizes"] = [len(sub) for sub in output_groups]
+    return output_groups, detail
+
+
+def _auto_split_groups(
+    groups: list[list[dict]],
+    cap: int,
+    min_cap: int,
+    progress_callback: Callable | None = None,
+    spatial_fraction: float = 0.25,
+) -> list[list[dict]]:
+    if cap <= 0 or not groups:
+        return groups
+    new_groups: list[list[dict]] = []
+    for idx, group in enumerate(groups, start=1):
+        subgroups, detail = _auto_split_single_group(group, cap, min_cap, spatial_fraction)
+        new_groups.extend(subgroups)
+        if progress_callback:
+            try:
+                sizes_str = ",".join(str(len(sg)) for sg in subgroups)
+                msg = (
+                    f"AutoSplit: group #{idx} N={len(group)} -> {len(subgroups)} subgroups "
+                    f"[{sizes_str}] (chrono; spatial split={'yes' if detail['spatial_split'] else 'no'}; "
+                    f"reason={detail['reason']})"
+                )
+                _log_and_callback(msg, prog=None, lvl="INFO_DETAIL", callback=progress_callback)
+            except Exception:
+                pass
+    return new_groups
+
+
+def _attempt_recluster_for_budget(
+    group: list[dict],
+    budget_bytes: int,
+    base_threshold_deg: float,
+    orientation_split_threshold_deg: float,
+    cluster_func: Callable[..., list] = cluster_seestar_stacks_connected,
+    max_attempts: int = 6,
+) -> tuple[list[list[dict]], float, int] | None:
+    """Try to relax clustering threshold until all subgroups fit the RAM budget."""
+
+    if not group or len(group) <= 1:
+        return None
+    try:
+        current_thr = float(base_threshold_deg)
+    except Exception:
+        return None
+    if current_thr <= 0:
+        return None
+
+    for attempt in range(1, max_attempts + 1):
+        current_thr = max(current_thr * 0.7, 1e-5)
+        try:
+            reclustered = cluster_func(
+                group,
+                float(current_thr),
+                None,
+                orientation_split_threshold_deg=orientation_split_threshold_deg,
+            )
+        except Exception:
+            return None
+
+        if not reclustered or len(reclustered) <= 1:
+            continue
+
+        fits_budget = True
+        for sub in reclustered:
+            total_bytes, _, _, _ = _estimate_group_memory_bytes(sub)
+            if budget_bytes > 0 and total_bytes > budget_bytes:
+                fits_budget = False
+                break
+        if fits_budget:
+            return reclustered, float(current_thr), attempt
+
+    return None
+
+
+def _apply_ram_budget_to_groups(
+    groups: list[list[dict]],
+    budget_bytes: int,
+    base_threshold_deg: float,
+    orientation_split_threshold_deg: float,
+    cluster_func: Callable[..., list] = cluster_seestar_stacks_connected,
+) -> tuple[list[list[dict]], list[dict]]:
+    """Ensure each stack group fits in the RAM budget by splitting or re-clustering."""
+
+    if budget_bytes is None or budget_bytes <= 0:
+        return groups, []
+
+    final_groups: list[list[dict]] = []
+    adjustments: list[dict] = []
+    queue: list[tuple[int, list[dict]]] = [(idx + 1, grp) for idx, grp in enumerate(groups)]
+
+    while queue:
+        group_index, group = queue.pop(0)
+        total_bytes, per_frame_bytes, _, _ = _estimate_group_memory_bytes(group)
+
+        if total_bytes <= 0 or total_bytes <= budget_bytes:
+            final_groups.append(group)
+            continue
+
+        if len(group) == 1:
+            # Nothing else can be done; log and proceed.
+            adjustments.append(
+                {
+                    "method": "single_over_budget",
+                    "group_index": group_index,
+                    "original_frames": len(group),
+                    "estimated_mb": total_bytes / (1024 ** 2),
+                    "budget_mb": budget_bytes / (1024 ** 2),
+                }
+            )
+            final_groups.append(group)
+            continue
+
+        recluster_result = _attempt_recluster_for_budget(
+            group,
+            budget_bytes,
+            base_threshold_deg,
+            orientation_split_threshold_deg,
+            cluster_func=cluster_func,
+        )
+        if recluster_result:
+            reclustered_groups, new_threshold, attempts = recluster_result
+            adjustments.append(
+                {
+                    "method": "recluster",
+                    "group_index": group_index,
+                    "original_frames": len(group),
+                    "num_subgroups": len(reclustered_groups),
+                    "new_threshold_deg": new_threshold,
+                    "attempts": attempts,
+                    "estimated_mb": total_bytes / (1024 ** 2),
+                    "budget_mb": budget_bytes / (1024 ** 2),
+                }
+            )
+            queue = [(group_index, sub) for sub in reclustered_groups] + queue
+            continue
+
+        if per_frame_bytes <= 0:
+            # Unable to infer size; keep original group.
+            final_groups.append(group)
+            continue
+
+        max_frames = max(1, int(budget_bytes // per_frame_bytes))
+        if max_frames >= len(group):
+            final_groups.append(group)
+            continue
+
+        segmented = _split_group_temporally(group, max_frames)
+        still_over = any(_estimate_group_memory_bytes(seg)[0] > budget_bytes for seg in segmented)
+        adjustments.append(
+            {
+                "method": "split",
+                "group_index": group_index,
+                "original_frames": len(group),
+                "num_subgroups": len(segmented),
+                "segment_size": max_frames,
+                "estimated_mb": total_bytes / (1024 ** 2),
+                "budget_mb": budget_bytes / (1024 ** 2),
+                "still_over_budget": still_over,
+            }
+        )
+        queue = [(group_index, seg) for seg in segmented] + queue
+
+    return final_groups, adjustments
+
+
 # --- Configuration du Logging ---
 logger = logging.getLogger("ZeMosaicWorker")
 if not logger.handlers:
@@ -264,7 +988,10 @@ try: import zemosaic_astrometry; ZEMOSAIC_ASTROMETRY_AVAILABLE = True; logger.in
 except ImportError as e: logger.error(f"Import 'zemosaic_astrometry.py' échoué: {e}.")
 try: import zemosaic_align_stack; ZEMOSAIC_ALIGN_STACK_AVAILABLE = True; logger.info("Module 'zemosaic_align_stack' importé.")
 except ImportError as e: logger.error(f"Import 'zemosaic_align_stack.py' échoué: {e}.")
-from .solver_settings import SolverSettings
+try:
+    from .solver_settings import SolverSettings  # type: ignore
+except ImportError:
+    from solver_settings import SolverSettings  # type: ignore
 
 # Optional configuration import for GPU toggle
 try:
@@ -512,6 +1239,113 @@ def _log_alignment_warning_summary():
         if count:
             human = ALIGN_WARNING_SUMMARY.get(key, key)
             logger.info("%d frame(s) - %s", count, human)
+
+
+def _auto_crop_mosaic_to_valid_region(
+    mosaic: np.ndarray,
+    coverage: np.ndarray | None,
+    output_wcs,
+    log_callback=None,
+    threshold: float = 1e-6,
+):
+    """Crop blank borders from the mosaic using the coverage map.
+
+    Parameters
+    ----------
+    mosaic : np.ndarray
+        Final stacked mosaic with shape ``(H, W, C)``.
+    coverage : np.ndarray | None
+        Coverage/weight map returned by ``reproject_and_coadd``.
+    output_wcs : astropy.wcs.WCS | Any
+        WCS object describing the mosaic; will be updated in-place if cropping occurs.
+    log_callback : callable | None
+        Optional callback used to emit log messages (same signature as ``_pcb``).
+    threshold : float
+        Minimum coverage value considered as valid data when computing the crop bounds.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray | None]
+        Cropped mosaic and coverage arrays. If no cropping is necessary the
+        original inputs are returned unchanged.
+    """
+
+    if mosaic is None or coverage is None:
+        return mosaic, coverage
+
+    try:
+        cov_array = np.asarray(coverage)
+    except Exception:
+        cov_array = coverage
+
+    if getattr(cov_array, "ndim", 0) != 2:
+        return mosaic, coverage
+
+    try:
+        valid_mask = np.asarray(cov_array) > float(threshold)
+    except Exception:
+        return mosaic, coverage
+
+    if not np.any(valid_mask):
+        return mosaic, coverage
+
+    rows = np.where(np.any(valid_mask, axis=1))[0]
+    cols = np.where(np.any(valid_mask, axis=0))[0]
+    if rows.size == 0 or cols.size == 0:
+        return mosaic, coverage
+
+    y_min, y_max = int(rows[0]), int(rows[-1]) + 1
+    x_min, x_max = int(cols[0]), int(cols[-1]) + 1
+
+    if (
+        y_min == 0
+        and x_min == 0
+        and y_max == mosaic.shape[0]
+        and x_max == mosaic.shape[1]
+    ):
+        return mosaic, coverage
+
+    cropped_mosaic = mosaic[y_min:y_max, x_min:x_max, ...]
+    cropped_coverage = coverage[y_min:y_max, x_min:x_max]
+
+    new_shape = tuple(int(v) for v in cropped_mosaic.shape)
+
+    if callable(log_callback):
+        try:
+            log_callback(
+                "ASM_REPROJ_COADD: Auto-cropped output to coverage bounds",
+                prog=None,
+                lvl="INFO_DETAIL",
+                y_bounds=f"{y_min}:{y_max}",
+                x_bounds=f"{x_min}:{x_max}",
+                new_shape=str(new_shape),
+            )
+        except Exception:
+            pass
+
+    try:
+        if hasattr(output_wcs, "wcs") and getattr(output_wcs, "wcs") is not None:
+            if hasattr(output_wcs.wcs, "crpix") and output_wcs.wcs.crpix is not None:
+                output_wcs.wcs.crpix[0] -= float(x_min)
+                output_wcs.wcs.crpix[1] -= float(y_min)
+            if hasattr(output_wcs.wcs, "naxis1"):
+                output_wcs.wcs.naxis1 = int(new_shape[1])
+            if hasattr(output_wcs.wcs, "naxis2"):
+                output_wcs.wcs.naxis2 = int(new_shape[0])
+    except Exception:
+        pass
+
+    for attr, val in (
+        ("pixel_shape", (int(new_shape[1]), int(new_shape[0]))),
+        ("array_shape", (int(new_shape[0]), int(new_shape[1]))),
+    ):
+        if hasattr(output_wcs, attr):
+            try:
+                setattr(output_wcs, attr, val)
+            except Exception:
+                pass
+
+    return cropped_mosaic, cropped_coverage
 
 
 def _wait_for_memmap_files(prefixes, timeout=10.0):
@@ -1344,13 +2178,20 @@ def create_master_tile(
     astap_sensitivity_global: int,
     astap_timeout_seconds_global: int,
     winsor_pool_workers: int,
-    progress_callback: callable
+    progress_callback: callable,
+    resource_strategy: dict | None = None,
 ):
     """
     Crée une "master tuile" à partir d'un groupe d'images.
     Lit les données image prétraitées depuis un cache disque (.npy).
     Utilise les WCS et Headers déjà résolus et stockés en mémoire.
     Transmet toutes les options de stacking, y compris la pondération radiale.
+
+    Returns
+    -------
+    tuple[tuple[str | None, object | None], list[list[dict]]]
+        - ``(path, wcs)`` du master stack produit (``None`` si échec).
+        - Liste de sous-groupes à retraiter (copie des ``raw_info`` pour les images non alignées).
     """
     pcb_tile = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(msg_key, prog, lvl, callback=progress_callback, **kwargs)
     # Load persistent configuration to forward GPU preference
@@ -1367,10 +2208,32 @@ def create_master_tile(
             setattr(zconfig, 'use_gpu', getattr(zconfig, 'use_gpu_phase5'))
     except Exception:
         pass
+    if resource_strategy:
+        try:
+            if resource_strategy.get('gpu_batch_hint'):
+                setattr(zconfig, 'gpu_batch_hint', int(resource_strategy.get('gpu_batch_hint')))
+            if 'memmap' in resource_strategy:
+                setattr(zconfig, 'stack_memmap_enabled', bool(resource_strategy.get('memmap')))
+            if resource_strategy.get('memmap_budget_mb') is not None:
+                setattr(zconfig, 'stack_memmap_budget_mb', resource_strategy.get('memmap_budget_mb'))
+        except Exception:
+            pass
+        try:
+            pcb_tile(
+                f"{func_id_log_base}_autocaps_hint",
+                prog=None,
+                lvl="INFO_DETAIL",
+                cap=resource_strategy.get('cap'),
+                memmap=resource_strategy.get('memmap'),
+                gpu_hint=resource_strategy.get('gpu_batch_hint'),
+            )
+        except Exception:
+            pass
     func_id_log_base = "mastertile"
 
-    pcb_tile(f"{func_id_log_base}_info_creation_started_from_cache", prog=None, lvl="INFO", 
+    pcb_tile(f"{func_id_log_base}_info_creation_started_from_cache", prog=None, lvl="INFO",
              num_raw=len(seestar_stack_group_info), tile_id=tile_id)
+    failed_groups_to_retry: list[list[dict]] = []
     pcb_tile(f"    {func_id_log_base}_{tile_id}: Options Stacking - Norm='{stack_norm_method}', "
              f"Weight='{stack_weight_method}' (RadialWeight={apply_radial_weight}), "
              f"Reject='{stack_reject_algo}', Combine='{stack_final_combine}'", prog=None, lvl="DEBUG")
@@ -1380,17 +2243,17 @@ def create_master_tile(
         if not ZEMOSAIC_UTILS_AVAILABLE: pcb_tile(f"{func_id_log_base}_error_utils_unavailable", prog=None, lvl="ERROR", tile_id=tile_id)
         if not ZEMOSAIC_ALIGN_STACK_AVAILABLE: pcb_tile(f"{func_id_log_base}_error_alignstack_unavailable", prog=None, lvl="ERROR", tile_id=tile_id)
         if not ASTROPY_AVAILABLE or not fits: pcb_tile(f"{func_id_log_base}_error_astropy_unavailable", prog=None, lvl="ERROR", tile_id=tile_id)
-        return None, None
+        return (None, None), failed_groups_to_retry
         
     if not seestar_stack_group_info: 
         pcb_tile(f"{func_id_log_base}_error_no_images_provided", prog=None, lvl="ERROR", tile_id=tile_id)
-        return None,None
+        return (None, None), failed_groups_to_retry
     
     # Choix de l'image de référence (généralement la première du groupe après tri ou la plus centrale)
     reference_image_index_in_group = 0 # Pourrait être plus sophistiqué à l'avenir
     if not (0 <= reference_image_index_in_group < len(seestar_stack_group_info)): 
         pcb_tile(f"{func_id_log_base}_error_invalid_ref_index", prog=None, lvl="ERROR", tile_id=tile_id, ref_idx=reference_image_index_in_group, group_size=len(seestar_stack_group_info))
-        return None,None
+        return (None, None), failed_groups_to_retry
     
     ref_info_for_tile = seestar_stack_group_info[reference_image_index_in_group]
     wcs_for_master_tile = ref_info_for_tile.get('wcs')
@@ -1399,7 +2262,7 @@ def create_master_tile(
 
     if not (wcs_for_master_tile and wcs_for_master_tile.is_celestial and header_dict_for_master_tile_base):
         pcb_tile(f"{func_id_log_base}_error_invalid_ref_wcs_header", prog=None, lvl="ERROR", tile_id=tile_id)
-        return None,None
+        return (None, None), failed_groups_to_retry
     
     # Conversion du dict en objet astropy.io.fits.Header pour la sauvegarde
     header_for_master_tile_base = fits.Header(header_dict_for_master_tile_base.cards if hasattr(header_dict_for_master_tile_base,'cards') else header_dict_for_master_tile_base)
@@ -1457,7 +2320,7 @@ def create_master_tile(
                  _PH3_CONCURRENCY_SEMAPHORE.release()
              except Exception:
                  pass
-             del tile_images_data_HWC_adu, tile_original_raw_headers; gc.collect(); return None, None
+             del tile_images_data_HWC_adu, tile_original_raw_headers; gc.collect(); return (None, None), failed_groups_to_retry
         except Exception as e_load_cache:
             pcb_tile(f"{func_id_log_base}_error_loading_cache", prog=None, lvl="ERROR", filename=os.path.basename(cached_image_file_path), error=str(e_load_cache), tile_id=tile_id)
             logger.error(f"Erreur chargement cache {cached_image_file_path} pour tuile {tile_id}", exc_info=True)
@@ -1469,9 +2332,9 @@ def create_master_tile(
     except Exception:
         pass
 
-    if not tile_images_data_HWC_adu: 
+    if not tile_images_data_HWC_adu:
         pcb_tile(f"{func_id_log_base}_error_no_valid_images_from_cache", prog=None, lvl="ERROR", tile_id=tile_id)
-        return None,None
+        return (None, None), failed_groups_to_retry
     # pcb_tile(f"{func_id_log_base}_info_loading_from_cache_finished", prog=None, lvl="DEBUG_DETAIL", num_loaded=len(tile_images_data_HWC_adu), tile_id=tile_id)
 
     # pcb_tile(f"{func_id_log_base}_info_intra_tile_alignment_started", prog=None, lvl="DEBUG_DETAIL", num_to_align=len(tile_images_data_HWC_adu), tile_id=tile_id)
@@ -1480,15 +2343,34 @@ def create_master_tile(
         _PH3_CONCURRENCY_SEMAPHORE.acquire()
     except Exception:
         pass
-    aligned_images_for_stack = zemosaic_align_stack.align_images_in_group(
-        image_data_list=tile_images_data_HWC_adu, 
-        reference_image_index=reference_image_index_in_group, 
+    aligned_images_for_stack, failed_alignment_indices = zemosaic_align_stack.align_images_in_group(
+        image_data_list=tile_images_data_HWC_adu,
+        reference_image_index=reference_image_index_in_group,
         progress_callback=progress_callback
     )
+    if failed_alignment_indices:
+        retry_group: list[dict] = []
+        for idx_fail in failed_alignment_indices:
+            if 0 <= idx_fail < len(seestar_stack_group_info):
+                raw_info = seestar_stack_group_info[idx_fail]
+                if isinstance(raw_info, dict):
+                    info_copy = dict(raw_info)
+                    current_retry = int(info_copy.get('retry_attempt', 0))
+                    info_copy['retry_attempt'] = current_retry + 1
+                    origin_chain = list(info_copy.get('retry_origin_chain', []))
+                    origin_chain.append(int(tile_id))
+                    info_copy['retry_origin_chain'] = origin_chain
+                else:
+                    info_copy = raw_info
+                retry_group.append(info_copy)
+        if retry_group:
+            failed_groups_to_retry.append(retry_group)
+
     del tile_images_data_HWC_adu; gc.collect()
-    
+
     valid_aligned_images = [img for img in aligned_images_for_stack if img is not None]
-    if aligned_images_for_stack: del aligned_images_for_stack # Libérer la liste originale après filtrage
+    if aligned_images_for_stack:
+        del aligned_images_for_stack # Libérer la liste originale après filtrage
 
     num_actually_aligned_for_header = len(valid_aligned_images)
     # pcb_tile(f"{func_id_log_base}_info_intra_tile_alignment_finished", prog=None, lvl="DEBUG_DETAIL", num_aligned=num_actually_aligned_for_header, tile_id=tile_id)
@@ -1499,7 +2381,7 @@ def create_master_tile(
             _PH3_CONCURRENCY_SEMAPHORE.release()
         except Exception:
             pass
-        return None,None
+        return (None, None), failed_groups_to_retry
     
     pcb_tile(f"{func_id_log_base}_info_stacking_started", prog=None, lvl="DEBUG_DETAIL", 
              num_to_stack=len(valid_aligned_images), tile_id=tile_id) # Les options sont loggées au début
@@ -1549,13 +2431,13 @@ def create_master_tile(
                                           # stack_aligned_images travaille sur ces arrays.
                                           # Il est bon de del ici.
 
-    if master_tile_stacked_HWC is None: 
+    if master_tile_stacked_HWC is None:
         pcb_tile(f"{func_id_log_base}_error_stacking_failed", prog=None, lvl="ERROR", tile_id=tile_id)
         try:
             _PH3_CONCURRENCY_SEMAPHORE.release()
         except Exception:
             pass
-        return None,None
+        return (None, None), failed_groups_to_retry
     
     pcb_tile(f"{func_id_log_base}_info_stacking_finished", prog=None, lvl="DEBUG_DETAIL", tile_id=tile_id, 
              shape=master_tile_stacked_HWC.shape)
@@ -1656,7 +2538,7 @@ def create_master_tile(
             _PH3_CONCURRENCY_SEMAPHORE.release()
         except Exception:
             pass
-        return temp_fits_filepath, wcs_for_master_tile
+        return (temp_fits_filepath, wcs_for_master_tile), failed_groups_to_retry
         
     except Exception as e_save_mt:
         pcb_tile(f"{func_id_log_base}_error_saving", prog=None, lvl="ERROR", tile_id=tile_id, error=str(e_save_mt))
@@ -1665,7 +2547,7 @@ def create_master_tile(
             _PH3_CONCURRENCY_SEMAPHORE.release()
         except Exception:
             pass
-        return None,None
+        return (None, None), failed_groups_to_retry
     finally:
         if 'master_tile_stacked_HWC' in locals() and master_tile_stacked_HWC is not None: 
             del master_tile_stacked_HWC
@@ -2399,6 +3281,13 @@ def assemble_final_mosaic_reproject_coadd(
         except Exception:
             pass
 
+    mosaic_data, coverage = _auto_crop_mosaic_to_valid_region(
+        mosaic_data,
+        coverage,
+        final_output_wcs,
+        log_callback=_pcb,
+    )
+
     # Defer memmap cleanup to Phase 6 after final save
 
     _log_memory_usage(progress_callback, "Fin assemble_final_mosaic_reproject_coadd")
@@ -2459,6 +3348,7 @@ def run_hierarchical_mosaic(
     cluster_target_groups_config: int,
     cluster_orientation_split_deg_config: float,
     progress_callback: callable,
+    stack_ram_budget_gb_config: float,
     stack_norm_method: str,
     stack_weight_method: str,
     stack_reject_algo: str,
@@ -2482,20 +3372,26 @@ def run_hierarchical_mosaic(
     coadd_cleanup_memmap_config: bool,
     assembly_process_workers_config: int,
     auto_limit_frames_per_master_tile_config: bool,
+    winsor_max_frames_per_pass_config: int,
     winsor_worker_limit_config: int,
     max_raw_per_master_tile_config: int,
     use_gpu_phase5: bool = False,
     gpu_id_phase5: int | None = None,
     logging_level_config: str = "INFO",
-    solver_settings: dict | None = None
+    solver_settings: dict | None = None,
+    skip_filter_ui: bool = False,
 ):
     """
     Orchestre le traitement de la mosaïque hiérarchique.
 
     Parameters
     ----------
+    winsor_max_frames_per_pass_config : int
+        Limite du nombre d'images traitées simultanément par le rejet Winsorized (0 = illimité).
     winsor_worker_limit_config : int
         Nombre maximal de workers pour la phase de rejet Winsorized.
+    stack_ram_budget_gb_config : float
+        Budget RAM (en Gio) autorisé pour le chargement d'un groupe de stacking (0 = illimité).
     """
     pcb = lambda msg_key, prog=None, lvl="INFO", **kwargs: _log_and_callback(msg_key, prog, lvl, callback=progress_callback, **kwargs)
 
@@ -2529,7 +3425,14 @@ def run_hierarchical_mosaic(
             if eta_seconds_total is not None and eta_seconds_total >= 0:
                 h, rem = divmod(int(eta_seconds_total), 3600); m, s = divmod(rem, 60)
                 eta_str = f"{h:02d}:{m:02d}:{s:02d}"
-            pcb(f"ETA_UPDATE:{eta_str}", prog=None, lvl="ETA_LEVEL") 
+            pcb(f"ETA_UPDATE:{eta_str}", prog=None, lvl="ETA_LEVEL")
+
+
+    resource_probe_info = _probe_system_resources(output_folder)
+    auto_caps_info: dict | None = None
+    auto_resource_strategy: dict = {}
+    phase0_header_items: list[dict] = []
+    phase0_lookup: dict[str, dict] = {}
 
 
     # Seuil de clustering : valeur de repli à 0.18° si l'option est absente ou non positive
@@ -2547,6 +3450,11 @@ def run_hierarchical_mosaic(
     except (TypeError, ValueError):
         orientation_split_thr = 0.0
     ORIENTATION_SPLIT_THRESHOLD_DEG = orientation_split_thr if orientation_split_thr > 0 else 0.0
+    try:
+        stack_ram_budget_gb = float(stack_ram_budget_gb_config or 0.0)
+    except (TypeError, ValueError):
+        stack_ram_budget_gb = 0.0
+    STACK_RAM_BUDGET_BYTES = int(stack_ram_budget_gb * (1024 ** 3)) if stack_ram_budget_gb > 0 else 0
     PROGRESS_WEIGHT_PHASE1_RAW_SCAN = 30; PROGRESS_WEIGHT_PHASE2_CLUSTERING = 5
     PROGRESS_WEIGHT_PHASE3_MASTER_TILES = 35; PROGRESS_WEIGHT_PHASE4_GRID_CALC = 5
     PROGRESS_WEIGHT_PHASE5_ASSEMBLY = 15; PROGRESS_WEIGHT_PHASE6_SAVE = 8
@@ -2616,8 +3524,15 @@ def run_hierarchical_mosaic(
     try:
         if os.path.exists(temp_image_cache_dir): shutil.rmtree(temp_image_cache_dir)
         os.makedirs(temp_image_cache_dir, exist_ok=True)
-    except OSError as e_mkdir_cache: 
+    except OSError as e_mkdir_cache:
         pcb("run_error_cache_dir_creation_failed", prog=None, lvl="ERROR", directory=temp_image_cache_dir, error=str(e_mkdir_cache)); return
+    try:
+        cache_probe = _probe_system_resources(temp_image_cache_dir)
+        for key, value in cache_probe.items():
+            if value is not None:
+                resource_probe_info[key] = value
+    except Exception:
+        pass
 
 # --- Phase 1 (Prétraitement et WCS) ---
     base_progress_phase1 = current_global_progress
@@ -2658,6 +3573,7 @@ def run_hierarchical_mosaic(
         pass
 
     # --- Phase 0 (Header-only scan + early filter) ---
+    skip_filter_ui = bool(skip_filter_ui)
     early_filter_enabled = True
     try:
         if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
@@ -2666,7 +3582,11 @@ def run_hierarchical_mosaic(
     except Exception:
         early_filter_enabled = True
 
-    if early_filter_enabled and ASTROPY_AVAILABLE and fits is not None:
+    if skip_filter_ui:
+        early_filter_enabled = False
+        pcb("log_filter_ui_skipped", prog=None, lvl="INFO_DETAIL")
+
+    if ASTROPY_AVAILABLE and fits is not None:
         pcb("Phase 0: header scan start", prog=None, lvl="INFO_DETAIL")
         t0_hscan = time.monotonic()
         header_items_for_filter = []
@@ -2677,9 +3597,7 @@ def run_hierarchical_mosaic(
             shp_hw = None
             center_sc = None
             try:
-                # Read only primary header
                 hdr = fits.getheader(fpath, 0)
-                # Infer shape from header if present
                 try:
                     nax1 = int(hdr.get("NAXIS1", 0))
                     nax2 = int(hdr.get("NAXIS2", 0))
@@ -2687,14 +3605,12 @@ def run_hierarchical_mosaic(
                         shp_hw = (nax2, nax1)
                 except Exception:
                     shp_hw = None
-                # Try to build a WCS
                 try:
                     w = WCS(hdr, naxis=2, relax=True) if WCS is not None else None
                     if w and getattr(w, "is_celestial", False):
                         wcs0 = w
                 except Exception:
                     wcs0 = None
-                # If no valid WCS, try to parse a center using existing astrometry logic
                 if wcs0 is None:
                     try:
                         if ZEMOSAIC_ASTROMETRY_AVAILABLE and zemosaic_astrometry and hasattr(zemosaic_astrometry, "extract_center_from_header"):
@@ -2715,100 +3631,107 @@ def run_hierarchical_mosaic(
                 header_items_for_filter.append(item)
                 num_scanned += 1
             except Exception:
-                # Skip silently; the filter UI will ignore items with no displayable info
                 header_items_for_filter.append({"path": fpath, "index": idx_file})
                 num_scanned += 1
         t1_hscan = time.monotonic()
         avg_t = (t1_hscan - t0_hscan) / max(1, num_scanned)
         pcb(f"Phase 0: header scan finished — files={num_scanned}, avg={avg_t:.4f}s/header", prog=None, lvl="DEBUG")
 
-        # Attempt to launch optional filter GUI on header-only items
-        try:
-            from zemosaic_filter_gui import launch_filter_interface
-            # Provide current clustering params so the filter UI reflects run settings
+        phase0_header_items = header_items_for_filter
+
+        if early_filter_enabled:
             try:
-                _init_overrides = {
-                    "cluster_panel_threshold": float(cluster_threshold_config),
-                    "cluster_target_groups": int(cluster_target_groups_config),
-                    "cluster_orientation_split_deg": float(cluster_orientation_split_deg_config),
-                }
-            except Exception:
-                _init_overrides = None
-            filter_ret = launch_filter_interface(header_items_for_filter, _init_overrides)
-            # New API: (filtered_items, accepted). Back-compat: may return only list.
-            accepted = True
-            filtered_items = None
-            overrides = None
-            if isinstance(filter_ret, tuple) and len(filter_ret) >= 1:
-                filtered_items = filter_ret[0]
-                if len(filter_ret) >= 2:
-                    try:
-                        accepted = bool(filter_ret[1])
-                    except Exception:
-                        accepted = True
-                if len(filter_ret) >= 3:
-                    try:
-                        overrides = filter_ret[2]
-                    except Exception:
-                        overrides = None
-            else:
-                filtered_items = filter_ret
-
-            # If user cancelled/closed the filter UI, abort the run gracefully
-            if not accepted:
-                pcb("log_key_processing_cancelled", prog=None, lvl="WARN")
-                return
-
-            # Guardrails: if UI returned nothing usable, keep original list
-            if filtered_items and isinstance(filtered_items, list):
-                sel_paths = set()
-                for it in filtered_items:
-                    p = it.get("path") or it.get("path_raw")
-                    if isinstance(p, str):
-                        sel_paths.add(p)
-                if sel_paths:
-                    # Preserve original ordering
-                    fits_file_paths = [p for p in fits_file_paths if p in sel_paths]
-                    num_total_raw_files = len(fits_file_paths)
-                    pcb(f"Phase 0: selection after filter = {num_total_raw_files} files", prog=None, lvl="INFO_DETAIL")
-
-            # Apply clustering parameter overrides (and inform GUI)
-            if isinstance(overrides, dict):
+                from zemosaic_filter_gui import launch_filter_interface
                 try:
-                    if 'cluster_panel_threshold' in overrides:
-                        new_thr = float(overrides['cluster_panel_threshold'])
-                        # Update effective threshold used later
-                        SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG = new_thr  # noqa: F841 (referenced later)
-                    if 'cluster_target_groups' in overrides:
-                        cluster_target_groups_config = int(overrides['cluster_target_groups'])  # noqa: F841
-                    if 'cluster_orientation_split_deg' in overrides:
-                        try:
-                            ORIENTATION_SPLIT_THRESHOLD_DEG = float(overrides['cluster_orientation_split_deg'])  # noqa: F841
-                        except Exception:
-                            ORIENTATION_SPLIT_THRESHOLD_DEG = 0.0  # noqa: F841
-                    # Notify GUI to update its controls
-                    try:
-                        thr_str = f"{float(overrides.get('cluster_panel_threshold', SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG)):.6f}"
-                    except Exception:
-                        thr_str = ""
-                    try:
-                        tgt_str = str(int(overrides.get('cluster_target_groups', cluster_target_groups_config)))
-                    except Exception:
-                        tgt_str = ""
-                    # Orientation split info (optional)
-                    try:
-                        ori_str = f"{float(overrides.get('cluster_orientation_split_deg', ORIENTATION_SPLIT_THRESHOLD_DEG)):.2f}"
-                    except Exception:
-                        ori_str = ""
-                    if thr_str or tgt_str or ori_str:
-                        pcb(f"CLUSTER_OVERRIDE:panel={thr_str};target={tgt_str};orient={ori_str}", prog=None, lvl="INFO_DETAIL")
+                    _init_overrides = {
+                        "cluster_panel_threshold": float(cluster_threshold_config),
+                        "cluster_target_groups": int(cluster_target_groups_config),
+                        "cluster_orientation_split_deg": float(cluster_orientation_split_deg_config),
+                    }
                 except Exception:
-                    pass
-        except ImportError:
-            # Optional UI absent: continue untouched
-            pass
-        except Exception as e_opt0:
-            logger.warning(f"Early filter UI disabled due to error: {e_opt0}")
+                    _init_overrides = None
+                filter_ret = launch_filter_interface(header_items_for_filter, _init_overrides)
+                accepted = True
+                filtered_items = None
+                overrides = None
+                if isinstance(filter_ret, tuple) and len(filter_ret) >= 1:
+                    filtered_items = filter_ret[0]
+                    if len(filter_ret) >= 2:
+                        try:
+                            accepted = bool(filter_ret[1])
+                        except Exception:
+                            accepted = True
+                    if len(filter_ret) >= 3:
+                        overrides = filter_ret[2]
+                elif isinstance(filter_ret, list):
+                    filtered_items = filter_ret
+                if overrides:
+                    try:
+                        if "cluster_panel_threshold" in overrides:
+                            cluster_threshold_config = overrides["cluster_panel_threshold"]
+                            pcb("clusterstacks_info_override_threshold", prog=None, lvl="INFO_DETAIL", value=cluster_threshold_config)
+                        if "cluster_target_groups" in overrides:
+                            cluster_target_groups_config = overrides["cluster_target_groups"]
+                            pcb("clusterstacks_info_override_target_groups", prog=None, lvl="INFO_DETAIL", value=cluster_target_groups_config)
+                        if "cluster_orientation_split_deg" in overrides:
+                            cluster_orientation_split_deg_config = overrides["cluster_orientation_split_deg"]
+                            pcb("clusterstacks_info_override_orientation_split", prog=None, lvl="INFO_DETAIL", value=cluster_orientation_split_deg_config)
+                    except Exception:
+                        pass
+                if not accepted:
+                    pcb("run_warn_phase0_filter_cancelled", prog=None, lvl="WARN")
+                    return
+                if filtered_items is not None:
+                    fits_file_paths = [item["path"] for item in filtered_items if isinstance(item, dict) and item.get("path")]
+                    pcb(f"Phase 0: selection after filter = {len(fits_file_paths)} files", prog=None, lvl="INFO_DETAIL")
+                    try:
+                        fits_file_paths.sort(key=lambda p: p.lower())
+                    except Exception:
+                        fits_file_paths.sort()
+            except ImportError:
+                pcb("Phase 0: filter GUI not available", prog=None, lvl="DEBUG_DETAIL")
+            except Exception as e_filter:
+                pcb(f"Phase 0 filter UI failed: {e_filter}", prog=None, lvl="WARN")
+        else:
+            pcb("Phase 0: header scan completed (filter UI disabled)", prog=None, lvl="DEBUG_DETAIL")
+    else:
+        pcb("Phase 0: header scan unavailable (Astropy missing)", prog=None, lvl="WARN")
+
+    phase0_lookup = {item["path"]: item for item in phase0_header_items if isinstance(item, dict) and item.get("path")}
+    per_frame_info = _estimate_per_frame_cost_mb(phase0_header_items)
+    auto_caps_info = _compute_auto_tile_caps(
+        resource_probe_info,
+        per_frame_info,
+        policy_max=50,
+        policy_min=8,
+        user_max_override=int(max_raw_per_master_tile_config) if max_raw_per_master_tile_config else None,
+    )
+    try:
+        msg = (
+            "AutoCaps: per_frame≈{pf:.1f} MB, RAM_free≈{rf:.0f} MB → "
+            "frames_by_ram={fbr}, cap={cap}, memmap={mm}, GPUHint={gpu}, parallel={par}".format(
+                pf=auto_caps_info.get("per_frame_mb", 0.0),
+                rf=resource_probe_info.get("ram_available_mb", 0.0) or 0.0,
+                fbr=auto_caps_info.get("frames_by_ram", 0),
+                cap=auto_caps_info.get("cap"),
+                mm="on" if auto_caps_info.get("memmap") else "off",
+                gpu=auto_caps_info.get("gpu_batch_hint") or "n/a",
+                par=auto_caps_info.get("parallel_groups", 1),
+            )
+        )
+        _log_and_callback(msg, prog=None, lvl="INFO_DETAIL", callback=progress_callback)
+    except Exception:
+        pass
+    auto_resource_strategy = {
+        "cap": auto_caps_info.get("cap"),
+        "min_cap": auto_caps_info.get("min_cap"),
+        "memmap": auto_caps_info.get("memmap"),
+        "memmap_budget_mb": auto_caps_info.get("memmap_budget_mb"),
+        "gpu_batch_hint": auto_caps_info.get("gpu_batch_hint"),
+        "parallel_groups": auto_caps_info.get("parallel_groups"),
+        "per_frame_mb": auto_caps_info.get("per_frame_mb"),
+    }
+
     
     # --- Détermination du nombre de workers de BASE ---
     effective_base_workers = 0
@@ -2897,13 +3820,25 @@ def run_hierarchical_mosaic(
                         try:
                             np.save(cached_image_path, img_data_adu)
                             # Stocker les informations pour les phases suivantes
-                            all_raw_files_processed_info_dict[file_path_original] = {
+                            entry = {
                                 'path_raw': file_path_original,
                                 'path_preprocessed_cache': cached_image_path,
                                 'path_hotpix_mask': hp_mask_path,
                                 'wcs': wcs_obj_solved,
                                 'header': header_obj_updated,
+                                'preprocessed_shape': tuple(int(dim) for dim in getattr(img_data_adu, 'shape', []) or ()),
                             }
+                            meta = phase0_lookup.get(file_path_original)
+                            if isinstance(meta, dict):
+                                if 'index' in meta:
+                                    entry['phase0_index'] = meta.get('index')
+                                if 'center' in meta:
+                                    entry['phase0_center'] = meta.get('center')
+                                if 'shape' in meta:
+                                    entry['phase0_shape'] = meta.get('shape')
+                                if 'wcs' in meta and 'wcs' not in entry:
+                                    entry['phase0_wcs'] = meta.get('wcs')
+                            all_raw_files_processed_info_dict[file_path_original] = entry
                         except Exception as e_save_npy:
                             pcb(
                                 "run_error_phase1_save_npy_failed",
@@ -3015,6 +3950,62 @@ def run_hierarchical_mosaic(
         progress_callback,
         orientation_split_threshold_deg=ORIENTATION_SPLIT_THRESHOLD_DEG,
     )
+    if STACK_RAM_BUDGET_BYTES > 0 and seestar_stack_groups:
+        seestar_stack_groups, ram_budget_adjustments = _apply_ram_budget_to_groups(
+            seestar_stack_groups,
+            STACK_RAM_BUDGET_BYTES,
+            float(SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG),
+            float(ORIENTATION_SPLIT_THRESHOLD_DEG),
+        )
+        for adj in ram_budget_adjustments:
+            method = adj.get("method")
+            if method == "recluster":
+                _log_and_callback(
+                    "clusterstacks_warn_ram_budget_recluster",
+                    prog=None,
+                    lvl="WARN",
+                    callback=progress_callback,
+                    group_index=adj.get("group_index"),
+                    original_frames=adj.get("original_frames"),
+                    num_subgroups=adj.get("num_subgroups"),
+                    new_threshold_deg=adj.get("new_threshold_deg"),
+                    attempts=adj.get("attempts"),
+                    estimated_mb=adj.get("estimated_mb"),
+                    budget_mb=adj.get("budget_mb"),
+                )
+            elif method == "split":
+                _log_and_callback(
+                    "clusterstacks_warn_ram_budget_split",
+                    prog=None,
+                    lvl="WARN",
+                    callback=progress_callback,
+                    group_index=adj.get("group_index"),
+                    original_frames=adj.get("original_frames"),
+                    num_subgroups=adj.get("num_subgroups"),
+                    segment_size=adj.get("segment_size"),
+                    estimated_mb=adj.get("estimated_mb"),
+                    budget_mb=adj.get("budget_mb"),
+                )
+                if adj.get("still_over_budget"):
+                    _log_and_callback(
+                        "clusterstacks_warn_ram_budget_split_still_over",
+                        prog=None,
+                        lvl="WARN",
+                        callback=progress_callback,
+                        group_index=adj.get("group_index"),
+                        segment_size=adj.get("segment_size"),
+                        budget_mb=adj.get("budget_mb"),
+                    )
+            elif method == "single_over_budget":
+                _log_and_callback(
+                    "clusterstacks_warn_ram_budget_single_over",
+                    prog=None,
+                    lvl="WARN",
+                    callback=progress_callback,
+                    group_index=adj.get("group_index"),
+                    estimated_mb=adj.get("estimated_mb"),
+                    budget_mb=adj.get("budget_mb"),
+                )
     # Diagnostic: nearest-neighbor separation percentiles to help tune eps
     try:
         panel_centers_sky_dbg = []
@@ -3255,6 +4246,32 @@ def run_hierarchical_mosaic(
     if not seestar_stack_groups:
         pcb("run_error_phase2_no_groups", prog=(base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING), lvl="ERROR")
         return
+    if auto_caps_info and seestar_stack_groups:
+        try:
+            cap_value = int(auto_caps_info.get("cap", 0))
+            min_value = int(auto_caps_info.get("min_cap", 8))
+        except Exception:
+            cap_value = 0
+            min_value = 8
+        if cap_value > 0:
+            original_count = len(seestar_stack_groups)
+            seestar_stack_groups = _auto_split_groups(
+                seestar_stack_groups,
+                cap_value,
+                min_value,
+                progress_callback=progress_callback,
+            )
+            if len(seestar_stack_groups) != original_count:
+                try:
+                    _log_and_callback(
+                        f"AutoSplit summary: {original_count} -> {len(seestar_stack_groups)} subgroup(s) (cap={cap_value})",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                        callback=progress_callback,
+                    )
+                except Exception:
+                    pass
+
     # Do not subdivide groups if a target group count is set; respect clustering first.
     if (cluster_target_groups_config is None or int(cluster_target_groups_config) <= 0) and \
        max_raw_per_master_tile_config and max_raw_per_master_tile_config > 0:
@@ -3274,6 +4291,7 @@ def run_hierarchical_mosaic(
         seestar_stack_groups = new_groups
     cpu_total = os.cpu_count() or 1
     winsor_worker_limit = max(1, min(int(winsor_worker_limit_config), cpu_total))
+    winsor_max_frames_per_pass = max(0, int(winsor_max_frames_per_pass_config))
     pcb(
         f"Winsor worker limit set to {winsor_worker_limit}" + (
             " (ProcessPoolExecutor enabled)" if winsor_worker_limit > 1 else ""
@@ -3281,6 +4299,12 @@ def run_hierarchical_mosaic(
         prog=None,
         lvl="INFO",
     )
+    if winsor_max_frames_per_pass > 0:
+        pcb(
+            f"Winsor streaming limit set to {winsor_max_frames_per_pass} frame(s) per pass",
+            prog=None,
+            lvl="INFO_DETAIL",
+        )
     manual_limit = max_raw_per_master_tile_config
     if (cluster_target_groups_config is None or int(cluster_target_groups_config) <= 0) and auto_limit_frames_per_master_tile_config:
         try:
@@ -3400,6 +4424,16 @@ def run_hierarchical_mosaic(
             pass
 
 
+    try:
+        setattr(zconfig, "winsor_worker_limit", int(winsor_worker_limit))
+    except Exception:
+        pass
+    try:
+        setattr(zconfig, "winsor_max_frames_per_pass", int(winsor_max_frames_per_pass))
+    except Exception:
+        pass
+
+
 
     # --- Phase 3 (Création Master Tuiles) ---
     base_progress_phase3 = current_global_progress
@@ -3422,6 +4456,24 @@ def run_hierarchical_mosaic(
         num_seestar_stacks_to_process,
         ALIGNMENT_PHASE_WORKER_RATIO,
     )
+    if auto_caps_info:
+        try:
+            parallel_cap = int(auto_caps_info.get("parallel_groups", 0))
+        except Exception:
+            parallel_cap = 0
+        if parallel_cap > 0:
+            prev_workers = actual_num_workers_ph3
+            actual_num_workers_ph3 = max(1, min(actual_num_workers_ph3, parallel_cap))
+            if actual_num_workers_ph3 != prev_workers:
+                try:
+                    _log_and_callback(
+                        f"AutoCaps: Phase 3 worker cap {prev_workers} -> {actual_num_workers_ph3} (parallel limit)",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                        callback=progress_callback,
+                    )
+                except Exception:
+                    pass
     # On Windows, cap Phase 3 concurrency to reduce I/O + CPU contention
     if os.name == 'nt':
         actual_num_workers_ph3 = max(1, min(actual_num_workers_ph3, 4))
@@ -3551,11 +4603,15 @@ def run_hierarchical_mosaic(
     
     executor_ph3 = ThreadPoolExecutor(max_workers=actual_num_workers_ph3, thread_name_prefix="ZeMosaic_Ph3_")
 
-    future_to_group_index = {
-        executor_ph3.submit(
+    future_to_tile_id: dict = {}
+    pending_futures: set = set()
+    next_dynamic_tile_id = num_seestar_stacks_to_process
+
+    def _submit_master_tile_group(group_info_list: list[dict], assigned_tile_id: int) -> None:
+        future = executor_ph3.submit(
             create_master_tile,
-            sg_info_list,
-            i_stk,  # tile_id
+            group_info_list,
+            assigned_tile_id,
             temp_master_tile_storage_dir,
             stack_norm_method, stack_weight_method, stack_reject_algo,
             stack_kappa_low, stack_kappa_high, parsed_winsor_limits,
@@ -3563,26 +4619,35 @@ def run_hierarchical_mosaic(
             apply_radial_weight_config, radial_feather_fraction_config,
             radial_shape_power_config, min_radial_weight_floor_config,
             astap_exe_path, astap_data_dir_param, astap_search_radius_config,
-            astap_downsample_config, astap_sensitivity_config, 180,  # timeout ASTAP
+            astap_downsample_config, astap_sensitivity_config, 180,
             winsor_worker_limit,
-            progress_callback
-        ): i_stk for i_stk, sg_info_list in enumerate(seestar_stack_groups)
-    }
+            progress_callback,
+            resource_strategy=auto_resource_strategy,
+        )
+        future_to_tile_id[future] = assigned_tile_id
+        pending_futures.add(future)
+
+    for i_stk, sg_info_list in enumerate(seestar_stack_groups):
+        _submit_master_tile_group(sg_info_list, i_stk)
 
     start_time_loop_ph3 = time.time()
     last_time_loop_ph3 = start_time_loop_ph3
     step_times_ph3 = []
 
-    for future in as_completed(future_to_group_index):
-            
-            group_index_original = future_to_group_index[future]
+    while pending_futures:
+        done_futures, _ = wait(pending_futures, return_when=FIRST_COMPLETED)
+        for future in done_futures:
+            pending_futures.discard(future)
+            tile_id_for_future = future_to_tile_id.pop(future, None)
+            if tile_id_for_future is None:
+                continue
             tiles_processed_count_ph3 += 1
-            
-            # --- ENVOYER LA MISE À JOUR DU COMPTEUR DE TUILES ---
+
             pcb(f"MASTER_TILE_COUNT_UPDATE:{tiles_processed_count_ph3}/{num_seestar_stacks_to_process}", prog=None, lvl="ETA_LEVEL")
-            # --- FIN ENVOI MISE À JOUR ---
-            
-            prog_step_phase3 = base_progress_phase3 + int(PROGRESS_WEIGHT_PHASE3_MASTER_TILES * (tiles_processed_count_ph3 / max(1, num_seestar_stacks_to_process)))
+
+            prog_step_phase3 = base_progress_phase3 + int(
+                PROGRESS_WEIGHT_PHASE3_MASTER_TILES * (tiles_processed_count_ph3 / max(1, num_seestar_stacks_to_process))
+            )
             if progress_callback:
                 try:
                     progress_callback("phase3_master_tiles", tiles_processed_count_ph3, num_seestar_stacks_to_process)
@@ -3592,19 +4657,82 @@ def run_hierarchical_mosaic(
             now = time.time()
             step_times_ph3.append(now - last_time_loop_ph3)
             last_time_loop_ph3 = now
+
             try:
-                mt_result_path, mt_result_wcs = future.result()
-                if mt_result_path and mt_result_wcs: 
-                    master_tiles_results_list_temp[group_index_original] = (mt_result_path, mt_result_wcs)
-                else: 
-                    pcb("run_warn_phase3_master_tile_creation_failed_thread", prog=prog_step_phase3, lvl="WARN", stack_num=group_index_original + 1)
-            except Exception as exc_thread_ph3: 
-                pcb("run_error_phase3_thread_exception", prog=prog_step_phase3, lvl="ERROR", stack_num=group_index_original + 1, error=str(exc_thread_ph3))
-                logger.error(f"Exception Phase 3 pour stack {group_index_original + 1}:", exc_info=True)
-            
-            if tiles_processed_count_ph3 % max(1, num_seestar_stacks_to_process // 5) == 0 or tiles_processed_count_ph3 == num_seestar_stacks_to_process : 
+                main_result, retry_groups = future.result()
+                mt_result_path, mt_result_wcs = (main_result or (None, None))
+                if mt_result_path and mt_result_wcs:
+                    master_tiles_results_list_temp[tile_id_for_future] = (mt_result_path, mt_result_wcs)
+                else:
+                    pcb(
+                        "run_warn_phase3_master_tile_creation_failed_thread",
+                        prog=prog_step_phase3,
+                        lvl="WARN",
+                        stack_num=int(tile_id_for_future) + 1,
+                    )
+                if retry_groups:
+                    for retry_group in retry_groups:
+                        if not retry_group:
+                            continue
+                        filtered_retry_group: list[dict] = []
+                        dropped_infos: list[dict] = []
+                        for raw_info in retry_group:
+                            if isinstance(raw_info, dict):
+                                attempts = int(raw_info.get('retry_attempt', 0))
+                                if attempts > MAX_ALIGNMENT_RETRY_ATTEMPTS:
+                                    dropped_infos.append(raw_info)
+                                    continue
+                            filtered_retry_group.append(raw_info)
+                        for dropped in dropped_infos:
+                            try:
+                                filename = os.path.basename(dropped.get('path_raw', 'UnknownRaw'))
+                            except Exception:
+                                filename = str(dropped)
+                            pcb(
+                                "run_warn_phase3_alignment_retry_abandoned",
+                                prog=None,
+                                lvl="WARN",
+                                tile_id=int(tile_id_for_future),
+                                filename=filename,
+                                attempts=int(dropped.get('retry_attempt', 0)) if isinstance(dropped, dict) else None,
+                            )
+                        if not filtered_retry_group:
+                            continue
+                        new_tile_id = next_dynamic_tile_id
+                        next_dynamic_tile_id += 1
+                        num_seestar_stacks_to_process += 1
+                        pcb(
+                            "run_info_phase3_retry_submitted",
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                            origin_tile=int(tile_id_for_future),
+                            new_tile=new_tile_id,
+                            frames=len(filtered_retry_group),
+                        )
+                        _submit_master_tile_group(filtered_retry_group, new_tile_id)
+                        pcb(
+                            f"MASTER_TILE_COUNT_UPDATE:{tiles_processed_count_ph3}/{num_seestar_stacks_to_process}",
+                            prog=None,
+                            lvl="ETA_LEVEL",
+                        )
+                        if progress_callback:
+                            try:
+                                progress_callback("phase3_master_tiles", tiles_processed_count_ph3, num_seestar_stacks_to_process)
+                            except Exception:
+                                pass
+            except Exception as exc_thread_ph3:
+                pcb(
+                    "run_error_phase3_thread_exception",
+                    prog=prog_step_phase3,
+                    lvl="ERROR",
+                    stack_num=int(tile_id_for_future) + 1,
+                    error=str(exc_thread_ph3),
+                )
+                logger.error(f"Exception Phase 3 pour stack {int(tile_id_for_future) + 1}:", exc_info=True)
+
+            if tiles_processed_count_ph3 % max(1, num_seestar_stacks_to_process // 5) == 0 or tiles_processed_count_ph3 == num_seestar_stacks_to_process:
                  _log_memory_usage(progress_callback, f"Phase 3 - Traité {tiles_processed_count_ph3}/{num_seestar_stacks_to_process} tuiles")
-            
+
             elapsed_phase3 = time.monotonic() - start_time_phase3
             time_per_master_tile_creation = elapsed_phase3 / max(1, tiles_processed_count_ph3)
             eta_phase3_sec = (num_seestar_stacks_to_process - tiles_processed_count_ph3) * time_per_master_tile_creation
@@ -3877,7 +5005,7 @@ def run_hierarchical_mosaic(
         try: final_header.update(final_output_wcs.to_header(relax=True))
         except Exception as e_hdr_wcs: pcb("run_warn_phase6_wcs_to_header_failed", error=str(e_hdr_wcs), lvl="WARN")
     
-    final_header['SOFTWARE']=('ZeMosaic v2.8.0','Mosaic Software') # Incrémente la version si tu le souhaites
+    final_header['SOFTWARE']=('ZeMosaic v2.9.1','Mosaic Software') # Incrémente la version si tu le souhaites
     final_header['NMASTILE']=(len(master_tiles_results_list),"Master Tiles combined")
     final_header['NRAWINIT']=(num_total_raw_files,"Initial raw images found")
     final_header['NRAWPROC']=(len(all_raw_files_processed_info),"Raw images with WCS processed")
@@ -4121,7 +5249,21 @@ def run_hierarchical_mosaic_process(
     # Insert the process queue callback in the expected position (after
     # cluster threshold, target group count, and orientation split parameter).
     # With the current signature, progress_callback is the 11th positional arg.
-    full_args = args[:10] + (queue_callback,) + args[10:]
+    if len(args) > 10:
+        candidate = args[10]
+        if callable(candidate):
+            # Replace the provided callback without disturbing other
+            # positional arguments.
+            full_args = args[:10] + (queue_callback,) + args[11:]
+        else:
+            # No callback was supplied: insert ours in the expected slot so
+            # that subsequent parameters keep their intended positions.
+            full_args = args[:10] + (queue_callback,) + args[10:]
+    else:
+        # Safety fallback: if the caller did not provide enough positional
+        # arguments to reach the callback slot, append ours so the worker
+        # still runs (mainly for CLI/debug scenarios).
+        full_args = args + (queue_callback,)
     try:
         run_hierarchical_mosaic(*full_args, solver_settings=solver_settings_dict, **kwargs)
     except Exception as e_proc:
