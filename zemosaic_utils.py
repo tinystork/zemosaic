@@ -935,9 +935,37 @@ def save_fits_image(image_data: np.ndarray,
             data_to_write_temp = image_data
         else:
             data_to_write_temp = image_data.astype(np.float32, copy=False)
+
+        # Ensure a zero floor for better viewer auto-stretch (ASI FITS View, etc.).
+        # Some viewers expect the black level to be at 0. If our mosaic carries a
+        # positive offset (e.g. min ~ 300–500 ADU), auto-stretch may miss the true
+        # background. Shift the baseline so the global finite minimum maps to 0.
+        try:
+            finite_min = float(np.nanmin(data_to_write_temp))
+            if np.isfinite(finite_min) and finite_min > 0.0:
+                _log_util_save(
+                    f"  SAVE_DEBUG: Positive baseline detected (min={finite_min:.3f}). Shifting to zero.",
+                    "INFO_DETAIL",
+                )
+                # Avoid mutating the caller's array when we didn't already make a copy
+                if data_to_write_temp is image_data:
+                    data_to_write_temp = data_to_write_temp.copy()
+                data_to_write_temp -= np.float32(finite_min)
+                # Guard against any numerical underflow
+                data_to_write_temp = np.maximum(data_to_write_temp, 0.0)
+        except Exception as _e_minshift:
+            # Non-fatal: keep original values if anything goes wrong
+            pass
+
+        # For float images keep the header simple; many viewers rely on missing BSCALE/BZERO
         final_header_to_write['BITPIX'] = -32
-        final_header_to_write['BSCALE'] = 1.0
-        final_header_to_write['BZERO'] = 0.0
+        if 'BSCALE' in final_header_to_write: del final_header_to_write['BSCALE']
+        if 'BZERO' in final_header_to_write: del final_header_to_write['BZERO']
+        # Several viewers misinterpret DATAMIN/DATAMAX on float images for their
+        # initial auto-stretch. Historically our best compatibility came from NOT
+        # writing these two cards for BITPIX=-32. Ensure they are absent.
+        if 'DATAMIN' in final_header_to_write: del final_header_to_write['DATAMIN']
+        if 'DATAMAX' in final_header_to_write: del final_header_to_write['DATAMAX']
         _log_util_save(f"  SAVE_DEBUG: (Float) data_to_write_temp: Range [{np.nanmin(data_to_write_temp):.3g}, {np.nanmax(data_to_write_temp):.3g}], IsFinite: {np.all(np.isfinite(data_to_write_temp))}", "WARN")
     else:
         min_in, max_in = np.nanmin(image_data), np.nanmax(image_data)
@@ -947,9 +975,13 @@ def save_fits_image(image_data: np.ndarray,
         elif np.any(np.isfinite(image_data)): image_normalized_01 = np.full_like(image_data, 0.5, dtype=np.float32)
         
         image_clipped_01 = np.clip(image_normalized_01, 0.0, 1.0)
-        data_to_write_temp = (image_clipped_01 * 65535.0).astype(np.uint16)
+        # Prepare unsigned 16-bit physical range [0, 65535]
+        data_u16_phys = (image_clipped_01 * 65535.0).astype(np.uint16)
+        # Store as FITS signed int16 with BZERO=32768 as per FITS convention
+        # raw_int16 = physical - 32768 in range [-32768, 32767]
+        data_to_write_temp = (data_u16_phys.astype(np.int32) - 32768).clip(-32768, 32767).astype(np.int16)
         final_header_to_write['BITPIX'] = 16; final_header_to_write['BSCALE'] = 1; final_header_to_write['BZERO'] = 32768
-        _log_util_save(f"  SAVE_DEBUG: (Uint16) data_to_write_temp: Range [{np.min(data_to_write_temp)}, {np.max(data_to_write_temp)}]", "WARN")
+        _log_util_save(f"  SAVE_DEBUG: (Int16+BZERO) raw data range [{np.min(data_to_write_temp)}, {np.max(data_to_write_temp)}] (phys 0..65535)", "WARN")
 
     data_for_hdu_cxhxw = None
     is_color = data_to_write_temp.ndim == 3 and data_to_write_temp.shape[-1] == 3
@@ -993,6 +1025,22 @@ def save_fits_image(image_data: np.ndarray,
     try:
         _log_util_save(f"SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: {np.nanmin(data_for_hdu_cxhxw)}, Max: {np.nanmax(data_for_hdu_cxhxw)}, Mean: {np.nanmean(data_for_hdu_cxhxw)}, Std: {np.nanstd(data_for_hdu_cxhxw)}, Dtype: {data_for_hdu_cxhxw.dtype}, Finite: {np.all(np.isfinite(data_for_hdu_cxhxw))}", "ERROR")
         
+        # Add DATAMIN/DATAMAX based on physical values expected by viewers
+        try:
+            if save_as_float:
+                # Do not write DATAMIN/DATAMAX for float output to avoid confusing auto-stretchers
+                for k in ('DATAMIN', 'DATAMAX'):
+                    if k in final_header_to_write:
+                        del final_header_to_write[k]
+            else:
+                # Convert raw int16 back to physical for header statistics
+                phys_min = float(np.nanmin(data_for_hdu_cxhxw.astype(np.int32) + 32768))
+                phys_max = float(np.nanmax(data_for_hdu_cxhxw.astype(np.int32) + 32768))
+                final_header_to_write['DATAMIN'] = phys_min
+                final_header_to_write['DATAMAX'] = phys_max
+        except Exception as _:
+            pass
+
         primary_hdu_object = current_fits_module.PrimaryHDU(data=data_for_hdu_cxhxw, header=final_header_to_write)
         
         _log_util_save(f"SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: {np.nanmin(primary_hdu_object.data)}, Max: {np.nanmax(primary_hdu_object.data)}, Mean: {np.nanmean(primary_hdu_object.data)}, Dtype: {primary_hdu_object.data.dtype}, Finite: {np.all(np.isfinite(primary_hdu_object.data))}", "ERROR")

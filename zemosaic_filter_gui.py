@@ -57,7 +57,9 @@ def launch_filter_interface(
         (filtered_list, accepted, overrides) where accepted is True only when
         Validate is clicked; False when Cancel is clicked or the window is closed.
         overrides contains user-chosen clustering parameters (or None):
-          {"cluster_panel_threshold": float, "cluster_target_groups": int}
+          {"cluster_panel_threshold": float,
+           "cluster_target_groups": int,
+           "cluster_orientation_split_deg": float}
     """
     # Early validation and fail-safe behavior
     if not isinstance(raw_files_with_wcs, list) or not raw_files_with_wcs:
@@ -87,6 +89,7 @@ def launch_filter_interface(
                 lang_code = cfg.get('language', 'en')
                 cfg_defaults['cluster_panel_threshold'] = float(cfg.get('cluster_panel_threshold', 0.08))
                 cfg_defaults['cluster_target_groups'] = int(cfg.get('cluster_target_groups', 0))
+                cfg_defaults['cluster_orientation_split_deg'] = float(cfg.get('cluster_orientation_split_deg', 0.0))
             except Exception:
                 lang_code = 'en'
 
@@ -269,7 +272,9 @@ def launch_filter_interface(
         main.rowconfigure(0, weight=1)
 
         # Matplotlib figure
-        fig = Figure(figsize=(7.0, 5.0), dpi=100)
+        # Use constrained_layout to reduce internal padding and let the
+        # figure adapt to the available space.
+        fig = Figure(figsize=(7.0, 5.0), dpi=100, constrained_layout=True)
         ax = fig.add_subplot(111)
         ax.set_xlabel(_tr(
             "filter_axis_ra_deg",
@@ -286,6 +291,45 @@ def launch_filter_interface(
         canvas = FigureCanvasTkAgg(fig, master=main)
         canvas_widget = canvas.get_tk_widget()
         canvas_widget.grid(row=0, column=0, sticky="nsew")
+
+        # Make the Matplotlib figure follow the widget size to avoid
+        # large empty borders around the plot.
+        def _apply_resize():
+            try:
+                w = max(50, int(canvas_widget.winfo_width()))
+                h = max(50, int(canvas_widget.winfo_height()))
+                # Resize figure in pixels -> inches
+                fig.set_size_inches(w / fig.dpi, h / fig.dpi, forward=True)
+                # Maximize axes area inside the figure
+                try:
+                    fig.subplots_adjust(left=0.06, right=0.995, bottom=0.08, top=0.98)
+                except Exception:
+                    pass
+                canvas.draw_idle()
+            except Exception:
+                pass
+
+        _resize_job = {"id": None}
+
+        def _on_canvas_configure(_event=None):
+            # Throttle frequent resizes during interactive dragging
+            try:
+                if _resize_job["id"] is not None:
+                    canvas_widget.after_cancel(_resize_job["id"])  # type: ignore[arg-type]
+                _resize_job["id"] = canvas_widget.after(60, lambda: (_apply_resize(), _resize_job.update({"id": None})))
+            except Exception:
+                pass
+
+        # Bind and trigger once to sync initial size
+        try:
+            canvas_widget.bind("<Configure>", _on_canvas_configure)
+        except Exception:
+            pass
+        try:
+            root.update_idletasks()
+            _apply_resize()
+        except Exception:
+            pass
 
         # Enable mouse-wheel zoom on the plot for easier selection
         def _setup_wheel_zoom(ax):
@@ -439,14 +483,17 @@ def launch_filter_interface(
         # Initial values from caller override current config defaults when provided
         init_target = None
         init_thresh = None
+        init_orient = None
         try:
             if isinstance(initial_overrides, dict):
                 if 'cluster_target_groups' in initial_overrides:
                     init_target = int(initial_overrides['cluster_target_groups'])
                 if 'cluster_panel_threshold' in initial_overrides:
                     init_thresh = float(initial_overrides['cluster_panel_threshold'])
+                if 'cluster_orientation_split_deg' in initial_overrides:
+                    init_orient = float(initial_overrides['cluster_orientation_split_deg'])
         except Exception:
-            init_target = None; init_thresh = None
+            init_target = None; init_thresh = None; init_orient = None
 
         target_groups_var = tk.IntVar(value=int(
             init_target if init_target is not None else cfg_defaults.get('cluster_target_groups', 0)
@@ -463,6 +510,16 @@ def launch_filter_interface(
         ))
         ttk.Spinbox(clust_frame, from_=0.01, to=5.0, increment=0.01, textvariable=panel_thresh_var, width=8, format="%.2f").grid(
             row=1, column=1, padx=4, pady=2, sticky="w"
+        )
+        ttk.Label(
+            clust_frame,
+            text=_tr("filter_orientation_split_label", "Split by orientation (deg) 0=off:")
+        ).grid(row=2, column=0, padx=4, pady=2, sticky="w")
+        orient_split_var = tk.DoubleVar(value=float(
+            init_orient if init_orient is not None else cfg_defaults.get('cluster_orientation_split_deg', 0.0)
+        ))
+        ttk.Spinbox(clust_frame, from_=0.0, to=180.0, increment=1.0, textvariable=orient_split_var, width=8, format="%.1f").grid(
+            row=2, column=1, padx=4, pady=2, sticky="w"
         )
 
         # Scrollable checkboxes list
@@ -560,6 +617,7 @@ def launch_filter_interface(
                 result["overrides"] = {
                     "cluster_panel_threshold": float(panel_thresh_var.get()),
                     "cluster_target_groups": int(target_groups_var.get()),
+                    "cluster_orientation_split_deg": float(orient_split_var.get()),
                 }
             except Exception:
                 result["overrides"] = None

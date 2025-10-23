@@ -21,7 +21,12 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_compl
 from concurrent.futures.process import BrokenProcessPool
 
 
-def cluster_seestar_stacks_connected(all_raw_files_with_info: list, stack_threshold_deg: float, progress_callback: callable):
+def cluster_seestar_stacks_connected(
+    all_raw_files_with_info: list,
+    stack_threshold_deg: float,
+    progress_callback: callable,
+    orientation_split_threshold_deg: float = 0.0,
+):
     """Order-invariant clustering of Seestar raws using spherical proximity.
 
     Builds a proximity graph (edges when separation < threshold) and returns
@@ -48,6 +53,7 @@ def cluster_seestar_stacks_connected(all_raw_files_with_info: list, stack_thresh
     )
     panel_centers_sky = []
     panel_data_for_clustering = []
+    panel_orientations_deg = []  # orientation of +X pixel axis on sky, in degrees [0,360)
     for info in all_raw_files_with_info:
         wcs_obj = info.get("wcs")
         if not (wcs_obj and getattr(wcs_obj, "is_celestial", False)):
@@ -67,6 +73,24 @@ def cluster_seestar_stacks_connected(all_raw_files_with_info: list, stack_thresh
                 continue
             panel_centers_sky.append(center_world)
             panel_data_for_clustering.append(info)
+            # Optionally compute orientation of X pixel axis using WCS
+            if orientation_split_threshold_deg and float(orientation_split_threshold_deg) > 0:
+                try:
+                    # Use center pixel + one-pixel step in +X to get position angle
+                    if getattr(wcs_obj, "pixel_shape", None):
+                        cx = wcs_obj.pixel_shape[0] / 2.0
+                        cy = wcs_obj.pixel_shape[1] / 2.0
+                    else:
+                        cx, cy = 0.0, 0.0
+                    c0 = wcs_obj.pixel_to_world(cx, cy)
+                    c1 = wcs_obj.pixel_to_world(cx + 1.0, cy)
+                    pa = c0.position_angle(c1).to(u.deg).value  # east of north
+                    ang = float(pa) % 360.0
+                    panel_orientations_deg.append(ang)
+                except Exception:
+                    panel_orientations_deg.append(None)
+            else:
+                panel_orientations_deg.append(None)
         except Exception:
             continue
     if not panel_centers_sky:
@@ -93,10 +117,25 @@ def cluster_seestar_stacks_connected(all_raw_files_with_info: list, stack_thresh
         ra, rb = find(a), find(b)
         if ra != rb:
             parent[rb] = ra
+    def _circ_delta_deg(a: float, b: float) -> float:
+        d = abs(float(a) - float(b))
+        if d > 180.0:
+            d = 360.0 - d
+        return d
+
     for a, b in zip(idx1, idx2):
         ia, ib = int(a), int(b)
         if ia == ib:
             continue
+        # If orientation-split is enabled, only connect when |Δangle| <= threshold
+        if orientation_split_threshold_deg and float(orientation_split_threshold_deg) > 0:
+            oa = panel_orientations_deg[ia] if ia < len(panel_orientations_deg) else None
+            ob = panel_orientations_deg[ib] if ib < len(panel_orientations_deg) else None
+            if oa is None or ob is None:
+                # Cannot compare orientations: do not connect
+                continue
+            if _circ_delta_deg(oa, ob) > float(orientation_split_threshold_deg):
+                continue
         union(ia, ib)
     groups_indices = {}
     for i in range(n):
@@ -2418,6 +2457,7 @@ def run_hierarchical_mosaic(
     astap_sensitivity_config: int,
     cluster_threshold_config: float,
     cluster_target_groups_config: int,
+    cluster_orientation_split_deg_config: float,
     progress_callback: callable,
     stack_norm_method: str,
     stack_weight_method: str,
@@ -2501,6 +2541,12 @@ def run_hierarchical_mosaic(
         cluster_threshold if cluster_threshold > 0 else 0.18
 
     )
+    # Orientation split threshold (degrees). 0 disables orientation filtering
+    try:
+        orientation_split_thr = float(cluster_orientation_split_deg_config or 0)
+    except (TypeError, ValueError):
+        orientation_split_thr = 0.0
+    ORIENTATION_SPLIT_THRESHOLD_DEG = orientation_split_thr if orientation_split_thr > 0 else 0.0
     PROGRESS_WEIGHT_PHASE1_RAW_SCAN = 30; PROGRESS_WEIGHT_PHASE2_CLUSTERING = 5
     PROGRESS_WEIGHT_PHASE3_MASTER_TILES = 35; PROGRESS_WEIGHT_PHASE4_GRID_CALC = 5
     PROGRESS_WEIGHT_PHASE5_ASSEMBLY = 15; PROGRESS_WEIGHT_PHASE6_SAVE = 8
@@ -2684,6 +2730,7 @@ def run_hierarchical_mosaic(
                 _init_overrides = {
                     "cluster_panel_threshold": float(cluster_threshold_config),
                     "cluster_target_groups": int(cluster_target_groups_config),
+                    "cluster_orientation_split_deg": float(cluster_orientation_split_deg_config),
                 }
             except Exception:
                 _init_overrides = None
@@ -2734,6 +2781,11 @@ def run_hierarchical_mosaic(
                         SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG = new_thr  # noqa: F841 (referenced later)
                     if 'cluster_target_groups' in overrides:
                         cluster_target_groups_config = int(overrides['cluster_target_groups'])  # noqa: F841
+                    if 'cluster_orientation_split_deg' in overrides:
+                        try:
+                            ORIENTATION_SPLIT_THRESHOLD_DEG = float(overrides['cluster_orientation_split_deg'])  # noqa: F841
+                        except Exception:
+                            ORIENTATION_SPLIT_THRESHOLD_DEG = 0.0  # noqa: F841
                     # Notify GUI to update its controls
                     try:
                         thr_str = f"{float(overrides.get('cluster_panel_threshold', SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG)):.6f}"
@@ -2743,8 +2795,13 @@ def run_hierarchical_mosaic(
                         tgt_str = str(int(overrides.get('cluster_target_groups', cluster_target_groups_config)))
                     except Exception:
                         tgt_str = ""
-                    if thr_str or tgt_str:
-                        pcb(f"CLUSTER_OVERRIDE:panel={thr_str};target={tgt_str}", prog=None, lvl="INFO_DETAIL")
+                    # Orientation split info (optional)
+                    try:
+                        ori_str = f"{float(overrides.get('cluster_orientation_split_deg', ORIENTATION_SPLIT_THRESHOLD_DEG)):.2f}"
+                    except Exception:
+                        ori_str = ""
+                    if thr_str or tgt_str or ori_str:
+                        pcb(f"CLUSTER_OVERRIDE:panel={thr_str};target={tgt_str};orient={ori_str}", prog=None, lvl="INFO_DETAIL")
                 except Exception:
                     pass
         except ImportError:
@@ -2953,7 +3010,10 @@ def run_hierarchical_mosaic(
     pcb("PHASE_UPDATE:2", prog=None, lvl="ETA_LEVEL")
     # Use order-invariant connected-components clustering for robustness
     seestar_stack_groups = cluster_seestar_stacks_connected(
-        all_raw_files_processed_info, SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG, progress_callback
+        all_raw_files_processed_info,
+        SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG,
+        progress_callback,
+        orientation_split_threshold_deg=ORIENTATION_SPLIT_THRESHOLD_DEG,
     )
     # Diagnostic: nearest-neighbor separation percentiles to help tune eps
     try:
@@ -3127,7 +3187,12 @@ def run_hierarchical_mosaic(
                     max_pair_deg = 0.5
                 thr_current = float(SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG)
                 def _count_groups(thr: float) -> tuple[int, list]:
-                    g = cluster_seestar_stacks_connected(all_raw_files_processed_info, float(thr), None)
+                    g = cluster_seestar_stacks_connected(
+                        all_raw_files_processed_info,
+                        float(thr),
+                        None,
+                        orientation_split_threshold_deg=ORIENTATION_SPLIT_THRESHOLD_DEG,
+                    )
                     return len(g), g
                 cnt_cur = len(seestar_stack_groups)
                 # Direction: if too many groups, increase threshold; if too few, decrease.
@@ -4054,8 +4119,9 @@ def run_hierarchical_mosaic_process(
         progress_queue.put((message_key_or_raw, progress_value, level, cb_kwargs))
 
     # Insert the process queue callback in the expected position (after
-    # cluster threshold and optional target group count).
-    full_args = args[:9] + (queue_callback,) + args[9:]
+    # cluster threshold, target group count, and orientation split parameter).
+    # With the current signature, progress_callback is the 11th positional arg.
+    full_args = args[:10] + (queue_callback,) + args[10:]
     try:
         run_hierarchical_mosaic(*full_args, solver_settings=solver_settings_dict, **kwargs)
     except Exception as e_proc:

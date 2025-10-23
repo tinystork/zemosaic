@@ -122,7 +122,8 @@ class ZeMosaicGUI:
                 "preprocess_background_sigma": 24.0,
                 # Valeur par défaut alignée avec le worker (0.18°)
                 "cluster_panel_threshold": 0.18,
-                "cluster_target_groups": 0
+                "cluster_target_groups": 0,
+                "cluster_orientation_split_deg": 0.0
             }
 
         # --- GPU Detection helper ---
@@ -216,6 +217,7 @@ class ZeMosaicGUI:
         self.astap_sensitivity_var = tk.IntVar(value=self.config.get("astap_default_sensitivity", 100))
         self.cluster_threshold_var = tk.DoubleVar(value=self.config.get("cluster_panel_threshold", 0.18))
         self.cluster_target_groups_var = tk.IntVar(value=self.config.get("cluster_target_groups", 0))
+        self.cluster_orientation_split_var = tk.DoubleVar(value=self.config.get("cluster_orientation_split_deg", 0.0))
         self.save_final_uint16_var = tk.BooleanVar(value=self.config.get("save_final_as_uint16", False))
 
         # --- Solver Settings ---
@@ -554,6 +556,11 @@ class ZeMosaicGUI:
         ttk.Label(params_frame, text="").grid(row=param_row_idx, column=0, padx=5, pady=3, sticky="w"); self.translatable_widgets["panel_clustering_target_label"] = params_frame.grid_slaves(row=param_row_idx,column=0)[0]
         ttk.Spinbox(params_frame, from_=0, to=999, increment=1, textvariable=self.cluster_target_groups_var, width=8).grid(row=param_row_idx, column=1, padx=5, pady=3, sticky="w")
         ttk.Label(params_frame, text="").grid(row=param_row_idx, column=2, padx=5, pady=3, sticky="w"); self.translatable_widgets["panel_clustering_target_note"] = params_frame.grid_slaves(row=param_row_idx,column=2)[0]
+        param_row_idx += 1
+        # Split by orientation (deg)
+        ttk.Label(params_frame, text="").grid(row=param_row_idx, column=0, padx=5, pady=3, sticky="w"); self.translatable_widgets["panel_orientation_split_label"] = params_frame.grid_slaves(row=param_row_idx,column=0)[0]
+        ttk.Spinbox(params_frame, from_=0.0, to=180.0, increment=1.0, textvariable=self.cluster_orientation_split_var, width=8, format="%.1f").grid(row=param_row_idx, column=1, padx=5, pady=3, sticky="w")
+        ttk.Label(params_frame, text="").grid(row=param_row_idx, column=2, padx=5, pady=3, sticky="w"); self.translatable_widgets["panel_orientation_split_note"] = params_frame.grid_slaves(row=param_row_idx,column=2)[0]
         param_row_idx += 1
         # Removed: Force Luminance option (images are sent to ASTAP as-is)
 
@@ -1279,6 +1286,7 @@ class ZeMosaicGUI:
                 _initial_overrides = {
                     "cluster_panel_threshold": float(self.cluster_threshold_var.get()) if hasattr(self, 'cluster_threshold_var') else float(self.config.get("cluster_panel_threshold", 0.18)),
                     "cluster_target_groups": int(self.cluster_target_groups_var.get()) if hasattr(self, 'cluster_target_groups_var') else int(self.config.get("cluster_target_groups", 0)),
+                    "cluster_orientation_split_deg": float(self.cluster_orientation_split_var.get()) if hasattr(self, 'cluster_orientation_split_var') else float(self.config.get("cluster_orientation_split_deg", 0.0)),
                 }
             except Exception:
                 _initial_overrides = None
@@ -1316,10 +1324,13 @@ class ZeMosaicGUI:
                         self.cluster_threshold_var.set(float(overrides['cluster_panel_threshold']))
                     if 'cluster_target_groups' in overrides and hasattr(self, 'cluster_target_groups_var'):
                         self.cluster_target_groups_var.set(int(overrides['cluster_target_groups']))
+                    if 'cluster_orientation_split_deg' in overrides and hasattr(self, 'cluster_orientation_split_var'):
+                        self.cluster_orientation_split_var.set(float(overrides['cluster_orientation_split_deg']))
                     # Persist to in-memory config so future opens keep it
                     try:
                         self.config["cluster_panel_threshold"] = float(self.cluster_threshold_var.get())
                         self.config["cluster_target_groups"] = int(self.cluster_target_groups_var.get())
+                        self.config["cluster_orientation_split_deg"] = float(self.cluster_orientation_split_var.get())
                     except Exception:
                         pass
                     try:
@@ -1675,6 +1686,7 @@ class ZeMosaicGUI:
             astap_sensitivity_val = self.astap_sensitivity_var.get()
             cluster_thresh_val = self.cluster_threshold_var.get()
             cluster_target_groups_val = self.cluster_target_groups_var.get()
+            cluster_orientation_split_val = self.cluster_orientation_split_var.get()
             
             stack_norm_method = self.stacking_normalize_method_var.get()
             stack_weight_method = self.stacking_weighting_method_var.get()
@@ -1780,6 +1792,7 @@ class ZeMosaicGUI:
         try:
             self.config["cluster_panel_threshold"] = float(cluster_thresh_val)
             self.config["cluster_target_groups"] = int(cluster_target_groups_val)
+            self.config["cluster_orientation_split_deg"] = float(cluster_orientation_split_val)
         except Exception:
             pass
 
@@ -1805,6 +1818,7 @@ class ZeMosaicGUI:
             astap_radius_val, astap_downsample_val, astap_sensitivity_val,
             cluster_thresh_val,
             cluster_target_groups_val,
+            cluster_orientation_split_val,
             stack_norm_method,
             stack_weight_method,
             stack_reject_algo,
