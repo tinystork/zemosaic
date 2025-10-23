@@ -4647,12 +4647,19 @@ def run_hierarchical_mosaic_process(
     # cluster threshold, target group count, and orientation split parameter).
     # With the current signature, progress_callback is the 11th positional arg.
     if len(args) > 10:
-        # Replace the provided callback with our proxy to avoid shifting the
-        # remaining positional arguments (which would trigger a TypeError).
-        full_args = args[:10] + (queue_callback,) + args[11:]
+        candidate = args[10]
+        if callable(candidate):
+            # Replace the provided callback without disturbing other
+            # positional arguments.
+            full_args = args[:10] + (queue_callback,) + args[11:]
+        else:
+            # No callback was supplied: insert ours in the expected slot so
+            # that subsequent parameters keep their intended positions.
+            full_args = args[:10] + (queue_callback,) + args[10:]
     else:
-        # Safety fallback: if the caller did not provide the progress
-        # callback, append ours so the worker still runs.
+        # Safety fallback: if the caller did not provide enough positional
+        # arguments to reach the callback slot, append ours so the worker
+        # still runs (mainly for CLI/debug scenarios).
         full_args = args + (queue_callback,)
     try:
         run_hierarchical_mosaic(*full_args, solver_settings=solver_settings_dict, **kwargs)
