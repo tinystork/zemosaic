@@ -280,7 +280,7 @@ class ZeMosaicGUI:
             value=self.config.get("apply_master_tile_crop", True) # Désactivé par défaut
         )
         self.master_tile_crop_percent_var = tk.DoubleVar(
-            value=self.config.get("master_tile_crop_percent", 18.0) # 18% par côté par défaut si activé
+            value=self.config.get("master_tile_crop_percent", 10.0) # 10% par côté par défaut si activé
         )
         self.use_memmap_var = tk.BooleanVar(value=self.config.get("coadd_use_memmap", False))
         self.mm_dir_var = tk.StringVar(value=self.config.get("coadd_memmap_dir", ""))
@@ -966,7 +966,7 @@ class ZeMosaicGUI:
             # print("DEBUG GUI: Root window non existante dans _update_ui_language.")
             return
 
-        self.root.title(self._tr("window_title", "ZeMosaic V2.7 - Hierarchical Mosaicker"))
+        self.root.title(self._tr("window_title", "ZeMosaic V2.8 - Hierarchical Mosaicker"))
 
         # Traduction des widgets standards (Labels, Buttons, Titres de Frames, Onglets etc.)
         for key, widget_info in self.translatable_widgets.items():
