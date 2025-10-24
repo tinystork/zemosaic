@@ -43,8 +43,9 @@ DEFAULT_CONFIG = {
     "enable_early_filter": True,
     # --- CLES POUR LE ROGNAGE DES MASTER TUILES ---
     "apply_master_tile_crop": True,       # Désactivé par défaut
-    "master_tile_crop_percent": 10.0      # Pourcentage par côté si activé (ex: 10%)
-    # --- FIN CLES POUR LE ROGNAGE --- 
+    "master_tile_crop_percent": 10.0,     # Pourcentage par côté si activé (ex: 10%)
+    "crop_follow_signal": False,
+    # --- FIN CLES POUR LE ROGNAGE ---
 }
 
 def get_config_path():
@@ -89,6 +90,7 @@ def load_config():
             except Exception: print(f"ERROR: {msg_title} - {msg_text} (messagebox error)")
     # else:
         # print(f"Config file not found at {config_path}. Using default configuration.")
+    current_config.setdefault("crop_follow_signal", False)
     return current_config
 
 def save_config(config_data):
