@@ -482,9 +482,17 @@ def launch_filter_interface(
                 h = max(50, int(canvas_widget.winfo_height()))
                 # Resize figure in pixels -> inches
                 fig.set_size_inches(w / fig.dpi, h / fig.dpi, forward=True)
-                # Maximize axes area inside the figure
+                # Maximize axes area inside the figure when compatible with the
+                # active Matplotlib layout engine.  Newer Matplotlib versions
+                # (>=3.8) expose layout engines that reject ``subplots_adjust``
+                # calls.  Skip the adjustment in that case to avoid runtime
+                # warnings.
                 try:
-                    fig.subplots_adjust(left=0.06, right=0.995, bottom=0.08, top=0.98)
+                    layout_engine = None
+                    if hasattr(fig, "get_layout_engine"):
+                        layout_engine = fig.get_layout_engine()
+                    if layout_engine is None:
+                        fig.subplots_adjust(left=0.06, right=0.995, bottom=0.08, top=0.98)
                 except Exception:
                     pass
                 canvas.draw_idle()
@@ -1202,7 +1210,6 @@ def launch_filter_interface(
             check_vars.append(var)
 
             # Label includes basename and optional separation
-            import os
             base = os.path.basename(it.path)
             sep_txt = ""
             if it.center is not None:
