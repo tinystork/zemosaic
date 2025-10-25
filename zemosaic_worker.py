@@ -2652,6 +2652,40 @@ def create_master_tile(
             zconfig = SimpleNamespace()
     else:
         zconfig = SimpleNamespace()
+
+    # Always propagate the stacking options selected in the GUI for the current run.
+    # The persisted config might not reflect the transient overrides, which caused
+    # Phase 3 to silently fall back to minimal defaults (plain mean stacking).
+    stacking_overrides = {
+        "stacking_normalize_method": stack_norm_method,
+        "stacking_weighting_method": stack_weight_method,
+        "stacking_rejection_algorithm": stack_reject_algo,
+        "stacking_kappa_low": stack_kappa_low,
+        "stacking_kappa_high": stack_kappa_high,
+        "stacking_final_combine_method": stack_final_combine,
+    }
+    try:
+        winsor_low, winsor_high = parsed_winsor_limits
+    except Exception:
+        winsor_low = winsor_high = None
+    if winsor_low is not None and winsor_high is not None:
+        stacking_overrides["stacking_winsor_limits"] = f"{winsor_low:.6g},{winsor_high:.6g}"
+        stacking_overrides["stacking_winsor_limits_tuple"] = (winsor_low, winsor_high)
+
+    if apply_radial_weight is not None:
+        stacking_overrides["apply_radial_weight"] = bool(apply_radial_weight)
+    if radial_feather_fraction is not None:
+        stacking_overrides["radial_feather_fraction"] = radial_feather_fraction
+    if radial_shape_power is not None:
+        stacking_overrides["radial_shape_power"] = radial_shape_power
+    if min_radial_weight_floor is not None:
+        stacking_overrides["min_radial_weight_floor"] = min_radial_weight_floor
+
+    for attr_name, attr_value in stacking_overrides.items():
+        try:
+            setattr(zconfig, attr_name, attr_value)
+        except Exception:
+            pass
     # Provide a generic alias for GPU usage so Phase 3 can honor the same toggle.
     try:
         if not hasattr(zconfig, 'use_gpu') and hasattr(zconfig, 'use_gpu_phase5'):
