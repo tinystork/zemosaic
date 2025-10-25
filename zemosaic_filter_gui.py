@@ -602,7 +602,7 @@ def launch_filter_interface(
             "filter_axis_dec_deg",
             "Dec [deg]"
         ))
-        ax.set_aspect("equal", adjustable="datalim")
+        ax.set_aspect("equal", adjustable="box")
         # For sky-like view, invert RA axis (optional)
         ax.invert_xaxis()
 

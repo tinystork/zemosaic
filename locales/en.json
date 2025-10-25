@@ -355,6 +355,7 @@
     "assemble_error_invalid_final_shape_reproj_coadd": "Reproject & Coadd ERROR: invalid final output shape {shape}.",
     "assemble_warn_swapped_final_shape_reproj_coadd": "Reproject & Coadd WARNING: provided dimensions {provided} were swapped, expected {expected}. Automatically corrected.",
     "assemble_error_mismatch_final_shape_reproj_coadd": "Reproject & Coadd ERROR: provided dimensions {provided} do not match mosaic grid {expected}.",
+    "assemble_info_gpu_flag": "Reproject & Coadd GPU flag: {use_gpu}.",
 
     "aligngroup_error_astroalign_unavailable": "AlignGroup ERROR: astroalign not available. Alignment cannot proceed.",
     "aligngroup_error_invalid_input_list_or_ref_index": "AlignGroup ERROR: invalid image list or reference index {ref_idx} out of range.",
@@ -374,6 +375,7 @@
     "run_error_phase5_assembly_failed_incremental": "ERROR P5: Final mosaic assembly via Incremental method failed.",
     "run_info_phase5_finished_incremental": "Phase 5 finished: Incremental assembly completed. Mosaic shape (HWC): {shape}",
     "run_warn_phase5_invalid_tile_skipped_for_assembly": "WARN P5: Invalid Master Tile ({filename}) skipped for final assembly.",
+    "run_info_phase5_gpu_mode": "Phase 5 GPU mode: {mode}. {details}",
 
     "getwcs_info_header_written": "WCS header updated for: {filename}",
     "getwcs_warn_header_write_failed": "WARNING: Failed to update WCS header for {filename}: {error}",

@@ -3458,6 +3458,7 @@ def assemble_final_mosaic_reproject_coadd(
     )
 
     start_time_phase = time.monotonic()
+    _pcb("assemble_info_gpu_flag", prog=None, lvl="INFO_DETAIL", use_gpu=bool(use_gpu))
 
     # Emit ETA during the preparation phase (before channels start)
     def _update_eta_prepare(done_tiles: int, total_tiles_local: int):
@@ -4052,6 +4053,9 @@ def run_hierarchical_mosaic(
     DEFAULT_PHASE_WORKER_RATIO = 1.0
     ALIGNMENT_PHASE_WORKER_RATIO = 0.5  # Limit aggressive phases to 50% of base workers
 
+    gpu_requested_initial = bool(use_gpu_phase5)
+    gpu_selected_id_initial = gpu_id_phase5
+    gpu_init_error: str | None = None
     if use_gpu_phase5 and gpu_id_phase5 is not None:
         os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id_phase5)
@@ -4065,14 +4069,16 @@ def run_hierarchical_mosaic(
                 lvl="ERROR",
                 error=str(e),
             )
+            gpu_init_error = str(e)
             use_gpu_phase5 = False
     else:
         for v in ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER"):
             os.environ.pop(v, None)
 
     # Determine final GPU usage flag only if a valid NVIDIA GPU is selected
+    gpu_available_runtime = gpu_is_available()
     use_gpu_phase5_flag = (
-        use_gpu_phase5 and gpu_id_phase5 is not None and gpu_is_available()
+        use_gpu_phase5 and gpu_id_phase5 is not None and gpu_available_runtime
     )
     if use_gpu_phase5_flag and ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils:
         try:
@@ -4081,6 +4087,67 @@ def run_hierarchical_mosaic(
                 zemosaic_utils.ensure_cupy_pool_initialized(0)
         except Exception:
             pass
+
+    gpu_log_details = ""
+    if use_gpu_phase5_flag:
+        gpu_name = f"GPU {gpu_id_phase5}"
+        gpu_mem_gb = None
+        gpu_info_error = None
+        try:
+            import cupy as _cupy_info
+            device_obj = _cupy_info.cuda.Device(0)
+            props = _cupy_info.cuda.runtime.getDeviceProperties(device_obj.id)
+            name_raw = props.get("name", gpu_name)
+            if isinstance(name_raw, bytes):
+                gpu_name = name_raw.decode(errors="ignore").strip()
+            elif isinstance(name_raw, str):
+                gpu_name = name_raw.strip() or gpu_name
+            total_mem = props.get("totalGlobalMem")
+            if isinstance(total_mem, (int, float)) and total_mem > 0:
+                gpu_mem_gb = total_mem / float(1024 ** 3)
+        except Exception as info_exc:
+            gpu_info_error = str(info_exc)
+
+        detail_parts = [f"device #{gpu_id_phase5}"]
+        if gpu_name:
+            detail_parts.append(gpu_name)
+        if gpu_mem_gb is not None:
+            detail_parts.append(f"VRAM≈{gpu_mem_gb:.2f} GiB")
+        if gpu_info_error:
+            detail_parts.append(f"info_error={gpu_info_error}")
+        gpu_log_details = ", ".join(detail_parts)
+        pcb(
+            "run_info_phase5_gpu_mode",
+            prog=None,
+            lvl="INFO",
+            mode="GPU",
+            details=gpu_log_details,
+        )
+    else:
+        requested_gpu = bool(gpu_requested_initial)
+        if not requested_gpu:
+            reason = "not_requested"
+        elif gpu_selected_id_initial is None:
+            reason = "missing_id"
+        elif not gpu_available_runtime:
+            reason = "gpu_unavailable"
+        elif gpu_init_error:
+            reason = "init_failed"
+        else:
+            reason = "disabled"
+        detail_parts = [f"requested={requested_gpu}", f"reason={reason}"]
+        if gpu_selected_id_initial is not None:
+            detail_parts.append(f"gpu_id={gpu_selected_id_initial}")
+        if gpu_init_error:
+            detail_parts.append(f"init_error={gpu_init_error}")
+        gpu_log_details = "fallback (" + ", ".join(detail_parts) + ")"
+        pcb(
+            "run_info_phase5_gpu_mode",
+            prog=None,
+            lvl="INFO",
+            mode="CPU",
+            details=gpu_log_details,
+        )
     def _compute_phase_workers(base_workers: int, num_tasks: int, ratio: float = DEFAULT_PHASE_WORKER_RATIO) -> int:
         workers = max(1, int(base_workers * ratio))
         if num_tasks > 0:
