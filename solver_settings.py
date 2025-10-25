@@ -16,6 +16,11 @@ class SolverSettings:
     timeout: int = 60
     downsample: int = 2
     force_lum: bool = False
+    astap_executable_path: str = ""
+    astap_data_directory_path: str = ""
+    astap_search_radius_deg: float = 3.0
+    astap_downsample: int = 2
+    astap_sensitivity: int = 100
 
     @staticmethod
     def default_path() -> Path:

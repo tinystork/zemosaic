@@ -26,6 +26,7 @@ Dependencies limited to tkinter, astropy, matplotlib, numpy; all optional.
 from __future__ import annotations
 
 from typing import List, Dict, Any, Optional
+from dataclasses import asdict
 import os
 import sys
 import shutil
@@ -36,6 +37,8 @@ import importlib
 def launch_filter_interface(
     raw_files_with_wcs: List[Dict[str, Any]],
     initial_overrides: Optional[Dict[str, Any]] = None,
+    solver_settings_dict: Optional[Dict[str, Any]] = None,
+    config_overrides: Optional[Dict[str, Any]] = None,
 ):
     """
     Display an optional Tkinter GUI to filter WCS-resolved images.
@@ -50,6 +53,15 @@ def launch_filter_interface(
           - 'index' (optional) : processing index
           - 'center' (optional) : astropy.coordinates.SkyCoord
           - 'header' (optional) : astropy.io.fits.Header (used to infer shape)
+
+    solver_settings_dict : dict, optional
+        Dictionary of solver configuration selected in the main GUI. When
+        provided, values such as ASTAP paths and search radius override the
+        defaults loaded from configuration files.
+    config_overrides : dict, optional
+        Additional configuration values collected from the main GUI (for
+        example the ASTAP data directory or clustering caps). These override
+        the defaults detected by this module.
 
     Returns
     -------
@@ -77,6 +89,7 @@ def launch_filter_interface(
         localizer = None
         cfg_defaults: Dict[str, Any] = {}
         cfg: Dict[str, Any] | None = None
+        solver_settings_payload: Dict[str, Any] = {}
         try:
             # Ensure project directory is on sys.path to import project modules
             base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -90,23 +103,57 @@ def launch_filter_interface(
 
             from solver_settings import SolverSettings
 
-            solver_settings = SolverSettings.load()
+            if isinstance(solver_settings_dict, dict):
+                solver_settings_payload.update(solver_settings_dict)
+            else:
+                try:
+                    solver_settings = SolverSettings.load_default()
+                except Exception:
+                    solver_settings = SolverSettings()
+                solver_settings_payload.update(asdict(solver_settings))
+
             cfg_defaults = {
-                "astap_executable_path": solver_settings.astap_executable_path,
-                "astap_data_directory_path": solver_settings.astap_data_directory_path,
-                "astap_default_search_radius": solver_settings.search_radius_deg,
-                "astap_default_downsample": solver_settings.downsample,
+                "astap_executable_path": cfg.get("astap_executable_path", ""),
+                "astap_data_directory_path": cfg.get("astap_data_directory_path", ""),
+                "astap_default_search_radius": cfg.get("astap_default_search_radius", 0.0),
+                "astap_default_downsample": cfg.get("astap_default_downsample", 0),
+                "astap_default_sensitivity": cfg.get("astap_default_sensitivity", 100),
                 "auto_limit_frames_per_master_tile": cfg.get("auto_limit_frames_per_master_tile", True),
                 "max_raw_per_master_tile": cfg.get("max_raw_per_master_tile", 0),
                 "apply_master_tile_crop": cfg.get("apply_master_tile_crop", False),
                 "master_tile_crop_percent": cfg.get("master_tile_crop_percent", 0.0),
             }
 
+            if solver_settings_payload:
+                exe_path = solver_settings_payload.get("astap_executable_path")
+                data_path = solver_settings_payload.get("astap_data_directory_path")
+                search_radius = solver_settings_payload.get("astap_search_radius_deg")
+                downsample = solver_settings_payload.get("astap_downsample")
+                sensitivity = solver_settings_payload.get("astap_sensitivity")
+
+                if isinstance(exe_path, str) and exe_path:
+                    cfg_defaults["astap_executable_path"] = exe_path
+                if isinstance(data_path, str) and data_path:
+                    cfg_defaults["astap_data_directory_path"] = data_path
+                if search_radius is not None:
+                    cfg_defaults["astap_default_search_radius"] = search_radius
+                if downsample is not None:
+                    cfg_defaults["astap_default_downsample"] = downsample
+                if sensitivity is not None:
+                    cfg_defaults["astap_default_sensitivity"] = sensitivity
+
             localizer = ZeMosaicLocalization(language_code=lang_code)
         except Exception as e:
             print(f"WARNING (Filter GUI): failed to init localization/config: {e}")
             cfg_defaults = {}
+            solver_settings_payload = {}
             localizer = None
+
+        if isinstance(config_overrides, dict):
+            try:
+                cfg_defaults.update(config_overrides)
+            except Exception:
+                pass
 
         def _tr(key: str, default_text: Optional[str] = None, **kwargs) -> str:
             if localizer is not None:
