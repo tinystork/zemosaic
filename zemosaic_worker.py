@@ -8,6 +8,7 @@ import gc
 import logging
 import inspect  # Pas utilisé directement ici, mais peut être utile pour des introspections futures
 import math
+import copy
 from datetime import datetime
 import psutil
 import tempfile
@@ -197,6 +198,248 @@ def _extract_hw_from_info(raw_info: dict) -> tuple[int, int]:
             pass
 
     return 0, 0
+
+
+def _clone_wcs_instance(wcs_obj):
+    """Return a defensive copy of a WCS-like object when possible."""
+
+    if wcs_obj is None:
+        return None
+    try:
+        return wcs_obj.deepcopy()
+    except AttributeError:
+        try:
+            return copy.deepcopy(wcs_obj)
+        except Exception:
+            return wcs_obj
+
+
+def _prepare_adaptive_master_tile_inputs(
+    original_images: list,
+    raw_infos: list,
+    reference_wcs,
+    base_shape_hw: tuple[int, int],
+    zconfig,
+    log_func: Callable | None = None,
+):
+    """Compute an adaptive canvas and reproject inputs when enabled."""
+
+    enable_adaptive = True
+    try:
+        enable_adaptive = bool(getattr(zconfig, "adaptive_master_tile_enable"))
+    except Exception:
+        enable_adaptive = True
+    if not enable_adaptive:
+        return None
+
+    if not (REPROJECT_AVAILABLE and reproject_interp and ASTROPY_AVAILABLE and WCS):
+        if log_func:
+            log_func("mastertile_adaptive_skip_missing_deps", lvl="WARN")
+        return None
+
+    if reference_wcs is None:
+        return None
+    if not original_images or not raw_infos:
+        return None
+
+    try:
+        base_h, base_w = int(base_shape_hw[0]), int(base_shape_hw[1])
+    except Exception:
+        return None
+    if base_h <= 0 or base_w <= 0:
+        return None
+
+    try:
+        max_mpx = float(getattr(zconfig, "max_master_tile_megapixels", 8.0))
+    except Exception:
+        max_mpx = 8.0
+    try:
+        max_scale = float(getattr(zconfig, "max_master_tile_scale", 2.0))
+    except Exception:
+        max_scale = 2.0
+    if max_scale <= 0:
+        max_scale = 1.0
+
+    xs: list[float] = []
+    ys: list[float] = []
+    entries: list[tuple[int, np.ndarray, WCS]] = []
+    for idx, (img, info) in enumerate(zip(original_images, raw_infos)):
+        if img is None or not isinstance(info, dict):
+            continue
+        wcs_in = info.get("wcs")
+        if not (wcs_in and getattr(wcs_in, "is_celestial", False)):
+            continue
+        h_info, w_info = _extract_hw_from_info(info)
+        if h_info <= 0 or w_info <= 0:
+            try:
+                h_info, w_info = int(img.shape[0]), int(img.shape[1])
+            except Exception:
+                continue
+        try:
+            pix_corners = np.array(
+                (
+                    (0.0, 0.0),
+                    (float(w_info), 0.0),
+                    (0.0, float(h_info)),
+                    (float(w_info), float(h_info)),
+                ),
+                dtype=float,
+            )
+            world = wcs_in.wcs_pix2world(pix_corners, 0)
+            xy = reference_wcs.wcs_world2pix(world, 0)
+        except Exception:
+            continue
+
+        for px, py in xy:
+            if np.isfinite(px) and np.isfinite(py):
+                xs.append(float(px))
+                ys.append(float(py))
+        entries.append((idx, img, wcs_in))
+
+    if not entries or not xs or not ys:
+        return None
+
+    x_min_raw = math.floor(min(xs))
+    x_max_raw = math.ceil(max(xs))
+    y_min_raw = math.floor(min(ys))
+    y_max_raw = math.ceil(max(ys))
+
+    span_x = max(base_w, x_max_raw - x_min_raw)
+    span_y = max(base_h, y_max_raw - y_min_raw)
+
+    out_w = span_x
+    out_h = span_y
+
+    if max_scale > 0:
+        max_w_scale = int(math.ceil(base_w * max_scale)) if base_w > 0 else 0
+        max_h_scale = int(math.ceil(base_h * max_scale)) if base_h > 0 else 0
+        if max_w_scale > 0:
+            out_w = min(out_w, max_w_scale)
+        if max_h_scale > 0:
+            out_h = min(out_h, max_h_scale)
+
+    if max_mpx > 0:
+        max_pixels = int(max_mpx * 1_000_000)
+        if max_pixels > 0 and out_w * out_h > max_pixels:
+            scale = math.sqrt(max_pixels / float(out_w * out_h))
+            out_w = max(base_w, int(out_w * scale))
+            out_h = max(base_h, int(out_h * scale))
+
+    desired_w = x_max_raw - x_min_raw
+    desired_h = y_max_raw - y_min_raw
+    offset_x = x_min_raw
+    offset_y = y_min_raw
+    if out_w < desired_w:
+        shrink_x = desired_w - out_w
+        offset_x += shrink_x // 2
+    if out_h < desired_h:
+        shrink_y = desired_h - out_h
+        offset_y += shrink_y // 2
+
+    if offset_x > 0:
+        offset_x = 0
+    if offset_y > 0:
+        offset_y = 0
+    if offset_x + out_w < base_w:
+        offset_x = base_w - out_w
+    if offset_y + out_h < base_h:
+        offset_y = base_h - out_h
+
+    offset_x = int(offset_x)
+    offset_y = int(offset_y)
+    out_w = int(out_w)
+    out_h = int(out_h)
+
+    if out_w <= 0 or out_h <= 0:
+        return None
+
+    if out_w == base_w and out_h == base_h and offset_x == 0 and offset_y == 0:
+        return None
+
+    if log_func:
+        log_func(
+            "mastertile_adaptive_canvas",
+            lvl="DEBUG_DETAIL",
+            width=out_w,
+            height=out_h,
+            offset_x=offset_x,
+            offset_y=offset_y,
+        )
+
+    wcs_out = _clone_wcs_instance(reference_wcs)
+    if wcs_out is None:
+        return None
+    try:
+        wcs_out.wcs.crpix[0] -= float(offset_x)
+        wcs_out.wcs.crpix[1] -= float(offset_y)
+    except Exception:
+        pass
+    try:
+        wcs_out.array_shape = (out_h, out_w)
+    except Exception:
+        pass
+    try:
+        wcs_out.pixel_shape = (out_w, out_h)
+    except Exception:
+        pass
+
+    shape_out = (out_h, out_w)
+    reproj_images: list[np.ndarray] = []
+    kept_positions: list[int] = []
+
+    for idx, img, wcs_in in entries:
+        try:
+            img_data = np.asarray(img, dtype=np.float32)
+            if img_data.ndim == 3 and img_data.shape[-1] >= 1:
+                reproj_channels = []
+                coverage_map = None
+                num_channels = img_data.shape[-1]
+                for chan in range(num_channels):
+                    reproj_chan, footprint = reproject_interp(
+                        (img_data[..., chan], wcs_in),
+                        wcs_out,
+                        shape_out=shape_out,
+                        return_footprint=True,
+                    )
+                    reproj_chan = np.asarray(reproj_chan, dtype=np.float32)
+                    footprint = np.asarray(footprint, dtype=np.float32)
+                    coverage_map = footprint if coverage_map is None else np.maximum(coverage_map, footprint)
+                    reproj_channels.append(reproj_chan)
+                reproj_img = np.stack(reproj_channels, axis=-1).astype(np.float32, copy=False)
+                if coverage_map is not None:
+                    invalid_mask = coverage_map <= 0
+                    if np.any(invalid_mask):
+                        reproj_img[invalid_mask] = np.nan
+            else:
+                reproj_img, footprint = reproject_interp(
+                    (img_data, wcs_in),
+                    wcs_out,
+                    shape_out=shape_out,
+                    return_footprint=True,
+                )
+                reproj_img = np.asarray(reproj_img, dtype=np.float32)
+                footprint = np.asarray(footprint, dtype=np.float32)
+                invalid_mask = footprint <= 0
+                if np.any(invalid_mask):
+                    reproj_img[invalid_mask] = np.nan
+
+            reproj_img = np.ascontiguousarray(reproj_img, dtype=np.float32)
+            reproj_img[~np.isfinite(reproj_img)] = np.nan
+            reproj_images.append(reproj_img)
+            kept_positions.append(idx)
+        except MemoryError as exc:
+            if log_func:
+                log_func("mastertile_adaptive_error_memory", lvl="WARN", error=str(exc))
+            return None
+        except Exception as exc:
+            if log_func:
+                log_func("mastertile_adaptive_reproject_failed", lvl="WARN", idx=idx, error=str(exc))
+            continue
+
+    if not reproj_images:
+        return None
+
+    return reproj_images, wcs_out, kept_positions
 
 
 def _estimate_group_memory_bytes(group: list[dict]) -> tuple[int, int, int, int]:
@@ -2463,7 +2706,8 @@ def create_master_tile(
         return (None, None), failed_groups_to_retry
     
     ref_info_for_tile = seestar_stack_group_info[reference_image_index_in_group]
-    wcs_for_master_tile = ref_info_for_tile.get('wcs')
+    wcs_reference_for_tile = ref_info_for_tile.get('wcs')
+    wcs_for_master_tile = _clone_wcs_instance(wcs_reference_for_tile)
     # Le header est un dict venant du cache, il faut le convertir en objet fits.Header si besoin
     header_dict_for_master_tile_base = ref_info_for_tile.get('header') 
 
@@ -2488,6 +2732,7 @@ def create_master_tile(
     
     tile_images_data_HWC_adu = []
     tile_original_raw_headers = [] # Liste des dictionnaires de header originaux
+    base_shape_hw: tuple[int, int] | None = None
 
     for i, raw_file_info in enumerate(seestar_stack_group_info):
         cached_image_file_path = raw_file_info.get('path_preprocessed_cache')
@@ -2519,7 +2764,15 @@ def create_master_tile(
             
             tile_images_data_HWC_adu.append(img_data_adu)
             # Stocker le dict de header, pas l'objet fits.Header, car c'est ce qui est dans raw_file_info
-            tile_original_raw_headers.append(raw_file_info.get('header')) 
+            tile_original_raw_headers.append(raw_file_info.get('header'))
+            if base_shape_hw is None and i == reference_image_index_in_group:
+                try:
+                    base_shape_hw = (
+                        int(img_data_adu.shape[0]),
+                        int(img_data_adu.shape[1]),
+                    )
+                except Exception:
+                    base_shape_hw = None
         except MemoryError as e_mem_load_cache:
              pcb_tile(f"{func_id_log_base}_error_memory_loading_cache", prog=None, lvl="ERROR", filename=os.path.basename(cached_image_file_path), error=str(e_mem_load_cache), tile_id=tile_id)
              # Release the concurrency slot before aborting
@@ -2543,6 +2796,15 @@ def create_master_tile(
         pcb_tile(f"{func_id_log_base}_error_no_valid_images_from_cache", prog=None, lvl="ERROR", tile_id=tile_id)
         return (None, None), failed_groups_to_retry
     # pcb_tile(f"{func_id_log_base}_info_loading_from_cache_finished", prog=None, lvl="DEBUG_DETAIL", num_loaded=len(tile_images_data_HWC_adu), tile_id=tile_id)
+
+    if base_shape_hw is None and tile_images_data_HWC_adu:
+        try:
+            base_shape_hw = (
+                int(tile_images_data_HWC_adu[0].shape[0]),
+                int(tile_images_data_HWC_adu[0].shape[1]),
+            )
+        except Exception:
+            base_shape_hw = None
 
     # pcb_tile(f"{func_id_log_base}_info_intra_tile_alignment_started", prog=None, lvl="DEBUG_DETAIL", num_to_align=len(tile_images_data_HWC_adu), tile_id=tile_id)
     # Limit concurrency during alignment/stacking as well to reduce peak RAM
@@ -2573,16 +2835,49 @@ def create_master_tile(
         if retry_group:
             failed_groups_to_retry.append(retry_group)
 
-    del tile_images_data_HWC_adu; gc.collect()
+    valid_indices = [idx for idx, img in enumerate(aligned_images_for_stack) if img is not None]
+    valid_aligned_images = [aligned_images_for_stack[idx] for idx in valid_indices]
 
-    valid_aligned_images = [img for img in aligned_images_for_stack if img is not None]
+    if base_shape_hw and valid_indices and tile_images_data_HWC_adu:
+        adaptive_inputs = _prepare_adaptive_master_tile_inputs(
+            [tile_images_data_HWC_adu[idx] for idx in valid_indices],
+            [seestar_stack_group_info[idx] for idx in valid_indices],
+            wcs_for_master_tile,
+            base_shape_hw,
+            zconfig,
+            log_func=pcb_tile,
+        )
+        if adaptive_inputs:
+            adaptive_images, adaptive_wcs, kept_positions = adaptive_inputs
+            if adaptive_images and kept_positions:
+                original_valid_indices = list(valid_indices)
+                valid_aligned_images = adaptive_images
+                wcs_for_master_tile = adaptive_wcs
+                valid_indices = [original_valid_indices[pos] for pos in kept_positions]
+                try:
+                    new_shape = valid_aligned_images[0].shape if valid_aligned_images else None
+                except Exception:
+                    new_shape = None
+                pcb_tile(
+                    f"{func_id_log_base}_info_adaptive_canvas_applied",
+                    prog=None,
+                    lvl="DEBUG_DETAIL",
+                    tile_id=tile_id,
+                    new_shape=str(new_shape) if new_shape else "unknown",
+                    images=len(valid_aligned_images),
+                )
+
+    if tile_images_data_HWC_adu:
+        del tile_images_data_HWC_adu
+    gc.collect()
+
     if aligned_images_for_stack:
         del aligned_images_for_stack # Libérer la liste originale après filtrage
 
     num_actually_aligned_for_header = len(valid_aligned_images)
     # pcb_tile(f"{func_id_log_base}_info_intra_tile_alignment_finished", prog=None, lvl="DEBUG_DETAIL", num_aligned=num_actually_aligned_for_header, tile_id=tile_id)
-    
-    if not valid_aligned_images: 
+
+    if not valid_aligned_images:
         pcb_tile(f"{func_id_log_base}_error_no_images_after_alignment", prog=None, lvl="ERROR", tile_id=tile_id)
         try:
             _PH3_CONCURRENCY_SEMAPHORE.release()
