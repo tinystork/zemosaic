@@ -1241,12 +1241,99 @@ def _log_alignment_warning_summary():
             logger.info("%d frame(s) - %s", count, human)
 
 
+def _crop_array_to_signal(
+    img: np.ndarray,
+    coverage: np.ndarray | None = None,
+    margin_frac: float = 0.05,
+) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    """Crop ``img`` to the bounding box of useful signal.
+
+    Parameters
+    ----------
+    img : np.ndarray
+        2D/3D array containing image data.
+    coverage : np.ndarray | None, optional
+        Optional coverage map used as mask (>0 considered valid).
+    margin_frac : float, optional
+        Additional fractional margin added to each side of the bounding box.
+
+    Returns
+    -------
+    tuple[np.ndarray, tuple[int, int, int, int]]
+        Cropped image and bounding box ``(y0, y1, x0, x1)``.
+    """
+
+    if img is None:
+        return img, (0, 0, 0, 0)
+
+    arr = np.asarray(img)
+    if arr.ndim < 2:
+        height = int(arr.shape[0]) if arr.ndim >= 1 else 0
+        width = int(arr.shape[1]) if arr.ndim > 1 else 0
+        return img, (0, height, 0, width)
+
+    height, width = int(arr.shape[0]), int(arr.shape[1])
+    default_bbox = (0, height, 0, width)
+
+    mask: np.ndarray | None = None
+    if coverage is not None:
+        try:
+            cov_arr = np.asarray(coverage)
+            if cov_arr.shape[0] == height and cov_arr.shape[1] == width:
+                mask = cov_arr > 0
+        except Exception:
+            mask = None
+
+    if mask is None:
+        data_arr = np.asarray(img)
+        if data_arr.ndim == 3:
+            valid_pixels = np.any(np.isfinite(data_arr) & (data_arr != 0), axis=-1)
+        else:
+            valid_pixels = np.isfinite(data_arr) & (data_arr != 0)
+        mask = valid_pixels
+
+    if not np.any(mask):
+        return img, default_bbox
+
+    rows = np.where(np.any(mask, axis=1))[0]
+    cols = np.where(np.any(mask, axis=0))[0]
+    if rows.size == 0 or cols.size == 0:
+        return img, default_bbox
+
+    y_min, y_max = int(rows[0]), int(rows[-1]) + 1
+    x_min, x_max = int(cols[0]), int(cols[-1]) + 1
+
+    try:
+        margin_frac = float(margin_frac)
+    except (TypeError, ValueError):
+        margin_frac = 0.0
+    margin_frac = max(0.0, margin_frac)
+
+    if margin_frac > 0.0:
+        bbox_height = y_max - y_min
+        bbox_width = x_max - x_min
+        margin_y = int(math.ceil(bbox_height * margin_frac))
+        margin_x = int(math.ceil(bbox_width * margin_frac))
+        y_min = max(0, y_min - margin_y)
+        y_max = min(height, y_max + margin_y)
+        x_min = max(0, x_min - margin_x)
+        x_max = min(width, x_max + margin_x)
+
+    bbox = (y_min, y_max, x_min, x_max)
+    cropped = img[y_min:y_max, x_min:x_max, ...]
+
+    return cropped, bbox
+
+
 def _auto_crop_mosaic_to_valid_region(
     mosaic: np.ndarray,
     coverage: np.ndarray | None,
     output_wcs,
     log_callback=None,
     threshold: float = 1e-6,
+    *,
+    follow_signal: bool | None = None,
+    margin_frac: float | None = 0.05,
 ):
     """Crop blank borders from the mosaic using the coverage map.
 
@@ -1270,45 +1357,109 @@ def _auto_crop_mosaic_to_valid_region(
         original inputs are returned unchanged.
     """
 
-    if mosaic is None or coverage is None:
+    if mosaic is None:
         return mosaic, coverage
+
+    mosaic_arr = np.asarray(mosaic)
+    if mosaic_arr.ndim < 2:
+        return mosaic, coverage
+
+    default_bbox = (0, int(mosaic_arr.shape[0]), 0, int(mosaic_arr.shape[1]))
+
+    if follow_signal is None:
+        try:
+            import zemosaic_config
+
+            cfg = zemosaic_config.load_config() or {}
+            follow_signal = bool(cfg.get("crop_follow_signal", False))
+        except Exception:
+            follow_signal = False
+    else:
+        follow_signal = bool(follow_signal)
 
     try:
-        cov_array = np.asarray(coverage)
-    except Exception:
-        cov_array = coverage
+        margin_value = 0.05 if margin_frac is None else float(margin_frac)
+    except (TypeError, ValueError):
+        margin_value = 0.05
+    margin_value = max(0.0, margin_value)
 
-    if getattr(cov_array, "ndim", 0) != 2:
+    bbox = default_bbox
+    cropped_mosaic = mosaic
+    cropped_coverage = coverage
+    used_signal_crop = False
+
+    if follow_signal:
+        try:
+            candidate_mosaic, candidate_bbox = _crop_array_to_signal(
+                mosaic,
+                coverage,
+                margin_value,
+            )
+            if candidate_bbox:
+                bbox = candidate_bbox
+                used_signal_crop = True
+                if bbox != default_bbox:
+                    cropped_mosaic = candidate_mosaic
+                    if coverage is not None:
+                        y0, y1, x0, x1 = bbox
+                        cropped_coverage = coverage[y0:y1, x0:x1]
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug("follow_signal crop applied, bbox=%s", bbox)
+        except Exception:
+            bbox = default_bbox
+            used_signal_crop = False
+
+    if used_signal_crop and bbox == default_bbox:
         return mosaic, coverage
 
-    try:
-        valid_mask = np.asarray(cov_array) > float(threshold)
-    except Exception:
+    if not used_signal_crop:
+        if coverage is None:
+            return mosaic, coverage
+
+        try:
+            cov_array = np.asarray(coverage)
+        except Exception:
+            cov_array = coverage
+
+        if getattr(cov_array, "ndim", 0) != 2:
+            return mosaic, coverage
+
+        try:
+            valid_mask = np.asarray(cov_array) > float(threshold)
+        except Exception:
+            return mosaic, coverage
+
+        if not np.any(valid_mask):
+            return mosaic, coverage
+
+        rows = np.where(np.any(valid_mask, axis=1))[0]
+        cols = np.where(np.any(valid_mask, axis=0))[0]
+        if rows.size == 0 or cols.size == 0:
+            return mosaic, coverage
+
+        y_min, y_max = int(rows[0]), int(rows[-1]) + 1
+        x_min, x_max = int(cols[0]), int(cols[-1]) + 1
+
+        bbox = (y_min, y_max, x_min, x_max)
+
+        if (
+            y_min == 0
+            and x_min == 0
+            and y_max == mosaic.shape[0]
+            and x_max == mosaic.shape[1]
+        ):
+            return mosaic, coverage
+
+        cropped_mosaic = mosaic[y_min:y_max, x_min:x_max, ...]
+        cropped_coverage = coverage[y_min:y_max, x_min:x_max]
+
+    if used_signal_crop and bbox == default_bbox:
+        # Signal crop requested but no bounding box reduction occurred.
         return mosaic, coverage
 
-    if not np.any(valid_mask):
-        return mosaic, coverage
+    new_shape = tuple(int(v) for v in np.shape(cropped_mosaic))
 
-    rows = np.where(np.any(valid_mask, axis=1))[0]
-    cols = np.where(np.any(valid_mask, axis=0))[0]
-    if rows.size == 0 or cols.size == 0:
-        return mosaic, coverage
-
-    y_min, y_max = int(rows[0]), int(rows[-1]) + 1
-    x_min, x_max = int(cols[0]), int(cols[-1]) + 1
-
-    if (
-        y_min == 0
-        and x_min == 0
-        and y_max == mosaic.shape[0]
-        and x_max == mosaic.shape[1]
-    ):
-        return mosaic, coverage
-
-    cropped_mosaic = mosaic[y_min:y_max, x_min:x_max, ...]
-    cropped_coverage = coverage[y_min:y_max, x_min:x_max]
-
-    new_shape = tuple(int(v) for v in cropped_mosaic.shape)
+    y_min, y_max, x_min, x_max = bbox
 
     if callable(log_callback):
         try:
@@ -3680,8 +3831,8 @@ def run_hierarchical_mosaic(
                         pass
                 if not accepted:
                     pcb("run_warn_phase0_filter_cancelled", prog=None, lvl="WARN")
-                    return
-                if filtered_items is not None:
+                    pcb("Phase 0: filter cancelled -> proceeding with all files", prog=None, lvl="INFO_DETAIL")
+                if accepted and filtered_items is not None:
                     fits_file_paths = [item["path"] for item in filtered_items if isinstance(item, dict) and item.get("path")]
                     pcb(f"Phase 0: selection after filter = {len(fits_file_paths)} files", prog=None, lvl="INFO_DETAIL")
                     try:
@@ -5005,7 +5156,7 @@ def run_hierarchical_mosaic(
         try: final_header.update(final_output_wcs.to_header(relax=True))
         except Exception as e_hdr_wcs: pcb("run_warn_phase6_wcs_to_header_failed", error=str(e_hdr_wcs), lvl="WARN")
     
-    final_header['SOFTWARE']=('ZeMosaic v2.9.1','Mosaic Software') # Incrémente la version si tu le souhaites
+    final_header['SOFTWARE']=('ZeMosaic v2.9.5','Mosaic Software') # Incrémente la version si tu le souhaites
     final_header['NMASTILE']=(len(master_tiles_results_list),"Master Tiles combined")
     final_header['NRAWINIT']=(num_total_raw_files,"Initial raw images found")
     final_header['NRAWPROC']=(len(all_raw_files_processed_info),"Raw images with WCS processed")

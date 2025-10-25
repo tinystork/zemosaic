@@ -263,11 +263,19 @@ def launch_filter_interface(
                 root = tk.Tk()
         else:
             root = tk.Tk()
+
         root.title(_tr(
             "filter_window_title",
             "ZeMosaic - Filtrer les images WCS (optionnel)" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "ZeMosaic - Filter WCS images (optional)"
         ))
-
+        # S'assurer que la fenêtre apparaît au premier plan et prend le focus
+        try:
+            root.lift()
+            root.attributes("-topmost", True)
+            root.after(200, lambda: root.attributes("-topmost", False))
+            root.focus_force()
+        except Exception:
+            pass
         # Top-level layout: left plot, right checkboxes/actions
         main = ttk.Frame(root)
         main.pack(fill=tk.BOTH, expand=True)
