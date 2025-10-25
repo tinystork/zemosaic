@@ -52,6 +52,10 @@ DEFAULT_CONFIG = {
     "master_tile_crop_percent": 5.0,     # Pourcentage par côté si activé (ex: 10%)
     "crop_follow_signal": True,
     # --- FIN CLES POUR LE ROGNAGE ---
+    # --- Adaptive master tile canvas (dynamic sizing) ---
+    "adaptive_master_tile_enable": True,
+    "max_master_tile_megapixels": 8.0,
+    "max_master_tile_scale": 2.0,
 }
 
 def get_config_path():
