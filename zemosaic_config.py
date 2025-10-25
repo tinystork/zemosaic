@@ -15,7 +15,7 @@ DEFAULT_CONFIG = {
     "num_processing_workers": -1, # -1 pour auto
     "stacking_normalize_method": "linear_fit",
     "stacking_weighting_method": "noise_variance",
-    "stacking_rejection_algorithm": "winsorized_sigma_clip", 
+    "stacking_rejection_algorithm": "winsorized_sigma_clip",
     "stacking_kappa_low": 3.0,
     "stacking_kappa_high": 3.0,
     "stacking_winsor_limits": "0.05,0.05", # String, sera parsé
@@ -23,6 +23,7 @@ DEFAULT_CONFIG = {
     "apply_radial_weight": False,
     "radial_feather_fraction": 0.8,
     "radial_shape_power": 2.0,
+    "use_gpu_phase3": False,
     "use_gpu_phase5": False,
     "gpu_id_phase5": 0,
     "gpu_selector": "",

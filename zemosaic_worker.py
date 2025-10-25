@@ -2688,10 +2688,15 @@ def create_master_tile(
             pass
     # Provide a generic alias for GPU usage so Phase 3 can honor the same toggle.
     try:
-        if not hasattr(zconfig, 'use_gpu') and hasattr(zconfig, 'use_gpu_phase5'):
-            setattr(zconfig, 'use_gpu', getattr(zconfig, 'use_gpu_phase5'))
+        if hasattr(zconfig, 'use_gpu_phase3'):
+            if not getattr(zconfig, 'use_gpu', False):
+                setattr(zconfig, 'use_gpu', bool(getattr(zconfig, 'use_gpu_phase3')))
+        if not getattr(zconfig, 'use_gpu', False) and hasattr(zconfig, 'use_gpu_phase5'):
+            setattr(zconfig, 'use_gpu', bool(getattr(zconfig, 'use_gpu_phase5')))
     except Exception:
         pass
+    func_id_log_base = "mastertile"
+
     if resource_strategy:
         try:
             if resource_strategy.get('gpu_batch_hint'):
@@ -2713,7 +2718,6 @@ def create_master_tile(
             )
         except Exception:
             pass
-    func_id_log_base = "mastertile"
 
     pcb_tile(f"{func_id_log_base}_info_creation_started_from_cache", prog=None, lvl="INFO",
              num_raw=len(seestar_stack_group_info), tile_id=tile_id)
@@ -5231,6 +5235,34 @@ def run_hierarchical_mosaic(
     _log_memory_usage(progress_callback, "Début Phase 3 (Master Tuiles)")
     pcb("run_info_phase3_started_from_cache", prog=base_progress_phase3, lvl="INFO")
     pcb("PHASE_UPDATE:3", prog=None, lvl="ETA_LEVEL")
+
+    phase3_gpu_requested = False
+    if zconfig is not None:
+        try:
+            phase3_gpu_requested = bool(
+                getattr(zconfig, 'use_gpu', False)
+                or getattr(zconfig, 'use_gpu_phase3', False)
+                or getattr(zconfig, 'use_gpu_phase5', False)
+            )
+        except Exception:
+            phase3_gpu_requested = False
+    gpu_label = "CPU fallback"
+    gpu_available = False
+    if phase3_gpu_requested and ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils:
+        try:
+            gpu_available = bool(zemosaic_utils.gpu_is_available())
+        except Exception:
+            gpu_available = False
+        if gpu_available:
+            try:
+                gpu_label = zemosaic_utils.gpu_device_name()
+            except Exception:
+                gpu_label = "Unknown GPU"
+    if phase3_gpu_requested and gpu_available:
+        pcb(f"[Phase3] GPU mode: enabled ({gpu_label})", prog=None, lvl="INFO")
+    else:
+        pcb("[Phase3] GPU mode: disabled (CPU fallback)", prog=None, lvl="INFO")
+
     temp_master_tile_storage_dir = os.path.join(output_folder, "zemosaic_temp_master_tiles")
     try:
         if os.path.exists(temp_master_tile_storage_dir): shutil.rmtree(temp_master_tile_storage_dir)
