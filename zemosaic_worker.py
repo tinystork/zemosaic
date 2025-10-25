@@ -3831,8 +3831,8 @@ def run_hierarchical_mosaic(
                         pass
                 if not accepted:
                     pcb("run_warn_phase0_filter_cancelled", prog=None, lvl="WARN")
-                    return
-                if filtered_items is not None:
+                    pcb("Phase 0: filter cancelled -> proceeding with all files", prog=None, lvl="INFO_DETAIL")
+                if accepted and filtered_items is not None:
                     fits_file_paths = [item["path"] for item in filtered_items if isinstance(item, dict) and item.get("path")]
                     pcb(f"Phase 0: selection after filter = {len(fits_file_paths)} files", prog=None, lvl="INFO_DETAIL")
                     try:
