@@ -3,5 +3,10 @@
   "api_key": "",
   "timeout": 60,
   "downsample": 2,
-  "force_lum": false
+  "force_lum": false,
+  "astap_executable_path": "",
+  "astap_data_directory_path": "",
+  "astap_search_radius_deg": 3.0,
+  "astap_downsample": 2,
+  "astap_sensitivity": 100
 }

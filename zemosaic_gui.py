@@ -1313,7 +1313,58 @@ class ZeMosaicGUI:
                 }
             except Exception:
                 _initial_overrides = None
-            result = launch_filter_interface(header_items, _initial_overrides)
+            solver_cfg_payload = None
+            config_overrides = None
+            try:
+                astap_exe = self.astap_exe_path_var.get().strip()
+                astap_data = self.astap_data_dir_var.get().strip()
+                try:
+                    astap_radius = float(self.astap_search_radius_var.get())
+                except Exception:
+                    astap_radius = self.solver_settings.astap_search_radius_deg
+                try:
+                    astap_downsample = int(self.astap_downsample_var.get())
+                except Exception:
+                    astap_downsample = self.solver_settings.astap_downsample
+                try:
+                    astap_sensitivity = int(self.astap_sensitivity_var.get())
+                except Exception:
+                    astap_sensitivity = self.solver_settings.astap_sensitivity
+
+                self.solver_settings.astap_executable_path = astap_exe
+                self.solver_settings.astap_data_directory_path = astap_data
+                self.solver_settings.astap_search_radius_deg = astap_radius
+                self.solver_settings.astap_downsample = astap_downsample
+                self.solver_settings.astap_sensitivity = astap_sensitivity
+
+                solver_cfg_payload = asdict(self.solver_settings)
+
+                config_overrides = {
+                    "astap_executable_path": astap_exe,
+                    "astap_data_directory_path": astap_data,
+                    "astap_default_search_radius": astap_radius,
+                    "astap_default_downsample": astap_downsample,
+                    "astap_default_sensitivity": astap_sensitivity,
+                }
+                try:
+                    config_overrides.update({
+                        "auto_limit_frames_per_master_tile": bool(self.auto_limit_frames_var.get()),
+                        "max_raw_per_master_tile": int(self.max_raw_per_tile_var.get()),
+                        "apply_master_tile_crop": bool(self.apply_master_tile_crop_var.get()),
+                        "master_tile_crop_percent": float(self.master_tile_crop_percent_var.get()),
+                    })
+                except Exception:
+                    pass
+            except Exception:
+                solver_cfg_payload = asdict(self.solver_settings)
+                config_overrides = None
+
+            result = launch_filter_interface(
+                header_items,
+                _initial_overrides,
+                solver_settings_dict=solver_cfg_payload,
+                config_overrides=config_overrides,
+            )
         except Exception as e:
             self._log_message(f"[ZGUI] Filter UI error: {e}", level="WARN")
             return
@@ -1711,7 +1762,7 @@ class ZeMosaicGUI:
             cluster_thresh_val = self.cluster_threshold_var.get()
             cluster_target_groups_val = self.cluster_target_groups_var.get()
             cluster_orientation_split_val = self.cluster_orientation_split_var.get()
-            
+
             stack_norm_method = self.stacking_normalize_method_var.get()
             stack_weight_method = self.stacking_weighting_method_var.get()
             stack_reject_algo = self.stacking_rejection_algorithm_var.get()
@@ -1724,7 +1775,7 @@ class ZeMosaicGUI:
             radial_feather_fraction_val = self.radial_feather_fraction_var.get()
             min_radial_weight_floor_val = self.min_radial_weight_floor_var.get()
             radial_shape_power_val = self.config.get("radial_shape_power", 2.0) # Toujours depuis config pour l'instant
-            
+
             final_assembly_method_val = self.final_assembly_method_var.get()
             num_base_workers_gui_val = self.num_workers_var.get()
 
@@ -1732,6 +1783,11 @@ class ZeMosaicGUI:
             self.solver_settings.api_key = self.astrometry_api_key_var.get().strip()
             self.solver_settings.timeout = self.astrometry_timeout_var.get()
             self.solver_settings.downsample = self.astrometry_downsample_var.get()
+            self.solver_settings.astap_executable_path = astap_exe
+            self.solver_settings.astap_data_directory_path = astap_data
+            self.solver_settings.astap_search_radius_deg = astap_radius_val
+            self.solver_settings.astap_downsample = astap_downsample_val
+            self.solver_settings.astap_sensitivity = astap_sensitivity_val
             try:
                 self.solver_settings.save_default()
             except Exception:
