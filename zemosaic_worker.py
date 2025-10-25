@@ -2695,6 +2695,8 @@ def create_master_tile(
             setattr(zconfig, 'use_gpu', bool(getattr(zconfig, 'use_gpu_phase5')))
     except Exception:
         pass
+    func_id_log_base = "mastertile"
+
     if resource_strategy:
         try:
             if resource_strategy.get('gpu_batch_hint'):
@@ -2716,7 +2718,6 @@ def create_master_tile(
             )
         except Exception:
             pass
-    func_id_log_base = "mastertile"
 
     pcb_tile(f"{func_id_log_base}_info_creation_started_from_cache", prog=None, lvl="INFO",
              num_raw=len(seestar_stack_group_info), tile_id=tile_id)
