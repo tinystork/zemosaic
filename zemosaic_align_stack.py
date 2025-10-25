@@ -675,6 +675,43 @@ def compute_weights_noise_fwhm(frames):
     return np.asarray(weights, dtype=np.float32)
 
 
+def _coerce_winsor_limits(value) -> tuple[float, float]:
+    """Return a validated ``(low, high)`` winsorization tuple.
+
+    Accepts ``None``, scalars, comma-delimited strings or iterables with two
+    numeric values. Falls back to ``(0.05, 0.05)`` if parsing fails or the
+    limits fall outside ``[0, 0.5)`` or their sum exceeds 1.0."""
+
+    default_limits = (0.05, 0.05)
+    if value is None:
+        return default_limits
+    if isinstance(value, str):
+        parts = value.split(",")
+        if len(parts) == 2:
+            try:
+                value = (float(parts[0].strip()), float(parts[1].strip()))
+            except ValueError:
+                return default_limits
+        else:
+            return default_limits
+    if isinstance(value, (int, float)):
+        coerced = float(value)
+        if 0.0 <= coerced < 0.5:
+            return (coerced, coerced)
+        return default_limits
+    try:
+        low, high = value  # type: ignore[misc]
+        low = float(low)
+        high = float(high)
+    except Exception:
+        return default_limits
+    if not (0.0 <= low < 0.5 and 0.0 <= high < 0.5):
+        return default_limits
+    if (low + high) >= 1.0:
+        return default_limits
+    return (low, high)
+
+
 def stack_winsorized_sigma_clip(frames, weights=None, zconfig=None, **kwargs):
     """
     Wrapper calling GPU or CPU winsorized sigma clip, with robust GPU guards.
@@ -728,6 +765,9 @@ def stack_winsorized_sigma_clip(frames, weights=None, zconfig=None, **kwargs):
     if max_frames_per_pass < 0:
         max_frames_per_pass = 0
 
+    winsor_limits = _coerce_winsor_limits(kwargs.get("winsor_limits"))
+    kwargs["winsor_limits"] = winsor_limits
+
     def _stack_winsor_streaming(limit: int) -> tuple[_np.ndarray, float]:
         nonlocal frames_list
 
@@ -740,7 +780,7 @@ def stack_winsorized_sigma_clip(frames, weights=None, zconfig=None, **kwargs):
         else:
             weights_array_full = None
 
-        winsor_limits = kwargs.get("winsor_limits", (0.05, 0.05))
+        winsor_limits_stream = winsor_limits
         kappa = kwargs.get("kappa", 3.0)
         apply_rewinsor = kwargs.get("apply_rewinsor", True)
         winsor_max_workers = kwargs.get("winsor_max_workers", 1)
@@ -761,7 +801,7 @@ def stack_winsorized_sigma_clip(frames, weights=None, zconfig=None, **kwargs):
 
             state, _ = _reject_outliers_winsorized_sigma_clip(
                 stacked_array_NHDWC=chunk_arr,
-                winsor_limits_tuple=winsor_limits,
+                winsor_limits_tuple=winsor_limits_stream,
                 sigma_low=float(kappa),
                 sigma_high=float(kappa),
                 progress_callback=progress_callback,
@@ -894,6 +934,7 @@ def stack_winsorized_sigma_clip(frames, weights=None, zconfig=None, **kwargs):
                     _internal_logger.warning(
                         "WARN (align_stack): GPU memory insufficient even after chunking attempts.")
 
+            gpu_kwargs.setdefault("winsor_limits", winsor_limits)
             gpu_img, gpu_rej = _run_gpu(frames_list)
             return gpu_img, float(gpu_rej)
 
@@ -916,6 +957,8 @@ def stack_winsorized_sigma_clip(frames, weights=None, zconfig=None, **kwargs):
 
     if weights is not None:
         kwargs["weights"] = weights  # mot-clé seulement
+
+    kwargs["winsor_limits"] = winsor_limits
 
     return cpu_stack_winsorized(frames_list, **kwargs)
 
@@ -2606,6 +2649,7 @@ def stack_aligned_images(
     if rejection_algorithm == 'kappa_sigma':
         data_for_combine, rejection_mask = _reject_outliers_kappa_sigma(stacked_array_NHDWC, sigma_clip_low, sigma_clip_high, progress_callback)
     elif rejection_algorithm == 'winsorized_sigma_clip':
+        winsor_limits = _coerce_winsor_limits(winsor_limits)
         data_for_combine, rejection_mask = _reject_outliers_winsorized_sigma_clip(
             stacked_array_NHDWC,
             winsor_limits,

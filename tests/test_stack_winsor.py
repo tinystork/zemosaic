@@ -26,3 +26,28 @@ def test_winsorized_sigma_clip_memmap_streaming(tmp_path):
     assert stacked.dtype == np.float32
     assert np.isfinite(stacked).all()
     assert isinstance(rejected, float)
+
+
+def test_winsorized_sigma_clip_handles_none_limits():
+    frames = np.random.rand(4, 5, 5).astype(np.float32)
+    stacked, rejected = zas.stack_winsorized_sigma_clip(frames, winsor_limits=None)
+
+    assert stacked.shape == (5, 5)
+    assert stacked.dtype == np.float32
+    assert isinstance(rejected, float)
+
+
+def test_stack_aligned_images_defaults_winsor_limits():
+    imgs = [np.random.rand(6, 6, 3).astype(np.float32) for _ in range(4)]
+    result = zas.stack_aligned_images(
+        imgs,
+        normalize_method="none",
+        weighting_method="none",
+        rejection_algorithm="winsorized_sigma_clip",
+        final_combine_method="mean",
+        winsor_limits=None,
+    )
+
+    assert isinstance(result, np.ndarray)
+    assert result.shape == (6, 6, 3)
+    assert result.dtype == np.float32
