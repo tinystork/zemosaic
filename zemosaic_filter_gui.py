@@ -33,6 +33,7 @@ import shutil
 import datetime
 import importlib
 import time
+import traceback
 
 
 def launch_filter_interface(
@@ -244,35 +245,38 @@ def launch_filter_interface(
 
         astrometry_mod = None
         worker_mod = None
+        _import_failures: Dict[str, list[str]] = {}
+
+        def _record_import_failure(key: str, module_name: str, exc: BaseException) -> None:
+            message = f"{module_name}: {exc}"
+            try:
+                tb = traceback.format_exception_only(type(exc), exc)
+                if tb:
+                    message = f"{module_name}: {tb[-1].strip()}"
+            except Exception:
+                pass
+            _import_failures.setdefault(key, []).append(message)
+
         def _import_module_with_fallback(mod_name: str):
             """Attempt to import a module regardless of package layout."""
 
-            try:
-                return importlib.import_module(mod_name)
-            except Exception:
-                pass
-
-            # When ZeMosaic is installed as a package (``zemosaic.*``) the
-            # absolute module name may include the package prefix.  Use the
-            # current module package when available so the imports also work
-            # in that layout.
+            candidates = [mod_name]
             pkg = globals().get("__package__") or ""
             if pkg:
-                try:
-                    return importlib.import_module(f"{pkg}.{mod_name}")
-                except Exception:
-                    pass
-
-            # Finally try importing from the top-level ``zemosaic`` package.
+                candidates.append(f"{pkg}.{mod_name}")
             if not mod_name.startswith("zemosaic"):
+                candidates.append(f"zemosaic.{mod_name}")
+
+            for candidate in candidates:
                 try:
-                    return importlib.import_module(f"zemosaic.{mod_name}")
-                except Exception:
-                    pass
+                    return importlib.import_module(candidate)
+                except Exception as exc:
+                    _record_import_failure(mod_name, candidate, exc)
             return None
 
         astrometry_mod = _import_module_with_fallback('zemosaic_astrometry')
         worker_mod = _import_module_with_fallback('zemosaic_worker')
+        worker_import_failure_summary = "; ".join(_import_failures.get('zemosaic_worker', []))
 
         solve_with_astap = getattr(astrometry_mod, 'solve_with_astap', None) if astrometry_mod else None
         extract_center_from_header_fn = getattr(astrometry_mod, 'extract_center_from_header', None) if astrometry_mod else None
@@ -957,6 +961,15 @@ def launch_filter_interface(
 
         if not (cluster_func and autosplit_func):
             auto_btn.state(["disabled"])
+            if worker_import_failure_summary:
+                _log_message(
+                    _tr(
+                        "filter_warn_worker_missing",
+                        "Auto-grouping disabled because the processing worker module failed to load: {error}",
+                        error=worker_import_failure_summary,
+                    ),
+                    level="ERROR",
+                )
 
         def _resolve_missing_wcs_inplace() -> None:
             if not astap_available or solve_with_astap is None:
