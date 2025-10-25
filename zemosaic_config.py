@@ -39,6 +39,12 @@ DEFAULT_CONFIG = {
     "winsor_worker_limit": 10,
     "winsor_max_frames_per_pass": 0,
     "max_raw_per_master_tile": 0,
+    # --- Intertile photometric calibration options ---
+    "intertile_photometric_match": True,
+    "intertile_preview_size": 512,
+    "intertile_overlap_min": 0.05,
+    "intertile_sky_percentile": [30.0, 70.0],
+    "intertile_robust_clip_sigma": 2.5,
     # Early GUI filter option (Phase 0 header-only scan)
     "enable_early_filter": True,
     # --- CLES POUR LE ROGNAGE DES MASTER TUILES ---

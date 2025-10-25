@@ -292,6 +292,15 @@ class ZeMosaicGUI:
         self.cleanup_memmap_var = tk.BooleanVar(master=self.root, value=self.config.get("coadd_cleanup_memmap", True))
         self.auto_limit_frames_var = tk.BooleanVar(master=self.root, value=self.config.get("auto_limit_frames_per_master_tile", True))
         self.max_raw_per_tile_var = tk.IntVar(master=self.root, value=self.config.get("max_raw_per_master_tile", 0))
+        intertile_sky_cfg = self.config.get("intertile_sky_percentile", [30.0, 70.0])
+        if not (isinstance(intertile_sky_cfg, (list, tuple)) and len(intertile_sky_cfg) >= 2):
+            intertile_sky_cfg = [30.0, 70.0]
+        self.intertile_match_var = tk.BooleanVar(master=self.root, value=self.config.get("intertile_photometric_match", True))
+        self.intertile_preview_size_var = tk.IntVar(master=self.root, value=self.config.get("intertile_preview_size", 512))
+        self.intertile_overlap_min_var = tk.DoubleVar(master=self.root, value=self.config.get("intertile_overlap_min", 0.05))
+        self.intertile_sky_low_var = tk.DoubleVar(master=self.root, value=float(intertile_sky_cfg[0]))
+        self.intertile_sky_high_var = tk.DoubleVar(master=self.root, value=float(intertile_sky_cfg[1]))
+        self.intertile_clip_sigma_var = tk.DoubleVar(master=self.root, value=self.config.get("intertile_robust_clip_sigma", 2.5))
         self.use_gpu_phase5_var = tk.BooleanVar(master=self.root, value=self.config.get("use_gpu_phase5", False))
         # Logging level var (keys are ERROR, WARN, INFO, DEBUG)
         self.logging_level_keys = ["ERROR", "WARN", "INFO", "DEBUG"]
@@ -844,6 +853,90 @@ class ZeMosaicGUI:
 
         self.use_gpu_phase5_var.trace_add("write", on_gpu_check)
         on_gpu_check()
+
+        intertile_label = ttk.Label(final_assembly_options_frame, text="")
+        intertile_label.grid(row=asm_opt_row, column=0, padx=5, pady=3, sticky="w")
+        self.translatable_widgets["intertile_match_label"] = intertile_label
+        self.intertile_match_check = ttk.Checkbutton(
+            final_assembly_options_frame,
+            variable=self.intertile_match_var,
+        )
+        self.intertile_match_check.grid(row=asm_opt_row, column=1, padx=5, pady=3, sticky="w")
+        asm_opt_row += 1
+
+        intertile_params_frame = ttk.Frame(final_assembly_options_frame)
+        intertile_params_frame.grid(row=asm_opt_row, column=0, columnspan=2, padx=5, pady=(0, 3), sticky="ew")
+        intertile_params_frame.columnconfigure(1, weight=1)
+
+        preview_label = ttk.Label(intertile_params_frame, text="")
+        preview_label.grid(row=0, column=0, padx=0, pady=2, sticky="w")
+        self.translatable_widgets["intertile_preview_label"] = preview_label
+        ttk.Spinbox(
+            intertile_params_frame,
+            from_=128,
+            to=2048,
+            increment=64,
+            textvariable=self.intertile_preview_size_var,
+            width=8,
+        ).grid(row=0, column=1, padx=(8, 5), pady=2, sticky="w")
+        preview_hint = ttk.Label(intertile_params_frame, text="")
+        preview_hint.grid(row=0, column=2, padx=(8, 0), pady=2, sticky="w")
+        self.translatable_widgets["intertile_preview_hint"] = preview_hint
+
+        overlap_label = ttk.Label(intertile_params_frame, text="")
+        overlap_label.grid(row=1, column=0, padx=0, pady=2, sticky="w")
+        self.translatable_widgets["intertile_overlap_label"] = overlap_label
+        ttk.Spinbox(
+            intertile_params_frame,
+            from_=0.0,
+            to=1.0,
+            increment=0.01,
+            textvariable=self.intertile_overlap_min_var,
+            width=8,
+            format="%.2f",
+        ).grid(row=1, column=1, padx=(8, 5), pady=2, sticky="w")
+        overlap_hint = ttk.Label(intertile_params_frame, text="")
+        overlap_hint.grid(row=1, column=2, padx=(8, 0), pady=2, sticky="w")
+        self.translatable_widgets["intertile_overlap_hint"] = overlap_hint
+
+        sky_label = ttk.Label(intertile_params_frame, text="")
+        sky_label.grid(row=2, column=0, padx=0, pady=2, sticky="w")
+        self.translatable_widgets["intertile_sky_label"] = sky_label
+        sky_frame = ttk.Frame(intertile_params_frame)
+        sky_frame.grid(row=2, column=1, padx=(8, 5), pady=2, sticky="w")
+        ttk.Spinbox(
+            sky_frame,
+            from_=0.0,
+            to=100.0,
+            increment=1.0,
+            textvariable=self.intertile_sky_low_var,
+            width=5,
+            format="%.1f",
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Spinbox(
+            sky_frame,
+            from_=0.0,
+            to=100.0,
+            increment=1.0,
+            textvariable=self.intertile_sky_high_var,
+            width=5,
+            format="%.1f",
+        ).pack(side=tk.LEFT)
+
+        clip_label = ttk.Label(intertile_params_frame, text="")
+        clip_label.grid(row=3, column=0, padx=0, pady=2, sticky="w")
+        self.translatable_widgets["intertile_clip_label"] = clip_label
+        ttk.Spinbox(
+            intertile_params_frame,
+            from_=0.5,
+            to=10.0,
+            increment=0.1,
+            textvariable=self.intertile_clip_sigma_var,
+            width=8,
+            format="%.1f",
+        ).grid(row=3, column=1, padx=(8, 5), pady=2, sticky="w")
+
+        asm_opt_row += 1
 
         # --- Logging Options Frame ---
         self.logging_frame = ttk.LabelFrame(self.scrollable_content_frame, text=self._tr("gui_logging_title", "Logging"))
@@ -1897,6 +1990,14 @@ class ZeMosaicGUI:
         self.config["winsor_worker_limit"] = self.winsor_workers_var.get()
         self.config["winsor_max_frames_per_pass"] = self.winsor_max_frames_var.get()
         self.config["max_raw_per_master_tile"] = self.max_raw_per_tile_var.get()
+        self.config["intertile_photometric_match"] = bool(self.intertile_match_var.get())
+        self.config["intertile_preview_size"] = int(self.intertile_preview_size_var.get())
+        self.config["intertile_overlap_min"] = float(self.intertile_overlap_min_var.get())
+        self.config["intertile_sky_percentile"] = [
+            float(self.intertile_sky_low_var.get()),
+            float(self.intertile_sky_high_var.get()),
+        ]
+        self.config["intertile_robust_clip_sigma"] = float(self.intertile_clip_sigma_var.get())
         # Persist logging level
         self.config["logging_level"] = self.logging_level_var.get()
 
@@ -1951,6 +2052,14 @@ class ZeMosaicGUI:
             self.winsor_max_frames_var.get(),
             self.winsor_workers_var.get(),
             self.max_raw_per_tile_var.get(),
+            bool(self.intertile_match_var.get()),
+            int(self.intertile_preview_size_var.get()),
+            float(self.intertile_overlap_min_var.get()),
+            [
+                float(self.intertile_sky_low_var.get()),
+                float(self.intertile_sky_high_var.get()),
+            ],
+            float(self.intertile_clip_sigma_var.get()),
             self.use_gpu_phase5_var.get(),
             gpu_id,
             self.logging_level_var.get(),

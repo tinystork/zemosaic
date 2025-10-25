@@ -3090,6 +3090,11 @@ def assemble_final_mosaic_reproject_coadd(
     base_progress_phase5: float | None = None,
     progress_weight_phase5: float | None = None,
     start_time_total_run: float | None = None,
+    intertile_photometric_match: bool = False,
+    intertile_preview_size: int = 512,
+    intertile_overlap_min: float = 0.05,
+    intertile_sky_percentile: tuple[float, float] | list[float] = (30.0, 70.0),
+    intertile_robust_clip_sigma: float = 2.5,
 ):
     """Assemble les master tiles en utilisant ``reproject_and_coadd``."""
     _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
@@ -3311,6 +3316,60 @@ def assemble_final_mosaic_reproject_coadd(
 
 
 
+    if (
+        intertile_photometric_match
+        and len(input_data_all_tiles_HWC_processed) >= 2
+        and ZEMOSAIC_UTILS_AVAILABLE
+        and hasattr(zemosaic_utils, "compute_intertile_affine_calibration")
+    ):
+        try:
+            corrections = zemosaic_utils.compute_intertile_affine_calibration(
+                input_data_all_tiles_HWC_processed,
+                final_output_wcs,
+                final_output_shape_hw,
+                preview_size=intertile_preview_size,
+                min_overlap_fraction=intertile_overlap_min,
+                sky_percentile=intertile_sky_percentile,
+                robust_clip_sigma=intertile_robust_clip_sigma,
+                progress_callback=progress_callback,
+            )
+        except Exception as exc_intertile:
+            corrections = {}
+            _pcb(
+                "assemble_warn_intertile_photometric_failed",
+                prog=None,
+                lvl="WARN",
+                error=str(exc_intertile),
+            )
+        else:
+            if corrections:
+                corrected_tiles = 0
+                for tile_idx, gain_offset in corrections.items():
+                    if not isinstance(gain_offset, (tuple, list)) or len(gain_offset) < 2:
+                        continue
+                    if not isinstance(tile_idx, int) or tile_idx < 0 or tile_idx >= len(input_data_all_tiles_HWC_processed):
+                        continue
+                    gain_val = float(gain_offset[0])
+                    offset_val = float(gain_offset[1])
+                    arr, tile_wcs = input_data_all_tiles_HWC_processed[tile_idx]
+                    if arr is None:
+                        continue
+                    try:
+                        arr *= gain_val
+                        arr += offset_val
+                        input_data_all_tiles_HWC_processed[tile_idx] = (arr, tile_wcs)
+                        corrected_tiles += 1
+                    except Exception:
+                        continue
+                if corrected_tiles:
+                    _pcb(
+                        "assemble_info_intertile_photometric_applied",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                        num_tiles=corrected_tiles,
+                    )
+
+
     # Build kwargs dynamically to remain compatible with different reproject versions
     reproj_kwargs = {}
     try:
@@ -3527,6 +3586,11 @@ def run_hierarchical_mosaic(
     winsor_max_frames_per_pass_config: int,
     winsor_worker_limit_config: int,
     max_raw_per_master_tile_config: int,
+    intertile_photometric_match_config: bool = True,
+    intertile_preview_size_config: int = 512,
+    intertile_overlap_min_config: float = 0.05,
+    intertile_sky_percentile_config: tuple[float, float] | list[float] = (30.0, 70.0),
+    intertile_robust_clip_sigma_config: float = 2.5,
     use_gpu_phase5: bool = False,
     gpu_id_phase5: int | None = None,
     logging_level_config: str = "INFO",
@@ -3586,6 +3650,17 @@ def run_hierarchical_mosaic(
     phase0_header_items: list[dict] = []
     phase0_lookup: dict[str, dict] = {}
     preplan_groups_override_paths: list[list[str]] | None = None
+
+    try:
+        if isinstance(intertile_sky_percentile_config, (list, tuple)) and len(intertile_sky_percentile_config) >= 2:
+            intertile_sky_percentile_tuple = (
+                float(intertile_sky_percentile_config[0]),
+                float(intertile_sky_percentile_config[1]),
+            )
+        else:
+            intertile_sky_percentile_tuple = (30.0, 70.0)
+    except Exception:
+        intertile_sky_percentile_tuple = (30.0, 70.0)
 
     def _normalize_path_for_matching(path_value: str | None) -> str | None:
         if not path_value:
@@ -5205,6 +5280,11 @@ def run_hierarchical_mosaic(
                     base_progress_phase5=base_progress_phase5,
                     progress_weight_phase5=PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
                     start_time_total_run=start_time_total_run,
+                    intertile_photometric_match=bool(intertile_photometric_match_config),
+                    intertile_preview_size=int(intertile_preview_size_config),
+                    intertile_overlap_min=float(intertile_overlap_min_config),
+                    intertile_sky_percentile=intertile_sky_percentile_tuple,
+                    intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
                 )
             except Exception as e_gpu:
                 logger.warning("GPU reproject_coadd failed, falling back to CPU: %s", e_gpu)
@@ -5224,6 +5304,11 @@ def run_hierarchical_mosaic(
                     base_progress_phase5=base_progress_phase5,
                     progress_weight_phase5=PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
                     start_time_total_run=start_time_total_run,
+                    intertile_photometric_match=bool(intertile_photometric_match_config),
+                    intertile_preview_size=int(intertile_preview_size_config),
+                    intertile_overlap_min=float(intertile_overlap_min_config),
+                    intertile_sky_percentile=intertile_sky_percentile_tuple,
+                    intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
                 )
         else:
             final_mosaic_data_HWC, final_mosaic_coverage_HW = assemble_final_mosaic_reproject_coadd(
@@ -5242,6 +5327,11 @@ def run_hierarchical_mosaic(
                 base_progress_phase5=base_progress_phase5,
                 progress_weight_phase5=PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
                 start_time_total_run=start_time_total_run,
+                intertile_photometric_match=bool(intertile_photometric_match_config),
+                intertile_preview_size=int(intertile_preview_size_config),
+                intertile_overlap_min=float(intertile_overlap_min_config),
+                intertile_sky_percentile=intertile_sky_percentile_tuple,
+                intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
             )
 
         log_key_phase5_failed = "run_error_phase5_assembly_failed_reproject_coadd"

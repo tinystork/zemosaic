@@ -32,6 +32,14 @@
     "winsor_worker_limit": 10,
     "winsor_max_frames_per_pass": 50,
     "max_raw_per_master_tile": 0,
+    "intertile_photometric_match": true,
+    "intertile_preview_size": 512,
+    "intertile_overlap_min": 0.05,
+    "intertile_sky_percentile": [
+        30.0,
+        70.0
+    ],
+    "intertile_robust_clip_sigma": 2.5,
     "enable_early_filter": true,
     "apply_master_tile_crop": true,
     "master_tile_crop_percent": 18.0,
