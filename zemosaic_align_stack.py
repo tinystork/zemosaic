@@ -299,6 +299,31 @@ def _free_gpu_pools():
             pass
 
 
+def _gpu_nanpercentile(values: np.ndarray, percentiles):
+    """Compute nan-aware percentiles on the GPU and release cached memory."""
+
+    if not GPU_AVAILABLE:
+        raise RuntimeError("CuPy is not available")
+
+    arr_gpu = None
+    try:
+        import cupy as cp  # type: ignore
+
+        _ensure_gpu_pool()
+        arr_gpu = cp.asarray(values, dtype=cp.float32)
+        result_gpu = cp.nanpercentile(arr_gpu, percentiles)
+
+        if np.isscalar(percentiles):
+            return float(result_gpu)
+
+        result_np = cp.asnumpy(result_gpu)
+        return np.asarray(result_np, dtype=np.float64)
+    finally:
+        if arr_gpu is not None:
+            del arr_gpu
+        _free_gpu_pools()
+
+
 def _has_gpu_budget(estimated_bytes: int) -> bool:
     func = _callable_or_none(_gpu_memory_ok)
     if func is None:
@@ -661,12 +686,15 @@ def _calculate_robust_stats_for_linear_fit(image_data_2d_float32: np.ndarray,
         if use_gpu and GPU_AVAILABLE:
             try:
                 if ZU_AVAILABLE and hasattr(zutils, "_percentiles_gpu"):
-                    stat_low, stat_high = zutils._percentiles_gpu(image_data_2d_float32, low_percentile, high_percentile)  # type: ignore[attr-defined]
+                    stat_low, stat_high = zutils._percentiles_gpu(
+                        image_data_2d_float32, low_percentile, high_percentile
+                    )  # type: ignore[attr-defined]
                 else:
-                    import cupy as cp  # type: ignore
-                    a = cp.asarray(image_data_2d_float32)
-                    stat_low = float(cp.nanpercentile(a, low_percentile))
-                    stat_high = float(cp.nanpercentile(a, high_percentile))
+                    stats = _gpu_nanpercentile(
+                        image_data_2d_float32,
+                        [low_percentile, high_percentile],
+                    )
+                    stat_low, stat_high = float(stats[0]), float(stats[1])
             except Exception:
                 stat_low = float(np.nanpercentile(image_data_2d_float32, low_percentile))
                 stat_high = float(np.nanpercentile(image_data_2d_float32, high_percentile))
@@ -1010,11 +1038,13 @@ def _normalize_images_sky_mean(image_list: list[np.ndarray | None],
             # Utiliser nanpercentile pour être robuste aux NaNs potentiels
             if use_gpu and GPU_AVAILABLE:
                 try:
-                    import cupy as cp  # type: ignore
-                    a = cp.asarray(target_data_for_ref_sky)
-                    ref_sky_level = float(cp.nanpercentile(a, sky_percentile))
+                    ref_sky_level = float(
+                        _gpu_nanpercentile(target_data_for_ref_sky, sky_percentile)
+                    )
                 except Exception:
-                    ref_sky_level = float(np.nanpercentile(target_data_for_ref_sky, sky_percentile))
+                    ref_sky_level = float(
+                        np.nanpercentile(target_data_for_ref_sky, sky_percentile)
+                    )
             else:
                 ref_sky_level = np.nanpercentile(target_data_for_ref_sky, sky_percentile)
             _pcb(f"NormSkyMean: Fond de ciel de référence (img idx {reference_index}) estimé à {ref_sky_level:.3g}", lvl="DEBUG_DETAIL")
@@ -1063,11 +1093,13 @@ def _normalize_images_sky_mean(image_list: list[np.ndarray | None],
             try:
                 if use_gpu and GPU_AVAILABLE:
                     try:
-                        import cupy as cp  # type: ignore
-                        ac = cp.asarray(target_data_for_current_sky)
-                        current_sky_level = float(cp.nanpercentile(ac, sky_percentile))
+                        current_sky_level = float(
+                            _gpu_nanpercentile(target_data_for_current_sky, sky_percentile)
+                        )
                     except Exception:
-                        current_sky_level = float(np.nanpercentile(target_data_for_current_sky, sky_percentile))
+                        current_sky_level = float(
+                            np.nanpercentile(target_data_for_current_sky, sky_percentile)
+                        )
                 else:
                     current_sky_level = np.nanpercentile(target_data_for_current_sky, sky_percentile)
             except Exception as e_perc_curr:
