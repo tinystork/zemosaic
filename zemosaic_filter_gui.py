@@ -378,9 +378,22 @@ def launch_filter_interface(
             except Exception:
                 overrides_state = {}
 
-        # If virtually nothing to display, skip GUI
-        if not any((it.center is not None) for it in items):
-            return raw_files_with_wcs, False
+        # Determine available sky coordinates.  Older projects or raw header
+        # scans may not provide any RA/Dec information, in which case we still
+        # want to display the file list even if the sky preview cannot show any
+        # overlay.  Fall back to a neutral reference center so downstream logic
+        # continues to work (thresholds, wrapping helpers, etc.).
+        centers_available = [it.center for it in items if it.center is not None]
+        has_explicit_centers = bool(centers_available)
+        if not centers_available:
+            fallback_center: Optional[SkyCoord] = None
+            for it in items:
+                if it.phase0_center is not None:
+                    fallback_center = it.phase0_center
+                    break
+            if fallback_center is None:
+                fallback_center = SkyCoord(ra=0.0 * u.deg, dec=0.0 * u.deg, frame="icrs")
+            centers_available = [fallback_center]
 
         # Compute robust global center via unit-vector average
         def average_skycoord(coords: list[SkyCoord]) -> SkyCoord:
@@ -390,7 +403,6 @@ def launch_filter_interface(
             sc = SkyCoord(x=vec_norm[0] * u.one, y=vec_norm[1] * u.one, z=vec_norm[2] * u.one, frame="icrs", representation_type="cartesian").spherical
             return SkyCoord(ra=sc.lon.to(u.deg), dec=sc.lat.to(u.deg), frame="icrs")
 
-        centers_available = [it.center for it in items if it.center is not None]
         global_center: SkyCoord = centers_available[0] if len(centers_available) == 1 else average_skycoord(centers_available)
 
         # RA wrapping helper around a reference RA
@@ -628,14 +640,25 @@ def launch_filter_interface(
                 if sep > thr:
                     var.set(False)
             update_visuals()
-        ttk.Button(
+        thresh_button = ttk.Button(
             thresh_frame,
             text=_tr(
                 "filter_apply_threshold_button",
                 "Exclure > X°" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Exclude > X°",
             ),
             command=apply_threshold,
-        ).grid(row=0, column=2, padx=4, pady=4)
+        )
+        thresh_button.grid(row=0, column=2, padx=4, pady=4)
+
+        if not has_explicit_centers:
+            try:
+                thresh_entry.state(["disabled"])
+            except Exception:
+                thresh_entry.configure(state=tk.DISABLED)
+            try:
+                thresh_button.state(["disabled"])
+            except Exception:
+                pass
 
         # Logging pane
         log_frame = ttk.LabelFrame(
@@ -660,6 +683,15 @@ def launch_filter_interface(
                 log_widget.see(tk.END)
             except Exception:
                 pass
+
+        if not has_explicit_centers:
+            _log_message(
+                _tr(
+                    "filter_warn_no_displayable_wcs",
+                    "Aucune information WCS/centre disponible ; l'aperçu restera vide mais vous pouvez sélectionner les fichiers." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "No WCS/center information available; the sky preview will remain empty but you can still select files.",
+                ),
+                level="WARN",
+            )
 
         def _progress_callback(msg: Any, _progress: Any = None, lvl: str | None = None) -> None:
             if msg is None:
@@ -813,6 +845,14 @@ def launch_filter_interface(
 
         summary_var = tk.StringVar(master=root, value="")
         resolved_counter = {"count": int(overrides_state.get("resolved_wcs_count", 0) or 0)}
+
+        if not has_explicit_centers:
+            summary_var.set(
+                _tr(
+                    "filter_summary_no_centers",
+                    "Centres WCS indisponibles — sélection manuelle uniquement." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "WCS centers unavailable — manual selection only.",
+                )
+            )
 
         operations = ttk.Frame(right)
         operations.grid(row=3, column=0, sticky="ew", padx=5, pady=5)
