@@ -103,6 +103,31 @@ def _has_any_finite(arr: np.ndarray) -> bool:
     return np.isfinite(arr).any()
 
 
+def _mask_for_sigma_stats(data: np.ndarray) -> Optional[np.ma.MaskedArray]:
+    """Mask invalid entries before ``sigma_clipped_stats`` computations.
+
+    Returns ``None`` when no finite samples remain to avoid triggering
+    ``RuntimeWarning`` inside Astropy's nanfunctions helpers.
+    """
+
+    masked = np.ma.masked_invalid(data, copy=False)
+    valid_count = masked.count()
+    if isinstance(valid_count, np.ndarray):
+        if not np.any(valid_count):
+            return None
+    elif valid_count == 0:
+        return None
+    return masked
+
+
+def _fill_sigma_result(value):
+    """Return a plain ``numpy`` array or scalar from sigma-clipped outputs."""
+
+    if isinstance(value, np.ma.MaskedArray):
+        return value.filled(np.nan)
+    return value
+
+
 def _winsorize_block_numpy(arr_block: np.ndarray, limits: tuple[float, float]) -> np.ndarray:
     """Winsorize a spatial block along axis 0 without modifying the input."""
 
@@ -1186,7 +1211,8 @@ def _calculate_image_weights_noise_variance(image_list: list[np.ndarray | None],
                     _pcb(f"WeightNoiseVar: Image {i}, Canal {c_idx} vide.", lvl="WARN")
                     current_image_channel_variances.append(np.inf) # Poids sera quasi nul
                     continue
-                if not _has_any_finite(channel_data):
+                channel_masked = _mask_for_sigma_stats(channel_data)
+                if channel_masked is None:
                     _pcb(
                         f"WeightNoiseVar: Image {i}, Canal {c_idx} sans données finies.",
                         lvl="WARN",
@@ -1196,8 +1222,9 @@ def _calculate_image_weights_noise_variance(image_list: list[np.ndarray | None],
                 try:
                     # Utiliser sigma_lower, sigma_upper pour un écrêtage plus robuste
                     _, _, stddev_ch = sigma_clipped_stats_func(
-                        channel_data, sigma_lower=3.0, sigma_upper=3.0, maxiters=5
+                        channel_masked, sigma_lower=3.0, sigma_upper=3.0, maxiters=5
                     )
+                    stddev_ch = _fill_sigma_result(stddev_ch)
                     if stddev_ch is not None and np.isfinite(stddev_ch) and stddev_ch > 1e-9: # 1e-9 pour éviter variance nulle
                         current_image_channel_variances.append(stddev_ch**2)
                     else:
@@ -1213,7 +1240,8 @@ def _calculate_image_weights_noise_variance(image_list: list[np.ndarray | None],
                 _pcb(f"WeightNoiseVar: Image monochrome {i} vide.", lvl="WARN")
                 current_image_channel_variances.append(np.inf)
             else:
-                if not _has_any_finite(img_for_stats):
+                img_masked = _mask_for_sigma_stats(img_for_stats)
+                if img_masked is None:
                     _pcb(
                         f"WeightNoiseVar: Image monochrome {i} sans données finies.",
                         lvl="WARN",
@@ -1222,8 +1250,9 @@ def _calculate_image_weights_noise_variance(image_list: list[np.ndarray | None],
                     continue
                 try:
                     _, _, stddev = sigma_clipped_stats_func(
-                        img_for_stats, sigma_lower=3.0, sigma_upper=3.0, maxiters=5
+                        img_masked, sigma_lower=3.0, sigma_upper=3.0, maxiters=5
                     )
+                    stddev = _fill_sigma_result(stddev)
                     if stddev is not None and np.isfinite(stddev) and stddev > 1e-9:
                         current_image_channel_variances.append(stddev**2)
                     else:
@@ -1321,8 +1350,15 @@ def _estimate_initial_fwhm(data_2d: np.ndarray, progress_callback: callable = No
         return default_fwhm
 
     try:
+        masked_data = _mask_for_sigma_stats(data_2d)
+        if masked_data is None:
+            _pcb_est("fwhm_est_no_finite_data", lvl="DEBUG_DETAIL", returned_fwhm=default_fwhm)
+            return default_fwhm
+
         # Estimation simple du fond et du bruit pour la segmentation
-        _, median, std = sigma_clipped_stats_func(data_2d, sigma=3.0, maxiters=5)
+        _, median, std = sigma_clipped_stats_func(masked_data, sigma=3.0, maxiters=5)
+        median = _fill_sigma_result(median)
+        std = _fill_sigma_result(std)
         if not (np.isfinite(median) and np.isfinite(std) and std > 1e-6):
             _pcb_est("fwhm_est_stats_invalid", lvl="DEBUG_DETAIL", returned_fwhm=default_fwhm)
             return default_fwhm
@@ -1451,12 +1487,18 @@ def _calculate_image_weights_noise_fwhm(image_list: list[np.ndarray | None],
                                    filter_size=(3, 3), sigma_clip=sigma_clip_bg_obj, bkg_estimator=bkg_estimator_obj)
                 data_subtracted = target_data_for_fwhm - bkg_obj.background
                 threshold_daofind_val = 5.0 * bkg_obj.background_rms 
-            except (ValueError, TypeError) as ve_bkg: 
+            except (ValueError, TypeError) as ve_bkg:
                 _pcb("weight_fwhm_bkg2d_error", lvl="WARN", img_idx=i, error=str(ve_bkg))
                 if not _has_any_finite(target_data_for_fwhm):
                     _pcb("weight_fwhm_no_finite_data_after_bkg_fail", lvl="WARN", img_idx=i)
                     fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
-                _, median_glob, stddev_glob = sigma_clipped_stats_func(target_data_for_fwhm, sigma=3.0, maxiters=5)
+                masked_target = _mask_for_sigma_stats(target_data_for_fwhm)
+                if masked_target is None:
+                    _pcb("weight_fwhm_no_valid_pixels_global_stats", lvl="WARN", img_idx=i)
+                    fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
+                _, median_glob, stddev_glob = sigma_clipped_stats_func(masked_target, sigma=3.0, maxiters=5)
+                median_glob = _fill_sigma_result(median_glob)
+                stddev_glob = _fill_sigma_result(stddev_glob)
                 if not (np.isfinite(median_glob) and np.isfinite(stddev_glob)):
                     _pcb("weight_fwhm_global_stats_invalid", lvl="WARN", img_idx=i)
                     fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
@@ -1626,7 +1668,8 @@ def _reject_outliers_kappa_sigma(stacked_array_NHDWC, sigma_low, sigma_high, pro
         step_times = []
         for c in range(total_steps):
             channel_data = stacked_array_NHDWC[..., c]
-            if not _has_any_finite(channel_data):
+            channel_masked = _mask_for_sigma_stats(channel_data)
+            if channel_masked is None:
                 _pcb(
                     "stack_kappa_warn_empty_channel_after_mask",
                     lvl="WARN",
@@ -1641,9 +1684,11 @@ def _reject_outliers_kappa_sigma(stacked_array_NHDWC, sigma_low, sigma_high, pro
                         pass
                 continue
             try:
-                _, median_ch, stddev_ch = sigma_clipped_stats_func(channel_data, sigma_lower=sigma_low, sigma_upper=sigma_high, axis=0, maxiters=5)
+                _, median_ch, stddev_ch = sigma_clipped_stats_func(channel_masked, sigma_lower=sigma_low, sigma_upper=sigma_high, axis=0, maxiters=5)
             except TypeError:
-                _, median_ch, stddev_ch = sigma_clipped_stats_func(channel_data, sigma=max(sigma_low, sigma_high), axis=0, maxiters=5)
+                _, median_ch, stddev_ch = sigma_clipped_stats_func(channel_masked, sigma=max(sigma_low, sigma_high), axis=0, maxiters=5)
+            median_ch = _fill_sigma_result(median_ch)
+            stddev_ch = _fill_sigma_result(stddev_ch)
             lower_bound = median_ch - sigma_low * stddev_ch; upper_bound = median_ch + sigma_high * stddev_ch
             channel_rejection_this_iter = (channel_data < lower_bound) | (channel_data > upper_bound)
             rejection_mask[..., c] = ~channel_rejection_this_iter
@@ -1660,8 +1705,14 @@ def _reject_outliers_kappa_sigma(stacked_array_NHDWC, sigma_low, sigma_high, pro
         if not _has_any_finite(stacked_array_NHDWC):
             _pcb("stack_kappa_warn_empty_stack_after_mask", lvl="WARN")
             return output_data_with_nans, rejection_mask
-        try: _, median_img, stddev_img = sigma_clipped_stats_func(stacked_array_NHDWC, sigma_lower=sigma_low, sigma_upper=sigma_high, axis=0, maxiters=5)
-        except TypeError: _, median_img, stddev_img = sigma_clipped_stats_func(stacked_array_NHDWC, sigma=max(sigma_low, sigma_high), axis=0, maxiters=5)
+        stacked_masked = _mask_for_sigma_stats(stacked_array_NHDWC)
+        if stacked_masked is None:
+            _pcb("stack_kappa_warn_empty_stack_after_mask", lvl="WARN")
+            return output_data_with_nans, rejection_mask
+        try: _, median_img, stddev_img = sigma_clipped_stats_func(stacked_masked, sigma_lower=sigma_low, sigma_upper=sigma_high, axis=0, maxiters=5)
+        except TypeError: _, median_img, stddev_img = sigma_clipped_stats_func(stacked_masked, sigma=max(sigma_low, sigma_high), axis=0, maxiters=5)
+        median_img = _fill_sigma_result(median_img)
+        stddev_img = _fill_sigma_result(stddev_img)
         lower_bound = median_img - sigma_low * stddev_img; upper_bound = median_img + sigma_high * stddev_img
         stats_rejection_this_iter = (stacked_array_NHDWC < lower_bound) | (stacked_array_NHDWC > upper_bound)
         rejection_mask = ~stats_rejection_this_iter
@@ -1850,7 +1901,8 @@ def _reject_outliers_winsorized_sigma_clip(
                     orig_block = original_channel_data_NHW[:, rows_slice, :]
                     wins_block = _winsorize_block_numpy(orig_block, winsor_limits_tuple)
 
-                    if not _has_any_finite(wins_block):
+                    wins_masked = _mask_for_sigma_stats(wins_block)
+                    if wins_masked is None:
                         _pcb(
                             "reject_winsor_warn_empty_block",
                             lvl="WARN",
@@ -1859,13 +1911,15 @@ def _reject_outliers_winsorized_sigma_clip(
                         continue
                     try:
                         _, median_winsorized, stddev_winsorized = sigma_clipped_stats_func(
-                            wins_block, sigma=3.0, axis=0, maxiters=5
+                            wins_masked, sigma=3.0, axis=0, maxiters=5
                         )
                     except TypeError:
                         _, median_winsorized, stddev_winsorized = sigma_clipped_stats_func(
-                            wins_block, sigma_lower=3.0, sigma_upper=3.0, axis=0, maxiters=5
+                            wins_masked, sigma_lower=3.0, sigma_upper=3.0, axis=0, maxiters=5
                         )
 
+                    median_winsorized = _fill_sigma_result(median_winsorized)
+                    stddev_winsorized = _fill_sigma_result(stddev_winsorized)
                     lower_bound = median_winsorized - (sigma_low * stddev_winsorized)
                     upper_bound = median_winsorized + (sigma_high * stddev_winsorized)
 
@@ -1909,18 +1963,21 @@ def _reject_outliers_winsorized_sigma_clip(
                 orig_block = original_data_NHW[:, rows_slice, :]
                 wins_block = _winsorize_block_numpy(orig_block, winsor_limits_tuple)
 
-                if not _has_any_finite(wins_block):
+                wins_masked = _mask_for_sigma_stats(wins_block)
+                if wins_masked is None:
                     _pcb("reject_winsor_warn_empty_block", lvl="WARN", channel="mono")
                     continue
                 try:
                     _, median_winsorized, stddev_winsorized = sigma_clipped_stats_func(
-                        wins_block, sigma=3.0, axis=0, maxiters=5
+                        wins_masked, sigma=3.0, axis=0, maxiters=5
                     )
                 except TypeError:
                      _, median_winsorized, stddev_winsorized = sigma_clipped_stats_func(
-                        wins_block, sigma_lower=3.0, sigma_upper=3.0, axis=0, maxiters=5
+                        wins_masked, sigma_lower=3.0, sigma_upper=3.0, axis=0, maxiters=5
                     )
 
+                median_winsorized = _fill_sigma_result(median_winsorized)
+                stddev_winsorized = _fill_sigma_result(stddev_winsorized)
                 lower_bound = median_winsorized - (sigma_low * stddev_winsorized)
                 upper_bound = median_winsorized + (sigma_high * stddev_winsorized)
 
