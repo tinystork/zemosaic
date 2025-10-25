@@ -555,6 +555,112 @@ def gpu_stack_linear(frames, *, sigma=3.0):
         _free_gpu_pools()
 
 
+def normalize_frames_linear_fit(frames):
+    """Normalize frames by fitting a linear transform to the first frame."""
+
+    import numpy as np
+
+    if not frames:
+        return []
+
+    ref = np.asarray(frames[0], dtype=np.float32)
+    normed = [ref]
+    if ref.size == 0:
+        return [np.asarray(f, dtype=np.float32) for f in frames]
+
+    for f in frames[1:]:
+        arr = np.asarray(f, dtype=np.float32)
+        x = arr.reshape(-1).astype(np.float64)
+        y = ref.reshape(-1).astype(np.float64)
+        mask = np.isfinite(x) & np.isfinite(y)
+        if mask.sum() < 1024:
+            normed.append(arr)
+            continue
+        try:
+            a, b = np.polyfit(x[mask], y[mask], 1)
+            normed.append((arr * a + b).astype(np.float32))
+        except Exception:
+            normed.append(arr)
+    return normed
+
+
+def normalize_frames_sky_mean(frames):
+    """Scale frames so that their mean sky level matches the global mean."""
+
+    import numpy as np
+
+    if not frames:
+        return []
+
+    normed = []
+    sky_levels = [np.nanmean(np.asarray(f, dtype=np.float32)) for f in frames]
+    ref_mean = np.nanmean(sky_levels) if sky_levels else np.nan
+    for f, m in zip(frames, sky_levels):
+        arr = np.asarray(f, dtype=np.float32)
+        if not np.isfinite(m) or m <= 0 or not np.isfinite(ref_mean):
+            normed.append(arr)
+            continue
+        scale = float(ref_mean) / float(m)
+        normed.append((arr * scale).astype(np.float32))
+    return normed
+
+
+def compute_weights_noise_variance(frames):
+    """Compute inverse variance weights for a sequence of frames."""
+
+    import numpy as np
+
+    if not frames:
+        return np.asarray([], dtype=np.float32)
+
+    variances = []
+    for f in frames:
+        arr = np.asarray(f, dtype=np.float32)
+        variances.append(np.nanvar(arr) + 1e-6)
+    return np.asarray([1.0 / v for v in variances], dtype=np.float32)
+
+
+def compute_weights_noise_fwhm(frames):
+    """Estimate weights from star FWHM measurements, fallback to variance."""
+
+    import numpy as np
+
+    def _to_luminance(frame: np.ndarray) -> np.ndarray:
+        if frame.ndim == 2:
+            return frame
+        if frame.ndim == 3 and frame.shape[-1] in (3, 4):
+            return np.nanmean(frame, axis=-1)
+        return frame.reshape(frame.shape[0], frame.shape[1]) if frame.ndim > 2 else frame
+
+    try:
+        from photutils.detection import DAOStarFinder
+        from astropy.stats import sigma_clipped_stats
+    except Exception:
+        return compute_weights_noise_variance(frames)
+
+    weights = []
+    for f in frames:
+        arr = np.asarray(f, dtype=np.float32)
+        image_2d = _to_luminance(arr)
+        try:
+            mean, median, std = sigma_clipped_stats(image_2d, sigma=3.0)
+            daofind = DAOStarFinder(fwhm=3.0, threshold=5.0 * std)
+            sources = daofind(image_2d - median)
+            if sources is None or len(sources) == 0:
+                weights.append(1.0)
+                continue
+            mean_fwhm = np.nanmean(sources['fwhm'])
+            if not np.isfinite(mean_fwhm):
+                weights.append(1.0)
+            else:
+                weights.append(1.0 / (mean_fwhm + 1e-3))
+        except Exception:
+            weights.append(1.0)
+    if not weights:
+        return compute_weights_noise_variance(frames)
+    return np.asarray(weights, dtype=np.float32)
+
+
 def stack_winsorized_sigma_clip(frames, weights=None, zconfig=None, **kwargs):
     """
     Wrapper calling GPU or CPU winsorized sigma clip, with robust GPU guards.
