@@ -4,6 +4,7 @@ import numpy as np
 import os
 import importlib.util
 import tempfile
+import warnings
 from dataclasses import dataclass
 from typing import Optional
 
@@ -126,6 +127,85 @@ def _fill_sigma_result(value):
     if isinstance(value, np.ma.MaskedArray):
         return value.filled(np.nan)
     return value
+
+
+def _sigma_clipped_stats_safe(data, **kwargs):
+    """Wrapper around ``sigma_clipped_stats`` that avoids RuntimeWarnings."""
+
+    if not SIGMA_CLIP_AVAILABLE or sigma_clipped_stats_func is None:
+        raise RuntimeError("sigma_clipped_stats is unavailable")
+
+    if data is None:
+        return np.nan, np.nan, np.nan
+
+    kwargs = dict(kwargs)
+    axis = kwargs.pop("axis", None)
+
+    masked = data if isinstance(data, np.ma.MaskedArray) else np.ma.masked_invalid(data, copy=False)
+
+    if axis is None:
+        valid_count = masked.count()
+        if isinstance(valid_count, np.ndarray):
+            total_valid = int(np.sum(valid_count))
+        else:
+            total_valid = int(valid_count)
+        if total_valid == 0:
+            return np.nan, np.nan, np.nan
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            return sigma_clipped_stats_func(masked, **kwargs)
+
+    if axis == 0:
+        if masked.ndim == 0 or masked.shape[0] == 0:
+            tail_shape = masked.shape[1:] if masked.ndim > 0 else ()
+            nan_arr = np.full(tail_shape, np.nan, dtype=np.float32) if tail_shape else np.nan
+            return nan_arr, nan_arr, nan_arr
+
+        lead = masked.shape[0]
+        tail_shape = masked.shape[1:]
+        mask_array = np.ma.getmaskarray(masked)
+        reshaped_data = np.ma.MaskedArray(
+            masked.reshape((lead, -1)),
+            mask=mask_array.reshape((lead, -1)),
+            copy=False,
+        )
+        valid_counts = reshaped_data.count(axis=0)
+        valid_mask = valid_counts > 0
+        if not np.any(valid_mask):
+            nan_arr = np.full(tail_shape, np.nan, dtype=np.float32)
+            return nan_arr, nan_arr, nan_arr
+
+        filtered = reshaped_data[:, valid_mask]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            mean_valid, median_valid, std_valid = sigma_clipped_stats_func(
+                filtered, axis=0, **kwargs
+            )
+
+        def _expand(value):
+            base = _fill_sigma_result(value)
+            arr = np.asarray(base, dtype=np.float32).reshape(-1)
+            if arr.size == 1 and valid_mask.sum() > 1:
+                arr = np.full(int(valid_mask.sum()), float(arr[0]), dtype=np.float32)
+            return arr
+
+        mean_full = np.full(valid_mask.shape, np.nan, dtype=np.float32)
+        median_full = np.full(valid_mask.shape, np.nan, dtype=np.float32)
+        std_full = np.full(valid_mask.shape, np.nan, dtype=np.float32)
+
+        mean_full[valid_mask] = _expand(mean_valid)
+        median_full[valid_mask] = _expand(median_valid)
+        std_full[valid_mask] = _expand(std_valid)
+
+        return (
+            mean_full.reshape(tail_shape),
+            median_full.reshape(tail_shape),
+            std_full.reshape(tail_shape),
+        )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        return sigma_clipped_stats_func(masked, axis=axis, **kwargs)
 
 
 def _winsorize_block_numpy(arr_block: np.ndarray, limits: tuple[float, float]) -> np.ndarray:
@@ -1221,7 +1301,7 @@ def _calculate_image_weights_noise_variance(image_list: list[np.ndarray | None],
                     continue
                 try:
                     # Utiliser sigma_lower, sigma_upper pour un écrêtage plus robuste
-                    _, _, stddev_ch = sigma_clipped_stats_func(
+                    _, _, stddev_ch = _sigma_clipped_stats_safe(
                         channel_masked, sigma_lower=3.0, sigma_upper=3.0, maxiters=5
                     )
                     stddev_ch = _fill_sigma_result(stddev_ch)
@@ -1249,7 +1329,7 @@ def _calculate_image_weights_noise_variance(image_list: list[np.ndarray | None],
                     current_image_channel_variances.append(np.inf)
                     continue
                 try:
-                    _, _, stddev = sigma_clipped_stats_func(
+                    _, _, stddev = _sigma_clipped_stats_safe(
                         img_masked, sigma_lower=3.0, sigma_upper=3.0, maxiters=5
                     )
                     stddev = _fill_sigma_result(stddev)
@@ -1356,7 +1436,7 @@ def _estimate_initial_fwhm(data_2d: np.ndarray, progress_callback: callable = No
             return default_fwhm
 
         # Estimation simple du fond et du bruit pour la segmentation
-        _, median, std = sigma_clipped_stats_func(masked_data, sigma=3.0, maxiters=5)
+        _, median, std = _sigma_clipped_stats_safe(masked_data, sigma=3.0, maxiters=5)
         median = _fill_sigma_result(median)
         std = _fill_sigma_result(std)
         if not (np.isfinite(median) and np.isfinite(std) and std > 1e-6):
@@ -1496,7 +1576,7 @@ def _calculate_image_weights_noise_fwhm(image_list: list[np.ndarray | None],
                 if masked_target is None:
                     _pcb("weight_fwhm_no_valid_pixels_global_stats", lvl="WARN", img_idx=i)
                     fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
-                _, median_glob, stddev_glob = sigma_clipped_stats_func(masked_target, sigma=3.0, maxiters=5)
+                _, median_glob, stddev_glob = _sigma_clipped_stats_safe(masked_target, sigma=3.0, maxiters=5)
                 median_glob = _fill_sigma_result(median_glob)
                 stddev_glob = _fill_sigma_result(stddev_glob)
                 if not (np.isfinite(median_glob) and np.isfinite(stddev_glob)):
@@ -1684,9 +1764,9 @@ def _reject_outliers_kappa_sigma(stacked_array_NHDWC, sigma_low, sigma_high, pro
                         pass
                 continue
             try:
-                _, median_ch, stddev_ch = sigma_clipped_stats_func(channel_masked, sigma_lower=sigma_low, sigma_upper=sigma_high, axis=0, maxiters=5)
+                _, median_ch, stddev_ch = _sigma_clipped_stats_safe(channel_masked, sigma_lower=sigma_low, sigma_upper=sigma_high, axis=0, maxiters=5)
             except TypeError:
-                _, median_ch, stddev_ch = sigma_clipped_stats_func(channel_masked, sigma=max(sigma_low, sigma_high), axis=0, maxiters=5)
+                _, median_ch, stddev_ch = _sigma_clipped_stats_safe(channel_masked, sigma=max(sigma_low, sigma_high), axis=0, maxiters=5)
             median_ch = _fill_sigma_result(median_ch)
             stddev_ch = _fill_sigma_result(stddev_ch)
             lower_bound = median_ch - sigma_low * stddev_ch; upper_bound = median_ch + sigma_high * stddev_ch
@@ -1709,8 +1789,8 @@ def _reject_outliers_kappa_sigma(stacked_array_NHDWC, sigma_low, sigma_high, pro
         if stacked_masked is None:
             _pcb("stack_kappa_warn_empty_stack_after_mask", lvl="WARN")
             return output_data_with_nans, rejection_mask
-        try: _, median_img, stddev_img = sigma_clipped_stats_func(stacked_masked, sigma_lower=sigma_low, sigma_upper=sigma_high, axis=0, maxiters=5)
-        except TypeError: _, median_img, stddev_img = sigma_clipped_stats_func(stacked_masked, sigma=max(sigma_low, sigma_high), axis=0, maxiters=5)
+        try: _, median_img, stddev_img = _sigma_clipped_stats_safe(stacked_masked, sigma_lower=sigma_low, sigma_upper=sigma_high, axis=0, maxiters=5)
+        except TypeError: _, median_img, stddev_img = _sigma_clipped_stats_safe(stacked_masked, sigma=max(sigma_low, sigma_high), axis=0, maxiters=5)
         median_img = _fill_sigma_result(median_img)
         stddev_img = _fill_sigma_result(stddev_img)
         lower_bound = median_img - sigma_low * stddev_img; upper_bound = median_img + sigma_high * stddev_img
@@ -1910,11 +1990,11 @@ def _reject_outliers_winsorized_sigma_clip(
                         )
                         continue
                     try:
-                        _, median_winsorized, stddev_winsorized = sigma_clipped_stats_func(
+                        _, median_winsorized, stddev_winsorized = _sigma_clipped_stats_safe(
                             wins_masked, sigma=3.0, axis=0, maxiters=5
                         )
                     except TypeError:
-                        _, median_winsorized, stddev_winsorized = sigma_clipped_stats_func(
+                        _, median_winsorized, stddev_winsorized = _sigma_clipped_stats_safe(
                             wins_masked, sigma_lower=3.0, sigma_upper=3.0, axis=0, maxiters=5
                         )
 
@@ -1968,11 +2048,11 @@ def _reject_outliers_winsorized_sigma_clip(
                     _pcb("reject_winsor_warn_empty_block", lvl="WARN", channel="mono")
                     continue
                 try:
-                    _, median_winsorized, stddev_winsorized = sigma_clipped_stats_func(
+                    _, median_winsorized, stddev_winsorized = _sigma_clipped_stats_safe(
                         wins_masked, sigma=3.0, axis=0, maxiters=5
                     )
                 except TypeError:
-                     _, median_winsorized, stddev_winsorized = sigma_clipped_stats_func(
+                     _, median_winsorized, stddev_winsorized = _sigma_clipped_stats_safe(
                         wins_masked, sigma_lower=3.0, sigma_upper=3.0, axis=0, maxiters=5
                     )
 

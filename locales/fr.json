@@ -354,6 +354,7 @@
     "assemble_error_invalid_final_shape_reproj_coadd": "ERREUR Reproject & Coadd : dimensions finales invalides {shape}.",
     "assemble_warn_swapped_final_shape_reproj_coadd": "AVERTISSEMENT Reproject & Coadd : dimensions fournies {provided} inversées, attendu {expected}. Correction automatique.",
     "assemble_error_mismatch_final_shape_reproj_coadd": "ERREUR Reproject & Coadd : dimensions fournies {provided} incompatibles avec la grille {expected}.",
+    "assemble_info_gpu_flag": "Reproject & Coadd : indicateur GPU = {use_gpu}.",
 
     "aligngroup_error_astroalign_unavailable": "AlignGroup ERREUR : astroalign non disponible. Alignement impossible.",
     "aligngroup_error_invalid_input_list_or_ref_index": "AlignGroup ERREUR : liste d'images invalide ou index de référence {ref_idx} hors bornes.",
@@ -373,6 +374,7 @@
     "run_error_phase5_assembly_failed_incremental": "ERREUR P5 : Échec de l'assemblage final via la méthode incrémentale.",
     "run_info_phase5_finished_incremental": "Phase 5 terminée : Assemblage incrémental terminé. Shape mosaïque (HWC) : {shape}",
     "run_warn_phase5_invalid_tile_skipped_for_assembly": "AVERT P5 : Master Tuile invalide ({filename}) ignorée pour l'assemblage final.",
+    "run_info_phase5_gpu_mode": "Mode GPU Phase 5 : {mode}. {details}",
 
     "getwcs_info_header_written": "Entête WCS mis à jour pour : {filename}",
     "getwcs_warn_header_write_failed": "AVERTISSEMENT : Échec de mise à jour de l'entête WCS pour {filename} : {error}",
