@@ -4029,6 +4029,13 @@ def run_hierarchical_mosaic(
     resource_probe_info = _probe_system_resources(output_folder)
     auto_caps_info: dict | None = None
     auto_resource_strategy: dict = {}
+    if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
+        try:
+            zconfig = SimpleNamespace(**(zemosaic_config.load_config() or {}))
+        except Exception:
+            zconfig = SimpleNamespace()
+    else:
+        zconfig = SimpleNamespace()
     phase0_header_items: list[dict] = []
     phase0_lookup: dict[str, dict] = {}
     preplan_groups_override_paths: list[list[str]] | None = None
