@@ -205,7 +205,13 @@ class ZeMosaicGUI:
         
         # --- Définition des listes de clés pour les ComboBoxes ---
         self.norm_method_keys = ["none", "linear_fit", "sky_mean"]
-        self.weight_method_keys = ["none", "noise_variance", "noise_fwhm"]
+        self.weight_method_keys = [
+            "none",
+            "noise_variance",
+            "noise_fwhm",
+            "noise_plus_fwhm",
+            "exposure_median",
+        ]
         self.reject_algo_keys = ["none", "kappa_sigma", "winsorized_sigma_clip", "linear_fit_clip"]
         self.combine_method_keys = ["mean", "median"]
         self.assembly_method_keys = ["reproject_coadd", "incremental"]
@@ -250,7 +256,12 @@ class ZeMosaicGUI:
         
         # --- Variables Tkinter pour les Options de Stacking ---
         self.stacking_normalize_method_var = tk.StringVar(master=self.root, value=self.config.get("stacking_normalize_method", self.norm_method_keys[0]))
-        self.stacking_weighting_method_var = tk.StringVar(master=self.root, value=self.config.get("stacking_weighting_method", self.weight_method_keys[0]))
+        self.stacking_weighting_method_var = tk.StringVar(
+            master=self.root,
+            value=self.config.get("stacking_weighting_method", self.weight_method_keys[0]),
+        )
+        if self.stacking_weighting_method_var.get() not in self.weight_method_keys:
+            self.stacking_weighting_method_var.set(self.weight_method_keys[0])
         self.stacking_rejection_algorithm_var = tk.StringVar(master=self.root, value=self.config.get("stacking_rejection_algorithm", self.reject_algo_keys[1]))
         
         self.stacking_kappa_low_var = tk.DoubleVar(master=self.root, value=self.config.get("stacking_kappa_low", 3.0))
@@ -627,7 +638,13 @@ class ZeMosaicGUI:
         # Pondération
         weight_label = ttk.Label(stacking_options_frame, text="")
         weight_label.grid(row=stk_opt_row, column=0, padx=5, pady=3, sticky="w"); self.translatable_widgets["stacking_weight_method_label"] = weight_label
-        self.weight_method_combo = ttk.Combobox(stacking_options_frame, values=[], state="readonly", width=25)
+        self.weight_method_combo = ttk.Combobox(
+            stacking_options_frame,
+            values=[],
+            state="readonly",
+            width=25,
+            textvariable=self.stacking_weighting_method_var,
+        )
         self.weight_method_combo.grid(row=stk_opt_row, column=1, padx=5, pady=3, sticky="ew", columnspan=3)
         self.weight_method_combo.bind("<<ComboboxSelected>>", lambda e, c=self.weight_method_combo, v=self.stacking_weighting_method_var, k_list=self.weight_method_keys, p="weight_method": self._combo_to_key(e, c, v, k_list, p)); stk_opt_row += 1
         # Rejet
@@ -1835,11 +1852,17 @@ class ZeMosaicGUI:
                                    self._tr("processing_already_running_warning"), 
                                    parent=self.root)
             return
-        if not ZEMOSAIC_WORKER_AVAILABLE or not run_hierarchical_mosaic: 
-            messagebox.showerror(self._tr("critical_error_title"), 
-                                 self._tr("worker_module_unavailable_error"), 
+        if not ZEMOSAIC_WORKER_AVAILABLE or not run_hierarchical_mosaic:
+            messagebox.showerror(self._tr("critical_error_title"),
+                                 self._tr("worker_module_unavailable_error"),
                                  parent=self.root)
             return
+
+        try:
+            if hasattr(self.root, "update_idletasks"):
+                self.root.update_idletasks()
+        except Exception:
+            pass
 
         # 1. RÉCUPÉRER TOUTES les valeurs des variables Tkinter
         skip_filter_ui_for_run = False
@@ -1891,11 +1914,23 @@ class ZeMosaicGUI:
             master_tile_crop_percent_val = self.master_tile_crop_percent_var.get()
             # --- FIN RÉCUPÉRATION ROGNAGE ---
             
-        except tk.TclError as e: 
-            messagebox.showerror(self._tr("param_error_title"), 
-                                 self._tr("invalid_param_value_error", error=e), 
+        except tk.TclError as e:
+            messagebox.showerror(self._tr("param_error_title"),
+                                 self._tr("invalid_param_value_error", error=e),
                                  parent=self.root)
             return
+
+        self.config["stacking_normalize_method"] = stack_norm_method
+        self.config["stacking_weighting_method"] = stack_weight_method
+        self.config["stacking_rejection_algorithm"] = stack_reject_algo
+        self.config["stacking_kappa_low"] = float(stack_kappa_low)
+        self.config["stacking_kappa_high"] = float(stack_kappa_high)
+        self.config["stacking_winsor_limits"] = stack_winsor_limits_str
+        self.config["stacking_final_combine_method"] = stack_final_combine
+        self.config["apply_radial_weight"] = bool(apply_radial_weight_val)
+        self.config["radial_feather_fraction"] = float(radial_feather_fraction_val)
+        self.config["radial_shape_power"] = float(radial_shape_power_val)
+        self.config["min_radial_weight_floor"] = float(min_radial_weight_floor_val)
 
         # 2. VALIDATIONS (chemins, etc.)
         # ... (section de validation inchangée pour l'instant)
@@ -2019,6 +2054,13 @@ class ZeMosaicGUI:
         except Exception:
             stack_ram_budget_val = 0.0
         self.config["stack_ram_budget_gb"] = stack_ram_budget_val
+
+        print(
+            f"[GUI] Stacking -> norm={self.config['stacking_normalize_method']}, "
+            f"weight={self.config['stacking_weighting_method']}, "
+            f"reject={self.config['stacking_rejection_algorithm']}, "
+            f"combine={self.config['stacking_final_combine_method']}"
+        )
 
         worker_args = (
             input_dir, output_dir, astap_exe, astap_data,
