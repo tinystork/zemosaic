@@ -32,6 +32,7 @@ import sys
 import shutil
 import datetime
 import importlib
+import time
 
 
 def launch_filter_interface(
@@ -1106,7 +1107,7 @@ def launch_filter_interface(
         # Confirm/cancel buttons
         bottom = ttk.Frame(right)
         bottom.grid(row=5, column=0, sticky="ew", padx=5, pady=5)
-        result: dict[str, Any] = {"accepted": False, "selected_indices": None, "overrides": None}
+        result: dict[str, Any] = {"accepted": None, "selected_indices": None, "overrides": None}
         def on_validate():
             sel = [i for i, v in enumerate(check_vars) if v.get()]
             result["accepted"] = True
@@ -1318,7 +1319,8 @@ def launch_filter_interface(
 
         # On window close: treat as cancel (keep all)
         def on_close():
-            result["accepted"] = False
+            if result.get("accepted") is None:
+                result["accepted"] = False
             result["selected_indices"] = None
             root.destroy()
         root.protocol("WM_DELETE_WINDOW", on_close)
@@ -1331,15 +1333,48 @@ def launch_filter_interface(
                     parent.wait_window(root)
                 except Exception:
                     # Fallback to simple update loop
-                    root.update(); root.update_idletasks()
+                    try:
+                        root.update()
+                        root.update_idletasks()
+                    except Exception:
+                        pass
             else:
                 root.mainloop()
         except KeyboardInterrupt:
             # If interrupted, keep default behavior (keep all)
             pass
+        except Exception:
+            # Some environments (notably on Windows when running from a
+            # multiprocessing daemon) occasionally fail to enter Tk's
+            # mainloop, leaving the window unresponsive.  Fall back to a
+            # manual event pump so the user can still interact with the UI.
+            try:
+                deadline = time.monotonic() + 3600.0  # 1 hour safety cap
+                while True:
+                    try:
+                        root.update_idletasks()
+                        root.update()
+                    except Exception:
+                        break
+                    # Exit when the window is destroyed or a decision was made
+                    if not root.winfo_exists() or result.get("accepted") is not None:
+                        break
+                    if time.monotonic() > deadline:
+                        break
+                    time.sleep(0.05)
+                try:
+                    if root.winfo_exists():
+                        root.destroy()
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
         # Return selection (and move unselected files into 'filtered_by_user')
-        if result.get("accepted") and isinstance(result.get("selected_indices"), list):
+        accepted_flag = result.get("accepted")
+        if accepted_flag is None:
+            accepted_flag = False
+        if accepted_flag and isinstance(result.get("selected_indices"), list):
             sel = result["selected_indices"]  # type: ignore[assignment]
 
             # Compute unselected indices
