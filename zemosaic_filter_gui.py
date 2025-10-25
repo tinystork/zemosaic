@@ -34,6 +34,8 @@ import datetime
 import importlib
 import time
 import traceback
+import threading
+import queue
 
 
 def launch_filter_interface(
@@ -748,6 +750,15 @@ def launch_filter_interface(
         log_widget = scrolledtext.ScrolledText(log_frame, height=6, wrap=tk.WORD, state=tk.DISABLED)
         log_widget.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
 
+        async_events: "queue.Queue[tuple[Any, ...]]" = queue.Queue()
+        resolve_state = {"running": False}
+
+        def _enqueue_event(kind: str, *payload: Any) -> None:
+            try:
+                async_events.put_nowait((kind, *payload))
+            except Exception:
+                pass
+
         def _log_message(message: str, level: str = "INFO") -> None:
             try:
                 timestamp = datetime.datetime.now().strftime("%H:%M:%S")
@@ -771,11 +782,7 @@ def launch_filter_interface(
             if msg is None:
                 return
             level = (lvl or "INFO")
-            _log_message(str(msg), level=level)
-            try:
-                root.update_idletasks()
-            except Exception:
-                pass
+            _enqueue_event("log", str(msg), level)
 
         def _sanitize_path(value: Any) -> str:
             """Normalize user-provided filesystem paths.
@@ -972,13 +979,31 @@ def launch_filter_interface(
                 )
 
         def _resolve_missing_wcs_inplace() -> None:
+            if resolve_state["running"]:
+                return
             if not astap_available or solve_with_astap is None:
                 _log_message(
                     _tr("filter_warn_astap_missing", "ASTAP executable not configured; skipping resolution."),
                     level="WARN",
                 )
                 return
+
+            pending = [
+                (idx, item)
+                for idx, item in enumerate(items)
+                if item.wcs is None and isinstance(item.path, str) and os.path.isfile(item.path)
+            ]
+            if not pending:
+                msg = _tr("filter_log_no_missing_wcs", "All listed files already include a WCS solution.")
+                summary_var.set(msg)
+                _log_message(msg, level="INFO")
+                return
+
+            resolve_state["running"] = True
             resolve_btn.state(["disabled"])
+            summary_var.set(_tr("filter_log_resolving", "Resolving missing WCS..."))
+            _log_message(_tr("filter_log_resolving", "Resolving missing WCS..."), level="INFO")
+
             try:
                 try:
                     srch_radius = float(search_radius_default)
@@ -993,63 +1018,50 @@ def launch_filter_interface(
                 except Exception:
                     downsample_val = None
 
-                resolved_now = 0
-                for idx, item in enumerate(items):
-                    if item.wcs is not None:
-                        continue
-                    path = item.path
-                    if not (isinstance(path, str) and os.path.isfile(path)):
-                        continue
-                    header_obj = item.header
-                    if header_obj is None and astap_fits_module is not None and astap_astropy_available:
-                        try:
-                            with astap_fits_module.open(path) as hdul_hdr:
-                                header_obj = hdul_hdr[0].header
-                                item.header = header_obj
-                                item.src["header"] = header_obj
-                        except Exception:
-                            header_obj = item.header
+                def _resolve_worker(pairs: list[tuple[int, Any]]) -> None:
+                    resolved_now = 0
                     try:
-                        wcs_obj = solve_with_astap(
-                            path,
-                            header_obj,
-                            astap_exe_path,
-                            astap_data_dir,
-                            search_radius_deg=srch_radius,
-                            downsample_factor=downsample_val,
-                            sensitivity=None,
-                            timeout_sec=60,
-                            update_original_header_in_place=False,
-                            progress_callback=_progress_callback,
-                        )
-                    except Exception as exc:
-                        _log_message(f"ASTAP resolve exception: {exc}", level="ERROR")
-                        wcs_obj = None
-                    if wcs_obj and getattr(wcs_obj, "is_celestial", False):
-                        item.src["wcs"] = wcs_obj
-                        item.wcs = wcs_obj
-                        item.refresh_geometry()
-                        _refresh_item_visual(idx)
-                        resolved_now += 1
-                        try:
-                            root.update_idletasks()
-                        except Exception:
-                            pass
-                if resolved_now >= 0:
-                    resolved_counter["count"] += resolved_now
-                    if resolved_now > 0:
-                        overrides_state["resolved_wcs_count"] = resolved_counter["count"]
-                    summary_msg = _tr(
-                        "filter_log_resolved_n",
-                        "Resolved WCS for {n} files.",
-                        n=resolved_now,
-                    )
-                    _log_message(summary_msg, level="INFO")
-                    if resolved_now > 0:
-                        _recompute_axes_limits()
-            finally:
-                if astap_available:
-                    resolve_btn.state(["!disabled"])
+                        for idx, item in pairs:
+                            path = item.path
+                            header_obj = item.header
+                            if header_obj is not None:
+                                _enqueue_event("header_loaded", idx, header_obj)
+                            elif astap_fits_module is not None and astap_astropy_available:
+                                try:
+                                    with astap_fits_module.open(path) as hdul_hdr:
+                                        header_obj = hdul_hdr[0].header
+                                        if header_obj is not None:
+                                            _enqueue_event("header_loaded", idx, header_obj)
+                                except Exception as exc:
+                                    _enqueue_event("log", f"Failed to load FITS header for '{path}': {exc}", "ERROR")
+                                    header_obj = item.header
+                            try:
+                                wcs_obj = solve_with_astap(
+                                    path,
+                                    header_obj,
+                                    astap_exe_path,
+                                    astap_data_dir,
+                                    search_radius_deg=srch_radius,
+                                    downsample_factor=downsample_val,
+                                    sensitivity=None,
+                                    timeout_sec=60,
+                                    update_original_header_in_place=False,
+                                    progress_callback=_progress_callback,
+                                )
+                            except Exception as exc:
+                                _enqueue_event("log", f"ASTAP resolve exception: {exc}", "ERROR")
+                                wcs_obj = None
+                            if wcs_obj and getattr(wcs_obj, "is_celestial", False):
+                                resolved_now += 1
+                                _enqueue_event("resolved_item", idx, header_obj, wcs_obj)
+                    finally:
+                        _enqueue_event("resolve_done", resolved_now)
+
+                threading.Thread(target=_resolve_worker, args=(pending,), daemon=True).start()
+            except Exception:
+                resolve_state["running"] = False
+                resolve_btn.state(["!disabled"])
+                raise
 
         def _auto_organize_master_tiles() -> None:
             if not (cluster_func and autosplit_func):
@@ -1417,6 +1429,75 @@ def launch_filter_interface(
                     new_point = None
             update_visuals(idx)
             _recompute_axes_limits()
+
+        def _process_async_events() -> None:
+            try:
+                while True:
+                    event = async_events.get_nowait()
+                    kind = event[0]
+                    if kind == "log":
+                        _, message, level = event
+                        _log_message(str(message), level=str(level))
+                    elif kind == "header_loaded":
+                        _, idx, header_obj = event
+                        if (
+                            isinstance(idx, int)
+                            and 0 <= idx < len(items)
+                            and header_obj is not None
+                        ):
+                            item = items[idx]
+                            item.header = header_obj
+                            item.src["header"] = header_obj
+                    elif kind == "resolved_item":
+                        _, idx, header_obj, wcs_obj = event
+                        if isinstance(idx, int) and 0 <= idx < len(items):
+                            item = items[idx]
+                            if header_obj is not None:
+                                item.header = header_obj
+                                item.src["header"] = header_obj
+                            if wcs_obj is not None and getattr(wcs_obj, "is_celestial", False):
+                                item.src["wcs"] = wcs_obj
+                                item.wcs = wcs_obj
+                                try:
+                                    item.refresh_geometry()
+                                except Exception:
+                                    pass
+                                _refresh_item_visual(idx)
+                    elif kind == "resolve_done":
+                        _, resolved_now = event
+                        try:
+                            resolved_count = int(resolved_now)
+                        except Exception:
+                            resolved_count = 0
+                        if resolved_count >= 0:
+                            resolved_counter["count"] += resolved_count
+                            if resolved_count > 0:
+                                overrides_state["resolved_wcs_count"] = resolved_counter["count"]
+                        summary_msg = _tr(
+                            "filter_log_resolved_n",
+                            "Resolved WCS for {n} files.",
+                            n=resolved_count,
+                        )
+                        summary_var.set(summary_msg)
+                        _log_message(summary_msg, level="INFO")
+                        if resolved_count > 0:
+                            _recompute_axes_limits()
+                        resolve_state["running"] = False
+                        try:
+                            resolve_btn.state(["!disabled"])
+                        except Exception:
+                            pass
+                    else:
+                        pass
+            except queue.Empty:
+                pass
+            finally:
+                try:
+                    root.after(150, _process_async_events)
+                except Exception:
+                    pass
+
+        _process_async_events()
 
         # Click-to-select/deselect via matplotlib pick events
         def _on_pick(event):
