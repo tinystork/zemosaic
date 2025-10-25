@@ -418,6 +418,7 @@
     "filter_log_resolved_n": "Resolved WCS for {n} files.",
     "filter_log_groups_summary": "Prepared {g} group(s), sizes: {sizes}.",
     "filter_warn_astap_missing": "ASTAP executable not configured; skipping resolution.",
+    "filter_warn_worker_missing": "Auto-grouping disabled because the processing worker module failed to load: {error}",
     "filter_select_all": "Select all",
     "filter_select_none": "Select none",
     "filter_validate": "Validate",
