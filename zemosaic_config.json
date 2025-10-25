@@ -30,6 +30,7 @@
     "assembly_process_workers": 0,
     "auto_limit_frames_per_master_tile": true,
     "winsor_worker_limit": 10,
+
     "winsor_max_frames_per_pass": 50,
     "max_raw_per_master_tile": 0,
     "intertile_photometric_match": true,
@@ -40,6 +41,7 @@
         70.0
     ],
     "intertile_robust_clip_sigma": 2.5,
+
     "enable_early_filter": true,
     "apply_master_tile_crop": true,
     "master_tile_crop_percent": 18.0,
