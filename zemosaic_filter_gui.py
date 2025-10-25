@@ -778,11 +778,37 @@ def launch_filter_interface(
                 level="WARN",
             )
 
-        def _progress_callback(msg: Any, _progress: Any = None, lvl: str | None = None) -> None:
+        def _progress_callback(
+            msg: Any,
+            progress: Any = None,
+            lvl: str | None = None,
+            **kwargs: Any,
+        ) -> None:
+            """Forward worker log messages without assuming a strict signature.
+
+            Older worker callbacks only forwarded ``(message, progress, level)``
+            while newer worker builds may pass additional keyword arguments used
+            for GUI formatting.  Accepting ``**kwargs`` prevents ``TypeError``
+            exceptions from background threads and keeps the logging pane
+            functional.
+            """
+
             if msg is None:
                 return
+
             level = (lvl or "INFO")
-            _enqueue_event("log", str(msg), level)
+            text = str(msg)
+
+            detail_parts: list[str] = []
+            if progress not in (None, ""):
+                detail_parts.append(f"progress={progress}")
+            if kwargs:
+                detail_parts.extend(f"{key}={value}" for key, value in kwargs.items())
+
+            if detail_parts:
+                text = f"{text} ({', '.join(detail_parts)})"
+
+            _enqueue_event("log", text, level)
 
         def _sanitize_path(value: Any) -> str:
             """Normalize user-provided filesystem paths.
