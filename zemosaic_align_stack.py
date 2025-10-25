@@ -1,5 +1,6 @@
 # zemosaic_align_stack.py
 
+import math
 import numpy as np
 import os
 import importlib.util
