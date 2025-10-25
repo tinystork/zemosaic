@@ -181,14 +181,35 @@ def launch_filter_interface(
 
         astrometry_mod = None
         worker_mod = None
-        try:
-            astrometry_mod = importlib.import_module('zemosaic_astrometry')
-        except Exception:
-            astrometry_mod = None
-        try:
-            worker_mod = importlib.import_module('zemosaic_worker')
-        except Exception:
-            worker_mod = None
+        def _import_module_with_fallback(mod_name: str):
+            """Attempt to import a module regardless of package layout."""
+
+            try:
+                return importlib.import_module(mod_name)
+            except Exception:
+                pass
+
+            # When ZeMosaic is installed as a package (``zemosaic.*``) the
+            # absolute module name may include the package prefix.  Use the
+            # current module package when available so the imports also work
+            # in that layout.
+            pkg = globals().get("__package__") or ""
+            if pkg:
+                try:
+                    return importlib.import_module(f"{pkg}.{mod_name}")
+                except Exception:
+                    pass
+
+            # Finally try importing from the top-level ``zemosaic`` package.
+            if not mod_name.startswith("zemosaic"):
+                try:
+                    return importlib.import_module(f"zemosaic.{mod_name}")
+                except Exception:
+                    pass
+            return None
+
+        astrometry_mod = _import_module_with_fallback('zemosaic_astrometry')
+        worker_mod = _import_module_with_fallback('zemosaic_worker')
 
         solve_with_astap = getattr(astrometry_mod, 'solve_with_astap', None) if astrometry_mod else None
         extract_center_from_header_fn = getattr(astrometry_mod, 'extract_center_from_header', None) if astrometry_mod else None
@@ -662,11 +683,29 @@ def launch_filter_interface(
         autosplit_cap = max(1, min(50, autosplit_cap))
         autosplit_min_cap = min(8, autosplit_cap)
 
+        def _astap_path_available(path: str) -> bool:
+            """Return True when the configured ASTAP location looks valid."""
+
+            if not path:
+                return False
+
+            if os.path.isfile(path):
+                return True
+
+            # macOS packages are directories ending with ``.app``
+            if sys.platform == "darwin" and path.lower().endswith(".app") and os.path.isdir(path):
+                return True
+
+            # As a generic fallback accept any existing executable entry.
+            try:
+                return os.path.exists(path) and os.access(path, os.X_OK)
+            except Exception:
+                return False
+
         astap_available = bool(
-            astap_exe_path
-            and os.path.isfile(astap_exe_path)
-            and solve_with_astap is not None
+            solve_with_astap is not None
             and astap_astropy_available
+            and _astap_path_available(astap_exe_path)
         )
 
         # Scrollable checkboxes list
