@@ -738,6 +738,61 @@ def _auto_split_groups(
     return new_groups
 
 
+def _group_center_deg(group):
+    """Renvoie le centre RA/DEC moyen d'un groupe."""
+
+    ras, decs = [], []
+    for info in group:
+        ra, dec = info.get("RA"), info.get("DEC")
+        if ra is not None and dec is not None:
+            ras.append(float(ra))
+            decs.append(float(dec))
+    if not ras:
+        return None
+    return (sum(ras) / len(ras), sum(decs) / len(decs))
+
+
+def _angular_sep_deg(a, b):
+    """Distance angulaire simple en degrés (approximation suffisante)."""
+
+    if not a or not b:
+        return 9999
+    dra = abs(a[0] - b[0])
+    ddec = abs(a[1] - b[1])
+    return (dra**2 + ddec**2) ** 0.5
+
+
+def _merge_small_groups(groups, min_size, cap):
+    """
+    Fusionne les petits groupes (<min_size) avec le plus proche voisin
+    si le total reste <= cap (avec marge 10%).
+    """
+
+    merged_flags = [False] * len(groups)
+    centers = [_group_center_deg(g) for g in groups]
+
+    for i, gi in enumerate(groups):
+        if merged_flags[i] or len(gi) >= min_size:
+            continue
+
+        best_j, best_d = None, 1e9
+        for j, gj in enumerate(groups):
+            if i == j or merged_flags[j]:
+                continue
+            d = _angular_sep_deg(centers[i], centers[j])
+            if d < best_d:
+                best_d, best_j = d, j
+
+        if best_j is not None and len(groups[best_j]) + len(gi) <= int(cap * 1.1):
+            groups[best_j].extend(gi)
+            merged_flags[i] = True
+            print(
+                f"[AutoMerge] Group {i} ({len(gi)} imgs) merged into {best_j} (now {len(groups[best_j])})"
+            )
+
+    return [g for k, g in enumerate(groups) if not merged_flags[k]]
+
+
 def _attempt_recluster_for_budget(
     group: list[dict],
     budget_bytes: int,
@@ -4604,6 +4659,12 @@ def run_hierarchical_mosaic(
                     )
                 except Exception:
                     pass
+            if min_value > 0:
+                seestar_stack_groups = _merge_small_groups(
+                    seestar_stack_groups,
+                    min_size=min_value,
+                    cap=cap_value,
+                )
 
     # Do not subdivide groups if a target group count is set; respect clustering first.
     if (
