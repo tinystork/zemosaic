@@ -267,6 +267,47 @@ try:
 except Exception:
     ZU_AVAILABLE = False
 
+if ZU_AVAILABLE:
+    _ensure_pool = getattr(zutils, "ensure_cupy_pool_initialized", None)
+    _free_pools = getattr(zutils, "free_cupy_memory_pools", None)
+    _gpu_memory_ok = getattr(zutils, "gpu_memory_sufficient", None)
+else:
+    _ensure_pool = None
+    _free_pools = None
+    _gpu_memory_ok = None
+
+
+def _callable_or_none(func):
+    return func if callable(func) else None
+
+
+def _ensure_gpu_pool():
+    func = _callable_or_none(_ensure_pool)
+    if func is not None:
+        try:
+            func()
+        except Exception:
+            pass
+
+
+def _free_gpu_pools():
+    func = _callable_or_none(_free_pools)
+    if func is not None:
+        try:
+            func()
+        except Exception:
+            pass
+
+
+def _has_gpu_budget(estimated_bytes: int) -> bool:
+    func = _callable_or_none(_gpu_memory_ok)
+    if func is None:
+        return True
+    try:
+        return bool(func(int(estimated_bytes), safety_fraction=0.75))
+    except Exception:
+        return True
+
 # --- Import des méthodes de stack CPU provenant du projet Seestar ---
 cpu_stack_winsorized = None
 cpu_stack_kappa = None
@@ -287,48 +328,93 @@ except Exception as e_import_stack:
 # --- Implementations GPU simplifiées des méthodes de stack ---
 def gpu_stack_winsorized(frames, *, kappa=3.0, winsor_limits=(0.05, 0.05), apply_rewinsor=True):
     import cupy as cp
-    arr = cp.stack([cp.asarray(f) for f in frames], axis=0)
-    low_q = cp.quantile(arr, winsor_limits[0], axis=0)
-    high_q = cp.quantile(arr, 1.0 - winsor_limits[1], axis=0)
-    arr_w = cp.clip(arr, low_q, high_q)
-    mean = cp.nanmean(arr_w, axis=0)
-    std = cp.nanstd(arr_w, axis=0)
-    mask = cp.abs(arr - mean) < kappa * std
-    if apply_rewinsor:
-        arr_clip = cp.where(mask, arr, arr_w)
-    else:
-        arr_clip = cp.where(mask, arr, cp.nan)
-    result = cp.nanmean(arr_clip, axis=0)
-    rejected = 100.0 * float(mask.size - cp.count_nonzero(mask)) / float(mask.size)
-    return cp.asnumpy(result.astype(cp.float32)), float(rejected)
+
+    frames_np = [np.asarray(f, dtype=np.float32) for f in frames]
+    if not frames_np:
+        raise ValueError("No frames provided")
+
+    per_frame_bytes = frames_np[0].nbytes
+    estimated_bytes = per_frame_bytes * len(frames_np) * 4
+    if not _has_gpu_budget(estimated_bytes):
+        raise RuntimeError("GPU winsorized clip: insufficient memory budget")
+
+    _ensure_gpu_pool()
+
+    try:
+        arr = cp.stack([cp.asarray(f) for f in frames_np], axis=0)
+        low_q = cp.quantile(arr, winsor_limits[0], axis=0)
+        high_q = cp.quantile(arr, 1.0 - winsor_limits[1], axis=0)
+        arr_w = cp.clip(arr, low_q, high_q)
+        mean = cp.nanmean(arr_w, axis=0)
+        std = cp.nanstd(arr_w, axis=0)
+        mask = cp.abs(arr - mean) < kappa * std
+        if apply_rewinsor:
+            arr_clip = cp.where(mask, arr, arr_w)
+        else:
+            arr_clip = cp.where(mask, arr, cp.nan)
+        result = cp.nanmean(arr_clip, axis=0)
+        rejected = 100.0 * float(mask.size - cp.count_nonzero(mask)) / float(mask.size)
+        return cp.asnumpy(result.astype(cp.float32)), float(rejected)
+    finally:
+        _free_gpu_pools()
 
 
 def gpu_stack_kappa(frames, *, sigma_low=3.0, sigma_high=3.0):
     import cupy as cp
-    arr = cp.stack([cp.asarray(f) for f in frames], axis=0)
-    med = cp.nanmedian(arr, axis=0)
-    std = cp.nanstd(arr, axis=0)
-    low = med - sigma_low * std
-    high = med + sigma_high * std
-    mask = (arr >= low) & (arr <= high)
-    arr_clip = cp.where(mask, arr, cp.nan)
-    result = cp.nanmean(arr_clip, axis=0)
-    rejected = 100.0 * float(mask.size - cp.count_nonzero(mask)) / float(mask.size)
-    return cp.asnumpy(result.astype(cp.float32)), float(rejected)
+
+    frames_np = [np.asarray(f, dtype=np.float32) for f in frames]
+    if not frames_np:
+        raise ValueError("No frames provided")
+
+    per_frame_bytes = frames_np[0].nbytes
+    estimated_bytes = per_frame_bytes * len(frames_np) * 3
+    if not _has_gpu_budget(estimated_bytes):
+        raise RuntimeError("GPU kappa clip: insufficient memory budget")
+
+    _ensure_gpu_pool()
+
+    try:
+        arr = cp.stack([cp.asarray(f) for f in frames_np], axis=0)
+        med = cp.nanmedian(arr, axis=0)
+        std = cp.nanstd(arr, axis=0)
+        low = med - sigma_low * std
+        high = med + sigma_high * std
+        mask = (arr >= low) & (arr <= high)
+        arr_clip = cp.where(mask, arr, cp.nan)
+        result = cp.nanmean(arr_clip, axis=0)
+        rejected = 100.0 * float(mask.size - cp.count_nonzero(mask)) / float(mask.size)
+        return cp.asnumpy(result.astype(cp.float32)), float(rejected)
+    finally:
+        _free_gpu_pools()
 
 
 def gpu_stack_linear(frames, *, sigma=3.0):
     import cupy as cp
-    arr = cp.stack([cp.asarray(f) for f in frames], axis=0)
-    med = cp.nanmedian(arr, axis=0)
-    resid = arr - med
-    med_r = cp.nanmedian(resid, axis=0)
-    std_r = cp.nanstd(resid, axis=0)
-    mask = cp.abs(resid - med_r) <= sigma * std_r
-    arr_clip = cp.where(mask, arr, cp.nan)
-    result = cp.nanmean(arr_clip, axis=0)
-    rejected = 100.0 * float(mask.size - cp.count_nonzero(mask)) / float(mask.size)
-    return cp.asnumpy(result.astype(cp.float32)), float(rejected)
+
+    frames_np = [np.asarray(f, dtype=np.float32) for f in frames]
+    if not frames_np:
+        raise ValueError("No frames provided")
+
+    per_frame_bytes = frames_np[0].nbytes
+    estimated_bytes = per_frame_bytes * len(frames_np) * 4
+    if not _has_gpu_budget(estimated_bytes):
+        raise RuntimeError("GPU linear clip: insufficient memory budget")
+
+    _ensure_gpu_pool()
+
+    try:
+        arr = cp.stack([cp.asarray(f) for f in frames_np], axis=0)
+        med = cp.nanmedian(arr, axis=0)
+        resid = arr - med
+        med_r = cp.nanmedian(resid, axis=0)
+        std_r = cp.nanstd(resid, axis=0)
+        mask = cp.abs(resid - med_r) <= sigma * std_r
+        arr_clip = cp.where(mask, arr, cp.nan)
+        result = cp.nanmean(arr_clip, axis=0)
+        rejected = 100.0 * float(mask.size - cp.count_nonzero(mask)) / float(mask.size)
+        return cp.asnumpy(result.astype(cp.float32)), float(rejected)
+    finally:
+        _free_gpu_pools()
 
 
 def stack_winsorized_sigma_clip(frames, weights=None, zconfig=None, **kwargs):
