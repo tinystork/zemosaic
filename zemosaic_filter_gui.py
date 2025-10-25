@@ -78,35 +78,34 @@ def launch_filter_interface(
         cfg_defaults: Dict[str, Any] = {}
         cfg: Dict[str, Any] | None = None
         try:
-            # Ensure project directory is on sys.path to import locales/* and config
+            # Ensure project directory is on sys.path to import project modules
             base_dir = os.path.dirname(os.path.abspath(__file__))
             if base_dir not in sys.path:
                 sys.path.insert(0, base_dir)
 
-            # Try import of localization util
-            locales_mod = importlib.import_module('locales.zemosaic_localization')
-            ZeMosaicLocalization = getattr(locales_mod, 'ZeMosaicLocalization', None)
+            from zemosaic_localization import ZeMosaicLocalization
+            import zemosaic_config
+            cfg = zemosaic_config.load_config()
+            lang_code = cfg.get("language", "en")
 
-            # Try import of config to get language preference and defaults
-            lang_code = 'en'
-            try:
-                zcfg = importlib.import_module('zemosaic_config')
-                cfg = zcfg.load_config()
-                lang_code = cfg.get('language', 'en')
-                cfg_defaults['astap_executable_path'] = cfg.get('astap_executable_path', '')
-                cfg_defaults['astap_data_directory_path'] = cfg.get('astap_data_directory_path', '')
-                cfg_defaults['astap_default_search_radius'] = float(cfg.get('astap_default_search_radius', 0.0))
-                cfg_defaults['astap_default_downsample'] = int(cfg.get('astap_default_downsample', 0))
-                cfg_defaults['auto_limit_frames_per_master_tile'] = bool(cfg.get('auto_limit_frames_per_master_tile', True))
-                cfg_defaults['max_raw_per_master_tile'] = int(cfg.get('max_raw_per_master_tile', 0))
-                cfg_defaults['apply_master_tile_crop'] = bool(cfg.get('apply_master_tile_crop', False))
-                cfg_defaults['master_tile_crop_percent'] = float(cfg.get('master_tile_crop_percent', 0.0))
-            except Exception:
-                lang_code = 'en'
+            from solver_settings import SolverSettings
 
-            if ZeMosaicLocalization is not None:
-                localizer = ZeMosaicLocalization(language_code=lang_code)
-        except Exception:
+            solver_settings = SolverSettings.load()
+            cfg_defaults = {
+                "astap_executable_path": solver_settings.astap_executable_path,
+                "astap_data_directory_path": solver_settings.astap_data_directory_path,
+                "astap_default_search_radius": solver_settings.search_radius_deg,
+                "astap_default_downsample": solver_settings.downsample,
+                "auto_limit_frames_per_master_tile": cfg.get("auto_limit_frames_per_master_tile", True),
+                "max_raw_per_master_tile": cfg.get("max_raw_per_master_tile", 0),
+                "apply_master_tile_crop": cfg.get("apply_master_tile_crop", False),
+                "master_tile_crop_percent": cfg.get("master_tile_crop_percent", 0.0),
+            }
+
+            localizer = ZeMosaicLocalization(language_code=lang_code)
+        except Exception as e:
+            print(f"WARNING (Filter GUI): failed to init localization/config: {e}")
+            cfg_defaults = {}
             localizer = None
 
         def _tr(key: str, default_text: Optional[str] = None, **kwargs) -> str:
