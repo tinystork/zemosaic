@@ -38,6 +38,74 @@ import threading
 import queue
 
 
+def _group_center_deg(group: list[dict]) -> Optional[tuple[float, float]]:
+    """Return the average RA/DEC (degrees) of a group if available."""
+
+    ras: list[float] = []
+    decs: list[float] = []
+    for info in group:
+        ra = info.get("RA")
+        dec = info.get("DEC")
+        if ra is not None and dec is not None:
+            try:
+                ras.append(float(ra))
+                decs.append(float(dec))
+            except Exception:
+                continue
+    if not ras:
+        return None
+    return (sum(ras) / len(ras), sum(decs) / len(decs))
+
+
+def _angular_sep_deg(a: Optional[tuple[float, float]], b: Optional[tuple[float, float]]) -> float:
+    """Approximate angular separation in degrees between two (RA, DEC) tuples."""
+
+    if not a or not b:
+        return 9999.0
+    dra = abs(a[0] - b[0])
+    ddec = abs(a[1] - b[1])
+    return (dra ** 2 + ddec ** 2) ** 0.5
+
+
+def _merge_small_groups(groups: list[list[dict]], min_size: int, cap: int) -> list[list[dict]]:
+    """
+    Merge groups smaller than ``min_size`` with their nearest neighbour when the
+    resulting size stays below ``cap`` (allowing a 10% margin).
+    """
+
+    if not groups or min_size <= 0 or cap <= 0:
+        return groups
+
+    merged_flags = [False] * len(groups)
+    centers = [_group_center_deg(g) for g in groups]
+
+    for i, group in enumerate(groups):
+        if merged_flags[i] or len(group) >= min_size:
+            continue
+
+        best_j: Optional[int] = None
+        best_dist = float("inf")
+        for j, neighbour in enumerate(groups):
+            if i == j or merged_flags[j]:
+                continue
+            dist = _angular_sep_deg(centers[i], centers[j])
+            if dist < best_dist:
+                best_dist = dist
+                best_j = j
+
+        if best_j is not None:
+            candidate_size = len(groups[best_j]) + len(group)
+            if candidate_size <= int(cap * 1.1):
+                groups[best_j].extend(group)
+                merged_flags[i] = True
+                print(
+                    f"[AutoMerge] Group {i} ({len(group)} imgs) merged into {best_j} "
+                    f"(now {len(groups[best_j])})"
+                )
+
+    return [grp for idx, grp in enumerate(groups) if not merged_flags[idx]]
+
+
 def launch_filter_interface(
     raw_files_with_wcs: List[Dict[str, Any]],
     initial_overrides: Optional[Dict[str, Any]] = None,
@@ -1162,6 +1230,8 @@ def launch_filter_interface(
                                 float(center_obj.dec.to(u.deg).value),
                             )
                         )
+                        entry.setdefault("RA", coord_samples[-1][0])
+                        entry.setdefault("DEC", coord_samples[-1][1])
                     candidate_infos.append(entry)
 
                 if not candidate_infos:
@@ -1216,6 +1286,11 @@ def launch_filter_interface(
                     cap=int(autosplit_cap),
                     min_cap=int(autosplit_min_cap),
                     progress_callback=_progress_callback,
+                )
+                final_groups = _merge_small_groups(
+                    final_groups,
+                    min_size=int(autosplit_min_cap),
+                    cap=int(autosplit_cap),
                 )
                 for grp in final_groups:
                     for info in grp:
