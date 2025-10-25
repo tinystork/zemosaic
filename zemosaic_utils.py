@@ -58,6 +58,43 @@ def ensure_cupy_pool_initialized(device_id: int | None = None) -> None:
         pass
     ensure_cupy_pool_initialized._done = True  # type: ignore[attr-defined]
 
+
+def free_cupy_memory_pools() -> None:
+    """Release cached device and pinned host memory held by CuPy pools."""
+
+    if not gpu_is_available():
+        return
+    try:
+        import cupy as cp  # type: ignore
+    except Exception:
+        return
+    try:
+        pool = cp.get_default_memory_pool()
+        pool.free_all_blocks()
+    except Exception:
+        pass
+    try:
+        pinned_pool = cp.get_default_pinned_memory_pool()
+        pinned_pool.free_all_blocks()
+    except Exception:
+        pass
+
+
+def gpu_memory_sufficient(estimated_bytes: int, safety_fraction: float = 0.75) -> bool:
+    """Return True if the reported free GPU memory largely exceeds ``estimated_bytes``."""
+
+    if not gpu_is_available() or estimated_bytes <= 0:
+        return True
+    try:
+        import cupy as cp  # type: ignore
+        free_bytes, _ = cp.cuda.runtime.memGetInfo()
+        # Leave some headroom so we do not hit the allocator limit immediately
+        threshold = int(max(0, free_bytes * safety_fraction))
+        return estimated_bytes <= threshold
+    except Exception:
+        # If querying memory fails, err on the side of allowing execution
+        return True
+
 from reproject.mosaicking import reproject_and_coadd as cpu_reproject_and_coadd
 
 # --- Définition locale du flag ASTROPY_AVAILABLE et du module fits pour ce fichier ---
@@ -1108,6 +1145,7 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
     # Import lazily to avoid importing cupy when GPU is not used
     import cupy as cp  # type: ignore
     from cupyx.scipy.ndimage import map_coordinates  # type: ignore
+    ensure_cupy_pool_initialized()
     try:
         from astropy.wcs import WCS as _WCS
     except Exception:
@@ -1133,14 +1171,38 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
     # Determine background match flag from either name
     match_background = bool(kwargs.get("match_background", kwargs.get("match_bg", False)))
 
+    float32_bytes = np.dtype(np.float32).itemsize
+
+    # Estimate the minimum amount of memory required just for the accumulators.
+    accumulator_bytes = 2 * H * W * float32_bytes
+    # Leave some breathing room for temporary buffers; require at least double the
+    # accumulator footprint to avoid triggering the CuPy allocator hard limit.
+    if not gpu_memory_sufficient(int(accumulator_bytes * 2.5), safety_fraction=0.8):
+        raise RuntimeError("Insufficient GPU memory for reprojection accumulators")
+
     # Prepare output accumulators on GPU
     mosaic_sum_gpu = cp.zeros((H, W), dtype=cp.float32)
     weight_sum_gpu = cp.zeros((H, W), dtype=cp.float32)
     tile_medians = []
 
     # Row-chunking to bound memory; tune based on device memory
-    rows_per_chunk = int(kwargs.get("rows_per_chunk", 256))
+    rows_per_chunk = int(kwargs.get("rows_per_chunk", 64))
     rows_per_chunk = max(32, min(rows_per_chunk, H))
+
+    # Dynamically cap the chunk size based on available GPU memory.
+    max_chunk_bytes = kwargs.get("max_chunk_bytes")
+    if max_chunk_bytes is None:
+        # Default soft cap that will be tightened against free VRAM below.
+        max_chunk_bytes = 128 * 1024 * 1024
+    try:
+        free_bytes, _ = cp.cuda.runtime.memGetInfo()
+        safe_target = max(16 * 1024 * 1024, int(free_bytes * 0.25))
+        max_chunk_bytes = int(min(max_chunk_bytes, safe_target))
+    except Exception:
+        max_chunk_bytes = int(max_chunk_bytes)
+    bytes_per_row_estimate = max(1, W * float32_bytes * 8)
+    adaptive_rows = max(1, max_chunk_bytes // bytes_per_row_estimate)
+    rows_per_chunk = max(32, min(rows_per_chunk, adaptive_rows, H))
 
     # Build an x-grid once (NumPy on CPU) and reuse
     x_grid = cp.asarray(cp.arange(W, dtype=cp.float32))  # cp.arange works well; stays on GPU when meshed
@@ -1232,7 +1294,10 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
         pass
 
     # Move back to CPU
-    return cp.asnumpy(mosaic_gpu).astype("float32"), cp.asnumpy(coverage_gpu).astype("float32")
+    try:
+        return cp.asnumpy(mosaic_gpu).astype("float32"), cp.asnumpy(coverage_gpu).astype("float32")
+    finally:
+        free_cupy_memory_pools()
 
 
 def reproject_and_coadd_wrapper(
@@ -1326,6 +1391,10 @@ def detect_and_correct_hot_pixels_gpu(image,
         k = int(neighborhood_size) if neighborhood_size % 2 == 1 else int(neighborhood_size + 1)
         k = max(3, k)
 
+        estimated_bytes = img.size * np.dtype(np.float32).itemsize * 6
+        if not gpu_memory_sufficient(int(estimated_bytes), safety_fraction=0.7):
+            raise RuntimeError("GPU hot-pixel filter: insufficient memory")
+
         out = np.empty_like(img, dtype=np.float32)
         for ch in range(c):
             g = cp.asarray(img[..., ch])
@@ -1349,6 +1418,8 @@ def detect_and_correct_hot_pixels_gpu(image,
         return detect_and_correct_hot_pixels(image, threshold=threshold,
                                              neighborhood_size=neighborhood_size,
                                              progress_callback=progress_callback)
+    finally:
+        free_cupy_memory_pools()
 
 
 def estimate_background_map_gpu(image,
@@ -1369,6 +1440,9 @@ def estimate_background_map_gpu(image,
 
         img = np.asarray(image, dtype=np.float32)
         is_color = img.ndim == 3 and img.shape[-1] == 3
+        estimated_bytes = img.size * np.dtype(np.float32).itemsize * (4 if is_color else 3)
+        if not gpu_memory_sufficient(int(estimated_bytes), safety_fraction=0.7):
+            raise RuntimeError("GPU background estimation: insufficient memory")
         if not is_color:
             g = cp.asarray(img)
             bg = gaussian_filter(g, sigma=float(sigma))
@@ -1394,6 +1468,8 @@ def estimate_background_map_gpu(image,
         except Exception:
             # As a last resort, return zeros so subtraction is a no-op
             return np.zeros_like(image, dtype=np.float32)
+    finally:
+        free_cupy_memory_pools()
 
 
 def stretch_auto_asifits_like_gpu(img_hwc_adu,
@@ -1409,6 +1485,9 @@ def stretch_auto_asifits_like_gpu(img_hwc_adu,
         ensure_cupy_pool_initialized()
         img = np.asarray(img_hwc_adu, dtype=np.float32)
         out = np.empty_like(img, dtype=np.float32)
+        estimated_bytes = img.size * np.dtype(np.float32).itemsize * 4
+        if not gpu_memory_sufficient(int(estimated_bytes), safety_fraction=0.7):
+            raise RuntimeError("GPU stretch: insufficient memory")
         for c in range(3):
             chan = cp.asarray(img[..., c])
             vmin = cp.percentile(chan, p_low)
@@ -1434,6 +1513,8 @@ def stretch_auto_asifits_like_gpu(img_hwc_adu,
         return np.clip(out, 0, 1).astype(np.float32)
     except Exception:
         return stretch_auto_asifits_like(img_hwc_adu, p_low=p_low, p_high=p_high, asinh_a=asinh_a, apply_wb=apply_wb)
+    finally:
+        free_cupy_memory_pools()
 
 
 
