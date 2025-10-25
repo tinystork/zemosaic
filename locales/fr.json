@@ -394,5 +394,11 @@
     "run_success_preview_saved_fallback": "Prévisualisation enregistrée (fallback) : {filename}",
     "run_error_phase3_thread_exception": "ERREUR P3 : Exception dans un thread de création de Master Tuile.",
     "run_error_phase4_reading_tile_shape": "ERREUR P4 : Échec de lecture de la forme (shape) de Master Tuile.",
-    "run_error_preview_stretch_unexpected_main": "ERREUR : Erreur inattendue lors de l'étirement de preview : {error}"
+    "run_error_preview_stretch_unexpected_main": "ERREUR : Erreur inattendue lors de l'étirement de preview : {error}",
+    "filter_log_panel_title": "Journal d'activité",
+    "filter_btn_resolve_wcs": "Résoudre les WCS manquants",
+    "filter_btn_auto_group": "Auto-organiser les Master Tiles",
+    "filter_log_resolved_n": "WCS résolus pour {n} fichier(s).",
+    "filter_log_groups_summary": "Préparation de {g} groupe(s), tailles : {sizes}.",
+    "filter_warn_astap_missing": "Exécutable ASTAP non configuré ; résolution ignorée."
 }
