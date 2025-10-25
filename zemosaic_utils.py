@@ -2,6 +2,7 @@
 
 # --- Standard Library Imports ---
 import os
+import math
 import numpy as np
 # L'import de astropy.io.fits est géré ci-dessous pour définir le flag
 import cv2
@@ -96,6 +97,10 @@ def gpu_memory_sufficient(estimated_bytes: int, safety_fraction: float = 0.75) -
         return True
 
 from reproject.mosaicking import reproject_and_coadd as cpu_reproject_and_coadd
+try:
+    from reproject import reproject_interp
+except Exception:
+    reproject_interp = None
 
 # --- Définition locale du flag ASTROPY_AVAILABLE et du module fits pour ce fichier ---
 ASTROPY_AVAILABLE_IN_UTILS = False
@@ -198,6 +203,391 @@ except ImportError:
 # --- Fin Définition locale ---
 
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+
+def _extract_luminance_plane(tile_array: np.ndarray) -> np.ndarray:
+    """Retourne une vue 2D (float32) utilisée pour les analyses photométriques."""
+
+    if tile_array.ndim == 2:
+        return tile_array.astype(np.float32, copy=False)
+    if tile_array.ndim == 3 and tile_array.shape[-1] > 1:
+        return tile_array.mean(axis=-1, dtype=np.float32)
+    if tile_array.ndim == 3:
+        return tile_array[..., 0].astype(np.float32, copy=False)
+    return tile_array.reshape(tile_array.shape[0], tile_array.shape[1]).astype(np.float32, copy=False)
+
+
+def estimate_overlap_pairs(
+    wcs_list,
+    shapes_hw,
+    final_output_wcs,
+    final_output_shape_hw,
+    min_overlap_fraction: float = 0.05,
+):
+    """Estime les couples de tuiles dont les empreintes WCS se chevauchent."""
+
+    if not wcs_list or not final_output_wcs:
+        return []
+    try:
+        final_w, final_h = int(final_output_shape_hw[1]), int(final_output_shape_hw[0])
+    except Exception:
+        final_h, final_w = 0, 0
+    try:
+        header = final_output_wcs.to_header()
+        crpix1 = float(header.get("CRPIX1", 0.0))
+        crpix2 = float(header.get("CRPIX2", 0.0))
+    except Exception:
+        header = None
+        crpix1 = crpix2 = 0.0
+
+    footprints = []
+    for idx, (wcs_obj, shape_hw) in enumerate(zip(wcs_list, shapes_hw)):
+        try:
+            if wcs_obj is None or not getattr(wcs_obj, "is_celestial", False):
+                footprints.append(None)
+                continue
+            h_i, w_i = int(shape_hw[0]), int(shape_hw[1])
+            if h_i <= 0 or w_i <= 0:
+                footprints.append(None)
+                continue
+            corners = np.array(
+                [[0.0, 0.0], [w_i - 1.0, 0.0], [0.0, h_i - 1.0], [w_i - 1.0, h_i - 1.0]],
+                dtype=np.float64,
+            )
+            world = wcs_obj.pixel_to_world(corners[:, 0], corners[:, 1])
+            px, py = final_output_wcs.world_to_pixel(world)
+            if px is None or py is None:
+                footprints.append(None)
+                continue
+            px = np.asarray(px, dtype=np.float64)
+            py = np.asarray(py, dtype=np.float64)
+            if not np.isfinite(px).any() or not np.isfinite(py).any():
+                footprints.append(None)
+                continue
+            x_min = float(np.nanmin(px))
+            x_max = float(np.nanmax(px))
+            y_min = float(np.nanmin(py))
+            y_max = float(np.nanmax(py))
+            if header is not None:
+                # Les CRPIX sont indexés à 1 ; limiter les bbox au champ final si possible.
+                x_min = max(x_min, -crpix1)
+                y_min = max(y_min, -crpix2)
+                if final_w > 0:
+                    x_max = min(x_max, final_w - crpix1)
+                if final_h > 0:
+                    y_max = min(y_max, final_h - crpix2)
+            if not np.isfinite([x_min, x_max, y_min, y_max]).all():
+                footprints.append(None)
+                continue
+            if x_max <= x_min or y_max <= y_min:
+                footprints.append(None)
+                continue
+            area = max((x_max - x_min) * (y_max - y_min), 1e-6)
+            footprints.append((x_min, x_max, y_min, y_max, area))
+        except Exception:
+            footprints.append(None)
+
+    overlaps = []
+    for i in range(len(footprints)):
+        box_i = footprints[i]
+        if box_i is None:
+            continue
+        for j in range(i + 1, len(footprints)):
+            box_j = footprints[j]
+            if box_j is None:
+                continue
+            x0 = max(box_i[0], box_j[0])
+            x1 = min(box_i[1], box_j[1])
+            y0 = max(box_i[2], box_j[2])
+            y1 = min(box_i[3], box_j[3])
+            if x1 <= x0 or y1 <= y0:
+                continue
+            overlap_area = (x1 - x0) * (y1 - y0)
+            min_area = min(box_i[4], box_j[4])
+            if min_area <= 0:
+                continue
+            if overlap_area / min_area < max(0.0, float(min_overlap_fraction)):
+                continue
+            x0_int = int(max(0, math.floor(x0)))
+            y0_int = int(max(0, math.floor(y0)))
+            x1_int = int(math.ceil(x1))
+            y1_int = int(math.ceil(y1))
+            if final_w > 0:
+                x1_int = min(x1_int, final_w)
+            if final_h > 0:
+                y1_int = min(y1_int, final_h)
+            if x1_int - x0_int < 4 or y1_int - y0_int < 4:
+                continue
+            overlaps.append(
+                {
+                    "i": i,
+                    "j": j,
+                    "bbox": (x0_int, x1_int, y0_int, y1_int),
+                    "weight": overlap_area,
+                }
+            )
+    return overlaps
+
+
+def robust_affine_fit(x_values: np.ndarray, y_values: np.ndarray, clip_sigma: float = 2.5):
+    """Ajuste robuste y ≈ a*x + b avec rejet sigma-clipping."""
+
+    if x_values.size < 16:
+        return None
+    x = x_values.astype(np.float64, copy=False)
+    y = y_values.astype(np.float64, copy=False)
+    mask = np.ones_like(x, dtype=bool)
+    clip_sigma = max(1.0, float(clip_sigma))
+    a_b = (1.0, 0.0)
+    for _ in range(6):
+        if mask.sum() < 8:
+            break
+        A = np.vstack([x[mask], np.ones(mask.sum(), dtype=np.float64)]).T
+        try:
+            sol, *_ = np.linalg.lstsq(A, y[mask], rcond=None)
+        except Exception:
+            return None
+        a_est, b_est = float(sol[0]), float(sol[1])
+        residuals = y - (a_est * x + b_est)
+        res_sel = residuals[mask]
+        sigma = np.std(res_sel)
+        a_b = (a_est, b_est)
+        if sigma <= 1e-6:
+            break
+        keep = np.abs(res_sel) <= clip_sigma * sigma
+        if keep.all():
+            break
+        new_mask = np.zeros_like(mask)
+        new_mask[np.flatnonzero(mask)[keep]] = True
+        if new_mask.sum() < 8:
+            break
+        mask = new_mask
+    return a_b
+
+
+def solve_global_affine(num_tiles: int, pair_entries, anchor_index: int = 0):
+    """Résout les gains/offsets globaux à partir des couples (a,b)."""
+
+    if num_tiles <= 0:
+        return {}
+    if not pair_entries:
+        return {i: (1.0, 0.0) for i in range(num_tiles)}
+
+    anchor = int(max(0, min(anchor_index, num_tiles - 1)))
+    rows = []
+    rhs = []
+    for entry in pair_entries:
+        i = entry[0]
+        j = entry[1]
+        a_ij = float(entry[2])
+        b_ij = float(entry[3])
+        weight = max(1.0, float(entry[4]))
+        if not np.isfinite(a_ij) or abs(a_ij) < 1e-6:
+            continue
+        sqrt_w = math.sqrt(weight)
+        row_gain = np.zeros(2 * num_tiles, dtype=np.float64)
+        row_gain[i] = -sqrt_w
+        row_gain[j] = a_ij * sqrt_w
+        rows.append(row_gain)
+        rhs.append(0.0)
+
+        row_offset = np.zeros(2 * num_tiles, dtype=np.float64)
+        row_offset[num_tiles + i] = sqrt_w
+        row_offset[num_tiles + j] = -sqrt_w
+        row_offset[j] = -b_ij * sqrt_w
+        rows.append(row_offset)
+        rhs.append(0.0)
+
+    # Contraintes d'ancrage : gain=1, offset=0
+    row_anchor_gain = np.zeros(2 * num_tiles, dtype=np.float64)
+    row_anchor_gain[anchor] = 1.0
+    rows.append(row_anchor_gain)
+    rhs.append(1.0)
+
+    row_anchor_offset = np.zeros(2 * num_tiles, dtype=np.float64)
+    row_anchor_offset[num_tiles + anchor] = 1.0
+    rows.append(row_anchor_offset)
+    rhs.append(0.0)
+
+    if not rows:
+        return {i: (1.0, 0.0) for i in range(num_tiles)}
+
+    A = np.vstack(rows)
+    b = np.asarray(rhs, dtype=np.float64)
+    try:
+        sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    except Exception:
+        return {i: (1.0, 0.0) for i in range(num_tiles)}
+
+    gains = sol[:num_tiles]
+    offsets = sol[num_tiles:]
+    result = {}
+    for idx in range(num_tiles):
+        g = float(gains[idx])
+        o = float(offsets[idx])
+        if not np.isfinite(g) or abs(g) < 1e-6:
+            g = 1.0
+        if not np.isfinite(o):
+            o = 0.0
+        result[idx] = (g, o)
+    return result
+
+
+def compute_intertile_affine_calibration(
+    tile_data_with_wcs,
+    final_output_wcs,
+    final_output_shape_hw,
+    preview_size: int = 512,
+    min_overlap_fraction: float = 0.05,
+    sky_percentile: tuple[float, float] | list[float] = (30.0, 70.0),
+    robust_clip_sigma: float = 2.5,
+    progress_callback=None,
+):
+    """Calcule des corrections affine (gain/offset) inter-tuiles avant reprojection."""
+
+    if tile_data_with_wcs is None or len(tile_data_with_wcs) < 2:
+        return {}
+    if reproject_interp is None or not ASTROPY_AVAILABLE_IN_UTILS:
+        return {}
+    try:
+        header_full = final_output_wcs.to_header()
+    except Exception:
+        return {}
+
+    try:
+        h_full = int(final_output_shape_hw[0])
+        w_full = int(final_output_shape_hw[1])
+    except Exception:
+        h_full = w_full = 0
+
+    sky_low, sky_high = 30.0, 70.0
+    try:
+        if isinstance(sky_percentile, (list, tuple)) and len(sky_percentile) >= 2:
+            sky_low = float(sky_percentile[0])
+            sky_high = float(sky_percentile[1])
+            if sky_low > sky_high:
+                sky_low, sky_high = sky_high, sky_low
+    except Exception:
+        sky_low, sky_high = 30.0, 70.0
+
+    wcs_list = [wcs for _data, wcs in tile_data_with_wcs]
+    shapes_hw = []
+    luminance_tiles = []
+    for data, _wcs in tile_data_with_wcs:
+        arr = np.asarray(data)
+        if arr.ndim == 3 and arr.shape[-1] == 0:
+            luminance_tiles.append(None)
+            shapes_hw.append((0, 0))
+            continue
+        luminance = _extract_luminance_plane(arr)
+        luminance_tiles.append(luminance)
+        shapes_hw.append((luminance.shape[0], luminance.shape[1]))
+
+    overlaps = estimate_overlap_pairs(
+        wcs_list,
+        shapes_hw,
+        final_output_wcs,
+        (h_full, w_full),
+        min_overlap_fraction=min_overlap_fraction,
+    )
+    if not overlaps:
+        return {}
+
+    try:
+        from astropy.wcs import WCS as _WCS
+    except Exception:
+        return {}
+
+    pair_entries = []
+    connectivity = np.zeros(len(tile_data_with_wcs), dtype=np.float64)
+    preview_size = max(128, int(preview_size))
+
+    for idx, overlap in enumerate(overlaps, 1):
+        i = overlap["i"]
+        j = overlap["j"]
+        bbox = overlap["bbox"]
+        weight = float(overlap.get("weight", 1.0))
+        if luminance_tiles[i] is None or luminance_tiles[j] is None:
+            continue
+        x0, x1, y0, y1 = bbox
+        sub_w = max(1, x1 - x0)
+        sub_h = max(1, y1 - y0)
+        header = header_full.copy()
+        header["NAXIS1"] = sub_w
+        header["NAXIS2"] = sub_h
+        if "CRPIX1" in header:
+            header["CRPIX1"] = float(header["CRPIX1"]) - x0
+        if "CRPIX2" in header:
+            header["CRPIX2"] = float(header["CRPIX2"]) - y0
+        try:
+            target_wcs = _WCS(header)
+        except Exception:
+            continue
+        try:
+            reproj_i, _ = reproject_interp(
+                (luminance_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
+            )
+            reproj_j, _ = reproject_interp(
+                (luminance_tiles[j], wcs_list[j]), target_wcs, shape_out=(sub_h, sub_w)
+            )
+        except Exception:
+            continue
+        if reproj_i is None or reproj_j is None:
+            continue
+        arr_i = np.asarray(reproj_i, dtype=np.float32)
+        arr_j = np.asarray(reproj_j, dtype=np.float32)
+        if arr_i.size == 0 or arr_j.size == 0:
+            continue
+        max_dim = max(arr_i.shape[0], arr_i.shape[1])
+        if max_dim > preview_size:
+            scale = preview_size / max_dim
+            new_w = max(8, int(round(arr_i.shape[1] * scale)))
+            new_h = max(8, int(round(arr_i.shape[0] * scale)))
+            arr_i = cv2.resize(arr_i, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            arr_j = cv2.resize(arr_j, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        valid = np.isfinite(arr_i) & np.isfinite(arr_j)
+        if not np.any(valid):
+            continue
+        sample_i = arr_i[valid]
+        sample_j = arr_j[valid]
+        if sample_i.size < 64:
+            continue
+        sky_proxy = 0.5 * (sample_i + sample_j)
+        try:
+            p_low = np.percentile(sky_proxy, sky_low)
+            p_high = np.percentile(sky_proxy, sky_high)
+        except Exception:
+            p_low = np.nanmin(sky_proxy)
+            p_high = np.nanmax(sky_proxy)
+        if not np.isfinite(p_low) or not np.isfinite(p_high):
+            continue
+        if p_high <= p_low:
+            p_low = np.nanmin(sky_proxy)
+            p_high = np.nanmax(sky_proxy)
+        mask = (sky_proxy >= p_low) & (sky_proxy <= p_high)
+        if mask.sum() < 32:
+            mask = np.ones_like(sky_proxy, dtype=bool)
+        x_samples = sample_i[mask]
+        y_samples = sample_j[mask]
+        fit = robust_affine_fit(x_samples, y_samples, clip_sigma=robust_clip_sigma)
+        if fit is None:
+            continue
+        a_ij, b_ij = fit
+        pair_entries.append((i, j, a_ij, b_ij, weight))
+        connectivity[i] += weight
+        connectivity[j] += weight
+        if progress_callback and idx % 5 == 0:
+            try:
+                progress_callback("phase5_intertile", idx, len(overlaps))
+            except Exception:
+                pass
+
+    if not pair_entries:
+        return {}
+
+    anchor = int(np.argmax(connectivity)) if np.any(connectivity > 0) else 0
+    solution = solve_global_affine(len(tile_data_with_wcs), pair_entries, anchor_index=anchor)
+    return solution
 # Les filtres VerifyWarning sont maintenant dans le try/except d'Astropy ci-dessus.
 
 
