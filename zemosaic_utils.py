@@ -27,6 +27,25 @@ def gpu_is_available() -> bool:
         return False
 
 
+def gpu_device_name() -> str:
+    """Return the CUDA device name exposed by CuPy, if available."""
+
+    if not GPU_AVAILABLE:
+        return "Unknown GPU"
+    try:
+        import cupy as cp  # type: ignore
+
+        props = cp.cuda.runtime.getDeviceProperties(0)
+        name = props.get("name") if isinstance(props, dict) else None
+        if isinstance(name, (bytes, bytearray)):
+            return name.decode(errors="ignore") or "Unknown GPU"
+        if isinstance(name, str) and name:
+            return name
+    except Exception:
+        pass
+    return "Unknown GPU"
+
+
 def ensure_cupy_pool_initialized(device_id: int | None = None) -> None:
     """Idempotently enable CuPy device + memory pools.
 

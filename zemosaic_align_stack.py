@@ -16,6 +16,11 @@ import time
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 
+try:
+    from zemosaic_utils import gpu_device_name as _gpu_device_name_helper
+except Exception:
+    _gpu_device_name_helper = None
+
 # dépendance Photutils
 PHOTOUTILS_AVAILABLE = False
 DAOStarFinder, FITSFixedWarning, CircularAperture, aperture_photometry, SigmaClip, Background2D, MedianBackground, SourceCatalog = [None]*8 # type: ignore
@@ -464,7 +469,16 @@ except Exception as e_import_stack:
     print(f"AVERT (zemosaic_align_stack): Optional import of external stack_methods failed: {e_import_stack}")
 
 # --- Implementations GPU simplifiées des méthodes de stack ---
-def gpu_stack_winsorized(frames, *, kappa=3.0, winsor_limits=(0.05, 0.05), apply_rewinsor=True):
+def gpu_stack_winsorized(
+    frames,
+    *,
+    kappa=3.0,
+    winsor_limits=(0.05, 0.05),
+    apply_rewinsor=True,
+    progress_callback=None,
+    winsor_max_workers=1,
+    **unused,
+):
     import cupy as cp
 
     frames_np = [np.asarray(f, dtype=np.float32) for f in frames]
@@ -496,8 +510,7 @@ def gpu_stack_winsorized(frames, *, kappa=3.0, winsor_limits=(0.05, 0.05), apply
     finally:
         _free_gpu_pools()
 
-
-def gpu_stack_kappa(frames, *, sigma_low=3.0, sigma_high=3.0):
+def gpu_stack_kappa(frames, *, sigma_low=3.0, sigma_high=3.0, progress_callback=None, **unused):
     import cupy as cp
 
     frames_np = [np.asarray(f, dtype=np.float32) for f in frames]
@@ -526,7 +539,7 @@ def gpu_stack_kappa(frames, *, sigma_low=3.0, sigma_high=3.0):
         _free_gpu_pools()
 
 
-def gpu_stack_linear(frames, *, sigma=3.0):
+def gpu_stack_linear(frames, *, sigma=3.0, progress_callback=None, **unused):
     import cupy as cp
 
     frames_np = [np.asarray(f, dtype=np.float32) for f in frames]
@@ -679,15 +692,28 @@ def stack_winsorized_sigma_clip(frames, weights=None, zconfig=None, **kwargs):
     sample = _np.asarray(frames_list[0])
     if sample.ndim not in (2, 3):
         raise ValueError(f"each frame must be (H,W) or (H,W,C); got shape {sample.shape}")
-    # Harmonize shapes for GPU path: drop mismatched frames early
-    frames_list = [f for f in frames_list if _np.asarray(f).shape == sample.shape]
+    expected_shape = sample.shape
+    # Harmonize shapes for GPU/CPU paths without forcing eager float32 copies
+    aligned_frames: list[_np.ndarray] = []
+    for frame in frames_list:
+        arr = _np.asarray(frame)
+        if arr.shape != expected_shape:
+            continue
+        aligned_frames.append(arr)
+    frames_list = aligned_frames
+    if not frames_list:
+        raise ValueError("frames is empty after shape harmonization")
+    sample = _np.asarray(frames_list[0])
     if len(frames_list) < 3:
         _internal_logger.warning("Winsorized clip needs >=3 images; forcing CPU.")
         use_gpu = False
     else:
-        # Accept either a generic 'use_gpu' flag or legacy 'use_gpu_phase5'
         if zconfig:
-            use_gpu = bool(getattr(zconfig, 'use_gpu', getattr(zconfig, 'use_gpu_phase5', False)))
+            use_gpu = bool(
+                getattr(zconfig, 'use_gpu', False)
+                or getattr(zconfig, 'use_gpu_phase3', False)
+                or getattr(zconfig, 'use_gpu_phase5', False)
+            )
         else:
             use_gpu = False
 
@@ -750,58 +776,138 @@ def stack_winsorized_sigma_clip(frames, weights=None, zconfig=None, **kwargs):
         stacked_stream, rejected_pct = state.finalize(weights_array_full is not None)
         return stacked_stream, rejected_pct
 
-    if max_frames_per_pass and len(frames_list) > max_frames_per_pass:
-        if use_gpu:
-            _internal_logger.info(
-                "Winsorized streaming enabled for %d frames (limit %d); forcing CPU path.",
-                len(frames_list),
-                max_frames_per_pass,
-            )
-            use_gpu = False
-        else:
-            _internal_logger.info(
-                "Winsorized streaming enabled for %d frames (limit %d).",
-                len(frames_list),
-                max_frames_per_pass,
-            )
+    gpu_callable = callable(globals().get("gpu_stack_winsorized", None))
+    gpu_requested = use_gpu and GPU_AVAILABLE and gpu_callable
+    gpu_kwargs = {
+        key: kwargs[key]
+        for key in ("kappa", "winsor_limits", "apply_rewinsor")
+        if key in kwargs
+    }
+
+    total_frames = len(frames_list)
+    if max_frames_per_pass and total_frames > max_frames_per_pass and not gpu_requested:
+        _internal_logger.info(
+            "Winsorized streaming enabled for %d frames (limit %d).",
+            total_frames,
+            max_frames_per_pass,
+        )
         return _stack_winsor_streaming(max_frames_per_pass)
+    elif max_frames_per_pass and total_frames > max_frames_per_pass and gpu_requested:
+        _internal_logger.info(
+            "INFO (align_stack): Ignoring winsor_max_frames_per_pass=%d to honor GPU path for %d frames.",
+            max_frames_per_pass,
+            total_frames,
+        )
 
     # --- GPU path (poids ignorés) ---
-    if use_gpu and GPU_AVAILABLE and callable(globals().get("gpu_stack_winsorized", None)):
+    if gpu_requested:
         try:
             if weights is not None:
                 _internal_logger.warning("GPU winsorized clip: 'weights' not supported; ignoring provided weights.")
-            gpu_out = gpu_stack_winsorized(frames_list, **kwargs)
+            gpu_name = "Unknown GPU"
+            try:
+                if callable(_gpu_device_name_helper):
+                    gpu_name = _gpu_device_name_helper()
+            except Exception:
+                gpu_name = "Unknown GPU"
+            _internal_logger.info(
+                "INFO (align_stack): GPU winsorized stack engaged for Phase 3 (%s)",
+                gpu_name,
+            )
+            _internal_logger.info(
+                "INFO (align_stack): GPU winsorized sigma clip engaged. Device: %s",
+                gpu_name,
+            )
 
-            # --- validations de sortie GPU ---
-            if gpu_out is None:
-                raise RuntimeError("GPU returned None")
-            # Support both (image, rejected_pct) and image-only returns
-            if isinstance(gpu_out, (list, tuple)) and len(gpu_out) >= 1:
-                _gpu_img = gpu_out[0]
-                _gpu_rej = float(gpu_out[1]) if len(gpu_out) > 1 else 0.0
-            else:
-                _gpu_img = gpu_out
-                _gpu_rej = 0.0
-            gpu_out = _np.asarray(_gpu_img)
-            # Sortie attendue: même champs spatiaux que frames_np sans l’axe N
-            exp_shape = sample.shape  # (H,W) ou (H,W,C)
-            if gpu_out.shape != exp_shape:
-                raise RuntimeError(f"GPU returned shape {gpu_out.shape}, expected {exp_shape}")
-            if not _np.any(_np.isfinite(gpu_out)):
-                raise RuntimeError("GPU output has no finite values")
-            # tolérance: > 90% de pixels finis
-            finite_ratio = _np.isfinite(gpu_out).mean()
-            if finite_ratio < 0.9:
-                raise RuntimeError(f"GPU output has too many NaN/Inf (finite_ratio={finite_ratio:.2%})")
+            sample_size = int(sample.size)
+            per_frame_bytes = sample_size * _np.dtype(_np.float32).itemsize
+            estimated_bytes = per_frame_bytes * total_frames * 4
 
-            return gpu_out.astype(_np.float32, copy=False), float(_gpu_rej)
+            def _run_gpu(sub_frames):
+                gpu_out_local = gpu_stack_winsorized(sub_frames, **gpu_kwargs)
+                if gpu_out_local is None:
+                    raise RuntimeError("GPU returned None")
+                if isinstance(gpu_out_local, (list, tuple)) and len(gpu_out_local) >= 1:
+                    img = gpu_out_local[0]
+                    rej_pct = float(gpu_out_local[1]) if len(gpu_out_local) > 1 else 0.0
+                else:
+                    img = gpu_out_local
+                    rej_pct = 0.0
+                img_arr = _np.asarray(img)
+                exp_shape = sample.shape
+                if img_arr.shape != exp_shape:
+                    raise RuntimeError(f"GPU returned shape {img_arr.shape}, expected {exp_shape}")
+                if not _np.any(_np.isfinite(img_arr)):
+                    raise RuntimeError("GPU output has no finite values")
+                finite_ratio_local = _np.isfinite(img_arr).mean()
+                if finite_ratio_local < 0.9:
+                    raise RuntimeError(
+                        f"GPU output has too many NaN/Inf (finite_ratio={finite_ratio_local:.2%})"
+                    )
+                return img_arr.astype(_np.float32, copy=False), rej_pct
+
+            if not _has_gpu_budget(estimated_bytes):
+                chunk_size = max(3, total_frames // 2)
+                while chunk_size >= 3:
+                    chunk_estimate = per_frame_bytes * chunk_size * 4
+                    if _has_gpu_budget(chunk_estimate):
+                        break
+                    new_size = max(3, chunk_size // 2)
+                    if new_size == chunk_size:
+                        chunk_size -= 1
+                    else:
+                        chunk_size = new_size
+                if chunk_size >= 3 and chunk_size < total_frames:
+                    ranges = []
+                    start_idx = 0
+                    while start_idx < total_frames:
+                        end_idx = min(total_frames, start_idx + chunk_size)
+                        if (total_frames - end_idx) < 3 and end_idx != total_frames:
+                            end_idx = total_frames
+                        ranges.append((start_idx, end_idx))
+                        start_idx = end_idx
+                    num_sublots = len(ranges)
+                    _internal_logger.warning(
+                        "WARN (align_stack): GPU memory borderline; splitting batch into %d sublots.",
+                        num_sublots,
+                    )
+                    accum = None
+                    total_weight = 0
+                    total_rej = 0.0
+                    for start, end in ranges:
+                        sub = frames_list[start:end]
+                        if len(sub) < 3:
+                            continue
+                        img_chunk, rej_chunk = _run_gpu(sub)
+                        weight = len(sub)
+                        if accum is None:
+                            accum = img_chunk.astype(_np.float64) * weight
+                        else:
+                            accum += img_chunk.astype(_np.float64) * weight
+                        total_weight += weight
+                        total_rej += rej_chunk * weight
+                    if accum is not None and total_weight:
+                        final_gpu = (accum / float(total_weight)).astype(_np.float32)
+                        return final_gpu, float(total_rej / float(total_weight))
+                else:
+                    _internal_logger.warning(
+                        "WARN (align_stack): GPU memory insufficient even after chunking attempts.")
+
+            gpu_img, gpu_rej = _run_gpu(frames_list)
+            return gpu_img, float(gpu_rej)
 
         except Exception as e:
-            _internal_logger.warning(
-                f"GPU winsorized clip failed or looked invalid → fallback CPU: {type(e).__name__}: {e}",
-                exc_info=True
+            _internal_logger.error(
+                "ERROR (align_stack): GPU stacking failed, falling back to CPU winsorized clip.",
+                exc_info=True,
             )
+            if max_frames_per_pass and total_frames > max_frames_per_pass:
+                _internal_logger.info(
+                    "Winsorized streaming fallback engaged for %d frames (limit %d) after GPU failure.",
+                    total_frames,
+                    max_frames_per_pass,
+                )
+                return _stack_winsor_streaming(max_frames_per_pass)
 
     # --- CPU path ---
     if not callable(globals().get("cpu_stack_winsorized", None)):
