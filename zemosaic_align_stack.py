@@ -779,6 +779,7 @@ def stack_winsorized_sigma_clip(frames, weights=None, zconfig=None, **kwargs):
 
     gpu_callable = callable(globals().get("gpu_stack_winsorized", None))
     gpu_requested = use_gpu and GPU_AVAILABLE and gpu_callable
+
     gpu_kwargs = {
         key: kwargs[key]
         for key in ("kappa", "winsor_limits", "apply_rewinsor")
@@ -798,6 +799,7 @@ def stack_winsorized_sigma_clip(frames, weights=None, zconfig=None, **kwargs):
             "INFO (align_stack): Ignoring winsor_max_frames_per_pass=%d to honor GPU path for %d frames.",
             max_frames_per_pass,
             total_frames,
+
         )
 
     # --- GPU path (poids ignorés) ---
@@ -817,11 +819,13 @@ def stack_winsorized_sigma_clip(frames, weights=None, zconfig=None, **kwargs):
             )
             _internal_logger.info("INFO (align_stack): GPU winsorized sigma clip engaged. Device: %s", gpu_name)
 
+
             per_frame_bytes = sample.nbytes
             estimated_bytes = per_frame_bytes * total_frames * 4
 
             def _run_gpu(sub_frames):
                 gpu_out_local = gpu_stack_winsorized(sub_frames, **gpu_kwargs)
+
                 if gpu_out_local is None:
                     raise RuntimeError("GPU returned None")
                 if isinstance(gpu_out_local, (list, tuple)) and len(gpu_out_local) >= 1:
