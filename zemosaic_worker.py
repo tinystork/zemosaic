@@ -2937,138 +2937,23 @@ def create_master_tile(
     except Exception:
         logger.info(log_message)
 
-    direct_stack_algorithms = {"winsorized_sigma_clip", "kappa_sigma", "linear_fit_clip"}
-    frames_for_direct_stack: list[np.ndarray] | None = None
-    weights_for_direct_stack = None
-
-    if effective_reject_algo in direct_stack_algorithms:
-        original_frames_for_direct = [
-            img if isinstance(img, np.ndarray) and img.dtype == np.float32 else np.asarray(img, dtype=np.float32)
-            for img in valid_aligned_images
-        ]
-        frames_for_direct_stack = list(original_frames_for_direct)
-
-        if effective_normalize_method == "linear_fit":
-            try:
-                frames_for_direct_stack = zemosaic_align_stack.normalize_frames_linear_fit(frames_for_direct_stack)
-                pcb_tile(
-                    f"{func_id_log_base}_info_norm_linear_fit",
-                    prog=None,
-                    lvl="INFO_DETAIL",
-                    tile_id=tile_id,
-                )
-            except Exception as exc_norm_lf:
-                logger.warning(
-                    "Linear-fit normalization failed for tile %s: %s",
-                    tile_id,
-                    exc_norm_lf,
-                    exc_info=True,
-                )
-        elif effective_normalize_method == "sky_mean":
-            try:
-                frames_for_direct_stack = zemosaic_align_stack.normalize_frames_sky_mean(frames_for_direct_stack)
-                pcb_tile(
-                    f"{func_id_log_base}_info_norm_sky_mean",
-                    prog=None,
-                    lvl="INFO_DETAIL",
-                    tile_id=tile_id,
-                )
-            except Exception as exc_norm_sky:
-                logger.warning(
-                    "Sky-mean normalization failed for tile %s: %s",
-                    tile_id,
-                    exc_norm_sky,
-                    exc_info=True,
-                )
-
-        if not frames_for_direct_stack:
-            frames_for_direct_stack = list(original_frames_for_direct)
-
-        try:
-            if effective_weight_method == "noise_variance":
-                weights_for_direct_stack = zemosaic_align_stack.compute_weights_noise_variance(frames_for_direct_stack)
-            elif effective_weight_method == "noise_fwhm":
-                weights_for_direct_stack = zemosaic_align_stack.compute_weights_noise_fwhm(frames_for_direct_stack)
-        except Exception as exc_weights:
-            logger.warning(
-                "Weight computation failed for tile %s: %s",
-                tile_id,
-                exc_weights,
-                exc_info=True,
-            )
-            weights_for_direct_stack = None
-
-    def _apply_final_combine_if_needed(result_array):
-        combine_method = effective_combine_method
-        if not isinstance(result_array, np.ndarray):
-            return result_array
-        if frames_for_direct_stack is None:
-            return result_array
-        frame_count = len(frames_for_direct_stack)
-        if frame_count == 0:
-            return result_array
-        if result_array.ndim >= 3 and result_array.shape[0] == frame_count:
-            try:
-                if combine_method == "median":
-                    return np.nanmedian(result_array, axis=0).astype(np.float32)
-                if combine_method == "mean":
-                    return np.nanmean(result_array, axis=0).astype(np.float32)
-            except Exception as exc_combine:
-                logger.warning(
-                    "Final combine %s failed for tile %s: %s",
-                    combine_method,
-                    tile_id,
-                    exc_combine,
-                    exc_info=True,
-                )
-        return result_array
-
-    if stack_reject_algo == "winsorized_sigma_clip":
-        frames_input = frames_for_direct_stack if frames_for_direct_stack is not None else valid_aligned_images
-        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_winsorized_sigma_clip(
-            frames_input,
-            weights=weights_for_direct_stack,
-            zconfig=zconfig,
-            kappa=stack_kappa_low,
-            winsor_limits=parsed_winsor_limits,
-            apply_rewinsor=True,
-        )
-        master_tile_stacked_HWC = _apply_final_combine_if_needed(master_tile_stacked_HWC)
-    elif stack_reject_algo == "kappa_sigma":
-        frames_input = frames_for_direct_stack if frames_for_direct_stack is not None else valid_aligned_images
-        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_kappa_sigma_clip(
-            frames_input,
-            zconfig=zconfig,
-            sigma_low=stack_kappa_low,
-            sigma_high=stack_kappa_high,
-        )
-        master_tile_stacked_HWC = _apply_final_combine_if_needed(master_tile_stacked_HWC)
-    elif stack_reject_algo == "linear_fit_clip":
-        frames_input = frames_for_direct_stack if frames_for_direct_stack is not None else valid_aligned_images
-        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_linear_fit_clip(
-            frames_input,
-            zconfig=zconfig,
-            sigma=stack_kappa_high,
-        )
-        master_tile_stacked_HWC = _apply_final_combine_if_needed(master_tile_stacked_HWC)
-    else:
-        master_tile_stacked_HWC = zemosaic_align_stack.stack_aligned_images(
-            aligned_image_data_list=valid_aligned_images,
-            normalize_method=stack_norm_method,
-            weighting_method=stack_weight_method,
-            rejection_algorithm=stack_reject_algo,
-            final_combine_method=stack_final_combine,
-            sigma_clip_low=stack_kappa_low,
-            sigma_clip_high=stack_kappa_high,
-            winsor_limits=parsed_winsor_limits,
-            minimum_signal_adu_target=0.0,
-            apply_radial_weight=apply_radial_weight,
-            radial_feather_fraction=radial_feather_fraction,
-            radial_shape_power=radial_shape_power,
-            winsor_max_workers=winsor_pool_workers,
-            progress_callback=progress_callback,
-            zconfig=zconfig,
-        )
+    master_tile_stacked_HWC = zemosaic_align_stack.stack_aligned_images(
+        aligned_image_data_list=valid_aligned_images,
+        normalize_method=effective_normalize_method,
+        weighting_method=effective_weight_method,
+        rejection_algorithm=effective_reject_algo,
+        final_combine_method=effective_combine_method,
+        sigma_clip_low=stack_kappa_low,
+        sigma_clip_high=stack_kappa_high,
+        winsor_limits=parsed_winsor_limits,
+        minimum_signal_adu_target=0.0,
+        apply_radial_weight=apply_radial_weight,
+        radial_feather_fraction=radial_feather_fraction,
+        radial_shape_power=radial_shape_power,
+        winsor_max_workers=winsor_pool_workers,
+        progress_callback=progress_callback,
+        zconfig=zconfig,
+    )
     
     del valid_aligned_images; gc.collect() # valid_aligned_images a été passé par valeur (copie de la liste)
                                           # mais les arrays NumPy à l'intérieur sont passés par référence.
