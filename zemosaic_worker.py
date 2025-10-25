@@ -9,6 +9,7 @@ import logging
 import inspect  # Pas utilisé directement ici, mais peut être utile pour des introspections futures
 import math
 import copy
+import unicodedata
 from datetime import datetime
 import psutil
 import tempfile
@@ -26,6 +27,45 @@ from concurrent.futures.process import BrokenProcessPool
 
 # Nombre maximum de tentatives d'alignement avant abandon définitif
 MAX_ALIGNMENT_RETRY_ATTEMPTS = 3
+
+
+_FITS_ASCII_REPLACEMENTS = {
+    "σ": "sigma",
+    "Σ": "Sigma",
+    "µ": "mu",
+    "μ": "mu",
+    "²": "^2",
+    "³": "^3",
+    "°": "deg",
+    "±": "+/-",
+    "×": "x",
+    "·": "*",
+}
+
+
+def _ensure_fits_ascii(value):
+    """Return a FITS-safe ASCII representation of *value*.
+
+    Astropy FITS headers only allow standard printable ASCII characters. Some of the
+    stacking labels exposed to the GUI (e.g. "Noise Variance (1/σ²)") contain
+    Greek letters or superscripts.  When these strings are written verbatim into
+    the FITS header a ``ValueError`` is raised.  We normalise and transliterate the
+    value here so that header keywords always receive ASCII text.  Non-string
+    values are returned unchanged.
+    """
+
+    if not isinstance(value, str):
+        return value
+
+    text = value
+    for char, replacement in _FITS_ASCII_REPLACEMENTS.items():
+        text = text.replace(char, replacement)
+
+    text = unicodedata.normalize("NFKD", text)
+    ascii_text = text.encode("ascii", "ignore").decode("ascii")
+    ascii_text = " ".join(ascii_text.split())
+
+    return ascii_text or "?"
 
 def cluster_seestar_stacks_connected(
     all_raw_files_with_info: list,
@@ -3009,8 +3049,8 @@ def create_master_tile(
         header_mt_save['ZMT_TYPE']=('Master Tile','ZeMosaic Processed Tile'); header_mt_save['ZMT_ID']=(tile_id,'Master Tile ID')
         header_mt_save['ZMT_NRAW']=(len(seestar_stack_group_info),'Raw frames in this tile group')
         header_mt_save['ZMT_NALGN']=(num_actually_aligned_for_header,'Successfully aligned frames for stack')
-        header_mt_save['ZMT_NORM'] = (str(stack_norm_method), 'Normalization method')
-        header_mt_save['ZMT_WGHT'] = (str(stack_weight_method), 'Weighting method')
+        header_mt_save['ZMT_NORM'] = (_ensure_fits_ascii(str(stack_norm_method)), 'Normalization method')
+        header_mt_save['ZMT_WGHT'] = (_ensure_fits_ascii(str(stack_weight_method)), 'Weighting method')
         if apply_radial_weight: # Log des paramètres radiaux
             header_mt_save['ZMT_RADW'] = (True, 'Radial weighting applied')
             header_mt_save['ZMT_RADF'] = (radial_feather_fraction, 'Radial feather fraction')
@@ -3018,7 +3058,7 @@ def create_master_tile(
         else:
             header_mt_save['ZMT_RADW'] = (False, 'Radial weighting applied')
 
-        header_mt_save['ZMT_REJ'] = (str(stack_reject_algo), 'Rejection algorithm')
+        header_mt_save['ZMT_REJ'] = (_ensure_fits_ascii(str(stack_reject_algo)), 'Rejection algorithm')
         if stack_reject_algo == "kappa_sigma":
             header_mt_save['ZMT_KAPLO'] = (stack_kappa_low, 'Kappa Sigma Low threshold')
             header_mt_save['ZMT_KAPHI'] = (stack_kappa_high, 'Kappa Sigma High threshold')
@@ -3028,11 +3068,14 @@ def create_master_tile(
             # Les paramètres Kappa sont aussi pertinents pour Winsorized
             header_mt_save['ZMT_KAPLO'] = (stack_kappa_low, 'Kappa Low for Winsorized')
             header_mt_save['ZMT_KAPHI'] = (stack_kappa_high, 'Kappa High for Winsorized')
-        header_mt_save['ZMT_COMB'] = (str(stack_final_combine), 'Final combine method')
+        header_mt_save['ZMT_COMB'] = (_ensure_fits_ascii(str(stack_final_combine)), 'Final combine method')
         
         if header_for_master_tile_base: # C'est déjà un objet fits.Header
             ref_path_raw_for_hdr = seestar_stack_group_info[reference_image_index_in_group].get('path_raw', 'UnknownRef')
-            header_mt_save['ZMT_REF'] = (os.path.basename(ref_path_raw_for_hdr), 'Reference raw frame for this tile WCS')
+            header_mt_save['ZMT_REF'] = (
+                _ensure_fits_ascii(os.path.basename(ref_path_raw_for_hdr)),
+                'Reference raw frame for this tile WCS',
+            )
             keys_from_ref = ['OBJECT','DATE-AVG','FILTER','INSTRUME','FOCALLEN','XPIXSZ','YPIXSZ', 'GAIN', 'OFFSET'] # Ajout GAIN, OFFSET
             for key_h in keys_from_ref:
                 if key_h in header_for_master_tile_base:
@@ -5855,8 +5898,8 @@ def run_hierarchical_mosaic(
     final_header['NRAWINIT']=(num_total_raw_files,"Initial raw images found")
     final_header['NRAWPROC']=(len(all_raw_files_processed_info),"Raw images with WCS processed")
     # ... (autres clés de config comme ASTAP, Stacking, etc.) ...
-    final_header['STK_NORM'] = (str(stack_norm_method), 'Stacking: Normalization Method')
-    final_header['STK_WGHT'] = (str(stack_weight_method), 'Stacking: Weighting Method')
+    final_header['STK_NORM'] = (_ensure_fits_ascii(str(stack_norm_method)), 'Stacking: Normalization Method')
+    final_header['STK_WGHT'] = (_ensure_fits_ascii(str(stack_weight_method)), 'Stacking: Weighting Method')
     if apply_radial_weight_config:
         final_header['STK_RADW'] = (True, 'Stacking: Radial Weighting Applied')
         final_header['STK_RADFF'] = (radial_feather_fraction_config, 'Stacking: Radial Feather Fraction')
@@ -5864,10 +5907,10 @@ def run_hierarchical_mosaic(
         final_header['STK_RADFLR'] = (min_radial_weight_floor_config, 'Stacking: Min Radial Weight Floor')
     else:
         final_header['STK_RADW'] = (False, 'Stacking: Radial Weighting Applied')
-    final_header['STK_REJ'] = (str(stack_reject_algo), 'Stacking: Rejection Algorithm')
+    final_header['STK_REJ'] = (_ensure_fits_ascii(str(stack_reject_algo)), 'Stacking: Rejection Algorithm')
     # ... (kappa, winsor si pertinent pour l'algo de rejet) ...
-    final_header['STK_COMB'] = (str(stack_final_combine), 'Stacking: Final Combine Method')
-    final_header['ZMASMBMTH'] = (final_assembly_method_config, 'Final Assembly Method')
+    final_header['STK_COMB'] = (_ensure_fits_ascii(str(stack_final_combine)), 'Stacking: Final Combine Method')
+    final_header['ZMASMBMTH'] = (_ensure_fits_ascii(str(final_assembly_method_config)), 'Final Assembly Method')
     final_header['ZM_WORKERS'] = (num_base_workers_config, 'GUI: Base workers config (0=auto)')
 
     try:
