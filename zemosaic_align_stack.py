@@ -694,17 +694,17 @@ def stack_winsorized_sigma_clip(frames, weights=None, zconfig=None, **kwargs):
     if sample.ndim not in (2, 3):
         raise ValueError(f"each frame must be (H,W) or (H,W,C); got shape {sample.shape}")
     expected_shape = sample.shape
-    # Harmonize shapes for GPU/CPU paths and promote to float32 for consistency
-    aligned_frames: list[np.ndarray] = []
+    # Harmonize shapes for GPU/CPU paths without forcing eager float32 copies
+    aligned_frames: list[_np.ndarray] = []
     for frame in frames_list:
         arr = _np.asarray(frame)
         if arr.shape != expected_shape:
             continue
-        aligned_frames.append(_np.asarray(arr, dtype=_np.float32, order="C"))
+        aligned_frames.append(arr)
     frames_list = aligned_frames
     if not frames_list:
         raise ValueError("frames is empty after shape harmonization")
-    sample = frames_list[0]
+    sample = _np.asarray(frames_list[0])
     if len(frames_list) < 3:
         _internal_logger.warning("Winsorized clip needs >=3 images; forcing CPU.")
         use_gpu = False
@@ -779,7 +779,6 @@ def stack_winsorized_sigma_clip(frames, weights=None, zconfig=None, **kwargs):
 
     gpu_callable = callable(globals().get("gpu_stack_winsorized", None))
     gpu_requested = use_gpu and GPU_AVAILABLE and gpu_callable
-
     gpu_kwargs = {
         key: kwargs[key]
         for key in ("kappa", "winsor_limits", "apply_rewinsor")
@@ -799,7 +798,6 @@ def stack_winsorized_sigma_clip(frames, weights=None, zconfig=None, **kwargs):
             "INFO (align_stack): Ignoring winsor_max_frames_per_pass=%d to honor GPU path for %d frames.",
             max_frames_per_pass,
             total_frames,
-
         )
 
     # --- GPU path (poids ignorés) ---
@@ -817,15 +815,17 @@ def stack_winsorized_sigma_clip(frames, weights=None, zconfig=None, **kwargs):
                 "INFO (align_stack): GPU winsorized stack engaged for Phase 3 (%s)",
                 gpu_name,
             )
-            _internal_logger.info("INFO (align_stack): GPU winsorized sigma clip engaged. Device: %s", gpu_name)
+            _internal_logger.info(
+                "INFO (align_stack): GPU winsorized sigma clip engaged. Device: %s",
+                gpu_name,
+            )
 
-
-            per_frame_bytes = sample.nbytes
+            sample_size = int(sample.size)
+            per_frame_bytes = sample_size * _np.dtype(_np.float32).itemsize
             estimated_bytes = per_frame_bytes * total_frames * 4
 
             def _run_gpu(sub_frames):
                 gpu_out_local = gpu_stack_winsorized(sub_frames, **gpu_kwargs)
-
                 if gpu_out_local is None:
                     raise RuntimeError("GPU returned None")
                 if isinstance(gpu_out_local, (list, tuple)) and len(gpu_out_local) >= 1:
