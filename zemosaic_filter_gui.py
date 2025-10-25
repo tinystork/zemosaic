@@ -670,8 +670,40 @@ def launch_filter_interface(
             except Exception:
                 pass
 
-        astap_exe_path = str(cfg_defaults.get('astap_executable_path', '') or '')
-        astap_data_dir = str(cfg_defaults.get('astap_data_directory_path', '') or '')
+        def _sanitize_path(value: Any) -> str:
+            """Normalize user-provided filesystem paths.
+
+            Configuration values may include surrounding quotes, unresolved
+            environment variables (e.g. ``%PROGRAMFILES%`` on Windows) or
+            user-home shortcuts.  Normalising here avoids false negatives
+            when checking for ASTAP availability.
+            """
+
+            try:
+                if value is None:
+                    return ""
+                path_str = str(value).strip()
+            except Exception:
+                return ""
+
+            # Drop wrapping quotes that Windows file dialogs can preserve
+            if path_str.startswith(('"', "'")) and path_str.endswith(('"', "'")) and len(path_str) >= 2:
+                path_str = path_str[1:-1]
+
+            expanded = os.path.expanduser(os.path.expandvars(path_str))
+            return expanded
+
+        astap_exe_path_raw = cfg_defaults.get('astap_executable_path', '')
+        astap_data_dir_raw = cfg_defaults.get('astap_data_directory_path', '')
+        astap_exe_path = _sanitize_path(astap_exe_path_raw)
+        astap_data_dir = _sanitize_path(astap_data_dir_raw)
+
+        # Keep the sanitized values in the defaults so downstream callers (log
+        # messages, resolver invocations) see consistent paths.
+        if astap_exe_path:
+            cfg_defaults['astap_executable_path'] = astap_exe_path
+        if astap_data_dir:
+            cfg_defaults['astap_data_directory_path'] = astap_data_dir
         search_radius_default = cfg_defaults.get('astap_default_search_radius', 0.0)
         downsample_default = cfg_defaults.get('astap_default_downsample', 0)
         autosplit_cap_cfg = cfg_defaults.get('max_raw_per_master_tile', 0)
@@ -689,11 +721,24 @@ def launch_filter_interface(
             if not path:
                 return False
 
+            # Direct file check
             if os.path.isfile(path):
                 return True
 
             # macOS packages are directories ending with ``.app``
             if sys.platform == "darwin" and path.lower().endswith(".app") and os.path.isdir(path):
+                return True
+
+            # Accept directories that contain the ASTAP binary
+            if os.path.isdir(path):
+                exe_name = "astap.exe" if os.name == "nt" else "astap"
+                candidate = os.path.join(path, exe_name)
+                if os.path.isfile(candidate):
+                    return True
+
+            # As a generic fallback try resolving via PATH
+            resolved = shutil.which(path) or shutil.which(os.path.basename(path))
+            if resolved:
                 return True
 
             # As a generic fallback accept any existing executable entry.
