@@ -876,13 +876,14 @@ def _apply_ram_budget_to_groups(
 
 
 # --- Configuration du Logging ---
+try:
+    log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zemosaic_worker.log")
+except NameError:
+    log_file_path = "zemosaic_worker.log"
+
 logger = logging.getLogger("ZeMosaicWorker")
 if not logger.handlers:
     logger.setLevel(logging.DEBUG)
-    try:
-        log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zemosaic_worker.log")
-    except NameError: 
-        log_file_path = "zemosaic_worker.log"
     fh = logging.FileHandler(log_file_path, mode='w', encoding='utf-8')
     fh.setLevel(logging.DEBUG)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(module)s.%(funcName)s:%(lineno)d - %(message)s')
@@ -3584,6 +3585,18 @@ def run_hierarchical_mosaic(
     auto_resource_strategy: dict = {}
     phase0_header_items: list[dict] = []
     phase0_lookup: dict[str, dict] = {}
+    preplan_groups_override_paths: list[list[str]] | None = None
+
+    def _normalize_path_for_matching(path_value: str | None) -> str | None:
+        if not path_value:
+            return None
+        try:
+            return os.path.normcase(os.path.abspath(path_value))
+        except Exception:
+            try:
+                return os.path.normcase(str(path_value))
+            except Exception:
+                return None
 
 
     # Seuil de clustering : valeur de repli à 0.18° si l'option est absente ou non positive
@@ -3829,6 +3842,38 @@ def run_hierarchical_mosaic(
                             pcb("clusterstacks_info_override_orientation_split", prog=None, lvl="INFO_DETAIL", value=cluster_orientation_split_deg_config)
                     except Exception:
                         pass
+                    try:
+                        raw_groups_override = overrides.get("preplan_master_groups") if isinstance(overrides, dict) else None
+                        if isinstance(raw_groups_override, list):
+                            mapped_groups: list[list[str]] = []
+                            for group in raw_groups_override:
+                                if not isinstance(group, (list, tuple)):
+                                    continue
+                                normalized_group: list[str] = []
+                                for item in group:
+                                    path_val = None
+                                    if isinstance(item, dict):
+                                        path_val = item.get("path") or item.get("path_raw")
+                                    elif isinstance(item, str):
+                                        path_val = item
+                                    norm_path = _normalize_path_for_matching(path_val)
+                                    if norm_path:
+                                        normalized_group.append(norm_path)
+                                if normalized_group:
+                                    mapped_groups.append(normalized_group)
+                            if mapped_groups:
+                                preplan_groups_override_paths = mapped_groups
+                                pcb(
+                                    f"Phase 0 filter provided {len(mapped_groups)} preplanned group(s).",
+                                    prog=None,
+                                    lvl="INFO_DETAIL",
+                                )
+                    except Exception as e_preplan:
+                        pcb(
+                            f"Phase 0 filter preplan override failed: {e_preplan}",
+                            prog=None,
+                            lvl="DEBUG_DETAIL",
+                        )
                 if not accepted:
                     pcb("run_warn_phase0_filter_cancelled", prog=None, lvl="WARN")
                     pcb("Phase 0: filter cancelled -> proceeding with all files", prog=None, lvl="INFO_DETAIL")
@@ -4095,68 +4140,130 @@ def run_hierarchical_mosaic(
     pcb("run_info_phase2_started", prog=base_progress_phase2, lvl="INFO")
     pcb("PHASE_UPDATE:2", prog=None, lvl="ETA_LEVEL")
     # Use order-invariant connected-components clustering for robustness
-    seestar_stack_groups = cluster_seestar_stacks_connected(
-        all_raw_files_processed_info,
-        SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG,
-        progress_callback,
-        orientation_split_threshold_deg=ORIENTATION_SPLIT_THRESHOLD_DEG,
-    )
-    if STACK_RAM_BUDGET_BYTES > 0 and seestar_stack_groups:
-        seestar_stack_groups, ram_budget_adjustments = _apply_ram_budget_to_groups(
-            seestar_stack_groups,
-            STACK_RAM_BUDGET_BYTES,
-            float(SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG),
-            float(ORIENTATION_SPLIT_THRESHOLD_DEG),
-        )
-        for adj in ram_budget_adjustments:
-            method = adj.get("method")
-            if method == "recluster":
+    preplan_groups_active = False
+    if preplan_groups_override_paths:
+        try:
+            path_lookup = {
+                _normalize_path_for_matching(info.get("path_raw") or info.get("path")): info
+                for info in all_raw_files_processed_info
+                if isinstance(info, dict)
+            }
+            used_paths: set[str] = set()
+            mapped_info_groups: list[list[dict]] = []
+            missing_preplan: list[str] = []
+            for group_paths in preplan_groups_override_paths:
+                current_group: list[dict] = []
+                for path_norm in group_paths:
+                    if not path_norm:
+                        continue
+                    info = path_lookup.get(path_norm)
+                    if info is not None:
+                        current_group.append(info)
+                        used_paths.add(path_norm)
+                    else:
+                        missing_preplan.append(path_norm)
+                if current_group:
+                    mapped_info_groups.append(current_group)
+            if mapped_info_groups:
+                leftovers = [
+                    info
+                    for info in all_raw_files_processed_info
+                    if _normalize_path_for_matching(info.get("path_raw") or info.get("path")) not in used_paths
+                ]
+                if leftovers:
+                    mapped_info_groups.append(leftovers)
+                seestar_stack_groups = mapped_info_groups
+                preplan_groups_active = True
                 _log_and_callback(
-                    "clusterstacks_warn_ram_budget_recluster",
+                    f"Phase 2: using {len(mapped_info_groups)} preplanned group(s) from filter UI.",
                     prog=None,
-                    lvl="WARN",
+                    lvl="INFO_DETAIL",
                     callback=progress_callback,
-                    group_index=adj.get("group_index"),
-                    original_frames=adj.get("original_frames"),
-                    num_subgroups=adj.get("num_subgroups"),
-                    new_threshold_deg=adj.get("new_threshold_deg"),
-                    attempts=adj.get("attempts"),
-                    estimated_mb=adj.get("estimated_mb"),
-                    budget_mb=adj.get("budget_mb"),
                 )
-            elif method == "split":
-                _log_and_callback(
-                    "clusterstacks_warn_ram_budget_split",
-                    prog=None,
-                    lvl="WARN",
-                    callback=progress_callback,
-                    group_index=adj.get("group_index"),
-                    original_frames=adj.get("original_frames"),
-                    num_subgroups=adj.get("num_subgroups"),
-                    segment_size=adj.get("segment_size"),
-                    estimated_mb=adj.get("estimated_mb"),
-                    budget_mb=adj.get("budget_mb"),
-                )
-                if adj.get("still_over_budget"):
+                if missing_preplan:
+                    try:
+                        preview = ", ".join(os.path.basename(p) for p in missing_preplan[:5] if p)
+                    except Exception:
+                        preview = ""
                     _log_and_callback(
-                        "clusterstacks_warn_ram_budget_split_still_over",
+                        "Phase 2: some preplanned paths were not found after preprocessing: "
+                        + (preview if preview else str(len(missing_preplan))),
+                        prog=None,
+                        lvl="WARN",
+                        callback=progress_callback,
+                    )
+        except Exception as e_preplan_map:
+            _log_and_callback(
+                f"Phase 2: failed to map preplanned groups ({e_preplan_map}). Falling back to clustering.",
+                prog=None,
+                lvl="WARN",
+                callback=progress_callback,
+            )
+            preplan_groups_active = False
+
+    if not preplan_groups_active:
+        seestar_stack_groups = cluster_seestar_stacks_connected(
+            all_raw_files_processed_info,
+            SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG,
+            progress_callback,
+            orientation_split_threshold_deg=ORIENTATION_SPLIT_THRESHOLD_DEG,
+        )
+        if STACK_RAM_BUDGET_BYTES > 0 and seestar_stack_groups:
+            seestar_stack_groups, ram_budget_adjustments = _apply_ram_budget_to_groups(
+                seestar_stack_groups,
+                STACK_RAM_BUDGET_BYTES,
+                float(SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG),
+                float(ORIENTATION_SPLIT_THRESHOLD_DEG),
+            )
+            for adj in ram_budget_adjustments:
+                method = adj.get("method")
+                if method == "recluster":
+                    _log_and_callback(
+                        "clusterstacks_warn_ram_budget_recluster",
                         prog=None,
                         lvl="WARN",
                         callback=progress_callback,
                         group_index=adj.get("group_index"),
-                        segment_size=adj.get("segment_size"),
+                        original_frames=adj.get("original_frames"),
+                        num_subgroups=adj.get("num_subgroups"),
+                        new_threshold_deg=adj.get("new_threshold_deg"),
+                        attempts=adj.get("attempts"),
+                        estimated_mb=adj.get("estimated_mb"),
                         budget_mb=adj.get("budget_mb"),
                     )
-            elif method == "single_over_budget":
-                _log_and_callback(
-                    "clusterstacks_warn_ram_budget_single_over",
-                    prog=None,
-                    lvl="WARN",
-                    callback=progress_callback,
-                    group_index=adj.get("group_index"),
-                    estimated_mb=adj.get("estimated_mb"),
-                    budget_mb=adj.get("budget_mb"),
-                )
+                elif method == "split":
+                    _log_and_callback(
+                        "clusterstacks_warn_ram_budget_split",
+                        prog=None,
+                        lvl="WARN",
+                        callback=progress_callback,
+                        group_index=adj.get("group_index"),
+                        original_frames=adj.get("original_frames"),
+                        num_subgroups=adj.get("num_subgroups"),
+                        segment_size=adj.get("segment_size"),
+                        estimated_mb=adj.get("estimated_mb"),
+                        budget_mb=adj.get("budget_mb"),
+                    )
+                    if adj.get("still_over_budget"):
+                        _log_and_callback(
+                            "clusterstacks_warn_ram_budget_split_still_over",
+                            prog=None,
+                            lvl="WARN",
+                            callback=progress_callback,
+                            group_index=adj.get("group_index"),
+                            segment_size=adj.get("segment_size"),
+                            budget_mb=adj.get("budget_mb"),
+                        )
+                elif method == "single_over_budget":
+                    _log_and_callback(
+                        "clusterstacks_warn_ram_budget_single_over",
+                        prog=None,
+                        lvl="WARN",
+                        callback=progress_callback,
+                        group_index=adj.get("group_index"),
+                        estimated_mb=adj.get("estimated_mb"),
+                        budget_mb=adj.get("budget_mb"),
+                    )
     # Diagnostic: nearest-neighbor separation percentiles to help tune eps
     try:
         panel_centers_sky_dbg = []
@@ -4288,7 +4395,7 @@ def run_hierarchical_mosaic(
         target_groups = int(cluster_target_groups_config or 0)
     except Exception:
         target_groups = 0
-    if target_groups > 0 and len(seestar_stack_groups) != target_groups:
+    if (not preplan_groups_active) and target_groups > 0 and len(seestar_stack_groups) != target_groups:
         try:
             # Build coordinates array
             panel_centers_sky = []
@@ -4397,7 +4504,7 @@ def run_hierarchical_mosaic(
     if not seestar_stack_groups:
         pcb("run_error_phase2_no_groups", prog=(base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING), lvl="ERROR")
         return
-    if auto_caps_info and seestar_stack_groups:
+    if (not preplan_groups_active) and auto_caps_info and seestar_stack_groups:
         try:
             cap_value = int(auto_caps_info.get("cap", 0))
             min_value = int(auto_caps_info.get("min_cap", 8))
@@ -4424,8 +4531,12 @@ def run_hierarchical_mosaic(
                     pass
 
     # Do not subdivide groups if a target group count is set; respect clustering first.
-    if (cluster_target_groups_config is None or int(cluster_target_groups_config) <= 0) and \
-       max_raw_per_master_tile_config and max_raw_per_master_tile_config > 0:
+    if (
+        not preplan_groups_active
+        and (cluster_target_groups_config is None or int(cluster_target_groups_config) <= 0)
+        and max_raw_per_master_tile_config
+        and max_raw_per_master_tile_config > 0
+    ):
         new_groups = []
         for g in seestar_stack_groups:
             for i in range(0, len(g), max_raw_per_master_tile_config):
@@ -4457,7 +4568,11 @@ def run_hierarchical_mosaic(
             lvl="INFO_DETAIL",
         )
     manual_limit = max_raw_per_master_tile_config
-    if (cluster_target_groups_config is None or int(cluster_target_groups_config) <= 0) and auto_limit_frames_per_master_tile_config:
+    if (
+        not preplan_groups_active
+        and (cluster_target_groups_config is None or int(cluster_target_groups_config) <= 0)
+        and auto_limit_frames_per_master_tile_config
+    ):
         try:
             sample_path = seestar_stack_groups[0][0].get('path_preprocessed_cache')
             sample_arr = np.load(sample_path, mmap_mode='r')
@@ -5156,7 +5271,7 @@ def run_hierarchical_mosaic(
         try: final_header.update(final_output_wcs.to_header(relax=True))
         except Exception as e_hdr_wcs: pcb("run_warn_phase6_wcs_to_header_failed", error=str(e_hdr_wcs), lvl="WARN")
     
-    final_header['SOFTWARE']=('ZeMosaic v2.9.5','Mosaic Software') # Incrémente la version si tu le souhaites
+    final_header['SOFTWARE']=('ZeMosaic v2.9.6','Mosaic Software') # Incrémente la version si tu le souhaites
     final_header['NMASTILE']=(len(master_tiles_results_list),"Master Tiles combined")
     final_header['NRAWINIT']=(num_total_raw_files,"Initial raw images found")
     final_header['NRAWPROC']=(len(all_raw_files_processed_info),"Raw images with WCS processed")
