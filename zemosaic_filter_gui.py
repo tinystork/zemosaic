@@ -107,17 +107,25 @@ def _merge_small_groups(groups: list[list[dict]], min_size: int, cap: int) -> li
 
 
 def launch_filter_interface(
-    raw_files_with_wcs: List[Dict[str, Any]],
+    raw_files_with_wcs_or_dir,
     initial_overrides: Optional[Dict[str, Any]] = None,
+    *,
+    stream_scan: bool = False,
+    scan_recursive: bool = True,
+    batch_size: int = 100,
+    preview_cap: int = 1000,
     solver_settings_dict: Optional[Dict[str, Any]] = None,
     config_overrides: Optional[Dict[str, Any]] = None,
+    **kwargs,
 ):
     """
     Display an optional Tkinter GUI to filter WCS-resolved images.
 
     Parameters
     ----------
-    raw_files_with_wcs : list[dict]
+    raw_files_with_wcs_or_dir : list[dict] | str
+        Either the legacy list of metadata dictionaries or, when ``stream_scan``
+        is True, a directory path to crawl lazily for FITS files.
         Each dict should ideally include:
           - 'path' (or 'path_raw') : absolute path to the FITS file
           - 'wcs' : astropy.wcs.WCS object
@@ -126,6 +134,19 @@ def launch_filter_interface(
           - 'center' (optional) : astropy.coordinates.SkyCoord
           - 'header' (optional) : astropy.io.fits.Header (used to infer shape)
 
+    stream_scan : bool, optional
+        Enable lazy directory crawling instead of receiving a pre-computed
+        metadata list.  When enabled, ``raw_files_with_wcs_or_dir`` must be a
+        directory path.
+    scan_recursive : bool, optional
+        When ``stream_scan`` is active, decide whether to descend into
+        sub-directories (default: True).
+    batch_size : int, optional
+        Number of files to accumulate before pushing a batch to the UI while
+        streaming (default: 100).
+    preview_cap : int, optional
+        Maximum number of footprints drawn on the Matplotlib preview to avoid
+        locking the UI for very large directories (default: 1000).
     solver_settings_dict : dict, optional
         Dictionary of solver configuration selected in the main GUI. When
         provided, values such as ASTAP paths and search radius override the
@@ -151,8 +172,22 @@ def launch_filter_interface(
         Keys are included only when relevant actions were triggered.
     """
     # Early validation and fail-safe behavior
-    if not isinstance(raw_files_with_wcs, list) or not raw_files_with_wcs:
-        return raw_files_with_wcs, False, None
+    stream_mode = False
+    input_dir: Optional[str] = None
+
+    if stream_scan and isinstance(raw_files_with_wcs_or_dir, str):
+        candidate = raw_files_with_wcs_or_dir
+        if os.path.isdir(candidate):
+            stream_mode = True
+            input_dir = candidate
+        else:
+            return [], False, None
+
+    if not stream_mode:
+        if not isinstance(raw_files_with_wcs_or_dir, list) or not raw_files_with_wcs_or_dir:
+            return raw_files_with_wcs_or_dir, False, None
+
+    raw_items_input = raw_files_with_wcs_or_dir
 
     try:
         # --- Optional localization support (autonomous fallback) ---
@@ -308,6 +343,8 @@ def launch_filter_interface(
         patch_tk_variables()
         import numpy as np
         from astropy.coordinates import SkyCoord
+        from astropy.io import fits
+        from astropy.wcs import WCS
         import astropy.units as u
         from matplotlib.figure import Figure
         from matplotlib.patches import Polygon
@@ -356,6 +393,130 @@ def launch_filter_interface(
         autosplit_func = getattr(worker_mod, '_auto_split_groups', None) if worker_mod else None
         compute_dispersion_func = getattr(worker_mod, '_compute_max_angular_separation_deg', None) if worker_mod else None
 
+        MAX_FOOTPRINTS = int(preview_cap or 0) or 1000
+        stream_queue: Optional[queue.Queue] = None
+        stream_state = {"done": not stream_mode}
+
+        def _iter_fits_paths(root: str, recursive: bool = True):
+            if not recursive:
+                try:
+                    with os.scandir(root) as it:
+                        for entry in it:
+                            if entry.is_file() and entry.name.lower().endswith((".fit", ".fits")):
+                                yield entry.path
+                except Exception:
+                    return
+            else:
+                for r, _dirs, files in os.walk(root):
+                    for fn in files:
+                        if fn.lower().endswith((".fit", ".fits")):
+                            yield os.path.join(r, fn)
+
+        def _minimal_header_payload(fpath: str) -> Dict[str, Any]:
+            payload: Dict[str, Any] = {"path": fpath}
+            try:
+                hdr = fits.getheader(fpath, 0)
+            except Exception:
+                return payload
+
+            nax1 = hdr.get("NAXIS1")
+            nax2 = hdr.get("NAXIS2")
+            if isinstance(nax1, (int, float)) and isinstance(nax2, (int, float)):
+                payload["shape"] = (int(nax2), int(nax1))
+
+            ra = hdr.get("CRVAL1")
+            dec = hdr.get("CRVAL2")
+            if ra is not None and dec is not None:
+                try:
+                    payload["center"] = (float(ra), float(dec))
+                except Exception:
+                    pass
+
+            try:
+                w = WCS(hdr, naxis=2, relax=True)
+                if w is not None and getattr(w, "is_celestial", False):
+                    payload["wcs"] = w
+            except Exception:
+                pass
+
+            keep_keys = {
+                key: hdr.get(key)
+                for key in (
+                    "NAXIS1",
+                    "NAXIS2",
+                    "CRVAL1",
+                    "CRVAL2",
+                    "CTYPE1",
+                    "CTYPE2",
+                    "CDELT1",
+                    "CDELT2",
+                    "CD1_1",
+                    "CD1_2",
+                    "CD2_1",
+                    "CD2_2",
+                    "PC1_1",
+                    "PC1_2",
+                    "PC2_1",
+                    "PC2_2",
+                    "DATE-OBS",
+                    "EXPTIME",
+                    "FILTER",
+                    "OBJECT",
+                )
+                if key in hdr
+            }
+            if keep_keys:
+                payload["header"] = keep_keys
+
+            return payload
+
+        initial_batches: list[list[Dict[str, Any]]] = []
+
+        if stream_mode and input_dir:
+            stream_queue = queue.Queue()
+
+            def _crawl_worker() -> None:
+                batch: list[Dict[str, Any]] = []
+                minimum_batch = max(1, int(batch_size) if isinstance(batch_size, int) else 100)
+                for idx, fpath in enumerate(_iter_fits_paths(input_dir, recursive=scan_recursive)):
+                    item = _minimal_header_payload(fpath)
+                    item["index"] = idx
+                    batch.append(item)
+                    if len(batch) >= minimum_batch:
+                        stream_queue.put(batch)
+                        batch = []
+                if batch:
+                    stream_queue.put(batch)
+                stream_queue.put(None)
+
+            threading.Thread(target=_crawl_worker, daemon=True).start()
+            stream_state["done"] = False
+
+            try:
+                first_batch = stream_queue.get(timeout=5.0)
+            except queue.Empty:
+                first_batch = None
+
+            if not first_batch:
+                return [], False, None
+
+            if first_batch is not None:
+                initial_batches.append(first_batch)
+            else:
+                stream_state["done"] = True
+        else:
+            normalized: list[Dict[str, Any]] = []
+            for i, entry in enumerate(raw_items_input or []):
+                try:
+                    data = dict(entry)
+                except Exception:
+                    data = {"path": entry}
+                data.setdefault("index", i)
+                normalized.append(data)
+            if not normalized:
+                return raw_items_input, False, None
+            initial_batches.append(normalized)
+
         # Attempt to read astropy WCS only when needed
         # (objects are provided by caller; we don't import WCS explicitly here)
 
@@ -372,7 +533,10 @@ def launch_filter_interface(
                     or f"<unknown_{idx}>"
                 )
                 self.wcs = src.get("wcs")
-                self.header = src.get("header")
+                header_payload = src.get("header")
+                if header_payload is None and src.get("header_subset") is not None:
+                    header_payload = src.get("header_subset")
+                self.header = header_payload
                 self.shape: Optional[tuple[int, int]] = None
                 self.center: Optional[SkyCoord] = None
                 self.phase0_center: Optional[SkyCoord] = None
@@ -505,8 +669,16 @@ def launch_filter_interface(
                     self.src["shape"] = self.shape
                 self.footprint = self._build_footprint(self.shape)
 
-        # Build items list
-        items: list[Item] = [Item(d, i) for i, d in enumerate(raw_files_with_wcs)]
+        raw_files_with_wcs: list[Dict[str, Any]] = []
+        items: list[Item] = []
+
+        def _materialize_batch(batch: list[Dict[str, Any]]) -> None:
+            for entry in batch:
+                raw_files_with_wcs.append(entry)
+                items.append(Item(entry, len(raw_files_with_wcs) - 1))
+
+        for batch in initial_batches:
+            _materialize_batch(batch)
         overrides_state: Dict[str, Any] = {}
         if isinstance(initial_overrides, dict):
             try:
@@ -1345,6 +1517,7 @@ def launch_filter_interface(
         bottom.grid(row=5, column=0, sticky="ew", padx=5, pady=5)
         result: dict[str, Any] = {"accepted": None, "selected_indices": None, "overrides": None}
         def on_validate():
+            _drain_stream_queue()
             sel = [i for i, v in enumerate(check_vars) if v.get()]
             result["accepted"] = True
             result["selected_indices"] = sel
@@ -1355,6 +1528,7 @@ def launch_filter_interface(
                 pass
             root.destroy()
         def on_cancel():
+            _drain_stream_queue()
             result["accepted"] = False
             result["selected_indices"] = None
             try:
@@ -1379,9 +1553,10 @@ def launch_filter_interface(
             command=on_cancel,
         ).pack(side=tk.RIGHT, padx=4)
 
-        # Populate checkboxes and draw footprints
+        # Populate checkboxes and draw footprints (supports streaming additions)
         check_vars: list[tk.BooleanVar] = []
-        patches: list[Polygon] = []
+        checkbuttons: list[Any] = []
+        patches: list[Any] = []
         center_pts: list[Any] = []  # matplotlib line2D handles
         # Map matplotlib artists back to item indices for click-to-select
         artist_to_index: dict[Any, int] = {}
@@ -1389,61 +1564,93 @@ def launch_filter_interface(
         ref_ra = float(global_center.ra.to(u.deg).value)
         ref_dec = float(global_center.dec.to(u.deg).value)
 
-        # Build visuals first to compute bounds
         all_ra_vals: list[float] = []
         all_dec_vals: list[float] = []
+        drawn_footprints = {"count": 0}
 
-        for idx, it in enumerate(items):
+        def _add_item_row(item: Item) -> None:
+            idx = len(check_vars)
             var = tk.BooleanVar(master=root, value=True)
             check_vars.append(var)
 
-            # Label includes basename and optional separation
-            base = os.path.basename(it.path)
+            base = os.path.basename(item.path)
             sep_txt = ""
-            if it.center is not None:
-                sep_deg = it.center.separation(global_center).to(u.deg).value
-                sep_txt = f"  ({sep_deg:.2f}°)"
+            if item.center is not None:
+                try:
+                    sep_deg = item.center.separation(global_center).to(u.deg).value
+                    sep_txt = f"  ({sep_deg:.2f}°)"
+                except Exception:
+                    sep_txt = ""
+
             cb = ttk.Checkbutton(inner, text=base + sep_txt, variable=var, command=lambda i=idx: update_visuals(i))
             cb.grid(row=idx, column=0, sticky="w")
+            checkbuttons.append(cb)
 
-            # Plot polygon footprint if available; else plot center point
+            # Ensure placeholders exist for visuals
+            patches.append(None)
+            center_pts.append(None)
+
             color_sel = "tab:blue"
-            color_unsel = "0.7"
 
-            if it.footprint is not None:
-                ra_wrapped = [wrap_ra_deg(float(ra), ref_ra) for ra in it.footprint[:, 0].tolist()]
-                decs = it.footprint[:, 1].tolist()
-                poly = Polygon(list(zip(ra_wrapped, decs)), closed=True, fill=False, edgecolor=color_sel, linewidth=1.0, alpha=0.9)
-                # Allow selection by clicking inside the footprint on the plot
+            local_ra_vals: list[float] = []
+            local_dec_vals: list[float] = []
+
+            if item.footprint is not None and drawn_footprints["count"] < MAX_FOOTPRINTS:
                 try:
-                    poly.set_picker(True)
+                    ra_wrapped = [wrap_ra_deg(float(ra), ref_ra) for ra in item.footprint[:, 0].tolist()]
+                    decs = item.footprint[:, 1].tolist()
+                    poly = Polygon(
+                        list(zip(ra_wrapped, decs)),
+                        closed=True,
+                        fill=False,
+                        edgecolor=color_sel,
+                        linewidth=1.0,
+                        alpha=0.9,
+                    )
+                    try:
+                        poly.set_picker(True)
+                    except Exception:
+                        pass
+                    ax.add_patch(poly)
+                    patches[idx] = poly
+                    artist_to_index[poly] = idx
+                    local_ra_vals.extend(ra_wrapped)
+                    local_dec_vals.extend(decs)
+                    drawn_footprints["count"] += 1
                 except Exception:
-                    pass
-                patches.append(poly)
-                ax.add_patch(poly)
-                artist_to_index[poly] = idx
-                all_ra_vals.extend(ra_wrapped)
-                all_dec_vals.extend(decs)
-            elif it.center is not None:
-                ra_c = wrap_ra_deg(float(it.center.ra.to(u.deg).value), ref_ra)
-                dec_c = float(it.center.dec.to(u.deg).value)
-                ln, = ax.plot([ra_c], [dec_c], marker="o", markersize=3, color=color_sel, alpha=0.9, picker=8)
-                center_pts.append(ln)
-                artist_to_index[ln] = idx
-                all_ra_vals.append(ra_c)
-                all_dec_vals.append(dec_c)
-            else:
-                # No WCS displayable — skip drawing, but keep placeholders for indexing
-                patches.append(None)  # type: ignore
-                center_pts.append(None)  # type: ignore
+                    patches[idx] = None
+            elif item.center is not None:
+                try:
+                    ra_c = wrap_ra_deg(float(item.center.ra.to(u.deg).value), ref_ra)
+                    dec_c = float(item.center.dec.to(u.deg).value)
+                    ln, = ax.plot(
+                        [ra_c],
+                        [dec_c],
+                        marker="o",
+                        markersize=3,
+                        color=color_sel,
+                        alpha=0.9,
+                        picker=8,
+                    )
+                    center_pts[idx] = ln
+                    artist_to_index[ln] = idx
+                    local_ra_vals.append(ra_c)
+                    local_dec_vals.append(dec_c)
+                except Exception:
+                    center_pts[idx] = None
 
-        # Set view limits with small margins
+            all_ra_vals.extend(local_ra_vals)
+            all_dec_vals.extend(local_dec_vals)
+
+        for item in items:
+            _add_item_row(item)
+
         if all_ra_vals and all_dec_vals:
             ra_min, ra_max = min(all_ra_vals), max(all_ra_vals)
             dec_min, dec_max = min(all_dec_vals), max(all_dec_vals)
             ra_pad = max(1e-3, (ra_max - ra_min) * 0.05 + 0.2)
             dec_pad = max(1e-3, (dec_max - dec_min) * 0.05 + 0.2)
-            ax.set_xlim(ra_max + ra_pad, ra_min - ra_pad)  # inverted x-axis
+            ax.set_xlim(ra_max + ra_pad, ra_min - ra_pad)
             ax.set_ylim(dec_min - dec_pad, dec_max + dec_pad)
         ax.grid(True, which="both", linestyle=":", linewidth=0.6)
 
@@ -1483,6 +1690,59 @@ def launch_filter_interface(
                 ax.set_ylim(dec_min - dec_pad, dec_max + dec_pad)
                 canvas.draw_idle()
 
+        def _ingest_batch(batch: list[Dict[str, Any]]) -> None:
+            if not batch:
+                return
+            for entry in batch:
+                raw_files_with_wcs.append(entry)
+                new_item = Item(entry, len(raw_files_with_wcs) - 1)
+                items.append(new_item)
+                _add_item_row(new_item)
+            update_visuals()
+            _recompute_axes_limits()
+
+        def _consume_ui_queue() -> None:
+            if stream_queue is None or stream_state.get("done"):
+                return
+            try:
+                while True:
+                    batch = stream_queue.get_nowait()
+                    if batch is None:
+                        stream_state["done"] = True
+                        break
+                    if batch:
+                        _ingest_batch(batch)
+            except queue.Empty:
+                pass
+            finally:
+                if not stream_state.get("done"):
+                    try:
+                        root.after(40, _consume_ui_queue)
+                    except Exception:
+                        stream_state["done"] = True
+
+        if stream_queue is not None and not stream_state.get("done"):
+            try:
+                root.after(40, _consume_ui_queue)
+            except Exception:
+                stream_state["done"] = True
+
+        def _drain_stream_queue() -> None:
+            if stream_queue is None or stream_state.get("done"):
+                return
+            while True:
+                try:
+                    batch = stream_queue.get(timeout=0.1)
+                except queue.Empty:
+                    if stream_state.get("done"):
+                        break
+                    continue
+                if batch is None:
+                    stream_state["done"] = True
+                    break
+                if batch:
+                    _ingest_batch(batch)
+
         def _refresh_item_visual(idx: int) -> None:
             if idx < 0 or idx >= len(items):
                 return
@@ -1496,6 +1756,7 @@ def launch_filter_interface(
                     pass
                 artist_to_index.pop(prev_patch, None)
                 patches[idx] = None
+                drawn_footprints["count"] = max(0, drawn_footprints["count"] - 1)
             if prev_point is not None:
                 try:
                     prev_point.remove()
@@ -1509,16 +1770,26 @@ def launch_filter_interface(
             new_patch = None
             new_point = None
             if item.footprint is not None:
-                try:
-                    ra_wrapped = [wrap_ra_deg(float(ra), ref_ra) for ra in item.footprint[:, 0].tolist()]
-                    decs = item.footprint[:, 1].tolist()
-                    new_patch = Polygon(list(zip(ra_wrapped, decs)), closed=True, fill=False, edgecolor=color_sel, linewidth=1.0, alpha=alpha_val)
-                    new_patch.set_picker(True)
-                    ax.add_patch(new_patch)
-                    artist_to_index[new_patch] = idx
-                    patches[idx] = new_patch
-                except Exception:
-                    new_patch = None
+                allow_draw = drawn_footprints["count"] < MAX_FOOTPRINTS
+                if allow_draw:
+                    try:
+                        ra_wrapped = [wrap_ra_deg(float(ra), ref_ra) for ra in item.footprint[:, 0].tolist()]
+                        decs = item.footprint[:, 1].tolist()
+                        new_patch = Polygon(
+                            list(zip(ra_wrapped, decs)),
+                            closed=True,
+                            fill=False,
+                            edgecolor=color_sel,
+                            linewidth=1.0,
+                            alpha=alpha_val,
+                        )
+                        new_patch.set_picker(True)
+                        ax.add_patch(new_patch)
+                        artist_to_index[new_patch] = idx
+                        patches[idx] = new_patch
+                        drawn_footprints["count"] += 1
+                    except Exception:
+                        new_patch = None
             elif item.center is not None:
                 try:
                     ra_c = wrap_ra_deg(float(item.center.ra.to(u.deg).value), ref_ra)
@@ -1623,6 +1894,7 @@ def launch_filter_interface(
 
         # On window close: treat as cancel (keep all)
         def on_close():
+            _drain_stream_queue()
             if result.get("accepted") is None:
                 result["accepted"] = False
             result["selected_indices"] = None
