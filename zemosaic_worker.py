@@ -3922,146 +3922,256 @@ def run_hierarchical_mosaic(
         pcb("log_filter_ui_skipped", prog=None, lvl="INFO_DETAIL")
 
     if ASTROPY_AVAILABLE and fits is not None:
-        pcb("Phase 0: header scan start", prog=None, lvl="INFO_DETAIL")
-        t0_hscan = time.monotonic()
-        header_items_for_filter = []
-        num_scanned = 0
-        for idx_file, fpath in enumerate(fits_file_paths):
-            hdr = None
-            wcs0 = None
-            shp_hw = None
-            center_sc = None
+        header_items_for_filter: list[dict] = []
+        filtered_items: list[dict] | None = None
+        filter_overrides: dict | None = None
+        filter_accepted = False
+        filter_invoked = False
+        streaming_filter_success = False
+
+        launch_filter_interface_fn = None
+        if early_filter_enabled:
             try:
-                hdr = fits.getheader(fpath, 0)
-                try:
-                    nax1 = int(hdr.get("NAXIS1", 0))
-                    nax2 = int(hdr.get("NAXIS2", 0))
-                    if nax1 > 0 and nax2 > 0:
-                        shp_hw = (nax2, nax1)
-                except Exception:
-                    shp_hw = None
-                try:
-                    w = WCS(hdr, naxis=2, relax=True) if WCS is not None else None
-                    if w and getattr(w, "is_celestial", False):
-                        wcs0 = w
-                except Exception:
-                    wcs0 = None
-                if wcs0 is None:
+                from zemosaic_filter_gui import launch_filter_interface as launch_filter_interface_fn  # type: ignore
+            except ImportError:
+                launch_filter_interface_fn = None
+                pcb("Phase 0: filter GUI not available", prog=None, lvl="DEBUG_DETAIL")
+
+        def _parse_filter_result(ret_obj):
+            filt_items = None
+            accepted_flag = False
+            overrides_obj = None
+            if isinstance(ret_obj, tuple) and len(ret_obj) >= 1:
+                filt_items = ret_obj[0]
+                if len(ret_obj) >= 2:
                     try:
-                        if ZEMOSAIC_ASTROMETRY_AVAILABLE and zemosaic_astrometry and hasattr(zemosaic_astrometry, "extract_center_from_header"):
-                            center_sc = zemosaic_astrometry.extract_center_from_header(hdr)
+                        accepted_flag = bool(ret_obj[1])
                     except Exception:
-                        center_sc = None
-                item = {
-                    "path": fpath,
-                    "header": hdr,
-                    "index": idx_file,
-                }
-                if shp_hw:
-                    item["shape"] = shp_hw
-                if wcs0 is not None:
-                    item["wcs"] = wcs0
-                if center_sc is not None:
-                    item["center"] = center_sc
-                header_items_for_filter.append(item)
-                num_scanned += 1
-            except Exception:
-                header_items_for_filter.append({"path": fpath, "index": idx_file})
-                num_scanned += 1
-        t1_hscan = time.monotonic()
-        avg_t = (t1_hscan - t0_hscan) / max(1, num_scanned)
-        pcb(f"Phase 0: header scan finished — files={num_scanned}, avg={avg_t:.4f}s/header", prog=None, lvl="DEBUG")
+                        accepted_flag = False
+                if len(ret_obj) >= 3:
+                    overrides_obj = ret_obj[2]
+            elif isinstance(ret_obj, list):
+                filt_items = ret_obj
+                accepted_flag = True
+            return filt_items, accepted_flag, overrides_obj
+
+        initial_filter_overrides = None
+        try:
+            initial_filter_overrides = {
+                "cluster_panel_threshold": float(cluster_threshold_config),
+                "cluster_target_groups": int(cluster_target_groups_config),
+                "cluster_orientation_split_deg": float(cluster_orientation_split_deg_config),
+            }
+        except Exception:
+            initial_filter_overrides = None
+
+        solver_payload_for_filter = solver_settings if isinstance(solver_settings, dict) else None
+        config_payload_for_filter = {
+            "astap_executable_path": astap_exe_path,
+            "astap_data_directory_path": astap_data_dir_param,
+            "astap_default_search_radius": astap_search_radius_config,
+            "astap_default_downsample": astap_downsample_config,
+            "astap_default_sensitivity": astap_sensitivity_config,
+        }
+
+        if launch_filter_interface_fn is not None:
+            try:
+                filter_invoked = True
+                filter_ret = launch_filter_interface_fn(
+                    input_folder,
+                    initial_filter_overrides,
+                    stream_scan=True,
+                    scan_recursive=True,
+                    batch_size=200,
+                    preview_cap=1500,
+                    solver_settings_dict=solver_payload_for_filter,
+                    config_overrides=config_payload_for_filter,
+                )
+                filtered_items, filter_accepted, filter_overrides = _parse_filter_result(filter_ret)
+                if isinstance(filtered_items, list):
+                    header_items_for_filter = filtered_items
+                if header_items_for_filter:
+                    streaming_filter_success = True
+                    pcb(
+                        f"Phase 0: streaming filter prepared {len(header_items_for_filter)} item(s)",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                    )
+                else:
+                    filter_invoked = False
+            except Exception as e_filter:
+                filter_invoked = False
+                header_items_for_filter = []
+                filtered_items = None
+                filter_overrides = None
+                filter_accepted = False
+                pcb(f"Phase 0 streaming filter failed: {e_filter}", prog=None, lvl="WARN")
+
+        if not streaming_filter_success:
+            pcb("Phase 0: header scan start", prog=None, lvl="INFO_DETAIL")
+            t0_hscan = time.monotonic()
+            header_items_for_filter = []
+            num_scanned = 0
+            for idx_file, fpath in enumerate(fits_file_paths):
+                hdr = None
+                wcs0 = None
+                shp_hw = None
+                center_sc = None
+                try:
+                    hdr = fits.getheader(fpath, 0)
+                    try:
+                        nax1 = int(hdr.get("NAXIS1", 0))
+                        nax2 = int(hdr.get("NAXIS2", 0))
+                        if nax1 > 0 and nax2 > 0:
+                            shp_hw = (nax2, nax1)
+                    except Exception:
+                        shp_hw = None
+                    try:
+                        w = WCS(hdr, naxis=2, relax=True) if WCS is not None else None
+                        if w and getattr(w, "is_celestial", False):
+                            wcs0 = w
+                    except Exception:
+                        wcs0 = None
+                    if wcs0 is None:
+                        try:
+                            if (
+                                ZEMOSAIC_ASTROMETRY_AVAILABLE
+                                and zemosaic_astrometry
+                                and hasattr(zemosaic_astrometry, "extract_center_from_header")
+                            ):
+                                center_sc = zemosaic_astrometry.extract_center_from_header(hdr)
+                        except Exception:
+                            center_sc = None
+                    item = {
+                        "path": fpath,
+                        "header": hdr,
+                        "index": idx_file,
+                    }
+                    if shp_hw:
+                        item["shape"] = shp_hw
+                    if wcs0 is not None:
+                        item["wcs"] = wcs0
+                    if center_sc is not None:
+                        item["center"] = center_sc
+                    header_items_for_filter.append(item)
+                    num_scanned += 1
+                except Exception:
+                    header_items_for_filter.append({"path": fpath, "index": idx_file})
+                    num_scanned += 1
+            t1_hscan = time.monotonic()
+            avg_t = (t1_hscan - t0_hscan) / max(1, num_scanned)
+            pcb(
+                f"Phase 0: header scan finished — files={num_scanned}, avg={avg_t:.4f}s/header",
+                prog=None,
+                lvl="DEBUG",
+            )
+
+            if launch_filter_interface_fn is not None and not filter_invoked:
+                try:
+                    filter_invoked = True
+                    filter_ret = launch_filter_interface_fn(header_items_for_filter, initial_filter_overrides)
+                    filtered_items, filter_accepted, filter_overrides = _parse_filter_result(filter_ret)
+                except Exception as e_filter:
+                    filter_invoked = False
+                    filtered_items = None
+                    filter_overrides = None
+                    filter_accepted = False
+                    pcb(f"Phase 0 filter UI failed: {e_filter}", prog=None, lvl="WARN")
+            elif not early_filter_enabled:
+                pcb("Phase 0: header scan completed (filter UI disabled)", prog=None, lvl="DEBUG_DETAIL")
 
         phase0_header_items = header_items_for_filter
 
-        if early_filter_enabled:
-            try:
-                from zemosaic_filter_gui import launch_filter_interface
+        if filter_invoked:
+            if filter_overrides:
                 try:
-                    _init_overrides = {
-                        "cluster_panel_threshold": float(cluster_threshold_config),
-                        "cluster_target_groups": int(cluster_target_groups_config),
-                        "cluster_orientation_split_deg": float(cluster_orientation_split_deg_config),
-                    }
-                except Exception:
-                    _init_overrides = None
-                filter_ret = launch_filter_interface(header_items_for_filter, _init_overrides)
-                accepted = True
-                filtered_items = None
-                overrides = None
-                if isinstance(filter_ret, tuple) and len(filter_ret) >= 1:
-                    filtered_items = filter_ret[0]
-                    if len(filter_ret) >= 2:
-                        try:
-                            accepted = bool(filter_ret[1])
-                        except Exception:
-                            accepted = True
-                    if len(filter_ret) >= 3:
-                        overrides = filter_ret[2]
-                elif isinstance(filter_ret, list):
-                    filtered_items = filter_ret
-                if overrides:
-                    try:
-                        if "cluster_panel_threshold" in overrides:
-                            cluster_threshold_config = overrides["cluster_panel_threshold"]
-                            pcb("clusterstacks_info_override_threshold", prog=None, lvl="INFO_DETAIL", value=cluster_threshold_config)
-                        if "cluster_target_groups" in overrides:
-                            cluster_target_groups_config = overrides["cluster_target_groups"]
-                            pcb("clusterstacks_info_override_target_groups", prog=None, lvl="INFO_DETAIL", value=cluster_target_groups_config)
-                        if "cluster_orientation_split_deg" in overrides:
-                            cluster_orientation_split_deg_config = overrides["cluster_orientation_split_deg"]
-                            pcb("clusterstacks_info_override_orientation_split", prog=None, lvl="INFO_DETAIL", value=cluster_orientation_split_deg_config)
-                    except Exception:
-                        pass
-                    try:
-                        raw_groups_override = overrides.get("preplan_master_groups") if isinstance(overrides, dict) else None
-                        if isinstance(raw_groups_override, list):
-                            mapped_groups: list[list[str]] = []
-                            for group in raw_groups_override:
-                                if not isinstance(group, (list, tuple)):
-                                    continue
-                                normalized_group: list[str] = []
-                                for item in group:
-                                    path_val = None
-                                    if isinstance(item, dict):
-                                        path_val = item.get("path") or item.get("path_raw")
-                                    elif isinstance(item, str):
-                                        path_val = item
-                                    norm_path = _normalize_path_for_matching(path_val)
-                                    if norm_path:
-                                        normalized_group.append(norm_path)
-                                if normalized_group:
-                                    mapped_groups.append(normalized_group)
-                            if mapped_groups:
-                                preplan_groups_override_paths = mapped_groups
-                                pcb(
-                                    f"Phase 0 filter provided {len(mapped_groups)} preplanned group(s).",
-                                    prog=None,
-                                    lvl="INFO_DETAIL",
-                                )
-                    except Exception as e_preplan:
+                    if "cluster_panel_threshold" in filter_overrides:
+                        cluster_threshold_config = filter_overrides["cluster_panel_threshold"]
                         pcb(
-                            f"Phase 0 filter preplan override failed: {e_preplan}",
+                            "clusterstacks_info_override_threshold",
                             prog=None,
-                            lvl="DEBUG_DETAIL",
+                            lvl="INFO_DETAIL",
+                            value=cluster_threshold_config,
                         )
-                if not accepted:
-                    pcb("run_warn_phase0_filter_cancelled", prog=None, lvl="WARN")
-                    pcb("Phase 0: filter cancelled -> proceeding with all files", prog=None, lvl="INFO_DETAIL")
-                if accepted and filtered_items is not None:
-                    fits_file_paths = [item["path"] for item in filtered_items if isinstance(item, dict) and item.get("path")]
-                    pcb(f"Phase 0: selection after filter = {len(fits_file_paths)} files", prog=None, lvl="INFO_DETAIL")
+                    if "cluster_target_groups" in filter_overrides:
+                        cluster_target_groups_config = filter_overrides["cluster_target_groups"]
+                        pcb(
+                            "clusterstacks_info_override_target_groups",
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                            value=cluster_target_groups_config,
+                        )
+                    if "cluster_orientation_split_deg" in filter_overrides:
+                        cluster_orientation_split_deg_config = filter_overrides["cluster_orientation_split_deg"]
+                        pcb(
+                            "clusterstacks_info_override_orientation_split",
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                            value=cluster_orientation_split_deg_config,
+                        )
+                except Exception:
+                    pass
+                try:
+                    raw_groups_override = (
+                        filter_overrides.get("preplan_master_groups")
+                        if isinstance(filter_overrides, dict)
+                        else None
+                    )
+                    if isinstance(raw_groups_override, list):
+                        mapped_groups: list[list[str]] = []
+                        for group in raw_groups_override:
+                            if not isinstance(group, (list, tuple)):
+                                continue
+                            normalized_group: list[str] = []
+                            for item in group:
+                                path_val = None
+                                if isinstance(item, dict):
+                                    path_val = item.get("path") or item.get("path_raw")
+                                elif isinstance(item, str):
+                                    path_val = item
+                                norm_path = _normalize_path_for_matching(path_val)
+                                if norm_path:
+                                    normalized_group.append(norm_path)
+                            if normalized_group:
+                                mapped_groups.append(normalized_group)
+                        if mapped_groups:
+                            preplan_groups_override_paths = mapped_groups
+                            pcb(
+                                f"Phase 0 filter provided {len(mapped_groups)} preplanned group(s).",
+                                prog=None,
+                                lvl="INFO_DETAIL",
+                            )
+                except Exception as e_preplan:
+                    pcb(
+                        f"Phase 0 filter preplan override failed: {e_preplan}",
+                        prog=None,
+                        lvl="DEBUG_DETAIL",
+                    )
+
+            if not filter_accepted:
+                pcb("run_warn_phase0_filter_cancelled", prog=None, lvl="WARN")
+                pcb("Phase 0: filter cancelled -> proceeding with all files", prog=None, lvl="INFO_DETAIL")
+            if filter_accepted and isinstance(filtered_items, list):
+                new_paths = [
+                    item.get("path")
+                    for item in filtered_items
+                    if isinstance(item, dict) and item.get("path")
+                ]
+                if new_paths:
+                    fits_file_paths = new_paths
+                    pcb(
+                        f"Phase 0: selection after filter = {len(fits_file_paths)} files",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                    )
                     try:
                         fits_file_paths.sort(key=lambda p: p.lower())
                     except Exception:
                         fits_file_paths.sort()
-            except ImportError:
-                pcb("Phase 0: filter GUI not available", prog=None, lvl="DEBUG_DETAIL")
-            except Exception as e_filter:
-                pcb(f"Phase 0 filter UI failed: {e_filter}", prog=None, lvl="WARN")
-        else:
-            pcb("Phase 0: header scan completed (filter UI disabled)", prog=None, lvl="DEBUG_DETAIL")
+            elif filter_accepted and not filtered_items:
+                pcb("Phase 0: filter returned no items", prog=None, lvl="WARN")
     else:
+        phase0_header_items = []
         pcb("Phase 0: header scan unavailable (Astropy missing)", prog=None, lvl="WARN")
 
     phase0_lookup = {item["path"]: item for item in phase0_header_items if isinstance(item, dict) and item.get("path")}

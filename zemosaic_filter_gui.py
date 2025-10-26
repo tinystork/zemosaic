@@ -394,8 +394,21 @@ def launch_filter_interface(
         compute_dispersion_func = getattr(worker_mod, '_compute_max_angular_separation_deg', None) if worker_mod else None
 
         MAX_FOOTPRINTS = int(preview_cap or 0) or 1000
+        cache_csv_path: Optional[str] = None
+        if stream_mode and input_dir:
+            cache_csv_path = os.path.join(input_dir, "headers_cache.csv")
+
         stream_queue: Optional[queue.Queue] = None
-        stream_state = {"done": not stream_mode}
+        stream_state = {
+            "done": not stream_mode,
+            "running": False,
+            "pending_start": False,
+            "status_message": None,
+            "spawn_worker": None,
+            "csv_loaded": False,
+        }
+        if cache_csv_path:
+            stream_state["csv_path"] = cache_csv_path
 
         def _iter_fits_paths(root: str, recursive: bool = True):
             if not recursive:
@@ -470,12 +483,113 @@ def launch_filter_interface(
 
             return payload
 
+        def _load_csv_bootstrap(path_csv: str) -> list[Dict[str, Any]]:
+            rows: list[Dict[str, Any]] = []
+            try:
+                import csv
+
+                with open(path_csv, "r", newline="", encoding="utf-8") as handle:
+                    reader = csv.DictReader(handle)
+                    for row in reader:
+                        entry: Dict[str, Any] = {"path": row.get("path", "")}
+                        nax1 = row.get("NAXIS1")
+                        nax2 = row.get("NAXIS2")
+                        if nax1 and nax2:
+                            try:
+                                entry["shape"] = (int(nax2), int(nax1))
+                            except Exception:
+                                pass
+                        ra_val = row.get("CRVAL1")
+                        dec_val = row.get("CRVAL2")
+                        if ra_val and dec_val:
+                            try:
+                                entry["center"] = (float(ra_val), float(dec_val))
+                            except Exception:
+                                pass
+                        header_subset = {
+                            key: row.get(key)
+                            for key in (
+                                "NAXIS1",
+                                "NAXIS2",
+                                "CRVAL1",
+                                "CRVAL2",
+                                "DATE-OBS",
+                                "EXPTIME",
+                                "FILTER",
+                                "OBJECT",
+                            )
+                            if row.get(key) is not None
+                        }
+                        if header_subset:
+                            entry["header"] = header_subset
+                        rows.append(entry)
+            except Exception:
+                return []
+            return rows
+
+        def _export_csv(path_csv: str, items_for_csv: list[Dict[str, Any]]) -> None:
+            try:
+                import csv
+
+                fieldnames = [
+                    "path",
+                    "NAXIS1",
+                    "NAXIS2",
+                    "CRVAL1",
+                    "CRVAL2",
+                    "DATE-OBS",
+                    "EXPTIME",
+                    "FILTER",
+                    "OBJECT",
+                ]
+                with open(path_csv, "w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                    writer.writeheader()
+                    for item in items_for_csv:
+                        header_payload = item.get("header") or {}
+                        shape_payload = item.get("shape")
+                        nax1 = header_payload.get("NAXIS1")
+                        nax2 = header_payload.get("NAXIS2")
+                        if (nax1 is None or nax2 is None) and isinstance(shape_payload, (list, tuple)) and len(shape_payload) >= 2:
+                            nax2 = shape_payload[0]
+                            nax1 = shape_payload[1]
+                        center_payload = item.get("center")
+                        if hasattr(center_payload, "ra") and hasattr(center_payload, "dec"):
+                            try:
+                                center_tuple = (
+                                    float(center_payload.ra.deg),
+                                    float(center_payload.dec.deg),
+                                )
+                            except Exception:
+                                center_tuple = (None, None)
+                        else:
+                            center_tuple = None
+                            if isinstance(center_payload, (list, tuple)) and len(center_payload) >= 2:
+                                try:
+                                    center_tuple = (float(center_payload[0]), float(center_payload[1]))
+                                except Exception:
+                                    center_tuple = None
+                        writer.writerow(
+                            {
+                                "path": item.get("path", ""),
+                                "NAXIS1": nax1 if nax1 is not None else "",
+                                "NAXIS2": nax2 if nax2 is not None else "",
+                                "CRVAL1": center_tuple[0] if center_tuple else "",
+                                "CRVAL2": center_tuple[1] if center_tuple else "",
+                                "DATE-OBS": header_payload.get("DATE-OBS", ""),
+                                "EXPTIME": header_payload.get("EXPTIME", ""),
+                                "FILTER": header_payload.get("FILTER", ""),
+                                "OBJECT": header_payload.get("OBJECT", ""),
+                            }
+                        )
+            except Exception as exc:
+                _log_message(f"[CSV] Export failed: {exc}", level="WARN")
+
         initial_batches: list[list[Dict[str, Any]]] = []
 
         if stream_mode and input_dir:
-            stream_queue = queue.Queue()
 
-            def _crawl_worker() -> None:
+            def _crawl_worker(target_queue: "queue.Queue[list[Dict[str, Any]] | None]") -> None:
                 batch: list[Dict[str, Any]] = []
                 minimum_batch = max(1, int(batch_size) if isinstance(batch_size, int) else 100)
                 for idx, fpath in enumerate(_iter_fits_paths(input_dir, recursive=scan_recursive)):
@@ -483,16 +597,38 @@ def launch_filter_interface(
                     item["index"] = idx
                     batch.append(item)
                     if len(batch) >= minimum_batch:
-                        stream_queue.put(batch)
+                        target_queue.put(batch)
                         batch = []
                 if batch:
-                    stream_queue.put(batch)
-                stream_queue.put(None)
+                    target_queue.put(batch)
+                target_queue.put(None)
+                stream_state["running"] = False
 
-            threading.Thread(target=_crawl_worker, daemon=True).start()
-            stream_state["done"] = False
-            # NE PAS attendre la 1re fournée ici : on laisse l'UI se lancer,
-            # les batches seront avalés par _consume_ui_queue()
+            def _spawn_worker() -> None:
+                nonlocal stream_queue
+                if stream_state.get("running"):
+                    return
+                stream_queue = queue.Queue()
+                stream_state["running"] = True
+                stream_state["done"] = False
+                stream_state["status_message"] = None
+                threading.Thread(target=_crawl_worker, args=(stream_queue,), daemon=True).start()
+
+            stream_state["spawn_worker"] = _spawn_worker
+            stream_state["done"] = True
+            if cache_csv_path and os.path.isfile(cache_csv_path):
+                bootstrap_rows = _load_csv_bootstrap(cache_csv_path)
+                if bootstrap_rows:
+                    initial_batches.append(bootstrap_rows)
+                    stream_state["csv_loaded"] = True
+                    stream_state["status_message"] = _tr(
+                        "filter_status_ready_csv",
+                        "Loaded from CSV. Click Analyse to refresh.",
+                    )
+                else:
+                    stream_state["pending_start"] = True
+            else:
+                stream_state["pending_start"] = True
         else:
             normalized: list[Dict[str, Any]] = []
             for i, entry in enumerate(raw_items_input or []):
@@ -742,7 +878,7 @@ def launch_filter_interface(
         main.columnconfigure(1, weight=2)
         main.rowconfigure(1, weight=1)
 
-        # Status strip (top): crawling indicator
+        # Status strip (top): crawling indicator + CSV helpers
         status = ttk.Frame(main)
         status.grid(row=0, column=0, columnspan=2, sticky="ew")
         status.columnconfigure(1, weight=1)
@@ -750,17 +886,56 @@ def launch_filter_interface(
         ttk.Label(status, textvariable=status_var).grid(row=0, column=0, padx=6, pady=4, sticky="w")
         pb = ttk.Progressbar(status, mode="indeterminate", length=180)
         pb.grid(row=0, column=1, padx=6, pady=4, sticky="e")
+        btn_bar = ttk.Frame(status)
+        btn_bar.grid(row=0, column=2, padx=(0, 6), pady=4, sticky="e")
+        analyse_btn = ttk.Button(
+            btn_bar,
+            text=_tr("filter_btn_analyse", "Analyse"),
+            width=10,
+        )
+        export_btn = ttk.Button(
+            btn_bar,
+            text=_tr("filter_btn_export_csv", "Export CSV"),
+            width=12,
+        )
+        analyse_btn.grid(row=0, column=0, padx=(0, 6))
+        export_btn.grid(row=0, column=1)
         if stream_mode:
-            try:
-                pb.start(80)
-            except Exception:
-                pass
+            if stream_state.get("status_message"):
+                status_var.set(stream_state["status_message"])
+                try:
+                    pb.stop()
+                except Exception:
+                    pass
+            elif stream_state.get("pending_start"):
+                try:
+                    pb.start(80)
+                except Exception:
+                    pass
+            else:
+                try:
+                    pb.stop()
+                except Exception:
+                    pass
+            if not cache_csv_path:
+                try:
+                    export_btn.state(["disabled"])
+                except Exception:
+                    pass
         else:
             try:
                 pb.stop()
             except Exception:
                 pass
             status_var.set(_tr("filter_status_ready", "Crawling done."))
+            try:
+                analyse_btn.state(["disabled"])
+            except Exception:
+                pass
+            try:
+                export_btn.state(["disabled"])
+            except Exception:
+                pass
 
         # Matplotlib figure
         # Use constrained_layout to reduce internal padding and let the
@@ -1577,6 +1752,20 @@ def launch_filter_interface(
         center_pts: list[Any] = []  # matplotlib line2D handles
         # Map matplotlib artists back to item indices for click-to-select
         artist_to_index: dict[Any, int] = {}
+        known_path_index: dict[str, int] = {}
+
+        def _path_key(value: Any) -> str:
+            try:
+                if isinstance(value, str) and value:
+                    return os.path.normcase(os.path.abspath(value))
+            except Exception:
+                pass
+            try:
+                if isinstance(value, str) and value:
+                    return os.path.normcase(value)
+            except Exception:
+                pass
+            return str(value) if value is not None else ""
 
         all_ra_vals: list[float] = []
         all_dec_vals: list[float] = []
@@ -1597,8 +1786,11 @@ def launch_filter_interface(
                     sep_txt = ""
 
             cb = ttk.Checkbutton(inner, text=base + sep_txt, variable=var, command=lambda i=idx: update_visuals(i))
-            cb.grid(row=idx, column=0, sticky="w")
+            cb.pack(anchor="w", fill="x", pady=1)
             checkbuttons.append(cb)
+            path_key = _path_key(item.path)
+            if path_key:
+                known_path_index[path_key] = idx
 
             # Ensure placeholders exist for visuals
             patches.append(None)
@@ -1708,8 +1900,43 @@ def launch_filter_interface(
             if not batch:
                 return
             for entry in batch:
+                candidate_path = entry.get("path") or entry.get("path_raw") or entry.get("path_preprocessed_cache")
+                key = _path_key(candidate_path)
+                if key and key in known_path_index:
+                    existing_idx = known_path_index[key]
+                    entry.setdefault("index", existing_idx)
+                    try:
+                        raw_files_with_wcs[existing_idx].update(entry)
+                    except Exception:
+                        raw_files_with_wcs[existing_idx] = dict(entry)
+                    try:
+                        items[existing_idx].src.update(entry)
+                    except Exception:
+                        items[existing_idx].src = dict(entry)
+                    try:
+                        items[existing_idx].index = existing_idx
+                        items[existing_idx].refresh_geometry()
+                    except Exception:
+                        pass
+                    try:
+                        base_name = os.path.basename(items[existing_idx].path)
+                        sep_txt = ""
+                        if items[existing_idx].center is not None:
+                            sep_deg = items[existing_idx].center.separation(global_center).to(u.deg).value
+                            sep_txt = f"  ({sep_deg:.2f}°)"
+                        if 0 <= existing_idx < len(checkbuttons):
+                            checkbuttons[existing_idx].configure(text=base_name + sep_txt)
+                    except Exception:
+                        pass
+                    try:
+                        _refresh_item_visual(existing_idx)
+                    except Exception:
+                        pass
+                    continue
                 raw_files_with_wcs.append(entry)
-                new_item = Item(entry, len(raw_files_with_wcs) - 1)
+                new_index = len(raw_files_with_wcs) - 1
+                entry.setdefault("index", new_index)
+                new_item = Item(entry, new_index)
                 items.append(new_item)
                 _add_item_row(new_item)
             update_visuals()
@@ -1734,9 +1961,15 @@ def launch_filter_interface(
                     batch = stream_queue.get_nowait()
                     if batch is None:
                         stream_state["done"] = True
+                        stream_state["running"] = False
                         try:
                             pb.stop()
                             status_var.set(_tr("filter_status_ready", "Crawling done."))
+                        except Exception:
+                            pass
+                        stream_state["status_message"] = _tr("filter_status_ready", "Crawling done.")
+                        try:
+                            analyse_btn.state(["!disabled"])
                         except Exception:
                             pass
                         break
@@ -1769,9 +2002,15 @@ def launch_filter_interface(
                     continue
                 if batch is None:
                     stream_state["done"] = True
+                    stream_state["running"] = False
                     try:
                         pb.stop()
                         status_var.set(_tr("filter_status_ready", "Crawling done."))
+                    except Exception:
+                        pass
+                    stream_state["status_message"] = _tr("filter_status_ready", "Crawling done.")
+                    try:
+                        analyse_btn.state(["!disabled"])
                     except Exception:
                         pass
                     break
@@ -1836,6 +2075,84 @@ def launch_filter_interface(
                     new_point = None
             update_visuals(idx)
             _recompute_axes_limits()
+
+        def _trigger_stream_start(force: bool = False) -> None:
+            if not stream_mode:
+                return
+            spawn_callable = stream_state.get("spawn_worker")
+            if not callable(spawn_callable):
+                return
+            if stream_state.get("running"):
+                return
+            if not force and not stream_state.get("pending_start"):
+                return
+            stream_state["pending_start"] = False
+            stream_state["status_message"] = _tr("filter_status_crawling", "Crawling files… please wait")
+            try:
+                status_var.set(stream_state["status_message"])
+            except Exception:
+                pass
+            try:
+                pb.start(80)
+            except Exception:
+                pass
+            try:
+                analyse_btn.state(["disabled"])
+            except Exception:
+                pass
+            spawn_callable()
+            try:
+                root.after(40, _consume_ui_queue)
+            except Exception:
+                stream_state["done"] = True
+
+        def _on_analyse() -> None:
+            if not stream_mode:
+                return
+            _trigger_stream_start(force=True)
+
+        def _on_export() -> None:
+            path_csv = stream_state.get("csv_path") if isinstance(stream_state.get("csv_path"), str) else cache_csv_path
+            if not path_csv:
+                return
+            try:
+                os.makedirs(os.path.dirname(path_csv), exist_ok=True)
+            except Exception:
+                pass
+            payload: list[Dict[str, Any]] = []
+            for it in items:
+                data = dict(it.src)
+                if it.shape is not None:
+                    data.setdefault("shape", it.shape)
+                if it.center is not None:
+                    data.setdefault("center", it.center)
+                payload.append(data)
+            _export_csv(path_csv, payload)
+            stream_state["csv_loaded"] = True
+            stream_state["status_message"] = _tr(
+                "filter_status_ready_csv",
+                "Loaded from CSV. Click Analyse to refresh.",
+            )
+            try:
+                status_var.set(stream_state["status_message"])
+            except Exception:
+                pass
+            _log_message(f"[CSV] Exported {len(payload)} items -> {path_csv}", level="INFO")
+
+        analyse_btn.configure(command=_on_analyse)
+        export_btn.configure(command=_on_export)
+        if stream_mode:
+            try:
+                analyse_btn.state(["!disabled"])
+            except Exception:
+                pass
+            if stream_state.get("pending_start"):
+                _trigger_stream_start()
+            elif stream_state.get("status_message"):
+                try:
+                    analyse_btn.state(["!disabled"])
+                except Exception:
+                    pass
 
         def _process_async_events() -> None:
             try:
