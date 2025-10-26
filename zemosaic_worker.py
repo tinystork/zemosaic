@@ -256,6 +256,7 @@ def _clone_wcs_instance(wcs_obj):
 
 def _prepare_adaptive_master_tile_inputs(
     original_images: list,
+    aligned_images: list | None,
     raw_infos: list,
     reference_wcs,
     base_shape_hw: tuple[int, int],
@@ -302,7 +303,8 @@ def _prepare_adaptive_master_tile_inputs(
 
     xs: list[float] = []
     ys: list[float] = []
-    entries: list[tuple[int, np.ndarray, WCS]] = []
+    entries: list[tuple[int, np.ndarray, np.ndarray | None, WCS, bool]] = []
+    needs_reproject_flags: list[bool] = []
     for idx, (img, info) in enumerate(zip(original_images, raw_infos)):
         if img is None or not isinstance(info, dict):
             continue
@@ -334,7 +336,16 @@ def _prepare_adaptive_master_tile_inputs(
             if np.isfinite(px) and np.isfinite(py):
                 xs.append(float(px))
                 ys.append(float(py))
-        entries.append((idx, img, wcs_in))
+        needs_reproject = False
+        for px, py in xy:
+            if not (0.0 <= px <= base_w and 0.0 <= py <= base_h):
+                needs_reproject = True
+                break
+        aligned_img = None
+        if aligned_images is not None and 0 <= idx < len(aligned_images):
+            aligned_img = aligned_images[idx]
+        entries.append((idx, img, aligned_img, wcs_in, needs_reproject))
+        needs_reproject_flags.append(needs_reproject)
 
     if not entries or not xs or not ys:
         return None
@@ -396,6 +407,12 @@ def _prepare_adaptive_master_tile_inputs(
     if out_w == base_w and out_h == base_h and offset_x == 0 and offset_y == 0:
         return None
 
+    if not any(needs_reproject_flags):
+        # Aucun pixel ne s'étend hors du canevas initial – inutile de reprojeter
+        if log_func:
+            log_func("mastertile_adaptive_skip_no_expansion", lvl="DEBUG_DETAIL")
+        return None
+
     if log_func:
         log_func(
             "mastertile_adaptive_canvas",
@@ -426,42 +443,69 @@ def _prepare_adaptive_master_tile_inputs(
     shape_out = (out_h, out_w)
     reproj_images: list[np.ndarray] = []
     kept_positions: list[int] = []
+    insert_y = -offset_y
+    insert_x = -offset_x
 
-    for idx, img, wcs_in in entries:
+    for idx, img, aligned_img, wcs_in, needs_reproject in entries:
         try:
-            img_data = np.asarray(img, dtype=np.float32)
-            if img_data.ndim == 3 and img_data.shape[-1] >= 1:
-                reproj_channels = []
-                coverage_map = None
-                num_channels = img_data.shape[-1]
-                for chan in range(num_channels):
-                    reproj_chan, footprint = reproject_interp(
-                        (img_data[..., chan], wcs_in),
+            if not needs_reproject and aligned_img is not None:
+                aligned_data = np.asarray(aligned_img, dtype=np.float32)
+                if aligned_data.ndim == 2:
+                    canvas = np.full(shape_out, np.nan, dtype=np.float32)
+                    y0 = int(insert_y)
+                    x0 = int(insert_x)
+                    y1 = min(y0 + aligned_data.shape[0], canvas.shape[0])
+                    x1 = min(x0 + aligned_data.shape[1], canvas.shape[1])
+                    if y0 < 0 or x0 < 0 or y1 > canvas.shape[0] or x1 > canvas.shape[1]:
+                        # Hors limites inattendu – repli sur la reprojection complète
+                        raise RuntimeError("aligned_canvas_bounds")
+                    canvas[y0:y1, x0:x1] = aligned_data[: y1 - y0, : x1 - x0]
+                    reproj_img = canvas
+                else:
+                    channels = aligned_data.shape[-1]
+                    canvas = np.full((shape_out[0], shape_out[1], channels), np.nan, dtype=np.float32)
+                    y0 = int(insert_y)
+                    x0 = int(insert_x)
+                    y1 = min(y0 + aligned_data.shape[0], canvas.shape[0])
+                    x1 = min(x0 + aligned_data.shape[1], canvas.shape[1])
+                    if y0 < 0 or x0 < 0 or y1 > canvas.shape[0] or x1 > canvas.shape[1]:
+                        raise RuntimeError("aligned_canvas_bounds")
+                    canvas[y0:y1, x0:x1, :] = aligned_data[: y1 - y0, : x1 - x0, :]
+                    reproj_img = canvas
+            else:
+                img_data = np.asarray(img, dtype=np.float32)
+                if img_data.ndim == 3 and img_data.shape[-1] >= 1:
+                    reproj_channels = []
+                    coverage_map = None
+                    num_channels = img_data.shape[-1]
+                    for chan in range(num_channels):
+                        reproj_chan, footprint = reproject_interp(
+                            (img_data[..., chan], wcs_in),
+                            wcs_out,
+                            shape_out=shape_out,
+                            return_footprint=True,
+                        )
+                        reproj_chan = np.asarray(reproj_chan, dtype=np.float32)
+                        footprint = np.asarray(footprint, dtype=np.float32)
+                        coverage_map = footprint if coverage_map is None else np.maximum(coverage_map, footprint)
+                        reproj_channels.append(reproj_chan)
+                    reproj_img = np.stack(reproj_channels, axis=-1).astype(np.float32, copy=False)
+                    if coverage_map is not None:
+                        invalid_mask = coverage_map <= 0
+                        if np.any(invalid_mask):
+                            reproj_img[invalid_mask] = np.nan
+                else:
+                    reproj_img, footprint = reproject_interp(
+                        (img_data, wcs_in),
                         wcs_out,
                         shape_out=shape_out,
                         return_footprint=True,
                     )
-                    reproj_chan = np.asarray(reproj_chan, dtype=np.float32)
+                    reproj_img = np.asarray(reproj_img, dtype=np.float32)
                     footprint = np.asarray(footprint, dtype=np.float32)
-                    coverage_map = footprint if coverage_map is None else np.maximum(coverage_map, footprint)
-                    reproj_channels.append(reproj_chan)
-                reproj_img = np.stack(reproj_channels, axis=-1).astype(np.float32, copy=False)
-                if coverage_map is not None:
-                    invalid_mask = coverage_map <= 0
+                    invalid_mask = footprint <= 0
                     if np.any(invalid_mask):
                         reproj_img[invalid_mask] = np.nan
-            else:
-                reproj_img, footprint = reproject_interp(
-                    (img_data, wcs_in),
-                    wcs_out,
-                    shape_out=shape_out,
-                    return_footprint=True,
-                )
-                reproj_img = np.asarray(reproj_img, dtype=np.float32)
-                footprint = np.asarray(footprint, dtype=np.float32)
-                invalid_mask = footprint <= 0
-                if np.any(invalid_mask):
-                    reproj_img[invalid_mask] = np.nan
 
             reproj_img = np.ascontiguousarray(reproj_img, dtype=np.float32)
             reproj_img[~np.isfinite(reproj_img)] = np.nan
@@ -2919,6 +2963,7 @@ def create_master_tile(
     if base_shape_hw and valid_indices and tile_images_data_HWC_adu:
         adaptive_inputs = _prepare_adaptive_master_tile_inputs(
             [tile_images_data_HWC_adu[idx] for idx in valid_indices],
+            [aligned_images_for_stack[idx] for idx in valid_indices],
             [seestar_stack_group_info[idx] for idx in valid_indices],
             wcs_for_master_tile,
             base_shape_hw,

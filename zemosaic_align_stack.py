@@ -1399,6 +1399,8 @@ def _normalize_images_sky_mean(image_list: list[np.ndarray | None],
                         0.587 * ref_image_adu_float[..., 1] + \
                         0.114 * ref_image_adu_float[..., 2]
         target_data_for_ref_sky = luminance_ref
+    elif ref_image_adu_float.ndim == 3 and ref_image_adu_float.shape[-1] == 1: # Mono avec canal explicite
+        target_data_for_ref_sky = ref_image_adu_float[..., 0]
     elif ref_image_adu_float.ndim == 2: # Monochrome HW
         target_data_for_ref_sky = ref_image_adu_float
     
@@ -1442,10 +1444,9 @@ def _normalize_images_sky_mean(image_list: list[np.ndarray | None],
         else:
             img_to_normalize_float = current_image_adu.copy() # Toujours copier pour modifier
 
+        subtract_reference_level = False
         if i == reference_index:
-            normalized_image_list[i] = img_to_normalize_float # C'est déjà la référence (ou sa copie float32)
-            _pcb(f"NormSkyMean: Image {i} est la référence, copiée.", lvl="DEBUG_VERY_DETAIL")
-            continue
+            subtract_reference_level = True
 
         target_data_for_current_sky = None
         is_current_color = img_to_normalize_float.ndim == 3 and img_to_normalize_float.shape[-1] == 3
@@ -1454,6 +1455,8 @@ def _normalize_images_sky_mean(image_list: list[np.ndarray | None],
                                 0.587 * img_to_normalize_float[..., 1] + \
                                 0.114 * img_to_normalize_float[..., 2]
             target_data_for_current_sky = luminance_current
+        elif img_to_normalize_float.ndim == 3 and img_to_normalize_float.shape[-1] == 1:
+            target_data_for_current_sky = img_to_normalize_float[..., 0]
         elif img_to_normalize_float.ndim == 2:
             target_data_for_current_sky = img_to_normalize_float
         
@@ -1478,12 +1481,18 @@ def _normalize_images_sky_mean(image_list: list[np.ndarray | None],
         
         if current_sky_level is not None and np.isfinite(current_sky_level):
             offset = ref_sky_level - current_sky_level
-            img_to_normalize_float += offset # Appliquer l'offset à tous les canaux si couleur, ou à l'image si mono
+            if not subtract_reference_level:
+                img_to_normalize_float += offset # Aligne le fond de ciel sur la référence
             normalized_image_list[i] = img_to_normalize_float
             _pcb(f"NormSkyMean: Image {i}, fond_ciel={current_sky_level:.3g}, offset_appliqué={offset:.3g}", lvl="DEBUG_VERY_DETAIL")
         else:
             _pcb(f"NormSkyMean: Fond de ciel invalide pour image {i} ({current_sky_level}). Image non normalisée.", lvl="WARN")
             normalized_image_list[i] = img_to_normalize_float # Retourner la copie non modifiée
+
+        if normalized_image_list[i] is not None:
+            normalized_image_list[i] -= ref_sky_level
+            if subtract_reference_level:
+                _pcb(f"NormSkyMean: Image {i} (référence) - soustraction fond {ref_sky_level:.3g}", lvl="DEBUG_VERY_DETAIL")
 
     _pcb("NormSkyMean: Normalisation par fond de ciel terminée.", lvl="DEBUG")
     return normalized_image_list
