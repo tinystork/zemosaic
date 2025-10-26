@@ -1891,11 +1891,28 @@ class ZeMosaicGUI:
             master_tile_crop_percent_val = self.master_tile_crop_percent_var.get()
             # --- FIN RÉCUPÉRATION ROGNAGE ---
             
-        except tk.TclError as e: 
-            messagebox.showerror(self._tr("param_error_title"), 
-                                 self._tr("invalid_param_value_error", error=e), 
+        except tk.TclError as e:
+            messagebox.showerror(self._tr("param_error_title"),
+                                 self._tr("invalid_param_value_error", error=e),
                                  parent=self.root)
             return
+
+        # 3. Synchroniser les paramètres de stacking depuis l'UI vers la config en mémoire
+        try:
+            self.config["stacking_normalize_method"] = stack_norm_method
+            self.config["stacking_weighting_method"] = stack_weight_method
+            self.config["stacking_rejection_algorithm"] = stack_reject_algo
+            self.config["stacking_kappa_low"] = float(stack_kappa_low)
+            self.config["stacking_kappa_high"] = float(stack_kappa_high)
+            self.config["stacking_final_combine_method"] = stack_final_combine
+        except Exception:
+            pass
+
+        try:
+            # Certains widgets stockent encore les limites Winsor comme chaîne
+            self.config["stacking_winsor_limits"] = str(stack_winsor_limits_str)
+        except Exception:
+            pass
 
         # 2. VALIDATIONS (chemins, etc.)
         # ... (section de validation inchangée pour l'instant)
@@ -2011,7 +2028,17 @@ class ZeMosaicGUI:
                 gpu_id = idx
                 break
         if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
-            zemosaic_config.save_config(self.config)
+            try:
+                zemosaic_config.save_config(self.config)
+            except Exception:
+                pass
+
+        print(
+            f"[GUI] Stacking -> norm={self.config['stacking_normalize_method']}, "
+            f"weight={self.config['stacking_weighting_method']}, "
+            f"reject={self.config['stacking_rejection_algorithm']}, "
+            f"combine={self.config['stacking_final_combine_method']}"
+        )
 
         stack_ram_budget_val = 0.0
         try:

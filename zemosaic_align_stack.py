@@ -5,7 +5,7 @@ import os
 import importlib.util
 import tempfile
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Callable
 
 GPU_AVAILABLE = importlib.util.find_spec("cupy") is not None
 import traceback
@@ -442,7 +442,7 @@ def gpu_stack_linear(frames, *, sigma=3.0):
         _free_gpu_pools()
 
 
-def stack_winsorized_sigma_clip(frames, weights=None, zconfig=None, **kwargs):
+def stack_winsorized_sigma_clip(frames, weights=None, weight_method: str = "none", zconfig=None, **kwargs):
     """
     Wrapper calling GPU or CPU winsorized sigma clip, with robust GPU guards.
 
@@ -472,6 +472,63 @@ def stack_winsorized_sigma_clip(frames, weights=None, zconfig=None, **kwargs):
         else:
             use_gpu = False
 
+    progress_callback = kwargs.get("progress_callback")
+    requested_weight_method = str(weight_method or "none").lower().strip()
+    weight_method_in_use = requested_weight_method or "none"
+    manual_weights = weights is not None
+    weight_label_for_log = "custom" if manual_weights and weight_method_in_use == "none" else weight_method_in_use
+    weights_array_full: _np.ndarray | None = None
+    weight_stats: dict[str, float] | None = None
+
+    if manual_weights:
+        weights_array_full = _np.asarray(weights, dtype=_np.float32)
+        if weights_array_full.shape[0] != len(frames_list):
+            raise ValueError(
+                f"weights shape {weights_array_full.shape} incompatible with frame count {len(frames_list)}"
+            )
+    elif weight_method_in_use not in ("", "none"):
+        frames_np_for_weights = [_np.asarray(f, dtype=_np.float32) for f in frames_list]
+        derived_list, effective_method, quality_stats = _compute_quality_weights(
+            frames_np_for_weights,
+            weight_method_in_use,
+            progress_callback=progress_callback,
+        )
+        weight_method_in_use = effective_method
+        if derived_list:
+            sanitized_arrays = []
+            for idx, arr in enumerate(derived_list):
+                if arr is not None:
+                    sanitized_arrays.append(_np.asarray(arr, dtype=_np.float32))
+                else:
+                    sanitized_arrays.append(_np.ones_like(frames_np_for_weights[idx], dtype=_np.float32))
+            weights_array_full = _np.stack(sanitized_arrays, axis=0)
+            weight_stats = quality_stats
+        del frames_np_for_weights
+
+    if weights_array_full is not None:
+        weights_array_full = _np.asarray(weights_array_full, dtype=_np.float32, copy=False)
+        if weights_array_full.ndim == 1:
+            extra_dims = (1,) * sample.ndim
+            weights_array_full = weights_array_full.reshape((weights_array_full.shape[0],) + extra_dims)
+        try:
+            weights_array_full = _np.broadcast_to(
+                weights_array_full,
+                (len(frames_list),) + sample.shape,
+            ).astype(_np.float32, copy=False)
+        except ValueError as exc:
+            raise ValueError(
+                f"weights shape {weights_array_full.shape} not broadcastable to {(len(frames_list),) + sample.shape}"
+            ) from exc
+        if weight_stats is None:
+            try:
+                weight_stats = {
+                    "min": float(_np.nanmin(weights_array_full)),
+                    "max": float(_np.nanmax(weights_array_full)),
+                    "frames": float(len(frames_list)),
+                }
+            except Exception:
+                weight_stats = None
+
     max_frames_per_pass = kwargs.pop("winsor_max_frames_per_pass", None)
     if max_frames_per_pass is None and zconfig is not None:
         max_frames_per_pass = getattr(zconfig, "winsor_max_frames_per_pass", 0)
@@ -483,16 +540,7 @@ def stack_winsorized_sigma_clip(frames, weights=None, zconfig=None, **kwargs):
         max_frames_per_pass = 0
 
     def _stack_winsor_streaming(limit: int) -> tuple[_np.ndarray, float]:
-        nonlocal frames_list
-
-        if weights is not None:
-            weights_array_full = _np.asarray(weights, dtype=_np.float32)
-            if weights_array_full.shape[0] != len(frames_list):
-                raise ValueError(
-                    f"weights shape {weights_array_full.shape} incompatible with frame count {len(frames_list)}"
-                )
-        else:
-            weights_array_full = None
+        nonlocal frames_list, weights_array_full
 
         winsor_limits = kwargs.get("winsor_limits", (0.05, 0.05))
         kappa = kwargs.get("kappa", 3.0)
@@ -550,8 +598,12 @@ def stack_winsorized_sigma_clip(frames, weights=None, zconfig=None, **kwargs):
     # --- GPU path (poids ignorés) ---
     if use_gpu and GPU_AVAILABLE and callable(globals().get("gpu_stack_winsorized", None)):
         try:
-            if weights is not None:
-                _internal_logger.warning("GPU winsorized clip: 'weights' not supported; ignoring provided weights.")
+            if weights_array_full is not None or weight_method_in_use not in ("", "none") or manual_weights:
+                _log_stack_message(
+                    f"[Stack][GPU Winsorized] weight_method='{weight_label_for_log}' requested but not supported on this path -> ignoring weights.",
+                    "INFO",
+                    progress_callback,
+                )
             gpu_out = gpu_stack_winsorized(frames_list, **kwargs)
 
             # --- validations de sortie GPU ---
@@ -588,13 +640,34 @@ def stack_winsorized_sigma_clip(frames, weights=None, zconfig=None, **kwargs):
     if not callable(globals().get("cpu_stack_winsorized", None)):
         raise RuntimeError("CPU stack_winsorized function unavailable")
 
-    if weights is not None:
-        kwargs["weights"] = weights  # mot-clé seulement
+    cpu_kwargs = dict(kwargs)
+    if weights_array_full is not None:
+        cpu_kwargs["weights"] = weights_array_full
 
-    return cpu_stack_winsorized(frames_list, **kwargs)
+    try:
+        result = cpu_stack_winsorized(frames_list, **cpu_kwargs)
+    except TypeError:
+        if weights_array_full is not None:
+            _log_stack_message(
+                "[Stack][Winsorized CPU] External implementation rejected weights; falling back to internal handler.",
+                "WARN",
+                progress_callback,
+            )
+            result = _cpu_stack_winsorized_fallback(frames_list, **cpu_kwargs)
+        else:
+            raise
+
+    if weights_array_full is not None and weight_stats:
+        _log_stack_message(
+            f"[Stack][Winsorized CPU] weight_method='{weight_label_for_log}'; weights: min={weight_stats['min']:.3g} max={weight_stats['max']:.3g}",
+            "INFO",
+            progress_callback,
+        )
+
+    return result
 
 
-def stack_kappa_sigma_clip(frames, zconfig=None, **kwargs):
+def stack_kappa_sigma_clip(frames, weight_method: str = "none", zconfig=None, **kwargs):
     """Wrapper calling GPU or CPU kappa-sigma clip.
 
     Honors a generic ``use_gpu`` flag on ``zconfig`` if present, otherwise
@@ -602,17 +675,71 @@ def stack_kappa_sigma_clip(frames, zconfig=None, **kwargs):
     """
     use_gpu = (getattr(zconfig, 'use_gpu', getattr(zconfig, 'use_gpu_phase5', False))
                if zconfig else False)
+    progress_callback = kwargs.get("progress_callback")
+    frames_list = list(frames)
+    requested_weight_method = str(weight_method or "none").lower().strip()
+    weight_method_in_use = requested_weight_method or "none"
+    weights_array: np.ndarray | None = None
+    weight_stats: dict[str, float] | None = None
+
+    if requested_weight_method not in ("", "none"):
+        frames_np_for_weights = [np.asarray(f, dtype=np.float32) for f in frames_list]
+        derived_list, effective_method, quality_stats = _compute_quality_weights(
+            frames_np_for_weights,
+            requested_weight_method,
+            progress_callback=progress_callback,
+        )
+        weight_method_in_use = effective_method
+        if derived_list:
+            sanitized_arrays = []
+            for idx, arr in enumerate(derived_list):
+                if arr is not None:
+                    sanitized_arrays.append(np.asarray(arr, dtype=np.float32))
+                else:
+                    sanitized_arrays.append(np.ones_like(frames_np_for_weights[idx], dtype=np.float32))
+            weights_array = np.stack(sanitized_arrays, axis=0)
+            weight_stats = quality_stats
+        del frames_np_for_weights
+
     if use_gpu and GPU_AVAILABLE:
         try:
-            return gpu_stack_kappa(frames, **kwargs)
+            if weights_array is not None:
+                _log_stack_message(
+                    f"[Stack][GPU Kappa] weight_method='{weight_method_in_use}' requested but not supported on GPU path; ignoring weights.",
+                    "INFO",
+                    progress_callback,
+                )
+            return gpu_stack_kappa(frames_list, **kwargs)
         except Exception:
             _internal_logger.warning("GPU kappa clip failed, fallback CPU", exc_info=True)
     if cpu_stack_kappa:
-        return cpu_stack_kappa(frames, **kwargs)
-    return _cpu_stack_kappa_fallback(frames, **kwargs)
+        cpu_kwargs = dict(kwargs)
+        if weights_array is not None:
+            cpu_kwargs["weights"] = weights_array
+        try:
+            result = cpu_stack_kappa(frames_list, **cpu_kwargs)
+        except TypeError:
+            if weights_array is not None:
+                _log_stack_message(
+                    "[Stack][CPU Kappa] External implementation rejected weights; using fallback.",
+                    "WARN",
+                    progress_callback,
+                )
+                result = _cpu_stack_kappa_fallback(frames_list, **cpu_kwargs)
+            else:
+                raise
+        else:
+            if weights_array is not None and weight_stats:
+                _log_stack_message(
+                    f"[Stack] Using CPU kappa-sigma; weight_method='{weight_method_in_use}'; weights: min={weight_stats['min']:.3g} max={weight_stats['max']:.3g}",
+                    "INFO",
+                    progress_callback,
+                )
+            return result
+    return _cpu_stack_kappa_fallback(frames_list, **kwargs)
 
 
-def stack_linear_fit_clip(frames, zconfig=None, **kwargs):
+def stack_linear_fit_clip(frames, weight_method: str = "none", zconfig=None, **kwargs):
     """Wrapper calling GPU or CPU linear fit clip.
 
     Honors a generic ``use_gpu`` flag on ``zconfig`` if present, otherwise
@@ -620,24 +747,68 @@ def stack_linear_fit_clip(frames, zconfig=None, **kwargs):
     """
     use_gpu = (getattr(zconfig, 'use_gpu', getattr(zconfig, 'use_gpu_phase5', False))
                if zconfig else False)
+    progress_callback = kwargs.get("progress_callback")
+    frames_list = list(frames)
+    requested_weight_method = str(weight_method or "none").lower().strip()
+    weight_method_in_use = requested_weight_method or "none"
+    weights_array: np.ndarray | None = None
+    weight_stats: dict[str, float] | None = None
+
+    if requested_weight_method not in ("", "none"):
+        frames_np_for_weights = [np.asarray(f, dtype=np.float32) for f in frames_list]
+        derived_list, effective_method, quality_stats = _compute_quality_weights(
+            frames_np_for_weights,
+            requested_weight_method,
+            progress_callback=progress_callback,
+        )
+        weight_method_in_use = effective_method
+        if derived_list:
+            sanitized_arrays = []
+            for idx, arr in enumerate(derived_list):
+                if arr is not None:
+                    sanitized_arrays.append(np.asarray(arr, dtype=np.float32))
+                else:
+                    sanitized_arrays.append(np.ones_like(frames_np_for_weights[idx], dtype=np.float32))
+            weights_array = np.stack(sanitized_arrays, axis=0)
+            weight_stats = quality_stats
+        del frames_np_for_weights
+
     if use_gpu and GPU_AVAILABLE:
         try:
-            return gpu_stack_linear(frames, **kwargs)
+            if weights_array is not None:
+                _log_stack_message(
+                    f"[Stack][GPU Linear] weight_method='{weight_method_in_use}' requested but not supported on GPU path; ignoring weights.",
+                    "INFO",
+                    progress_callback,
+                )
+            return gpu_stack_linear(frames_list, **kwargs)
         except Exception:
             _internal_logger.warning("GPU linear clip failed, fallback CPU", exc_info=True)
     if cpu_stack_linear:
-        return cpu_stack_linear(frames, **kwargs)
-    return _cpu_stack_linear_fallback(frames, **kwargs)
-
-
-# Fallback logger for cases where progress_callback might not be available
-# or for internal print-like debugging within this module if necessary.
-_internal_logger = logging.getLogger("ZeMosaicAlignStackInternal")
-if not _internal_logger.hasHandlers():
-    _internal_logger.setLevel(logging.DEBUG)
-    # Add a null handler to prevent "No handler found" warnings if not configured elsewhere
-    # _internal_logger.addHandler(logging.NullHandler()) # Or configure a basic one if needed for standalone tests.
-
+        cpu_kwargs = dict(kwargs)
+        if weights_array is not None:
+            cpu_kwargs["weights"] = weights_array
+        try:
+            result = cpu_stack_linear(frames_list, **cpu_kwargs)
+        except TypeError:
+            if weights_array is not None:
+                _log_stack_message(
+                    "[Stack][CPU Linear] External implementation rejected weights; using fallback.",
+                    "WARN",
+                    progress_callback,
+                )
+                result = _cpu_stack_linear_fallback(frames_list, **cpu_kwargs)
+            else:
+                raise
+        else:
+            if weights_array is not None and weight_stats:
+                _log_stack_message(
+                    f"[Stack] Using CPU linear-fit clip; weight_method='{weight_method_in_use}'; weights: min={weight_stats['min']:.3g} max={weight_stats['max']:.3g}",
+                    "INFO",
+                    progress_callback,
+                )
+            return result
+    return _cpu_stack_linear_fallback(frames_list, **kwargs)
 
 
 def _calculate_robust_stats_for_linear_fit(image_data_2d_float32: np.ndarray,
@@ -1578,6 +1749,116 @@ def _calculate_image_weights_noise_fwhm(image_list: list[np.ndarray | None],
     _pcb(f"WeightFWHM: Calcul des poids FWHM terminé. {num_actual_weights_fwhm}/{len(image_list)} tableaux de poids retournés.", lvl="DEBUG")
     return output_weights_list_fwhm
 
+
+def _compute_quality_weights(
+    image_list: list[np.ndarray | None],
+    requested_method: str,
+    progress_callback: Callable | None = None,
+) -> tuple[list[np.ndarray | None] | None, str, dict[str, float] | None]:
+    """Compute per-frame quality weights according to the requested method."""
+
+    if not image_list:
+        return None, "none", None
+
+    method_norm = str(requested_method or "none").lower().strip()
+    if not method_norm or method_norm == "none":
+        return None, "none", None
+
+    effective_method = method_norm
+
+    if method_norm == "noise_variance":
+        weights_source = _calculate_image_weights_noise_variance(
+            image_list, progress_callback=progress_callback
+        )
+    elif method_norm == "noise_fwhm":
+        if not PHOTOUTILS_AVAILABLE:
+            _log_stack_message(
+                "[Stack] Weighting 'noise_fwhm' requested but Photutils unavailable -> fallback to 'noise_variance'.",
+                "WARN",
+                progress_callback,
+            )
+            effective_method = "noise_variance"
+            weights_source = _calculate_image_weights_noise_variance(
+                image_list, progress_callback=progress_callback
+            )
+        else:
+            weights_source = _calculate_image_weights_noise_fwhm(
+                image_list, progress_callback=progress_callback
+            )
+            has_data = bool(weights_source and any(w is not None for w in weights_source))
+            if not has_data:
+                _log_stack_message(
+                    "[Stack] FWHM weighting produced no usable weights; falling back to 'noise_variance'.",
+                    "WARN",
+                    progress_callback,
+                )
+                effective_method = "noise_variance"
+                weights_source = _calculate_image_weights_noise_variance(
+                    image_list, progress_callback=progress_callback
+                )
+    else:
+        _log_stack_message(
+            f"[Stack] Unknown weighting method '{method_norm}' requested; ignoring weights.",
+            "WARN",
+            progress_callback,
+        )
+        return None, "none", None
+
+    if not weights_source:
+        return None, "none", None
+
+    sanitized: list[np.ndarray | None] = [None] * len(image_list)
+    min_val: float | None = None
+    max_val: float | None = None
+    effective_frames = 0
+
+    for idx, frame in enumerate(image_list):
+        if frame is None:
+            continue
+        frame_arr = np.asarray(frame, dtype=np.float32)
+        base_weight = weights_source[idx] if idx < len(weights_source) else None
+        if base_weight is None:
+            continue
+        weight_arr = np.asarray(base_weight, dtype=np.float32, copy=False)
+        try:
+            weight_arr = np.broadcast_to(weight_arr, frame_arr.shape).astype(np.float32, copy=False)
+        except ValueError:
+            _log_stack_message(
+                f"[Stack] Weight array for frame {idx} incompatible with shape {frame_arr.shape}; ignoring frame weight.",
+                "WARN",
+                progress_callback,
+            )
+            continue
+        if not np.any(np.isfinite(weight_arr)):
+            continue
+        arr_min = float(np.nanmin(weight_arr))
+        arr_max = float(np.nanmax(weight_arr))
+        has_effect = (
+            abs(arr_max - arr_min) >= 1e-6
+            or abs(arr_min - 1.0) >= 1e-6
+            or abs(arr_max - 1.0) >= 1e-6
+        )
+        if not has_effect:
+            continue
+        sanitized[idx] = weight_arr
+        effective_frames += 1
+        if np.isfinite(arr_min):
+            min_val = arr_min if min_val is None else min(min_val, arr_min)
+        if np.isfinite(arr_max):
+            max_val = arr_max if max_val is None else max(max_val, arr_max)
+
+    if effective_frames == 0 or min_val is None or max_val is None:
+        if effective_method != "none":
+            _log_stack_message(
+                f"[Stack] Weighting method '{effective_method}' produced uniform weights; continuing without weighting.",
+                "WARN",
+                progress_callback,
+            )
+        return None, "none", None
+
+    stats = {"min": float(min_val), "max": float(max_val), "frames": effective_frames}
+    return sanitized, effective_method, stats
+
 def _reject_outliers_kappa_sigma(stacked_array_NHDWC, sigma_low, sigma_high, progress_callback=None):
     _pcb = lambda msg_key, lvl="INFO_DETAIL", **kwargs: \
         progress_callback(msg_key, None, lvl, **kwargs) if progress_callback else _internal_logger.debug(f"PCB_FALLBACK_{lvl}: {msg_key} {kwargs}")
@@ -1990,10 +2271,12 @@ def stack_aligned_images(
         return None
 
     num_images = len(valid_images_to_stack)
+    requested_weight_method = str(weighting_method or "none")
+    weighting_method = requested_weight_method.lower().strip() or "none"
     _pcb("stackimages_info_start_stacking", lvl="INFO",
               num_images=num_images, norm=normalize_method,
               weight=weighting_method, reject=rejection_algorithm,
-              combine=final_combine_method, 
+              combine=final_combine_method,
               radial_weight_active=apply_radial_weight,
               radial_feather=radial_feather_fraction if apply_radial_weight else "N/A")
 
@@ -2065,42 +2348,28 @@ def stack_aligned_images(
 
 
     # --- PONDÉRATION DE QUALITÉ (Bruit/FWHM) ---
-    quality_weights_list = None 
-    _pcb(f"STACK_IMG_WEIGHT_QUAL: Début calcul poids qualité. Méthode: {weighting_method}", lvl="ERROR")
-    if weighting_method == 'noise_variance':
-        quality_weights_list = _calculate_image_weights_noise_variance(current_images_data_list, progress_callback=progress_callback)
-    elif weighting_method == 'noise_fwhm':
-        # ... (logique pour noise_fwhm, potentiellement combiner les deux) ...
-        # Pour simplifier le debug actuel, si on veut "noise+fwhm", on pourrait avoir une clé dédiée
-        # ou s'assurer que cette section calcule bien les deux et les combine.
-        # Pour l'instant, elle calcule FWHM, puis Variance si FWHM a échoué ET si "variance" ou "noise" est dans la clé.
-        # Testons d'abord avec 'none' pour la pondération qualité.
-        if "fwhm" in weighting_method.lower():
-             quality_weights_list = _calculate_image_weights_noise_fwhm(current_images_data_list, progress_callback=progress_callback)
-        if ("variance" in weighting_method.lower() or "noise" in weighting_method.lower()) and \
-           (quality_weights_list is None or not any(w is not None for w in quality_weights_list)): # Si fwhm a échoué ou n'a pas été demandé
-            _pcb(f"STACK_IMG_WEIGHT_QUAL: Tentative calcul poids variance (soit demandé, soit FWHM a échoué).", lvl="ERROR")
-            weights_var_temp = _calculate_image_weights_noise_variance(current_images_data_list, progress_callback=progress_callback)
-            if quality_weights_list and weights_var_temp and any(w is not None for w in quality_weights_list) and any(w is not None for w in weights_var_temp):
-                 _pcb(f"STACK_IMG_WEIGHT_QUAL: Combinaison poids FWHM et Variance.", lvl="ERROR")
-                 # Assurer que les listes ont la même taille
-                 len_q = len(quality_weights_list)
-                 len_v = len(weights_var_temp)
-                 # ... (logique de combinaison plus robuste si les longueurs diffèrent, ou erreur) ...
-                 if len_q == len_v:
-                     quality_weights_list = [ (w_f*w_v if w_f is not None and w_v is not None else (w_f if w_f is not None else w_v)) 
-                                             for w_f, w_v in zip(quality_weights_list, weights_var_temp) ]
-                 else: _pcb(f"STACK_IMG_WEIGHT_QUAL: ERREUR - Mismatch longueurs poids FWHM ({len_q}) et Variance ({len_v}).", lvl="ERROR")
-
-            elif weights_var_temp:
-                quality_weights_list = weights_var_temp
-    # ... (autres méthodes de pondération qualité) ...
-    _pcb(f"STACK_IMG_WEIGHT_QUAL: Fin calcul poids qualité. quality_weights_list is {'None' if quality_weights_list is None else 'Exists'}.", lvl="ERROR")
-    if quality_weights_list and any(w is not None for w in quality_weights_list):
-        # Trouver le premier poids non-None pour le log
-        first_valid_q_weight = next((w for w in quality_weights_list if w is not None), None)
-        if first_valid_q_weight is not None:
-             _pcb(f"STACK_IMG_WEIGHT_QUAL: Premier quality_weight non-None - shape: {first_valid_q_weight.shape}, type: {first_valid_q_weight.dtype}, range: [{np.min(first_valid_q_weight):.3g}-{np.max(first_valid_q_weight):.3g}]", lvl="ERROR")
+    _pcb(f"STACK_IMG_WEIGHT_QUAL: Début calcul poids qualité. Méthode demandée: {weighting_method}", lvl="ERROR")
+    quality_weights_list, effective_weight_method, quality_weight_stats = _compute_quality_weights(
+        current_images_data_list,
+        weighting_method,
+        progress_callback=progress_callback,
+    )
+    if effective_weight_method != weighting_method:
+        _pcb(
+            f"STACK_IMG_WEIGHT_QUAL: Fallback méthode '{weighting_method}' -> '{effective_weight_method}'.",
+            lvl="WARN",
+        )
+    weighting_method = effective_weight_method
+    if quality_weights_list and quality_weight_stats:
+        _pcb(
+            f"[Stack] Weights computed (method={weighting_method}): min={quality_weight_stats['min']:.3g} max={quality_weight_stats['max']:.3g}",
+            lvl="INFO",
+        )
+    _pcb(
+        "STACK_IMG_WEIGHT_QUAL: Fin calcul poids qualité.",
+        lvl="ERROR",
+    )
+    quality_weights_list = quality_weights_list or []
 
 
     # --- PONDÉRATION RADIALE ---
@@ -2322,6 +2591,7 @@ def _cpu_stack_kappa_fallback(
     *,
     sigma_low: float = 3.0,
     sigma_high: float = 3.0,
+    weights=None,
     progress_callback=None,
 ):
     """CPU kappa-sigma clip fallback.
@@ -2343,7 +2613,28 @@ def _cpu_stack_kappa_fallback(
     high = med + float(sigma_high) * std
     mask = (arr >= low) & (arr <= high)
     arr_clip = np.where(mask, arr, np.nan)
-    stacked = np.nanmean(arr_clip, axis=0).astype(np.float32)
+    if weights is None:
+        stacked = np.nanmean(arr_clip, axis=0).astype(np.float32)
+    else:
+        w = np.asarray(weights, dtype=np.float32)
+        if w.ndim == 1 and w.shape[0] == arr.shape[0]:
+            extra_dims = (1,) * (arr.ndim - 1)
+            w = w.reshape((arr.shape[0],) + extra_dims)
+        try:
+            bw = np.broadcast_to(w, arr_clip.shape).astype(np.float32, copy=False)
+        except ValueError as exc:
+            raise ValueError(
+                f"weights shape {w.shape} not compatible with frames shape {arr.shape}"
+            ) from exc
+        bw = np.where(mask, bw, 0.0)
+        num = np.nansum(arr_clip * bw, axis=0)
+        den = np.sum(bw, axis=0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            stacked = np.where(den > 0, num / den, np.nan)
+        if np.any(~np.isfinite(stacked)):
+            stacked_fallback = np.nanmean(arr, axis=0)
+            stacked = np.where(np.isfinite(stacked), stacked, stacked_fallback)
+        stacked = stacked.astype(np.float32, copy=False)
     rejected_pct = 100.0 * float(mask.size - np.count_nonzero(mask)) / float(mask.size) if mask.size else 0.0
     _pcb("cpu_kappa_fallback_done", lvl="DEBUG_DETAIL")
     return stacked, rejected_pct
@@ -2353,6 +2644,7 @@ def _cpu_stack_linear_fallback(
     frames,
     *,
     sigma: float = 3.0,
+    weights=None,
     progress_callback=None,
 ):
     """CPU linear residual clipping fallback.
@@ -2375,7 +2667,28 @@ def _cpu_stack_linear_fallback(
     std_r = np.nanstd(resid, axis=0)
     mask = np.abs(resid - med_r) <= float(sigma) * std_r
     arr_clip = np.where(mask, arr, np.nan)
-    stacked = np.nanmean(arr_clip, axis=0).astype(np.float32)
+    if weights is None:
+        stacked = np.nanmean(arr_clip, axis=0).astype(np.float32)
+    else:
+        w = np.asarray(weights, dtype=np.float32)
+        if w.ndim == 1 and w.shape[0] == arr.shape[0]:
+            extra_dims = (1,) * (arr.ndim - 1)
+            w = w.reshape((arr.shape[0],) + extra_dims)
+        try:
+            bw = np.broadcast_to(w, arr_clip.shape).astype(np.float32, copy=False)
+        except ValueError as exc:
+            raise ValueError(
+                f"weights shape {w.shape} not compatible with frames shape {arr.shape}"
+            ) from exc
+        bw = np.where(mask, bw, 0.0)
+        num = np.nansum(arr_clip * bw, axis=0)
+        den = np.sum(bw, axis=0)
+        with np.errstate(invalid="ignore", divide="ignore"):
+            stacked = np.where(den > 0, num / den, np.nan)
+        if np.any(~np.isfinite(stacked)):
+            stacked_fallback = np.nanmean(arr, axis=0)
+            stacked = np.where(np.isfinite(stacked), stacked, stacked_fallback)
+        stacked = stacked.astype(np.float32, copy=False)
     rejected_pct = 100.0 * float(mask.size - np.count_nonzero(mask)) / float(mask.size) if mask.size else 0.0
     _pcb("cpu_linear_fallback_done", lvl="DEBUG_DETAIL")
     return stacked, rejected_pct
