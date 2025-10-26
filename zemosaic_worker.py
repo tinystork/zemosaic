@@ -2596,6 +2596,7 @@ def create_master_tile(
     if stack_reject_algo == "winsorized_sigma_clip":
         master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_winsorized_sigma_clip(
             valid_aligned_images,
+            weight_method=stack_weight_method,
             zconfig=zconfig,
             kappa=stack_kappa_low,
             winsor_limits=parsed_winsor_limits,
@@ -2604,6 +2605,7 @@ def create_master_tile(
     elif stack_reject_algo == "kappa_sigma":
         master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_kappa_sigma_clip(
             valid_aligned_images,
+            weight_method=stack_weight_method,
             zconfig=zconfig,
             sigma_low=stack_kappa_low,
             sigma_high=stack_kappa_high,
@@ -2611,6 +2613,7 @@ def create_master_tile(
     elif stack_reject_algo == "linear_fit_clip":
         master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_linear_fit_clip(
             valid_aligned_images,
+            weight_method=stack_weight_method,
             zconfig=zconfig,
             sigma=stack_kappa_high,
         )
@@ -3686,6 +3689,31 @@ def run_hierarchical_mosaic(
     except Exception:
         pass
 
+    # --- Harmoniser les méthodes de pondération issues du GUI / CLI / fallback config ---
+    requested_stack_weight_method = stack_weight_method
+    stack_weight_method_normalized = str(stack_weight_method or "").lower().strip()
+    if not stack_weight_method_normalized:
+        stack_weight_method_normalized = ""
+        if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
+            try:
+                cfg_weight = zemosaic_config.load_config() or {}
+                stack_weight_method_normalized = str(
+                    cfg_weight.get("stacking_weighting_method", "")
+                ).lower().strip()
+            except Exception:
+                stack_weight_method_normalized = ""
+    if not stack_weight_method_normalized:
+        stack_weight_method_normalized = "none"
+    if stack_weight_method_normalized not in {"none", "noise_variance", "noise_fwhm"}:
+        stack_weight_method_normalized = "none"
+    if str(requested_stack_weight_method or "").lower().strip() != stack_weight_method_normalized:
+        _log_and_callback(
+            f"[Worker] stack_weight_method fallback -> '{stack_weight_method_normalized}'",
+            lvl="INFO",
+            callback=progress_callback,
+        )
+    stack_weight_method = stack_weight_method_normalized
+
     # Reset alignment warning counters at start of run
     for k in ALIGN_WARNING_COUNTS:
         ALIGN_WARNING_COUNTS[k] = 0
@@ -3808,6 +3836,15 @@ def run_hierarchical_mosaic(
     pcb("CHRONO_START_REQUEST", prog=None, lvl="CHRONO_LEVEL")
     _log_memory_usage(progress_callback, "Début Run Hierarchical Mosaic")
     pcb("run_info_processing_started", prog=current_global_progress, lvl="INFO")
+    _log_and_callback(
+        (
+            f"Options Stacking (Master Tiles): Norm='{stack_norm_method}', "
+            f"Weight='{stack_weight_method}', Reject='{stack_reject_algo}', "
+            f"Combine='{stack_final_combine}'"
+        ),
+        lvl="INFO",
+        callback=progress_callback,
+    )
     pcb(f"  Config ASTAP: Exe='{os.path.basename(astap_exe_path) if astap_exe_path else 'N/A'}', Data='{os.path.basename(astap_data_dir_param) if astap_data_dir_param else 'N/A'}', Radius={astap_search_radius_config}deg, Downsample={astap_downsample_config}, Sens={astap_sensitivity_config}", prog=None, lvl="DEBUG_DETAIL")
     pcb(f"  Config Workers (GUI): Base demandé='{num_base_workers_config}' (0=auto)", prog=None, lvl="DEBUG_DETAIL")
     pcb(f"  Options Stacking (Master Tuiles): Norm='{stack_norm_method}', Weight='{stack_weight_method}', Reject='{stack_reject_algo}', Combine='{stack_final_combine}', RadialWeight={apply_radial_weight_config} (Feather={radial_feather_fraction_config if apply_radial_weight_config else 'N/A'}, Power={radial_shape_power_config if apply_radial_weight_config else 'N/A'}, Floor={min_radial_weight_floor_config if apply_radial_weight_config else 'N/A'})", prog=None, lvl="DEBUG_DETAIL")
