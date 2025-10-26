@@ -491,19 +491,8 @@ def launch_filter_interface(
 
             threading.Thread(target=_crawl_worker, daemon=True).start()
             stream_state["done"] = False
-
-            try:
-                first_batch = stream_queue.get(timeout=5.0)
-            except queue.Empty:
-                first_batch = None
-
-            if not first_batch:
-                return [], False, None
-
-            if first_batch is not None:
-                initial_batches.append(first_batch)
-            else:
-                stream_state["done"] = True
+            # NE PAS attendre la 1re fournée ici : on laisse l'UI se lancer,
+            # les batches seront avalés par _consume_ui_queue()
         else:
             normalized: list[Dict[str, Any]] = []
             for i, entry in enumerate(raw_items_input or []):
@@ -691,17 +680,7 @@ def launch_filter_interface(
         # want to display the file list even if the sky preview cannot show any
         # overlay.  Fall back to a neutral reference center so downstream logic
         # continues to work (thresholds, wrapping helpers, etc.).
-        centers_available = [it.center for it in items if it.center is not None]
-        has_explicit_centers = bool(centers_available)
-        if not centers_available:
-            fallback_center: Optional[SkyCoord] = None
-            for it in items:
-                if it.phase0_center is not None:
-                    fallback_center = it.phase0_center
-                    break
-            if fallback_center is None:
-                fallback_center = SkyCoord(ra=0.0 * u.deg, dec=0.0 * u.deg, frame="icrs")
-            centers_available = [fallback_center]
+        has_explicit_centers = False
 
         # Compute robust global center via unit-vector average
         def average_skycoord(coords: list[SkyCoord]) -> SkyCoord:
@@ -711,7 +690,9 @@ def launch_filter_interface(
             sc = SkyCoord(x=vec_norm[0] * u.one, y=vec_norm[1] * u.one, z=vec_norm[2] * u.one, frame="icrs", representation_type="cartesian").spherical
             return SkyCoord(ra=sc.lon.to(u.deg), dec=sc.lat.to(u.deg), frame="icrs")
 
-        global_center: SkyCoord = centers_available[0] if len(centers_available) == 1 else average_skycoord(centers_available)
+        global_center: SkyCoord = SkyCoord(ra=0.0 * u.deg, dec=0.0 * u.deg, frame="icrs")
+        ref_ra = float(global_center.ra.to(u.deg).value)
+        ref_dec = float(global_center.dec.to(u.deg).value)
 
         # RA wrapping helper around a reference RA
         def wrap_ra_deg(ra_deg: float, ref_deg: float) -> float:
@@ -759,7 +740,27 @@ def launch_filter_interface(
         main.pack(fill=tk.BOTH, expand=True)
         main.columnconfigure(0, weight=3)
         main.columnconfigure(1, weight=2)
-        main.rowconfigure(0, weight=1)
+        main.rowconfigure(1, weight=1)
+
+        # Status strip (top): crawling indicator
+        status = ttk.Frame(main)
+        status.grid(row=0, column=0, columnspan=2, sticky="ew")
+        status.columnconfigure(1, weight=1)
+        status_var = tk.StringVar(master=root, value=_tr("filter_status_crawling", "Crawling files… please wait"))
+        ttk.Label(status, textvariable=status_var).grid(row=0, column=0, padx=6, pady=4, sticky="w")
+        pb = ttk.Progressbar(status, mode="indeterminate", length=180)
+        pb.grid(row=0, column=1, padx=6, pady=4, sticky="e")
+        if stream_mode:
+            try:
+                pb.start(80)
+            except Exception:
+                pass
+        else:
+            try:
+                pb.stop()
+            except Exception:
+                pass
+            status_var.set(_tr("filter_status_ready", "Crawling done."))
 
         # Matplotlib figure
         # Use constrained_layout to reduce internal padding and let the
@@ -780,7 +781,7 @@ def launch_filter_interface(
 
         canvas = FigureCanvasTkAgg(fig, master=main)
         canvas_widget = canvas.get_tk_widget()
-        canvas_widget.grid(row=0, column=0, sticky="nsew")
+        canvas_widget.grid(row=1, column=0, sticky="nsew")
 
         # Make the Matplotlib figure follow the widget size to avoid
         # large empty borders around the plot.
@@ -905,9 +906,25 @@ def launch_filter_interface(
 
         _setup_wheel_zoom(ax)
 
+        # Lazy recomputation of global center once we have some items
+        _center_ready = {"ok": False}
+
+        def _maybe_update_global_center():
+            nonlocal global_center, has_explicit_centers, ref_ra, ref_dec
+            coords = [it.center for it in items if it.center is not None]
+            has_explicit_centers = bool(coords)
+            if not coords:
+                return
+            global_center = coords[0] if len(coords) == 1 else average_skycoord(coords)
+            ref_ra = float(global_center.ra.to(u.deg).value)
+            ref_dec = float(global_center.dec.to(u.deg).value)
+            _center_ready["ok"] = True
+
+        _maybe_update_global_center()
+
         # Right panel with controls
         right = ttk.Frame(main)
-        right.grid(row=0, column=1, sticky="nsew")
+        right.grid(row=1, column=1, sticky="nsew")
         # The scrollable list lives at row=2 (row=1 reserved for clustering params)
         try:
             right.rowconfigure(2, weight=1)
@@ -1561,9 +1578,6 @@ def launch_filter_interface(
         # Map matplotlib artists back to item indices for click-to-select
         artist_to_index: dict[Any, int] = {}
 
-        ref_ra = float(global_center.ra.to(u.deg).value)
-        ref_dec = float(global_center.dec.to(u.deg).value)
-
         all_ra_vals: list[float] = []
         all_dec_vals: list[float] = []
         drawn_footprints = {"count": 0}
@@ -1699,6 +1713,17 @@ def launch_filter_interface(
                 items.append(new_item)
                 _add_item_row(new_item)
             update_visuals()
+            if not _center_ready["ok"]:
+                _maybe_update_global_center()
+                if _center_ready["ok"] and has_explicit_centers:
+                    try:
+                        thresh_entry.state(["!disabled"])
+                    except Exception:
+                        thresh_entry.configure(state=tk.NORMAL)
+                    try:
+                        thresh_button.state(["!disabled"])
+                    except Exception:
+                        pass
             _recompute_axes_limits()
 
         def _consume_ui_queue() -> None:
@@ -1709,6 +1734,11 @@ def launch_filter_interface(
                     batch = stream_queue.get_nowait()
                     if batch is None:
                         stream_state["done"] = True
+                        try:
+                            pb.stop()
+                            status_var.set(_tr("filter_status_ready", "Crawling done."))
+                        except Exception:
+                            pass
                         break
                     if batch:
                         _ingest_batch(batch)
@@ -1739,6 +1769,11 @@ def launch_filter_interface(
                     continue
                 if batch is None:
                     stream_state["done"] = True
+                    try:
+                        pb.stop()
+                        status_var.set(_tr("filter_status_ready", "Crawling done."))
+                    except Exception:
+                        pass
                     break
                 if batch:
                     _ingest_batch(batch)
