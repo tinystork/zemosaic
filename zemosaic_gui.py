@@ -1328,74 +1328,27 @@ class ZeMosaicGUI:
             messagebox.showerror(self._tr("error_title"), self._tr("invalid_input_folder_error"), parent=self.root)
             return
 
-        # Collect FITS paths deterministically
-        fits_paths = []
-        for r, _dirs, files in os.walk(input_dir):
-            try:
-                files = sorted(files, key=lambda s: s.lower())
-            except Exception:
-                files = list(files)
-            for fn in files:
-                if fn.lower().endswith((".fit", ".fits")):
-                    fits_paths.append(os.path.join(r, fn))
+        # Ensure the directory contains at least one FITS file without performing
+        # a full upfront crawl (which can freeze the UI on large trees).
+        has_fits = False
         try:
-            fits_paths.sort(key=lambda p: p.lower())
+            for root_dir, _dirs, files in os.walk(input_dir):
+                for fn in files:
+                    if fn.lower().endswith((".fit", ".fits")):
+                        has_fits = True
+                        break
+                if has_fits:
+                    break
         except Exception:
-            fits_paths.sort()
+            has_fits = False
 
-        if not fits_paths:
-            messagebox.showwarning(self._tr("error_title"), self._tr("run_error_no_fits_found_input", "No FITS files found in input folder."), parent=self.root)
+        if not has_fits:
+            messagebox.showwarning(
+                self._tr("error_title"),
+                self._tr("run_error_no_fits_found_input", "No FITS files found in input folder."),
+                parent=self.root,
+            )
             return
-
-        # Lightweight header scan (subset of worker logic)
-        header_items = []
-        try:
-            from astropy.io import fits
-            from astropy.wcs import WCS
-            from astropy.coordinates import SkyCoord
-            import astropy.units as u
-        except Exception:
-            # Launch filter anyway; it will fail-safe and return unchanged
-            fits = None; WCS = None; SkyCoord = None; u = None
-
-        for i, fpath in enumerate(fits_paths):
-            hdr = None; wcs0 = None; shp_hw = None; center_sc = None
-            try:
-                if fits is not None:
-                    hdr = fits.getheader(fpath, 0)
-                    try:
-                        nax1 = int(hdr.get("NAXIS1", 0)); nax2 = int(hdr.get("NAXIS2", 0))
-                        if nax1 > 0 and nax2 > 0:
-                            shp_hw = (nax2, nax1)
-                    except Exception:
-                        shp_hw = None
-                    try:
-                        w = WCS(hdr, naxis=2, relax=True) if WCS is not None else None
-                        if w and getattr(w, "is_celestial", False):
-                            wcs0 = w
-                    except Exception:
-                        wcs0 = None
-                    if wcs0 is None and hdr is not None and SkyCoord is not None and u is not None:
-                        try:
-                            crval = getattr(getattr(wcs0, 'wcs', None), 'crval', None)
-                            if crval is None and hdr is not None:
-                                ra = hdr.get('CRVAL1'); dec = hdr.get('CRVAL2')
-                                if ra is not None and dec is not None:
-                                    center_sc = SkyCoord(float(ra) * u.deg, float(dec) * u.deg, frame='icrs')
-                        except Exception:
-                            center_sc = None
-            except Exception:
-                pass
-            item = {"path": fpath, "index": i}
-            if hdr is not None:
-                item["header"] = hdr
-            if shp_hw is not None:
-                item["shape"] = shp_hw
-            if wcs0 is not None:
-                item["wcs"] = wcs0
-            if center_sc is not None:
-                item["center"] = center_sc
-            header_items.append(item)
 
         # Import filter UI lazily and launch
         try:
@@ -1465,8 +1418,12 @@ class ZeMosaicGUI:
                 config_overrides = None
 
             result = launch_filter_interface(
-                header_items,
+                input_dir,
                 _initial_overrides,
+                stream_scan=True,
+                scan_recursive=True,
+                batch_size=200,
+                preview_cap=1500,
                 solver_settings_dict=solver_cfg_payload,
                 config_overrides=config_overrides,
             )
@@ -1491,9 +1448,25 @@ class ZeMosaicGUI:
         if accepted:
             try:
                 kept = len(filtered_list) if isinstance(filtered_list, list) else 0
-                total = len(header_items)
+                total = None
+                if isinstance(overrides, dict):
+                    try:
+                        total = int(overrides.get("resolved_wcs_count"))
+                    except Exception:
+                        total = None
+                if total is None and isinstance(filtered_list, list):
+                    total = len(filtered_list)
                 self._log_message(self._tr("info", "Info"), level="INFO_DETAIL")
-                self._log_message(f"[ZGUI] Filter validated: kept {kept}/{total}. No processing started.", level="INFO_DETAIL")
+                if total is not None:
+                    self._log_message(
+                        f"[ZGUI] Filter validated: kept {kept}/{total}. No processing started.",
+                        level="INFO_DETAIL",
+                    )
+                else:
+                    self._log_message(
+                        f"[ZGUI] Filter validated: kept {kept} files. No processing started.",
+                        level="INFO_DETAIL",
+                    )
             except Exception:
                 pass
             # Apply clustering overrides if provided
