@@ -1786,7 +1786,7 @@ def launch_filter_interface(
                     sep_txt = ""
 
             cb = ttk.Checkbutton(inner, text=base + sep_txt, variable=var, command=lambda i=idx: update_visuals(i))
-            cb.grid(row=idx, column=0, sticky="w")
+            cb.pack(anchor="w", fill="x", pady=1)
             checkbuttons.append(cb)
             path_key = _path_key(item.path)
             if path_key:
