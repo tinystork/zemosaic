@@ -45,6 +45,7 @@ DEFAULT_CONFIG = {
     "intertile_overlap_min": 0.05,
     "intertile_sky_percentile": [30.0, 70.0],
     "intertile_robust_clip_sigma": 2.5,
+    "use_auto_intertile": False,
     # Early GUI filter option (Phase 0 header-only scan)
     "enable_early_filter": True,
     # --- CLES POUR LE ROGNAGE DES MASTER TUILES ---

@@ -441,6 +441,8 @@ def compute_intertile_affine_calibration(
     min_overlap_fraction: float = 0.05,
     sky_percentile: tuple[float, float] | list[float] = (30.0, 70.0),
     robust_clip_sigma: float = 2.5,
+    use_auto_intertile: bool = False,
+    logger=None,
     progress_callback=None,
 ):
     """Calcule des corrections affine (gain/offset) inter-tuiles avant reprojection."""
@@ -483,54 +485,128 @@ def compute_intertile_affine_calibration(
         luminance_tiles.append(luminance)
         shapes_hw.append((luminance.shape[0], luminance.shape[1]))
 
-    # Ajustement automatique selon le nombre de tuiles (pour clustering large)
     num_tiles = len(tile_data_with_wcs)
-    if num_tiles > 20:
-        min_overlap_fraction = 0.01
-        preview_size = max(1024, preview_size)
 
-    overlaps = estimate_overlap_pairs(
-        wcs_list,
-        shapes_hw,
-        final_output_wcs,
-        (h_full, w_full),
-        min_overlap_fraction=min_overlap_fraction,
-    )
-    if not overlaps:
+    try:
+        preview_size = int(preview_size)
+    except Exception:
+        preview_size = 512
+    preview_size = max(128, preview_size)
+
+    try:
+        min_overlap_fraction = float(min_overlap_fraction)
+    except Exception:
+        min_overlap_fraction = 0.05
+    if not math.isfinite(min_overlap_fraction):
+        min_overlap_fraction = 0.05
+    if min_overlap_fraction < 0:
+        min_overlap_fraction = 0.0
+
+    def _log_intertile(message: str, level: str = "INFO") -> None:
+        prefixed = message if message.startswith("[Intertile]") else f"[Intertile] {message}"
+        level_upper = str(level).upper()
+        if logger is not None:
+            try:
+                if level_upper in {"WARN", "WARNING"}:
+                    logger.warning(prefixed)
+                elif level_upper in {"ERROR", "CRITICAL"}:
+                    logger.error(prefixed)
+                elif level_upper in {"DEBUG", "DEBUG_DETAIL"}:
+                    logger.debug(prefixed)
+                else:
+                    logger.info(prefixed)
+            except Exception:
+                pass
         if progress_callback:
             try:
-                progress_callback(
-                    "No overlap pairs found — applying global normalization fallback.",
-                    None,
-                    "WARN",
-                )
+                progress_callback(prefixed, None, level_upper)
             except Exception:
                 pass
 
+    if use_auto_intertile and num_tiles > 20:
+        tuned_preview = max(1024, preview_size)
+        tuned_overlap = min(min_overlap_fraction, 0.01)
+        preview_size = int(tuned_preview)
+        min_overlap_fraction = float(tuned_overlap)
+        _log_intertile(
+            f"Auto-tune enabled for {num_tiles} tiles — using preview={preview_size}, min_overlap={min_overlap_fraction:.4f}",
+            level="INFO",
+        )
+
+    base_min_overlap = float(min_overlap_fraction)
+
+    candidates: list[float] = []
+    seen_thresholds: set[float] = set()
+
+    def _add_candidate(value: float) -> None:
         try:
-            # --- GPU-aware global median normalization ---
+            val = float(value)
+        except Exception:
+            return
+        if not math.isfinite(val):
+            return
+        if val < 0:
+            val = 0.0
+        key = round(val, 6)
+        if key in seen_thresholds:
+            return
+        seen_thresholds.add(key)
+        candidates.append(val)
+
+    _add_candidate(base_min_overlap)
+    for fallback_threshold in (0.03, 0.02, 0.01):
+        if fallback_threshold < base_min_overlap - 1e-6:
+            _add_candidate(fallback_threshold)
+    if not candidates:
+        candidates.append(0.0)
+
+    overlaps = []
+    effective_min_overlap = base_min_overlap
+    for threshold in candidates:
+        overlaps = estimate_overlap_pairs(
+            wcs_list,
+            shapes_hw,
+            final_output_wcs,
+            (h_full, w_full),
+            min_overlap_fraction=threshold,
+        )
+        _log_intertile(
+            f"Overlap pairs at min_overlap={threshold:.4f}: {len(overlaps)}",
+            level="INFO",
+        )
+        if overlaps:
+            effective_min_overlap = threshold
+            if threshold + 1e-6 < base_min_overlap:
+                _log_intertile(
+                    f"Using relaxed min_overlap={threshold:.4f} (initial {base_min_overlap:.4f}).",
+                    level="INFO",
+                )
+            break
+
+    if not overlaps:
+        _log_intertile(
+            "No overlap pairs found after retries — applying GLOBAL fallback (median normalization).",
+            level="WARN",
+        )
+        try:
             use_gpu = False
-            xp = np  # xp = numpy or cupy depending on GPU
+            xp = np
+            cp = None
             try:
-                import cupy as cp  # type: ignore
+                import cupy as _cp  # type: ignore
 
                 if gpu_is_available():
-                    xp = cp
+                    xp = _cp
+                    cp = _cp
                     use_gpu = True
-                    if progress_callback:
-                        try:
-                            progress_callback(
-                                "CuPy GPU detected — normalization on GPU.",
-                                None,
-                                "INFO_DETAIL",
-                            )
-                        except Exception:
-                            pass
+                    _log_intertile(
+                        "CuPy GPU detected — normalization on GPU.",
+                        level="INFO_DETAIL",
+                    )
             except Exception:
                 xp = np
                 use_gpu = False
 
-            # Récupération des médianes de chaque tuile
             medians = []
             for data, _ in tile_data_with_wcs:
                 if data is None:
@@ -541,29 +617,15 @@ def compute_intertile_affine_calibration(
                     medians.append(med)
 
             if not medians:
-                if progress_callback:
-                    try:
-                        progress_callback(
-                            "No valid medians found for normalization.",
-                            None,
-                            "WARN",
-                        )
-                    except Exception:
-                        pass
+                _log_intertile("No valid medians found for normalization.", level="WARN")
                 return {}
 
             global_median = float(np.median(medians))
-            if progress_callback:
-                try:
-                    progress_callback(
-                        f"Global normalization median reference = {global_median:.4f}",
-                        None,
-                        "INFO_DETAIL",
-                    )
-                except Exception:
-                    pass
+            _log_intertile(
+                f"Global normalization median reference = {global_median:.4f}",
+                level="INFO_DETAIL",
+            )
 
-            # Application du scaling sur chaque tuile
             new_tile_data = []
             for data, wcs_obj in tile_data_with_wcs:
                 if data is None:
@@ -573,34 +635,23 @@ def compute_intertile_affine_calibration(
                 med = float(xp.median(arr).get() if use_gpu else np.median(arr))
                 scale = (global_median / med) if med and np.isfinite(med) and med != 0 else 1.0
                 scaled = arr * scale
-                if use_gpu:
+                if use_gpu and cp is not None:
                     scaled = cp.asnumpy(scaled)  # type: ignore
                 new_tile_data.append((scaled, wcs_obj))
             tile_data_with_wcs[:] = new_tile_data
 
-            if progress_callback:
-                try:
-                    progress_callback(
-                        "Applied global normalization to all master tiles.",
-                        None,
-                        "INFO",
-                    )
-                except Exception:
-                    pass
+            _log_intertile("Applied global normalization to all master tiles.", level="INFO")
 
         except Exception as e_norm:
-            if progress_callback:
-                try:
-                    progress_callback(
-                        f"Global normalization fallback failed: {e_norm}",
-                        None,
-                        "ERROR",
-                    )
-                except Exception:
-                    pass
+            _log_intertile(f"Global normalization fallback failed: {e_norm}", level="ERROR")
 
-        # Skip further calibration since we normalized globally
         return {}
+
+    min_overlap_fraction = effective_min_overlap
+    _log_intertile(
+        f"Using: preview={preview_size}, min_overlap={effective_min_overlap:.4f}, sky=({sky_low:.1f},{sky_high:.1f}), clip={robust_clip_sigma:.2f}, pairs={len(overlaps)}",
+        level="INFO",
+    )
 
     try:
         from astropy.wcs import WCS as _WCS

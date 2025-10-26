@@ -3153,6 +3153,7 @@ def assemble_final_mosaic_reproject_coadd(
     intertile_overlap_min: float = 0.05,
     intertile_sky_percentile: tuple[float, float] | list[float] = (30.0, 70.0),
     intertile_robust_clip_sigma: float = 2.5,
+    use_auto_intertile: bool = False,
 ):
     """Assemble les master tiles en utilisant ``reproject_and_coadd``."""
     _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
@@ -3389,6 +3390,8 @@ def assemble_final_mosaic_reproject_coadd(
                 min_overlap_fraction=intertile_overlap_min,
                 sky_percentile=intertile_sky_percentile,
                 robust_clip_sigma=intertile_robust_clip_sigma,
+                use_auto_intertile=use_auto_intertile,
+                logger=logger,
                 progress_callback=progress_callback,
             )
         except Exception as exc_intertile:
@@ -3649,6 +3652,7 @@ def run_hierarchical_mosaic(
     intertile_overlap_min_config: float = 0.05,
     intertile_sky_percentile_config: tuple[float, float] | list[float] = (30.0, 70.0),
     intertile_robust_clip_sigma_config: float = 2.5,
+    use_auto_intertile_config: bool = False,
     use_gpu_phase5: bool = False,
     gpu_id_phase5: int | None = None,
     logging_level_config: str = "INFO",
@@ -5383,6 +5387,7 @@ def run_hierarchical_mosaic(
                     intertile_overlap_min=float(intertile_overlap_min_config),
                     intertile_sky_percentile=intertile_sky_percentile_tuple,
                     intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
+                    use_auto_intertile=bool(use_auto_intertile_config),
                 )
             except Exception as e_gpu:
                 logger.warning("GPU reproject_coadd failed, falling back to CPU: %s", e_gpu)
@@ -5407,6 +5412,7 @@ def run_hierarchical_mosaic(
                     intertile_overlap_min=float(intertile_overlap_min_config),
                     intertile_sky_percentile=intertile_sky_percentile_tuple,
                     intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
+                    use_auto_intertile=bool(use_auto_intertile_config),
                 )
         else:
             final_mosaic_data_HWC, final_mosaic_coverage_HW = assemble_final_mosaic_reproject_coadd(
@@ -5430,6 +5436,7 @@ def run_hierarchical_mosaic(
                 intertile_overlap_min=float(intertile_overlap_min_config),
                 intertile_sky_percentile=intertile_sky_percentile_tuple,
                 intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
+                use_auto_intertile=bool(use_auto_intertile_config),
             )
 
         log_key_phase5_failed = "run_error_phase5_assembly_failed_reproject_coadd"

@@ -21,6 +21,7 @@ class SolverSettings:
     astap_search_radius_deg: float = 3.0
     astap_downsample: int = 2
     astap_sensitivity: int = 100
+    use_auto_intertile: bool = False
 
     @staticmethod
     def default_path() -> Path:

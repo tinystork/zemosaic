@@ -301,6 +301,10 @@ class ZeMosaicGUI:
         self.intertile_sky_low_var = tk.DoubleVar(master=self.root, value=float(intertile_sky_cfg[0]))
         self.intertile_sky_high_var = tk.DoubleVar(master=self.root, value=float(intertile_sky_cfg[1]))
         self.intertile_clip_sigma_var = tk.DoubleVar(master=self.root, value=self.config.get("intertile_robust_clip_sigma", 2.5))
+        self.use_auto_intertile_var = tk.BooleanVar(
+            master=self.root,
+            value=self.config.get("use_auto_intertile", False),
+        )
         self.use_gpu_phase5_var = tk.BooleanVar(master=self.root, value=self.config.get("use_gpu_phase5", False))
         # Logging level var (keys are ERROR, WARN, INFO, DEBUG)
         self.logging_level_keys = ["ERROR", "WARN", "INFO", "DEBUG"]
@@ -935,6 +939,14 @@ class ZeMosaicGUI:
             width=8,
             format="%.1f",
         ).grid(row=3, column=1, padx=(8, 5), pady=2, sticky="w")
+
+        self.intertile_auto_check = ttk.Checkbutton(
+            intertile_params_frame,
+            variable=self.use_auto_intertile_var,
+            text="",
+        )
+        self.intertile_auto_check.grid(row=4, column=0, columnspan=3, padx=0, pady=(4, 2), sticky="w")
+        self.translatable_widgets["intertile_auto_label"] = self.intertile_auto_check
 
         asm_opt_row += 1
 
@@ -2015,6 +2027,7 @@ class ZeMosaicGUI:
             float(self.intertile_sky_high_var.get()),
         ]
         self.config["intertile_robust_clip_sigma"] = float(self.intertile_clip_sigma_var.get())
+        self.config["use_auto_intertile"] = bool(self.use_auto_intertile_var.get())
         # Persist logging level
         self.config["logging_level"] = self.logging_level_var.get()
 
@@ -2087,6 +2100,7 @@ class ZeMosaicGUI:
                 float(self.intertile_sky_high_var.get()),
             ],
             float(self.intertile_clip_sigma_var.get()),
+            bool(self.use_auto_intertile_var.get()),
             self.use_gpu_phase5_var.get(),
             gpu_id,
             self.logging_level_var.get(),

@@ -328,6 +328,7 @@
     "intertile_overlap_hint": "(vs. smaller tile area)",
     "intertile_sky_label": "Sky percentile range:",
     "intertile_clip_label": "Robust clip sigma:",
+    "intertile_auto_label": "Auto-tune inter-tile parameters (recommended >20 tiles)",
     "no_gpu_title": "GPU not detected",
     "no_gpu_msg": "No NVIDIA GPU detected. Falling back to CPU.",
     "performance_options_frame_title": "Performance Options",
