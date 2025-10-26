@@ -483,6 +483,12 @@ def compute_intertile_affine_calibration(
         luminance_tiles.append(luminance)
         shapes_hw.append((luminance.shape[0], luminance.shape[1]))
 
+    # Ajustement automatique selon le nombre de tuiles (pour clustering large)
+    num_tiles = len(tile_data_with_wcs)
+    if num_tiles > 20:
+        min_overlap_fraction = 0.01
+        preview_size = max(1024, preview_size)
+
     overlaps = estimate_overlap_pairs(
         wcs_list,
         shapes_hw,
@@ -491,6 +497,109 @@ def compute_intertile_affine_calibration(
         min_overlap_fraction=min_overlap_fraction,
     )
     if not overlaps:
+        if progress_callback:
+            try:
+                progress_callback(
+                    "No overlap pairs found — applying global normalization fallback.",
+                    None,
+                    "WARN",
+                )
+            except Exception:
+                pass
+
+        try:
+            # --- GPU-aware global median normalization ---
+            use_gpu = False
+            xp = np  # xp = numpy or cupy depending on GPU
+            try:
+                import cupy as cp  # type: ignore
+
+                if gpu_is_available():
+                    xp = cp
+                    use_gpu = True
+                    if progress_callback:
+                        try:
+                            progress_callback(
+                                "CuPy GPU detected — normalization on GPU.",
+                                None,
+                                "INFO_DETAIL",
+                            )
+                        except Exception:
+                            pass
+            except Exception:
+                xp = np
+                use_gpu = False
+
+            # Récupération des médianes de chaque tuile
+            medians = []
+            for data, _ in tile_data_with_wcs:
+                if data is None:
+                    continue
+                arr = xp.asarray(data, dtype=xp.float32)
+                med = float(xp.median(arr).get() if use_gpu else np.median(arr))
+                if np.isfinite(med) and med > 0:
+                    medians.append(med)
+
+            if not medians:
+                if progress_callback:
+                    try:
+                        progress_callback(
+                            "No valid medians found for normalization.",
+                            None,
+                            "WARN",
+                        )
+                    except Exception:
+                        pass
+                return {}
+
+            global_median = float(np.median(medians))
+            if progress_callback:
+                try:
+                    progress_callback(
+                        f"Global normalization median reference = {global_median:.4f}",
+                        None,
+                        "INFO_DETAIL",
+                    )
+                except Exception:
+                    pass
+
+            # Application du scaling sur chaque tuile
+            new_tile_data = []
+            for data, wcs_obj in tile_data_with_wcs:
+                if data is None:
+                    new_tile_data.append((data, wcs_obj))
+                    continue
+                arr = xp.asarray(data, dtype=xp.float32)
+                med = float(xp.median(arr).get() if use_gpu else np.median(arr))
+                scale = (global_median / med) if med and np.isfinite(med) and med != 0 else 1.0
+                scaled = arr * scale
+                if use_gpu:
+                    scaled = cp.asnumpy(scaled)  # type: ignore
+                new_tile_data.append((scaled, wcs_obj))
+            tile_data_with_wcs[:] = new_tile_data
+
+            if progress_callback:
+                try:
+                    progress_callback(
+                        "Applied global normalization to all master tiles.",
+                        None,
+                        "INFO",
+                    )
+                except Exception:
+                    pass
+
+        except Exception as e_norm:
+            if progress_callback:
+                try:
+                    progress_callback(
+                        f"Global normalization fallback failed: {e_norm}",
+                        None,
+                        "ERROR",
+                    )
+                except Exception:
+                    pass
+
+        # Skip further calibration since we normalized globally
         return {}
 
     try:
@@ -587,6 +696,16 @@ def compute_intertile_affine_calibration(
 
     anchor = int(np.argmax(connectivity)) if np.any(connectivity > 0) else 0
     solution = solve_global_affine(len(tile_data_with_wcs), pair_entries, anchor_index=anchor)
+    if progress_callback:
+        try:
+            progress_callback(
+                "Ensuring match_background=True for final coadd.",
+                None,
+                "DEBUG_DETAIL",
+            )
+        except Exception:
+            pass
+
     return solution
 # Les filtres VerifyWarning sont maintenant dans le try/except d'Astropy ci-dessus.
 
