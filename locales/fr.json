@@ -326,6 +326,7 @@
     "intertile_overlap_hint": "(fraction vs. tuile la plus petite)",
     "intertile_sky_label": "Plage de percentiles ciel :",
     "intertile_clip_label": "Sigma de clipping robuste :",
+    "intertile_auto_label": "Auto-ajuster les paramètres inter-tuiles (recommandé au-delà de 20 tuiles)",
     "no_gpu_title": "GPU non détecté",
     "no_gpu_msg": "Aucun GPU NVIDIA détecté. Repli CPU activé.",
 
