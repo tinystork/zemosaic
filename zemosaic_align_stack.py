@@ -5,7 +5,7 @@ import os
 import importlib.util
 import tempfile
 from dataclasses import dataclass
-from typing import Optional, Callable
+from typing import Optional, Callable, Any
 
 GPU_AVAILABLE = importlib.util.find_spec("cupy") is not None
 import traceback
@@ -123,6 +123,85 @@ except ImportError as e_util_rad:
 _internal_logger = logging.getLogger("zemosaic.align_stack")
 if not _internal_logger.handlers:
     _internal_logger.addHandler(logging.NullHandler())
+
+_STACK_LOG_LEVEL_MAP = {
+    "DEBUG": logging.DEBUG,
+    "DEBUG_DETAIL": logging.DEBUG,
+    "INFO": logging.INFO,
+    "INFO_DETAIL": logging.DEBUG,
+    "WARN": logging.WARNING,
+    "WARNING": logging.WARNING,
+    "ERROR": logging.ERROR,
+    "SUCCESS": logging.INFO,
+    "ETA_LEVEL": logging.DEBUG,
+    "CHRONO_LEVEL": logging.DEBUG,
+}
+
+_STACK_USER_FACING_LEVELS = {"INFO", "WARN", "WARNING", "ERROR", "SUCCESS"}
+
+
+def _log_stack_message(
+    message_key_or_raw: Any,
+    level: str | None = "INFO",
+    progress_callback: Optional[Callable] = None,
+    **kwargs: Any,
+) -> None:
+    """Forward stack logging messages to the worker log and optional callback.
+
+    Parameters
+    ----------
+    message_key_or_raw:
+        Either a localization key or a raw message string.
+    level:
+        Logging severity. Mirrors :func:`zemosaic_worker._log_and_callback`.
+    progress_callback:
+        Callback compatible with :func:`zemosaic_worker._log_and_callback`.
+    **kwargs:
+        Extra context forwarded to the callback and used for formatting when
+        logging non user-facing levels.
+    """
+
+    level_str = "INFO"
+    if isinstance(level, str):
+        level_str = level.upper()
+    elif level is not None:
+        try:
+            level_str = str(level).upper()
+        except Exception:
+            level_str = "INFO"
+
+    if level_str == "WARNING":
+        # Normalise to WARN to align with worker expectations.
+        level_str = "WARN"
+
+    if level_str in _STACK_USER_FACING_LEVELS:
+        message_for_internal_log = f"[STACK][KEY_OR_RAW: {message_key_or_raw}]"
+        if kwargs:
+            message_for_internal_log += f" (Args: {kwargs})"
+    else:
+        message_for_internal_log = str(message_key_or_raw)
+        if kwargs:
+            try:
+                message_for_internal_log = message_for_internal_log.format(**kwargs)
+            except Exception:
+                # Keep the unformatted message but append kwargs for context.
+                message_for_internal_log = f"{message_for_internal_log} | kwargs={kwargs}"
+
+    _internal_logger.log(
+        _STACK_LOG_LEVEL_MAP.get(level_str, logging.INFO),
+        message_for_internal_log,
+    )
+
+    if progress_callback and callable(progress_callback):
+        try:
+            progress_callback(message_key_or_raw, None, level_str, **kwargs)
+        except Exception as cb_err:
+            _internal_logger.warning(
+                "Stack progress callback failure for %r: %s",
+                message_key_or_raw,
+                cb_err,
+                exc_info=True,
+            )
 
 CPU_WINSOR_MEMMAP_THRESHOLD_BYTES = int(
     os.environ.get("ZEMOSAIC_CPU_WINSOR_MEMMAP_THRESHOLD", 3 * 1024**3)
