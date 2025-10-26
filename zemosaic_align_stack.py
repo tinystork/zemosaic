@@ -120,6 +120,10 @@ try:
 except ImportError as e_util_rad:
         print(f"AVERT (zemosaic_align_stack): Radial weighting: Erreur import make_radial_weight_map: {e_util_rad}")
 
+_internal_logger = logging.getLogger("zemosaic.align_stack")
+if not _internal_logger.handlers:
+    _internal_logger.addHandler(logging.NullHandler())
+
 CPU_WINSOR_MEMMAP_THRESHOLD_BYTES = int(
     os.environ.get("ZEMOSAIC_CPU_WINSOR_MEMMAP_THRESHOLD", 3 * 1024**3)
 )
