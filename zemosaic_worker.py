@@ -1,3 +1,47 @@
+"""
+╔══════════════════════════════════════════════════════════════════════╗
+║ ZeMosaic / ZeSeestarStacker Project                                  ║
+║                                                                      ║
+║ Auteur  : Tinystork, seigneur des couteaux à beurre (aka Tristan Nauleau)  
+║ Partenaire : J.A.R.V.I.S. (/ˈdʒɑːrvɪs/) — Just a Rather Very Intelligent System  
+║              (aka ChatGPT, Grand Maître du ciselage de code)         ║
+║                                                                      ║
+║ Licence : GNU General Public License v3.0 (GPL-3.0)                  ║
+║                                                                      ║
+║ Description :                                                        ║
+║   Ce programme a été forgé à la lueur des pixels et de la caféine,   ║
+║   dans le but noble de transformer des nuages de photons en art      ║
+║   astronomique. Si vous l’utilisez, pensez à dire “merci”,           ║
+║   à lever les yeux vers le ciel, ou à citer Tinystork et J.A.R.V.I.S.║
+║   (le karma des développeurs en dépend).                             ║
+║                                                                      ║
+║ Avertissement :                                                      ║
+║   Aucune IA ni aucun couteau à beurre n’a été blessé durant le       ║
+║   développement de ce code.                                          ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+
+╔══════════════════════════════════════════════════════════════════════╗
+║ ZeMosaic / ZeSeestarStacker Project                                  ║
+║                                                                      ║
+║ Author  : Tinystork, Lord of the Butter Knives (aka Tristan Nauleau) ║
+║ Partner : J.A.R.V.I.S. (/ˈdʒɑːrvɪs/) — Just a Rather Very Intelligent System  
+║           (aka ChatGPT, Grand Master of Code Chiseling)              ║
+║                                                                      ║
+║ License : GNU General Public License v3.0 (GPL-3.0)                  ║
+║                                                                      ║
+║ Description:                                                         ║
+║   This program was forged under the sacred light of pixels and       ║
+║   caffeine, with the noble intent of turning clouds of photons into  ║
+║   astronomical art. If you use it, please consider saying “thanks,”  ║
+║   gazing at the stars, or crediting Tinystork and J.A.R.V.I.S. —     ║
+║   developer karma depends on it.                                     ║
+║                                                                      ║
+║ Disclaimer:                                                          ║
+║   No AIs or butter knives were harmed in the making of this code.    ║
+╚══════════════════════════════════════════════════════════════════════╝
+"""
+
 from __future__ import annotations
 
 # zemosaic_worker.py
@@ -773,6 +817,61 @@ def _enforce_master_tile_cap(
         else:
             new_groups.append(group)
     return new_groups, any_split
+
+
+def compute_auto_max_raw_per_master_tile(
+    total_raws: int,
+    resource_info: dict,
+    per_frame_info: dict,
+    *,
+    user_value: int | None,
+    min_tiles_floor: int = 14,
+    progress_callback: Callable | None = None,
+) -> int:
+    """Determine the cap used to split oversized clustering groups."""
+
+    resource_info = dict(resource_info or {})
+    per_frame_info = dict(per_frame_info or {})
+
+    caps = _compute_auto_tile_caps(resource_info, per_frame_info, policy_max=50, policy_min=8)
+    cap_ram = int(max(8, min(50, caps.get("cap", 50))))
+
+    N = int(max(0, total_raws))
+    if N <= 150:
+        cap_rule = 10
+    elif N <= 400:
+        cap_rule = 8
+    elif N <= 3000:
+        cap_rule = 8
+    elif N <= 12000:
+        cap_rule = 6
+    else:
+        cap_rule = 6
+
+    if user_value and user_value > 0:
+        C = int(user_value)
+    else:
+        C = int(min(cap_ram, cap_rule))
+
+    floor_tiles = max(1, int(min_tiles_floor))
+    if N > 0 and C > 0:
+        tiles_est = max(1, N // C)
+        if tiles_est < floor_tiles:
+            C = max(4, N // floor_tiles)
+
+    C = int(max(4, min(200, C)))
+
+    try:
+        _log_and_callback(
+            f"[AutoCap] N={N} cap_ram={cap_ram} cap_rule={cap_rule} -> C={C}",
+            prog=None,
+            lvl="INFO_DETAIL",
+            callback=progress_callback,
+        )
+    except Exception:
+        pass
+
+    return C
 
 
 def _extract_timestamp(info: dict, fallback: float) -> float:

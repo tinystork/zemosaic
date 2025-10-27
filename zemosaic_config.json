@@ -24,7 +24,7 @@
     "solver_method": "ansvr",
     "astrometry_local_path": "",
     "astrometry_api_key": "",
-    "save_final_as_uint16": true,
+    "save_final_as_uint16": false,
     "legacy_rgb_cube": false,
     "coadd_use_memmap": true,
     "coadd_memmap_dir": "",
