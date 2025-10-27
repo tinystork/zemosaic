@@ -28,6 +28,8 @@ from __future__ import annotations
 from typing import List, Dict, Any, Optional
 from collections.abc import Iterable
 from dataclasses import asdict
+import inspect
+import math
 import os
 import sys
 import shutil
@@ -66,45 +68,6 @@ def _angular_sep_deg(a: Optional[tuple[float, float]], b: Optional[tuple[float, 
     dra = abs(a[0] - b[0])
     ddec = abs(a[1] - b[1])
     return (dra ** 2 + ddec ** 2) ** 0.5
-
-
-def _merge_small_groups(groups: list[list[dict]], min_size: int, cap: int) -> list[list[dict]]:
-    """
-    Merge groups smaller than ``min_size`` with their nearest neighbour when the
-    resulting size stays below ``cap`` (allowing a 10% margin).
-    """
-
-    if not groups or min_size <= 0 or cap <= 0:
-        return groups
-
-    merged_flags = [False] * len(groups)
-    centers = [_group_center_deg(g) for g in groups]
-
-    for i, group in enumerate(groups):
-        if merged_flags[i] or len(group) >= min_size:
-            continue
-
-        best_j: Optional[int] = None
-        best_dist = float("inf")
-        for j, neighbour in enumerate(groups):
-            if i == j or merged_flags[j]:
-                continue
-            dist = _angular_sep_deg(centers[i], centers[j])
-            if dist < best_dist:
-                best_dist = dist
-                best_j = j
-
-        if best_j is not None:
-            candidate_size = len(groups[best_j]) + len(group)
-            if candidate_size <= int(cap * 1.1):
-                groups[best_j].extend(group)
-                merged_flags[i] = True
-                print(
-                    f"[AutoMerge] Group {i} ({len(group)} imgs) merged into {best_j} "
-                    f"(now {len(groups[best_j])})"
-                )
-
-    return [grp for idx, grp in enumerate(groups) if not merged_flags[idx]]
 
 
 def launch_filter_interface(
@@ -384,6 +347,7 @@ def launch_filter_interface(
 
         astrometry_mod = _import_module_with_fallback('zemosaic_astrometry')
         worker_mod = _import_module_with_fallback('zemosaic_worker')
+        policy_mod = _import_module_with_fallback('zemosaic_policy')
         worker_import_failure_summary = "; ".join(_import_failures.get('zemosaic_worker', []))
 
         solve_with_astap = getattr(astrometry_mod, 'solve_with_astap', None) if astrometry_mod else None
@@ -391,8 +355,21 @@ def launch_filter_interface(
         astap_fits_module = getattr(astrometry_mod, 'fits', None) if astrometry_mod else None
         astap_astropy_available = bool(getattr(astrometry_mod, 'ASTROPY_AVAILABLE_ASTROMETRY', False)) if astrometry_mod else False
         cluster_func = getattr(worker_mod, 'cluster_seestar_stacks_connected', None) if worker_mod else None
-        autosplit_func = getattr(worker_mod, '_auto_split_groups', None) if worker_mod else None
+        split_temporal_func = getattr(worker_mod, '_split_group_temporally', None) if worker_mod else None
+        per_frame_estimator = getattr(worker_mod, '_estimate_per_frame_cost_mb', None) if worker_mod else None
         compute_dispersion_func = getattr(worker_mod, '_compute_max_angular_separation_deg', None) if worker_mod else None
+
+        compute_auto_cap_func = None
+        if policy_mod:
+            compute_auto_cap_func = getattr(policy_mod, 'compute_auto_max_raw_per_master_tile', None)
+        if compute_auto_cap_func is None and worker_mod:
+            compute_auto_cap_func = getattr(worker_mod, 'compute_auto_max_raw_per_master_tile', None)
+
+        probe_resources_func = None
+        if policy_mod:
+            probe_resources_func = getattr(policy_mod, 'probe_system_resources_for_gui', None)
+        if probe_resources_func is None and worker_mod:
+            probe_resources_func = getattr(worker_mod, '_probe_system_resources', None)
 
         MAX_FOOTPRINTS = int(preview_cap or 0) or 1000
         cache_csv_path: Optional[str] = None
@@ -1316,14 +1293,10 @@ def launch_filter_interface(
             cfg_defaults['astap_data_directory_path'] = astap_data_dir
         search_radius_default = cfg_defaults.get('astap_default_search_radius', 0.0)
         downsample_default = cfg_defaults.get('astap_default_downsample', 0)
-        autosplit_cap_cfg = cfg_defaults.get('max_raw_per_master_tile', 0)
         try:
-            autosplit_cap_cfg_int = int(autosplit_cap_cfg)
+            manual_master_cap_value = int(cfg_defaults.get('max_raw_per_master_tile', 0) or 0)
         except Exception:
-            autosplit_cap_cfg_int = 0
-        autosplit_cap = autosplit_cap_cfg_int if autosplit_cap_cfg_int > 0 else 50
-        autosplit_cap = max(1, min(50, autosplit_cap))
-        autosplit_min_cap = min(8, autosplit_cap)
+            manual_master_cap_value = 0
 
         def _astap_path_available(path: str) -> bool:
             """Return True when the configured ASTAP location looks valid."""
@@ -1494,7 +1467,8 @@ def launch_filter_interface(
                 level="WARN",
             )
 
-        if not (cluster_func and autosplit_func):
+        auto_helpers_ready = bool(cluster_func and split_temporal_func and compute_auto_cap_func)
+        if not auto_helpers_ready:
             auto_btn.state(["disabled"])
             if worker_import_failure_summary:
                 _log_message(
@@ -1503,6 +1477,11 @@ def launch_filter_interface(
                         "Auto-grouping disabled because the processing worker module failed to load: {error}",
                         error=worker_import_failure_summary,
                     ),
+                    level="ERROR",
+                )
+            else:
+                _log_message(
+                    "Auto-grouping disabled: required worker helpers unavailable.",
                     level="ERROR",
                 )
 
@@ -1592,7 +1571,7 @@ def launch_filter_interface(
                 raise
 
         def _auto_organize_master_tiles() -> None:
-            if not (cluster_func and autosplit_func):
+            if not auto_helpers_ready:
                 return
             auto_btn.state(["disabled"])
             try:
@@ -1715,33 +1694,156 @@ def launch_filter_interface(
                     _log_message(summary_text, level="WARN")
                     return
 
-                final_groups = autosplit_func(
-                    groups,
-                    cap=int(autosplit_cap),
-                    min_cap=int(autosplit_min_cap),
-                    progress_callback=_progress_callback,
-                )
-                final_groups = _merge_small_groups(
-                    final_groups,
-                    min_size=int(autosplit_min_cap),
-                    cap=int(autosplit_cap),
-                )
+                total_raws = len(candidate_infos)
+
+                per_frame_info: Dict[str, Any] = {}
+                if callable(per_frame_estimator):
+                    try:
+                        per_frame_info = per_frame_estimator(candidate_infos)
+                    except Exception as exc:
+                        _log_message(f"Per-frame estimate failed: {exc}", level="DEBUG_DETAIL")
+                        per_frame_info = {}
+
+                resource_info: Dict[str, Any] = {}
+                if callable(probe_resources_func):
+                    try:
+                        cache_hint = cfg_defaults.get("cache_directory_path") or cfg_defaults.get("cache_directory")
+                        resource_info = probe_resources_func(cache_hint)
+                    except Exception as exc:
+                        _log_message(f"Resource probe failed: {exc}", level="DEBUG_DETAIL")
+                        resource_info = {}
+
+                cap_details: Dict[str, Any] = {
+                    "total_raws": total_raws,
+                    "cap_ram": None,
+                    "cap_rule": None,
+                    "cap_final": manual_master_cap_value,
+                    "mode": "manual" if manual_master_cap_value > 0 else "auto",
+                }
+                cap_value = manual_master_cap_value if manual_master_cap_value > 0 else 0
+
+                supports_cap_details = False
+                if callable(compute_auto_cap_func):
+                    try:
+                        sig = inspect.signature(compute_auto_cap_func)
+                        supports_cap_details = "return_details" in sig.parameters
+                    except Exception:
+                        supports_cap_details = False
+
+                    result = None
+                    try:
+                        if supports_cap_details:
+                            result = compute_auto_cap_func(
+                                total_raws=total_raws,
+                                resource_info=resource_info,
+                                per_frame_info=per_frame_info,
+                                user_value=manual_master_cap_value,
+                                min_tiles_floor=14,
+                                return_details=True,
+                            )
+                        else:
+                            result = compute_auto_cap_func(
+                                total_raws=total_raws,
+                                resource_info=resource_info,
+                                per_frame_info=per_frame_info,
+                                user_value=manual_master_cap_value,
+                                min_tiles_floor=14,
+                            )
+                    except TypeError as exc_type:
+                        if supports_cap_details:
+                            try:
+                                result = compute_auto_cap_func(
+                                    total_raws=total_raws,
+                                    resource_info=resource_info,
+                                    per_frame_info=per_frame_info,
+                                    user_value=manual_master_cap_value,
+                                    min_tiles_floor=14,
+                                )
+                                supports_cap_details = False
+                            except Exception as exc_retry:
+                                _log_message(
+                                    f"Auto-cap computation failed after fallback: {exc_retry}",
+                                    level="WARN",
+                                )
+                                result = None
+                        else:
+                            _log_message(f"Auto-cap computation failed: {exc_type}", level="WARN")
+                            result = None
+                    except Exception as exc:
+                        _log_message(f"Auto-cap computation failed: {exc}", level="WARN")
+                        result = None
+
+                    if result is not None:
+                        if isinstance(result, tuple) and len(result) == 2:
+                            cap_value, cap_details = result
+                        else:
+                            try:
+                                cap_value = int(result)
+                            except Exception:
+                                cap_value = manual_master_cap_value if manual_master_cap_value > 0 else 0
+                    else:
+                        cap_value = manual_master_cap_value if manual_master_cap_value > 0 else 0
+
+                try:
+                    cap_value_int = int(cap_value)
+                except Exception:
+                    cap_value_int = 0
+
+                final_groups: list[list[dict]] = []
+                for idx, group in enumerate(groups, start=1):
+                    if cap_value_int > 0 and len(group) > cap_value_int and callable(split_temporal_func):
+                        segments = split_temporal_func(group, cap_value_int)
+                        final_groups.extend(segments)
+                        _log_message(
+                            (
+                                f"[FilterAuto] Split group #{idx} size={len(group)} into "
+                                f"{math.ceil(len(group) / cap_value_int)} segments (cap={cap_value_int})"
+                            ),
+                            level="INFO_DETAIL",
+                        )
+                    else:
+                        final_groups.append(group)
+
+                if not final_groups:
+                    final_groups = groups
+
                 for grp in final_groups:
                     for info in grp:
                         if info.pop("_fallback_wcs_used", False):
                             info.pop("wcs", None)
+
+                cap_details["cap_final"] = int(cap_value_int)
+
                 overrides_state["preplan_master_groups"] = final_groups
-                overrides_state["autosplit_cap"] = int(autosplit_cap)
-                sizes = [len(gr) for gr in final_groups]
-                sizes_str = ", ".join(str(s) for s in sizes) if sizes else "[]"
+                overrides_state["autosplit_cap"] = int(cap_value_int)
+                overrides_state["autosplit_mode"] = cap_details.get("mode")
+                overrides_state["autosplit_details"] = cap_details
+
+                threshold_display = f"{threshold_deg:.2f}"
+                mode_key = str(cap_details.get("mode", "auto")).lower()
+                if mode_key == "manual":
+                    mode_label = _tr("filter_log_auto_master_mode_manual", "manual")
+                else:
+                    mode_label = _tr("filter_log_auto_master_mode_auto", "auto")
+
+                est_tiles = len(final_groups)
                 summary_text = _tr(
-                    "filter_log_groups_summary",
-                    "Prepared {g} group(s), sizes: {sizes}.",
-                    g=len(final_groups),
-                    sizes=sizes_str,
+                    "filter_log_auto_master_estimate",
+                    "Estimated master tiles: {tiles} (mode={mode}, cap={cap}, threshold={threshold}°, groups before split={groups}).",
+                    tiles=est_tiles,
+                    mode=mode_label,
+                    cap=str(cap_value_int),
+                    threshold=threshold_display,
+                    groups=len(groups),
                 )
                 summary_var.set(summary_text)
                 _log_message(summary_text, level="INFO")
+
+                log_line = (
+                    f"[FilterAuto] N={total_raws} threshold={threshold_deg:.3f} groups={len(groups)} "
+                    f"cap={cap_value_int} -> est_master_tiles={est_tiles} (mode={mode_key})"
+                )
+                _log_message(log_line, level="INFO_DETAIL")
             finally:
                 auto_btn.state(["!disabled"])
 
