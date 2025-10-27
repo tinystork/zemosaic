@@ -1420,8 +1420,8 @@ class ZeMosaicGUI:
                 self.quality_crop_advanced_frame.grid()
             else:
                 self.quality_crop_advanced_frame.grid_remove()
-            except tk.TclError:
-                pass
+        except tk.TclError:
+            pass
 
         state = "normal" if enabled else "disabled"
         for widget in getattr(self, "_quality_crop_inputs", []):
