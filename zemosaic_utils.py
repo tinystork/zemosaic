@@ -198,6 +198,124 @@ except ImportError:
         def getheader(filepath, ext=0):
             print(f"MOCK fits_module_for_utils.getheader CALLED for {filepath} (Astropy not found).")
             return MockFitsHeader()
+
+
+def _merge_header_cards(target_header, source_header) -> None:
+    """Merge ``source_header`` into ``target_header`` while skipping NAXIS cards."""
+
+    if source_header is None:
+        return
+
+    try:
+        from astropy.io.fits import Header as FitsHeader  # type: ignore
+    except Exception:
+        FitsHeader = ()  # type: ignore
+
+    # Handle astropy Header explicitly to preserve comments
+    if FitsHeader and isinstance(source_header, FitsHeader):
+        for card in source_header.cards:
+            keyword = getattr(card, "keyword", None)
+            if not keyword:
+                continue
+            if str(keyword).upper().startswith("NAXIS"):
+                continue
+            target_header[keyword] = (card.value, card.comment)
+        return
+
+    # Generic mapping-like objects (dict, HeaderDict, etc.)
+    if hasattr(source_header, "items"):
+        try:
+            for key, value in source_header.items():
+                if str(key).upper().startswith("NAXIS"):
+                    continue
+                target_header[key] = value
+        except Exception:
+            pass
+        return
+
+    # Fallback: attempt direct ``update``
+    try:
+        target_header.update(source_header)
+    except Exception:
+        pass
+
+
+def write_final_fits_uint16_color_aware(
+    out_path: str,
+    final_img: "np.ndarray",
+    header: "fits_module_for_utils.Header | dict | None" = None,
+    *,
+    force_rgb_planes: bool,
+    legacy_rgb_cube: bool,
+    overwrite: bool = True,
+):
+    """Save final mosaic as uint16 FITS while preserving RGB colour planes."""
+
+    if not ASTROPY_AVAILABLE_IN_UTILS or fits_module_for_utils is None:
+        raise RuntimeError("Astropy FITS writer unavailable; cannot save uint16 mosaic.")
+
+    import numpy as np  # Local import for clarity inside helper
+
+    if final_img is None:
+        raise ValueError("final_img is None")
+
+    arr = np.asarray(final_img)
+    if arr.size == 0:
+        raise ValueError("final_img is empty")
+
+    fits_mod = fits_module_for_utils
+
+    # Normalize mono (H, W, 1) inputs
+    if arr.ndim == 3 and arr.shape[-1] == 1:
+        arr = arr[..., 0]
+
+    is_rgb = bool(force_rgb_planes and arr.ndim == 3 and arr.shape[-1] == 3)
+
+    if is_rgb:
+        if np.issubdtype(arr.dtype, np.floating):
+            arr16 = np.clip(arr, 0.0, 1.0) * 65535.0 + 0.5
+            arr16 = arr16.astype(np.uint16, copy=False)
+        elif arr.dtype != np.uint16:
+            arr16 = arr.astype(np.uint16, copy=False)
+        else:
+            arr16 = arr
+
+        data = np.moveaxis(arr16, -1, 0)
+        primary_hdu = fits_mod.PrimaryHDU(data=data)
+        hdr = primary_hdu.header
+        _merge_header_cards(hdr, header)
+        hdr["ZEMO16"] = (True, "Saved as uint16")
+        hdr["ZEMORGB"] = (True, "RGB planes present")
+        hdr["ZEMOLEG"] = (bool(legacy_rgb_cube), "Legacy RGB cube mode")
+        hdr["CHANNELS"] = (3, "Number of color channels")
+        hdul = fits_mod.HDUList([primary_hdu])
+    else:
+        if np.issubdtype(arr.dtype, np.floating):
+            arr16 = np.clip(arr, 0.0, 1.0) * 65535.0 + 0.5
+            arr16 = arr16.astype(np.uint16, copy=False)
+        elif arr.dtype != np.uint16:
+            arr16 = arr.astype(np.uint16, copy=False)
+        else:
+            arr16 = arr
+
+        primary_hdu = fits_mod.PrimaryHDU(data=arr16)
+        hdr = primary_hdu.header
+        _merge_header_cards(hdr, header)
+        hdr["ZEMO16"] = (True, "Saved as uint16")
+        hdr["ZEMORGB"] = (False, "No separate RGB planes")
+        hdr["ZEMOLEG"] = (bool(legacy_rgb_cube), "Legacy RGB cube mode")
+        hdr["CHANNELS"] = (1, "Number of color channels")
+        hdul = fits_mod.HDUList([primary_hdu])
+
+    try:
+        hdul.writeto(out_path, overwrite=overwrite, output_verify="fix")
+    finally:
+        if hasattr(hdul, "close"):
+            try:
+                hdul.close()
+            except Exception:
+                pass
+
     
     fits_module_for_utils = MockFitsModule()
     print("AVERTISSEMENT (zemosaic_utils): Astropy (fits) non trouvé. Fonctionnalités FITS limitées/mockées.")
