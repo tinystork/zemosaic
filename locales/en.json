@@ -362,7 +362,7 @@
     "gui_memmap_cleanup": "Delete *.dat when finished",
     "gui_auto_limit_frames": "Auto limit frames per master tile (system stability)",
     "max_raw_per_master_tile_label": "Max raw per master tile",
-    "max_raw_per_master_tile_note": "0 = automatic (calculated). Positive value = maximum raw images per master tile.",
+    "max_raw_per_master_tile_note": "0 = auto (honours RAM & dataset size; never merges clusters, only splits oversized ones; tries to keep ≥14 tiles).",
     "reject_winsor_info_channel_progress": "Winsorized Sigma Clip processing channel {channel}...",
     "reject_winsor_info_mono_progress": "Winsorized Sigma Clip processing monochrome data...",
 
@@ -445,6 +445,9 @@
     "filter_log_resolved_n": "Resolved WCS for {n} files.",
     "filter_log_no_missing_wcs": "All listed files already include a WCS solution.",
     "filter_log_groups_summary": "Prepared {g} group(s), sizes: {sizes}.",
+    "filter_log_auto_master_estimate": "Estimated master tiles: {tiles} (mode={mode}, cap={cap}, threshold={threshold}°, groups before split={groups}).",
+    "filter_log_auto_master_mode_auto": "auto",
+    "filter_log_auto_master_mode_manual": "manual",
     "filter_warn_astap_missing": "ASTAP executable not configured; skipping resolution.",
     "filter_warn_worker_missing": "Auto-grouping disabled because the processing worker module failed to load: {error}",
     "filter_select_all": "Select all",
