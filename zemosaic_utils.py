@@ -288,6 +288,12 @@ def write_final_fits_uint16_color_aware(
         hdr["ZEMORGB"] = (True, "RGB planes present")
         hdr["ZEMOLEG"] = (bool(legacy_rgb_cube), "Legacy RGB cube mode")
         hdr["CHANNELS"] = (3, "Number of color channels")
+        # Forcer le scaling standard pour 16-bit non signé
+        hdr["BITPIX"] = 16
+        hdr["BSCALE"] = (1, "Unsigned 16-bit scaling")
+        hdr["BZERO"]  = (32768, "Unsigned 16-bit zero point")
+        hdr["DATAMIN"] = (0, "Display hint")
+        hdr["DATAMAX"] = (65535, "Display hint")
         hdul = fits_mod.HDUList([primary_hdu])
     else:
         if np.issubdtype(arr.dtype, np.floating):
