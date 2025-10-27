@@ -272,8 +272,24 @@ def write_final_fits_uint16_color_aware(
     is_rgb = bool(force_rgb_planes and arr.ndim == 3 and arr.shape[-1] == 3)
 
     if np.issubdtype(arr.dtype, np.floating):
-        u16 = np.clip(arr, 0.0, 1.0) * 65535.0 + 0.5
-        u16 = u16.astype(np.uint16, copy=False)
+        arr_float = _ensure_float32_no_nan(arr)
+
+        finite_mask = np.isfinite(arr_float)
+        if not np.any(finite_mask):
+            u16 = np.zeros(arr_float.shape, dtype=np.uint16)
+        else:
+            finite_vals = arr_float[finite_mask]
+            vmin = float(np.nanmin(finite_vals))
+            vmax = float(np.nanmax(finite_vals))
+
+            if 0.0 <= vmin and vmax <= 1.0 + 1e-6:
+                scaled = np.clip(arr_float, 0.0, 1.0) * 65535.0 + 0.5
+                u16 = scaled.astype(np.uint16, copy=False)
+            elif 0.0 <= vmin and vmax <= 65535.0:
+                clipped = np.clip(arr_float, 0.0, 65535.0) + 0.5
+                u16 = clipped.astype(np.uint16, copy=False)
+            else:
+                u16 = _rescale_to_u16(arr_float)
     elif arr.dtype != np.uint16:
         u16 = arr.astype(np.uint16, copy=False)
     else:
@@ -288,13 +304,6 @@ def write_final_fits_uint16_color_aware(
         _merge_header_cards(hdr, header)
         hdr["ZEMORGB"] = (True, "RGB planes present")
         hdr["CHANNELS"] = (3, "Number of color channels")
-        # Forcer le scaling standard pour 16-bit non signé
-        hdr["BITPIX"] = 16
-        hdr["BSCALE"] = (1, "Unsigned 16-bit scaling")
-        hdr["BZERO"]  = (32768, "Unsigned 16-bit zero point")
-        hdr["DATAMIN"] = (0, "Display hint")
-        hdr["DATAMAX"] = (65535, "Display hint")
-        hdul = fits_mod.HDUList([primary_hdu])
     else:
         primary_hdu = fits_mod.PrimaryHDU(data=i16)
         hdr = primary_hdu.header
