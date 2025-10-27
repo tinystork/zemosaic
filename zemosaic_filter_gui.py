@@ -28,6 +28,7 @@ from __future__ import annotations
 from typing import List, Dict, Any, Optional
 from collections.abc import Iterable
 from dataclasses import asdict
+import inspect
 import math
 import os
 import sys
@@ -1721,22 +1722,66 @@ def launch_filter_interface(
                 }
                 cap_value = manual_master_cap_value if manual_master_cap_value > 0 else 0
 
+                supports_cap_details = False
                 if callable(compute_auto_cap_func):
                     try:
-                        result = compute_auto_cap_func(
-                            total_raws=total_raws,
-                            resource_info=resource_info,
-                            per_frame_info=per_frame_info,
-                            user_value=manual_master_cap_value,
-                            min_tiles_floor=14,
-                            return_details=True,
-                        )
+                        sig = inspect.signature(compute_auto_cap_func)
+                        supports_cap_details = "return_details" in sig.parameters
+                    except Exception:
+                        supports_cap_details = False
+
+                    result = None
+                    try:
+                        if supports_cap_details:
+                            result = compute_auto_cap_func(
+                                total_raws=total_raws,
+                                resource_info=resource_info,
+                                per_frame_info=per_frame_info,
+                                user_value=manual_master_cap_value,
+                                min_tiles_floor=14,
+                                return_details=True,
+                            )
+                        else:
+                            result = compute_auto_cap_func(
+                                total_raws=total_raws,
+                                resource_info=resource_info,
+                                per_frame_info=per_frame_info,
+                                user_value=manual_master_cap_value,
+                                min_tiles_floor=14,
+                            )
+                    except TypeError as exc_type:
+                        if supports_cap_details:
+                            try:
+                                result = compute_auto_cap_func(
+                                    total_raws=total_raws,
+                                    resource_info=resource_info,
+                                    per_frame_info=per_frame_info,
+                                    user_value=manual_master_cap_value,
+                                    min_tiles_floor=14,
+                                )
+                                supports_cap_details = False
+                            except Exception as exc_retry:
+                                _log_message(
+                                    f"Auto-cap computation failed after fallback: {exc_retry}",
+                                    level="WARN",
+                                )
+                                result = None
+                        else:
+                            _log_message(f"Auto-cap computation failed: {exc_type}", level="WARN")
+                            result = None
+                    except Exception as exc:
+                        _log_message(f"Auto-cap computation failed: {exc}", level="WARN")
+                        result = None
+
+                    if result is not None:
                         if isinstance(result, tuple) and len(result) == 2:
                             cap_value, cap_details = result
                         else:
-                            cap_value = int(result)
-                    except Exception as exc:
-                        _log_message(f"Auto-cap computation failed: {exc}", level="WARN")
+                            try:
+                                cap_value = int(result)
+                            except Exception:
+                                cap_value = manual_master_cap_value if manual_master_cap_value > 0 else 0
+                    else:
                         cap_value = manual_master_cap_value if manual_master_cap_value > 0 else 0
 
                 try:

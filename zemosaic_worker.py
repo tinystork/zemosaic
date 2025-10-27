@@ -819,61 +819,6 @@ def _enforce_master_tile_cap(
     return new_groups, any_split
 
 
-def compute_auto_max_raw_per_master_tile(
-    total_raws: int,
-    resource_info: dict,
-    per_frame_info: dict,
-    *,
-    user_value: int | None,
-    min_tiles_floor: int = 14,
-    progress_callback: Callable | None = None,
-) -> int:
-    """Determine the cap used to split oversized clustering groups."""
-
-    resource_info = dict(resource_info or {})
-    per_frame_info = dict(per_frame_info or {})
-
-    caps = _compute_auto_tile_caps(resource_info, per_frame_info, policy_max=50, policy_min=8)
-    cap_ram = int(max(8, min(50, caps.get("cap", 50))))
-
-    N = int(max(0, total_raws))
-    if N <= 150:
-        cap_rule = 10
-    elif N <= 400:
-        cap_rule = 8
-    elif N <= 3000:
-        cap_rule = 8
-    elif N <= 12000:
-        cap_rule = 6
-    else:
-        cap_rule = 6
-
-    if user_value and user_value > 0:
-        C = int(user_value)
-    else:
-        C = int(min(cap_ram, cap_rule))
-
-    floor_tiles = max(1, int(min_tiles_floor))
-    if N > 0 and C > 0:
-        tiles_est = max(1, N // C)
-        if tiles_est < floor_tiles:
-            C = max(4, N // floor_tiles)
-
-    C = int(max(4, min(200, C)))
-
-    try:
-        _log_and_callback(
-            f"[AutoCap] N={N} cap_ram={cap_ram} cap_rule={cap_rule} -> C={C}",
-            prog=None,
-            lvl="INFO_DETAIL",
-            callback=progress_callback,
-        )
-    except Exception:
-        pass
-
-    return C
-
-
 def _extract_timestamp(info: dict, fallback: float) -> float:
     header = info.get("header") if isinstance(info, dict) else None
     if header is not None:
@@ -5483,18 +5428,105 @@ def run_hierarchical_mosaic(
     except Exception:
         user_max_for_auto_cap = 0
 
-    auto_cap_value, auto_cap_info = compute_auto_max_raw_per_master_tile(
-        total_raws=total_raws,
-        resource_info=resource_probe_info or {},
-        per_frame_info=per_frame_info or {},
-        user_value=user_max_for_auto_cap,
-        min_tiles_floor=14,
-        return_details=True,
-    )
+    auto_cap_info: dict[str, int | str | None] = {
+        "total_raws": int(total_raws),
+        "cap_ram": None,
+        "cap_rule": None,
+        "cap_final": None,
+        "mode": "manual" if user_max_for_auto_cap and user_max_for_auto_cap > 0 else "auto",
+    }
+
+    compute_cap_fn = compute_auto_max_raw_per_master_tile
+    supports_details = False
+    try:
+        sig = inspect.signature(compute_cap_fn)
+        supports_details = "return_details" in sig.parameters
+    except Exception:
+        supports_details = False
+
+    auto_cap_result = None
+    try:
+        if supports_details:
+            auto_cap_result = compute_cap_fn(
+                total_raws=total_raws,
+                resource_info=resource_probe_info or {},
+                per_frame_info=per_frame_info or {},
+                user_value=user_max_for_auto_cap,
+                min_tiles_floor=14,
+                return_details=True,
+            )
+        else:
+            auto_cap_result = compute_cap_fn(
+                total_raws=total_raws,
+                resource_info=resource_probe_info or {},
+                per_frame_info=per_frame_info or {},
+                user_value=user_max_for_auto_cap,
+                min_tiles_floor=14,
+            )
+    except TypeError as exc_type:
+        # Older helper versions may not accept ``return_details`` – retry without it.
+        if supports_details:
+            try:
+                auto_cap_result = compute_cap_fn(
+                    total_raws=total_raws,
+                    resource_info=resource_probe_info or {},
+                    per_frame_info=per_frame_info or {},
+                    user_value=user_max_for_auto_cap,
+                    min_tiles_floor=14,
+                )
+                supports_details = False
+            except Exception as exc_retry:
+                _log_and_callback(
+                    f"[AutoCap] Fallback failed after TypeError: {exc_retry}",
+                    prog=None,
+                    lvl="WARN",
+                    callback=progress_callback,
+                )
+                auto_cap_result = None
+        else:
+            _log_and_callback(
+                f"[AutoCap] Auto-cap computation failed: {exc_type}",
+                prog=None,
+                lvl="WARN",
+                callback=progress_callback,
+            )
+            auto_cap_result = None
+    except Exception as exc_cap:
+        _log_and_callback(
+            f"[AutoCap] Auto-cap computation failed: {exc_cap}",
+            prog=None,
+            lvl="WARN",
+            callback=progress_callback,
+        )
+        auto_cap_result = None
+
+    if isinstance(auto_cap_result, tuple) and len(auto_cap_result) == 2:
+        auto_cap_value, details = auto_cap_result
+        if isinstance(details, dict):
+            auto_cap_info.update({
+                "total_raws": details.get("total_raws", auto_cap_info["total_raws"]),
+                "cap_ram": details.get("cap_ram", auto_cap_info["cap_ram"]),
+                "cap_rule": details.get("cap_rule", auto_cap_info["cap_rule"]),
+                "cap_final": details.get("cap_final", auto_cap_info["cap_final"]),
+                "mode": details.get("mode", auto_cap_info["mode"]),
+            })
+    elif auto_cap_result is not None:
+        auto_cap_value = auto_cap_result
+    else:
+        auto_cap_value = user_max_for_auto_cap if user_max_for_auto_cap and user_max_for_auto_cap > 0 else 0
+
+    try:
+        auto_cap_value_int = int(auto_cap_value)
+    except Exception:
+        auto_cap_value_int = 0
+
+    if auto_cap_info.get("cap_final") is None:
+        auto_cap_info["cap_final"] = auto_cap_value_int
+    auto_cap_info["total_raws"] = int(auto_cap_info.get("total_raws", total_raws) or total_raws)
 
     cap_log_message = (
-        f"[AutoCap] N={auto_cap_info['total_raws']} cap_ram={auto_cap_info['cap_ram']} "
-        f"cap_rule={auto_cap_info['cap_rule']} -> C={auto_cap_info['cap_final']}"
+        f"[AutoCap] N={auto_cap_info.get('total_raws')} cap_ram={auto_cap_info.get('cap_ram')} "
+        f"cap_rule={auto_cap_info.get('cap_rule')} -> C={auto_cap_info.get('cap_final')}"
     )
     if auto_cap_info.get("mode") == "manual":
         cap_log_message += " (manual override)"
@@ -5508,7 +5540,7 @@ def run_hierarchical_mosaic(
     except Exception:
         pass
 
-    effective_cap = int(auto_cap_value) if auto_cap_value else 0
+    effective_cap = int(auto_cap_value_int) if auto_cap_value_int else 0
     target_groups_value = target_groups if "target_groups" in locals() else 0
     manual_override_active = bool(user_max_for_auto_cap and user_max_for_auto_cap > 0)
     if (
