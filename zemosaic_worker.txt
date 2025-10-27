@@ -1,0 +1,774 @@
+2025-10-26 15:22:55,515 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:947 - Logging pour ZeMosaicWorker initialisé. Logs écrits dans: F:\seescan\env\zemosaic\zemosaic_worker.log
+2025-10-26 15:22:55,619 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:1009 - Bibliothèque Astropy importée.
+2025-10-26 15:22:55,619 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:1022 - Bibliothèque 'reproject' importée.
+2025-10-26 15:22:55,619 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:1041 - Module 'zemosaic_utils' importé.
+2025-10-26 15:22:55,619 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:1043 - Module 'zemosaic_astrometry' importé.
+2025-10-26 15:22:55,619 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:1045 - Module 'zemosaic_align_stack' importé.
+2025-10-26 15:22:55,622 - ZeMosaicWorker - INFO - zemosaic_worker.run_hierarchical_mosaic:3688 - Worker logging level set to DEBUG
+2025-10-26 15:22:55,714 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - CHRONO_START_REQUEST
+2025-10-26 15:22:56,468 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Début Run Hierarchical Mosaic): Proc RSS: 304.5MB, VMS: 1353.8MB. Sys RAM: Avail 9333MB / Total 32469MB (71.3%% used). Sys Swap: Used 4393MB / Total 97038MB (4.5%% used).
+2025-10-26 15:22:56,469 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: run_info_processing_started]
+2025-10-26 15:22:56,469 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: Options Stacking (Master Tiles): Norm='sky_mean', Weight='noise_variance', Reject='winsorized_sigma_clip', Combine='mean']
+2025-10-26 15:22:56,469 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -   Config ASTAP: Exe='astap.exe', Data='astap', Radius=3.0deg, Downsample=2, Sens=100
+2025-10-26 15:22:56,469 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -   Config Workers (GUI): Base demandé='0' (0=auto)
+2025-10-26 15:22:56,469 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -   Options Stacking (Master Tuiles): Norm='sky_mean', Weight='noise_variance', Reject='winsorized_sigma_clip', Combine='mean', RadialWeight=False (Feather=N/A, Power=N/A, Floor=N/A)
+2025-10-26 15:22:56,469 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -   Options Assemblage Final: Méthode='reproject_coadd'
+2025-10-26 15:22:57,150 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Début Phase 1 (Prétraitement)): Proc RSS: 314.9MB, VMS: 1363.7MB. Sys RAM: Avail 9283MB / Total 32469MB (71.4%% used). Sys Swap: Used 4393MB / Total 97038MB (4.5%% used).
+2025-10-26 15:22:57,150 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: run_info_phase1_started_cache]
+2025-10-26 15:22:57,150 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - PHASE_UPDATE:1
+2025-10-26 15:22:57,154 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - run_info_found_potential_fits
+2025-10-26 15:22:57,154 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:0/198
+2025-10-26 15:22:57,155 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Phase 0: header scan start
+2025-10-26 15:22:59,407 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Phase 0: header scan finished — files=198, avg=0.0114s/header
+2025-10-26 15:23:00,047 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:947 - Logging pour ZeMosaicWorker initialisé. Logs écrits dans: F:\seescan\env\zemosaic\zemosaic_worker.log
+2025-10-26 15:23:00,048 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:1009 - Bibliothèque Astropy importée.
+2025-10-26 15:23:00,048 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:1022 - Bibliothèque 'reproject' importée.
+2025-10-26 15:23:00,048 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:1041 - Module 'zemosaic_utils' importé.
+2025-10-26 15:23:00,048 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:1043 - Module 'zemosaic_astrometry' importé.
+2025-10-26 15:23:00,048 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:1045 - Module 'zemosaic_align_stack' importé.
+2025-10-26 15:23:04,335 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: clusterstacks_info_start] (Args: {'num_files': 198, 'threshold': 0.2})
+2025-10-26 15:23:04,429 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: clusterstacks_info_finished] (Args: {'num_groups': 1})
+2025-10-26 15:23:04,559 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - AutoSplit: group #1 N=198 -> 29 subgroups [10,3,6,10,7,6,10,1,10,5,2,10,4,6,10,2,10,10,8,10,5,10,2,6,4,8,10,10,3] (chrono; spatial split=yes; reason=dispersion)
+2025-10-26 15:23:05,967 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - clusterstacks_info_override_threshold
+2025-10-26 15:23:05,967 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - clusterstacks_info_override_target_groups
+2025-10-26 15:23:05,967 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - clusterstacks_info_override_orientation_split
+2025-10-26 15:23:05,968 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Phase 0 filter provided 26 preplanned group(s).
+2025-10-26 15:23:05,968 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Phase 0: selection after filter = 198 files
+2025-10-26 15:23:05,968 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - AutoCaps: per_frame≈15.8 MB, RAM_free≈9284 MB → frames_by_ram=352, cap=10, memmap=off, GPUHint=10, parallel=35
+2025-10-26 15:23:05,968 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - WORKERS_CONFIG: Mode Auto. Base de workers calculée: 12 (75% de 16 processeurs logiques)
+2025-10-26 15:23:05,968 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: WORKERS_PHASE1: Utilisation de 12 worker(s). (Base: 12, Fichiers: 198)]
+2025-10-26 15:23:07,886 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:1/198
+2025-10-26 15:23:08,035 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:27:17
+2025-10-26 15:23:08,035 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:2/198
+2025-10-26 15:23:08,158 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:24:15
+2025-10-26 15:23:08,158 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:3/198
+2025-10-26 15:23:08,276 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:23:20
+2025-10-26 15:23:08,276 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:4/198
+2025-10-26 15:23:08,399 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:22:58
+2025-10-26 15:23:08,400 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:5/198
+2025-10-26 15:23:08,544 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:22:52
+2025-10-26 15:23:08,544 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:6/198
+2025-10-26 15:23:08,726 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:22:57
+2025-10-26 15:23:08,730 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:7/198
+2025-10-26 15:23:08,887 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:21:48
+2025-10-26 15:23:08,895 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:8/198
+2025-10-26 15:23:09,081 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:19:23
+2025-10-26 15:23:09,082 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:9/198
+2025-10-26 15:23:09,285 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:17:31
+2025-10-26 15:23:09,286 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:10/198
+2025-10-26 15:23:09,455 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:15:58
+2025-10-26 15:23:09,462 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:11/198
+2025-10-26 15:23:09,611 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:14:41
+2025-10-26 15:23:09,614 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:12/198
+2025-10-26 15:23:09,789 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:13:39
+2025-10-26 15:23:09,845 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:13/198
+2025-10-26 15:23:10,001 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:12:48
+2025-10-26 15:23:10,002 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:14/198
+2025-10-26 15:23:10,130 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:11:59
+2025-10-26 15:23:10,220 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:15/198
+2025-10-26 15:23:10,351 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:11:22
+2025-10-26 15:23:10,381 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:16/198
+2025-10-26 15:23:10,526 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:10:48
+2025-10-26 15:23:10,527 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:17/198
+2025-10-26 15:23:10,684 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:10:16
+2025-10-26 15:23:10,684 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:18/198
+2025-10-26 15:23:10,815 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:09:47
+2025-10-26 15:23:10,816 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:19/198
+2025-10-26 15:23:10,970 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Phase 1 - Traité 19/198): Proc RSS: 1537.2MB, VMS: 3261.3MB. Sys RAM: Avail 7724MB / Total 32469MB (76.2%% used). Sys Swap: Used 4393MB / Total 97038MB (4.5%% used).
+2025-10-26 15:23:10,971 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:09:21
+2025-10-26 15:23:10,972 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:20/198
+2025-10-26 15:23:11,138 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:08:59
+2025-10-26 15:23:11,141 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:21/198
+2025-10-26 15:23:11,340 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:08:40
+2025-10-26 15:23:11,348 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:22/198
+2025-10-26 15:23:11,741 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:08:30
+2025-10-26 15:23:11,742 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:23/198
+2025-10-26 15:23:11,974 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:08:16
+2025-10-26 15:23:11,978 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:24/198
+2025-10-26 15:23:12,143 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:08:00
+2025-10-26 15:23:12,493 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:25/198
+2025-10-26 15:23:12,624 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:07:55
+2025-10-26 15:23:12,624 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:26/198
+2025-10-26 15:23:12,751 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:07:40
+2025-10-26 15:23:12,804 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:27/198
+2025-10-26 15:23:12,931 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:07:27
+2025-10-26 15:23:12,931 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:28/198
+2025-10-26 15:23:13,068 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:07:14
+2025-10-26 15:23:13,073 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:29/198
+2025-10-26 15:23:13,229 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:07:03
+2025-10-26 15:23:13,234 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:30/198
+2025-10-26 15:23:13,365 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:06:52
+2025-10-26 15:23:13,370 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:31/198
+2025-10-26 15:23:13,528 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:06:42
+2025-10-26 15:23:13,530 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:32/198
+2025-10-26 15:23:13,678 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:06:32
+2025-10-26 15:23:13,678 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:33/198
+2025-10-26 15:23:13,830 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:06:23
+2025-10-26 15:23:13,831 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:34/198
+2025-10-26 15:23:14,037 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:06:16
+2025-10-26 15:23:14,040 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:35/198
+2025-10-26 15:23:14,187 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:06:08
+2025-10-26 15:23:14,188 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:36/198
+2025-10-26 15:23:14,335 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:06:00
+2025-10-26 15:23:14,500 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:37/198
+2025-10-26 15:23:14,649 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:05:56
+2025-10-26 15:23:14,650 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:38/198
+2025-10-26 15:23:14,804 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Phase 1 - Traité 38/198): Proc RSS: 2165.8MB, VMS: 4090.4MB. Sys RAM: Avail 6792MB / Total 32469MB (79.1%% used). Sys Swap: Used 4393MB / Total 97038MB (4.5%% used).
+2025-10-26 15:23:14,807 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:05:49
+2025-10-26 15:23:14,883 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:39/198
+2025-10-26 15:23:15,036 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:05:44
+2025-10-26 15:23:15,093 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:40/198
+2025-10-26 15:23:15,220 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:05:38
+2025-10-26 15:23:15,276 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:41/198
+2025-10-26 15:23:15,398 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:05:33
+2025-10-26 15:23:15,478 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:42/198
+2025-10-26 15:23:15,655 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:05:29
+2025-10-26 15:23:15,656 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:43/198
+2025-10-26 15:23:15,860 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:05:24
+2025-10-26 15:23:15,892 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:44/198
+2025-10-26 15:23:16,145 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:05:21
+2025-10-26 15:23:16,145 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:45/198
+2025-10-26 15:23:16,307 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:05:16
+2025-10-26 15:23:16,376 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:46/198
+2025-10-26 15:23:16,540 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:05:12
+2025-10-26 15:23:16,540 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:47/198
+2025-10-26 15:23:16,690 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:05:08
+2025-10-26 15:23:16,858 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:48/198
+2025-10-26 15:23:17,055 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:05:06
+2025-10-26 15:23:17,076 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:49/198
+2025-10-26 15:23:17,223 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:05:02
+2025-10-26 15:23:17,259 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:50/198
+2025-10-26 15:23:17,385 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:04:58
+2025-10-26 15:23:17,385 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:51/198
+2025-10-26 15:23:17,537 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:04:53
+2025-10-26 15:23:17,538 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:52/198
+2025-10-26 15:23:17,780 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:04:51
+2025-10-26 15:23:17,781 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:53/198
+2025-10-26 15:23:17,947 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:04:47
+2025-10-26 15:23:17,989 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:54/198
+2025-10-26 15:23:18,162 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:04:44
+2025-10-26 15:23:18,164 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:55/198
+2025-10-26 15:23:18,339 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:04:41
+2025-10-26 15:23:18,371 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:56/198
+2025-10-26 15:23:18,517 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:04:37
+2025-10-26 15:23:18,522 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:57/198
+2025-10-26 15:23:18,681 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Phase 1 - Traité 57/198): Proc RSS: 2628.0MB, VMS: 4484.2MB. Sys RAM: Avail 6252MB / Total 32469MB (80.7%% used). Sys Swap: Used 4393MB / Total 97038MB (4.5%% used).
+2025-10-26 15:23:18,683 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:04:34
+2025-10-26 15:23:18,728 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:58/198
+2025-10-26 15:23:18,861 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:04:31
+2025-10-26 15:23:18,877 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:59/198
+2025-10-26 15:23:19,031 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:04:28
+2025-10-26 15:23:19,101 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:60/198
+2025-10-26 15:23:19,237 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:04:25
+2025-10-26 15:23:19,273 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:61/198
+2025-10-26 15:23:19,408 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:04:22
+2025-10-26 15:23:19,421 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:62/198
+2025-10-26 15:23:19,562 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:04:19
+2025-10-26 15:23:19,563 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:63/198
+2025-10-26 15:23:19,700 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:04:16
+2025-10-26 15:23:19,724 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:64/198
+2025-10-26 15:23:19,873 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:04:14
+2025-10-26 15:23:19,897 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:65/198
+2025-10-26 15:23:20,069 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:04:11
+2025-10-26 15:23:20,071 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:66/198
+2025-10-26 15:23:20,256 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:04:09
+2025-10-26 15:23:20,304 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:67/198
+2025-10-26 15:23:20,491 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:04:07
+2025-10-26 15:23:20,557 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:68/198
+2025-10-26 15:23:20,709 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:04:05
+2025-10-26 15:23:20,744 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:69/198
+2025-10-26 15:23:20,900 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:04:03
+2025-10-26 15:23:21,039 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:70/198
+2025-10-26 15:23:21,181 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:04:02
+2025-10-26 15:23:21,181 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:71/198
+2025-10-26 15:23:21,323 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:59
+2025-10-26 15:23:21,451 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:72/198
+2025-10-26 15:23:21,594 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:58
+2025-10-26 15:23:21,606 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:73/198
+2025-10-26 15:23:21,737 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:56
+2025-10-26 15:23:21,775 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:74/198
+2025-10-26 15:23:21,908 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:54
+2025-10-26 15:23:21,909 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:75/198
+2025-10-26 15:23:22,058 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:51
+2025-10-26 15:23:22,093 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:76/198
+2025-10-26 15:23:22,257 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Phase 1 - Traité 76/198): Proc RSS: 2994.3MB, VMS: 4856.3MB. Sys RAM: Avail 5752MB / Total 32469MB (82.3%% used). Sys Swap: Used 4393MB / Total 97038MB (4.5%% used).
+2025-10-26 15:23:22,258 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:50
+2025-10-26 15:23:22,365 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:77/198
+2025-10-26 15:23:22,501 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:48
+2025-10-26 15:23:22,503 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:78/198
+2025-10-26 15:23:22,640 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:46
+2025-10-26 15:23:22,640 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:79/198
+2025-10-26 15:23:22,780 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:44
+2025-10-26 15:23:22,810 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:80/198
+2025-10-26 15:23:22,946 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:42
+2025-10-26 15:23:23,010 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:81/198
+2025-10-26 15:23:23,175 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:41
+2025-10-26 15:23:23,326 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:82/198
+2025-10-26 15:23:23,475 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:40
+2025-10-26 15:23:23,477 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:83/198
+2025-10-26 15:23:23,685 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:38
+2025-10-26 15:23:23,807 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:84/198
+2025-10-26 15:23:23,964 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:38
+2025-10-26 15:23:24,000 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:85/198
+2025-10-26 15:23:24,155 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:36
+2025-10-26 15:23:24,175 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:86/198
+2025-10-26 15:23:24,307 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:34
+2025-10-26 15:23:24,309 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:87/198
+2025-10-26 15:23:24,443 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:32
+2025-10-26 15:23:24,529 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:88/198
+2025-10-26 15:23:24,706 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:31
+2025-10-26 15:23:24,789 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:89/198
+2025-10-26 15:23:24,991 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:31
+2025-10-26 15:23:24,994 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:90/198
+2025-10-26 15:23:25,143 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:29
+2025-10-26 15:23:25,185 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:91/198
+2025-10-26 15:23:25,335 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:27
+2025-10-26 15:23:25,336 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:92/198
+2025-10-26 15:23:25,512 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:26
+2025-10-26 15:23:25,512 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:93/198
+2025-10-26 15:23:25,664 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:24
+2025-10-26 15:23:25,687 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:94/198
+2025-10-26 15:23:25,879 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:23
+2025-10-26 15:23:25,881 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:95/198
+2025-10-26 15:23:26,053 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Phase 1 - Traité 95/198): Proc RSS: 3431.9MB, VMS: 5189.1MB. Sys RAM: Avail 5311MB / Total 32469MB (83.6%% used). Sys Swap: Used 4393MB / Total 97038MB (4.5%% used).
+2025-10-26 15:23:26,060 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:22
+2025-10-26 15:23:26,144 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:96/198
+2025-10-26 15:23:26,294 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:21
+2025-10-26 15:23:26,321 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:97/198
+2025-10-26 15:23:26,463 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:19
+2025-10-26 15:23:26,547 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:98/198
+2025-10-26 15:23:26,667 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:18
+2025-10-26 15:23:26,667 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:99/198
+2025-10-26 15:23:26,822 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:17
+2025-10-26 15:23:26,936 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:100/198
+2025-10-26 15:23:27,109 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:16
+2025-10-26 15:23:27,280 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:101/198
+2025-10-26 15:23:27,446 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:16
+2025-10-26 15:23:27,447 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:102/198
+2025-10-26 15:23:27,625 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:14
+2025-10-26 15:23:27,642 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:103/198
+2025-10-26 15:23:27,852 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:13
+2025-10-26 15:23:27,883 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:104/198
+2025-10-26 15:23:28,052 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:12
+2025-10-26 15:23:28,053 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:105/198
+2025-10-26 15:23:28,219 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:11
+2025-10-26 15:23:28,376 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:106/198
+2025-10-26 15:23:28,543 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:11
+2025-10-26 15:23:28,545 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:107/198
+2025-10-26 15:23:28,724 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:09
+2025-10-26 15:23:28,880 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:108/198
+2025-10-26 15:23:29,079 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:09
+2025-10-26 15:23:29,086 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:109/198
+2025-10-26 15:23:29,275 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:08
+2025-10-26 15:23:29,280 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:110/198
+2025-10-26 15:23:29,450 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:07
+2025-10-26 15:23:29,468 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:111/198
+2025-10-26 15:23:29,658 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:06
+2025-10-26 15:23:29,663 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:112/198
+2025-10-26 15:23:29,913 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:05
+2025-10-26 15:23:29,920 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:113/198
+2025-10-26 15:23:30,204 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:05
+2025-10-26 15:23:30,204 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:114/198
+2025-10-26 15:23:30,430 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Phase 1 - Traité 114/198): Proc RSS: 3936.8MB, VMS: 5727.4MB. Sys RAM: Avail 4998MB / Total 32469MB (84.6%% used). Sys Swap: Used 4393MB / Total 97038MB (4.5%% used).
+2025-10-26 15:23:30,433 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:04
+2025-10-26 15:23:30,652 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:115/198
+2025-10-26 15:23:30,807 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:04
+2025-10-26 15:23:30,810 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:116/198
+2025-10-26 15:23:30,955 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:02
+2025-10-26 15:23:31,000 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:117/198
+2025-10-26 15:23:31,136 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:01
+2025-10-26 15:23:31,222 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:118/198
+2025-10-26 15:23:31,390 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:01
+2025-10-26 15:23:31,390 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:119/198
+2025-10-26 15:23:31,543 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:59
+2025-10-26 15:23:31,570 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:120/198
+2025-10-26 15:23:31,732 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:58
+2025-10-26 15:23:31,732 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:121/198
+2025-10-26 15:23:31,912 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:57
+2025-10-26 15:23:31,927 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:122/198
+2025-10-26 15:23:32,088 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:56
+2025-10-26 15:23:32,091 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:123/198
+2025-10-26 15:23:32,273 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:55
+2025-10-26 15:23:32,355 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:124/198
+2025-10-26 15:23:32,539 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:55
+2025-10-26 15:23:32,540 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:125/198
+2025-10-26 15:23:32,722 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:54
+2025-10-26 15:23:32,761 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:126/198
+2025-10-26 15:23:32,914 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:53
+2025-10-26 15:23:33,075 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:127/198
+2025-10-26 15:23:33,194 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:52
+2025-10-26 15:23:33,195 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:128/198
+2025-10-26 15:23:33,328 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:51
+2025-10-26 15:23:33,441 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:129/198
+2025-10-26 15:23:33,569 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:50
+2025-10-26 15:23:33,580 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:130/198
+2025-10-26 15:23:33,715 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:49
+2025-10-26 15:23:33,720 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:131/198
+2025-10-26 15:23:33,904 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:48
+2025-10-26 15:23:33,929 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:132/198
+2025-10-26 15:23:34,098 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:47
+2025-10-26 15:23:34,099 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:133/198
+2025-10-26 15:23:34,255 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Phase 1 - Traité 133/198): Proc RSS: 4353.6MB, VMS: 6185.0MB. Sys RAM: Avail 4614MB / Total 32469MB (85.8%% used). Sys Swap: Used 4393MB / Total 97038MB (4.5%% used).
+2025-10-26 15:23:34,255 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:46
+2025-10-26 15:23:34,284 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:134/198
+2025-10-26 15:23:34,456 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:45
+2025-10-26 15:23:34,486 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:135/198
+2025-10-26 15:23:34,643 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:44
+2025-10-26 15:23:34,674 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:136/198
+2025-10-26 15:23:34,828 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:43
+2025-10-26 15:23:34,833 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:137/198
+2025-10-26 15:23:34,979 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:42
+2025-10-26 15:23:35,075 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:138/198
+2025-10-26 15:23:35,231 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:42
+2025-10-26 15:23:35,396 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:139/198
+2025-10-26 15:23:35,535 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:41
+2025-10-26 15:23:35,540 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:140/198
+2025-10-26 15:23:35,683 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:40
+2025-10-26 15:23:35,768 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:141/198
+2025-10-26 15:23:36,017 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:40
+2025-10-26 15:23:36,058 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:142/198
+2025-10-26 15:23:36,276 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:39
+2025-10-26 15:23:36,277 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:143/198
+2025-10-26 15:23:36,424 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:38
+2025-10-26 15:23:36,443 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:144/198
+2025-10-26 15:23:36,645 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:38
+2025-10-26 15:23:36,646 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:145/198
+2025-10-26 15:23:36,837 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:37
+2025-10-26 15:23:36,870 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:146/198
+2025-10-26 15:23:37,035 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:36
+2025-10-26 15:23:37,220 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:147/198
+2025-10-26 15:23:37,353 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:36
+2025-10-26 15:23:37,353 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:148/198
+2025-10-26 15:23:37,522 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:35
+2025-10-26 15:23:37,523 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:149/198
+2025-10-26 15:23:37,707 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:34
+2025-10-26 15:23:37,737 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:150/198
+2025-10-26 15:23:37,890 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:33
+2025-10-26 15:23:37,978 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:151/198
+2025-10-26 15:23:38,125 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:32
+2025-10-26 15:23:38,158 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:152/198
+2025-10-26 15:23:38,319 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Phase 1 - Traité 152/198): Proc RSS: 4882.7MB, VMS: 6658.9MB. Sys RAM: Avail 4159MB / Total 32469MB (87.2%% used). Sys Swap: Used 4393MB / Total 97038MB (4.5%% used).
+2025-10-26 15:23:38,319 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:32
+2025-10-26 15:23:38,334 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:153/198
+2025-10-26 15:23:38,466 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:31
+2025-10-26 15:23:38,573 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:154/198
+2025-10-26 15:23:38,721 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:30
+2025-10-26 15:23:38,746 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:155/198
+2025-10-26 15:23:38,899 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:29
+2025-10-26 15:23:38,923 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:156/198
+2025-10-26 15:23:39,103 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:29
+2025-10-26 15:23:39,175 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:157/198
+2025-10-26 15:23:39,318 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:28
+2025-10-26 15:23:39,343 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:158/198
+2025-10-26 15:23:39,504 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:27
+2025-10-26 15:23:39,645 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:159/198
+2025-10-26 15:23:39,799 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:27
+2025-10-26 15:23:39,801 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:160/198
+2025-10-26 15:23:39,970 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:26
+2025-10-26 15:23:39,976 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:161/198
+2025-10-26 15:23:40,135 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:25
+2025-10-26 15:23:40,215 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:162/198
+2025-10-26 15:23:40,365 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:24
+2025-10-26 15:23:40,439 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:163/198
+2025-10-26 15:23:40,602 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:24
+2025-10-26 15:23:40,609 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:164/198
+2025-10-26 15:23:40,790 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:23
+2025-10-26 15:23:40,798 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:165/198
+2025-10-26 15:23:41,006 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:22
+2025-10-26 15:23:41,142 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:166/198
+2025-10-26 15:23:41,349 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:22
+2025-10-26 15:23:41,434 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:167/198
+2025-10-26 15:23:41,597 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:22
+2025-10-26 15:23:41,633 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:168/198
+2025-10-26 15:23:41,810 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:21
+2025-10-26 15:23:41,811 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:169/198
+2025-10-26 15:23:41,975 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:20
+2025-10-26 15:23:41,975 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:170/198
+2025-10-26 15:23:42,176 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:19
+2025-10-26 15:23:42,268 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:171/198
+2025-10-26 15:23:42,442 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Phase 1 - Traité 171/198): Proc RSS: 5306.6MB, VMS: 7116.5MB. Sys RAM: Avail 4018MB / Total 32469MB (87.6%% used). Sys Swap: Used 4393MB / Total 97038MB (4.5%% used).
+2025-10-26 15:23:42,443 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:19
+2025-10-26 15:23:42,541 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:172/198
+2025-10-26 15:23:42,758 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:19
+2025-10-26 15:23:42,849 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:173/198
+2025-10-26 15:23:43,055 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:18
+2025-10-26 15:23:43,056 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:174/198
+2025-10-26 15:23:43,235 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:17
+2025-10-26 15:23:43,268 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:175/198
+2025-10-26 15:23:43,474 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:17
+2025-10-26 15:23:43,538 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:176/198
+2025-10-26 15:23:43,721 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:16
+2025-10-26 15:23:43,723 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:177/198
+2025-10-26 15:23:43,892 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:15
+2025-10-26 15:23:44,071 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:178/198
+2025-10-26 15:23:44,240 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:15
+2025-10-26 15:23:44,241 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:179/198
+2025-10-26 15:23:44,383 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:14
+2025-10-26 15:23:44,517 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:180/198
+2025-10-26 15:23:44,682 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:14
+2025-10-26 15:23:44,775 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:181/198
+2025-10-26 15:23:44,928 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:13
+2025-10-26 15:23:44,928 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:182/198
+2025-10-26 15:23:45,082 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:13
+2025-10-26 15:23:45,082 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:183/198
+2025-10-26 15:23:45,223 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:12
+2025-10-26 15:23:45,265 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:184/198
+2025-10-26 15:23:45,444 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:11
+2025-10-26 15:23:45,480 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:185/198
+2025-10-26 15:23:45,639 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:10
+2025-10-26 15:23:45,705 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:186/198
+2025-10-26 15:23:45,879 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:10
+2025-10-26 15:23:45,896 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:187/198
+2025-10-26 15:23:46,058 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:09
+2025-10-26 15:23:46,092 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:188/198
+2025-10-26 15:23:46,271 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:09
+2025-10-26 15:23:46,307 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:189/198
+2025-10-26 15:23:46,484 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:08
+2025-10-26 15:23:46,532 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:190/198
+2025-10-26 15:23:46,721 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Phase 1 - Traité 190/198): Proc RSS: 5643.2MB, VMS: 7486.0MB. Sys RAM: Avail 3742MB / Total 32469MB (88.5%% used). Sys Swap: Used 4393MB / Total 97038MB (4.5%% used).
+2025-10-26 15:23:46,724 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:07
+2025-10-26 15:23:46,750 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:191/198
+2025-10-26 15:23:46,880 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:07
+2025-10-26 15:23:46,931 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:192/198
+2025-10-26 15:23:47,059 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:06
+2025-10-26 15:23:47,059 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:193/198
+2025-10-26 15:23:47,174 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:05
+2025-10-26 15:23:47,213 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:194/198
+2025-10-26 15:23:47,340 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:04
+2025-10-26 15:23:47,341 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:195/198
+2025-10-26 15:23:47,464 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:04
+2025-10-26 15:23:47,520 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:196/198
+2025-10-26 15:23:47,661 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:03
+2025-10-26 15:23:47,661 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:197/198
+2025-10-26 15:23:47,795 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:02
+2025-10-26 15:23:47,795 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - RAW_FILE_COUNT_UPDATE:198/198
+2025-10-26 15:23:47,962 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Phase 1 - Traité 198/198): Proc RSS: 5192.2MB, VMS: 6594.1MB. Sys RAM: Avail 4157MB / Total 32469MB (87.2%% used). Sys Swap: Used 4393MB / Total 97038MB (4.5%% used).
+2025-10-26 15:23:47,962 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:01
+2025-10-26 15:23:47,982 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Fin Phase 1 (Prétraitement)): Proc RSS: 5190.9MB, VMS: 6592.5MB. Sys RAM: Avail 4158MB / Total 32469MB (87.2%% used). Sys Swap: Used 4393MB / Total 97038MB (4.5%% used).
+2025-10-26 15:23:47,982 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: run_info_phase1_finished_cache] (Args: {'num_valid_raws': 198})
+2025-10-26 15:23:47,982 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     Temps moyen/brute (P1): 0.21s
+2025-10-26 15:23:47,995 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Début Phase 2 (Clustering)): Proc RSS: 5190.6MB, VMS: 6591.8MB. Sys RAM: Avail 4155MB / Total 32469MB (87.2%% used). Sys Swap: Used 4393MB / Total 97038MB (4.5%% used).
+2025-10-26 15:23:47,995 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: run_info_phase2_started]
+2025-10-26 15:23:47,995 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - PHASE_UPDATE:2
+2025-10-26 15:23:47,996 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Phase 2: using 26 preplanned group(s) from filter UI.
+2025-10-26 15:23:48,160 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Cluster NN stats (deg): P10=0.0000, P50=0.0000, P90=0.0000
+2025-10-26 15:23:48,160 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: Winsor worker limit set to 10 (ProcessPoolExecutor enabled)]
+2025-10-26 15:23:48,160 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Winsor streaming limit set to 10 frame(s) per pass
+2025-10-26 15:23:48,171 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Fin Phase 2): Proc RSS: 5191.7MB, VMS: 6592.8MB. Sys RAM: Avail 4147MB / Total 32469MB (87.2%% used). Sys Swap: Used 4393MB / Total 97038MB (4.5%% used).
+2025-10-26 15:23:48,171 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: run_info_phase2_finished] (Args: {'num_groups': 26})
+2025-10-26 15:23:48,220 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - IO_BENCH: read 1661.3 MB/s (fast), write 475.1 MB/s (fast)
+2025-10-26 15:23:48,220 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - IO_ADAPT: cache read slots set to 2
+2025-10-26 15:23:48,233 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Début Phase 3 (Master Tuiles)): Proc RSS: 5191.7MB, VMS: 6592.8MB. Sys RAM: Avail 4203MB / Total 32469MB (87.1%% used). Sys Swap: Used 4393MB / Total 97038MB (4.5%% used).
+2025-10-26 15:23:48,234 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: run_info_phase3_started_from_cache]
+2025-10-26 15:23:48,234 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - PHASE_UPDATE:3
+2025-10-26 15:23:48,235 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: WORKERS_PHASE3: Utilisation de 4 worker(s). (Base: 12, Ratio 50%, Groupes: 26)]
+2025-10-26 15:23:48,237 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:0/26
+2025-10-26 15:23:48,239 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 10, 'tile_id': 0})
+2025-10-26 15:23:48,240 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     mastertile_0: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean'
+2025-10-26 15:23:48,240 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_reference_set
+2025-10-26 15:23:48,240 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_loading_from_cache_started
+2025-10-26 15:23:48,241 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 3, 'tile_id': 1})
+2025-10-26 15:23:48,241 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     mastertile_1: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean'
+2025-10-26 15:23:48,242 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_reference_set
+2025-10-26 15:23:48,242 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_loading_from_cache_started
+2025-10-26 15:23:48,242 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 6, 'tile_id': 2})
+2025-10-26 15:23:48,242 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     mastertile_2: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean'
+2025-10-26 15:23:48,243 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_reference_set
+2025-10-26 15:23:48,243 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_loading_from_cache_started
+2025-10-26 15:23:48,243 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 10, 'tile_id': 3})
+2025-10-26 15:23:48,244 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     mastertile_3: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean'
+2025-10-26 15:23:48,244 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_reference_set
+2025-10-26 15:23:48,244 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_loading_from_cache_started
+2025-10-26 15:23:49,488 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - IO_ADAPT_RT: cache_read_slots -> 2
+2025-10-26 15:23:53,106 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_started
+2025-10-26 15:23:58,478 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_finished
+2025-10-26 15:23:58,917 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_saved
+2025-10-26 15:23:59,047 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:1/26
+2025-10-26 15:23:59,047 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:06:21
+2025-10-26 15:23:59,049 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 6, 'tile_id': 4})
+2025-10-26 15:23:59,050 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     mastertile_4: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean'
+2025-10-26 15:23:59,050 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_reference_set
+2025-10-26 15:23:59,050 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_loading_from_cache_started
+2025-10-26 15:23:59,983 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_started
+2025-10-26 15:24:06,712 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_started
+2025-10-26 15:24:07,196 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_started
+2025-10-26 15:24:07,333 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_started
+2025-10-26 15:24:08,373 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_finished
+2025-10-26 15:24:08,837 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_saved
+2025-10-26 15:24:08,976 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:2/26
+2025-10-26 15:24:08,976 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:06:10
+2025-10-26 15:24:08,978 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 11, 'tile_id': 5})
+2025-10-26 15:24:08,978 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     mastertile_5: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean'
+2025-10-26 15:24:08,979 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_reference_set
+2025-10-26 15:24:08,979 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_loading_from_cache_started
+2025-10-26 15:24:16,069 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_finished
+2025-10-26 15:24:16,622 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_saved
+2025-10-26 15:24:16,727 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:3/26
+2025-10-26 15:24:16,728 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:05:44
+2025-10-26 15:24:16,729 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 10, 'tile_id': 6})
+2025-10-26 15:24:16,729 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     mastertile_6: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean'
+2025-10-26 15:24:16,730 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_reference_set
+2025-10-26 15:24:16,730 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_loading_from_cache_started
+2025-10-26 15:24:22,306 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_finished
+2025-10-26 15:24:22,529 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_finished
+2025-10-26 15:24:23,097 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_saved
+2025-10-26 15:24:23,231 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:4/26
+2025-10-26 15:24:23,231 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:05:21
+2025-10-26 15:24:23,232 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 5, 'tile_id': 7})
+2025-10-26 15:24:23,232 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     mastertile_7: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean'
+2025-10-26 15:24:23,233 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_reference_set
+2025-10-26 15:24:23,233 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_loading_from_cache_started
+2025-10-26 15:24:23,382 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_saved
+2025-10-26 15:24:23,502 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:5/26
+2025-10-26 15:24:23,513 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Phase 3 - Traité 5/26 tuiles): Proc RSS: 6352.8MB, VMS: 9402.5MB. Sys RAM: Avail 4921MB / Total 32469MB (84.8%% used). Sys Swap: Used 5493MB / Total 97038MB (5.7%% used).
+2025-10-26 15:24:23,522 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:04:30
+2025-10-26 15:24:23,523 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 8})
+2025-10-26 15:24:23,523 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     mastertile_8: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean'
+2025-10-26 15:24:23,524 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_reference_set
+2025-10-26 15:24:23,524 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_loading_from_cache_started
+2025-10-26 15:24:23,684 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_started
+2025-10-26 15:24:25,519 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_started
+2025-10-26 15:24:28,552 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_finished
+2025-10-26 15:24:29,158 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_saved
+2025-10-26 15:24:29,264 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:6/26
+2025-10-26 15:24:29,264 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:04:20
+2025-10-26 15:24:29,265 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 10, 'tile_id': 9})
+2025-10-26 15:24:29,266 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     mastertile_9: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean'
+2025-10-26 15:24:29,266 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_reference_set
+2025-10-26 15:24:29,266 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_loading_from_cache_started
+2025-10-26 15:24:29,862 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_started
+2025-10-26 15:24:30,116 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_started
+2025-10-26 15:24:35,069 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_finished
+2025-10-26 15:24:35,503 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_saved
+2025-10-26 15:24:35,613 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:7/26
+2025-10-26 15:24:35,613 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:04:13
+2025-10-26 15:24:35,614 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 4, 'tile_id': 10})
+2025-10-26 15:24:35,614 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     mastertile_10: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean'
+2025-10-26 15:24:35,615 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_reference_set
+2025-10-26 15:24:35,615 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_loading_from_cache_started
+2025-10-26 15:24:38,985 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_started
+2025-10-26 15:24:40,862 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_started
+2025-10-26 15:24:43,529 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_finished
+2025-10-26 15:24:43,971 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_saved
+2025-10-26 15:24:44,097 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:8/26
+2025-10-26 15:24:44,097 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:04:14
+2025-10-26 15:24:44,098 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 10, 'tile_id': 11})
+2025-10-26 15:24:44,098 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     mastertile_11: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean'
+2025-10-26 15:24:44,099 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_reference_set
+2025-10-26 15:24:44,099 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_loading_from_cache_started
+2025-10-26 15:24:45,059 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_finished
+2025-10-26 15:24:45,479 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_saved
+2025-10-26 15:24:45,602 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:9/26
+2025-10-26 15:24:45,602 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:51
+2025-10-26 15:24:45,603 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 12})
+2025-10-26 15:24:45,603 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     mastertile_12: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean'
+2025-10-26 15:24:45,603 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_reference_set
+2025-10-26 15:24:45,603 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_loading_from_cache_started
+2025-10-26 15:24:47,566 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_started
+2025-10-26 15:24:51,106 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_finished
+2025-10-26 15:24:51,887 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_saved
+2025-10-26 15:24:52,092 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:10/26
+2025-10-26 15:24:52,116 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Phase 3 - Traité 10/26 tuiles): Proc RSS: 8380.8MB, VMS: 10717.1MB. Sys RAM: Avail 2866MB / Total 32469MB (91.2%% used). Sys Swap: Used 5491MB / Total 97038MB (5.7%% used).
+2025-10-26 15:24:52,116 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:46
+2025-10-26 15:24:52,117 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 10, 'tile_id': 13})
+2025-10-26 15:24:52,117 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     mastertile_13: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean'
+2025-10-26 15:24:52,117 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_reference_set
+2025-10-26 15:24:52,117 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_loading_from_cache_started
+2025-10-26 15:24:53,900 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_finished
+2025-10-26 15:24:54,345 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_saved
+2025-10-26 15:24:54,460 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:11/26
+2025-10-26 15:24:54,460 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:29
+2025-10-26 15:24:54,461 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 10, 'tile_id': 14})
+2025-10-26 15:24:54,461 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     mastertile_14: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean'
+2025-10-26 15:24:54,461 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_reference_set
+2025-10-26 15:24:54,461 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_loading_from_cache_started
+2025-10-26 15:24:57,472 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - IO_ADAPT_RT: ph3_workers -> 3
+2025-10-26 15:24:57,472 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - IO_ADAPT_RT: cache_read_slots -> 1
+2025-10-26 15:24:58,425 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_finished
+2025-10-26 15:24:58,738 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - IO_ADAPT_RT: cache_read_slots -> 2
+2025-10-26 15:24:58,944 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_saved
+2025-10-26 15:24:59,195 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:12/26
+2025-10-26 15:24:59,196 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:20
+2025-10-26 15:24:59,198 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 8, 'tile_id': 15})
+2025-10-26 15:24:59,199 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     mastertile_15: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean'
+2025-10-26 15:24:59,199 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_reference_set
+2025-10-26 15:24:59,199 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_loading_from_cache_started
+2025-10-26 15:25:02,640 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_started
+2025-10-26 15:25:09,307 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_started
+2025-10-26 15:25:09,473 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_started
+2025-10-26 15:25:09,863 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_started
+2025-10-26 15:25:15,708 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_finished
+2025-10-26 15:25:16,218 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_saved
+2025-10-26 15:25:16,341 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:13/26
+2025-10-26 15:25:16,341 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:35
+2025-10-26 15:25:16,342 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 10, 'tile_id': 16})
+2025-10-26 15:25:16,342 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     mastertile_16: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean'
+2025-10-26 15:25:16,342 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_reference_set
+2025-10-26 15:25:16,342 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_loading_from_cache_started
+2025-10-26 15:25:19,980 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_finished
+2025-10-26 15:25:20,487 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_saved
+2025-10-26 15:25:20,659 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:14/26
+2025-10-26 15:25:20,660 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:23
+2025-10-26 15:25:20,661 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 5, 'tile_id': 17})
+2025-10-26 15:25:20,661 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     mastertile_17: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean'
+2025-10-26 15:25:20,662 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_reference_set
+2025-10-26 15:25:20,662 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_loading_from_cache_started
+2025-10-26 15:25:23,234 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_finished
+2025-10-26 15:25:23,483 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_finished
+2025-10-26 15:25:24,206 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_saved
+2025-10-26 15:25:24,344 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:15/26
+2025-10-26 15:25:24,356 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Phase 3 - Traité 15/26 tuiles): Proc RSS: 6234.4MB, VMS: 9458.7MB. Sys RAM: Avail 5536MB / Total 32469MB (83.0%% used). Sys Swap: Used 5496MB / Total 97038MB (5.7%% used).
+2025-10-26 15:25:24,356 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:03:11
+2025-10-26 15:25:24,358 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 10, 'tile_id': 18})
+2025-10-26 15:25:24,358 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     mastertile_18: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean'
+2025-10-26 15:25:24,359 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_reference_set
+2025-10-26 15:25:24,359 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_loading_from_cache_started
+2025-10-26 15:25:24,491 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_saved
+2025-10-26 15:25:24,601 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:16/26
+2025-10-26 15:25:24,601 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:54
+2025-10-26 15:25:24,602 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 19})
+2025-10-26 15:25:24,602 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     mastertile_19: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean'
+2025-10-26 15:25:24,603 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_reference_set
+2025-10-26 15:25:24,603 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_loading_from_cache_started
+2025-10-26 15:25:26,382 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_started
+2025-10-26 15:25:27,454 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_started
+2025-10-26 15:25:29,231 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_started
+2025-10-26 15:25:29,642 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_finished
+2025-10-26 15:25:30,076 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_saved
+2025-10-26 15:25:30,185 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:17/26
+2025-10-26 15:25:30,185 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:46
+2025-10-26 15:25:30,187 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 6, 'tile_id': 20})
+2025-10-26 15:25:30,187 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     mastertile_20: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean'
+2025-10-26 15:25:30,188 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_reference_set
+2025-10-26 15:25:30,188 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_loading_from_cache_started
+2025-10-26 15:25:34,151 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_finished
+2025-10-26 15:25:34,547 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_saved
+2025-10-26 15:25:34,660 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:18/26
+2025-10-26 15:25:34,662 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:36
+2025-10-26 15:25:34,662 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 11, 'tile_id': 21})
+2025-10-26 15:25:34,662 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     mastertile_21: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean'
+2025-10-26 15:25:34,663 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_reference_set
+2025-10-26 15:25:34,663 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_loading_from_cache_started
+2025-10-26 15:25:37,340 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_started
+2025-10-26 15:25:38,158 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_started
+2025-10-26 15:25:42,689 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_finished
+2025-10-26 15:25:43,117 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_saved
+2025-10-26 15:25:43,227 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:19/26
+2025-10-26 15:25:43,227 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:31
+2025-10-26 15:25:43,228 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 8, 'tile_id': 22})
+2025-10-26 15:25:43,228 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     mastertile_22: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean'
+2025-10-26 15:25:43,228 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_reference_set
+2025-10-26 15:25:43,228 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_loading_from_cache_started
+2025-10-26 15:25:46,299 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_finished
+2025-10-26 15:25:46,757 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_saved
+2025-10-26 15:25:46,880 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:20/26
+2025-10-26 15:25:46,892 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Phase 3 - Traité 20/26 tuiles): Proc RSS: 6605.8MB, VMS: 9237.1MB. Sys RAM: Avail 5119MB / Total 32469MB (84.2%% used). Sys Swap: Used 5496MB / Total 97038MB (5.7%% used).
+2025-10-26 15:25:46,893 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:20
+2025-10-26 15:25:46,894 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 10, 'tile_id': 23})
+2025-10-26 15:25:46,894 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     mastertile_23: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean'
+2025-10-26 15:25:46,895 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_reference_set
+2025-10-26 15:25:46,895 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_loading_from_cache_started
+2025-10-26 15:25:50,849 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_finished
+2025-10-26 15:25:51,116 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_started
+2025-10-26 15:25:51,439 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_saved
+2025-10-26 15:25:51,562 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:21/26
+2025-10-26 15:25:51,563 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:11
+2025-10-26 15:25:51,563 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 10, 'tile_id': 24})
+2025-10-26 15:25:51,563 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     mastertile_24: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean'
+2025-10-26 15:25:51,564 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_reference_set
+2025-10-26 15:25:51,564 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_loading_from_cache_started
+2025-10-26 15:25:55,406 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_started
+2025-10-26 15:26:02,053 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_started
+2025-10-26 15:26:04,870 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_started
+2025-10-26 15:26:05,632 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_finished
+2025-10-26 15:26:06,194 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_saved
+2025-10-26 15:26:06,309 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:22/26
+2025-10-26 15:26:06,310 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:09
+2025-10-26 15:26:06,310 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 9, 'tile_id': 25})
+2025-10-26 15:26:06,310 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 -     mastertile_25: Options Stacking - Norm='sky_mean', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean'
+2025-10-26 15:26:06,311 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_reference_set
+2025-10-26 15:26:06,311 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_loading_from_cache_started
+2025-10-26 15:26:15,758 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_finished
+2025-10-26 15:26:16,230 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_saved
+2025-10-26 15:26:16,345 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:23/26
+2025-10-26 15:26:16,345 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:02
+2025-10-26 15:26:16,845 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_started
+2025-10-26 15:26:19,067 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_finished
+2025-10-26 15:26:19,657 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_saved
+2025-10-26 15:26:19,803 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:24/26
+2025-10-26 15:26:19,803 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:01:51
+2025-10-26 15:26:20,671 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_finished
+2025-10-26 15:26:21,125 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_saved
+2025-10-26 15:26:21,243 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:25/26
+2025-10-26 15:26:21,253 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Phase 3 - Traité 25/26 tuiles): Proc RSS: 5762.2MB, VMS: 8939.5MB. Sys RAM: Avail 5908MB / Total 32469MB (81.8%% used). Sys Swap: Used 5488MB / Total 97038MB (5.7%% used).
+2025-10-26 15:26:21,254 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:01:39
+2025-10-26 15:26:25,770 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_stacking_finished
+2025-10-26 15:26:26,104 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - mastertile_info_saved
+2025-10-26 15:26:26,211 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:26/26
+2025-10-26 15:26:26,220 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Phase 3 - Traité 26/26 tuiles): Proc RSS: 5507.2MB, VMS: 8659.5MB. Sys RAM: Avail 6171MB / Total 32469MB (81.0%% used). Sys Swap: Used 5488MB / Total 97038MB (5.7%% used).
+2025-10-26 15:26:26,220 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:01:30
+2025-10-26 15:26:27,536 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Fin Phase 3): Proc RSS: 5507.0MB, VMS: 8659.2MB. Sys RAM: Avail 6181MB / Total 32469MB (81.0%% used). Sys Swap: Used 5488MB / Total 97038MB (5.7%% used).
+2025-10-26 15:26:27,536 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - phase3_debug_timing
+2025-10-26 15:26:27,536 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: run_info_phase3_finished_from_cache] (Args: {'num_master_tiles': 26})
+2025-10-26 15:26:27,536 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - MASTER_TILE_COUNT_UPDATE:26/26
+2025-10-26 15:26:27,536 - ZeMosaicWorker - INFO - zemosaic_worker.run_hierarchical_mosaic:5216 - All master tiles complete, entering Phase 5 (reproject & coadd)
+2025-10-26 15:26:27,544 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Début Phase 4 (Calcul Grille)): Proc RSS: 5507.0MB, VMS: 8659.2MB. Sys RAM: Avail 6181MB / Total 32469MB (81.0%% used). Sys Swap: Used 5488MB / Total 97038MB (5.7%% used).
+2025-10-26 15:26:27,544 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: run_info_phase4_started]
+2025-10-26 15:26:27,544 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - PHASE_UPDATE:4
+2025-10-26 15:26:27,547 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - calcgrid_info_start_calc
+2025-10-26 15:26:27,548 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - CalcGrid: 26 WCS/Shapes valides pour calcul.
+2025-10-26 15:26:27,550 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: calcgrid_info_scales] (Args: {'avg_input_scale_arcsec': np.float64(2.3737173848918616), 'target_scale_arcsec': np.float64(2.3737173848918616)})
+2025-10-26 15:26:27,675 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: calcgrid_info_optimal_grid_calculated] (Args: {'shape': (2831, 2406), 'crval': array([323.67172654,  57.49234165])})
+2025-10-26 15:26:27,684 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Fin Phase 4): Proc RSS: 5507.2MB, VMS: 8659.2MB. Sys RAM: Avail 6180MB / Total 32469MB (81.0%% used). Sys Swap: Used 5488MB / Total 97038MB (5.7%% used).
+2025-10-26 15:26:27,684 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - phase4_debug_timing
+2025-10-26 15:26:27,685 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: run_info_phase4_finished] (Args: {'shape': (2831, 2406), 'crval': array([323.67172654,  57.49234165])})
+2025-10-26 15:26:27,685 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - PHASE_UPDATE:5
+2025-10-26 15:26:27,696 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Début Phase 5 (Méthode: reproject_coadd, Rognage MT Appliqué: True, %Rognage: 18.0)): Proc RSS: 5507.2MB, VMS: 8659.2MB. Sys RAM: Avail 6180MB / Total 32469MB (81.0%% used). Sys Swap: Used 5488MB / Total 97038MB (5.7%% used).
+2025-10-26 15:26:27,699 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: run_info_phase5_started_reproject_coadd]
+2025-10-26 15:26:27,711 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Début assemble_final_mosaic_reproject_coadd): Proc RSS: 5507.2MB, VMS: 8659.2MB. Sys RAM: Avail 6179MB / Total 32469MB (81.0%% used). Sys Swap: Used 5488MB / Total 97038MB (5.7%% used).
+2025-10-26 15:26:27,711 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ASM_REPROJ_COADD: Options de rognage - Appliquer: True, Pourcentage: 18.0
+2025-10-26 15:26:27,735 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:01:11
+2025-10-26 15:26:27,841 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:01:10
+2025-10-26 15:26:27,969 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - assemble_progress_tiles_processed_inc
+2025-10-26 15:26:27,969 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:01:09
+2025-10-26 15:26:28,096 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:01:07
+2025-10-26 15:26:28,214 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - assemble_progress_tiles_processed_inc
+2025-10-26 15:26:28,214 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:01:06
+2025-10-26 15:26:28,331 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:01:05
+2025-10-26 15:26:28,356 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - assemble_progress_tiles_processed_inc
+2025-10-26 15:26:28,356 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:01:05
+2025-10-26 15:27:16,241 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - assemble_info_intertile_photometric_applied
+2025-10-26 15:28:01,777 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:04:24
+2025-10-26 15:28:01,785 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Phase5 Reproject: mémoire après canal 1): Proc RSS: 6285.0MB, VMS: 8426.8MB. Sys RAM: Avail 6199MB / Total 32469MB (80.9%% used). Sys Swap: Used 5487MB / Total 97038MB (5.7%% used).
+2025-10-26 15:28:45,245 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:02:10
+2025-10-26 15:28:45,254 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Phase5 Reproject: mémoire après canal 2): Proc RSS: 6311.1MB, VMS: 8232.5MB. Sys RAM: Avail 6145MB / Total 32469MB (81.1%% used). Sys Swap: Used 5487MB / Total 97038MB (5.7%% used).
+2025-10-26 15:29:28,546 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:00:43
+2025-10-26 15:29:28,554 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Phase5 Reproject: mémoire après canal 3): Proc RSS: 6337.1MB, VMS: 8258.5MB. Sys RAM: Avail 6135MB / Total 32469MB (81.1%% used). Sys Swap: Used 5479MB / Total 97038MB (5.6%% used).
+2025-10-26 15:29:28,589 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - assemble_debug_reproject_timing
+2025-10-26 15:29:28,593 - ZeMosaicWorker - DEBUG - zemosaic_worker._auto_crop_mosaic_to_valid_region:1463 - follow_signal crop applied, bbox=(241, 2592, 93, 2305)
+2025-10-26 15:29:28,594 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ASM_REPROJ_COADD: Auto-cropped output to coverage bounds
+2025-10-26 15:29:28,604 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Fin assemble_final_mosaic_reproject_coadd): Proc RSS: 6415.0MB, VMS: 8336.6MB. Sys RAM: Avail 6059MB / Total 32469MB (81.3%% used). Sys Swap: Used 5479MB / Total 97038MB (5.6%% used).
+2025-10-26 15:29:28,604 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: assemble_info_finished_reproject_coadd] (Args: {'shape': (2351, 2212, 3)})
+2025-10-26 15:29:28,604 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:00:43
+2025-10-26 15:29:28,666 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Fin Phase 5 (Assemblage)): Proc RSS: 5619.7MB, VMS: 7539.8MB. Sys RAM: Avail 6849MB / Total 32469MB (78.9%% used). Sys Swap: Used 5479MB / Total 97038MB (5.6%% used).
+2025-10-26 15:29:28,666 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: run_info_phase5_finished_reproject_coadd] (Args: {'shape': (2351, 2212, 3)})
+2025-10-26 15:29:28,667 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - PHASE_UPDATE:6
+2025-10-26 15:29:28,675 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Début Phase 6 (Sauvegarde)): Proc RSS: 5619.7MB, VMS: 7539.8MB. Sys RAM: Avail 6848MB / Total 32469MB (78.9%% used). Sys Swap: Used 5479MB / Total 97038MB (5.6%% used).
+2025-10-26 15:29:28,675 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: run_info_phase6_started]
+2025-10-26 15:29:29,570 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - run_info_coverage_map_saved
+2025-10-26 15:29:29,570 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: run_success_mosaic_saved] (Args: {'filename': 'zemosaic_MT26_R198.fits'})
+2025-10-26 15:29:29,580 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Fin Sauvegarde FITS (avant preview)): Proc RSS: 5619.7MB, VMS: 7539.8MB. Sys RAM: Avail 6853MB / Total 32469MB (78.9%% used). Sys Swap: Used 5479MB / Total 97038MB (5.6%% used).
+2025-10-26 15:29:29,580 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - run_info_preview_stretch_started_auto_asifits
+2025-10-26 15:29:30,376 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: run_success_preview_saved_auto_asifits] (Args: {'filename': 'zemosaic_MT26_R198_preview.png'})
+2025-10-26 15:29:30,483 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Début Phase 7 (Nettoyage)): Proc RSS: 5689.8MB, VMS: 7609.9MB. Sys RAM: Avail 6758MB / Total 32469MB (79.2%% used). Sys Swap: Used 5479MB / Total 97038MB (5.6%% used).
+2025-10-26 15:29:30,483 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: run_info_phase7_cleanup_starting]
+2025-10-26 15:29:30,483 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - PHASE_UPDATE:7
+2025-10-26 15:29:31,316 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - run_info_temp_preprocessed_cache_cleaned
+2025-10-26 15:29:31,485 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - run_info_temp_master_tiles_fits_cleaned
+2025-10-26 15:29:31,508 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Fin Phase 7): Proc RSS: 5689.8MB, VMS: 7609.9MB. Sys RAM: Avail 6626MB / Total 32469MB (79.6%% used). Sys Swap: Used 5479MB / Total 97038MB (5.6%% used).
+2025-10-26 15:29:31,508 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - CHRONO_STOP_REQUEST
+2025-10-26 15:29:31,509 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - ETA_UPDATE:00:00:00
+2025-10-26 15:29:31,509 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:1232 - [CLÉ_POUR_GUI: run_success_processing_completed] (Args: {'duration': '395.79'})
+2025-10-26 15:29:31,672 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:1232 - Memory Usage (Fin Run Hierarchical Mosaic (après GC final)): Proc RSS: 5689.8MB, VMS: 7609.9MB. Sys RAM: Avail 6610MB / Total 32469MB (79.6%% used). Sys Swap: Used 5479MB / Total 97038MB (5.6%% used).
+2025-10-26 15:29:31,673 - ZeMosaicWorker - INFO - zemosaic_worker._log_alignment_warning_summary:1289 - Alignment summary: no frames ignored due to errors.
+2025-10-26 15:29:31,673 - ZeMosaicWorker - INFO - zemosaic_worker.run_hierarchical_mosaic:5656 - ===== Run Hierarchical Mosaic COMPLETED in 395.79s =====
