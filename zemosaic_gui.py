@@ -283,13 +283,29 @@ class ZeMosaicGUI:
         self.winsor_max_frames_var = tk.IntVar(master=self.root, value=self.config.get("winsor_max_frames_per_pass", 0))
         # --- FIN NOMBRE DE WORKERS ---
         # --- NOUVELLES VARIABLES TKINTER POUR LE ROGNAGE ---
-        self.apply_master_tile_crop_var = tk.BooleanVar(master=self.root, 
+        self.apply_master_tile_crop_var = tk.BooleanVar(master=self.root,
             value=self.config.get("apply_master_tile_crop", True) # Désactivé par défaut
         )
-        self.master_tile_crop_percent_var = tk.DoubleVar(master=self.root, 
+        self.master_tile_crop_percent_var = tk.DoubleVar(master=self.root,
             value=self.config.get("master_tile_crop_percent", 10.0) # 10% par côté par défaut si activé
         )
+        self.quality_crop_enabled_var = tk.BooleanVar(master=self.root,
+            value=self.config.get("quality_crop_enabled", False)
+        )
+        self.quality_crop_band_var = tk.IntVar(master=self.root,
+            value=self.config.get("quality_crop_band_px", 32)
+        )
+        self.quality_crop_ks_var = tk.DoubleVar(master=self.root,
+            value=self.config.get("quality_crop_k_sigma", 2.0)
+        )
+        self.quality_crop_margin_var = tk.IntVar(master=self.root,
+            value=self.config.get("quality_crop_margin_px", 8)
+        )
         self.use_memmap_var = tk.BooleanVar(master=self.root, value=self.config.get("coadd_use_memmap", False))
+        try:
+            self.quality_crop_enabled_var.trace_add("write", self._update_quality_crop_state)
+        except Exception:
+            pass
         self.mm_dir_var = tk.StringVar(master=self.root, value=self.config.get("coadd_memmap_dir", ""))
         self.cleanup_memmap_var = tk.BooleanVar(master=self.root, value=self.config.get("coadd_cleanup_memmap", True))
         self.auto_limit_frames_var = tk.BooleanVar(master=self.root, value=self.config.get("auto_limit_frames_per_master_tile", True))
@@ -341,6 +357,8 @@ class ZeMosaicGUI:
         self.translatable_widgets = {}
 
         self._build_ui()
+        self._update_quality_crop_state()
+        self._update_crop_options_state()
         self._update_solver_frames()
         self.root.after_idle(self._update_ui_language) # Déplacé après _build_ui pour que les widgets existent
         #self.root.after_idle(self._update_assembly_dependent_options) # En prévision d'un forçage de combinaisons 
@@ -830,6 +848,68 @@ class ZeMosaicGUI:
         crop_percent_note.grid(row=crop_opt_row, column=2, padx=(10,5), pady=3, sticky="ew")
         self.translatable_widgets["master_tile_crop_percent_note"] = crop_percent_note
         crop_opt_row += 1
+
+        self.quality_crop_check = ttk.Checkbutton(
+            crop_options_frame,
+            text="",
+            variable=self.quality_crop_enabled_var,
+            command=self._update_quality_crop_state,
+        )
+        self.quality_crop_check.grid(row=crop_opt_row, column=0, columnspan=3, padx=5, pady=(6, 3), sticky="w")
+        self.translatable_widgets["quality_crop_toggle_label"] = self.quality_crop_check
+        crop_opt_row += 1
+
+        self.quality_crop_advanced_frame = ttk.LabelFrame(crop_options_frame, text="")
+        self.quality_crop_advanced_frame.grid(row=crop_opt_row, column=0, columnspan=3, padx=5, pady=(0, 6), sticky="ew")
+        self.translatable_widgets["quality_crop_advanced"] = self.quality_crop_advanced_frame
+        for col_idx in range(6):
+            self.quality_crop_advanced_frame.columnconfigure(col_idx, weight=0)
+
+        quality_band_label = ttk.Label(self.quality_crop_advanced_frame, text="")
+        quality_band_label.grid(row=0, column=0, padx=5, pady=3, sticky="w")
+        self.translatable_widgets["quality_crop_band_label"] = quality_band_label
+        self.quality_crop_band_spinbox = ttk.Spinbox(
+            self.quality_crop_advanced_frame,
+            from_=4,
+            to=256,
+            increment=4,
+            textvariable=self.quality_crop_band_var,
+            width=6,
+        )
+        self.quality_crop_band_spinbox.grid(row=0, column=1, padx=5, pady=3, sticky="w")
+
+        quality_ks_label = ttk.Label(self.quality_crop_advanced_frame, text="")
+        quality_ks_label.grid(row=0, column=2, padx=5, pady=3, sticky="w")
+        self.translatable_widgets["quality_crop_ks_label"] = quality_ks_label
+        self.quality_crop_ks_spinbox = ttk.Spinbox(
+            self.quality_crop_advanced_frame,
+            from_=0.5,
+            to=5.0,
+            increment=0.1,
+            format="%.1f",
+            textvariable=self.quality_crop_ks_var,
+            width=6,
+        )
+        self.quality_crop_ks_spinbox.grid(row=0, column=3, padx=5, pady=3, sticky="w")
+
+        quality_margin_label = ttk.Label(self.quality_crop_advanced_frame, text="")
+        quality_margin_label.grid(row=0, column=4, padx=5, pady=3, sticky="w")
+        self.translatable_widgets["quality_crop_margin_label"] = quality_margin_label
+        self.quality_crop_margin_spinbox = ttk.Spinbox(
+            self.quality_crop_advanced_frame,
+            from_=0,
+            to=64,
+            increment=1,
+            textvariable=self.quality_crop_margin_var,
+            width=6,
+        )
+        self.quality_crop_margin_spinbox.grid(row=0, column=5, padx=5, pady=3, sticky="w")
+        self._quality_crop_inputs = [
+            self.quality_crop_band_spinbox,
+            self.quality_crop_ks_spinbox,
+            self.quality_crop_margin_spinbox,
+        ]
+        crop_opt_row += 1
         # --- FIN  CADRE DE ROGNAGE ---
 
         # --- Options d'Assemblage Final ---
@@ -1281,12 +1361,44 @@ class ZeMosaicGUI:
             return # Widgets pas encore prêts
 
         try:
-            if self.apply_master_tile_crop_var.get():
+            quality_enabled = bool(self.quality_crop_enabled_var.get()) if hasattr(self, 'quality_crop_enabled_var') else False
+        except tk.TclError:
+            quality_enabled = False
+
+        try:
+            if self.apply_master_tile_crop_var.get() and not quality_enabled:
                 self.crop_percent_spinbox.config(state=tk.NORMAL)
             else:
                 self.crop_percent_spinbox.config(state=tk.DISABLED)
         except tk.TclError:
             pass # Widget peut avoir été détruit
+
+    def _update_quality_crop_state(self, *args):
+        """Affiche ou masque le panneau avancé et gère l'état des champs qualité."""
+        if not hasattr(self, 'quality_crop_advanced_frame'):
+            return
+
+        try:
+            enabled = bool(self.quality_crop_enabled_var.get())
+        except tk.TclError:
+            enabled = False
+
+        try:
+            if enabled:
+                self.quality_crop_advanced_frame.grid()
+            else:
+                self.quality_crop_advanced_frame.grid_remove()
+        except tk.TclError:
+            pass
+
+        state = "normal" if enabled else "disabled"
+        for widget in getattr(self, "_quality_crop_inputs", []):
+            try:
+                widget.config(state=state)
+            except tk.TclError:
+                pass
+
+        self._update_crop_options_state()
 
     def _on_assembly_method_change(self, *args):
         method = self.final_assembly_method_var.get()
@@ -1520,6 +1632,10 @@ class ZeMosaicGUI:
                         "max_raw_per_master_tile": int(self.max_raw_per_tile_var.get()),
                         "apply_master_tile_crop": bool(self.apply_master_tile_crop_var.get()),
                         "master_tile_crop_percent": float(self.master_tile_crop_percent_var.get()),
+                        "quality_crop_enabled": bool(self.quality_crop_enabled_var.get()),
+                        "quality_crop_band_px": int(self.quality_crop_band_var.get()),
+                        "quality_crop_k_sigma": float(self.quality_crop_ks_var.get()),
+                        "quality_crop_margin_px": int(self.quality_crop_margin_var.get()),
                     })
                 except Exception:
                     pass
@@ -1985,6 +2101,22 @@ class ZeMosaicGUI:
             # --- RÉCUPÉRATION DES NOUVELLES VALEURS POUR LE ROGNAGE ---
             apply_master_tile_crop_val = self.apply_master_tile_crop_var.get()
             master_tile_crop_percent_val = self.master_tile_crop_percent_var.get()
+            quality_crop_enabled_val = self.quality_crop_enabled_var.get()
+            try:
+                quality_crop_band_val = int(self.quality_crop_band_var.get())
+            except Exception:
+                quality_crop_band_val = int(self.config.get("quality_crop_band_px", 32))
+                self.quality_crop_band_var.set(quality_crop_band_val)
+            try:
+                quality_crop_k_sigma_val = float(self.quality_crop_ks_var.get())
+            except Exception:
+                quality_crop_k_sigma_val = float(self.config.get("quality_crop_k_sigma", 2.0))
+                self.quality_crop_ks_var.set(quality_crop_k_sigma_val)
+            try:
+                quality_crop_margin_val = int(self.quality_crop_margin_var.get())
+            except Exception:
+                quality_crop_margin_val = int(self.config.get("quality_crop_margin_px", 8))
+                self.quality_crop_margin_var.set(quality_crop_margin_val)
             # --- FIN RÉCUPÉRATION ROGNAGE ---
             
         except tk.TclError as e:
@@ -2153,6 +2285,12 @@ class ZeMosaicGUI:
         except Exception:
             stack_ram_budget_val = 0.0
         self.config["stack_ram_budget_gb"] = stack_ram_budget_val
+        self.config["apply_master_tile_crop"] = bool(apply_master_tile_crop_val)
+        self.config["master_tile_crop_percent"] = float(master_tile_crop_percent_val)
+        self.config["quality_crop_enabled"] = bool(quality_crop_enabled_val)
+        self.config["quality_crop_band_px"] = int(quality_crop_band_val)
+        self.config["quality_crop_k_sigma"] = float(quality_crop_k_sigma_val)
+        self.config["quality_crop_margin_px"] = int(quality_crop_margin_val)
 
         worker_args = (
             input_dir, output_dir, astap_exe, astap_data,
@@ -2178,6 +2316,10 @@ class ZeMosaicGUI:
             # --- NOUVEAUX ARGUMENTS POUR LE ROGNAGE ---
             apply_master_tile_crop_val,
             master_tile_crop_percent_val,
+            bool(quality_crop_enabled_val),
+            int(quality_crop_band_val),
+            float(quality_crop_k_sigma_val),
+            int(quality_crop_margin_val),
             self.save_final_uint16_var.get(),
             self.use_memmap_var.get(),
             memmap_dir,

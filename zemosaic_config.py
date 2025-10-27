@@ -57,6 +57,10 @@ DEFAULT_CONFIG = {
     # --- CLES POUR LE ROGNAGE DES MASTER TUILES ---
     "apply_master_tile_crop": True,       # Désactivé par défaut
     "master_tile_crop_percent": 5.0,     # Pourcentage par côté si activé (ex: 10%)
+    "quality_crop_enabled": False,
+    "quality_crop_band_px": 32,
+    "quality_crop_k_sigma": 2.0,
+    "quality_crop_margin_px": 8,
     "crop_follow_signal": True,
     # --- FIN CLES POUR LE ROGNAGE ---
 }
