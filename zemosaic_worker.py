@@ -836,6 +836,61 @@ def _compute_auto_tile_caps(
     }
 
 
+def compute_auto_max_raw_per_master_tile(
+    total_raws: int,
+    resource_info: dict,
+    per_frame_info: dict,
+    *,
+    user_value: int | None,
+    min_tiles_floor: int = 14,
+    progress_callback: Callable | None = None,
+) -> int:
+    """Determine the cap used to split oversized clustering groups."""
+
+    resource_info = dict(resource_info or {})
+    per_frame_info = dict(per_frame_info or {})
+
+    caps = _compute_auto_tile_caps(resource_info, per_frame_info, policy_max=50, policy_min=8)
+    cap_ram = int(max(8, min(50, caps.get("cap", 50))))
+
+    N = int(max(0, total_raws))
+    if N <= 150:
+        cap_rule = 10
+    elif N <= 400:
+        cap_rule = 8
+    elif N <= 3000:
+        cap_rule = 8
+    elif N <= 12000:
+        cap_rule = 6
+    else:
+        cap_rule = 6
+
+    if user_value and user_value > 0:
+        C = int(user_value)
+    else:
+        C = int(min(cap_ram, cap_rule))
+
+    floor_tiles = max(1, int(min_tiles_floor))
+    if N > 0 and C > 0:
+        tiles_est = max(1, N // C)
+        if tiles_est < floor_tiles:
+            C = max(4, N // floor_tiles)
+
+    C = int(max(4, min(200, C)))
+
+    try:
+        _log_and_callback(
+            f"[AutoCap] N={N} cap_ram={cap_ram} cap_rule={cap_rule} -> C={C}",
+            prog=None,
+            lvl="INFO_DETAIL",
+            callback=progress_callback,
+        )
+    except Exception:
+        pass
+
+    return C
+
+
 def _extract_timestamp(info: dict, fallback: float) -> float:
     header = info.get("header") if isinstance(info, dict) else None
     if header is not None:
@@ -5438,37 +5493,51 @@ def run_hierarchical_mosaic(
     if not seestar_stack_groups:
         pcb("run_error_phase2_no_groups", prog=(base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING), lvl="ERROR")
         return
-    if (not preplan_groups_active) and auto_caps_info and seestar_stack_groups:
-        try:
-            cap_value = int(auto_caps_info.get("cap", 0))
-            min_value = int(auto_caps_info.get("min_cap", 8))
-        except Exception:
-            cap_value = 0
-            min_value = 8
-        if cap_value > 0:
-            original_count = len(seestar_stack_groups)
-            seestar_stack_groups = _auto_split_groups(
-                seestar_stack_groups,
-                cap_value,
-                min_value,
-                progress_callback=progress_callback,
-            )
-            if len(seestar_stack_groups) != original_count:
+
+    total_raws = sum(len(g) for g in seestar_stack_groups)
+    try:
+        user_max_for_auto_cap = int(max_raw_per_master_tile_config or 0)
+    except Exception:
+        user_max_for_auto_cap = 0
+
+    auto_cap_value = compute_auto_max_raw_per_master_tile(
+        total_raws=total_raws,
+        resource_info=resource_probe_info or {},
+        per_frame_info=per_frame_info or {},
+        user_value=user_max_for_auto_cap,
+        min_tiles_floor=14,
+        progress_callback=progress_callback,
+    )
+
+    effective_cap = int(auto_cap_value) if auto_cap_value else 0
+    target_groups_value = target_groups if "target_groups" in locals() else 0
+    if (
+        not preplan_groups_active
+        and (target_groups_value <= 0)
+        and effective_cap > 0
+        and seestar_stack_groups
+    ):
+        capped_groups: list[list[dict]] = []
+        for idx, group in enumerate(seestar_stack_groups, start=1):
+            if len(group) > effective_cap:
+                segments = _split_group_temporally(group, effective_cap)
+                capped_groups.extend(segments)
                 try:
+                    msg = (
+                        f"[AutoCap] Split group #{idx} size={len(group)} into "
+                        f"{math.ceil(len(group) / effective_cap)} segments (cap={effective_cap})"
+                    )
                     _log_and_callback(
-                        f"AutoSplit summary: {original_count} -> {len(seestar_stack_groups)} subgroup(s) (cap={cap_value})",
+                        msg,
                         prog=None,
                         lvl="INFO_DETAIL",
                         callback=progress_callback,
                     )
                 except Exception:
                     pass
-            if min_value > 0:
-                seestar_stack_groups = _merge_small_groups(
-                    seestar_stack_groups,
-                    min_size=min_value,
-                    cap=cap_value,
-                )
+            else:
+                capped_groups.append(group)
+        seestar_stack_groups = capped_groups
 
     # Do not subdivide groups if a target group count is set; respect clustering first.
     if (
@@ -5477,6 +5546,7 @@ def run_hierarchical_mosaic(
         and max_raw_per_master_tile_config
         and max_raw_per_master_tile_config > 0
     ):
+        # Manual cap already enforced via AutoCap path; retain block for backwards compatibility logging.
         new_groups = []
         for g in seestar_stack_groups:
             for i in range(0, len(g), max_raw_per_master_tile_config):

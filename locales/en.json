@@ -362,7 +362,7 @@
     "gui_memmap_cleanup": "Delete *.dat when finished",
     "gui_auto_limit_frames": "Auto limit frames per master tile (system stability)",
     "max_raw_per_master_tile_label": "Max raw per master tile",
-    "max_raw_per_master_tile_note": "0 = automatic (calculated). Positive value = maximum raw images per master tile.",
+    "max_raw_per_master_tile_note": "0 = auto (honours RAM & dataset size; never merges clusters, only splits oversized ones; tries to keep ≥14 tiles).",
     "reject_winsor_info_channel_progress": "Winsorized Sigma Clip processing channel {channel}...",
     "reject_winsor_info_mono_progress": "Winsorized Sigma Clip processing monochrome data...",
 
