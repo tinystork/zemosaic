@@ -426,6 +426,9 @@
     "filter_btn_auto_group": "Auto-organiser les Master Tiles",
     "filter_log_resolved_n": "WCS résolus pour {n} fichier(s).",
     "filter_log_groups_summary": "Préparation de {g} groupe(s), tailles : {sizes}.",
+    "filter_log_auto_master_estimate": "Tuiles maîtres estimées : {tiles} (mode={mode}, cap={cap}, seuil={threshold}°, groupes avant découpe={groups}).",
+    "filter_log_auto_master_mode_auto": "auto",
+    "filter_log_auto_master_mode_manual": "manuel",
     "filter_warn_astap_missing": "Exécutable ASTAP non configuré ; résolution ignorée.",
     "filter_warn_worker_missing": "Organisation auto désactivée car le module de traitement n'a pas pu être chargé : {error}"
 }
