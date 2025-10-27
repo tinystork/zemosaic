@@ -923,6 +923,8 @@ def launch_filter_interface(
         )
         analyse_btn.grid(row=0, column=0, padx=(0, 6))
         export_btn.grid(row=0, column=1)
+        total_initial_entries = len(items)
+
         if stream_mode:
             if stream_state.get("status_message"):
                 status_var.set(stream_state["status_message"])
@@ -946,11 +948,23 @@ def launch_filter_interface(
                 except Exception:
                     pass
         else:
-            try:
-                pb.stop()
-            except Exception:
-                pass
-            status_var.set(_tr("filter_status_ready", "Crawling done."))
+            if total_initial_entries > 400:
+                try:
+                    pb.start(80)
+                except Exception:
+                    pass
+                status_var.set(
+                    _tr(
+                        "filter_status_populating",
+                        "Preparing list… {current}/{total}",
+                    ).format(current=0, total=total_initial_entries)
+                )
+            else:
+                try:
+                    pb.stop()
+                except Exception:
+                    pass
+                status_var.set(_tr("filter_status_ready", "Crawling done."))
             try:
                 analyse_btn.state(["disabled"])
             except Exception:
@@ -1793,6 +1807,38 @@ def launch_filter_interface(
         all_ra_vals: list[float] = []
         all_dec_vals: list[float] = []
         drawn_footprints = {"count": 0}
+        population_state = {
+            "next_index": 0,
+            "total": total_initial_entries,
+            "finalized": False,
+        }
+        populate_indicator = {"running": False}
+
+        def _update_population_indicator(processed: int, *, done: bool = False) -> None:
+            if stream_mode:
+                return
+            if done:
+                try:
+                    pb.stop()
+                except Exception:
+                    pass
+                populate_indicator["running"] = False
+                status_var.set(_tr("filter_status_ready", "Crawling done."))
+                return
+            if population_state["total"] <= 0:
+                return
+            if not populate_indicator["running"]:
+                try:
+                    pb.start(80)
+                except Exception:
+                    pass
+                populate_indicator["running"] = True
+            status_var.set(
+                _tr(
+                    "filter_status_populating",
+                    "Preparing list… {current}/{total}",
+                ).format(current=min(processed, population_state["total"]), total=population_state["total"])
+            )
 
         def _add_item_row(item: Item) -> None:
             idx = len(check_vars)
@@ -1876,17 +1922,6 @@ def launch_filter_interface(
 
             all_ra_vals.extend(local_ra_vals)
             all_dec_vals.extend(local_dec_vals)
-
-        for item in items:
-            _add_item_row(item)
-
-        if all_ra_vals and all_dec_vals:
-            ra_min, ra_max = min(all_ra_vals), max(all_ra_vals)
-            dec_min, dec_max = min(all_dec_vals), max(all_dec_vals)
-            ra_pad = max(1e-3, (ra_max - ra_min) * 0.05 + 0.2)
-            dec_pad = max(1e-3, (dec_max - dec_min) * 0.05 + 0.2)
-            ax.set_xlim(ra_max + ra_pad, ra_min - ra_pad)
-            ax.set_ylim(dec_min - dec_pad, dec_max + dec_pad)
         ax.grid(True, which="both", linestyle=":", linewidth=0.6)
 
         def update_visuals(changed_index: Optional[int] = None) -> None:
@@ -1903,7 +1938,59 @@ def launch_filter_interface(
                     center_pts[i].set_alpha(alp)
             canvas.draw_idle()
 
-        update_visuals()
+        def _apply_initial_axes() -> None:
+            if all_ra_vals and all_dec_vals:
+                ra_min, ra_max = min(all_ra_vals), max(all_ra_vals)
+                dec_min, dec_max = min(all_dec_vals), max(all_dec_vals)
+                ra_pad = max(1e-3, (ra_max - ra_min) * 0.05 + 0.2)
+                dec_pad = max(1e-3, (dec_max - dec_min) * 0.05 + 0.2)
+                ax.set_xlim(ra_max + ra_pad, ra_min - ra_pad)
+                ax.set_ylim(dec_min - dec_pad, dec_max + dec_pad)
+                canvas.draw_idle()
+
+        def _finalize_initial_population() -> None:
+            if population_state["finalized"]:
+                return
+            population_state["finalized"] = True
+            update_visuals()
+            _apply_initial_axes()
+            _update_population_indicator(population_state["total"], done=True)
+
+        def _populate_initial_chunk() -> None:
+            total = population_state["total"]
+            if total <= 0:
+                _finalize_initial_population()
+                return
+            start = population_state["next_index"]
+            if start >= total:
+                _finalize_initial_population()
+                return
+            # Load a larger synchronous chunk first, then smaller async batches
+            chunk = 0
+            if start == 0:
+                chunk = min(total, 400)
+            else:
+                chunk = min(total - start, 200)
+            end = start + chunk
+            for idx in range(start, end):
+                _add_item_row(items[idx])
+            population_state["next_index"] = end
+            _update_population_indicator(end, done=end >= total)
+            try:
+                canvas.draw_idle()
+            except Exception:
+                pass
+            if end >= total:
+                _finalize_initial_population()
+            else:
+                # Yield to Tkinter before continuing with the next batch
+                try:
+                    root.after(15, _populate_initial_chunk)
+                except Exception:
+                    # If scheduling fails, continue synchronously to avoid losing items
+                    _populate_initial_chunk()
+
+        _populate_initial_chunk()
 
         def _recompute_axes_limits() -> None:
             ra_vals: list[float] = []
