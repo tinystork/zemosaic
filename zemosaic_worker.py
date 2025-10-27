@@ -3,6 +3,7 @@ from __future__ import annotations
 # zemosaic_worker.py
 
 import os
+import copy
 import shutil
 import time
 import traceback
@@ -2712,6 +2713,10 @@ def create_master_tile(
     radial_shape_power: float,           # Pourrait être une constante ou configurable
     min_radial_weight_floor: float,
     # --- FIN NOUVEAUX PARAMÈTRES ---
+    quality_crop_enabled: bool,
+    quality_crop_band_px: int,
+    quality_crop_k_sigma: float,
+    quality_crop_margin_px: int,
     # Paramètres ASTAP (pourraient être enlevés si plus du tout utilisés ici)
     astap_exe_path_global: str, 
     astap_data_dir_global: str, 
@@ -3081,10 +3086,125 @@ def create_master_tile(
                     reason=norm_mode,
                 )
 
+    quality_crop_rect: tuple[int, int, int, int] | None = None
+    if quality_crop_enabled:
+        try:
+            band_px = max(4, int(quality_crop_band_px))
+        except Exception:
+            band_px = 32
+        try:
+            margin_px = max(0, int(quality_crop_margin_px))
+        except Exception:
+            margin_px = 8
+        try:
+            k_sigma = float(quality_crop_k_sigma)
+            if not math.isfinite(k_sigma):
+                raise ValueError("k_sigma not finite")
+        except Exception:
+            k_sigma = 2.0
+        k_sigma = max(0.1, min(k_sigma, 10.0))
+
+        data_for_crop = np.asarray(master_tile_stacked_HWC)
+        axis_mode = "HWC"
+        if data_for_crop.ndim == 3 and data_for_crop.shape[0] == 3 and data_for_crop.shape[-1] != 3:
+            data_for_crop = np.moveaxis(data_for_crop, 0, -1)
+            axis_mode = "CHW"
+        elif data_for_crop.ndim == 2:
+            data_for_crop = data_for_crop[..., np.newaxis]
+            axis_mode = "HW"
+
+        try:
+            if data_for_crop.ndim < 3:
+                raise ValueError("insufficient dimensions for quality crop")
+
+            if data_for_crop.shape[-1] >= 3:
+                R = data_for_crop[..., 0]
+                G = data_for_crop[..., 1]
+                B = data_for_crop[..., 2]
+            else:
+                mono = data_for_crop[..., 0]
+                R = G = B = mono
+
+            lum2d = np.nanmean(np.stack([R, G, B], axis=0), axis=0).astype(np.float32)
+            R = np.nan_to_num(np.asarray(R, dtype=np.float32), nan=0.0)
+            G = np.nan_to_num(np.asarray(G, dtype=np.float32), nan=0.0)
+            B = np.nan_to_num(np.asarray(B, dtype=np.float32), nan=0.0)
+            lum2d = np.nan_to_num(lum2d, nan=0.0)
+
+            from .lecropper import detect_autocrop_rgb
+
+            y0, x0, y1, x1 = detect_autocrop_rgb(
+                lum2d,
+                R,
+                G,
+                B,
+                band_px=band_px,
+                k_sigma=k_sigma,
+                margin_px=margin_px,
+            )
+
+            h_lum, w_lum = lum2d.shape
+            if not (0 <= y0 < y1 <= h_lum and 0 <= x0 < x1 <= w_lum):
+                raise ValueError("invalid crop rectangle")
+
+            crop_area = (y1 - y0) * (x1 - x0)
+            full_area = h_lum * w_lum
+            if crop_area <= 0 or (crop_area / max(1, full_area)) >= 0.97:
+                pcb_tile(
+                    f"MT_CROP: quality crop skipped (rect={y0,x0,y1,x1}, area_ratio={crop_area/max(1, full_area):.3f})",
+                    prog=None,
+                    lvl="WARN",
+                )
+            else:
+                cropped = data_for_crop[y0:y1, x0:x1, ...]
+                if axis_mode == "CHW":
+                    master_tile_stacked_HWC = np.moveaxis(cropped, -1, 0)
+                elif axis_mode == "HW":
+                    master_tile_stacked_HWC = cropped[..., 0]
+                else:
+                    master_tile_stacked_HWC = cropped
+                quality_crop_rect = (int(y0), int(x0), int(y1), int(x1))
+
+                if wcs_for_master_tile is not None:
+                    try:
+                        if hasattr(wcs_for_master_tile, "deepcopy"):
+                            wcs_cropped = wcs_for_master_tile.deepcopy()
+                        else:
+                            wcs_cropped = copy.deepcopy(wcs_for_master_tile)
+                    except Exception:
+                        wcs_cropped = None
+
+                    if wcs_cropped is not None and hasattr(wcs_cropped, "wcs"):
+                        try:
+                            wcs_cropped.wcs.crpix[0] -= x0
+                            wcs_cropped.wcs.crpix[1] -= y0
+                        except Exception as e_crpix:
+                            pcb_tile(
+                                f"MT_CROP: quality-based WCS shift failed: {e_crpix}",
+                                prog=None,
+                                lvl="WARN",
+                            )
+                        else:
+                            wcs_for_master_tile = wcs_cropped
+                    elif wcs_cropped is not None:
+                        wcs_for_master_tile = wcs_cropped
+
+                pcb_tile(
+                    f"MT_CROP: quality-based rect={quality_crop_rect} (band={band_px}, k={k_sigma:.2f}, margin={margin_px})",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                )
+        except Exception as e_crop:
+            pcb_tile(
+                f"MT_CROP: quality-based crop failed ({e_crop})",
+                prog=None,
+                lvl="WARN",
+            )
+
     # pcb_tile(f"{func_id_log_base}_info_saving_started", prog=None, lvl="DEBUG_DETAIL", tile_id=tile_id)
     temp_fits_filename = f"master_tile_{tile_id:03d}.fits"
     temp_fits_filepath = os.path.join(output_temp_dir,temp_fits_filename)
-    
+
     try:
         # Créer un nouvel objet Header pour la sauvegarde
         header_mt_save = fits.Header()
@@ -3186,6 +3306,22 @@ def create_master_tile(
             header_mt_save['EXPTOTAL']=(round(total_exposure_tile,2),'[s] Sum of EXPTIME for this tile')
             header_mt_save['NEXP_SUM']=(num_exposure_summed,'Number of exposures summed for EXPTOTAL')
 
+
+        if quality_crop_rect and "CRPIX1" in header_mt_save and "CRPIX2" in header_mt_save:
+            try:
+                header_mt_save["CRPIX1"] = header_mt_save.get("CRPIX1", 0.0) - quality_crop_rect[1]
+                header_mt_save["CRPIX2"] = header_mt_save.get("CRPIX2", 0.0) - quality_crop_rect[0]
+            except Exception:
+                pass
+
+        if quality_crop_rect:
+            header_mt_save['ZMT_QCRO'] = (True, 'Quality-based crop applied')
+            header_mt_save['ZMT_QBOX'] = (
+                "{},{},{},{}".format(*quality_crop_rect),
+                'Quality crop rectangle (y0,x0,y1,x1)',
+            )
+        else:
+            header_mt_save['ZMT_QCRO'] = (False, 'Quality-based crop applied')
 
         zemosaic_utils.save_fits_image(
             image_data=master_tile_stacked_HWC,
@@ -4089,9 +4225,13 @@ def run_hierarchical_mosaic(
     min_radial_weight_floor_config: float,
     final_assembly_method_config: str,
     num_base_workers_config: int,
-        # --- ARGUMENTS POUR LE ROGNAGE ---
+    # --- ARGUMENTS POUR LE ROGNAGE ---
     apply_master_tile_crop_config: bool,
     master_tile_crop_percent_config: float,
+    quality_crop_enabled_config: bool,
+    quality_crop_band_px_config: int,
+    quality_crop_k_sigma_config: float,
+    quality_crop_margin_px_config: int,
     save_final_as_uint16_config: bool,
 
     coadd_use_memmap_config: bool,
@@ -5686,6 +5826,8 @@ def run_hierarchical_mosaic(
             poststack_equalize_rgb_config,
             apply_radial_weight_config, radial_feather_fraction_config,
             radial_shape_power_config, min_radial_weight_floor_config,
+            quality_crop_enabled_config, quality_crop_band_px_config,
+            quality_crop_k_sigma_config, quality_crop_margin_px_config,
             astap_exe_path, astap_data_dir_param, astap_search_radius_config,
             astap_downsample_config, astap_sensitivity_config, 180,
             winsor_worker_limit,
@@ -5917,7 +6059,17 @@ def run_hierarchical_mosaic(
     base_progress_phase5 = current_global_progress
     pcb("PHASE_UPDATE:5", prog=None, lvl="ETA_LEVEL")
     USE_INCREMENTAL_ASSEMBLY = (final_assembly_method_config == "incremental")
-    _log_memory_usage(progress_callback, f"Début Phase 5 (Méthode: {final_assembly_method_config}, Rognage MT Appliqué: {apply_master_tile_crop_config}, %Rognage: {master_tile_crop_percent_config if apply_master_tile_crop_config else 'N/A'})") # Log mis à jour
+    apply_crop_for_assembly = bool(apply_master_tile_crop_config and not quality_crop_enabled_config)
+    _log_memory_usage(
+        progress_callback,
+        (
+            "Début Phase 5 (Méthode: "
+            f"{final_assembly_method_config}, "
+            f"Rognage MT Appliqué: {apply_crop_for_assembly}, "
+            f"QualityCrop: {quality_crop_enabled_config}, "
+            f"%Rognage: {master_tile_crop_percent_config if apply_crop_for_assembly else 'N/A'})"
+        ),
+    )
     
     valid_master_tiles_for_assembly = []
     for mt_p, mt_w in master_tiles_results_list:
@@ -5955,7 +6107,7 @@ def run_hierarchical_mosaic(
                     final_output_shape_hw=final_output_shape_hw,
                     progress_callback=progress_callback,
                     n_channels=3,
-                    apply_crop=apply_master_tile_crop_config,
+                    apply_crop=apply_crop_for_assembly,
                     crop_percent=master_tile_crop_percent_config,
                     processing_threads=assembly_process_workers_config,
                     memmap_dir=inc_memmap_dir,
@@ -5969,7 +6121,7 @@ def run_hierarchical_mosaic(
                     final_output_shape_hw=final_output_shape_hw,
                     progress_callback=progress_callback,
                     n_channels=3,
-                    apply_crop=apply_master_tile_crop_config,
+                    apply_crop=apply_crop_for_assembly,
                     crop_percent=master_tile_crop_percent_config,
                     processing_threads=assembly_process_workers_config,
                     memmap_dir=inc_memmap_dir,
@@ -5982,7 +6134,7 @@ def run_hierarchical_mosaic(
                 final_output_shape_hw=final_output_shape_hw,
                 progress_callback=progress_callback,
                 n_channels=3,
-                apply_crop=apply_master_tile_crop_config,
+                apply_crop=apply_crop_for_assembly,
                 crop_percent=master_tile_crop_percent_config,
                 processing_threads=assembly_process_workers_config,
                 memmap_dir=inc_memmap_dir,
@@ -6007,7 +6159,7 @@ def run_hierarchical_mosaic(
                     progress_callback=progress_callback,
                     n_channels=3,
                     match_bg=True,
-                    apply_crop=apply_master_tile_crop_config,
+                    apply_crop=apply_crop_for_assembly,
                     crop_percent=master_tile_crop_percent_config,
                     use_gpu=True,
                     base_progress_phase5=base_progress_phase5,
@@ -6029,7 +6181,7 @@ def run_hierarchical_mosaic(
                     progress_callback=progress_callback,
                     n_channels=3,
                     match_bg=True,
-                    apply_crop=apply_master_tile_crop_config,
+                    apply_crop=apply_crop_for_assembly,
                     crop_percent=master_tile_crop_percent_config,
                     use_gpu=False,
                     use_memmap=bool(coadd_use_memmap_config),
@@ -6053,7 +6205,7 @@ def run_hierarchical_mosaic(
                 progress_callback=progress_callback,
                 n_channels=3,
                 match_bg=True,
-                apply_crop=apply_master_tile_crop_config,
+                apply_crop=apply_crop_for_assembly,
                 crop_percent=master_tile_crop_percent_config,
                 use_gpu=use_gpu_phase5_flag,
                 use_memmap=bool(coadd_use_memmap_config),

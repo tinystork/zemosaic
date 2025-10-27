@@ -46,6 +46,11 @@
     "apply_master_tile_crop_label": "Crop Master Tile Edges:",
     "master_tile_crop_percent_label": "Crop Percentage per Side (0-25%):",
     "master_tile_crop_percent_note": "(0.0 = no crop)",
+    "quality_crop_toggle_label": "Quality-based crop (signal)",
+    "quality_crop_advanced": "Advanced",
+    "quality_crop_band_label": "Band (px)",
+    "quality_crop_ks_label": "k·sigma",
+    "quality_crop_margin_label": "Margin (px)",
 
     "gui_logging_title": "Logging",
     "gui_logging_level": "Logging level:",

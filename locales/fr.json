@@ -49,7 +49,12 @@
     "crop_options_frame_title": "Options de Rognage des Tuiles Maîtresses",
     "apply_master_tile_crop_label": "Rogner les Bords des Tuiles Maîtresses :",
     "master_tile_crop_percent_label": "Pourcentage de Rognage par Côté (0-25%) :",
-    "master_tile_crop_percent_note": "(0.0 = pas de rognage)",    
+    "master_tile_crop_percent_note": "(0.0 = pas de rognage)",
+    "quality_crop_toggle_label": "Rognage qualité (signal)",
+    "quality_crop_advanced": "Avancé",
+    "quality_crop_band_label": "Bande (px)",
+    "quality_crop_ks_label": "k·sigma",
+    "quality_crop_margin_label": "Marge (px)",
 
     "gui_logging_title": "Journalisation",
     "gui_logging_level": "Niveau de log :",
