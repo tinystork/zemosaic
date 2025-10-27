@@ -311,6 +311,7 @@
     "stackimages_warn_min_not_finite_offset_skipped": "StackImages AVERT : Valeur minimale de l'image empilée non finie. Offset final ignoré.",
     "stackimages_info_min_above_target_offset_skipped": "StackImages INFO : Valeur minimale {current_min:.1f} déjà au-dessus de l'ADU cible {target_adu:.1f}. Offset final ignoré.",
 
+    "stacking_post_equalize_rgb_label": "Égaliser RGB (par sous-stack) :",
     "stacking_apply_radial_label": "Appliquer Pondération Radiale :",
     "stacking_radial_feather_label": "Fraction d'Atténuation Radiale (0.1-1.0) :",
     "final_assembly_options_frame_title": "Options d'Assemblage Final",

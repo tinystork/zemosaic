@@ -112,6 +112,7 @@ class ZeMosaicGUI:
                 "stacking_kappa_high": 3.0,
                 "stacking_winsor_limits": "0.05,0.05",
                 "stacking_final_combine_method": "mean",
+                "poststack_equalize_rgb": True,
                 # Logging
                 "logging_level": "INFO",
                 "apply_radial_weight": False,
@@ -257,7 +258,8 @@ class ZeMosaicGUI:
         self.stacking_kappa_high_var = tk.DoubleVar(master=self.root, value=self.config.get("stacking_kappa_high", 3.0))
         self.stacking_winsor_limits_str_var = tk.StringVar(master=self.root, value=self.config.get("stacking_winsor_limits", "0.05,0.05"))
         self.stacking_final_combine_method_var = tk.StringVar(master=self.root, value=self.config.get("stacking_final_combine_method", self.combine_method_keys[0]))
-        
+        self.poststack_equalize_rgb_var = tk.BooleanVar(master=self.root, value=self.config.get("poststack_equalize_rgb", True))
+
         # --- PONDÉRATION RADIALE ---
         self.apply_radial_weight_var = tk.BooleanVar(master=self.root, value=self.config.get("apply_radial_weight", False))
         self.radial_feather_fraction_var = tk.DoubleVar(master=self.root, value=self.config.get("radial_feather_fraction", 0.8))
@@ -680,6 +682,10 @@ class ZeMosaicGUI:
         self.final_combine_combo = ttk.Combobox(stacking_options_frame, values=[], state="readonly", width=25)
         self.final_combine_combo.grid(row=stk_opt_row, column=1, padx=5, pady=3, sticky="ew", columnspan=3)
         self.final_combine_combo.bind("<<ComboboxSelected>>", lambda e, c=self.final_combine_combo, v=self.stacking_final_combine_method_var, k_list=self.combine_method_keys, p="combine_method": self._combo_to_key(e, c, v, k_list, p)); stk_opt_row += 1
+        self.post_equalize_rgb_label = ttk.Label(stacking_options_frame, text="")
+        self.post_equalize_rgb_label.grid(row=stk_opt_row, column=0, padx=5, pady=3, sticky="w"); self.translatable_widgets["stacking_post_equalize_rgb_label"] = self.post_equalize_rgb_label
+        self.post_equalize_rgb_check = ttk.Checkbutton(stacking_options_frame, variable=self.poststack_equalize_rgb_var)
+        self.post_equalize_rgb_check.grid(row=stk_opt_row, column=1, padx=5, pady=3, sticky="w"); stk_opt_row += 1
         # Pondération Radiale
         self.apply_radial_weight_label = ttk.Label(stacking_options_frame, text="")
         self.apply_radial_weight_label.grid(row=stk_opt_row, column=0, padx=5, pady=3, sticky="w"); self.translatable_widgets["stacking_apply_radial_label"] = self.apply_radial_weight_label
@@ -1953,6 +1959,7 @@ class ZeMosaicGUI:
             stack_winsor_limits_str = self.stacking_winsor_limits_str_var.get()
             stack_final_combine = self.stacking_final_combine_method_var.get()
 
+            poststack_equalize_rgb_val = self.poststack_equalize_rgb_var.get()
             apply_radial_weight_val = self.apply_radial_weight_var.get()
             radial_feather_fraction_val = self.radial_feather_fraction_var.get()
             min_radial_weight_floor_val = self.min_radial_weight_floor_var.get()
@@ -1994,6 +2001,7 @@ class ZeMosaicGUI:
             self.config["stacking_kappa_low"] = float(stack_kappa_low)
             self.config["stacking_kappa_high"] = float(stack_kappa_high)
             self.config["stacking_final_combine_method"] = stack_final_combine
+            self.config["poststack_equalize_rgb"] = bool(poststack_equalize_rgb_val)
         except Exception:
             pass
 
@@ -2135,7 +2143,8 @@ class ZeMosaicGUI:
             f"[GUI] Stacking -> norm={self.config['stacking_normalize_method']}, "
             f"weight={self.config['stacking_weighting_method']}, "
             f"reject={self.config['stacking_rejection_algorithm']}, "
-            f"combine={self.config['stacking_final_combine_method']}"
+            f"combine={self.config['stacking_final_combine_method']}, "
+            f"rgb_eq={self.config['poststack_equalize_rgb']}"
         )
 
         stack_ram_budget_val = 0.0
@@ -2157,8 +2166,9 @@ class ZeMosaicGUI:
             stack_reject_algo,
             stack_kappa_low,
             stack_kappa_high,
-            parsed_winsor_limits, 
+            parsed_winsor_limits,
             stack_final_combine,
+            bool(poststack_equalize_rgb_val),
             apply_radial_weight_val,
             radial_feather_fraction_val,
             radial_shape_power_val,

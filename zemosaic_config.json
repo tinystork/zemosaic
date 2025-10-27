@@ -13,6 +13,7 @@
     "stacking_kappa_high": 3.0,
     "stacking_winsor_limits": "0.05,0.05",
     "stacking_final_combine_method": "mean",
+    "poststack_equalize_rgb": true,
     "apply_radial_weight": false,
     "radial_feather_fraction": 0.8,
     "radial_shape_power": 2.0,
