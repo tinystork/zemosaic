@@ -327,6 +327,13 @@
     "intertile_sky_label": "Plage de percentiles ciel :",
     "intertile_clip_label": "Sigma de clipping robuste :",
     "intertile_auto_label": "Auto-ajuster les paramètres inter-tuiles (recommandé au-delà de 20 tuiles)",
+    "p3_center_out_label": "Normalisation centre→bord (Phase 3) :",
+    "p3_center_preview_label": "Prévisualisation pour recouvrements :",
+    "p3_center_preview_hint": "(pixels réduits)",
+    "p3_center_overlap_label": "Fraction de recouvrement minimale :",
+    "p3_center_overlap_hint": "(rapport à la tuile traitée)",
+    "p3_center_sky_label": "Plage de percentile ciel :",
+    "p3_center_clip_label": "Sigma de clip robuste :",
     "no_gpu_title": "GPU non détecté",
     "no_gpu_msg": "Aucun GPU NVIDIA détecté. Repli CPU activé.",
 

@@ -3,6 +3,7 @@
 # --- Standard Library Imports ---
 import os
 import math
+import copy
 import numpy as np
 # L'import de astropy.io.fits est géré ci-dessous pour définir le flag
 import cv2
@@ -363,6 +364,153 @@ def robust_affine_fit(x_values: np.ndarray, y_values: np.ndarray, clip_sigma: fl
             break
         mask = new_mask
     return a_b
+
+
+def compute_sky_statistics(
+    image: np.ndarray | None,
+    low_percentile: float,
+    high_percentile: float,
+) -> dict[str, float] | None:
+    """Compute simple sky statistics using percentile-based limits."""
+
+    if image is None:
+        return None
+    arr = np.asarray(image, dtype=np.float64)
+    if arr.size == 0:
+        return None
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return None
+    low = float(np.nanpercentile(arr, float(low_percentile)))
+    high = float(np.nanpercentile(arr, float(high_percentile)))
+    median = float(np.nanmedian(arr))
+    return {"median": median, "low": low, "high": high}
+
+
+def estimate_sky_affine_to_ref(
+    samples_src: np.ndarray,
+    samples_ref: np.ndarray,
+    sky_low: float,
+    sky_high: float,
+    clip_sigma: float,
+):
+    """Estimate affine parameters matching ``samples_src`` onto ``samples_ref``."""
+
+    if samples_src is None or samples_ref is None:
+        return None
+    x = np.asarray(samples_src, dtype=np.float64).ravel()
+    y = np.asarray(samples_ref, dtype=np.float64).ravel()
+    if x.size == 0 or y.size == 0 or x.size != y.size:
+        return None
+    valid = np.isfinite(x) & np.isfinite(y)
+    if not np.any(valid):
+        return None
+    x = x[valid]
+    y = y[valid]
+    if x.size < 16:
+        return None
+    proxy = 0.5 * (x + y)
+    try:
+        p_low = float(np.nanpercentile(proxy, float(sky_low)))
+        p_high = float(np.nanpercentile(proxy, float(sky_high)))
+    except Exception:
+        p_low = float(np.nanpercentile(proxy, 25.0))
+        p_high = float(np.nanpercentile(proxy, 75.0))
+    if not np.isfinite(p_low) or not np.isfinite(p_high):
+        return None
+    if p_high <= p_low:
+        p_low = float(np.nanmin(proxy))
+        p_high = float(np.nanmax(proxy))
+    sky_mask = (proxy >= p_low) & (proxy <= p_high)
+    x_sel = x[sky_mask]
+    y_sel = y[sky_mask]
+    if x_sel.size < 16:
+        x_sel = x
+        y_sel = y
+    fit = robust_affine_fit(x_sel, y_sel, clip_sigma=float(clip_sigma))
+    if fit is None:
+        return None
+    gain, offset = fit
+    if not (np.isfinite(gain) and np.isfinite(offset)):
+        return None
+    return float(gain), float(offset), int(x_sel.size)
+
+
+def _rescale_wcs_for_preview(
+    wcs_obj,
+    original_shape_hw: tuple[int, int],
+    new_shape_hw: tuple[int, int],
+):
+    if not wcs_obj or not getattr(wcs_obj, "is_celestial", False):
+        return None
+    try:
+        preview_wcs = wcs_obj.deepcopy()
+    except Exception:
+        preview_wcs = copy.deepcopy(wcs_obj)
+    if preview_wcs is None:
+        return None
+    try:
+        orig_h, orig_w = map(float, original_shape_hw)
+        new_h, new_w = map(float, new_shape_hw)
+        if new_h <= 0 or new_w <= 0:
+            return None
+        scale_y = orig_h / new_h
+        scale_x = orig_w / new_w
+        if hasattr(preview_wcs, "wcs") and preview_wcs.wcs is not None:
+            if preview_wcs.wcs.crpix is not None and preview_wcs.wcs.crpix.size >= 2:
+                preview_wcs.wcs.crpix[0] = (float(preview_wcs.wcs.crpix[0]) - 0.5) / scale_x + 0.5
+                preview_wcs.wcs.crpix[1] = (float(preview_wcs.wcs.crpix[1]) - 0.5) / scale_y + 0.5
+            if preview_wcs.wcs.cd is not None:
+                preview_wcs.wcs.cd[0, :] *= scale_x
+                preview_wcs.wcs.cd[1, :] *= scale_y
+            elif preview_wcs.wcs.cdelt is not None:
+                preview_wcs.wcs.cdelt[0] *= scale_x
+                preview_wcs.wcs.cdelt[1] *= scale_y
+        try:
+            preview_wcs.pixel_shape = (int(round(new_w)), int(round(new_h)))
+        except Exception:
+            pass
+        return preview_wcs
+    except Exception:
+        return None
+
+
+def create_downscaled_luminance_preview(
+    image: np.ndarray,
+    wcs_obj,
+    preview_size: int = 256,
+) -> tuple[np.ndarray | None, object | None]:
+    """Return a luminance preview and adjusted WCS for quick overlap tests."""
+
+    if image is None:
+        return None, None
+    arr = np.asarray(image)
+    if arr.ndim == 3:
+        if arr.shape[2] == 1:
+            arr = arr[..., 0]
+        else:
+            arr = 0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]
+    arr = np.asarray(arr, dtype=np.float32)
+    if arr.ndim != 2:
+        arr = np.squeeze(arr)
+        if arr.ndim != 2:
+            return arr, None
+    arr = np.where(np.isfinite(arr), arr, np.nan)
+    h, w = arr.shape
+    preview = arr
+    preview_wcs = None
+    if preview_size and max(h, w) > preview_size:
+        scale = max(h, w) / float(preview_size)
+        new_w = max(8, int(round(w / scale)))
+        new_h = max(8, int(round(h / scale)))
+        preview = cv2.resize(arr, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        preview = preview.astype(np.float32, copy=False)
+        preview_wcs = _rescale_wcs_for_preview(wcs_obj, (h, w), (new_h, new_w))
+    else:
+        preview = arr.astype(np.float32, copy=False)
+        if wcs_obj is not None:
+            preview_wcs = _rescale_wcs_for_preview(wcs_obj, (h, w), (h, w))
+    return preview, preview_wcs
 
 
 def solve_global_affine(num_tiles: int, pair_entries, anchor_index: int = 0):
