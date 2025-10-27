@@ -271,22 +271,22 @@ def write_final_fits_uint16_color_aware(
 
     is_rgb = bool(force_rgb_planes and arr.ndim == 3 and arr.shape[-1] == 3)
 
-    if is_rgb:
-        if np.issubdtype(arr.dtype, np.floating):
-            arr16 = np.clip(arr, 0.0, 1.0) * 65535.0 + 0.5
-            arr16 = arr16.astype(np.uint16, copy=False)
-        elif arr.dtype != np.uint16:
-            arr16 = arr.astype(np.uint16, copy=False)
-        else:
-            arr16 = arr
+    if np.issubdtype(arr.dtype, np.floating):
+        u16 = np.clip(arr, 0.0, 1.0) * 65535.0 + 0.5
+        u16 = u16.astype(np.uint16, copy=False)
+    elif arr.dtype != np.uint16:
+        u16 = arr.astype(np.uint16, copy=False)
+    else:
+        u16 = arr
 
-        data = np.moveaxis(arr16, -1, 0)
+    i16 = (u16.astype(np.int32, copy=False) - 32768).astype(np.int16, copy=False)
+
+    if is_rgb:
+        data = np.moveaxis(i16, -1, 0)
         primary_hdu = fits_mod.PrimaryHDU(data=data)
         hdr = primary_hdu.header
         _merge_header_cards(hdr, header)
-        hdr["ZEMO16"] = (True, "Saved as uint16")
         hdr["ZEMORGB"] = (True, "RGB planes present")
-        hdr["ZEMOLEG"] = (bool(legacy_rgb_cube), "Legacy RGB cube mode")
         hdr["CHANNELS"] = (3, "Number of color channels")
         # Forcer le scaling standard pour 16-bit non signé
         hdr["BITPIX"] = 16
@@ -296,22 +296,23 @@ def write_final_fits_uint16_color_aware(
         hdr["DATAMAX"] = (65535, "Display hint")
         hdul = fits_mod.HDUList([primary_hdu])
     else:
-        if np.issubdtype(arr.dtype, np.floating):
-            arr16 = np.clip(arr, 0.0, 1.0) * 65535.0 + 0.5
-            arr16 = arr16.astype(np.uint16, copy=False)
-        elif arr.dtype != np.uint16:
-            arr16 = arr.astype(np.uint16, copy=False)
-        else:
-            arr16 = arr
-
-        primary_hdu = fits_mod.PrimaryHDU(data=arr16)
+        primary_hdu = fits_mod.PrimaryHDU(data=i16)
         hdr = primary_hdu.header
         _merge_header_cards(hdr, header)
-        hdr["ZEMO16"] = (True, "Saved as uint16")
         hdr["ZEMORGB"] = (False, "No separate RGB planes")
-        hdr["ZEMOLEG"] = (bool(legacy_rgb_cube), "Legacy RGB cube mode")
         hdr["CHANNELS"] = (1, "Number of color channels")
-        hdul = fits_mod.HDUList([primary_hdu])
+
+    hdr["ZEMO16"] = (True, "Saved as uint16 via int16 + BZERO")
+    hdr["ZEMOLEG"] = (bool(legacy_rgb_cube), "Legacy RGB cube mode")
+    hdr["BITPIX"] = 16
+    hdr["BSCALE"] = 1
+    hdr["BZERO"] = 32768
+    if "DATAMIN" in hdr:
+        del hdr["DATAMIN"]
+    if "DATAMAX" in hdr:
+        del hdr["DATAMAX"]
+
+    hdul = fits_mod.HDUList([primary_hdu])
 
     try:
         hdul.writeto(out_path, overwrite=overwrite, output_verify="fix")
