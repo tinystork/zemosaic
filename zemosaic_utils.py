@@ -4,6 +4,7 @@
 import os
 import math
 import copy
+import logging
 import numpy as np
 # L'import de astropy.io.fits est géré ci-dessous pour définir le flag
 import cv2
@@ -16,6 +17,9 @@ import importlib.util
 # --- GPU/CUDA Availability ----------------------------------------------------
 GPU_AVAILABLE = importlib.util.find_spec("cupy") is not None
 map_coordinates = None  # Lazily imported when needed
+
+
+logger = logging.getLogger(__name__)
 
 # --- Lightweight CuPy helpers -------------------------------------------------
 def gpu_is_available() -> bool:
@@ -96,6 +100,16 @@ def gpu_memory_sufficient(estimated_bytes: int, safety_fraction: float = 0.75) -
     except Exception:
         # If querying memory fails, err on the side of allowing execution
         return True
+
+
+def _force_cpu_intertile() -> bool:
+    """Return True when GPU usage for intertile helpers is disabled via env."""
+
+    value = os.environ.get("ZEMOSAIC_FORCE_CPU_INTERTILE")
+    if value is None:
+        return False
+    value = value.strip().lower()
+    return value not in {"", "0", "false", "no", "off"}
 
 from reproject.mosaicking import reproject_and_coadd as cpu_reproject_and_coadd
 try:
@@ -511,6 +525,53 @@ def compute_sky_statistics(
     arr = arr[np.isfinite(arr)]
     if arr.size == 0:
         return None
+
+    use_gpu = False
+    fallback_reason = ""
+    if _force_cpu_intertile():
+        fallback_reason = "env_override"
+    else:
+        try:
+            if gpu_is_available():
+                estimated_bytes = int(arr.nbytes * 2.0)
+                if gpu_memory_sufficient(estimated_bytes, safety_fraction=0.75):
+                    use_gpu = True
+                else:
+                    fallback_reason = f"insufficient_memory(est={estimated_bytes})"
+            else:
+                fallback_reason = "gpu_unavailable"
+        except Exception as exc:
+            fallback_reason = f"gpu_check_failed:{exc!r}"
+
+    if use_gpu:
+        try:
+            import cupy as cp  # type: ignore
+        except Exception as exc:
+            fallback_reason = f"gpu_import_failed:{exc!r}"
+            use_gpu = False
+        else:
+            ensure_cupy_pool_initialized()
+            arr_gpu = None
+            try:
+                logger.debug(
+                    "[Intertile][GPU] compute_sky_statistics using CuPy (N=%d, bytes=%d)",
+                    arr.size,
+                    arr.nbytes,
+                )
+                arr_gpu = cp.asarray(arr, dtype=cp.float32)
+                low = float(cp.asnumpy(cp.nanpercentile(arr_gpu, float(low_percentile))))
+                high = float(cp.asnumpy(cp.nanpercentile(arr_gpu, float(high_percentile))))
+                median = float(cp.asnumpy(cp.nanmedian(arr_gpu)))
+                return {"median": median, "low": low, "high": high}
+            except Exception as exc:
+                fallback_reason = f"gpu_error:{exc!r}"
+            finally:
+                if arr_gpu is not None:
+                    del arr_gpu
+                free_cupy_memory_pools()
+
+    if fallback_reason:
+        logger.debug("[Intertile][GPU] Fallback to CPU: reason=%s", fallback_reason)
     low = float(np.nanpercentile(arr, float(low_percentile)))
     high = float(np.nanpercentile(arr, float(high_percentile)))
     median = float(np.nanmedian(arr))
@@ -539,24 +600,93 @@ def estimate_sky_affine_to_ref(
     y = y[valid]
     if x.size < 16:
         return None
-    proxy = 0.5 * (x + y)
-    try:
-        p_low = float(np.nanpercentile(proxy, float(sky_low)))
-        p_high = float(np.nanpercentile(proxy, float(sky_high)))
-    except Exception:
-        p_low = float(np.nanpercentile(proxy, 25.0))
-        p_high = float(np.nanpercentile(proxy, 75.0))
-    if not np.isfinite(p_low) or not np.isfinite(p_high):
-        return None
-    if p_high <= p_low:
-        p_low = float(np.nanmin(proxy))
-        p_high = float(np.nanmax(proxy))
-    sky_mask = (proxy >= p_low) & (proxy <= p_high)
-    x_sel = x[sky_mask]
-    y_sel = y[sky_mask]
-    if x_sel.size < 16:
-        x_sel = x
-        y_sel = y
+    x_sel: np.ndarray | None = None
+    y_sel: np.ndarray | None = None
+    use_gpu = False
+    fallback_reason = ""
+    if _force_cpu_intertile():
+        fallback_reason = "env_override"
+    else:
+        try:
+            if gpu_is_available():
+                estimated_bytes = int((x.nbytes + y.nbytes) * 3.0)
+                if gpu_memory_sufficient(estimated_bytes, safety_fraction=0.75):
+                    use_gpu = True
+                else:
+                    fallback_reason = f"insufficient_memory(est={estimated_bytes})"
+            else:
+                fallback_reason = "gpu_unavailable"
+        except Exception as exc:
+            fallback_reason = f"gpu_check_failed:{exc!r}"
+
+    if use_gpu:
+        try:
+            import cupy as cp  # type: ignore
+        except Exception as exc:
+            fallback_reason = f"gpu_import_failed:{exc!r}"
+            use_gpu = False
+        else:
+            ensure_cupy_pool_initialized()
+            x_gpu = y_gpu = proxy_gpu = mask_gpu = None
+            try:
+                logger.debug(
+                    "[Intertile][GPU] estimate_sky_affine_to_ref using CuPy for percentiles (N=%d, bytes=%d)",
+                    x.size,
+                    x.nbytes + y.nbytes,
+                )
+                x_gpu = cp.asarray(x, dtype=cp.float32)
+                y_gpu = cp.asarray(y, dtype=cp.float32)
+                proxy_gpu = 0.5 * (x_gpu + y_gpu)
+                p_low = float(cp.asnumpy(cp.nanpercentile(proxy_gpu, float(sky_low))))
+                p_high = float(cp.asnumpy(cp.nanpercentile(proxy_gpu, float(sky_high))))
+                if not math.isfinite(p_low) or not math.isfinite(p_high):
+                    return None
+                if p_high <= p_low:
+                    p_low = float(cp.asnumpy(cp.nanmin(proxy_gpu)))
+                    p_high = float(cp.asnumpy(cp.nanmax(proxy_gpu)))
+                mask_gpu = (proxy_gpu >= p_low) & (proxy_gpu <= p_high)
+                x_sel = cp.asnumpy(x_gpu[mask_gpu])
+                y_sel = cp.asnumpy(y_gpu[mask_gpu])
+                if x_sel.size < 16:
+                    x_sel = cp.asnumpy(x_gpu)
+                    y_sel = cp.asnumpy(y_gpu)
+            except Exception as exc:
+                fallback_reason = f"gpu_error:{exc!r}"
+                x_sel = None
+                y_sel = None
+                use_gpu = False
+            finally:
+                if mask_gpu is not None:
+                    del mask_gpu
+                if proxy_gpu is not None:
+                    del proxy_gpu
+                if x_gpu is not None:
+                    del x_gpu
+                if y_gpu is not None:
+                    del y_gpu
+                free_cupy_memory_pools()
+
+    if not use_gpu:
+        if fallback_reason:
+            logger.debug("[Intertile][GPU] Fallback to CPU: reason=%s", fallback_reason)
+        proxy = 0.5 * (x + y)
+        try:
+            p_low = float(np.nanpercentile(proxy, float(sky_low)))
+            p_high = float(np.nanpercentile(proxy, float(sky_high)))
+        except Exception:
+            p_low = float(np.nanpercentile(proxy, 25.0))
+            p_high = float(np.nanpercentile(proxy, 75.0))
+        if not np.isfinite(p_low) or not np.isfinite(p_high):
+            return None
+        if p_high <= p_low:
+            p_low = float(np.nanmin(proxy))
+            p_high = float(np.nanmax(proxy))
+        sky_mask = (proxy >= p_low) & (proxy <= p_high)
+        x_sel = x[sky_mask]
+        y_sel = y[sky_mask]
+        if x_sel.size < 16:
+            x_sel = x
+            y_sel = y
     fit = robust_affine_fit(x_sel, y_sel, clip_sigma=float(clip_sigma))
     if fit is None:
         return None
