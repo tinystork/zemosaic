@@ -1179,12 +1179,12 @@ def launch_filter_interface(
                     ),
                 )
                 return
-            for it, var in zip(items, check_vars):
+            for idx, it in enumerate(items):
                 if it.center is None:
                     continue
                 sep = it.center.separation(global_center).to(u.deg).value
                 if sep > thr:
-                    var.set(False)
+                    _set_selected(idx, False)
             update_visuals()
         thresh_button = ttk.Button(
             thresh_frame,
@@ -1363,7 +1363,7 @@ def launch_filter_interface(
             and _astap_path_available(astap_exe_path)
         )
 
-        # Scrollable checkboxes list
+        # Scrollable selection list (checkboxes for small sets, listbox for large)
         list_frame = ttk.LabelFrame(
             right,
             text=_tr(
@@ -1375,50 +1375,82 @@ def launch_filter_interface(
         list_frame.rowconfigure(0, weight=1)
         list_frame.columnconfigure(0, weight=1)
 
-        canvas_list = tk.Canvas(list_frame, borderwidth=0, highlightthickness=0)
-        vsb = ttk.Scrollbar(list_frame, orient="vertical", command=canvas_list.yview)
-        inner = ttk.Frame(canvas_list)
-        inner.bind("<Configure>", lambda e: canvas_list.configure(scrollregion=canvas_list.bbox("all")))
-        canvas_list.create_window((0, 0), window=inner, anchor="nw")
-        canvas_list.configure(yscrollcommand=vsb.set)
-        canvas_list.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
+        CHECKBOX_HARD_LIMIT = 2000
+        use_listbox_mode = stream_mode or total_initial_entries > CHECKBOX_HARD_LIMIT
+        listbox_widget: Optional[tk.Listbox] = None
+        canvas_list: Optional[tk.Canvas] = None
+        inner: Optional[ttk.Frame] = None
+        list_scroll_target: Optional[Any] = None
+
+        if use_listbox_mode:
+            listbox_widget = tk.Listbox(
+                list_frame,
+                selectmode=tk.MULTIPLE,
+                exportselection=False,
+                activestyle="none",
+            )
+            listbox_widget.grid(row=0, column=0, sticky="nsew")
+            vsb = ttk.Scrollbar(list_frame, orient="vertical", command=listbox_widget.yview)
+            vsb.grid(row=0, column=1, sticky="ns")
+            listbox_widget.configure(yscrollcommand=vsb.set)
+            list_scroll_target = listbox_widget
+        else:
+            canvas_list = tk.Canvas(list_frame, borderwidth=0, highlightthickness=0)
+            vsb = ttk.Scrollbar(list_frame, orient="vertical", command=canvas_list.yview)
+            inner = ttk.Frame(canvas_list)
+            inner.bind("<Configure>", lambda e: canvas_list.configure(scrollregion=canvas_list.bbox("all")))
+            canvas_list.create_window((0, 0), window=inner, anchor="nw")
+            canvas_list.configure(yscrollcommand=vsb.set)
+            canvas_list.grid(row=0, column=0, sticky="nsew")
+            vsb.grid(row=0, column=1, sticky="ns")
+            list_scroll_target = canvas_list
 
         # Enable mouse-wheel scrolling over the right list (Windows/Linux/macOS)
         def _on_list_mousewheel(event):
+            target = list_scroll_target
+            if target is None:
+                return
             try:
                 if getattr(event, 'num', None) == 4:  # Linux scroll up
-                    canvas_list.yview_scroll(-1, "units")
+                    target.yview_scroll(-1, "units")
                 elif getattr(event, 'num', None) == 5:  # Linux scroll down
-                    canvas_list.yview_scroll(1, "units")
+                    target.yview_scroll(1, "units")
                 else:  # Windows / macOS
                     delta = int(-1 * (event.delta / 120)) if getattr(event, 'delta', 0) else 0
                     if delta != 0:
-                        canvas_list.yview_scroll(delta, "units")
+                        target.yview_scroll(delta, "units")
             except Exception:
                 pass
 
-        def _bind_list_mousewheel(_):
+        def _bind_list_mousewheel(event):
+            target = list_scroll_target if list_scroll_target is not None else getattr(event, "widget", None)
+            if target is None:
+                return
             try:
-                canvas_list.bind_all("<MouseWheel>", _on_list_mousewheel)
-                canvas_list.bind_all("<Button-4>", _on_list_mousewheel)
-                canvas_list.bind_all("<Button-5>", _on_list_mousewheel)
+                target.bind_all("<MouseWheel>", _on_list_mousewheel)
+                target.bind_all("<Button-4>", _on_list_mousewheel)
+                target.bind_all("<Button-5>", _on_list_mousewheel)
             except Exception:
                 pass
 
-        def _unbind_list_mousewheel(_):
+        def _unbind_list_mousewheel(event):
+            target = list_scroll_target if list_scroll_target is not None else getattr(event, "widget", None)
+            if target is None:
+                return
             try:
-                canvas_list.unbind_all("<MouseWheel>")
-                canvas_list.unbind_all("<Button-4>")
-                canvas_list.unbind_all("<Button-5>")
+                target.unbind_all("<MouseWheel>")
+                target.unbind_all("<Button-4>")
+                target.unbind_all("<Button-5>")
             except Exception:
                 pass
 
-        # Bind/unbind on enter/leave so the wheel affects only this list
-        inner.bind("<Enter>", _bind_list_mousewheel)
-        inner.bind("<Leave>", _unbind_list_mousewheel)
-        canvas_list.bind("<Enter>", _bind_list_mousewheel)
-        canvas_list.bind("<Leave>", _unbind_list_mousewheel)
+        if list_scroll_target is not None:
+            list_scroll_target.bind("<Enter>", _bind_list_mousewheel)
+            list_scroll_target.bind("<Leave>", _unbind_list_mousewheel)
+
+        selection_state: list[bool] = []
+        listbox_selection_cache: set[int] = set()
+        listbox_programmatic = {"active": False}
 
         summary_var = tk.StringVar(master=root, value="")
         resolved_counter = {"count": int(overrides_state.get("resolved_wcs_count", 0) or 0)}
@@ -1564,7 +1596,7 @@ def launch_filter_interface(
                 return
             auto_btn.state(["disabled"])
             try:
-                selected_indices = [i for i, v in enumerate(check_vars) if v.get()]
+                selected_indices = _get_selected_indices()
                 if not selected_indices:
                     summary_text = _tr(
                         "filter_log_groups_summary",
@@ -1720,10 +1752,38 @@ def launch_filter_interface(
         actions = ttk.Frame(right)
         actions.grid(row=4, column=0, sticky="ew", padx=5, pady=5)
         def select_all():
-            for v in check_vars: v.set(True)
+            if use_listbox_mode:
+                if selection_state:
+                    listbox_programmatic["active"] = True
+                    try:
+                        selection_state[:] = [True] * len(selection_state)
+                        listbox_selection_cache.clear()
+                        listbox_selection_cache.update(range(len(selection_state)))
+                        if listbox_widget is not None:
+                            listbox_widget.selection_set(0, tk.END)
+                    finally:
+                        listbox_programmatic["active"] = False
+                else:
+                    pass
+            else:
+                for v in check_vars:
+                    v.set(True)
             update_visuals()
+
         def select_none():
-            for v in check_vars: v.set(False)
+            if use_listbox_mode:
+                if selection_state:
+                    listbox_programmatic["active"] = True
+                    try:
+                        selection_state[:] = [False] * len(selection_state)
+                        listbox_selection_cache.clear()
+                        if listbox_widget is not None:
+                            listbox_widget.selection_clear(0, tk.END)
+                    finally:
+                        listbox_programmatic["active"] = False
+            else:
+                for v in check_vars:
+                    v.set(False)
             update_visuals()
         ttk.Button(
             actions,
@@ -1748,7 +1808,7 @@ def launch_filter_interface(
         result: dict[str, Any] = {"accepted": None, "selected_indices": None, "overrides": None}
         def on_validate():
             _drain_stream_queue()
-            sel = [i for i, v in enumerate(check_vars) if v.get()]
+            sel = _get_selected_indices()
             result["accepted"] = True
             result["selected_indices"] = sel
             result["overrides"] = overrides_state if overrides_state else None
@@ -1786,11 +1846,99 @@ def launch_filter_interface(
         # Populate checkboxes and draw footprints (supports streaming additions)
         check_vars: list[tk.BooleanVar] = []
         checkbuttons: list[Any] = []
+        item_labels: list[str] = []
         patches: list[Any] = []
         center_pts: list[Any] = []  # matplotlib line2D handles
         # Map matplotlib artists back to item indices for click-to-select
         artist_to_index: dict[Any, int] = {}
         known_path_index: dict[str, int] = {}
+
+        def _is_selected(idx: int) -> bool:
+            if idx < 0:
+                return False
+            if use_listbox_mode:
+                if idx < len(selection_state):
+                    return bool(selection_state[idx])
+                return False
+            if idx < len(check_vars):
+                try:
+                    return bool(check_vars[idx].get())
+                except Exception:
+                    return False
+            return False
+
+        def _set_selected(idx: int, value: bool, *, sync_widget: bool = True) -> None:
+            val = bool(value)
+            if use_listbox_mode:
+                if idx < 0:
+                    return
+                while idx >= len(selection_state):
+                    selection_state.append(True)
+                    listbox_selection_cache.add(len(selection_state) - 1)
+                selection_state[idx] = val
+                if not sync_widget:
+                    if val:
+                        listbox_selection_cache.add(idx)
+                    else:
+                        listbox_selection_cache.discard(idx)
+                    return
+                if listbox_widget is None:
+                    if val:
+                        listbox_selection_cache.add(idx)
+                    else:
+                        listbox_selection_cache.discard(idx)
+                    return
+                listbox_programmatic["active"] = True
+                try:
+                    if val:
+                        listbox_widget.selection_set(idx)
+                        listbox_selection_cache.add(idx)
+                    else:
+                        listbox_widget.selection_clear(idx)
+                        listbox_selection_cache.discard(idx)
+                except Exception:
+                    pass
+                finally:
+                    listbox_programmatic["active"] = False
+            else:
+                if 0 <= idx < len(check_vars):
+                    try:
+                        check_vars[idx].set(val)
+                    except Exception:
+                        pass
+
+        def _get_selected_indices() -> list[int]:
+            if use_listbox_mode:
+                return [i for i, flag in enumerate(selection_state) if flag]
+            return [i for i, var in enumerate(check_vars) if var.get()]
+
+        def _update_item_label(idx: int, text: str) -> None:
+            if idx < 0 or idx >= len(item_labels):
+                return
+            item_labels[idx] = text
+            if use_listbox_mode:
+                if listbox_widget is None:
+                    return
+                listbox_programmatic["active"] = True
+                try:
+                    listbox_widget.delete(idx)
+                    listbox_widget.insert(idx, text)
+                    if _is_selected(idx):
+                        listbox_widget.selection_set(idx)
+                        listbox_selection_cache.add(idx)
+                    else:
+                        listbox_widget.selection_clear(idx)
+                        listbox_selection_cache.discard(idx)
+                except Exception:
+                    pass
+                finally:
+                    listbox_programmatic["active"] = False
+            else:
+                if 0 <= idx < len(checkbuttons):
+                    try:
+                        checkbuttons[idx].configure(text=text)
+                    except Exception:
+                        pass
 
         def _path_key(value: Any) -> str:
             try:
@@ -1843,10 +1991,7 @@ def launch_filter_interface(
             )
 
         def _add_item_row(item: Item) -> None:
-            idx = len(check_vars)
-            var = tk.BooleanVar(master=root, value=True)
-            check_vars.append(var)
-
+            idx = len(item_labels)
             base = os.path.basename(item.path)
             sep_txt = ""
             if item.center is not None:
@@ -1856,9 +2001,31 @@ def launch_filter_interface(
                 except Exception:
                     sep_txt = ""
 
-            cb = ttk.Checkbutton(inner, text=base + sep_txt, variable=var, command=lambda i=idx: update_visuals(i))
-            cb.pack(anchor="w", fill="x", pady=1)
-            checkbuttons.append(cb)
+            display_text = base + sep_txt
+            item_labels.append(display_text)
+
+            if use_listbox_mode:
+                selection_state.append(True)
+                listbox_selection_cache.add(idx)
+                if listbox_widget is not None:
+                    listbox_programmatic["active"] = True
+                    try:
+                        listbox_widget.insert(tk.END, display_text)
+                        listbox_widget.selection_set(idx)
+                    except Exception:
+                        pass
+                    finally:
+                        listbox_programmatic["active"] = False
+            else:
+                var = tk.BooleanVar(master=root, value=True)
+                check_vars.append(var)
+                if inner is not None:
+                    cb = ttk.Checkbutton(inner, text=display_text, variable=var, command=lambda i=idx: update_visuals(i))
+                    cb.pack(anchor="w", fill="x", pady=1)
+                    checkbuttons.append(cb)
+                else:
+                    checkbuttons.append(None)
+
             path_key = _path_key(item.path)
             if path_key:
                 known_path_index[path_key] = idx
@@ -1944,7 +2111,7 @@ def launch_filter_interface(
                     continue
                 if i < 0 or i >= len(items):
                     continue
-                selected = check_vars[i].get()
+                selected = _is_selected(i)
                 col = "tab:blue" if selected else "0.7"
                 alp = 0.9 if selected else 0.3
                 if i < len(patches) and patches[i] is not None:
@@ -1957,6 +2124,30 @@ def launch_filter_interface(
                     any_updated = True
             if any_updated:
                 canvas.draw_idle()
+
+        if use_listbox_mode and listbox_widget is not None:
+            def _on_listbox_select(_event: Any) -> None:
+                if listbox_programmatic.get("active"):
+                    return
+                try:
+                    current = {int(idx) for idx in listbox_widget.curselection()}
+                except Exception:
+                    return
+                added = current - listbox_selection_cache
+                removed = listbox_selection_cache - current
+                if not added and not removed:
+                    return
+                for idx in added:
+                    if 0 <= idx < len(selection_state):
+                        selection_state[idx] = True
+                for idx in removed:
+                    if 0 <= idx < len(selection_state):
+                        selection_state[idx] = False
+                listbox_selection_cache.clear()
+                listbox_selection_cache.update(current)
+                update_visuals(list(added | removed))
+
+            listbox_widget.bind("<<ListboxSelect>>", _on_listbox_select)
 
         def _apply_initial_axes() -> None:
             if all_ra_vals and all_dec_vals:
@@ -2076,8 +2267,7 @@ def launch_filter_interface(
                         if items[existing_idx].center is not None:
                             sep_deg = items[existing_idx].center.separation(global_center).to(u.deg).value
                             sep_txt = f"  ({sep_deg:.2f}°)"
-                        if 0 <= existing_idx < len(checkbuttons):
-                            checkbuttons[existing_idx].configure(text=base_name + sep_txt)
+                        _update_item_label(existing_idx, base_name + sep_txt)
                     except Exception:
                         pass
                     try:
@@ -2193,7 +2383,7 @@ def launch_filter_interface(
                     pass
                 artist_to_index.pop(prev_point, None)
                 center_pts[idx] = None
-            selected = check_vars[idx].get()
+            selected = _is_selected(idx)
             color_sel = "tab:blue" if selected else "0.7"
             alpha_val = 0.9 if selected else 0.3
             new_patch = None
@@ -2392,8 +2582,8 @@ def launch_filter_interface(
                 if i is None:
                     return
                 # Toggle associated checkbox and refresh colors
-                curr = check_vars[i].get()
-                check_vars[i].set(not curr)
+                curr = _is_selected(i)
+                _set_selected(i, not curr)
                 update_visuals(i)
             except Exception:
                 pass
