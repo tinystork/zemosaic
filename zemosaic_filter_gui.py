@@ -665,7 +665,11 @@ def launch_filter_interface(
                 self.shape: Optional[tuple[int, int]] = None
                 self.center: Optional[SkyCoord] = None
                 self.phase0_center: Optional[SkyCoord] = None
-                self.footprint: Optional[np.ndarray] = None  # shape (N, 2) in deg
+                # Footprint computations are quite expensive for thousands of
+                # entries.  Compute them lazily only when the UI actually needs
+                # the polygon to be drawn.
+                self._footprint_cache: Optional[np.ndarray] = None
+                self._footprint_ready: bool = False
                 self.refresh_geometry()
 
             def _coerce_skycoord(self, value: Any) -> Optional[SkyCoord]:
@@ -777,6 +781,22 @@ def launch_filter_interface(
                 except Exception:
                     return None
 
+            def get_cached_footprint(self) -> Optional[np.ndarray]:
+                """Return footprint if it has already been computed."""
+
+                if self._footprint_ready:
+                    return self._footprint_cache
+                return None
+
+            def ensure_footprint(self) -> Optional[np.ndarray]:
+                """Compute and cache the footprint when needed."""
+
+                if not self._footprint_ready:
+                    self._footprint_cache = self._build_footprint(self.shape)
+                    # Mark as ready even when None so we don't retry endlessly
+                    self._footprint_ready = True
+                return self._footprint_cache
+
             def refresh_geometry(self) -> None:
                 self.shape = self._infer_shape()
                 if self.shape and self.wcs is not None and getattr(self.wcs, "pixel_shape", None) is None:
@@ -792,7 +812,10 @@ def launch_filter_interface(
                     self.src["center"] = self.center
                 if self.shape is not None:
                     self.src["shape"] = self.shape
-                self.footprint = self._build_footprint(self.shape)
+                # Heavy footprint computations are deferred until explicitly
+                # requested by the UI via ``ensure_footprint``.
+                self._footprint_cache = None
+                self._footprint_ready = False
 
         raw_files_with_wcs: list[Dict[str, Any]] = []
         items: list[Item] = []
@@ -900,6 +923,8 @@ def launch_filter_interface(
         )
         analyse_btn.grid(row=0, column=0, padx=(0, 6))
         export_btn.grid(row=0, column=1)
+        total_initial_entries = len(items)
+
         if stream_mode:
             if stream_state.get("status_message"):
                 status_var.set(stream_state["status_message"])
@@ -923,11 +948,23 @@ def launch_filter_interface(
                 except Exception:
                     pass
         else:
-            try:
-                pb.stop()
-            except Exception:
-                pass
-            status_var.set(_tr("filter_status_ready", "Crawling done."))
+            if total_initial_entries > 400:
+                try:
+                    pb.start(80)
+                except Exception:
+                    pass
+                status_var.set(
+                    _tr(
+                        "filter_status_populating",
+                        "Preparing list… {current}/{total}",
+                    ).format(current=0, total=total_initial_entries)
+                )
+            else:
+                try:
+                    pb.stop()
+                except Exception:
+                    pass
+                status_var.set(_tr("filter_status_ready", "Crawling done."))
             try:
                 analyse_btn.state(["disabled"])
             except Exception:
@@ -1770,6 +1807,38 @@ def launch_filter_interface(
         all_ra_vals: list[float] = []
         all_dec_vals: list[float] = []
         drawn_footprints = {"count": 0}
+        population_state = {
+            "next_index": 0,
+            "total": total_initial_entries,
+            "finalized": False,
+        }
+        populate_indicator = {"running": False}
+
+        def _update_population_indicator(processed: int, *, done: bool = False) -> None:
+            if stream_mode:
+                return
+            if done:
+                try:
+                    pb.stop()
+                except Exception:
+                    pass
+                populate_indicator["running"] = False
+                status_var.set(_tr("filter_status_ready", "Crawling done."))
+                return
+            if population_state["total"] <= 0:
+                return
+            if not populate_indicator["running"]:
+                try:
+                    pb.start(80)
+                except Exception:
+                    pass
+                populate_indicator["running"] = True
+            status_var.set(
+                _tr(
+                    "filter_status_populating",
+                    "Preparing list… {current}/{total}",
+                ).format(current=min(processed, population_state["total"]), total=population_state["total"])
+            )
 
         def _add_item_row(item: Item) -> None:
             idx = len(check_vars)
@@ -1801,10 +1870,16 @@ def launch_filter_interface(
             local_ra_vals: list[float] = []
             local_dec_vals: list[float] = []
 
-            if item.footprint is not None and drawn_footprints["count"] < MAX_FOOTPRINTS:
+            footprint_to_draw: Optional[np.ndarray] = None
+            if drawn_footprints["count"] < MAX_FOOTPRINTS:
+                footprint_to_draw = item.ensure_footprint()
+            else:
+                footprint_to_draw = item.get_cached_footprint()
+
+            if footprint_to_draw is not None and drawn_footprints["count"] < MAX_FOOTPRINTS:
                 try:
-                    ra_wrapped = [wrap_ra_deg(float(ra), ref_ra) for ra in item.footprint[:, 0].tolist()]
-                    decs = item.footprint[:, 1].tolist()
+                    ra_wrapped = [wrap_ra_deg(float(ra), ref_ra) for ra in footprint_to_draw[:, 0].tolist()]
+                    decs = footprint_to_draw[:, 1].tolist()
                     poly = Polygon(
                         list(zip(ra_wrapped, decs)),
                         closed=True,
@@ -1847,17 +1922,6 @@ def launch_filter_interface(
 
             all_ra_vals.extend(local_ra_vals)
             all_dec_vals.extend(local_dec_vals)
-
-        for item in items:
-            _add_item_row(item)
-
-        if all_ra_vals and all_dec_vals:
-            ra_min, ra_max = min(all_ra_vals), max(all_ra_vals)
-            dec_min, dec_max = min(all_dec_vals), max(all_dec_vals)
-            ra_pad = max(1e-3, (ra_max - ra_min) * 0.05 + 0.2)
-            dec_pad = max(1e-3, (dec_max - dec_min) * 0.05 + 0.2)
-            ax.set_xlim(ra_max + ra_pad, ra_min - ra_pad)
-            ax.set_ylim(dec_min - dec_pad, dec_max + dec_pad)
         ax.grid(True, which="both", linestyle=":", linewidth=0.6)
 
         def update_visuals(changed_index: Optional[int] = None) -> None:
@@ -1874,16 +1938,69 @@ def launch_filter_interface(
                     center_pts[i].set_alpha(alp)
             canvas.draw_idle()
 
-        update_visuals()
+        def _apply_initial_axes() -> None:
+            if all_ra_vals and all_dec_vals:
+                ra_min, ra_max = min(all_ra_vals), max(all_ra_vals)
+                dec_min, dec_max = min(all_dec_vals), max(all_dec_vals)
+                ra_pad = max(1e-3, (ra_max - ra_min) * 0.05 + 0.2)
+                dec_pad = max(1e-3, (dec_max - dec_min) * 0.05 + 0.2)
+                ax.set_xlim(ra_max + ra_pad, ra_min - ra_pad)
+                ax.set_ylim(dec_min - dec_pad, dec_max + dec_pad)
+                canvas.draw_idle()
+
+        def _finalize_initial_population() -> None:
+            if population_state["finalized"]:
+                return
+            population_state["finalized"] = True
+            update_visuals()
+            _apply_initial_axes()
+            _update_population_indicator(population_state["total"], done=True)
+
+        def _populate_initial_chunk() -> None:
+            total = population_state["total"]
+            if total <= 0:
+                _finalize_initial_population()
+                return
+            start = population_state["next_index"]
+            if start >= total:
+                _finalize_initial_population()
+                return
+            # Load a larger synchronous chunk first, then smaller async batches
+            chunk = 0
+            if start == 0:
+                chunk = min(total, 400)
+            else:
+                chunk = min(total - start, 200)
+            end = start + chunk
+            for idx in range(start, end):
+                _add_item_row(items[idx])
+            population_state["next_index"] = end
+            _update_population_indicator(end, done=end >= total)
+            try:
+                canvas.draw_idle()
+            except Exception:
+                pass
+            if end >= total:
+                _finalize_initial_population()
+            else:
+                # Yield to Tkinter before continuing with the next batch
+                try:
+                    root.after(15, _populate_initial_chunk)
+                except Exception:
+                    # If scheduling fails, continue synchronously to avoid losing items
+                    _populate_initial_chunk()
+
+        _populate_initial_chunk()
 
         def _recompute_axes_limits() -> None:
             ra_vals: list[float] = []
             dec_vals: list[float] = []
             for it in items:
-                if it.footprint is not None:
-                    for ra in it.footprint[:, 0].tolist():
+                footprint = it.get_cached_footprint()
+                if footprint is not None:
+                    for ra in footprint[:, 0].tolist():
                         ra_vals.append(wrap_ra_deg(float(ra), ref_ra))
-                    dec_vals.extend(it.footprint[:, 1].tolist())
+                    dec_vals.extend(footprint[:, 1].tolist())
                 elif it.center is not None:
                     ra_vals.append(wrap_ra_deg(float(it.center.ra.to(u.deg).value), ref_ra))
                     dec_vals.append(float(it.center.dec.to(u.deg).value))
@@ -2043,12 +2160,16 @@ def launch_filter_interface(
             alpha_val = 0.9 if selected else 0.3
             new_patch = None
             new_point = None
-            if item.footprint is not None:
+            footprint = item.get_cached_footprint()
+            if footprint is not None or (drawn_footprints["count"] < MAX_FOOTPRINTS and item.wcs is not None):
                 allow_draw = drawn_footprints["count"] < MAX_FOOTPRINTS
                 if allow_draw:
                     try:
-                        ra_wrapped = [wrap_ra_deg(float(ra), ref_ra) for ra in item.footprint[:, 0].tolist()]
-                        decs = item.footprint[:, 1].tolist()
+                        footprint = item.ensure_footprint()
+                        if footprint is None:
+                            raise ValueError("no footprint")
+                        ra_wrapped = [wrap_ra_deg(float(ra), ref_ra) for ra in footprint[:, 0].tolist()]
+                        decs = footprint[:, 1].tolist()
                         new_patch = Polygon(
                             list(zip(ra_wrapped, decs)),
                             closed=True,
