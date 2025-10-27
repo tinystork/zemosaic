@@ -315,10 +315,6 @@ def write_final_fits_uint16_color_aware(
                 hdul.close()
             except Exception:
                 pass
-
-    
-    fits_module_for_utils = MockFitsModule()
-    print("AVERTISSEMENT (zemosaic_utils): Astropy (fits) non trouvé. Fonctionnalités FITS limitées/mockées.")
 # --- Fin Définition locale ---
 
 warnings.filterwarnings("ignore", category=FutureWarning)
