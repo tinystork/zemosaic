@@ -32,6 +32,14 @@
     "winsor_worker_limit": 10,
     "winsor_max_frames_per_pass": 10,
     "max_raw_per_master_tile": 30,
+    "center_out_normalization_p3": true,
+    "p3_center_sky_percentile": [
+        25.0,
+        60.0
+    ],
+    "p3_center_robust_clip_sigma": 2.5,
+    "p3_center_preview_size": 256,
+    "p3_center_min_overlap_fraction": 0.03,
     "intertile_photometric_match": true,
     "intertile_preview_size": 512,
     "intertile_overlap_min": 0.05,

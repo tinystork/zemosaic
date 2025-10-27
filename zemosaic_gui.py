@@ -305,6 +305,27 @@ class ZeMosaicGUI:
             master=self.root,
             value=self.config.get("use_auto_intertile", False),
         )
+        center_sky_cfg = self.config.get("p3_center_sky_percentile", [25.0, 60.0])
+        if not (isinstance(center_sky_cfg, (list, tuple)) and len(center_sky_cfg) >= 2):
+            center_sky_cfg = [25.0, 60.0]
+        self.center_out_normalization_var = tk.BooleanVar(
+            master=self.root,
+            value=self.config.get("center_out_normalization_p3", True),
+        )
+        self.p3_center_preview_size_var = tk.IntVar(
+            master=self.root,
+            value=self.config.get("p3_center_preview_size", 256),
+        )
+        self.p3_center_overlap_var = tk.DoubleVar(
+            master=self.root,
+            value=self.config.get("p3_center_min_overlap_fraction", 0.03),
+        )
+        self.p3_center_sky_low_var = tk.DoubleVar(master=self.root, value=float(center_sky_cfg[0]))
+        self.p3_center_sky_high_var = tk.DoubleVar(master=self.root, value=float(center_sky_cfg[1]))
+        self.p3_center_clip_sigma_var = tk.DoubleVar(
+            master=self.root,
+            value=self.config.get("p3_center_robust_clip_sigma", 2.5),
+        )
         self.use_gpu_phase5_var = tk.BooleanVar(master=self.root, value=self.config.get("use_gpu_phase5", False))
         # Logging level var (keys are ERROR, WARN, INFO, DEBUG)
         self.logging_level_keys = ["ERROR", "WARN", "INFO", "DEBUG"]
@@ -947,6 +968,89 @@ class ZeMosaicGUI:
         )
         self.intertile_auto_check.grid(row=4, column=0, columnspan=3, padx=0, pady=(4, 2), sticky="w")
         self.translatable_widgets["intertile_auto_label"] = self.intertile_auto_check
+
+        asm_opt_row += 1
+        center_out_label = ttk.Label(final_assembly_options_frame, text="")
+        center_out_label.grid(row=asm_opt_row, column=0, padx=5, pady=3, sticky="w")
+        self.translatable_widgets["p3_center_out_label"] = center_out_label
+        self.center_out_check = ttk.Checkbutton(
+            final_assembly_options_frame,
+            variable=self.center_out_normalization_var,
+        )
+        self.center_out_check.grid(row=asm_opt_row, column=1, padx=5, pady=3, sticky="w")
+
+        asm_opt_row += 1
+        center_out_params_frame = ttk.Frame(final_assembly_options_frame)
+        center_out_params_frame.grid(row=asm_opt_row, column=0, columnspan=2, padx=5, pady=(0, 6), sticky="ew")
+        center_out_params_frame.columnconfigure(1, weight=1)
+
+        center_preview_label = ttk.Label(center_out_params_frame, text="")
+        center_preview_label.grid(row=0, column=0, padx=0, pady=2, sticky="w")
+        self.translatable_widgets["p3_center_preview_label"] = center_preview_label
+        ttk.Spinbox(
+            center_out_params_frame,
+            from_=64,
+            to=1024,
+            increment=32,
+            textvariable=self.p3_center_preview_size_var,
+            width=8,
+        ).grid(row=0, column=1, padx=(8, 5), pady=2, sticky="w")
+        center_preview_hint = ttk.Label(center_out_params_frame, text="")
+        center_preview_hint.grid(row=0, column=2, padx=(8, 0), pady=2, sticky="w")
+        self.translatable_widgets["p3_center_preview_hint"] = center_preview_hint
+
+        center_overlap_label = ttk.Label(center_out_params_frame, text="")
+        center_overlap_label.grid(row=1, column=0, padx=0, pady=2, sticky="w")
+        self.translatable_widgets["p3_center_overlap_label"] = center_overlap_label
+        ttk.Spinbox(
+            center_out_params_frame,
+            from_=0.0,
+            to=1.0,
+            increment=0.01,
+            textvariable=self.p3_center_overlap_var,
+            width=8,
+            format="%.2f",
+        ).grid(row=1, column=1, padx=(8, 5), pady=2, sticky="w")
+        center_overlap_hint = ttk.Label(center_out_params_frame, text="")
+        center_overlap_hint.grid(row=1, column=2, padx=(8, 0), pady=2, sticky="w")
+        self.translatable_widgets["p3_center_overlap_hint"] = center_overlap_hint
+
+        center_sky_label = ttk.Label(center_out_params_frame, text="")
+        center_sky_label.grid(row=2, column=0, padx=0, pady=2, sticky="w")
+        self.translatable_widgets["p3_center_sky_label"] = center_sky_label
+        center_sky_frame = ttk.Frame(center_out_params_frame)
+        center_sky_frame.grid(row=2, column=1, padx=(8, 5), pady=2, sticky="w")
+        ttk.Spinbox(
+            center_sky_frame,
+            from_=0.0,
+            to=100.0,
+            increment=1.0,
+            textvariable=self.p3_center_sky_low_var,
+            width=5,
+            format="%.1f",
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Spinbox(
+            center_sky_frame,
+            from_=0.0,
+            to=100.0,
+            increment=1.0,
+            textvariable=self.p3_center_sky_high_var,
+            width=5,
+            format="%.1f",
+        ).pack(side=tk.LEFT)
+
+        center_clip_label = ttk.Label(center_out_params_frame, text="")
+        center_clip_label.grid(row=3, column=0, padx=0, pady=2, sticky="w")
+        self.translatable_widgets["p3_center_clip_label"] = center_clip_label
+        ttk.Spinbox(
+            center_out_params_frame,
+            from_=0.5,
+            to=10.0,
+            increment=0.1,
+            textvariable=self.p3_center_clip_sigma_var,
+            width=8,
+            format="%.1f",
+        ).grid(row=3, column=1, padx=(8, 5), pady=2, sticky="w")
 
         asm_opt_row += 1
 
@@ -2001,6 +2105,14 @@ class ZeMosaicGUI:
         ]
         self.config["intertile_robust_clip_sigma"] = float(self.intertile_clip_sigma_var.get())
         self.config["use_auto_intertile"] = bool(self.use_auto_intertile_var.get())
+        self.config["center_out_normalization_p3"] = bool(self.center_out_normalization_var.get())
+        self.config["p3_center_preview_size"] = int(self.p3_center_preview_size_var.get())
+        self.config["p3_center_min_overlap_fraction"] = float(self.p3_center_overlap_var.get())
+        self.config["p3_center_sky_percentile"] = [
+            float(self.p3_center_sky_low_var.get()),
+            float(self.p3_center_sky_high_var.get()),
+        ]
+        self.config["p3_center_robust_clip_sigma"] = float(self.p3_center_clip_sigma_var.get())
         # Persist logging level
         self.config["logging_level"] = self.logging_level_var.get()
 
@@ -2074,6 +2186,14 @@ class ZeMosaicGUI:
             ],
             float(self.intertile_clip_sigma_var.get()),
             bool(self.use_auto_intertile_var.get()),
+            bool(self.center_out_normalization_var.get()),
+            [
+                float(self.p3_center_sky_low_var.get()),
+                float(self.p3_center_sky_high_var.get()),
+            ],
+            float(self.p3_center_clip_sigma_var.get()),
+            int(self.p3_center_preview_size_var.get()),
+            float(self.p3_center_overlap_var.get()),
             self.use_gpu_phase5_var.get(),
             gpu_id,
             self.logging_level_var.get(),
