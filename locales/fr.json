@@ -319,6 +319,14 @@
     "assembly_method_incremental": "Incrémental (Basse Mémoire, Bon pour Grands Ensembles)",
     "use_gpu_phase5": "Utiliser GPU NVIDIA pour la phase 5",
     "gpu_selector_label": "Sélecteur de GPU :",
+    "intertile_match_label": "Ajustement photométrique inter-tuiles :",
+    "intertile_preview_label": "Taille de prévisualisation :",
+    "intertile_preview_hint": "(pixels ; 256–1024 conseillé)",
+    "intertile_overlap_label": "Chevauchement minimal :",
+    "intertile_overlap_hint": "(fraction vs. tuile la plus petite)",
+    "intertile_sky_label": "Plage de percentiles ciel :",
+    "intertile_clip_label": "Sigma de clipping robuste :",
+    "intertile_auto_label": "Auto-ajuster les paramètres inter-tuiles (recommandé au-delà de 20 tuiles)",
     "no_gpu_title": "GPU non détecté",
     "no_gpu_msg": "Aucun GPU NVIDIA détecté. Repli CPU activé.",
 
@@ -381,6 +389,8 @@
 
     "assemble_error_no_tiles_provided_reproject_coadd": "ERREUR Reproject & Coadd : aucune Master Tuile valide à assembler.",
     "assemble_error_reproject_coadd_call_failed": "ERREUR Reproject & Coadd : échec du traitement : {error}",
+    "assemble_info_intertile_photometric_applied": "Phase 5 : calibration photométrique inter-tuiles appliquée à {num_tiles} tuile(s).",
+    "assemble_warn_intertile_photometric_failed": "Phase 5 : échec de la calibration photométrique inter-tuiles : {error}",
 
     "run_warn_phase4_failed_set_pixel_shape": "AVERT P4 : Échec du paramétrage de la taille de pixel pour une Master Tuile ; valeurs par défaut utilisées.",
     "run_warn_phase4_invalid_master_tile_for_grid": "AVERT P4 : Master Tuile WCS/shape invalide pour la grille ; ignorée.",
@@ -394,5 +404,12 @@
     "run_success_preview_saved_fallback": "Prévisualisation enregistrée (fallback) : {filename}",
     "run_error_phase3_thread_exception": "ERREUR P3 : Exception dans un thread de création de Master Tuile.",
     "run_error_phase4_reading_tile_shape": "ERREUR P4 : Échec de lecture de la forme (shape) de Master Tuile.",
-    "run_error_preview_stretch_unexpected_main": "ERREUR : Erreur inattendue lors de l'étirement de preview : {error}"
+    "run_error_preview_stretch_unexpected_main": "ERREUR : Erreur inattendue lors de l'étirement de preview : {error}",
+    "filter_log_panel_title": "Journal d'activité",
+    "filter_btn_resolve_wcs": "Résoudre les WCS manquants",
+    "filter_btn_auto_group": "Auto-organiser les Master Tiles",
+    "filter_log_resolved_n": "WCS résolus pour {n} fichier(s).",
+    "filter_log_groups_summary": "Préparation de {g} groupe(s), tailles : {sizes}.",
+    "filter_warn_astap_missing": "Exécutable ASTAP non configuré ; résolution ignorée.",
+    "filter_warn_worker_missing": "Organisation auto désactivée car le module de traitement n'a pas pu être chargé : {error}"
 }

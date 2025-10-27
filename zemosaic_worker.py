@@ -738,6 +738,61 @@ def _auto_split_groups(
     return new_groups
 
 
+def _group_center_deg(group):
+    """Renvoie le centre RA/DEC moyen d'un groupe."""
+
+    ras, decs = [], []
+    for info in group:
+        ra, dec = info.get("RA"), info.get("DEC")
+        if ra is not None and dec is not None:
+            ras.append(float(ra))
+            decs.append(float(dec))
+    if not ras:
+        return None
+    return (sum(ras) / len(ras), sum(decs) / len(decs))
+
+
+def _angular_sep_deg(a, b):
+    """Distance angulaire simple en degrés (approximation suffisante)."""
+
+    if not a or not b:
+        return 9999
+    dra = abs(a[0] - b[0])
+    ddec = abs(a[1] - b[1])
+    return (dra**2 + ddec**2) ** 0.5
+
+
+def _merge_small_groups(groups, min_size, cap):
+    """
+    Fusionne les petits groupes (<min_size) avec le plus proche voisin
+    si le total reste <= cap (avec marge 10%).
+    """
+
+    merged_flags = [False] * len(groups)
+    centers = [_group_center_deg(g) for g in groups]
+
+    for i, gi in enumerate(groups):
+        if merged_flags[i] or len(gi) >= min_size:
+            continue
+
+        best_j, best_d = None, 1e9
+        for j, gj in enumerate(groups):
+            if i == j or merged_flags[j]:
+                continue
+            d = _angular_sep_deg(centers[i], centers[j])
+            if d < best_d:
+                best_d, best_j = d, j
+
+        if best_j is not None and len(groups[best_j]) + len(gi) <= int(cap * 1.1):
+            groups[best_j].extend(gi)
+            merged_flags[i] = True
+            print(
+                f"[AutoMerge] Group {i} ({len(gi)} imgs) merged into {best_j} (now {len(groups[best_j])})"
+            )
+
+    return [g for k, g in enumerate(groups) if not merged_flags[k]]
+
+
 def _attempt_recluster_for_budget(
     group: list[dict],
     budget_bytes: int,
@@ -876,13 +931,14 @@ def _apply_ram_budget_to_groups(
 
 
 # --- Configuration du Logging ---
+try:
+    log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zemosaic_worker.log")
+except NameError:
+    log_file_path = "zemosaic_worker.log"
+
 logger = logging.getLogger("ZeMosaicWorker")
 if not logger.handlers:
     logger.setLevel(logging.DEBUG)
-    try:
-        log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zemosaic_worker.log")
-    except NameError: 
-        log_file_path = "zemosaic_worker.log"
     fh = logging.FileHandler(log_file_path, mode='w', encoding='utf-8')
     fh.setLevel(logging.DEBUG)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(module)s.%(funcName)s:%(lineno)d - %(message)s')
@@ -1241,12 +1297,99 @@ def _log_alignment_warning_summary():
             logger.info("%d frame(s) - %s", count, human)
 
 
+def _crop_array_to_signal(
+    img: np.ndarray,
+    coverage: np.ndarray | None = None,
+    margin_frac: float = 0.05,
+) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    """Crop ``img`` to the bounding box of useful signal.
+
+    Parameters
+    ----------
+    img : np.ndarray
+        2D/3D array containing image data.
+    coverage : np.ndarray | None, optional
+        Optional coverage map used as mask (>0 considered valid).
+    margin_frac : float, optional
+        Additional fractional margin added to each side of the bounding box.
+
+    Returns
+    -------
+    tuple[np.ndarray, tuple[int, int, int, int]]
+        Cropped image and bounding box ``(y0, y1, x0, x1)``.
+    """
+
+    if img is None:
+        return img, (0, 0, 0, 0)
+
+    arr = np.asarray(img)
+    if arr.ndim < 2:
+        height = int(arr.shape[0]) if arr.ndim >= 1 else 0
+        width = int(arr.shape[1]) if arr.ndim > 1 else 0
+        return img, (0, height, 0, width)
+
+    height, width = int(arr.shape[0]), int(arr.shape[1])
+    default_bbox = (0, height, 0, width)
+
+    mask: np.ndarray | None = None
+    if coverage is not None:
+        try:
+            cov_arr = np.asarray(coverage)
+            if cov_arr.shape[0] == height and cov_arr.shape[1] == width:
+                mask = cov_arr > 0
+        except Exception:
+            mask = None
+
+    if mask is None:
+        data_arr = np.asarray(img)
+        if data_arr.ndim == 3:
+            valid_pixels = np.any(np.isfinite(data_arr) & (data_arr != 0), axis=-1)
+        else:
+            valid_pixels = np.isfinite(data_arr) & (data_arr != 0)
+        mask = valid_pixels
+
+    if not np.any(mask):
+        return img, default_bbox
+
+    rows = np.where(np.any(mask, axis=1))[0]
+    cols = np.where(np.any(mask, axis=0))[0]
+    if rows.size == 0 or cols.size == 0:
+        return img, default_bbox
+
+    y_min, y_max = int(rows[0]), int(rows[-1]) + 1
+    x_min, x_max = int(cols[0]), int(cols[-1]) + 1
+
+    try:
+        margin_frac = float(margin_frac)
+    except (TypeError, ValueError):
+        margin_frac = 0.0
+    margin_frac = max(0.0, margin_frac)
+
+    if margin_frac > 0.0:
+        bbox_height = y_max - y_min
+        bbox_width = x_max - x_min
+        margin_y = int(math.ceil(bbox_height * margin_frac))
+        margin_x = int(math.ceil(bbox_width * margin_frac))
+        y_min = max(0, y_min - margin_y)
+        y_max = min(height, y_max + margin_y)
+        x_min = max(0, x_min - margin_x)
+        x_max = min(width, x_max + margin_x)
+
+    bbox = (y_min, y_max, x_min, x_max)
+    cropped = img[y_min:y_max, x_min:x_max, ...]
+
+    return cropped, bbox
+
+
 def _auto_crop_mosaic_to_valid_region(
     mosaic: np.ndarray,
     coverage: np.ndarray | None,
     output_wcs,
     log_callback=None,
     threshold: float = 1e-6,
+    *,
+    follow_signal: bool | None = None,
+    margin_frac: float | None = 0.05,
 ):
     """Crop blank borders from the mosaic using the coverage map.
 
@@ -1270,45 +1413,109 @@ def _auto_crop_mosaic_to_valid_region(
         original inputs are returned unchanged.
     """
 
-    if mosaic is None or coverage is None:
+    if mosaic is None:
         return mosaic, coverage
+
+    mosaic_arr = np.asarray(mosaic)
+    if mosaic_arr.ndim < 2:
+        return mosaic, coverage
+
+    default_bbox = (0, int(mosaic_arr.shape[0]), 0, int(mosaic_arr.shape[1]))
+
+    if follow_signal is None:
+        try:
+            import zemosaic_config
+
+            cfg = zemosaic_config.load_config() or {}
+            follow_signal = bool(cfg.get("crop_follow_signal", False))
+        except Exception:
+            follow_signal = False
+    else:
+        follow_signal = bool(follow_signal)
 
     try:
-        cov_array = np.asarray(coverage)
-    except Exception:
-        cov_array = coverage
+        margin_value = 0.05 if margin_frac is None else float(margin_frac)
+    except (TypeError, ValueError):
+        margin_value = 0.05
+    margin_value = max(0.0, margin_value)
 
-    if getattr(cov_array, "ndim", 0) != 2:
+    bbox = default_bbox
+    cropped_mosaic = mosaic
+    cropped_coverage = coverage
+    used_signal_crop = False
+
+    if follow_signal:
+        try:
+            candidate_mosaic, candidate_bbox = _crop_array_to_signal(
+                mosaic,
+                coverage,
+                margin_value,
+            )
+            if candidate_bbox:
+                bbox = candidate_bbox
+                used_signal_crop = True
+                if bbox != default_bbox:
+                    cropped_mosaic = candidate_mosaic
+                    if coverage is not None:
+                        y0, y1, x0, x1 = bbox
+                        cropped_coverage = coverage[y0:y1, x0:x1]
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug("follow_signal crop applied, bbox=%s", bbox)
+        except Exception:
+            bbox = default_bbox
+            used_signal_crop = False
+
+    if used_signal_crop and bbox == default_bbox:
         return mosaic, coverage
 
-    try:
-        valid_mask = np.asarray(cov_array) > float(threshold)
-    except Exception:
+    if not used_signal_crop:
+        if coverage is None:
+            return mosaic, coverage
+
+        try:
+            cov_array = np.asarray(coverage)
+        except Exception:
+            cov_array = coverage
+
+        if getattr(cov_array, "ndim", 0) != 2:
+            return mosaic, coverage
+
+        try:
+            valid_mask = np.asarray(cov_array) > float(threshold)
+        except Exception:
+            return mosaic, coverage
+
+        if not np.any(valid_mask):
+            return mosaic, coverage
+
+        rows = np.where(np.any(valid_mask, axis=1))[0]
+        cols = np.where(np.any(valid_mask, axis=0))[0]
+        if rows.size == 0 or cols.size == 0:
+            return mosaic, coverage
+
+        y_min, y_max = int(rows[0]), int(rows[-1]) + 1
+        x_min, x_max = int(cols[0]), int(cols[-1]) + 1
+
+        bbox = (y_min, y_max, x_min, x_max)
+
+        if (
+            y_min == 0
+            and x_min == 0
+            and y_max == mosaic.shape[0]
+            and x_max == mosaic.shape[1]
+        ):
+            return mosaic, coverage
+
+        cropped_mosaic = mosaic[y_min:y_max, x_min:x_max, ...]
+        cropped_coverage = coverage[y_min:y_max, x_min:x_max]
+
+    if used_signal_crop and bbox == default_bbox:
+        # Signal crop requested but no bounding box reduction occurred.
         return mosaic, coverage
 
-    if not np.any(valid_mask):
-        return mosaic, coverage
+    new_shape = tuple(int(v) for v in np.shape(cropped_mosaic))
 
-    rows = np.where(np.any(valid_mask, axis=1))[0]
-    cols = np.where(np.any(valid_mask, axis=0))[0]
-    if rows.size == 0 or cols.size == 0:
-        return mosaic, coverage
-
-    y_min, y_max = int(rows[0]), int(rows[-1]) + 1
-    x_min, x_max = int(cols[0]), int(cols[-1]) + 1
-
-    if (
-        y_min == 0
-        and x_min == 0
-        and y_max == mosaic.shape[0]
-        and x_max == mosaic.shape[1]
-    ):
-        return mosaic, coverage
-
-    cropped_mosaic = mosaic[y_min:y_max, x_min:x_max, ...]
-    cropped_coverage = coverage[y_min:y_max, x_min:x_max]
-
-    new_shape = tuple(int(v) for v in cropped_mosaic.shape)
+    y_min, y_max, x_min, x_max = bbox
 
     if callable(log_callback):
         try:
@@ -2389,6 +2596,7 @@ def create_master_tile(
     if stack_reject_algo == "winsorized_sigma_clip":
         master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_winsorized_sigma_clip(
             valid_aligned_images,
+            weight_method=stack_weight_method,
             zconfig=zconfig,
             kappa=stack_kappa_low,
             winsor_limits=parsed_winsor_limits,
@@ -2397,6 +2605,7 @@ def create_master_tile(
     elif stack_reject_algo == "kappa_sigma":
         master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_kappa_sigma_clip(
             valid_aligned_images,
+            weight_method=stack_weight_method,
             zconfig=zconfig,
             sigma_low=stack_kappa_low,
             sigma_high=stack_kappa_high,
@@ -2404,6 +2613,7 @@ def create_master_tile(
     elif stack_reject_algo == "linear_fit_clip":
         master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_linear_fit_clip(
             valid_aligned_images,
+            weight_method=stack_weight_method,
             zconfig=zconfig,
             sigma=stack_kappa_high,
         )
@@ -2938,6 +3148,12 @@ def assemble_final_mosaic_reproject_coadd(
     base_progress_phase5: float | None = None,
     progress_weight_phase5: float | None = None,
     start_time_total_run: float | None = None,
+    intertile_photometric_match: bool = False,
+    intertile_preview_size: int = 512,
+    intertile_overlap_min: float = 0.05,
+    intertile_sky_percentile: tuple[float, float] | list[float] = (30.0, 70.0),
+    intertile_robust_clip_sigma: float = 2.5,
+    use_auto_intertile: bool = False,
 ):
     """Assemble les master tiles en utilisant ``reproject_and_coadd``."""
     _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
@@ -3159,6 +3375,62 @@ def assemble_final_mosaic_reproject_coadd(
 
 
 
+    if (
+        intertile_photometric_match
+        and len(input_data_all_tiles_HWC_processed) >= 2
+        and ZEMOSAIC_UTILS_AVAILABLE
+        and hasattr(zemosaic_utils, "compute_intertile_affine_calibration")
+    ):
+        try:
+            corrections = zemosaic_utils.compute_intertile_affine_calibration(
+                input_data_all_tiles_HWC_processed,
+                final_output_wcs,
+                final_output_shape_hw,
+                preview_size=intertile_preview_size,
+                min_overlap_fraction=intertile_overlap_min,
+                sky_percentile=intertile_sky_percentile,
+                robust_clip_sigma=intertile_robust_clip_sigma,
+                use_auto_intertile=use_auto_intertile,
+                logger=logger,
+                progress_callback=progress_callback,
+            )
+        except Exception as exc_intertile:
+            corrections = {}
+            _pcb(
+                "assemble_warn_intertile_photometric_failed",
+                prog=None,
+                lvl="WARN",
+                error=str(exc_intertile),
+            )
+        else:
+            if corrections:
+                corrected_tiles = 0
+                for tile_idx, gain_offset in corrections.items():
+                    if not isinstance(gain_offset, (tuple, list)) or len(gain_offset) < 2:
+                        continue
+                    if not isinstance(tile_idx, int) or tile_idx < 0 or tile_idx >= len(input_data_all_tiles_HWC_processed):
+                        continue
+                    gain_val = float(gain_offset[0])
+                    offset_val = float(gain_offset[1])
+                    arr, tile_wcs = input_data_all_tiles_HWC_processed[tile_idx]
+                    if arr is None:
+                        continue
+                    try:
+                        arr *= gain_val
+                        arr += offset_val
+                        input_data_all_tiles_HWC_processed[tile_idx] = (arr, tile_wcs)
+                        corrected_tiles += 1
+                    except Exception:
+                        continue
+                if corrected_tiles:
+                    _pcb(
+                        "assemble_info_intertile_photometric_applied",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                        num_tiles=corrected_tiles,
+                    )
+
+
     # Build kwargs dynamically to remain compatible with different reproject versions
     reproj_kwargs = {}
     try:
@@ -3375,6 +3647,12 @@ def run_hierarchical_mosaic(
     winsor_max_frames_per_pass_config: int,
     winsor_worker_limit_config: int,
     max_raw_per_master_tile_config: int,
+    intertile_photometric_match_config: bool = True,
+    intertile_preview_size_config: int = 512,
+    intertile_overlap_min_config: float = 0.05,
+    intertile_sky_percentile_config: tuple[float, float] | list[float] = (30.0, 70.0),
+    intertile_robust_clip_sigma_config: float = 2.5,
+    use_auto_intertile_config: bool = False,
     use_gpu_phase5: bool = False,
     gpu_id_phase5: int | None = None,
     logging_level_config: str = "INFO",
@@ -3415,6 +3693,31 @@ def run_hierarchical_mosaic(
     except Exception:
         pass
 
+    # --- Harmoniser les méthodes de pondération issues du GUI / CLI / fallback config ---
+    requested_stack_weight_method = stack_weight_method
+    stack_weight_method_normalized = str(stack_weight_method or "").lower().strip()
+    if not stack_weight_method_normalized:
+        stack_weight_method_normalized = ""
+        if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
+            try:
+                cfg_weight = zemosaic_config.load_config() or {}
+                stack_weight_method_normalized = str(
+                    cfg_weight.get("stacking_weighting_method", "")
+                ).lower().strip()
+            except Exception:
+                stack_weight_method_normalized = ""
+    if not stack_weight_method_normalized:
+        stack_weight_method_normalized = "none"
+    if stack_weight_method_normalized not in {"none", "noise_variance", "noise_fwhm"}:
+        stack_weight_method_normalized = "none"
+    if str(requested_stack_weight_method or "").lower().strip() != stack_weight_method_normalized:
+        _log_and_callback(
+            f"[Worker] stack_weight_method fallback -> '{stack_weight_method_normalized}'",
+            lvl="INFO",
+            callback=progress_callback,
+        )
+    stack_weight_method = stack_weight_method_normalized
+
     # Reset alignment warning counters at start of run
     for k in ALIGN_WARNING_COUNTS:
         ALIGN_WARNING_COUNTS[k] = 0
@@ -3433,6 +3736,29 @@ def run_hierarchical_mosaic(
     auto_resource_strategy: dict = {}
     phase0_header_items: list[dict] = []
     phase0_lookup: dict[str, dict] = {}
+    preplan_groups_override_paths: list[list[str]] | None = None
+
+    try:
+        if isinstance(intertile_sky_percentile_config, (list, tuple)) and len(intertile_sky_percentile_config) >= 2:
+            intertile_sky_percentile_tuple = (
+                float(intertile_sky_percentile_config[0]),
+                float(intertile_sky_percentile_config[1]),
+            )
+        else:
+            intertile_sky_percentile_tuple = (30.0, 70.0)
+    except Exception:
+        intertile_sky_percentile_tuple = (30.0, 70.0)
+
+    def _normalize_path_for_matching(path_value: str | None) -> str | None:
+        if not path_value:
+            return None
+        try:
+            return os.path.normcase(os.path.abspath(path_value))
+        except Exception:
+            try:
+                return os.path.normcase(str(path_value))
+            except Exception:
+                return None
 
 
     # Seuil de clustering : valeur de repli à 0.18° si l'option est absente ou non positive
@@ -3514,6 +3840,15 @@ def run_hierarchical_mosaic(
     pcb("CHRONO_START_REQUEST", prog=None, lvl="CHRONO_LEVEL")
     _log_memory_usage(progress_callback, "Début Run Hierarchical Mosaic")
     pcb("run_info_processing_started", prog=current_global_progress, lvl="INFO")
+    _log_and_callback(
+        (
+            f"Options Stacking (Master Tiles): Norm='{stack_norm_method}', "
+            f"Weight='{stack_weight_method}', Reject='{stack_reject_algo}', "
+            f"Combine='{stack_final_combine}'"
+        ),
+        lvl="INFO",
+        callback=progress_callback,
+    )
     pcb(f"  Config ASTAP: Exe='{os.path.basename(astap_exe_path) if astap_exe_path else 'N/A'}', Data='{os.path.basename(astap_data_dir_param) if astap_data_dir_param else 'N/A'}', Radius={astap_search_radius_config}deg, Downsample={astap_downsample_config}, Sens={astap_sensitivity_config}", prog=None, lvl="DEBUG_DETAIL")
     pcb(f"  Config Workers (GUI): Base demandé='{num_base_workers_config}' (0=auto)", prog=None, lvl="DEBUG_DETAIL")
     pcb(f"  Options Stacking (Master Tuiles): Norm='{stack_norm_method}', Weight='{stack_weight_method}', Reject='{stack_reject_algo}', Combine='{stack_final_combine}', RadialWeight={apply_radial_weight_config} (Feather={radial_feather_fraction_config if apply_radial_weight_config else 'N/A'}, Power={radial_shape_power_config if apply_radial_weight_config else 'N/A'}, Floor={min_radial_weight_floor_config if apply_radial_weight_config else 'N/A'})", prog=None, lvl="DEBUG_DETAIL")
@@ -3587,114 +3922,256 @@ def run_hierarchical_mosaic(
         pcb("log_filter_ui_skipped", prog=None, lvl="INFO_DETAIL")
 
     if ASTROPY_AVAILABLE and fits is not None:
-        pcb("Phase 0: header scan start", prog=None, lvl="INFO_DETAIL")
-        t0_hscan = time.monotonic()
-        header_items_for_filter = []
-        num_scanned = 0
-        for idx_file, fpath in enumerate(fits_file_paths):
-            hdr = None
-            wcs0 = None
-            shp_hw = None
-            center_sc = None
+        header_items_for_filter: list[dict] = []
+        filtered_items: list[dict] | None = None
+        filter_overrides: dict | None = None
+        filter_accepted = False
+        filter_invoked = False
+        streaming_filter_success = False
+
+        launch_filter_interface_fn = None
+        if early_filter_enabled:
             try:
-                hdr = fits.getheader(fpath, 0)
-                try:
-                    nax1 = int(hdr.get("NAXIS1", 0))
-                    nax2 = int(hdr.get("NAXIS2", 0))
-                    if nax1 > 0 and nax2 > 0:
-                        shp_hw = (nax2, nax1)
-                except Exception:
-                    shp_hw = None
-                try:
-                    w = WCS(hdr, naxis=2, relax=True) if WCS is not None else None
-                    if w and getattr(w, "is_celestial", False):
-                        wcs0 = w
-                except Exception:
-                    wcs0 = None
-                if wcs0 is None:
+                from zemosaic_filter_gui import launch_filter_interface as launch_filter_interface_fn  # type: ignore
+            except ImportError:
+                launch_filter_interface_fn = None
+                pcb("Phase 0: filter GUI not available", prog=None, lvl="DEBUG_DETAIL")
+
+        def _parse_filter_result(ret_obj):
+            filt_items = None
+            accepted_flag = False
+            overrides_obj = None
+            if isinstance(ret_obj, tuple) and len(ret_obj) >= 1:
+                filt_items = ret_obj[0]
+                if len(ret_obj) >= 2:
                     try:
-                        if ZEMOSAIC_ASTROMETRY_AVAILABLE and zemosaic_astrometry and hasattr(zemosaic_astrometry, "extract_center_from_header"):
-                            center_sc = zemosaic_astrometry.extract_center_from_header(hdr)
+                        accepted_flag = bool(ret_obj[1])
                     except Exception:
-                        center_sc = None
-                item = {
-                    "path": fpath,
-                    "header": hdr,
-                    "index": idx_file,
-                }
-                if shp_hw:
-                    item["shape"] = shp_hw
-                if wcs0 is not None:
-                    item["wcs"] = wcs0
-                if center_sc is not None:
-                    item["center"] = center_sc
-                header_items_for_filter.append(item)
-                num_scanned += 1
-            except Exception:
-                header_items_for_filter.append({"path": fpath, "index": idx_file})
-                num_scanned += 1
-        t1_hscan = time.monotonic()
-        avg_t = (t1_hscan - t0_hscan) / max(1, num_scanned)
-        pcb(f"Phase 0: header scan finished — files={num_scanned}, avg={avg_t:.4f}s/header", prog=None, lvl="DEBUG")
+                        accepted_flag = False
+                if len(ret_obj) >= 3:
+                    overrides_obj = ret_obj[2]
+            elif isinstance(ret_obj, list):
+                filt_items = ret_obj
+                accepted_flag = True
+            return filt_items, accepted_flag, overrides_obj
+
+        initial_filter_overrides = None
+        try:
+            initial_filter_overrides = {
+                "cluster_panel_threshold": float(cluster_threshold_config),
+                "cluster_target_groups": int(cluster_target_groups_config),
+                "cluster_orientation_split_deg": float(cluster_orientation_split_deg_config),
+            }
+        except Exception:
+            initial_filter_overrides = None
+
+        solver_payload_for_filter = solver_settings if isinstance(solver_settings, dict) else None
+        config_payload_for_filter = {
+            "astap_executable_path": astap_exe_path,
+            "astap_data_directory_path": astap_data_dir_param,
+            "astap_default_search_radius": astap_search_radius_config,
+            "astap_default_downsample": astap_downsample_config,
+            "astap_default_sensitivity": astap_sensitivity_config,
+        }
+
+        if launch_filter_interface_fn is not None:
+            try:
+                filter_invoked = True
+                filter_ret = launch_filter_interface_fn(
+                    input_folder,
+                    initial_filter_overrides,
+                    stream_scan=True,
+                    scan_recursive=True,
+                    batch_size=200,
+                    preview_cap=1500,
+                    solver_settings_dict=solver_payload_for_filter,
+                    config_overrides=config_payload_for_filter,
+                )
+                filtered_items, filter_accepted, filter_overrides = _parse_filter_result(filter_ret)
+                if isinstance(filtered_items, list):
+                    header_items_for_filter = filtered_items
+                if header_items_for_filter:
+                    streaming_filter_success = True
+                    pcb(
+                        f"Phase 0: streaming filter prepared {len(header_items_for_filter)} item(s)",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                    )
+                else:
+                    filter_invoked = False
+            except Exception as e_filter:
+                filter_invoked = False
+                header_items_for_filter = []
+                filtered_items = None
+                filter_overrides = None
+                filter_accepted = False
+                pcb(f"Phase 0 streaming filter failed: {e_filter}", prog=None, lvl="WARN")
+
+        if not streaming_filter_success:
+            pcb("Phase 0: header scan start", prog=None, lvl="INFO_DETAIL")
+            t0_hscan = time.monotonic()
+            header_items_for_filter = []
+            num_scanned = 0
+            for idx_file, fpath in enumerate(fits_file_paths):
+                hdr = None
+                wcs0 = None
+                shp_hw = None
+                center_sc = None
+                try:
+                    hdr = fits.getheader(fpath, 0)
+                    try:
+                        nax1 = int(hdr.get("NAXIS1", 0))
+                        nax2 = int(hdr.get("NAXIS2", 0))
+                        if nax1 > 0 and nax2 > 0:
+                            shp_hw = (nax2, nax1)
+                    except Exception:
+                        shp_hw = None
+                    try:
+                        w = WCS(hdr, naxis=2, relax=True) if WCS is not None else None
+                        if w and getattr(w, "is_celestial", False):
+                            wcs0 = w
+                    except Exception:
+                        wcs0 = None
+                    if wcs0 is None:
+                        try:
+                            if (
+                                ZEMOSAIC_ASTROMETRY_AVAILABLE
+                                and zemosaic_astrometry
+                                and hasattr(zemosaic_astrometry, "extract_center_from_header")
+                            ):
+                                center_sc = zemosaic_astrometry.extract_center_from_header(hdr)
+                        except Exception:
+                            center_sc = None
+                    item = {
+                        "path": fpath,
+                        "header": hdr,
+                        "index": idx_file,
+                    }
+                    if shp_hw:
+                        item["shape"] = shp_hw
+                    if wcs0 is not None:
+                        item["wcs"] = wcs0
+                    if center_sc is not None:
+                        item["center"] = center_sc
+                    header_items_for_filter.append(item)
+                    num_scanned += 1
+                except Exception:
+                    header_items_for_filter.append({"path": fpath, "index": idx_file})
+                    num_scanned += 1
+            t1_hscan = time.monotonic()
+            avg_t = (t1_hscan - t0_hscan) / max(1, num_scanned)
+            pcb(
+                f"Phase 0: header scan finished — files={num_scanned}, avg={avg_t:.4f}s/header",
+                prog=None,
+                lvl="DEBUG",
+            )
+
+            if launch_filter_interface_fn is not None and not filter_invoked:
+                try:
+                    filter_invoked = True
+                    filter_ret = launch_filter_interface_fn(header_items_for_filter, initial_filter_overrides)
+                    filtered_items, filter_accepted, filter_overrides = _parse_filter_result(filter_ret)
+                except Exception as e_filter:
+                    filter_invoked = False
+                    filtered_items = None
+                    filter_overrides = None
+                    filter_accepted = False
+                    pcb(f"Phase 0 filter UI failed: {e_filter}", prog=None, lvl="WARN")
+            elif not early_filter_enabled:
+                pcb("Phase 0: header scan completed (filter UI disabled)", prog=None, lvl="DEBUG_DETAIL")
 
         phase0_header_items = header_items_for_filter
 
-        if early_filter_enabled:
-            try:
-                from zemosaic_filter_gui import launch_filter_interface
+        if filter_invoked:
+            if filter_overrides:
                 try:
-                    _init_overrides = {
-                        "cluster_panel_threshold": float(cluster_threshold_config),
-                        "cluster_target_groups": int(cluster_target_groups_config),
-                        "cluster_orientation_split_deg": float(cluster_orientation_split_deg_config),
-                    }
+                    if "cluster_panel_threshold" in filter_overrides:
+                        cluster_threshold_config = filter_overrides["cluster_panel_threshold"]
+                        pcb(
+                            "clusterstacks_info_override_threshold",
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                            value=cluster_threshold_config,
+                        )
+                    if "cluster_target_groups" in filter_overrides:
+                        cluster_target_groups_config = filter_overrides["cluster_target_groups"]
+                        pcb(
+                            "clusterstacks_info_override_target_groups",
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                            value=cluster_target_groups_config,
+                        )
+                    if "cluster_orientation_split_deg" in filter_overrides:
+                        cluster_orientation_split_deg_config = filter_overrides["cluster_orientation_split_deg"]
+                        pcb(
+                            "clusterstacks_info_override_orientation_split",
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                            value=cluster_orientation_split_deg_config,
+                        )
                 except Exception:
-                    _init_overrides = None
-                filter_ret = launch_filter_interface(header_items_for_filter, _init_overrides)
-                accepted = True
-                filtered_items = None
-                overrides = None
-                if isinstance(filter_ret, tuple) and len(filter_ret) >= 1:
-                    filtered_items = filter_ret[0]
-                    if len(filter_ret) >= 2:
-                        try:
-                            accepted = bool(filter_ret[1])
-                        except Exception:
-                            accepted = True
-                    if len(filter_ret) >= 3:
-                        overrides = filter_ret[2]
-                elif isinstance(filter_ret, list):
-                    filtered_items = filter_ret
-                if overrides:
-                    try:
-                        if "cluster_panel_threshold" in overrides:
-                            cluster_threshold_config = overrides["cluster_panel_threshold"]
-                            pcb("clusterstacks_info_override_threshold", prog=None, lvl="INFO_DETAIL", value=cluster_threshold_config)
-                        if "cluster_target_groups" in overrides:
-                            cluster_target_groups_config = overrides["cluster_target_groups"]
-                            pcb("clusterstacks_info_override_target_groups", prog=None, lvl="INFO_DETAIL", value=cluster_target_groups_config)
-                        if "cluster_orientation_split_deg" in overrides:
-                            cluster_orientation_split_deg_config = overrides["cluster_orientation_split_deg"]
-                            pcb("clusterstacks_info_override_orientation_split", prog=None, lvl="INFO_DETAIL", value=cluster_orientation_split_deg_config)
-                    except Exception:
-                        pass
-                if not accepted:
-                    pcb("run_warn_phase0_filter_cancelled", prog=None, lvl="WARN")
-                    return
-                if filtered_items is not None:
-                    fits_file_paths = [item["path"] for item in filtered_items if isinstance(item, dict) and item.get("path")]
-                    pcb(f"Phase 0: selection after filter = {len(fits_file_paths)} files", prog=None, lvl="INFO_DETAIL")
+                    pass
+                try:
+                    raw_groups_override = (
+                        filter_overrides.get("preplan_master_groups")
+                        if isinstance(filter_overrides, dict)
+                        else None
+                    )
+                    if isinstance(raw_groups_override, list):
+                        mapped_groups: list[list[str]] = []
+                        for group in raw_groups_override:
+                            if not isinstance(group, (list, tuple)):
+                                continue
+                            normalized_group: list[str] = []
+                            for item in group:
+                                path_val = None
+                                if isinstance(item, dict):
+                                    path_val = item.get("path") or item.get("path_raw")
+                                elif isinstance(item, str):
+                                    path_val = item
+                                norm_path = _normalize_path_for_matching(path_val)
+                                if norm_path:
+                                    normalized_group.append(norm_path)
+                            if normalized_group:
+                                mapped_groups.append(normalized_group)
+                        if mapped_groups:
+                            preplan_groups_override_paths = mapped_groups
+                            pcb(
+                                f"Phase 0 filter provided {len(mapped_groups)} preplanned group(s).",
+                                prog=None,
+                                lvl="INFO_DETAIL",
+                            )
+                except Exception as e_preplan:
+                    pcb(
+                        f"Phase 0 filter preplan override failed: {e_preplan}",
+                        prog=None,
+                        lvl="DEBUG_DETAIL",
+                    )
+
+            if not filter_accepted:
+                pcb("run_warn_phase0_filter_cancelled", prog=None, lvl="WARN")
+                pcb("Phase 0: filter cancelled -> proceeding with all files", prog=None, lvl="INFO_DETAIL")
+            if filter_accepted and isinstance(filtered_items, list):
+                new_paths = [
+                    item.get("path")
+                    for item in filtered_items
+                    if isinstance(item, dict) and item.get("path")
+                ]
+                if new_paths:
+                    fits_file_paths = new_paths
+                    pcb(
+                        f"Phase 0: selection after filter = {len(fits_file_paths)} files",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                    )
                     try:
                         fits_file_paths.sort(key=lambda p: p.lower())
                     except Exception:
                         fits_file_paths.sort()
-            except ImportError:
-                pcb("Phase 0: filter GUI not available", prog=None, lvl="DEBUG_DETAIL")
-            except Exception as e_filter:
-                pcb(f"Phase 0 filter UI failed: {e_filter}", prog=None, lvl="WARN")
-        else:
-            pcb("Phase 0: header scan completed (filter UI disabled)", prog=None, lvl="DEBUG_DETAIL")
+            elif filter_accepted and not filtered_items:
+                pcb("Phase 0: filter returned no items", prog=None, lvl="WARN")
     else:
+        phase0_header_items = []
         pcb("Phase 0: header scan unavailable (Astropy missing)", prog=None, lvl="WARN")
 
     phase0_lookup = {item["path"]: item for item in phase0_header_items if isinstance(item, dict) and item.get("path")}
@@ -3944,68 +4421,130 @@ def run_hierarchical_mosaic(
     pcb("run_info_phase2_started", prog=base_progress_phase2, lvl="INFO")
     pcb("PHASE_UPDATE:2", prog=None, lvl="ETA_LEVEL")
     # Use order-invariant connected-components clustering for robustness
-    seestar_stack_groups = cluster_seestar_stacks_connected(
-        all_raw_files_processed_info,
-        SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG,
-        progress_callback,
-        orientation_split_threshold_deg=ORIENTATION_SPLIT_THRESHOLD_DEG,
-    )
-    if STACK_RAM_BUDGET_BYTES > 0 and seestar_stack_groups:
-        seestar_stack_groups, ram_budget_adjustments = _apply_ram_budget_to_groups(
-            seestar_stack_groups,
-            STACK_RAM_BUDGET_BYTES,
-            float(SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG),
-            float(ORIENTATION_SPLIT_THRESHOLD_DEG),
-        )
-        for adj in ram_budget_adjustments:
-            method = adj.get("method")
-            if method == "recluster":
+    preplan_groups_active = False
+    if preplan_groups_override_paths:
+        try:
+            path_lookup = {
+                _normalize_path_for_matching(info.get("path_raw") or info.get("path")): info
+                for info in all_raw_files_processed_info
+                if isinstance(info, dict)
+            }
+            used_paths: set[str] = set()
+            mapped_info_groups: list[list[dict]] = []
+            missing_preplan: list[str] = []
+            for group_paths in preplan_groups_override_paths:
+                current_group: list[dict] = []
+                for path_norm in group_paths:
+                    if not path_norm:
+                        continue
+                    info = path_lookup.get(path_norm)
+                    if info is not None:
+                        current_group.append(info)
+                        used_paths.add(path_norm)
+                    else:
+                        missing_preplan.append(path_norm)
+                if current_group:
+                    mapped_info_groups.append(current_group)
+            if mapped_info_groups:
+                leftovers = [
+                    info
+                    for info in all_raw_files_processed_info
+                    if _normalize_path_for_matching(info.get("path_raw") or info.get("path")) not in used_paths
+                ]
+                if leftovers:
+                    mapped_info_groups.append(leftovers)
+                seestar_stack_groups = mapped_info_groups
+                preplan_groups_active = True
                 _log_and_callback(
-                    "clusterstacks_warn_ram_budget_recluster",
+                    f"Phase 2: using {len(mapped_info_groups)} preplanned group(s) from filter UI.",
                     prog=None,
-                    lvl="WARN",
+                    lvl="INFO_DETAIL",
                     callback=progress_callback,
-                    group_index=adj.get("group_index"),
-                    original_frames=adj.get("original_frames"),
-                    num_subgroups=adj.get("num_subgroups"),
-                    new_threshold_deg=adj.get("new_threshold_deg"),
-                    attempts=adj.get("attempts"),
-                    estimated_mb=adj.get("estimated_mb"),
-                    budget_mb=adj.get("budget_mb"),
                 )
-            elif method == "split":
-                _log_and_callback(
-                    "clusterstacks_warn_ram_budget_split",
-                    prog=None,
-                    lvl="WARN",
-                    callback=progress_callback,
-                    group_index=adj.get("group_index"),
-                    original_frames=adj.get("original_frames"),
-                    num_subgroups=adj.get("num_subgroups"),
-                    segment_size=adj.get("segment_size"),
-                    estimated_mb=adj.get("estimated_mb"),
-                    budget_mb=adj.get("budget_mb"),
-                )
-                if adj.get("still_over_budget"):
+                if missing_preplan:
+                    try:
+                        preview = ", ".join(os.path.basename(p) for p in missing_preplan[:5] if p)
+                    except Exception:
+                        preview = ""
                     _log_and_callback(
-                        "clusterstacks_warn_ram_budget_split_still_over",
+                        "Phase 2: some preplanned paths were not found after preprocessing: "
+                        + (preview if preview else str(len(missing_preplan))),
+                        prog=None,
+                        lvl="WARN",
+                        callback=progress_callback,
+                    )
+        except Exception as e_preplan_map:
+            _log_and_callback(
+                f"Phase 2: failed to map preplanned groups ({e_preplan_map}). Falling back to clustering.",
+                prog=None,
+                lvl="WARN",
+                callback=progress_callback,
+            )
+            preplan_groups_active = False
+
+    if not preplan_groups_active:
+        seestar_stack_groups = cluster_seestar_stacks_connected(
+            all_raw_files_processed_info,
+            SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG,
+            progress_callback,
+            orientation_split_threshold_deg=ORIENTATION_SPLIT_THRESHOLD_DEG,
+        )
+        if STACK_RAM_BUDGET_BYTES > 0 and seestar_stack_groups:
+            seestar_stack_groups, ram_budget_adjustments = _apply_ram_budget_to_groups(
+                seestar_stack_groups,
+                STACK_RAM_BUDGET_BYTES,
+                float(SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG),
+                float(ORIENTATION_SPLIT_THRESHOLD_DEG),
+            )
+            for adj in ram_budget_adjustments:
+                method = adj.get("method")
+                if method == "recluster":
+                    _log_and_callback(
+                        "clusterstacks_warn_ram_budget_recluster",
                         prog=None,
                         lvl="WARN",
                         callback=progress_callback,
                         group_index=adj.get("group_index"),
-                        segment_size=adj.get("segment_size"),
+                        original_frames=adj.get("original_frames"),
+                        num_subgroups=adj.get("num_subgroups"),
+                        new_threshold_deg=adj.get("new_threshold_deg"),
+                        attempts=adj.get("attempts"),
+                        estimated_mb=adj.get("estimated_mb"),
                         budget_mb=adj.get("budget_mb"),
                     )
-            elif method == "single_over_budget":
-                _log_and_callback(
-                    "clusterstacks_warn_ram_budget_single_over",
-                    prog=None,
-                    lvl="WARN",
-                    callback=progress_callback,
-                    group_index=adj.get("group_index"),
-                    estimated_mb=adj.get("estimated_mb"),
-                    budget_mb=adj.get("budget_mb"),
-                )
+                elif method == "split":
+                    _log_and_callback(
+                        "clusterstacks_warn_ram_budget_split",
+                        prog=None,
+                        lvl="WARN",
+                        callback=progress_callback,
+                        group_index=adj.get("group_index"),
+                        original_frames=adj.get("original_frames"),
+                        num_subgroups=adj.get("num_subgroups"),
+                        segment_size=adj.get("segment_size"),
+                        estimated_mb=adj.get("estimated_mb"),
+                        budget_mb=adj.get("budget_mb"),
+                    )
+                    if adj.get("still_over_budget"):
+                        _log_and_callback(
+                            "clusterstacks_warn_ram_budget_split_still_over",
+                            prog=None,
+                            lvl="WARN",
+                            callback=progress_callback,
+                            group_index=adj.get("group_index"),
+                            segment_size=adj.get("segment_size"),
+                            budget_mb=adj.get("budget_mb"),
+                        )
+                elif method == "single_over_budget":
+                    _log_and_callback(
+                        "clusterstacks_warn_ram_budget_single_over",
+                        prog=None,
+                        lvl="WARN",
+                        callback=progress_callback,
+                        group_index=adj.get("group_index"),
+                        estimated_mb=adj.get("estimated_mb"),
+                        budget_mb=adj.get("budget_mb"),
+                    )
     # Diagnostic: nearest-neighbor separation percentiles to help tune eps
     try:
         panel_centers_sky_dbg = []
@@ -4137,7 +4676,7 @@ def run_hierarchical_mosaic(
         target_groups = int(cluster_target_groups_config or 0)
     except Exception:
         target_groups = 0
-    if target_groups > 0 and len(seestar_stack_groups) != target_groups:
+    if (not preplan_groups_active) and target_groups > 0 and len(seestar_stack_groups) != target_groups:
         try:
             # Build coordinates array
             panel_centers_sky = []
@@ -4246,7 +4785,7 @@ def run_hierarchical_mosaic(
     if not seestar_stack_groups:
         pcb("run_error_phase2_no_groups", prog=(base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING), lvl="ERROR")
         return
-    if auto_caps_info and seestar_stack_groups:
+    if (not preplan_groups_active) and auto_caps_info and seestar_stack_groups:
         try:
             cap_value = int(auto_caps_info.get("cap", 0))
             min_value = int(auto_caps_info.get("min_cap", 8))
@@ -4271,10 +4810,20 @@ def run_hierarchical_mosaic(
                     )
                 except Exception:
                     pass
+            if min_value > 0:
+                seestar_stack_groups = _merge_small_groups(
+                    seestar_stack_groups,
+                    min_size=min_value,
+                    cap=cap_value,
+                )
 
     # Do not subdivide groups if a target group count is set; respect clustering first.
-    if (cluster_target_groups_config is None or int(cluster_target_groups_config) <= 0) and \
-       max_raw_per_master_tile_config and max_raw_per_master_tile_config > 0:
+    if (
+        not preplan_groups_active
+        and (cluster_target_groups_config is None or int(cluster_target_groups_config) <= 0)
+        and max_raw_per_master_tile_config
+        and max_raw_per_master_tile_config > 0
+    ):
         new_groups = []
         for g in seestar_stack_groups:
             for i in range(0, len(g), max_raw_per_master_tile_config):
@@ -4306,7 +4855,11 @@ def run_hierarchical_mosaic(
             lvl="INFO_DETAIL",
         )
     manual_limit = max_raw_per_master_tile_config
-    if (cluster_target_groups_config is None or int(cluster_target_groups_config) <= 0) and auto_limit_frames_per_master_tile_config:
+    if (
+        not preplan_groups_active
+        and (cluster_target_groups_config is None or int(cluster_target_groups_config) <= 0)
+        and auto_limit_frames_per_master_tile_config
+    ):
         try:
             sample_path = seestar_stack_groups[0][0].get('path_preprocessed_cache')
             sample_arr = np.load(sample_path, mmap_mode='r')
@@ -4939,6 +5492,12 @@ def run_hierarchical_mosaic(
                     base_progress_phase5=base_progress_phase5,
                     progress_weight_phase5=PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
                     start_time_total_run=start_time_total_run,
+                    intertile_photometric_match=bool(intertile_photometric_match_config),
+                    intertile_preview_size=int(intertile_preview_size_config),
+                    intertile_overlap_min=float(intertile_overlap_min_config),
+                    intertile_sky_percentile=intertile_sky_percentile_tuple,
+                    intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
+                    use_auto_intertile=bool(use_auto_intertile_config),
                 )
             except Exception as e_gpu:
                 logger.warning("GPU reproject_coadd failed, falling back to CPU: %s", e_gpu)
@@ -4958,6 +5517,12 @@ def run_hierarchical_mosaic(
                     base_progress_phase5=base_progress_phase5,
                     progress_weight_phase5=PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
                     start_time_total_run=start_time_total_run,
+                    intertile_photometric_match=bool(intertile_photometric_match_config),
+                    intertile_preview_size=int(intertile_preview_size_config),
+                    intertile_overlap_min=float(intertile_overlap_min_config),
+                    intertile_sky_percentile=intertile_sky_percentile_tuple,
+                    intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
+                    use_auto_intertile=bool(use_auto_intertile_config),
                 )
         else:
             final_mosaic_data_HWC, final_mosaic_coverage_HW = assemble_final_mosaic_reproject_coadd(
@@ -4976,6 +5541,12 @@ def run_hierarchical_mosaic(
                 base_progress_phase5=base_progress_phase5,
                 progress_weight_phase5=PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
                 start_time_total_run=start_time_total_run,
+                intertile_photometric_match=bool(intertile_photometric_match_config),
+                intertile_preview_size=int(intertile_preview_size_config),
+                intertile_overlap_min=float(intertile_overlap_min_config),
+                intertile_sky_percentile=intertile_sky_percentile_tuple,
+                intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
+                use_auto_intertile=bool(use_auto_intertile_config),
             )
 
         log_key_phase5_failed = "run_error_phase5_assembly_failed_reproject_coadd"
@@ -5005,7 +5576,7 @@ def run_hierarchical_mosaic(
         try: final_header.update(final_output_wcs.to_header(relax=True))
         except Exception as e_hdr_wcs: pcb("run_warn_phase6_wcs_to_header_failed", error=str(e_hdr_wcs), lvl="WARN")
     
-    final_header['SOFTWARE']=('ZeMosaic v2.9.1','Mosaic Software') # Incrémente la version si tu le souhaites
+    final_header['SOFTWARE']=('ZeMosaic v2.9.6','Mosaic Software') # Incrémente la version si tu le souhaites
     final_header['NMASTILE']=(len(master_tiles_results_list),"Master Tiles combined")
     final_header['NRAWINIT']=(num_total_raw_files,"Initial raw images found")
     final_header['NRAWPROC']=(len(all_raw_files_processed_info),"Raw images with WCS processed")

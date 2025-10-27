@@ -292,6 +292,19 @@ class ZeMosaicGUI:
         self.cleanup_memmap_var = tk.BooleanVar(master=self.root, value=self.config.get("coadd_cleanup_memmap", True))
         self.auto_limit_frames_var = tk.BooleanVar(master=self.root, value=self.config.get("auto_limit_frames_per_master_tile", True))
         self.max_raw_per_tile_var = tk.IntVar(master=self.root, value=self.config.get("max_raw_per_master_tile", 0))
+        intertile_sky_cfg = self.config.get("intertile_sky_percentile", [30.0, 70.0])
+        if not (isinstance(intertile_sky_cfg, (list, tuple)) and len(intertile_sky_cfg) >= 2):
+            intertile_sky_cfg = [30.0, 70.0]
+        self.intertile_match_var = tk.BooleanVar(master=self.root, value=self.config.get("intertile_photometric_match", True))
+        self.intertile_preview_size_var = tk.IntVar(master=self.root, value=self.config.get("intertile_preview_size", 512))
+        self.intertile_overlap_min_var = tk.DoubleVar(master=self.root, value=self.config.get("intertile_overlap_min", 0.05))
+        self.intertile_sky_low_var = tk.DoubleVar(master=self.root, value=float(intertile_sky_cfg[0]))
+        self.intertile_sky_high_var = tk.DoubleVar(master=self.root, value=float(intertile_sky_cfg[1]))
+        self.intertile_clip_sigma_var = tk.DoubleVar(master=self.root, value=self.config.get("intertile_robust_clip_sigma", 2.5))
+        self.use_auto_intertile_var = tk.BooleanVar(
+            master=self.root,
+            value=self.config.get("use_auto_intertile", False),
+        )
         self.use_gpu_phase5_var = tk.BooleanVar(master=self.root, value=self.config.get("use_gpu_phase5", False))
         # Logging level var (keys are ERROR, WARN, INFO, DEBUG)
         self.logging_level_keys = ["ERROR", "WARN", "INFO", "DEBUG"]
@@ -845,6 +858,98 @@ class ZeMosaicGUI:
         self.use_gpu_phase5_var.trace_add("write", on_gpu_check)
         on_gpu_check()
 
+        intertile_label = ttk.Label(final_assembly_options_frame, text="")
+        intertile_label.grid(row=asm_opt_row, column=0, padx=5, pady=3, sticky="w")
+        self.translatable_widgets["intertile_match_label"] = intertile_label
+        self.intertile_match_check = ttk.Checkbutton(
+            final_assembly_options_frame,
+            variable=self.intertile_match_var,
+        )
+        self.intertile_match_check.grid(row=asm_opt_row, column=1, padx=5, pady=3, sticky="w")
+        asm_opt_row += 1
+
+        intertile_params_frame = ttk.Frame(final_assembly_options_frame)
+        intertile_params_frame.grid(row=asm_opt_row, column=0, columnspan=2, padx=5, pady=(0, 3), sticky="ew")
+        intertile_params_frame.columnconfigure(1, weight=1)
+
+        preview_label = ttk.Label(intertile_params_frame, text="")
+        preview_label.grid(row=0, column=0, padx=0, pady=2, sticky="w")
+        self.translatable_widgets["intertile_preview_label"] = preview_label
+        ttk.Spinbox(
+            intertile_params_frame,
+            from_=128,
+            to=2048,
+            increment=64,
+            textvariable=self.intertile_preview_size_var,
+            width=8,
+        ).grid(row=0, column=1, padx=(8, 5), pady=2, sticky="w")
+        preview_hint = ttk.Label(intertile_params_frame, text="")
+        preview_hint.grid(row=0, column=2, padx=(8, 0), pady=2, sticky="w")
+        self.translatable_widgets["intertile_preview_hint"] = preview_hint
+
+        overlap_label = ttk.Label(intertile_params_frame, text="")
+        overlap_label.grid(row=1, column=0, padx=0, pady=2, sticky="w")
+        self.translatable_widgets["intertile_overlap_label"] = overlap_label
+        ttk.Spinbox(
+            intertile_params_frame,
+            from_=0.0,
+            to=1.0,
+            increment=0.01,
+            textvariable=self.intertile_overlap_min_var,
+            width=8,
+            format="%.2f",
+        ).grid(row=1, column=1, padx=(8, 5), pady=2, sticky="w")
+        overlap_hint = ttk.Label(intertile_params_frame, text="")
+        overlap_hint.grid(row=1, column=2, padx=(8, 0), pady=2, sticky="w")
+        self.translatable_widgets["intertile_overlap_hint"] = overlap_hint
+
+        sky_label = ttk.Label(intertile_params_frame, text="")
+        sky_label.grid(row=2, column=0, padx=0, pady=2, sticky="w")
+        self.translatable_widgets["intertile_sky_label"] = sky_label
+        sky_frame = ttk.Frame(intertile_params_frame)
+        sky_frame.grid(row=2, column=1, padx=(8, 5), pady=2, sticky="w")
+        ttk.Spinbox(
+            sky_frame,
+            from_=0.0,
+            to=100.0,
+            increment=1.0,
+            textvariable=self.intertile_sky_low_var,
+            width=5,
+            format="%.1f",
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Spinbox(
+            sky_frame,
+            from_=0.0,
+            to=100.0,
+            increment=1.0,
+            textvariable=self.intertile_sky_high_var,
+            width=5,
+            format="%.1f",
+        ).pack(side=tk.LEFT)
+
+        clip_label = ttk.Label(intertile_params_frame, text="")
+        clip_label.grid(row=3, column=0, padx=0, pady=2, sticky="w")
+        self.translatable_widgets["intertile_clip_label"] = clip_label
+        ttk.Spinbox(
+            intertile_params_frame,
+            from_=0.5,
+            to=10.0,
+            increment=0.1,
+            textvariable=self.intertile_clip_sigma_var,
+            width=8,
+            format="%.1f",
+        ).grid(row=3, column=1, padx=(8, 5), pady=2, sticky="w")
+
+        self.intertile_auto_check = ttk.Checkbutton(
+            intertile_params_frame,
+            variable=self.use_auto_intertile_var,
+            text="",
+        )
+        self.intertile_auto_check.grid(row=4, column=0, columnspan=3, padx=0, pady=(4, 2), sticky="w")
+        self.translatable_widgets["intertile_auto_label"] = self.intertile_auto_check
+
+        asm_opt_row += 1
+
         # --- Logging Options Frame ---
         self.logging_frame = ttk.LabelFrame(self.scrollable_content_frame, text=self._tr("gui_logging_title", "Logging"))
         self.logging_frame.pack(fill=tk.X, pady=(0,10))
@@ -1223,74 +1328,27 @@ class ZeMosaicGUI:
             messagebox.showerror(self._tr("error_title"), self._tr("invalid_input_folder_error"), parent=self.root)
             return
 
-        # Collect FITS paths deterministically
-        fits_paths = []
-        for r, _dirs, files in os.walk(input_dir):
-            try:
-                files = sorted(files, key=lambda s: s.lower())
-            except Exception:
-                files = list(files)
-            for fn in files:
-                if fn.lower().endswith((".fit", ".fits")):
-                    fits_paths.append(os.path.join(r, fn))
+        # Ensure the directory contains at least one FITS file without performing
+        # a full upfront crawl (which can freeze the UI on large trees).
+        has_fits = False
         try:
-            fits_paths.sort(key=lambda p: p.lower())
+            for root_dir, _dirs, files in os.walk(input_dir):
+                for fn in files:
+                    if fn.lower().endswith((".fit", ".fits")):
+                        has_fits = True
+                        break
+                if has_fits:
+                    break
         except Exception:
-            fits_paths.sort()
+            has_fits = False
 
-        if not fits_paths:
-            messagebox.showwarning(self._tr("error_title"), self._tr("run_error_no_fits_found_input", "No FITS files found in input folder."), parent=self.root)
+        if not has_fits:
+            messagebox.showwarning(
+                self._tr("error_title"),
+                self._tr("run_error_no_fits_found_input", "No FITS files found in input folder."),
+                parent=self.root,
+            )
             return
-
-        # Lightweight header scan (subset of worker logic)
-        header_items = []
-        try:
-            from astropy.io import fits
-            from astropy.wcs import WCS
-            from astropy.coordinates import SkyCoord
-            import astropy.units as u
-        except Exception:
-            # Launch filter anyway; it will fail-safe and return unchanged
-            fits = None; WCS = None; SkyCoord = None; u = None
-
-        for i, fpath in enumerate(fits_paths):
-            hdr = None; wcs0 = None; shp_hw = None; center_sc = None
-            try:
-                if fits is not None:
-                    hdr = fits.getheader(fpath, 0)
-                    try:
-                        nax1 = int(hdr.get("NAXIS1", 0)); nax2 = int(hdr.get("NAXIS2", 0))
-                        if nax1 > 0 and nax2 > 0:
-                            shp_hw = (nax2, nax1)
-                    except Exception:
-                        shp_hw = None
-                    try:
-                        w = WCS(hdr, naxis=2, relax=True) if WCS is not None else None
-                        if w and getattr(w, "is_celestial", False):
-                            wcs0 = w
-                    except Exception:
-                        wcs0 = None
-                    if wcs0 is None and hdr is not None and SkyCoord is not None and u is not None:
-                        try:
-                            crval = getattr(getattr(wcs0, 'wcs', None), 'crval', None)
-                            if crval is None and hdr is not None:
-                                ra = hdr.get('CRVAL1'); dec = hdr.get('CRVAL2')
-                                if ra is not None and dec is not None:
-                                    center_sc = SkyCoord(float(ra) * u.deg, float(dec) * u.deg, frame='icrs')
-                        except Exception:
-                            center_sc = None
-            except Exception:
-                pass
-            item = {"path": fpath, "index": i}
-            if hdr is not None:
-                item["header"] = hdr
-            if shp_hw is not None:
-                item["shape"] = shp_hw
-            if wcs0 is not None:
-                item["wcs"] = wcs0
-            if center_sc is not None:
-                item["center"] = center_sc
-            header_items.append(item)
 
         # Import filter UI lazily and launch
         try:
@@ -1313,7 +1371,62 @@ class ZeMosaicGUI:
                 }
             except Exception:
                 _initial_overrides = None
-            result = launch_filter_interface(header_items, _initial_overrides)
+            solver_cfg_payload = None
+            config_overrides = None
+            try:
+                astap_exe = self.astap_exe_path_var.get().strip()
+                astap_data = self.astap_data_dir_var.get().strip()
+                try:
+                    astap_radius = float(self.astap_search_radius_var.get())
+                except Exception:
+                    astap_radius = self.solver_settings.astap_search_radius_deg
+                try:
+                    astap_downsample = int(self.astap_downsample_var.get())
+                except Exception:
+                    astap_downsample = self.solver_settings.astap_downsample
+                try:
+                    astap_sensitivity = int(self.astap_sensitivity_var.get())
+                except Exception:
+                    astap_sensitivity = self.solver_settings.astap_sensitivity
+
+                self.solver_settings.astap_executable_path = astap_exe
+                self.solver_settings.astap_data_directory_path = astap_data
+                self.solver_settings.astap_search_radius_deg = astap_radius
+                self.solver_settings.astap_downsample = astap_downsample
+                self.solver_settings.astap_sensitivity = astap_sensitivity
+
+                solver_cfg_payload = asdict(self.solver_settings)
+
+                config_overrides = {
+                    "astap_executable_path": astap_exe,
+                    "astap_data_directory_path": astap_data,
+                    "astap_default_search_radius": astap_radius,
+                    "astap_default_downsample": astap_downsample,
+                    "astap_default_sensitivity": astap_sensitivity,
+                }
+                try:
+                    config_overrides.update({
+                        "auto_limit_frames_per_master_tile": bool(self.auto_limit_frames_var.get()),
+                        "max_raw_per_master_tile": int(self.max_raw_per_tile_var.get()),
+                        "apply_master_tile_crop": bool(self.apply_master_tile_crop_var.get()),
+                        "master_tile_crop_percent": float(self.master_tile_crop_percent_var.get()),
+                    })
+                except Exception:
+                    pass
+            except Exception:
+                solver_cfg_payload = asdict(self.solver_settings)
+                config_overrides = None
+
+            result = launch_filter_interface(
+                input_dir,
+                _initial_overrides,
+                stream_scan=True,
+                scan_recursive=True,
+                batch_size=200,
+                preview_cap=1500,
+                solver_settings_dict=solver_cfg_payload,
+                config_overrides=config_overrides,
+            )
         except Exception as e:
             self._log_message(f"[ZGUI] Filter UI error: {e}", level="WARN")
             return
@@ -1335,9 +1448,25 @@ class ZeMosaicGUI:
         if accepted:
             try:
                 kept = len(filtered_list) if isinstance(filtered_list, list) else 0
-                total = len(header_items)
+                total = None
+                if isinstance(overrides, dict):
+                    try:
+                        total = int(overrides.get("resolved_wcs_count"))
+                    except Exception:
+                        total = None
+                if total is None and isinstance(filtered_list, list):
+                    total = len(filtered_list)
                 self._log_message(self._tr("info", "Info"), level="INFO_DETAIL")
-                self._log_message(f"[ZGUI] Filter validated: kept {kept}/{total}. No processing started.", level="INFO_DETAIL")
+                if total is not None:
+                    self._log_message(
+                        f"[ZGUI] Filter validated: kept {kept}/{total}. No processing started.",
+                        level="INFO_DETAIL",
+                    )
+                else:
+                    self._log_message(
+                        f"[ZGUI] Filter validated: kept {kept} files. No processing started.",
+                        level="INFO_DETAIL",
+                    )
             except Exception:
                 pass
             # Apply clustering overrides if provided
@@ -1711,7 +1840,7 @@ class ZeMosaicGUI:
             cluster_thresh_val = self.cluster_threshold_var.get()
             cluster_target_groups_val = self.cluster_target_groups_var.get()
             cluster_orientation_split_val = self.cluster_orientation_split_var.get()
-            
+
             stack_norm_method = self.stacking_normalize_method_var.get()
             stack_weight_method = self.stacking_weighting_method_var.get()
             stack_reject_algo = self.stacking_rejection_algorithm_var.get()
@@ -1724,7 +1853,7 @@ class ZeMosaicGUI:
             radial_feather_fraction_val = self.radial_feather_fraction_var.get()
             min_radial_weight_floor_val = self.min_radial_weight_floor_var.get()
             radial_shape_power_val = self.config.get("radial_shape_power", 2.0) # Toujours depuis config pour l'instant
-            
+
             final_assembly_method_val = self.final_assembly_method_var.get()
             num_base_workers_gui_val = self.num_workers_var.get()
 
@@ -1732,6 +1861,11 @@ class ZeMosaicGUI:
             self.solver_settings.api_key = self.astrometry_api_key_var.get().strip()
             self.solver_settings.timeout = self.astrometry_timeout_var.get()
             self.solver_settings.downsample = self.astrometry_downsample_var.get()
+            self.solver_settings.astap_executable_path = astap_exe
+            self.solver_settings.astap_data_directory_path = astap_data
+            self.solver_settings.astap_search_radius_deg = astap_radius_val
+            self.solver_settings.astap_downsample = astap_downsample_val
+            self.solver_settings.astap_sensitivity = astap_sensitivity_val
             try:
                 self.solver_settings.save_default()
             except Exception:
@@ -1742,11 +1876,28 @@ class ZeMosaicGUI:
             master_tile_crop_percent_val = self.master_tile_crop_percent_var.get()
             # --- FIN RÉCUPÉRATION ROGNAGE ---
             
-        except tk.TclError as e: 
-            messagebox.showerror(self._tr("param_error_title"), 
-                                 self._tr("invalid_param_value_error", error=e), 
+        except tk.TclError as e:
+            messagebox.showerror(self._tr("param_error_title"),
+                                 self._tr("invalid_param_value_error", error=e),
                                  parent=self.root)
             return
+
+        # 3. Synchroniser les paramètres de stacking depuis l'UI vers la config en mémoire
+        try:
+            self.config["stacking_normalize_method"] = stack_norm_method
+            self.config["stacking_weighting_method"] = stack_weight_method
+            self.config["stacking_rejection_algorithm"] = stack_reject_algo
+            self.config["stacking_kappa_low"] = float(stack_kappa_low)
+            self.config["stacking_kappa_high"] = float(stack_kappa_high)
+            self.config["stacking_final_combine_method"] = stack_final_combine
+        except Exception:
+            pass
+
+        try:
+            # Certains widgets stockent encore les limites Winsor comme chaîne
+            self.config["stacking_winsor_limits"] = str(stack_winsor_limits_str)
+        except Exception:
+            pass
 
         # 2. VALIDATIONS (chemins, etc.)
         # ... (section de validation inchangée pour l'instant)
@@ -1841,6 +1992,15 @@ class ZeMosaicGUI:
         self.config["winsor_worker_limit"] = self.winsor_workers_var.get()
         self.config["winsor_max_frames_per_pass"] = self.winsor_max_frames_var.get()
         self.config["max_raw_per_master_tile"] = self.max_raw_per_tile_var.get()
+        self.config["intertile_photometric_match"] = bool(self.intertile_match_var.get())
+        self.config["intertile_preview_size"] = int(self.intertile_preview_size_var.get())
+        self.config["intertile_overlap_min"] = float(self.intertile_overlap_min_var.get())
+        self.config["intertile_sky_percentile"] = [
+            float(self.intertile_sky_low_var.get()),
+            float(self.intertile_sky_high_var.get()),
+        ]
+        self.config["intertile_robust_clip_sigma"] = float(self.intertile_clip_sigma_var.get())
+        self.config["use_auto_intertile"] = bool(self.use_auto_intertile_var.get())
         # Persist logging level
         self.config["logging_level"] = self.logging_level_var.get()
 
@@ -1854,7 +2014,17 @@ class ZeMosaicGUI:
                 gpu_id = idx
                 break
         if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
-            zemosaic_config.save_config(self.config)
+            try:
+                zemosaic_config.save_config(self.config)
+            except Exception:
+                pass
+
+        print(
+            f"[GUI] Stacking -> norm={self.config['stacking_normalize_method']}, "
+            f"weight={self.config['stacking_weighting_method']}, "
+            f"reject={self.config['stacking_rejection_algorithm']}, "
+            f"combine={self.config['stacking_final_combine_method']}"
+        )
 
         stack_ram_budget_val = 0.0
         try:
@@ -1895,6 +2065,15 @@ class ZeMosaicGUI:
             self.winsor_max_frames_var.get(),
             self.winsor_workers_var.get(),
             self.max_raw_per_tile_var.get(),
+            bool(self.intertile_match_var.get()),
+            int(self.intertile_preview_size_var.get()),
+            float(self.intertile_overlap_min_var.get()),
+            [
+                float(self.intertile_sky_low_var.get()),
+                float(self.intertile_sky_high_var.get()),
+            ],
+            float(self.intertile_clip_sigma_var.get()),
+            bool(self.use_auto_intertile_var.get()),
             self.use_gpu_phase5_var.get(),
             gpu_id,
             self.logging_level_var.get(),

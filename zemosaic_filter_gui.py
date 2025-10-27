@@ -26,23 +26,107 @@ Dependencies limited to tkinter, astropy, matplotlib, numpy; all optional.
 from __future__ import annotations
 
 from typing import List, Dict, Any, Optional
+from collections.abc import Iterable
+from dataclasses import asdict
 import os
 import sys
 import shutil
 import datetime
 import importlib
+import time
+import traceback
+import threading
+import queue
+
+
+def _group_center_deg(group: list[dict]) -> Optional[tuple[float, float]]:
+    """Return the average RA/DEC (degrees) of a group if available."""
+
+    ras: list[float] = []
+    decs: list[float] = []
+    for info in group:
+        ra = info.get("RA")
+        dec = info.get("DEC")
+        if ra is not None and dec is not None:
+            try:
+                ras.append(float(ra))
+                decs.append(float(dec))
+            except Exception:
+                continue
+    if not ras:
+        return None
+    return (sum(ras) / len(ras), sum(decs) / len(decs))
+
+
+def _angular_sep_deg(a: Optional[tuple[float, float]], b: Optional[tuple[float, float]]) -> float:
+    """Approximate angular separation in degrees between two (RA, DEC) tuples."""
+
+    if not a or not b:
+        return 9999.0
+    dra = abs(a[0] - b[0])
+    ddec = abs(a[1] - b[1])
+    return (dra ** 2 + ddec ** 2) ** 0.5
+
+
+def _merge_small_groups(groups: list[list[dict]], min_size: int, cap: int) -> list[list[dict]]:
+    """
+    Merge groups smaller than ``min_size`` with their nearest neighbour when the
+    resulting size stays below ``cap`` (allowing a 10% margin).
+    """
+
+    if not groups or min_size <= 0 or cap <= 0:
+        return groups
+
+    merged_flags = [False] * len(groups)
+    centers = [_group_center_deg(g) for g in groups]
+
+    for i, group in enumerate(groups):
+        if merged_flags[i] or len(group) >= min_size:
+            continue
+
+        best_j: Optional[int] = None
+        best_dist = float("inf")
+        for j, neighbour in enumerate(groups):
+            if i == j or merged_flags[j]:
+                continue
+            dist = _angular_sep_deg(centers[i], centers[j])
+            if dist < best_dist:
+                best_dist = dist
+                best_j = j
+
+        if best_j is not None:
+            candidate_size = len(groups[best_j]) + len(group)
+            if candidate_size <= int(cap * 1.1):
+                groups[best_j].extend(group)
+                merged_flags[i] = True
+                print(
+                    f"[AutoMerge] Group {i} ({len(group)} imgs) merged into {best_j} "
+                    f"(now {len(groups[best_j])})"
+                )
+
+    return [grp for idx, grp in enumerate(groups) if not merged_flags[idx]]
 
 
 def launch_filter_interface(
-    raw_files_with_wcs: List[Dict[str, Any]],
+    raw_files_with_wcs_or_dir,
     initial_overrides: Optional[Dict[str, Any]] = None,
+    *,
+    stream_scan: bool = False,
+    scan_recursive: bool = True,
+    batch_size: int = 100,
+    preview_cap: int = 1000,
+    solver_settings_dict: Optional[Dict[str, Any]] = None,
+    config_overrides: Optional[Dict[str, Any]] = None,
+    **kwargs,
 ):
     """
     Display an optional Tkinter GUI to filter WCS-resolved images.
 
     Parameters
     ----------
-    raw_files_with_wcs : list[dict]
+    raw_files_with_wcs_or_dir : list[dict] | str
+        Either the legacy list of metadata dictionaries or, when ``stream_scan``
+        is True, a directory path to crawl lazily for FITS files.
         Each dict should ideally include:
           - 'path' (or 'path_raw') : absolute path to the FITS file
           - 'wcs' : astropy.wcs.WCS object
@@ -51,52 +135,195 @@ def launch_filter_interface(
           - 'center' (optional) : astropy.coordinates.SkyCoord
           - 'header' (optional) : astropy.io.fits.Header (used to infer shape)
 
+    stream_scan : bool, optional
+        Enable lazy directory crawling instead of receiving a pre-computed
+        metadata list.  When enabled, ``raw_files_with_wcs_or_dir`` must be a
+        directory path.
+    scan_recursive : bool, optional
+        When ``stream_scan`` is active, decide whether to descend into
+        sub-directories (default: True).
+    batch_size : int, optional
+        Number of files to accumulate before pushing a batch to the UI while
+        streaming (default: 100).
+    preview_cap : int, optional
+        Maximum number of footprints drawn on the Matplotlib preview to avoid
+        locking the UI for very large directories (default: 1000).
+    solver_settings_dict : dict, optional
+        Dictionary of solver configuration selected in the main GUI. When
+        provided, values such as ASTAP paths and search radius override the
+        defaults loaded from configuration files.
+    config_overrides : dict, optional
+        Additional configuration values collected from the main GUI (for
+        example the ASTAP data directory or clustering caps). These override
+        the defaults detected by this module.
+
     Returns
     -------
     tuple[list[dict], bool, dict | None]
         (filtered_list, accepted, overrides) where accepted is True only when
         Validate is clicked; False when Cancel is clicked or the window is closed.
-        overrides contains user-chosen clustering parameters (or None):
-          {"cluster_panel_threshold": float,
-           "cluster_target_groups": int,
-           "cluster_orientation_split_deg": float}
+        overrides can contain optional metadata collected in the filter GUI, such
+        as pre-computed master tile groupings or counters for resolved WCS files:
+          {
+             "preplan_master_groups": list[list[dict]],
+             "autosplit_cap": int,
+             "filter_excluded_indices": list[int],
+             "resolved_wcs_count": int,
+          }
+        Keys are included only when relevant actions were triggered.
     """
     # Early validation and fail-safe behavior
-    if not isinstance(raw_files_with_wcs, list) or not raw_files_with_wcs:
-        return raw_files_with_wcs, False, None
+    stream_mode = False
+    input_dir: Optional[str] = None
+
+    if stream_scan and isinstance(raw_files_with_wcs_or_dir, str):
+        candidate = raw_files_with_wcs_or_dir
+        if os.path.isdir(candidate):
+            stream_mode = True
+            input_dir = candidate
+        else:
+            return [], False, None
+
+    if not stream_mode:
+        if not isinstance(raw_files_with_wcs_or_dir, list) or not raw_files_with_wcs_or_dir:
+            return raw_files_with_wcs_or_dir, False, None
+
+    raw_items_input = raw_files_with_wcs_or_dir
 
     try:
         # --- Optional localization support (autonomous fallback) ---
         # If running inside the ZeMosaic project folder structure, try to use
         # the existing localization system and the language set in main GUI.
         localizer = None
-        cfg_defaults: Dict[str, Any] = {}
-        try:
-            # Ensure project directory is on sys.path to import locales/* and config
-            base_dir = os.path.dirname(os.path.abspath(__file__))
-            if base_dir not in sys.path:
-                sys.path.insert(0, base_dir)
+        cfg_defaults: Dict[str, Any] = {
+            "astap_executable_path": "",
+            "astap_data_directory_path": "",
+            "astap_default_search_radius": 0.0,
+            "astap_default_downsample": 0,
+            "astap_default_sensitivity": 100,
+            "auto_limit_frames_per_master_tile": True,
+            "max_raw_per_master_tile": 0,
+            "apply_master_tile_crop": False,
+            "master_tile_crop_percent": 0.0,
+        }
+        cfg: Dict[str, Any] | None = None
+        solver_settings_payload: Dict[str, Any] = {}
+        lang_code = "en"
 
-            # Try import of localization util
-            locales_mod = importlib.import_module('locales.zemosaic_localization')
-            ZeMosaicLocalization = getattr(locales_mod, 'ZeMosaicLocalization', None)
+        # Ensure project directory is on sys.path to import project modules
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        if base_dir not in sys.path:
+            sys.path.insert(0, base_dir)
 
-            # Try import of config to get language preference and defaults
-            lang_code = 'en'
+        # Try to load localization support from either legacy or packaged paths
+        localizer_cls = None
+        localization_errors: list[str] = []
+        for mod_name in ("zemosaic_localization", "locales.zemosaic_localization"):
             try:
-                zcfg = importlib.import_module('zemosaic_config')
-                cfg = zcfg.load_config()
-                lang_code = cfg.get('language', 'en')
-                cfg_defaults['cluster_panel_threshold'] = float(cfg.get('cluster_panel_threshold', 0.08))
-                cfg_defaults['cluster_target_groups'] = int(cfg.get('cluster_target_groups', 0))
-                cfg_defaults['cluster_orientation_split_deg'] = float(cfg.get('cluster_orientation_split_deg', 0.0))
-            except Exception:
-                lang_code = 'en'
+                module = importlib.import_module(mod_name)
+                candidate = getattr(module, "ZeMosaicLocalization", None)
+                if candidate is not None:
+                    localizer_cls = candidate
+                    break
+            except Exception as exc:
+                localization_errors.append(str(exc))
 
-            if ZeMosaicLocalization is not None:
-                localizer = ZeMosaicLocalization(language_code=lang_code)
+        # Load persistent configuration if available
+        zconfig_module = None
+        try:
+            zconfig_module = importlib.import_module("zemosaic_config")
         except Exception:
-            localizer = None
+            try:
+                pkg_prefix = globals().get("__package__") or ""
+                if pkg_prefix:
+                    zconfig_module = importlib.import_module(f"{pkg_prefix}.zemosaic_config")
+            except Exception as exc:
+                print(f"WARNING (Filter GUI): failed to import configuration module: {exc}")
+                zconfig_module = None
+
+        if zconfig_module is not None:
+            try:
+                cfg = zconfig_module.load_config()
+                if isinstance(cfg, dict):
+                    lang_code = str(cfg.get("language", lang_code))
+                    cfg_defaults.update({
+                        "astap_executable_path": cfg.get("astap_executable_path", cfg_defaults["astap_executable_path"]),
+                        "astap_data_directory_path": cfg.get("astap_data_directory_path", cfg_defaults["astap_data_directory_path"]),
+                        "astap_default_search_radius": cfg.get("astap_default_search_radius", cfg_defaults["astap_default_search_radius"]),
+                        "astap_default_downsample": cfg.get("astap_default_downsample", cfg_defaults["astap_default_downsample"]),
+                        "astap_default_sensitivity": cfg.get("astap_default_sensitivity", cfg_defaults["astap_default_sensitivity"]),
+                        "auto_limit_frames_per_master_tile": cfg.get("auto_limit_frames_per_master_tile", cfg_defaults["auto_limit_frames_per_master_tile"]),
+                        "max_raw_per_master_tile": cfg.get("max_raw_per_master_tile", cfg_defaults["max_raw_per_master_tile"]),
+                        "apply_master_tile_crop": cfg.get("apply_master_tile_crop", cfg_defaults["apply_master_tile_crop"]),
+                        "master_tile_crop_percent": cfg.get("master_tile_crop_percent", cfg_defaults["master_tile_crop_percent"]),
+                    })
+            except Exception as exc:
+                print(f"WARNING (Filter GUI): failed to load configuration: {exc}")
+
+        # Load solver settings (either provided by caller or defaults)
+        solver_cls = None
+        solver_module = None
+        try:
+            solver_module = importlib.import_module("solver_settings")
+        except Exception:
+            try:
+                pkg_prefix = globals().get("__package__") or ""
+                if pkg_prefix:
+                    solver_module = importlib.import_module(f"{pkg_prefix}.solver_settings")
+            except Exception as exc:
+                print(f"WARNING (Filter GUI): failed to import solver settings: {exc}")
+                solver_module = None
+
+        if solver_module is not None:
+            solver_cls = getattr(solver_module, "SolverSettings", None)
+
+        if isinstance(solver_settings_dict, dict):
+            solver_settings_payload.update(solver_settings_dict)
+        elif solver_cls is not None:
+            try:
+                solver_settings = solver_cls.load_default()
+            except Exception:
+                solver_settings = solver_cls()
+            try:
+                solver_settings_payload.update(asdict(solver_settings))
+            except Exception:
+                pass
+
+        if solver_settings_payload:
+            exe_path = solver_settings_payload.get("astap_executable_path")
+            data_path = solver_settings_payload.get("astap_data_directory_path")
+            search_radius = solver_settings_payload.get("astap_search_radius_deg")
+            downsample = solver_settings_payload.get("astap_downsample")
+            sensitivity = solver_settings_payload.get("astap_sensitivity")
+
+            if isinstance(exe_path, str) and exe_path:
+                cfg_defaults["astap_executable_path"] = exe_path
+            if isinstance(data_path, str) and data_path:
+                cfg_defaults["astap_data_directory_path"] = data_path
+            if search_radius is not None:
+                cfg_defaults["astap_default_search_radius"] = search_radius
+            if downsample is not None:
+                cfg_defaults["astap_default_downsample"] = downsample
+            if sensitivity is not None:
+                cfg_defaults["astap_default_sensitivity"] = sensitivity
+
+        if localizer_cls is not None:
+            try:
+                localizer = localizer_cls(language_code=lang_code)
+            except Exception as exc:
+                print(f"WARNING (Filter GUI): failed to initialise localization: {exc}")
+                localizer = None
+        elif localization_errors:
+            print(
+                "WARNING (Filter GUI): localization module not available; proceeding with defaults. "
+                f"Details: {localization_errors[-1]}"
+            )
+
+        if isinstance(config_overrides, dict):
+            try:
+                cfg_defaults.update(config_overrides)
+            except Exception:
+                pass
 
         def _tr(key: str, default_text: Optional[str] = None, **kwargs) -> str:
             if localizer is not None:
@@ -110,17 +337,311 @@ def launch_filter_interface(
 
         # Imports kept inside to avoid import-time errors affecting pipeline
         import tkinter as tk
-        from tkinter import ttk, messagebox
+        from tkinter import ttk, messagebox, scrolledtext
 
         from core.tk_safe import patch_tk_variables
 
         patch_tk_variables()
         import numpy as np
         from astropy.coordinates import SkyCoord
+        from astropy.io import fits
+        from astropy.wcs import WCS
         import astropy.units as u
         from matplotlib.figure import Figure
         from matplotlib.patches import Polygon
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+        astrometry_mod = None
+        worker_mod = None
+        _import_failures: Dict[str, list[str]] = {}
+
+        def _record_import_failure(key: str, module_name: str, exc: BaseException) -> None:
+            message = f"{module_name}: {exc}"
+            try:
+                tb = traceback.format_exception_only(type(exc), exc)
+                if tb:
+                    message = f"{module_name}: {tb[-1].strip()}"
+            except Exception:
+                pass
+            _import_failures.setdefault(key, []).append(message)
+
+        def _import_module_with_fallback(mod_name: str):
+            """Attempt to import a module regardless of package layout."""
+
+            candidates = [mod_name]
+            pkg = globals().get("__package__") or ""
+            if pkg:
+                candidates.append(f"{pkg}.{mod_name}")
+            if not mod_name.startswith("zemosaic"):
+                candidates.append(f"zemosaic.{mod_name}")
+
+            for candidate in candidates:
+                try:
+                    return importlib.import_module(candidate)
+                except Exception as exc:
+                    _record_import_failure(mod_name, candidate, exc)
+            return None
+
+        astrometry_mod = _import_module_with_fallback('zemosaic_astrometry')
+        worker_mod = _import_module_with_fallback('zemosaic_worker')
+        worker_import_failure_summary = "; ".join(_import_failures.get('zemosaic_worker', []))
+
+        solve_with_astap = getattr(astrometry_mod, 'solve_with_astap', None) if astrometry_mod else None
+        extract_center_from_header_fn = getattr(astrometry_mod, 'extract_center_from_header', None) if astrometry_mod else None
+        astap_fits_module = getattr(astrometry_mod, 'fits', None) if astrometry_mod else None
+        astap_astropy_available = bool(getattr(astrometry_mod, 'ASTROPY_AVAILABLE_ASTROMETRY', False)) if astrometry_mod else False
+        cluster_func = getattr(worker_mod, 'cluster_seestar_stacks_connected', None) if worker_mod else None
+        autosplit_func = getattr(worker_mod, '_auto_split_groups', None) if worker_mod else None
+        compute_dispersion_func = getattr(worker_mod, '_compute_max_angular_separation_deg', None) if worker_mod else None
+
+        MAX_FOOTPRINTS = int(preview_cap or 0) or 1000
+        cache_csv_path: Optional[str] = None
+        if stream_mode and input_dir:
+            cache_csv_path = os.path.join(input_dir, "headers_cache.csv")
+
+        stream_queue: Optional[queue.Queue] = None
+        stream_state = {
+            "done": not stream_mode,
+            "running": False,
+            "pending_start": False,
+            "status_message": None,
+            "spawn_worker": None,
+            "csv_loaded": False,
+        }
+        if cache_csv_path:
+            stream_state["csv_path"] = cache_csv_path
+
+        def _iter_fits_paths(root: str, recursive: bool = True):
+            if not recursive:
+                try:
+                    with os.scandir(root) as it:
+                        for entry in it:
+                            if entry.is_file() and entry.name.lower().endswith((".fit", ".fits")):
+                                yield entry.path
+                except Exception:
+                    return
+            else:
+                for r, _dirs, files in os.walk(root):
+                    for fn in files:
+                        if fn.lower().endswith((".fit", ".fits")):
+                            yield os.path.join(r, fn)
+
+        def _minimal_header_payload(fpath: str) -> Dict[str, Any]:
+            payload: Dict[str, Any] = {"path": fpath}
+            try:
+                hdr = fits.getheader(fpath, 0)
+            except Exception:
+                return payload
+
+            nax1 = hdr.get("NAXIS1")
+            nax2 = hdr.get("NAXIS2")
+            if isinstance(nax1, (int, float)) and isinstance(nax2, (int, float)):
+                payload["shape"] = (int(nax2), int(nax1))
+
+            ra = hdr.get("CRVAL1")
+            dec = hdr.get("CRVAL2")
+            if ra is not None and dec is not None:
+                try:
+                    payload["center"] = (float(ra), float(dec))
+                except Exception:
+                    pass
+
+            try:
+                w = WCS(hdr, naxis=2, relax=True)
+                if w is not None and getattr(w, "is_celestial", False):
+                    payload["wcs"] = w
+            except Exception:
+                pass
+
+            keep_keys = {
+                key: hdr.get(key)
+                for key in (
+                    "NAXIS1",
+                    "NAXIS2",
+                    "CRVAL1",
+                    "CRVAL2",
+                    "CTYPE1",
+                    "CTYPE2",
+                    "CDELT1",
+                    "CDELT2",
+                    "CD1_1",
+                    "CD1_2",
+                    "CD2_1",
+                    "CD2_2",
+                    "PC1_1",
+                    "PC1_2",
+                    "PC2_1",
+                    "PC2_2",
+                    "DATE-OBS",
+                    "EXPTIME",
+                    "FILTER",
+                    "OBJECT",
+                )
+                if key in hdr
+            }
+            if keep_keys:
+                payload["header"] = keep_keys
+
+            return payload
+
+        def _load_csv_bootstrap(path_csv: str) -> list[Dict[str, Any]]:
+            rows: list[Dict[str, Any]] = []
+            try:
+                import csv
+
+                with open(path_csv, "r", newline="", encoding="utf-8") as handle:
+                    reader = csv.DictReader(handle)
+                    for row in reader:
+                        entry: Dict[str, Any] = {"path": row.get("path", "")}
+                        nax1 = row.get("NAXIS1")
+                        nax2 = row.get("NAXIS2")
+                        if nax1 and nax2:
+                            try:
+                                entry["shape"] = (int(nax2), int(nax1))
+                            except Exception:
+                                pass
+                        ra_val = row.get("CRVAL1")
+                        dec_val = row.get("CRVAL2")
+                        if ra_val and dec_val:
+                            try:
+                                entry["center"] = (float(ra_val), float(dec_val))
+                            except Exception:
+                                pass
+                        header_subset = {
+                            key: row.get(key)
+                            for key in (
+                                "NAXIS1",
+                                "NAXIS2",
+                                "CRVAL1",
+                                "CRVAL2",
+                                "DATE-OBS",
+                                "EXPTIME",
+                                "FILTER",
+                                "OBJECT",
+                            )
+                            if row.get(key) is not None
+                        }
+                        if header_subset:
+                            entry["header"] = header_subset
+                        rows.append(entry)
+            except Exception:
+                return []
+            return rows
+
+        def _export_csv(path_csv: str, items_for_csv: list[Dict[str, Any]]) -> None:
+            try:
+                import csv
+
+                fieldnames = [
+                    "path",
+                    "NAXIS1",
+                    "NAXIS2",
+                    "CRVAL1",
+                    "CRVAL2",
+                    "DATE-OBS",
+                    "EXPTIME",
+                    "FILTER",
+                    "OBJECT",
+                ]
+                with open(path_csv, "w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                    writer.writeheader()
+                    for item in items_for_csv:
+                        header_payload = item.get("header") or {}
+                        shape_payload = item.get("shape")
+                        nax1 = header_payload.get("NAXIS1")
+                        nax2 = header_payload.get("NAXIS2")
+                        if (nax1 is None or nax2 is None) and isinstance(shape_payload, (list, tuple)) and len(shape_payload) >= 2:
+                            nax2 = shape_payload[0]
+                            nax1 = shape_payload[1]
+                        center_payload = item.get("center")
+                        if hasattr(center_payload, "ra") and hasattr(center_payload, "dec"):
+                            try:
+                                center_tuple = (
+                                    float(center_payload.ra.deg),
+                                    float(center_payload.dec.deg),
+                                )
+                            except Exception:
+                                center_tuple = (None, None)
+                        else:
+                            center_tuple = None
+                            if isinstance(center_payload, (list, tuple)) and len(center_payload) >= 2:
+                                try:
+                                    center_tuple = (float(center_payload[0]), float(center_payload[1]))
+                                except Exception:
+                                    center_tuple = None
+                        writer.writerow(
+                            {
+                                "path": item.get("path", ""),
+                                "NAXIS1": nax1 if nax1 is not None else "",
+                                "NAXIS2": nax2 if nax2 is not None else "",
+                                "CRVAL1": center_tuple[0] if center_tuple else "",
+                                "CRVAL2": center_tuple[1] if center_tuple else "",
+                                "DATE-OBS": header_payload.get("DATE-OBS", ""),
+                                "EXPTIME": header_payload.get("EXPTIME", ""),
+                                "FILTER": header_payload.get("FILTER", ""),
+                                "OBJECT": header_payload.get("OBJECT", ""),
+                            }
+                        )
+            except Exception as exc:
+                _log_message(f"[CSV] Export failed: {exc}", level="WARN")
+
+        initial_batches: list[list[Dict[str, Any]]] = []
+
+        if stream_mode and input_dir:
+
+            def _crawl_worker(target_queue: "queue.Queue[list[Dict[str, Any]] | None]") -> None:
+                batch: list[Dict[str, Any]] = []
+                minimum_batch = max(1, int(batch_size) if isinstance(batch_size, int) else 100)
+                for idx, fpath in enumerate(_iter_fits_paths(input_dir, recursive=scan_recursive)):
+                    item = _minimal_header_payload(fpath)
+                    item["index"] = idx
+                    batch.append(item)
+                    if len(batch) >= minimum_batch:
+                        target_queue.put(batch)
+                        batch = []
+                if batch:
+                    target_queue.put(batch)
+                target_queue.put(None)
+                stream_state["running"] = False
+
+            def _spawn_worker() -> None:
+                nonlocal stream_queue
+                if stream_state.get("running"):
+                    return
+                stream_queue = queue.Queue()
+                stream_state["running"] = True
+                stream_state["done"] = False
+                stream_state["status_message"] = None
+                threading.Thread(target=_crawl_worker, args=(stream_queue,), daemon=True).start()
+
+            stream_state["spawn_worker"] = _spawn_worker
+            stream_state["done"] = True
+            if cache_csv_path and os.path.isfile(cache_csv_path):
+                bootstrap_rows = _load_csv_bootstrap(cache_csv_path)
+                if bootstrap_rows:
+                    initial_batches.append(bootstrap_rows)
+                    stream_state["csv_loaded"] = True
+                    stream_state["status_message"] = _tr(
+                        "filter_status_ready_csv",
+                        "Loaded from CSV. Click Analyse to refresh.",
+                    )
+                else:
+                    stream_state["pending_start"] = True
+            else:
+                stream_state["pending_start"] = True
+        else:
+            normalized: list[Dict[str, Any]] = []
+            for i, entry in enumerate(raw_items_input or []):
+                try:
+                    data = dict(entry)
+                except Exception:
+                    data = {"path": entry}
+                data.setdefault("index", i)
+                normalized.append(data)
+            if not normalized:
+                return raw_items_input, False, None
+            initial_batches.append(normalized)
 
         # Attempt to read astropy WCS only when needed
         # (objects are provided by caller; we don't import WCS explicitly here)
@@ -138,91 +659,188 @@ def launch_filter_interface(
                     or f"<unknown_{idx}>"
                 )
                 self.wcs = src.get("wcs")
-                self.header = src.get("header")
-                # Determine image shape (H, W)
-                shp = src.get("shape")
-                if not shp and self.header is not None:
-                    try:
-                        naxis1 = int(self.header.get("NAXIS1"))
-                        naxis2 = int(self.header.get("NAXIS2"))
-                        shp = (naxis2, naxis1)
-                    except Exception:
-                        shp = None
-                if not shp and getattr(self.wcs, "pixel_shape", None):
-                    try:
-                        # astropy WCS pixel_shape is (nx, ny)
-                        nx, ny = self.wcs.pixel_shape  # type: ignore[attr-defined]
-                        shp = (int(ny), int(nx))
-                    except Exception:
-                        shp = None
-                if not shp and getattr(self.wcs, "array_shape", None):
-                    try:
-                        # array_shape tends to be (ny, nx)
-                        ny, nx = self.wcs.array_shape  # type: ignore[attr-defined]
-                        shp = (int(ny), int(nx))
-                    except Exception:
-                        shp = None
-                self.shape: Optional[tuple[int, int]] = shp if isinstance(shp, tuple) and len(shp) == 2 else None
-
-                # Center SkyCoord if provided; else compute from WCS/shape
-                c = src.get("center")
+                header_payload = src.get("header")
+                if header_payload is None and src.get("header_subset") is not None:
+                    header_payload = src.get("header_subset")
+                self.header = header_payload
+                self.shape: Optional[tuple[int, int]] = None
                 self.center: Optional[SkyCoord] = None
-                if c is not None:
+                self.phase0_center: Optional[SkyCoord] = None
+                # Footprint computations are quite expensive for thousands of
+                # entries.  Compute them lazily only when the UI actually needs
+                # the polygon to be drawn.
+                self._footprint_cache: Optional[np.ndarray] = None
+                self._footprint_ready: bool = False
+                self.refresh_geometry()
+
+            def _coerce_skycoord(self, value: Any) -> Optional[SkyCoord]:
+                if value is None:
+                    return None
+                if isinstance(value, SkyCoord):
+                    return value
+                try:
+                    if isinstance(value, (list, tuple)) and len(value) >= 2:
+                        ra_deg = float(value[0])
+                        dec_deg = float(value[1])
+                        return SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
+                    if isinstance(value, dict):
+                        ra_val = value.get("ra") or value.get("RA")
+                        dec_val = value.get("dec") or value.get("DEC")
+                        if ra_val is not None and dec_val is not None:
+                            return SkyCoord(ra=float(ra_val) * u.deg, dec=float(dec_val) * u.deg, frame="icrs")
+                except Exception:
+                    return None
+                return None
+
+            def _infer_shape(self) -> Optional[tuple[int, int]]:
+                shp = self.src.get("shape")
+                if isinstance(shp, (list, tuple)) and len(shp) >= 2:
                     try:
-                        # Trust provided SkyCoord
-                        self.center = c
+                        h = int(shp[0])
+                        w = int(shp[1])
+                        if h > 0 and w > 0:
+                            return (h, w)
                     except Exception:
-                        self.center = None
-                if self.center is None and self.wcs is not None:
+                        pass
+                header_obj = self.header
+                if header_obj is not None:
                     try:
-                        if self.shape is not None:
-                            h, w = self.shape
-                            xc = (w - 1) / 2.0
-                            yc = (h - 1) / 2.0
+                        getter = header_obj.get if hasattr(header_obj, "get") else header_obj.__getitem__
+                        naxis1 = int(getter("NAXIS1"))
+                        naxis2 = int(getter("NAXIS2"))
+                        if naxis1 > 0 and naxis2 > 0:
+                            return (naxis2, naxis1)
+                    except Exception:
+                        pass
+                if getattr(self.wcs, "pixel_shape", None):
+                    try:
+                        nx, ny = self.wcs.pixel_shape  # type: ignore[attr-defined]
+                        h = int(ny)
+                        w = int(nx)
+                        if h > 0 and w > 0:
+                            return (h, w)
+                    except Exception:
+                        pass
+                if getattr(self.wcs, "array_shape", None):
+                    try:
+                        ny, nx = self.wcs.array_shape  # type: ignore[attr-defined]
+                        h = int(ny)
+                        w = int(nx)
+                        if h > 0 and w > 0:
+                            return (h, w)
+                    except Exception:
+                        pass
+                return None
+
+            def _center_from_wcs(self, shape_hw: Optional[tuple[int, int]]) -> Optional[SkyCoord]:
+                if self.wcs is None:
+                    return None
+                try:
+                    if shape_hw is not None:
+                        h, w = shape_hw
+                        xc = (w - 1) / 2.0
+                        yc = (h - 1) / 2.0
+                    else:
+                        crpix = getattr(self.wcs.wcs, "crpix", None)
+                        if crpix is not None and len(crpix) >= 2:
+                            xc, yc = float(crpix[0]), float(crpix[1])
                         else:
-                            # Fallback to CRPIX if shape is unknown
-                            crpix = getattr(self.wcs.wcs, "crpix", None)
-                            if crpix is not None and len(crpix) >= 2:
-                                xc, yc = float(crpix[0]), float(crpix[1])
-                            else:
-                                # Last resort: assume 2048x2048 and center
-                                xc, yc = 1023.5, 1023.5
-                        sky = self.wcs.pixel_to_world(xc, yc)
-                        # Ensure RA/Dec in degrees
-                        ra = float(sky.ra.to(u.deg).value)
-                        dec = float(sky.dec.to(u.deg).value)
-                        self.center = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs")
-                    except Exception:
-                        self.center = None
+                            xc, yc = 1023.5, 1023.5
+                    sky = self.wcs.pixel_to_world(xc, yc)
+                    ra = float(sky.ra.to(u.deg).value)
+                    dec = float(sky.dec.to(u.deg).value)
+                    return SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs")
+                except Exception:
+                    return None
 
-                # Compute footprint corners as SkyCoord list if possible
-                self.footprint: Optional[np.ndarray] = None  # shape (N, 2) in deg as [[ra, dec], ...]
-                if self.wcs is not None and self.shape is not None:
+            def _center_from_header(self) -> Optional[SkyCoord]:
+                if extract_center_from_header_fn and self.header is not None:
                     try:
-                        h, w = self.shape
-                        # Corners in pixel coords (x=col, y=row)
-                        corners = [
-                            (0.0, 0.0),
-                            (w - 1.0, 0.0),
-                            (w - 1.0, h - 1.0),
-                            (0.0, h - 1.0),
-                        ]
-                        ras = []
-                        decs = []
-                        for (x, y) in corners:
-                            sc = self.wcs.pixel_to_world(x, y)
-                            ras.append(float(sc.ra.to(u.deg).value))
-                            decs.append(float(sc.dec.to(u.deg).value))
-                        self.footprint = np.column_stack([np.array(ras), np.array(decs)])
+                        return extract_center_from_header_fn(self.header)
                     except Exception:
-                        self.footprint = None
+                        return None
+                return None
 
-        # Build items list
-        items: list[Item] = [Item(d, i) for i, d in enumerate(raw_files_with_wcs)]
+            def _build_footprint(self, shape_hw: Optional[tuple[int, int]]) -> Optional[np.ndarray]:
+                if self.wcs is None or shape_hw is None:
+                    return None
+                try:
+                    h, w = shape_hw
+                    corners = [
+                        (0.0, 0.0),
+                        (w - 1.0, 0.0),
+                        (w - 1.0, h - 1.0),
+                        (0.0, h - 1.0),
+                    ]
+                    ras = []
+                    decs = []
+                    for (x, y) in corners:
+                        sc = self.wcs.pixel_to_world(x, y)
+                        ras.append(float(sc.ra.to(u.deg).value))
+                        decs.append(float(sc.dec.to(u.deg).value))
+                    return np.column_stack([np.array(ras), np.array(decs)])
+                except Exception:
+                    return None
 
-        # If virtually nothing to display, skip GUI
-        if not any((it.center is not None) for it in items):
-            return raw_files_with_wcs, False
+            def get_cached_footprint(self) -> Optional[np.ndarray]:
+                """Return footprint if it has already been computed."""
+
+                if self._footprint_ready:
+                    return self._footprint_cache
+                return None
+
+            def ensure_footprint(self) -> Optional[np.ndarray]:
+                """Compute and cache the footprint when needed."""
+
+                if not self._footprint_ready:
+                    self._footprint_cache = self._build_footprint(self.shape)
+                    # Mark as ready even when None so we don't retry endlessly
+                    self._footprint_ready = True
+                return self._footprint_cache
+
+            def refresh_geometry(self) -> None:
+                self.shape = self._infer_shape()
+                if self.shape and self.wcs is not None and getattr(self.wcs, "pixel_shape", None) is None:
+                    try:
+                        self.wcs.pixel_shape = (self.shape[1], self.shape[0])
+                    except Exception:
+                        pass
+                self.phase0_center = self._coerce_skycoord(self.src.get("phase0_center"))
+                direct_center = self._coerce_skycoord(self.src.get("center"))
+                center = direct_center or self.phase0_center or self._center_from_wcs(self.shape) or self._center_from_header()
+                self.center = center
+                if self.center is not None:
+                    self.src["center"] = self.center
+                if self.shape is not None:
+                    self.src["shape"] = self.shape
+                # Heavy footprint computations are deferred until explicitly
+                # requested by the UI via ``ensure_footprint``.
+                self._footprint_cache = None
+                self._footprint_ready = False
+
+        raw_files_with_wcs: list[Dict[str, Any]] = []
+        items: list[Item] = []
+
+        def _materialize_batch(batch: list[Dict[str, Any]]) -> None:
+            for entry in batch:
+                raw_files_with_wcs.append(entry)
+                items.append(Item(entry, len(raw_files_with_wcs) - 1))
+
+        for batch in initial_batches:
+            _materialize_batch(batch)
+        overrides_state: Dict[str, Any] = {}
+        if isinstance(initial_overrides, dict):
+            try:
+                overrides_state.update(initial_overrides)
+            except Exception:
+                overrides_state = {}
+
+        # Determine available sky coordinates.  Older projects or raw header
+        # scans may not provide any RA/Dec information, in which case we still
+        # want to display the file list even if the sky preview cannot show any
+        # overlay.  Fall back to a neutral reference center so downstream logic
+        # continues to work (thresholds, wrapping helpers, etc.).
+        has_explicit_centers = False
 
         # Compute robust global center via unit-vector average
         def average_skycoord(coords: list[SkyCoord]) -> SkyCoord:
@@ -232,8 +850,9 @@ def launch_filter_interface(
             sc = SkyCoord(x=vec_norm[0] * u.one, y=vec_norm[1] * u.one, z=vec_norm[2] * u.one, frame="icrs", representation_type="cartesian").spherical
             return SkyCoord(ra=sc.lon.to(u.deg), dec=sc.lat.to(u.deg), frame="icrs")
 
-        centers_available = [it.center for it in items if it.center is not None]
-        global_center: SkyCoord = centers_available[0] if len(centers_available) == 1 else average_skycoord(centers_available)
+        global_center: SkyCoord = SkyCoord(ra=0.0 * u.deg, dec=0.0 * u.deg, frame="icrs")
+        ref_ra = float(global_center.ra.to(u.deg).value)
+        ref_dec = float(global_center.dec.to(u.deg).value)
 
         # RA wrapping helper around a reference RA
         def wrap_ra_deg(ra_deg: float, ref_deg: float) -> float:
@@ -263,17 +882,98 @@ def launch_filter_interface(
                 root = tk.Tk()
         else:
             root = tk.Tk()
+
         root.title(_tr(
             "filter_window_title",
             "ZeMosaic - Filtrer les images WCS (optionnel)" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "ZeMosaic - Filter WCS images (optional)"
         ))
-
+        # S'assurer que la fenêtre apparaît au premier plan et prend le focus
+        try:
+            root.lift()
+            root.attributes("-topmost", True)
+            root.after(200, lambda: root.attributes("-topmost", False))
+            root.focus_force()
+        except Exception:
+            pass
         # Top-level layout: left plot, right checkboxes/actions
         main = ttk.Frame(root)
         main.pack(fill=tk.BOTH, expand=True)
         main.columnconfigure(0, weight=3)
         main.columnconfigure(1, weight=2)
-        main.rowconfigure(0, weight=1)
+        main.rowconfigure(1, weight=1)
+
+        # Status strip (top): crawling indicator + CSV helpers
+        status = ttk.Frame(main)
+        status.grid(row=0, column=0, columnspan=2, sticky="ew")
+        status.columnconfigure(1, weight=1)
+        status_var = tk.StringVar(master=root, value=_tr("filter_status_crawling", "Crawling files… please wait"))
+        ttk.Label(status, textvariable=status_var).grid(row=0, column=0, padx=6, pady=4, sticky="w")
+        pb = ttk.Progressbar(status, mode="indeterminate", length=180)
+        pb.grid(row=0, column=1, padx=6, pady=4, sticky="e")
+        btn_bar = ttk.Frame(status)
+        btn_bar.grid(row=0, column=2, padx=(0, 6), pady=4, sticky="e")
+        analyse_btn = ttk.Button(
+            btn_bar,
+            text=_tr("filter_btn_analyse", "Analyse"),
+            width=10,
+        )
+        export_btn = ttk.Button(
+            btn_bar,
+            text=_tr("filter_btn_export_csv", "Export CSV"),
+            width=12,
+        )
+        analyse_btn.grid(row=0, column=0, padx=(0, 6))
+        export_btn.grid(row=0, column=1)
+        total_initial_entries = len(items)
+
+        if stream_mode:
+            if stream_state.get("status_message"):
+                status_var.set(stream_state["status_message"])
+                try:
+                    pb.stop()
+                except Exception:
+                    pass
+            elif stream_state.get("pending_start"):
+                try:
+                    pb.start(80)
+                except Exception:
+                    pass
+            else:
+                try:
+                    pb.stop()
+                except Exception:
+                    pass
+            if not cache_csv_path:
+                try:
+                    export_btn.state(["disabled"])
+                except Exception:
+                    pass
+        else:
+            if total_initial_entries > 400:
+                try:
+                    pb.start(80)
+                except Exception:
+                    pass
+                status_var.set(
+                    _tr(
+                        "filter_status_populating",
+                        "Preparing list… {current}/{total}",
+                    ).format(current=0, total=total_initial_entries)
+                )
+            else:
+                try:
+                    pb.stop()
+                except Exception:
+                    pass
+                status_var.set(_tr("filter_status_ready", "Crawling done."))
+            try:
+                analyse_btn.state(["disabled"])
+            except Exception:
+                pass
+            try:
+                export_btn.state(["disabled"])
+            except Exception:
+                pass
 
         # Matplotlib figure
         # Use constrained_layout to reduce internal padding and let the
@@ -294,7 +994,7 @@ def launch_filter_interface(
 
         canvas = FigureCanvasTkAgg(fig, master=main)
         canvas_widget = canvas.get_tk_widget()
-        canvas_widget.grid(row=0, column=0, sticky="nsew")
+        canvas_widget.grid(row=1, column=0, sticky="nsew")
 
         # Make the Matplotlib figure follow the widget size to avoid
         # large empty borders around the plot.
@@ -304,9 +1004,17 @@ def launch_filter_interface(
                 h = max(50, int(canvas_widget.winfo_height()))
                 # Resize figure in pixels -> inches
                 fig.set_size_inches(w / fig.dpi, h / fig.dpi, forward=True)
-                # Maximize axes area inside the figure
+                # Maximize axes area inside the figure when compatible with the
+                # active Matplotlib layout engine.  Newer Matplotlib versions
+                # (>=3.8) expose layout engines that reject ``subplots_adjust``
+                # calls.  Skip the adjustment in that case to avoid runtime
+                # warnings.
                 try:
-                    fig.subplots_adjust(left=0.06, right=0.995, bottom=0.08, top=0.98)
+                    layout_engine = None
+                    if hasattr(fig, "get_layout_engine"):
+                        layout_engine = fig.get_layout_engine()
+                    if layout_engine is None:
+                        fig.subplots_adjust(left=0.06, right=0.995, bottom=0.08, top=0.98)
                 except Exception:
                     pass
                 canvas.draw_idle()
@@ -411,9 +1119,25 @@ def launch_filter_interface(
 
         _setup_wheel_zoom(ax)
 
+        # Lazy recomputation of global center once we have some items
+        _center_ready = {"ok": False}
+
+        def _maybe_update_global_center():
+            nonlocal global_center, has_explicit_centers, ref_ra, ref_dec
+            coords = [it.center for it in items if it.center is not None]
+            has_explicit_centers = bool(coords)
+            if not coords:
+                return
+            global_center = coords[0] if len(coords) == 1 else average_skycoord(coords)
+            ref_ra = float(global_center.ra.to(u.deg).value)
+            ref_dec = float(global_center.dec.to(u.deg).value)
+            _center_ready["ok"] = True
+
+        _maybe_update_global_center()
+
         # Right panel with controls
         right = ttk.Frame(main)
-        right.grid(row=0, column=1, sticky="nsew")
+        right.grid(row=1, column=1, sticky="nsew")
         # The scrollable list lives at row=2 (row=1 reserved for clustering params)
         try:
             right.rowconfigure(2, weight=1)
@@ -455,78 +1179,191 @@ def launch_filter_interface(
                     ),
                 )
                 return
-            for it, var in zip(items, check_vars):
+            for idx, it in enumerate(items):
                 if it.center is None:
                     continue
                 sep = it.center.separation(global_center).to(u.deg).value
                 if sep > thr:
-                    var.set(False)
+                    _set_selected(idx, False)
             update_visuals()
-        ttk.Button(
+        thresh_button = ttk.Button(
             thresh_frame,
             text=_tr(
                 "filter_apply_threshold_button",
                 "Exclure > X°" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Exclude > X°",
             ),
             command=apply_threshold,
-        ).grid(row=0, column=2, padx=4, pady=4)
+        )
+        thresh_button.grid(row=0, column=2, padx=4, pady=4)
 
-        # Clustering parameter overrides (propagated back to main GUI)
-        clust_frame = ttk.LabelFrame(
+        if not has_explicit_centers:
+            try:
+                thresh_entry.state(["disabled"])
+            except Exception:
+                thresh_entry.configure(state=tk.DISABLED)
+            try:
+                thresh_button.state(["disabled"])
+            except Exception:
+                pass
+
+        # Logging pane
+        log_frame = ttk.LabelFrame(
             right,
             text=_tr(
-                "filter_cluster_params_title",
-                "Clustering parameters" if 'fr' not in str(locals().get('lang_code', 'en')).lower() else "Paramètres de clustering",
+                "filter_log_panel_title",
+                "Activity log" if 'fr' not in str(locals().get('lang_code', 'en')).lower() else "Journal d'activité",
             ),
         )
-        clust_frame.grid(row=1, column=0, sticky="ew", padx=5, pady=(0,5))
-        ttk.Label(
-            clust_frame,
-            text=_tr("filter_cluster_target_label", "Target stacks:")
-        ).grid(row=0, column=0, padx=4, pady=2, sticky="w")
-        # Initial values from caller override current config defaults when provided
-        init_target = None
-        init_thresh = None
-        init_orient = None
+        log_frame.grid(row=1, column=0, sticky="nsew", padx=5, pady=(0, 5))
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+        log_widget = scrolledtext.ScrolledText(log_frame, height=6, wrap=tk.WORD, state=tk.DISABLED)
+        log_widget.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+
+        async_events: "queue.Queue[tuple[Any, ...]]" = queue.Queue()
+        resolve_state = {"running": False}
+
+        def _enqueue_event(kind: str, *payload: Any) -> None:
+            try:
+                async_events.put_nowait((kind, *payload))
+            except Exception:
+                pass
+
+        def _log_message(message: str, level: str = "INFO") -> None:
+            try:
+                timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+                log_widget.configure(state=tk.NORMAL)
+                log_widget.insert(tk.END, f"[{timestamp}] [{level.upper()}] {message}\n")
+                log_widget.configure(state=tk.DISABLED)
+                log_widget.see(tk.END)
+            except Exception:
+                pass
+
+        if not has_explicit_centers:
+            _log_message(
+                _tr(
+                    "filter_warn_no_displayable_wcs",
+                    "Aucune information WCS/centre disponible ; l'aperçu restera vide mais vous pouvez sélectionner les fichiers." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "No WCS/center information available; the sky preview will remain empty but you can still select files.",
+                ),
+                level="WARN",
+            )
+
+        def _progress_callback(
+            msg: Any,
+            progress: Any = None,
+            lvl: str | None = None,
+            **kwargs: Any,
+        ) -> None:
+            """Forward worker log messages without assuming a strict signature.
+
+            Older worker callbacks only forwarded ``(message, progress, level)``
+            while newer worker builds may pass additional keyword arguments used
+            for GUI formatting.  Accepting ``**kwargs`` prevents ``TypeError``
+            exceptions from background threads and keeps the logging pane
+            functional.
+            """
+
+            if msg is None:
+                return
+
+            level = (lvl or "INFO")
+            text = str(msg)
+
+            detail_parts: list[str] = []
+            if progress not in (None, ""):
+                detail_parts.append(f"progress={progress}")
+            if kwargs:
+                detail_parts.extend(f"{key}={value}" for key, value in kwargs.items())
+
+            if detail_parts:
+                text = f"{text} ({', '.join(detail_parts)})"
+
+            _enqueue_event("log", text, level)
+
+        def _sanitize_path(value: Any) -> str:
+            """Normalize user-provided filesystem paths.
+
+            Configuration values may include surrounding quotes, unresolved
+            environment variables (e.g. ``%PROGRAMFILES%`` on Windows) or
+            user-home shortcuts.  Normalising here avoids false negatives
+            when checking for ASTAP availability.
+            """
+
+            try:
+                if value is None:
+                    return ""
+                path_str = str(value).strip()
+            except Exception:
+                return ""
+
+            # Drop wrapping quotes that Windows file dialogs can preserve
+            if path_str.startswith(('"', "'")) and path_str.endswith(('"', "'")) and len(path_str) >= 2:
+                path_str = path_str[1:-1]
+
+            expanded = os.path.expanduser(os.path.expandvars(path_str))
+            return expanded
+
+        astap_exe_path_raw = cfg_defaults.get('astap_executable_path', '')
+        astap_data_dir_raw = cfg_defaults.get('astap_data_directory_path', '')
+        astap_exe_path = _sanitize_path(astap_exe_path_raw)
+        astap_data_dir = _sanitize_path(astap_data_dir_raw)
+
+        # Keep the sanitized values in the defaults so downstream callers (log
+        # messages, resolver invocations) see consistent paths.
+        if astap_exe_path:
+            cfg_defaults['astap_executable_path'] = astap_exe_path
+        if astap_data_dir:
+            cfg_defaults['astap_data_directory_path'] = astap_data_dir
+        search_radius_default = cfg_defaults.get('astap_default_search_radius', 0.0)
+        downsample_default = cfg_defaults.get('astap_default_downsample', 0)
+        autosplit_cap_cfg = cfg_defaults.get('max_raw_per_master_tile', 0)
         try:
-            if isinstance(initial_overrides, dict):
-                if 'cluster_target_groups' in initial_overrides:
-                    init_target = int(initial_overrides['cluster_target_groups'])
-                if 'cluster_panel_threshold' in initial_overrides:
-                    init_thresh = float(initial_overrides['cluster_panel_threshold'])
-                if 'cluster_orientation_split_deg' in initial_overrides:
-                    init_orient = float(initial_overrides['cluster_orientation_split_deg'])
+            autosplit_cap_cfg_int = int(autosplit_cap_cfg)
         except Exception:
-            init_target = None; init_thresh = None; init_orient = None
+            autosplit_cap_cfg_int = 0
+        autosplit_cap = autosplit_cap_cfg_int if autosplit_cap_cfg_int > 0 else 50
+        autosplit_cap = max(1, min(50, autosplit_cap))
+        autosplit_min_cap = min(8, autosplit_cap)
 
-        target_groups_var = tk.IntVar(master=root, value=int(
-            init_target if init_target is not None else cfg_defaults.get('cluster_target_groups', 0)
-        ))
-        ttk.Spinbox(clust_frame, from_=0, to=999, increment=1, textvariable=target_groups_var, width=8).grid(
-            row=0, column=1, padx=4, pady=2, sticky="w"
-        )
-        ttk.Label(
-            clust_frame,
-            text=_tr("filter_cluster_threshold_label", "Panel threshold (deg):")
-        ).grid(row=1, column=0, padx=4, pady=2, sticky="w")
-        panel_thresh_var = tk.DoubleVar(master=root, value=float(
-            init_thresh if init_thresh is not None else cfg_defaults.get('cluster_panel_threshold', 0.08)
-        ))
-        ttk.Spinbox(clust_frame, from_=0.01, to=5.0, increment=0.01, textvariable=panel_thresh_var, width=8, format="%.2f").grid(
-            row=1, column=1, padx=4, pady=2, sticky="w"
-        )
-        ttk.Label(
-            clust_frame,
-            text=_tr("filter_orientation_split_label", "Split by orientation (deg) 0=off:")
-        ).grid(row=2, column=0, padx=4, pady=2, sticky="w")
-        orient_split_var = tk.DoubleVar(master=root, value=float(
-            init_orient if init_orient is not None else cfg_defaults.get('cluster_orientation_split_deg', 0.0)
-        ))
-        ttk.Spinbox(clust_frame, from_=0.0, to=180.0, increment=1.0, textvariable=orient_split_var, width=8, format="%.1f").grid(
-            row=2, column=1, padx=4, pady=2, sticky="w"
+        def _astap_path_available(path: str) -> bool:
+            """Return True when the configured ASTAP location looks valid."""
+
+            if not path:
+                return False
+
+            # Direct file check
+            if os.path.isfile(path):
+                return True
+
+            # macOS packages are directories ending with ``.app``
+            if sys.platform == "darwin" and path.lower().endswith(".app") and os.path.isdir(path):
+                return True
+
+            # Accept directories that contain the ASTAP binary
+            if os.path.isdir(path):
+                exe_name = "astap.exe" if os.name == "nt" else "astap"
+                candidate = os.path.join(path, exe_name)
+                if os.path.isfile(candidate):
+                    return True
+
+            # As a generic fallback try resolving via PATH
+            resolved = shutil.which(path) or shutil.which(os.path.basename(path))
+            if resolved:
+                return True
+
+            # As a generic fallback accept any existing executable entry.
+            try:
+                return os.path.exists(path) and os.access(path, os.X_OK)
+            except Exception:
+                return False
+
+        astap_available = bool(
+            solve_with_astap is not None
+            and astap_astropy_available
+            and _astap_path_available(astap_exe_path)
         )
 
-        # Scrollable checkboxes list
+        # Scrollable selection list (checkboxes for small sets, listbox for large)
         list_frame = ttk.LabelFrame(
             right,
             text=_tr(
@@ -538,59 +1375,415 @@ def launch_filter_interface(
         list_frame.rowconfigure(0, weight=1)
         list_frame.columnconfigure(0, weight=1)
 
-        canvas_list = tk.Canvas(list_frame, borderwidth=0, highlightthickness=0)
-        vsb = ttk.Scrollbar(list_frame, orient="vertical", command=canvas_list.yview)
-        inner = ttk.Frame(canvas_list)
-        inner.bind("<Configure>", lambda e: canvas_list.configure(scrollregion=canvas_list.bbox("all")))
-        canvas_list.create_window((0, 0), window=inner, anchor="nw")
-        canvas_list.configure(yscrollcommand=vsb.set)
-        canvas_list.grid(row=0, column=0, sticky="nsew")
-        vsb.grid(row=0, column=1, sticky="ns")
+        CHECKBOX_HARD_LIMIT = 2000
+        use_listbox_mode = stream_mode or total_initial_entries > CHECKBOX_HARD_LIMIT
+        listbox_widget: Optional[tk.Listbox] = None
+        canvas_list: Optional[tk.Canvas] = None
+        inner: Optional[ttk.Frame] = None
+        list_scroll_target: Optional[Any] = None
+
+        if use_listbox_mode:
+            listbox_widget = tk.Listbox(
+                list_frame,
+                selectmode=tk.MULTIPLE,
+                exportselection=False,
+                activestyle="none",
+            )
+            listbox_widget.grid(row=0, column=0, sticky="nsew")
+            vsb = ttk.Scrollbar(list_frame, orient="vertical", command=listbox_widget.yview)
+            vsb.grid(row=0, column=1, sticky="ns")
+            listbox_widget.configure(yscrollcommand=vsb.set)
+            list_scroll_target = listbox_widget
+        else:
+            canvas_list = tk.Canvas(list_frame, borderwidth=0, highlightthickness=0)
+            vsb = ttk.Scrollbar(list_frame, orient="vertical", command=canvas_list.yview)
+            inner = ttk.Frame(canvas_list)
+            inner.bind("<Configure>", lambda e: canvas_list.configure(scrollregion=canvas_list.bbox("all")))
+            canvas_list.create_window((0, 0), window=inner, anchor="nw")
+            canvas_list.configure(yscrollcommand=vsb.set)
+            canvas_list.grid(row=0, column=0, sticky="nsew")
+            vsb.grid(row=0, column=1, sticky="ns")
+            list_scroll_target = canvas_list
 
         # Enable mouse-wheel scrolling over the right list (Windows/Linux/macOS)
         def _on_list_mousewheel(event):
+            target = list_scroll_target
+            if target is None:
+                return
             try:
                 if getattr(event, 'num', None) == 4:  # Linux scroll up
-                    canvas_list.yview_scroll(-1, "units")
+                    target.yview_scroll(-1, "units")
                 elif getattr(event, 'num', None) == 5:  # Linux scroll down
-                    canvas_list.yview_scroll(1, "units")
+                    target.yview_scroll(1, "units")
                 else:  # Windows / macOS
                     delta = int(-1 * (event.delta / 120)) if getattr(event, 'delta', 0) else 0
                     if delta != 0:
-                        canvas_list.yview_scroll(delta, "units")
+                        target.yview_scroll(delta, "units")
             except Exception:
                 pass
 
-        def _bind_list_mousewheel(_):
+        def _bind_list_mousewheel(event):
+            target = list_scroll_target if list_scroll_target is not None else getattr(event, "widget", None)
+            if target is None:
+                return
             try:
-                canvas_list.bind_all("<MouseWheel>", _on_list_mousewheel)
-                canvas_list.bind_all("<Button-4>", _on_list_mousewheel)
-                canvas_list.bind_all("<Button-5>", _on_list_mousewheel)
+                target.bind_all("<MouseWheel>", _on_list_mousewheel)
+                target.bind_all("<Button-4>", _on_list_mousewheel)
+                target.bind_all("<Button-5>", _on_list_mousewheel)
             except Exception:
                 pass
 
-        def _unbind_list_mousewheel(_):
+        def _unbind_list_mousewheel(event):
+            target = list_scroll_target if list_scroll_target is not None else getattr(event, "widget", None)
+            if target is None:
+                return
             try:
-                canvas_list.unbind_all("<MouseWheel>")
-                canvas_list.unbind_all("<Button-4>")
-                canvas_list.unbind_all("<Button-5>")
+                target.unbind_all("<MouseWheel>")
+                target.unbind_all("<Button-4>")
+                target.unbind_all("<Button-5>")
             except Exception:
                 pass
 
-        # Bind/unbind on enter/leave so the wheel affects only this list
-        inner.bind("<Enter>", _bind_list_mousewheel)
-        inner.bind("<Leave>", _unbind_list_mousewheel)
-        canvas_list.bind("<Enter>", _bind_list_mousewheel)
-        canvas_list.bind("<Leave>", _unbind_list_mousewheel)
+        if list_scroll_target is not None:
+            list_scroll_target.bind("<Enter>", _bind_list_mousewheel)
+            list_scroll_target.bind("<Leave>", _unbind_list_mousewheel)
+
+        selection_state: list[bool] = []
+        listbox_selection_cache: set[int] = set()
+        listbox_programmatic = {"active": False}
+
+        summary_var = tk.StringVar(master=root, value="")
+        resolved_counter = {"count": int(overrides_state.get("resolved_wcs_count", 0) or 0)}
+
+        if not has_explicit_centers:
+            summary_var.set(
+                _tr(
+                    "filter_summary_no_centers",
+                    "Centres WCS indisponibles — sélection manuelle uniquement." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "WCS centers unavailable — manual selection only.",
+                )
+            )
+
+        operations = ttk.Frame(right)
+        operations.grid(row=3, column=0, sticky="ew", padx=5, pady=5)
+        operations.columnconfigure(2, weight=1)
+
+        resolve_btn = ttk.Button(
+            operations,
+            text=_tr("filter_btn_resolve_wcs", "Resolve missing WCS"),
+        )
+        resolve_btn.grid(row=0, column=0, padx=4, pady=2, sticky="w")
+
+        auto_btn = ttk.Button(
+            operations,
+            text=_tr("filter_btn_auto_group", "Auto-organize Master Tiles"),
+        )
+        auto_btn.grid(row=0, column=1, padx=4, pady=2, sticky="w")
+
+        ttk.Label(
+            operations,
+            textvariable=summary_var,
+            anchor="w",
+            justify="left",
+            wraplength=260,
+        ).grid(row=0, column=2, padx=4, pady=2, sticky="w")
+
+        if not astap_available:
+            resolve_btn.state(["disabled"])
+            _log_message(
+                _tr("filter_warn_astap_missing", "ASTAP executable not configured; skipping resolution."),
+                level="WARN",
+            )
+
+        if not (cluster_func and autosplit_func):
+            auto_btn.state(["disabled"])
+            if worker_import_failure_summary:
+                _log_message(
+                    _tr(
+                        "filter_warn_worker_missing",
+                        "Auto-grouping disabled because the processing worker module failed to load: {error}",
+                        error=worker_import_failure_summary,
+                    ),
+                    level="ERROR",
+                )
+
+        def _resolve_missing_wcs_inplace() -> None:
+            if resolve_state["running"]:
+                return
+            if not astap_available or solve_with_astap is None:
+                _log_message(
+                    _tr("filter_warn_astap_missing", "ASTAP executable not configured; skipping resolution."),
+                    level="WARN",
+                )
+                return
+
+            pending = [
+                (idx, item)
+                for idx, item in enumerate(items)
+                if item.wcs is None and isinstance(item.path, str) and os.path.isfile(item.path)
+            ]
+            if not pending:
+                msg = _tr("filter_log_no_missing_wcs", "All listed files already include a WCS solution.")
+                summary_var.set(msg)
+                _log_message(msg, level="INFO")
+                return
+
+            resolve_state["running"] = True
+            resolve_btn.state(["disabled"])
+            summary_var.set(_tr("filter_log_resolving", "Resolving missing WCS..."))
+            _log_message(_tr("filter_log_resolving", "Resolving missing WCS..."), level="INFO")
+
+            try:
+                try:
+                    srch_radius = float(search_radius_default)
+                    if srch_radius <= 0:
+                        srch_radius = None
+                except Exception:
+                    srch_radius = None
+                try:
+                    downsample_val = int(downsample_default)
+                    if downsample_val < 0:
+                        downsample_val = None
+                except Exception:
+                    downsample_val = None
+
+                def _resolve_worker(pairs: list[tuple[int, Any]]) -> None:
+                    resolved_now = 0
+                    try:
+                        for idx, item in pairs:
+                            path = item.path
+                            header_obj = item.header
+                            if header_obj is not None:
+                                _enqueue_event("header_loaded", idx, header_obj)
+                            elif astap_fits_module is not None and astap_astropy_available:
+                                try:
+                                    with astap_fits_module.open(path) as hdul_hdr:
+                                        header_obj = hdul_hdr[0].header
+                                        if header_obj is not None:
+                                            _enqueue_event("header_loaded", idx, header_obj)
+                                except Exception as exc:
+                                    _enqueue_event("log", f"Failed to load FITS header for '{path}': {exc}", "ERROR")
+                                    header_obj = item.header
+                            try:
+                                wcs_obj = solve_with_astap(
+                                    path,
+                                    header_obj,
+                                    astap_exe_path,
+                                    astap_data_dir,
+                                    search_radius_deg=srch_radius,
+                                    downsample_factor=downsample_val,
+                                    sensitivity=None,
+                                    timeout_sec=60,
+                                    update_original_header_in_place=False,
+                                    progress_callback=_progress_callback,
+                                )
+                            except Exception as exc:
+                                _enqueue_event("log", f"ASTAP resolve exception: {exc}", "ERROR")
+                                wcs_obj = None
+                            if wcs_obj and getattr(wcs_obj, "is_celestial", False):
+                                resolved_now += 1
+                                _enqueue_event("resolved_item", idx, header_obj, wcs_obj)
+                    finally:
+                        _enqueue_event("resolve_done", resolved_now)
+
+                threading.Thread(target=_resolve_worker, args=(pending,), daemon=True).start()
+            except Exception:
+                resolve_state["running"] = False
+                resolve_btn.state(["!disabled"])
+                raise
+
+        def _auto_organize_master_tiles() -> None:
+            if not (cluster_func and autosplit_func):
+                return
+            auto_btn.state(["disabled"])
+            try:
+                selected_indices = _get_selected_indices()
+                if not selected_indices:
+                    summary_text = _tr(
+                        "filter_log_groups_summary",
+                        "Prepared {g} group(s), sizes: {sizes}.",
+                        g=0,
+                        sizes="[]",
+                    )
+                    summary_var.set(summary_text)
+                    _log_message(summary_text, level="INFO")
+                    return
+
+                class _FallbackWCS:
+                    is_celestial = True
+
+                    def __init__(self, center_coord: SkyCoord):
+                        self._center = center_coord
+                        self.pixel_shape = (1, 1)
+                        self.array_shape = (1, 1)
+
+                        class _Inner:
+                            def __init__(self, center: SkyCoord):
+                                self.crval = (
+                                    float(center.ra.to(u.deg).value),
+                                    float(center.dec.to(u.deg).value),
+                                )
+                                self.crpix = (0.5, 0.5)
+
+                        self.wcs = _Inner(center_coord)
+
+                    def pixel_to_world(self, _x: float, _y: float):
+                        return self._center
+
+                candidate_infos: list[dict] = []
+                coord_samples: list[tuple[float, float]] = []
+                for idx in selected_indices:
+                    item = items[idx]
+                    entry = dict(item.src)
+                    if "path" not in entry:
+                        entry["path"] = item.path
+                    if "path_raw" not in entry and item.src.get("path_raw"):
+                        entry["path_raw"] = item.src.get("path_raw")
+                    if "header" not in entry:
+                        entry["header"] = item.header
+                    if item.shape and "shape" not in entry:
+                        entry["shape"] = item.shape
+                    center_obj = item.center or item.phase0_center
+                    if center_obj is None and extract_center_from_header_fn and item.header is not None:
+                        try:
+                            center_obj = extract_center_from_header_fn(item.header)
+                        except Exception:
+                            center_obj = None
+                    if item.wcs is None and center_obj is not None:
+                        entry["wcs"] = _FallbackWCS(center_obj)
+                        entry["_fallback_wcs_used"] = True
+                        entry.setdefault("phase0_center", center_obj)
+                        entry.setdefault("center", center_obj)
+                    elif item.wcs is not None:
+                        entry["wcs"] = item.wcs
+                        if center_obj is not None:
+                            entry.setdefault("center", center_obj)
+                    if center_obj is not None:
+                        coord_samples.append(
+                            (
+                                float(center_obj.ra.to(u.deg).value),
+                                float(center_obj.dec.to(u.deg).value),
+                            )
+                        )
+                        entry.setdefault("RA", coord_samples[-1][0])
+                        entry.setdefault("DEC", coord_samples[-1][1])
+                    candidate_infos.append(entry)
+
+                if not candidate_infos:
+                    summary_text = _tr(
+                        "filter_log_groups_summary",
+                        "Prepared {g} group(s), sizes: {sizes}.",
+                        g=0,
+                        sizes="[]",
+                    )
+                    summary_var.set(summary_text)
+                    _log_message(summary_text, level="WARN")
+                    return
+
+                if coord_samples:
+                    if compute_dispersion_func:
+                        try:
+                            dispersion_deg = float(compute_dispersion_func(coord_samples))
+                        except Exception:
+                            dispersion_deg = 0.0
+                    else:
+                        dispersion_deg = 0.0
+                else:
+                    dispersion_deg = 0.0
+
+                if dispersion_deg <= 0.12:
+                    threshold_deg = 0.10
+                elif dispersion_deg <= 0.30:
+                    threshold_deg = 0.15
+                else:
+                    threshold_deg = 0.18 if dispersion_deg <= 0.60 else 0.20
+                threshold_deg = min(0.20, max(0.08, threshold_deg))
+
+                groups = cluster_func(
+                    candidate_infos,
+                    float(threshold_deg),
+                    _progress_callback,
+                    orientation_split_threshold_deg=0.0,
+                )
+                if not groups:
+                    summary_text = _tr(
+                        "filter_log_groups_summary",
+                        "Prepared {g} group(s), sizes: {sizes}.",
+                        g=0,
+                        sizes="[]",
+                    )
+                    summary_var.set(summary_text)
+                    _log_message(summary_text, level="WARN")
+                    return
+
+                final_groups = autosplit_func(
+                    groups,
+                    cap=int(autosplit_cap),
+                    min_cap=int(autosplit_min_cap),
+                    progress_callback=_progress_callback,
+                )
+                final_groups = _merge_small_groups(
+                    final_groups,
+                    min_size=int(autosplit_min_cap),
+                    cap=int(autosplit_cap),
+                )
+                for grp in final_groups:
+                    for info in grp:
+                        if info.pop("_fallback_wcs_used", False):
+                            info.pop("wcs", None)
+                overrides_state["preplan_master_groups"] = final_groups
+                overrides_state["autosplit_cap"] = int(autosplit_cap)
+                sizes = [len(gr) for gr in final_groups]
+                sizes_str = ", ".join(str(s) for s in sizes) if sizes else "[]"
+                summary_text = _tr(
+                    "filter_log_groups_summary",
+                    "Prepared {g} group(s), sizes: {sizes}.",
+                    g=len(final_groups),
+                    sizes=sizes_str,
+                )
+                summary_var.set(summary_text)
+                _log_message(summary_text, level="INFO")
+            finally:
+                auto_btn.state(["!disabled"])
+
+        resolve_btn.configure(command=_resolve_missing_wcs_inplace)
+        auto_btn.configure(command=_auto_organize_master_tiles)
 
         # Selection helpers
         actions = ttk.Frame(right)
-        actions.grid(row=3, column=0, sticky="ew", padx=5, pady=5)
+        actions.grid(row=4, column=0, sticky="ew", padx=5, pady=5)
         def select_all():
-            for v in check_vars: v.set(True)
+            if use_listbox_mode:
+                if selection_state:
+                    listbox_programmatic["active"] = True
+                    try:
+                        selection_state[:] = [True] * len(selection_state)
+                        listbox_selection_cache.clear()
+                        listbox_selection_cache.update(range(len(selection_state)))
+                        if listbox_widget is not None:
+                            listbox_widget.selection_set(0, tk.END)
+                    finally:
+                        listbox_programmatic["active"] = False
+                else:
+                    pass
+            else:
+                for v in check_vars:
+                    v.set(True)
             update_visuals()
+
         def select_none():
-            for v in check_vars: v.set(False)
+            if use_listbox_mode:
+                if selection_state:
+                    listbox_programmatic["active"] = True
+                    try:
+                        selection_state[:] = [False] * len(selection_state)
+                        listbox_selection_cache.clear()
+                        if listbox_widget is not None:
+                            listbox_widget.selection_clear(0, tk.END)
+                    finally:
+                        listbox_programmatic["active"] = False
+            else:
+                for v in check_vars:
+                    v.set(False)
             update_visuals()
         ttk.Button(
             actions,
@@ -611,26 +1804,21 @@ def launch_filter_interface(
 
         # Confirm/cancel buttons
         bottom = ttk.Frame(right)
-        bottom.grid(row=4, column=0, sticky="ew", padx=5, pady=5)
-        result: dict[str, Any] = {"accepted": False, "selected_indices": None, "overrides": None}
+        bottom.grid(row=5, column=0, sticky="ew", padx=5, pady=5)
+        result: dict[str, Any] = {"accepted": None, "selected_indices": None, "overrides": None}
         def on_validate():
-            sel = [i for i, v in enumerate(check_vars) if v.get()]
+            _drain_stream_queue()
+            sel = _get_selected_indices()
             result["accepted"] = True
             result["selected_indices"] = sel
-            try:
-                result["overrides"] = {
-                    "cluster_panel_threshold": float(panel_thresh_var.get()),
-                    "cluster_target_groups": int(target_groups_var.get()),
-                    "cluster_orientation_split_deg": float(orient_split_var.get()),
-                }
-            except Exception:
-                result["overrides"] = None
+            result["overrides"] = overrides_state if overrides_state else None
             try:
                 root.quit()
             except Exception:
                 pass
             root.destroy()
         def on_cancel():
+            _drain_stream_queue()
             result["accepted"] = False
             result["selected_indices"] = None
             try:
@@ -655,90 +1843,734 @@ def launch_filter_interface(
             command=on_cancel,
         ).pack(side=tk.RIGHT, padx=4)
 
-        # Populate checkboxes and draw footprints
+        # Populate checkboxes and draw footprints (supports streaming additions)
         check_vars: list[tk.BooleanVar] = []
-        patches: list[Polygon] = []
+        checkbuttons: list[Any] = []
+        item_labels: list[str] = []
+        patches: list[Any] = []
         center_pts: list[Any] = []  # matplotlib line2D handles
         # Map matplotlib artists back to item indices for click-to-select
         artist_to_index: dict[Any, int] = {}
+        known_path_index: dict[str, int] = {}
 
-        ref_ra = float(global_center.ra.to(u.deg).value)
-        ref_dec = float(global_center.dec.to(u.deg).value)
-
-        # Build visuals first to compute bounds
-        all_ra_vals: list[float] = []
-        all_dec_vals: list[float] = []
-
-        for idx, it in enumerate(items):
-            var = tk.BooleanVar(master=root, value=True)
-            check_vars.append(var)
-
-            # Label includes basename and optional separation
-            import os
-            base = os.path.basename(it.path)
-            sep_txt = ""
-            if it.center is not None:
-                sep_deg = it.center.separation(global_center).to(u.deg).value
-                sep_txt = f"  ({sep_deg:.2f}°)"
-            cb = ttk.Checkbutton(inner, text=base + sep_txt, variable=var, command=lambda i=idx: update_visuals(i))
-            cb.grid(row=idx, column=0, sticky="w")
-
-            # Plot polygon footprint if available; else plot center point
-            color_sel = "tab:blue"
-            color_unsel = "0.7"
-
-            if it.footprint is not None:
-                ra_wrapped = [wrap_ra_deg(float(ra), ref_ra) for ra in it.footprint[:, 0].tolist()]
-                decs = it.footprint[:, 1].tolist()
-                poly = Polygon(list(zip(ra_wrapped, decs)), closed=True, fill=False, edgecolor=color_sel, linewidth=1.0, alpha=0.9)
-                # Allow selection by clicking inside the footprint on the plot
+        def _is_selected(idx: int) -> bool:
+            if idx < 0:
+                return False
+            if use_listbox_mode:
+                if idx < len(selection_state):
+                    return bool(selection_state[idx])
+                return False
+            if idx < len(check_vars):
                 try:
-                    poly.set_picker(True)
+                    return bool(check_vars[idx].get())
+                except Exception:
+                    return False
+            return False
+
+        def _set_selected(idx: int, value: bool, *, sync_widget: bool = True) -> None:
+            val = bool(value)
+            if use_listbox_mode:
+                if idx < 0:
+                    return
+                while idx >= len(selection_state):
+                    selection_state.append(True)
+                    listbox_selection_cache.add(len(selection_state) - 1)
+                selection_state[idx] = val
+                if not sync_widget:
+                    if val:
+                        listbox_selection_cache.add(idx)
+                    else:
+                        listbox_selection_cache.discard(idx)
+                    return
+                if listbox_widget is None:
+                    if val:
+                        listbox_selection_cache.add(idx)
+                    else:
+                        listbox_selection_cache.discard(idx)
+                    return
+                listbox_programmatic["active"] = True
+                try:
+                    if val:
+                        listbox_widget.selection_set(idx)
+                        listbox_selection_cache.add(idx)
+                    else:
+                        listbox_widget.selection_clear(idx)
+                        listbox_selection_cache.discard(idx)
                 except Exception:
                     pass
-                patches.append(poly)
-                ax.add_patch(poly)
-                artist_to_index[poly] = idx
-                all_ra_vals.extend(ra_wrapped)
-                all_dec_vals.extend(decs)
-            elif it.center is not None:
-                ra_c = wrap_ra_deg(float(it.center.ra.to(u.deg).value), ref_ra)
-                dec_c = float(it.center.dec.to(u.deg).value)
-                ln, = ax.plot([ra_c], [dec_c], marker="o", markersize=3, color=color_sel, alpha=0.9, picker=8)
-                center_pts.append(ln)
-                artist_to_index[ln] = idx
-                all_ra_vals.append(ra_c)
-                all_dec_vals.append(dec_c)
+                finally:
+                    listbox_programmatic["active"] = False
             else:
-                # No WCS displayable — skip drawing, but keep placeholders for indexing
-                patches.append(None)  # type: ignore
-                center_pts.append(None)  # type: ignore
+                if 0 <= idx < len(check_vars):
+                    try:
+                        check_vars[idx].set(val)
+                    except Exception:
+                        pass
 
-        # Set view limits with small margins
-        if all_ra_vals and all_dec_vals:
-            ra_min, ra_max = min(all_ra_vals), max(all_ra_vals)
-            dec_min, dec_max = min(all_dec_vals), max(all_dec_vals)
-            ra_pad = max(1e-3, (ra_max - ra_min) * 0.05 + 0.2)
-            dec_pad = max(1e-3, (dec_max - dec_min) * 0.05 + 0.2)
-            ax.set_xlim(ra_max + ra_pad, ra_min - ra_pad)  # inverted x-axis
-            ax.set_ylim(dec_min - dec_pad, dec_max + dec_pad)
+        def _get_selected_indices() -> list[int]:
+            if use_listbox_mode:
+                return [i for i, flag in enumerate(selection_state) if flag]
+            return [i for i, var in enumerate(check_vars) if var.get()]
+
+        def _update_item_label(idx: int, text: str) -> None:
+            if idx < 0 or idx >= len(item_labels):
+                return
+            item_labels[idx] = text
+            if use_listbox_mode:
+                if listbox_widget is None:
+                    return
+                listbox_programmatic["active"] = True
+                try:
+                    listbox_widget.delete(idx)
+                    listbox_widget.insert(idx, text)
+                    if _is_selected(idx):
+                        listbox_widget.selection_set(idx)
+                        listbox_selection_cache.add(idx)
+                    else:
+                        listbox_widget.selection_clear(idx)
+                        listbox_selection_cache.discard(idx)
+                except Exception:
+                    pass
+                finally:
+                    listbox_programmatic["active"] = False
+            else:
+                if 0 <= idx < len(checkbuttons):
+                    try:
+                        checkbuttons[idx].configure(text=text)
+                    except Exception:
+                        pass
+
+        def _path_key(value: Any) -> str:
+            try:
+                if isinstance(value, str) and value:
+                    return os.path.normcase(os.path.abspath(value))
+            except Exception:
+                pass
+            try:
+                if isinstance(value, str) and value:
+                    return os.path.normcase(value)
+            except Exception:
+                pass
+            return str(value) if value is not None else ""
+
+        all_ra_vals: list[float] = []
+        all_dec_vals: list[float] = []
+        drawn_footprints = {"count": 0}
+        axes_update_pending = {"pending": False}
+        population_state = {
+            "next_index": 0,
+            "total": total_initial_entries,
+            "finalized": False,
+        }
+        populate_indicator = {"running": False}
+
+        def _update_population_indicator(processed: int, *, done: bool = False) -> None:
+            if stream_mode:
+                return
+            if done:
+                try:
+                    pb.stop()
+                except Exception:
+                    pass
+                populate_indicator["running"] = False
+                status_var.set(_tr("filter_status_ready", "Crawling done."))
+                return
+            if population_state["total"] <= 0:
+                return
+            if not populate_indicator["running"]:
+                try:
+                    pb.start(80)
+                except Exception:
+                    pass
+                populate_indicator["running"] = True
+            status_var.set(
+                _tr(
+                    "filter_status_populating",
+                    "Preparing list… {current}/{total}",
+                ).format(current=min(processed, population_state["total"]), total=population_state["total"])
+            )
+
+        def _add_item_row(item: Item) -> None:
+            idx = len(item_labels)
+            base = os.path.basename(item.path)
+            sep_txt = ""
+            if item.center is not None:
+                try:
+                    sep_deg = item.center.separation(global_center).to(u.deg).value
+                    sep_txt = f"  ({sep_deg:.2f}°)"
+                except Exception:
+                    sep_txt = ""
+
+            display_text = base + sep_txt
+            item_labels.append(display_text)
+
+            if use_listbox_mode:
+                selection_state.append(True)
+                listbox_selection_cache.add(idx)
+                if listbox_widget is not None:
+                    listbox_programmatic["active"] = True
+                    try:
+                        listbox_widget.insert(tk.END, display_text)
+                        listbox_widget.selection_set(idx)
+                    except Exception:
+                        pass
+                    finally:
+                        listbox_programmatic["active"] = False
+            else:
+                var = tk.BooleanVar(master=root, value=True)
+                check_vars.append(var)
+                if inner is not None:
+                    cb = ttk.Checkbutton(inner, text=display_text, variable=var, command=lambda i=idx: update_visuals(i))
+                    cb.pack(anchor="w", fill="x", pady=1)
+                    checkbuttons.append(cb)
+                else:
+                    checkbuttons.append(None)
+
+            path_key = _path_key(item.path)
+            if path_key:
+                known_path_index[path_key] = idx
+
+            # Ensure placeholders exist for visuals
+            patches.append(None)
+            center_pts.append(None)
+
+            color_sel = "tab:blue"
+
+            local_ra_vals: list[float] = []
+            local_dec_vals: list[float] = []
+
+            footprint_to_draw: Optional[np.ndarray] = None
+            if drawn_footprints["count"] < MAX_FOOTPRINTS:
+                footprint_to_draw = item.ensure_footprint()
+            else:
+                footprint_to_draw = item.get_cached_footprint()
+
+            if footprint_to_draw is not None and drawn_footprints["count"] < MAX_FOOTPRINTS:
+                try:
+                    ra_wrapped = [wrap_ra_deg(float(ra), ref_ra) for ra in footprint_to_draw[:, 0].tolist()]
+                    decs = footprint_to_draw[:, 1].tolist()
+                    poly = Polygon(
+                        list(zip(ra_wrapped, decs)),
+                        closed=True,
+                        fill=False,
+                        edgecolor=color_sel,
+                        linewidth=1.0,
+                        alpha=0.9,
+                    )
+                    try:
+                        poly.set_picker(True)
+                    except Exception:
+                        pass
+                    ax.add_patch(poly)
+                    patches[idx] = poly
+                    artist_to_index[poly] = idx
+                    local_ra_vals.extend(ra_wrapped)
+                    local_dec_vals.extend(decs)
+                    drawn_footprints["count"] += 1
+                except Exception:
+                    patches[idx] = None
+            elif item.center is not None:
+                try:
+                    ra_c = wrap_ra_deg(float(item.center.ra.to(u.deg).value), ref_ra)
+                    dec_c = float(item.center.dec.to(u.deg).value)
+                    ln, = ax.plot(
+                        [ra_c],
+                        [dec_c],
+                        marker="o",
+                        markersize=3,
+                        color=color_sel,
+                        alpha=0.9,
+                        picker=8,
+                    )
+                    center_pts[idx] = ln
+                    artist_to_index[ln] = idx
+                    local_ra_vals.append(ra_c)
+                    local_dec_vals.append(dec_c)
+                except Exception:
+                    center_pts[idx] = None
+
+            all_ra_vals.extend(local_ra_vals)
+            all_dec_vals.extend(local_dec_vals)
         ax.grid(True, which="both", linestyle=":", linewidth=0.6)
 
-        def update_visuals(changed_index: Optional[int] = None) -> None:
-            # Update colors/alpha for polygons and points according to selection state
-            for i, it in enumerate(items):
-                selected = check_vars[i].get()
+        def update_visuals(changed_index: Optional[Iterable[int] | int] = None) -> None:
+            """Refresh matplotlib artists to match the checkbox selection state."""
+
+            if changed_index is None:
+                target_indices: Iterable[int] = range(len(items))
+            elif isinstance(changed_index, Iterable) and not isinstance(changed_index, (str, bytes)):
+                target_indices = changed_index
+            else:
+                target_indices = (changed_index,)
+
+            any_updated = False
+            for raw_idx in target_indices:
+                try:
+                    i = int(raw_idx)
+                except (TypeError, ValueError):
+                    continue
+                if i < 0 or i >= len(items):
+                    continue
+                selected = _is_selected(i)
                 col = "tab:blue" if selected else "0.7"
                 alp = 0.9 if selected else 0.3
                 if i < len(patches) and patches[i] is not None:
                     patches[i].set_edgecolor(col)
                     patches[i].set_alpha(alp)
+                    any_updated = True
                 if i < len(center_pts) and center_pts[i] is not None:
                     center_pts[i].set_color(col)
                     center_pts[i].set_alpha(alp)
-            canvas.draw_idle()
+                    any_updated = True
+            if any_updated:
+                canvas.draw_idle()
 
-        update_visuals()
+        if use_listbox_mode and listbox_widget is not None:
+            def _on_listbox_select(_event: Any) -> None:
+                if listbox_programmatic.get("active"):
+                    return
+                try:
+                    current = {int(idx) for idx in listbox_widget.curselection()}
+                except Exception:
+                    return
+                added = current - listbox_selection_cache
+                removed = listbox_selection_cache - current
+                if not added and not removed:
+                    return
+                for idx in added:
+                    if 0 <= idx < len(selection_state):
+                        selection_state[idx] = True
+                for idx in removed:
+                    if 0 <= idx < len(selection_state):
+                        selection_state[idx] = False
+                listbox_selection_cache.clear()
+                listbox_selection_cache.update(current)
+                update_visuals(list(added | removed))
+
+            listbox_widget.bind("<<ListboxSelect>>", _on_listbox_select)
+
+        def _apply_initial_axes() -> None:
+            if all_ra_vals and all_dec_vals:
+                ra_min, ra_max = min(all_ra_vals), max(all_ra_vals)
+                dec_min, dec_max = min(all_dec_vals), max(all_dec_vals)
+                ra_pad = max(1e-3, (ra_max - ra_min) * 0.05 + 0.2)
+                dec_pad = max(1e-3, (dec_max - dec_min) * 0.05 + 0.2)
+                ax.set_xlim(ra_max + ra_pad, ra_min - ra_pad)
+                ax.set_ylim(dec_min - dec_pad, dec_max + dec_pad)
+                canvas.draw_idle()
+
+        def _finalize_initial_population() -> None:
+            if population_state["finalized"]:
+                return
+            population_state["finalized"] = True
+            update_visuals()
+            _apply_initial_axes()
+            _update_population_indicator(population_state["total"], done=True)
+
+        def _populate_initial_chunk() -> None:
+            total = population_state["total"]
+            if total <= 0:
+                _finalize_initial_population()
+                return
+            start = population_state["next_index"]
+            if start >= total:
+                _finalize_initial_population()
+                return
+            # Load a larger synchronous chunk first, then smaller async batches
+            chunk = 0
+            if start == 0:
+                chunk = min(total, 400)
+            else:
+                chunk = min(total - start, 200)
+            end = start + chunk
+            for idx in range(start, end):
+                _add_item_row(items[idx])
+            population_state["next_index"] = end
+            _update_population_indicator(end, done=end >= total)
+            try:
+                canvas.draw_idle()
+            except Exception:
+                pass
+            if end >= total:
+                _finalize_initial_population()
+            else:
+                # Yield to Tkinter before continuing with the next batch
+                try:
+                    root.after(15, _populate_initial_chunk)
+                except Exception:
+                    # If scheduling fails, continue synchronously to avoid losing items
+                    _populate_initial_chunk()
+
+        _populate_initial_chunk()
+
+        def _recompute_axes_limits() -> None:
+            ra_vals: list[float] = []
+            dec_vals: list[float] = []
+            for it in items:
+                footprint = it.get_cached_footprint()
+                if footprint is not None:
+                    for ra in footprint[:, 0].tolist():
+                        ra_vals.append(wrap_ra_deg(float(ra), ref_ra))
+                    dec_vals.extend(footprint[:, 1].tolist())
+                elif it.center is not None:
+                    ra_vals.append(wrap_ra_deg(float(it.center.ra.to(u.deg).value), ref_ra))
+                    dec_vals.append(float(it.center.dec.to(u.deg).value))
+            if ra_vals and dec_vals:
+                ra_min, ra_max = min(ra_vals), max(ra_vals)
+                dec_min, dec_max = min(dec_vals), max(dec_vals)
+                ra_pad = max(1e-3, (ra_max - ra_min) * 0.05 + 0.2)
+                dec_pad = max(1e-3, (dec_max - dec_min) * 0.05 + 0.2)
+                ax.set_xlim(ra_max + ra_pad, ra_min - ra_pad)
+                ax.set_ylim(dec_min - dec_pad, dec_max + dec_pad)
+                canvas.draw_idle()
+
+        def _schedule_axes_update() -> None:
+            if axes_update_pending["pending"]:
+                return
+
+            def _do_update() -> None:
+                axes_update_pending["pending"] = False
+                _recompute_axes_limits()
+
+            axes_update_pending["pending"] = True
+            try:
+                root.after_idle(_do_update)
+            except Exception:
+                _do_update()
+
+        def _ingest_batch(batch: list[Dict[str, Any]]) -> None:
+            if not batch:
+                return
+            new_indices: list[int] = []
+            for entry in batch:
+                candidate_path = entry.get("path") or entry.get("path_raw") or entry.get("path_preprocessed_cache")
+                key = _path_key(candidate_path)
+                if key and key in known_path_index:
+                    existing_idx = known_path_index[key]
+                    entry.setdefault("index", existing_idx)
+                    try:
+                        raw_files_with_wcs[existing_idx].update(entry)
+                    except Exception:
+                        raw_files_with_wcs[existing_idx] = dict(entry)
+                    try:
+                        items[existing_idx].src.update(entry)
+                    except Exception:
+                        items[existing_idx].src = dict(entry)
+                    try:
+                        items[existing_idx].index = existing_idx
+                        items[existing_idx].refresh_geometry()
+                    except Exception:
+                        pass
+                    try:
+                        base_name = os.path.basename(items[existing_idx].path)
+                        sep_txt = ""
+                        if items[existing_idx].center is not None:
+                            sep_deg = items[existing_idx].center.separation(global_center).to(u.deg).value
+                            sep_txt = f"  ({sep_deg:.2f}°)"
+                        _update_item_label(existing_idx, base_name + sep_txt)
+                    except Exception:
+                        pass
+                    try:
+                        _refresh_item_visual(existing_idx)
+                    except Exception:
+                        pass
+                    continue
+                raw_files_with_wcs.append(entry)
+                new_index = len(raw_files_with_wcs) - 1
+                entry.setdefault("index", new_index)
+                new_item = Item(entry, new_index)
+                items.append(new_item)
+                _add_item_row(new_item)
+                new_indices.append(new_index)
+            if new_indices:
+                update_visuals(new_indices)
+            if not _center_ready["ok"]:
+                _maybe_update_global_center()
+                if _center_ready["ok"] and has_explicit_centers:
+                    try:
+                        thresh_entry.state(["!disabled"])
+                    except Exception:
+                        thresh_entry.configure(state=tk.NORMAL)
+                    try:
+                        thresh_button.state(["!disabled"])
+                    except Exception:
+                        pass
+            if new_indices:
+                _schedule_axes_update()
+
+        def _consume_ui_queue() -> None:
+            if stream_queue is None or stream_state.get("done"):
+                return
+            try:
+                while True:
+                    batch = stream_queue.get_nowait()
+                    if batch is None:
+                        stream_state["done"] = True
+                        stream_state["running"] = False
+                        try:
+                            pb.stop()
+                            status_var.set(_tr("filter_status_ready", "Crawling done."))
+                        except Exception:
+                            pass
+                        stream_state["status_message"] = _tr("filter_status_ready", "Crawling done.")
+                        try:
+                            analyse_btn.state(["!disabled"])
+                        except Exception:
+                            pass
+                        break
+                    if batch:
+                        _ingest_batch(batch)
+            except queue.Empty:
+                pass
+            finally:
+                if not stream_state.get("done"):
+                    try:
+                        root.after(40, _consume_ui_queue)
+                    except Exception:
+                        stream_state["done"] = True
+
+        if stream_queue is not None and not stream_state.get("done"):
+            try:
+                root.after(40, _consume_ui_queue)
+            except Exception:
+                stream_state["done"] = True
+
+        def _drain_stream_queue() -> None:
+            if stream_queue is None or stream_state.get("done"):
+                return
+            while True:
+                try:
+                    batch = stream_queue.get(timeout=0.1)
+                except queue.Empty:
+                    if stream_state.get("done"):
+                        break
+                    continue
+                if batch is None:
+                    stream_state["done"] = True
+                    stream_state["running"] = False
+                    try:
+                        pb.stop()
+                        status_var.set(_tr("filter_status_ready", "Crawling done."))
+                    except Exception:
+                        pass
+                    stream_state["status_message"] = _tr("filter_status_ready", "Crawling done.")
+                    try:
+                        analyse_btn.state(["!disabled"])
+                    except Exception:
+                        pass
+                    break
+                if batch:
+                    _ingest_batch(batch)
+
+        def _refresh_item_visual(idx: int) -> None:
+            if idx < 0 or idx >= len(items):
+                return
+            item = items[idx]
+            prev_patch = patches[idx] if idx < len(patches) else None
+            prev_point = center_pts[idx] if idx < len(center_pts) else None
+            if prev_patch is not None:
+                try:
+                    prev_patch.remove()
+                except Exception:
+                    pass
+                artist_to_index.pop(prev_patch, None)
+                patches[idx] = None
+                drawn_footprints["count"] = max(0, drawn_footprints["count"] - 1)
+            if prev_point is not None:
+                try:
+                    prev_point.remove()
+                except Exception:
+                    pass
+                artist_to_index.pop(prev_point, None)
+                center_pts[idx] = None
+            selected = _is_selected(idx)
+            color_sel = "tab:blue" if selected else "0.7"
+            alpha_val = 0.9 if selected else 0.3
+            new_patch = None
+            new_point = None
+            footprint = item.get_cached_footprint()
+            if footprint is not None or (drawn_footprints["count"] < MAX_FOOTPRINTS and item.wcs is not None):
+                allow_draw = drawn_footprints["count"] < MAX_FOOTPRINTS
+                if allow_draw:
+                    try:
+                        footprint = item.ensure_footprint()
+                        if footprint is None:
+                            raise ValueError("no footprint")
+                        ra_wrapped = [wrap_ra_deg(float(ra), ref_ra) for ra in footprint[:, 0].tolist()]
+                        decs = footprint[:, 1].tolist()
+                        new_patch = Polygon(
+                            list(zip(ra_wrapped, decs)),
+                            closed=True,
+                            fill=False,
+                            edgecolor=color_sel,
+                            linewidth=1.0,
+                            alpha=alpha_val,
+                        )
+                        new_patch.set_picker(True)
+                        ax.add_patch(new_patch)
+                        artist_to_index[new_patch] = idx
+                        patches[idx] = new_patch
+                        drawn_footprints["count"] += 1
+                    except Exception:
+                        new_patch = None
+            elif item.center is not None:
+                try:
+                    ra_c = wrap_ra_deg(float(item.center.ra.to(u.deg).value), ref_ra)
+                    dec_c = float(item.center.dec.to(u.deg).value)
+                    new_point, = ax.plot([ra_c], [dec_c], marker="o", markersize=3, color=color_sel, alpha=alpha_val, picker=8)
+                    artist_to_index[new_point] = idx
+                    center_pts[idx] = new_point
+                except Exception:
+                    new_point = None
+            update_visuals(idx)
+            _schedule_axes_update()
+
+        def _trigger_stream_start(force: bool = False) -> None:
+            if not stream_mode:
+                return
+            spawn_callable = stream_state.get("spawn_worker")
+            if not callable(spawn_callable):
+                return
+            if stream_state.get("running"):
+                return
+            if not force and not stream_state.get("pending_start"):
+                return
+            stream_state["pending_start"] = False
+            stream_state["status_message"] = _tr("filter_status_crawling", "Crawling files… please wait")
+            try:
+                status_var.set(stream_state["status_message"])
+            except Exception:
+                pass
+            try:
+                pb.start(80)
+            except Exception:
+                pass
+            try:
+                analyse_btn.state(["disabled"])
+            except Exception:
+                pass
+            spawn_callable()
+            try:
+                root.after(40, _consume_ui_queue)
+            except Exception:
+                stream_state["done"] = True
+
+        def _on_analyse() -> None:
+            if not stream_mode:
+                return
+            _trigger_stream_start(force=True)
+
+        def _on_export() -> None:
+            path_csv = stream_state.get("csv_path") if isinstance(stream_state.get("csv_path"), str) else cache_csv_path
+            if not path_csv:
+                return
+            try:
+                os.makedirs(os.path.dirname(path_csv), exist_ok=True)
+            except Exception:
+                pass
+            payload: list[Dict[str, Any]] = []
+            for it in items:
+                data = dict(it.src)
+                if it.shape is not None:
+                    data.setdefault("shape", it.shape)
+                if it.center is not None:
+                    data.setdefault("center", it.center)
+                payload.append(data)
+            _export_csv(path_csv, payload)
+            stream_state["csv_loaded"] = True
+            stream_state["status_message"] = _tr(
+                "filter_status_ready_csv",
+                "Loaded from CSV. Click Analyse to refresh.",
+            )
+            try:
+                status_var.set(stream_state["status_message"])
+            except Exception:
+                pass
+            _log_message(f"[CSV] Exported {len(payload)} items -> {path_csv}", level="INFO")
+
+        analyse_btn.configure(command=_on_analyse)
+        export_btn.configure(command=_on_export)
+        if stream_mode:
+            try:
+                analyse_btn.state(["!disabled"])
+            except Exception:
+                pass
+            if stream_state.get("pending_start"):
+                _trigger_stream_start()
+            elif stream_state.get("status_message"):
+                try:
+                    analyse_btn.state(["!disabled"])
+                except Exception:
+                    pass
+
+        def _process_async_events() -> None:
+            try:
+                while True:
+                    event = async_events.get_nowait()
+                    kind = event[0]
+                    if kind == "log":
+                        _, message, level = event
+                        _log_message(str(message), level=str(level))
+                    elif kind == "header_loaded":
+                        _, idx, header_obj = event
+                        if (
+                            isinstance(idx, int)
+                            and 0 <= idx < len(items)
+                            and header_obj is not None
+                        ):
+                            item = items[idx]
+                            item.header = header_obj
+                            item.src["header"] = header_obj
+                    elif kind == "resolved_item":
+                        _, idx, header_obj, wcs_obj = event
+                        if isinstance(idx, int) and 0 <= idx < len(items):
+                            item = items[idx]
+                            if header_obj is not None:
+                                item.header = header_obj
+                                item.src["header"] = header_obj
+                            if wcs_obj is not None and getattr(wcs_obj, "is_celestial", False):
+                                item.src["wcs"] = wcs_obj
+                                item.wcs = wcs_obj
+                                try:
+                                    item.refresh_geometry()
+                                except Exception:
+                                    pass
+                                _refresh_item_visual(idx)
+                    elif kind == "resolve_done":
+                        _, resolved_now = event
+                        try:
+                            resolved_count = int(resolved_now)
+                        except Exception:
+                            resolved_count = 0
+                        if resolved_count >= 0:
+                            resolved_counter["count"] += resolved_count
+                            if resolved_count > 0:
+                                overrides_state["resolved_wcs_count"] = resolved_counter["count"]
+                        summary_msg = _tr(
+                            "filter_log_resolved_n",
+                            "Resolved WCS for {n} files.",
+                            n=resolved_count,
+                        )
+                        summary_var.set(summary_msg)
+                        _log_message(summary_msg, level="INFO")
+                        if resolved_count > 0:
+                            _schedule_axes_update()
+                        resolve_state["running"] = False
+                        try:
+                            resolve_btn.state(["!disabled"])
+                        except Exception:
+                            pass
+                    else:
+                        pass
+            except queue.Empty:
+                pass
+            finally:
+                try:
+                    root.after(150, _process_async_events)
+                except Exception:
+                    pass
+
+        _process_async_events()
 
         # Click-to-select/deselect via matplotlib pick events
         def _on_pick(event):
@@ -750,8 +2582,8 @@ def launch_filter_interface(
                 if i is None:
                     return
                 # Toggle associated checkbox and refresh colors
-                curr = check_vars[i].get()
-                check_vars[i].set(not curr)
+                curr = _is_selected(i)
+                _set_selected(i, not curr)
                 update_visuals(i)
             except Exception:
                 pass
@@ -763,7 +2595,9 @@ def launch_filter_interface(
 
         # On window close: treat as cancel (keep all)
         def on_close():
-            result["accepted"] = False
+            _drain_stream_queue()
+            if result.get("accepted") is None:
+                result["accepted"] = False
             result["selected_indices"] = None
             root.destroy()
         root.protocol("WM_DELETE_WINDOW", on_close)
@@ -776,20 +2610,55 @@ def launch_filter_interface(
                     parent.wait_window(root)
                 except Exception:
                     # Fallback to simple update loop
-                    root.update(); root.update_idletasks()
+                    try:
+                        root.update()
+                        root.update_idletasks()
+                    except Exception:
+                        pass
             else:
                 root.mainloop()
         except KeyboardInterrupt:
             # If interrupted, keep default behavior (keep all)
             pass
+        except Exception:
+            # Some environments (notably on Windows when running from a
+            # multiprocessing daemon) occasionally fail to enter Tk's
+            # mainloop, leaving the window unresponsive.  Fall back to a
+            # manual event pump so the user can still interact with the UI.
+            try:
+                deadline = time.monotonic() + 3600.0  # 1 hour safety cap
+                while True:
+                    try:
+                        root.update_idletasks()
+                        root.update()
+                    except Exception:
+                        break
+                    # Exit when the window is destroyed or a decision was made
+                    if not root.winfo_exists() or result.get("accepted") is not None:
+                        break
+                    if time.monotonic() > deadline:
+                        break
+                    time.sleep(0.05)
+                try:
+                    if root.winfo_exists():
+                        root.destroy()
+                except Exception:
+                    pass
+            except Exception:
+                pass
 
         # Return selection (and move unselected files into 'filtered_by_user')
-        if result.get("accepted") and isinstance(result.get("selected_indices"), list):
+        accepted_flag = result.get("accepted")
+        if accepted_flag is None:
+            accepted_flag = False
+        if accepted_flag and isinstance(result.get("selected_indices"), list):
             sel = result["selected_indices"]  # type: ignore[assignment]
 
             # Compute unselected indices
             total_n = len(raw_files_with_wcs)
             unselected_indices = [i for i in range(total_n) if i not in sel]
+            if unselected_indices:
+                overrides_state["filter_excluded_indices"] = unselected_indices
 
             # Prepare destination folder under the common input directory
             def _preferred_src_path(entry: Dict[str, Any]) -> Optional[str]:
@@ -854,7 +2723,7 @@ def launch_filter_interface(
                         # Non-fatal: keep going
                         print(f"WARN filter_gui: Failed to move '{src_path}' -> filtered_by_user: {e}")
 
-            return [raw_files_with_wcs[i] for i in sel], True, result.get("overrides")
+            return [raw_files_with_wcs[i] for i in sel], True, (overrides_state if overrides_state else None)
         else:
             # Keep all if canceled or closed
             return raw_files_with_wcs, False, None
