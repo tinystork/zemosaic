@@ -665,7 +665,11 @@ def launch_filter_interface(
                 self.shape: Optional[tuple[int, int]] = None
                 self.center: Optional[SkyCoord] = None
                 self.phase0_center: Optional[SkyCoord] = None
-                self.footprint: Optional[np.ndarray] = None  # shape (N, 2) in deg
+                # Footprint computations are quite expensive for thousands of
+                # entries.  Compute them lazily only when the UI actually needs
+                # the polygon to be drawn.
+                self._footprint_cache: Optional[np.ndarray] = None
+                self._footprint_ready: bool = False
                 self.refresh_geometry()
 
             def _coerce_skycoord(self, value: Any) -> Optional[SkyCoord]:
@@ -777,6 +781,22 @@ def launch_filter_interface(
                 except Exception:
                     return None
 
+            def get_cached_footprint(self) -> Optional[np.ndarray]:
+                """Return footprint if it has already been computed."""
+
+                if self._footprint_ready:
+                    return self._footprint_cache
+                return None
+
+            def ensure_footprint(self) -> Optional[np.ndarray]:
+                """Compute and cache the footprint when needed."""
+
+                if not self._footprint_ready:
+                    self._footprint_cache = self._build_footprint(self.shape)
+                    # Mark as ready even when None so we don't retry endlessly
+                    self._footprint_ready = True
+                return self._footprint_cache
+
             def refresh_geometry(self) -> None:
                 self.shape = self._infer_shape()
                 if self.shape and self.wcs is not None and getattr(self.wcs, "pixel_shape", None) is None:
@@ -792,7 +812,10 @@ def launch_filter_interface(
                     self.src["center"] = self.center
                 if self.shape is not None:
                     self.src["shape"] = self.shape
-                self.footprint = self._build_footprint(self.shape)
+                # Heavy footprint computations are deferred until explicitly
+                # requested by the UI via ``ensure_footprint``.
+                self._footprint_cache = None
+                self._footprint_ready = False
 
         raw_files_with_wcs: list[Dict[str, Any]] = []
         items: list[Item] = []
@@ -1801,10 +1824,16 @@ def launch_filter_interface(
             local_ra_vals: list[float] = []
             local_dec_vals: list[float] = []
 
-            if item.footprint is not None and drawn_footprints["count"] < MAX_FOOTPRINTS:
+            footprint_to_draw: Optional[np.ndarray] = None
+            if drawn_footprints["count"] < MAX_FOOTPRINTS:
+                footprint_to_draw = item.ensure_footprint()
+            else:
+                footprint_to_draw = item.get_cached_footprint()
+
+            if footprint_to_draw is not None and drawn_footprints["count"] < MAX_FOOTPRINTS:
                 try:
-                    ra_wrapped = [wrap_ra_deg(float(ra), ref_ra) for ra in item.footprint[:, 0].tolist()]
-                    decs = item.footprint[:, 1].tolist()
+                    ra_wrapped = [wrap_ra_deg(float(ra), ref_ra) for ra in footprint_to_draw[:, 0].tolist()]
+                    decs = footprint_to_draw[:, 1].tolist()
                     poly = Polygon(
                         list(zip(ra_wrapped, decs)),
                         closed=True,
@@ -1880,10 +1909,11 @@ def launch_filter_interface(
             ra_vals: list[float] = []
             dec_vals: list[float] = []
             for it in items:
-                if it.footprint is not None:
-                    for ra in it.footprint[:, 0].tolist():
+                footprint = it.get_cached_footprint()
+                if footprint is not None:
+                    for ra in footprint[:, 0].tolist():
                         ra_vals.append(wrap_ra_deg(float(ra), ref_ra))
-                    dec_vals.extend(it.footprint[:, 1].tolist())
+                    dec_vals.extend(footprint[:, 1].tolist())
                 elif it.center is not None:
                     ra_vals.append(wrap_ra_deg(float(it.center.ra.to(u.deg).value), ref_ra))
                     dec_vals.append(float(it.center.dec.to(u.deg).value))
@@ -2043,12 +2073,16 @@ def launch_filter_interface(
             alpha_val = 0.9 if selected else 0.3
             new_patch = None
             new_point = None
-            if item.footprint is not None:
+            footprint = item.get_cached_footprint()
+            if footprint is not None or (drawn_footprints["count"] < MAX_FOOTPRINTS and item.wcs is not None):
                 allow_draw = drawn_footprints["count"] < MAX_FOOTPRINTS
                 if allow_draw:
                     try:
-                        ra_wrapped = [wrap_ra_deg(float(ra), ref_ra) for ra in item.footprint[:, 0].tolist()]
-                        decs = item.footprint[:, 1].tolist()
+                        footprint = item.ensure_footprint()
+                        if footprint is None:
+                            raise ValueError("no footprint")
+                        ra_wrapped = [wrap_ra_deg(float(ra), ref_ra) for ra in footprint[:, 0].tolist()]
+                        decs = footprint[:, 1].tolist()
                         new_patch = Polygon(
                             list(zip(ra_wrapped, decs)),
                             closed=True,
