@@ -1695,7 +1695,7 @@ def launch_filter_interface(
                 elif dispersion_deg <= 0.30:
                     threshold_deg = 0.15
                 else:
-                    threshold_deg = 0.18 if dispersion_deg <= 0.60 else 0.20
+                    threshold_deg = 0.05 if dispersion_deg <= 0.60 else 0.20
                 threshold_deg = min(0.20, max(0.08, threshold_deg))
 
                 groups = cluster_func(

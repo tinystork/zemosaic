@@ -4406,13 +4406,13 @@ def run_hierarchical_mosaic(
                 return None
 
 
-    # Seuil de clustering : valeur de repli à 0.18° si l'option est absente ou non positive
+    # Seuil de clustering : valeur de repli à 0.05° si l'option est absente ou non positive
     try:
         cluster_threshold = float(cluster_threshold_config or 0)
     except (TypeError, ValueError):
         cluster_threshold = 0
     SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG = (
-        cluster_threshold if cluster_threshold > 0 else 0.18
+        cluster_threshold if cluster_threshold > 0 else 0.05
 
     )
     # Orientation split threshold (degrees). 0 disables orientation filtering

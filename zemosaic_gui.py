@@ -168,8 +168,8 @@ class ZeMosaicGUI:
                 # DÉSACTIVÉE par défaut pour conserver le rendu antérieur
                 "preprocess_remove_background_gpu": False,
                 "preprocess_background_sigma": 24.0,
-                # Valeur par défaut alignée avec le worker (0.18°)
-                "cluster_panel_threshold": 0.18,
+                # Valeur par défaut alignée avec le worker (0.05°)
+                "cluster_panel_threshold": 0.05,
                 "cluster_target_groups": 0,
                 "cluster_orientation_split_deg": 0.0
             }
@@ -263,7 +263,7 @@ class ZeMosaicGUI:
         self.astap_search_radius_var = tk.DoubleVar(master=self.root, value=self.config.get("astap_default_search_radius", 3.0))
         self.astap_downsample_var = tk.IntVar(master=self.root, value=self.config.get("astap_default_downsample", 2))
         self.astap_sensitivity_var = tk.IntVar(master=self.root, value=self.config.get("astap_default_sensitivity", 100))
-        self.cluster_threshold_var = tk.DoubleVar(master=self.root, value=self.config.get("cluster_panel_threshold", 0.18))
+        self.cluster_threshold_var = tk.DoubleVar(master=self.root, value=self.config.get("cluster_panel_threshold", 0.05))
         self.cluster_target_groups_var = tk.IntVar(master=self.root, value=self.config.get("cluster_target_groups", 0))
         self.cluster_orientation_split_var = tk.DoubleVar(master=self.root, value=self.config.get("cluster_orientation_split_deg", 0.0))
         self.save_final_uint16_var = tk.BooleanVar(master=self.root, value=self.config.get("save_final_as_uint16", False))
@@ -1740,7 +1740,7 @@ class ZeMosaicGUI:
             _initial_overrides = None
             try:
                 _initial_overrides = {
-                    "cluster_panel_threshold": float(self.cluster_threshold_var.get()) if hasattr(self, 'cluster_threshold_var') else float(self.config.get("cluster_panel_threshold", 0.18)),
+                    "cluster_panel_threshold": float(self.cluster_threshold_var.get()) if hasattr(self, 'cluster_threshold_var') else float(self.config.get("cluster_panel_threshold", 0.05)),
                     "cluster_target_groups": int(self.cluster_target_groups_var.get()) if hasattr(self, 'cluster_target_groups_var') else int(self.config.get("cluster_target_groups", 0)),
                     "cluster_orientation_split_deg": float(self.cluster_orientation_split_var.get()) if hasattr(self, 'cluster_orientation_split_var') else float(self.config.get("cluster_orientation_split_deg", 0.0)),
                 }

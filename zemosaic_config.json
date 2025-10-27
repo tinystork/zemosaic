@@ -33,7 +33,7 @@
     "auto_limit_frames_per_master_tile": true,
     "winsor_worker_limit": 10,
     "winsor_max_frames_per_pass": 0,
-    "max_raw_per_master_tile": 30,
+    "max_raw_per_master_tile": 20,
     "center_out_normalization_p3": true,
     "p3_center_sky_percentile": [
         25.0,
