@@ -39,6 +39,11 @@ DEFAULT_CONFIG = {
     "winsor_worker_limit": 10,
     "winsor_max_frames_per_pass": 0,
     "max_raw_per_master_tile": 0,
+    "center_out_normalization_p3": True,
+    "p3_center_sky_percentile": [25.0, 60.0],
+    "p3_center_robust_clip_sigma": 2.5,
+    "p3_center_preview_size": 256,
+    "p3_center_min_overlap_fraction": 0.03,
     # --- Intertile photometric calibration options ---
     "intertile_photometric_match": True,
     "intertile_preview_size": 512,
