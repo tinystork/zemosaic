@@ -11,6 +11,8 @@ import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
+import logging
+
 import numpy as np
 from astropy.io import fits
 
@@ -68,6 +70,24 @@ def binary_erosion1(m):
     )
     return n
 
+
+def _binary_erosion(mask, iterations=1):
+    """Binary erosion with zero padding to avoid wrap-around effects."""
+    mask = mask.astype(bool)
+    iters = max(0, int(iterations))
+    if iters == 0:
+        return mask
+    for _ in range(iters):
+        padded = np.pad(mask, 1, mode="constant", constant_values=False)
+        mask = (
+            padded[1:-1, 1:-1]
+            & padded[:-2, 1:-1] & padded[2:, 1:-1]
+            & padded[1:-1, :-2] & padded[1:-1, 2:]
+            & padded[:-2, :-2] & padded[:-2, 2:]
+            & padded[2:, :-2] & padded[2:, 2:]
+        )
+    return mask
+
 def bbox_from_mask(m):
     """BBox (y0,x0,y1,x1) du masque True. Si vide -> None."""
     ys, xs = np.where(m)
@@ -79,6 +99,9 @@ def bbox_from_mask(m):
 
 
 # -------------------------- coeur: détection auto-crop -----------------------
+
+logger = logging.getLogger(__name__)
+
 
 def detect_autocrop_rgb(lum2d, R, G, B, band_px=32, k_sigma=2.0, margin_px=8):
     """
@@ -117,14 +140,23 @@ def detect_autocrop_rgb(lum2d, R, G, B, band_px=32, k_sigma=2.0, margin_px=8):
     nonblack_small = (Rs > eps_small) | (Gs > eps_small) | (Bs > eps_small)
     base = np.isfinite(Ls) & nonblack_small & (Ls >= thrL) & (Vs >= thrV)
 
-    # --- 4) Rejet chroma bleu en bordure (faible recouvrement typique Seestar) ---
-    # "Excess-blue" simple (données normalisées)
-    Ez = Bs - np.maximum(Rs, Gs)
-    b = max(2, min(Hs, Ws) // 64)  # largeur de bord dynamique
+    # --- 4) Rejet chroma générique en bordure ---
+    Cmax = np.maximum(np.maximum(Rs, Gs), Bs)
+    Cmin = np.minimum(np.minimum(Rs, Gs), Bs)
+    sat = Cmax - Cmin
+    edge_band_px = max(24, margin_px)
+    edge_band_small = max(1, int(np.ceil(edge_band_px / float(max(1, band_px)))))
     edge = np.zeros_like(base, dtype=bool)
-    edge[:b, :] = True; edge[-b:, :] = True; edge[:, :b] = True; edge[:, -b:] = True
-    t_chroma = 0.15  # seuil modéré puisque canaux normalisés
-    base[edge & (Ez > t_chroma)] = False
+    edge[:edge_band_small, :] = True
+    edge[-edge_band_small:, :] = True
+    edge[:, :edge_band_small] = True
+    edge[:, -edge_band_small:] = True
+    t_chroma = 0.18
+    mask_chroma = edge & (sat > t_chroma)
+    mask_chroma = _binary_erosion(mask_chroma, iterations=2)
+    logger.debug("QBC edge-chroma: t=%.2f, erode=%d", t_chroma, 2)
+    if mask_chroma.any():
+        base[mask_chroma] = False
 
     # --- 5) Érosion (deux passes) pour casser les ponts fins ---
     m_small = binary_erosion1(base)
@@ -163,6 +195,80 @@ def detect_autocrop_rgb(lum2d, R, G, B, band_px=32, k_sigma=2.0, margin_px=8):
         return y0, x0, y1, x1
 
     y0, x0, y1, x1 = _trim_dark_edges_fullres(lum2d, (y0, x0, y1, x1))
+    before_color_trim = (int(y0), int(x0), int(y1), int(x1))
+    after_color_trim = _trim_color_edges_fullres(R, G, B, before_color_trim, step=3, minsize=32, k=k_sigma)
+    logger.debug("QBC color-trim: before=%s after=%s", before_color_trim, after_color_trim)
+
+    y0, x0, y1, x1 = after_color_trim
+    touches = (
+        y0 <= margin_px or x0 <= margin_px or y1 >= (H - margin_px) or x1 >= (W - margin_px)
+    )
+    if touches and band_px > 32:
+        band_px2 = max(16, band_px // 2)
+        logger.debug("QBC second-pass triggered: band %d -> %d", band_px, band_px2)
+        refined = detect_autocrop_rgb(lum2d, R, G, B, band_px=band_px2, k_sigma=k_sigma, margin_px=margin_px)
+        y0 = max(y0, refined[0])
+        x0 = max(x0, refined[1])
+        y1 = min(y1, refined[2])
+        x1 = min(x1, refined[3])
+        if y1 <= y0 or x1 <= x0:
+            return refined
+
+    return int(y0), int(x0), int(y1), int(x1)
+
+
+def _trim_color_edges_fullres(R, G, B, rect, step=3, minsize=32, k=3.0):
+    y0, x0, y1, x1 = rect
+    if (y1 - y0) <= minsize * 2 or (x1 - x0) <= minsize * 2:
+        return rect
+
+    inner = (slice(y0 + minsize, y1 - minsize), slice(x0 + minsize, x1 - minsize))
+    if (inner[0].start >= inner[0].stop) or (inner[1].start >= inner[1].stop):
+        return rect
+
+    r_inner = R[inner]
+    g_inner = G[inner]
+    b_inner = B[inner]
+
+    r_med = np.nanmedian(r_inner)
+    g_med = np.nanmedian(g_inner)
+    b_med = np.nanmedian(b_inner)
+
+    r_mad = np.nanmedian(np.abs(r_inner - r_med)) + 1e-6
+    g_mad = np.nanmedian(np.abs(g_inner - g_med)) + 1e-6
+    b_mad = np.nanmedian(np.abs(b_inner - b_med)) + 1e-6
+
+    def over(chan, med, mad, sl):
+        return np.nanmean(chan[sl]) > med + k * mad
+
+    while (x1 - x0) > minsize and (
+        over(R, r_med, r_mad, (slice(y0, y1), slice(x0, min(x0 + step, x1))))
+        or over(G, g_med, g_mad, (slice(y0, y1), slice(x0, min(x0 + step, x1))))
+        or over(B, b_med, b_mad, (slice(y0, y1), slice(x0, min(x0 + step, x1))))
+    ):
+        x0 += step
+
+    while (x1 - x0) > minsize and (
+        over(R, r_med, r_mad, (slice(y0, y1), slice(max(x1 - step, x0), x1)))
+        or over(G, g_med, g_mad, (slice(y0, y1), slice(max(x1 - step, x0), x1)))
+        or over(B, b_med, b_mad, (slice(y0, y1), slice(max(x1 - step, x0), x1)))
+    ):
+        x1 -= step
+
+    while (y1 - y0) > minsize and (
+        over(R, r_med, r_mad, (slice(y0, min(y0 + step, y1)), slice(x0, x1)))
+        or over(G, g_med, g_mad, (slice(y0, min(y0 + step, y1)), slice(x0, x1)))
+        or over(B, b_med, b_mad, (slice(y0, min(y0 + step, y1)), slice(x0, x1)))
+    ):
+        y0 += step
+
+    while (y1 - y0) > minsize and (
+        over(R, r_med, r_mad, (slice(max(y1 - step, y0), y1), slice(x0, x1)))
+        or over(G, g_med, g_mad, (slice(max(y1 - step, y0), y1), slice(x0, x1)))
+        or over(B, b_med, b_mad, (slice(max(y1 - step, y0), y1), slice(x0, x1)))
+    ):
+        y1 -= step
+
     return int(y0), int(x0), int(y1), int(x1)
 
 
