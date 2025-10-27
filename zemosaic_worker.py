@@ -6273,16 +6273,41 @@ def run_hierarchical_mosaic(
     try:
         if not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils): 
             raise RuntimeError("zemosaic_utils non disponible pour sauvegarde FITS.")
-        zemosaic_utils.save_fits_image(
-            image_data=final_mosaic_data_HWC,
-            output_path=final_fits_path,
-            header=final_header,
-            overwrite=True,
-            save_as_float=not save_final_as_uint16_config,
-            legacy_rgb_cube=bool(legacy_rgb_cube_config),
-            progress_callback=progress_callback,
-            axis_order="HWC",
-        )
+        legacy_rgb_flag = bool(legacy_rgb_cube_config)
+        if bool(save_final_as_uint16_config) and not legacy_rgb_flag:
+            if not hasattr(zemosaic_utils, "write_final_fits_uint16_color_aware"):
+                raise RuntimeError("write_final_fits_uint16_color_aware unavailable in zemosaic_utils")
+            is_rgb = (
+                isinstance(final_mosaic_data_HWC, np.ndarray)
+                and final_mosaic_data_HWC.ndim == 3
+                and final_mosaic_data_HWC.shape[-1] == 3
+            )
+            zemosaic_utils.write_final_fits_uint16_color_aware(
+                final_fits_path,
+                final_mosaic_data_HWC,
+                header=final_header,
+                force_rgb_planes=is_rgb,
+                legacy_rgb_cube=legacy_rgb_flag,
+                overwrite=True,
+            )
+            if is_rgb:
+                pcb(
+                    "run_info_phase6_saved_uint16_rgb_planes",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                    filename=os.path.basename(final_fits_path),
+                )
+        else:
+            zemosaic_utils.save_fits_image(
+                image_data=final_mosaic_data_HWC,
+                output_path=final_fits_path,
+                header=final_header,
+                overwrite=True,
+                save_as_float=not save_final_as_uint16_config,
+                legacy_rgb_cube=legacy_rgb_flag,
+                progress_callback=progress_callback,
+                axis_order="HWC",
+            )
         
         if final_mosaic_coverage_HW is not None and np.any(final_mosaic_coverage_HW):
             coverage_path = os.path.join(output_folder, f"{output_base_name}_coverage.fits")
