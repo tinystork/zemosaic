@@ -26,6 +26,7 @@ Dependencies limited to tkinter, astropy, matplotlib, numpy; all optional.
 from __future__ import annotations
 
 from typing import List, Dict, Any, Optional
+from collections.abc import Iterable
 from dataclasses import asdict
 import os
 import sys
@@ -1807,6 +1808,7 @@ def launch_filter_interface(
         all_ra_vals: list[float] = []
         all_dec_vals: list[float] = []
         drawn_footprints = {"count": 0}
+        axes_update_pending = {"pending": False}
         population_state = {
             "next_index": 0,
             "total": total_initial_entries,
@@ -1924,19 +1926,37 @@ def launch_filter_interface(
             all_dec_vals.extend(local_dec_vals)
         ax.grid(True, which="both", linestyle=":", linewidth=0.6)
 
-        def update_visuals(changed_index: Optional[int] = None) -> None:
-            # Update colors/alpha for polygons and points according to selection state
-            for i, it in enumerate(items):
+        def update_visuals(changed_index: Optional[Iterable[int] | int] = None) -> None:
+            """Refresh matplotlib artists to match the checkbox selection state."""
+
+            if changed_index is None:
+                target_indices: Iterable[int] = range(len(items))
+            elif isinstance(changed_index, Iterable) and not isinstance(changed_index, (str, bytes)):
+                target_indices = changed_index
+            else:
+                target_indices = (changed_index,)
+
+            any_updated = False
+            for raw_idx in target_indices:
+                try:
+                    i = int(raw_idx)
+                except (TypeError, ValueError):
+                    continue
+                if i < 0 or i >= len(items):
+                    continue
                 selected = check_vars[i].get()
                 col = "tab:blue" if selected else "0.7"
                 alp = 0.9 if selected else 0.3
                 if i < len(patches) and patches[i] is not None:
                     patches[i].set_edgecolor(col)
                     patches[i].set_alpha(alp)
+                    any_updated = True
                 if i < len(center_pts) and center_pts[i] is not None:
                     center_pts[i].set_color(col)
                     center_pts[i].set_alpha(alp)
-            canvas.draw_idle()
+                    any_updated = True
+            if any_updated:
+                canvas.draw_idle()
 
         def _apply_initial_axes() -> None:
             if all_ra_vals and all_dec_vals:
@@ -2013,9 +2033,24 @@ def launch_filter_interface(
                 ax.set_ylim(dec_min - dec_pad, dec_max + dec_pad)
                 canvas.draw_idle()
 
+        def _schedule_axes_update() -> None:
+            if axes_update_pending["pending"]:
+                return
+
+            def _do_update() -> None:
+                axes_update_pending["pending"] = False
+                _recompute_axes_limits()
+
+            axes_update_pending["pending"] = True
+            try:
+                root.after_idle(_do_update)
+            except Exception:
+                _do_update()
+
         def _ingest_batch(batch: list[Dict[str, Any]]) -> None:
             if not batch:
                 return
+            new_indices: list[int] = []
             for entry in batch:
                 candidate_path = entry.get("path") or entry.get("path_raw") or entry.get("path_preprocessed_cache")
                 key = _path_key(candidate_path)
@@ -2056,7 +2091,9 @@ def launch_filter_interface(
                 new_item = Item(entry, new_index)
                 items.append(new_item)
                 _add_item_row(new_item)
-            update_visuals()
+                new_indices.append(new_index)
+            if new_indices:
+                update_visuals(new_indices)
             if not _center_ready["ok"]:
                 _maybe_update_global_center()
                 if _center_ready["ok"] and has_explicit_centers:
@@ -2068,7 +2105,8 @@ def launch_filter_interface(
                         thresh_button.state(["!disabled"])
                     except Exception:
                         pass
-            _recompute_axes_limits()
+            if new_indices:
+                _schedule_axes_update()
 
         def _consume_ui_queue() -> None:
             if stream_queue is None or stream_state.get("done"):
@@ -2195,7 +2233,7 @@ def launch_filter_interface(
                 except Exception:
                     new_point = None
             update_visuals(idx)
-            _recompute_axes_limits()
+            _schedule_axes_update()
 
         def _trigger_stream_start(force: bool = False) -> None:
             if not stream_mode:
@@ -2326,7 +2364,7 @@ def launch_filter_interface(
                         summary_var.set(summary_msg)
                         _log_message(summary_msg, level="INFO")
                         if resolved_count > 0:
-                            _recompute_axes_limits()
+                            _schedule_axes_update()
                         resolve_state["running"] = False
                         try:
                             resolve_btn.state(["!disabled"])
