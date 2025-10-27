@@ -1778,11 +1778,14 @@ def save_fits_image(image_data: np.ndarray,
                     if k in final_header_to_write:
                         del final_header_to_write[k]
             else:
-                # Convert raw int16 back to physical for header statistics
-                phys_min = float(np.nanmin(data_for_hdu_cxhxw.astype(np.int32) + 32768))
-                phys_max = float(np.nanmax(data_for_hdu_cxhxw.astype(np.int32) + 32768))
-                final_header_to_write['DATAMIN'] = phys_min
-                final_header_to_write['DATAMAX'] = phys_max
+                # DATAMIN/DATAMAX must reflect the stored integer sample range to
+                # avoid overflow in viewers that cast these keywords to the data
+                # type (e.g. ASI FITS Viewer). Keep the raw int16 limits here; the
+                # physical unsigned range is implied by BSCALE/BZERO.
+                raw_min = float(np.nanmin(data_for_hdu_cxhxw))
+                raw_max = float(np.nanmax(data_for_hdu_cxhxw))
+                final_header_to_write['DATAMIN'] = raw_min
+                final_header_to_write['DATAMAX'] = raw_max
         except Exception as _:
             pass
 
