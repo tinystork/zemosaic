@@ -2723,7 +2723,7 @@ def create_master_tile(
     resource_strategy: dict | None = None,
     center_out_context: CenterOutNormalizationContext | None = None,
     center_out_settings: dict | None = None,
-    _center_out_rank: int | None = None,
+    center_out_rank: int | None = None,
 ):
     """
     Crée une "master tuile" à partir d'un groupe d'images.
