@@ -1614,12 +1614,220 @@ def save_numpy_to_fits(image_data: np.ndarray, header, output_path: str, *, axis
 
 
 
+def _ensure_float32_no_nan(arr: np.ndarray) -> np.ndarray:
+    """Return a float32 view/copy of ``arr`` with NaN/Inf replaced by zero."""
+
+    arr_float = arr.astype(np.float32, copy=False)
+    if not np.all(np.isfinite(arr_float)):
+        arr_float = arr_float.copy()
+        np.nan_to_num(arr_float, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    return arr_float
+
+
+def _rescale_to_u16(arr: np.ndarray) -> np.ndarray:
+    """Scale float32 ``arr`` to the full uint16 range [0, 65535]."""
+
+    finite_mask = np.isfinite(arr)
+    if not np.any(finite_mask):
+        return np.zeros(arr.shape, dtype=np.uint16)
+
+    finite_values = arr[finite_mask]
+    vmin = float(np.nanmin(finite_values))
+    vmax = float(np.nanmax(finite_values))
+
+    if (not np.isfinite(vmin)) or (not np.isfinite(vmax)) or vmax <= vmin:
+        return np.zeros(arr.shape, dtype=np.uint16)
+
+    scale = 65535.0 / (vmax - vmin)
+    result = np.zeros(arr.shape, dtype=np.float32)
+    result[finite_mask] = (arr[finite_mask] - vmin) * scale
+    np.clip(result, 0.0, 65535.0, out=result)
+    return result.astype(np.uint16)
+
+
+def _to_int16_with_bzero(u16_arr: np.ndarray) -> np.ndarray:
+    """Convert ``uint16`` samples to FITS-compliant int16 with ``BZERO=32768``."""
+
+    shifted = u16_arr.astype(np.int32, copy=False) - 32768
+    return np.clip(shifted, -32768, 32767).astype(np.int16, copy=False)
+
+
+def _prepare_int16_header(base_header, width: int, height: int, *, extname: str | None = None):
+    """Return a header for a 2-D int16 image with BSCALE/BZERO metadata."""
+
+    header = base_header.copy()
+    for key in (
+        "SIMPLE",
+        "BITPIX",
+        "NAXIS",
+        "NAXIS1",
+        "NAXIS2",
+        "NAXIS3",
+        "NAXIS4",
+        "NAXIS5",
+        "BSCALE",
+        "BZERO",
+        "EXTEND",
+        "XTENSION",
+        "CHECKSUM",
+        "DATASUM",
+        "PCOUNT",
+        "GCOUNT",
+        "CTYPE3",
+        "CTYPE4",
+    ):
+        if key in header:
+            del header[key]
+
+    for key in ("DATAMIN", "DATAMAX"):
+        if key in header:
+            del header[key]
+
+    if extname:
+        header["EXTNAME"] = extname
+    elif "EXTNAME" in header:
+        del header["EXTNAME"]
+
+    header["BITPIX"] = 16
+    header["BSCALE"] = 1
+    header["BZERO"] = 32768
+    header["NAXIS"] = 2
+    header["NAXIS1"] = int(width)
+    header["NAXIS2"] = int(height)
+    return header
+
+
+def _update_dataminmax(header, data: np.ndarray) -> None:
+    """Set ``DATAMIN``/``DATAMAX`` cards to match the stored integer range."""
+
+    for key in ("DATAMIN", "DATAMAX"):
+        if key in header:
+            del header[key]
+    try:
+        raw_min = int(np.nanmin(data))
+        raw_max = int(np.nanmax(data))
+    except ValueError:
+        raw_min = raw_max = 0
+    header["DATAMIN"] = raw_min
+    header["DATAMAX"] = raw_max
+
+
+def _build_rgb_luminance_hdus(
+    img_hwc: np.ndarray,
+    base_header,
+    fits_module,
+    log_fn,
+):
+    """Create a luminance primary HDU and R/G/B extensions."""
+
+    height, width, _ = img_hwc.shape
+    r_plane, g_plane, b_plane = np.moveaxis(img_hwc, -1, 0)
+
+    luminance = (0.2126 * r_plane + 0.7152 * g_plane + 0.0722 * b_plane).astype(
+        np.float32, copy=False
+    )
+
+    u16_l = _rescale_to_u16(luminance)
+    i16_l = _to_int16_with_bzero(u16_l)
+    header_primary = _prepare_int16_header(base_header, width, height)
+    _update_dataminmax(header_primary, i16_l)
+    primary_hdu = fits_module.PrimaryHDU(data=i16_l, header=header_primary)
+    primary_hdu.header['BSCALE'] = 1
+    primary_hdu.header['BZERO'] = 32768
+    log_fn(
+        f"  SAVE_DEBUG: Luminance primary range [{np.min(i16_l)}, {np.max(i16_l)}]",
+        "WARN",
+    )
+
+    extensions = []
+    for name, plane in (("R", r_plane), ("G", g_plane), ("B", b_plane)):
+        u16_plane = _rescale_to_u16(plane)
+        i16_plane = _to_int16_with_bzero(u16_plane)
+        header_plane = _prepare_int16_header(base_header, width, height, extname=name)
+        _update_dataminmax(header_plane, i16_plane)
+        image_hdu = fits_module.ImageHDU(data=i16_plane, header=header_plane, name=name)
+        image_hdu.header['BSCALE'] = 1
+        image_hdu.header['BZERO'] = 32768
+        log_fn(
+            f"  SAVE_DEBUG: Channel {name} range [{np.min(i16_plane)}, {np.max(i16_plane)}]",
+            "WARN",
+        )
+        extensions.append(image_hdu)
+
+    return primary_hdu, extensions
+
+
+def _build_legacy_rgb_cube_hdu(
+    img_hwc: np.ndarray,
+    base_header,
+    fits_module,
+    log_fn,
+):
+    """Return a legacy RGB cube PrimaryHDU (channels-first)."""
+
+    height, width, channels = img_hwc.shape
+    planes = np.moveaxis(img_hwc, -1, 0)
+    scaled_planes = []
+    for name, plane in zip(("R", "G", "B"), planes):
+        u16_plane = _rescale_to_u16(plane)
+        i16_plane = _to_int16_with_bzero(u16_plane)
+        log_fn(
+            f"  SAVE_DEBUG: Legacy plane {name} range [{np.min(i16_plane)}, {np.max(i16_plane)}]",
+            "WARN",
+        )
+        scaled_planes.append(i16_plane)
+
+    cube_i16 = np.stack(scaled_planes, axis=0)
+    header = _prepare_int16_header(base_header, width, height)
+    header["NAXIS"] = 3
+    header["NAXIS3"] = int(channels)
+    header["CTYPE3"] = ("RGB", "Color Format")
+    header["EXTNAME"] = "RGB"
+    _update_dataminmax(header, cube_i16)
+    log_fn(
+        f"  SAVE_DEBUG: Legacy cube range [{np.min(cube_i16)}, {np.max(cube_i16)}]",
+        "WARN",
+    )
+    legacy_hdu = fits_module.PrimaryHDU(data=cube_i16, header=header)
+    legacy_hdu.header['BSCALE'] = 1
+    legacy_hdu.header['BZERO'] = 32768
+    return legacy_hdu
+
+
+def _build_generic_cube_hdu(
+    img_hwc: np.ndarray,
+    base_header,
+    fits_module,
+    log_fn,
+):
+    """Fallback: scale and save an arbitrary multi-channel cube."""
+
+    height, width, channels = img_hwc.shape
+    u16_data = _rescale_to_u16(img_hwc)
+    i16_data = _to_int16_with_bzero(u16_data)
+    data_to_write = np.moveaxis(i16_data, -1, 0)
+    header = _prepare_int16_header(base_header, width, height)
+    header["NAXIS"] = 3
+    header["NAXIS3"] = int(channels)
+    _update_dataminmax(header, data_to_write)
+    log_fn(
+        f"  SAVE_DEBUG: Generic cube range [{np.min(data_to_write)}, {np.max(data_to_write)}]",
+        "WARN",
+    )
+    generic_hdu = fits_module.PrimaryHDU(data=data_to_write, header=header)
+    generic_hdu.header['BSCALE'] = 1
+    generic_hdu.header['BZERO'] = 32768
+    return generic_hdu
+
+
+
 
 def save_fits_image(image_data: np.ndarray,
                     output_path: str,
                     header = None,  # Type hint peut être plus flexible: fits_module_for_utils.Header() | dict
                     overwrite: bool = True,
                     save_as_float: bool = False,
+                    legacy_rgb_cube: bool = False,
                     progress_callback: callable = None,
                     axis_order: str = "HWC"):
     """
@@ -1674,6 +1882,8 @@ def save_fits_image(image_data: np.ndarray,
             except KeyError: pass
 
     data_to_write_temp = None
+    hdus_to_write = []
+    primary_hdu_object = None
     if save_as_float:
         # Avoid an extra full-size copy if already float32 (important for huge mosaics)
         if isinstance(image_data, np.ndarray) and image_data.dtype == np.float32:
@@ -1712,110 +1922,168 @@ def save_fits_image(image_data: np.ndarray,
         if 'DATAMIN' in final_header_to_write: del final_header_to_write['DATAMIN']
         if 'DATAMAX' in final_header_to_write: del final_header_to_write['DATAMAX']
         _log_util_save(f"  SAVE_DEBUG: (Float) data_to_write_temp: Range [{np.nanmin(data_to_write_temp):.3g}, {np.nanmax(data_to_write_temp):.3g}], IsFinite: {np.all(np.isfinite(data_to_write_temp))}", "WARN")
-    else:
-        min_in, max_in = np.nanmin(image_data), np.nanmax(image_data)
-        image_normalized_01 = np.zeros_like(image_data, dtype=np.float32)
-        if np.isfinite(min_in) and np.isfinite(max_in) and (max_in > min_in + 1e-9):
-            image_normalized_01 = (image_data.astype(np.float32) - min_in) / (max_in - min_in)
-        elif np.any(np.isfinite(image_data)): image_normalized_01 = np.full_like(image_data, 0.5, dtype=np.float32)
-        
-        image_clipped_01 = np.clip(image_normalized_01, 0.0, 1.0)
-        # Prepare unsigned 16-bit physical range [0, 65535]
-        data_u16_phys = (image_clipped_01 * 65535.0).astype(np.uint16)
-        # Store as FITS signed int16 with BZERO=32768 as per FITS convention
-        # raw_int16 = physical - 32768 in range [-32768, 32767]
-        data_to_write_temp = (data_u16_phys.astype(np.int32) - 32768).clip(-32768, 32767).astype(np.int16)
-        final_header_to_write['BITPIX'] = 16; final_header_to_write['BSCALE'] = 1; final_header_to_write['BZERO'] = 32768
-        _log_util_save(f"  SAVE_DEBUG: (Int16+BZERO) raw data range [{np.min(data_to_write_temp)}, {np.max(data_to_write_temp)}] (phys 0..65535)", "WARN")
 
-    data_for_hdu_cxhxw = None
-    is_color = data_to_write_temp.ndim == 3 and data_to_write_temp.shape[-1] == 3
-    if is_color:
         axis_order_upper = str(axis_order).upper()
-        if axis_order_upper == 'HWC':
-            h, w, c = data_to_write_temp.shape
-            data_for_hdu_cxhxw = np.moveaxis(data_to_write_temp, -1, 0)
-        elif axis_order_upper == 'CHW':
-            c, h, w = data_to_write_temp.shape
-            data_for_hdu_cxhxw = data_to_write_temp
-        else:
-            _log_util_save(f"Axis order '{axis_order}' non reconnu, utilisation 'HWC'", "WARN")
-            h, w, c = data_to_write_temp.shape
-            data_for_hdu_cxhxw = np.moveaxis(data_to_write_temp, -1, 0)
-        final_header_to_write['NAXIS'] = 3
-        final_header_to_write['NAXIS1'] = w
-        final_header_to_write['NAXIS2'] = h
-        final_header_to_write['NAXIS3'] = c
-        if 'CTYPE3' not in final_header_to_write:
-            final_header_to_write['CTYPE3'] = ('RGB', 'Color Format')
-        if 'EXTNAME' not in final_header_to_write:
-            final_header_to_write['EXTNAME'] = 'RGB'
-    else: # HW (ou déjà CxHxW, par exemple une carte de couverture)
-        if data_to_write_temp.ndim == 2: # Cas explicite HW pour monochrome
-            data_for_hdu_cxhxw = data_to_write_temp
-            final_header_to_write['NAXIS'] = 2; final_header_to_write['NAXIS1'] = data_to_write_temp.shape[1]
-            final_header_to_write['NAXIS2'] = data_to_write_temp.shape[0]
-            if 'NAXIS3' in final_header_to_write: del final_header_to_write['NAXIS3']
-            if 'CTYPE3' in final_header_to_write: del final_header_to_write['CTYPE3']
-        else: # Si ce n'est ni HWC ni HW, on suppose que c'est déjà dans le bon format pour HDU (ex: couverture CxHxW)
-            data_for_hdu_cxhxw = data_to_write_temp 
-            # Dans ce cas, on espère que le header contient déjà les bonnes infos NAXIS, ou Astropy les déduira.
-            _log_util_save(f"SAVE_DEBUG: Shape data_to_write_temp non HWC ni HW standard: {data_to_write_temp.shape}. Passage direct à HDU.", "DEBUG_DETAIL")
-
-    
-    _log_util_save(f"SAVE_DEBUG: Données PRÊTES pour HDU (data_for_hdu_cxhxw) - Shape: {data_for_hdu_cxhxw.shape}, Dtype: {data_for_hdu_cxhxw.dtype}, Range: [{np.nanmin(data_for_hdu_cxhxw):.3g}, {np.nanmax(data_for_hdu_cxhxw):.3g}], IsFinite: {np.all(np.isfinite(data_for_hdu_cxhxw))}", "WARN")
-        
-    hdul = None 
-    primary_hdu_object = None # Pour pouvoir del primary_hdu.data
-    try:
-        _log_util_save(f"SAVE_DEBUG: AVANT PrimaryHDU - data_for_hdu_cxhxw - Min: {np.nanmin(data_for_hdu_cxhxw)}, Max: {np.nanmax(data_for_hdu_cxhxw)}, Mean: {np.nanmean(data_for_hdu_cxhxw)}, Std: {np.nanstd(data_for_hdu_cxhxw)}, Dtype: {data_for_hdu_cxhxw.dtype}, Finite: {np.all(np.isfinite(data_for_hdu_cxhxw))}", "ERROR")
-        
-        # Add DATAMIN/DATAMAX based on physical values expected by viewers
-        try:
-            if save_as_float:
-                # Do not write DATAMIN/DATAMAX for float output to avoid confusing auto-stretchers
-                for k in ('DATAMIN', 'DATAMAX'):
-                    if k in final_header_to_write:
-                        del final_header_to_write[k]
+        if data_to_write_temp.ndim == 3:
+            if axis_order_upper == 'HWC':
+                data_for_primary = np.moveaxis(data_to_write_temp, -1, 0)
+            elif axis_order_upper == 'CHW':
+                data_for_primary = data_to_write_temp
             else:
-                # DATAMIN/DATAMAX must reflect the stored integer sample range to
-                # avoid overflow in viewers that cast these keywords to the data
-                # type (e.g. ASI FITS Viewer). Keep the raw int16 limits here; the
-                # physical unsigned range is implied by BSCALE/BZERO.
-                raw_min = float(np.nanmin(data_for_hdu_cxhxw))
-                raw_max = float(np.nanmax(data_for_hdu_cxhxw))
-                final_header_to_write['DATAMIN'] = raw_min
-                final_header_to_write['DATAMAX'] = raw_max
-        except Exception as _:
-            pass
+                _log_util_save(f"Axis order '{axis_order}' non reconnu, utilisation 'HWC'", "WARN")
+                data_for_primary = np.moveaxis(data_to_write_temp, -1, 0)
+        else:
+            data_for_primary = data_to_write_temp
 
-        primary_hdu_object = current_fits_module.PrimaryHDU(data=data_for_hdu_cxhxw, header=final_header_to_write)
-        
-        _log_util_save(f"SAVE_DEBUG: APRÈS PrimaryHDU - primary_hdu.data - Min: {np.nanmin(primary_hdu_object.data)}, Max: {np.nanmax(primary_hdu_object.data)}, Mean: {np.nanmean(primary_hdu_object.data)}, Dtype: {primary_hdu_object.data.dtype}, Finite: {np.all(np.isfinite(primary_hdu_object.data))}", "ERROR")
-        
-        hdul = current_fits_module.HDUList([primary_hdu_object])
+        _log_util_save(
+            f"SAVE_DEBUG: Données PRÊTES (float) - Shape: {data_for_primary.shape}, Dtype: {data_for_primary.dtype}, Range: [{np.nanmin(data_for_primary):.3g}, {np.nanmax(data_for_primary):.3g}], IsFinite: {np.all(np.isfinite(data_for_primary))}",
+            "WARN",
+        )
+
+        header_float = final_header_to_write.copy()
+        header_float['BITPIX'] = -32
+        if 'BSCALE' in header_float:
+            del header_float['BSCALE']
+        if 'BZERO' in header_float:
+            del header_float['BZERO']
+        if 'DATAMIN' in header_float:
+            del header_float['DATAMIN']
+        if 'DATAMAX' in header_float:
+            del header_float['DATAMAX']
+
+        if data_to_write_temp.ndim == 3:
+            if axis_order_upper == 'HWC':
+                h, w, c = image_data.shape
+            elif axis_order_upper == 'CHW':
+                c, h, w = image_data.shape
+            else:
+                h, w, c = image_data.shape
+            header_float['NAXIS'] = 3
+            header_float['NAXIS1'] = int(w)
+            header_float['NAXIS2'] = int(h)
+            header_float['NAXIS3'] = int(c)
+            if 'CTYPE3' not in header_float:
+                header_float['CTYPE3'] = ('RGB', 'Color Format')
+            if 'EXTNAME' not in header_float:
+                header_float['EXTNAME'] = 'RGB'
+        else:
+            header_float['NAXIS'] = 2
+            header_float['NAXIS1'] = int(data_for_primary.shape[1])
+            header_float['NAXIS2'] = int(data_for_primary.shape[0])
+            if 'NAXIS3' in header_float:
+                del header_float['NAXIS3']
+            if 'CTYPE3' in header_float:
+                del header_float['CTYPE3']
+            if 'EXTNAME' in header_float:
+                del header_float['EXTNAME']
+
+        primary_hdu_object = current_fits_module.PrimaryHDU(data=data_for_primary, header=header_float)
+        hdus_to_write.append(primary_hdu_object)
+    else:
+        axis_order_upper = str(axis_order).upper()
+        if image_data.ndim == 2:
+            sanitized = _ensure_float32_no_nan(image_data)
+            u16_plane = _rescale_to_u16(sanitized)
+            i16_plane = _to_int16_with_bzero(u16_plane)
+            header_primary = _prepare_int16_header(final_header_to_write, sanitized.shape[1], sanitized.shape[0])
+            _update_dataminmax(header_primary, i16_plane)
+            primary_hdu_object = current_fits_module.PrimaryHDU(data=i16_plane, header=header_primary)
+            primary_hdu_object.header['BSCALE'] = 1
+            primary_hdu_object.header['BZERO'] = 32768
+            hdus_to_write.append(primary_hdu_object)
+            _log_util_save(
+                f"  SAVE_DEBUG: Monochrome int16 range [{np.min(i16_plane)}, {np.max(i16_plane)}]",
+                "WARN",
+            )
+        elif image_data.ndim == 3:
+            if axis_order_upper == 'CHW':
+                img_hwc = np.moveaxis(image_data, 0, -1)
+            elif axis_order_upper == 'HWC':
+                img_hwc = image_data
+            else:
+                _log_util_save(f"Axis order '{axis_order}' non reconnu, utilisation 'HWC'", "WARN")
+                img_hwc = image_data
+
+            img_hwc = _ensure_float32_no_nan(img_hwc)
+            channels = img_hwc.shape[-1]
+            if channels == 3:
+                if legacy_rgb_cube:
+                    primary_hdu_object = _build_legacy_rgb_cube_hdu(
+                        img_hwc, final_header_to_write, current_fits_module, _log_util_save
+                    )
+                    hdus_to_write.append(primary_hdu_object)
+                else:
+                    primary_hdu_object, plane_hdus = _build_rgb_luminance_hdus(
+                        img_hwc, final_header_to_write, current_fits_module, _log_util_save
+                    )
+                    hdus_to_write.append(primary_hdu_object)
+                    hdus_to_write.extend(plane_hdus)
+            else:
+                _log_util_save(
+                    f"SAVE_DEBUG: Canaux={channels} (non-RGB). Utilisation du mode cube générique.",
+                    "WARN",
+                )
+                primary_hdu_object = _build_generic_cube_hdu(
+                    img_hwc, final_header_to_write, current_fits_module, _log_util_save
+                )
+                hdus_to_write.append(primary_hdu_object)
+        else:
+            _log_util_save(
+                f"ERREUR: Dimensions d'image non supportées pour '{base_output_filename}' : {image_data.shape}",
+                "ERROR",
+            )
+            return
+
+        if hdus_to_write:
+            primary_data = hdus_to_write[0].data
+            _log_util_save(
+                f"SAVE_DEBUG: Données PRÊTES (int16) - Shape: {primary_data.shape}, Dtype: {primary_data.dtype}, Range: [{np.min(primary_data)} - {np.max(primary_data)}]",
+                "WARN",
+            )
+
+    if not hdus_to_write:
+        _log_util_save(
+            f"ERREUR: Aucun HDU généré pour '{base_output_filename}'. Sauvegarde annulée.",
+            "ERROR",
+        )
+        return
+
+    hdul = None
+    try:
+        primary_for_log = primary_hdu_object or hdus_to_write[0]
+        primary_data = getattr(primary_for_log, 'data', None)
+        if primary_data is not None:
+            _log_util_save(
+                f"SAVE_DEBUG: AVANT écriture - Min: {np.nanmin(primary_data)}, Max: {np.nanmax(primary_data)}, Mean: {np.nanmean(primary_data)}, Std: {np.nanstd(primary_data)}, Dtype: {primary_data.dtype}, Finite: {np.all(np.isfinite(primary_data))}",
+                "ERROR",
+            )
+
+        hdul = current_fits_module.HDUList(hdus_to_write)
         _log_util_save(f"Écriture vers '{base_output_filename}' (overwrite={overwrite})...", "DEBUG_DETAIL")
-        
-        hdul.writeto(output_path, overwrite=overwrite, checksum=True, output_verify='exception') 
+
+        hdul.writeto(output_path, overwrite=overwrite, checksum=True, output_verify='exception')
         _log_util_save(f"Sauvegarde FITS vers '{base_output_filename}' RÉUSSIE.", "INFO")
 
     except Exception as e_write:
         _log_util_save(f"ERREUR CRITIQUE lors sauvegarde FITS '{base_output_filename}': {type(e_write).__name__} - {e_write}", "ERROR")
-        if progress_callback: _log_util_save(f"  [ZU SaveFITS TRACEBACK] {traceback.format_exc(limit=3)}", "ERROR")
+        if progress_callback:
+            _log_util_save(f"  [ZU SaveFITS TRACEBACK] {traceback.format_exc(limit=3)}", "ERROR")
     finally:
         if hdul is not None and hasattr(hdul, 'close'):
-            try: hdul.close()
-            except Exception: pass
-        
+            try:
+                hdul.close()
+            except Exception:
+                pass
+
         # Nettoyage explicite pour aider le GC
         if 'data_to_write_temp' in locals() and data_to_write_temp is not None:
             del data_to_write_temp
-        if 'data_for_hdu_cxhxw' in locals() and data_for_hdu_cxhxw is not None:
-            del data_for_hdu_cxhxw
         if primary_hdu_object is not None and hasattr(primary_hdu_object, 'data') and primary_hdu_object.data is not None:
-             del primary_hdu_object.data 
+            del primary_hdu_object.data
         if primary_hdu_object is not None:
-             del primary_hdu_object
+            del primary_hdu_object
+        if 'hdus_to_write' in locals():
+            del hdus_to_write
         if 'hdul' in locals() and hdul is not None:
             del hdul
         gc.collect() # gc doit être importé en haut du fichier zemosaic_utils.py
