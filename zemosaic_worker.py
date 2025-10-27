@@ -19,7 +19,7 @@ import multiprocessing
 import threading
 import itertools
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, Any
 from types import SimpleNamespace
 
 import numpy as np
@@ -2705,6 +2705,7 @@ def create_master_tile(
     stack_kappa_high: float,
     parsed_winsor_limits: tuple[float, float],
     stack_final_combine: str,
+    poststack_equalize_rgb: bool,
     # --- NOUVEAUX PARAMÈTRES POUR LA PONDÉRATION RADIALE ---
     apply_radial_weight: bool,             # Vient de la GUI/config
     radial_feather_fraction: float,      # Vient de la GUI/config
@@ -2746,6 +2747,10 @@ def create_master_tile(
             zconfig = SimpleNamespace()
     else:
         zconfig = SimpleNamespace()
+    try:
+        setattr(zconfig, "poststack_equalize_rgb", bool(poststack_equalize_rgb))
+    except Exception:
+        pass
     # Provide a generic alias for GPU usage so Phase 3 can honor the same toggle.
     try:
         if not hasattr(zconfig, 'use_gpu') and hasattr(zconfig, 'use_gpu_phase5'):
@@ -2778,9 +2783,13 @@ def create_master_tile(
     pcb_tile(f"{func_id_log_base}_info_creation_started_from_cache", prog=None, lvl="INFO",
              num_raw=len(seestar_stack_group_info), tile_id=tile_id)
     failed_groups_to_retry: list[list[dict]] = []
-    pcb_tile(f"    {func_id_log_base}_{tile_id}: Options Stacking - Norm='{stack_norm_method}', "
-             f"Weight='{stack_weight_method}' (RadialWeight={apply_radial_weight}), "
-             f"Reject='{stack_reject_algo}', Combine='{stack_final_combine}'", prog=None, lvl="DEBUG")
+    pcb_tile(
+        f"    {func_id_log_base}_{tile_id}: Options Stacking - Norm='{stack_norm_method}', "
+        f"Weight='{stack_weight_method}' (RadialWeight={apply_radial_weight}), "
+        f"Reject='{stack_reject_algo}', Combine='{stack_final_combine}', RGBEqualize={poststack_equalize_rgb}",
+        prog=None,
+        lvl="DEBUG",
+    )
 
     if not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils and ZEMOSAIC_ALIGN_STACK_AVAILABLE and zemosaic_align_stack and ASTROPY_AVAILABLE and fits): # Ajout de 'fits' pour header_mt_save
         # ... (votre gestion d'erreur de dépendances existante) ...
@@ -2927,9 +2936,11 @@ def create_master_tile(
             pass
         return (None, None), failed_groups_to_retry
     
-    pcb_tile(f"{func_id_log_base}_info_stacking_started", prog=None, lvl="DEBUG_DETAIL", 
+    pcb_tile(f"{func_id_log_base}_info_stacking_started", prog=None, lvl="DEBUG_DETAIL",
              num_to_stack=len(valid_aligned_images), tile_id=tile_id) # Les options sont loggées au début
-    
+
+    stack_metadata: dict[str, Any] = {}
+
     if stack_reject_algo == "winsorized_sigma_clip":
         master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_winsorized_sigma_clip(
             valid_aligned_images,
@@ -2938,6 +2949,7 @@ def create_master_tile(
             kappa=stack_kappa_low,
             winsor_limits=parsed_winsor_limits,
             apply_rewinsor=True,
+            stack_metadata=stack_metadata,
         )
     elif stack_reject_algo == "kappa_sigma":
         master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_kappa_sigma_clip(
@@ -2946,6 +2958,7 @@ def create_master_tile(
             zconfig=zconfig,
             sigma_low=stack_kappa_low,
             sigma_high=stack_kappa_high,
+            stack_metadata=stack_metadata,
         )
     elif stack_reject_algo == "linear_fit_clip":
         master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_linear_fit_clip(
@@ -2953,6 +2966,7 @@ def create_master_tile(
             weight_method=stack_weight_method,
             zconfig=zconfig,
             sigma=stack_kappa_high,
+            stack_metadata=stack_metadata,
         )
     else:
         master_tile_stacked_HWC = zemosaic_align_stack.stack_aligned_images(
@@ -2971,6 +2985,7 @@ def create_master_tile(
             winsor_max_workers=winsor_pool_workers,
             progress_callback=progress_callback,
             zconfig=zconfig,
+            stack_metadata=stack_metadata,
         )
     
     del valid_aligned_images; gc.collect() # valid_aligned_images a été passé par valeur (copie de la liste)
@@ -2991,6 +3006,37 @@ def create_master_tile(
              # min_val=np.nanmin(master_tile_stacked_HWC), # Peut être verbeux
              # max_val=np.nanmax(master_tile_stacked_HWC),
              # mean_val=np.nanmean(master_tile_stacked_HWC))
+
+    rgb_eq_info = stack_metadata.get("rgb_equalization", {})
+    try:
+        gain_r = float(rgb_eq_info.get("gain_r", 1.0))
+    except (TypeError, ValueError):
+        gain_r = 1.0
+    try:
+        gain_g = float(rgb_eq_info.get("gain_g", 1.0))
+    except (TypeError, ValueError):
+        gain_g = 1.0
+    try:
+        gain_b = float(rgb_eq_info.get("gain_b", 1.0))
+    except (TypeError, ValueError):
+        gain_b = 1.0
+    try:
+        target_median_val = float(rgb_eq_info.get("target_median", float("nan")))
+    except (TypeError, ValueError):
+        target_median_val = float("nan")
+    eq_enabled = bool(rgb_eq_info.get("enabled", False))
+    eq_applied = bool(rgb_eq_info.get("applied", False))
+    target_str = f"{target_median_val:.6g}" if np.isfinite(target_median_val) else "nan"
+    history_msg = (
+        f"RGB equalized per sub-stack (enabled={str(eq_enabled)}, applied={str(eq_applied)}): "
+        f"gains=({gain_r:.6f},{gain_g:.6f},{gain_b:.6f}), target={target_str}"
+    )
+    pcb_tile(
+        f"[RGB-EQ] poststack_equalize_rgb enabled={eq_enabled}, applied={eq_applied}, "
+        f"gains=({gain_r:.6f},{gain_g:.6f},{gain_b:.6f}), target={target_str}",
+        prog=None,
+        lvl="INFO" if eq_enabled else "DEBUG_DETAIL",
+    )
 
     norm_result = None
     norm_mode = "disabled"
@@ -3074,6 +3120,15 @@ def create_master_tile(
             header_mt_save['ZMT_RADP'] = (radial_shape_power, 'Radial shape power')
         else:
             header_mt_save['ZMT_RADW'] = (False, 'Radial weighting applied')
+
+        header_mt_save['RGBGAINR'] = (gain_r, 'RGB equalization gain (red)')
+        header_mt_save['RGBGAING'] = (gain_g, 'RGB equalization gain (green)')
+        header_mt_save['RGBGAINB'] = (gain_b, 'RGB equalization gain (blue)')
+        header_mt_save['RGBEQMED'] = (target_median_val, 'RGB equalization target median')
+        try:
+            header_mt_save.add_history(history_msg)
+        except Exception:
+            header_mt_save['HISTORY'] = history_msg
 
         header_mt_save['ZMT_REJ'] = (str(stack_reject_algo), 'Rejection algorithm')
         if stack_reject_algo == "kappa_sigma":
@@ -4027,6 +4082,7 @@ def run_hierarchical_mosaic(
     stack_kappa_high: float,
     parsed_winsor_limits: tuple[float, float],
     stack_final_combine: str,
+    poststack_equalize_rgb_config: bool,
     apply_radial_weight_config: bool,
     radial_feather_fraction_config: float,
     radial_shape_power_config: float,
@@ -4255,7 +4311,15 @@ def run_hierarchical_mosaic(
     )
     pcb(f"  Config ASTAP: Exe='{os.path.basename(astap_exe_path) if astap_exe_path else 'N/A'}', Data='{os.path.basename(astap_data_dir_param) if astap_data_dir_param else 'N/A'}', Radius={astap_search_radius_config}deg, Downsample={astap_downsample_config}, Sens={astap_sensitivity_config}", prog=None, lvl="DEBUG_DETAIL")
     pcb(f"  Config Workers (GUI): Base demandé='{num_base_workers_config}' (0=auto)", prog=None, lvl="DEBUG_DETAIL")
-    pcb(f"  Options Stacking (Master Tuiles): Norm='{stack_norm_method}', Weight='{stack_weight_method}', Reject='{stack_reject_algo}', Combine='{stack_final_combine}', RadialWeight={apply_radial_weight_config} (Feather={radial_feather_fraction_config if apply_radial_weight_config else 'N/A'}, Power={radial_shape_power_config if apply_radial_weight_config else 'N/A'}, Floor={min_radial_weight_floor_config if apply_radial_weight_config else 'N/A'})", prog=None, lvl="DEBUG_DETAIL")
+    pcb(
+        f"  Options Stacking (Master Tuiles): Norm='{stack_norm_method}', Weight='{stack_weight_method}', Reject='{stack_reject_algo}', "
+        f"Combine='{stack_final_combine}', RGBEqualize={poststack_equalize_rgb_config}, RadialWeight={apply_radial_weight_config} "
+        f"(Feather={radial_feather_fraction_config if apply_radial_weight_config else 'N/A'}, "
+        f"Power={radial_shape_power_config if apply_radial_weight_config else 'N/A'}, "
+        f"Floor={min_radial_weight_floor_config if apply_radial_weight_config else 'N/A'})",
+        prog=None,
+        lvl="DEBUG_DETAIL",
+    )
     pcb(f"  Options Assemblage Final: Méthode='{final_assembly_method_config}'", prog=None, lvl="DEBUG_DETAIL")
 
     time_per_raw_file_wcs = None; time_per_master_tile_creation = None
@@ -5619,6 +5683,7 @@ def run_hierarchical_mosaic(
             stack_norm_method, stack_weight_method, stack_reject_algo,
             stack_kappa_low, stack_kappa_high, parsed_winsor_limits,
             stack_final_combine,
+            poststack_equalize_rgb_config,
             apply_radial_weight_config, radial_feather_fraction_config,
             radial_shape_power_config, min_radial_weight_floor_config,
             astap_exe_path, astap_data_dir_param, astap_search_radius_config,

@@ -313,6 +313,7 @@
     "stackimages_warn_min_not_finite_offset_skipped": "StackImages WARN: Minimum value of stacked image is not finite. Skipping final offset.",
     "stackimages_info_min_above_target_offset_skipped": "StackImages INFO: Minimum value {current_min:.1f} already above target ADU {target_adu:.1f}. Skipping final offset.",
     
+    "stacking_post_equalize_rgb_label": "Equalize RGB (per sub-stack):",
     "stacking_apply_radial_label": "Apply Radial Weighting:",
     "stacking_radial_feather_label": "Radial Feather Fraction (0.1-1.0):",
     "final_assembly_options_frame_title": "Final Assembly Options",

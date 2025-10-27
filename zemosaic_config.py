@@ -20,6 +20,7 @@ DEFAULT_CONFIG = {
     "stacking_kappa_high": 3.0,
     "stacking_winsor_limits": "0.05,0.05", # String, sera parsé
     "stacking_final_combine_method": "mean",
+    "poststack_equalize_rgb": True,
     "apply_radial_weight": False,
     "radial_feather_fraction": 0.8,
     "radial_shape_power": 2.0,

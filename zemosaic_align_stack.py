@@ -140,6 +140,120 @@ _STACK_LOG_LEVEL_MAP = {
 _STACK_USER_FACING_LEVELS = {"INFO", "WARN", "WARNING", "ERROR", "SUCCESS"}
 
 
+def equalize_rgb_medians_inplace(img: np.ndarray) -> tuple[float, float, float, float]:
+    """In-place per-channel median equalization so that median(R)==median(G)==median(B)."""
+
+    if img is None or img.ndim != 3 or img.shape[2] != 3:
+        return (1.0, 1.0, 1.0, float("nan"))
+
+    med = np.nanmedian(img, axis=(0, 1)).astype(np.float32)
+    finite = np.isfinite(med) & (med > 0)
+    if not np.any(finite):
+        return (1.0, 1.0, 1.0, float("nan"))
+
+    target = float(np.nanmedian(med[finite]))
+    gains = np.ones(3, dtype=np.float32)
+    gains[finite] = target / med[finite]
+    img *= gains[None, None, :]
+    return (float(gains[0]), float(gains[1]), float(gains[2]), target)
+
+
+def _coerce_config_bool(value: Any, default: bool = True) -> bool:
+    """Best-effort coercion of configuration values to booleans."""
+
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, np.integer)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+        return default
+    try:
+        return bool(value)
+    except Exception:
+        return default
+
+
+def _poststack_rgb_equalization(
+    stacked: np.ndarray | None,
+    zconfig=None,
+    stack_metadata: dict | None = None,
+) -> dict:
+    """Apply optional RGB equalization and record metadata."""
+
+    default_enabled = True
+    try:
+        if isinstance(zconfig, dict):
+            enabled = _coerce_config_bool(zconfig.get("poststack_equalize_rgb", default_enabled), default_enabled)
+        else:
+            enabled = _coerce_config_bool(getattr(zconfig, "poststack_equalize_rgb", default_enabled), default_enabled)
+    except Exception:
+        enabled = default_enabled
+
+    info = {
+        "enabled": enabled,
+        "applied": False,
+        "gain_r": 1.0,
+        "gain_g": 1.0,
+        "gain_b": 1.0,
+        "target_median": float("nan"),
+    }
+
+    if not enabled or stacked is None or not isinstance(stacked, np.ndarray):
+        if stack_metadata is not None:
+            stack_metadata["rgb_equalization"] = info
+        return info
+
+    if stacked.ndim != 3 or stacked.shape[2] != 3:
+        if stack_metadata is not None:
+            stack_metadata["rgb_equalization"] = info
+        return info
+
+    try:
+        gain_r, gain_g, gain_b, target = equalize_rgb_medians_inplace(stacked)
+        info.update(
+            gain_r=float(gain_r),
+            gain_g=float(gain_g),
+            gain_b=float(gain_b),
+            target_median=float(target),
+        )
+        if np.isfinite(target):
+            info["applied"] = True
+            _internal_logger.info(
+                "[RGB-EQ] Applied per-substack RGB median equalization: "
+                f"gains (R,G,B)=({gain_r:.6f},{gain_g:.6f},{gain_b:.6f}), target_median={target:.6g}"
+            )
+        else:
+            _internal_logger.info(
+                "[RGB-EQ] Skipped RGB equalization due to non-finite channel medians."
+            )
+    except Exception as exc:
+        _internal_logger.warning(f"[RGB-EQ] Skipped RGB equalization due to error: {exc}")
+    finally:
+        if stack_metadata is not None:
+            stack_metadata["rgb_equalization"] = info
+
+    return info
+
+
+def _normalize_stack_output(result: Any) -> tuple[np.ndarray, float]:
+    """Normalize heterogeneous stack outputs into (array, rejected_pct)."""
+
+    if isinstance(result, (list, tuple)) and len(result) >= 1:
+        stacked = np.asarray(result[0], dtype=np.float32).astype(np.float32, copy=False)
+        rejected = float(result[1]) if len(result) > 1 else 0.0
+    else:
+        stacked = np.asarray(result, dtype=np.float32).astype(np.float32, copy=False)
+        rejected = 0.0
+    return stacked, rejected
+
+
 def _log_stack_message(
     message_key_or_raw: Any,
     level: str | None = "INFO",
@@ -525,7 +639,14 @@ def gpu_stack_linear(frames, *, sigma=3.0):
         _free_gpu_pools()
 
 
-def stack_winsorized_sigma_clip(frames, weights=None, weight_method: str = "none", zconfig=None, **kwargs):
+def stack_winsorized_sigma_clip(
+    frames,
+    weights=None,
+    weight_method: str = "none",
+    zconfig=None,
+    stack_metadata: dict | None = None,
+    **kwargs,
+):
     """
     Wrapper calling GPU or CPU winsorized sigma clip, with robust GPU guards.
 
@@ -660,6 +781,8 @@ def stack_winsorized_sigma_clip(frames, weights=None, weight_method: str = "none
             del chunk_arr, chunk
 
         stacked_stream, rejected_pct = state.finalize(weights_array_full is not None)
+        stacked_stream = stacked_stream.astype(_np.float32, copy=False)
+        _poststack_rgb_equalization(stacked_stream, zconfig, stack_metadata)
         return stacked_stream, rejected_pct
 
     if max_frames_per_pass and len(frames_list) > max_frames_per_pass:
@@ -699,7 +822,7 @@ def stack_winsorized_sigma_clip(frames, weights=None, weight_method: str = "none
             else:
                 _gpu_img = gpu_out
                 _gpu_rej = 0.0
-            gpu_out = _np.asarray(_gpu_img)
+            gpu_out = _np.asarray(_gpu_img, dtype=_np.float32)
             # Sortie attendue: même champs spatiaux que frames_np sans l’axe N
             exp_shape = sample.shape  # (H,W) ou (H,W,C)
             if gpu_out.shape != exp_shape:
@@ -711,7 +834,8 @@ def stack_winsorized_sigma_clip(frames, weights=None, weight_method: str = "none
             if finite_ratio < 0.9:
                 raise RuntimeError(f"GPU output has too many NaN/Inf (finite_ratio={finite_ratio:.2%})")
 
-            return gpu_out.astype(_np.float32, copy=False), float(_gpu_rej)
+            _poststack_rgb_equalization(gpu_out, zconfig, stack_metadata)
+            return gpu_out, float(_gpu_rej)
 
         except Exception as e:
             _internal_logger.warning(
@@ -747,10 +871,18 @@ def stack_winsorized_sigma_clip(frames, weights=None, weight_method: str = "none
             progress_callback,
         )
 
-    return result
+    stacked_cpu, rejected = _normalize_stack_output(result)
+    _poststack_rgb_equalization(stacked_cpu, zconfig, stack_metadata)
+    return stacked_cpu, rejected
 
 
-def stack_kappa_sigma_clip(frames, weight_method: str = "none", zconfig=None, **kwargs):
+def stack_kappa_sigma_clip(
+    frames,
+    weight_method: str = "none",
+    zconfig=None,
+    stack_metadata: dict | None = None,
+    **kwargs,
+):
     """Wrapper calling GPU or CPU kappa-sigma clip.
 
     Honors a generic ``use_gpu`` flag on ``zconfig`` if present, otherwise
@@ -792,7 +924,10 @@ def stack_kappa_sigma_clip(frames, weight_method: str = "none", zconfig=None, **
                     "INFO",
                     progress_callback,
                 )
-            return gpu_stack_kappa(frames_list, **kwargs)
+            gpu_result = gpu_stack_kappa(frames_list, **kwargs)
+            stacked_gpu, rejected_gpu = _normalize_stack_output(gpu_result)
+            _poststack_rgb_equalization(stacked_gpu, zconfig, stack_metadata)
+            return stacked_gpu, rejected_gpu
         except Exception:
             _internal_logger.warning("GPU kappa clip failed, fallback CPU", exc_info=True)
     if cpu_stack_kappa:
@@ -818,11 +953,22 @@ def stack_kappa_sigma_clip(frames, weight_method: str = "none", zconfig=None, **
                     "INFO",
                     progress_callback,
                 )
-            return result
-    return _cpu_stack_kappa_fallback(frames_list, **kwargs)
+        stacked_cpu, rejected_cpu = _normalize_stack_output(result)
+        _poststack_rgb_equalization(stacked_cpu, zconfig, stack_metadata)
+        return stacked_cpu, rejected_cpu
+    fallback_result = _cpu_stack_kappa_fallback(frames_list, **kwargs)
+    stacked_fb, rejected_fb = _normalize_stack_output(fallback_result)
+    _poststack_rgb_equalization(stacked_fb, zconfig, stack_metadata)
+    return stacked_fb, rejected_fb
 
 
-def stack_linear_fit_clip(frames, weight_method: str = "none", zconfig=None, **kwargs):
+def stack_linear_fit_clip(
+    frames,
+    weight_method: str = "none",
+    zconfig=None,
+    stack_metadata: dict | None = None,
+    **kwargs,
+):
     """Wrapper calling GPU or CPU linear fit clip.
 
     Honors a generic ``use_gpu`` flag on ``zconfig`` if present, otherwise
@@ -864,7 +1010,10 @@ def stack_linear_fit_clip(frames, weight_method: str = "none", zconfig=None, **k
                     "INFO",
                     progress_callback,
                 )
-            return gpu_stack_linear(frames_list, **kwargs)
+            gpu_result = gpu_stack_linear(frames_list, **kwargs)
+            stacked_gpu, rejected_gpu = _normalize_stack_output(gpu_result)
+            _poststack_rgb_equalization(stacked_gpu, zconfig, stack_metadata)
+            return stacked_gpu, rejected_gpu
         except Exception:
             _internal_logger.warning("GPU linear clip failed, fallback CPU", exc_info=True)
     if cpu_stack_linear:
@@ -890,8 +1039,13 @@ def stack_linear_fit_clip(frames, weight_method: str = "none", zconfig=None, **k
                     "INFO",
                     progress_callback,
                 )
-            return result
-    return _cpu_stack_linear_fallback(frames_list, **kwargs)
+        stacked_cpu, rejected_cpu = _normalize_stack_output(result)
+        _poststack_rgb_equalization(stacked_cpu, zconfig, stack_metadata)
+        return stacked_cpu, rejected_cpu
+    fallback_result = _cpu_stack_linear_fallback(frames_list, **kwargs)
+    stacked_fb, rejected_fb = _normalize_stack_output(fallback_result)
+    _poststack_rgb_equalization(stacked_fb, zconfig, stack_metadata)
+    return stacked_fb, rejected_fb
 
 
 def _calculate_robust_stats_for_linear_fit(image_data_2d_float32: np.ndarray,
@@ -2323,7 +2477,8 @@ def stack_aligned_images(
     radial_shape_power: float = 2.0,
     winsor_max_workers: int = 1,
     progress_callback: callable = None,
-    zconfig=None
+    zconfig=None,
+    stack_metadata: dict | None = None,
 ) -> np.ndarray | None:
     """
     Stacke une liste d'images alignées, appliquant normalisation, pondération (qualité + radiale),
@@ -2661,7 +2816,11 @@ def stack_aligned_images(
             result_image_adu += offset_to_apply
     
     _pcb(f"STACK_IMG_EXIT: Fin stack_aligned_images. Range final: [{np.nanmin(result_image_adu):.2g}-{np.nanmax(result_image_adu):.2g}]", lvl="ERROR")
-    return result_image_adu.astype(np.float32) if result_image_adu is not None else None
+    if result_image_adu is None:
+        return None
+    result_image_adu = result_image_adu.astype(np.float32, copy=False)
+    _poststack_rgb_equalization(result_image_adu, zconfig, stack_metadata)
+    return result_image_adu
 
 
 
