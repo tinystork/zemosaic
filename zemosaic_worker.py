@@ -4233,6 +4233,7 @@ def run_hierarchical_mosaic(
     quality_crop_k_sigma_config: float,
     quality_crop_margin_px_config: int,
     save_final_as_uint16_config: bool,
+    legacy_rgb_cube_config: bool,
 
     coadd_use_memmap_config: bool,
     coadd_memmap_dir_config: str,
@@ -6278,6 +6279,7 @@ def run_hierarchical_mosaic(
             header=final_header,
             overwrite=True,
             save_as_float=not save_final_as_uint16_config,
+            legacy_rgb_cube=bool(legacy_rgb_cube_config),
             progress_callback=progress_callback,
             axis_order="HWC",
         )
