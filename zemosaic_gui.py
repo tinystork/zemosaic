@@ -224,6 +224,11 @@ class ZeMosaicGUI:
         self.cluster_target_groups_var = tk.IntVar(master=self.root, value=self.config.get("cluster_target_groups", 0))
         self.cluster_orientation_split_var = tk.DoubleVar(master=self.root, value=self.config.get("cluster_orientation_split_deg", 0.0))
         self.save_final_uint16_var = tk.BooleanVar(master=self.root, value=self.config.get("save_final_as_uint16", False))
+        self.legacy_rgb_cube_var = tk.BooleanVar(master=self.root, value=self.config.get("legacy_rgb_cube", False))
+        try:
+            self.save_final_uint16_var.trace_add("write", self._update_legacy_toggle_state)
+        except Exception:
+            pass
 
         # --- Solver Settings ---
         try:
@@ -577,6 +582,31 @@ class ZeMosaicGUI:
 
         ttk.Label(folders_frame, text="").grid(row=2, column=0, padx=5, pady=5, sticky="w"); self.translatable_widgets["save_final_16bit_label"] = folders_frame.grid_slaves(row=2,column=0)[0]
         ttk.Checkbutton(folders_frame, variable=self.save_final_uint16_var).grid(row=2, column=1, padx=5, pady=5, sticky="w")
+
+        self.output_advanced_button = ttk.Button(
+            folders_frame,
+            text="",
+            command=self._toggle_output_advanced_options,
+        )
+        self.output_advanced_button.grid(row=3, column=0, columnspan=3, padx=5, pady=(0, 2), sticky="w")
+
+        self.output_advanced_frame = ttk.Frame(folders_frame)
+        self.output_advanced_frame.grid(row=4, column=0, columnspan=3, padx=5, pady=(0, 5), sticky="ew")
+        self.output_advanced_frame.columnconfigure(1, weight=1)
+
+        legacy_label = ttk.Label(self.output_advanced_frame, text="")
+        legacy_label.grid(row=0, column=0, padx=5, pady=3, sticky="w")
+        self.translatable_widgets["legacy_rgb_cube_label"] = legacy_label
+        self.legacy_rgb_cube_check = ttk.Checkbutton(
+            self.output_advanced_frame,
+            variable=self.legacy_rgb_cube_var,
+        )
+        self.legacy_rgb_cube_check.grid(row=0, column=1, padx=5, pady=3, sticky="w")
+
+        self._output_advanced_expanded = False
+        self.output_advanced_frame.grid_remove()
+        self._update_output_advanced_button_text()
+        self._update_legacy_toggle_state()
 
 
         # --- ASTAP Configuration Frame ---
@@ -1343,6 +1373,8 @@ class ZeMosaicGUI:
                     self.elapsed_time_var.set(self._tr("initial_elapsed_time", "00:00:00"))
                 except tk.TclError: pass
 
+        self._update_output_advanced_button_text()
+
         # S'assurer que l'état des paramètres de rejet est mis à jour (déjà correct)
         if hasattr(self, '_update_rejection_params_state'):
             try:
@@ -1397,6 +1429,84 @@ class ZeMosaicGUI:
                 widget.config(state=state)
             except tk.TclError:
                 pass
+
+    def _toggle_output_advanced_options(self, *args):
+        if not hasattr(self, 'output_advanced_frame'):
+            return
+        try:
+            if not bool(self.save_final_uint16_var.get()):
+                return
+        except tk.TclError:
+            return
+
+        self._output_advanced_expanded = not getattr(self, "_output_advanced_expanded", False)
+        try:
+            if self._output_advanced_expanded:
+                self.output_advanced_frame.grid()
+            else:
+                self.output_advanced_frame.grid_remove()
+        except tk.TclError:
+            pass
+        self._update_output_advanced_button_text()
+
+    def _update_output_advanced_button_text(self):
+        if not hasattr(self, 'output_advanced_button'):
+            return
+        expanded = bool(getattr(self, "_output_advanced_expanded", False))
+        enabled = False
+        try:
+            enabled = bool(self.save_final_uint16_var.get())
+        except tk.TclError:
+            enabled = False
+        key = "output_advanced_hide" if expanded and enabled else "output_advanced_show"
+        default_text = "Advanced ▾" if expanded and enabled else "Advanced ▸"
+        try:
+            text = self._tr(key, default_text)
+        except Exception:
+            text = default_text
+        try:
+            self.output_advanced_button.config(text=text)
+        except tk.TclError:
+            pass
+
+    def _update_legacy_toggle_state(self, *args):
+        if not hasattr(self, 'legacy_rgb_cube_check'):
+            return
+        try:
+            enabled = bool(self.save_final_uint16_var.get())
+        except tk.TclError:
+            enabled = False
+
+        state = tk.NORMAL if enabled else tk.DISABLED
+        try:
+            self.legacy_rgb_cube_check.config(state=state)
+        except tk.TclError:
+            pass
+
+        try:
+            self.output_advanced_button.config(state=tk.NORMAL if enabled else tk.DISABLED)
+        except tk.TclError:
+            pass
+
+        if not enabled:
+            if getattr(self, "_output_advanced_expanded", False):
+                try:
+                    self.output_advanced_frame.grid_remove()
+                except tk.TclError:
+                    pass
+            self._output_advanced_expanded = False
+            try:
+                self.legacy_rgb_cube_var.set(False)
+            except tk.TclError:
+                pass
+        else:
+            if getattr(self, "_output_advanced_expanded", False):
+                try:
+                    self.output_advanced_frame.grid()
+                except tk.TclError:
+                    pass
+
+        self._update_output_advanced_button_text()
 
         self._update_crop_options_state()
 
@@ -2265,6 +2375,8 @@ class ZeMosaicGUI:
                 self.config["gpu_id_phase5"] = idx
                 gpu_id = idx
                 break
+        self.config["save_final_as_uint16"] = bool(self.save_final_uint16_var.get())
+        self.config["legacy_rgb_cube"] = bool(self.legacy_rgb_cube_var.get())
         if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
             try:
                 zemosaic_config.save_config(self.config)
@@ -2321,6 +2433,7 @@ class ZeMosaicGUI:
             float(quality_crop_k_sigma_val),
             int(quality_crop_margin_val),
             self.save_final_uint16_var.get(),
+            self.legacy_rgb_cube_var.get(),
             self.use_memmap_var.get(),
             memmap_dir,
             self.cleanup_memmap_var.get(),

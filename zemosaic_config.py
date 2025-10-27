@@ -32,6 +32,7 @@ DEFAULT_CONFIG = {
     "astrometry_local_path": "",
     "astrometry_api_key": "",
     "save_final_as_uint16": False,
+    "legacy_rgb_cube": False,
     "coadd_use_memmap": True,
     "coadd_memmap_dir": "",
     "coadd_cleanup_memmap": True,
