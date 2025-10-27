@@ -25,6 +25,10 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from zemosaic_policy import (
+    compute_auto_max_raw_per_master_tile,
+    compute_auto_tile_caps as _compute_auto_tile_caps,
+)
 
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, FIRST_COMPLETED, as_completed
 # BrokenProcessPool moved under concurrent.futures.process in modern Python
@@ -733,63 +737,42 @@ def _probe_system_resources(cache_dir: str | None = None) -> dict:
     return info
 
 
-def _compute_auto_tile_caps(
-    resource_info: dict,
-    per_frame_info: dict,
-    policy_max: int = 50,
-    policy_min: int = 8,
-    disk_threshold_mb: float = 8192.0,
-    user_max_override: int | None = None,
-) -> dict:
-    """Combine resource probes and per-frame costs into adaptive caps."""
+def _enforce_master_tile_cap(
+    groups: list[list[dict]],
+    cap: int,
+    progress_callback: Callable | None = None,
+    *,
+    log_prefix: str = "[AutoCap]",
+) -> tuple[list[list[dict]], bool]:
+    """Split groups that exceed ``cap`` while preserving ordering.
 
-    per_frame_mb = float(per_frame_info.get("per_frame_mb", 0.0) or 0.0)
-    usable_ram_mb = float(resource_info.get("usable_ram_mb") or 0.0)
-    ram_available_mb = float(resource_info.get("ram_available_mb") or 0.0)
+    Returns the possibly modified groups along with a flag indicating whether
+    any split was performed.
+    """
 
-    if user_max_override and user_max_override > 0:
-        policy_max = min(policy_max, int(user_max_override))
+    if cap <= 0 or not groups:
+        return groups, False
 
-    frames_by_ram = 0
-    if per_frame_mb > 0 and usable_ram_mb > 0:
-        frames_by_ram = max(0, int(math.floor(usable_ram_mb / per_frame_mb)))
-
-    cap_candidate = policy_max if policy_max > 0 else frames_by_ram or policy_min
-    if frames_by_ram > 0:
-        cap_candidate = min(cap_candidate, frames_by_ram)
-    cap_candidate = max(policy_min, cap_candidate)
-
-    disk_free_mb = float(resource_info.get("disk_free_mb") or 0.0)
-    usable_disk_mb = float(resource_info.get("usable_disk_mb") or 0.0)
-
-    memmap_enabled = False
-    memmap_budget_mb = None
-    if frames_by_ram < policy_min and disk_free_mb > disk_threshold_mb:
-        memmap_enabled = True
-        memmap_budget_mb = max(policy_min * per_frame_mb, usable_disk_mb * 0.2 if usable_disk_mb else disk_free_mb * 0.2)
-
-    gpu_hint = None
-    usable_vram_mb = float(resource_info.get("usable_vram_mb") or 0.0)
-    if per_frame_mb > 0 and usable_vram_mb > 0:
-        gpu_hint = max(1, min(cap_candidate, int(math.floor(usable_vram_mb / per_frame_mb))))
-
-    parallel_cap = 1
-    if frames_by_ram and cap_candidate > 0:
-        parallel_cap = max(1, frames_by_ram // max(1, cap_candidate))
-    if memmap_enabled:
-        parallel_cap = 1
-
-    return {
-        "per_frame_mb": per_frame_mb,
-        "frames_by_ram": frames_by_ram,
-        "cap": int(cap_candidate),
-        "min_cap": int(policy_min),
-        "memmap": bool(memmap_enabled),
-        "memmap_budget_mb": memmap_budget_mb,
-        "gpu_batch_hint": gpu_hint,
-        "ram_available_mb": ram_available_mb,
-        "parallel_groups": int(parallel_cap),
-    }
+    new_groups: list[list[dict]] = []
+    any_split = False
+    for idx, group in enumerate(groups, start=1):
+        if len(group) > cap:
+            segments = _split_group_temporally(group, cap)
+            new_groups.extend(segments)
+            any_split = True
+            try:
+                _log_and_callback(
+                    f"{log_prefix} Split group #{idx} size={len(group)} into "
+                    f"{math.ceil(len(group) / cap)} segments (cap={cap})",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                    callback=progress_callback,
+                )
+            except Exception:
+                pass
+        else:
+            new_groups.append(group)
+    return new_groups, any_split
 
 
 def _extract_timestamp(info: dict, fallback: float) -> float:
@@ -5394,59 +5377,166 @@ def run_hierarchical_mosaic(
     if not seestar_stack_groups:
         pcb("run_error_phase2_no_groups", prog=(base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING), lvl="ERROR")
         return
-    if (not preplan_groups_active) and auto_caps_info and seestar_stack_groups:
-        try:
-            cap_value = int(auto_caps_info.get("cap", 0))
-            min_value = int(auto_caps_info.get("min_cap", 8))
-        except Exception:
-            cap_value = 0
-            min_value = 8
-        if cap_value > 0:
-            original_count = len(seestar_stack_groups)
-            seestar_stack_groups = _auto_split_groups(
-                seestar_stack_groups,
-                cap_value,
-                min_value,
-                progress_callback=progress_callback,
-            )
-            if len(seestar_stack_groups) != original_count:
-                try:
-                    _log_and_callback(
-                        f"AutoSplit summary: {original_count} -> {len(seestar_stack_groups)} subgroup(s) (cap={cap_value})",
-                        prog=None,
-                        lvl="INFO_DETAIL",
-                        callback=progress_callback,
-                    )
-                except Exception:
-                    pass
-            if min_value > 0:
-                seestar_stack_groups = _merge_small_groups(
-                    seestar_stack_groups,
-                    min_size=min_value,
-                    cap=cap_value,
-                )
 
-    # Do not subdivide groups if a target group count is set; respect clustering first.
+    total_raws = sum(len(g) for g in seestar_stack_groups)
+    try:
+        user_max_for_auto_cap = int(max_raw_per_master_tile_config or 0)
+    except Exception:
+        user_max_for_auto_cap = 0
+
+    auto_cap_info: dict[str, int | str | None] = {
+        "total_raws": int(total_raws),
+        "cap_ram": None,
+        "cap_rule": None,
+        "cap_final": None,
+        "mode": "manual" if user_max_for_auto_cap and user_max_for_auto_cap > 0 else "auto",
+    }
+
+    compute_cap_fn = compute_auto_max_raw_per_master_tile
+    supports_details = False
+    try:
+        sig = inspect.signature(compute_cap_fn)
+        supports_details = "return_details" in sig.parameters
+    except Exception:
+        supports_details = False
+
+    auto_cap_result = None
+    try:
+        if supports_details:
+            auto_cap_result = compute_cap_fn(
+                total_raws=total_raws,
+                resource_info=resource_probe_info or {},
+                per_frame_info=per_frame_info or {},
+                user_value=user_max_for_auto_cap,
+                min_tiles_floor=14,
+                return_details=True,
+            )
+        else:
+            auto_cap_result = compute_cap_fn(
+                total_raws=total_raws,
+                resource_info=resource_probe_info or {},
+                per_frame_info=per_frame_info or {},
+                user_value=user_max_for_auto_cap,
+                min_tiles_floor=14,
+            )
+    except TypeError as exc_type:
+        # Older helper versions may not accept ``return_details`` – retry without it.
+        if supports_details:
+            try:
+                auto_cap_result = compute_cap_fn(
+                    total_raws=total_raws,
+                    resource_info=resource_probe_info or {},
+                    per_frame_info=per_frame_info or {},
+                    user_value=user_max_for_auto_cap,
+                    min_tiles_floor=14,
+                )
+                supports_details = False
+            except Exception as exc_retry:
+                _log_and_callback(
+                    f"[AutoCap] Fallback failed after TypeError: {exc_retry}",
+                    prog=None,
+                    lvl="WARN",
+                    callback=progress_callback,
+                )
+                auto_cap_result = None
+        else:
+            _log_and_callback(
+                f"[AutoCap] Auto-cap computation failed: {exc_type}",
+                prog=None,
+                lvl="WARN",
+                callback=progress_callback,
+            )
+            auto_cap_result = None
+    except Exception as exc_cap:
+        _log_and_callback(
+            f"[AutoCap] Auto-cap computation failed: {exc_cap}",
+            prog=None,
+            lvl="WARN",
+            callback=progress_callback,
+        )
+        auto_cap_result = None
+
+    if isinstance(auto_cap_result, tuple) and len(auto_cap_result) == 2:
+        auto_cap_value, details = auto_cap_result
+        if isinstance(details, dict):
+            auto_cap_info.update({
+                "total_raws": details.get("total_raws", auto_cap_info["total_raws"]),
+                "cap_ram": details.get("cap_ram", auto_cap_info["cap_ram"]),
+                "cap_rule": details.get("cap_rule", auto_cap_info["cap_rule"]),
+                "cap_final": details.get("cap_final", auto_cap_info["cap_final"]),
+                "mode": details.get("mode", auto_cap_info["mode"]),
+            })
+    elif auto_cap_result is not None:
+        auto_cap_value = auto_cap_result
+    else:
+        auto_cap_value = user_max_for_auto_cap if user_max_for_auto_cap and user_max_for_auto_cap > 0 else 0
+
+    try:
+        auto_cap_value_int = int(auto_cap_value)
+    except Exception:
+        auto_cap_value_int = 0
+
+    if auto_cap_info.get("cap_final") is None:
+        auto_cap_info["cap_final"] = auto_cap_value_int
+    auto_cap_info["total_raws"] = int(auto_cap_info.get("total_raws", total_raws) or total_raws)
+    try:
+        auto_cap_info.setdefault("min_cap", int(auto_caps_info.get("min_cap", 0)))
+    except Exception:
+        pass
+
+    cap_log_message = (
+        f"[AutoCap] N={auto_cap_info.get('total_raws')} cap_ram={auto_cap_info.get('cap_ram')} "
+        f"cap_rule={auto_cap_info.get('cap_rule')} -> C={auto_cap_info.get('cap_final')}"
+    )
+    if auto_cap_info.get("mode") == "manual":
+        cap_log_message += " (manual override)"
+    try:
+        _log_and_callback(
+            cap_log_message,
+            prog=None,
+            lvl="INFO_DETAIL",
+            callback=progress_callback,
+        )
+    except Exception:
+        pass
+
+    effective_cap = int(auto_cap_value_int) if auto_cap_value_int else 0
+    target_groups_value = target_groups if "target_groups" in locals() else 0
+    manual_override_active = bool(user_max_for_auto_cap and user_max_for_auto_cap > 0)
     if (
         not preplan_groups_active
-        and (cluster_target_groups_config is None or int(cluster_target_groups_config) <= 0)
-        and max_raw_per_master_tile_config
-        and max_raw_per_master_tile_config > 0
+        and (target_groups_value <= 0)
+        and effective_cap > 0
+        and seestar_stack_groups
     ):
-        new_groups = []
-        for g in seestar_stack_groups:
-            for i in range(0, len(g), max_raw_per_master_tile_config):
-                new_groups.append(g[i:i + max_raw_per_master_tile_config])
-        if len(new_groups) != len(seestar_stack_groups):
+        original_group_count = len(seestar_stack_groups)
+        seestar_stack_groups, cap_split = _enforce_master_tile_cap(
+            seestar_stack_groups,
+            effective_cap,
+            progress_callback,
+        )
+        if manual_override_active and cap_split and len(seestar_stack_groups) != original_group_count:
             pcb(
                 "clusterstacks_info_groups_split_manual_limit",
                 prog=None,
                 lvl="INFO_DETAIL",
-                original=len(seestar_stack_groups),
-                new=len(new_groups),
-                limit=max_raw_per_master_tile_config,
+                original=original_group_count,
+                new=len(seestar_stack_groups),
+                limit=effective_cap,
             )
-        seestar_stack_groups = new_groups
+        merge_min_cap = 0
+        try:
+            merge_min_cap = int(auto_cap_info.get("min_cap", 0) or 0)
+        except Exception:
+            merge_min_cap = 0
+        if merge_min_cap > 0:
+            merge_min_cap = max(1, min(merge_min_cap, effective_cap))
+            auto_cap_info["min_cap"] = merge_min_cap
+            seestar_stack_groups = _merge_small_groups(
+                seestar_stack_groups,
+                min_size=merge_min_cap,
+                cap=effective_cap,
+            )
     cpu_total = os.cpu_count() or 1
     winsor_worker_limit = max(1, min(int(winsor_worker_limit_config), cpu_total))
     winsor_max_frames_per_pass = max(0, int(winsor_max_frames_per_pass_config))
