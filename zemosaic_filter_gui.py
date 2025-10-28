@@ -1,45 +1,45 @@
-"""
-╔══════════════════════════════════════════════════════════════════════╗
-║ ZeMosaic / ZeSeestarStacker Project                                  ║
-║                                                                      ║
-║ Auteur  : Tinystork, seigneur des couteaux à beurre (aka Tristan Nauleau)  
-║ Partenaire : J.A.R.V.I.S. (/ˈdʒɑːrvɪs/) — Just a Rather Very Intelligent System  
-║              (aka ChatGPT, Grand Maître du ciselage de code)         ║
-║                                                                      ║
-║ Licence : GNU General Public License v3.0 (GPL-3.0)                  ║
-║                                                                      ║
-║ Description :                                                        ║
-║   Ce programme a été forgé à la lueur des pixels et de la caféine,   ║
-║   dans le but noble de transformer des nuages de photons en art      ║
-║   astronomique. Si vous l’utilisez, pensez à dire “merci”,           ║
-║   à lever les yeux vers le ciel, ou à citer Tinystork et J.A.R.V.I.S.║
-║   (le karma des développeurs en dépend).                             ║
-║                                                                      ║
-║ Avertissement :                                                      ║
-║   Aucune IA ni aucun couteau à beurre n’a été blessé durant le       ║
-║   développement de ce code.                                          ║
-╚══════════════════════════════════════════════════════════════════════╝
+﻿"""
+â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
+â•‘ ZeMosaic / ZeSeestarStacker Project                                  â•‘
+â•‘                                                                      â•‘
+â•‘ Auteur  : Tinystork, seigneur des couteaux Ã  beurre (aka Tristan Nauleau)  
+â•‘ Partenaire : J.A.R.V.I.S. (/ËˆdÊ’É‘ËrvÉªs/) â€” Just a Rather Very Intelligent System  
+â•‘              (aka ChatGPT, Grand MaÃ®tre du ciselage de code)         â•‘
+â•‘                                                                      â•‘
+â•‘ Licence : GNU General Public License v3.0 (GPL-3.0)                  â•‘
+â•‘                                                                      â•‘
+â•‘ Description :                                                        â•‘
+â•‘   Ce programme a Ã©tÃ© forgÃ© Ã  la lueur des pixels et de la cafÃ©ine,   â•‘
+â•‘   dans le but noble de transformer des nuages de photons en art      â•‘
+â•‘   astronomique. Si vous lâ€™utilisez, pensez Ã  dire â€œmerciâ€,           â•‘
+â•‘   Ã  lever les yeux vers le ciel, ou Ã  citer Tinystork et J.A.R.V.I.S.â•‘
+â•‘   (le karma des dÃ©veloppeurs en dÃ©pend).                             â•‘
+â•‘                                                                      â•‘
+â•‘ Avertissement :                                                      â•‘
+â•‘   Aucune IA ni aucun couteau Ã  beurre nâ€™a Ã©tÃ© blessÃ© durant le       â•‘
+â•‘   dÃ©veloppement de ce code.                                          â•‘
+â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 
-╔══════════════════════════════════════════════════════════════════════╗
-║ ZeMosaic / ZeSeestarStacker Project                                  ║
-║                                                                      ║
-║ Author  : Tinystork, Lord of the Butter Knives (aka Tristan Nauleau) ║
-║ Partner : J.A.R.V.I.S. (/ˈdʒɑːrvɪs/) — Just a Rather Very Intelligent System  
-║           (aka ChatGPT, Grand Master of Code Chiseling)              ║
-║                                                                      ║
-║ License : GNU General Public License v3.0 (GPL-3.0)                  ║
-║                                                                      ║
-║ Description:                                                         ║
-║   This program was forged under the sacred light of pixels and       ║
-║   caffeine, with the noble intent of turning clouds of photons into  ║
-║   astronomical art. If you use it, please consider saying “thanks,”  ║
-║   gazing at the stars, or crediting Tinystork and J.A.R.V.I.S. —     ║
-║   developer karma depends on it.                                     ║
-║                                                                      ║
-║ Disclaimer:                                                          ║
-║   No AIs or butter knives were harmed in the making of this code.    ║
-╚══════════════════════════════════════════════════════════════════════╝
+â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
+â•‘ ZeMosaic / ZeSeestarStacker Project                                  â•‘
+â•‘                                                                      â•‘
+â•‘ Author  : Tinystork, Lord of the Butter Knives (aka Tristan Nauleau) â•‘
+â•‘ Partner : J.A.R.V.I.S. (/ËˆdÊ’É‘ËrvÉªs/) â€” Just a Rather Very Intelligent System  
+â•‘           (aka ChatGPT, Grand Master of Code Chiseling)              â•‘
+â•‘                                                                      â•‘
+â•‘ License : GNU General Public License v3.0 (GPL-3.0)                  â•‘
+â•‘                                                                      â•‘
+â•‘ Description:                                                         â•‘
+â•‘   This program was forged under the sacred light of pixels and       â•‘
+â•‘   caffeine, with the noble intent of turning clouds of photons into  â•‘
+â•‘   astronomical art. If you use it, please consider saying â€œthanks,â€  â•‘
+â•‘   gazing at the stars, or crediting Tinystork and J.A.R.V.I.S. â€”     â•‘
+â•‘   developer karma depends on it.                                     â•‘
+â•‘                                                                      â•‘
+â•‘ Disclaimer:                                                          â•‘
+â•‘   No AIs or butter knives were harmed in the making of this code.    â•‘
+â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 Optional GUI filter for ZeMosaic Phase 1 results.
 
@@ -551,6 +551,22 @@ def launch_filter_interface(
                                 entry["center"] = (float(ra_val), float(dec_val))
                             except Exception:
                                 pass
+                        # Try to read persisted WCS footprint corners (if present)
+                        try:
+                            fp_ra_vals: list[float] = []
+                            fp_dec_vals: list[float] = []
+                            for k in ("1", "2", "3", "4"):
+                                v_ra = row.get(f"FP_RA{k}")
+                                v_dec = row.get(f"FP_DEC{k}")
+                                if v_ra is not None and v_dec is not None and str(v_ra) != "" and str(v_dec) != "":
+                                    fp_ra_vals.append(float(v_ra))
+                                    fp_dec_vals.append(float(v_dec))
+                            if fp_ra_vals and len(fp_ra_vals) == len(fp_dec_vals) and len(fp_ra_vals) >= 3:
+                                entry["footprint_radec"] = [
+                                    (fp_ra_vals[i], fp_dec_vals[i]) for i in range(len(fp_ra_vals))
+                                ]
+                        except Exception:
+                            pass
                         header_subset = {
                             key: row.get(key)
                             for key in (
@@ -582,6 +598,11 @@ def launch_filter_interface(
                     "NAXIS2",
                     "CRVAL1",
                     "CRVAL2",
+                    # Persist up to 4 WCS footprint corners (deg)
+                    "FP_RA1", "FP_DEC1",
+                    "FP_RA2", "FP_DEC2",
+                    "FP_RA3", "FP_DEC3",
+                    "FP_RA4", "FP_DEC4",
                     "DATE-OBS",
                     "EXPTIME",
                     "FILTER",
@@ -614,6 +635,41 @@ def launch_filter_interface(
                                     center_tuple = (float(center_payload[0]), float(center_payload[1]))
                                 except Exception:
                                     center_tuple = None
+                        # Determine footprint corners, if available
+                        fp_cols = {f"FP_RA{i}": "" for i in range(1, 5)}
+                        fp_cols.update({f"FP_DEC{i}": "" for i in range(1, 5)})
+                        fp_src = None
+                        try:
+                            pre = item.get("footprint_radec") or item.get("_precomp_fp")
+                            if isinstance(pre, (list, tuple)) and len(pre) >= 3:
+                                fp_src = [(float(p[0]), float(p[1])) for p in pre]
+                        except Exception:
+                            fp_src = None
+                        if fp_src is None:
+                            # Try computing from WCS if present
+                            wcs_obj = item.get("wcs") if isinstance(item, dict) else None
+                            if wcs_obj is not None and isinstance(shape_payload, (list, tuple)) and len(shape_payload) >= 2:
+                                try:
+                                    h = int(shape_payload[0]); w = int(shape_payload[1])
+                                    corners = [
+                                        (0.0, 0.0),
+                                        (w - 1.0, 0.0),
+                                        (w - 1.0, h - 1.0),
+                                        (0.0, h - 1.0),
+                                    ]
+                                    fp_tmp: list[tuple[float, float]] = []
+                                    for (x, y) in corners:
+                                        sc = wcs_obj.pixel_to_world(x, y)
+                                        ra = float(sc.ra.to(u.deg).value)
+                                        dec = float(sc.dec.to(u.deg).value)
+                                        fp_tmp.append((ra, dec))
+                                    fp_src = fp_tmp
+                                except Exception:
+                                    fp_src = None
+                        if isinstance(fp_src, list) and fp_src:
+                            for i in range(min(4, len(fp_src))):
+                                fp_cols[f"FP_RA{i+1}"] = fp_src[i][0]
+                                fp_cols[f"FP_DEC{i+1}"] = fp_src[i][1]
                         writer.writerow(
                             {
                                 "path": item.get("path", ""),
@@ -621,6 +677,7 @@ def launch_filter_interface(
                                 "NAXIS2": nax2 if nax2 is not None else "",
                                 "CRVAL1": center_tuple[0] if center_tuple else "",
                                 "CRVAL2": center_tuple[1] if center_tuple else "",
+                                **fp_cols,
                                 "DATE-OBS": header_payload.get("DATE-OBS", ""),
                                 "EXPTIME": header_payload.get("EXPTIME", ""),
                                 "FILTER": header_payload.get("FILTER", ""),
@@ -840,6 +897,46 @@ def launch_filter_interface(
                 except Exception:
                     return None
 
+            def _apply_precomputed_footprint_if_available(self) -> None:
+                """Load a precomputed footprint polygon from the source dict.
+
+                The CSV bootstrap can store footprint corners as a list of
+                (RA, Dec) tuples under the ``footprint_radec`` key. When this
+                data is present, use it directly so the preview can display the
+                blue frames without requiring a WCS object.
+                """
+                try:
+                    pts = self.src.get("footprint_radec")
+                    if isinstance(pts, (list, tuple)) and len(pts) >= 3:
+                        arr = []
+                        for p in pts:
+                            try:
+                                arr.append([float(p[0]), float(p[1])])
+                            except Exception:
+                                arr = []
+                                break
+                        if arr:
+                            self._footprint_cache = np.array(arr, dtype=float)
+                            self._footprint_ready = True
+                            return
+                except Exception:
+                    pass
+                # Optional fallback: FP_RA*/FP_DEC* scalars if present
+                try:
+                    vals: list[list[float]] = []
+                    for k in ("1", "2", "3", "4"):
+                        ra = self.src.get(f"FP_RA{k}")
+                        dec = self.src.get(f"FP_DEC{k}")
+                        if ra is None or dec is None or str(ra) == "" or str(dec) == "":
+                            continue
+                        vals.append([float(ra), float(dec)])
+                    if len(vals) >= 3:
+                        self._footprint_cache = np.array(vals, dtype=float)
+                        self._footprint_ready = True
+                        return
+                except Exception:
+                    pass
+
             def get_cached_footprint(self) -> Optional[np.ndarray]:
                 """Return footprint if it has already been computed."""
 
@@ -875,6 +972,9 @@ def launch_filter_interface(
                 # requested by the UI via ``ensure_footprint``.
                 self._footprint_cache = None
                 self._footprint_ready = False
+                # But if a precomputed polygon is available (from CSV), use it
+                # so the preview can immediately display blue frames.
+                self._apply_precomputed_footprint_if_available()
 
         raw_files_with_wcs: list[Dict[str, Any]] = []
         items: list[Item] = []
@@ -945,7 +1045,7 @@ def launch_filter_interface(
             "filter_window_title",
             "ZeMosaic - Filtrer les images WCS (optionnel)" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "ZeMosaic - Filter WCS images (optional)"
         ))
-        # S'assurer que la fenêtre apparaît au premier plan et prend le focus
+        # S'assurer que la fenÃªtre apparaÃ®t au premier plan et prend le focus
         try:
             root.lift()
             root.attributes("-topmost", True)
@@ -964,7 +1064,7 @@ def launch_filter_interface(
         status = ttk.Frame(main)
         status.grid(row=0, column=0, columnspan=2, sticky="ew")
         status.columnconfigure(1, weight=1)
-        status_var = tk.StringVar(master=root, value=_tr("filter_status_crawling", "Crawling files… please wait"))
+        status_var = tk.StringVar(master=root, value=_tr("filter_status_crawling", "Crawling filesâ€¦ please wait"))
         ttk.Label(status, textvariable=status_var).grid(row=0, column=0, padx=6, pady=4, sticky="w")
         pb = ttk.Progressbar(status, mode="indeterminate", length=180)
         pb.grid(row=0, column=1, padx=6, pady=4, sticky="e")
@@ -1001,7 +1101,7 @@ def launch_filter_interface(
                     status_var.set(
                         _tr(
                             "filter_status_click_analyse",
-                            "Cliquez sur Analyse pour démarrer l'exploration." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Ready — click Analyse to scan.",
+                            "Cliquez sur Analyse pour dÃ©marrer l'exploration." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Ready â€” click Analyse to scan.",
                         )
                     )
                 except Exception:
@@ -1025,7 +1125,7 @@ def launch_filter_interface(
                 status_var.set(
                     _tr(
                         "filter_status_populating",
-                        "Preparing list… {current}/{total}",
+                        "Preparing listâ€¦ {current}/{total}",
                     ).format(current=0, total=total_initial_entries)
                 )
             else:
@@ -1243,7 +1343,7 @@ def launch_filter_interface(
                     ),
                     _tr(
                         "filter_invalid_value_message",
-                        "Veuillez entrer une distance en degrés (nombre)." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Please enter a distance in degrees (number).",
+                        "Veuillez entrer une distance en degrÃ©s (nombre)." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Please enter a distance in degrees (number).",
                     ),
                 )
                 return
@@ -1258,7 +1358,7 @@ def launch_filter_interface(
             thresh_frame,
             text=_tr(
                 "filter_apply_threshold_button",
-                "Exclure > X°" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Exclude > X°",
+                "Exclure > XÂ°" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Exclude > XÂ°",
             ),
             command=apply_threshold,
         )
@@ -1279,7 +1379,7 @@ def launch_filter_interface(
             right,
             text=_tr(
                 "filter_log_panel_title",
-                "Activity log" if 'fr' not in str(locals().get('lang_code', 'en')).lower() else "Journal d'activité",
+                "Activity log" if 'fr' not in str(locals().get('lang_code', 'en')).lower() else "Journal d'activitÃ©",
             ),
         )
         log_frame.grid(row=1, column=0, sticky="nsew", padx=5, pady=(0, 5))
@@ -1311,7 +1411,7 @@ def launch_filter_interface(
             _log_message(
                 _tr(
                     "filter_warn_no_displayable_wcs",
-                    "Aucune information WCS/centre disponible ; l'aperçu restera vide mais vous pouvez sélectionner les fichiers." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "No WCS/center information available; the sky preview will remain empty but you can still select files.",
+                    "Aucune information WCS/centre disponible ; l'aperÃ§u restera vide mais vous pouvez sÃ©lectionner les fichiers." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "No WCS/center information available; the sky preview will remain empty but you can still select files.",
                 ),
                 level="WARN",
             )
@@ -1527,7 +1627,7 @@ def launch_filter_interface(
             summary_var.set(
                 _tr(
                     "filter_summary_no_centers",
-                    "Centres WCS indisponibles — sélection manuelle uniquement." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "WCS centers unavailable — manual selection only.",
+                    "Centres WCS indisponibles â€” sÃ©lection manuelle uniquement." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "WCS centers unavailable â€” manual selection only.",
                 )
             )
 
@@ -1810,11 +1910,23 @@ def launch_filter_interface(
                 )
                 summary_var.set(summary_text)
                 _log_message(summary_text, level="INFO")
+                try:
+                    _draw_group_outlines(final_groups)
+                except Exception:
+                    pass
             finally:
                 auto_btn.state(["!disabled"])
 
         resolve_btn.configure(command=_resolve_missing_wcs_inplace)
         auto_btn.configure(command=_auto_organize_master_tiles)
+
+        # If initial overrides already include preplanned groups, draw them now
+        try:
+            preplanned = overrides_state.get("preplan_master_groups") if isinstance(overrides_state, dict) else None
+            if preplanned:
+                _draw_group_outlines(preplanned)
+        except Exception:
+            pass
 
         # Selection helpers
         actions = ttk.Frame(right)
@@ -1857,7 +1969,7 @@ def launch_filter_interface(
             actions,
             text=_tr(
                 "filter_select_all",
-                "Tout sélectionner" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Select all",
+                "Tout sÃ©lectionner" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Select all",
             ),
             command=select_all,
         ).pack(side=tk.LEFT, padx=4)
@@ -1865,7 +1977,7 @@ def launch_filter_interface(
             actions,
             text=_tr(
                 "filter_select_none",
-                "Tout désélectionner" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Deselect all",
+                "Tout dÃ©sÃ©lectionner" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Deselect all",
             ),
             command=select_none,
         ).pack(side=tk.LEFT, padx=4)
@@ -1936,6 +2048,160 @@ def launch_filter_interface(
         item_labels: list[str] = []
         patches: list[Any] = []
         center_pts: list[Any] = []  # matplotlib line2D handles
+        # Master Tile outlines (group-level overlays)
+        group_outline_patches: list[Any] = []
+
+        def _clear_group_outlines() -> None:
+            try:
+                for art in group_outline_patches:
+                    try:
+                        art.remove()
+                    except Exception:
+                        pass
+            finally:
+                group_outline_patches.clear()
+
+        def _draw_group_outlines(groups_payload: Optional[list[list[dict]]]) -> None:
+            """Draw red bounding contours for Master Tile groups on the preview.
+
+            For each group (list of dict entries similar to items), collect
+            available RA/Dec samples (footprints when possible, otherwise
+            centers), compute a simple axis-aligned bounding rectangle in the
+            wrapped RA/Dec space, and render it as a red polygon.
+            """
+            if not groups_payload:
+                _clear_group_outlines()
+                try:
+                    canvas.draw_idle()
+                except Exception:
+                    pass
+                return
+
+            _clear_group_outlines()
+            try:
+                for grp in groups_payload:
+                    ra_vals_g: list[float] = []
+                    dec_vals_g: list[float] = []
+
+                    for info in grp or []:
+                        # 1) Prefer footprints already computed for the item corresponding
+                        #    to this entry (ensures consistency with blue outlines).
+                        try:
+                            # Try to map back to an existing Item via its path
+                            path_val = None
+                            if isinstance(info, dict):
+                                path_val = (
+                                    info.get("path")
+                                    or info.get("path_raw")
+                                    or info.get("path_preprocessed_cache")
+                                )
+                            idx_mapped = None
+                            if path_val is not None:
+                                key = _path_key(path_val)
+                                idx_mapped = known_path_index.get(key)
+                            if idx_mapped is not None and 0 <= idx_mapped < len(items):
+                                it = items[idx_mapped]
+                                fp = it.get_cached_footprint() or it.ensure_footprint()
+                                if fp is not None and isinstance(fp, np.ndarray) and fp.shape[1] >= 2:
+                                    for pt in fp.tolist():
+                                        try:
+                                            ra_vals_g.append(wrap_ra_deg(float(pt[0]), ref_ra))
+                                            dec_vals_g.append(float(pt[1]))
+                                        except Exception:
+                                            pass
+                                    # Use the best source available; skip to next info
+                                    continue
+                        except Exception:
+                            pass
+
+                        # Attempt to use footprint corners when possible
+                        wcs_obj = None
+                        try:
+                            if isinstance(info, dict):
+                                wcs_obj = info.get("wcs")
+                        except Exception:
+                            wcs_obj = None
+
+                        # Infer shape
+                        shp = None
+                        try:
+                            if isinstance(info, dict):
+                                shp_val = info.get("shape")
+                                if isinstance(shp_val, (list, tuple)) and len(shp_val) >= 2:
+                                    h = int(shp_val[0]); w = int(shp_val[1])
+                                    if h > 0 and w > 0:
+                                        shp = (h, w)
+                        except Exception:
+                            shp = None
+
+                        if wcs_obj is not None and shp is not None and hasattr(wcs_obj, "pixel_to_world"):
+                            try:
+                                h, w = shp
+                                corners = [
+                                    (0.0, 0.0),
+                                    (w - 1.0, 0.0),
+                                    (w - 1.0, h - 1.0),
+                                    (0.0, h - 1.0),
+                                ]
+                                for (x, y) in corners:
+                                    sc = wcs_obj.pixel_to_world(x, y)
+                                    ra = float(sc.ra.to(u.deg).value)
+                                    dec = float(sc.dec.to(u.deg).value)
+                                    ra_vals_g.append(wrap_ra_deg(ra, ref_ra))
+                                    dec_vals_g.append(dec)
+                                continue
+                            except Exception:
+                                pass
+
+                        # Fallback: use center
+                        try:
+                            c = info.get("center") if isinstance(info, dict) else None
+                            ra_c = None; dec_c = None
+                            if c is not None:
+                                if hasattr(c, "ra") and hasattr(c, "dec"):
+                                    ra_c = float(c.ra.to(u.deg).value)
+                                    dec_c = float(c.dec.to(u.deg).value)
+                                elif isinstance(c, (list, tuple)) and len(c) >= 2:
+                                    ra_c = float(c[0]); dec_c = float(c[1])
+                                elif isinstance(c, dict):
+                                    ra_v = c.get("ra") or c.get("RA")
+                                    dec_v = c.get("dec") or c.get("DEC")
+                                    if ra_v is not None and dec_v is not None:
+                                        ra_c = float(ra_v); dec_c = float(dec_v)
+                            if ra_c is not None and dec_c is not None:
+                                ra_vals_g.append(wrap_ra_deg(ra_c, ref_ra))
+                                dec_vals_g.append(dec_c)
+                        except Exception:
+                            pass
+
+                    if not ra_vals_g or not dec_vals_g:
+                        continue
+
+                    try:
+                        ra_min, ra_max = min(ra_vals_g), max(ra_vals_g)
+                        dec_min, dec_max = min(dec_vals_g), max(dec_vals_g)
+                        # Tiny padding so thin groups remain visible
+                        ra_pad = max(1e-3, (ra_max - ra_min) * 0.03 + 0.05)
+                        dec_pad = max(1e-3, (dec_max - dec_min) * 0.03 + 0.05)
+                        ra0, ra1 = ra_min - ra_pad, ra_max + ra_pad
+                        dec0, dec1 = dec_min - dec_pad, dec_max + dec_pad
+                        rect_pts = [(ra0, dec0), (ra1, dec0), (ra1, dec1), (ra0, dec1)]
+                        poly = Polygon(rect_pts, closed=True, fill=False, edgecolor="red", linewidth=1.6, alpha=0.9, linestyle="--")
+                        ax.add_patch(poly)
+                        group_outline_patches.append(poly)
+                    except Exception:
+                        continue
+
+                try:
+                    canvas.draw_idle()
+                except Exception:
+                    pass
+            except Exception:
+                _clear_group_outlines()
+                try:
+                    canvas.draw_idle()
+                except Exception:
+                    pass
         # Map matplotlib artists back to item indices for click-to-select
         artist_to_index: dict[Any, int] = {}
         known_path_index: dict[str, int] = {}
@@ -2073,7 +2339,7 @@ def launch_filter_interface(
             status_var.set(
                 _tr(
                     "filter_status_populating",
-                    "Preparing list… {current}/{total}",
+                    "Preparing listâ€¦ {current}/{total}",
                 ).format(current=min(processed, population_state["total"]), total=population_state["total"])
             )
 
@@ -2084,7 +2350,7 @@ def launch_filter_interface(
             if item.center is not None:
                 try:
                     sep_deg = item.center.separation(global_center).to(u.deg).value
-                    sep_txt = f"  ({sep_deg:.2f}°)"
+                    sep_txt = f"  ({sep_deg:.2f}Â°)"
                 except Exception:
                     sep_txt = ""
 
@@ -2353,7 +2619,7 @@ def launch_filter_interface(
                         sep_txt = ""
                         if items[existing_idx].center is not None:
                             sep_deg = items[existing_idx].center.separation(global_center).to(u.deg).value
-                            sep_txt = f"  ({sep_deg:.2f}°)"
+                            sep_txt = f"  ({sep_deg:.2f}Â°)"
                         _update_item_label(existing_idx, base_name + sep_txt)
                     except Exception:
                         pass
@@ -2397,6 +2663,16 @@ def launch_filter_interface(
                         try:
                             pb.stop()
                             status_var.set(_tr("filter_status_ready", "Crawling done."))
+                        except Exception:
+                            pass
+                        try:
+                            _log_message(
+                                _tr(
+                                    "filter_log_analysis_complete",
+                                    "Analyse terminee." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Analysis complete.",
+                                ),
+                                level="INFO",
+                            )
                         except Exception:
                             pass
                         stream_state["status_message"] = _tr("filter_status_ready", "Crawling done.")
@@ -2452,6 +2728,16 @@ def launch_filter_interface(
                     try:
                         pb.stop()
                         status_var.set(_tr("filter_status_ready", "Crawling done."))
+                    except Exception:
+                        pass
+                    try:
+                        _log_message(
+                            _tr(
+                                "filter_log_analysis_complete",
+                                "Analyse terminee." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Analysis complete.",
+                            ),
+                            level="INFO",
+                        )
                     except Exception:
                         pass
                     stream_state["status_message"] = _tr("filter_status_ready", "Crawling done.")
@@ -2543,7 +2829,7 @@ def launch_filter_interface(
             if not force and not stream_state.get("pending_start"):
                 return
             stream_state["pending_start"] = False
-            stream_state["status_message"] = _tr("filter_status_crawling", "Crawling files… please wait")
+            stream_state["status_message"] = _tr("filter_status_crawling", "Crawling filesâ€¦ please wait")
             try:
                 status_var.set(stream_state["status_message"])
             except Exception:
@@ -2582,6 +2868,15 @@ def launch_filter_interface(
                     data.setdefault("shape", it.shape)
                 if it.center is not None:
                     data.setdefault("center", it.center)
+                # If we have a computed footprint (from WCS or CSV), pass it
+                # along explicitly so the exporter can persist it.
+                try:
+                    fp = it.get_cached_footprint() or it.ensure_footprint()
+                    if fp is not None:
+                        # Convert ndarray to list of tuples for serialization
+                        data.setdefault("_precomp_fp", [(float(r), float(d)) for r, d in fp.tolist()])
+                except Exception:
+                    pass
                 payload.append(data)
             _export_csv(path_csv, payload)
             stream_state["csv_loaded"] = True
@@ -2609,7 +2904,7 @@ def launch_filter_interface(
                     status_var.set(
                         _tr(
                             "filter_status_click_analyse",
-                            "Cliquez sur Analyse pour démarrer l'exploration." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Ready — click Analyse to scan.",
+                            "Cliquez sur Analyse pour dÃ©marrer l'exploration." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Ready â€” click Analyse to scan.",
                         )
                     )
                 except Exception:
@@ -2861,11 +3156,12 @@ def launch_filter_interface(
             return raw_files_with_wcs, False, None
 
     except ImportError:
-        # Any optional dependency missing — silently keep all
+        # Any optional dependency missing â€” silently keep all
         return raw_files_with_wcs, False, None
     except Exception:
-        # Any unexpected error — fail safe and keep all
+        # Any unexpected error â€” fail safe and keep all
         return raw_files_with_wcs, False, None
 
 
 __all__ = ["launch_filter_interface"]
+
