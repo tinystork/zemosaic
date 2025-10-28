@@ -442,6 +442,8 @@ def launch_filter_interface(
             cache_csv_path = os.path.join(input_dir, "headers_cache.csv")
 
         stream_queue: Optional[queue.Queue] = None
+        # Stop flag for the streaming worker to support instant cancel/close
+        stream_stop_event: Optional[threading.Event] = None
         stream_state = {
             "done": not stream_mode,
             "running": False,
@@ -632,30 +634,44 @@ def launch_filter_interface(
 
         if stream_mode and input_dir:
 
-            def _crawl_worker(target_queue: "queue.Queue[list[Dict[str, Any]] | None]") -> None:
+            def _crawl_worker(target_queue: "queue.Queue[list[Dict[str, Any]] | None]",
+                               stop_event: threading.Event) -> None:
                 batch: list[Dict[str, Any]] = []
                 minimum_batch = max(1, int(batch_size) if isinstance(batch_size, int) else 100)
                 for idx, fpath in enumerate(_iter_fits_paths(input_dir, recursive=scan_recursive)):
+                    # Allow cooperative, responsive cancellation
+                    if stop_event.is_set():
+                        break
                     item = _minimal_header_payload(fpath)
                     item["index"] = idx
                     batch.append(item)
                     if len(batch) >= minimum_batch:
+                        if stop_event.is_set():
+                            break
                         target_queue.put(batch)
                         batch = []
-                if batch:
-                    target_queue.put(batch)
+                if not stop_event.is_set():
+                    if batch:
+                        target_queue.put(batch)
+                # Always signal completion to unblock consumers
                 target_queue.put(None)
                 stream_state["running"] = False
 
             def _spawn_worker() -> None:
                 nonlocal stream_queue
+                nonlocal stream_stop_event
                 if stream_state.get("running"):
                     return
                 stream_queue = queue.Queue()
+                stream_stop_event = threading.Event()
                 stream_state["running"] = True
                 stream_state["done"] = False
                 stream_state["status_message"] = None
-                threading.Thread(target=_crawl_worker, args=(stream_queue,), daemon=True).start()
+                threading.Thread(
+                    target=_crawl_worker,
+                    args=(stream_queue, stream_stop_event),
+                    daemon=True,
+                ).start()
 
             stream_state["spawn_worker"] = _spawn_worker
             stream_state["done"] = True
@@ -976,8 +992,18 @@ def launch_filter_interface(
                 except Exception:
                     pass
             elif stream_state.get("pending_start"):
+                # Idle: wait for explicit click on Analyse
                 try:
-                    pb.start(80)
+                    pb.stop()
+                except Exception:
+                    pass
+                try:
+                    status_var.set(
+                        _tr(
+                            "filter_status_click_analyse",
+                            "Cliquez sur Analyse pour démarrer l'exploration." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Ready — click Analyse to scan.",
+                        )
+                    )
                 except Exception:
                     pass
             else:
@@ -1865,7 +1891,7 @@ def launch_filter_interface(
             return payload
 
         def on_validate():
-            _drain_stream_queue()
+            _drain_stream_queue_non_blocking(mark_done=True)
             sel = _get_selected_indices()
             result["accepted"] = True
             result["selected_indices"] = sel
@@ -1877,7 +1903,7 @@ def launch_filter_interface(
                 pass
             root.destroy()
         def on_cancel():
-            _drain_stream_queue()
+            _drain_stream_queue_non_blocking(mark_done=True)
             result["accepted"] = False
             result["selected_indices"] = None
             result["cancelled"] = True
@@ -2396,16 +2422,30 @@ def launch_filter_interface(
             except Exception:
                 stream_state["done"] = True
 
-        def _drain_stream_queue() -> None:
-            if stream_queue is None or stream_state.get("done"):
+        def _drain_stream_queue_non_blocking(mark_done: bool = False) -> None:
+            """Drain any queued batches without waiting.
+
+            If ``mark_done`` is True, also request the worker to stop and
+            prevent re-scheduling of consumers. This makes Cancel/close
+            instantaneous even on slow USB drives.
+            """
+            nonlocal stream_stop_event
+            if stream_queue is None:
                 return
+            if mark_done:
+                stream_state["done"] = True
+                if stream_stop_event is not None:
+                    try:
+                        stream_stop_event.set()
+                    except Exception:
+                        pass
+            drained_any = False
             while True:
                 try:
-                    batch = stream_queue.get(timeout=0.1)
+                    batch = stream_queue.get_nowait()
                 except queue.Empty:
-                    if stream_state.get("done"):
-                        break
-                    continue
+                    break
+                drained_any = True
                 if batch is None:
                     stream_state["done"] = True
                     stream_state["running"] = False
@@ -2422,6 +2462,12 @@ def launch_filter_interface(
                     break
                 if batch:
                     _ingest_batch(batch)
+            # If we consumed something and we're not marked done, schedule a light pass
+            if drained_any and not stream_state.get("done"):
+                try:
+                    root.after(40, _consume_ui_queue)
+                except Exception:
+                    stream_state["done"] = True
 
         def _refresh_item_visual(idx: int) -> None:
             if idx < 0 or idx >= len(items):
@@ -2557,7 +2603,17 @@ def launch_filter_interface(
             except Exception:
                 pass
             if stream_state.get("pending_start"):
-                _trigger_stream_start()
+                # Do not auto-start; wait for user to click Analyse
+                try:
+                    pb.stop()
+                    status_var.set(
+                        _tr(
+                            "filter_status_click_analyse",
+                            "Cliquez sur Analyse pour démarrer l'exploration." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Ready — click Analyse to scan.",
+                        )
+                    )
+                except Exception:
+                    pass
             elif stream_state.get("status_message"):
                 try:
                     analyse_btn.state(["!disabled"])
@@ -2656,7 +2712,7 @@ def launch_filter_interface(
 
         # On window close: treat as cancel (keep all)
         def on_close():
-            _drain_stream_queue()
+            _drain_stream_queue_non_blocking(mark_done=True)
             if result.get("accepted") is None:
                 result["accepted"] = False
             result["selected_indices"] = None
