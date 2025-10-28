@@ -4641,6 +4641,10 @@ def run_hierarchical_mosaic(
                     config_overrides=config_payload_for_filter,
                 )
                 filtered_items, filter_accepted, filter_overrides = _parse_filter_result(filter_ret)
+                if isinstance(filter_overrides, dict) and filter_overrides.get("filter_cancelled"):
+                    pcb("run_warn_phase0_filter_cancelled", prog=None, lvl="WARN")
+                    pcb("log_key_processing_cancelled", prog=None, lvl="WARN")
+                    return
                 if isinstance(filtered_items, list):
                     header_items_for_filter = filtered_items
                 if header_items_for_filter:
@@ -4724,6 +4728,10 @@ def run_hierarchical_mosaic(
                     filter_invoked = True
                     filter_ret = launch_filter_interface_fn(header_items_for_filter, initial_filter_overrides)
                     filtered_items, filter_accepted, filter_overrides = _parse_filter_result(filter_ret)
+                    if isinstance(filter_overrides, dict) and filter_overrides.get("filter_cancelled"):
+                        pcb("run_warn_phase0_filter_cancelled", prog=None, lvl="WARN")
+                        pcb("log_key_processing_cancelled", prog=None, lvl="WARN")
+                        return
                 except Exception as e_filter:
                     filter_invoked = False
                     filtered_items = None
