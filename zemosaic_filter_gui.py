@@ -40,9 +40,7 @@
 ║ Disclaimer:                                                          ║
 ║   No AIs or butter knives were harmed in the making of this code.    ║
 ╚══════════════════════════════════════════════════════════════════════╝
-"""
 
-"""
 Optional GUI filter for ZeMosaic Phase 1 results.
 
 This module exposes a single function:
