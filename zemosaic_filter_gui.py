@@ -1847,13 +1847,30 @@ def launch_filter_interface(
         # Confirm/cancel buttons
         bottom = ttk.Frame(right)
         bottom.grid(row=5, column=0, sticky="ew", padx=5, pady=5)
-        result: dict[str, Any] = {"accepted": None, "selected_indices": None, "overrides": None}
+        result: dict[str, Any] = {
+            "accepted": None,
+            "selected_indices": None,
+            "overrides": None,
+            "cancelled": False,
+        }
+
+        def _cancel_overrides_payload() -> dict[str, Any]:
+            payload: dict[str, Any] = {}
+            if isinstance(overrides_state, dict) and overrides_state:
+                payload.update(overrides_state)
+            current = result.get("overrides")
+            if isinstance(current, dict) and current:
+                payload.update(current)
+            payload["filter_cancelled"] = True
+            return payload
+
         def on_validate():
             _drain_stream_queue()
             sel = _get_selected_indices()
             result["accepted"] = True
             result["selected_indices"] = sel
             result["overrides"] = overrides_state if overrides_state else None
+            result["cancelled"] = False
             try:
                 root.quit()
             except Exception:
@@ -1863,6 +1880,8 @@ def launch_filter_interface(
             _drain_stream_queue()
             result["accepted"] = False
             result["selected_indices"] = None
+            result["cancelled"] = True
+            result["overrides"] = _cancel_overrides_payload()
             try:
                 root.quit()
             except Exception:
@@ -2641,6 +2660,8 @@ def launch_filter_interface(
             if result.get("accepted") is None:
                 result["accepted"] = False
             result["selected_indices"] = None
+            result["cancelled"] = True
+            result["overrides"] = _cancel_overrides_payload()
             root.destroy()
         root.protocol("WM_DELETE_WINDOW", on_close)
 
@@ -2693,6 +2714,19 @@ def launch_filter_interface(
         accepted_flag = result.get("accepted")
         if accepted_flag is None:
             accepted_flag = False
+        cancelled_flag = bool(result.get("cancelled"))
+        if cancelled_flag:
+            overrides_payload: dict[str, Any] | None
+            overrides_payload = None
+            overrides_result = result.get("overrides")
+            if isinstance(overrides_result, dict):
+                overrides_payload = dict(overrides_result)
+            elif isinstance(overrides_state, dict) and overrides_state:
+                overrides_payload = dict(overrides_state)
+            if overrides_payload is None:
+                overrides_payload = {}
+            overrides_payload["filter_cancelled"] = True
+            return raw_files_with_wcs, False, overrides_payload
         if accepted_flag and isinstance(result.get("selected_indices"), list):
             sel = result["selected_indices"]  # type: ignore[assignment]
 
