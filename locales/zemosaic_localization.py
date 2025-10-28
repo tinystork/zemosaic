@@ -106,7 +106,8 @@ class ZeMosaicLocalization:
             return False
 
         try:
-            with open(file_path_to_load, 'r', encoding='utf-8') as f:
+            # Accept both UTF-8 with and without BOM to avoid JSON decode errors
+            with open(file_path_to_load, 'r', encoding='utf-8-sig') as f:
                 temp_translations_loaded = json.load(f)
             print(f"INFO (Localization _load_language_file): Traductions pour '{lang_code_to_load}' chargées ({len(temp_translations_loaded)} clés) depuis {file_path_to_load}")
             loaded_successfully = True

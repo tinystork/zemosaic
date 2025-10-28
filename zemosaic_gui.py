@@ -166,7 +166,7 @@ class ZeMosaicGUI:
                 "num_processing_workers": 0, # 0 pour auto, anciennement -1
                 # Prétraitement GPU (facultatif) : suppression du gradient de fond
                 # DÉSACTIVÉE par défaut pour conserver le rendu antérieur
-                "preprocess_remove_background_gpu": False,
+                "preprocess_remove_background_gpu": True,
                 "preprocess_background_sigma": 24.0,
                 # Valeur par défaut alignée avec le worker (0.05°)
                 "cluster_panel_threshold": 0.05,
