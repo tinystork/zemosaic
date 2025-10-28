@@ -1,6 +1,53 @@
+"""
+╔══════════════════════════════════════════════════════════════════════╗
+║ ZeMosaic / ZeSeestarStacker Project                                  ║
+║                                                                      ║
+║ Auteur  : Tinystork, seigneur des couteaux à beurre (aka Tristan Nauleau)  
+║ Partenaire : J.A.R.V.I.S. (/ˈdʒɑːrvɪs/) — Just a Rather Very Intelligent System  
+║              (aka ChatGPT, Grand Maître du ciselage de code)         ║
+║                                                                      ║
+║ Licence : GNU General Public License v3.0 (GPL-3.0)                  ║
+║                                                                      ║
+║ Description :                                                        ║
+║   Ce programme a été forgé à la lueur des pixels et de la caféine,   ║
+║   dans le but noble de transformer des nuages de photons en art      ║
+║   astronomique. Si vous l’utilisez, pensez à dire “merci”,           ║
+║   à lever les yeux vers le ciel, ou à citer Tinystork et J.A.R.V.I.S.║
+║   (le karma des développeurs en dépend).                             ║
+║                                                                      ║
+║ Avertissement :                                                      ║
+║   Aucune IA ni aucun couteau à beurre n’a été blessé durant le       ║
+║   développement de ce code.                                          ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+
+╔══════════════════════════════════════════════════════════════════════╗
+║ ZeMosaic / ZeSeestarStacker Project                                  ║
+║                                                                      ║
+║ Author  : Tinystork, Lord of the Butter Knives (aka Tristan Nauleau) ║
+║ Partner : J.A.R.V.I.S. (/ˈdʒɑːrvɪs/) — Just a Rather Very Intelligent System  
+║           (aka ChatGPT, Grand Master of Code Chiseling)              ║
+║                                                                      ║
+║ License : GNU General Public License v3.0 (GPL-3.0)                  ║
+║                                                                      ║
+║ Description:                                                         ║
+║   This program was forged under the sacred light of pixels and       ║
+║   caffeine, with the noble intent of turning clouds of photons into  ║
+║   astronomical art. If you use it, please consider saying “thanks,”  ║
+║   gazing at the stars, or crediting Tinystork and J.A.R.V.I.S. —     ║
+║   developer karma depends on it.                                     ║
+║                                                                      ║
+║ Disclaimer:                                                          ║
+║   No AIs or butter knives were harmed in the making of this code.    ║
+╚══════════════════════════════════════════════════════════════════════╝
+"""
+
+from __future__ import annotations
+
 # zemosaic_worker.py
 
 import os
+import copy
 import shutil
 import time
 import traceback
@@ -16,8 +63,12 @@ import uuid
 import multiprocessing
 import threading
 import itertools
-from typing import Callable
+from dataclasses import dataclass
+from typing import Callable, Any
 from types import SimpleNamespace
+
+import numpy as np
+
 
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, FIRST_COMPLETED, as_completed
 # BrokenProcessPool moved under concurrent.futures.process in modern Python
@@ -154,6 +205,335 @@ def cluster_seestar_stacks_connected(
         groups.append([panel_data_for_clustering[i] for i in members])
     _log_and_callback("clusterstacks_info_finished", num_groups=len(groups), level="INFO", callback=progress_callback)
     return groups
+
+
+# --- Phase 3 center-out helpers -------------------------------------------------
+
+
+@dataclass
+class _CenterPreviewEntry:
+    tile_id: int
+    preview: "np.ndarray | None"
+    wcs: object | None
+    stats: dict | None
+    mode: str
+    gain: float
+    offset: float
+
+
+class CenterOutNormalizationContext:
+    def __init__(
+        self,
+        anchor_tile_original_id: int,
+        ordered_tile_ids: list[int],
+        tile_distances: dict[int, float] | None,
+        settings: dict,
+        global_center=None,
+        logger_instance=None,
+    ):
+        self.anchor_original_id = int(anchor_tile_original_id)
+        self.ordered_tile_ids = list(ordered_tile_ids)
+        self._rank_map = {tid: idx for idx, tid in enumerate(self.ordered_tile_ids)}
+        self.tile_distances = dict(tile_distances or {})
+        self.settings = settings or {}
+        self.global_center = global_center
+        self.logger = logger_instance or logger
+        self._lock = threading.RLock()
+        self._entries: dict[int, _CenterPreviewEntry] = {}
+        self.anchor_stats: dict | None = None
+        self.anchor_ready_event = threading.Event()
+
+    def get_rank(self, tile_id: int) -> int | None:
+        return self._rank_map.get(int(tile_id))
+
+    def get_distance(self, tile_id: int) -> float | None:
+        return self.tile_distances.get(int(tile_id))
+
+    def wait_for_anchor(self) -> bool:
+        if self.anchor_ready_event.is_set():
+            return True
+        return self.anchor_ready_event.wait(timeout=60.0)
+
+    def register_tile(
+        self,
+        tile_id: int,
+        preview: "np.ndarray | None",
+        preview_wcs,
+        stats: dict | None,
+        gain: float,
+        offset: float,
+        mode: str,
+    ) -> None:
+        entry = _CenterPreviewEntry(
+            tile_id=int(tile_id),
+            preview=None if preview is None else np.asarray(preview, dtype=np.float32, copy=True),
+            wcs=preview_wcs,
+            stats=stats.copy() if isinstance(stats, dict) else stats,
+            mode=str(mode),
+            gain=float(gain),
+            offset=float(offset),
+        )
+        with self._lock:
+            self._entries[int(tile_id)] = entry
+            if int(tile_id) == self.anchor_original_id:
+                self.anchor_stats = entry.stats
+                self.anchor_ready_event.set()
+
+    def get_processed_tiles(self, exclude_tile_id: int | None = None) -> list[_CenterPreviewEntry]:
+        with self._lock:
+            items = [
+                entry
+                for tid, entry in self._entries.items()
+                if exclude_tile_id is None or int(tid) != int(exclude_tile_id)
+            ]
+        items.sort(key=lambda ent: (self.get_rank(ent.tile_id) if self.get_rank(ent.tile_id) is not None else 1_000_000))
+        return items
+
+    def get_anchor_stats(self) -> dict | None:
+        with self._lock:
+            return self.anchor_stats.copy() if isinstance(self.anchor_stats, dict) else self.anchor_stats
+
+
+def _extract_group_center_skycoord(group_info_list: list[dict]) -> "SkyCoord | None":
+    if not group_info_list:
+        return None
+    if not (ASTROPY_AVAILABLE and SkyCoord and u):
+        return None
+    for entry in group_info_list:
+        wcs_obj = entry.get("wcs")
+        if wcs_obj and getattr(wcs_obj, "is_celestial", False):
+            try:
+                if getattr(wcs_obj, "pixel_shape", None):
+                    width = float(wcs_obj.pixel_shape[0])
+                    height = float(wcs_obj.pixel_shape[1])
+                else:
+                    shape = entry.get("preprocessed_shape")
+                    if shape and len(shape) >= 2:
+                        height = float(shape[0])
+                        width = float(shape[1])
+                    else:
+                        height = width = 0.0
+                cx = width / 2.0
+                cy = height / 2.0
+                center_world = wcs_obj.pixel_to_world(cx, cy)
+                if isinstance(center_world, SkyCoord):
+                    return center_world
+            except Exception:
+                pass
+            try:
+                if hasattr(wcs_obj, "wcs") and wcs_obj.wcs and wcs_obj.wcs.crval is not None:
+                    ra = float(wcs_obj.wcs.crval[0])
+                    dec = float(wcs_obj.wcs.crval[1])
+                    return SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs")
+            except Exception:
+                pass
+    for entry in group_info_list:
+        header = entry.get("header")
+        if header is None:
+            continue
+        try:
+            if hasattr(header, "get"):
+                ra_val = header.get("CRVAL1")
+                dec_val = header.get("CRVAL2")
+            else:
+                ra_val = header["CRVAL1"]
+                dec_val = header["CRVAL2"]
+            if ra_val is None or dec_val is None:
+                continue
+            return SkyCoord(ra=float(ra_val) * u.deg, dec=float(dec_val) * u.deg, frame="icrs")
+        except Exception:
+            continue
+    return None
+
+
+def _compute_center_out_order(
+    seestar_stack_groups: list[list[dict]],
+) -> tuple[list[int], "SkyCoord", dict[int, float]] | None:
+    if not seestar_stack_groups:
+        return None
+    if not (ASTROPY_AVAILABLE and SkyCoord and u):
+        return None
+    centers = []
+    fallback = []
+    for idx, group in enumerate(seestar_stack_groups):
+        center = _extract_group_center_skycoord(group)
+        if center:
+            centers.append((idx, center))
+        else:
+            fallback.append(idx)
+    if not centers:
+        return None
+    arr = np.array([coord.cartesian.xyz.value for _, coord in centers], dtype=np.float64)
+    norm = np.linalg.norm(arr, axis=1)
+    norm[norm == 0] = 1.0
+    arr = arr / norm[:, None]
+    vec = arr.mean(axis=0)
+    if np.linalg.norm(vec) <= 0:
+        return None
+    vec_norm = vec / np.linalg.norm(vec)
+    spherical = SkyCoord(
+        x=vec_norm[0] * u.one,
+        y=vec_norm[1] * u.one,
+        z=vec_norm[2] * u.one,
+        frame="icrs",
+        representation_type="cartesian",
+    ).spherical
+    global_center = SkyCoord(ra=spherical.lon.to(u.deg), dec=spherical.lat.to(u.deg), frame="icrs")
+    distances: dict[int, float] = {}
+    for idx, coord in centers:
+        try:
+            distances[idx] = float(coord.separation(global_center).deg)
+        except Exception:
+            distances[idx] = float("nan")
+    ordered = sorted(
+        [idx for idx, _ in centers],
+        key=lambda tid: (distances.get(tid, float("inf")), tid),
+    )
+    for idx in fallback:
+        if idx not in ordered:
+            ordered.append(idx)
+    return ordered, global_center, distances
+
+
+def apply_center_out_normalization_p3(
+    tile_array: "np.ndarray",
+    tile_wcs,
+    tile_id: int,
+    context: CenterOutNormalizationContext | None,
+    settings: dict | None,
+    log_func: Callable | None = None,
+) -> tuple["np.ndarray", tuple[float, float] | None, str, dict]:
+    if tile_array is None or context is None or not settings or not settings.get("enabled", True):
+        return tile_array, None, "disabled", {}
+
+    preview_size = int(settings.get("preview_size", 256))
+    sky_percent = settings.get("sky_percentile", (25.0, 60.0))
+    if not (isinstance(sky_percent, (tuple, list)) and len(sky_percent) >= 2):
+        sky_percent = (25.0, 60.0)
+    sky_low, sky_high = float(sky_percent[0]), float(sky_percent[1])
+    clip_sigma = float(settings.get("clip_sigma", 2.5))
+    min_overlap = float(settings.get("min_overlap_fraction", 0.03))
+
+    preview_raw, preview_wcs = zemosaic_utils.create_downscaled_luminance_preview(
+        tile_array,
+        tile_wcs,
+        preview_size,
+    )
+    tile_stats_raw = zemosaic_utils.compute_sky_statistics(preview_raw, sky_low, sky_high)
+
+    if int(tile_id) == context.anchor_original_id:
+        context.register_tile(tile_id, preview_raw, preview_wcs, tile_stats_raw, 1.0, 0.0, "anchor")
+        details = {
+            "rank": context.get_rank(tile_id),
+            "distance": context.get_distance(tile_id),
+            "mode": "anchor",
+            "samples": int(preview_raw.size if preview_raw is not None else 0),
+        }
+        return tile_array, (1.0, 0.0), "anchor", details
+
+    context.wait_for_anchor()
+    best_gain_offset: tuple[float, float] | None = None
+    best_samples = 0
+    best_reference = None
+
+    if preview_raw is not None and preview_wcs is not None and reproject_interp:
+        for entry in context.get_processed_tiles(exclude_tile_id=tile_id):
+            if entry.preview is None or entry.wcs is None:
+                continue
+            try:
+                reproj_src, footprint = reproject_interp(
+                    (preview_raw, preview_wcs),
+                    entry.wcs,
+                    shape_out=entry.preview.shape,
+                )
+            except Exception:
+                continue
+            if reproj_src is None or footprint is None:
+                continue
+            valid = np.isfinite(reproj_src) & np.isfinite(entry.preview) & (footprint > 0.1)
+            if not np.any(valid):
+                continue
+            overlap_fraction = valid.sum() / max(1, entry.preview.size)
+            if overlap_fraction < min_overlap:
+                continue
+            fit = zemosaic_utils.estimate_sky_affine_to_ref(
+                reproj_src[valid],
+                entry.preview[valid],
+                sky_low,
+                sky_high,
+                clip_sigma,
+            )
+            if not fit:
+                continue
+            gain, offset, samples = fit
+            if not np.isfinite(gain) or not np.isfinite(offset):
+                continue
+            if samples > best_samples:
+                best_samples = samples
+                best_gain_offset = (gain, offset)
+                best_reference = entry.tile_id
+
+    mode = "anchor_fallback"
+    if best_gain_offset is None:
+        anchor_stats = context.get_anchor_stats()
+        gain = 1.0
+        offset = 0.0
+        if anchor_stats and tile_stats_raw:
+            anchor_span = float(anchor_stats.get("high", 0.0)) - float(anchor_stats.get("low", 0.0))
+            tile_span = float(tile_stats_raw.get("high", 0.0)) - float(tile_stats_raw.get("low", 0.0))
+            if np.isfinite(anchor_span) and np.isfinite(tile_span) and tile_span > 1e-6:
+                gain = anchor_span / tile_span
+            anchor_med = float(anchor_stats.get("median", 0.0))
+            tile_med = float(tile_stats_raw.get("median", 0.0))
+            offset = anchor_med - gain * tile_med
+        best_gain_offset = (gain, offset)
+        best_samples = int(tile_stats_raw.get("median", 0) if tile_stats_raw else 0)
+    else:
+        mode = "overlap"
+
+    gain, offset = best_gain_offset
+    if not np.isfinite(gain) or not np.isfinite(offset):
+        return tile_array, None, "invalid", {}
+
+    try:
+        np.multiply(tile_array, gain, out=tile_array, casting="unsafe")
+        np.add(tile_array, offset, out=tile_array, casting="unsafe")
+    except Exception:
+        tile_array = tile_array * gain + offset
+
+    preview_corrected = None
+    if preview_raw is not None:
+        preview_corrected = preview_raw * gain + offset
+    corrected_stats = zemosaic_utils.compute_sky_statistics(preview_corrected, sky_low, sky_high)
+    context.register_tile(tile_id, preview_corrected, preview_wcs, corrected_stats, gain, offset, mode)
+
+    details = {
+        "rank": context.get_rank(tile_id),
+        "distance": context.get_distance(tile_id),
+        "mode": mode if best_reference is None else f"{mode}:{best_reference}",
+        "samples": int(best_samples),
+        "reference": best_reference,
+        "gain": float(gain),
+        "offset": float(offset),
+    }
+    if log_func:
+        try:
+            log_func(
+                "center_out_debug",
+                prog=None,
+                lvl="DEBUG_DETAIL",
+                tile=int(tile_id),
+                rank=details.get("rank"),
+                distance=f"{details.get('distance'):.4f}" if isinstance(details.get("distance"), float) else None,
+                mode=details.get("mode"),
+                gain=f"{gain:.6f}",
+                offset=f"{offset:.6f}",
+                samples=int(best_samples),
+            )
+        except Exception:
+            pass
+    return tile_array, (gain, offset), mode, details
+
 
 
 # --- Helpers for RAM budget enforcement during stacking ---
@@ -958,7 +1338,6 @@ ALIGN_WARNING_SUMMARY = {
 ALIGN_WARNING_COUNTS = {key: 0 for key in ALIGN_WARNING_SUMMARY}
 
 # --- Third-Party Library Imports ---
-import numpy as np
 import zarr
 from packaging.version import Version
 
@@ -2360,8 +2739,8 @@ def get_wcs_and_pretreat_raw_file(
 # ... (vos imports existants : os, shutil, time, traceback, gc, logging, np, astropy, reproject, et les modules zemosaic_...)
 
 def create_master_tile(
-    seestar_stack_group_info: list[dict], 
-    tile_id: int, 
+    seestar_stack_group_info: list[dict],
+    tile_id: int,
     output_temp_dir: str,
     # Paramètres de stacking existants
     stack_norm_method: str,
@@ -2371,12 +2750,17 @@ def create_master_tile(
     stack_kappa_high: float,
     parsed_winsor_limits: tuple[float, float],
     stack_final_combine: str,
+    poststack_equalize_rgb: bool,
     # --- NOUVEAUX PARAMÈTRES POUR LA PONDÉRATION RADIALE ---
     apply_radial_weight: bool,             # Vient de la GUI/config
     radial_feather_fraction: float,      # Vient de la GUI/config
     radial_shape_power: float,           # Pourrait être une constante ou configurable
     min_radial_weight_floor: float,
     # --- FIN NOUVEAUX PARAMÈTRES ---
+    quality_crop_enabled: bool,
+    quality_crop_band_px: int,
+    quality_crop_k_sigma: float,
+    quality_crop_margin_px: int,
     # Paramètres ASTAP (pourraient être enlevés si plus du tout utilisés ici)
     astap_exe_path_global: str, 
     astap_data_dir_global: str, 
@@ -2387,6 +2771,9 @@ def create_master_tile(
     winsor_pool_workers: int,
     progress_callback: callable,
     resource_strategy: dict | None = None,
+    center_out_context: CenterOutNormalizationContext | None = None,
+    center_out_settings: dict | None = None,
+    center_out_rank: int | None = None,
 ):
     """
     Crée une "master tuile" à partir d'un groupe d'images.
@@ -2409,6 +2796,10 @@ def create_master_tile(
             zconfig = SimpleNamespace()
     else:
         zconfig = SimpleNamespace()
+    try:
+        setattr(zconfig, "poststack_equalize_rgb", bool(poststack_equalize_rgb))
+    except Exception:
+        pass
     # Provide a generic alias for GPU usage so Phase 3 can honor the same toggle.
     try:
         if not hasattr(zconfig, 'use_gpu') and hasattr(zconfig, 'use_gpu_phase5'):
@@ -2441,9 +2832,13 @@ def create_master_tile(
     pcb_tile(f"{func_id_log_base}_info_creation_started_from_cache", prog=None, lvl="INFO",
              num_raw=len(seestar_stack_group_info), tile_id=tile_id)
     failed_groups_to_retry: list[list[dict]] = []
-    pcb_tile(f"    {func_id_log_base}_{tile_id}: Options Stacking - Norm='{stack_norm_method}', "
-             f"Weight='{stack_weight_method}' (RadialWeight={apply_radial_weight}), "
-             f"Reject='{stack_reject_algo}', Combine='{stack_final_combine}'", prog=None, lvl="DEBUG")
+    pcb_tile(
+        f"    {func_id_log_base}_{tile_id}: Options Stacking - Norm='{stack_norm_method}', "
+        f"Weight='{stack_weight_method}' (RadialWeight={apply_radial_weight}), "
+        f"Reject='{stack_reject_algo}', Combine='{stack_final_combine}', RGBEqualize={poststack_equalize_rgb}",
+        prog=None,
+        lvl="DEBUG",
+    )
 
     if not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils and ZEMOSAIC_ALIGN_STACK_AVAILABLE and zemosaic_align_stack and ASTROPY_AVAILABLE and fits): # Ajout de 'fits' pour header_mt_save
         # ... (votre gestion d'erreur de dépendances existante) ...
@@ -2590,9 +2985,11 @@ def create_master_tile(
             pass
         return (None, None), failed_groups_to_retry
     
-    pcb_tile(f"{func_id_log_base}_info_stacking_started", prog=None, lvl="DEBUG_DETAIL", 
+    pcb_tile(f"{func_id_log_base}_info_stacking_started", prog=None, lvl="DEBUG_DETAIL",
              num_to_stack=len(valid_aligned_images), tile_id=tile_id) # Les options sont loggées au début
-    
+
+    stack_metadata: dict[str, Any] = {}
+
     if stack_reject_algo == "winsorized_sigma_clip":
         master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_winsorized_sigma_clip(
             valid_aligned_images,
@@ -2601,6 +2998,7 @@ def create_master_tile(
             kappa=stack_kappa_low,
             winsor_limits=parsed_winsor_limits,
             apply_rewinsor=True,
+            stack_metadata=stack_metadata,
         )
     elif stack_reject_algo == "kappa_sigma":
         master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_kappa_sigma_clip(
@@ -2609,6 +3007,7 @@ def create_master_tile(
             zconfig=zconfig,
             sigma_low=stack_kappa_low,
             sigma_high=stack_kappa_high,
+            stack_metadata=stack_metadata,
         )
     elif stack_reject_algo == "linear_fit_clip":
         master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_linear_fit_clip(
@@ -2616,6 +3015,7 @@ def create_master_tile(
             weight_method=stack_weight_method,
             zconfig=zconfig,
             sigma=stack_kappa_high,
+            stack_metadata=stack_metadata,
         )
     else:
         master_tile_stacked_HWC = zemosaic_align_stack.stack_aligned_images(
@@ -2634,6 +3034,7 @@ def create_master_tile(
             winsor_max_workers=winsor_pool_workers,
             progress_callback=progress_callback,
             zconfig=zconfig,
+            stack_metadata=stack_metadata,
         )
     
     del valid_aligned_images; gc.collect() # valid_aligned_images a été passé par valeur (copie de la liste)
@@ -2648,17 +3049,206 @@ def create_master_tile(
         except Exception:
             pass
         return (None, None), failed_groups_to_retry
-    
-    pcb_tile(f"{func_id_log_base}_info_stacking_finished", prog=None, lvl="DEBUG_DETAIL", tile_id=tile_id, 
+
+    pcb_tile(f"{func_id_log_base}_info_stacking_finished", prog=None, lvl="DEBUG_DETAIL", tile_id=tile_id,
              shape=master_tile_stacked_HWC.shape)
              # min_val=np.nanmin(master_tile_stacked_HWC), # Peut être verbeux
-             # max_val=np.nanmax(master_tile_stacked_HWC), 
+             # max_val=np.nanmax(master_tile_stacked_HWC),
              # mean_val=np.nanmean(master_tile_stacked_HWC))
+
+    rgb_eq_info = stack_metadata.get("rgb_equalization", {})
+    try:
+        gain_r = float(rgb_eq_info.get("gain_r", 1.0))
+    except (TypeError, ValueError):
+        gain_r = 1.0
+    try:
+        gain_g = float(rgb_eq_info.get("gain_g", 1.0))
+    except (TypeError, ValueError):
+        gain_g = 1.0
+    try:
+        gain_b = float(rgb_eq_info.get("gain_b", 1.0))
+    except (TypeError, ValueError):
+        gain_b = 1.0
+    try:
+        target_median_val = float(rgb_eq_info.get("target_median", float("nan")))
+    except (TypeError, ValueError):
+        target_median_val = float("nan")
+    eq_enabled = bool(rgb_eq_info.get("enabled", False))
+    eq_applied = bool(rgb_eq_info.get("applied", False))
+    target_str = f"{target_median_val:.6g}" if np.isfinite(target_median_val) else "nan"
+    history_msg = (
+        f"RGB equalized per sub-stack (enabled={str(eq_enabled)}, applied={str(eq_applied)}): "
+        f"gains=({gain_r:.6f},{gain_g:.6f},{gain_b:.6f}), target={target_str}"
+    )
+    pcb_tile(
+        f"[RGB-EQ] poststack_equalize_rgb enabled={eq_enabled}, applied={eq_applied}, "
+        f"gains=({gain_r:.6f},{gain_g:.6f},{gain_b:.6f}), target={target_str}",
+        prog=None,
+        lvl="INFO" if eq_enabled else "DEBUG_DETAIL",
+    )
+
+    norm_result = None
+    norm_mode = "disabled"
+    norm_details: dict = {}
+    if center_out_context and isinstance(center_out_settings, dict):
+        try:
+            norm_settings = {
+                "enabled": bool(center_out_settings.get("enabled", True)),
+                "preview_size": int(center_out_settings.get("preview_size", 256)),
+                "sky_percentile": tuple(center_out_settings.get("sky_percentile", (25.0, 60.0))),
+                "clip_sigma": float(center_out_settings.get("clip_sigma", 2.5)),
+                "min_overlap_fraction": float(center_out_settings.get("min_overlap_fraction", 0.03)),
+            }
+        except Exception:
+            norm_settings = {"enabled": False}
+        if norm_settings.get("enabled", False):
+            master_tile_stacked_HWC, norm_result, norm_mode, norm_details = apply_center_out_normalization_p3(
+                master_tile_stacked_HWC,
+                wcs_for_master_tile,
+                tile_id,
+                center_out_context,
+                norm_settings,
+                pcb_tile,
+            )
+            if norm_result:
+                pcb_tile(
+                    f"{func_id_log_base}_center_out_applied",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                    tile_id=tile_id,
+                    gain=f"{norm_result[0]:.6f}",
+                    offset=f"{norm_result[1]:.6f}",
+                    mode=norm_mode,
+                    samples=norm_details.get("samples"),
+                )
+            else:
+                pcb_tile(
+                    f"{func_id_log_base}_center_out_skipped",
+                    prog=None,
+                    lvl="DEBUG_DETAIL",
+                    tile_id=tile_id,
+                    reason=norm_mode,
+                )
+
+    quality_crop_rect: tuple[int, int, int, int] | None = None
+    if quality_crop_enabled:
+        try:
+            band_px = max(4, int(quality_crop_band_px))
+        except Exception:
+            band_px = 32
+        try:
+            margin_px = max(0, int(quality_crop_margin_px))
+        except Exception:
+            margin_px = 8
+        try:
+            k_sigma = float(quality_crop_k_sigma)
+            if not math.isfinite(k_sigma):
+                raise ValueError("k_sigma not finite")
+        except Exception:
+            k_sigma = 2.0
+        k_sigma = max(0.1, min(k_sigma, 10.0))
+
+        data_for_crop = np.asarray(master_tile_stacked_HWC)
+        axis_mode = "HWC"
+        if data_for_crop.ndim == 3 and data_for_crop.shape[0] == 3 and data_for_crop.shape[-1] != 3:
+            data_for_crop = np.moveaxis(data_for_crop, 0, -1)
+            axis_mode = "CHW"
+        elif data_for_crop.ndim == 2:
+            data_for_crop = data_for_crop[..., np.newaxis]
+            axis_mode = "HW"
+
+        try:
+            if data_for_crop.ndim < 3:
+                raise ValueError("insufficient dimensions for quality crop")
+
+            if data_for_crop.shape[-1] >= 3:
+                R = data_for_crop[..., 0]
+                G = data_for_crop[..., 1]
+                B = data_for_crop[..., 2]
+            else:
+                mono = data_for_crop[..., 0]
+                R = G = B = mono
+
+            lum2d = np.nanmean(np.stack([R, G, B], axis=0), axis=0).astype(np.float32)
+            R = np.nan_to_num(np.asarray(R, dtype=np.float32), nan=0.0)
+            G = np.nan_to_num(np.asarray(G, dtype=np.float32), nan=0.0)
+            B = np.nan_to_num(np.asarray(B, dtype=np.float32), nan=0.0)
+            lum2d = np.nan_to_num(lum2d, nan=0.0)
+
+            from .lecropper import detect_autocrop_rgb
+
+            y0, x0, y1, x1 = detect_autocrop_rgb(
+                lum2d,
+                R,
+                G,
+                B,
+                band_px=band_px,
+                k_sigma=k_sigma,
+                margin_px=margin_px,
+            )
+
+            h_lum, w_lum = lum2d.shape
+            if not (0 <= y0 < y1 <= h_lum and 0 <= x0 < x1 <= w_lum):
+                raise ValueError("invalid crop rectangle")
+
+            crop_area = (y1 - y0) * (x1 - x0)
+            full_area = h_lum * w_lum
+            if crop_area <= 0 or (crop_area / max(1, full_area)) >= 0.97:
+                pcb_tile(
+                    f"MT_CROP: quality crop skipped (rect={y0,x0,y1,x1}, area_ratio={crop_area/max(1, full_area):.3f})",
+                    prog=None,
+                    lvl="WARN",
+                )
+            else:
+                cropped = data_for_crop[y0:y1, x0:x1, ...]
+                if axis_mode == "CHW":
+                    master_tile_stacked_HWC = np.moveaxis(cropped, -1, 0)
+                elif axis_mode == "HW":
+                    master_tile_stacked_HWC = cropped[..., 0]
+                else:
+                    master_tile_stacked_HWC = cropped
+                quality_crop_rect = (int(y0), int(x0), int(y1), int(x1))
+
+                if wcs_for_master_tile is not None:
+                    try:
+                        if hasattr(wcs_for_master_tile, "deepcopy"):
+                            wcs_cropped = wcs_for_master_tile.deepcopy()
+                        else:
+                            wcs_cropped = copy.deepcopy(wcs_for_master_tile)
+                    except Exception:
+                        wcs_cropped = None
+
+                    if wcs_cropped is not None and hasattr(wcs_cropped, "wcs"):
+                        try:
+                            wcs_cropped.wcs.crpix[0] -= x0
+                            wcs_cropped.wcs.crpix[1] -= y0
+                        except Exception as e_crpix:
+                            pcb_tile(
+                                f"MT_CROP: quality-based WCS shift failed: {e_crpix}",
+                                prog=None,
+                                lvl="WARN",
+                            )
+                        else:
+                            wcs_for_master_tile = wcs_cropped
+                    elif wcs_cropped is not None:
+                        wcs_for_master_tile = wcs_cropped
+
+                pcb_tile(
+                    f"MT_CROP: quality-based rect={quality_crop_rect} (band={band_px}, k={k_sigma:.2f}, margin={margin_px})",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                )
+        except Exception as e_crop:
+            pcb_tile(
+                f"MT_CROP: quality-based crop failed ({e_crop})",
+                prog=None,
+                lvl="WARN",
+            )
 
     # pcb_tile(f"{func_id_log_base}_info_saving_started", prog=None, lvl="DEBUG_DETAIL", tile_id=tile_id)
     temp_fits_filename = f"master_tile_{tile_id:03d}.fits"
     temp_fits_filepath = os.path.join(output_temp_dir,temp_fits_filename)
-    
+
     try:
         # Créer un nouvel objet Header pour la sauvegarde
         header_mt_save = fits.Header()
@@ -2695,6 +3285,15 @@ def create_master_tile(
         else:
             header_mt_save['ZMT_RADW'] = (False, 'Radial weighting applied')
 
+        header_mt_save['RGBGAINR'] = (gain_r, 'RGB equalization gain (red)')
+        header_mt_save['RGBGAING'] = (gain_g, 'RGB equalization gain (green)')
+        header_mt_save['RGBGAINB'] = (gain_b, 'RGB equalization gain (blue)')
+        header_mt_save['RGBEQMED'] = (target_median_val, 'RGB equalization target median')
+        try:
+            header_mt_save.add_history(history_msg)
+        except Exception:
+            header_mt_save['HISTORY'] = history_msg
+
         header_mt_save['ZMT_REJ'] = (str(stack_reject_algo), 'Rejection algorithm')
         if stack_reject_algo == "kappa_sigma":
             header_mt_save['ZMT_KAPLO'] = (stack_kappa_low, 'Kappa Sigma Low threshold')
@@ -2706,7 +3305,26 @@ def create_master_tile(
             header_mt_save['ZMT_KAPLO'] = (stack_kappa_low, 'Kappa Low for Winsorized')
             header_mt_save['ZMT_KAPHI'] = (stack_kappa_high, 'Kappa High for Winsorized')
         header_mt_save['ZMT_COMB'] = (str(stack_final_combine), 'Final combine method')
-        
+
+        if center_out_context and center_out_settings:
+            header_mt_save['ZMT_ANCH'] = (
+                int(center_out_context.anchor_original_id),
+                'Anchor tile id (original index)'
+            )
+            if norm_result:
+                header_mt_save['ZMT_P3CO'] = (1, 'Phase 3 center-out normalization applied')
+                header_mt_save['ZMT_AGAIN'] = (float(norm_result[0]), 'Phase 3 center-out gain')
+                header_mt_save['ZMT_AOFF'] = (float(norm_result[1]), 'Phase 3 center-out offset')
+            else:
+                header_mt_save['ZMT_P3CO'] = (0, 'Phase 3 center-out normalization applied')
+                header_mt_save['ZMT_AGAIN'] = (1.0, 'Phase 3 center-out gain')
+                header_mt_save['ZMT_AOFF'] = (0.0, 'Phase 3 center-out offset')
+        else:
+            header_mt_save['ZMT_P3CO'] = (0, 'Phase 3 center-out normalization applied')
+            header_mt_save['ZMT_AGAIN'] = (1.0, 'Phase 3 center-out gain')
+            header_mt_save['ZMT_AOFF'] = (0.0, 'Phase 3 center-out offset')
+            header_mt_save['ZMT_ANCH'] = (-1, 'Anchor tile id (original index)')
+
         if header_for_master_tile_base: # C'est déjà un objet fits.Header
             ref_path_raw_for_hdr = seestar_stack_group_info[reference_image_index_in_group].get('path_raw', 'UnknownRef')
             header_mt_save['ZMT_REF'] = (os.path.basename(ref_path_raw_for_hdr), 'Reference raw frame for this tile WCS')
@@ -2732,6 +3350,22 @@ def create_master_tile(
             header_mt_save['EXPTOTAL']=(round(total_exposure_tile,2),'[s] Sum of EXPTIME for this tile')
             header_mt_save['NEXP_SUM']=(num_exposure_summed,'Number of exposures summed for EXPTOTAL')
 
+
+        if quality_crop_rect and "CRPIX1" in header_mt_save and "CRPIX2" in header_mt_save:
+            try:
+                header_mt_save["CRPIX1"] = header_mt_save.get("CRPIX1", 0.0) - quality_crop_rect[1]
+                header_mt_save["CRPIX2"] = header_mt_save.get("CRPIX2", 0.0) - quality_crop_rect[0]
+            except Exception:
+                pass
+
+        if quality_crop_rect:
+            header_mt_save['ZMT_QCRO'] = (True, 'Quality-based crop applied')
+            header_mt_save['ZMT_QBOX'] = (
+                "{},{},{},{}".format(*quality_crop_rect),
+                'Quality crop rectangle (y0,x0,y1,x1)',
+            )
+        else:
+            header_mt_save['ZMT_QCRO'] = (False, 'Quality-based crop applied')
 
         zemosaic_utils.save_fits_image(
             image_data=master_tile_stacked_HWC,
@@ -3628,16 +4262,22 @@ def run_hierarchical_mosaic(
     stack_kappa_high: float,
     parsed_winsor_limits: tuple[float, float],
     stack_final_combine: str,
+    poststack_equalize_rgb_config: bool,
     apply_radial_weight_config: bool,
     radial_feather_fraction_config: float,
     radial_shape_power_config: float,
     min_radial_weight_floor_config: float,
     final_assembly_method_config: str,
     num_base_workers_config: int,
-        # --- ARGUMENTS POUR LE ROGNAGE ---
+    # --- ARGUMENTS POUR LE ROGNAGE ---
     apply_master_tile_crop_config: bool,
     master_tile_crop_percent_config: float,
+    quality_crop_enabled_config: bool,
+    quality_crop_band_px_config: int,
+    quality_crop_k_sigma_config: float,
+    quality_crop_margin_px_config: int,
     save_final_as_uint16_config: bool,
+    legacy_rgb_cube_config: bool,
 
     coadd_use_memmap_config: bool,
     coadd_memmap_dir_config: str,
@@ -3653,6 +4293,11 @@ def run_hierarchical_mosaic(
     intertile_sky_percentile_config: tuple[float, float] | list[float] = (30.0, 70.0),
     intertile_robust_clip_sigma_config: float = 2.5,
     use_auto_intertile_config: bool = False,
+    center_out_normalization_p3_config: bool = True,
+    p3_center_sky_percentile_config: tuple[float, float] | list[float] = (25.0, 60.0),
+    p3_center_robust_clip_sigma_config: float = 2.5,
+    p3_center_preview_size_config: int = 256,
+    p3_center_min_overlap_fraction_config: float = 0.03,
     use_gpu_phase5: bool = False,
     gpu_id_phase5: int | None = None,
     logging_level_config: str = "INFO",
@@ -3761,13 +4406,13 @@ def run_hierarchical_mosaic(
                 return None
 
 
-    # Seuil de clustering : valeur de repli à 0.18° si l'option est absente ou non positive
+    # Seuil de clustering : valeur de repli à 0.05° si l'option est absente ou non positive
     try:
         cluster_threshold = float(cluster_threshold_config or 0)
     except (TypeError, ValueError):
         cluster_threshold = 0
     SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG = (
-        cluster_threshold if cluster_threshold > 0 else 0.18
+        cluster_threshold if cluster_threshold > 0 else 0.05
 
     )
     # Orientation split threshold (degrees). 0 disables orientation filtering
@@ -3851,7 +4496,15 @@ def run_hierarchical_mosaic(
     )
     pcb(f"  Config ASTAP: Exe='{os.path.basename(astap_exe_path) if astap_exe_path else 'N/A'}', Data='{os.path.basename(astap_data_dir_param) if astap_data_dir_param else 'N/A'}', Radius={astap_search_radius_config}deg, Downsample={astap_downsample_config}, Sens={astap_sensitivity_config}", prog=None, lvl="DEBUG_DETAIL")
     pcb(f"  Config Workers (GUI): Base demandé='{num_base_workers_config}' (0=auto)", prog=None, lvl="DEBUG_DETAIL")
-    pcb(f"  Options Stacking (Master Tuiles): Norm='{stack_norm_method}', Weight='{stack_weight_method}', Reject='{stack_reject_algo}', Combine='{stack_final_combine}', RadialWeight={apply_radial_weight_config} (Feather={radial_feather_fraction_config if apply_radial_weight_config else 'N/A'}, Power={radial_shape_power_config if apply_radial_weight_config else 'N/A'}, Floor={min_radial_weight_floor_config if apply_radial_weight_config else 'N/A'})", prog=None, lvl="DEBUG_DETAIL")
+    pcb(
+        f"  Options Stacking (Master Tuiles): Norm='{stack_norm_method}', Weight='{stack_weight_method}', Reject='{stack_reject_algo}', "
+        f"Combine='{stack_final_combine}', RGBEqualize={poststack_equalize_rgb_config}, RadialWeight={apply_radial_weight_config} "
+        f"(Feather={radial_feather_fraction_config if apply_radial_weight_config else 'N/A'}, "
+        f"Power={radial_shape_power_config if apply_radial_weight_config else 'N/A'}, "
+        f"Floor={min_radial_weight_floor_config if apply_radial_weight_config else 'N/A'})",
+        prog=None,
+        lvl="DEBUG_DETAIL",
+    )
     pcb(f"  Options Assemblage Final: Méthode='{final_assembly_method_config}'", prog=None, lvl="DEBUG_DETAIL")
 
     time_per_raw_file_wcs = None; time_per_master_tile_creation = None
@@ -5002,6 +5655,52 @@ def run_hierarchical_mosaic(
         
     master_tiles_results_list_temp = {}
     start_time_phase3 = time.monotonic()
+
+    tile_id_order = list(range(len(seestar_stack_groups)))
+    center_out_context: CenterOutNormalizationContext | None = None
+    center_out_settings = {
+        "enabled": bool(center_out_normalization_p3_config),
+        "sky_percentile": tuple((p3_center_sky_percentile_config or (25.0, 60.0))[:2]) if isinstance(p3_center_sky_percentile_config, (list, tuple)) else (25.0, 60.0),
+        "clip_sigma": float(p3_center_robust_clip_sigma_config),
+        "preview_size": int(p3_center_preview_size_config),
+        "min_overlap_fraction": float(p3_center_min_overlap_fraction_config),
+    }
+    if center_out_settings["enabled"] and seestar_stack_groups:
+        order_info = _compute_center_out_order(seestar_stack_groups)
+        distances = {}
+        global_center_coord = None
+        if order_info:
+            ordered_indices, global_center_coord, distances = order_info
+            try:
+                seestar_stack_groups = [seestar_stack_groups[i] for i in ordered_indices]
+                tile_id_order = ordered_indices
+            except Exception:
+                tile_id_order = list(range(len(seestar_stack_groups)))
+            try:
+                pcb(
+                    "phase3_center_out_plan",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                    anchor=int(tile_id_order[0]) if tile_id_order else None,
+                    center_ra=f"{global_center_coord.ra.deg:.6f}" if global_center_coord else None,
+                    center_dec=f"{global_center_coord.dec.deg:.6f}" if global_center_coord else None,
+                )
+            except Exception:
+                pass
+        else:
+            distances = {}
+            global_center_coord = None
+        if tile_id_order:
+            center_out_context = CenterOutNormalizationContext(
+                anchor_tile_original_id=tile_id_order[0],
+                ordered_tile_ids=tile_id_order,
+                tile_distances=distances,
+                settings=center_out_settings,
+                global_center=global_center_coord,
+                logger_instance=logger,
+            )
+    else:
+        center_out_settings["enabled"] = False
     
     # Calcul des workers pour la Phase 3 (alignement/stacking des groupes)
     actual_num_workers_ph3 = _compute_phase_workers(
@@ -5160,7 +5859,7 @@ def run_hierarchical_mosaic(
     pending_futures: set = set()
     next_dynamic_tile_id = num_seestar_stacks_to_process
 
-    def _submit_master_tile_group(group_info_list: list[dict], assigned_tile_id: int) -> None:
+    def _submit_master_tile_group(group_info_list: list[dict], assigned_tile_id: int, processing_rank: int | None = None) -> None:
         future = executor_ph3.submit(
             create_master_tile,
             group_info_list,
@@ -5169,19 +5868,27 @@ def run_hierarchical_mosaic(
             stack_norm_method, stack_weight_method, stack_reject_algo,
             stack_kappa_low, stack_kappa_high, parsed_winsor_limits,
             stack_final_combine,
+            poststack_equalize_rgb_config,
             apply_radial_weight_config, radial_feather_fraction_config,
             radial_shape_power_config, min_radial_weight_floor_config,
+            quality_crop_enabled_config, quality_crop_band_px_config,
+            quality_crop_k_sigma_config, quality_crop_margin_px_config,
             astap_exe_path, astap_data_dir_param, astap_search_radius_config,
             astap_downsample_config, astap_sensitivity_config, 180,
             winsor_worker_limit,
             progress_callback,
             resource_strategy=auto_resource_strategy,
+            center_out_context=center_out_context,
+            center_out_settings=center_out_settings if center_out_context else None,
+            center_out_rank=processing_rank,
         )
         future_to_tile_id[future] = assigned_tile_id
         pending_futures.add(future)
 
-    for i_stk, sg_info_list in enumerate(seestar_stack_groups):
-        _submit_master_tile_group(sg_info_list, i_stk)
+    for proc_idx, sg_info_list in enumerate(seestar_stack_groups):
+        assigned_tile_id = tile_id_order[proc_idx] if proc_idx < len(tile_id_order) else proc_idx
+        rank = center_out_context.get_rank(assigned_tile_id) if center_out_context else proc_idx
+        _submit_master_tile_group(sg_info_list, assigned_tile_id, rank)
 
     start_time_loop_ph3 = time.time()
     last_time_loop_ph3 = start_time_loop_ph3
@@ -5262,7 +5969,8 @@ def run_hierarchical_mosaic(
                             new_tile=new_tile_id,
                             frames=len(filtered_retry_group),
                         )
-                        _submit_master_tile_group(filtered_retry_group, new_tile_id)
+                        retry_rank = center_out_context.get_rank(new_tile_id) if center_out_context else None
+                        _submit_master_tile_group(filtered_retry_group, new_tile_id, retry_rank)
                         pcb(
                             f"MASTER_TILE_COUNT_UPDATE:{tiles_processed_count_ph3}/{num_seestar_stacks_to_process}",
                             prog=None,
@@ -5396,7 +6104,17 @@ def run_hierarchical_mosaic(
     base_progress_phase5 = current_global_progress
     pcb("PHASE_UPDATE:5", prog=None, lvl="ETA_LEVEL")
     USE_INCREMENTAL_ASSEMBLY = (final_assembly_method_config == "incremental")
-    _log_memory_usage(progress_callback, f"Début Phase 5 (Méthode: {final_assembly_method_config}, Rognage MT Appliqué: {apply_master_tile_crop_config}, %Rognage: {master_tile_crop_percent_config if apply_master_tile_crop_config else 'N/A'})") # Log mis à jour
+    apply_crop_for_assembly = bool(apply_master_tile_crop_config and not quality_crop_enabled_config)
+    _log_memory_usage(
+        progress_callback,
+        (
+            "Début Phase 5 (Méthode: "
+            f"{final_assembly_method_config}, "
+            f"Rognage MT Appliqué: {apply_crop_for_assembly}, "
+            f"QualityCrop: {quality_crop_enabled_config}, "
+            f"%Rognage: {master_tile_crop_percent_config if apply_crop_for_assembly else 'N/A'})"
+        ),
+    )
     
     valid_master_tiles_for_assembly = []
     for mt_p, mt_w in master_tiles_results_list:
@@ -5434,7 +6152,7 @@ def run_hierarchical_mosaic(
                     final_output_shape_hw=final_output_shape_hw,
                     progress_callback=progress_callback,
                     n_channels=3,
-                    apply_crop=apply_master_tile_crop_config,
+                    apply_crop=apply_crop_for_assembly,
                     crop_percent=master_tile_crop_percent_config,
                     processing_threads=assembly_process_workers_config,
                     memmap_dir=inc_memmap_dir,
@@ -5448,7 +6166,7 @@ def run_hierarchical_mosaic(
                     final_output_shape_hw=final_output_shape_hw,
                     progress_callback=progress_callback,
                     n_channels=3,
-                    apply_crop=apply_master_tile_crop_config,
+                    apply_crop=apply_crop_for_assembly,
                     crop_percent=master_tile_crop_percent_config,
                     processing_threads=assembly_process_workers_config,
                     memmap_dir=inc_memmap_dir,
@@ -5461,7 +6179,7 @@ def run_hierarchical_mosaic(
                 final_output_shape_hw=final_output_shape_hw,
                 progress_callback=progress_callback,
                 n_channels=3,
-                apply_crop=apply_master_tile_crop_config,
+                apply_crop=apply_crop_for_assembly,
                 crop_percent=master_tile_crop_percent_config,
                 processing_threads=assembly_process_workers_config,
                 memmap_dir=inc_memmap_dir,
@@ -5486,7 +6204,7 @@ def run_hierarchical_mosaic(
                     progress_callback=progress_callback,
                     n_channels=3,
                     match_bg=True,
-                    apply_crop=apply_master_tile_crop_config,
+                    apply_crop=apply_crop_for_assembly,
                     crop_percent=master_tile_crop_percent_config,
                     use_gpu=True,
                     base_progress_phase5=base_progress_phase5,
@@ -5508,7 +6226,7 @@ def run_hierarchical_mosaic(
                     progress_callback=progress_callback,
                     n_channels=3,
                     match_bg=True,
-                    apply_crop=apply_master_tile_crop_config,
+                    apply_crop=apply_crop_for_assembly,
                     crop_percent=master_tile_crop_percent_config,
                     use_gpu=False,
                     use_memmap=bool(coadd_use_memmap_config),
@@ -5532,7 +6250,7 @@ def run_hierarchical_mosaic(
                 progress_callback=progress_callback,
                 n_channels=3,
                 match_bg=True,
-                apply_crop=apply_master_tile_crop_config,
+                apply_crop=apply_crop_for_assembly,
                 crop_percent=master_tile_crop_percent_config,
                 use_gpu=use_gpu_phase5_flag,
                 use_memmap=bool(coadd_use_memmap_config),
@@ -5576,7 +6294,7 @@ def run_hierarchical_mosaic(
         try: final_header.update(final_output_wcs.to_header(relax=True))
         except Exception as e_hdr_wcs: pcb("run_warn_phase6_wcs_to_header_failed", error=str(e_hdr_wcs), lvl="WARN")
     
-    final_header['SOFTWARE']=('ZeMosaic v2.9.6','Mosaic Software') # Incrémente la version si tu le souhaites
+    final_header['SOFTWARE']=('ZeMosaic v3.0.0','Mosaic Software') # Incrémente la version si tu le souhaites
     final_header['NMASTILE']=(len(master_tiles_results_list),"Master Tiles combined")
     final_header['NRAWINIT']=(num_total_raw_files,"Initial raw images found")
     final_header['NRAWPROC']=(len(all_raw_files_processed_info),"Raw images with WCS processed")
@@ -5599,15 +6317,41 @@ def run_hierarchical_mosaic(
     try:
         if not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils): 
             raise RuntimeError("zemosaic_utils non disponible pour sauvegarde FITS.")
-        zemosaic_utils.save_fits_image(
-            image_data=final_mosaic_data_HWC,
-            output_path=final_fits_path,
-            header=final_header,
-            overwrite=True,
-            save_as_float=not save_final_as_uint16_config,
-            progress_callback=progress_callback,
-            axis_order="HWC",
-        )
+        legacy_rgb_flag = bool(legacy_rgb_cube_config)
+        if bool(save_final_as_uint16_config) and not legacy_rgb_flag:
+            if not hasattr(zemosaic_utils, "write_final_fits_uint16_color_aware"):
+                raise RuntimeError("write_final_fits_uint16_color_aware unavailable in zemosaic_utils")
+            is_rgb = (
+                isinstance(final_mosaic_data_HWC, np.ndarray)
+                and final_mosaic_data_HWC.ndim == 3
+                and final_mosaic_data_HWC.shape[-1] == 3
+            )
+            zemosaic_utils.write_final_fits_uint16_color_aware(
+                final_fits_path,
+                final_mosaic_data_HWC,
+                header=final_header,
+                force_rgb_planes=is_rgb,
+                legacy_rgb_cube=legacy_rgb_flag,
+                overwrite=True,
+            )
+            if is_rgb:
+                pcb(
+                    "run_info_phase6_saved_uint16_rgb_planes",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                    filename=os.path.basename(final_fits_path),
+                )
+        else:
+            zemosaic_utils.save_fits_image(
+                image_data=final_mosaic_data_HWC,
+                output_path=final_fits_path,
+                header=final_header,
+                overwrite=True,
+                save_as_float=not save_final_as_uint16_config,
+                legacy_rgb_cube=legacy_rgb_flag,
+                progress_callback=progress_callback,
+                axis_order="HWC",
+            )
         
         if final_mosaic_coverage_HW is not None and np.any(final_mosaic_coverage_HW):
             coverage_path = os.path.join(output_folder, f"{output_base_name}_coverage.fits")

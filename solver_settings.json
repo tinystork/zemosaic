@@ -8,5 +8,6 @@
   "astap_data_directory_path": "C:/Program Files/astap",
   "astap_search_radius_deg": 3.0,
   "astap_downsample": 2,
-  "astap_sensitivity": 100
+  "astap_sensitivity": 100,
+  "use_auto_intertile": false
 }
