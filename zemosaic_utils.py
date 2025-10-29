@@ -2500,6 +2500,51 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
                 match_background = False
     except Exception:
         pass
+
+    # When affine corrections are present, align per-tile medians to a global median
+    # computed after applying the affine. This mirrors the CPU path where tiles are
+    # effectively brought to a common baseline before coaddition.
+    tile_scale_factors: list[float] | None = None
+    try:
+        if tile_affine is not None:
+            med_list: list[float] = []
+            for idx_tile, img_np in enumerate(data_list):
+                try:
+                    g, o = tile_affine[idx_tile]
+                except Exception:
+                    g, o = 1.0, 0.0
+                try:
+                    arr32 = np.asarray(img_np, dtype=np.float32)
+                    # median of affine-applied values on CPU for robustness
+                    med = float(np.nanmedian(arr32 * g + o))
+                except Exception:
+                    med = float("nan")
+                med_list.append(med)
+
+            # Compute global median of tile medians
+            try:
+                finite_meds = [m for m in med_list if np.isfinite(m)]
+                global_median = float(np.nanmedian(finite_meds)) if finite_meds else 0.0
+            except Exception:
+                global_median = 0.0
+
+            # Build multiplicative scale to anchor each tile to the common median
+            tile_scale_factors = []
+            for m in med_list:
+                if np.isfinite(m) and abs(m) > 1e-8:
+                    tile_scale_factors.append(float(global_median / m))
+                else:
+                    tile_scale_factors.append(1.0)
+            try:
+                import logging
+                logging.getLogger(__name__).debug(
+                    "[GPU Reproj] Applied median renormalization: global_median=%.6g",
+                    global_median,
+                )
+            except Exception:
+                pass
+    except Exception:
+        tile_scale_factors = None
     
     # Estimate the minimum amount of memory required just for the accumulators.
     accumulator_bytes = 2 * H * W * float32_bytes
@@ -2672,6 +2717,15 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
                     img = img * cp.float32(g)
                 if o != 0.0:
                     img = img + cp.float32(o)
+            except Exception:
+                pass
+
+        # After affine, optionally scale tile to align its median to the global median
+        if tile_scale_factors is not None:
+            try:
+                s = tile_scale_factors[idx_tile]
+                if s != 1.0 and np.isfinite(s):
+                    img = img * cp.float32(s)
             except Exception:
                 pass
         if match_background:
