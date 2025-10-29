@@ -2769,6 +2769,7 @@ def create_master_tile(
     astap_sensitivity_global: int,
     astap_timeout_seconds_global: int,
     winsor_pool_workers: int,
+    winsor_max_frames_per_pass: int,
     progress_callback: callable,
     resource_strategy: dict | None = None,
     center_out_context: CenterOutNormalizationContext | None = None,
@@ -2995,6 +2996,8 @@ def create_master_tile(
             kappa=stack_kappa_low,
             winsor_limits=parsed_winsor_limits,
             apply_rewinsor=True,
+            winsor_max_frames_per_pass=int(winsor_max_frames_per_pass) if winsor_max_frames_per_pass is not None else 0,
+            winsor_max_workers=int(winsor_pool_workers) if winsor_pool_workers is not None else 1,
             stack_metadata=stack_metadata,
         )
     elif stack_reject_algo == "kappa_sigma":
@@ -5799,6 +5802,43 @@ def run_hierarchical_mosaic(
                 )
     except Exception:
         pass
+    # RAM-aware cap for Phase 3: estimate per-job footprint and clamp concurrency
+    try:
+        avail_bytes = int(psutil.virtual_memory().available)
+        # Determine per-frame bytes via a sample cached image when possible
+        per_frame_bytes = None
+        try:
+            sample_cache = None
+            if seestar_stack_groups and seestar_stack_groups[0]:
+                sample_cache = seestar_stack_groups[0][0].get('path_preprocessed_cache')
+            if sample_cache and os.path.exists(sample_cache):
+                _arr = np.load(sample_cache, mmap_mode='r')
+                per_frame_bytes = int(_arr.size) * int(_arr.dtype.itemsize)
+                _arr = None
+        except Exception:
+            per_frame_bytes = None
+        if per_frame_bytes is None or per_frame_bytes <= 0:
+            # Conservative default (Seestar 1080x1920 RGB float32)
+            per_frame_bytes = 1080 * 1920 * 3 * 4
+        frames_per_pass = int(winsor_max_frames_per_pass) if winsor_max_frames_per_pass and int(winsor_max_frames_per_pass) > 0 else 256
+        fudge = 2.0
+        per_job_bytes = int(max(1, frames_per_pass) * per_frame_bytes * fudge)
+        allowed = int(avail_bytes * 0.6)
+        max_by_ram = max(1, allowed // max(1, per_job_bytes))
+        prev_workers = actual_num_workers_ph3
+        actual_num_workers_ph3 = max(1, min(actual_num_workers_ph3, int(max_by_ram)))
+        if actual_num_workers_ph3 != prev_workers:
+            try:
+                mb_per_job = per_job_bytes / (1024.0 * 1024.0)
+                pcb(
+                    f"RAM_CAP: Phase 3 workers {prev_workers} -> {actual_num_workers_ph3} (frames/pass={frames_per_pass}, per-job~{mb_per_job:.1f}MB)",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
     pcb(
         f"WORKERS_PHASE3: Utilisation de {actual_num_workers_ph3} worker(s). (Base: {effective_base_workers}, Ratio {ALIGNMENT_PHASE_WORKER_RATIO*100:.0f}%, Groupes: {num_seestar_stacks_to_process})",
         prog=None,
@@ -5933,6 +5973,7 @@ def run_hierarchical_mosaic(
             astap_exe_path, astap_data_dir_param, astap_search_radius_config,
             astap_downsample_config, astap_sensitivity_config, 180,
             winsor_worker_limit,
+            winsor_max_frames_per_pass,
             progress_callback,
             resource_strategy=auto_resource_strategy,
             center_out_context=center_out_context,
@@ -6047,6 +6088,17 @@ def run_hierarchical_mosaic(
                     error=str(exc_thread_ph3),
                 )
                 logger.error(f"Exception Phase 3 pour stack {int(tile_id_for_future) + 1}:", exc_info=True)
+            finally:
+                # Aggressively free CuPy memory pools between tiles to avoid device/pinned host growth
+                try:
+                    if ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils and hasattr(zemosaic_utils, "free_cupy_memory_pools"):
+                        zemosaic_utils.free_cupy_memory_pools()
+                except Exception:
+                    pass
+                try:
+                    gc.collect()
+                except Exception:
+                    pass
 
             if tiles_processed_count_ph3 % max(1, num_seestar_stacks_to_process // 5) == 0 or tiles_processed_count_ph3 == num_seestar_stacks_to_process:
                  _log_memory_usage(progress_callback, f"Phase 3 - Traité {tiles_processed_count_ph3}/{num_seestar_stacks_to_process} tuiles")
