@@ -767,28 +767,54 @@ def stack_winsorized_sigma_clip(
         if derived_list:
             sanitized_arrays = []
             for idx, arr in enumerate(derived_list):
+                frame_shape = _np.asarray(frames_np_for_weights[idx]).shape if idx < len(frames_np_for_weights) else None
                 if arr is not None:
-                    sanitized_arrays.append(_np.asarray(arr, dtype=_np.float32))
+                    w_arr = _np.asarray(arr, dtype=_np.float32, copy=False)
+                    # Ensure compact per-frame weight: (1,1,C) for color or (1,) for mono/scalar
+                    if frame_shape is not None and len(frame_shape) == 3 and frame_shape[-1] == 3:
+                        if w_arr.ndim == 0:
+                            w_arr = _np.full((1, 1, 3), float(w_arr), dtype=_np.float32)
+                        elif w_arr.ndim == 1 and w_arr.shape[0] == 3:
+                            w_arr = w_arr.reshape((1, 1, 3))
+                        else:
+                            # Last resort: reduce to per-channel mean and broadcast to (1,1,3)
+                            try:
+                                chv = _np.nanmean(w_arr, axis=(0, 1)) if w_arr.ndim >= 2 else _np.asarray(w_arr)
+                                chv = _np.asarray(chv, dtype=_np.float32).reshape((1, 1, -1))
+                                if chv.shape[-1] == 3:
+                                    w_arr = chv
+                                else:
+                                    w_arr = _np.ones((1, 1, 3), dtype=_np.float32)
+                            except Exception:
+                                w_arr = _np.ones((1, 1, 3), dtype=_np.float32)
+                    else:
+                        # Monochrome target: scalar as (1,)
+                        if w_arr.ndim > 0:
+                            try:
+                                val = float(_np.nanmean(w_arr))
+                            except Exception:
+                                val = 1.0
+                            w_arr = _np.asarray([val], dtype=_np.float32)
+                        else:
+                            w_arr = w_arr.reshape((1,))
+                    sanitized_arrays.append(w_arr)
                 else:
-                    sanitized_arrays.append(_np.ones_like(frames_np_for_weights[idx], dtype=_np.float32))
+                    # Default unit weight in compact form
+                    if frame_shape is not None and len(frame_shape) == 3 and frame_shape[-1] == 3:
+                        sanitized_arrays.append(_np.ones((1, 1, 3), dtype=_np.float32))
+                    else:
+                        sanitized_arrays.append(_np.ones((1,), dtype=_np.float32))
+            # Stack into (N, 1[,1[,C]])
             weights_array_full = _np.stack(sanitized_arrays, axis=0)
             weight_stats = quality_stats
         del frames_np_for_weights
 
     if weights_array_full is not None:
+        # Keep compact shape and defer broadcasting to the compute sites
         weights_array_full = _np.asarray(weights_array_full, dtype=_np.float32, copy=False)
         if weights_array_full.ndim == 1:
-            extra_dims = (1,) * sample.ndim
-            weights_array_full = weights_array_full.reshape((weights_array_full.shape[0],) + extra_dims)
-        try:
-            weights_array_full = _np.broadcast_to(
-                weights_array_full,
-                (len(frames_list),) + sample.shape,
-            ).astype(_np.float32, copy=False)
-        except ValueError as exc:
-            raise ValueError(
-                f"weights shape {weights_array_full.shape} not broadcastable to {(len(frames_list),) + sample.shape}"
-            ) from exc
+            # (N,) -> (N,1)
+            weights_array_full = weights_array_full.reshape((weights_array_full.shape[0], 1))
         if weight_stats is None:
             try:
                 weight_stats = {
@@ -1601,13 +1627,13 @@ def _normalize_images_sky_mean(image_list: list[np.ndarray | None],
 
 
 
-def _calculate_image_weights_noise_variance(image_list: list[np.ndarray | None], 
-                                            progress_callback: callable = None) -> list[np.ndarray | None]:
+def _calculate_image_weights_noise_variance(
+    image_list: list[np.ndarray | None],
+    progress_callback: callable = None,
+) -> list[np.ndarray | None]:
     """
-    Calcule les poids pour une liste d'images basés sur l'inverse de la variance du bruit.
-    Le bruit est estimé à partir des statistiques sigma-clippées.
-    Pour les images couleur, les poids sont calculés et appliqués PAR CANAL.
-    Retourne une liste de tableaux de poids (HWC ou HW), de même forme que les images d'entrée.
+    Calcule des poids qualité basés sur l'inverse de la variance du bruit.
+    Retourne des poids compacts par image: scalaire pour mono ou vecteur 3 canaux pour couleur.
     """
     _pcb = lambda msg_key, lvl="INFO_DETAIL", **kwargs: \
         progress_callback(msg_key, None, lvl, **kwargs) if progress_callback else _internal_logger.debug(f"PCB_FALLBACK_{lvl}: {msg_key} {kwargs}")
@@ -1620,10 +1646,12 @@ def _calculate_image_weights_noise_variance(image_list: list[np.ndarray | None],
         _pcb("weight_noisevar_warn_astropy_stats_unavailable", lvl="WARN")
         weights = []
         for img in image_list:
-            if img is not None:
-                weights.append(np.ones_like(img, dtype=np.float32))
-            else:
+            if img is None:
                 weights.append(None)
+            elif isinstance(img, np.ndarray) and img.ndim == 3 and img.shape[-1] == 3:
+                weights.append(np.asarray([1.0, 1.0, 1.0], dtype=np.float32))
+            else:
+                weights.append(np.asarray(1.0, dtype=np.float32))
         return weights
 
     # Va stocker pour chaque image valide:
@@ -1720,40 +1748,38 @@ def _calculate_image_weights_noise_variance(image_list: list[np.ndarray | None],
     output_weights_list = [None] * len(image_list)
 
     for idx_in_valid_arrays, original_image_idx in enumerate(valid_image_indices):
-        original_img_data_shape_ref = image_list[original_image_idx] # Pour obtenir la shape HWC ou HW
-        if original_img_data_shape_ref is None: continue # Ne devrait pas arriver
+        original_img_data_shape_ref = image_list[original_image_idx]
+        if original_img_data_shape_ref is None:
+            continue
 
         variances_for_current_img = variances_per_image_channels[idx_in_valid_arrays]
         
-        # Créer le tableau de poids pour cette image, de la même forme
-        weights_for_this_img_array = np.zeros_like(original_img_data_shape_ref, dtype=np.float32)
-
-        if original_img_data_shape_ref.ndim == 3 and len(variances_for_current_img) == original_img_data_shape_ref.shape[-1]: # Couleur
+        # Créer un poids compact pour cette image: (3,) pour couleur ou scalaire pour mono
+        if original_img_data_shape_ref.ndim == 3 and len(variances_for_current_img) == original_img_data_shape_ref.shape[-1]:
+            ch_weights = []
             for c_idx in range(original_img_data_shape_ref.shape[-1]):
                 variance_ch = variances_for_current_img[c_idx]
                 if np.isfinite(variance_ch) and variance_ch > 1e-18:
-                    calculated_weight = min_overall_variance / variance_ch
+                    ch_weights.append(float(min_overall_variance / variance_ch))
                 else:
-                    calculated_weight = 1e-6 # Poids très faible si variance du canal est invalide ou nulle
-                weights_for_this_img_array[..., c_idx] = calculated_weight
-                # _pcb(f"WeightNoiseVar: Img {original_image_idx}, Ch {c_idx}, Var={variance_ch:.2e}, PoidsRel={calculated_weight:.3f}", lvl="DEBUG_VERY_DETAIL")
-        
-        elif original_img_data_shape_ref.ndim == 2 and len(variances_for_current_img) == 1: # Monochrome
+                    ch_weights.append(1e-6)
+            output_weights_list[original_image_idx] = np.asarray(ch_weights, dtype=np.float32)
+        elif original_img_data_shape_ref.ndim == 2 and len(variances_for_current_img) == 1:
             variance_mono = variances_for_current_img[0]
             if np.isfinite(variance_mono) and variance_mono > 1e-18:
-                calculated_weight = min_overall_variance / variance_mono
+                calculated_weight = float(min_overall_variance / variance_mono)
             else:
                 calculated_weight = 1e-6
-            weights_for_this_img_array[:] = calculated_weight # Appliquer à tous les pixels de l'image HW
-            # _pcb(f"WeightNoiseVar: Img {original_image_idx} (Mono), Var={variance_mono:.2e}, PoidsRel={calculated_weight:.3f}", lvl="DEBUG_VERY_DETAIL")
-        
-        output_weights_list[original_image_idx] = weights_for_this_img_array
+            output_weights_list[original_image_idx] = np.asarray(calculated_weight, dtype=np.float32)
 
     # Pour les images qui n'ont pas pu être traitées (initialement None, ou erreur en cours de route)
     for i in range(len(image_list)):
         if output_weights_list[i] is None and image_list[i] is not None:
-            _pcb(f"WeightNoiseVar: Image {i} (pas de poids valide calc.), fallback sur poids uniforme 1.0.", lvl="DEBUG_DETAIL")
-            output_weights_list[i] = np.ones_like(image_list[i], dtype=np.float32)
+            _pcb("WeightNoiseVar: Image sans poids valide, fallback sur 1.0.", lvl="DEBUG_DETAIL")
+            if isinstance(image_list[i], np.ndarray) and image_list[i].ndim == 3 and image_list[i].shape[-1] == 3:
+                output_weights_list[i] = np.asarray([1.0, 1.0, 1.0], dtype=np.float32)
+            else:
+                output_weights_list[i] = np.asarray(1.0, dtype=np.float32)
             
     num_actual_weights = sum(1 for w_arr in output_weights_list if w_arr is not None)
     _pcb(f"WeightNoiseVar: Calcul des poids (par canal si couleur) terminé. {num_actual_weights}/{len(image_list)} tableaux de poids retournés.", lvl="DEBUG")
@@ -1827,11 +1853,13 @@ def _estimate_initial_fwhm(data_2d: np.ndarray, progress_callback: callable = No
         return default_fwhm
 
 
-def _calculate_image_weights_noise_fwhm(image_list: list[np.ndarray | None], 
-                                        progress_callback: callable = None) -> list[np.ndarray | None]:
+def _calculate_image_weights_noise_fwhm(
+    image_list: list[np.ndarray | None],
+    progress_callback: callable = None,
+) -> list[np.ndarray | None]:
     """
-    Calcule les poids pour une liste d'images basés sur l'inverse de la FWHM moyenne des étoiles.
-    Tente d'estimer une FWHM initiale pour la détection de sources.
+    Calcule des poids basés sur l'inverse de la FWHM. Retourne des poids compacts
+    par image: scalaire pour mono ou vecteur 3 canaux pour couleur.
     """
     _pcb = lambda msg_key, lvl="INFO_DETAIL", **kwargs: \
         progress_callback(msg_key, None, lvl, **kwargs) if progress_callback else _internal_logger.debug(f"PCB_FALLBACK_{lvl}: {msg_key} {kwargs}")
@@ -1842,10 +1870,20 @@ def _calculate_image_weights_noise_fwhm(image_list: list[np.ndarray | None],
 
     if not PHOTOUTILS_AVAILABLE or not SIGMA_CLIP_AVAILABLE:
         missing_fwhm_deps = []
-        if not PHOTOUTILS_AVAILABLE: missing_fwhm_deps.append("Photutils")
-        if not SIGMA_CLIP_AVAILABLE: missing_fwhm_deps.append("Astropy.stats (SigmaClip)")
+        if not PHOTOUTILS_AVAILABLE:
+            missing_fwhm_deps.append("Photutils")
+        if not SIGMA_CLIP_AVAILABLE:
+            missing_fwhm_deps.append("Astropy.stats (SigmaClip)")
         _pcb("weight_fwhm_warn_deps_unavailable", lvl="WARN", missing=", ".join(missing_fwhm_deps))
-        return [np.ones_like(img, dtype=np.float32) if img is not None else None for img in image_list]
+        compact = []
+        for img in image_list:
+            if img is None:
+                compact.append(None)
+            elif isinstance(img, np.ndarray) and img.ndim == 3 and img.shape[-1] == 3:
+                compact.append(np.asarray([1.0, 1.0, 1.0], dtype=np.float32))
+            else:
+                compact.append(np.asarray(1.0, dtype=np.float32))
+        return compact
 
     fwhm_values_per_image = [] 
     valid_image_indices_fwhm = []
@@ -2048,11 +2086,17 @@ def _calculate_image_weights_noise_fwhm(image_list: list[np.ndarray | None],
         if original_image_data is None:
             output_weights_list_fwhm[i] = None
         elif i in final_calculated_weights_scalar_fwhm:
-            scalar_w_fwhm = final_calculated_weights_scalar_fwhm[i]
-            output_weights_list_fwhm[i] = np.full_like(original_image_data, scalar_w_fwhm, dtype=np.float32)
-        else: 
+            scalar_w_fwhm = float(final_calculated_weights_scalar_fwhm[i])
+            if isinstance(original_image_data, np.ndarray) and original_image_data.ndim == 3 and original_image_data.shape[-1] == 3:
+                output_weights_list_fwhm[i] = np.asarray([scalar_w_fwhm] * 3, dtype=np.float32)
+            else:
+                output_weights_list_fwhm[i] = np.asarray(scalar_w_fwhm, dtype=np.float32)
+        else:
             _pcb("weight_fwhm_fallback_weight_one", lvl="DEBUG_DETAIL", img_idx=i)
-            output_weights_list_fwhm[i] = np.ones_like(original_image_data, dtype=np.float32)
+            if isinstance(original_image_data, np.ndarray) and original_image_data.ndim == 3 and original_image_data.shape[-1] == 3:
+                output_weights_list_fwhm[i] = np.asarray([1.0, 1.0, 1.0], dtype=np.float32)
+            else:
+                output_weights_list_fwhm[i] = np.asarray(1.0, dtype=np.float32)
             
     num_actual_weights_fwhm = sum(1 for w_arr in output_weights_list_fwhm if w_arr is not None)
     _pcb(f"WeightFWHM: Calcul des poids FWHM terminé. {num_actual_weights_fwhm}/{len(image_list)} tableaux de poids retournés.", lvl="DEBUG")
@@ -2064,7 +2108,12 @@ def _compute_quality_weights(
     requested_method: str,
     progress_callback: Callable | None = None,
 ) -> tuple[list[np.ndarray | None] | None, str, dict[str, float] | None]:
-    """Compute per-frame quality weights according to the requested method."""
+    """Compute per-frame quality weights according to the requested method.
+
+    Returns compact per-frame weights to avoid materializing full (H,W[,C]) planes:
+    - For color: arrays of shape (1, 1, 3)
+    - For mono: arrays of shape (1,)
+    """
 
     if not image_list:
         return None, "none", None
@@ -2128,20 +2177,36 @@ def _compute_quality_weights(
         base_weight = weights_source[idx] if idx < len(weights_source) else None
         if base_weight is None:
             continue
-        weight_arr = np.asarray(base_weight, dtype=np.float32, copy=False)
-        try:
-            weight_arr = np.broadcast_to(weight_arr, frame_arr.shape).astype(np.float32, copy=False)
-        except ValueError:
-            _log_stack_message(
-                f"[Stack] Weight array for frame {idx} incompatible with shape {frame_arr.shape}; ignoring frame weight.",
-                "WARN",
-                progress_callback,
-            )
+        w = np.asarray(base_weight, dtype=np.float32, copy=False)
+        # Compactify weight to scalar or per-channel 3-vector
+        if frame_arr.ndim == 3 and frame_arr.shape[-1] == 3:
+            # Color: expect per-channel weight
+            if w.ndim == 0:
+                w_compact = np.full((1, 1, 3), float(w), dtype=np.float32)
+            elif w.ndim == 1 and w.shape[0] == 3:
+                w_compact = w.reshape((1, 1, 3)).astype(np.float32, copy=False)
+            else:
+                try:
+                    chv = np.nanmean(w, axis=(0, 1)) if w.ndim >= 2 else np.asarray(w)
+                    chv = np.asarray(chv, dtype=np.float32).reshape((1, 1, -1))
+                    if chv.shape[-1] == 3:
+                        w_compact = chv
+                    else:
+                        w_compact = np.ones((1, 1, 3), dtype=np.float32)
+                except Exception:
+                    w_compact = np.ones((1, 1, 3), dtype=np.float32)
+        else:
+            # Mono: scalar
+            try:
+                val = float(np.nanmean(w)) if w.ndim > 0 else float(w)
+            except Exception:
+                val = 1.0
+            w_compact = np.asarray([val], dtype=np.float32)
+
+        if not np.any(np.isfinite(w_compact)):
             continue
-        if not np.any(np.isfinite(weight_arr)):
-            continue
-        arr_min = float(np.nanmin(weight_arr))
-        arr_max = float(np.nanmax(weight_arr))
+        arr_min = float(np.nanmin(w_compact))
+        arr_max = float(np.nanmax(w_compact))
         has_effect = (
             abs(arr_max - arr_min) >= 1e-6
             or abs(arr_min - 1.0) >= 1e-6
@@ -2149,7 +2214,7 @@ def _compute_quality_weights(
         )
         if not has_effect:
             continue
-        sanitized[idx] = weight_arr
+        sanitized[idx] = w_compact
         effective_frames += 1
         if np.isfinite(arr_min):
             min_val = arr_min if min_val is None else min(min_val, arr_min)
