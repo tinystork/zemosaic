@@ -593,9 +593,14 @@ except Exception as e_import_stack:
 
 # --- Implementations GPU simplifiées des méthodes de stack ---
 def gpu_stack_winsorized(frames, *, kappa=3.0, winsor_limits=(0.05, 0.05), apply_rewinsor=True):
+    """GPU Winsorized Sigma-Clip aligned with CPU logic.
+
+    Order matches CPU: winsor -> sigma (median/std on winsorized) -> mean.
+    Rejection mask is computed on original data using bounds from winsorized stats.
+    """
     import cupy as cp
 
-    frames_np = [np.asarray(f, dtype=np.float32) for f in frames]
+    frames_np = [np.asarray(f, dtype=np.float32) for f in frames if f is not None]
     if not frames_np:
         raise ValueError("No frames provided")
 
@@ -607,18 +612,31 @@ def gpu_stack_winsorized(frames, *, kappa=3.0, winsor_limits=(0.05, 0.05), apply
     _ensure_gpu_pool()
 
     try:
-        arr = cp.stack([cp.asarray(f) for f in frames_np], axis=0)
-        low_q = cp.quantile(arr, winsor_limits[0], axis=0)
-        high_q = cp.quantile(arr, 1.0 - winsor_limits[1], axis=0)
-        arr_w = cp.clip(arr, low_q, high_q)
-        mean = cp.nanmean(arr_w, axis=0)
-        std = cp.nanstd(arr_w, axis=0)
-        mask = cp.abs(arr - mean) < kappa * std
+        arr = cp.stack([cp.asarray(f, dtype=cp.float32) for f in frames_np], axis=0)
+
+        low, high = float(winsor_limits[0]), float(winsor_limits[1])
+        # Winsorize along stack axis (0) with NaN-safe quantiles
+        q_low = cp.nanquantile(arr, low, axis=0)
+        q_high = cp.nanquantile(arr, 1.0 - high, axis=0)
+        arr_w = cp.clip(arr, q_low, q_high)
+
+        # Sigma stats from winsorized data (median/std)
+        median_w = cp.nanmedian(arr_w, axis=0)
+        std_w = cp.nanstd(arr_w, axis=0)
+        lower = median_w - (kappa * std_w)
+        upper = median_w + (kappa * std_w)
+
+        # Reject original values outside bounds; optionally re-winsorize rejected
+        mask = (arr >= lower) & (arr <= upper)
         if apply_rewinsor:
             arr_clip = cp.where(mask, arr, arr_w)
         else:
             arr_clip = cp.where(mask, arr, cp.nan)
+
         result = cp.nanmean(arr_clip, axis=0)
+        # Optional safety clip to [0,1] can be applied by caller if needed
+        # result = cp.clip(result, 0.0, 1.0)
+
         rejected = 100.0 * float(mask.size - cp.count_nonzero(mask)) / float(mask.size)
         return cp.asnumpy(result.astype(cp.float32)), float(rejected)
     finally:
@@ -716,7 +734,11 @@ def stack_winsorized_sigma_clip(
     else:
         # Accept either a generic 'use_gpu' flag or legacy 'use_gpu_phase5'
         if zconfig:
-            use_gpu = bool(getattr(zconfig, 'use_gpu', getattr(zconfig, 'use_gpu_phase5', False)))
+            # Stacking should not be toggled by the Phase‑5 GPU option.
+            # Honor only explicit stacking flags or generic 'use_gpu'.
+            use_gpu = bool(getattr(zconfig, 'stack_use_gpu',
+                                   getattr(zconfig, 'use_gpu_stack',
+                                           getattr(zconfig, 'use_gpu', False))))
         else:
             use_gpu = False
 
@@ -932,7 +954,10 @@ def stack_kappa_sigma_clip(
     Honors a generic ``use_gpu`` flag on ``zconfig`` if present, otherwise
     falls back to the legacy ``use_gpu_phase5`` flag used by the GUI.
     """
-    use_gpu = (getattr(zconfig, 'use_gpu', getattr(zconfig, 'use_gpu_phase5', False))
+    # Do not let the Phase‑5 GPU flag affect stacking.
+    use_gpu = (getattr(zconfig, 'stack_use_gpu',
+                       getattr(zconfig, 'use_gpu_stack',
+                               getattr(zconfig, 'use_gpu', False)))
                if zconfig else False)
     progress_callback = kwargs.get("progress_callback")
     frames_list = list(frames)
@@ -1018,7 +1043,10 @@ def stack_linear_fit_clip(
     Honors a generic ``use_gpu`` flag on ``zconfig`` if present, otherwise
     falls back to the legacy ``use_gpu_phase5`` flag used by the GUI.
     """
-    use_gpu = (getattr(zconfig, 'use_gpu', getattr(zconfig, 'use_gpu_phase5', False))
+    # Do not let the Phase‑5 GPU flag affect stacking.
+    use_gpu = (getattr(zconfig, 'stack_use_gpu',
+                       getattr(zconfig, 'use_gpu_stack',
+                               getattr(zconfig, 'use_gpu', False)))
                if zconfig else False)
     progress_callback = kwargs.get("progress_callback")
     frames_list = list(frames)
@@ -2597,7 +2625,10 @@ def stack_aligned_images(
     use_gpu_norm = False
     try:
         if zconfig is not None:
-            use_gpu_norm = bool(getattr(zconfig, 'use_gpu', getattr(zconfig, 'use_gpu_phase5', False)))
+            # Normalization during stacking should follow stacking GPU flags only.
+            use_gpu_norm = bool(getattr(zconfig, 'stack_use_gpu',
+                                        getattr(zconfig, 'use_gpu_stack',
+                                                getattr(zconfig, 'use_gpu', False))))
     except Exception:
         use_gpu_norm = False
     if normalize_method == 'linear_fit':

@@ -2800,12 +2800,9 @@ def create_master_tile(
         setattr(zconfig, "poststack_equalize_rgb", bool(poststack_equalize_rgb))
     except Exception:
         pass
-    # Provide a generic alias for GPU usage so Phase 3 can honor the same toggle.
-    try:
-        if not hasattr(zconfig, 'use_gpu') and hasattr(zconfig, 'use_gpu_phase5'):
-            setattr(zconfig, 'use_gpu', getattr(zconfig, 'use_gpu_phase5'))
-    except Exception:
-        pass
+    # Do not alias Phase‑5 GPU flag onto a generic 'use_gpu' here.
+    # Stacking code now honors only explicit stacking flags
+    # (e.g., 'stack_use_gpu' / 'use_gpu_stack') or 'use_gpu' if set by user.
     if resource_strategy:
         try:
             if resource_strategy.get('gpu_batch_hint'):
@@ -4009,6 +4006,8 @@ def assemble_final_mosaic_reproject_coadd(
 
 
 
+    # Optional inter-tile photometric (gain/offset) calibration
+    pending_affine_list = None
     if (
         intertile_photometric_match
         and len(input_data_all_tiles_HWC_processed) >= 2
@@ -4037,21 +4036,33 @@ def assemble_final_mosaic_reproject_coadd(
                 error=str(exc_intertile),
             )
         else:
-            if corrections:
+            # Build ordered list aligned with tiles for possible GPU application
+            try:
+                n_tiles_local = len(input_data_all_tiles_HWC_processed)
+                pending_affine_list = [
+                    (
+                        float(corrections.get(i, (1.0, 0.0))[0]),
+                        float(corrections.get(i, (1.0, 0.0))[1]),
+                    )
+                    for i in range(n_tiles_local)
+                ]
+            except Exception:
+                pending_affine_list = None
+
+            # For CPU path, apply in-place like before to preserve behavior
+            if not use_gpu and corrections:
                 corrected_tiles = 0
-                for tile_idx, gain_offset in corrections.items():
-                    if not isinstance(gain_offset, (tuple, list)) or len(gain_offset) < 2:
+                for tile_idx, (gain_val, offset_val) in enumerate(pending_affine_list or []):
+                    if tile_idx < 0 or tile_idx >= len(input_data_all_tiles_HWC_processed):
                         continue
-                    if not isinstance(tile_idx, int) or tile_idx < 0 or tile_idx >= len(input_data_all_tiles_HWC_processed):
-                        continue
-                    gain_val = float(gain_offset[0])
-                    offset_val = float(gain_offset[1])
                     arr, tile_wcs = input_data_all_tiles_HWC_processed[tile_idx]
                     if arr is None:
                         continue
                     try:
-                        arr *= gain_val
-                        arr += offset_val
+                        if gain_val != 1.0:
+                            arr *= float(gain_val)
+                        if offset_val != 0.0:
+                            arr += float(offset_val)
                         input_data_all_tiles_HWC_processed[tile_idx] = (arr, tile_wcs)
                         corrected_tiles += 1
                     except Exception:
@@ -4088,6 +4099,36 @@ def assemble_final_mosaic_reproject_coadd(
         # If introspection fails just fall back to basic arguments
         reproj_kwargs = {"match_background": match_bg}
 
+    # Provide GPU-only tuning hints (safely ignored by CPU via wrapper filtering)
+    try:
+        reproj_kwargs["bg_preview_size"] = int(max(128, int(intertile_preview_size)))
+    except Exception:
+        reproj_kwargs["bg_preview_size"] = 512
+    try:
+        reproj_kwargs["intertile_sky_percentile"] = (
+            tuple(intertile_sky_percentile)
+            if isinstance(intertile_sky_percentile, (list, tuple)) and len(intertile_sky_percentile) >= 2
+            else (30.0, 70.0)
+        )
+    except Exception:
+        reproj_kwargs["intertile_sky_percentile"] = (30.0, 70.0)
+    try:
+        reproj_kwargs["intertile_robust_clip_sigma"] = float(intertile_robust_clip_sigma)
+    except Exception:
+        reproj_kwargs["intertile_robust_clip_sigma"] = 2.5
+
+    # If we are going to use the GPU, pass the precomputed affine corrections down
+    # so they are applied inside the GPU reprojection (parity with CPU path).
+    if use_gpu and pending_affine_list is not None:
+        reproj_kwargs["tile_affine_corrections"] = pending_affine_list
+        try:
+            _pcb(
+                f"ASM_REPROJ_COADD: Passing intertile affine corrections to GPU (n={len(pending_affine_list)})",
+                lvl="DEBUG_DETAIL",
+            )
+        except Exception:
+            pass
+
 
     # Prepare output containers: either RAM lists or disk-backed memmaps
     mosaic_channels = []
@@ -4114,6 +4155,14 @@ def assemble_final_mosaic_reproject_coadd(
         start_time_loop = time.time()
         last_time = start_time_loop
         step_times = []
+        if use_gpu:
+            try:
+                _pcb(
+                    f"ASM_REPROJ_COADD: GPU background match enabled (preview={reproj_kwargs.get('bg_preview_size','N/A')}, sky={reproj_kwargs.get('intertile_sky_percentile','N/A')}, clip={reproj_kwargs.get('intertile_robust_clip_sigma','N/A')})",
+                    lvl="DEBUG_DETAIL",
+                )
+            except Exception:
+                pass
         for ch in range(n_channels):
 
             data_list = [arr[..., ch] for arr, _w in input_data_all_tiles_HWC_processed]
