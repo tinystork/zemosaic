@@ -2769,6 +2769,7 @@ def create_master_tile(
     astap_sensitivity_global: int,
     astap_timeout_seconds_global: int,
     winsor_pool_workers: int,
+    winsor_max_frames_per_pass: int,
     progress_callback: callable,
     resource_strategy: dict | None = None,
     center_out_context: CenterOutNormalizationContext | None = None,
@@ -2800,12 +2801,9 @@ def create_master_tile(
         setattr(zconfig, "poststack_equalize_rgb", bool(poststack_equalize_rgb))
     except Exception:
         pass
-    # Provide a generic alias for GPU usage so Phase 3 can honor the same toggle.
-    try:
-        if not hasattr(zconfig, 'use_gpu') and hasattr(zconfig, 'use_gpu_phase5'):
-            setattr(zconfig, 'use_gpu', getattr(zconfig, 'use_gpu_phase5'))
-    except Exception:
-        pass
+    # Do not alias Phase‑5 GPU flag onto a generic 'use_gpu' here.
+    # Stacking code now honors only explicit stacking flags
+    # (e.g., 'stack_use_gpu' / 'use_gpu_stack') or 'use_gpu' if set by user.
     if resource_strategy:
         try:
             if resource_strategy.get('gpu_batch_hint'):
@@ -2998,6 +2996,8 @@ def create_master_tile(
             kappa=stack_kappa_low,
             winsor_limits=parsed_winsor_limits,
             apply_rewinsor=True,
+            winsor_max_frames_per_pass=int(winsor_max_frames_per_pass) if winsor_max_frames_per_pass is not None else 0,
+            winsor_max_workers=int(winsor_pool_workers) if winsor_pool_workers is not None else 1,
             stack_metadata=stack_metadata,
         )
     elif stack_reject_algo == "kappa_sigma":
@@ -4009,6 +4009,8 @@ def assemble_final_mosaic_reproject_coadd(
 
 
 
+    # Optional inter-tile photometric (gain/offset) calibration
+    pending_affine_list = None
     if (
         intertile_photometric_match
         and len(input_data_all_tiles_HWC_processed) >= 2
@@ -4037,21 +4039,33 @@ def assemble_final_mosaic_reproject_coadd(
                 error=str(exc_intertile),
             )
         else:
-            if corrections:
+            # Build ordered list aligned with tiles for possible GPU application
+            try:
+                n_tiles_local = len(input_data_all_tiles_HWC_processed)
+                pending_affine_list = [
+                    (
+                        float(corrections.get(i, (1.0, 0.0))[0]),
+                        float(corrections.get(i, (1.0, 0.0))[1]),
+                    )
+                    for i in range(n_tiles_local)
+                ]
+            except Exception:
+                pending_affine_list = None
+
+            # For CPU path, apply in-place like before to preserve behavior
+            if not use_gpu and corrections:
                 corrected_tiles = 0
-                for tile_idx, gain_offset in corrections.items():
-                    if not isinstance(gain_offset, (tuple, list)) or len(gain_offset) < 2:
+                for tile_idx, (gain_val, offset_val) in enumerate(pending_affine_list or []):
+                    if tile_idx < 0 or tile_idx >= len(input_data_all_tiles_HWC_processed):
                         continue
-                    if not isinstance(tile_idx, int) or tile_idx < 0 or tile_idx >= len(input_data_all_tiles_HWC_processed):
-                        continue
-                    gain_val = float(gain_offset[0])
-                    offset_val = float(gain_offset[1])
                     arr, tile_wcs = input_data_all_tiles_HWC_processed[tile_idx]
                     if arr is None:
                         continue
                     try:
-                        arr *= gain_val
-                        arr += offset_val
+                        if gain_val != 1.0:
+                            arr *= float(gain_val)
+                        if offset_val != 0.0:
+                            arr += float(offset_val)
                         input_data_all_tiles_HWC_processed[tile_idx] = (arr, tile_wcs)
                         corrected_tiles += 1
                     except Exception:
@@ -4088,6 +4102,36 @@ def assemble_final_mosaic_reproject_coadd(
         # If introspection fails just fall back to basic arguments
         reproj_kwargs = {"match_background": match_bg}
 
+    # Provide GPU-only tuning hints (safely ignored by CPU via wrapper filtering)
+    try:
+        reproj_kwargs["bg_preview_size"] = int(max(128, int(intertile_preview_size)))
+    except Exception:
+        reproj_kwargs["bg_preview_size"] = 512
+    try:
+        reproj_kwargs["intertile_sky_percentile"] = (
+            tuple(intertile_sky_percentile)
+            if isinstance(intertile_sky_percentile, (list, tuple)) and len(intertile_sky_percentile) >= 2
+            else (30.0, 70.0)
+        )
+    except Exception:
+        reproj_kwargs["intertile_sky_percentile"] = (30.0, 70.0)
+    try:
+        reproj_kwargs["intertile_robust_clip_sigma"] = float(intertile_robust_clip_sigma)
+    except Exception:
+        reproj_kwargs["intertile_robust_clip_sigma"] = 2.5
+
+    # If we are going to use the GPU, pass the precomputed affine corrections down
+    # so they are applied inside the GPU reprojection (parity with CPU path).
+    if use_gpu and pending_affine_list is not None:
+        reproj_kwargs["tile_affine_corrections"] = pending_affine_list
+        try:
+            _pcb(
+                f"ASM_REPROJ_COADD: Passing intertile affine corrections to GPU (n={len(pending_affine_list)})",
+                lvl="DEBUG_DETAIL",
+            )
+        except Exception:
+            pass
+
 
     # Prepare output containers: either RAM lists or disk-backed memmaps
     mosaic_channels = []
@@ -4114,6 +4158,14 @@ def assemble_final_mosaic_reproject_coadd(
         start_time_loop = time.time()
         last_time = start_time_loop
         step_times = []
+        if use_gpu:
+            try:
+                _pcb(
+                    f"ASM_REPROJ_COADD: GPU background match enabled (preview={reproj_kwargs.get('bg_preview_size','N/A')}, sky={reproj_kwargs.get('intertile_sky_percentile','N/A')}, clip={reproj_kwargs.get('intertile_robust_clip_sigma','N/A')})",
+                    lvl="DEBUG_DETAIL",
+                )
+            except Exception:
+                pass
         for ch in range(n_channels):
 
             data_list = [arr[..., ch] for arr, _w in input_data_all_tiles_HWC_processed]
@@ -5750,6 +5802,43 @@ def run_hierarchical_mosaic(
                 )
     except Exception:
         pass
+    # RAM-aware cap for Phase 3: estimate per-job footprint and clamp concurrency
+    try:
+        avail_bytes = int(psutil.virtual_memory().available)
+        # Determine per-frame bytes via a sample cached image when possible
+        per_frame_bytes = None
+        try:
+            sample_cache = None
+            if seestar_stack_groups and seestar_stack_groups[0]:
+                sample_cache = seestar_stack_groups[0][0].get('path_preprocessed_cache')
+            if sample_cache and os.path.exists(sample_cache):
+                _arr = np.load(sample_cache, mmap_mode='r')
+                per_frame_bytes = int(_arr.size) * int(_arr.dtype.itemsize)
+                _arr = None
+        except Exception:
+            per_frame_bytes = None
+        if per_frame_bytes is None or per_frame_bytes <= 0:
+            # Conservative default (Seestar 1080x1920 RGB float32)
+            per_frame_bytes = 1080 * 1920 * 3 * 4
+        frames_per_pass = int(winsor_max_frames_per_pass) if winsor_max_frames_per_pass and int(winsor_max_frames_per_pass) > 0 else 256
+        fudge = 2.0
+        per_job_bytes = int(max(1, frames_per_pass) * per_frame_bytes * fudge)
+        allowed = int(avail_bytes * 0.6)
+        max_by_ram = max(1, allowed // max(1, per_job_bytes))
+        prev_workers = actual_num_workers_ph3
+        actual_num_workers_ph3 = max(1, min(actual_num_workers_ph3, int(max_by_ram)))
+        if actual_num_workers_ph3 != prev_workers:
+            try:
+                mb_per_job = per_job_bytes / (1024.0 * 1024.0)
+                pcb(
+                    f"RAM_CAP: Phase 3 workers {prev_workers} -> {actual_num_workers_ph3} (frames/pass={frames_per_pass}, per-job~{mb_per_job:.1f}MB)",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
     pcb(
         f"WORKERS_PHASE3: Utilisation de {actual_num_workers_ph3} worker(s). (Base: {effective_base_workers}, Ratio {ALIGNMENT_PHASE_WORKER_RATIO*100:.0f}%, Groupes: {num_seestar_stacks_to_process})",
         prog=None,
@@ -5884,6 +5973,7 @@ def run_hierarchical_mosaic(
             astap_exe_path, astap_data_dir_param, astap_search_radius_config,
             astap_downsample_config, astap_sensitivity_config, 180,
             winsor_worker_limit,
+            winsor_max_frames_per_pass,
             progress_callback,
             resource_strategy=auto_resource_strategy,
             center_out_context=center_out_context,
@@ -5998,6 +6088,17 @@ def run_hierarchical_mosaic(
                     error=str(exc_thread_ph3),
                 )
                 logger.error(f"Exception Phase 3 pour stack {int(tile_id_for_future) + 1}:", exc_info=True)
+            finally:
+                # Aggressively free CuPy memory pools between tiles to avoid device/pinned host growth
+                try:
+                    if ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils and hasattr(zemosaic_utils, "free_cupy_memory_pools"):
+                        zemosaic_utils.free_cupy_memory_pools()
+                except Exception:
+                    pass
+                try:
+                    gc.collect()
+                except Exception:
+                    pass
 
             if tiles_processed_count_ph3 % max(1, num_seestar_stacks_to_process // 5) == 0 or tiles_processed_count_ph3 == num_seestar_stacks_to_process:
                  _log_memory_usage(progress_callback, f"Phase 3 - Traité {tiles_processed_count_ph3}/{num_seestar_stacks_to_process} tuiles")
@@ -6302,7 +6403,7 @@ def run_hierarchical_mosaic(
         try: final_header.update(final_output_wcs.to_header(relax=True))
         except Exception as e_hdr_wcs: pcb("run_warn_phase6_wcs_to_header_failed", error=str(e_hdr_wcs), lvl="WARN")
     
-    final_header['SOFTWARE']=('ZeMosaic v3.1.0','Mosaic Software') # Incrémente la version si tu le souhaites
+    final_header['SOFTWARE']=('ZeMosaic v3.2.0','Mosaic Software') # Incrémente la version si tu le souhaites
     final_header['NMASTILE']=(len(master_tiles_results_list),"Master Tiles combined")
     final_header['NRAWINIT']=(num_total_raw_files,"Initial raw images found")
     final_header['NRAWPROC']=(len(all_raw_files_processed_info),"Raw images with WCS processed")
