@@ -146,25 +146,42 @@ def _compute_dynamic_footprint_budget(
         Hard upper bound derived from configuration/CLI arguments.
     """
 
-    base_cap = max_footprints
     try:
-        coerced = int(preview_cap or 0)
-        fallback = coerced or max_footprints
-        base_cap = min(max_footprints, fallback)
+        base_cap = int(max_footprints)
     except Exception:
-        base_cap = max_footprints
+        base_cap = 0
 
-    if total_items >= 2000:
-        cap = 0
-    elif total_items >= 1200:
-        cap = min(base_cap, 400)
+    preview_limit: Optional[int] = None
+    try:
+        coerced_preview = int(preview_cap)
+        if coerced_preview > 0:
+            preview_limit = coerced_preview
+    except Exception:
+        preview_limit = None
+
+    if preview_limit is not None:
+        base_cap = min(base_cap or preview_limit, preview_limit)
+
+    base_cap = max(50, base_cap) if base_cap else 50
+
+    if total_items >= 8000:
+        cap = 200
+    elif total_items >= 4000:
+        cap = 350
+    elif total_items >= 2000:
+        cap = 600
     else:
         cap = min(base_cap, 1500)
 
+    if preview_limit is not None:
+        cap = min(cap, preview_limit)
+
+    cap = min(cap, base_cap) if base_cap else cap
+
     try:
-        return max(0, int(cap))
+        return max(1, int(cap))
     except Exception:
-        return 0
+        return 1
 
 
 def launch_filter_interface(
@@ -494,7 +511,16 @@ def launch_filter_interface(
         solve_with_astrometry = getattr(worker_mod, 'solve_with_astrometry', None) if worker_mod else None
         solve_with_ansvr = getattr(worker_mod, 'solve_with_ansvr', None) if worker_mod else None
 
-        MAX_FOOTPRINTS = int(preview_cap or 0) or 3000
+        max_footprints_override = None
+        if isinstance(config_overrides, dict):
+            try:
+                override_val = int(config_overrides.get("footprints_max"))
+                if override_val > 0:
+                    max_footprints_override = override_val
+            except Exception:
+                max_footprints_override = None
+
+        MAX_FOOTPRINTS = max_footprints_override or (int(preview_cap or 0) or 3000)
         cache_csv_path: Optional[str] = None
         if stream_mode and input_dir:
             cache_csv_path = os.path.join(input_dir, "headers_cache.csv")
@@ -2560,7 +2586,7 @@ def launch_filter_interface(
             "indices": [],
             "sizes": [],
         }
-        footprint_budget_state = {"budget": 0}
+        footprint_budget_state = {"budget": 0, "total_items": 0}
         preview_hint_state = {"active": False}
         visual_build_state = {"indices": [], "cursor": 0, "job": None, "full": True, "footprints_used": 0}
 
@@ -2631,6 +2657,7 @@ def launch_filter_interface(
                 max_footprints=MAX_FOOTPRINTS,
             )
             footprint_budget_state["budget"] = cap
+            footprint_budget_state["total_items"] = len(items)
             try:
                 current_summary = summary_var.get()
             except Exception:
@@ -3186,23 +3213,33 @@ def launch_filter_interface(
             return footprint_budget_state.get("budget", 0) > 0
 
         def _apply_summary_hint(text: str) -> str:
+            base_text = str(text or "")
+            hint = _tr(
+                "filter_preview_points_hint",
+                "Preview uses a reduced set of footprints for performance. Zoom or filter to reveal more footprints.",
+            )
             try:
                 wants_footprints = bool(draw_footprints_var.get())
             except Exception:
                 wants_footprints = False
-            if not wants_footprints or footprint_budget_state.get("budget", 0) > 0:
+
+            budget = int(footprint_budget_state.get("budget") or 0)
+            total = int(footprint_budget_state.get("total_items") or 0)
+
+            if hint and hint in base_text:
+                base_text = base_text.replace(f" — {hint}", "")
+                base_text = base_text.replace(hint, "").strip()
+                if base_text.endswith("—"):
+                    base_text = base_text[:-1].rstrip()
+
+            if not wants_footprints or total <= 0 or budget >= total:
                 preview_hint_state["active"] = False
-                return text
-            hint = _tr(
-                "filter_preview_points_hint",
-                "Preview limited to points for speed; zoom or filter to see footprints.",
-            )
+                return base_text
+
             preview_hint_state["active"] = True
-            if not text:
+            if not base_text:
                 return hint
-            if hint in text:
-                return text
-            return f"{text} — {hint}"
+            return f"{base_text} — {hint}"
 
         axes_update_pending = {"pending": False}
         population_state = {

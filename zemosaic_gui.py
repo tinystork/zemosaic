@@ -1801,7 +1801,6 @@ class ZeMosaicGUI:
                 _initial_overrides,
                 stream_scan=True,
                 scan_recursive=True,
-                batch_size=200,
                 preview_cap=1500,
                 solver_settings_dict=solver_cfg_payload,
                 config_overrides=config_overrides,
