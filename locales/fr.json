@@ -1,5 +1,5 @@
 ﻿{
-    "window_title": "ZeMosaic V3.2.0 - fulgur Mosaïqueur Hiérarchique",
+    "window_title": "ZeMosaic V3.2.1 - fulgur Mosaïqueur Hiérarchique",
     "language_selector_label": "Langue :",
     "folders_frame_title": "Dossiers",
     "input_folder_label": "Dossier d'Entr├®e (Brutes) :",
@@ -429,4 +429,6 @@
     "filter_log_analysis_complete": "Analyse terminée.",
     "filter_warn_astap_missing": "Ex├®cutable ASTAP non configur├® ; r├®solution ignor├®e.",
     "filter_warn_worker_missing": "Organisation auto d├®sactiv├®e car le module de traitement n'a pas pu ├¬tre charg├® : {error}"
+,
+    "photometric_safe_fallback_applied": "Sécurité photométrique appliquée (corr={corr:.3f}, gain={gain:.3f}, offset={offset:.3f}, échantillons={samples})"
 }
