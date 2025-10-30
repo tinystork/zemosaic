@@ -1801,6 +1801,7 @@ class ZeMosaicGUI:
                 _initial_overrides,
                 stream_scan=True,
                 scan_recursive=True,
+                batch_size=200,
                 preview_cap=1500,
                 solver_settings_dict=solver_cfg_payload,
                 config_overrides=config_overrides,
@@ -1876,6 +1877,8 @@ class ZeMosaicGUI:
             # Mark cancelled to ensure GUI end-of-run messages behave consistently if used as pre-run stage
             self._cancel_requested = True
             self._log_message("log_key_processing_cancelled", level="WARN")
+
+        return
 
 
 
