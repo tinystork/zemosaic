@@ -1410,21 +1410,73 @@ def launch_filter_interface(
         resolve_state = {"running": False}
         _progress_log_state = {"last": 0.0}
 
+        MAX_UI_MSG = 150
+        UI_BUDGET_MS = 35.0
+        LOG_FLUSH_INTERVAL = 0.2
+
+        log_buffer: list[tuple[str, str]] = []
+        last_log_flush = {"ts": 0.0}
+
+        pending_visual_refresh: set[int] = set()
+        visual_refresh_job = {"handle": None}
+        footprints_restore_state = {"needs_restore": False, "value": True, "indices": set()}
+
         def _enqueue_event(kind: str, *payload: Any) -> None:
             try:
                 async_events.put_nowait((kind, *payload))
             except Exception:
                 pass
 
-        def _log_message(message: str, level: str = "INFO") -> None:
+        def _write_log_entries(entries: list[tuple[str, str]]) -> None:
+            if not entries:
+                return
             try:
-                timestamp = datetime.datetime.now().strftime("%H:%M:%S")
                 log_widget.configure(state=tk.NORMAL)
-                log_widget.insert(tk.END, f"[{timestamp}] [{level.upper()}] {message}\n")
+                for level, message in entries:
+                    lvl = str(level or "INFO").upper()
+                    text = str(message)
+                    timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+                    log_widget.insert(tk.END, f"[{timestamp}] [{lvl}] {text}\n")
                 log_widget.configure(state=tk.DISABLED)
                 log_widget.see(tk.END)
             except Exception:
                 pass
+
+        def _flush_log_buffer(force: bool = False) -> None:
+            if not log_buffer:
+                return
+            now = time.monotonic()
+            if not force and now - last_log_flush["ts"] < LOG_FLUSH_INTERVAL:
+                return
+            entries = list(log_buffer)
+            log_buffer.clear()
+            last_log_flush["ts"] = now
+            _write_log_entries(entries)
+
+        def _flush_visual_refresh() -> None:
+            visual_refresh_job["handle"] = None
+            if not pending_visual_refresh:
+                return
+            targets = sorted(pending_visual_refresh)
+            pending_visual_refresh.clear()
+            for idx in targets:
+                try:
+                    _refresh_item_visual(idx, schedule_axes=False)
+                except Exception:
+                    pass
+            _schedule_axes_update()
+
+        def _schedule_visual_refresh_flush() -> None:
+            if visual_refresh_job.get("handle") is not None:
+                return
+            try:
+                visual_refresh_job["handle"] = root.after(200, _flush_visual_refresh)
+            except Exception:
+                visual_refresh_job["handle"] = None
+                _flush_visual_refresh()
+
+        def _log_message(message: str, level: str = "INFO") -> None:
+            _write_log_entries([(level, message)])
 
         if not has_explicit_centers:
             _log_message(
@@ -1784,6 +1836,28 @@ def launch_filter_interface(
             summary_var.set(summary_msg)
             _log_message(summary_msg, level="INFO")
 
+            footprints_restore_state["value"] = bool(draw_footprints_var.get())
+            footprints_restore_state["needs_restore"] = True
+            indices_cache = footprints_restore_state.get("indices")
+            if isinstance(indices_cache, set):
+                indices_cache.clear()
+            else:
+                footprints_restore_state["indices"] = set()
+            try:
+                draw_footprints_var.set(False)
+            except Exception:
+                pass
+            if footprints_restore_state["value"]:
+                pending_visual_refresh.update(range(len(items)))
+                _schedule_visual_refresh_flush()
+            try:
+                footprints_chk.state(["disabled"])
+            except Exception:
+                try:
+                    footprints_chk.configure(state=tk.DISABLED)
+                except Exception:
+                    pass
+
             solver_settings_local: Dict[str, Any] = dict(combined_solver_settings)
             if astrometry_api_key:
                 solver_settings_local["api_key"] = astrometry_api_key
@@ -2055,6 +2129,27 @@ def launch_filter_interface(
             except Exception:
                 resolve_state["running"] = False
                 resolve_btn.state(["!disabled"])
+                if footprints_restore_state.get("needs_restore"):
+                    original_value = bool(footprints_restore_state.get("value", True))
+                    try:
+                        draw_footprints_var.set(original_value)
+                    except Exception:
+                        pass
+                    if original_value:
+                        pending_visual_refresh.update(range(len(items)))
+                    if pending_visual_refresh:
+                        _schedule_visual_refresh_flush()
+                    try:
+                        footprints_chk.state(["!disabled"])
+                    except Exception:
+                        try:
+                            footprints_chk.configure(state=tk.NORMAL)
+                        except Exception:
+                            pass
+                    footprints_restore_state["needs_restore"] = False
+                    indices_cache = footprints_restore_state.get("indices")
+                    if isinstance(indices_cache, set):
+                        indices_cache.clear()
                 raise
 
         def _auto_organize_master_tiles() -> None:
@@ -3234,7 +3329,7 @@ def launch_filter_interface(
                 except Exception:
                     stream_state["done"] = True
 
-        def _refresh_item_visual(idx: int) -> None:
+        def _refresh_item_visual(idx: int, *, schedule_axes: bool = True) -> None:
             if idx < 0 or idx >= len(items):
                 return
             item = items[idx]
@@ -3296,7 +3391,8 @@ def launch_filter_interface(
                 except Exception:
                     new_point = None
             update_visuals(idx)
-            _schedule_axes_update()
+            if schedule_axes:
+                _schedule_axes_update()
 
         def _on_draw_mode_change() -> None:
             for index in range(len(items)):
@@ -3408,13 +3504,23 @@ def launch_filter_interface(
                     pass
 
         def _process_async_events() -> None:
+            start = time.monotonic()
+            processed = 0
+            time_budget_exhausted = False
             try:
-                while True:
-                    event = async_events.get_nowait()
+                while processed < MAX_UI_MSG:
+                    if (time.monotonic() - start) * 1000.0 >= UI_BUDGET_MS:
+                        time_budget_exhausted = True
+                        break
+                    try:
+                        event = async_events.get_nowait()
+                    except queue.Empty:
+                        break
+                    processed += 1
                     kind = event[0]
                     if kind == "log":
                         _, message, level = event
-                        _log_message(str(message), level=str(level))
+                        log_buffer.append((str(level or "INFO"), str(message)))
                     elif kind == "header_loaded":
                         _, idx, header_obj = event
                         if (
@@ -3439,7 +3545,14 @@ def launch_filter_interface(
                                     item.refresh_geometry()
                                 except Exception:
                                     pass
-                                _refresh_item_visual(idx)
+                            pending_visual_refresh.add(idx)
+                            _schedule_visual_refresh_flush()
+                            if footprints_restore_state.get("needs_restore"):
+                                indices_cache = footprints_restore_state.get("indices")
+                                if not isinstance(indices_cache, set):
+                                    indices_cache = set()
+                                    footprints_restore_state["indices"] = indices_cache
+                                indices_cache.add(idx)
                     elif kind == "resolve_done":
                         _, resolved_now = event
                         try:
@@ -3456,21 +3569,50 @@ def launch_filter_interface(
                             n=resolved_count,
                         )
                         summary_var.set(summary_msg)
-                        _log_message(summary_msg, level="INFO")
-                        if resolved_count > 0:
-                            _schedule_axes_update()
+                        log_buffer.append(("INFO", summary_msg))
                         resolve_state["running"] = False
                         try:
                             resolve_btn.state(["!disabled"])
                         except Exception:
                             pass
+                        if footprints_restore_state.get("needs_restore"):
+                            original_value = bool(footprints_restore_state.get("value", True))
+                            try:
+                                draw_footprints_var.set(original_value)
+                            except Exception:
+                                pass
+                            indices_cache = footprints_restore_state.get("indices")
+                            if isinstance(indices_cache, set) and indices_cache:
+                                pending_visual_refresh.update(indices_cache)
+                            if original_value and not pending_visual_refresh:
+                                pending_visual_refresh.update(range(len(items)))
+                            if pending_visual_refresh:
+                                _schedule_visual_refresh_flush()
+                            try:
+                                footprints_chk.state(["!disabled"])
+                            except Exception:
+                                try:
+                                    footprints_chk.configure(state=tk.NORMAL)
+                                except Exception:
+                                    pass
+                            footprints_restore_state["needs_restore"] = False
+                            if isinstance(indices_cache, set):
+                                indices_cache.clear()
                     else:
                         pass
-            except queue.Empty:
-                pass
             finally:
+                now = time.monotonic()
+                has_more = False
+                if time_budget_exhausted or processed >= MAX_UI_MSG:
+                    has_more = True
+                if not async_events.empty():
+                    has_more = True
+                flush_due = now - last_log_flush["ts"] >= LOG_FLUSH_INTERVAL
+                _flush_log_buffer(force=flush_due)
+                if log_buffer and not flush_due:
+                    has_more = True
                 try:
-                    root.after(150, _process_async_events)
+                    root.after(60 if has_more else 150, _process_async_events)
                 except Exception:
                     pass
 
