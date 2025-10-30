@@ -4,7 +4,7 @@
 ║ ZeMosaic / ZeSeestarStacker Project                                  ║
 ║                                                                      ║
 ║ Auteur  : Tinystork, seigneur des couteaux à beurre (aka Tristan Nauleau)  
-║ Partenaire : J.A.R.V.I.S. (/ˈdʒɑːrvɪs/) — Just a Rather Very Intelligent System  
+║ Partenaire : J.A.R.V.I.S. (/'dʒɑːrvɪs/) — Just a Rather Very Intelligent System  
 ║              (aka ChatGPT, Grand Maître du ciselage de code)         ║
 ║                                                                      ║
 ║ Licence : GNU General Public License v3.0 (GPL-3.0)                  ║
@@ -26,7 +26,7 @@
 ║ ZeMosaic / ZeSeestarStacker Project                                  ║
 ║                                                                      ║
 ║ Author  : Tinystork, Lord of the Butter Knives (aka Tristan Nauleau) ║
-║ Partner : J.A.R.V.I.S. (/ˈdʒɑːrvɪs/) — Just a Rather Very Intelligent System  
+║ Partner : J.A.R.V.I.S. (/'dʒɑːrvɪs/) — Just a Rather Very Intelligent System  
 ║           (aka ChatGPT, Grand Master of Code Chiseling)              ║
 ║                                                                      ║
 ║ License : GNU General Public License v3.0 (GPL-3.0)                  ║
