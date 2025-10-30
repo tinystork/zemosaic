@@ -1179,6 +1179,10 @@ def launch_filter_interface(
             root.focus_force()
         except Exception:
             pass
+        try:
+            root.protocol("WM_DELETE_WINDOW", root.destroy)
+        except Exception:
+            pass
         # Top-level layout: left plot, right checkboxes/actions
         main = ttk.Frame(root)
         main.pack(fill=tk.BOTH, expand=True)
