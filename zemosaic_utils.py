@@ -736,6 +736,42 @@ def estimate_sky_affine_to_ref(
     gain, offset = fit
     if not (np.isfinite(gain) and np.isfinite(offset)):
         return None
+
+    # --- Safe photometric fallback (visual stability only) ---
+    # Compute correlation between selected samples. If correlation is weak or
+    # fitted gain is non-positive, recompute a stable gain/offset from robust
+    # statistics to avoid negative-flux master tiles on weak datasets.
+    try:
+        corr = float(np.corrcoef(x_sel, y_sel)[0, 1])
+    except Exception:
+        corr = float("nan")
+
+    if float(gain) <= 0.0 or (not np.isfinite(corr)) or abs(corr) < 0.3:
+        src_med = float(np.nanmedian(x_sel))
+        ref_med = float(np.nanmedian(y_sel))
+        src_std = float(np.nanstd(x_sel))
+        ref_std = float(np.nanstd(y_sel))
+        if src_std > 1e-6:
+            safe_gain = max(1e-6, ref_std / src_std)
+        else:
+            safe_gain = 1.0
+        safe_gain = np.float32(safe_gain)
+        safe_offset = np.float32(ref_med - float(safe_gain) * src_med)
+
+        # Log explicit safeguard application for diagnostics
+        try:
+            logger.debug(
+                "Photometric safeguard applied (corr=%.3f, gain=%.3f, offset=%.3f, samples=%d)",
+                corr if np.isfinite(corr) else float("nan"),
+                float(safe_gain),
+                float(safe_offset),
+                int(x_sel.size),
+            )
+        except Exception:
+            pass
+
+        gain, offset = float(safe_gain), float(safe_offset)
+
     return float(gain), float(offset), int(x_sel.size)
 
 
