@@ -1,12 +1,12 @@
-﻿{
+{
     "window_title": "ZeMosaic V3.2.2 - fulgur Hierarchical Mosaicker",
     "language_selector_label": "Language:",
     "folders_frame_title": "Folders",
     "input_folder_label": "Input Folder (Raws):",
     "output_folder_label": "Output Folder:",
     "save_final_16bit_label": "Save Final Mosaic as 16-bit:",
-    "output_advanced_show": "Advanced Ôû©",
-    "output_advanced_hide": "Advanced Ôû¥",
+    "output_advanced_show": "Advanced ▸",
+    "output_advanced_hide": "Advanced ▾",
     "legacy_rgb_cube_label": "Legacy 3D RGB (not recommended):",
     "astap_config_frame_title": "ASTAP Configuration",
     "astap_exe_label": "ASTAP Executable Path:",
@@ -22,9 +22,9 @@
     "astap_sensitivity_label": "ASTAP Sensitivity (-sens):",
     "astap_sensitivity_note": "(e.g., 100, higher = more sensitive)",
     "panel_clustering_threshold_label": "Panel Clustering Threshold (deg):",
-    "panel_clustering_threshold_note": "Typical Seestar S50: 0.05ÔÇô0.12┬░ same session; up to 0.20┬░ multi-night. Larger values may merge adjacent panels.",
+    "panel_clustering_threshold_note": "Typical Seestar S50: 0.05–0.12° same session; up to 0.20° multi-night. Larger values may merge adjacent panels.",
     "panel_orientation_split_label": "Split by orientation (deg) 0=off:",
-    "panel_orientation_split_note": "Uses WCS field angle; edges require |╬öangle| Ôëñ threshold.",
+    "panel_orientation_split_note": "Uses WCS field angle; edges require |Δangle| ≤ threshold.",
     "open_filter_button": "Open Filter",
     "launch_button": "Start Hierarchical Mosaic",
     "stop_button": "Stop",
@@ -52,17 +52,14 @@
     "quality_crop_toggle_label": "Quality-based crop (signal)",
     "quality_crop_advanced": "Advanced",
     "quality_crop_band_label": "Band (px)",
-    "quality_crop_ks_label": "k┬Àsigma",
+    "quality_crop_ks_label": "k·sigma",
     "quality_crop_margin_label": "Margin (px)",
-
     "gui_logging_title": "Logging",
     "gui_logging_level": "Logging level:",
     "logging_level_debug": "Debug",
     "logging_level_info": "Info",
     "logging_level_warn": "Warn",
     "logging_level_error": "Error",
-
-
     "config_warning_title": "Config Warning",
     "config_module_not_found_warning": "Configuration module (zemosaic_config.py) not found.\nASTAP paths will not be saved between sessions.",
     "astap_path_title": "ASTAP Path",
@@ -109,7 +106,6 @@
     "q_quit_while_processing_msg": "Processing is currently in progress.\nQuitting now might interrupt the process abruptly.\n\nAre you sure you want to quit?",
     "critical_launch_error_title": "Critical Launch Error",
     "worker_module_missing_critical_error": "Worker module (zemosaic_worker.py) not found or import error.\nZeMosaic cannot start its main functionalities.\n\nPlease check console logs for import error details and ensure all dependencies (Astropy, Reproject, etc.) are installed.",
-
     "run_error_critical_deps_missing": "CRITICAL ERROR: Missing module(s): {modules}. Aborting.",
     "run_info_processing_started": "Starting mosaic processing (Master Tile Workflow)...",
     "run_error_no_fits_found_input": "ERROR: No FITS files found in input folder.",
@@ -150,9 +146,6 @@
     "run_info_temp_master_tiles_cleaned": "Temporary Master Tiles cleaned up.",
     "run_warn_phase7_cleanup_failed": "WARNING P7: Failed to clean up temporary Master Tile folder '{directory}': {error}",
     "run_success_processing_completed": "Hierarchical mosaic processing completed in {duration}s.",
-
-
-    
     "calcgrid_info_start_calc": "CalcGrid: Starting grid calculation for {num_wcs_shapes} WCS/shapes. Scale: {scale_factor}x",
     "calcgrid_error_reproject_unavailable": "CalcGrid ERROR: Reproject (find_optimal_celestial_wcs) not available.",
     "calcgrid_error_astropy_unavailable": "CalcGrid ERROR: Astropy (units/Angle) not available.",
@@ -168,10 +161,9 @@
     "calcgrid_info_optimal_grid_calculated": "CalcGrid: Optimal grid: Shape(H,W)={shape}, CRVAL={crval}",
     "calcgrid_error_find_optimal_wcs_unavailable": "CalcGrid ERROR: find_optimal_celestial_wcs function is not available.",
     "calcgrid_error_find_optimal_wcs_call": "CalcGrid ERROR calling find_optimal_celestial_wcs: {error}",
-
     "clusterstacks_error_astropy_unavailable": "ClusterStacks ERROR: Astropy (SkyCoord/units) not available.",
     "clusterstacks_warn_no_raw_info": "ClusterStacks: No raw file information provided.",
-    "clusterstacks_info_start": "ClusterStacks: Clustering {num_files} raw files (fine threshold: {threshold}┬░)...",
+    "clusterstacks_info_start": "ClusterStacks: Clustering {num_files} raw files (fine threshold: {threshold}°)...",
     "clusterstacks_warn_no_centers": "ClusterStacks WARN: No valid celestial centers found for clustering.",
     "clusterstacks_info_finished": "ClusterStacks: {num_groups} Seestar stacks (fine groups) formed.",
     "clusterstacks_info_groups_split_auto_limit": "Auto limit enabled: groups split from {original} to {new}, max {limit} frames (sample {shape})",
@@ -179,9 +171,8 @@
     "clusterstacks_warn_auto_limit_failed": "Auto limit estimation failed: {error}",
     "clusterstacks_warn_ram_budget_split": "RAM budget exceeded for group #{group_index}: {original_frames} frame(s) (~{estimated_mb:.1f} MiB) > budget {budget_mb:.1f} MiB. Split into {num_subgroups} subgroup(s) of <= {segment_size} frame(s).",
     "clusterstacks_warn_ram_budget_split_still_over": "Even after splitting, subgroup(s) for group #{group_index} exceed the budget {budget_mb:.1f} MiB (segment size {segment_size}). Proceeding with caution.",
-    "clusterstacks_warn_ram_budget_recluster": "RAM budget exceeded for group #{group_index}: {original_frames} frame(s) (~{estimated_mb:.1f} MiB) > budget {budget_mb:.1f} MiB. Relaxed clustering threshold to {new_threshold_deg:.4f}┬░ (attempt {attempts}) ÔåÆ {num_subgroups} subgroup(s).",
+    "clusterstacks_warn_ram_budget_recluster": "RAM budget exceeded for group #{group_index}: {original_frames} frame(s) (~{estimated_mb:.1f} MiB) > budget {budget_mb:.1f} MiB. Relaxed clustering threshold to {new_threshold_deg:.4f}° (attempt {attempts}) → {num_subgroups} subgroup(s).",
     "clusterstacks_warn_ram_budget_single_over": "RAM budget warning for group #{group_index}: single frame still requires ~{estimated_mb:.1f} MiB > budget {budget_mb:.1f} MiB. No further split possible.",
-
     "getwcs_error_utils_unavailable": "GetWCS_Pretreat ERROR: zemosaic_utils module not available.",
     "getwcs_error_load_failed": "GetWCS_Pretreat ERROR: Failed to load '{filename}'.",
     "getwcs_warn_debayer_failed": "GetWCS_Pretreat WARN: Debayering failed for '{filename}': {error}. Attempting to stack as grayscale (replicated).",
@@ -197,7 +188,6 @@
     "getwcs_error_set_pixel_shape_final": "GetWCS_Pretreat ERROR: Failed setting final pixel_shape: {error}.",
     "getwcs_error_invalid_naxis_for_pixel_shape": "GetWCS_Pretreat ERROR: Invalid NAXIS1/2 for final pixel_shape.",
     "getwcs_info_pretreatment_wcs_ok": "GetWCS_Pretreat: Pretreatment and WCS OK for '{filename}'. WCS CRVAL: {crval}.",
-
     "mastertile_info_creation_started": "MasterTile_{tile_id}: Creation started ({num_raw} raws)...",
     "mastertile_error_utils_unavailable": "MasterTile_{tile_id} ERROR: zemosaic_utils not available.",
     "mastertile_error_alignstack_unavailable": "MasterTile_{tile_id} ERROR: zemosaic_align_stack not available.",
@@ -221,7 +211,6 @@
     "mastertile_info_saved": "MasterTile_{tile_id} saved ({format_type}): {filename}",
     "mastertile_info_saving_finished": "MasterTile_{tile_id}: === Saving Master Tile Finished ===",
     "mastertile_error_saving": "MasterTile_{tile_id} ERROR (saving): {error}",
-    
     "assemble_error_reproject_unavailable": "AssembleFinal ERROR: Reproject library not available.",
     "assemble_info_start": "AssembleFinal: Assembling {num_tiles} master tiles...",
     "assemble_error_read_master_tile": "AssembleFinal ERROR reading Master Tile {filename}: {error}. Skipped.",
@@ -229,9 +218,6 @@
     "assemble_info_final_stacking_started": "AssembleFinal: Final stacking of {num_valid_tiles} valid Master Tiles...",
     "assemble_error_stacking_failed": "AssembleFinal ERROR stacking: {error}",
     "assemble_info_finished": "AssembleFinal: Final mosaic assembled.",
-
-
-    
     "run_info_phase1_started_cache": "Phase 1: Scanning raw files, preprocessing, WCS, and caching image data...",
     "run_error_cache_dir_creation_failed": "ERROR: Could not create temporary image cache directory '{directory}': {error}",
     "run_error_phase1_cache_save_failed": "ERROR Phase 1: Failed to save preprocessed data for '{filename}' to cache: {error}",
@@ -244,7 +230,6 @@
     "run_warn_phase7_cache_cleanup_failed": "WARNING P7: Failed to clean up temporary image cache folder '{directory}': {error}",
     "run_info_temp_master_tiles_fits_cleaned": "Temporary master tile FITS directory '{directory}' cleaned up.",
     "run_warn_phase7_master_tiles_fits_cleanup_failed": "WARNING P7: Failed to clean up temporary master tile FITS folder '{directory}': {error}",
-
     "mastertile_info_creation_started_from_cache": "MasterTile_{tile_id}: Creation started from cache ({num_raw} raws)...",
     "mastertile_info_loading_from_cache_started": "MasterTile_{tile_id}: === Start Loading Preprocessed Images from Cache ({num_images} images) ===",
     "mastertile_warn_cache_file_missing": "MasterTile_{tile_id} WARN: Cached preprocessed file for '{filename}' not found at '{cache_path}'. Skipped.",
@@ -255,16 +240,12 @@
     "mastertile_info_loading_from_cache_finished": "MasterTile_{tile_id}: === Loading from Cache Finished. {num_loaded} images ready. ===",
     "stacking_options_frame_title": "Stacking Options (Master Tiles)",
     "stacking_norm_method_label": "Normalization:",
-    
-
-
-    
     "norm_method_none": "None",
     "norm_method_linear_fit": "Linear Fit (Sky)",
     "norm_method_sky_mean": "Sky Mean Subtraction",
     "stacking_weight_method_label": "Weighting:",
     "weight_method_none": "None",
-    "weight_method_noise_variance": "Noise Variance (1/¤â┬▓)",
+    "weight_method_noise_variance": "Noise Variance (1/σ²)",
     "weight_method_noise_fwhm": "Noise + FWHM",
     "stacking_reject_algo_label": "Rejection Algorithm:",
     "reject_algo_none": "None",
@@ -278,9 +259,6 @@
     "stacking_final_combine_label": "Final Combine:",
     "combine_method_mean": "Mean",
     "combine_method_median": "Median",
-    
-    
-    
     "invalid_winsor_limits_error": "Invalid Winsor limits format (e.g., '0.05,0.05'). Limits must be 0.0 to <0.5. Error: {error}",
     "stackhelper_warn_norm_sky_mean_not_implemented": "StackHelper WARN: Sky Mean normalization not yet implemented. Skipping.",
     "stackhelper_warn_weight_noise_var_not_implemented": "StackHelper WARN: Noise Variance weighting not yet implemented. Using uniform weights.",
@@ -320,7 +298,6 @@
     "stackimages_info_applying_offset": "StackImages INFO: Applying final offset of {offset:.2f} to reach target ADU {target_adu:.1f}.",
     "stackimages_warn_min_not_finite_offset_skipped": "StackImages WARN: Minimum value of stacked image is not finite. Skipping final offset.",
     "stackimages_info_min_above_target_offset_skipped": "StackImages INFO: Minimum value {current_min:.1f} already above target ADU {target_adu:.1f}. Skipping final offset.",
-    
     "stacking_post_equalize_rgb_label": "Equalize RGB (per sub-stack):",
     "stacking_apply_radial_label": "Apply Radial Weighting:",
     "stacking_radial_feather_label": "Radial Feather Fraction (0.1-1.0):",
@@ -332,7 +309,7 @@
     "gpu_selector_label": "GPU selector:",
     "intertile_match_label": "Inter-tile photometric match:",
     "intertile_preview_label": "Preview grid size:",
-    "intertile_preview_hint": "(pixels; 256ÔÇô1024 recommended)",
+    "intertile_preview_hint": "(pixels; 256–1024 recommended)",
     "intertile_overlap_label": "Minimum overlap fraction:",
     "intertile_overlap_hint": "(vs. smaller tile area)",
     "intertile_sky_label": "Sky percentile range:",
@@ -365,23 +342,20 @@
     "max_raw_per_master_tile_note": "0 = automatic (calculated). Positive value = maximum raw images per master tile.",
     "reject_winsor_info_channel_progress": "Winsorized Sigma Clip processing channel {channel}...",
     "reject_winsor_info_mono_progress": "Winsorized Sigma Clip processing monochrome data...",
-
     "assemble_error_invalid_final_shape_inc": "Incremental assembly ERROR: invalid final output shape {shape}.",
     "assemble_warn_swapped_final_shape_inc": "Incremental assembly WARNING: provided dimensions {provided} were swapped, expected {expected}. Automatically corrected.",
     "assemble_error_mismatch_final_shape_inc": "Incremental assembly ERROR: provided dimensions {provided} do not match mosaic grid {expected}.",
     "assemble_error_invalid_final_shape_reproj_coadd": "Reproject & Coadd ERROR: invalid final output shape {shape}.",
     "assemble_warn_swapped_final_shape_reproj_coadd": "Reproject & Coadd WARNING: provided dimensions {provided} were swapped, expected {expected}. Automatically corrected.",
     "assemble_error_mismatch_final_shape_reproj_coadd": "Reproject & Coadd ERROR: provided dimensions {provided} do not match mosaic grid {expected}.",
-
     "aligngroup_error_astroalign_unavailable": "AlignGroup ERROR: astroalign not available. Alignment cannot proceed.",
     "aligngroup_error_invalid_input_list_or_ref_index": "AlignGroup ERROR: invalid image list or reference index {ref_idx} out of range.",
     "aligngroup_error_ref_image_none": "AlignGroup ERROR: reference image (index {ref_idx}) is None.",
-    "aligngroup_warn_shape_mismatch_after_align": "AlignGroup WARNING: aligned image (idx {img_idx}) shape {aligned_shape} Ôëá reference {ref_shape}. Skipping.",
+    "aligngroup_warn_shape_mismatch_after_align": "AlignGroup WARNING: aligned image (idx {img_idx}) shape {aligned_shape} ≠ reference {ref_shape}. Skipping.",
     "aligngroup_warn_register_returned_none": "AlignGroup WARNING: astroalign returned None for image {img_idx}.",
     "aligngroup_warn_max_iter_error": "AlignGroup WARNING: maximum iterations reached for image {img_idx}. Skipping.",
     "aligngroup_warn_value_error": "AlignGroup WARNING: ValueError aligning image {img_idx}: {error}",
     "aligngroup_error_exception_aligning": "AlignGroup ERROR: exception {error_type} on image {img_idx}: {error_msg}",
-
     "run_info_phase5_started_reproject_coadd": "Phase 5: Final assembly (Reproject & Coadd)...",
     "run_info_phase5_started_incremental": "Phase 5: Final assembly (Incremental on-disk coadd)...",
     "run_error_phase5_inc_func_missing": "CRITICAL P5: Incremental assembly function not available.",
@@ -391,10 +365,8 @@
     "run_error_phase5_assembly_failed_incremental": "ERROR P5: Final mosaic assembly via Incremental method failed.",
     "run_info_phase5_finished_incremental": "Phase 5 finished: Incremental assembly completed. Mosaic shape (HWC): {shape}",
     "run_warn_phase5_invalid_tile_skipped_for_assembly": "WARN P5: Invalid Master Tile ({filename}) skipped for final assembly.",
-
     "getwcs_info_header_written": "WCS header updated for: {filename}",
     "getwcs_warn_header_write_failed": "WARNING: Failed to update WCS header for {filename}: {error}",
-
     "run_info_preview_stretch_started_auto_asifits": "Preview: Applying ASI FITS-like auto stretch...",
     "run_success_preview_saved_auto_asifits": "Preview saved (auto ASI FITS-like): {filename}",
     "run_warn_preview_imwrite_failed_auto_asifits": "WARNING: Could not save preview PNG (auto ASI FITS-like): {filename}",
@@ -403,21 +375,17 @@
     "run_error_preview_opencv_failed_auto_asifits": "ERROR: OpenCV write failed for auto ASI FITS-like preview: {error}",
     "run_error_preview_stretch_auto_asifits_returned_none": "ERROR: auto ASI FITS-like stretch returned no image.",
     "run_info_preview_fallback_to_simple_asinh": "Preview: Fallback to simple asinh stretch.",
-
     "assemble_error_no_tiles_provided_reproject_coadd": "Reproject & Coadd ERROR: no valid Master Tiles to assemble.",
     "assemble_error_reproject_coadd_call_failed": "Reproject & Coadd ERROR: processing failed: {error}",
     "assemble_info_intertile_photometric_applied": "Phase 5: Applied inter-tile photometric calibration to {num_tiles} tile(s).",
     "assemble_warn_intertile_photometric_failed": "Phase 5: Inter-tile photometric calibration failed: {error}",
-
     "run_warn_phase4_failed_set_pixel_shape": "WARN P4: Failed to set pixel shape for a Master Tile; using defaults.",
     "run_warn_phase4_invalid_master_tile_for_grid": "WARN P4: Invalid Master Tile WCS/shape for grid; skipped.",
     "run_warn_phase4_no_data_in_tile_fits": "WARN P4: No data found in Master Tile FITS; skipped.",
     "run_warn_phase4_unhandled_tile_shape": "WARN P4: Unhandled Master Tile shape; skipped.",
     "run_warn_phase4_zero_dimensions_tile": "WARN P4: Master Tile has zero dimensions; skipped.",
-
     "panel_clustering_target_label": "Target stacks (auto-threshold):",
     "panel_clustering_target_note": "0 disables. Increase threshold to reach ~target groups.",
-
     "filter_cluster_params_title": "Clustering parameters",
     "filter_cluster_target_label": "Target stacks:",
     "filter_cluster_threshold_label": "Panel threshold (deg):",
@@ -430,17 +398,22 @@
     "run_error_phase3_thread_exception": "ERROR P3: Exception in master tile creation thread.",
     "run_error_phase4_reading_tile_shape": "ERROR P4: Failed reading Master Tile shape.",
     "run_error_preview_stretch_unexpected_main": "ERROR: Unexpected error during preview stretch: {error}",
-
     "filter_window_title": "ZeMosaic - Filter WCS images (optional)",
     "filter_axis_ra_deg": "RA [deg]",
     "filter_axis_dec_deg": "Dec [deg]",
     "filter_exclude_by_distance_title": "Exclude by distance to center",
     "filter_distance_label": "Distance (deg):",
-    "filter_exclude_gt_x": "Exclude > X┬░",
+    "filter_exclude_gt_x": "Exclude > X°",
     "filter_images_check_to_keep": "Images (check to keep)",
     "filter_log_panel_title": "Activity log",
     "filter_btn_resolve_wcs": "Resolve missing WCS",
     "filter_btn_auto_group": "Auto-organize Master Tiles",
+    "filter_btn_analyse": "Analyse",
+    "filter_btn_export_csv": "Export CSV",
+    "filter_chk_draw_footprints": "Draw WCS footprints",
+    "filter_chk_write_wcs": "Write WCS to file",
+    "filter_status_crawling": "Crawling files… please wait",
+    "filter_status_ready": "Crawling done.",
     "filter_log_resolving": "Resolving missing WCS...",
     "filter_log_resolved_n": "Resolved WCS for {n} files.",
     "filter_log_no_missing_wcs": "All listed files already include a WCS solution.",

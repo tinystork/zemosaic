@@ -1,69 +1,48 @@
-﻿"""
-â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
-â•‘ ZeMosaic / ZeSeestarStacker Project                                  â•‘
-â•‘                                                                      â•‘
-â•‘ Auteur  : Tinystork, seigneur des couteaux Ã  beurre (aka Tristan Nauleau)  
-â•‘ Partenaire : J.A.R.V.I.S. (/ËˆdÊ’É‘ËrvÉªs/) â€” Just a Rather Very Intelligent System  
-â•‘              (aka ChatGPT, Grand MaÃ®tre du ciselage de code)         â•‘
-â•‘                                                                      â•‘
-â•‘ Licence : GNU General Public License v3.0 (GPL-3.0)                  â•‘
-â•‘                                                                      â•‘
-â•‘ Description :                                                        â•‘
-â•‘   Ce programme a Ã©tÃ© forgÃ© Ã  la lueur des pixels et de la cafÃ©ine,   â•‘
-â•‘   dans le but noble de transformer des nuages de photons en art      â•‘
-â•‘   astronomique. Si vous lâ€™utilisez, pensez Ã  dire â€œmerciâ€,           â•‘
-â•‘   Ã  lever les yeux vers le ciel, ou Ã  citer Tinystork et J.A.R.V.I.S.â•‘
-â•‘   (le karma des dÃ©veloppeurs en dÃ©pend).                             â•‘
-â•‘                                                                      â•‘
-â•‘ Avertissement :                                                      â•‘
-â•‘   Aucune IA ni aucun couteau Ã  beurre nâ€™a Ã©tÃ© blessÃ© durant le       â•‘
-â•‘   dÃ©veloppement de ce code.                                          â•‘
-â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-
-
-â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
-â•‘ ZeMosaic / ZeSeestarStacker Project                                  â•‘
-â•‘                                                                      â•‘
-â•‘ Author  : Tinystork, Lord of the Butter Knives (aka Tristan Nauleau) â•‘
-â•‘ Partner : J.A.R.V.I.S. (/ËˆdÊ’É‘ËrvÉªs/) â€” Just a Rather Very Intelligent System  
-â•‘           (aka ChatGPT, Grand Master of Code Chiseling)              â•‘
-â•‘                                                                      â•‘
-â•‘ License : GNU General Public License v3.0 (GPL-3.0)                  â•‘
-â•‘                                                                      â•‘
-â•‘ Description:                                                         â•‘
-â•‘   This program was forged under the sacred light of pixels and       â•‘
-â•‘   caffeine, with the noble intent of turning clouds of photons into  â•‘
-â•‘   astronomical art. If you use it, please consider saying â€œthanks,â€  â•‘
-â•‘   gazing at the stars, or crediting Tinystork and J.A.R.V.I.S. â€”     â•‘
-â•‘   developer karma depends on it.                                     â•‘
-â•‘                                                                      â•‘
-â•‘ Disclaimer:                                                          â•‘
-â•‘   No AIs or butter knives were harmed in the making of this code.    â•‘
-â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-
-Optional GUI filter for ZeMosaic Phase 1 results.
-
-This module exposes a single function:
-
-    launch_filter_interface(
-        raw_files_with_wcs: list[dict],
-        initial_overrides: dict | None = None,
-    ) -> tuple[list[dict], bool, dict | None]
-
-It opens a small Tkinter window with a schematic sky map (RA/Dec, in degrees)
-showing the footprint of each WCS-resolved image as a polygon and a checkbox
-list to include/exclude individual images. A helper can also exclude images
-farther than X degrees from the global center.
-
-Safety requirements:
-- If this module is missing or raises, the caller should continue unchanged.
-- If the window is closed or any error occurs, the original input list is
-  returned unchanged.
-  In that case this function returns (original_list, False) so the caller can
-  decide to abort processing.
-
-Dependencies limited to tkinter, astropy, matplotlib, numpy; all optional.
+# zemosaic_filter_gui.py
 """
+╔══════════════════════════════════════════════════════════════════════╗
+║ ZeMosaic / ZeSeestarStacker Project                                  ║
+║                                                                      ║
+║ Auteur  : Tinystork, seigneur des couteaux à beurre (aka Tristan Nauleau)
+║ Partenaire : J.A.R.V.I.S. (/ˈdʒɑːrvɪs/) — Just a Rather Very Intelligent System
+║              (aka ChatGPT, Grand Maître du ciselage de code)         ║
+║                                                                      ║
+║ Licence : GNU General Public License v3.0 (GPL-3.0)                  ║
+║                                                                      ║
+║ Description :                                                        ║
+║   Ce programme a été forgé à la lueur des pixels et de la caféine,   ║
+║   dans le but noble de transformer des nuages de photons en art      ║
+║   astronomique. Si vous l’utilisez, pensez à dire “merci”,           ║
+║   à lever les yeux vers le ciel, ou à citer Tinystork et J.A.R.V.I.S.║
+║   (le karma des développeurs en dépend).                             ║
+║                                                                      ║
+║ Avertissement :                                                      ║
+║   Aucune IA ni aucun couteau à beurre n’a été blessé durant le       ║
+║   développement de ce code.                                          ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+
+╔══════════════════════════════════════════════════════════════════════╗
+║ ZeMosaic / ZeSeestarStacker Project                                  ║
+║                                                                      ║
+║ Author  : Tinystork, Lord of the Butter Knives (aka Tristan Nauleau) ║
+║ Partner : J.A.R.V.I.S. (/ˈdʒɑːrvɪs/) — Just a Rather Very Intelligent System
+║           (aka ChatGPT, Grand Master of Code Chiseling)              ║
+║                                                                      ║
+║ License : GNU General Public License v3.0 (GPL-3.0)                  ║
+║                                                                      ║
+║ Description:                                                         ║
+║   This program was forged under the sacred light of pixels and       ║
+║   caffeine, with the noble intent of turning clouds of photons into  ║
+║   astronomical art. If you use it, please consider saying “thanks,”  ║
+║   gazing at the stars, or crediting Tinystork and J.A.R.V.I.S. —     ║
+║   developer karma depends on it.                                     ║
+║                                                                      ║
+║ Disclaimer:                                                          ║
+║   No AIs or butter knives were harmed in the making of this code.    ║
+╚══════════════════════════════════════════════════════════════════════╝
+"""
+
 
 from __future__ import annotations
 
@@ -1076,7 +1055,7 @@ def launch_filter_interface(
             "filter_window_title",
             "ZeMosaic - Filtrer les images WCS (optionnel)" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "ZeMosaic - Filter WCS images (optional)"
         ))
-        # S'assurer que la fenÃªtre apparaÃ®t au premier plan et prend le focus
+        # S'assurer que la fenêtre apparaît au premier plan et prend le focus
         try:
             root.lift()
             root.attributes("-topmost", True)
@@ -1095,7 +1074,7 @@ def launch_filter_interface(
         status = ttk.Frame(main)
         status.grid(row=0, column=0, columnspan=2, sticky="ew")
         status.columnconfigure(1, weight=1)
-        status_var = tk.StringVar(master=root, value=_tr("filter_status_crawling", "Crawling filesâ€¦ please wait"))
+        status_var = tk.StringVar(master=root, value=_tr("filter_status_crawling", "Crawling files… please wait"))
         ttk.Label(status, textvariable=status_var).grid(row=0, column=0, padx=6, pady=4, sticky="w")
         pb = ttk.Progressbar(status, mode="indeterminate", length=180)
         pb.grid(row=0, column=1, padx=6, pady=4, sticky="e")
@@ -1132,7 +1111,7 @@ def launch_filter_interface(
                     status_var.set(
                         _tr(
                             "filter_status_click_analyse",
-                            "Cliquez sur Analyse pour dÃ©marrer l'exploration." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Ready â€” click Analyse to scan.",
+                            "Cliquez sur Analyse pour démarrer l'exploration." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Ready — click Analyse to scan.",
                         )
                     )
                 except Exception:
@@ -1156,7 +1135,7 @@ def launch_filter_interface(
                 status_var.set(
                     _tr(
                         "filter_status_populating",
-                        "Preparing listâ€¦ {current}/{total}",
+                        "Preparing list… {current}/{total}",
                     ).format(current=0, total=total_initial_entries)
                 )
             else:
@@ -1374,7 +1353,7 @@ def launch_filter_interface(
                     ),
                     _tr(
                         "filter_invalid_value_message",
-                        "Veuillez entrer une distance en degrÃ©s (nombre)." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Please enter a distance in degrees (number).",
+                        "Veuillez entrer une distance en degrés (nombre)." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Please enter a distance in degrees (number).",
                     ),
                 )
                 return
@@ -1389,7 +1368,7 @@ def launch_filter_interface(
             thresh_frame,
             text=_tr(
                 "filter_apply_threshold_button",
-                "Exclure > XÂ°" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Exclude > XÂ°",
+                "Exclure > X°" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Exclude > X°",
             ),
             command=apply_threshold,
         )
@@ -1410,7 +1389,7 @@ def launch_filter_interface(
             right,
             text=_tr(
                 "filter_log_panel_title",
-                "Activity log" if 'fr' not in str(locals().get('lang_code', 'en')).lower() else "Journal d'activitÃ©",
+                "Activity log" if 'fr' not in str(locals().get('lang_code', 'en')).lower() else "Journal d'activité",
             ),
         )
         log_frame.grid(row=1, column=0, sticky="nsew", padx=5, pady=(0, 5))
@@ -1442,7 +1421,7 @@ def launch_filter_interface(
             _log_message(
                 _tr(
                     "filter_warn_no_displayable_wcs",
-                    "Aucune information WCS/centre disponible ; l'aperÃ§u restera vide mais vous pouvez sÃ©lectionner les fichiers." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "No WCS/center information available; the sky preview will remain empty but you can still select files.",
+                    "Aucune information WCS/centre disponible ; l'aperçu restera vide mais vous pouvez sélectionner les fichiers." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "No WCS/center information available; the sky preview will remain empty but you can still select files.",
                 ),
                 level="WARN",
             )
@@ -1658,7 +1637,7 @@ def launch_filter_interface(
             summary_var.set(
                 _tr(
                     "filter_summary_no_centers",
-                    "Centres WCS indisponibles â€” sÃ©lection manuelle uniquement." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "WCS centers unavailable â€” manual selection only.",
+                    "Centres WCS indisponibles — sélection manuelle uniquement." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "WCS centers unavailable — manual selection only.",
                 )
             )
 
@@ -2022,7 +2001,7 @@ def launch_filter_interface(
             actions,
             text=_tr(
                 "filter_select_all",
-                "Tout sÃ©lectionner" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Select all",
+                "Tout sélectionner" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Select all",
             ),
             command=select_all,
         ).pack(side=tk.LEFT, padx=4)
@@ -2030,7 +2009,7 @@ def launch_filter_interface(
             actions,
             text=_tr(
                 "filter_select_none",
-                "Tout dÃ©sÃ©lectionner" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Deselect all",
+                "Tout désélectionner" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Deselect all",
             ),
             command=select_none,
         ).pack(side=tk.LEFT, padx=4)
@@ -2572,7 +2551,7 @@ def launch_filter_interface(
             status_var.set(
                 _tr(
                     "filter_status_populating",
-                    "Preparing listâ€¦ {current}/{total}",
+                    "Preparing list… {current}/{total}",
                 ).format(current=min(processed, population_state["total"]), total=population_state["total"])
             )
 
@@ -2583,7 +2562,7 @@ def launch_filter_interface(
             if item.center is not None:
                 try:
                     sep_deg = item.center.separation(global_center).to(u.deg).value
-                    sep_txt = f"  ({sep_deg:.2f}Â°)"
+                    sep_txt = f"  ({sep_deg:.2f}°)"
                 except Exception:
                     sep_txt = ""
 
@@ -2853,7 +2832,7 @@ def launch_filter_interface(
                         sep_txt = ""
                         if items[existing_idx].center is not None:
                             sep_deg = items[existing_idx].center.separation(global_center).to(u.deg).value
-                            sep_txt = f"  ({sep_deg:.2f}Â°)"
+                            sep_txt = f"  ({sep_deg:.2f}°)"
                         _update_item_label(existing_idx, base_name + sep_txt)
                     except Exception:
                         pass
@@ -3076,7 +3055,7 @@ def launch_filter_interface(
             if not force and not stream_state.get("pending_start"):
                 return
             stream_state["pending_start"] = False
-            stream_state["status_message"] = _tr("filter_status_crawling", "Crawling filesâ€¦ please wait")
+            stream_state["status_message"] = _tr("filter_status_crawling", "Crawling files… please wait")
             try:
                 status_var.set(stream_state["status_message"])
             except Exception:
@@ -3151,7 +3130,7 @@ def launch_filter_interface(
                     status_var.set(
                         _tr(
                             "filter_status_click_analyse",
-                            "Cliquez sur Analyse pour dÃ©marrer l'exploration." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Ready â€” click Analyse to scan.",
+                            "Cliquez sur Analyse pour démarrer l'exploration." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Ready — click Analyse to scan.",
                         )
                     )
                 except Exception:
@@ -3403,10 +3382,10 @@ def launch_filter_interface(
             return raw_files_with_wcs, False, None
 
     except ImportError:
-        # Any optional dependency missing â€” silently keep all
+        # Any optional dependency missing — silently keep all
         return raw_files_with_wcs, False, None
     except Exception:
-        # Any unexpected error â€” fail safe and keep all
+        # Any unexpected error — fail safe and keep all
         return raw_files_with_wcs, False, None
 
 
