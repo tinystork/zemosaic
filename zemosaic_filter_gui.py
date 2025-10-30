@@ -1636,7 +1636,7 @@ def launch_filter_interface(
         operations.columnconfigure(2, weight=1)
 
         draw_footprints_var = tk.BooleanVar(master=root, value=False)
-        write_wcs_var = tk.BooleanVar(master=root, value=False)
+        write_wcs_var = tk.BooleanVar(master=root, value=True)
 
         resolve_btn = ttk.Button(
             operations,
