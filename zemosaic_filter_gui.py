@@ -128,6 +128,45 @@ def _merge_small_groups(groups: list[list[dict]], min_size: int, cap: int) -> li
     return [grp for idx, grp in enumerate(groups) if not merged_flags[idx]]
 
 
+def _compute_dynamic_footprint_budget(
+    total_items: int,
+    preview_cap: Any,
+    *,
+    max_footprints: int,
+) -> int:
+    """Return the footprint budget capped dynamically for preview rendering.
+
+    Parameters
+    ----------
+    total_items : int
+        Number of catalogue entries that could be rendered.
+    preview_cap : Any
+        User-provided preview cap (may be ``None`` or a string).
+    max_footprints : int
+        Hard upper bound derived from configuration/CLI arguments.
+    """
+
+    base_cap = max_footprints
+    try:
+        coerced = int(preview_cap or 0)
+        fallback = coerced or max_footprints
+        base_cap = min(max_footprints, fallback)
+    except Exception:
+        base_cap = max_footprints
+
+    if total_items >= 2000:
+        cap = 0
+    elif total_items >= 1200:
+        cap = min(base_cap, 400)
+    else:
+        cap = min(base_cap, 1500)
+
+    try:
+        return max(0, int(cap))
+    except Exception:
+        return 0
+
+
 def launch_filter_interface(
     raw_files_with_wcs_or_dir,
     initial_overrides: Optional[Dict[str, Any]] = None,
@@ -376,8 +415,9 @@ def launch_filter_interface(
         from astropy.wcs.utils import pixel_to_skycoord
         import astropy.units as u
         from matplotlib.figure import Figure
-        from matplotlib.patches import Polygon
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        from matplotlib.collections import LineCollection
+        from matplotlib.colors import to_rgba
 
         def footprint_wh_deg(wcs_obj: Any) -> tuple[float, float]:
             """Return footprint width/height in degrees for a given WCS."""
@@ -488,6 +528,45 @@ def launch_filter_interface(
                         if fn.lower().endswith((".fit", ".fits")):
                             yield os.path.join(r, fn)
 
+        def _compute_footprint_from_wcs(
+            wcs_obj: Any,
+            shape_hw: Optional[tuple[int, int]] = None,
+        ) -> Optional[list[tuple[float, float]]]:
+            if wcs_obj is None or not getattr(wcs_obj, "is_celestial", False):
+                return None
+            try:
+                if shape_hw is not None and len(shape_hw) >= 2:
+                    h, w = float(shape_hw[0]), float(shape_hw[1])
+                else:
+                    px_shape = getattr(wcs_obj, "pixel_shape", None)
+                    if px_shape and len(px_shape) >= 2:
+                        w = float(px_shape[0])
+                        h = float(px_shape[1])
+                    else:
+                        arr_shape = getattr(wcs_obj, "array_shape", None)
+                        if arr_shape and len(arr_shape) >= 2:
+                            h = float(arr_shape[0])
+                            w = float(arr_shape[1])
+                        else:
+                            return None
+                if h <= 1.0 or w <= 1.0:
+                    return None
+                corners = (
+                    (0.0, 0.0),
+                    (w - 1.0, 0.0),
+                    (w - 1.0, h - 1.0),
+                    (0.0, h - 1.0),
+                )
+                result: list[tuple[float, float]] = []
+                for x, y in corners:
+                    sky = wcs_obj.pixel_to_world(float(x), float(y))
+                    ra_v = float(sky.ra.to(u.deg).value)
+                    dec_v = float(sky.dec.to(u.deg).value)
+                    result.append((ra_v, dec_v))
+                return result
+            except Exception:
+                return None
+
         def _minimal_header_payload(fpath: str) -> Dict[str, Any]:
             payload: Dict[str, Any] = {"path": fpath}
             try:
@@ -512,6 +591,9 @@ def launch_filter_interface(
                 w = WCS(hdr, naxis=2, relax=True)
                 if w is not None and getattr(w, "is_celestial", False):
                     payload["wcs"] = w
+                    fp = _compute_footprint_from_wcs(w, payload.get("shape"))
+                    if fp:
+                        payload["footprint_radec"] = fp
             except Exception:
                 pass
 
@@ -1461,10 +1543,15 @@ def launch_filter_interface(
             pending_visual_refresh.clear()
             for idx in targets:
                 try:
-                    _refresh_item_visual(idx, schedule_axes=False)
+                    if idx < 0 or idx >= len(items):
+                        continue
+                    _ensure_wrapped_capacity(idx)
+                    footprint_wrapped[idx] = None
+                    centroid_wrapped[idx] = None
+                    _prepare_visual_payload(idx)
                 except Exception:
                     pass
-            _schedule_axes_update()
+            _schedule_visual_build(full=True)
 
         def _schedule_visual_refresh_flush() -> None:
             if visual_refresh_job.get("handle") is not None:
@@ -1720,9 +1807,11 @@ def launch_filter_interface(
 
         if not has_explicit_centers:
             summary_var.set(
-                _tr(
-                    "filter_summary_no_centers",
-                    "Centres WCS indisponibles — sélection manuelle uniquement." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "WCS centers unavailable — manual selection only.",
+                _apply_summary_hint(
+                    _tr(
+                        "filter_summary_no_centers",
+                        "Centres WCS indisponibles — sélection manuelle uniquement." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "WCS centers unavailable — manual selection only.",
+                    )
                 )
             )
 
@@ -1822,7 +1911,7 @@ def launch_filter_interface(
             ]
             if not pending:
                 msg = _tr("filter_log_no_missing_wcs", "All listed files already include a WCS solution.")
-                summary_var.set(msg)
+                summary_var.set(_apply_summary_hint(msg))
                 _log_message(msg, level="INFO")
                 return
 
@@ -1833,7 +1922,7 @@ def launch_filter_interface(
                 "filter_log_resolving_wide",
                 "Resolving missing WCS (ASTAP/Astrometry/ANSVR)…",
             )
-            summary_var.set(summary_msg)
+            summary_var.set(_apply_summary_hint(summary_msg))
             _log_message(summary_msg, level="INFO")
 
             footprints_restore_state["value"] = bool(draw_footprints_var.get())
@@ -1993,7 +2082,24 @@ def launch_filter_interface(
                                     solver=solver_name,
                                     name=file_name,
                                 )
-                                _enqueue_event("resolved_item", idx, header_obj, wcs_obj)
+                                footprint_pts = None
+                                try:
+                                    shape_hw = getattr(item, "shape", None)
+                                    if shape_hw is None and header_obj is not None:
+                                        try:
+                                            nax1 = header_obj.get("NAXIS1")
+                                            nax2 = header_obj.get("NAXIS2")
+                                            if nax1 and nax2:
+                                                w_px = int(float(nax1))
+                                                h_px = int(float(nax2))
+                                                if w_px > 0 and h_px > 0:
+                                                    shape_hw = (h_px, w_px)
+                                        except Exception:
+                                            pass
+                                    footprint_pts = _compute_footprint_from_wcs(wcs_obj, shape_hw)
+                                except Exception:
+                                    footprint_pts = None
+                                _enqueue_event("resolved_item", idx, header_obj, wcs_obj, footprint_pts)
 
                             def _handle_failure(solver_name: str, err: str, level: str = "WARN") -> None:
                                 _log_solver_event(
@@ -2165,7 +2271,7 @@ def launch_filter_interface(
                         g=0,
                         sizes="[]",
                     )
-                    summary_var.set(summary_text)
+                    summary_var.set(_apply_summary_hint(summary_text))
                     _log_message(summary_text, level="INFO")
                     return
 
@@ -2236,7 +2342,7 @@ def launch_filter_interface(
                         g=0,
                         sizes="[]",
                     )
-                    summary_var.set(summary_text)
+                    summary_var.set(_apply_summary_hint(summary_text))
                     _log_message(summary_text, level="WARN")
                     return
 
@@ -2272,7 +2378,7 @@ def launch_filter_interface(
                         g=0,
                         sizes="[]",
                     )
-                    summary_var.set(summary_text)
+                    summary_var.set(_apply_summary_hint(summary_text))
                     _log_message(summary_text, level="WARN")
                     return
 
@@ -2301,7 +2407,7 @@ def launch_filter_interface(
                     g=len(final_groups),
                     sizes=sizes_str,
                 )
-                summary_var.set(summary_text)
+                summary_var.set(_apply_summary_hint(summary_text))
                 _log_message(summary_text, level="INFO")
                 try:
                     _draw_group_outlines(final_groups)
@@ -2439,30 +2545,241 @@ def launch_filter_interface(
         check_vars: list[tk.BooleanVar] = []
         checkbuttons: list[Any] = []
         item_labels: list[str] = []
-        patches: list[Any] = []
-        center_pts: list[Any] = []  # matplotlib line2D handles
+        footprint_wrapped: list[Optional[np.ndarray]] = []
+        centroid_wrapped: list[Optional[tuple[float, float]]] = []
+        footprints_state: Dict[str, Any] = {
+            "collection": None,
+            "segments": [],
+            "colors": [],
+            "indices": [],
+        }
+        centroids_state: Dict[str, Any] = {
+            "collection": None,
+            "offsets": [],
+            "colors": [],
+            "indices": [],
+            "sizes": [],
+        }
+        footprint_budget_state = {"budget": 0}
+        preview_hint_state = {"active": False}
+        visual_build_state = {"indices": [], "cursor": 0, "job": None, "full": True, "footprints_used": 0}
+
+        def _ensure_visual_collections() -> None:
+            if footprints_state["collection"] is None:
+                lc = LineCollection([], linewidths=1.0, colors=[], alpha=1.0)
+                lc.set_picker(True)
+                try:
+                    lc.set_pickradius(5)
+                except Exception:
+                    pass
+                ax.add_collection(lc)
+                footprints_state["collection"] = lc
+            if centroids_state["collection"] is None:
+                sc = ax.scatter([], [], s=20, picker=True, alpha=0.9, c="tab:blue")
+                sc.set_offsets(np.empty((0, 2)))
+                sc.set_facecolors(np.empty((0, 4)))
+                sc.set_edgecolors(np.empty((0, 4)))
+                centroids_state["collection"] = sc
+
+        def _clear_visual_datasets() -> None:
+            footprints_state["segments"] = []
+            footprints_state["colors"] = []
+            footprints_state["indices"] = []
+            centroids_state["offsets"] = []
+            centroids_state["colors"] = []
+            centroids_state["indices"] = []
+            centroids_state["sizes"] = []
+
+        def _update_line_collection() -> None:
+            _ensure_visual_collections()
+            lc: Optional[LineCollection] = footprints_state.get("collection")
+            if lc is None:
+                return
+            lc.set_segments(footprints_state["segments"])
+            if footprints_state["colors"]:
+                lc.set_colors(footprints_state["colors"])
+            else:
+                lc.set_colors([])
+
+        def _update_centroid_collection() -> None:
+            _ensure_visual_collections()
+            coll = centroids_state.get("collection")
+            if coll is None:
+                return
+            offsets = centroids_state["offsets"]
+            if offsets:
+                coll.set_offsets(np.asarray(offsets, dtype=float))
+            else:
+                coll.set_offsets(np.empty((0, 2)))
+            colors = centroids_state["colors"]
+            sizes = centroids_state["sizes"]
+            if colors:
+                coll.set_facecolors(colors)
+                coll.set_edgecolors(colors)
+            else:
+                coll.set_facecolors(np.empty((0, 4)))
+                coll.set_edgecolors(np.empty((0, 4)))
+            if sizes:
+                coll.set_sizes(np.asarray(sizes, dtype=float))
+            else:
+                coll.set_sizes(np.empty((0,), dtype=float))
+
+        def _recompute_footprint_budget() -> int:
+            cap = _compute_dynamic_footprint_budget(
+                len(items),
+                preview_cap,
+                max_footprints=MAX_FOOTPRINTS,
+            )
+            footprint_budget_state["budget"] = cap
+            try:
+                current_summary = summary_var.get()
+            except Exception:
+                current_summary = ""
+            try:
+                summary_var.set(_apply_summary_hint(str(current_summary)))
+            except Exception:
+                pass
+            return footprint_budget_state["budget"]
+
+        VISUAL_CHUNK = 300
+
+        def _ensure_wrapped_capacity(idx: int) -> None:
+            while idx >= len(footprint_wrapped):
+                footprint_wrapped.append(None)
+            while idx >= len(centroid_wrapped):
+                centroid_wrapped.append(None)
+
+        def _prepare_visual_payload(idx: int) -> None:
+            _ensure_wrapped_capacity(idx)
+            item = items[idx]
+            fp = item.get_cached_footprint()
+            wrapped_fp: Optional[np.ndarray] = None
+            if fp is not None and len(fp) >= 3:
+                try:
+                    ra_vals = [wrap_ra_deg(float(v), ref_ra) for v in fp[:, 0].tolist()]
+                    dec_vals = [float(v) for v in fp[:, 1].tolist()]
+                    coords = np.column_stack([np.asarray(ra_vals, dtype=float), np.asarray(dec_vals, dtype=float)])
+                    wrapped_fp = coords
+                except Exception:
+                    wrapped_fp = None
+            footprint_wrapped[idx] = wrapped_fp
+            center_val: Optional[tuple[float, float]] = None
+            if item.center is not None:
+                try:
+                    ra_c = wrap_ra_deg(float(item.center.ra.to(u.deg).value), ref_ra)
+                    dec_c = float(item.center.dec.to(u.deg).value)
+                    center_val = (ra_c, dec_c)
+                except Exception:
+                    center_val = None
+            centroid_wrapped[idx] = center_val
+
+        def _append_visual_entry(idx: int) -> None:
+            selected = _is_selected(idx)
+            color = to_rgba("tab:blue" if selected else "0.7", 0.9 if selected else 0.3)
+            draw_fp = _should_draw_footprints()
+            footprint_budget = footprint_budget_state["budget"]
+            wrapped_fp = footprint_wrapped[idx]
+            if (
+                draw_fp
+                and wrapped_fp is not None
+                and visual_build_state["footprints_used"] < footprint_budget
+            ):
+                try:
+                    closed = np.vstack([wrapped_fp, wrapped_fp[0]])
+                except Exception:
+                    closed = None
+                if closed is not None:
+                    footprints_state["segments"].append(closed)
+                    footprints_state["colors"].append(color)
+                    footprints_state["indices"].append(idx)
+                    visual_build_state["footprints_used"] += 1
+                    return
+            center_val = centroid_wrapped[idx]
+            if center_val is not None:
+                centroids_state["offsets"].append(center_val)
+                centroids_state["colors"].append(color)
+                centroids_state["indices"].append(idx)
+                centroids_state["sizes"].append(28.0 if selected else 18.0)
+
+        def _process_visual_build_chunk() -> None:
+            visual_build_state["job"] = None
+            if not visual_build_state["indices"]:
+                return
+            start = visual_build_state["cursor"]
+            end = min(len(visual_build_state["indices"]), start + VISUAL_CHUNK)
+            if start == 0 and visual_build_state.get("full", True):
+                _clear_visual_datasets()
+                visual_build_state["footprints_used"] = 0
+                _recompute_footprint_budget()
+            for local_idx in range(start, end):
+                idx = visual_build_state["indices"][local_idx]
+                if idx < 0 or idx >= len(items):
+                    continue
+                _prepare_visual_payload(idx)
+                _append_visual_entry(idx)
+            _update_line_collection()
+            _update_centroid_collection()
+            if end < len(visual_build_state["indices"]):
+                visual_build_state["cursor"] = end
+                try:
+                    visual_build_state["job"] = root.after(15, _process_visual_build_chunk)
+                except Exception:
+                    _process_visual_build_chunk()
+            else:
+                visual_build_state["indices"] = []
+                visual_build_state["cursor"] = 0
+                visual_build_state["full"] = True
+                visual_build_state["footprints_used"] = 0
+                _schedule_axes_update()
+
+        def _schedule_visual_build(indices: Optional[Iterable[int]] = None, *, full: bool = False) -> None:
+            if indices is None or full:
+                target = list(range(len(items)))
+                full = True
+            else:
+                uniq: list[int] = []
+                seen: set[int] = set()
+                for raw in indices:
+                    try:
+                        idx = int(raw)
+                    except Exception:
+                        continue
+                    if idx < 0 or idx >= len(items) or idx in seen:
+                        continue
+                    uniq.append(idx)
+                    seen.add(idx)
+                target = uniq
+                if len(target) >= len(items):
+                    full = True
+                    target = list(range(len(items)))
+            visual_build_state["indices"] = target
+            visual_build_state["cursor"] = 0
+            visual_build_state["full"] = bool(full)
+            visual_build_state["footprints_used"] = 0
+            if visual_build_state["job"] is None:
+                try:
+                    visual_build_state["job"] = root.after(10, _process_visual_build_chunk)
+                except Exception:
+                    _process_visual_build_chunk()
         # Master Tile outlines (group-level overlays)
-        group_outline_patches: list[Any] = []
+        group_outline_state: Dict[str, Any] = {"collection": None, "segments": []}
 
         def _clear_group_outlines() -> None:
-            try:
-                for art in group_outline_patches:
+            coll = group_outline_state.get("collection")
+            if coll is not None:
+                try:
+                    coll.set_segments([])
+                except Exception:
                     try:
-                        art.remove()
+                        coll.remove()
                     except Exception:
                         pass
-            finally:
-                group_outline_patches.clear()
+                    group_outline_state["collection"] = None
+            group_outline_state["segments"] = []
 
         def _draw_group_outlines(groups_payload: Optional[list[list[dict]]]) -> None:
-            """Draw red Master Tile contours using celestial coordinates.
+            """Draw red Master Tile contours using celestial coordinates."""
 
-            For each group (list of dict entries similar to items), estimate a
-            representative footprint size in degrees and render a dashed red
-            rectangle centred on every available RA/Dec sample.  The rectangles
-            are computed in the sky reference frame so their proportions remain
-            consistent regardless of the current Matplotlib canvas scaling.
-            """
             if not groups_payload:
                 _clear_group_outlines()
                 try:
@@ -2479,7 +2796,7 @@ def launch_filter_interface(
                     pass
                 return
 
-            _clear_group_outlines()
+            segments: list[np.ndarray] = []
             try:
                 def _wcs_corners_deg(wcs_obj: Any) -> Optional[np.ndarray]:
                     try:
@@ -2563,7 +2880,6 @@ def launch_filter_interface(
                     corner_dec_samples: list[float] = []
 
                     for info in (grp or []):
-                        # --- collect W×H en degrés (médiane servira de taille de tuile)
                         wcs_candidates = []
                         idx_mapped = None
                         path_val = (
@@ -2592,10 +2908,7 @@ def launch_filter_interface(
                                     corner_ra_samples,
                                     corner_dec_samples,
                                 )
-                            if widths and heights:
-                                break
 
-                        # --- collect centre RA/Dec
                         ra_c = None
                         dec_c = None
                         if idx_mapped is not None and 0 <= idx_mapped < len(items) and items[idx_mapped].center is not None:
@@ -2638,13 +2951,10 @@ def launch_filter_interface(
                             centers_wrapped.append(wrap_ra_deg(ra_c, ref_ra))
                             centers_dec.append(float(dec_c))
 
-                        # --- integrate precomputed footprint polygons when WCS is absent
                         footprint_points: Optional[Any] = None
                         if idx_mapped is not None and 0 <= idx_mapped < len(items):
                             try:
                                 fp_cached = items[idx_mapped].get_cached_footprint()
-                                if fp_cached is None:
-                                    fp_cached = items[idx_mapped].ensure_footprint()
                                 footprint_points = fp_cached
                             except Exception:
                                 footprint_points = None
@@ -2674,20 +2984,17 @@ def launch_filter_interface(
                                 corner_dec_samples,
                             )
 
-                    # --- si pas de centre: passer au groupe suivant
                     if not centers_wrapped:
                         continue
 
-                    # Taille de tuile = médiane des footprints du groupe (fallback 0.2°)
                     tile_w = float(np.median(widths)) if widths else 0.2
                     tile_h = float(np.median(heights)) if heights else 0.2
 
-                    # Centre représentatif = médiane des centres du groupe
                     grp_ra = float(np.median(centers_wrapped))
                     grp_dec = float(np.median(centers_dec))
 
                     cos_dec = float(np.cos(np.deg2rad(grp_dec))) if np.isfinite(grp_dec) else 1.0
-                    if abs(cos_dec) < 1e-6:  # éviter la division quasi nulle
+                    if abs(cos_dec) < 1e-6:
                         cos_dec = 1e-6 if cos_dec >= 0 else -1e-6
 
                     if corner_ra_samples and corner_dec_samples:
@@ -2704,7 +3011,6 @@ def launch_filter_interface(
                                 y_min = float(np.nanmin(y_offsets))
                                 y_max = float(np.nanmax(y_offsets))
                                 if np.isfinite(x_min) and np.isfinite(x_max) and np.isfinite(y_min) and np.isfinite(y_max):
-                                    # recentrer sur le centre du canvas combiné
                                     x_center = 0.5 * (x_min + x_max)
                                     y_center = 0.5 * (y_min + y_max)
                                     if abs(x_center) > 1e-9:
@@ -2729,7 +3035,6 @@ def launch_filter_interface(
                         except Exception:
                             pass
 
-                    # Construire 1 rectangle rouge pour CE groupe
                     dx = tile_w / 2.0 / cos_dec
                     dy = tile_h / 2.0
                     ra_corners = [
@@ -2740,19 +3045,20 @@ def launch_filter_interface(
                     ]
                     dec_corners = [grp_dec - dy, grp_dec - dy, grp_dec + dy, grp_dec + dy]
                     rect_pts = list(zip(ra_corners, dec_corners))
+                    rect = np.array(rect_pts + [rect_pts[0]], dtype=float)
+                    segments.append(rect)
 
-                    poly = Polygon(
-                        rect_pts,
-                        closed=True,
-                        fill=False,
-                        edgecolor="red",
-                        linewidth=1.6,
-                        alpha=0.9,
-                        linestyle="--",
-                        zorder=5,
-                    )
-                    ax.add_patch(poly)
-                    group_outline_patches.append(poly)
+                group_outline_state["segments"] = segments
+                coll = group_outline_state.get("collection")
+                if coll is None:
+                    coll = LineCollection([], linewidths=1.6, colors=["red"], linestyle="--", alpha=0.9, zorder=5)
+                    ax.add_collection(coll)
+                    group_outline_state["collection"] = coll
+                coll.set_segments(segments)
+                if segments:
+                    coll.set_colors([to_rgba("red", 0.9) for _ in segments])
+                coll.set_linestyle("--")
+                coll.set_linewidth(1.6)
 
             except Exception:
                 _clear_group_outlines()
@@ -2769,8 +3075,6 @@ def launch_filter_interface(
                     canvas.draw_idle()
                 except Exception:
                     pass
-        # Map matplotlib artists back to item indices for click-to-select
-        artist_to_index: dict[Any, int] = {}
         known_path_index: dict[str, int] = {}
 
         def _is_selected(idx: int) -> bool:
@@ -2875,13 +3179,31 @@ def launch_filter_interface(
 
         def _should_draw_footprints() -> bool:
             try:
-                return bool(draw_footprints_var.get())
+                if not bool(draw_footprints_var.get()):
+                    return False
             except Exception:
                 return False
+            return footprint_budget_state.get("budget", 0) > 0
 
-        all_ra_vals: list[float] = []
-        all_dec_vals: list[float] = []
-        drawn_footprints = {"count": 0}
+        def _apply_summary_hint(text: str) -> str:
+            try:
+                wants_footprints = bool(draw_footprints_var.get())
+            except Exception:
+                wants_footprints = False
+            if not wants_footprints or footprint_budget_state.get("budget", 0) > 0:
+                preview_hint_state["active"] = False
+                return text
+            hint = _tr(
+                "filter_preview_points_hint",
+                "Preview limited to points for speed; zoom or filter to see footprints.",
+            )
+            preview_hint_state["active"] = True
+            if not text:
+                return hint
+            if hint in text:
+                return text
+            return f"{text} — {hint}"
+
         axes_update_pending = {"pending": False}
         population_state = {
             "next_index": 0,
@@ -2956,101 +3278,76 @@ def launch_filter_interface(
             if path_key:
                 known_path_index[path_key] = idx
 
-            # Ensure placeholders exist for visuals
-            patches.append(None)
-            center_pts.append(None)
-
-            color_sel = "tab:blue"
-
-            local_ra_vals: list[float] = []
-            local_dec_vals: list[float] = []
-
-            should_draw = _should_draw_footprints()
-            footprint_to_draw: Optional[np.ndarray] = None
-            if should_draw and drawn_footprints["count"] < MAX_FOOTPRINTS:
-                footprint_to_draw = item.ensure_footprint()
-            elif should_draw:
-                footprint_to_draw = item.get_cached_footprint()
-
-            if should_draw and footprint_to_draw is not None and drawn_footprints["count"] < MAX_FOOTPRINTS:
-                try:
-                    ra_wrapped = [wrap_ra_deg(float(ra), ref_ra) for ra in footprint_to_draw[:, 0].tolist()]
-                    decs = footprint_to_draw[:, 1].tolist()
-                    poly = Polygon(
-                        list(zip(ra_wrapped, decs)),
-                        closed=True,
-                        fill=False,
-                        edgecolor=color_sel,
-                        linewidth=1.0,
-                        alpha=0.9,
-                    )
-                    try:
-                        poly.set_picker(True)
-                    except Exception:
-                        pass
-                    ax.add_patch(poly)
-                    patches[idx] = poly
-                    artist_to_index[poly] = idx
-                    local_ra_vals.extend(ra_wrapped)
-                    local_dec_vals.extend(decs)
-                    drawn_footprints["count"] += 1
-                except Exception:
-                    patches[idx] = None
-            elif item.center is not None:
-                try:
-                    ra_c = wrap_ra_deg(float(item.center.ra.to(u.deg).value), ref_ra)
-                    dec_c = float(item.center.dec.to(u.deg).value)
-                    ln, = ax.plot(
-                        [ra_c],
-                        [dec_c],
-                        marker="o",
-                        markersize=3,
-                        color=color_sel,
-                        alpha=0.9,
-                        picker=8,
-                    )
-                    center_pts[idx] = ln
-                    artist_to_index[ln] = idx
-                    local_ra_vals.append(ra_c)
-                    local_dec_vals.append(dec_c)
-                except Exception:
-                    center_pts[idx] = None
-
-            all_ra_vals.extend(local_ra_vals)
-            all_dec_vals.extend(local_dec_vals)
+            _ensure_wrapped_capacity(idx)
+            footprint_wrapped[idx] = None
+            centroid_wrapped[idx] = None
         ax.grid(True, which="both", linestyle=":", linewidth=0.6)
 
         def update_visuals(changed_index: Optional[Iterable[int] | int] = None) -> None:
-            """Refresh matplotlib artists to match the checkbox selection state."""
+            """Refresh aggregated matplotlib artists to match selection state."""
 
             if changed_index is None:
-                target_indices: Iterable[int] = range(len(items))
+                target = set(range(len(items)))
             elif isinstance(changed_index, Iterable) and not isinstance(changed_index, (str, bytes)):
-                target_indices = changed_index
+                target = set()
+                for raw_idx in changed_index:
+                    try:
+                        idx_val = int(raw_idx)
+                    except (TypeError, ValueError):
+                        continue
+                    if 0 <= idx_val < len(items):
+                        target.add(idx_val)
             else:
-                target_indices = (changed_index,)
-
-            any_updated = False
-            for raw_idx in target_indices:
+                target = set()
                 try:
-                    i = int(raw_idx)
+                    idx_val = int(changed_index)  # type: ignore[arg-type]
                 except (TypeError, ValueError):
-                    continue
-                if i < 0 or i >= len(items):
-                    continue
-                selected = _is_selected(i)
-                col = "tab:blue" if selected else "0.7"
-                alp = 0.9 if selected else 0.3
-                if i < len(patches) and patches[i] is not None:
-                    patches[i].set_edgecolor(col)
-                    patches[i].set_alpha(alp)
-                    any_updated = True
-                if i < len(center_pts) and center_pts[i] is not None:
-                    center_pts[i].set_color(col)
-                    center_pts[i].set_alpha(alp)
-                    any_updated = True
-            if any_updated:
-                canvas.draw_idle()
+                    idx_val = -1
+                if 0 <= idx_val < len(items):
+                    target.add(idx_val)
+
+            if not target:
+                target = set(range(len(items)))
+
+            updated = False
+            lc: Optional[LineCollection] = footprints_state.get("collection")
+            if lc is not None and footprints_state["indices"]:
+                colors = list(footprints_state["colors"])
+                for pos, idx in enumerate(footprints_state["indices"]):
+                    if idx not in target:
+                        continue
+                    selected = _is_selected(idx)
+                    colors[pos] = to_rgba("tab:blue" if selected else "0.7", 0.9 if selected else 0.3)
+                    updated = True
+                if updated:
+                    footprints_state["colors"] = colors
+                    lc.set_colors(colors)
+
+            coll = centroids_state.get("collection")
+            if coll is not None and centroids_state["indices"]:
+                colors = list(centroids_state["colors"])
+                sizes = list(centroids_state["sizes"])
+                centroid_updated = False
+                for pos, idx in enumerate(centroids_state["indices"]):
+                    if idx not in target:
+                        continue
+                    selected = _is_selected(idx)
+                    colors[pos] = to_rgba("tab:blue" if selected else "0.7", 0.9 if selected else 0.3)
+                    sizes[pos] = 28.0 if selected else 18.0
+                    centroid_updated = True
+                if centroid_updated:
+                    centroids_state["colors"] = colors
+                    centroids_state["sizes"] = sizes
+                    coll.set_facecolors(colors)
+                    coll.set_edgecolors(colors)
+                    coll.set_sizes(np.asarray(sizes, dtype=float))
+                    updated = True
+
+            if updated:
+                try:
+                    canvas.blit(ax.bbox)
+                except Exception:
+                    canvas.draw_idle()
 
         if use_listbox_mode and listbox_widget is not None:
             def _on_listbox_select(_event: Any) -> None:
@@ -3076,22 +3373,12 @@ def launch_filter_interface(
 
             listbox_widget.bind("<<ListboxSelect>>", _on_listbox_select)
 
-        def _apply_initial_axes() -> None:
-            if all_ra_vals and all_dec_vals:
-                ra_min, ra_max = min(all_ra_vals), max(all_ra_vals)
-                dec_min, dec_max = min(all_dec_vals), max(all_dec_vals)
-                ra_pad = max(1e-3, (ra_max - ra_min) * 0.05 + 0.2)
-                dec_pad = max(1e-3, (dec_max - dec_min) * 0.05 + 0.2)
-                ax.set_xlim(ra_max + ra_pad, ra_min - ra_pad)
-                ax.set_ylim(dec_min - dec_pad, dec_max + dec_pad)
-                canvas.draw_idle()
-
         def _finalize_initial_population() -> None:
             if population_state["finalized"]:
                 return
             population_state["finalized"] = True
             update_visuals()
-            _apply_initial_axes()
+            _schedule_axes_update()
             _update_population_indicator(population_state["total"], done=True)
 
         def _populate_initial_chunk() -> None:
@@ -3112,6 +3399,8 @@ def launch_filter_interface(
             end = start + chunk
             for idx in range(start, end):
                 _add_item_row(items[idx])
+            if end > start:
+                _schedule_visual_build(full=True)
             population_state["next_index"] = end
             _update_population_indicator(end, done=end >= total)
             try:
@@ -3169,6 +3458,7 @@ def launch_filter_interface(
             if not batch:
                 return
             new_indices: list[int] = []
+            visuals_dirty = False
             for entry in batch:
                 candidate_path = entry.get("path") or entry.get("path_raw") or entry.get("path_preprocessed_cache")
                 key = _path_key(candidate_path)
@@ -3198,9 +3488,10 @@ def launch_filter_interface(
                     except Exception:
                         pass
                     try:
-                        _refresh_item_visual(existing_idx)
+                        _refresh_item_visual(existing_idx, schedule_axes=False, trigger_build=False)
                     except Exception:
                         pass
+                    visuals_dirty = True
                     continue
                 raw_files_with_wcs.append(entry)
                 new_index = len(raw_files_with_wcs) - 1
@@ -3209,6 +3500,7 @@ def launch_filter_interface(
                 items.append(new_item)
                 _add_item_row(new_item)
                 new_indices.append(new_index)
+                visuals_dirty = True
             if new_indices:
                 update_visuals(new_indices)
             if not _center_ready["ok"]:
@@ -3222,7 +3514,8 @@ def launch_filter_interface(
                         thresh_button.state(["!disabled"])
                     except Exception:
                         pass
-            if new_indices:
+            if visuals_dirty:
+                _schedule_visual_build(full=True)
                 _schedule_axes_update()
 
         def _consume_ui_queue() -> None:
@@ -3329,77 +3622,20 @@ def launch_filter_interface(
                 except Exception:
                     stream_state["done"] = True
 
-        def _refresh_item_visual(idx: int, *, schedule_axes: bool = True) -> None:
+        def _refresh_item_visual(idx: int, *, schedule_axes: bool = True, trigger_build: bool = True) -> None:
             if idx < 0 or idx >= len(items):
                 return
-            item = items[idx]
-            prev_patch = patches[idx] if idx < len(patches) else None
-            prev_point = center_pts[idx] if idx < len(center_pts) else None
-            if prev_patch is not None:
-                try:
-                    prev_patch.remove()
-                except Exception:
-                    pass
-                artist_to_index.pop(prev_patch, None)
-                patches[idx] = None
-                drawn_footprints["count"] = max(0, drawn_footprints["count"] - 1)
-            if prev_point is not None:
-                try:
-                    prev_point.remove()
-                except Exception:
-                    pass
-                artist_to_index.pop(prev_point, None)
-                center_pts[idx] = None
-            selected = _is_selected(idx)
-            color_sel = "tab:blue" if selected else "0.7"
-            alpha_val = 0.9 if selected else 0.3
-            new_patch = None
-            new_point = None
-            should_draw = _should_draw_footprints()
-            footprint = item.get_cached_footprint() if should_draw else None
-            allow_draw = should_draw and drawn_footprints["count"] < MAX_FOOTPRINTS
-            if allow_draw and (footprint is not None or item.wcs is not None):
-                try:
-                    if footprint is None:
-                        footprint = item.ensure_footprint()
-                    if footprint is None:
-                        raise ValueError("no footprint")
-                    ra_wrapped = [wrap_ra_deg(float(ra), ref_ra) for ra in footprint[:, 0].tolist()]
-                    decs = footprint[:, 1].tolist()
-                    new_patch = Polygon(
-                        list(zip(ra_wrapped, decs)),
-                        closed=True,
-                        fill=False,
-                        edgecolor=color_sel,
-                        linewidth=1.0,
-                        alpha=alpha_val,
-                    )
-                    new_patch.set_picker(True)
-                    ax.add_patch(new_patch)
-                    artist_to_index[new_patch] = idx
-                    patches[idx] = new_patch
-                    drawn_footprints["count"] += 1
-                except Exception:
-                    new_patch = None
-            elif item.center is not None:
-                try:
-                    ra_c = wrap_ra_deg(float(item.center.ra.to(u.deg).value), ref_ra)
-                    dec_c = float(item.center.dec.to(u.deg).value)
-                    new_point, = ax.plot([ra_c], [dec_c], marker="o", markersize=3, color=color_sel, alpha=alpha_val, picker=8)
-                    artist_to_index[new_point] = idx
-                    center_pts[idx] = new_point
-                except Exception:
-                    new_point = None
-            update_visuals(idx)
+            _ensure_wrapped_capacity(idx)
+            footprint_wrapped[idx] = None
+            centroid_wrapped[idx] = None
+            _prepare_visual_payload(idx)
+            if trigger_build:
+                _schedule_visual_build(full=True)
             if schedule_axes:
                 _schedule_axes_update()
 
         def _on_draw_mode_change() -> None:
-            for index in range(len(items)):
-                try:
-                    _refresh_item_visual(index)
-                except Exception:
-                    pass
+            _schedule_visual_build(full=True)
 
         try:
             footprints_chk.configure(command=_on_draw_mode_change)
@@ -3459,10 +3695,17 @@ def launch_filter_interface(
                 # If we have a computed footprint (from WCS or CSV), pass it
                 # along explicitly so the exporter can persist it.
                 try:
-                    fp = it.get_cached_footprint() or it.ensure_footprint()
+                    fp = it.get_cached_footprint()
+                    if fp is None:
+                        fp_pts = it.src.get("footprint_radec") or it.src.get("_precomp_fp")
+                        if isinstance(fp_pts, (list, tuple)) and len(fp_pts) >= 3:
+                            try:
+                                fp = np.asarray([[float(p[0]), float(p[1])] for p in fp_pts], dtype=float)
+                            except Exception:
+                                fp = None
                     if fp is not None:
-                        # Convert ndarray to list of tuples for serialization
-                        data.setdefault("_precomp_fp", [(float(r), float(d)) for r, d in fp.tolist()])
+                        coords = np.asarray(fp, dtype=float)
+                        data.setdefault("_precomp_fp", [(float(r), float(d)) for r, d in coords.tolist()])
                 except Exception:
                     pass
                 payload.append(data)
@@ -3532,12 +3775,18 @@ def launch_filter_interface(
                             item.header = header_obj
                             item.src["header"] = header_obj
                     elif kind == "resolved_item":
-                        _, idx, header_obj, wcs_obj = event
+                        footprint_pts = event[4] if len(event) >= 5 else None
+                        _, idx, header_obj, wcs_obj = event[:4]
                         if isinstance(idx, int) and 0 <= idx < len(items):
                             item = items[idx]
                             if header_obj is not None:
                                 item.header = header_obj
                                 item.src["header"] = header_obj
+                            if footprint_pts:
+                                try:
+                                    item.src["footprint_radec"] = footprint_pts
+                                except Exception:
+                                    pass
                             if wcs_obj is not None and getattr(wcs_obj, "is_celestial", False):
                                 item.src["wcs"] = wcs_obj
                                 item.wcs = wcs_obj
@@ -3568,7 +3817,7 @@ def launch_filter_interface(
                             "Resolved WCS for {n} files.",
                             n=resolved_count,
                         )
-                        summary_var.set(summary_msg)
+                        summary_var.set(_apply_summary_hint(summary_msg))
                         log_buffer.append(("INFO", summary_msg))
                         resolve_state["running"] = False
                         try:
@@ -3624,13 +3873,40 @@ def launch_filter_interface(
                 artist = getattr(event, 'artist', None)
                 if artist is None:
                     return
-                i = artist_to_index.get(artist)
-                if i is None:
+                indices: list[int] = []
+                if artist is footprints_state.get("collection"):
+                    picked = getattr(event, "ind", None)
+                    if picked is None:
+                        return
+                    if isinstance(picked, (list, tuple, np.ndarray)):
+                        candidates = picked
+                    else:
+                        candidates = [picked]
+                    if not candidates:
+                        return
+                    pos = int(candidates[0])
+                    if 0 <= pos < len(footprints_state["indices"]):
+                        indices.append(footprints_state["indices"][pos])
+                elif artist is centroids_state.get("collection"):
+                    picked = getattr(event, "ind", None)
+                    if picked is None:
+                        return
+                    if isinstance(picked, (list, tuple, np.ndarray)):
+                        candidates = picked
+                    else:
+                        candidates = [picked]
+                    if not candidates:
+                        return
+                    pos = int(candidates[0])
+                    if 0 <= pos < len(centroids_state["indices"]):
+                        indices.append(centroids_state["indices"][pos])
+                else:
                     return
-                # Toggle associated checkbox and refresh colors
-                curr = _is_selected(i)
-                _set_selected(i, not curr)
-                update_visuals(i)
+                for i in indices:
+                    curr = _is_selected(i)
+                    _set_selected(i, not curr)
+                if indices:
+                    update_visuals(indices)
             except Exception:
                 pass
 
