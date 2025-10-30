@@ -1,6 +1,8 @@
 ## Unreleased
 ### Fixed
 * Robust FITS writing for ASTAP CLI (colour order normalised)
+* Filter window now opens once via the streaming scanner path in the GUI
+* Restored lightweight WCS footprint previews on large datasets with updated guidance copy
 ### Added
 * Solver option “Convert to Luminance” to force mono before plate-solve
 * Added configurable `winsor_worker_limit` (CLI `--winsor-workers` / `-W` and GUI field)

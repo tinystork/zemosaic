@@ -412,6 +412,7 @@
     "filter_btn_export_csv": "Export CSV",
     "filter_chk_draw_footprints": "Draw WCS footprints",
     "filter_chk_write_wcs": "Write WCS to file",
+    "filter_preview_points_hint": "Preview uses a reduced set of footprints for performance. Zoom or filter to reveal more footprints.",
     "filter_status_crawling": "Crawling files… please wait",
     "filter_status_ready": "Crawling done.",
     "filter_log_resolving": "Resolving missing WCS...",

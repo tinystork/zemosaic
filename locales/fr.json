@@ -403,6 +403,7 @@
     "filter_btn_export_csv": "Exporter en CSV",
     "filter_chk_draw_footprints": "Tracer les empreintes WCS",
     "filter_chk_write_wcs": "Écrire le WCS dans le fichier",
+    "filter_preview_points_hint": "L'aperçu utilise un ensemble réduit d'empreintes pour préserver les performances. Zoomez ou filtrez pour afficher davantage d'empreintes.",
     "filter_status_crawling": "Analyse des fichiers… veuillez patienter",
     "filter_status_ready": "Analyse terminée.",
     "filter_log_resolving": "Résolution des WCS manquants...",
