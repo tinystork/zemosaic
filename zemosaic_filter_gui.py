@@ -2164,6 +2164,56 @@ def launch_filter_interface(
                     except Exception:
                         return None
 
+                def _extend_from_points(
+                    points: Any,
+                    widths_acc: list[float],
+                    heights_acc: list[float],
+                    ra_acc: list[float],
+                    dec_acc: list[float],
+                ) -> None:
+                    try:
+                        arr = np.asarray(points, dtype=float)
+                    except Exception:
+                        return
+                    if arr.ndim != 2 or arr.shape[1] < 2:
+                        return
+                    ra_vals = arr[:, 0]
+                    dec_vals = arr[:, 1]
+                    if ra_vals.size == 0 or dec_vals.size == 0:
+                        return
+                    mask = np.isfinite(ra_vals) & np.isfinite(dec_vals)
+                    if not np.any(mask):
+                        return
+                    ra_vals = ra_vals[mask]
+                    dec_vals = dec_vals[mask]
+                    ra_acc.extend(float(v) for v in ra_vals.tolist())
+                    dec_acc.extend(float(v) for v in dec_vals.tolist())
+
+                    ref_ra_local = float(np.nanmedian(ra_vals))
+                    ref_dec_local = float(np.nanmedian(dec_vals))
+                    if not np.isfinite(ref_ra_local) or not np.isfinite(ref_dec_local):
+                        return
+                    cos_local = float(np.cos(np.deg2rad(ref_dec_local))) if np.isfinite(ref_dec_local) else 1.0
+                    if abs(cos_local) < 1e-6:
+                        cos_local = 1e-6 if cos_local >= 0 else -1e-6
+
+                    try:
+                        x_vals = [
+                            (wrap_ra_deg(float(rv), ref_ra_local) - ref_ra_local) * cos_local for rv in ra_vals
+                        ]
+                        y_vals = [float(dv) - ref_dec_local for dv in dec_vals]
+                    except Exception:
+                        return
+
+                    if x_vals:
+                        span_x = float(np.nanmax(x_vals) - np.nanmin(x_vals))
+                        if np.isfinite(span_x) and span_x > 0:
+                            widths_acc.append(span_x)
+                    if y_vals:
+                        span_y = float(np.nanmax(y_vals) - np.nanmin(y_vals))
+                        if np.isfinite(span_y) and span_y > 0:
+                            heights_acc.append(span_y)
+
                 for grp in groups_payload:
                     centers_wrapped: list[float] = []
                     centers_dec: list[float] = []
@@ -2195,9 +2245,13 @@ def launch_filter_interface(
                                 heights.append(h_deg)
                             corners = _wcs_corners_deg(wcs_obj)
                             if corners is not None:
-                                for ra_val, dec_val in corners.tolist():
-                                    corner_ra_samples.append(float(ra_val))
-                                    corner_dec_samples.append(float(dec_val))
+                                _extend_from_points(
+                                    corners,
+                                    widths,
+                                    heights,
+                                    corner_ra_samples,
+                                    corner_dec_samples,
+                                )
                             if widths and heights:
                                 break
 
@@ -2243,6 +2297,42 @@ def launch_filter_interface(
                         if ra_c is not None and dec_c is not None:
                             centers_wrapped.append(wrap_ra_deg(ra_c, ref_ra))
                             centers_dec.append(float(dec_c))
+
+                        # --- integrate precomputed footprint polygons when WCS is absent
+                        footprint_points: Optional[Any] = None
+                        if idx_mapped is not None and 0 <= idx_mapped < len(items):
+                            try:
+                                fp_cached = items[idx_mapped].get_cached_footprint()
+                                if fp_cached is None:
+                                    fp_cached = items[idx_mapped].ensure_footprint()
+                                footprint_points = fp_cached
+                            except Exception:
+                                footprint_points = None
+                        if footprint_points is None and isinstance(info, dict):
+                            footprint_points = info.get("footprint_radec") or info.get("_precomp_fp")
+                            if footprint_points is None:
+                                vals: list[tuple[float, float]] = []
+                                try:
+                                    for k in ("1", "2", "3", "4"):
+                                        ra_val = info.get(f"FP_RA{k}")
+                                        dec_val = info.get(f"FP_DEC{k}")
+                                        if ra_val is None or dec_val is None:
+                                            continue
+                                        if str(ra_val) == "" or str(dec_val) == "":
+                                            continue
+                                        vals.append((float(ra_val), float(dec_val)))
+                                except Exception:
+                                    vals = []
+                                if vals:
+                                    footprint_points = vals
+                        if footprint_points is not None:
+                            _extend_from_points(
+                                footprint_points,
+                                widths,
+                                heights,
+                                corner_ra_samples,
+                                corner_dec_samples,
+                            )
 
                     # --- si pas de centre: passer au groupe suivant
                     if not centers_wrapped:
