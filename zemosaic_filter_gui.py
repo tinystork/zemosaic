@@ -46,7 +46,7 @@
 
 from __future__ import annotations
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 from collections.abc import Iterable
 from dataclasses import asdict
 import os
@@ -89,17 +89,57 @@ def _angular_sep_deg(a: Optional[tuple[float, float]], b: Optional[tuple[float, 
     return (dra ** 2 + ddec ** 2) ** 0.5
 
 
-def _merge_small_groups(groups: list[list[dict]], min_size: int, cap: int) -> list[list[dict]]:
-    """
-    Merge groups smaller than ``min_size`` with their nearest neighbour when the
-    resulting size stays below ``cap`` (allowing a 10% margin).
+def _merge_small_groups(
+    groups: list[list[dict]],
+    min_size: int,
+    cap: int,
+    *,
+    cap_allowance: Optional[int] = None,
+    compute_dispersion: Optional[Callable[[list[tuple[float, float]]], float]] = None,
+    max_dispersion_deg: Optional[float] = None,
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> list[list[dict]]:
+    """Merge undersized groups with their nearest neighbour when safe.
+
+    Parameters
+    ----------
+    groups : list[list[dict]]
+        Groups to examine.
+    min_size : int
+        Minimum size below which a group becomes a merge candidate.
+    cap : int
+        Hard cap (without allowance) used as base reference.
+    cap_allowance : Optional[int]
+        Optional absolute cap allowing temporary overflows.
+    compute_dispersion : Optional[Callable]
+        Callable returning the maximum angular separation (deg) for coordinates.
+    max_dispersion_deg : Optional[float]
+        Reject merges that would push dispersion beyond this threshold.
+    log_fn : Optional[Callable[[str], None]]
+        Optional logging callback invoked for each successful merge.
     """
 
     if not groups or min_size <= 0 or cap <= 0:
         return groups
 
+    cap_limit = int(cap_allowance) if cap_allowance and cap_allowance > 0 else int(cap)
+    cap_limit = max(cap_limit, int(cap))
+
     merged_flags = [False] * len(groups)
     centers = [_group_center_deg(g) for g in groups]
+
+    def _collect_coords(payload: list[dict]) -> list[tuple[float, float]]:
+        coords: list[tuple[float, float]] = []
+        for info in payload:
+            ra = info.get("RA")
+            dec = info.get("DEC")
+            if ra is None or dec is None:
+                continue
+            try:
+                coords.append((float(ra), float(dec)))
+            except Exception:
+                continue
+        return coords
 
     for i, group in enumerate(groups):
         if merged_flags[i] or len(group) >= min_size:
@@ -115,15 +155,33 @@ def _merge_small_groups(groups: list[list[dict]], min_size: int, cap: int) -> li
                 best_dist = dist
                 best_j = j
 
-        if best_j is not None:
-            candidate_size = len(groups[best_j]) + len(group)
-            if candidate_size <= int(cap * 1.1):
-                groups[best_j].extend(group)
-                merged_flags[i] = True
-                print(
-                    f"[AutoMerge] Group {i} ({len(group)} imgs) merged into {best_j} "
-                    f"(now {len(groups[best_j])})"
+        if best_j is None:
+            continue
+
+        candidate_size = len(groups[best_j]) + len(group)
+        if candidate_size > cap_limit:
+            continue
+
+        if compute_dispersion is not None and max_dispersion_deg is not None and max_dispersion_deg > 0:
+            coords_combined = _collect_coords(groups[best_j]) + _collect_coords(group)
+            if coords_combined:
+                try:
+                    dispersion_val = float(compute_dispersion(coords_combined))
+                except Exception:
+                    dispersion_val = None
+                if dispersion_val is not None and dispersion_val > max_dispersion_deg:
+                    continue
+
+        groups[best_j].extend(group)
+        merged_flags[i] = True
+        centers[best_j] = _group_center_deg(groups[best_j])
+        if log_fn is not None:
+            try:
+                log_fn(
+                    f"Merged group {i} ({len(group)} imgs) into {best_j} (size={len(groups[best_j])})"
                 )
+            except Exception:
+                pass
 
     return [grp for idx, grp in enumerate(groups) if not merged_flags[idx]]
 
@@ -1563,12 +1621,22 @@ def launch_filter_interface(
         pending_visual_refresh: set[int] = set()
         visual_refresh_job = {"handle": None}
         footprints_restore_state = {"needs_restore": False, "value": True, "indices": set()}
+        pending_outline_state: Dict[str, Any] = {"groups": None}
 
         def _enqueue_event(kind: str, *payload: Any) -> None:
             try:
                 async_events.put_nowait((kind, *payload))
             except Exception:
                 pass
+
+        def _log_async(message: str, level: str = "INFO") -> None:
+            if message is None:
+                return
+            try:
+                lvl = str(level or "INFO")
+            except Exception:
+                lvl = "INFO"
+            _enqueue_event("log", str(message), lvl)
 
         def _write_log_entries(entries: list[tuple[str, str]]) -> None:
             if not entries:
@@ -1940,6 +2008,8 @@ def launch_filter_interface(
         # Build operations area defensively: never let a single error hide the panel
         draw_footprints_var = tk.BooleanVar(master=root, value=True)
         write_wcs_var = tk.BooleanVar(master=root, value=True)
+        coverage_first_var = tk.BooleanVar(master=root, value=True)
+        overcap_percent_var = tk.IntVar(master=root, value=10)
 
         resolve_btn = None
         auto_btn = None
@@ -1972,6 +2042,39 @@ def launch_filter_interface(
             ).grid(row=0, column=2, padx=4, pady=2, sticky="w")
         except Exception as e:
             _log_message(f"[FilterUI] Summary label failed: {e}", level="WARN")
+
+        try:
+            coverage_chk = ttk.Checkbutton(
+                operations,
+                text=_tr(
+                    "ui_coverage_first",
+                    "Coverage-first clustering (may exceed Max raws/tile)",
+                ),
+                variable=coverage_first_var,
+            )
+            coverage_chk.grid(row=2, column=0, columnspan=3, padx=4, pady=(6, 0), sticky="w")
+        except Exception as e:
+            _log_message(f"[FilterUI] Coverage-first checkbox failed: {e}", level="WARN")
+
+        overcap_spin = None
+        try:
+            overcap_label = ttk.Label(
+                operations,
+                text=_tr("ui_overcap_allowance_pct", "Over-cap allowance (%)"),
+            )
+            overcap_label.grid(row=3, column=0, padx=4, pady=(2, 0), sticky="w")
+            overcap_spin = ttk.Spinbox(
+                operations,
+                from_=0,
+                to=50,
+                increment=5,
+                textvariable=overcap_percent_var,
+                width=5,
+                justify="center",
+            )
+            overcap_spin.grid(row=3, column=1, padx=4, pady=(2, 0), sticky="w")
+        except Exception as e:
+            _log_message(f"[FilterUI] Over-cap spinbox failed: {e}", level="WARN")
 
         try:
             footprints_chk = ttk.Checkbutton(
@@ -2399,163 +2502,400 @@ def launch_filter_interface(
                         indices_cache.clear()
                 raise
 
+        # Coverage-first auto-organization state and helpers
+        auto_cluster_state = {"running": False}
+
+        def _tr_safe(key: str, default: str, **kwargs: Any) -> str:
+            try:
+                return _tr(key, default, **kwargs)
+            except Exception:
+                try:
+                    return default.format(**kwargs)
+                except Exception:
+                    return default
+
         def _auto_organize_master_tiles() -> None:
             if not (cluster_func and autosplit_func):
                 return
-            auto_btn.state(["disabled"])
+            if auto_cluster_state.get("running"):
+                return
             try:
-                selected_indices = _get_selected_indices()
-                if not selected_indices:
-                    summary_text = _tr(
+                auto_btn.state(["disabled"])
+            except Exception:
+                pass
+
+            try:
+                selected_indices = list(_get_selected_indices())
+            except Exception:
+                selected_indices = []
+
+            if not selected_indices:
+                summary_text = _tr_safe(
+                    "filter_log_groups_summary",
+                    "Prepared {g} group(s), sizes: {sizes}.",
+                    g=0,
+                    sizes="[]",
+                )
+                summary_var.set(_apply_summary_hint(summary_text))
+                _log_message(summary_text, level="INFO")
+                try:
+                    auto_btn.state(["!disabled"])
+                except Exception:
+                    pass
+                return
+
+            try:
+                overcap_pct_value = int(overcap_percent_var.get())
+            except Exception:
+                overcap_pct_value = 10
+            overcap_pct_value = max(0, min(50, overcap_pct_value))
+            coverage_enabled_flag = bool(coverage_first_var.get())
+
+            auto_cluster_state["running"] = True
+
+            def _finalize_ui() -> None:
+                auto_cluster_state["running"] = False
+                try:
+                    auto_btn.state(["!disabled"])
+                except Exception:
+                    pass
+
+            def _notify_no_groups(level: str) -> None:
+                summary_text_local = _tr_safe(
+                    "filter_log_groups_summary",
+                    "Prepared {g} group(s), sizes: {sizes}.",
+                    g=0,
+                    sizes="[]",
+                )
+                summary_var.set(_apply_summary_hint(summary_text_local))
+                _log_message(summary_text_local, level=level)
+                _finalize_ui()
+
+            def _handle_error(message: str) -> None:
+                _log_message(message, level="ERROR")
+                _finalize_ui()
+
+            def _apply_result(result: Dict[str, Any]) -> None:
+                try:
+                    final_groups = result.get("final_groups") or []
+                    if isinstance(overrides_state, dict):
+                        overrides_state["preplan_master_groups"] = final_groups
+                        try:
+                            overrides_state.pop("autosplit_cap", None)
+                        except Exception:
+                            pass
+                    sizes = result.get("sizes")
+                    if not isinstance(sizes, list):
+                        sizes = [len(gr) for gr in final_groups]
+                    sizes_str = ", ".join(str(s) for s in sizes) if sizes else "[]"
+                    summary_text = _tr_safe(
                         "filter_log_groups_summary",
                         "Prepared {g} group(s), sizes: {sizes}.",
-                        g=0,
-                        sizes="[]",
+                        g=len(final_groups),
+                        sizes=sizes_str,
                     )
                     summary_var.set(_apply_summary_hint(summary_text))
                     _log_message(summary_text, level="INFO")
-                    return
-
-                class _FallbackWCS:
-                    is_celestial = True
-
-                    def __init__(self, center_coord: SkyCoord):
-                        self._center = center_coord
-                        self.pixel_shape = (1, 1)
-                        self.array_shape = (1, 1)
-
-                        class _Inner:
-                            def __init__(self, center: SkyCoord):
-                                self.crval = (
-                                    float(center.ra.to(u.deg).value),
-                                    float(center.dec.to(u.deg).value),
-                                )
-                                self.crpix = (0.5, 0.5)
-
-                        self.wcs = _Inner(center_coord)
-
-                    def pixel_to_world(self, _x: float, _y: float):
-                        return self._center
-
-                candidate_infos: list[dict] = []
-                coord_samples: list[tuple[float, float]] = []
-                for idx in selected_indices:
-                    item = items[idx]
-                    entry = dict(item.src)
-                    if "path" not in entry:
-                        entry["path"] = item.path
-                    if "path_raw" not in entry and item.src.get("path_raw"):
-                        entry["path_raw"] = item.src.get("path_raw")
-                    if "header" not in entry:
-                        entry["header"] = item.header
-                    if item.shape and "shape" not in entry:
-                        entry["shape"] = item.shape
-                    center_obj = item.center or item.phase0_center
-                    if center_obj is None and extract_center_from_header_fn and item.header is not None:
-                        try:
-                            center_obj = extract_center_from_header_fn(item.header)
-                        except Exception:
-                            center_obj = None
-                    if item.wcs is None and center_obj is not None:
-                        entry["wcs"] = _FallbackWCS(center_obj)
-                        entry["_fallback_wcs_used"] = True
-                        entry.setdefault("phase0_center", center_obj)
-                        entry.setdefault("center", center_obj)
-                    elif item.wcs is not None:
-                        entry["wcs"] = item.wcs
-                        if center_obj is not None:
-                            entry.setdefault("center", center_obj)
-                    if center_obj is not None:
-                        coord_samples.append(
-                            (
-                                float(center_obj.ra.to(u.deg).value),
-                                float(center_obj.dec.to(u.deg).value),
-                            )
+                    if result.get("coverage_first"):
+                        done_msg = _tr_safe(
+                            "log_covfirst_done",
+                            "Coverage-first preplan ready: {N} groups written to overrides_state.preplan_master_groups",
+                            N=len(final_groups),
                         )
-                        entry.setdefault("RA", coord_samples[-1][0])
-                        entry.setdefault("DEC", coord_samples[-1][1])
-                    candidate_infos.append(entry)
+                        _log_message(done_msg, level="INFO")
+                    pending_outline_state["groups"] = final_groups if final_groups else None
+                    if not resolve_state.get("running"):
+                        try:
+                            _draw_group_outlines(final_groups)
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    _log_message(f"[FilterUI] Failed to apply clustering result: {exc}", level="ERROR")
+                finally:
+                    _finalize_ui()
 
-                if not candidate_infos:
-                    summary_text = _tr(
-                        "filter_log_groups_summary",
-                        "Prepared {g} group(s), sizes: {sizes}.",
-                        g=0,
-                        sizes="[]",
-                    )
-                    summary_var.set(_apply_summary_hint(summary_text))
-                    _log_message(summary_text, level="WARN")
-                    return
+            def _worker(selected_snapshot: list[int], overcap_pct: int, coverage_enabled: bool) -> None:
+                try:
+                    class _FallbackWCS:
+                        is_celestial = True
 
-                if coord_samples:
-                    if compute_dispersion_func:
+                        def __init__(self, center_coord: SkyCoord):
+                            self._center = center_coord
+                            self.pixel_shape = (1, 1)
+                            self.array_shape = (1, 1)
+
+                            class _Inner:
+                                def __init__(self, center: SkyCoord):
+                                    self.crval = (
+                                        float(center.ra.to(u.deg).value),
+                                        float(center.dec.to(u.deg).value),
+                                    )
+                                    self.crpix = (0.5, 0.5)
+
+                            self.wcs = _Inner(center_coord)
+
+                        def pixel_to_world(self, _x: float, _y: float):
+                            return self._center
+
+                    candidate_infos: list[dict] = []
+                    coord_samples: list[tuple[float, float]] = []
+                    for idx in selected_snapshot:
+                        if idx < 0 or idx >= len(items):
+                            continue
+                        item = items[idx]
+                        entry = dict(item.src)
+                        if "path" not in entry:
+                            entry["path"] = item.path
+                        if "path_raw" not in entry and item.src.get("path_raw"):
+                            entry["path_raw"] = item.src.get("path_raw")
+                        if "header" not in entry:
+                            entry["header"] = item.header
+                        if item.shape and "shape" not in entry:
+                            entry["shape"] = item.shape
+                        center_obj = item.center or item.phase0_center
+                        if center_obj is None and extract_center_from_header_fn and item.header is not None:
+                            try:
+                                center_obj = extract_center_from_header_fn(item.header)
+                            except Exception:
+                                center_obj = None
+                        if item.wcs is None and center_obj is not None:
+                            entry["wcs"] = _FallbackWCS(center_obj)
+                            entry["_fallback_wcs_used"] = True
+                            entry.setdefault("phase0_center", center_obj)
+                            entry.setdefault("center", center_obj)
+                        elif item.wcs is not None:
+                            entry["wcs"] = item.wcs
+                            if center_obj is not None:
+                                entry.setdefault("center", center_obj)
+                        if center_obj is not None:
+                            try:
+                                coord_samples.append(
+                                    (
+                                        float(center_obj.ra.to(u.deg).value),
+                                        float(center_obj.dec.to(u.deg).value),
+                                    )
+                                )
+                                entry.setdefault("RA", coord_samples[-1][0])
+                                entry.setdefault("DEC", coord_samples[-1][1])
+                            except Exception:
+                                pass
+                        candidate_infos.append(entry)
+
+                    if not candidate_infos:
+                        root.after(0, lambda: _notify_no_groups("WARN"))
+                        return
+
+                    if coord_samples and compute_dispersion_func:
                         try:
                             dispersion_deg = float(compute_dispersion_func(coord_samples))
                         except Exception:
                             dispersion_deg = 0.0
                     else:
                         dispersion_deg = 0.0
-                else:
-                    dispersion_deg = 0.0
 
-                if dispersion_deg <= 0.12:
-                    threshold_deg = 0.10
-                elif dispersion_deg <= 0.30:
-                    threshold_deg = 0.15
-                else:
-                    threshold_deg = 0.05 if dispersion_deg <= 0.60 else 0.20
-                threshold_deg = min(0.20, max(0.08, threshold_deg))
+                    if dispersion_deg <= 0.12:
+                        threshold_heuristic = 0.10
+                    elif dispersion_deg <= 0.30:
+                        threshold_heuristic = 0.15
+                    else:
+                        threshold_heuristic = 0.05 if dispersion_deg <= 0.60 else 0.20
+                    threshold_heuristic = min(0.20, max(0.08, threshold_heuristic))
 
-                groups = cluster_func(
-                    candidate_infos,
-                    float(threshold_deg),
-                    _progress_callback,
-                    orientation_split_threshold_deg=0.0,
-                )
-                if not groups:
-                    summary_text = _tr(
-                        "filter_log_groups_summary",
-                        "Prepared {g} group(s), sizes: {sizes}.",
-                        g=0,
-                        sizes="[]",
+                    threshold_override = None
+                    threshold_candidates = [
+                        combined_solver_settings.get("panel_clustering_threshold_deg"),
+                        combined_solver_settings.get("cluster_panel_threshold"),
+                    ]
+                    if isinstance(overrides_state, dict):
+                        threshold_candidates.extend(
+                            [
+                                overrides_state.get("panel_clustering_threshold_deg"),
+                                overrides_state.get("cluster_panel_threshold"),
+                            ]
+                        )
+                    for candidate in threshold_candidates:
+                        try:
+                            val = float(candidate)
+                        except Exception:
+                            continue
+                        if val > 0:
+                            threshold_override = val
+                            break
+
+                    threshold_initial = float(threshold_override) if threshold_override and threshold_override > 0 else float(threshold_heuristic)
+                    if threshold_initial <= 0:
+                        threshold_initial = float(threshold_heuristic) if threshold_heuristic > 0 else 0.10
+
+                    orientation_threshold = 0.0
+                    orientation_candidates = [combined_solver_settings.get("cluster_orientation_split_deg")]
+                    if isinstance(overrides_state, dict):
+                        orientation_candidates.append(overrides_state.get("cluster_orientation_split_deg"))
+                    for candidate in orientation_candidates:
+                        try:
+                            val = float(candidate)
+                        except Exception:
+                            continue
+                        if val > 0:
+                            orientation_threshold = val
+                            break
+
+                    cap_effective = int(autosplit_cap)
+                    cap_candidates = [combined_solver_settings.get("max_raw_per_master_tile")]
+                    if isinstance(overrides_state, dict):
+                        cap_candidates.append(overrides_state.get("max_raw_per_master_tile"))
+                    for candidate in cap_candidates:
+                        try:
+                            val = int(candidate)
+                        except Exception:
+                            continue
+                        if val > 0:
+                            cap_effective = max(1, min(50, val))
+                            break
+
+                    min_cap_effective = int(autosplit_min_cap)
+                    min_candidates = [combined_solver_settings.get("autosplit_min_cap")]
+                    if isinstance(overrides_state, dict):
+                        min_candidates.append(overrides_state.get("autosplit_min_cap"))
+                    for candidate in min_candidates:
+                        try:
+                            val = int(candidate)
+                        except Exception:
+                            continue
+                        if val > 0:
+                            min_cap_effective = max(1, min(val, cap_effective))
+                            break
+                    min_cap_effective = max(1, min(min_cap_effective, cap_effective))
+
+                    if coverage_enabled:
+                        start_msg = _tr_safe(
+                            "log_covfirst_start",
+                            "Coverage-first clustering: start (threshold={TH} deg, cap={CAP}, min_cap={MIN})",
+                            TH=f"{threshold_initial:.3f}",
+                            CAP=int(cap_effective),
+                            MIN=int(min_cap_effective),
+                        )
+                        _log_async(start_msg, "INFO")
+
+                    threshold_for_cluster = float(threshold_initial)
+                    groups_initial = cluster_func(
+                        candidate_infos,
+                        threshold_for_cluster,
+                        _progress_callback,
+                        orientation_split_threshold_deg=float(orientation_threshold),
                     )
-                    summary_var.set(_apply_summary_hint(summary_text))
-                    _log_message(summary_text, level="WARN")
-                    return
+                    if not groups_initial:
+                        root.after(0, lambda: _notify_no_groups("WARN"))
+                        return
 
-                final_groups = autosplit_func(
-                    groups,
-                    cap=int(autosplit_cap),
-                    min_cap=int(autosplit_min_cap),
-                    progress_callback=_progress_callback,
-                )
-                final_groups = _merge_small_groups(
-                    final_groups,
-                    min_size=int(autosplit_min_cap),
-                    cap=int(autosplit_cap),
-                )
-                for grp in final_groups:
-                    for info in grp:
-                        if info.pop("_fallback_wcs_used", False):
-                            info.pop("wcs", None)
-                overrides_state["preplan_master_groups"] = final_groups
-                overrides_state["autosplit_cap"] = int(autosplit_cap)
-                sizes = [len(gr) for gr in final_groups]
-                sizes_str = ", ".join(str(s) for s in sizes) if sizes else "[]"
-                summary_text = _tr(
-                    "filter_log_groups_summary",
-                    "Prepared {g} group(s), sizes: {sizes}.",
-                    g=len(final_groups),
-                    sizes=sizes_str,
-                )
-                summary_var.set(_apply_summary_hint(summary_text))
-                _log_message(summary_text, level="INFO")
-                try:
-                    _draw_group_outlines(final_groups)
-                except Exception:
-                    pass
-            finally:
-                auto_btn.state(["!disabled"])
+                    groups_used = groups_initial
+                    threshold_used = threshold_for_cluster
+                    candidate_count = len(candidate_infos)
+                    ratio = (len(groups_initial) / float(candidate_count)) if candidate_count else 0.0
+                    pathological = candidate_count > 0 and (len(groups_initial) >= candidate_count or ratio >= 0.6)
+
+                    if coverage_enabled and pathological and len(coord_samples) >= 5:
+                        p90_value = None
+                        try:
+                            sc = SkyCoord(
+                                ra=[c[0] for c in coord_samples] * u.deg,
+                                dec=[c[1] for c in coord_samples] * u.deg,
+                                frame="icrs",
+                            )
+                            sep_matrix = sc[:, None].separation(sc[None, :]).deg
+                            if sep_matrix.size:
+                                with np.errstate(invalid="ignore"):
+                                    np.fill_diagonal(sep_matrix, np.nan)
+                                nearest = np.nanmin(sep_matrix, axis=1)
+                                finite = nearest[np.isfinite(nearest) & (nearest > 0)]
+                                if finite.size:
+                                    p90_value = float(np.nanpercentile(finite, 90))
+                        except Exception:
+                            p90_value = None
+                        if p90_value and np.isfinite(p90_value):
+                            threshold_relaxed = max(threshold_for_cluster, float(p90_value) * 1.1)
+                            if threshold_relaxed > threshold_for_cluster * 1.001:
+                                groups_relaxed = cluster_func(
+                                    candidate_infos,
+                                    threshold_relaxed,
+                                    _progress_callback,
+                                    orientation_split_threshold_deg=float(orientation_threshold),
+                                )
+                                if groups_relaxed and len(groups_relaxed) < len(groups_initial):
+                                    relax_msg = _tr_safe(
+                                        "log_covfirst_relax",
+                                        "Relaxed epsilon using P90 NN: old={OLD} deg -> new={NEW} deg",
+                                        OLD=f"{threshold_for_cluster:.3f}",
+                                        NEW=f"{threshold_relaxed:.3f}",
+                                    )
+                                    _log_async(relax_msg, "INFO")
+                                    groups_used = groups_relaxed
+                                    threshold_used = threshold_relaxed
+
+                    groups_after_autosplit = autosplit_func(
+                        groups_used,
+                        cap=int(cap_effective),
+                        min_cap=int(min_cap_effective),
+                        progress_callback=_progress_callback,
+                    )
+                    if coverage_enabled:
+                        autosplit_msg = _tr_safe(
+                            "log_covfirst_autosplit",
+                            "Autosplit applied: cap={CAP}, min_cap={MIN}, groups_in={IN}, groups_out={OUT}",
+                            CAP=int(cap_effective),
+                            MIN=int(min_cap_effective),
+                            IN=len(groups_used),
+                            OUT=len(groups_after_autosplit),
+                        )
+                        _log_async(autosplit_msg, "INFO")
+
+                    cap_with_allowance = max(int(cap_effective), int(cap_effective * (1 + overcap_pct / 100.0)))
+                    max_dispersion_limit = None
+                    if compute_dispersion_func and threshold_used > 0:
+                        max_dispersion_limit = float(threshold_used) * 1.05
+
+                    merge_log_fn = (lambda msg: _log_async(msg, "DEBUG_DETAIL")) if coverage_enabled else None
+                    final_groups = _merge_small_groups(
+                        groups_after_autosplit,
+                        min_size=int(min_cap_effective),
+                        cap=int(cap_effective),
+                        cap_allowance=cap_with_allowance,
+                        compute_dispersion=compute_dispersion_func if compute_dispersion_func else None,
+                        max_dispersion_deg=max_dispersion_limit,
+                        log_fn=merge_log_fn,
+                    )
+                    if coverage_enabled:
+                        merge_msg = _tr_safe(
+                            "log_covfirst_merge",
+                            "Merged small groups with over-cap allowance={ALLOW}%, final_groups={N}",
+                            ALLOW=int(overcap_pct),
+                            N=len(final_groups),
+                        )
+                        _log_async(merge_msg, "INFO")
+
+                    for grp in final_groups:
+                        for info in grp:
+                            if info.pop("_fallback_wcs_used", False):
+                                info.pop("wcs", None)
+
+                    result_payload = {
+                        "final_groups": final_groups,
+                        "sizes": [len(gr) for gr in final_groups],
+                        "coverage_first": coverage_enabled,
+                        "threshold_used": threshold_used,
+                    }
+                    root.after(0, lambda res=result_payload: _apply_result(res))
+                except Exception as exc:
+                    error_msg = f"[FilterUI] Coverage-first clustering failed: {exc}"
+                    root.after(0, lambda msg=error_msg: _handle_error(msg))
+
+            try:
+                threading.Thread(
+                    target=_worker,
+                    args=(selected_indices, overcap_pct_value, coverage_enabled_flag),
+                    daemon=True,
+                ).start()
+            except Exception as exc:
+                _handle_error(f"[FilterUI] Unable to start coverage-first clustering: {exc}")
 
         try:
             if resolve_btn is not None:
@@ -3013,6 +3353,8 @@ def launch_filter_interface(
 
         def _draw_group_outlines(groups_payload: Optional[list[list[dict]]]) -> None:
             """Draw red Master Tile contours using celestial coordinates."""
+
+            pending_outline_state["groups"] = groups_payload if groups_payload else None
 
             if not groups_payload:
                 _clear_group_outlines()
@@ -4144,6 +4486,11 @@ def launch_filter_interface(
                             resolve_btn.state(["!disabled"])
                         except Exception:
                             pass
+                        if not resolve_state.get("running") and pending_outline_state.get("groups") is not None:
+                            try:
+                                _draw_group_outlines(pending_outline_state.get("groups"))
+                            except Exception:
+                                pass
                         if footprints_restore_state.get("needs_restore"):
                             original_value = bool(footprints_restore_state.get("value", True))
                             try:
