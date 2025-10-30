@@ -293,6 +293,9 @@ class ZeMosaicGUI:
         self._chrono_start_time = None
         self._chrono_after_id = None
         self._stage_times = {}
+        # Last filter outcomes to forward to worker (overrides + optional header list)
+        self._last_filter_overrides = None
+        self._last_filtered_header_items = None
         
         self.current_language_var = tk.StringVar(master=self.root, value=self.localizer.language_code)
         self.current_language_var.trace_add("write", self._on_language_change)
@@ -1823,7 +1826,7 @@ class ZeMosaicGUI:
         else:
             filtered_list = result
 
-        # Log a small message; do not start processing
+        # On Validate: apply overrides then start processing immediately
         if accepted:
             try:
                 kept = len(filtered_list) if isinstance(filtered_list, list) else 0
@@ -1838,16 +1841,23 @@ class ZeMosaicGUI:
                 self._log_message(self._tr("info", "Info"), level="INFO_DETAIL")
                 if total is not None:
                     self._log_message(
-                        f"[ZGUI] Filter validated: kept {kept}/{total}. No processing started.",
+                        f"[ZGUI] Filter validated: kept {kept}/{total}. Starting processing…",
                         level="INFO_DETAIL",
                     )
                 else:
                     self._log_message(
-                        f"[ZGUI] Filter validated: kept {kept} files. No processing started.",
+                        f"[ZGUI] Filter validated: kept {kept} files. Starting processing…",
                         level="INFO_DETAIL",
                     )
             except Exception:
                 pass
+            # Persist last filter results for the worker run
+            try:
+                self._last_filter_overrides = overrides if isinstance(overrides, dict) else None
+                self._last_filtered_header_items = filtered_list if isinstance(filtered_list, list) else None
+            except Exception:
+                self._last_filter_overrides = None
+                self._last_filtered_header_items = None
             # Apply clustering overrides if provided
             try:
                 if isinstance(overrides, dict):
@@ -1873,10 +1883,21 @@ class ZeMosaicGUI:
                     self._log_message("[ZGUI] Applied clustering overrides from filter UI.", level="INFO_DETAIL")
             except Exception:
                 pass
+            # Start processing now, skipping a second filter prompt
+            try:
+                self._start_processing(skip_filter_ui_for_run=True)
+            except Exception:
+                # Fall back to idle if anything goes wrong starting immediately
+                pass
         else:
             # Mark cancelled to ensure GUI end-of-run messages behave consistently if used as pre-run stage
             self._cancel_requested = True
             self._log_message("log_key_processing_cancelled", level="WARN")
+            # Clear any stale filter carry-overs
+            self._last_filter_overrides = None
+            self._last_filtered_header_items = None
+
+        return
 
 
 
@@ -2193,7 +2214,7 @@ class ZeMosaicGUI:
 
 
 
-    def _start_processing(self):
+    def _start_processing(self, *, skip_filter_ui_for_run: bool = False):
         if self.is_processing: 
             messagebox.showwarning(self._tr("processing_in_progress_title"), 
                                    self._tr("processing_already_running_warning"), 
@@ -2206,7 +2227,7 @@ class ZeMosaicGUI:
             return
 
         # 1. RÉCUPÉRER TOUTES les valeurs des variables Tkinter
-        skip_filter_ui_for_run = False
+        
         input_dir = self.input_dir_var.get()
         output_dir = self.output_dir_var.get()
         astap_exe = self.astap_exe_path_var.get()
@@ -2317,20 +2338,151 @@ class ZeMosaicGUI:
                 return
 
         # 2bis. Choix utilisateur concernant l'ouverture du filtre
-        try:
-            wants_filter_window = messagebox.askyesno(
-                self._tr("filter_prompt_title", "Filter range and set clustering?"),
-                self._tr(
-                    "filter_prompt_message",
-                    "Do you want to open the filter window to adjust the range and clustering before processing?",
-                ),
-                parent=self.root,
-                icon='question',
-            )
-        except tk.TclError:
-            wants_filter_window = True
-        if wants_filter_window is False:
-            skip_filter_ui_for_run = True
+        if not skip_filter_ui_for_run:
+            try:
+                wants_filter_window = messagebox.askyesno(
+                    self._tr("filter_prompt_title", "Filter range and set clustering?"),
+                    self._tr(
+                        "filter_prompt_message",
+                        "Do you want to open the filter window to adjust the range and clustering before processing?",
+                    ),
+                    parent=self.root,
+                    icon='question',
+                )
+            except tk.TclError:
+                wants_filter_window = True
+            if wants_filter_window is False:
+                # User chose not to open the filter UI: run the worker as-is.
+                skip_filter_ui_for_run = True
+            else:
+                # Open the filter UI BEFORE starting the worker so the window stays
+                # responsive and analysis only starts when the user clicks "Analyse".
+                # This mirrors the behavior of the "Open Filter" button.
+                try:
+                    try:
+                        from .zemosaic_filter_gui import launch_filter_interface
+                    except Exception:
+                        from zemosaic_filter_gui import launch_filter_interface
+                except Exception:
+                    self._log_message("[ZGUI] Filter UI not available (pre-run). Proceeding without it.", level="WARN")
+                    skip_filter_ui_for_run = True
+                else:
+                    # Build initial overrides from current GUI values so the filter
+                    # reflects thresholds and clustering parameters.
+                    _initial_overrides = None
+                    try:
+                        _initial_overrides = {
+                            "cluster_panel_threshold": float(self.cluster_threshold_var.get()) if hasattr(self, 'cluster_threshold_var') else float(self.config.get("cluster_panel_threshold", 0.05)),
+                            "cluster_target_groups": int(self.cluster_target_groups_var.get()) if hasattr(self, 'cluster_target_groups_var') else int(self.config.get("cluster_target_groups", 0)),
+                            "cluster_orientation_split_deg": float(self.cluster_orientation_split_var.get()) if hasattr(self, 'cluster_orientation_split_var') else float(self.config.get("cluster_orientation_split_deg", 0.0)),
+                        }
+                    except Exception:
+                        _initial_overrides = None
+
+                    # Forward solver/config payload like _open_filter_only does
+                    solver_cfg_payload = None
+                    config_overrides = None
+                    try:
+                        solver_cfg_payload = asdict(self.solver_settings)
+                        config_overrides = {
+                            "apply_master_tile_crop": bool(self.apply_master_tile_crop_var.get()),
+                            "master_tile_crop_percent": float(self.master_tile_crop_percent_var.get()),
+                            "quality_crop_enabled": bool(self.quality_crop_enabled_var.get()),
+                            "quality_crop_band_px": int(self.quality_crop_band_var.get()),
+                            "quality_crop_k_sigma": float(self.quality_crop_ks_var.get()),
+                            "quality_crop_margin_px": int(self.quality_crop_margin_var.get()),
+                            "astap_executable_path": astap_exe,
+                            "astap_data_directory_path": astap_data,
+                        }
+                    except Exception:
+                        # Fallback to minimal payload
+                        try:
+                            solver_cfg_payload = asdict(self.solver_settings)
+                        except Exception:
+                            solver_cfg_payload = None
+                        config_overrides = None
+
+                    try:
+                        filter_result = launch_filter_interface(
+                            input_dir,
+                            _initial_overrides,
+                            stream_scan=True,
+                            scan_recursive=True,
+                            batch_size=200,
+                            preview_cap=1500,
+                            solver_settings_dict=solver_cfg_payload,
+                            config_overrides=config_overrides,
+                        )
+                    except Exception as e_pre_filter:
+                        # If the filter cannot be opened, continue without it.
+                        self._log_message(f"[ZGUI] Pre-run filter UI error: {e_pre_filter}", level="WARN")
+                        skip_filter_ui_for_run = True
+                    else:
+                        # Parse returned tuple/list. Preserve overrides and the
+                        # optional filtered header items list to forward to worker.
+                        accepted_tmp = True; overrides_tmp = None; filtered_items_tmp = None
+                        if isinstance(filter_result, tuple) and len(filter_result) >= 1:
+                            try:
+                                filtered_items_tmp = filter_result[0]
+                            except Exception:
+                                filtered_items_tmp = None
+                            if len(filter_result) >= 2:
+                                try:
+                                    accepted_tmp = bool(filter_result[1])
+                                except Exception:
+                                    accepted_tmp = True
+                            if len(filter_result) >= 3:
+                                try:
+                                    overrides_tmp = filter_result[2]
+                                except Exception:
+                                    overrides_tmp = None
+                        # Apply clustering overrides so the GUI matches the filter.
+                        try:
+                            if isinstance(overrides_tmp, dict):
+                                if 'cluster_panel_threshold' in overrides_tmp and hasattr(self, 'cluster_threshold_var'):
+                                    self.cluster_threshold_var.set(float(overrides_tmp['cluster_panel_threshold']))
+                                if 'cluster_target_groups' in overrides_tmp and hasattr(self, 'cluster_target_groups_var'):
+                                    self.cluster_target_groups_var.set(int(overrides_tmp['cluster_target_groups']))
+                                if 'cluster_orientation_split_deg' in overrides_tmp and hasattr(self, 'cluster_orientation_split_var'):
+                                    self.cluster_orientation_split_var.set(float(overrides_tmp['cluster_orientation_split_deg']))
+                                # Persist in in-memory config
+                                try:
+                                    self.config["cluster_panel_threshold"] = float(self.cluster_threshold_var.get())
+                                    self.config["cluster_target_groups"] = int(self.cluster_target_groups_var.get())
+                                    self.config["cluster_orientation_split_deg"] = float(self.cluster_orientation_split_var.get())
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                        # The filter UI was shown already. Avoid launching it again
+                        # in the worker process regardless of whether the user
+                        # validated or cancelled (in the latter case we proceed
+                        # with all files unless the user canceled explicitly).
+                        skip_filter_ui_for_run = True
+
+                        # New behavior: if the user validated the filter window,
+                        # continue automatically with processing. If canceled,
+                        # abort starting the worker and return to the GUI idle.
+                        if not accepted_tmp:
+                            # Respect user cancellation and do not start
+                            self._cancel_requested = True
+                            self._log_message("log_key_processing_cancelled", level="WARN")
+                            # Clear any stale filter carry-overs
+                            self._last_filter_overrides = None
+                            self._last_filtered_header_items = None
+                            return
+                        # Persist the last filter outcomes to forward to the worker
+                        try:
+                            self._last_filter_overrides = overrides_tmp if isinstance(overrides_tmp, dict) else None
+                            self._last_filtered_header_items = (
+                                filtered_items_tmp if isinstance(filtered_items_tmp, list) else None
+                            )
+                        except Exception:
+                            self._last_filter_overrides = None
+                            self._last_filtered_header_items = None
+                        # Else: fall through to start processing below
+        # if skip_filter_ui_for_run is True, we bypass the prompt entirely
 
 
         # 3. PARSING et VALIDATION des limites Winsor (inchangé)
@@ -2512,6 +2664,15 @@ class ZeMosaicGUI:
         worker_kwargs = {"solver_settings_dict": worker_args[-1]}
         if skip_filter_ui_for_run:
             worker_kwargs["skip_filter_ui"] = True
+            # Also forward filter overrides and selection if we have them so the
+            # worker consumes them without relaunching the filter.
+            if isinstance(self._last_filter_overrides, dict):
+                worker_kwargs["filter_invoked"] = True
+                worker_kwargs["filter_overrides"] = self._last_filter_overrides
+            if isinstance(self._last_filtered_header_items, list):
+                worker_kwargs["filtered_header_items"] = self._last_filtered_header_items
+            # Explicitly disable early filter in worker to avoid double invocation
+            worker_kwargs["early_filter_enabled"] = False
 
         self.progress_queue = multiprocessing.Queue()
         self.worker_process = multiprocessing.Process(
