@@ -293,6 +293,9 @@ class ZeMosaicGUI:
         self._chrono_start_time = None
         self._chrono_after_id = None
         self._stage_times = {}
+        # Last filter outcomes to forward to worker (overrides + optional header list)
+        self._last_filter_overrides = None
+        self._last_filtered_header_items = None
         
         self.current_language_var = tk.StringVar(master=self.root, value=self.localizer.language_code)
         self.current_language_var.trace_add("write", self._on_language_change)
@@ -1848,6 +1851,13 @@ class ZeMosaicGUI:
                     )
             except Exception:
                 pass
+            # Persist last filter results for the worker run
+            try:
+                self._last_filter_overrides = overrides if isinstance(overrides, dict) else None
+                self._last_filtered_header_items = filtered_list if isinstance(filtered_list, list) else None
+            except Exception:
+                self._last_filter_overrides = None
+                self._last_filtered_header_items = None
             # Apply clustering overrides if provided
             try:
                 if isinstance(overrides, dict):
@@ -1883,6 +1893,9 @@ class ZeMosaicGUI:
             # Mark cancelled to ensure GUI end-of-run messages behave consistently if used as pre-run stage
             self._cancel_requested = True
             self._log_message("log_key_processing_cancelled", level="WARN")
+            # Clear any stale filter carry-overs
+            self._last_filter_overrides = None
+            self._last_filtered_header_items = None
 
         return
 
@@ -2405,11 +2418,14 @@ class ZeMosaicGUI:
                         self._log_message(f"[ZGUI] Pre-run filter UI error: {e_pre_filter}", level="WARN")
                         skip_filter_ui_for_run = True
                     else:
-                        # Parse returned tuple/list. The filter UI already moves
-                        # excluded files to 'filtered_by_user', so the worker can
-                        # simply scan the input folder. We just adopt overrides.
-                        accepted_tmp = True; overrides_tmp = None
+                        # Parse returned tuple/list. Preserve overrides and the
+                        # optional filtered header items list to forward to worker.
+                        accepted_tmp = True; overrides_tmp = None; filtered_items_tmp = None
                         if isinstance(filter_result, tuple) and len(filter_result) >= 1:
+                            try:
+                                filtered_items_tmp = filter_result[0]
+                            except Exception:
+                                filtered_items_tmp = None
                             if len(filter_result) >= 2:
                                 try:
                                     accepted_tmp = bool(filter_result[1])
@@ -2452,7 +2468,19 @@ class ZeMosaicGUI:
                             # Respect user cancellation and do not start
                             self._cancel_requested = True
                             self._log_message("log_key_processing_cancelled", level="WARN")
+                            # Clear any stale filter carry-overs
+                            self._last_filter_overrides = None
+                            self._last_filtered_header_items = None
                             return
+                        # Persist the last filter outcomes to forward to the worker
+                        try:
+                            self._last_filter_overrides = overrides_tmp if isinstance(overrides_tmp, dict) else None
+                            self._last_filtered_header_items = (
+                                filtered_items_tmp if isinstance(filtered_items_tmp, list) else None
+                            )
+                        except Exception:
+                            self._last_filter_overrides = None
+                            self._last_filtered_header_items = None
                         # Else: fall through to start processing below
         # if skip_filter_ui_for_run is True, we bypass the prompt entirely
 
@@ -2636,6 +2664,15 @@ class ZeMosaicGUI:
         worker_kwargs = {"solver_settings_dict": worker_args[-1]}
         if skip_filter_ui_for_run:
             worker_kwargs["skip_filter_ui"] = True
+            # Also forward filter overrides and selection if we have them so the
+            # worker consumes them without relaunching the filter.
+            if isinstance(self._last_filter_overrides, dict):
+                worker_kwargs["filter_invoked"] = True
+                worker_kwargs["filter_overrides"] = self._last_filter_overrides
+            if isinstance(self._last_filtered_header_items, list):
+                worker_kwargs["filtered_header_items"] = self._last_filtered_header_items
+            # Explicitly disable early filter in worker to avoid double invocation
+            worker_kwargs["early_filter_enabled"] = False
 
         self.progress_queue = multiprocessing.Queue()
         self.worker_process = multiprocessing.Process(

@@ -4355,6 +4355,11 @@ def run_hierarchical_mosaic(
     logging_level_config: str = "INFO",
     solver_settings: dict | None = None,
     skip_filter_ui: bool = False,
+    # New optional integration points when filter ran in GUI
+    filter_invoked: bool = False,
+    filter_overrides: dict | None = None,
+    filtered_header_items: list[dict] | None = None,
+    early_filter_enabled: bool | None = None,
 ):
     """
     Orchestre le traitement de la mosaïque hiérarchique.
@@ -4613,14 +4618,24 @@ def run_hierarchical_mosaic(
         pass
 
     # --- Phase 0 (Header-only scan + early filter) ---
+    # Preserve GUI-provided filter context arguments
+    filter_invoked_arg = filter_invoked
+    filter_overrides_arg = filter_overrides
+    filtered_header_items_arg = filtered_header_items
+
     skip_filter_ui = bool(skip_filter_ui)
-    early_filter_enabled = True
-    try:
-        if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
-            cfg0 = zemosaic_config.load_config() or {}
-            early_filter_enabled = bool(cfg0.get("enable_early_filter", True))
-    except Exception:
+    # Resolve early filter enable policy: explicit argument takes precedence,
+    # otherwise load from config, then apply skip_filter_ui override.
+    if early_filter_enabled is None:
         early_filter_enabled = True
+        try:
+            if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
+                cfg0 = zemosaic_config.load_config() or {}
+                early_filter_enabled = bool(cfg0.get("enable_early_filter", True))
+        except Exception:
+            early_filter_enabled = True
+    else:
+        early_filter_enabled = bool(early_filter_enabled)
 
     if skip_filter_ui:
         early_filter_enabled = False
@@ -4629,9 +4644,10 @@ def run_hierarchical_mosaic(
     if ASTROPY_AVAILABLE and fits is not None:
         header_items_for_filter: list[dict] = []
         filtered_items: list[dict] | None = None
-        filter_overrides: dict | None = None
+        # If caller provided overrides or prior filter state, adopt them
+        filter_overrides = filter_overrides_arg if isinstance(filter_overrides_arg, dict) else None
         filter_accepted = False
-        filter_invoked = False
+        filter_invoked = bool(filter_invoked_arg)
         streaming_filter_success = False
 
         launch_filter_interface_fn = None
@@ -4669,6 +4685,17 @@ def run_hierarchical_mosaic(
             }
         except Exception:
             initial_filter_overrides = None
+
+        # If the GUI already provided a filtered list, adopt it directly and
+        # mark the streaming path as successful to avoid relaunching the UI.
+        if isinstance(filtered_header_items_arg, list) and filtered_header_items_arg:
+            try:
+                header_items_for_filter = filtered_header_items_arg
+            except Exception:
+                header_items_for_filter = list(filtered_header_items_arg)
+            filter_invoked = True
+            filter_accepted = True
+            streaming_filter_success = True
 
         solver_payload_for_filter = solver_settings if isinstance(solver_settings, dict) else None
         config_payload_for_filter = {
