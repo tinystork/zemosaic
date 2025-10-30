@@ -388,10 +388,41 @@ def launch_filter_interface(
         from astropy.coordinates import SkyCoord
         from astropy.io import fits
         from astropy.wcs import WCS
+        from astropy.wcs.utils import pixel_to_skycoord
         import astropy.units as u
         from matplotlib.figure import Figure
         from matplotlib.patches import Polygon
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+        def footprint_wh_deg(wcs_obj: Any) -> tuple[float, float]:
+            """Return footprint width/height in degrees for a given WCS."""
+
+            try:
+                ny: Optional[int] = None
+                nx: Optional[int] = None
+                if getattr(wcs_obj, "array_shape", None):
+                    ny, nx = wcs_obj.array_shape  # type: ignore[attr-defined]
+                elif getattr(wcs_obj, "pixel_shape", None):
+                    nx, ny = wcs_obj.pixel_shape  # type: ignore[attr-defined]
+                if ny is None or nx is None:
+                    return (float("nan"), float("nan"))
+
+                px = np.array([[0, 0], [nx, 0], [nx, ny], [0, ny]], dtype=float)
+                sky = pixel_to_skycoord(px[:, 0], px[:, 1], wcs_obj)
+                ra = sky.ra.deg
+                dec = sky.dec.deg
+                ra0 = float(np.nanmedian(ra))
+                dec0 = float(np.nanmedian(dec))
+                cos_dec0 = float(np.cos(np.deg2rad(dec0))) if np.isfinite(dec0) else 1.0
+                if abs(cos_dec0) < 1e-6:
+                    cos_dec0 = 1e-6 if cos_dec0 >= 0 else -1e-6
+                x = (ra - ra0) * cos_dec0
+                y = dec - dec0
+                width = float(np.nanmax(x) - np.nanmin(x))
+                height = float(np.nanmax(y) - np.nanmin(y))
+                return width, height
+            except Exception:
+                return (float("nan"), float("nan"))
 
         astrometry_mod = None
         worker_mod = None
@@ -2084,15 +2115,24 @@ def launch_filter_interface(
                 group_outline_patches.clear()
 
         def _draw_group_outlines(groups_payload: Optional[list[list[dict]]]) -> None:
-            """Draw red bounding contours for Master Tile groups on the preview.
+            """Draw red Master Tile contours using celestial coordinates.
 
-            For each group (list of dict entries similar to items), collect
-            available RA/Dec samples (footprints when possible, otherwise
-            centers), compute a simple axis-aligned bounding rectangle in the
-            wrapped RA/Dec space, and render it as a red polygon.
+            For each group (list of dict entries similar to items), estimate a
+            representative footprint size in degrees and render a dashed red
+            rectangle centred on every available RA/Dec sample.  The rectangles
+            are computed in the sky reference frame so their proportions remain
+            consistent regardless of the current Matplotlib canvas scaling.
             """
             if not groups_payload:
                 _clear_group_outlines()
+                try:
+                    ax.relim()
+                except Exception:
+                    pass
+                try:
+                    ax.autoscale_view()
+                except Exception:
+                    pass
                 try:
                     canvas.draw_idle()
                 except Exception:
@@ -2102,121 +2142,129 @@ def launch_filter_interface(
             _clear_group_outlines()
             try:
                 for grp in groups_payload:
-                    ra_vals_g: list[float] = []
-                    dec_vals_g: list[float] = []
+                    centers: list[tuple[float, float]] = []
+                    widths: list[float] = []
+                    heights: list[float] = []
 
                     for info in grp or []:
-                        # 1) Prefer footprints already computed for the item corresponding
-                        #    to this entry (ensures consistency with blue outlines).
-                        try:
-                            # Try to map back to an existing Item via its path
-                            path_val = None
-                            if isinstance(info, dict):
-                                path_val = (
-                                    info.get("path")
-                                    or info.get("path_raw")
-                                    or info.get("path_preprocessed_cache")
-                                )
-                            idx_mapped = None
-                            if path_val is not None:
-                                key = _path_key(path_val)
-                                idx_mapped = known_path_index.get(key)
-                            if idx_mapped is not None and 0 <= idx_mapped < len(items):
-                                it = items[idx_mapped]
-                                fp = it.get_cached_footprint() or it.ensure_footprint()
-                                if fp is not None and isinstance(fp, np.ndarray) and fp.shape[1] >= 2:
-                                    for pt in fp.tolist():
-                                        try:
-                                            ra_vals_g.append(wrap_ra_deg(float(pt[0]), ref_ra))
-                                            dec_vals_g.append(float(pt[1]))
-                                        except Exception:
-                                            pass
-                                    # Use the best source available; skip to next info
-                                    continue
-                        except Exception:
-                            pass
+                        path_val = None
+                        if isinstance(info, dict):
+                            path_val = (
+                                info.get("path")
+                                or info.get("path_raw")
+                                or info.get("path_preprocessed_cache")
+                            )
+                        idx_mapped = None
+                        if path_val is not None:
+                            key = _path_key(path_val)
+                            idx_mapped = known_path_index.get(key)
 
-                        # Attempt to use footprint corners when possible
-                        wcs_obj = None
-                        try:
-                            if isinstance(info, dict):
-                                wcs_obj = info.get("wcs")
-                        except Exception:
-                            wcs_obj = None
+                        item_obj = None
+                        if idx_mapped is not None and 0 <= idx_mapped < len(items):
+                            item_obj = items[idx_mapped]
 
-                        # Infer shape
-                        shp = None
-                        try:
-                            if isinstance(info, dict):
-                                shp_val = info.get("shape")
-                                if isinstance(shp_val, (list, tuple)) and len(shp_val) >= 2:
-                                    h = int(shp_val[0]); w = int(shp_val[1])
-                                    if h > 0 and w > 0:
-                                        shp = (h, w)
-                        except Exception:
-                            shp = None
+                        wcs_candidates: list[Any] = []
+                        if item_obj is not None and getattr(item_obj, "wcs", None) is not None:
+                            wcs_candidates.append(item_obj.wcs)
+                        if isinstance(info, dict):
+                            wcs_val = info.get("wcs")
+                            if wcs_val is not None:
+                                wcs_candidates.append(wcs_val)
 
-                        if wcs_obj is not None and shp is not None and hasattr(wcs_obj, "pixel_to_world"):
+                        for wcs_obj in wcs_candidates:
+                            w_deg, h_deg = footprint_wh_deg(wcs_obj)
+                            if np.isfinite(w_deg) and np.isfinite(h_deg) and w_deg > 0 and h_deg > 0:
+                                widths.append(w_deg)
+                                heights.append(h_deg)
+                                break
+
+                        ra_c = None
+                        dec_c = None
+                        if item_obj is not None and item_obj.center is not None:
                             try:
-                                h, w = shp
-                                corners = [
-                                    (0.0, 0.0),
-                                    (w - 1.0, 0.0),
-                                    (w - 1.0, h - 1.0),
-                                    (0.0, h - 1.0),
-                                ]
-                                for (x, y) in corners:
-                                    sc = wcs_obj.pixel_to_world(x, y)
-                                    ra = float(sc.ra.to(u.deg).value)
-                                    dec = float(sc.dec.to(u.deg).value)
-                                    ra_vals_g.append(wrap_ra_deg(ra, ref_ra))
-                                    dec_vals_g.append(dec)
-                                continue
+                                ra_c = float(item_obj.center.ra.to(u.deg).value)
+                                dec_c = float(item_obj.center.dec.to(u.deg).value)
                             except Exception:
-                                pass
+                                ra_c = None
+                                dec_c = None
 
-                        # Fallback: use center
-                        try:
-                            c = info.get("center") if isinstance(info, dict) else None
-                            ra_c = None; dec_c = None
-                            if c is not None:
-                                if hasattr(c, "ra") and hasattr(c, "dec"):
-                                    ra_c = float(c.ra.to(u.deg).value)
-                                    dec_c = float(c.dec.to(u.deg).value)
-                                elif isinstance(c, (list, tuple)) and len(c) >= 2:
-                                    ra_c = float(c[0]); dec_c = float(c[1])
-                                elif isinstance(c, dict):
-                                    ra_v = c.get("ra") or c.get("RA")
-                                    dec_v = c.get("dec") or c.get("DEC")
-                                    if ra_v is not None and dec_v is not None:
-                                        ra_c = float(ra_v); dec_c = float(dec_v)
-                            if ra_c is not None and dec_c is not None:
-                                ra_vals_g.append(wrap_ra_deg(ra_c, ref_ra))
-                                dec_vals_g.append(dec_c)
-                        except Exception:
-                            pass
+                        if (ra_c is None or dec_c is None) and isinstance(info, dict):
+                            try:
+                                c = info.get("center")
+                                if c is not None:
+                                    if hasattr(c, "ra") and hasattr(c, "dec"):
+                                        ra_c = float(c.ra.to(u.deg).value)
+                                        dec_c = float(c.dec.to(u.deg).value)
+                                    elif isinstance(c, (list, tuple)) and len(c) >= 2:
+                                        ra_c = float(c[0])
+                                        dec_c = float(c[1])
+                                    elif isinstance(c, dict):
+                                        ra_v = c.get("ra") or c.get("RA")
+                                        dec_v = c.get("dec") or c.get("DEC")
+                                        if ra_v is not None and dec_v is not None:
+                                            ra_c = float(ra_v)
+                                            dec_c = float(dec_v)
+                            except Exception:
+                                ra_c = None
+                                dec_c = None
 
-                    if not ra_vals_g or not dec_vals_g:
+                        if (ra_c is None or dec_c is None) and isinstance(info, dict):
+                            try:
+                                ra_val = info.get("RA")
+                                dec_val = info.get("DEC")
+                                if ra_val is not None and dec_val is not None:
+                                    ra_c = float(ra_val)
+                                    dec_c = float(dec_val)
+                            except Exception:
+                                ra_c = None
+                                dec_c = None
+
+                        if ra_c is not None and dec_c is not None:
+                            centers.append((wrap_ra_deg(ra_c, ref_ra), float(dec_c)))
+
+                    if not centers:
                         continue
 
-                    try:
-                        ra_min, ra_max = min(ra_vals_g), max(ra_vals_g)
-                        dec_min, dec_max = min(dec_vals_g), max(dec_vals_g)
-                        # Tiny padding so thin groups remain visible
-                        ra_pad = max(1e-3, (ra_max - ra_min) * 0.03 + 0.05)
-                        dec_pad = max(1e-3, (dec_max - dec_min) * 0.03 + 0.05)
-                        ra0, ra1 = ra_min - ra_pad, ra_max + ra_pad
-                        dec0, dec1 = dec_min - dec_pad, dec_max + dec_pad
-                        rect_pts = [(ra0, dec0), (ra1, dec0), (ra1, dec1), (ra0, dec1)]
+                    tile_w = float(np.median(widths)) if widths else 0.2
+                    tile_h = float(np.median(heights)) if heights else 0.2
+
+                    for ra_center, dec_center in centers:
+                        cos_dec = float(np.cos(np.deg2rad(dec_center))) if np.isfinite(dec_center) else 1.0
+                        if abs(cos_dec) < 1e-6:
+                            cos_dec = 1e-6 if cos_dec >= 0 else -1e-6
+                        dx = tile_w / 2.0 / cos_dec
+                        dy = tile_h / 2.0
+                        ra_corners = [
+                            wrap_ra_deg(ra_center - dx, ref_ra),
+                            wrap_ra_deg(ra_center + dx, ref_ra),
+                            wrap_ra_deg(ra_center + dx, ref_ra),
+                            wrap_ra_deg(ra_center - dx, ref_ra),
+                        ]
+                        dec_corners = [
+                            dec_center - dy,
+                            dec_center - dy,
+                            dec_center + dy,
+                            dec_center + dy,
+                        ]
+                        rect_pts = list(zip(ra_corners, dec_corners))
+                        # NOTE (Codex patch): The red master-tile rectangles are now drawn in
+                        # celestial coordinates (RA/Dec degrees) with fixed aspect ratio. This
+                        # prevents distortion when footprints are shown.
                         poly = Polygon(rect_pts, closed=True, fill=False, edgecolor="red", linewidth=1.6, alpha=0.9, linestyle="--")
                         ax.add_patch(poly)
                         group_outline_patches.append(poly)
-                    except Exception:
-                        continue
 
             except Exception:
                 _clear_group_outlines()
             finally:
+                try:
+                    ax.relim()
+                except Exception:
+                    pass
+                try:
+                    ax.autoscale_view()
+                except Exception:
+                    pass
                 try:
                     canvas.draw_idle()
                 except Exception:
