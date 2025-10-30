@@ -2142,35 +2142,27 @@ def launch_filter_interface(
             _clear_group_outlines()
             try:
                 for grp in groups_payload:
-                    centers: list[tuple[float, float]] = []
+                    centers_wrapped: list[float] = []
+                    centers_dec: list[float] = []
                     widths: list[float] = []
                     heights: list[float] = []
 
-                    for info in grp or []:
-                        path_val = None
-                        if isinstance(info, dict):
-                            path_val = (
-                                info.get("path")
-                                or info.get("path_raw")
-                                or info.get("path_preprocessed_cache")
-                            )
+                    for info in (grp or []):
+                        # --- collect W×H en degrés (médiane servira de taille de tuile)
+                        wcs_candidates = []
                         idx_mapped = None
-                        if path_val is not None:
+                        path_val = (
+                            (info.get("path") or info.get("path_raw") or info.get("path_preprocessed_cache"))
+                            if isinstance(info, dict)
+                            else None
+                        )
+                        if path_val:
                             key = _path_key(path_val)
                             idx_mapped = known_path_index.get(key)
-
-                        item_obj = None
-                        if idx_mapped is not None and 0 <= idx_mapped < len(items):
-                            item_obj = items[idx_mapped]
-
-                        wcs_candidates: list[Any] = []
-                        if item_obj is not None and getattr(item_obj, "wcs", None) is not None:
-                            wcs_candidates.append(item_obj.wcs)
-                        if isinstance(info, dict):
-                            wcs_val = info.get("wcs")
-                            if wcs_val is not None:
-                                wcs_candidates.append(wcs_val)
-
+                        if idx_mapped is not None and 0 <= idx_mapped < len(items) and getattr(items[idx_mapped], "wcs", None) is not None:
+                            wcs_candidates.append(items[idx_mapped].wcs)
+                        if isinstance(info, dict) and info.get("wcs") is not None:
+                            wcs_candidates.append(info["wcs"])
                         for wcs_obj in wcs_candidates:
                             w_deg, h_deg = footprint_wh_deg(wcs_obj)
                             if np.isfinite(w_deg) and np.isfinite(h_deg) and w_deg > 0 and h_deg > 0:
@@ -2178,81 +2170,88 @@ def launch_filter_interface(
                                 heights.append(h_deg)
                                 break
 
+                        # --- collect centre RA/Dec
                         ra_c = None
                         dec_c = None
-                        if item_obj is not None and item_obj.center is not None:
+                        if idx_mapped is not None and 0 <= idx_mapped < len(items) and items[idx_mapped].center is not None:
                             try:
-                                ra_c = float(item_obj.center.ra.to(u.deg).value)
-                                dec_c = float(item_obj.center.dec.to(u.deg).value)
+                                ra_c = float(items[idx_mapped].center.ra.to(u.deg).value)
+                                dec_c = float(items[idx_mapped].center.dec.to(u.deg).value)
                             except Exception:
                                 ra_c = None
                                 dec_c = None
-
                         if (ra_c is None or dec_c is None) and isinstance(info, dict):
+                            c = info.get("center")
                             try:
-                                c = info.get("center")
-                                if c is not None:
-                                    if hasattr(c, "ra") and hasattr(c, "dec"):
-                                        ra_c = float(c.ra.to(u.deg).value)
-                                        dec_c = float(c.dec.to(u.deg).value)
-                                    elif isinstance(c, (list, tuple)) and len(c) >= 2:
-                                        ra_c = float(c[0])
-                                        dec_c = float(c[1])
-                                    elif isinstance(c, dict):
-                                        ra_v = c.get("ra") or c.get("RA")
-                                        dec_v = c.get("dec") or c.get("DEC")
-                                        if ra_v is not None and dec_v is not None:
-                                            ra_c = float(ra_v)
-                                            dec_c = float(dec_v)
+                                if c is not None and hasattr(c, "ra") and hasattr(c, "dec"):
+                                    ra_c = float(c.ra.to(u.deg).value)
+                                    dec_c = float(c.dec.to(u.deg).value)
+                                elif isinstance(c, (list, tuple)) and len(c) >= 2:
+                                    ra_c = float(c[0])
+                                    dec_c = float(c[1])
+                                elif isinstance(c, dict):
+                                    ra_v = c.get("ra") or c.get("RA")
+                                    dec_v = c.get("dec") or c.get("DEC")
+                                    if ra_v is not None and dec_v is not None:
+                                        ra_c = float(ra_v)
+                                        dec_c = float(dec_v)
                             except Exception:
                                 ra_c = None
                                 dec_c = None
-
                         if (ra_c is None or dec_c is None) and isinstance(info, dict):
                             try:
-                                ra_val = info.get("RA")
-                                dec_val = info.get("DEC")
-                                if ra_val is not None and dec_val is not None:
-                                    ra_c = float(ra_val)
-                                    dec_c = float(dec_val)
+                                ra_v = info.get("RA")
+                                dec_v = info.get("DEC")
+                                if ra_v is not None and dec_v is not None:
+                                    ra_c = float(ra_v)
+                                    dec_c = float(dec_v)
                             except Exception:
                                 ra_c = None
                                 dec_c = None
 
                         if ra_c is not None and dec_c is not None:
-                            centers.append((wrap_ra_deg(ra_c, ref_ra), float(dec_c)))
+                            centers_wrapped.append(wrap_ra_deg(ra_c, ref_ra))
+                            centers_dec.append(float(dec_c))
 
-                    if not centers:
+                    # --- si pas de centre: passer au groupe suivant
+                    if not centers_wrapped:
                         continue
 
+                    # Taille de tuile = médiane des footprints du groupe (fallback 0.2°)
                     tile_w = float(np.median(widths)) if widths else 0.2
                     tile_h = float(np.median(heights)) if heights else 0.2
 
-                    for ra_center, dec_center in centers:
-                        cos_dec = float(np.cos(np.deg2rad(dec_center))) if np.isfinite(dec_center) else 1.0
-                        if abs(cos_dec) < 1e-6:
-                            cos_dec = 1e-6 if cos_dec >= 0 else -1e-6
-                        dx = tile_w / 2.0 / cos_dec
-                        dy = tile_h / 2.0
-                        ra_corners = [
-                            wrap_ra_deg(ra_center - dx, ref_ra),
-                            wrap_ra_deg(ra_center + dx, ref_ra),
-                            wrap_ra_deg(ra_center + dx, ref_ra),
-                            wrap_ra_deg(ra_center - dx, ref_ra),
-                        ]
-                        dec_corners = [
-                            dec_center - dy,
-                            dec_center - dy,
-                            dec_center + dy,
-                            dec_center + dy,
-                        ]
-                        rect_pts = list(zip(ra_corners, dec_corners))
-                        # NOTE (Codex patch): The red master-tile rectangles are now drawn in
-                        # celestial coordinates (RA/Dec degrees) with fixed aspect ratio. This
-                        # prevents distortion when footprints are shown.
-                        poly = Polygon(rect_pts, closed=True, fill=False, edgecolor="red", linewidth=1.6, alpha=0.9, linestyle="--")
-                        ax.add_patch(poly)
-                        group_outline_patches.append(poly)
+                    # Centre représentatif = médiane des centres du groupe
+                    grp_ra = float(np.median(centers_wrapped))
+                    grp_dec = float(np.median(centers_dec))
+
+                    # Construire 1 rectangle rouge pour CE groupe
+                    cos_dec = float(np.cos(np.deg2rad(grp_dec))) if np.isfinite(grp_dec) else 1.0
+                    if abs(cos_dec) < 1e-6:  # éviter la division quasi nulle
+                        cos_dec = 1e-6 if cos_dec >= 0 else -1e-6
+                    dx = tile_w / 2.0 / cos_dec
+                    dy = tile_h / 2.0
+                    ra_corners = [
+                        wrap_ra_deg(grp_ra - dx, ref_ra),
+                        wrap_ra_deg(grp_ra + dx, ref_ra),
+                        wrap_ra_deg(grp_ra + dx, ref_ra),
+                        wrap_ra_deg(grp_ra - dx, ref_ra),
+                    ]
+                    dec_corners = [grp_dec - dy, grp_dec - dy, grp_dec + dy, grp_dec + dy]
+                    rect_pts = list(zip(ra_corners, dec_corners))
+
+                    poly = Polygon(
+                        rect_pts,
+                        closed=True,
+                        fill=False,
+                        edgecolor="red",
+                        linewidth=1.6,
+                        alpha=0.9,
+                        linestyle="--",
+                        zorder=5,
+                    )
+                    ax.add_patch(poly)
+                    group_outline_patches.append(poly)
 
             except Exception:
                 _clear_group_outlines()
