@@ -1872,6 +1872,50 @@ def launch_filter_interface(
         listbox_programmatic = {"active": False}
 
         summary_var = tk.StringVar(master=root, value="")
+
+        # Early helper: may be called before footprint/draw state exists.
+        def _apply_summary_hint(text: str) -> str:
+            base_text = str(text or "")
+            hint = _tr(
+                "filter_preview_points_hint",
+                "Preview uses a reduced set of footprints for performance. Zoom or filter to reveal more footprints.",
+            )
+            # Draw toggle may not exist yet during early startup
+            try:
+                wants_footprints = bool(draw_footprints_var.get())
+            except Exception:
+                wants_footprints = False
+
+            # Budget/total may not be initialized yet; be safe
+            budget = 0
+            total = 0
+            try:
+                budget = int((footprint_budget_state.get("budget") or 0))  # type: ignore[name-defined]
+                total = int((footprint_budget_state.get("total_items") or 0))  # type: ignore[name-defined]
+            except Exception:
+                budget = 0
+                total = 0
+
+            if hint and hint in base_text:
+                base_text = base_text.replace(f" - {hint}", "")
+                base_text = base_text.replace(hint, "").strip()
+                if base_text.endswith("-"):
+                    base_text = base_text[:-1].rstrip()
+
+            if not wants_footprints or total <= 0 or budget >= total:
+                try:
+                    preview_hint_state["active"] = False  # type: ignore[name-defined]
+                except Exception:
+                    pass
+                return base_text
+
+            try:
+                preview_hint_state["active"] = True  # type: ignore[name-defined]
+            except Exception:
+                pass
+            if not base_text:
+                return hint
+            return f"{base_text} - {hint}"
         resolved_counter = {"count": int(overrides_state.get("resolved_wcs_count", 0) or 0)}
 
         if not has_explicit_centers:
@@ -3329,36 +3373,48 @@ def launch_filter_interface(
                 return False
             return footprint_budget_state.get("budget", 0) > 0
 
-        def _apply_summary_hint(text: str) -> str:
-            base_text = str(text or "")
-            hint = _tr(
-                "filter_preview_points_hint",
-                "Preview uses a reduced set of footprints for performance. Zoom or filter to reveal more footprints.",
-            )
-            try:
-                wants_footprints = bool(draw_footprints_var.get())
-            except Exception:
-                wants_footprints = False
-
-            budget = int(footprint_budget_state.get("budget") or 0)
-            total = int(footprint_budget_state.get("total_items") or 0)
-
-            if hint and hint in base_text:
-                base_text = base_text.replace(f" — {hint}", "")
-                base_text = base_text.replace(hint, "").strip()
-                if base_text.endswith("—"):
-                    base_text = base_text[:-1].rstrip()
-
-            if not wants_footprints or total <= 0 or budget >= total:
-                preview_hint_state["active"] = False
-                return base_text
-
-            preview_hint_state["active"] = True
-            if not base_text:
-                return hint
-            return f"{base_text} — {hint}"
+        # (moved earlier — see early definition near summary_var)
 
         axes_update_pending = {"pending": False}
+
+        # Define axes update helpers early so any earlier population calls can use them safely
+        def _recompute_axes_limits() -> None:
+            ra_vals: list[float] = []
+            dec_vals: list[float] = []
+            for it in items:
+                footprint = it.get_cached_footprint()
+                if footprint is not None:
+                    for ra in footprint[:, 0].tolist():
+                        ra_vals.append(wrap_ra_deg(float(ra), ref_ra))
+                    dec_vals.extend(footprint[:, 1].tolist())
+                elif it.center is not None:
+                    ra_vals.append(wrap_ra_deg(float(it.center.ra.to(u.deg).value), ref_ra))
+                    dec_vals.append(float(it.center.dec.to(u.deg).value))
+            if ra_vals and dec_vals:
+                ra_min, ra_max = min(ra_vals), max(ra_vals)
+                dec_min, dec_max = min(dec_vals), max(dec_vals)
+                ra_pad = max(1e-3, (ra_max - ra_min) * 0.05 + 0.2)
+                dec_pad = max(1e-3, (dec_max - dec_min) * 0.05 + 0.2)
+                ax.set_xlim(ra_max + ra_pad, ra_min - ra_pad)
+                ax.set_ylim(dec_min - dec_pad, dec_max + dec_pad)
+                try:
+                    canvas.draw_idle()
+                except Exception:
+                    pass
+
+        def _schedule_axes_update() -> None:
+            if axes_update_pending["pending"]:
+                return
+
+            def _do_update() -> None:
+                axes_update_pending["pending"] = False
+                _recompute_axes_limits()
+
+            axes_update_pending["pending"] = True
+            try:
+                root.after_idle(_do_update)
+            except Exception:
+                _do_update()
         population_state = {
             "next_index": 0,
             "total": total_initial_entries,
@@ -4283,13 +4339,84 @@ def launch_filter_interface(
             # Keep all if canceled or closed
             return raw_files_with_wcs, False, None
 
-    except ImportError:
-        # Any optional dependency missing — silently keep all
+    except ImportError as exc:
+        # Optional dependency missing — report clearly and keep all
+        try:
+            print(f"[FilterUI] ImportError: {exc}")
+            import traceback as _tb
+            print(_tb.format_exc())
+        except Exception:
+            pass
+        # If a Tk root exists (launched from main GUI), surface a messagebox
+        try:
+            import tkinter as _tk
+            from tkinter import messagebox as _mb
+            if getattr(_tk, "_default_root", None) is not None:
+                _mb.showerror(
+                    "Filter UI",
+                    "Missing optional dependency (numpy/matplotlib/astropy).\nInstall the packages and retry.",
+                )
+        except Exception:
+            pass
         return raw_files_with_wcs, False, None
-    except Exception:
-        # Any unexpected error — fail safe and keep all
+    except Exception as exc:
+        # Unexpected error — report and fail safe
+        try:
+            print(f"[FilterUI] Error while building filter UI: {exc}")
+            import traceback as _tb
+            print(_tb.format_exc())
+        except Exception:
+            pass
+        try:
+            import tkinter as _tk
+            from tkinter import messagebox as _mb
+            if getattr(_tk, "_default_root", None) is not None:
+                _mb.showerror(
+                    "Filter UI",
+                    f"Could not open filter window.\n{exc}",
+                )
+        except Exception:
+            pass
         return raw_files_with_wcs, False, None
 
 
 __all__ = ["launch_filter_interface"]
+
+if __name__ == "__main__":
+    # Minimal CLI to launch the filter window for a directory.
+    import sys as _sys, os as _os
+    args = _sys.argv[1:]
+    if not args:
+        print("Usage: python zemosaic_filter_gui.py <input_dir>")
+        print("       python -m zemosaic_filter_gui <input_dir>")
+        _sys.exit(1)
+    inp = _os.path.expanduser(_os.path.expandvars(args[0]))
+    if not (_os.path.isdir(inp)):
+        print(f"Error: '{inp}' is not a directory")
+        _sys.exit(2)
+    try:
+        res = launch_filter_interface(
+            inp,
+            None,
+            stream_scan=True,
+            scan_recursive=True,
+            batch_size=200,
+            preview_cap=1500,
+            solver_settings_dict=None,
+            config_overrides=None,
+        )
+        # Print a short summary to the console so CLI runs are visible
+        if isinstance(res, tuple) and len(res) >= 2:
+            kept = len(res[0]) if isinstance(res[0], list) else 0
+            accepted = bool(res[1])
+            print(f"[FilterUI] Closed. accepted={accepted} kept={kept}")
+        else:
+            kept = len(res) if isinstance(res, list) else 0
+            print(f"[FilterUI] Closed. kept={kept}")
+    except KeyboardInterrupt:
+        pass
+    except Exception as _exc:
+        print(f"[FilterUI] Unhandled error: {_exc}")
+        import traceback as _tb
+        print(_tb.format_exc())
 
