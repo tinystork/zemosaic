@@ -156,7 +156,7 @@ def launch_filter_interface(
     stream_scan: bool = False,
     scan_recursive: bool = True,
     batch_size: int = 100,
-    preview_cap: int = 1000,
+    preview_cap: int = 200,
     solver_settings_dict: Optional[Dict[str, Any]] = None,
     config_overrides: Optional[Dict[str, Any]] = None,
     **kwargs,
@@ -189,7 +189,7 @@ def launch_filter_interface(
         streaming (default: 100).
     preview_cap : int, optional
         Maximum number of footprints drawn on the Matplotlib preview to avoid
-        locking the UI for very large directories (default: 1000).
+        locking the UI for very large directories (default: 200).
     solver_settings_dict : dict, optional
         Dictionary of solver configuration selected in the main GUI. When
         provided, values such as ASTAP paths and search radius override the
@@ -436,7 +436,7 @@ def launch_filter_interface(
         autosplit_func = getattr(worker_mod, '_auto_split_groups', None) if worker_mod else None
         compute_dispersion_func = getattr(worker_mod, '_compute_max_angular_separation_deg', None) if worker_mod else None
 
-        MAX_FOOTPRINTS = int(preview_cap or 0) or 1000
+        MAX_FOOTPRINTS = int(preview_cap or 0) or 200
         cache_csv_path: Optional[str] = None
         if stream_mode and input_dir:
             cache_csv_path = os.path.join(input_dir, "headers_cache.csv")
@@ -1635,6 +1635,9 @@ def launch_filter_interface(
         operations.grid(row=3, column=0, sticky="ew", padx=5, pady=5)
         operations.columnconfigure(2, weight=1)
 
+        draw_footprints_var = tk.BooleanVar(master=root, value=False)
+        write_wcs_var = tk.BooleanVar(master=root, value=False)
+
         resolve_btn = ttk.Button(
             operations,
             text=_tr("filter_btn_resolve_wcs", "Resolve missing WCS"),
@@ -1655,8 +1658,26 @@ def launch_filter_interface(
             wraplength=260,
         ).grid(row=0, column=2, padx=4, pady=2, sticky="w")
 
+        footprints_chk = ttk.Checkbutton(
+            operations,
+            text=_tr("filter_chk_draw_footprints", "Draw WCS footprints"),
+            variable=draw_footprints_var,
+        )
+        footprints_chk.grid(row=1, column=0, columnspan=2, padx=4, pady=(2, 0), sticky="w")
+
+        write_wcs_chk = ttk.Checkbutton(
+            operations,
+            text=_tr("filter_chk_write_wcs", "Write WCS to file"),
+            variable=write_wcs_var,
+        )
+        write_wcs_chk.grid(row=1, column=2, padx=4, pady=(2, 0), sticky="w")
+
         if not astap_available:
             resolve_btn.state(["disabled"])
+            try:
+                write_wcs_chk.state(["disabled"])
+            except Exception:
+                pass
             _log_message(
                 _tr("filter_warn_astap_missing", "ASTAP executable not configured; skipping resolution."),
                 level="WARN",
@@ -1695,6 +1716,7 @@ def launch_filter_interface(
                 _log_message(msg, level="INFO")
                 return
 
+            write_inplace = bool(write_wcs_var.get())
             resolve_state["running"] = True
             resolve_btn.state(["disabled"])
             summary_var.set(_tr("filter_log_resolving", "Resolving missing WCS..."))
@@ -1741,7 +1763,7 @@ def launch_filter_interface(
                                     downsample_factor=downsample_val,
                                     sensitivity=None,
                                     timeout_sec=60,
-                                    update_original_header_in_place=False,
+                                    update_original_header_in_place=write_inplace,
                                     progress_callback=_progress_callback,
                                 )
                             except Exception as exc:
@@ -2306,6 +2328,12 @@ def launch_filter_interface(
                 pass
             return str(value) if value is not None else ""
 
+        def _should_draw_footprints() -> bool:
+            try:
+                return bool(draw_footprints_var.get())
+            except Exception:
+                return False
+
         all_ra_vals: list[float] = []
         all_dec_vals: list[float] = []
         drawn_footprints = {"count": 0}
@@ -2392,13 +2420,14 @@ def launch_filter_interface(
             local_ra_vals: list[float] = []
             local_dec_vals: list[float] = []
 
+            should_draw = _should_draw_footprints()
             footprint_to_draw: Optional[np.ndarray] = None
-            if drawn_footprints["count"] < MAX_FOOTPRINTS:
+            if should_draw and drawn_footprints["count"] < MAX_FOOTPRINTS:
                 footprint_to_draw = item.ensure_footprint()
-            else:
+            elif should_draw:
                 footprint_to_draw = item.get_cached_footprint()
 
-            if footprint_to_draw is not None and drawn_footprints["count"] < MAX_FOOTPRINTS:
+            if should_draw and footprint_to_draw is not None and drawn_footprints["count"] < MAX_FOOTPRINTS:
                 try:
                     ra_wrapped = [wrap_ra_deg(float(ra), ref_ra) for ra in footprint_to_draw[:, 0].tolist()]
                     decs = footprint_to_draw[:, 1].tolist()
@@ -2781,31 +2810,32 @@ def launch_filter_interface(
             alpha_val = 0.9 if selected else 0.3
             new_patch = None
             new_point = None
-            footprint = item.get_cached_footprint()
-            if footprint is not None or (drawn_footprints["count"] < MAX_FOOTPRINTS and item.wcs is not None):
-                allow_draw = drawn_footprints["count"] < MAX_FOOTPRINTS
-                if allow_draw:
-                    try:
+            should_draw = _should_draw_footprints()
+            footprint = item.get_cached_footprint() if should_draw else None
+            allow_draw = should_draw and drawn_footprints["count"] < MAX_FOOTPRINTS
+            if allow_draw and (footprint is not None or item.wcs is not None):
+                try:
+                    if footprint is None:
                         footprint = item.ensure_footprint()
-                        if footprint is None:
-                            raise ValueError("no footprint")
-                        ra_wrapped = [wrap_ra_deg(float(ra), ref_ra) for ra in footprint[:, 0].tolist()]
-                        decs = footprint[:, 1].tolist()
-                        new_patch = Polygon(
-                            list(zip(ra_wrapped, decs)),
-                            closed=True,
-                            fill=False,
-                            edgecolor=color_sel,
-                            linewidth=1.0,
-                            alpha=alpha_val,
-                        )
-                        new_patch.set_picker(True)
-                        ax.add_patch(new_patch)
-                        artist_to_index[new_patch] = idx
-                        patches[idx] = new_patch
-                        drawn_footprints["count"] += 1
-                    except Exception:
-                        new_patch = None
+                    if footprint is None:
+                        raise ValueError("no footprint")
+                    ra_wrapped = [wrap_ra_deg(float(ra), ref_ra) for ra in footprint[:, 0].tolist()]
+                    decs = footprint[:, 1].tolist()
+                    new_patch = Polygon(
+                        list(zip(ra_wrapped, decs)),
+                        closed=True,
+                        fill=False,
+                        edgecolor=color_sel,
+                        linewidth=1.0,
+                        alpha=alpha_val,
+                    )
+                    new_patch.set_picker(True)
+                    ax.add_patch(new_patch)
+                    artist_to_index[new_patch] = idx
+                    patches[idx] = new_patch
+                    drawn_footprints["count"] += 1
+                except Exception:
+                    new_patch = None
             elif item.center is not None:
                 try:
                     ra_c = wrap_ra_deg(float(item.center.ra.to(u.deg).value), ref_ra)
@@ -2817,6 +2847,18 @@ def launch_filter_interface(
                     new_point = None
             update_visuals(idx)
             _schedule_axes_update()
+
+        def _on_draw_mode_change() -> None:
+            for index in range(len(items)):
+                try:
+                    _refresh_item_visual(index)
+                except Exception:
+                    pass
+
+        try:
+            footprints_chk.configure(command=_on_draw_mode_change)
+        except Exception:
+            pass
 
         def _trigger_stream_start(force: bool = False) -> None:
             if not stream_mode:
