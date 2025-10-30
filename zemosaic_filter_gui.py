@@ -2671,6 +2671,33 @@ def launch_filter_interface(
             root.after(200, _ensure_controls_visible_later)
         except Exception as e:
             _log_message(f"[FilterUI] Scheduling visibility check failed: {e}", level="WARN")
+
+        # Keep controls row visible across resizes or heavy redraws (ASTAP/zoom)
+        def _enforce_right_grid(_event: Any | None = None) -> None:
+            try:
+                # Ensure the scrollable list (row=2) is the only stretchable row
+                right.rowconfigure(0, weight=0)
+                right.rowconfigure(1, weight=0)
+                right.rowconfigure(2, weight=1)
+                # Maintain a sane minimum height for the bottom controls
+                desired = 0
+                try:
+                    desired = int(operations.winfo_reqheight()) + int(actions.winfo_reqheight()) + int(bottom.winfo_reqheight()) + 12
+                except Exception:
+                    desired = 180
+                right.rowconfigure(3, weight=0, minsize=max(160, desired))
+            except Exception:
+                # Last resort: at least ensure row 3 doesn't collapse fully
+                try:
+                    right.rowconfigure(3, minsize=180)
+                except Exception:
+                    pass
+
+        try:
+            right.bind("<Configure>", _enforce_right_grid)
+            root.after_idle(_enforce_right_grid)
+        except Exception:
+            pass
         result: dict[str, Any] = {
             "accepted": None,
             "selected_indices": None,
@@ -2695,22 +2722,41 @@ def launch_filter_interface(
             result["selected_indices"] = sel
             result["overrides"] = overrides_state if overrides_state else None
             result["cancelled"] = False
-            try:
-                root.quit()
-            except Exception:
-                pass
-            root.destroy()
+            # If running as a Toplevel, do not quit the main GUI loop
+            if root_is_toplevel:
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+            else:
+                try:
+                    root.quit()
+                except Exception:
+                    pass
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
         def on_cancel():
             _drain_stream_queue_non_blocking(mark_done=True)
             result["accepted"] = False
             result["selected_indices"] = None
             result["cancelled"] = True
             result["overrides"] = _cancel_overrides_payload()
-            try:
-                root.quit()
-            except Exception:
-                pass
-            root.destroy()
+            if root_is_toplevel:
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+            else:
+                try:
+                    root.quit()
+                except Exception:
+                    pass
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
         ttk.Button(
             bottom,
             text=_tr(
