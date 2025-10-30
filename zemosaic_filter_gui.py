@@ -2141,11 +2141,36 @@ def launch_filter_interface(
 
             _clear_group_outlines()
             try:
+                def _wcs_corners_deg(wcs_obj: Any) -> Optional[np.ndarray]:
+                    try:
+                        ny: Optional[int] = None
+                        nx: Optional[int] = None
+                        if getattr(wcs_obj, "array_shape", None):
+                            ny, nx = wcs_obj.array_shape  # type: ignore[attr-defined]
+                        elif getattr(wcs_obj, "pixel_shape", None):
+                            nx, ny = wcs_obj.pixel_shape  # type: ignore[attr-defined]
+                        if ny is None or nx is None:
+                            return None
+                        px = np.array(
+                            [[0.0, 0.0], [float(nx), 0.0], [float(nx), float(ny)], [0.0, float(ny)]],
+                            dtype=float,
+                        )
+                        sky = pixel_to_skycoord(px[:, 0], px[:, 1], wcs_obj)
+                        ra = np.array(sky.ra.deg, dtype=float)
+                        dec = np.array(sky.dec.deg, dtype=float)
+                        if ra.size != 4 or dec.size != 4:
+                            return None
+                        return np.column_stack((ra, dec))
+                    except Exception:
+                        return None
+
                 for grp in groups_payload:
                     centers_wrapped: list[float] = []
                     centers_dec: list[float] = []
                     widths: list[float] = []
                     heights: list[float] = []
+                    corner_ra_samples: list[float] = []
+                    corner_dec_samples: list[float] = []
 
                     for info in (grp or []):
                         # --- collect W×H en degrés (médiane servira de taille de tuile)
@@ -2168,6 +2193,12 @@ def launch_filter_interface(
                             if np.isfinite(w_deg) and np.isfinite(h_deg) and w_deg > 0 and h_deg > 0:
                                 widths.append(w_deg)
                                 heights.append(h_deg)
+                            corners = _wcs_corners_deg(wcs_obj)
+                            if corners is not None:
+                                for ra_val, dec_val in corners.tolist():
+                                    corner_ra_samples.append(float(ra_val))
+                                    corner_dec_samples.append(float(dec_val))
+                            if widths and heights:
                                 break
 
                         # --- collect centre RA/Dec
@@ -2225,10 +2256,50 @@ def launch_filter_interface(
                     grp_ra = float(np.median(centers_wrapped))
                     grp_dec = float(np.median(centers_dec))
 
-                    # Construire 1 rectangle rouge pour CE groupe
                     cos_dec = float(np.cos(np.deg2rad(grp_dec))) if np.isfinite(grp_dec) else 1.0
                     if abs(cos_dec) < 1e-6:  # éviter la division quasi nulle
                         cos_dec = 1e-6 if cos_dec >= 0 else -1e-6
+
+                    if corner_ra_samples and corner_dec_samples:
+                        try:
+                            x_offsets: list[float] = []
+                            y_offsets: list[float] = []
+                            for ra_val, dec_val in zip(corner_ra_samples, corner_dec_samples):
+                                delta_ra = wrap_ra_deg(float(ra_val), grp_ra) - grp_ra
+                                x_offsets.append(delta_ra * cos_dec)
+                                y_offsets.append(float(dec_val) - grp_dec)
+                            if x_offsets and y_offsets:
+                                x_min = float(np.nanmin(x_offsets))
+                                x_max = float(np.nanmax(x_offsets))
+                                y_min = float(np.nanmin(y_offsets))
+                                y_max = float(np.nanmax(y_offsets))
+                                if np.isfinite(x_min) and np.isfinite(x_max) and np.isfinite(y_min) and np.isfinite(y_max):
+                                    # recentrer sur le centre du canvas combiné
+                                    x_center = 0.5 * (x_min + x_max)
+                                    y_center = 0.5 * (y_min + y_max)
+                                    if abs(x_center) > 1e-9:
+                                        grp_ra = wrap_ra_deg(grp_ra + (x_center / cos_dec), ref_ra)
+                                    if abs(y_center) > 1e-9:
+                                        grp_dec = grp_dec + y_center
+                                    cos_dec = float(np.cos(np.deg2rad(grp_dec))) if np.isfinite(grp_dec) else 1.0
+                                    if abs(cos_dec) < 1e-6:
+                                        cos_dec = 1e-6 if cos_dec >= 0 else -1e-6
+                                    x_offsets = []
+                                    y_offsets = []
+                                    for ra_val, dec_val in zip(corner_ra_samples, corner_dec_samples):
+                                        delta_ra = wrap_ra_deg(float(ra_val), grp_ra) - grp_ra
+                                        x_offsets.append(delta_ra * cos_dec)
+                                        y_offsets.append(float(dec_val) - grp_dec)
+                                    x_span = float(np.nanmax(x_offsets) - np.nanmin(x_offsets)) if x_offsets else 0.0
+                                    y_span = float(np.nanmax(y_offsets) - np.nanmin(y_offsets)) if y_offsets else 0.0
+                                    if np.isfinite(x_span) and x_span > 0:
+                                        tile_w = max(tile_w, x_span)
+                                    if np.isfinite(y_span) and y_span > 0:
+                                        tile_h = max(tile_h, y_span)
+                        except Exception:
+                            pass
+
+                    # Construire 1 rectangle rouge pour CE groupe
                     dx = tile_w / 2.0 / cos_dec
                     dy = tile_h / 2.0
                     ra_corners = [
