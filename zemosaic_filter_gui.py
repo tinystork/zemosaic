@@ -436,7 +436,7 @@ def launch_filter_interface(
         autosplit_func = getattr(worker_mod, '_auto_split_groups', None) if worker_mod else None
         compute_dispersion_func = getattr(worker_mod, '_compute_max_angular_separation_deg', None) if worker_mod else None
 
-        MAX_FOOTPRINTS = int(preview_cap or 0) or 200
+        MAX_FOOTPRINTS = int(preview_cap or 0) or 3000
         cache_csv_path: Optional[str] = None
         if stream_mode and input_dir:
             cache_csv_path = os.path.join(input_dir, "headers_cache.csv")
@@ -2214,12 +2214,9 @@ def launch_filter_interface(
                     except Exception:
                         continue
 
-                try:
-                    canvas.draw_idle()
-                except Exception:
-                    pass
             except Exception:
                 _clear_group_outlines()
+            finally:
                 try:
                     canvas.draw_idle()
                 except Exception:
