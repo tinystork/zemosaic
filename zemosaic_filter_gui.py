@@ -328,6 +328,12 @@ def launch_filter_interface(
             if sensitivity is not None:
                 cfg_defaults["astap_default_sensitivity"] = sensitivity
 
+        combined_solver_settings: Dict[str, Any] = {}
+        if solver_settings_payload:
+            combined_solver_settings.update(solver_settings_payload)
+        if isinstance(config_overrides, dict):
+            combined_solver_settings.update(config_overrides)
+
         if localizer_cls is not None:
             try:
                 localizer = localizer_cls(language_code=lang_code)
@@ -445,6 +451,8 @@ def launch_filter_interface(
         cluster_func = getattr(worker_mod, 'cluster_seestar_stacks_connected', None) if worker_mod else None
         autosplit_func = getattr(worker_mod, '_auto_split_groups', None) if worker_mod else None
         compute_dispersion_func = getattr(worker_mod, '_compute_max_angular_separation_deg', None) if worker_mod else None
+        solve_with_astrometry = getattr(worker_mod, 'solve_with_astrometry', None) if worker_mod else None
+        solve_with_ansvr = getattr(worker_mod, 'solve_with_ansvr', None) if worker_mod else None
 
         MAX_FOOTPRINTS = int(preview_cap or 0) or 3000
         cache_csv_path: Optional[str] = None
@@ -1400,6 +1408,7 @@ def launch_filter_interface(
 
         async_events: "queue.Queue[tuple[Any, ...]]" = queue.Queue()
         resolve_state = {"running": False}
+        _progress_log_state = {"last": 0.0}
 
         def _enqueue_event(kind: str, *payload: Any) -> None:
             try:
@@ -1456,6 +1465,12 @@ def launch_filter_interface(
             if detail_parts:
                 text = f"{text} ({', '.join(detail_parts)})"
 
+            now = time.monotonic()
+            level_upper = str(level).upper()
+            if level_upper not in {"ERROR", "WARN"}:
+                if now - _progress_log_state["last"] < 0.5:
+                    return
+            _progress_log_state["last"] = now
             _enqueue_event("log", text, level)
 
         def _sanitize_path(value: Any) -> str:
@@ -1485,6 +1500,24 @@ def launch_filter_interface(
         astap_data_dir_raw = cfg_defaults.get('astap_data_directory_path', '')
         astap_exe_path = _sanitize_path(astap_exe_path_raw)
         astap_data_dir = _sanitize_path(astap_data_dir_raw)
+
+        ansvr_path_candidates = [
+            combined_solver_settings.get('ansvr_path'),
+            combined_solver_settings.get('astrometry_local_path'),
+            combined_solver_settings.get('local_ansvr_path'),
+        ]
+        ansvr_path = next(
+            (
+                _sanitize_path(candidate)
+                for candidate in ansvr_path_candidates
+                if isinstance(candidate, str) and candidate.strip()
+            ),
+            "",
+        )
+        if ansvr_path:
+            combined_solver_settings['ansvr_path'] = ansvr_path
+
+        astrometry_api_key = str(combined_solver_settings.get('api_key') or "").strip()
 
         # Keep the sanitized values in the defaults so downstream callers (log
         # messages, resolver invocations) see consistent paths.
@@ -1682,14 +1715,21 @@ def launch_filter_interface(
         )
         write_wcs_chk.grid(row=1, column=2, padx=4, pady=(2, 0), sticky="w")
 
-        if not astap_available:
+        astrometry_solver_available = bool(solve_with_astrometry is not None and astrometry_api_key)
+        ansvr_solver_available = bool(solve_with_ansvr is not None and ansvr_path)
+        any_solver_available = astap_available or astrometry_solver_available or ansvr_solver_available
+
+        if not any_solver_available:
             resolve_btn.state(["disabled"])
             try:
                 write_wcs_chk.state(["disabled"])
             except Exception:
                 pass
             _log_message(
-                _tr("filter_warn_astap_missing", "ASTAP executable not configured; skipping resolution."),
+                _tr(
+                    "filter_warn_no_solvers",
+                    "No WCS solver configured (ASTAP/Astrometry/ANSVR).",
+                ),
                 level="WARN",
             )
 
@@ -1708,9 +1748,17 @@ def launch_filter_interface(
         def _resolve_missing_wcs_inplace() -> None:
             if resolve_state["running"]:
                 return
-            if not astap_available or solve_with_astap is None:
+
+            astap_enabled = bool(astap_available and solve_with_astap is not None)
+            astrometry_enabled = bool(solve_with_astrometry is not None and astrometry_api_key)
+            ansvr_enabled = bool(solve_with_ansvr is not None and ansvr_path)
+
+            if not (astap_enabled or astrometry_enabled or ansvr_enabled):
                 _log_message(
-                    _tr("filter_warn_astap_missing", "ASTAP executable not configured; skipping resolution."),
+                    _tr(
+                        "filter_warn_no_solvers",
+                        "No WCS solver configured (ASTAP/Astrometry/ANSVR).",
+                    ),
                     level="WARN",
                 )
                 return
@@ -1729,28 +1777,97 @@ def launch_filter_interface(
             write_inplace = bool(write_wcs_var.get())
             resolve_state["running"] = True
             resolve_btn.state(["disabled"])
-            summary_var.set(_tr("filter_log_resolving", "Resolving missing WCS..."))
-            _log_message(_tr("filter_log_resolving", "Resolving missing WCS..."), level="INFO")
+            summary_msg = _tr(
+                "filter_log_resolving_wide",
+                "Resolving missing WCS (ASTAP/Astrometry/ANSVR)…",
+            )
+            summary_var.set(summary_msg)
+            _log_message(summary_msg, level="INFO")
 
-            try:
-                try:
-                    srch_radius = float(search_radius_default)
-                    if srch_radius <= 0:
-                        srch_radius = None
-                except Exception:
-                    srch_radius = None
-                try:
-                    downsample_val = int(downsample_default)
-                    if downsample_val < 0:
-                        downsample_val = None
-                except Exception:
-                    downsample_val = None
+            solver_settings_local: Dict[str, Any] = dict(combined_solver_settings)
+            if astrometry_api_key:
+                solver_settings_local["api_key"] = astrometry_api_key
+            if ansvr_path:
+                solver_settings_local["ansvr_path"] = ansvr_path
+            solver_settings_local["update_original_header_in_place"] = write_inplace
 
-                def _resolve_worker(pairs: list[tuple[int, Any]]) -> None:
-                    resolved_now = 0
+            def _coerce_float(val: Any) -> Optional[float]:
+                try:
+                    if val is None:
+                        return None
+                    value = float(val)
+                except Exception:
+                    return None
+                return value
+
+            def _coerce_int(val: Any) -> Optional[int]:
+                try:
+                    if val is None or val == "":
+                        return None
+                    value = int(float(val))
+                except Exception:
+                    return None
+                return value
+
+            search_radius_val = solver_settings_local.get(
+                "astap_search_radius_deg",
+                cfg_defaults.get("astap_default_search_radius"),
+            )
+            srch_radius = _coerce_float(search_radius_val)
+            if srch_radius is not None and srch_radius <= 0:
+                srch_radius = None
+            if srch_radius is not None:
+                solver_settings_local["astap_search_radius_deg"] = srch_radius
+
+            downsample_candidate = solver_settings_local.get("astap_downsample")
+            if downsample_candidate is None:
+                downsample_candidate = solver_settings_local.get("downsample")
+            if downsample_candidate is None:
+                downsample_candidate = downsample_default
+            downsample_val = _coerce_int(downsample_candidate)
+            if downsample_val is not None and downsample_val < 0:
+                downsample_val = None
+            if downsample_val is not None:
+                solver_settings_local["downsample"] = downsample_val
+
+            sensitivity_candidate = solver_settings_local.get(
+                "astap_sensitivity",
+                cfg_defaults.get("astap_default_sensitivity"),
+            )
+            sensitivity_val = _coerce_int(sensitivity_candidate)
+            if sensitivity_val is not None:
+                solver_settings_local["astap_sensitivity"] = sensitivity_val
+
+            timeout_candidate = solver_settings_local.get("timeout")
+            if timeout_candidate in (None, ""):
+                timeout_candidate = solver_settings_local.get("ansvr_timeout")
+            timeout_val = _coerce_int(timeout_candidate)
+            if timeout_val is None or timeout_val <= 0:
+                timeout_val = 60
+            timeout_sec = max(5, min(timeout_val, 120))
+            solver_settings_local["timeout"] = timeout_sec
+            solver_settings_local["ansvr_timeout"] = timeout_sec
+
+            astrometry_direct = getattr(astrometry_mod, "solve_with_astrometry_net", None) if astrometry_mod else None
+            ansvr_direct = getattr(astrometry_mod, "solve_with_ansvr", None) if astrometry_mod else None
+
+            def _resolve_worker(pairs: list[tuple[int, Any]]) -> None:
+                resolved_now = 0
+
+                def _log_solver_event(key: str, default: str, level: str, **fmt: Any) -> None:
                     try:
-                        for idx, item in pairs:
+                        message = _tr(key, default, **fmt)
+                    except Exception:
+                        message = default.format(**fmt)
+                    _enqueue_event("log", message, level)
+
+                try:
+                    for idx, item in pairs:
+                        try:
                             path = item.path
+                            if not isinstance(path, str) or not os.path.isfile(path):
+                                continue
+
                             header_obj = item.header
                             if header_obj is not None:
                                 _enqueue_event("header_loaded", idx, header_obj)
@@ -1758,33 +1875,182 @@ def launch_filter_interface(
                                 try:
                                     with astap_fits_module.open(path) as hdul_hdr:
                                         header_obj = hdul_hdr[0].header
-                                        if header_obj is not None:
-                                            _enqueue_event("header_loaded", idx, header_obj)
                                 except Exception as exc:
-                                    _enqueue_event("log", f"Failed to load FITS header for '{path}': {exc}", "ERROR")
-                                    header_obj = item.header
-                            try:
-                                wcs_obj = solve_with_astap(
-                                    path,
-                                    header_obj,
-                                    astap_exe_path,
-                                    astap_data_dir,
-                                    search_radius_deg=srch_radius,
-                                    downsample_factor=downsample_val,
-                                    sensitivity=None,
-                                    timeout_sec=60,
-                                    update_original_header_in_place=write_inplace,
-                                    progress_callback=_progress_callback,
-                                )
-                            except Exception as exc:
-                                _enqueue_event("log", f"ASTAP resolve exception: {exc}", "ERROR")
-                                wcs_obj = None
-                            if wcs_obj and getattr(wcs_obj, "is_celestial", False):
-                                resolved_now += 1
-                                _enqueue_event("resolved_item", idx, header_obj, wcs_obj)
-                    finally:
-                        _enqueue_event("resolve_done", resolved_now)
+                                    _enqueue_event(
+                                        "log",
+                                        f"Failed to load FITS header for '{path}': {exc}",
+                                        "ERROR",
+                                    )
+                                    header_obj = None
+                                else:
+                                    if header_obj is not None:
+                                        _enqueue_event("header_loaded", idx, header_obj)
+                            if header_obj is None:
+                                try:
+                                    header_obj = fits.getheader(path, 0)
+                                except Exception as exc:
+                                    _enqueue_event(
+                                        "log",
+                                        f"Failed to load FITS header for '{path}': {exc}",
+                                        "ERROR",
+                                    )
+                                    continue
+                                else:
+                                    if header_obj is not None:
+                                        _enqueue_event("header_loaded", idx, header_obj)
 
+                            solved_wcs = None
+                            file_name = os.path.basename(path)
+
+                            try:
+                                existing = WCS(header_obj, naxis=2, relax=True)
+                                if existing is not None and getattr(existing, "is_celestial", False):
+                                    solved_wcs = existing
+                            except Exception:
+                                pass
+
+                            def _handle_success(solver_name: str, wcs_obj: Any) -> None:
+                                nonlocal resolved_now
+                                resolved_now += 1
+                                _log_solver_event(
+                                    "filter_log_solver_ok",
+                                    "{solver} solved {name}.",
+                                    "INFO",
+                                    solver=solver_name,
+                                    name=file_name,
+                                )
+                                _enqueue_event("resolved_item", idx, header_obj, wcs_obj)
+
+                            def _handle_failure(solver_name: str, err: str, level: str = "WARN") -> None:
+                                _log_solver_event(
+                                    "filter_log_solver_failed",
+                                    "{solver} failed for {name} ({err}).",
+                                    level,
+                                    solver=solver_name,
+                                    name=file_name,
+                                    err=err,
+                                )
+
+                            if solved_wcs is not None:
+                                _handle_success("Header", solved_wcs)
+                                continue
+
+                            # ASTAP attempt
+                            if astap_enabled:
+                                _log_solver_event(
+                                    "filter_log_solver_attempt",
+                                    "Trying {solver} for {name}…",
+                                    "INFO",
+                                    solver="ASTAP",
+                                    name=file_name,
+                                )
+                                try:
+                                    astap_wcs = solve_with_astap(
+                                        path,
+                                        header_obj,
+                                        astap_exe_path,
+                                        astap_data_dir,
+                                        search_radius_deg=srch_radius,
+                                        downsample_factor=downsample_val,
+                                        sensitivity=sensitivity_val,
+                                        timeout_sec=timeout_sec,
+                                        update_original_header_in_place=write_inplace,
+                                        progress_callback=_progress_callback,
+                                    )
+                                except Exception as exc:
+                                    _handle_failure("ASTAP", str(exc), level="ERROR")
+                                else:
+                                    if astap_wcs and getattr(astap_wcs, "is_celestial", False):
+                                        _handle_success("ASTAP", astap_wcs)
+                                        continue
+                                    _handle_failure("ASTAP", "no solution")
+
+                            if astrometry_enabled:
+                                _log_solver_event(
+                                    "filter_log_solver_attempt",
+                                    "Trying {solver} for {name}…",
+                                    "INFO",
+                                    solver="Astrometry.net",
+                                    name=file_name,
+                                )
+                                skip_failure = False
+                                try:
+                                    if write_inplace and solve_with_astrometry:
+                                        astrometry_wcs = solve_with_astrometry(
+                                            path,
+                                            header_obj,
+                                            solver_settings_local,
+                                            progress_callback=_progress_callback,
+                                        )
+                                    elif not write_inplace and astrometry_direct:
+                                        astrometry_wcs = astrometry_direct(
+                                            path,
+                                            header_obj,
+                                            api_key=solver_settings_local.get("api_key", ""),
+                                            timeout_sec=timeout_sec,
+                                            downsample_factor=solver_settings_local.get("downsample"),
+                                            update_original_header_in_place=False,
+                                            progress_callback=_progress_callback,
+                                        )
+                                    else:
+                                        astrometry_wcs = None
+                                        if not write_inplace:
+                                            _handle_failure("Astrometry.net", "disabled (write-off)", level="INFO")
+                                            skip_failure = True
+                                except Exception as exc:
+                                    _handle_failure("Astrometry.net", str(exc), level="ERROR")
+                                else:
+                                    if astrometry_wcs and getattr(astrometry_wcs, "is_celestial", False):
+                                        _handle_success("Astrometry.net", astrometry_wcs)
+                                        continue
+                                    if not skip_failure:
+                                        _handle_failure("Astrometry.net", "no solution")
+
+                            if ansvr_enabled:
+                                _log_solver_event(
+                                    "filter_log_solver_attempt",
+                                    "Trying {solver} for {name}…",
+                                    "INFO",
+                                    solver="ANSVR",
+                                    name=file_name,
+                                )
+                                skip_failure = False
+                                try:
+                                    if write_inplace and solve_with_ansvr:
+                                        ansvr_wcs = solve_with_ansvr(
+                                            path,
+                                            header_obj,
+                                            solver_settings_local,
+                                            progress_callback=_progress_callback,
+                                        )
+                                    elif not write_inplace and ansvr_direct:
+                                        ansvr_wcs = ansvr_direct(
+                                            path,
+                                            header_obj,
+                                            ansvr_config_path=solver_settings_local.get("ansvr_path", ""),
+                                            timeout_sec=timeout_sec,
+                                            update_original_header_in_place=False,
+                                            progress_callback=_progress_callback,
+                                        )
+                                    else:
+                                        ansvr_wcs = None
+                                        if not write_inplace:
+                                            _handle_failure("ANSVR", "disabled (write-off)", level="INFO")
+                                            skip_failure = True
+                                except Exception as exc:
+                                    _handle_failure("ANSVR", str(exc), level="ERROR")
+                                else:
+                                    if ansvr_wcs and getattr(ansvr_wcs, "is_celestial", False):
+                                        _handle_success("ANSVR", ansvr_wcs)
+                                        continue
+                                    if not skip_failure:
+                                        _handle_failure("ANSVR", "no solution")
+                        except Exception as exc:
+                            _enqueue_event("log", f"Unexpected resolver error: {exc}", "ERROR")
+                finally:
+                    _enqueue_event("resolve_done", resolved_now)
+
+            try:
                 threading.Thread(target=_resolve_worker, args=(pending,), daemon=True).start()
             except Exception:
                 resolve_state["running"] = False
