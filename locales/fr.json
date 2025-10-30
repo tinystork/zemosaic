@@ -418,5 +418,7 @@
     "filter_log_analysis_complete": "Analyse terminée.",
     "filter_warn_astap_missing": "Exécutable ASTAP non configuré ; résolution ignorée.",
     "filter_warn_worker_missing": "Organisation auto désactivée car le module de traitement n'a pas pu être chargé : {error}",
-    "photometric_safe_fallback_applied": "Sécurité photométrique appliquée (corr={corr:.3f}, gain={gain:.3f}, offset={offset:.3f}, échantillons={samples})"
+    "photometric_safe_fallback_applied": "Sécurité photométrique appliquée (corr={corr:.3f}, gain={gain:.3f}, offset={offset:.3f}, échantillons={samples})",
+    "filter_log_analyse_clicked": "Analyse cliquée — préparation de l'exploration…",
+    "filter_warn_no_input_dir": "Aucun dossier d'entrée à analyser."
 }

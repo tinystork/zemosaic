@@ -2332,7 +2332,118 @@ class ZeMosaicGUI:
         except tk.TclError:
             wants_filter_window = True
         if wants_filter_window is False:
+            # User chose not to open the filter UI: run the worker as-is.
             skip_filter_ui_for_run = True
+        else:
+            # Open the filter UI BEFORE starting the worker so the window stays
+            # responsive and analysis only starts when the user clicks "Analyse".
+            # This mirrors the behavior of the "Open Filter" button.
+            try:
+                try:
+                    from .zemosaic_filter_gui import launch_filter_interface
+                except Exception:
+                    from zemosaic_filter_gui import launch_filter_interface
+            except Exception:
+                self._log_message("[ZGUI] Filter UI not available (pre-run). Proceeding without it.", level="WARN")
+                skip_filter_ui_for_run = True
+            else:
+                # Build initial overrides from current GUI values so the filter
+                # reflects thresholds and clustering parameters.
+                _initial_overrides = None
+                try:
+                    _initial_overrides = {
+                        "cluster_panel_threshold": float(self.cluster_threshold_var.get()) if hasattr(self, 'cluster_threshold_var') else float(self.config.get("cluster_panel_threshold", 0.05)),
+                        "cluster_target_groups": int(self.cluster_target_groups_var.get()) if hasattr(self, 'cluster_target_groups_var') else int(self.config.get("cluster_target_groups", 0)),
+                        "cluster_orientation_split_deg": float(self.cluster_orientation_split_var.get()) if hasattr(self, 'cluster_orientation_split_var') else float(self.config.get("cluster_orientation_split_deg", 0.0)),
+                    }
+                except Exception:
+                    _initial_overrides = None
+
+                # Forward solver/config payload like _open_filter_only does
+                solver_cfg_payload = None
+                config_overrides = None
+                try:
+                    solver_cfg_payload = asdict(self.solver_settings)
+                    config_overrides = {
+                        "apply_master_tile_crop": bool(self.apply_master_tile_crop_var.get()),
+                        "master_tile_crop_percent": float(self.master_tile_crop_percent_var.get()),
+                        "quality_crop_enabled": bool(self.quality_crop_enabled_var.get()),
+                        "quality_crop_band_px": int(self.quality_crop_band_var.get()),
+                        "quality_crop_k_sigma": float(self.quality_crop_ks_var.get()),
+                        "quality_crop_margin_px": int(self.quality_crop_margin_var.get()),
+                        "astap_executable_path": astap_exe,
+                        "astap_data_directory_path": astap_data,
+                    }
+                except Exception:
+                    # Fallback to minimal payload
+                    try:
+                        solver_cfg_payload = asdict(self.solver_settings)
+                    except Exception:
+                        solver_cfg_payload = None
+                    config_overrides = None
+
+                try:
+                    filter_result = launch_filter_interface(
+                        input_dir,
+                        _initial_overrides,
+                        stream_scan=True,
+                        scan_recursive=True,
+                        batch_size=200,
+                        preview_cap=1500,
+                        solver_settings_dict=solver_cfg_payload,
+                        config_overrides=config_overrides,
+                    )
+                except Exception as e_pre_filter:
+                    # If the filter cannot be opened, continue without it.
+                    self._log_message(f"[ZGUI] Pre-run filter UI error: {e_pre_filter}", level="WARN")
+                    skip_filter_ui_for_run = True
+                else:
+                    # Parse returned tuple/list. The filter UI already moves
+                    # excluded files to 'filtered_by_user', so the worker can
+                    # simply scan the input folder. We just adopt overrides.
+                    accepted_tmp = True; overrides_tmp = None
+                    if isinstance(filter_result, tuple) and len(filter_result) >= 1:
+                        if len(filter_result) >= 2:
+                            try:
+                                accepted_tmp = bool(filter_result[1])
+                            except Exception:
+                                accepted_tmp = True
+                        if len(filter_result) >= 3:
+                            try:
+                                overrides_tmp = filter_result[2]
+                            except Exception:
+                                overrides_tmp = None
+                    # Apply clustering overrides so the GUI matches the filter.
+                    try:
+                        if isinstance(overrides_tmp, dict):
+                            if 'cluster_panel_threshold' in overrides_tmp and hasattr(self, 'cluster_threshold_var'):
+                                self.cluster_threshold_var.set(float(overrides_tmp['cluster_panel_threshold']))
+                            if 'cluster_target_groups' in overrides_tmp and hasattr(self, 'cluster_target_groups_var'):
+                                self.cluster_target_groups_var.set(int(overrides_tmp['cluster_target_groups']))
+                            if 'cluster_orientation_split_deg' in overrides_tmp and hasattr(self, 'cluster_orientation_split_var'):
+                                self.cluster_orientation_split_var.set(float(overrides_tmp['cluster_orientation_split_deg']))
+                            # Persist in in-memory config
+                            try:
+                                self.config["cluster_panel_threshold"] = float(self.cluster_threshold_var.get())
+                                self.config["cluster_target_groups"] = int(self.cluster_target_groups_var.get())
+                                self.config["cluster_orientation_split_deg"] = float(self.cluster_orientation_split_var.get())
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+
+                    # The filter UI was shown already. Avoid launching it again
+                    # in the worker process regardless of whether the user
+                    # validated or cancelled (in the latter case we proceed
+                    # with all files).
+                    skip_filter_ui_for_run = True
+
+                    # Important: do not start the worker automatically here.
+                    # We return to the GUI so the user can review and press
+                    # "Start" once ready. This guarantees the processing does
+                    # not begin while the filter window is open or just after
+                    # clicking Analyse inside the filter.
+                    return
 
 
         # 3. PARSING et VALIDATION des limites Winsor (inchangé)

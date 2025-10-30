@@ -433,5 +433,7 @@
     "filter_cancel": "Cancel",
     "filter_invalid_value_title": "Invalid value",
     "filter_invalid_value_msg": "Please enter a distance in degrees (numeric).",
-    "photometric_safe_fallback_applied": "Photometric safeguard applied (corr={corr:.3f}, gain={gain:.3f}, offset={offset:.3f}, samples={samples})"
+    "photometric_safe_fallback_applied": "Photometric safeguard applied (corr={corr:.3f}, gain={gain:.3f}, offset={offset:.3f}, samples={samples})",
+    "filter_log_analyse_clicked": "Analyse clicked — preparing scan…",
+    "filter_warn_no_input_dir": "No input directory to scan."
 }

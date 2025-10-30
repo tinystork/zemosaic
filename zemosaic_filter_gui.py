@@ -253,12 +253,19 @@ def launch_filter_interface(
     stream_mode = False
     input_dir: Optional[str] = None
 
-    if stream_scan and isinstance(raw_files_with_wcs_or_dir, str):
-        candidate = raw_files_with_wcs_or_dir
+    # Robust detection: if a directory path is provided, always use streaming
+    # mode regardless of the explicit flag. This makes callers resilient to
+    # mismatched parameters and guarantees the presence of the Analyse button.
+    if isinstance(raw_files_with_wcs_or_dir, str):
+        # Normalize user-provided path for robust directory detection
+        candidate = str(raw_files_with_wcs_or_dir).strip().strip('"').strip("'")
+        candidate = os.path.expanduser(os.path.expandvars(candidate))
         if os.path.isdir(candidate):
             stream_mode = True
             input_dir = candidate
-        else:
+        elif stream_scan:
+            # Caller requested streaming but provided a non-directory path →
+            # fail fast with a safe default.
             return [], False, None
 
     if not stream_mode:
@@ -266,6 +273,20 @@ def launch_filter_interface(
             return raw_files_with_wcs_or_dir, False, None
 
     raw_items_input = raw_files_with_wcs_or_dir
+
+    # --- Simple debug logger (console + buffer flushed to UI log later) ---
+    _dbg_msgs: list[str] = []
+    def _dbg(msg: str) -> None:
+        try:
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
+        except Exception:
+            ts = "??:??:??"
+        line = f"[FilterUI {ts}] {msg}"
+        try:
+            print(line)
+        except Exception:
+            pass
+        _dbg_msgs.append(line)
 
     try:
         # --- Optional localization support (autonomous fallback) ---
@@ -1246,6 +1267,7 @@ def launch_filter_interface(
                     export_btn.state(["disabled"])
                 except Exception:
                     pass
+            _dbg(f"stream_mode=True; pending_start={stream_state.get('pending_start')} csv_loaded={stream_state.get('csv_loaded')} input_dir={input_dir}")
         else:
             if total_initial_entries > 400:
                 try:
@@ -1436,12 +1458,21 @@ def launch_filter_interface(
         # Right panel with controls
         right = ttk.Frame(main)
         right.grid(row=1, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
         # The scrollable list lives at row=2 (row=1 reserved for clustering params)
         try:
             right.rowconfigure(2, weight=1)
         except Exception:
             right.rowconfigure(1, weight=1)
-        right.columnconfigure(0, weight=1)
+        # Reserve space for the aggregate controls container (row=3)
+        # Ensure a reasonable minimum height so controls are always visible.
+        try:
+            right.rowconfigure(3, weight=0, minsize=180)
+        except Exception:
+            try:
+                right.rowconfigure(3, minsize=180)
+            except Exception:
+                pass
 
         # Threshold controls
         thresh_frame = ttk.LabelFrame(
@@ -1553,6 +1584,14 @@ def launch_filter_interface(
                 log_widget.see(tk.END)
             except Exception:
                 pass
+
+        # Flush any buffered debug messages from early startup
+        try:
+            if _dbg_msgs:
+                _write_log_entries([("INFO", msg) for msg in _dbg_msgs])
+                _dbg_msgs.clear()
+        except Exception:
+            pass
 
         def _flush_log_buffer(force: bool = False) -> None:
             if not log_buffer:
@@ -1845,76 +1884,104 @@ def launch_filter_interface(
                 )
             )
 
-        operations = ttk.Frame(right)
-        operations.grid(row=3, column=0, sticky="ew", padx=5, pady=5)
+        # Aggregate controls container (ensures persistent visibility)
+        controls = ttk.Frame(right)
+        controls.grid(row=3, column=0, sticky="ew", padx=5, pady=5)
+        controls.columnconfigure(0, weight=1)
+
+        operations = ttk.Frame(controls)
+        operations.pack(fill=tk.X, expand=False)
         operations.columnconfigure(2, weight=1)
 
+        # Build operations area defensively: never let a single error hide the panel
         draw_footprints_var = tk.BooleanVar(master=root, value=True)
         write_wcs_var = tk.BooleanVar(master=root, value=True)
 
-        resolve_btn = ttk.Button(
-            operations,
-            text=_tr("filter_btn_resolve_wcs", "Resolve missing WCS"),
-        )
-        resolve_btn.grid(row=0, column=0, padx=4, pady=2, sticky="w")
-
-        auto_btn = ttk.Button(
-            operations,
-            text=_tr("filter_btn_auto_group", "Auto-organize Master Tiles"),
-        )
-        auto_btn.grid(row=0, column=1, padx=4, pady=2, sticky="w")
-
-        ttk.Label(
-            operations,
-            textvariable=summary_var,
-            anchor="w",
-            justify="left",
-            wraplength=260,
-        ).grid(row=0, column=2, padx=4, pady=2, sticky="w")
-
-        footprints_chk = ttk.Checkbutton(
-            operations,
-            text=_tr("filter_chk_draw_footprints", "Draw WCS footprints"),
-            variable=draw_footprints_var,
-        )
-        footprints_chk.grid(row=1, column=0, columnspan=2, padx=4, pady=(2, 0), sticky="w")
-
-        write_wcs_chk = ttk.Checkbutton(
-            operations,
-            text=_tr("filter_chk_write_wcs", "Write WCS to file"),
-            variable=write_wcs_var,
-        )
-        write_wcs_chk.grid(row=1, column=2, padx=4, pady=(2, 0), sticky="w")
-
-        astrometry_solver_available = bool(solve_with_astrometry is not None and astrometry_api_key)
-        ansvr_solver_available = bool(solve_with_ansvr is not None and ansvr_path)
-        any_solver_available = astap_available or astrometry_solver_available or ansvr_solver_available
-
-        if not any_solver_available:
-            resolve_btn.state(["disabled"])
-            try:
-                write_wcs_chk.state(["disabled"])
-            except Exception:
-                pass
-            _log_message(
-                _tr(
-                    "filter_warn_no_solvers",
-                    "No WCS solver configured (ASTAP/Astrometry/ANSVR).",
-                ),
-                level="WARN",
+        resolve_btn = None
+        auto_btn = None
+        footprints_chk = None
+        write_wcs_chk = None
+        try:
+            resolve_btn = ttk.Button(
+                operations,
+                text=_tr("filter_btn_resolve_wcs", "Resolve missing WCS"),
             )
+            resolve_btn.grid(row=0, column=0, padx=4, pady=2, sticky="w")
+        except Exception as e:
+            _log_message(f"[FilterUI] Resolve button init failed: {e}", level="WARN")
+        try:
+            auto_btn = ttk.Button(
+                operations,
+                text=_tr("filter_btn_auto_group", "Auto-organize Master Tiles"),
+            )
+            auto_btn.grid(row=0, column=1, padx=4, pady=2, sticky="w")
+        except Exception as e:
+            _log_message(f"[FilterUI] Auto-group button init failed: {e}", level="WARN")
 
-        if not (cluster_func and autosplit_func):
-            auto_btn.state(["disabled"])
-            if worker_import_failure_summary:
+        try:
+            ttk.Label(
+                operations,
+                textvariable=summary_var,
+                anchor="w",
+                justify="left",
+                wraplength=260,
+            ).grid(row=0, column=2, padx=4, pady=2, sticky="w")
+        except Exception as e:
+            _log_message(f"[FilterUI] Summary label failed: {e}", level="WARN")
+
+        try:
+            footprints_chk = ttk.Checkbutton(
+                operations,
+                text=_tr("filter_chk_draw_footprints", "Draw WCS footprints"),
+                variable=draw_footprints_var,
+            )
+            footprints_chk.grid(row=1, column=0, columnspan=2, padx=4, pady=(2, 0), sticky="w")
+        except Exception as e:
+            _log_message(f"[FilterUI] Footprints checkbox failed: {e}", level="WARN")
+
+        try:
+            write_wcs_chk = ttk.Checkbutton(
+                operations,
+                text=_tr("filter_chk_write_wcs", "Write WCS to file"),
+                variable=write_wcs_var,
+            )
+            write_wcs_chk.grid(row=1, column=2, padx=4, pady=(2, 0), sticky="w")
+        except Exception as e:
+            _log_message(f"[FilterUI] Write-WCS checkbox failed: {e}", level="WARN")
+
+        try:
+            astrometry_solver_available = bool(solve_with_astrometry is not None and astrometry_api_key)
+            ansvr_solver_available = bool(solve_with_ansvr is not None and ansvr_path)
+            any_solver_available = astap_available or astrometry_solver_available or ansvr_solver_available
+
+            if not any_solver_available and resolve_btn is not None:
+                resolve_btn.state(["disabled"])
+                try:
+                    if write_wcs_chk is not None:
+                        write_wcs_chk.state(["disabled"])
+                except Exception:
+                    pass
                 _log_message(
                     _tr(
-                        "filter_warn_worker_missing",
-                        "Auto-grouping disabled because the processing worker module failed to load: {error}",
-                        error=worker_import_failure_summary,
+                        "filter_warn_no_solvers",
+                        "No WCS solver configured (ASTAP/Astrometry/ANSVR).",
                     ),
-                    level="ERROR",
+                    level="WARN",
                 )
+
+            if not (cluster_func and autosplit_func) and auto_btn is not None:
+                auto_btn.state(["disabled"])
+                if worker_import_failure_summary:
+                    _log_message(
+                        _tr(
+                            "filter_warn_worker_missing",
+                            "Auto-grouping disabled because the processing worker module failed to load: {error}",
+                            error=worker_import_failure_summary,
+                        ),
+                        level="ERROR",
+                    )
+        except Exception as e:
+            _log_message(f"[FilterUI] Operations availability checks failed: {e}", level="WARN")
 
         def _resolve_missing_wcs_inplace() -> None:
             if resolve_state["running"]:
@@ -2446,8 +2513,16 @@ def launch_filter_interface(
             finally:
                 auto_btn.state(["!disabled"])
 
-        resolve_btn.configure(command=_resolve_missing_wcs_inplace)
-        auto_btn.configure(command=_auto_organize_master_tiles)
+        try:
+            if resolve_btn is not None:
+                resolve_btn.configure(command=_resolve_missing_wcs_inplace)
+        except Exception as e:
+            _log_message(f"[FilterUI] Resolve button hook failed: {e}", level="WARN")
+        try:
+            if auto_btn is not None:
+                auto_btn.configure(command=_auto_organize_master_tiles)
+        except Exception as e:
+            _log_message(f"[FilterUI] Auto-group button hook failed: {e}", level="WARN")
 
         # If initial overrides already include preplanned groups, draw them now
         try:
@@ -2458,8 +2533,11 @@ def launch_filter_interface(
             pass
 
         # Selection helpers
-        actions = ttk.Frame(right)
-        actions.grid(row=4, column=0, sticky="ew", padx=5, pady=5)
+        actions = ttk.Frame(controls)
+        try:
+            actions.pack(fill=tk.X, expand=False, pady=5)
+        except Exception:
+            actions.pack(fill=tk.X, expand=False)
         def select_all():
             if use_listbox_mode:
                 if selection_state:
@@ -2512,8 +2590,43 @@ def launch_filter_interface(
         ).pack(side=tk.LEFT, padx=4)
 
         # Confirm/cancel buttons
-        bottom = ttk.Frame(right)
-        bottom.grid(row=5, column=0, sticky="ew", padx=5, pady=5)
+        bottom = ttk.Frame(controls)
+        try:
+            bottom.pack(fill=tk.X, expand=False)
+        except Exception:
+            bottom.pack(fill=tk.X)
+        try:
+            right.update_idletasks()
+            _dbg("Right panel constructed; awaiting controls visibility check…")
+        except Exception:
+            pass
+
+        def _ensure_controls_visible_later():
+            try:
+                # If controls area didn't map yet (themes/geometry lag), give
+                # those rows a larger minimum size and try again shortly.
+                if not bottom.winfo_ismapped() or bottom.winfo_height() < 5:
+                    try:
+                        right.rowconfigure(3, minsize=180)
+                    except Exception:
+                        pass
+                    try:
+                        _dbg("Controls not visible yet; increasing row minsize and retrying…")
+                    except Exception:
+                        pass
+                    root.after(150, _ensure_controls_visible_later)
+                else:
+                    try:
+                        _dbg(f"Controls visible: operations={operations.winfo_height()} actions={actions.winfo_height()} bottom={bottom.winfo_height()}")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        try:
+            root.after(200, _ensure_controls_visible_later)
+        except Exception as e:
+            _log_message(f"[FilterUI] Scheduling visibility check failed: {e}", level="WARN")
         result: dict[str, Any] = {
             "accepted": None,
             "selected_indices": None,
@@ -3603,6 +3716,8 @@ def launch_filter_interface(
         if stream_queue is not None and not stream_state.get("done"):
             try:
                 root.after(40, _consume_ui_queue)
+                # Opportunistic non-blocking pass in case scheduling is delayed
+                _drain_stream_queue_non_blocking(mark_done=False)
             except Exception:
                 stream_state["done"] = True
 
@@ -3684,7 +3799,11 @@ def launch_filter_interface(
             pass
 
         def _trigger_stream_start(force: bool = False) -> None:
-            if not stream_mode:
+            try:
+                _dbg(f"_trigger_stream_start called; stream_mode={stream_mode}, pending_start={stream_state.get('pending_start')}, running={stream_state.get('running')}")
+            except Exception:
+                pass
+            if not stream_mode and not callable(stream_state.get("spawn_worker")):
                 return
             spawn_callable = stream_state.get("spawn_worker")
             if not callable(spawn_callable):
@@ -3694,6 +3813,7 @@ def launch_filter_interface(
             if not force and not stream_state.get("pending_start"):
                 return
             stream_state["pending_start"] = False
+            stream_state["done"] = False
             stream_state["status_message"] = _tr("filter_status_crawling", "Crawling files… please wait")
             try:
                 status_var.set(stream_state["status_message"])
@@ -3701,6 +3821,10 @@ def launch_filter_interface(
                 pass
             try:
                 pb.start(80)
+            except Exception:
+                pass
+            try:
+                _log_message("[Filter] Analyse clicked — starting directory crawl…", level="INFO")
             except Exception:
                 pass
             try:
@@ -3714,7 +3838,52 @@ def launch_filter_interface(
                 stream_state["done"] = True
 
         def _on_analyse() -> None:
-            if not stream_mode:
+            try:
+                _dbg("Analyse button pressed")
+            except Exception:
+                pass
+            # Always surface an Activity log entry for clarity
+            try:
+                _log_message(_tr("filter_log_analyse_clicked", "Analyse clicked — preparing scan…"), level="INFO")
+            except Exception:
+                pass
+            # If the spawn worker is not set yet but we have an input directory,
+            # build a minimal fallback spawner so Analyse still works.
+            if not callable(stream_state.get("spawn_worker")):
+                try:
+                    if isinstance(input_dir, str) and os.path.isdir(input_dir):
+                        def _fallback_crawl_worker(target_queue: "queue.Queue[list[Dict[str, Any]] | None]", stop_event: threading.Event) -> None:
+                            batch: list[Dict[str, Any]] = []
+                            minimum_batch = max(1, int(batch_size) if isinstance(batch_size, int) else 100)
+                            for idx, fpath in enumerate(_iter_fits_paths(input_dir, recursive=scan_recursive)):
+                                if stop_event.is_set():
+                                    break
+                                item = _minimal_header_payload(fpath)
+                                item["index"] = idx
+                                batch.append(item)
+                                if len(batch) >= minimum_batch:
+                                    if stop_event.is_set():
+                                        break
+                                    target_queue.put(batch)
+                                    batch = []
+                            if not stop_event.is_set():
+                                if batch:
+                                    target_queue.put(batch)
+                            target_queue.put(None)
+                        def _fallback_spawn() -> None:
+                            nonlocal stream_queue, stream_stop_event
+                            if stream_state.get("running"):
+                                return
+                            stream_queue = queue.Queue()
+                            stream_stop_event = threading.Event()
+                            stream_state["running"] = True
+                            stream_state["done"] = False
+                            stream_state["status_message"] = None
+                            threading.Thread(target=_fallback_crawl_worker, args=(stream_queue, stream_stop_event), daemon=True).start()
+                        stream_state["spawn_worker"] = _fallback_spawn
+                except Exception:
+                    pass
+            if not stream_mode and not callable(stream_state.get("spawn_worker")):
                 return
             _trigger_stream_start(force=True)
 
@@ -3763,10 +3932,18 @@ def launch_filter_interface(
             _log_message(f"[CSV] Exported {len(payload)} items -> {path_csv}", level="INFO")
 
         analyse_btn.configure(command=_on_analyse)
+        try:
+            analyse_btn.bind('<Button-1>', lambda e: (_dbg('Analyse <Button-1> event'), None)[1])
+        except Exception:
+            pass
         export_btn.configure(command=_on_export)
         if stream_mode:
             try:
                 analyse_btn.state(["!disabled"])
+            except Exception:
+                pass
+            try:
+                analyse_btn.configure(state=tk.NORMAL)
             except Exception:
                 pass
             if stream_state.get("pending_start"):

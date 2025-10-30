@@ -4693,22 +4693,24 @@ def run_hierarchical_mosaic(
                     config_overrides=config_payload_for_filter,
                 )
                 filtered_items, filter_accepted, filter_overrides = _parse_filter_result(filter_ret)
+                # If the user cancelled from the filter UI, abort the run cleanly
                 if isinstance(filter_overrides, dict) and filter_overrides.get("filter_cancelled"):
                     pcb("run_warn_phase0_filter_cancelled", prog=None, lvl="WARN")
                     pcb("log_key_processing_cancelled", prog=None, lvl="WARN")
                     return
+                # In streaming mode the UI returns the final filtered list, not
+                # the header pre-scan items. Consider the streaming path a success
+                # whenever the UI was invoked without raising.
+                streaming_filter_success = True
                 if isinstance(filtered_items, list):
                     header_items_for_filter = filtered_items
-                if header_items_for_filter:
-                    streaming_filter_success = True
-                    pcb(
-                        f"Phase 0: streaming filter prepared {len(header_items_for_filter)} item(s)",
-                        prog=None,
-                        lvl="INFO_DETAIL",
-                    )
-                else:
-                    filter_invoked = False
+                pcb(
+                    "Phase 0: streaming filter UI completed",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                )
             except Exception as e_filter:
+                # If we fail to invoke the streaming UI, fall back to header scan.
                 filter_invoked = False
                 header_items_for_filter = []
                 filtered_items = None
