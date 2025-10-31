@@ -77,6 +77,58 @@ from concurrent.futures.process import BrokenProcessPool
 # Nombre maximum de tentatives d'alignement avant abandon définitif
 MAX_ALIGNMENT_RETRY_ATTEMPTS = 3
 
+
+def _ensure_hwc_master_tile(
+    data: np.ndarray,
+    tile_label: str | None = None,
+) -> np.ndarray:
+    """Normalize master tile data to ``H x W x C`` float32 layout.
+
+    Parameters
+    ----------
+    data : np.ndarray
+        Array loaded from FITS (typically via ``hdul[0].data``).
+    tile_label : str | None
+        Optional identifier used for logging in case of shape issues.
+
+    Returns
+    -------
+    np.ndarray
+        Array with shape ``(H, W, C)`` and dtype ``float32``.
+
+    Raises
+    ------
+    ValueError
+        If the array dimensionality is unsupported or cannot be coerced
+        into an ``HWC`` representation.
+    """
+
+    arr = np.asarray(data, dtype=np.float32)
+
+    if arr.ndim == 2:
+        arr = arr[..., np.newaxis]
+    elif arr.ndim == 3:
+        if arr.shape[-1] in (1, 3):
+            pass
+        elif arr.shape[0] in (1, 3):
+            arr = np.moveaxis(arr, 0, -1)
+        else:
+            msg = (
+                f"Unexpected tile shape for RGB master tile: {arr.shape}"
+            )
+            if tile_label:
+                msg += f" (tile: {tile_label})"
+            logger.error(msg)
+            raise ValueError(msg)
+    else:
+        msg = f"Unsupported tile dimensionality: {arr.shape}"
+        if tile_label:
+            msg += f" (tile: {tile_label})"
+        logger.error(msg)
+        raise ValueError(msg)
+
+    return np.asarray(arr, dtype=np.float32, order="C")
+
 def cluster_seestar_stacks_connected(
     all_raw_files_with_info: list,
     stack_threshold_deg: float,
@@ -2091,6 +2143,8 @@ def reproject_tile_to_mosaic(
     apply_crop: bool = False,
     crop_percent: float = 0.0,
     tile_affine: tuple[float, float] | None = None,
+    gain: float | None = None,
+    offset: float | None = None,
     match_background: bool = True,
     nan_fill_value: float = 0.0,
     enforce_positive: bool = True,
@@ -2125,34 +2179,31 @@ def reproject_tile_to_mosaic(
                 return None, None, (0, 0, 0, 0)
 
     with fits.open(tile_path, memmap=False) as hdul:
-        data = hdul[0].data.astype(np.float32)
+        raw_data = hdul[0].data
 
-    # Les master tiles sauvegardées via ``save_fits_image`` utilisent l'ordre
-    # d'axes ``CxHxW``.  Pour l'assemblage incrémental nous attendons
-    # ``H x W x C``.  Effectuer la conversion si nécessaire.
-    if data.ndim == 3 and data.shape[0] == 3 and data.shape[-1] != 3:
-        data = np.moveaxis(data, 0, -1)
-
-    if data.ndim == 2:
-        data = data[..., np.newaxis]
+    try:
+        data = _ensure_hwc_master_tile(raw_data, os.path.basename(tile_path))
+    except ValueError:
+        return None, None, (0, 0, 0, 0)
     n_channels = data.shape[-1]
 
     # Assurer une base numérique propre (float32 + NaN vers valeur neutre)
-    data = np.asarray(data, dtype=np.float32, order="C")
     np.nan_to_num(data, copy=False, nan=nan_fill_value, posinf=nan_fill_value, neginf=nan_fill_value)
 
-    # Appliquer les corrections photométriques (gain puis offset) si fournies
-    if tile_affine is not None:
+    if gain is None or offset is None:
+        if tile_affine is not None:
+            try:
+                gain, offset = tile_affine
+            except Exception:
+                gain, offset = None, None
+
+    if gain is not None and offset is not None:
         try:
-            gain_val, offset_val = tile_affine
-        except Exception:
-            gain_val, offset_val = 1.0, 0.0
-        try:
-            gain_val = float(gain_val)
+            gain_val = float(gain)
         except Exception:
             gain_val = 1.0
         try:
-            offset_val = float(offset_val)
+            offset_val = float(offset)
         except Exception:
             offset_val = 0.0
         if not np.isfinite(gain_val):
@@ -2180,6 +2231,9 @@ def reproject_tile_to_mosaic(
                 n_channels = data.shape[-1]
         except Exception:
             pass
+
+    if data.ndim != 3:
+        raise ValueError(f"Expected HWC data after normalization, got shape {data.shape}")
 
     base_weight = np.ones(data.shape[:2], dtype=np.float32)
     if (
@@ -3534,7 +3588,7 @@ def assemble_final_mosaic_incremental(
         msg_key, prog, lvl, callback=progress_callback, **kwargs
     )
 
-    pending_affine_list = None
+    pending_affine_list: list[tuple[float, float]] | None = None
     if tile_affine_corrections:
         sanitized_affine: list[tuple[float, float]] = []
         nontrivial_detected = False
@@ -3560,7 +3614,7 @@ def assemble_final_mosaic_incremental(
             ):
                 nontrivial_detected = True
             sanitized_affine.append((gain_val, offset_val))
-        if sanitized_affine and nontrivial_detected:
+        if sanitized_affine:
             pending_affine_list = sanitized_affine
 
     use_feather = bool(use_radial_feather) if use_radial_feather is not None else False
@@ -3671,12 +3725,7 @@ def assemble_final_mosaic_incremental(
             try:
                 with fits.open(tile_path, memmap=False) as hdul:
                     tile_data = hdul[0].data
-                tile_arr = np.asarray(tile_data, dtype=np.float32)
-                if tile_arr.ndim == 3 and tile_arr.shape[0] == 3 and tile_arr.shape[-1] != 3:
-                    tile_arr = np.moveaxis(tile_arr, 0, -1)
-                if tile_arr.ndim == 2:
-                    tile_arr = tile_arr[..., np.newaxis]
-                tile_arr = np.asarray(tile_arr, dtype=np.float32, order="C")
+                tile_arr = _ensure_hwc_master_tile(tile_data, os.path.basename(tile_path))
                 np.nan_to_num(tile_arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
                 try:
                     preview_arr, preview_wcs = zemosaic_utils.create_downscaled_luminance_preview(
@@ -3748,9 +3797,9 @@ def assemble_final_mosaic_incremental(
                 lvl="WARN",
                 error="preview_failed",
             )
+        nontrivial_detected = False
         try:
-            sanitized_affine: list[tuple[float, float]] = []
-            nontrivial_detected = False
+            sanitized_affine = []
             for idx_tile in range(total_tiles):
                 gain_val, offset_val = corrections.get(idx_tile, (1.0, 0.0))
                 try:
@@ -3770,15 +3819,30 @@ def assemble_final_mosaic_incremental(
                 ):
                     nontrivial_detected = True
                 sanitized_affine.append((gain_val, offset_val))
-            pending_affine_list = sanitized_affine if nontrivial_detected else None
+            pending_affine_list = sanitized_affine
         except Exception:
             pending_affine_list = None
+            nontrivial_detected = False
         if preview_entries:
             try:
                 preview_entries.clear()
             except Exception:
                 pass
         affine_elapsed = time.monotonic() - affine_start
+        if nontrivial_detected:
+            try:
+                pcb_asm(
+                    "assemble_info_intertile_photometric_applied",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                    num_tiles=sum(
+                        1
+                        for g_val, o_val in pending_affine_list or []
+                        if abs(g_val - 1.0) > 1e-6 or abs(o_val) > 1e-6
+                    ),
+                )
+            except Exception:
+                pass
         pcb_asm(
             "run_info_incremental_affine_done",
             prog=None,
@@ -3877,26 +3941,38 @@ def assemble_final_mosaic_incremental(
                 # On transmet donc leurs en-têtes et ils seront reconstruits dans le worker.
                 tile_wcs_hdr = tile_wcs.to_header() if hasattr(tile_wcs, "to_header") else tile_wcs
                 output_wcs_hdr = final_output_wcs.to_header() if hasattr(final_output_wcs, "to_header") else final_output_wcs
-                tile_affine = None
+                gain_val = None
+                offset_val = None
                 if pending_affine_list and (tile_idx - 1) < len(pending_affine_list):
                     raw_affine = pending_affine_list[tile_idx - 1]
+                    try:
+                        gain_val = float(raw_affine[0])
+                    except Exception:
+                        gain_val = 1.0
+                    try:
+                        offset_val = float(raw_affine[1])
+                    except Exception:
+                        offset_val = 0.0
+                    if not np.isfinite(gain_val):
+                        gain_val = 1.0
+                    if not np.isfinite(offset_val):
+                        offset_val = 0.0
                     if (
-                        abs(raw_affine[0] - 1.0) > 1e-6
-                        or abs(raw_affine[1]) > 1e-6
+                        affine_log_indices
+                        and tile_idx in affine_log_indices
+                        and (abs(gain_val - 1.0) > 1e-6 or abs(offset_val) > 1e-6)
                     ):
-                        tile_affine = raw_affine
-                        if affine_log_indices and tile_idx in affine_log_indices:
-                            try:
-                                pcb_asm(
-                                    "run_info_incremental_apply_gain_offset",
-                                    prog=None,
-                                    lvl="INFO_DETAIL",
-                                    tile_num=tile_idx,
-                                    gain=f"{tile_affine[0]:.6f}",
-                                    offset=f"{tile_affine[1]:.6f}",
-                                )
-                            except Exception:
-                                pass
+                        try:
+                            pcb_asm(
+                                "run_info_incremental_apply_gain_offset",
+                                prog=None,
+                                lvl="INFO_DETAIL",
+                                tile_num=tile_idx,
+                                gain=f"{gain_val:.6f}",
+                                offset=f"{offset_val:.6f}",
+                            )
+                        except Exception:
+                            pass
                 future = ex.submit(
                     reproject_tile_to_mosaic,
                     tile_path,
@@ -3906,7 +3982,9 @@ def assemble_final_mosaic_incremental(
                     feather=use_feather,
                     apply_crop=apply_crop,
                     crop_percent=crop_percent,
-                    tile_affine=tile_affine,
+                    tile_affine=None,
+                    gain=gain_val,
+                    offset=offset_val,
                     match_background=match_background,
                     nan_fill_value=0.0,
                     enforce_positive=enforce_positive_flag,
@@ -4056,6 +4134,24 @@ def assemble_final_mosaic_incremental(
         )
 
     pcb_asm("assemble_info_finished_incremental", prog=None, lvl="INFO", shape=str(mosaic.shape))
+
+    if mosaic.ndim != 3:
+        raise ValueError(f"Expected incremental mosaic in HWC order, got {mosaic.shape}")
+    logger.debug("Mosaic shape (HWC): %s", mosaic.shape)
+    if logger.isEnabledFor(logging.DEBUG):
+        mask = weight_data > 0
+        if np.any(mask):
+            stats = []
+            for c in range(mosaic.shape[-1]):
+                vals = mosaic[..., c][mask]
+                if vals.size:
+                    stats.append((float(np.mean(vals)), float(np.std(vals))))
+                else:
+                    stats.append((float("nan"), float("nan")))
+            logger.debug(
+                "Incremental overlap stats (mean/std per channel): %s",
+                stats,
+            )
 
     if cleanup_memmap:
         for p in (sum_path, weight_path):
@@ -4298,19 +4394,18 @@ def assemble_final_mosaic_reproject_coadd(
     total_tiles_for_prep = len(master_tile_fits_with_wcs_list)
     for idx, (tile_path, tile_wcs) in enumerate(master_tile_fits_with_wcs_list, 1):
         with fits.open(tile_path, memmap=False) as hdul:
-            data = hdul[0].data.astype(np.float32)
+            raw_data = hdul[0].data
 
-        # Master tiles saved via ``save_fits_image`` use the ``HWC`` axis order
-        # which stores color images in ``C x H x W`` within the FITS file.  When
-        # reading them back for final assembly we expect ``H x W x C``.
-        # If the first axis has length 3 and differs from the last axis we
-        # convert back to ``HWC``.  This avoids passing arrays of shape
-        # ``(3, H, W)`` to ``reproject_and_coadd`` which would produce an
-        # invalid coverage map consisting of thin lines only.
-        if data.ndim == 3 and data.shape[0] in (1, 3) and data.shape[-1] != data.shape[0]:
-            data = np.moveaxis(data, 0, -1)
-        if data.ndim == 2:
-            data = data[..., np.newaxis]
+        try:
+            data = _ensure_hwc_master_tile(raw_data, os.path.basename(tile_path))
+        except ValueError:
+            _pcb(
+                "assemble_warn_intertile_photometric_failed",
+                prog=None,
+                lvl="WARN",
+                error=f"invalid_shape:{os.path.basename(tile_path)}",
+            )
+            continue
 
         if (
             apply_crop
@@ -4545,6 +4640,17 @@ def assemble_final_mosaic_reproject_coadd(
             except Exception:
                 pass
         for ch in range(n_channels):
+            for arr, _w in input_data_all_tiles_HWC_processed:
+                if arr is None:
+                    continue
+                if arr.ndim != 3:
+                    raise ValueError(
+                        f"Master tile data must be HWC before channel slicing, got {arr.shape}"
+                    )
+                if ch >= arr.shape[-1]:
+                    raise ValueError(
+                        f"Channel index {ch} out of bounds for tile shape {arr.shape}"
+                    )
 
             data_list = [arr[..., ch] for arr, _w in input_data_all_tiles_HWC_processed]
             wcs_list = [wcs for _arr, wcs in input_data_all_tiles_HWC_processed]
@@ -4634,6 +4740,25 @@ def assemble_final_mosaic_reproject_coadd(
         shape=mosaic_data.shape if mosaic_data is not None else "N/A",
     )
 
+    if mosaic_data is not None:
+        if mosaic_data.ndim != 3:
+            raise ValueError(f"Expected final mosaic in HWC order, got {mosaic_data.shape}")
+        logger.debug("Mosaic shape (HWC): %s", mosaic_data.shape)
+        if isinstance(coverage, np.ndarray) and logger.isEnabledFor(logging.DEBUG):
+            mask = coverage > 0
+            if np.any(mask):
+                stats = []
+                for c in range(mosaic_data.shape[-1]):
+                    vals = mosaic_data[..., c][mask]
+                    if vals.size:
+                        stats.append((float(np.mean(vals)), float(np.std(vals))))
+                    else:
+                        stats.append((float("nan"), float("nan")))
+                logger.debug(
+                    "Reproject overlap stats (mean/std per channel): %s",
+                    stats,
+                )
+
     _update_eta(n_channels)
 
     return mosaic_data.astype(np.float32), coverage.astype(np.float32)
@@ -4656,7 +4781,7 @@ def _load_master_tiles_for_two_pass(
             continue
         try:
             with fits.open(tile_path, memmap=False) as hdul:
-                data = hdul[0].data.astype(np.float32)
+                raw_data = hdul[0].data
         except Exception as exc:
             if logger:
                 logger.warning(
@@ -4665,10 +4790,15 @@ def _load_master_tiles_for_two_pass(
                     exc,
                 )
             continue
-        if data.ndim == 3 and data.shape[0] in (1, 3) and data.shape[-1] != data.shape[0]:
-            data = np.moveaxis(data, 0, -1)
-        if data.ndim == 2:
-            data = data[..., np.newaxis]
+        try:
+            data = _ensure_hwc_master_tile(raw_data, os.path.basename(tile_path))
+        except ValueError:
+            if logger:
+                logger.warning(
+                    "[TwoPass] Skipping tile with unexpected shape: %s",
+                    os.path.basename(tile_path),
+                )
+            continue
         current_wcs = tile_wcs
         if (
             apply_crop
