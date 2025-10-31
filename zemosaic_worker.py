@@ -3467,6 +3467,9 @@ def assemble_final_mosaic_incremental(
     processing_threads: int = 0,
     memmap_dir: str | None = None,
     cleanup_memmap: bool = True,
+    base_progress_phase5: float | None = None,
+    progress_weight_phase5: float | None = None,
+    start_time_total_run: float | None = None,
 ):
     """Assemble les master tiles par co-addition sur disque."""
     import time
@@ -3478,6 +3481,11 @@ def assemble_final_mosaic_incremental(
     pcb_asm = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
         msg_key, prog, lvl, callback=progress_callback, **kwargs
     )
+
+    if progress_weight_phase5 is None:
+        progress_weight_phase5 = globals().get("PROGRESS_WEIGHT_PHASE5_ASSEMBLY", 0.0)
+    if base_progress_phase5 is None:
+        base_progress_phase5 = 0.0
 
     pcb_asm(
         f"ASM_INC: Début. Options rognage - Appliquer: {apply_crop}, %: {crop_percent if apply_crop else 'N/A'}",
@@ -3707,14 +3715,31 @@ def assemble_final_mosaic_incremental(
                     time_per_tile = elapsed_inc / processed
                     eta_tiles_sec = (total_tiles - processed) * time_per_tile
 
-                    # Variables définies en amont dans zemosaic_worker.py
-                    # base_progress_phase5, PROGRESS_WEIGHT_PHASE5_ASSEMBLY, time.monotonic()...
-                    current_progress_pct = base_progress_phase5 + (processed / total_tiles) * PROGRESS_WEIGHT_PHASE5_ASSEMBLY
-                    elapsed_total = time.monotonic() - time_run_started  # variable importée ou passée en paramètre
-                    sec_per_pct = elapsed_total / current_progress_pct if current_progress_pct > 0 else 0
-                    total_eta_sec = eta_tiles_sec + (100 - current_progress_pct) * sec_per_pct
-
-                    update_gui_eta(total_eta_sec)
+                    if (
+                        progress_weight_phase5
+                        and start_time_total_run is not None
+                        and total_tiles > 0
+                    ):
+                        try:
+                            current_progress_pct = base_progress_phase5 + (
+                                (processed / total_tiles) * progress_weight_phase5
+                            )
+                            current_progress_pct = max(
+                                current_progress_pct,
+                                base_progress_phase5 + 0.01,
+                            )
+                            elapsed_total = time.monotonic() - start_time_total_run
+                            sec_per_pct = (
+                                elapsed_total / current_progress_pct
+                                if current_progress_pct > 0
+                                else 0.0
+                            )
+                            total_eta_sec = eta_tiles_sec + (
+                                max(0.0, 100 - current_progress_pct) * sec_per_pct
+                            )
+                            update_gui_eta(total_eta_sec)
+                        except Exception:
+                            pass
 
             if tiles_since_flush > 0:
                 hsum.flush()
@@ -6758,6 +6783,9 @@ def run_hierarchical_mosaic(
                     processing_threads=assembly_process_workers_config,
                     memmap_dir=inc_memmap_dir,
                     cleanup_memmap=True,
+                    base_progress_phase5=base_progress_phase5,
+                    progress_weight_phase5=PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
+                    start_time_total_run=start_time_total_run,
                 )
             except Exception as e_gpu:
                 logger.warning("GPU incremental assembly failed, falling back to CPU: %s", e_gpu)
@@ -6772,6 +6800,9 @@ def run_hierarchical_mosaic(
                     processing_threads=assembly_process_workers_config,
                     memmap_dir=inc_memmap_dir,
                     cleanup_memmap=True,
+                    base_progress_phase5=base_progress_phase5,
+                    progress_weight_phase5=PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
+                    start_time_total_run=start_time_total_run,
                 )
         else:
             final_mosaic_data_HWC, final_mosaic_coverage_HW = assemble_final_mosaic_incremental(
@@ -6785,6 +6816,9 @@ def run_hierarchical_mosaic(
                 processing_threads=assembly_process_workers_config,
                 memmap_dir=inc_memmap_dir,
                 cleanup_memmap=True,
+                base_progress_phase5=base_progress_phase5,
+                progress_weight_phase5=PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
+                start_time_total_run=start_time_total_run,
             )
         log_key_phase5_failed = "run_error_phase5_assembly_failed_incremental"
         log_key_phase5_finished = "run_info_phase5_finished_incremental"
