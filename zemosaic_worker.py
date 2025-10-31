@@ -4351,6 +4351,10 @@ def _load_master_tiles_for_two_pass(
                     )
         tiles.append(np.asarray(data, dtype=np.float32))
         tiles_wcs.append(current_wcs)
+        if logger and len(tiles) <= 5:
+            logger.debug(
+                "[TwoPass] Loaded tile %s with shape=%s", os.path.basename(tile_path), np.asarray(data).shape
+            )
     return tiles, tiles_wcs
 
 
@@ -4365,21 +4369,39 @@ def compute_per_tile_gains_from_coverage(
     logger=None,
 ) -> list[float]:
     """Compute multiplicative gains for each tile using the blurred coverage map."""
+    if logger:
+        logger.debug(
+            "[TwoPass] compute_per_tile_gains_from_coverage start: tiles=%d, coverage_shape=%s, sigma=%s, clip=%s",
+            len(tiles) if tiles else 0,
+            getattr(coverage_p1, "shape", None),
+            sigma_px,
+            gain_clip,
+        )
     if coverage_p1 is None or coverage_p1.ndim != 2:
         raise ValueError("Coverage map must be 2D for gain estimation")
     coverage = np.asarray(coverage_p1, dtype=np.float32)
     if coverage.size == 0:
         raise ValueError("Coverage map is empty")
+    if logger:
+        logger.debug(
+            "[TwoPass] Coverage stats before blur: shape=%s, min=%.4f, max=%.4f, mean=%.4f",
+            coverage.shape,
+            float(np.nanmin(coverage)),
+            float(np.nanmax(coverage)),
+            float(np.nanmean(coverage)),
+        )
     sigma_px = int(max(0, sigma_px))
     gain_min, gain_max = map(float, gain_clip)
     if gain_min > gain_max:
         gain_min, gain_max = gain_max, gain_min
     if sigma_px > 0:
         blurred = None
+        blur_source = "identity"
         try:
             from scipy.ndimage import gaussian_filter  # type: ignore
 
             blurred = gaussian_filter(coverage, sigma=float(sigma_px))
+            blur_source = "scipy"
         except Exception as exc:
             if logger:
                 logger.debug(
@@ -4391,6 +4413,7 @@ def compute_per_tile_gains_from_coverage(
 
                 k = max(3, int(2 * round(float(sigma_px) * 1.5) + 1))
                 blurred = cv2.GaussianBlur(coverage, (k, k), sigmaX=float(sigma_px))
+                blur_source = "cv2"
             except Exception as exc_cv:
                 if logger:
                     logger.warning("[TwoPass] Coverage blur fallback failed: %s", exc_cv)
@@ -4399,11 +4422,24 @@ def compute_per_tile_gains_from_coverage(
             if blurred is not None
             else coverage.copy()
         )
+        if logger:
+            logger.debug(
+                "[TwoPass] Coverage blur applied with sigma=%d using %s", sigma_px, blur_source
+            )
     else:
         cov_blur = coverage.copy()
+        if logger:
+            logger.debug("[TwoPass] Coverage blur skipped (sigma=0)")
     eps = np.finfo(np.float32).eps
     scale_map = cov_blur / np.maximum(coverage, eps)
     scale_map = np.clip(scale_map, 0.5, 2.0)
+    if logger:
+        logger.debug(
+            "[TwoPass] Scale map stats: min=%.4f, max=%.4f, mean=%.4f",
+            float(np.nanmin(scale_map)),
+            float(np.nanmax(scale_map)),
+            float(np.nanmean(scale_map)),
+        )
     if not tiles or not tiles_wcs or len(tiles) != len(tiles_wcs):
         raise ValueError("Tile data and WCS lists must be aligned and non-empty")
     gains: list[float] = []
@@ -4430,9 +4466,23 @@ def compute_per_tile_gains_from_coverage(
         valid = (reproj_mask > 0.1) & (coverage > 0.0)
         if not np.any(valid):
             gains.append(1.0)
+            if logger and idx < 10:
+                logger.debug(
+                    "[TwoPass] Tile %d has no valid overlap (mask>0.1 count=%d)",
+                    idx,
+                    int(np.count_nonzero(reproj_mask > 0.1)),
+                )
             continue
         med_gain = float(np.median(scale_map[valid]))
         gains.append(float(np.clip(med_gain, gain_min, gain_max)))
+        if logger and idx < 10:
+            logger.debug(
+                "[TwoPass] Tile %d gain=%.4f (raw=%.4f, valid_pix=%d)",
+                idx,
+                gains[-1],
+                med_gain,
+                int(np.count_nonzero(valid)),
+            )
     return gains
 
 
@@ -4448,7 +4498,23 @@ def run_second_pass_coverage_renorm(
     logger=None,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Apply coverage-based gains to tiles and reproject them for a second pass."""
+    if logger:
+        logger.debug(
+            "[TwoPass] run_second_pass_coverage_renorm start: tiles=%d, wcs=%d, coverage_shape=%s, sigma=%s, clip=%s",
+            len(tiles) if tiles else 0,
+            len(tiles_wcs) if tiles_wcs else 0,
+            getattr(coverage_p1, "shape", None),
+            sigma_px,
+            gain_clip,
+        )
     if not tiles or not tiles_wcs or coverage_p1 is None:
+        if logger:
+            logger.warning(
+                "[TwoPass] Missing inputs for second pass (tiles=%s, wcs=%s, coverage=%s)",
+                bool(tiles),
+                bool(tiles_wcs),
+                coverage_p1 is not None,
+            )
         return None
     if not (REPROJECT_AVAILABLE and reproject_and_coadd and reproject_interp):
         if logger:
@@ -4472,6 +4538,15 @@ def run_second_pass_coverage_renorm(
         if logger:
             logger.warning("[TwoPass] Gain computation failed: %s", exc, exc_info=True)
         return None
+    if logger:
+        finite_gains = [g for g in gains if np.isfinite(g)]
+        logger.debug(
+            "[TwoPass] Computed gains count=%d, finite=%d, min=%.4f, max=%.4f",
+            len(gains),
+            len(finite_gains),
+            float(np.min(finite_gains)) if finite_gains else float("nan"),
+            float(np.max(finite_gains)) if finite_gains else float("nan"),
+        )
     corrected_tiles: list[np.ndarray] = []
     for arr, gain in zip(tiles, gains):
         tile_arr = np.asarray(arr, dtype=np.float32)
@@ -4513,6 +4588,14 @@ def run_second_pass_coverage_renorm(
     coverage_result: np.ndarray | None = None
     shape_out_hw = tuple(map(int, shape_out))
     for ch in range(n_channels):
+        if logger:
+            logger.debug(
+                "[TwoPass] Reproject channel %d/%d with %d tiles (shape_out=%s)",
+                ch + 1,
+                n_channels,
+                len(corrected_tiles),
+                shape_out_hw,
+            )
         data_list = [tile[..., ch] if tile.ndim == 3 else tile[..., 0] for tile in corrected_tiles]
         try:
             chan_mosaic, chan_cov = zemosaic_utils.reproject_and_coadd_wrapper(
@@ -4532,9 +4615,19 @@ def run_second_pass_coverage_renorm(
                     exc_info=True,
                 )
             return None
-        mosaic_channels.append(np.asarray(chan_mosaic, dtype=np.float32))
+        chan_mosaic_np = np.asarray(chan_mosaic, dtype=np.float32)
+        mosaic_channels.append(chan_mosaic_np)
         if coverage_result is None:
             coverage_result = np.asarray(chan_cov, dtype=np.float32)
+        if logger:
+            logger.debug(
+                "[TwoPass] Channel %d done: mosaic_shape=%s, coverage_shape=%s, cov_stats=(min=%.4f, max=%.4f)",
+                ch + 1,
+                getattr(chan_mosaic_np, "shape", None),
+                getattr(coverage_result, "shape", None),
+                float(np.nanmin(coverage_result)) if coverage_result is not None else float("nan"),
+                float(np.nanmax(coverage_result)) if coverage_result is not None else float("nan"),
+            )
     mosaic = (
         mosaic_channels[0][..., np.newaxis]
         if n_channels == 1
@@ -6710,6 +6803,13 @@ def run_hierarchical_mosaic(
     current_global_progress = base_progress_phase5 + PROGRESS_WEIGHT_PHASE5_ASSEMBLY
 
     if two_pass_enabled and final_mosaic_coverage_HW is not None:
+        if logger:
+            logger.info(
+                "[TwoPass] Second pass requested (sigma=%s, clip=%s); coverage shape=%s",
+                two_pass_sigma_px,
+                gain_clip_tuple,
+                getattr(final_mosaic_coverage_HW, "shape", None),
+            )
         try:
             tiles_for_second_pass: list[np.ndarray] = []
             wcs_for_second_pass: list[Any] = []
@@ -6725,6 +6825,13 @@ def run_hierarchical_mosaic(
                     apply_crop=apply_crop_for_assembly,
                     crop_percent=master_tile_crop_percent_config,
                     logger=logger,
+                )
+            if logger:
+                logger.debug(
+                    "[TwoPass] Prepared %d tiles for second pass (collected=%s, incremental=%s)",
+                    len(tiles_for_second_pass),
+                    bool(collected_tiles_for_second_pass),
+                    USE_INCREMENTAL_ASSEMBLY,
                 )
             if tiles_for_second_pass and wcs_for_second_pass:
                 result = run_second_pass_coverage_renorm(
