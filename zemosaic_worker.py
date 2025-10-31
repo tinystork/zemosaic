@@ -4486,6 +4486,28 @@ def run_second_pass_coverage_renorm(
         )
     except Exception:
         output_projection = final_wcs_p1
+
+    reproj_kwargs: dict[str, Any] = {
+        "output_projection": output_projection,
+        "reproject_function": reproject_interp,
+        "combine_function": "mean",
+    }
+    try:
+        sig = inspect.signature(reproject_and_coadd)
+    except Exception:
+        sig = None
+    if sig:
+        if "match_background" in sig.parameters:
+            reproj_kwargs["match_background"] = True
+        elif "match_bg" in sig.parameters:
+            reproj_kwargs["match_bg"] = True
+        if "use_memmap" in sig.parameters:
+            reproj_kwargs["use_memmap"] = False
+        elif "intermediate_memmap" in sig.parameters:
+            reproj_kwargs["intermediate_memmap"] = False
+    else:
+        reproj_kwargs["match_background"] = True
+
     n_channels = corrected_tiles[0].shape[-1] if corrected_tiles[0].ndim == 3 else 1
     mosaic_channels: list[np.ndarray] = []
     coverage_result: np.ndarray | None = None
@@ -4497,12 +4519,9 @@ def run_second_pass_coverage_renorm(
                 data_list=data_list,
                 wcs_list=tiles_wcs,
                 shape_out=shape_out_hw,
-                output_projection=output_projection,
                 use_gpu=False,
                 cpu_func=reproject_and_coadd,
-                reproject_function=reproject_interp,
-                combine_function="mean",
-                match_background=True,
+                **reproj_kwargs,
             )
         except Exception as exc:
             if logger:
