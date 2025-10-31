@@ -733,6 +733,22 @@ def _probe_system_resources(cache_dir: str | None = None) -> dict:
     except Exception:
         pass
 
+    two_pass_enabled = bool(two_pass_coverage_renorm_config)
+    try:
+        two_pass_sigma_px = int(two_pass_cov_sigma_px_config)
+    except Exception:
+        two_pass_sigma_px = 50
+    gain_clip_raw = two_pass_cov_gain_clip_config
+    if isinstance(gain_clip_raw, (list, tuple)) and len(gain_clip_raw) >= 2:
+        try:
+            gain_clip_tuple = (float(gain_clip_raw[0]), float(gain_clip_raw[1]))
+        except Exception:
+            gain_clip_tuple = (0.85, 1.18)
+    else:
+        gain_clip_tuple = (0.85, 1.18)
+    if gain_clip_tuple[0] > gain_clip_tuple[1]:
+        gain_clip_tuple = (gain_clip_tuple[1], gain_clip_tuple[0])
+
     try:
         target_dir = cache_dir if cache_dir and os.path.isdir(cache_dir) else os.getcwd()
         du = shutil.disk_usage(target_dir)
@@ -3788,6 +3804,7 @@ def assemble_final_mosaic_reproject_coadd(
     intertile_sky_percentile: tuple[float, float] | list[float] = (30.0, 70.0),
     intertile_robust_clip_sigma: float = 2.5,
     use_auto_intertile: bool = False,
+    collect_tile_data: list | None = None,
 ):
     """Assemble les master tiles en utilisant ``reproject_and_coadd``."""
     _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
@@ -4079,6 +4096,23 @@ def assemble_final_mosaic_reproject_coadd(
                     )
 
 
+    if collect_tile_data is not None:
+        try:
+            collect_tile_data.clear()
+        except Exception:
+            collect_tile_data[:] = []
+        for arr, tile_wcs in input_data_all_tiles_HWC_processed:
+            if arr is None:
+                continue
+            try:
+                collect_tile_data.append((np.array(arr, copy=True), tile_wcs))
+            except Exception:
+                try:
+                    collect_tile_data.append((arr.copy(), tile_wcs))
+                except Exception:
+                    collect_tile_data.append((np.asarray(arr, dtype=np.float32), tile_wcs))
+
+
     # Build kwargs dynamically to remain compatible with different reproject versions
     reproj_kwargs = {}
     try:
@@ -4260,6 +4294,350 @@ def assemble_final_mosaic_reproject_coadd(
 
     return mosaic_data.astype(np.float32), coverage.astype(np.float32)
 
+
+def _load_master_tiles_for_two_pass(
+    master_tile_fits_with_wcs_list: list,
+    *,
+    apply_crop: bool,
+    crop_percent: float,
+    logger=None,
+):
+    """Load master tiles from disk for the coverage renormalization pass."""
+    tiles: list[np.ndarray] = []
+    tiles_wcs: list[Any] = []
+    if not master_tile_fits_with_wcs_list:
+        return tiles, tiles_wcs
+    for tile_path, tile_wcs in master_tile_fits_with_wcs_list:
+        if not tile_path or not os.path.exists(tile_path) or tile_wcs is None:
+            continue
+        try:
+            with fits.open(tile_path, memmap=False) as hdul:
+                data = hdul[0].data.astype(np.float32)
+        except Exception as exc:
+            if logger:
+                logger.warning(
+                    "[TwoPass] Failed to load master tile %s: %s",
+                    os.path.basename(tile_path),
+                    exc,
+                )
+            continue
+        if data.ndim == 3 and data.shape[0] in (1, 3) and data.shape[-1] != data.shape[0]:
+            data = np.moveaxis(data, 0, -1)
+        if data.ndim == 2:
+            data = data[..., np.newaxis]
+        current_wcs = tile_wcs
+        if (
+            apply_crop
+            and crop_percent > 1e-3
+            and ZEMOSAIC_UTILS_AVAILABLE
+            and hasattr(zemosaic_utils, "crop_image_and_wcs")
+        ):
+            try:
+                cropped_img, cropped_wcs = zemosaic_utils.crop_image_and_wcs(
+                    data,
+                    copy.deepcopy(tile_wcs),
+                    float(crop_percent) / 100.0,
+                    progress_callback=None,
+                )
+                if cropped_img is not None and cropped_wcs is not None:
+                    data = cropped_img
+                    current_wcs = cropped_wcs
+            except Exception as exc:
+                if logger:
+                    logger.debug(
+                        "[TwoPass] Crop failed for %s: %s",
+                        os.path.basename(tile_path),
+                        exc,
+                    )
+        tiles.append(np.asarray(data, dtype=np.float32))
+        tiles_wcs.append(current_wcs)
+        if logger and len(tiles) <= 5:
+            logger.debug(
+                "[TwoPass] Loaded tile %s with shape=%s", os.path.basename(tile_path), np.asarray(data).shape
+            )
+    return tiles, tiles_wcs
+
+
+def compute_per_tile_gains_from_coverage(
+    tiles: list[np.ndarray],
+    tiles_wcs: list[Any],
+    final_wcs: Any,
+    coverage_p1: np.ndarray,
+    *,
+    sigma_px: int,
+    gain_clip: tuple[float, float],
+    logger=None,
+) -> list[float]:
+    """Compute multiplicative gains for each tile using the blurred coverage map."""
+    if logger:
+        logger.debug(
+            "[TwoPass] compute_per_tile_gains_from_coverage start: tiles=%d, coverage_shape=%s, sigma=%s, clip=%s",
+            len(tiles) if tiles else 0,
+            getattr(coverage_p1, "shape", None),
+            sigma_px,
+            gain_clip,
+        )
+    if coverage_p1 is None or coverage_p1.ndim != 2:
+        raise ValueError("Coverage map must be 2D for gain estimation")
+    coverage = np.asarray(coverage_p1, dtype=np.float32)
+    if coverage.size == 0:
+        raise ValueError("Coverage map is empty")
+    if logger:
+        logger.debug(
+            "[TwoPass] Coverage stats before blur: shape=%s, min=%.4f, max=%.4f, mean=%.4f",
+            coverage.shape,
+            float(np.nanmin(coverage)),
+            float(np.nanmax(coverage)),
+            float(np.nanmean(coverage)),
+        )
+    sigma_px = int(max(0, sigma_px))
+    gain_min, gain_max = map(float, gain_clip)
+    if gain_min > gain_max:
+        gain_min, gain_max = gain_max, gain_min
+    if sigma_px > 0:
+        blurred = None
+        blur_source = "identity"
+        try:
+            from scipy.ndimage import gaussian_filter  # type: ignore
+
+            blurred = gaussian_filter(coverage, sigma=float(sigma_px))
+            blur_source = "scipy"
+        except Exception as exc:
+            if logger:
+                logger.debug(
+                    "[TwoPass] scipy gaussian_filter failed (%s), trying cv2 fallback",
+                    exc,
+                )
+            try:
+                import cv2  # type: ignore
+
+                k = max(3, int(2 * round(float(sigma_px) * 1.5) + 1))
+                blurred = cv2.GaussianBlur(coverage, (k, k), sigmaX=float(sigma_px))
+                blur_source = "cv2"
+            except Exception as exc_cv:
+                if logger:
+                    logger.warning("[TwoPass] Coverage blur fallback failed: %s", exc_cv)
+        cov_blur = (
+            np.asarray(blurred, dtype=np.float32)
+            if blurred is not None
+            else coverage.copy()
+        )
+        if logger:
+            logger.debug(
+                "[TwoPass] Coverage blur applied with sigma=%d using %s", sigma_px, blur_source
+            )
+    else:
+        cov_blur = coverage.copy()
+        if logger:
+            logger.debug("[TwoPass] Coverage blur skipped (sigma=0)")
+    eps = np.finfo(np.float32).eps
+    scale_map = cov_blur / np.maximum(coverage, eps)
+    scale_map = np.clip(scale_map, 0.5, 2.0)
+    if logger:
+        logger.debug(
+            "[TwoPass] Scale map stats: min=%.4f, max=%.4f, mean=%.4f",
+            float(np.nanmin(scale_map)),
+            float(np.nanmax(scale_map)),
+            float(np.nanmean(scale_map)),
+        )
+    if not tiles or not tiles_wcs or len(tiles) != len(tiles_wcs):
+        raise ValueError("Tile data and WCS lists must be aligned and non-empty")
+    gains: list[float] = []
+    for idx, (tile, tile_wcs) in enumerate(zip(tiles, tiles_wcs)):
+        if tile is None or tile_wcs is None:
+            gains.append(1.0)
+            continue
+        shape = np.asarray(tile).shape
+        if shape[0] <= 0 or shape[1] <= 0:
+            gains.append(1.0)
+            continue
+        mask = np.ones(shape[:2], dtype=np.float32)
+        try:
+            reproj_mask, _ = reproject_interp(
+                (mask, tile_wcs),
+                final_wcs,
+                shape_out=coverage.shape,
+            )
+        except Exception as exc:
+            if logger:
+                logger.warning("[TwoPass] Mask reprojection failed for tile %d: %s", idx, exc)
+            gains.append(1.0)
+            continue
+        valid = (reproj_mask > 0.1) & (coverage > 0.0)
+        if not np.any(valid):
+            gains.append(1.0)
+            if logger and idx < 10:
+                logger.debug(
+                    "[TwoPass] Tile %d has no valid overlap (mask>0.1 count=%d)",
+                    idx,
+                    int(np.count_nonzero(reproj_mask > 0.1)),
+                )
+            continue
+        med_gain = float(np.median(scale_map[valid]))
+        gains.append(float(np.clip(med_gain, gain_min, gain_max)))
+        if logger and idx < 10:
+            logger.debug(
+                "[TwoPass] Tile %d gain=%.4f (raw=%.4f, valid_pix=%d)",
+                idx,
+                gains[-1],
+                med_gain,
+                int(np.count_nonzero(valid)),
+            )
+    return gains
+
+
+def run_second_pass_coverage_renorm(
+    tiles: list[np.ndarray],
+    tiles_wcs: list[Any],
+    final_wcs_p1: Any,
+    coverage_p1: np.ndarray,
+    shape_out: tuple[int, int],
+    *,
+    sigma_px: int,
+    gain_clip: tuple[float, float],
+    logger=None,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Apply coverage-based gains to tiles and reproject them for a second pass."""
+    if logger:
+        logger.debug(
+            "[TwoPass] run_second_pass_coverage_renorm start: tiles=%d, wcs=%d, coverage_shape=%s, sigma=%s, clip=%s",
+            len(tiles) if tiles else 0,
+            len(tiles_wcs) if tiles_wcs else 0,
+            getattr(coverage_p1, "shape", None),
+            sigma_px,
+            gain_clip,
+        )
+    if not tiles or not tiles_wcs or coverage_p1 is None:
+        if logger:
+            logger.warning(
+                "[TwoPass] Missing inputs for second pass (tiles=%s, wcs=%s, coverage=%s)",
+                bool(tiles),
+                bool(tiles_wcs),
+                coverage_p1 is not None,
+            )
+        return None
+    if not (REPROJECT_AVAILABLE and reproject_and_coadd and reproject_interp):
+        if logger:
+            logger.warning("[TwoPass] Reproject dependencies unavailable; skipping second pass")
+        return None
+    if not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils):
+        if logger:
+            logger.warning("[TwoPass] zemosaic_utils unavailable; skipping second pass")
+        return None
+    try:
+        gains = compute_per_tile_gains_from_coverage(
+            tiles,
+            tiles_wcs,
+            final_wcs_p1,
+            coverage_p1,
+            sigma_px=sigma_px,
+            gain_clip=gain_clip,
+            logger=logger,
+        )
+    except Exception as exc:
+        if logger:
+            logger.warning("[TwoPass] Gain computation failed: %s", exc, exc_info=True)
+        return None
+    if logger:
+        finite_gains = [g for g in gains if np.isfinite(g)]
+        logger.debug(
+            "[TwoPass] Computed gains count=%d, finite=%d, min=%.4f, max=%.4f",
+            len(gains),
+            len(finite_gains),
+            float(np.min(finite_gains)) if finite_gains else float("nan"),
+            float(np.max(finite_gains)) if finite_gains else float("nan"),
+        )
+    corrected_tiles: list[np.ndarray] = []
+    for arr, gain in zip(tiles, gains):
+        tile_arr = np.asarray(arr, dtype=np.float32)
+        if tile_arr.ndim == 2:
+            tile_arr = tile_arr[..., np.newaxis]
+        corrected_tiles.append(tile_arr * float(gain))
+    try:
+        output_projection = (
+            final_wcs_p1.to_header(relax=True)
+            if hasattr(final_wcs_p1, "to_header")
+            else final_wcs_p1
+        )
+    except Exception:
+        output_projection = final_wcs_p1
+
+    reproj_kwargs: dict[str, Any] = {
+        "output_projection": output_projection,
+        "reproject_function": reproject_interp,
+        "combine_function": "mean",
+    }
+    try:
+        sig = inspect.signature(reproject_and_coadd)
+    except Exception:
+        sig = None
+    if sig:
+        if "match_background" in sig.parameters:
+            reproj_kwargs["match_background"] = True
+        elif "match_bg" in sig.parameters:
+            reproj_kwargs["match_bg"] = True
+        if "use_memmap" in sig.parameters:
+            reproj_kwargs["use_memmap"] = False
+        elif "intermediate_memmap" in sig.parameters:
+            reproj_kwargs["intermediate_memmap"] = False
+    else:
+        reproj_kwargs["match_background"] = True
+
+    n_channels = corrected_tiles[0].shape[-1] if corrected_tiles[0].ndim == 3 else 1
+    mosaic_channels: list[np.ndarray] = []
+    coverage_result: np.ndarray | None = None
+    shape_out_hw = tuple(map(int, shape_out))
+    for ch in range(n_channels):
+        if logger:
+            logger.debug(
+                "[TwoPass] Reproject channel %d/%d with %d tiles (shape_out=%s)",
+                ch + 1,
+                n_channels,
+                len(corrected_tiles),
+                shape_out_hw,
+            )
+        data_list = [tile[..., ch] if tile.ndim == 3 else tile[..., 0] for tile in corrected_tiles]
+        try:
+            chan_mosaic, chan_cov = zemosaic_utils.reproject_and_coadd_wrapper(
+                data_list=data_list,
+                wcs_list=tiles_wcs,
+                shape_out=shape_out_hw,
+                use_gpu=False,
+                cpu_func=reproject_and_coadd,
+                **reproj_kwargs,
+            )
+        except Exception as exc:
+            if logger:
+                logger.warning(
+                    "[TwoPass] Reprojection failed on channel %d: %s",
+                    ch,
+                    exc,
+                    exc_info=True,
+                )
+            return None
+        chan_mosaic_np = np.asarray(chan_mosaic, dtype=np.float32)
+        mosaic_channels.append(chan_mosaic_np)
+        if coverage_result is None:
+            coverage_result = np.asarray(chan_cov, dtype=np.float32)
+        if logger:
+            logger.debug(
+                "[TwoPass] Channel %d done: mosaic_shape=%s, coverage_shape=%s, cov_stats=(min=%.4f, max=%.4f)",
+                ch + 1,
+                getattr(chan_mosaic_np, "shape", None),
+                getattr(coverage_result, "shape", None),
+                float(np.nanmin(coverage_result)) if coverage_result is not None else float("nan"),
+                float(np.nanmax(coverage_result)) if coverage_result is not None else float("nan"),
+            )
+    mosaic = (
+        mosaic_channels[0][..., np.newaxis]
+        if n_channels == 1
+        else np.stack(mosaic_channels, axis=-1)
+    )
+    if coverage_result is None:
+        return None
+    return mosaic.astype(np.float32), coverage_result.astype(np.float32)
+
+
 # Backwards compatibility alias expected by tests
 assemble_final_mosaic_with_reproject_coadd = assemble_final_mosaic_reproject_coadd
 
@@ -4345,6 +4723,9 @@ def run_hierarchical_mosaic(
     intertile_sky_percentile_config: tuple[float, float] | list[float] = (30.0, 70.0),
     intertile_robust_clip_sigma_config: float = 2.5,
     use_auto_intertile_config: bool = False,
+    two_pass_coverage_renorm_config: bool = False,
+    two_pass_cov_sigma_px_config: int = 50,
+    two_pass_cov_gain_clip_config: tuple[float, float] | list[float] = (0.85, 1.18),
     center_out_normalization_p3_config: bool = True,
     p3_center_sky_percentile_config: tuple[float, float] | list[float] = (25.0, 60.0),
     p3_center_robust_clip_sigma_config: float = 2.5,
@@ -6267,6 +6648,9 @@ def run_hierarchical_mosaic(
         return
 
     final_mosaic_data_HWC, final_mosaic_coverage_HW = None, None
+    collected_tiles_for_second_pass: list[tuple[np.ndarray, Any]] | None = (
+        [] if two_pass_enabled and not USE_INCREMENTAL_ASSEMBLY else None
+    )
     log_key_phase5_failed, log_key_phase5_finished = "", ""
 
     # Vérification de la disponibilité des fonctions d'assemblage
@@ -6354,6 +6738,7 @@ def run_hierarchical_mosaic(
                     intertile_sky_percentile=intertile_sky_percentile_tuple,
                     intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
                     use_auto_intertile=bool(use_auto_intertile_config),
+                    collect_tile_data=collected_tiles_for_second_pass,
                 )
             except Exception as e_gpu:
                 logger.warning("GPU reproject_coadd failed, falling back to CPU: %s", e_gpu)
@@ -6379,6 +6764,7 @@ def run_hierarchical_mosaic(
                     intertile_sky_percentile=intertile_sky_percentile_tuple,
                     intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
                     use_auto_intertile=bool(use_auto_intertile_config),
+                    collect_tile_data=collected_tiles_for_second_pass,
                 )
         else:
             final_mosaic_data_HWC, final_mosaic_coverage_HW = assemble_final_mosaic_reproject_coadd(
@@ -6403,6 +6789,7 @@ def run_hierarchical_mosaic(
                 intertile_sky_percentile=intertile_sky_percentile_tuple,
                 intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
                 use_auto_intertile=bool(use_auto_intertile_config),
+                collect_tile_data=collected_tiles_for_second_pass,
             )
 
         log_key_phase5_failed = "run_error_phase5_assembly_failed_reproject_coadd"
@@ -6414,9 +6801,76 @@ def run_hierarchical_mosaic(
         return
         
     current_global_progress = base_progress_phase5 + PROGRESS_WEIGHT_PHASE5_ASSEMBLY
+
+    if two_pass_enabled and final_mosaic_coverage_HW is not None:
+        if logger:
+            logger.info(
+                "[TwoPass] Second pass requested (sigma=%s, clip=%s); coverage shape=%s",
+                two_pass_sigma_px,
+                gain_clip_tuple,
+                getattr(final_mosaic_coverage_HW, "shape", None),
+            )
+        try:
+            tiles_for_second_pass: list[np.ndarray] = []
+            wcs_for_second_pass: list[Any] = []
+            if collected_tiles_for_second_pass:
+                for arr, twcs in collected_tiles_for_second_pass:
+                    if arr is None or twcs is None:
+                        continue
+                    tiles_for_second_pass.append(np.asarray(arr, dtype=np.float32))
+                    wcs_for_second_pass.append(twcs)
+            elif USE_INCREMENTAL_ASSEMBLY:
+                tiles_for_second_pass, wcs_for_second_pass = _load_master_tiles_for_two_pass(
+                    valid_master_tiles_for_assembly,
+                    apply_crop=apply_crop_for_assembly,
+                    crop_percent=master_tile_crop_percent_config,
+                    logger=logger,
+                )
+            if logger:
+                logger.debug(
+                    "[TwoPass] Prepared %d tiles for second pass (collected=%s, incremental=%s)",
+                    len(tiles_for_second_pass),
+                    bool(collected_tiles_for_second_pass),
+                    USE_INCREMENTAL_ASSEMBLY,
+                )
+            if tiles_for_second_pass and wcs_for_second_pass:
+                result = run_second_pass_coverage_renorm(
+                    tiles_for_second_pass,
+                    wcs_for_second_pass,
+                    final_output_wcs,
+                    final_mosaic_coverage_HW,
+                    final_output_shape_hw,
+                    sigma_px=two_pass_sigma_px,
+                    gain_clip=gain_clip_tuple,
+                    logger=logger,
+                )
+                if result is not None:
+                    final_mosaic_data_HWC, final_mosaic_coverage_HW = result
+                    logger.info(
+                        "[TwoPass] coverage-renorm OK (σ=%s, clip=[%.3f, %.3f])",
+                        two_pass_sigma_px,
+                        gain_clip_tuple[0],
+                        gain_clip_tuple[1],
+                    )
+                else:
+                    logger.warning("[TwoPass] renorm failed → keeping first-pass outputs")
+            else:
+                logger.warning("[TwoPass] No tiles available for coverage renorm; keeping first-pass outputs")
+        except Exception:
+            logger.exception("[TwoPass] renorm exception → keeping first-pass outputs")
+        finally:
+            if collected_tiles_for_second_pass is not None:
+                collected_tiles_for_second_pass.clear()
+            tiles_for_second_pass = []
+            wcs_for_second_pass = []
+
     _log_memory_usage(progress_callback, "Fin Phase 5 (Assemblage)")
-    pcb(log_key_phase5_finished, prog=current_global_progress, lvl="INFO", 
-        shape=final_mosaic_data_HWC.shape if final_mosaic_data_HWC is not None else "N/A")
+    pcb(
+        log_key_phase5_finished,
+        prog=current_global_progress,
+        lvl="INFO",
+        shape=final_mosaic_data_HWC.shape if final_mosaic_data_HWC is not None else "N/A",
+    )
     
 
     # --- Phase 6 (Sauvegarde) ---
@@ -6644,7 +7098,19 @@ def run_hierarchical_mosaic(
     pcb("PHASE_UPDATE:7", prog=None, lvl="ETA_LEVEL")
     try:
         if os.path.exists(temp_image_cache_dir): shutil.rmtree(temp_image_cache_dir); pcb("run_info_temp_preprocessed_cache_cleaned", prog=None, lvl="INFO_DETAIL", directory=temp_image_cache_dir)
-        if os.path.exists(temp_master_tile_storage_dir): shutil.rmtree(temp_master_tile_storage_dir); pcb("run_info_temp_master_tiles_fits_cleaned", prog=None, lvl="INFO_DETAIL", directory=temp_master_tile_storage_dir)
+        if (
+            not two_pass_enabled
+            and os.path.exists(temp_master_tile_storage_dir)
+        ):
+            shutil.rmtree(temp_master_tile_storage_dir)
+            pcb("run_info_temp_master_tiles_fits_cleaned", prog=None, lvl="INFO_DETAIL", directory=temp_master_tile_storage_dir)
+        elif two_pass_enabled and os.path.exists(temp_master_tile_storage_dir):
+            pcb(
+                "run_info_temp_master_tiles_kept_two_pass",
+                prog=None,
+                lvl="INFO_DETAIL",
+                directory=temp_master_tile_storage_dir,
+            )
     except Exception as e_clean_final: pcb("run_warn_phase7_cleanup_failed", prog=None, lvl="WARN", error=str(e_clean_final))
     current_global_progress = base_progress_phase7 + PROGRESS_WEIGHT_PHASE7_CLEANUP; current_global_progress = min(100, current_global_progress)
     _log_memory_usage(progress_callback, "Fin Phase 7"); pcb("CHRONO_STOP_REQUEST", prog=None, lvl="CHRONO_LEVEL"); update_gui_eta(0)

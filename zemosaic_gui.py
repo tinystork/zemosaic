@@ -374,6 +374,19 @@ class ZeMosaicGUI:
             master=self.root,
             value=self.config.get("use_auto_intertile", False),
         )
+        self.two_pass_cov_var = tk.BooleanVar(
+            master=self.root,
+            value=self.config.get("two_pass_coverage_renorm", False),
+        )
+        self.two_pass_sigma_var = tk.IntVar(
+            master=self.root,
+            value=int(self.config.get("two_pass_cov_sigma_px", 50)),
+        )
+        gain_clip_cfg = self.config.get("two_pass_cov_gain_clip", [0.85, 1.18])
+        if not (isinstance(gain_clip_cfg, (list, tuple)) and len(gain_clip_cfg) >= 2):
+            gain_clip_cfg = [0.85, 1.18]
+        self.two_pass_gain_min_var = tk.DoubleVar(master=self.root, value=float(gain_clip_cfg[0]))
+        self.two_pass_gain_max_var = tk.DoubleVar(master=self.root, value=float(gain_clip_cfg[1]))
         center_sky_cfg = self.config.get("p3_center_sky_percentile", [25.0, 60.0])
         if not (isinstance(center_sky_cfg, (list, tuple)) and len(center_sky_cfg) >= 2):
             center_sky_cfg = [25.0, 60.0]
@@ -1130,6 +1143,51 @@ class ZeMosaicGUI:
         )
         self.intertile_auto_check.grid(row=4, column=0, columnspan=3, padx=0, pady=(4, 2), sticky="w")
         self.translatable_widgets["intertile_auto_label"] = self.intertile_auto_check
+
+        two_pass_check = ttk.Checkbutton(
+            intertile_params_frame,
+            variable=self.two_pass_cov_var,
+            text="",
+        )
+        two_pass_check.grid(row=5, column=0, columnspan=3, padx=0, pady=(6, 2), sticky="w")
+        self.translatable_widgets["cfg_two_pass_coverage_renorm"] = two_pass_check
+
+        two_pass_sigma_label = ttk.Label(intertile_params_frame, text="")
+        two_pass_sigma_label.grid(row=6, column=0, padx=0, pady=2, sticky="w")
+        self.translatable_widgets["cfg_two_pass_cov_sigma_px"] = two_pass_sigma_label
+        ttk.Spinbox(
+            intertile_params_frame,
+            from_=0,
+            to=512,
+            increment=5,
+            textvariable=self.two_pass_sigma_var,
+            width=8,
+        ).grid(row=6, column=1, padx=(8, 5), pady=2, sticky="w")
+
+        two_pass_gain_label = ttk.Label(intertile_params_frame, text="")
+        two_pass_gain_label.grid(row=7, column=0, padx=0, pady=2, sticky="w")
+        self.translatable_widgets["cfg_two_pass_cov_gain_clip"] = two_pass_gain_label
+        gain_frame = ttk.Frame(intertile_params_frame)
+        gain_frame.grid(row=7, column=1, padx=(8, 5), pady=2, sticky="w")
+        ttk.Spinbox(
+            gain_frame,
+            from_=0.1,
+            to=5.0,
+            increment=0.01,
+            textvariable=self.two_pass_gain_min_var,
+            width=6,
+            format="%.2f",
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(gain_frame, text="→").pack(side=tk.LEFT)
+        ttk.Spinbox(
+            gain_frame,
+            from_=0.1,
+            to=5.0,
+            increment=0.01,
+            textvariable=self.two_pass_gain_max_var,
+            width=6,
+            format="%.2f",
+        ).pack(side=tk.LEFT, padx=(4, 0))
 
         asm_opt_row += 1
         center_out_label = ttk.Label(final_assembly_options_frame, text="")
@@ -2550,6 +2608,12 @@ class ZeMosaicGUI:
         ]
         self.config["intertile_robust_clip_sigma"] = float(self.intertile_clip_sigma_var.get())
         self.config["use_auto_intertile"] = bool(self.use_auto_intertile_var.get())
+        self.config["two_pass_coverage_renorm"] = bool(self.two_pass_cov_var.get())
+        self.config["two_pass_cov_sigma_px"] = int(self.two_pass_sigma_var.get())
+        self.config["two_pass_cov_gain_clip"] = [
+            float(self.two_pass_gain_min_var.get()),
+            float(self.two_pass_gain_max_var.get()),
+        ]
         self.config["center_out_normalization_p3"] = bool(self.center_out_normalization_var.get())
         self.config["p3_center_preview_size"] = int(self.p3_center_preview_size_var.get())
         self.config["p3_center_min_overlap_fraction"] = float(self.p3_center_overlap_var.get())
@@ -2646,6 +2710,12 @@ class ZeMosaicGUI:
             ],
             float(self.intertile_clip_sigma_var.get()),
             bool(self.use_auto_intertile_var.get()),
+            bool(self.two_pass_cov_var.get()),
+            int(self.two_pass_sigma_var.get()),
+            [
+                float(self.two_pass_gain_min_var.get()),
+                float(self.two_pass_gain_max_var.get()),
+            ],
             bool(self.center_out_normalization_var.get()),
             [
                 float(self.p3_center_sky_low_var.get()),
