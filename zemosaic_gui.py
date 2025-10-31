@@ -2715,6 +2715,8 @@ class ZeMosaicGUI:
             ],
             float(self.intertile_clip_sigma_var.get()),
             bool(self.use_auto_intertile_var.get()),
+            bool(self.config.get("match_background_for_final", True)),
+            bool(self.config.get("incremental_feather_parity", False)),
             bool(self.two_pass_cov_var.get()),
             int(self.two_pass_sigma_var.get()),
             [

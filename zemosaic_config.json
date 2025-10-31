@@ -57,6 +57,8 @@
     ],
     "intertile_robust_clip_sigma": 2.5,
     "use_auto_intertile": true,
+    "match_background_for_final": true,
+    "incremental_feather_parity": false,
     "enable_early_filter": true,
     "apply_master_tile_crop": true,
     "master_tile_crop_percent": 18.0,

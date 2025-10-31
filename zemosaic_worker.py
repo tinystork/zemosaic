@@ -2082,10 +2082,19 @@ def solve_with_ansvr(
 # passées à ASTAP telles quelles pour la résolution (pas de conversion mono).
 
 
-def reproject_tile_to_mosaic(tile_path: str, tile_wcs, mosaic_wcs, mosaic_shape_hw,
-                             feather: bool = True,
-                             apply_crop: bool = False,
-                             crop_percent: float = 0.0):
+def reproject_tile_to_mosaic(
+    tile_path: str,
+    tile_wcs,
+    mosaic_wcs,
+    mosaic_shape_hw,
+    feather: bool = True,
+    apply_crop: bool = False,
+    crop_percent: float = 0.0,
+    tile_affine: tuple[float, float] | None = None,
+    match_background: bool = True,
+    nan_fill_value: float = 0.0,
+    enforce_positive: bool = True,
+):
     """Reprojecte une tuile sur la grille finale et renvoie l'image et sa carte
     de poids ainsi que la bounding box utile.
 
@@ -2127,6 +2136,33 @@ def reproject_tile_to_mosaic(tile_path: str, tile_wcs, mosaic_wcs, mosaic_shape_
     if data.ndim == 2:
         data = data[..., np.newaxis]
     n_channels = data.shape[-1]
+
+    # Assurer une base numérique propre (float32 + NaN vers valeur neutre)
+    data = np.asarray(data, dtype=np.float32, order="C")
+    np.nan_to_num(data, copy=False, nan=nan_fill_value, posinf=nan_fill_value, neginf=nan_fill_value)
+
+    # Appliquer les corrections photométriques (gain puis offset) si fournies
+    if tile_affine is not None:
+        try:
+            gain_val, offset_val = tile_affine
+        except Exception:
+            gain_val, offset_val = 1.0, 0.0
+        try:
+            gain_val = float(gain_val)
+        except Exception:
+            gain_val = 1.0
+        try:
+            offset_val = float(offset_val)
+        except Exception:
+            offset_val = 0.0
+        if not np.isfinite(gain_val):
+            gain_val = 1.0
+        if not np.isfinite(offset_val):
+            offset_val = 0.0
+        if gain_val != 1.0:
+            data *= gain_val
+        if offset_val != 0.0:
+            data += offset_val
 
     # Optional cropping of the tile before reprojection
     if apply_crop and crop_percent > 1e-3 and ZEMOSAIC_UTILS_AVAILABLE \
@@ -2215,15 +2251,20 @@ def reproject_tile_to_mosaic(tile_path: str, tile_wcs, mosaic_wcs, mosaic_shape_
     if not np.any(valid):
         return None, None, (0, 0, 0, 0)
 
-    # Soustraire un fond médian par canal pour imiter match_background=True
-    try:
-        for c in range(n_channels):
-            med_c = np.nanmedian(reproj_img[..., c][valid])
-            if np.isfinite(med_c):
-                reproj_img[..., c] -= med_c
-        reproj_img = np.clip(reproj_img, 0, None)
-    except Exception:
-        pass
+    # Normalisation d'arrière-plan optionnelle (match_background)
+    if match_background:
+        try:
+            for c in range(n_channels):
+                channel_view = reproj_img[..., c]
+                med_c = np.nanmedian(channel_view[valid])
+                if np.isfinite(med_c):
+                    channel_view -= med_c
+            # Contraindre les NaN générés par la soustraction
+            np.nan_to_num(reproj_img, copy=False, nan=0.0)
+        except Exception:
+            pass
+    if enforce_positive:
+        np.clip(reproj_img, 0.0, None, out=reproj_img)
 
     # Les indices sont retournés dans l'ordre (xmin, xmax, ymin, ymax)
     return reproj_img, reproj_weight, (i0, i1, j0, j1)
@@ -3467,6 +3508,18 @@ def assemble_final_mosaic_incremental(
     processing_threads: int = 0,
     memmap_dir: str | None = None,
     cleanup_memmap: bool = True,
+    intertile_photometric_match: bool = False,
+    intertile_preview_size: int = 512,
+    intertile_overlap_min: float = 0.05,
+    intertile_sky_percentile: tuple[float, float] | list[float] = (30.0, 70.0),
+    intertile_robust_clip_sigma: float = 2.5,
+    use_auto_intertile: bool = False,
+    match_background: bool = True,
+    feather_parity: bool = False,
+    use_radial_feather: bool | None = None,
+    two_pass_coverage_renorm: bool = False,
+    tile_affine_corrections: list[tuple[float, float]] | None = None,
+    enforce_positive: bool | None = None,
     base_progress_phase5: float | None = None,
     progress_weight_phase5: float | None = None,
     start_time_total_run: float | None = None,
@@ -3477,10 +3530,50 @@ def assemble_final_mosaic_incremental(
     start_time_inc = time.monotonic()
     total_tiles = len(master_tile_fits_with_wcs_list)
     FLUSH_BATCH_SIZE = 10  # nombre de tuiles entre chaque flush sur le memmap
-    use_feather = False  # Désactivation du feathering par défaut
     pcb_asm = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
         msg_key, prog, lvl, callback=progress_callback, **kwargs
     )
+
+    pending_affine_list = None
+    if tile_affine_corrections:
+        sanitized_affine: list[tuple[float, float]] = []
+        nontrivial_detected = False
+        for entry in tile_affine_corrections:
+            try:
+                gain_val, offset_val = entry
+            except Exception:
+                gain_val, offset_val = 1.0, 0.0
+            try:
+                gain_val = float(gain_val)
+            except Exception:
+                gain_val = 1.0
+            try:
+                offset_val = float(offset_val)
+            except Exception:
+                offset_val = 0.0
+            if not np.isfinite(gain_val):
+                gain_val = 1.0
+            if not np.isfinite(offset_val):
+                offset_val = 0.0
+            if not nontrivial_detected and (
+                abs(gain_val - 1.0) > 1e-6 or abs(offset_val) > 1e-6
+            ):
+                nontrivial_detected = True
+            sanitized_affine.append((gain_val, offset_val))
+        if sanitized_affine and nontrivial_detected:
+            pending_affine_list = sanitized_affine
+
+    use_feather = bool(use_radial_feather) if use_radial_feather is not None else False
+    parity_mode = bool(intertile_photometric_match and match_background and feather_parity)
+    if feather_parity:
+        if use_feather:
+            use_feather = False
+        pcb_asm("run_warn_incremental_feather_parity_enabled", prog=None, lvl="WARN")
+
+    if enforce_positive is None:
+        enforce_positive_flag = not parity_mode
+    else:
+        enforce_positive_flag = bool(enforce_positive)
 
     if progress_weight_phase5 is None:
         progress_weight_phase5 = globals().get("PROGRESS_WEIGHT_PHASE5_ASSEMBLY", 0.0)
@@ -3554,9 +3647,180 @@ def assemble_final_mosaic_incremental(
             )
             return None, None
 
+    if match_background:
+        pcb_asm("run_info_incremental_match_background", prog=None, lvl="INFO_DETAIL")
+
+    if (
+        intertile_photometric_match
+        and pending_affine_list is None
+        and total_tiles >= 2
+        and ZEMOSAIC_UTILS_AVAILABLE
+        and hasattr(zemosaic_utils, "create_downscaled_luminance_preview")
+        and hasattr(zemosaic_utils, "compute_intertile_affine_calibration")
+    ):
+        affine_start = time.monotonic()
+        pcb_asm(
+            "run_info_incremental_affine_start",
+            prog=None,
+            lvl="INFO",
+            num_tiles=total_tiles,
+        )
+        preview_entries: list[tuple[np.ndarray, object]] = []
+        preview_failed = False
+        for idx, (tile_path, tile_wcs) in enumerate(master_tile_fits_with_wcs_list, 1):
+            try:
+                with fits.open(tile_path, memmap=False) as hdul:
+                    tile_data = hdul[0].data
+                tile_arr = np.asarray(tile_data, dtype=np.float32)
+                if tile_arr.ndim == 3 and tile_arr.shape[0] == 3 and tile_arr.shape[-1] != 3:
+                    tile_arr = np.moveaxis(tile_arr, 0, -1)
+                if tile_arr.ndim == 2:
+                    tile_arr = tile_arr[..., np.newaxis]
+                tile_arr = np.asarray(tile_arr, dtype=np.float32, order="C")
+                np.nan_to_num(tile_arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+                try:
+                    preview_arr, preview_wcs = zemosaic_utils.create_downscaled_luminance_preview(
+                        tile_arr,
+                        tile_wcs,
+                        preview_size=intertile_preview_size,
+                    )
+                except Exception:
+                    preview_arr, preview_wcs = None, None
+                if preview_arr is None:
+                    luminance = tile_arr
+                    if luminance.ndim == 3 and luminance.shape[-1] > 1:
+                        luminance = np.nanmean(luminance, axis=-1)
+                    elif luminance.ndim == 3:
+                        luminance = luminance[..., 0]
+                    luminance = np.asarray(np.squeeze(luminance), dtype=np.float32)
+                    np.nan_to_num(luminance, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+                    preview_arr = luminance
+                if preview_wcs is None:
+                    preview_wcs = tile_wcs
+                preview_entries.append((preview_arr, preview_wcs))
+            except Exception as exc_preview:
+                preview_failed = True
+                logger.warning(
+                    "Incremental intertile preview failed for %s: %s",
+                    tile_path,
+                    exc_preview,
+                )
+                logger.debug("Traceback (preview failure):", exc_info=True)
+                break
+            finally:
+                if progress_callback:
+                    try:
+                        progress_callback("phase5_intertile", idx, total_tiles)
+                    except Exception:
+                        pass
+        corrections = {}
+        if not preview_failed and len(preview_entries) == total_tiles:
+            try:
+                corrections = zemosaic_utils.compute_intertile_affine_calibration(
+                    preview_entries,
+                    final_output_wcs,
+                    final_output_shape_hw,
+                    preview_size=intertile_preview_size,
+                    min_overlap_fraction=intertile_overlap_min,
+                    sky_percentile=intertile_sky_percentile,
+                    robust_clip_sigma=intertile_robust_clip_sigma,
+                    use_auto_intertile=use_auto_intertile,
+                    logger=logger,
+                    progress_callback=progress_callback,
+                )
+            except Exception as exc_intertile:
+                pcb_asm(
+                    "assemble_warn_intertile_photometric_failed",
+                    prog=None,
+                    lvl="WARN",
+                    error=str(exc_intertile),
+                )
+                logger.warning(
+                    "Intertile photometric calibration failed (incremental): %s",
+                    exc_intertile,
+                    exc_info=True,
+                )
+                corrections = {}
+        elif preview_failed:
+            pcb_asm(
+                "assemble_warn_intertile_photometric_failed",
+                prog=None,
+                lvl="WARN",
+                error="preview_failed",
+            )
+        try:
+            sanitized_affine: list[tuple[float, float]] = []
+            nontrivial_detected = False
+            for idx_tile in range(total_tiles):
+                gain_val, offset_val = corrections.get(idx_tile, (1.0, 0.0))
+                try:
+                    gain_val = float(gain_val)
+                except Exception:
+                    gain_val = 1.0
+                try:
+                    offset_val = float(offset_val)
+                except Exception:
+                    offset_val = 0.0
+                if not np.isfinite(gain_val):
+                    gain_val = 1.0
+                if not np.isfinite(offset_val):
+                    offset_val = 0.0
+                if not nontrivial_detected and (
+                    abs(gain_val - 1.0) > 1e-6 or abs(offset_val) > 1e-6
+                ):
+                    nontrivial_detected = True
+                sanitized_affine.append((gain_val, offset_val))
+            pending_affine_list = sanitized_affine if nontrivial_detected else None
+        except Exception:
+            pending_affine_list = None
+        if preview_entries:
+            try:
+                preview_entries.clear()
+            except Exception:
+                pass
+        affine_elapsed = time.monotonic() - affine_start
+        pcb_asm(
+            "run_info_incremental_affine_done",
+            prog=None,
+            lvl="INFO",
+            elapsed=f"{affine_elapsed:.2f}",
+            num_tiles=len(pending_affine_list or []),
+        )
+        if pending_affine_list:
+            # Préparer un échantillonnage de logs pour l'application par tuile.
+            nontrivial_indices = [
+                i
+                for i, (g_val, o_val) in enumerate(pending_affine_list, 1)
+                if abs(g_val - 1.0) > 1e-6 or abs(o_val) > 1e-6
+            ]
+            if nontrivial_indices:
+                sample_span = max(1, len(nontrivial_indices) // 4)
+                affine_log_indices = set(nontrivial_indices[::sample_span])
+                affine_log_indices.add(nontrivial_indices[0])
+                affine_log_indices.add(nontrivial_indices[-1])
+            else:
+                affine_log_indices = set()
+        else:
+            affine_log_indices = set()
+    else:
+        affine_log_indices = set()
+
+    if pending_affine_list and not affine_log_indices:
+        nontrivial_indices = [
+            i
+            for i, (g_val, o_val) in enumerate(pending_affine_list, 1)
+            if abs(g_val - 1.0) > 1e-6 or abs(o_val) > 1e-6
+        ]
+        if nontrivial_indices:
+            sample_span = max(1, len(nontrivial_indices) // 4)
+            affine_log_indices = set(nontrivial_indices[::sample_span])
+            affine_log_indices.add(nontrivial_indices[0])
+            affine_log_indices.add(nontrivial_indices[-1])
+        else:
+            affine_log_indices = set()
+
     sum_shape = (h, w, n_channels)
     weight_shape = (h, w)
-
 
     internal_temp_dir = False
     if memmap_dir is None:
@@ -3613,6 +3877,26 @@ def assemble_final_mosaic_incremental(
                 # On transmet donc leurs en-têtes et ils seront reconstruits dans le worker.
                 tile_wcs_hdr = tile_wcs.to_header() if hasattr(tile_wcs, "to_header") else tile_wcs
                 output_wcs_hdr = final_output_wcs.to_header() if hasattr(final_output_wcs, "to_header") else final_output_wcs
+                tile_affine = None
+                if pending_affine_list and (tile_idx - 1) < len(pending_affine_list):
+                    raw_affine = pending_affine_list[tile_idx - 1]
+                    if (
+                        abs(raw_affine[0] - 1.0) > 1e-6
+                        or abs(raw_affine[1]) > 1e-6
+                    ):
+                        tile_affine = raw_affine
+                        if affine_log_indices and tile_idx in affine_log_indices:
+                            try:
+                                pcb_asm(
+                                    "run_info_incremental_apply_gain_offset",
+                                    prog=None,
+                                    lvl="INFO_DETAIL",
+                                    tile_num=tile_idx,
+                                    gain=f"{tile_affine[0]:.6f}",
+                                    offset=f"{tile_affine[1]:.6f}",
+                                )
+                            except Exception:
+                                pass
                 future = ex.submit(
                     reproject_tile_to_mosaic,
                     tile_path,
@@ -3622,6 +3906,10 @@ def assemble_final_mosaic_incremental(
                     feather=use_feather,
                     apply_crop=apply_crop,
                     crop_percent=crop_percent,
+                    tile_affine=tile_affine,
+                    match_background=match_background,
+                    nan_fill_value=0.0,
+                    enforce_positive=enforce_positive_flag,
                 )
                 future_map[future] = tile_idx
 
@@ -4799,6 +5087,8 @@ def run_hierarchical_mosaic(
     intertile_sky_percentile_config: tuple[float, float] | list[float] = (30.0, 70.0),
     intertile_robust_clip_sigma_config: float = 2.5,
     use_auto_intertile_config: bool = False,
+    match_background_for_final_config: bool = True,
+    incremental_feather_parity_config: bool = False,
     two_pass_coverage_renorm_config: bool = False,
     two_pass_cov_sigma_px_config: int = 50,
     two_pass_cov_gain_clip_config: tuple[float, float] | list[float] = (0.85, 1.18),
@@ -4919,6 +5209,13 @@ def run_hierarchical_mosaic(
     phase0_header_items: list[dict] = []
     phase0_lookup: dict[str, dict] = {}
     preplan_groups_override_paths: list[list[str]] | None = None
+    intertile_match_flag = bool(intertile_photometric_match_config)
+    match_background_flag = (
+        True
+        if match_background_for_final_config is None
+        else bool(match_background_for_final_config)
+    )
+    feather_parity_flag = bool(incremental_feather_parity_config)
 
     try:
         if isinstance(intertile_sky_percentile_config, (list, tuple)) and len(intertile_sky_percentile_config) >= 2:
@@ -6739,6 +7036,16 @@ def run_hierarchical_mosaic(
         ),
     )
     
+    incremental_parity_active = (
+        USE_INCREMENTAL_ASSEMBLY
+        and intertile_match_flag
+        and match_background_flag
+        and feather_parity_flag
+    )
+    if incremental_parity_active and two_pass_enabled:
+        two_pass_enabled = False
+        pcb("run_info_incremental_two_pass_parity_disabled", prog=None, lvl="INFO_DETAIL")
+
     valid_master_tiles_for_assembly = []
     for mt_p, mt_w in master_tiles_results_list:
         if mt_p and os.path.exists(mt_p) and mt_w and mt_w.is_celestial: 
@@ -6783,6 +7090,15 @@ def run_hierarchical_mosaic(
                     processing_threads=assembly_process_workers_config,
                     memmap_dir=inc_memmap_dir,
                     cleanup_memmap=True,
+                    intertile_photometric_match=intertile_match_flag,
+                    intertile_preview_size=int(intertile_preview_size_config),
+                    intertile_overlap_min=float(intertile_overlap_min_config),
+                    intertile_sky_percentile=intertile_sky_percentile_tuple,
+                    intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
+                    use_auto_intertile=bool(use_auto_intertile_config),
+                    match_background=match_background_flag,
+                    feather_parity=feather_parity_flag,
+                    two_pass_coverage_renorm=bool(two_pass_coverage_renorm_config),
                     base_progress_phase5=base_progress_phase5,
                     progress_weight_phase5=PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
                     start_time_total_run=start_time_total_run,
@@ -6800,6 +7116,15 @@ def run_hierarchical_mosaic(
                     processing_threads=assembly_process_workers_config,
                     memmap_dir=inc_memmap_dir,
                     cleanup_memmap=True,
+                    intertile_photometric_match=intertile_match_flag,
+                    intertile_preview_size=int(intertile_preview_size_config),
+                    intertile_overlap_min=float(intertile_overlap_min_config),
+                    intertile_sky_percentile=intertile_sky_percentile_tuple,
+                    intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
+                    use_auto_intertile=bool(use_auto_intertile_config),
+                    match_background=match_background_flag,
+                    feather_parity=feather_parity_flag,
+                    two_pass_coverage_renorm=bool(two_pass_coverage_renorm_config),
                     base_progress_phase5=base_progress_phase5,
                     progress_weight_phase5=PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
                     start_time_total_run=start_time_total_run,
@@ -6816,6 +7141,15 @@ def run_hierarchical_mosaic(
                 processing_threads=assembly_process_workers_config,
                 memmap_dir=inc_memmap_dir,
                 cleanup_memmap=True,
+                intertile_photometric_match=intertile_match_flag,
+                intertile_preview_size=int(intertile_preview_size_config),
+                intertile_overlap_min=float(intertile_overlap_min_config),
+                intertile_sky_percentile=intertile_sky_percentile_tuple,
+                intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
+                use_auto_intertile=bool(use_auto_intertile_config),
+                match_background=match_background_flag,
+                feather_parity=feather_parity_flag,
+                two_pass_coverage_renorm=bool(two_pass_coverage_renorm_config),
                 base_progress_phase5=base_progress_phase5,
                 progress_weight_phase5=PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
                 start_time_total_run=start_time_total_run,
@@ -6838,14 +7172,14 @@ def run_hierarchical_mosaic(
                     final_output_shape_hw=final_output_shape_hw,
                     progress_callback=progress_callback,
                     n_channels=3,
-                    match_bg=True,
+                    match_bg=match_background_flag,
                     apply_crop=apply_crop_for_assembly,
                     crop_percent=master_tile_crop_percent_config,
                     use_gpu=True,
                     base_progress_phase5=base_progress_phase5,
                     progress_weight_phase5=PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
                     start_time_total_run=start_time_total_run,
-                    intertile_photometric_match=bool(intertile_photometric_match_config),
+                    intertile_photometric_match=intertile_match_flag,
                     intertile_preview_size=int(intertile_preview_size_config),
                     intertile_overlap_min=float(intertile_overlap_min_config),
                     intertile_sky_percentile=intertile_sky_percentile_tuple,
@@ -6861,7 +7195,7 @@ def run_hierarchical_mosaic(
                     final_output_shape_hw=final_output_shape_hw,
                     progress_callback=progress_callback,
                     n_channels=3,
-                    match_bg=True,
+                    match_bg=match_background_flag,
                     apply_crop=apply_crop_for_assembly,
                     crop_percent=master_tile_crop_percent_config,
                     use_gpu=False,
@@ -6871,7 +7205,7 @@ def run_hierarchical_mosaic(
                     base_progress_phase5=base_progress_phase5,
                     progress_weight_phase5=PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
                     start_time_total_run=start_time_total_run,
-                    intertile_photometric_match=bool(intertile_photometric_match_config),
+                    intertile_photometric_match=intertile_match_flag,
                     intertile_preview_size=int(intertile_preview_size_config),
                     intertile_overlap_min=float(intertile_overlap_min_config),
                     intertile_sky_percentile=intertile_sky_percentile_tuple,
@@ -6886,7 +7220,7 @@ def run_hierarchical_mosaic(
                 final_output_shape_hw=final_output_shape_hw,
                 progress_callback=progress_callback,
                 n_channels=3,
-                match_bg=True,
+                match_bg=match_background_flag,
                 apply_crop=apply_crop_for_assembly,
                 crop_percent=master_tile_crop_percent_config,
                 use_gpu=use_gpu_phase5_flag,
@@ -6896,7 +7230,7 @@ def run_hierarchical_mosaic(
                 base_progress_phase5=base_progress_phase5,
                 progress_weight_phase5=PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
                 start_time_total_run=start_time_total_run,
-                intertile_photometric_match=bool(intertile_photometric_match_config),
+                intertile_photometric_match=intertile_match_flag,
                 intertile_preview_size=int(intertile_preview_size_config),
                 intertile_overlap_min=float(intertile_overlap_min_config),
                 intertile_sky_percentile=intertile_sky_percentile_tuple,
