@@ -2625,7 +2625,12 @@ class ZeMosaicGUI:
         # Persist logging level
         self.config["logging_level"] = self.logging_level_var.get()
 
-        self.config["use_gpu_phase5"] = self.use_gpu_phase5_var.get()
+        gpu_phase5_selected = bool(self.use_gpu_phase5_var.get())
+        self.config["use_gpu_phase5"] = gpu_phase5_selected
+        # Propagate the Phase 5 GPU preference to stacking without adding UI controls.
+        # Stacking code checks 'stack_use_gpu' first, then legacy fallbacks.
+        self.config["stack_use_gpu"] = gpu_phase5_selected
+        self.config["use_gpu_stack"] = gpu_phase5_selected
         sel = self.gpu_selector_var.get()
         gpu_id = None
         for disp, idx in self._gpus:

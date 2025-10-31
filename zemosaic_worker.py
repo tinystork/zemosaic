@@ -2824,6 +2824,26 @@ def create_master_tile(
             zconfig = SimpleNamespace()
     else:
         zconfig = SimpleNamespace()
+    # Ensure stacking GPU preference mirrors the Phase 5 GPU intent when not explicitly set.
+    try:
+        phase5_pref = bool(getattr(zconfig, "use_gpu_phase5"))
+    except Exception:
+        phase5_pref = False
+    try:
+        stack_pref = getattr(zconfig, "stack_use_gpu")
+    except AttributeError:
+        stack_pref = None
+    except Exception:
+        stack_pref = None
+    if stack_pref is None:
+        setattr(zconfig, "stack_use_gpu", phase5_pref)
+    else:
+        try:
+            setattr(zconfig, "stack_use_gpu", bool(stack_pref))
+        except Exception:
+            setattr(zconfig, "stack_use_gpu", phase5_pref)
+    if not hasattr(zconfig, "use_gpu_stack") or getattr(zconfig, "use_gpu_stack") is None:
+        setattr(zconfig, "use_gpu_stack", getattr(zconfig, "stack_use_gpu", phase5_pref))
     try:
         setattr(zconfig, "poststack_equalize_rgb", bool(poststack_equalize_rgb))
     except Exception:
@@ -4378,6 +4398,7 @@ def compute_per_tile_gains_from_coverage(
     sigma_px: int,
     gain_clip: tuple[float, float],
     logger=None,
+    use_gpu: bool = False,
 ) -> list[float]:
     """Compute multiplicative gains for each tile using the blurred coverage map."""
     if logger:
@@ -4408,26 +4429,42 @@ def compute_per_tile_gains_from_coverage(
     if sigma_px > 0:
         blurred = None
         blur_source = "identity"
-        try:
-            from scipy.ndimage import gaussian_filter  # type: ignore
-
-            blurred = gaussian_filter(coverage, sigma=float(sigma_px))
-            blur_source = "scipy"
-        except Exception as exc:
-            if logger:
-                logger.debug(
-                    "[TwoPass] scipy gaussian_filter failed (%s), trying cv2 fallback",
-                    exc,
-                )
+        if use_gpu:
             try:
-                import cv2  # type: ignore
+                import cupy as cp  # type: ignore
+                from cupyx.scipy.ndimage import gaussian_filter as gpu_gaussian_filter  # type: ignore
 
-                k = max(3, int(2 * round(float(sigma_px) * 1.5) + 1))
-                blurred = cv2.GaussianBlur(coverage, (k, k), sigmaX=float(sigma_px))
-                blur_source = "cv2"
-            except Exception as exc_cv:
+                cov_gpu = cp.asarray(coverage, dtype=cp.float32)
+                blurred_gpu = gpu_gaussian_filter(cov_gpu, float(sigma_px))
+                blurred = cp.asnumpy(blurred_gpu)
+                blur_source = "cupy"
+            except Exception as exc_gpu:
                 if logger:
-                    logger.warning("[TwoPass] Coverage blur fallback failed: %s", exc_cv)
+                    logger.debug(
+                        "[TwoPass] cupy gaussian_filter failed (%s), falling back to CPU",
+                        exc_gpu,
+                    )
+        if blurred is None:
+            try:
+                from scipy.ndimage import gaussian_filter  # type: ignore
+
+                blurred = gaussian_filter(coverage, sigma=float(sigma_px))
+                blur_source = "scipy"
+            except Exception as exc:
+                if logger:
+                    logger.debug(
+                        "[TwoPass] scipy gaussian_filter failed (%s), trying cv2 fallback",
+                        exc,
+                    )
+                try:
+                    import cv2  # type: ignore
+
+                    k = max(3, int(2 * round(float(sigma_px) * 1.5) + 1))
+                    blurred = cv2.GaussianBlur(coverage, (k, k), sigmaX=float(sigma_px))
+                    blur_source = "cv2"
+                except Exception as exc_cv:
+                    if logger:
+                        logger.warning("[TwoPass] Coverage blur fallback failed: %s", exc_cv)
         cov_blur = (
             np.asarray(blurred, dtype=np.float32)
             if blurred is not None
@@ -4507,6 +4544,7 @@ def run_second_pass_coverage_renorm(
     sigma_px: int,
     gain_clip: tuple[float, float],
     logger=None,
+    use_gpu_two_pass: bool | None = None,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Apply coverage-based gains to tiles and reproject them for a second pass."""
     if logger:
@@ -4535,6 +4573,7 @@ def run_second_pass_coverage_renorm(
         if logger:
             logger.warning("[TwoPass] zemosaic_utils unavailable; skipping second pass")
         return None
+    use_gpu = bool(use_gpu_two_pass)
     try:
         gains = compute_per_tile_gains_from_coverage(
             tiles,
@@ -4544,6 +4583,7 @@ def run_second_pass_coverage_renorm(
             sigma_px=sigma_px,
             gain_clip=gain_clip,
             logger=logger,
+            use_gpu=use_gpu,
         )
     except Exception as exc:
         if logger:
@@ -4613,7 +4653,7 @@ def run_second_pass_coverage_renorm(
                 data_list=data_list,
                 wcs_list=tiles_wcs,
                 shape_out=shape_out_hw,
-                use_gpu=False,
+                use_gpu=use_gpu,
                 cpu_func=reproject_and_coadd,
                 **reproj_kwargs,
             )
@@ -6882,6 +6922,7 @@ def run_hierarchical_mosaic(
                     sigma_px=two_pass_sigma_px,
                     gain_clip=gain_clip_tuple,
                     logger=logger,
+                    use_gpu_two_pass=use_gpu_phase5_flag,
                 )
                 if result is not None:
                     final_mosaic_data_HWC, final_mosaic_coverage_HW = result
