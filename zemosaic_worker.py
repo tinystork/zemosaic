@@ -709,7 +709,13 @@ def _estimate_per_frame_cost_mb(
     }
 
 
-def _probe_system_resources(cache_dir: str | None = None) -> dict:
+def _probe_system_resources(
+    cache_dir: str | None = None,
+    *,
+    two_pass_enabled: bool | None = None,
+    two_pass_sigma_px: int | None = None,
+    two_pass_gain_clip: tuple[float, float] | list[float] | None = None,
+) -> dict:
     """Collect RAM, disk and GPU availability information."""
 
     info: dict = {
@@ -733,21 +739,26 @@ def _probe_system_resources(cache_dir: str | None = None) -> dict:
     except Exception:
         pass
 
-    two_pass_enabled = bool(two_pass_coverage_renorm_config)
-    try:
-        two_pass_sigma_px = int(two_pass_cov_sigma_px_config)
-    except Exception:
-        two_pass_sigma_px = 50
-    gain_clip_raw = two_pass_cov_gain_clip_config
-    if isinstance(gain_clip_raw, (list, tuple)) and len(gain_clip_raw) >= 2:
+    tp_enabled = bool(two_pass_enabled) if two_pass_enabled is not None else False
+    tp_sigma_px = 50
+    if two_pass_sigma_px is not None:
         try:
-            gain_clip_tuple = (float(gain_clip_raw[0]), float(gain_clip_raw[1]))
-        except Exception:
+            tp_sigma_px = int(two_pass_sigma_px)
+        except (TypeError, ValueError):
+            tp_sigma_px = 50
+    gain_clip_tuple: tuple[float, float] = (0.85, 1.18)
+    if isinstance(two_pass_gain_clip, (list, tuple)) and len(two_pass_gain_clip) >= 2:
+        try:
+            low = float(two_pass_gain_clip[0])
+            high = float(two_pass_gain_clip[1])
+            if low > high:
+                low, high = high, low
+            gain_clip_tuple = (low, high)
+        except (TypeError, ValueError):
             gain_clip_tuple = (0.85, 1.18)
-    else:
-        gain_clip_tuple = (0.85, 1.18)
-    if gain_clip_tuple[0] > gain_clip_tuple[1]:
-        gain_clip_tuple = (gain_clip_tuple[1], gain_clip_tuple[0])
+    info["two_pass_enabled"] = tp_enabled
+    info["two_pass_sigma_px"] = tp_sigma_px
+    info["two_pass_gain_clip"] = gain_clip_tuple
 
     try:
         target_dir = cache_dir if cache_dir and os.path.isdir(cache_dir) else os.getcwd()
@@ -4814,7 +4825,30 @@ def run_hierarchical_mosaic(
             pcb(f"ETA_UPDATE:{eta_str}", prog=None, lvl="ETA_LEVEL")
 
 
-    resource_probe_info = _probe_system_resources(output_folder)
+    resource_probe_info = _probe_system_resources(
+        output_folder,
+        two_pass_enabled=two_pass_coverage_renorm_config,
+        two_pass_sigma_px=two_pass_cov_sigma_px_config,
+        two_pass_gain_clip=two_pass_cov_gain_clip_config,
+    )
+    two_pass_enabled = bool(resource_probe_info.get("two_pass_enabled", False))
+    try:
+        two_pass_sigma_px = int(resource_probe_info.get("two_pass_sigma_px", 50) or 50)
+    except (TypeError, ValueError):
+        two_pass_sigma_px = 50
+    gain_clip_raw = resource_probe_info.get("two_pass_gain_clip")
+    gain_clip_tuple: tuple[float, float]
+    if isinstance(gain_clip_raw, (list, tuple)) and len(gain_clip_raw) >= 2:
+        try:
+            low = float(gain_clip_raw[0])
+            high = float(gain_clip_raw[1])
+            if low > high:
+                low, high = high, low
+            gain_clip_tuple = (low, high)
+        except (TypeError, ValueError):
+            gain_clip_tuple = (0.85, 1.18)
+    else:
+        gain_clip_tuple = (0.85, 1.18)
     auto_caps_info: dict | None = None
     auto_resource_strategy: dict = {}
     phase0_header_items: list[dict] = []
@@ -4953,7 +4987,12 @@ def run_hierarchical_mosaic(
     except OSError as e_mkdir_cache:
         pcb("run_error_cache_dir_creation_failed", prog=None, lvl="ERROR", directory=temp_image_cache_dir, error=str(e_mkdir_cache)); return
     try:
-        cache_probe = _probe_system_resources(temp_image_cache_dir)
+        cache_probe = _probe_system_resources(
+            temp_image_cache_dir,
+            two_pass_enabled=two_pass_coverage_renorm_config,
+            two_pass_sigma_px=two_pass_cov_sigma_px_config,
+            two_pass_gain_clip=two_pass_cov_gain_clip_config,
+        )
         for key, value in cache_probe.items():
             if value is not None:
                 resource_probe_info[key] = value
@@ -6886,7 +6925,7 @@ def run_hierarchical_mosaic(
         try: final_header.update(final_output_wcs.to_header(relax=True))
         except Exception as e_hdr_wcs: pcb("run_warn_phase6_wcs_to_header_failed", error=str(e_hdr_wcs), lvl="WARN")
     
-    final_header['SOFTWARE']=('ZeMosaic v3.2.4','Mosaic Software') # Incrémente la version 
+    final_header['SOFTWARE']=('ZeMosaic v3.2.5','Mosaic Software') # Incrémente la version 
     final_header['NMASTILE']=(len(master_tiles_results_list),"Master Tiles combined")
     final_header['NRAWINIT']=(num_total_raw_files,"Initial raw images found")
     final_header['NRAWPROC']=(len(all_raw_files_processed_info),"Raw images with WCS processed")

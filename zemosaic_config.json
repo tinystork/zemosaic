@@ -21,7 +21,7 @@
     "gpu_id_phase5": 0,
     "gpu_selector": "NVIDIA GeForce RTX 3070 Laptop GPU",
     "final_assembly_method": "reproject_coadd",
-    "two_pass_coverage_renorm": false,
+    "two_pass_coverage_renorm": true,
     "two_pass_cov_sigma_px": 50,
     "two_pass_cov_gain_clip": [
         0.85,
