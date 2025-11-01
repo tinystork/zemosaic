@@ -293,6 +293,30 @@ class ZeMosaicGUI:
         self._chrono_start_time = None
         self._chrono_after_id = None
         self._stage_times = {}
+        self._stage_aliases = {
+            "phase1_scan": "phase1",
+            "phase2_cluster": "phase2",
+            "phase3_master_tiles": "phase3",
+            "phase4_grid": "phase4",
+            "phase5_intertile": "phase5",
+            "phase5_incremental": "phase5",
+            "phase5_reproject": "phase5",
+        }
+        self._stage_order = ["phase1", "phase2", "phase3", "phase4", "phase5", "phase6", "phase7"]
+        self._stage_weights = {
+            "phase1": 30.0,
+            "phase2": 5.0,
+            "phase3": 35.0,
+            "phase4": 5.0,
+            "phase5": 15.0,
+            "phase6": 8.0,
+            "phase7": 2.0,
+        }
+        self._stage_progress_values = {key: 0.0 for key in self._stage_order}
+        self._stage_totals = {}
+        self._progress_start_time = None
+        self._last_global_progress = 0.0
+        self._eta_seconds_smoothed = None
         # Last filter outcomes to forward to worker (overrides + optional header list)
         self._last_filter_overrides = None
         self._last_filtered_header_items = None
@@ -374,6 +398,19 @@ class ZeMosaicGUI:
             master=self.root,
             value=self.config.get("use_auto_intertile", False),
         )
+        self.two_pass_cov_var = tk.BooleanVar(
+            master=self.root,
+            value=self.config.get("two_pass_coverage_renorm", False),
+        )
+        self.two_pass_sigma_var = tk.IntVar(
+            master=self.root,
+            value=int(self.config.get("two_pass_cov_sigma_px", 50)),
+        )
+        gain_clip_cfg = self.config.get("two_pass_cov_gain_clip", [0.85, 1.18])
+        if not (isinstance(gain_clip_cfg, (list, tuple)) and len(gain_clip_cfg) >= 2):
+            gain_clip_cfg = [0.85, 1.18]
+        self.two_pass_gain_min_var = tk.DoubleVar(master=self.root, value=float(gain_clip_cfg[0]))
+        self.two_pass_gain_max_var = tk.DoubleVar(master=self.root, value=float(gain_clip_cfg[1]))
         center_sky_cfg = self.config.get("p3_center_sky_percentile", [25.0, 60.0])
         if not (isinstance(center_sky_cfg, (list, tuple)) and len(center_sky_cfg) >= 2):
             center_sky_cfg = [25.0, 60.0]
@@ -1130,6 +1167,51 @@ class ZeMosaicGUI:
         )
         self.intertile_auto_check.grid(row=4, column=0, columnspan=3, padx=0, pady=(4, 2), sticky="w")
         self.translatable_widgets["intertile_auto_label"] = self.intertile_auto_check
+
+        two_pass_check = ttk.Checkbutton(
+            intertile_params_frame,
+            variable=self.two_pass_cov_var,
+            text="",
+        )
+        two_pass_check.grid(row=5, column=0, columnspan=3, padx=0, pady=(6, 2), sticky="w")
+        self.translatable_widgets["cfg_two_pass_coverage_renorm"] = two_pass_check
+
+        two_pass_sigma_label = ttk.Label(intertile_params_frame, text="")
+        two_pass_sigma_label.grid(row=6, column=0, padx=0, pady=2, sticky="w")
+        self.translatable_widgets["cfg_two_pass_cov_sigma_px"] = two_pass_sigma_label
+        ttk.Spinbox(
+            intertile_params_frame,
+            from_=0,
+            to=512,
+            increment=5,
+            textvariable=self.two_pass_sigma_var,
+            width=8,
+        ).grid(row=6, column=1, padx=(8, 5), pady=2, sticky="w")
+
+        two_pass_gain_label = ttk.Label(intertile_params_frame, text="")
+        two_pass_gain_label.grid(row=7, column=0, padx=0, pady=2, sticky="w")
+        self.translatable_widgets["cfg_two_pass_cov_gain_clip"] = two_pass_gain_label
+        gain_frame = ttk.Frame(intertile_params_frame)
+        gain_frame.grid(row=7, column=1, padx=(8, 5), pady=2, sticky="w")
+        ttk.Spinbox(
+            gain_frame,
+            from_=0.1,
+            to=5.0,
+            increment=0.01,
+            textvariable=self.two_pass_gain_min_var,
+            width=6,
+            format="%.2f",
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Label(gain_frame, text="→").pack(side=tk.LEFT)
+        ttk.Spinbox(
+            gain_frame,
+            from_=0.1,
+            to=5.0,
+            increment=0.01,
+            textvariable=self.two_pass_gain_max_var,
+            width=6,
+            format="%.2f",
+        ).pack(side=tk.LEFT, padx=(4, 0))
 
         asm_opt_row += 1
         center_out_label = ttk.Label(final_assembly_options_frame, text="")
@@ -2099,7 +2181,20 @@ class ZeMosaicGUI:
                 try:
                     current_progress = float(progress_value)
                     current_progress = max(0.0, min(100.0, current_progress))
+                    last_progress = getattr(self, "_last_global_progress", 0.0)
+                    if current_progress < last_progress:
+                        current_progress = last_progress
+                    else:
+                        self._last_global_progress = current_progress
                     self.progress_bar_var.set(current_progress)
+                    if current_progress > 0.0 and getattr(self, "_progress_start_time", None) is None:
+                        self._progress_start_time = time.monotonic()
+                    if current_progress >= 99.9:
+                        self._eta_seconds_smoothed = 0.0
+                        try:
+                            self.eta_var.set("00:00:00")
+                        except tk.TclError:
+                            pass
                 except (ValueError, TypeError) as e_prog:
                     # Utiliser le logger de la classe GUI si disponible, sinon print
                     log_func = getattr(self, 'logger.error', print) if hasattr(self, 'logger') else print
@@ -2178,34 +2273,140 @@ class ZeMosaicGUI:
 
     def on_worker_progress(self, stage: str, current: int, total: int):
         """Handle progress updates for a specific processing stage."""
-        if stage not in self._stage_times:
-            self._stage_times[stage] = {
-                'start': time.monotonic(),
-                'last': time.monotonic(),
-                'steps': []
-            }
-        else:
-            now = time.monotonic()
-            last = self._stage_times[stage]['last']
-            self._stage_times[stage]['steps'].append(now - last)
-            self._stage_times[stage]['last'] = now
+        now = time.monotonic()
+        stage_key = self._stage_aliases.get(stage, stage)
 
-        percent = (current / total * 100.0) if total else 0.0
         try:
-            if hasattr(self, 'progress_bar_var'):
+            current_val = int(current)
+        except (TypeError, ValueError):
+            current_val = 0
+        try:
+            total_val = int(total)
+        except (TypeError, ValueError):
+            total_val = 0
+
+        if total_val < 0:
+            total_val = 0
+        if total_val > 0:
+            current_val = max(0, min(current_val, total_val))
+        else:
+            current_val = max(0, current_val)
+
+        timings = self._stage_times.get(stage_key)
+        if timings is None or current_val <= 1:
+            timings = {
+                "start": now,
+                "last": now,
+                "steps": [],
+                "last_count": current_val,
+            }
+            self._stage_times[stage_key] = timings
+        else:
+            last_count = timings.get("last_count", 0)
+            if current_val > last_count:
+                delta = now - timings.get("last", now)
+                if delta >= 0:
+                    steps = timings.setdefault("steps", [])
+                    steps.append(delta)
+                    if len(steps) > 120:
+                        del steps[: len(steps) - 120]
+                timings["last"] = now
+                timings["last_count"] = current_val
+            else:
+                timings["last"] = now
+                timings["last_count"] = current_val
+
+        if self._progress_start_time is None:
+            self._progress_start_time = now
+
+        stage_weight = self._stage_weights.get(stage_key)
+        if stage_weight is None:
+            percent = (current_val / total_val * 100.0) if total_val else 0.0
+            percent = max(0.0, min(100.0, percent))
+            prior = self._last_global_progress
+            percent = max(prior, percent)
+            self._last_global_progress = percent
+            try:
                 self.progress_bar_var.set(percent)
+            except tk.TclError:
+                pass
+            steps = timings.get("steps") or []
+            if steps and total_val:
+                avg = sum(steps) / len(steps)
+                remaining_steps = max(0, total_val - current_val)
+                remaining = max(0.0, remaining_steps * avg)
+                if self._eta_seconds_smoothed is None:
+                    smoothed_remaining = remaining
+                else:
+                    alpha = 0.3
+                    smoothed_remaining = (alpha * remaining) + ((1 - alpha) * self._eta_seconds_smoothed)
+                self._eta_seconds_smoothed = smoothed_remaining
+                eta_h, eta_rem = divmod(int(smoothed_remaining + 0.5), 3600)
+                eta_m, eta_s = divmod(eta_rem, 60)
+                try:
+                    self.eta_var.set(f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}")
+                except tk.TclError:
+                    pass
+            return
+
+        self._stage_totals[stage_key] = total_val
+        if stage_key in self._stage_order:
+            stage_index = self._stage_order.index(stage_key)
+            for previous_stage in self._stage_order[:stage_index]:
+                if self._stage_progress_values.get(previous_stage, 0.0) < 1.0:
+                    self._stage_progress_values[previous_stage] = 1.0
+
+        stage_fraction = (current_val / float(total_val)) if total_val else 0.0
+        stage_fraction = max(0.0, min(1.0, stage_fraction))
+        self._stage_progress_values[stage_key] = stage_fraction
+
+        global_progress = 0.0
+        for key in self._stage_order:
+            weight = self._stage_weights.get(key, 0.0)
+            if weight <= 0.0:
+                continue
+            fraction = self._stage_progress_values.get(key, 0.0)
+            if fraction <= 0.0:
+                continue
+            if fraction > 1.0:
+                fraction = 1.0
+            global_progress += weight * fraction
+
+        prior_progress = self._last_global_progress
+        global_progress = max(prior_progress, min(100.0, global_progress))
+        self._last_global_progress = global_progress
+
+        try:
+            self.progress_bar_var.set(global_progress)
         except tk.TclError:
             pass
 
-        times = self._stage_times[stage]
-        if times['steps']:
-            avg = sum(times['steps']) / len(times['steps'])
-            remaining = max(0.0, (total - current) * avg)
-            h, rem = divmod(int(remaining), 3600)
-            m, s = divmod(rem, 60)
+        if global_progress >= 99.9:
+            self._eta_seconds_smoothed = 0.0
             try:
-                if hasattr(self, 'eta_var') and self.eta_var:
-                    self.eta_var.set(f"{h:02d}:{m:02d}:{s:02d}")
+                self.eta_var.set("00:00:00")
+            except tk.TclError:
+                pass
+            return
+
+        elapsed = now - self._progress_start_time if self._progress_start_time is not None else 0.0
+        eta_seconds = None
+        if global_progress > 0.0 and elapsed >= 0.0:
+            fraction_complete = max(1e-6, global_progress / 100.0)
+            estimated_total = elapsed / fraction_complete
+            eta_seconds = max(0.0, estimated_total - elapsed)
+
+        if eta_seconds is not None:
+            if self._eta_seconds_smoothed is None:
+                smoothed = eta_seconds
+            else:
+                alpha = 0.3
+                smoothed = (alpha * eta_seconds) + ((1 - alpha) * self._eta_seconds_smoothed)
+            self._eta_seconds_smoothed = smoothed
+            eta_h, eta_rem = divmod(int(smoothed + 0.5), 3600)
+            eta_m, eta_s = divmod(eta_rem, 60)
+            try:
+                self.eta_var.set(f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}")
             except tk.TclError:
                 pass
         
@@ -2507,6 +2708,21 @@ class ZeMosaicGUI:
             self.file_count_var.set("")
         if hasattr(self, "phase_var"):
             self.phase_var.set("")
+        try:
+            self.progress_bar_var.set(0.0)
+        except tk.TclError:
+            pass
+        self._last_global_progress = 0.0
+        self._progress_start_time = None
+        self._eta_seconds_smoothed = None
+        self._stage_times.clear()
+        self._stage_totals.clear()
+        for key in self._stage_order:
+            self._stage_progress_values[key] = 0.0
+        try:
+            self.eta_var.set(self._tr("initial_eta_value", "--:--:--"))
+        except tk.TclError:
+            pass
         self.is_processing = True
         self._cancel_requested = False
         self.launch_button.config(state=tk.DISABLED)
@@ -2550,6 +2766,12 @@ class ZeMosaicGUI:
         ]
         self.config["intertile_robust_clip_sigma"] = float(self.intertile_clip_sigma_var.get())
         self.config["use_auto_intertile"] = bool(self.use_auto_intertile_var.get())
+        self.config["two_pass_coverage_renorm"] = bool(self.two_pass_cov_var.get())
+        self.config["two_pass_cov_sigma_px"] = int(self.two_pass_sigma_var.get())
+        self.config["two_pass_cov_gain_clip"] = [
+            float(self.two_pass_gain_min_var.get()),
+            float(self.two_pass_gain_max_var.get()),
+        ]
         self.config["center_out_normalization_p3"] = bool(self.center_out_normalization_var.get())
         self.config["p3_center_preview_size"] = int(self.p3_center_preview_size_var.get())
         self.config["p3_center_min_overlap_fraction"] = float(self.p3_center_overlap_var.get())
@@ -2561,7 +2783,12 @@ class ZeMosaicGUI:
         # Persist logging level
         self.config["logging_level"] = self.logging_level_var.get()
 
-        self.config["use_gpu_phase5"] = self.use_gpu_phase5_var.get()
+        gpu_phase5_selected = bool(self.use_gpu_phase5_var.get())
+        self.config["use_gpu_phase5"] = gpu_phase5_selected
+        # Propagate the Phase 5 GPU preference to stacking without adding UI controls.
+        # Stacking code checks 'stack_use_gpu' first, then legacy fallbacks.
+        self.config["stack_use_gpu"] = gpu_phase5_selected
+        self.config["use_gpu_stack"] = gpu_phase5_selected
         sel = self.gpu_selector_var.get()
         gpu_id = None
         for disp, idx in self._gpus:
@@ -2646,6 +2873,14 @@ class ZeMosaicGUI:
             ],
             float(self.intertile_clip_sigma_var.get()),
             bool(self.use_auto_intertile_var.get()),
+            bool(self.config.get("match_background_for_final", True)),
+            bool(self.config.get("incremental_feather_parity", False)),
+            bool(self.two_pass_cov_var.get()),
+            int(self.two_pass_sigma_var.get()),
+            [
+                float(self.two_pass_gain_min_var.get()),
+                float(self.two_pass_gain_max_var.get()),
+            ],
             bool(self.center_out_normalization_var.get()),
             [
                 float(self.p3_center_sky_low_var.get()),

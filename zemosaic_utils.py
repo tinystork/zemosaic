@@ -799,12 +799,24 @@ def _rescale_wcs_for_preview(
             if preview_wcs.wcs.crpix is not None and preview_wcs.wcs.crpix.size >= 2:
                 preview_wcs.wcs.crpix[0] = (float(preview_wcs.wcs.crpix[0]) - 0.5) / scale_x + 0.5
                 preview_wcs.wcs.crpix[1] = (float(preview_wcs.wcs.crpix[1]) - 0.5) / scale_y + 0.5
-            if preview_wcs.wcs.cd is not None:
+            # Some WCS instances expose ``cd`` while others rely on ``cdelt``.
+            cd_matrix = None
+            try:
+                cd_matrix = preview_wcs.wcs.cd
+            except (AttributeError, ValueError):
+                cd_matrix = None
+            if cd_matrix is not None:
                 preview_wcs.wcs.cd[0, :] *= scale_x
                 preview_wcs.wcs.cd[1, :] *= scale_y
-            elif preview_wcs.wcs.cdelt is not None:
-                preview_wcs.wcs.cdelt[0] *= scale_x
-                preview_wcs.wcs.cdelt[1] *= scale_y
+            else:
+                cdelt = None
+                try:
+                    cdelt = preview_wcs.wcs.cdelt
+                except (AttributeError, ValueError):
+                    cdelt = None
+                if cdelt is not None:
+                    preview_wcs.wcs.cdelt[0] *= scale_x
+                    preview_wcs.wcs.cdelt[1] *= scale_y
         try:
             preview_wcs.pixel_shape = (int(round(new_w)), int(round(new_h)))
         except Exception:
@@ -2489,22 +2501,10 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
     # Determine background match flag from either name
     match_background = bool(kwargs.get("match_background", kwargs.get("match_bg", False)))
 
-    # Optional parameters for local overlap estimation (defaults align with CPU intent)
-    bg_preview_size = int(kwargs.get("bg_preview_size", 512))
-    bg_preview_size = max(128, min(4096, int(bg_preview_size)))
-    sky_low, sky_high = 30.0, 70.0
-    try:
-        sp = kwargs.get("intertile_sky_percentile")
-        if isinstance(sp, (list, tuple)) and len(sp) >= 2:
-            sky_low = float(sp[0]); sky_high = float(sp[1])
-            if sky_low > sky_high:
-                sky_low, sky_high = sky_high, sky_low
-    except Exception:
-        pass
-    try:
-        robust_clip_sigma = float(kwargs.get("intertile_robust_clip_sigma", 2.5))
-    except Exception:
-        robust_clip_sigma = 2.5
+    # Consume GPU tuning hints for API compatibility (currently unused in V3.2.5 parity path)
+    _ = kwargs.get("bg_preview_size", 512)
+    _ = kwargs.get("intertile_sky_percentile")
+    _ = kwargs.get("intertile_robust_clip_sigma", 2.5)
 
     float32_bytes = np.dtype(np.float32).itemsize
 
@@ -2523,65 +2523,6 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
         except Exception:
             tile_affine = None
 
-    # If an affine (gain/offset) is provided and is non-trivial for any tile,
-    # disable additional background matching to avoid double-offset correction.
-    try:
-        if tile_affine is not None:
-            has_nontrivial_affine = any((g != 1.0) or (o != 0.0) for (g, o) in tile_affine)
-            if has_nontrivial_affine and match_background:
-                import logging
-                logging.getLogger(__name__).debug(
-                    "[GPU Reproj] Disabling match_background because tile_affine_corrections are provided."
-                )
-                match_background = False
-    except Exception:
-        pass
-
-    # When affine corrections are present, align per-tile medians to a global median
-    # computed after applying the affine. This mirrors the CPU path where tiles are
-    # effectively brought to a common baseline before coaddition.
-    tile_scale_factors: list[float] | None = None
-    try:
-        if tile_affine is not None:
-            med_list: list[float] = []
-            for idx_tile, img_np in enumerate(data_list):
-                try:
-                    g, o = tile_affine[idx_tile]
-                except Exception:
-                    g, o = 1.0, 0.0
-                try:
-                    arr32 = np.asarray(img_np, dtype=np.float32)
-                    # median of affine-applied values on CPU for robustness
-                    med = float(np.nanmedian(arr32 * g + o))
-                except Exception:
-                    med = float("nan")
-                med_list.append(med)
-
-            # Compute global median of tile medians
-            try:
-                finite_meds = [m for m in med_list if np.isfinite(m)]
-                global_median = float(np.nanmedian(finite_meds)) if finite_meds else 0.0
-            except Exception:
-                global_median = 0.0
-
-            # Build multiplicative scale to anchor each tile to the common median
-            tile_scale_factors = []
-            for m in med_list:
-                if np.isfinite(m) and abs(m) > 1e-8:
-                    tile_scale_factors.append(float(global_median / m))
-                else:
-                    tile_scale_factors.append(1.0)
-            try:
-                import logging
-                logging.getLogger(__name__).debug(
-                    "[GPU Reproj] Applied median renormalization: global_median=%.6g",
-                    global_median,
-                )
-            except Exception:
-                pass
-    except Exception:
-        tile_scale_factors = None
-    
     # Estimate the minimum amount of memory required just for the accumulators.
     accumulator_bytes = 2 * H * W * float32_bytes
     # Leave some breathing room for temporary buffers; require at least double the
@@ -2592,8 +2533,6 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
     # Prepare output accumulators on GPU
     mosaic_sum_gpu = cp.zeros((H, W), dtype=cp.float32)
     weight_sum_gpu = cp.zeros((H, W), dtype=cp.float32)
-    tile_offsets: list[float] = [0.0] * n_inputs
-
     # Row-chunking to bound memory; tune based on device memory
     rows_per_chunk = int(kwargs.get("rows_per_chunk", 64))
     rows_per_chunk = max(32, min(rows_per_chunk, H))
@@ -2616,130 +2555,6 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
     # Build an x-grid once (NumPy on CPU) and reuse
     x_grid = cp.asarray(cp.arange(W, dtype=cp.float32))  # cp.arange works well; stays on GPU when meshed
 
-    # If requested, estimate per-tile additive offsets from overlaps on a coarse grid
-    if match_background and reproject_interp is not None and ASTROPY_AVAILABLE_IN_UTILS and n_inputs >= 2:
-        try:
-            from astropy.wcs import WCS as _WCS
-            # Derive a reduced-resolution WCS for coarse reprojection
-            header_full = output_wcs.to_header() if hasattr(output_wcs, "to_header") else output_wcs
-            # Compute aspect-preserving coarse shape
-            h_full = int(H); w_full = int(W)
-            max_dim = max(h_full, w_full)
-            scale = max(1, int(round(max_dim / float(bg_preview_size))))
-            hc = max(16, int(round(h_full / float(scale))))
-            wc = max(16, int(round(w_full / float(scale))))
-            header = header_full.copy()
-            # Adjust NAXIS and CRPIX to maintain geometry
-            header["NAXIS1"] = wc
-            header["NAXIS2"] = hc
-            if "CRPIX1" in header:
-                header["CRPIX1"] = float(header["CRPIX1"]) / scale
-            if "CRPIX2" in header:
-                header["CRPIX2"] = float(header["CRPIX2"]) / scale
-            coarse_wcs = _WCS(header)
-
-            # Coarse reprojection for each tile (CPU reproject for robustness)
-            coarse_imgs: list[np.ndarray] = []
-            coarse_masks: list[np.ndarray] = []
-            for arr_np, wcs_in in zip(data_list, wcs_list):
-                try:
-                    arr32 = np.asarray(arr_np, dtype=np.float32)
-                    reproj, footprint = reproject_interp((arr32, wcs_in), coarse_wcs, shape_out=(hc, wc))
-                    img_c = np.asarray(reproj, dtype=np.float32)
-                    m = np.asarray(footprint > 0, dtype=bool)
-                    # Erode mask to avoid edge bias and ringing
-                    def _erode_bool(mask: np.ndarray, iterations: int = 2) -> np.ndarray:
-                        it = max(1, int(iterations))
-                        out = mask.astype(bool, copy=True)
-                        for _ in range(it):
-                            pad = np.pad(out, 1, constant_values=False)
-                            nb = pad[0:-2, 0:-2] & pad[0:-2, 1:-1] & pad[0:-2, 2:] & \
-                                 pad[1:-1, 0:-2] & pad[1:-1, 1:-1] & pad[1:-1, 2:] & \
-                                 pad[2:  , 0:-2] & pad[2:  , 1:-1] & pad[2:  , 2:]
-                            out = nb
-                        return out
-                    # 2 iterations on coarse grid is inexpensive and robust
-                    m = _erode_bool(m, iterations=2)
-                    coarse_imgs.append(img_c)
-                    coarse_masks.append(m)
-                except Exception:
-                    coarse_imgs.append(np.zeros((hc, wc), dtype=np.float32))
-                    coarse_masks.append(np.zeros((hc, wc), dtype=bool))
-
-            # Build pairwise equations a_j - a_i ~= median(delta_ij in sky region)
-            rows = []  # each row: (-1 at i, +1 at j)
-            rhs = []   # median differences
-            weights = []  # weight by overlap pixels
-            pair_count = 0
-            diffs_abs = []
-            for i in range(n_inputs):
-                for j in range(i + 1, n_inputs):
-                    m = coarse_masks[i] & coarse_masks[j]
-                    if not np.any(m):
-                        continue
-                    vi = coarse_imgs[i][m]
-                    vj = coarse_imgs[j][m]
-                    if vi.size < 64:
-                        continue
-                    # Select sky-like subset via percentiles on the mid value
-                    sky_proxy = 0.5 * (vi + vj)
-                    try:
-                        p_lo = np.nanpercentile(sky_proxy, sky_low)
-                        p_hi = np.nanpercentile(sky_proxy, sky_high)
-                        mask_sky = (sky_proxy >= p_lo) & (sky_proxy <= p_hi)
-                        if np.count_nonzero(mask_sky) >= 32:
-                            vi = vi[mask_sky]; vj = vj[mask_sky]
-                    except Exception:
-                        pass
-                    if vi.size < 16:
-                        continue
-                    diff = (vj - vi)
-                    # Robust center with sigma clip
-                    d_med = float(np.nanmedian(diff))
-                    try:
-                        d_std = float(np.nanstd(diff))
-                        if np.isfinite(d_std) and d_std > 0 and robust_clip_sigma > 0:
-                            keep = np.abs(diff - d_med) <= (robust_clip_sigma * d_std)
-                            if np.count_nonzero(keep) >= 8:
-                                diff = diff[keep]
-                                d_med = float(np.nanmedian(diff))
-                    except Exception:
-                        pass
-                    w = max(1.0, float(diff.size))
-                    row = np.zeros(n_inputs, dtype=np.float64)
-                    row[i] = -1.0; row[j] = 1.0
-                    rows.append(row)
-                    rhs.append(d_med)
-                    weights.append(w)
-                    diffs_abs.append(abs(d_med))
-                    pair_count += 1
-
-            if rows:
-                A = np.vstack(rows)
-                b = np.asarray(rhs, dtype=np.float64)
-                w = np.sqrt(np.asarray(weights, dtype=np.float64))
-                Aw = A * w[:, None]
-                bw = b * w
-                # Anchor first tile to zero to resolve degeneracy
-                reg = np.zeros((1, n_inputs)); reg[0, 0] = 1.0
-                Aw = np.vstack([Aw, reg])
-                bw = np.concatenate([bw, np.array([0.0])])
-                try:
-                    sol, *_ = np.linalg.lstsq(Aw, bw, rcond=None)
-                    tile_offsets = [float(x) for x in sol]
-                    import logging
-                    logging.getLogger(__name__).debug(
-                        "[GPU Reproj] Overlap pairs=%d, median|delta|=%.4g; offsets per tile: %s",
-                        int(pair_count),
-                        (float(np.median(diffs_abs)) if diffs_abs else 0.0),
-                        ", ".join(f"{v:+.4g}" for v in tile_offsets),
-                    )
-                except Exception:
-                    tile_offsets = [0.0] * n_inputs
-        except Exception:
-            # Fallback: leave offsets at zero; final baseline handling below keeps output stable
-            pass
-
     # Iterate over tiles
     for idx_tile, (img_np, tile_wcs) in enumerate(zip(data_list, wcs_list)):
         # Basic input validation and convert to float32 without NaN side-effects
@@ -2756,27 +2571,16 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
             except Exception:
                 pass
 
-        # After affine, optionally scale tile to align its median to the global median
-        if tile_scale_factors is not None:
-            try:
-                s = tile_scale_factors[idx_tile]
-                if s != 1.0 and np.isfinite(s):
-                    img = img * cp.float32(s)
-            except Exception:
-                pass
         if match_background:
-            # Subtract overlap-derived additive offset if available; otherwise fallback to tile median
-            offset_val = 0.0
+            # Mirror CPU behaviour: subtract the per-tile median after affine correction.
             try:
-                offset_val = float(tile_offsets[idx_tile])
+                offset_val = float(cp.nanmedian(img).get())
             except Exception:
-                offset_val = 0.0
-            if offset_val == 0.0:
                 try:
-                    offset_val = float(cp.nanmedian(img).get())
+                    offset_val = float(np.nanmedian(cp.asnumpy(img)))
                 except Exception:
                     offset_val = 0.0
-            if offset_val != 0.0:
+            if offset_val != 0.0 and np.isfinite(offset_val):
                 img = img - cp.float32(offset_val)
 
         # Valid mask (1 for finite pixels, 0 otherwise); used for coverage and weighted mean

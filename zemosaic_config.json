@@ -21,6 +21,12 @@
     "gpu_id_phase5": 0,
     "gpu_selector": "NVIDIA GeForce RTX 3070 Laptop GPU",
     "final_assembly_method": "reproject_coadd",
+    "two_pass_coverage_renorm": true,
+    "two_pass_cov_sigma_px": 50,
+    "two_pass_cov_gain_clip": [
+        0.85,
+        1.18
+    ],
     "solver_method": "ansvr",
     "astrometry_local_path": "",
     "astrometry_api_key": "",
@@ -51,6 +57,8 @@
     ],
     "intertile_robust_clip_sigma": 2.5,
     "use_auto_intertile": true,
+    "match_background_for_final": true,
+    "incremental_feather_parity": false,
     "enable_early_filter": true,
     "apply_master_tile_crop": true,
     "master_tile_crop_percent": 18.0,
