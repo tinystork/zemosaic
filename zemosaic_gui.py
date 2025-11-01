@@ -293,6 +293,30 @@ class ZeMosaicGUI:
         self._chrono_start_time = None
         self._chrono_after_id = None
         self._stage_times = {}
+        self._stage_aliases = {
+            "phase1_scan": "phase1",
+            "phase2_cluster": "phase2",
+            "phase3_master_tiles": "phase3",
+            "phase4_grid": "phase4",
+            "phase5_intertile": "phase5",
+            "phase5_incremental": "phase5",
+            "phase5_reproject": "phase5",
+        }
+        self._stage_order = ["phase1", "phase2", "phase3", "phase4", "phase5", "phase6", "phase7"]
+        self._stage_weights = {
+            "phase1": 30.0,
+            "phase2": 5.0,
+            "phase3": 35.0,
+            "phase4": 5.0,
+            "phase5": 15.0,
+            "phase6": 8.0,
+            "phase7": 2.0,
+        }
+        self._stage_progress_values = {key: 0.0 for key in self._stage_order}
+        self._stage_totals = {}
+        self._progress_start_time = None
+        self._last_global_progress = 0.0
+        self._eta_seconds_smoothed = None
         # Last filter outcomes to forward to worker (overrides + optional header list)
         self._last_filter_overrides = None
         self._last_filtered_header_items = None
@@ -2157,7 +2181,20 @@ class ZeMosaicGUI:
                 try:
                     current_progress = float(progress_value)
                     current_progress = max(0.0, min(100.0, current_progress))
+                    last_progress = getattr(self, "_last_global_progress", 0.0)
+                    if current_progress < last_progress:
+                        current_progress = last_progress
+                    else:
+                        self._last_global_progress = current_progress
                     self.progress_bar_var.set(current_progress)
+                    if current_progress > 0.0 and getattr(self, "_progress_start_time", None) is None:
+                        self._progress_start_time = time.monotonic()
+                    if current_progress >= 99.9:
+                        self._eta_seconds_smoothed = 0.0
+                        try:
+                            self.eta_var.set("00:00:00")
+                        except tk.TclError:
+                            pass
                 except (ValueError, TypeError) as e_prog:
                     # Utiliser le logger de la classe GUI si disponible, sinon print
                     log_func = getattr(self, 'logger.error', print) if hasattr(self, 'logger') else print
@@ -2236,34 +2273,140 @@ class ZeMosaicGUI:
 
     def on_worker_progress(self, stage: str, current: int, total: int):
         """Handle progress updates for a specific processing stage."""
-        if stage not in self._stage_times:
-            self._stage_times[stage] = {
-                'start': time.monotonic(),
-                'last': time.monotonic(),
-                'steps': []
-            }
-        else:
-            now = time.monotonic()
-            last = self._stage_times[stage]['last']
-            self._stage_times[stage]['steps'].append(now - last)
-            self._stage_times[stage]['last'] = now
+        now = time.monotonic()
+        stage_key = self._stage_aliases.get(stage, stage)
 
-        percent = (current / total * 100.0) if total else 0.0
         try:
-            if hasattr(self, 'progress_bar_var'):
+            current_val = int(current)
+        except (TypeError, ValueError):
+            current_val = 0
+        try:
+            total_val = int(total)
+        except (TypeError, ValueError):
+            total_val = 0
+
+        if total_val < 0:
+            total_val = 0
+        if total_val > 0:
+            current_val = max(0, min(current_val, total_val))
+        else:
+            current_val = max(0, current_val)
+
+        timings = self._stage_times.get(stage_key)
+        if timings is None or current_val <= 1:
+            timings = {
+                "start": now,
+                "last": now,
+                "steps": [],
+                "last_count": current_val,
+            }
+            self._stage_times[stage_key] = timings
+        else:
+            last_count = timings.get("last_count", 0)
+            if current_val > last_count:
+                delta = now - timings.get("last", now)
+                if delta >= 0:
+                    steps = timings.setdefault("steps", [])
+                    steps.append(delta)
+                    if len(steps) > 120:
+                        del steps[: len(steps) - 120]
+                timings["last"] = now
+                timings["last_count"] = current_val
+            else:
+                timings["last"] = now
+                timings["last_count"] = current_val
+
+        if self._progress_start_time is None:
+            self._progress_start_time = now
+
+        stage_weight = self._stage_weights.get(stage_key)
+        if stage_weight is None:
+            percent = (current_val / total_val * 100.0) if total_val else 0.0
+            percent = max(0.0, min(100.0, percent))
+            prior = self._last_global_progress
+            percent = max(prior, percent)
+            self._last_global_progress = percent
+            try:
                 self.progress_bar_var.set(percent)
+            except tk.TclError:
+                pass
+            steps = timings.get("steps") or []
+            if steps and total_val:
+                avg = sum(steps) / len(steps)
+                remaining_steps = max(0, total_val - current_val)
+                remaining = max(0.0, remaining_steps * avg)
+                if self._eta_seconds_smoothed is None:
+                    smoothed_remaining = remaining
+                else:
+                    alpha = 0.3
+                    smoothed_remaining = (alpha * remaining) + ((1 - alpha) * self._eta_seconds_smoothed)
+                self._eta_seconds_smoothed = smoothed_remaining
+                eta_h, eta_rem = divmod(int(smoothed_remaining + 0.5), 3600)
+                eta_m, eta_s = divmod(eta_rem, 60)
+                try:
+                    self.eta_var.set(f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}")
+                except tk.TclError:
+                    pass
+            return
+
+        self._stage_totals[stage_key] = total_val
+        if stage_key in self._stage_order:
+            stage_index = self._stage_order.index(stage_key)
+            for previous_stage in self._stage_order[:stage_index]:
+                if self._stage_progress_values.get(previous_stage, 0.0) < 1.0:
+                    self._stage_progress_values[previous_stage] = 1.0
+
+        stage_fraction = (current_val / float(total_val)) if total_val else 0.0
+        stage_fraction = max(0.0, min(1.0, stage_fraction))
+        self._stage_progress_values[stage_key] = stage_fraction
+
+        global_progress = 0.0
+        for key in self._stage_order:
+            weight = self._stage_weights.get(key, 0.0)
+            if weight <= 0.0:
+                continue
+            fraction = self._stage_progress_values.get(key, 0.0)
+            if fraction <= 0.0:
+                continue
+            if fraction > 1.0:
+                fraction = 1.0
+            global_progress += weight * fraction
+
+        prior_progress = self._last_global_progress
+        global_progress = max(prior_progress, min(100.0, global_progress))
+        self._last_global_progress = global_progress
+
+        try:
+            self.progress_bar_var.set(global_progress)
         except tk.TclError:
             pass
 
-        times = self._stage_times[stage]
-        if times['steps']:
-            avg = sum(times['steps']) / len(times['steps'])
-            remaining = max(0.0, (total - current) * avg)
-            h, rem = divmod(int(remaining), 3600)
-            m, s = divmod(rem, 60)
+        if global_progress >= 99.9:
+            self._eta_seconds_smoothed = 0.0
             try:
-                if hasattr(self, 'eta_var') and self.eta_var:
-                    self.eta_var.set(f"{h:02d}:{m:02d}:{s:02d}")
+                self.eta_var.set("00:00:00")
+            except tk.TclError:
+                pass
+            return
+
+        elapsed = now - self._progress_start_time if self._progress_start_time is not None else 0.0
+        eta_seconds = None
+        if global_progress > 0.0 and elapsed >= 0.0:
+            fraction_complete = max(1e-6, global_progress / 100.0)
+            estimated_total = elapsed / fraction_complete
+            eta_seconds = max(0.0, estimated_total - elapsed)
+
+        if eta_seconds is not None:
+            if self._eta_seconds_smoothed is None:
+                smoothed = eta_seconds
+            else:
+                alpha = 0.3
+                smoothed = (alpha * eta_seconds) + ((1 - alpha) * self._eta_seconds_smoothed)
+            self._eta_seconds_smoothed = smoothed
+            eta_h, eta_rem = divmod(int(smoothed + 0.5), 3600)
+            eta_m, eta_s = divmod(eta_rem, 60)
+            try:
+                self.eta_var.set(f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}")
             except tk.TclError:
                 pass
         
@@ -2565,6 +2708,21 @@ class ZeMosaicGUI:
             self.file_count_var.set("")
         if hasattr(self, "phase_var"):
             self.phase_var.set("")
+        try:
+            self.progress_bar_var.set(0.0)
+        except tk.TclError:
+            pass
+        self._last_global_progress = 0.0
+        self._progress_start_time = None
+        self._eta_seconds_smoothed = None
+        self._stage_times.clear()
+        self._stage_totals.clear()
+        for key in self._stage_order:
+            self._stage_progress_values[key] = 0.0
+        try:
+            self.eta_var.set(self._tr("initial_eta_value", "--:--:--"))
+        except tk.TclError:
+            pass
         self.is_processing = True
         self._cancel_requested = False
         self.launch_button.config(state=tk.DISABLED)

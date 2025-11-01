@@ -2187,9 +2187,6 @@ def reproject_tile_to_mosaic(
         return None, None, (0, 0, 0, 0)
     n_channels = data.shape[-1]
 
-    # Assurer une base numérique propre (float32 + NaN vers valeur neutre)
-    np.nan_to_num(data, copy=False, nan=nan_fill_value, posinf=nan_fill_value, neginf=nan_fill_value)
-
     if gain is None or offset is None:
         if tile_affine is not None:
             try:
@@ -2313,10 +2310,17 @@ def reproject_tile_to_mosaic(
                 med_c = np.nanmedian(channel_view[valid])
                 if np.isfinite(med_c):
                     channel_view -= med_c
-            # Contraindre les NaN générés par la soustraction
-            np.nan_to_num(reproj_img, copy=False, nan=0.0)
         except Exception:
             pass
+
+    if nan_fill_value is not None:
+        np.nan_to_num(
+            reproj_img,
+            copy=False,
+            nan=nan_fill_value,
+            posinf=nan_fill_value,
+            neginf=nan_fill_value,
+        )
     if enforce_positive:
         np.clip(reproj_img, 0.0, None, out=reproj_img)
 
@@ -4394,18 +4398,15 @@ def assemble_final_mosaic_reproject_coadd(
     total_tiles_for_prep = len(master_tile_fits_with_wcs_list)
     for idx, (tile_path, tile_wcs) in enumerate(master_tile_fits_with_wcs_list, 1):
         with fits.open(tile_path, memmap=False) as hdul:
-            raw_data = hdul[0].data
+            data = hdul[0].data.astype(np.float32)
 
-        try:
-            data = _ensure_hwc_master_tile(raw_data, os.path.basename(tile_path))
-        except ValueError:
-            _pcb(
-                "assemble_warn_intertile_photometric_failed",
-                prog=None,
-                lvl="WARN",
-                error=f"invalid_shape:{os.path.basename(tile_path)}",
-            )
-            continue
+        # Master tiles saved via ``save_fits_image`` use the ``HWC`` axis order
+        # which stores color images in ``C x H x W`` within the FITS file. When
+        # reading them back for final assembly we expect ``H x W x C``.
+        if data.ndim == 3 and data.shape[0] in (1, 3) and data.shape[-1] != data.shape[0]:
+            data = np.moveaxis(data, 0, -1)
+        if data.ndim == 2:
+            data = data[..., np.newaxis]
 
         if (
             apply_crop
@@ -4781,7 +4782,7 @@ def _load_master_tiles_for_two_pass(
             continue
         try:
             with fits.open(tile_path, memmap=False) as hdul:
-                raw_data = hdul[0].data
+                data = hdul[0].data.astype(np.float32)
         except Exception as exc:
             if logger:
                 logger.warning(
@@ -4790,15 +4791,10 @@ def _load_master_tiles_for_two_pass(
                     exc,
                 )
             continue
-        try:
-            data = _ensure_hwc_master_tile(raw_data, os.path.basename(tile_path))
-        except ValueError:
-            if logger:
-                logger.warning(
-                    "[TwoPass] Skipping tile with unexpected shape: %s",
-                    os.path.basename(tile_path),
-                )
-            continue
+        if data.ndim == 3 and data.shape[0] in (1, 3) and data.shape[-1] != data.shape[0]:
+            data = np.moveaxis(data, 0, -1)
+        if data.ndim == 2:
+            data = data[..., np.newaxis]
         current_wcs = tile_wcs
         if (
             apply_crop
@@ -7302,7 +7298,7 @@ def run_hierarchical_mosaic(
                     final_output_shape_hw=final_output_shape_hw,
                     progress_callback=progress_callback,
                     n_channels=3,
-                    match_bg=match_background_flag,
+                    match_bg=True,
                     apply_crop=apply_crop_for_assembly,
                     crop_percent=master_tile_crop_percent_config,
                     use_gpu=True,
@@ -7325,7 +7321,7 @@ def run_hierarchical_mosaic(
                     final_output_shape_hw=final_output_shape_hw,
                     progress_callback=progress_callback,
                     n_channels=3,
-                    match_bg=match_background_flag,
+                    match_bg=True,
                     apply_crop=apply_crop_for_assembly,
                     crop_percent=master_tile_crop_percent_config,
                     use_gpu=False,
@@ -7350,7 +7346,7 @@ def run_hierarchical_mosaic(
                 final_output_shape_hw=final_output_shape_hw,
                 progress_callback=progress_callback,
                 n_channels=3,
-                match_bg=match_background_flag,
+                match_bg=True,
                 apply_crop=apply_crop_for_assembly,
                 crop_percent=master_tile_crop_percent_config,
                 use_gpu=use_gpu_phase5_flag,
@@ -7464,7 +7460,7 @@ def run_hierarchical_mosaic(
         try: final_header.update(final_output_wcs.to_header(relax=True))
         except Exception as e_hdr_wcs: pcb("run_warn_phase6_wcs_to_header_failed", error=str(e_hdr_wcs), lvl="WARN")
     
-    final_header['SOFTWARE']=('ZeMosaic v3.2.5','Mosaic Software') # Incrémente la version 
+    final_header['SOFTWARE']=('ZeMosaic v3.2.6','Mosaic Software') # Incrémente la version 
     final_header['NMASTILE']=(len(master_tiles_results_list),"Master Tiles combined")
     final_header['NRAWINIT']=(num_total_raw_files,"Initial raw images found")
     final_header['NRAWPROC']=(len(all_raw_files_processed_info),"Raw images with WCS processed")

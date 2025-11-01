@@ -799,12 +799,24 @@ def _rescale_wcs_for_preview(
             if preview_wcs.wcs.crpix is not None and preview_wcs.wcs.crpix.size >= 2:
                 preview_wcs.wcs.crpix[0] = (float(preview_wcs.wcs.crpix[0]) - 0.5) / scale_x + 0.5
                 preview_wcs.wcs.crpix[1] = (float(preview_wcs.wcs.crpix[1]) - 0.5) / scale_y + 0.5
-            if preview_wcs.wcs.cd is not None:
+            # Some WCS instances expose ``cd`` while others rely on ``cdelt``.
+            cd_matrix = None
+            try:
+                cd_matrix = preview_wcs.wcs.cd
+            except (AttributeError, ValueError):
+                cd_matrix = None
+            if cd_matrix is not None:
                 preview_wcs.wcs.cd[0, :] *= scale_x
                 preview_wcs.wcs.cd[1, :] *= scale_y
-            elif preview_wcs.wcs.cdelt is not None:
-                preview_wcs.wcs.cdelt[0] *= scale_x
-                preview_wcs.wcs.cdelt[1] *= scale_y
+            else:
+                cdelt = None
+                try:
+                    cdelt = preview_wcs.wcs.cdelt
+                except (AttributeError, ValueError):
+                    cdelt = None
+                if cdelt is not None:
+                    preview_wcs.wcs.cdelt[0] *= scale_x
+                    preview_wcs.wcs.cdelt[1] *= scale_y
         try:
             preview_wcs.pixel_shape = (int(round(new_w)), int(round(new_h)))
         except Exception:
