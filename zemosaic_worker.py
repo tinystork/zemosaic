@@ -129,6 +129,213 @@ def _ensure_hwc_master_tile(
 
     return np.asarray(arr, dtype=np.float32, order="C")
 
+
+@dataclass
+class _TileAffineSource:
+    """Container for intertile photometric calibration inputs."""
+
+    path: str | None
+    wcs: Any
+    data: np.ndarray | None = None
+
+
+def _sanitize_affine_corrections(
+    raw_corrections: Any,
+    total_tiles: int,
+) -> tuple[list[tuple[float, float]] | None, bool]:
+    """Normalize gain/offset pairs and detect non-trivial entries."""
+
+    if raw_corrections is None:
+        return None, False
+
+    sanitized: list[tuple[float, float]] = []
+    nontrivial = False
+
+    for idx in range(max(total_tiles, 0)):
+        if isinstance(raw_corrections, dict):
+            candidate = raw_corrections.get(idx, (1.0, 0.0))
+        else:
+            try:
+                candidate = raw_corrections[idx]
+            except (IndexError, TypeError):
+                candidate = (1.0, 0.0)
+
+        try:
+            gain_val = float(candidate[0])
+        except Exception:
+            gain_val = 1.0
+        try:
+            offset_val = float(candidate[1])
+        except Exception:
+            offset_val = 0.0
+
+        if not np.isfinite(gain_val):
+            gain_val = 1.0
+        if not np.isfinite(offset_val):
+            offset_val = 0.0
+
+        if not nontrivial and (abs(gain_val - 1.0) > 1e-6 or abs(offset_val) > 1e-6):
+            nontrivial = True
+
+        sanitized.append((gain_val, offset_val))
+
+    if not sanitized:
+        return None, False
+
+    return sanitized, nontrivial
+
+
+def _select_affine_log_indices(
+    affine_list: list[tuple[float, float]] | None,
+) -> set[int]:
+    """Pick representative tile indices (1-based) for logging."""
+
+    if not affine_list:
+        return set()
+
+    nontrivial_indices = [
+        idx + 1
+        for idx, (gain_val, offset_val) in enumerate(affine_list)
+        if abs(gain_val - 1.0) > 1e-6 or abs(offset_val) > 1e-6
+    ]
+    if not nontrivial_indices:
+        return set()
+
+    sample_span = max(1, len(nontrivial_indices) // 4)
+    selected = set(nontrivial_indices[::sample_span])
+    selected.add(nontrivial_indices[0])
+    selected.add(nontrivial_indices[-1])
+    return selected
+
+
+def _compute_intertile_affine_corrections_from_sources(
+    sources: list[_TileAffineSource],
+    final_output_wcs,
+    final_output_shape_hw: tuple[int, int],
+    preview_size: int,
+    min_overlap_fraction: float,
+    sky_percentile: tuple[float, float] | list[float],
+    robust_clip_sigma: float,
+    use_auto_intertile: bool,
+    logger_obj=None,
+    progress_callback: Callable | None = None,
+) -> tuple[list[tuple[float, float]] | None, bool, str, str | None]:
+    """Common implementation for intertile gain/offset computation.
+
+    Returns
+    -------
+    (list[(gain, offset)] | None, bool, str, str | None)
+        Sanitized affine list (or ``None``), flag indicating whether non-trivial
+        corrections were detected, status string (``\"ok\"``, ``\"skipped\"``,
+        ``\"preview_failed\"``, ``\"compute_failed\"``) and optional error message.
+    """
+
+    total_tiles = len(sources)
+    if total_tiles < 2:
+        return None, False, "skipped", None
+
+    if not (
+        ZEMOSAIC_UTILS_AVAILABLE
+        and hasattr(zemosaic_utils, "compute_intertile_affine_calibration")
+    ):
+        return None, False, "skipped", None
+
+    preview_entries: list[tuple[np.ndarray, Any]] = []
+
+    for idx, src in enumerate(sources, 1):
+        try:
+            tile_arr: np.ndarray
+            if src.data is not None:
+                tile_arr = _ensure_hwc_master_tile(
+                    src.data,
+                    os.path.basename(src.path) if src.path else None,
+                )
+                tile_arr = np.array(tile_arr, copy=True)
+            else:
+                if not src.path:
+                    raise ValueError("Tile data missing and no path provided.")
+                with fits.open(src.path, memmap=False) as hdul:
+                    tile_arr = _ensure_hwc_master_tile(
+                        hdul[0].data,
+                        os.path.basename(src.path),
+                    )
+            tile_arr = np.asarray(tile_arr, dtype=np.float32, order="C")
+
+            preview_arr = None
+            preview_wcs = None
+            if (
+                ZEMOSAIC_UTILS_AVAILABLE
+                and hasattr(zemosaic_utils, "create_downscaled_luminance_preview")
+            ):
+                try:
+                    preview_arr, preview_wcs = zemosaic_utils.create_downscaled_luminance_preview(
+                        tile_arr,
+                        src.wcs,
+                        preview_size=preview_size,
+                    )
+                except Exception:
+                    preview_arr, preview_wcs = None, None
+
+            if preview_arr is None:
+                luminance = tile_arr
+                if luminance.ndim == 3 and luminance.shape[-1] > 1:
+                    luminance = np.nanmean(luminance, axis=-1)
+                elif luminance.ndim == 3:
+                    luminance = luminance[..., 0]
+                luminance = np.asarray(np.squeeze(luminance), dtype=np.float32)
+                np.nan_to_num(luminance, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+                preview_arr = luminance
+
+            if preview_wcs is None:
+                preview_wcs = src.wcs
+
+            preview_entries.append(
+                (np.asarray(preview_arr, dtype=np.float32, order="C"), preview_wcs)
+            )
+        except Exception as exc:
+            if logger_obj:
+                logger_obj.warning(
+                    "Intertile preview failed for %s: %s",
+                    src.path or f"tile#{idx}",
+                    exc,
+                )
+                logger_obj.debug("Traceback (preview failure):", exc_info=True)
+            preview_entries.clear()
+            return None, False, "preview_failed", str(exc)
+        finally:
+            if progress_callback:
+                try:
+                    progress_callback("phase5_intertile", idx, total_tiles)
+                except Exception:
+                    pass
+
+    try:
+        corrections = zemosaic_utils.compute_intertile_affine_calibration(
+            preview_entries,
+            final_output_wcs,
+            final_output_shape_hw,
+            preview_size=preview_size,
+            min_overlap_fraction=min_overlap_fraction,
+            sky_percentile=sky_percentile,
+            robust_clip_sigma=robust_clip_sigma,
+            use_auto_intertile=use_auto_intertile,
+            logger=logger_obj,
+            progress_callback=progress_callback,
+        )
+    except Exception as exc:
+        if logger_obj:
+            logger_obj.warning(
+                "Intertile photometric calibration failed: %s",
+                exc,
+            )
+            logger_obj.debug("Traceback (intertile failure):", exc_info=True)
+        return None, False, "compute_failed", str(exc)
+    finally:
+        preview_entries.clear()
+
+    sanitized, nontrivial = _sanitize_affine_corrections(corrections, total_tiles)
+    return sanitized, nontrivial, "ok", None
+
 def cluster_seestar_stacks_connected(
     all_raw_files_with_info: list,
     stack_threshold_deg: float,
@@ -3593,33 +3800,12 @@ def assemble_final_mosaic_incremental(
     )
 
     pending_affine_list: list[tuple[float, float]] | None = None
+    nontrivial_detected = False
     if tile_affine_corrections:
-        sanitized_affine: list[tuple[float, float]] = []
-        nontrivial_detected = False
-        for entry in tile_affine_corrections:
-            try:
-                gain_val, offset_val = entry
-            except Exception:
-                gain_val, offset_val = 1.0, 0.0
-            try:
-                gain_val = float(gain_val)
-            except Exception:
-                gain_val = 1.0
-            try:
-                offset_val = float(offset_val)
-            except Exception:
-                offset_val = 0.0
-            if not np.isfinite(gain_val):
-                gain_val = 1.0
-            if not np.isfinite(offset_val):
-                offset_val = 0.0
-            if not nontrivial_detected and (
-                abs(gain_val - 1.0) > 1e-6 or abs(offset_val) > 1e-6
-            ):
-                nontrivial_detected = True
-            sanitized_affine.append((gain_val, offset_val))
-        if sanitized_affine:
-            pending_affine_list = sanitized_affine
+        pending_affine_list, nontrivial_detected = _sanitize_affine_corrections(
+            tile_affine_corrections,
+            len(master_tile_fits_with_wcs_list),
+        )
 
     use_feather = bool(use_radial_feather) if use_radial_feather is not None else False
     parity_mode = bool(intertile_photometric_match and match_background and feather_parity)
@@ -3723,115 +3909,42 @@ def assemble_final_mosaic_incremental(
             lvl="INFO",
             num_tiles=total_tiles,
         )
-        preview_entries: list[tuple[np.ndarray, object]] = []
-        preview_failed = False
-        for idx, (tile_path, tile_wcs) in enumerate(master_tile_fits_with_wcs_list, 1):
-            try:
-                with fits.open(tile_path, memmap=False) as hdul:
-                    tile_data = hdul[0].data
-                tile_arr = _ensure_hwc_master_tile(tile_data, os.path.basename(tile_path))
-                np.nan_to_num(tile_arr, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-                try:
-                    preview_arr, preview_wcs = zemosaic_utils.create_downscaled_luminance_preview(
-                        tile_arr,
-                        tile_wcs,
-                        preview_size=intertile_preview_size,
-                    )
-                except Exception:
-                    preview_arr, preview_wcs = None, None
-                if preview_arr is None:
-                    luminance = tile_arr
-                    if luminance.ndim == 3 and luminance.shape[-1] > 1:
-                        luminance = np.nanmean(luminance, axis=-1)
-                    elif luminance.ndim == 3:
-                        luminance = luminance[..., 0]
-                    luminance = np.asarray(np.squeeze(luminance), dtype=np.float32)
-                    np.nan_to_num(luminance, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-                    preview_arr = luminance
-                if preview_wcs is None:
-                    preview_wcs = tile_wcs
-                preview_entries.append((preview_arr, preview_wcs))
-            except Exception as exc_preview:
-                preview_failed = True
-                logger.warning(
-                    "Incremental intertile preview failed for %s: %s",
-                    tile_path,
-                    exc_preview,
-                )
-                logger.debug("Traceback (preview failure):", exc_info=True)
-                break
-            finally:
-                if progress_callback:
-                    try:
-                        progress_callback("phase5_intertile", idx, total_tiles)
-                    except Exception:
-                        pass
-        corrections = {}
-        if not preview_failed and len(preview_entries) == total_tiles:
-            try:
-                corrections = zemosaic_utils.compute_intertile_affine_calibration(
-                    preview_entries,
-                    final_output_wcs,
-                    final_output_shape_hw,
-                    preview_size=intertile_preview_size,
-                    min_overlap_fraction=intertile_overlap_min,
-                    sky_percentile=intertile_sky_percentile,
-                    robust_clip_sigma=intertile_robust_clip_sigma,
-                    use_auto_intertile=use_auto_intertile,
-                    logger=logger,
-                    progress_callback=progress_callback,
-                )
-            except Exception as exc_intertile:
-                pcb_asm(
-                    "assemble_warn_intertile_photometric_failed",
-                    prog=None,
-                    lvl="WARN",
-                    error=str(exc_intertile),
-                )
-                logger.warning(
-                    "Intertile photometric calibration failed (incremental): %s",
-                    exc_intertile,
-                    exc_info=True,
-                )
-                corrections = {}
-        elif preview_failed:
+        tile_sources = [
+            _TileAffineSource(path=tile_path, wcs=tile_wcs)
+            for tile_path, tile_wcs in master_tile_fits_with_wcs_list
+        ]
+        pending_affine_list, nontrivial_detected, affine_status, affine_error = (
+            _compute_intertile_affine_corrections_from_sources(
+                tile_sources=tile_sources,
+                final_output_wcs=final_output_wcs,
+                final_output_shape_hw=final_output_shape_hw,
+                preview_size=int(intertile_preview_size),
+                min_overlap_fraction=float(intertile_overlap_min),
+                sky_percentile=intertile_sky_percentile,
+                robust_clip_sigma=float(intertile_robust_clip_sigma),
+                use_auto_intertile=use_auto_intertile,
+                logger_obj=logger,
+                progress_callback=progress_callback,
+            )
+        )
+        if affine_status == "preview_failed":
             pcb_asm(
                 "assemble_warn_intertile_photometric_failed",
                 prog=None,
                 lvl="WARN",
                 error="preview_failed",
             )
-        nontrivial_detected = False
-        try:
-            sanitized_affine = []
-            for idx_tile in range(total_tiles):
-                gain_val, offset_val = corrections.get(idx_tile, (1.0, 0.0))
-                try:
-                    gain_val = float(gain_val)
-                except Exception:
-                    gain_val = 1.0
-                try:
-                    offset_val = float(offset_val)
-                except Exception:
-                    offset_val = 0.0
-                if not np.isfinite(gain_val):
-                    gain_val = 1.0
-                if not np.isfinite(offset_val):
-                    offset_val = 0.0
-                if not nontrivial_detected and (
-                    abs(gain_val - 1.0) > 1e-6 or abs(offset_val) > 1e-6
-                ):
-                    nontrivial_detected = True
-                sanitized_affine.append((gain_val, offset_val))
-            pending_affine_list = sanitized_affine
-        except Exception:
             pending_affine_list = None
             nontrivial_detected = False
-        if preview_entries:
-            try:
-                preview_entries.clear()
-            except Exception:
-                pass
+        elif affine_status == "compute_failed":
+            pcb_asm(
+                "assemble_warn_intertile_photometric_failed",
+                prog=None,
+                lvl="WARN",
+                error=str(affine_error),
+            )
+            pending_affine_list = None
+            nontrivial_detected = False
         affine_elapsed = time.monotonic() - affine_start
         if nontrivial_detected:
             try:
@@ -3854,38 +3967,7 @@ def assemble_final_mosaic_incremental(
             elapsed=f"{affine_elapsed:.2f}",
             num_tiles=len(pending_affine_list or []),
         )
-        if pending_affine_list:
-            # Préparer un échantillonnage de logs pour l'application par tuile.
-            nontrivial_indices = [
-                i
-                for i, (g_val, o_val) in enumerate(pending_affine_list, 1)
-                if abs(g_val - 1.0) > 1e-6 or abs(o_val) > 1e-6
-            ]
-            if nontrivial_indices:
-                sample_span = max(1, len(nontrivial_indices) // 4)
-                affine_log_indices = set(nontrivial_indices[::sample_span])
-                affine_log_indices.add(nontrivial_indices[0])
-                affine_log_indices.add(nontrivial_indices[-1])
-            else:
-                affine_log_indices = set()
-        else:
-            affine_log_indices = set()
-    else:
-        affine_log_indices = set()
-
-    if pending_affine_list and not affine_log_indices:
-        nontrivial_indices = [
-            i
-            for i, (g_val, o_val) in enumerate(pending_affine_list, 1)
-            if abs(g_val - 1.0) > 1e-6 or abs(o_val) > 1e-6
-        ]
-        if nontrivial_indices:
-            sample_span = max(1, len(nontrivial_indices) // 4)
-            affine_log_indices = set(nontrivial_indices[::sample_span])
-            affine_log_indices.add(nontrivial_indices[0])
-            affine_log_indices.add(nontrivial_indices[-1])
-        else:
-            affine_log_indices = set()
+    affine_log_indices = _select_affine_log_indices(pending_affine_list)
 
     sum_shape = (h, w, n_channels)
     weight_shape = (h, w)
@@ -4249,6 +4331,7 @@ def assemble_final_mosaic_reproject_coadd(
     intertile_robust_clip_sigma: float = 2.5,
     use_auto_intertile: bool = False,
     collect_tile_data: list | None = None,
+    tile_affine_corrections: list[tuple[float, float]] | None = None,
 ):
     """Assemble les master tiles en utilisant ``reproject_and_coadd``."""
     _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
@@ -4467,74 +4550,89 @@ def assemble_final_mosaic_reproject_coadd(
 
 
     # Optional inter-tile photometric (gain/offset) calibration
-    pending_affine_list = None
+    pending_affine_list, nontrivial_affine = _sanitize_affine_corrections(
+        tile_affine_corrections,
+        len(input_data_all_tiles_HWC_processed),
+    )
+
     if (
-        intertile_photometric_match
+        pending_affine_list is None
+        and intertile_photometric_match
         and len(input_data_all_tiles_HWC_processed) >= 2
-        and ZEMOSAIC_UTILS_AVAILABLE
-        and hasattr(zemosaic_utils, "compute_intertile_affine_calibration")
     ):
-        try:
-            corrections = zemosaic_utils.compute_intertile_affine_calibration(
-                input_data_all_tiles_HWC_processed,
-                final_output_wcs,
-                final_output_shape_hw,
-                preview_size=intertile_preview_size,
-                min_overlap_fraction=intertile_overlap_min,
+        tile_sources = []
+        for (tile_path, tile_wcs_orig), (arr, tile_wcs_processed) in zip(
+            master_tile_fits_with_wcs_list,
+            input_data_all_tiles_HWC_processed,
+        ):
+            tile_sources.append(
+                _TileAffineSource(
+                    path=tile_path,
+                    wcs=tile_wcs_processed or tile_wcs_orig,
+                    data=arr,
+                )
+            )
+
+        pending_affine_list, nontrivial_affine, affine_status, affine_error = (
+            _compute_intertile_affine_corrections_from_sources(
+                sources=tile_sources,
+                final_output_wcs=final_output_wcs,
+                final_output_shape_hw=final_output_shape_hw,
+                preview_size=int(intertile_preview_size),
+                min_overlap_fraction=float(intertile_overlap_min),
                 sky_percentile=intertile_sky_percentile,
-                robust_clip_sigma=intertile_robust_clip_sigma,
+                robust_clip_sigma=float(intertile_robust_clip_sigma),
                 use_auto_intertile=use_auto_intertile,
-                logger=logger,
+                logger_obj=logger,
                 progress_callback=progress_callback,
             )
-        except Exception as exc_intertile:
-            corrections = {}
+        )
+
+        if affine_status == "preview_failed":
             _pcb(
                 "assemble_warn_intertile_photometric_failed",
                 prog=None,
                 lvl="WARN",
-                error=str(exc_intertile),
+                error="preview_failed",
             )
-        else:
-            # Build ordered list aligned with tiles for possible GPU application
+            pending_affine_list = None
+            nontrivial_affine = False
+        elif affine_status == "compute_failed":
+            _pcb(
+                "assemble_warn_intertile_photometric_failed",
+                prog=None,
+                lvl="WARN",
+                error=str(affine_error),
+            )
+            pending_affine_list = None
+            nontrivial_affine = False
+
+    if pending_affine_list and not use_gpu:
+        corrected_tiles = 0
+        for tile_idx, (gain_val, offset_val) in enumerate(pending_affine_list):
+            if tile_idx < 0 or tile_idx >= len(input_data_all_tiles_HWC_processed):
+                continue
+            arr, tile_wcs_local = input_data_all_tiles_HWC_processed[tile_idx]
+            if arr is None:
+                continue
             try:
-                n_tiles_local = len(input_data_all_tiles_HWC_processed)
-                pending_affine_list = [
-                    (
-                        float(corrections.get(i, (1.0, 0.0))[0]),
-                        float(corrections.get(i, (1.0, 0.0))[1]),
-                    )
-                    for i in range(n_tiles_local)
-                ]
+                if gain_val != 1.0:
+                    arr *= float(gain_val)
+                if offset_val != 0.0:
+                    arr += float(offset_val)
+                input_data_all_tiles_HWC_processed[tile_idx] = (arr, tile_wcs_local)
+                corrected_tiles += 1
             except Exception:
-                pending_affine_list = None
-
-            # For CPU path, apply in-place like before to preserve behavior
-            if not use_gpu and corrections:
-                corrected_tiles = 0
-                for tile_idx, (gain_val, offset_val) in enumerate(pending_affine_list or []):
-                    if tile_idx < 0 or tile_idx >= len(input_data_all_tiles_HWC_processed):
-                        continue
-                    arr, tile_wcs = input_data_all_tiles_HWC_processed[tile_idx]
-                    if arr is None:
-                        continue
-                    try:
-                        if gain_val != 1.0:
-                            arr *= float(gain_val)
-                        if offset_val != 0.0:
-                            arr += float(offset_val)
-                        input_data_all_tiles_HWC_processed[tile_idx] = (arr, tile_wcs)
-                        corrected_tiles += 1
-                    except Exception:
-                        continue
-                if corrected_tiles:
-                    _pcb(
-                        "assemble_info_intertile_photometric_applied",
-                        prog=None,
-                        lvl="INFO_DETAIL",
-                        num_tiles=corrected_tiles,
-                    )
-
+                continue
+        if corrected_tiles:
+            _pcb(
+                "assemble_info_intertile_photometric_applied",
+                prog=None,
+                lvl="INFO_DETAIL",
+                num_tiles=corrected_tiles,
+            )
+    elif pending_affine_list is None:
+        nontrivial_affine = False
 
     if collect_tile_data is not None:
         try:
