@@ -372,6 +372,8 @@
     "run_info_phase5_finished_reproject_coadd": "Phase 5 terminée : Reproject & Coadd terminé. Shape mosaïque (HWC) : {shape}",
     "run_error_phase5_assembly_failed_incremental": "ERREUR P5 : Échec de l'assemblage final via la méthode incrémentale.",
     "run_info_phase5_finished_incremental": "Phase 5 terminée : Assemblage incrémental terminé. Shape mosaïque (HWC) : {shape}",
+    "assemble_info_incremental_autocrop_done": "Auto-rognage incrémental appliqué. Nouvelle taille : {shape}",
+    "assemble_warn_incremental_autocrop_failed": "Auto-rognage incrémental échoué : {error}",
     "run_info_incremental_affine_start": "Assemblage incrémental : calcul des corrections photométriques inter-tuiles ({num_tiles} tuiles)...",
     "run_info_incremental_affine_done": "Assemblage incrémental : calibration affine terminée (tuiles={num_tiles}, durée={elapsed}s).",
     "run_info_incremental_apply_gain_offset": "Assemblage incrémental : application du gain/décalage sur la tuile n°{tile_num} (gain={gain}, offset={offset}).",

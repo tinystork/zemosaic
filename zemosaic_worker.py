@@ -243,67 +243,30 @@ def _compute_intertile_affine_corrections_from_sources(
     ):
         return None, False, "skipped", None
 
-    preview_entries: list[tuple[np.ndarray, Any]] = []
+    tile_pairs: list[tuple[np.ndarray, Any]] = []
 
     for idx, src in enumerate(sources, 1):
         try:
             tile_arr: np.ndarray
+            label = os.path.basename(src.path) if src.path else None
             if src.data is not None:
-                tile_arr = _ensure_hwc_master_tile(
-                    src.data,
-                    os.path.basename(src.path) if src.path else None,
-                )
-                tile_arr = np.array(tile_arr, copy=True)
+                tile_arr = _ensure_hwc_master_tile(src.data, label)
             else:
                 if not src.path:
                     raise ValueError("Tile data missing and no path provided.")
                 with fits.open(src.path, memmap=False) as hdul:
-                    tile_arr = _ensure_hwc_master_tile(
-                        hdul[0].data,
-                        os.path.basename(src.path),
-                    )
+                    tile_arr = _ensure_hwc_master_tile(hdul[0].data, label)
             tile_arr = np.asarray(tile_arr, dtype=np.float32, order="C")
-
-            preview_arr = None
-            preview_wcs = None
-            if (
-                ZEMOSAIC_UTILS_AVAILABLE
-                and hasattr(zemosaic_utils, "create_downscaled_luminance_preview")
-            ):
-                try:
-                    preview_arr, preview_wcs = zemosaic_utils.create_downscaled_luminance_preview(
-                        tile_arr,
-                        src.wcs,
-                        preview_size=preview_size,
-                    )
-                except Exception:
-                    preview_arr, preview_wcs = None, None
-
-            if preview_arr is None:
-                luminance = tile_arr
-                if luminance.ndim == 3 and luminance.shape[-1] > 1:
-                    luminance = np.nanmean(luminance, axis=-1)
-                elif luminance.ndim == 3:
-                    luminance = luminance[..., 0]
-                luminance = np.asarray(np.squeeze(luminance), dtype=np.float32)
-                np.nan_to_num(luminance, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-                preview_arr = luminance
-
-            if preview_wcs is None:
-                preview_wcs = src.wcs
-
-            preview_entries.append(
-                (np.asarray(preview_arr, dtype=np.float32, order="C"), preview_wcs)
-            )
+            tile_pairs.append((tile_arr, src.wcs))
         except Exception as exc:
             if logger_obj:
                 logger_obj.warning(
-                    "Intertile preview failed for %s: %s",
+                    "Intertile data load failed for %s: %s",
                     src.path or f"tile#{idx}",
                     exc,
                 )
-                logger_obj.debug("Traceback (preview failure):", exc_info=True)
-            preview_entries.clear()
+                logger_obj.debug("Traceback (intertile data load):", exc_info=True)
+            tile_pairs.clear()
             return None, False, "preview_failed", str(exc)
         finally:
             if progress_callback:
@@ -314,7 +277,7 @@ def _compute_intertile_affine_corrections_from_sources(
 
     try:
         corrections = zemosaic_utils.compute_intertile_affine_calibration(
-            preview_entries,
+            tile_pairs,
             final_output_wcs,
             final_output_shape_hw,
             preview_size=preview_size,
@@ -334,7 +297,7 @@ def _compute_intertile_affine_corrections_from_sources(
             logger_obj.debug("Traceback (intertile failure):", exc_info=True)
         return None, False, "compute_failed", str(exc)
     finally:
-        preview_entries.clear()
+        tile_pairs.clear()
 
     sanitized, nontrivial = _sanitize_affine_corrections(corrections, total_tiles)
     return sanitized, nontrivial, "ok", None
@@ -3810,7 +3773,8 @@ def assemble_final_mosaic_incremental(
             len(master_tile_fits_with_wcs_list),
         )
 
-    use_feather = bool(use_radial_feather) if use_radial_feather is not None else False
+    # Default to radial feathering for parity with the legacy pipeline unless explicitly disabled.
+    use_feather = True if use_radial_feather is None else bool(use_radial_feather)
     parity_mode = bool(intertile_photometric_match and match_background and feather_parity)
     if feather_parity:
         if use_feather:
@@ -3918,7 +3882,7 @@ def assemble_final_mosaic_incremental(
         ]
         pending_affine_list, nontrivial_detected, affine_status, affine_error = (
             _compute_intertile_affine_corrections_from_sources(
-                tile_sources=tile_sources,
+                sources=tile_sources,
                 final_output_wcs=final_output_wcs,
                 final_output_shape_hw=final_output_shape_hw,
                 preview_size=int(intertile_preview_size),
@@ -4223,6 +4187,28 @@ def assemble_final_mosaic_incremental(
         )
 
     pcb_asm("assemble_info_finished_incremental", prog=None, lvl="INFO", shape=str(mosaic.shape))
+
+    # Harmonize incremental output with reproject/coadd by removing empty borders
+    try:
+        mosaic, weight_data = _auto_crop_mosaic_to_valid_region(
+            mosaic,
+            weight_data,
+            final_output_wcs,
+            log_callback=pcb_asm,
+        )
+        pcb_asm(
+            "assemble_info_incremental_autocrop_done",
+            prog=None,
+            lvl="INFO_DETAIL",
+            shape=str(getattr(mosaic, "shape", None)),
+        )
+    except Exception as exc_crop:
+        pcb_asm(
+            "assemble_warn_incremental_autocrop_failed",
+            prog=None,
+            lvl="WARN",
+            error=str(exc_crop),
+        )
 
     if mosaic.ndim != 3:
         raise ValueError(f"Expected incremental mosaic in HWC order, got {mosaic.shape}")
@@ -4611,42 +4597,43 @@ def assemble_final_mosaic_reproject_coadd(
             nontrivial_affine = False
 
     if pending_affine_list:
-        corrected_tiles = 0
-        for tile_idx, (gain_val, offset_val) in enumerate(pending_affine_list):
-            if tile_idx < 0 or tile_idx >= len(input_data_all_tiles_HWC_processed):
-                continue
-            arr, tile_wcs_local = input_data_all_tiles_HWC_processed[tile_idx]
-            if arr is None:
-                continue
-            try:
-                arr_np = np.asarray(arr, dtype=np.float32, order="C")
-                if gain_val != 1.0:
-                    np.multiply(arr_np, float(gain_val), out=arr_np, casting="unsafe")
-                if offset_val != 0.0:
-                    np.add(arr_np, float(offset_val), out=arr_np, casting="unsafe")
-                input_data_all_tiles_HWC_processed[tile_idx] = (arr_np, tile_wcs_local)
-                corrected_tiles += 1
-            except Exception:
-                continue
-        if corrected_tiles:
-            try:
-                _pcb(
-                    "assemble_info_intertile_photometric_applied",
-                    prog=None,
-                    lvl="INFO_DETAIL",
-                    num_tiles=corrected_tiles,
-                )
-            except Exception:
-                pass
+        if use_gpu:
+            # Defer gain/offset application to GPU path for parity with V3.2.5
             nontrivial_affine = True
         else:
-            nontrivial_affine = False
+            corrected_tiles = 0
+            for tile_idx, (gain_val, offset_val) in enumerate(pending_affine_list):
+                if tile_idx < 0 or tile_idx >= len(input_data_all_tiles_HWC_processed):
+                    continue
+                arr, tile_wcs_local = input_data_all_tiles_HWC_processed[tile_idx]
+                if arr is None:
+                    continue
+                try:
+                    arr_np = np.asarray(arr, dtype=np.float32, order="C")
+                    if gain_val != 1.0:
+                        np.multiply(arr_np, float(gain_val), out=arr_np, casting="unsafe")
+                    if offset_val != 0.0:
+                        np.add(arr_np, float(offset_val), out=arr_np, casting="unsafe")
+                    input_data_all_tiles_HWC_processed[tile_idx] = (arr_np, tile_wcs_local)
+                    corrected_tiles += 1
+                except Exception:
+                    continue
+            if corrected_tiles:
+                try:
+                    _pcb(
+                        "assemble_info_intertile_photometric_applied",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                        num_tiles=corrected_tiles,
+                    )
+                except Exception:
+                    pass
+                nontrivial_affine = True
+            else:
+                nontrivial_affine = False
+                pending_affine_list = None
     else:
         nontrivial_affine = False
-        pending_affine_list = None
-
-    if use_gpu:
-        # Corrections already applied to the CPU arrays; avoid reapplying in GPU path.
         pending_affine_list = None
 
     if collect_tile_data is not None:
