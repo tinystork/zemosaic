@@ -2535,9 +2535,21 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
         except Exception:
             tile_affine = None
 
-    # Keep match_background behaviour aligned with CPU path even when affine
-    # corrections are provided. CPU assembly applies the corrections first and
-    # still enables background matching, so we mirror that parity here.
+    # If affine corrections are present, disable additional background matching
+    # to avoid double offset removal. This mirrors the V3.2.5 behaviour that
+    # produced seamless transitions on the GPU pipeline.
+    try:
+        if tile_affine is not None:
+            has_nontrivial_affine = any((g != 1.0) or (o != 0.0) for (g, o) in tile_affine)
+            if has_nontrivial_affine and match_background:
+                import logging
+
+                logging.getLogger(__name__).debug(
+                    "[GPU Reproj] Disabling match_background because tile_affine_corrections are provided."
+                )
+                match_background = False
+    except Exception:
+        pass
 
     # When affine corrections are present, align per-tile medians to a global median
     # computed after applying the affine. This mirrors the CPU path where tiles are
