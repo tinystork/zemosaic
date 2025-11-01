@@ -182,7 +182,10 @@ def _sanitize_affine_corrections(
     if not sanitized:
         return None, False
 
-    return sanitized, nontrivial
+    if not nontrivial:
+        return None, False
+
+    return sanitized, True
 
 
 def _select_affine_log_indices(
@@ -4607,7 +4610,7 @@ def assemble_final_mosaic_reproject_coadd(
             pending_affine_list = None
             nontrivial_affine = False
 
-    if pending_affine_list and not use_gpu:
+    if pending_affine_list:
         corrected_tiles = 0
         for tile_idx, (gain_val, offset_val) in enumerate(pending_affine_list):
             if tile_idx < 0 or tile_idx >= len(input_data_all_tiles_HWC_processed):
@@ -4616,23 +4619,35 @@ def assemble_final_mosaic_reproject_coadd(
             if arr is None:
                 continue
             try:
+                arr_np = np.asarray(arr, dtype=np.float32, order="C")
                 if gain_val != 1.0:
-                    arr *= float(gain_val)
+                    np.multiply(arr_np, float(gain_val), out=arr_np, casting="unsafe")
                 if offset_val != 0.0:
-                    arr += float(offset_val)
-                input_data_all_tiles_HWC_processed[tile_idx] = (arr, tile_wcs_local)
+                    np.add(arr_np, float(offset_val), out=arr_np, casting="unsafe")
+                input_data_all_tiles_HWC_processed[tile_idx] = (arr_np, tile_wcs_local)
                 corrected_tiles += 1
             except Exception:
                 continue
         if corrected_tiles:
-            _pcb(
-                "assemble_info_intertile_photometric_applied",
-                prog=None,
-                lvl="INFO_DETAIL",
-                num_tiles=corrected_tiles,
-            )
-    elif pending_affine_list is None:
+            try:
+                _pcb(
+                    "assemble_info_intertile_photometric_applied",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                    num_tiles=corrected_tiles,
+                )
+            except Exception:
+                pass
+            nontrivial_affine = True
+        else:
+            nontrivial_affine = False
+    else:
         nontrivial_affine = False
+        pending_affine_list = None
+
+    if use_gpu:
+        # Corrections already applied to the CPU arrays; avoid reapplying in GPU path.
+        pending_affine_list = None
 
     if collect_tile_data is not None:
         try:
