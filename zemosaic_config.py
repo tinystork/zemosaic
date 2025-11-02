@@ -28,6 +28,9 @@ DEFAULT_CONFIG = {
     "gpu_id_phase5": 0,
     "gpu_selector": "",
     "final_assembly_method": "reproject_coadd", # Options: "reproject_coadd", "incremental",
+    "two_pass_coverage_renorm": False,
+    "two_pass_cov_sigma_px": 50,
+    "two_pass_cov_gain_clip": [0.85, 1.18],
     "solver_method": "ansvr",
     "astrometry_local_path": "",
     "astrometry_api_key": "",
@@ -53,6 +56,8 @@ DEFAULT_CONFIG = {
     "intertile_sky_percentile": [30.0, 70.0],
     "intertile_robust_clip_sigma": 2.5,
     "use_auto_intertile": False,
+    "match_background_for_final": True,
+    "incremental_feather_parity": False,
     # Early GUI filter option (Phase 0 header-only scan)
     "enable_early_filter": True,
     # --- CLES POUR LE ROGNAGE DES MASTER TUILES ---

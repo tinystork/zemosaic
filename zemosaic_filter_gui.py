@@ -1,73 +1,52 @@
-﻿"""
-â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
-â•‘ ZeMosaic / ZeSeestarStacker Project                                  â•‘
-â•‘                                                                      â•‘
-â•‘ Auteur  : Tinystork, seigneur des couteaux Ã  beurre (aka Tristan Nauleau)  
-â•‘ Partenaire : J.A.R.V.I.S. (/ËˆdÊ’É‘ËrvÉªs/) â€” Just a Rather Very Intelligent System  
-â•‘              (aka ChatGPT, Grand MaÃ®tre du ciselage de code)         â•‘
-â•‘                                                                      â•‘
-â•‘ Licence : GNU General Public License v3.0 (GPL-3.0)                  â•‘
-â•‘                                                                      â•‘
-â•‘ Description :                                                        â•‘
-â•‘   Ce programme a Ã©tÃ© forgÃ© Ã  la lueur des pixels et de la cafÃ©ine,   â•‘
-â•‘   dans le but noble de transformer des nuages de photons en art      â•‘
-â•‘   astronomique. Si vous lâ€™utilisez, pensez Ã  dire â€œmerciâ€,           â•‘
-â•‘   Ã  lever les yeux vers le ciel, ou Ã  citer Tinystork et J.A.R.V.I.S.â•‘
-â•‘   (le karma des dÃ©veloppeurs en dÃ©pend).                             â•‘
-â•‘                                                                      â•‘
-â•‘ Avertissement :                                                      â•‘
-â•‘   Aucune IA ni aucun couteau Ã  beurre nâ€™a Ã©tÃ© blessÃ© durant le       â•‘
-â•‘   dÃ©veloppement de ce code.                                          â•‘
-â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-
-
-â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—
-â•‘ ZeMosaic / ZeSeestarStacker Project                                  â•‘
-â•‘                                                                      â•‘
-â•‘ Author  : Tinystork, Lord of the Butter Knives (aka Tristan Nauleau) â•‘
-â•‘ Partner : J.A.R.V.I.S. (/ËˆdÊ’É‘ËrvÉªs/) â€” Just a Rather Very Intelligent System  
-â•‘           (aka ChatGPT, Grand Master of Code Chiseling)              â•‘
-â•‘                                                                      â•‘
-â•‘ License : GNU General Public License v3.0 (GPL-3.0)                  â•‘
-â•‘                                                                      â•‘
-â•‘ Description:                                                         â•‘
-â•‘   This program was forged under the sacred light of pixels and       â•‘
-â•‘   caffeine, with the noble intent of turning clouds of photons into  â•‘
-â•‘   astronomical art. If you use it, please consider saying â€œthanks,â€  â•‘
-â•‘   gazing at the stars, or crediting Tinystork and J.A.R.V.I.S. â€”     â•‘
-â•‘   developer karma depends on it.                                     â•‘
-â•‘                                                                      â•‘
-â•‘ Disclaimer:                                                          â•‘
-â•‘   No AIs or butter knives were harmed in the making of this code.    â•‘
-â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-
-Optional GUI filter for ZeMosaic Phase 1 results.
-
-This module exposes a single function:
-
-    launch_filter_interface(
-        raw_files_with_wcs: list[dict],
-        initial_overrides: dict | None = None,
-    ) -> tuple[list[dict], bool, dict | None]
-
-It opens a small Tkinter window with a schematic sky map (RA/Dec, in degrees)
-showing the footprint of each WCS-resolved image as a polygon and a checkbox
-list to include/exclude individual images. A helper can also exclude images
-farther than X degrees from the global center.
-
-Safety requirements:
-- If this module is missing or raises, the caller should continue unchanged.
-- If the window is closed or any error occurs, the original input list is
-  returned unchanged.
-  In that case this function returns (original_list, False) so the caller can
-  decide to abort processing.
-
-Dependencies limited to tkinter, astropy, matplotlib, numpy; all optional.
+# zemosaic_filter_gui.py
 """
+╔══════════════════════════════════════════════════════════════════════╗
+║ ZeMosaic / ZeSeestarStacker Project                                  ║
+║                                                                      ║
+║ Auteur  : Tinystork, seigneur des couteaux à beurre (aka Tristan Nauleau)
+║ Partenaire : J.A.R.V.I.S. (/ˈdʒɑːrvɪs/) — Just a Rather Very Intelligent System
+║              (aka ChatGPT, Grand Maître du ciselage de code)         ║
+║                                                                      ║
+║ Licence : GNU General Public License v3.0 (GPL-3.0)                  ║
+║                                                                      ║
+║ Description :                                                        ║
+║   Ce programme a été forgé à la lueur des pixels et de la caféine,   ║
+║   dans le but noble de transformer des nuages de photons en art      ║
+║   astronomique. Si vous l’utilisez, pensez à dire “merci”,           ║
+║   à lever les yeux vers le ciel, ou à citer Tinystork et J.A.R.V.I.S.║
+║   (le karma des développeurs en dépend).                             ║
+║                                                                      ║
+║ Avertissement :                                                      ║
+║   Aucune IA ni aucun couteau à beurre n’a été blessé durant le       ║
+║   développement de ce code.                                          ║
+╚══════════════════════════════════════════════════════════════════════╝
+
+
+╔══════════════════════════════════════════════════════════════════════╗
+║ ZeMosaic / ZeSeestarStacker Project                                  ║
+║                                                                      ║
+║ Author  : Tinystork, Lord of the Butter Knives (aka Tristan Nauleau) ║
+║ Partner : J.A.R.V.I.S. (/ˈdʒɑːrvɪs/) — Just a Rather Very Intelligent System
+║           (aka ChatGPT, Grand Master of Code Chiseling)              ║
+║                                                                      ║
+║ License : GNU General Public License v3.0 (GPL-3.0)                  ║
+║                                                                      ║
+║ Description:                                                         ║
+║   This program was forged under the sacred light of pixels and       ║
+║   caffeine, with the noble intent of turning clouds of photons into  ║
+║   astronomical art. If you use it, please consider saying “thanks,”  ║
+║   gazing at the stars, or crediting Tinystork and J.A.R.V.I.S. —     ║
+║   developer karma depends on it.                                     ║
+║                                                                      ║
+║ Disclaimer:                                                          ║
+║   No AIs or butter knives were harmed in the making of this code.    ║
+╚══════════════════════════════════════════════════════════════════════╝
+"""
+
 
 from __future__ import annotations
 
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 from collections.abc import Iterable
 from dataclasses import asdict
 import os
@@ -110,17 +89,57 @@ def _angular_sep_deg(a: Optional[tuple[float, float]], b: Optional[tuple[float, 
     return (dra ** 2 + ddec ** 2) ** 0.5
 
 
-def _merge_small_groups(groups: list[list[dict]], min_size: int, cap: int) -> list[list[dict]]:
-    """
-    Merge groups smaller than ``min_size`` with their nearest neighbour when the
-    resulting size stays below ``cap`` (allowing a 10% margin).
+def _merge_small_groups(
+    groups: list[list[dict]],
+    min_size: int,
+    cap: int,
+    *,
+    cap_allowance: Optional[int] = None,
+    compute_dispersion: Optional[Callable[[list[tuple[float, float]]], float]] = None,
+    max_dispersion_deg: Optional[float] = None,
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> list[list[dict]]:
+    """Merge undersized groups with their nearest neighbour when safe.
+
+    Parameters
+    ----------
+    groups : list[list[dict]]
+        Groups to examine.
+    min_size : int
+        Minimum size below which a group becomes a merge candidate.
+    cap : int
+        Hard cap (without allowance) used as base reference.
+    cap_allowance : Optional[int]
+        Optional absolute cap allowing temporary overflows.
+    compute_dispersion : Optional[Callable]
+        Callable returning the maximum angular separation (deg) for coordinates.
+    max_dispersion_deg : Optional[float]
+        Reject merges that would push dispersion beyond this threshold.
+    log_fn : Optional[Callable[[str], None]]
+        Optional logging callback invoked for each successful merge.
     """
 
     if not groups or min_size <= 0 or cap <= 0:
         return groups
 
+    cap_limit = int(cap_allowance) if cap_allowance and cap_allowance > 0 else int(cap)
+    cap_limit = max(cap_limit, int(cap))
+
     merged_flags = [False] * len(groups)
     centers = [_group_center_deg(g) for g in groups]
+
+    def _collect_coords(payload: list[dict]) -> list[tuple[float, float]]:
+        coords: list[tuple[float, float]] = []
+        for info in payload:
+            ra = info.get("RA")
+            dec = info.get("DEC")
+            if ra is None or dec is None:
+                continue
+            try:
+                coords.append((float(ra), float(dec)))
+            except Exception:
+                continue
+        return coords
 
     for i, group in enumerate(groups):
         if merged_flags[i] or len(group) >= min_size:
@@ -136,17 +155,91 @@ def _merge_small_groups(groups: list[list[dict]], min_size: int, cap: int) -> li
                 best_dist = dist
                 best_j = j
 
-        if best_j is not None:
-            candidate_size = len(groups[best_j]) + len(group)
-            if candidate_size <= int(cap * 1.1):
-                groups[best_j].extend(group)
-                merged_flags[i] = True
-                print(
-                    f"[AutoMerge] Group {i} ({len(group)} imgs) merged into {best_j} "
-                    f"(now {len(groups[best_j])})"
+        if best_j is None:
+            continue
+
+        candidate_size = len(groups[best_j]) + len(group)
+        if candidate_size > cap_limit:
+            continue
+
+        if compute_dispersion is not None and max_dispersion_deg is not None and max_dispersion_deg > 0:
+            coords_combined = _collect_coords(groups[best_j]) + _collect_coords(group)
+            if coords_combined:
+                try:
+                    dispersion_val = float(compute_dispersion(coords_combined))
+                except Exception:
+                    dispersion_val = None
+                if dispersion_val is not None and dispersion_val > max_dispersion_deg:
+                    continue
+
+        groups[best_j].extend(group)
+        merged_flags[i] = True
+        centers[best_j] = _group_center_deg(groups[best_j])
+        if log_fn is not None:
+            try:
+                log_fn(
+                    f"Merged group {i} ({len(group)} imgs) into {best_j} (size={len(groups[best_j])})"
                 )
+            except Exception:
+                pass
 
     return [grp for idx, grp in enumerate(groups) if not merged_flags[idx]]
+
+
+def _compute_dynamic_footprint_budget(
+    total_items: int,
+    preview_cap: Any,
+    *,
+    max_footprints: int,
+) -> int:
+    """Return the footprint budget capped dynamically for preview rendering.
+
+    Parameters
+    ----------
+    total_items : int
+        Number of catalogue entries that could be rendered.
+    preview_cap : Any
+        User-provided preview cap (may be ``None`` or a string).
+    max_footprints : int
+        Hard upper bound derived from configuration/CLI arguments.
+    """
+
+    try:
+        base_cap = int(max_footprints)
+    except Exception:
+        base_cap = 0
+
+    preview_limit: Optional[int] = None
+    try:
+        coerced_preview = int(preview_cap)
+        if coerced_preview > 0:
+            preview_limit = coerced_preview
+    except Exception:
+        preview_limit = None
+
+    if preview_limit is not None:
+        base_cap = min(base_cap or preview_limit, preview_limit)
+
+    base_cap = max(50, base_cap) if base_cap else 50
+
+    if total_items >= 8000:
+        cap = 200
+    elif total_items >= 4000:
+        cap = 350
+    elif total_items >= 2000:
+        cap = 600
+    else:
+        cap = min(base_cap, 1500)
+
+    if preview_limit is not None:
+        cap = min(cap, preview_limit)
+
+    cap = min(cap, base_cap) if base_cap else cap
+
+    try:
+        return max(1, int(cap))
+    except Exception:
+        return 1
 
 
 def launch_filter_interface(
@@ -156,7 +249,7 @@ def launch_filter_interface(
     stream_scan: bool = False,
     scan_recursive: bool = True,
     batch_size: int = 100,
-    preview_cap: int = 1000,
+    preview_cap: int = 200,
     solver_settings_dict: Optional[Dict[str, Any]] = None,
     config_overrides: Optional[Dict[str, Any]] = None,
     **kwargs,
@@ -189,7 +282,7 @@ def launch_filter_interface(
         streaming (default: 100).
     preview_cap : int, optional
         Maximum number of footprints drawn on the Matplotlib preview to avoid
-        locking the UI for very large directories (default: 1000).
+        locking the UI for very large directories (default: 200).
     solver_settings_dict : dict, optional
         Dictionary of solver configuration selected in the main GUI. When
         provided, values such as ASTAP paths and search radius override the
@@ -218,12 +311,19 @@ def launch_filter_interface(
     stream_mode = False
     input_dir: Optional[str] = None
 
-    if stream_scan and isinstance(raw_files_with_wcs_or_dir, str):
-        candidate = raw_files_with_wcs_or_dir
+    # Robust detection: if a directory path is provided, always use streaming
+    # mode regardless of the explicit flag. This makes callers resilient to
+    # mismatched parameters and guarantees the presence of the Analyse button.
+    if isinstance(raw_files_with_wcs_or_dir, str):
+        # Normalize user-provided path for robust directory detection
+        candidate = str(raw_files_with_wcs_or_dir).strip().strip('"').strip("'")
+        candidate = os.path.expanduser(os.path.expandvars(candidate))
         if os.path.isdir(candidate):
             stream_mode = True
             input_dir = candidate
-        else:
+        elif stream_scan:
+            # Caller requested streaming but provided a non-directory path →
+            # fail fast with a safe default.
             return [], False, None
 
     if not stream_mode:
@@ -231,6 +331,20 @@ def launch_filter_interface(
             return raw_files_with_wcs_or_dir, False, None
 
     raw_items_input = raw_files_with_wcs_or_dir
+
+    # --- Simple debug logger (console + buffer flushed to UI log later) ---
+    _dbg_msgs: list[str] = []
+    def _dbg(msg: str) -> None:
+        try:
+            ts = datetime.datetime.now().strftime("%H:%M:%S")
+        except Exception:
+            ts = "??:??:??"
+        line = f"[FilterUI {ts}] {msg}"
+        try:
+            print(line)
+        except Exception:
+            pass
+        _dbg_msgs.append(line)
 
     try:
         # --- Optional localization support (autonomous fallback) ---
@@ -349,6 +463,12 @@ def launch_filter_interface(
             if sensitivity is not None:
                 cfg_defaults["astap_default_sensitivity"] = sensitivity
 
+        combined_solver_settings: Dict[str, Any] = {}
+        if solver_settings_payload:
+            combined_solver_settings.update(solver_settings_payload)
+        if isinstance(config_overrides, dict):
+            combined_solver_settings.update(config_overrides)
+
         if localizer_cls is not None:
             try:
                 localizer = localizer_cls(language_code=lang_code)
@@ -388,10 +508,42 @@ def launch_filter_interface(
         from astropy.coordinates import SkyCoord
         from astropy.io import fits
         from astropy.wcs import WCS
+        from astropy.wcs.utils import pixel_to_skycoord
         import astropy.units as u
         from matplotlib.figure import Figure
-        from matplotlib.patches import Polygon
         from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+        from matplotlib.collections import LineCollection
+        from matplotlib.colors import to_rgba
+
+        def footprint_wh_deg(wcs_obj: Any) -> tuple[float, float]:
+            """Return footprint width/height in degrees for a given WCS."""
+
+            try:
+                ny: Optional[int] = None
+                nx: Optional[int] = None
+                if getattr(wcs_obj, "array_shape", None):
+                    ny, nx = wcs_obj.array_shape  # type: ignore[attr-defined]
+                elif getattr(wcs_obj, "pixel_shape", None):
+                    nx, ny = wcs_obj.pixel_shape  # type: ignore[attr-defined]
+                if ny is None or nx is None:
+                    return (float("nan"), float("nan"))
+
+                px = np.array([[0, 0], [nx, 0], [nx, ny], [0, ny]], dtype=float)
+                sky = pixel_to_skycoord(px[:, 0], px[:, 1], wcs_obj)
+                ra = sky.ra.deg
+                dec = sky.dec.deg
+                ra0 = float(np.nanmedian(ra))
+                dec0 = float(np.nanmedian(dec))
+                cos_dec0 = float(np.cos(np.deg2rad(dec0))) if np.isfinite(dec0) else 1.0
+                if abs(cos_dec0) < 1e-6:
+                    cos_dec0 = 1e-6 if cos_dec0 >= 0 else -1e-6
+                x = (ra - ra0) * cos_dec0
+                y = dec - dec0
+                width = float(np.nanmax(x) - np.nanmin(x))
+                height = float(np.nanmax(y) - np.nanmin(y))
+                return width, height
+            except Exception:
+                return (float("nan"), float("nan"))
 
         astrometry_mod = None
         worker_mod = None
@@ -435,8 +587,19 @@ def launch_filter_interface(
         cluster_func = getattr(worker_mod, 'cluster_seestar_stacks_connected', None) if worker_mod else None
         autosplit_func = getattr(worker_mod, '_auto_split_groups', None) if worker_mod else None
         compute_dispersion_func = getattr(worker_mod, '_compute_max_angular_separation_deg', None) if worker_mod else None
+        solve_with_astrometry = getattr(worker_mod, 'solve_with_astrometry', None) if worker_mod else None
+        solve_with_ansvr = getattr(worker_mod, 'solve_with_ansvr', None) if worker_mod else None
 
-        MAX_FOOTPRINTS = int(preview_cap or 0) or 1000
+        max_footprints_override = None
+        if isinstance(config_overrides, dict):
+            try:
+                override_val = int(config_overrides.get("footprints_max"))
+                if override_val > 0:
+                    max_footprints_override = override_val
+            except Exception:
+                max_footprints_override = None
+
+        MAX_FOOTPRINTS = max_footprints_override or (int(preview_cap or 0) or 3000)
         cache_csv_path: Optional[str] = None
         if stream_mode and input_dir:
             cache_csv_path = os.path.join(input_dir, "headers_cache.csv")
@@ -470,6 +633,45 @@ def launch_filter_interface(
                         if fn.lower().endswith((".fit", ".fits")):
                             yield os.path.join(r, fn)
 
+        def _compute_footprint_from_wcs(
+            wcs_obj: Any,
+            shape_hw: Optional[tuple[int, int]] = None,
+        ) -> Optional[list[tuple[float, float]]]:
+            if wcs_obj is None or not getattr(wcs_obj, "is_celestial", False):
+                return None
+            try:
+                if shape_hw is not None and len(shape_hw) >= 2:
+                    h, w = float(shape_hw[0]), float(shape_hw[1])
+                else:
+                    px_shape = getattr(wcs_obj, "pixel_shape", None)
+                    if px_shape and len(px_shape) >= 2:
+                        w = float(px_shape[0])
+                        h = float(px_shape[1])
+                    else:
+                        arr_shape = getattr(wcs_obj, "array_shape", None)
+                        if arr_shape and len(arr_shape) >= 2:
+                            h = float(arr_shape[0])
+                            w = float(arr_shape[1])
+                        else:
+                            return None
+                if h <= 1.0 or w <= 1.0:
+                    return None
+                corners = (
+                    (0.0, 0.0),
+                    (w - 1.0, 0.0),
+                    (w - 1.0, h - 1.0),
+                    (0.0, h - 1.0),
+                )
+                result: list[tuple[float, float]] = []
+                for x, y in corners:
+                    sky = wcs_obj.pixel_to_world(float(x), float(y))
+                    ra_v = float(sky.ra.to(u.deg).value)
+                    dec_v = float(sky.dec.to(u.deg).value)
+                    result.append((ra_v, dec_v))
+                return result
+            except Exception:
+                return None
+
         def _minimal_header_payload(fpath: str) -> Dict[str, Any]:
             payload: Dict[str, Any] = {"path": fpath}
             try:
@@ -494,6 +696,9 @@ def launch_filter_interface(
                 w = WCS(hdr, naxis=2, relax=True)
                 if w is not None and getattr(w, "is_celestial", False):
                     payload["wcs"] = w
+                    fp = _compute_footprint_from_wcs(w, payload.get("shape"))
+                    if fp:
+                        payload["footprint_radec"] = fp
             except Exception:
                 pass
 
@@ -1045,12 +1250,16 @@ def launch_filter_interface(
             "filter_window_title",
             "ZeMosaic - Filtrer les images WCS (optionnel)" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "ZeMosaic - Filter WCS images (optional)"
         ))
-        # S'assurer que la fenÃªtre apparaÃ®t au premier plan et prend le focus
+        # S'assurer que la fenêtre apparaît au premier plan et prend le focus
         try:
             root.lift()
             root.attributes("-topmost", True)
             root.after(200, lambda: root.attributes("-topmost", False))
             root.focus_force()
+        except Exception:
+            pass
+        try:
+            root.protocol("WM_DELETE_WINDOW", root.destroy)
         except Exception:
             pass
         # Top-level layout: left plot, right checkboxes/actions
@@ -1064,7 +1273,7 @@ def launch_filter_interface(
         status = ttk.Frame(main)
         status.grid(row=0, column=0, columnspan=2, sticky="ew")
         status.columnconfigure(1, weight=1)
-        status_var = tk.StringVar(master=root, value=_tr("filter_status_crawling", "Crawling filesâ€¦ please wait"))
+        status_var = tk.StringVar(master=root, value=_tr("filter_status_crawling", "Crawling files… please wait"))
         ttk.Label(status, textvariable=status_var).grid(row=0, column=0, padx=6, pady=4, sticky="w")
         pb = ttk.Progressbar(status, mode="indeterminate", length=180)
         pb.grid(row=0, column=1, padx=6, pady=4, sticky="e")
@@ -1101,7 +1310,7 @@ def launch_filter_interface(
                     status_var.set(
                         _tr(
                             "filter_status_click_analyse",
-                            "Cliquez sur Analyse pour dÃ©marrer l'exploration." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Ready â€” click Analyse to scan.",
+                            "Cliquez sur Analyse pour démarrer l'exploration." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Ready — click Analyse to scan.",
                         )
                     )
                 except Exception:
@@ -1116,6 +1325,7 @@ def launch_filter_interface(
                     export_btn.state(["disabled"])
                 except Exception:
                     pass
+            _dbg(f"stream_mode=True; pending_start={stream_state.get('pending_start')} csv_loaded={stream_state.get('csv_loaded')} input_dir={input_dir}")
         else:
             if total_initial_entries > 400:
                 try:
@@ -1125,7 +1335,7 @@ def launch_filter_interface(
                 status_var.set(
                     _tr(
                         "filter_status_populating",
-                        "Preparing listâ€¦ {current}/{total}",
+                        "Preparing list… {current}/{total}",
                     ).format(current=0, total=total_initial_entries)
                 )
             else:
@@ -1306,12 +1516,21 @@ def launch_filter_interface(
         # Right panel with controls
         right = ttk.Frame(main)
         right.grid(row=1, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
         # The scrollable list lives at row=2 (row=1 reserved for clustering params)
         try:
             right.rowconfigure(2, weight=1)
         except Exception:
             right.rowconfigure(1, weight=1)
-        right.columnconfigure(0, weight=1)
+        # Reserve space for the aggregate controls container (row=3)
+        # Ensure a reasonable minimum height so controls are always visible.
+        try:
+            right.rowconfigure(3, weight=0, minsize=180)
+        except Exception:
+            try:
+                right.rowconfigure(3, minsize=180)
+            except Exception:
+                pass
 
         # Threshold controls
         thresh_frame = ttk.LabelFrame(
@@ -1343,7 +1562,7 @@ def launch_filter_interface(
                     ),
                     _tr(
                         "filter_invalid_value_message",
-                        "Veuillez entrer une distance en degrÃ©s (nombre)." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Please enter a distance in degrees (number).",
+                        "Veuillez entrer une distance en degrés (nombre)." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Please enter a distance in degrees (number).",
                     ),
                 )
                 return
@@ -1358,7 +1577,7 @@ def launch_filter_interface(
             thresh_frame,
             text=_tr(
                 "filter_apply_threshold_button",
-                "Exclure > XÂ°" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Exclude > XÂ°",
+                "Exclure > X°" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Exclude > X°",
             ),
             command=apply_threshold,
         )
@@ -1379,7 +1598,7 @@ def launch_filter_interface(
             right,
             text=_tr(
                 "filter_log_panel_title",
-                "Activity log" if 'fr' not in str(locals().get('lang_code', 'en')).lower() else "Journal d'activitÃ©",
+                "Activity log" if 'fr' not in str(locals().get('lang_code', 'en')).lower() else "Journal d'activité",
             ),
         )
         log_frame.grid(row=1, column=0, sticky="nsew", padx=5, pady=(0, 5))
@@ -1390,6 +1609,19 @@ def launch_filter_interface(
 
         async_events: "queue.Queue[tuple[Any, ...]]" = queue.Queue()
         resolve_state = {"running": False}
+        _progress_log_state = {"last": 0.0}
+
+        MAX_UI_MSG = 150
+        UI_BUDGET_MS = 35.0
+        LOG_FLUSH_INTERVAL = 0.2
+
+        log_buffer: list[tuple[str, str]] = []
+        last_log_flush = {"ts": 0.0}
+
+        pending_visual_refresh: set[int] = set()
+        visual_refresh_job = {"handle": None}
+        footprints_restore_state = {"needs_restore": False, "value": True, "indices": set()}
+        pending_outline_state: Dict[str, Any] = {"groups": None}
 
         def _enqueue_event(kind: str, *payload: Any) -> None:
             try:
@@ -1397,21 +1629,84 @@ def launch_filter_interface(
             except Exception:
                 pass
 
-        def _log_message(message: str, level: str = "INFO") -> None:
+        def _log_async(message: str, level: str = "INFO") -> None:
+            if message is None:
+                return
             try:
-                timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+                lvl = str(level or "INFO")
+            except Exception:
+                lvl = "INFO"
+            _enqueue_event("log", str(message), lvl)
+
+        def _write_log_entries(entries: list[tuple[str, str]]) -> None:
+            if not entries:
+                return
+            try:
                 log_widget.configure(state=tk.NORMAL)
-                log_widget.insert(tk.END, f"[{timestamp}] [{level.upper()}] {message}\n")
+                for level, message in entries:
+                    lvl = str(level or "INFO").upper()
+                    text = str(message)
+                    timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+                    log_widget.insert(tk.END, f"[{timestamp}] [{lvl}] {text}\n")
                 log_widget.configure(state=tk.DISABLED)
                 log_widget.see(tk.END)
             except Exception:
                 pass
 
+        # Flush any buffered debug messages from early startup
+        try:
+            if _dbg_msgs:
+                _write_log_entries([("INFO", msg) for msg in _dbg_msgs])
+                _dbg_msgs.clear()
+        except Exception:
+            pass
+
+        def _flush_log_buffer(force: bool = False) -> None:
+            if not log_buffer:
+                return
+            now = time.monotonic()
+            if not force and now - last_log_flush["ts"] < LOG_FLUSH_INTERVAL:
+                return
+            entries = list(log_buffer)
+            log_buffer.clear()
+            last_log_flush["ts"] = now
+            _write_log_entries(entries)
+
+        def _flush_visual_refresh() -> None:
+            visual_refresh_job["handle"] = None
+            if not pending_visual_refresh:
+                return
+            targets = sorted(pending_visual_refresh)
+            pending_visual_refresh.clear()
+            for idx in targets:
+                try:
+                    if idx < 0 or idx >= len(items):
+                        continue
+                    _ensure_wrapped_capacity(idx)
+                    footprint_wrapped[idx] = None
+                    centroid_wrapped[idx] = None
+                    _prepare_visual_payload(idx)
+                except Exception:
+                    pass
+            _schedule_visual_build(full=True)
+
+        def _schedule_visual_refresh_flush() -> None:
+            if visual_refresh_job.get("handle") is not None:
+                return
+            try:
+                visual_refresh_job["handle"] = root.after(200, _flush_visual_refresh)
+            except Exception:
+                visual_refresh_job["handle"] = None
+                _flush_visual_refresh()
+
+        def _log_message(message: str, level: str = "INFO") -> None:
+            _write_log_entries([(level, message)])
+
         if not has_explicit_centers:
             _log_message(
                 _tr(
                     "filter_warn_no_displayable_wcs",
-                    "Aucune information WCS/centre disponible ; l'aperÃ§u restera vide mais vous pouvez sÃ©lectionner les fichiers." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "No WCS/center information available; the sky preview will remain empty but you can still select files.",
+                    "Aucune information WCS/centre disponible ; l'aperçu restera vide mais vous pouvez sélectionner les fichiers." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "No WCS/center information available; the sky preview will remain empty but you can still select files.",
                 ),
                 level="WARN",
             )
@@ -1446,6 +1741,12 @@ def launch_filter_interface(
             if detail_parts:
                 text = f"{text} ({', '.join(detail_parts)})"
 
+            now = time.monotonic()
+            level_upper = str(level).upper()
+            if level_upper not in {"ERROR", "WARN"}:
+                if now - _progress_log_state["last"] < 0.5:
+                    return
+            _progress_log_state["last"] = now
             _enqueue_event("log", text, level)
 
         def _sanitize_path(value: Any) -> str:
@@ -1475,6 +1776,24 @@ def launch_filter_interface(
         astap_data_dir_raw = cfg_defaults.get('astap_data_directory_path', '')
         astap_exe_path = _sanitize_path(astap_exe_path_raw)
         astap_data_dir = _sanitize_path(astap_data_dir_raw)
+
+        ansvr_path_candidates = [
+            combined_solver_settings.get('ansvr_path'),
+            combined_solver_settings.get('astrometry_local_path'),
+            combined_solver_settings.get('local_ansvr_path'),
+        ]
+        ansvr_path = next(
+            (
+                _sanitize_path(candidate)
+                for candidate in ansvr_path_candidates
+                if isinstance(candidate, str) and candidate.strip()
+            ),
+            "",
+        )
+        if ansvr_path:
+            combined_solver_settings['ansvr_path'] = ansvr_path
+
+        astrometry_api_key = str(combined_solver_settings.get('api_key') or "").strip()
 
         # Keep the sanitized values in the defaults so downstream callers (log
         # messages, resolver invocations) see consistent paths.
@@ -1621,65 +1940,210 @@ def launch_filter_interface(
         listbox_programmatic = {"active": False}
 
         summary_var = tk.StringVar(master=root, value="")
+
+        # Early helper: may be called before footprint/draw state exists.
+        def _apply_summary_hint(text: str) -> str:
+            base_text = str(text or "")
+            hint = _tr(
+                "filter_preview_points_hint",
+                "Preview uses a reduced set of footprints for performance. Zoom or filter to reveal more footprints.",
+            )
+            # Draw toggle may not exist yet during early startup
+            try:
+                wants_footprints = bool(draw_footprints_var.get())
+            except Exception:
+                wants_footprints = False
+
+            # Budget/total may not be initialized yet; be safe
+            budget = 0
+            total = 0
+            try:
+                budget = int((footprint_budget_state.get("budget") or 0))  # type: ignore[name-defined]
+                total = int((footprint_budget_state.get("total_items") or 0))  # type: ignore[name-defined]
+            except Exception:
+                budget = 0
+                total = 0
+
+            if hint and hint in base_text:
+                base_text = base_text.replace(f" - {hint}", "")
+                base_text = base_text.replace(hint, "").strip()
+                if base_text.endswith("-"):
+                    base_text = base_text[:-1].rstrip()
+
+            if not wants_footprints or total <= 0 or budget >= total:
+                try:
+                    preview_hint_state["active"] = False  # type: ignore[name-defined]
+                except Exception:
+                    pass
+                return base_text
+
+            try:
+                preview_hint_state["active"] = True  # type: ignore[name-defined]
+            except Exception:
+                pass
+            if not base_text:
+                return hint
+            return f"{base_text} - {hint}"
         resolved_counter = {"count": int(overrides_state.get("resolved_wcs_count", 0) or 0)}
 
         if not has_explicit_centers:
             summary_var.set(
-                _tr(
-                    "filter_summary_no_centers",
-                    "Centres WCS indisponibles â€” sÃ©lection manuelle uniquement." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "WCS centers unavailable â€” manual selection only.",
+                _apply_summary_hint(
+                    _tr(
+                        "filter_summary_no_centers",
+                        "Centres WCS indisponibles — sélection manuelle uniquement." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "WCS centers unavailable — manual selection only.",
+                    )
                 )
             )
 
-        operations = ttk.Frame(right)
-        operations.grid(row=3, column=0, sticky="ew", padx=5, pady=5)
+        # Aggregate controls container (ensures persistent visibility)
+        controls = ttk.Frame(right)
+        controls.grid(row=3, column=0, sticky="ew", padx=5, pady=5)
+        controls.columnconfigure(0, weight=1)
+
+        operations = ttk.Frame(controls)
+        operations.pack(fill=tk.X, expand=False)
         operations.columnconfigure(2, weight=1)
 
-        resolve_btn = ttk.Button(
-            operations,
-            text=_tr("filter_btn_resolve_wcs", "Resolve missing WCS"),
-        )
-        resolve_btn.grid(row=0, column=0, padx=4, pady=2, sticky="w")
+        # Build operations area defensively: never let a single error hide the panel
+        draw_footprints_var = tk.BooleanVar(master=root, value=True)
+        write_wcs_var = tk.BooleanVar(master=root, value=True)
+        coverage_first_var = tk.BooleanVar(master=root, value=True)
+        overcap_percent_var = tk.IntVar(master=root, value=10)
 
-        auto_btn = ttk.Button(
-            operations,
-            text=_tr("filter_btn_auto_group", "Auto-organize Master Tiles"),
-        )
-        auto_btn.grid(row=0, column=1, padx=4, pady=2, sticky="w")
-
-        ttk.Label(
-            operations,
-            textvariable=summary_var,
-            anchor="w",
-            justify="left",
-            wraplength=260,
-        ).grid(row=0, column=2, padx=4, pady=2, sticky="w")
-
-        if not astap_available:
-            resolve_btn.state(["disabled"])
-            _log_message(
-                _tr("filter_warn_astap_missing", "ASTAP executable not configured; skipping resolution."),
-                level="WARN",
+        resolve_btn = None
+        auto_btn = None
+        footprints_chk = None
+        write_wcs_chk = None
+        try:
+            resolve_btn = ttk.Button(
+                operations,
+                text=_tr("filter_btn_resolve_wcs", "Resolve missing WCS"),
             )
+            resolve_btn.grid(row=0, column=0, padx=4, pady=2, sticky="w")
+        except Exception as e:
+            _log_message(f"[FilterUI] Resolve button init failed: {e}", level="WARN")
+        try:
+            auto_btn = ttk.Button(
+                operations,
+                text=_tr("filter_btn_auto_group", "Auto-organize Master Tiles"),
+            )
+            auto_btn.grid(row=0, column=1, padx=4, pady=2, sticky="w")
+        except Exception as e:
+            _log_message(f"[FilterUI] Auto-group button init failed: {e}", level="WARN")
 
-        if not (cluster_func and autosplit_func):
-            auto_btn.state(["disabled"])
-            if worker_import_failure_summary:
+        try:
+            ttk.Label(
+                operations,
+                textvariable=summary_var,
+                anchor="w",
+                justify="left",
+                wraplength=260,
+            ).grid(row=0, column=2, padx=4, pady=2, sticky="w")
+        except Exception as e:
+            _log_message(f"[FilterUI] Summary label failed: {e}", level="WARN")
+
+        try:
+            coverage_chk = ttk.Checkbutton(
+                operations,
+                text=_tr(
+                    "ui_coverage_first",
+                    "Coverage-first clustering (may exceed Max raws/tile)",
+                ),
+                variable=coverage_first_var,
+            )
+            coverage_chk.grid(row=2, column=0, columnspan=3, padx=4, pady=(6, 0), sticky="w")
+        except Exception as e:
+            _log_message(f"[FilterUI] Coverage-first checkbox failed: {e}", level="WARN")
+
+        overcap_spin = None
+        try:
+            overcap_label = ttk.Label(
+                operations,
+                text=_tr("ui_overcap_allowance_pct", "Over-cap allowance (%)"),
+            )
+            overcap_label.grid(row=3, column=0, padx=4, pady=(2, 0), sticky="w")
+            overcap_spin = ttk.Spinbox(
+                operations,
+                from_=0,
+                to=50,
+                increment=5,
+                textvariable=overcap_percent_var,
+                width=5,
+                justify="center",
+            )
+            overcap_spin.grid(row=3, column=1, padx=4, pady=(2, 0), sticky="w")
+        except Exception as e:
+            _log_message(f"[FilterUI] Over-cap spinbox failed: {e}", level="WARN")
+
+        try:
+            footprints_chk = ttk.Checkbutton(
+                operations,
+                text=_tr("filter_chk_draw_footprints", "Draw WCS footprints"),
+                variable=draw_footprints_var,
+            )
+            footprints_chk.grid(row=1, column=0, columnspan=2, padx=4, pady=(2, 0), sticky="w")
+        except Exception as e:
+            _log_message(f"[FilterUI] Footprints checkbox failed: {e}", level="WARN")
+
+        try:
+            write_wcs_chk = ttk.Checkbutton(
+                operations,
+                text=_tr("filter_chk_write_wcs", "Write WCS to file"),
+                variable=write_wcs_var,
+            )
+            write_wcs_chk.grid(row=1, column=2, padx=4, pady=(2, 0), sticky="w")
+        except Exception as e:
+            _log_message(f"[FilterUI] Write-WCS checkbox failed: {e}", level="WARN")
+
+        try:
+            astrometry_solver_available = bool(solve_with_astrometry is not None and astrometry_api_key)
+            ansvr_solver_available = bool(solve_with_ansvr is not None and ansvr_path)
+            any_solver_available = astap_available or astrometry_solver_available or ansvr_solver_available
+
+            if not any_solver_available and resolve_btn is not None:
+                resolve_btn.state(["disabled"])
+                try:
+                    if write_wcs_chk is not None:
+                        write_wcs_chk.state(["disabled"])
+                except Exception:
+                    pass
                 _log_message(
                     _tr(
-                        "filter_warn_worker_missing",
-                        "Auto-grouping disabled because the processing worker module failed to load: {error}",
-                        error=worker_import_failure_summary,
+                        "filter_warn_no_solvers",
+                        "No WCS solver configured (ASTAP/Astrometry/ANSVR).",
                     ),
-                    level="ERROR",
+                    level="WARN",
                 )
+
+            if not (cluster_func and autosplit_func) and auto_btn is not None:
+                auto_btn.state(["disabled"])
+                if worker_import_failure_summary:
+                    _log_message(
+                        _tr(
+                            "filter_warn_worker_missing",
+                            "Auto-grouping disabled because the processing worker module failed to load: {error}",
+                            error=worker_import_failure_summary,
+                        ),
+                        level="ERROR",
+                    )
+        except Exception as e:
+            _log_message(f"[FilterUI] Operations availability checks failed: {e}", level="WARN")
 
         def _resolve_missing_wcs_inplace() -> None:
             if resolve_state["running"]:
                 return
-            if not astap_available or solve_with_astap is None:
+
+            astap_enabled = bool(astap_available and solve_with_astap is not None)
+            astrometry_enabled = bool(solve_with_astrometry is not None and astrometry_api_key)
+            ansvr_enabled = bool(solve_with_ansvr is not None and ansvr_path)
+
+            if not (astap_enabled or astrometry_enabled or ansvr_enabled):
                 _log_message(
-                    _tr("filter_warn_astap_missing", "ASTAP executable not configured; skipping resolution."),
+                    _tr(
+                        "filter_warn_no_solvers",
+                        "No WCS solver configured (ASTAP/Astrometry/ANSVR).",
+                    ),
                     level="WARN",
                 )
                 return
@@ -1691,34 +2155,126 @@ def launch_filter_interface(
             ]
             if not pending:
                 msg = _tr("filter_log_no_missing_wcs", "All listed files already include a WCS solution.")
-                summary_var.set(msg)
+                summary_var.set(_apply_summary_hint(msg))
                 _log_message(msg, level="INFO")
                 return
 
+            write_inplace = bool(write_wcs_var.get())
             resolve_state["running"] = True
             resolve_btn.state(["disabled"])
-            summary_var.set(_tr("filter_log_resolving", "Resolving missing WCS..."))
-            _log_message(_tr("filter_log_resolving", "Resolving missing WCS..."), level="INFO")
+            summary_msg = _tr(
+                "filter_log_resolving_wide",
+                "Resolving missing WCS (ASTAP/Astrometry/ANSVR)…",
+            )
+            summary_var.set(_apply_summary_hint(summary_msg))
+            _log_message(summary_msg, level="INFO")
 
+            footprints_restore_state["value"] = bool(draw_footprints_var.get())
+            footprints_restore_state["needs_restore"] = True
+            indices_cache = footprints_restore_state.get("indices")
+            if isinstance(indices_cache, set):
+                indices_cache.clear()
+            else:
+                footprints_restore_state["indices"] = set()
             try:
+                draw_footprints_var.set(False)
+            except Exception:
+                pass
+            if footprints_restore_state["value"]:
+                pending_visual_refresh.update(range(len(items)))
+                _schedule_visual_refresh_flush()
+            try:
+                footprints_chk.state(["disabled"])
+            except Exception:
                 try:
-                    srch_radius = float(search_radius_default)
-                    if srch_radius <= 0:
-                        srch_radius = None
+                    footprints_chk.configure(state=tk.DISABLED)
                 except Exception:
-                    srch_radius = None
-                try:
-                    downsample_val = int(downsample_default)
-                    if downsample_val < 0:
-                        downsample_val = None
-                except Exception:
-                    downsample_val = None
+                    pass
 
-                def _resolve_worker(pairs: list[tuple[int, Any]]) -> None:
-                    resolved_now = 0
+            solver_settings_local: Dict[str, Any] = dict(combined_solver_settings)
+            if astrometry_api_key:
+                solver_settings_local["api_key"] = astrometry_api_key
+            if ansvr_path:
+                solver_settings_local["ansvr_path"] = ansvr_path
+            solver_settings_local["update_original_header_in_place"] = write_inplace
+
+            def _coerce_float(val: Any) -> Optional[float]:
+                try:
+                    if val is None:
+                        return None
+                    value = float(val)
+                except Exception:
+                    return None
+                return value
+
+            def _coerce_int(val: Any) -> Optional[int]:
+                try:
+                    if val is None or val == "":
+                        return None
+                    value = int(float(val))
+                except Exception:
+                    return None
+                return value
+
+            search_radius_val = solver_settings_local.get(
+                "astap_search_radius_deg",
+                cfg_defaults.get("astap_default_search_radius"),
+            )
+            srch_radius = _coerce_float(search_radius_val)
+            if srch_radius is not None and srch_radius <= 0:
+                srch_radius = None
+            if srch_radius is not None:
+                solver_settings_local["astap_search_radius_deg"] = srch_radius
+
+            downsample_candidate = solver_settings_local.get("astap_downsample")
+            if downsample_candidate is None:
+                downsample_candidate = solver_settings_local.get("downsample")
+            if downsample_candidate is None:
+                downsample_candidate = downsample_default
+            downsample_val = _coerce_int(downsample_candidate)
+            if downsample_val is not None and downsample_val < 0:
+                downsample_val = None
+            if downsample_val is not None:
+                solver_settings_local["downsample"] = downsample_val
+
+            sensitivity_candidate = solver_settings_local.get(
+                "astap_sensitivity",
+                cfg_defaults.get("astap_default_sensitivity"),
+            )
+            sensitivity_val = _coerce_int(sensitivity_candidate)
+            if sensitivity_val is not None:
+                solver_settings_local["astap_sensitivity"] = sensitivity_val
+
+            timeout_candidate = solver_settings_local.get("timeout")
+            if timeout_candidate in (None, ""):
+                timeout_candidate = solver_settings_local.get("ansvr_timeout")
+            timeout_val = _coerce_int(timeout_candidate)
+            if timeout_val is None or timeout_val <= 0:
+                timeout_val = 60
+            timeout_sec = max(5, min(timeout_val, 120))
+            solver_settings_local["timeout"] = timeout_sec
+            solver_settings_local["ansvr_timeout"] = timeout_sec
+
+            astrometry_direct = getattr(astrometry_mod, "solve_with_astrometry_net", None) if astrometry_mod else None
+            ansvr_direct = getattr(astrometry_mod, "solve_with_ansvr", None) if astrometry_mod else None
+
+            def _resolve_worker(pairs: list[tuple[int, Any]]) -> None:
+                resolved_now = 0
+
+                def _log_solver_event(key: str, default: str, level: str, **fmt: Any) -> None:
                     try:
-                        for idx, item in pairs:
+                        message = _tr(key, default, **fmt)
+                    except Exception:
+                        message = default.format(**fmt)
+                    _enqueue_event("log", message, level)
+
+                try:
+                    for idx, item in pairs:
+                        try:
                             path = item.path
+                            if not isinstance(path, str) or not os.path.isfile(path):
+                                continue
+
                             header_obj = item.header
                             if header_obj is not None:
                                 _enqueue_event("header_loaded", idx, header_obj)
@@ -1726,199 +2282,631 @@ def launch_filter_interface(
                                 try:
                                     with astap_fits_module.open(path) as hdul_hdr:
                                         header_obj = hdul_hdr[0].header
-                                        if header_obj is not None:
-                                            _enqueue_event("header_loaded", idx, header_obj)
                                 except Exception as exc:
-                                    _enqueue_event("log", f"Failed to load FITS header for '{path}': {exc}", "ERROR")
-                                    header_obj = item.header
-                            try:
-                                wcs_obj = solve_with_astap(
-                                    path,
-                                    header_obj,
-                                    astap_exe_path,
-                                    astap_data_dir,
-                                    search_radius_deg=srch_radius,
-                                    downsample_factor=downsample_val,
-                                    sensitivity=None,
-                                    timeout_sec=60,
-                                    update_original_header_in_place=False,
-                                    progress_callback=_progress_callback,
-                                )
-                            except Exception as exc:
-                                _enqueue_event("log", f"ASTAP resolve exception: {exc}", "ERROR")
-                                wcs_obj = None
-                            if wcs_obj and getattr(wcs_obj, "is_celestial", False):
-                                resolved_now += 1
-                                _enqueue_event("resolved_item", idx, header_obj, wcs_obj)
-                    finally:
-                        _enqueue_event("resolve_done", resolved_now)
+                                    _enqueue_event(
+                                        "log",
+                                        f"Failed to load FITS header for '{path}': {exc}",
+                                        "ERROR",
+                                    )
+                                    header_obj = None
+                                else:
+                                    if header_obj is not None:
+                                        _enqueue_event("header_loaded", idx, header_obj)
+                            if header_obj is None:
+                                try:
+                                    header_obj = fits.getheader(path, 0)
+                                except Exception as exc:
+                                    _enqueue_event(
+                                        "log",
+                                        f"Failed to load FITS header for '{path}': {exc}",
+                                        "ERROR",
+                                    )
+                                    continue
+                                else:
+                                    if header_obj is not None:
+                                        _enqueue_event("header_loaded", idx, header_obj)
 
+                            solved_wcs = None
+                            file_name = os.path.basename(path)
+
+                            try:
+                                existing = WCS(header_obj, naxis=2, relax=True)
+                                if existing is not None and getattr(existing, "is_celestial", False):
+                                    solved_wcs = existing
+                            except Exception:
+                                pass
+
+                            def _handle_success(solver_name: str, wcs_obj: Any) -> None:
+                                nonlocal resolved_now
+                                resolved_now += 1
+                                _log_solver_event(
+                                    "filter_log_solver_ok",
+                                    "{solver} solved {name}.",
+                                    "INFO",
+                                    solver=solver_name,
+                                    name=file_name,
+                                )
+                                footprint_pts = None
+                                try:
+                                    shape_hw = getattr(item, "shape", None)
+                                    if shape_hw is None and header_obj is not None:
+                                        try:
+                                            nax1 = header_obj.get("NAXIS1")
+                                            nax2 = header_obj.get("NAXIS2")
+                                            if nax1 and nax2:
+                                                w_px = int(float(nax1))
+                                                h_px = int(float(nax2))
+                                                if w_px > 0 and h_px > 0:
+                                                    shape_hw = (h_px, w_px)
+                                        except Exception:
+                                            pass
+                                    footprint_pts = _compute_footprint_from_wcs(wcs_obj, shape_hw)
+                                except Exception:
+                                    footprint_pts = None
+                                _enqueue_event("resolved_item", idx, header_obj, wcs_obj, footprint_pts)
+
+                            def _handle_failure(solver_name: str, err: str, level: str = "WARN") -> None:
+                                _log_solver_event(
+                                    "filter_log_solver_failed",
+                                    "{solver} failed for {name} ({err}).",
+                                    level,
+                                    solver=solver_name,
+                                    name=file_name,
+                                    err=err,
+                                )
+
+                            if solved_wcs is not None:
+                                _handle_success("Header", solved_wcs)
+                                continue
+
+                            # ASTAP attempt
+                            if astap_enabled:
+                                _log_solver_event(
+                                    "filter_log_solver_attempt",
+                                    "Trying {solver} for {name}…",
+                                    "INFO",
+                                    solver="ASTAP",
+                                    name=file_name,
+                                )
+                                try:
+                                    astap_wcs = solve_with_astap(
+                                        path,
+                                        header_obj,
+                                        astap_exe_path,
+                                        astap_data_dir,
+                                        search_radius_deg=srch_radius,
+                                        downsample_factor=downsample_val,
+                                        sensitivity=sensitivity_val,
+                                        timeout_sec=timeout_sec,
+                                        update_original_header_in_place=write_inplace,
+                                        progress_callback=_progress_callback,
+                                    )
+                                except Exception as exc:
+                                    _handle_failure("ASTAP", str(exc), level="ERROR")
+                                else:
+                                    if astap_wcs and getattr(astap_wcs, "is_celestial", False):
+                                        _handle_success("ASTAP", astap_wcs)
+                                        continue
+                                    _handle_failure("ASTAP", "no solution")
+
+                            if astrometry_enabled:
+                                _log_solver_event(
+                                    "filter_log_solver_attempt",
+                                    "Trying {solver} for {name}…",
+                                    "INFO",
+                                    solver="Astrometry.net",
+                                    name=file_name,
+                                )
+                                skip_failure = False
+                                try:
+                                    if write_inplace and solve_with_astrometry:
+                                        astrometry_wcs = solve_with_astrometry(
+                                            path,
+                                            header_obj,
+                                            solver_settings_local,
+                                            progress_callback=_progress_callback,
+                                        )
+                                    elif not write_inplace and astrometry_direct:
+                                        astrometry_wcs = astrometry_direct(
+                                            path,
+                                            header_obj,
+                                            api_key=solver_settings_local.get("api_key", ""),
+                                            timeout_sec=timeout_sec,
+                                            downsample_factor=solver_settings_local.get("downsample"),
+                                            update_original_header_in_place=False,
+                                            progress_callback=_progress_callback,
+                                        )
+                                    else:
+                                        astrometry_wcs = None
+                                        if not write_inplace:
+                                            _handle_failure("Astrometry.net", "disabled (write-off)", level="INFO")
+                                            skip_failure = True
+                                except Exception as exc:
+                                    _handle_failure("Astrometry.net", str(exc), level="ERROR")
+                                else:
+                                    if astrometry_wcs and getattr(astrometry_wcs, "is_celestial", False):
+                                        _handle_success("Astrometry.net", astrometry_wcs)
+                                        continue
+                                    if not skip_failure:
+                                        _handle_failure("Astrometry.net", "no solution")
+
+                            if ansvr_enabled:
+                                _log_solver_event(
+                                    "filter_log_solver_attempt",
+                                    "Trying {solver} for {name}…",
+                                    "INFO",
+                                    solver="ANSVR",
+                                    name=file_name,
+                                )
+                                skip_failure = False
+                                try:
+                                    if write_inplace and solve_with_ansvr:
+                                        ansvr_wcs = solve_with_ansvr(
+                                            path,
+                                            header_obj,
+                                            solver_settings_local,
+                                            progress_callback=_progress_callback,
+                                        )
+                                    elif not write_inplace and ansvr_direct:
+                                        ansvr_wcs = ansvr_direct(
+                                            path,
+                                            header_obj,
+                                            ansvr_config_path=solver_settings_local.get("ansvr_path", ""),
+                                            timeout_sec=timeout_sec,
+                                            update_original_header_in_place=False,
+                                            progress_callback=_progress_callback,
+                                        )
+                                    else:
+                                        ansvr_wcs = None
+                                        if not write_inplace:
+                                            _handle_failure("ANSVR", "disabled (write-off)", level="INFO")
+                                            skip_failure = True
+                                except Exception as exc:
+                                    _handle_failure("ANSVR", str(exc), level="ERROR")
+                                else:
+                                    if ansvr_wcs and getattr(ansvr_wcs, "is_celestial", False):
+                                        _handle_success("ANSVR", ansvr_wcs)
+                                        continue
+                                    if not skip_failure:
+                                        _handle_failure("ANSVR", "no solution")
+                        except Exception as exc:
+                            _enqueue_event("log", f"Unexpected resolver error: {exc}", "ERROR")
+                finally:
+                    _enqueue_event("resolve_done", resolved_now)
+
+            try:
                 threading.Thread(target=_resolve_worker, args=(pending,), daemon=True).start()
             except Exception:
                 resolve_state["running"] = False
                 resolve_btn.state(["!disabled"])
+                if footprints_restore_state.get("needs_restore"):
+                    original_value = bool(footprints_restore_state.get("value", True))
+                    try:
+                        draw_footprints_var.set(original_value)
+                    except Exception:
+                        pass
+                    if original_value:
+                        pending_visual_refresh.update(range(len(items)))
+                    if pending_visual_refresh:
+                        _schedule_visual_refresh_flush()
+                    try:
+                        footprints_chk.state(["!disabled"])
+                    except Exception:
+                        try:
+                            footprints_chk.configure(state=tk.NORMAL)
+                        except Exception:
+                            pass
+                    footprints_restore_state["needs_restore"] = False
+                    indices_cache = footprints_restore_state.get("indices")
+                    if isinstance(indices_cache, set):
+                        indices_cache.clear()
                 raise
+
+        # Coverage-first auto-organization state and helpers
+        auto_cluster_state = {"running": False}
+
+        def _tr_safe(key: str, default: str, **kwargs: Any) -> str:
+            try:
+                return _tr(key, default, **kwargs)
+            except Exception:
+                try:
+                    return default.format(**kwargs)
+                except Exception:
+                    return default
 
         def _auto_organize_master_tiles() -> None:
             if not (cluster_func and autosplit_func):
                 return
-            auto_btn.state(["disabled"])
+            if auto_cluster_state.get("running"):
+                return
             try:
-                selected_indices = _get_selected_indices()
-                if not selected_indices:
-                    summary_text = _tr(
-                        "filter_log_groups_summary",
-                        "Prepared {g} group(s), sizes: {sizes}.",
-                        g=0,
-                        sizes="[]",
-                    )
-                    summary_var.set(summary_text)
-                    _log_message(summary_text, level="INFO")
-                    return
+                auto_btn.state(["disabled"])
+            except Exception:
+                pass
 
-                class _FallbackWCS:
-                    is_celestial = True
+            try:
+                selected_indices = list(_get_selected_indices())
+            except Exception:
+                selected_indices = []
 
-                    def __init__(self, center_coord: SkyCoord):
-                        self._center = center_coord
-                        self.pixel_shape = (1, 1)
-                        self.array_shape = (1, 1)
+            if not selected_indices:
+                summary_text = _tr_safe(
+                    "filter_log_groups_summary",
+                    "Prepared {g} group(s), sizes: {sizes}.",
+                    g=0,
+                    sizes="[]",
+                )
+                summary_var.set(_apply_summary_hint(summary_text))
+                _log_message(summary_text, level="INFO")
+                try:
+                    auto_btn.state(["!disabled"])
+                except Exception:
+                    pass
+                return
 
-                        class _Inner:
-                            def __init__(self, center: SkyCoord):
-                                self.crval = (
-                                    float(center.ra.to(u.deg).value),
-                                    float(center.dec.to(u.deg).value),
-                                )
-                                self.crpix = (0.5, 0.5)
+            try:
+                overcap_pct_value = int(overcap_percent_var.get())
+            except Exception:
+                overcap_pct_value = 10
+            overcap_pct_value = max(0, min(50, overcap_pct_value))
+            coverage_enabled_flag = bool(coverage_first_var.get())
 
-                        self.wcs = _Inner(center_coord)
+            auto_cluster_state["running"] = True
 
-                    def pixel_to_world(self, _x: float, _y: float):
-                        return self._center
+            def _finalize_ui() -> None:
+                auto_cluster_state["running"] = False
+                try:
+                    auto_btn.state(["!disabled"])
+                except Exception:
+                    pass
 
-                candidate_infos: list[dict] = []
-                coord_samples: list[tuple[float, float]] = []
-                for idx in selected_indices:
-                    item = items[idx]
-                    entry = dict(item.src)
-                    if "path" not in entry:
-                        entry["path"] = item.path
-                    if "path_raw" not in entry and item.src.get("path_raw"):
-                        entry["path_raw"] = item.src.get("path_raw")
-                    if "header" not in entry:
-                        entry["header"] = item.header
-                    if item.shape and "shape" not in entry:
-                        entry["shape"] = item.shape
-                    center_obj = item.center or item.phase0_center
-                    if center_obj is None and extract_center_from_header_fn and item.header is not None:
+            def _notify_no_groups(level: str) -> None:
+                summary_text_local = _tr_safe(
+                    "filter_log_groups_summary",
+                    "Prepared {g} group(s), sizes: {sizes}.",
+                    g=0,
+                    sizes="[]",
+                )
+                summary_var.set(_apply_summary_hint(summary_text_local))
+                _log_message(summary_text_local, level=level)
+                _finalize_ui()
+
+            def _handle_error(message: str) -> None:
+                _log_message(message, level="ERROR")
+                _finalize_ui()
+
+            def _apply_result(result: Dict[str, Any]) -> None:
+                try:
+                    final_groups = result.get("final_groups") or []
+                    if isinstance(overrides_state, dict):
+                        overrides_state["preplan_master_groups"] = final_groups
                         try:
-                            center_obj = extract_center_from_header_fn(item.header)
+                            overrides_state.pop("autosplit_cap", None)
                         except Exception:
-                            center_obj = None
-                    if item.wcs is None and center_obj is not None:
-                        entry["wcs"] = _FallbackWCS(center_obj)
-                        entry["_fallback_wcs_used"] = True
-                        entry.setdefault("phase0_center", center_obj)
-                        entry.setdefault("center", center_obj)
-                    elif item.wcs is not None:
-                        entry["wcs"] = item.wcs
-                        if center_obj is not None:
-                            entry.setdefault("center", center_obj)
-                    if center_obj is not None:
-                        coord_samples.append(
-                            (
-                                float(center_obj.ra.to(u.deg).value),
-                                float(center_obj.dec.to(u.deg).value),
-                            )
-                        )
-                        entry.setdefault("RA", coord_samples[-1][0])
-                        entry.setdefault("DEC", coord_samples[-1][1])
-                    candidate_infos.append(entry)
-
-                if not candidate_infos:
-                    summary_text = _tr(
+                            pass
+                    sizes = result.get("sizes")
+                    if not isinstance(sizes, list):
+                        sizes = [len(gr) for gr in final_groups]
+                    sizes_str = ", ".join(str(s) for s in sizes) if sizes else "[]"
+                    summary_text = _tr_safe(
                         "filter_log_groups_summary",
                         "Prepared {g} group(s), sizes: {sizes}.",
-                        g=0,
-                        sizes="[]",
+                        g=len(final_groups),
+                        sizes=sizes_str,
                     )
-                    summary_var.set(summary_text)
-                    _log_message(summary_text, level="WARN")
-                    return
+                    summary_var.set(_apply_summary_hint(summary_text))
+                    _log_message(summary_text, level="INFO")
+                    if result.get("coverage_first"):
+                        done_msg = _tr_safe(
+                            "log_covfirst_done",
+                            "Coverage-first preplan ready: {N} groups written to overrides_state.preplan_master_groups",
+                            N=len(final_groups),
+                        )
+                        _log_message(done_msg, level="INFO")
+                    pending_outline_state["groups"] = final_groups if final_groups else None
+                    if not resolve_state.get("running"):
+                        try:
+                            _draw_group_outlines(final_groups)
+                        except Exception:
+                            pass
+                except Exception as exc:
+                    _log_message(f"[FilterUI] Failed to apply clustering result: {exc}", level="ERROR")
+                finally:
+                    _finalize_ui()
 
-                if coord_samples:
-                    if compute_dispersion_func:
+            def _worker(selected_snapshot: list[int], overcap_pct: int, coverage_enabled: bool) -> None:
+                try:
+                    class _FallbackWCS:
+                        is_celestial = True
+
+                        def __init__(self, center_coord: SkyCoord):
+                            self._center = center_coord
+                            self.pixel_shape = (1, 1)
+                            self.array_shape = (1, 1)
+
+                            class _Inner:
+                                def __init__(self, center: SkyCoord):
+                                    self.crval = (
+                                        float(center.ra.to(u.deg).value),
+                                        float(center.dec.to(u.deg).value),
+                                    )
+                                    self.crpix = (0.5, 0.5)
+
+                            self.wcs = _Inner(center_coord)
+
+                        def pixel_to_world(self, _x: float, _y: float):
+                            return self._center
+
+                    candidate_infos: list[dict] = []
+                    coord_samples: list[tuple[float, float]] = []
+                    for idx in selected_snapshot:
+                        if idx < 0 or idx >= len(items):
+                            continue
+                        item = items[idx]
+                        entry = dict(item.src)
+                        if "path" not in entry:
+                            entry["path"] = item.path
+                        if "path_raw" not in entry and item.src.get("path_raw"):
+                            entry["path_raw"] = item.src.get("path_raw")
+                        if "header" not in entry:
+                            entry["header"] = item.header
+                        if item.shape and "shape" not in entry:
+                            entry["shape"] = item.shape
+                        center_obj = item.center or item.phase0_center
+                        if center_obj is None and extract_center_from_header_fn and item.header is not None:
+                            try:
+                                center_obj = extract_center_from_header_fn(item.header)
+                            except Exception:
+                                center_obj = None
+                        if item.wcs is None and center_obj is not None:
+                            entry["wcs"] = _FallbackWCS(center_obj)
+                            entry["_fallback_wcs_used"] = True
+                            entry.setdefault("phase0_center", center_obj)
+                            entry.setdefault("center", center_obj)
+                        elif item.wcs is not None:
+                            entry["wcs"] = item.wcs
+                            if center_obj is not None:
+                                entry.setdefault("center", center_obj)
+                        if center_obj is not None:
+                            try:
+                                coord_samples.append(
+                                    (
+                                        float(center_obj.ra.to(u.deg).value),
+                                        float(center_obj.dec.to(u.deg).value),
+                                    )
+                                )
+                                entry.setdefault("RA", coord_samples[-1][0])
+                                entry.setdefault("DEC", coord_samples[-1][1])
+                            except Exception:
+                                pass
+                        candidate_infos.append(entry)
+
+                    if not candidate_infos:
+                        root.after(0, lambda: _notify_no_groups("WARN"))
+                        return
+
+                    if coord_samples and compute_dispersion_func:
                         try:
                             dispersion_deg = float(compute_dispersion_func(coord_samples))
                         except Exception:
                             dispersion_deg = 0.0
                     else:
                         dispersion_deg = 0.0
-                else:
-                    dispersion_deg = 0.0
 
-                if dispersion_deg <= 0.12:
-                    threshold_deg = 0.10
-                elif dispersion_deg <= 0.30:
-                    threshold_deg = 0.15
-                else:
-                    threshold_deg = 0.05 if dispersion_deg <= 0.60 else 0.20
-                threshold_deg = min(0.20, max(0.08, threshold_deg))
+                    if dispersion_deg <= 0.12:
+                        threshold_heuristic = 0.10
+                    elif dispersion_deg <= 0.30:
+                        threshold_heuristic = 0.15
+                    else:
+                        threshold_heuristic = 0.05 if dispersion_deg <= 0.60 else 0.20
+                    threshold_heuristic = min(0.20, max(0.08, threshold_heuristic))
 
-                groups = cluster_func(
-                    candidate_infos,
-                    float(threshold_deg),
-                    _progress_callback,
-                    orientation_split_threshold_deg=0.0,
-                )
-                if not groups:
-                    summary_text = _tr(
-                        "filter_log_groups_summary",
-                        "Prepared {g} group(s), sizes: {sizes}.",
-                        g=0,
-                        sizes="[]",
+                    threshold_override = None
+                    threshold_candidates = [
+                        combined_solver_settings.get("panel_clustering_threshold_deg"),
+                        combined_solver_settings.get("cluster_panel_threshold"),
+                    ]
+                    if isinstance(overrides_state, dict):
+                        threshold_candidates.extend(
+                            [
+                                overrides_state.get("panel_clustering_threshold_deg"),
+                                overrides_state.get("cluster_panel_threshold"),
+                            ]
+                        )
+                    for candidate in threshold_candidates:
+                        try:
+                            val = float(candidate)
+                        except Exception:
+                            continue
+                        if val > 0:
+                            threshold_override = val
+                            break
+
+                    threshold_initial = float(threshold_override) if threshold_override and threshold_override > 0 else float(threshold_heuristic)
+                    if threshold_initial <= 0:
+                        threshold_initial = float(threshold_heuristic) if threshold_heuristic > 0 else 0.10
+
+                    orientation_threshold = 0.0
+                    orientation_candidates = [combined_solver_settings.get("cluster_orientation_split_deg")]
+                    if isinstance(overrides_state, dict):
+                        orientation_candidates.append(overrides_state.get("cluster_orientation_split_deg"))
+                    for candidate in orientation_candidates:
+                        try:
+                            val = float(candidate)
+                        except Exception:
+                            continue
+                        if val > 0:
+                            orientation_threshold = val
+                            break
+
+                    cap_effective = int(autosplit_cap)
+                    cap_candidates = [combined_solver_settings.get("max_raw_per_master_tile")]
+                    if isinstance(overrides_state, dict):
+                        cap_candidates.append(overrides_state.get("max_raw_per_master_tile"))
+                    for candidate in cap_candidates:
+                        try:
+                            val = int(candidate)
+                        except Exception:
+                            continue
+                        if val > 0:
+                            cap_effective = max(1, min(50, val))
+                            break
+
+                    min_cap_effective = int(autosplit_min_cap)
+                    min_candidates = [combined_solver_settings.get("autosplit_min_cap")]
+                    if isinstance(overrides_state, dict):
+                        min_candidates.append(overrides_state.get("autosplit_min_cap"))
+                    for candidate in min_candidates:
+                        try:
+                            val = int(candidate)
+                        except Exception:
+                            continue
+                        if val > 0:
+                            min_cap_effective = max(1, min(val, cap_effective))
+                            break
+                    min_cap_effective = max(1, min(min_cap_effective, cap_effective))
+
+                    if coverage_enabled:
+                        start_msg = _tr_safe(
+                            "log_covfirst_start",
+                            "Coverage-first clustering: start (threshold={TH} deg, cap={CAP}, min_cap={MIN})",
+                            TH=f"{threshold_initial:.3f}",
+                            CAP=int(cap_effective),
+                            MIN=int(min_cap_effective),
+                        )
+                        _log_async(start_msg, "INFO")
+
+                    threshold_for_cluster = float(threshold_initial)
+                    groups_initial = cluster_func(
+                        candidate_infos,
+                        threshold_for_cluster,
+                        _progress_callback,
+                        orientation_split_threshold_deg=float(orientation_threshold),
                     )
-                    summary_var.set(summary_text)
-                    _log_message(summary_text, level="WARN")
-                    return
+                    if not groups_initial:
+                        root.after(0, lambda: _notify_no_groups("WARN"))
+                        return
 
-                final_groups = autosplit_func(
-                    groups,
-                    cap=int(autosplit_cap),
-                    min_cap=int(autosplit_min_cap),
-                    progress_callback=_progress_callback,
-                )
-                final_groups = _merge_small_groups(
-                    final_groups,
-                    min_size=int(autosplit_min_cap),
-                    cap=int(autosplit_cap),
-                )
-                for grp in final_groups:
-                    for info in grp:
-                        if info.pop("_fallback_wcs_used", False):
-                            info.pop("wcs", None)
-                overrides_state["preplan_master_groups"] = final_groups
-                overrides_state["autosplit_cap"] = int(autosplit_cap)
-                sizes = [len(gr) for gr in final_groups]
-                sizes_str = ", ".join(str(s) for s in sizes) if sizes else "[]"
-                summary_text = _tr(
-                    "filter_log_groups_summary",
-                    "Prepared {g} group(s), sizes: {sizes}.",
-                    g=len(final_groups),
-                    sizes=sizes_str,
-                )
-                summary_var.set(summary_text)
-                _log_message(summary_text, level="INFO")
-                try:
-                    _draw_group_outlines(final_groups)
-                except Exception:
-                    pass
-            finally:
-                auto_btn.state(["!disabled"])
+                    groups_used = groups_initial
+                    threshold_used = threshold_for_cluster
+                    candidate_count = len(candidate_infos)
+                    ratio = (len(groups_initial) / float(candidate_count)) if candidate_count else 0.0
+                    pathological = candidate_count > 0 and (len(groups_initial) >= candidate_count or ratio >= 0.6)
 
-        resolve_btn.configure(command=_resolve_missing_wcs_inplace)
-        auto_btn.configure(command=_auto_organize_master_tiles)
+                    if coverage_enabled and pathological and len(coord_samples) >= 5:
+                        p90_value = None
+                        try:
+                            sc = SkyCoord(
+                                ra=[c[0] for c in coord_samples] * u.deg,
+                                dec=[c[1] for c in coord_samples] * u.deg,
+                                frame="icrs",
+                            )
+                            sep_matrix = sc[:, None].separation(sc[None, :]).deg
+                            if sep_matrix.size:
+                                with np.errstate(invalid="ignore"):
+                                    np.fill_diagonal(sep_matrix, np.nan)
+                                nearest = np.nanmin(sep_matrix, axis=1)
+                                finite = nearest[np.isfinite(nearest) & (nearest > 0)]
+                                if finite.size:
+                                    p90_value = float(np.nanpercentile(finite, 90))
+                        except Exception:
+                            p90_value = None
+                        if p90_value and np.isfinite(p90_value):
+                            threshold_relaxed = max(threshold_for_cluster, float(p90_value) * 1.1)
+                            if threshold_relaxed > threshold_for_cluster * 1.001:
+                                groups_relaxed = cluster_func(
+                                    candidate_infos,
+                                    threshold_relaxed,
+                                    _progress_callback,
+                                    orientation_split_threshold_deg=float(orientation_threshold),
+                                )
+                                if groups_relaxed and len(groups_relaxed) < len(groups_initial):
+                                    relax_msg = _tr_safe(
+                                        "log_covfirst_relax",
+                                        "Relaxed epsilon using P90 NN: old={OLD} deg -> new={NEW} deg",
+                                        OLD=f"{threshold_for_cluster:.3f}",
+                                        NEW=f"{threshold_relaxed:.3f}",
+                                    )
+                                    _log_async(relax_msg, "INFO")
+                                    groups_used = groups_relaxed
+                                    threshold_used = threshold_relaxed
+
+                    groups_after_autosplit = autosplit_func(
+                        groups_used,
+                        cap=int(cap_effective),
+                        min_cap=int(min_cap_effective),
+                        progress_callback=_progress_callback,
+                    )
+                    if coverage_enabled:
+                        autosplit_msg = _tr_safe(
+                            "log_covfirst_autosplit",
+                            "Autosplit applied: cap={CAP}, min_cap={MIN}, groups_in={IN}, groups_out={OUT}",
+                            CAP=int(cap_effective),
+                            MIN=int(min_cap_effective),
+                            IN=len(groups_used),
+                            OUT=len(groups_after_autosplit),
+                        )
+                        _log_async(autosplit_msg, "INFO")
+
+                    cap_with_allowance = max(int(cap_effective), int(cap_effective * (1 + overcap_pct / 100.0)))
+                    max_dispersion_limit = None
+                    if compute_dispersion_func and threshold_used > 0:
+                        max_dispersion_limit = float(threshold_used) * 1.05
+
+                    merge_log_fn = (lambda msg: _log_async(msg, "DEBUG_DETAIL")) if coverage_enabled else None
+                    final_groups = _merge_small_groups(
+                        groups_after_autosplit,
+                        min_size=int(min_cap_effective),
+                        cap=int(cap_effective),
+                        cap_allowance=cap_with_allowance,
+                        compute_dispersion=compute_dispersion_func if compute_dispersion_func else None,
+                        max_dispersion_deg=max_dispersion_limit,
+                        log_fn=merge_log_fn,
+                    )
+                    if coverage_enabled:
+                        merge_msg = _tr_safe(
+                            "log_covfirst_merge",
+                            "Merged small groups with over-cap allowance={ALLOW}%, final_groups={N}",
+                            ALLOW=int(overcap_pct),
+                            N=len(final_groups),
+                        )
+                        _log_async(merge_msg, "INFO")
+
+                    for grp in final_groups:
+                        for info in grp:
+                            if info.pop("_fallback_wcs_used", False):
+                                info.pop("wcs", None)
+
+                    result_payload = {
+                        "final_groups": final_groups,
+                        "sizes": [len(gr) for gr in final_groups],
+                        "coverage_first": coverage_enabled,
+                        "threshold_used": threshold_used,
+                    }
+                    root.after(0, lambda res=result_payload: _apply_result(res))
+                except Exception as exc:
+                    error_msg = f"[FilterUI] Coverage-first clustering failed: {exc}"
+                    root.after(0, lambda msg=error_msg: _handle_error(msg))
+
+            try:
+                threading.Thread(
+                    target=_worker,
+                    args=(selected_indices, overcap_pct_value, coverage_enabled_flag),
+                    daemon=True,
+                ).start()
+            except Exception as exc:
+                _handle_error(f"[FilterUI] Unable to start coverage-first clustering: {exc}")
+
+        try:
+            if resolve_btn is not None:
+                resolve_btn.configure(command=_resolve_missing_wcs_inplace)
+        except Exception as e:
+            _log_message(f"[FilterUI] Resolve button hook failed: {e}", level="WARN")
+        try:
+            if auto_btn is not None:
+                auto_btn.configure(command=_auto_organize_master_tiles)
+        except Exception as e:
+            _log_message(f"[FilterUI] Auto-group button hook failed: {e}", level="WARN")
 
         # If initial overrides already include preplanned groups, draw them now
         try:
@@ -1929,8 +2917,11 @@ def launch_filter_interface(
             pass
 
         # Selection helpers
-        actions = ttk.Frame(right)
-        actions.grid(row=4, column=0, sticky="ew", padx=5, pady=5)
+        actions = ttk.Frame(controls)
+        try:
+            actions.pack(fill=tk.X, expand=False, pady=5)
+        except Exception:
+            actions.pack(fill=tk.X, expand=False)
         def select_all():
             if use_listbox_mode:
                 if selection_state:
@@ -1969,7 +2960,7 @@ def launch_filter_interface(
             actions,
             text=_tr(
                 "filter_select_all",
-                "Tout sÃ©lectionner" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Select all",
+                "Tout sélectionner" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Select all",
             ),
             command=select_all,
         ).pack(side=tk.LEFT, padx=4)
@@ -1977,14 +2968,76 @@ def launch_filter_interface(
             actions,
             text=_tr(
                 "filter_select_none",
-                "Tout dÃ©sÃ©lectionner" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Deselect all",
+                "Tout désélectionner" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Deselect all",
             ),
             command=select_none,
         ).pack(side=tk.LEFT, padx=4)
 
         # Confirm/cancel buttons
-        bottom = ttk.Frame(right)
-        bottom.grid(row=5, column=0, sticky="ew", padx=5, pady=5)
+        bottom = ttk.Frame(controls)
+        try:
+            bottom.pack(fill=tk.X, expand=False)
+        except Exception:
+            bottom.pack(fill=tk.X)
+        try:
+            right.update_idletasks()
+            _dbg("Right panel constructed; awaiting controls visibility check…")
+        except Exception:
+            pass
+
+        def _ensure_controls_visible_later():
+            try:
+                # If controls area didn't map yet (themes/geometry lag), give
+                # those rows a larger minimum size and try again shortly.
+                if not bottom.winfo_ismapped() or bottom.winfo_height() < 5:
+                    try:
+                        right.rowconfigure(3, minsize=180)
+                    except Exception:
+                        pass
+                    try:
+                        _dbg("Controls not visible yet; increasing row minsize and retrying…")
+                    except Exception:
+                        pass
+                    root.after(150, _ensure_controls_visible_later)
+                else:
+                    try:
+                        _dbg(f"Controls visible: operations={operations.winfo_height()} actions={actions.winfo_height()} bottom={bottom.winfo_height()}")
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        try:
+            root.after(200, _ensure_controls_visible_later)
+        except Exception as e:
+            _log_message(f"[FilterUI] Scheduling visibility check failed: {e}", level="WARN")
+
+        # Keep controls row visible across resizes or heavy redraws (ASTAP/zoom)
+        def _enforce_right_grid(_event: Any | None = None) -> None:
+            try:
+                # Ensure the scrollable list (row=2) is the only stretchable row
+                right.rowconfigure(0, weight=0)
+                right.rowconfigure(1, weight=0)
+                right.rowconfigure(2, weight=1)
+                # Maintain a sane minimum height for the bottom controls
+                desired = 0
+                try:
+                    desired = int(operations.winfo_reqheight()) + int(actions.winfo_reqheight()) + int(bottom.winfo_reqheight()) + 12
+                except Exception:
+                    desired = 180
+                right.rowconfigure(3, weight=0, minsize=max(160, desired))
+            except Exception:
+                # Last resort: at least ensure row 3 doesn't collapse fully
+                try:
+                    right.rowconfigure(3, minsize=180)
+                except Exception:
+                    pass
+
+        try:
+            right.bind("<Configure>", _enforce_right_grid)
+            root.after_idle(_enforce_right_grid)
+        except Exception:
+            pass
         result: dict[str, Any] = {
             "accepted": None,
             "selected_indices": None,
@@ -2009,22 +3062,41 @@ def launch_filter_interface(
             result["selected_indices"] = sel
             result["overrides"] = overrides_state if overrides_state else None
             result["cancelled"] = False
-            try:
-                root.quit()
-            except Exception:
-                pass
-            root.destroy()
+            # If running as a Toplevel, do not quit the main GUI loop
+            if root_is_toplevel:
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+            else:
+                try:
+                    root.quit()
+                except Exception:
+                    pass
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
         def on_cancel():
             _drain_stream_queue_non_blocking(mark_done=True)
             result["accepted"] = False
             result["selected_indices"] = None
             result["cancelled"] = True
             result["overrides"] = _cancel_overrides_payload()
-            try:
-                root.quit()
-            except Exception:
-                pass
-            root.destroy()
+            if root_is_toplevel:
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
+            else:
+                try:
+                    root.quit()
+                except Exception:
+                    pass
+                try:
+                    root.destroy()
+                except Exception:
+                    pass
         ttk.Button(
             bottom,
             text=_tr(
@@ -2046,164 +3118,539 @@ def launch_filter_interface(
         check_vars: list[tk.BooleanVar] = []
         checkbuttons: list[Any] = []
         item_labels: list[str] = []
-        patches: list[Any] = []
-        center_pts: list[Any] = []  # matplotlib line2D handles
+        footprint_wrapped: list[Optional[np.ndarray]] = []
+        centroid_wrapped: list[Optional[tuple[float, float]]] = []
+        footprints_state: Dict[str, Any] = {
+            "collection": None,
+            "segments": [],
+            "colors": [],
+            "indices": [],
+        }
+        centroids_state: Dict[str, Any] = {
+            "collection": None,
+            "offsets": [],
+            "colors": [],
+            "indices": [],
+            "sizes": [],
+        }
+        footprint_budget_state = {"budget": 0, "total_items": 0}
+        preview_hint_state = {"active": False}
+        visual_build_state = {"indices": [], "cursor": 0, "job": None, "full": True, "footprints_used": 0}
+
+        def _ensure_visual_collections() -> None:
+            if footprints_state["collection"] is None:
+                lc = LineCollection([], linewidths=1.0, colors=[], alpha=1.0)
+                lc.set_picker(True)
+                try:
+                    lc.set_pickradius(5)
+                except Exception:
+                    pass
+                ax.add_collection(lc)
+                footprints_state["collection"] = lc
+            if centroids_state["collection"] is None:
+                sc = ax.scatter([], [], s=20, picker=True, alpha=0.9, c="tab:blue")
+                sc.set_offsets(np.empty((0, 2)))
+                sc.set_facecolors(np.empty((0, 4)))
+                sc.set_edgecolors(np.empty((0, 4)))
+                centroids_state["collection"] = sc
+
+        def _clear_visual_datasets() -> None:
+            footprints_state["segments"] = []
+            footprints_state["colors"] = []
+            footprints_state["indices"] = []
+            centroids_state["offsets"] = []
+            centroids_state["colors"] = []
+            centroids_state["indices"] = []
+            centroids_state["sizes"] = []
+
+        def _update_line_collection() -> None:
+            _ensure_visual_collections()
+            lc: Optional[LineCollection] = footprints_state.get("collection")
+            if lc is None:
+                return
+            lc.set_segments(footprints_state["segments"])
+            if footprints_state["colors"]:
+                lc.set_colors(footprints_state["colors"])
+            else:
+                lc.set_colors([])
+
+        def _update_centroid_collection() -> None:
+            _ensure_visual_collections()
+            coll = centroids_state.get("collection")
+            if coll is None:
+                return
+            offsets = centroids_state["offsets"]
+            if offsets:
+                coll.set_offsets(np.asarray(offsets, dtype=float))
+            else:
+                coll.set_offsets(np.empty((0, 2)))
+            colors = centroids_state["colors"]
+            sizes = centroids_state["sizes"]
+            if colors:
+                coll.set_facecolors(colors)
+                coll.set_edgecolors(colors)
+            else:
+                coll.set_facecolors(np.empty((0, 4)))
+                coll.set_edgecolors(np.empty((0, 4)))
+            if sizes:
+                coll.set_sizes(np.asarray(sizes, dtype=float))
+            else:
+                coll.set_sizes(np.empty((0,), dtype=float))
+
+        def _recompute_footprint_budget() -> int:
+            cap = _compute_dynamic_footprint_budget(
+                len(items),
+                preview_cap,
+                max_footprints=MAX_FOOTPRINTS,
+            )
+            footprint_budget_state["budget"] = cap
+            footprint_budget_state["total_items"] = len(items)
+            try:
+                current_summary = summary_var.get()
+            except Exception:
+                current_summary = ""
+            try:
+                summary_var.set(_apply_summary_hint(str(current_summary)))
+            except Exception:
+                pass
+            return footprint_budget_state["budget"]
+
+        VISUAL_CHUNK = 300
+
+        def _ensure_wrapped_capacity(idx: int) -> None:
+            while idx >= len(footprint_wrapped):
+                footprint_wrapped.append(None)
+            while idx >= len(centroid_wrapped):
+                centroid_wrapped.append(None)
+
+        def _prepare_visual_payload(idx: int) -> None:
+            _ensure_wrapped_capacity(idx)
+            item = items[idx]
+            fp = item.get_cached_footprint()
+            wrapped_fp: Optional[np.ndarray] = None
+            if fp is not None and len(fp) >= 3:
+                try:
+                    ra_vals = [wrap_ra_deg(float(v), ref_ra) for v in fp[:, 0].tolist()]
+                    dec_vals = [float(v) for v in fp[:, 1].tolist()]
+                    coords = np.column_stack([np.asarray(ra_vals, dtype=float), np.asarray(dec_vals, dtype=float)])
+                    wrapped_fp = coords
+                except Exception:
+                    wrapped_fp = None
+            footprint_wrapped[idx] = wrapped_fp
+            center_val: Optional[tuple[float, float]] = None
+            if item.center is not None:
+                try:
+                    ra_c = wrap_ra_deg(float(item.center.ra.to(u.deg).value), ref_ra)
+                    dec_c = float(item.center.dec.to(u.deg).value)
+                    center_val = (ra_c, dec_c)
+                except Exception:
+                    center_val = None
+            centroid_wrapped[idx] = center_val
+
+        def _append_visual_entry(idx: int) -> None:
+            selected = _is_selected(idx)
+            color = to_rgba("tab:blue" if selected else "0.7", 0.9 if selected else 0.3)
+            draw_fp = _should_draw_footprints()
+            footprint_budget = footprint_budget_state["budget"]
+            wrapped_fp = footprint_wrapped[idx]
+            if (
+                draw_fp
+                and wrapped_fp is not None
+                and visual_build_state["footprints_used"] < footprint_budget
+            ):
+                try:
+                    closed = np.vstack([wrapped_fp, wrapped_fp[0]])
+                except Exception:
+                    closed = None
+                if closed is not None:
+                    footprints_state["segments"].append(closed)
+                    footprints_state["colors"].append(color)
+                    footprints_state["indices"].append(idx)
+                    visual_build_state["footprints_used"] += 1
+                    return
+            center_val = centroid_wrapped[idx]
+            if center_val is not None:
+                centroids_state["offsets"].append(center_val)
+                centroids_state["colors"].append(color)
+                centroids_state["indices"].append(idx)
+                centroids_state["sizes"].append(28.0 if selected else 18.0)
+
+        def _process_visual_build_chunk() -> None:
+            visual_build_state["job"] = None
+            if not visual_build_state["indices"]:
+                return
+            start = visual_build_state["cursor"]
+            end = min(len(visual_build_state["indices"]), start + VISUAL_CHUNK)
+            if start == 0 and visual_build_state.get("full", True):
+                _clear_visual_datasets()
+                visual_build_state["footprints_used"] = 0
+                _recompute_footprint_budget()
+            for local_idx in range(start, end):
+                idx = visual_build_state["indices"][local_idx]
+                if idx < 0 or idx >= len(items):
+                    continue
+                _prepare_visual_payload(idx)
+                _append_visual_entry(idx)
+            _update_line_collection()
+            _update_centroid_collection()
+            if end < len(visual_build_state["indices"]):
+                visual_build_state["cursor"] = end
+                try:
+                    visual_build_state["job"] = root.after(15, _process_visual_build_chunk)
+                except Exception:
+                    _process_visual_build_chunk()
+            else:
+                visual_build_state["indices"] = []
+                visual_build_state["cursor"] = 0
+                visual_build_state["full"] = True
+                visual_build_state["footprints_used"] = 0
+                _schedule_axes_update()
+
+        def _schedule_visual_build(indices: Optional[Iterable[int]] = None, *, full: bool = False) -> None:
+            if indices is None or full:
+                target = list(range(len(items)))
+                full = True
+            else:
+                uniq: list[int] = []
+                seen: set[int] = set()
+                for raw in indices:
+                    try:
+                        idx = int(raw)
+                    except Exception:
+                        continue
+                    if idx < 0 or idx >= len(items) or idx in seen:
+                        continue
+                    uniq.append(idx)
+                    seen.add(idx)
+                target = uniq
+                if len(target) >= len(items):
+                    full = True
+                    target = list(range(len(items)))
+            visual_build_state["indices"] = target
+            visual_build_state["cursor"] = 0
+            visual_build_state["full"] = bool(full)
+            visual_build_state["footprints_used"] = 0
+            if visual_build_state["job"] is None:
+                try:
+                    visual_build_state["job"] = root.after(10, _process_visual_build_chunk)
+                except Exception:
+                    _process_visual_build_chunk()
         # Master Tile outlines (group-level overlays)
-        group_outline_patches: list[Any] = []
+        group_outline_state: Dict[str, Any] = {"collection": None, "segments": []}
 
         def _clear_group_outlines() -> None:
-            try:
-                for art in group_outline_patches:
+            coll = group_outline_state.get("collection")
+            if coll is not None:
+                try:
+                    coll.set_segments([])
+                except Exception:
                     try:
-                        art.remove()
+                        coll.remove()
                     except Exception:
                         pass
-            finally:
-                group_outline_patches.clear()
+                    group_outline_state["collection"] = None
+            group_outline_state["segments"] = []
 
         def _draw_group_outlines(groups_payload: Optional[list[list[dict]]]) -> None:
-            """Draw red bounding contours for Master Tile groups on the preview.
+            """Draw red Master Tile contours using celestial coordinates."""
 
-            For each group (list of dict entries similar to items), collect
-            available RA/Dec samples (footprints when possible, otherwise
-            centers), compute a simple axis-aligned bounding rectangle in the
-            wrapped RA/Dec space, and render it as a red polygon.
-            """
+            pending_outline_state["groups"] = groups_payload if groups_payload else None
+
             if not groups_payload:
                 _clear_group_outlines()
+                try:
+                    ax.relim()
+                except Exception:
+                    pass
+                try:
+                    ax.autoscale_view()
+                except Exception:
+                    pass
                 try:
                     canvas.draw_idle()
                 except Exception:
                     pass
                 return
 
-            _clear_group_outlines()
+            segments: list[np.ndarray] = []
             try:
+                def _wcs_corners_deg(wcs_obj: Any) -> Optional[np.ndarray]:
+                    try:
+                        ny: Optional[int] = None
+                        nx: Optional[int] = None
+                        if getattr(wcs_obj, "array_shape", None):
+                            ny, nx = wcs_obj.array_shape  # type: ignore[attr-defined]
+                        elif getattr(wcs_obj, "pixel_shape", None):
+                            nx, ny = wcs_obj.pixel_shape  # type: ignore[attr-defined]
+                        if ny is None or nx is None:
+                            return None
+                        px = np.array(
+                            [[0.0, 0.0], [float(nx), 0.0], [float(nx), float(ny)], [0.0, float(ny)]],
+                            dtype=float,
+                        )
+                        sky = pixel_to_skycoord(px[:, 0], px[:, 1], wcs_obj)
+                        ra = np.array(sky.ra.deg, dtype=float)
+                        dec = np.array(sky.dec.deg, dtype=float)
+                        if ra.size != 4 or dec.size != 4:
+                            return None
+                        return np.column_stack((ra, dec))
+                    except Exception:
+                        return None
+
+                def _extend_from_points(
+                    points: Any,
+                    widths_acc: list[float],
+                    heights_acc: list[float],
+                    ra_acc: list[float],
+                    dec_acc: list[float],
+                ) -> None:
+                    try:
+                        arr = np.asarray(points, dtype=float)
+                    except Exception:
+                        return
+                    if arr.ndim != 2 or arr.shape[1] < 2:
+                        return
+                    ra_vals = arr[:, 0]
+                    dec_vals = arr[:, 1]
+                    if ra_vals.size == 0 or dec_vals.size == 0:
+                        return
+                    mask = np.isfinite(ra_vals) & np.isfinite(dec_vals)
+                    if not np.any(mask):
+                        return
+                    ra_vals = ra_vals[mask]
+                    dec_vals = dec_vals[mask]
+                    ra_acc.extend(float(v) for v in ra_vals.tolist())
+                    dec_acc.extend(float(v) for v in dec_vals.tolist())
+
+                    ref_ra_local = float(np.nanmedian(ra_vals))
+                    ref_dec_local = float(np.nanmedian(dec_vals))
+                    if not np.isfinite(ref_ra_local) or not np.isfinite(ref_dec_local):
+                        return
+                    cos_local = float(np.cos(np.deg2rad(ref_dec_local))) if np.isfinite(ref_dec_local) else 1.0
+                    if abs(cos_local) < 1e-6:
+                        cos_local = 1e-6 if cos_local >= 0 else -1e-6
+
+                    try:
+                        x_vals = [
+                            (wrap_ra_deg(float(rv), ref_ra_local) - ref_ra_local) * cos_local for rv in ra_vals
+                        ]
+                        y_vals = [float(dv) - ref_dec_local for dv in dec_vals]
+                    except Exception:
+                        return
+
+                    if x_vals:
+                        span_x = float(np.nanmax(x_vals) - np.nanmin(x_vals))
+                        if np.isfinite(span_x) and span_x > 0:
+                            widths_acc.append(span_x)
+                    if y_vals:
+                        span_y = float(np.nanmax(y_vals) - np.nanmin(y_vals))
+                        if np.isfinite(span_y) and span_y > 0:
+                            heights_acc.append(span_y)
+
                 for grp in groups_payload:
-                    ra_vals_g: list[float] = []
-                    dec_vals_g: list[float] = []
+                    centers_wrapped: list[float] = []
+                    centers_dec: list[float] = []
+                    widths: list[float] = []
+                    heights: list[float] = []
+                    corner_ra_samples: list[float] = []
+                    corner_dec_samples: list[float] = []
 
-                    for info in grp or []:
-                        # 1) Prefer footprints already computed for the item corresponding
-                        #    to this entry (ensures consistency with blue outlines).
-                        try:
-                            # Try to map back to an existing Item via its path
-                            path_val = None
-                            if isinstance(info, dict):
-                                path_val = (
-                                    info.get("path")
-                                    or info.get("path_raw")
-                                    or info.get("path_preprocessed_cache")
+                    for info in (grp or []):
+                        wcs_candidates = []
+                        idx_mapped = None
+                        path_val = (
+                            (info.get("path") or info.get("path_raw") or info.get("path_preprocessed_cache"))
+                            if isinstance(info, dict)
+                            else None
+                        )
+                        if path_val:
+                            key = _path_key(path_val)
+                            idx_mapped = known_path_index.get(key)
+                        if idx_mapped is not None and 0 <= idx_mapped < len(items) and getattr(items[idx_mapped], "wcs", None) is not None:
+                            wcs_candidates.append(items[idx_mapped].wcs)
+                        if isinstance(info, dict) and info.get("wcs") is not None:
+                            wcs_candidates.append(info["wcs"])
+                        for wcs_obj in wcs_candidates:
+                            w_deg, h_deg = footprint_wh_deg(wcs_obj)
+                            if np.isfinite(w_deg) and np.isfinite(h_deg) and w_deg > 0 and h_deg > 0:
+                                widths.append(w_deg)
+                                heights.append(h_deg)
+                            corners = _wcs_corners_deg(wcs_obj)
+                            if corners is not None:
+                                _extend_from_points(
+                                    corners,
+                                    widths,
+                                    heights,
+                                    corner_ra_samples,
+                                    corner_dec_samples,
                                 )
-                            idx_mapped = None
-                            if path_val is not None:
-                                key = _path_key(path_val)
-                                idx_mapped = known_path_index.get(key)
-                            if idx_mapped is not None and 0 <= idx_mapped < len(items):
-                                it = items[idx_mapped]
-                                fp = it.get_cached_footprint() or it.ensure_footprint()
-                                if fp is not None and isinstance(fp, np.ndarray) and fp.shape[1] >= 2:
-                                    for pt in fp.tolist():
-                                        try:
-                                            ra_vals_g.append(wrap_ra_deg(float(pt[0]), ref_ra))
-                                            dec_vals_g.append(float(pt[1]))
-                                        except Exception:
-                                            pass
-                                    # Use the best source available; skip to next info
-                                    continue
-                        except Exception:
-                            pass
 
-                        # Attempt to use footprint corners when possible
-                        wcs_obj = None
-                        try:
-                            if isinstance(info, dict):
-                                wcs_obj = info.get("wcs")
-                        except Exception:
-                            wcs_obj = None
-
-                        # Infer shape
-                        shp = None
-                        try:
-                            if isinstance(info, dict):
-                                shp_val = info.get("shape")
-                                if isinstance(shp_val, (list, tuple)) and len(shp_val) >= 2:
-                                    h = int(shp_val[0]); w = int(shp_val[1])
-                                    if h > 0 and w > 0:
-                                        shp = (h, w)
-                        except Exception:
-                            shp = None
-
-                        if wcs_obj is not None and shp is not None and hasattr(wcs_obj, "pixel_to_world"):
+                        ra_c = None
+                        dec_c = None
+                        if idx_mapped is not None and 0 <= idx_mapped < len(items) and items[idx_mapped].center is not None:
                             try:
-                                h, w = shp
-                                corners = [
-                                    (0.0, 0.0),
-                                    (w - 1.0, 0.0),
-                                    (w - 1.0, h - 1.0),
-                                    (0.0, h - 1.0),
-                                ]
-                                for (x, y) in corners:
-                                    sc = wcs_obj.pixel_to_world(x, y)
-                                    ra = float(sc.ra.to(u.deg).value)
-                                    dec = float(sc.dec.to(u.deg).value)
-                                    ra_vals_g.append(wrap_ra_deg(ra, ref_ra))
-                                    dec_vals_g.append(dec)
-                                continue
+                                ra_c = float(items[idx_mapped].center.ra.to(u.deg).value)
+                                dec_c = float(items[idx_mapped].center.dec.to(u.deg).value)
                             except Exception:
-                                pass
-
-                        # Fallback: use center
-                        try:
-                            c = info.get("center") if isinstance(info, dict) else None
-                            ra_c = None; dec_c = None
-                            if c is not None:
-                                if hasattr(c, "ra") and hasattr(c, "dec"):
+                                ra_c = None
+                                dec_c = None
+                        if (ra_c is None or dec_c is None) and isinstance(info, dict):
+                            c = info.get("center")
+                            try:
+                                if c is not None and hasattr(c, "ra") and hasattr(c, "dec"):
                                     ra_c = float(c.ra.to(u.deg).value)
                                     dec_c = float(c.dec.to(u.deg).value)
                                 elif isinstance(c, (list, tuple)) and len(c) >= 2:
-                                    ra_c = float(c[0]); dec_c = float(c[1])
+                                    ra_c = float(c[0])
+                                    dec_c = float(c[1])
                                 elif isinstance(c, dict):
                                     ra_v = c.get("ra") or c.get("RA")
                                     dec_v = c.get("dec") or c.get("DEC")
                                     if ra_v is not None and dec_v is not None:
-                                        ra_c = float(ra_v); dec_c = float(dec_v)
-                            if ra_c is not None and dec_c is not None:
-                                ra_vals_g.append(wrap_ra_deg(ra_c, ref_ra))
-                                dec_vals_g.append(dec_c)
+                                        ra_c = float(ra_v)
+                                        dec_c = float(dec_v)
+                            except Exception:
+                                ra_c = None
+                                dec_c = None
+                        if (ra_c is None or dec_c is None) and isinstance(info, dict):
+                            try:
+                                ra_v = info.get("RA")
+                                dec_v = info.get("DEC")
+                                if ra_v is not None and dec_v is not None:
+                                    ra_c = float(ra_v)
+                                    dec_c = float(dec_v)
+                            except Exception:
+                                ra_c = None
+                                dec_c = None
+
+                        if ra_c is not None and dec_c is not None:
+                            centers_wrapped.append(wrap_ra_deg(ra_c, ref_ra))
+                            centers_dec.append(float(dec_c))
+
+                        footprint_points: Optional[Any] = None
+                        if idx_mapped is not None and 0 <= idx_mapped < len(items):
+                            try:
+                                fp_cached = items[idx_mapped].get_cached_footprint()
+                                footprint_points = fp_cached
+                            except Exception:
+                                footprint_points = None
+                        if footprint_points is None and isinstance(info, dict):
+                            footprint_points = info.get("footprint_radec") or info.get("_precomp_fp")
+                            if footprint_points is None:
+                                vals: list[tuple[float, float]] = []
+                                try:
+                                    for k in ("1", "2", "3", "4"):
+                                        ra_val = info.get(f"FP_RA{k}")
+                                        dec_val = info.get(f"FP_DEC{k}")
+                                        if ra_val is None or dec_val is None:
+                                            continue
+                                        if str(ra_val) == "" or str(dec_val) == "":
+                                            continue
+                                        vals.append((float(ra_val), float(dec_val)))
+                                except Exception:
+                                    vals = []
+                                if vals:
+                                    footprint_points = vals
+                        if footprint_points is not None:
+                            _extend_from_points(
+                                footprint_points,
+                                widths,
+                                heights,
+                                corner_ra_samples,
+                                corner_dec_samples,
+                            )
+
+                    if not centers_wrapped:
+                        continue
+
+                    tile_w = float(np.median(widths)) if widths else 0.2
+                    tile_h = float(np.median(heights)) if heights else 0.2
+
+                    grp_ra = float(np.median(centers_wrapped))
+                    grp_dec = float(np.median(centers_dec))
+
+                    cos_dec = float(np.cos(np.deg2rad(grp_dec))) if np.isfinite(grp_dec) else 1.0
+                    if abs(cos_dec) < 1e-6:
+                        cos_dec = 1e-6 if cos_dec >= 0 else -1e-6
+
+                    if corner_ra_samples and corner_dec_samples:
+                        try:
+                            x_offsets: list[float] = []
+                            y_offsets: list[float] = []
+                            for ra_val, dec_val in zip(corner_ra_samples, corner_dec_samples):
+                                delta_ra = wrap_ra_deg(float(ra_val), grp_ra) - grp_ra
+                                x_offsets.append(delta_ra * cos_dec)
+                                y_offsets.append(float(dec_val) - grp_dec)
+                            if x_offsets and y_offsets:
+                                x_min = float(np.nanmin(x_offsets))
+                                x_max = float(np.nanmax(x_offsets))
+                                y_min = float(np.nanmin(y_offsets))
+                                y_max = float(np.nanmax(y_offsets))
+                                if np.isfinite(x_min) and np.isfinite(x_max) and np.isfinite(y_min) and np.isfinite(y_max):
+                                    x_center = 0.5 * (x_min + x_max)
+                                    y_center = 0.5 * (y_min + y_max)
+                                    if abs(x_center) > 1e-9:
+                                        grp_ra = wrap_ra_deg(grp_ra + (x_center / cos_dec), ref_ra)
+                                    if abs(y_center) > 1e-9:
+                                        grp_dec = grp_dec + y_center
+                                    cos_dec = float(np.cos(np.deg2rad(grp_dec))) if np.isfinite(grp_dec) else 1.0
+                                    if abs(cos_dec) < 1e-6:
+                                        cos_dec = 1e-6 if cos_dec >= 0 else -1e-6
+                                    x_offsets = []
+                                    y_offsets = []
+                                    for ra_val, dec_val in zip(corner_ra_samples, corner_dec_samples):
+                                        delta_ra = wrap_ra_deg(float(ra_val), grp_ra) - grp_ra
+                                        x_offsets.append(delta_ra * cos_dec)
+                                        y_offsets.append(float(dec_val) - grp_dec)
+                                    x_span = float(np.nanmax(x_offsets) - np.nanmin(x_offsets)) if x_offsets else 0.0
+                                    y_span = float(np.nanmax(y_offsets) - np.nanmin(y_offsets)) if y_offsets else 0.0
+                                    if np.isfinite(x_span) and x_span > 0:
+                                        tile_w = max(tile_w, x_span)
+                                    if np.isfinite(y_span) and y_span > 0:
+                                        tile_h = max(tile_h, y_span)
                         except Exception:
                             pass
 
-                    if not ra_vals_g or not dec_vals_g:
-                        continue
+                    dx = tile_w / 2.0 / cos_dec
+                    dy = tile_h / 2.0
+                    ra_corners = [
+                        wrap_ra_deg(grp_ra - dx, ref_ra),
+                        wrap_ra_deg(grp_ra + dx, ref_ra),
+                        wrap_ra_deg(grp_ra + dx, ref_ra),
+                        wrap_ra_deg(grp_ra - dx, ref_ra),
+                    ]
+                    dec_corners = [grp_dec - dy, grp_dec - dy, grp_dec + dy, grp_dec + dy]
+                    rect_pts = list(zip(ra_corners, dec_corners))
+                    rect = np.array(rect_pts + [rect_pts[0]], dtype=float)
+                    segments.append(rect)
 
-                    try:
-                        ra_min, ra_max = min(ra_vals_g), max(ra_vals_g)
-                        dec_min, dec_max = min(dec_vals_g), max(dec_vals_g)
-                        # Tiny padding so thin groups remain visible
-                        ra_pad = max(1e-3, (ra_max - ra_min) * 0.03 + 0.05)
-                        dec_pad = max(1e-3, (dec_max - dec_min) * 0.03 + 0.05)
-                        ra0, ra1 = ra_min - ra_pad, ra_max + ra_pad
-                        dec0, dec1 = dec_min - dec_pad, dec_max + dec_pad
-                        rect_pts = [(ra0, dec0), (ra1, dec0), (ra1, dec1), (ra0, dec1)]
-                        poly = Polygon(rect_pts, closed=True, fill=False, edgecolor="red", linewidth=1.6, alpha=0.9, linestyle="--")
-                        ax.add_patch(poly)
-                        group_outline_patches.append(poly)
-                    except Exception:
-                        continue
+                group_outline_state["segments"] = segments
+                coll = group_outline_state.get("collection")
+                if coll is None:
+                    coll = LineCollection([], linewidths=1.6, colors=["red"], linestyle="--", alpha=0.9, zorder=5)
+                    ax.add_collection(coll)
+                    group_outline_state["collection"] = coll
+                coll.set_segments(segments)
+                if segments:
+                    coll.set_colors([to_rgba("red", 0.9) for _ in segments])
+                coll.set_linestyle("--")
+                coll.set_linewidth(1.6)
 
-                try:
-                    canvas.draw_idle()
-                except Exception:
-                    pass
             except Exception:
                 _clear_group_outlines()
+            finally:
+                try:
+                    ax.relim()
+                except Exception:
+                    pass
+                try:
+                    ax.autoscale_view()
+                except Exception:
+                    pass
                 try:
                     canvas.draw_idle()
                 except Exception:
                     pass
-        # Map matplotlib artists back to item indices for click-to-select
-        artist_to_index: dict[Any, int] = {}
         known_path_index: dict[str, int] = {}
 
         def _is_selected(idx: int) -> bool:
@@ -2306,10 +3753,56 @@ def launch_filter_interface(
                 pass
             return str(value) if value is not None else ""
 
-        all_ra_vals: list[float] = []
-        all_dec_vals: list[float] = []
-        drawn_footprints = {"count": 0}
+        def _should_draw_footprints() -> bool:
+            try:
+                if not bool(draw_footprints_var.get()):
+                    return False
+            except Exception:
+                return False
+            return footprint_budget_state.get("budget", 0) > 0
+
+        # (moved earlier — see early definition near summary_var)
+
         axes_update_pending = {"pending": False}
+
+        # Define axes update helpers early so any earlier population calls can use them safely
+        def _recompute_axes_limits() -> None:
+            ra_vals: list[float] = []
+            dec_vals: list[float] = []
+            for it in items:
+                footprint = it.get_cached_footprint()
+                if footprint is not None:
+                    for ra in footprint[:, 0].tolist():
+                        ra_vals.append(wrap_ra_deg(float(ra), ref_ra))
+                    dec_vals.extend(footprint[:, 1].tolist())
+                elif it.center is not None:
+                    ra_vals.append(wrap_ra_deg(float(it.center.ra.to(u.deg).value), ref_ra))
+                    dec_vals.append(float(it.center.dec.to(u.deg).value))
+            if ra_vals and dec_vals:
+                ra_min, ra_max = min(ra_vals), max(ra_vals)
+                dec_min, dec_max = min(dec_vals), max(dec_vals)
+                ra_pad = max(1e-3, (ra_max - ra_min) * 0.05 + 0.2)
+                dec_pad = max(1e-3, (dec_max - dec_min) * 0.05 + 0.2)
+                ax.set_xlim(ra_max + ra_pad, ra_min - ra_pad)
+                ax.set_ylim(dec_min - dec_pad, dec_max + dec_pad)
+                try:
+                    canvas.draw_idle()
+                except Exception:
+                    pass
+
+        def _schedule_axes_update() -> None:
+            if axes_update_pending["pending"]:
+                return
+
+            def _do_update() -> None:
+                axes_update_pending["pending"] = False
+                _recompute_axes_limits()
+
+            axes_update_pending["pending"] = True
+            try:
+                root.after_idle(_do_update)
+            except Exception:
+                _do_update()
         population_state = {
             "next_index": 0,
             "total": total_initial_entries,
@@ -2339,7 +3832,7 @@ def launch_filter_interface(
             status_var.set(
                 _tr(
                     "filter_status_populating",
-                    "Preparing listâ€¦ {current}/{total}",
+                    "Preparing list… {current}/{total}",
                 ).format(current=min(processed, population_state["total"]), total=population_state["total"])
             )
 
@@ -2350,7 +3843,7 @@ def launch_filter_interface(
             if item.center is not None:
                 try:
                     sep_deg = item.center.separation(global_center).to(u.deg).value
-                    sep_txt = f"  ({sep_deg:.2f}Â°)"
+                    sep_txt = f"  ({sep_deg:.2f}°)"
                 except Exception:
                     sep_txt = ""
 
@@ -2383,100 +3876,76 @@ def launch_filter_interface(
             if path_key:
                 known_path_index[path_key] = idx
 
-            # Ensure placeholders exist for visuals
-            patches.append(None)
-            center_pts.append(None)
-
-            color_sel = "tab:blue"
-
-            local_ra_vals: list[float] = []
-            local_dec_vals: list[float] = []
-
-            footprint_to_draw: Optional[np.ndarray] = None
-            if drawn_footprints["count"] < MAX_FOOTPRINTS:
-                footprint_to_draw = item.ensure_footprint()
-            else:
-                footprint_to_draw = item.get_cached_footprint()
-
-            if footprint_to_draw is not None and drawn_footprints["count"] < MAX_FOOTPRINTS:
-                try:
-                    ra_wrapped = [wrap_ra_deg(float(ra), ref_ra) for ra in footprint_to_draw[:, 0].tolist()]
-                    decs = footprint_to_draw[:, 1].tolist()
-                    poly = Polygon(
-                        list(zip(ra_wrapped, decs)),
-                        closed=True,
-                        fill=False,
-                        edgecolor=color_sel,
-                        linewidth=1.0,
-                        alpha=0.9,
-                    )
-                    try:
-                        poly.set_picker(True)
-                    except Exception:
-                        pass
-                    ax.add_patch(poly)
-                    patches[idx] = poly
-                    artist_to_index[poly] = idx
-                    local_ra_vals.extend(ra_wrapped)
-                    local_dec_vals.extend(decs)
-                    drawn_footprints["count"] += 1
-                except Exception:
-                    patches[idx] = None
-            elif item.center is not None:
-                try:
-                    ra_c = wrap_ra_deg(float(item.center.ra.to(u.deg).value), ref_ra)
-                    dec_c = float(item.center.dec.to(u.deg).value)
-                    ln, = ax.plot(
-                        [ra_c],
-                        [dec_c],
-                        marker="o",
-                        markersize=3,
-                        color=color_sel,
-                        alpha=0.9,
-                        picker=8,
-                    )
-                    center_pts[idx] = ln
-                    artist_to_index[ln] = idx
-                    local_ra_vals.append(ra_c)
-                    local_dec_vals.append(dec_c)
-                except Exception:
-                    center_pts[idx] = None
-
-            all_ra_vals.extend(local_ra_vals)
-            all_dec_vals.extend(local_dec_vals)
+            _ensure_wrapped_capacity(idx)
+            footprint_wrapped[idx] = None
+            centroid_wrapped[idx] = None
         ax.grid(True, which="both", linestyle=":", linewidth=0.6)
 
         def update_visuals(changed_index: Optional[Iterable[int] | int] = None) -> None:
-            """Refresh matplotlib artists to match the checkbox selection state."""
+            """Refresh aggregated matplotlib artists to match selection state."""
 
             if changed_index is None:
-                target_indices: Iterable[int] = range(len(items))
+                target = set(range(len(items)))
             elif isinstance(changed_index, Iterable) and not isinstance(changed_index, (str, bytes)):
-                target_indices = changed_index
+                target = set()
+                for raw_idx in changed_index:
+                    try:
+                        idx_val = int(raw_idx)
+                    except (TypeError, ValueError):
+                        continue
+                    if 0 <= idx_val < len(items):
+                        target.add(idx_val)
             else:
-                target_indices = (changed_index,)
-
-            any_updated = False
-            for raw_idx in target_indices:
+                target = set()
                 try:
-                    i = int(raw_idx)
+                    idx_val = int(changed_index)  # type: ignore[arg-type]
                 except (TypeError, ValueError):
-                    continue
-                if i < 0 or i >= len(items):
-                    continue
-                selected = _is_selected(i)
-                col = "tab:blue" if selected else "0.7"
-                alp = 0.9 if selected else 0.3
-                if i < len(patches) and patches[i] is not None:
-                    patches[i].set_edgecolor(col)
-                    patches[i].set_alpha(alp)
-                    any_updated = True
-                if i < len(center_pts) and center_pts[i] is not None:
-                    center_pts[i].set_color(col)
-                    center_pts[i].set_alpha(alp)
-                    any_updated = True
-            if any_updated:
-                canvas.draw_idle()
+                    idx_val = -1
+                if 0 <= idx_val < len(items):
+                    target.add(idx_val)
+
+            if not target:
+                target = set(range(len(items)))
+
+            updated = False
+            lc: Optional[LineCollection] = footprints_state.get("collection")
+            if lc is not None and footprints_state["indices"]:
+                colors = list(footprints_state["colors"])
+                for pos, idx in enumerate(footprints_state["indices"]):
+                    if idx not in target:
+                        continue
+                    selected = _is_selected(idx)
+                    colors[pos] = to_rgba("tab:blue" if selected else "0.7", 0.9 if selected else 0.3)
+                    updated = True
+                if updated:
+                    footprints_state["colors"] = colors
+                    lc.set_colors(colors)
+
+            coll = centroids_state.get("collection")
+            if coll is not None and centroids_state["indices"]:
+                colors = list(centroids_state["colors"])
+                sizes = list(centroids_state["sizes"])
+                centroid_updated = False
+                for pos, idx in enumerate(centroids_state["indices"]):
+                    if idx not in target:
+                        continue
+                    selected = _is_selected(idx)
+                    colors[pos] = to_rgba("tab:blue" if selected else "0.7", 0.9 if selected else 0.3)
+                    sizes[pos] = 28.0 if selected else 18.0
+                    centroid_updated = True
+                if centroid_updated:
+                    centroids_state["colors"] = colors
+                    centroids_state["sizes"] = sizes
+                    coll.set_facecolors(colors)
+                    coll.set_edgecolors(colors)
+                    coll.set_sizes(np.asarray(sizes, dtype=float))
+                    updated = True
+
+            if updated:
+                try:
+                    canvas.blit(ax.bbox)
+                except Exception:
+                    canvas.draw_idle()
 
         if use_listbox_mode and listbox_widget is not None:
             def _on_listbox_select(_event: Any) -> None:
@@ -2502,22 +3971,12 @@ def launch_filter_interface(
 
             listbox_widget.bind("<<ListboxSelect>>", _on_listbox_select)
 
-        def _apply_initial_axes() -> None:
-            if all_ra_vals and all_dec_vals:
-                ra_min, ra_max = min(all_ra_vals), max(all_ra_vals)
-                dec_min, dec_max = min(all_dec_vals), max(all_dec_vals)
-                ra_pad = max(1e-3, (ra_max - ra_min) * 0.05 + 0.2)
-                dec_pad = max(1e-3, (dec_max - dec_min) * 0.05 + 0.2)
-                ax.set_xlim(ra_max + ra_pad, ra_min - ra_pad)
-                ax.set_ylim(dec_min - dec_pad, dec_max + dec_pad)
-                canvas.draw_idle()
-
         def _finalize_initial_population() -> None:
             if population_state["finalized"]:
                 return
             population_state["finalized"] = True
             update_visuals()
-            _apply_initial_axes()
+            _schedule_axes_update()
             _update_population_indicator(population_state["total"], done=True)
 
         def _populate_initial_chunk() -> None:
@@ -2538,6 +3997,8 @@ def launch_filter_interface(
             end = start + chunk
             for idx in range(start, end):
                 _add_item_row(items[idx])
+            if end > start:
+                _schedule_visual_build(full=True)
             population_state["next_index"] = end
             _update_population_indicator(end, done=end >= total)
             try:
@@ -2595,6 +4056,7 @@ def launch_filter_interface(
             if not batch:
                 return
             new_indices: list[int] = []
+            visuals_dirty = False
             for entry in batch:
                 candidate_path = entry.get("path") or entry.get("path_raw") or entry.get("path_preprocessed_cache")
                 key = _path_key(candidate_path)
@@ -2619,14 +4081,15 @@ def launch_filter_interface(
                         sep_txt = ""
                         if items[existing_idx].center is not None:
                             sep_deg = items[existing_idx].center.separation(global_center).to(u.deg).value
-                            sep_txt = f"  ({sep_deg:.2f}Â°)"
+                            sep_txt = f"  ({sep_deg:.2f}°)"
                         _update_item_label(existing_idx, base_name + sep_txt)
                     except Exception:
                         pass
                     try:
-                        _refresh_item_visual(existing_idx)
+                        _refresh_item_visual(existing_idx, schedule_axes=False, trigger_build=False)
                     except Exception:
                         pass
+                    visuals_dirty = True
                     continue
                 raw_files_with_wcs.append(entry)
                 new_index = len(raw_files_with_wcs) - 1
@@ -2635,6 +4098,7 @@ def launch_filter_interface(
                 items.append(new_item)
                 _add_item_row(new_item)
                 new_indices.append(new_index)
+                visuals_dirty = True
             if new_indices:
                 update_visuals(new_indices)
             if not _center_ready["ok"]:
@@ -2648,7 +4112,8 @@ def launch_filter_interface(
                         thresh_button.state(["!disabled"])
                     except Exception:
                         pass
-            if new_indices:
+            if visuals_dirty:
+                _schedule_visual_build(full=True)
                 _schedule_axes_update()
 
         def _consume_ui_queue() -> None:
@@ -2695,6 +4160,8 @@ def launch_filter_interface(
         if stream_queue is not None and not stream_state.get("done"):
             try:
                 root.after(40, _consume_ui_queue)
+                # Opportunistic non-blocking pass in case scheduling is delayed
+                _drain_stream_queue_non_blocking(mark_done=False)
             except Exception:
                 stream_state["done"] = True
 
@@ -2755,71 +4222,32 @@ def launch_filter_interface(
                 except Exception:
                     stream_state["done"] = True
 
-        def _refresh_item_visual(idx: int) -> None:
+        def _refresh_item_visual(idx: int, *, schedule_axes: bool = True, trigger_build: bool = True) -> None:
             if idx < 0 or idx >= len(items):
                 return
-            item = items[idx]
-            prev_patch = patches[idx] if idx < len(patches) else None
-            prev_point = center_pts[idx] if idx < len(center_pts) else None
-            if prev_patch is not None:
-                try:
-                    prev_patch.remove()
-                except Exception:
-                    pass
-                artist_to_index.pop(prev_patch, None)
-                patches[idx] = None
-                drawn_footprints["count"] = max(0, drawn_footprints["count"] - 1)
-            if prev_point is not None:
-                try:
-                    prev_point.remove()
-                except Exception:
-                    pass
-                artist_to_index.pop(prev_point, None)
-                center_pts[idx] = None
-            selected = _is_selected(idx)
-            color_sel = "tab:blue" if selected else "0.7"
-            alpha_val = 0.9 if selected else 0.3
-            new_patch = None
-            new_point = None
-            footprint = item.get_cached_footprint()
-            if footprint is not None or (drawn_footprints["count"] < MAX_FOOTPRINTS and item.wcs is not None):
-                allow_draw = drawn_footprints["count"] < MAX_FOOTPRINTS
-                if allow_draw:
-                    try:
-                        footprint = item.ensure_footprint()
-                        if footprint is None:
-                            raise ValueError("no footprint")
-                        ra_wrapped = [wrap_ra_deg(float(ra), ref_ra) for ra in footprint[:, 0].tolist()]
-                        decs = footprint[:, 1].tolist()
-                        new_patch = Polygon(
-                            list(zip(ra_wrapped, decs)),
-                            closed=True,
-                            fill=False,
-                            edgecolor=color_sel,
-                            linewidth=1.0,
-                            alpha=alpha_val,
-                        )
-                        new_patch.set_picker(True)
-                        ax.add_patch(new_patch)
-                        artist_to_index[new_patch] = idx
-                        patches[idx] = new_patch
-                        drawn_footprints["count"] += 1
-                    except Exception:
-                        new_patch = None
-            elif item.center is not None:
-                try:
-                    ra_c = wrap_ra_deg(float(item.center.ra.to(u.deg).value), ref_ra)
-                    dec_c = float(item.center.dec.to(u.deg).value)
-                    new_point, = ax.plot([ra_c], [dec_c], marker="o", markersize=3, color=color_sel, alpha=alpha_val, picker=8)
-                    artist_to_index[new_point] = idx
-                    center_pts[idx] = new_point
-                except Exception:
-                    new_point = None
-            update_visuals(idx)
-            _schedule_axes_update()
+            _ensure_wrapped_capacity(idx)
+            footprint_wrapped[idx] = None
+            centroid_wrapped[idx] = None
+            _prepare_visual_payload(idx)
+            if trigger_build:
+                _schedule_visual_build(full=True)
+            if schedule_axes:
+                _schedule_axes_update()
+
+        def _on_draw_mode_change() -> None:
+            _schedule_visual_build(full=True)
+
+        try:
+            footprints_chk.configure(command=_on_draw_mode_change)
+        except Exception:
+            pass
 
         def _trigger_stream_start(force: bool = False) -> None:
-            if not stream_mode:
+            try:
+                _dbg(f"_trigger_stream_start called; stream_mode={stream_mode}, pending_start={stream_state.get('pending_start')}, running={stream_state.get('running')}")
+            except Exception:
+                pass
+            if not stream_mode and not callable(stream_state.get("spawn_worker")):
                 return
             spawn_callable = stream_state.get("spawn_worker")
             if not callable(spawn_callable):
@@ -2829,13 +4257,18 @@ def launch_filter_interface(
             if not force and not stream_state.get("pending_start"):
                 return
             stream_state["pending_start"] = False
-            stream_state["status_message"] = _tr("filter_status_crawling", "Crawling filesâ€¦ please wait")
+            stream_state["done"] = False
+            stream_state["status_message"] = _tr("filter_status_crawling", "Crawling files… please wait")
             try:
                 status_var.set(stream_state["status_message"])
             except Exception:
                 pass
             try:
                 pb.start(80)
+            except Exception:
+                pass
+            try:
+                _log_message("[Filter] Analyse clicked — starting directory crawl…", level="INFO")
             except Exception:
                 pass
             try:
@@ -2849,7 +4282,52 @@ def launch_filter_interface(
                 stream_state["done"] = True
 
         def _on_analyse() -> None:
-            if not stream_mode:
+            try:
+                _dbg("Analyse button pressed")
+            except Exception:
+                pass
+            # Always surface an Activity log entry for clarity
+            try:
+                _log_message(_tr("filter_log_analyse_clicked", "Analyse clicked — preparing scan…"), level="INFO")
+            except Exception:
+                pass
+            # If the spawn worker is not set yet but we have an input directory,
+            # build a minimal fallback spawner so Analyse still works.
+            if not callable(stream_state.get("spawn_worker")):
+                try:
+                    if isinstance(input_dir, str) and os.path.isdir(input_dir):
+                        def _fallback_crawl_worker(target_queue: "queue.Queue[list[Dict[str, Any]] | None]", stop_event: threading.Event) -> None:
+                            batch: list[Dict[str, Any]] = []
+                            minimum_batch = max(1, int(batch_size) if isinstance(batch_size, int) else 100)
+                            for idx, fpath in enumerate(_iter_fits_paths(input_dir, recursive=scan_recursive)):
+                                if stop_event.is_set():
+                                    break
+                                item = _minimal_header_payload(fpath)
+                                item["index"] = idx
+                                batch.append(item)
+                                if len(batch) >= minimum_batch:
+                                    if stop_event.is_set():
+                                        break
+                                    target_queue.put(batch)
+                                    batch = []
+                            if not stop_event.is_set():
+                                if batch:
+                                    target_queue.put(batch)
+                            target_queue.put(None)
+                        def _fallback_spawn() -> None:
+                            nonlocal stream_queue, stream_stop_event
+                            if stream_state.get("running"):
+                                return
+                            stream_queue = queue.Queue()
+                            stream_stop_event = threading.Event()
+                            stream_state["running"] = True
+                            stream_state["done"] = False
+                            stream_state["status_message"] = None
+                            threading.Thread(target=_fallback_crawl_worker, args=(stream_queue, stream_stop_event), daemon=True).start()
+                        stream_state["spawn_worker"] = _fallback_spawn
+                except Exception:
+                    pass
+            if not stream_mode and not callable(stream_state.get("spawn_worker")):
                 return
             _trigger_stream_start(force=True)
 
@@ -2871,10 +4349,17 @@ def launch_filter_interface(
                 # If we have a computed footprint (from WCS or CSV), pass it
                 # along explicitly so the exporter can persist it.
                 try:
-                    fp = it.get_cached_footprint() or it.ensure_footprint()
+                    fp = it.get_cached_footprint()
+                    if fp is None:
+                        fp_pts = it.src.get("footprint_radec") or it.src.get("_precomp_fp")
+                        if isinstance(fp_pts, (list, tuple)) and len(fp_pts) >= 3:
+                            try:
+                                fp = np.asarray([[float(p[0]), float(p[1])] for p in fp_pts], dtype=float)
+                            except Exception:
+                                fp = None
                     if fp is not None:
-                        # Convert ndarray to list of tuples for serialization
-                        data.setdefault("_precomp_fp", [(float(r), float(d)) for r, d in fp.tolist()])
+                        coords = np.asarray(fp, dtype=float)
+                        data.setdefault("_precomp_fp", [(float(r), float(d)) for r, d in coords.tolist()])
                 except Exception:
                     pass
                 payload.append(data)
@@ -2891,10 +4376,18 @@ def launch_filter_interface(
             _log_message(f"[CSV] Exported {len(payload)} items -> {path_csv}", level="INFO")
 
         analyse_btn.configure(command=_on_analyse)
+        try:
+            analyse_btn.bind('<Button-1>', lambda e: (_dbg('Analyse <Button-1> event'), None)[1])
+        except Exception:
+            pass
         export_btn.configure(command=_on_export)
         if stream_mode:
             try:
                 analyse_btn.state(["!disabled"])
+            except Exception:
+                pass
+            try:
+                analyse_btn.configure(state=tk.NORMAL)
             except Exception:
                 pass
             if stream_state.get("pending_start"):
@@ -2904,7 +4397,7 @@ def launch_filter_interface(
                     status_var.set(
                         _tr(
                             "filter_status_click_analyse",
-                            "Cliquez sur Analyse pour dÃ©marrer l'exploration." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Ready â€” click Analyse to scan.",
+                            "Cliquez sur Analyse pour démarrer l'exploration." if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Ready — click Analyse to scan.",
                         )
                     )
                 except Exception:
@@ -2916,13 +4409,23 @@ def launch_filter_interface(
                     pass
 
         def _process_async_events() -> None:
+            start = time.monotonic()
+            processed = 0
+            time_budget_exhausted = False
             try:
-                while True:
-                    event = async_events.get_nowait()
+                while processed < MAX_UI_MSG:
+                    if (time.monotonic() - start) * 1000.0 >= UI_BUDGET_MS:
+                        time_budget_exhausted = True
+                        break
+                    try:
+                        event = async_events.get_nowait()
+                    except queue.Empty:
+                        break
+                    processed += 1
                     kind = event[0]
                     if kind == "log":
                         _, message, level = event
-                        _log_message(str(message), level=str(level))
+                        log_buffer.append((str(level or "INFO"), str(message)))
                     elif kind == "header_loaded":
                         _, idx, header_obj = event
                         if (
@@ -2934,12 +4437,18 @@ def launch_filter_interface(
                             item.header = header_obj
                             item.src["header"] = header_obj
                     elif kind == "resolved_item":
-                        _, idx, header_obj, wcs_obj = event
+                        footprint_pts = event[4] if len(event) >= 5 else None
+                        _, idx, header_obj, wcs_obj = event[:4]
                         if isinstance(idx, int) and 0 <= idx < len(items):
                             item = items[idx]
                             if header_obj is not None:
                                 item.header = header_obj
                                 item.src["header"] = header_obj
+                            if footprint_pts:
+                                try:
+                                    item.src["footprint_radec"] = footprint_pts
+                                except Exception:
+                                    pass
                             if wcs_obj is not None and getattr(wcs_obj, "is_celestial", False):
                                 item.src["wcs"] = wcs_obj
                                 item.wcs = wcs_obj
@@ -2947,7 +4456,14 @@ def launch_filter_interface(
                                     item.refresh_geometry()
                                 except Exception:
                                     pass
-                                _refresh_item_visual(idx)
+                            pending_visual_refresh.add(idx)
+                            _schedule_visual_refresh_flush()
+                            if footprints_restore_state.get("needs_restore"):
+                                indices_cache = footprints_restore_state.get("indices")
+                                if not isinstance(indices_cache, set):
+                                    indices_cache = set()
+                                    footprints_restore_state["indices"] = indices_cache
+                                indices_cache.add(idx)
                     elif kind == "resolve_done":
                         _, resolved_now = event
                         try:
@@ -2963,22 +4479,56 @@ def launch_filter_interface(
                             "Resolved WCS for {n} files.",
                             n=resolved_count,
                         )
-                        summary_var.set(summary_msg)
-                        _log_message(summary_msg, level="INFO")
-                        if resolved_count > 0:
-                            _schedule_axes_update()
+                        summary_var.set(_apply_summary_hint(summary_msg))
+                        log_buffer.append(("INFO", summary_msg))
                         resolve_state["running"] = False
                         try:
                             resolve_btn.state(["!disabled"])
                         except Exception:
                             pass
+                        if not resolve_state.get("running") and pending_outline_state.get("groups") is not None:
+                            try:
+                                _draw_group_outlines(pending_outline_state.get("groups"))
+                            except Exception:
+                                pass
+                        if footprints_restore_state.get("needs_restore"):
+                            original_value = bool(footprints_restore_state.get("value", True))
+                            try:
+                                draw_footprints_var.set(original_value)
+                            except Exception:
+                                pass
+                            indices_cache = footprints_restore_state.get("indices")
+                            if isinstance(indices_cache, set) and indices_cache:
+                                pending_visual_refresh.update(indices_cache)
+                            if original_value and not pending_visual_refresh:
+                                pending_visual_refresh.update(range(len(items)))
+                            if pending_visual_refresh:
+                                _schedule_visual_refresh_flush()
+                            try:
+                                footprints_chk.state(["!disabled"])
+                            except Exception:
+                                try:
+                                    footprints_chk.configure(state=tk.NORMAL)
+                                except Exception:
+                                    pass
+                            footprints_restore_state["needs_restore"] = False
+                            if isinstance(indices_cache, set):
+                                indices_cache.clear()
                     else:
                         pass
-            except queue.Empty:
-                pass
             finally:
+                now = time.monotonic()
+                has_more = False
+                if time_budget_exhausted or processed >= MAX_UI_MSG:
+                    has_more = True
+                if not async_events.empty():
+                    has_more = True
+                flush_due = now - last_log_flush["ts"] >= LOG_FLUSH_INTERVAL
+                _flush_log_buffer(force=flush_due)
+                if log_buffer and not flush_due:
+                    has_more = True
                 try:
-                    root.after(150, _process_async_events)
+                    root.after(60 if has_more else 150, _process_async_events)
                 except Exception:
                     pass
 
@@ -2990,13 +4540,40 @@ def launch_filter_interface(
                 artist = getattr(event, 'artist', None)
                 if artist is None:
                     return
-                i = artist_to_index.get(artist)
-                if i is None:
+                indices: list[int] = []
+                if artist is footprints_state.get("collection"):
+                    picked = getattr(event, "ind", None)
+                    if picked is None:
+                        return
+                    if isinstance(picked, (list, tuple, np.ndarray)):
+                        candidates = picked
+                    else:
+                        candidates = [picked]
+                    if not candidates:
+                        return
+                    pos = int(candidates[0])
+                    if 0 <= pos < len(footprints_state["indices"]):
+                        indices.append(footprints_state["indices"][pos])
+                elif artist is centroids_state.get("collection"):
+                    picked = getattr(event, "ind", None)
+                    if picked is None:
+                        return
+                    if isinstance(picked, (list, tuple, np.ndarray)):
+                        candidates = picked
+                    else:
+                        candidates = [picked]
+                    if not candidates:
+                        return
+                    pos = int(candidates[0])
+                    if 0 <= pos < len(centroids_state["indices"]):
+                        indices.append(centroids_state["indices"][pos])
+                else:
                     return
-                # Toggle associated checkbox and refresh colors
-                curr = _is_selected(i)
-                _set_selected(i, not curr)
-                update_visuals(i)
+                for i in indices:
+                    curr = _is_selected(i)
+                    _set_selected(i, not curr)
+                if indices:
+                    update_visuals(indices)
             except Exception:
                 pass
 
@@ -3155,13 +4732,84 @@ def launch_filter_interface(
             # Keep all if canceled or closed
             return raw_files_with_wcs, False, None
 
-    except ImportError:
-        # Any optional dependency missing â€” silently keep all
+    except ImportError as exc:
+        # Optional dependency missing — report clearly and keep all
+        try:
+            print(f"[FilterUI] ImportError: {exc}")
+            import traceback as _tb
+            print(_tb.format_exc())
+        except Exception:
+            pass
+        # If a Tk root exists (launched from main GUI), surface a messagebox
+        try:
+            import tkinter as _tk
+            from tkinter import messagebox as _mb
+            if getattr(_tk, "_default_root", None) is not None:
+                _mb.showerror(
+                    "Filter UI",
+                    "Missing optional dependency (numpy/matplotlib/astropy).\nInstall the packages and retry.",
+                )
+        except Exception:
+            pass
         return raw_files_with_wcs, False, None
-    except Exception:
-        # Any unexpected error â€” fail safe and keep all
+    except Exception as exc:
+        # Unexpected error — report and fail safe
+        try:
+            print(f"[FilterUI] Error while building filter UI: {exc}")
+            import traceback as _tb
+            print(_tb.format_exc())
+        except Exception:
+            pass
+        try:
+            import tkinter as _tk
+            from tkinter import messagebox as _mb
+            if getattr(_tk, "_default_root", None) is not None:
+                _mb.showerror(
+                    "Filter UI",
+                    f"Could not open filter window.\n{exc}",
+                )
+        except Exception:
+            pass
         return raw_files_with_wcs, False, None
 
 
 __all__ = ["launch_filter_interface"]
+
+if __name__ == "__main__":
+    # Minimal CLI to launch the filter window for a directory.
+    import sys as _sys, os as _os
+    args = _sys.argv[1:]
+    if not args:
+        print("Usage: python zemosaic_filter_gui.py <input_dir>")
+        print("       python -m zemosaic_filter_gui <input_dir>")
+        _sys.exit(1)
+    inp = _os.path.expanduser(_os.path.expandvars(args[0]))
+    if not (_os.path.isdir(inp)):
+        print(f"Error: '{inp}' is not a directory")
+        _sys.exit(2)
+    try:
+        res = launch_filter_interface(
+            inp,
+            None,
+            stream_scan=True,
+            scan_recursive=True,
+            batch_size=200,
+            preview_cap=1500,
+            solver_settings_dict=None,
+            config_overrides=None,
+        )
+        # Print a short summary to the console so CLI runs are visible
+        if isinstance(res, tuple) and len(res) >= 2:
+            kept = len(res[0]) if isinstance(res[0], list) else 0
+            accepted = bool(res[1])
+            print(f"[FilterUI] Closed. accepted={accepted} kept={kept}")
+        else:
+            kept = len(res) if isinstance(res, list) else 0
+            print(f"[FilterUI] Closed. kept={kept}")
+    except KeyboardInterrupt:
+        pass
+    except Exception as _exc:
+        print(f"[FilterUI] Unhandled error: {_exc}")
+        import traceback as _tb
+        print(_tb.format_exc())
 
