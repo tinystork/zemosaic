@@ -39,6 +39,9 @@ DEFAULT_CONFIG = {
     "coadd_use_memmap": True,
     "coadd_memmap_dir": "",
     "coadd_cleanup_memmap": True,
+    # Cache retention policy for Phase 1 preprocessed .npy files.
+    # Allowed values: "run_end", "per_tile", "keep".
+    "cache_retention": "run_end",
     "assembly_process_workers": 0,  # Worker count for final assembly (both methods)
     "auto_limit_frames_per_master_tile": True,
     "winsor_worker_limit": 10,
@@ -118,6 +121,7 @@ def load_config():
     # else:
         # print(f"Config file not found at {config_path}. Using default configuration.")
     current_config.setdefault("crop_follow_signal", False)
+    current_config.setdefault("cache_retention", "run_end")
     return current_config
 
 def save_config(config_data):
