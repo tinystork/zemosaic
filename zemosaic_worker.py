@@ -333,6 +333,8 @@ def _select_quality_anchor(
         stats: dict[str, float] | None = None
         group_idx = id_to_group_index.get(tile_id)
         preview_arr = None
+        tile_array = None
+        loaded_tile_ref = None
         if group_idx is not None and 0 <= group_idx < len(seestar_groups):
             group_info = seestar_groups[group_idx]
         else:
@@ -342,17 +344,38 @@ def _select_quality_anchor(
             if reference_entry is None:
                 raise ValueError("empty_group")
             wcs_obj = reference_entry.get("wcs")
-            tile_data = None
             cache_path = reference_entry.get("path_preprocessed_cache")
             if cache_path and os.path.exists(cache_path):
-                tile_data = np.load(cache_path, mmap_mode=None, allow_pickle=False)
-            elif reference_entry.get("preprocessed_data") is not None:
-                tile_data = reference_entry.get("preprocessed_data")
-            elif reference_entry.get("img_data_processed") is not None:
-                tile_data = reference_entry.get("img_data_processed")
-            if tile_data is None:
+                try:
+                    tile_array = np.load(cache_path, mmap_mode="r")
+                except Exception:
+                    tile_array = None
+            if tile_array is None and reference_entry.get("preprocessed_data") is not None:
+                tile_array = reference_entry.get("preprocessed_data")
+            if tile_array is None and reference_entry.get("img_data_processed") is not None:
+                tile_array = reference_entry.get("img_data_processed")
+            if tile_array is None:
+                raw_path = reference_entry.get("path_raw") or reference_entry.get("path")
+                if (
+                    raw_path
+                    and os.path.exists(raw_path)
+                    and hasattr(zemosaic_utils, "load_and_validate_fits")
+                ):
+                    try:
+                        res = zemosaic_utils.load_and_validate_fits(
+                            raw_path,
+                            normalize_to_float32=False,
+                            attempt_fix_nonfinite=True,
+                            progress_callback=None,
+                        )
+                        tile_array = res[0] if isinstance(res, (tuple, list)) and res else res
+                    except Exception:
+                        tile_array = None
+            if tile_array is None:
                 raise ValueError("no_cache")
-            tile_array = np.asarray(tile_data, dtype=np.float32)
+            loaded_tile_ref = tile_array
+            tile_array = _ensure_hwc_master_tile(tile_array, f"anchor_probe#{tile_id}")
+            tile_array = np.asarray(tile_array, dtype=np.float32, order="C")
             preview_arr, _ = zemosaic_utils.create_downscaled_luminance_preview(
                 tile_array,
                 wcs_obj,
@@ -382,6 +405,14 @@ def _select_quality_anchor(
         finally:
             if preview_arr is not None:
                 del preview_arr
+            if loaded_tile_ref is not None and isinstance(loaded_tile_ref, np.memmap):
+                mmap_obj = getattr(loaded_tile_ref, "_mmap", None)
+                if mmap_obj is not None:
+                    try:
+                        mmap_obj.close()
+                    except Exception:
+                        pass
+            tile_array = None
 
         candidate_entries.append(
             {
