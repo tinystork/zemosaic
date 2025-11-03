@@ -212,8 +212,9 @@ def _compute_dynamic_footprint_budget(
     preview_limit: Optional[int] = None
     try:
         coerced_preview = int(preview_cap)
-        if coerced_preview > 0:
-            preview_limit = coerced_preview
+        if coerced_preview <= 0:
+            return 0
+        preview_limit = coerced_preview
     except Exception:
         preview_limit = None
 
@@ -223,11 +224,13 @@ def _compute_dynamic_footprint_budget(
     base_cap = max(50, base_cap) if base_cap else 50
 
     if total_items >= 8000:
-        cap = 200
-    elif total_items >= 4000:
-        cap = 350
+        cap = min(200, base_cap)
+    elif total_items >= 5000:
+        cap = 0
     elif total_items >= 2000:
-        cap = 600
+        cap = min(600, base_cap)
+    elif total_items >= 1500:
+        cap = min(400, base_cap)
     else:
         cap = min(base_cap, 1500)
 
@@ -237,7 +240,7 @@ def _compute_dynamic_footprint_budget(
     cap = min(cap, base_cap) if base_cap else cap
 
     try:
-        return max(1, int(cap))
+        return max(0, int(cap))
     except Exception:
         return 1
 
