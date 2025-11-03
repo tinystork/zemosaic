@@ -60,6 +60,7 @@
     "quality_crop_band_label": "Bande (px)",
     "quality_crop_ks_label": "k·sigma",
     "quality_crop_margin_label": "Marge (px)",
+    "gui_cache_retention_label": "Rétention du cache :",
     "gui_logging_title": "Journalisation",
     "gui_logging_level": "Niveau de log :",
     "logging_level_debug": "Debug",
