@@ -139,6 +139,115 @@ class _TileAffineSource:
     data: np.ndarray | None = None
 
 
+def _apply_preview_quality_crop(
+    tile_array: "np.ndarray",
+    crop_settings: dict | None,
+) -> "np.ndarray":
+    """Apply quality-crop heuristics to candidate previews when available."""
+
+    if tile_array is None or not crop_settings:
+        return tile_array
+    if not crop_settings.get("enabled", False) or not ANCHOR_AUTOCROP_AVAILABLE:
+        return tile_array
+
+    arr = np.asarray(tile_array, dtype=np.float32)
+    if arr.ndim == 2:
+        arr = arr[..., np.newaxis]
+    if arr.ndim != 3 or arr.shape[-1] == 0:
+        return tile_array
+
+    h, w, c = arr.shape
+    if h < 8 or w < 8:
+        return tile_array
+
+    if c == 1:
+        rgb_view = np.repeat(arr, 3, axis=-1)
+    elif c >= 3:
+        rgb_view = arr[..., :3]
+    else:
+        pad_count = 3 - c
+        rgb_view = np.concatenate([arr, np.repeat(arr[..., -1:], pad_count, axis=-1)], axis=-1)
+
+    try:
+        band_px = max(4, int(crop_settings.get("band_px", 32)))
+    except Exception:
+        band_px = 32
+    try:
+        margin_px = max(0, int(crop_settings.get("margin_px", 8)))
+    except Exception:
+        margin_px = 8
+    try:
+        k_sigma = float(crop_settings.get("k_sigma", 2.0))
+        if not math.isfinite(k_sigma):
+            raise ValueError
+    except Exception:
+        k_sigma = 2.0
+    k_sigma = max(0.1, min(k_sigma, 10.0))
+
+    try:
+        lum2d = rgb_view.mean(axis=-1)
+        R = rgb_view[..., 0]
+        G = rgb_view[..., 1]
+        B = rgb_view[..., 2]
+        y0, x0, y1, x1 = _anchor_detect_autocrop(
+            lum2d,
+            R,
+            G,
+            B,
+            band_px=band_px,
+            k_sigma=k_sigma,
+            margin_px=margin_px,
+        )
+    except Exception:
+        return tile_array
+
+    if not (0 <= y0 < y1 <= h and 0 <= x0 < x1 <= w):
+        return tile_array
+
+    crop_area = (y1 - y0) * (x1 - x0)
+    full_area = h * w if h > 0 and w > 0 else 0
+    if crop_area <= 0 or (full_area > 0 and (crop_area / full_area) >= 0.97):
+        return tile_array
+
+    cropped = arr[y0:y1, x0:x1, ...]
+    return np.ascontiguousarray(cropped, dtype=np.float32)
+
+
+def _score_anchor_candidate(
+    stats: dict,
+    group_median: float,
+    deviation_clip: float | None = None,
+) -> float:
+    """Compute a quality score for an anchor candidate (lower is better)."""
+
+    try:
+        median_val = float(stats.get("median", 0.0))
+    except Exception:
+        median_val = 0.0
+    try:
+        span_val = float(stats.get("span"))
+    except Exception:
+        try:
+            span_val = float(stats.get("high", 0.0) - stats.get("low", 0.0))
+        except Exception:
+            span_val = 0.0
+    try:
+        robust_sigma = float(stats.get("robust_sigma", 0.0))
+    except Exception:
+        robust_sigma = 0.0
+
+    if not math.isfinite(span_val):
+        span_val = 0.0
+    if not math.isfinite(robust_sigma):
+        robust_sigma = 0.0
+
+    deviation = abs(median_val - group_median)
+    if deviation_clip is not None and deviation_clip > 0:
+        deviation = min(deviation, float(deviation_clip))
+
+    return float(deviation + 0.7 * max(span_val, 0.0) + 0.3 * max(robust_sigma, 0.0))
+
+
 def _sanitize_affine_corrections(
     raw_corrections: Any,
     total_tiles: int,
@@ -211,6 +320,269 @@ def _select_affine_log_indices(
     return selected
 
 
+def _select_quality_anchor(
+    ordered_ids: list[int],
+    distances: dict[int, float],
+    seestar_groups: list[list[dict]],
+    anchor_settings: dict,
+    center_settings: dict,
+    quality_crop_settings: dict | None,
+    progress_callback: Callable | None = None,
+) -> int | None:
+    """Pick the best-quality anchor among the most central tiles."""
+
+    if not ordered_ids or not seestar_groups:
+        return None
+    if not (
+        ZEMOSAIC_UTILS_AVAILABLE
+        and hasattr(zemosaic_utils, "create_downscaled_luminance_preview")
+        and hasattr(zemosaic_utils, "compute_sky_statistics")
+    ):
+        return None
+
+    try:
+        probe_limit = int(anchor_settings.get("probe_limit", 12))
+    except Exception:
+        probe_limit = 12
+    probe_limit = max(1, probe_limit)
+
+    span_cfg = anchor_settings.get("span_range", (0.02, 6.0))
+    if not (isinstance(span_cfg, (list, tuple)) and len(span_cfg) >= 2):
+        span_cfg = (0.02, 6.0)
+    try:
+        span_low = float(span_cfg[0])
+    except Exception:
+        span_low = 0.02
+    try:
+        span_high = float(span_cfg[1])
+    except Exception:
+        span_high = 6.0
+    if span_low > span_high:
+        span_low, span_high = span_high, span_low
+
+    try:
+        median_clip_sigma = float(anchor_settings.get("median_clip_sigma", 2.5))
+    except Exception:
+        median_clip_sigma = 2.5
+
+    try:
+        preview_size = int(center_settings.get("preview_size", 256))
+    except Exception:
+        preview_size = 256
+    sky_percent = center_settings.get("sky_percentile", (25.0, 60.0))
+    if not (isinstance(sky_percent, (list, tuple)) and len(sky_percent) >= 2):
+        sky_percent = (25.0, 60.0)
+    try:
+        sky_low = float(sky_percent[0])
+    except Exception:
+        sky_low = 25.0
+    try:
+        sky_high = float(sky_percent[1])
+    except Exception:
+        sky_high = 60.0
+
+    id_to_group_index = {
+        ordered_ids[idx]: idx
+        for idx in range(min(len(ordered_ids), len(seestar_groups)))
+    }
+    candidate_ids: list[int] = []
+    for tid in ordered_ids:
+        if tid in id_to_group_index:
+            candidate_ids.append(int(tid))
+        if len(candidate_ids) >= probe_limit:
+            break
+    if not candidate_ids:
+        return None
+
+    _log_and_callback(
+        "center_anchor_probe_start",
+        lvl="INFO",
+        callback=progress_callback,
+        probe_count=len(candidate_ids),
+    )
+
+    candidate_entries: list[dict[str, Any]] = []
+    medians: list[float] = []
+
+    for tile_id in candidate_ids:
+        stats: dict[str, float] | None = None
+        group_idx = id_to_group_index.get(tile_id)
+        preview_arr = None
+        tile_array = None
+        loaded_tile_ref = None
+        if group_idx is not None and 0 <= group_idx < len(seestar_groups):
+            group_info = seestar_groups[group_idx]
+        else:
+            group_info = None
+        try:
+            reference_entry = group_info[0] if group_info else None
+            if reference_entry is None:
+                raise ValueError("empty_group")
+            wcs_obj = reference_entry.get("wcs")
+            cache_path = reference_entry.get("path_preprocessed_cache")
+            if cache_path and os.path.exists(cache_path):
+                try:
+                    tile_array = np.load(cache_path, mmap_mode="r")
+                except Exception:
+                    tile_array = None
+            if tile_array is None and reference_entry.get("preprocessed_data") is not None:
+                tile_array = reference_entry.get("preprocessed_data")
+            if tile_array is None and reference_entry.get("img_data_processed") is not None:
+                tile_array = reference_entry.get("img_data_processed")
+            if tile_array is None:
+                raw_path = reference_entry.get("path_raw") or reference_entry.get("path")
+                if (
+                    raw_path
+                    and os.path.exists(raw_path)
+                    and hasattr(zemosaic_utils, "load_and_validate_fits")
+                ):
+                    try:
+                        res = zemosaic_utils.load_and_validate_fits(
+                            raw_path,
+                            normalize_to_float32=False,
+                            attempt_fix_nonfinite=True,
+                            progress_callback=None,
+                        )
+                        tile_array = res[0] if isinstance(res, (tuple, list)) and res else res
+                    except Exception:
+                        tile_array = None
+            if tile_array is None:
+                raise ValueError("no_cache")
+            loaded_tile_ref = tile_array
+            tile_array = _ensure_hwc_master_tile(tile_array, f"anchor_probe#{tile_id}")
+            tile_array = _apply_preview_quality_crop(tile_array, quality_crop_settings)
+            tile_array = np.asarray(tile_array, dtype=np.float32, order="C")
+            preview_arr, _ = zemosaic_utils.create_downscaled_luminance_preview(
+                tile_array,
+                wcs_obj,
+                preview_size,
+            )
+            stats = zemosaic_utils.compute_sky_statistics(preview_arr, sky_low, sky_high)
+            if stats is not None and preview_arr is not None:
+                valid = np.asarray(preview_arr, dtype=np.float64)
+                valid = valid[np.isfinite(valid)]
+                if valid.size > 0:
+                    base_median = float(np.median(valid))
+                    stats.setdefault("median", base_median)
+                    span_val = float(stats.get("high", base_median) - stats.get("low", base_median))
+                    stats["span"] = span_val
+                    mad = float(np.median(np.abs(valid - base_median)))
+                    stats["robust_sigma"] = float(1.4826 * mad) if mad > 0 else 0.0
+                    medians.append(float(stats.get("median", base_median)))
+                else:
+                    stats.setdefault("median", 0.0)
+                    stats["span"] = float(stats.get("high", 0.0) - stats.get("low", 0.0))
+                    stats["robust_sigma"] = 0.0
+            else:
+                stats = None
+        except Exception as exc:
+            logger.debug("Anchor candidate %s preview failed: %s", tile_id, exc, exc_info=True)
+            stats = None
+        finally:
+            if preview_arr is not None:
+                del preview_arr
+            if loaded_tile_ref is not None and isinstance(loaded_tile_ref, np.memmap):
+                mmap_obj = getattr(loaded_tile_ref, "_mmap", None)
+                if mmap_obj is not None:
+                    try:
+                        mmap_obj.close()
+                    except Exception:
+                        pass
+            tile_array = None
+
+        candidate_entries.append(
+            {
+                "tile_id": tile_id,
+                "stats": stats,
+                "distance": float(distances.get(tile_id, float("nan"))),
+            }
+        )
+
+    if not medians:
+        return None
+
+    medians_arr = np.asarray(medians, dtype=np.float64)
+    medians_arr = medians_arr[np.isfinite(medians_arr)]
+    if medians_arr.size == 0:
+        return None
+    group_median = float(np.median(medians_arr))
+    mad = float(np.median(np.abs(medians_arr - group_median)))
+    deviation_clip = None
+    if mad > 0 and math.isfinite(mad):
+        deviation_clip = float(max(0.0, median_clip_sigma) * 1.4826 * mad)
+
+    best_entry: dict[str, Any] | None = None
+    best_score = float("inf")
+
+    for entry in candidate_entries:
+        stats = entry.get("stats")
+        accepted = True
+        score = float("inf")
+        median_val = float("nan")
+        span_val = float("nan")
+        if not stats:
+            accepted = False
+        else:
+            try:
+                median_val = float(stats.get("median", float("nan")))
+            except Exception:
+                median_val = float("nan")
+            try:
+                span_val = float(stats.get("span"))
+            except Exception:
+                try:
+                    span_val = float(stats.get("high", 0.0) - stats.get("low", 0.0))
+                except Exception:
+                    span_val = float("nan")
+            try:
+                robust_sigma_val = float(stats.get("robust_sigma", 0.0))
+            except Exception:
+                robust_sigma_val = 0.0
+            if not (math.isfinite(median_val) and math.isfinite(span_val)):
+                accepted = False
+            if accepted and not math.isfinite(robust_sigma_val):
+                stats["robust_sigma"] = 0.0
+                robust_sigma_val = 0.0
+            if accepted:
+                if span_val < span_low or span_val > span_high:
+                    accepted = False
+            if accepted and deviation_clip is not None and deviation_clip > 0:
+                if abs(median_val - group_median) > deviation_clip:
+                    accepted = False
+            if accepted:
+                score = _score_anchor_candidate(stats, group_median, deviation_clip)
+                if score < best_score:
+                    best_score = score
+                    best_entry = entry
+        entry["accepted"] = accepted
+        entry["score"] = score
+        _log_and_callback(
+            "center_anchor_probe_candidate",
+            lvl="DEBUG_DETAIL",
+            callback=progress_callback,
+            tile=int(entry["tile_id"]),
+            dist_deg=entry.get("distance"),
+            median=median_val,
+            span=span_val,
+            score=score,
+            accepted="accepted" if accepted else "rejected",
+        )
+
+    if best_entry is None:
+        return None
+
+    _log_and_callback(
+        "center_anchor_selected",
+        lvl="INFO",
+        callback=progress_callback,
+        tile=int(best_entry["tile_id"]),
+        dist_deg=best_entry.get("distance"),
+        score=best_score,
+    )
+
+    return int(best_entry["tile_id"])
+
+
 def _compute_intertile_affine_corrections_from_sources(
     sources: list[_TileAffineSource],
     final_output_wcs,
@@ -222,6 +594,8 @@ def _compute_intertile_affine_corrections_from_sources(
     use_auto_intertile: bool,
     logger_obj=None,
     progress_callback: Callable | None = None,
+    intertile_global_recenter: bool = False,
+    intertile_recenter_clip: tuple[float, float] | list[float] | None = None,
 ) -> tuple[list[tuple[float, float]] | None, bool, str, str | None]:
     """Common implementation for intertile gain/offset computation.
 
@@ -244,6 +618,7 @@ def _compute_intertile_affine_corrections_from_sources(
         return None, False, "skipped", None
 
     tile_pairs: list[tuple[np.ndarray, Any]] = []
+    preview_arrays: list[np.ndarray | None] = []
 
     for idx, src in enumerate(sources, 1):
         try:
@@ -258,6 +633,19 @@ def _compute_intertile_affine_corrections_from_sources(
                     tile_arr = _ensure_hwc_master_tile(hdul[0].data, label)
             tile_arr = np.asarray(tile_arr, dtype=np.float32, order="C")
             tile_pairs.append((tile_arr, src.wcs))
+            preview_entry = None
+            if intertile_global_recenter:
+                try:
+                    preview_entry, _ = zemosaic_utils.create_downscaled_luminance_preview(
+                        tile_arr,
+                        src.wcs,
+                        preview_size,
+                    )
+                    if preview_entry is not None:
+                        preview_entry = np.asarray(preview_entry, dtype=np.float32)
+                except Exception:
+                    preview_entry = None
+            preview_arrays.append(preview_entry)
         except Exception as exc:
             if logger_obj:
                 logger_obj.warning(
@@ -267,6 +655,7 @@ def _compute_intertile_affine_corrections_from_sources(
                 )
                 logger_obj.debug("Traceback (intertile data load):", exc_info=True)
             tile_pairs.clear()
+            preview_arrays.clear()
             return None, False, "preview_failed", str(exc)
         finally:
             if progress_callback:
@@ -300,6 +689,76 @@ def _compute_intertile_affine_corrections_from_sources(
         tile_pairs.clear()
 
     sanitized, nontrivial = _sanitize_affine_corrections(corrections, total_tiles)
+
+    if sanitized and intertile_global_recenter and preview_arrays:
+        clip_cfg = intertile_recenter_clip if isinstance(intertile_recenter_clip, (list, tuple)) else None
+        if not clip_cfg or len(clip_cfg) < 2:
+            clip_cfg = (0.85, 1.18)
+        try:
+            clip_low = float(clip_cfg[0])
+        except Exception:
+            clip_low = 0.85
+        try:
+            clip_high = float(clip_cfg[1])
+        except Exception:
+            clip_high = 1.18
+        if clip_low > clip_high:
+            clip_low, clip_high = clip_high, clip_low
+
+        try:
+            medians_before: list[float] = []
+            for preview_entry, affine in zip(preview_arrays, sanitized):
+                if preview_entry is None:
+                    medians_before.append(float("nan"))
+                    continue
+                gain_val, offset_val = affine
+                try:
+                    corrected = preview_entry * float(gain_val) + float(offset_val)
+                    med_val = float(np.nanmedian(corrected)) if corrected.size > 0 else float("nan")
+                except Exception:
+                    med_val = float("nan")
+                medians_before.append(med_val)
+
+            finite_medians = [m for m in medians_before if math.isfinite(m) and m > 0]
+            if finite_medians:
+                target = float(np.median(finite_medians))
+                _log_and_callback(
+                    "intertile_recenter_applied",
+                    lvl="INFO",
+                    callback=progress_callback,
+                    target=target,
+                    clip_low=clip_low,
+                    clip_high=clip_high,
+                )
+                for idx, med_val in enumerate(medians_before):
+                    if not (math.isfinite(med_val) and med_val > 0):
+                        continue
+                    gain_adj = target / med_val if med_val != 0 else 1.0
+                    if not math.isfinite(gain_adj) or gain_adj <= 0:
+                        continue
+                    if gain_adj < clip_low:
+                        gain_adj = clip_low
+                    elif gain_adj > clip_high:
+                        gain_adj = clip_high
+                    gain_val, offset_val = sanitized[idx]
+                    sanitized[idx] = (float(gain_val) * gain_adj, float(offset_val) * gain_adj)
+                    _log_and_callback(
+                        "intertile_recenter_adjust",
+                        lvl="INFO_DETAIL",
+                        callback=progress_callback,
+                        tile=int(idx),
+                        median_before=med_val,
+                        gain_adj=gain_adj,
+                    )
+        except Exception as exc:
+            if logger_obj:
+                logger_obj.warning("Intertile global recenter failed: %s", exc)
+                logger_obj.debug("Traceback (intertile recenter):", exc_info=True)
+        finally:
+            preview_arrays.clear()
+    elif intertile_global_recenter and preview_arrays:
+        preview_arrays.clear()
+
     return sanitized, nontrivial, "ok", None
 
 def cluster_seestar_stacks_connected(
@@ -1679,6 +2138,16 @@ try:
     from .solver_settings import SolverSettings  # type: ignore
 except ImportError:
     from solver_settings import SolverSettings  # type: ignore
+
+try:
+    from .lecropper import detect_autocrop_rgb as _anchor_detect_autocrop
+except ImportError:
+    try:
+        from lecropper import detect_autocrop_rgb as _anchor_detect_autocrop
+    except Exception:
+        _anchor_detect_autocrop = None
+
+ANCHOR_AUTOCROP_AVAILABLE = callable(_anchor_detect_autocrop)
 
 # Optional configuration import for GPU toggle
 try:
@@ -3744,6 +4213,8 @@ def assemble_final_mosaic_incremental(
     intertile_overlap_min: float = 0.05,
     intertile_sky_percentile: tuple[float, float] | list[float] = (30.0, 70.0),
     intertile_robust_clip_sigma: float = 2.5,
+    intertile_global_recenter: bool = True,
+    intertile_recenter_clip: tuple[float, float] | list[float] = (0.85, 1.18),
     use_auto_intertile: bool = False,
     match_background: bool = True,
     feather_parity: bool = False,
@@ -3892,6 +4363,8 @@ def assemble_final_mosaic_incremental(
                 use_auto_intertile=use_auto_intertile,
                 logger_obj=logger,
                 progress_callback=progress_callback,
+                intertile_global_recenter=bool(intertile_global_recenter),
+                intertile_recenter_clip=intertile_recenter_clip,
             )
         )
         if affine_status == "preview_failed":
@@ -4574,6 +5047,8 @@ def assemble_final_mosaic_reproject_coadd(
                 use_auto_intertile=use_auto_intertile,
                 logger_obj=logger,
                 progress_callback=progress_callback,
+                intertile_global_recenter=bool(intertile_global_recenter_config),
+                intertile_recenter_clip=intertile_recenter_clip_tuple,
             )
         )
 
@@ -5312,6 +5787,8 @@ def run_hierarchical_mosaic(
     intertile_overlap_min_config: float = 0.05,
     intertile_sky_percentile_config: tuple[float, float] | list[float] = (30.0, 70.0),
     intertile_robust_clip_sigma_config: float = 2.5,
+    intertile_global_recenter_config: bool = True,
+    intertile_recenter_clip_config: tuple[float, float] | list[float] = (0.85, 1.18),
     use_auto_intertile_config: bool = False,
     match_background_for_final_config: bool = True,
     incremental_feather_parity_config: bool = False,
@@ -5323,6 +5800,10 @@ def run_hierarchical_mosaic(
     p3_center_robust_clip_sigma_config: float = 2.5,
     p3_center_preview_size_config: int = 256,
     p3_center_min_overlap_fraction_config: float = 0.03,
+    center_out_anchor_mode_config: str = "auto_central_quality",
+    anchor_quality_probe_limit_config: int = 12,
+    anchor_quality_span_range_config: tuple[float, float] | list[float] = (0.02, 6.0),
+    anchor_quality_median_clip_sigma_config: float = 2.5,
     use_gpu_phase5: bool = False,
     gpu_id_phase5: int | None = None,
     logging_level_config: str = "INFO",
@@ -5447,6 +5928,20 @@ def run_hierarchical_mosaic(
             gain_clip_tuple = (0.85, 1.18)
     else:
         gain_clip_tuple = (0.85, 1.18)
+    try:
+        if (
+            isinstance(intertile_recenter_clip_config, (list, tuple))
+            and len(intertile_recenter_clip_config) >= 2
+        ):
+            clip_low = float(intertile_recenter_clip_config[0])
+            clip_high = float(intertile_recenter_clip_config[1])
+            if clip_low > clip_high:
+                clip_low, clip_high = clip_high, clip_low
+            intertile_recenter_clip_tuple = (clip_low, clip_high)
+        else:
+            intertile_recenter_clip_tuple = (0.85, 1.18)
+    except Exception:
+        intertile_recenter_clip_tuple = (0.85, 1.18)
     auto_caps_info: dict | None = None
     auto_resource_strategy: dict = {}
     phase0_header_items: list[dict] = []
@@ -6819,6 +7314,34 @@ def run_hierarchical_mosaic(
         "preview_size": int(p3_center_preview_size_config),
         "min_overlap_fraction": float(p3_center_min_overlap_fraction_config),
     }
+    anchor_mode_value = str(center_out_anchor_mode_config or "auto_central_quality").strip()
+    anchor_mode_lower = anchor_mode_value.lower()
+    anchor_quality_settings = {
+        "probe_limit": anchor_quality_probe_limit_config,
+        "span_range": anchor_quality_span_range_config,
+        "median_clip_sigma": anchor_quality_median_clip_sigma_config,
+    }
+    try:
+        anchor_crop_band = max(4, int(quality_crop_band_px_config))
+    except Exception:
+        anchor_crop_band = 32
+    try:
+        anchor_crop_margin = max(0, int(quality_crop_margin_px_config))
+    except Exception:
+        anchor_crop_margin = 8
+    try:
+        anchor_crop_sigma = float(quality_crop_k_sigma_config)
+        if not math.isfinite(anchor_crop_sigma):
+            raise ValueError
+    except Exception:
+        anchor_crop_sigma = 2.0
+    anchor_crop_sigma = max(0.1, min(anchor_crop_sigma, 10.0))
+    anchor_crop_settings = {
+        "enabled": bool(ANCHOR_AUTOCROP_AVAILABLE and anchor_mode_lower == "auto_central_quality"),
+        "band_px": anchor_crop_band,
+        "margin_px": anchor_crop_margin,
+        "k_sigma": anchor_crop_sigma,
+    }
     if center_out_settings["enabled"] and seestar_stack_groups:
         order_info = _compute_center_out_order(seestar_stack_groups)
         distances = {}
@@ -6830,23 +7353,55 @@ def run_hierarchical_mosaic(
                 tile_id_order = ordered_indices
             except Exception:
                 tile_id_order = list(range(len(seestar_stack_groups)))
-            try:
-                pcb(
-                    "phase3_center_out_plan",
-                    prog=None,
-                    lvl="INFO_DETAIL",
-                    anchor=int(tile_id_order[0]) if tile_id_order else None,
-                    center_ra=f"{global_center_coord.ra.deg:.6f}" if global_center_coord else None,
-                    center_dec=f"{global_center_coord.dec.deg:.6f}" if global_center_coord else None,
-                )
-            except Exception:
-                pass
         else:
             distances = {}
             global_center_coord = None
+
+        anchor_original_id: int | None = tile_id_order[0] if tile_id_order else None
+        if tile_id_order and anchor_mode_lower == "auto_central_quality":
+            selected_anchor = _select_quality_anchor(
+                tile_id_order,
+                distances,
+                seestar_stack_groups,
+                anchor_quality_settings,
+                center_out_settings,
+                anchor_crop_settings,
+                progress_callback,
+            )
+            if selected_anchor is not None and selected_anchor in tile_id_order:
+                if selected_anchor != tile_id_order[0]:
+                    try:
+                        sel_index = tile_id_order.index(selected_anchor)
+                        tile_id_order.insert(0, tile_id_order.pop(sel_index))
+                        seestar_stack_groups.insert(0, seestar_stack_groups.pop(sel_index))
+                    except Exception:
+                        pass
+                anchor_original_id = int(selected_anchor)
+            else:
+                _log_and_callback(
+                    "center_anchor_fallback_central_only",
+                    lvl="WARN",
+                    callback=progress_callback,
+                )
+        elif tile_id_order:
+            anchor_original_id = int(tile_id_order[0])
+
+        try:
+            pcb(
+                "phase3_center_out_plan",
+                prog=None,
+                lvl="INFO_DETAIL",
+                anchor=int(anchor_original_id) if anchor_original_id is not None else None,
+                center_ra=f"{global_center_coord.ra.deg:.6f}" if global_center_coord else None,
+                center_dec=f"{global_center_coord.dec.deg:.6f}" if global_center_coord else None,
+            )
+        except Exception:
+            pass
+
         if tile_id_order:
+            anchor_id_final = int(anchor_original_id) if anchor_original_id is not None else int(tile_id_order[0])
             center_out_context = CenterOutNormalizationContext(
-                anchor_tile_original_id=tile_id_order[0],
+                anchor_tile_original_id=anchor_id_final,
                 ordered_tile_ids=tile_id_order,
                 tile_distances=distances,
                 settings=center_out_settings,
@@ -7411,6 +7966,8 @@ def run_hierarchical_mosaic(
                     intertile_overlap_min=float(intertile_overlap_min_config),
                     intertile_sky_percentile=intertile_sky_percentile_tuple,
                     intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
+                    intertile_global_recenter=bool(intertile_global_recenter_config),
+                    intertile_recenter_clip=intertile_recenter_clip_tuple,
                     use_auto_intertile=bool(use_auto_intertile_config),
                     match_background=match_background_flag,
                     feather_parity=feather_parity_flag,
@@ -7437,6 +7994,8 @@ def run_hierarchical_mosaic(
                     intertile_overlap_min=float(intertile_overlap_min_config),
                     intertile_sky_percentile=intertile_sky_percentile_tuple,
                     intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
+                    intertile_global_recenter=bool(intertile_global_recenter_config),
+                    intertile_recenter_clip=intertile_recenter_clip_tuple,
                     use_auto_intertile=bool(use_auto_intertile_config),
                     match_background=match_background_flag,
                     feather_parity=feather_parity_flag,
@@ -7462,6 +8021,8 @@ def run_hierarchical_mosaic(
                 intertile_overlap_min=float(intertile_overlap_min_config),
                 intertile_sky_percentile=intertile_sky_percentile_tuple,
                 intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
+                intertile_global_recenter=bool(intertile_global_recenter_config),
+                intertile_recenter_clip=intertile_recenter_clip_tuple,
                 use_auto_intertile=bool(use_auto_intertile_config),
                 match_background=match_background_flag,
                 feather_parity=feather_parity_flag,
@@ -7498,9 +8059,11 @@ def run_hierarchical_mosaic(
                     intertile_photometric_match=intertile_match_flag,
                     intertile_preview_size=int(intertile_preview_size_config),
                     intertile_overlap_min=float(intertile_overlap_min_config),
-                    intertile_sky_percentile=intertile_sky_percentile_tuple,
-                    intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
-                    use_auto_intertile=bool(use_auto_intertile_config),
+            intertile_sky_percentile=intertile_sky_percentile_tuple,
+            intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
+            intertile_global_recenter=bool(intertile_global_recenter_config),
+            intertile_recenter_clip=intertile_recenter_clip_tuple,
+            use_auto_intertile=bool(use_auto_intertile_config),
                     collect_tile_data=collected_tiles_for_second_pass,
                 )
             except Exception as e_gpu:
@@ -7526,6 +8089,8 @@ def run_hierarchical_mosaic(
                     intertile_overlap_min=float(intertile_overlap_min_config),
                     intertile_sky_percentile=intertile_sky_percentile_tuple,
                     intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
+                    intertile_global_recenter=bool(intertile_global_recenter_config),
+                    intertile_recenter_clip=intertile_recenter_clip_tuple,
                     use_auto_intertile=bool(use_auto_intertile_config),
                     collect_tile_data=collected_tiles_for_second_pass,
                 )

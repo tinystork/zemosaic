@@ -436,6 +436,15 @@ class ZeMosaicGUI:
             master=self.root,
             value=self.config.get("p3_center_robust_clip_sigma", 2.5),
         )
+        self.center_anchor_mode_var = tk.StringVar(
+            master=self.root,
+            value=str(self.config.get("center_out_anchor_mode", "auto_central_quality")),
+        )
+        try:
+            anchor_probe_initial = int(self.config.get("anchor_quality_probe_limit", 12))
+        except Exception:
+            anchor_probe_initial = 12
+        self.anchor_probe_limit_var = tk.IntVar(master=self.root, value=anchor_probe_initial)
         self.use_gpu_phase5_var = tk.BooleanVar(master=self.root, value=self.config.get("use_gpu_phase5", False))
         # Logging level var (keys are ERROR, WARN, INFO, DEBUG)
         self.logging_level_keys = ["ERROR", "WARN", "INFO", "DEBUG"]
@@ -1311,6 +1320,36 @@ class ZeMosaicGUI:
             width=8,
             format="%.1f",
         ).grid(row=3, column=1, padx=(8, 5), pady=2, sticky="w")
+
+        anchor_mode_label = ttk.Label(center_out_params_frame, text="")
+        anchor_mode_label.grid(row=4, column=0, padx=0, pady=2, sticky="w")
+        self.translatable_widgets["center_anchor_mode_label"] = anchor_mode_label
+        anchor_mode_combo = ttk.Combobox(
+            center_out_params_frame,
+            textvariable=self.center_anchor_mode_var,
+            values=["auto_central_quality", "central_only"],
+            state="readonly",
+            width=20,
+        )
+        anchor_mode_combo.grid(row=4, column=1, padx=(8, 5), pady=2, sticky="w")
+        anchor_mode_hint = ttk.Label(center_out_params_frame, text="")
+        anchor_mode_hint.grid(row=4, column=2, padx=(8, 0), pady=2, sticky="w")
+        self.translatable_widgets["center_anchor_mode_hint"] = anchor_mode_hint
+
+        anchor_probe_label = ttk.Label(center_out_params_frame, text="")
+        anchor_probe_label.grid(row=5, column=0, padx=0, pady=2, sticky="w")
+        self.translatable_widgets["center_anchor_probe_label"] = anchor_probe_label
+        ttk.Spinbox(
+            center_out_params_frame,
+            from_=1,
+            to=50,
+            increment=1,
+            textvariable=self.anchor_probe_limit_var,
+            width=8,
+        ).grid(row=5, column=1, padx=(8, 5), pady=2, sticky="w")
+        anchor_probe_hint = ttk.Label(center_out_params_frame, text="")
+        anchor_probe_hint.grid(row=5, column=2, padx=(8, 0), pady=2, sticky="w")
+        self.translatable_widgets["center_anchor_probe_hint"] = anchor_probe_hint
 
         asm_opt_row += 1
 
@@ -2828,6 +2867,8 @@ class ZeMosaicGUI:
             float(self.p3_center_sky_high_var.get()),
         ]
         self.config["p3_center_robust_clip_sigma"] = float(self.p3_center_clip_sigma_var.get())
+        self.config["center_out_anchor_mode"] = str(self.center_anchor_mode_var.get())
+        self.config["anchor_quality_probe_limit"] = int(self.anchor_probe_limit_var.get())
         # Persist logging level
         self.config["logging_level"] = self.logging_level_var.get()
         self.config["cache_retention"] = self.cache_retention_var.get()
@@ -2875,6 +2916,26 @@ class ZeMosaicGUI:
         self.config["quality_crop_k_sigma"] = float(quality_crop_k_sigma_val)
         self.config["quality_crop_margin_px"] = int(quality_crop_margin_val)
 
+        span_range_cfg = self.config.get("anchor_quality_span_range", [0.02, 6.0])
+        if not (isinstance(span_range_cfg, (list, tuple)) and len(span_range_cfg) >= 2):
+            span_range_cfg = [0.02, 6.0]
+        try:
+            span_range_cfg = [float(span_range_cfg[0]), float(span_range_cfg[1])]
+        except Exception:
+            span_range_cfg = [0.02, 6.0]
+        try:
+            median_clip_sigma_cfg = float(self.config.get("anchor_quality_median_clip_sigma", 2.5))
+        except Exception:
+            median_clip_sigma_cfg = 2.5
+        recenter_clip_cfg = self.config.get("intertile_recenter_clip", [0.85, 1.18])
+        if not (isinstance(recenter_clip_cfg, (list, tuple)) and len(recenter_clip_cfg) >= 2):
+            recenter_clip_cfg = [0.85, 1.18]
+        try:
+            recenter_clip_cfg = [float(recenter_clip_cfg[0]), float(recenter_clip_cfg[1])]
+        except Exception:
+            recenter_clip_cfg = [0.85, 1.18]
+        intertile_global_recenter_val = bool(self.config.get("intertile_global_recenter", True))
+
         worker_args = (
             input_dir, output_dir, astap_exe, astap_data,
             astap_radius_val, astap_downsample_val, astap_sensitivity_val,
@@ -2921,6 +2982,8 @@ class ZeMosaicGUI:
                 float(self.intertile_sky_high_var.get()),
             ],
             float(self.intertile_clip_sigma_var.get()),
+            intertile_global_recenter_val,
+            recenter_clip_cfg,
             bool(self.use_auto_intertile_var.get()),
             bool(self.config.get("match_background_for_final", True)),
             bool(self.config.get("incremental_feather_parity", False)),
@@ -2938,6 +3001,10 @@ class ZeMosaicGUI:
             float(self.p3_center_clip_sigma_var.get()),
             int(self.p3_center_preview_size_var.get()),
             float(self.p3_center_overlap_var.get()),
+            self.center_anchor_mode_var.get(),
+            int(self.anchor_probe_limit_var.get()),
+            span_range_cfg,
+            median_clip_sigma_cfg,
             self.use_gpu_phase5_var.get(),
             gpu_id,
             self.logging_level_var.get(),
