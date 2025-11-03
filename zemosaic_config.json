@@ -39,6 +39,10 @@
     "auto_limit_frames_per_master_tile": true,
     "winsor_worker_limit": 10,
     "winsor_max_frames_per_pass": 50,
+    "winsor_auto_fallback_on_memory_error": true,
+    "winsor_min_frames_per_pass": 4,
+    "winsor_memmap_fallback": "auto",
+    "winsor_split_strategy": "sequential",
     "max_raw_per_master_tile": 10,
     "center_out_normalization_p3": true,
     "p3_center_sky_percentile": [

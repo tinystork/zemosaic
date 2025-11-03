@@ -210,6 +210,12 @@ The configuration file exposes a few options to control memory consumption:
 - `max_raw_per_master_tile` – manual cap on raw frames stacked per master tile (0 disables).
 - `winsor_worker_limit` – maximum parallel workers during the Winsorized rejection step.
 - `winsor_max_frames_per_pass` – maximum frames processed at once during Winsorized rejection (0 keeps previous behaviour).
+- `winsor_auto_fallback_on_memory_error` – proactively halve the batch size, then fall back to disk streaming when NumPy cannot allocate RAM.
+- `winsor_min_frames_per_pass` – lower bound for the streaming fallback (default 4).
+- `winsor_memmap_fallback` – `auto` (default) activates disk-backed memmap only when needed, `always` forces it, `never` keeps pure RAM processing.
+- `winsor_split_strategy` – choose `sequential` (default) or `roundrobin` chunk scheduling to balance memory pressure across large stacks.
+
+Machines with < 16 GB RAM benefit from setting `winsor_max_frames_per_pass` to 32–48 and keeping the automatic fallback enabled. En dessous de 16 Gio de RAM, conservez l’option de secours automatique activée et limitez les passes à 32–48 images ; le mode `memmap` sera déclenché si nécessaire pour éviter les erreurs `ArrayMemoryError`.
 
 6 ▸ Quick CLI example
 ```bash
