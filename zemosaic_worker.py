@@ -139,6 +139,80 @@ class _TileAffineSource:
     data: np.ndarray | None = None
 
 
+def _apply_preview_quality_crop(
+    tile_array: "np.ndarray",
+    crop_settings: dict | None,
+) -> "np.ndarray":
+    """Apply quality-crop heuristics to candidate previews when available."""
+
+    if tile_array is None or not crop_settings:
+        return tile_array
+    if not crop_settings.get("enabled", False) or not ANCHOR_AUTOCROP_AVAILABLE:
+        return tile_array
+
+    arr = np.asarray(tile_array, dtype=np.float32)
+    if arr.ndim == 2:
+        arr = arr[..., np.newaxis]
+    if arr.ndim != 3 or arr.shape[-1] == 0:
+        return tile_array
+
+    h, w, c = arr.shape
+    if h < 8 or w < 8:
+        return tile_array
+
+    if c == 1:
+        rgb_view = np.repeat(arr, 3, axis=-1)
+    elif c >= 3:
+        rgb_view = arr[..., :3]
+    else:
+        pad_count = 3 - c
+        rgb_view = np.concatenate([arr, np.repeat(arr[..., -1:], pad_count, axis=-1)], axis=-1)
+
+    try:
+        band_px = max(4, int(crop_settings.get("band_px", 32)))
+    except Exception:
+        band_px = 32
+    try:
+        margin_px = max(0, int(crop_settings.get("margin_px", 8)))
+    except Exception:
+        margin_px = 8
+    try:
+        k_sigma = float(crop_settings.get("k_sigma", 2.0))
+        if not math.isfinite(k_sigma):
+            raise ValueError
+    except Exception:
+        k_sigma = 2.0
+    k_sigma = max(0.1, min(k_sigma, 10.0))
+
+    try:
+        lum2d = rgb_view.mean(axis=-1)
+        R = rgb_view[..., 0]
+        G = rgb_view[..., 1]
+        B = rgb_view[..., 2]
+        y0, x0, y1, x1 = _anchor_detect_autocrop(
+            lum2d,
+            R,
+            G,
+            B,
+            band_px=band_px,
+            k_sigma=k_sigma,
+            margin_px=margin_px,
+        )
+    except Exception:
+        return tile_array
+
+    if not (0 <= y0 < y1 <= h and 0 <= x0 < x1 <= w):
+        return tile_array
+
+    crop_area = (y1 - y0) * (x1 - x0)
+    full_area = h * w if h > 0 and w > 0 else 0
+    if crop_area <= 0 or (full_area > 0 and (crop_area / full_area) >= 0.97):
+        return tile_array
+
+    cropped = arr[y0:y1, x0:x1, ...]
+    return np.ascontiguousarray(cropped, dtype=np.float32)
+
+
 def _score_anchor_candidate(
     stats: dict,
     group_median: float,
@@ -252,6 +326,7 @@ def _select_quality_anchor(
     seestar_groups: list[list[dict]],
     anchor_settings: dict,
     center_settings: dict,
+    quality_crop_settings: dict | None,
     progress_callback: Callable | None = None,
 ) -> int | None:
     """Pick the best-quality anchor among the most central tiles."""
@@ -375,6 +450,7 @@ def _select_quality_anchor(
                 raise ValueError("no_cache")
             loaded_tile_ref = tile_array
             tile_array = _ensure_hwc_master_tile(tile_array, f"anchor_probe#{tile_id}")
+            tile_array = _apply_preview_quality_crop(tile_array, quality_crop_settings)
             tile_array = np.asarray(tile_array, dtype=np.float32, order="C")
             preview_arr, _ = zemosaic_utils.create_downscaled_luminance_preview(
                 tile_array,
@@ -629,51 +705,57 @@ def _compute_intertile_affine_corrections_from_sources(
         if clip_low > clip_high:
             clip_low, clip_high = clip_high, clip_low
 
-        medians_before: list[float] = []
-        for preview_entry, affine in zip(preview_arrays, sanitized):
-            if preview_entry is None:
-                medians_before.append(float("nan"))
-                continue
-            gain_val, offset_val = affine
-            try:
-                corrected = preview_entry * float(gain_val) + float(offset_val)
-                med_val = float(np.nanmedian(corrected)) if corrected.size > 0 else float("nan")
-            except Exception:
-                med_val = float("nan")
-            medians_before.append(med_val)
+        try:
+            medians_before: list[float] = []
+            for preview_entry, affine in zip(preview_arrays, sanitized):
+                if preview_entry is None:
+                    medians_before.append(float("nan"))
+                    continue
+                gain_val, offset_val = affine
+                try:
+                    corrected = preview_entry * float(gain_val) + float(offset_val)
+                    med_val = float(np.nanmedian(corrected)) if corrected.size > 0 else float("nan")
+                except Exception:
+                    med_val = float("nan")
+                medians_before.append(med_val)
 
-        finite_medians = [m for m in medians_before if math.isfinite(m) and m > 0]
-        if finite_medians:
-            target = float(np.median(finite_medians))
-            _log_and_callback(
-                "intertile_recenter_applied",
-                lvl="INFO",
-                callback=progress_callback,
-                target=target,
-                clip_low=clip_low,
-                clip_high=clip_high,
-            )
-            for idx, med_val in enumerate(medians_before):
-                if not (math.isfinite(med_val) and med_val > 0):
-                    continue
-                gain_adj = target / med_val if med_val != 0 else 1.0
-                if not math.isfinite(gain_adj) or gain_adj <= 0:
-                    continue
-                if gain_adj < clip_low:
-                    gain_adj = clip_low
-                elif gain_adj > clip_high:
-                    gain_adj = clip_high
-                gain_val, offset_val = sanitized[idx]
-                sanitized[idx] = (float(gain_val) * gain_adj, float(offset_val) * gain_adj)
+            finite_medians = [m for m in medians_before if math.isfinite(m) and m > 0]
+            if finite_medians:
+                target = float(np.median(finite_medians))
                 _log_and_callback(
-                    "intertile_recenter_adjust",
-                    lvl="INFO_DETAIL",
+                    "intertile_recenter_applied",
+                    lvl="INFO",
                     callback=progress_callback,
-                    tile=int(idx),
-                    median_before=med_val,
-                    gain_adj=gain_adj,
+                    target=target,
+                    clip_low=clip_low,
+                    clip_high=clip_high,
                 )
-        preview_arrays.clear()
+                for idx, med_val in enumerate(medians_before):
+                    if not (math.isfinite(med_val) and med_val > 0):
+                        continue
+                    gain_adj = target / med_val if med_val != 0 else 1.0
+                    if not math.isfinite(gain_adj) or gain_adj <= 0:
+                        continue
+                    if gain_adj < clip_low:
+                        gain_adj = clip_low
+                    elif gain_adj > clip_high:
+                        gain_adj = clip_high
+                    gain_val, offset_val = sanitized[idx]
+                    sanitized[idx] = (float(gain_val) * gain_adj, float(offset_val) * gain_adj)
+                    _log_and_callback(
+                        "intertile_recenter_adjust",
+                        lvl="INFO_DETAIL",
+                        callback=progress_callback,
+                        tile=int(idx),
+                        median_before=med_val,
+                        gain_adj=gain_adj,
+                    )
+        except Exception as exc:
+            if logger_obj:
+                logger_obj.warning("Intertile global recenter failed: %s", exc)
+                logger_obj.debug("Traceback (intertile recenter):", exc_info=True)
+        finally:
+            preview_arrays.clear()
     elif intertile_global_recenter and preview_arrays:
         preview_arrays.clear()
 
@@ -2056,6 +2138,16 @@ try:
     from .solver_settings import SolverSettings  # type: ignore
 except ImportError:
     from solver_settings import SolverSettings  # type: ignore
+
+try:
+    from .lecropper import detect_autocrop_rgb as _anchor_detect_autocrop
+except ImportError:
+    try:
+        from lecropper import detect_autocrop_rgb as _anchor_detect_autocrop
+    except Exception:
+        _anchor_detect_autocrop = None
+
+ANCHOR_AUTOCROP_AVAILABLE = callable(_anchor_detect_autocrop)
 
 # Optional configuration import for GPU toggle
 try:
@@ -7229,6 +7321,27 @@ def run_hierarchical_mosaic(
         "span_range": anchor_quality_span_range_config,
         "median_clip_sigma": anchor_quality_median_clip_sigma_config,
     }
+    try:
+        anchor_crop_band = max(4, int(quality_crop_band_px_config))
+    except Exception:
+        anchor_crop_band = 32
+    try:
+        anchor_crop_margin = max(0, int(quality_crop_margin_px_config))
+    except Exception:
+        anchor_crop_margin = 8
+    try:
+        anchor_crop_sigma = float(quality_crop_k_sigma_config)
+        if not math.isfinite(anchor_crop_sigma):
+            raise ValueError
+    except Exception:
+        anchor_crop_sigma = 2.0
+    anchor_crop_sigma = max(0.1, min(anchor_crop_sigma, 10.0))
+    anchor_crop_settings = {
+        "enabled": bool(ANCHOR_AUTOCROP_AVAILABLE and anchor_mode_lower == "auto_central_quality"),
+        "band_px": anchor_crop_band,
+        "margin_px": anchor_crop_margin,
+        "k_sigma": anchor_crop_sigma,
+    }
     if center_out_settings["enabled"] and seestar_stack_groups:
         order_info = _compute_center_out_order(seestar_stack_groups)
         distances = {}
@@ -7252,6 +7365,7 @@ def run_hierarchical_mosaic(
                 seestar_stack_groups,
                 anchor_quality_settings,
                 center_out_settings,
+                anchor_crop_settings,
                 progress_callback,
             )
             if selected_anchor is not None and selected_anchor in tile_id_order:
