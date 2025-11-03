@@ -65,16 +65,30 @@ import queue
 def _detect_instrument_from_header(header: dict | None) -> str:
     if not header:
         return "Unknown"
-    c = str(header.get("CREATOR", "")).upper()
-    i = str(header.get("INSTRUME", "")).upper()
-    if "SEESTAR S50" in c:
+
+    def _clean(value: Any) -> str:
+        try:
+            return str(value).strip()
+        except Exception:
+            return ""
+
+    creator_raw = _clean(header.get("CREATOR"))
+    creator = creator_raw.upper()
+    instrume_raw = _clean(header.get("INSTRUME"))
+    instrume = instrume_raw.upper()
+
+    if "SEESTAR S50" in creator:
         return "Seestar S50"
-    if "SEESTAR S30" in c:
+    if "SEESTAR S30" in creator:
         return "Seestar S30"
-    if "ASIAIR" in c:
-        return "ASIAIR"
-    if i.startswith("ZWO ASI") or "ASI" in i:
-        return header.get("INSTRUME", "ASI (Unknown)") or "ASI (Unknown)"
+    if "ASIAIR" in creator:
+        # Prefer the more specific INSTRUME label when available (e.g. ZWO ASIAIR Plus)
+        return instrume_raw or "ASIAIR"
+    if instrume.startswith("ZWO ASI") or "ASI" in instrume:
+        return instrume_raw or "ASI (Unknown)"
+    if instrume_raw:
+        # Fall back to the raw INSTRUME label for other devices
+        return instrume_raw
     return "Unknown"
 
 
@@ -1025,7 +1039,10 @@ def launch_filter_interface(
                 if header_payload is None and src.get("header_subset") is not None:
                     header_payload = src.get("header_subset")
                 self.header = header_payload
-                self.instrument: str = _detect_instrument_from_header(self.header)
+                detected = _detect_instrument_from_header(self.header)
+                self.instrument: str = detected.strip() if isinstance(detected, str) else "Unknown"
+                if not self.instrument:
+                    self.instrument = "Unknown"
                 self.shape: Optional[tuple[int, int]] = None
                 self.center: Optional[SkyCoord] = None
                 self.phase0_center: Optional[SkyCoord] = None
@@ -1643,6 +1660,21 @@ def launch_filter_interface(
             command=apply_threshold,
         )
         thresh_button.grid(row=0, column=2, padx=4, pady=4)
+
+        def _refresh_instrument_options() -> None:
+            values: list[str] = ["All"]
+            extras = sorted(x for x in instruments_found if x and x != "Unknown")
+            if extras:
+                values.extend(extras)
+            else:
+                values.append("Unknown")
+            if instrument_combo is not None:
+                try:
+                    instrument_combo["values"] = tuple(values)
+                except Exception:
+                    pass
+            if instrument_var.get() not in values:
+                instrument_var.set("All")
 
         filter_frame = ttk.Frame(right)
         filter_frame.grid(row=1, column=0, sticky="ew", padx=5, pady=(0, 5))
@@ -3985,9 +4017,10 @@ def launch_filter_interface(
         def _add_item_row(item: Item) -> None:
             idx = len(item_labels)
             base = os.path.basename(item.path)
+            instrument_name = (item.instrument or "").strip()
             tag = ""
-            if item.instrument and item.instrument != "Unknown":
-                tag = f" [{item.instrument}]"
+            if instrument_name and instrument_name != "Unknown":
+                tag = f" [{instrument_name}]"
             sep_txt = ""
             if item.center is not None:
                 try:
@@ -4025,7 +4058,10 @@ def launch_filter_interface(
             if path_key:
                 known_path_index[path_key] = idx
 
-            instruments_found.add(item.instrument or "Unknown")
+            previous_count = len(instruments_found)
+            instruments_found.add(instrument_name or "Unknown")
+            if len(instruments_found) != previous_count:
+                _refresh_instrument_options()
             current_choice = instrument_var.get()
             if current_choice != "All" and item.instrument != current_choice:
                 _set_selected(idx, False)
@@ -4130,15 +4166,7 @@ def launch_filter_interface(
                 return
             population_state["finalized"] = True
             try:
-                values = ["All"] + sorted(
-                    x for x in instruments_found if x and x != "Unknown"
-                )
-                if not values[1:]:
-                    values = ["All", "Unknown"]
-                if instrument_combo is not None:
-                    instrument_combo["values"] = tuple(values)
-                if instrument_var.get() not in values:
-                    instrument_var.set("All")
+                _refresh_instrument_options()
             except Exception:
                 pass
             update_visuals()
