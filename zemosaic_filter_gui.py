@@ -47,6 +47,7 @@
 from __future__ import annotations
 
 from typing import List, Dict, Any, Optional, Callable
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import asdict
 import os
@@ -184,6 +185,19 @@ def _merge_small_groups(
                 pass
 
     return [grp for idx, grp in enumerate(groups) if not merged_flags[idx]]
+
+
+def _format_sizes_histogram(sizes: list[int], max_buckets: int = 6) -> str:
+    """Return a compact histogram string for group sizes."""
+
+    if not sizes:
+        return "[]"
+
+    counter = Counter(sizes)
+    pairs = sorted(counter.items(), key=lambda kv: (-kv[1], -kv[0]))
+    head = ", ".join(f"{size}×{count}" for size, count in pairs[:max_buckets])
+    tail = len(pairs) - max_buckets
+    return head + (f", +{tail} more" if tail > 0 else "")
 
 
 def _compute_dynamic_footprint_budget(
@@ -1943,6 +1957,7 @@ def launch_filter_interface(
         listbox_programmatic = {"active": False}
 
         summary_var = tk.StringVar(master=root, value="")
+        sizes_details_state = {"full_sizes": "[]", "log_text": ""}
 
         # Early helper: may be called before footprint/draw state exists.
         def _apply_summary_hint(text: str) -> str:
@@ -2007,6 +2022,7 @@ def launch_filter_interface(
         operations = ttk.Frame(controls)
         operations.pack(fill=tk.X, expand=False)
         operations.columnconfigure(2, weight=1)
+        operations.columnconfigure(3, weight=0)
 
         # Build operations area defensively: never let a single error hide the panel
         draw_footprints_var = tk.BooleanVar(master=root, value=True)
@@ -2018,6 +2034,7 @@ def launch_filter_interface(
         auto_btn = None
         footprints_chk = None
         write_wcs_chk = None
+        details_btn = None
         try:
             resolve_btn = ttk.Button(
                 operations,
@@ -2045,6 +2062,38 @@ def launch_filter_interface(
             ).grid(row=0, column=2, padx=4, pady=2, sticky="w")
         except Exception as e:
             _log_message(f"[FilterUI] Summary label failed: {e}", level="WARN")
+
+        def _show_sizes_details():
+            try:
+                win = tk.Toplevel(root)
+                win.title("Master-tile sizes")
+                win.geometry("420x300")
+                import tkinter.scrolledtext as st
+
+                box = st.ScrolledText(win, wrap="word")
+                box.pack(fill="both", expand=True)
+                text = sizes_details_state.get("full_sizes") or sizes_details_state.get("log_text") or ""
+                try:
+                    box.insert("1.0", text)
+                except Exception:
+                    box.insert("1.0", str(text))
+                box.configure(state="disabled")
+                copy_btn = ttk.Button(
+                    win,
+                    text="Copy",
+                    command=lambda: (win.clipboard_clear(), win.clipboard_append(text)),
+                )
+                copy_btn.pack(pady=4)
+            except Exception as _exc:
+                _log_message(f"[FilterUI] Failed to open sizes popup: {_exc}", level="WARN")
+
+        try:
+            details_btn = ttk.Button(operations, text="Details…", command=_show_sizes_details)
+            details_btn.grid(row=0, column=3, padx=4, sticky="ne")
+            details_btn.grid_remove()
+        except Exception as e:
+            _log_message(f"[FilterUI] Details button failed: {e}", level="WARN")
+            details_btn = None
 
         try:
             coverage_chk = ttk.Checkbutton(
@@ -2541,6 +2590,13 @@ def launch_filter_interface(
                 )
                 summary_var.set(_apply_summary_hint(summary_text))
                 _log_message(summary_text, level="INFO")
+                sizes_details_state["full_sizes"] = "[]"
+                sizes_details_state["log_text"] = summary_text
+                if details_btn is not None:
+                    try:
+                        details_btn.grid_remove()
+                    except Exception:
+                        pass
                 try:
                     auto_btn.state(["!disabled"])
                 except Exception:
@@ -2572,6 +2628,13 @@ def launch_filter_interface(
                 )
                 summary_var.set(_apply_summary_hint(summary_text_local))
                 _log_message(summary_text_local, level=level)
+                sizes_details_state["full_sizes"] = "[]"
+                sizes_details_state["log_text"] = summary_text_local
+                if details_btn is not None:
+                    try:
+                        details_btn.grid_remove()
+                    except Exception:
+                        pass
                 _finalize_ui()
 
             def _handle_error(message: str) -> None:
@@ -2590,15 +2653,33 @@ def launch_filter_interface(
                     sizes = result.get("sizes")
                     if not isinstance(sizes, list):
                         sizes = [len(gr) for gr in final_groups]
-                    sizes_str = ", ".join(str(s) for s in sizes) if sizes else "[]"
-                    summary_text = _tr_safe(
+                    full_sizes_str = ", ".join(map(str, sizes)) if sizes else "[]"
+                    summary_text_for_log = _tr_safe(
                         "filter_log_groups_summary",
                         "Prepared {g} group(s), sizes: {sizes}.",
                         g=len(final_groups),
-                        sizes=sizes_str,
+                        sizes=full_sizes_str,
                     )
-                    summary_var.set(_apply_summary_hint(summary_text))
-                    _log_message(summary_text, level="INFO")
+                    _log_message(summary_text_for_log, level="INFO")
+                    sizes_details_state["full_sizes"] = full_sizes_str
+                    sizes_details_state["log_text"] = summary_text_for_log
+
+                    hist_str = _format_sizes_histogram(sizes)
+                    summary_text_compact = _tr_safe(
+                        "filter_log_groups_summary",
+                        "Prepared {g} group(s), sizes: {sizes}.",
+                        g=len(final_groups),
+                        sizes=hist_str,
+                    )
+                    summary_var.set(_apply_summary_hint(summary_text_compact))
+                    if details_btn is not None:
+                        try:
+                            if len(sizes) > 60:
+                                details_btn.grid()
+                            else:
+                                details_btn.grid_remove()
+                        except Exception:
+                            pass
                     if result.get("coverage_first"):
                         done_msg = _tr_safe(
                             "log_covfirst_done",
