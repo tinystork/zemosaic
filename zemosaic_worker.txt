@@ -1,0 +1,101 @@
+2025-11-04 13:25:14,336 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:2038 - Logging pour ZeMosaicWorker initialisé. Logs écrits dans: F:\seescan\env\zemosaic\zemosaic_worker.log
+2025-11-04 13:25:14,430 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:2099 - Bibliothèque Astropy importée.
+2025-11-04 13:25:14,430 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:2112 - Bibliothèque 'reproject' importée.
+2025-11-04 13:25:14,430 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:2131 - Module 'zemosaic_utils' importé.
+2025-11-04 13:25:14,430 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:2133 - Module 'zemosaic_astrometry' importé.
+2025-11-04 13:25:14,430 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:2135 - Module 'zemosaic_align_stack' importé.
+2025-11-04 13:25:14,861 - ZeMosaicWorker - INFO - zemosaic_worker.run_hierarchical_mosaic:5880 - Cache retention mode: per_tile
+2025-11-04 13:25:14,861 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:2332 - run_info_cache_retention_mode
+2025-11-04 13:25:14,861 - ZeMosaicWorker - INFO - zemosaic_worker.run_hierarchical_mosaic:5902 - Worker logging level set to INFO
+2025-11-04 13:25:15,562 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: run_info_processing_started]
+2025-11-04 13:25:15,562 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: Options Stacking (Master Tiles): Norm='linear_fit', Weight='noise_variance', Reject='winsorized_sigma_clip', Combine='mean']
+2025-11-04 13:25:15,571 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: run_info_phase1_started_cache]
+2025-11-04 13:25:15,572 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: Phase 0: filter returned no items]
+2025-11-04 13:25:15,574 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: WORKERS_PHASE1: Utilisation de 12 worker(s). (Base: 12, Fichiers: 66)]
+2025-11-04 13:25:25,650 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: run_info_phase1_finished_cache] (Args: {'num_valid_raws': 66})
+2025-11-04 13:25:25,655 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: run_info_phase2_started]
+2025-11-04 13:25:25,705 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: Winsor worker limit set to 10 (ProcessPoolExecutor enabled)]
+2025-11-04 13:25:25,713 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: run_info_phase2_finished] (Args: {'num_groups': 27})
+2025-11-04 13:25:25,748 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: run_info_phase3_started_from_cache]
+2025-11-04 13:25:25,825 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: center_anchor_probe_start] (Args: {'probe_count': 12})
+2025-11-04 13:25:28,571 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: center_anchor_fallback_central_only]
+2025-11-04 13:25:28,575 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: WORKERS_PHASE3: Utilisation de 4 worker(s). (Base: 12, Ratio 50%, Groupes: 27)]
+2025-11-04 13:25:28,579 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 0})
+2025-11-04 13:25:28,579 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 3, 'tile_id': 1})
+2025-11-04 13:25:28,580 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 3, 'tile_id': 5})
+2025-11-04 13:25:28,581 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 3, 'tile_id': 7})
+2025-11-04 13:25:33,175 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.788541,1.033281), target=1219.22]
+2025-11-04 13:25:33,972 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 3})
+2025-11-04 13:25:37,432 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.788713,1.029187), target=1214.09]
+2025-11-04 13:25:38,045 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 4})
+2025-11-04 13:25:39,461 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.786873,1.035521), target=1232.06]
+2025-11-04 13:25:39,548 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.791898,1.035380), target=1231.78]
+2025-11-04 13:25:39,629 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.790075,1.024886), target=1204.61]
+2025-11-04 13:25:40,379 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 3, 'tile_id': 8})
+2025-11-04 13:25:40,971 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 6})
+2025-11-04 13:25:41,243 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 2})
+2025-11-04 13:25:42,802 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.789227,1.033250), target=1223.55]
+2025-11-04 13:25:43,610 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 3, 'tile_id': 9})
+2025-11-04 13:25:45,249 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.788476,1.021948), target=1197]
+2025-11-04 13:25:45,249 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.790318,1.043445), target=1247.19]
+2025-11-04 13:25:46,079 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 14})
+2025-11-04 13:25:46,837 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 3, 'tile_id': 18})
+2025-11-04 13:25:49,750 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.793759,1.027852), target=1193.36]
+2025-11-04 13:25:50,081 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.791660,1.035107), target=1230.94]
+2025-11-04 13:25:50,812 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 13})
+2025-11-04 13:25:51,675 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 3, 'tile_id': 10})
+2025-11-04 13:25:53,277 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.790804,1.023137), target=1201.6]
+2025-11-04 13:25:54,518 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.789578,1.016092), target=1176.85]
+2025-11-04 13:25:54,793 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 3, 'tile_id': 15})
+2025-11-04 13:25:56,191 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 3, 'tile_id': 17})
+2025-11-04 13:25:56,567 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.797082,1.031145), target=1197.47]
+2025-11-04 13:25:58,217 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 12})
+2025-11-04 13:26:01,542 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.790886,1.026145), target=1197.42]
+2025-11-04 13:26:01,862 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.787238,1.012990), target=1173.7]
+2025-11-04 13:26:02,882 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 11})
+2025-11-04 13:26:03,740 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 16})
+2025-11-04 13:26:04,813 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.798833,1.036117), target=1191.92]
+2025-11-04 13:26:05,651 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.796918,1.030251), target=1197.49]
+2025-11-04 13:26:06,223 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 23})
+2025-11-04 13:26:06,844 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.786764,1.016605), target=1185.64]
+2025-11-04 13:26:07,598 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.794684,1.029830), target=1195.51]
+2025-11-04 13:26:07,817 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 4, 'tile_id': 19})
+2025-11-04 13:26:08,653 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 3, 'tile_id': 22})
+2025-11-04 13:26:10,304 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 26})
+2025-11-04 13:26:10,935 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.808029,1.061778), target=1179.93]
+2025-11-04 13:26:11,959 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.860700,1.195676), target=1106]
+2025-11-04 13:26:12,578 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: MT_CROP: quality crop skipped (rect=(8, 8, 1912, 1072), area_ratio=0.977)]
+2025-11-04 13:26:12,944 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 24})
+2025-11-04 13:26:13,715 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: MT_CROP: quality crop skipped (rect=(8, 8, 1912, 1072), area_ratio=0.977)]
+2025-11-04 13:26:14,107 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 20})
+2025-11-04 13:26:16,435 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.809758,1.066105), target=1174.64]
+2025-11-04 13:26:17,445 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.823202,1.103168), target=1174.98]
+2025-11-04 13:26:18,088 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: MT_CROP: quality crop skipped (rect=(8, 8, 1912, 1072), area_ratio=0.977)]
+2025-11-04 13:26:18,517 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 3, 'tile_id': 25})
+2025-11-04 13:26:18,695 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.834689,1.121361), target=1160.09]
+2025-11-04 13:26:19,600 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: MT_CROP: quality crop skipped (rect=(8, 8, 1912, 1072), area_ratio=0.977)]
+2025-11-04 13:26:19,992 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 21})
+2025-11-04 13:26:20,366 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.816369,1.072666), target=1165.11]
+2025-11-04 13:26:23,459 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.825181,1.108579), target=1171.32]
+2025-11-04 13:26:26,634 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.830517,1.119018), target=1158.77]
+2025-11-04 13:26:29,351 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: run_info_phase3_finished_from_cache] (Args: {'num_master_tiles': 27})
+2025-11-04 13:26:29,351 - ZeMosaicWorker - INFO - zemosaic_worker.run_hierarchical_mosaic:7866 - All master tiles complete, entering Phase 5 (reproject & coadd)
+2025-11-04 13:26:29,356 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: run_info_phase4_started]
+2025-11-04 13:26:29,362 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: calcgrid_info_scales] (Args: {'avg_input_scale_arcsec': np.float64(2.3715373013968377), 'target_scale_arcsec': np.float64(2.3715373013968377)})
+2025-11-04 13:26:29,458 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: calcgrid_info_optimal_grid_calculated] (Args: {'shape': (3821, 2684), 'crval': array([184.18480874,  47.15520753])})
+2025-11-04 13:26:29,464 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: run_info_phase4_finished] (Args: {'shape': (3821, 2684), 'crval': array([184.18480874,  47.15520753])})
+2025-11-04 13:26:29,473 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: run_info_phase5_started_reproject_coadd]
+2025-11-04 13:26:30,855 - ZeMosaicWorker - INFO - zemosaic_utils._log_intertile:1085 - [Intertile] Auto-tune enabled for 27 tiles — using preview=1024, min_overlap=0.0100
+2025-11-04 13:26:30,898 - ZeMosaicWorker - INFO - zemosaic_utils._log_intertile:1085 - [Intertile] Overlap pairs at min_overlap=0.0100: 162
+2025-11-04 13:26:30,898 - ZeMosaicWorker - INFO - zemosaic_utils._log_intertile:1085 - [Intertile] Using: preview=1024, min_overlap=0.0100, sky=(30.0,70.0), clip=2.50, pairs=162
+2025-11-04 13:29:51,923 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: assemble_info_finished_reproject_coadd] (Args: {'shape': (3395, 2525, 3)})
+2025-11-04 13:29:51,975 - ZeMosaicWorker - INFO - zemosaic_worker.run_hierarchical_mosaic:8172 - [TwoPass] Second pass requested (sigma=50, clip=(0.85, 1.18)); coverage shape=(3395, 2525)
+2025-11-04 13:36:25,042 - ZeMosaicWorker - INFO - zemosaic_worker.run_hierarchical_mosaic:8215 - [TwoPass] coverage-renorm OK (σ=50, clip=[0.850, 1.180])
+2025-11-04 13:36:25,066 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: run_info_phase5_finished_reproject_coadd] (Args: {'shape': (3821, 2684, 3)})
+2025-11-04 13:36:25,074 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: run_info_phase6_started]
+2025-11-04 13:36:26,222 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: run_success_mosaic_saved] (Args: {'filename': 'zemosaic_MT27_R66.fits'})
+2025-11-04 13:36:27,366 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: run_success_preview_saved_auto_asifits] (Args: {'filename': 'zemosaic_MT27_R66_preview.png'})
+2025-11-04 13:36:27,438 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: run_info_phase7_cleanup_starting]
+2025-11-04 13:36:27,444 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:2332 - [CLÉ_POUR_GUI: run_success_processing_completed] (Args: {'duration': '672.48'})
+2025-11-04 13:36:27,528 - ZeMosaicWorker - INFO - zemosaic_worker._log_alignment_warning_summary:2389 - Alignment summary: no frames ignored due to errors.
+2025-11-04 13:36:27,528 - ZeMosaicWorker - INFO - zemosaic_worker.run_hierarchical_mosaic:8503 - ===== Run Hierarchical Mosaic COMPLETED in 672.48s =====
