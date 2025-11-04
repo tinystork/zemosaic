@@ -785,103 +785,109 @@ def estimate_sky_affine_to_ref(
 
     return float(gain), float(offset), int(x_sel.size)
 
-
 def _rescale_wcs_for_preview(
     wcs_obj,
     original_shape_hw: tuple[int, int],
     new_shape_hw: tuple[int, int],
+    *,
+    keep_distortion: bool = True,
 ):
+    """
+    Build a preview WCS consistent with the resized preview array.
+    - keep_distortion=True  (default): clone original WCS and rescale CRPIX & CD/CDELT,
+      preserving SIP/distortion (matches 3.2.4 behavior).
+    - keep_distortion=False: fit a local TAN plane at the image center (no SIP),
+      then rescale CD to the preview pixel size.
+    """
     if not wcs_obj or not getattr(wcs_obj, "is_celestial", False):
         return None
     try:
-        preview_wcs = wcs_obj.deepcopy()
-    except Exception:
-        preview_wcs = copy.deepcopy(wcs_obj)
-    if preview_wcs is None:
-        return None
-
-    # Linearize TAN-SIP previews into pure TAN WCS when Astropy is available.
-    if ASTROPY_WCS_AVAILABLE_IN_UTILS and AstropyWCS is not None:
-        header_obj = None
-        try:
-            header_obj = preview_wcs.to_header(relax=True)
-        except TypeError:
-            try:
-                header_obj = preview_wcs.to_header()
-            except Exception:
-                header_obj = None
-        except Exception:
-            header_obj = None
-
-        if header_obj is not None:
-            try:
-                for key in list(header_obj.keys()):
-                    if any(
-                        key.startswith(prefix)
-                        for prefix in ("A_", "B_", "AP_", "BP_", "PV1_", "PV2_")
-                    ):
-                        try:
-                            del header_obj[key]
-                        except Exception:
-                            pass
-
-                for axis in (1, 2):
-                    ctype_key = f"CTYPE{axis}"
-                    current_value = header_obj.get(ctype_key)
-                    if current_value is None:
-                        continue
-                    ctype_str = str(current_value)
-                    if "-SIP" in ctype_str:
-                        ctype_str = ctype_str.replace("-SIP", "")
-                    if not ctype_str.endswith("TAN"):
-                        ctype_str = "RA---TAN" if axis == 1 else "DEC--TAN"
-                    header_obj[ctype_key] = ctype_str
-
-                original_pixel_shape = getattr(preview_wcs, "pixel_shape", None)
-                preview_wcs = AstropyWCS(header_obj, naxis=2, relax=True)
-                if original_pixel_shape is not None:
-                    try:
-                        preview_wcs.pixel_shape = tuple(original_pixel_shape)  # type: ignore[arg-type]
-                    except Exception:
-                        pass
-                global _PREVIEW_WCS_LINEARIZED_LOGGED
-                if not _PREVIEW_WCS_LINEARIZED_LOGGED:
-                    logger.debug("PreviewWCS linearized (SIP dropped)")
-                    _PREVIEW_WCS_LINEARIZED_LOGGED = True
-            except Exception:
-                try:
-                    preview_wcs = wcs_obj.deepcopy()
-                except Exception:
-                    preview_wcs = copy.deepcopy(wcs_obj)
-
-    try:
         orig_h, orig_w = map(float, original_shape_hw)
         new_h, new_w = map(float, new_shape_hw)
-        if new_h <= 0 or new_w <= 0:
+    except Exception:
+        return None
+    if new_h <= 0 or new_w <= 0:
+        return None
+
+    scale_y = orig_h / new_h
+    scale_x = orig_w / new_w
+
+    # Fast path: preserve SIP/distortion (regression to 3.2.4)
+    if keep_distortion:
+        try:
+            preview_wcs = wcs_obj.deepcopy()
+        except Exception:
+            preview_wcs = copy.deepcopy(wcs_obj)
+        if preview_wcs is None:
             return None
-        scale_y = orig_h / new_h
-        scale_x = orig_w / new_w
-        if hasattr(preview_wcs, "wcs") and preview_wcs.wcs is not None:
-            if preview_wcs.wcs.crpix is not None and preview_wcs.wcs.crpix.size >= 2:
-                preview_wcs.wcs.crpix[0] = (float(preview_wcs.wcs.crpix[0]) - 0.5) / scale_x + 0.5
-                preview_wcs.wcs.crpix[1] = (float(preview_wcs.wcs.crpix[1]) - 0.5) / scale_y + 0.5
-            cd_matrix = None
-            try:
-                cd_matrix = preview_wcs.wcs.cd
-            except (AttributeError, ValueError):
-                cd_matrix = None
-            if cd_matrix is not None:
-                preview_wcs.wcs.cd[0, :] *= scale_x
-                preview_wcs.wcs.cd[1, :] *= scale_y
-            else:
-                cdelt = None
+        try:
+            if hasattr(preview_wcs, "wcs") and preview_wcs.wcs is not None:
+                if preview_wcs.wcs.crpix is not None and preview_wcs.wcs.crpix.size >= 2:
+                    preview_wcs.wcs.crpix[0] = (float(preview_wcs.wcs.crpix[0]) - 0.5) / scale_x + 0.5
+                    preview_wcs.wcs.crpix[1] = (float(preview_wcs.wcs.crpix[1]) - 0.5) / scale_y + 0.5
+                # Rescale CD or CDELT
                 try:
-                    cdelt = preview_wcs.wcs.cdelt
-                except (AttributeError, ValueError):
-                    cdelt = None
-                if cdelt is not None:
-                    preview_wcs.wcs.cdelt[0] *= scale_x
-                    preview_wcs.wcs.cdelt[1] *= scale_y
+                    cd = preview_wcs.wcs.cd
+                except Exception:
+                    cd = None
+                if cd is not None:
+                    preview_wcs.wcs.cd[0, :] *= scale_x
+                    preview_wcs.wcs.cd[1, :] *= scale_y
+                else:
+                    try:
+                        preview_wcs.wcs.cdelt[0] *= scale_x
+                        preview_wcs.wcs.cdelt[1] *= scale_y
+                    except Exception:
+                        pass
+            try:
+                preview_wcs.pixel_shape = (int(round(new_w)), int(round(new_h)))
+            except Exception:
+                pass
+            try:
+                preview_wcs.fix()
+            except Exception:
+                pass
+            return preview_wcs
+        except Exception:
+            return None
+
+    # Proper linearization: fit a TAN plane at center, then rescale CD
+    if not (ASTROPY_WCS_AVAILABLE_IN_UTILS and AstropyWCS is not None):
+        return None
+    try:
+        # Center in original pixel grid
+        cx = (orig_w - 1.0) * 0.5
+        cy = (orig_h - 1.0) * 0.5
+        # Sample world at center and ±1px to estimate Jacobian
+        c0 = wcs_obj.pixel_to_world(cx, cy)
+        cx1 = wcs_obj.pixel_to_world(cx + 1.0, cy)
+        cy1 = wcs_obj.pixel_to_world(cx, cy + 1.0)
+        # Convert small offsets to degrees in a local tangent approx
+        ra0 = float(c0.ra.deg)
+        dec0 = float(c0.dec.deg)
+        cosd = max(1e-6, abs(math.cos(math.radians(dec0))))
+        d_ra_dx = (float(cx1.ra.deg) - ra0) * cosd
+        d_dec_dx = float(cx1.dec.deg) - dec0
+        d_ra_dy  = (float(cy1.ra.deg) - ra0) * cosd
+        d_dec_dy = float(cy1.dec.deg) - dec0
+        # CD in deg/px at original scale
+        cd = np.array([[d_ra_dx, d_ra_dy],
+                       [d_dec_dx, d_dec_dy]], dtype=np.float64)
+        # Rescale to preview pixels: preview pixel = scale_x * original px (x), scale_y (y)
+        cd[0, 0] *= scale_x; cd[0, 1] *= scale_y
+        cd[1, 0] *= scale_x; cd[1, 1] *= scale_y
+        # Build a clean TAN WCS
+        hdr = {}
+        hdr["NAXIS"]  = 2
+        hdr["CTYPE1"] = "RA---TAN"
+        hdr["CTYPE2"] = "DEC--TAN"
+        hdr["CRVAL1"] = ra0
+        hdr["CRVAL2"] = dec0
+        hdr["CRPIX1"] = (new_w + 1.0) * 0.5
+        hdr["CRPIX2"] = (new_h + 1.0) * 0.5
+        hdr["CD1_1"]  = cd[0, 0]; hdr["CD1_2"] = cd[0, 1]
+        hdr["CD2_1"]  = cd[1, 0]; hdr["CD2_2"] = cd[1, 1]
+        preview_wcs = AstropyWCS(header=hdr, naxis=2, relax=True)
         try:
             preview_wcs.pixel_shape = (int(round(new_w)), int(round(new_h)))
         except Exception:
@@ -893,8 +899,7 @@ def _rescale_wcs_for_preview(
         return preview_wcs
     except Exception:
         return None
-
-
+    
 def create_downscaled_luminance_preview(
     image: np.ndarray,
     wcs_obj,

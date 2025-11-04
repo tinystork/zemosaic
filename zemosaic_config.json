@@ -21,7 +21,7 @@
     "gpu_id_phase5": 0,
     "gpu_selector": "NVIDIA GeForce RTX 3070 Laptop GPU",
     "final_assembly_method": "reproject_coadd",
-    "two_pass_coverage_renorm": true,
+    "two_pass_coverage_renorm": false,
     "two_pass_cov_sigma_px": 50,
     "two_pass_cov_gain_clip": [
         0.85,
@@ -35,24 +35,24 @@
     "coadd_use_memmap": true,
     "coadd_memmap_dir": "",
     "coadd_cleanup_memmap": true,
-    "cache_retention": "per_tile",
+    "cache_retention": "run_end",
     "assembly_process_workers": 0,
     "auto_limit_frames_per_master_tile": true,
     "winsor_worker_limit": 10,
-    "winsor_max_frames_per_pass": 20,
+    "winsor_max_frames_per_pass": 10,
     "winsor_auto_fallback_on_memory_error": true,
     "winsor_min_frames_per_pass": 4,
     "winsor_memmap_fallback": "auto",
     "winsor_split_strategy": "sequential",
-    "max_raw_per_master_tile": 50,
+    "max_raw_per_master_tile": 0,
     "center_out_normalization_p3": true,
     "center_out_anchor_mode": "auto_central_quality",
     "anchor_quality_probe_limit": 12,
     "anchor_quality_span_range": [
-        0.005,
-        10.0
+        0.02,
+        6.0
     ],
-    "anchor_quality_median_clip_sigma": 3.5,
+    "anchor_quality_median_clip_sigma": 2.5,
     "enable_poststack_anchor_review": true,
     "poststack_anchor_probe_limit": 8,
     "poststack_anchor_span_range": [
@@ -60,7 +60,7 @@
         10.0
     ],
     "poststack_anchor_median_clip_sigma": 3.5,
-    "poststack_anchor_min_improvement": 0.02,
+    "poststack_anchor_min_improvement": 0.12,
     "poststack_anchor_use_overlap_affine": true,
     "p3_center_sky_percentile": [
         25.0,
@@ -82,14 +82,14 @@
         0.85,
         1.18
     ],
-    "use_auto_intertile": true,
+    "use_auto_intertile": false,
     "match_background_for_final": true,
     "incremental_feather_parity": false,
     "enable_early_filter": true,
     "apply_master_tile_crop": true,
-    "master_tile_crop_percent": 18.0,
-    "quality_crop_enabled": true,
-    "quality_crop_band_px": 36,
+    "master_tile_crop_percent": 5.0,
+    "quality_crop_enabled": false,
+    "quality_crop_band_px": 32,
     "quality_crop_k_sigma": 2.0,
     "quality_crop_margin_px": 8,
     "crop_follow_signal": true
