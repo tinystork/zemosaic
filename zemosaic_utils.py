@@ -57,12 +57,23 @@ import traceback
 import gc
 import importlib.util
 
+# --- Optional Astropy WCS import (lightweight, guarded) ----------------------
+ASTROPY_WCS_AVAILABLE_IN_UTILS = False
+AstropyWCS = None
+try:  # pragma: no cover - optional dependency path
+    from astropy.wcs import WCS as AstropyWCS  # type: ignore
+
+    ASTROPY_WCS_AVAILABLE_IN_UTILS = True
+except Exception:
+    AstropyWCS = None
+
 # --- GPU/CUDA Availability ----------------------------------------------------
 GPU_AVAILABLE = importlib.util.find_spec("cupy") is not None
 map_coordinates = None  # Lazily imported when needed
 
 
 logger = logging.getLogger(__name__)
+_PREVIEW_WCS_LINEARIZED_LOGGED = False
 
 # --- Lightweight CuPy helpers -------------------------------------------------
 def gpu_is_available() -> bool:
@@ -788,6 +799,61 @@ def _rescale_wcs_for_preview(
         preview_wcs = copy.deepcopy(wcs_obj)
     if preview_wcs is None:
         return None
+
+    # Linearize TAN-SIP previews into pure TAN WCS when Astropy is available.
+    if ASTROPY_WCS_AVAILABLE_IN_UTILS and AstropyWCS is not None:
+        header_obj = None
+        try:
+            header_obj = preview_wcs.to_header(relax=True)
+        except TypeError:
+            try:
+                header_obj = preview_wcs.to_header()
+            except Exception:
+                header_obj = None
+        except Exception:
+            header_obj = None
+
+        if header_obj is not None:
+            try:
+                for key in list(header_obj.keys()):
+                    if any(
+                        key.startswith(prefix)
+                        for prefix in ("A_", "B_", "AP_", "BP_", "PV1_", "PV2_")
+                    ):
+                        try:
+                            del header_obj[key]
+                        except Exception:
+                            pass
+
+                for axis in (1, 2):
+                    ctype_key = f"CTYPE{axis}"
+                    current_value = header_obj.get(ctype_key)
+                    if current_value is None:
+                        continue
+                    ctype_str = str(current_value)
+                    if "-SIP" in ctype_str:
+                        ctype_str = ctype_str.replace("-SIP", "")
+                    if not ctype_str.endswith("TAN"):
+                        ctype_str = "RA---TAN" if axis == 1 else "DEC--TAN"
+                    header_obj[ctype_key] = ctype_str
+
+                original_pixel_shape = getattr(preview_wcs, "pixel_shape", None)
+                preview_wcs = AstropyWCS(header_obj, naxis=2, relax=True)
+                if original_pixel_shape is not None:
+                    try:
+                        preview_wcs.pixel_shape = tuple(original_pixel_shape)  # type: ignore[arg-type]
+                    except Exception:
+                        pass
+                global _PREVIEW_WCS_LINEARIZED_LOGGED
+                if not _PREVIEW_WCS_LINEARIZED_LOGGED:
+                    logger.debug("PreviewWCS linearized (SIP dropped)")
+                    _PREVIEW_WCS_LINEARIZED_LOGGED = True
+            except Exception:
+                try:
+                    preview_wcs = wcs_obj.deepcopy()
+                except Exception:
+                    preview_wcs = copy.deepcopy(wcs_obj)
+
     try:
         orig_h, orig_w = map(float, original_shape_hw)
         new_h, new_w = map(float, new_shape_hw)
@@ -799,7 +865,6 @@ def _rescale_wcs_for_preview(
             if preview_wcs.wcs.crpix is not None and preview_wcs.wcs.crpix.size >= 2:
                 preview_wcs.wcs.crpix[0] = (float(preview_wcs.wcs.crpix[0]) - 0.5) / scale_x + 0.5
                 preview_wcs.wcs.crpix[1] = (float(preview_wcs.wcs.crpix[1]) - 0.5) / scale_y + 0.5
-            # Some WCS instances expose ``cd`` while others rely on ``cdelt``.
             cd_matrix = None
             try:
                 cd_matrix = preview_wcs.wcs.cd
@@ -819,6 +884,10 @@ def _rescale_wcs_for_preview(
                     preview_wcs.wcs.cdelt[1] *= scale_y
         try:
             preview_wcs.pixel_shape = (int(round(new_w)), int(round(new_h)))
+        except Exception:
+            pass
+        try:
+            preview_wcs.fix()
         except Exception:
             pass
         return preview_wcs
