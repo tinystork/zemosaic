@@ -47,12 +47,21 @@
     "max_raw_per_master_tile": 50,
     "center_out_normalization_p3": true,
     "center_out_anchor_mode": "auto_central_quality",
-    "anchor_quality_probe_limit": 16,
+    "anchor_quality_probe_limit": 12,
     "anchor_quality_span_range": [
         0.005,
         10.0
     ],
     "anchor_quality_median_clip_sigma": 3.5,
+    "enable_poststack_anchor_review": true,
+    "poststack_anchor_probe_limit": 8,
+    "poststack_anchor_span_range": [
+        0.004,
+        10.0
+    ],
+    "poststack_anchor_median_clip_sigma": 3.5,
+    "poststack_anchor_min_improvement": 0.02,
+    "poststack_anchor_use_overlap_affine": true,
     "p3_center_sky_percentile": [
         25.0,
         60.0
