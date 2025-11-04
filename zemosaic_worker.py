@@ -5231,19 +5231,54 @@ def assemble_final_mosaic_reproject_coadd(
             data_list = [arr[..., ch] for arr, _w in input_data_all_tiles_HWC_processed]
             wcs_list = [wcs for _arr, wcs in input_data_all_tiles_HWC_processed]
 
-            chan_mosaic, chan_cov = reproject_and_coadd_wrapper(
-                data_list=data_list,
-                wcs_list=wcs_list,
-                shape_out=final_output_shape_hw,
+            reproj_call_kwargs = dict(reproj_kwargs)
+            if use_gpu:
+                for unsupported_kw in ("intertile_global_recenter",):
+                    if unsupported_kw in reproj_call_kwargs:
+                        reproj_call_kwargs.pop(unsupported_kw, None)
+                        logger.debug(
+                            "[GPU Reproject] Ignoring unsupported kwarg: %s",
+                            unsupported_kw,
+                        )
 
-                output_projection=output_header,
-                use_gpu=use_gpu,
-                cpu_func=reproject_and_coadd,
+            def _invoke_reproject(local_kwargs: dict):
+                return reproject_and_coadd_wrapper(
+                    data_list=data_list,
+                    wcs_list=wcs_list,
+                    shape_out=final_output_shape_hw,
+                    output_projection=output_header,
+                    use_gpu=use_gpu,
+                    cpu_func=reproject_and_coadd,
+                    reproject_function=reproject_interp,
+                    combine_function="mean",
+                    **local_kwargs,
+                )
 
-                reproject_function=reproject_interp,
-                combine_function="mean",
-                **reproj_kwargs,
-            )
+            try:
+                chan_mosaic, chan_cov = _invoke_reproject(reproj_call_kwargs)
+            except TypeError as gpu_kw_err:
+                if use_gpu:
+                    logger.warning(
+                        "[GPU Reproject] Unexpected kwargs triggered TypeError: %s",
+                        gpu_kw_err,
+                    )
+                    retry_kwargs = reproj_call_kwargs.copy()
+                    removed_after_error: list[str] = []
+                    err_msg = str(gpu_kw_err)
+                    for key in list(retry_kwargs.keys()):
+                        if f"'{key}'" in err_msg:
+                            retry_kwargs.pop(key, None)
+                            removed_after_error.append(key)
+                    if removed_after_error:
+                        logger.debug(
+                            "[GPU Reproject] Retrying without kwargs: %s",
+                            ", ".join(removed_after_error),
+                        )
+                        chan_mosaic, chan_cov = _invoke_reproject(retry_kwargs)
+                    else:
+                        raise
+                else:
+                    raise
             # Store channel result to memmap if enabled, else keep in RAM list
             ch_f32 = chan_mosaic.astype(np.float32)
             if mosaic_memmap is not None:
