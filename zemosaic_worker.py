@@ -4791,6 +4791,8 @@ def assemble_final_mosaic_reproject_coadd(
     intertile_overlap_min: float = 0.05,
     intertile_sky_percentile: tuple[float, float] | list[float] = (30.0, 70.0),
     intertile_robust_clip_sigma: float = 2.5,
+    intertile_global_recenter: bool = True,
+    intertile_recenter_clip: tuple[float, float] | list[float] | None = (0.85, 1.18),
     use_auto_intertile: bool = False,
     collect_tile_data: list | None = None,
     tile_affine_corrections: list[tuple[float, float]] | None = None,
@@ -5047,8 +5049,8 @@ def assemble_final_mosaic_reproject_coadd(
                 use_auto_intertile=use_auto_intertile,
                 logger_obj=logger,
                 progress_callback=progress_callback,
-                intertile_global_recenter=bool(intertile_global_recenter_config),
-                intertile_recenter_clip=intertile_recenter_clip_tuple,
+                intertile_global_recenter=bool(intertile_global_recenter),
+                intertile_recenter_clip=intertile_recenter_clip,
             )
         )
 
