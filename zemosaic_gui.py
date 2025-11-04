@@ -383,6 +383,10 @@ class ZeMosaicGUI:
             pass
         self.mm_dir_var = tk.StringVar(master=self.root, value=self.config.get("coadd_memmap_dir", ""))
         self.cleanup_memmap_var = tk.BooleanVar(master=self.root, value=self.config.get("coadd_cleanup_memmap", True))
+        self.cache_retention_var = tk.StringVar(
+            master=self.root,
+            value=self.config.get("cache_retention", "run_end"),
+        )
         self.auto_limit_frames_var = tk.BooleanVar(master=self.root, value=self.config.get("auto_limit_frames_per_master_tile", True))
         self.max_raw_per_tile_var = tk.IntVar(master=self.root, value=self.config.get("max_raw_per_master_tile", 0))
         intertile_sky_cfg = self.config.get("intertile_sky_percentile", [30.0, 70.0])
@@ -733,6 +737,18 @@ class ZeMosaicGUI:
         ttk.Label(params_frame, text="").grid(row=param_row_idx, column=0, padx=5, pady=3, sticky="w"); self.translatable_widgets["panel_orientation_split_label"] = params_frame.grid_slaves(row=param_row_idx,column=0)[0]
         ttk.Spinbox(params_frame, from_=0.0, to=180.0, increment=1.0, textvariable=self.cluster_orientation_split_var, width=8, format="%.1f").grid(row=param_row_idx, column=1, padx=5, pady=3, sticky="w")
         ttk.Label(params_frame, text="").grid(row=param_row_idx, column=2, padx=5, pady=3, sticky="w"); self.translatable_widgets["panel_orientation_split_note"] = params_frame.grid_slaves(row=param_row_idx,column=2)[0]
+        param_row_idx += 1
+
+        cache_retention_label = ttk.Label(params_frame, text=self._tr("gui_cache_retention_label", "Cache retention:"))
+        cache_retention_label.grid(row=param_row_idx, column=0, padx=5, pady=3, sticky="w")
+        self.translatable_widgets["gui_cache_retention_label"] = cache_retention_label
+        ttk.Combobox(
+            params_frame,
+            textvariable=self.cache_retention_var,
+            values=["run_end", "per_tile", "keep"],
+            state="readonly",
+            width=15,
+        ).grid(row=param_row_idx, column=1, padx=5, pady=3, sticky="w")
         param_row_idx += 1
         # Removed: Force Luminance option (images are sent to ASTAP as-is)
 
@@ -1302,7 +1318,10 @@ class ZeMosaicGUI:
         self.logging_frame = ttk.LabelFrame(self.scrollable_content_frame, text=self._tr("gui_logging_title", "Logging"))
         self.logging_frame.pack(fill=tk.X, pady=(0,10))
         self.logging_frame.columnconfigure(1, weight=1)
-        ttk.Label(self.logging_frame, text=self._tr("gui_logging_level", "Logging level:")).grid(row=0, column=0, sticky="w", padx=5, pady=3)
+        self.translatable_widgets["gui_logging_title"] = self.logging_frame
+        logging_level_label = ttk.Label(self.logging_frame, text=self._tr("gui_logging_level", "Logging level:"))
+        logging_level_label.grid(row=0, column=0, sticky="w", padx=5, pady=3)
+        self.translatable_widgets["gui_logging_level"] = logging_level_label
         # Display values localized, but store keys
         level_display = [
             self._tr("logging_level_error", "Error"),
@@ -1331,12 +1350,21 @@ class ZeMosaicGUI:
         self.memmap_frame = ttk.LabelFrame(self.scrollable_content_frame, text=self._tr("gui_memmap_title", "Options memmap (coadd)"))
         self.memmap_frame.pack(fill=tk.X, pady=(0,10))
         self.memmap_frame.columnconfigure(1, weight=1)
-        ttk.Checkbutton(self.memmap_frame, text=self._tr("gui_memmap_enable", "Use disk memmap"), variable=self.use_memmap_var).grid(row=0, column=0, sticky="w", padx=5, pady=3)
-        ttk.Label(self.memmap_frame, text=self._tr("gui_memmap_dir", "Memmap Folder")).grid(row=1, column=0, sticky="e", padx=5, pady=3)
+        self.translatable_widgets["gui_memmap_title"] = self.memmap_frame
+        memmap_enable_check = ttk.Checkbutton(self.memmap_frame, text=self._tr("gui_memmap_enable", "Use disk memmap"), variable=self.use_memmap_var)
+        memmap_enable_check.grid(row=0, column=0, sticky="w", padx=5, pady=3)
+        self.translatable_widgets["gui_memmap_enable"] = memmap_enable_check
+        memmap_dir_label = ttk.Label(self.memmap_frame, text=self._tr("gui_memmap_dir", "Memmap Folder"))
+        memmap_dir_label.grid(row=1, column=0, sticky="e", padx=5, pady=3)
+        self.translatable_widgets["gui_memmap_dir"] = memmap_dir_label
         ttk.Entry(self.memmap_frame, textvariable=self.mm_dir_var, width=45).grid(row=1, column=1, sticky="we", padx=5, pady=3)
         ttk.Button(self.memmap_frame, text="…", command=self._browse_mm_dir).grid(row=1, column=2, padx=5, pady=3)
-        ttk.Checkbutton(self.memmap_frame, text=self._tr("gui_memmap_cleanup", "Delete *.dat when finished"), variable=self.cleanup_memmap_var).grid(row=2, column=0, sticky="w", padx=5, pady=3)
-        ttk.Checkbutton(self.memmap_frame, text=self._tr("gui_auto_limit_frames", "Auto limit frames per master tile (system stability)"), variable=self.auto_limit_frames_var).grid(row=3, column=0, sticky="w", padx=5, pady=3, columnspan=2)
+        memmap_cleanup_check = ttk.Checkbutton(self.memmap_frame, text=self._tr("gui_memmap_cleanup", "Delete *.dat when finished"), variable=self.cleanup_memmap_var)
+        memmap_cleanup_check.grid(row=2, column=0, sticky="w", padx=5, pady=3)
+        self.translatable_widgets["gui_memmap_cleanup"] = memmap_cleanup_check
+        auto_limit_check = ttk.Checkbutton(self.memmap_frame, text=self._tr("gui_auto_limit_frames", "Auto limit frames per master tile (system stability)"), variable=self.auto_limit_frames_var)
+        auto_limit_check.grid(row=3, column=0, sticky="w", padx=5, pady=3, columnspan=2)
+        self.translatable_widgets["gui_auto_limit_frames"] = auto_limit_check
         self._on_assembly_method_change()
         
 
@@ -1475,6 +1503,26 @@ class ZeMosaicGUI:
                 pass # Ignorer si le widget n'existe plus
             except Exception as e:
                 print(f"DEBUG GUI: Erreur inattendue lors de la mise à jour du widget standard '{key}': {e}")
+
+        if hasattr(self, 'logging_level_combo'):
+            try:
+                level_display = [
+                    self._tr("logging_level_error", "Error"),
+                    self._tr("logging_level_warn", "Warn"),
+                    self._tr("logging_level_info", "Info"),
+                    self._tr("logging_level_debug", "Debug"),
+                ]
+                self._logging_level_display_map = dict(zip(self.logging_level_keys, level_display))
+                self._logging_level_reverse_map = {v: k for k, v in self._logging_level_display_map.items()}
+                self.logging_level_combo["values"] = level_display
+                self.logging_level_combo.set(
+                    self._logging_level_display_map.get(
+                        self.logging_level_var.get(),
+                        level_display[2] if len(level_display) >= 3 else level_display[0],
+                    )
+                )
+            except (tk.TclError, Exception):
+                pass
 
         # Utiliser _refresh_combobox pour mettre à jour TOUS les comboboxes
         # (Cette partie est déjà correcte dans votre code)
@@ -2782,6 +2830,7 @@ class ZeMosaicGUI:
         self.config["p3_center_robust_clip_sigma"] = float(self.p3_center_clip_sigma_var.get())
         # Persist logging level
         self.config["logging_level"] = self.logging_level_var.get()
+        self.config["cache_retention"] = self.cache_retention_var.get()
 
         gpu_phase5_selected = bool(self.use_gpu_phase5_var.get())
         self.config["use_gpu_phase5"] = gpu_phase5_selected

@@ -44,12 +44,13 @@
 """
 
 
+import math
 import numpy as np
 import os
 import importlib.util
 import tempfile
 from dataclasses import dataclass
-from typing import Optional, Callable, Any
+from typing import Optional, Callable, Any, Iterable, Sequence
 
 GPU_AVAILABLE = importlib.util.find_spec("cupy") is not None
 import traceback
@@ -58,6 +59,11 @@ import logging  # Added for logger fallback
 import time
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+
+try:  # NumPy 2.x exposes _ArrayMemoryError here
+    from numpy.core._exceptions import _ArrayMemoryError as _NumpyArrayMemoryError
+except Exception:  # pragma: no cover - fallback for older numpy
+    _NumpyArrayMemoryError = MemoryError  # type: ignore[assignment]
 
 # dépendance Photutils
 PHOTOUTILS_AVAILABLE = False
@@ -384,6 +390,196 @@ def _cleanup_memmap(arr: np.ndarray, path: Optional[str]) -> None:
                 "CPU winsorized fallback: unable to delete memmap file",
                 exc_info=True,
             )
+
+
+def _query_system_memory() -> tuple[int, int]:
+    """Return (available_ram_bytes, free_swap_bytes) with graceful fallbacks."""
+
+    available = 0
+    free_swap = 0
+    try:  # pragma: no cover - psutil may be missing at runtime
+        import psutil  # type: ignore
+
+        try:
+            vm = psutil.virtual_memory()
+            available = int(getattr(vm, "available", 0) or 0)
+        except Exception:
+            available = 0
+        try:
+            sm = psutil.swap_memory()
+            free_swap = int(getattr(sm, "free", 0) or 0)
+        except Exception:
+            free_swap = 0
+    except Exception:
+        available = 0
+        free_swap = 0
+    return max(0, available), max(0, free_swap)
+
+
+def _estimate_winsor_required_bytes(
+    frames_count: int,
+    frame_shape: Sequence[int],
+    *,
+    dtype: np.dtype = np.dtype(np.float32),
+    overhead_factor: float = 3.2,
+) -> int:
+    """Estimate the transient memory required for winsorized stacking."""
+
+    if frames_count <= 0:
+        return 0
+    try:
+        total_elements = int(np.prod((frames_count,) + tuple(frame_shape), dtype=np.int64))
+    except Exception:
+        total_elements = frames_count
+        for dim in frame_shape:
+            try:
+                total_elements *= int(dim)
+            except Exception:
+                total_elements = 0
+    base_bytes = max(0, total_elements) * int(dtype.itemsize)
+    return int(base_bytes * max(1.0, overhead_factor))
+
+
+def _generate_winsor_chunk_indices(
+    total_frames: int,
+    chunk_size: int,
+    strategy: str,
+) -> Iterable[list[int]]:
+    """Yield index groups respecting the requested split strategy."""
+
+    if total_frames <= 0:
+        return []
+    chunk_size = max(1, int(chunk_size))
+    strategy_norm = str(strategy or "sequential").lower()
+
+    if strategy_norm == "roundrobin" and chunk_size < total_frames:
+        chunk_count = max(1, math.ceil(total_frames / chunk_size))
+        return [
+            list(range(offset, total_frames, chunk_count))
+            for offset in range(chunk_count)
+        ]
+
+    return [
+        list(range(start, min(total_frames, start + chunk_size)))
+        for start in range(0, total_frames, chunk_size)
+    ]
+
+
+@dataclass
+class WinsorMemoryPlan:
+    mode: str = "in_memory"
+    frames_per_pass: int | None = None
+    force_memmap: bool = False
+    split_strategy: str = "sequential"
+    fallback_chain: list[tuple[str, Optional[int]]] = None  # type: ignore[assignment]
+    reason: str | None = None
+    details: dict[str, float] | None = None
+
+    def __post_init__(self) -> None:  # pragma: no cover - simple default fixup
+        if self.fallback_chain is None:
+            self.fallback_chain = []
+        if self.details is None:
+            self.details = {}
+
+
+def _plan_winsor_memory_strategy(
+    *,
+    total_frames: int,
+    frame_shape: Sequence[int],
+    requested_pass: int | None,
+    min_pass: int,
+    auto_fallback: bool,
+    memmap_policy: str,
+    memmap_enabled: bool,
+    split_strategy: str,
+    memmap_budget_mb: float | None,
+) -> WinsorMemoryPlan:
+    """Compute how winsorized stacking should proceed under memory pressure."""
+
+    plan = WinsorMemoryPlan(split_strategy=split_strategy)
+    if total_frames <= 0:
+        return plan
+
+    initial_pass = requested_pass if requested_pass and requested_pass > 0 else total_frames
+    min_pass = max(1, min_pass)
+    plan.frames_per_pass = int(initial_pass)
+
+    if not auto_fallback:
+        plan.mode = "in_memory"
+        plan.force_memmap = memmap_policy == "always"
+        if plan.force_memmap:
+            plan.reason = "memmap_policy_always"
+        plan.fallback_chain = []
+        return plan
+
+    available_ram, free_swap = _query_system_memory()
+    memmap_budget_bytes = 0
+    if memmap_budget_mb:
+        try:
+            memmap_budget_bytes = max(0, float(memmap_budget_mb)) * 1024 * 1024
+        except Exception:
+            memmap_budget_bytes = 0
+
+    safety_factor = 0.82
+    swap_factor = 0.25
+    allowed_bytes = (available_ram * safety_factor) + (free_swap * swap_factor) + memmap_budget_bytes
+    estimated_bytes = _estimate_winsor_required_bytes(initial_pass, frame_shape)
+
+    memmap_policy_norm = str(memmap_policy or "auto").lower()
+    allow_memmap_fallback = memmap_policy_norm != "never" and (
+        memmap_enabled or memmap_policy_norm == "always"
+    )
+
+    plan.details = {
+        "estimated_bytes": float(estimated_bytes),
+        "allowed_bytes": float(allowed_bytes),
+        "available_ram_bytes": float(available_ram),
+        "swap_free_bytes": float(free_swap),
+    }
+
+    if estimated_bytes <= allowed_bytes:
+        plan.mode = "in_memory"
+        plan.force_memmap = memmap_policy_norm == "always"
+        if plan.force_memmap:
+            plan.reason = "memmap_policy_always"
+        plan.fallback_chain = []
+        if allow_memmap_fallback:
+            plan.fallback_chain.append(("memmap", None))
+        plan.fallback_chain.append(("incremental", min_pass))
+        return plan
+
+    # Need to reduce frames per pass
+    reduced_pass = int(initial_pass)
+    while reduced_pass > min_pass and _estimate_winsor_required_bytes(reduced_pass, frame_shape) > allowed_bytes:
+        reduced_pass = max(min_pass, reduced_pass // 2)
+
+    if reduced_pass < initial_pass:
+        reduced_estimate = _estimate_winsor_required_bytes(reduced_pass, frame_shape)
+        if reduced_estimate <= allowed_bytes:
+            plan.mode = "stream"
+            plan.frames_per_pass = reduced_pass
+            plan.reason = "reduce_frames"
+            plan.fallback_chain = []
+            if allow_memmap_fallback:
+                plan.fallback_chain.append(("memmap", None))
+            plan.fallback_chain.append(("incremental", min_pass))
+            return plan
+        # Reduction not sufficient; fall through to memmap/incremental handling
+
+    # Cannot reduce further -> try memmap if possible
+    if allow_memmap_fallback:
+        plan.mode = "memmap"
+        plan.force_memmap = True
+        plan.reason = "memmap_forced"
+        plan.fallback_chain = [("incremental", min_pass)]
+        return plan
+
+    # Last resort: incremental streaming at minimum chunk size
+    plan.mode = "incremental"
+    plan.frames_per_pass = max(1, min_pass)
+    plan.reason = "incremental"
+    plan.fallback_chain = []
+    return plan
 
 
 @dataclass
@@ -835,7 +1031,69 @@ def stack_winsorized_sigma_clip(
     if max_frames_per_pass < 0:
         max_frames_per_pass = 0
 
-    def _stack_winsor_streaming(limit: int) -> tuple[_np.ndarray, float]:
+    auto_fallback_flag = kwargs.pop(
+        "winsor_auto_fallback_on_memory_error",
+        getattr(zconfig, "winsor_auto_fallback_on_memory_error", True) if zconfig else True,
+    )
+    auto_fallback_on_memory_error = bool(auto_fallback_flag)
+
+    min_frames_per_pass = kwargs.pop(
+        "winsor_min_frames_per_pass",
+        getattr(zconfig, "winsor_min_frames_per_pass", 2) if zconfig else 2,
+    )
+    try:
+        min_frames_per_pass = max(1, int(min_frames_per_pass))
+    except (TypeError, ValueError):
+        min_frames_per_pass = 1
+
+    memmap_policy = kwargs.pop(
+        "winsor_memmap_fallback",
+        getattr(zconfig, "winsor_memmap_fallback", "auto") if zconfig else "auto",
+    )
+    memmap_policy = str(memmap_policy or "auto").lower()
+
+    split_strategy = kwargs.pop(
+        "winsor_split_strategy",
+        getattr(zconfig, "winsor_split_strategy", "sequential") if zconfig else "sequential",
+    )
+    split_strategy = str(split_strategy or "sequential").lower()
+
+    memmap_enabled_flag = False
+    memmap_budget_mb = None
+    if zconfig is not None:
+        memmap_enabled_flag = bool(
+            getattr(zconfig, "stack_memmap_enabled", False)
+            or getattr(zconfig, "gui_memmap_enable", False)
+        )
+        memmap_budget_mb = getattr(zconfig, "stack_memmap_budget_mb", None)
+
+    memory_plan = _plan_winsor_memory_strategy(
+        total_frames=len(frames_list),
+        frame_shape=sample.shape,
+        requested_pass=max_frames_per_pass if max_frames_per_pass > 0 else None,
+        min_pass=min_frames_per_pass,
+        auto_fallback=auto_fallback_on_memory_error,
+        memmap_policy=memmap_policy,
+        memmap_enabled=memmap_enabled_flag,
+        split_strategy=split_strategy,
+        memmap_budget_mb=memmap_budget_mb,
+    )
+
+    user_cap_stream = (
+        max_frames_per_pass > 0 and len(frames_list) > max_frames_per_pass and memory_plan.mode == "in_memory"
+    )
+    if user_cap_stream:
+        memory_plan.mode = "stream"
+        memory_plan.frames_per_pass = max_frames_per_pass
+        memory_plan.reason = "user_cap"
+        memory_plan.fallback_chain = [
+            ("memmap", None),
+            ("incremental", min_frames_per_pass),
+        ]
+        if memory_plan.details is not None:
+            memory_plan.details["user_cap_limit"] = float(max_frames_per_pass)
+
+    def _stack_winsor_streaming(limit: int, *, split_strategy: str = "sequential") -> tuple[_np.ndarray, float]:
         nonlocal frames_list, weights_array_full
 
         winsor_limits = kwargs.get("winsor_limits", (0.05, 0.05))
@@ -847,15 +1105,15 @@ def stack_winsorized_sigma_clip(
         state = WinsorStreamingState.create(sample.shape)
 
         total_frames = len(frames_list)
-        for start in range(0, total_frames, limit):
-            stop = min(total_frames, start + limit)
-            chunk = [_np.asarray(f, dtype=_np.float32) for f in frames_list[start:stop]]
+        indices_groups = _generate_winsor_chunk_indices(total_frames, limit, split_strategy)
+        for indices in indices_groups:
+            chunk = [_np.asarray(frames_list[idx], dtype=_np.float32) for idx in indices]
             if not chunk:
                 continue
             chunk_arr = _np.stack(chunk, axis=0)
             weights_chunk = None
             if weights_array_full is not None:
-                weights_chunk = weights_array_full[start:stop]
+                weights_chunk = weights_array_full[indices]
 
             state, _ = _reject_outliers_winsorized_sigma_clip(
                 stacked_array_NHDWC=chunk_arr,
@@ -877,21 +1135,54 @@ def stack_winsorized_sigma_clip(
         _poststack_rgb_equalization(stacked_stream, zconfig, stack_metadata)
         return stacked_stream, rejected_pct
 
-    if max_frames_per_pass and len(frames_list) > max_frames_per_pass:
+    force_memmap_plan = bool(memory_plan.force_memmap)
+
+    if memory_plan.mode in {"stream", "incremental"}:
+        frames_limit = memory_plan.frames_per_pass or len(frames_list)
+        frames_limit = max(1, int(frames_limit))
         if use_gpu:
             _internal_logger.info(
-                "Winsorized streaming enabled for %d frames (limit %d); forcing CPU path.",
+                "Winsorized streaming forced for %d frames (limit %d); GPU path disabled.",
                 len(frames_list),
-                max_frames_per_pass,
+                frames_limit,
             )
             use_gpu = False
-        else:
-            _internal_logger.info(
-                "Winsorized streaming enabled for %d frames (limit %d).",
-                len(frames_list),
-                max_frames_per_pass,
-            )
-        return _stack_winsor_streaming(max_frames_per_pass)
+
+        msg_key = "stack_mem_fallback_reduce_frames"
+        if memory_plan.reason == "user_cap":
+            msg_key = "stack_mem_fallback_user_cap"
+        elif memory_plan.mode == "incremental":
+            msg_key = "stack_mem_fallback_incremental"
+
+        details = memory_plan.details or {}
+        estimated_mb = details.get("estimated_bytes", 0.0) / (1024.0 ** 2)
+        allowed_mb = details.get("allowed_bytes", 0.0) / (1024.0 ** 2)
+
+        _log_stack_message(
+            msg_key,
+            "WARN" if memory_plan.mode != "stream" or memory_plan.reason != "user_cap" else "INFO",
+            progress_callback,
+            original_frames=len(frames_list),
+            frames_per_pass=frames_limit,
+            estimated_mb=float(estimated_mb),
+            allowed_mb=float(allowed_mb),
+            strategy=memory_plan.split_strategy,
+        )
+
+        return _stack_winsor_streaming(frames_limit, split_strategy=memory_plan.split_strategy)
+
+    if memory_plan.mode == "memmap":
+        force_memmap_plan = True
+        details = memory_plan.details or {}
+        estimated_mb = details.get("estimated_bytes", 0.0) / (1024.0 ** 2)
+        allowed_mb = details.get("allowed_bytes", 0.0) / (1024.0 ** 2)
+        _log_stack_message(
+            "stack_mem_fallback_memmap",
+            "WARN",
+            progress_callback,
+            estimated_mb=float(estimated_mb),
+            allowed_mb=float(allowed_mb),
+        )
 
     # --- GPU path (poids ignorés) ---
     if use_gpu and GPU_AVAILABLE and callable(globals().get("gpu_stack_winsorized", None)):
@@ -943,29 +1234,95 @@ def stack_winsorized_sigma_clip(
     if weights_array_full is not None:
         cpu_kwargs["weights"] = weights_array_full
 
-    try:
-        result = cpu_stack_winsorized(frames_list, **cpu_kwargs)
-    except TypeError:
-        if weights_array_full is not None:
+    fallback_sequence: list[tuple[str, Optional[int]]] = []
+    if force_memmap_plan:
+        fallback_sequence.append(("memmap", None))
+    fallback_sequence.extend(memory_plan.fallback_chain or [])
+
+    result_tuple: Any = None
+    last_error: Exception | None = None
+
+    if not force_memmap_plan:
+        try:
+            result_tuple = cpu_stack_winsorized(frames_list, **cpu_kwargs)
+        except TypeError:
+            if weights_array_full is not None:
+                _log_stack_message(
+                    "[Stack][Winsorized CPU] External implementation rejected weights; falling back to internal handler.",
+                    "WARN",
+                    progress_callback,
+                )
+                result_tuple = _cpu_stack_winsorized_fallback(
+                    frames_list,
+                    **cpu_kwargs,
+                    force_memmap=force_memmap_plan,
+                )
+            else:
+                raise
+        except (MemoryError, _NumpyArrayMemoryError) as mem_err:
+            last_error = mem_err
             _log_stack_message(
-                "[Stack][Winsorized CPU] External implementation rejected weights; falling back to internal handler.",
+                "stack_mem_retry_after_error",
                 "WARN",
                 progress_callback,
+                error=str(mem_err),
             )
-            result = _cpu_stack_winsorized_fallback(frames_list, **cpu_kwargs)
-        else:
-            raise
 
-    if weights_array_full is not None and weight_stats:
-        _log_stack_message(
-            f"[Stack][Winsorized CPU] weight_method='{weight_label_for_log}'; weights: min={weight_stats['min']:.3g} max={weight_stats['max']:.3g}",
-            "INFO",
-            progress_callback,
-        )
+    if result_tuple is not None:
+        stacked_cpu, rejected = _normalize_stack_output(result_tuple)
+        if weights_array_full is not None and weight_stats:
+            _log_stack_message(
+                f"[Stack][Winsorized CPU] weight_method='{weight_label_for_log}'; weights: min={weight_stats['min']:.3g} max={weight_stats['max']:.3g}",
+                "INFO",
+                progress_callback,
+            )
+        _poststack_rgb_equalization(stacked_cpu, zconfig, stack_metadata)
+        return stacked_cpu, rejected
 
-    stacked_cpu, rejected = _normalize_stack_output(result)
-    _poststack_rgb_equalization(stacked_cpu, zconfig, stack_metadata)
-    return stacked_cpu, rejected
+    for mode, param in fallback_sequence:
+        if mode == "memmap":
+            if last_error is not None:
+                _log_stack_message(
+                    "stack_mem_retry_memmap",
+                    "WARN",
+                    progress_callback,
+                    error=str(last_error),
+                )
+            try:
+                result_tuple = _cpu_stack_winsorized_fallback(
+                    frames_list,
+                    **cpu_kwargs,
+                    force_memmap=True,
+                )
+            except (MemoryError, _NumpyArrayMemoryError) as mem_err:
+                last_error = mem_err
+                continue
+        elif mode == "incremental":
+            limit = param or min_frames_per_pass
+            limit = max(1, int(limit))
+            _log_stack_message(
+                "stack_mem_retry_incremental",
+                "WARN",
+                progress_callback,
+                frames_per_pass=limit,
+                error=str(last_error) if last_error is not None else None,
+            )
+            return _stack_winsor_streaming(limit, split_strategy=memory_plan.split_strategy)
+
+        if result_tuple is not None:
+            stacked_cpu, rejected = _normalize_stack_output(result_tuple)
+            if weights_array_full is not None and weight_stats:
+                _log_stack_message(
+                    f"[Stack][Winsorized CPU] weight_method='{weight_label_for_log}'; weights: min={weight_stats['min']:.3g} max={weight_stats['max']:.3g}",
+                    "INFO",
+                    progress_callback,
+                )
+            _poststack_rgb_equalization(stacked_cpu, zconfig, stack_metadata)
+            return stacked_cpu, rejected
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Winsorized stacking failed to produce a result")
 
 
 def stack_kappa_sigma_clip(
@@ -3083,6 +3440,7 @@ def _cpu_stack_winsorized_fallback(
     weights=None,
     winsor_max_workers: int = 1,
     progress_callback=None,
+    force_memmap: bool = False,
 ):
     """
     CPU fallback for winsorized sigma-clip stacking.
@@ -3103,6 +3461,8 @@ def _cpu_stack_winsorized_fallback(
         Parallelism hint for winsor steps (passed through to helper).
     progress_callback : callable or None
         Optional progress logger.
+    force_memmap : bool
+        If ``True``, always materialize the frame stack on disk via ``numpy.memmap``.
 
     Returns
     -------
@@ -3150,7 +3510,7 @@ def _cpu_stack_winsorized_fallback(
     dtype = np.dtype(np.float32)
     estimated_bytes = int(np.prod(arr_shape, dtype=np.int64)) * dtype.itemsize
     memmap_path: Optional[str] = None
-    if estimated_bytes >= CPU_WINSOR_MEMMAP_THRESHOLD_BYTES:
+    if force_memmap or estimated_bytes >= CPU_WINSOR_MEMMAP_THRESHOLD_BYTES:
         tmp = tempfile.NamedTemporaryFile(prefix="zemosaic_winsor_", suffix=".dat", delete=False)
         memmap_path = tmp.name
         tmp.close()

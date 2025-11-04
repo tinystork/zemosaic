@@ -47,6 +47,7 @@
 from __future__ import annotations
 
 from typing import List, Dict, Any, Optional, Callable
+from collections import Counter
 from collections.abc import Iterable
 from dataclasses import asdict
 import os
@@ -58,6 +59,37 @@ import time
 import traceback
 import threading
 import queue
+
+
+# --- Instrument detection helpers -------------------------------------------
+def _detect_instrument_from_header(header: dict | None) -> str:
+    if not header:
+        return "Unknown"
+
+    def _clean(value: Any) -> str:
+        try:
+            return str(value).strip()
+        except Exception:
+            return ""
+
+    creator_raw = _clean(header.get("CREATOR"))
+    creator = creator_raw.upper()
+    instrume_raw = _clean(header.get("INSTRUME"))
+    instrume = instrume_raw.upper()
+
+    if "SEESTAR S50" in creator:
+        return "Seestar S50"
+    if "SEESTAR S30" in creator:
+        return "Seestar S30"
+    if "ASIAIR" in creator:
+        # Prefer the more specific INSTRUME label when available (e.g. ZWO ASIAIR Plus)
+        return instrume_raw or "ASIAIR"
+    if instrume.startswith("ZWO ASI") or "ASI" in instrume:
+        return instrume_raw or "ASI (Unknown)"
+    if instrume_raw:
+        # Fall back to the raw INSTRUME label for other devices
+        return instrume_raw
+    return "Unknown"
 
 
 def _group_center_deg(group: list[dict]) -> Optional[tuple[float, float]]:
@@ -186,6 +218,19 @@ def _merge_small_groups(
     return [grp for idx, grp in enumerate(groups) if not merged_flags[idx]]
 
 
+def _format_sizes_histogram(sizes: list[int], max_buckets: int = 6) -> str:
+    """Return a compact histogram string for group sizes."""
+
+    if not sizes:
+        return "[]"
+
+    counter = Counter(sizes)
+    pairs = sorted(counter.items(), key=lambda kv: (-kv[1], -kv[0]))
+    head = ", ".join(f"{size}×{count}" for size, count in pairs[:max_buckets])
+    tail = len(pairs) - max_buckets
+    return head + (f", +{tail} more" if tail > 0 else "")
+
+
 def _compute_dynamic_footprint_budget(
     total_items: int,
     preview_cap: Any,
@@ -212,8 +257,9 @@ def _compute_dynamic_footprint_budget(
     preview_limit: Optional[int] = None
     try:
         coerced_preview = int(preview_cap)
-        if coerced_preview > 0:
-            preview_limit = coerced_preview
+        if coerced_preview <= 0:
+            return 0
+        preview_limit = coerced_preview
     except Exception:
         preview_limit = None
 
@@ -223,11 +269,13 @@ def _compute_dynamic_footprint_budget(
     base_cap = max(50, base_cap) if base_cap else 50
 
     if total_items >= 8000:
-        cap = 200
-    elif total_items >= 4000:
-        cap = 350
+        cap = min(200, base_cap)
+    elif total_items >= 5000:
+        cap = 0
     elif total_items >= 2000:
-        cap = 600
+        cap = min(600, base_cap)
+    elif total_items >= 1500:
+        cap = min(400, base_cap)
     else:
         cap = min(base_cap, 1500)
 
@@ -237,7 +285,7 @@ def _compute_dynamic_footprint_budget(
     cap = min(cap, base_cap) if base_cap else cap
 
     try:
-        return max(1, int(cap))
+        return max(0, int(cap))
     except Exception:
         return 1
 
@@ -709,6 +757,8 @@ def launch_filter_interface(
                     "NAXIS2",
                     "CRVAL1",
                     "CRVAL2",
+                    "CREATOR",
+                    "INSTRUME",
                     "CTYPE1",
                     "CTYPE2",
                     "CDELT1",
@@ -779,6 +829,8 @@ def launch_filter_interface(
                                 "NAXIS2",
                                 "CRVAL1",
                                 "CRVAL2",
+                                "CREATOR",
+                                "INSTRUME",
                                 "DATE-OBS",
                                 "EXPTIME",
                                 "FILTER",
@@ -808,6 +860,8 @@ def launch_filter_interface(
                     "FP_RA2", "FP_DEC2",
                     "FP_RA3", "FP_DEC3",
                     "FP_RA4", "FP_DEC4",
+                    "CREATOR",
+                    "INSTRUME",
                     "DATE-OBS",
                     "EXPTIME",
                     "FILTER",
@@ -883,6 +937,8 @@ def launch_filter_interface(
                                 "CRVAL1": center_tuple[0] if center_tuple else "",
                                 "CRVAL2": center_tuple[1] if center_tuple else "",
                                 **fp_cols,
+                                "CREATOR": header_payload.get("CREATOR", ""),
+                                "INSTRUME": header_payload.get("INSTRUME", ""),
                                 "DATE-OBS": header_payload.get("DATE-OBS", ""),
                                 "EXPTIME": header_payload.get("EXPTIME", ""),
                                 "FILTER": header_payload.get("FILTER", ""),
@@ -983,6 +1039,10 @@ def launch_filter_interface(
                 if header_payload is None and src.get("header_subset") is not None:
                     header_payload = src.get("header_subset")
                 self.header = header_payload
+                detected = _detect_instrument_from_header(self.header)
+                self.instrument: str = detected.strip() if isinstance(detected, str) else "Unknown"
+                if not self.instrument:
+                    self.instrument = "Unknown"
                 self.shape: Optional[tuple[int, int]] = None
                 self.center: Optional[SkyCoord] = None
                 self.phase0_center: Optional[SkyCoord] = None
@@ -1183,6 +1243,7 @@ def launch_filter_interface(
 
         raw_files_with_wcs: list[Dict[str, Any]] = []
         items: list[Item] = []
+        instruments_found: set[str] = set()
 
         def _materialize_batch(batch: list[Dict[str, Any]]) -> None:
             for entry in batch:
@@ -1517,18 +1578,35 @@ def launch_filter_interface(
         right = ttk.Frame(main)
         right.grid(row=1, column=1, sticky="nsew")
         right.columnconfigure(0, weight=1)
-        # The scrollable list lives at row=2 (row=1 reserved for clustering params)
+        # The scrollable list lives at row=3 (row=1 reserved for threshold & filters)
         try:
-            right.rowconfigure(2, weight=1)
+            right.rowconfigure(3, weight=1)
         except Exception:
-            right.rowconfigure(1, weight=1)
-        # Reserve space for the aggregate controls container (row=3)
+            right.rowconfigure(2, weight=1)
+        # Reserve space for the aggregate controls container (row=4)
         # Ensure a reasonable minimum height so controls are always visible.
         try:
-            right.rowconfigure(3, weight=0, minsize=180)
+            right.rowconfigure(4, weight=0, minsize=180)
         except Exception:
             try:
-                right.rowconfigure(3, minsize=180)
+                right.rowconfigure(4, minsize=180)
+            except Exception:
+                pass
+
+        instrument_var = tk.StringVar(master=root, value="All")
+        instrument_combo: Optional[ttk.Combobox] = None
+
+        def _apply_instrument_filter(*_: object) -> None:
+            chosen = instrument_var.get()
+            if chosen == "All":
+                for idx, it in enumerate(items):
+                    _set_selected(idx, True)
+            else:
+                for idx, it in enumerate(items):
+                    _set_selected(idx, it.instrument == chosen)
+            update_visuals()
+            try:
+                canvas.draw_idle()
             except Exception:
                 pass
 
@@ -1583,6 +1661,39 @@ def launch_filter_interface(
         )
         thresh_button.grid(row=0, column=2, padx=4, pady=4)
 
+        def _refresh_instrument_options() -> None:
+            values: list[str] = ["All"]
+            extras = sorted(x for x in instruments_found if x and x != "Unknown")
+            if extras:
+                values.extend(extras)
+            else:
+                values.append("Unknown")
+            if instrument_combo is not None:
+                try:
+                    instrument_combo["values"] = tuple(values)
+                except Exception:
+                    pass
+            if instrument_var.get() not in values:
+                instrument_var.set("All")
+
+        filter_frame = ttk.Frame(right)
+        filter_frame.grid(row=1, column=0, sticky="ew", padx=5, pady=(0, 5))
+        filter_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(filter_frame, text="Instrument:").grid(row=0, column=0, padx=4, pady=4, sticky="w")
+        try:
+            instrument_combo = ttk.Combobox(
+                filter_frame,
+                textvariable=instrument_var,
+                state="readonly",
+                width=20,
+            )
+            instrument_combo.grid(row=0, column=1, padx=4, pady=4, sticky="ew")
+            instrument_combo["values"] = ("All",)
+            instrument_combo.bind("<<ComboboxSelected>>", _apply_instrument_filter)
+        except Exception:
+            instrument_combo = None
+
         if not has_explicit_centers:
             try:
                 thresh_entry.state(["disabled"])
@@ -1601,7 +1712,7 @@ def launch_filter_interface(
                 "Activity log" if 'fr' not in str(locals().get('lang_code', 'en')).lower() else "Journal d'activité",
             ),
         )
-        log_frame.grid(row=1, column=0, sticky="nsew", padx=5, pady=(0, 5))
+        log_frame.grid(row=2, column=0, sticky="nsew", padx=5, pady=(0, 5))
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(0, weight=1)
         log_widget = scrolledtext.ScrolledText(log_frame, height=6, wrap=tk.WORD, state=tk.DISABLED)
@@ -1858,7 +1969,7 @@ def launch_filter_interface(
                 "Images (cocher pour garder)" if 'fr' in str(locals().get('lang_code', 'en')).lower() else "Images (check to keep)",
             ),
         )
-        list_frame.grid(row=2, column=0, sticky="nsew", padx=5, pady=5)
+        list_frame.grid(row=3, column=0, sticky="nsew", padx=5, pady=5)
         list_frame.rowconfigure(0, weight=1)
         list_frame.columnconfigure(0, weight=1)
 
@@ -1940,6 +2051,7 @@ def launch_filter_interface(
         listbox_programmatic = {"active": False}
 
         summary_var = tk.StringVar(master=root, value="")
+        sizes_details_state = {"full_sizes": "[]", "log_text": ""}
 
         # Early helper: may be called before footprint/draw state exists.
         def _apply_summary_hint(text: str) -> str:
@@ -1998,12 +2110,13 @@ def launch_filter_interface(
 
         # Aggregate controls container (ensures persistent visibility)
         controls = ttk.Frame(right)
-        controls.grid(row=3, column=0, sticky="ew", padx=5, pady=5)
+        controls.grid(row=4, column=0, sticky="ew", padx=5, pady=5)
         controls.columnconfigure(0, weight=1)
 
         operations = ttk.Frame(controls)
         operations.pack(fill=tk.X, expand=False)
         operations.columnconfigure(2, weight=1)
+        operations.columnconfigure(3, weight=0)
 
         # Build operations area defensively: never let a single error hide the panel
         draw_footprints_var = tk.BooleanVar(master=root, value=True)
@@ -2015,6 +2128,7 @@ def launch_filter_interface(
         auto_btn = None
         footprints_chk = None
         write_wcs_chk = None
+        details_btn = None
         try:
             resolve_btn = ttk.Button(
                 operations,
@@ -2042,6 +2156,38 @@ def launch_filter_interface(
             ).grid(row=0, column=2, padx=4, pady=2, sticky="w")
         except Exception as e:
             _log_message(f"[FilterUI] Summary label failed: {e}", level="WARN")
+
+        def _show_sizes_details():
+            try:
+                win = tk.Toplevel(root)
+                win.title("Master-tile sizes")
+                win.geometry("420x300")
+                import tkinter.scrolledtext as st
+
+                box = st.ScrolledText(win, wrap="word")
+                box.pack(fill="both", expand=True)
+                text = sizes_details_state.get("full_sizes") or sizes_details_state.get("log_text") or ""
+                try:
+                    box.insert("1.0", text)
+                except Exception:
+                    box.insert("1.0", str(text))
+                box.configure(state="disabled")
+                copy_btn = ttk.Button(
+                    win,
+                    text="Copy",
+                    command=lambda: (win.clipboard_clear(), win.clipboard_append(text)),
+                )
+                copy_btn.pack(pady=4)
+            except Exception as _exc:
+                _log_message(f"[FilterUI] Failed to open sizes popup: {_exc}", level="WARN")
+
+        try:
+            details_btn = ttk.Button(operations, text="Details…", command=_show_sizes_details)
+            details_btn.grid(row=0, column=3, padx=4, sticky="ne")
+            details_btn.grid_remove()
+        except Exception as e:
+            _log_message(f"[FilterUI] Details button failed: {e}", level="WARN")
+            details_btn = None
 
         try:
             coverage_chk = ttk.Checkbutton(
@@ -2538,6 +2684,13 @@ def launch_filter_interface(
                 )
                 summary_var.set(_apply_summary_hint(summary_text))
                 _log_message(summary_text, level="INFO")
+                sizes_details_state["full_sizes"] = "[]"
+                sizes_details_state["log_text"] = summary_text
+                if details_btn is not None:
+                    try:
+                        details_btn.grid_remove()
+                    except Exception:
+                        pass
                 try:
                     auto_btn.state(["!disabled"])
                 except Exception:
@@ -2569,6 +2722,13 @@ def launch_filter_interface(
                 )
                 summary_var.set(_apply_summary_hint(summary_text_local))
                 _log_message(summary_text_local, level=level)
+                sizes_details_state["full_sizes"] = "[]"
+                sizes_details_state["log_text"] = summary_text_local
+                if details_btn is not None:
+                    try:
+                        details_btn.grid_remove()
+                    except Exception:
+                        pass
                 _finalize_ui()
 
             def _handle_error(message: str) -> None:
@@ -2587,15 +2747,33 @@ def launch_filter_interface(
                     sizes = result.get("sizes")
                     if not isinstance(sizes, list):
                         sizes = [len(gr) for gr in final_groups]
-                    sizes_str = ", ".join(str(s) for s in sizes) if sizes else "[]"
-                    summary_text = _tr_safe(
+                    full_sizes_str = ", ".join(map(str, sizes)) if sizes else "[]"
+                    summary_text_for_log = _tr_safe(
                         "filter_log_groups_summary",
                         "Prepared {g} group(s), sizes: {sizes}.",
                         g=len(final_groups),
-                        sizes=sizes_str,
+                        sizes=full_sizes_str,
                     )
-                    summary_var.set(_apply_summary_hint(summary_text))
-                    _log_message(summary_text, level="INFO")
+                    _log_message(summary_text_for_log, level="INFO")
+                    sizes_details_state["full_sizes"] = full_sizes_str
+                    sizes_details_state["log_text"] = summary_text_for_log
+
+                    hist_str = _format_sizes_histogram(sizes)
+                    summary_text_compact = _tr_safe(
+                        "filter_log_groups_summary",
+                        "Prepared {g} group(s), sizes: {sizes}.",
+                        g=len(final_groups),
+                        sizes=hist_str,
+                    )
+                    summary_var.set(_apply_summary_hint(summary_text_compact))
+                    if details_btn is not None:
+                        try:
+                            if len(sizes) > 60:
+                                details_btn.grid()
+                            else:
+                                details_btn.grid_remove()
+                        except Exception:
+                            pass
                     if result.get("coverage_first"):
                         done_msg = _tr_safe(
                             "log_covfirst_done",
@@ -3839,6 +4017,10 @@ def launch_filter_interface(
         def _add_item_row(item: Item) -> None:
             idx = len(item_labels)
             base = os.path.basename(item.path)
+            instrument_name = (item.instrument or "").strip()
+            tag = ""
+            if instrument_name and instrument_name != "Unknown":
+                tag = f" [{instrument_name}]"
             sep_txt = ""
             if item.center is not None:
                 try:
@@ -3847,7 +4029,7 @@ def launch_filter_interface(
                 except Exception:
                     sep_txt = ""
 
-            display_text = base + sep_txt
+            display_text = base + tag + sep_txt
             item_labels.append(display_text)
 
             if use_listbox_mode:
@@ -3875,6 +4057,14 @@ def launch_filter_interface(
             path_key = _path_key(item.path)
             if path_key:
                 known_path_index[path_key] = idx
+
+            previous_count = len(instruments_found)
+            instruments_found.add(instrument_name or "Unknown")
+            if len(instruments_found) != previous_count:
+                _refresh_instrument_options()
+            current_choice = instrument_var.get()
+            if current_choice != "All" and item.instrument != current_choice:
+                _set_selected(idx, False)
 
             _ensure_wrapped_capacity(idx)
             footprint_wrapped[idx] = None
@@ -3975,6 +4165,10 @@ def launch_filter_interface(
             if population_state["finalized"]:
                 return
             population_state["finalized"] = True
+            try:
+                _refresh_instrument_options()
+            except Exception:
+                pass
             update_visuals()
             _schedule_axes_update()
             _update_population_indicator(population_state["total"], done=True)
