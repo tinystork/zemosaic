@@ -56,6 +56,13 @@ DEFAULT_CONFIG = {
     "anchor_quality_probe_limit": 12,
     "anchor_quality_span_range": [0.02, 6.0],
     "anchor_quality_median_clip_sigma": 2.5,
+    # Phase 3.9 post-stack anchor review
+    "enable_poststack_anchor_review": True,
+    "poststack_anchor_probe_limit": 8,
+    "poststack_anchor_span_range": [0.004, 10.0],
+    "poststack_anchor_median_clip_sigma": 3.5,
+    "poststack_anchor_min_improvement": 0.12,
+    "poststack_anchor_use_overlap_affine": True,
     "p3_center_sky_percentile": [25.0, 60.0],
     "p3_center_robust_clip_sigma": 2.5,
     "p3_center_preview_size": 256,
