@@ -740,8 +740,45 @@ def _compute_intertile_affine_corrections_from_sources(
                 except Exception:
                     pass
 
+    # [ETA Bridge] Wrapper pour intercepter "[Intertile] Using: ... pairs=K"
+    def _intertile_progress_bridge(message_or_stage, current, level, **kwargs):
+        try:
+            # Seed ETA dès que l'on connaît le nombre de paires et la taille de preview
+            if isinstance(message_or_stage, str) and message_or_stage.startswith("[Intertile] Using:"):
+                # Ex: "[Intertile] Using: preview=512, min_overlap=0.0500, sky=(30.0,70.0), clip=2.50, pairs=353"
+                try:
+                    parts = message_or_stage.split("Using:", 1)[1]
+                    # petite extraction clé=valeur robuste
+                    kv = {}
+                    for p in parts.split(","):
+                        if "=" in p:
+                            k, v = p.split("=", 1)
+                            kv[k.strip()] = v.strip().strip(",")
+                    preview = int(kv.get("preview", "512"))
+                    pairs = int(kv.get("pairs", "0"))
+                    # Heuristique : coût ~ C * pairs * (preview/512)^2
+                    # GPU/CPU : facteur 1.0 (GPU) / 3.0 (CPU) basique (peut être affiné)
+                    gpu_factor = 1.0 if bool(getattr(zconfig, "use_gpu_phase5", False)) else 3.0
+                    base_cost_per_pair = 0.020  # 20 ms/pair @ preview=512 sur GPU (à ajuster)
+                    seconds = gpu_factor * base_cost_per_pair * pairs * (preview / 512.0) ** 2
+                    h, rem = divmod(int(seconds), 3600)
+                    m, s = divmod(rem, 60)
+                    # Pousser une ETA initiale vers le GUI (il se recadrera ensuite avec les ticks "pairs")
+                    _log_and_callback(f"ETA_UPDATE:{h:02d}:{m:02d}:{s:02d}", None, "ETA_LEVEL", callback=progress_callback)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Relais vers le callback GUI d'origine pour l'affichage + ETA fine (via on_worker_progress)
+        if progress_callback:
+            try:
+                progress_callback(message_or_stage, current, level, **kwargs)
+            except Exception:
+                pass
+
     try:
         corrections = zemosaic_utils.compute_intertile_affine_calibration(
+
             tile_pairs,
             final_output_wcs,
             final_output_shape_hw,
@@ -751,7 +788,7 @@ def _compute_intertile_affine_corrections_from_sources(
             robust_clip_sigma=robust_clip_sigma,
             use_auto_intertile=use_auto_intertile,
             logger=logger_obj,
-            progress_callback=progress_callback,
+            progress_callback=_intertile_progress_bridge,
         )
     except Exception as exc:
         if logger_obj:

@@ -1307,8 +1307,19 @@ def compute_intertile_affine_calibration(
             continue
         a_ij, b_ij = fit
         pair_entries.append((i, j, a_ij, b_ij, weight))
+
+        a_ij, b_ij = fit
+        pair_entries.append((i, j, a_ij, b_ij, weight))
         connectivity[i] += weight
         connectivity[j] += weight
+
+        # [ETA] Tick fin de traitement de la paire idx
+        if progress_callback:
+            try:
+                progress_callback("phase5_intertile_pairs", int(idx), int(len(overlaps)))
+            except Exception:
+                pass
+
         if progress_callback and idx % 5 == 0:
             try:
                 progress_callback("phase5_intertile", idx, len(overlaps))
