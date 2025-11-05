@@ -436,6 +436,35 @@ class ZeMosaicGUI:
             master=self.root,
             value=self.config.get("p3_center_robust_clip_sigma", 2.5),
         )
+        self.center_anchor_mode_var = tk.StringVar(
+            master=self.root,
+            value=str(self.config.get("center_out_anchor_mode", "auto_central_quality")),
+        )
+        try:
+            anchor_probe_initial = int(self.config.get("anchor_quality_probe_limit", 12))
+        except Exception:
+            anchor_probe_initial = 12
+        self.anchor_probe_limit_var = tk.IntVar(master=self.root, value=anchor_probe_initial)
+        self.poststack_review_var = tk.BooleanVar(
+            master=self.root,
+            value=self.config.get("enable_poststack_anchor_review", True),
+        )
+        try:
+            post_anchor_probe_initial = int(self.config.get("poststack_anchor_probe_limit", 8))
+        except Exception:
+            post_anchor_probe_initial = 8
+        self.poststack_probe_limit_var = tk.IntVar(
+            master=self.root,
+            value=post_anchor_probe_initial,
+        )
+        try:
+            min_impr_initial = float(self.config.get("poststack_anchor_min_improvement", 0.12)) * 100.0
+        except Exception:
+            min_impr_initial = 12.0
+        self.poststack_min_improvement_var = tk.DoubleVar(
+            master=self.root,
+            value=min_impr_initial,
+        )
         self.use_gpu_phase5_var = tk.BooleanVar(master=self.root, value=self.config.get("use_gpu_phase5", False))
         # Logging level var (keys are ERROR, WARN, INFO, DEBUG)
         self.logging_level_keys = ["ERROR", "WARN", "INFO", "DEBUG"]
@@ -1312,6 +1341,81 @@ class ZeMosaicGUI:
             format="%.1f",
         ).grid(row=3, column=1, padx=(8, 5), pady=2, sticky="w")
 
+        anchor_mode_label = ttk.Label(center_out_params_frame, text="")
+        anchor_mode_label.grid(row=4, column=0, padx=0, pady=2, sticky="w")
+        self.translatable_widgets["center_anchor_mode_label"] = anchor_mode_label
+        anchor_mode_combo = ttk.Combobox(
+            center_out_params_frame,
+            textvariable=self.center_anchor_mode_var,
+            values=["auto_central_quality", "central_only"],
+            state="readonly",
+            width=20,
+        )
+        anchor_mode_combo.grid(row=4, column=1, padx=(8, 5), pady=2, sticky="w")
+        anchor_mode_hint = ttk.Label(center_out_params_frame, text="")
+        anchor_mode_hint.grid(row=4, column=2, padx=(8, 0), pady=2, sticky="w")
+        self.translatable_widgets["center_anchor_mode_hint"] = anchor_mode_hint
+
+        anchor_probe_label = ttk.Label(center_out_params_frame, text="")
+        anchor_probe_label.grid(row=5, column=0, padx=0, pady=2, sticky="w")
+        self.translatable_widgets["center_anchor_probe_label"] = anchor_probe_label
+        ttk.Spinbox(
+            center_out_params_frame,
+            from_=1,
+            to=50,
+            increment=1,
+            textvariable=self.anchor_probe_limit_var,
+            width=8,
+        ).grid(row=5, column=1, padx=(8, 5), pady=2, sticky="w")
+        anchor_probe_hint = ttk.Label(center_out_params_frame, text="")
+        anchor_probe_hint.grid(row=5, column=2, padx=(8, 0), pady=2, sticky="w")
+        self.translatable_widgets["center_anchor_probe_hint"] = anchor_probe_hint
+
+        post_anchor_check = ttk.Checkbutton(
+            center_out_params_frame,
+            variable=self.poststack_review_var,
+            command=self._update_post_anchor_controls_state,
+            text="",
+        )
+        post_anchor_check.grid(row=6, column=0, columnspan=2, padx=0, pady=2, sticky="w")
+        self.translatable_widgets["center_post_anchor_enable"] = post_anchor_check
+        post_anchor_hint = ttk.Label(center_out_params_frame, text="")
+        post_anchor_hint.grid(row=6, column=2, padx=(8, 0), pady=2, sticky="w")
+        self.translatable_widgets["center_post_anchor_hint"] = post_anchor_hint
+
+        post_anchor_params_frame = ttk.Frame(center_out_params_frame)
+        post_anchor_params_frame.grid(row=7, column=0, columnspan=3, padx=(20, 0), pady=(0, 6), sticky="w")
+        post_anchor_params_frame.columnconfigure(1, weight=1)
+        post_anchor_probe_label = ttk.Label(post_anchor_params_frame, text="")
+        post_anchor_probe_label.grid(row=0, column=0, padx=(0, 6), pady=2, sticky="w")
+        self.translatable_widgets["center_post_anchor_probe_label"] = post_anchor_probe_label
+        self.post_anchor_probe_spin = ttk.Spinbox(
+            post_anchor_params_frame,
+            from_=1,
+            to=20,
+            increment=1,
+            textvariable=self.poststack_probe_limit_var,
+            width=5,
+        )
+        self.post_anchor_probe_spin.grid(row=0, column=1, padx=(0, 12), pady=2, sticky="w")
+        post_anchor_min_label = ttk.Label(post_anchor_params_frame, text="")
+        post_anchor_min_label.grid(row=0, column=2, padx=(0, 6), pady=2, sticky="w")
+        self.translatable_widgets["center_post_anchor_min_label"] = post_anchor_min_label
+        self.post_anchor_min_spin = ttk.Spinbox(
+            post_anchor_params_frame,
+            from_=0.0,
+            to=100.0,
+            increment=1.0,
+            textvariable=self.poststack_min_improvement_var,
+            width=6,
+            format="%.1f",
+        )
+        self.post_anchor_min_spin.grid(row=0, column=3, padx=(0, 6), pady=2, sticky="w")
+
+        self._post_anchor_inputs = [self.post_anchor_probe_spin, self.post_anchor_min_spin]
+        self.poststack_review_var.trace_add("write", self._update_post_anchor_controls_state)
+        self._update_post_anchor_controls_state()
+
         asm_opt_row += 1
 
         # --- Logging Options Frame ---
@@ -1558,6 +1662,23 @@ class ZeMosaicGUI:
                     self.root.after_idle(self._update_rejection_params_state)
             except Exception as e_uras:
                 print(f"DEBUG GUI: Erreur appel _update_rejection_params_state via after_idle: {e_uras}")
+
+
+    def _update_post_anchor_controls_state(self, *args):
+        """Enable or disable post-stack review inputs based on toggle."""
+        widgets = getattr(self, "_post_anchor_inputs", None)
+        if not widgets:
+            return
+        try:
+            enabled = bool(self.poststack_review_var.get())
+        except tk.TclError:
+            enabled = False
+        state = "normal" if enabled else "disabled"
+        for widget in widgets:
+            try:
+                widget.config(state=state)
+            except tk.TclError:
+                continue
 
 
     def _update_crop_options_state(self, *args):
@@ -2828,6 +2949,17 @@ class ZeMosaicGUI:
             float(self.p3_center_sky_high_var.get()),
         ]
         self.config["p3_center_robust_clip_sigma"] = float(self.p3_center_clip_sigma_var.get())
+        self.config["center_out_anchor_mode"] = str(self.center_anchor_mode_var.get())
+        self.config["anchor_quality_probe_limit"] = int(self.anchor_probe_limit_var.get())
+        self.config["enable_poststack_anchor_review"] = bool(self.poststack_review_var.get())
+        self.config["poststack_anchor_probe_limit"] = int(self.poststack_probe_limit_var.get())
+        try:
+            min_impr_percent = float(self.poststack_min_improvement_var.get())
+        except Exception:
+            min_impr_percent = 0.0
+        min_impr_percent = max(0.0, min_impr_percent)
+        min_impr_fraction = min(1.0, min_impr_percent / 100.0)
+        self.config["poststack_anchor_min_improvement"] = min_impr_fraction
         # Persist logging level
         self.config["logging_level"] = self.logging_level_var.get()
         self.config["cache_retention"] = self.cache_retention_var.get()
@@ -2875,6 +3007,44 @@ class ZeMosaicGUI:
         self.config["quality_crop_k_sigma"] = float(quality_crop_k_sigma_val)
         self.config["quality_crop_margin_px"] = int(quality_crop_margin_val)
 
+        span_range_cfg = self.config.get("anchor_quality_span_range", [0.02, 6.0])
+        if not (isinstance(span_range_cfg, (list, tuple)) and len(span_range_cfg) >= 2):
+            span_range_cfg = [0.02, 6.0]
+        try:
+            span_range_cfg = [float(span_range_cfg[0]), float(span_range_cfg[1])]
+        except Exception:
+            span_range_cfg = [0.02, 6.0]
+        try:
+            median_clip_sigma_cfg = float(self.config.get("anchor_quality_median_clip_sigma", 2.5))
+        except Exception:
+            median_clip_sigma_cfg = 2.5
+        recenter_clip_cfg = self.config.get("intertile_recenter_clip", [0.85, 1.18])
+        if not (isinstance(recenter_clip_cfg, (list, tuple)) and len(recenter_clip_cfg) >= 2):
+            recenter_clip_cfg = [0.85, 1.18]
+        try:
+            recenter_clip_cfg = [float(recenter_clip_cfg[0]), float(recenter_clip_cfg[1])]
+        except Exception:
+            recenter_clip_cfg = [0.85, 1.18]
+        intertile_global_recenter_val = bool(self.config.get("intertile_global_recenter", True))
+
+        poststack_span_cfg = self.config.get("poststack_anchor_span_range", [0.004, 10.0])
+        if not (isinstance(poststack_span_cfg, (list, tuple)) and len(poststack_span_cfg) >= 2):
+            poststack_span_cfg = [0.004, 10.0]
+        try:
+            poststack_span_cfg = [float(poststack_span_cfg[0]), float(poststack_span_cfg[1])]
+        except Exception:
+            poststack_span_cfg = [0.004, 10.0]
+        try:
+            poststack_median_clip_sigma_cfg = float(self.config.get("poststack_anchor_median_clip_sigma", 3.5))
+        except Exception:
+            poststack_median_clip_sigma_cfg = 3.5
+        try:
+            poststack_min_improvement_cfg = float(self.config.get("poststack_anchor_min_improvement", 0.12))
+        except Exception:
+            poststack_min_improvement_cfg = 0.12
+        poststack_min_improvement_cfg = min(1.0, max(0.0, poststack_min_improvement_cfg))
+        poststack_use_overlap_cfg = bool(self.config.get("poststack_anchor_use_overlap_affine", True))
+
         worker_args = (
             input_dir, output_dir, astap_exe, astap_data,
             astap_radius_val, astap_downsample_val, astap_sensitivity_val,
@@ -2921,6 +3091,8 @@ class ZeMosaicGUI:
                 float(self.intertile_sky_high_var.get()),
             ],
             float(self.intertile_clip_sigma_var.get()),
+            intertile_global_recenter_val,
+            recenter_clip_cfg,
             bool(self.use_auto_intertile_var.get()),
             bool(self.config.get("match_background_for_final", True)),
             bool(self.config.get("incremental_feather_parity", False)),
@@ -2938,6 +3110,16 @@ class ZeMosaicGUI:
             float(self.p3_center_clip_sigma_var.get()),
             int(self.p3_center_preview_size_var.get()),
             float(self.p3_center_overlap_var.get()),
+            self.center_anchor_mode_var.get(),
+            int(self.anchor_probe_limit_var.get()),
+            span_range_cfg,
+            median_clip_sigma_cfg,
+            bool(self.poststack_review_var.get()),
+            int(self.poststack_probe_limit_var.get()),
+            poststack_span_cfg,
+            poststack_median_clip_sigma_cfg,
+            poststack_min_improvement_cfg,
+            poststack_use_overlap_cfg,
             self.use_gpu_phase5_var.get(),
             gpu_id,
             self.logging_level_var.get(),
