@@ -35,7 +35,7 @@
     "coadd_use_memmap": true,
     "coadd_memmap_dir": "",
     "coadd_cleanup_memmap": true,
-    "cache_retention": "run_end",
+    "cache_retention": "per_tile",
     "assembly_process_workers": 0,
     "auto_limit_frames_per_master_tile": true,
     "winsor_worker_limit": 10,
@@ -47,20 +47,20 @@
     "max_raw_per_master_tile": 50,
     "center_out_normalization_p3": true,
     "center_out_anchor_mode": "auto_central_quality",
-    "anchor_quality_probe_limit": 12,
+    "anchor_quality_probe_limit": 20,
     "anchor_quality_span_range": [
         0.02,
         6.0
     ],
     "anchor_quality_median_clip_sigma": 2.5,
     "enable_poststack_anchor_review": true,
-    "poststack_anchor_probe_limit": 8,
+    "poststack_anchor_probe_limit": 12,
     "poststack_anchor_span_range": [
         0.004,
         10.0
     ],
     "poststack_anchor_median_clip_sigma": 3.5,
-    "poststack_anchor_min_improvement": 0.01,
+    "poststack_anchor_min_improvement": 0.05,
     "poststack_anchor_use_overlap_affine": true,
     "p3_center_sky_percentile": [
         25.0,
