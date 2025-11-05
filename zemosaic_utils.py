@@ -57,12 +57,23 @@ import traceback
 import gc
 import importlib.util
 
+# --- Optional Astropy WCS import (lightweight, guarded) ----------------------
+ASTROPY_WCS_AVAILABLE_IN_UTILS = False
+AstropyWCS = None
+try:  # pragma: no cover - optional dependency path
+    from astropy.wcs import WCS as AstropyWCS  # type: ignore
+
+    ASTROPY_WCS_AVAILABLE_IN_UTILS = True
+except Exception:
+    AstropyWCS = None
+
 # --- GPU/CUDA Availability ----------------------------------------------------
 GPU_AVAILABLE = importlib.util.find_spec("cupy") is not None
 map_coordinates = None  # Lazily imported when needed
 
 
 logger = logging.getLogger(__name__)
+_PREVIEW_WCS_LINEARIZED_LOGGED = False
 
 # --- Lightweight CuPy helpers -------------------------------------------------
 def gpu_is_available() -> bool:
@@ -774,58 +785,121 @@ def estimate_sky_affine_to_ref(
 
     return float(gain), float(offset), int(x_sel.size)
 
-
 def _rescale_wcs_for_preview(
     wcs_obj,
     original_shape_hw: tuple[int, int],
     new_shape_hw: tuple[int, int],
+    *,
+    keep_distortion: bool = True,
 ):
+    """
+    Build a preview WCS consistent with the resized preview array.
+    - keep_distortion=True  (default): clone original WCS and rescale CRPIX & CD/CDELT,
+      preserving SIP/distortion (matches 3.2.4 behavior).
+    - keep_distortion=False: fit a local TAN plane at the image center (no SIP),
+      then rescale CD to the preview pixel size.
+    """
     if not wcs_obj or not getattr(wcs_obj, "is_celestial", False):
-        return None
-    try:
-        preview_wcs = wcs_obj.deepcopy()
-    except Exception:
-        preview_wcs = copy.deepcopy(wcs_obj)
-    if preview_wcs is None:
         return None
     try:
         orig_h, orig_w = map(float, original_shape_hw)
         new_h, new_w = map(float, new_shape_hw)
-        if new_h <= 0 or new_w <= 0:
+    except Exception:
+        return None
+    if new_h <= 0 or new_w <= 0:
+        return None
+
+    scale_y = orig_h / new_h
+    scale_x = orig_w / new_w
+
+    # Fast path: preserve SIP/distortion (regression to 3.2.4)
+    if keep_distortion:
+        try:
+            preview_wcs = wcs_obj.deepcopy()
+        except Exception:
+            preview_wcs = copy.deepcopy(wcs_obj)
+        if preview_wcs is None:
             return None
-        scale_y = orig_h / new_h
-        scale_x = orig_w / new_w
-        if hasattr(preview_wcs, "wcs") and preview_wcs.wcs is not None:
-            if preview_wcs.wcs.crpix is not None and preview_wcs.wcs.crpix.size >= 2:
-                preview_wcs.wcs.crpix[0] = (float(preview_wcs.wcs.crpix[0]) - 0.5) / scale_x + 0.5
-                preview_wcs.wcs.crpix[1] = (float(preview_wcs.wcs.crpix[1]) - 0.5) / scale_y + 0.5
-            # Some WCS instances expose ``cd`` while others rely on ``cdelt``.
-            cd_matrix = None
-            try:
-                cd_matrix = preview_wcs.wcs.cd
-            except (AttributeError, ValueError):
-                cd_matrix = None
-            if cd_matrix is not None:
-                preview_wcs.wcs.cd[0, :] *= scale_x
-                preview_wcs.wcs.cd[1, :] *= scale_y
-            else:
-                cdelt = None
+        try:
+            if hasattr(preview_wcs, "wcs") and preview_wcs.wcs is not None:
+                if preview_wcs.wcs.crpix is not None and preview_wcs.wcs.crpix.size >= 2:
+                    preview_wcs.wcs.crpix[0] = (float(preview_wcs.wcs.crpix[0]) - 0.5) / scale_x + 0.5
+                    preview_wcs.wcs.crpix[1] = (float(preview_wcs.wcs.crpix[1]) - 0.5) / scale_y + 0.5
+                # Rescale CD or CDELT
                 try:
-                    cdelt = preview_wcs.wcs.cdelt
-                except (AttributeError, ValueError):
-                    cdelt = None
-                if cdelt is not None:
-                    preview_wcs.wcs.cdelt[0] *= scale_x
-                    preview_wcs.wcs.cdelt[1] *= scale_y
+                    cd = preview_wcs.wcs.cd
+                except Exception:
+                    cd = None
+                if cd is not None:
+                    preview_wcs.wcs.cd[0, :] *= scale_x
+                    preview_wcs.wcs.cd[1, :] *= scale_y
+                else:
+                    try:
+                        preview_wcs.wcs.cdelt[0] *= scale_x
+                        preview_wcs.wcs.cdelt[1] *= scale_y
+                    except Exception:
+                        pass
+            try:
+                preview_wcs.pixel_shape = (int(round(new_w)), int(round(new_h)))
+            except Exception:
+                pass
+            try:
+                preview_wcs.fix()
+            except Exception:
+                pass
+            return preview_wcs
+        except Exception:
+            return None
+
+    # Proper linearization: fit a TAN plane at center, then rescale CD
+    if not (ASTROPY_WCS_AVAILABLE_IN_UTILS and AstropyWCS is not None):
+        return None
+    try:
+        # Center in original pixel grid
+        cx = (orig_w - 1.0) * 0.5
+        cy = (orig_h - 1.0) * 0.5
+        # Sample world at center and ±1px to estimate Jacobian
+        c0 = wcs_obj.pixel_to_world(cx, cy)
+        cx1 = wcs_obj.pixel_to_world(cx + 1.0, cy)
+        cy1 = wcs_obj.pixel_to_world(cx, cy + 1.0)
+        # Convert small offsets to degrees in a local tangent approx
+        ra0 = float(c0.ra.deg)
+        dec0 = float(c0.dec.deg)
+        cosd = max(1e-6, abs(math.cos(math.radians(dec0))))
+        d_ra_dx = (float(cx1.ra.deg) - ra0) * cosd
+        d_dec_dx = float(cx1.dec.deg) - dec0
+        d_ra_dy  = (float(cy1.ra.deg) - ra0) * cosd
+        d_dec_dy = float(cy1.dec.deg) - dec0
+        # CD in deg/px at original scale
+        cd = np.array([[d_ra_dx, d_ra_dy],
+                       [d_dec_dx, d_dec_dy]], dtype=np.float64)
+        # Rescale to preview pixels: preview pixel = scale_x * original px (x), scale_y (y)
+        cd[0, 0] *= scale_x; cd[0, 1] *= scale_y
+        cd[1, 0] *= scale_x; cd[1, 1] *= scale_y
+        # Build a clean TAN WCS
+        hdr = {}
+        hdr["NAXIS"]  = 2
+        hdr["CTYPE1"] = "RA---TAN"
+        hdr["CTYPE2"] = "DEC--TAN"
+        hdr["CRVAL1"] = ra0
+        hdr["CRVAL2"] = dec0
+        hdr["CRPIX1"] = (new_w + 1.0) * 0.5
+        hdr["CRPIX2"] = (new_h + 1.0) * 0.5
+        hdr["CD1_1"]  = cd[0, 0]; hdr["CD1_2"] = cd[0, 1]
+        hdr["CD2_1"]  = cd[1, 0]; hdr["CD2_2"] = cd[1, 1]
+        preview_wcs = AstropyWCS(header=hdr, naxis=2, relax=True)
         try:
             preview_wcs.pixel_shape = (int(round(new_w)), int(round(new_h)))
+        except Exception:
+            pass
+        try:
+            preview_wcs.fix()
         except Exception:
             pass
         return preview_wcs
     except Exception:
         return None
-
-
+    
 def create_downscaled_luminance_preview(
     image: np.ndarray,
     wcs_obj,
@@ -1233,8 +1307,19 @@ def compute_intertile_affine_calibration(
             continue
         a_ij, b_ij = fit
         pair_entries.append((i, j, a_ij, b_ij, weight))
+
+        a_ij, b_ij = fit
+        pair_entries.append((i, j, a_ij, b_ij, weight))
         connectivity[i] += weight
         connectivity[j] += weight
+
+        # [ETA] Tick fin de traitement de la paire idx
+        if progress_callback:
+            try:
+                progress_callback("phase5_intertile_pairs", int(idx), int(len(overlaps)))
+            except Exception:
+                pass
+
         if progress_callback and idx % 5 == 0:
             try:
                 progress_callback("phase5_intertile", idx, len(overlaps))

@@ -44,8 +44,24 @@
     "winsor_min_frames_per_pass": 4,
     "winsor_memmap_fallback": "auto",
     "winsor_split_strategy": "sequential",
-    "max_raw_per_master_tile": 20,
+    "max_raw_per_master_tile": 50,
     "center_out_normalization_p3": true,
+    "center_out_anchor_mode": "auto_central_quality",
+    "anchor_quality_probe_limit": 20,
+    "anchor_quality_span_range": [
+        0.02,
+        6.0
+    ],
+    "anchor_quality_median_clip_sigma": 2.5,
+    "enable_poststack_anchor_review": true,
+    "poststack_anchor_probe_limit": 12,
+    "poststack_anchor_span_range": [
+        0.004,
+        10.0
+    ],
+    "poststack_anchor_median_clip_sigma": 3.5,
+    "poststack_anchor_min_improvement": 0.05,
+    "poststack_anchor_use_overlap_affine": true,
     "p3_center_sky_percentile": [
         25.0,
         60.0
@@ -61,14 +77,19 @@
         70.0
     ],
     "intertile_robust_clip_sigma": 2.5,
+    "intertile_global_recenter": true,
+    "intertile_recenter_clip": [
+        0.85,
+        1.18
+    ],
     "use_auto_intertile": true,
     "match_background_for_final": true,
     "incremental_feather_parity": false,
     "enable_early_filter": true,
     "apply_master_tile_crop": true,
-    "master_tile_crop_percent": 18.0,
+    "master_tile_crop_percent": 5.0,
     "quality_crop_enabled": true,
-    "quality_crop_band_px": 36,
+    "quality_crop_band_px": 32,
     "quality_crop_k_sigma": 2.0,
     "quality_crop_margin_px": 8,
     "crop_follow_signal": true

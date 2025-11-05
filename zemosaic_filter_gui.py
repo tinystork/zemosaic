@@ -59,6 +59,9 @@ import time
 import traceback
 import threading
 import queue
+import json
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 
 # --- Instrument detection helpers -------------------------------------------
@@ -1810,8 +1813,390 @@ def launch_filter_interface(
                 visual_refresh_job["handle"] = None
                 _flush_visual_refresh()
 
+        def _canvas_draw_idle() -> None:
+            try:
+                canvas.draw_idle()
+            except Exception:
+                try:
+                    canvas.draw()
+                except Exception:
+                    pass
+
+        def _flush_deferred_wcs_results(force: bool = False) -> None:
+            buffer = wcs_async_state.get("buffer")
+            if not isinstance(buffer, list) or not buffer:
+                return
+            chunk_size = max(1, int(DEFER_DRAW_CHUNK))
+            flushed_any = False
+            while buffer and (force or len(buffer) >= chunk_size):
+                chunk = buffer[:chunk_size]
+                del buffer[:chunk_size]
+                pending_visual_refresh.update(chunk)
+                _schedule_visual_refresh_flush()
+                flushed_any = True
+            if flushed_any:
+                _canvas_draw_idle()
+
+        def _flush_live_updates(force: bool = False) -> None:
+            live_buffer = wcs_async_state.get("live_buffer")
+            if not isinstance(live_buffer, list) or not live_buffer:
+                return
+            threshold = max(1, int(LIVE_DRAW_THROTTLE))
+            if not force and len(live_buffer) < threshold:
+                return
+            targets = list(live_buffer)
+            live_buffer.clear()
+            pending_visual_refresh.update(targets)
+            _schedule_visual_refresh_flush()
+            _canvas_draw_idle()
+
         def _log_message(message: str, level: str = "INFO") -> None:
             _write_log_entries([(level, message)])
+
+        def _handle_wcs_result(payload: Dict[str, Any]) -> None:
+            if not isinstance(payload, dict):
+                return
+
+            idx_raw = payload.get("idx", payload.get("index"))
+            try:
+                idx_val = int(idx_raw)
+            except Exception:
+                idx_val = None
+
+            ok = bool(payload.get("ok"))
+            wcs_async_state["done"] = int(wcs_async_state.get("done") or 0) + 1
+            if ok:
+                wcs_async_state["success"] = int(wcs_async_state.get("success") or 0) + 1
+
+            total = int(wcs_async_state.get("total") or 0)
+            done_now = int(wcs_async_state.get("done") or 0)
+            try:
+                if total > 0:
+                    progress_text = f"{done_now}/{total} solved…"
+                else:
+                    progress_text = f"{done_now} solved…"
+                summary_var.set(_apply_summary_hint(progress_text))
+            except Exception:
+                pass
+
+            header_obj = payload.get("header")
+            wcs_obj = payload.get("wcs")
+            footprint_payload = payload.get("corners") or payload.get("footprint")
+
+            if isinstance(idx_val, int) and 0 <= idx_val < len(items):
+                item = items[idx_val]
+                if header_obj is not None:
+                    try:
+                        item.header = header_obj
+                        item.src["header"] = header_obj
+                    except Exception:
+                        pass
+                if wcs_obj is not None and getattr(wcs_obj, "is_celestial", False):
+                    try:
+                        item.wcs = wcs_obj
+                        item.src["wcs"] = wcs_obj
+                    except Exception:
+                        pass
+                sanitized_fp: list[tuple[float, float]] = []
+                if isinstance(footprint_payload, (list, tuple)):
+                    for entry in footprint_payload:
+                        try:
+                            ra_val, dec_val = entry
+                            sanitized_fp.append((float(ra_val), float(dec_val)))
+                        except Exception:
+                            continue
+                if sanitized_fp:
+                    try:
+                        item.src["footprint_radec"] = sanitized_fp
+                    except Exception:
+                        pass
+                if wcs_obj is not None or sanitized_fp:
+                    try:
+                        item.refresh_geometry()
+                    except Exception:
+                        pass
+                if ok and footprints_restore_state.get("needs_restore"):
+                    indices_cache = footprints_restore_state.get("indices")
+                    if not isinstance(indices_cache, set):
+                        indices_cache = set()
+                        footprints_restore_state["indices"] = indices_cache
+                    indices_cache.add(idx_val)
+                has_visual_update = bool(sanitized_fp) or (wcs_obj is not None)
+                if has_visual_update:
+                    if defer_overlay_var.get():
+                        buffer = wcs_async_state.get("buffer")
+                        if isinstance(buffer, list):
+                            buffer.append(idx_val)
+                            _flush_deferred_wcs_results()
+                    else:
+                        live_buffer = wcs_async_state.get("live_buffer")
+                        if isinstance(live_buffer, list):
+                            live_buffer.append(idx_val)
+                            _flush_live_updates()
+
+            log_path = wcs_async_state.get("log_path")
+            path_value = payload.get("path")
+            solver_value = payload.get("solver")
+            error_value = payload.get("error")
+            log_entry: Dict[str, Any] = {}
+            if isinstance(path_value, str) and path_value:
+                log_entry["path"] = path_value
+            log_entry["ok"] = ok
+            if solver_value:
+                log_entry["solver"] = str(solver_value)
+            if error_value:
+                log_entry["error"] = str(error_value)
+            if footprint_payload:
+                corners_list: list[list[float]] = []
+                if isinstance(footprint_payload, (list, tuple)):
+                    for entry in footprint_payload:
+                        try:
+                            ra_val, dec_val = entry
+                            corners_list.append([float(ra_val), float(dec_val)])
+                        except Exception:
+                            continue
+                if corners_list:
+                    log_entry["corners"] = corners_list
+            if log_entry.get("path") and log_path:
+                try:
+                    with open(str(log_path), "a", encoding="utf-8") as fw:
+                        fw.write(json.dumps(log_entry, ensure_ascii=False) + "\n")
+                except Exception:
+                    pass
+
+        def _poll_wcs_queue() -> None:
+            wcs_async_state["poll_job"] = None
+            q = wcs_async_state.get("ui_queue")
+            if not isinstance(q, queue.Queue):
+                return
+
+            drained: list[Any] = []
+            while True:
+                try:
+                    drained.append(q.get_nowait())
+                except queue.Empty:
+                    break
+                except Exception:
+                    break
+
+            for payload in drained:
+                if isinstance(payload, dict):
+                    _handle_wcs_result(payload)
+
+            running = bool(wcs_async_state.get("running"))
+            total = int(wcs_async_state.get("total") or 0)
+            done = int(wcs_async_state.get("done") or 0)
+            pending_list = wcs_async_state.get("pending")
+            still_running = False
+            if isinstance(pending_list, list):
+                for fut in list(pending_list):
+                    try:
+                        if fut is not None and not fut.done():
+                            still_running = True
+                            break
+                    except Exception:
+                        continue
+
+            if running and (done >= total > 0 or (not still_running and q.empty())):
+                _finalize_wcs_run()
+                running = False
+
+            if running:
+                try:
+                    wcs_async_state["poll_job"] = root.after(120, _poll_wcs_queue)
+                except Exception:
+                    wcs_async_state["poll_job"] = None
+                    _finalize_wcs_run()
+            else:
+                _flush_deferred_wcs_results(force=True)
+                _flush_live_updates(force=True)
+
+        def _finalize_wcs_run() -> None:
+            if not wcs_async_state.get("running"):
+                return
+            wcs_async_state["running"] = False
+            _flush_deferred_wcs_results(force=True)
+            _flush_live_updates(force=True)
+            executor = wcs_async_state.get("executor")
+            if executor is not None:
+                try:
+                    executor.shutdown(wait=False, cancel_futures=False)
+                except Exception:
+                    pass
+            wcs_async_state["executor"] = None
+            pending_list = wcs_async_state.get("pending")
+            if isinstance(pending_list, list):
+                pending_list.clear()
+            q = wcs_async_state.get("ui_queue")
+            if isinstance(q, queue.Queue):
+                try:
+                    while True:
+                        q.get_nowait()
+                except queue.Empty:
+                    pass
+                except Exception:
+                    pass
+            success = int(wcs_async_state.get("success") or 0)
+            try:
+                _enqueue_event("resolve_done", success)
+            except Exception:
+                pass
+
+        def _cancel_wcs_executor() -> None:
+            wcs_async_state["stop"] = True
+            poll_job = wcs_async_state.get("poll_job")
+            if poll_job is not None:
+                try:
+                    root.after_cancel(poll_job)
+                except Exception:
+                    pass
+                wcs_async_state["poll_job"] = None
+            executor = wcs_async_state.get("executor")
+            if executor is not None:
+                try:
+                    executor.shutdown(wait=False, cancel_futures=True)
+                except Exception:
+                    pass
+            pending_list = wcs_async_state.get("pending")
+            if isinstance(pending_list, list):
+                for fut in pending_list:
+                    try:
+                        fut.cancel()
+                    except Exception:
+                        pass
+                pending_list.clear()
+            q = wcs_async_state.get("ui_queue")
+            if isinstance(q, queue.Queue):
+                try:
+                    while True:
+                        q.get_nowait()
+                except queue.Empty:
+                    pass
+                except Exception:
+                    pass
+            wcs_async_state["running"] = False
+
+        def _paint_from_log_clicked() -> None:
+            if wcs_async_state.get("running"):
+                _log_message("Resolve running — please wait for completion before painting from log.", level="WARN")
+                return
+
+            def _normalized(path_value: str) -> str:
+                try:
+                    return os.path.normcase(os.path.abspath(os.path.expanduser(path_value)))
+                except Exception:
+                    return str(path_value)
+
+            candidates: list[Path] = []
+            log_path_candidate = wcs_async_state.get("log_path")
+            if isinstance(log_path_candidate, str) and log_path_candidate:
+                candidates.append(Path(log_path_candidate))
+            if input_dir:
+                try:
+                    candidates.append(Path(input_dir) / WCS_LOG_NAME)
+                except Exception:
+                    pass
+            for it in items:
+                candidate_path = getattr(it, "path", None)
+                if isinstance(candidate_path, str) and candidate_path:
+                    try:
+                        candidates.append(Path(candidate_path).expanduser().resolve().parent / WCS_LOG_NAME)
+                    except Exception:
+                        continue
+
+            chosen_path: Optional[Path] = None
+            seen: set[str] = set()
+            for cand in candidates:
+                try:
+                    resolved = cand.expanduser()
+                except Exception:
+                    continue
+                key = resolved.as_posix()
+                if key in seen:
+                    continue
+                seen.add(key)
+                if resolved.exists():
+                    chosen_path = resolved
+                    break
+
+            if chosen_path is None and candidates:
+                chosen_path = candidates[0]
+
+            if chosen_path is None or not chosen_path.exists():
+                _log_message("No WCS log file found for the current selection.", level="WARN")
+                return
+
+            wcs_async_state["log_path"] = str(chosen_path)
+
+            try:
+                with chosen_path.open("r", encoding="utf-8") as handle:
+                    lines = handle.readlines()
+            except Exception as exc:
+                _log_message(f"Failed to read WCS log: {exc}", level="WARN")
+                return
+
+            if not lines:
+                _log_message("WCS log is empty.", level="INFO")
+                return
+
+            lookup: Dict[str, int] = {}
+            for idx, it in enumerate(items):
+                for key in (getattr(it, "path", None), it.src.get("path_raw"), it.src.get("path_preprocessed_cache")):
+                    if isinstance(key, str) and key:
+                        lookup[_normalized(key)] = idx
+
+            updated: list[int] = []
+            for raw_line in lines:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(data, dict) or not data.get("ok"):
+                    continue
+                path_value = data.get("path")
+                if not isinstance(path_value, str):
+                    continue
+                idx_target = lookup.get(_normalized(path_value))
+                if idx_target is None:
+                    continue
+                corners = data.get("corners") or data.get("footprint")
+                if not isinstance(corners, (list, tuple)) or len(corners) < 3:
+                    continue
+                sanitized: list[tuple[float, float]] = []
+                for entry in corners:
+                    try:
+                        ra_val, dec_val = entry
+                        sanitized.append((float(ra_val), float(dec_val)))
+                    except Exception:
+                        continue
+                if not sanitized:
+                    continue
+                item = items[idx_target]
+                try:
+                    item.src["footprint_radec"] = sanitized
+                except Exception:
+                    pass
+                try:
+                    item.refresh_geometry()
+                except Exception:
+                    pass
+                if idx_target not in updated:
+                    updated.append(idx_target)
+
+            if not updated:
+                _log_message("WCS log did not contain matching resolved entries.", level="INFO")
+                return
+
+            pending_visual_refresh.update(updated)
+            _schedule_visual_refresh_flush()
+            _canvas_draw_idle()
+
+            summary_msg = f"Painted {len(updated)} entries from log."
+            summary_var.set(_apply_summary_hint(summary_msg))
+            _log_message(summary_msg, level="INFO")
 
         if not has_explicit_centers:
             _log_message(
@@ -2124,6 +2509,27 @@ def launch_filter_interface(
         coverage_first_var = tk.BooleanVar(master=root, value=True)
         overcap_percent_var = tk.IntVar(master=root, value=10)
 
+        WCS_LOG_NAME = "zemosaic_wcs.log"
+        DEFER_DRAW_CHUNK = 200
+        LIVE_DRAW_THROTTLE = 20
+
+        defer_overlay_var = tk.BooleanVar(master=root, value=True)
+
+        wcs_async_state: Dict[str, Any] = {
+            "executor": None,
+            "pending": [],
+            "ui_queue": queue.Queue(),
+            "buffer": [],
+            "live_buffer": [],
+            "log_path": None,
+            "running": False,
+            "stop": False,
+            "done": 0,
+            "total": 0,
+            "success": 0,
+            "poll_job": None,
+        }
+
         resolve_btn = None
         auto_btn = None
         footprints_chk = None
@@ -2156,6 +2562,24 @@ def launch_filter_interface(
             ).grid(row=0, column=2, padx=4, pady=2, sticky="w")
         except Exception as e:
             _log_message(f"[FilterUI] Summary label failed: {e}", level="WARN")
+
+        try:
+            ttk.Checkbutton(
+                operations,
+                text="Defer overlay (faster, no freeze)",
+                variable=defer_overlay_var,
+            ).grid(row=1, column=0, columnspan=2, padx=4, pady=2, sticky="w")
+        except Exception as e:
+            _log_message(f"[FilterUI] Defer overlay checkbox failed: {e}", level="WARN")
+
+        try:
+            ttk.Button(
+                operations,
+                text="Paint from log",
+                command=lambda: _paint_from_log_clicked(),
+            ).grid(row=1, column=2, padx=4, pady=2, sticky="w")
+        except Exception as e:
+            _log_message(f"[FilterUI] Paint-from-log button failed: {e}", level="WARN")
 
         def _show_sizes_details():
             try:
@@ -2404,227 +2828,407 @@ def launch_filter_interface(
             astrometry_direct = getattr(astrometry_mod, "solve_with_astrometry_net", None) if astrometry_mod else None
             ansvr_direct = getattr(astrometry_mod, "solve_with_ansvr", None) if astrometry_mod else None
 
-            def _resolve_worker(pairs: list[tuple[int, Any]]) -> None:
-                resolved_now = 0
-
-                def _log_solver_event(key: str, default: str, level: str, **fmt: Any) -> None:
+            def _log_solver_event(key: str, default: str, level: str, **fmt: Any) -> None:
+                try:
+                    message = _tr(key, default, **fmt)
+                except Exception:
                     try:
-                        message = _tr(key, default, **fmt)
-                    except Exception:
                         message = default.format(**fmt)
-                    _enqueue_event("log", message, level)
+                    except Exception:
+                        message = default
+                _enqueue_event("log", message, level)
+
+            def _solve_one_image_blocking(idx: int, item: Any) -> Dict[str, Any]:
+                result: Dict[str, Any] = {
+                    "idx": idx,
+                    "path": getattr(item, "path", None),
+                    "ok": False,
+                }
+                if wcs_async_state.get("stop"):
+                    result["error"] = "cancelled"
+                    return result
+
+                path = getattr(item, "path", None)
+                if not isinstance(path, str) or not os.path.isfile(path):
+                    result["error"] = "missing file"
+                    return result
+
+                file_name = os.path.basename(path)
+                header_obj = getattr(item, "header", None)
 
                 try:
-                    for idx, item in pairs:
+                    if header_obj is not None:
+                        _enqueue_event("header_loaded", idx, header_obj)
+                    elif astap_fits_module is not None and astap_astropy_available:
                         try:
-                            path = item.path
-                            if not isinstance(path, str) or not os.path.isfile(path):
-                                continue
-
-                            header_obj = item.header
+                            with astap_fits_module.open(path) as hdul_hdr:
+                                header_obj = hdul_hdr[0].header
+                        except Exception as exc:
+                            _log_solver_event(
+                                "filter_log_solver_failed",
+                                "Failed to load FITS header for {name} ({err}).",
+                                "ERROR",
+                                solver="Header",
+                                name=file_name,
+                                err=exc,
+                            )
+                        else:
                             if header_obj is not None:
                                 _enqueue_event("header_loaded", idx, header_obj)
-                            elif astap_fits_module is not None and astap_astropy_available:
-                                try:
-                                    with astap_fits_module.open(path) as hdul_hdr:
-                                        header_obj = hdul_hdr[0].header
-                                except Exception as exc:
-                                    _enqueue_event(
-                                        "log",
-                                        f"Failed to load FITS header for '{path}': {exc}",
-                                        "ERROR",
-                                    )
-                                    header_obj = None
-                                else:
-                                    if header_obj is not None:
-                                        _enqueue_event("header_loaded", idx, header_obj)
-                            if header_obj is None:
-                                try:
-                                    header_obj = fits.getheader(path, 0)
-                                except Exception as exc:
-                                    _enqueue_event(
-                                        "log",
-                                        f"Failed to load FITS header for '{path}': {exc}",
-                                        "ERROR",
-                                    )
-                                    continue
-                                else:
-                                    if header_obj is not None:
-                                        _enqueue_event("header_loaded", idx, header_obj)
+                    if header_obj is None:
+                        try:
+                            header_obj = fits.getheader(path, 0)
+                        except Exception as exc:
+                            _log_solver_event(
+                                "filter_log_solver_failed",
+                                "Failed to load FITS header for {name} ({err}).",
+                                "ERROR",
+                                solver="Header",
+                                name=file_name,
+                                err=exc,
+                            )
+                            result["error"] = str(exc)
+                            return result
+                        else:
+                            if header_obj is not None:
+                                _enqueue_event("header_loaded", idx, header_obj)
 
-                            solved_wcs = None
-                            file_name = os.path.basename(path)
+                    def _shape_from_header() -> Optional[tuple[int, int]]:
+                        shape_hw = getattr(item, "shape", None)
+                        if shape_hw is not None:
+                            return shape_hw
+                        if header_obj is None:
+                            return None
+                        try:
+                            nax1 = header_obj.get("NAXIS1")
+                            nax2 = header_obj.get("NAXIS2")
+                            if nax1 and nax2:
+                                w_px = int(float(nax1))
+                                h_px = int(float(nax2))
+                                if w_px > 0 and h_px > 0:
+                                    return (h_px, w_px)
+                        except Exception:
+                            return getattr(item, "shape", None)
+                        return getattr(item, "shape", None)
 
-                            try:
-                                existing = WCS(header_obj, naxis=2, relax=True)
-                                if existing is not None and getattr(existing, "is_celestial", False):
-                                    solved_wcs = existing
-                            except Exception:
-                                pass
+                    def _on_success(solver_name: str, wcs_obj: Any) -> Dict[str, Any]:
+                        _log_solver_event(
+                            "filter_log_solver_ok",
+                            "{solver} solved {name}.",
+                            "INFO",
+                            solver=solver_name,
+                            name=file_name,
+                        )
+                        result["ok"] = True
+                        result["solver"] = solver_name
+                        result["header"] = header_obj
+                        result["wcs"] = wcs_obj
+                        footprint_pts = None
+                        try:
+                            footprint_pts = _compute_footprint_from_wcs(wcs_obj, _shape_from_header())
+                        except Exception:
+                            footprint_pts = None
+                        if footprint_pts:
+                            result["corners"] = footprint_pts
+                        return result
 
-                            def _handle_success(solver_name: str, wcs_obj: Any) -> None:
-                                nonlocal resolved_now
-                                resolved_now += 1
-                                _log_solver_event(
-                                    "filter_log_solver_ok",
-                                    "{solver} solved {name}.",
-                                    "INFO",
-                                    solver=solver_name,
-                                    name=file_name,
+                    try:
+                        existing = WCS(header_obj, naxis=2, relax=True)
+                        if existing is not None and getattr(existing, "is_celestial", False):
+                            return _on_success("Header", existing)
+                    except Exception:
+                        pass
+
+                    last_error: Optional[str] = None
+
+                    if wcs_async_state.get("stop"):
+                        result["error"] = "cancelled"
+                        return result
+
+                    if astap_enabled:
+                        _log_solver_event(
+                            "filter_log_solver_attempt",
+                            "Trying {solver} for {name}…",
+                            "INFO",
+                            solver="ASTAP",
+                            name=file_name,
+                        )
+                        try:
+                            astap_wcs = solve_with_astap(
+                                path,
+                                header_obj,
+                                astap_exe_path,
+                                astap_data_dir,
+                                search_radius_deg=srch_radius,
+                                downsample_factor=downsample_val,
+                                sensitivity=sensitivity_val,
+                                timeout_sec=timeout_sec,
+                                update_original_header_in_place=write_inplace,
+                                progress_callback=_progress_callback,
+                            )
+                        except Exception as exc:
+                            last_error = str(exc)
+                            _log_solver_event(
+                                "filter_log_solver_failed",
+                                "{solver} failed for {name} ({err}).",
+                                "ERROR",
+                                solver="ASTAP",
+                                name=file_name,
+                                err=exc,
+                            )
+                        else:
+                            if astap_wcs and getattr(astap_wcs, "is_celestial", False):
+                                return _on_success("ASTAP", astap_wcs)
+                            _log_solver_event(
+                                "filter_log_solver_failed",
+                                "{solver} failed for {name} ({err}).",
+                                "WARN",
+                                solver="ASTAP",
+                                name=file_name,
+                                err="no solution",
+                            )
+
+                    if wcs_async_state.get("stop"):
+                        result["error"] = "cancelled"
+                        return result
+
+                    if astrometry_enabled:
+                        _log_solver_event(
+                            "filter_log_solver_attempt",
+                            "Trying {solver} for {name}…",
+                            "INFO",
+                            solver="Astrometry.net",
+                            name=file_name,
+                        )
+                        skip_failure = False
+                        try:
+                            if write_inplace and solve_with_astrometry:
+                                astrometry_wcs = solve_with_astrometry(
+                                    path,
+                                    header_obj,
+                                    solver_settings_local,
+                                    progress_callback=_progress_callback,
                                 )
-                                footprint_pts = None
-                                try:
-                                    shape_hw = getattr(item, "shape", None)
-                                    if shape_hw is None and header_obj is not None:
-                                        try:
-                                            nax1 = header_obj.get("NAXIS1")
-                                            nax2 = header_obj.get("NAXIS2")
-                                            if nax1 and nax2:
-                                                w_px = int(float(nax1))
-                                                h_px = int(float(nax2))
-                                                if w_px > 0 and h_px > 0:
-                                                    shape_hw = (h_px, w_px)
-                                        except Exception:
-                                            pass
-                                    footprint_pts = _compute_footprint_from_wcs(wcs_obj, shape_hw)
-                                except Exception:
-                                    footprint_pts = None
-                                _enqueue_event("resolved_item", idx, header_obj, wcs_obj, footprint_pts)
-
-                            def _handle_failure(solver_name: str, err: str, level: str = "WARN") -> None:
+                            elif not write_inplace and astrometry_direct:
+                                astrometry_wcs = astrometry_direct(
+                                    path,
+                                    header_obj,
+                                    api_key=solver_settings_local.get("api_key", ""),
+                                    timeout_sec=timeout_sec,
+                                    downsample_factor=solver_settings_local.get("downsample"),
+                                    update_original_header_in_place=False,
+                                    progress_callback=_progress_callback,
+                                )
+                            else:
+                                astrometry_wcs = None
+                                if not write_inplace:
+                                    _log_solver_event(
+                                        "filter_log_solver_failed",
+                                        "{solver} failed for {name} ({err}).",
+                                        "INFO",
+                                        solver="Astrometry.net",
+                                        name=file_name,
+                                        err="disabled (write-off)",
+                                    )
+                                    skip_failure = True
+                        except Exception as exc:
+                            last_error = str(exc)
+                            _log_solver_event(
+                                "filter_log_solver_failed",
+                                "{solver} failed for {name} ({err}).",
+                                "ERROR",
+                                solver="Astrometry.net",
+                                name=file_name,
+                                err=exc,
+                            )
+                        else:
+                            if astrometry_wcs and getattr(astrometry_wcs, "is_celestial", False):
+                                return _on_success("Astrometry.net", astrometry_wcs)
+                            if not skip_failure:
                                 _log_solver_event(
                                     "filter_log_solver_failed",
                                     "{solver} failed for {name} ({err}).",
-                                    level,
-                                    solver=solver_name,
-                                    name=file_name,
-                                    err=err,
-                                )
-
-                            if solved_wcs is not None:
-                                _handle_success("Header", solved_wcs)
-                                continue
-
-                            # ASTAP attempt
-                            if astap_enabled:
-                                _log_solver_event(
-                                    "filter_log_solver_attempt",
-                                    "Trying {solver} for {name}…",
-                                    "INFO",
-                                    solver="ASTAP",
-                                    name=file_name,
-                                )
-                                try:
-                                    astap_wcs = solve_with_astap(
-                                        path,
-                                        header_obj,
-                                        astap_exe_path,
-                                        astap_data_dir,
-                                        search_radius_deg=srch_radius,
-                                        downsample_factor=downsample_val,
-                                        sensitivity=sensitivity_val,
-                                        timeout_sec=timeout_sec,
-                                        update_original_header_in_place=write_inplace,
-                                        progress_callback=_progress_callback,
-                                    )
-                                except Exception as exc:
-                                    _handle_failure("ASTAP", str(exc), level="ERROR")
-                                else:
-                                    if astap_wcs and getattr(astap_wcs, "is_celestial", False):
-                                        _handle_success("ASTAP", astap_wcs)
-                                        continue
-                                    _handle_failure("ASTAP", "no solution")
-
-                            if astrometry_enabled:
-                                _log_solver_event(
-                                    "filter_log_solver_attempt",
-                                    "Trying {solver} for {name}…",
-                                    "INFO",
+                                    "WARN",
                                     solver="Astrometry.net",
                                     name=file_name,
+                                    err="no solution",
                                 )
-                                skip_failure = False
-                                try:
-                                    if write_inplace and solve_with_astrometry:
-                                        astrometry_wcs = solve_with_astrometry(
-                                            path,
-                                            header_obj,
-                                            solver_settings_local,
-                                            progress_callback=_progress_callback,
-                                        )
-                                    elif not write_inplace and astrometry_direct:
-                                        astrometry_wcs = astrometry_direct(
-                                            path,
-                                            header_obj,
-                                            api_key=solver_settings_local.get("api_key", ""),
-                                            timeout_sec=timeout_sec,
-                                            downsample_factor=solver_settings_local.get("downsample"),
-                                            update_original_header_in_place=False,
-                                            progress_callback=_progress_callback,
-                                        )
-                                    else:
-                                        astrometry_wcs = None
-                                        if not write_inplace:
-                                            _handle_failure("Astrometry.net", "disabled (write-off)", level="INFO")
-                                            skip_failure = True
-                                except Exception as exc:
-                                    _handle_failure("Astrometry.net", str(exc), level="ERROR")
-                                else:
-                                    if astrometry_wcs and getattr(astrometry_wcs, "is_celestial", False):
-                                        _handle_success("Astrometry.net", astrometry_wcs)
-                                        continue
-                                    if not skip_failure:
-                                        _handle_failure("Astrometry.net", "no solution")
 
-                            if ansvr_enabled:
+                    if wcs_async_state.get("stop"):
+                        result["error"] = "cancelled"
+                        return result
+
+                    if ansvr_enabled:
+                        _log_solver_event(
+                            "filter_log_solver_attempt",
+                            "Trying {solver} for {name}…",
+                            "INFO",
+                            solver="ANSVR",
+                            name=file_name,
+                        )
+                        skip_failure = False
+                        try:
+                            if write_inplace and solve_with_ansvr:
+                                ansvr_wcs = solve_with_ansvr(
+                                    path,
+                                    header_obj,
+                                    solver_settings_local,
+                                    progress_callback=_progress_callback,
+                                )
+                            elif not write_inplace and ansvr_direct:
+                                ansvr_wcs = ansvr_direct(
+                                    path,
+                                    header_obj,
+                                    ansvr_config_path=solver_settings_local.get("ansvr_path", ""),
+                                    timeout_sec=timeout_sec,
+                                    update_original_header_in_place=False,
+                                    progress_callback=_progress_callback,
+                                )
+                            else:
+                                ansvr_wcs = None
+                                if not write_inplace:
+                                    _log_solver_event(
+                                        "filter_log_solver_failed",
+                                        "{solver} failed for {name} ({err}).",
+                                        "INFO",
+                                        solver="ANSVR",
+                                        name=file_name,
+                                        err="disabled (write-off)",
+                                    )
+                                    skip_failure = True
+                        except Exception as exc:
+                            last_error = str(exc)
+                            _log_solver_event(
+                                "filter_log_solver_failed",
+                                "{solver} failed for {name} ({err}).",
+                                "ERROR",
+                                solver="ANSVR",
+                                name=file_name,
+                                err=exc,
+                            )
+                        else:
+                            if ansvr_wcs and getattr(ansvr_wcs, "is_celestial", False):
+                                return _on_success("ANSVR", ansvr_wcs)
+                            if not skip_failure:
                                 _log_solver_event(
-                                    "filter_log_solver_attempt",
-                                    "Trying {solver} for {name}…",
-                                    "INFO",
+                                    "filter_log_solver_failed",
+                                    "{solver} failed for {name} ({err}).",
+                                    "WARN",
                                     solver="ANSVR",
                                     name=file_name,
+                                    err="no solution",
                                 )
-                                skip_failure = False
-                                try:
-                                    if write_inplace and solve_with_ansvr:
-                                        ansvr_wcs = solve_with_ansvr(
-                                            path,
-                                            header_obj,
-                                            solver_settings_local,
-                                            progress_callback=_progress_callback,
-                                        )
-                                    elif not write_inplace and ansvr_direct:
-                                        ansvr_wcs = ansvr_direct(
-                                            path,
-                                            header_obj,
-                                            ansvr_config_path=solver_settings_local.get("ansvr_path", ""),
-                                            timeout_sec=timeout_sec,
-                                            update_original_header_in_place=False,
-                                            progress_callback=_progress_callback,
-                                        )
-                                    else:
-                                        ansvr_wcs = None
-                                        if not write_inplace:
-                                            _handle_failure("ANSVR", "disabled (write-off)", level="INFO")
-                                            skip_failure = True
-                                except Exception as exc:
-                                    _handle_failure("ANSVR", str(exc), level="ERROR")
-                                else:
-                                    if ansvr_wcs and getattr(ansvr_wcs, "is_celestial", False):
-                                        _handle_success("ANSVR", ansvr_wcs)
-                                        continue
-                                    if not skip_failure:
-                                        _handle_failure("ANSVR", "no solution")
-                        except Exception as exc:
-                            _enqueue_event("log", f"Unexpected resolver error: {exc}", "ERROR")
-                finally:
-                    _enqueue_event("resolve_done", resolved_now)
+
+                    if wcs_async_state.get("stop"):
+                        result["error"] = "cancelled"
+                        return result
+
+                    if last_error:
+                        result["error"] = last_error
+                    else:
+                        result["error"] = "no solution"
+                    return result
+                except Exception as exc:
+                    _enqueue_event("log", f"Unexpected resolver error: {exc}", "ERROR")
+                    result["error"] = str(exc)
+                    return result
 
             try:
-                threading.Thread(target=_resolve_worker, args=(pending,), daemon=True).start()
-            except Exception:
+                _cancel_wcs_executor()
+                queue_obj = wcs_async_state.get("ui_queue")
+                if isinstance(queue_obj, queue.Queue):
+                    try:
+                        while True:
+                            queue_obj.get_nowait()
+                    except queue.Empty:
+                        pass
+                    except Exception:
+                        pass
+                buffer_list = wcs_async_state.get("buffer")
+                if isinstance(buffer_list, list):
+                    buffer_list.clear()
+                live_list = wcs_async_state.get("live_buffer")
+                if isinstance(live_list, list):
+                    live_list.clear()
+                wcs_async_state["done"] = 0
+                wcs_async_state["success"] = 0
+                wcs_async_state["total"] = len(pending)
+                wcs_async_state["stop"] = False
+                wcs_async_state["running"] = True
+
+                log_dir: Optional[Path] = None
+                for _idx, _item in pending:
+                    candidate_path = getattr(_item, "path", None)
+                    if isinstance(candidate_path, str) and candidate_path:
+                        try:
+                            log_dir = Path(candidate_path).expanduser().resolve().parent
+                        except Exception:
+                            log_dir = Path(os.path.dirname(candidate_path))
+                        break
+                if log_dir is None and input_dir:
+                    try:
+                        log_dir = Path(input_dir).expanduser().resolve()
+                    except Exception:
+                        log_dir = Path(input_dir)
+
+                log_path: Optional[Path] = None
+                if log_dir is not None:
+                    log_path = log_dir / WCS_LOG_NAME
+                    wcs_async_state["log_path"] = str(log_path)
+                    try:
+                        log_path.parent.mkdir(parents=True, exist_ok=True)
+                    except Exception:
+                        pass
+                    try:
+                        log_path.write_text("", encoding="utf-8")
+                    except Exception:
+                        pass
+                else:
+                    wcs_async_state["log_path"] = None
+
+                max_workers = max(1, min(4, os.cpu_count() or 2))
+                executor = ThreadPoolExecutor(max_workers=max_workers)
+                wcs_async_state["executor"] = executor
+                pending_futures: list[Any] = []
+                wcs_async_state["pending"] = pending_futures
+
+                for idx, item in pending:
+                    if wcs_async_state.get("stop"):
+                        break
+                    future = executor.submit(_solve_one_image_blocking, idx, item)
+                    pending_futures.append(future)
+
+                    def _on_done(fut: Any, *, _idx: int = idx, _item: Any = item) -> None:
+                        try:
+                            res = fut.result()
+                        except Exception as exc:
+                            _enqueue_event("log", f"Unexpected resolver error: {exc}", "ERROR")
+                            res = {
+                                "idx": _idx,
+                                "path": getattr(_item, "path", None),
+                                "ok": False,
+                                "error": str(exc),
+                            }
+                        try:
+                            wcs_async_state["ui_queue"].put_nowait(res)
+                        except Exception:
+                            pass
+
+                    future.add_done_callback(_on_done)
+
+                try:
+                    wcs_async_state["poll_job"] = root.after(100, _poll_wcs_queue)
+                except Exception:
+                    wcs_async_state["poll_job"] = None
+                    _poll_wcs_queue()
+
+            except Exception as exc:
+                wcs_async_state["running"] = False
                 resolve_state["running"] = False
-                resolve_btn.state(["!disabled"])
+                try:
+                    resolve_btn.state(["!disabled"])
+                except Exception:
+                    pass
                 if footprints_restore_state.get("needs_restore"):
                     original_value = bool(footprints_restore_state.get("value", True))
                     try:
@@ -2646,7 +3250,8 @@ def launch_filter_interface(
                     indices_cache = footprints_restore_state.get("indices")
                     if isinstance(indices_cache, set):
                         indices_cache.clear()
-                raise
+                _log_message(f"[FilterUI] Unable to start WCS executor: {exc}", level="ERROR")
+                return
 
         # Coverage-first auto-organization state and helpers
         auto_cluster_state = {"running": False}
@@ -4778,6 +5383,7 @@ def launch_filter_interface(
 
         # On window close: treat as cancel (keep all)
         def on_close():
+            _cancel_wcs_executor()
             _drain_stream_queue_non_blocking(mark_done=True)
             if result.get("accepted") is None:
                 result["accepted"] = False
