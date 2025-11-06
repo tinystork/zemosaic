@@ -475,5 +475,10 @@
     "filter_warn_worker_missing": "Organisation auto désactivée car le module de traitement n'a pas pu être chargé : {error}",
     "photometric_safe_fallback_applied": "Sécurité photométrique appliquée (corr={corr:.3f}, gain={gain:.3f}, offset={offset:.3f}, échantillons={samples})",
     "filter_log_analyse_clicked": "Analyse cliquée — préparation de l'exploration…",
-    "filter_warn_no_input_dir": "Aucun dossier d'entrée à analyser."
+    "filter_warn_no_input_dir": "Aucun dossier d'entrée à analyser.",
+    "FILTER_EXCLUDED_DIR": "Le dossier « unaligned_by_zemosaic » est exclu et ne sera pas analysé.",
+    "FILTER_MOVE_FAILED_INPUT": "Le chemin d’entrée pointe vers un dossier exclu. Veuillez en choisir un autre.",
+    "FILTER_FILE_MOVED_UNALIGNED": "Fichier problématique déplacé vers « unaligned_by_zemosaic » : {filename}",
+    "FILTER_WCS_FAIL_MOVED": "Échec de la résolution WCS ; fichier déplacé vers « unaligned_by_zemosaic ».",
+    "FILTER_REFRESH_AFTER_MOVE": "Liste rafraîchie après exclusion des fichiers non alignés."
 }

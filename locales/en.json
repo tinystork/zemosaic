@@ -490,5 +490,10 @@
     "filter_invalid_value_msg": "Please enter a distance in degrees (numeric).",
     "photometric_safe_fallback_applied": "Photometric safeguard applied (corr={corr:.3f}, gain={gain:.3f}, offset={offset:.3f}, samples={samples})",
     "filter_log_analyse_clicked": "Analyse clicked — preparing scan…",
-    "filter_warn_no_input_dir": "No input directory to scan."
+    "filter_warn_no_input_dir": "No input directory to scan.",
+    "FILTER_EXCLUDED_DIR": "The folder \"unaligned_by_zemosaic\" is excluded and will not be scanned.",
+    "FILTER_MOVE_FAILED_INPUT": "Input path points to an excluded folder. Please select another folder.",
+    "FILTER_FILE_MOVED_UNALIGNED": "Moved problematic file to 'unaligned_by_zemosaic': {filename}",
+    "FILTER_WCS_FAIL_MOVED": "WCS solve failed; file moved to 'unaligned_by_zemosaic'.",
+    "FILTER_REFRESH_AFTER_MOVE": "List refreshed after excluding unaligned files."
 }
