@@ -65,6 +65,8 @@ import threading
 import itertools
 import platform
 import importlib.util
+from pathlib import Path
+from threading import Lock
 from dataclasses import dataclass
 from typing import Callable, Any, Iterable
 from types import SimpleNamespace
@@ -75,6 +77,128 @@ import numpy as np
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, FIRST_COMPLETED, as_completed
 # BrokenProcessPool moved under concurrent.futures.process in modern Python
 from concurrent.futures.process import BrokenProcessPool
+
+try:
+    from zemosaic_utils import EXCLUDED_DIRS, is_path_excluded
+except Exception:
+    EXCLUDED_DIRS = frozenset({"unaligned_by_zemosaic"})
+
+    def is_path_excluded(path, excluded_dirs=None):
+        import os
+
+        parts = set(os.path.normpath(str(path)).split(os.sep))
+        dirs = set(excluded_dirs) if excluded_dirs else set()
+        return any(d in parts for d in (dirs or {"unaligned_by_zemosaic"}))
+
+
+UNALIGNED_DIRNAME = "unaligned_by_zemosaic"
+_UNALIGNED_LOCK = Lock()
+
+
+def _move_to_unaligned_safe(
+    src_path: str | os.PathLike,
+    input_root: str | os.PathLike,
+    *,
+    logger: logging.Logger = logging.getLogger(__name__),
+) -> tuple[str, Path | None]:
+    """Thread-safe move helper for ``unaligned_by_zemosaic``.
+
+    Parameters
+    ----------
+    src_path : str | os.PathLike
+        Path to the source file that should be relocated.
+    input_root : str | os.PathLike
+        Root input directory that owns the ``unaligned`` folder.
+    logger : logging.Logger, optional
+        Logger instance used for diagnostics.
+
+    Returns
+    -------
+    tuple[str, Path | None]
+        ``(status, destination_path)`` where ``status`` is one of
+        ``{"moved", "skipped_excluded", "missing", "already_moved", "conflict", "failed"}``.
+        ``destination_path`` is provided when a target directory is known.
+    """
+
+    try:
+        src = Path(src_path).expanduser().resolve(strict=False)
+    except Exception:
+        src = Path(src_path)
+
+    try:
+        root = Path(input_root).expanduser().resolve(strict=False)
+    except Exception:
+        root = Path(input_root)
+
+    # Skip if the source is already part of an excluded directory
+    try:
+        if is_path_excluded(src, EXCLUDED_DIRS):
+            try:
+                logger.warning("Skip move: path already excluded: %s", src)
+            except Exception:
+                pass
+            return "skipped_excluded", None
+    except Exception:
+        if UNALIGNED_DIRNAME in set(src.parts):
+            try:
+                logger.warning("Skip move: path already excluded: %s", src)
+            except Exception:
+                pass
+            return "skipped_excluded", None
+
+    if not src.exists():
+        try:
+            logger.debug("Skip move: source missing (likely already moved): %s", src)
+        except Exception:
+            pass
+        return "missing", None
+
+    target_dir = root / UNALIGNED_DIRNAME
+
+    with _UNALIGNED_LOCK:
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            try:
+                logger.debug("Failed to ensure unaligned dir exists (%s): %s", target_dir, exc)
+            except Exception:
+                pass
+
+    dst = target_dir / src.name
+
+    try:
+        shutil.move(str(src), str(dst))
+        try:
+            logger.info("Moved to '%s': %s", UNALIGNED_DIRNAME, dst)
+        except Exception:
+            pass
+        return "moved", dst
+    except FileExistsError:
+        if not src.exists():
+            try:
+                logger.debug("Move raced (already exists), keeping destination: %s", dst)
+            except Exception:
+                pass
+            return "already_moved", dst
+        try:
+            logger.debug("Move skipped (destination exists): %s", dst)
+        except Exception:
+            pass
+        return "conflict", dst
+    except FileNotFoundError:
+        try:
+            logger.debug("Move skipped: source vanished before move: %s", src)
+        except Exception:
+            pass
+        return "already_moved", dst
+    except Exception as exc:
+        try:
+            logger.warning(
+                "Move to '%s' failed for %s: %s", UNALIGNED_DIRNAME, src, exc
+            )
+        except Exception:
+            pass
+        return "failed", dst
 
 # Nombre maximum de tentatives d'alignement avant abandon définitif
 MAX_ALIGNMENT_RETRY_ATTEMPTS = 3
@@ -4353,6 +4477,15 @@ def get_wcs_and_pretreat_raw_file(
     _pcb_local = lambda msg_key, lvl="DEBUG", **kwargs: \
         progress_callback(msg_key, None, lvl, **kwargs) if progress_callback else print(f"GETWCS_LOG {lvl}: {msg_key} {kwargs}")
 
+    try:
+        if is_path_excluded(file_path, EXCLUDED_DIRS):
+            logger.debug("Skip excluded path: %s", file_path)
+            return None, None, None, None
+    except Exception:
+        if UNALIGNED_DIRNAME in os.path.normpath(file_path).split(os.sep):
+            logger.debug("Skip excluded path: %s", file_path)
+            return None, None, None, None
+
     if solver_settings is None:
         solver_settings = {}
 
@@ -4697,32 +4830,36 @@ def get_wcs_and_pretreat_raw_file(
 
     # Si on arrive ici, c'est que wcs_brute est None ou non céleste
     _pcb_local("getwcs_action_moving_unsolved_file", lvl="WARN", filename=filename)
-    try:
-        original_file_dir = os.path.dirname(file_path)
-        unaligned_dir_name = "unaligned_by_zemosaic"
-        unaligned_path = os.path.join(original_file_dir, unaligned_dir_name)
-        
-        if not os.path.exists(unaligned_path):
-            os.makedirs(unaligned_path)
-            _pcb_local(f"  Création dossier: '{unaligned_path}'", lvl="INFO_DETAIL")
-        
-        destination_path = os.path.join(unaligned_path, filename)
-        
-        if os.path.exists(destination_path):
-            base, ext = os.path.splitext(filename)
-            timestamp_suffix = time.strftime("_%Y%m%d%H%M%S")
-            destination_path = os.path.join(unaligned_path, f"{base}{timestamp_suffix}{ext}")
-            _pcb_local(f"  Fichier de destination '{filename}' existe déjà. Renommage en '{os.path.basename(destination_path)}'", lvl="DEBUG_DETAIL")
+    status, destination_path = _move_to_unaligned_safe(
+        file_path,
+        os.path.dirname(file_path),
+        logger=logger,
+    )
 
-        shutil.move(file_path, destination_path) # shutil.move écrase si la destination existe et est un fichier
-                                                  # mais notre renommage ci-dessus gère le cas.
-        _pcb_local(f"  Fichier '{filename}' déplacé vers '{unaligned_path}'.", lvl="INFO")
+    if status == "moved" and destination_path is not None:
+        _pcb_local(
+            f"  Fichier '{filename}' déplacé vers '{destination_path.parent}'.",
+            lvl="INFO",
+        )
+    elif status in {"already_moved", "missing"}:
+        _pcb_local(
+            f"  Fichier '{filename}' déjà déplacé ou introuvable (course détectée).",
+            lvl="DEBUG_DETAIL",
+        )
+    elif status == "skipped_excluded":
+        _pcb_local(
+            f"  Fichier '{filename}' déjà dans un dossier exclu, déplacement ignoré.",
+            lvl="WARN",
+        )
+    elif status in {"conflict", "failed"}:
+        _pcb_local(
+            "getwcs_error_moving_unaligned_file",
+            lvl="ERROR",
+            filename=filename,
+            error=f"status={status}",
+        )
 
-    except Exception as e_move:
-        _pcb_local(f"getwcs_error_moving_unaligned_file", lvl="ERROR", filename=filename, error=str(e_move))
-        logger.error(f"Erreur déplacement fichier {filename} vers dossier unaligned:", exc_info=True)
-            
-    if img_data_processed_adu is not None: del img_data_processed_adu 
+    if img_data_processed_adu is not None: del img_data_processed_adu
     gc.collect()
     return None, None, None, None
 
@@ -7451,15 +7588,38 @@ def run_hierarchical_mosaic(
     
     fits_file_paths = []
     # Scan des fichiers FITS dans le dossier d'entrée et ses sous-dossiers
-    for root_dir_iter, _, files_in_dir_iter in os.walk(input_folder):
+    for root_dir_iter, dirnames_iter, files_in_dir_iter in os.walk(input_folder):
+        # Exclure les dossiers interdits dès la descente
+        try:
+            dirnames_iter[:] = [
+                d
+                for d in dirnames_iter
+                if not is_path_excluded(Path(root_dir_iter) / d, EXCLUDED_DIRS)
+            ]
+        except Exception:
+            dirnames_iter[:] = [
+                d
+                for d in dirnames_iter
+                if UNALIGNED_DIRNAME
+                not in os.path.normpath(os.path.join(root_dir_iter, d)).split(os.sep)
+            ]
+
         # Assurer un ordre déterministe quelle que soit la plateforme/FS
         try:
             files_in_dir_iter = sorted(files_in_dir_iter, key=lambda s: s.lower())
         except Exception:
             files_in_dir_iter = list(files_in_dir_iter)
+
         for file_name_iter in files_in_dir_iter:
             if file_name_iter.lower().endswith((".fit", ".fits")):
-                fits_file_paths.append(os.path.join(root_dir_iter, file_name_iter))
+                full_path = os.path.join(root_dir_iter, file_name_iter)
+                try:
+                    if is_path_excluded(full_path, EXCLUDED_DIRS):
+                        continue
+                except Exception:
+                    if UNALIGNED_DIRNAME in os.path.normpath(full_path).split(os.sep):
+                        continue
+                fits_file_paths.append(full_path)
     # Tri global déterministe
     try:
         fits_file_paths.sort(key=lambda p: p.lower())
@@ -7763,13 +7923,23 @@ def run_hierarchical_mosaic(
                     for item in filtered_items
                     if isinstance(item, dict) and item.get("path")
                 ]
-                if new_paths:
-                    fits_file_paths = new_paths
-                    pcb(
-                        f"Phase 0: selection after filter = {len(fits_file_paths)} files",
-                        prog=None,
-                        lvl="INFO_DETAIL",
-                    )
+                filtered_paths: list[str] = []
+                for candidate_path in new_paths:
+                    try:
+                        if is_path_excluded(candidate_path, EXCLUDED_DIRS):
+                            continue
+                    except Exception:
+                        if UNALIGNED_DIRNAME in os.path.normpath(str(candidate_path)).split(os.sep):
+                            continue
+                    filtered_paths.append(candidate_path)
+
+                fits_file_paths = filtered_paths
+                pcb(
+                    f"Phase 0: selection after filter = {len(fits_file_paths)} files",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                )
+                if fits_file_paths:
                     try:
                         fits_file_paths.sort(key=lambda p: p.lower())
                     except Exception:
