@@ -1,46 +1,46 @@
 # zemosaic_align_stack.py
 """
-╔══════════════════════════════════════════════════════════════════════╗
-║ ZeMosaic / ZeSeestarStacker Project                                  ║
-║                                                                      ║
-║ Auteur  : Tinystork, seigneur des couteaux à beurre (aka Tristan Nauleau)  
-║ Partenaire : J.A.R.V.I.S. (/ˈdʒɑːrvɪs/) — Just a Rather Very Intelligent System  
-║              (aka ChatGPT, Grand Maître du ciselage de code)         ║
-║                                                                      ║
-║ Licence : GNU General Public License v3.0 (GPL-3.0)                  ║
-║                                                                      ║
-║ Description :                                                        ║
-║   Ce programme a été forgé à la lueur des pixels et de la caféine,   ║
-║   dans le but noble de transformer des nuages de photons en art      ║
-║   astronomique. Si vous l’utilisez, pensez à dire “merci”,           ║
-║   à lever les yeux vers le ciel, ou à citer Tinystork et J.A.R.V.I.S.║
-║   (le karma des développeurs en dépend).                             ║
-║                                                                      ║
-║ Avertissement :                                                      ║
-║   Aucune IA ni aucun couteau à beurre n’a été blessé durant le       ║
-║   développement de ce code.                                          ║
-╚══════════════════════════════════════════════════════════════════════╝
+ÔòöÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòù
+Ôòæ ZeMosaic / ZeSeestarStacker Project                                  Ôòæ
+Ôòæ                                                                      Ôòæ
+Ôòæ Auteur  : Tinystork, seigneur des couteaux ├á beurre (aka Tristan Nauleau)  
+Ôòæ Partenaire : J.A.R.V.I.S. (/╦êd╩Æ╔æ╦Érv╔¬s/) ÔÇö Just a Rather Very Intelligent System  
+Ôòæ              (aka ChatGPT, Grand Ma├«tre du ciselage de code)         Ôòæ
+Ôòæ                                                                      Ôòæ
+Ôòæ Licence : GNU General Public License v3.0 (GPL-3.0)                  Ôòæ
+Ôòæ                                                                      Ôòæ
+Ôòæ Description :                                                        Ôòæ
+Ôòæ   Ce programme a ├®t├® forg├® ├á la lueur des pixels et de la caf├®ine,   Ôòæ
+Ôòæ   dans le but noble de transformer des nuages de photons en art      Ôòæ
+Ôòæ   astronomique. Si vous lÔÇÖutilisez, pensez ├á dire ÔÇ£merciÔÇØ,           Ôòæ
+Ôòæ   ├á lever les yeux vers le ciel, ou ├á citer Tinystork et J.A.R.V.I.S.Ôòæ
+Ôòæ   (le karma des d├®veloppeurs en d├®pend).                             Ôòæ
+Ôòæ                                                                      Ôòæ
+Ôòæ Avertissement :                                                      Ôòæ
+Ôòæ   Aucune IA ni aucun couteau ├á beurre nÔÇÖa ├®t├® bless├® durant le       Ôòæ
+Ôòæ   d├®veloppement de ce code.                                          Ôòæ
+ÔòÜÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòØ
 
 
-╔══════════════════════════════════════════════════════════════════════╗
-║ ZeMosaic / ZeSeestarStacker Project                                  ║
-║                                                                      ║
-║ Author  : Tinystork, Lord of the Butter Knives (aka Tristan Nauleau) ║
-║ Partner : J.A.R.V.I.S. (/ˈdʒɑːrvɪs/) — Just a Rather Very Intelligent System  
-║           (aka ChatGPT, Grand Master of Code Chiseling)              ║
-║                                                                      ║
-║ License : GNU General Public License v3.0 (GPL-3.0)                  ║
-║                                                                      ║
-║ Description:                                                         ║
-║   This program was forged under the sacred light of pixels and       ║
-║   caffeine, with the noble intent of turning clouds of photons into  ║
-║   astronomical art. If you use it, please consider saying “thanks,”  ║
-║   gazing at the stars, or crediting Tinystork and J.A.R.V.I.S. —     ║
-║   developer karma depends on it.                                     ║
-║                                                                      ║
-║ Disclaimer:                                                          ║
-║   No AIs or butter knives were harmed in the making of this code.    ║
-╚══════════════════════════════════════════════════════════════════════╝
+ÔòöÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòù
+Ôòæ ZeMosaic / ZeSeestarStacker Project                                  Ôòæ
+Ôòæ                                                                      Ôòæ
+Ôòæ Author  : Tinystork, Lord of the Butter Knives (aka Tristan Nauleau) Ôòæ
+Ôòæ Partner : J.A.R.V.I.S. (/╦êd╩Æ╔æ╦Érv╔¬s/) ÔÇö Just a Rather Very Intelligent System  
+Ôòæ           (aka ChatGPT, Grand Master of Code Chiseling)              Ôòæ
+Ôòæ                                                                      Ôòæ
+Ôòæ License : GNU General Public License v3.0 (GPL-3.0)                  Ôòæ
+Ôòæ                                                                      Ôòæ
+Ôòæ Description:                                                         Ôòæ
+Ôòæ   This program was forged under the sacred light of pixels and       Ôòæ
+Ôòæ   caffeine, with the noble intent of turning clouds of photons into  Ôòæ
+Ôòæ   astronomical art. If you use it, please consider saying ÔÇ£thanks,ÔÇØ  Ôòæ
+Ôòæ   gazing at the stars, or crediting Tinystork and J.A.R.V.I.S. ÔÇö     Ôòæ
+Ôòæ   developer karma depends on it.                                     Ôòæ
+Ôòæ                                                                      Ôòæ
+Ôòæ Disclaimer:                                                          Ôòæ
+Ôòæ   No AIs or butter knives were harmed in the making of this code.    Ôòæ
+ÔòÜÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòÉÔòØ
 """
 
 
@@ -65,7 +65,7 @@ try:  # NumPy 2.x exposes _ArrayMemoryError here
 except Exception:  # pragma: no cover - fallback for older numpy
     _NumpyArrayMemoryError = MemoryError  # type: ignore[assignment]
 
-# dépendance Photutils
+# d├®pendance Photutils
 PHOTOUTILS_AVAILABLE = False
 DAOStarFinder, FITSFixedWarning, CircularAperture, aperture_photometry, SigmaClip, Background2D, MedianBackground, SourceCatalog = [None]*8 # type: ignore
 try:
@@ -83,40 +83,40 @@ try:
     warnings.filterwarnings('ignore', category=FITSFixedWarning)
     
     PHOTOUTILS_AVAILABLE = True
-    # print("INFO (zemosaic_align_stack): Photutils importé.")
+    # print("INFO (zemosaic_align_stack): Photutils import├®.")
 except ImportError:
-    print("AVERT (zemosaic_align_stack): Photutils non disponible. FWHM weighting limité.")
+    print("AVERT (zemosaic_align_stack): Photutils non disponible. FWHM weighting limit├®.")
 
-# --- Dépendance Astroalign ---
+# --- D├®pendance Astroalign ---
 ASTROALIGN_AVAILABLE = False
 astroalign_module = None 
 try:
     import astroalign as aa
     astroalign_module = aa
     ASTROALIGN_AVAILABLE = True
-    # print("INFO (zemosaic_align_stack): Astroalign importé.") # Log au démarrage du worker principal
+    # print("INFO (zemosaic_align_stack): Astroalign import├®.") # Log au d├®marrage du worker principal
 except ImportError:
-    print("ERREUR CRITIQUE (zemosaic_align_stack): Astroalign non installé. Alignement impossible.")
+    print("ERREUR CRITIQUE (zemosaic_align_stack): Astroalign non install├®. Alignement impossible.")
 
-# --- Dépendance Astropy (pour sigma_clipped_stats) ---
+# --- D├®pendance Astropy (pour sigma_clipped_stats) ---
 SIGMA_CLIP_AVAILABLE = False
 sigma_clipped_stats_func = None
 try:
     from astropy.stats import sigma_clipped_stats
     sigma_clipped_stats_func = sigma_clipped_stats
     SIGMA_CLIP_AVAILABLE = True
-    # print("INFO (zemosaic_align_stack): Astropy.stats.sigma_clipped_stats importé.")
+    # print("INFO (zemosaic_align_stack): Astropy.stats.sigma_clipped_stats import├®.")
 except ImportError:
-    print("AVERT (zemosaic_align_stack): Astropy.stats non disponible. Kappa-sigma stacking limité.")
+    print("AVERT (zemosaic_align_stack): Astropy.stats non disponible. Kappa-sigma stacking limit├®.")
 
-# --- Dépendance SciPy (pour Winsorize) ---
+# --- D├®pendance SciPy (pour Winsorize) ---
 SCIPY_AVAILABLE = False
 winsorize_func = None
 try:
     from scipy.stats.mstats import winsorize
     winsorize_func = winsorize
     SCIPY_AVAILABLE = True
-    # print("INFO (zemosaic_align_stack): Scipy.stats.mstats.winsorize importé.")
+    # print("INFO (zemosaic_align_stack): Scipy.stats.mstats.winsorize import├®.")
 except ImportError:
     print("AVERT (zemosaic_align_stack): Scipy non disponible. Winsorized Sigma Clip non fonctionnel.")
 
@@ -770,7 +770,7 @@ def _has_gpu_budget(estimated_bytes: int) -> bool:
     except Exception:
         return True
 
-# --- Import des méthodes de stack CPU provenant du projet Seestar ---
+# --- Import des m├®thodes de stack CPU provenant du projet Seestar ---
 cpu_stack_winsorized = None
 cpu_stack_kappa = None
 cpu_stack_linear = None
@@ -787,7 +787,7 @@ try:
 except Exception as e_import_stack:
     print(f"AVERT (zemosaic_align_stack): Optional import of external stack_methods failed: {e_import_stack}")
 
-# --- Implementations GPU simplifiées des méthodes de stack ---
+# --- Implementations GPU simplifi├®es des m├®thodes de stack ---
 def gpu_stack_winsorized(frames, *, kappa=3.0, winsor_limits=(0.05, 0.05), apply_rewinsor=True):
     """GPU Winsorized Sigma-Clip aligned with CPU logic.
 
@@ -908,11 +908,11 @@ def stack_winsorized_sigma_clip(
     """
     Wrapper calling GPU or CPU winsorized sigma clip, with robust GPU guards.
 
-    - La voie GPU ignore les `weights` (non supportés).
-    - Si la voie GPU échoue ou produit une sortie suspecte, fallback CPU.
-    - La voie CPU accepte `weights` en mot-clé si fournis.
+    - La voie GPU ignore les `weights` (non support├®s).
+    - Si la voie GPU ├®choue ou produit une sortie suspecte, fallback CPU.
+    - La voie CPU accepte `weights` en mot-cl├® si fournis.
     """
-    # --- validations légères d'entrée ---
+    # --- validations l├®g├¿res d'entr├®e ---
     if frames is None:
         raise ValueError("frames is None")
     import numpy as _np
@@ -930,7 +930,7 @@ def stack_winsorized_sigma_clip(
     else:
         # Accept either a generic 'use_gpu' flag or legacy 'use_gpu_phase5'
         if zconfig:
-            # Stacking should not be toggled by the Phase‑5 GPU option.
+            # Stacking should not be toggled by the PhaseÔÇæ5 GPU option.
             # Honor only explicit stacking flags or generic 'use_gpu'.
             use_gpu = bool(getattr(zconfig, 'stack_use_gpu',
                                    getattr(zconfig, 'use_gpu_stack',
@@ -1127,7 +1127,7 @@ def stack_winsorized_sigma_clip(
                 streaming_state=state,
             )
 
-            # Libérer les références intermédiaires au plus tôt
+            # Lib├®rer les r├®f├®rences interm├®diaires au plus t├┤t
             del chunk_arr, chunk
 
         stacked_stream, rejected_pct = state.finalize(weights_array_full is not None)
@@ -1184,7 +1184,7 @@ def stack_winsorized_sigma_clip(
             allowed_mb=float(allowed_mb),
         )
 
-    # --- GPU path (poids ignorés) ---
+    # --- GPU path (poids ignor├®s) ---
     if use_gpu and GPU_AVAILABLE and callable(globals().get("gpu_stack_winsorized", None)):
         try:
             if weights_array_full is not None or weight_method_in_use not in ("", "none") or manual_weights:
@@ -1206,13 +1206,13 @@ def stack_winsorized_sigma_clip(
                 _gpu_img = gpu_out
                 _gpu_rej = 0.0
             gpu_out = _np.asarray(_gpu_img, dtype=_np.float32)
-            # Sortie attendue: même champs spatiaux que frames_np sans l’axe N
+            # Sortie attendue: m├¬me champs spatiaux que frames_np sans lÔÇÖaxe N
             exp_shape = sample.shape  # (H,W) ou (H,W,C)
             if gpu_out.shape != exp_shape:
                 raise RuntimeError(f"GPU returned shape {gpu_out.shape}, expected {exp_shape}")
             if not _np.any(_np.isfinite(gpu_out)):
                 raise RuntimeError("GPU output has no finite values")
-            # tolérance: > 90% de pixels finis
+            # tol├®rance: > 90% de pixels finis
             finite_ratio = _np.isfinite(gpu_out).mean()
             if finite_ratio < 0.9:
                 raise RuntimeError(f"GPU output has too many NaN/Inf (finite_ratio={finite_ratio:.2%})")
@@ -1222,7 +1222,7 @@ def stack_winsorized_sigma_clip(
 
         except Exception as e:
             _internal_logger.warning(
-                f"GPU winsorized clip failed or looked invalid → fallback CPU: {type(e).__name__}: {e}",
+                f"GPU winsorized clip failed or looked invalid ÔåÆ fallback CPU: {type(e).__name__}: {e}",
                 exc_info=True
             )
 
@@ -1337,7 +1337,7 @@ def stack_kappa_sigma_clip(
     Honors a generic ``use_gpu`` flag on ``zconfig`` if present, otherwise
     falls back to the legacy ``use_gpu_phase5`` flag used by the GUI.
     """
-    # Do not let the Phase‑5 GPU flag affect stacking.
+    # Do not let the PhaseÔÇæ5 GPU flag affect stacking.
     use_gpu = (getattr(zconfig, 'stack_use_gpu',
                        getattr(zconfig, 'use_gpu_stack',
                                getattr(zconfig, 'use_gpu', False)))
@@ -1426,7 +1426,7 @@ def stack_linear_fit_clip(
     Honors a generic ``use_gpu`` flag on ``zconfig`` if present, otherwise
     falls back to the legacy ``use_gpu_phase5`` flag used by the GUI.
     """
-    # Do not let the Phase‑5 GPU flag affect stacking.
+    # Do not let the PhaseÔÇæ5 GPU flag affect stacking.
     use_gpu = (getattr(zconfig, 'stack_use_gpu',
                        getattr(zconfig, 'use_gpu_stack',
                                getattr(zconfig, 'use_gpu', False)))
@@ -1510,13 +1510,13 @@ def _calculate_robust_stats_for_linear_fit(image_data_2d_float32: np.ndarray,
                                            use_gpu: bool = False):
     """
     Calcule des statistiques robustes (deux points de percentiles) pour une image 2D (un canal).
-    Utilisé par la normalisation par ajustement linéaire pour estimer le fond de ciel et
-    un point légèrement au-dessus, tout en essayant d'éviter les étoiles brillantes.
+    Utilis├® par la normalisation par ajustement lin├®aire pour estimer le fond de ciel et
+    un point l├®g├¿rement au-dessus, tout en essayant d'├®viter les ├®toiles brillantes.
 
     Args:
         image_data_2d_float32 (np.ndarray): Image 2D (un canal), dtype float32.
-        low_percentile (float): Percentile inférieur (ex: 25.0 pour le fond de ciel).
-        high_percentile (float): Percentile supérieur (ex: 90.0 pour un point au-dessus du fond).
+        low_percentile (float): Percentile inf├®rieur (ex: 25.0 pour le fond de ciel).
+        high_percentile (float): Percentile sup├®rieur (ex: 90.0 pour un point au-dessus du fond).
         progress_callback (callable, optional): Fonction de callback pour les logs.
 
     Returns:
@@ -1531,18 +1531,18 @@ def _calculate_robust_stats_for_linear_fit(image_data_2d_float32: np.ndarray,
         _pcb("stathelper_error_invalid_input_for_stats", lvl="WARN",
              shape=image_data_2d_float32.shape if hasattr(image_data_2d_float32, 'shape') else 'N/A',
              ndim=image_data_2d_float32.ndim if hasattr(image_data_2d_float32, 'ndim') else 'N/A')
-        return 0.0, 1.0 # Fallback pour une entrée clairement incorrecte
+        return 0.0, 1.0 # Fallback pour une entr├®e clairement incorrecte
 
     if image_data_2d_float32.size == 0:
         _pcb("stathelper_error_empty_image_for_stats", lvl="WARN")
         return 0.0, 1.0
 
-    # Assurer que les données sont finies pour le calcul des percentiles
-    # np.nanpercentile gère déjà les NaNs, mais il est bon de savoir si tout est non-fini.
+    # Assurer que les donn├®es sont finies pour le calcul des percentiles
+    # np.nanpercentile g├¿re d├®j├á les NaNs, mais il est bon de savoir si tout est non-fini.
     finite_data = image_data_2d_float32[np.isfinite(image_data_2d_float32)]
     if finite_data.size == 0:
         _pcb("stathelper_warn_all_nan_or_inf_for_stats", lvl="WARN")
-        return 0.0, 1.0 # Pas de données valides pour calculer les percentiles
+        return 0.0, 1.0 # Pas de donn├®es valides pour calculer les percentiles
 
     try:
         # Prefer GPU percentiles when requested and available
@@ -1568,23 +1568,23 @@ def _calculate_robust_stats_for_linear_fit(image_data_2d_float32: np.ndarray,
 
     except Exception as e_perc:
         _pcb(f"stathelper_error_percentile_calc: {e_perc}", lvl="WARN")
-        # Fallback très simple si nanpercentile échoue pour une raison imprévue
+        # Fallback tr├¿s simple si nanpercentile ├®choue pour une raison impr├®vue
         # (normalement, ne devrait pas arriver si finite_data n'est pas vide)
-        # Utilise les min/max des données finies comme un pis-aller.
-        if finite_data.size > 0 : # Double check, bien que déjà fait avant
+        # Utilise les min/max des donn├®es finies comme un pis-aller.
+        if finite_data.size > 0 : # Double check, bien que d├®j├á fait avant
              stat_low = float(np.min(finite_data))
              stat_high = float(np.max(finite_data))
              _pcb(f"stathelper_warn_percentile_exception_fallback_minmax: low={stat_low:.3g}, high={stat_high:.3g}", lvl="WARN")
-        else: # Ne devrait jamais être atteint si la logique précédente est correcte
+        else: # Ne devrait jamais ├¬tre atteint si la logique pr├®c├®dente est correcte
             return 0.0, 1.0
 
 
-    # Gérer le cas où l'image est (presque) plate
-    if abs(stat_high - stat_low) < 1e-5: # 1e-5 est un seuil arbitraire, pourrait être ajusté
-        _pcb(f"stathelper_warn_stats_nearly_equal: low={stat_low:.3g}, high={stat_high:.3g}. L'image est peut-être plate ou a peu de dynamique dans les percentiles choisis.", lvl="DEBUG_DETAIL")
-        # Si les stats sont égales, cela signifie que la plage entre low_percentile et high_percentile est très étroite.
-        # Cela peut arriver avec des images avec peu de signal ou très bruitées où les percentiles tombent au même endroit.
-        # On retourne quand même ces valeurs, la logique appelante devra gérer cela (ex: a = 1, b = offset).
+    # G├®rer le cas o├╣ l'image est (presque) plate
+    if abs(stat_high - stat_low) < 1e-5: # 1e-5 est un seuil arbitraire, pourrait ├¬tre ajust├®
+        _pcb(f"stathelper_warn_stats_nearly_equal: low={stat_low:.3g}, high={stat_high:.3g}. L'image est peut-├¬tre plate ou a peu de dynamique dans les percentiles choisis.", lvl="DEBUG_DETAIL")
+        # Si les stats sont ├®gales, cela signifie que la plage entre low_percentile et high_percentile est tr├¿s ├®troite.
+        # Cela peut arriver avec des images avec peu de signal ou tr├¿s bruit├®es o├╣ les percentiles tombent au m├¬me endroit.
+        # On retourne quand m├¬me ces valeurs, la logique appelante devra g├®rer cela (ex: a = 1, b = offset).
 
     return stat_low, stat_high
 
@@ -1597,8 +1597,8 @@ def align_images_in_group(image_data_list: list,
                           propagate_mask: bool = False,
                           progress_callback: callable = None) -> tuple[list, list[int]]:
     """
-    Aligne une liste d'images (données NumPy HWC, float32, ADU) sur une image de référence
-    de ce même groupe en utilisant astroalign.
+    Aligne une liste d'images (donn├®es NumPy HWC, float32, ADU) sur une image de r├®f├®rence
+    de ce m├¬me groupe en utilisant astroalign.
     """
     # Define a local alias for the callback
     _pcb = lambda msg_key, lvl="INFO_DETAIL", **kwargs: \
@@ -1710,48 +1710,44 @@ def align_images_in_group(image_data_list: list,
         return empty, list(range(len(empty)))
     
     if reference_image_adu.dtype != np.float32:
-        _pcb(f"AlignGroup: Image de référence (index {reference_image_index}) convertie en float32.", lvl="DEBUG_DETAIL")
+        _pcb(f"AlignGroup: Image de r├®f├®rence (index {reference_image_index}) convertie en float32.", lvl="DEBUG_DETAIL")
         reference_image_adu = reference_image_adu.astype(np.float32)
 
-    _pcb(f"AlignGroup: Alignement intra-tuile sur réf. idx {reference_image_index} (shape {reference_image_adu.shape}).", lvl="DEBUG")
+    _pcb(f"AlignGroup: Alignement intra-tuile sur r├®f. idx {reference_image_index} (shape {reference_image_adu.shape}).", lvl="DEBUG")
     aligned_images = [None] * len(image_data_list)
 
     for i, source_image_adu_orig in enumerate(image_data_list):
         if source_image_adu_orig is None:
-            _pcb(f"AlignGroup: Image source {i} est None, ignorée.", lvl="WARN")
+            _pcb(f"AlignGroup: Image source {i} est None, ignor├®e.", lvl="WARN")
             continue
 
         source_image_adu = source_image_adu_orig.astype(np.float32, copy=False) 
 
         if i == reference_image_index:
             aligned_images[i] = reference_image_adu.copy() 
-            _pcb(f"AlignGroup: Image {i} est la référence, copiée.", lvl="DEBUG_DETAIL")
+            _pcb(f"AlignGroup: Image {i} est la r├®f├®rence, copi├®e.", lvl="DEBUG_DETAIL")
             continue
 
-        _pcb(f"AlignGroup: Alignement image {i} (shape {source_image_adu.shape}) sur référence...", lvl="DEBUG_DETAIL")
+        _pcb(f"AlignGroup: Alignement image {i} (shape {source_image_adu.shape}) sur r├®f├®rence...", lvl="DEBUG_DETAIL")
         try:
-            # 1) Pré-alignement robuste par corrélation de phase (translation entière)
-            prealign_fft_img = None
+            # Try GPU FFT phase correlation first for robust global translation
             try_fft = True
             if try_fft:
                 src_lum = (0.299 * source_image_adu[..., 0] + 0.587 * source_image_adu[..., 1] + 0.114 * source_image_adu[..., 2]).astype(np.float32) if (source_image_adu.ndim == 3 and source_image_adu.shape[-1] == 3) else source_image_adu
-                ref_lum = (0.299 * reference_image_adu[..., 0] + 0.587 * reference_image_adu[..., 1] + 0.114 * reference_image_adu[..., 2]).astype(np.float32) if (reference_image_adu.ndim == 3 && reference_image_adu.shape[-1] == 3) else reference_image_adu
+                ref_lum = (0.299 * reference_image_adu[..., 0] + 0.587 * reference_image_adu[..., 1] + 0.114 * reference_image_adu[..., 2]).astype(np.float32) if (reference_image_adu.ndim == 3 and reference_image_adu.shape[-1] == 3) else reference_image_adu
                 dy, dx, conf = _fft_phase_shift(src_lum, ref_lum)
-                if abs(dy) + abs(dx) > 0 and conf >= 3.0:  # heuristique de confiance
-                    prealign_fft_img = _apply_integer_shift_hw_or_hwc(source_image_adu, dy, dx)
-                    _pcb(f"AlignGroup: FFT shift appliqué (dy={dy}, dx={dx}, conf={conf:.2f}).", lvl="DEBUG_DETAIL")
-
-            # 2) Affinage par astroalign (rotation/affine). Toujours tenter pour corriger la rotation.
-            # Choisir la source pour astroalign: pré-alignée si dispo, sinon brute
-            src_for_aa_base = prealign_fft_img if prealign_fft_img is not None else source_image_adu
-
-            # Garantir des buffers writables/contigus pour astroalign afin d'éviter
+                if abs(dy) + abs(dx) > 0 and conf >= 3.0:  # heuristic confidence
+                    aligned_images[i] = _apply_integer_shift_hw_or_hwc(source_image_adu, dy, dx)
+                    _pcb(f"AlignGroup: FFT shift applied (dy={dy}, dx={dx}, conf={conf:.2f}).", lvl="DEBUG_DETAIL")
+                    continue
+            # Fall back to astroalign for fine/affine alignment
+            # Garantir des buffers writables/contigus pour astroalign afin d'├®viter
             # "ValueError: buffer source array is read-only" avec des memmaps read-only
             src_for_aa = (
-                src_for_aa_base if (getattr(src_for_aa_base, 'flags', None)
-                                     and src_for_aa_base.flags.writeable
-                                     and src_for_aa_base.flags.c_contiguous)
-                else np.array(src_for_aa_base, dtype=np.float32, copy=True, order='C')
+                source_image_adu if (getattr(source_image_adu, 'flags', None)
+                                     and source_image_adu.flags.writeable
+                                     and source_image_adu.flags.c_contiguous)
+                else np.array(source_image_adu, dtype=np.float32, copy=True, order='C')
             )
             ref_for_aa = (
                 reference_image_adu if (getattr(reference_image_adu, 'flags', None)
@@ -1768,33 +1764,16 @@ def align_images_in_group(image_data_list: list,
                 if aligned_image_output.shape != reference_image_adu.shape:
                     _pcb("aligngroup_warn_shape_mismatch_after_align", lvl="WARN", img_idx=i, 
                               aligned_shape=aligned_image_output.shape, ref_shape=reference_image_adu.shape)
-                    # Si astroalign retourne une forme non conforme mais FFT a fonctionné, utiliser FFT
-                    if prealign_fft_img is not None and prealign_fft_img.shape == reference_image_adu.shape:
-                        aligned_images[i] = prealign_fft_img.astype(np.float32)
-                        _pcb("AlignGroup: Fallback FFT-only après mismatch de forme.", lvl="WARN")
-                    else:
-                        aligned_images[i] = None
+                    aligned_images[i] = None
                 else:
                     aligned_images[i] = aligned_image_output.astype(np.float32)
-                    _pcb(f"AlignGroup: Image {i} alignée (affine).", lvl="DEBUG_DETAIL")
+                    _pcb(f"AlignGroup: Image {i} align├®e.", lvl="DEBUG_DETAIL")
             else:
                 _pcb("aligngroup_warn_register_returned_none", lvl="WARN", img_idx=i)
-                if prealign_fft_img is not None and prealign_fft_img.shape == reference_image_adu.shape:
-                    aligned_images[i] = prealign_fft_img.astype(np.float32)
-                    _pcb("AlignGroup: Fallback FFT-only (astroalign None).", lvl="WARN")
-                else:
-                    aligned_images[i] = None
+                aligned_images[i] = None
         except astroalign_module.MaxIterError:
             _pcb("aligngroup_warn_max_iter_error", lvl="WARN", img_idx=i)
-            # En cas d'échec astroalign, repli sur FFT si disponible
-            try:
-                if 'prealign_fft_img' in locals() and prealign_fft_img is not None and prealign_fft_img.shape == reference_image_adu.shape:
-                    aligned_images[i] = prealign_fft_img.astype(np.float32)
-                    _pcb("AlignGroup: Fallback FFT-only (MaxIterError).", lvl="WARN")
-                else:
-                    aligned_images[i] = None
-            except Exception:
-                aligned_images[i] = None
+            aligned_images[i] = None
         except ValueError as ve:
             _pcb("aligngroup_warn_value_error", lvl="WARN", img_idx=i, error=str(ve))
             aligned_images[i] = None
@@ -1833,9 +1812,9 @@ def _normalize_images_linear_fit(image_list_hwc_float32: list[np.ndarray],
         ref_channel_2d = ref_image_hwc_float32[..., c_idx_ref] if is_color else ref_image_hwc_float32
         ref_low, ref_high = _calculate_robust_stats_for_linear_fit(ref_channel_2d, low_percentile, high_percentile, progress_callback, use_gpu=use_gpu)
         ref_stats_per_channel.append((ref_low, ref_high))
-        _pcb(f"NormLinFit: Réf. Canal {c_idx_ref}: StatLow={ref_low:.3g}, StatHigh={ref_high:.3g}", lvl="DEBUG_DETAIL")
+        _pcb(f"NormLinFit: R├®f. Canal {c_idx_ref}: StatLow={ref_low:.3g}, StatHigh={ref_high:.3g}", lvl="DEBUG_DETAIL")
         if abs(ref_high - ref_low) < 1e-5:
-             _pcb(f"NormLinFit: AVERT Réf. Canal {c_idx_ref} est (presque) plat.", lvl="WARN")
+             _pcb(f"NormLinFit: AVERT R├®f. Canal {c_idx_ref} est (presque) plat.", lvl="WARN")
 
     for i, src_image_hwc_orig_float32 in enumerate(image_list_hwc_float32):
         if src_image_hwc_orig_float32 is None: continue
@@ -1848,7 +1827,7 @@ def _normalize_images_linear_fit(image_list_hwc_float32: list[np.ndarray],
         else:
             src_image_hwc_float32 = src_image_hwc_float32.copy()
         if src_image_hwc_float32.shape != ref_image_hwc_float32.shape:
-            _pcb(f"NormLinFit: AVERT Img {i} shape {src_image_hwc_float32.shape} != réf {ref_image_hwc_float32.shape}. Ignorée.", lvl="WARN")
+            _pcb(f"NormLinFit: AVERT Img {i} shape {src_image_hwc_float32.shape} != r├®f {ref_image_hwc_float32.shape}. Ignor├®e.", lvl="WARN")
             continue
         for c_idx_src in range(num_channels):
             src_channel_2d = src_image_hwc_float32[..., c_idx_src] if is_color else src_image_hwc_float32
@@ -1881,9 +1860,9 @@ def _normalize_images_sky_mean(image_list: list[np.ndarray | None],
                                progress_callback: callable = None,
                                use_gpu: bool = False) -> list[np.ndarray | None]:
     """
-    Normalise une liste d'images en ajustant leur fond de ciel moyen (estimé par percentile)
-    pour correspondre à celui de l'image de référence.
-    Opère sur la luminance pour les images couleur.
+    Normalise une liste d'images en ajustant leur fond de ciel moyen (estim├® par percentile)
+    pour correspondre ├á celui de l'image de r├®f├®rence.
+    Op├¿re sur la luminance pour les images couleur.
     """
     _pcb = lambda msg_key, lvl="INFO_DETAIL", **kwargs: \
         progress_callback(msg_key, None, lvl, **kwargs) if progress_callback else _internal_logger.debug(f"PCB_FALLBACK_{lvl}: {msg_key} {kwargs}")
@@ -1894,19 +1873,19 @@ def _normalize_images_sky_mean(image_list: list[np.ndarray | None],
     
     if not (0 <= reference_index < len(image_list) and image_list[reference_index] is not None):
         _pcb("norm_skymean_error_invalid_ref", lvl="ERROR", ref_idx=reference_index)
-        # Retourner une copie des images originales si la référence est invalide
+        # Retourner une copie des images originales si la r├®f├®rence est invalide
         return [img.copy() if img is not None else None for img in image_list]
 
-    _pcb(f"NormSkyMean: Début normalisation par fond de ciel (percentile {sky_percentile}%) sur réf. idx {reference_index}.", lvl="DEBUG")
+    _pcb(f"NormSkyMean: D├®but normalisation par fond de ciel (percentile {sky_percentile}%) sur r├®f. idx {reference_index}.", lvl="DEBUG")
     
     ref_image_adu = image_list[reference_index]
-    # S'assurer que l'image de référence est en float32 pour les calculs
+    # S'assurer que l'image de r├®f├®rence est en float32 pour les calculs
     if ref_image_adu.dtype != np.float32:
         ref_image_adu_float = ref_image_adu.astype(np.float32, copy=True)
     else:
-        ref_image_adu_float = ref_image_adu # Pas besoin de copier si déjà float32 et on ne le modifie pas directement
+        ref_image_adu_float = ref_image_adu # Pas besoin de copier si d├®j├á float32 et on ne le modifie pas directement
 
-    # --- Calculer le fond de ciel de référence ---
+    # --- Calculer le fond de ciel de r├®f├®rence ---
     ref_sky_level = None
     target_data_for_ref_sky = None
     if ref_image_adu_float.ndim == 3 and ref_image_adu_float.shape[-1] == 3: # Couleur HWC
@@ -1919,7 +1898,7 @@ def _normalize_images_sky_mean(image_list: list[np.ndarray | None],
     
     if target_data_for_ref_sky is not None and target_data_for_ref_sky.size > 0:
         try:
-            # Utiliser nanpercentile pour être robuste aux NaNs potentiels
+            # Utiliser nanpercentile pour ├¬tre robuste aux NaNs potentiels
             if use_gpu and GPU_AVAILABLE:
                 try:
                     ref_sky_level = float(
@@ -1931,17 +1910,17 @@ def _normalize_images_sky_mean(image_list: list[np.ndarray | None],
                     )
             else:
                 ref_sky_level = np.nanpercentile(target_data_for_ref_sky, sky_percentile)
-            _pcb(f"NormSkyMean: Fond de ciel de référence (img idx {reference_index}) estimé à {ref_sky_level:.3g}", lvl="DEBUG_DETAIL")
+            _pcb(f"NormSkyMean: Fond de ciel de r├®f├®rence (img idx {reference_index}) estim├® ├á {ref_sky_level:.3g}", lvl="DEBUG_DETAIL")
         except Exception as e_perc_ref:
-            _pcb(f"NormSkyMean: Erreur calcul percentile réf: {e_perc_ref}", lvl="WARN")
-            # Si échec, on ne peut pas normaliser, retourner les images telles quelles (ou des copies)
+            _pcb(f"NormSkyMean: Erreur calcul percentile r├®f: {e_perc_ref}", lvl="WARN")
+            # Si ├®chec, on ne peut pas normaliser, retourner les images telles quelles (ou des copies)
             return [img.copy() if img is not None else None for img in image_list]
     else:
-        _pcb("NormSkyMean: Impossible de déterminer les données pour le fond de ciel de référence.", lvl="WARN")
+        _pcb("NormSkyMean: Impossible de d├®terminer les donn├®es pour le fond de ciel de r├®f├®rence.", lvl="WARN")
         return [img.copy() if img is not None else None for img in image_list]
 
     if ref_sky_level is None or not np.isfinite(ref_sky_level):
-        _pcb(f"NormSkyMean: Fond de ciel de référence invalide ({ref_sky_level}). Normalisation annulée.", lvl="ERROR")
+        _pcb(f"NormSkyMean: Fond de ciel de r├®f├®rence invalide ({ref_sky_level}). Normalisation annul├®e.", lvl="ERROR")
         return [img.copy() if img is not None else None for img in image_list]
 
     # --- Normaliser chaque image ---
@@ -1958,8 +1937,8 @@ def _normalize_images_sky_mean(image_list: list[np.ndarray | None],
             img_to_normalize_float = current_image_adu.copy() # Toujours copier pour modifier
 
         if i == reference_index:
-            normalized_image_list[i] = img_to_normalize_float # C'est déjà la référence (ou sa copie float32)
-            _pcb(f"NormSkyMean: Image {i} est la référence, copiée.", lvl="DEBUG_VERY_DETAIL")
+            normalized_image_list[i] = img_to_normalize_float # C'est d├®j├á la r├®f├®rence (ou sa copie float32)
+            _pcb(f"NormSkyMean: Image {i} est la r├®f├®rence, copi├®e.", lvl="DEBUG_VERY_DETAIL")
             continue
 
         target_data_for_current_sky = None
@@ -1987,20 +1966,20 @@ def _normalize_images_sky_mean(image_list: list[np.ndarray | None],
                 else:
                     current_sky_level = np.nanpercentile(target_data_for_current_sky, sky_percentile)
             except Exception as e_perc_curr:
-                 _pcb(f"NormSkyMean: Erreur calcul percentile image {i}: {e_perc_curr}. Image non normalisée.", lvl="WARN")
-                 normalized_image_list[i] = img_to_normalize_float # Retourner la copie non modifiée
+                 _pcb(f"NormSkyMean: Erreur calcul percentile image {i}: {e_perc_curr}. Image non normalis├®e.", lvl="WARN")
+                 normalized_image_list[i] = img_to_normalize_float # Retourner la copie non modifi├®e
                  continue
         
         if current_sky_level is not None and np.isfinite(current_sky_level):
             offset = ref_sky_level - current_sky_level
-            img_to_normalize_float += offset # Appliquer l'offset à tous les canaux si couleur, ou à l'image si mono
+            img_to_normalize_float += offset # Appliquer l'offset ├á tous les canaux si couleur, ou ├á l'image si mono
             normalized_image_list[i] = img_to_normalize_float
-            _pcb(f"NormSkyMean: Image {i}, fond_ciel={current_sky_level:.3g}, offset_appliqué={offset:.3g}", lvl="DEBUG_VERY_DETAIL")
+            _pcb(f"NormSkyMean: Image {i}, fond_ciel={current_sky_level:.3g}, offset_appliqu├®={offset:.3g}", lvl="DEBUG_VERY_DETAIL")
         else:
-            _pcb(f"NormSkyMean: Fond de ciel invalide pour image {i} ({current_sky_level}). Image non normalisée.", lvl="WARN")
-            normalized_image_list[i] = img_to_normalize_float # Retourner la copie non modifiée
+            _pcb(f"NormSkyMean: Fond de ciel invalide pour image {i} ({current_sky_level}). Image non normalis├®e.", lvl="WARN")
+            normalized_image_list[i] = img_to_normalize_float # Retourner la copie non modifi├®e
 
-    _pcb("NormSkyMean: Normalisation par fond de ciel terminée.", lvl="DEBUG")
+    _pcb("NormSkyMean: Normalisation par fond de ciel termin├®e.", lvl="DEBUG")
     return normalized_image_list
 
 
@@ -2010,7 +1989,7 @@ def _calculate_image_weights_noise_variance(
     progress_callback: callable = None,
 ) -> list[np.ndarray | None]:
     """
-    Calcule des poids qualité basés sur l'inverse de la variance du bruit.
+    Calcule des poids qualit├® bas├®s sur l'inverse de la variance du bruit.
     Retourne des poids compacts par image: scalaire pour mono ou vecteur 3 canaux pour couleur.
     """
     _pcb = lambda msg_key, lvl="INFO_DETAIL", **kwargs: \
@@ -2038,14 +2017,14 @@ def _calculate_image_weights_noise_variance(
     variances_per_image_channels = [] 
     valid_image_indices = []
 
-    _pcb(f"WeightNoiseVar: Début calcul des poids (par canal si couleur) pour {len(image_list)} images.", lvl="DEBUG")
+    _pcb(f"WeightNoiseVar: D├®but calcul des poids (par canal si couleur) pour {len(image_list)} images.", lvl="DEBUG")
 
     for i, image_data_adu in enumerate(image_list):
         if image_data_adu is None:
-            continue # Sera géré à la fin
+            continue # Sera g├®r├® ├á la fin
         
         if image_data_adu.size == 0:
-            _pcb(f"WeightNoiseVar: Image {i} est vide, poids non calculé pour celle-ci.", lvl="WARN")
+            _pcb(f"WeightNoiseVar: Image {i} est vide, poids non calcul├® pour celle-ci.", lvl="WARN")
             continue
 
         img_for_stats = image_data_adu
@@ -2065,11 +2044,11 @@ def _calculate_image_weights_noise_variance(
                     current_image_channel_variances.append(np.inf) # Poids sera quasi nul
                     continue
                 try:
-                    # Utiliser sigma_lower, sigma_upper pour un écrêtage plus robuste
+                    # Utiliser sigma_lower, sigma_upper pour un ├®cr├¬tage plus robuste
                     _, _, stddev_ch = sigma_clipped_stats_func(
                         channel_data, sigma_lower=3.0, sigma_upper=3.0, maxiters=5
                     )
-                    if stddev_ch is not None and np.isfinite(stddev_ch) and stddev_ch > 1e-9: # 1e-9 pour éviter variance nulle
+                    if stddev_ch is not None and np.isfinite(stddev_ch) and stddev_ch > 1e-9: # 1e-9 pour ├®viter variance nulle
                         current_image_channel_variances.append(stddev_ch**2)
                     else:
                         _pcb(f"WeightNoiseVar: Image {i}, Canal {c_idx}, stddev invalide ({stddev_ch}). Variance Inf.", lvl="WARN")
@@ -2097,14 +2076,14 @@ def _calculate_image_weights_noise_variance(
                     _pcb(f"WeightNoiseVar: Erreur stats image monochrome {i}: {e_stats_mono}", lvl="WARN")
                     current_image_channel_variances.append(np.inf)
         else:
-            _pcb(f"WeightNoiseVar: Image {i} a une forme non supportée ({img_for_stats.shape}).", lvl="WARN")
-            continue # Passe à l'image suivante
+            _pcb(f"WeightNoiseVar: Image {i} a une forme non support├®e ({img_for_stats.shape}).", lvl="WARN")
+            continue # Passe ├á l'image suivante
         
-        # Si on a réussi à calculer des variances pour les canaux de cette image
+        # Si on a r├®ussi ├á calculer des variances pour les canaux de cette image
         if len(current_image_channel_variances) == num_channels_in_image and num_channels_in_image > 0:
             variances_per_image_channels.append(current_image_channel_variances)
             valid_image_indices.append(i)
-        elif num_channels_in_image > 0 : # Si on s'attendait à des canaux mais on n'a pas toutes les variances
+        elif num_channels_in_image > 0 : # Si on s'attendait ├á des canaux mais on n'a pas toutes les variances
              _pcb(f"WeightNoiseVar: N'a pas pu calculer toutes les variances de canal pour l'image {i}.", lvl="WARN")
 
 
@@ -2115,13 +2094,13 @@ def _calculate_image_weights_noise_variance(
     all_finite_variances = []
     for var_list_for_img in variances_per_image_channels:
         for var_val in var_list_for_img:
-            if np.isfinite(var_val) and var_val > 1e-18: # Seuil très bas pour variance valide
+            if np.isfinite(var_val) and var_val > 1e-18: # Seuil tr├¿s bas pour variance valide
                 all_finite_variances.append(var_val)
     
     min_overall_variance = np.min(all_finite_variances) if all_finite_variances else 1e-9
     if min_overall_variance <= 0: min_overall_variance = 1e-9 # Assurer qu'elle est positive
 
-    _pcb(f"WeightNoiseVar: Variance minimale globale trouvée: {min_overall_variance:.3g}", lvl="DEBUG_DETAIL")
+    _pcb(f"WeightNoiseVar: Variance minimale globale trouv├®e: {min_overall_variance:.3g}", lvl="DEBUG_DETAIL")
 
     output_weights_list = [None] * len(image_list)
 
@@ -2132,7 +2111,7 @@ def _calculate_image_weights_noise_variance(
 
         variances_for_current_img = variances_per_image_channels[idx_in_valid_arrays]
         
-        # Créer un poids compact pour cette image: (3,) pour couleur ou scalaire pour mono
+        # Cr├®er un poids compact pour cette image: (3,) pour couleur ou scalaire pour mono
         if original_img_data_shape_ref.ndim == 3 and len(variances_for_current_img) == original_img_data_shape_ref.shape[-1]:
             ch_weights = []
             for c_idx in range(original_img_data_shape_ref.shape[-1]):
@@ -2150,7 +2129,7 @@ def _calculate_image_weights_noise_variance(
                 calculated_weight = 1e-6
             output_weights_list[original_image_idx] = np.asarray(calculated_weight, dtype=np.float32)
 
-    # Pour les images qui n'ont pas pu être traitées (initialement None, ou erreur en cours de route)
+    # Pour les images qui n'ont pas pu ├¬tre trait├®es (initialement None, ou erreur en cours de route)
     for i in range(len(image_list)):
         if output_weights_list[i] is None and image_list[i] is not None:
             _pcb("WeightNoiseVar: Image sans poids valide, fallback sur 1.0.", lvl="DEBUG_DETAIL")
@@ -2160,21 +2139,21 @@ def _calculate_image_weights_noise_variance(
                 output_weights_list[i] = np.asarray(1.0, dtype=np.float32)
             
     num_actual_weights = sum(1 for w_arr in output_weights_list if w_arr is not None)
-    _pcb(f"WeightNoiseVar: Calcul des poids (par canal si couleur) terminé. {num_actual_weights}/{len(image_list)} tableaux de poids retournés.", lvl="DEBUG")
+    _pcb(f"WeightNoiseVar: Calcul des poids (par canal si couleur) termin├®. {num_actual_weights}/{len(image_list)} tableaux de poids retourn├®s.", lvl="DEBUG")
     return output_weights_list
 
 
 
 def _estimate_initial_fwhm(data_2d: np.ndarray, progress_callback: callable = None) -> float:
     """
-    Tente d'estimer une FWHM initiale à partir des données 2D.
-    Utilise la segmentation et les propriétés des sources.
+    Tente d'estimer une FWHM initiale ├á partir des donn├®es 2D.
+    Utilise la segmentation et les propri├®t├®s des sources.
     """
     _pcb_est = lambda msg_key, lvl="INFO_DETAIL", **kwargs: \
         progress_callback(msg_key, None, lvl, **kwargs) if progress_callback else _internal_logger.debug(f"PCB_FALLBACK_{lvl}: {msg_key} {kwargs}")
 
     default_fwhm = 4.0 # Valeur de secours
-    if data_2d.size < 1000: # Pas assez de données pour une estimation fiable
+    if data_2d.size < 1000: # Pas assez de donn├®es pour une estimation fiable
         _pcb_est("fwhm_est_data_insufficient", lvl="DEBUG_DETAIL", returned_fwhm=default_fwhm)
         return default_fwhm
 
@@ -2204,12 +2183,12 @@ def _estimate_initial_fwhm(data_2d: np.ndarray, progress_callback: callable = No
         for props in cat:
             try:
                 # equivalent_fwhm est une bonne estimation si la source est ~gaussienne
-                # On filtre sur l'ellipticité pour ne garder que les sources rondes
+                # On filtre sur l'ellipticit├® pour ne garder que les sources rondes
                 if props.eccentricity is not None and props.eccentricity < 0.5 and \
                    props.equivalent_fwhm is not None and np.isfinite(props.equivalent_fwhm) and \
-                   1.0 < props.equivalent_fwhm < 20.0: # FWHM doit être dans une plage plausible
+                   1.0 < props.equivalent_fwhm < 20.0: # FWHM doit ├¬tre dans une plage plausible
                     fwhms_from_cat.append(props.equivalent_fwhm.value)
-            except AttributeError: # Certaines propriétés peuvent manquer
+            except AttributeError: # Certaines propri├®t├®s peuvent manquer
                 continue
             if len(fwhms_from_cat) >= 100: # Limiter le nombre de sources pour l'estimation
                 break
@@ -2236,7 +2215,7 @@ def _calculate_image_weights_noise_fwhm(
     progress_callback: callable = None,
 ) -> list[np.ndarray | None]:
     """
-    Calcule des poids basés sur l'inverse de la FWHM. Retourne des poids compacts
+    Calcule des poids bas├®s sur l'inverse de la FWHM. Retourne des poids compacts
     par image: scalaire pour mono ou vecteur 3 canaux pour couleur.
     """
     _pcb = lambda msg_key, lvl="INFO_DETAIL", **kwargs: \
@@ -2266,7 +2245,7 @@ def _calculate_image_weights_noise_fwhm(
     fwhm_values_per_image = [] 
     valid_image_indices_fwhm = []
 
-    _pcb(f"WeightFWHM: Début calcul des poids FWHM pour {len(image_list)} images.", lvl="DEBUG")
+    _pcb(f"WeightFWHM: D├®but calcul des poids FWHM pour {len(image_list)} images.", lvl="DEBUG")
 
     for i, image_data_adu in enumerate(image_list):
         if image_data_adu is None:
@@ -2298,13 +2277,13 @@ def _calculate_image_weights_noise_fwhm(
         
         try:
             estimated_initial_fwhm = _estimate_initial_fwhm(target_data_for_fwhm, progress_callback)
-            _pcb(f"WeightFWHM: Image {i}, FWHM initiale estimée pour détection: {estimated_initial_fwhm:.2f} px", lvl="DEBUG_DETAIL")
+            _pcb(f"WeightFWHM: Image {i}, FWHM initiale estim├®e pour d├®tection: {estimated_initial_fwhm:.2f} px", lvl="DEBUG_DETAIL")
 
             box_size_bg = min(target_data_for_fwhm.shape[0] // 8, target_data_for_fwhm.shape[1] // 8, 50)
             box_size_bg = max(box_size_bg, 16)
             
-            sigma_clip_bg_obj = SigmaClip(sigma=3.0) # Renommé pour éviter conflit
-            bkg_estimator_obj = MedianBackground()   # Renommé pour éviter conflit
+            sigma_clip_bg_obj = SigmaClip(sigma=3.0) # Renomm├® pour ├®viter conflit
+            bkg_estimator_obj = MedianBackground()   # Renomm├® pour ├®viter conflit
             
             if not np.any(np.isfinite(target_data_for_fwhm)):
                 _pcb("weight_fwhm_no_finite_data", lvl="WARN", img_idx=i)
@@ -2315,7 +2294,7 @@ def _calculate_image_weights_noise_fwhm(
                  _pcb("weight_fwhm_image_flat", lvl="DEBUG_DETAIL", img_idx=i, stddev=std_data_check)
                  fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
 
-            bkg_obj = None # Pour vérifier si bkg a été défini
+            bkg_obj = None # Pour v├®rifier si bkg a ├®t├® d├®fini
             try:
                 bkg_obj = Background2D(target_data_for_fwhm, (box_size_bg, box_size_bg), 
                                    filter_size=(3, 3), sigma_clip=sigma_clip_bg_obj, bkg_estimator=bkg_estimator_obj)
@@ -2348,7 +2327,7 @@ def _calculate_image_weights_noise_fwhm(
                 _pcb("weight_fwhm_not_enough_sources_daofind", lvl="DEBUG_DETAIL", img_idx=i, count=len(sources_table) if sources_table is not None else 0)
                 fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
 
-            # Utilisation de SourceCatalog pour les propriétés morphologiques
+            # Utilisation de SourceCatalog pour les propri├®t├®s morphologiques
             threshold_seg_val = 1.5 * (bkg_obj.background_rms if bkg_obj and hasattr(bkg_obj, 'background_rms') else np.nanstd(data_subtracted))
             if hasattr(threshold_seg_val, 'mean'): threshold_seg_val = np.abs(np.mean(threshold_seg_val))
             else: threshold_seg_val = np.abs(threshold_seg_val)
@@ -2359,9 +2338,9 @@ def _calculate_image_weights_noise_fwhm(
                 _pcb("weight_fwhm_segmentation_cat_failed", lvl="DEBUG_DETAIL", img_idx=i)
                 fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
             
-            # Filtrer les sources de DAOStarFinder avant de les passer à SourceCatalog
+            # Filtrer les sources de DAOStarFinder avant de les passer ├á SourceCatalog
             h_img_cat, w_img_cat = data_subtracted.shape
-            border_margin_cat = int(estimated_initial_fwhm * 2) # Marge basée sur FWHM
+            border_margin_cat = int(estimated_initial_fwhm * 2) # Marge bas├®e sur FWHM
             
             # Assurer que les colonnes existent avant de filtrer
             cols_to_check = ['xcentroid', 'ycentroid', 'flux', 'sharpness', 'roundness1', 'roundness2']
@@ -2388,10 +2367,10 @@ def _calculate_image_weights_noise_fwhm(
             filtered_sources_table.sort('flux', reverse=True)
             top_sources_table = filtered_sources_table[:100] # Limiter aux 100 plus brillantes
             
-            # Passer les positions des sources détectées par DAOStarFinder à SourceCatalog
+            # Passer les positions des sources d├®tect├®es par DAOStarFinder ├á SourceCatalog
             try:
                 cat_obj = SourceCatalog(data_subtracted, segm_map_cat, sources=top_sources_table)
-            except Exception as e_scat: # SourceCatalog peut échouer si segm_map_cat est incompatible avec sources
+            except Exception as e_scat: # SourceCatalog peut ├®chouer si segm_map_cat est incompatible avec sources
                  _pcb("weight_fwhm_sourcecatalog_init_error", lvl="WARN", img_idx=i, error=str(e_scat))
                  fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
 
@@ -2403,11 +2382,11 @@ def _calculate_image_weights_noise_fwhm(
             fwhms_this_image = []
             for source_props in cat_obj:
                 try:
-                    # equivalent_fwhm est disponible et généralement fiable pour les sources bien segmentées.
+                    # equivalent_fwhm est disponible et g├®n├®ralement fiable pour les sources bien segment├®es.
                     # On pourrait aussi utiliser (semimajor_axis_sigma + semiminor_axis_sigma) / 2 * gaussian_sigma_to_fwhm
-                    fwhm_val = source_props.equivalent_fwhm # C'est déjà une FWHM en pixels
+                    fwhm_val = source_props.equivalent_fwhm # C'est d├®j├á une FWHM en pixels
                     if fwhm_val is not None and np.isfinite(fwhm_val) and \
-                       0.8 < fwhm_val < (estimated_initial_fwhm * 2.5): # Doit être dans une plage raisonnable
+                       0.8 < fwhm_val < (estimated_initial_fwhm * 2.5): # Doit ├¬tre dans une plage raisonnable
                         fwhms_this_image.append(fwhm_val)
                 except AttributeError: continue
                 except Exception: continue
@@ -2417,7 +2396,7 @@ def _calculate_image_weights_noise_fwhm(
                 fwhm_values_per_image.append(np.inf); valid_image_indices_fwhm.append(i); continue
 
             median_fwhm_val = np.nanmedian(fwhms_this_image)
-            if np.isfinite(median_fwhm_val) and 0.7 < median_fwhm_val < 20.0: # FWHM doit être > ~0.7 pixel et < 20
+            if np.isfinite(median_fwhm_val) and 0.7 < median_fwhm_val < 20.0: # FWHM doit ├¬tre > ~0.7 pixel et < 20
                 fwhm_values_per_image.append(median_fwhm_val)
                 valid_image_indices_fwhm.append(i)
                 _pcb("weight_fwhm_success", lvl="DEBUG_DETAIL", img_idx=i, median_fwhm=median_fwhm_val, num_stars=len(fwhms_this_image))
@@ -2433,11 +2412,11 @@ def _calculate_image_weights_noise_fwhm(
 
     # --- Fin de la boucle sur les images ---
 
-    if not fwhm_values_per_image: # Si aucune FWHM n'a pu être calculée pour aucune image
+    if not fwhm_values_per_image: # Si aucune FWHM n'a pu ├¬tre calcul├®e pour aucune image
         _pcb("weight_fwhm_warn_no_fwhm_values_overall", lvl="WARN")
         return [np.ones_like(img, dtype=np.float32) if img is not None else None for img in image_list]
 
-    finite_fwhms_all = [f for f in fwhm_values_per_image if np.isfinite(f) and f > 0.1] # 0.1 seuil très bas
+    finite_fwhms_all = [f for f in fwhm_values_per_image if np.isfinite(f) and f > 0.1] # 0.1 seuil tr├¿s bas
     if not finite_fwhms_all:
         _pcb("weight_fwhm_warn_all_fwhm_are_infinite", lvl="WARN")
         return [np.ones_like(img, dtype=np.float32) if img is not None else None for img in image_list]
@@ -2450,11 +2429,11 @@ def _calculate_image_weights_noise_fwhm(
     final_calculated_weights_scalar_fwhm = {}
     for idx_in_valid_list, original_idx in enumerate(valid_image_indices_fwhm):
         fwhm_current_image = fwhm_values_per_image[idx_in_valid_list]
-        weight_val = 1e-6 # Poids par défaut très faible
+        weight_val = 1e-6 # Poids par d├®faut tr├¿s faible
         if np.isfinite(fwhm_current_image) and fwhm_current_image > 0.1:
             # Poids = (min_FWHM / FWHM_image) ^ N. Ici N=1.
-            # Cela donne un poids de 1 à la meilleure image, <1 aux autres.
-            # Si FWHM_image est plus petit que min_overall_valid_fwhm (ne devrait pas arriver), clamp à 1.
+            # Cela donne un poids de 1 ├á la meilleure image, <1 aux autres.
+            # Si FWHM_image est plus petit que min_overall_valid_fwhm (ne devrait pas arriver), clamp ├á 1.
             weight_val = min_overall_valid_fwhm / max(fwhm_current_image, min_overall_valid_fwhm)
         final_calculated_weights_scalar_fwhm[original_idx] = weight_val
         _pcb(f"WeightFWHM: Img idx_orig={original_idx}, FWHM={fwhm_current_image:.2f}, PoidsRelFinal={weight_val:.3f}", lvl="DEBUG_DETAIL")
@@ -2477,7 +2456,7 @@ def _calculate_image_weights_noise_fwhm(
                 output_weights_list_fwhm[i] = np.asarray(1.0, dtype=np.float32)
             
     num_actual_weights_fwhm = sum(1 for w_arr in output_weights_list_fwhm if w_arr is not None)
-    _pcb(f"WeightFWHM: Calcul des poids FWHM terminé. {num_actual_weights_fwhm}/{len(image_list)} tableaux de poids retournés.", lvl="DEBUG")
+    _pcb(f"WeightFWHM: Calcul des poids FWHM termin├®. {num_actual_weights_fwhm}/{len(image_list)} tableaux de poids retourn├®s.", lvl="DEBUG")
     return output_weights_list_fwhm
 
 
@@ -2739,30 +2718,30 @@ def _reject_outliers_winsorized_sigma_clip(
 ) -> tuple[np.ndarray | WinsorStreamingState, Optional[np.ndarray]]:
     """
     Rejette les outliers en utilisant un Winsorized Sigma Clip.
-    1. Winsorize les données le long de l'axe des images.
-    2. Calcule les statistiques sigma-clippées sur les données winsorisées.
-    3. Rejette les pixels des données *originales* basés sur ces statistiques.
+    1. Winsorize les donn├®es le long de l'axe des images.
+    2. Calcule les statistiques sigma-clipp├®es sur les donn├®es winsoris├®es.
+    3. Rejette les pixels des donn├®es *originales* bas├®s sur ces statistiques.
 
     Args:
-        stacked_array_NHDWC: Tableau des images empilées (N, H, W, C) ou (N, H, W).
-        winsor_limits_tuple: Tuple de fractions (0-0.5) pour écrêter en bas et en haut.
-        sigma_low: Nombre de sigmas pour le seuil inférieur de rejet.
-        sigma_high: Nombre de sigmas pour le seuil supérieur de rejet.
+        stacked_array_NHDWC: Tableau des images empil├®es (N, H, W, C) ou (N, H, W).
+        winsor_limits_tuple: Tuple de fractions (0-0.5) pour ├®cr├¬ter en bas et en haut.
+        sigma_low: Nombre de sigmas pour le seuil inf├®rieur de rejet.
+        sigma_high: Nombre de sigmas pour le seuil sup├®rieur de rejet.
         progress_callback: Fonction de callback pour les logs.
-        max_workers: Nombre maximum de travailleurs parallèles pour la winsorisation.
+        max_workers: Nombre maximum de travailleurs parall├¿les pour la winsorisation.
             Typiquement issu de ``run_cfg.winsor_worker_limit``.
-        apply_rewinsor: Si True, remplace les pixels rejetés par les valeurs winsorisées
-            ("rewinsorisation"). Sinon, les pixels rejetés restent NaN.
-        weights_chunk: Poids optionnels pour les images du bloc courant (alignés sur l'axe 0).
-        streaming_state: Accumulateur de streaming. Si fourni, la fonction agrège les
-            statistiques dans cet objet et retourne ``streaming_state`` en première valeur
+        apply_rewinsor: Si True, remplace les pixels rejet├®s par les valeurs winsoris├®es
+            ("rewinsorisation"). Sinon, les pixels rejet├®s restent NaN.
+        weights_chunk: Poids optionnels pour les images du bloc courant (align├®s sur l'axe 0).
+        streaming_state: Accumulateur de streaming. Si fourni, la fonction agr├¿ge les
+            statistiques dans cet objet et retourne ``streaming_state`` en premi├¿re valeur
             au lieu d'un tableau complet.
 
     Returns:
         tuple[np.ndarray | WinsorStreamingState, Optional[np.ndarray]]:
             - output_data_with_nans ou l'accumulateur de streaming si ``streaming_state`` est fourni.
-            - rejection_mask: Masque booléen (True où les pixels sont gardés) ou ``None`` si le masque complet
-              n'est pas construit pour réduire l'empreinte mémoire.
+            - rejection_mask: Masque bool├®en (True o├╣ les pixels sont gard├®s) ou ``None`` si le masque complet
+              n'est pas construit pour r├®duire l'empreinte m├®moire.
     """
     _pcb = lambda msg_key, lvl="INFO_DETAIL", **kwargs: \
         progress_callback(msg_key, None, lvl, **kwargs) if progress_callback else _internal_logger.debug(f"PCB_FALLBACK_{lvl}: {msg_key} {kwargs}")
@@ -2772,7 +2751,7 @@ def _reject_outliers_winsorized_sigma_clip(
         if not SCIPY_AVAILABLE or not winsorize_func: missing_deps.append("Scipy (winsorize)")
         if not SIGMA_CLIP_AVAILABLE or not sigma_clipped_stats_func: missing_deps.append("Astropy.stats (sigma_clipped_stats)")
         _pcb("reject_winsor_warn_deps_unavailable", lvl="WARN", missing=", ".join(missing_deps))
-        # Retourner les données originales sans rejet si les dépendances manquent
+        # Retourner les donn├®es originales sans rejet si les d├®pendances manquent
         data_view = stacked_array_NHDWC.astype(np.float32, copy=False)
         fallback_sum_chunk = np.nansum(data_view, axis=0, dtype=np.float64)
         fallback_count_chunk = np.isfinite(data_view).sum(axis=0, dtype=np.int64)
@@ -2786,16 +2765,16 @@ def _reject_outliers_winsorized_sigma_clip(
             return streaming_state, None
         return data_view, None
 
-    _pcb(f"RejWinsor: Début Rejet Winsorized Sigma Clip. Limits={winsor_limits_tuple}, SigmaLow={sigma_low}, SigmaHigh={sigma_high}.", lvl="DEBUG",
+    _pcb(f"RejWinsor: D├®but Rejet Winsorized Sigma Clip. Limits={winsor_limits_tuple}, SigmaLow={sigma_low}, SigmaHigh={sigma_high}.", lvl="DEBUG",
          shape=stacked_array_NHDWC.shape)
 
-    # S'assurer que les limites de winsorisation sont valides (doit être déjà fait dans la GUI, mais double check)
+    # S'assurer que les limites de winsorisation sont valides (doit ├¬tre d├®j├á fait dans la GUI, mais double check)
     low_cut, high_cut = winsor_limits_tuple
     if not (0.0 <= low_cut < 0.5 and 0.0 <= high_cut < 0.5 and (low_cut + high_cut) < 1.0):
         _pcb("reject_winsor_error_invalid_limits", lvl="ERROR", limits=winsor_limits_tuple)
         return _finalize_result(output_data_with_nans)
 
-    # Copie des données originales pour y insérer les NaN pour les pixels rejetés
+    # Copie des donn├®es originales pour y ins├®rer les NaN pour les pixels rejet├®s
     output_data_with_nans = stacked_array_NHDWC.astype(np.float32, copy=False) # Travailler sur float32
     fallback_sum_chunk = np.nansum(output_data_with_nans, axis=0, dtype=np.float64)
     fallback_count_chunk = np.isfinite(output_data_with_nans).sum(axis=0, dtype=np.int64)
@@ -2815,7 +2794,7 @@ def _reject_outliers_winsorized_sigma_clip(
     is_color = stacked_array_NHDWC.ndim == 4 and stacked_array_NHDWC.shape[-1] == 3
     num_images_in_stack = stacked_array_NHDWC.shape[0]
 
-    if num_images_in_stack < 3: # Winsorize et sigma-clip ont besoin d'assez de données
+    if num_images_in_stack < 3: # Winsorize et sigma-clip ont besoin d'assez de donn├®es
         _pcb("reject_winsor_warn_not_enough_images", lvl="WARN", num_images=num_images_in_stack)
         return _finalize_result(output_data_with_nans)
 
@@ -2864,7 +2843,7 @@ def _reject_outliers_winsorized_sigma_clip(
 
                 total_rejected_pixels += rejected_in_channel
                 _pcb(
-                    f"    RejWinsor: Canal {c_idx}, {rejected_in_channel} pixels rejetés.",
+                    f"    RejWinsor: Canal {c_idx}, {rejected_in_channel} pixels rejet├®s.",
                     lvl="DEBUG_DETAIL",
                 )
                 time.sleep(0)
@@ -2915,12 +2894,12 @@ def _reject_outliers_winsorized_sigma_clip(
                     np.copyto(output_block, wins_block, where=np.isnan(output_block))
 
             total_rejected_pixels += num_rejected_mono
-            _pcb(f"  RejWinsor: Monochrome, {num_rejected_mono} pixels rejetés.", lvl="DEBUG_DETAIL")
+            _pcb(f"  RejWinsor: Monochrome, {num_rejected_mono} pixels rejet├®s.", lvl="DEBUG_DETAIL")
 
     except MemoryError as e_mem:
         _pcb("reject_winsor_error_memory", lvl="ERROR", error=str(e_mem))
         _internal_logger.error("MemoryError dans _reject_outliers_winsorized_sigma_clip", exc_info=True)
-        # En cas de MemoryError, retourner une vue float32 sans duplication pour éviter un double échec.
+        # En cas de MemoryError, retourner une vue float32 sans duplication pour ├®viter un double ├®chec.
         fallback_view = stacked_array_NHDWC.astype(np.float32, copy=False)
         return _finalize_result(fallback_view)
     except Exception as e_winsor:
@@ -2938,29 +2917,29 @@ def _reject_outliers_winsorized_sigma_clip(
 
 def _reject_outliers_linear_fit_clip(
     stacked_array_NHDWC: np.ndarray,
-    # Quels paramètres seraient nécessaires ?
-    # Probablement des seuils pour le rejet des résidus,
-    # peut-être des options pour le type de modèle à ajuster.
+    # Quels param├¿tres seraient n├®cessaires ?
+    # Probablement des seuils pour le rejet des r├®sidus,
+    # peut-├¬tre des options pour le type de mod├¿le ├á ajuster.
     # Pour l'instant, gardons-le simple.
-    # sigma_clip_low_resid: float = 3.0, # Exemple de paramètre
-    # sigma_clip_high_resid: float = 3.0, # Exemple de paramètre
+    # sigma_clip_low_resid: float = 3.0, # Exemple de param├¿tre
+    # sigma_clip_high_resid: float = 3.0, # Exemple de param├¿tre
     progress_callback: callable = None
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Rejette les outliers en utilisant un Linear Fit Clipping (PLACEHOLDER).
-    Cette méthode vise à modéliser et à soustraire les variations lentes (gradients)
-    entre les images et l'image de référence (ex: médiane du stack), puis à rejeter
-    les pixels qui s'écartent significativement de ce modèle.
+    Cette m├®thode vise ├á mod├®liser et ├á soustraire les variations lentes (gradients)
+    entre les images et l'image de r├®f├®rence (ex: m├®diane du stack), puis ├á rejeter
+    les pixels qui s'├®cartent significativement de ce mod├¿le.
 
     Args:
-        stacked_array_NHDWC: Tableau des images empilées (N, H, W, C) ou (N, H, W).
+        stacked_array_NHDWC: Tableau des images empil├®es (N, H, W, C) ou (N, H, W).
         progress_callback: Fonction de callback pour les logs.
-        // Ajouter d'autres paramètres au besoin.
+        // Ajouter d'autres param├¿tres au besoin.
 
     Returns:
         tuple[np.ndarray, np.ndarray]:
-            - output_data_with_nans ou réwinsorisé selon ``apply_rewinsor``.
-            - rejection_mask: Masque booléen (True où les pixels sont gardés).
+            - output_data_with_nans ou r├®winsoris├® selon ``apply_rewinsor``.
+            - rejection_mask: Masque bool├®en (True o├╣ les pixels sont gard├®s).
     """
     _pcb = lambda msg_key, lvl="INFO_DETAIL", **kwargs: \
         progress_callback(msg_key, None, lvl, **kwargs) if progress_callback else _internal_logger.debug(f"PCB_FALLBACK_{lvl}: {msg_key} {kwargs}")
@@ -2968,14 +2947,14 @@ def _reject_outliers_linear_fit_clip(
     _pcb("reject_linearfit_warn_not_implemented", lvl="WARN",
          shape=stacked_array_NHDWC.shape)
 
-    # Pour l'instant, cette fonction ne fait rien et retourne les données telles quelles.
-    # L'implémentation réelle serait complexe.
+    # Pour l'instant, cette fonction ne fait rien et retourne les donn├®es telles quelles.
+    # L'impl├®mentation r├®elle serait complexe.
     return stacked_array_NHDWC.copy(), np.ones_like(stacked_array_NHDWC, dtype=bool)
 
 
 # zemosaic_align_stack.py
 
-# ... (imports et autres fonctions restent les mêmes) ...
+# ... (imports et autres fonctions restent les m├¬mes) ...
 
 def stack_aligned_images(
     aligned_image_data_list: list[np.ndarray | None],
@@ -2996,9 +2975,9 @@ def stack_aligned_images(
     stack_metadata: dict | None = None,
 ) -> np.ndarray | None:
     """
-    Stacke une liste d'images alignées, appliquant normalisation, pondération (qualité + radiale),
+    Stacke une liste d'images align├®es, appliquant normalisation, pond├®ration (qualit├® + radiale),
     et rejet d'outliers optionnels. VERSION AVEC LOGS DE DEBUG INTENSIFS.
-    ``winsor_max_workers`` permet de paralléliser la phase de Winsorisation lors
+    ``winsor_max_workers`` permet de parall├®liser la phase de Winsorisation lors
     du rejet Winsorized Sigma Clip.
     """
     # Wrapper: demote very verbose internal logs so they don't flood the GUI
@@ -3015,7 +2994,7 @@ def stack_aligned_images(
         else:
             return _internal_logger.debug(f"PCB_FALLBACK_{level}_{prog}: {msg_key} {kwargs}")
 
-    _pcb("STACK_IMG_ENTRY: Début stack_aligned_images.", lvl="ERROR") # Log d'entrée
+    _pcb("STACK_IMG_ENTRY: D├®but stack_aligned_images.", lvl="ERROR") # Log d'entr├®e
 
     valid_images_to_stack = [img for img in aligned_image_data_list if img is not None and isinstance(img, np.ndarray)]
     if not valid_images_to_stack:
@@ -3033,7 +3012,7 @@ def stack_aligned_images(
               radial_weight_active=apply_radial_weight,
               radial_feather=radial_feather_fraction if apply_radial_weight else "N/A")
 
-    # --- Préparation des images ---
+    # --- Pr├®paration des images ---
     first_shape = None
     processed_images_for_stack = []
     for idx, img_adu in enumerate(valid_images_to_stack):
@@ -3044,7 +3023,7 @@ def stack_aligned_images(
         if not current_img.flags.c_contiguous:
             current_img = np.ascontiguousarray(current_img, dtype=np.float32)
         
-        # Vérification des infinités DÈS LE DÉBUT
+        # V├®rification des infinit├®s D├êS LE D├ëBUT
         if not np.all(np.isfinite(current_img)):
             _pcb(f"STACK_IMG_PREP: AVERT Image {idx} (shape {current_img.shape}) contient des non-finis AVANT normalisation. Remplacement par 0.", lvl="ERROR")
             current_img = np.nan_to_num(current_img, nan=0.0, posinf=0.0, neginf=0.0)
@@ -3057,11 +3036,11 @@ def stack_aligned_images(
 
     if not processed_images_for_stack:
         _pcb("stackimages_error_no_images_after_shape_check", lvl="ERROR")
-        _pcb("STACK_IMG_EXIT: Retourne None (pas d'images après check shape).", lvl="ERROR")
+        _pcb("STACK_IMG_EXIT: Retourne None (pas d'images apr├¿s check shape).", lvl="ERROR")
         return None
     
     current_images_data_list = processed_images_for_stack # Renommage pour la suite
-    _pcb(f"STACK_IMG_PREP: {len(current_images_data_list)} images prêtes pour normalisation.", lvl="ERROR")
+    _pcb(f"STACK_IMG_PREP: {len(current_images_data_list)} images pr├¬tes pour normalisation.", lvl="ERROR")
 
 
     # --- NORMALISATION ---
@@ -3080,15 +3059,15 @@ def stack_aligned_images(
     elif normalize_method == 'sky_mean':
         _pcb("STACK_IMG_NORM: Appel _normalize_images_sky_mean.", lvl="ERROR")
         current_images_data_list = _normalize_images_sky_mean(current_images_data_list, progress_callback=progress_callback, use_gpu=use_gpu_norm)
-    # ... (autres méthodes de normalisation si ajoutées) ...
+    # ... (autres m├®thodes de normalisation si ajout├®es) ...
     
-    current_images_data_list = [img for img in current_images_data_list if img is not None] # Filtrer si normalisation a échoué pour certaines
+    current_images_data_list = [img for img in current_images_data_list if img is not None] # Filtrer si normalisation a ├®chou├® pour certaines
     if not current_images_data_list:
         _pcb("stackimages_error_no_images_left_after_normalization_step", lvl="ERROR")
-        _pcb("STACK_IMG_EXIT: Retourne None (pas d'images après normalisation).", lvl="ERROR")
+        _pcb("STACK_IMG_EXIT: Retourne None (pas d'images apr├¿s normalisation).", lvl="ERROR")
         return None
 
-    _pcb(f"STACK_IMG_NORM: {len(current_images_data_list)} images après normalisation. Vérification des non-finis POST-normalisation.", lvl="ERROR")
+    _pcb(f"STACK_IMG_NORM: {len(current_images_data_list)} images apr├¿s normalisation. V├®rification des non-finis POST-normalisation.", lvl="ERROR")
     temp_list_post_norm = []
     for idx_post_norm, img_post_norm in enumerate(current_images_data_list):
         if img_post_norm is not None:
@@ -3099,12 +3078,12 @@ def stack_aligned_images(
     current_images_data_list = temp_list_post_norm
     del temp_list_post_norm
     if not current_images_data_list: # Double check
-        _pcb("STACK_IMG_NORM: Toutes les images sont devenues None après nettoyage post-normalisation.", lvl="ERROR")
+        _pcb("STACK_IMG_NORM: Toutes les images sont devenues None apr├¿s nettoyage post-normalisation.", lvl="ERROR")
         return None
 
 
-    # --- PONDÉRATION DE QUALITÉ (Bruit/FWHM) ---
-    _pcb(f"STACK_IMG_WEIGHT_QUAL: Début calcul poids qualité. Méthode demandée: {weighting_method}", lvl="ERROR")
+    # --- POND├ëRATION DE QUALIT├ë (Bruit/FWHM) ---
+    _pcb(f"STACK_IMG_WEIGHT_QUAL: D├®but calcul poids qualit├®. M├®thode demand├®e: {weighting_method}", lvl="ERROR")
     quality_weights_list, effective_weight_method, quality_weight_stats = _compute_quality_weights(
         current_images_data_list,
         weighting_method,
@@ -3112,7 +3091,7 @@ def stack_aligned_images(
     )
     if effective_weight_method != weighting_method:
         _pcb(
-            f"STACK_IMG_WEIGHT_QUAL: Fallback méthode '{weighting_method}' -> '{effective_weight_method}'.",
+            f"STACK_IMG_WEIGHT_QUAL: Fallback m├®thode '{weighting_method}' -> '{effective_weight_method}'.",
             lvl="WARN",
         )
     weighting_method = effective_weight_method
@@ -3122,15 +3101,15 @@ def stack_aligned_images(
             lvl="INFO",
         )
     _pcb(
-        "STACK_IMG_WEIGHT_QUAL: Fin calcul poids qualité.",
+        "STACK_IMG_WEIGHT_QUAL: Fin calcul poids qualit├®.",
         lvl="ERROR",
     )
     quality_weights_list = quality_weights_list or []
 
 
-    # --- PONDÉRATION RADIALE ---
+    # --- POND├ëRATION RADIALE ---
     final_radial_weights_list = [None] * len(current_images_data_list)
-    _pcb(f"STACK_IMG_WEIGHT_RAD: Début calcul poids radiaux. Apply: {apply_radial_weight}", lvl="ERROR")
+    _pcb(f"STACK_IMG_WEIGHT_RAD: D├®but calcul poids radiaux. Apply: {apply_radial_weight}", lvl="ERROR")
     if apply_radial_weight and ZEMOSAIC_UTILS_AVAILABLE_FOR_RADIAL and make_radial_weight_map_func:
         for idx, img_data_HWC in enumerate(current_images_data_list):
             if img_data_HWC is None: continue
@@ -3160,11 +3139,11 @@ def stack_aligned_images(
         elif q_w is not None: image_weights_list_combined[i] = q_w
         elif r_w is not None: image_weights_list_combined[i] = r_w
         else: image_weights_list_combined[i] = None
-    _pcb(f"STACK_IMG_WEIGHT_COMB: Poids combinés. image_weights_list_combined is {'None' if image_weights_list_combined is None else 'Exists'}.", lvl="ERROR")
+    _pcb(f"STACK_IMG_WEIGHT_COMB: Poids combin├®s. image_weights_list_combined is {'None' if image_weights_list_combined is None else 'Exists'}.", lvl="ERROR")
     if image_weights_list_combined and any(w is not None for w in image_weights_list_combined):
         first_valid_c_weight = next((w for w in image_weights_list_combined if w is not None), None)
         if first_valid_c_weight is not None:
-             _pcb(f"STACK_IMG_WEIGHT_COMB: Premier poids combiné non-None - shape: {first_valid_c_weight.shape}, type: {first_valid_c_weight.dtype}, range: [{np.min(first_valid_c_weight):.3g}-{np.max(first_valid_c_weight):.3g}]", lvl="ERROR")
+             _pcb(f"STACK_IMG_WEIGHT_COMB: Premier poids combin├® non-None - shape: {first_valid_c_weight.shape}, type: {first_valid_c_weight.dtype}, range: [{np.min(first_valid_c_weight):.3g}-{np.max(first_valid_c_weight):.3g}]", lvl="ERROR")
 
 
     # --- STACKAGE NUMPY ---
@@ -3179,13 +3158,13 @@ def stack_aligned_images(
         stacked_array_NHDWC = np.stack(valid_images_for_numpy_stack, axis=0)
         _pcb(f"STACK_IMG_NP_STACK: stacked_array_NHDWC - shape: {stacked_array_NHDWC.shape}, dtype: {stacked_array_NHDWC.dtype}, range: [{np.min(stacked_array_NHDWC):.2g}-{np.max(stacked_array_NHDWC):.2g}]", lvl="ERROR")
 
-        # Filtrer les poids combinés pour correspondre EXACTEMENT aux images stackées
+        # Filtrer les poids combin├®s pour correspondre EXACTEMENT aux images stack├®es
         filtered_combined_weights = [
             image_weights_list_combined[i] 
-            for i, img in enumerate(current_images_data_list) # Itérer sur la liste originale avant filtrage pour garder les bons indices de poids
+            for i, img in enumerate(current_images_data_list) # It├®rer sur la liste originale avant filtrage pour garder les bons indices de poids
             if img is not None # Condition pour que l'image soit dans valid_images_for_numpy_stack
         ]
-        del current_images_data_list, valid_images_for_numpy_stack # Libérer mémoire
+        del current_images_data_list, valid_images_for_numpy_stack # Lib├®rer m├®moire
         gc.collect()
     except Exception as e_np_stack:
         _pcb(f"stackimages_error_value_stacking_images: {e_np_stack}", lvl="ERROR")
@@ -3198,9 +3177,9 @@ def stack_aligned_images(
             # Prendre uniquement les poids qui ne sont pas None
             valid_weights_to_stack_numpy = [w for w in filtered_combined_weights if w is not None]
             if not valid_weights_to_stack_numpy:
-                _pcb("STACK_IMG_NP_STACK_WEIGHTS: Tous les poids filtrés sont None. weights_array_NHDWC sera None.", lvl="ERROR")
+                _pcb("STACK_IMG_NP_STACK_WEIGHTS: Tous les poids filtr├®s sont None. weights_array_NHDWC sera None.", lvl="ERROR")
             elif len(valid_weights_to_stack_numpy) != stacked_array_NHDWC.shape[0]:
-                 _pcb(f"STACK_IMG_NP_STACK_WEIGHTS: ERREUR - Mismatch nombre poids valides ({len(valid_weights_to_stack_numpy)}) et images stackées ({stacked_array_NHDWC.shape[0]}).", lvl="ERROR")
+                 _pcb(f"STACK_IMG_NP_STACK_WEIGHTS: ERREUR - Mismatch nombre poids valides ({len(valid_weights_to_stack_numpy)}) et images stack├®es ({stacked_array_NHDWC.shape[0]}).", lvl="ERROR")
             else:
                 weights_array_NHDWC = np.stack(valid_weights_to_stack_numpy, axis=0)
                 if weights_array_NHDWC.shape != stacked_array_NHDWC.shape:
@@ -3214,12 +3193,12 @@ def stack_aligned_images(
     if weights_array_NHDWC is not None:
          _pcb(f"STACK_IMG_NP_STACK_WEIGHTS: weights_array_NHDWC - shape: {weights_array_NHDWC.shape}, type: {weights_array_NHDWC.dtype}, range: [{np.min(weights_array_NHDWC):.3g}-{np.max(weights_array_NHDWC):.3g}]", lvl="ERROR")
 
-    # ... (Nettoyage des listes de poids intermédiaires) ...
+    # ... (Nettoyage des listes de poids interm├®diaires) ...
     del quality_weights_list, final_radial_weights_list, image_weights_list_combined, filtered_combined_weights
     gc.collect()
 
     # --- REJET D'OUTLIERS ---
-    _pcb(f"STACK_IMG_REJECT: Début rejet. Algorithme: {rejection_algorithm}", lvl="ERROR")
+    _pcb(f"STACK_IMG_REJECT: D├®but rejet. Algorithme: {rejection_algorithm}", lvl="ERROR")
     data_for_combine = stacked_array_NHDWC 
     rejection_mask = None
     if rejection_algorithm == 'kappa_sigma':
@@ -3238,7 +3217,7 @@ def stack_aligned_images(
 
 
     # --- COMBINAISON FINALE ---
-    _pcb(f"STACK_IMG_COMBINE: Début combinaison finale. Méthode: {final_combine_method}", lvl="ERROR")
+    _pcb(f"STACK_IMG_COMBINE: D├®but combinaison finale. M├®thode: {final_combine_method}", lvl="ERROR")
     result_image_adu = None
     try:
         effective_weights_for_combine = weights_array_NHDWC
@@ -3272,20 +3251,20 @@ def stack_aligned_images(
                     
                     if data_masked_for_avg.shape[0] == 1: # Cas N=1
                         _pcb(f"STACK_IMG_COMBINE_MEAN: N=1. Multiplication directe: data * poids_effectif.", lvl="ERROR")
-                        # Log des pixels avant et après
-                        img_idx_log, h_log, w_log, c_log = 0,0,0,0 # Pixel (0,0,0) de la première (unique) image
+                        # Log des pixels avant et apr├¿s
+                        img_idx_log, h_log, w_log, c_log = 0,0,0,0 # Pixel (0,0,0) de la premi├¿re (unique) image
                         _pcb(f"  N=1 PRE-MULT: data_pixel=[{data_masked_for_avg[img_idx_log,h_log,w_log,c_log]:.3g}], weight_pixel=[{effective_weights_for_combine[img_idx_log,h_log,w_log,c_log]:.3g}]", lvl="ERROR")
                         result_image_adu = data_masked_for_avg[0] * effective_weights_for_combine[0]
                         _pcb(f"  N=1 POST-MULT: result_pixel=[{result_image_adu[h_log,w_log,c_log]:.3g}]", lvl="ERROR")
                     else: # Cas N > 1
-                        _pcb(f"STACK_IMG_COMBINE_MEAN: N={data_masked_for_avg.shape[0]}. Moyenne pondérée standard.", lvl="ERROR")
+                        _pcb(f"STACK_IMG_COMBINE_MEAN: N={data_masked_for_avg.shape[0]}. Moyenne pond├®r├®e standard.", lvl="ERROR")
                         sum_weighted_data = np.sum(data_masked_for_avg * effective_weights_for_combine, axis=0)
                         sum_weights = np.sum(effective_weights_for_combine, axis=0)
                         _pcb(f"  N>1 POST-SUM: sum_weighted_data range: [{np.min(sum_weighted_data):.2g}-{np.max(sum_weighted_data):.2g}]", lvl="ERROR")
                         _pcb(f"  N>1 POST-SUM: sum_weights range: [{np.min(sum_weights):.2g}-{np.max(sum_weights):.2g}]", lvl="ERROR")
                         
                         # Inspecter un pixel de bord pour sum_weights
-                        bh,bw = 0,0 # Bord supérieur gauche
+                        bh,bw = 0,0 # Bord sup├®rieur gauche
                         if sum_weights.ndim == 3 and sum_weights.shape[0]>bh and sum_weights.shape[1]>bw:
                              _pcb(f"  N>1 POST-SUM: sum_weights[{bh},{bw},0] = {sum_weights[bh,bw,0]:.3g}", lvl="ERROR")
                         
@@ -3322,7 +3301,7 @@ def stack_aligned_images(
 
     if result_image_adu is None:
         _pcb("stackimages_error_combine_result_none", lvl="ERROR")
-        _pcb("STACK_IMG_EXIT: Retourne None (result_image_adu est None après try-except).", lvl="ERROR")
+        _pcb("STACK_IMG_EXIT: Retourne None (result_image_adu est None apr├¿s try-except).", lvl="ERROR")
         return None
 
     _pcb(f"STACK_IMG_OFFSET: Avant offset final. Range: [{np.nanmin(result_image_adu):.2g}-{np.nanmax(result_image_adu):.2g}]", lvl="ERROR")
@@ -3546,7 +3525,7 @@ def _cpu_stack_winsorized_fallback(
         )
     else:
         arr = np.stack(frames_list, axis=0)
-    # Libérer au plus tôt la mémoire retenue par la liste de frames individuelles.
+    # Lib├®rer au plus t├┤t la m├®moire retenue par la liste de frames individuelles.
     frames_list.clear()
     if arr.ndim not in (3, 4):
         raise ValueError(f"frames must be (N,H,W) or (N,H,W,C); got shape {arr.shape}")
@@ -3641,3 +3620,4 @@ except NameError:
     cpu_stack_linear = None
 if cpu_stack_linear is None:
     cpu_stack_linear = _cpu_stack_linear_fallback
+
