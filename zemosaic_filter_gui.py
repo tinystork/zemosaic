@@ -62,6 +62,7 @@ import threading
 import queue
 import json
 import logging
+import re
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -668,6 +669,29 @@ def launch_filter_interface(
             except Exception:
                 print(f"ERROR (Filter GUI): {msg}{detail}")
             return raw_items_input, False, None
+
+        def _write_header_to_fits_local(file_path: str, header_obj) -> None:
+            """Safely persist ``header_obj`` into ``file_path`` FITS header."""
+
+            if header_obj is None:
+                return
+            try:
+                with fits.open(file_path, mode="update", memmap=False) as hdul:
+                    hdul[0].header.update(header_obj)
+                    hdul.flush()
+            except Exception as exc:
+                logger.debug("[FilterUI] Failed to write header for %s: %s", file_path, exc)
+
+        def _has_celestial_wcs(header_obj) -> bool:
+            """Return True when ``header_obj`` contains a valid celestial WCS."""
+
+            if header_obj is None:
+                return False
+            try:
+                wcs_obj = WCS(header_obj, naxis=2, relax=True)
+            except Exception:
+                return False
+            return bool(getattr(wcs_obj, "is_celestial", False))
 
         def footprint_wh_deg(wcs_obj: Any) -> tuple[float, float]:
             """Return footprint width/height in degrees for a given WCS."""
@@ -1991,6 +2015,19 @@ def launch_filter_interface(
         async_events: "queue.Queue[tuple[Any, ...]]" = queue.Queue()
         resolve_state = {"running": False}
         _progress_log_state = {"last": 0.0}
+        resolve_now_state: Dict[str, Any] = {
+            "running": False,
+            "executor": None,
+            "futures": [],
+            "total": 0,
+            "done": 0,
+            "success": 0,
+            "log_path": None,
+            "log_dir": None,
+            "button": None,
+            "progressbar": None,
+            "status_var": None,
+        }
 
         MAX_UI_MSG = 150
         UI_BUDGET_MS = 35.0
@@ -2379,6 +2416,517 @@ def launch_filter_interface(
                 except Exception:
                     pass
             wcs_async_state["running"] = False
+
+        def _resolve_now_log_base(paths: list[str]) -> Optional[Path]:
+            if input_dir_path is not None:
+                return input_dir_path
+            sanitized: list[str] = []
+            for entry in paths:
+                if not entry:
+                    continue
+                try:
+                    sanitized.append(os.path.abspath(entry))
+                except Exception:
+                    continue
+            if not sanitized:
+                return None
+            try:
+                common = Path(os.path.commonpath(sanitized))
+            except Exception:
+                try:
+                    common = Path(sanitized[0]).parent
+                except Exception:
+                    return None
+            if common.is_file():
+                try:
+                    common = common.parent
+                except Exception:
+                    return None
+            return common
+
+        def _resolve_now_append_log(result: Dict[str, Any]) -> None:
+            log_path = resolve_now_state.get("log_path")
+            if not log_path:
+                return
+            path_val = result.get("path")
+            log_dir = resolve_now_state.get("log_dir")
+            try:
+                if log_dir is not None and path_val:
+                    rel_path = os.path.relpath(path_val, str(log_dir))
+                elif path_val:
+                    rel_path = os.path.basename(path_val)
+                else:
+                    rel_path = "<unknown>"
+            except Exception:
+                rel_path = os.path.basename(path_val) if path_val else "<unknown>"
+            status = "OK" if result.get("ok") else "FAIL"
+            if result.get("skipped"):
+                status = "SKIP"
+            code_val = result.get("return_code")
+            code_txt = "-" if code_val is None else str(code_val)
+            duration = result.get("duration")
+            try:
+                duration_txt = f"{float(duration):.2f}"
+            except Exception:
+                duration_txt = "-"
+            timestamp = datetime.datetime.now().isoformat(timespec="seconds") + "Z"
+            line = f"{timestamp}\t{status}\t{rel_path}\tcode={code_txt}\ttime_s={duration_txt}"
+            err_msg = result.get("error")
+            if err_msg:
+                line += f"\tmsg={err_msg}"
+            try:
+                with open(str(log_path), "a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
+            except Exception:
+                pass
+
+        def _update_resolve_now_ui() -> None:
+            total = int(resolve_now_state.get("total") or 0)
+            done = int(resolve_now_state.get("done") or 0)
+            success = int(resolve_now_state.get("success") or 0)
+            pb_widget = resolve_now_state.get("progressbar")
+            if pb_widget is not None:
+                try:
+                    pb_widget.config(mode="determinate", maximum=max(total, 1))
+                    pb_widget["value"] = min(done, total)
+                except Exception:
+                    pass
+            status_var_local = resolve_now_state.get("status_var")
+            if status_var_local is not None:
+                try:
+                    status_text = _tr(
+                        "filter_resolve_now_progress",
+                        "{done}/{total} processed ({ok} solved)",
+                        done=done,
+                        total=total,
+                        ok=success,
+                    )
+                except Exception:
+                    status_text = f"{done}/{total} ({success})"
+                try:
+                    status_var_local.set(status_text)
+                except Exception:
+                    pass
+            try:
+                if total > 0:
+                    summary_text = _tr(
+                        "filter_resolve_now_summary",
+                        "Resolving WCS: {done}/{total} processed ({ok} success).",
+                        done=done,
+                        total=total,
+                        ok=success,
+                    )
+                else:
+                    summary_text = _tr("filter_resolve_now_summary_idle", "Resolving WCS: idle.")
+                summary_var.set(_apply_summary_hint(summary_text))
+            except Exception:
+                pass
+
+        def _finalize_resolve_now_run() -> None:
+            if not resolve_now_state.get("running"):
+                return
+            resolve_now_state["running"] = False
+            executor = resolve_now_state.get("executor")
+            if executor is not None:
+                try:
+                    executor.shutdown(wait=False, cancel_futures=False)
+                except Exception:
+                    pass
+            resolve_now_state["executor"] = None
+            futures_list = resolve_now_state.get("futures")
+            if isinstance(futures_list, list):
+                futures_list.clear()
+            btn_widget = resolve_now_state.get("button")
+            if btn_widget is not None:
+                try:
+                    btn_widget.state(["!disabled"])
+                except Exception:
+                    try:
+                        btn_widget.configure(state=tk.NORMAL)
+                    except Exception:
+                        pass
+            total = int(resolve_now_state.get("total") or 0)
+            success = int(resolve_now_state.get("success") or 0)
+            try:
+                final_msg = _tr(
+                    "filter_resolve_now_done",
+                    "Resolve & write WCS completed: {ok}/{total} success.",
+                    ok=success,
+                    total=total,
+                )
+            except Exception:
+                final_msg = f"Resolve & write WCS completed: {success}/{total}"
+            _update_resolve_now_ui()
+            try:
+                status_var.set(final_msg)
+            except Exception:
+                pass
+            try:
+                summary_var.set(_apply_summary_hint(final_msg))
+            except Exception:
+                pass
+            try:
+                _flush_log_buffer(force=True)
+            except Exception:
+                pass
+
+        def _process_resolve_now_result(result: Dict[str, Any]) -> None:
+            if not isinstance(result, dict):
+                return
+            resolve_now_state["done"] = int(resolve_now_state.get("done") or 0) + 1
+            ok = bool(result.get("ok"))
+            skipped = bool(result.get("skipped"))
+            if ok and not skipped:
+                resolve_now_state["success"] = int(resolve_now_state.get("success") or 0) + 1
+                resolved_counter["count"] += 1
+                overrides_state["resolved_wcs_count"] = resolved_counter["count"]
+            idx_val = result.get("idx")
+            path_val = result.get("path")
+            header_obj = result.get("header")
+            wcs_obj = result.get("wcs")
+            if isinstance(idx_val, int) and 0 <= idx_val < len(items):
+                item = items[idx_val]
+                if header_obj is not None:
+                    try:
+                        item.header = header_obj
+                        item.src["header"] = header_obj
+                    except Exception:
+                        pass
+                if wcs_obj is not None and getattr(wcs_obj, "is_celestial", False):
+                    item.wcs = wcs_obj
+                    item.src["wcs"] = wcs_obj
+                    try:
+                        item.refresh_geometry()
+                    except Exception:
+                        pass
+                    try:
+                        _ensure_wrapped_capacity(idx_val)
+                        footprint_wrapped[idx_val] = None
+                        centroid_wrapped[idx_val] = None
+                    except Exception:
+                        pass
+                    pending_visual_refresh.add(idx_val)
+                    _schedule_visual_refresh_flush()
+                    _canvas_draw_idle()
+            name = os.path.basename(path_val) if isinstance(path_val, str) else "<unknown>"
+            if ok:
+                msg = _tr(
+                    "filter_resolve_now_log_ok",
+                    "WCS resolved for {name}.",
+                    name=name,
+                )
+                _log_message(msg, level="INFO")
+            else:
+                err_msg = result.get("error") or "unknown error"
+                msg = _tr(
+                    "filter_resolve_now_log_fail",
+                    "Failed to resolve WCS for {name}: {error}",
+                    name=name,
+                    error=err_msg,
+                )
+                _log_message(msg, level="WARN" if not skipped else "INFO")
+            _resolve_now_append_log(result)
+            _update_resolve_now_ui()
+            total = int(resolve_now_state.get("total") or 0)
+            done = int(resolve_now_state.get("done") or 0)
+            if done >= total:
+                _finalize_resolve_now_run()
+
+        def _dispatch_resolve_now_future(idx: int, fut) -> None:
+            def _deliver() -> None:
+                try:
+                    payload = fut.result()
+                except Exception as exc:
+                    path_guess = None
+                    if isinstance(idx, int) and 0 <= idx < len(items):
+                        path_guess = getattr(items[idx], "path", None)
+                    payload = {
+                        "idx": idx,
+                        "path": path_guess,
+                        "ok": False,
+                        "error": str(exc),
+                        "return_code": None,
+                        "duration": 0.0,
+                    }
+                _process_resolve_now_result(payload)
+
+            try:
+                root.after(0, _deliver)
+            except Exception:
+                _deliver()
+
+        def _on_pre_solve_wcs_clicked() -> None:
+            if resolve_now_state.get("running"):
+                return
+            if not (astap_available and solve_with_astap is not None):
+                warn_msg = _tr(
+                    "filter_resolve_now_no_astap",
+                    "ASTAP solver is not configured or unavailable.",
+                )
+                _log_message(warn_msg, level="WARN")
+                try:
+                    status_var.set(warn_msg)
+                except Exception:
+                    pass
+                status_local = resolve_now_state.get("status_var")
+                if status_local is not None:
+                    try:
+                        status_local.set(warn_msg)
+                    except Exception:
+                        pass
+                return
+
+            targets: list[tuple[int, str, Any]] = []
+            for idx, item in enumerate(items):
+                path_val = getattr(item, "path", None)
+                if not isinstance(path_val, str) or not os.path.isfile(path_val):
+                    continue
+                try:
+                    path_obj = Path(path_val)
+                except Exception:
+                    path_obj = Path(str(path_val))
+                try:
+                    if is_path_excluded(path_obj, EXCLUDED_DIRS):
+                        continue
+                except Exception:
+                    continue
+                header_obj = getattr(item, "header", None)
+                has_item_wcs = bool(item.wcs is not None and getattr(item.wcs, "is_celestial", False))
+                if has_item_wcs:
+                    continue
+                if header_obj is not None and _has_celestial_wcs(header_obj):
+                    continue
+                targets.append((idx, path_val, header_obj))
+
+            if not targets:
+                idle_msg = _tr(
+                    "filter_resolve_now_idle",
+                    "All listed files already include a celestial WCS.",
+                )
+                try:
+                    summary_var.set(_apply_summary_hint(idle_msg))
+                    status_var.set(idle_msg)
+                except Exception:
+                    pass
+                status_local = resolve_now_state.get("status_var")
+                if status_local is not None:
+                    try:
+                        status_local.set(idle_msg)
+                    except Exception:
+                        pass
+                return
+
+            def _coerce_float(value: Any) -> Optional[float]:
+                try:
+                    if value is None or value == "":
+                        return None
+                    return float(value)
+                except Exception:
+                    return None
+
+            def _coerce_int(value: Any) -> Optional[int]:
+                try:
+                    if value is None or value == "":
+                        return None
+                    return int(float(value))
+                except Exception:
+                    return None
+
+            search_radius_val = (
+                combined_solver_settings.get("astap_search_radius_deg")
+                if isinstance(combined_solver_settings, dict)
+                else None
+            )
+            if search_radius_val is None:
+                search_radius_val = combined_solver_settings.get("search_radius_deg") if isinstance(combined_solver_settings, dict) else None
+            search_radius = _coerce_float(search_radius_val)
+            if search_radius is not None and search_radius <= 0:
+                search_radius = None
+
+            downsample_candidate = None
+            if isinstance(combined_solver_settings, dict):
+                downsample_candidate = combined_solver_settings.get("astap_downsample")
+                if downsample_candidate is None:
+                    downsample_candidate = combined_solver_settings.get("downsample")
+            downsample_val = _coerce_int(downsample_candidate)
+            if downsample_val is not None and downsample_val < 0:
+                downsample_val = None
+
+            sensitivity_candidate = None
+            if isinstance(combined_solver_settings, dict):
+                sensitivity_candidate = combined_solver_settings.get("astap_sensitivity")
+            sensitivity_val = _coerce_int(sensitivity_candidate)
+
+            timeout_base = None
+            timeout_astap = None
+            if isinstance(combined_solver_settings, dict):
+                timeout_base = _coerce_int(combined_solver_settings.get("timeout_sec"))
+                if timeout_base is None:
+                    timeout_base = _coerce_int(combined_solver_settings.get("timeout"))
+                timeout_astap = _coerce_int(combined_solver_settings.get("astap_timeout_sec"))
+            if timeout_base is None or timeout_base <= 0:
+                timeout_base = 120
+            timeout_base = max(5, timeout_base)
+            if timeout_astap is None or timeout_astap <= 0:
+                timeout_astap = max(180, timeout_base)
+
+            resolve_now_state["running"] = True
+            resolve_now_state["total"] = len(targets)
+            resolve_now_state["done"] = 0
+            resolve_now_state["success"] = 0
+            futures_list = resolve_now_state.get("futures")
+            if isinstance(futures_list, list):
+                futures_list.clear()
+
+            log_base = _resolve_now_log_base([path for _, path, _ in targets])
+            if log_base is not None:
+                try:
+                    log_base.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
+                log_path = log_base / WCS_LOG_NAME
+                resolve_now_state["log_dir"] = log_base
+                resolve_now_state["log_path"] = log_path
+                try:
+                    with open(str(log_path), "a", encoding="utf-8") as handle:
+                        handle.write(
+                            f"# {datetime.datetime.now().isoformat(timespec='seconds')}Z Resolve & write WCS now\n"
+                        )
+                except Exception:
+                    pass
+            else:
+                resolve_now_state["log_dir"] = None
+                resolve_now_state["log_path"] = None
+
+            btn_widget = resolve_now_state.get("button")
+            if btn_widget is not None:
+                try:
+                    btn_widget.state(["disabled"])
+                except Exception:
+                    try:
+                        btn_widget.configure(state=tk.DISABLED)
+                    except Exception:
+                        pass
+            try:
+                status_var.set(
+                    _tr(
+                        "filter_resolve_now_running",
+                        "Resolving WCS in background…",
+                    )
+                )
+            except Exception:
+                pass
+            _update_resolve_now_ui()
+
+            max_workers = min(8, max(2, (os.cpu_count() or 4)))
+            try:
+                executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="FilterWCS")
+            except Exception as exc:
+                resolve_now_state["running"] = False
+                resolve_now_state["executor"] = None
+                if btn_widget is not None:
+                    try:
+                        btn_widget.state(["!disabled"])
+                    except Exception:
+                        try:
+                            btn_widget.configure(state=tk.NORMAL)
+                        except Exception:
+                            pass
+                _log_message(f"Failed to start WCS resolve threads: {exc}", level="ERROR")
+                return
+            resolve_now_state["executor"] = executor
+
+            code_pattern = re.compile(r"code\\s+(-?\\d+)", re.IGNORECASE)
+
+            def _solve_target(idx: int, path_val: str, header_obj) -> Dict[str, Any]:
+                start_ts = time.monotonic()
+                result: Dict[str, Any] = {
+                    "idx": idx,
+                    "path": path_val,
+                    "ok": False,
+                    "return_code": None,
+                    "duration": 0.0,
+                }
+                header_payload = header_obj
+                if header_payload is not None:
+                    try:
+                        header_payload = header_payload.copy()
+                    except Exception:
+                        pass
+                if header_payload is None:
+                    try:
+                        header_payload = fits.getheader(path_val, 0)
+                    except Exception as exc:
+                        result["error"] = f"header load failed: {exc}"
+                        result["duration"] = time.monotonic() - start_ts
+                        return result
+                if _has_celestial_wcs(header_payload):
+                    result["ok"] = True
+                    result["skipped"] = True
+                    try:
+                        result["wcs"] = WCS(header_payload, naxis=2, relax=True)
+                    except Exception:
+                        pass
+                    result["header"] = header_payload
+                    result["return_code"] = 0
+                    result["duration"] = time.monotonic() - start_ts
+                    return result
+
+                progress_state = {"return_code": None}
+
+                def _progress_cb(message, *_args) -> None:
+                    if not isinstance(message, str):
+                        return
+                    match = code_pattern.search(message)
+                    if match:
+                        try:
+                            progress_state["return_code"] = int(match.group(1))
+                        except Exception:
+                            progress_state["return_code"] = None
+
+                try:
+                    wcs_obj = solve_with_astap(
+                        path_val,
+                        header_payload,
+                        astap_exe_path,
+                        astap_data_dir,
+                        search_radius_deg=search_radius,
+                        downsample_factor=downsample_val,
+                        sensitivity=sensitivity_val,
+                        timeout_sec=timeout_astap,
+                        update_original_header_in_place=True,
+                        progress_callback=_progress_cb,
+                    )
+                except Exception as exc:
+                    result["error"] = str(exc)
+                    result["return_code"] = progress_state.get("return_code")
+                    result["duration"] = time.monotonic() - start_ts
+                    return result
+
+                result["return_code"] = progress_state.get("return_code")
+                result["duration"] = time.monotonic() - start_ts
+                if wcs_obj is not None and getattr(wcs_obj, "is_celestial", False):
+                    try:
+                        _write_header_to_fits_local(path_val, header_payload)
+                    except Exception:
+                        pass
+                    result["ok"] = True
+                    result["wcs"] = wcs_obj
+                    result["header"] = header_payload
+                else:
+                    result["error"] = "no solution"
+                return result
+
+            futures_collected: list[tuple[int, Any]] = []
+            for idx, path_val, header_obj in targets:
+                fut = executor.submit(_solve_target, idx, path_val, header_obj)
+                futures_collected.append((idx, fut))
+            resolve_now_state["futures"] = [f for _, f in futures_collected]
+            for idx, fut in futures_collected:
+                try:
+                    fut.add_done_callback(lambda f, i=idx: _dispatch_resolve_now_future(i, f))
+                except Exception:
+                    _dispatch_resolve_now_future(idx, fut)
 
         def _paint_from_log_clicked() -> None:
             if wcs_async_state.get("running"):
@@ -4199,6 +4747,34 @@ def launch_filter_interface(
                     root.destroy()
                 except Exception:
                     pass
+        resolve_now_frame = ttk.Frame(bottom)
+        try:
+            resolve_now_frame.pack(side=tk.LEFT, padx=4, pady=4)
+        except Exception:
+            resolve_now_frame.pack(side=tk.LEFT, padx=4)
+        resolve_now_status = tk.StringVar(master=root, value="")
+        resolve_now_state["status_var"] = resolve_now_status
+        try:
+            resolve_now_btn_widget = ttk.Button(
+                resolve_now_frame,
+                text=_tr("filter_resolve_now_button", "Resolve & write WCS now"),
+                command=_on_pre_solve_wcs_clicked,
+            )
+            resolve_now_btn_widget.pack(fill=tk.X, expand=False)
+            resolve_now_state["button"] = resolve_now_btn_widget
+        except Exception:
+            resolve_now_state["button"] = None
+        try:
+            resolve_now_progress = ttk.Progressbar(resolve_now_frame, mode="determinate", length=160)
+            resolve_now_progress.pack(fill=tk.X, expand=False, pady=(4, 0))
+            resolve_now_state["progressbar"] = resolve_now_progress
+        except Exception:
+            resolve_now_state["progressbar"] = None
+        try:
+            ttk.Label(resolve_now_frame, textvariable=resolve_now_status).pack(fill=tk.X, expand=False, pady=(2, 0))
+        except Exception:
+            pass
+
         ttk.Button(
             bottom,
             text=_tr(
