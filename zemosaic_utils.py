@@ -108,6 +108,63 @@ def is_path_excluded(path: Path | str, excluded_dirs: Iterable[str] | None = Non
             return False
     return any(part in parts for part in directories)
 
+
+def has_valid_wcs(header) -> bool:
+    """Return True when *header* appears to describe a usable celestial WCS."""
+
+    if header is None:
+        return False
+
+    def _get(key: str):
+        if header is None:
+            return None
+        try:
+            if hasattr(header, "get"):
+                return header.get(key)
+            return header[key]
+        except Exception:
+            return None
+
+    def _float_like(value: object) -> bool:
+        if value is None:
+            return False
+        try:
+            float(value)
+        except Exception:
+            return False
+        return True
+
+    ctype1 = _get("CTYPE1")
+    ctype2 = _get("CTYPE2")
+    if not isinstance(ctype1, str) or not isinstance(ctype2, str):
+        return False
+    axis1 = ctype1.strip().upper()
+    axis2 = ctype2.strip().upper()
+    if not axis1 or not axis2:
+        return False
+    axis1_ok = any(tag in axis1 for tag in ("RA", "LON"))
+    axis2_ok = any(tag in axis2 for tag in ("DEC", "LAT"))
+    if not (axis1_ok and axis2_ok):
+        return False
+
+    for key in ("CRVAL1", "CRVAL2", "CRPIX1", "CRPIX2"):
+        if not _float_like(_get(key)):
+            return False
+
+    cd_terms = ("CD1_1", "CD1_2", "CD2_1", "CD2_2")
+    pc_terms = ("PC1_1", "PC1_2", "PC2_1", "PC2_2")
+    cdelt_terms = ("CDELT1", "CDELT2")
+
+    has_cd_matrix = all(_float_like(_get(term)) for term in cd_terms)
+    has_pc_matrix = all(_float_like(_get(term)) for term in pc_terms) and all(
+        _float_like(_get(term)) for term in cdelt_terms
+    )
+
+    if not (has_cd_matrix or has_pc_matrix):
+        return False
+
+    return True
+
 # --- Lightweight CuPy helpers -------------------------------------------------
 def gpu_is_available() -> bool:
     if not GPU_AVAILABLE:

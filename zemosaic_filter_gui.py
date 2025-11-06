@@ -675,12 +675,30 @@ def launch_filter_interface(
 
             if header_obj is None:
                 return
+            with fits.open(file_path, mode="update", memmap=False) as hdul:
+                hdul[0].header.update(header_obj)
+                hdul.flush()
+
+        def _persist_wcs_header_if_requested(path_val: str, hdr_obj, write_inplace: bool) -> None:
+            """Persist ``hdr_obj`` to disk when ``write_inplace`` is enabled."""
+
+            if not write_inplace or hdr_obj is None:
+                return
+            if not isinstance(path_val, str) or not path_val:
+                return
+            display_name = os.path.basename(path_val) or path_val
             try:
-                with fits.open(file_path, mode="update", memmap=False) as hdul:
-                    hdul[0].header.update(header_obj)
-                    hdul.flush()
-            except Exception as exc:
-                logger.debug("[FilterUI] Failed to write header for %s: %s", file_path, exc)
+                _write_header_to_fits_local(path_val, hdr_obj)
+            except Exception as exc:  # pragma: no cover - UI logging side effect
+                _log_message(
+                    f"[WCS] Failed to write header for '{display_name}': {exc}",
+                    level="WARN",
+                )
+            else:
+                _log_message(
+                    f"[WCS] Header written to '{display_name}'",
+                    level="INFO",
+                )
 
         def _has_celestial_wcs(header_obj) -> bool:
             """Return True when ``header_obj`` contains a valid celestial WCS."""
@@ -2247,6 +2265,8 @@ def launch_filter_interface(
 
             log_path = wcs_async_state.get("log_path")
             path_value = payload.get("path")
+            if ok:
+                _persist_wcs_header_if_requested(path_value, header_obj, write_inplace)
             solver_value = payload.get("solver")
             error_value = payload.get("error")
             log_entry: Dict[str, Any] = {}
