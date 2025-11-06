@@ -383,6 +383,549 @@ def _compose_global_anchor_shift(
     return result, nontrivial
 
 
+@dataclass
+class _InterMasterTile:
+    index: int
+    path: str
+    wcs: Any
+    shape_hw: tuple[int, int]
+    sky_corners: Any | None = None
+
+
+def _phase45_resolve_tile_shape(path: str | None, tile_wcs: Any) -> tuple[int, int] | None:
+    if path is None or not os.path.exists(path):
+        return None
+    if tile_wcs is not None and getattr(tile_wcs, "pixel_shape", None):
+        try:
+            px_shape = tile_wcs.pixel_shape
+            if px_shape and len(px_shape) >= 2:
+                h = int(px_shape[1])
+                w = int(px_shape[0])
+                if h > 0 and w > 0:
+                    return (h, w)
+        except Exception:
+            pass
+    try:
+        with fits.open(path, memmap=True, do_not_scale_image_data=True) as hdul:
+            data_shape = hdul[0].shape if hdul and hdul[0] is not None else None
+            if not data_shape:
+                return None
+            if len(data_shape) == 2:
+                return (int(data_shape[0]), int(data_shape[1]))
+            if len(data_shape) == 3:
+                return (int(data_shape[0]), int(data_shape[1]))
+    except Exception:
+        return None
+    return None
+
+
+def _phase45_tile_corners(tile: _InterMasterTile) -> Any | None:
+    if tile.sky_corners is not None:
+        return tile.sky_corners
+    if not (tile.wcs and tile.wcs.is_celestial and tile.shape_hw):
+        return None
+    try:
+        h, w = tile.shape_hw
+        xs = np.asarray([0.0, float(w), float(w), 0.0], dtype=np.float64)
+        ys = np.asarray([0.0, 0.0, float(h), float(h)], dtype=np.float64)
+        sky = tile.wcs.pixel_to_world(xs, ys)
+        tile.sky_corners = sky
+        return sky
+    except Exception:
+        return None
+
+
+def _phase45_project_polygon(corners: Any, reference: Any) -> np.ndarray | None:
+    if corners is None or reference is None:
+        return None
+    try:
+        offset_frame = reference.skyoffset_frame()
+        projected = corners.transform_to(offset_frame)
+        x = np.asarray(projected.lon.arcsec, dtype=np.float64)
+        y = np.asarray(projected.lat.arcsec, dtype=np.float64)
+        return np.stack([x, y], axis=1)
+    except Exception:
+        return None
+
+
+def _phase45_polygon_area(poly: np.ndarray | None) -> float:
+    if poly is None or len(poly) < 3:
+        return 0.0
+    x = poly[:, 0]
+    y = poly[:, 1]
+    return float(abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))) * 0.5)
+
+
+def _phase45_clip_polygon(subject: np.ndarray, clipper: np.ndarray) -> np.ndarray:
+    if subject.size == 0 or clipper.size == 0:
+        return np.empty((0, 2), dtype=np.float64)
+
+    def _edge_intersection(p1, p2, q1, q2):
+        x1, y1 = p1
+        x2, y2 = p2
+        x3, y3 = q1
+        x4, y4 = q2
+        denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+        if abs(denom) < 1e-9:
+            return p2
+        num_x = (x1 * y2 - y1 * x2) * (x3 - x4) - (x1 - x2) * (x3 * y4 - y3 * x4)
+        num_y = (x1 * y2 - y1 * x2) * (y3 - y4) - (y1 - y2) * (x3 * y4 - y3 * x4)
+        return np.array([num_x / denom, num_y / denom], dtype=np.float64)
+
+    def _inside(point, edge_start, edge_end):
+        return (edge_end[0] - edge_start[0]) * (point[1] - edge_start[1]) - (edge_end[1] - edge_start[1]) * (point[0] - edge_start[0]) >= 0
+
+    output = subject
+    clip_points = clipper
+    for i in range(len(clip_points)):
+        next_output = []
+        a = clip_points[i]
+        b = clip_points[(i + 1) % len(clip_points)]
+        if not len(output):
+            break
+        prev = output[-1]
+        for curr in output:
+            if _inside(curr, a, b):
+                if not _inside(prev, a, b):
+                    next_output.append(_edge_intersection(prev, curr, a, b))
+                next_output.append(curr)
+            elif _inside(prev, a, b):
+                next_output.append(_edge_intersection(prev, curr, a, b))
+            prev = curr
+        output = np.asarray(next_output, dtype=np.float64)
+        if output.size == 0:
+            break
+    return output if output.size else np.empty((0, 2), dtype=np.float64)
+
+
+def _phase45_overlap_fraction(tile_a: _InterMasterTile, tile_b: _InterMasterTile) -> float:
+    if not (ASTROPY_AVAILABLE and SkyCoord and tile_a and tile_b):
+        return 0.0
+    sky_a = _phase45_tile_corners(tile_a)
+    sky_b = _phase45_tile_corners(tile_b)
+    if sky_a is None or sky_b is None:
+        return 0.0
+    try:
+        ra_all = np.concatenate([sky_a.ra.deg, sky_b.ra.deg])
+        dec_all = np.concatenate([sky_a.dec.deg, sky_b.dec.deg])
+        if ra_all.size == 0 or dec_all.size == 0:
+            return 0.0
+        center = SkyCoord(ra=np.nanmean(ra_all), dec=np.nanmean(dec_all), unit="deg")
+    except Exception:
+        return 0.0
+
+    poly_a = _phase45_project_polygon(sky_a, center)
+    poly_b = _phase45_project_polygon(sky_b, center)
+    if poly_a is None or poly_b is None or poly_a.size == 0 or poly_b.size == 0:
+        return 0.0
+    area_a = _phase45_polygon_area(poly_a)
+    area_b = _phase45_polygon_area(poly_b)
+    if area_a <= 0.0 or area_b <= 0.0:
+        return 0.0
+    intersection = _phase45_clip_polygon(poly_a, poly_b)
+    inter_area = _phase45_polygon_area(intersection)
+    if inter_area <= 0.0:
+        return 0.0
+    return float(inter_area / max(1e-9, min(area_a, area_b)))
+
+
+def _phase45_compute_cutout_wcs(final_wcs: Any, final_shape_hw: tuple[int, int] | None, tiles: list[_InterMasterTile]) -> tuple[Any | None, tuple[int, int] | None]:
+    if not (final_wcs and final_shape_hw and tiles):
+        return None, None
+    try:
+        wcs_copy = final_wcs.deepcopy() if hasattr(final_wcs, "deepcopy") else copy.deepcopy(final_wcs)
+    except Exception:
+        wcs_copy = copy.deepcopy(final_wcs)
+    if wcs_copy is None:
+        return None, None
+    height, width = int(final_shape_hw[0]), int(final_shape_hw[1])
+    min_x = float(width)
+    min_y = float(height)
+    max_x = 0.0
+    max_y = 0.0
+    valid = False
+    for tile in tiles:
+        sky = _phase45_tile_corners(tile)
+        if sky is None:
+            continue
+        try:
+            px, py = wcs_copy.world_to_pixel(sky)
+            if px is None or py is None:
+                continue
+            px = np.asarray(px, dtype=np.float64)
+            py = np.asarray(py, dtype=np.float64)
+        except Exception:
+            continue
+        if px.size == 0 or py.size == 0:
+            continue
+        min_x = min(min_x, float(np.nanmin(px)))
+        min_y = min(min_y, float(np.nanmin(py)))
+        max_x = max(max_x, float(np.nanmax(px)))
+        max_y = max(max_y, float(np.nanmax(py)))
+        valid = True
+    if not valid:
+        return None, None
+    min_x = max(0.0, math.floor(min_x))
+    min_y = max(0.0, math.floor(min_y))
+    max_x = min(float(width), math.ceil(max_x))
+    max_y = min(float(height), math.ceil(max_y))
+    if max_x <= min_x:
+        max_x = min(width, min_x + 1.0)
+    if max_y <= min_y:
+        max_y = min(height, min_y + 1.0)
+    local_w = max(1, int(round(max_x - min_x)))
+    local_h = max(1, int(round(max_y - min_y)))
+    try:
+        if hasattr(wcs_copy, "wcs") and hasattr(wcs_copy.wcs, "crpix"):
+            wcs_copy.wcs.crpix[0] -= min_x
+            wcs_copy.wcs.crpix[1] -= min_y
+        if hasattr(wcs_copy, "array_shape"):
+            wcs_copy.array_shape = (local_h, local_w)
+    except Exception:
+        pass
+    return wcs_copy, (local_h, local_w)
+
+
+def _phase45_allocate_stack_storage(
+    count: int,
+    shape_hw: tuple[int, int],
+    channels: int,
+    policy: str,
+    temp_dir: str | None,
+) -> tuple[np.ndarray, str | None]:
+    dtype = np.float32
+    h, w = shape_hw
+    policy_norm = str(policy or "auto").lower()
+    use_memmap = False
+    if policy_norm == "always":
+        use_memmap = True
+    elif policy_norm == "auto":
+        estimated_bytes = count * h * w * channels * np.dtype(dtype).itemsize
+        use_memmap = estimated_bytes > (256 * 1024 * 1024)
+    if not use_memmap:
+        return np.full((count, h, w, channels), np.nan, dtype=dtype), None
+    directory = temp_dir or tempfile.gettempdir()
+    os.makedirs(directory, exist_ok=True)
+    file_path = os.path.join(directory, f"phase45_stack_{uuid.uuid4().hex}.dat")
+    storage = np.memmap(file_path, dtype=dtype, mode="w+", shape=(count, h, w, channels))
+    storage[:] = np.nan
+    return storage, file_path
+
+
+def _phase45_cleanup_storage(storage: np.ndarray | None, memmap_path: str | None) -> None:
+    try:
+        if isinstance(storage, np.memmap):
+            storage.flush()
+    except Exception:
+        pass
+    if memmap_path and os.path.exists(memmap_path):
+        try:
+            os.remove(memmap_path)
+        except Exception:
+            pass
+
+
+def _run_phase4_5_inter_master_merge(
+    master_tiles: list[tuple[str | None, Any]],
+    final_output_wcs: Any,
+    final_output_shape_hw: tuple[int, int] | None,
+    temp_storage_dir: str | None,
+    output_folder: str,
+    cache_retention_mode: str,
+    inter_cfg: dict,
+    stack_cfg: dict,
+    progress_callback: Callable | None,
+    pcb: Callable[..., None],
+) -> list[tuple[str | None, Any]]:
+    enable = bool(inter_cfg.get("enable", False))
+    if not enable:
+        return master_tiles
+    if len(master_tiles) < 2:
+        return master_tiles
+    if not (ASTROPY_AVAILABLE and REPROJECT_AVAILABLE and ZEMOSAIC_UTILS_AVAILABLE and ZEMOSAIC_ALIGN_STACK_AVAILABLE and reproject_interp):
+        pcb("p45_finished", prog=None, lvl="INFO_DETAIL", tiles_in=len(master_tiles), tiles_out=len(master_tiles))
+        return master_tiles
+
+    threshold = float(inter_cfg.get("overlap_threshold", 0.60))
+    threshold = max(0.0, min(1.0, threshold))
+    min_group = max(2, int(inter_cfg.get("min_group_size", 2)))
+    max_group = max(min_group, int(inter_cfg.get("max_group", 64)))
+    method = str(inter_cfg.get("stack_method", "winsor")).lower()
+    if method not in {"winsor", "mean", "median"}:
+        method = "winsor"
+    memmap_policy = str(inter_cfg.get("memmap_policy", "auto")).lower()
+    local_scale = str(inter_cfg.get("local_scale", "final")).lower()
+    if local_scale not in {"final", "native"}:
+        local_scale = "final"
+
+    pcb("p45_start", prog=None, lvl="INFO")
+
+    tiles: list[_InterMasterTile] = []
+    for idx, (path, wcs_obj) in enumerate(master_tiles):
+        shape_hw = _phase45_resolve_tile_shape(path, wcs_obj)
+        if not shape_hw:
+            continue
+        tiles.append(_InterMasterTile(index=idx, path=path, wcs=wcs_obj, shape_hw=shape_hw))
+
+    if len(tiles) < min_group:
+        pcb("p45_finished", prog=None, lvl="INFO_DETAIL", tiles_in=len(master_tiles), tiles_out=len(master_tiles))
+        return master_tiles
+
+    tile_map = {tile.index: tile for tile in tiles}
+    adjacency: dict[int, set[int]] = {tile.index: set() for tile in tiles}
+    for i, tile_a in enumerate(tiles):
+        for tile_b in tiles[i + 1 :]:
+            overlap = _phase45_overlap_fraction(tile_a, tile_b)
+            if overlap >= threshold:
+                adjacency[tile_a.index].add(tile_b.index)
+                adjacency[tile_b.index].add(tile_a.index)
+
+    visited: set[int] = set()
+    groups: list[list[int]] = []
+    for tile in tiles:
+        if tile.index in visited:
+            continue
+        stack = [tile.index]
+        component: list[int] = []
+        while stack:
+            node = stack.pop()
+            if node in visited:
+                continue
+            visited.add(node)
+            component.append(node)
+            stack.extend(adjacency.get(node, ()))
+        if len(component) >= min_group:
+            groups.append(sorted(component))
+
+    if not groups:
+        pcb("p45_finished", prog=None, lvl="INFO_DETAIL", tiles_in=len(master_tiles), tiles_out=len(master_tiles))
+        return master_tiles
+
+    total_chunks = sum(max(1, math.ceil(len(group) / max_group)) for group in groups)
+    processed_chunks = 0
+    replacements: dict[int, tuple[str | None, Any]] = {}
+    consumed_indices: set[int] = set()
+    cleanup_paths: list[str] = []
+
+    for group_id, group_indices in enumerate(groups, start=1):
+        members = [tile_map[idx] for idx in group_indices if idx in tile_map]
+        if not members:
+            continue
+        pcb("p45_group_info", prog=None, lvl="DEBUG", group=group_id, total=len(groups), members=len(members))
+        for chunk_start in range(0, len(members), max_group):
+            chunk_tiles = members[chunk_start : chunk_start + max_group]
+            processed_chunks += 1
+            if progress_callback:
+                try:
+                    progress_callback("phase4_5", processed_chunks, total_chunks)
+                except Exception:
+                    pass
+
+            reference_tile = chunk_tiles[0]
+            if local_scale == "final" and final_output_wcs and final_output_shape_hw:
+                local_wcs, local_shape = _phase45_compute_cutout_wcs(final_output_wcs, final_output_shape_hw, chunk_tiles)
+                if local_wcs is None or local_shape is None:
+                    local_wcs = reference_tile.wcs
+                    local_shape = reference_tile.shape_hw
+            else:
+                local_wcs = reference_tile.wcs
+                local_shape = reference_tile.shape_hw
+
+            if not (local_wcs and local_shape):
+                continue
+
+            storage = None
+            memmap_path = None
+            success = True
+            frames: list[np.ndarray] = []
+            channels = 3
+            preloaded: dict[int, np.ndarray] = {}
+            try:
+                with fits.open(chunk_tiles[0].path, memmap=True, do_not_scale_image_data=True) as hdul_sample:
+                    first_arr = _ensure_hwc_master_tile(hdul_sample[0].data, os.path.basename(chunk_tiles[0].path))
+                channels = int(first_arr.shape[-1]) if first_arr.ndim == 3 else 1
+                if channels <= 0:
+                    channels = 1
+                if channels not in (1, 3):
+                    channels = min(3, max(1, channels))
+                    if first_arr.shape[-1] != channels:
+                        first_arr = first_arr[..., :channels]
+                preloaded[chunk_tiles[0].index] = first_arr.astype(np.float32, copy=False)
+            except Exception:
+                success = False
+                channels = 3
+            if not success:
+                continue
+            try:
+                storage, memmap_path = _phase45_allocate_stack_storage(len(chunk_tiles), local_shape, channels, memmap_policy, temp_storage_dir)
+                for idx_tile, tile in enumerate(chunk_tiles):
+                    if tile.index in preloaded:
+                        arr = preloaded.pop(tile.index)
+                    else:
+                        with fits.open(tile.path, memmap=True, do_not_scale_image_data=True) as hdul:
+                            arr = _ensure_hwc_master_tile(hdul[0].data, os.path.basename(tile.path))
+                            arr = np.asarray(arr, dtype=np.float32)
+                    if arr.ndim == 2:
+                        arr = arr[..., np.newaxis]
+                    if arr.shape[-1] != channels:
+                        if channels == 3 and arr.shape[-1] == 1:
+                            arr = np.repeat(arr, 3, axis=-1)
+                        elif channels == 1:
+                            arr = arr[..., :1]
+                        else:
+                            arr = np.repeat(arr[..., :1], channels, axis=-1)
+                    arr = np.asarray(arr, dtype=np.float32, copy=False)
+                    reproj = np.full((local_shape[0], local_shape[1], channels), np.nan, dtype=np.float32)
+                    for ch in range(channels):
+                        plane = arr[..., ch]
+                        reproj_plane, footprint = reproject_interp((plane, tile.wcs), local_wcs, shape_out=(local_shape[0], local_shape[1]))
+                        if reproj_plane is None:
+                            success = False
+                            break
+                        reproj_plane = np.asarray(reproj_plane, dtype=np.float32)
+                        if footprint is not None:
+                            mask = np.asarray(footprint) <= 0.0
+                            if mask.shape == reproj_plane.shape:
+                                reproj_plane[mask] = np.nan
+                        reproj[..., ch] = reproj_plane
+                    if not success:
+                        break
+                    storage[idx_tile, :, :, :] = reproj
+                    frames.append(storage[idx_tile])
+                if not success or not frames:
+                    success = False
+            except Exception:
+                success = False
+
+            if not success:
+                _phase45_cleanup_storage(storage, memmap_path)
+                continue
+
+            try:
+                kappa_val = float(stack_cfg.get("kappa_low", 3.0))
+            except Exception:
+                kappa_val = 3.0
+            limits_val = stack_cfg.get("winsor_limits", (0.05, 0.05))
+            try:
+                limits_val = (
+                    float(limits_val[0]),
+                    float(limits_val[1]),
+                )
+            except Exception:
+                limits_val = (0.05, 0.05)
+            try:
+                max_pass_val = int(stack_cfg.get("winsor_max_frames_per_pass", 0))
+            except Exception:
+                max_pass_val = 0
+            try:
+                worker_limit_val = int(stack_cfg.get("winsor_worker_limit", 1))
+            except Exception:
+                worker_limit_val = 1
+            stack_kwargs = {
+                "kappa": kappa_val,
+                "winsor_limits": limits_val,
+                "winsor_max_frames_per_pass": max_pass_val,
+                "winsor_max_workers": max(1, worker_limit_val),
+            }
+            try:
+                if method == "winsor":
+                    super_arr, _ = zemosaic_align_stack.stack_winsorized_sigma_clip(
+                        frames,
+                        weight_method="none",
+                        zconfig=None,
+                        **stack_kwargs,
+                    )
+                elif method == "median":
+                    super_arr = np.nanmedian(np.stack(frames, axis=0), axis=0).astype(np.float32)
+                else:
+                    super_arr = np.nanmean(np.stack(frames, axis=0), axis=0).astype(np.float32)
+            except Exception:
+                _phase45_cleanup_storage(storage, memmap_path)
+                continue
+
+            _phase45_cleanup_storage(storage, memmap_path)
+
+            if super_arr is None:
+                continue
+
+            super_arr = np.asarray(super_arr, dtype=np.float32)
+            representative_idx = min(tile.index for tile in chunk_tiles)
+            consumed_indices.update(tile.index for tile in chunk_tiles)
+
+            target_dir = temp_storage_dir or output_folder
+            os.makedirs(target_dir, exist_ok=True)
+            super_filename = f"super_tile_{representative_idx:03d}_{uuid.uuid4().hex[:8]}.fits"
+            super_path = os.path.join(target_dir, super_filename)
+
+            header = fits.Header()
+            try:
+                header.update(local_wcs.to_header(relax=True))
+            except Exception:
+                pass
+            try:
+                header["ZMT_TYPE"] = ("Super Tile", "Inter-Master merged tile")
+                header["ZMT_SUPR"] = (len(chunk_tiles), "Tiles merged in Phase 4.5")
+            except Exception:
+                pass
+            try:
+                header.add_history(f"Inter-Master merge ({len(chunk_tiles)} tiles)")
+            except Exception:
+                header["HISTORY"] = f"Inter-Master merge ({len(chunk_tiles)} tiles)"
+
+            try:
+                zemosaic_utils.save_fits_image(
+                    image_data=super_arr,
+                    output_path=super_path,
+                    header=header,
+                    overwrite=True,
+                    save_as_float=True,
+                    axis_order="HWC" if super_arr.ndim == 3 else None,
+                )
+            except Exception:
+                try:
+                    fits.writeto(super_path, super_arr.astype(np.float32), header=header, overwrite=True)
+                except Exception:
+                    continue
+
+            replacements[representative_idx] = (super_path, local_wcs)
+            cleanup_paths.extend(tile.path for tile in chunk_tiles if tile.path)
+
+            snr_gain = math.sqrt(len(chunk_tiles))
+            pcb(
+                "p45_group_result",
+                prog=None,
+                lvl="INFO_DETAIL",
+                size=len(chunk_tiles),
+                out=os.path.basename(super_path),
+                snr=f"{snr_gain:.2f}",
+            )
+
+    if cache_retention_mode != "keep":
+        for path in cleanup_paths:
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+    new_master_tiles: list[tuple[str | None, Any]] = []
+    for idx, original in enumerate(master_tiles):
+        if idx in replacements:
+            new_master_tiles.append(replacements[idx])
+        elif idx not in consumed_indices:
+            new_master_tiles.append(original)
+
+    pcb(
+        "p45_finished",
+        prog=None,
+        lvl="INFO",
+        tiles_in=len(master_tiles),
+        tiles_out=len(new_master_tiles),
+    )
+    return new_master_tiles if new_master_tiles else master_tiles
+
+
 def _select_quality_anchor(
     ordered_ids: list[int],
     distances: dict[int, float],
@@ -6452,6 +6995,13 @@ def run_hierarchical_mosaic(
     radial_shape_power_config: float,
     min_radial_weight_floor_config: float,
     final_assembly_method_config: str,
+    inter_master_merge_enable_config: bool,
+    inter_master_overlap_threshold_config: float,
+    inter_master_min_group_size_config: int,
+    inter_master_stack_method_config: str,
+    inter_master_memmap_policy_config: str,
+    inter_master_local_scale_config: str,
+    inter_master_max_group_config: int,
     num_base_workers_config: int,
     # --- ARGUMENTS POUR LE ROGNAGE ---
     apply_master_tile_crop_config: bool,
@@ -6695,7 +7245,8 @@ def run_hierarchical_mosaic(
     STACK_RAM_BUDGET_BYTES = int(stack_ram_budget_gb * (1024 ** 3)) if stack_ram_budget_gb > 0 else 0
     PROGRESS_WEIGHT_PHASE1_RAW_SCAN = 30; PROGRESS_WEIGHT_PHASE2_CLUSTERING = 5
     PROGRESS_WEIGHT_PHASE3_MASTER_TILES = 35; PROGRESS_WEIGHT_PHASE4_GRID_CALC = 5
-    PROGRESS_WEIGHT_PHASE5_ASSEMBLY = 15; PROGRESS_WEIGHT_PHASE6_SAVE = 8
+    PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER = 6
+    PROGRESS_WEIGHT_PHASE5_ASSEMBLY = 9; PROGRESS_WEIGHT_PHASE6_SAVE = 8
     PROGRESS_WEIGHT_PHASE7_CLEANUP = 2
 
     DEFAULT_PHASE_WORKER_RATIO = 1.0
@@ -8613,6 +9164,42 @@ def run_hierarchical_mosaic(
             total=f"{total_elapsed:.2f}",
         )
     pcb("run_info_phase4_finished", prog=current_global_progress, lvl="INFO", shape=final_output_shape_hw, crval=final_output_wcs.wcs.crval if final_output_wcs.wcs else 'N/A')
+
+    base_progress_phase4_5 = current_global_progress
+    if inter_master_merge_enable_config:
+        pcb("PHASE_UPDATE:4.5", prog=None, lvl="ETA_LEVEL")
+        _log_memory_usage(progress_callback, "Début Phase 4.5 (Inter-Master merge)")
+        inter_cfg_phase45 = {
+            "enable": bool(inter_master_merge_enable_config),
+            "overlap_threshold": float(inter_master_overlap_threshold_config),
+            "min_group_size": int(inter_master_min_group_size_config),
+            "stack_method": str(inter_master_stack_method_config).lower(),
+            "memmap_policy": str(inter_master_memmap_policy_config).lower(),
+            "local_scale": str(inter_master_local_scale_config).lower(),
+            "max_group": int(inter_master_max_group_config),
+        }
+        stack_cfg_phase45 = {
+            "kappa_low": float(stack_kappa_low),
+            "winsor_limits": parsed_winsor_limits,
+            "winsor_max_frames_per_pass": winsor_max_frames_per_pass_config,
+            "winsor_worker_limit": winsor_worker_limit_config,
+        }
+        master_tiles_results_list = _run_phase4_5_inter_master_merge(
+            master_tiles_results_list,
+            final_output_wcs,
+            final_output_shape_hw,
+            temp_master_tile_storage_dir,
+            output_folder,
+            cache_retention_mode,
+            inter_cfg_phase45,
+            stack_cfg_phase45,
+            progress_callback,
+            pcb,
+        )
+        current_global_progress = base_progress_phase4_5 + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
+        _log_memory_usage(progress_callback, "Fin Phase 4.5")
+    else:
+        current_global_progress = base_progress_phase4_5 + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
 
 # --- Phase 5 (Assemblage Final) ---
     base_progress_phase5 = current_global_progress
