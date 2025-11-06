@@ -385,17 +385,19 @@ class ZeMosaicGUI:
             "phase2_cluster": "phase2",
             "phase3_master_tiles": "phase3",
             "phase4_grid": "phase4",
+            "phase4_5": "phase4_5",
             "phase5_intertile": "phase5",
             "phase5_incremental": "phase5",
             "phase5_reproject": "phase5",
         }
-        self._stage_order = ["phase1", "phase2", "phase3", "phase4", "phase5", "phase6", "phase7"]
+        self._stage_order = ["phase1", "phase2", "phase3", "phase4", "phase4_5", "phase5", "phase6", "phase7"]
         self._stage_weights = {
             "phase1": 30.0,
             "phase2": 5.0,
             "phase3": 35.0,
             "phase4": 5.0,
-            "phase5": 15.0,
+            "phase4_5": 6.0,
+            "phase5": 9.0,
             "phase6": 8.0,
             "phase7": 2.0,
         }
@@ -429,10 +431,32 @@ class ZeMosaicGUI:
         # radial_shape_power est géré via self.config directement
         
         # --- METHODE D'ASSEMBLAGE ---
-        self.final_assembly_method_var = tk.StringVar(master=self.root, 
+        self.final_assembly_method_var = tk.StringVar(master=self.root,
             value=self.config.get("final_assembly_method", self.assembly_method_keys[0])
         )
         self.final_assembly_method_var.trace_add("write", self._on_assembly_method_change)
+
+        self.inter_master_merge_var = tk.BooleanVar(
+            master=self.root,
+            value=bool(self.config.get("inter_master_merge_enable", False)),
+        )
+        overlap_default = 0.60
+        try:
+            overlap_default = float(self.config.get("inter_master_overlap_threshold", 0.60))
+        except Exception:
+            overlap_default = 0.60
+        overlap_default = max(0.0, min(1.0, overlap_default))
+        self.inter_master_overlap_var = tk.DoubleVar(
+            master=self.root,
+            value=overlap_default * 100.0,
+        )
+        method_default = str(self.config.get("inter_master_stack_method", "winsor")).lower()
+        if method_default not in {"winsor", "mean", "median"}:
+            method_default = "winsor"
+        self.inter_master_method_var = tk.StringVar(
+            master=self.root,
+            value=method_default,
+        )
         
         # --- NOMBRE DE WORKERS ---
         # Utiliser 0 pour auto, comme convenu. La clé de config est "num_processing_workers".
@@ -1169,6 +1193,45 @@ class ZeMosaicGUI:
         self.final_assembly_method_combo = ttk.Combobox(final_assembly_options_frame, values=[], state="readonly", width=40)
         self.final_assembly_method_combo.grid(row=asm_opt_row, column=1, padx=5, pady=5, sticky="ew")
         self.final_assembly_method_combo.bind("<<ComboboxSelected>>", lambda e, c=self.final_assembly_method_combo, v=self.final_assembly_method_var, k_list=self.assembly_method_keys, p="assembly_method": self._combo_to_key(e, c, v, k_list, p)); asm_opt_row += 1
+
+        self.inter_master_merge_check = ttk.Checkbutton(
+            final_assembly_options_frame,
+            text="",
+            variable=self.inter_master_merge_var,
+        )
+        self.inter_master_merge_check.grid(row=asm_opt_row, column=0, columnspan=2, padx=5, pady=(2, 2), sticky="w")
+        self.translatable_widgets["cfg_inter_master_enable"] = self.inter_master_merge_check
+        asm_opt_row += 1
+
+        self.inter_master_overlap_label = ttk.Label(final_assembly_options_frame, text="")
+        self.inter_master_overlap_label.grid(row=asm_opt_row, column=0, padx=5, pady=2, sticky="w")
+        self.translatable_widgets["cfg_inter_master_overlap"] = self.inter_master_overlap_label
+
+        self.inter_master_overlap_spin = ttk.Spinbox(
+            final_assembly_options_frame,
+            from_=0.0,
+            to=100.0,
+            increment=1.0,
+            textvariable=self.inter_master_overlap_var,
+            width=6,
+            format="%.0f",
+        )
+        self.inter_master_overlap_spin.grid(row=asm_opt_row, column=1, padx=5, pady=2, sticky="w")
+        asm_opt_row += 1
+
+        self.inter_master_method_label = ttk.Label(final_assembly_options_frame, text="")
+        self.inter_master_method_label.grid(row=asm_opt_row, column=0, padx=5, pady=2, sticky="w")
+        self.translatable_widgets["cfg_inter_master_method"] = self.inter_master_method_label
+
+        self.inter_master_method_combo = ttk.Combobox(
+            final_assembly_options_frame,
+            state="readonly",
+            width=20,
+            textvariable=self.inter_master_method_var,
+            values=("winsor", "mean", "median"),
+        )
+        self.inter_master_method_combo.grid(row=asm_opt_row, column=1, padx=5, pady=2, sticky="w")
+        asm_opt_row += 1
 
         gpu_chk = ttk.Checkbutton(
             final_assembly_options_frame,
@@ -2320,7 +2383,9 @@ class ZeMosaicGUI:
                             phase_name = self._tr(f"phase_name_{phase_num}")
                             display = self._tr("phase_display_format", "P{num} - {name}", num=phase_num, name=phase_name)
                         else:
-                            display = str(phase_id)
+                            normalized_id = phase_id.replace(".", "_")
+                            phase_name = self._tr(f"phase_name_{normalized_id}", phase_id)
+                            display = self._tr("phase_display_format", "P{num} - {name}", num=phase_id, name=phase_name)
                         if hasattr(self.phase_var, 'set') and callable(self.phase_var.set):
                             self.phase_var.set(display)
                     except Exception:
@@ -3094,6 +3159,23 @@ class ZeMosaicGUI:
         self.config["quality_crop_k_sigma"] = float(quality_crop_k_sigma_val)
         self.config["quality_crop_margin_px"] = int(quality_crop_margin_val)
 
+        inter_master_enable_val = bool(self.inter_master_merge_var.get())
+        try:
+            overlap_pct_val = float(self.inter_master_overlap_var.get())
+        except Exception:
+            overlap_pct_val = float(self.config.get("inter_master_overlap_threshold", 0.60) * 100.0)
+            self.inter_master_overlap_var.set(overlap_pct_val)
+        overlap_pct_val = max(0.0, min(100.0, overlap_pct_val))
+        overlap_fraction = overlap_pct_val / 100.0
+        method_val = str(self.inter_master_method_var.get()).lower()
+        if method_val not in {"winsor", "mean", "median"}:
+            method_val = "winsor"
+            self.inter_master_method_var.set(method_val)
+
+        self.config["inter_master_merge_enable"] = inter_master_enable_val
+        self.config["inter_master_overlap_threshold"] = overlap_fraction
+        self.config["inter_master_stack_method"] = method_val
+
         span_range_cfg = self.config.get("anchor_quality_span_range", [0.02, 6.0])
         if not (isinstance(span_range_cfg, (list, tuple)) and len(span_range_cfg) >= 2):
             span_range_cfg = [0.02, 6.0]
@@ -3132,6 +3214,23 @@ class ZeMosaicGUI:
         poststack_min_improvement_cfg = min(1.0, max(0.0, poststack_min_improvement_cfg))
         poststack_use_overlap_cfg = bool(self.config.get("poststack_anchor_use_overlap_affine", True))
 
+        try:
+            inter_master_min_group_val = int(self.config.get("inter_master_min_group_size", 2))
+        except Exception:
+            inter_master_min_group_val = 2
+        inter_master_min_group_val = max(2, inter_master_min_group_val)
+        try:
+            inter_master_max_group_val = int(self.config.get("inter_master_max_group", 64))
+        except Exception:
+            inter_master_max_group_val = 64
+        inter_master_max_group_val = max(inter_master_min_group_val, inter_master_max_group_val)
+        inter_master_memmap_policy_val = str(self.config.get("inter_master_memmap_policy", "auto")).lower()
+        if inter_master_memmap_policy_val not in {"auto", "always", "never"}:
+            inter_master_memmap_policy_val = "auto"
+        inter_master_local_scale_val = str(self.config.get("inter_master_local_scale", "final")).lower()
+        if inter_master_local_scale_val not in {"final", "native"}:
+            inter_master_local_scale_val = "final"
+
         worker_args = (
             input_dir, output_dir, astap_exe, astap_data,
             astap_radius_val, astap_downsample_val, astap_sensitivity_val,
@@ -3152,6 +3251,13 @@ class ZeMosaicGUI:
             radial_shape_power_val,
             min_radial_weight_floor_val,
             final_assembly_method_val,
+            inter_master_enable_val,
+            overlap_fraction,
+            inter_master_min_group_val,
+            method_val,
+            inter_master_memmap_policy_val,
+            inter_master_local_scale_val,
+            inter_master_max_group_val,
             num_base_workers_gui_val,
             # --- NOUVEAUX ARGUMENTS POUR LE ROGNAGE ---
             apply_master_tile_crop_val,
