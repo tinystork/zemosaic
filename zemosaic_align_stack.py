@@ -1735,7 +1735,7 @@ def align_images_in_group(image_data_list: list,
             try_fft = True
             if try_fft:
                 src_lum = (0.299 * source_image_adu[..., 0] + 0.587 * source_image_adu[..., 1] + 0.114 * source_image_adu[..., 2]).astype(np.float32) if (source_image_adu.ndim == 3 and source_image_adu.shape[-1] == 3) else source_image_adu
-                ref_lum = (0.299 * reference_image_adu[..., 0] + 0.587 * reference_image_adu[..., 1] + 0.114 * reference_image_adu[..., 2]).astype(np.float32) if (reference_image_adu.ndim == 3 && reference_image_adu.shape[-1] == 3) else reference_image_adu
+                ref_lum = (0.299 * reference_image_adu[..., 0] + 0.587 * reference_image_adu[..., 1] + 0.114 * reference_image_adu[..., 2]).astype(np.float32) if (reference_image_adu.ndim == 3 and reference_image_adu.shape[-1] == 3) else reference_image_adu
                 dy, dx, conf = _fft_phase_shift(src_lum, ref_lum)
                 if abs(dy) + abs(dx) > 0 and conf >= 3.0:  # heuristique de confiance
                     prealign_fft_img = _apply_integer_shift_hw_or_hwc(source_image_adu, dy, dx)
