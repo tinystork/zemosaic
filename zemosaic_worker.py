@@ -4356,6 +4356,20 @@ def get_wcs_and_pretreat_raw_file(
     if solver_settings is None:
         solver_settings = {}
 
+    header_precheck = None
+    preexisting_wcs_flag = False
+    if ASTROPY_AVAILABLE and fits is not None and hasattr(zemosaic_utils, "has_valid_wcs"):
+        try:
+            with fits.open(file_path, mode="readonly", memmap=False) as hdul_hdr:
+                header_precheck = hdul_hdr[0].header.copy()
+        except Exception:
+            header_precheck = None
+        else:
+            try:
+                preexisting_wcs_flag = bool(zemosaic_utils.has_valid_wcs(header_precheck))
+            except Exception:
+                preexisting_wcs_flag = False
+
     # Charger configuration pour options de prétraitement (si disponible)
     _cfg_pre = {}
     try:
@@ -4386,6 +4400,12 @@ def get_wcs_and_pretreat_raw_file(
     else:
         img_data_raw_adu = res_load
         header_orig = None
+
+    if header_orig is None and header_precheck is not None:
+        try:
+            header_orig = header_precheck.copy()
+        except Exception:
+            header_orig = copy.deepcopy(header_precheck)
 
     if img_data_raw_adu is None or header_orig is None:
         _pcb_local("getwcs_error_load_failed", lvl="ERROR", filename=filename)
@@ -4497,20 +4517,55 @@ def get_wcs_and_pretreat_raw_file(
     except Exception:
         pass
 
+    header_for_wcs_check = header_orig if header_orig is not None else header_precheck
+    skip_solver_due_to_existing_wcs = False
+    if header_for_wcs_check is not None and hasattr(zemosaic_utils, "has_valid_wcs"):
+        try:
+            skip_solver_due_to_existing_wcs = bool(zemosaic_utils.has_valid_wcs(header_for_wcs_check))
+        except Exception:
+            skip_solver_due_to_existing_wcs = bool(preexisting_wcs_flag)
+    else:
+        skip_solver_due_to_existing_wcs = bool(preexisting_wcs_flag)
+
+    preexisting_wcs_obj = None
+    if (
+        skip_solver_due_to_existing_wcs
+        and header_for_wcs_check is not None
+        and ASTROPY_AVAILABLE
+        and WCS
+    ):
+        try:
+            candidate_wcs = WCS(header_for_wcs_check, naxis=2, relax=True)
+            if getattr(candidate_wcs, "is_celestial", False):
+                preexisting_wcs_obj = candidate_wcs
+            else:
+                skip_solver_due_to_existing_wcs = False
+        except Exception as e_wcs_hdr:
+            skip_solver_due_to_existing_wcs = False
+            _pcb_local("getwcs_warn_header_wcs_read_failed", lvl="WARN", filename=filename, error=str(e_wcs_hdr))
+            logger.warning("Existing WCS header invalid for '%s': %s", filename, e_wcs_hdr)
+
     # --- Résolution WCS ---
     _pcb_local(f"  Résolution WCS pour '{filename}'...", lvl="DEBUG_DETAIL")
-    wcs_brute = None
+    wcs_brute = preexisting_wcs_obj if preexisting_wcs_obj is not None else None
     # Évite d'écrire le header FITS si le WCS est déjà présent dans le fichier d'origine.
     # Nous ne réécrivons le header que si un solver externe (ASTAP/ASTROMETRY/ANSVR)
     # a effectivement injecté/ajusté des clés WCS dans header_orig.
     should_write_header_back = False
-    if ASTROPY_AVAILABLE and WCS: # S'assurer que WCS est bien l'objet d'Astropy
+    if preexisting_wcs_obj is not None:
+        skip_msg = f"Skip WCS solve for '{filename}' (WCS present)."
+        _pcb_local(skip_msg, lvl="INFO")
+        logger.info(skip_msg)
+    if wcs_brute is None and ASTROPY_AVAILABLE and WCS: # S'assurer que WCS est bien l'objet d'Astropy
         try:
             wcs_from_header = WCS(header_orig, naxis=2, relax=True) # Utiliser WCS d'Astropy
             if wcs_from_header.is_celestial and hasattr(wcs_from_header.wcs,'crval') and \
                (hasattr(wcs_from_header.wcs,'cdelt') or hasattr(wcs_from_header.wcs,'cd') or hasattr(wcs_from_header.wcs,'pc')):
                 wcs_brute = wcs_from_header
                 _pcb_local(f"    WCS trouvé dans header FITS de '{filename}'.", lvl="DEBUG_DETAIL")
+                skip_msg = f"Skip WCS solve for '{filename}' (WCS present)."
+                _pcb_local(skip_msg, lvl="INFO")
+                logger.info(skip_msg)
                 # WCS déjà présent => pas besoin de réécrire le header
                 should_write_header_back = False
         except Exception as e_wcs_hdr:
