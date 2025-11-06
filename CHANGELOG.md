@@ -12,3 +12,7 @@
 * Automatic memory fallback controls for Winsorized stacking (`winsor_auto_fallback_on_memory_error`, `winsor_min_frames_per_pass`, `winsor_memmap_fallback`, `winsor_split_strategy`)
 * Fixed incremental assembly with reproject>=0.11
 * 16-bit FITS export now writes a 2D luminance primary with R/G/B extensions for broader viewer compatibility, with a legacy RGB cube available from Advanced options
+* Added cross-platform GUI icon fallback using existing PNG assets
+
+### Changed
+* Improved cross-platform startup: GUI icon fallback, optional dependency handling, and GPU detection now degrade gracefully on macOS/Linux (CUDA acceleration remains Windows-only)
