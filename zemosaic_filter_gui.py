@@ -2821,9 +2821,14 @@ def launch_filter_interface(
             timeout_val = _coerce_int(timeout_candidate)
             if timeout_val is None or timeout_val <= 0:
                 timeout_val = 60
-            timeout_sec = max(5, min(timeout_val, 120))
+            timeout_sec = max(5, timeout_val)
             solver_settings_local["timeout"] = timeout_sec
             solver_settings_local["ansvr_timeout"] = timeout_sec
+
+            # ASTAP handling in the worker always allows up to 180 seconds before
+            # timing out. Mirror that behaviour here so the filter UI matches the
+            # main pipeline resilience on slow solves.
+            astap_timeout_sec = max(180, timeout_sec)
 
             astrometry_direct = getattr(astrometry_mod, "solve_with_astrometry_net", None) if astrometry_mod else None
             ansvr_direct = getattr(astrometry_mod, "solve_with_ansvr", None) if astrometry_mod else None
@@ -2962,7 +2967,7 @@ def launch_filter_interface(
                                 search_radius_deg=srch_radius,
                                 downsample_factor=downsample_val,
                                 sensitivity=sensitivity_val,
-                                timeout_sec=timeout_sec,
+                                timeout_sec=astap_timeout_sec,
                                 update_original_header_in_place=write_inplace,
                                 progress_callback=_progress_callback,
                             )
