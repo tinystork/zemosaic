@@ -45,6 +45,7 @@
 import sys  # Ajout pour sys.path et sys.modules
 import multiprocessing
 import os
+import platform
 # import reproject # L'import direct ici n'est pas crucial, mais ne fait pas de mal
 import tkinter as tk
 from tkinter import messagebox  # Nécessaire pour la messagebox d'erreur critique
@@ -54,6 +55,10 @@ print("--- run_zemosaic.py: DÉBUT DES IMPORTS ---")
 print(f"Python Executable: {sys.executable}")
 print(f"Python Version: {sys.version}")
 print(f"Chemin de travail actuel (CWD): {sys.path[0]}") # sys.path[0] est généralement le dossier du script
+
+_system_name = platform.system().lower()
+if _system_name == "darwin":
+    print("[Info] macOS détecté : CUDA/GPU désactivé si indisponible. Mode CPU.")
 
 # S'assurer que le dossier parent est dans sys.path afin que les imports relatifs
 # dans les modules du package fonctionnent même lorsque ce script est exécuté

@@ -135,6 +135,15 @@ def load_config():
         # print(f"Config file not found at {config_path}. Using default configuration.")
     current_config.setdefault("crop_follow_signal", False)
     current_config.setdefault("cache_retention", "run_end")
+    for key in (
+        "astap_executable_path",
+        "astap_data_directory_path",
+        "coadd_memmap_dir",
+        "gpu_selector",
+    ):
+        value = current_config.get(key)
+        if isinstance(value, str) and value:
+            current_config[key] = os.path.expanduser(value)
     return current_config
 
 def save_config(config_data):

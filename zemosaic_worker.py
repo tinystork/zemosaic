@@ -63,6 +63,8 @@ import uuid
 import multiprocessing
 import threading
 import itertools
+import platform
+import importlib.util
 from dataclasses import dataclass
 from typing import Callable, Any, Iterable
 from types import SimpleNamespace
@@ -76,6 +78,10 @@ from concurrent.futures.process import BrokenProcessPool
 
 # Nombre maximum de tentatives d'alignement avant abandon définitif
 MAX_ALIGNMENT_RETRY_ATTEMPTS = 3
+
+SYSTEM_NAME = platform.system().lower()
+IS_WINDOWS = SYSTEM_NAME == "windows"
+CUPY_AVAILABLE = importlib.util.find_spec("cupy") is not None and IS_WINDOWS
 
 
 def _ensure_hwc_master_tile(
@@ -2086,9 +2092,7 @@ def _probe_system_resources(
 
     # GPU detection via CuPy first, then torch
     try:
-        import importlib
-
-        if importlib.util.find_spec("cupy") is not None:
+        if CUPY_AVAILABLE:
             import cupy  # type: ignore
 
             try:
@@ -2874,7 +2878,7 @@ def _categorize_io_speed(mbps: float | None) -> str:
 
 def gpu_is_available() -> bool:
     """Return True if CuPy and a CUDA device are available."""
-    if importlib.util.find_spec("cupy") is None:
+    if not CUPY_AVAILABLE:
         return False
     try:
         import cupy
@@ -6128,7 +6132,7 @@ def compute_per_tile_gains_from_coverage(
     if sigma_px > 0:
         blurred = None
         blur_source = "identity"
-        if use_gpu:
+        if use_gpu and CUPY_AVAILABLE:
             try:
                 import cupy as cp  # type: ignore
                 from cupyx.scipy.ndimage import gaussian_filter as gpu_gaussian_filter  # type: ignore
@@ -6697,7 +6701,7 @@ def run_hierarchical_mosaic(
     DEFAULT_PHASE_WORKER_RATIO = 1.0
     ALIGNMENT_PHASE_WORKER_RATIO = 0.5  # Limit aggressive phases to 50% of base workers
 
-    if use_gpu_phase5 and gpu_id_phase5 is not None:
+    if use_gpu_phase5 and gpu_id_phase5 is not None and CUPY_AVAILABLE:
         os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id_phase5)
         try:
@@ -6717,7 +6721,10 @@ def run_hierarchical_mosaic(
 
     # Determine final GPU usage flag only if a valid NVIDIA GPU is selected
     use_gpu_phase5_flag = (
-        use_gpu_phase5 and gpu_id_phase5 is not None and gpu_is_available()
+        use_gpu_phase5
+        and gpu_id_phase5 is not None
+        and CUPY_AVAILABLE
+        and gpu_is_available()
     )
     if use_gpu_phase5_flag and ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils:
         try:

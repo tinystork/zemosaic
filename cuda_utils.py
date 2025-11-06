@@ -44,10 +44,27 @@
 
 import os
 import subprocess
+import shutil
+import platform
+import importlib.util
+
+SYSTEM_NAME = platform.system().lower()
+IS_WINDOWS = SYSTEM_NAME == "windows"
+CUPY_AVAILABLE = importlib.util.find_spec("cupy") is not None
+
+
+def gpu_supported() -> bool:
+    """Return ``True`` when CUDA operations are supported on this platform."""
+
+    return IS_WINDOWS and CUPY_AVAILABLE
 
 
 def enforce_nvidia_gpu():
     """Force l'utilisation du premier GPU NVIDIA via CUDA_VISIBLE_DEVICES."""
+    if not gpu_supported():
+        return False
+    if shutil.which("nvidia-smi") is None:
+        return False
     try:
         out = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
