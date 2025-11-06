@@ -51,7 +51,7 @@
     "winsor_min_frames_per_pass": 4,
     "winsor_memmap_fallback": "auto",
     "winsor_split_strategy": "sequential",
-    "max_raw_per_master_tile": 50,
+    "max_raw_per_master_tile": 30,
     "center_out_normalization_p3": true,
     "center_out_anchor_mode": "auto_central_quality",
     "anchor_quality_probe_limit": 20,
@@ -85,6 +85,7 @@
     ],
     "intertile_robust_clip_sigma": 2.5,
     "intertile_global_recenter": true,
+    "force_resolve_existing_wcs": false,
     "intertile_recenter_clip": [
         0.85,
         1.18

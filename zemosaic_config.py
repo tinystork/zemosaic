@@ -81,6 +81,7 @@ DEFAULT_CONFIG = {
     "intertile_sky_percentile": [30.0, 70.0],
     "intertile_robust_clip_sigma": 2.5,
     "intertile_global_recenter": True,
+    "force_resolve_existing_wcs": False,
     "intertile_recenter_clip": [0.85, 1.18],
     "use_auto_intertile": False,
     "match_background_for_final": True,

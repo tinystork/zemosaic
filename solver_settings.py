@@ -66,6 +66,9 @@ class SolverSettings:
     astap_downsample: int = 2
     astap_sensitivity: int = 100
     use_auto_intertile: bool = False
+    force_resolve_existing_wcs: bool = False
+    intertile_offset_limit_adu: float = 50.0
+    intertile_gain_limits: tuple[float, float] = (0.75, 1.25)
 
     @staticmethod
     def default_path() -> Path:

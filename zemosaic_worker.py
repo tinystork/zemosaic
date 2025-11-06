@@ -550,8 +550,16 @@ def _phase45_tile_corners(tile: _InterMasterTile) -> Any | None:
         return None
     try:
         h, w = tile.shape_hw
-        xs = np.asarray([0.0, float(w), float(w), 0.0], dtype=np.float64)
-        ys = np.asarray([0.0, 0.0, float(h), float(h)], dtype=np.float64)
+        # Use pixel-edge coordinates (-0.5 .. width-0.5) so the projected polygon
+        # matches the actual coverage footprint instead of pixel centres.
+        xs = np.asarray(
+            [-0.5, float(w) - 0.5, float(w) - 0.5, -0.5],
+            dtype=np.float64,
+        )
+        ys = np.asarray(
+            [-0.5, -0.5, float(h) - 0.5, float(h) - 0.5],
+            dtype=np.float64,
+        )
         sky = tile.wcs.pixel_to_world(xs, ys)
         tile.sky_corners = sky
         return sky
@@ -663,10 +671,10 @@ def _phase45_compute_cutout_wcs(final_wcs: Any, final_shape_hw: tuple[int, int] 
     if wcs_copy is None:
         return None, None
     height, width = int(final_shape_hw[0]), int(final_shape_hw[1])
-    min_x = float(width)
-    min_y = float(height)
-    max_x = 0.0
-    max_y = 0.0
+    edge_min_x = float("inf")
+    edge_min_y = float("inf")
+    edge_max_x = float("-inf")
+    edge_max_y = float("-inf")
     valid = False
     for tile in tiles:
         sky = _phase45_tile_corners(tile)
@@ -682,27 +690,29 @@ def _phase45_compute_cutout_wcs(final_wcs: Any, final_shape_hw: tuple[int, int] 
             continue
         if px.size == 0 or py.size == 0:
             continue
-        min_x = min(min_x, float(np.nanmin(px)))
-        min_y = min(min_y, float(np.nanmin(py)))
-        max_x = max(max_x, float(np.nanmax(px)))
-        max_y = max(max_y, float(np.nanmax(py)))
+        edge_min_x = min(edge_min_x, float(np.nanmin(px)))
+        edge_min_y = min(edge_min_y, float(np.nanmin(py)))
+        edge_max_x = max(edge_max_x, float(np.nanmax(px)))
+        edge_max_y = max(edge_max_y, float(np.nanmax(py)))
         valid = True
     if not valid:
         return None, None
-    min_x = max(0.0, math.floor(min_x))
-    min_y = max(0.0, math.floor(min_y))
-    max_x = min(float(width), math.ceil(max_x))
-    max_y = min(float(height), math.ceil(max_y))
-    if max_x <= min_x:
-        max_x = min(width, min_x + 1.0)
-    if max_y <= min_y:
-        max_y = min(height, min_y + 1.0)
-    local_w = max(1, int(round(max_x - min_x)))
-    local_h = max(1, int(round(max_y - min_y)))
+    # Convert edge coordinates (relative to pixel boundaries) into integer pixel
+    # indices that map to the same mosaic grid as the final WCS.
+    start_x = max(0, int(math.floor(edge_min_x + 0.5)))
+    start_y = max(0, int(math.floor(edge_min_y + 0.5)))
+    stop_x = min(width, int(math.ceil(edge_max_x - 0.5)) + 1)
+    stop_y = min(height, int(math.ceil(edge_max_y - 0.5)) + 1)
+    if stop_x <= start_x:
+        stop_x = min(width, start_x + 1)
+    if stop_y <= start_y:
+        stop_y = min(height, start_y + 1)
+    local_w = max(1, int(stop_x - start_x))
+    local_h = max(1, int(stop_y - start_y))
     try:
         if hasattr(wcs_copy, "wcs") and hasattr(wcs_copy.wcs, "crpix"):
-            wcs_copy.wcs.crpix[0] -= min_x
-            wcs_copy.wcs.crpix[1] -= min_y
+            wcs_copy.wcs.crpix[0] -= start_x
+            wcs_copy.wcs.crpix[1] -= start_y
         if hasattr(wcs_copy, "array_shape"):
             wcs_copy.array_shape = (local_h, local_w)
     except Exception:
@@ -4488,20 +4498,37 @@ def get_wcs_and_pretreat_raw_file(
 
     if solver_settings is None:
         solver_settings = {}
+    elif not isinstance(solver_settings, dict):
+        try:
+            solver_settings = dict(solver_settings)
+        except Exception:
+            solver_settings = getattr(solver_settings, "__dict__", {}) or {}
+            if not isinstance(solver_settings, dict):
+                solver_settings = {}
 
     header_precheck = None
     preexisting_wcs_flag = False
-    if ASTROPY_AVAILABLE and fits is not None and hasattr(zemosaic_utils, "has_valid_wcs"):
+    preexisting_wcs_failure_reason = None
+    if ASTROPY_AVAILABLE and fits is not None:
         try:
             with fits.open(file_path, mode="readonly", memmap=False) as hdul_hdr:
                 header_precheck = hdul_hdr[0].header.copy()
         except Exception:
             header_precheck = None
         else:
-            try:
-                preexisting_wcs_flag = bool(zemosaic_utils.has_valid_wcs(header_precheck))
-            except Exception:
-                preexisting_wcs_flag = False
+            if hasattr(zemosaic_utils, "validate_wcs_header"):
+                try:
+                    preexisting_wcs_flag, _, failure_reason = zemosaic_utils.validate_wcs_header(header_precheck)
+                except Exception as exc_validate:
+                    preexisting_wcs_flag = False
+                    failure_reason = f"validate_exception: {exc_validate}"
+                if not preexisting_wcs_flag:
+                    preexisting_wcs_failure_reason = failure_reason
+            elif hasattr(zemosaic_utils, "has_valid_wcs"):
+                try:
+                    preexisting_wcs_flag = bool(zemosaic_utils.has_valid_wcs(header_precheck))
+                except Exception:
+                    preexisting_wcs_flag = False
 
     # Charger configuration pour options de prétraitement (si disponible)
     _cfg_pre = {}
@@ -4512,6 +4539,26 @@ def get_wcs_and_pretreat_raw_file(
         _cfg_pre = {}
     _bg_gpu_enabled = bool(_cfg_pre.get("preprocess_remove_background_gpu", False))
     _bg_sigma = float(_cfg_pre.get("preprocess_background_sigma", 24.0))
+    force_resolve_existing_wcs_cfg = bool(_cfg_pre.get("force_resolve_existing_wcs", False))
+    force_resolve_existing_wcs = bool(
+        solver_settings.get("force_resolve_existing_wcs", force_resolve_existing_wcs_cfg)
+    )
+    try:
+        affine_offset_limit_adu = float(solver_settings.get("intertile_offset_limit_adu", 50.0))
+    except Exception:
+        affine_offset_limit_adu = 50.0
+    affine_offset_limit_adu = max(0.0, abs(affine_offset_limit_adu))
+    gain_limits_cfg = solver_settings.get("intertile_gain_limits")
+    if isinstance(gain_limits_cfg, (list, tuple)) and len(gain_limits_cfg) == 2:
+        try:
+            gain_limit_min = float(gain_limits_cfg[0])
+            gain_limit_max = float(gain_limits_cfg[1])
+        except Exception:
+            gain_limit_min, gain_limit_max = 0.75, 1.25
+    else:
+        gain_limit_min, gain_limit_max = 0.75, 1.25
+    if gain_limit_min > gain_limit_max:
+        gain_limit_min, gain_limit_max = gain_limit_max, gain_limit_min
 
     _pcb_local(f"GetWCS_Pretreat: Début pour '{filename}'.", lvl="DEBUG_DETAIL") # Niveau DEBUG_DETAIL pour être moins verbeux
 
@@ -4652,7 +4699,19 @@ def get_wcs_and_pretreat_raw_file(
 
     header_for_wcs_check = header_orig if header_orig is not None else header_precheck
     skip_solver_due_to_existing_wcs = False
-    if header_for_wcs_check is not None and hasattr(zemosaic_utils, "has_valid_wcs"):
+    wcs_validation_reason = None
+    preexisting_wcs_obj = None
+    if header_for_wcs_check is not None and hasattr(zemosaic_utils, "validate_wcs_header"):
+        try:
+            valid_wcs, candidate_wcs, failure_reason = zemosaic_utils.validate_wcs_header(header_for_wcs_check)
+        except Exception as exc_validate_hdr:
+            valid_wcs, candidate_wcs, failure_reason = False, None, f"validate_exception: {exc_validate_hdr}"
+        skip_solver_due_to_existing_wcs = bool(valid_wcs)
+        if skip_solver_due_to_existing_wcs:
+            preexisting_wcs_obj = candidate_wcs
+        else:
+            wcs_validation_reason = failure_reason
+    elif header_for_wcs_check is not None and hasattr(zemosaic_utils, "has_valid_wcs"):
         try:
             skip_solver_due_to_existing_wcs = bool(zemosaic_utils.has_valid_wcs(header_for_wcs_check))
         except Exception:
@@ -4660,23 +4719,43 @@ def get_wcs_and_pretreat_raw_file(
     else:
         skip_solver_due_to_existing_wcs = bool(preexisting_wcs_flag)
 
-    preexisting_wcs_obj = None
-    if (
-        skip_solver_due_to_existing_wcs
-        and header_for_wcs_check is not None
-        and ASTROPY_AVAILABLE
-        and WCS
-    ):
+    if skip_solver_due_to_existing_wcs and preexisting_wcs_obj is None and header_for_wcs_check is not None and ASTROPY_AVAILABLE and WCS:
         try:
-            candidate_wcs = WCS(header_for_wcs_check, naxis=2, relax=True)
-            if getattr(candidate_wcs, "is_celestial", False):
-                preexisting_wcs_obj = candidate_wcs
+            candidate_wcs_hdr = WCS(header_for_wcs_check, naxis=2, relax=True)
+            if getattr(candidate_wcs_hdr, "is_celestial", False):
+                preexisting_wcs_obj = candidate_wcs_hdr
             else:
                 skip_solver_due_to_existing_wcs = False
+                if wcs_validation_reason is None:
+                    wcs_validation_reason = "wcs_not_celestial"
         except Exception as e_wcs_hdr:
             skip_solver_due_to_existing_wcs = False
+            if wcs_validation_reason is None:
+                wcs_validation_reason = f"astropy_wcs_exception: {e_wcs_hdr}"
             _pcb_local("getwcs_warn_header_wcs_read_failed", lvl="WARN", filename=filename, error=str(e_wcs_hdr))
             logger.warning("Existing WCS header invalid for '%s': %s", filename, e_wcs_hdr)
+
+    if not skip_solver_due_to_existing_wcs and wcs_validation_reason is None:
+        wcs_validation_reason = preexisting_wcs_failure_reason
+
+    if force_resolve_existing_wcs and skip_solver_due_to_existing_wcs:
+        _pcb_local(
+            "getwcs_info_force_resolve_existing_wcs",
+            lvl="INFO",
+            filename=filename,
+        )
+        logger.info("Force resolving existing WCS for '%s' due to configuration override.", filename)
+        skip_solver_due_to_existing_wcs = False
+        preexisting_wcs_obj = None
+
+    if not skip_solver_due_to_existing_wcs and wcs_validation_reason:
+        _pcb_local(
+            "getwcs_info_existing_wcs_rejected",
+            lvl="WARN",
+            filename=filename,
+            reason=wcs_validation_reason,
+        )
+        logger.warning("Existing WCS for '%s' rejected: %s", filename, wcs_validation_reason)
 
     # --- Résolution WCS ---
     _pcb_local(f"  Résolution WCS pour '{filename}'...", lvl="DEBUG_DETAIL")
@@ -6473,10 +6552,38 @@ def assemble_final_mosaic_reproject_coadd(
                     continue
                 try:
                     arr_np = np.asarray(arr, dtype=np.float32, order="C")
-                    if gain_val != 1.0:
-                        np.multiply(arr_np, float(gain_val), out=arr_np, casting="unsafe")
-                    if offset_val != 0.0:
-                        np.add(arr_np, float(offset_val), out=arr_np, casting="unsafe")
+                    gain_to_apply = float(gain_val)
+                    offset_to_apply = float(offset_val)
+                    if match_bg:
+                        gain_before = gain_to_apply
+                        offset_before = offset_to_apply
+                        if gain_to_apply < gain_limit_min:
+                            gain_to_apply = gain_limit_min
+                        elif gain_to_apply > gain_limit_max:
+                            gain_to_apply = gain_limit_max
+                        if affine_offset_limit_adu > 0.0:
+                            if abs(offset_to_apply) > affine_offset_limit_adu:
+                                offset_to_apply = 0.0
+                            else:
+                                offset_to_apply = max(-affine_offset_limit_adu, min(offset_to_apply, affine_offset_limit_adu))
+                        if gain_to_apply != gain_before or offset_to_apply != offset_before:
+                            try:
+                                _pcb(
+                                    "assemble_warn_affine_clamped",
+                                    prog=None,
+                                    lvl="INFO_DETAIL",
+                                    tile_index=tile_idx,
+                                    gain_before=gain_before,
+                                    gain_after=gain_to_apply,
+                                    offset_before=offset_before,
+                                    offset_after=offset_to_apply,
+                                )
+                            except Exception:
+                                pass
+                    if gain_to_apply != 1.0:
+                        np.multiply(arr_np, gain_to_apply, out=arr_np, casting="unsafe")
+                    if offset_to_apply != 0.0:
+                        np.add(arr_np, offset_to_apply, out=arr_np, casting="unsafe")
                     input_data_all_tiles_HWC_processed[tile_idx] = (arr_np, tile_wcs_local)
                     corrected_tiles += 1
                 except Exception:

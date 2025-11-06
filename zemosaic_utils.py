@@ -109,11 +109,43 @@ def is_path_excluded(path: Path | str, excluded_dirs: Iterable[str] | None = Non
     return any(part in parts for part in directories)
 
 
-def has_valid_wcs(header) -> bool:
-    """Return True when *header* appears to describe a usable celestial WCS."""
+def _extract_cd_matrix_from_wcs(wcs_obj):
+    """Return the 2x2 CD matrix for *wcs_obj* or None when unavailable."""
+    try:
+        cd_attr = getattr(wcs_obj.wcs, "cd", None)
+    except Exception:
+        cd_attr = None
+
+    if cd_attr is not None:
+        cd_arr = np.asarray(cd_attr, dtype=np.float64)
+        if cd_arr.ndim == 2 and cd_arr.shape[0] >= 2 and cd_arr.shape[1] >= 2:
+            return cd_arr[:2, :2]
+
+    try:
+        pc_attr = getattr(wcs_obj.wcs, "pc", None)
+        cdelt_attr = getattr(wcs_obj.wcs, "cdelt", None)
+    except Exception:
+        pc_attr = None
+        cdelt_attr = None
+
+    if pc_attr is not None and cdelt_attr is not None:
+        pc_arr = np.asarray(pc_attr, dtype=np.float64)
+        cdelt_arr = np.asarray(cdelt_attr, dtype=np.float64)
+        if (
+            pc_arr.ndim == 2
+            and pc_arr.shape[0] >= 2
+            and pc_arr.shape[1] >= 2
+            and cdelt_arr.size >= 2
+        ):
+            return pc_arr[:2, :2] @ np.diag(cdelt_arr[:2])
+    return None
+
+
+def validate_wcs_header(header, *, require_footprint: bool = True):
+    """Validate *header* and return (is_valid, wcs_obj_or_none, failure_reason)."""
 
     if header is None:
-        return False
+        return False, None, "missing_header"
 
     def _get(key: str):
         if header is None:
@@ -137,19 +169,19 @@ def has_valid_wcs(header) -> bool:
     ctype1 = _get("CTYPE1")
     ctype2 = _get("CTYPE2")
     if not isinstance(ctype1, str) or not isinstance(ctype2, str):
-        return False
+        return False, None, "missing_ctype"
     axis1 = ctype1.strip().upper()
     axis2 = ctype2.strip().upper()
     if not axis1 or not axis2:
-        return False
+        return False, None, "empty_ctype"
     axis1_ok = any(tag in axis1 for tag in ("RA", "LON"))
     axis2_ok = any(tag in axis2 for tag in ("DEC", "LAT"))
     if not (axis1_ok and axis2_ok):
-        return False
+        return False, None, "ctype_not_celestial"
 
     for key in ("CRVAL1", "CRVAL2", "CRPIX1", "CRPIX2"):
         if not _float_like(_get(key)):
-            return False
+            return False, None, f"missing_{key.lower()}"
 
     cd_terms = ("CD1_1", "CD1_2", "CD2_1", "CD2_2")
     pc_terms = ("PC1_1", "PC1_2", "PC2_1", "PC2_2")
@@ -161,9 +193,91 @@ def has_valid_wcs(header) -> bool:
     )
 
     if not (has_cd_matrix or has_pc_matrix):
-        return False
+        return False, None, "missing_wcs_matrix"
 
-    return True
+    if not ASTROPY_WCS_AVAILABLE_IN_UTILS or AstropyWCS is None:
+        return False, None, "astropy_wcs_unavailable"
+
+    try:
+        candidate_wcs = AstropyWCS(header, naxis=2, relax=True)  # type: ignore[call-arg]
+    except Exception as exc:
+        return False, None, f"astropy_wcs_exception: {exc}"
+
+    if not getattr(candidate_wcs, "is_celestial", False):
+        return False, None, "wcs_not_celestial"
+
+    cd_matrix = _extract_cd_matrix_from_wcs(candidate_wcs)
+    if cd_matrix is None:
+        return False, None, "missing_cd_matrix"
+    if not np.all(np.isfinite(cd_matrix)):
+        return False, None, "nonfinite_cd_matrix"
+
+    try:
+        det = float(np.linalg.det(cd_matrix))
+    except Exception as exc_det:  # pragma: no cover - extremely unlikely
+        return False, None, f"cd_determinant_failure: {exc_det}"
+
+    if not np.isfinite(det):
+        return False, None, "nonfinite_cd_determinant"
+    if abs(det) < 1e-16:
+        return False, None, "singular_cd_matrix"
+
+    scale_min_arcsec = 0.3
+    scale_max_arcsec = 15.0
+    try:
+        from astropy.wcs.utils import proj_plane_pixel_scales  # type: ignore
+
+        scales_deg = np.asarray(proj_plane_pixel_scales(candidate_wcs), dtype=np.float64)
+    except Exception:
+        scales_deg = np.sqrt(np.sum(cd_matrix[:2, :2] ** 2, axis=0))
+    scales_arcsec = np.abs(scales_deg) * 3600.0
+    finite_scales = scales_arcsec[np.isfinite(scales_arcsec)]
+    if finite_scales.size == 0:
+        return False, None, "pixel_scale_missing"
+    min_scale = float(np.nanmin(finite_scales))
+    max_scale = float(np.nanmax(finite_scales))
+    if min_scale < scale_min_arcsec or max_scale > scale_max_arcsec:
+        return False, None, f"pixel_scale_out_of_range[{min_scale:.3f},{max_scale:.3f}]"
+
+    scale_min_deg = scale_min_arcsec / 3600.0
+    scale_max_deg = scale_max_arcsec / 3600.0
+    det_abs = abs(det)
+    if det_abs < (scale_min_deg**2) * 1e-2:
+        return False, None, "cd_determinant_too_small"
+    if det_abs > (scale_max_deg**2) * 1e2:
+        return False, None, "cd_determinant_too_large"
+
+    if require_footprint:
+        naxis1 = _get("NAXIS1")
+        naxis2 = _get("NAXIS2")
+        axes = None
+        if _float_like(naxis1) and _float_like(naxis2):
+            try:
+                axes = (int(float(naxis2)), int(float(naxis1)))
+            except Exception:
+                axes = None
+        if axes and axes[0] > 0 and axes[1] > 0:
+            try:
+                footprint = candidate_wcs.calc_footprint(axes=axes)
+            except Exception as exc_fp:
+                return False, None, f"calc_footprint_failed: {exc_fp}"
+            footprint_arr = np.asarray(footprint, dtype=np.float64)
+            if footprint_arr.ndim != 2 or footprint_arr.shape[1] < 2:
+                return False, None, "calc_footprint_bad_shape"
+            if not np.all(np.isfinite(footprint_arr)):
+                return False, None, "calc_footprint_nonfinite"
+            dec_values = footprint_arr[:, 1]
+            if np.any((dec_values < -90.5) | (dec_values > 90.5)):
+                return False, None, "calc_footprint_dec_out_of_bounds"
+
+    return True, candidate_wcs, None
+
+
+def has_valid_wcs(header) -> bool:
+    """Return True when *header* appears to describe a usable celestial WCS."""
+
+    is_valid, _, _ = validate_wcs_header(header)
+    return bool(is_valid)
 
 # --- Lightweight CuPy helpers -------------------------------------------------
 def gpu_is_available() -> bool:
@@ -2419,8 +2533,9 @@ def save_fits_image(image_data: np.ndarray,
 
         # Ensure a zero floor for better viewer auto-stretch (ASI FITS View, etc.).
         # Some viewers expect the black level to be at 0. If our mosaic carries a
-        # positive offset (e.g. min ~ 300–500 ADU), auto-stretch may miss the true
+        # positive offset (e.g. min ~ 300-500 ADU), auto-stretch may miss the true
         # background. Shift the baseline so the global finite minimum maps to 0.
+        baseline_shift_applied = 0.0
         try:
             finite_min = float(np.nanmin(data_to_write_temp))
             if np.isfinite(finite_min) and finite_min > 0.0:
@@ -2434,6 +2549,18 @@ def save_fits_image(image_data: np.ndarray,
                 data_to_write_temp -= np.float32(finite_min)
                 # Guard against any numerical underflow
                 data_to_write_temp = np.maximum(data_to_write_temp, 0.0)
+                baseline_shift_applied = -float(finite_min)
+            elif np.isfinite(finite_min) and finite_min < 0.0:
+                shift_value = -float(finite_min)
+                _log_util_save(
+                    f"  SAVE_DEBUG: Negative baseline detected (min={finite_min:.3f}). Raising by {shift_value:.3f}.",
+                    "INFO_DETAIL",
+                )
+                if data_to_write_temp is image_data:
+                    data_to_write_temp = data_to_write_temp.copy()
+                data_to_write_temp += np.float32(shift_value)
+                data_to_write_temp = np.maximum(data_to_write_temp, 0.0)
+                baseline_shift_applied = shift_value
         except Exception as _e_minshift:
             # Non-fatal: keep original values if anything goes wrong
             pass
@@ -2476,6 +2603,17 @@ def save_fits_image(image_data: np.ndarray,
             del header_float['DATAMIN']
         if 'DATAMAX' in header_float:
             del header_float['DATAMAX']
+
+        if baseline_shift_applied != 0.0:
+            shift_msg = f"Baseline shift applied for FITS float export: {baseline_shift_applied:+.6f} ADU"
+            try:
+                header_float.add_history(shift_msg)
+            except Exception:
+                pass
+            try:
+                final_header_to_write.add_history(shift_msg)
+            except Exception:
+                pass
 
         if data_to_write_temp.ndim == 3:
             if axis_order_upper == 'HWC':

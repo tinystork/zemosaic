@@ -9,5 +9,11 @@
   "astap_search_radius_deg": 3.0,
   "astap_downsample": 2,
   "astap_sensitivity": 100,
-  "use_auto_intertile": false
+  "use_auto_intertile": false,
+  "force_resolve_existing_wcs": false,
+  "intertile_offset_limit_adu": 50.0,
+  "intertile_gain_limits": [
+    0.75,
+    1.25
+  ]
 }
