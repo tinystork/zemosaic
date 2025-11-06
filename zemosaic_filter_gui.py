@@ -55,6 +55,7 @@ import sys
 import shutil
 import datetime
 import importlib
+import importlib.util
 import time
 import traceback
 import threading
@@ -417,36 +418,54 @@ def launch_filter_interface(
         solver_settings_payload: Dict[str, Any] = {}
         lang_code = "en"
 
-        # Ensure project directory is on sys.path to import project modules
+        # Ensure project directory and parent are on sys.path to import project modules
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        if base_dir not in sys.path:
-            sys.path.insert(0, base_dir)
+        project_root = os.path.dirname(base_dir)
+        for candidate in (base_dir, project_root):
+            if candidate and candidate not in sys.path:
+                sys.path.insert(0, candidate)
+
+        pkg_prefix = globals().get("__package__") or ""
+
+        def _import_optional_module(*module_names: str):
+            last_error: str | None = None
+            for mod_name in module_names:
+                spec = importlib.util.find_spec(mod_name)
+                if spec is None:
+                    last_error = f"Module not found: {mod_name}"
+                    continue
+                try:
+                    return importlib.import_module(mod_name), None
+                except Exception as exc:
+                    last_error = f"{mod_name}: {exc}"
+            return None, last_error
 
         # Try to load localization support from either legacy or packaged paths
+        localization_candidates = [
+            "locales.zemosaic_localization",
+            "zemosaic_localization",
+        ]
+        if pkg_prefix:
+            localization_candidates.insert(0, f"{pkg_prefix}.zemosaic_localization")
+            localization_candidates.insert(0, f"{pkg_prefix}.locales.zemosaic_localization")
         localizer_cls = None
         localization_errors: list[str] = []
-        for mod_name in ("zemosaic_localization", "locales.zemosaic_localization"):
-            try:
-                module = importlib.import_module(mod_name)
-                candidate = getattr(module, "ZeMosaicLocalization", None)
-                if candidate is not None:
-                    localizer_cls = candidate
-                    break
-            except Exception as exc:
-                localization_errors.append(str(exc))
+        for candidate in localization_candidates:
+            module, import_error = _import_optional_module(candidate)
+            if module is None:
+                if import_error:
+                    localization_errors.append(import_error)
+                continue
+            localizer_cls = getattr(module, "ZeMosaicLocalization", None)
+            if localizer_cls is not None:
+                break
 
         # Load persistent configuration if available
-        zconfig_module = None
-        try:
-            zconfig_module = importlib.import_module("zemosaic_config")
-        except Exception:
-            try:
-                pkg_prefix = globals().get("__package__") or ""
-                if pkg_prefix:
-                    zconfig_module = importlib.import_module(f"{pkg_prefix}.zemosaic_config")
-            except Exception as exc:
-                print(f"WARNING (Filter GUI): failed to import configuration module: {exc}")
-                zconfig_module = None
+        config_candidates = []
+        if pkg_prefix:
+            config_candidates.append(f"{pkg_prefix}.zemosaic_config")
+        config_candidates.append("zemosaic_config")
+        zconfig_module, config_error = _import_optional_module(*config_candidates)
 
         if zconfig_module is not None:
             try:
@@ -466,23 +485,20 @@ def launch_filter_interface(
                     })
             except Exception as exc:
                 print(f"WARNING (Filter GUI): failed to load configuration: {exc}")
+        elif config_error:
+            print(f"WARNING (Filter GUI): configuration module unavailable: {config_error}")
 
         # Load solver settings (either provided by caller or defaults)
         solver_cls = None
-        solver_module = None
-        try:
-            solver_module = importlib.import_module("solver_settings")
-        except Exception:
-            try:
-                pkg_prefix = globals().get("__package__") or ""
-                if pkg_prefix:
-                    solver_module = importlib.import_module(f"{pkg_prefix}.solver_settings")
-            except Exception as exc:
-                print(f"WARNING (Filter GUI): failed to import solver settings: {exc}")
-                solver_module = None
-
+        solver_candidates = []
+        if pkg_prefix:
+            solver_candidates.append(f"{pkg_prefix}.solver_settings")
+        solver_candidates.append("solver_settings")
+        solver_module, solver_error = _import_optional_module(*solver_candidates)
         if solver_module is not None:
             solver_cls = getattr(solver_module, "SolverSettings", None)
+        elif solver_error:
+            print(f"WARNING (Filter GUI): solver settings module unavailable: {solver_error}")
 
         if isinstance(solver_settings_dict, dict):
             solver_settings_payload.update(solver_settings_dict)
@@ -504,8 +520,10 @@ def launch_filter_interface(
             sensitivity = solver_settings_payload.get("astap_sensitivity")
 
             if isinstance(exe_path, str) and exe_path:
+                exe_path = os.path.expanduser(exe_path)
                 cfg_defaults["astap_executable_path"] = exe_path
             if isinstance(data_path, str) and data_path:
+                data_path = os.path.expanduser(data_path)
                 cfg_defaults["astap_data_directory_path"] = data_path
             if search_radius is not None:
                 cfg_defaults["astap_default_search_radius"] = search_radius
@@ -555,16 +573,32 @@ def launch_filter_interface(
         from core.tk_safe import patch_tk_variables
 
         patch_tk_variables()
-        import numpy as np
-        from astropy.coordinates import SkyCoord
-        from astropy.io import fits
-        from astropy.wcs import WCS
-        from astropy.wcs.utils import pixel_to_skycoord
-        import astropy.units as u
-        from matplotlib.figure import Figure
-        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-        from matplotlib.collections import LineCollection
-        from matplotlib.colors import to_rgba
+        heavy_import_error: ImportError | None = None
+        try:
+            import numpy as np
+            from astropy.coordinates import SkyCoord
+            from astropy.io import fits
+            from astropy.wcs import WCS
+            from astropy.wcs.utils import pixel_to_skycoord
+            import astropy.units as u
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+            from matplotlib.collections import LineCollection
+            from matplotlib.colors import to_rgba
+        except ImportError as exc:
+            heavy_import_error = exc
+
+        if heavy_import_error is not None:
+            msg = (
+                "Missing optional dependency (numpy/matplotlib/astropy).\n"
+                "Install the packages and retry."
+            )
+            detail = f" Details: {heavy_import_error}"
+            try:
+                messagebox.showerror("ZeMosaic Filter", msg + detail)
+            except Exception:
+                print(f"ERROR (Filter GUI): {msg}{detail}")
+            return raw_items_input, False, None
 
         def footprint_wh_deg(wcs_obj: Any) -> tuple[float, float]:
             """Return footprint width/height in degrees for a given WCS."""

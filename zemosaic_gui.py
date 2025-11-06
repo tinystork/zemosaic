@@ -56,13 +56,22 @@ import traceback
 import time
 import subprocess
 import sys
-
-try:
-    import wmi
-except ImportError:  # pragma: no cover - wmi may be unavailable on non Windows
-    wmi = None
-
+import platform
+import shutil
+import importlib
 import importlib.util
+
+SYSTEM_NAME = platform.system().lower()
+IS_WINDOWS = SYSTEM_NAME == "windows"
+IS_MAC = SYSTEM_NAME == "darwin"
+
+if IS_WINDOWS:
+    try:
+        import wmi
+    except ImportError:  # pragma: no cover - wmi may be unavailable on non Windows
+        wmi = None
+else:
+    wmi = None
 
 CUPY_AVAILABLE = importlib.util.find_spec("cupy") is not None
 cupy = None
@@ -76,39 +85,98 @@ except ImportError:
     PILLOW_AVAILABLE_FOR_ICON = False
     print("AVERT GUI: Pillow (PIL) non installé. L'icône PNG ne peut pas être chargée.")
 # --- Import du module de localisation ---
-try:
-    from locales.zemosaic_localization import ZeMosaicLocalization
-    ZEMOSAIC_LOCALIZATION_AVAILABLE = True
-except ImportError as e_loc:
-    ZEMOSAIC_LOCALIZATION_AVAILABLE = False
-    ZeMosaicLocalization = None # Factice
-    print(f"ERREUR (zemosaic_gui): Impossible d'importer 'ZeMosaicLocalization': {e_loc}")
+ZEMOSAIC_LOCALIZATION_AVAILABLE = False
+ZeMosaicLocalization = None
+_localization_errors = []
+for candidate in ("locales.zemosaic_localization", "zemosaic_localization"):
+    spec = importlib.util.find_spec(candidate)
+    if spec is None:
+        _localization_errors.append(f"Module not found: {candidate}")
+        continue
+    try:
+        module = importlib.import_module(candidate)
+    except Exception as exc:
+        _localization_errors.append(f"{candidate}: {exc}")
+        continue
+    ZeMosaicLocalization = getattr(module, "ZeMosaicLocalization", None)
+    if ZeMosaicLocalization is not None:
+        ZEMOSAIC_LOCALIZATION_AVAILABLE = True
+        break
+if not ZEMOSAIC_LOCALIZATION_AVAILABLE:
+    detail = _localization_errors[-1] if _localization_errors else "module introuvable"
+    print(f"ERREUR (zemosaic_gui): module de localisation introuvable ({detail}).")
 
 # --- Configuration Import ---
-try:
-    import zemosaic_config 
-    ZEMOSAIC_CONFIG_AVAILABLE = True
-except ImportError as e_config:
-    ZEMOSAIC_CONFIG_AVAILABLE = False
-    zemosaic_config = None
-    print(f"AVERTISSEMENT (zemosaic_gui): 'zemosaic_config.py' non trouvé: {e_config}")
+zemosaic_config = None
+ZEMOSAIC_CONFIG_AVAILABLE = False
+config_candidates = []
+if __package__:
+    config_candidates.append(f"{__package__}.zemosaic_config")
+config_candidates.extend(["zemosaic_config", "core.zemosaic_config"])
+_config_errors = []
+for candidate in config_candidates:
+    spec = importlib.util.find_spec(candidate)
+    if spec is None:
+        _config_errors.append(f"Module not found: {candidate}")
+        continue
+    try:
+        zemosaic_config = importlib.import_module(candidate)
+        ZEMOSAIC_CONFIG_AVAILABLE = True
+        break
+    except Exception as exc:
+        _config_errors.append(f"{candidate}: {exc}")
+if not ZEMOSAIC_CONFIG_AVAILABLE:
+    detail = _config_errors[-1] if _config_errors else "module introuvable"
+    print(f"AVERTISSEMENT (zemosaic_gui): 'zemosaic_config.py' introuvable ({detail}).")
 
 # --- Worker Import ---
-try:
-    # Import worker from the same package so relative imports inside it work
-    from .zemosaic_worker import (
-        run_hierarchical_mosaic,
-        run_hierarchical_mosaic_process,
-    )
-    ZEMOSAIC_WORKER_AVAILABLE = True
-except ImportError as e_worker:
-    ZEMOSAIC_WORKER_AVAILABLE = False
-    run_hierarchical_mosaic = None
-    run_hierarchical_mosaic_process = None
-    print(f"ERREUR (zemosaic_gui): 'run_hierarchical_mosaic' non trouvé: {e_worker}")
+run_hierarchical_mosaic = None
+run_hierarchical_mosaic_process = None
+ZEMOSAIC_WORKER_AVAILABLE = False
+worker_candidates = []
+if __package__:
+    worker_candidates.append(f"{__package__}.zemosaic_worker")
+worker_candidates.extend(["zemosaic_worker", "core.zemosaic_worker"])
+_worker_errors = []
+for candidate in worker_candidates:
+    spec = importlib.util.find_spec(candidate)
+    if spec is None:
+        _worker_errors.append(f"Module not found: {candidate}")
+        continue
+    try:
+        worker_module = importlib.import_module(candidate)
+        run_hierarchical_mosaic = getattr(worker_module, "run_hierarchical_mosaic", None)
+        run_hierarchical_mosaic_process = getattr(worker_module, "run_hierarchical_mosaic_process", None)
+        if callable(run_hierarchical_mosaic) and callable(run_hierarchical_mosaic_process):
+            ZEMOSAIC_WORKER_AVAILABLE = True
+            break
+    except Exception as exc:
+        _worker_errors.append(f"{candidate}: {exc}")
+if not ZEMOSAIC_WORKER_AVAILABLE:
+    detail = _worker_errors[-1] if _worker_errors else "module introuvable"
+    print(f"ERREUR (zemosaic_gui): worker de mosaïque indisponible ({detail}).")
 
 from dataclasses import asdict
-from .solver_settings import SolverSettings
+
+SolverSettings = None
+solver_candidates = []
+if __package__:
+    solver_candidates.append(f"{__package__}.solver_settings")
+solver_candidates.append("solver_settings")
+_solver_errors = []
+for candidate in solver_candidates:
+    spec = importlib.util.find_spec(candidate)
+    if spec is None:
+        _solver_errors.append(f"Module not found: {candidate}")
+        continue
+    try:
+        SolverSettings = importlib.import_module(candidate).SolverSettings
+        break
+    except Exception as exc:
+        _solver_errors.append(f"{candidate}: {exc}")
+if SolverSettings is None:
+    detail = _solver_errors[-1] if _solver_errors else "module introuvable"
+    raise ImportError(f"solver_settings module is required for ZeMosaic GUI ({detail})")
 
 
 
@@ -116,19 +184,28 @@ class ZeMosaicGUI:
     def __init__(self, root_window):
         self.root = root_window
 
-        # --- DÉFINIR L'ICÔNE DE LA FENÊTRE (AVEC .ICO NATIF) ---
+        # --- DÉFINIR L'ICÔNE DE LA FENÊTRE AVEC FALLBACK MULTIPLATEFORME ---
         try:
             base_path = os.path.dirname(os.path.abspath(__file__))
-            icon_path = os.path.join(base_path, "icon", "zemosaic.ico")
+            ico_path = os.path.join(base_path, "icon", "zemosaic.ico")
+            png_candidates = [
+                os.path.join(base_path, "icon", name)
+                for name in ("zemosaic.png", "zemosaic_icon.png", "zemosaic_64x64.png")
+            ]
 
-            if os.path.exists(icon_path):
-                self.root.iconbitmap(default=icon_path)
+            if IS_WINDOWS and os.path.exists(ico_path):
+                self.root.iconbitmap(default=ico_path)
             else:
-                print(f"AVERT GUI: Fichier d'icône ICO non trouvé à {icon_path}")
-        except tk.TclError:
-            print("AVERT GUI: Impossible de définir l'icône ICO (TclError).")
+                png_path = next((path for path in png_candidates if os.path.exists(path)), None)
+                if png_path:
+                    self.root.iconphoto(True, tk.PhotoImage(file=png_path))
+                elif os.path.exists(ico_path):
+                    # Fallback for non-Windows platforms supporting ICO via PhotoImage
+                    self.root.iconphoto(True, tk.PhotoImage(file=ico_path))
+                else:
+                    print("AVERT GUI: icône introuvable (ICO/PNG)")
         except Exception as e_icon:
-            print(f"AVERT GUI: Erreur lors de la définition de l'icône ICO: {e_icon}")
+            print(f"AVERT GUI: icône non appliquée ({e_icon})")
         # --- FIN DÉFINITION ICÔNE ---
 
 
@@ -174,6 +251,16 @@ class ZeMosaicGUI:
                 "cluster_orientation_split_deg": 0.0
             }
 
+        for key in (
+            "astap_executable_path",
+            "astap_data_directory_path",
+            "coadd_memmap_dir",
+            "gpu_selector",
+        ):
+            value = self.config.get(key)
+            if isinstance(value, str) and value:
+                self.config[key] = os.path.expanduser(value)
+
         # --- GPU Detection helper ---
         def _detect_gpus():
             """Return a list of detected GPUs as ``(display_name, index)`` tuples.
@@ -183,14 +270,14 @@ class ZeMosaicGUI:
             """
 
             controllers = []
-            if wmi:
+            if IS_WINDOWS and wmi:
                 try:
                     obj = wmi.WMI()
                     controllers = [c.Name for c in obj.Win32_VideoController()]
                 except Exception:
                     controllers = []
 
-            if not controllers:
+            if not controllers and shutil.which("nvidia-smi"):
                 try:
                     out = subprocess.check_output(
                         ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
