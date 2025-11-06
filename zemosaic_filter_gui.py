@@ -2197,6 +2197,8 @@ def launch_filter_interface(
             if ok:
                 wcs_async_state["success"] = int(wcs_async_state.get("success") or 0) + 1
 
+            write_inplace = bool(wcs_async_state.get("write_inplace"))
+
             total = int(wcs_async_state.get("total") or 0)
             done_now = int(wcs_async_state.get("done") or 0)
             try:
@@ -4042,6 +4044,7 @@ def launch_filter_interface(
                 wcs_async_state["total"] = len(pending)
                 wcs_async_state["stop"] = False
                 wcs_async_state["running"] = True
+                wcs_async_state["write_inplace"] = write_inplace
 
                 log_dir: Optional[Path] = None
                 for _idx, _item in pending:
