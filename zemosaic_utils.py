@@ -48,6 +48,8 @@ import os
 import math
 import copy
 import logging
+from pathlib import Path
+from typing import Iterable
 import numpy as np
 # L'import de astropy.io.fits est géré ci-dessous pour définir le flag
 import cv2
@@ -74,6 +76,37 @@ map_coordinates = None  # Lazily imported when needed
 
 logger = logging.getLogger(__name__)
 _PREVIEW_WCS_LINEARIZED_LOGGED = False
+
+
+EXCLUDED_DIRS = frozenset({"unaligned_by_zemosaic"})
+
+
+def is_path_excluded(path: Path | str, excluded_dirs: Iterable[str] | None = None) -> bool:
+    """Return True when *path* is located inside a known excluded directory."""
+
+    try:
+        candidate = Path(path)
+    except Exception:
+        return False
+
+    directories = set(EXCLUDED_DIRS)
+    if excluded_dirs is not None:
+        try:
+            directories = set(excluded_dirs)
+        except Exception:
+            directories = set(EXCLUDED_DIRS)
+    if not directories:
+        return False
+
+    try:
+        resolved = candidate.expanduser().resolve(strict=False)
+        parts = set(resolved.parts)
+    except Exception:
+        try:
+            parts = set(candidate.parts)
+        except Exception:
+            return False
+    return any(part in parts for part in directories)
 
 # --- Lightweight CuPy helpers -------------------------------------------------
 def gpu_is_available() -> bool:

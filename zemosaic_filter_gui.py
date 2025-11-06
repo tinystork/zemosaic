@@ -61,8 +61,14 @@ import traceback
 import threading
 import queue
 import json
+import logging
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+
+from zemosaic_utils import EXCLUDED_DIRS, is_path_excluded
+
+
+logger = logging.getLogger(__name__)
 
 
 # --- Instrument detection helpers -------------------------------------------
@@ -362,6 +368,12 @@ def launch_filter_interface(
     # Early validation and fail-safe behavior
     stream_mode = False
     input_dir: Optional[str] = None
+    input_dir_path: Optional[Path] = None
+    excluded_input_dir = False
+    pending_startup_messages: list[tuple[str, str]] = []
+    startup_status_messages: list[str] = []
+    exclusion_notified_paths: set[str] = set()
+    excluded_paths_pending: list[Path] = []
 
     # Robust detection: if a directory path is provided, always use streaming
     # mode regardless of the explicit flag. This makes callers resilient to
@@ -384,6 +396,17 @@ def launch_filter_interface(
 
     raw_items_input = raw_files_with_wcs_or_dir
 
+    if input_dir:
+        try:
+            input_dir_path = Path(input_dir).expanduser()
+        except Exception:
+            input_dir_path = Path(input_dir)
+        try:
+            if is_path_excluded(input_dir_path, EXCLUDED_DIRS):
+                excluded_input_dir = True
+        except Exception:
+            pass
+
     # --- Simple debug logger (console + buffer flushed to UI log later) ---
     _dbg_msgs: list[str] = []
     def _dbg(msg: str) -> None:
@@ -397,6 +420,35 @@ def launch_filter_interface(
         except Exception:
             pass
         _dbg_msgs.append(line)
+
+    def _queue_startup_message(level: str, message: str) -> None:
+        if not message:
+            return
+        pending_startup_messages.append((level, message))
+        try:
+            log_method = getattr(logger, level.lower(), logger.info)
+        except Exception:
+            log_method = logger.info
+        try:
+            log_method(message)
+        except Exception:
+            logger.info(message)
+
+    def _remember_exclusion(path: Path, message: str) -> None:
+        key = str(path)
+        if key in exclusion_notified_paths:
+            return
+        exclusion_notified_paths.add(key)
+        try:
+            logger.debug("Skipping excluded path: %s", path)
+        except Exception:
+            pass
+        display_msg = message
+        try:
+            display_msg = f"{message} ({path})"
+        except Exception:
+            pass
+        _queue_startup_message("WARN", display_msg)
 
     try:
         # --- Optional localization support (autonomous fallback) ---
@@ -566,6 +618,23 @@ def launch_filter_interface(
             # Fallback: return default_text or key placeholder
             return default_text if default_text is not None else f"_{key}_"
 
+        if excluded_input_dir:
+            msg = _tr(
+                "FILTER_MOVE_FAILED_INPUT",
+                "Input path points to an excluded folder. Please select another folder.",
+            )
+            startup_status_messages.append(msg)
+            _queue_startup_message("WARN", msg)
+
+        if excluded_paths_pending:
+            exclusion_msg = _tr(
+                "FILTER_EXCLUDED_DIR",
+                'The folder "unaligned_by_zemosaic" is excluded and will not be scanned.',
+            )
+            for pending_path in list(excluded_paths_pending):
+                _remember_exclusion(pending_path, exclusion_msg)
+            excluded_paths_pending.clear()
+
         # Imports kept inside to avoid import-time errors affecting pipeline
         import tkinter as tk
         from tkinter import ttk, messagebox, scrolledtext
@@ -704,19 +773,71 @@ def launch_filter_interface(
             stream_state["csv_path"] = cache_csv_path
 
         def _iter_fits_paths(root: str, recursive: bool = True):
+            exclusion_msg = _tr(
+                "FILTER_EXCLUDED_DIR",
+                'The folder "unaligned_by_zemosaic" is excluded and will not be scanned.',
+            )
+            try:
+                root_candidate = Path(root)
+            except Exception:
+                root_candidate = Path(str(root))
+
+            if is_path_excluded(root_candidate, EXCLUDED_DIRS):
+                _remember_exclusion(root_candidate, exclusion_msg)
+                if not startup_status_messages:
+                    msg = _tr(
+                        "FILTER_MOVE_FAILED_INPUT",
+                        "Input path points to an excluded folder. Please select another folder.",
+                    )
+                    startup_status_messages.append(msg)
+                return
+
+            def _should_skip(path_value: Path) -> bool:
+                if not is_path_excluded(path_value, EXCLUDED_DIRS):
+                    return False
+                _remember_exclusion(path_value, exclusion_msg)
+                return True
+
             if not recursive:
                 try:
                     with os.scandir(root) as it:
                         for entry in it:
+                            try:
+                                entry_path = Path(entry.path)
+                            except Exception:
+                                entry_path = Path(str(entry.path))
+                            if entry.is_dir():
+                                if _should_skip(entry_path):
+                                    continue
+                                continue
                             if entry.is_file() and entry.name.lower().endswith((".fit", ".fits")):
+                                if _should_skip(entry_path):
+                                    continue
                                 yield entry.path
                 except Exception:
                     return
             else:
-                for r, _dirs, files in os.walk(root):
+                for r, dirs, files in os.walk(root):
+                    try:
+                        current_dir = Path(r)
+                    except Exception:
+                        current_dir = Path(str(r))
+                    if _should_skip(current_dir):
+                        continue
+                    filtered_dirs = []
+                    for d in list(dirs):
+                        child = current_dir / d
+                        if _should_skip(child):
+                            continue
+                        filtered_dirs.append(d)
+                    dirs[:] = filtered_dirs
                     for fn in files:
-                        if fn.lower().endswith((".fit", ".fits")):
-                            yield os.path.join(r, fn)
+                        if not fn.lower().endswith((".fit", ".fits")):
+                            continue
+                        candidate = current_dir / fn
+                        if _should_skip(candidate):
+                            continue
+                        yield str(candidate)
 
         def _compute_footprint_from_wcs(
             wcs_obj: Any,
@@ -819,6 +940,83 @@ def launch_filter_interface(
                 payload["header"] = keep_keys
 
             return payload
+
+        def _move_problematic_file(path_value: str) -> Dict[str, Any]:
+            info: Dict[str, Any] = {}
+            if not path_value:
+                return info
+            try:
+                src_path = Path(path_value)
+            except Exception:
+                return info
+            if not src_path.exists():
+                return info
+            if is_path_excluded(src_path, EXCLUDED_DIRS):
+                info["skipped"] = True
+                return info
+
+            target_dir_name = next(iter(EXCLUDED_DIRS), "unaligned_by_zemosaic")
+            base_dir = input_dir_path or src_path.parent
+            try:
+                base_dir = Path(base_dir)
+            except Exception:
+                base_dir = Path(str(base_dir))
+            try:
+                base_dir = base_dir.expanduser().resolve(strict=False)
+            except Exception:
+                pass
+            destination_dir = base_dir / target_dir_name
+            try:
+                destination_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+
+            destination_path = destination_dir / src_path.name
+            if destination_path.exists():
+                timestamp = datetime.datetime.now().strftime("_%Y%m%d_%H%M%S")
+                stem = src_path.stem
+                suffix = src_path.suffix
+                counter = 1
+                while destination_path.exists() and counter <= 50:
+                    destination_path = destination_dir / f"{stem}{timestamp}_{counter}{suffix}"
+                    counter += 1
+
+            try:
+                logger.debug("Moving problematic file %s -> %s", src_path, destination_path)
+            except Exception:
+                pass
+
+            try:
+                src_path.replace(destination_path)
+                moved = True
+            except Exception:
+                try:
+                    shutil.move(str(src_path), str(destination_path))
+                    moved = True
+                except Exception as exc_move:
+                    info["error"] = str(exc_move)
+                    try:
+                        logger.error(
+                            "Failed to move problematic file %s -> %s", src_path, destination_path, exc_info=True
+                        )
+                    except Exception:
+                        pass
+                    return info
+
+            if moved:
+                info.update(
+                    {
+                        "moved": True,
+                        "source": str(src_path),
+                        "destination": str(destination_path),
+                        "filename": destination_path.name,
+                    }
+                )
+                try:
+                    logger.info("Moved problematic file to %s", destination_path)
+                except Exception:
+                    pass
+            return info
 
         def _load_csv_bootstrap(path_csv: str) -> list[Dict[str, Any]]:
             rows: list[Dict[str, Any]] = []
@@ -1017,6 +1215,16 @@ def launch_filter_interface(
                 nonlocal stream_stop_event
                 if stream_state.get("running"):
                     return
+                if excluded_input_dir:
+                    msg = _tr(
+                        "FILTER_MOVE_FAILED_INPUT",
+                        "Input path points to an excluded folder. Please select another folder.",
+                    )
+                    stream_state["running"] = False
+                    stream_state["done"] = True
+                    stream_state["status_message"] = msg
+                    _queue_startup_message("WARN", msg)
+                    return
                 stream_queue = queue.Queue()
                 stream_stop_event = threading.Event()
                 stream_state["running"] = True
@@ -1045,13 +1253,28 @@ def launch_filter_interface(
                 stream_state["pending_start"] = True
         else:
             normalized: list[Dict[str, Any]] = []
-            for i, entry in enumerate(raw_items_input or []):
+            next_index = 0
+            for entry in raw_items_input or []:
                 try:
                     data = dict(entry)
                 except Exception:
                     data = {"path": entry}
-                data.setdefault("index", i)
+                path_candidate = (
+                    data.get("path")
+                    or data.get("path_raw")
+                    or data.get("path_preprocessed_cache")
+                )
+                if path_candidate:
+                    try:
+                        candidate_path = Path(path_candidate)
+                        if is_path_excluded(candidate_path, EXCLUDED_DIRS):
+                            excluded_paths_pending.append(candidate_path)
+                            continue
+                    except Exception:
+                        pass
+                data["index"] = next_index
                 normalized.append(data)
+                next_index += 1
             if not normalized:
                 return raw_items_input, False, None
             initial_batches.append(normalized)
@@ -1390,6 +1613,16 @@ def launch_filter_interface(
         analyse_btn.grid(row=0, column=0, padx=(0, 6))
         export_btn.grid(row=0, column=1)
         total_initial_entries = len(items)
+
+        if startup_status_messages:
+            try:
+                status_var.set(startup_status_messages[-1])
+            except Exception:
+                pass
+            try:
+                pb.stop()
+            except Exception:
+                pass
 
         if stream_mode:
             if stream_state.get("status_message"):
@@ -1809,6 +2042,13 @@ def launch_filter_interface(
         except Exception:
             pass
 
+        try:
+            if pending_startup_messages:
+                _write_log_entries(list(pending_startup_messages))
+                pending_startup_messages.clear()
+        except Exception:
+            pass
+
         def _flush_log_buffer(force: bool = False) -> None:
             if not log_buffer:
                 return
@@ -1991,6 +2231,36 @@ def launch_filter_interface(
                             continue
                 if corners_list:
                     log_entry["corners"] = corners_list
+            if not ok:
+                move_error = payload.get("move_error")
+                if move_error:
+                    _log_message(f"[FilterUI] Failed to move problematic file: {move_error}", level="ERROR")
+                if payload.get("moved") and isinstance(idx_val, int):
+                    moved_filename = payload.get("move_filename")
+                    if not moved_filename and isinstance(path_value, str):
+                        moved_filename = os.path.basename(path_value)
+                    info_msg = _tr(
+                        "FILTER_FILE_MOVED_UNALIGNED",
+                        "Moved problematic file to 'unaligned_by_zemosaic': {filename}",
+                    ).format(filename=moved_filename or "?")
+                    _log_message(info_msg, level="INFO")
+                    try:
+                        status_var.set(
+                            _tr(
+                                "FILTER_WCS_FAIL_MOVED",
+                                "WCS solve failed; file moved to 'unaligned_by_zemosaic'.",
+                            )
+                        )
+                    except Exception:
+                        pass
+                    _remove_item(idx_val)
+                    refresh_msg = _tr(
+                        "FILTER_REFRESH_AFTER_MOVE",
+                        "List refreshed after excluding unaligned files.",
+                    )
+                    summary_var.set(_apply_summary_hint(refresh_msg))
+                    _log_message(refresh_msg, level="INFO")
+
             if log_entry.get("path") and log_path:
                 try:
                     with open(str(log_path), "a", encoding="utf-8") as fw:
@@ -2895,6 +3165,18 @@ def launch_filter_interface(
                 file_name = os.path.basename(path)
                 header_obj = getattr(item, "header", None)
 
+                def _record_failure(error_message: Optional[str]) -> Dict[str, Any]:
+                    if error_message:
+                        result["error"] = str(error_message)
+                    move_info = _move_problematic_file(path)
+                    if move_info.get("moved"):
+                        result["moved"] = True
+                        result["moved_path"] = move_info.get("destination")
+                        result["move_filename"] = move_info.get("filename")
+                    if move_info.get("error"):
+                        result["move_error"] = move_info.get("error")
+                    return result
+
                 try:
                     if header_obj is not None:
                         _enqueue_event("header_loaded", idx, header_obj)
@@ -2926,8 +3208,7 @@ def launch_filter_interface(
                                 name=file_name,
                                 err=exc,
                             )
-                            result["error"] = str(exc)
-                            return result
+                            return _record_failure(str(exc))
                         else:
                             if header_obj is not None:
                                 _enqueue_event("header_loaded", idx, header_obj)
@@ -3166,11 +3447,10 @@ def launch_filter_interface(
                         result["error"] = last_error
                     else:
                         result["error"] = "no solution"
-                    return result
+                    return _record_failure(result.get("error"))
                 except Exception as exc:
                     _enqueue_event("log", f"Unexpected resolver error: {exc}", "ERROR")
-                    result["error"] = str(exc)
-                    return result
+                    return _record_failure(str(exc))
 
             try:
                 _cancel_wcs_executor()
@@ -4658,6 +4938,102 @@ def launch_filter_interface(
                 ).format(current=min(processed, population_state["total"]), total=population_state["total"])
             )
 
+        def _remove_item(idx: int) -> None:
+            if idx < 0 or idx >= len(items):
+                return
+
+            try:
+                removed_item = items.pop(idx)
+            except Exception:
+                return
+
+            if idx < len(raw_files_with_wcs):
+                try:
+                    raw_files_with_wcs.pop(idx)
+                except Exception:
+                    pass
+
+            if idx < len(item_labels):
+                try:
+                    item_labels.pop(idx)
+                except Exception:
+                    pass
+
+            if idx < len(footprint_wrapped):
+                try:
+                    footprint_wrapped.pop(idx)
+                except Exception:
+                    pass
+            if idx < len(centroid_wrapped):
+                try:
+                    centroid_wrapped.pop(idx)
+                except Exception:
+                    pass
+
+            if use_listbox_mode:
+                if idx < len(selection_state):
+                    try:
+                        selection_state.pop(idx)
+                    except Exception:
+                        pass
+                adjusted_cache: set[int] = set()
+                for pos in listbox_selection_cache:
+                    if pos == idx:
+                        continue
+                    adjusted_cache.add(pos - 1 if pos > idx else pos)
+                listbox_selection_cache.clear()
+                listbox_selection_cache.update(adjusted_cache)
+                if listbox_widget is not None:
+                    try:
+                        listbox_widget.delete(idx)
+                    except Exception:
+                        pass
+            else:
+                if idx < len(check_vars):
+                    try:
+                        check_vars.pop(idx)
+                    except Exception:
+                        pass
+                if idx < len(checkbuttons):
+                    btn = checkbuttons.pop(idx)
+                    if btn is not None:
+                        try:
+                            btn.destroy()
+                        except Exception:
+                            pass
+
+            known_path_index.clear()
+            for pos, entry in enumerate(items):
+                key = _path_key(getattr(entry, "path", None))
+                if key:
+                    known_path_index[key] = pos
+
+            instruments_found.clear()
+            for entry in items:
+                instruments_found.add((entry.instrument or "Unknown").strip() or "Unknown")
+            try:
+                _refresh_instrument_options()
+            except Exception:
+                pass
+
+            pending_visual_refresh.clear()
+            _clear_visual_datasets()
+            _recompute_footprint_budget()
+            _schedule_visual_build(full=True)
+            _schedule_axes_update()
+
+            population_state["total"] = len(items)
+            if population_state["next_index"] > len(items):
+                population_state["next_index"] = len(items)
+
+            if not items:
+                try:
+                    _draw_group_outlines(None)
+                except Exception:
+                    pass
+
+            _dbg(f"Removed problematic item: idx={idx}, remaining={len(items)} path={getattr(removed_item, 'path', '?')}")
+
         def _add_item_row(item: Item) -> None:
             idx = len(item_labels)
             base = os.path.basename(item.path)
@@ -4895,8 +5271,20 @@ def launch_filter_interface(
                 return
             new_indices: list[int] = []
             visuals_dirty = False
+            exclusion_msg = _tr(
+                "FILTER_EXCLUDED_DIR",
+                'The folder "unaligned_by_zemosaic" is excluded and will not be scanned.',
+            )
             for entry in batch:
                 candidate_path = entry.get("path") or entry.get("path_raw") or entry.get("path_preprocessed_cache")
+                if candidate_path:
+                    try:
+                        candidate_obj = Path(candidate_path)
+                    except Exception:
+                        candidate_obj = Path(str(candidate_path))
+                    if is_path_excluded(candidate_obj, EXCLUDED_DIRS):
+                        _remember_exclusion(candidate_obj, exclusion_msg)
+                        continue
                 key = _path_key(candidate_path)
                 if key and key in known_path_index:
                     existing_idx = known_path_index[key]
