@@ -1,843 +1,327 @@
-2025-11-06 18:09:23,192 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:3348 - Logging pour ZeMosaicWorker initialisé. Logs écrits dans: D:\astro\zemosaic\zemosaic_worker.log
-2025-11-06 18:09:23,343 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:3409 - Bibliothèque Astropy importée.
-2025-11-06 18:09:23,343 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:3422 - Bibliothèque 'reproject' importée.
-2025-11-06 18:09:23,343 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:3441 - Module 'zemosaic_utils' importé.
-2025-11-06 18:09:23,343 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:3443 - Module 'zemosaic_astrometry' importé.
-2025-11-06 18:09:23,343 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:3445 - Module 'zemosaic_align_stack' importé.
-2025-11-06 18:09:26,450 - ZeMosaicWorker - INFO - zemosaic_worker.run_hierarchical_mosaic:7289 - Cache retention mode: run_end
-2025-11-06 18:09:26,450 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - run_info_cache_retention_mode
-2025-11-06 18:09:26,451 - ZeMosaicWorker - INFO - zemosaic_worker.run_hierarchical_mosaic:7311 - Worker logging level set to DEBUG
-2025-11-06 18:09:26,458 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - CHRONO_START_REQUEST
-2025-11-06 18:09:27,185 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Début Run Hierarchical Mosaic): Proc RSS: 194.3MB, VMS: 641.7MB. Sys RAM: Avail 2748MB / Total 8035MB (65.8%% used). Sys Swap: Used 2630MB / Total 24576MB (10.7%% used).
-2025-11-06 18:09:27,185 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: run_info_processing_started]
-2025-11-06 18:09:27,186 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: Options Stacking (Master Tiles): Norm='linear_fit', Weight='noise_variance', Reject='winsorized_sigma_clip', Combine='mean']
-2025-11-06 18:09:27,186 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 -   Config ASTAP: Exe='astap.exe', Data='astap', Radius=3.0deg, Downsample=2, Sens=100
-2025-11-06 18:09:27,186 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 -   Config Workers (GUI): Base demandé='0' (0=auto)
-2025-11-06 18:09:27,186 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 -   Options Stacking (Master Tuiles): Norm='linear_fit', Weight='noise_variance', Reject='winsorized_sigma_clip', Combine='mean', RGBEqualize=True, RadialWeight=False (Feather=N/A, Power=N/A, Floor=N/A)
-2025-11-06 18:09:27,186 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 -   Options Assemblage Final: Méthode='reproject_coadd'
-2025-11-06 18:09:27,372 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Début Phase 1 (Prétraitement)): Proc RSS: 199.3MB, VMS: 646.4MB. Sys RAM: Avail 2735MB / Total 8035MB (66.0%% used). Sys Swap: Used 2630MB / Total 24576MB (10.7%% used).
-2025-11-06 18:09:27,373 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: run_info_phase1_started_cache]
-2025-11-06 18:09:27,373 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - PHASE_UPDATE:1
-2025-11-06 18:09:27,430 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - run_info_found_potential_fits
-2025-11-06 18:09:27,430 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:0/165
-2025-11-06 18:09:27,430 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - log_filter_ui_skipped
-2025-11-06 18:09:27,430 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - clusterstacks_info_override_threshold
-2025-11-06 18:09:27,430 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - clusterstacks_info_override_target_groups
-2025-11-06 18:09:27,430 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - clusterstacks_info_override_orientation_split
-2025-11-06 18:09:27,431 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Phase 0 filter provided 9 preplanned group(s).
-2025-11-06 18:09:27,431 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: Phase 0: filter returned no items]
-2025-11-06 18:09:27,431 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - AutoCaps: per_frame≈15.8 MB, RAM_free≈2735 MB → frames_by_ram=103, cap=20, memmap=off, GPUHint=n/a, parallel=5
-2025-11-06 18:09:27,432 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - WORKERS_CONFIG: Mode Auto. Base de workers calculée: 6 (75% de 8 processeurs logiques)
-2025-11-06 18:09:27,432 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: WORKERS_PHASE1: Utilisation de 6 worker(s). (Base: 6, Fichiers: 165)]
-2025-11-06 18:09:28,467 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-214403.fit' (WCS present).
-2025-11-06 18:09:28,483 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:1/165
-2025-11-06 18:09:28,486 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-214351.fit' (WCS present).
-2025-11-06 18:09:28,653 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-214329.fit' (WCS present).
-2025-11-06 18:09:28,653 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:06:59
-2025-11-06 18:09:28,691 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-214340.fit' (WCS present).
-2025-11-06 18:09:28,699 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-214421.fit' (WCS present).
-2025-11-06 18:09:28,701 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:2/165
-2025-11-06 18:09:28,826 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:05:49
-2025-11-06 18:09:28,841 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-214432.fit' (WCS present).
-2025-11-06 18:09:28,841 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:3/165
-2025-11-06 18:09:28,975 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:05:33
-2025-11-06 18:09:28,976 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:4/165
-2025-11-06 18:09:29,090 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:05:28
-2025-11-06 18:09:29,093 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:5/165
-2025-11-06 18:09:29,219 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:05:30
-2025-11-06 18:09:29,219 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:6/165
-2025-11-06 18:09:29,358 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:05:13
-2025-11-06 18:09:30,019 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-214506.fit' (WCS present).
-2025-11-06 18:09:30,034 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-214455.fit' (WCS present).
-2025-11-06 18:09:30,046 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:7/165
-2025-11-06 18:09:30,166 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:05:49
-2025-11-06 18:09:30,169 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:8/165
-2025-11-06 18:09:30,306 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:05:17
-2025-11-06 18:09:30,366 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-214538.fit' (WCS present).
-2025-11-06 18:09:30,380 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-214612.fit' (WCS present).
-2025-11-06 18:09:30,392 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-214549.fit' (WCS present).
-2025-11-06 18:09:30,394 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:9/165
-2025-11-06 18:09:30,426 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-214526.fit' (WCS present).
-2025-11-06 18:09:30,542 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:04:59
-2025-11-06 18:09:30,544 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:10/165
-2025-11-06 18:09:30,709 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:04:40
-2025-11-06 18:09:30,709 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:11/165
-2025-11-06 18:09:30,827 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:04:21
-2025-11-06 18:09:30,834 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:12/165
-2025-11-06 18:09:30,955 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:04:06
-2025-11-06 18:09:31,654 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-214632.fit' (WCS present).
-2025-11-06 18:09:31,656 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-214643.fit' (WCS present).
-2025-11-06 18:09:31,661 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:13/165
-2025-11-06 18:09:31,801 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:04:31
-2025-11-06 18:09:31,803 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:14/165
-2025-11-06 18:09:31,924 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:04:17
-2025-11-06 18:09:31,986 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-214654.fit' (WCS present).
-2025-11-06 18:09:31,996 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:15/165
-2025-11-06 18:09:32,013 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-214706.fit' (WCS present).
-2025-11-06 18:09:32,059 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-214748.fit' (WCS present).
-2025-11-06 18:09:32,147 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:04:10
-2025-11-06 18:09:32,148 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:16/165
-2025-11-06 18:09:32,193 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-214737.fit' (WCS present).
-2025-11-06 18:09:32,307 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Phase 1 - Traité 16/165): Proc RSS: 773.3MB, VMS: 1230.6MB. Sys RAM: Avail 2007MB / Total 8035MB (75.0%% used). Sys Swap: Used 2637MB / Total 24576MB (10.7%% used).
-2025-11-06 18:09:32,311 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:04:00
-2025-11-06 18:09:32,311 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:17/165
-2025-11-06 18:09:32,429 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:50
-2025-11-06 18:09:32,431 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:18/165
-2025-11-06 18:09:32,545 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:41
-2025-11-06 18:09:33,188 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-214759.fit' (WCS present).
-2025-11-06 18:09:33,195 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:19/165
-2025-11-06 18:09:33,345 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:57
-2025-11-06 18:09:33,352 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-214811.fit' (WCS present).
-2025-11-06 18:09:33,363 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:20/165
-2025-11-06 18:09:33,497 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:50
-2025-11-06 18:09:33,570 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-214841.fit' (WCS present).
-2025-11-06 18:09:33,593 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-214852.fit' (WCS present).
-2025-11-06 18:09:33,597 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:21/165
-2025-11-06 18:09:33,635 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-214914.fit' (WCS present).
-2025-11-06 18:09:33,725 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:46
-2025-11-06 18:09:33,726 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:22/165
-2025-11-06 18:09:33,767 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-214926.fit' (WCS present).
-2025-11-06 18:09:33,857 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:39
-2025-11-06 18:09:33,857 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:23/165
-2025-11-06 18:09:34,097 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:36
-2025-11-06 18:09:34,097 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:24/165
-2025-11-06 18:09:34,221 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:30
-2025-11-06 18:09:34,808 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-214946.fit' (WCS present).
-2025-11-06 18:09:34,814 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:25/165
-2025-11-06 18:09:34,965 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-214957.fit' (WCS present).
-2025-11-06 18:09:34,969 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:40
-2025-11-06 18:09:34,976 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:26/165
-2025-11-06 18:09:35,123 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:35
-2025-11-06 18:09:35,294 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215102.fit' (WCS present).
-2025-11-06 18:09:35,305 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215020.fit' (WCS present).
-2025-11-06 18:09:35,312 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:27/165
-2025-11-06 18:09:35,523 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:36
-2025-11-06 18:09:35,535 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:28/165
-2025-11-06 18:09:35,547 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215051.fit' (WCS present).
-2025-11-06 18:09:35,577 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215008.fit' (WCS present).
-2025-11-06 18:09:35,759 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:34
-2025-11-06 18:09:35,759 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:29/165
-2025-11-06 18:09:35,925 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:29
-2025-11-06 18:09:35,925 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:30/165
-2025-11-06 18:09:36,052 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:25
-2025-11-06 18:09:36,909 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215114.fit' (WCS present).
-2025-11-06 18:09:36,919 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:31/165
-2025-11-06 18:09:37,083 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:39
-2025-11-06 18:09:37,206 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215125.fit' (WCS present).
-2025-11-06 18:09:37,220 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:32/165
-2025-11-06 18:09:37,385 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Phase 1 - Traité 32/165): Proc RSS: 1563.8MB, VMS: 2038.9MB. Sys RAM: Avail 1284MB / Total 8035MB (84.0%% used). Sys Swap: Used 2636MB / Total 24576MB (10.7%% used).
-2025-11-06 18:09:37,385 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:38
-2025-11-06 18:09:37,523 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215136.fit' (WCS present).
-2025-11-06 18:09:37,535 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:33/165
-2025-11-06 18:09:37,573 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215208.fit' (WCS present).
-2025-11-06 18:09:37,673 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:36
-2025-11-06 18:09:37,674 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:34/165
-2025-11-06 18:09:37,813 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215230.fit' (WCS present).
-2025-11-06 18:09:37,819 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:32
-2025-11-06 18:09:37,819 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:35/165
-2025-11-06 18:09:37,938 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:27
-2025-11-06 18:09:37,944 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215156.fit' (WCS present).
-2025-11-06 18:09:37,951 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:36/165
-2025-11-06 18:09:38,074 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:23
-2025-11-06 18:09:38,583 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215301.fit' (WCS present).
-2025-11-06 18:09:38,590 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:37/165
-2025-11-06 18:09:38,729 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:29
-2025-11-06 18:09:38,803 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215313.fit' (WCS present).
-2025-11-06 18:09:38,818 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:38/165
-2025-11-06 18:09:38,949 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:26
-2025-11-06 18:09:39,364 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215347.fit' (WCS present).
-2025-11-06 18:09:39,387 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215324.fit' (WCS present).
-2025-11-06 18:09:39,387 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:39/165
-2025-11-06 18:09:39,546 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215407.fit' (WCS present).
-2025-11-06 18:09:39,547 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:30
-2025-11-06 18:09:39,561 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:40/165
-2025-11-06 18:09:39,611 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215418.fit' (WCS present).
-2025-11-06 18:09:39,699 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:27
-2025-11-06 18:09:39,700 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:41/165
-2025-11-06 18:09:39,822 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:23
-2025-11-06 18:09:39,823 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:42/165
-2025-11-06 18:09:39,936 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:19
-2025-11-06 18:09:40,275 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215429.fit' (WCS present).
-2025-11-06 18:09:40,290 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:43/165
-2025-11-06 18:09:40,486 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215440.fit' (WCS present).
-2025-11-06 18:09:40,494 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:22
-2025-11-06 18:09:40,495 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:44/165
-2025-11-06 18:09:40,629 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:19
-2025-11-06 18:09:41,241 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215523.fit' (WCS present).
-2025-11-06 18:09:41,248 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215512.fit' (WCS present).
-2025-11-06 18:09:41,255 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:45/165
-2025-11-06 18:09:41,452 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215452.fit' (WCS present).
-2025-11-06 18:09:41,452 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:25
-2025-11-06 18:09:41,462 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:46/165
-2025-11-06 18:09:41,597 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:22
-2025-11-06 18:09:41,601 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:47/165
-2025-11-06 18:09:41,752 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:19
-2025-11-06 18:09:41,757 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215534.fit' (WCS present).
-2025-11-06 18:09:41,784 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:48/165
-2025-11-06 18:09:41,919 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Phase 1 - Traité 48/165): Proc RSS: 1703.5MB, VMS: 2152.4MB. Sys RAM: Avail 1488MB / Total 8035MB (81.5%% used). Sys Swap: Used 2941MB / Total 24576MB (12.0%% used).
-2025-11-06 18:09:41,920 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:17
-2025-11-06 18:09:42,100 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215546.fit' (WCS present).
-2025-11-06 18:09:42,115 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:49/165
-2025-11-06 18:09:42,245 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:16
-2025-11-06 18:09:42,345 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215557.fit' (WCS present).
-2025-11-06 18:09:42,353 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:50/165
-2025-11-06 18:09:42,482 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:14
-2025-11-06 18:09:43,034 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215640.fit' (WCS present).
-2025-11-06 18:09:43,054 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215702.fit' (WCS present).
-2025-11-06 18:09:43,062 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:51/165
-2025-11-06 18:09:43,199 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:19
-2025-11-06 18:09:43,200 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:52/165
-2025-11-06 18:09:43,205 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215651.fit' (WCS present).
-2025-11-06 18:09:43,336 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:16
-2025-11-06 18:09:43,338 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:53/165
-2025-11-06 18:09:43,464 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:13
-2025-11-06 18:09:43,506 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215720.fit' (WCS present).
-2025-11-06 18:09:43,517 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:54/165
-2025-11-06 18:09:43,638 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:11
-2025-11-06 18:09:43,748 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215743.fit' (WCS present).
-2025-11-06 18:09:43,765 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:55/165
-2025-11-06 18:09:43,903 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:09
-2025-11-06 18:09:43,969 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215754.fit' (WCS present).
-2025-11-06 18:09:43,986 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:56/165
-2025-11-06 18:09:44,113 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:08
-2025-11-06 18:09:44,766 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215805.fit' (WCS present).
-2025-11-06 18:09:44,771 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:57/165
-2025-11-06 18:09:44,815 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215826.fit' (WCS present).
-2025-11-06 18:09:44,919 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:12
-2025-11-06 18:09:44,921 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:58/165
-2025-11-06 18:09:44,967 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215837.fit' (WCS present).
-2025-11-06 18:09:45,064 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:10
-2025-11-06 18:09:45,065 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:59/165
-2025-11-06 18:09:45,213 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215848.fit' (WCS present).
-2025-11-06 18:09:45,225 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:08
-2025-11-06 18:09:45,226 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:60/165
-2025-11-06 18:09:45,382 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215911.fit' (WCS present).
-2025-11-06 18:09:45,385 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:05
-2025-11-06 18:09:45,392 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:61/165
-2025-11-06 18:09:45,505 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:03
-2025-11-06 18:09:45,600 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215931.fit' (WCS present).
-2025-11-06 18:09:45,618 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:62/165
-2025-11-06 18:09:45,741 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:02
-2025-11-06 18:09:46,853 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220016.fit' (WCS present).
-2025-11-06 18:09:46,861 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215942.fit' (WCS present).
-2025-11-06 18:09:46,875 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220005.fit' (WCS present).
-2025-11-06 18:09:46,877 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:63/165
-2025-11-06 18:09:47,074 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:11
-2025-11-06 18:09:47,082 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:64/165
-2025-11-06 18:09:47,083 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-215953.fit' (WCS present).
-2025-11-06 18:09:47,130 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220036.fit' (WCS present).
-2025-11-06 18:09:47,311 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Phase 1 - Traité 64/165): Proc RSS: 2001.4MB, VMS: 2458.6MB. Sys RAM: Avail 1344MB / Total 8035MB (83.3%% used). Sys Swap: Used 2954MB / Total 24576MB (12.0%% used).
-2025-11-06 18:09:47,311 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:09
-2025-11-06 18:09:47,311 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:65/165
-2025-11-06 18:09:47,495 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:07
-2025-11-06 18:09:47,512 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220047.fit' (WCS present).
-2025-11-06 18:09:47,512 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:66/165
-2025-11-06 18:09:47,679 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:05
-2025-11-06 18:09:47,679 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:67/165
-2025-11-06 18:09:47,818 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:03
-2025-11-06 18:09:47,818 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:68/165
-2025-11-06 18:09:47,985 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:01
-2025-11-06 18:09:48,830 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220202.fit' (WCS present).
-2025-11-06 18:09:48,850 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:69/165
-2025-11-06 18:09:49,015 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:07
-2025-11-06 18:09:49,134 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220059.fit' (WCS present).
-2025-11-06 18:09:49,143 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220110.fit' (WCS present).
-2025-11-06 18:09:49,161 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220213.fit' (WCS present).
-2025-11-06 18:09:49,163 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220139.fit' (WCS present).
-2025-11-06 18:09:49,163 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:70/165
-2025-11-06 18:09:49,316 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:06
-2025-11-06 18:09:49,317 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:71/165
-2025-11-06 18:09:49,318 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220151.fit' (WCS present).
-2025-11-06 18:09:49,454 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:04
-2025-11-06 18:09:49,458 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:72/165
-2025-11-06 18:09:49,598 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:02
-2025-11-06 18:09:49,598 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:73/165
-2025-11-06 18:09:49,746 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:00
-2025-11-06 18:09:49,746 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:74/165
-2025-11-06 18:09:49,881 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:58
-2025-11-06 18:09:50,599 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220225.fit' (WCS present).
-2025-11-06 18:09:50,614 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:75/165
-2025-11-06 18:09:50,778 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:02
-2025-11-06 18:09:50,922 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220317.fit' (WCS present).
-2025-11-06 18:09:50,939 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:76/165
-2025-11-06 18:09:51,139 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:01
-2025-11-06 18:09:51,255 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220243.fit' (WCS present).
-2025-11-06 18:09:51,264 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:77/165
-2025-11-06 18:09:51,464 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220328.fit' (WCS present).
-2025-11-06 18:09:51,464 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:01
-2025-11-06 18:09:51,529 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:78/165
-2025-11-06 18:09:51,521 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220348.fit' (WCS present).
-2025-11-06 18:09:51,509 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220254.fit' (WCS present).
-2025-11-06 18:09:51,707 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:59
-2025-11-06 18:09:51,707 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:79/165
-2025-11-06 18:09:51,849 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:57
-2025-11-06 18:09:51,856 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:80/165
-2025-11-06 18:09:52,047 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Phase 1 - Traité 80/165): Proc RSS: 2418.8MB, VMS: 2875.8MB. Sys RAM: Avail 895MB / Total 8035MB (88.9%% used). Sys Swap: Used 2970MB / Total 24576MB (12.1%% used).
-2025-11-06 18:09:52,054 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:56
-2025-11-06 18:09:52,645 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220359.fit' (WCS present).
-2025-11-06 18:09:52,652 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:81/165
-2025-11-06 18:09:52,797 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:58
-2025-11-06 18:09:52,933 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220411.fit' (WCS present).
-2025-11-06 18:09:52,941 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:82/165
-2025-11-06 18:09:53,086 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:57
-2025-11-06 18:09:53,419 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220433.fit' (WCS present).
-2025-11-06 18:09:53,436 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:83/165
-2025-11-06 18:09:53,596 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:58
-2025-11-06 18:09:53,694 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220453.fit' (WCS present).
-2025-11-06 18:09:53,705 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:84/165
-2025-11-06 18:09:53,707 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220505.fit' (WCS present).
-2025-11-06 18:09:53,855 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:57
-2025-11-06 18:09:53,856 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:85/165
-2025-11-06 18:09:53,909 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220516.fit' (WCS present).
-2025-11-06 18:09:54,012 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:55
-2025-11-06 18:09:54,027 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:86/165
-2025-11-06 18:09:54,171 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:54
-2025-11-06 18:09:54,569 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220527.fit' (WCS present).
-2025-11-06 18:09:54,586 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:87/165
-2025-11-06 18:09:54,734 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:54
-2025-11-06 18:09:54,795 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220539.fit' (WCS present).
-2025-11-06 18:09:54,812 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:88/165
-2025-11-06 18:09:54,950 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:53
-2025-11-06 18:09:55,633 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220621.fit' (WCS present).
-2025-11-06 18:09:55,642 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220558.fit' (WCS present).
-2025-11-06 18:09:55,671 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:89/165
-2025-11-06 18:09:55,681 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220610.fit' (WCS present).
-2025-11-06 18:09:55,855 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220632.fit' (WCS present).
-2025-11-06 18:09:55,866 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:56
-2025-11-06 18:09:55,866 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:90/165
-2025-11-06 18:09:55,991 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:54
-2025-11-06 18:09:55,994 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:91/165
-2025-11-06 18:09:56,122 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:52
-2025-11-06 18:09:56,126 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:92/165
-2025-11-06 18:09:56,300 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:51
-2025-11-06 18:09:56,384 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220643.fit' (WCS present).
-2025-11-06 18:09:56,395 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:93/165
-2025-11-06 18:09:56,541 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:50
-2025-11-06 18:09:56,633 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220715.fit' (WCS present).
-2025-11-06 18:09:56,657 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:94/165
-2025-11-06 18:09:56,832 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:49
-2025-11-06 18:09:57,868 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220726.fit' (WCS present).
-2025-11-06 18:09:57,903 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:95/165
-2025-11-06 18:09:57,946 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220737.fit' (WCS present).
-2025-11-06 18:09:57,947 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220748.fit' (WCS present).
-2025-11-06 18:09:58,146 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:54
-2025-11-06 18:09:58,172 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:96/165
-2025-11-06 18:09:58,179 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220807.fit' (WCS present).
-2025-11-06 18:09:58,193 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220818.fit' (WCS present).
-2025-11-06 18:09:58,411 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Phase 1 - Traité 96/165): Proc RSS: 2179.8MB, VMS: 3175.0MB. Sys RAM: Avail 966MB / Total 8035MB (88.0%% used). Sys Swap: Used 3080MB / Total 24576MB (12.5%% used).
-2025-11-06 18:09:58,415 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:53
-2025-11-06 18:09:58,416 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:97/165
-2025-11-06 18:09:58,465 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220829.fit' (WCS present).
-2025-11-06 18:09:58,612 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:52
-2025-11-06 18:09:58,612 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:98/165
-2025-11-06 18:09:58,766 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:50
-2025-11-06 18:09:58,766 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:99/165
-2025-11-06 18:09:58,898 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:48
-2025-11-06 18:09:58,899 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:100/165
-2025-11-06 18:09:59,045 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:47
-2025-11-06 18:10:00,108 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220935.fit' (WCS present).
-2025-11-06 18:10:00,128 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:101/165
-2025-11-06 18:10:00,317 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:51
-2025-11-06 18:10:00,376 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220946.fit' (WCS present).
-2025-11-06 18:10:00,395 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:102/165
-2025-11-06 18:10:00,415 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220841.fit' (WCS present).
-2025-11-06 18:10:00,579 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:50
-2025-11-06 18:10:00,580 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:103/165
-2025-11-06 18:10:00,719 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:48
-2025-11-06 18:10:00,734 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220924.fit' (WCS present).
-2025-11-06 18:10:00,751 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220852.fit' (WCS present).
-2025-11-06 18:10:00,766 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:104/165
-2025-11-06 18:10:00,815 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220912.fit' (WCS present).
-2025-11-06 18:10:00,936 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:47
-2025-11-06 18:10:00,936 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:105/165
-2025-11-06 18:10:01,096 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:46
-2025-11-06 18:10:01,096 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:106/165
-2025-11-06 18:10:01,240 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:44
-2025-11-06 18:10:01,952 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-220957.fit' (WCS present).
-2025-11-06 18:10:01,967 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:107/165
-2025-11-06 18:10:02,115 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:46
-2025-11-06 18:10:02,220 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221016.fit' (WCS present).
-2025-11-06 18:10:02,234 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:108/165
-2025-11-06 18:10:02,376 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:45
-2025-11-06 18:10:02,569 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221121.fit' (WCS present).
-2025-11-06 18:10:02,601 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221101.fit' (WCS present).
-2025-11-06 18:10:02,601 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:109/165
-2025-11-06 18:10:02,605 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221027.fit' (WCS present).
-2025-11-06 18:10:02,670 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221050.fit' (WCS present).
-2025-11-06 18:10:02,769 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:45
-2025-11-06 18:10:02,770 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:110/165
-2025-11-06 18:10:02,905 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:43
-2025-11-06 18:10:02,906 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:111/165
-2025-11-06 18:10:03,064 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:42
-2025-11-06 18:10:03,064 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:112/165
-2025-11-06 18:10:03,242 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Phase 1 - Traité 112/165): Proc RSS: 2135.5MB, VMS: 3644.3MB. Sys RAM: Avail 858MB / Total 8035MB (89.3%% used). Sys Swap: Used 3261MB / Total 24576MB (13.3%% used).
-2025-11-06 18:10:03,242 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:40
-2025-11-06 18:10:03,871 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221132.fit' (WCS present).
-2025-11-06 18:10:03,880 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:113/165
-2025-11-06 18:10:04,110 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:42
-2025-11-06 18:10:04,216 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221143.fit' (WCS present).
-2025-11-06 18:10:04,228 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:114/165
-2025-11-06 18:10:04,412 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:41
-2025-11-06 18:10:04,617 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221206.fit' (WCS present).
-2025-11-06 18:10:04,645 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221155.fit' (WCS present).
-2025-11-06 18:10:04,645 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:115/165
-2025-11-06 18:10:04,710 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221226.fit' (WCS present).
-2025-11-06 18:10:04,836 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:41
-2025-11-06 18:10:04,840 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:116/165
-2025-11-06 18:10:04,982 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:39
-2025-11-06 18:10:04,994 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221237.fit' (WCS present).
-2025-11-06 18:10:04,994 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:117/165
-2025-11-06 18:10:05,166 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:38
-2025-11-06 18:10:05,167 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:118/165
-2025-11-06 18:10:05,321 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:37
-2025-11-06 18:10:05,872 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221249.fit' (WCS present).
-2025-11-06 18:10:05,882 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:119/165
-2025-11-06 18:10:06,047 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:38
-2025-11-06 18:10:06,072 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221300.fit' (WCS present).
-2025-11-06 18:10:06,086 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:120/165
-2025-11-06 18:10:06,243 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:37
-2025-11-06 18:10:06,503 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221311.fit' (WCS present).
-2025-11-06 18:10:06,523 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:121/165
-2025-11-06 18:10:06,701 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:36
-2025-11-06 18:10:06,728 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221331.fit' (WCS present).
-2025-11-06 18:10:06,729 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221342.fit' (WCS present).
-2025-11-06 18:10:06,739 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:122/165
-2025-11-06 18:10:06,901 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221354.fit' (WCS present).
-2025-11-06 18:10:06,901 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:35
-2025-11-06 18:10:06,914 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:123/165
-2025-11-06 18:10:07,052 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:34
-2025-11-06 18:10:07,052 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:124/165
-2025-11-06 18:10:07,193 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:33
-2025-11-06 18:10:07,677 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221405.fit' (WCS present).
-2025-11-06 18:10:07,689 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221416.fit' (WCS present).
-2025-11-06 18:10:07,703 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:125/165
-2025-11-06 18:10:07,863 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:33
-2025-11-06 18:10:07,864 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:126/165
-2025-11-06 18:10:08,051 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:32
-2025-11-06 18:10:08,415 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221437.fit' (WCS present).
-2025-11-06 18:10:08,424 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:127/165
-2025-11-06 18:10:08,591 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:32
-2025-11-06 18:10:08,694 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221510.fit' (WCS present).
-2025-11-06 18:10:08,701 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221459.fit' (WCS present).
-2025-11-06 18:10:08,711 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:128/165
-2025-11-06 18:10:08,775 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221522.fit' (WCS present).
-2025-11-06 18:10:08,906 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Phase 1 - Traité 128/165): Proc RSS: 2131.9MB, VMS: 4078.3MB. Sys RAM: Avail 986MB / Total 8035MB (87.7%% used). Sys Swap: Used 3663MB / Total 24576MB (14.9%% used).
-2025-11-06 18:10:08,908 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:31
-2025-11-06 18:10:08,909 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:129/165
-2025-11-06 18:10:09,064 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:30
-2025-11-06 18:10:09,064 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:130/165
-2025-11-06 18:10:09,232 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:29
-2025-11-06 18:10:09,663 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221551.fit' (WCS present).
-2025-11-06 18:10:09,678 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221540.fit' (WCS present).
-2025-11-06 18:10:09,687 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:131/165
-2025-11-06 18:10:09,828 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:29
-2025-11-06 18:10:09,828 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:132/165
-2025-11-06 18:10:09,993 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:28
-2025-11-06 18:10:10,585 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221645.fit' (WCS present).
-2025-11-06 18:10:10,590 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221625.fit' (WCS present).
-2025-11-06 18:10:10,598 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:133/165
-2025-11-06 18:10:10,775 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:29
-2025-11-06 18:10:10,776 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:134/165
-2025-11-06 18:10:10,844 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221708.fit' (WCS present).
-2025-11-06 18:10:10,862 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221657.fit' (WCS present).
-2025-11-06 18:10:10,982 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:28
-2025-11-06 18:10:10,983 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:135/165
-2025-11-06 18:10:11,136 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:27
-2025-11-06 18:10:11,137 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:136/165
-2025-11-06 18:10:11,306 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:25
-2025-11-06 18:10:11,671 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221730.fit' (WCS present).
-2025-11-06 18:10:11,690 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221719.fit' (WCS present).
-2025-11-06 18:10:11,708 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:137/165
-2025-11-06 18:10:11,873 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:25
-2025-11-06 18:10:11,873 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:138/165
-2025-11-06 18:10:12,029 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:24
-2025-11-06 18:10:12,687 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221750.fit' (WCS present).
-2025-11-06 18:10:12,722 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:139/165
-2025-11-06 18:10:12,731 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221802.fit' (WCS present).
-2025-11-06 18:10:12,923 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:25
-2025-11-06 18:10:12,923 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:140/165
-2025-11-06 18:10:13,075 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:24
-2025-11-06 18:10:13,144 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221813.fit' (WCS present).
-2025-11-06 18:10:13,158 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:141/165
-2025-11-06 18:10:13,359 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221824.fit' (WCS present).
-2025-11-06 18:10:13,360 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:23
-2025-11-06 18:10:13,373 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:142/165
-2025-11-06 18:10:13,532 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:22
-2025-11-06 18:10:13,692 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221918.fit' (WCS present).
-2025-11-06 18:10:13,705 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:143/165
-2025-11-06 18:10:13,757 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221836.fit' (WCS present).
-2025-11-06 18:10:13,871 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:22
-2025-11-06 18:10:13,875 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:144/165
-2025-11-06 18:10:14,022 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Phase 1 - Traité 144/165): Proc RSS: 2054.4MB, VMS: 4451.9MB. Sys RAM: Avail 1127MB / Total 8035MB (86.0%% used). Sys Swap: Used 3992MB / Total 24576MB (16.2%% used).
-2025-11-06 18:10:14,023 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:20
-2025-11-06 18:10:14,771 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221941.fit' (WCS present).
-2025-11-06 18:10:14,786 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:145/165
-2025-11-06 18:10:14,818 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221930.fit' (WCS present).
-2025-11-06 18:10:14,974 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:22
-2025-11-06 18:10:14,976 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:146/165
-2025-11-06 18:10:15,115 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:20
-2025-11-06 18:10:15,291 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-222012.fit' (WCS present).
-2025-11-06 18:10:15,294 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-221952.fit' (WCS present).
-2025-11-06 18:10:15,304 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:147/165
-2025-11-06 18:10:15,504 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:20
-2025-11-06 18:10:15,504 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:148/165
-2025-11-06 18:10:15,649 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:19
-2025-11-06 18:10:15,693 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-222035.fit' (WCS present).
-2025-11-06 18:10:15,707 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-222024.fit' (WCS present).
-2025-11-06 18:10:15,717 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:149/165
-2025-11-06 18:10:15,901 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:18
-2025-11-06 18:10:15,906 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:150/165
-2025-11-06 18:10:16,071 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:17
-2025-11-06 18:10:16,965 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-222046.fit' (WCS present).
-2025-11-06 18:10:16,990 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-222057.fit' (WCS present).
-2025-11-06 18:10:17,006 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:151/165
-2025-11-06 18:10:17,184 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:18
-2025-11-06 18:10:17,189 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:152/165
-2025-11-06 18:10:17,403 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-222117.fit' (WCS present).
-2025-11-06 18:10:17,403 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:17
-2025-11-06 18:10:17,416 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:153/165
-2025-11-06 18:10:17,600 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-222140.fit' (WCS present).
-2025-11-06 18:10:17,602 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:16
-2025-11-06 18:10:17,611 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:154/165
-2025-11-06 18:10:17,632 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-222151.fit' (WCS present).
-2025-11-06 18:10:17,834 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:15
-2025-11-06 18:10:17,845 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:155/165
-2025-11-06 18:10:17,845 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-222129.fit' (WCS present).
-2025-11-06 18:10:18,024 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:14
-2025-11-06 18:10:18,029 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:156/165
-2025-11-06 18:10:18,219 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:13
-2025-11-06 18:10:19,107 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-222223.fit' (WCS present).
-2025-11-06 18:10:19,124 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:157/165
-2025-11-06 18:10:19,281 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:14
-2025-11-06 18:10:19,365 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-222234.fit' (WCS present).
-2025-11-06 18:10:19,384 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:158/165
-2025-11-06 18:10:19,390 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-222203.fit' (WCS present).
-2025-11-06 18:10:19,579 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:14
-2025-11-06 18:10:19,590 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-222245.fit' (WCS present).
-2025-11-06 18:10:19,596 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-222256.fit' (WCS present).
-2025-11-06 18:10:19,596 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:159/165
-2025-11-06 18:10:19,772 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:13
-2025-11-06 18:10:19,773 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:160/165
-2025-11-06 18:10:19,840 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-222308.fit' (WCS present).
-2025-11-06 18:10:19,949 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Phase 1 - Traité 160/165): Proc RSS: 1726.9MB, VMS: 4622.3MB. Sys RAM: Avail 1277MB / Total 8035MB (84.1%% used). Sys Swap: Used 4382MB / Total 24576MB (17.8%% used).
-2025-11-06 18:10:19,958 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:12
-2025-11-06 18:10:19,958 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:161/165
-2025-11-06 18:10:20,084 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:10
-2025-11-06 18:10:20,084 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:162/165
-2025-11-06 18:10:20,215 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:09
-2025-11-06 18:10:20,745 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-222349.fit' (WCS present).
-2025-11-06 18:10:20,755 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:163/165
-2025-11-06 18:10:20,874 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:09
-2025-11-06 18:10:20,931 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-222411.fit' (WCS present).
-2025-11-06 18:10:20,958 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:4701 - Skip WCS solve for 'Light_M 81_10.0s_IRCUT_20250314-222400.fit' (WCS present).
-2025-11-06 18:10:20,958 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:164/165
-2025-11-06 18:10:21,089 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:08
-2025-11-06 18:10:21,089 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - RAW_FILE_COUNT_UPDATE:165/165
-2025-11-06 18:10:21,215 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Phase 1 - Traité 165/165): Proc RSS: 1687.5MB, VMS: 4578.7MB. Sys RAM: Avail 1354MB / Total 8035MB (83.1%% used). Sys Swap: Used 4374MB / Total 24576MB (17.8%% used).
-2025-11-06 18:10:21,215 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:02:07
-2025-11-06 18:10:21,260 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Fin Phase 1 (Prétraitement)): Proc RSS: 1692.3MB, VMS: 4578.4MB. Sys RAM: Avail 1352MB / Total 8035MB (83.2%% used). Sys Swap: Used 4373MB / Total 24576MB (17.8%% used).
-2025-11-06 18:10:21,260 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: run_info_phase1_finished_cache] (Args: {'num_valid_raws': 165})
-2025-11-06 18:10:21,260 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 -     Temps moyen/brute (P1): 0.33s
-2025-11-06 18:10:21,270 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Début Phase 2 (Clustering)): Proc RSS: 1692.8MB, VMS: 4578.0MB. Sys RAM: Avail 1351MB / Total 8035MB (83.2%% used). Sys Swap: Used 4373MB / Total 24576MB (17.8%% used).
-2025-11-06 18:10:21,270 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: run_info_phase2_started]
-2025-11-06 18:10:21,270 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - PHASE_UPDATE:2
-2025-11-06 18:10:21,273 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Phase 2: using 9 preplanned group(s) from filter UI.
-2025-11-06 18:10:21,599 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Cluster NN stats (deg): P10=0.0000, P50=0.0000, P90=0.0000
-2025-11-06 18:10:21,600 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: Winsor worker limit set to 8 (ProcessPoolExecutor enabled)]
-2025-11-06 18:10:21,600 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Winsor streaming limit set to 5 frame(s) per pass
-2025-11-06 18:10:21,610 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Fin Phase 2): Proc RSS: 1695.1MB, VMS: 4579.0MB. Sys RAM: Avail 1345MB / Total 8035MB (83.3%% used). Sys Swap: Used 4372MB / Total 24576MB (17.8%% used).
-2025-11-06 18:10:21,610 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: run_info_phase2_finished] (Args: {'num_groups': 9})
-2025-11-06 18:10:21,646 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_BENCH: read 1096.7 MB/s (fast), write 968.4 MB/s (fast)
-2025-11-06 18:10:21,646 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT: cache read slots set to 2
-2025-11-06 18:10:21,656 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Début Phase 3 (Master Tuiles)): Proc RSS: 1695.1MB, VMS: 4579.0MB. Sys RAM: Avail 1326MB / Total 8035MB (83.5%% used). Sys Swap: Used 4372MB / Total 24576MB (17.8%% used).
-2025-11-06 18:10:21,656 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: run_info_phase3_started_from_cache]
-2025-11-06 18:10:21,656 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - PHASE_UPDATE:3
-2025-11-06 18:10:21,689 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: center_anchor_probe_start] (Args: {'probe_count': 9})
-2025-11-06 18:10:26,206 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - center_anchor_probe_candidate
-2025-11-06 18:10:26,207 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - center_anchor_probe_candidate
-2025-11-06 18:10:26,207 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - center_anchor_probe_candidate
-2025-11-06 18:10:26,207 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - center_anchor_probe_candidate
-2025-11-06 18:10:26,207 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - center_anchor_probe_candidate
-2025-11-06 18:10:26,207 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - center_anchor_probe_candidate
-2025-11-06 18:10:26,207 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - center_anchor_probe_candidate
-2025-11-06 18:10:26,207 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - center_anchor_probe_candidate
-2025-11-06 18:10:26,207 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - center_anchor_probe_candidate
-2025-11-06 18:10:26,207 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: center_anchor_soft_fallback]
-2025-11-06 18:10:26,207 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: center_anchor_selected] (Args: {'tile': 3, 'dist_deg': 0.022985930320533574, 'score': 40.63109538940432})
-2025-11-06 18:10:26,208 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - phase3_center_out_plan
-2025-11-06 18:10:26,215 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: WORKERS_PHASE3: Utilisation de 3 worker(s). (Base: 6, Ratio 50%, Groupes: 9)]
-2025-11-06 18:10:26,219 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - MASTER_TILE_COUNT_UPDATE:0/9
-2025-11-06 18:10:26,221 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 20, 'tile_id': 3})
-2025-11-06 18:10:26,222 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 -     mastertile_3: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean', RGBEqualize=True
-2025-11-06 18:10:26,222 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_reference_set
-2025-11-06 18:10:26,223 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_loading_from_cache_started
-2025-11-06 18:10:26,223 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 20, 'tile_id': 1})
-2025-11-06 18:10:26,223 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 -     mastertile_1: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean', RGBEqualize=True
-2025-11-06 18:10:26,224 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_reference_set
-2025-11-06 18:10:26,224 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_loading_from_cache_started
-2025-11-06 18:10:26,225 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 5, 'tile_id': 8})
-2025-11-06 18:10:26,225 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 -     mastertile_8: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean', RGBEqualize=True
-2025-11-06 18:10:26,226 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_reference_set
-2025-11-06 18:10:26,226 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_loading_from_cache_started
-2025-11-06 18:10:26,453 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_intra_tile_alignment_started
-2025-11-06 18:10:27,471 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: cache_read_slots -> 1
-2025-11-06 18:10:27,842 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_intra_tile_alignment_started
-2025-11-06 18:10:27,854 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_intra_tile_alignment_started
-2025-11-06 18:10:28,723 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: ph3_workers -> 1
-2025-11-06 18:10:30,127 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: cache_read_slots -> 2
-2025-11-06 18:10:35,158 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: cache_read_slots -> 1
-2025-11-06 18:10:36,410 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: cache_read_slots -> 2
-2025-11-06 18:10:41,336 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_intra_tile_alignment_finished
-2025-11-06 18:10:41,336 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_stacking_started
-2025-11-06 18:10:46,419 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: ph3_workers -> 3
-2025-11-06 18:10:58,703 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_stacking_finished
-2025-11-06 18:10:58,704 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.806635,1.093866), target=1434.47]
-2025-11-06 18:11:29,574 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_intra_tile_alignment_finished
-2025-11-06 18:11:29,575 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_stacking_started
-2025-11-06 18:11:29,913 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_intra_tile_alignment_finished
-2025-11-06 18:11:29,914 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_stacking_started
-2025-11-06 18:11:42,099 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: ph3_workers -> 2
-2025-11-06 18:11:48,357 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: ph3_workers -> 3
-2025-11-06 18:11:58,820 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - center_out_debug
-2025-11-06 18:11:58,821 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_center_out_applied
-2025-11-06 18:11:59,274 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - MT_CROP: quality-based rect=(72, 106, 1176, 1006) (band=32, k=2.00, margin=8)
-2025-11-06 18:11:59,676 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_saved
-2025-11-06 18:11:59,780 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - MASTER_TILE_COUNT_UPDATE:1/9
-2025-11-06 18:11:59,901 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Phase 3 - Traité 1/9 tuiles): Proc RSS: 1875.6MB, VMS: 6761.0MB. Sys RAM: Avail 1882MB / Total 8035MB (76.6%% used). Sys Swap: Used 6979MB / Total 24576MB (28.4%% used).
-2025-11-06 18:11:59,903 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:17:07
-2025-11-06 18:11:59,904 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 20, 'tile_id': 0})
-2025-11-06 18:11:59,904 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 -     mastertile_0: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean', RGBEqualize=True
-2025-11-06 18:11:59,905 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_reference_set
-2025-11-06 18:11:59,905 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_loading_from_cache_started
-2025-11-06 18:12:00,926 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: ph3_workers -> 1
-2025-11-06 18:12:00,927 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: cache_read_slots -> 1
-2025-11-06 18:12:00,998 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_intra_tile_alignment_started
-2025-11-06 18:12:02,180 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: cache_read_slots -> 2
-2025-11-06 18:12:07,194 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: cache_read_slots -> 1
-2025-11-06 18:12:08,445 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: cache_read_slots -> 2
-2025-11-06 18:12:33,890 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: cache_read_slots -> 1
-2025-11-06 18:12:35,142 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: cache_read_slots -> 2
-2025-11-06 18:12:45,528 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_stacking_finished
-2025-11-06 18:12:45,547 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.807389,1.103741), target=1463.02]
-2025-11-06 18:12:45,602 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_center_out_applied
-2025-11-06 18:12:46,235 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - MT_CROP: quality-based rect=(72, 8, 1272, 1072) (band=32, k=2.00, margin=8)
-2025-11-06 18:12:46,660 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_stacking_finished
-2025-11-06 18:12:46,660 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.805598,1.109711), target=1468.9]
-2025-11-06 18:12:46,875 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_saved
-2025-11-06 18:12:46,973 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - MASTER_TILE_COUNT_UPDATE:2/9
-2025-11-06 18:12:47,075 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Phase 3 - Traité 2/9 tuiles): Proc RSS: 900.7MB, VMS: 5556.8MB. Sys RAM: Avail 3450MB / Total 8035MB (57.1%% used). Sys Swap: Used 7569MB / Total 24576MB (30.8%% used).
-2025-11-06 18:12:47,120 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:12:57
-2025-11-06 18:12:47,134 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 20, 'tile_id': 7})
-2025-11-06 18:12:47,177 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 -     mastertile_7: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean', RGBEqualize=True
-2025-11-06 18:12:47,178 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_reference_set
-2025-11-06 18:12:47,178 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_loading_from_cache_started
-2025-11-06 18:12:47,462 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - center_out_debug
-2025-11-06 18:12:47,462 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_center_out_applied
-2025-11-06 18:12:47,862 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - MT_CROP: quality-based rect=(72, 138, 1272, 1006) (band=32, k=2.00, margin=8)
-2025-11-06 18:12:48,216 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: cache_read_slots -> 1
-2025-11-06 18:12:48,218 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_saved
-2025-11-06 18:12:48,315 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - MASTER_TILE_COUNT_UPDATE:3/9
-2025-11-06 18:12:48,419 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Phase 3 - Traité 3/9 tuiles): Proc RSS: 1244.7MB, VMS: 5881.8MB. Sys RAM: Avail 3101MB / Total 8035MB (61.4%% used). Sys Swap: Used 7543MB / Total 24576MB (30.7%% used).
-2025-11-06 18:12:48,419 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:08:44
-2025-11-06 18:12:48,420 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 20, 'tile_id': 6})
-2025-11-06 18:12:48,420 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 -     mastertile_6: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean', RGBEqualize=True
-2025-11-06 18:12:48,421 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_reference_set
-2025-11-06 18:12:48,421 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_loading_from_cache_started
-2025-11-06 18:12:48,712 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_intra_tile_alignment_started
-2025-11-06 18:12:50,012 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_intra_tile_alignment_started
-2025-11-06 18:12:50,721 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: ph3_workers -> 3
-2025-11-06 18:12:50,722 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: cache_read_slots -> 2
-2025-11-06 18:13:08,958 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_intra_tile_alignment_finished
-2025-11-06 18:13:08,958 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_stacking_started
-2025-11-06 18:13:26,037 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: ph3_workers -> 2
-2025-11-06 18:13:57,527 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_intra_tile_alignment_finished
-2025-11-06 18:13:57,527 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_stacking_started
-2025-11-06 18:13:57,677 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_intra_tile_alignment_finished
-2025-11-06 18:13:57,677 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_stacking_started
-2025-11-06 18:14:22,411 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_stacking_finished
-2025-11-06 18:14:22,412 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.805238,1.113434), target=1475.22]
-2025-11-06 18:14:22,706 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - center_out_debug
-2025-11-06 18:14:22,706 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_center_out_applied
-2025-11-06 18:14:23,166 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - MT_CROP: quality-based rect=(104, 8, 1112, 1072) (band=32, k=2.00, margin=8)
-2025-11-06 18:14:23,559 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_saved
-2025-11-06 18:14:23,656 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - MASTER_TILE_COUNT_UPDATE:4/9
-2025-11-06 18:14:23,757 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Phase 3 - Traité 4/9 tuiles): Proc RSS: 1458.8MB, VMS: 6123.9MB. Sys RAM: Avail 2829MB / Total 8035MB (64.8%% used). Sys Swap: Used 7235MB / Total 24576MB (29.4%% used).
-2025-11-06 18:14:23,758 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:09:53
-2025-11-06 18:14:23,759 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 20, 'tile_id': 4})
-2025-11-06 18:14:23,759 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 -     mastertile_4: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean', RGBEqualize=True
-2025-11-06 18:14:23,760 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_reference_set
-2025-11-06 18:14:23,761 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_loading_from_cache_started
-2025-11-06 18:14:24,840 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_intra_tile_alignment_started
-2025-11-06 18:14:25,090 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: ph3_workers -> 1
-2025-11-06 18:14:25,090 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: cache_read_slots -> 1
-2025-11-06 18:14:26,341 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: cache_read_slots -> 2
-2025-11-06 18:15:13,945 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_stacking_finished
-2025-11-06 18:15:13,947 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.807138,1.097030), target=1438.88]
-2025-11-06 18:15:14,760 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - center_out_debug
-2025-11-06 18:15:14,760 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_center_out_applied
-2025-11-06 18:15:15,317 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - MT_CROP: quality-based rect=(104, 8, 1272, 1072) (band=32, k=2.00, margin=8)
-2025-11-06 18:15:15,807 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_saved
-2025-11-06 18:15:15,924 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - MASTER_TILE_COUNT_UPDATE:5/9
-2025-11-06 18:15:16,046 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Phase 3 - Traité 5/9 tuiles): Proc RSS: 2058.5MB, VMS: 6943.4MB. Sys RAM: Avail 2075MB / Total 8035MB (74.2%% used). Sys Swap: Used 7616MB / Total 24576MB (31.0%% used).
-2025-11-06 18:15:16,046 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:08:48
-2025-11-06 18:15:16,048 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 20, 'tile_id': 5})
-2025-11-06 18:15:16,048 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 -     mastertile_5: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean', RGBEqualize=True
-2025-11-06 18:15:16,049 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_reference_set
-2025-11-06 18:15:16,049 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_loading_from_cache_started
-2025-11-06 18:15:16,449 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: cache_read_slots -> 1
-2025-11-06 18:15:16,720 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_stacking_finished
-2025-11-06 18:15:16,721 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.805856,1.099257), target=1448.72]
-2025-11-06 18:15:17,362 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - center_out_debug
-2025-11-06 18:15:17,363 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_center_out_applied
-2025-11-06 18:15:18,007 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_intra_tile_alignment_started
-2025-11-06 18:15:18,483 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - MT_CROP: quality-based rect=(72, 106, 1080, 1006) (band=32, k=2.00, margin=8)
-2025-11-06 18:15:18,898 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_saved
-2025-11-06 18:15:19,010 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - MASTER_TILE_COUNT_UPDATE:6/9
-2025-11-06 18:15:19,136 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Phase 3 - Traité 6/9 tuiles): Proc RSS: 1499.7MB, VMS: 6200.8MB. Sys RAM: Avail 2478MB / Total 8035MB (69.2%% used). Sys Swap: Used 7472MB / Total 24576MB (30.4%% used).
-2025-11-06 18:15:19,139 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:06:40
-2025-11-06 18:15:19,140 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 20, 'tile_id': 2})
-2025-11-06 18:15:19,140 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 -     mastertile_2: Options Stacking - Norm='linear_fit', Weight='noise_variance' (RadialWeight=False), Reject='winsorized_sigma_clip', Combine='mean', RGBEqualize=True
-2025-11-06 18:15:19,141 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_reference_set
-2025-11-06 18:15:19,141 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_loading_from_cache_started
-2025-11-06 18:15:19,253 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: cache_read_slots -> 2
-2025-11-06 18:15:20,504 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: cache_read_slots -> 1
-2025-11-06 18:15:20,754 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_intra_tile_alignment_started
-2025-11-06 18:15:23,009 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: cache_read_slots -> 2
-2025-11-06 18:15:28,997 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_intra_tile_alignment_finished
-2025-11-06 18:15:28,997 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_stacking_started
-2025-11-06 18:15:39,504 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: ph3_workers -> 3
-2025-11-06 18:16:12,386 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: ph3_workers -> 2
-2025-11-06 18:16:19,914 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_intra_tile_alignment_finished
-2025-11-06 18:16:19,914 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_stacking_started
-2025-11-06 18:16:24,022 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_intra_tile_alignment_finished
-2025-11-06 18:16:24,022 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_stacking_started
-2025-11-06 18:16:44,175 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_stacking_finished
-2025-11-06 18:16:44,175 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.806877,1.100392), target=1446.95]
-2025-11-06 18:16:44,757 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - center_out_debug
-2025-11-06 18:16:44,758 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_center_out_applied
-2025-11-06 18:16:45,216 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - MT_CROP: quality-based rect=(72, 106, 1144, 1006) (band=32, k=2.00, margin=8)
-2025-11-06 18:16:45,556 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_saved
-2025-11-06 18:16:45,660 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - MASTER_TILE_COUNT_UPDATE:7/9
-2025-11-06 18:16:45,754 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Phase 3 - Traité 7/9 tuiles): Proc RSS: 1407.9MB, VMS: 6071.8MB. Sys RAM: Avail 2956MB / Total 8035MB (63.2%% used). Sys Swap: Used 7178MB / Total 24576MB (29.2%% used).
-2025-11-06 18:16:45,755 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:06:16
-2025-11-06 18:16:46,678 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: ph3_workers -> 3
-2025-11-06 18:17:21,336 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_stacking_finished
-2025-11-06 18:17:21,337 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.809014,1.097330), target=1444.59]
-2025-11-06 18:17:22,029 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - center_out_debug
-2025-11-06 18:17:22,029 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_center_out_applied
-2025-11-06 18:17:22,528 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - MT_CROP: quality-based rect=(72, 73, 1368, 1006) (band=32, k=2.00, margin=8)
-2025-11-06 18:17:22,858 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_saved
-2025-11-06 18:17:22,972 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - MASTER_TILE_COUNT_UPDATE:8/9
-2025-11-06 18:17:23,077 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Phase 3 - Traité 8/9 tuiles): Proc RSS: 1285.3MB, VMS: 5796.6MB. Sys RAM: Avail 3062MB / Total 8035MB (61.9%% used). Sys Swap: Used 7174MB / Total 24576MB (29.2%% used).
-2025-11-06 18:17:23,077 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:04:56
-2025-11-06 18:17:26,245 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_stacking_finished
-2025-11-06 18:17:26,245 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.000000,0.806408,1.108588), target=1475.22]
-2025-11-06 18:17:27,262 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - center_out_debug
-2025-11-06 18:17:27,262 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_center_out_applied
-2025-11-06 18:17:27,798 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - MT_CROP: quality-based rect=(104, 73, 1048, 973) (band=32, k=2.00, margin=8)
-2025-11-06 18:17:28,149 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - mastertile_info_saved
-2025-11-06 18:17:28,267 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - MASTER_TILE_COUNT_UPDATE:9/9
-2025-11-06 18:17:28,382 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Phase 3 - Traité 9/9 tuiles): Proc RSS: 148.7MB, VMS: 4620.1MB. Sys RAM: Avail 4008MB / Total 8035MB (50.1%% used). Sys Swap: Used 7169MB / Total 24576MB (29.2%% used).
-2025-11-06 18:17:28,382 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:26
-2025-11-06 18:17:29,398 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - IO_ADAPT_RT: cache_read_slots -> 1
-2025-11-06 18:17:29,414 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: post_anchor_start]
-2025-11-06 18:17:30,953 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - post_anchor_candidate
-2025-11-06 18:17:30,953 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - post_anchor_candidate
-2025-11-06 18:17:30,953 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - post_anchor_candidate
-2025-11-06 18:17:30,953 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - post_anchor_candidate
-2025-11-06 18:17:30,954 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - post_anchor_candidate
-2025-11-06 18:17:30,954 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - post_anchor_candidate
-2025-11-06 18:17:30,954 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - post_anchor_candidate
-2025-11-06 18:17:30,954 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - post_anchor_candidate
-2025-11-06 18:17:30,954 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - post_anchor_candidate
-2025-11-06 18:17:30,954 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: center_anchor_soft_fallback]
-2025-11-06 18:17:33,147 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: post_anchor_selected] (Args: {'tile': 6, 'impr': 0.44444251957234726})
-2025-11-06 18:17:33,147 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: post_anchor_shift] (Args: {'gain': 0.6585670393290526, 'offset': -373.19163843628104})
-2025-11-06 18:17:33,260 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Fin Phase 3): Proc RSS: 148.8MB, VMS: 4615.3MB. Sys RAM: Avail 3996MB / Total 8035MB (50.3%% used). Sys Swap: Used 7167MB / Total 24576MB (29.2%% used).
-2025-11-06 18:17:33,260 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - phase3_debug_timing
-2025-11-06 18:17:33,260 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: run_info_phase3_finished_from_cache] (Args: {'num_master_tiles': 9})
-2025-11-06 18:17:33,260 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - MASTER_TILE_COUNT_UPDATE:9/9
-2025-11-06 18:17:33,261 - ZeMosaicWorker - INFO - zemosaic_worker.run_hierarchical_mosaic:9337 - All master tiles complete, entering Phase 5 (reproject & coadd)
-2025-11-06 18:17:33,270 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Début Phase 4 (Calcul Grille)): Proc RSS: 149.4MB, VMS: 4615.8MB. Sys RAM: Avail 3996MB / Total 8035MB (50.3%% used). Sys Swap: Used 7167MB / Total 24576MB (29.2%% used).
-2025-11-06 18:17:33,271 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: run_info_phase4_started]
-2025-11-06 18:17:33,271 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - PHASE_UPDATE:4
-2025-11-06 18:17:33,273 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - calcgrid_info_start_calc
-2025-11-06 18:17:33,273 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - CalcGrid: 9 WCS/Shapes valides pour calcul.
-2025-11-06 18:17:33,276 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: calcgrid_info_scales] (Args: {'avg_input_scale_arcsec': np.float64(2.3715412093907493), 'target_scale_arcsec': np.float64(2.3715412093907493)})
-2025-11-06 18:17:33,359 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: calcgrid_info_optimal_grid_calculated] (Args: {'shape': (2052, 1347), 'crval': array([148.89063926,  69.08276425])})
-2025-11-06 18:17:33,372 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Fin Phase 4): Proc RSS: 149.9MB, VMS: 4615.8MB. Sys RAM: Avail 4000MB / Total 8035MB (50.2%% used). Sys Swap: Used 7166MB / Total 24576MB (29.2%% used).
-2025-11-06 18:17:33,373 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - phase4_debug_timing
-2025-11-06 18:17:33,373 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: run_info_phase4_finished] (Args: {'shape': (2052, 1347), 'crval': array([148.89063926,  69.08276425])})
-2025-11-06 18:17:33,374 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - PHASE_UPDATE:5
-2025-11-06 18:17:33,385 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Début Phase 5 (Méthode: reproject_coadd, Rognage MT Appliqué: False, QualityCrop: True, %Rognage: N/A)): Proc RSS: 149.9MB, VMS: 4615.8MB. Sys RAM: Avail 4000MB / Total 8035MB (50.2%% used). Sys Swap: Used 7166MB / Total 24576MB (29.2%% used).
-2025-11-06 18:17:33,387 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: run_info_phase5_started_reproject_coadd]
-2025-11-06 18:17:33,396 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Début assemble_final_mosaic_reproject_coadd): Proc RSS: 149.9MB, VMS: 4615.8MB. Sys RAM: Avail 4000MB / Total 8035MB (50.2%% used). Sys Swap: Used 7166MB / Total 24576MB (29.2%% used).
-2025-11-06 18:17:33,396 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ASM_REPROJ_COADD: Options de rognage - Appliquer: False, Pourcentage: N/A
-2025-11-06 18:17:33,414 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:01:53
-2025-11-06 18:17:33,488 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:01:50
-2025-11-06 18:17:33,565 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - assemble_progress_tiles_processed_inc
-2025-11-06 18:17:33,566 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:01:47
-2025-11-06 18:17:34,114 - ZeMosaicWorker - INFO - zemosaic_utils._log_intertile:1180 - [Intertile] Overlap pairs at min_overlap=0.0500: 36
-2025-11-06 18:17:34,114 - ZeMosaicWorker - INFO - zemosaic_utils._log_intertile:1180 - [Intertile] Using: preview=512, min_overlap=0.0500, sky=(30.0,70.0), clip=2.50, pairs=36
-2025-11-06 18:18:13,506 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - assemble_info_intertile_photometric_applied
-2025-11-06 18:18:13,536 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - assemble_debug_memmap_paths
-2025-11-06 18:18:28,614 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:03:33
-2025-11-06 18:18:28,623 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Phase5 Reproject: mémoire après canal 1): Proc RSS: 595.7MB, VMS: 5018.8MB. Sys RAM: Avail 3456MB / Total 8035MB (57.0%% used). Sys Swap: Used 7149MB / Total 24576MB (29.1%% used).
-2025-11-06 18:18:44,446 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:01:58
-2025-11-06 18:18:44,454 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Phase5 Reproject: mémoire après canal 2): Proc RSS: 596.4MB, VMS: 5019.9MB. Sys RAM: Avail 3504MB / Total 8035MB (56.4%% used). Sys Swap: Used 7144MB / Total 24576MB (29.1%% used).
-2025-11-06 18:19:00,052 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:01:03
-2025-11-06 18:19:00,064 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Phase5 Reproject: mémoire après canal 3): Proc RSS: 596.6MB, VMS: 5019.9MB. Sys RAM: Avail 3409MB / Total 8035MB (57.6%% used). Sys Swap: Used 7134MB / Total 24576MB (29.0%% used).
-2025-11-06 18:19:00,064 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - assemble_debug_reproject_timing
-2025-11-06 18:19:00,068 - ZeMosaicWorker - DEBUG - zemosaic_worker._auto_crop_mosaic_to_valid_region:3873 - follow_signal crop applied, bbox=(0, 1441, 102, 1347)
-2025-11-06 18:19:00,068 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ASM_REPROJ_COADD: Auto-cropped output to coverage bounds
-2025-11-06 18:19:00,076 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Fin assemble_final_mosaic_reproject_coadd): Proc RSS: 596.6MB, VMS: 5019.9MB. Sys RAM: Avail 3409MB / Total 8035MB (57.6%% used). Sys Swap: Used 7134MB / Total 24576MB (29.0%% used).
-2025-11-06 18:19:00,077 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: assemble_info_finished_reproject_coadd] (Args: {'shape': (1441, 1245, 3)})
-2025-11-06 18:19:00,077 - ZeMosaicWorker - DEBUG - zemosaic_worker.assemble_final_mosaic_reproject_coadd:6755 - Mosaic shape (HWC): (1441, 1245, 3)
-2025-11-06 18:19:00,113 - ZeMosaicWorker - DEBUG - zemosaic_worker.assemble_final_mosaic_reproject_coadd:6766 - Reproject overlap stats (mean/std per channel): [(-124.56842803955078, 50.4366569519043), (-126.23548889160156, 52.362937927246094), (-131.6353759765625, 44.4266242980957)]
-2025-11-06 18:19:00,114 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:01:03
-2025-11-06 18:19:00,150 - ZeMosaicWorker - INFO - zemosaic_worker.run_hierarchical_mosaic:9688 - [TwoPass] Second pass requested (sigma=50, clip=(0.85, 1.18)); coverage shape=(1441, 1245)
-2025-11-06 18:19:00,150 - ZeMosaicWorker - DEBUG - zemosaic_worker.run_hierarchical_mosaic:9711 - [TwoPass] Prepared 9 tiles for second pass (collected=True, incremental=False)
-2025-11-06 18:19:00,150 - ZeMosaicWorker - DEBUG - zemosaic_worker.run_second_pass_coverage_renorm:6998 - [TwoPass] run_second_pass_coverage_renorm start: tiles=9, wcs=9, coverage_shape=(1441, 1245), sigma=50, clip=(0.85, 1.18)
-2025-11-06 18:19:00,150 - ZeMosaicWorker - DEBUG - zemosaic_worker.compute_per_tile_gains_from_coverage:6852 - [TwoPass] compute_per_tile_gains_from_coverage start: tiles=9, coverage_shape=(1441, 1245), sigma=50, clip=(0.85, 1.18)
-2025-11-06 18:19:00,159 - ZeMosaicWorker - DEBUG - zemosaic_worker.compute_per_tile_gains_from_coverage:6865 - [TwoPass] Coverage stats before blur: shape=(1441, 1245), min=0.0000, max=9.0000, mean=5.3278
-2025-11-06 18:19:01,218 - ZeMosaicWorker - DEBUG - zemosaic_worker.compute_per_tile_gains_from_coverage:6921 - [TwoPass] Coverage blur applied with sigma=50 using scipy
-2025-11-06 18:19:01,233 - ZeMosaicWorker - DEBUG - zemosaic_worker.compute_per_tile_gains_from_coverage:6932 - [TwoPass] Scale map stats: min=0.5000, max=2.0000, mean=1.2036
-2025-11-06 18:19:03,578 - ZeMosaicWorker - DEBUG - zemosaic_worker.compute_per_tile_gains_from_coverage:6974 - [TwoPass] Tile 0 gain=0.9978 (raw=0.9978, valid_pix=1072806)
-2025-11-06 18:19:06,513 - ZeMosaicWorker - DEBUG - zemosaic_worker.compute_per_tile_gains_from_coverage:6974 - [TwoPass] Tile 1 gain=0.9967 (raw=0.9967, valid_pix=1041008)
-2025-11-06 18:19:09,328 - ZeMosaicWorker - DEBUG - zemosaic_worker.compute_per_tile_gains_from_coverage:6974 - [TwoPass] Tile 2 gain=0.9974 (raw=0.9974, valid_pix=850074)
-2025-11-06 18:19:11,578 - ZeMosaicWorker - DEBUG - zemosaic_worker.compute_per_tile_gains_from_coverage:6974 - [TwoPass] Tile 3 gain=0.9974 (raw=0.9974, valid_pix=1277250)
-2025-11-06 18:19:13,877 - ZeMosaicWorker - DEBUG - zemosaic_worker.compute_per_tile_gains_from_coverage:6974 - [TwoPass] Tile 4 gain=0.9970 (raw=0.9970, valid_pix=965177)
-2025-11-06 18:19:16,181 - ZeMosaicWorker - DEBUG - zemosaic_worker.compute_per_tile_gains_from_coverage:6974 - [TwoPass] Tile 5 gain=0.9961 (raw=0.9961, valid_pix=1210673)
-2025-11-06 18:19:18,533 - ZeMosaicWorker - DEBUG - zemosaic_worker.compute_per_tile_gains_from_coverage:6974 - [TwoPass] Tile 6 gain=0.9966 (raw=0.9966, valid_pix=906727)
-2025-11-06 18:19:20,807 - ZeMosaicWorker - DEBUG - zemosaic_worker.compute_per_tile_gains_from_coverage:6974 - [TwoPass] Tile 7 gain=0.9979 (raw=0.9979, valid_pix=1242935)
-2025-11-06 18:19:23,094 - ZeMosaicWorker - DEBUG - zemosaic_worker.compute_per_tile_gains_from_coverage:6974 - [TwoPass] Tile 8 gain=0.9970 (raw=0.9970, valid_pix=991710)
-2025-11-06 18:19:23,098 - ZeMosaicWorker - DEBUG - zemosaic_worker.run_second_pass_coverage_renorm:7041 - [TwoPass] Computed gains count=9, finite=9, min=0.9961, max=0.9979
-2025-11-06 18:19:23,138 - ZeMosaicWorker - DEBUG - zemosaic_worker.run_second_pass_coverage_renorm:7090 - [TwoPass] Reproject channel 1/3 with 9 tiles (shape_out=(2052, 1347))
-2025-11-06 18:19:37,772 - ZeMosaicWorker - DEBUG - zemosaic_worker.run_second_pass_coverage_renorm:7121 - [TwoPass] Channel 1 done: mosaic_shape=(2052, 1347), coverage_shape=(2052, 1347), cov_stats=(min=0.0000, max=9.0000)
-2025-11-06 18:19:37,772 - ZeMosaicWorker - DEBUG - zemosaic_worker.run_second_pass_coverage_renorm:7090 - [TwoPass] Reproject channel 2/3 with 9 tiles (shape_out=(2052, 1347))
-2025-11-06 18:19:53,922 - ZeMosaicWorker - DEBUG - zemosaic_worker.run_second_pass_coverage_renorm:7121 - [TwoPass] Channel 2 done: mosaic_shape=(2052, 1347), coverage_shape=(2052, 1347), cov_stats=(min=0.0000, max=9.0000)
-2025-11-06 18:19:53,922 - ZeMosaicWorker - DEBUG - zemosaic_worker.run_second_pass_coverage_renorm:7090 - [TwoPass] Reproject channel 3/3 with 9 tiles (shape_out=(2052, 1347))
-2025-11-06 18:20:09,101 - ZeMosaicWorker - DEBUG - zemosaic_worker.run_second_pass_coverage_renorm:7121 - [TwoPass] Channel 3 done: mosaic_shape=(2052, 1347), coverage_shape=(2052, 1347), cov_stats=(min=0.0000, max=9.0000)
-2025-11-06 18:20:09,146 - ZeMosaicWorker - INFO - zemosaic_worker.run_hierarchical_mosaic:9731 - [TwoPass] coverage-renorm OK (σ=50, clip=[0.850, 1.180])
-2025-11-06 18:20:09,160 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Fin Phase 5 (Assemblage)): Proc RSS: 216.6MB, VMS: 4681.1MB. Sys RAM: Avail 3664MB / Total 8035MB (54.4%% used). Sys Swap: Used 7112MB / Total 24576MB (28.9%% used).
-2025-11-06 18:20:09,160 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: run_info_phase5_finished_reproject_coadd] (Args: {'shape': (2052, 1347, 3)})
-2025-11-06 18:20:09,160 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - PHASE_UPDATE:6
-2025-11-06 18:20:09,168 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Début Phase 6 (Sauvegarde)): Proc RSS: 216.6MB, VMS: 4681.1MB. Sys RAM: Avail 3664MB / Total 8035MB (54.4%% used). Sys Swap: Used 7112MB / Total 24576MB (28.9%% used).
-2025-11-06 18:20:09,169 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: run_info_phase6_started]
-2025-11-06 18:20:09,807 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - run_info_coverage_map_saved
-2025-11-06 18:20:09,807 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: run_success_mosaic_saved] (Args: {'filename': 'zemosaic_MT9_R165.fits'})
-2025-11-06 18:20:09,818 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Fin Sauvegarde FITS (avant preview)): Proc RSS: 216.6MB, VMS: 4681.1MB. Sys RAM: Avail 3651MB / Total 8035MB (54.6%% used). Sys Swap: Used 7111MB / Total 24576MB (28.9%% used).
-2025-11-06 18:20:09,818 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - run_info_preview_stretch_started_auto_asifits
-2025-11-06 18:20:10,575 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: run_success_preview_saved_auto_asifits] (Args: {'filename': 'zemosaic_MT9_R165_preview.png'})
-2025-11-06 18:20:10,679 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Début Phase 7 (Nettoyage)): Proc RSS: 265.2MB, VMS: 4729.3MB. Sys RAM: Avail 3599MB / Total 8035MB (55.2%% used). Sys Swap: Used 7111MB / Total 24576MB (28.9%% used).
-2025-11-06 18:20:10,679 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: run_info_phase7_cleanup_starting]
-2025-11-06 18:20:10,679 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - PHASE_UPDATE:7
-2025-11-06 18:20:10,846 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - run_info_temp_preprocessed_cache_cleaned
-2025-11-06 18:20:10,846 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - run_info_temp_master_tiles_kept_two_pass
-2025-11-06 18:20:10,855 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Fin Phase 7): Proc RSS: 265.2MB, VMS: 4729.3MB. Sys RAM: Avail 3592MB / Total 8035MB (55.3%% used). Sys Swap: Used 7111MB / Total 24576MB (28.9%% used).
-2025-11-06 18:20:10,856 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - CHRONO_STOP_REQUEST
-2025-11-06 18:20:10,856 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - ETA_UPDATE:00:00:00
-2025-11-06 18:20:10,856 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:3642 - [CLÉ_POUR_GUI: run_success_processing_completed] (Args: {'duration': '644.40'})
-2025-11-06 18:20:10,951 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:3642 - Memory Usage (Fin Run Hierarchical Mosaic (après GC final)): Proc RSS: 265.2MB, VMS: 4729.3MB. Sys RAM: Avail 3581MB / Total 8035MB (55.4%% used). Sys Swap: Used 7109MB / Total 24576MB (28.9%% used).
-2025-11-06 18:20:10,951 - ZeMosaicWorker - INFO - zemosaic_worker._log_alignment_warning_summary:3699 - Alignment summary: no frames ignored due to errors.
-2025-11-06 18:20:10,951 - ZeMosaicWorker - INFO - zemosaic_worker.run_hierarchical_mosaic:10019 - ===== Run Hierarchical Mosaic COMPLETED in 644.40s =====
+2025-11-07 19:20:24,910 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:4397 - Logging pour ZeMosaicWorker initialisé. Logs écrits dans: F:\seescan\env\zemosaic\zemosaic_worker.log
+2025-11-07 19:20:25,052 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:4458 - Bibliothèque Astropy importée.
+2025-11-07 19:20:25,052 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:4471 - Bibliothèque 'reproject' importée.
+2025-11-07 19:20:25,052 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:4490 - Module 'zemosaic_utils' importé.
+2025-11-07 19:20:25,052 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:4492 - Module 'zemosaic_astrometry' importé.
+2025-11-07 19:20:25,053 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:4494 - Module 'zemosaic_align_stack' importé.
+2025-11-07 19:20:26,217 - ZeMosaicWorker - INFO - zemosaic_worker.run_hierarchical_mosaic:8507 - Cache retention mode: run_end
+2025-11-07 19:20:26,217 - ZeMosaicWorker - DEBUG - zemosaic_worker._log_and_callback:4691 - run_info_cache_retention_mode
+2025-11-07 19:20:26,217 - ZeMosaicWorker - INFO - zemosaic_worker.run_hierarchical_mosaic:8529 - Worker logging level set to INFO
+2025-11-07 19:20:27,106 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: run_info_processing_started]
+2025-11-07 19:20:27,106 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: Options Stacking (Master Tiles): Norm='linear_fit', Weight='noise_variance', Reject='winsorized_sigma_clip', Combine='mean']
+2025-11-07 19:20:27,122 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: run_info_phase1_started_cache]
+2025-11-07 19:20:27,164 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: Phase 0: filter returned no items]
+2025-11-07 19:20:27,164 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: WORKERS_PHASE1: Utilisation de 12 worker(s). (Base: 12, Fichiers: 198)]
+2025-11-07 19:20:28,507 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-030738.fit' (WCS present).
+2025-11-07 19:20:28,609 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-030909.fit' (WCS present).
+2025-11-07 19:20:28,623 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-030059.fit' (WCS present).
+2025-11-07 19:20:28,745 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-030331.fit' (WCS present).
+2025-11-07 19:20:28,882 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-030635.fit' (WCS present).
+2025-11-07 19:20:28,883 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-030229.fit' (WCS present).
+2025-11-07 19:20:29,083 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-030129.fit' (WCS present).
+2025-11-07 19:20:29,180 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-030534.fit' (WCS present).
+2025-11-07 19:20:29,341 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-030402.fit' (WCS present).
+2025-11-07 19:20:29,461 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-030503.fit' (WCS present).
+2025-11-07 19:20:29,690 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-030808.fit' (WCS present).
+2025-11-07 19:20:29,709 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-054309.fit' (WCS present).
+2025-11-07 19:20:30,095 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-031142.fit' (WCS present).
+2025-11-07 19:20:30,283 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-031011.fit' (WCS present).
+2025-11-07 19:20:30,333 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-031041.fit' (WCS present).
+2025-11-07 19:20:30,529 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-031244.fit' (WCS present).
+2025-11-07 19:20:30,689 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-031314.fit' (WCS present).
+2025-11-07 19:20:30,831 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-031414.fit' (WCS present).
+2025-11-07 19:20:30,987 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-031445.fit' (WCS present).
+2025-11-07 19:20:31,043 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-031545.fit' (WCS present).
+2025-11-07 19:20:31,250 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-031748.fit' (WCS present).
+2025-11-07 19:20:31,283 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-031647.fit' (WCS present).
+2025-11-07 19:20:31,785 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-031819.fit' (WCS present).
+2025-11-07 19:20:32,095 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-031920.fit' (WCS present).
+2025-11-07 19:20:32,349 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-032021.fit' (WCS present).
+2025-11-07 19:20:32,487 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-032255.fit' (WCS present).
+2025-11-07 19:20:32,653 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-032153.fit' (WCS present).
+2025-11-07 19:20:32,781 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-032427.fit' (WCS present).
+2025-11-07 19:20:32,911 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-032052.fit' (WCS present).
+2025-11-07 19:20:33,116 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-032559.fit' (WCS present).
+2025-11-07 19:20:33,272 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-032325.fit' (WCS present).
+2025-11-07 19:20:33,423 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-032528.fit' (WCS present).
+2025-11-07 19:20:33,460 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-032700.fit' (WCS present).
+2025-11-07 19:20:33,582 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-032731.fit' (WCS present).
+2025-11-07 19:20:33,872 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-032831.fit' (WCS present).
+2025-11-07 19:20:34,106 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-032901.fit' (WCS present).
+2025-11-07 19:20:34,275 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-033003.fit' (WCS present).
+2025-11-07 19:20:34,401 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-033236.fit' (WCS present).
+2025-11-07 19:20:34,422 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-033104.fit' (WCS present).
+2025-11-07 19:20:34,724 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-033135.fit' (WCS present).
+2025-11-07 19:20:35,004 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-033339.fit' (WCS present).
+2025-11-07 19:20:35,402 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-033408.fit' (WCS present).
+2025-11-07 19:20:35,700 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-033711.fit' (WCS present).
+2025-11-07 19:20:35,843 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-033511.fit' (WCS present).
+2025-11-07 19:20:35,866 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-033610.fit' (WCS present).
+2025-11-07 19:20:36,095 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-033742.fit' (WCS present).
+2025-11-07 19:20:36,311 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-033843.fit' (WCS present).
+2025-11-07 19:20:36,544 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-033913.fit' (WCS present).
+2025-11-07 19:20:36,693 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-034014.fit' (WCS present).
+2025-11-07 19:20:36,709 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-034045.fit' (WCS present).
+2025-11-07 19:20:36,727 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-034146.fit' (WCS present).
+2025-11-07 19:20:37,225 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-034216.fit' (WCS present).
+2025-11-07 19:20:37,399 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-034319.fit' (WCS present).
+2025-11-07 19:20:37,677 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-034421.fit' (WCS present).
+2025-11-07 19:20:37,914 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-034653.fit' (WCS present).
+2025-11-07 19:20:38,047 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-034451.fit' (WCS present).
+2025-11-07 19:20:38,189 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-034825.fit' (WCS present).
+2025-11-07 19:20:38,202 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-034551.fit' (WCS present).
+2025-11-07 19:20:38,367 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-034754.fit' (WCS present).
+2025-11-07 19:20:38,707 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-035159.fit' (WCS present).
+2025-11-07 19:20:39,047 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-034926.fit' (WCS present).
+2025-11-07 19:20:39,312 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-035027.fit' (WCS present).
+2025-11-07 19:20:39,362 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-035128.fit' (WCS present).
+2025-11-07 19:20:39,499 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-035300.fit' (WCS present).
+2025-11-07 19:20:39,863 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-035432.fit' (WCS present).
+2025-11-07 19:20:40,010 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-035331.fit' (WCS present).
+2025-11-07 19:20:40,224 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-035603.fit' (WCS present).
+2025-11-07 19:20:40,349 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-035502.fit' (WCS present).
+2025-11-07 19:20:40,563 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-035737.fit' (WCS present).
+2025-11-07 19:20:40,687 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-035634.fit' (WCS present).
+2025-11-07 19:20:40,731 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-035836.fit' (WCS present).
+2025-11-07 19:20:40,860 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-035937.fit' (WCS present).
+2025-11-07 19:20:41,200 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-040038.fit' (WCS present).
+2025-11-07 19:20:41,346 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-040109.fit' (WCS present).
+2025-11-07 19:20:41,536 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-040241.fit' (WCS present).
+2025-11-07 19:20:41,699 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-040210.fit' (WCS present).
+2025-11-07 19:20:42,005 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-040342.fit' (WCS present).
+2025-11-07 19:20:42,240 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-040412.fit' (WCS present).
+2025-11-07 19:20:42,396 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-040513.fit' (WCS present).
+2025-11-07 19:20:42,636 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-040544.fit' (WCS present).
+2025-11-07 19:20:42,818 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-040646.fit' (WCS present).
+2025-11-07 19:20:43,017 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-040950.fit' (WCS present).
+2025-11-07 19:20:43,031 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-040848.fit' (WCS present).
+2025-11-07 19:20:43,257 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-040749.fit' (WCS present).
+2025-11-07 19:20:43,428 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-041122.fit' (WCS present).
+2025-11-07 19:20:43,440 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-041021.fit' (WCS present).
+2025-11-07 19:20:43,702 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-041152.fit' (WCS present).
+2025-11-07 19:20:43,861 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-041253.fit' (WCS present).
+2025-11-07 19:20:44,015 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-041356.fit' (WCS present).
+2025-11-07 19:20:44,206 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-041425.fit' (WCS present).
+2025-11-07 19:20:44,364 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-041528.fit' (WCS present).
+2025-11-07 19:20:44,587 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-041629.fit' (WCS present).
+2025-11-07 19:20:44,763 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-041700.fit' (WCS present).
+2025-11-07 19:20:44,799 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-041801.fit' (WCS present).
+2025-11-07 19:20:45,033 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-041832.fit' (WCS present).
+2025-11-07 19:20:45,274 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-042033.fit' (WCS present).
+2025-11-07 19:20:45,283 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-041933.fit' (WCS present).
+2025-11-07 19:20:45,520 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-042104.fit' (WCS present).
+2025-11-07 19:20:45,784 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-042204.fit' (WCS present).
+2025-11-07 19:20:46,012 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-042305.fit' (WCS present).
+2025-11-07 19:20:46,248 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-042336.fit' (WCS present).
+2025-11-07 19:20:46,548 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-042538.fit' (WCS present).
+2025-11-07 19:20:46,702 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-042437.fit' (WCS present).
+2025-11-07 19:20:46,964 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-042710.fit' (WCS present).
+2025-11-07 19:20:46,974 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-042640.fit' (WCS present).
+2025-11-07 19:20:47,237 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-042811.fit' (WCS present).
+2025-11-07 19:20:47,356 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-042913.fit' (WCS present).
+2025-11-07 19:20:47,517 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-043045.fit' (WCS present).
+2025-11-07 19:20:47,641 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-043014.fit' (WCS present).
+2025-11-07 19:20:47,795 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-043146.fit' (WCS present).
+2025-11-07 19:20:47,928 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-043248.fit' (WCS present).
+2025-11-07 19:20:47,965 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-043318.fit' (WCS present).
+2025-11-07 19:20:48,212 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-043420.fit' (WCS present).
+2025-11-07 19:20:48,387 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-043451.fit' (WCS present).
+2025-11-07 19:20:48,576 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-043551.fit' (WCS present).
+2025-11-07 19:20:48,776 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-043723.fit' (WCS present).
+2025-11-07 19:20:49,071 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-043854.fit' (WCS present).
+2025-11-07 19:20:49,130 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-043824.fit' (WCS present).
+2025-11-07 19:20:49,226 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-043621.fit' (WCS present).
+2025-11-07 19:20:49,994 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-043955.fit' (WCS present).
+2025-11-07 19:20:50,138 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-044057.fit' (WCS present).
+2025-11-07 19:20:50,304 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-044157.fit' (WCS present).
+2025-11-07 19:20:50,457 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-044301.fit' (WCS present).
+2025-11-07 19:20:50,708 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-044500.fit' (WCS present).
+2025-11-07 19:20:50,864 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-044531.fit' (WCS present).
+2025-11-07 19:20:50,882 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-044400.fit' (WCS present).
+2025-11-07 19:20:51,242 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-044632.fit' (WCS present).
+2025-11-07 19:20:51,268 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-044703.fit' (WCS present).
+2025-11-07 19:20:51,576 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-044936.fit' (WCS present).
+2025-11-07 19:20:51,610 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-044834.fit' (WCS present).
+2025-11-07 19:20:51,898 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-044804.fit' (WCS present).
+2025-11-07 19:20:52,148 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-045037.fit' (WCS present).
+2025-11-07 19:20:52,380 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-045138.fit' (WCS present).
+2025-11-07 19:20:52,689 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-045209.fit' (WCS present).
+2025-11-07 19:20:52,913 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-045311.fit' (WCS present).
+2025-11-07 19:20:53,065 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-045544.fit' (WCS present).
+2025-11-07 19:20:53,222 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-045444.fit' (WCS present).
+2025-11-07 19:20:53,401 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-045413.fit' (WCS present).
+2025-11-07 19:20:53,843 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-045716.fit' (WCS present).
+2025-11-07 19:20:54,288 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-050019.fit' (WCS present).
+2025-11-07 19:20:54,464 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-045918.fit' (WCS present).
+2025-11-07 19:20:54,662 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-045645.fit' (WCS present).
+2025-11-07 19:20:54,825 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-045817.fit' (WCS present).
+2025-11-07 19:20:55,102 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-050151.fit' (WCS present).
+2025-11-07 19:20:55,126 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-050120.fit' (WCS present).
+2025-11-07 19:20:55,474 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-050324.fit' (WCS present).
+2025-11-07 19:20:55,508 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-050253.fit' (WCS present).
+2025-11-07 19:20:55,766 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-050424.fit' (WCS present).
+2025-11-07 19:20:55,973 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-050455.fit' (WCS present).
+2025-11-07 19:20:55,994 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-050556.fit' (WCS present).
+2025-11-07 19:20:56,018 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-050626.fit' (WCS present).
+2025-11-07 19:20:56,525 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-050859.fit' (WCS present).
+2025-11-07 19:20:56,672 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-050800.fit' (WCS present).
+2025-11-07 19:20:56,886 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-051000.fit' (WCS present).
+2025-11-07 19:20:56,947 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-051102.fit' (WCS present).
+2025-11-07 19:20:57,262 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-051233.fit' (WCS present).
+2025-11-07 19:20:57,279 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-051132.fit' (WCS present).
+2025-11-07 19:20:57,339 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-051304.fit' (WCS present).
+2025-11-07 19:20:57,725 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-051436.fit' (WCS present).
+2025-11-07 19:20:57,734 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-051405.fit' (WCS present).
+2025-11-07 19:20:58,444 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-051537.fit' (WCS present).
+2025-11-07 19:20:58,793 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-051711.fit' (WCS present).
+2025-11-07 19:20:59,052 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-051810.fit' (WCS present).
+2025-11-07 19:20:59,081 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-051607.fit' (WCS present).
+2025-11-07 19:20:59,426 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-051912.fit' (WCS present).
+2025-11-07 19:20:59,679 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-052044.fit' (WCS present).
+2025-11-07 19:20:59,816 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-052013.fit' (WCS present).
+2025-11-07 19:21:00,178 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-052215.fit' (WCS present).
+2025-11-07 19:21:00,227 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-052316.fit' (WCS present).
+2025-11-07 19:21:00,334 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-052145.fit' (WCS present).
+2025-11-07 19:21:00,604 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-052550.fit' (WCS present).
+2025-11-07 19:21:00,760 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-052448.fit' (WCS present).
+2025-11-07 19:21:00,916 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-052418.fit' (WCS present).
+2025-11-07 19:21:00,949 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-052651.fit' (WCS present).
+2025-11-07 19:21:01,297 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-052823.fit' (WCS present).
+2025-11-07 19:21:01,326 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-052722.fit' (WCS present).
+2025-11-07 19:21:01,673 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-052854.fit' (WCS present).
+2025-11-07 19:21:01,879 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-053025.fit' (WCS present).
+2025-11-07 19:21:02,050 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-052955.fit' (WCS present).
+2025-11-07 19:21:02,225 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-053126.fit' (WCS present).
+2025-11-07 19:21:02,471 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-053328.fit' (WCS present).
+2025-11-07 19:21:02,845 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-053227.fit' (WCS present).
+2025-11-07 19:21:02,919 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-053359.fit' (WCS present).
+2025-11-07 19:21:03,466 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-053500.fit' (WCS present).
+2025-11-07 19:21:03,656 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-053601.fit' (WCS present).
+2025-11-07 19:21:03,821 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-053631.fit' (WCS present).
+2025-11-07 19:21:04,025 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-053834.fit' (WCS present).
+2025-11-07 19:21:04,166 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-053733.fit' (WCS present).
+2025-11-07 19:21:04,194 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-053935.fit' (WCS present).
+2025-11-07 19:21:04,515 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-054006.fit' (WCS present).
+2025-11-07 19:21:04,753 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-054107.fit' (WCS present).
+2025-11-07 19:21:04,765 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-054137.fit' (WCS present).
+2025-11-07 19:21:05,005 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-054239.fit' (WCS present).
+2025-11-07 19:21:05,014 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-054441.fit' (WCS present).
+2025-11-07 19:21:05,135 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-054410.fit' (WCS present).
+2025-11-07 19:21:05,361 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-054542.fit' (WCS present).
+2025-11-07 19:21:05,366 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-054643.fit' (WCS present).
+2025-11-07 19:21:05,392 - ZeMosaicWorker - INFO - zemosaic_worker.get_wcs_and_pretreat_raw_file:5819 - Skip WCS solve for 'Light_mosaic_IC 1396B_30.0s_LP_20250518-054714.fit' (WCS present).
+2025-11-07 19:21:05,711 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: run_info_phase1_finished_cache] (Args: {'num_valid_raws': 198})
+2025-11-07 19:21:05,720 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: run_info_phase2_started]
+2025-11-07 19:21:05,874 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: Winsor worker limit set to 10 (ProcessPoolExecutor enabled)]
+2025-11-07 19:21:05,885 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: run_info_phase2_finished] (Args: {'num_groups': 32})
+2025-11-07 19:21:05,925 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: run_info_phase3_started_from_cache]
+2025-11-07 19:21:05,979 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: center_anchor_probe_start] (Args: {'probe_count': 20})
+2025-11-07 19:21:11,774 - ZeMosaicWorker - WARNING - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: center_anchor_soft_fallback]
+2025-11-07 19:21:11,774 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: center_anchor_selected] (Args: {'tile': 7, 'dist_deg': 0.2728921303823163, 'score': 7.883353757324202})
+2025-11-07 19:21:11,782 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: WORKERS_PHASE3: Utilisation de 4 worker(s). (Base: 12, Ratio 50%, Groupes: 32)]
+2025-11-07 19:21:11,785 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 12, 'tile_id': 7})
+2025-11-07 19:21:11,787 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 13, 'tile_id': 0})
+2025-11-07 19:21:11,787 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 31})
+2025-11-07 19:21:11,788 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 7, 'tile_id': 4})
+2025-11-07 19:21:13,704 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.143013,0.875418,1.000000), target=872.588]
+2025-11-07 19:21:34,098 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.021825,0.938817,1.000000), target=658.919]
+2025-11-07 19:21:46,310 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.028307,0.933803,1.000000), target=678.678]
+2025-11-07 19:21:47,327 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 9, 'tile_id': 2})
+2025-11-07 19:21:47,516 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 12, 'tile_id': 3})
+2025-11-07 19:21:47,948 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 10, 'tile_id': 6})
+2025-11-07 19:21:52,727 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.049806,0.965107,1.000000), target=648.63]
+2025-11-07 19:21:54,284 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 6, 'tile_id': 1})
+2025-11-07 19:22:15,097 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.039542,0.938314,1.000000), target=655.166]
+2025-11-07 19:22:16,082 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 18, 'tile_id': 5})
+2025-11-07 19:22:20,258 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.033982,0.943089,1.000000), target=664.686]
+2025-11-07 19:22:21,512 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 25})
+2025-11-07 19:22:23,310 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.016097,0.940693,1.000000), target=604.016]
+2025-11-07 19:22:24,642 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 8, 'tile_id': 14})
+2025-11-07 19:22:25,301 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.021172,0.950756,1.000000), target=673.05]
+2025-11-07 19:22:27,216 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 6, 'tile_id': 8})
+2025-11-07 19:22:30,297 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.022606,0.944665,1.000000), target=656.874]
+2025-11-07 19:22:31,816 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 6, 'tile_id': 12})
+2025-11-07 19:22:48,585 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.023336,0.934490,1.000000), target=673.61]
+2025-11-07 19:22:50,035 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 13})
+2025-11-07 19:22:50,970 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.015830,0.942294,1.000000), target=605.133]
+2025-11-07 19:22:51,559 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.013731,0.942991,1.000000), target=597.456]
+2025-11-07 19:22:52,308 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 4, 'tile_id': 15})
+2025-11-07 19:22:53,513 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 1, 'tile_id': 30})
+2025-11-07 19:22:54,265 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.020493,0.941512,1.000000), target=616.006]
+2025-11-07 19:22:55,191 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.016847,0.935770,1.000000), target=611.531]
+2025-11-07 19:22:56,033 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 7, 'tile_id': 19})
+2025-11-07 19:22:57,511 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 6, 'tile_id': 9})
+2025-11-07 19:23:05,901 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.016424,0.939797,1.000000), target=608.488]
+2025-11-07 19:23:07,378 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 4, 'tile_id': 16})
+2025-11-07 19:23:17,453 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.025148,0.929537,1.000000), target=674.71]
+2025-11-07 19:23:18,687 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.015245,0.936516,1.000000), target=620.338]
+2025-11-07 19:23:19,321 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 9, 'tile_id': 11})
+2025-11-07 19:23:19,520 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.080656,0.990140,1.000000), target=678.396]
+2025-11-07 19:23:20,400 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.014719,0.937097,1.000000), target=611.982]
+2025-11-07 19:23:21,330 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 6, 'tile_id': 18})
+2025-11-07 19:23:22,297 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 2, 'tile_id': 20})
+2025-11-07 19:23:23,513 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 7, 'tile_id': 21})
+2025-11-07 19:23:26,784 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.023355,0.934081,1.000000), target=619.925]
+2025-11-07 19:23:29,511 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 6, 'tile_id': 26})
+2025-11-07 19:23:42,419 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.015863,0.937243,1.000000), target=616.887]
+2025-11-07 19:23:44,832 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 6, 'tile_id': 10})
+2025-11-07 19:23:45,351 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.028373,0.935969,1.000000), target=629.308]
+2025-11-07 19:23:47,542 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.039936,0.930378,1.000000), target=653.428]
+2025-11-07 19:23:48,012 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 4, 'tile_id': 22})
+2025-11-07 19:23:50,720 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 6, 'tile_id': 17})
+2025-11-07 19:23:52,602 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.025408,0.935486,1.000000), target=687.158]
+2025-11-07 19:23:55,193 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 4, 'tile_id': 27})
+2025-11-07 19:24:01,471 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.028299,0.929226,1.000000), target=632.895]
+2025-11-07 19:24:03,663 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 4, 'tile_id': 23})
+2025-11-07 19:24:05,388 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.020934,0.930499,1.000000), target=677.205]
+2025-11-07 19:24:07,519 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.040286,0.918204,1.000000), target=660.5]
+2025-11-07 19:24:08,194 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 4, 'tile_id': 28})
+2025-11-07 19:24:10,290 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.013849,0.934275,1.000000), target=621.19]
+2025-11-07 19:24:10,686 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 4, 'tile_id': 24})
+2025-11-07 19:24:13,816 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: mastertile_info_creation_started_from_cache] (Args: {'num_raw': 4, 'tile_id': 29})
+2025-11-07 19:24:17,180 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.030675,0.926819,1.000000), target=635.516]
+2025-11-07 19:24:21,160 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.043988,0.921501,1.000000), target=669.183]
+2025-11-07 19:24:23,166 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.033677,0.926769,1.000000), target=638.524]
+2025-11-07 19:24:25,353 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: [RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(1.044050,0.911495,1.000000), target=680.085]
+2025-11-07 19:24:28,257 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: post_anchor_start]
+2025-11-07 19:24:31,668 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: post_anchor_selected] (Args: {'tile': 5, 'impr': 0.09627797137683217})
+2025-11-07 19:24:31,668 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: post_anchor_shift] (Args: {'gain': 0.7442467050911161, 'offset': -4.194415263574314})
+2025-11-07 19:24:31,776 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: run_info_phase3_finished_from_cache] (Args: {'num_master_tiles': 32})
+2025-11-07 19:24:31,777 - ZeMosaicWorker - INFO - zemosaic_worker.run_hierarchical_mosaic:10555 - All master tiles complete, entering Phase 5 (reproject & coadd)
+2025-11-07 19:24:31,787 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: run_info_phase4_started]
+2025-11-07 19:24:31,793 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: calcgrid_info_scales] (Args: {'avg_input_scale_arcsec': np.float64(2.373742905829704), 'target_scale_arcsec': np.float64(2.373742905829704)})
+2025-11-07 19:24:31,922 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: calcgrid_info_optimal_grid_calculated] (Args: {'shape': (2712, 2198), 'crval': array([323.63854665,  57.47907742])})
+2025-11-07 19:24:31,933 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: run_info_phase4_finished] (Args: {'shape': (2712, 2198), 'crval': array([323.63854665,  57.47907742])})
+2025-11-07 19:24:31,942 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: p45_start]
+2025-11-07 19:30:31,733 - ZeMosaicWorker - INFO - zemosaic_worker._run_phase4_5_inter_master_merge:1722 - phase4_5: injected 2 super-tiles from 2 groups
+2025-11-07 19:30:31,733 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: phase4_5: injected 2 super-tiles from 2 groups]
+2025-11-07 19:30:32,621 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: p45_finished] (Args: {'tiles_in': 32, 'tiles_out': 13})
+2025-11-07 19:30:32,654 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: run_info_phase5_started_reproject_coadd]
+2025-11-07 19:30:34,254 - ZeMosaicWorker - INFO - zemosaic_utils._log_intertile:1294 - [Intertile] Overlap pairs at min_overlap=0.0500: 36
+2025-11-07 19:30:34,254 - ZeMosaicWorker - INFO - zemosaic_utils._log_intertile:1294 - [Intertile] Using: preview=512, min_overlap=0.0500, sky=(30.0,70.0), clip=2.50, pairs=36
+2025-11-07 19:30:58,408 - ZeMosaicWorker - INFO - zemosaic_worker.assemble_final_mosaic_reproject_coadd:7624 - intertile: recomputed affine corrections on effective set: tiles=13
+2025-11-07 19:30:58,408 - ZeMosaicWorker - INFO - zemosaic_worker.assemble_final_mosaic_reproject_coadd:7628 - apply_photometric: using affine_by_id for 13 tiles
+2025-11-07 19:30:58,409 - ZeMosaicWorker - INFO - zemosaic_worker.assemble_final_mosaic_reproject_coadd:7644 - apply_photometric: tile=tile:0000 gain=0.74425 offset=-4.19442
+2025-11-07 19:30:58,409 - ZeMosaicWorker - INFO - zemosaic_worker.assemble_final_mosaic_reproject_coadd:7644 - apply_photometric: tile=super:0001_18_283a0a99 gain=0.74425 offset=-4.19442
+2025-11-07 19:30:58,409 - ZeMosaicWorker - INFO - zemosaic_worker.assemble_final_mosaic_reproject_coadd:7644 - apply_photometric: tile=tile:0010 gain=0.74425 offset=-4.19442
+2025-11-07 19:30:58,409 - ZeMosaicWorker - INFO - zemosaic_worker.assemble_final_mosaic_reproject_coadd:7644 - apply_photometric: tile=tile:0011 gain=0.74425 offset=-4.19442
+2025-11-07 19:30:58,409 - ZeMosaicWorker - INFO - zemosaic_worker.assemble_final_mosaic_reproject_coadd:7644 - apply_photometric: tile=tile:0013 gain=0.74425 offset=-4.19442
+2025-11-07 19:30:58,409 - ZeMosaicWorker - INFO - zemosaic_worker.assemble_final_mosaic_reproject_coadd:7644 - apply_photometric: tile=tile:0019 gain=0.74425 offset=-4.19442
+2025-11-07 19:30:58,409 - ZeMosaicWorker - INFO - zemosaic_worker.assemble_final_mosaic_reproject_coadd:7644 - apply_photometric: tile=tile:0021 gain=0.74425 offset=-4.19442
+2025-11-07 19:30:58,409 - ZeMosaicWorker - INFO - zemosaic_worker.assemble_final_mosaic_reproject_coadd:7644 - apply_photometric: tile=super:0022_03_315f1626 gain=0.74425 offset=-4.19442
+2025-11-07 19:30:58,409 - ZeMosaicWorker - INFO - zemosaic_worker.assemble_final_mosaic_reproject_coadd:7644 - apply_photometric: tile=tile:0025 gain=0.74425 offset=-4.19442
+2025-11-07 19:30:58,409 - ZeMosaicWorker - INFO - zemosaic_worker.assemble_final_mosaic_reproject_coadd:7644 - apply_photometric: tile=tile:0026 gain=0.74425 offset=-4.19442
+2025-11-07 19:30:58,409 - ZeMosaicWorker - INFO - zemosaic_worker.assemble_final_mosaic_reproject_coadd:7644 - apply_photometric: tile=tile:0027 gain=0.74425 offset=-4.19442
+2025-11-07 19:30:58,409 - ZeMosaicWorker - INFO - zemosaic_worker.assemble_final_mosaic_reproject_coadd:7644 - apply_photometric: tile=tile:0028 gain=0.74425 offset=-4.19442
+2025-11-07 19:30:58,409 - ZeMosaicWorker - INFO - zemosaic_worker.assemble_final_mosaic_reproject_coadd:7644 - apply_photometric: tile=tile:0029 gain=0.74425 offset=-4.19442
+2025-11-07 19:31:55,071 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: assemble_info_finished_reproject_coadd] (Args: {'shape': (2712, 2198, 3)})
+2025-11-07 19:31:55,103 - ZeMosaicWorker - INFO - zemosaic_worker.run_hierarchical_mosaic:10944 - [TwoPass] Second pass requested (sigma=50, clip=(0.85, 1.18)); coverage shape=(2712, 2198)
+2025-11-07 19:34:10,732 - ZeMosaicWorker - INFO - zemosaic_worker.run_hierarchical_mosaic:10987 - [TwoPass] coverage-renorm OK (σ=50, clip=[0.850, 1.180])
+2025-11-07 19:34:10,752 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: run_info_phase5_finished_reproject_coadd] (Args: {'shape': (2712, 2198, 3)})
+2025-11-07 19:34:10,761 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: run_info_phase6_started]
+2025-11-07 19:34:11,981 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: run_success_mosaic_saved] (Args: {'filename': 'zemosaic_MT13_R198.fits'})
+2025-11-07 19:34:12,938 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: run_success_preview_saved_auto_asifits] (Args: {'filename': 'zemosaic_MT13_R198_preview.png'})
+2025-11-07 19:34:13,034 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: run_info_phase7_cleanup_starting]
+2025-11-07 19:34:13,199 - ZeMosaicWorker - INFO - zemosaic_worker._log_and_callback:4691 - [CLÉ_POUR_GUI: run_success_processing_completed] (Args: {'duration': '826.84'})
+2025-11-07 19:34:13,299 - ZeMosaicWorker - INFO - zemosaic_worker._log_alignment_warning_summary:4748 - Alignment summary: no frames ignored due to errors.
+2025-11-07 19:34:13,299 - ZeMosaicWorker - INFO - zemosaic_worker.run_hierarchical_mosaic:11305 - ===== Run Hierarchical Mosaic COMPLETED in 826.84s =====

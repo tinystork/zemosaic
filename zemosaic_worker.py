@@ -55,6 +55,7 @@ import gc
 import logging
 import inspect  # Pas utilisé directement ici, mais peut être utile pour des introspections futures
 import math
+import hashlib
 from datetime import datetime
 import psutil
 import tempfile
@@ -199,6 +200,88 @@ def _move_to_unaligned_safe(
         except Exception:
             pass
         return "failed", dst
+
+
+_MASTER_TILE_ID_LOCK = Lock()
+_MASTER_TILE_ID_REGISTRY: dict[str, str] = {}
+
+
+def _normalize_tile_path(path: str | os.PathLike | None) -> str | None:
+    """Return a stable absolute path for registry keys."""
+
+    if path is None:
+        return None
+    try:
+        return os.path.abspath(os.path.realpath(str(path)))
+    except Exception:
+        try:
+            return os.path.abspath(str(path))
+        except Exception:
+            return str(path)
+
+
+def _register_master_tile_identity(path: str | os.PathLike | None, tile_id: str | int | None) -> None:
+    """Remember the logical ``tile_id`` associated with a saved tile path."""
+
+    if path is None or tile_id is None:
+        return
+    normalized = _normalize_tile_path(path)
+    if not normalized:
+        return
+    with _MASTER_TILE_ID_LOCK:
+        _MASTER_TILE_ID_REGISTRY[normalized] = str(tile_id)
+
+
+def _lookup_master_tile_identity(path: str | os.PathLike | None) -> str | None:
+    """Fetch a previously registered ``tile_id`` for ``path`` if available."""
+
+    if path is None:
+        return None
+    normalized = _normalize_tile_path(path)
+    if not normalized:
+        return None
+    with _MASTER_TILE_ID_LOCK:
+        return _MASTER_TILE_ID_REGISTRY.get(normalized)
+
+
+def _resolve_tile_identifier(
+    path: str | os.PathLike | None,
+    header: Any | None,
+    fallback_idx: int | None,
+) -> str:
+    """Resolve or synthesize a deterministic ``tile_id`` for a tile entry."""
+
+    registered = _lookup_master_tile_identity(path)
+    if registered:
+        return registered
+
+    candidate = None
+    if header is not None:
+        try:
+            if "ZMT_SUPID" in header:
+                candidate = str(header["ZMT_SUPID"])
+        except Exception:
+            candidate = None
+        if candidate is None:
+            try:
+                if "ZMT_ID" in header:
+                    candidate = f"tile:{int(header['ZMT_ID'])}"
+            except Exception:
+                try:
+                    candidate = str(header.get("ZMT_ID")) if header.get("ZMT_ID") is not None else None
+                except Exception:
+                    candidate = None
+
+    if candidate is None and fallback_idx is not None:
+        candidate = f"tile:{int(fallback_idx):04d}"
+    elif candidate is None and path:
+        base = os.path.splitext(os.path.basename(str(path)))[0]
+        candidate = f"path:{base}"
+    elif candidate is None:
+        candidate = "tile:unknown"
+
+    _register_master_tile_identity(path, candidate)
+    return candidate
 
 # Nombre maximum de tentatives d'alignement avant abandon définitif
 MAX_ALIGNMENT_RETRY_ATTEMPTS = 3
@@ -450,6 +533,47 @@ def _select_affine_log_indices(
     return selected
 
 
+def _build_affine_lookup_for_tiles(
+    tiles: list[dict[str, Any]],
+    affine_list: list[tuple[float, float]] | None,
+) -> tuple[dict[str, tuple[float, float]] | None, str | None]:
+    """Map sanitized affine corrections to ``tile_id`` entries."""
+
+    if not tiles or not affine_list:
+        return None, None
+
+    expected = len(tiles)
+    if len(affine_list) != expected:
+        return None, f"expected={expected}, got={len(affine_list)}"
+
+    lookup: dict[str, tuple[float, float]] = {}
+    missing: list[str] = []
+    for tile_entry, affine in zip(tiles, affine_list):
+        tile_id = tile_entry.get("tile_id") if isinstance(tile_entry, dict) else None
+        if not tile_id:
+            missing.append(f"idx{len(lookup)}")
+            continue
+        if tile_id in lookup:
+            missing.append(f"dup:{tile_id}")
+            continue
+        try:
+            gain_val = float(affine[0])
+        except Exception:
+            gain_val = 1.0
+        try:
+            offset_val = float(affine[1])
+        except Exception:
+            offset_val = 0.0
+        lookup[str(tile_id)] = (gain_val, offset_val)
+
+    if missing:
+        preview = ", ".join(missing[:5])
+        detail = f"missing_ids={preview}"
+        return None, detail
+
+    return lookup or None, None
+
+
 def _compose_global_anchor_shift(
     affine_list: list[tuple[float, float]] | None,
     total_tiles: int,
@@ -514,6 +638,7 @@ class _InterMasterTile:
     wcs: Any
     shape_hw: tuple[int, int]
     sky_corners: Any | None = None
+    bbox_bounds: tuple[float, float, float, float] | None = None
 
 
 def _phase45_resolve_tile_shape(path: str | None, tile_wcs: Any) -> tuple[int, int] | None:
@@ -565,6 +690,74 @@ def _phase45_tile_corners(tile: _InterMasterTile) -> Any | None:
         return sky
     except Exception:
         return None
+
+
+def _phase45_tile_bbox(tile: _InterMasterTile) -> tuple[float, float, float, float] | None:
+    if tile.bbox_bounds is not None:
+        return tile.bbox_bounds
+    corners = _phase45_tile_corners(tile)
+    if corners is None:
+        return None
+    try:
+        celestial = corners.icrs
+    except Exception:
+        celestial = corners
+    ra_vals: np.ndarray | None = None
+    dec_vals: np.ndarray | None = None
+    for attr_name in (("ra", "dec"), ("lon", "lat")):
+        ra_attr = getattr(celestial, attr_name[0], None)
+        dec_attr = getattr(celestial, attr_name[1], None)
+        if ra_attr is None or dec_attr is None:
+            continue
+        try:
+            ra_vals = np.asarray(ra_attr.deg, dtype=np.float64).ravel()
+            dec_vals = np.asarray(dec_attr.deg, dtype=np.float64).ravel()
+            break
+        except Exception:
+            continue
+    if ra_vals is None or dec_vals is None:
+        try:
+            ra_vals = np.asarray(celestial.spherical.lon.deg, dtype=np.float64).ravel()
+            dec_vals = np.asarray(celestial.spherical.lat.deg, dtype=np.float64).ravel()
+        except Exception:
+            return None
+    mask = np.isfinite(ra_vals) & np.isfinite(dec_vals)
+    if not np.any(mask):
+        return None
+    ra_vals = ra_vals[mask]
+    dec_vals = dec_vals[mask]
+    bbox = (
+        float(np.min(ra_vals)),
+        float(np.max(ra_vals)),
+        float(np.min(dec_vals)),
+        float(np.max(dec_vals)),
+    )
+    tile.bbox_bounds = bbox
+    return bbox
+
+
+def _phase45_group_bbox(members: list[_InterMasterTile]) -> dict[str, float] | None:
+    ra_min: float | None = None
+    ra_max: float | None = None
+    dec_min: float | None = None
+    dec_max: float | None = None
+    for tile in members:
+        bbox = _phase45_tile_bbox(tile)
+        if not bbox:
+            continue
+        t_ra_min, t_ra_max, t_dec_min, t_dec_max = bbox
+        ra_min = t_ra_min if ra_min is None else min(ra_min, t_ra_min)
+        ra_max = t_ra_max if ra_max is None else max(ra_max, t_ra_max)
+        dec_min = t_dec_min if dec_min is None else min(dec_min, t_dec_min)
+        dec_max = t_dec_max if dec_max is None else max(dec_max, t_dec_max)
+    if None in (ra_min, ra_max, dec_min, dec_max):
+        return None
+    return {
+        "ra_min": float(ra_min),
+        "ra_max": float(ra_max),
+        "dec_min": float(dec_min),
+        "dec_max": float(dec_max),
+    }
 
 
 def _phase45_project_polygon(corners: Any, reference: Any) -> np.ndarray | None:
@@ -784,13 +977,20 @@ def _run_phase4_5_inter_master_merge(
     threshold = max(0.0, min(1.0, threshold))
     min_group = max(2, int(inter_cfg.get("min_group_size", 2)))
     max_group = max(min_group, int(inter_cfg.get("max_group", 64)))
-    method = str(inter_cfg.get("stack_method", "winsor")).lower()
-    if method not in {"winsor", "mean", "median"}:
-        method = "winsor"
     memmap_policy = str(inter_cfg.get("memmap_policy", "auto")).lower()
-    local_scale = str(inter_cfg.get("local_scale", "final")).lower()
+    local_scale = str(inter_cfg.get("local_scale", "native")).lower()
     if local_scale not in {"final", "native"}:
-        local_scale = "final"
+        local_scale = "native"
+
+    photometry_intragroup = bool(inter_cfg.get("photometry_intragroup", True))
+    photometry_intersuper = bool(inter_cfg.get("photometry_intersuper", True))
+    try:
+        photometry_clip_sigma = float(inter_cfg.get("photometry_clip_sigma", 3.0))
+    except Exception:
+        photometry_clip_sigma = 3.0
+    if not math.isfinite(photometry_clip_sigma):
+        photometry_clip_sigma = 3.0
+    photometry_clip_sigma = max(0.1, photometry_clip_sigma)
 
     pcb("p45_start", prog=None, lvl="INFO")
 
@@ -810,13 +1010,12 @@ def _run_phase4_5_inter_master_merge(
 
     logger.debug(
         "[P4.5] Starting Inter-Master merge: threshold=%.2f, min_group=%d, max_group=%d, "
-        "memmap=%s, local_scale=%s, method=%s, master_tiles=%d",
+        "memmap=%s, local_scale=%s, master_tiles=%d",
         threshold,
         min_group,
         max_group,
         memmap_policy,
         local_scale,
-        method,
         len(master_tiles),
     )
     if not _phase45_gui_emit(
@@ -835,6 +1034,7 @@ def _run_phase4_5_inter_master_merge(
     photometry_apply_available = hasattr(zemosaic_align_stack, "apply_affine_photometry")
 
     tiles: list[_InterMasterTile] = []
+    group_super_counts: dict[int, int] = {}
     for idx, (path, wcs_obj) in enumerate(master_tiles):
         shape_hw = _phase45_resolve_tile_shape(path, wcs_obj)
         if not shape_hw:
@@ -911,6 +1111,33 @@ def _run_phase4_5_inter_master_merge(
         pcb("p45_finished", prog=None, lvl="INFO_DETAIL", tiles_in=len(master_tiles), tiles_out=len(master_tiles))
         return master_tiles
 
+    _phase45_gui_message(
+        f"Phase 4.5: overlap grouping ready ({len(groups)} groups >= {min_group})"
+    )
+    group_layout_payload: list[dict[str, Any]] = []
+    for gid, component in enumerate(groups, start=1):
+        member_tiles = [tile_map[idx] for idx in component if idx in tile_map]
+        if not member_tiles:
+            continue
+        repr_idx = min(tile.index for tile in member_tiles)
+        bbox = _phase45_group_bbox(member_tiles)
+        group_layout_payload.append(
+            {
+                "group_id": gid,
+                "members": [tile.index for tile in member_tiles],
+                "repr": repr_idx,
+                "bbox": bbox,
+            }
+        )
+    if group_layout_payload:
+        logger.debug("[P4.5] Emitting groups layout payload (%d groups)", len(group_layout_payload))
+        _phase45_gui_emit(
+            "p45_groups_layout",
+            level="DEBUG",
+            groups=group_layout_payload,
+            total_groups=len(groups),
+        )
+
     total_chunks = sum(max(1, math.ceil(len(group) / max_group)) for group in groups)
     logger.debug(
         "[P4.5] Planned processing batches: groups=%d, chunks=%d, max_group=%d",
@@ -932,6 +1159,7 @@ def _run_phase4_5_inter_master_merge(
             continue
         group_chunks = max(1, math.ceil(len(members) / max_group))
         member_ids = [tile.index for tile in members]
+        group_completed_chunks = 0
         if not _phase45_gui_emit(
             "p45_group_info",
             level="DEBUG",
@@ -959,6 +1187,23 @@ def _run_phase4_5_inter_master_merge(
                 except Exception:
                     pass
             chunk_idx = min(group_chunks, (chunk_start // max_group) + 1)
+            _phase45_gui_emit(
+                "p45_group_started",
+                level="DEBUG",
+                group_id=group_id,
+                chunk=chunk_idx,
+                chunks=group_chunks,
+                size=len(chunk_tiles),
+            )
+            _phase45_gui_emit(
+                "p45_group_progress",
+                level="ETA_LEVEL",
+                group_id=group_id,
+                chunk=chunk_idx,
+                done=group_completed_chunks,
+                total=group_chunks,
+                size=len(chunk_tiles),
+            )
             if not _phase45_gui_emit(
                 "p45_group_info",
                 level="DEBUG",
@@ -1045,7 +1290,7 @@ def _run_phase4_5_inter_master_merge(
                     channels,
                 )
                 _phase45_gui_message(
-                    f"Phase 4.5: group {group_id} chunk {chunk_idx}/{group_chunks} reprojection"
+                    f"Phase 4.5: group {group_id} chunk {chunk_idx}/{group_chunks} reprojection ({allocation_mode})"
                 )
                 for idx_tile, tile in enumerate(chunk_tiles):
                     if tile.index in preloaded:
@@ -1159,60 +1404,125 @@ def _run_phase4_5_inter_master_merge(
                         frames, method="phase", max_shift_px=8
                     )
                     logger.debug("[P4.5][G%03d] Micro-align done", group_id)
+                    _phase45_gui_message(
+                        f"Phase 4.5: group {group_id} micro-align done"
+                    )
             except Exception as exc:
                 logger.debug("[P4.5][G%03d] Micro-align skipped/failed: %s", group_id, exc)
 
-            # 4.5.b — normalisation photométrique locale (gain/offset)
-            try:
-                if norm_method != "none" and photometry_estimator_available:
+            # 4.5.b — normalisation photométrique intra-groupe (gain/offset)
+            if (
+                photometry_estimator_available
+                and photometry_apply_available
+                and photometry_intragroup
+                and len(frames) >= 2
+            ):
+                try:
+                    _phase45_gui_emit(
+                        "p45_group_photometry_start",
+                        level="INFO_DETAIL",
+                        group_id=group_id,
+                        chunk=chunk_idx,
+                        size=len(chunk_tiles),
+                        clip=photometry_clip_sigma,
+                    )
                     logger.debug(
-                        "[P4.5][G%03d] Photometry normalization start: method=%s, weight=%s",
+                        "[P4.5][G%03d] Intra-group photometry start (chunk=%d, tiles=%d, clip=%.2f)",
+                        group_id,
+                        chunk_idx,
+                        len(chunk_tiles),
+                        photometry_clip_sigma,
+                    )
+                    chunk_sources: list[_TileAffineSource] = []
+                    for idx_tile, tile in enumerate(chunk_tiles):
+                        if idx_tile >= len(frames):
+                            break
+                        frame_view = np.array(frames[idx_tile], dtype=np.float32, copy=False)
+                        chunk_sources.append(
+                            _TileAffineSource(
+                                path=tile.path,
+                                wcs=local_wcs,
+                                data=frame_view,
+                            )
+                        )
+                    if len(chunk_sources) >= 2:
+                        affine_estimates = zemosaic_align_stack.estimate_affine_photometry(
+                            chunk_sources,
+                            robust=True,
+                            clip_sigma=photometry_clip_sigma,
+                            match_background=True,
+                        )
+                        corrections, nontrivial = _sanitize_affine_corrections(
+                            affine_estimates,
+                            len(chunk_sources),
+                        )
+                        if corrections and nontrivial:
+                            frames = zemosaic_align_stack.apply_affine_photometry(frames, corrections)
+                            log_indices = _select_affine_log_indices(corrections)
+                            sample_indices = [
+                                chunk_tiles[idx - 1].index
+                                for idx in sorted(log_indices)
+                                if 0 < idx <= len(chunk_tiles)
+                            ]
+                            sample_payload = ", ".join(str(val) for val in sample_indices) if sample_indices else "-"
+                            _phase45_gui_emit(
+                                "p45_group_photometry_applied",
+                                level="INFO_DETAIL",
+                                group_id=group_id,
+                                chunk=chunk_idx,
+                                applied=len(corrections),
+                                samples=sample_payload,
+                            )
+                            logger.debug(
+                                "[P4.5][G%03d] Intra-group photometry applied (chunk=%d, samples=%s)",
+                                group_id,
+                                chunk_idx,
+                                sample_payload,
+                            )
+                        else:
+                            logger.debug(
+                                "[P4.5][G%03d] Intra-group photometry produced no corrections (chunk=%d)",
+                                group_id,
+                                chunk_idx,
+                            )
+                    else:
+                        logger.debug(
+                            "[P4.5][G%03d] Intra-group photometry skipped (insufficient tiles: %d)",
+                            group_id,
+                            len(chunk_sources),
+                        )
+                except Exception as exc:
+                    logger.debug(
+                        "[P4.5][G%03d] Intra-group photometry skipped due to error: %s",
+                        group_id,
+                        exc,
+                    )
+
+            # Héritage: respecter les réglages legacy si la nouvelle photométrie est désactivée.
+            if (
+                not photometry_intragroup
+                and photometry_estimator_available
+                and photometry_apply_available
+                and norm_method != "none"
+                and len(frames) >= 2
+            ):
+                try:
+                    logger.debug(
+                        "[P4.5][G%03d] Legacy inter-tile photometric normalization (method=%s, weight=%s)",
                         group_id,
                         norm_method,
                         weight_method,
                     )
-                    gains_offsets = zemosaic_align_stack.estimate_affine_photometry(
+                    affine_corr = zemosaic_align_stack.estimate_affine_photometry(
                         frames, method=norm_method, weight_method=weight_method
                     )
-                    nontrivial = 0
-                    samples: list[str] = []
-                    if isinstance(gains_offsets, (list, tuple, np.ndarray)):
-                        try:
-                            iterable = list(gains_offsets)
-                        except Exception:
-                            iterable = gains_offsets
-                        for idx_go, pair in enumerate(iterable):
-                            try:
-                                gain = float(pair[0])
-                            except Exception:
-                                gain = 1.0
-                            try:
-                                offset = float(pair[1])
-                            except Exception:
-                                offset = 0.0
-                            if abs(gain - 1.0) > 1e-3 or abs(offset) > 1e-3:
-                                nontrivial += 1
-                                if len(samples) < 3:
-                                    samples.append(f"#{idx_go}:{gain:.3f}/{offset:.3f}")
-                        if samples:
-                            sample_repr = "; ".join(samples)
-                        else:
-                            sample_repr = ""
-                    else:
-                        sample_repr = ""
-                    logger.debug(
-                        "[P4.5][G%03d] Photometry normalization applied: %d non-trivial corrections%s",
-                        group_id,
-                        nontrivial,
-                        f" ({sample_repr})" if sample_repr else "",
-                    )
+                    frames = zemosaic_align_stack.apply_affine_photometry(frames, affine_corr)
+                    logger.debug("[P4.5][G%03d] Legacy inter-tile normalization applied", group_id)
                     _phase45_gui_message(
-                        f"Phase 4.5: group {group_id} photometric match ({nontrivial} corrections)"
+                        f"Phase 4.5: group {group_id} inter-tile photometric normalization"
                     )
-                    if photometry_apply_available:
-                        frames = zemosaic_align_stack.apply_affine_photometry(frames, gains_offsets)
-            except Exception as exc:
-                logger.debug("[P4.5][G%03d] Photometry norm skipped/failed: %s", group_id, exc)
+                except Exception as exc:
+                    logger.warning("[P4.5][G%03d] Legacy inter-tile normalization failed: %s", group_id, exc)
 
             # 4.5.c — empilement selon les réglages GUI
             logger.debug(
@@ -1285,7 +1595,26 @@ def _run_phase4_5_inter_master_merge(
                 )
                 continue
 
-            super_arr = np.asarray(super_arr, dtype=np.float32)
+            try:
+                super_arr = _ensure_hwc_master_tile(
+                    super_arr,
+                    tile_label=f"p45_group_{group_id:03d}_chunk_{chunk_idx}",
+                )
+            except Exception as exc:
+                logger.debug(
+                    "[P4.5][G%03d] Super array normalization failed: %s",
+                    group_id,
+                    exc,
+                )
+                continue
+            if channels == 1 and super_arr.shape[-1] != 1:
+                super_arr = super_arr[..., :1]
+            elif channels == 3:
+                if super_arr.shape[-1] == 1:
+                    super_arr = np.repeat(super_arr, 3, axis=-1)
+                elif super_arr.shape[-1] > 3:
+                    super_arr = super_arr[..., :3]
+            super_arr = np.asarray(super_arr, dtype=np.float32, order="C")
             arr_shape = tuple(super_arr.shape)
             logger.debug(
                 "[P4.5][G%03d] Super array ready: shape=%s, dtype=%s",
@@ -1296,14 +1625,22 @@ def _run_phase4_5_inter_master_merge(
             _phase45_gui_message(
                 f"Phase 4.5: group {group_id} super-tile shape {arr_shape}"
             )
-            representative_idx = min(tile.index for tile in chunk_tiles)
+            member_indices = sorted(tile.index for tile in chunk_tiles)
+            representative_idx = member_indices[0]
             consumed_indices.update(tile.index for tile in chunk_tiles)
+
+            member_signature = ",".join(str(idx) for idx in member_indices)
+            digest = hashlib.sha1(member_signature.encode("utf-8")).hexdigest()[:8]
+            super_tile_id = f"super:{representative_idx:04d}_{len(member_indices):02d}_{digest}"
 
             target_dir = temp_storage_dir or output_folder
             os.makedirs(target_dir, exist_ok=True)
             super_filename = f"super_tile_{representative_idx:03d}_{uuid.uuid4().hex[:8]}.fits"
             super_path = os.path.join(target_dir, super_filename)
             logger.debug("[P4.5][G%03d] Saving super tile to %s", group_id, super_path)
+            _phase45_gui_message(
+                f"Phase 4.5: group {group_id} writing {super_filename} ({arr_shape})"
+            )
 
             header = fits.Header()
             try:
@@ -1313,6 +1650,10 @@ def _run_phase4_5_inter_master_merge(
             try:
                 header["ZMT_TYPE"] = ("Super Tile", "Inter-Master merged tile")
                 header["ZMT_SUPR"] = (len(chunk_tiles), "Tiles merged in Phase 4.5")
+            except Exception:
+                pass
+            try:
+                header["ZMT_SUPID"] = (super_tile_id, "Phase 4.5 super tile id")
             except Exception:
                 pass
             try:
@@ -1335,8 +1676,11 @@ def _run_phase4_5_inter_master_merge(
                 except Exception:
                     continue
 
+            _register_master_tile_identity(super_path, super_tile_id)
+
             replacements[representative_idx] = (super_path, local_wcs)
             cleanup_paths.extend(tile.path for tile in chunk_tiles if tile.path)
+            group_super_counts[group_id] = group_super_counts.get(group_id, 0) + 1
 
             snr_gain = math.sqrt(len(chunk_tiles))
             pcb(
@@ -1346,6 +1690,8 @@ def _run_phase4_5_inter_master_merge(
                 size=len(chunk_tiles),
                 out=os.path.basename(super_path),
                 snr=f"{snr_gain:.2f}",
+                group_id=group_id,
+                chunk=chunk_idx,
             )
             logger.debug(
                 "[P4.5][G%03d] Super tile saved (%d tiles, SNR x%.2f): %s shape=%s",
@@ -1355,15 +1701,390 @@ def _run_phase4_5_inter_master_merge(
                 super_path,
                 arr_shape,
             )
+            _phase45_gui_message(
+                f"Phase 4.5: group {group_id} super tile saved "
+                f"(chunk {chunk_idx}/{group_chunks}, SNR x{snr_gain:.2f})"
+            )
+            group_completed_chunks = max(group_completed_chunks, chunk_idx)
+            _phase45_gui_emit(
+                "p45_group_progress",
+                level="ETA_LEVEL",
+                group_id=group_id,
+                chunk=chunk_idx,
+                done=group_completed_chunks,
+                total=group_chunks,
+                size=len(chunk_tiles),
+            )
+
+    total_super_tiles = sum(group_super_counts.values())
+    if total_super_tiles:
+        groups_with_super = len(group_super_counts)
+        logger.info(
+            "phase4_5: injected %d super-tiles from %d groups",
+            total_super_tiles,
+            groups_with_super,
+        )
+        _phase45_gui_message(
+            f"phase4_5: injected {total_super_tiles} super-tiles from {groups_with_super} groups",
+            level="INFO",
+        )
 
     if cache_retention_mode != "keep":
+        removed_count = 0
         for path in cleanup_paths:
             if not path or not os.path.exists(path):
                 continue
             try:
                 os.remove(path)
+                removed_count += 1
             except Exception:
                 pass
+        if removed_count:
+            logger.debug("[P4.5] Removed %d original master tiles post-merge", removed_count)
+            _phase45_gui_message(f"Phase 4.5: cleanup removed {removed_count} original tiles")
+
+    # --- [P4.5] Inter-super photometric normalization (gain-only) ---
+    try:
+        candidate_super_tiles = [
+            (tidx, entry)
+            for tidx, entry in sorted(replacements.items())
+            if entry and entry[0] and os.path.exists(entry[0])
+        ]
+        if photometry_intersuper and len(candidate_super_tiles) >= 2:
+            pcb("p45_norm_start", lvl="INFO_DETAIL", tiles=len(candidate_super_tiles))
+            end_payload: dict[str, Any] = {"applied": 0}
+            try:
+                stats: list[tuple[int, str, np.ndarray, int]] = []
+                for tidx, (tpath, _twcs) in candidate_super_tiles:
+                    try:
+                        with fits.open(
+                            tpath,
+                            memmap=True,
+                            do_not_scale_image_data=True,
+                        ) as hdul:
+                            raw = hdul[0].data
+                            if raw is None:
+                                continue
+                            arr = _ensure_hwc_master_tile(raw, os.path.basename(tpath))
+                    except Exception as exc:
+                        logger.debug("[P4.5] Norm stats failed for %s: %s", tpath, exc)
+                        continue
+                    channels = arr.shape[-1]
+                    med = np.full(channels, np.nan, dtype=np.float32)
+                    weight = 0
+                    for ch in range(channels):
+                        plane = arr[..., ch]
+                        valid = np.isfinite(plane)
+                        valid_count = int(valid.sum())
+                        if not valid_count:
+                            continue
+                        vals = plane[valid].astype(np.float32, copy=False)
+                        median_val = float(np.nanmedian(vals))
+                        if valid_count > 32 and photometry_clip_sigma > 0:
+                            try:
+                                q1, q3 = np.nanpercentile(vals, [25.0, 75.0])
+                                iqr = float(q3 - q1)
+                                if iqr > 0:
+                                    sigma_est = iqr / 1.349
+                                    clip_width = sigma_est * photometry_clip_sigma
+                                    if clip_width > 0:
+                                        low = median_val - clip_width
+                                        high = median_val + clip_width
+                                        clip_mask = (vals >= low) & (vals <= high)
+                                        if clip_mask.any():
+                                            median_val = float(np.nanmedian(vals[clip_mask]))
+                            except Exception:
+                                pass
+                        med[ch] = median_val
+                        weight += valid_count
+                    if weight == 0 or not np.all(np.isfinite(med)):
+                        continue
+                    stats.append((int(tidx), tpath, med, weight))
+
+                valid_stats = [entry for entry in stats if entry[3] > 0 and np.all(np.isfinite(entry[2]))]
+                if len(valid_stats) >= 2:
+                    meds = np.vstack([entry[2] for entry in valid_stats])
+                    weights = np.asarray([float(entry[3]) for entry in valid_stats], dtype=np.float64)
+                    total_weight = float(weights.sum())
+                    ref_mode = "median"
+                    dominant_idx = int(np.argmax(weights))
+                    ref_tile = int(valid_stats[dominant_idx][0])
+                    ref = np.zeros(meds.shape[1], dtype=np.float32)
+                    if total_weight <= 0:
+                        ref_mode = "tile"
+                        ref = meds[dominant_idx]
+                    else:
+                        for ch in range(meds.shape[1]):
+                            col = meds[:, ch]
+                            order = np.argsort(col)
+                            sorted_vals = col[order]
+                            sorted_weights = weights[order]
+                            cutoff = total_weight * 0.5
+                            cumsum = np.cumsum(sorted_weights)
+                            idx = int(np.searchsorted(cumsum, cutoff, side="left"))
+                            idx = min(idx, len(sorted_vals) - 1)
+                            ref[ch] = float(sorted_vals[idx])
+                    if not np.all(np.isfinite(ref)):
+                        ref_mode = "tile"
+                        ref = meds[dominant_idx]
+                    ref = np.asarray(ref, dtype=np.float32, order="C")
+
+                    gain_clip_cfg = (
+                        inter_cfg.get("two_pass_cov_gain_clip")
+                        or stack_cfg.get("two_pass_cov_gain_clip")
+                    )
+                    gmin, gmax = 0.85, 1.18
+                    if isinstance(gain_clip_cfg, (list, tuple)) and len(gain_clip_cfg) >= 2:
+                        try:
+                            gmin = float(gain_clip_cfg[0])
+                            gmax = float(gain_clip_cfg[1])
+                        except Exception:
+                            gmin, gmax = 0.85, 1.18
+                    if not math.isfinite(gmin) or not math.isfinite(gmax):
+                        gmin, gmax = 0.85, 1.18
+                    if gmin > gmax:
+                        gmin, gmax = gmax, gmin
+
+                    preview_gains = []
+                    for med in meds:
+                        gains_preview = np.ones_like(ref, dtype=np.float32)
+                        valid_mask = (
+                            np.isfinite(med)
+                            & np.isfinite(ref)
+                            & (med != 0)
+                            & (ref != 0)
+                        )
+                        same_sign = np.signbit(med) == np.signbit(ref)
+                        valid_mask &= same_sign
+                        gains_preview[valid_mask] = ref[valid_mask] / med[valid_mask]
+                        preview_gains.append(np.clip(gains_preview, gmin, gmax))
+                    preview_arr = np.vstack(preview_gains)
+                    gain_summary = ",".join(
+                        f"ch{idx}:{float(np.nanmedian(preview_arr[:, idx])):.3f}"
+                        for idx in range(preview_arr.shape[1])
+                    )
+                    pcb(
+                        "p45_norm_stats",
+                        lvl="DEBUG",
+                        ref="median" if ref_mode == "median" else f"tile_{ref_tile}",
+                        target=[float(val) for val in ref.tolist()],
+                        gains_summary=gain_summary,
+                    )
+
+                    applied_tiles = 0
+                    ref_descriptor = "weighted" if ref_mode == "median" else f"tile:{ref_tile}"
+                    for tidx, tpath, med, _ in valid_stats:
+                        gains = np.ones_like(ref, dtype=np.float32)
+                        valid_mask = (
+                            np.isfinite(med)
+                            & np.isfinite(ref)
+                            & (med != 0)
+                            & (ref != 0)
+                        )
+                        same_sign = np.signbit(med) == np.signbit(ref)
+                        valid_mask &= same_sign
+                        gains[valid_mask] = ref[valid_mask] / med[valid_mask]
+                        gains = np.clip(gains, gmin, gmax)
+                        if np.all(np.abs(gains - 1.0) <= 1e-6):
+                            continue
+                        if not tpath or not os.path.exists(tpath):
+                            continue
+                        try:
+                            with fits.open(
+                                tpath,
+                                mode="update",
+                                memmap=False,
+                                do_not_scale_image_data=True,
+                            ) as hdul:
+                                raw = hdul[0].data
+                                if raw is None:
+                                    continue
+                                arr = _ensure_hwc_master_tile(raw, os.path.basename(tpath))
+                                arr_corr = np.asarray(arr, dtype=np.float32, order="C")
+                                for ch in range(min(arr_corr.shape[-1], gains.size)):
+                                    arr_corr[..., ch] *= float(gains[ch])
+                                if raw.ndim == 2:
+                                    arr_store = arr_corr[..., 0]
+                                elif (
+                                    raw.ndim == 3
+                                    and raw.shape[0] in (1, 3)
+                                    and raw.shape[-1] not in (1, 3)
+                                ):
+                                    arr_store = np.moveaxis(arr_corr, -1, 0)
+                                elif raw.ndim == 3 and raw.shape[-1] in (1, 3):
+                                    arr_store = arr_corr[..., : raw.shape[-1]]
+                                else:
+                                    arr_store = arr_corr
+                                arr_store = np.asarray(arr_store, dtype=np.float32, order="C")
+                                if hdul[0].data.shape == arr_store.shape:
+                                    hdul[0].data[...] = arr_store
+                                else:
+                                    hdul[0].data = arr_store
+                                header = hdul[0].header
+                                try:
+                                    header["ZM45NORM"] = (True, "Phase 4.5 inter-super normalization")
+                                except Exception:
+                                    pass
+                                history_line = (
+                                    "P4.5 intersuper norm gain="
+                                    + ",".join(f"{val:.6f}" for val in gains.tolist())
+                                    + ", offset=0.0, ref="
+                                    + ref_descriptor
+                                )
+                                try:
+                                    header.add_history(history_line)
+                                except Exception:
+                                    try:
+                                        header["HISTORY"] = history_line
+                                    except Exception:
+                                        pass
+                                hdul.flush()
+                            applied_tiles += 1
+                            pcb("p45_norm_apply", lvl="DEBUG", tile=int(tidx), gains=gains.tolist())
+                        except Exception as exc:
+                            logger.debug("[P4.5] Norm apply failed for %s: %s", tpath, exc)
+                    end_payload["applied"] = applied_tiles
+                else:
+                    logger.debug(
+                        "[P4.5] Inter-super normalization skipped: insufficient stats (%d)",
+                        len(valid_stats),
+                    )
+                    end_payload["reason"] = "insufficient_stats"
+            finally:
+                pcb("p45_norm_end", lvl="INFO_DETAIL", **end_payload)
+    except Exception as exc:
+        logger.debug("[P4.5] Inter-super normalization skipped due to error: %s", exc)
+
+    # ---- Inter-supertiles photometric normalization (optional) ----
+    if (
+        photometry_estimator_available
+        and photometry_apply_available
+        and photometry_intersuper
+    ):
+        try:
+            calib_entries: list[_TileAffineSource] = []
+            for idx, original in enumerate(master_tiles):
+                entry: tuple[str | None, Any] | None = None
+                if idx in replacements:
+                    entry = replacements[idx]
+                elif idx not in consumed_indices:
+                    entry = original
+                if not entry:
+                    continue
+                path, wcs_obj = entry
+                if not path or wcs_obj is None:
+                    continue
+                calib_entries.append(_TileAffineSource(path=path, wcs=wcs_obj))
+            if len(calib_entries) >= 2:
+                _phase45_gui_emit(
+                    "p45_global_photometry_start",
+                    level="INFO_DETAIL",
+                    size=len(calib_entries),
+                    clip=photometry_clip_sigma,
+                )
+                logger.debug(
+                    "[P4.5] Global photometry start: entries=%d, clip=%.2f",
+                    len(calib_entries),
+                    photometry_clip_sigma,
+                )
+                global_affine = zemosaic_align_stack.estimate_affine_photometry(
+                    calib_entries,
+                    robust=True,
+                    clip_sigma=photometry_clip_sigma,
+                    match_background=True,
+                )
+                corrections, nontrivial = _sanitize_affine_corrections(
+                    global_affine,
+                    len(calib_entries),
+                )
+                if corrections and nontrivial:
+                    nontrivial_count = sum(
+                        1
+                        for gain_val, offset_val in corrections
+                        if abs(gain_val - 1.0) > 1e-6 or abs(offset_val) > 1e-6
+                    )
+                    for entry_idx, src in enumerate(calib_entries):
+                        path = src.path
+                        if not path or not os.path.exists(path):
+                            continue
+                        gain_val, offset_val = corrections[entry_idx]
+                        if abs(gain_val - 1.0) <= 1e-6 and abs(offset_val) <= 1e-6:
+                            continue
+                        try:
+                            with fits.open(
+                                path,
+                                mode="update",
+                                memmap=True,
+                                do_not_scale_image_data=True,
+                            ) as hdul:
+                                raw_data = hdul[0].data
+                                if raw_data is None:
+                                    continue
+                                arr_hwc = _ensure_hwc_master_tile(
+                                    raw_data,
+                                    os.path.basename(path),
+                                )
+                                arr_corr = (
+                                    arr_hwc * np.float32(gain_val) + np.float32(offset_val)
+                                ).astype(np.float32, copy=False)
+                                if raw_data.ndim == 2:
+                                    arr_store = arr_corr[..., 0]
+                                elif (
+                                    raw_data.ndim == 3
+                                    and raw_data.shape[0] in (1, 3)
+                                    and raw_data.shape[-1] not in (1, 3)
+                                ):
+                                    arr_store = np.moveaxis(arr_corr, -1, 0)
+                                elif raw_data.ndim == 3 and raw_data.shape[-1] in (1, 3):
+                                    arr_store = arr_corr[..., : raw_data.shape[-1]]
+                                else:
+                                    arr_store = arr_corr
+                                arr_store = np.asarray(arr_store, dtype=np.float32, order="C")
+                                if hdul[0].data.shape == arr_store.shape:
+                                    hdul[0].data[...] = arr_store
+                                else:
+                                    hdul[0].data = arr_store
+                                header = hdul[0].header
+                                try:
+                                    header.add_history("Phase 4.5 inter-super photometric match applied")
+                                except Exception:
+                                    try:
+                                        header["HISTORY"] = "Phase 4.5 inter-super photometric match applied"
+                                    except Exception:
+                                        pass
+                                hdul.flush()
+                        except Exception as exc:
+                            logger.debug(
+                                "[P4.5] Global photometry apply failed for %s: %s",
+                                os.path.basename(path) if path else "<memory>",
+                                exc,
+                            )
+                    _phase45_gui_emit(
+                        "p45_global_photometry_done",
+                        level="INFO_DETAIL",
+                        nontrivial=nontrivial_count,
+                        size=len(corrections),
+                    )
+                    logger.debug(
+                        "[P4.5] Global photometry applied to %d/%d entries",
+                        nontrivial_count,
+                        len(corrections),
+                    )
+                else:
+                    _phase45_gui_emit(
+                        "p45_global_photometry_done",
+                        level="INFO_DETAIL",
+                        nontrivial=0,
+                        size=len(calib_entries),
+                    )
+                    logger.debug("[P4.5] Global photometry produced no corrections")
+            else:
+                logger.debug(
+                    "[P4.5] Global photometry skipped (insufficient entries: %d)",
+                    len(calib_entries),
+                )
+        except Exception:
+            logger.debug("[P4.5] Inter-super photometry skipped (error).", exc_info=True)
 
     new_master_tiles: list[tuple[str | None, Any]] = []
     for idx, original in enumerate(master_tiles):
@@ -5940,6 +6661,10 @@ def create_master_tile(
             progress_callback=progress_callback,
             axis_order="HWC",
         )
+        try:
+            _register_master_tile_identity(temp_fits_filepath, f"tile:{int(tile_id):04d}")
+        except Exception:
+            _register_master_tile_identity(temp_fits_filepath, tile_id)
         pcb_tile(f"{func_id_log_base}_info_saved", prog=None, lvl="INFO_DETAIL", tile_id=tile_id, format_type='float32', filename=os.path.basename(temp_fits_filepath))
         # pcb_tile(f"{func_id_log_base}_info_saving_finished", prog=None, lvl="DEBUG_DETAIL", tile_id=tile_id)
         try:
@@ -6582,6 +7307,7 @@ def assemble_final_mosaic_reproject_coadd(
     collect_tile_data: list | None = None,
     tile_affine_corrections: list[tuple[float, float]] | None = None,
     global_anchor_shift: tuple[float, float] | None = None,
+    phase45_enabled: bool = False,
 ):
     """Assemble les master tiles en utilisant ``reproject_and_coadd``."""
     _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
@@ -6726,12 +7452,17 @@ def assemble_final_mosaic_reproject_coadd(
     )
 
 
-    input_data_all_tiles_HWC_processed = []
+    effective_tiles: list[dict[str, Any]] = []
     hdr_for_output = None
     total_tiles_for_prep = len(master_tile_fits_with_wcs_list)
     for idx, (tile_path, tile_wcs) in enumerate(master_tile_fits_with_wcs_list, 1):
+        tile_header = None
         with fits.open(tile_path, memmap=False) as hdul:
             data = hdul[0].data.astype(np.float32)
+            try:
+                tile_header = hdul[0].header.copy()
+            except Exception:
+                tile_header = None
 
         # Master tiles saved via ``save_fits_image`` use the ``HWC`` axis order
         # which stores color images in ``C x H x W`` within the FITS file. When
@@ -6782,7 +7513,13 @@ def assemble_final_mosaic_reproject_coadd(
             except Exception:
                 pass
 
-        input_data_all_tiles_HWC_processed.append((data, tile_wcs))
+        tile_entry = {
+            "data": data,
+            "wcs": tile_wcs,
+            "path": tile_path,
+            "tile_id": _resolve_tile_identifier(tile_path, tile_header, idx - 1),
+        }
+        effective_tiles.append(tile_entry)
 
         if idx % 10 == 0 or idx == len(master_tile_fits_with_wcs_list):
             _pcb(
@@ -6802,24 +7539,21 @@ def assemble_final_mosaic_reproject_coadd(
     # Optional inter-tile photometric (gain/offset) calibration
     pending_affine_list, nontrivial_affine = _sanitize_affine_corrections(
         tile_affine_corrections,
-        len(input_data_all_tiles_HWC_processed),
+        len(effective_tiles),
     )
 
     if (
         pending_affine_list is None
         and intertile_photometric_match
-        and len(input_data_all_tiles_HWC_processed) >= 2
+        and len(effective_tiles) >= 2
     ):
         tile_sources = []
-        for (tile_path, tile_wcs_orig), (arr, tile_wcs_processed) in zip(
-            master_tile_fits_with_wcs_list,
-            input_data_all_tiles_HWC_processed,
-        ):
+        for entry in effective_tiles:
             tile_sources.append(
                 _TileAffineSource(
-                    path=tile_path,
-                    wcs=tile_wcs_processed or tile_wcs_orig,
-                    data=arr,
+                    path=entry.get("path"),
+                    wcs=entry.get("wcs"),
+                    data=entry.get("data"),
                 )
             )
 
@@ -6859,7 +7593,7 @@ def assemble_final_mosaic_reproject_coadd(
             pending_affine_list = None
             nontrivial_affine = False
 
-    total_tiles_prepared = len(input_data_all_tiles_HWC_processed)
+    total_tiles_prepared = len(effective_tiles)
     pending_affine_list, anchor_shift_applied = _compose_global_anchor_shift(
         pending_affine_list,
         total_tiles_prepared,
@@ -6868,20 +7602,60 @@ def assemble_final_mosaic_reproject_coadd(
     if anchor_shift_applied:
         nontrivial_affine = True
 
+    affine_by_id: dict[str, tuple[float, float]] | None = None
     if pending_affine_list:
+        affine_by_id, affine_mismatch_detail = _build_affine_lookup_for_tiles(
+            effective_tiles,
+            pending_affine_list,
+        )
+        if affine_mismatch_detail:
+            logger.warning(
+                "affine_list_mismatch: expected %d corrections for %d tiles, got %d — skip photometric corrections and rely on match_background",
+                len(effective_tiles),
+                len(effective_tiles),
+                len(pending_affine_list or []),
+            )
+            logger.warning("affine_list_mismatch detail: %s", affine_mismatch_detail)
+            pending_affine_list = None
+            affine_by_id = None
+            nontrivial_affine = False
+        else:
+            if phase45_enabled:
+                logger.info(
+                    "intertile: recomputed affine corrections on effective set: tiles=%d",
+                    len(effective_tiles),
+                )
+            logger.info(
+                "apply_photometric: using affine_by_id for %d tiles",
+                len(effective_tiles),
+            )
+    else:
+        nontrivial_affine = False
+        pending_affine_list = None
+
+    if pending_affine_list and affine_by_id:
         if use_gpu:
-            # Defer gain/offset application to GPU path for parity with V3.2.5
             nontrivial_affine = True
+            for entry in effective_tiles:
+                tile_id = entry.get("tile_id")
+                if not tile_id:
+                    continue
+                gain_val, offset_val = affine_by_id.get(tile_id, (1.0, 0.0))
+                logger.info(
+                    "apply_photometric: tile=%s gain=%.5f offset=%.5f",
+                    tile_id,
+                    gain_val,
+                    offset_val,
+                )
         else:
             corrected_tiles = 0
-            for tile_idx, (gain_val, offset_val) in enumerate(pending_affine_list):
-                if tile_idx < 0 or tile_idx >= len(input_data_all_tiles_HWC_processed):
+            for tile_entry in effective_tiles:
+                tile_id = tile_entry.get("tile_id")
+                if not tile_id or tile_entry.get("data") is None:
                     continue
-                arr, tile_wcs_local = input_data_all_tiles_HWC_processed[tile_idx]
-                if arr is None:
-                    continue
+                gain_val, offset_val = affine_by_id.get(tile_id, (1.0, 0.0))
                 try:
-                    arr_np = np.asarray(arr, dtype=np.float32, order="C")
+                    arr_np = np.asarray(tile_entry["data"], dtype=np.float32, order="C")
                     gain_to_apply = float(gain_val)
                     offset_to_apply = float(offset_val)
                     if match_bg:
@@ -6902,7 +7676,7 @@ def assemble_final_mosaic_reproject_coadd(
                                     "assemble_warn_affine_clamped",
                                     prog=None,
                                     lvl="INFO_DETAIL",
-                                    tile_index=tile_idx,
+                                    tile_id=tile_id,
                                     gain_before=gain_before,
                                     gain_after=gain_to_apply,
                                     offset_before=offset_before,
@@ -6914,8 +7688,14 @@ def assemble_final_mosaic_reproject_coadd(
                         np.multiply(arr_np, gain_to_apply, out=arr_np, casting="unsafe")
                     if offset_to_apply != 0.0:
                         np.add(arr_np, offset_to_apply, out=arr_np, casting="unsafe")
-                    input_data_all_tiles_HWC_processed[tile_idx] = (arr_np, tile_wcs_local)
+                    tile_entry["data"] = arr_np
                     corrected_tiles += 1
+                    logger.info(
+                        "apply_photometric: tile=%s gain=%.5f offset=%.5f",
+                        tile_id,
+                        gain_to_apply,
+                        offset_to_apply,
+                    )
                 except Exception:
                     continue
             if corrected_tiles:
@@ -6941,7 +7721,9 @@ def assemble_final_mosaic_reproject_coadd(
             collect_tile_data.clear()
         except Exception:
             collect_tile_data[:] = []
-        for arr, tile_wcs in input_data_all_tiles_HWC_processed:
+        for entry in effective_tiles:
+            arr = entry.get("data") if isinstance(entry, dict) else None
+            tile_wcs = entry.get("wcs") if isinstance(entry, dict) else None
             if arr is None:
                 continue
             try:
@@ -7041,7 +7823,9 @@ def assemble_final_mosaic_reproject_coadd(
             except Exception:
                 pass
         for ch in range(n_channels):
-            for arr, _w in input_data_all_tiles_HWC_processed:
+            valid_entries: list[dict[str, Any]] = []
+            for entry in effective_tiles:
+                arr = entry.get("data") if isinstance(entry, dict) else None
                 if arr is None:
                     continue
                 if arr.ndim != 3:
@@ -7052,9 +7836,10 @@ def assemble_final_mosaic_reproject_coadd(
                     raise ValueError(
                         f"Channel index {ch} out of bounds for tile shape {arr.shape}"
                     )
+                valid_entries.append(entry)
 
-            data_list = [arr[..., ch] for arr, _w in input_data_all_tiles_HWC_processed]
-            wcs_list = [wcs for _arr, wcs in input_data_all_tiles_HWC_processed]
+            data_list = [entry.get("data")[..., ch] for entry in valid_entries]
+            wcs_list = [entry.get("wcs") for entry in valid_entries]
 
             reproj_call_kwargs = dict(reproj_kwargs)
             if use_gpu:
@@ -7700,15 +8485,21 @@ def run_hierarchical_mosaic(
     stack_ram_budget_gb_config : float
         Budget RAM (en Gio) autorisé pour le chargement d'un groupe de stacking (0 = illimité).
     """
+    worker_config_cache: dict[str, Any] = {}
+    if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
+        try:
+            worker_config_cache = zemosaic_config.load_config() or {}
+        except Exception:
+            worker_config_cache = {}
+
     pcb = lambda msg_key, prog=None, lvl="INFO", **kwargs: _log_and_callback(msg_key, prog, lvl, callback=progress_callback, **kwargs)
 
     # Cache retention policy (Phase 1 preprocessed cache cleanup)
     cache_retention_mode = "run_end"
     allowed_cache_modes = {"run_end", "per_tile", "keep"}
-    if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
+    if worker_config_cache:
         try:
-            cfg_cache = zemosaic_config.load_config() or {}
-            cache_retention_mode = str(cfg_cache.get("cache_retention", "run_end")).strip().lower()
+            cache_retention_mode = str(worker_config_cache.get("cache_retention", "run_end")).strip().lower()
         except Exception:
             cache_retention_mode = "run_end"
     if cache_retention_mode not in allowed_cache_modes:
@@ -9827,6 +10618,7 @@ def run_hierarchical_mosaic(
     pcb("run_info_phase4_finished", prog=current_global_progress, lvl="INFO", shape=final_output_shape_hw, crval=final_output_wcs.wcs.crval if final_output_wcs.wcs else 'N/A')
 
     base_progress_phase4_5 = current_global_progress
+    phase45_active_flag = bool(inter_master_merge_enable_config)
     if inter_master_merge_enable_config:
         pcb("PHASE_UPDATE:4.5", prog=None, lvl="ETA_LEVEL")
         _log_memory_usage(progress_callback, "Début Phase 4.5 (Inter-Master merge)")
@@ -9839,6 +10631,30 @@ def run_hierarchical_mosaic(
             "local_scale": str(inter_master_local_scale_config).lower(),
             "max_group": int(inter_master_max_group_config),
         }
+        try:
+            photometry_clip_cfg = float(worker_config_cache.get("inter_master_photometry_clip_sigma", 3.0))
+        except Exception:
+            photometry_clip_cfg = 3.0
+        if not math.isfinite(photometry_clip_cfg):
+            photometry_clip_cfg = 3.0
+        inter_cfg_phase45.update(
+            {
+                "photometry_intragroup": bool(worker_config_cache.get("inter_master_photometry_intragroup", True)),
+                "photometry_intersuper": bool(worker_config_cache.get("inter_master_photometry_intersuper", True)),
+                "photometry_clip_sigma": max(0.1, photometry_clip_cfg),
+            }
+        )
+        gain_clip_cfg = worker_config_cache.get("two_pass_cov_gain_clip")
+        if isinstance(gain_clip_cfg, (list, tuple)) and len(gain_clip_cfg) >= 2:
+            try:
+                gmin = float(gain_clip_cfg[0])
+                gmax = float(gain_clip_cfg[1])
+                if math.isfinite(gmin) and math.isfinite(gmax):
+                    if gmin > gmax:
+                        gmin, gmax = gmax, gmin
+                    inter_cfg_phase45["two_pass_cov_gain_clip"] = (gmin, gmax)
+            except Exception:
+                pass
         stack_cfg_phase45 = {
             "kappa_low": float(stack_kappa_low),
             "kappa_high": float(stack_kappa_high),
@@ -10051,6 +10867,7 @@ def run_hierarchical_mosaic(
                     use_auto_intertile=bool(use_auto_intertile_config),
                     collect_tile_data=collected_tiles_for_second_pass,
                     global_anchor_shift=global_anchor_shift,
+                    phase45_enabled=phase45_active_flag,
                 )
             except Exception as e_gpu:
                 logger.warning("GPU reproject_coadd failed, falling back to CPU: %s", e_gpu)
@@ -10080,6 +10897,7 @@ def run_hierarchical_mosaic(
                     use_auto_intertile=bool(use_auto_intertile_config),
                     collect_tile_data=collected_tiles_for_second_pass,
                     global_anchor_shift=global_anchor_shift,
+                    phase45_enabled=phase45_active_flag,
                 )
         else:
             final_mosaic_data_HWC, final_mosaic_coverage_HW = assemble_final_mosaic_reproject_coadd(
@@ -10108,6 +10926,7 @@ def run_hierarchical_mosaic(
                 use_auto_intertile=bool(use_auto_intertile_config),
                 collect_tile_data=collected_tiles_for_second_pass,
                 global_anchor_shift=global_anchor_shift,
+                phase45_enabled=phase45_active_flag,
             )
 
         log_key_phase5_failed = "run_error_phase5_assembly_failed_reproject_coadd"

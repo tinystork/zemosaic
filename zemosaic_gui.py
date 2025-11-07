@@ -60,6 +60,7 @@ import platform
 import shutil
 import importlib
 import importlib.util
+from typing import Any, Optional
 
 SYSTEM_NAME = platform.system().lower()
 IS_WINDOWS = SYSTEM_NAME == "windows"
@@ -457,6 +458,16 @@ class ZeMosaicGUI:
             master=self.root,
             value=method_default,
         )
+        self.phase45_overlay_var = tk.BooleanVar(master=self.root, value=True)
+        self.phase45_status_var = tk.StringVar(
+            master=self.root,
+            value=self._tr("phase45_status_idle", "Phase 4.5 idle"),
+        )
+        self.phase45_groups: dict[int, dict[str, Any]] = {}
+        self.phase45_group_progress: dict[int, dict[str, int]] = {}
+        self.phase45_active: Optional[int] = None
+        self.phase45_last_out: Optional[str] = None
+        self.phase45_canvas: Optional[tk.Canvas] = None
         
         # --- NOMBRE DE WORKERS ---
         # Utiliser 0 pour auto, comme convenu. La clé de config est "num_processing_workers".
@@ -1219,23 +1230,6 @@ class ZeMosaicGUI:
         self.inter_master_overlap_spin.grid(row=asm_opt_row, column=1, padx=5, pady=2, sticky="w")
         asm_opt_row += 1
 
-        self.inter_master_method_label = ttk.Label(final_assembly_options_frame, text="")
-        self.inter_master_method_label.grid(row=asm_opt_row, column=0, padx=5, pady=2, sticky="w")
-        self.translatable_widgets["cfg_inter_master_method"] = self.inter_master_method_label
-
-        self.inter_master_method_combo = ttk.Combobox(
-            final_assembly_options_frame,
-            state="disabled",
-            width=20,
-            textvariable=self.inter_master_method_var,
-            values=("winsor", "mean", "median"),
-        )
-        self.inter_master_method_combo.grid(row=asm_opt_row, column=1, padx=5, pady=2, sticky="w")
-        # Phase 4.5 reuses the stacking settings picked for Phase 3, so hide the redundant selector.
-        self.inter_master_method_label.grid_remove()
-        self.inter_master_method_combo.grid_remove()
-        asm_opt_row += 1
-
         gpu_chk = ttk.Checkbutton(
             final_assembly_options_frame,
             # Keep translation key for backward compatibility, update default text
@@ -1708,6 +1702,39 @@ class ZeMosaicGUI:
         log_scrollbar_x_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
         copy_btn.pack(side=tk.RIGHT, padx=(5,0))
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        phase45_frame = ttk.LabelFrame(
+            self.scrollable_content_frame,
+            text=self._tr("phase45_monitor_title", "Phase 4.5 - Overlap Monitor"),
+            padding="8",
+        )
+        phase45_frame.pack(fill=tk.X, pady=(0, 10))
+        self.translatable_widgets["phase45_monitor_title"] = phase45_frame
+        overlay_row = ttk.Frame(phase45_frame)
+        overlay_row.pack(fill=tk.X, padx=5, pady=(0, 4))
+        overlay_toggle = ttk.Checkbutton(
+            overlay_row,
+            text=self._tr("phase45_monitor_overlay_toggle", "Show overlay"),
+            variable=self.phase45_overlay_var,
+            command=self._redraw_phase45_overlay,
+        )
+        overlay_toggle.pack(side=tk.LEFT)
+        self.translatable_widgets["phase45_monitor_overlay_toggle"] = overlay_toggle
+        self.phase45_canvas = tk.Canvas(
+            phase45_frame,
+            width=420,
+            height=220,
+            background="#0f1117",
+            highlightthickness=0,
+        )
+        self.phase45_canvas.pack(fill=tk.X, padx=5, pady=5)
+        self.phase45_canvas.bind("<Configure>", lambda _evt: self._redraw_phase45_overlay())
+        ttk.Label(
+            phase45_frame,
+            textvariable=self.phase45_status_var,
+            font=("Segoe UI", 9, "italic"),
+        ).pack(fill=tk.X, padx=5, pady=(0, 2))
+        self._redraw_phase45_overlay()
 
 
         self.scrollable_content_frame.update_idletasks()
@@ -2540,10 +2567,246 @@ class ZeMosaicGUI:
                     self._log_tags_configured = True
             except tk.TclError:
                 pass # Ignorer si log_text n'est pas encore prêt lors d'un appel très précoce
+    def _phase45_reset_overlay(self, clear_groups=True):
+        if clear_groups:
+            self.phase45_groups = {}
+            self.phase45_last_out = None
+        self.phase45_group_progress = {}
+        self.phase45_active = None
+        self._update_phase45_status()
+        self._redraw_phase45_overlay()
 
+    def _update_phase45_status(self, status_override=None):
+        if not hasattr(self, "phase45_status_var"):
+            return
+        text = status_override
+        if not text:
+            total_groups = len(getattr(self, "phase45_groups", {}) or {})
+            if total_groups == 0:
+                text = self._tr("phase45_status_idle", "Phase 4.5 idle")
+            else:
+                parts = [f"Groups: {total_groups}"]
+                active = self.phase45_active
+                if active is not None:
+                    progress = self.phase45_group_progress.get(active)
+                    if progress and progress.get("total"):
+                        parts.append(
+                            f"Active: G{active} ({progress.get('done', 0)}/{progress.get('total', 0)})"
+                        )
+                    else:
+                        parts.append(f"Active: G{active}")
+                if self.phase45_last_out:
+                    parts.append(f"Super: {self.phase45_last_out}")
+                text = " | ".join(parts)
+        try:
+            self.phase45_status_var.set(text)
+        except tk.TclError:
+            pass
 
+    def _redraw_phase45_overlay(self, *_):
+        canvas = getattr(self, "phase45_canvas", None)
+        if not canvas or not hasattr(canvas, "winfo_exists") or not canvas.winfo_exists():
+            return
+        try:
+            width = max(int(canvas.winfo_width()), 10)
+            height = max(int(canvas.winfo_height()), 10)
+        except tk.TclError:
+            return
+        canvas.delete("all")
+        if not self.phase45_overlay_var.get():
+            canvas.create_text(
+                width / 2,
+                height / 2,
+                text=self._tr("phase45_overlay_hidden", "Overlay hidden"),
+                fill="#6f7177",
+            )
+            return
+        groups = getattr(self, "phase45_groups", {})
+        if not groups:
+            canvas.create_text(
+                width / 2,
+                height / 2,
+                text=self._tr("phase45_overlay_waiting", "Waiting for Phase 4.5..."),
+                fill="#6f7177",
+            )
+            return
+        bboxes = [g.get("bbox") for g in groups.values() if g.get("bbox")]
+        if not bboxes:
+            canvas.create_text(
+                width / 2,
+                height / 2,
+                text=self._tr("phase45_overlay_no_geo", "No WCS footprints"),
+                fill="#6f7177",
+            )
+            return
+        ra_min = min(entry["ra_min"] for entry in bboxes)
+        ra_max = max(entry["ra_max"] for entry in bboxes)
+        dec_min = min(entry["dec_min"] for entry in bboxes)
+        dec_max = max(entry["dec_max"] for entry in bboxes)
+        ra_span = max(ra_max - ra_min, 1e-6)
+        dec_span = max(dec_max - dec_min, 1e-6)
+        pad = 8
+        drawable_w = max(width - (pad * 2), 1)
+        drawable_h = max(height - (pad * 2), 1)
+        for gid in sorted(groups):
+            entry = groups[gid]
+            bbox = entry.get("bbox")
+            if not bbox:
+                continue
+            x0 = pad + ((bbox["ra_min"] - ra_min) / ra_span) * drawable_w
+            x1 = pad + ((bbox["ra_max"] - ra_min) / ra_span) * drawable_w
+            y0 = pad + ((dec_max - bbox["dec_max"]) / dec_span) * drawable_h
+            y1 = pad + ((dec_max - bbox["dec_min"]) / dec_span) * drawable_h
+            is_active = gid == self.phase45_active
+            progress = self.phase45_group_progress.get(gid)
+            outline = "#8E44AD"
+            dash_pattern = (3, 2)
+            fill_color = ""
+            if is_active:
+                outline = "#E53935"
+                dash_pattern = None
+                fill_color = "#FFCDD2"
+            rect_kwargs = {
+                "outline": outline,
+                "width": 2 if is_active else 1,
+            }
+            if dash_pattern:
+                rect_kwargs["dash"] = dash_pattern
+            if fill_color:
+                rect_kwargs["fill"] = fill_color
+                rect_kwargs["stipple"] = "gray25"
+            canvas.create_rectangle(
+                x0,
+                y0,
+                x1,
+                y1,
+                **rect_kwargs,
+            )
+            label = f"G{gid}"
+            if is_active and progress and progress.get("total"):
+                label = f"G{gid} {progress.get('done', 0)}/{progress.get('total', 0)}"
+            canvas.create_text(
+                x0 + 4,
+                y0 + 4,
+                anchor="nw",
+                fill="#E53935" if is_active else "#d4b5ff",
+                text=label,
+                font=("Consolas", 9, "bold") if is_active else ("Consolas", 8),
+            )
 
+    def _phase45_handle_groups_layout(self, payload, level):
+        data = payload or {}
+        groups_payload = data.get("groups") or []
+        new_groups: dict[int, dict[str, Any]] = {}
+        for entry in groups_payload:
+            try:
+                gid = int(entry.get("group_id"))
+            except Exception:
+                continue
+            new_groups[gid] = {
+                "bbox": entry.get("bbox"),
+                "members": entry.get("members") or [],
+                "repr": entry.get("repr"),
+            }
+        self.phase45_groups = new_groups
+        self.phase45_group_progress = {}
+        self.phase45_active = None
+        self.phase45_last_out = None
+        total = data.get("total_groups", len(new_groups))
+        self._update_phase45_status()
+        self._redraw_phase45_overlay()
+        self._log_message(
+            f"[P4.5] Overlap layout ready ({len(new_groups)}/{total} groups)",
+            level=level or "DEBUG_DETAIL",
+        )
 
+    def _phase45_handle_group_started(self, payload, level):
+        data = payload or {}
+        gid = data.get("group_id")
+        try:
+            gid_int = int(gid)
+        except Exception:
+            gid_int = None
+        chunk = data.get("chunk")
+        chunks = data.get("chunks") or data.get("total")
+        size = data.get("size")
+        if gid_int is not None:
+            total_chunks = int(chunks) if chunks else 0
+            self.phase45_active = gid_int
+            self.phase45_group_progress[gid_int] = {
+                "done": int(data.get("done", 0)),
+                "total": total_chunks,
+                "size": size,
+            }
+        self._update_phase45_status()
+        self._redraw_phase45_overlay()
+        if gid_int is not None:
+            chunk_txt = f"{chunk}/{chunks}" if chunk and chunks else chunk or "-"
+            size_txt = f"{size} tiles" if size else "tiles"
+            self._log_message(
+                f"[P4.5] Group G{gid_int} started chunk {chunk_txt} ({size_txt})",
+                level=level or "DEBUG_DETAIL",
+            )
+
+    def _phase45_handle_group_progress(self, payload, level):
+        data = payload or {}
+        gid = data.get("group_id")
+        try:
+            gid_int = int(gid)
+        except Exception:
+            gid_int = None
+        done = data.get("done", 0)
+        total = data.get("total", 0)
+        size = data.get("size")
+        try:
+            done = int(done)
+        except Exception:
+            done = 0
+        try:
+            total = int(total)
+        except Exception:
+            total = 0
+        if gid_int is not None:
+            prog_entry = self.phase45_group_progress.setdefault(
+                gid_int, {"done": 0, "total": total, "size": size}
+            )
+            prog_entry["done"] = done
+            if total:
+                prog_entry["total"] = total
+            if size is not None:
+                prog_entry["size"] = size
+            self.phase45_group_progress[gid_int] = prog_entry
+            self.phase45_active = gid_int
+        self._update_phase45_status()
+        self._redraw_phase45_overlay()
+        if gid_int is not None and total:
+            self._log_message(
+                f"[P4.5] Group G{gid_int} progress {done}/{total}",
+                level=level or "DEBUG_DETAIL",
+            )
+
+    def _phase45_handle_group_result(self, payload):
+        data = payload or {}
+        last_out = data.get("out")
+        if last_out:
+            self.phase45_last_out = os.path.basename(last_out)
+        gid = data.get("group_id")
+        try:
+            gid_int = int(gid)
+        except Exception:
+            gid_int = None
+        if gid_int is not None:
+            self.phase45_active = gid_int
+        self._update_phase45_status()
+        self._redraw_phase45_overlay()
+
+    def _phase45_handle_finish(self):
+        completion_text = self._tr("phase45_status_complete", "Phase 4.5 complete")
+        if self.phase45_last_out:
+            completion_text = f"{completion_text} | Super: {self.phase45_last_out}"
+        self.phase45_active = None
+        self._update_phase45_status(status_override=completion_text)
+        self._redraw_phase45_overlay()
 
     def _start_gui_chrono(self):
         if hasattr(self, '_chrono_after_id') and self._chrono_after_id:
@@ -3373,6 +3636,7 @@ class ZeMosaicGUI:
                 except Exception:
                     break
                 processed += 1
+                kwargs = kwargs or {}
                 if msg_key == "STAGE_PROGRESS":
                     stage, cur, tot = prog, lvl, kwargs.get('total', 0)
                     self.on_worker_progress(stage, cur, tot)
@@ -3382,6 +3646,21 @@ class ZeMosaicGUI:
                         self.worker_process.join(timeout=0.1)
                         self.worker_process = None
                     continue
+                if msg_key == "p45_start":
+                    self._phase45_reset_overlay()
+                elif msg_key == "p45_groups_layout":
+                    self._phase45_handle_groups_layout(kwargs, lvl)
+                    continue
+                elif msg_key == "p45_group_started":
+                    self._phase45_handle_group_started(kwargs, lvl)
+                    continue
+                elif msg_key == "p45_group_progress":
+                    self._phase45_handle_group_progress(kwargs, lvl)
+                    continue
+                elif msg_key == "p45_group_result":
+                    self._phase45_handle_group_result(kwargs)
+                elif msg_key == "p45_finished":
+                    self._phase45_handle_finish()
                 self._log_message(msg_key, prog, lvl, **kwargs)
                 # Time-slice: avoid monopolizing Tk thread
                 if time.monotonic() - start_time > 0.03:
