@@ -1,10 +1,23 @@
 # zemosaic_config.py
 import json
 import os
-import tkinter.filedialog as fd
-import tkinter.messagebox as mb
+import platform
+import shutil
+from pathlib import Path
+from typing import List, Optional, Tuple
+
+try:  # Tkinter is optional for headless/CLI usage
+    import tkinter.filedialog as fd
+    import tkinter.messagebox as mb
+except Exception:  # pragma: no cover - depends on OS packages
+    fd = None
+    mb = None
 
 CONFIG_FILE_NAME = "zemosaic_config.json"
+SYSTEM_NAME = platform.system().lower()
+IS_WINDOWS = SYSTEM_NAME == "windows"
+IS_MAC = SYSTEM_NAME == "darwin"
+
 DEFAULT_CONFIG = {
     "astap_executable_path": "",
     "astap_data_directory_path": "", 
@@ -99,6 +112,209 @@ DEFAULT_CONFIG = {
     # --- FIN CLES POUR LE ROGNAGE ---
 }
 
+
+def _home_path(*parts: str) -> str:
+    """Safely join parts under the current user's home directory."""
+    try:
+        return str(Path.home().joinpath(*parts))
+    except Exception:
+        return ""
+
+
+def _resolve_astap_executable(candidate: Optional[str]) -> Optional[str]:
+    """Expand and validate a potential ASTAP executable path."""
+    if not candidate:
+        return None
+    expanded = os.path.normpath(os.path.expanduser(candidate.strip()))
+    if os.path.isfile(expanded):
+        return expanded
+    if expanded.lower().endswith(".app") and os.path.isdir(expanded):
+        app_exec = os.path.join(expanded, "Contents", "MacOS", "astap")
+        if os.path.isfile(app_exec):
+            return os.path.normpath(app_exec)
+    if os.path.isdir(expanded):
+        exe_name = "astap.exe" if IS_WINDOWS else "astap"
+        nested = os.path.join(expanded, exe_name)
+        if os.path.isfile(nested):
+            return os.path.normpath(nested)
+    resolved = shutil.which(expanded) or shutil.which(os.path.basename(expanded))
+    if resolved and os.path.isfile(resolved):
+        return os.path.normpath(resolved)
+    return None
+
+
+def _resolve_astap_data_dir(candidate: Optional[str]) -> Optional[str]:
+    """Expand and validate a potential ASTAP data directory path."""
+    if not candidate:
+        return None
+    expanded = os.path.normpath(os.path.expanduser(candidate.strip()))
+    if os.path.isdir(expanded):
+        return expanded
+    return None
+
+
+def _candidate_astap_binary_paths() -> List[str]:
+    exe_name = "astap.exe" if IS_WINDOWS else "astap"
+    candidates: list[str] = []
+    # Environment overrides first
+    for env_key in ("ASTAP_EXE", "ASTAP_BIN", "ASTAP_PATH"):
+        env_val = os.environ.get(env_key)
+        if env_val:
+            candidates.append(env_val)
+
+    if IS_WINDOWS:
+        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        for base in (program_files, program_files_x86):
+            if base:
+                candidates.append(os.path.join(base, "astap", exe_name))
+        candidates.extend(
+            [
+                rf"C:\ASTAP\{exe_name}",
+                rf"C:\astap\{exe_name}",
+            ]
+        )
+    elif IS_MAC:
+        candidates.extend(
+            [
+                "/Applications/ASTAP.app",
+                "/Applications/ASTAP/astap",
+                "/Applications/ASTAP.app/Contents/MacOS/astap",
+                _home_path("Applications", "ASTAP.app"),
+                _home_path("Applications", "ASTAP.app", "Contents", "MacOS", "astap"),
+            ]
+        )
+    else:
+        candidates.extend(
+            [
+                f"/usr/bin/{exe_name}",
+                f"/usr/local/bin/{exe_name}",
+                f"/opt/astap/{exe_name}",
+                f"/opt/astap/bin/{exe_name}",
+                _home_path(".local", "bin", exe_name),
+                _home_path("astap", exe_name),
+            ]
+        )
+
+    # Allow PATH lookups as a last resort
+    candidates.append(exe_name)
+    return [c for c in candidates if c]
+
+
+def _candidate_astap_data_dirs(astap_exe_path: Optional[str]) -> List[str]:
+    candidates: list[str] = []
+    for env_key in ("ASTAP_DATA_DIR", "ASTAP_STAR_DB", "ASTAP_DATABASE"):
+        env_val = os.environ.get(env_key)
+        if env_val:
+            candidates.append(env_val)
+
+    if astap_exe_path:
+        exe_dir = os.path.dirname(astap_exe_path)
+        if exe_dir:
+            candidates.append(exe_dir)
+            candidates.append(os.path.join(exe_dir, "data"))
+            if IS_MAC:
+                # Bundle Resources folder
+                try:
+                    bundle_root = Path(astap_exe_path).resolve().parents[1]
+                    candidates.append(str(bundle_root / "Resources"))
+                except IndexError:
+                    pass
+
+    if IS_WINDOWS:
+        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
+        program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
+        for base in (program_files, program_files_x86):
+            if base:
+                candidates.append(os.path.join(base, "astap"))
+    elif IS_MAC:
+        candidates.extend(
+            [
+                "/Applications/ASTAP.app/Contents/Resources",
+                _home_path("Applications", "ASTAP.app", "Contents", "Resources"),
+                _home_path("Library", "Application Support", "ASTAP"),
+                "/Library/Application Support/ASTAP",
+            ]
+        )
+    else:
+        candidates.extend(
+            [
+                "/usr/share/astap",
+                "/usr/local/share/astap",
+                "/opt/astap",
+                "/opt/astap/share",
+                _home_path(".local", "share", "astap"),
+            ]
+        )
+    return [c for c in candidates if c]
+
+
+def _auto_find_astap_executable() -> Optional[str]:
+    seen: set[str] = set()
+    for candidate in _candidate_astap_binary_paths():
+        resolved = _resolve_astap_executable(candidate)
+        if resolved and resolved not in seen:
+            return resolved
+        if resolved:
+            seen.add(resolved)
+    return None
+
+
+def _auto_find_astap_data_dir(astap_exe_path: Optional[str]) -> Optional[str]:
+    seen: set[str] = set()
+    for candidate in _candidate_astap_data_dirs(astap_exe_path):
+        resolved = _resolve_astap_data_dir(candidate)
+        if resolved and resolved not in seen:
+            return resolved
+        if resolved:
+            seen.add(resolved)
+    return None
+
+
+def detect_astap_installation() -> Tuple[Optional[str], Optional[str]]:
+    """
+    Public helper for callers that need to inspect the auto-detected ASTAP paths.
+    Returns (exe_path, data_dir) when detection succeeds, or (None, None).
+    """
+    exe_path = _auto_find_astap_executable()
+    data_dir = _auto_find_astap_data_dir(exe_path)
+    return exe_path, data_dir
+
+
+def _apply_astap_platform_defaults(config: dict) -> bool:
+    """
+    Ensure ASTAP paths are usable on the current platform by auto-detecting
+    well-known installation locations when the config value is empty or invalid.
+    """
+    updated = False
+
+    current_exe = config.get("astap_executable_path", "")
+    resolved_exe = _resolve_astap_executable(current_exe)
+    if current_exe and not resolved_exe:
+        config["astap_executable_path"] = ""
+    if not resolved_exe:
+        resolved_exe = _auto_find_astap_executable()
+        if resolved_exe:
+            config["astap_executable_path"] = resolved_exe
+            updated = True
+    else:
+        config["astap_executable_path"] = resolved_exe
+
+    current_data = config.get("astap_data_directory_path", "")
+    resolved_data = _resolve_astap_data_dir(current_data)
+    if current_data and not resolved_data:
+        config["astap_data_directory_path"] = ""
+    if not resolved_data:
+        resolved_data = _auto_find_astap_data_dir(resolved_exe)
+        if resolved_data:
+            config["astap_data_directory_path"] = resolved_data
+            updated = True
+    else:
+        config["astap_data_directory_path"] = resolved_data
+
+    return updated
+
+
 def get_config_path():
     """
     Retourne le chemin du fichier de configuration.
@@ -152,6 +368,7 @@ def load_config():
         value = current_config.get(key)
         if isinstance(value, str) and value:
             current_config[key] = os.path.expanduser(value)
+    _apply_astap_platform_defaults(current_config)
     return current_config
 
 def save_config(config_data):
@@ -201,30 +418,77 @@ def save_config(config_data):
 # ... (vos fonctions ask_and_set_astap_path, etc.)
 
 def ask_and_set_astap_path(current_config):
-    """Demande à l'utilisateur le chemin de l'exécutable ASTAP et met à jour la config."""
+    """Prompt the user for the ASTAP executable in a cross-platform friendly way."""
+    if fd is None:
+        print("ASTAP path prompt unavailable (tkinter non installé).")
+        return current_config.get("astap_executable_path", "")
+
+    if IS_WINDOWS:
+        filetypes = (("Fichiers exécutables", "*.exe"), ("Tous les fichiers", "*.*"))
+    elif IS_MAC:
+        filetypes = (
+            ("Applications ASTAP", "*.app"),
+            ("Binaires", "astap"),
+            ("Tous les fichiers", "*"),
+        )
+    else:
+        filetypes = (("Binaires", "astap"), ("Tous les fichiers", "*"))
+
     astap_path = fd.askopenfilename(
         title="Sélectionner l'exécutable ASTAP",
-        filetypes=(("Fichiers exécutables", "*.exe"), ("Tous les fichiers", "*.*"))
+        filetypes=filetypes,
     )
-    if astap_path:
-        current_config["astap_executable_path"] = astap_path
-        if save_config(current_config):
-            mb.showinfo("Chemin ASTAP Défini", f"Chemin ASTAP défini à : {astap_path}", parent=None) # Spécifier parent si possible
-        return astap_path
-    return current_config.get("astap_executable_path", "")
+    if IS_MAC and not astap_path:
+        # Allow selecting the .app bundle if the binary is hidden.
+        astap_path = fd.askdirectory(title="Sélectionner l'application ASTAP (.app)")
+
+    resolved_path = _resolve_astap_executable(astap_path)
+    if not resolved_path:
+        if astap_path:
+            message = f"Le chemin sélectionné ne semble pas contenir l'exécutable ASTAP: {astap_path}"
+            if mb:
+                mb.showwarning("Chemin ASTAP invalide", message, parent=None)
+            else:
+                print(f"WARNING: {message}")
+        return current_config.get("astap_executable_path", "")
+
+    current_config["astap_executable_path"] = resolved_path
+    if save_config(current_config):
+        msg = f"Chemin ASTAP défini à : {resolved_path}"
+        if mb:
+            mb.showinfo("Chemin ASTAP Défini", msg, parent=None)
+        else:
+            print(msg)
+    return resolved_path
 
 
 def ask_and_set_astap_data_dir_path(current_config):
-    """Demande à l'utilisateur le chemin du dossier de données ASTAP et met à jour la config."""
+    """Prompt for the ASTAP star database directory."""
+    if fd is None:
+        print("ASTAP data directory prompt indisponible (tkinter non installé).")
+        return current_config.get("astap_data_directory_path", "")
+
     astap_data_dir = fd.askdirectory(
         title="Sélectionner le dossier de données ASTAP (contenant G17, H17, etc.)"
     )
-    if astap_data_dir:
-        current_config["astap_data_directory_path"] = astap_data_dir
-        if save_config(current_config):
-            mb.showinfo("Dossier Données ASTAP Défini", f"Dossier de données ASTAP défini à : {astap_data_dir}", parent=None)
-        return astap_data_dir
-    return current_config.get("astap_data_directory_path", "")
+    resolved_dir = _resolve_astap_data_dir(astap_data_dir)
+    if not resolved_dir:
+        if astap_data_dir:
+            message = f"Le dossier sélectionné n'existe pas ou ne contient pas les catalogues ASTAP: {astap_data_dir}"
+            if mb:
+                mb.showwarning("Dossier ASTAP invalide", message, parent=None)
+            else:
+                print(f"WARNING: {message}")
+        return current_config.get("astap_data_directory_path", "")
+
+    current_config["astap_data_directory_path"] = resolved_dir
+    if save_config(current_config):
+        msg = f"Dossier de données ASTAP défini à : {resolved_dir}"
+        if mb:
+            mb.showinfo("Dossier Données ASTAP Défini", msg, parent=None)
+        else:
+            print(msg)
+    return resolved_dir
 
 
 def get_astap_executable_path():

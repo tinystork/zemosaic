@@ -1,6 +1,6 @@
 {
-    "astap_executable_path": "C:/Program Files/astap/astap.exe",
-    "astap_data_directory_path": "C:/Program Files/astap",
+    "astap_executable_path": "C:\\Program Files\\astap\\astap.exe",
+    "astap_data_directory_path": "C:\\Program Files\\astap",
     "astap_default_search_radius": 3.0,
     "astap_default_downsample": 2,
     "astap_default_sensitivity": 100,
@@ -19,7 +19,7 @@
     "radial_shape_power": 2.0,
     "use_gpu_phase5": true,
     "gpu_id_phase5": null,
-    "gpu_selector": "NVIDIA GeForce MX150",
+    "gpu_selector": "CPU (no GPU)",
     "final_assembly_method": "reproject_coadd",
     "inter_master_merge_enable": false,
     "inter_master_overlap_threshold": 0.6,
