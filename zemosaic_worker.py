@@ -63,6 +63,10 @@ import uuid
 import multiprocessing
 import threading
 import itertools
+import platform
+import importlib.util
+from pathlib import Path
+from threading import Lock
 from dataclasses import dataclass
 from typing import Callable, Any, Iterable
 from types import SimpleNamespace
@@ -74,8 +78,134 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, FI
 # BrokenProcessPool moved under concurrent.futures.process in modern Python
 from concurrent.futures.process import BrokenProcessPool
 
+try:
+    from zemosaic_utils import EXCLUDED_DIRS, is_path_excluded
+except Exception:
+    EXCLUDED_DIRS = frozenset({"unaligned_by_zemosaic"})
+
+    def is_path_excluded(path, excluded_dirs=None):
+        import os
+
+        parts = set(os.path.normpath(str(path)).split(os.sep))
+        dirs = set(excluded_dirs) if excluded_dirs else set()
+        return any(d in parts for d in (dirs or {"unaligned_by_zemosaic"}))
+
+
+UNALIGNED_DIRNAME = "unaligned_by_zemosaic"
+_UNALIGNED_LOCK = Lock()
+
+
+def _move_to_unaligned_safe(
+    src_path: str | os.PathLike,
+    input_root: str | os.PathLike,
+    *,
+    logger: logging.Logger = logging.getLogger(__name__),
+) -> tuple[str, Path | None]:
+    """Thread-safe move helper for ``unaligned_by_zemosaic``.
+
+    Parameters
+    ----------
+    src_path : str | os.PathLike
+        Path to the source file that should be relocated.
+    input_root : str | os.PathLike
+        Root input directory that owns the ``unaligned`` folder.
+    logger : logging.Logger, optional
+        Logger instance used for diagnostics.
+
+    Returns
+    -------
+    tuple[str, Path | None]
+        ``(status, destination_path)`` where ``status`` is one of
+        ``{"moved", "skipped_excluded", "missing", "already_moved", "conflict", "failed"}``.
+        ``destination_path`` is provided when a target directory is known.
+    """
+
+    try:
+        src = Path(src_path).expanduser().resolve(strict=False)
+    except Exception:
+        src = Path(src_path)
+
+    try:
+        root = Path(input_root).expanduser().resolve(strict=False)
+    except Exception:
+        root = Path(input_root)
+
+    # Skip if the source is already part of an excluded directory
+    try:
+        if is_path_excluded(src, EXCLUDED_DIRS):
+            try:
+                logger.warning("Skip move: path already excluded: %s", src)
+            except Exception:
+                pass
+            return "skipped_excluded", None
+    except Exception:
+        if UNALIGNED_DIRNAME in set(src.parts):
+            try:
+                logger.warning("Skip move: path already excluded: %s", src)
+            except Exception:
+                pass
+            return "skipped_excluded", None
+
+    if not src.exists():
+        try:
+            logger.debug("Skip move: source missing (likely already moved): %s", src)
+        except Exception:
+            pass
+        return "missing", None
+
+    target_dir = root / UNALIGNED_DIRNAME
+
+    with _UNALIGNED_LOCK:
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            try:
+                logger.debug("Failed to ensure unaligned dir exists (%s): %s", target_dir, exc)
+            except Exception:
+                pass
+
+    dst = target_dir / src.name
+
+    try:
+        shutil.move(str(src), str(dst))
+        try:
+            logger.info("Moved to '%s': %s", UNALIGNED_DIRNAME, dst)
+        except Exception:
+            pass
+        return "moved", dst
+    except FileExistsError:
+        if not src.exists():
+            try:
+                logger.debug("Move raced (already exists), keeping destination: %s", dst)
+            except Exception:
+                pass
+            return "already_moved", dst
+        try:
+            logger.debug("Move skipped (destination exists): %s", dst)
+        except Exception:
+            pass
+        return "conflict", dst
+    except FileNotFoundError:
+        try:
+            logger.debug("Move skipped: source vanished before move: %s", src)
+        except Exception:
+            pass
+        return "already_moved", dst
+    except Exception as exc:
+        try:
+            logger.warning(
+                "Move to '%s' failed for %s: %s", UNALIGNED_DIRNAME, src, exc
+            )
+        except Exception:
+            pass
+        return "failed", dst
+
 # Nombre maximum de tentatives d'alignement avant abandon définitif
 MAX_ALIGNMENT_RETRY_ATTEMPTS = 3
+
+SYSTEM_NAME = platform.system().lower()
+IS_WINDOWS = SYSTEM_NAME == "windows"
+CUPY_AVAILABLE = importlib.util.find_spec("cupy") is not None and IS_WINDOWS
 
 
 def _ensure_hwc_master_tile(
@@ -375,6 +505,559 @@ def _compose_global_anchor_shift(
     result = composed
     nontrivial = any(abs(g - 1.0) > 1e-6 or abs(o) > 1e-6 for g, o in result) if result else False
     return result, nontrivial
+
+
+@dataclass
+class _InterMasterTile:
+    index: int
+    path: str
+    wcs: Any
+    shape_hw: tuple[int, int]
+    sky_corners: Any | None = None
+
+
+def _phase45_resolve_tile_shape(path: str | None, tile_wcs: Any) -> tuple[int, int] | None:
+    if path is None or not os.path.exists(path):
+        return None
+    if tile_wcs is not None and getattr(tile_wcs, "pixel_shape", None):
+        try:
+            px_shape = tile_wcs.pixel_shape
+            if px_shape and len(px_shape) >= 2:
+                h = int(px_shape[1])
+                w = int(px_shape[0])
+                if h > 0 and w > 0:
+                    return (h, w)
+        except Exception:
+            pass
+    try:
+        with fits.open(path, memmap=True, do_not_scale_image_data=True) as hdul:
+            data_shape = hdul[0].shape if hdul and hdul[0] is not None else None
+            if not data_shape:
+                return None
+            if len(data_shape) == 2:
+                return (int(data_shape[0]), int(data_shape[1]))
+            if len(data_shape) == 3:
+                return (int(data_shape[0]), int(data_shape[1]))
+    except Exception:
+        return None
+    return None
+
+
+def _phase45_tile_corners(tile: _InterMasterTile) -> Any | None:
+    if tile.sky_corners is not None:
+        return tile.sky_corners
+    if not (tile.wcs and tile.wcs.is_celestial and tile.shape_hw):
+        return None
+    try:
+        h, w = tile.shape_hw
+        # Use pixel-edge coordinates (-0.5 .. width-0.5) so the projected polygon
+        # matches the actual coverage footprint instead of pixel centres.
+        xs = np.asarray(
+            [-0.5, float(w) - 0.5, float(w) - 0.5, -0.5],
+            dtype=np.float64,
+        )
+        ys = np.asarray(
+            [-0.5, -0.5, float(h) - 0.5, float(h) - 0.5],
+            dtype=np.float64,
+        )
+        sky = tile.wcs.pixel_to_world(xs, ys)
+        tile.sky_corners = sky
+        return sky
+    except Exception:
+        return None
+
+
+def _phase45_project_polygon(corners: Any, reference: Any) -> np.ndarray | None:
+    if corners is None or reference is None:
+        return None
+    try:
+        offset_frame = reference.skyoffset_frame()
+        projected = corners.transform_to(offset_frame)
+        x = np.asarray(projected.lon.arcsec, dtype=np.float64)
+        y = np.asarray(projected.lat.arcsec, dtype=np.float64)
+        return np.stack([x, y], axis=1)
+    except Exception:
+        return None
+
+
+def _phase45_polygon_area(poly: np.ndarray | None) -> float:
+    if poly is None or len(poly) < 3:
+        return 0.0
+    x = poly[:, 0]
+    y = poly[:, 1]
+    return float(abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1))) * 0.5)
+
+
+def _phase45_clip_polygon(subject: np.ndarray, clipper: np.ndarray) -> np.ndarray:
+    if subject.size == 0 or clipper.size == 0:
+        return np.empty((0, 2), dtype=np.float64)
+
+    def _edge_intersection(p1, p2, q1, q2):
+        x1, y1 = p1
+        x2, y2 = p2
+        x3, y3 = q1
+        x4, y4 = q2
+        denom = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+        if abs(denom) < 1e-9:
+            return p2
+        num_x = (x1 * y2 - y1 * x2) * (x3 - x4) - (x1 - x2) * (x3 * y4 - y3 * x4)
+        num_y = (x1 * y2 - y1 * x2) * (y3 - y4) - (y1 - y2) * (x3 * y4 - y3 * x4)
+        return np.array([num_x / denom, num_y / denom], dtype=np.float64)
+
+    def _inside(point, edge_start, edge_end):
+        return (edge_end[0] - edge_start[0]) * (point[1] - edge_start[1]) - (edge_end[1] - edge_start[1]) * (point[0] - edge_start[0]) >= 0
+
+    output = subject
+    clip_points = clipper
+    for i in range(len(clip_points)):
+        next_output = []
+        a = clip_points[i]
+        b = clip_points[(i + 1) % len(clip_points)]
+        if not len(output):
+            break
+        prev = output[-1]
+        for curr in output:
+            if _inside(curr, a, b):
+                if not _inside(prev, a, b):
+                    next_output.append(_edge_intersection(prev, curr, a, b))
+                next_output.append(curr)
+            elif _inside(prev, a, b):
+                next_output.append(_edge_intersection(prev, curr, a, b))
+            prev = curr
+        output = np.asarray(next_output, dtype=np.float64)
+        if output.size == 0:
+            break
+    return output if output.size else np.empty((0, 2), dtype=np.float64)
+
+
+def _phase45_overlap_fraction(tile_a: _InterMasterTile, tile_b: _InterMasterTile) -> float:
+    if not (ASTROPY_AVAILABLE and SkyCoord and tile_a and tile_b):
+        return 0.0
+    sky_a = _phase45_tile_corners(tile_a)
+    sky_b = _phase45_tile_corners(tile_b)
+    if sky_a is None or sky_b is None:
+        return 0.0
+    try:
+        ra_all = np.concatenate([sky_a.ra.deg, sky_b.ra.deg])
+        dec_all = np.concatenate([sky_a.dec.deg, sky_b.dec.deg])
+        if ra_all.size == 0 or dec_all.size == 0:
+            return 0.0
+        center = SkyCoord(ra=np.nanmean(ra_all), dec=np.nanmean(dec_all), unit="deg")
+    except Exception:
+        return 0.0
+
+    poly_a = _phase45_project_polygon(sky_a, center)
+    poly_b = _phase45_project_polygon(sky_b, center)
+    if poly_a is None or poly_b is None or poly_a.size == 0 or poly_b.size == 0:
+        return 0.0
+    area_a = _phase45_polygon_area(poly_a)
+    area_b = _phase45_polygon_area(poly_b)
+    if area_a <= 0.0 or area_b <= 0.0:
+        return 0.0
+    intersection = _phase45_clip_polygon(poly_a, poly_b)
+    inter_area = _phase45_polygon_area(intersection)
+    if inter_area <= 0.0:
+        return 0.0
+    return float(inter_area / max(1e-9, min(area_a, area_b)))
+
+
+def _phase45_compute_cutout_wcs(final_wcs: Any, final_shape_hw: tuple[int, int] | None, tiles: list[_InterMasterTile]) -> tuple[Any | None, tuple[int, int] | None]:
+    if not (final_wcs and final_shape_hw and tiles):
+        return None, None
+    try:
+        wcs_copy = final_wcs.deepcopy() if hasattr(final_wcs, "deepcopy") else copy.deepcopy(final_wcs)
+    except Exception:
+        wcs_copy = copy.deepcopy(final_wcs)
+    if wcs_copy is None:
+        return None, None
+    height, width = int(final_shape_hw[0]), int(final_shape_hw[1])
+    edge_min_x = float("inf")
+    edge_min_y = float("inf")
+    edge_max_x = float("-inf")
+    edge_max_y = float("-inf")
+    valid = False
+    for tile in tiles:
+        sky = _phase45_tile_corners(tile)
+        if sky is None:
+            continue
+        try:
+            px, py = wcs_copy.world_to_pixel(sky)
+            if px is None or py is None:
+                continue
+            px = np.asarray(px, dtype=np.float64)
+            py = np.asarray(py, dtype=np.float64)
+        except Exception:
+            continue
+        if px.size == 0 or py.size == 0:
+            continue
+        edge_min_x = min(edge_min_x, float(np.nanmin(px)))
+        edge_min_y = min(edge_min_y, float(np.nanmin(py)))
+        edge_max_x = max(edge_max_x, float(np.nanmax(px)))
+        edge_max_y = max(edge_max_y, float(np.nanmax(py)))
+        valid = True
+    if not valid:
+        return None, None
+    # Convert edge coordinates (relative to pixel boundaries) into integer pixel
+    # indices that map to the same mosaic grid as the final WCS.
+    start_x = max(0, int(math.floor(edge_min_x + 0.5)))
+    start_y = max(0, int(math.floor(edge_min_y + 0.5)))
+    stop_x = min(width, int(math.ceil(edge_max_x - 0.5)) + 1)
+    stop_y = min(height, int(math.ceil(edge_max_y - 0.5)) + 1)
+    if stop_x <= start_x:
+        stop_x = min(width, start_x + 1)
+    if stop_y <= start_y:
+        stop_y = min(height, start_y + 1)
+    local_w = max(1, int(stop_x - start_x))
+    local_h = max(1, int(stop_y - start_y))
+    try:
+        if hasattr(wcs_copy, "wcs") and hasattr(wcs_copy.wcs, "crpix"):
+            wcs_copy.wcs.crpix[0] -= start_x
+            wcs_copy.wcs.crpix[1] -= start_y
+        if hasattr(wcs_copy, "array_shape"):
+            wcs_copy.array_shape = (local_h, local_w)
+    except Exception:
+        pass
+    return wcs_copy, (local_h, local_w)
+
+
+def _phase45_allocate_stack_storage(
+    count: int,
+    shape_hw: tuple[int, int],
+    channels: int,
+    policy: str,
+    temp_dir: str | None,
+) -> tuple[np.ndarray, str | None]:
+    dtype = np.float32
+    h, w = shape_hw
+    policy_norm = str(policy or "auto").lower()
+    use_memmap = False
+    if policy_norm == "always":
+        use_memmap = True
+    elif policy_norm == "auto":
+        estimated_bytes = count * h * w * channels * np.dtype(dtype).itemsize
+        use_memmap = estimated_bytes > (256 * 1024 * 1024)
+    if not use_memmap:
+        return np.full((count, h, w, channels), np.nan, dtype=dtype), None
+    directory = temp_dir or tempfile.gettempdir()
+    os.makedirs(directory, exist_ok=True)
+    file_path = os.path.join(directory, f"phase45_stack_{uuid.uuid4().hex}.dat")
+    storage = np.memmap(file_path, dtype=dtype, mode="w+", shape=(count, h, w, channels))
+    storage[:] = np.nan
+    return storage, file_path
+
+
+def _phase45_cleanup_storage(storage: np.ndarray | None, memmap_path: str | None) -> None:
+    try:
+        if isinstance(storage, np.memmap):
+            storage.flush()
+    except Exception:
+        pass
+    if memmap_path and os.path.exists(memmap_path):
+        try:
+            os.remove(memmap_path)
+        except Exception:
+            pass
+
+
+def _run_phase4_5_inter_master_merge(
+    master_tiles: list[tuple[str | None, Any]],
+    final_output_wcs: Any,
+    final_output_shape_hw: tuple[int, int] | None,
+    temp_storage_dir: str | None,
+    output_folder: str,
+    cache_retention_mode: str,
+    inter_cfg: dict,
+    stack_cfg: dict,
+    progress_callback: Callable | None,
+    pcb: Callable[..., None],
+) -> list[tuple[str | None, Any]]:
+    enable = bool(inter_cfg.get("enable", False))
+    if not enable:
+        return master_tiles
+    if len(master_tiles) < 2:
+        return master_tiles
+    if not (ASTROPY_AVAILABLE and REPROJECT_AVAILABLE and ZEMOSAIC_UTILS_AVAILABLE and ZEMOSAIC_ALIGN_STACK_AVAILABLE and reproject_interp):
+        pcb("p45_finished", prog=None, lvl="INFO_DETAIL", tiles_in=len(master_tiles), tiles_out=len(master_tiles))
+        return master_tiles
+
+    threshold = float(inter_cfg.get("overlap_threshold", 0.60))
+    threshold = max(0.0, min(1.0, threshold))
+    min_group = max(2, int(inter_cfg.get("min_group_size", 2)))
+    max_group = max(min_group, int(inter_cfg.get("max_group", 64)))
+    method = str(inter_cfg.get("stack_method", "winsor")).lower()
+    if method not in {"winsor", "mean", "median"}:
+        method = "winsor"
+    memmap_policy = str(inter_cfg.get("memmap_policy", "auto")).lower()
+    local_scale = str(inter_cfg.get("local_scale", "final")).lower()
+    if local_scale not in {"final", "native"}:
+        local_scale = "final"
+
+    pcb("p45_start", prog=None, lvl="INFO")
+
+    tiles: list[_InterMasterTile] = []
+    for idx, (path, wcs_obj) in enumerate(master_tiles):
+        shape_hw = _phase45_resolve_tile_shape(path, wcs_obj)
+        if not shape_hw:
+            continue
+        tiles.append(_InterMasterTile(index=idx, path=path, wcs=wcs_obj, shape_hw=shape_hw))
+
+    if len(tiles) < min_group:
+        pcb("p45_finished", prog=None, lvl="INFO_DETAIL", tiles_in=len(master_tiles), tiles_out=len(master_tiles))
+        return master_tiles
+
+    tile_map = {tile.index: tile for tile in tiles}
+    adjacency: dict[int, set[int]] = {tile.index: set() for tile in tiles}
+    for i, tile_a in enumerate(tiles):
+        for tile_b in tiles[i + 1 :]:
+            overlap = _phase45_overlap_fraction(tile_a, tile_b)
+            if overlap >= threshold:
+                adjacency[tile_a.index].add(tile_b.index)
+                adjacency[tile_b.index].add(tile_a.index)
+
+    visited: set[int] = set()
+    groups: list[list[int]] = []
+    for tile in tiles:
+        if tile.index in visited:
+            continue
+        stack = [tile.index]
+        component: list[int] = []
+        while stack:
+            node = stack.pop()
+            if node in visited:
+                continue
+            visited.add(node)
+            component.append(node)
+            stack.extend(adjacency.get(node, ()))
+        if len(component) >= min_group:
+            groups.append(sorted(component))
+
+    if not groups:
+        pcb("p45_finished", prog=None, lvl="INFO_DETAIL", tiles_in=len(master_tiles), tiles_out=len(master_tiles))
+        return master_tiles
+
+    total_chunks = sum(max(1, math.ceil(len(group) / max_group)) for group in groups)
+    processed_chunks = 0
+    replacements: dict[int, tuple[str | None, Any]] = {}
+    consumed_indices: set[int] = set()
+    cleanup_paths: list[str] = []
+
+    for group_id, group_indices in enumerate(groups, start=1):
+        members = [tile_map[idx] for idx in group_indices if idx in tile_map]
+        if not members:
+            continue
+        pcb("p45_group_info", prog=None, lvl="DEBUG", group=group_id, total=len(groups), members=len(members))
+        for chunk_start in range(0, len(members), max_group):
+            chunk_tiles = members[chunk_start : chunk_start + max_group]
+            processed_chunks += 1
+            if progress_callback:
+                try:
+                    progress_callback("phase4_5", processed_chunks, total_chunks)
+                except Exception:
+                    pass
+
+            reference_tile = chunk_tiles[0]
+            if local_scale == "final" and final_output_wcs and final_output_shape_hw:
+                local_wcs, local_shape = _phase45_compute_cutout_wcs(final_output_wcs, final_output_shape_hw, chunk_tiles)
+                if local_wcs is None or local_shape is None:
+                    local_wcs = reference_tile.wcs
+                    local_shape = reference_tile.shape_hw
+            else:
+                local_wcs = reference_tile.wcs
+                local_shape = reference_tile.shape_hw
+
+            if not (local_wcs and local_shape):
+                continue
+
+            storage = None
+            memmap_path = None
+            success = True
+            frames: list[np.ndarray] = []
+            channels = 3
+            preloaded: dict[int, np.ndarray] = {}
+            try:
+                with fits.open(chunk_tiles[0].path, memmap=True, do_not_scale_image_data=True) as hdul_sample:
+                    first_arr = _ensure_hwc_master_tile(hdul_sample[0].data, os.path.basename(chunk_tiles[0].path))
+                channels = int(first_arr.shape[-1]) if first_arr.ndim == 3 else 1
+                if channels <= 0:
+                    channels = 1
+                if channels not in (1, 3):
+                    channels = min(3, max(1, channels))
+                    if first_arr.shape[-1] != channels:
+                        first_arr = first_arr[..., :channels]
+                preloaded[chunk_tiles[0].index] = first_arr.astype(np.float32, copy=False)
+            except Exception:
+                success = False
+                channels = 3
+            if not success:
+                continue
+            try:
+                storage, memmap_path = _phase45_allocate_stack_storage(len(chunk_tiles), local_shape, channels, memmap_policy, temp_storage_dir)
+                for idx_tile, tile in enumerate(chunk_tiles):
+                    if tile.index in preloaded:
+                        arr = preloaded.pop(tile.index)
+                    else:
+                        with fits.open(tile.path, memmap=True, do_not_scale_image_data=True) as hdul:
+                            arr = _ensure_hwc_master_tile(hdul[0].data, os.path.basename(tile.path))
+                            arr = np.asarray(arr, dtype=np.float32)
+                    if arr.ndim == 2:
+                        arr = arr[..., np.newaxis]
+                    if arr.shape[-1] != channels:
+                        if channels == 3 and arr.shape[-1] == 1:
+                            arr = np.repeat(arr, 3, axis=-1)
+                        elif channels == 1:
+                            arr = arr[..., :1]
+                        else:
+                            arr = np.repeat(arr[..., :1], channels, axis=-1)
+                    arr = np.asarray(arr, dtype=np.float32, copy=False)
+                    reproj = np.full((local_shape[0], local_shape[1], channels), np.nan, dtype=np.float32)
+                    for ch in range(channels):
+                        plane = arr[..., ch]
+                        reproj_plane, footprint = reproject_interp((plane, tile.wcs), local_wcs, shape_out=(local_shape[0], local_shape[1]))
+                        if reproj_plane is None:
+                            success = False
+                            break
+                        reproj_plane = np.asarray(reproj_plane, dtype=np.float32)
+                        if footprint is not None:
+                            mask = np.asarray(footprint) <= 0.0
+                            if mask.shape == reproj_plane.shape:
+                                reproj_plane[mask] = np.nan
+                        reproj[..., ch] = reproj_plane
+                    if not success:
+                        break
+                    storage[idx_tile, :, :, :] = reproj
+                    frames.append(storage[idx_tile])
+                if not success or not frames:
+                    success = False
+            except Exception:
+                success = False
+
+            if not success:
+                _phase45_cleanup_storage(storage, memmap_path)
+                continue
+
+            try:
+                kappa_val = float(stack_cfg.get("kappa_low", 3.0))
+            except Exception:
+                kappa_val = 3.0
+            limits_val = stack_cfg.get("winsor_limits", (0.05, 0.05))
+            try:
+                limits_val = (
+                    float(limits_val[0]),
+                    float(limits_val[1]),
+                )
+            except Exception:
+                limits_val = (0.05, 0.05)
+            try:
+                max_pass_val = int(stack_cfg.get("winsor_max_frames_per_pass", 0))
+            except Exception:
+                max_pass_val = 0
+            try:
+                worker_limit_val = int(stack_cfg.get("winsor_worker_limit", 1))
+            except Exception:
+                worker_limit_val = 1
+            stack_kwargs = {
+                "kappa": kappa_val,
+                "winsor_limits": limits_val,
+                "winsor_max_frames_per_pass": max_pass_val,
+                "winsor_max_workers": max(1, worker_limit_val),
+            }
+            try:
+                if method == "winsor":
+                    super_arr, _ = zemosaic_align_stack.stack_winsorized_sigma_clip(
+                        frames,
+                        weight_method="none",
+                        zconfig=None,
+                        **stack_kwargs,
+                    )
+                elif method == "median":
+                    super_arr = np.nanmedian(np.stack(frames, axis=0), axis=0).astype(np.float32)
+                else:
+                    super_arr = np.nanmean(np.stack(frames, axis=0), axis=0).astype(np.float32)
+            except Exception:
+                _phase45_cleanup_storage(storage, memmap_path)
+                continue
+
+            _phase45_cleanup_storage(storage, memmap_path)
+
+            if super_arr is None:
+                continue
+
+            super_arr = np.asarray(super_arr, dtype=np.float32)
+            representative_idx = min(tile.index for tile in chunk_tiles)
+            consumed_indices.update(tile.index for tile in chunk_tiles)
+
+            target_dir = temp_storage_dir or output_folder
+            os.makedirs(target_dir, exist_ok=True)
+            super_filename = f"super_tile_{representative_idx:03d}_{uuid.uuid4().hex[:8]}.fits"
+            super_path = os.path.join(target_dir, super_filename)
+
+            header = fits.Header()
+            try:
+                header.update(local_wcs.to_header(relax=True))
+            except Exception:
+                pass
+            try:
+                header["ZMT_TYPE"] = ("Super Tile", "Inter-Master merged tile")
+                header["ZMT_SUPR"] = (len(chunk_tiles), "Tiles merged in Phase 4.5")
+            except Exception:
+                pass
+            try:
+                header.add_history(f"Inter-Master merge ({len(chunk_tiles)} tiles)")
+            except Exception:
+                header["HISTORY"] = f"Inter-Master merge ({len(chunk_tiles)} tiles)"
+
+            try:
+                zemosaic_utils.save_fits_image(
+                    image_data=super_arr,
+                    output_path=super_path,
+                    header=header,
+                    overwrite=True,
+                    save_as_float=True,
+                    axis_order="HWC" if super_arr.ndim == 3 else None,
+                )
+            except Exception:
+                try:
+                    fits.writeto(super_path, super_arr.astype(np.float32), header=header, overwrite=True)
+                except Exception:
+                    continue
+
+            replacements[representative_idx] = (super_path, local_wcs)
+            cleanup_paths.extend(tile.path for tile in chunk_tiles if tile.path)
+
+            snr_gain = math.sqrt(len(chunk_tiles))
+            pcb(
+                "p45_group_result",
+                prog=None,
+                lvl="INFO_DETAIL",
+                size=len(chunk_tiles),
+                out=os.path.basename(super_path),
+                snr=f"{snr_gain:.2f}",
+            )
+
+    if cache_retention_mode != "keep":
+        for path in cleanup_paths:
+            if not path or not os.path.exists(path):
+                continue
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+    new_master_tiles: list[tuple[str | None, Any]] = []
+    for idx, original in enumerate(master_tiles):
+        if idx in replacements:
+            new_master_tiles.append(replacements[idx])
+        elif idx not in consumed_indices:
+            new_master_tiles.append(original)
+
+    pcb(
+        "p45_finished",
+        prog=None,
+        lvl="INFO",
+        tiles_in=len(master_tiles),
+        tiles_out=len(new_master_tiles),
+    )
+    return new_master_tiles if new_master_tiles else master_tiles
 
 
 def _select_quality_anchor(
@@ -2086,9 +2769,7 @@ def _probe_system_resources(
 
     # GPU detection via CuPy first, then torch
     try:
-        import importlib
-
-        if importlib.util.find_spec("cupy") is not None:
+        if CUPY_AVAILABLE:
             import cupy  # type: ignore
 
             try:
@@ -2874,7 +3555,7 @@ def _categorize_io_speed(mbps: float | None) -> str:
 
 def gpu_is_available() -> bool:
     """Return True if CuPy and a CUDA device are available."""
-    if importlib.util.find_spec("cupy") is None:
+    if not CUPY_AVAILABLE:
         return False
     try:
         import cupy
@@ -3806,8 +4487,48 @@ def get_wcs_and_pretreat_raw_file(
     _pcb_local = lambda msg_key, lvl="DEBUG", **kwargs: \
         progress_callback(msg_key, None, lvl, **kwargs) if progress_callback else print(f"GETWCS_LOG {lvl}: {msg_key} {kwargs}")
 
+    try:
+        if is_path_excluded(file_path, EXCLUDED_DIRS):
+            logger.debug("Skip excluded path: %s", file_path)
+            return None, None, None, None
+    except Exception:
+        if UNALIGNED_DIRNAME in os.path.normpath(file_path).split(os.sep):
+            logger.debug("Skip excluded path: %s", file_path)
+            return None, None, None, None
+
     if solver_settings is None:
         solver_settings = {}
+    elif not isinstance(solver_settings, dict):
+        try:
+            solver_settings = dict(solver_settings)
+        except Exception:
+            solver_settings = getattr(solver_settings, "__dict__", {}) or {}
+            if not isinstance(solver_settings, dict):
+                solver_settings = {}
+
+    header_precheck = None
+    preexisting_wcs_flag = False
+    preexisting_wcs_failure_reason = None
+    if ASTROPY_AVAILABLE and fits is not None:
+        try:
+            with fits.open(file_path, mode="readonly", memmap=False) as hdul_hdr:
+                header_precheck = hdul_hdr[0].header.copy()
+        except Exception:
+            header_precheck = None
+        else:
+            if hasattr(zemosaic_utils, "validate_wcs_header"):
+                try:
+                    preexisting_wcs_flag, _, failure_reason = zemosaic_utils.validate_wcs_header(header_precheck)
+                except Exception as exc_validate:
+                    preexisting_wcs_flag = False
+                    failure_reason = f"validate_exception: {exc_validate}"
+                if not preexisting_wcs_flag:
+                    preexisting_wcs_failure_reason = failure_reason
+            elif hasattr(zemosaic_utils, "has_valid_wcs"):
+                try:
+                    preexisting_wcs_flag = bool(zemosaic_utils.has_valid_wcs(header_precheck))
+                except Exception:
+                    preexisting_wcs_flag = False
 
     # Charger configuration pour options de prétraitement (si disponible)
     _cfg_pre = {}
@@ -3818,6 +4539,26 @@ def get_wcs_and_pretreat_raw_file(
         _cfg_pre = {}
     _bg_gpu_enabled = bool(_cfg_pre.get("preprocess_remove_background_gpu", False))
     _bg_sigma = float(_cfg_pre.get("preprocess_background_sigma", 24.0))
+    force_resolve_existing_wcs_cfg = bool(_cfg_pre.get("force_resolve_existing_wcs", False))
+    force_resolve_existing_wcs = bool(
+        solver_settings.get("force_resolve_existing_wcs", force_resolve_existing_wcs_cfg)
+    )
+    try:
+        affine_offset_limit_adu = float(solver_settings.get("intertile_offset_limit_adu", 50.0))
+    except Exception:
+        affine_offset_limit_adu = 50.0
+    affine_offset_limit_adu = max(0.0, abs(affine_offset_limit_adu))
+    gain_limits_cfg = solver_settings.get("intertile_gain_limits")
+    if isinstance(gain_limits_cfg, (list, tuple)) and len(gain_limits_cfg) == 2:
+        try:
+            gain_limit_min = float(gain_limits_cfg[0])
+            gain_limit_max = float(gain_limits_cfg[1])
+        except Exception:
+            gain_limit_min, gain_limit_max = 0.75, 1.25
+    else:
+        gain_limit_min, gain_limit_max = 0.75, 1.25
+    if gain_limit_min > gain_limit_max:
+        gain_limit_min, gain_limit_max = gain_limit_max, gain_limit_min
 
     _pcb_local(f"GetWCS_Pretreat: Début pour '{filename}'.", lvl="DEBUG_DETAIL") # Niveau DEBUG_DETAIL pour être moins verbeux
 
@@ -3839,6 +4580,12 @@ def get_wcs_and_pretreat_raw_file(
     else:
         img_data_raw_adu = res_load
         header_orig = None
+
+    if header_orig is None and header_precheck is not None:
+        try:
+            header_orig = header_precheck.copy()
+        except Exception:
+            header_orig = copy.deepcopy(header_precheck)
 
     if img_data_raw_adu is None or header_orig is None:
         _pcb_local("getwcs_error_load_failed", lvl="ERROR", filename=filename)
@@ -3950,20 +4697,87 @@ def get_wcs_and_pretreat_raw_file(
     except Exception:
         pass
 
+    header_for_wcs_check = header_orig if header_orig is not None else header_precheck
+    skip_solver_due_to_existing_wcs = False
+    wcs_validation_reason = None
+    preexisting_wcs_obj = None
+    if header_for_wcs_check is not None and hasattr(zemosaic_utils, "validate_wcs_header"):
+        try:
+            valid_wcs, candidate_wcs, failure_reason = zemosaic_utils.validate_wcs_header(header_for_wcs_check)
+        except Exception as exc_validate_hdr:
+            valid_wcs, candidate_wcs, failure_reason = False, None, f"validate_exception: {exc_validate_hdr}"
+        skip_solver_due_to_existing_wcs = bool(valid_wcs)
+        if skip_solver_due_to_existing_wcs:
+            preexisting_wcs_obj = candidate_wcs
+        else:
+            wcs_validation_reason = failure_reason
+    elif header_for_wcs_check is not None and hasattr(zemosaic_utils, "has_valid_wcs"):
+        try:
+            skip_solver_due_to_existing_wcs = bool(zemosaic_utils.has_valid_wcs(header_for_wcs_check))
+        except Exception:
+            skip_solver_due_to_existing_wcs = bool(preexisting_wcs_flag)
+    else:
+        skip_solver_due_to_existing_wcs = bool(preexisting_wcs_flag)
+
+    if skip_solver_due_to_existing_wcs and preexisting_wcs_obj is None and header_for_wcs_check is not None and ASTROPY_AVAILABLE and WCS:
+        try:
+            candidate_wcs_hdr = WCS(header_for_wcs_check, naxis=2, relax=True)
+            if getattr(candidate_wcs_hdr, "is_celestial", False):
+                preexisting_wcs_obj = candidate_wcs_hdr
+            else:
+                skip_solver_due_to_existing_wcs = False
+                if wcs_validation_reason is None:
+                    wcs_validation_reason = "wcs_not_celestial"
+        except Exception as e_wcs_hdr:
+            skip_solver_due_to_existing_wcs = False
+            if wcs_validation_reason is None:
+                wcs_validation_reason = f"astropy_wcs_exception: {e_wcs_hdr}"
+            _pcb_local("getwcs_warn_header_wcs_read_failed", lvl="WARN", filename=filename, error=str(e_wcs_hdr))
+            logger.warning("Existing WCS header invalid for '%s': %s", filename, e_wcs_hdr)
+
+    if not skip_solver_due_to_existing_wcs and wcs_validation_reason is None:
+        wcs_validation_reason = preexisting_wcs_failure_reason
+
+    if force_resolve_existing_wcs and skip_solver_due_to_existing_wcs:
+        _pcb_local(
+            "getwcs_info_force_resolve_existing_wcs",
+            lvl="INFO",
+            filename=filename,
+        )
+        logger.info("Force resolving existing WCS for '%s' due to configuration override.", filename)
+        skip_solver_due_to_existing_wcs = False
+        preexisting_wcs_obj = None
+
+    if not skip_solver_due_to_existing_wcs and wcs_validation_reason:
+        _pcb_local(
+            "getwcs_info_existing_wcs_rejected",
+            lvl="WARN",
+            filename=filename,
+            reason=wcs_validation_reason,
+        )
+        logger.warning("Existing WCS for '%s' rejected: %s", filename, wcs_validation_reason)
+
     # --- Résolution WCS ---
     _pcb_local(f"  Résolution WCS pour '{filename}'...", lvl="DEBUG_DETAIL")
-    wcs_brute = None
+    wcs_brute = preexisting_wcs_obj if preexisting_wcs_obj is not None else None
     # Évite d'écrire le header FITS si le WCS est déjà présent dans le fichier d'origine.
     # Nous ne réécrivons le header que si un solver externe (ASTAP/ASTROMETRY/ANSVR)
     # a effectivement injecté/ajusté des clés WCS dans header_orig.
     should_write_header_back = False
-    if ASTROPY_AVAILABLE and WCS: # S'assurer que WCS est bien l'objet d'Astropy
+    if preexisting_wcs_obj is not None:
+        skip_msg = f"Skip WCS solve for '{filename}' (WCS present)."
+        _pcb_local(skip_msg, lvl="INFO")
+        logger.info(skip_msg)
+    if wcs_brute is None and ASTROPY_AVAILABLE and WCS: # S'assurer que WCS est bien l'objet d'Astropy
         try:
             wcs_from_header = WCS(header_orig, naxis=2, relax=True) # Utiliser WCS d'Astropy
             if wcs_from_header.is_celestial and hasattr(wcs_from_header.wcs,'crval') and \
                (hasattr(wcs_from_header.wcs,'cdelt') or hasattr(wcs_from_header.wcs,'cd') or hasattr(wcs_from_header.wcs,'pc')):
                 wcs_brute = wcs_from_header
                 _pcb_local(f"    WCS trouvé dans header FITS de '{filename}'.", lvl="DEBUG_DETAIL")
+                skip_msg = f"Skip WCS solve for '{filename}' (WCS present)."
+                _pcb_local(skip_msg, lvl="INFO")
+                logger.info(skip_msg)
                 # WCS déjà présent => pas besoin de réécrire le header
                 should_write_header_back = False
         except Exception as e_wcs_hdr:
@@ -4095,32 +4909,36 @@ def get_wcs_and_pretreat_raw_file(
 
     # Si on arrive ici, c'est que wcs_brute est None ou non céleste
     _pcb_local("getwcs_action_moving_unsolved_file", lvl="WARN", filename=filename)
-    try:
-        original_file_dir = os.path.dirname(file_path)
-        unaligned_dir_name = "unaligned_by_zemosaic"
-        unaligned_path = os.path.join(original_file_dir, unaligned_dir_name)
-        
-        if not os.path.exists(unaligned_path):
-            os.makedirs(unaligned_path)
-            _pcb_local(f"  Création dossier: '{unaligned_path}'", lvl="INFO_DETAIL")
-        
-        destination_path = os.path.join(unaligned_path, filename)
-        
-        if os.path.exists(destination_path):
-            base, ext = os.path.splitext(filename)
-            timestamp_suffix = time.strftime("_%Y%m%d%H%M%S")
-            destination_path = os.path.join(unaligned_path, f"{base}{timestamp_suffix}{ext}")
-            _pcb_local(f"  Fichier de destination '{filename}' existe déjà. Renommage en '{os.path.basename(destination_path)}'", lvl="DEBUG_DETAIL")
+    status, destination_path = _move_to_unaligned_safe(
+        file_path,
+        os.path.dirname(file_path),
+        logger=logger,
+    )
 
-        shutil.move(file_path, destination_path) # shutil.move écrase si la destination existe et est un fichier
-                                                  # mais notre renommage ci-dessus gère le cas.
-        _pcb_local(f"  Fichier '{filename}' déplacé vers '{unaligned_path}'.", lvl="INFO")
+    if status == "moved" and destination_path is not None:
+        _pcb_local(
+            f"  Fichier '{filename}' déplacé vers '{destination_path.parent}'.",
+            lvl="INFO",
+        )
+    elif status in {"already_moved", "missing"}:
+        _pcb_local(
+            f"  Fichier '{filename}' déjà déplacé ou introuvable (course détectée).",
+            lvl="DEBUG_DETAIL",
+        )
+    elif status == "skipped_excluded":
+        _pcb_local(
+            f"  Fichier '{filename}' déjà dans un dossier exclu, déplacement ignoré.",
+            lvl="WARN",
+        )
+    elif status in {"conflict", "failed"}:
+        _pcb_local(
+            "getwcs_error_moving_unaligned_file",
+            lvl="ERROR",
+            filename=filename,
+            error=f"status={status}",
+        )
 
-    except Exception as e_move:
-        _pcb_local(f"getwcs_error_moving_unaligned_file", lvl="ERROR", filename=filename, error=str(e_move))
-        logger.error(f"Erreur déplacement fichier {filename} vers dossier unaligned:", exc_info=True)
-            
-    if img_data_processed_adu is not None: del img_data_processed_adu 
+    if img_data_processed_adu is not None: del img_data_processed_adu
     gc.collect()
     return None, None, None, None
 
@@ -4318,13 +5136,12 @@ def create_master_tile(
                          shape=img_data_adu.shape if hasattr(img_data_adu, 'shape') else 'N/A', 
                          dtype=img_data_adu.dtype if hasattr(img_data_adu, 'dtype') else 'N/A', tile_id=tile_id)
                 del img_data_adu; gc.collect(); continue
-            # Ensure writable, C-contiguous buffers (astroalign may require writeable arrays)
+            # Assurer des buffers C-contigus ET écriturables pour l'aligneur
+            # (les memmaps en lecture seule peuvent provoquer des échecs silencieux)
             try:
-                # Avoid forcing writable copies; astroalign does not modify input arrays.
-                # Only ensure contiguity if needed.
-                if not getattr(img_data_adu, 'flags', None) or (not img_data_adu.flags.c_contiguous):
-                    img_data_adu = np.ascontiguousarray(img_data_adu, dtype=np.float32)
+                img_data_adu = np.array(img_data_adu, dtype=np.float32, order='C', copy=True)
             except Exception:
+                # En cas d'exception, forcer une copie contiguë
                 img_data_adu = np.ascontiguousarray(img_data_adu, dtype=np.float32)
             
             tile_images_data_HWC_adu.append(img_data_adu)
@@ -4354,7 +5171,7 @@ def create_master_tile(
         return (None, None), failed_groups_to_retry
     # pcb_tile(f"{func_id_log_base}_info_loading_from_cache_finished", prog=None, lvl="DEBUG_DETAIL", num_loaded=len(tile_images_data_HWC_adu), tile_id=tile_id)
 
-    # pcb_tile(f"{func_id_log_base}_info_intra_tile_alignment_started", prog=None, lvl="DEBUG_DETAIL", num_to_align=len(tile_images_data_HWC_adu), tile_id=tile_id)
+    pcb_tile(f"{func_id_log_base}_info_intra_tile_alignment_started", prog=None, lvl="DEBUG_DETAIL", num_to_align=len(tile_images_data_HWC_adu), tile_id=tile_id)
     # Limit concurrency during alignment/stacking as well to reduce peak RAM
     try:
         _PH3_CONCURRENCY_SEMAPHORE.acquire()
@@ -4390,7 +5207,7 @@ def create_master_tile(
         del aligned_images_for_stack # Libérer la liste originale après filtrage
 
     num_actually_aligned_for_header = len(valid_aligned_images)
-    # pcb_tile(f"{func_id_log_base}_info_intra_tile_alignment_finished", prog=None, lvl="DEBUG_DETAIL", num_aligned=num_actually_aligned_for_header, tile_id=tile_id)
+    pcb_tile(f"{func_id_log_base}_info_intra_tile_alignment_finished", prog=None, lvl="DEBUG_DETAIL", num_aligned=num_actually_aligned_for_header, tile_id=tile_id)
     
     if not valid_aligned_images: 
         pcb_tile(f"{func_id_log_base}_error_no_images_after_alignment", prog=None, lvl="ERROR", tile_id=tile_id)
@@ -4650,6 +5467,15 @@ def create_master_tile(
                     elif wcs_cropped is not None:
                         wcs_for_master_tile = wcs_cropped
 
+                    if wcs_for_master_tile is wcs_cropped and hasattr(wcs_cropped, "pixel_shape"):
+                        try:
+                            new_h, new_w = master_tile_stacked_HWC.shape[:2]
+                            wcs_cropped.pixel_shape = (new_w, new_h)
+                            if hasattr(wcs_cropped, "array_shape"):
+                                wcs_cropped.array_shape = (new_h, new_w)
+                        except Exception:
+                            pass
+
                 pcb_tile(
                     f"MT_CROP: quality-based rect={quality_crop_rect} (band={band_px}, k={k_sigma:.2f}, margin={margin_px})",
                     prog=None,
@@ -4767,13 +5593,6 @@ def create_master_tile(
             header_mt_save['EXPTOTAL']=(round(total_exposure_tile,2),'[s] Sum of EXPTIME for this tile')
             header_mt_save['NEXP_SUM']=(num_exposure_summed,'Number of exposures summed for EXPTOTAL')
 
-
-        if quality_crop_rect and "CRPIX1" in header_mt_save and "CRPIX2" in header_mt_save:
-            try:
-                header_mt_save["CRPIX1"] = header_mt_save.get("CRPIX1", 0.0) - quality_crop_rect[1]
-                header_mt_save["CRPIX2"] = header_mt_save.get("CRPIX2", 0.0) - quality_crop_rect[0]
-            except Exception:
-                pass
 
         if quality_crop_rect:
             header_mt_save['ZMT_QCRO'] = (True, 'Quality-based crop applied')
@@ -5735,10 +6554,38 @@ def assemble_final_mosaic_reproject_coadd(
                     continue
                 try:
                     arr_np = np.asarray(arr, dtype=np.float32, order="C")
-                    if gain_val != 1.0:
-                        np.multiply(arr_np, float(gain_val), out=arr_np, casting="unsafe")
-                    if offset_val != 0.0:
-                        np.add(arr_np, float(offset_val), out=arr_np, casting="unsafe")
+                    gain_to_apply = float(gain_val)
+                    offset_to_apply = float(offset_val)
+                    if match_bg:
+                        gain_before = gain_to_apply
+                        offset_before = offset_to_apply
+                        if gain_to_apply < gain_limit_min:
+                            gain_to_apply = gain_limit_min
+                        elif gain_to_apply > gain_limit_max:
+                            gain_to_apply = gain_limit_max
+                        if affine_offset_limit_adu > 0.0:
+                            if abs(offset_to_apply) > affine_offset_limit_adu:
+                                offset_to_apply = 0.0
+                            else:
+                                offset_to_apply = max(-affine_offset_limit_adu, min(offset_to_apply, affine_offset_limit_adu))
+                        if gain_to_apply != gain_before or offset_to_apply != offset_before:
+                            try:
+                                _pcb(
+                                    "assemble_warn_affine_clamped",
+                                    prog=None,
+                                    lvl="INFO_DETAIL",
+                                    tile_index=tile_idx,
+                                    gain_before=gain_before,
+                                    gain_after=gain_to_apply,
+                                    offset_before=offset_before,
+                                    offset_after=offset_to_apply,
+                                )
+                            except Exception:
+                                pass
+                    if gain_to_apply != 1.0:
+                        np.multiply(arr_np, gain_to_apply, out=arr_np, casting="unsafe")
+                    if offset_to_apply != 0.0:
+                        np.add(arr_np, offset_to_apply, out=arr_np, casting="unsafe")
                     input_data_all_tiles_HWC_processed[tile_idx] = (arr_np, tile_wcs_local)
                     corrected_tiles += 1
                 except Exception:
@@ -6128,7 +6975,7 @@ def compute_per_tile_gains_from_coverage(
     if sigma_px > 0:
         blurred = None
         blur_source = "identity"
-        if use_gpu:
+        if use_gpu and CUPY_AVAILABLE:
             try:
                 import cupy as cp  # type: ignore
                 from cupyx.scipy.ndimage import gaussian_filter as gpu_gaussian_filter  # type: ignore
@@ -6448,6 +7295,13 @@ def run_hierarchical_mosaic(
     radial_shape_power_config: float,
     min_radial_weight_floor_config: float,
     final_assembly_method_config: str,
+    inter_master_merge_enable_config: bool,
+    inter_master_overlap_threshold_config: float,
+    inter_master_min_group_size_config: int,
+    inter_master_stack_method_config: str,
+    inter_master_memmap_policy_config: str,
+    inter_master_local_scale_config: str,
+    inter_master_max_group_config: int,
     num_base_workers_config: int,
     # --- ARGUMENTS POUR LE ROGNAGE ---
     apply_master_tile_crop_config: bool,
@@ -6691,13 +7545,14 @@ def run_hierarchical_mosaic(
     STACK_RAM_BUDGET_BYTES = int(stack_ram_budget_gb * (1024 ** 3)) if stack_ram_budget_gb > 0 else 0
     PROGRESS_WEIGHT_PHASE1_RAW_SCAN = 30; PROGRESS_WEIGHT_PHASE2_CLUSTERING = 5
     PROGRESS_WEIGHT_PHASE3_MASTER_TILES = 35; PROGRESS_WEIGHT_PHASE4_GRID_CALC = 5
-    PROGRESS_WEIGHT_PHASE5_ASSEMBLY = 15; PROGRESS_WEIGHT_PHASE6_SAVE = 8
+    PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER = 6
+    PROGRESS_WEIGHT_PHASE5_ASSEMBLY = 9; PROGRESS_WEIGHT_PHASE6_SAVE = 8
     PROGRESS_WEIGHT_PHASE7_CLEANUP = 2
 
     DEFAULT_PHASE_WORKER_RATIO = 1.0
     ALIGNMENT_PHASE_WORKER_RATIO = 0.5  # Limit aggressive phases to 50% of base workers
 
-    if use_gpu_phase5 and gpu_id_phase5 is not None:
+    if use_gpu_phase5 and gpu_id_phase5 is not None and CUPY_AVAILABLE:
         os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id_phase5)
         try:
@@ -6717,7 +7572,10 @@ def run_hierarchical_mosaic(
 
     # Determine final GPU usage flag only if a valid NVIDIA GPU is selected
     use_gpu_phase5_flag = (
-        use_gpu_phase5 and gpu_id_phase5 is not None and gpu_is_available()
+        use_gpu_phase5
+        and gpu_id_phase5 is not None
+        and CUPY_AVAILABLE
+        and gpu_is_available()
     )
     if use_gpu_phase5_flag and ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils:
         try:
@@ -6838,15 +7696,38 @@ def run_hierarchical_mosaic(
     
     fits_file_paths = []
     # Scan des fichiers FITS dans le dossier d'entrée et ses sous-dossiers
-    for root_dir_iter, _, files_in_dir_iter in os.walk(input_folder):
+    for root_dir_iter, dirnames_iter, files_in_dir_iter in os.walk(input_folder):
+        # Exclure les dossiers interdits dès la descente
+        try:
+            dirnames_iter[:] = [
+                d
+                for d in dirnames_iter
+                if not is_path_excluded(Path(root_dir_iter) / d, EXCLUDED_DIRS)
+            ]
+        except Exception:
+            dirnames_iter[:] = [
+                d
+                for d in dirnames_iter
+                if UNALIGNED_DIRNAME
+                not in os.path.normpath(os.path.join(root_dir_iter, d)).split(os.sep)
+            ]
+
         # Assurer un ordre déterministe quelle que soit la plateforme/FS
         try:
             files_in_dir_iter = sorted(files_in_dir_iter, key=lambda s: s.lower())
         except Exception:
             files_in_dir_iter = list(files_in_dir_iter)
+
         for file_name_iter in files_in_dir_iter:
             if file_name_iter.lower().endswith((".fit", ".fits")):
-                fits_file_paths.append(os.path.join(root_dir_iter, file_name_iter))
+                full_path = os.path.join(root_dir_iter, file_name_iter)
+                try:
+                    if is_path_excluded(full_path, EXCLUDED_DIRS):
+                        continue
+                except Exception:
+                    if UNALIGNED_DIRNAME in os.path.normpath(full_path).split(os.sep):
+                        continue
+                fits_file_paths.append(full_path)
     # Tri global déterministe
     try:
         fits_file_paths.sort(key=lambda p: p.lower())
@@ -7150,13 +8031,23 @@ def run_hierarchical_mosaic(
                     for item in filtered_items
                     if isinstance(item, dict) and item.get("path")
                 ]
-                if new_paths:
-                    fits_file_paths = new_paths
-                    pcb(
-                        f"Phase 0: selection after filter = {len(fits_file_paths)} files",
-                        prog=None,
-                        lvl="INFO_DETAIL",
-                    )
+                filtered_paths: list[str] = []
+                for candidate_path in new_paths:
+                    try:
+                        if is_path_excluded(candidate_path, EXCLUDED_DIRS):
+                            continue
+                    except Exception:
+                        if UNALIGNED_DIRNAME in os.path.normpath(str(candidate_path)).split(os.sep):
+                            continue
+                    filtered_paths.append(candidate_path)
+
+                fits_file_paths = filtered_paths
+                pcb(
+                    f"Phase 0: selection after filter = {len(fits_file_paths)} files",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                )
+                if fits_file_paths:
                     try:
                         fits_file_paths.sort(key=lambda p: p.lower())
                     except Exception:
@@ -8607,6 +9498,42 @@ def run_hierarchical_mosaic(
         )
     pcb("run_info_phase4_finished", prog=current_global_progress, lvl="INFO", shape=final_output_shape_hw, crval=final_output_wcs.wcs.crval if final_output_wcs.wcs else 'N/A')
 
+    base_progress_phase4_5 = current_global_progress
+    if inter_master_merge_enable_config:
+        pcb("PHASE_UPDATE:4.5", prog=None, lvl="ETA_LEVEL")
+        _log_memory_usage(progress_callback, "Début Phase 4.5 (Inter-Master merge)")
+        inter_cfg_phase45 = {
+            "enable": bool(inter_master_merge_enable_config),
+            "overlap_threshold": float(inter_master_overlap_threshold_config),
+            "min_group_size": int(inter_master_min_group_size_config),
+            "stack_method": str(inter_master_stack_method_config).lower(),
+            "memmap_policy": str(inter_master_memmap_policy_config).lower(),
+            "local_scale": str(inter_master_local_scale_config).lower(),
+            "max_group": int(inter_master_max_group_config),
+        }
+        stack_cfg_phase45 = {
+            "kappa_low": float(stack_kappa_low),
+            "winsor_limits": parsed_winsor_limits,
+            "winsor_max_frames_per_pass": winsor_max_frames_per_pass_config,
+            "winsor_worker_limit": winsor_worker_limit_config,
+        }
+        master_tiles_results_list = _run_phase4_5_inter_master_merge(
+            master_tiles_results_list,
+            final_output_wcs,
+            final_output_shape_hw,
+            temp_master_tile_storage_dir,
+            output_folder,
+            cache_retention_mode,
+            inter_cfg_phase45,
+            stack_cfg_phase45,
+            progress_callback,
+            pcb,
+        )
+        current_global_progress = base_progress_phase4_5 + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
+        _log_memory_usage(progress_callback, "Fin Phase 4.5")
+    else:
+        current_global_progress = base_progress_phase4_5 + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
+
 # --- Phase 5 (Assemblage Final) ---
     base_progress_phase5 = current_global_progress
     pcb("PHASE_UPDATE:5", prog=None, lvl="ETA_LEVEL")
@@ -8940,7 +9867,7 @@ def run_hierarchical_mosaic(
         try: final_header.update(final_output_wcs.to_header(relax=True))
         except Exception as e_hdr_wcs: pcb("run_warn_phase6_wcs_to_header_failed", error=str(e_hdr_wcs), lvl="WARN")
     
-    final_header['SOFTWARE']=('ZeMosaic v3.2.8','Mosaic Software') # Incrémente la version 
+    final_header['SOFTWARE']=('ZeMosaic v3.2.9','Mosaic Software') # Incrémente la version 
     final_header['NMASTILE']=(len(master_tiles_results_list),"Master Tiles combined")
     final_header['NRAWINIT']=(num_total_raw_files,"Initial raw images found")
     final_header['NRAWPROC']=(len(all_raw_files_processed_info),"Raw images with WCS processed")
@@ -8998,6 +9925,36 @@ def run_hierarchical_mosaic(
                 progress_callback=progress_callback,
                 axis_order="HWC",
             )
+
+            if (
+                ZEMOSAIC_UTILS_AVAILABLE
+                and hasattr(zemosaic_utils, "write_final_fits_uint16_color_aware")
+            ):
+                viewer_fits_path = os.path.join(output_folder, f"{output_base_name}_viewer.fits")
+                try:
+                    zemosaic_utils.write_final_fits_uint16_color_aware(
+                        viewer_fits_path,
+                        final_mosaic_data_HWC,
+                        header=final_header,
+                        force_rgb_planes=isinstance(final_mosaic_data_HWC, np.ndarray)
+                        and final_mosaic_data_HWC.ndim == 3
+                        and final_mosaic_data_HWC.shape[-1] == 3,
+                        legacy_rgb_cube=legacy_rgb_flag,
+                        overwrite=True,
+                    )
+                    pcb(
+                        "run_info_phase6_viewer_fits_saved",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                        filename=os.path.basename(viewer_fits_path),
+                    )
+                except Exception as e_viewer:
+                    pcb(
+                        "run_warn_phase6_viewer_fits_failed",
+                        prog=None,
+                        lvl="WARN",
+                        error=str(e_viewer),
+                    )
         
         if final_mosaic_coverage_HW is not None and np.any(final_mosaic_coverage_HW):
             coverage_path = os.path.join(output_folder, f"{output_base_name}_coverage.fits")

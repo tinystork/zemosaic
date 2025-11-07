@@ -1730,24 +1730,28 @@ def align_images_in_group(image_data_list: list,
 
         _pcb(f"AlignGroup: Alignement image {i} (shape {source_image_adu.shape}) sur référence...", lvl="DEBUG_DETAIL")
         try:
-            # Try GPU FFT phase correlation first for robust global translation
+            # 1) Pré-alignement robuste par corrélation de phase (translation entière)
+            prealign_fft_img = None
             try_fft = True
             if try_fft:
                 src_lum = (0.299 * source_image_adu[..., 0] + 0.587 * source_image_adu[..., 1] + 0.114 * source_image_adu[..., 2]).astype(np.float32) if (source_image_adu.ndim == 3 and source_image_adu.shape[-1] == 3) else source_image_adu
                 ref_lum = (0.299 * reference_image_adu[..., 0] + 0.587 * reference_image_adu[..., 1] + 0.114 * reference_image_adu[..., 2]).astype(np.float32) if (reference_image_adu.ndim == 3 and reference_image_adu.shape[-1] == 3) else reference_image_adu
                 dy, dx, conf = _fft_phase_shift(src_lum, ref_lum)
-                if abs(dy) + abs(dx) > 0 and conf >= 3.0:  # heuristic confidence
-                    aligned_images[i] = _apply_integer_shift_hw_or_hwc(source_image_adu, dy, dx)
-                    _pcb(f"AlignGroup: FFT shift applied (dy={dy}, dx={dx}, conf={conf:.2f}).", lvl="DEBUG_DETAIL")
-                    continue
-            # Fall back to astroalign for fine/affine alignment
+                if abs(dy) + abs(dx) > 0 and conf >= 3.0:  # heuristique de confiance
+                    prealign_fft_img = _apply_integer_shift_hw_or_hwc(source_image_adu, dy, dx)
+                    _pcb(f"AlignGroup: FFT shift appliqué (dy={dy}, dx={dx}, conf={conf:.2f}).", lvl="DEBUG_DETAIL")
+
+            # 2) Affinage par astroalign (rotation/affine). Toujours tenter pour corriger la rotation.
+            # Choisir la source pour astroalign: pré-alignée si dispo, sinon brute
+            src_for_aa_base = prealign_fft_img if prealign_fft_img is not None else source_image_adu
+
             # Garantir des buffers writables/contigus pour astroalign afin d'éviter
             # "ValueError: buffer source array is read-only" avec des memmaps read-only
             src_for_aa = (
-                source_image_adu if (getattr(source_image_adu, 'flags', None)
-                                     and source_image_adu.flags.writeable
-                                     and source_image_adu.flags.c_contiguous)
-                else np.array(source_image_adu, dtype=np.float32, copy=True, order='C')
+                src_for_aa_base if (getattr(src_for_aa_base, 'flags', None)
+                                     and src_for_aa_base.flags.writeable
+                                     and src_for_aa_base.flags.c_contiguous)
+                else np.array(src_for_aa_base, dtype=np.float32, copy=True, order='C')
             )
             ref_for_aa = (
                 reference_image_adu if (getattr(reference_image_adu, 'flags', None)
@@ -1764,16 +1768,33 @@ def align_images_in_group(image_data_list: list,
                 if aligned_image_output.shape != reference_image_adu.shape:
                     _pcb("aligngroup_warn_shape_mismatch_after_align", lvl="WARN", img_idx=i, 
                               aligned_shape=aligned_image_output.shape, ref_shape=reference_image_adu.shape)
-                    aligned_images[i] = None
+                    # Si astroalign retourne une forme non conforme mais FFT a fonctionné, utiliser FFT
+                    if prealign_fft_img is not None and prealign_fft_img.shape == reference_image_adu.shape:
+                        aligned_images[i] = prealign_fft_img.astype(np.float32)
+                        _pcb("AlignGroup: Fallback FFT-only après mismatch de forme.", lvl="WARN")
+                    else:
+                        aligned_images[i] = None
                 else:
                     aligned_images[i] = aligned_image_output.astype(np.float32)
-                    _pcb(f"AlignGroup: Image {i} alignée.", lvl="DEBUG_DETAIL")
+                    _pcb(f"AlignGroup: Image {i} alignée (affine).", lvl="DEBUG_DETAIL")
             else:
                 _pcb("aligngroup_warn_register_returned_none", lvl="WARN", img_idx=i)
-                aligned_images[i] = None
+                if prealign_fft_img is not None and prealign_fft_img.shape == reference_image_adu.shape:
+                    aligned_images[i] = prealign_fft_img.astype(np.float32)
+                    _pcb("AlignGroup: Fallback FFT-only (astroalign None).", lvl="WARN")
+                else:
+                    aligned_images[i] = None
         except astroalign_module.MaxIterError:
             _pcb("aligngroup_warn_max_iter_error", lvl="WARN", img_idx=i)
-            aligned_images[i] = None
+            # En cas d'échec astroalign, repli sur FFT si disponible
+            try:
+                if 'prealign_fft_img' in locals() and prealign_fft_img is not None and prealign_fft_img.shape == reference_image_adu.shape:
+                    aligned_images[i] = prealign_fft_img.astype(np.float32)
+                    _pcb("AlignGroup: Fallback FFT-only (MaxIterError).", lvl="WARN")
+                else:
+                    aligned_images[i] = None
+            except Exception:
+                aligned_images[i] = None
         except ValueError as ve:
             _pcb("aligngroup_warn_value_error", lvl="WARN", img_idx=i, error=str(ve))
             aligned_images[i] = None

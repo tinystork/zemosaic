@@ -56,13 +56,22 @@ import traceback
 import time
 import subprocess
 import sys
-
-try:
-    import wmi
-except ImportError:  # pragma: no cover - wmi may be unavailable on non Windows
-    wmi = None
-
+import platform
+import shutil
+import importlib
 import importlib.util
+
+SYSTEM_NAME = platform.system().lower()
+IS_WINDOWS = SYSTEM_NAME == "windows"
+IS_MAC = SYSTEM_NAME == "darwin"
+
+if IS_WINDOWS:
+    try:
+        import wmi
+    except ImportError:  # pragma: no cover - wmi may be unavailable on non Windows
+        wmi = None
+else:
+    wmi = None
 
 CUPY_AVAILABLE = importlib.util.find_spec("cupy") is not None
 cupy = None
@@ -76,39 +85,98 @@ except ImportError:
     PILLOW_AVAILABLE_FOR_ICON = False
     print("AVERT GUI: Pillow (PIL) non installé. L'icône PNG ne peut pas être chargée.")
 # --- Import du module de localisation ---
-try:
-    from locales.zemosaic_localization import ZeMosaicLocalization
-    ZEMOSAIC_LOCALIZATION_AVAILABLE = True
-except ImportError as e_loc:
-    ZEMOSAIC_LOCALIZATION_AVAILABLE = False
-    ZeMosaicLocalization = None # Factice
-    print(f"ERREUR (zemosaic_gui): Impossible d'importer 'ZeMosaicLocalization': {e_loc}")
+ZEMOSAIC_LOCALIZATION_AVAILABLE = False
+ZeMosaicLocalization = None
+_localization_errors = []
+for candidate in ("locales.zemosaic_localization", "zemosaic_localization"):
+    spec = importlib.util.find_spec(candidate)
+    if spec is None:
+        _localization_errors.append(f"Module not found: {candidate}")
+        continue
+    try:
+        module = importlib.import_module(candidate)
+    except Exception as exc:
+        _localization_errors.append(f"{candidate}: {exc}")
+        continue
+    ZeMosaicLocalization = getattr(module, "ZeMosaicLocalization", None)
+    if ZeMosaicLocalization is not None:
+        ZEMOSAIC_LOCALIZATION_AVAILABLE = True
+        break
+if not ZEMOSAIC_LOCALIZATION_AVAILABLE:
+    detail = _localization_errors[-1] if _localization_errors else "module introuvable"
+    print(f"ERREUR (zemosaic_gui): module de localisation introuvable ({detail}).")
 
 # --- Configuration Import ---
-try:
-    import zemosaic_config 
-    ZEMOSAIC_CONFIG_AVAILABLE = True
-except ImportError as e_config:
-    ZEMOSAIC_CONFIG_AVAILABLE = False
-    zemosaic_config = None
-    print(f"AVERTISSEMENT (zemosaic_gui): 'zemosaic_config.py' non trouvé: {e_config}")
+zemosaic_config = None
+ZEMOSAIC_CONFIG_AVAILABLE = False
+config_candidates = []
+if __package__:
+    config_candidates.append(f"{__package__}.zemosaic_config")
+config_candidates.extend(["zemosaic_config", "core.zemosaic_config"])
+_config_errors = []
+for candidate in config_candidates:
+    spec = importlib.util.find_spec(candidate)
+    if spec is None:
+        _config_errors.append(f"Module not found: {candidate}")
+        continue
+    try:
+        zemosaic_config = importlib.import_module(candidate)
+        ZEMOSAIC_CONFIG_AVAILABLE = True
+        break
+    except Exception as exc:
+        _config_errors.append(f"{candidate}: {exc}")
+if not ZEMOSAIC_CONFIG_AVAILABLE:
+    detail = _config_errors[-1] if _config_errors else "module introuvable"
+    print(f"AVERTISSEMENT (zemosaic_gui): 'zemosaic_config.py' introuvable ({detail}).")
 
 # --- Worker Import ---
-try:
-    # Import worker from the same package so relative imports inside it work
-    from .zemosaic_worker import (
-        run_hierarchical_mosaic,
-        run_hierarchical_mosaic_process,
-    )
-    ZEMOSAIC_WORKER_AVAILABLE = True
-except ImportError as e_worker:
-    ZEMOSAIC_WORKER_AVAILABLE = False
-    run_hierarchical_mosaic = None
-    run_hierarchical_mosaic_process = None
-    print(f"ERREUR (zemosaic_gui): 'run_hierarchical_mosaic' non trouvé: {e_worker}")
+run_hierarchical_mosaic = None
+run_hierarchical_mosaic_process = None
+ZEMOSAIC_WORKER_AVAILABLE = False
+worker_candidates = []
+if __package__:
+    worker_candidates.append(f"{__package__}.zemosaic_worker")
+worker_candidates.extend(["zemosaic_worker", "core.zemosaic_worker"])
+_worker_errors = []
+for candidate in worker_candidates:
+    spec = importlib.util.find_spec(candidate)
+    if spec is None:
+        _worker_errors.append(f"Module not found: {candidate}")
+        continue
+    try:
+        worker_module = importlib.import_module(candidate)
+        run_hierarchical_mosaic = getattr(worker_module, "run_hierarchical_mosaic", None)
+        run_hierarchical_mosaic_process = getattr(worker_module, "run_hierarchical_mosaic_process", None)
+        if callable(run_hierarchical_mosaic) and callable(run_hierarchical_mosaic_process):
+            ZEMOSAIC_WORKER_AVAILABLE = True
+            break
+    except Exception as exc:
+        _worker_errors.append(f"{candidate}: {exc}")
+if not ZEMOSAIC_WORKER_AVAILABLE:
+    detail = _worker_errors[-1] if _worker_errors else "module introuvable"
+    print(f"ERREUR (zemosaic_gui): worker de mosaïque indisponible ({detail}).")
 
 from dataclasses import asdict
-from .solver_settings import SolverSettings
+
+SolverSettings = None
+solver_candidates = []
+if __package__:
+    solver_candidates.append(f"{__package__}.solver_settings")
+solver_candidates.append("solver_settings")
+_solver_errors = []
+for candidate in solver_candidates:
+    spec = importlib.util.find_spec(candidate)
+    if spec is None:
+        _solver_errors.append(f"Module not found: {candidate}")
+        continue
+    try:
+        SolverSettings = importlib.import_module(candidate).SolverSettings
+        break
+    except Exception as exc:
+        _solver_errors.append(f"{candidate}: {exc}")
+if SolverSettings is None:
+    detail = _solver_errors[-1] if _solver_errors else "module introuvable"
+    raise ImportError(f"solver_settings module is required for ZeMosaic GUI ({detail})")
 
 
 
@@ -116,19 +184,28 @@ class ZeMosaicGUI:
     def __init__(self, root_window):
         self.root = root_window
 
-        # --- DÉFINIR L'ICÔNE DE LA FENÊTRE (AVEC .ICO NATIF) ---
+        # --- DÉFINIR L'ICÔNE DE LA FENÊTRE AVEC FALLBACK MULTIPLATEFORME ---
         try:
             base_path = os.path.dirname(os.path.abspath(__file__))
-            icon_path = os.path.join(base_path, "icon", "zemosaic.ico")
+            ico_path = os.path.join(base_path, "icon", "zemosaic.ico")
+            png_candidates = [
+                os.path.join(base_path, "icon", name)
+                for name in ("zemosaic.png", "zemosaic_icon.png", "zemosaic_64x64.png")
+            ]
 
-            if os.path.exists(icon_path):
-                self.root.iconbitmap(default=icon_path)
+            if IS_WINDOWS and os.path.exists(ico_path):
+                self.root.iconbitmap(default=ico_path)
             else:
-                print(f"AVERT GUI: Fichier d'icône ICO non trouvé à {icon_path}")
-        except tk.TclError:
-            print("AVERT GUI: Impossible de définir l'icône ICO (TclError).")
+                png_path = next((path for path in png_candidates if os.path.exists(path)), None)
+                if png_path:
+                    self.root.iconphoto(True, tk.PhotoImage(file=png_path))
+                elif os.path.exists(ico_path):
+                    # Fallback for non-Windows platforms supporting ICO via PhotoImage
+                    self.root.iconphoto(True, tk.PhotoImage(file=ico_path))
+                else:
+                    print("AVERT GUI: icône introuvable (ICO/PNG)")
         except Exception as e_icon:
-            print(f"AVERT GUI: Erreur lors de la définition de l'icône ICO: {e_icon}")
+            print(f"AVERT GUI: icône non appliquée ({e_icon})")
         # --- FIN DÉFINITION ICÔNE ---
 
 
@@ -174,6 +251,16 @@ class ZeMosaicGUI:
                 "cluster_orientation_split_deg": 0.0
             }
 
+        for key in (
+            "astap_executable_path",
+            "astap_data_directory_path",
+            "coadd_memmap_dir",
+            "gpu_selector",
+        ):
+            value = self.config.get(key)
+            if isinstance(value, str) and value:
+                self.config[key] = os.path.expanduser(value)
+
         # --- GPU Detection helper ---
         def _detect_gpus():
             """Return a list of detected GPUs as ``(display_name, index)`` tuples.
@@ -183,14 +270,14 @@ class ZeMosaicGUI:
             """
 
             controllers = []
-            if wmi:
+            if IS_WINDOWS and wmi:
                 try:
                     obj = wmi.WMI()
                     controllers = [c.Name for c in obj.Win32_VideoController()]
                 except Exception:
                     controllers = []
 
-            if not controllers:
+            if not controllers and shutil.which("nvidia-smi"):
                 try:
                     out = subprocess.check_output(
                         ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
@@ -298,17 +385,19 @@ class ZeMosaicGUI:
             "phase2_cluster": "phase2",
             "phase3_master_tiles": "phase3",
             "phase4_grid": "phase4",
+            "phase4_5": "phase4_5",
             "phase5_intertile": "phase5",
             "phase5_incremental": "phase5",
             "phase5_reproject": "phase5",
         }
-        self._stage_order = ["phase1", "phase2", "phase3", "phase4", "phase5", "phase6", "phase7"]
+        self._stage_order = ["phase1", "phase2", "phase3", "phase4", "phase4_5", "phase5", "phase6", "phase7"]
         self._stage_weights = {
             "phase1": 30.0,
             "phase2": 5.0,
             "phase3": 35.0,
             "phase4": 5.0,
-            "phase5": 15.0,
+            "phase4_5": 6.0,
+            "phase5": 9.0,
             "phase6": 8.0,
             "phase7": 2.0,
         }
@@ -342,10 +431,32 @@ class ZeMosaicGUI:
         # radial_shape_power est géré via self.config directement
         
         # --- METHODE D'ASSEMBLAGE ---
-        self.final_assembly_method_var = tk.StringVar(master=self.root, 
+        self.final_assembly_method_var = tk.StringVar(master=self.root,
             value=self.config.get("final_assembly_method", self.assembly_method_keys[0])
         )
         self.final_assembly_method_var.trace_add("write", self._on_assembly_method_change)
+
+        self.inter_master_merge_var = tk.BooleanVar(
+            master=self.root,
+            value=bool(self.config.get("inter_master_merge_enable", False)),
+        )
+        overlap_default = 0.60
+        try:
+            overlap_default = float(self.config.get("inter_master_overlap_threshold", 0.60))
+        except Exception:
+            overlap_default = 0.60
+        overlap_default = max(0.0, min(1.0, overlap_default))
+        self.inter_master_overlap_var = tk.DoubleVar(
+            master=self.root,
+            value=overlap_default * 100.0,
+        )
+        method_default = str(self.config.get("inter_master_stack_method", "winsor")).lower()
+        if method_default not in {"winsor", "mean", "median"}:
+            method_default = "winsor"
+        self.inter_master_method_var = tk.StringVar(
+            master=self.root,
+            value=method_default,
+        )
         
         # --- NOMBRE DE WORKERS ---
         # Utiliser 0 pour auto, comme convenu. La clé de config est "num_processing_workers".
@@ -1082,6 +1193,45 @@ class ZeMosaicGUI:
         self.final_assembly_method_combo = ttk.Combobox(final_assembly_options_frame, values=[], state="readonly", width=40)
         self.final_assembly_method_combo.grid(row=asm_opt_row, column=1, padx=5, pady=5, sticky="ew")
         self.final_assembly_method_combo.bind("<<ComboboxSelected>>", lambda e, c=self.final_assembly_method_combo, v=self.final_assembly_method_var, k_list=self.assembly_method_keys, p="assembly_method": self._combo_to_key(e, c, v, k_list, p)); asm_opt_row += 1
+
+        self.inter_master_merge_check = ttk.Checkbutton(
+            final_assembly_options_frame,
+            text="",
+            variable=self.inter_master_merge_var,
+        )
+        self.inter_master_merge_check.grid(row=asm_opt_row, column=0, columnspan=2, padx=5, pady=(2, 2), sticky="w")
+        self.translatable_widgets["cfg_inter_master_enable"] = self.inter_master_merge_check
+        asm_opt_row += 1
+
+        self.inter_master_overlap_label = ttk.Label(final_assembly_options_frame, text="")
+        self.inter_master_overlap_label.grid(row=asm_opt_row, column=0, padx=5, pady=2, sticky="w")
+        self.translatable_widgets["cfg_inter_master_overlap"] = self.inter_master_overlap_label
+
+        self.inter_master_overlap_spin = ttk.Spinbox(
+            final_assembly_options_frame,
+            from_=0.0,
+            to=100.0,
+            increment=1.0,
+            textvariable=self.inter_master_overlap_var,
+            width=6,
+            format="%.0f",
+        )
+        self.inter_master_overlap_spin.grid(row=asm_opt_row, column=1, padx=5, pady=2, sticky="w")
+        asm_opt_row += 1
+
+        self.inter_master_method_label = ttk.Label(final_assembly_options_frame, text="")
+        self.inter_master_method_label.grid(row=asm_opt_row, column=0, padx=5, pady=2, sticky="w")
+        self.translatable_widgets["cfg_inter_master_method"] = self.inter_master_method_label
+
+        self.inter_master_method_combo = ttk.Combobox(
+            final_assembly_options_frame,
+            state="readonly",
+            width=20,
+            textvariable=self.inter_master_method_var,
+            values=("winsor", "mean", "median"),
+        )
+        self.inter_master_method_combo.grid(row=asm_opt_row, column=1, padx=5, pady=2, sticky="w")
+        asm_opt_row += 1
 
         gpu_chk = ttk.Checkbutton(
             final_assembly_options_frame,
@@ -2233,7 +2383,9 @@ class ZeMosaicGUI:
                             phase_name = self._tr(f"phase_name_{phase_num}")
                             display = self._tr("phase_display_format", "P{num} - {name}", num=phase_num, name=phase_name)
                         else:
-                            display = str(phase_id)
+                            normalized_id = phase_id.replace(".", "_")
+                            phase_name = self._tr(f"phase_name_{normalized_id}", phase_id)
+                            display = self._tr("phase_display_format", "P{num} - {name}", num=phase_id, name=phase_name)
                         if hasattr(self.phase_var, 'set') and callable(self.phase_var.set):
                             self.phase_var.set(display)
                     except Exception:
@@ -3007,6 +3159,23 @@ class ZeMosaicGUI:
         self.config["quality_crop_k_sigma"] = float(quality_crop_k_sigma_val)
         self.config["quality_crop_margin_px"] = int(quality_crop_margin_val)
 
+        inter_master_enable_val = bool(self.inter_master_merge_var.get())
+        try:
+            overlap_pct_val = float(self.inter_master_overlap_var.get())
+        except Exception:
+            overlap_pct_val = float(self.config.get("inter_master_overlap_threshold", 0.60) * 100.0)
+            self.inter_master_overlap_var.set(overlap_pct_val)
+        overlap_pct_val = max(0.0, min(100.0, overlap_pct_val))
+        overlap_fraction = overlap_pct_val / 100.0
+        method_val = str(self.inter_master_method_var.get()).lower()
+        if method_val not in {"winsor", "mean", "median"}:
+            method_val = "winsor"
+            self.inter_master_method_var.set(method_val)
+
+        self.config["inter_master_merge_enable"] = inter_master_enable_val
+        self.config["inter_master_overlap_threshold"] = overlap_fraction
+        self.config["inter_master_stack_method"] = method_val
+
         span_range_cfg = self.config.get("anchor_quality_span_range", [0.02, 6.0])
         if not (isinstance(span_range_cfg, (list, tuple)) and len(span_range_cfg) >= 2):
             span_range_cfg = [0.02, 6.0]
@@ -3045,6 +3214,23 @@ class ZeMosaicGUI:
         poststack_min_improvement_cfg = min(1.0, max(0.0, poststack_min_improvement_cfg))
         poststack_use_overlap_cfg = bool(self.config.get("poststack_anchor_use_overlap_affine", True))
 
+        try:
+            inter_master_min_group_val = int(self.config.get("inter_master_min_group_size", 2))
+        except Exception:
+            inter_master_min_group_val = 2
+        inter_master_min_group_val = max(2, inter_master_min_group_val)
+        try:
+            inter_master_max_group_val = int(self.config.get("inter_master_max_group", 64))
+        except Exception:
+            inter_master_max_group_val = 64
+        inter_master_max_group_val = max(inter_master_min_group_val, inter_master_max_group_val)
+        inter_master_memmap_policy_val = str(self.config.get("inter_master_memmap_policy", "auto")).lower()
+        if inter_master_memmap_policy_val not in {"auto", "always", "never"}:
+            inter_master_memmap_policy_val = "auto"
+        inter_master_local_scale_val = str(self.config.get("inter_master_local_scale", "final")).lower()
+        if inter_master_local_scale_val not in {"final", "native"}:
+            inter_master_local_scale_val = "final"
+
         worker_args = (
             input_dir, output_dir, astap_exe, astap_data,
             astap_radius_val, astap_downsample_val, astap_sensitivity_val,
@@ -3065,6 +3251,13 @@ class ZeMosaicGUI:
             radial_shape_power_val,
             min_radial_weight_floor_val,
             final_assembly_method_val,
+            inter_master_enable_val,
+            overlap_fraction,
+            inter_master_min_group_val,
+            method_val,
+            inter_master_memmap_policy_val,
+            inter_master_local_scale_val,
+            inter_master_max_group_val,
             num_base_workers_gui_val,
             # --- NOUVEAUX ARGUMENTS POUR LE ROGNAGE ---
             apply_master_tile_crop_val,

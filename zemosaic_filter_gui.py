@@ -55,13 +55,22 @@ import sys
 import shutil
 import datetime
 import importlib
+import importlib.util
 import time
 import traceback
 import threading
 import queue
 import json
+import logging
+import re
+import math
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
+
+from zemosaic_utils import EXCLUDED_DIRS, is_path_excluded
+
+
+logger = logging.getLogger(__name__)
 
 
 # --- Instrument detection helpers -------------------------------------------
@@ -221,6 +230,118 @@ def _merge_small_groups(
     return [grp for idx, grp in enumerate(groups) if not merged_flags[idx]]
 
 
+def _circ_delta_deg(a: float, b: float) -> float:
+    """Return the absolute circular delta (degrees) between two angles."""
+
+    try:
+        delta = abs(float(a) - float(b)) % 360.0
+    except Exception:
+        return float("inf")
+    if delta > 180.0:
+        delta = 360.0 - delta
+    return delta
+
+
+def _circular_dispersion_deg(values: Iterable[float]) -> float:
+    """Estimate the minimal arc covering ``values`` on the unit circle (deg)."""
+
+    sanitized = []
+    for val in values:
+        try:
+            coerced = float(val)
+        except Exception:
+            continue
+        if math.isnan(coerced) or math.isinf(coerced):
+            continue
+        sanitized.append(coerced % 360.0)
+
+    if len(sanitized) <= 1:
+        return 0.0
+
+    sanitized.sort()
+    gaps: list[float] = []
+    for i in range(len(sanitized) - 1):
+        gaps.append(sanitized[i + 1] - sanitized[i])
+    gaps.append((sanitized[0] + 360.0) - sanitized[-1])
+    max_gap = max(gaps) if gaps else 0.0
+    dispersion = 360.0 - max_gap
+    if dispersion < 0.0:
+        dispersion = 0.0
+    return dispersion
+
+
+def _split_group_by_orientation(group: list[dict], threshold_deg: float) -> list[list[dict]]:
+    """Split ``group`` using circular proximity of ``PA_DEG`` values."""
+
+    if threshold_deg <= 0 or len(group) <= 1:
+        return [group]
+
+    with_angles: list[tuple[int, float]] = []
+    without_angles: list[int] = []
+    for idx, info in enumerate(group):
+        try:
+            pa_val = info.get("PA_DEG")
+        except Exception:
+            pa_val = None
+        try:
+            pa_deg = float(pa_val)
+        except Exception:
+            pa_deg = None
+        if pa_deg is None or math.isnan(pa_deg):
+            without_angles.append(idx)
+            continue
+        with_angles.append((idx, pa_deg % 360.0))
+
+    if len(with_angles) <= 1:
+        return [group]
+
+    with_angles.sort(key=lambda pair: pair[1])
+    parent = list(range(len(with_angles)))
+
+    def _find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def _union(a: int, b: int) -> None:
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i in range(len(with_angles) - 1):
+        if _circ_delta_deg(with_angles[i][1], with_angles[i + 1][1]) <= threshold_deg:
+            _union(i, i + 1)
+    if _circ_delta_deg(with_angles[0][1], with_angles[-1][1]) <= threshold_deg:
+        _union(0, len(with_angles) - 1)
+
+    buckets: dict[int, list[int]] = {}
+    for idx_valid, (original_idx, _) in enumerate(with_angles):
+        root = _find(idx_valid)
+        buckets.setdefault(root, []).append(original_idx)
+
+    subgroups: list[list[dict]] = []
+    subgroup_meta: list[tuple[int, list[dict]]] = []
+    for indices in buckets.values():
+        ordered_indices = sorted(indices)
+        subgroup_meta.append((ordered_indices[0], [group[i] for i in ordered_indices]))
+
+    if not subgroup_meta:
+        return [group]
+
+    subgroup_meta.sort(key=lambda pair: pair[0])
+    subgroups = [payload for _, payload in subgroup_meta]
+
+    if without_angles:
+        fallback_target = max(subgroups, key=len, default=subgroups[0])
+        for idx in without_angles:
+            fallback_target.append(group[idx])
+
+    if len(subgroups) == 1:
+        return [group]
+    return subgroups
+
+
 def _format_sizes_histogram(sizes: list[int], max_buckets: int = 6) -> str:
     """Return a compact histogram string for group sizes."""
 
@@ -361,6 +482,12 @@ def launch_filter_interface(
     # Early validation and fail-safe behavior
     stream_mode = False
     input_dir: Optional[str] = None
+    input_dir_path: Optional[Path] = None
+    excluded_input_dir = False
+    pending_startup_messages: list[tuple[str, str]] = []
+    startup_status_messages: list[str] = []
+    exclusion_notified_paths: set[str] = set()
+    excluded_paths_pending: list[Path] = []
 
     # Robust detection: if a directory path is provided, always use streaming
     # mode regardless of the explicit flag. This makes callers resilient to
@@ -383,6 +510,17 @@ def launch_filter_interface(
 
     raw_items_input = raw_files_with_wcs_or_dir
 
+    if input_dir:
+        try:
+            input_dir_path = Path(input_dir).expanduser()
+        except Exception:
+            input_dir_path = Path(input_dir)
+        try:
+            if is_path_excluded(input_dir_path, EXCLUDED_DIRS):
+                excluded_input_dir = True
+        except Exception:
+            pass
+
     # --- Simple debug logger (console + buffer flushed to UI log later) ---
     _dbg_msgs: list[str] = []
     def _dbg(msg: str) -> None:
@@ -396,6 +534,35 @@ def launch_filter_interface(
         except Exception:
             pass
         _dbg_msgs.append(line)
+
+    def _queue_startup_message(level: str, message: str) -> None:
+        if not message:
+            return
+        pending_startup_messages.append((level, message))
+        try:
+            log_method = getattr(logger, level.lower(), logger.info)
+        except Exception:
+            log_method = logger.info
+        try:
+            log_method(message)
+        except Exception:
+            logger.info(message)
+
+    def _remember_exclusion(path: Path, message: str) -> None:
+        key = str(path)
+        if key in exclusion_notified_paths:
+            return
+        exclusion_notified_paths.add(key)
+        try:
+            logger.debug("Skipping excluded path: %s", path)
+        except Exception:
+            pass
+        display_msg = message
+        try:
+            display_msg = f"{message} ({path})"
+        except Exception:
+            pass
+        _queue_startup_message("WARN", display_msg)
 
     try:
         # --- Optional localization support (autonomous fallback) ---
@@ -417,36 +584,54 @@ def launch_filter_interface(
         solver_settings_payload: Dict[str, Any] = {}
         lang_code = "en"
 
-        # Ensure project directory is on sys.path to import project modules
+        # Ensure project directory and parent are on sys.path to import project modules
         base_dir = os.path.dirname(os.path.abspath(__file__))
-        if base_dir not in sys.path:
-            sys.path.insert(0, base_dir)
+        project_root = os.path.dirname(base_dir)
+        for candidate in (base_dir, project_root):
+            if candidate and candidate not in sys.path:
+                sys.path.insert(0, candidate)
+
+        pkg_prefix = globals().get("__package__") or ""
+
+        def _import_optional_module(*module_names: str):
+            last_error: str | None = None
+            for mod_name in module_names:
+                spec = importlib.util.find_spec(mod_name)
+                if spec is None:
+                    last_error = f"Module not found: {mod_name}"
+                    continue
+                try:
+                    return importlib.import_module(mod_name), None
+                except Exception as exc:
+                    last_error = f"{mod_name}: {exc}"
+            return None, last_error
 
         # Try to load localization support from either legacy or packaged paths
+        localization_candidates = [
+            "locales.zemosaic_localization",
+            "zemosaic_localization",
+        ]
+        if pkg_prefix:
+            localization_candidates.insert(0, f"{pkg_prefix}.zemosaic_localization")
+            localization_candidates.insert(0, f"{pkg_prefix}.locales.zemosaic_localization")
         localizer_cls = None
         localization_errors: list[str] = []
-        for mod_name in ("zemosaic_localization", "locales.zemosaic_localization"):
-            try:
-                module = importlib.import_module(mod_name)
-                candidate = getattr(module, "ZeMosaicLocalization", None)
-                if candidate is not None:
-                    localizer_cls = candidate
-                    break
-            except Exception as exc:
-                localization_errors.append(str(exc))
+        for candidate in localization_candidates:
+            module, import_error = _import_optional_module(candidate)
+            if module is None:
+                if import_error:
+                    localization_errors.append(import_error)
+                continue
+            localizer_cls = getattr(module, "ZeMosaicLocalization", None)
+            if localizer_cls is not None:
+                break
 
         # Load persistent configuration if available
-        zconfig_module = None
-        try:
-            zconfig_module = importlib.import_module("zemosaic_config")
-        except Exception:
-            try:
-                pkg_prefix = globals().get("__package__") or ""
-                if pkg_prefix:
-                    zconfig_module = importlib.import_module(f"{pkg_prefix}.zemosaic_config")
-            except Exception as exc:
-                print(f"WARNING (Filter GUI): failed to import configuration module: {exc}")
-                zconfig_module = None
+        config_candidates = []
+        if pkg_prefix:
+            config_candidates.append(f"{pkg_prefix}.zemosaic_config")
+        config_candidates.append("zemosaic_config")
+        zconfig_module, config_error = _import_optional_module(*config_candidates)
 
         if zconfig_module is not None:
             try:
@@ -466,23 +651,20 @@ def launch_filter_interface(
                     })
             except Exception as exc:
                 print(f"WARNING (Filter GUI): failed to load configuration: {exc}")
+        elif config_error:
+            print(f"WARNING (Filter GUI): configuration module unavailable: {config_error}")
 
         # Load solver settings (either provided by caller or defaults)
         solver_cls = None
-        solver_module = None
-        try:
-            solver_module = importlib.import_module("solver_settings")
-        except Exception:
-            try:
-                pkg_prefix = globals().get("__package__") or ""
-                if pkg_prefix:
-                    solver_module = importlib.import_module(f"{pkg_prefix}.solver_settings")
-            except Exception as exc:
-                print(f"WARNING (Filter GUI): failed to import solver settings: {exc}")
-                solver_module = None
-
+        solver_candidates = []
+        if pkg_prefix:
+            solver_candidates.append(f"{pkg_prefix}.solver_settings")
+        solver_candidates.append("solver_settings")
+        solver_module, solver_error = _import_optional_module(*solver_candidates)
         if solver_module is not None:
             solver_cls = getattr(solver_module, "SolverSettings", None)
+        elif solver_error:
+            print(f"WARNING (Filter GUI): solver settings module unavailable: {solver_error}")
 
         if isinstance(solver_settings_dict, dict):
             solver_settings_payload.update(solver_settings_dict)
@@ -504,8 +686,10 @@ def launch_filter_interface(
             sensitivity = solver_settings_payload.get("astap_sensitivity")
 
             if isinstance(exe_path, str) and exe_path:
+                exe_path = os.path.expanduser(exe_path)
                 cfg_defaults["astap_executable_path"] = exe_path
             if isinstance(data_path, str) and data_path:
+                data_path = os.path.expanduser(data_path)
                 cfg_defaults["astap_data_directory_path"] = data_path
             if search_radius is not None:
                 cfg_defaults["astap_default_search_radius"] = search_radius
@@ -548,6 +732,23 @@ def launch_filter_interface(
             # Fallback: return default_text or key placeholder
             return default_text if default_text is not None else f"_{key}_"
 
+        if excluded_input_dir:
+            msg = _tr(
+                "FILTER_MOVE_FAILED_INPUT",
+                "Input path points to an excluded folder. Please select another folder.",
+            )
+            startup_status_messages.append(msg)
+            _queue_startup_message("WARN", msg)
+
+        if excluded_paths_pending:
+            exclusion_msg = _tr(
+                "FILTER_EXCLUDED_DIR",
+                'The folder "unaligned_by_zemosaic" is excluded and will not be scanned.',
+            )
+            for pending_path in list(excluded_paths_pending):
+                _remember_exclusion(pending_path, exclusion_msg)
+            excluded_paths_pending.clear()
+
         # Imports kept inside to avoid import-time errors affecting pipeline
         import tkinter as tk
         from tkinter import ttk, messagebox, scrolledtext
@@ -555,16 +756,73 @@ def launch_filter_interface(
         from core.tk_safe import patch_tk_variables
 
         patch_tk_variables()
-        import numpy as np
-        from astropy.coordinates import SkyCoord
-        from astropy.io import fits
-        from astropy.wcs import WCS
-        from astropy.wcs.utils import pixel_to_skycoord
-        import astropy.units as u
-        from matplotlib.figure import Figure
-        from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-        from matplotlib.collections import LineCollection
-        from matplotlib.colors import to_rgba
+        heavy_import_error: ImportError | None = None
+        try:
+            import numpy as np
+            from astropy.coordinates import SkyCoord
+            from astropy.io import fits
+            from astropy.wcs import WCS
+            from astropy.wcs.utils import pixel_to_skycoord
+            import astropy.units as u
+            from matplotlib.figure import Figure
+            from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+            from matplotlib.collections import LineCollection
+            from matplotlib.colors import to_rgba, hsv_to_rgb
+        except ImportError as exc:
+            heavy_import_error = exc
+
+        if heavy_import_error is not None:
+            msg = (
+                "Missing optional dependency (numpy/matplotlib/astropy).\n"
+                "Install the packages and retry."
+            )
+            detail = f" Details: {heavy_import_error}"
+            try:
+                messagebox.showerror("ZeMosaic Filter", msg + detail)
+            except Exception:
+                print(f"ERROR (Filter GUI): {msg}{detail}")
+            return raw_items_input, False, None
+
+        def _write_header_to_fits_local(file_path: str, header_obj) -> None:
+            """Safely persist ``header_obj`` into ``file_path`` FITS header."""
+
+            if header_obj is None:
+                return
+            with fits.open(file_path, mode="update", memmap=False) as hdul:
+                hdul[0].header.update(header_obj)
+                hdul.flush()
+
+        def _persist_wcs_header_if_requested(path_val: str, hdr_obj, write_inplace: bool) -> None:
+            """Persist ``hdr_obj`` to disk when ``write_inplace`` is enabled."""
+
+            if not write_inplace or hdr_obj is None:
+                return
+            if not isinstance(path_val, str) or not path_val:
+                return
+            display_name = os.path.basename(path_val) or path_val
+            try:
+                _write_header_to_fits_local(path_val, hdr_obj)
+            except Exception as exc:  # pragma: no cover - UI logging side effect
+                _log_message(
+                    f"[WCS] Failed to write header for '{display_name}': {exc}",
+                    level="WARN",
+                )
+            else:
+                _log_message(
+                    f"[WCS] Header written to '{display_name}'",
+                    level="INFO",
+                )
+
+        def _has_celestial_wcs(header_obj) -> bool:
+            """Return True when ``header_obj`` contains a valid celestial WCS."""
+
+            if header_obj is None:
+                return False
+            try:
+                wcs_obj = WCS(header_obj, naxis=2, relax=True)
+            except Exception:
+                return False
+            return bool(getattr(wcs_obj, "is_celestial", False))
 
         def footprint_wh_deg(wcs_obj: Any) -> tuple[float, float]:
             """Return footprint width/height in degrees for a given WCS."""
@@ -670,19 +928,71 @@ def launch_filter_interface(
             stream_state["csv_path"] = cache_csv_path
 
         def _iter_fits_paths(root: str, recursive: bool = True):
+            exclusion_msg = _tr(
+                "FILTER_EXCLUDED_DIR",
+                'The folder "unaligned_by_zemosaic" is excluded and will not be scanned.',
+            )
+            try:
+                root_candidate = Path(root)
+            except Exception:
+                root_candidate = Path(str(root))
+
+            if is_path_excluded(root_candidate, EXCLUDED_DIRS):
+                _remember_exclusion(root_candidate, exclusion_msg)
+                if not startup_status_messages:
+                    msg = _tr(
+                        "FILTER_MOVE_FAILED_INPUT",
+                        "Input path points to an excluded folder. Please select another folder.",
+                    )
+                    startup_status_messages.append(msg)
+                return
+
+            def _should_skip(path_value: Path) -> bool:
+                if not is_path_excluded(path_value, EXCLUDED_DIRS):
+                    return False
+                _remember_exclusion(path_value, exclusion_msg)
+                return True
+
             if not recursive:
                 try:
                     with os.scandir(root) as it:
                         for entry in it:
+                            try:
+                                entry_path = Path(entry.path)
+                            except Exception:
+                                entry_path = Path(str(entry.path))
+                            if entry.is_dir():
+                                if _should_skip(entry_path):
+                                    continue
+                                continue
                             if entry.is_file() and entry.name.lower().endswith((".fit", ".fits")):
+                                if _should_skip(entry_path):
+                                    continue
                                 yield entry.path
                 except Exception:
                     return
             else:
-                for r, _dirs, files in os.walk(root):
+                for r, dirs, files in os.walk(root):
+                    try:
+                        current_dir = Path(r)
+                    except Exception:
+                        current_dir = Path(str(r))
+                    if _should_skip(current_dir):
+                        continue
+                    filtered_dirs = []
+                    for d in list(dirs):
+                        child = current_dir / d
+                        if _should_skip(child):
+                            continue
+                        filtered_dirs.append(d)
+                    dirs[:] = filtered_dirs
                     for fn in files:
-                        if fn.lower().endswith((".fit", ".fits")):
-                            yield os.path.join(r, fn)
+                        if not fn.lower().endswith((".fit", ".fits")):
+                            continue
+                        candidate = current_dir / fn
+                        if _should_skip(candidate):
+                            continue
+                        yield str(candidate)
 
         def _compute_footprint_from_wcs(
             wcs_obj: Any,
@@ -723,6 +1033,49 @@ def launch_filter_interface(
             except Exception:
                 return None
 
+        def _compute_position_angle_deg(
+            wcs_obj: Any,
+            shape_hw: Optional[tuple[int, int]] = None,
+        ) -> Optional[float]:
+            """Compute the on-sky position angle (deg) of the +X pixel axis."""
+
+            if wcs_obj is None or not getattr(wcs_obj, "is_celestial", False):
+                return None
+            if not hasattr(wcs_obj, "pixel_to_world"):
+                return None
+            try:
+                width = None
+                height = None
+                px_shape = getattr(wcs_obj, "pixel_shape", None)
+                if px_shape and len(px_shape) >= 2:
+                    width = float(px_shape[0])
+                    height = float(px_shape[1])
+                elif getattr(wcs_obj, "array_shape", None) and len(wcs_obj.array_shape) >= 2:  # type: ignore[attr-defined]
+                    height = float(wcs_obj.array_shape[0])  # type: ignore[attr-defined]
+                    width = float(wcs_obj.array_shape[1])  # type: ignore[attr-defined]
+                elif shape_hw and len(shape_hw) >= 2:
+                    height = float(shape_hw[0])
+                    width = float(shape_hw[1])
+                if width is None or height is None or width <= 1.0 or height <= 1.0:
+                    return None
+                cx = width / 2.0
+                cy = height / 2.0
+                c0 = wcs_obj.pixel_to_world(cx, cy)
+                c1 = wcs_obj.pixel_to_world(cx + 1.0, cy)
+                pa_deg = float(c0.position_angle(c1).to(u.deg).value) % 360.0
+                return pa_deg
+            except Exception:
+                return None
+
+        def _assign_pa_metadata(target: dict[str, Any], wcs_obj: Any, shape_hw: Optional[tuple[int, int]]) -> None:
+            """Populate ``target["PA_DEG"]`` using ``wcs_obj`` and optional shape."""
+
+            try:
+                pa_val = _compute_position_angle_deg(wcs_obj, shape_hw)
+            except Exception:
+                pa_val = None
+            target["PA_DEG"] = pa_val if pa_val is not None else None
+
         def _minimal_header_payload(fpath: str) -> Dict[str, Any]:
             payload: Dict[str, Any] = {"path": fpath}
             try:
@@ -747,6 +1100,7 @@ def launch_filter_interface(
                 w = WCS(hdr, naxis=2, relax=True)
                 if w is not None and getattr(w, "is_celestial", False):
                     payload["wcs"] = w
+                    _assign_pa_metadata(payload, w, payload.get("shape"))
                     fp = _compute_footprint_from_wcs(w, payload.get("shape"))
                     if fp:
                         payload["footprint_radec"] = fp
@@ -785,6 +1139,83 @@ def launch_filter_interface(
                 payload["header"] = keep_keys
 
             return payload
+
+        def _move_problematic_file(path_value: str) -> Dict[str, Any]:
+            info: Dict[str, Any] = {}
+            if not path_value:
+                return info
+            try:
+                src_path = Path(path_value)
+            except Exception:
+                return info
+            if not src_path.exists():
+                return info
+            if is_path_excluded(src_path, EXCLUDED_DIRS):
+                info["skipped"] = True
+                return info
+
+            target_dir_name = next(iter(EXCLUDED_DIRS), "unaligned_by_zemosaic")
+            base_dir = input_dir_path or src_path.parent
+            try:
+                base_dir = Path(base_dir)
+            except Exception:
+                base_dir = Path(str(base_dir))
+            try:
+                base_dir = base_dir.expanduser().resolve(strict=False)
+            except Exception:
+                pass
+            destination_dir = base_dir / target_dir_name
+            try:
+                destination_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+
+            destination_path = destination_dir / src_path.name
+            if destination_path.exists():
+                timestamp = datetime.datetime.now().strftime("_%Y%m%d_%H%M%S")
+                stem = src_path.stem
+                suffix = src_path.suffix
+                counter = 1
+                while destination_path.exists() and counter <= 50:
+                    destination_path = destination_dir / f"{stem}{timestamp}_{counter}{suffix}"
+                    counter += 1
+
+            try:
+                logger.debug("Moving problematic file %s -> %s", src_path, destination_path)
+            except Exception:
+                pass
+
+            try:
+                src_path.replace(destination_path)
+                moved = True
+            except Exception:
+                try:
+                    shutil.move(str(src_path), str(destination_path))
+                    moved = True
+                except Exception as exc_move:
+                    info["error"] = str(exc_move)
+                    try:
+                        logger.error(
+                            "Failed to move problematic file %s -> %s", src_path, destination_path, exc_info=True
+                        )
+                    except Exception:
+                        pass
+                    return info
+
+            if moved:
+                info.update(
+                    {
+                        "moved": True,
+                        "source": str(src_path),
+                        "destination": str(destination_path),
+                        "filename": destination_path.name,
+                    }
+                )
+                try:
+                    logger.info("Moved problematic file to %s", destination_path)
+                except Exception:
+                    pass
+            return info
 
         def _load_csv_bootstrap(path_csv: str) -> list[Dict[str, Any]]:
             rows: list[Dict[str, Any]] = []
@@ -983,6 +1414,16 @@ def launch_filter_interface(
                 nonlocal stream_stop_event
                 if stream_state.get("running"):
                     return
+                if excluded_input_dir:
+                    msg = _tr(
+                        "FILTER_MOVE_FAILED_INPUT",
+                        "Input path points to an excluded folder. Please select another folder.",
+                    )
+                    stream_state["running"] = False
+                    stream_state["done"] = True
+                    stream_state["status_message"] = msg
+                    _queue_startup_message("WARN", msg)
+                    return
                 stream_queue = queue.Queue()
                 stream_stop_event = threading.Event()
                 stream_state["running"] = True
@@ -1011,13 +1452,28 @@ def launch_filter_interface(
                 stream_state["pending_start"] = True
         else:
             normalized: list[Dict[str, Any]] = []
-            for i, entry in enumerate(raw_items_input or []):
+            next_index = 0
+            for entry in raw_items_input or []:
                 try:
                     data = dict(entry)
                 except Exception:
                     data = {"path": entry}
-                data.setdefault("index", i)
+                path_candidate = (
+                    data.get("path")
+                    or data.get("path_raw")
+                    or data.get("path_preprocessed_cache")
+                )
+                if path_candidate:
+                    try:
+                        candidate_path = Path(path_candidate)
+                        if is_path_excluded(candidate_path, EXCLUDED_DIRS):
+                            excluded_paths_pending.append(candidate_path)
+                            continue
+                    except Exception:
+                        pass
+                data["index"] = next_index
                 normalized.append(data)
+                next_index += 1
             if not normalized:
                 return raw_items_input, False, None
             initial_batches.append(normalized)
@@ -1049,6 +1505,7 @@ def launch_filter_interface(
                 self.shape: Optional[tuple[int, int]] = None
                 self.center: Optional[SkyCoord] = None
                 self.phase0_center: Optional[SkyCoord] = None
+                self.pa_deg: Optional[float] = None
                 # Footprint computations are quite expensive for thousands of
                 # entries.  Compute them lazily only when the UI actually needs
                 # the polygon to be drawn.
@@ -1236,6 +1693,12 @@ def launch_filter_interface(
                     self.src["center"] = self.center
                 if self.shape is not None:
                     self.src["shape"] = self.shape
+                if self.wcs is not None:
+                    pa_value = _compute_position_angle_deg(self.wcs, self.shape)
+                else:
+                    pa_value = None
+                self.pa_deg = pa_value
+                self.src["PA_DEG"] = pa_value if pa_value is not None else None
                 # Heavy footprint computations are deferred until explicitly
                 # requested by the UI via ``ensure_footprint``.
                 self._footprint_cache = None
@@ -1261,6 +1724,48 @@ def launch_filter_interface(
                 overrides_state.update(initial_overrides)
             except Exception:
                 overrides_state = {}
+
+        def _sanitize_angle_value(value: Any, default: float = 0.0) -> float:
+            """Return a finite angle value in [0, 180], falling back to ``default``."""
+
+            try:
+                val = float(value)
+            except Exception:
+                return default
+            if math.isnan(val) or math.isinf(val):
+                return default
+            if val < 0.0:
+                return 0.0
+            if val > 180.0:
+                return 180.0
+            return val
+
+        ANGLE_SPLIT_DEFAULT_DEG = 5.0
+        AUTO_ANGLE_DETECT_DEFAULT_DEG = 10.0
+
+        auto_angle_detect_threshold = AUTO_ANGLE_DETECT_DEFAULT_DEG
+        detect_candidates: list[Any] = []
+        if isinstance(overrides_state, dict):
+            detect_candidates.append(overrides_state.get("auto_angle_detect_deg"))
+        if isinstance(combined_solver_settings, dict):
+            detect_candidates.append(combined_solver_settings.get("auto_angle_detect_deg"))
+        for candidate in detect_candidates:
+            val = _sanitize_angle_value(candidate, AUTO_ANGLE_DETECT_DEFAULT_DEG)
+            if val > 0:
+                auto_angle_detect_threshold = val
+                break
+
+        orientation_effective_state: Dict[str, float] = {"value": 0.0}
+        candidate_chain: list[Any] = []
+        if isinstance(overrides_state, dict):
+            candidate_chain.append(overrides_state.get("cluster_orientation_split_deg"))
+        if isinstance(combined_solver_settings, dict):
+            candidate_chain.append(combined_solver_settings.get("cluster_orientation_split_deg"))
+        for candidate in candidate_chain:
+            val = _sanitize_angle_value(candidate, 0.0)
+            if val > 0:
+                orientation_effective_state["value"] = val
+                break
 
         # Determine available sky coordinates.  Older projects or raw header
         # scans may not provide any RA/Dec information, in which case we still
@@ -1356,6 +1861,16 @@ def launch_filter_interface(
         analyse_btn.grid(row=0, column=0, padx=(0, 6))
         export_btn.grid(row=0, column=1)
         total_initial_entries = len(items)
+
+        if startup_status_messages:
+            try:
+                status_var.set(startup_status_messages[-1])
+            except Exception:
+                pass
+            try:
+                pb.stop()
+            except Exception:
+                pass
 
         if stream_mode:
             if stream_state.get("status_message"):
@@ -1724,6 +2239,19 @@ def launch_filter_interface(
         async_events: "queue.Queue[tuple[Any, ...]]" = queue.Queue()
         resolve_state = {"running": False}
         _progress_log_state = {"last": 0.0}
+        resolve_now_state: Dict[str, Any] = {
+            "running": False,
+            "executor": None,
+            "futures": [],
+            "total": 0,
+            "done": 0,
+            "success": 0,
+            "log_path": None,
+            "log_dir": None,
+            "button": None,
+            "progressbar": None,
+            "status_var": None,
+        }
 
         MAX_UI_MSG = 150
         UI_BUDGET_MS = 35.0
@@ -1772,6 +2300,13 @@ def launch_filter_interface(
             if _dbg_msgs:
                 _write_log_entries([("INFO", msg) for msg in _dbg_msgs])
                 _dbg_msgs.clear()
+        except Exception:
+            pass
+
+        try:
+            if pending_startup_messages:
+                _write_log_entries(list(pending_startup_messages))
+                pending_startup_messages.clear()
         except Exception:
             pass
 
@@ -1868,6 +2403,8 @@ def launch_filter_interface(
             if ok:
                 wcs_async_state["success"] = int(wcs_async_state.get("success") or 0) + 1
 
+            write_inplace = bool(wcs_async_state.get("write_inplace"))
+
             total = int(wcs_async_state.get("total") or 0)
             done_now = int(wcs_async_state.get("done") or 0)
             try:
@@ -1936,6 +2473,8 @@ def launch_filter_interface(
 
             log_path = wcs_async_state.get("log_path")
             path_value = payload.get("path")
+            if ok:
+                _persist_wcs_header_if_requested(path_value, header_obj, write_inplace)
             solver_value = payload.get("solver")
             error_value = payload.get("error")
             log_entry: Dict[str, Any] = {}
@@ -1957,6 +2496,36 @@ def launch_filter_interface(
                             continue
                 if corners_list:
                     log_entry["corners"] = corners_list
+            if not ok:
+                move_error = payload.get("move_error")
+                if move_error:
+                    _log_message(f"[FilterUI] Failed to move problematic file: {move_error}", level="ERROR")
+                if payload.get("moved") and isinstance(idx_val, int):
+                    moved_filename = payload.get("move_filename")
+                    if not moved_filename and isinstance(path_value, str):
+                        moved_filename = os.path.basename(path_value)
+                    info_msg = _tr(
+                        "FILTER_FILE_MOVED_UNALIGNED",
+                        "Moved problematic file to 'unaligned_by_zemosaic': {filename}",
+                    ).format(filename=moved_filename or "?")
+                    _log_message(info_msg, level="INFO")
+                    try:
+                        status_var.set(
+                            _tr(
+                                "FILTER_WCS_FAIL_MOVED",
+                                "WCS solve failed; file moved to 'unaligned_by_zemosaic'.",
+                            )
+                        )
+                    except Exception:
+                        pass
+                    _remove_item(idx_val)
+                    refresh_msg = _tr(
+                        "FILTER_REFRESH_AFTER_MOVE",
+                        "List refreshed after excluding unaligned files.",
+                    )
+                    summary_var.set(_apply_summary_hint(refresh_msg))
+                    _log_message(refresh_msg, level="INFO")
+
             if log_entry.get("path") and log_path:
                 try:
                     with open(str(log_path), "a", encoding="utf-8") as fw:
@@ -2075,6 +2644,519 @@ def launch_filter_interface(
                 except Exception:
                     pass
             wcs_async_state["running"] = False
+
+        def _resolve_now_log_base(paths: list[str]) -> Optional[Path]:
+            if input_dir_path is not None:
+                return input_dir_path
+            sanitized: list[str] = []
+            for entry in paths:
+                if not entry:
+                    continue
+                try:
+                    sanitized.append(os.path.abspath(entry))
+                except Exception:
+                    continue
+            if not sanitized:
+                return None
+            try:
+                common = Path(os.path.commonpath(sanitized))
+            except Exception:
+                try:
+                    common = Path(sanitized[0]).parent
+                except Exception:
+                    return None
+            if common.is_file():
+                try:
+                    common = common.parent
+                except Exception:
+                    return None
+            return common
+
+        def _resolve_now_append_log(result: Dict[str, Any]) -> None:
+            log_path = resolve_now_state.get("log_path")
+            if not log_path:
+                return
+            path_val = result.get("path")
+            log_dir = resolve_now_state.get("log_dir")
+            try:
+                if log_dir is not None and path_val:
+                    rel_path = os.path.relpath(path_val, str(log_dir))
+                elif path_val:
+                    rel_path = os.path.basename(path_val)
+                else:
+                    rel_path = "<unknown>"
+            except Exception:
+                rel_path = os.path.basename(path_val) if path_val else "<unknown>"
+            status = "OK" if result.get("ok") else "FAIL"
+            if result.get("skipped"):
+                status = "SKIP"
+            code_val = result.get("return_code")
+            code_txt = "-" if code_val is None else str(code_val)
+            duration = result.get("duration")
+            try:
+                duration_txt = f"{float(duration):.2f}"
+            except Exception:
+                duration_txt = "-"
+            timestamp = datetime.datetime.now().isoformat(timespec="seconds") + "Z"
+            line = f"{timestamp}\t{status}\t{rel_path}\tcode={code_txt}\ttime_s={duration_txt}"
+            err_msg = result.get("error")
+            if err_msg:
+                line += f"\tmsg={err_msg}"
+            try:
+                with open(str(log_path), "a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
+            except Exception:
+                pass
+
+        def _update_resolve_now_ui() -> None:
+            total = int(resolve_now_state.get("total") or 0)
+            done = int(resolve_now_state.get("done") or 0)
+            success = int(resolve_now_state.get("success") or 0)
+            pb_widget = resolve_now_state.get("progressbar")
+            if pb_widget is not None:
+                try:
+                    pb_widget.config(mode="determinate", maximum=max(total, 1))
+                    pb_widget["value"] = min(done, total)
+                except Exception:
+                    pass
+            status_var_local = resolve_now_state.get("status_var")
+            if status_var_local is not None:
+                try:
+                    status_text = _tr(
+                        "filter_resolve_now_progress",
+                        "{done}/{total} processed ({ok} solved)",
+                        done=done,
+                        total=total,
+                        ok=success,
+                    )
+                except Exception:
+                    status_text = f"{done}/{total} ({success})"
+                try:
+                    status_var_local.set(status_text)
+                except Exception:
+                    pass
+            try:
+                if total > 0:
+                    summary_text = _tr(
+                        "filter_resolve_now_summary",
+                        "Resolving WCS: {done}/{total} processed ({ok} success).",
+                        done=done,
+                        total=total,
+                        ok=success,
+                    )
+                else:
+                    summary_text = _tr("filter_resolve_now_summary_idle", "Resolving WCS: idle.")
+                summary_var.set(_apply_summary_hint(summary_text))
+            except Exception:
+                pass
+
+        def _finalize_resolve_now_run() -> None:
+            if not resolve_now_state.get("running"):
+                return
+            resolve_now_state["running"] = False
+            executor = resolve_now_state.get("executor")
+            if executor is not None:
+                try:
+                    executor.shutdown(wait=False, cancel_futures=False)
+                except Exception:
+                    pass
+            resolve_now_state["executor"] = None
+            futures_list = resolve_now_state.get("futures")
+            if isinstance(futures_list, list):
+                futures_list.clear()
+            btn_widget = resolve_now_state.get("button")
+            if btn_widget is not None:
+                try:
+                    btn_widget.state(["!disabled"])
+                except Exception:
+                    try:
+                        btn_widget.configure(state=tk.NORMAL)
+                    except Exception:
+                        pass
+            total = int(resolve_now_state.get("total") or 0)
+            success = int(resolve_now_state.get("success") or 0)
+            try:
+                final_msg = _tr(
+                    "filter_resolve_now_done",
+                    "Resolve & write WCS completed: {ok}/{total} success.",
+                    ok=success,
+                    total=total,
+                )
+            except Exception:
+                final_msg = f"Resolve & write WCS completed: {success}/{total}"
+            _update_resolve_now_ui()
+            try:
+                status_var.set(final_msg)
+            except Exception:
+                pass
+            try:
+                summary_var.set(_apply_summary_hint(final_msg))
+            except Exception:
+                pass
+            try:
+                _flush_log_buffer(force=True)
+            except Exception:
+                pass
+
+        def _process_resolve_now_result(result: Dict[str, Any]) -> None:
+            if not isinstance(result, dict):
+                return
+            resolve_now_state["done"] = int(resolve_now_state.get("done") or 0) + 1
+            ok = bool(result.get("ok"))
+            skipped = bool(result.get("skipped"))
+            if ok and not skipped:
+                resolve_now_state["success"] = int(resolve_now_state.get("success") or 0) + 1
+                resolved_counter["count"] += 1
+                overrides_state["resolved_wcs_count"] = resolved_counter["count"]
+            idx_val = result.get("idx")
+            path_val = result.get("path")
+            header_obj = result.get("header")
+            wcs_obj = result.get("wcs")
+            if isinstance(idx_val, int) and 0 <= idx_val < len(items):
+                item = items[idx_val]
+                if header_obj is not None:
+                    try:
+                        item.header = header_obj
+                        item.src["header"] = header_obj
+                    except Exception:
+                        pass
+                if wcs_obj is not None and getattr(wcs_obj, "is_celestial", False):
+                    item.wcs = wcs_obj
+                    item.src["wcs"] = wcs_obj
+                    try:
+                        item.refresh_geometry()
+                    except Exception:
+                        pass
+                    try:
+                        _ensure_wrapped_capacity(idx_val)
+                        footprint_wrapped[idx_val] = None
+                        centroid_wrapped[idx_val] = None
+                    except Exception:
+                        pass
+                    pending_visual_refresh.add(idx_val)
+                    _schedule_visual_refresh_flush()
+                    _canvas_draw_idle()
+            name = os.path.basename(path_val) if isinstance(path_val, str) else "<unknown>"
+            if ok:
+                msg = _tr(
+                    "filter_resolve_now_log_ok",
+                    "WCS resolved for {name}.",
+                    name=name,
+                )
+                _log_message(msg, level="INFO")
+            else:
+                err_msg = result.get("error") or "unknown error"
+                msg = _tr(
+                    "filter_resolve_now_log_fail",
+                    "Failed to resolve WCS for {name}: {error}",
+                    name=name,
+                    error=err_msg,
+                )
+                _log_message(msg, level="WARN" if not skipped else "INFO")
+            _resolve_now_append_log(result)
+            _update_resolve_now_ui()
+            total = int(resolve_now_state.get("total") or 0)
+            done = int(resolve_now_state.get("done") or 0)
+            if done >= total:
+                _finalize_resolve_now_run()
+
+        def _dispatch_resolve_now_future(idx: int, fut) -> None:
+            def _deliver() -> None:
+                try:
+                    payload = fut.result()
+                except Exception as exc:
+                    path_guess = None
+                    if isinstance(idx, int) and 0 <= idx < len(items):
+                        path_guess = getattr(items[idx], "path", None)
+                    payload = {
+                        "idx": idx,
+                        "path": path_guess,
+                        "ok": False,
+                        "error": str(exc),
+                        "return_code": None,
+                        "duration": 0.0,
+                    }
+                _process_resolve_now_result(payload)
+
+            try:
+                root.after(0, _deliver)
+            except Exception:
+                _deliver()
+
+        def _on_pre_solve_wcs_clicked() -> None:
+            if resolve_now_state.get("running"):
+                return
+            if not (astap_available and solve_with_astap is not None):
+                warn_msg = _tr(
+                    "filter_resolve_now_no_astap",
+                    "ASTAP solver is not configured or unavailable.",
+                )
+                _log_message(warn_msg, level="WARN")
+                try:
+                    status_var.set(warn_msg)
+                except Exception:
+                    pass
+                status_local = resolve_now_state.get("status_var")
+                if status_local is not None:
+                    try:
+                        status_local.set(warn_msg)
+                    except Exception:
+                        pass
+                return
+
+            targets: list[tuple[int, str, Any]] = []
+            for idx, item in enumerate(items):
+                path_val = getattr(item, "path", None)
+                if not isinstance(path_val, str) or not os.path.isfile(path_val):
+                    continue
+                try:
+                    path_obj = Path(path_val)
+                except Exception:
+                    path_obj = Path(str(path_val))
+                try:
+                    if is_path_excluded(path_obj, EXCLUDED_DIRS):
+                        continue
+                except Exception:
+                    continue
+                header_obj = getattr(item, "header", None)
+                has_item_wcs = bool(item.wcs is not None and getattr(item.wcs, "is_celestial", False))
+                if has_item_wcs:
+                    continue
+                if header_obj is not None and _has_celestial_wcs(header_obj):
+                    continue
+                targets.append((idx, path_val, header_obj))
+
+            if not targets:
+                idle_msg = _tr(
+                    "filter_resolve_now_idle",
+                    "All listed files already include a celestial WCS.",
+                )
+                try:
+                    summary_var.set(_apply_summary_hint(idle_msg))
+                    status_var.set(idle_msg)
+                except Exception:
+                    pass
+                status_local = resolve_now_state.get("status_var")
+                if status_local is not None:
+                    try:
+                        status_local.set(idle_msg)
+                    except Exception:
+                        pass
+                return
+
+            def _coerce_float(value: Any) -> Optional[float]:
+                try:
+                    if value is None or value == "":
+                        return None
+                    return float(value)
+                except Exception:
+                    return None
+
+            def _coerce_int(value: Any) -> Optional[int]:
+                try:
+                    if value is None or value == "":
+                        return None
+                    return int(float(value))
+                except Exception:
+                    return None
+
+            search_radius_val = (
+                combined_solver_settings.get("astap_search_radius_deg")
+                if isinstance(combined_solver_settings, dict)
+                else None
+            )
+            if search_radius_val is None:
+                search_radius_val = combined_solver_settings.get("search_radius_deg") if isinstance(combined_solver_settings, dict) else None
+            search_radius = _coerce_float(search_radius_val)
+            if search_radius is not None and search_radius <= 0:
+                search_radius = None
+
+            downsample_candidate = None
+            if isinstance(combined_solver_settings, dict):
+                downsample_candidate = combined_solver_settings.get("astap_downsample")
+                if downsample_candidate is None:
+                    downsample_candidate = combined_solver_settings.get("downsample")
+            downsample_val = _coerce_int(downsample_candidate)
+            if downsample_val is not None and downsample_val < 0:
+                downsample_val = None
+
+            sensitivity_candidate = None
+            if isinstance(combined_solver_settings, dict):
+                sensitivity_candidate = combined_solver_settings.get("astap_sensitivity")
+            sensitivity_val = _coerce_int(sensitivity_candidate)
+
+            timeout_base = None
+            timeout_astap = None
+            if isinstance(combined_solver_settings, dict):
+                timeout_base = _coerce_int(combined_solver_settings.get("timeout_sec"))
+                if timeout_base is None:
+                    timeout_base = _coerce_int(combined_solver_settings.get("timeout"))
+                timeout_astap = _coerce_int(combined_solver_settings.get("astap_timeout_sec"))
+            if timeout_base is None or timeout_base <= 0:
+                timeout_base = 120
+            timeout_base = max(5, timeout_base)
+            if timeout_astap is None or timeout_astap <= 0:
+                timeout_astap = max(180, timeout_base)
+
+            resolve_now_state["running"] = True
+            resolve_now_state["total"] = len(targets)
+            resolve_now_state["done"] = 0
+            resolve_now_state["success"] = 0
+            futures_list = resolve_now_state.get("futures")
+            if isinstance(futures_list, list):
+                futures_list.clear()
+
+            log_base = _resolve_now_log_base([path for _, path, _ in targets])
+            if log_base is not None:
+                try:
+                    log_base.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
+                log_path = log_base / WCS_LOG_NAME
+                resolve_now_state["log_dir"] = log_base
+                resolve_now_state["log_path"] = log_path
+                try:
+                    with open(str(log_path), "a", encoding="utf-8") as handle:
+                        handle.write(
+                            f"# {datetime.datetime.now().isoformat(timespec='seconds')}Z Resolve & write WCS now\n"
+                        )
+                except Exception:
+                    pass
+            else:
+                resolve_now_state["log_dir"] = None
+                resolve_now_state["log_path"] = None
+
+            btn_widget = resolve_now_state.get("button")
+            if btn_widget is not None:
+                try:
+                    btn_widget.state(["disabled"])
+                except Exception:
+                    try:
+                        btn_widget.configure(state=tk.DISABLED)
+                    except Exception:
+                        pass
+            try:
+                status_var.set(
+                    _tr(
+                        "filter_resolve_now_running",
+                        "Resolving WCS in background…",
+                    )
+                )
+            except Exception:
+                pass
+            _update_resolve_now_ui()
+
+            max_workers = min(8, max(2, (os.cpu_count() or 4)))
+            try:
+                executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="FilterWCS")
+            except Exception as exc:
+                resolve_now_state["running"] = False
+                resolve_now_state["executor"] = None
+                if btn_widget is not None:
+                    try:
+                        btn_widget.state(["!disabled"])
+                    except Exception:
+                        try:
+                            btn_widget.configure(state=tk.NORMAL)
+                        except Exception:
+                            pass
+                _log_message(f"Failed to start WCS resolve threads: {exc}", level="ERROR")
+                return
+            resolve_now_state["executor"] = executor
+
+            code_pattern = re.compile(r"code\\s+(-?\\d+)", re.IGNORECASE)
+
+            def _solve_target(idx: int, path_val: str, header_obj) -> Dict[str, Any]:
+                start_ts = time.monotonic()
+                result: Dict[str, Any] = {
+                    "idx": idx,
+                    "path": path_val,
+                    "ok": False,
+                    "return_code": None,
+                    "duration": 0.0,
+                }
+                header_payload = header_obj
+                if header_payload is not None:
+                    try:
+                        header_payload = header_payload.copy()
+                    except Exception:
+                        pass
+                if header_payload is None:
+                    try:
+                        header_payload = fits.getheader(path_val, 0)
+                    except Exception as exc:
+                        result["error"] = f"header load failed: {exc}"
+                        result["duration"] = time.monotonic() - start_ts
+                        return result
+                if _has_celestial_wcs(header_payload):
+                    result["ok"] = True
+                    result["skipped"] = True
+                    try:
+                        result["wcs"] = WCS(header_payload, naxis=2, relax=True)
+                        _assign_pa_metadata(result, result["wcs"], result.get("shape"))
+                    except Exception:
+                        pass
+                    result["header"] = header_payload
+                    result["return_code"] = 0
+                    result["duration"] = time.monotonic() - start_ts
+                    return result
+
+                progress_state = {"return_code": None}
+
+                def _progress_cb(message, *_args) -> None:
+                    if not isinstance(message, str):
+                        return
+                    match = code_pattern.search(message)
+                    if match:
+                        try:
+                            progress_state["return_code"] = int(match.group(1))
+                        except Exception:
+                            progress_state["return_code"] = None
+
+                try:
+                    wcs_obj = solve_with_astap(
+                        path_val,
+                        header_payload,
+                        astap_exe_path,
+                        astap_data_dir,
+                        search_radius_deg=search_radius,
+                        downsample_factor=downsample_val,
+                        sensitivity=sensitivity_val,
+                        timeout_sec=timeout_astap,
+                        update_original_header_in_place=True,
+                        progress_callback=_progress_cb,
+                    )
+                except Exception as exc:
+                    result["error"] = str(exc)
+                    result["return_code"] = progress_state.get("return_code")
+                    result["duration"] = time.monotonic() - start_ts
+                    return result
+
+                result["return_code"] = progress_state.get("return_code")
+                result["duration"] = time.monotonic() - start_ts
+                if wcs_obj is not None and getattr(wcs_obj, "is_celestial", False):
+                    try:
+                        _write_header_to_fits_local(path_val, header_payload)
+                    except Exception:
+                        pass
+                    result["ok"] = True
+                    result["wcs"] = wcs_obj
+                    _assign_pa_metadata(result, wcs_obj, result.get("shape"))
+                    result["header"] = header_payload
+                else:
+                    result["error"] = "no solution"
+                return result
+
+            futures_collected: list[tuple[int, Any]] = []
+            for idx, path_val, header_obj in targets:
+                fut = executor.submit(_solve_target, idx, path_val, header_obj)
+                futures_collected.append((idx, fut))
+            resolve_now_state["futures"] = [f for _, f in futures_collected]
+            for idx, fut in futures_collected:
+                try:
+                    fut.add_done_callback(lambda f, i=idx: _dispatch_resolve_now_future(i, f))
+                except Exception:
+                    _dispatch_resolve_now_future(idx, fut)
 
         def _paint_from_log_clicked() -> None:
             if wcs_async_state.get("running"):
@@ -2508,6 +3590,35 @@ def launch_filter_interface(
         write_wcs_var = tk.BooleanVar(master=root, value=True)
         coverage_first_var = tk.BooleanVar(master=root, value=True)
         overcap_percent_var = tk.IntVar(master=root, value=10)
+        angle_split_initial = orientation_effective_state["value"] if orientation_effective_state["value"] > 0 else ANGLE_SPLIT_DEFAULT_DEG
+        auto_angle_split_var = tk.BooleanVar(master=root, value=True)
+        angle_split_deg_var = tk.DoubleVar(master=root, value=float(angle_split_initial))
+
+        def _current_angle_split_candidate() -> float:
+            if angle_split_deg_var is None:
+                return ANGLE_SPLIT_DEFAULT_DEG
+            try:
+                return _sanitize_angle_value(angle_split_deg_var.get(), ANGLE_SPLIT_DEFAULT_DEG)
+            except Exception:
+                return ANGLE_SPLIT_DEFAULT_DEG
+
+        def _update_orientation_effective(value: float) -> None:
+            sanitized = _sanitize_angle_value(value, 0.0)
+            orientation_effective_state["value"] = sanitized
+            if isinstance(overrides_state, dict):
+                overrides_state["cluster_orientation_split_deg"] = sanitized
+
+        def _on_auto_angle_toggle(*_args: Any) -> None:
+            manual_mode = bool(auto_angle_split_var and not auto_angle_split_var.get())
+            if manual_mode:
+                _update_orientation_effective(_current_angle_split_candidate())
+            else:
+                _update_orientation_effective(orientation_effective_state.get("value", 0.0))
+
+        try:
+            auto_angle_split_var.trace_add("write", lambda *_: _on_auto_angle_toggle())
+        except Exception:
+            pass
 
         WCS_LOG_NAME = "zemosaic_wcs.log"
         DEFER_DRAW_CHUNK = 200
@@ -2645,6 +3756,37 @@ def launch_filter_interface(
             overcap_spin.grid(row=3, column=1, padx=4, pady=(2, 0), sticky="w")
         except Exception as e:
             _log_message(f"[FilterUI] Over-cap spinbox failed: {e}", level="WARN")
+
+        try:
+            auto_angle_chk = ttk.Checkbutton(
+                operations,
+                text=_tr("ui_auto_angle_split", "Auto split by orientation"),
+                variable=auto_angle_split_var,
+            )
+            auto_angle_chk.grid(row=4, column=0, columnspan=3, padx=4, pady=(6, 0), sticky="w")
+        except Exception as e:
+            _log_message(f"[FilterUI] Auto-angle checkbox failed: {e}", level="WARN")
+            auto_angle_chk = None
+
+        try:
+            angle_label = ttk.Label(
+                operations,
+                text=_tr("ui_angle_split_threshold", "Orientation split (deg)"),
+            )
+            angle_label.grid(row=5, column=0, padx=4, pady=(2, 0), sticky="w")
+            angle_spin = ttk.Spinbox(
+                operations,
+                from_=0.0,
+                to=180.0,
+                increment=0.5,
+                textvariable=angle_split_deg_var,
+                width=6,
+                justify="center",
+                format="%.1f",
+            )
+            angle_spin.grid(row=5, column=1, padx=4, pady=(2, 0), sticky="w")
+        except Exception as e:
+            _log_message(f"[FilterUI] Angle split spinbox failed: {e}", level="WARN")
 
         try:
             footprints_chk = ttk.Checkbutton(
@@ -2821,9 +3963,14 @@ def launch_filter_interface(
             timeout_val = _coerce_int(timeout_candidate)
             if timeout_val is None or timeout_val <= 0:
                 timeout_val = 60
-            timeout_sec = max(5, min(timeout_val, 120))
+            timeout_sec = max(5, timeout_val)
             solver_settings_local["timeout"] = timeout_sec
             solver_settings_local["ansvr_timeout"] = timeout_sec
+
+            # ASTAP handling in the worker always allows up to 180 seconds before
+            # timing out. Mirror that behaviour here so the filter UI matches the
+            # main pipeline resilience on slow solves.
+            astap_timeout_sec = max(180, timeout_sec)
 
             astrometry_direct = getattr(astrometry_mod, "solve_with_astrometry_net", None) if astrometry_mod else None
             ansvr_direct = getattr(astrometry_mod, "solve_with_ansvr", None) if astrometry_mod else None
@@ -2856,6 +4003,18 @@ def launch_filter_interface(
                 file_name = os.path.basename(path)
                 header_obj = getattr(item, "header", None)
 
+                def _record_failure(error_message: Optional[str]) -> Dict[str, Any]:
+                    if error_message:
+                        result["error"] = str(error_message)
+                    move_info = _move_problematic_file(path)
+                    if move_info.get("moved"):
+                        result["moved"] = True
+                        result["moved_path"] = move_info.get("destination")
+                        result["move_filename"] = move_info.get("filename")
+                    if move_info.get("error"):
+                        result["move_error"] = move_info.get("error")
+                    return result
+
                 try:
                     if header_obj is not None:
                         _enqueue_event("header_loaded", idx, header_obj)
@@ -2887,8 +4046,7 @@ def launch_filter_interface(
                                 name=file_name,
                                 err=exc,
                             )
-                            result["error"] = str(exc)
-                            return result
+                            return _record_failure(str(exc))
                         else:
                             if header_obj is not None:
                                 _enqueue_event("header_loaded", idx, header_obj)
@@ -2923,6 +4081,7 @@ def launch_filter_interface(
                         result["solver"] = solver_name
                         result["header"] = header_obj
                         result["wcs"] = wcs_obj
+                        _assign_pa_metadata(result, wcs_obj, _shape_from_header())
                         footprint_pts = None
                         try:
                             footprint_pts = _compute_footprint_from_wcs(wcs_obj, _shape_from_header())
@@ -2962,7 +4121,7 @@ def launch_filter_interface(
                                 search_radius_deg=srch_radius,
                                 downsample_factor=downsample_val,
                                 sensitivity=sensitivity_val,
-                                timeout_sec=timeout_sec,
+                                timeout_sec=astap_timeout_sec,
                                 update_original_header_in_place=write_inplace,
                                 progress_callback=_progress_callback,
                             )
@@ -3127,11 +4286,10 @@ def launch_filter_interface(
                         result["error"] = last_error
                     else:
                         result["error"] = "no solution"
-                    return result
+                    return _record_failure(result.get("error"))
                 except Exception as exc:
                     _enqueue_event("log", f"Unexpected resolver error: {exc}", "ERROR")
-                    result["error"] = str(exc)
-                    return result
+                    return _record_failure(str(exc))
 
             try:
                 _cancel_wcs_executor()
@@ -3155,6 +4313,7 @@ def launch_filter_interface(
                 wcs_async_state["total"] = len(pending)
                 wcs_async_state["stop"] = False
                 wcs_async_state["running"] = True
+                wcs_async_state["write_inplace"] = write_inplace
 
                 log_dir: Optional[Path] = None
                 for _idx, _item in pending:
@@ -3443,11 +4602,14 @@ def launch_filter_interface(
                                 center_obj = None
                         if item.wcs is None and center_obj is not None:
                             entry["wcs"] = _FallbackWCS(center_obj)
+                            entry["PA_DEG"] = None
                             entry["_fallback_wcs_used"] = True
                             entry.setdefault("phase0_center", center_obj)
                             entry.setdefault("center", center_obj)
                         elif item.wcs is not None:
                             entry["wcs"] = item.wcs
+                            if "PA_DEG" not in entry:
+                                entry["PA_DEG"] = getattr(item, "pa_deg", None)
                             if center_obj is not None:
                                 entry.setdefault("center", center_obj)
                         if center_obj is not None:
@@ -3509,15 +4671,21 @@ def launch_filter_interface(
                     if threshold_initial <= 0:
                         threshold_initial = float(threshold_heuristic) if threshold_heuristic > 0 else 0.10
 
+                    auto_angle_enabled = bool(auto_angle_split_var.get()) if auto_angle_split_var is not None else True
+                    manual_angle_mode = not auto_angle_enabled
+                    angle_split_candidate = _current_angle_split_candidate()
+                    if manual_angle_mode:
+                        _update_orientation_effective(angle_split_candidate)
                     orientation_threshold = 0.0
-                    orientation_candidates = [combined_solver_settings.get("cluster_orientation_split_deg")]
+                    orientation_candidates: list[Any] = []
+                    if manual_angle_mode and angle_split_candidate > 0:
+                        orientation_candidates.append(angle_split_candidate)
                     if isinstance(overrides_state, dict):
                         orientation_candidates.append(overrides_state.get("cluster_orientation_split_deg"))
+                    if isinstance(combined_solver_settings, dict):
+                        orientation_candidates.append(combined_solver_settings.get("cluster_orientation_split_deg"))
                     for candidate in orientation_candidates:
-                        try:
-                            val = float(candidate)
-                        except Exception:
-                            continue
+                        val = _sanitize_angle_value(candidate, 0.0)
                         if val > 0:
                             orientation_threshold = val
                             break
@@ -3613,6 +4781,53 @@ def launch_filter_interface(
                                     _log_async(relax_msg, "INFO")
                                     groups_used = groups_relaxed
                                     threshold_used = threshold_relaxed
+
+                    angle_split_effective = float(orientation_threshold if orientation_threshold > 0 else 0.0)
+                    if manual_angle_mode:
+                        angle_split_effective = angle_split_candidate
+                    else:
+                        auto_angle_triggered = False
+                        if (
+                            auto_angle_enabled
+                            and angle_split_effective <= 0.0
+                            and angle_split_candidate > 0.0
+                        ):
+                            oriented_groups: list[list[dict]] = []
+                            triggered_groups = 0
+                            for grp in groups_used:
+                                pa_values: list[float] = []
+                                for info in grp or []:
+                                    try:
+                                        pa_raw = info.get("PA_DEG")
+                                    except Exception:
+                                        pa_raw = None
+                                    try:
+                                        pa_float = float(pa_raw)
+                                    except Exception:
+                                        pa_float = None
+                                    if pa_float is None or not math.isfinite(pa_float):
+                                        continue
+                                    pa_values.append(pa_float)
+                                dispersion_val = _circular_dispersion_deg(pa_values)
+                                if dispersion_val > auto_angle_detect_threshold:
+                                    triggered_groups += 1
+                                    oriented_groups.extend(_split_group_by_orientation(grp, angle_split_candidate))
+                                else:
+                                    oriented_groups.append(grp)
+                            if triggered_groups > 0:
+                                groups_used = oriented_groups
+                                angle_split_effective = angle_split_candidate
+                                auto_angle_triggered = True
+                                _update_orientation_effective(angle_split_effective)
+                                auto_msg = _tr_safe(
+                                    "filter_log_orientation_autosplit",
+                                    "Orientation auto-split enabled: threshold={TH}° for {N} group(s)",
+                                    TH=f"{angle_split_effective:.1f}",
+                                    N=triggered_groups,
+                                )
+                                _log_async(auto_msg, "INFO")
+                        if not auto_angle_triggered:
+                            _update_orientation_effective(angle_split_effective)
 
                     groups_after_autosplit = autosplit_func(
                         groups_used,
@@ -3828,7 +5043,15 @@ def launch_filter_interface(
             "cancelled": False,
         }
 
+        def _ensure_orientation_override_synced() -> None:
+            manual_mode = bool(auto_angle_split_var and not auto_angle_split_var.get())
+            if manual_mode:
+                _update_orientation_effective(_current_angle_split_candidate())
+            else:
+                _update_orientation_effective(orientation_effective_state.get("value", 0.0))
+
         def _cancel_overrides_payload() -> dict[str, Any]:
+            _ensure_orientation_override_synced()
             payload: dict[str, Any] = {}
             if isinstance(overrides_state, dict) and overrides_state:
                 payload.update(overrides_state)
@@ -3843,6 +5066,8 @@ def launch_filter_interface(
             sel = _get_selected_indices()
             result["accepted"] = True
             result["selected_indices"] = sel
+            # ensure orientation override exported
+            _ensure_orientation_override_synced()
             result["overrides"] = overrides_state if overrides_state else None
             result["cancelled"] = False
             # If running as a Toplevel, do not quit the main GUI loop
@@ -3860,6 +5085,7 @@ def launch_filter_interface(
                     root.destroy()
                 except Exception:
                     pass
+
         def on_cancel():
             _drain_stream_queue_non_blocking(mark_done=True)
             result["accepted"] = False
@@ -3880,6 +5106,34 @@ def launch_filter_interface(
                     root.destroy()
                 except Exception:
                     pass
+        resolve_now_frame = ttk.Frame(bottom)
+        try:
+            resolve_now_frame.pack(side=tk.LEFT, padx=4, pady=4)
+        except Exception:
+            resolve_now_frame.pack(side=tk.LEFT, padx=4)
+        resolve_now_status = tk.StringVar(master=root, value="")
+        resolve_now_state["status_var"] = resolve_now_status
+        try:
+            resolve_now_btn_widget = ttk.Button(
+                resolve_now_frame,
+                text=_tr("filter_resolve_now_button", "Resolve & write WCS now"),
+                command=_on_pre_solve_wcs_clicked,
+            )
+            resolve_now_btn_widget.pack(fill=tk.X, expand=False)
+            resolve_now_state["button"] = resolve_now_btn_widget
+        except Exception:
+            resolve_now_state["button"] = None
+        try:
+            resolve_now_progress = ttk.Progressbar(resolve_now_frame, mode="determinate", length=160)
+            resolve_now_progress.pack(fill=tk.X, expand=False, pady=(4, 0))
+            resolve_now_state["progressbar"] = resolve_now_progress
+        except Exception:
+            resolve_now_state["progressbar"] = None
+        try:
+            ttk.Label(resolve_now_frame, textvariable=resolve_now_status).pack(fill=tk.X, expand=False, pady=(2, 0))
+        except Exception:
+            pass
+
         ttk.Button(
             bottom,
             text=_tr(
@@ -4030,9 +5284,34 @@ def launch_filter_interface(
                     center_val = None
             centroid_wrapped[idx] = center_val
 
+        def _color_for_item(idx: int, selected: bool) -> tuple[float, float, float, float]:
+            base_alpha = 0.9 if selected else 0.35
+            pa_value = None
+            if 0 <= idx < len(items):
+                try:
+                    pa_value = items[idx].pa_deg
+                except Exception:
+                    pa_value = None
+                if pa_value is None:
+                    try:
+                        pa_raw = items[idx].src.get("PA_DEG")
+                        pa_value = float(pa_raw)
+                    except Exception:
+                        pa_value = None
+            if pa_value is not None and math.isfinite(pa_value):
+                hue = (float(pa_value) % 360.0) / 360.0
+                saturation = 0.65 if selected else 0.45
+                value = 0.95 if selected else 0.80
+                try:
+                    rgb = hsv_to_rgb((hue, saturation, value))
+                    return (float(rgb[0]), float(rgb[1]), float(rgb[2]), base_alpha)
+                except Exception:
+                    pass
+            return to_rgba("tab:blue" if selected else "0.7", base_alpha)
+
         def _append_visual_entry(idx: int) -> None:
             selected = _is_selected(idx)
-            color = to_rgba("tab:blue" if selected else "0.7", 0.9 if selected else 0.3)
+            color = _color_for_item(idx, selected)
             draw_fp = _should_draw_footprints()
             footprint_budget = footprint_budget_state["budget"]
             wrapped_fp = footprint_wrapped[idx]
@@ -4619,6 +5898,102 @@ def launch_filter_interface(
                 ).format(current=min(processed, population_state["total"]), total=population_state["total"])
             )
 
+        def _remove_item(idx: int) -> None:
+            if idx < 0 or idx >= len(items):
+                return
+
+            try:
+                removed_item = items.pop(idx)
+            except Exception:
+                return
+
+            if idx < len(raw_files_with_wcs):
+                try:
+                    raw_files_with_wcs.pop(idx)
+                except Exception:
+                    pass
+
+            if idx < len(item_labels):
+                try:
+                    item_labels.pop(idx)
+                except Exception:
+                    pass
+
+            if idx < len(footprint_wrapped):
+                try:
+                    footprint_wrapped.pop(idx)
+                except Exception:
+                    pass
+            if idx < len(centroid_wrapped):
+                try:
+                    centroid_wrapped.pop(idx)
+                except Exception:
+                    pass
+
+            if use_listbox_mode:
+                if idx < len(selection_state):
+                    try:
+                        selection_state.pop(idx)
+                    except Exception:
+                        pass
+                adjusted_cache: set[int] = set()
+                for pos in listbox_selection_cache:
+                    if pos == idx:
+                        continue
+                    adjusted_cache.add(pos - 1 if pos > idx else pos)
+                listbox_selection_cache.clear()
+                listbox_selection_cache.update(adjusted_cache)
+                if listbox_widget is not None:
+                    try:
+                        listbox_widget.delete(idx)
+                    except Exception:
+                        pass
+            else:
+                if idx < len(check_vars):
+                    try:
+                        check_vars.pop(idx)
+                    except Exception:
+                        pass
+                if idx < len(checkbuttons):
+                    btn = checkbuttons.pop(idx)
+                    if btn is not None:
+                        try:
+                            btn.destroy()
+                        except Exception:
+                            pass
+
+            known_path_index.clear()
+            for pos, entry in enumerate(items):
+                key = _path_key(getattr(entry, "path", None))
+                if key:
+                    known_path_index[key] = pos
+
+            instruments_found.clear()
+            for entry in items:
+                instruments_found.add((entry.instrument or "Unknown").strip() or "Unknown")
+            try:
+                _refresh_instrument_options()
+            except Exception:
+                pass
+
+            pending_visual_refresh.clear()
+            _clear_visual_datasets()
+            _recompute_footprint_budget()
+            _schedule_visual_build(full=True)
+            _schedule_axes_update()
+
+            population_state["total"] = len(items)
+            if population_state["next_index"] > len(items):
+                population_state["next_index"] = len(items)
+
+            if not items:
+                try:
+                    _draw_group_outlines(None)
+                except Exception:
+                    pass
+
+            _dbg(f"Removed problematic item: idx={idx}, remaining={len(items)} path={getattr(removed_item, 'path', '?')}")
+
         def _add_item_row(item: Item) -> None:
             idx = len(item_labels)
             base = os.path.basename(item.path)
@@ -4856,8 +6231,20 @@ def launch_filter_interface(
                 return
             new_indices: list[int] = []
             visuals_dirty = False
+            exclusion_msg = _tr(
+                "FILTER_EXCLUDED_DIR",
+                'The folder "unaligned_by_zemosaic" is excluded and will not be scanned.',
+            )
             for entry in batch:
                 candidate_path = entry.get("path") or entry.get("path_raw") or entry.get("path_preprocessed_cache")
+                if candidate_path:
+                    try:
+                        candidate_obj = Path(candidate_path)
+                    except Exception:
+                        candidate_obj = Path(str(candidate_path))
+                    if is_path_excluded(candidate_obj, EXCLUDED_DIRS):
+                        _remember_exclusion(candidate_obj, exclusion_msg)
+                        continue
                 key = _path_key(candidate_path)
                 if key and key in known_path_index:
                     existing_idx = known_path_index[key]

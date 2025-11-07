@@ -83,6 +83,11 @@ psutil for memory monitoring
 
 tkinter for the graphical user interface
 
+> **Note (Linux/macOS):** Tkinter is bundled with the official Python installers.
+> On minimal Linux distributions you must install it via your package manager
+> (e.g. `sudo apt install python3-tk` or `sudo dnf install python3-tkinter`).
+> It is not published as a pip package named `tk`.
+
 📦 Installation & Usage
 1. 🔧 Install Python dependencies
 If you have a local clone of the repository, make sure you're in the project folder, then run:
@@ -138,6 +143,81 @@ Select stacking and assembly options
 
 Click Start Hierarchical Mosaic
 
+### macOS quickstart
+
+1. Install Python 3.11+ from [python.org](https://www.python.org/downloads/) (includes Tk).  
+   Homebrew users should also `brew install tcl-tk` and follow the caveats so Tk can be located.
+2. Download the macOS ASTAP `.dmg`, drag `ASTAP.app` into `/Applications`, then install the star catalogs
+   (D50/H17) under `/Library/Application Support/ASTAP` or `~/Library/Application Support/ASTAP`.
+3. Inside the project folder run:
+
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   python3 -m pip install --upgrade pip
+   python3 -m pip install -r requirements.txt
+   python3 run_zemosaic.py
+   ```
+
+4. ZeMosaic now auto-detects `/Applications/ASTAP.app/Contents/MacOS/astap` and the associated catalog
+   directories, but you can override them at any time:
+
+   ```bash
+   export ASTAP_EXE=/Applications/ASTAP.app/Contents/MacOS/astap
+   export ASTAP_DATA_DIR="/Library/Application Support/ASTAP"
+   ```
+
+### Linux quickstart
+
+1. Install Python, pip, Tk, and build tooling via your package manager. Example for Debian/Ubuntu:
+
+   ```bash
+   sudo apt update
+   sudo apt install python3 python3-venv python3-pip python3-tk python3-dev build-essential
+   ```
+
+   Fedora/RHEL users can run `sudo dnf install python3 python3-venv python3-pip python3-tkinter`.
+
+2. Install the ASTAP Linux package (from https://www.hnsky.org/astap.htm) and the desired star catalogs.
+   The default installer places binaries under `/usr/bin/astap` and data under `/opt/astap`.
+
+3. Create a virtual environment and launch ZeMosaic:
+
+   ```bash
+   python3 -m venv .venv
+   source .venv/bin/activate
+   python3 -m pip install --upgrade pip
+   python3 -m pip install -r requirements.txt
+   python3 run_zemosaic.py
+   ```
+
+4. ASTAP locations are discovered automatically on `/usr/bin`, `/usr/local/bin`, and `/opt/astap`, but
+   you can pin custom installs:
+
+   ```bash
+   export ASTAP_EXE=/usr/local/bin/astap
+   export ASTAP_DATA_DIR=/opt/astap
+   ```
+
+### ASTAP path detection & overrides
+
+`zemosaic_config.py` now validates the stored executable/data paths on startup and, if needed, scans the
+common installation directories for Windows (`Program Files`), macOS (`/Applications/ASTAP*.app`), and
+Linux (`/usr/bin`, `/opt/astap`, etc.). The following environment variables are respected ahead of the
+auto-detected paths:
+
+- `ASTAP_EXE`, `ASTAP_BIN`, or `ASTAP_PATH` for the binary
+- `ASTAP_DATA_DIR`, `ASTAP_STAR_DB`, or `ASTAP_DATABASE` for the star catalogs
+
+You can inspect what was found by running:
+
+```bash
+python - <<'PY'
+from zemosaic_config import detect_astap_installation
+print(detect_astap_installation())
+PY
+```
+
 🔧 Build & Compilation (Windows) / Compilation (Windows)
 🇬🇧 Instructions (English)
 To build the standalone executable version of ZeMosaic, follow these steps:
@@ -184,6 +264,33 @@ compile\build_zemosaic.bat
 L’exécutable final se trouvera dans dist/zemosaic.exe.
 
 ✅ Les fichiers de traduction (locales/*.json) et les icônes (icon/zemosaic.ico) sont inclus automatiquement.
+
+🛠️ Build & Compilation (macOS/Linux)
+🇬🇧 Instructions (English)
+
+1. Ensure you have a virtual environment (`python3 -m venv .venv`), then activate it: `source .venv/bin/activate`.
+2. Install the runtime requirements once: `python3 -m pip install -r requirements.txt`.
+3. Make the helper executable and launch it:
+
+   ```bash
+   chmod +x compile/build_zemosaic_posix.sh
+   ./compile/build_zemosaic_posix.sh
+   ```
+
+   The script installs/updates PyInstaller inside `.venv` and produces `dist/zemosaic`.
+
+🇫🇷 Instructions (Français)
+
+1. Créez/activez votre environnement virtuel (`python3 -m venv .venv` puis `source .venv/bin/activate`).
+2. Installez les dépendances (`python3 -m pip install -r requirements.txt`).
+3. Rendez le script exécutable puis lancez-le :
+
+   ```bash
+   chmod +x compile/build_zemosaic_posix.sh
+   ./compile/build_zemosaic_posix.sh
+   ```
+
+   L'exécutable macOS/Linux sera généré dans `dist/zemosaic`.
 
 ### Memory-mapped coadd (enabled by default)
 
