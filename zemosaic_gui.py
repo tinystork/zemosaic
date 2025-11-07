@@ -1,4 +1,4 @@
-# zemosaic_gui.py
+﻿# zemosaic_gui.py
 """
 ╔══════════════════════════════════════════════════════════════════════╗
 ║ ZeMosaic / ZeSeestarStacker Project                                  ║
