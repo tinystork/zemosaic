@@ -63,6 +63,7 @@ import queue
 import json
 import logging
 import re
+import math
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
@@ -227,6 +228,118 @@ def _merge_small_groups(
                 pass
 
     return [grp for idx, grp in enumerate(groups) if not merged_flags[idx]]
+
+
+def _circ_delta_deg(a: float, b: float) -> float:
+    """Return the absolute circular delta (degrees) between two angles."""
+
+    try:
+        delta = abs(float(a) - float(b)) % 360.0
+    except Exception:
+        return float("inf")
+    if delta > 180.0:
+        delta = 360.0 - delta
+    return delta
+
+
+def _circular_dispersion_deg(values: Iterable[float]) -> float:
+    """Estimate the minimal arc covering ``values`` on the unit circle (deg)."""
+
+    sanitized = []
+    for val in values:
+        try:
+            coerced = float(val)
+        except Exception:
+            continue
+        if math.isnan(coerced) or math.isinf(coerced):
+            continue
+        sanitized.append(coerced % 360.0)
+
+    if len(sanitized) <= 1:
+        return 0.0
+
+    sanitized.sort()
+    gaps: list[float] = []
+    for i in range(len(sanitized) - 1):
+        gaps.append(sanitized[i + 1] - sanitized[i])
+    gaps.append((sanitized[0] + 360.0) - sanitized[-1])
+    max_gap = max(gaps) if gaps else 0.0
+    dispersion = 360.0 - max_gap
+    if dispersion < 0.0:
+        dispersion = 0.0
+    return dispersion
+
+
+def _split_group_by_orientation(group: list[dict], threshold_deg: float) -> list[list[dict]]:
+    """Split ``group`` using circular proximity of ``PA_DEG`` values."""
+
+    if threshold_deg <= 0 or len(group) <= 1:
+        return [group]
+
+    with_angles: list[tuple[int, float]] = []
+    without_angles: list[int] = []
+    for idx, info in enumerate(group):
+        try:
+            pa_val = info.get("PA_DEG")
+        except Exception:
+            pa_val = None
+        try:
+            pa_deg = float(pa_val)
+        except Exception:
+            pa_deg = None
+        if pa_deg is None or math.isnan(pa_deg):
+            without_angles.append(idx)
+            continue
+        with_angles.append((idx, pa_deg % 360.0))
+
+    if len(with_angles) <= 1:
+        return [group]
+
+    with_angles.sort(key=lambda pair: pair[1])
+    parent = list(range(len(with_angles)))
+
+    def _find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def _union(a: int, b: int) -> None:
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i in range(len(with_angles) - 1):
+        if _circ_delta_deg(with_angles[i][1], with_angles[i + 1][1]) <= threshold_deg:
+            _union(i, i + 1)
+    if _circ_delta_deg(with_angles[0][1], with_angles[-1][1]) <= threshold_deg:
+        _union(0, len(with_angles) - 1)
+
+    buckets: dict[int, list[int]] = {}
+    for idx_valid, (original_idx, _) in enumerate(with_angles):
+        root = _find(idx_valid)
+        buckets.setdefault(root, []).append(original_idx)
+
+    subgroups: list[list[dict]] = []
+    subgroup_meta: list[tuple[int, list[dict]]] = []
+    for indices in buckets.values():
+        ordered_indices = sorted(indices)
+        subgroup_meta.append((ordered_indices[0], [group[i] for i in ordered_indices]))
+
+    if not subgroup_meta:
+        return [group]
+
+    subgroup_meta.sort(key=lambda pair: pair[0])
+    subgroups = [payload for _, payload in subgroup_meta]
+
+    if without_angles:
+        fallback_target = max(subgroups, key=len, default=subgroups[0])
+        for idx in without_angles:
+            fallback_target.append(group[idx])
+
+    if len(subgroups) == 1:
+        return [group]
+    return subgroups
 
 
 def _format_sizes_histogram(sizes: list[int], max_buckets: int = 6) -> str:
@@ -654,7 +767,7 @@ def launch_filter_interface(
             from matplotlib.figure import Figure
             from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
             from matplotlib.collections import LineCollection
-            from matplotlib.colors import to_rgba
+            from matplotlib.colors import to_rgba, hsv_to_rgb
         except ImportError as exc:
             heavy_import_error = exc
 
@@ -920,6 +1033,49 @@ def launch_filter_interface(
             except Exception:
                 return None
 
+        def _compute_position_angle_deg(
+            wcs_obj: Any,
+            shape_hw: Optional[tuple[int, int]] = None,
+        ) -> Optional[float]:
+            """Compute the on-sky position angle (deg) of the +X pixel axis."""
+
+            if wcs_obj is None or not getattr(wcs_obj, "is_celestial", False):
+                return None
+            if not hasattr(wcs_obj, "pixel_to_world"):
+                return None
+            try:
+                width = None
+                height = None
+                px_shape = getattr(wcs_obj, "pixel_shape", None)
+                if px_shape and len(px_shape) >= 2:
+                    width = float(px_shape[0])
+                    height = float(px_shape[1])
+                elif getattr(wcs_obj, "array_shape", None) and len(wcs_obj.array_shape) >= 2:  # type: ignore[attr-defined]
+                    height = float(wcs_obj.array_shape[0])  # type: ignore[attr-defined]
+                    width = float(wcs_obj.array_shape[1])  # type: ignore[attr-defined]
+                elif shape_hw and len(shape_hw) >= 2:
+                    height = float(shape_hw[0])
+                    width = float(shape_hw[1])
+                if width is None or height is None or width <= 1.0 or height <= 1.0:
+                    return None
+                cx = width / 2.0
+                cy = height / 2.0
+                c0 = wcs_obj.pixel_to_world(cx, cy)
+                c1 = wcs_obj.pixel_to_world(cx + 1.0, cy)
+                pa_deg = float(c0.position_angle(c1).to(u.deg).value) % 360.0
+                return pa_deg
+            except Exception:
+                return None
+
+        def _assign_pa_metadata(target: dict[str, Any], wcs_obj: Any, shape_hw: Optional[tuple[int, int]]) -> None:
+            """Populate ``target["PA_DEG"]`` using ``wcs_obj`` and optional shape."""
+
+            try:
+                pa_val = _compute_position_angle_deg(wcs_obj, shape_hw)
+            except Exception:
+                pa_val = None
+            target["PA_DEG"] = pa_val if pa_val is not None else None
+
         def _minimal_header_payload(fpath: str) -> Dict[str, Any]:
             payload: Dict[str, Any] = {"path": fpath}
             try:
@@ -944,6 +1100,7 @@ def launch_filter_interface(
                 w = WCS(hdr, naxis=2, relax=True)
                 if w is not None and getattr(w, "is_celestial", False):
                     payload["wcs"] = w
+                    _assign_pa_metadata(payload, w, payload.get("shape"))
                     fp = _compute_footprint_from_wcs(w, payload.get("shape"))
                     if fp:
                         payload["footprint_radec"] = fp
@@ -1348,6 +1505,7 @@ def launch_filter_interface(
                 self.shape: Optional[tuple[int, int]] = None
                 self.center: Optional[SkyCoord] = None
                 self.phase0_center: Optional[SkyCoord] = None
+                self.pa_deg: Optional[float] = None
                 # Footprint computations are quite expensive for thousands of
                 # entries.  Compute them lazily only when the UI actually needs
                 # the polygon to be drawn.
@@ -1535,6 +1693,12 @@ def launch_filter_interface(
                     self.src["center"] = self.center
                 if self.shape is not None:
                     self.src["shape"] = self.shape
+                if self.wcs is not None:
+                    pa_value = _compute_position_angle_deg(self.wcs, self.shape)
+                else:
+                    pa_value = None
+                self.pa_deg = pa_value
+                self.src["PA_DEG"] = pa_value if pa_value is not None else None
                 # Heavy footprint computations are deferred until explicitly
                 # requested by the UI via ``ensure_footprint``.
                 self._footprint_cache = None
@@ -1560,6 +1724,48 @@ def launch_filter_interface(
                 overrides_state.update(initial_overrides)
             except Exception:
                 overrides_state = {}
+
+        def _sanitize_angle_value(value: Any, default: float = 0.0) -> float:
+            """Return a finite angle value in [0, 180], falling back to ``default``."""
+
+            try:
+                val = float(value)
+            except Exception:
+                return default
+            if math.isnan(val) or math.isinf(val):
+                return default
+            if val < 0.0:
+                return 0.0
+            if val > 180.0:
+                return 180.0
+            return val
+
+        ANGLE_SPLIT_DEFAULT_DEG = 5.0
+        AUTO_ANGLE_DETECT_DEFAULT_DEG = 10.0
+
+        auto_angle_detect_threshold = AUTO_ANGLE_DETECT_DEFAULT_DEG
+        detect_candidates: list[Any] = []
+        if isinstance(overrides_state, dict):
+            detect_candidates.append(overrides_state.get("auto_angle_detect_deg"))
+        if isinstance(combined_solver_settings, dict):
+            detect_candidates.append(combined_solver_settings.get("auto_angle_detect_deg"))
+        for candidate in detect_candidates:
+            val = _sanitize_angle_value(candidate, AUTO_ANGLE_DETECT_DEFAULT_DEG)
+            if val > 0:
+                auto_angle_detect_threshold = val
+                break
+
+        orientation_effective_state: Dict[str, float] = {"value": 0.0}
+        candidate_chain: list[Any] = []
+        if isinstance(overrides_state, dict):
+            candidate_chain.append(overrides_state.get("cluster_orientation_split_deg"))
+        if isinstance(combined_solver_settings, dict):
+            candidate_chain.append(combined_solver_settings.get("cluster_orientation_split_deg"))
+        for candidate in candidate_chain:
+            val = _sanitize_angle_value(candidate, 0.0)
+            if val > 0:
+                orientation_effective_state["value"] = val
+                break
 
         # Determine available sky coordinates.  Older projects or raw header
         # scans may not provide any RA/Dec information, in which case we still
@@ -2887,6 +3093,7 @@ def launch_filter_interface(
                     result["skipped"] = True
                     try:
                         result["wcs"] = WCS(header_payload, naxis=2, relax=True)
+                        _assign_pa_metadata(result, result["wcs"], result.get("shape"))
                     except Exception:
                         pass
                     result["header"] = header_payload
@@ -2934,6 +3141,7 @@ def launch_filter_interface(
                         pass
                     result["ok"] = True
                     result["wcs"] = wcs_obj
+                    _assign_pa_metadata(result, wcs_obj, result.get("shape"))
                     result["header"] = header_payload
                 else:
                     result["error"] = "no solution"
@@ -3382,6 +3590,35 @@ def launch_filter_interface(
         write_wcs_var = tk.BooleanVar(master=root, value=True)
         coverage_first_var = tk.BooleanVar(master=root, value=True)
         overcap_percent_var = tk.IntVar(master=root, value=10)
+        angle_split_initial = orientation_effective_state["value"] if orientation_effective_state["value"] > 0 else ANGLE_SPLIT_DEFAULT_DEG
+        auto_angle_split_var = tk.BooleanVar(master=root, value=True)
+        angle_split_deg_var = tk.DoubleVar(master=root, value=float(angle_split_initial))
+
+        def _current_angle_split_candidate() -> float:
+            if angle_split_deg_var is None:
+                return ANGLE_SPLIT_DEFAULT_DEG
+            try:
+                return _sanitize_angle_value(angle_split_deg_var.get(), ANGLE_SPLIT_DEFAULT_DEG)
+            except Exception:
+                return ANGLE_SPLIT_DEFAULT_DEG
+
+        def _update_orientation_effective(value: float) -> None:
+            sanitized = _sanitize_angle_value(value, 0.0)
+            orientation_effective_state["value"] = sanitized
+            if isinstance(overrides_state, dict):
+                overrides_state["cluster_orientation_split_deg"] = sanitized
+
+        def _on_auto_angle_toggle(*_args: Any) -> None:
+            manual_mode = bool(auto_angle_split_var and not auto_angle_split_var.get())
+            if manual_mode:
+                _update_orientation_effective(_current_angle_split_candidate())
+            else:
+                _update_orientation_effective(orientation_effective_state.get("value", 0.0))
+
+        try:
+            auto_angle_split_var.trace_add("write", lambda *_: _on_auto_angle_toggle())
+        except Exception:
+            pass
 
         WCS_LOG_NAME = "zemosaic_wcs.log"
         DEFER_DRAW_CHUNK = 200
@@ -3519,6 +3756,37 @@ def launch_filter_interface(
             overcap_spin.grid(row=3, column=1, padx=4, pady=(2, 0), sticky="w")
         except Exception as e:
             _log_message(f"[FilterUI] Over-cap spinbox failed: {e}", level="WARN")
+
+        try:
+            auto_angle_chk = ttk.Checkbutton(
+                operations,
+                text=_tr("ui_auto_angle_split", "Auto split by orientation"),
+                variable=auto_angle_split_var,
+            )
+            auto_angle_chk.grid(row=4, column=0, columnspan=3, padx=4, pady=(6, 0), sticky="w")
+        except Exception as e:
+            _log_message(f"[FilterUI] Auto-angle checkbox failed: {e}", level="WARN")
+            auto_angle_chk = None
+
+        try:
+            angle_label = ttk.Label(
+                operations,
+                text=_tr("ui_angle_split_threshold", "Orientation split (deg)"),
+            )
+            angle_label.grid(row=5, column=0, padx=4, pady=(2, 0), sticky="w")
+            angle_spin = ttk.Spinbox(
+                operations,
+                from_=0.0,
+                to=180.0,
+                increment=0.5,
+                textvariable=angle_split_deg_var,
+                width=6,
+                justify="center",
+                format="%.1f",
+            )
+            angle_spin.grid(row=5, column=1, padx=4, pady=(2, 0), sticky="w")
+        except Exception as e:
+            _log_message(f"[FilterUI] Angle split spinbox failed: {e}", level="WARN")
 
         try:
             footprints_chk = ttk.Checkbutton(
@@ -3813,6 +4081,7 @@ def launch_filter_interface(
                         result["solver"] = solver_name
                         result["header"] = header_obj
                         result["wcs"] = wcs_obj
+                        _assign_pa_metadata(result, wcs_obj, _shape_from_header())
                         footprint_pts = None
                         try:
                             footprint_pts = _compute_footprint_from_wcs(wcs_obj, _shape_from_header())
@@ -4333,11 +4602,14 @@ def launch_filter_interface(
                                 center_obj = None
                         if item.wcs is None and center_obj is not None:
                             entry["wcs"] = _FallbackWCS(center_obj)
+                            entry["PA_DEG"] = None
                             entry["_fallback_wcs_used"] = True
                             entry.setdefault("phase0_center", center_obj)
                             entry.setdefault("center", center_obj)
                         elif item.wcs is not None:
                             entry["wcs"] = item.wcs
+                            if "PA_DEG" not in entry:
+                                entry["PA_DEG"] = getattr(item, "pa_deg", None)
                             if center_obj is not None:
                                 entry.setdefault("center", center_obj)
                         if center_obj is not None:
@@ -4399,15 +4671,21 @@ def launch_filter_interface(
                     if threshold_initial <= 0:
                         threshold_initial = float(threshold_heuristic) if threshold_heuristic > 0 else 0.10
 
+                    auto_angle_enabled = bool(auto_angle_split_var.get()) if auto_angle_split_var is not None else True
+                    manual_angle_mode = not auto_angle_enabled
+                    angle_split_candidate = _current_angle_split_candidate()
+                    if manual_angle_mode:
+                        _update_orientation_effective(angle_split_candidate)
                     orientation_threshold = 0.0
-                    orientation_candidates = [combined_solver_settings.get("cluster_orientation_split_deg")]
+                    orientation_candidates: list[Any] = []
+                    if manual_angle_mode and angle_split_candidate > 0:
+                        orientation_candidates.append(angle_split_candidate)
                     if isinstance(overrides_state, dict):
                         orientation_candidates.append(overrides_state.get("cluster_orientation_split_deg"))
+                    if isinstance(combined_solver_settings, dict):
+                        orientation_candidates.append(combined_solver_settings.get("cluster_orientation_split_deg"))
                     for candidate in orientation_candidates:
-                        try:
-                            val = float(candidate)
-                        except Exception:
-                            continue
+                        val = _sanitize_angle_value(candidate, 0.0)
                         if val > 0:
                             orientation_threshold = val
                             break
@@ -4503,6 +4781,53 @@ def launch_filter_interface(
                                     _log_async(relax_msg, "INFO")
                                     groups_used = groups_relaxed
                                     threshold_used = threshold_relaxed
+
+                    angle_split_effective = float(orientation_threshold if orientation_threshold > 0 else 0.0)
+                    if manual_angle_mode:
+                        angle_split_effective = angle_split_candidate
+                    else:
+                        auto_angle_triggered = False
+                        if (
+                            auto_angle_enabled
+                            and angle_split_effective <= 0.0
+                            and angle_split_candidate > 0.0
+                        ):
+                            oriented_groups: list[list[dict]] = []
+                            triggered_groups = 0
+                            for grp in groups_used:
+                                pa_values: list[float] = []
+                                for info in grp or []:
+                                    try:
+                                        pa_raw = info.get("PA_DEG")
+                                    except Exception:
+                                        pa_raw = None
+                                    try:
+                                        pa_float = float(pa_raw)
+                                    except Exception:
+                                        pa_float = None
+                                    if pa_float is None or not math.isfinite(pa_float):
+                                        continue
+                                    pa_values.append(pa_float)
+                                dispersion_val = _circular_dispersion_deg(pa_values)
+                                if dispersion_val > auto_angle_detect_threshold:
+                                    triggered_groups += 1
+                                    oriented_groups.extend(_split_group_by_orientation(grp, angle_split_candidate))
+                                else:
+                                    oriented_groups.append(grp)
+                            if triggered_groups > 0:
+                                groups_used = oriented_groups
+                                angle_split_effective = angle_split_candidate
+                                auto_angle_triggered = True
+                                _update_orientation_effective(angle_split_effective)
+                                auto_msg = _tr_safe(
+                                    "filter_log_orientation_autosplit",
+                                    "Orientation auto-split enabled: threshold={TH}° for {N} group(s)",
+                                    TH=f"{angle_split_effective:.1f}",
+                                    N=triggered_groups,
+                                )
+                                _log_async(auto_msg, "INFO")
+                        if not auto_angle_triggered:
+                            _update_orientation_effective(angle_split_effective)
 
                     groups_after_autosplit = autosplit_func(
                         groups_used,
@@ -4718,7 +5043,15 @@ def launch_filter_interface(
             "cancelled": False,
         }
 
+        def _ensure_orientation_override_synced() -> None:
+            manual_mode = bool(auto_angle_split_var and not auto_angle_split_var.get())
+            if manual_mode:
+                _update_orientation_effective(_current_angle_split_candidate())
+            else:
+                _update_orientation_effective(orientation_effective_state.get("value", 0.0))
+
         def _cancel_overrides_payload() -> dict[str, Any]:
+            _ensure_orientation_override_synced()
             payload: dict[str, Any] = {}
             if isinstance(overrides_state, dict) and overrides_state:
                 payload.update(overrides_state)
@@ -4733,6 +5066,8 @@ def launch_filter_interface(
             sel = _get_selected_indices()
             result["accepted"] = True
             result["selected_indices"] = sel
+            # ensure orientation override exported
+            _ensure_orientation_override_synced()
             result["overrides"] = overrides_state if overrides_state else None
             result["cancelled"] = False
             # If running as a Toplevel, do not quit the main GUI loop
@@ -4750,6 +5085,7 @@ def launch_filter_interface(
                     root.destroy()
                 except Exception:
                     pass
+
         def on_cancel():
             _drain_stream_queue_non_blocking(mark_done=True)
             result["accepted"] = False
@@ -4948,9 +5284,34 @@ def launch_filter_interface(
                     center_val = None
             centroid_wrapped[idx] = center_val
 
+        def _color_for_item(idx: int, selected: bool) -> tuple[float, float, float, float]:
+            base_alpha = 0.9 if selected else 0.35
+            pa_value = None
+            if 0 <= idx < len(items):
+                try:
+                    pa_value = items[idx].pa_deg
+                except Exception:
+                    pa_value = None
+                if pa_value is None:
+                    try:
+                        pa_raw = items[idx].src.get("PA_DEG")
+                        pa_value = float(pa_raw)
+                    except Exception:
+                        pa_value = None
+            if pa_value is not None and math.isfinite(pa_value):
+                hue = (float(pa_value) % 360.0) / 360.0
+                saturation = 0.65 if selected else 0.45
+                value = 0.95 if selected else 0.80
+                try:
+                    rgb = hsv_to_rgb((hue, saturation, value))
+                    return (float(rgb[0]), float(rgb[1]), float(rgb[2]), base_alpha)
+                except Exception:
+                    pass
+            return to_rgba("tab:blue" if selected else "0.7", base_alpha)
+
         def _append_visual_entry(idx: int) -> None:
             selected = _is_selected(idx)
-            color = to_rgba("tab:blue" if selected else "0.7", 0.9 if selected else 0.3)
+            color = _color_for_item(idx, selected)
             draw_fp = _should_draw_footprints()
             footprint_budget = footprint_budget_state["budget"]
             wrapped_fp = footprint_wrapped[idx]

@@ -1,5 +1,5 @@
 ﻿{
-    "window_title": "ZeMosaic V3.2.8 - Artifex Luminis Hierarchical Mosaicker",
+    "window_title": "ZeMosaic V3.2.9 - Artifex Luminis Hierarchical Mosaicker",
     "language_selector_label": "Language:",
     "folders_frame_title": "Folders",
     "input_folder_label": "Input Folder (Raws):",
@@ -158,6 +158,8 @@
     "intertile_recenter_adjust": "Tile #{tile}: median_before={median_before:.4g}, gain_adj={gain_adj:.4g}.",
     "run_info_phase6_started": "Phase 6: Saving final mosaic...",
     "run_info_coverage_map_saved": "Coverage map saved: {filename}",
+    "run_info_phase6_viewer_fits_saved": "Viewer-friendly FITS (uint16) saved: {filename}",
+    "run_warn_phase6_viewer_fits_failed": "Viewer FITS export failed: {error}",
     "run_success_mosaic_saved": "Final mosaic saved: {filename}",
     "run_error_phase6_save_failed": "ERROR P6: Failed to save final mosaic: {error}",
     "run_info_preview_stretch_started": "Test Visu Phase: Applying percentile stretch for preview image...",

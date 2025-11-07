@@ -5467,6 +5467,15 @@ def create_master_tile(
                     elif wcs_cropped is not None:
                         wcs_for_master_tile = wcs_cropped
 
+                    if wcs_for_master_tile is wcs_cropped and hasattr(wcs_cropped, "pixel_shape"):
+                        try:
+                            new_h, new_w = master_tile_stacked_HWC.shape[:2]
+                            wcs_cropped.pixel_shape = (new_w, new_h)
+                            if hasattr(wcs_cropped, "array_shape"):
+                                wcs_cropped.array_shape = (new_h, new_w)
+                        except Exception:
+                            pass
+
                 pcb_tile(
                     f"MT_CROP: quality-based rect={quality_crop_rect} (band={band_px}, k={k_sigma:.2f}, margin={margin_px})",
                     prog=None,
@@ -5584,13 +5593,6 @@ def create_master_tile(
             header_mt_save['EXPTOTAL']=(round(total_exposure_tile,2),'[s] Sum of EXPTIME for this tile')
             header_mt_save['NEXP_SUM']=(num_exposure_summed,'Number of exposures summed for EXPTOTAL')
 
-
-        if quality_crop_rect and "CRPIX1" in header_mt_save and "CRPIX2" in header_mt_save:
-            try:
-                header_mt_save["CRPIX1"] = header_mt_save.get("CRPIX1", 0.0) - quality_crop_rect[1]
-                header_mt_save["CRPIX2"] = header_mt_save.get("CRPIX2", 0.0) - quality_crop_rect[0]
-            except Exception:
-                pass
 
         if quality_crop_rect:
             header_mt_save['ZMT_QCRO'] = (True, 'Quality-based crop applied')
@@ -9865,7 +9867,7 @@ def run_hierarchical_mosaic(
         try: final_header.update(final_output_wcs.to_header(relax=True))
         except Exception as e_hdr_wcs: pcb("run_warn_phase6_wcs_to_header_failed", error=str(e_hdr_wcs), lvl="WARN")
     
-    final_header['SOFTWARE']=('ZeMosaic v3.2.8','Mosaic Software') # Incrémente la version 
+    final_header['SOFTWARE']=('ZeMosaic v3.2.9','Mosaic Software') # Incrémente la version 
     final_header['NMASTILE']=(len(master_tiles_results_list),"Master Tiles combined")
     final_header['NRAWINIT']=(num_total_raw_files,"Initial raw images found")
     final_header['NRAWPROC']=(len(all_raw_files_processed_info),"Raw images with WCS processed")
@@ -9923,6 +9925,36 @@ def run_hierarchical_mosaic(
                 progress_callback=progress_callback,
                 axis_order="HWC",
             )
+
+            if (
+                ZEMOSAIC_UTILS_AVAILABLE
+                and hasattr(zemosaic_utils, "write_final_fits_uint16_color_aware")
+            ):
+                viewer_fits_path = os.path.join(output_folder, f"{output_base_name}_viewer.fits")
+                try:
+                    zemosaic_utils.write_final_fits_uint16_color_aware(
+                        viewer_fits_path,
+                        final_mosaic_data_HWC,
+                        header=final_header,
+                        force_rgb_planes=isinstance(final_mosaic_data_HWC, np.ndarray)
+                        and final_mosaic_data_HWC.ndim == 3
+                        and final_mosaic_data_HWC.shape[-1] == 3,
+                        legacy_rgb_cube=legacy_rgb_flag,
+                        overwrite=True,
+                    )
+                    pcb(
+                        "run_info_phase6_viewer_fits_saved",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                        filename=os.path.basename(viewer_fits_path),
+                    )
+                except Exception as e_viewer:
+                    pcb(
+                        "run_warn_phase6_viewer_fits_failed",
+                        prog=None,
+                        lvl="WARN",
+                        error=str(e_viewer),
+                    )
         
         if final_mosaic_coverage_HW is not None and np.any(final_mosaic_coverage_HW):
             coverage_path = os.path.join(output_folder, f"{output_base_name}_coverage.fits")

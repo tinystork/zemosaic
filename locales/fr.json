@@ -1,5 +1,5 @@
 ﻿{
-    "window_title": "ZeMosaic V3.2.8 - Artifex Luminis Mosaïqueur Hiérarchique",
+    "window_title": "ZeMosaic V3.2.9 - Artifex Luminis Mosaïqueur Hiérarchique",
     "language_selector_label": "Langue :",
     "folders_frame_title": "Dossiers",
     "input_folder_label": "Dossier d'Entrée (Brutes) :",
@@ -161,6 +161,8 @@
     "intertile_recenter_adjust": "Tuile #{tile} : médiane_avant={median_before:.4g}, gain_adj={gain_adj:.4g}.",
     "run_info_phase6_started": "Phase 6 : Sauvegarde de la mosaïque finale...",
     "run_info_coverage_map_saved": "Carte de couverture sauvegardée : {filename}",
+    "run_info_phase6_viewer_fits_saved": "FITS de visualisation (uint16) enregistré : {filename}",
+    "run_warn_phase6_viewer_fits_failed": "Échec de l'export FITS de visualisation : {error}",
     "run_success_mosaic_saved": "Mosaïque finale sauvegardée : {filename}",
     "run_error_phase6_save_failed": "ERREUR P6 : Échec sauvegarde mosaïque finale : {error}",
     "run_info_preview_stretch_started": "Phase Test Visu : Application d'un étirement percentile pour image de prévisualisation...",
