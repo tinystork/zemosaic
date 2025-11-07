@@ -230,6 +230,36 @@ def _merge_small_groups(
     return [grp for idx, grp in enumerate(groups) if not merged_flags[idx]]
 
 
+ASTAP_CONCURRENCY_STATE = {"config": 1}
+
+
+def _read_astap_max_procs(default: Optional[int] = None) -> int:
+    """Return the ASTAP concurrency cap from environment variables."""
+    env_keys = (
+        "ZEMOSAIC_ASTAP_MAX_PROCS",
+        "ZEMO_ASTAP_MAX_PROCS",
+        "ZEMO_FILTER_ASTAP_MAX_PROCS",
+    )
+    for key in env_keys:
+        raw = os.environ.get(key)
+        if raw is None:
+            continue
+        raw_str = str(raw).strip()
+        if not raw_str:
+            continue
+        try:
+            value = int(float(raw_str))
+        except Exception:
+            continue
+        if value >= 1:
+            return value
+    fallback = default if default is not None else ASTAP_CONCURRENCY_STATE.get("config", 1)
+    try:
+        return max(1, int(fallback))
+    except Exception:
+        return 1
+
+
 def _circ_delta_deg(a: float, b: float) -> float:
     """Return the absolute circular delta (degrees) between two angles."""
 
@@ -575,6 +605,7 @@ def launch_filter_interface(
             "astap_default_search_radius": 0.0,
             "astap_default_downsample": 0,
             "astap_default_sensitivity": 100,
+            "astap_max_instances": 1,
             "auto_limit_frames_per_master_tile": True,
             "max_raw_per_master_tile": 0,
             "apply_master_tile_crop": False,
@@ -583,6 +614,12 @@ def launch_filter_interface(
         cfg: Dict[str, Any] | None = None
         solver_settings_payload: Dict[str, Any] = {}
         lang_code = "en"
+
+        def _coerce_positive_int(value: Any, fallback: int = 1) -> int:
+            try:
+                return max(1, int(float(value)))
+            except Exception:
+                return max(1, fallback)
 
         # Ensure project directory and parent are on sys.path to import project modules
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -638,12 +675,19 @@ def launch_filter_interface(
                 cfg = zconfig_module.load_config()
                 if isinstance(cfg, dict):
                     lang_code = str(cfg.get("language", lang_code))
+                    inst_cfg = cfg.get("astap_max_instances", cfg_defaults["astap_max_instances"])
+                    try:
+                        inst_cfg = int(float(inst_cfg))
+                    except Exception:
+                        inst_cfg = cfg_defaults["astap_max_instances"]
+                    inst_cfg = max(1, inst_cfg)
                     cfg_defaults.update({
                         "astap_executable_path": cfg.get("astap_executable_path", cfg_defaults["astap_executable_path"]),
                         "astap_data_directory_path": cfg.get("astap_data_directory_path", cfg_defaults["astap_data_directory_path"]),
                         "astap_default_search_radius": cfg.get("astap_default_search_radius", cfg_defaults["astap_default_search_radius"]),
                         "astap_default_downsample": cfg.get("astap_default_downsample", cfg_defaults["astap_default_downsample"]),
                         "astap_default_sensitivity": cfg.get("astap_default_sensitivity", cfg_defaults["astap_default_sensitivity"]),
+                        "astap_max_instances": inst_cfg,
                         "auto_limit_frames_per_master_tile": cfg.get("auto_limit_frames_per_master_tile", cfg_defaults["auto_limit_frames_per_master_tile"]),
                         "max_raw_per_master_tile": cfg.get("max_raw_per_master_tile", cfg_defaults["max_raw_per_master_tile"]),
                         "apply_master_tile_crop": cfg.get("apply_master_tile_crop", cfg_defaults["apply_master_tile_crop"]),
@@ -698,12 +742,6 @@ def launch_filter_interface(
             if sensitivity is not None:
                 cfg_defaults["astap_default_sensitivity"] = sensitivity
 
-        combined_solver_settings: Dict[str, Any] = {}
-        if solver_settings_payload:
-            combined_solver_settings.update(solver_settings_payload)
-        if isinstance(config_overrides, dict):
-            combined_solver_settings.update(config_overrides)
-
         if localizer_cls is not None:
             try:
                 localizer = localizer_cls(language_code=lang_code)
@@ -721,6 +759,21 @@ def launch_filter_interface(
                 cfg_defaults.update(config_overrides)
             except Exception:
                 pass
+
+        astap_instances_initial = _coerce_positive_int(
+            cfg_defaults.get("astap_max_instances", ASTAP_CONCURRENCY_STATE.get("config", 1)),
+            fallback=ASTAP_CONCURRENCY_STATE.get("config", 1),
+        )
+        cfg_defaults["astap_max_instances"] = astap_instances_initial
+        ASTAP_CONCURRENCY_STATE["config"] = astap_instances_initial
+        os.environ.setdefault("ZEMOSAIC_ASTAP_MAX_PROCS", str(astap_instances_initial))
+
+        combined_solver_settings: Dict[str, Any] = {}
+        if solver_settings_payload:
+            combined_solver_settings.update(solver_settings_payload)
+        if isinstance(config_overrides, dict):
+            combined_solver_settings.update(config_overrides)
+        combined_solver_settings.setdefault("astap_max_instances", astap_instances_initial)
 
         def _tr(key: str, default_text: Optional[str] = None, **kwargs) -> str:
             if localizer is not None:
@@ -893,6 +946,12 @@ def launch_filter_interface(
         extract_center_from_header_fn = getattr(astrometry_mod, 'extract_center_from_header', None) if astrometry_mod else None
         astap_fits_module = getattr(astrometry_mod, 'fits', None) if astrometry_mod else None
         astap_astropy_available = bool(getattr(astrometry_mod, 'ASTROPY_AVAILABLE_ASTROMETRY', False)) if astrometry_mod else False
+        astap_instances_current = ASTAP_CONCURRENCY_STATE.get("config", 1)
+        if astrometry_mod and hasattr(astrometry_mod, "set_astap_max_concurrent_instances"):
+            try:
+                astrometry_mod.set_astap_max_concurrent_instances(astap_instances_current)
+            except Exception as exc:
+                print(f"WARNING (Filter GUI): unable to apply ASTAP concurrency cap: {exc}")
         cluster_func = getattr(worker_mod, 'cluster_seestar_stacks_connected', None) if worker_mod else None
         autosplit_func = getattr(worker_mod, '_auto_split_groups', None) if worker_mod else None
         compute_dispersion_func = getattr(worker_mod, '_compute_max_angular_separation_deg', None) if worker_mod else None
@@ -3046,7 +3105,13 @@ def launch_filter_interface(
                 pass
             _update_resolve_now_ui()
 
-            max_workers = min(8, max(2, (os.cpu_count() or 4)))
+            astap_max_procs = _read_astap_max_procs()
+            max_workers = astap_max_procs
+            _log_message(
+                f"[FilterGUI] ASTAP concurrency cap = {astap_max_procs} "
+                f"(ThreadPool max_workers={max_workers}; env keys: ZEMOSAIC_ASTAP_MAX_PROCS/ZEMO_ASTAP_MAX_PROCS/ZEMO_FILTER_ASTAP_MAX_PROCS)",
+                level="INFO",
+            )
             try:
                 executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="FilterWCS")
             except Exception as exc:
@@ -3063,6 +3128,8 @@ def launch_filter_interface(
                 _log_message(f"Failed to start WCS resolve threads: {exc}", level="ERROR")
                 return
             resolve_now_state["executor"] = executor
+
+            astap_slot_semaphore = threading.BoundedSemaphore(value=astap_max_procs)
 
             code_pattern = re.compile(r"code\\s+(-?\\d+)", re.IGNORECASE)
 
@@ -3113,24 +3180,36 @@ def launch_filter_interface(
                         except Exception:
                             progress_state["return_code"] = None
 
+                target_name = "<unknown>"
+                if path_val:
+                    try:
+                        target_name = os.path.basename(str(path_val))
+                    except Exception:
+                        target_name = str(path_val)
+
+                _log_message(f"[FilterGUI] ASTAP wait slot -> {target_name}", level="DEBUG")
                 try:
-                    wcs_obj = solve_with_astap(
-                        path_val,
-                        header_payload,
-                        astap_exe_path,
-                        astap_data_dir,
-                        search_radius_deg=search_radius,
-                        downsample_factor=downsample_val,
-                        sensitivity=sensitivity_val,
-                        timeout_sec=timeout_astap,
-                        update_original_header_in_place=True,
-                        progress_callback=_progress_cb,
-                    )
+                    with astap_slot_semaphore:
+                        _log_message(f"[FilterGUI] ASTAP start -> {target_name}", level="DEBUG")
+                        wcs_obj = solve_with_astap(
+                            path_val,
+                            header_payload,
+                            astap_exe_path,
+                            astap_data_dir,
+                            search_radius_deg=search_radius,
+                            downsample_factor=downsample_val,
+                            sensitivity=sensitivity_val,
+                            timeout_sec=timeout_astap,
+                            update_original_header_in_place=True,
+                            progress_callback=_progress_cb,
+                        )
                 except Exception as exc:
                     result["error"] = str(exc)
                     result["return_code"] = progress_state.get("return_code")
                     result["duration"] = time.monotonic() - start_ts
                     return result
+                finally:
+                    _log_message(f"[FilterGUI] ASTAP done -> {target_name}", level="DEBUG")
 
                 result["return_code"] = progress_state.get("return_code")
                 result["duration"] = time.monotonic() - start_ts
@@ -3692,6 +3771,77 @@ def launch_filter_interface(
         except Exception as e:
             _log_message(f"[FilterUI] Paint-from-log button failed: {e}", level="WARN")
 
+        astap_instances_var = tk.StringVar(master=root, value=str(ASTAP_CONCURRENCY_STATE.get("config", 1)))
+        astap_instances_cap = max(1, (os.cpu_count() or 2) // 2)
+        astap_instance_values = [str(i) for i in range(1, astap_instances_cap + 1)]
+        if astap_instances_var.get() not in astap_instance_values:
+            astap_instance_values.append(astap_instances_var.get())
+        try:
+            astap_instance_values = sorted(set(astap_instance_values), key=lambda v: int(float(v)))
+        except Exception:
+            pass
+
+        def _apply_astap_instance_choice(*_args: Any, persist: bool = True) -> None:
+            raw_value = astap_instances_var.get()
+            try:
+                parsed = int(float(raw_value))
+            except Exception:
+                parsed = ASTAP_CONCURRENCY_STATE.get("config", 1)
+            parsed = max(1, parsed)
+
+            if parsed > 1:
+                try:
+                    if messagebox.askokcancel(
+                        _tr("filter_astap_multi_warning_title", "ASTAP Concurrency Warning"),
+                        _tr(
+                            "filter_astap_multi_warning_message",
+                            "Running more than one ASTAP instance can trigger the \"Access violation\" popup you saw earlier. Only continue if you are ready to dismiss those warnings and understand this mode is not officially supported.",
+                        ),
+                        icon="warning",
+                        default=messagebox.CANCEL,
+                    ) is False:
+                        astap_instances_var.set(str(ASTAP_CONCURRENCY_STATE.get("config", 1)))
+                        return
+                except Exception:
+                    pass
+
+            astap_instances_var.set(str(parsed))
+            ASTAP_CONCURRENCY_STATE["config"] = parsed
+            cfg_defaults["astap_max_instances"] = parsed
+            combined_solver_settings["astap_max_instances"] = parsed
+            if isinstance(overrides_state, dict):
+                overrides_state["astap_max_instances"] = parsed
+            os.environ["ZEMOSAIC_ASTAP_MAX_PROCS"] = str(parsed)
+            if astrometry_mod and hasattr(astrometry_mod, "set_astap_max_concurrent_instances"):
+                try:
+                    astrometry_mod.set_astap_max_concurrent_instances(parsed)
+                except Exception as exc:
+                    _log_message(f"[FilterUI] ASTAP concurrency update failed: {exc}", level="WARN")
+            if persist and zconfig_module and hasattr(zconfig_module, "save_config") and isinstance(cfg, dict):
+                cfg["astap_max_instances"] = parsed
+                try:
+                    zconfig_module.save_config(cfg)
+                except Exception as exc:
+                    _log_message(f"[FilterUI] Failed to save ASTAP max instances: {exc}", level="WARN")
+
+        try:
+            ttk.Label(
+                operations,
+                text=_tr("filter_label_astap_instances", "Max ASTAP instances"),
+            ).grid(row=2, column=0, padx=4, pady=(6, 0), sticky="w")
+            instances_combo = ttk.Combobox(
+                operations,
+                state="readonly",
+                values=astap_instance_values,
+                width=6,
+                textvariable=astap_instances_var,
+                justify="center",
+            )
+            instances_combo.grid(row=2, column=1, padx=4, pady=(6, 0), sticky="w")
+            instances_combo.bind("<<ComboboxSelected>>", _apply_astap_instance_choice)
+        except Exception as e:
+            _log_message(f"[FilterUI] ASTAP instances selector failed: {e}", level="WARN")
+
         def _show_sizes_details():
             try:
                 win = tk.Toplevel(root)
@@ -3733,7 +3883,7 @@ def launch_filter_interface(
                 ),
                 variable=coverage_first_var,
             )
-            coverage_chk.grid(row=2, column=0, columnspan=3, padx=4, pady=(6, 0), sticky="w")
+            coverage_chk.grid(row=3, column=0, columnspan=3, padx=4, pady=(6, 0), sticky="w")
         except Exception as e:
             _log_message(f"[FilterUI] Coverage-first checkbox failed: {e}", level="WARN")
 
@@ -3743,7 +3893,7 @@ def launch_filter_interface(
                 operations,
                 text=_tr("ui_overcap_allowance_pct", "Over-cap allowance (%)"),
             )
-            overcap_label.grid(row=3, column=0, padx=4, pady=(2, 0), sticky="w")
+            overcap_label.grid(row=4, column=0, padx=4, pady=(2, 0), sticky="w")
             overcap_spin = ttk.Spinbox(
                 operations,
                 from_=0,
@@ -3753,7 +3903,7 @@ def launch_filter_interface(
                 width=5,
                 justify="center",
             )
-            overcap_spin.grid(row=3, column=1, padx=4, pady=(2, 0), sticky="w")
+            overcap_spin.grid(row=4, column=1, padx=4, pady=(2, 0), sticky="w")
         except Exception as e:
             _log_message(f"[FilterUI] Over-cap spinbox failed: {e}", level="WARN")
 
@@ -3763,7 +3913,7 @@ def launch_filter_interface(
                 text=_tr("ui_auto_angle_split", "Auto split by orientation"),
                 variable=auto_angle_split_var,
             )
-            auto_angle_chk.grid(row=4, column=0, columnspan=3, padx=4, pady=(6, 0), sticky="w")
+            auto_angle_chk.grid(row=5, column=0, columnspan=3, padx=4, pady=(6, 0), sticky="w")
         except Exception as e:
             _log_message(f"[FilterUI] Auto-angle checkbox failed: {e}", level="WARN")
             auto_angle_chk = None
@@ -3773,7 +3923,7 @@ def launch_filter_interface(
                 operations,
                 text=_tr("ui_angle_split_threshold", "Orientation split (deg)"),
             )
-            angle_label.grid(row=5, column=0, padx=4, pady=(2, 0), sticky="w")
+            angle_label.grid(row=6, column=0, padx=4, pady=(2, 0), sticky="w")
             angle_spin = ttk.Spinbox(
                 operations,
                 from_=0.0,
@@ -3784,7 +3934,7 @@ def launch_filter_interface(
                 justify="center",
                 format="%.1f",
             )
-            angle_spin.grid(row=5, column=1, padx=4, pady=(2, 0), sticky="w")
+            angle_spin.grid(row=6, column=1, padx=4, pady=(2, 0), sticky="w")
         except Exception as e:
             _log_message(f"[FilterUI] Angle split spinbox failed: {e}", level="WARN")
 
@@ -3975,6 +4125,17 @@ def launch_filter_interface(
             astrometry_direct = getattr(astrometry_mod, "solve_with_astrometry_net", None) if astrometry_mod else None
             ansvr_direct = getattr(astrometry_mod, "solve_with_ansvr", None) if astrometry_mod else None
 
+            astap_slot_semaphore: Optional[threading.BoundedSemaphore] = None
+            astap_slot_cap: Optional[int] = None
+            if astap_enabled:
+                astap_slot_cap = _read_astap_max_procs()
+                astap_slot_semaphore = threading.BoundedSemaphore(value=astap_slot_cap)
+                _log_message(
+                    "[FilterUI] ASTAP concurrent solves capped at "
+                    f"{astap_slot_cap} (env keys: ZEMOSAIC_ASTAP_MAX_PROCS/ZEMO_ASTAP_MAX_PROCS/ZEMO_FILTER_ASTAP_MAX_PROCS).",
+                    level="DEBUG",
+                )
+
             def _log_solver_event(key: str, default: str, level: str, **fmt: Any) -> None:
                 try:
                     message = _tr(key, default, **fmt)
@@ -4112,19 +4273,37 @@ def launch_filter_interface(
                             solver="ASTAP",
                             name=file_name,
                         )
+                        astap_wcs = None
                         try:
-                            astap_wcs = solve_with_astap(
-                                path,
-                                header_obj,
-                                astap_exe_path,
-                                astap_data_dir,
-                                search_radius_deg=srch_radius,
-                                downsample_factor=downsample_val,
-                                sensitivity=sensitivity_val,
-                                timeout_sec=astap_timeout_sec,
-                                update_original_header_in_place=write_inplace,
-                                progress_callback=_progress_callback,
-                            )
+                            if astap_slot_semaphore:
+                                _log_message(f"[FilterUI] ASTAP wait slot -> {file_name}", level="DEBUG_DETAIL")
+                                with astap_slot_semaphore:
+                                    _log_message(f"[FilterUI] ASTAP start -> {file_name}", level="DEBUG_DETAIL")
+                                    astap_wcs = solve_with_astap(
+                                        path,
+                                        header_obj,
+                                        astap_exe_path,
+                                        astap_data_dir,
+                                        search_radius_deg=srch_radius,
+                                        downsample_factor=downsample_val,
+                                        sensitivity=sensitivity_val,
+                                        timeout_sec=astap_timeout_sec,
+                                        update_original_header_in_place=write_inplace,
+                                        progress_callback=_progress_callback,
+                                    )
+                            else:
+                                astap_wcs = solve_with_astap(
+                                    path,
+                                    header_obj,
+                                    astap_exe_path,
+                                    astap_data_dir,
+                                    search_radius_deg=srch_radius,
+                                    downsample_factor=downsample_val,
+                                    sensitivity=sensitivity_val,
+                                    timeout_sec=astap_timeout_sec,
+                                    update_original_header_in_place=write_inplace,
+                                    progress_callback=_progress_callback,
+                                )
                         except Exception as exc:
                             last_error = str(exc)
                             _log_solver_event(
@@ -4146,6 +4325,9 @@ def launch_filter_interface(
                                 name=file_name,
                                 err="no solution",
                             )
+                        finally:
+                            if astap_slot_semaphore:
+                                _log_message(f"[FilterUI] ASTAP done -> {file_name}", level="DEBUG_DETAIL")
 
                     if wcs_async_state.get("stop"):
                         result["error"] = "cancelled"

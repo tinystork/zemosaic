@@ -55,6 +55,8 @@ import shutil
 import gc
 import logging
 import psutil
+import threading
+from contextlib import contextmanager
 from concurrent.futures import ProcessPoolExecutor
 
 import multiprocessing
@@ -96,6 +98,83 @@ except Exception:
     logger.warning(
         "AstrometrySolver: astroquery non installée. Plate-solving web Astrometry.net désactivé."
     )
+
+_ASTAP_CONCURRENCY_ENV_KEYS = (
+    "ZEMOSAIC_ASTAP_MAX_PROCS",
+    "ZEMO_ASTAP_MAX_PROCS",
+    "ZEMO_FILTER_ASTAP_MAX_PROCS",
+)
+
+
+def _resolve_astap_max_procs(default: int = 1) -> int:
+    """Return the configured ASTAP concurrency cap."""
+    for key in _ASTAP_CONCURRENCY_ENV_KEYS:
+        raw = os.environ.get(key)
+        if raw is None:
+            continue
+        raw_str = str(raw).strip()
+        if not raw_str:
+            continue
+        try:
+            value = int(float(raw_str))
+        except Exception:
+            logger.debug("ASTAP concurrency: ignoring invalid %s=%r", key, raw)
+            continue
+        if value >= 1:
+            return value
+    return max(1, default)
+
+
+_ASTAP_MAX_PROCS = _resolve_astap_max_procs()
+_ASTAP_SEMAPHORE_LOCK = threading.Lock()
+_ASTAP_SLOT_SEMAPHORE = threading.BoundedSemaphore(value=_ASTAP_MAX_PROCS)
+logger.debug(
+    "ASTAP concurrency limited to %s process(es) (env keys: %s)",
+    _ASTAP_MAX_PROCS,
+    ", ".join(_ASTAP_CONCURRENCY_ENV_KEYS),
+)
+
+
+@contextmanager
+def _astap_slot_guard(image_label: str = ""):
+    """Serialize ASTAP runs across threads to avoid concurrent crashes."""
+    semaphore = _ASTAP_SLOT_SEMAPHORE
+    if semaphore is None:
+        yield
+        return
+    if image_label:
+        logger.debug("ASTAP slot wait -> %s", image_label)
+    semaphore.acquire()
+    try:
+        if image_label:
+            logger.debug("ASTAP slot acquired -> %s", image_label)
+        yield
+    finally:
+        if image_label:
+            logger.debug("ASTAP slot release -> %s", image_label)
+        semaphore.release()
+
+
+def set_astap_max_concurrent_instances(count: int) -> int:
+    """Update the ASTAP concurrency cap at runtime."""
+    global _ASTAP_MAX_PROCS, _ASTAP_SLOT_SEMAPHORE
+    try:
+        desired = int(count)
+    except Exception:
+        desired = _ASTAP_MAX_PROCS
+    desired = max(1, desired)
+    with _ASTAP_SEMAPHORE_LOCK:
+        if desired == _ASTAP_MAX_PROCS:
+            return _ASTAP_MAX_PROCS
+        _ASTAP_MAX_PROCS = desired
+        _ASTAP_SLOT_SEMAPHORE = threading.BoundedSemaphore(value=_ASTAP_MAX_PROCS)
+        logger.info("ASTAP concurrency cap updated to %s via runtime setter.", _ASTAP_MAX_PROCS)
+        return _ASTAP_MAX_PROCS
+
+
+def get_astap_max_concurrent_instances() -> int:
+    """Return the current ASTAP concurrency cap."""
+    return _ASTAP_MAX_PROCS
 
 
 def _log_memory_usage(progress_callback: callable, context_message: str = ""):
@@ -810,7 +889,8 @@ def solve_with_astap(image_fits_path: str,
     try:
         # Run ASTAP directly to avoid nested ProcessPoolExecutors from threads (can hang on Windows).
         # We still enforce a strict timeout via subprocess.run inside _run_astap_subprocess.
-        astap_process_result = _run_astap_subprocess(cmd_list_astap, current_image_dir, timeout_sec)
+        with _astap_slot_guard(img_basename_log):
+            astap_process_result = _run_astap_subprocess(cmd_list_astap, current_image_dir, timeout_sec)
         logger.debug(f"ASTAP return code: {astap_process_result.returncode}")
 
         rc_astap = astap_process_result.returncode

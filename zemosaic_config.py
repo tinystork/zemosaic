@@ -24,6 +24,7 @@ DEFAULT_CONFIG = {
     "astap_default_search_radius": 3.0, 
     "astap_default_downsample": 2, 
     "astap_default_sensitivity": 100,
+    "astap_max_instances": 1,
     "language": "en",
     "num_processing_workers": -1, # -1 pour auto
     "stacking_normalize_method": "linear_fit",
@@ -513,3 +514,12 @@ def get_astap_default_downsample():
 def get_astap_default_sensitivity():
     config = load_config()
     return config.get("astap_default_sensitivity", DEFAULT_CONFIG["astap_default_sensitivity"])
+
+def get_astap_max_instances():
+    """Return the configured ASTAP concurrency limit (>=1)."""
+    config = load_config()
+    value = config.get("astap_max_instances", DEFAULT_CONFIG.get("astap_max_instances", 1))
+    try:
+        return max(1, int(value))
+    except Exception:
+        return max(1, DEFAULT_CONFIG.get("astap_max_instances", 1))
