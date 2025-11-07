@@ -262,6 +262,10 @@ class ZeMosaicGUI:
             if isinstance(value, str) and value:
                 self.config[key] = os.path.expanduser(value)
 
+        # Phase 4.5 (inter-master merge) stays in the codebase but must not be user-activable for this release.
+        # Force the flag off regardless of persisted config so the worker never receives an enabled state.
+        self.config["inter_master_merge_enable"] = False
+
         # --- GPU Detection helper ---
         def _detect_gpus():
             """Return a list of detected GPUs as ``(display_name, index)`` tuples.
@@ -1205,31 +1209,6 @@ class ZeMosaicGUI:
         self.final_assembly_method_combo.grid(row=asm_opt_row, column=1, padx=5, pady=5, sticky="ew")
         self.final_assembly_method_combo.bind("<<ComboboxSelected>>", lambda e, c=self.final_assembly_method_combo, v=self.final_assembly_method_var, k_list=self.assembly_method_keys, p="assembly_method": self._combo_to_key(e, c, v, k_list, p)); asm_opt_row += 1
 
-        self.inter_master_merge_check = ttk.Checkbutton(
-            final_assembly_options_frame,
-            text="",
-            variable=self.inter_master_merge_var,
-        )
-        self.inter_master_merge_check.grid(row=asm_opt_row, column=0, columnspan=2, padx=5, pady=(2, 2), sticky="w")
-        self.translatable_widgets["cfg_inter_master_enable"] = self.inter_master_merge_check
-        asm_opt_row += 1
-
-        self.inter_master_overlap_label = ttk.Label(final_assembly_options_frame, text="")
-        self.inter_master_overlap_label.grid(row=asm_opt_row, column=0, padx=5, pady=2, sticky="w")
-        self.translatable_widgets["cfg_inter_master_overlap"] = self.inter_master_overlap_label
-
-        self.inter_master_overlap_spin = ttk.Spinbox(
-            final_assembly_options_frame,
-            from_=0.0,
-            to=100.0,
-            increment=1.0,
-            textvariable=self.inter_master_overlap_var,
-            width=6,
-            format="%.0f",
-        )
-        self.inter_master_overlap_spin.grid(row=asm_opt_row, column=1, padx=5, pady=2, sticky="w")
-        asm_opt_row += 1
-
         gpu_chk = ttk.Checkbutton(
             final_assembly_options_frame,
             # Keep translation key for backward compatibility, update default text
@@ -1702,40 +1681,6 @@ class ZeMosaicGUI:
         log_scrollbar_x_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
         copy_btn.pack(side=tk.RIGHT, padx=(5,0))
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        phase45_frame = ttk.LabelFrame(
-            self.scrollable_content_frame,
-            text=self._tr("phase45_monitor_title", "Phase 4.5 - Overlap Monitor"),
-            padding="8",
-        )
-        phase45_frame.pack(fill=tk.X, pady=(0, 10))
-        self.translatable_widgets["phase45_monitor_title"] = phase45_frame
-        overlay_row = ttk.Frame(phase45_frame)
-        overlay_row.pack(fill=tk.X, padx=5, pady=(0, 4))
-        overlay_toggle = ttk.Checkbutton(
-            overlay_row,
-            text=self._tr("phase45_monitor_overlay_toggle", "Show overlay"),
-            variable=self.phase45_overlay_var,
-            command=self._redraw_phase45_overlay,
-        )
-        overlay_toggle.pack(side=tk.LEFT)
-        self.translatable_widgets["phase45_monitor_overlay_toggle"] = overlay_toggle
-        self.phase45_canvas = tk.Canvas(
-            phase45_frame,
-            width=420,
-            height=220,
-            background="#0f1117",
-            highlightthickness=0,
-        )
-        self.phase45_canvas.pack(fill=tk.X, padx=5, pady=5)
-        self.phase45_canvas.bind("<Configure>", lambda _evt: self._redraw_phase45_overlay())
-        ttk.Label(
-            phase45_frame,
-            textvariable=self.phase45_status_var,
-            font=("Segoe UI", 9, "italic"),
-        ).pack(fill=tk.X, padx=5, pady=(0, 2))
-        self._redraw_phase45_overlay()
-
 
         self.scrollable_content_frame.update_idletasks()
         self.main_canvas.configure(scrollregion=self.main_canvas.bbox("all"))

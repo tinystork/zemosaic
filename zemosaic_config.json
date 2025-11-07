@@ -22,7 +22,7 @@
     "gpu_id_phase5": 0,
     "gpu_selector": "NVIDIA GeForce RTX 3070 Laptop GPU",
     "final_assembly_method": "reproject_coadd",
-    "inter_master_merge_enable": true,
+    "inter_master_merge_enable": false,
     "inter_master_overlap_threshold": 0.1,
     "inter_master_min_group_size": 2,
     "inter_master_stack_method": "winsor",

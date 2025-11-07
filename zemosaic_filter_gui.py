@@ -3992,8 +3992,29 @@ def launch_filter_interface(
         except Exception as e:
             _log_message(f"[FilterUI] Operations availability checks failed: {e}", level="WARN")
 
+        def _warn_astap_multi_instance() -> bool:
+            """Return True if the user accepts multi-ASTAP risk."""
+            current = ASTAP_CONCURRENCY_STATE.get("config", 1)
+            if current <= 1:
+                return True
+            try:
+                decision = messagebox.askokcancel(
+                    _tr("filter_astap_multi_warning_title", "ASTAP Concurrency Warning"),
+                    _tr(
+                        "filter_astap_multi_warning_message",
+                        "Running more than one ASTAP instance can trigger the \"Access violation\" popup you saw earlier. Only continue if you are ready to dismiss those warnings and understand this mode is not officially supported.",
+                    ),
+                    icon="warning",
+                    default=messagebox.CANCEL,
+                )
+                return bool(decision)
+            except Exception:
+                return True
+
         def _resolve_missing_wcs_inplace() -> None:
             if resolve_state["running"]:
+                return
+            if not _warn_astap_multi_instance():
                 return
 
             astap_enabled = bool(astap_available and solve_with_astap is not None)
