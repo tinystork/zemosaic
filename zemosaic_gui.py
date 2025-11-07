@@ -1225,12 +1225,15 @@ class ZeMosaicGUI:
 
         self.inter_master_method_combo = ttk.Combobox(
             final_assembly_options_frame,
-            state="readonly",
+            state="disabled",
             width=20,
             textvariable=self.inter_master_method_var,
             values=("winsor", "mean", "median"),
         )
         self.inter_master_method_combo.grid(row=asm_opt_row, column=1, padx=5, pady=2, sticky="w")
+        # Phase 4.5 reuses the stacking settings picked for Phase 3, so hide the redundant selector.
+        self.inter_master_method_label.grid_remove()
+        self.inter_master_method_combo.grid_remove()
         asm_opt_row += 1
 
         gpu_chk = ttk.Checkbutton(
