@@ -983,7 +983,7 @@ def _run_phase4_5_inter_master_merge(
         local_scale = "native"
 
     photometry_intragroup = bool(inter_cfg.get("photometry_intragroup", True))
-    photometry_intersuper = bool(inter_cfg.get("photometry_intersuper", True))
+    photometry_intersuper = bool(inter_cfg.get("photometry_intersuper", True))  # réservé pour plus tard
     try:
         photometry_clip_sigma = float(inter_cfg.get("photometry_clip_sigma", 3.0))
     except Exception:
@@ -1230,20 +1230,24 @@ def _run_phase4_5_inter_master_merge(
             )
 
             reference_tile = chunk_tiles[0]
+            local_wcs_source = "native"
+            local_wcs = reference_tile.wcs
+            local_shape = reference_tile.shape_hw
             if local_scale == "final" and final_output_wcs and final_output_shape_hw:
-                local_wcs, local_shape = _phase45_compute_cutout_wcs(final_output_wcs, final_output_shape_hw, chunk_tiles)
-                if local_wcs is None or local_shape is None:
-                    local_wcs = reference_tile.wcs
-                    local_shape = reference_tile.shape_hw
-            else:
-                local_wcs = reference_tile.wcs
-                local_shape = reference_tile.shape_hw
+                cutout_wcs, cutout_shape = _phase45_compute_cutout_wcs(
+                    final_output_wcs, final_output_shape_hw, chunk_tiles
+                )
+                if cutout_wcs is not None and cutout_shape is not None:
+                    local_wcs = cutout_wcs
+                    local_shape = cutout_shape
+                    local_wcs_source = "cutout"
 
             if not (local_wcs and local_shape):
                 continue
             logger.debug(
-                "[P4.5][G%03d] Local frame resolved: scale=%s, shape=%s, ref_tile=%d",
+                "[P4.5][G%03d][cutout] Local frame resolved: source=%s, scale=%s, shape=%s, ref_tile=%d",
                 group_id,
+                local_wcs_source,
                 local_scale,
                 tuple(local_shape),
                 reference_tile.index,
@@ -1251,6 +1255,172 @@ def _run_phase4_5_inter_master_merge(
             _phase45_gui_message(
                 f"Phase 4.5: group {group_id} local frame {local_shape[0]}x{local_shape[1]}"
             )
+
+            chunk_affine_corrections: list[tuple[float, float] | None] = [None] * len(chunk_tiles)
+            chunk_photometry_done = False
+
+            try:
+                kappa_val = float(stack_cfg.get("kappa_low", 3.0))
+            except Exception:
+                kappa_val = 3.0
+            limits_val = stack_cfg.get("winsor_limits", (0.05, 0.05))
+            try:
+                limits_val = (
+                    float(limits_val[0]),
+                    float(limits_val[1]),
+                )
+            except Exception:
+                limits_val = (0.05, 0.05)
+            try:
+                max_pass_val = int(stack_cfg.get("winsor_max_frames_per_pass", 0))
+            except Exception:
+                max_pass_val = 0
+            try:
+                worker_limit_val = int(stack_cfg.get("winsor_worker_limit", 1))
+            except Exception:
+                worker_limit_val = 1
+            stack_kwargs = {
+                "kappa": kappa_val,
+                "winsor_limits": limits_val,
+                "winsor_max_frames_per_pass": max_pass_val,
+                "winsor_max_workers": max(1, worker_limit_val),
+            }
+            super_arr = None
+            # --- Phase 4.5 (améliorée) : 2.1 → 3.1 à l’intérieur de 4.5 ---
+            # Réutiliser les options choisies dans le GUI :
+            #   normalize_method, weight_method, reject_algo, final_combine,
+            #   kappa/winsor/workers déjà présents dans stack_cfg/stack_kwargs.
+            try:
+                norm_method = str(
+                    stack_cfg.get(
+                        "stacking_normalize_method",
+                        stack_cfg.get(
+                            "normalize_method",
+                            stack_cfg.get("stack_norm_method", "none"),
+                        ),
+                    )
+                ).lower()
+            except Exception:
+                norm_method = "none"
+            try:
+                weight_method = str(stack_cfg.get("weight_method", stack_cfg.get("stack_weight_method", "none"))).lower()
+            except Exception:
+                weight_method = "none"
+            try:
+                reject_algo = str(stack_cfg.get("reject_algo", stack_cfg.get("stack_reject_algo", "winsorized_sigma_clip"))).lower()
+            except Exception:
+                reject_algo = "winsorized_sigma_clip"
+            try:
+                final_combine = str(stack_cfg.get("final_combine", stack_cfg.get("stack_final_combine", "mean"))).lower()
+            except Exception:
+                final_combine = "mean"
+
+            normalize_method = norm_method
+            do_chunk_photometry = (
+                photometry_intragroup
+                and normalize_method not in ("", "none")
+                and ZEMOSAIC_ALIGN_STACK_AVAILABLE
+                and photometry_estimator_available
+                and photometry_apply_available
+            )
+            if do_chunk_photometry:
+                try:
+                    preview_size = int(stack_cfg.get("intertile_preview_size", 512))
+                except Exception:
+                    preview_size = 512
+                try:
+                    overlap_min = float(stack_cfg.get("intertile_overlap_min", 0.05))
+                except Exception:
+                    overlap_min = 0.05
+                sky_percent_cfg = stack_cfg.get("intertile_sky_percentile") or (30.0, 70.0)
+                if not (isinstance(sky_percent_cfg, (list, tuple)) and len(sky_percent_cfg) >= 2):
+                    sky_percent_cfg = (30.0, 70.0)
+                try:
+                    sky_low = float(sky_percent_cfg[0])
+                except Exception:
+                    sky_low = 30.0
+                try:
+                    sky_high = float(sky_percent_cfg[1])
+                except Exception:
+                    sky_high = 70.0
+                if sky_low > sky_high:
+                    sky_low, sky_high = sky_high, sky_low
+                try:
+                    robust_clip = float(stack_cfg.get("intertile_robust_clip_sigma", 2.5))
+                except Exception:
+                    robust_clip = 2.5
+                robust_clip = max(0.1, robust_clip)
+                sources: list[_TileAffineSource] = []
+                valid_indices: list[int] = []
+                for idx_tile, tile in enumerate(chunk_tiles):
+                    path = tile.path
+                    if not path:
+                        continue
+                    try:
+                        with fits.open(path, memmap=True, do_not_scale_image_data=True) as hdul:
+                            arr = _ensure_hwc_master_tile(hdul[0].data, os.path.basename(path))
+                            arr = np.asarray(arr, dtype=np.float32, copy=False)
+                        sources.append(_TileAffineSource(path=path, wcs=tile.wcs, data=arr))
+                        valid_indices.append(idx_tile)
+                    except Exception as exc:
+                        logger.warning("[P4.5] Failed to read tile data for photometry (%s): %s", path, exc)
+                if len(sources) >= 2:
+                    pcb(
+                        "p45_photometry_start",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                        group=group_id,
+                        chunk=chunk_idx,
+                        tiles=len(sources),
+                        method=normalize_method,
+                    )
+                    logger.info(
+                        "[P4.5][photometry] Intra-group normalization start (group=%03d chunk=%d, method=%s, tiles=%d)",
+                        group_id,
+                        chunk_idx,
+                        normalize_method,
+                        len(sources),
+                    )
+                    try:
+                        affine_raw = zemosaic_align_stack.estimate_affine_photometry(
+                            sources,
+                            preview_size=preview_size,
+                            overlap_min=overlap_min,
+                            sky_percentile=(sky_low, sky_high),
+                            robust_clip_sigma=min(robust_clip, float(photometry_clip_sigma)),
+                        )
+                        corrections, nontrivial = _sanitize_affine_corrections(
+                            affine_raw,
+                            len(sources),
+                        )
+                        if corrections and nontrivial:
+                            for corr_idx, corr in enumerate(corrections):
+                                if 0 <= corr_idx < len(valid_indices):
+                                    chunk_affine_corrections[valid_indices[corr_idx]] = corr
+                            pcb(
+                                "p45_photometry_applied",
+                                prog=None,
+                                lvl="INFO_DETAIL",
+                                group=group_id,
+                                chunk=chunk_idx,
+                            )
+                            logger.info(
+                                "[P4.5][photometry] Applied affine corrections (group=%03d chunk=%d, corrected=%d)",
+                                group_id,
+                                chunk_idx,
+                                len([c for c in corrections if c is not None]),
+                            )
+                            chunk_photometry_done = True
+                        else:
+                            logger.debug("[P4.5][photometry] No affine corrections (identity).")
+                    except Exception as exc:
+                        logger.warning("[P4.5][photometry] Error while estimating/applying: %s", exc, exc_info=True)
+                else:
+                    logger.info("[P4.5][photometry] Skipped (insufficient valid tiles).")
+            elif photometry_intragroup and normalize_method not in ("", "none"):
+                logger.warning(
+                    "[P4.5][photometry] Skip intra-group normalization (API unavailable)."
+                )
 
             storage = None
             memmap_path = None
@@ -1292,6 +1462,11 @@ def _run_phase4_5_inter_master_merge(
                 _phase45_gui_message(
                     f"Phase 4.5: group {group_id} chunk {chunk_idx}/{group_chunks} reprojection ({allocation_mode})"
                 )
+                reproject_kwargs = {"shape_out": (local_shape[0], local_shape[1])}
+                if _REPROJECT_INTERP_SUPPORTS_FILL_VALUE:
+                    reproject_kwargs["fill_value"] = np.nan
+                if _REPROJECT_INTERP_SUPPORTS_MATCH_BG:
+                    reproject_kwargs["match_background"] = True
                 for idx_tile, tile in enumerate(chunk_tiles):
                     if tile.index in preloaded:
                         arr = preloaded.pop(tile.index)
@@ -1309,10 +1484,22 @@ def _run_phase4_5_inter_master_merge(
                         else:
                             arr = np.repeat(arr[..., :1], channels, axis=-1)
                     arr = np.asarray(arr, dtype=np.float32, copy=False)
+                    corr = chunk_affine_corrections[idx_tile]
+                    if corr:
+                        try:
+                            gain = float(corr[0])
+                        except Exception:
+                            gain = 1.0
+                        try:
+                            offset = float(corr[1])
+                        except Exception:
+                            offset = 0.0
+                        arr *= gain
+                        arr += offset
                     reproj = np.full((local_shape[0], local_shape[1], channels), np.nan, dtype=np.float32)
                     for ch in range(channels):
                         plane = arr[..., ch]
-                        reproj_plane, footprint = reproject_interp((plane, tile.wcs), local_wcs, shape_out=(local_shape[0], local_shape[1]))
+                        reproj_plane, footprint = reproject_interp((plane, tile.wcs), local_wcs, **reproject_kwargs)
                         if reproj_plane is None:
                             success = False
                             break
@@ -1341,54 +1528,6 @@ def _run_phase4_5_inter_master_merge(
                 _phase45_cleanup_storage(storage, memmap_path)
                 continue
 
-            try:
-                kappa_val = float(stack_cfg.get("kappa_low", 3.0))
-            except Exception:
-                kappa_val = 3.0
-            limits_val = stack_cfg.get("winsor_limits", (0.05, 0.05))
-            try:
-                limits_val = (
-                    float(limits_val[0]),
-                    float(limits_val[1]),
-                )
-            except Exception:
-                limits_val = (0.05, 0.05)
-            try:
-                max_pass_val = int(stack_cfg.get("winsor_max_frames_per_pass", 0))
-            except Exception:
-                max_pass_val = 0
-            try:
-                worker_limit_val = int(stack_cfg.get("winsor_worker_limit", 1))
-            except Exception:
-                worker_limit_val = 1
-            stack_kwargs = {
-                "kappa": kappa_val,
-                "winsor_limits": limits_val,
-                "winsor_max_frames_per_pass": max_pass_val,
-                "winsor_max_workers": max(1, worker_limit_val),
-            }
-            super_arr = None
-            # --- Phase 4.5 (améliorée) : 2.1 → 3.1 à l’intérieur de 4.5 ---
-            # Réutiliser les options choisies dans le GUI :
-            #   normalize_method, weight_method, reject_algo, final_combine,
-            #   kappa/winsor/workers déjà présents dans stack_cfg/stack_kwargs.
-            try:
-                norm_method = str(stack_cfg.get("normalize_method", stack_cfg.get("stack_norm_method", "none"))).lower()
-            except Exception:
-                norm_method = "none"
-            try:
-                weight_method = str(stack_cfg.get("weight_method", stack_cfg.get("stack_weight_method", "none"))).lower()
-            except Exception:
-                weight_method = "none"
-            try:
-                reject_algo = str(stack_cfg.get("reject_algo", stack_cfg.get("stack_reject_algo", "winsorized_sigma_clip"))).lower()
-            except Exception:
-                reject_algo = "winsorized_sigma_clip"
-            try:
-                final_combine = str(stack_cfg.get("final_combine", stack_cfg.get("stack_final_combine", "mean"))).lower()
-            except Exception:
-                final_combine = "mean"
-
             # 4.5.a — micro-alignement résiduel (noop si indisponible)
             try:
                 if micro_align_available:
@@ -1412,9 +1551,11 @@ def _run_phase4_5_inter_master_merge(
 
             # 4.5.b — normalisation photométrique intra-groupe (gain/offset)
             if (
-                photometry_estimator_available
+                not chunk_photometry_done
+                and photometry_estimator_available
                 and photometry_apply_available
                 and photometry_intragroup
+                and norm_method not in ("", "none")
                 and len(frames) >= 2
             ):
                 try:
@@ -1524,6 +1665,143 @@ def _run_phase4_5_inter_master_merge(
                 except Exception as exc:
                     logger.warning("[P4.5][G%03d] Legacy inter-tile normalization failed: %s", group_id, exc)
 
+            logger.debug(
+                "[P4.5][G%03d] Photometry: method=%s, frames=%d, chan=%d",
+                group_id,
+                norm_method,
+                len(frames),
+                channels,
+            )
+            try:
+                clip_sigma_norm = float(photometry_clip_sigma)
+            except Exception:
+                clip_sigma_norm = 3.0
+            if not math.isfinite(clip_sigma_norm):
+                clip_sigma_norm = 3.0
+            clip_sigma_norm = max(0.1, min(clip_sigma_norm, 10.0))
+            sky_percent_cfg = stack_cfg.get("intertile_sky_percentile") or inter_cfg.get("intertile_sky_percentile")
+            if not (
+                isinstance(sky_percent_cfg, (list, tuple))
+                and len(sky_percent_cfg) >= 2
+            ):
+                sky_low, sky_high = 30.0, 70.0
+            else:
+                try:
+                    sky_low = float(sky_percent_cfg[0])
+                except Exception:
+                    sky_low = 30.0
+                try:
+                    sky_high = float(sky_percent_cfg[1])
+                except Exception:
+                    sky_high = 70.0
+                if not math.isfinite(sky_low):
+                    sky_low = 30.0
+                if not math.isfinite(sky_high):
+                    sky_high = 70.0
+            if sky_low > sky_high:
+                sky_low, sky_high = sky_high, sky_low
+            sky_low = max(0.0, min(100.0, sky_low))
+            sky_high = max(0.0, min(100.0, sky_high))
+            if sky_high - sky_low < 1e-3:
+                sky_low, sky_high = 30.0, 70.0
+
+            if norm_method in ("linear_fit", "sky_mean") and len(frames) >= 2:
+                try:
+                    ref_arr = np.asarray(frames[0], dtype=np.float32, copy=False)
+                    if ref_arr.ndim == 2:
+                        ref_arr = ref_arr[..., np.newaxis]
+                    ref_channels = ref_arr.shape[-1]
+                    total_pixels = max(1, ref_arr.shape[0] * ref_arr.shape[1])
+                    min_overlap_required = max(5000, int(math.ceil(total_pixels * 0.01)))
+                    for frame_idx in range(1, len(frames)):
+                        src_arr = frames[frame_idx]
+                        if src_arr is None:
+                            continue
+                        src_arr = np.asarray(src_arr, dtype=np.float32, copy=False)
+                        if src_arr.ndim == 2:
+                            src_arr = src_arr[..., np.newaxis]
+                        if src_arr.shape[-1] != ref_channels:
+                            continue
+                        if norm_method == "linear_fit":
+                            for ch in range(ref_channels):
+                                ref_chan = ref_arr[..., ch]
+                                src_chan = src_arr[..., ch]
+                                common_mask = np.isfinite(ref_chan) & np.isfinite(src_chan)
+                                common_pixels = int(common_mask.sum())
+                                if common_pixels < min_overlap_required:
+                                    continue
+                                x = src_chan[common_mask]
+                                y = ref_chan[common_mask]
+                                if clip_sigma_norm > 0.0 and x.size and y.size:
+                                    clip_mask = np.ones(x.shape, dtype=bool)
+                                    if x.size > 4:
+                                        x_med = float(np.nanmedian(x))
+                                        x_std = float(np.nanstd(x))
+                                        if math.isfinite(x_std) and x_std > 0.0:
+                                            clip_mask &= np.abs(x - x_med) <= (clip_sigma_norm * x_std)
+                                    if y.size > 4:
+                                        y_med = float(np.nanmedian(y))
+                                        y_std = float(np.nanstd(y))
+                                        if math.isfinite(y_std) and y_std > 0.0:
+                                            clip_mask &= np.abs(y - y_med) <= (clip_sigma_norm * y_std)
+                                    if not np.any(clip_mask):
+                                        continue
+                                    x = x[clip_mask]
+                                    y = y[clip_mask]
+                                    if x.size < max(1000, min_overlap_required // 2):
+                                        continue
+                                if x.size < 2:
+                                    continue
+                                xm = float(np.mean(x))
+                                ym = float(np.mean(y))
+                                xv = x - xm
+                                yv = y - ym
+                                denom = float(np.dot(xv, xv))
+                                if denom <= 0.0 or not math.isfinite(denom):
+                                    continue
+                                slope = float(np.dot(xv, yv) / denom)
+                                intercept = float(ym - slope * xm)
+                                if not (math.isfinite(slope) and math.isfinite(intercept)):
+                                    continue
+                                slope = float(np.clip(slope, 0.25, 4.0))
+                                src_valid = np.isfinite(src_chan)
+                                if not np.any(src_valid):
+                                    continue
+                                src_values = src_chan[src_valid]
+                                src_values *= slope
+                                src_values += intercept
+                                src_chan[src_valid] = src_values
+                        else:  # sky_mean
+                            for ch in range(ref_channels):
+                                ref_chan = ref_arr[..., ch]
+                                src_chan = src_arr[..., ch]
+                                ref_mask = np.isfinite(ref_chan)
+                                src_mask = np.isfinite(src_chan)
+                                if not (np.any(ref_mask) and np.any(src_mask)):
+                                    continue
+                                ref_vals = ref_chan[ref_mask]
+                                src_vals = src_chan[src_mask]
+                                ref_range = np.nanpercentile(ref_vals, [sky_low, sky_high])
+                                src_range = np.nanpercentile(src_vals, [sky_low, sky_high])
+                                ref_sel = (ref_vals >= ref_range[0]) & (ref_vals <= ref_range[1])
+                                src_sel = (src_vals >= src_range[0]) & (src_vals <= src_range[1])
+                                ref_clip = ref_vals[ref_sel] if np.any(ref_sel) else ref_vals
+                                src_clip = src_vals[src_sel] if np.any(src_sel) else src_vals
+                                if ref_clip.size == 0 or src_clip.size == 0:
+                                    continue
+                                bg_ref = float(np.nanmedian(ref_clip))
+                                bg_src = float(np.nanmedian(src_clip))
+                                if not (math.isfinite(bg_ref) and math.isfinite(bg_src)):
+                                    continue
+                                delta = bg_ref - bg_src
+                                src_chan[src_mask] = src_chan[src_mask] + delta
+                except Exception:
+                    logger.debug(
+                        "[P4.5][G%03d] Chunk photometric normalization skipped (error)",
+                        group_id,
+                        exc_info=True,
+                    )
+
             # 4.5.c — empilement selon les réglages GUI
             logger.debug(
                 "[P4.5][G%03d] Stack params: reject=%s, combine=%s, kappa=%.2f, winsor_limits=%s, workers=%d, weight=%s",
@@ -1615,6 +1893,7 @@ def _run_phase4_5_inter_master_merge(
                 elif super_arr.shape[-1] > 3:
                     super_arr = super_arr[..., :3]
             super_arr = np.asarray(super_arr, dtype=np.float32, order="C")
+            np.nan_to_num(super_arr, copy=False)
             arr_shape = tuple(super_arr.shape)
             logger.debug(
                 "[P4.5][G%03d] Super array ready: shape=%s, dtype=%s",
@@ -1645,6 +1924,13 @@ def _run_phase4_5_inter_master_merge(
             header = fits.Header()
             try:
                 header.update(local_wcs.to_header(relax=True))
+            except Exception:
+                pass
+            try:
+                header["ZMT_WCSLV"] = (
+                    "local" if local_wcs_source == "cutout" else "native",
+                    "Phase 4.5 super-tile WCS frame",
+                )
             except Exception:
                 pass
             try:
@@ -4471,6 +4757,17 @@ try:
     logger.info("Bibliothèque 'reproject' importée.")
 except ImportError as e_reproject_final: logger.critical(f"Échec import reproject: {e_reproject_final}.")
 except Exception as e_reproject_other_final: logger.critical(f"Erreur import 'reproject': {e_reproject_other_final}", exc_info=True)
+
+_REPROJECT_INTERP_SUPPORTS_MATCH_BG = False
+_REPROJECT_INTERP_SUPPORTS_FILL_VALUE = False
+if REPROJECT_AVAILABLE and reproject_interp:
+    try:
+        _sig_reproj_interp = inspect.signature(reproject_interp)
+        _REPROJECT_INTERP_SUPPORTS_MATCH_BG = "match_background" in _sig_reproj_interp.parameters
+        _REPROJECT_INTERP_SUPPORTS_FILL_VALUE = "fill_value" in _sig_reproj_interp.parameters
+    except Exception:
+        _REPROJECT_INTERP_SUPPORTS_MATCH_BG = False
+        _REPROJECT_INTERP_SUPPORTS_FILL_VALUE = False
 
 # --- Local Project Module Imports ---
 zemosaic_utils, ZEMOSAIC_UTILS_AVAILABLE = None, False
@@ -10663,6 +10960,7 @@ def run_hierarchical_mosaic(
             "winsor_worker_limit": winsor_worker_limit_config,
             # Phase 4.5 uses GUI stacking options directly; include canonical and legacy keys
             "normalize_method": stack_norm_method,
+            "stacking_normalize_method": stack_norm_method,
             "weight_method": stack_weight_method,
             "reject_algo": stack_reject_algo,
             "final_combine": stack_final_combine,
@@ -10670,6 +10968,7 @@ def run_hierarchical_mosaic(
             "stack_weight_method": stack_weight_method,
             "stack_reject_algo": stack_reject_algo,
             "stack_final_combine": stack_final_combine,
+            "intertile_sky_percentile": intertile_sky_percentile_tuple,
         }
         master_tiles_results_list = _run_phase4_5_inter_master_merge(
             master_tiles_results_list,

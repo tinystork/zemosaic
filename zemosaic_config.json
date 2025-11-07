@@ -7,7 +7,7 @@
     "language": "en",
     "num_processing_workers": -1,
     "stacking_normalize_method": "linear_fit",
-    "stacking_weighting_method": "noise_variance",
+    "stacking_weighting_method": "noise_fwhm",
     "stacking_rejection_algorithm": "winsorized_sigma_clip",
     "stacking_kappa_low": 3.0,
     "stacking_kappa_high": 3.0,
