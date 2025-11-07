@@ -794,6 +794,46 @@ def _run_phase4_5_inter_master_merge(
 
     pcb("p45_start", prog=None, lvl="INFO")
 
+    def _phase45_gui_emit(key=None, *, level: str = "DEBUG", **kwargs) -> bool:
+        """Emit a GUI log safely, falling back silently if the GUI is detached."""
+        if not pcb:
+            return False
+        try:
+            pcb(key, prog=None, lvl=level, **kwargs)
+            return True
+        except Exception:
+            return False
+
+    def _phase45_gui_message(message: str, level: str = "DEBUG") -> bool:
+        """Send a free-form heartbeat message to the GUI log."""
+        return _phase45_gui_emit(message, level=level)
+
+    logger.debug(
+        "[P4.5] Starting Inter-Master merge: threshold=%.2f, min_group=%d, max_group=%d, "
+        "memmap=%s, local_scale=%s, method=%s, master_tiles=%d",
+        threshold,
+        min_group,
+        max_group,
+        memmap_policy,
+        local_scale,
+        method,
+        len(master_tiles),
+    )
+    if not _phase45_gui_emit(
+        "p45_group_info",
+        level="DEBUG",
+        group=0,
+        total=len(master_tiles),
+        members=len(master_tiles),
+    ):
+        _phase45_gui_message(
+            f"Phase 4.5: preparing overlap graph (tiles={len(master_tiles)})"
+        )
+
+    micro_align_available = hasattr(zemosaic_align_stack, "micro_align_stack")
+    photometry_estimator_available = hasattr(zemosaic_align_stack, "estimate_affine_photometry")
+    photometry_apply_available = hasattr(zemosaic_align_stack, "apply_affine_photometry")
+
     tiles: list[_InterMasterTile] = []
     for idx, (path, wcs_obj) in enumerate(master_tiles):
         shape_hw = _phase45_resolve_tile_shape(path, wcs_obj)
@@ -801,21 +841,46 @@ def _run_phase4_5_inter_master_merge(
             continue
         tiles.append(_InterMasterTile(index=idx, path=path, wcs=wcs_obj, shape_hw=shape_hw))
 
+    logger.debug(
+        "[P4.5] Candidate tiles retained for overlap graph: %d/%d",
+        len(tiles),
+        len(master_tiles),
+    )
+    _phase45_gui_message(f"Phase 4.5: building overlap graph with {len(tiles)} tiles")
+
     if len(tiles) < min_group:
         pcb("p45_finished", prog=None, lvl="INFO_DETAIL", tiles_in=len(master_tiles), tiles_out=len(master_tiles))
         return master_tiles
 
     tile_map = {tile.index: tile for tile in tiles}
     adjacency: dict[int, set[int]] = {tile.index: set() for tile in tiles}
+    total_pairs = 0
     for i, tile_a in enumerate(tiles):
         for tile_b in tiles[i + 1 :]:
             overlap = _phase45_overlap_fraction(tile_a, tile_b)
             if overlap >= threshold:
                 adjacency[tile_a.index].add(tile_b.index)
                 adjacency[tile_b.index].add(tile_a.index)
-
+                total_pairs += 1
+        if i and i % 10 == 0:
+            msg = (
+                f"Phase 4.5: overlap scan {i}/{len(tiles)} (edges>={threshold:.2f}: {total_pairs})"
+            )
+            logger.debug("[P4.5] %s", msg)
+            _phase45_gui_message(msg)
+    logger.debug(
+        "[P4.5] Overlap graph: %d tiles, %d edges >= %.2f",
+        len(tiles),
+        total_pairs,
+        threshold,
+    )
+    _phase45_gui_message(
+        f"Phase 4.5: overlap graph ready ({total_pairs} edges >= {threshold:.2f})"
+    )
     visited: set[int] = set()
     groups: list[list[int]] = []
+    total_components = 0
+    valid_components = 0
     for tile in tiles:
         if tile.index in visited:
             continue
@@ -828,14 +893,34 @@ def _run_phase4_5_inter_master_merge(
             visited.add(node)
             component.append(node)
             stack.extend(adjacency.get(node, ()))
+        total_components += 1
         if len(component) >= min_group:
             groups.append(sorted(component))
+            valid_components += 1
+
+    logger.debug(
+        "[P4.5] Connected components: total=%d, meeting_min_group=%d (min_group=%d)",
+        total_components,
+        valid_components,
+        min_group,
+    )
+    if not groups:
+        _phase45_gui_message("Phase 4.5: no groups reached the minimum overlap")
 
     if not groups:
         pcb("p45_finished", prog=None, lvl="INFO_DETAIL", tiles_in=len(master_tiles), tiles_out=len(master_tiles))
         return master_tiles
 
     total_chunks = sum(max(1, math.ceil(len(group) / max_group)) for group in groups)
+    logger.debug(
+        "[P4.5] Planned processing batches: groups=%d, chunks=%d, max_group=%d",
+        len(groups),
+        total_chunks,
+        max_group,
+    )
+    _phase45_gui_message(
+        f"Phase 4.5: processing {len(groups)} groups / {total_chunks} chunks"
+    )
     processed_chunks = 0
     replacements: dict[int, tuple[str | None, Any]] = {}
     consumed_indices: set[int] = set()
@@ -845,7 +930,26 @@ def _run_phase4_5_inter_master_merge(
         members = [tile_map[idx] for idx in group_indices if idx in tile_map]
         if not members:
             continue
-        pcb("p45_group_info", prog=None, lvl="DEBUG", group=group_id, total=len(groups), members=len(members))
+        group_chunks = max(1, math.ceil(len(members) / max_group))
+        member_ids = [tile.index for tile in members]
+        if not _phase45_gui_emit(
+            "p45_group_info",
+            level="DEBUG",
+            group=group_id,
+            total=len(groups),
+            members=len(members),
+            chunks=group_chunks,
+        ):
+            _phase45_gui_message(
+                f"Phase 4.5: group {group_id} queued ({len(members)} tiles)"
+            )
+        logger.debug(
+            "[P4.5][G%03d] Preparing group: members=%d, chunks=%d, ids=%s",
+            group_id,
+            len(members),
+            group_chunks,
+            member_ids,
+        )
         for chunk_start in range(0, len(members), max_group):
             chunk_tiles = members[chunk_start : chunk_start + max_group]
             processed_chunks += 1
@@ -854,6 +958,31 @@ def _run_phase4_5_inter_master_merge(
                     progress_callback("phase4_5", processed_chunks, total_chunks)
                 except Exception:
                     pass
+            chunk_idx = min(group_chunks, (chunk_start // max_group) + 1)
+            if not _phase45_gui_emit(
+                "p45_group_info",
+                level="DEBUG",
+                group=group_id,
+                total=len(groups),
+                members=len(chunk_tiles),
+                chunk=chunk_idx,
+                chunks=group_chunks,
+                processed=processed_chunks,
+                total_chunks=total_chunks,
+            ):
+                _phase45_gui_message(
+                    f"Phase 4.5: processing chunk {chunk_idx}/{group_chunks} "
+                    f"(group {group_id}, global {processed_chunks}/{total_chunks})"
+                )
+            logger.debug(
+                "[P4.5][G%03d] Chunk %d/%d (%d tiles) - global chunk %d/%d",
+                group_id,
+                chunk_idx,
+                group_chunks,
+                len(chunk_tiles),
+                processed_chunks,
+                total_chunks,
+            )
 
             reference_tile = chunk_tiles[0]
             if local_scale == "final" and final_output_wcs and final_output_shape_hw:
@@ -867,6 +996,16 @@ def _run_phase4_5_inter_master_merge(
 
             if not (local_wcs and local_shape):
                 continue
+            logger.debug(
+                "[P4.5][G%03d] Local frame resolved: scale=%s, shape=%s, ref_tile=%d",
+                group_id,
+                local_scale,
+                tuple(local_shape),
+                reference_tile.index,
+            )
+            _phase45_gui_message(
+                f"Phase 4.5: group {group_id} local frame {local_shape[0]}x{local_shape[1]}"
+            )
 
             storage = None
             memmap_path = None
@@ -889,9 +1028,25 @@ def _run_phase4_5_inter_master_merge(
                 success = False
                 channels = 3
             if not success:
+                logger.debug("[P4.5][G%03d] Failed to preload reference tile for chunk %d/%d", group_id, chunk_idx, group_chunks)
                 continue
             try:
                 storage, memmap_path = _phase45_allocate_stack_storage(len(chunk_tiles), local_shape, channels, memmap_policy, temp_storage_dir)
+                allocation_mode = "memmap" if memmap_path else "ram"
+                logger.debug(
+                    "[P4.5][G%03d] Allocated %s stack storage for chunk %d/%d: "
+                    "tiles=%d, shape=%s, channels=%d",
+                    group_id,
+                    allocation_mode,
+                    chunk_idx,
+                    group_chunks,
+                    len(chunk_tiles),
+                    local_shape,
+                    channels,
+                )
+                _phase45_gui_message(
+                    f"Phase 4.5: group {group_id} chunk {chunk_idx}/{group_chunks} reprojection"
+                )
                 for idx_tile, tile in enumerate(chunk_tiles):
                     if tile.index in preloaded:
                         arr = preloaded.pop(tile.index)
@@ -932,6 +1087,12 @@ def _run_phase4_5_inter_master_merge(
                 success = False
 
             if not success:
+                logger.debug(
+                    "[P4.5][G%03d] Chunk %d/%d aborted during reprojection",
+                    group_id,
+                    chunk_idx,
+                    group_chunks,
+                )
                 _phase45_cleanup_storage(storage, memmap_path)
                 continue
 
@@ -961,28 +1122,180 @@ def _run_phase4_5_inter_master_merge(
                 "winsor_max_frames_per_pass": max_pass_val,
                 "winsor_max_workers": max(1, worker_limit_val),
             }
+            super_arr = None
+            # --- Phase 4.5 (améliorée) : 2.1 → 3.1 à l’intérieur de 4.5 ---
+            # Réutiliser les options choisies dans le GUI :
+            #   normalize_method, weight_method, reject_algo, final_combine,
+            #   kappa/winsor/workers déjà présents dans stack_cfg/stack_kwargs.
             try:
-                if method == "winsor":
-                    super_arr, _ = zemosaic_align_stack.stack_winsorized_sigma_clip(
-                        frames,
-                        weight_method="none",
-                        zconfig=None,
-                        **stack_kwargs,
-                    )
-                elif method == "median":
-                    super_arr = np.nanmedian(np.stack(frames, axis=0), axis=0).astype(np.float32)
-                else:
-                    super_arr = np.nanmean(np.stack(frames, axis=0), axis=0).astype(np.float32)
+                norm_method = str(stack_cfg.get("normalize_method", stack_cfg.get("stack_norm_method", "none"))).lower()
             except Exception:
+                norm_method = "none"
+            try:
+                weight_method = str(stack_cfg.get("weight_method", stack_cfg.get("stack_weight_method", "none"))).lower()
+            except Exception:
+                weight_method = "none"
+            try:
+                reject_algo = str(stack_cfg.get("reject_algo", stack_cfg.get("stack_reject_algo", "winsorized_sigma_clip"))).lower()
+            except Exception:
+                reject_algo = "winsorized_sigma_clip"
+            try:
+                final_combine = str(stack_cfg.get("final_combine", stack_cfg.get("stack_final_combine", "mean"))).lower()
+            except Exception:
+                final_combine = "mean"
+
+            # 4.5.a — micro-alignement résiduel (noop si indisponible)
+            try:
+                if micro_align_available:
+                    logger.debug(
+                        "[P4.5][G%03d] Micro-align start: method=phase, frames=%d",
+                        group_id,
+                        len(frames),
+                    )
+                    _phase45_gui_message(
+                        f"Phase 4.5: group {group_id} micro-align ({len(frames)} frames)"
+                    )
+                    frames = zemosaic_align_stack.micro_align_stack(
+                        frames, method="phase", max_shift_px=8
+                    )
+                    logger.debug("[P4.5][G%03d] Micro-align done", group_id)
+            except Exception as exc:
+                logger.debug("[P4.5][G%03d] Micro-align skipped/failed: %s", group_id, exc)
+
+            # 4.5.b — normalisation photométrique locale (gain/offset)
+            try:
+                if norm_method != "none" and photometry_estimator_available:
+                    logger.debug(
+                        "[P4.5][G%03d] Photometry normalization start: method=%s, weight=%s",
+                        group_id,
+                        norm_method,
+                        weight_method,
+                    )
+                    gains_offsets = zemosaic_align_stack.estimate_affine_photometry(
+                        frames, method=norm_method, weight_method=weight_method
+                    )
+                    nontrivial = 0
+                    samples: list[str] = []
+                    if isinstance(gains_offsets, (list, tuple, np.ndarray)):
+                        try:
+                            iterable = list(gains_offsets)
+                        except Exception:
+                            iterable = gains_offsets
+                        for idx_go, pair in enumerate(iterable):
+                            try:
+                                gain = float(pair[0])
+                            except Exception:
+                                gain = 1.0
+                            try:
+                                offset = float(pair[1])
+                            except Exception:
+                                offset = 0.0
+                            if abs(gain - 1.0) > 1e-3 or abs(offset) > 1e-3:
+                                nontrivial += 1
+                                if len(samples) < 3:
+                                    samples.append(f"#{idx_go}:{gain:.3f}/{offset:.3f}")
+                        if samples:
+                            sample_repr = "; ".join(samples)
+                        else:
+                            sample_repr = ""
+                    else:
+                        sample_repr = ""
+                    logger.debug(
+                        "[P4.5][G%03d] Photometry normalization applied: %d non-trivial corrections%s",
+                        group_id,
+                        nontrivial,
+                        f" ({sample_repr})" if sample_repr else "",
+                    )
+                    _phase45_gui_message(
+                        f"Phase 4.5: group {group_id} photometric match ({nontrivial} corrections)"
+                    )
+                    if photometry_apply_available:
+                        frames = zemosaic_align_stack.apply_affine_photometry(frames, gains_offsets)
+            except Exception as exc:
+                logger.debug("[P4.5][G%03d] Photometry norm skipped/failed: %s", group_id, exc)
+
+            # 4.5.c — empilement selon les réglages GUI
+            logger.debug(
+                "[P4.5][G%03d] Stack params: reject=%s, combine=%s, kappa=%.2f, winsor_limits=%s, workers=%d, weight=%s",
+                group_id,
+                reject_algo,
+                final_combine,
+                kappa_val,
+                limits_val,
+                stack_kwargs["winsor_max_workers"],
+                weight_method,
+            )
+            _phase45_gui_message(
+                f"Phase 4.5: group {group_id} stacking ({reject_algo}/{final_combine})"
+            )
+            try:
+                if reject_algo in ("winsor", "winsorized_sigma_clip"):
+                    result = zemosaic_align_stack.stack_winsorized_sigma_clip(
+                        frames, weight_method=weight_method, zconfig=None, **stack_kwargs
+                    )
+                    super_arr = result[0] if isinstance(result, (tuple, list)) else result
+                elif reject_algo == "kappa_sigma":
+                    stack_result = None
+                    if hasattr(zemosaic_align_stack, "stack_kappa_sigma"):
+                        stack_result = zemosaic_align_stack.stack_kappa_sigma(
+                            frames,
+                            kappa=float(stack_cfg.get("kappa_low", 3.0)),
+                            combine=final_combine,
+                            weight_method=weight_method,
+                        )
+                    elif hasattr(zemosaic_align_stack, "stack_kappa_sigma_clip"):
+                        stack_result = zemosaic_align_stack.stack_kappa_sigma_clip(
+                            frames,
+                            weight_method=weight_method,
+                            zconfig=None,
+                            sigma_low=float(stack_cfg.get("kappa_low", 3.0)),
+                            sigma_high=float(stack_cfg.get("kappa_high", stack_cfg.get("kappa_low", 3.0))),
+                        )
+                    if stack_result is not None:
+                        super_arr = stack_result[0] if isinstance(stack_result, (tuple, list)) else stack_result
+                elif reject_algo == "linear_fit_clip" and hasattr(zemosaic_align_stack, "stack_linear_fit_clip"):
+                    result = zemosaic_align_stack.stack_linear_fit_clip(
+                        frames,
+                        weight_method=weight_method,
+                        zconfig=None,
+                        sigma=float(stack_cfg.get("kappa_high", stack_cfg.get("kappa_low", 3.0))),
+                    )
+                    super_arr = result[0] if isinstance(result, (tuple, list)) else result
+
+                if super_arr is None:
+                    stack_np = np.stack(frames, axis=0).astype(np.float32, copy=False)
+                    super_arr = (
+                        np.nanmedian(stack_np, axis=0).astype(np.float32)
+                        if final_combine == "median"
+                        else np.nanmean(stack_np, axis=0).astype(np.float32)
+                    )
+            except Exception as exc:
+                logger.debug("[P4.5][G%03d] Stack failed: %s", group_id, exc)
                 _phase45_cleanup_storage(storage, memmap_path)
                 continue
 
             _phase45_cleanup_storage(storage, memmap_path)
 
             if super_arr is None:
+                logger.debug(
+                    "[P4.5][G%03d] Stack yielded no data; skipping chunk %d/%d",
+                    group_id,
+                    chunk_idx,
+                    group_chunks,
+                )
                 continue
 
             super_arr = np.asarray(super_arr, dtype=np.float32)
+            arr_shape = tuple(super_arr.shape)
+            logger.debug(
+                "[P4.5][G%03d] Super array ready: shape=%s, dtype=%s",
+                group_id,
+                arr_shape,
+                super_arr.dtype,
+            )
+            _phase45_gui_message(
+                f"Phase 4.5: group {group_id} super-tile shape {arr_shape}"
+            )
             representative_idx = min(tile.index for tile in chunk_tiles)
             consumed_indices.update(tile.index for tile in chunk_tiles)
 
@@ -990,6 +1303,7 @@ def _run_phase4_5_inter_master_merge(
             os.makedirs(target_dir, exist_ok=True)
             super_filename = f"super_tile_{representative_idx:03d}_{uuid.uuid4().hex[:8]}.fits"
             super_path = os.path.join(target_dir, super_filename)
+            logger.debug("[P4.5][G%03d] Saving super tile to %s", group_id, super_path)
 
             header = fits.Header()
             try:
@@ -1033,6 +1347,14 @@ def _run_phase4_5_inter_master_merge(
                 out=os.path.basename(super_path),
                 snr=f"{snr_gain:.2f}",
             )
+            logger.debug(
+                "[P4.5][G%03d] Super tile saved (%d tiles, SNR x%.2f): %s shape=%s",
+                group_id,
+                len(chunk_tiles),
+                snr_gain,
+                super_path,
+                arr_shape,
+            )
 
     if cache_retention_mode != "keep":
         for path in cleanup_paths:
@@ -1050,6 +1372,12 @@ def _run_phase4_5_inter_master_merge(
         elif idx not in consumed_indices:
             new_master_tiles.append(original)
 
+    logger.debug(
+        "[P4.5] Finished Inter-Master merge: tiles_in=%d, tiles_out=%d, replacements=%d",
+        len(master_tiles),
+        len(new_master_tiles),
+        len(replacements),
+    )
     pcb(
         "p45_finished",
         prog=None,
@@ -9513,9 +9841,19 @@ def run_hierarchical_mosaic(
         }
         stack_cfg_phase45 = {
             "kappa_low": float(stack_kappa_low),
+            "kappa_high": float(stack_kappa_high),
             "winsor_limits": parsed_winsor_limits,
             "winsor_max_frames_per_pass": winsor_max_frames_per_pass_config,
             "winsor_worker_limit": winsor_worker_limit_config,
+            # Phase 4.5 uses GUI stacking options directly; include canonical and legacy keys
+            "normalize_method": stack_norm_method,
+            "weight_method": stack_weight_method,
+            "reject_algo": stack_reject_algo,
+            "final_combine": stack_final_combine,
+            "stack_norm_method": stack_norm_method,
+            "stack_weight_method": stack_weight_method,
+            "stack_reject_algo": stack_reject_algo,
+            "stack_final_combine": stack_final_combine,
         }
         master_tiles_results_list = _run_phase4_5_inter_master_merge(
             master_tiles_results_list,

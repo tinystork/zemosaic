@@ -51,7 +51,7 @@
     "winsor_min_frames_per_pass": 4,
     "winsor_memmap_fallback": "auto",
     "winsor_split_strategy": "sequential",
-    "max_raw_per_master_tile": 30,
+    "max_raw_per_master_tile": 50,
     "center_out_normalization_p3": true,
     "center_out_anchor_mode": "auto_central_quality",
     "anchor_quality_probe_limit": 20,
