@@ -46,6 +46,8 @@
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
+print("INFO: using NEW lecropper (Alt-Az + Quality-crop pipeline)")
+
 import os
 import sys
 import glob
@@ -146,7 +148,15 @@ def bbox_from_mask(m):
 logger = logging.getLogger(__name__)
 
 
-def detect_autocrop_rgb(lum2d, R, G, B, band_px=32, k_sigma=2.0, margin_px=8):
+def detect_autocrop_rgb(
+    lum2d,
+    R,
+    G,
+    B,
+    band_px=32,
+    k_sigma=2.0,
+    margin_px=8,
+):
     """
     Renvoie (y0, x0, y1, x1) en pleine résolution.
     Corrigé: normalisation, non-noir, planchers, double érosion, trim full-res.
@@ -260,6 +270,161 @@ def detect_autocrop_rgb(lum2d, R, G, B, band_px=32, k_sigma=2.0, margin_px=8):
     return int(y0), int(x0), int(y1), int(x1)
 
 
+def _radial_falloff_mask(shape, margin_percent=5.0, decay_ratio=0.15):
+    """Return a smooth radial mask (1 center -> 0 edges).
+
+    Parameters
+    ----------
+    shape : tuple[int, int]
+        Spatial (H, W) dimensions of the mask to generate.
+    margin_percent : float
+        Percentage of the radius to attenuate (0-50%).
+    decay_ratio : float
+        Ratio of the transition width relative to the margin (0 = hard cut).
+    """
+
+    if len(shape) != 2:
+        raise ValueError("shape must be (H, W)")
+
+    H, W = shape
+    if H == 0 or W == 0:
+        return np.zeros((H, W), dtype=np.float32)
+
+    yy = np.linspace(-1.0, 1.0, H, dtype=np.float32)
+    xx = np.linspace(-1.0, 1.0, W, dtype=np.float32)
+    yy, xx = np.meshgrid(yy, xx, indexing="ij")
+    r = np.hypot(xx, yy)
+    r_max = float(r.max()) or 1.0
+    r_norm = r / r_max
+
+    margin = float(np.clip(margin_percent / 100.0, 0.0, 0.5))
+    if margin <= 0.0:
+        return np.ones((H, W), dtype=np.float32)
+
+    inner = max(0.0, 1.0 - margin)
+    decay_ratio = max(0.0, float(decay_ratio))
+    transition = max(1e-3, margin * decay_ratio)
+    outer = min(1.0, inner + transition)
+
+    mask = np.ones((H, W), dtype=np.float32)
+
+    hard_zone = r_norm >= outer
+    mask[hard_zone] = 0.0
+
+    if outer > inner:
+        # Smooth step transition between inner and outer.
+        trans_zone = (r_norm >= inner) & (r_norm < outer)
+        if np.any(trans_zone):
+            width = outer - inner
+            t = (r_norm[trans_zone] - inner) / width
+            smooth = 1.0 - (3.0 - 2.0 * t) * (t ** 2)
+            mask[trans_zone] = smooth.astype(np.float32)
+
+    return np.clip(mask, 0.0, 1.0)
+
+
+def mask_altaz_artifacts(
+    full_img,
+    margin_percent=5.0,
+    decay_ratio=0.15,
+    fill_value=0.0,
+    return_mask=False,
+    hard_threshold=1e-3,
+):
+    """Softly attenuate Alt-Az rotation artifacts near the corners.
+
+    Parameters
+    ----------
+    full_img : np.ndarray
+        Image (2D) or cube (channel-first or channel-last) to be masked.
+    margin_percent : float
+        Percentage of the radius to attenuate from the borders.
+    decay_ratio : float
+        Controls how soft the transition is (0 -> hard cut).
+    fill_value : float or None
+        Value to use once the mask is close to zero. ``None`` keeps the
+        smooth attenuation without forcing a hard fill.
+    return_mask : bool
+        Whether to return the generated mask alongside the image.
+    hard_threshold : float
+        Threshold below which the mask is considered "off" for fill_value.
+    """
+
+    arr = np.asarray(full_img, dtype=np.float32)
+    arr = arr.copy()
+
+    if arr.ndim < 2:
+        raise ValueError("mask_altaz_artifacts expects at least 2 dimensions")
+
+    if arr.ndim == 2:
+        spatial_shape = arr.shape
+        leading_spatial = True
+    else:
+        head_shape = arr.shape[:2]
+        tail_shape = arr.shape[-2:]
+        head_area = head_shape[0] * head_shape[1]
+        tail_area = tail_shape[0] * tail_shape[1]
+        if head_area >= tail_area:
+            spatial_shape = head_shape
+            leading_spatial = True
+        else:
+            spatial_shape = tail_shape
+            leading_spatial = False
+
+    mask2d = _radial_falloff_mask(spatial_shape, margin_percent, decay_ratio)
+
+    if arr.ndim == 2:
+        masked = arr * mask2d
+    elif leading_spatial:
+        stretch = spatial_shape + (1,) * (arr.ndim - 2)
+        masked = arr * mask2d.reshape(stretch)
+    else:
+        stretch = (1,) * (arr.ndim - 2) + spatial_shape
+        masked = arr * mask2d.reshape(stretch)
+
+    if fill_value is not None:
+        fill_mask = mask2d <= float(hard_threshold)
+        if np.isnan(fill_value):
+            fill_value = np.nan
+        if masked.ndim == 2:
+            masked = np.where(fill_mask, fill_value, masked)
+        elif leading_spatial:
+            fill_shape = spatial_shape + (1,) * (masked.ndim - 2)
+            masked = np.where(fill_mask.reshape(fill_shape), fill_value, masked)
+        else:
+            fill_shape = (1,) * (masked.ndim - 2) + spatial_shape
+            masked = np.where(fill_mask.reshape(fill_shape), fill_value, masked)
+
+    if return_mask:
+        return masked, mask2d
+    return masked
+
+
+def apply_altaz_cleanup(
+    image,
+    margin_percent: float = 5.0,
+    decay: float = 0.15,
+    nanize: bool = False,
+):
+    """
+    Public helper that mirrors the Alt-Az cleanup expected by ZeMosaic.
+
+    The function intentionally avoids any dependency on ZeMosaic so that this
+    module stays standalone-friendly.
+    """
+
+    if image is None:
+        return None
+
+    fill_value = np.nan if nanize else 0.0
+    return mask_altaz_artifacts(
+        image,
+        margin_percent=margin_percent,
+        decay_ratio=decay,
+        fill_value=fill_value,
+    )
+
+
 def _trim_color_edges_fullres(R, G, B, rect, step=3, minsize=32, k=3.0):
     y0, x0, y1, x1 = rect
     if (y1 - y0) <= minsize * 2 or (x1 - x0) <= minsize * 2:
@@ -352,7 +517,15 @@ def load_fits_rgb(path):
     return lum, R, G, B
 
 
-def save_cropped_fits(in_path, rect, out_suffix="_cropped"):
+def save_cropped_fits(
+    in_path,
+    rect,
+    out_suffix="_cropped",
+    altaz_cleanup=False,
+    altaz_margin=5.0,
+    altaz_decay=0.15,
+    altaz_use_nan=False,
+):
     y0, x0, y1, x1 = rect
     # Use memmap=False so the FITS file handle is fully released before
     # potentially overwriting the source file (Windows needs the file closed).
@@ -371,6 +544,15 @@ def save_cropped_fits(in_path, rect, out_suffix="_cropped"):
             cropped = data[:, y0:y1, x0:x1]
     else:
         cropped = data
+
+    if altaz_cleanup:
+        fill_value = np.nan if altaz_use_nan else 0.0
+        cropped = mask_altaz_artifacts(
+            cropped,
+            margin_percent=altaz_margin,
+            decay_ratio=altaz_decay,
+            fill_value=fill_value,
+        )
 
     # Mise à jour rapide du CRPIX si présent (optionnel)
     if "CRPIX1" in header and "CRPIX2" in header:
@@ -415,6 +597,20 @@ class AutoCropApp:
         tk.Label(top, text="margin px").pack(side=tk.LEFT, padx=(10, 2))
         self.margin_var = tk.StringVar(value="8")
         tk.Entry(top, textvariable=self.margin_var, width=5).pack(side=tk.LEFT)
+
+        self.altaz_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(top, text="Alt-Az cleanup", variable=self.altaz_var).pack(side=tk.LEFT, padx=8)
+
+        tk.Label(top, text="AltAz margin %").pack(side=tk.LEFT, padx=(4, 2))
+        self.altaz_margin_var = tk.StringVar(value="5.0")
+        tk.Entry(top, textvariable=self.altaz_margin_var, width=5).pack(side=tk.LEFT)
+
+        tk.Label(top, text="AltAz decay").pack(side=tk.LEFT, padx=(4, 2))
+        self.altaz_decay_var = tk.StringVar(value="0.15")
+        tk.Entry(top, textvariable=self.altaz_decay_var, width=5).pack(side=tk.LEFT)
+
+        self.altaz_nan_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(top, text="Alt-Az → NaN", variable=self.altaz_nan_var).pack(side=tk.LEFT, padx=6)
 
         tk.Button(top, text="Analyze", command=self.analyze).pack(side=tk.LEFT, padx=8)
         tk.Button(top, text="Export CSV", command=self.export_csv).pack(side=tk.LEFT, padx=4)
@@ -473,6 +669,23 @@ class AutoCropApp:
         for f in files:
             self.listbox.insert(tk.END, os.path.basename(f))
         self.status.set(f"Found {len(files)} FITS files.")
+
+    def _get_altaz_params(self):
+        enabled = bool(self.altaz_var.get())
+        try:
+            margin = float(self.altaz_margin_var.get())
+        except Exception:
+            margin = 5.0
+        margin = float(np.clip(margin, 0.0, 50.0))
+
+        try:
+            decay = float(self.altaz_decay_var.get())
+        except Exception:
+            decay = 0.15
+        decay = max(0.0, decay)
+
+        use_nan = bool(self.altaz_nan_var.get())
+        return enabled, margin, decay, use_nan
 
     def analyze(self):
         if not self.files:
@@ -533,6 +746,14 @@ class AutoCropApp:
             lum, R, G, B = load_fits_rgb(path)
             # on affiche la luminance (low-stretch pour voir les bords sombres)
             disp = np.power(np.clip(lum, 0, 1), 0.5)
+            altaz_enabled, altaz_margin, altaz_decay, _ = self._get_altaz_params()
+            if altaz_enabled:
+                disp = mask_altaz_artifacts(
+                    disp,
+                    margin_percent=altaz_margin,
+                    decay_ratio=altaz_decay,
+                    fill_value=0.0,
+                )
             self.ax.imshow(disp, origin="upper", cmap="gray")
             if rect is not None:
                 y0, x0, y1, x1 = rect
@@ -568,13 +789,22 @@ class AutoCropApp:
             messagebox.showinfo("Apply Crop", "No results to apply.")
             return
         ok, err = 0, 0
+        altaz_enabled, altaz_margin, altaz_decay, altaz_use_nan = self._get_altaz_params()
         for p in self.files:
             rect = self.results.get(p)
             if not rect:
                 continue
             try:
                 suffix = "" if self.replace_var.get() else "_cropped"
-                outp = save_cropped_fits(p, rect, out_suffix=suffix)
+                outp = save_cropped_fits(
+                    p,
+                    rect,
+                    out_suffix=suffix,
+                    altaz_cleanup=altaz_enabled,
+                    altaz_margin=altaz_margin,
+                    altaz_decay=altaz_decay,
+                    altaz_use_nan=altaz_use_nan,
+                )
                 ok += 1
             except Exception as e:
                 print(f"[CROP ERROR] {p}: {e}\n{traceback.format_exc()}", file=sys.stderr)

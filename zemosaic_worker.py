@@ -69,15 +69,34 @@ import importlib.util
 from pathlib import Path
 from threading import Lock
 from dataclasses import dataclass
-from typing import Callable, Any, Iterable
+from typing import Callable, Any, Iterable, Optional
 from types import SimpleNamespace
 
 import numpy as np
 
 
+
+try:
+    import lecropper  # noqa: F401
+
+    _LECROPPER_AVAILABLE = True
+except Exception:
+    lecropper = None
+    _LECROPPER_AVAILABLE = False
+
+
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, FIRST_COMPLETED, as_completed
 # BrokenProcessPool moved under concurrent.futures.process in modern Python
 from concurrent.futures.process import BrokenProcessPool
+
+# ZeQualityMT (quality gate for Master Tiles)
+try:
+    from zequalityMT import quality_metrics as _zq_quality_metrics
+except Exception:
+    _zq_quality_metrics = None
+
+_ZEQUALITY_WARNING_EMITTED = False
+_ZEQUALITY_WARNING_LOCK = threading.Lock()
 
 try:
     from zemosaic_utils import EXCLUDED_DIRS, is_path_excluded
@@ -200,6 +219,87 @@ def _move_to_unaligned_safe(
         except Exception:
             pass
         return "failed", dst
+
+
+def _apply_lecropper_pipeline(arr: np.ndarray | None, cfg: dict | None) -> np.ndarray | None:
+    """Apply quality crop + Alt-Az cleanup if the new lecropper is available."""
+
+    if not (_LECROPPER_AVAILABLE and isinstance(arr, np.ndarray) and arr.size):
+        return arr
+
+    cfg = cfg or {}
+    try:
+        q_enabled = bool(cfg.get("quality_crop_enabled", False))
+    except Exception:
+        q_enabled = False
+    try:
+        band_px = int(cfg.get("quality_crop_band_px", 32))
+    except Exception:
+        band_px = 32
+    try:
+        k_sigma = float(cfg.get("quality_crop_k_sigma", 2.0))
+    except Exception:
+        k_sigma = 2.0
+    try:
+        margin_px = int(cfg.get("quality_crop_margin_px", 8))
+    except Exception:
+        margin_px = 8
+    try:
+        min_run = int(cfg.get("quality_crop_min_run", 2))
+    except Exception:
+        min_run = 2
+
+    try:
+        az_enabled = bool(cfg.get("altaz_cleanup_enabled", False))
+    except Exception:
+        az_enabled = False
+    try:
+        az_margin = float(cfg.get("altaz_margin_percent", 5.0))
+    except Exception:
+        az_margin = 5.0
+    try:
+        az_decay = float(cfg.get("altaz_decay", 0.15))
+    except Exception:
+        az_decay = 0.15
+    try:
+        az_nanize = bool(cfg.get("altaz_nanize", True))
+    except Exception:
+        az_nanize = True
+
+    out = arr
+    try:
+        if q_enabled and hasattr(lecropper, "quality_crop"):
+            out = lecropper.quality_crop(
+                out,
+                band_px=band_px,
+                k_sigma=k_sigma,
+                margin_px=margin_px,
+                min_run=min_run,
+            )
+
+        if az_enabled:
+            if hasattr(lecropper, "altZ_cleanup"):
+                out = lecropper.altZ_cleanup(
+                    out,
+                    margin_percent=az_margin,
+                    decay=az_decay,
+                    nanize=az_nanize,
+                )
+            elif hasattr(lecropper, "apply_altaz_cleanup"):
+                out = lecropper.apply_altaz_cleanup(
+                    out,
+                    margin_percent=az_margin,
+                    decay=az_decay,
+                    nanize=az_nanize,
+                )
+    except Exception as exc:
+        try:
+            logger.warning("lecropper pipeline skipped (err=%s)", exc)
+        except Exception:
+            pass
+        return arr
+
+    return out
 
 
 _MASTER_TILE_ID_LOCK = Lock()
@@ -341,6 +441,116 @@ def _ensure_hwc_master_tile(
         raise ValueError(msg)
 
     return np.asarray(arr, dtype=np.float32, order="C")
+
+
+def _zequality_accept_override(metrics: dict[str, float], threshold: float) -> bool:
+    """Replicates ZeQualityMT's lenient acceptance rules."""
+    if (
+        metrics.get("CC", 0.0) >= 0.70
+        and metrics.get("CER", 0.0) < 0.35
+        and metrics.get("ED", 0.0) < 1.2
+    ):
+        return True
+    if (
+        metrics.get("CC", 0.0) >= 0.78
+        and metrics.get("SC", 0.0) < 0.28
+        and metrics.get("NBR", 0.0) < 0.10
+    ):
+        return True
+    if (
+        metrics.get("TRL", 0.0) > 0.30
+        and metrics.get("CER", 0.0) < 0.40
+        and metrics.get("SC", 0.0) < 0.40
+    ):
+        return True
+    return False
+
+
+def _prepare_quality_gate_array(arr: np.ndarray) -> np.ndarray:
+    """Ensure ZeQualityMT receives an ``H x W x C`` float32 array with <=3 channels."""
+    if arr is None:
+        raise ValueError("Master tile array is None")
+    data = np.asarray(arr, dtype=np.float32)
+    if data.ndim == 2:
+        data = data[..., np.newaxis]
+    if data.ndim != 3:
+        raise ValueError(f"Unsupported master tile dimensionality for quality gate: {data.shape}")
+    if data.shape[0] in (1, 3) and data.shape[-1] not in (1, 3):
+        data = np.moveaxis(data, 0, -1)
+    if data.shape[-1] == 1:
+        data = np.repeat(data, 3, axis=-1)
+    elif data.shape[-1] > 3:
+        data = data[..., :3]
+    return np.ascontiguousarray(data, dtype=np.float32)
+
+
+def _evaluate_quality_gate_metrics(
+    tile_id: int,
+    arr: np.ndarray,
+    *,
+    enabled: bool,
+    threshold: float,
+    edge_band: int,
+    k_sigma: float,
+    erode_px: int,
+    pcb: Optional[Callable] = None,
+) -> Optional[dict[str, Any]]:
+    """Compute ZeQualityMT metrics for a stacked tile if enabled and available."""
+    if not enabled:
+        return None
+    if _zq_quality_metrics is None:
+        global _ZEQUALITY_WARNING_EMITTED
+        emit = False
+        with _ZEQUALITY_WARNING_LOCK:
+            if not _ZEQUALITY_WARNING_EMITTED:
+                _ZEQUALITY_WARNING_EMITTED = True
+                emit = True
+        if emit:
+            msg = "module_missing"
+            if pcb:
+                pcb("mt_quality_gate_unavailable", prog=None, lvl="WARN", tile_id=int(tile_id), error=msg)
+            logger.warning("[ZeQualityMT] quality gate unavailable: zequalityMT module missing")
+        return None
+    try:
+        arr_for_metrics = _prepare_quality_gate_array(arr)
+        metrics = _zq_quality_metrics(
+            arr_for_metrics,
+            edge_band=max(8, int(edge_band)),
+            k_sigma=max(0.0, float(k_sigma)),
+            erode_px=max(0, int(erode_px)),
+        )
+        score = float(metrics.get("score", float("nan")))
+        accepted = (score <= float(threshold)) or _zequality_accept_override(metrics, float(threshold))
+        return {
+            "metrics": metrics,
+            "score": score,
+            "accepted": bool(accepted),
+        }
+    except Exception as exc:
+        if pcb:
+            pcb("mt_quality_gate_unavailable", prog=None, lvl="WARN", tile_id=int(tile_id), error=str(exc))
+        logger.warning("[ZeQualityMT] quality gate failed for tile %s: %s", tile_id, exc)
+        return None
+
+
+def _move_quality_reject_file(src_path: str) -> tuple[str, bool]:
+    """Move a rejected master tile alongside its siblings for review."""
+    try:
+        base_dir = os.path.dirname(src_path) or "."
+        rej_dir = os.path.join(base_dir, "rejected_by_quality")
+        os.makedirs(rej_dir, exist_ok=True)
+        candidate = os.path.join(rej_dir, os.path.basename(src_path))
+        if os.path.exists(candidate):
+            base, ext = os.path.splitext(candidate)
+            idx = 1
+            while os.path.exists(f"{base}_{idx}{ext}"):
+                idx += 1
+            candidate = f"{base}_{idx}{ext}"
+        shutil.move(src_path, candidate)
+        return candidate, True
+    except Exception as exc:
+        logger.warning("Failed to move rejected master tile %s: %s", src_path, exc)
+        return src_path, False
 
 
 @dataclass
@@ -1894,6 +2104,18 @@ def _run_phase4_5_inter_master_merge(
                     super_arr = super_arr[..., :3]
             super_arr = np.asarray(super_arr, dtype=np.float32, order="C")
             np.nan_to_num(super_arr, copy=False)
+            pipeline_cfg = {
+                "quality_crop_enabled": stack_cfg.get("quality_crop_enabled"),
+                "quality_crop_band_px": stack_cfg.get("quality_crop_band_px"),
+                "quality_crop_k_sigma": stack_cfg.get("quality_crop_k_sigma"),
+                "quality_crop_margin_px": stack_cfg.get("quality_crop_margin_px"),
+                "quality_crop_min_run": stack_cfg.get("quality_crop_min_run"),
+                "altaz_cleanup_enabled": stack_cfg.get("altaz_cleanup_enabled"),
+                "altaz_margin_percent": stack_cfg.get("altaz_margin_percent"),
+                "altaz_decay": stack_cfg.get("altaz_decay"),
+                "altaz_nanize": stack_cfg.get("altaz_nanize"),
+            }
+            super_arr = _apply_lecropper_pipeline(super_arr, pipeline_cfg)
             arr_shape = tuple(super_arr.shape)
             logger.debug(
                 "[P4.5][G%03d] Super array ready: shape=%s, dtype=%s",
@@ -6322,6 +6544,17 @@ def create_master_tile(
     quality_crop_band_px: int,
     quality_crop_k_sigma: float,
     quality_crop_margin_px: int,
+    quality_crop_min_run: int,
+    altaz_cleanup_enabled: bool,
+    altaz_margin_percent: float,
+    altaz_decay: float,
+    altaz_nanize: bool,
+    quality_gate_enabled: bool,
+    quality_gate_threshold: float,
+    quality_gate_edge_band_px: int,
+    quality_gate_k_sigma: float,
+    quality_gate_erode_px: int,
+    quality_gate_move_rejects: bool,
     # Paramètres ASTAP (pourraient être enlevés si plus du tout utilisés ici)
     astap_exe_path_global: str, 
     astap_data_dir_global: str, 
@@ -6834,6 +7067,30 @@ def create_master_tile(
                 lvl="WARN",
             )
 
+    pipeline_cfg = {
+        "quality_crop_enabled": quality_crop_enabled,
+        "quality_crop_band_px": quality_crop_band_px,
+        "quality_crop_k_sigma": quality_crop_k_sigma,
+        "quality_crop_margin_px": quality_crop_margin_px,
+        "quality_crop_min_run": quality_crop_min_run,
+        "altaz_cleanup_enabled": altaz_cleanup_enabled,
+        "altaz_margin_percent": altaz_margin_percent,
+        "altaz_decay": altaz_decay,
+        "altaz_nanize": altaz_nanize,
+    }
+    master_tile_stacked_HWC = _apply_lecropper_pipeline(master_tile_stacked_HWC, pipeline_cfg)
+
+    quality_gate_eval: Optional[dict[str, Any]] = _evaluate_quality_gate_metrics(
+        tile_id,
+        master_tile_stacked_HWC,
+        enabled=quality_gate_enabled,
+        threshold=quality_gate_threshold,
+        edge_band=quality_gate_edge_band_px,
+        k_sigma=quality_gate_k_sigma,
+        erode_px=quality_gate_erode_px,
+        pcb=pcb_tile,
+    )
+
     # pcb_tile(f"{func_id_log_base}_info_saving_started", prog=None, lvl="DEBUG_DETAIL", tile_id=tile_id)
     temp_fits_filename = f"master_tile_{tile_id:03d}.fits"
     temp_fits_filepath = os.path.join(output_temp_dir,temp_fits_filename)
@@ -6949,6 +7206,18 @@ def create_master_tile(
         else:
             header_mt_save['ZMT_QCRO'] = (False, 'Quality-based crop applied')
 
+        if quality_gate_eval and quality_gate_eval.get("metrics"):
+            metrics = quality_gate_eval.get("metrics") or {}
+            score = float(quality_gate_eval.get("score", 0.0))
+            accepted_flag = bool(quality_gate_eval.get("accepted", True))
+            header_mt_save['ZMT_QS'] = (round(score, 3), 'ZeQuality score (0=good)')
+            header_mt_save['ZMT_QBD'] = (0 if accepted_flag else 1, '1 if auto-rejected')
+            header_mt_save['ZMT_EOC'] = (round(metrics.get("EOC", 0.0), 3), 'Extended Object Coverage')
+            header_mt_save['ZMT_TRL'] = (round(metrics.get("TRL", 0.0), 3), 'Trailiness index')
+            header_mt_save['ZMT_CER'] = (round(metrics.get("CER", 0.0), 3), 'Corner Emptiness Ratio')
+        elif quality_gate_enabled:
+            header_mt_save['ZMT_QBD'] = (0, '1 if auto-rejected')
+
         zemosaic_utils.save_fits_image(
             image_data=master_tile_stacked_HWC,
             output_path=temp_fits_filepath,
@@ -6958,17 +7227,66 @@ def create_master_tile(
             progress_callback=progress_callback,
             axis_order="HWC",
         )
-        try:
-            _register_master_tile_identity(temp_fits_filepath, f"tile:{int(tile_id):04d}")
-        except Exception:
-            _register_master_tile_identity(temp_fits_filepath, tile_id)
-        pcb_tile(f"{func_id_log_base}_info_saved", prog=None, lvl="INFO_DETAIL", tile_id=tile_id, format_type='float32', filename=os.path.basename(temp_fits_filepath))
+
+        final_tile_path: Optional[str] = temp_fits_filepath
+        final_wcs = wcs_for_master_tile
+
+        if quality_gate_eval and quality_gate_eval.get("metrics"):
+            metrics = quality_gate_eval.get("metrics") or {}
+            score = float(quality_gate_eval.get("score", 0.0))
+            accepted_flag = bool(quality_gate_eval.get("accepted", True))
+            pcb_tile(
+                "mt_quality_gate_result",
+                prog=None,
+                lvl="INFO",
+                tile_id=int(tile_id),
+                path=os.path.basename(temp_fits_filepath),
+                score=f"{score:.3f}",
+                threshold=f"{float(quality_gate_threshold):.3f}",
+                accepted=accepted_flag,
+            )
+            logger.info(
+                "[ZeQualityMT] tile=%s score=%.3f thr=%.3f -> %s",
+                tile_id,
+                score,
+                float(quality_gate_threshold),
+                "ACCEPT" if accepted_flag else "REJECT",
+            )
+            if not accepted_flag:
+                if quality_gate_move_rejects:
+                    moved_path, moved = _move_quality_reject_file(temp_fits_filepath)
+                    if moved:
+                        pcb_tile(
+                            "mt_quality_gate_moved",
+                            prog=None,
+                            lvl="WARN",
+                            tile_id=int(tile_id),
+                            dst=moved_path,
+                        )
+                        logger.warning("[ZeQualityMT] tile=%s moved to %s", tile_id, moved_path)
+                final_tile_path = None
+                final_wcs = None
+
+        if final_tile_path:
+            try:
+                _register_master_tile_identity(final_tile_path, f"tile:{int(tile_id):04d}")
+            except Exception:
+                _register_master_tile_identity(final_tile_path, tile_id)
+
+        pcb_tile(
+            f"{func_id_log_base}_info_saved",
+            prog=None,
+            lvl="INFO_DETAIL",
+            tile_id=tile_id,
+            format_type='float32',
+            filename=os.path.basename(final_tile_path or temp_fits_filepath),
+        )
         # pcb_tile(f"{func_id_log_base}_info_saving_finished", prog=None, lvl="DEBUG_DETAIL", tile_id=tile_id)
         try:
             _PH3_CONCURRENCY_SEMAPHORE.release()
         except Exception:
             pass
-        return (temp_fits_filepath, wcs_for_master_tile), failed_groups_to_retry
+        return (final_tile_path, final_wcs), failed_groups_to_retry
         
     except Exception as e_save_mt:
         pcb_tile(f"{func_id_log_base}_error_saving", prog=None, lvl="ERROR", tile_id=tile_id, error=str(e_save_mt))
@@ -8720,6 +9038,17 @@ def run_hierarchical_mosaic(
     quality_crop_band_px_config: int,
     quality_crop_k_sigma_config: float,
     quality_crop_margin_px_config: int,
+    quality_crop_min_run_config: int,
+    altaz_cleanup_enabled_config: bool,
+    altaz_margin_percent_config: float,
+    altaz_decay_config: float,
+    altaz_nanize_config: bool,
+    quality_gate_enabled_config: bool,
+    quality_gate_threshold_config: float,
+    quality_gate_edge_band_px_config: int,
+    quality_gate_k_sigma_config: float,
+    quality_gate_erode_px_config: int,
+    quality_gate_move_rejects_config: bool,
     save_final_as_uint16_config: bool,
     legacy_rgb_cube_config: bool,
 
@@ -10621,6 +10950,17 @@ def run_hierarchical_mosaic(
             radial_shape_power_config, min_radial_weight_floor_config,
             quality_crop_enabled_config, quality_crop_band_px_config,
             quality_crop_k_sigma_config, quality_crop_margin_px_config,
+            quality_crop_min_run_config,
+            altaz_cleanup_enabled_config,
+            altaz_margin_percent_config,
+            altaz_decay_config,
+            altaz_nanize_config,
+            quality_gate_enabled_config,
+            quality_gate_threshold_config,
+            quality_gate_edge_band_px_config,
+            quality_gate_k_sigma_config,
+            quality_gate_erode_px_config,
+            quality_gate_move_rejects_config,
             astap_exe_path, astap_data_dir_param, astap_search_radius_config,
             astap_downsample_config, astap_sensitivity_config, 180,
             winsor_worker_limit,
@@ -10969,6 +11309,15 @@ def run_hierarchical_mosaic(
             "stack_reject_algo": stack_reject_algo,
             "stack_final_combine": stack_final_combine,
             "intertile_sky_percentile": intertile_sky_percentile_tuple,
+            "quality_crop_enabled": bool(quality_crop_enabled_config),
+            "quality_crop_band_px": int(quality_crop_band_px_config),
+            "quality_crop_k_sigma": float(quality_crop_k_sigma_config),
+            "quality_crop_margin_px": int(quality_crop_margin_px_config),
+            "quality_crop_min_run": int(quality_crop_min_run_config),
+            "altaz_cleanup_enabled": bool(altaz_cleanup_enabled_config),
+            "altaz_margin_percent": float(altaz_margin_percent_config),
+            "altaz_decay": float(altaz_decay_config),
+            "altaz_nanize": bool(altaz_nanize_config),
         }
         master_tiles_results_list = _run_phase4_5_inter_master_merge(
             master_tiles_results_list,

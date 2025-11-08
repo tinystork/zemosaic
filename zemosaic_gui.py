@@ -502,9 +502,65 @@ class ZeMosaicGUI:
         self.quality_crop_margin_var = tk.IntVar(master=self.root,
             value=self.config.get("quality_crop_margin_px", 8)
         )
+        self.quality_crop_min_run_var = tk.IntVar(
+            master=self.root,
+            value=self.config.get("quality_crop_min_run", 2),
+        )
+
+        # --- Master Tile Quality Gate (ZeQualityMT) ---
+        self.quality_gate_enabled_var = tk.BooleanVar(
+            master=self.root,
+            value=bool(self.config.get("quality_gate_enabled", False)),
+        )
+        self.quality_gate_threshold_var = tk.DoubleVar(
+            master=self.root,
+            value=float(self.config.get("quality_gate_threshold", 0.48)),
+        )
+        self.quality_gate_edge_band_var = tk.IntVar(
+            master=self.root,
+            value=int(self.config.get("quality_gate_edge_band_px", 64)),
+        )
+        self.quality_gate_k_sigma_var = tk.DoubleVar(
+            master=self.root,
+            value=float(self.config.get("quality_gate_k_sigma", 2.5)),
+        )
+        self.quality_gate_erode_var = tk.IntVar(
+            master=self.root,
+            value=int(self.config.get("quality_gate_erode_px", 3)),
+        )
+        self.quality_gate_move_rejects_var = tk.BooleanVar(
+            master=self.root,
+            value=bool(self.config.get("quality_gate_move_rejects", True)),
+        )
+
+        # --- Alt-Az cleanup (lecropper altZ) ---
+        self.altaz_cleanup_enabled_var = tk.BooleanVar(
+            master=self.root,
+            value=self.config.get("altaz_cleanup_enabled", False),
+        )
+        self.altaz_margin_percent_var = tk.DoubleVar(
+            master=self.root,
+            value=self.config.get("altaz_margin_percent", 5.0),
+        )
+        self.altaz_decay_var = tk.DoubleVar(
+            master=self.root,
+            value=self.config.get("altaz_decay", 0.15),
+        )
+        self.altaz_nanize_var = tk.BooleanVar(
+            master=self.root,
+            value=self.config.get("altaz_nanize", True),
+        )
         self.use_memmap_var = tk.BooleanVar(master=self.root, value=self.config.get("coadd_use_memmap", False))
         try:
             self.quality_crop_enabled_var.trace_add("write", self._update_quality_crop_state)
+        except Exception:
+            pass
+        try:
+            self.quality_gate_enabled_var.trace_add("write", self._update_quality_gate_state)
+        except Exception:
+            pass
+        try:
+            self.altaz_cleanup_enabled_var.trace_add("write", self._update_altaz_state)
         except Exception:
             pass
         self.mm_dir_var = tk.StringVar(master=self.root, value=self.config.get("coadd_memmap_dir", ""))
@@ -605,6 +661,8 @@ class ZeMosaicGUI:
 
         self._build_ui()
         self._update_quality_crop_state()
+        self._update_altaz_state()
+        self._update_quality_gate_state()
         self._update_crop_options_state()
         self._update_solver_frames()
         self.root.after_idle(self._update_ui_language) # Déplacé après _build_ui pour que les widgets existent
@@ -1096,7 +1154,7 @@ class ZeMosaicGUI:
         # --- NOUVEAU CADRE : OPTIONS DE ROGNAGE DES TUILES MAÎTRESSES ---
         crop_options_frame = ttk.LabelFrame(self.scrollable_content_frame, text="", padding="10")
         crop_options_frame.pack(fill=tk.X, pady=(5, 10), padx=0)
-        self.translatable_widgets["crop_options_frame_title"] = crop_options_frame
+        self.translatable_widgets["mt_crop_and_reject_frame_title"] = crop_options_frame
         crop_options_frame.columnconfigure(1, weight=0) # Labels et spinbox de largeur fixe
         crop_options_frame.columnconfigure(2, weight=1) # La note peut s'étendre
 
@@ -1146,7 +1204,7 @@ class ZeMosaicGUI:
         self.quality_crop_advanced_frame = ttk.LabelFrame(crop_options_frame, text="")
         self.quality_crop_advanced_frame.grid(row=crop_opt_row, column=0, columnspan=3, padx=5, pady=(0, 6), sticky="ew")
         self.translatable_widgets["quality_crop_advanced"] = self.quality_crop_advanced_frame
-        for col_idx in range(6):
+        for col_idx in range(8):
             self.quality_crop_advanced_frame.columnconfigure(col_idx, weight=0)
 
         quality_band_label = ttk.Label(self.quality_crop_advanced_frame, text="")
@@ -1188,11 +1246,249 @@ class ZeMosaicGUI:
             width=6,
         )
         self.quality_crop_margin_spinbox.grid(row=0, column=5, padx=5, pady=3, sticky="w")
+
+        quality_min_run_label = ttk.Label(self.quality_crop_advanced_frame, text="")
+        quality_min_run_label.grid(row=0, column=6, padx=5, pady=3, sticky="w")
+        self.translatable_widgets["quality_crop_min_run_label"] = quality_min_run_label
+        self.quality_crop_min_run_spinbox = ttk.Spinbox(
+            self.quality_crop_advanced_frame,
+            from_=1,
+            to=32,
+            increment=1,
+            textvariable=self.quality_crop_min_run_var,
+            width=6,
+        )
+        self.quality_crop_min_run_spinbox.grid(row=0, column=7, padx=5, pady=3, sticky="w")
+
         self._quality_crop_inputs = [
             self.quality_crop_band_spinbox,
             self.quality_crop_ks_spinbox,
             self.quality_crop_margin_spinbox,
+            self.quality_crop_min_run_spinbox,
         ]
+
+        self.altaz_cleanup_check = ttk.Checkbutton(
+            self.quality_crop_advanced_frame,
+            text="",
+            variable=self.altaz_cleanup_enabled_var,
+            command=self._update_altaz_state,
+        )
+        self.altaz_cleanup_check.grid(row=1, column=0, padx=5, pady=(6, 3), sticky="w")
+        self.translatable_widgets["altaz_cleanup_toggle_label"] = self.altaz_cleanup_check
+
+        altaz_margin_label = ttk.Label(self.quality_crop_advanced_frame, text="")
+        altaz_margin_label.grid(row=1, column=1, padx=5, pady=(6, 3), sticky="w")
+        self.translatable_widgets["altaz_margin_percent_label"] = altaz_margin_label
+        self.altaz_margin_spinbox = ttk.Spinbox(
+            self.quality_crop_advanced_frame,
+            from_=0.0,
+            to=50.0,
+            increment=0.5,
+            format="%.1f",
+            textvariable=self.altaz_margin_percent_var,
+            width=6,
+        )
+        self.altaz_margin_spinbox.grid(row=1, column=2, padx=5, pady=(6, 3), sticky="w")
+
+        altaz_decay_label = ttk.Label(self.quality_crop_advanced_frame, text="")
+        altaz_decay_label.grid(row=1, column=3, padx=5, pady=(6, 3), sticky="w")
+        self.translatable_widgets["altaz_decay_label"] = altaz_decay_label
+        self.altaz_decay_spinbox = ttk.Spinbox(
+            self.quality_crop_advanced_frame,
+            from_=0.0,
+            to=2.0,
+            increment=0.05,
+            format="%.2f",
+            textvariable=self.altaz_decay_var,
+            width=6,
+        )
+        self.altaz_decay_spinbox.grid(row=1, column=4, padx=5, pady=(6, 3), sticky="w")
+
+        self.altaz_nan_check = ttk.Checkbutton(
+            self.quality_crop_advanced_frame,
+            text="",
+            variable=self.altaz_nanize_var,
+        )
+        self.altaz_nan_check.grid(row=1, column=5, padx=5, pady=(6, 3), sticky="w")
+        self.translatable_widgets["altaz_nanize_label"] = self.altaz_nan_check
+
+        self._altaz_inputs = [
+            self.altaz_margin_spinbox,
+            self.altaz_decay_spinbox,
+            self.altaz_nan_check,
+        ]
+
+        # --- Master Tile Quality Gate (ZeQualityMT) ---
+        quality_gate_frame = ttk.LabelFrame(crop_options_frame, text="")
+        quality_gate_frame.grid(row=crop_opt_row, column=0, columnspan=3, padx=5, pady=(0, 6), sticky="ew")
+        quality_gate_frame.columnconfigure(1, weight=1)
+        quality_gate_frame.columnconfigure(3, weight=1)
+        self.translatable_widgets["mt_quality_gate_group"] = quality_gate_frame
+
+        qgate_guard = {"locked": False}
+
+        def _update_qgate_value(var, key, fallback, *, min_value=None, max_value=None, cast=float):
+            if qgate_guard["locked"]:
+                return
+            qgate_guard["locked"] = True
+            try:
+                try:
+                    current_val = cast(var.get())
+                except (tk.TclError, ValueError, TypeError):
+                    current_val = fallback
+                value = current_val
+                if min_value is not None:
+                    value = max(min_value, value)
+                if max_value is not None:
+                    value = min(max_value, value)
+                if cast is int:
+                    value = int(value)
+                else:
+                    value = float(value)
+                self.config[key] = value
+                if value != current_val:
+                    var.set(value)
+            finally:
+                qgate_guard["locked"] = False
+
+        def _on_quality_gate_threshold_change(*_):
+            _update_qgate_value(
+                self.quality_gate_threshold_var,
+                "quality_gate_threshold",
+                float(self.config.get("quality_gate_threshold", 0.48)),
+                min_value=0.0,
+                max_value=1.0,
+                cast=float,
+            )
+
+        def _on_quality_gate_edge_change(*_):
+            _update_qgate_value(
+                self.quality_gate_edge_band_var,
+                "quality_gate_edge_band_px",
+                int(self.config.get("quality_gate_edge_band_px", 64)),
+                min_value=0,
+                cast=int,
+            )
+
+        def _on_quality_gate_k_sigma_change(*_):
+            _update_qgate_value(
+                self.quality_gate_k_sigma_var,
+                "quality_gate_k_sigma",
+                float(self.config.get("quality_gate_k_sigma", 2.5)),
+                min_value=0.0,
+                cast=float,
+            )
+
+        def _on_quality_gate_erode_change(*_):
+            _update_qgate_value(
+                self.quality_gate_erode_var,
+                "quality_gate_erode_px",
+                int(self.config.get("quality_gate_erode_px", 3)),
+                min_value=0,
+                cast=int,
+            )
+
+        def _on_quality_gate_move_change(*_):
+            self.config["quality_gate_move_rejects"] = bool(self.quality_gate_move_rejects_var.get())
+
+        self.quality_gate_enable_check = ttk.Checkbutton(
+            quality_gate_frame,
+            text="",
+            variable=self.quality_gate_enabled_var,
+            command=self._update_quality_gate_state,
+        )
+        self.quality_gate_enable_check.grid(row=0, column=0, columnspan=2, padx=5, pady=(2, 2), sticky="w")
+        self.translatable_widgets["mt_quality_gate_enable"] = self.quality_gate_enable_check
+
+        self.quality_gate_move_check = ttk.Checkbutton(
+            quality_gate_frame,
+            text="",
+            variable=self.quality_gate_move_rejects_var,
+            command=_on_quality_gate_move_change,
+        )
+        self.quality_gate_move_check.grid(row=0, column=2, columnspan=2, padx=5, pady=(2, 2), sticky="w")
+        self.translatable_widgets["mt_quality_gate_move_rejects"] = self.quality_gate_move_check
+
+        qgate_threshold_label = ttk.Label(quality_gate_frame, text="")
+        qgate_threshold_label.grid(row=1, column=0, padx=5, pady=2, sticky="e")
+        self.translatable_widgets["mt_quality_gate_threshold"] = qgate_threshold_label
+
+        self.quality_gate_threshold_spinbox = ttk.Spinbox(
+            quality_gate_frame,
+            from_=0.0,
+            to=1.0,
+            increment=0.01,
+            format="%.2f",
+            width=8,
+            textvariable=self.quality_gate_threshold_var,
+            command=_on_quality_gate_threshold_change,
+        )
+        self.quality_gate_threshold_spinbox.grid(row=1, column=1, padx=5, pady=2, sticky="w")
+        self.quality_gate_threshold_var.trace_add("write", _on_quality_gate_threshold_change)
+
+        qgate_edge_label = ttk.Label(quality_gate_frame, text="")
+        qgate_edge_label.grid(row=1, column=2, padx=5, pady=2, sticky="e")
+        self.translatable_widgets["mt_quality_gate_edge_band"] = qgate_edge_label
+
+        self.quality_gate_edge_spinbox = ttk.Spinbox(
+            quality_gate_frame,
+            from_=0,
+            to=4096,
+            increment=1,
+            width=8,
+            textvariable=self.quality_gate_edge_band_var,
+            command=_on_quality_gate_edge_change,
+        )
+        self.quality_gate_edge_spinbox.grid(row=1, column=3, padx=5, pady=2, sticky="w")
+        self.quality_gate_edge_band_var.trace_add("write", _on_quality_gate_edge_change)
+
+        qgate_ks_label = ttk.Label(quality_gate_frame, text="")
+        qgate_ks_label.grid(row=2, column=0, padx=5, pady=2, sticky="e")
+        self.translatable_widgets["mt_quality_gate_k_sigma"] = qgate_ks_label
+
+        self.quality_gate_k_sigma_spinbox = ttk.Spinbox(
+            quality_gate_frame,
+            from_=0.0,
+            to=10.0,
+            increment=0.1,
+            format="%.1f",
+            width=8,
+            textvariable=self.quality_gate_k_sigma_var,
+            command=_on_quality_gate_k_sigma_change,
+        )
+        self.quality_gate_k_sigma_spinbox.grid(row=2, column=1, padx=5, pady=2, sticky="w")
+        self.quality_gate_k_sigma_var.trace_add("write", _on_quality_gate_k_sigma_change)
+
+        qgate_erode_label = ttk.Label(quality_gate_frame, text="")
+        qgate_erode_label.grid(row=2, column=2, padx=5, pady=2, sticky="e")
+        self.translatable_widgets["mt_quality_gate_erode"] = qgate_erode_label
+
+        self.quality_gate_erode_spinbox = ttk.Spinbox(
+            quality_gate_frame,
+            from_=0,
+            to=512,
+            increment=1,
+            width=8,
+            textvariable=self.quality_gate_erode_var,
+            command=_on_quality_gate_erode_change,
+        )
+        self.quality_gate_erode_spinbox.grid(row=2, column=3, padx=5, pady=2, sticky="w")
+        self.quality_gate_erode_var.trace_add("write", _on_quality_gate_erode_change)
+
+        self._quality_gate_inputs = [
+            self.quality_gate_threshold_spinbox,
+            self.quality_gate_edge_spinbox,
+            self.quality_gate_k_sigma_spinbox,
+            self.quality_gate_erode_spinbox,
+            self.quality_gate_move_check,
+        ]
+
+        _on_quality_gate_threshold_change()
+        _on_quality_gate_edge_change()
+        _on_quality_gate_k_sigma_change()
+        _on_quality_gate_erode_change()
+        _on_quality_gate_move_change()
+
         crop_opt_row += 1
         # --- FIN  CADRE DE ROGNAGE ---
 
@@ -1828,7 +2124,7 @@ class ZeMosaicGUI:
             pass # Widget peut avoir été détruit
 
     def _update_quality_crop_state(self, *args):
-        """Affiche ou masque le panneau avancé et gère l'état des champs qualité."""
+        """Met à jour l'état des champs qualité sans masquer le panneau avancé."""
         if not hasattr(self, 'quality_crop_advanced_frame'):
             return
 
@@ -1838,15 +2134,43 @@ class ZeMosaicGUI:
             enabled = False
 
         try:
-            if enabled:
-                self.quality_crop_advanced_frame.grid()
-            else:
-                self.quality_crop_advanced_frame.grid_remove()
+            self.quality_crop_advanced_frame.grid()
         except tk.TclError:
             pass
 
-        state = "normal" if enabled else "disabled"
+        state = tk.NORMAL if enabled else tk.DISABLED
         for widget in getattr(self, "_quality_crop_inputs", []):
+            try:
+                widget.config(state=state)
+            except tk.TclError:
+                pass
+
+    def _update_quality_gate_state(self, *args):
+        """Active/désactive les paramètres du Quality Gate."""
+        widgets = getattr(self, "_quality_gate_inputs", None)
+        if not widgets:
+            return
+        try:
+            enabled = bool(self.quality_gate_enabled_var.get())
+        except tk.TclError:
+            enabled = False
+        state = "normal" if enabled else "disabled"
+        for widget in widgets:
+            try:
+                widget.config(state=state)
+            except tk.TclError:
+                continue
+        self.config["quality_gate_enabled"] = enabled
+
+    def _update_altaz_state(self, *args):
+        """Active/désactive les paramètres Alt-Az."""
+        try:
+            enabled = bool(self.altaz_cleanup_enabled_var.get())
+        except Exception:
+            enabled = False
+
+        state = tk.NORMAL if enabled else tk.DISABLED
+        for widget in getattr(self, "_altaz_inputs", []):
             try:
                 widget.config(state=state)
             except tk.TclError:
@@ -2168,6 +2492,17 @@ class ZeMosaicGUI:
                         "quality_crop_band_px": int(self.quality_crop_band_var.get()),
                         "quality_crop_k_sigma": float(self.quality_crop_ks_var.get()),
                         "quality_crop_margin_px": int(self.quality_crop_margin_var.get()),
+                        "quality_crop_min_run": int(self.quality_crop_min_run_var.get()),
+                        "altaz_cleanup_enabled": bool(self.altaz_cleanup_enabled_var.get()),
+                        "altaz_margin_percent": float(self.altaz_margin_percent_var.get()),
+                        "altaz_decay": float(self.altaz_decay_var.get()),
+                        "altaz_nanize": bool(self.altaz_nanize_var.get()),
+                        "quality_gate_enabled": bool(self.quality_gate_enabled_var.get()),
+                        "quality_gate_threshold": float(self.quality_gate_threshold_var.get()),
+                        "quality_gate_edge_band_px": int(self.quality_gate_edge_band_var.get()),
+                        "quality_gate_k_sigma": float(self.quality_gate_k_sigma_var.get()),
+                        "quality_gate_erode_px": int(self.quality_gate_erode_var.get()),
+                        "quality_gate_move_rejects": bool(self.quality_gate_move_rejects_var.get()),
                     })
                 except Exception:
                     pass
@@ -3024,6 +3359,61 @@ class ZeMosaicGUI:
             except Exception:
                 quality_crop_margin_val = int(self.config.get("quality_crop_margin_px", 8))
                 self.quality_crop_margin_var.set(quality_crop_margin_val)
+            try:
+                quality_crop_min_run_val = int(self.quality_crop_min_run_var.get())
+            except Exception:
+                quality_crop_min_run_val = int(self.config.get("quality_crop_min_run", 2))
+                self.quality_crop_min_run_var.set(quality_crop_min_run_val)
+            altaz_cleanup_enabled_val = bool(self.altaz_cleanup_enabled_var.get())
+            try:
+                altaz_margin_val = float(self.altaz_margin_percent_var.get())
+            except Exception:
+                altaz_margin_val = float(self.config.get("altaz_margin_percent", 5.0))
+                self.altaz_margin_percent_var.set(altaz_margin_val)
+            try:
+                altaz_decay_val = float(self.altaz_decay_var.get())
+            except Exception:
+                altaz_decay_val = float(self.config.get("altaz_decay", 0.15))
+                self.altaz_decay_var.set(altaz_decay_val)
+            altaz_nanize_val = bool(self.altaz_nanize_var.get())
+            quality_gate_enabled_val = bool(self.quality_gate_enabled_var.get())
+            try:
+                quality_gate_threshold_val = float(self.quality_gate_threshold_var.get())
+            except Exception:
+                quality_gate_threshold_val = float(self.config.get("quality_gate_threshold", 0.48))
+            quality_gate_threshold_val = max(0.0, min(1.0, quality_gate_threshold_val))
+            try:
+                self.quality_gate_threshold_var.set(quality_gate_threshold_val)
+            except Exception:
+                pass
+            try:
+                quality_gate_edge_band_val = int(self.quality_gate_edge_band_var.get())
+            except Exception:
+                quality_gate_edge_band_val = int(self.config.get("quality_gate_edge_band_px", 64))
+            quality_gate_edge_band_val = max(0, quality_gate_edge_band_val)
+            try:
+                self.quality_gate_edge_band_var.set(quality_gate_edge_band_val)
+            except Exception:
+                pass
+            try:
+                quality_gate_k_sigma_val = float(self.quality_gate_k_sigma_var.get())
+            except Exception:
+                quality_gate_k_sigma_val = float(self.config.get("quality_gate_k_sigma", 2.5))
+            quality_gate_k_sigma_val = max(0.0, quality_gate_k_sigma_val)
+            try:
+                self.quality_gate_k_sigma_var.set(quality_gate_k_sigma_val)
+            except Exception:
+                pass
+            try:
+                quality_gate_erode_px_val = int(self.quality_gate_erode_var.get())
+            except Exception:
+                quality_gate_erode_px_val = int(self.config.get("quality_gate_erode_px", 3))
+            quality_gate_erode_px_val = max(0, quality_gate_erode_px_val)
+            try:
+                self.quality_gate_erode_var.set(quality_gate_erode_px_val)
+            except Exception:
+                pass
+            quality_gate_move_rejects_val = bool(self.quality_gate_move_rejects_var.get())
             # --- FIN RÉCUPÉRATION ROGNAGE ---
             
         except tk.TclError as e:
@@ -3124,8 +3514,19 @@ class ZeMosaicGUI:
                             "quality_crop_band_px": int(self.quality_crop_band_var.get()),
                             "quality_crop_k_sigma": float(self.quality_crop_ks_var.get()),
                             "quality_crop_margin_px": int(self.quality_crop_margin_var.get()),
+                            "quality_crop_min_run": int(self.quality_crop_min_run_var.get()),
+                            "altaz_cleanup_enabled": bool(self.altaz_cleanup_enabled_var.get()),
+                            "altaz_margin_percent": float(self.altaz_margin_percent_var.get()),
+                            "altaz_decay": float(self.altaz_decay_var.get()),
+                            "altaz_nanize": bool(self.altaz_nanize_var.get()),
                             "astap_executable_path": astap_exe,
                             "astap_data_directory_path": astap_data,
+                            "quality_gate_enabled": bool(self.quality_gate_enabled_var.get()),
+                            "quality_gate_threshold": float(self.quality_gate_threshold_var.get()),
+                            "quality_gate_edge_band_px": int(self.quality_gate_edge_band_var.get()),
+                            "quality_gate_k_sigma": float(self.quality_gate_k_sigma_var.get()),
+                            "quality_gate_erode_px": int(self.quality_gate_erode_var.get()),
+                            "quality_gate_move_rejects": bool(self.quality_gate_move_rejects_var.get()),
                         }
                     except Exception:
                         # Fallback to minimal payload
@@ -3341,6 +3742,12 @@ class ZeMosaicGUI:
                 self.config["gpu_id_phase5"] = idx
                 gpu_id = idx
                 break
+        self.config["quality_gate_enabled"] = bool(quality_gate_enabled_val)
+        self.config["quality_gate_threshold"] = float(quality_gate_threshold_val)
+        self.config["quality_gate_edge_band_px"] = int(quality_gate_edge_band_val)
+        self.config["quality_gate_k_sigma"] = float(quality_gate_k_sigma_val)
+        self.config["quality_gate_erode_px"] = int(quality_gate_erode_px_val)
+        self.config["quality_gate_move_rejects"] = bool(quality_gate_move_rejects_val)
         self.config["save_final_as_uint16"] = bool(self.save_final_uint16_var.get())
         self.config["legacy_rgb_cube"] = bool(self.legacy_rgb_cube_var.get())
         if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
@@ -3369,6 +3776,11 @@ class ZeMosaicGUI:
         self.config["quality_crop_band_px"] = int(quality_crop_band_val)
         self.config["quality_crop_k_sigma"] = float(quality_crop_k_sigma_val)
         self.config["quality_crop_margin_px"] = int(quality_crop_margin_val)
+        self.config["quality_crop_min_run"] = int(quality_crop_min_run_val)
+        self.config["altaz_cleanup_enabled"] = bool(altaz_cleanup_enabled_val)
+        self.config["altaz_margin_percent"] = float(altaz_margin_val)
+        self.config["altaz_decay"] = float(altaz_decay_val)
+        self.config["altaz_nanize"] = bool(altaz_nanize_val)
 
         inter_master_enable_val = bool(self.inter_master_merge_var.get())
         try:
@@ -3477,6 +3889,17 @@ class ZeMosaicGUI:
             int(quality_crop_band_val),
             float(quality_crop_k_sigma_val),
             int(quality_crop_margin_val),
+            int(quality_crop_min_run_val),
+            bool(altaz_cleanup_enabled_val),
+            float(altaz_margin_val),
+            float(altaz_decay_val),
+            bool(altaz_nanize_val),
+            bool(quality_gate_enabled_val),
+            float(quality_gate_threshold_val),
+            int(quality_gate_edge_band_val),
+            float(quality_gate_k_sigma_val),
+            int(quality_gate_erode_px_val),
+            bool(quality_gate_move_rejects_val),
             self.save_final_uint16_var.get(),
             self.legacy_rgb_cube_var.get(),
             self.use_memmap_var.get(),

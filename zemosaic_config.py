@@ -112,6 +112,20 @@ DEFAULT_CONFIG = {
     "quality_crop_band_px": 32,
     "quality_crop_k_sigma": 2.0,
     "quality_crop_margin_px": 8,
+    # --- Master Tile Quality Gate (ZeQualityMT) ---
+    "quality_gate_enabled": False,
+    "quality_gate_threshold": 0.48,
+    "quality_gate_edge_band_px": 64,
+    "quality_gate_k_sigma": 2.5,
+    "quality_gate_erode_px": 3,
+    "quality_gate_move_rejects": True,
+    # --- Alt-Az cleanup (lecropper altZ) ---
+    "altaz_cleanup_enabled": False,
+    "altaz_margin_percent": 5.0,   # UI: "AltAz margin %"
+    "altaz_decay": 0.15,           # UI: "AltAz decay"
+    "altaz_nanize": True,          # UI: "Alt-Az → NaN"
+    # --- Qualité avancée ---
+    "quality_crop_min_run": 2,     # UI: "min run"
     "crop_follow_signal": True,
     # --- FIN CLES POUR LE ROGNAGE ---
 }
