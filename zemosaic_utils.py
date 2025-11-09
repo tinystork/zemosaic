@@ -49,7 +49,7 @@ import math
 import copy
 import logging
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
 import numpy as np
 # L'import de astropy.io.fits est géré ci-dessous pour définir le flag
 import cv2
@@ -1612,6 +1612,17 @@ def load_and_validate_fits(filepath,
                 return None, header_for_fallback, info
 
             data_raw_from_fits = hdu_img.data # Peut être int16, uint16, float32, etc.
+            alpha_mask = None
+            for hdu_extra in hdul:
+                name = getattr(hdu_extra, "name", "")
+                if isinstance(name, str) and name.upper() == "ALPHA" and hdu_extra.data is not None:
+                    alpha_mask = np.asarray(hdu_extra.data)
+                    if alpha_mask.ndim > 2:
+                        alpha_mask = alpha_mask[..., 0]
+                    alpha_mask = np.asarray(alpha_mask, dtype=np.uint8, copy=False)
+                    break
+            if alpha_mask is not None:
+                info["alpha_mask"] = alpha_mask
             header = hdu_img.header.copy(); header_for_fallback = header.copy()
             
             _log_util(f"Données lues HDU {img_hdu_idx}. Shape brute: {data_raw_from_fits.shape}, Dtype brut: {data_raw_from_fits.dtype}", "DEBUG")
@@ -2469,7 +2480,8 @@ def save_fits_image(image_data: np.ndarray,
                     save_as_float: bool = False,
                     legacy_rgb_cube: bool = False,
                     progress_callback: callable = None,
-                    axis_order: str = "HWC"):
+                    axis_order: str = "HWC",
+                    alpha_mask: Optional[np.ndarray] = None):
     """
     Sauvegarde des données image NumPy dans un fichier FITS.
     Utilise ASTROPY_AVAILABLE_IN_UTILS défini localement.
@@ -2479,6 +2491,7 @@ def save_fits_image(image_data: np.ndarray,
     - ``"HWC"`` (défaut) : ``Height x Width x Channels``. Les données sont
       transposées en ``CxHxW`` pour l'écriture FITS.
     - ``"CHW"`` : les données sont déjà dans l'ordre ``Channels x Height x Width``.
+    - ``alpha_mask`` : optionally include a uint8 mask (0..255) as ``ALPHA`` extension.
     """
 
     def _log_util_save(message, level="DEBUG_DETAIL", pcb=progress_callback):
@@ -2712,6 +2725,16 @@ def save_fits_image(image_data: np.ndarray,
         )
         return
 
+    if alpha_mask is not None:
+        try:
+            alpha_arr = np.asarray(alpha_mask, dtype=np.uint8, copy=False)
+            if alpha_arr.ndim > 2:
+                alpha_arr = alpha_arr[..., 0]
+            alpha_hdu = current_fits_module.ImageHDU(alpha_arr, name="ALPHA")
+            alpha_hdu.header["ALPHADSC"] = ("1=opaque(in), 0=transparent(out)", "")
+            hdus_to_write.append(alpha_hdu)
+        except Exception:
+            _log_util_save("SAVE_DEBUG: Unable to append ALPHA extension (shape mismatch)", "WARN")
     hdul = None
     try:
         primary_for_log = primary_hdu_object or hdus_to_write[0]

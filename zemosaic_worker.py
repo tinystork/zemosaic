@@ -443,6 +443,51 @@ def _ensure_hwc_master_tile(
     return np.asarray(arr, dtype=np.float32, order="C")
 
 
+def load_image_with_optional_alpha(
+    path: str,
+    *,
+    tile_label: str | None = None,
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None]:
+    """Load a FITS image alongside its optional ALPHA extension."""
+
+    if not (ASTROPY_AVAILABLE and fits):
+        raise RuntimeError("Astropy FITS support unavailable while loading image")
+
+    with fits.open(path, memmap=True, do_not_scale_image_data=True) as hdul:
+        primary = hdul[0].data
+        alpha_hdu = hdul["ALPHA"] if "ALPHA" in hdul else None
+        alpha = None
+        if alpha_hdu is not None and alpha_hdu.data is not None:
+            try:
+                alpha = np.asarray(alpha_hdu.data, dtype=np.uint8)
+            except Exception:
+                alpha = None
+
+    label = tile_label or os.path.basename(str(path))
+    data = _ensure_hwc_master_tile(primary, label)
+    data = np.asarray(data, dtype=np.float32, order="C", copy=False)
+
+    weights: np.ndarray | None = None
+    if alpha is not None:
+        alpha = np.squeeze(alpha)
+        if alpha.ndim != 2:
+            try:
+                alpha = alpha.reshape(alpha.shape[-2], alpha.shape[-1])
+            except Exception:
+                alpha = None
+        if alpha is not None:
+            alpha = np.clip(alpha, 0, 255).astype(np.uint8, copy=False)
+            weights = alpha.astype(np.float32) / 255.0
+            weights = np.clip(weights, 0.0, 1.0)
+            if data.ndim == 2:
+                if weights.shape == data.shape:
+                    data = np.where(weights <= 0.0, np.nan, data)
+            elif data.ndim == 3 and weights.shape == data.shape[:2]:
+                data = np.where(weights[..., None] <= 0.0, np.nan, data)
+
+    return data, weights, alpha
+
+
 def _zequality_accept_override(metrics: dict[str, float], threshold: float) -> bool:
     """Replicates ZeQualityMT's lenient acceptance rules."""
     if (
@@ -1567,9 +1612,8 @@ def _run_phase4_5_inter_master_merge(
                     if not path:
                         continue
                     try:
-                        with fits.open(path, memmap=True, do_not_scale_image_data=True) as hdul:
-                            arr = _ensure_hwc_master_tile(hdul[0].data, os.path.basename(path))
-                            arr = np.asarray(arr, dtype=np.float32, copy=False)
+                        arr, _, _ = load_image_with_optional_alpha(path, tile_label=os.path.basename(path))
+                        arr = np.asarray(arr, dtype=np.float32, copy=False)
                         sources.append(_TileAffineSource(path=path, wcs=tile.wcs, data=arr))
                         valid_indices.append(idx_tile)
                     except Exception as exc:
@@ -1636,11 +1680,15 @@ def _run_phase4_5_inter_master_merge(
             memmap_path = None
             success = True
             frames: list[np.ndarray] = []
+            frame_weights: list[np.ndarray | None] = []
             channels = 3
             preloaded: dict[int, np.ndarray] = {}
+            preloaded_weights: dict[int, np.ndarray | None] = {}
             try:
-                with fits.open(chunk_tiles[0].path, memmap=True, do_not_scale_image_data=True) as hdul_sample:
-                    first_arr = _ensure_hwc_master_tile(hdul_sample[0].data, os.path.basename(chunk_tiles[0].path))
+                first_arr, first_weights, _ = load_image_with_optional_alpha(
+                    chunk_tiles[0].path,
+                    tile_label=os.path.basename(chunk_tiles[0].path),
+                )
                 channels = int(first_arr.shape[-1]) if first_arr.ndim == 3 else 1
                 if channels <= 0:
                     channels = 1
@@ -1649,6 +1697,9 @@ def _run_phase4_5_inter_master_merge(
                     if first_arr.shape[-1] != channels:
                         first_arr = first_arr[..., :channels]
                 preloaded[chunk_tiles[0].index] = first_arr.astype(np.float32, copy=False)
+                preloaded_weights[chunk_tiles[0].index] = (
+                    np.asarray(first_weights, dtype=np.float32) if first_weights is not None else None
+                )
             except Exception:
                 success = False
                 channels = 3
@@ -1680,10 +1731,14 @@ def _run_phase4_5_inter_master_merge(
                 for idx_tile, tile in enumerate(chunk_tiles):
                     if tile.index in preloaded:
                         arr = preloaded.pop(tile.index)
+                        weight_map = preloaded_weights.pop(tile.index, None)
                     else:
-                        with fits.open(tile.path, memmap=True, do_not_scale_image_data=True) as hdul:
-                            arr = _ensure_hwc_master_tile(hdul[0].data, os.path.basename(tile.path))
-                            arr = np.asarray(arr, dtype=np.float32)
+                        arr, weight_map, _ = load_image_with_optional_alpha(
+                            tile.path,
+                            tile_label=os.path.basename(tile.path),
+                        )
+                    if weight_map is not None:
+                        weight_map = np.asarray(weight_map, dtype=np.float32, copy=False)
                     if arr.ndim == 2:
                         arr = arr[..., np.newaxis]
                     if arr.shape[-1] != channels:
@@ -1707,6 +1762,22 @@ def _run_phase4_5_inter_master_merge(
                         arr *= gain
                         arr += offset
                     reproj = np.full((local_shape[0], local_shape[1], channels), np.nan, dtype=np.float32)
+                    weight_local = None
+                    if weight_map is not None:
+                        try:
+                            weight_plane, weight_fp = reproject_interp(
+                                (weight_map, tile.wcs),
+                                local_wcs,
+                                **reproject_kwargs,
+                            )
+                            weight_plane = np.asarray(weight_plane, dtype=np.float32)
+                            if weight_fp is not None:
+                                mask_fp = np.asarray(weight_fp) <= 0.0
+                                if mask_fp.shape == weight_plane.shape:
+                                    weight_plane[mask_fp] = 0.0
+                            weight_local = np.clip(np.nan_to_num(weight_plane, nan=0.0), 0.0, 1.0)
+                        except Exception:
+                            weight_local = None
                     for ch in range(channels):
                         plane = arr[..., ch]
                         reproj_plane, footprint = reproject_interp((plane, tile.wcs), local_wcs, **reproject_kwargs)
@@ -1719,10 +1790,15 @@ def _run_phase4_5_inter_master_merge(
                             if mask.shape == reproj_plane.shape:
                                 reproj_plane[mask] = np.nan
                         reproj[..., ch] = reproj_plane
+                    if weight_local is not None:
+                        mask_zero = weight_local <= 0.0
+                        if mask_zero.shape == reproj.shape[:2]:
+                            reproj = np.where(mask_zero[..., None], np.nan, reproj)
                     if not success:
                         break
                     storage[idx_tile, :, :, :] = reproj
                     frames.append(storage[idx_tile])
+                    frame_weights.append(weight_local)
                 if not success or not frames:
                     success = False
             except Exception:
@@ -1738,9 +1814,10 @@ def _run_phase4_5_inter_master_merge(
                 _phase45_cleanup_storage(storage, memmap_path)
                 continue
 
+            alpha_weights_present = any(w is not None for w in frame_weights)
             # 4.5.a — micro-alignement résiduel (noop si indisponible)
             try:
-                if micro_align_available:
+                if micro_align_available and not alpha_weights_present:
                     logger.debug(
                         "[P4.5][G%03d] Micro-align start: method=phase, frames=%d",
                         group_id,
@@ -1756,6 +1833,8 @@ def _run_phase4_5_inter_master_merge(
                     _phase45_gui_message(
                         f"Phase 4.5: group {group_id} micro-align done"
                     )
+                elif micro_align_available and alpha_weights_present:
+                    logger.debug("[P4.5][G%03d] Micro-align skipped (alpha weights attached)", group_id)
             except Exception as exc:
                 logger.debug("[P4.5][G%03d] Micro-align skipped/failed: %s", group_id, exc)
 
@@ -2026,51 +2105,77 @@ def _run_phase4_5_inter_master_merge(
             _phase45_gui_message(
                 f"Phase 4.5: group {group_id} stacking ({reject_algo}/{final_combine})"
             )
-            try:
-                if reject_algo in ("winsor", "winsorized_sigma_clip"):
-                    result = zemosaic_align_stack.stack_winsorized_sigma_clip(
-                        frames, weight_method=weight_method, zconfig=None, **stack_kwargs
-                    )
-                    super_arr = result[0] if isinstance(result, (tuple, list)) else result
-                elif reject_algo == "kappa_sigma":
-                    stack_result = None
-                    if hasattr(zemosaic_align_stack, "stack_kappa_sigma"):
-                        stack_result = zemosaic_align_stack.stack_kappa_sigma(
-                            frames,
-                            kappa=float(stack_cfg.get("kappa_low", 3.0)),
-                            combine=final_combine,
-                            weight_method=weight_method,
+            alpha_out = None
+            weights_ready = any(isinstance(w, np.ndarray) for w in frame_weights)
+            super_arr = None
+            if weights_ready:
+                try:
+                    frames_np = np.stack(frames, axis=0).astype(np.float32, copy=False)
+                    reference_shape = frames_np.shape[1:3]
+                    weight_stack_list: list[np.ndarray] = []
+                    for wmap in frame_weights:
+                        if isinstance(wmap, np.ndarray) and wmap.shape == reference_shape:
+                            weight_stack_list.append(wmap.astype(np.float32, copy=False))
+                        else:
+                            weight_stack_list.append(np.ones(reference_shape, dtype=np.float32))
+                    weight_stack = np.stack(weight_stack_list, axis=0)
+                    weight_stack = np.clip(np.nan_to_num(weight_stack, nan=0.0), 0.0, 1.0)
+                    weight_expanded = weight_stack[..., None]
+                    num = np.nansum(frames_np * weight_expanded, axis=0)
+                    den = np.nansum(weight_expanded, axis=0)
+                    super_arr = np.where(den > 0, num / den, np.nan)
+                    alpha_out = (np.nanmax(weight_stack, axis=0) * 255.0).astype(np.uint8)
+                    logger.debug("[P4.5][G%03d] Applied alpha-weighted stacking", group_id)
+                except Exception as exc:
+                    alpha_out = None
+                    super_arr = None
+                    logger.debug("[P4.5][G%03d] Alpha-weighted stack failed: %s", group_id, exc)
+            if super_arr is None:
+                try:
+                    if reject_algo in ("winsor", "winsorized_sigma_clip"):
+                        result = zemosaic_align_stack.stack_winsorized_sigma_clip(
+                            frames, weight_method=weight_method, zconfig=None, **stack_kwargs
                         )
-                    elif hasattr(zemosaic_align_stack, "stack_kappa_sigma_clip"):
-                        stack_result = zemosaic_align_stack.stack_kappa_sigma_clip(
+                        super_arr = result[0] if isinstance(result, (tuple, list)) else result
+                    elif reject_algo == "kappa_sigma":
+                        stack_result = None
+                        if hasattr(zemosaic_align_stack, "stack_kappa_sigma"):
+                            stack_result = zemosaic_align_stack.stack_kappa_sigma(
+                                frames,
+                                kappa=float(stack_cfg.get("kappa_low", 3.0)),
+                                combine=final_combine,
+                                weight_method=weight_method,
+                            )
+                        elif hasattr(zemosaic_align_stack, "stack_kappa_sigma_clip"):
+                            stack_result = zemosaic_align_stack.stack_kappa_sigma_clip(
+                                frames,
+                                weight_method=weight_method,
+                                zconfig=None,
+                                sigma_low=float(stack_cfg.get("kappa_low", 3.0)),
+                                sigma_high=float(stack_cfg.get("kappa_high", stack_cfg.get("kappa_low", 3.0))),
+                            )
+                        if stack_result is not None:
+                            super_arr = stack_result[0] if isinstance(stack_result, (tuple, list)) else stack_result
+                    elif reject_algo == "linear_fit_clip" and hasattr(zemosaic_align_stack, "stack_linear_fit_clip"):
+                        result = zemosaic_align_stack.stack_linear_fit_clip(
                             frames,
                             weight_method=weight_method,
                             zconfig=None,
-                            sigma_low=float(stack_cfg.get("kappa_low", 3.0)),
-                            sigma_high=float(stack_cfg.get("kappa_high", stack_cfg.get("kappa_low", 3.0))),
+                            sigma=float(stack_cfg.get("kappa_high", stack_cfg.get("kappa_low", 3.0))),
                         )
-                    if stack_result is not None:
-                        super_arr = stack_result[0] if isinstance(stack_result, (tuple, list)) else stack_result
-                elif reject_algo == "linear_fit_clip" and hasattr(zemosaic_align_stack, "stack_linear_fit_clip"):
-                    result = zemosaic_align_stack.stack_linear_fit_clip(
-                        frames,
-                        weight_method=weight_method,
-                        zconfig=None,
-                        sigma=float(stack_cfg.get("kappa_high", stack_cfg.get("kappa_low", 3.0))),
-                    )
-                    super_arr = result[0] if isinstance(result, (tuple, list)) else result
+                        super_arr = result[0] if isinstance(result, (tuple, list)) else result
 
-                if super_arr is None:
-                    stack_np = np.stack(frames, axis=0).astype(np.float32, copy=False)
-                    super_arr = (
-                        np.nanmedian(stack_np, axis=0).astype(np.float32)
-                        if final_combine == "median"
-                        else np.nanmean(stack_np, axis=0).astype(np.float32)
-                    )
-            except Exception as exc:
-                logger.debug("[P4.5][G%03d] Stack failed: %s", group_id, exc)
-                _phase45_cleanup_storage(storage, memmap_path)
-                continue
+                    if super_arr is None:
+                        stack_np = np.stack(frames, axis=0).astype(np.float32, copy=False)
+                        super_arr = (
+                            np.nanmedian(stack_np, axis=0).astype(np.float32)
+                            if final_combine == "median"
+                            else np.nanmean(stack_np, axis=0).astype(np.float32)
+                        )
+                except Exception as exc:
+                    logger.debug("[P4.5][G%03d] Stack failed: %s", group_id, exc)
+                    _phase45_cleanup_storage(storage, memmap_path)
+                    continue
 
             _phase45_cleanup_storage(storage, memmap_path)
 
@@ -2170,6 +2275,14 @@ def _run_phase4_5_inter_master_merge(
                 header["HISTORY"] = f"Inter-Master merge ({len(chunk_tiles)} tiles)"
 
             try:
+                header["ALPHAEXT"] = (
+                    1 if alpha_out is not None else 0,
+                    "Alpha mask ext present",
+                )
+            except Exception:
+                pass
+
+            try:
                 zemosaic_utils.save_fits_image(
                     image_data=super_arr,
                     output_path=super_path,
@@ -2177,10 +2290,16 @@ def _run_phase4_5_inter_master_merge(
                     overwrite=True,
                     save_as_float=True,
                     axis_order="HWC" if super_arr.ndim == 3 else None,
+                    alpha_mask=alpha_out,
                 )
             except Exception:
                 try:
-                    fits.writeto(super_path, super_arr.astype(np.float32), header=header, overwrite=True)
+                    hdus = [fits.PrimaryHDU(super_arr.astype(np.float32), header=header)]
+                    if alpha_out is not None:
+                        alpha_hdu = fits.ImageHDU(alpha_out, name="ALPHA")
+                        alpha_hdu.header["ALPHADSC"] = ("1=opaque(in), 0=transparent(out)", "")
+                        hdus.append(alpha_hdu)
+                    fits.HDUList(hdus).writeto(super_path, overwrite=True)
                 except Exception:
                     continue
 
@@ -5368,6 +5487,7 @@ def _auto_crop_mosaic_to_valid_region(
     *,
     follow_signal: bool | None = None,
     margin_frac: float | None = 0.05,
+    alpha_map: np.ndarray | None = None,
 ):
     """Crop blank borders from the mosaic using the coverage map.
 
@@ -5386,17 +5506,17 @@ def _auto_crop_mosaic_to_valid_region(
 
     Returns
     -------
-    tuple[np.ndarray, np.ndarray | None]
-        Cropped mosaic and coverage arrays. If no cropping is necessary the
-        original inputs are returned unchanged.
+    tuple[np.ndarray, np.ndarray | None, np.ndarray | None]
+        Cropped mosaic, coverage, and alpha arrays. If no cropping is
+        necessary the original inputs are returned unchanged.
     """
 
     if mosaic is None:
-        return mosaic, coverage
+        return mosaic, coverage, alpha_map
 
     mosaic_arr = np.asarray(mosaic)
     if mosaic_arr.ndim < 2:
-        return mosaic, coverage
+        return mosaic, coverage, alpha_map
 
     default_bbox = (0, int(mosaic_arr.shape[0]), 0, int(mosaic_arr.shape[1]))
 
@@ -5420,6 +5540,7 @@ def _auto_crop_mosaic_to_valid_region(
     bbox = default_bbox
     cropped_mosaic = mosaic
     cropped_coverage = coverage
+    alpha_out = alpha_map
     used_signal_crop = False
 
     if follow_signal:
@@ -5437,6 +5558,9 @@ def _auto_crop_mosaic_to_valid_region(
                     if coverage is not None:
                         y0, y1, x0, x1 = bbox
                         cropped_coverage = coverage[y0:y1, x0:x1]
+                    if alpha_out is not None:
+                        y0, y1, x0, x1 = bbox
+                        alpha_out = alpha_out[y0:y1, x0:x1]
                     if logger.isEnabledFor(logging.DEBUG):
                         logger.debug("follow_signal crop applied, bbox=%s", bbox)
         except Exception:
@@ -5444,11 +5568,11 @@ def _auto_crop_mosaic_to_valid_region(
             used_signal_crop = False
 
     if used_signal_crop and bbox == default_bbox:
-        return mosaic, coverage
+        return mosaic, coverage, alpha_out
 
     if not used_signal_crop:
         if coverage is None:
-            return mosaic, coverage
+            return mosaic, coverage, alpha_out
 
         try:
             cov_array = np.asarray(coverage)
@@ -5456,20 +5580,20 @@ def _auto_crop_mosaic_to_valid_region(
             cov_array = coverage
 
         if getattr(cov_array, "ndim", 0) != 2:
-            return mosaic, coverage
+            return mosaic, coverage, alpha_out
 
         try:
             valid_mask = np.asarray(cov_array) > float(threshold)
         except Exception:
-            return mosaic, coverage
+            return mosaic, coverage, alpha_out
 
         if not np.any(valid_mask):
-            return mosaic, coverage
+            return mosaic, coverage, alpha_out
 
         rows = np.where(np.any(valid_mask, axis=1))[0]
         cols = np.where(np.any(valid_mask, axis=0))[0]
         if rows.size == 0 or cols.size == 0:
-            return mosaic, coverage
+            return mosaic, coverage, alpha_out
 
         y_min, y_max = int(rows[0]), int(rows[-1]) + 1
         x_min, x_max = int(cols[0]), int(cols[-1]) + 1
@@ -5482,7 +5606,7 @@ def _auto_crop_mosaic_to_valid_region(
             and y_max == mosaic.shape[0]
             and x_max == mosaic.shape[1]
         ):
-            return mosaic, coverage
+            return mosaic, coverage, alpha_out
 
         cropped_mosaic = mosaic[y_min:y_max, x_min:x_max, ...]
         cropped_coverage = coverage[y_min:y_max, x_min:x_max]
@@ -5530,7 +5654,11 @@ def _auto_crop_mosaic_to_valid_region(
             except Exception:
                 pass
 
-    return cropped_mosaic, cropped_coverage
+    if alpha_out is not None:
+        y0, y1, x0, x1 = bbox
+        alpha_out = alpha_out[y0:y1, x0:x1]
+
+    return cropped_mosaic, cropped_coverage, alpha_out
 
 
 def _wait_for_memmap_files(prefixes, timeout=10.0):
@@ -5668,6 +5796,7 @@ def reproject_tile_to_mosaic(
     match_background: bool = True,
     nan_fill_value: float = 0.0,
     enforce_positive: bool = True,
+    return_image: bool = True,
 ):
     """Reprojecte une tuile sur la grille finale et renvoie l'image et sa carte
     de poids ainsi que la bounding box utile.
@@ -5682,7 +5811,7 @@ def reproject_tile_to_mosaic(
     où les arguments doivent être sérialisables.
     """
     if not (REPROJECT_AVAILABLE and reproject_interp and ASTROPY_AVAILABLE and fits):
-        return None, None, (0, 0, 0, 0)
+        return None, None, None, (0, 0, 0, 0)
 
     # Les objets WCS ne sont pas toujours sérialisables via multiprocessing.
     # Si on reçoit des en-têtes (dict ou fits.Header), reconstruire les WCS ici.
@@ -5691,21 +5820,31 @@ def reproject_tile_to_mosaic(
             try:
                 tile_wcs = WCS(tile_wcs)
             except Exception:
-                return None, None, (0, 0, 0, 0)
+                return None, None, None, (0, 0, 0, 0)
         if not isinstance(mosaic_wcs, WCS):
             try:
                 mosaic_wcs = WCS(mosaic_wcs)
             except Exception:
-                return None, None, (0, 0, 0, 0)
-
-    with fits.open(tile_path, memmap=False) as hdul:
-        raw_data = hdul[0].data
+                return None, None, None, (0, 0, 0, 0)
 
     try:
-        data = _ensure_hwc_master_tile(raw_data, os.path.basename(tile_path))
-    except ValueError:
-        return None, None, (0, 0, 0, 0)
+        data, weight_map, _ = load_image_with_optional_alpha(
+            tile_path,
+            tile_label=os.path.basename(tile_path),
+        )
+    except Exception:
+        return None, None, None, (0, 0, 0, 0)
     n_channels = data.shape[-1]
+    alpha_weight_map = None
+    if isinstance(weight_map, np.ndarray):
+        try:
+            alpha_weight_map = np.clip(
+                np.asarray(weight_map, dtype=np.float32, copy=False),
+                0.0,
+                1.0,
+            )
+        except Exception:
+            alpha_weight_map = None
 
     if gain is None or offset is None:
         if tile_affine is not None:
@@ -5736,6 +5875,7 @@ def reproject_tile_to_mosaic(
     if apply_crop and crop_percent > 1e-3 and ZEMOSAIC_UTILS_AVAILABLE \
             and hasattr(zemosaic_utils, "crop_image_and_wcs"):
         try:
+            original_hw = data.shape[:2]
             cropped, cropped_wcs = zemosaic_utils.crop_image_and_wcs(
                 data,
                 tile_wcs,
@@ -5746,6 +5886,24 @@ def reproject_tile_to_mosaic(
                 data = cropped
                 tile_wcs = cropped_wcs
                 n_channels = data.shape[-1]
+                new_hw = data.shape[:2]
+                if (
+                    alpha_weight_map is not None
+                    and alpha_weight_map.shape == original_hw
+                    and original_hw[0] >= new_hw[0]
+                    and original_hw[1] >= new_hw[1]
+                ):
+                    dh = (original_hw[0] - new_hw[0]) // 2
+                    dw = (original_hw[1] - new_hw[1]) // 2
+                    top = dh
+                    bottom = top + new_hw[0]
+                    left = dw
+                    right = left + new_hw[1]
+                    alpha_weight_map = alpha_weight_map[top:bottom, left:right]
+                    if alpha_weight_map.shape != new_hw:
+                        alpha_weight_map = None
+                else:
+                    alpha_weight_map = None
         except Exception:
             pass
 
@@ -5770,8 +5928,14 @@ def reproject_tile_to_mosaic(
             base_weight = np.ones(data.shape[:2], dtype=np.float32)
 
     # --- Determine bounding box covered by the tile on the mosaic
+    if alpha_weight_map is not None and alpha_weight_map.shape == base_weight.shape:
+        alpha_component = alpha_weight_map
+    else:
+        alpha_component = np.ones_like(base_weight, dtype=np.float32)
+    combined_weight = alpha_component * base_weight
+
     footprint_full, _ = reproject_interp(
-        (base_weight, tile_wcs),
+        (combined_weight, tile_wcs),
         mosaic_wcs,
         shape_out=mosaic_shape_hw,
         order='nearest-neighbor',  # suffit, c'est binaire
@@ -5780,7 +5944,7 @@ def reproject_tile_to_mosaic(
 
     j_idx, i_idx = np.where(footprint_full > 0)
     if j_idx.size == 0:
-        return None, None, (0, 0, 0, 0)
+        return None, None, None, (0, 0, 0, 0)
 
     j0, j1 = int(j_idx.min()), int(j_idx.max()) + 1
     i0, i1 = int(i_idx.min()), int(i_idx.max()) + 1
@@ -5794,36 +5958,57 @@ def reproject_tile_to_mosaic(
         sub_wcs = mosaic_wcs
 
     # Allocate arrays only for the useful area
-    reproj_img = np.zeros((h, w, n_channels), dtype=np.float32)
+    reproj_img = None
+    if return_image:
+        reproj_img = np.zeros((h, w, n_channels), dtype=np.float32)
     reproj_weight = np.zeros((h, w), dtype=np.float32)
 
-    for c in range(n_channels):
-        reproj_c, footprint = reproject_interp(
-            (data[..., c], tile_wcs),
+    try:
+        weight_reproj_full, _ = reproject_interp(
+            (combined_weight, tile_wcs),
             sub_wcs,
             shape_out=(h, w),
             order='bilinear',
             parallel=False,
         )
+        weight_reproj_full = np.clip(np.nan_to_num(weight_reproj_full, nan=0.0), 0.0, None)
+    except Exception:
+        weight_reproj_full = np.zeros((h, w), dtype=np.float32)
 
-        w_reproj, _ = reproject_interp(
-            (base_weight, tile_wcs),
+    if return_image:
+        for c in range(n_channels):
+            reproj_c, footprint = reproject_interp(
+                (data[..., c], tile_wcs),
+                sub_wcs,
+                shape_out=(h, w),
+                order='bilinear',
+                parallel=False,
+            )
+
+            total_w = footprint * weight_reproj_full
+            reproj_img[..., c] = reproj_c.astype(np.float32)
+            reproj_weight += total_w.astype(np.float32)
+    else:
+        reproj_weight = weight_reproj_full.astype(np.float32, copy=False)
+
+    try:
+        alpha_patch, _ = reproject_interp(
+            (alpha_component, tile_wcs),
             sub_wcs,
             shape_out=(h, w),
             order='bilinear',
             parallel=False,
         )
-
-        total_w = footprint * w_reproj
-        reproj_img[..., c] = reproj_c.astype(np.float32)
-        reproj_weight += total_w.astype(np.float32)
+        alpha_patch = np.clip(np.nan_to_num(alpha_patch, nan=0.0), 0.0, 1.0).astype(np.float32, copy=False)
+    except Exception:
+        alpha_patch = np.ones((h, w), dtype=np.float32)
 
     valid = reproj_weight > 0
     if not np.any(valid):
-        return None, None, (0, 0, 0, 0)
+        return None, None, None, (0, 0, 0, 0)
 
     # Normalisation d'arrière-plan optionnelle (match_background)
-    if match_background:
+    if return_image and match_background and reproj_img is not None:
         try:
             for c in range(n_channels):
                 channel_view = reproj_img[..., c]
@@ -5833,7 +6018,7 @@ def reproject_tile_to_mosaic(
         except Exception:
             pass
 
-    if nan_fill_value is not None:
+    if return_image and nan_fill_value is not None and reproj_img is not None:
         np.nan_to_num(
             reproj_img,
             copy=False,
@@ -5841,11 +6026,72 @@ def reproject_tile_to_mosaic(
             posinf=nan_fill_value,
             neginf=nan_fill_value,
         )
-    if enforce_positive:
+    if return_image and enforce_positive and reproj_img is not None:
         np.clip(reproj_img, 0.0, None, out=reproj_img)
 
     # Les indices sont retournés dans l'ordre (xmin, xmax, ymin, ymax)
-    return reproj_img, reproj_weight, (i0, i1, j0, j1)
+    return reproj_img, reproj_weight, alpha_patch, (i0, i1, j0, j1)
+
+
+def _build_alpha_union_map(
+    master_tile_fits_with_wcs_list: list,
+    mosaic_wcs,
+    mosaic_shape_hw: tuple[int, int],
+    *,
+    apply_crop: bool,
+    crop_percent: float,
+    progress_callback: callable | None = None,
+):
+    """Reproject ALPHA masks from tiles and combine them via max."""
+
+    if not master_tile_fits_with_wcs_list:
+        return None
+
+    alpha_union = np.zeros(mosaic_shape_hw, dtype=np.float32)
+    for idx, entry in enumerate(master_tile_fits_with_wcs_list, 1):
+        try:
+            tile_path, tile_wcs = entry
+        except Exception:
+            continue
+        if not tile_path or tile_wcs is None:
+            continue
+        try:
+            _, _, alpha_patch, (xmin, xmax, ymin, ymax) = reproject_tile_to_mosaic(
+                tile_path,
+                tile_wcs,
+                mosaic_wcs,
+                mosaic_shape_hw,
+                feather=False,
+                apply_crop=apply_crop,
+                crop_percent=crop_percent,
+                tile_affine=None,
+                gain=None,
+                offset=None,
+                match_background=False,
+                nan_fill_value=None,
+                enforce_positive=False,
+                return_image=False,
+            )
+        except Exception:
+            logger.debug(
+                "Alpha reprojection failed for tile %s (idx=%d)",
+                os.path.basename(str(tile_path)),
+                idx,
+                exc_info=True,
+            )
+            continue
+        if (
+            alpha_patch is None
+            or xmin >= xmax
+            or ymin >= ymax
+            or alpha_patch.shape[0] != (ymax - ymin)
+            or alpha_patch.shape[1] != (xmax - xmin)
+        ):
+            continue
+        tgt = alpha_union[ymin:ymax, xmin:xmax]
+        np.maximum(tgt, alpha_patch.astype(np.float32, copy=False), out=tgt)
+
+    return alpha_union
 
 
 
@@ -7079,6 +7325,16 @@ def create_master_tile(
         "altaz_nanize": altaz_nanize,
     }
     master_tile_stacked_HWC = _apply_lecropper_pipeline(master_tile_stacked_HWC, pipeline_cfg)
+    alpha_mask_out: np.ndarray | None = None
+    try:
+        arr_for_alpha = np.asarray(master_tile_stacked_HWC)
+        if arr_for_alpha.ndim == 3:
+            valid_mask = np.any(np.isfinite(arr_for_alpha), axis=-1)
+        else:
+            valid_mask = np.isfinite(arr_for_alpha)
+        alpha_mask_out = np.where(valid_mask, 255, 0).astype(np.uint8)
+    except Exception:
+        alpha_mask_out = None
 
     quality_gate_eval: Optional[dict[str, Any]] = _evaluate_quality_gate_metrics(
         tile_id,
@@ -7148,9 +7404,10 @@ def create_master_tile(
             header_mt_save['ZMT_WINLO'] = (parsed_winsor_limits[0], 'Winsor Lower limit %')
             header_mt_save['ZMT_WINHI'] = (parsed_winsor_limits[1], 'Winsor Upper limit %')
             # Les paramètres Kappa sont aussi pertinents pour Winsorized
-            header_mt_save['ZMT_KAPLO'] = (stack_kappa_low, 'Kappa Low for Winsorized')
-            header_mt_save['ZMT_KAPHI'] = (stack_kappa_high, 'Kappa High for Winsorized')
+        header_mt_save['ZMT_KAPLO'] = (stack_kappa_low, 'Kappa Low for Winsorized')
+        header_mt_save['ZMT_KAPHI'] = (stack_kappa_high, 'Kappa High for Winsorized')
         header_mt_save['ZMT_COMB'] = (str(stack_final_combine), 'Final combine method')
+        header_mt_save['ALPHAEXT'] = (1 if alpha_mask_out is not None else 0, 'Alpha mask ext present')
 
         if center_out_context and center_out_settings:
             header_mt_save['ZMT_ANCH'] = (
@@ -7226,6 +7483,7 @@ def create_master_tile(
             save_as_float=True,
             progress_callback=progress_callback,
             axis_order="HWC",
+            alpha_mask=alpha_mask_out,
         )
 
         final_tile_path: Optional[str] = temp_fits_filepath
@@ -7397,11 +7655,11 @@ def assemble_final_mosaic_incremental(
             lvl="ERROR",
             missing=", ".join(missing_deps),
         )
-        return None, None
+        return None, None, None
 
     if not master_tile_fits_with_wcs_list:
         pcb_asm("assemble_error_no_tiles_provided_incremental", prog=None, lvl="ERROR")
-        return None, None
+        return None, None, None
 
     # ``final_output_shape_hw`` MUST be provided in ``(height, width)`` order.
     if (
@@ -7414,7 +7672,7 @@ def assemble_final_mosaic_incremental(
             lvl="ERROR",
             shape=str(final_output_shape_hw),
         )
-        return None, None
+        return None, None, None
 
     h, w = map(int, final_output_shape_hw)
 
@@ -7445,7 +7703,7 @@ def assemble_final_mosaic_incremental(
                 provided=str(final_output_shape_hw),
                 expected=str(expected_hw),
             )
-            return None, None
+            return None, None, None
 
     if match_background:
         pcb_asm("run_info_incremental_match_background", prog=None, lvl="INFO_DETAIL")
@@ -7546,14 +7804,16 @@ def assemble_final_mosaic_incremental(
         os.makedirs(memmap_dir, exist_ok=True)
     sum_path = os.path.join(memmap_dir, "SOMME.fits")
     weight_path = os.path.join(memmap_dir, "WEIGHT.fits")
+    alpha_path = os.path.join(memmap_dir, "ALPHA.fits")
 
     try:
         fits.writeto(sum_path, np.zeros(sum_shape, dtype=dtype_accumulator), overwrite=True)
         fits.writeto(weight_path, np.zeros(weight_shape, dtype=dtype_norm), overwrite=True)
+        fits.writeto(alpha_path, np.zeros(weight_shape, dtype=np.float32), overwrite=True)
     except Exception as e_create:
         pcb_asm("assemble_error_memmap_write_failed_inc", prog=None, lvl="ERROR", error=str(e_create))
         logger.error("Failed to create memmap FITS", exc_info=True)
-        return None, None
+        return None, None, None
 
 
     try:
@@ -7573,9 +7833,11 @@ def assemble_final_mosaic_incremental(
     try:
         with Executor(max_workers=max_procs) as ex, \
                 fits.open(sum_path, mode="update", memmap=True) as hsum, \
-                fits.open(weight_path, mode="update", memmap=True) as hwei:
+                fits.open(weight_path, mode="update", memmap=True) as hwei, \
+                fits.open(alpha_path, mode="update", memmap=True) as halpha:
             fsum = hsum[0].data
             fwei = hwei[0].data
+            falpha = halpha[0].data
 
             tiles_since_flush = 0
 
@@ -7654,7 +7916,7 @@ def assemble_final_mosaic_incremental(
                     # reproject_tile_to_mosaic renvoie les bornes de la tuile
                     # sous la forme (xmin, xmax, ymin, ymax) afin de
                     # correspondre aux indices de colonne puis de ligne.
-                    I_tile, W_tile, (xmin, xmax, ymin, ymax) = fut.result()
+                    I_tile, W_tile, alpha_tile, (xmin, xmax, ymin, ymax) = fut.result()
                 except MemoryError as e_mem:
                     pcb_asm(
                         "assemble_error_memory_tile_reprojection_inc",
@@ -7681,7 +7943,7 @@ def assemble_final_mosaic_incremental(
                         "BrokenProcessPool during tile reprojection",
                         exc_info=True,
                     )
-                    return None, None
+                    return None, None, None
                 except Exception as e_reproj:
                     pcb_asm(
                         "assemble_error_tile_reprojection_failed_inc",
@@ -7704,10 +7966,17 @@ def assemble_final_mosaic_incremental(
                     for c in range(n_channels):
                         tgt_sum[..., c][mask] += I_tile[..., c][mask] * W_tile[mask]
                     tgt_wgt[mask] += W_tile[mask]
+                    if alpha_tile is None or alpha_tile.shape != W_tile.shape:
+                        alpha_tile = np.where(W_tile > 0, 1.0, 0.0).astype(np.float32, copy=False)
+                    else:
+                        alpha_tile = np.clip(np.asarray(alpha_tile, dtype=np.float32, copy=False), 0.0, 1.0)
+                    tgt_alpha = falpha[ymin:ymax, xmin:xmax]
+                    np.maximum(tgt_alpha, alpha_tile, out=tgt_alpha)
                     tiles_since_flush += 1
                     if tiles_since_flush >= FLUSH_BATCH_SIZE:
                         hsum.flush()
                         hwei.flush()
+                        halpha.flush()
                         tiles_since_flush = 0
 
                 processed += 1
@@ -7762,15 +8031,19 @@ def assemble_final_mosaic_incremental(
             if tiles_since_flush > 0:
                 hsum.flush()
                 hwei.flush()
+                halpha.flush()
                 tiles_since_flush = 0
     except Exception as e_pool:
         pcb_asm("assemble_error_incremental_pool_failed", prog=None, lvl="ERROR", error=str(e_pool))
         logger.error("Error during incremental assembly", exc_info=True)
-        return None, None
+        return None, None, None
 
-    with fits.open(sum_path, memmap=True) as hsum, fits.open(weight_path, memmap=True) as hwei:
+    with fits.open(sum_path, memmap=True) as hsum, \
+            fits.open(weight_path, memmap=True) as hwei, \
+            fits.open(alpha_path, memmap=True) as halpha:
         sum_data = hsum[0].data.astype(np.float32)
         weight_data = hwei[0].data.astype(np.float32)
+        alpha_data = halpha[0].data.astype(np.float32)
         mosaic = np.zeros_like(sum_data, dtype=np.float32)
         np.divide(sum_data, weight_data[..., None], out=mosaic, where=weight_data[..., None] > 0)
 
@@ -7789,11 +8062,12 @@ def assemble_final_mosaic_incremental(
 
     # Harmonize incremental output with reproject/coadd by removing empty borders
     try:
-        mosaic, weight_data = _auto_crop_mosaic_to_valid_region(
+        mosaic, weight_data, alpha_data = _auto_crop_mosaic_to_valid_region(
             mosaic,
             weight_data,
             final_output_wcs,
             log_callback=pcb_asm,
+            alpha_map=alpha_data,
         )
         pcb_asm(
             "assemble_info_incremental_autocrop_done",
@@ -7828,7 +8102,7 @@ def assemble_final_mosaic_incremental(
             )
 
     if cleanup_memmap:
-        for p in (sum_path, weight_path):
+        for p in (sum_path, weight_path, alpha_path):
             try:
                 os.remove(p)
             except OSError:
@@ -7841,7 +8115,7 @@ def assemble_final_mosaic_incremental(
                 pass
 
 
-    return mosaic, weight_data
+    return mosaic, weight_data, alpha_data
 
 def _reproject_and_coadd_channel_worker(channel_data_list, output_wcs_header, output_shape_hw, match_bg, mm_sum_prefix=None, mm_cov_prefix=None):
     """Worker function to run reproject_and_coadd in a separate process."""
@@ -8011,11 +8285,11 @@ def assemble_final_mosaic_reproject_coadd(
             lvl="ERROR",
             missing=", ".join(missing_deps),
         )
-        return None, None
+        return None, None, None
 
     if not master_tile_fits_with_wcs_list:
         _pcb("assemble_error_no_tiles_provided_reproject_coadd", prog=None, lvl="ERROR")
-        return None, None
+        return None, None, None
 
     if (
         not isinstance(final_output_shape_hw, (tuple, list))
@@ -8027,7 +8301,7 @@ def assemble_final_mosaic_reproject_coadd(
             lvl="ERROR",
             shape=str(final_output_shape_hw),
         )
-        return None, None
+        return None, None, None
 
     h, w = map(int, final_output_shape_hw)
 
@@ -8058,7 +8332,7 @@ def assemble_final_mosaic_reproject_coadd(
                 provided=str(final_output_shape_hw),
                 expected=str(expected_hw),
             )
-            return None, None
+            return None, None, None
 
     # Convertir la sortie WCS en header FITS si possible une seule fois
     output_header = (
@@ -8538,7 +8812,7 @@ def assemble_final_mosaic_reproject_coadd(
             "Erreur fatale lors de l'appel à reproject_and_coadd:",
             exc_info=True,
         )
-        return None, None
+        return None, None, None
 
     if mosaic_memmap is not None:
         mosaic_data = mosaic_memmap
@@ -8560,12 +8834,46 @@ def assemble_final_mosaic_reproject_coadd(
         except Exception:
             pass
 
-    mosaic_data, coverage = _auto_crop_mosaic_to_valid_region(
+    alpha_union = None
+    try:
+        alpha_union = _build_alpha_union_map(
+            master_tile_fits_with_wcs_list,
+            final_output_wcs,
+            final_output_shape_hw,
+            apply_crop=apply_crop,
+            crop_percent=crop_percent,
+            progress_callback=_pcb,
+        )
+    except Exception:
+        alpha_union = None
+
+    mosaic_data, coverage, alpha_union = _auto_crop_mosaic_to_valid_region(
         mosaic_data,
         coverage,
         final_output_wcs,
         log_callback=_pcb,
+        alpha_map=alpha_union,
     )
+
+    # --- ALPHA FINAL: propager l’alpha jusqu’à la sauvegarde ---
+    alpha_final = None
+    try:
+        if alpha_union is not None:
+            a = np.asarray(alpha_union)
+            # S'assurer de la forme (H,W)
+            if a.ndim > 2:
+                a = np.squeeze(a)
+            if a.ndim == 3 and a.shape[-1] == 1:
+                a = a[..., 0]
+            # Normaliser en uint8 0..255 si ce n’est pas déjà le cas
+            if a.dtype != np.uint8:
+                # Si alpha est [0..1] -> 0..255 ; sinon binaire/poids quelconque -> clamp
+                a = (np.clip(a, 0.0, 1.0) * 255.0).astype(np.uint8)
+            alpha_final = a
+            logger.info("[Alpha] Union mask propagated to Phase 6, shape=%s, dtype=%s", a.shape, a.dtype)
+    except Exception as _e_alpha_norm:
+        alpha_final = None
+        logger.debug("Alpha union normalization failed: %s", _e_alpha_norm)
 
     # Defer memmap cleanup to Phase 6 after final save
 
@@ -8598,7 +8906,11 @@ def assemble_final_mosaic_reproject_coadd(
 
     _update_eta(n_channels)
 
-    return mosaic_data.astype(np.float32), coverage.astype(np.float32)
+    return (
+        mosaic_data.astype(np.float32),
+        coverage.astype(np.float32),
+        alpha_final,
+    )
 
 
 def _load_master_tiles_for_two_pass(
@@ -9926,6 +10238,16 @@ def run_hierarchical_mosaic(
                         cached_image_path = os.path.join(temp_image_cache_dir, cache_file_basename)
                         try:
                             np.save(cached_image_path, img_data_adu)
+                        except Exception as e_save_npy:
+                            pcb(
+                                "run_error_phase1_save_npy_failed",
+                                prog=prog_step_phase1,
+                                lvl="ERROR",
+                                filename=os.path.basename(file_path_original),
+                                error=str(e_save_npy),
+                            )
+                            logger.error(f"Erreur sauvegarde NPY pour {file_path_original}:", exc_info=True)
+                        else:
                             # Stocker les informations pour les phases suivantes
                             entry = {
                                 'path_raw': file_path_original,
@@ -9946,15 +10268,6 @@ def run_hierarchical_mosaic(
                                 if 'wcs' in meta and 'wcs' not in entry:
                                     entry['phase0_wcs'] = meta.get('wcs')
                             all_raw_files_processed_info_dict[file_path_original] = entry
-                        except Exception as e_save_npy:
-                            pcb(
-                                "run_error_phase1_save_npy_failed",
-                                prog=prog_step_phase1,
-                                lvl="ERROR",
-                                filename=os.path.basename(file_path_original),
-                                error=str(e_save_npy),
-                            )
-                            logger.error(f"Erreur sauvegarde NPY pour {file_path_original}:", exc_info=True)
                         finally:
                             # Libérer la mémoire des données image dès que possible
                             del img_data_adu
@@ -11375,7 +11688,7 @@ def run_hierarchical_mosaic(
         # Nettoyage optionnel ici avant de retourner si besoin
         return
 
-    final_mosaic_data_HWC, final_mosaic_coverage_HW = None, None
+    final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = None, None, None
     collected_tiles_for_second_pass: list[tuple[np.ndarray, Any]] | None = (
         [] if two_pass_enabled and not USE_INCREMENTAL_ASSEMBLY else None
     )
@@ -11396,7 +11709,7 @@ def run_hierarchical_mosaic(
                 import cupy
                 cupy.cuda.Device(0).use()
                 # Incremental GPU path not implemented; use CPU incremental assembly.
-                final_mosaic_data_HWC, final_mosaic_coverage_HW = assemble_final_mosaic_incremental(
+                final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = assemble_final_mosaic_incremental(
                     master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly,
                     final_output_wcs=final_output_wcs,
                     final_output_shape_hw=final_output_shape_hw,
@@ -11425,7 +11738,7 @@ def run_hierarchical_mosaic(
                 )
             except Exception as e_gpu:
                 logger.warning("GPU incremental assembly failed, falling back to CPU: %s", e_gpu)
-                final_mosaic_data_HWC, final_mosaic_coverage_HW = assemble_final_mosaic_incremental(
+                final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = assemble_final_mosaic_incremental(
                     master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly,
                     final_output_wcs=final_output_wcs,
                     final_output_shape_hw=final_output_shape_hw,
@@ -11453,7 +11766,7 @@ def run_hierarchical_mosaic(
                     global_anchor_shift=global_anchor_shift,
                 )
         else:
-            final_mosaic_data_HWC, final_mosaic_coverage_HW = assemble_final_mosaic_incremental(
+            final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = assemble_final_mosaic_incremental(
                 master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly,
                 final_output_wcs=final_output_wcs,
                 final_output_shape_hw=final_output_shape_hw,
@@ -11493,7 +11806,7 @@ def run_hierarchical_mosaic(
 
                 cupy.cuda.Device(0).use()
                 # Use the internal CPU/GPU wrapper with use_gpu=True
-                final_mosaic_data_HWC, final_mosaic_coverage_HW = assemble_final_mosaic_reproject_coadd(
+                final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = assemble_final_mosaic_reproject_coadd(
                     master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly,
                     final_output_wcs=final_output_wcs,
                     final_output_shape_hw=final_output_shape_hw,
@@ -11520,7 +11833,7 @@ def run_hierarchical_mosaic(
                 )
             except Exception as e_gpu:
                 logger.warning("GPU reproject_coadd failed, falling back to CPU: %s", e_gpu)
-                final_mosaic_data_HWC, final_mosaic_coverage_HW = assemble_final_mosaic_reproject_coadd(
+                final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = assemble_final_mosaic_reproject_coadd(
                     master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly,
                     final_output_wcs=final_output_wcs,
                     final_output_shape_hw=final_output_shape_hw,
@@ -11549,7 +11862,7 @@ def run_hierarchical_mosaic(
                     phase45_enabled=phase45_active_flag,
                 )
         else:
-            final_mosaic_data_HWC, final_mosaic_coverage_HW = assemble_final_mosaic_reproject_coadd(
+            final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = assemble_final_mosaic_reproject_coadd(
                 master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly,
                 final_output_wcs=final_output_wcs,
                 final_output_shape_hw=final_output_shape_hw,
@@ -11586,6 +11899,48 @@ def run_hierarchical_mosaic(
         # Nettoyage optionnel ici
         return
         
+    alpha_final: np.ndarray | None = None
+    try:
+        if isinstance(final_alpha_map, np.ndarray):
+            alpha_candidate = np.asarray(final_alpha_map)
+            if alpha_candidate.ndim > 2:
+                alpha_candidate = np.squeeze(alpha_candidate)
+            if alpha_candidate.ndim == 3 and alpha_candidate.shape[-1] == 1:
+                alpha_candidate = alpha_candidate[..., 0]
+            if alpha_candidate.dtype != np.uint8:
+                if np.issubdtype(alpha_candidate.dtype, np.integer):
+                    alpha_candidate = np.clip(alpha_candidate, 0, 255).astype(np.uint8)
+                else:
+                    alpha_candidate = (np.clip(alpha_candidate, 0.0, 1.0) * 255.0).astype(np.uint8)
+            alpha_final = alpha_candidate
+        elif isinstance(final_mosaic_data_HWC, np.ndarray):
+            if final_mosaic_coverage_HW is not None:
+                cov = np.nan_to_num(
+                    final_mosaic_coverage_HW,
+                    nan=0.0,
+                    neginf=0.0,
+                    posinf=0.0,
+                ).astype(np.float32, copy=False)
+                max_cov = float(np.nanmax(cov)) if np.any(cov) else 0.0
+                if max_cov > 0:
+                    alpha_final = (np.clip(cov / max_cov, 0.0, 1.0) * 255.0).astype(np.uint8)
+                else:
+                    mask_valid = (
+                        np.any(np.isfinite(final_mosaic_data_HWC), axis=-1)
+                        if final_mosaic_data_HWC.ndim == 3
+                        else np.isfinite(final_mosaic_data_HWC)
+                    )
+                    alpha_final = (mask_valid.astype(np.float32) * 255.0).astype(np.uint8)
+            else:
+                mask_valid = (
+                    np.any(np.isfinite(final_mosaic_data_HWC), axis=-1)
+                    if final_mosaic_data_HWC.ndim == 3
+                    else np.isfinite(final_mosaic_data_HWC)
+                )
+                alpha_final = (mask_valid.astype(np.float32) * 255.0).astype(np.uint8)
+    except Exception:
+        alpha_final = None
+
     current_global_progress = base_progress_phase5 + PROGRESS_WEIGHT_PHASE5_ASSEMBLY
 
     if two_pass_enabled and final_mosaic_coverage_HW is not None:
@@ -11690,6 +12045,7 @@ def run_hierarchical_mosaic(
     final_header['STK_REJ'] = (str(stack_reject_algo), 'Stacking: Rejection Algorithm')
     # ... (kappa, winsor si pertinent pour l'algo de rejet) ...
     final_header['STK_COMB'] = (str(stack_final_combine), 'Stacking: Final Combine Method')
+    final_header['ALPHAEXT'] = (1 if alpha_final is not None else 0, 'Alpha mask ext present')
     final_header['ZMASMBMTH'] = (final_assembly_method_config, 'Final Assembly Method')
     final_header['ZM_WORKERS'] = (num_base_workers_config, 'GUI: Base workers config (0=auto)')
 
@@ -11697,6 +12053,34 @@ def run_hierarchical_mosaic(
         if not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils): 
             raise RuntimeError("zemosaic_utils non disponible pour sauvegarde FITS.")
         legacy_rgb_flag = bool(legacy_rgb_cube_config)
+        def _append_alpha_extension(target_path: str, alpha_data: np.ndarray | None) -> None:
+            if alpha_data is None or not os.path.exists(target_path):
+                return
+            try:
+                alpha_arr = np.asarray(alpha_data, dtype=np.uint8, copy=False)
+                if alpha_arr.ndim > 2:
+                    alpha_arr = np.squeeze(alpha_arr)
+                if alpha_arr.ndim == 3 and alpha_arr.shape[-1] == 1:
+                    alpha_arr = alpha_arr[..., 0]
+                with fits.open(target_path, mode="update") as hdul_final:
+                    alpha_hdu = None
+                    for hdu in hdul_final:
+                        name = getattr(hdu, "name", "")
+                        if isinstance(name, str) and name.upper() == "ALPHA":
+                            alpha_hdu = hdu
+                            break
+                    if alpha_hdu is not None:
+                        alpha_hdu.data = alpha_arr
+                        alpha_hdu.header["ALPHADSC"] = ("1=opaque(in), 0=transparent(out)", "")
+                    else:
+                        alpha_hdu = fits.ImageHDU(alpha_arr, name="ALPHA")
+                        alpha_hdu.header["ALPHADSC"] = ("1=opaque(in), 0=transparent(out)", "")
+                        hdul_final.append(alpha_hdu)
+                    hdul_final[0].header["ALPHAEXT"] = (1, "Alpha mask ext present")
+                    hdul_final.flush()
+            except Exception as exc_alpha:
+                logger.debug("Failed to append/update ALPHA extension to %s: %s", target_path, exc_alpha)
+
         if bool(save_final_as_uint16_config) and not legacy_rgb_flag:
             if not hasattr(zemosaic_utils, "write_final_fits_uint16_color_aware"):
                 raise RuntimeError("write_final_fits_uint16_color_aware unavailable in zemosaic_utils")
@@ -11713,6 +12097,7 @@ def run_hierarchical_mosaic(
                 legacy_rgb_cube=legacy_rgb_flag,
                 overwrite=True,
             )
+            _append_alpha_extension(final_fits_path, alpha_final)
             if is_rgb:
                 pcb(
                     "run_info_phase6_saved_uint16_rgb_planes",
@@ -11730,7 +12115,9 @@ def run_hierarchical_mosaic(
                 legacy_rgb_cube=legacy_rgb_flag,
                 progress_callback=progress_callback,
                 axis_order="HWC",
+                alpha_mask=alpha_final,
             )
+            _append_alpha_extension(final_fits_path, alpha_final)
 
             if (
                 ZEMOSAIC_UTILS_AVAILABLE
@@ -11748,6 +12135,7 @@ def run_hierarchical_mosaic(
                         legacy_rgb_cube=legacy_rgb_flag,
                         overwrite=True,
                     )
+                    _append_alpha_extension(viewer_fits_path, alpha_final)
                     pcb(
                         "run_info_phase6_viewer_fits_saved",
                         prog=None,
@@ -11781,6 +12169,8 @@ def run_hierarchical_mosaic(
             )
             pcb("run_info_coverage_map_saved", prog=None, lvl="INFO_DETAIL", filename=os.path.basename(coverage_path))
         
+        logger.info("[Alpha] Final mosaic saved with ALPHA=%s", bool(alpha_final is not None))
+
         current_global_progress = base_progress_phase6 + PROGRESS_WEIGHT_PHASE6_SAVE
         pcb("run_success_mosaic_saved", prog=current_global_progress, lvl="SUCCESS", filename=os.path.basename(final_fits_path))
     except Exception as e_save_m: 
@@ -11800,6 +12190,8 @@ def run_hierarchical_mosaic(
         pcb("run_info_preview_stretch_started_auto_asifits", prog=None, lvl="INFO_DETAIL") # Log mis à jour
         try:
             # Downscale extremely large mosaics for preview to avoid OOM
+            step = 1
+            alpha_preview: np.ndarray | None = None
             try:
                 h_prev, w_prev = int(final_mosaic_data_HWC.shape[0]), int(final_mosaic_data_HWC.shape[1])
                 max_preview_dim = 4000  # cap the longest side for preview
@@ -11813,6 +12205,39 @@ def run_hierarchical_mosaic(
                     preview_view = final_mosaic_data_HWC
             except Exception:
                 preview_view = final_mosaic_data_HWC
+                step = 1
+
+            if alpha_final is not None:
+                try:
+                    alpha_src = np.asarray(alpha_final, dtype=np.uint8, copy=False)
+                    if alpha_src.ndim > 2:
+                        alpha_src = np.squeeze(alpha_src)
+                    if alpha_src.ndim == 3 and alpha_src.shape[-1] == 1:
+                        alpha_src = alpha_src[..., 0]
+                    if alpha_src.shape[0] == final_mosaic_data_HWC.shape[0] and alpha_src.shape[1] == final_mosaic_data_HWC.shape[1]:
+                        alpha_preview = alpha_src[::step, ::step] if step > 1 else alpha_src
+                        if (
+                            alpha_preview.shape[0] >= preview_view.shape[0]
+                            and alpha_preview.shape[1] >= preview_view.shape[1]
+                            and (alpha_preview.shape[0], alpha_preview.shape[1]) != (preview_view.shape[0], preview_view.shape[1])
+                        ):
+                            alpha_preview = alpha_preview[: preview_view.shape[0], : preview_view.shape[1]]
+                        if alpha_preview.shape[0] == preview_view.shape[0] and alpha_preview.shape[1] == preview_view.shape[1]:
+                            mask_zero = alpha_preview <= 0
+                            if np.any(mask_zero):
+                                preview_view = np.array(preview_view, copy=True)
+                                preview_view[mask_zero[..., None]] = np.nan
+                        else:
+                            alpha_preview = None
+                    else:
+                        logger.debug(
+                            "[Alpha] Preview mask shape mismatch: alpha=%s vs mosaic=%s",
+                            getattr(alpha_src, "shape", None),
+                            getattr(final_mosaic_data_HWC, "shape", None),
+                        )
+                except Exception as exc_alpha_prev:
+                    logger.debug("[Alpha] Failed to prepare preview alpha mask: %s", exc_alpha_prev)
+                    alpha_preview = None
 
             # Vérifier si la fonction stretch_auto_asifits_like existe dans zemosaic_utils
             if hasattr(zemosaic_utils, 'stretch_auto_asifits_like') and callable(zemosaic_utils.stretch_auto_asifits_like):
@@ -11856,8 +12281,23 @@ def run_hierarchical_mosaic(
                     png_path = os.path.join(output_folder, f"{output_base_name}_preview.png")
                     try: 
                         import cv2 # Importer cv2 seulement si nécessaire
-                        img_bgr = cv2.cvtColor(img_u8, cv2.COLOR_RGB2BGR)
-                        if cv2.imwrite(png_path, img_bgr): 
+                        alpha_png = None
+                        if alpha_preview is not None:
+                            alpha_png = np.clip(alpha_preview, 0, 255).astype(np.uint8, copy=False)
+                            if alpha_png.shape[:2] != img_u8.shape[:2]:
+                                alpha_png = cv2.resize(
+                                    alpha_png,
+                                    (img_u8.shape[1], img_u8.shape[0]),
+                                    interpolation=cv2.INTER_NEAREST,
+                                )
+                        if alpha_png is not None:
+                            img_bgra = cv2.cvtColor(img_u8, cv2.COLOR_RGB2BGRA)
+                            img_bgra[..., 3] = alpha_png
+                            write_success = cv2.imwrite(png_path, img_bgra)
+                        else:
+                            img_bgr = cv2.cvtColor(img_u8, cv2.COLOR_RGB2BGR)
+                            write_success = cv2.imwrite(png_path, img_bgr)
+                        if write_success: 
                             pcb("run_success_preview_saved_auto_asifits", prog=None, lvl="SUCCESS", filename=os.path.basename(png_path))
                         else: 
                             pcb("run_warn_preview_imwrite_failed_auto_asifits", prog=None, lvl="WARN", filename=os.path.basename(png_path))
@@ -11879,8 +12319,22 @@ def run_hierarchical_mosaic(
                         png_path_fb = os.path.join(output_folder, f"{output_base_name}_preview_fallback.png")
                         try:
                             import cv2
-                            img_bgr_fb = cv2.cvtColor(img_u8_fb, cv2.COLOR_RGB2BGR)
-                            cv2.imwrite(png_path_fb, img_bgr_fb)
+                            alpha_png_fb = None
+                            if alpha_preview is not None:
+                                alpha_png_fb = np.clip(alpha_preview, 0, 255).astype(np.uint8, copy=False)
+                                if alpha_png_fb.shape[:2] != img_u8_fb.shape[:2]:
+                                    alpha_png_fb = cv2.resize(
+                                        alpha_png_fb,
+                                        (img_u8_fb.shape[1], img_u8_fb.shape[0]),
+                                        interpolation=cv2.INTER_NEAREST,
+                                    )
+                            if alpha_png_fb is not None:
+                                img_bgra_fb = cv2.cvtColor(img_u8_fb, cv2.COLOR_RGB2BGRA)
+                                img_bgra_fb[..., 3] = alpha_png_fb
+                                cv2.imwrite(png_path_fb, img_bgra_fb)
+                            else:
+                                img_bgr_fb = cv2.cvtColor(img_u8_fb, cv2.COLOR_RGB2BGR)
+                                cv2.imwrite(png_path_fb, img_bgr_fb)
                             pcb("run_success_preview_saved_fallback", prog=None, lvl="INFO_DETAIL", filename=os.path.basename(png_path_fb))
                         except: pass # Ignorer erreur fallback
 

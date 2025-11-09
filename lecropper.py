@@ -60,6 +60,7 @@ import logging
 
 import numpy as np
 from astropy.io import fits
+from typing import Any
 
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
@@ -146,6 +147,55 @@ def bbox_from_mask(m):
 # -------------------------- coeur: détection auto-crop -----------------------
 
 logger = logging.getLogger(__name__)
+
+_ALPHA_EXPORT_SETTINGS: dict[str, Any] | None = None
+
+
+def _get_altaz_alpha_settings():
+    global _ALPHA_EXPORT_SETTINGS
+    if _ALPHA_EXPORT_SETTINGS is not None:
+        return _ALPHA_EXPORT_SETTINGS
+
+    settings = {
+        "fits": True,
+        "sidecar": False,
+        "format": "png",
+    }
+
+    try:
+        import zemosaic_config as _zconf  # type: ignore[import]
+
+        cfg = {}
+        try:
+            if hasattr(_zconf, "load_config"):
+                cfg = _zconf.load_config() or {}
+        except Exception:
+            cfg = {}
+
+        settings["fits"] = bool(cfg.get("altaz_export_alpha_fits", settings["fits"]))
+        settings["sidecar"] = bool(cfg.get("altaz_export_alpha_sidecar", settings["sidecar"]))
+        fmt = cfg.get("altaz_alpha_sidecar_format")
+        if isinstance(fmt, str) and fmt:
+            settings["format"] = fmt.lower()
+    except Exception:
+        pass
+
+    def _from_env(key: str, default: bool) -> bool:
+        val = os.environ.get(key)
+        if val is None:
+            return default
+        if val.strip().lower() in {"0", "false", "off", "no"}:
+            return False
+        return True
+
+    settings["fits"] = _from_env("ZEM_ALTALPHA_FITS", settings["fits"])
+    settings["sidecar"] = _from_env("ZEM_ALTALPHA_SIDECAR", settings["sidecar"])
+    fmt_env = os.environ.get("ZEM_ALTALPHA_SIDECAR_FORMAT")
+    if fmt_env:
+        settings["format"] = fmt_env.lower()
+
+    _ALPHA_EXPORT_SETTINGS = settings
+    return settings
 
 
 def detect_autocrop_rgb(
@@ -545,14 +595,33 @@ def save_cropped_fits(
     else:
         cropped = data
 
+    alpha_mask = None
     if altaz_cleanup:
         fill_value = np.nan if altaz_use_nan else 0.0
-        cropped = mask_altaz_artifacts(
-            cropped,
-            margin_percent=altaz_margin,
-            decay_ratio=altaz_decay,
-            fill_value=fill_value,
-        )
+        if altaz_use_nan:
+            cropped, mask = mask_altaz_artifacts(
+                cropped,
+                margin_percent=altaz_margin,
+                decay_ratio=altaz_decay,
+                fill_value=fill_value,
+                return_mask=True,
+            )
+            # NOTE [DO-NOT-REMOVE (alpha mask)]: ce masque ALPHA est requis pour
+            # l’édition cosmétique et la transparence de la mosaïque finale.
+            # Ne pas supprimer cette étape : elle garantit l’absence d’arcs noirs.
+            cropped = np.where(mask == 0, np.nan, cropped)
+            mask8 = np.clip(mask, 0.0, 1.0)
+            alpha_mask = np.asarray((mask8 * 255.0).round(), dtype=np.uint8)
+        else:
+            cropped = mask_altaz_artifacts(
+                cropped,
+                margin_percent=altaz_margin,
+                decay_ratio=altaz_decay,
+                fill_value=fill_value,
+            )
+            alpha_mask = None
+    else:
+        alpha_mask = None
 
     # Mise à jour rapide du CRPIX si présent (optionnel)
     if "CRPIX1" in header and "CRPIX2" in header:
@@ -561,7 +630,50 @@ def save_cropped_fits(
 
     base, ext = os.path.splitext(in_path)
     out_path = f"{base}{out_suffix}{ext}"
-    fits.writeto(out_path, cropped, header, overwrite=True)
+
+    settings = _get_altaz_alpha_settings()
+    hdus = []
+    primary = fits.PrimaryHDU(cropped, header)
+    primary.header["ALTZCLN"] = (bool(altaz_cleanup), "Alt-Az cleanup applied")
+    primary.header["ALTZNAN"] = (bool(altaz_use_nan), "NaN outside FoV")
+    primary.header["ALPHAEXT"] = (int(alpha_mask is not None and settings["fits"]), "Alpha mask ext present")
+    hdus.append(primary)
+    if alpha_mask is not None and settings["fits"]:
+        alpha_hdu = fits.ImageHDU(alpha_mask, name="ALPHA")
+        alpha_hdu.header["ALPHADSC"] = ("1=opaque(in), 0=transparent(out)", "")
+        hdus.append(alpha_hdu)
+    fits.HDUList(hdus).writeto(out_path, overwrite=True)
+    logger.info(f"[lecropper] Saved FITS with ALPHA={alpha_mask is not None and settings['fits']} → {out_path}")
+
+    if alpha_mask is not None and settings["sidecar"]:
+        try:
+            from PIL import Image
+
+            img = np.asarray(cropped, dtype=np.float32)
+            finite = np.isfinite(img)
+            if finite.any():
+                p1, p99 = np.nanpercentile(img[finite], [1, 99])
+                scale = max(p99 - p1, 1e-6)
+                img = np.clip((img - p1) / scale, 0.0, 1.0)
+            else:
+                img = np.zeros_like(img, dtype=np.float32)
+            img8 = (np.clip(img, 0.0, 1.0) * 255.0).astype(np.uint8)
+            if img8.ndim == 2:
+                rgb = np.stack([img8, img8, img8], axis=-1)
+            elif img8.ndim == 3 and img8.shape[-1] == 3:
+                rgb = img8
+            else:
+                rgb = np.stack([img8[..., 0]] * 3, axis=-1)
+            rgba = Image.fromarray(rgb, mode="RGB")
+            A = Image.fromarray(alpha_mask, mode="L")
+            rgba.putalpha(A)
+            side_ext = settings["format"] or "png"
+            side_path = os.path.splitext(out_path)[0] + f".alpha.{side_ext}"
+            rgba.save(side_path)
+            logger.info(f"Saved alpha sidecar {side_path}")
+        except Exception:
+            pass
+
     return out_path
 
 

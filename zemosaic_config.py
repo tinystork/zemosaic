@@ -124,6 +124,10 @@ DEFAULT_CONFIG = {
     "altaz_margin_percent": 5.0,   # UI: "AltAz margin %"
     "altaz_decay": 0.15,           # UI: "AltAz decay"
     "altaz_nanize": True,          # UI: "Alt-Az → NaN"
+    # --- Alt-Az Alpha export ---
+    "altaz_export_alpha_fits": True,
+    "altaz_export_alpha_sidecar": False,
+    "altaz_alpha_sidecar_format": "png",
     # --- Qualité avancée ---
     "quality_crop_min_run": 2,     # UI: "min run"
     "crop_follow_signal": True,
@@ -387,6 +391,36 @@ def load_config():
         if isinstance(value, str) and value:
             current_config[key] = os.path.expanduser(value)
     _apply_astap_platform_defaults(current_config)
+
+    def _env_flag(env_key: str, default: bool) -> bool:
+        val = os.environ.get(env_key)
+        if val is None:
+            return default
+        if val.strip().lower() in {"0", "false", "off", "no"}:
+            return False
+        return True
+
+    current_config["altaz_export_alpha_fits"] = _env_flag(
+        "ZEM_ALTALPHA_FITS",
+        bool(current_config.get("altaz_export_alpha_fits", True)),
+    )
+    current_config["altaz_export_alpha_sidecar"] = _env_flag(
+        "ZEM_ALTALPHA_SIDECAR",
+        bool(current_config.get("altaz_export_alpha_sidecar", False)),
+    )
+
+    fmt_env = os.environ.get("ZEM_ALTALPHA_SIDECAR_FORMAT")
+    fmt_cfg = current_config.get("altaz_alpha_sidecar_format", "png")
+    fmt_val = fmt_env if fmt_env is not None else fmt_cfg
+    if not isinstance(fmt_val, str):
+        fmt_val = str(fmt_val or "png")
+    fmt_val = fmt_val.strip().lower() or "png"
+    if fmt_val in {"tif"}:
+        fmt_val = "tiff"
+    elif fmt_val not in {"png", "tiff"}:
+        fmt_val = "png"
+    current_config["altaz_alpha_sidecar_format"] = fmt_val
+
     return current_config
 
 def save_config(config_data):
