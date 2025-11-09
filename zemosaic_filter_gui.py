@@ -2133,11 +2133,17 @@ def launch_filter_interface(
             except Exception:
                 pass
 
+        # Dedicated holder so the Matplotlib canvas can stretch to the full grid cell
+        plot_holder = ttk.Frame(main)
+        plot_holder.grid(row=1, column=0, sticky="nsew")
+        plot_holder.rowconfigure(0, weight=1)
+        plot_holder.columnconfigure(0, weight=1)
+
         # Matplotlib figure (manual layout so the axes stay pinned to the bottom)
         fig = Figure(figsize=(7.0, 5.0), dpi=100)
-        # Disable Matplotlib's automatic layout engines so that manual
-        # adjustments (anchor, subplots_adjust) keep the axes glued to the
-        # bottom edge even when the widget provides extra vertical room.
+        # Disable Matplotlib's automatic layout engines so that manual layout
+        # adjustments (subplots_adjust, aspect tweaks) remain effective during
+        # aggressive window resizes.
         try:
             if hasattr(fig, "set_layout_engine"):
                 fig.set_layout_engine(None)
@@ -2152,66 +2158,92 @@ def launch_filter_interface(
             "filter_axis_dec_deg",
             "Dec [deg]"
         ))
-        ax.set_aspect("equal", adjustable="box", anchor="C")
-        # Explicit anchor keeps the plot centered vertically when the surface
-        # provides more height than the figure needs.
-        ax.set_anchor("C")
+        # Allow Matplotlib to stretch the axes freely so the preview actually
+        # fills the Tk frame (otherwise equal-aspect plots leave huge gutters).
+        # RA/Dec overlays are illustrative, not for precise measurements.
+        ax.set_aspect("auto")
         # For sky-like view, invert RA axis (optional)
         ax.invert_xaxis()
+        # Force the RA axis ticks to remain visible even when Matplotlib switches
+        # layouts/aspects during window resizes.
+        ax.tick_params(axis="x", which="both", top=False, bottom=True, labeltop=False, labelbottom=True, direction="out", pad=2)
+        ax.xaxis.set_label_position("bottom")
+        try:
+            ax.xaxis.set_ticks_position("bottom")
+        except Exception:
+            pass
+        try:
+            ax.spines["bottom"].set_visible(True)
+            ax.spines["top"].set_visible(False)
+        except Exception:
+            pass
 
-        canvas = FigureCanvasTkAgg(fig, master=main)
+        canvas = FigureCanvasTkAgg(fig, master=plot_holder)
         canvas_widget = canvas.get_tk_widget()
-        # Anchor the plot to the bottom edge so the RA axis remains visible when
-        # extra height is available.
-        canvas_widget.grid(row=1, column=0, sticky="sew")
+        canvas_widget.grid(row=0, column=0, sticky="nsew")
 
         # Make the Matplotlib figure follow the widget size to avoid
         # large empty borders around the plot.
         def _apply_resize():
             try:
-                w = max(50, int(canvas_widget.winfo_width()))
-                h = max(50, int(canvas_widget.winfo_height()))
+                w = max(50, int(plot_holder.winfo_width()))
+                h = max(50, int(plot_holder.winfo_height()))
+                # Resize figure using the actual screen DPI reported by Tk so the
+                # Matplotlib canvas matches the widget size even on HiDPI setups.
+                try:
+                    widget_dpi = float(canvas_widget.winfo_fpixels("1i"))
+                    if math.isfinite(widget_dpi) and widget_dpi > 4.0:
+                        fig.set_dpi(widget_dpi)
+                except Exception:
+                    widget_dpi = fig.dpi
                 # Resize figure in pixels -> inches
-                fig.set_size_inches(w / fig.dpi, h / fig.dpi, forward=True)
+                fig.set_size_inches(w / widget_dpi, h / widget_dpi, forward=True)
                 # Maximize axes area inside the figure when compatible with the
                 # active Matplotlib layout engine.  Newer Matplotlib versions
                 # (>=3.8) expose layout engines that reject ``subplots_adjust``
                 # calls.  Skip the adjustment in that case to avoid runtime
-                # warnings.
+                # warnings.  Use an adaptive bottom margin (in pixels) so the RA
+                # axis ticks stay visible without wasting a huge white band.
                 try:
                     layout_engine = None
                     if hasattr(fig, "get_layout_engine"):
                         layout_engine = fig.get_layout_engine()
                     if layout_engine is None:
-                        fig.subplots_adjust(left=0.06, right=0.995, bottom=0.08, top=0.98)
+                        # Resize tick labels when the canvas is squashed so the
+                        # axis still fits within a thin strip.
+                        tick_size = 10
+                        if h < 240:
+                            tick_size = max(7, min(10, int(h / 32)))
+                        ax.tick_params(axis="both", labelsize=tick_size)
+                        # Reserve only the pixels we truly need for the labels.
+                        required_margin_px = max(16.0, tick_size * 1.6)
+                        bottom_margin = min(0.08, max(0.0025, required_margin_px / max(h, 1)))
+                        left_margin = 0.045
+                        right_margin = 0.995
+                        top_margin = 0.995
+                        fig.subplots_adjust(left=left_margin, right=right_margin, bottom=bottom_margin, top=top_margin)
+                        # Explicitly pin the axes rectangle so Matplotlib cannot
+                        # reflow it (avoids the “axis jumps upward” effect seen
+                        # during window construction on some Tk themes).
+                        width = max(0.05, right_margin - left_margin)
+                        height = max(0.05, top_margin - bottom_margin)
+                        ax.set_position([left_margin, bottom_margin, width, height])
                 except Exception:
                     pass
-                try:
-                    # Re-apply anchor after subplot adjustments or box-aspect tweaks
-                    # because Matplotlib may reset the position during tight layout
-                    # calculations, which brings the RA axis back to the top.
-                    ax.set_anchor("SW")
-                except Exception:
-                    pass
+                # No special aspect re-application is required in auto mode.
                 canvas.draw_idle()
             except Exception:
                 pass
 
-        _resize_job = {"id": None}
-
         def _on_canvas_configure(_event=None):
-            # Throttle frequent resizes during interactive dragging
-            try:
-                if _resize_job["id"] is not None:
-                    canvas_widget.after_cancel(_resize_job["id"])  # type: ignore[arg-type]
-                _resize_job["id"] = canvas_widget.after(60, lambda: (_apply_resize(), _resize_job.update({"id": None})))
-            except Exception:
-                _apply_resize()
-                _resize_job["id"] = None
+            # Apply immediately so the Matplotlib surface always matches the
+            # widget size (otherwise we sometimes see old figure sizes linger
+            # until the user interacts again).
+            _apply_resize()
 
         # Bind and trigger once to sync initial size
         try:
-            canvas_widget.bind("<Configure>", _on_canvas_configure)
+            plot_holder.bind("<Configure>", _on_canvas_configure)
         except Exception:
             pass
         try:
