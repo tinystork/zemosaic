@@ -230,6 +230,36 @@ def _merge_small_groups(
     return [grp for idx, grp in enumerate(groups) if not merged_flags[idx]]
 
 
+ASTAP_CONCURRENCY_STATE = {"config": 1}
+
+
+def _read_astap_max_procs(default: Optional[int] = None) -> int:
+    """Return the ASTAP concurrency cap from environment variables."""
+    env_keys = (
+        "ZEMOSAIC_ASTAP_MAX_PROCS",
+        "ZEMO_ASTAP_MAX_PROCS",
+        "ZEMO_FILTER_ASTAP_MAX_PROCS",
+    )
+    for key in env_keys:
+        raw = os.environ.get(key)
+        if raw is None:
+            continue
+        raw_str = str(raw).strip()
+        if not raw_str:
+            continue
+        try:
+            value = int(float(raw_str))
+        except Exception:
+            continue
+        if value >= 1:
+            return value
+    fallback = default if default is not None else ASTAP_CONCURRENCY_STATE.get("config", 1)
+    try:
+        return max(1, int(fallback))
+    except Exception:
+        return 1
+
+
 def _circ_delta_deg(a: float, b: float) -> float:
     """Return the absolute circular delta (degrees) between two angles."""
 
@@ -575,6 +605,7 @@ def launch_filter_interface(
             "astap_default_search_radius": 0.0,
             "astap_default_downsample": 0,
             "astap_default_sensitivity": 100,
+            "astap_max_instances": 1,
             "auto_limit_frames_per_master_tile": True,
             "max_raw_per_master_tile": 0,
             "apply_master_tile_crop": False,
@@ -583,6 +614,12 @@ def launch_filter_interface(
         cfg: Dict[str, Any] | None = None
         solver_settings_payload: Dict[str, Any] = {}
         lang_code = "en"
+
+        def _coerce_positive_int(value: Any, fallback: int = 1) -> int:
+            try:
+                return max(1, int(float(value)))
+            except Exception:
+                return max(1, fallback)
 
         # Ensure project directory and parent are on sys.path to import project modules
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -638,12 +675,19 @@ def launch_filter_interface(
                 cfg = zconfig_module.load_config()
                 if isinstance(cfg, dict):
                     lang_code = str(cfg.get("language", lang_code))
+                    inst_cfg = cfg.get("astap_max_instances", cfg_defaults["astap_max_instances"])
+                    try:
+                        inst_cfg = int(float(inst_cfg))
+                    except Exception:
+                        inst_cfg = cfg_defaults["astap_max_instances"]
+                    inst_cfg = max(1, inst_cfg)
                     cfg_defaults.update({
                         "astap_executable_path": cfg.get("astap_executable_path", cfg_defaults["astap_executable_path"]),
                         "astap_data_directory_path": cfg.get("astap_data_directory_path", cfg_defaults["astap_data_directory_path"]),
                         "astap_default_search_radius": cfg.get("astap_default_search_radius", cfg_defaults["astap_default_search_radius"]),
                         "astap_default_downsample": cfg.get("astap_default_downsample", cfg_defaults["astap_default_downsample"]),
                         "astap_default_sensitivity": cfg.get("astap_default_sensitivity", cfg_defaults["astap_default_sensitivity"]),
+                        "astap_max_instances": inst_cfg,
                         "auto_limit_frames_per_master_tile": cfg.get("auto_limit_frames_per_master_tile", cfg_defaults["auto_limit_frames_per_master_tile"]),
                         "max_raw_per_master_tile": cfg.get("max_raw_per_master_tile", cfg_defaults["max_raw_per_master_tile"]),
                         "apply_master_tile_crop": cfg.get("apply_master_tile_crop", cfg_defaults["apply_master_tile_crop"]),
@@ -698,12 +742,6 @@ def launch_filter_interface(
             if sensitivity is not None:
                 cfg_defaults["astap_default_sensitivity"] = sensitivity
 
-        combined_solver_settings: Dict[str, Any] = {}
-        if solver_settings_payload:
-            combined_solver_settings.update(solver_settings_payload)
-        if isinstance(config_overrides, dict):
-            combined_solver_settings.update(config_overrides)
-
         if localizer_cls is not None:
             try:
                 localizer = localizer_cls(language_code=lang_code)
@@ -721,6 +759,21 @@ def launch_filter_interface(
                 cfg_defaults.update(config_overrides)
             except Exception:
                 pass
+
+        astap_instances_initial = _coerce_positive_int(
+            cfg_defaults.get("astap_max_instances", ASTAP_CONCURRENCY_STATE.get("config", 1)),
+            fallback=ASTAP_CONCURRENCY_STATE.get("config", 1),
+        )
+        cfg_defaults["astap_max_instances"] = astap_instances_initial
+        ASTAP_CONCURRENCY_STATE["config"] = astap_instances_initial
+        os.environ.setdefault("ZEMOSAIC_ASTAP_MAX_PROCS", str(astap_instances_initial))
+
+        combined_solver_settings: Dict[str, Any] = {}
+        if solver_settings_payload:
+            combined_solver_settings.update(solver_settings_payload)
+        if isinstance(config_overrides, dict):
+            combined_solver_settings.update(config_overrides)
+        combined_solver_settings.setdefault("astap_max_instances", astap_instances_initial)
 
         def _tr(key: str, default_text: Optional[str] = None, **kwargs) -> str:
             if localizer is not None:
@@ -783,6 +836,86 @@ def launch_filter_interface(
                 print(f"ERROR (Filter GUI): {msg}{detail}")
             return raw_items_input, False, None
 
+        SIP_COEFF_PREFIXES = ("A_", "B_", "AP_", "BP_")
+        SIP_META_KEYS = {"A_ORDER", "B_ORDER", "AP_ORDER", "BP_ORDER"}
+
+        def _header_contains_sip_terms(header_obj: Any) -> bool:
+            """Return True when the header exposes SIP distortion keywords."""
+
+            if header_obj is None:
+                return False
+            try:
+                keys_iter = list(header_obj.keys())  # type: ignore[arg-type]
+            except Exception:
+                try:
+                    keys_iter = list(header_obj)
+                except Exception:
+                    return False
+            for raw_key in keys_iter:
+                if raw_key is None:
+                    continue
+                key_upper = str(raw_key).strip().upper()
+                if not key_upper:
+                    continue
+                if key_upper in SIP_META_KEYS:
+                    return True
+                for prefix in SIP_COEFF_PREFIXES:
+                    if key_upper.startswith(prefix):
+                        return True
+            return False
+
+        def _ensure_sip_suffix_inplace(header_obj: Any):
+            """Append '-SIP' to CTYPE axes when SIP terms are present."""
+
+            if header_obj is None:
+                return None
+            try:
+                has_sip = _header_contains_sip_terms(header_obj)
+            except Exception:
+                has_sip = False
+            if not has_sip:
+                return header_obj
+
+            def _maybe_update(key: str) -> None:
+                try:
+                    value = header_obj[key]
+                except Exception:
+                    try:
+                        value = header_obj.get(key)
+                    except Exception:
+                        value = None
+                if not isinstance(value, str):
+                    return
+                cleaned = value.strip()
+                if not cleaned or cleaned.upper().endswith("-SIP"):
+                    return
+                new_value = f"{cleaned}-SIP"
+                try:
+                    header_obj[key] = new_value
+                except Exception:
+                    try:
+                        header_obj.set(key, new_value)
+                    except Exception:
+                        pass
+
+            _maybe_update("CTYPE1")
+            _maybe_update("CTYPE2")
+            return header_obj
+
+        def _build_wcs_from_header(header_obj):
+            """Instantiate a WCS while normalizing SIP metadata when needed."""
+
+            if header_obj is None:
+                return None
+            try:
+                hdr = _ensure_sip_suffix_inplace(header_obj)
+            except Exception:
+                hdr = header_obj
+            try:
+                return WCS(hdr, naxis=2, relax=True)
+            except Exception:
+                return None
+
         def _write_header_to_fits_local(file_path: str, header_obj) -> None:
             """Safely persist ``header_obj`` into ``file_path`` FITS header."""
 
@@ -816,12 +949,7 @@ def launch_filter_interface(
         def _has_celestial_wcs(header_obj) -> bool:
             """Return True when ``header_obj`` contains a valid celestial WCS."""
 
-            if header_obj is None:
-                return False
-            try:
-                wcs_obj = WCS(header_obj, naxis=2, relax=True)
-            except Exception:
-                return False
+            wcs_obj = _build_wcs_from_header(header_obj)
             return bool(getattr(wcs_obj, "is_celestial", False))
 
         def footprint_wh_deg(wcs_obj: Any) -> tuple[float, float]:
@@ -893,6 +1021,12 @@ def launch_filter_interface(
         extract_center_from_header_fn = getattr(astrometry_mod, 'extract_center_from_header', None) if astrometry_mod else None
         astap_fits_module = getattr(astrometry_mod, 'fits', None) if astrometry_mod else None
         astap_astropy_available = bool(getattr(astrometry_mod, 'ASTROPY_AVAILABLE_ASTROMETRY', False)) if astrometry_mod else False
+        astap_instances_current = ASTAP_CONCURRENCY_STATE.get("config", 1)
+        if astrometry_mod and hasattr(astrometry_mod, "set_astap_max_concurrent_instances"):
+            try:
+                astrometry_mod.set_astap_max_concurrent_instances(astap_instances_current)
+            except Exception as exc:
+                print(f"WARNING (Filter GUI): unable to apply ASTAP concurrency cap: {exc}")
         cluster_func = getattr(worker_mod, 'cluster_seestar_stacks_connected', None) if worker_mod else None
         autosplit_func = getattr(worker_mod, '_auto_split_groups', None) if worker_mod else None
         compute_dispersion_func = getattr(worker_mod, '_compute_max_angular_separation_deg', None) if worker_mod else None
@@ -1096,16 +1230,13 @@ def launch_filter_interface(
                 except Exception:
                     pass
 
-            try:
-                w = WCS(hdr, naxis=2, relax=True)
-                if w is not None and getattr(w, "is_celestial", False):
-                    payload["wcs"] = w
-                    _assign_pa_metadata(payload, w, payload.get("shape"))
-                    fp = _compute_footprint_from_wcs(w, payload.get("shape"))
-                    if fp:
-                        payload["footprint_radec"] = fp
-            except Exception:
-                pass
+            w = _build_wcs_from_header(hdr)
+            if w is not None and getattr(w, "is_celestial", False):
+                payload["wcs"] = w
+                _assign_pa_metadata(payload, w, payload.get("shape"))
+                fp = _compute_footprint_from_wcs(w, payload.get("shape"))
+                if fp:
+                    payload["footprint_radec"] = fp
 
             keep_keys = {
                 key: hdr.get(key)
@@ -1803,11 +1934,16 @@ def launch_filter_interface(
                 root = tk.Toplevel(parent_root)
                 root_is_toplevel = True
                 try:
-                    root.transient(parent_root)
+                    print("[FilterUI] parent_root detected -> using Toplevel (modal)")
                 except Exception:
                     pass
                 try:
-                    root.grab_set()  # modal
+                    root.transient(parent_root)
+                except Exception:
+                    pass
+                # Apply the modal grab immediately (behavior from main branch)
+                try:
+                    root.grab_set()
                 except Exception:
                     pass
             except Exception:
@@ -1831,6 +1967,7 @@ def launch_filter_interface(
             root.protocol("WM_DELETE_WINDOW", root.destroy)
         except Exception:
             pass
+
         # Top-level layout: left plot, right checkboxes/actions
         main = ttk.Frame(root)
         main.pack(fill=tk.BOTH, expand=True)
@@ -1860,6 +1997,70 @@ def launch_filter_interface(
         )
         analyse_btn.grid(row=0, column=0, padx=(0, 6))
         export_btn.grid(row=0, column=1)
+
+        max_button_state = {
+            "active": False,
+            "geometry": None,
+            "used_zoom_state": False,
+        }
+        max_button_normal = _tr("filter_btn_maximize", "Maximize")
+        max_button_restore = _tr("filter_btn_restore", "Restore")
+        max_button_text = tk.StringVar(master=root, value=max_button_normal)
+
+        def _toggle_maximize() -> None:
+            """Toggle between normal size and a maximized state."""
+
+            if not root.winfo_exists():
+                return
+
+            if max_button_state["active"]:
+                # Restore previous geometry/state
+                if max_button_state.get("used_zoom_state"):
+                    try:
+                        root.state("normal")
+                    except Exception:
+                        pass
+                geometry = max_button_state.get("geometry")
+                if isinstance(geometry, str) and geometry:
+                    try:
+                        root.geometry(geometry)
+                    except Exception:
+                        pass
+                max_button_state["active"] = False
+                max_button_state["used_zoom_state"] = False
+                max_button_text.set(max_button_normal)
+                return
+
+            # Save current geometry before maximizing
+            try:
+                max_button_state["geometry"] = root.geometry()
+            except Exception:
+                max_button_state["geometry"] = None
+            max_button_state["used_zoom_state"] = False
+
+            # Prefer native zoomed state when available (mostly on Windows)
+            try:
+                root.state("zoomed")
+                max_button_state["used_zoom_state"] = True
+            except Exception:
+                # Fallback: manually span the primary screen
+                try:
+                    screen_w = root.winfo_screenwidth()
+                    screen_h = root.winfo_screenheight()
+                    root.geometry(f"{screen_w}x{screen_h}+0+0")
+                except Exception:
+                    pass
+
+            max_button_state["active"] = True
+            max_button_text.set(max_button_restore)
+
+        maximise_btn = ttk.Button(
+            btn_bar,
+            textvariable=max_button_text,
+            command=_toggle_maximize,
+            width=10,
+        )
+        maximise_btn.grid(row=0, column=2, padx=(6, 0))
         total_initial_entries = len(items)
 
         if startup_status_messages:
@@ -1932,10 +2133,22 @@ def launch_filter_interface(
             except Exception:
                 pass
 
-        # Matplotlib figure
-        # Use constrained_layout to reduce internal padding and let the
-        # figure adapt to the available space.
-        fig = Figure(figsize=(7.0, 5.0), dpi=100, constrained_layout=True)
+        # Dedicated holder so the Matplotlib canvas can stretch to the full grid cell
+        plot_holder = ttk.Frame(main)
+        plot_holder.grid(row=1, column=0, sticky="nsew")
+        plot_holder.rowconfigure(0, weight=1)
+        plot_holder.columnconfigure(0, weight=1)
+
+        # Matplotlib figure (manual layout so the axes stay pinned to the bottom)
+        fig = Figure(figsize=(7.0, 5.0), dpi=100)
+        # Disable Matplotlib's automatic layout engines so that manual layout
+        # adjustments (subplots_adjust, aspect tweaks) remain effective during
+        # aggressive window resizes.
+        try:
+            if hasattr(fig, "set_layout_engine"):
+                fig.set_layout_engine(None)
+        except Exception:
+            pass
         ax = fig.add_subplot(111)
         ax.set_xlabel(_tr(
             "filter_axis_ra_deg",
@@ -1945,53 +2158,92 @@ def launch_filter_interface(
             "filter_axis_dec_deg",
             "Dec [deg]"
         ))
-        ax.set_aspect("equal", adjustable="datalim")
+        # Allow Matplotlib to stretch the axes freely so the preview actually
+        # fills the Tk frame (otherwise equal-aspect plots leave huge gutters).
+        # RA/Dec overlays are illustrative, not for precise measurements.
+        ax.set_aspect("auto")
         # For sky-like view, invert RA axis (optional)
         ax.invert_xaxis()
+        # Force the RA axis ticks to remain visible even when Matplotlib switches
+        # layouts/aspects during window resizes.
+        ax.tick_params(axis="x", which="both", top=False, bottom=True, labeltop=False, labelbottom=True, direction="out", pad=2)
+        ax.xaxis.set_label_position("bottom")
+        try:
+            ax.xaxis.set_ticks_position("bottom")
+        except Exception:
+            pass
+        try:
+            ax.spines["bottom"].set_visible(True)
+            ax.spines["top"].set_visible(False)
+        except Exception:
+            pass
 
-        canvas = FigureCanvasTkAgg(fig, master=main)
+        canvas = FigureCanvasTkAgg(fig, master=plot_holder)
         canvas_widget = canvas.get_tk_widget()
-        canvas_widget.grid(row=1, column=0, sticky="nsew")
+        canvas_widget.grid(row=0, column=0, sticky="nsew")
 
         # Make the Matplotlib figure follow the widget size to avoid
         # large empty borders around the plot.
         def _apply_resize():
             try:
-                w = max(50, int(canvas_widget.winfo_width()))
-                h = max(50, int(canvas_widget.winfo_height()))
+                w = max(50, int(plot_holder.winfo_width()))
+                h = max(50, int(plot_holder.winfo_height()))
+                # Resize figure using the actual screen DPI reported by Tk so the
+                # Matplotlib canvas matches the widget size even on HiDPI setups.
+                try:
+                    widget_dpi = float(canvas_widget.winfo_fpixels("1i"))
+                    if math.isfinite(widget_dpi) and widget_dpi > 4.0:
+                        fig.set_dpi(widget_dpi)
+                except Exception:
+                    widget_dpi = fig.dpi
                 # Resize figure in pixels -> inches
-                fig.set_size_inches(w / fig.dpi, h / fig.dpi, forward=True)
+                fig.set_size_inches(w / widget_dpi, h / widget_dpi, forward=True)
                 # Maximize axes area inside the figure when compatible with the
                 # active Matplotlib layout engine.  Newer Matplotlib versions
                 # (>=3.8) expose layout engines that reject ``subplots_adjust``
                 # calls.  Skip the adjustment in that case to avoid runtime
-                # warnings.
+                # warnings.  Use an adaptive bottom margin (in pixels) so the RA
+                # axis ticks stay visible without wasting a huge white band.
                 try:
                     layout_engine = None
                     if hasattr(fig, "get_layout_engine"):
                         layout_engine = fig.get_layout_engine()
                     if layout_engine is None:
-                        fig.subplots_adjust(left=0.06, right=0.995, bottom=0.08, top=0.98)
+                        # Resize tick labels when the canvas is squashed so the
+                        # axis still fits within a thin strip.
+                        tick_size = 10
+                        if h < 240:
+                            tick_size = max(7, min(10, int(h / 32)))
+                        ax.tick_params(axis="both", labelsize=tick_size)
+                        # Reserve only the pixels we truly need for the labels.
+                        required_margin_px = max(16.0, tick_size * 1.6)
+                        bottom_margin = min(0.08, max(0.0025, required_margin_px / max(h, 1)))
+                        left_margin = 0.045
+                        right_margin = 0.995
+                        top_margin = 0.995
+                        fig.subplots_adjust(left=left_margin, right=right_margin, bottom=bottom_margin, top=top_margin)
+                        # Explicitly pin the axes rectangle so Matplotlib cannot
+                        # reflow it (avoids the “axis jumps upward” effect seen
+                        # during window construction on some Tk themes).
+                        width = max(0.05, right_margin - left_margin)
+                        height = max(0.05, top_margin - bottom_margin)
+                        ax.set_position([left_margin, bottom_margin, width, height])
                 except Exception:
                     pass
+                # No special aspect re-application is required in auto mode.
                 canvas.draw_idle()
             except Exception:
                 pass
 
-        _resize_job = {"id": None}
-
         def _on_canvas_configure(_event=None):
-            # Throttle frequent resizes during interactive dragging
-            try:
-                if _resize_job["id"] is not None:
-                    canvas_widget.after_cancel(_resize_job["id"])  # type: ignore[arg-type]
-                _resize_job["id"] = canvas_widget.after(60, lambda: (_apply_resize(), _resize_job.update({"id": None})))
-            except Exception:
-                pass
+            # Apply immediately so the Matplotlib surface always matches the
+            # widget size (otherwise we sometimes see old figure sizes linger
+            # until the user interacts again).
+            _apply_resize()
 
         # Bind and trigger once to sync initial size
         try:
-            canvas_widget.bind("<Configure>", _on_canvas_configure)
+            plot_holder.bind("<Configure>", _on_canvas_configure)
         except Exception:
             pass
         try:
@@ -3046,7 +3298,13 @@ def launch_filter_interface(
                 pass
             _update_resolve_now_ui()
 
-            max_workers = min(8, max(2, (os.cpu_count() or 4)))
+            astap_max_procs = _read_astap_max_procs()
+            max_workers = astap_max_procs
+            _log_message(
+                f"[FilterGUI] ASTAP concurrency cap = {astap_max_procs} "
+                f"(ThreadPool max_workers={max_workers}; env keys: ZEMOSAIC_ASTAP_MAX_PROCS/ZEMO_ASTAP_MAX_PROCS/ZEMO_FILTER_ASTAP_MAX_PROCS)",
+                level="INFO",
+            )
             try:
                 executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="FilterWCS")
             except Exception as exc:
@@ -3063,6 +3321,8 @@ def launch_filter_interface(
                 _log_message(f"Failed to start WCS resolve threads: {exc}", level="ERROR")
                 return
             resolve_now_state["executor"] = executor
+
+            astap_slot_semaphore = threading.BoundedSemaphore(value=astap_max_procs)
 
             code_pattern = re.compile(r"code\\s+(-?\\d+)", re.IGNORECASE)
 
@@ -3088,14 +3348,12 @@ def launch_filter_interface(
                         result["error"] = f"header load failed: {exc}"
                         result["duration"] = time.monotonic() - start_ts
                         return result
-                if _has_celestial_wcs(header_payload):
+                existing_wcs = _build_wcs_from_header(header_payload)
+                if existing_wcs is not None and getattr(existing_wcs, "is_celestial", False):
                     result["ok"] = True
                     result["skipped"] = True
-                    try:
-                        result["wcs"] = WCS(header_payload, naxis=2, relax=True)
-                        _assign_pa_metadata(result, result["wcs"], result.get("shape"))
-                    except Exception:
-                        pass
+                    result["wcs"] = existing_wcs
+                    _assign_pa_metadata(result, existing_wcs, result.get("shape"))
                     result["header"] = header_payload
                     result["return_code"] = 0
                     result["duration"] = time.monotonic() - start_ts
@@ -3113,24 +3371,36 @@ def launch_filter_interface(
                         except Exception:
                             progress_state["return_code"] = None
 
+                target_name = "<unknown>"
+                if path_val:
+                    try:
+                        target_name = os.path.basename(str(path_val))
+                    except Exception:
+                        target_name = str(path_val)
+
+                _log_message(f"[FilterGUI] ASTAP wait slot -> {target_name}", level="DEBUG")
                 try:
-                    wcs_obj = solve_with_astap(
-                        path_val,
-                        header_payload,
-                        astap_exe_path,
-                        astap_data_dir,
-                        search_radius_deg=search_radius,
-                        downsample_factor=downsample_val,
-                        sensitivity=sensitivity_val,
-                        timeout_sec=timeout_astap,
-                        update_original_header_in_place=True,
-                        progress_callback=_progress_cb,
-                    )
+                    with astap_slot_semaphore:
+                        _log_message(f"[FilterGUI] ASTAP start -> {target_name}", level="DEBUG")
+                        wcs_obj = solve_with_astap(
+                            path_val,
+                            header_payload,
+                            astap_exe_path,
+                            astap_data_dir,
+                            search_radius_deg=search_radius,
+                            downsample_factor=downsample_val,
+                            sensitivity=sensitivity_val,
+                            timeout_sec=timeout_astap,
+                            update_original_header_in_place=True,
+                            progress_callback=_progress_cb,
+                        )
                 except Exception as exc:
                     result["error"] = str(exc)
                     result["return_code"] = progress_state.get("return_code")
                     result["duration"] = time.monotonic() - start_ts
                     return result
+                finally:
+                    _log_message(f"[FilterGUI] ASTAP done -> {target_name}", level="DEBUG")
 
                 result["return_code"] = progress_state.get("return_code")
                 result["duration"] = time.monotonic() - start_ts
@@ -3692,6 +3962,77 @@ def launch_filter_interface(
         except Exception as e:
             _log_message(f"[FilterUI] Paint-from-log button failed: {e}", level="WARN")
 
+        astap_instances_var = tk.StringVar(master=root, value=str(ASTAP_CONCURRENCY_STATE.get("config", 1)))
+        astap_instances_cap = max(1, (os.cpu_count() or 2) // 2)
+        astap_instance_values = [str(i) for i in range(1, astap_instances_cap + 1)]
+        if astap_instances_var.get() not in astap_instance_values:
+            astap_instance_values.append(astap_instances_var.get())
+        try:
+            astap_instance_values = sorted(set(astap_instance_values), key=lambda v: int(float(v)))
+        except Exception:
+            pass
+
+        def _apply_astap_instance_choice(*_args: Any, persist: bool = True) -> None:
+            raw_value = astap_instances_var.get()
+            try:
+                parsed = int(float(raw_value))
+            except Exception:
+                parsed = ASTAP_CONCURRENCY_STATE.get("config", 1)
+            parsed = max(1, parsed)
+
+            if parsed > 1:
+                try:
+                    if messagebox.askokcancel(
+                        _tr("filter_astap_multi_warning_title", "ASTAP Concurrency Warning"),
+                        _tr(
+                            "filter_astap_multi_warning_message",
+                            "Running more than one ASTAP instance can trigger the \"Access violation\" popup you saw earlier. Only continue if you are ready to dismiss those warnings and understand this mode is not officially supported.",
+                        ),
+                        icon="warning",
+                        default=messagebox.CANCEL,
+                    ) is False:
+                        astap_instances_var.set(str(ASTAP_CONCURRENCY_STATE.get("config", 1)))
+                        return
+                except Exception:
+                    pass
+
+            astap_instances_var.set(str(parsed))
+            ASTAP_CONCURRENCY_STATE["config"] = parsed
+            cfg_defaults["astap_max_instances"] = parsed
+            combined_solver_settings["astap_max_instances"] = parsed
+            if isinstance(overrides_state, dict):
+                overrides_state["astap_max_instances"] = parsed
+            os.environ["ZEMOSAIC_ASTAP_MAX_PROCS"] = str(parsed)
+            if astrometry_mod and hasattr(astrometry_mod, "set_astap_max_concurrent_instances"):
+                try:
+                    astrometry_mod.set_astap_max_concurrent_instances(parsed)
+                except Exception as exc:
+                    _log_message(f"[FilterUI] ASTAP concurrency update failed: {exc}", level="WARN")
+            if persist and zconfig_module and hasattr(zconfig_module, "save_config") and isinstance(cfg, dict):
+                cfg["astap_max_instances"] = parsed
+                try:
+                    zconfig_module.save_config(cfg)
+                except Exception as exc:
+                    _log_message(f"[FilterUI] Failed to save ASTAP max instances: {exc}", level="WARN")
+
+        try:
+            ttk.Label(
+                operations,
+                text=_tr("filter_label_astap_instances", "Max ASTAP instances"),
+            ).grid(row=2, column=0, padx=4, pady=(6, 0), sticky="w")
+            instances_combo = ttk.Combobox(
+                operations,
+                state="readonly",
+                values=astap_instance_values,
+                width=6,
+                textvariable=astap_instances_var,
+                justify="center",
+            )
+            instances_combo.grid(row=2, column=1, padx=4, pady=(6, 0), sticky="w")
+            instances_combo.bind("<<ComboboxSelected>>", _apply_astap_instance_choice)
+        except Exception as e:
+            _log_message(f"[FilterUI] ASTAP instances selector failed: {e}", level="WARN")
+
         def _show_sizes_details():
             try:
                 win = tk.Toplevel(root)
@@ -3733,7 +4074,7 @@ def launch_filter_interface(
                 ),
                 variable=coverage_first_var,
             )
-            coverage_chk.grid(row=2, column=0, columnspan=3, padx=4, pady=(6, 0), sticky="w")
+            coverage_chk.grid(row=3, column=0, columnspan=3, padx=4, pady=(6, 0), sticky="w")
         except Exception as e:
             _log_message(f"[FilterUI] Coverage-first checkbox failed: {e}", level="WARN")
 
@@ -3743,7 +4084,7 @@ def launch_filter_interface(
                 operations,
                 text=_tr("ui_overcap_allowance_pct", "Over-cap allowance (%)"),
             )
-            overcap_label.grid(row=3, column=0, padx=4, pady=(2, 0), sticky="w")
+            overcap_label.grid(row=4, column=0, padx=4, pady=(2, 0), sticky="w")
             overcap_spin = ttk.Spinbox(
                 operations,
                 from_=0,
@@ -3753,7 +4094,7 @@ def launch_filter_interface(
                 width=5,
                 justify="center",
             )
-            overcap_spin.grid(row=3, column=1, padx=4, pady=(2, 0), sticky="w")
+            overcap_spin.grid(row=4, column=1, padx=4, pady=(2, 0), sticky="w")
         except Exception as e:
             _log_message(f"[FilterUI] Over-cap spinbox failed: {e}", level="WARN")
 
@@ -3763,7 +4104,7 @@ def launch_filter_interface(
                 text=_tr("ui_auto_angle_split", "Auto split by orientation"),
                 variable=auto_angle_split_var,
             )
-            auto_angle_chk.grid(row=4, column=0, columnspan=3, padx=4, pady=(6, 0), sticky="w")
+            auto_angle_chk.grid(row=5, column=0, columnspan=3, padx=4, pady=(6, 0), sticky="w")
         except Exception as e:
             _log_message(f"[FilterUI] Auto-angle checkbox failed: {e}", level="WARN")
             auto_angle_chk = None
@@ -3773,7 +4114,7 @@ def launch_filter_interface(
                 operations,
                 text=_tr("ui_angle_split_threshold", "Orientation split (deg)"),
             )
-            angle_label.grid(row=5, column=0, padx=4, pady=(2, 0), sticky="w")
+            angle_label.grid(row=6, column=0, padx=4, pady=(2, 0), sticky="w")
             angle_spin = ttk.Spinbox(
                 operations,
                 from_=0.0,
@@ -3784,7 +4125,7 @@ def launch_filter_interface(
                 justify="center",
                 format="%.1f",
             )
-            angle_spin.grid(row=5, column=1, padx=4, pady=(2, 0), sticky="w")
+            angle_spin.grid(row=6, column=1, padx=4, pady=(2, 0), sticky="w")
         except Exception as e:
             _log_message(f"[FilterUI] Angle split spinbox failed: {e}", level="WARN")
 
@@ -3842,8 +4183,29 @@ def launch_filter_interface(
         except Exception as e:
             _log_message(f"[FilterUI] Operations availability checks failed: {e}", level="WARN")
 
+        def _warn_astap_multi_instance() -> bool:
+            """Return True if the user accepts multi-ASTAP risk."""
+            current = ASTAP_CONCURRENCY_STATE.get("config", 1)
+            if current <= 1:
+                return True
+            try:
+                decision = messagebox.askokcancel(
+                    _tr("filter_astap_multi_warning_title", "ASTAP Concurrency Warning"),
+                    _tr(
+                        "filter_astap_multi_warning_message",
+                        "Running more than one ASTAP instance can trigger the \"Access violation\" popup you saw earlier. Only continue if you are ready to dismiss those warnings and understand this mode is not officially supported.",
+                    ),
+                    icon="warning",
+                    default=messagebox.CANCEL,
+                )
+                return bool(decision)
+            except Exception:
+                return True
+
         def _resolve_missing_wcs_inplace() -> None:
             if resolve_state["running"]:
+                return
+            if not _warn_astap_multi_instance():
                 return
 
             astap_enabled = bool(astap_available and solve_with_astap is not None)
@@ -3975,6 +4337,17 @@ def launch_filter_interface(
             astrometry_direct = getattr(astrometry_mod, "solve_with_astrometry_net", None) if astrometry_mod else None
             ansvr_direct = getattr(astrometry_mod, "solve_with_ansvr", None) if astrometry_mod else None
 
+            astap_slot_semaphore: Optional[threading.BoundedSemaphore] = None
+            astap_slot_cap: Optional[int] = None
+            if astap_enabled:
+                astap_slot_cap = _read_astap_max_procs()
+                astap_slot_semaphore = threading.BoundedSemaphore(value=astap_slot_cap)
+                _log_message(
+                    "[FilterUI] ASTAP concurrent solves capped at "
+                    f"{astap_slot_cap} (env keys: ZEMOSAIC_ASTAP_MAX_PROCS/ZEMO_ASTAP_MAX_PROCS/ZEMO_FILTER_ASTAP_MAX_PROCS).",
+                    level="DEBUG",
+                )
+
             def _log_solver_event(key: str, default: str, level: str, **fmt: Any) -> None:
                 try:
                     message = _tr(key, default, **fmt)
@@ -4091,12 +4464,9 @@ def launch_filter_interface(
                             result["corners"] = footprint_pts
                         return result
 
-                    try:
-                        existing = WCS(header_obj, naxis=2, relax=True)
-                        if existing is not None and getattr(existing, "is_celestial", False):
-                            return _on_success("Header", existing)
-                    except Exception:
-                        pass
+                    existing = _build_wcs_from_header(header_obj)
+                    if existing is not None and getattr(existing, "is_celestial", False):
+                        return _on_success("Header", existing)
 
                     last_error: Optional[str] = None
 
@@ -4112,19 +4482,37 @@ def launch_filter_interface(
                             solver="ASTAP",
                             name=file_name,
                         )
+                        astap_wcs = None
                         try:
-                            astap_wcs = solve_with_astap(
-                                path,
-                                header_obj,
-                                astap_exe_path,
-                                astap_data_dir,
-                                search_radius_deg=srch_radius,
-                                downsample_factor=downsample_val,
-                                sensitivity=sensitivity_val,
-                                timeout_sec=astap_timeout_sec,
-                                update_original_header_in_place=write_inplace,
-                                progress_callback=_progress_callback,
-                            )
+                            if astap_slot_semaphore:
+                                _log_message(f"[FilterUI] ASTAP wait slot -> {file_name}", level="DEBUG_DETAIL")
+                                with astap_slot_semaphore:
+                                    _log_message(f"[FilterUI] ASTAP start -> {file_name}", level="DEBUG_DETAIL")
+                                    astap_wcs = solve_with_astap(
+                                        path,
+                                        header_obj,
+                                        astap_exe_path,
+                                        astap_data_dir,
+                                        search_radius_deg=srch_radius,
+                                        downsample_factor=downsample_val,
+                                        sensitivity=sensitivity_val,
+                                        timeout_sec=astap_timeout_sec,
+                                        update_original_header_in_place=write_inplace,
+                                        progress_callback=_progress_callback,
+                                    )
+                            else:
+                                astap_wcs = solve_with_astap(
+                                    path,
+                                    header_obj,
+                                    astap_exe_path,
+                                    astap_data_dir,
+                                    search_radius_deg=srch_radius,
+                                    downsample_factor=downsample_val,
+                                    sensitivity=sensitivity_val,
+                                    timeout_sec=astap_timeout_sec,
+                                    update_original_header_in_place=write_inplace,
+                                    progress_callback=_progress_callback,
+                                )
                         except Exception as exc:
                             last_error = str(exc)
                             _log_solver_event(
@@ -4146,6 +4534,9 @@ def launch_filter_interface(
                                 name=file_name,
                                 err="no solution",
                             )
+                        finally:
+                            if astap_slot_semaphore:
+                                _log_message(f"[FilterUI] ASTAP done -> {file_name}", level="DEBUG_DETAIL")
 
                     if wcs_async_state.get("stop"):
                         result["error"] = "cancelled"
@@ -4977,63 +5368,36 @@ def launch_filter_interface(
             bottom.pack(fill=tk.X, expand=False)
         except Exception:
             bottom.pack(fill=tk.X)
-        try:
-            right.update_idletasks()
-            _dbg("Right panel constructed; awaiting controls visibility check…")
-        except Exception:
-            pass
-
-        def _ensure_controls_visible_later():
-            try:
-                # If controls area didn't map yet (themes/geometry lag), give
-                # those rows a larger minimum size and try again shortly.
-                if not bottom.winfo_ismapped() or bottom.winfo_height() < 5:
-                    try:
-                        right.rowconfigure(3, minsize=180)
-                    except Exception:
-                        pass
-                    try:
-                        _dbg("Controls not visible yet; increasing row minsize and retrying…")
-                    except Exception:
-                        pass
-                    root.after(150, _ensure_controls_visible_later)
-                else:
-                    try:
-                        _dbg(f"Controls visible: operations={operations.winfo_height()} actions={actions.winfo_height()} bottom={bottom.winfo_height()}")
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-        try:
-            root.after(200, _ensure_controls_visible_later)
-        except Exception as e:
-            _log_message(f"[FilterUI] Scheduling visibility check failed: {e}", level="WARN")
-
-        # Keep controls row visible across resizes or heavy redraws (ASTAP/zoom)
         def _enforce_right_grid(_event: Any | None = None) -> None:
             try:
-                # Ensure the scrollable list (row=2) is the only stretchable row
                 right.rowconfigure(0, weight=0)
                 right.rowconfigure(1, weight=0)
                 right.rowconfigure(2, weight=1)
-                # Maintain a sane minimum height for the bottom controls
                 desired = 0
                 try:
-                    desired = int(operations.winfo_reqheight()) + int(actions.winfo_reqheight()) + int(bottom.winfo_reqheight()) + 12
+                    desired = (
+                        int(operations.winfo_reqheight())
+                        + int(actions.winfo_reqheight())
+                        + int(bottom.winfo_reqheight())
+                        + 12
+                    )
                 except Exception:
                     desired = 180
                 right.rowconfigure(3, weight=0, minsize=max(160, desired))
             except Exception:
-                # Last resort: at least ensure row 3 doesn't collapse fully
                 try:
                     right.rowconfigure(3, minsize=180)
                 except Exception:
                     pass
 
         try:
+            right.update_idletasks()
+            _enforce_right_grid()
+        except Exception:
+            pass
+
+        try:
             right.bind("<Configure>", _enforce_right_grid)
-            root.after_idle(_enforce_right_grid)
         except Exception:
             pass
         result: dict[str, Any] = {
@@ -6780,6 +7144,8 @@ def launch_filter_interface(
             root.destroy()
         root.protocol("WM_DELETE_WINDOW", on_close)
 
+        # (Modal grab already applied when creating the Toplevel.)
+
         # Start modal loop (use wait_window for Toplevel)
         try:
             if root_is_toplevel:
@@ -6999,4 +7365,3 @@ if __name__ == "__main__":
         print(f"[FilterUI] Unhandled error: {_exc}")
         import traceback as _tb
         print(_tb.format_exc())
-

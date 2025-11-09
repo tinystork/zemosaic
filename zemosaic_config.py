@@ -24,6 +24,7 @@ DEFAULT_CONFIG = {
     "astap_default_search_radius": 3.0, 
     "astap_default_downsample": 2, 
     "astap_default_sensitivity": 100,
+    "astap_max_instances": 1,
     "language": "en",
     "num_processing_workers": -1, # -1 pour auto
     "stacking_normalize_method": "linear_fit",
@@ -48,6 +49,9 @@ DEFAULT_CONFIG = {
     "inter_master_memmap_policy": "auto",
     "inter_master_local_scale": "final",
     "inter_master_max_group": 64,
+    "inter_master_photometry_intragroup": True,
+    "inter_master_photometry_intersuper": True,
+    "inter_master_photometry_clip_sigma": 3.0,
     "two_pass_coverage_renorm": False,
     "two_pass_cov_sigma_px": 50,
     "two_pass_cov_gain_clip": [0.85, 1.18],
@@ -103,11 +107,25 @@ DEFAULT_CONFIG = {
     "enable_early_filter": True,
     # --- CLES POUR LE ROGNAGE DES MASTER TUILES ---
     "apply_master_tile_crop": True,       # Désactivé par défaut
-    "master_tile_crop_percent": 5.0,     # Pourcentage par côté si activé (ex: 10%)
+    "master_tile_crop_percent": 3.0,     # Pourcentage par côté si activé (ex: 10%)
     "quality_crop_enabled": False,
     "quality_crop_band_px": 32,
     "quality_crop_k_sigma": 2.0,
     "quality_crop_margin_px": 8,
+    # --- Master Tile Quality Gate (ZeQualityMT) ---
+    "quality_gate_enabled": False,
+    "quality_gate_threshold": 0.48,
+    "quality_gate_edge_band_px": 64,
+    "quality_gate_k_sigma": 2.5,
+    "quality_gate_erode_px": 3,
+    "quality_gate_move_rejects": True,
+    # --- Alt-Az cleanup (lecropper altZ) ---
+    "altaz_cleanup_enabled": False,
+    "altaz_margin_percent": 5.0,   # UI: "AltAz margin %"
+    "altaz_decay": 0.15,           # UI: "AltAz decay"
+    "altaz_nanize": True,          # UI: "Alt-Az → NaN"
+    # --- Qualité avancée ---
+    "quality_crop_min_run": 2,     # UI: "min run"
     "crop_follow_signal": True,
     # --- FIN CLES POUR LE ROGNAGE ---
 }
@@ -510,3 +528,12 @@ def get_astap_default_downsample():
 def get_astap_default_sensitivity():
     config = load_config()
     return config.get("astap_default_sensitivity", DEFAULT_CONFIG["astap_default_sensitivity"])
+
+def get_astap_max_instances():
+    """Return the configured ASTAP concurrency limit (>=1)."""
+    config = load_config()
+    value = config.get("astap_max_instances", DEFAULT_CONFIG.get("astap_max_instances", 1))
+    try:
+        return max(1, int(value))
+    except Exception:
+        return max(1, DEFAULT_CONFIG.get("astap_max_instances", 1))

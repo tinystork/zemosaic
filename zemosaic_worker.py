@@ -55,6 +55,7 @@ import gc
 import logging
 import inspect  # Pas utilisé directement ici, mais peut être utile pour des introspections futures
 import math
+import hashlib
 from datetime import datetime
 import psutil
 import tempfile
@@ -68,15 +69,34 @@ import importlib.util
 from pathlib import Path
 from threading import Lock
 from dataclasses import dataclass
-from typing import Callable, Any, Iterable
+from typing import Callable, Any, Iterable, Optional
 from types import SimpleNamespace
 
 import numpy as np
 
 
+
+try:
+    import lecropper  # noqa: F401
+
+    _LECROPPER_AVAILABLE = True
+except Exception:
+    lecropper = None
+    _LECROPPER_AVAILABLE = False
+
+
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, FIRST_COMPLETED, as_completed
 # BrokenProcessPool moved under concurrent.futures.process in modern Python
 from concurrent.futures.process import BrokenProcessPool
+
+# ZeQualityMT (quality gate for Master Tiles)
+try:
+    from zequalityMT import quality_metrics as _zq_quality_metrics
+except Exception:
+    _zq_quality_metrics = None
+
+_ZEQUALITY_WARNING_EMITTED = False
+_ZEQUALITY_WARNING_LOCK = threading.Lock()
 
 try:
     from zemosaic_utils import EXCLUDED_DIRS, is_path_excluded
@@ -200,6 +220,169 @@ def _move_to_unaligned_safe(
             pass
         return "failed", dst
 
+
+def _apply_lecropper_pipeline(arr: np.ndarray | None, cfg: dict | None) -> np.ndarray | None:
+    """Apply quality crop + Alt-Az cleanup if the new lecropper is available."""
+
+    if not (_LECROPPER_AVAILABLE and isinstance(arr, np.ndarray) and arr.size):
+        return arr
+
+    cfg = cfg or {}
+    try:
+        q_enabled = bool(cfg.get("quality_crop_enabled", False))
+    except Exception:
+        q_enabled = False
+    try:
+        band_px = int(cfg.get("quality_crop_band_px", 32))
+    except Exception:
+        band_px = 32
+    try:
+        k_sigma = float(cfg.get("quality_crop_k_sigma", 2.0))
+    except Exception:
+        k_sigma = 2.0
+    try:
+        margin_px = int(cfg.get("quality_crop_margin_px", 8))
+    except Exception:
+        margin_px = 8
+    try:
+        min_run = int(cfg.get("quality_crop_min_run", 2))
+    except Exception:
+        min_run = 2
+
+    try:
+        az_enabled = bool(cfg.get("altaz_cleanup_enabled", False))
+    except Exception:
+        az_enabled = False
+    try:
+        az_margin = float(cfg.get("altaz_margin_percent", 5.0))
+    except Exception:
+        az_margin = 5.0
+    try:
+        az_decay = float(cfg.get("altaz_decay", 0.15))
+    except Exception:
+        az_decay = 0.15
+    try:
+        az_nanize = bool(cfg.get("altaz_nanize", True))
+    except Exception:
+        az_nanize = True
+
+    out = arr
+    try:
+        if q_enabled and hasattr(lecropper, "quality_crop"):
+            out = lecropper.quality_crop(
+                out,
+                band_px=band_px,
+                k_sigma=k_sigma,
+                margin_px=margin_px,
+                min_run=min_run,
+            )
+
+        if az_enabled:
+            if hasattr(lecropper, "altZ_cleanup"):
+                out = lecropper.altZ_cleanup(
+                    out,
+                    margin_percent=az_margin,
+                    decay=az_decay,
+                    nanize=az_nanize,
+                )
+            elif hasattr(lecropper, "apply_altaz_cleanup"):
+                out = lecropper.apply_altaz_cleanup(
+                    out,
+                    margin_percent=az_margin,
+                    decay=az_decay,
+                    nanize=az_nanize,
+                )
+    except Exception as exc:
+        try:
+            logger.warning("lecropper pipeline skipped (err=%s)", exc)
+        except Exception:
+            pass
+        return arr
+
+    return out
+
+
+_MASTER_TILE_ID_LOCK = Lock()
+_MASTER_TILE_ID_REGISTRY: dict[str, str] = {}
+
+
+def _normalize_tile_path(path: str | os.PathLike | None) -> str | None:
+    """Return a stable absolute path for registry keys."""
+
+    if path is None:
+        return None
+    try:
+        return os.path.abspath(os.path.realpath(str(path)))
+    except Exception:
+        try:
+            return os.path.abspath(str(path))
+        except Exception:
+            return str(path)
+
+
+def _register_master_tile_identity(path: str | os.PathLike | None, tile_id: str | int | None) -> None:
+    """Remember the logical ``tile_id`` associated with a saved tile path."""
+
+    if path is None or tile_id is None:
+        return
+    normalized = _normalize_tile_path(path)
+    if not normalized:
+        return
+    with _MASTER_TILE_ID_LOCK:
+        _MASTER_TILE_ID_REGISTRY[normalized] = str(tile_id)
+
+
+def _lookup_master_tile_identity(path: str | os.PathLike | None) -> str | None:
+    """Fetch a previously registered ``tile_id`` for ``path`` if available."""
+
+    if path is None:
+        return None
+    normalized = _normalize_tile_path(path)
+    if not normalized:
+        return None
+    with _MASTER_TILE_ID_LOCK:
+        return _MASTER_TILE_ID_REGISTRY.get(normalized)
+
+
+def _resolve_tile_identifier(
+    path: str | os.PathLike | None,
+    header: Any | None,
+    fallback_idx: int | None,
+) -> str:
+    """Resolve or synthesize a deterministic ``tile_id`` for a tile entry."""
+
+    registered = _lookup_master_tile_identity(path)
+    if registered:
+        return registered
+
+    candidate = None
+    if header is not None:
+        try:
+            if "ZMT_SUPID" in header:
+                candidate = str(header["ZMT_SUPID"])
+        except Exception:
+            candidate = None
+        if candidate is None:
+            try:
+                if "ZMT_ID" in header:
+                    candidate = f"tile:{int(header['ZMT_ID'])}"
+            except Exception:
+                try:
+                    candidate = str(header.get("ZMT_ID")) if header.get("ZMT_ID") is not None else None
+                except Exception:
+                    candidate = None
+
+    if candidate is None and fallback_idx is not None:
+        candidate = f"tile:{int(fallback_idx):04d}"
+    elif candidate is None and path:
+        base = os.path.splitext(os.path.basename(str(path)))[0]
+        candidate = f"path:{base}"
+    elif candidate is None:
+        candidate = "tile:unknown"
+
+    _register_master_tile_identity(path, candidate)
+    return candidate
+
 # Nombre maximum de tentatives d'alignement avant abandon définitif
 MAX_ALIGNMENT_RETRY_ATTEMPTS = 3
 
@@ -258,6 +441,116 @@ def _ensure_hwc_master_tile(
         raise ValueError(msg)
 
     return np.asarray(arr, dtype=np.float32, order="C")
+
+
+def _zequality_accept_override(metrics: dict[str, float], threshold: float) -> bool:
+    """Replicates ZeQualityMT's lenient acceptance rules."""
+    if (
+        metrics.get("CC", 0.0) >= 0.70
+        and metrics.get("CER", 0.0) < 0.35
+        and metrics.get("ED", 0.0) < 1.2
+    ):
+        return True
+    if (
+        metrics.get("CC", 0.0) >= 0.78
+        and metrics.get("SC", 0.0) < 0.28
+        and metrics.get("NBR", 0.0) < 0.10
+    ):
+        return True
+    if (
+        metrics.get("TRL", 0.0) > 0.30
+        and metrics.get("CER", 0.0) < 0.40
+        and metrics.get("SC", 0.0) < 0.40
+    ):
+        return True
+    return False
+
+
+def _prepare_quality_gate_array(arr: np.ndarray) -> np.ndarray:
+    """Ensure ZeQualityMT receives an ``H x W x C`` float32 array with <=3 channels."""
+    if arr is None:
+        raise ValueError("Master tile array is None")
+    data = np.asarray(arr, dtype=np.float32)
+    if data.ndim == 2:
+        data = data[..., np.newaxis]
+    if data.ndim != 3:
+        raise ValueError(f"Unsupported master tile dimensionality for quality gate: {data.shape}")
+    if data.shape[0] in (1, 3) and data.shape[-1] not in (1, 3):
+        data = np.moveaxis(data, 0, -1)
+    if data.shape[-1] == 1:
+        data = np.repeat(data, 3, axis=-1)
+    elif data.shape[-1] > 3:
+        data = data[..., :3]
+    return np.ascontiguousarray(data, dtype=np.float32)
+
+
+def _evaluate_quality_gate_metrics(
+    tile_id: int,
+    arr: np.ndarray,
+    *,
+    enabled: bool,
+    threshold: float,
+    edge_band: int,
+    k_sigma: float,
+    erode_px: int,
+    pcb: Optional[Callable] = None,
+) -> Optional[dict[str, Any]]:
+    """Compute ZeQualityMT metrics for a stacked tile if enabled and available."""
+    if not enabled:
+        return None
+    if _zq_quality_metrics is None:
+        global _ZEQUALITY_WARNING_EMITTED
+        emit = False
+        with _ZEQUALITY_WARNING_LOCK:
+            if not _ZEQUALITY_WARNING_EMITTED:
+                _ZEQUALITY_WARNING_EMITTED = True
+                emit = True
+        if emit:
+            msg = "module_missing"
+            if pcb:
+                pcb("mt_quality_gate_unavailable", prog=None, lvl="WARN", tile_id=int(tile_id), error=msg)
+            logger.warning("[ZeQualityMT] quality gate unavailable: zequalityMT module missing")
+        return None
+    try:
+        arr_for_metrics = _prepare_quality_gate_array(arr)
+        metrics = _zq_quality_metrics(
+            arr_for_metrics,
+            edge_band=max(8, int(edge_band)),
+            k_sigma=max(0.0, float(k_sigma)),
+            erode_px=max(0, int(erode_px)),
+        )
+        score = float(metrics.get("score", float("nan")))
+        accepted = (score <= float(threshold)) or _zequality_accept_override(metrics, float(threshold))
+        return {
+            "metrics": metrics,
+            "score": score,
+            "accepted": bool(accepted),
+        }
+    except Exception as exc:
+        if pcb:
+            pcb("mt_quality_gate_unavailable", prog=None, lvl="WARN", tile_id=int(tile_id), error=str(exc))
+        logger.warning("[ZeQualityMT] quality gate failed for tile %s: %s", tile_id, exc)
+        return None
+
+
+def _move_quality_reject_file(src_path: str) -> tuple[str, bool]:
+    """Move a rejected master tile alongside its siblings for review."""
+    try:
+        base_dir = os.path.dirname(src_path) or "."
+        rej_dir = os.path.join(base_dir, "rejected_by_quality")
+        os.makedirs(rej_dir, exist_ok=True)
+        candidate = os.path.join(rej_dir, os.path.basename(src_path))
+        if os.path.exists(candidate):
+            base, ext = os.path.splitext(candidate)
+            idx = 1
+            while os.path.exists(f"{base}_{idx}{ext}"):
+                idx += 1
+            candidate = f"{base}_{idx}{ext}"
+        shutil.move(src_path, candidate)
+        return candidate, True
+    except Exception as exc:
+        logger.warning("Failed to move rejected master tile %s: %s", src_path, exc)
+        return src_path, False
 
 
 @dataclass
@@ -450,6 +743,47 @@ def _select_affine_log_indices(
     return selected
 
 
+def _build_affine_lookup_for_tiles(
+    tiles: list[dict[str, Any]],
+    affine_list: list[tuple[float, float]] | None,
+) -> tuple[dict[str, tuple[float, float]] | None, str | None]:
+    """Map sanitized affine corrections to ``tile_id`` entries."""
+
+    if not tiles or not affine_list:
+        return None, None
+
+    expected = len(tiles)
+    if len(affine_list) != expected:
+        return None, f"expected={expected}, got={len(affine_list)}"
+
+    lookup: dict[str, tuple[float, float]] = {}
+    missing: list[str] = []
+    for tile_entry, affine in zip(tiles, affine_list):
+        tile_id = tile_entry.get("tile_id") if isinstance(tile_entry, dict) else None
+        if not tile_id:
+            missing.append(f"idx{len(lookup)}")
+            continue
+        if tile_id in lookup:
+            missing.append(f"dup:{tile_id}")
+            continue
+        try:
+            gain_val = float(affine[0])
+        except Exception:
+            gain_val = 1.0
+        try:
+            offset_val = float(affine[1])
+        except Exception:
+            offset_val = 0.0
+        lookup[str(tile_id)] = (gain_val, offset_val)
+
+    if missing:
+        preview = ", ".join(missing[:5])
+        detail = f"missing_ids={preview}"
+        return None, detail
+
+    return lookup or None, None
+
+
 def _compose_global_anchor_shift(
     affine_list: list[tuple[float, float]] | None,
     total_tiles: int,
@@ -514,6 +848,7 @@ class _InterMasterTile:
     wcs: Any
     shape_hw: tuple[int, int]
     sky_corners: Any | None = None
+    bbox_bounds: tuple[float, float, float, float] | None = None
 
 
 def _phase45_resolve_tile_shape(path: str | None, tile_wcs: Any) -> tuple[int, int] | None:
@@ -565,6 +900,74 @@ def _phase45_tile_corners(tile: _InterMasterTile) -> Any | None:
         return sky
     except Exception:
         return None
+
+
+def _phase45_tile_bbox(tile: _InterMasterTile) -> tuple[float, float, float, float] | None:
+    if tile.bbox_bounds is not None:
+        return tile.bbox_bounds
+    corners = _phase45_tile_corners(tile)
+    if corners is None:
+        return None
+    try:
+        celestial = corners.icrs
+    except Exception:
+        celestial = corners
+    ra_vals: np.ndarray | None = None
+    dec_vals: np.ndarray | None = None
+    for attr_name in (("ra", "dec"), ("lon", "lat")):
+        ra_attr = getattr(celestial, attr_name[0], None)
+        dec_attr = getattr(celestial, attr_name[1], None)
+        if ra_attr is None or dec_attr is None:
+            continue
+        try:
+            ra_vals = np.asarray(ra_attr.deg, dtype=np.float64).ravel()
+            dec_vals = np.asarray(dec_attr.deg, dtype=np.float64).ravel()
+            break
+        except Exception:
+            continue
+    if ra_vals is None or dec_vals is None:
+        try:
+            ra_vals = np.asarray(celestial.spherical.lon.deg, dtype=np.float64).ravel()
+            dec_vals = np.asarray(celestial.spherical.lat.deg, dtype=np.float64).ravel()
+        except Exception:
+            return None
+    mask = np.isfinite(ra_vals) & np.isfinite(dec_vals)
+    if not np.any(mask):
+        return None
+    ra_vals = ra_vals[mask]
+    dec_vals = dec_vals[mask]
+    bbox = (
+        float(np.min(ra_vals)),
+        float(np.max(ra_vals)),
+        float(np.min(dec_vals)),
+        float(np.max(dec_vals)),
+    )
+    tile.bbox_bounds = bbox
+    return bbox
+
+
+def _phase45_group_bbox(members: list[_InterMasterTile]) -> dict[str, float] | None:
+    ra_min: float | None = None
+    ra_max: float | None = None
+    dec_min: float | None = None
+    dec_max: float | None = None
+    for tile in members:
+        bbox = _phase45_tile_bbox(tile)
+        if not bbox:
+            continue
+        t_ra_min, t_ra_max, t_dec_min, t_dec_max = bbox
+        ra_min = t_ra_min if ra_min is None else min(ra_min, t_ra_min)
+        ra_max = t_ra_max if ra_max is None else max(ra_max, t_ra_max)
+        dec_min = t_dec_min if dec_min is None else min(dec_min, t_dec_min)
+        dec_max = t_dec_max if dec_max is None else max(dec_max, t_dec_max)
+    if None in (ra_min, ra_max, dec_min, dec_max):
+        return None
+    return {
+        "ra_min": float(ra_min),
+        "ra_max": float(ra_max),
+        "dec_min": float(dec_min),
+        "dec_max": float(dec_max),
+    }
 
 
 def _phase45_project_polygon(corners: Any, reference: Any) -> np.ndarray | None:
@@ -784,22 +1187,76 @@ def _run_phase4_5_inter_master_merge(
     threshold = max(0.0, min(1.0, threshold))
     min_group = max(2, int(inter_cfg.get("min_group_size", 2)))
     max_group = max(min_group, int(inter_cfg.get("max_group", 64)))
-    method = str(inter_cfg.get("stack_method", "winsor")).lower()
-    if method not in {"winsor", "mean", "median"}:
-        method = "winsor"
     memmap_policy = str(inter_cfg.get("memmap_policy", "auto")).lower()
-    local_scale = str(inter_cfg.get("local_scale", "final")).lower()
+    local_scale = str(inter_cfg.get("local_scale", "native")).lower()
     if local_scale not in {"final", "native"}:
-        local_scale = "final"
+        local_scale = "native"
+
+    photometry_intragroup = bool(inter_cfg.get("photometry_intragroup", True))
+    photometry_intersuper = bool(inter_cfg.get("photometry_intersuper", True))  # réservé pour plus tard
+    try:
+        photometry_clip_sigma = float(inter_cfg.get("photometry_clip_sigma", 3.0))
+    except Exception:
+        photometry_clip_sigma = 3.0
+    if not math.isfinite(photometry_clip_sigma):
+        photometry_clip_sigma = 3.0
+    photometry_clip_sigma = max(0.1, photometry_clip_sigma)
 
     pcb("p45_start", prog=None, lvl="INFO")
 
+    def _phase45_gui_emit(key=None, *, level: str = "DEBUG", **kwargs) -> bool:
+        """Emit a GUI log safely, falling back silently if the GUI is detached."""
+        if not pcb:
+            return False
+        try:
+            pcb(key, prog=None, lvl=level, **kwargs)
+            return True
+        except Exception:
+            return False
+
+    def _phase45_gui_message(message: str, level: str = "DEBUG") -> bool:
+        """Send a free-form heartbeat message to the GUI log."""
+        return _phase45_gui_emit(message, level=level)
+
+    logger.debug(
+        "[P4.5] Starting Inter-Master merge: threshold=%.2f, min_group=%d, max_group=%d, "
+        "memmap=%s, local_scale=%s, master_tiles=%d",
+        threshold,
+        min_group,
+        max_group,
+        memmap_policy,
+        local_scale,
+        len(master_tiles),
+    )
+    if not _phase45_gui_emit(
+        "p45_group_info",
+        level="DEBUG",
+        group=0,
+        total=len(master_tiles),
+        members=len(master_tiles),
+    ):
+        _phase45_gui_message(
+            f"Phase 4.5: preparing overlap graph (tiles={len(master_tiles)})"
+        )
+
+    micro_align_available = hasattr(zemosaic_align_stack, "micro_align_stack")
+    photometry_estimator_available = hasattr(zemosaic_align_stack, "estimate_affine_photometry")
+    photometry_apply_available = hasattr(zemosaic_align_stack, "apply_affine_photometry")
+
     tiles: list[_InterMasterTile] = []
+    group_super_counts: dict[int, int] = {}
     for idx, (path, wcs_obj) in enumerate(master_tiles):
         shape_hw = _phase45_resolve_tile_shape(path, wcs_obj)
         if not shape_hw:
             continue
         tiles.append(_InterMasterTile(index=idx, path=path, wcs=wcs_obj, shape_hw=shape_hw))
+
+    logger.debug(
+        "[P4.5] Candidate tiles retained for overlap graph: %d/%d",
+        len(tiles),
+        len(master_tiles),
+    )
+    _phase45_gui_message(f"Phase 4.5: building overlap graph with {len(tiles)} tiles")
 
     if len(tiles) < min_group:
         pcb("p45_finished", prog=None, lvl="INFO_DETAIL", tiles_in=len(master_tiles), tiles_out=len(master_tiles))
@@ -807,15 +1264,33 @@ def _run_phase4_5_inter_master_merge(
 
     tile_map = {tile.index: tile for tile in tiles}
     adjacency: dict[int, set[int]] = {tile.index: set() for tile in tiles}
+    total_pairs = 0
     for i, tile_a in enumerate(tiles):
         for tile_b in tiles[i + 1 :]:
             overlap = _phase45_overlap_fraction(tile_a, tile_b)
             if overlap >= threshold:
                 adjacency[tile_a.index].add(tile_b.index)
                 adjacency[tile_b.index].add(tile_a.index)
-
+                total_pairs += 1
+        if i and i % 10 == 0:
+            msg = (
+                f"Phase 4.5: overlap scan {i}/{len(tiles)} (edges>={threshold:.2f}: {total_pairs})"
+            )
+            logger.debug("[P4.5] %s", msg)
+            _phase45_gui_message(msg)
+    logger.debug(
+        "[P4.5] Overlap graph: %d tiles, %d edges >= %.2f",
+        len(tiles),
+        total_pairs,
+        threshold,
+    )
+    _phase45_gui_message(
+        f"Phase 4.5: overlap graph ready ({total_pairs} edges >= {threshold:.2f})"
+    )
     visited: set[int] = set()
     groups: list[list[int]] = []
+    total_components = 0
+    valid_components = 0
     for tile in tiles:
         if tile.index in visited:
             continue
@@ -828,14 +1303,61 @@ def _run_phase4_5_inter_master_merge(
             visited.add(node)
             component.append(node)
             stack.extend(adjacency.get(node, ()))
+        total_components += 1
         if len(component) >= min_group:
             groups.append(sorted(component))
+            valid_components += 1
+
+    logger.debug(
+        "[P4.5] Connected components: total=%d, meeting_min_group=%d (min_group=%d)",
+        total_components,
+        valid_components,
+        min_group,
+    )
+    if not groups:
+        _phase45_gui_message("Phase 4.5: no groups reached the minimum overlap")
 
     if not groups:
         pcb("p45_finished", prog=None, lvl="INFO_DETAIL", tiles_in=len(master_tiles), tiles_out=len(master_tiles))
         return master_tiles
 
+    _phase45_gui_message(
+        f"Phase 4.5: overlap grouping ready ({len(groups)} groups >= {min_group})"
+    )
+    group_layout_payload: list[dict[str, Any]] = []
+    for gid, component in enumerate(groups, start=1):
+        member_tiles = [tile_map[idx] for idx in component if idx in tile_map]
+        if not member_tiles:
+            continue
+        repr_idx = min(tile.index for tile in member_tiles)
+        bbox = _phase45_group_bbox(member_tiles)
+        group_layout_payload.append(
+            {
+                "group_id": gid,
+                "members": [tile.index for tile in member_tiles],
+                "repr": repr_idx,
+                "bbox": bbox,
+            }
+        )
+    if group_layout_payload:
+        logger.debug("[P4.5] Emitting groups layout payload (%d groups)", len(group_layout_payload))
+        _phase45_gui_emit(
+            "p45_groups_layout",
+            level="DEBUG",
+            groups=group_layout_payload,
+            total_groups=len(groups),
+        )
+
     total_chunks = sum(max(1, math.ceil(len(group) / max_group)) for group in groups)
+    logger.debug(
+        "[P4.5] Planned processing batches: groups=%d, chunks=%d, max_group=%d",
+        len(groups),
+        total_chunks,
+        max_group,
+    )
+    _phase45_gui_message(
+        f"Phase 4.5: processing {len(groups)} groups / {total_chunks} chunks"
+    )
     processed_chunks = 0
     replacements: dict[int, tuple[str | None, Any]] = {}
     consumed_indices: set[int] = set()
@@ -845,7 +1367,27 @@ def _run_phase4_5_inter_master_merge(
         members = [tile_map[idx] for idx in group_indices if idx in tile_map]
         if not members:
             continue
-        pcb("p45_group_info", prog=None, lvl="DEBUG", group=group_id, total=len(groups), members=len(members))
+        group_chunks = max(1, math.ceil(len(members) / max_group))
+        member_ids = [tile.index for tile in members]
+        group_completed_chunks = 0
+        if not _phase45_gui_emit(
+            "p45_group_info",
+            level="DEBUG",
+            group=group_id,
+            total=len(groups),
+            members=len(members),
+            chunks=group_chunks,
+        ):
+            _phase45_gui_message(
+                f"Phase 4.5: group {group_id} queued ({len(members)} tiles)"
+            )
+        logger.debug(
+            "[P4.5][G%03d] Preparing group: members=%d, chunks=%d, ids=%s",
+            group_id,
+            len(members),
+            group_chunks,
+            member_ids,
+        )
         for chunk_start in range(0, len(members), max_group):
             chunk_tiles = members[chunk_start : chunk_start + max_group]
             processed_chunks += 1
@@ -854,86 +1396,78 @@ def _run_phase4_5_inter_master_merge(
                     progress_callback("phase4_5", processed_chunks, total_chunks)
                 except Exception:
                     pass
+            chunk_idx = min(group_chunks, (chunk_start // max_group) + 1)
+            _phase45_gui_emit(
+                "p45_group_started",
+                level="DEBUG",
+                group_id=group_id,
+                chunk=chunk_idx,
+                chunks=group_chunks,
+                size=len(chunk_tiles),
+            )
+            _phase45_gui_emit(
+                "p45_group_progress",
+                level="ETA_LEVEL",
+                group_id=group_id,
+                chunk=chunk_idx,
+                done=group_completed_chunks,
+                total=group_chunks,
+                size=len(chunk_tiles),
+            )
+            if not _phase45_gui_emit(
+                "p45_group_info",
+                level="DEBUG",
+                group=group_id,
+                total=len(groups),
+                members=len(chunk_tiles),
+                chunk=chunk_idx,
+                chunks=group_chunks,
+                processed=processed_chunks,
+                total_chunks=total_chunks,
+            ):
+                _phase45_gui_message(
+                    f"Phase 4.5: processing chunk {chunk_idx}/{group_chunks} "
+                    f"(group {group_id}, global {processed_chunks}/{total_chunks})"
+                )
+            logger.debug(
+                "[P4.5][G%03d] Chunk %d/%d (%d tiles) - global chunk %d/%d",
+                group_id,
+                chunk_idx,
+                group_chunks,
+                len(chunk_tiles),
+                processed_chunks,
+                total_chunks,
+            )
 
             reference_tile = chunk_tiles[0]
+            local_wcs_source = "native"
+            local_wcs = reference_tile.wcs
+            local_shape = reference_tile.shape_hw
             if local_scale == "final" and final_output_wcs and final_output_shape_hw:
-                local_wcs, local_shape = _phase45_compute_cutout_wcs(final_output_wcs, final_output_shape_hw, chunk_tiles)
-                if local_wcs is None or local_shape is None:
-                    local_wcs = reference_tile.wcs
-                    local_shape = reference_tile.shape_hw
-            else:
-                local_wcs = reference_tile.wcs
-                local_shape = reference_tile.shape_hw
+                cutout_wcs, cutout_shape = _phase45_compute_cutout_wcs(
+                    final_output_wcs, final_output_shape_hw, chunk_tiles
+                )
+                if cutout_wcs is not None and cutout_shape is not None:
+                    local_wcs = cutout_wcs
+                    local_shape = cutout_shape
+                    local_wcs_source = "cutout"
 
             if not (local_wcs and local_shape):
                 continue
+            logger.debug(
+                "[P4.5][G%03d][cutout] Local frame resolved: source=%s, scale=%s, shape=%s, ref_tile=%d",
+                group_id,
+                local_wcs_source,
+                local_scale,
+                tuple(local_shape),
+                reference_tile.index,
+            )
+            _phase45_gui_message(
+                f"Phase 4.5: group {group_id} local frame {local_shape[0]}x{local_shape[1]}"
+            )
 
-            storage = None
-            memmap_path = None
-            success = True
-            frames: list[np.ndarray] = []
-            channels = 3
-            preloaded: dict[int, np.ndarray] = {}
-            try:
-                with fits.open(chunk_tiles[0].path, memmap=True, do_not_scale_image_data=True) as hdul_sample:
-                    first_arr = _ensure_hwc_master_tile(hdul_sample[0].data, os.path.basename(chunk_tiles[0].path))
-                channels = int(first_arr.shape[-1]) if first_arr.ndim == 3 else 1
-                if channels <= 0:
-                    channels = 1
-                if channels not in (1, 3):
-                    channels = min(3, max(1, channels))
-                    if first_arr.shape[-1] != channels:
-                        first_arr = first_arr[..., :channels]
-                preloaded[chunk_tiles[0].index] = first_arr.astype(np.float32, copy=False)
-            except Exception:
-                success = False
-                channels = 3
-            if not success:
-                continue
-            try:
-                storage, memmap_path = _phase45_allocate_stack_storage(len(chunk_tiles), local_shape, channels, memmap_policy, temp_storage_dir)
-                for idx_tile, tile in enumerate(chunk_tiles):
-                    if tile.index in preloaded:
-                        arr = preloaded.pop(tile.index)
-                    else:
-                        with fits.open(tile.path, memmap=True, do_not_scale_image_data=True) as hdul:
-                            arr = _ensure_hwc_master_tile(hdul[0].data, os.path.basename(tile.path))
-                            arr = np.asarray(arr, dtype=np.float32)
-                    if arr.ndim == 2:
-                        arr = arr[..., np.newaxis]
-                    if arr.shape[-1] != channels:
-                        if channels == 3 and arr.shape[-1] == 1:
-                            arr = np.repeat(arr, 3, axis=-1)
-                        elif channels == 1:
-                            arr = arr[..., :1]
-                        else:
-                            arr = np.repeat(arr[..., :1], channels, axis=-1)
-                    arr = np.asarray(arr, dtype=np.float32, copy=False)
-                    reproj = np.full((local_shape[0], local_shape[1], channels), np.nan, dtype=np.float32)
-                    for ch in range(channels):
-                        plane = arr[..., ch]
-                        reproj_plane, footprint = reproject_interp((plane, tile.wcs), local_wcs, shape_out=(local_shape[0], local_shape[1]))
-                        if reproj_plane is None:
-                            success = False
-                            break
-                        reproj_plane = np.asarray(reproj_plane, dtype=np.float32)
-                        if footprint is not None:
-                            mask = np.asarray(footprint) <= 0.0
-                            if mask.shape == reproj_plane.shape:
-                                reproj_plane[mask] = np.nan
-                        reproj[..., ch] = reproj_plane
-                    if not success:
-                        break
-                    storage[idx_tile, :, :, :] = reproj
-                    frames.append(storage[idx_tile])
-                if not success or not frames:
-                    success = False
-            except Exception:
-                success = False
-
-            if not success:
-                _phase45_cleanup_storage(storage, memmap_path)
-                continue
+            chunk_affine_corrections: list[tuple[float, float] | None] = [None] * len(chunk_tiles)
+            chunk_photometry_done = False
 
             try:
                 kappa_val = float(stack_cfg.get("kappa_low", 3.0))
@@ -961,35 +1495,653 @@ def _run_phase4_5_inter_master_merge(
                 "winsor_max_frames_per_pass": max_pass_val,
                 "winsor_max_workers": max(1, worker_limit_val),
             }
+            super_arr = None
+            # --- Phase 4.5 (améliorée) : 2.1 → 3.1 à l’intérieur de 4.5 ---
+            # Réutiliser les options choisies dans le GUI :
+            #   normalize_method, weight_method, reject_algo, final_combine,
+            #   kappa/winsor/workers déjà présents dans stack_cfg/stack_kwargs.
             try:
-                if method == "winsor":
-                    super_arr, _ = zemosaic_align_stack.stack_winsorized_sigma_clip(
-                        frames,
-                        weight_method="none",
-                        zconfig=None,
-                        **stack_kwargs,
+                norm_method = str(
+                    stack_cfg.get(
+                        "stacking_normalize_method",
+                        stack_cfg.get(
+                            "normalize_method",
+                            stack_cfg.get("stack_norm_method", "none"),
+                        ),
                     )
-                elif method == "median":
-                    super_arr = np.nanmedian(np.stack(frames, axis=0), axis=0).astype(np.float32)
-                else:
-                    super_arr = np.nanmean(np.stack(frames, axis=0), axis=0).astype(np.float32)
+                ).lower()
             except Exception:
+                norm_method = "none"
+            try:
+                weight_method = str(stack_cfg.get("weight_method", stack_cfg.get("stack_weight_method", "none"))).lower()
+            except Exception:
+                weight_method = "none"
+            try:
+                reject_algo = str(stack_cfg.get("reject_algo", stack_cfg.get("stack_reject_algo", "winsorized_sigma_clip"))).lower()
+            except Exception:
+                reject_algo = "winsorized_sigma_clip"
+            try:
+                final_combine = str(stack_cfg.get("final_combine", stack_cfg.get("stack_final_combine", "mean"))).lower()
+            except Exception:
+                final_combine = "mean"
+
+            normalize_method = norm_method
+            do_chunk_photometry = (
+                photometry_intragroup
+                and normalize_method not in ("", "none")
+                and ZEMOSAIC_ALIGN_STACK_AVAILABLE
+                and photometry_estimator_available
+                and photometry_apply_available
+            )
+            if do_chunk_photometry:
+                try:
+                    preview_size = int(stack_cfg.get("intertile_preview_size", 512))
+                except Exception:
+                    preview_size = 512
+                try:
+                    overlap_min = float(stack_cfg.get("intertile_overlap_min", 0.05))
+                except Exception:
+                    overlap_min = 0.05
+                sky_percent_cfg = stack_cfg.get("intertile_sky_percentile") or (30.0, 70.0)
+                if not (isinstance(sky_percent_cfg, (list, tuple)) and len(sky_percent_cfg) >= 2):
+                    sky_percent_cfg = (30.0, 70.0)
+                try:
+                    sky_low = float(sky_percent_cfg[0])
+                except Exception:
+                    sky_low = 30.0
+                try:
+                    sky_high = float(sky_percent_cfg[1])
+                except Exception:
+                    sky_high = 70.0
+                if sky_low > sky_high:
+                    sky_low, sky_high = sky_high, sky_low
+                try:
+                    robust_clip = float(stack_cfg.get("intertile_robust_clip_sigma", 2.5))
+                except Exception:
+                    robust_clip = 2.5
+                robust_clip = max(0.1, robust_clip)
+                sources: list[_TileAffineSource] = []
+                valid_indices: list[int] = []
+                for idx_tile, tile in enumerate(chunk_tiles):
+                    path = tile.path
+                    if not path:
+                        continue
+                    try:
+                        with fits.open(path, memmap=True, do_not_scale_image_data=True) as hdul:
+                            arr = _ensure_hwc_master_tile(hdul[0].data, os.path.basename(path))
+                            arr = np.asarray(arr, dtype=np.float32, copy=False)
+                        sources.append(_TileAffineSource(path=path, wcs=tile.wcs, data=arr))
+                        valid_indices.append(idx_tile)
+                    except Exception as exc:
+                        logger.warning("[P4.5] Failed to read tile data for photometry (%s): %s", path, exc)
+                if len(sources) >= 2:
+                    pcb(
+                        "p45_photometry_start",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                        group=group_id,
+                        chunk=chunk_idx,
+                        tiles=len(sources),
+                        method=normalize_method,
+                    )
+                    logger.info(
+                        "[P4.5][photometry] Intra-group normalization start (group=%03d chunk=%d, method=%s, tiles=%d)",
+                        group_id,
+                        chunk_idx,
+                        normalize_method,
+                        len(sources),
+                    )
+                    try:
+                        affine_raw = zemosaic_align_stack.estimate_affine_photometry(
+                            sources,
+                            preview_size=preview_size,
+                            overlap_min=overlap_min,
+                            sky_percentile=(sky_low, sky_high),
+                            robust_clip_sigma=min(robust_clip, float(photometry_clip_sigma)),
+                        )
+                        corrections, nontrivial = _sanitize_affine_corrections(
+                            affine_raw,
+                            len(sources),
+                        )
+                        if corrections and nontrivial:
+                            for corr_idx, corr in enumerate(corrections):
+                                if 0 <= corr_idx < len(valid_indices):
+                                    chunk_affine_corrections[valid_indices[corr_idx]] = corr
+                            pcb(
+                                "p45_photometry_applied",
+                                prog=None,
+                                lvl="INFO_DETAIL",
+                                group=group_id,
+                                chunk=chunk_idx,
+                            )
+                            logger.info(
+                                "[P4.5][photometry] Applied affine corrections (group=%03d chunk=%d, corrected=%d)",
+                                group_id,
+                                chunk_idx,
+                                len([c for c in corrections if c is not None]),
+                            )
+                            chunk_photometry_done = True
+                        else:
+                            logger.debug("[P4.5][photometry] No affine corrections (identity).")
+                    except Exception as exc:
+                        logger.warning("[P4.5][photometry] Error while estimating/applying: %s", exc, exc_info=True)
+                else:
+                    logger.info("[P4.5][photometry] Skipped (insufficient valid tiles).")
+            elif photometry_intragroup and normalize_method not in ("", "none"):
+                logger.warning(
+                    "[P4.5][photometry] Skip intra-group normalization (API unavailable)."
+                )
+
+            storage = None
+            memmap_path = None
+            success = True
+            frames: list[np.ndarray] = []
+            channels = 3
+            preloaded: dict[int, np.ndarray] = {}
+            try:
+                with fits.open(chunk_tiles[0].path, memmap=True, do_not_scale_image_data=True) as hdul_sample:
+                    first_arr = _ensure_hwc_master_tile(hdul_sample[0].data, os.path.basename(chunk_tiles[0].path))
+                channels = int(first_arr.shape[-1]) if first_arr.ndim == 3 else 1
+                if channels <= 0:
+                    channels = 1
+                if channels not in (1, 3):
+                    channels = min(3, max(1, channels))
+                    if first_arr.shape[-1] != channels:
+                        first_arr = first_arr[..., :channels]
+                preloaded[chunk_tiles[0].index] = first_arr.astype(np.float32, copy=False)
+            except Exception:
+                success = False
+                channels = 3
+            if not success:
+                logger.debug("[P4.5][G%03d] Failed to preload reference tile for chunk %d/%d", group_id, chunk_idx, group_chunks)
+                continue
+            try:
+                storage, memmap_path = _phase45_allocate_stack_storage(len(chunk_tiles), local_shape, channels, memmap_policy, temp_storage_dir)
+                allocation_mode = "memmap" if memmap_path else "ram"
+                logger.debug(
+                    "[P4.5][G%03d] Allocated %s stack storage for chunk %d/%d: "
+                    "tiles=%d, shape=%s, channels=%d",
+                    group_id,
+                    allocation_mode,
+                    chunk_idx,
+                    group_chunks,
+                    len(chunk_tiles),
+                    local_shape,
+                    channels,
+                )
+                _phase45_gui_message(
+                    f"Phase 4.5: group {group_id} chunk {chunk_idx}/{group_chunks} reprojection ({allocation_mode})"
+                )
+                reproject_kwargs = {"shape_out": (local_shape[0], local_shape[1])}
+                if _REPROJECT_INTERP_SUPPORTS_FILL_VALUE:
+                    reproject_kwargs["fill_value"] = np.nan
+                if _REPROJECT_INTERP_SUPPORTS_MATCH_BG:
+                    reproject_kwargs["match_background"] = True
+                for idx_tile, tile in enumerate(chunk_tiles):
+                    if tile.index in preloaded:
+                        arr = preloaded.pop(tile.index)
+                    else:
+                        with fits.open(tile.path, memmap=True, do_not_scale_image_data=True) as hdul:
+                            arr = _ensure_hwc_master_tile(hdul[0].data, os.path.basename(tile.path))
+                            arr = np.asarray(arr, dtype=np.float32)
+                    if arr.ndim == 2:
+                        arr = arr[..., np.newaxis]
+                    if arr.shape[-1] != channels:
+                        if channels == 3 and arr.shape[-1] == 1:
+                            arr = np.repeat(arr, 3, axis=-1)
+                        elif channels == 1:
+                            arr = arr[..., :1]
+                        else:
+                            arr = np.repeat(arr[..., :1], channels, axis=-1)
+                    arr = np.asarray(arr, dtype=np.float32, copy=False)
+                    corr = chunk_affine_corrections[idx_tile]
+                    if corr:
+                        try:
+                            gain = float(corr[0])
+                        except Exception:
+                            gain = 1.0
+                        try:
+                            offset = float(corr[1])
+                        except Exception:
+                            offset = 0.0
+                        arr *= gain
+                        arr += offset
+                    reproj = np.full((local_shape[0], local_shape[1], channels), np.nan, dtype=np.float32)
+                    for ch in range(channels):
+                        plane = arr[..., ch]
+                        reproj_plane, footprint = reproject_interp((plane, tile.wcs), local_wcs, **reproject_kwargs)
+                        if reproj_plane is None:
+                            success = False
+                            break
+                        reproj_plane = np.asarray(reproj_plane, dtype=np.float32)
+                        if footprint is not None:
+                            mask = np.asarray(footprint) <= 0.0
+                            if mask.shape == reproj_plane.shape:
+                                reproj_plane[mask] = np.nan
+                        reproj[..., ch] = reproj_plane
+                    if not success:
+                        break
+                    storage[idx_tile, :, :, :] = reproj
+                    frames.append(storage[idx_tile])
+                if not success or not frames:
+                    success = False
+            except Exception:
+                success = False
+
+            if not success:
+                logger.debug(
+                    "[P4.5][G%03d] Chunk %d/%d aborted during reprojection",
+                    group_id,
+                    chunk_idx,
+                    group_chunks,
+                )
+                _phase45_cleanup_storage(storage, memmap_path)
+                continue
+
+            # 4.5.a — micro-alignement résiduel (noop si indisponible)
+            try:
+                if micro_align_available:
+                    logger.debug(
+                        "[P4.5][G%03d] Micro-align start: method=phase, frames=%d",
+                        group_id,
+                        len(frames),
+                    )
+                    _phase45_gui_message(
+                        f"Phase 4.5: group {group_id} micro-align ({len(frames)} frames)"
+                    )
+                    frames = zemosaic_align_stack.micro_align_stack(
+                        frames, method="phase", max_shift_px=8
+                    )
+                    logger.debug("[P4.5][G%03d] Micro-align done", group_id)
+                    _phase45_gui_message(
+                        f"Phase 4.5: group {group_id} micro-align done"
+                    )
+            except Exception as exc:
+                logger.debug("[P4.5][G%03d] Micro-align skipped/failed: %s", group_id, exc)
+
+            # 4.5.b — normalisation photométrique intra-groupe (gain/offset)
+            if (
+                not chunk_photometry_done
+                and photometry_estimator_available
+                and photometry_apply_available
+                and photometry_intragroup
+                and norm_method not in ("", "none")
+                and len(frames) >= 2
+            ):
+                try:
+                    _phase45_gui_emit(
+                        "p45_group_photometry_start",
+                        level="INFO_DETAIL",
+                        group_id=group_id,
+                        chunk=chunk_idx,
+                        size=len(chunk_tiles),
+                        clip=photometry_clip_sigma,
+                    )
+                    logger.debug(
+                        "[P4.5][G%03d] Intra-group photometry start (chunk=%d, tiles=%d, clip=%.2f)",
+                        group_id,
+                        chunk_idx,
+                        len(chunk_tiles),
+                        photometry_clip_sigma,
+                    )
+                    chunk_sources: list[_TileAffineSource] = []
+                    for idx_tile, tile in enumerate(chunk_tiles):
+                        if idx_tile >= len(frames):
+                            break
+                        frame_view = np.array(frames[idx_tile], dtype=np.float32, copy=False)
+                        chunk_sources.append(
+                            _TileAffineSource(
+                                path=tile.path,
+                                wcs=local_wcs,
+                                data=frame_view,
+                            )
+                        )
+                    if len(chunk_sources) >= 2:
+                        affine_estimates = zemosaic_align_stack.estimate_affine_photometry(
+                            chunk_sources,
+                            robust=True,
+                            clip_sigma=photometry_clip_sigma,
+                            match_background=True,
+                        )
+                        corrections, nontrivial = _sanitize_affine_corrections(
+                            affine_estimates,
+                            len(chunk_sources),
+                        )
+                        if corrections and nontrivial:
+                            frames = zemosaic_align_stack.apply_affine_photometry(frames, corrections)
+                            log_indices = _select_affine_log_indices(corrections)
+                            sample_indices = [
+                                chunk_tiles[idx - 1].index
+                                for idx in sorted(log_indices)
+                                if 0 < idx <= len(chunk_tiles)
+                            ]
+                            sample_payload = ", ".join(str(val) for val in sample_indices) if sample_indices else "-"
+                            _phase45_gui_emit(
+                                "p45_group_photometry_applied",
+                                level="INFO_DETAIL",
+                                group_id=group_id,
+                                chunk=chunk_idx,
+                                applied=len(corrections),
+                                samples=sample_payload,
+                            )
+                            logger.debug(
+                                "[P4.5][G%03d] Intra-group photometry applied (chunk=%d, samples=%s)",
+                                group_id,
+                                chunk_idx,
+                                sample_payload,
+                            )
+                        else:
+                            logger.debug(
+                                "[P4.5][G%03d] Intra-group photometry produced no corrections (chunk=%d)",
+                                group_id,
+                                chunk_idx,
+                            )
+                    else:
+                        logger.debug(
+                            "[P4.5][G%03d] Intra-group photometry skipped (insufficient tiles: %d)",
+                            group_id,
+                            len(chunk_sources),
+                        )
+                except Exception as exc:
+                    logger.debug(
+                        "[P4.5][G%03d] Intra-group photometry skipped due to error: %s",
+                        group_id,
+                        exc,
+                    )
+
+            # Héritage: respecter les réglages legacy si la nouvelle photométrie est désactivée.
+            if (
+                not photometry_intragroup
+                and photometry_estimator_available
+                and photometry_apply_available
+                and norm_method != "none"
+                and len(frames) >= 2
+            ):
+                try:
+                    logger.debug(
+                        "[P4.5][G%03d] Legacy inter-tile photometric normalization (method=%s, weight=%s)",
+                        group_id,
+                        norm_method,
+                        weight_method,
+                    )
+                    affine_corr = zemosaic_align_stack.estimate_affine_photometry(
+                        frames, method=norm_method, weight_method=weight_method
+                    )
+                    frames = zemosaic_align_stack.apply_affine_photometry(frames, affine_corr)
+                    logger.debug("[P4.5][G%03d] Legacy inter-tile normalization applied", group_id)
+                    _phase45_gui_message(
+                        f"Phase 4.5: group {group_id} inter-tile photometric normalization"
+                    )
+                except Exception as exc:
+                    logger.warning("[P4.5][G%03d] Legacy inter-tile normalization failed: %s", group_id, exc)
+
+            logger.debug(
+                "[P4.5][G%03d] Photometry: method=%s, frames=%d, chan=%d",
+                group_id,
+                norm_method,
+                len(frames),
+                channels,
+            )
+            try:
+                clip_sigma_norm = float(photometry_clip_sigma)
+            except Exception:
+                clip_sigma_norm = 3.0
+            if not math.isfinite(clip_sigma_norm):
+                clip_sigma_norm = 3.0
+            clip_sigma_norm = max(0.1, min(clip_sigma_norm, 10.0))
+            sky_percent_cfg = stack_cfg.get("intertile_sky_percentile") or inter_cfg.get("intertile_sky_percentile")
+            if not (
+                isinstance(sky_percent_cfg, (list, tuple))
+                and len(sky_percent_cfg) >= 2
+            ):
+                sky_low, sky_high = 30.0, 70.0
+            else:
+                try:
+                    sky_low = float(sky_percent_cfg[0])
+                except Exception:
+                    sky_low = 30.0
+                try:
+                    sky_high = float(sky_percent_cfg[1])
+                except Exception:
+                    sky_high = 70.0
+                if not math.isfinite(sky_low):
+                    sky_low = 30.0
+                if not math.isfinite(sky_high):
+                    sky_high = 70.0
+            if sky_low > sky_high:
+                sky_low, sky_high = sky_high, sky_low
+            sky_low = max(0.0, min(100.0, sky_low))
+            sky_high = max(0.0, min(100.0, sky_high))
+            if sky_high - sky_low < 1e-3:
+                sky_low, sky_high = 30.0, 70.0
+
+            if norm_method in ("linear_fit", "sky_mean") and len(frames) >= 2:
+                try:
+                    ref_arr = np.asarray(frames[0], dtype=np.float32, copy=False)
+                    if ref_arr.ndim == 2:
+                        ref_arr = ref_arr[..., np.newaxis]
+                    ref_channels = ref_arr.shape[-1]
+                    total_pixels = max(1, ref_arr.shape[0] * ref_arr.shape[1])
+                    min_overlap_required = max(5000, int(math.ceil(total_pixels * 0.01)))
+                    for frame_idx in range(1, len(frames)):
+                        src_arr = frames[frame_idx]
+                        if src_arr is None:
+                            continue
+                        src_arr = np.asarray(src_arr, dtype=np.float32, copy=False)
+                        if src_arr.ndim == 2:
+                            src_arr = src_arr[..., np.newaxis]
+                        if src_arr.shape[-1] != ref_channels:
+                            continue
+                        if norm_method == "linear_fit":
+                            for ch in range(ref_channels):
+                                ref_chan = ref_arr[..., ch]
+                                src_chan = src_arr[..., ch]
+                                common_mask = np.isfinite(ref_chan) & np.isfinite(src_chan)
+                                common_pixels = int(common_mask.sum())
+                                if common_pixels < min_overlap_required:
+                                    continue
+                                x = src_chan[common_mask]
+                                y = ref_chan[common_mask]
+                                if clip_sigma_norm > 0.0 and x.size and y.size:
+                                    clip_mask = np.ones(x.shape, dtype=bool)
+                                    if x.size > 4:
+                                        x_med = float(np.nanmedian(x))
+                                        x_std = float(np.nanstd(x))
+                                        if math.isfinite(x_std) and x_std > 0.0:
+                                            clip_mask &= np.abs(x - x_med) <= (clip_sigma_norm * x_std)
+                                    if y.size > 4:
+                                        y_med = float(np.nanmedian(y))
+                                        y_std = float(np.nanstd(y))
+                                        if math.isfinite(y_std) and y_std > 0.0:
+                                            clip_mask &= np.abs(y - y_med) <= (clip_sigma_norm * y_std)
+                                    if not np.any(clip_mask):
+                                        continue
+                                    x = x[clip_mask]
+                                    y = y[clip_mask]
+                                    if x.size < max(1000, min_overlap_required // 2):
+                                        continue
+                                if x.size < 2:
+                                    continue
+                                xm = float(np.mean(x))
+                                ym = float(np.mean(y))
+                                xv = x - xm
+                                yv = y - ym
+                                denom = float(np.dot(xv, xv))
+                                if denom <= 0.0 or not math.isfinite(denom):
+                                    continue
+                                slope = float(np.dot(xv, yv) / denom)
+                                intercept = float(ym - slope * xm)
+                                if not (math.isfinite(slope) and math.isfinite(intercept)):
+                                    continue
+                                slope = float(np.clip(slope, 0.25, 4.0))
+                                src_valid = np.isfinite(src_chan)
+                                if not np.any(src_valid):
+                                    continue
+                                src_values = src_chan[src_valid]
+                                src_values *= slope
+                                src_values += intercept
+                                src_chan[src_valid] = src_values
+                        else:  # sky_mean
+                            for ch in range(ref_channels):
+                                ref_chan = ref_arr[..., ch]
+                                src_chan = src_arr[..., ch]
+                                ref_mask = np.isfinite(ref_chan)
+                                src_mask = np.isfinite(src_chan)
+                                if not (np.any(ref_mask) and np.any(src_mask)):
+                                    continue
+                                ref_vals = ref_chan[ref_mask]
+                                src_vals = src_chan[src_mask]
+                                ref_range = np.nanpercentile(ref_vals, [sky_low, sky_high])
+                                src_range = np.nanpercentile(src_vals, [sky_low, sky_high])
+                                ref_sel = (ref_vals >= ref_range[0]) & (ref_vals <= ref_range[1])
+                                src_sel = (src_vals >= src_range[0]) & (src_vals <= src_range[1])
+                                ref_clip = ref_vals[ref_sel] if np.any(ref_sel) else ref_vals
+                                src_clip = src_vals[src_sel] if np.any(src_sel) else src_vals
+                                if ref_clip.size == 0 or src_clip.size == 0:
+                                    continue
+                                bg_ref = float(np.nanmedian(ref_clip))
+                                bg_src = float(np.nanmedian(src_clip))
+                                if not (math.isfinite(bg_ref) and math.isfinite(bg_src)):
+                                    continue
+                                delta = bg_ref - bg_src
+                                src_chan[src_mask] = src_chan[src_mask] + delta
+                except Exception:
+                    logger.debug(
+                        "[P4.5][G%03d] Chunk photometric normalization skipped (error)",
+                        group_id,
+                        exc_info=True,
+                    )
+
+            # 4.5.c — empilement selon les réglages GUI
+            logger.debug(
+                "[P4.5][G%03d] Stack params: reject=%s, combine=%s, kappa=%.2f, winsor_limits=%s, workers=%d, weight=%s",
+                group_id,
+                reject_algo,
+                final_combine,
+                kappa_val,
+                limits_val,
+                stack_kwargs["winsor_max_workers"],
+                weight_method,
+            )
+            _phase45_gui_message(
+                f"Phase 4.5: group {group_id} stacking ({reject_algo}/{final_combine})"
+            )
+            try:
+                if reject_algo in ("winsor", "winsorized_sigma_clip"):
+                    result = zemosaic_align_stack.stack_winsorized_sigma_clip(
+                        frames, weight_method=weight_method, zconfig=None, **stack_kwargs
+                    )
+                    super_arr = result[0] if isinstance(result, (tuple, list)) else result
+                elif reject_algo == "kappa_sigma":
+                    stack_result = None
+                    if hasattr(zemosaic_align_stack, "stack_kappa_sigma"):
+                        stack_result = zemosaic_align_stack.stack_kappa_sigma(
+                            frames,
+                            kappa=float(stack_cfg.get("kappa_low", 3.0)),
+                            combine=final_combine,
+                            weight_method=weight_method,
+                        )
+                    elif hasattr(zemosaic_align_stack, "stack_kappa_sigma_clip"):
+                        stack_result = zemosaic_align_stack.stack_kappa_sigma_clip(
+                            frames,
+                            weight_method=weight_method,
+                            zconfig=None,
+                            sigma_low=float(stack_cfg.get("kappa_low", 3.0)),
+                            sigma_high=float(stack_cfg.get("kappa_high", stack_cfg.get("kappa_low", 3.0))),
+                        )
+                    if stack_result is not None:
+                        super_arr = stack_result[0] if isinstance(stack_result, (tuple, list)) else stack_result
+                elif reject_algo == "linear_fit_clip" and hasattr(zemosaic_align_stack, "stack_linear_fit_clip"):
+                    result = zemosaic_align_stack.stack_linear_fit_clip(
+                        frames,
+                        weight_method=weight_method,
+                        zconfig=None,
+                        sigma=float(stack_cfg.get("kappa_high", stack_cfg.get("kappa_low", 3.0))),
+                    )
+                    super_arr = result[0] if isinstance(result, (tuple, list)) else result
+
+                if super_arr is None:
+                    stack_np = np.stack(frames, axis=0).astype(np.float32, copy=False)
+                    super_arr = (
+                        np.nanmedian(stack_np, axis=0).astype(np.float32)
+                        if final_combine == "median"
+                        else np.nanmean(stack_np, axis=0).astype(np.float32)
+                    )
+            except Exception as exc:
+                logger.debug("[P4.5][G%03d] Stack failed: %s", group_id, exc)
                 _phase45_cleanup_storage(storage, memmap_path)
                 continue
 
             _phase45_cleanup_storage(storage, memmap_path)
 
             if super_arr is None:
+                logger.debug(
+                    "[P4.5][G%03d] Stack yielded no data; skipping chunk %d/%d",
+                    group_id,
+                    chunk_idx,
+                    group_chunks,
+                )
                 continue
 
-            super_arr = np.asarray(super_arr, dtype=np.float32)
-            representative_idx = min(tile.index for tile in chunk_tiles)
+            try:
+                super_arr = _ensure_hwc_master_tile(
+                    super_arr,
+                    tile_label=f"p45_group_{group_id:03d}_chunk_{chunk_idx}",
+                )
+            except Exception as exc:
+                logger.debug(
+                    "[P4.5][G%03d] Super array normalization failed: %s",
+                    group_id,
+                    exc,
+                )
+                continue
+            if channels == 1 and super_arr.shape[-1] != 1:
+                super_arr = super_arr[..., :1]
+            elif channels == 3:
+                if super_arr.shape[-1] == 1:
+                    super_arr = np.repeat(super_arr, 3, axis=-1)
+                elif super_arr.shape[-1] > 3:
+                    super_arr = super_arr[..., :3]
+            super_arr = np.asarray(super_arr, dtype=np.float32, order="C")
+            np.nan_to_num(super_arr, copy=False)
+            pipeline_cfg = {
+                "quality_crop_enabled": stack_cfg.get("quality_crop_enabled"),
+                "quality_crop_band_px": stack_cfg.get("quality_crop_band_px"),
+                "quality_crop_k_sigma": stack_cfg.get("quality_crop_k_sigma"),
+                "quality_crop_margin_px": stack_cfg.get("quality_crop_margin_px"),
+                "quality_crop_min_run": stack_cfg.get("quality_crop_min_run"),
+                "altaz_cleanup_enabled": stack_cfg.get("altaz_cleanup_enabled"),
+                "altaz_margin_percent": stack_cfg.get("altaz_margin_percent"),
+                "altaz_decay": stack_cfg.get("altaz_decay"),
+                "altaz_nanize": stack_cfg.get("altaz_nanize"),
+            }
+            super_arr = _apply_lecropper_pipeline(super_arr, pipeline_cfg)
+            arr_shape = tuple(super_arr.shape)
+            logger.debug(
+                "[P4.5][G%03d] Super array ready: shape=%s, dtype=%s",
+                group_id,
+                arr_shape,
+                super_arr.dtype,
+            )
+            _phase45_gui_message(
+                f"Phase 4.5: group {group_id} super-tile shape {arr_shape}"
+            )
+            member_indices = sorted(tile.index for tile in chunk_tiles)
+            representative_idx = member_indices[0]
             consumed_indices.update(tile.index for tile in chunk_tiles)
+
+            member_signature = ",".join(str(idx) for idx in member_indices)
+            digest = hashlib.sha1(member_signature.encode("utf-8")).hexdigest()[:8]
+            super_tile_id = f"super:{representative_idx:04d}_{len(member_indices):02d}_{digest}"
 
             target_dir = temp_storage_dir or output_folder
             os.makedirs(target_dir, exist_ok=True)
             super_filename = f"super_tile_{representative_idx:03d}_{uuid.uuid4().hex[:8]}.fits"
             super_path = os.path.join(target_dir, super_filename)
+            logger.debug("[P4.5][G%03d] Saving super tile to %s", group_id, super_path)
+            _phase45_gui_message(
+                f"Phase 4.5: group {group_id} writing {super_filename} ({arr_shape})"
+            )
 
             header = fits.Header()
             try:
@@ -997,8 +2149,19 @@ def _run_phase4_5_inter_master_merge(
             except Exception:
                 pass
             try:
+                header["ZMT_WCSLV"] = (
+                    "local" if local_wcs_source == "cutout" else "native",
+                    "Phase 4.5 super-tile WCS frame",
+                )
+            except Exception:
+                pass
+            try:
                 header["ZMT_TYPE"] = ("Super Tile", "Inter-Master merged tile")
                 header["ZMT_SUPR"] = (len(chunk_tiles), "Tiles merged in Phase 4.5")
+            except Exception:
+                pass
+            try:
+                header["ZMT_SUPID"] = (super_tile_id, "Phase 4.5 super tile id")
             except Exception:
                 pass
             try:
@@ -1021,8 +2184,11 @@ def _run_phase4_5_inter_master_merge(
                 except Exception:
                     continue
 
+            _register_master_tile_identity(super_path, super_tile_id)
+
             replacements[representative_idx] = (super_path, local_wcs)
             cleanup_paths.extend(tile.path for tile in chunk_tiles if tile.path)
+            group_super_counts[group_id] = group_super_counts.get(group_id, 0) + 1
 
             snr_gain = math.sqrt(len(chunk_tiles))
             pcb(
@@ -1032,16 +2198,401 @@ def _run_phase4_5_inter_master_merge(
                 size=len(chunk_tiles),
                 out=os.path.basename(super_path),
                 snr=f"{snr_gain:.2f}",
+                group_id=group_id,
+                chunk=chunk_idx,
+            )
+            logger.debug(
+                "[P4.5][G%03d] Super tile saved (%d tiles, SNR x%.2f): %s shape=%s",
+                group_id,
+                len(chunk_tiles),
+                snr_gain,
+                super_path,
+                arr_shape,
+            )
+            _phase45_gui_message(
+                f"Phase 4.5: group {group_id} super tile saved "
+                f"(chunk {chunk_idx}/{group_chunks}, SNR x{snr_gain:.2f})"
+            )
+            group_completed_chunks = max(group_completed_chunks, chunk_idx)
+            _phase45_gui_emit(
+                "p45_group_progress",
+                level="ETA_LEVEL",
+                group_id=group_id,
+                chunk=chunk_idx,
+                done=group_completed_chunks,
+                total=group_chunks,
+                size=len(chunk_tiles),
             )
 
+    total_super_tiles = sum(group_super_counts.values())
+    if total_super_tiles:
+        groups_with_super = len(group_super_counts)
+        logger.info(
+            "phase4_5: injected %d super-tiles from %d groups",
+            total_super_tiles,
+            groups_with_super,
+        )
+        _phase45_gui_message(
+            f"phase4_5: injected {total_super_tiles} super-tiles from {groups_with_super} groups",
+            level="INFO",
+        )
+
     if cache_retention_mode != "keep":
+        removed_count = 0
         for path in cleanup_paths:
             if not path or not os.path.exists(path):
                 continue
             try:
                 os.remove(path)
+                removed_count += 1
             except Exception:
                 pass
+        if removed_count:
+            logger.debug("[P4.5] Removed %d original master tiles post-merge", removed_count)
+            _phase45_gui_message(f"Phase 4.5: cleanup removed {removed_count} original tiles")
+
+    # --- [P4.5] Inter-super photometric normalization (gain-only) ---
+    try:
+        candidate_super_tiles = [
+            (tidx, entry)
+            for tidx, entry in sorted(replacements.items())
+            if entry and entry[0] and os.path.exists(entry[0])
+        ]
+        if photometry_intersuper and len(candidate_super_tiles) >= 2:
+            pcb("p45_norm_start", lvl="INFO_DETAIL", tiles=len(candidate_super_tiles))
+            end_payload: dict[str, Any] = {"applied": 0}
+            try:
+                stats: list[tuple[int, str, np.ndarray, int]] = []
+                for tidx, (tpath, _twcs) in candidate_super_tiles:
+                    try:
+                        with fits.open(
+                            tpath,
+                            memmap=True,
+                            do_not_scale_image_data=True,
+                        ) as hdul:
+                            raw = hdul[0].data
+                            if raw is None:
+                                continue
+                            arr = _ensure_hwc_master_tile(raw, os.path.basename(tpath))
+                    except Exception as exc:
+                        logger.debug("[P4.5] Norm stats failed for %s: %s", tpath, exc)
+                        continue
+                    channels = arr.shape[-1]
+                    med = np.full(channels, np.nan, dtype=np.float32)
+                    weight = 0
+                    for ch in range(channels):
+                        plane = arr[..., ch]
+                        valid = np.isfinite(plane)
+                        valid_count = int(valid.sum())
+                        if not valid_count:
+                            continue
+                        vals = plane[valid].astype(np.float32, copy=False)
+                        median_val = float(np.nanmedian(vals))
+                        if valid_count > 32 and photometry_clip_sigma > 0:
+                            try:
+                                q1, q3 = np.nanpercentile(vals, [25.0, 75.0])
+                                iqr = float(q3 - q1)
+                                if iqr > 0:
+                                    sigma_est = iqr / 1.349
+                                    clip_width = sigma_est * photometry_clip_sigma
+                                    if clip_width > 0:
+                                        low = median_val - clip_width
+                                        high = median_val + clip_width
+                                        clip_mask = (vals >= low) & (vals <= high)
+                                        if clip_mask.any():
+                                            median_val = float(np.nanmedian(vals[clip_mask]))
+                            except Exception:
+                                pass
+                        med[ch] = median_val
+                        weight += valid_count
+                    if weight == 0 or not np.all(np.isfinite(med)):
+                        continue
+                    stats.append((int(tidx), tpath, med, weight))
+
+                valid_stats = [entry for entry in stats if entry[3] > 0 and np.all(np.isfinite(entry[2]))]
+                if len(valid_stats) >= 2:
+                    meds = np.vstack([entry[2] for entry in valid_stats])
+                    weights = np.asarray([float(entry[3]) for entry in valid_stats], dtype=np.float64)
+                    total_weight = float(weights.sum())
+                    ref_mode = "median"
+                    dominant_idx = int(np.argmax(weights))
+                    ref_tile = int(valid_stats[dominant_idx][0])
+                    ref = np.zeros(meds.shape[1], dtype=np.float32)
+                    if total_weight <= 0:
+                        ref_mode = "tile"
+                        ref = meds[dominant_idx]
+                    else:
+                        for ch in range(meds.shape[1]):
+                            col = meds[:, ch]
+                            order = np.argsort(col)
+                            sorted_vals = col[order]
+                            sorted_weights = weights[order]
+                            cutoff = total_weight * 0.5
+                            cumsum = np.cumsum(sorted_weights)
+                            idx = int(np.searchsorted(cumsum, cutoff, side="left"))
+                            idx = min(idx, len(sorted_vals) - 1)
+                            ref[ch] = float(sorted_vals[idx])
+                    if not np.all(np.isfinite(ref)):
+                        ref_mode = "tile"
+                        ref = meds[dominant_idx]
+                    ref = np.asarray(ref, dtype=np.float32, order="C")
+
+                    gain_clip_cfg = (
+                        inter_cfg.get("two_pass_cov_gain_clip")
+                        or stack_cfg.get("two_pass_cov_gain_clip")
+                    )
+                    gmin, gmax = 0.85, 1.18
+                    if isinstance(gain_clip_cfg, (list, tuple)) and len(gain_clip_cfg) >= 2:
+                        try:
+                            gmin = float(gain_clip_cfg[0])
+                            gmax = float(gain_clip_cfg[1])
+                        except Exception:
+                            gmin, gmax = 0.85, 1.18
+                    if not math.isfinite(gmin) or not math.isfinite(gmax):
+                        gmin, gmax = 0.85, 1.18
+                    if gmin > gmax:
+                        gmin, gmax = gmax, gmin
+
+                    preview_gains = []
+                    for med in meds:
+                        gains_preview = np.ones_like(ref, dtype=np.float32)
+                        valid_mask = (
+                            np.isfinite(med)
+                            & np.isfinite(ref)
+                            & (med != 0)
+                            & (ref != 0)
+                        )
+                        same_sign = np.signbit(med) == np.signbit(ref)
+                        valid_mask &= same_sign
+                        gains_preview[valid_mask] = ref[valid_mask] / med[valid_mask]
+                        preview_gains.append(np.clip(gains_preview, gmin, gmax))
+                    preview_arr = np.vstack(preview_gains)
+                    gain_summary = ",".join(
+                        f"ch{idx}:{float(np.nanmedian(preview_arr[:, idx])):.3f}"
+                        for idx in range(preview_arr.shape[1])
+                    )
+                    pcb(
+                        "p45_norm_stats",
+                        lvl="DEBUG",
+                        ref="median" if ref_mode == "median" else f"tile_{ref_tile}",
+                        target=[float(val) for val in ref.tolist()],
+                        gains_summary=gain_summary,
+                    )
+
+                    applied_tiles = 0
+                    ref_descriptor = "weighted" if ref_mode == "median" else f"tile:{ref_tile}"
+                    for tidx, tpath, med, _ in valid_stats:
+                        gains = np.ones_like(ref, dtype=np.float32)
+                        valid_mask = (
+                            np.isfinite(med)
+                            & np.isfinite(ref)
+                            & (med != 0)
+                            & (ref != 0)
+                        )
+                        same_sign = np.signbit(med) == np.signbit(ref)
+                        valid_mask &= same_sign
+                        gains[valid_mask] = ref[valid_mask] / med[valid_mask]
+                        gains = np.clip(gains, gmin, gmax)
+                        if np.all(np.abs(gains - 1.0) <= 1e-6):
+                            continue
+                        if not tpath or not os.path.exists(tpath):
+                            continue
+                        try:
+                            with fits.open(
+                                tpath,
+                                mode="update",
+                                memmap=False,
+                                do_not_scale_image_data=True,
+                            ) as hdul:
+                                raw = hdul[0].data
+                                if raw is None:
+                                    continue
+                                arr = _ensure_hwc_master_tile(raw, os.path.basename(tpath))
+                                arr_corr = np.asarray(arr, dtype=np.float32, order="C")
+                                for ch in range(min(arr_corr.shape[-1], gains.size)):
+                                    arr_corr[..., ch] *= float(gains[ch])
+                                if raw.ndim == 2:
+                                    arr_store = arr_corr[..., 0]
+                                elif (
+                                    raw.ndim == 3
+                                    and raw.shape[0] in (1, 3)
+                                    and raw.shape[-1] not in (1, 3)
+                                ):
+                                    arr_store = np.moveaxis(arr_corr, -1, 0)
+                                elif raw.ndim == 3 and raw.shape[-1] in (1, 3):
+                                    arr_store = arr_corr[..., : raw.shape[-1]]
+                                else:
+                                    arr_store = arr_corr
+                                arr_store = np.asarray(arr_store, dtype=np.float32, order="C")
+                                if hdul[0].data.shape == arr_store.shape:
+                                    hdul[0].data[...] = arr_store
+                                else:
+                                    hdul[0].data = arr_store
+                                header = hdul[0].header
+                                try:
+                                    header["ZM45NORM"] = (True, "Phase 4.5 inter-super normalization")
+                                except Exception:
+                                    pass
+                                history_line = (
+                                    "P4.5 intersuper norm gain="
+                                    + ",".join(f"{val:.6f}" for val in gains.tolist())
+                                    + ", offset=0.0, ref="
+                                    + ref_descriptor
+                                )
+                                try:
+                                    header.add_history(history_line)
+                                except Exception:
+                                    try:
+                                        header["HISTORY"] = history_line
+                                    except Exception:
+                                        pass
+                                hdul.flush()
+                            applied_tiles += 1
+                            pcb("p45_norm_apply", lvl="DEBUG", tile=int(tidx), gains=gains.tolist())
+                        except Exception as exc:
+                            logger.debug("[P4.5] Norm apply failed for %s: %s", tpath, exc)
+                    end_payload["applied"] = applied_tiles
+                else:
+                    logger.debug(
+                        "[P4.5] Inter-super normalization skipped: insufficient stats (%d)",
+                        len(valid_stats),
+                    )
+                    end_payload["reason"] = "insufficient_stats"
+            finally:
+                pcb("p45_norm_end", lvl="INFO_DETAIL", **end_payload)
+    except Exception as exc:
+        logger.debug("[P4.5] Inter-super normalization skipped due to error: %s", exc)
+
+    # ---- Inter-supertiles photometric normalization (optional) ----
+    if (
+        photometry_estimator_available
+        and photometry_apply_available
+        and photometry_intersuper
+    ):
+        try:
+            calib_entries: list[_TileAffineSource] = []
+            for idx, original in enumerate(master_tiles):
+                entry: tuple[str | None, Any] | None = None
+                if idx in replacements:
+                    entry = replacements[idx]
+                elif idx not in consumed_indices:
+                    entry = original
+                if not entry:
+                    continue
+                path, wcs_obj = entry
+                if not path or wcs_obj is None:
+                    continue
+                calib_entries.append(_TileAffineSource(path=path, wcs=wcs_obj))
+            if len(calib_entries) >= 2:
+                _phase45_gui_emit(
+                    "p45_global_photometry_start",
+                    level="INFO_DETAIL",
+                    size=len(calib_entries),
+                    clip=photometry_clip_sigma,
+                )
+                logger.debug(
+                    "[P4.5] Global photometry start: entries=%d, clip=%.2f",
+                    len(calib_entries),
+                    photometry_clip_sigma,
+                )
+                global_affine = zemosaic_align_stack.estimate_affine_photometry(
+                    calib_entries,
+                    robust=True,
+                    clip_sigma=photometry_clip_sigma,
+                    match_background=True,
+                )
+                corrections, nontrivial = _sanitize_affine_corrections(
+                    global_affine,
+                    len(calib_entries),
+                )
+                if corrections and nontrivial:
+                    nontrivial_count = sum(
+                        1
+                        for gain_val, offset_val in corrections
+                        if abs(gain_val - 1.0) > 1e-6 or abs(offset_val) > 1e-6
+                    )
+                    for entry_idx, src in enumerate(calib_entries):
+                        path = src.path
+                        if not path or not os.path.exists(path):
+                            continue
+                        gain_val, offset_val = corrections[entry_idx]
+                        if abs(gain_val - 1.0) <= 1e-6 and abs(offset_val) <= 1e-6:
+                            continue
+                        try:
+                            with fits.open(
+                                path,
+                                mode="update",
+                                memmap=True,
+                                do_not_scale_image_data=True,
+                            ) as hdul:
+                                raw_data = hdul[0].data
+                                if raw_data is None:
+                                    continue
+                                arr_hwc = _ensure_hwc_master_tile(
+                                    raw_data,
+                                    os.path.basename(path),
+                                )
+                                arr_corr = (
+                                    arr_hwc * np.float32(gain_val) + np.float32(offset_val)
+                                ).astype(np.float32, copy=False)
+                                if raw_data.ndim == 2:
+                                    arr_store = arr_corr[..., 0]
+                                elif (
+                                    raw_data.ndim == 3
+                                    and raw_data.shape[0] in (1, 3)
+                                    and raw_data.shape[-1] not in (1, 3)
+                                ):
+                                    arr_store = np.moveaxis(arr_corr, -1, 0)
+                                elif raw_data.ndim == 3 and raw_data.shape[-1] in (1, 3):
+                                    arr_store = arr_corr[..., : raw_data.shape[-1]]
+                                else:
+                                    arr_store = arr_corr
+                                arr_store = np.asarray(arr_store, dtype=np.float32, order="C")
+                                if hdul[0].data.shape == arr_store.shape:
+                                    hdul[0].data[...] = arr_store
+                                else:
+                                    hdul[0].data = arr_store
+                                header = hdul[0].header
+                                try:
+                                    header.add_history("Phase 4.5 inter-super photometric match applied")
+                                except Exception:
+                                    try:
+                                        header["HISTORY"] = "Phase 4.5 inter-super photometric match applied"
+                                    except Exception:
+                                        pass
+                                hdul.flush()
+                        except Exception as exc:
+                            logger.debug(
+                                "[P4.5] Global photometry apply failed for %s: %s",
+                                os.path.basename(path) if path else "<memory>",
+                                exc,
+                            )
+                    _phase45_gui_emit(
+                        "p45_global_photometry_done",
+                        level="INFO_DETAIL",
+                        nontrivial=nontrivial_count,
+                        size=len(corrections),
+                    )
+                    logger.debug(
+                        "[P4.5] Global photometry applied to %d/%d entries",
+                        nontrivial_count,
+                        len(corrections),
+                    )
+                else:
+                    _phase45_gui_emit(
+                        "p45_global_photometry_done",
+                        level="INFO_DETAIL",
+                        nontrivial=0,
+                        size=len(calib_entries),
+                    )
+                    logger.debug("[P4.5] Global photometry produced no corrections")
+            else:
+                logger.debug(
+                    "[P4.5] Global photometry skipped (insufficient entries: %d)",
+                    len(calib_entries),
+                )
+        except Exception:
+            logger.debug("[P4.5] Inter-super photometry skipped (error).", exc_info=True)
 
     new_master_tiles: list[tuple[str | None, Any]] = []
     for idx, original in enumerate(master_tiles):
@@ -1050,6 +2601,12 @@ def _run_phase4_5_inter_master_merge(
         elif idx not in consumed_indices:
             new_master_tiles.append(original)
 
+    logger.debug(
+        "[P4.5] Finished Inter-Master merge: tiles_in=%d, tiles_out=%d, replacements=%d",
+        len(master_tiles),
+        len(new_master_tiles),
+        len(replacements),
+    )
     pcb(
         "p45_finished",
         prog=None,
@@ -3423,6 +4980,17 @@ try:
 except ImportError as e_reproject_final: logger.critical(f"Échec import reproject: {e_reproject_final}.")
 except Exception as e_reproject_other_final: logger.critical(f"Erreur import 'reproject': {e_reproject_other_final}", exc_info=True)
 
+_REPROJECT_INTERP_SUPPORTS_MATCH_BG = False
+_REPROJECT_INTERP_SUPPORTS_FILL_VALUE = False
+if REPROJECT_AVAILABLE and reproject_interp:
+    try:
+        _sig_reproj_interp = inspect.signature(reproject_interp)
+        _REPROJECT_INTERP_SUPPORTS_MATCH_BG = "match_background" in _sig_reproj_interp.parameters
+        _REPROJECT_INTERP_SUPPORTS_FILL_VALUE = "fill_value" in _sig_reproj_interp.parameters
+    except Exception:
+        _REPROJECT_INTERP_SUPPORTS_MATCH_BG = False
+        _REPROJECT_INTERP_SUPPORTS_FILL_VALUE = False
+
 # --- Local Project Module Imports ---
 zemosaic_utils, ZEMOSAIC_UTILS_AVAILABLE = None, False
 zemosaic_astrometry, ZEMOSAIC_ASTROMETRY_AVAILABLE = None, False
@@ -4976,6 +6544,17 @@ def create_master_tile(
     quality_crop_band_px: int,
     quality_crop_k_sigma: float,
     quality_crop_margin_px: int,
+    quality_crop_min_run: int,
+    altaz_cleanup_enabled: bool,
+    altaz_margin_percent: float,
+    altaz_decay: float,
+    altaz_nanize: bool,
+    quality_gate_enabled: bool,
+    quality_gate_threshold: float,
+    quality_gate_edge_band_px: int,
+    quality_gate_k_sigma: float,
+    quality_gate_erode_px: int,
+    quality_gate_move_rejects: bool,
     # Paramètres ASTAP (pourraient être enlevés si plus du tout utilisés ici)
     astap_exe_path_global: str, 
     astap_data_dir_global: str, 
@@ -5488,6 +7067,30 @@ def create_master_tile(
                 lvl="WARN",
             )
 
+    pipeline_cfg = {
+        "quality_crop_enabled": quality_crop_enabled,
+        "quality_crop_band_px": quality_crop_band_px,
+        "quality_crop_k_sigma": quality_crop_k_sigma,
+        "quality_crop_margin_px": quality_crop_margin_px,
+        "quality_crop_min_run": quality_crop_min_run,
+        "altaz_cleanup_enabled": altaz_cleanup_enabled,
+        "altaz_margin_percent": altaz_margin_percent,
+        "altaz_decay": altaz_decay,
+        "altaz_nanize": altaz_nanize,
+    }
+    master_tile_stacked_HWC = _apply_lecropper_pipeline(master_tile_stacked_HWC, pipeline_cfg)
+
+    quality_gate_eval: Optional[dict[str, Any]] = _evaluate_quality_gate_metrics(
+        tile_id,
+        master_tile_stacked_HWC,
+        enabled=quality_gate_enabled,
+        threshold=quality_gate_threshold,
+        edge_band=quality_gate_edge_band_px,
+        k_sigma=quality_gate_k_sigma,
+        erode_px=quality_gate_erode_px,
+        pcb=pcb_tile,
+    )
+
     # pcb_tile(f"{func_id_log_base}_info_saving_started", prog=None, lvl="DEBUG_DETAIL", tile_id=tile_id)
     temp_fits_filename = f"master_tile_{tile_id:03d}.fits"
     temp_fits_filepath = os.path.join(output_temp_dir,temp_fits_filename)
@@ -5603,6 +7206,18 @@ def create_master_tile(
         else:
             header_mt_save['ZMT_QCRO'] = (False, 'Quality-based crop applied')
 
+        if quality_gate_eval and quality_gate_eval.get("metrics"):
+            metrics = quality_gate_eval.get("metrics") or {}
+            score = float(quality_gate_eval.get("score", 0.0))
+            accepted_flag = bool(quality_gate_eval.get("accepted", True))
+            header_mt_save['ZMT_QS'] = (round(score, 3), 'ZeQuality score (0=good)')
+            header_mt_save['ZMT_QBD'] = (0 if accepted_flag else 1, '1 if auto-rejected')
+            header_mt_save['ZMT_EOC'] = (round(metrics.get("EOC", 0.0), 3), 'Extended Object Coverage')
+            header_mt_save['ZMT_TRL'] = (round(metrics.get("TRL", 0.0), 3), 'Trailiness index')
+            header_mt_save['ZMT_CER'] = (round(metrics.get("CER", 0.0), 3), 'Corner Emptiness Ratio')
+        elif quality_gate_enabled:
+            header_mt_save['ZMT_QBD'] = (0, '1 if auto-rejected')
+
         zemosaic_utils.save_fits_image(
             image_data=master_tile_stacked_HWC,
             output_path=temp_fits_filepath,
@@ -5612,13 +7227,67 @@ def create_master_tile(
             progress_callback=progress_callback,
             axis_order="HWC",
         )
-        pcb_tile(f"{func_id_log_base}_info_saved", prog=None, lvl="INFO_DETAIL", tile_id=tile_id, format_type='float32', filename=os.path.basename(temp_fits_filepath))
+
+        final_tile_path: Optional[str] = temp_fits_filepath
+        final_wcs = wcs_for_master_tile
+
+        if quality_gate_eval and quality_gate_eval.get("metrics"):
+            metrics = quality_gate_eval.get("metrics") or {}
+            score = float(quality_gate_eval.get("score", 0.0))
+            accepted_flag = bool(quality_gate_eval.get("accepted", True))
+            status_label = "ACCEPT" if accepted_flag else "REJECT"
+            pcb_tile(
+                "mt_quality_gate_result",
+                prog=None,
+                lvl="INFO",
+                tile_id=int(tile_id),
+                path=os.path.basename(temp_fits_filepath),
+                score=f"{score:.3f}",
+                threshold=f"{float(quality_gate_threshold):.3f}",
+                status=status_label,
+            )
+            logger.info(
+                "[ZeQualityMT] tile=%s score=%.3f thr=%.3f -> %s",
+                tile_id,
+                score,
+                float(quality_gate_threshold),
+                status_label,
+            )
+            if not accepted_flag:
+                if quality_gate_move_rejects:
+                    moved_path, moved = _move_quality_reject_file(temp_fits_filepath)
+                    if moved:
+                        pcb_tile(
+                            "mt_quality_gate_moved",
+                            prog=None,
+                            lvl="WARN",
+                            tile_id=int(tile_id),
+                            dst=moved_path,
+                        )
+                        logger.warning("[ZeQualityMT] tile=%s moved to %s", tile_id, moved_path)
+                final_tile_path = None
+                final_wcs = None
+
+        if final_tile_path:
+            try:
+                _register_master_tile_identity(final_tile_path, f"tile:{int(tile_id):04d}")
+            except Exception:
+                _register_master_tile_identity(final_tile_path, tile_id)
+
+        pcb_tile(
+            f"{func_id_log_base}_info_saved",
+            prog=None,
+            lvl="INFO_DETAIL",
+            tile_id=tile_id,
+            format_type='float32',
+            filename=os.path.basename(final_tile_path or temp_fits_filepath),
+        )
         # pcb_tile(f"{func_id_log_base}_info_saving_finished", prog=None, lvl="DEBUG_DETAIL", tile_id=tile_id)
         try:
             _PH3_CONCURRENCY_SEMAPHORE.release()
         except Exception:
             pass
-        return (temp_fits_filepath, wcs_for_master_tile), failed_groups_to_retry
+        return (final_tile_path, final_wcs), failed_groups_to_retry
         
     except Exception as e_save_mt:
         pcb_tile(f"{func_id_log_base}_error_saving", prog=None, lvl="ERROR", tile_id=tile_id, error=str(e_save_mt))
@@ -6254,6 +7923,7 @@ def assemble_final_mosaic_reproject_coadd(
     collect_tile_data: list | None = None,
     tile_affine_corrections: list[tuple[float, float]] | None = None,
     global_anchor_shift: tuple[float, float] | None = None,
+    phase45_enabled: bool = False,
 ):
     """Assemble les master tiles en utilisant ``reproject_and_coadd``."""
     _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
@@ -6398,12 +8068,17 @@ def assemble_final_mosaic_reproject_coadd(
     )
 
 
-    input_data_all_tiles_HWC_processed = []
+    effective_tiles: list[dict[str, Any]] = []
     hdr_for_output = None
     total_tiles_for_prep = len(master_tile_fits_with_wcs_list)
     for idx, (tile_path, tile_wcs) in enumerate(master_tile_fits_with_wcs_list, 1):
+        tile_header = None
         with fits.open(tile_path, memmap=False) as hdul:
             data = hdul[0].data.astype(np.float32)
+            try:
+                tile_header = hdul[0].header.copy()
+            except Exception:
+                tile_header = None
 
         # Master tiles saved via ``save_fits_image`` use the ``HWC`` axis order
         # which stores color images in ``C x H x W`` within the FITS file. When
@@ -6454,7 +8129,13 @@ def assemble_final_mosaic_reproject_coadd(
             except Exception:
                 pass
 
-        input_data_all_tiles_HWC_processed.append((data, tile_wcs))
+        tile_entry = {
+            "data": data,
+            "wcs": tile_wcs,
+            "path": tile_path,
+            "tile_id": _resolve_tile_identifier(tile_path, tile_header, idx - 1),
+        }
+        effective_tiles.append(tile_entry)
 
         if idx % 10 == 0 or idx == len(master_tile_fits_with_wcs_list):
             _pcb(
@@ -6474,24 +8155,21 @@ def assemble_final_mosaic_reproject_coadd(
     # Optional inter-tile photometric (gain/offset) calibration
     pending_affine_list, nontrivial_affine = _sanitize_affine_corrections(
         tile_affine_corrections,
-        len(input_data_all_tiles_HWC_processed),
+        len(effective_tiles),
     )
 
     if (
         pending_affine_list is None
         and intertile_photometric_match
-        and len(input_data_all_tiles_HWC_processed) >= 2
+        and len(effective_tiles) >= 2
     ):
         tile_sources = []
-        for (tile_path, tile_wcs_orig), (arr, tile_wcs_processed) in zip(
-            master_tile_fits_with_wcs_list,
-            input_data_all_tiles_HWC_processed,
-        ):
+        for entry in effective_tiles:
             tile_sources.append(
                 _TileAffineSource(
-                    path=tile_path,
-                    wcs=tile_wcs_processed or tile_wcs_orig,
-                    data=arr,
+                    path=entry.get("path"),
+                    wcs=entry.get("wcs"),
+                    data=entry.get("data"),
                 )
             )
 
@@ -6531,7 +8209,7 @@ def assemble_final_mosaic_reproject_coadd(
             pending_affine_list = None
             nontrivial_affine = False
 
-    total_tiles_prepared = len(input_data_all_tiles_HWC_processed)
+    total_tiles_prepared = len(effective_tiles)
     pending_affine_list, anchor_shift_applied = _compose_global_anchor_shift(
         pending_affine_list,
         total_tiles_prepared,
@@ -6540,20 +8218,60 @@ def assemble_final_mosaic_reproject_coadd(
     if anchor_shift_applied:
         nontrivial_affine = True
 
+    affine_by_id: dict[str, tuple[float, float]] | None = None
     if pending_affine_list:
+        affine_by_id, affine_mismatch_detail = _build_affine_lookup_for_tiles(
+            effective_tiles,
+            pending_affine_list,
+        )
+        if affine_mismatch_detail:
+            logger.warning(
+                "affine_list_mismatch: expected %d corrections for %d tiles, got %d — skip photometric corrections and rely on match_background",
+                len(effective_tiles),
+                len(effective_tiles),
+                len(pending_affine_list or []),
+            )
+            logger.warning("affine_list_mismatch detail: %s", affine_mismatch_detail)
+            pending_affine_list = None
+            affine_by_id = None
+            nontrivial_affine = False
+        else:
+            if phase45_enabled:
+                logger.info(
+                    "intertile: recomputed affine corrections on effective set: tiles=%d",
+                    len(effective_tiles),
+                )
+            logger.info(
+                "apply_photometric: using affine_by_id for %d tiles",
+                len(effective_tiles),
+            )
+    else:
+        nontrivial_affine = False
+        pending_affine_list = None
+
+    if pending_affine_list and affine_by_id:
         if use_gpu:
-            # Defer gain/offset application to GPU path for parity with V3.2.5
             nontrivial_affine = True
+            for entry in effective_tiles:
+                tile_id = entry.get("tile_id")
+                if not tile_id:
+                    continue
+                gain_val, offset_val = affine_by_id.get(tile_id, (1.0, 0.0))
+                logger.info(
+                    "apply_photometric: tile=%s gain=%.5f offset=%.5f",
+                    tile_id,
+                    gain_val,
+                    offset_val,
+                )
         else:
             corrected_tiles = 0
-            for tile_idx, (gain_val, offset_val) in enumerate(pending_affine_list):
-                if tile_idx < 0 or tile_idx >= len(input_data_all_tiles_HWC_processed):
+            for tile_entry in effective_tiles:
+                tile_id = tile_entry.get("tile_id")
+                if not tile_id or tile_entry.get("data") is None:
                     continue
-                arr, tile_wcs_local = input_data_all_tiles_HWC_processed[tile_idx]
-                if arr is None:
-                    continue
+                gain_val, offset_val = affine_by_id.get(tile_id, (1.0, 0.0))
                 try:
-                    arr_np = np.asarray(arr, dtype=np.float32, order="C")
+                    arr_np = np.asarray(tile_entry["data"], dtype=np.float32, order="C")
                     gain_to_apply = float(gain_val)
                     offset_to_apply = float(offset_val)
                     if match_bg:
@@ -6574,7 +8292,7 @@ def assemble_final_mosaic_reproject_coadd(
                                     "assemble_warn_affine_clamped",
                                     prog=None,
                                     lvl="INFO_DETAIL",
-                                    tile_index=tile_idx,
+                                    tile_id=tile_id,
                                     gain_before=gain_before,
                                     gain_after=gain_to_apply,
                                     offset_before=offset_before,
@@ -6586,8 +8304,14 @@ def assemble_final_mosaic_reproject_coadd(
                         np.multiply(arr_np, gain_to_apply, out=arr_np, casting="unsafe")
                     if offset_to_apply != 0.0:
                         np.add(arr_np, offset_to_apply, out=arr_np, casting="unsafe")
-                    input_data_all_tiles_HWC_processed[tile_idx] = (arr_np, tile_wcs_local)
+                    tile_entry["data"] = arr_np
                     corrected_tiles += 1
+                    logger.info(
+                        "apply_photometric: tile=%s gain=%.5f offset=%.5f",
+                        tile_id,
+                        gain_to_apply,
+                        offset_to_apply,
+                    )
                 except Exception:
                     continue
             if corrected_tiles:
@@ -6613,7 +8337,9 @@ def assemble_final_mosaic_reproject_coadd(
             collect_tile_data.clear()
         except Exception:
             collect_tile_data[:] = []
-        for arr, tile_wcs in input_data_all_tiles_HWC_processed:
+        for entry in effective_tiles:
+            arr = entry.get("data") if isinstance(entry, dict) else None
+            tile_wcs = entry.get("wcs") if isinstance(entry, dict) else None
             if arr is None:
                 continue
             try:
@@ -6713,7 +8439,9 @@ def assemble_final_mosaic_reproject_coadd(
             except Exception:
                 pass
         for ch in range(n_channels):
-            for arr, _w in input_data_all_tiles_HWC_processed:
+            valid_entries: list[dict[str, Any]] = []
+            for entry in effective_tiles:
+                arr = entry.get("data") if isinstance(entry, dict) else None
                 if arr is None:
                     continue
                 if arr.ndim != 3:
@@ -6724,9 +8452,10 @@ def assemble_final_mosaic_reproject_coadd(
                     raise ValueError(
                         f"Channel index {ch} out of bounds for tile shape {arr.shape}"
                     )
+                valid_entries.append(entry)
 
-            data_list = [arr[..., ch] for arr, _w in input_data_all_tiles_HWC_processed]
-            wcs_list = [wcs for _arr, wcs in input_data_all_tiles_HWC_processed]
+            data_list = [entry.get("data")[..., ch] for entry in valid_entries]
+            wcs_list = [entry.get("wcs") for entry in valid_entries]
 
             reproj_call_kwargs = dict(reproj_kwargs)
             if use_gpu:
@@ -7310,6 +9039,17 @@ def run_hierarchical_mosaic(
     quality_crop_band_px_config: int,
     quality_crop_k_sigma_config: float,
     quality_crop_margin_px_config: int,
+    quality_crop_min_run_config: int,
+    altaz_cleanup_enabled_config: bool,
+    altaz_margin_percent_config: float,
+    altaz_decay_config: float,
+    altaz_nanize_config: bool,
+    quality_gate_enabled_config: bool,
+    quality_gate_threshold_config: float,
+    quality_gate_edge_band_px_config: int,
+    quality_gate_k_sigma_config: float,
+    quality_gate_erode_px_config: int,
+    quality_gate_move_rejects_config: bool,
     save_final_as_uint16_config: bool,
     legacy_rgb_cube_config: bool,
 
@@ -7372,15 +9112,21 @@ def run_hierarchical_mosaic(
     stack_ram_budget_gb_config : float
         Budget RAM (en Gio) autorisé pour le chargement d'un groupe de stacking (0 = illimité).
     """
+    worker_config_cache: dict[str, Any] = {}
+    if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
+        try:
+            worker_config_cache = zemosaic_config.load_config() or {}
+        except Exception:
+            worker_config_cache = {}
+
     pcb = lambda msg_key, prog=None, lvl="INFO", **kwargs: _log_and_callback(msg_key, prog, lvl, callback=progress_callback, **kwargs)
 
     # Cache retention policy (Phase 1 preprocessed cache cleanup)
     cache_retention_mode = "run_end"
     allowed_cache_modes = {"run_end", "per_tile", "keep"}
-    if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
+    if worker_config_cache:
         try:
-            cfg_cache = zemosaic_config.load_config() or {}
-            cache_retention_mode = str(cfg_cache.get("cache_retention", "run_end")).strip().lower()
+            cache_retention_mode = str(worker_config_cache.get("cache_retention", "run_end")).strip().lower()
         except Exception:
             cache_retention_mode = "run_end"
     if cache_retention_mode not in allowed_cache_modes:
@@ -9205,6 +10951,17 @@ def run_hierarchical_mosaic(
             radial_shape_power_config, min_radial_weight_floor_config,
             quality_crop_enabled_config, quality_crop_band_px_config,
             quality_crop_k_sigma_config, quality_crop_margin_px_config,
+            quality_crop_min_run_config,
+            altaz_cleanup_enabled_config,
+            altaz_margin_percent_config,
+            altaz_decay_config,
+            altaz_nanize_config,
+            quality_gate_enabled_config,
+            quality_gate_threshold_config,
+            quality_gate_edge_band_px_config,
+            quality_gate_k_sigma_config,
+            quality_gate_erode_px_config,
+            quality_gate_move_rejects_config,
             astap_exe_path, astap_data_dir_param, astap_search_radius_config,
             astap_downsample_config, astap_sensitivity_config, 180,
             winsor_worker_limit,
@@ -9499,6 +11256,7 @@ def run_hierarchical_mosaic(
     pcb("run_info_phase4_finished", prog=current_global_progress, lvl="INFO", shape=final_output_shape_hw, crval=final_output_wcs.wcs.crval if final_output_wcs.wcs else 'N/A')
 
     base_progress_phase4_5 = current_global_progress
+    phase45_active_flag = bool(inter_master_merge_enable_config)
     if inter_master_merge_enable_config:
         pcb("PHASE_UPDATE:4.5", prog=None, lvl="ETA_LEVEL")
         _log_memory_usage(progress_callback, "Début Phase 4.5 (Inter-Master merge)")
@@ -9511,11 +11269,56 @@ def run_hierarchical_mosaic(
             "local_scale": str(inter_master_local_scale_config).lower(),
             "max_group": int(inter_master_max_group_config),
         }
+        try:
+            photometry_clip_cfg = float(worker_config_cache.get("inter_master_photometry_clip_sigma", 3.0))
+        except Exception:
+            photometry_clip_cfg = 3.0
+        if not math.isfinite(photometry_clip_cfg):
+            photometry_clip_cfg = 3.0
+        inter_cfg_phase45.update(
+            {
+                "photometry_intragroup": bool(worker_config_cache.get("inter_master_photometry_intragroup", True)),
+                "photometry_intersuper": bool(worker_config_cache.get("inter_master_photometry_intersuper", True)),
+                "photometry_clip_sigma": max(0.1, photometry_clip_cfg),
+            }
+        )
+        gain_clip_cfg = worker_config_cache.get("two_pass_cov_gain_clip")
+        if isinstance(gain_clip_cfg, (list, tuple)) and len(gain_clip_cfg) >= 2:
+            try:
+                gmin = float(gain_clip_cfg[0])
+                gmax = float(gain_clip_cfg[1])
+                if math.isfinite(gmin) and math.isfinite(gmax):
+                    if gmin > gmax:
+                        gmin, gmax = gmax, gmin
+                    inter_cfg_phase45["two_pass_cov_gain_clip"] = (gmin, gmax)
+            except Exception:
+                pass
         stack_cfg_phase45 = {
             "kappa_low": float(stack_kappa_low),
+            "kappa_high": float(stack_kappa_high),
             "winsor_limits": parsed_winsor_limits,
             "winsor_max_frames_per_pass": winsor_max_frames_per_pass_config,
             "winsor_worker_limit": winsor_worker_limit_config,
+            # Phase 4.5 uses GUI stacking options directly; include canonical and legacy keys
+            "normalize_method": stack_norm_method,
+            "stacking_normalize_method": stack_norm_method,
+            "weight_method": stack_weight_method,
+            "reject_algo": stack_reject_algo,
+            "final_combine": stack_final_combine,
+            "stack_norm_method": stack_norm_method,
+            "stack_weight_method": stack_weight_method,
+            "stack_reject_algo": stack_reject_algo,
+            "stack_final_combine": stack_final_combine,
+            "intertile_sky_percentile": intertile_sky_percentile_tuple,
+            "quality_crop_enabled": bool(quality_crop_enabled_config),
+            "quality_crop_band_px": int(quality_crop_band_px_config),
+            "quality_crop_k_sigma": float(quality_crop_k_sigma_config),
+            "quality_crop_margin_px": int(quality_crop_margin_px_config),
+            "quality_crop_min_run": int(quality_crop_min_run_config),
+            "altaz_cleanup_enabled": bool(altaz_cleanup_enabled_config),
+            "altaz_margin_percent": float(altaz_margin_percent_config),
+            "altaz_decay": float(altaz_decay_config),
+            "altaz_nanize": bool(altaz_nanize_config),
         }
         master_tiles_results_list = _run_phase4_5_inter_master_merge(
             master_tiles_results_list,
@@ -9713,6 +11516,7 @@ def run_hierarchical_mosaic(
                     use_auto_intertile=bool(use_auto_intertile_config),
                     collect_tile_data=collected_tiles_for_second_pass,
                     global_anchor_shift=global_anchor_shift,
+                    phase45_enabled=phase45_active_flag,
                 )
             except Exception as e_gpu:
                 logger.warning("GPU reproject_coadd failed, falling back to CPU: %s", e_gpu)
@@ -9742,6 +11546,7 @@ def run_hierarchical_mosaic(
                     use_auto_intertile=bool(use_auto_intertile_config),
                     collect_tile_data=collected_tiles_for_second_pass,
                     global_anchor_shift=global_anchor_shift,
+                    phase45_enabled=phase45_active_flag,
                 )
         else:
             final_mosaic_data_HWC, final_mosaic_coverage_HW = assemble_final_mosaic_reproject_coadd(
@@ -9770,6 +11575,7 @@ def run_hierarchical_mosaic(
                 use_auto_intertile=bool(use_auto_intertile_config),
                 collect_tile_data=collected_tiles_for_second_pass,
                 global_anchor_shift=global_anchor_shift,
+                phase45_enabled=phase45_active_flag,
             )
 
         log_key_phase5_failed = "run_error_phase5_assembly_failed_reproject_coadd"
@@ -9867,7 +11673,7 @@ def run_hierarchical_mosaic(
         try: final_header.update(final_output_wcs.to_header(relax=True))
         except Exception as e_hdr_wcs: pcb("run_warn_phase6_wcs_to_header_failed", error=str(e_hdr_wcs), lvl="WARN")
     
-    final_header['SOFTWARE']=('ZeMosaic v3.2.9','Mosaic Software') # Incrémente la version 
+    final_header['SOFTWARE']=('ZeMosaic v3.3.0','Mosaic Software') # Incrémente la version 
     final_header['NMASTILE']=(len(master_tiles_results_list),"Master Tiles combined")
     final_header['NRAWINIT']=(num_total_raw_files,"Initial raw images found")
     final_header['NRAWPROC']=(len(all_raw_files_processed_info),"Raw images with WCS processed")
