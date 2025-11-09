@@ -481,6 +481,8 @@
     "filter_btn_auto_group": "Auto-organize Master Tiles",
     "filter_btn_analyse": "Analyse",
     "filter_btn_export_csv": "Export CSV",
+    "filter_btn_maximize": "Maximize",
+    "filter_btn_restore": "Restore",
     "filter_chk_draw_footprints": "Draw WCS footprints",
     "filter_label_astap_instances": "Max ASTAP instances",
     "filter_astap_multi_warning_title": "ASTAP Concurrency Warning",

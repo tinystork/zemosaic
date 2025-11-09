@@ -1,25 +1,30 @@
 {
   "accepted": [
-    "C:/Users/TRISTAN/Desktop/astrophoto/M81_copie/out/zemosaic_temp_master_tiles\\master_tile_015.fits",
-    "C:/Users/TRISTAN/Desktop/astrophoto/M81_copie/out/zemosaic_temp_master_tiles\\master_tile_016.fits",
-    "C:/Users/TRISTAN/Desktop/astrophoto/M81_copie/out/zemosaic_temp_master_tiles\\master_tile_045.fits",
-    "C:/Users/TRISTAN/Desktop/astrophoto/M81_copie/out/zemosaic_temp_master_tiles\\master_tile_061.fits",
-    "C:/Users/TRISTAN/Desktop/astrophoto/M81_copie/out/zemosaic_temp_master_tiles\\master_tile_062.fits",
-    "C:/Users/TRISTAN/Desktop/astrophoto/M81_copie/out/zemosaic_temp_master_tiles\\master_tile_063.fits",
-    "C:/Users/TRISTAN/Desktop/astrophoto/M81_copie/out/zemosaic_temp_master_tiles\\master_tile_064.fits",
-    "C:/Users/TRISTAN/Desktop/astrophoto/M81_copie/out/zemosaic_temp_master_tiles\\master_tile_065.fits",
-    "C:/Users/TRISTAN/Desktop/astrophoto/M81_copie/out/zemosaic_temp_master_tiles\\master_tile_066.fits"
+    "C:/Users/TRISTAN/Desktop/astrophoto/NGC4631/NGC4631/zemosaic_temp_master_tiles\\master_tile_000.fits",
+    "C:/Users/TRISTAN/Desktop/astrophoto/NGC4631/NGC4631/zemosaic_temp_master_tiles\\master_tile_001.fits",
+    "C:/Users/TRISTAN/Desktop/astrophoto/NGC4631/NGC4631/zemosaic_temp_master_tiles\\master_tile_002.fits",
+    "C:/Users/TRISTAN/Desktop/astrophoto/NGC4631/NGC4631/zemosaic_temp_master_tiles\\master_tile_003.fits",
+    "C:/Users/TRISTAN/Desktop/astrophoto/NGC4631/NGC4631/zemosaic_temp_master_tiles\\master_tile_006.fits",
+    "C:/Users/TRISTAN/Desktop/astrophoto/NGC4631/NGC4631/zemosaic_temp_master_tiles\\master_tile_008.fits",
+    "C:/Users/TRISTAN/Desktop/astrophoto/NGC4631/NGC4631/zemosaic_temp_master_tiles\\master_tile_010.fits",
+    "C:/Users/TRISTAN/Desktop/astrophoto/NGC4631/NGC4631/zemosaic_temp_master_tiles\\master_tile_011.fits"
   ],
-  "rejected": [],
+  "rejected": [
+    "C:/Users/TRISTAN/Desktop/astrophoto/NGC4631/NGC4631/zemosaic_temp_master_tiles\\rejected_by_quality\\master_tile_004.fits",
+    "C:/Users/TRISTAN/Desktop/astrophoto/NGC4631/NGC4631/zemosaic_temp_master_tiles\\rejected_by_quality\\master_tile_016.fits",
+    "C:/Users/TRISTAN/Desktop/astrophoto/NGC4631/NGC4631/zemosaic_temp_master_tiles\\rejected_by_quality\\master_tile_022.fits"
+  ],
   "scores": {
-    "C:/Users/TRISTAN/Desktop/astrophoto/M81_copie/out/zemosaic_temp_master_tiles\\master_tile_015.fits": 0.3943708314004271,
-    "C:/Users/TRISTAN/Desktop/astrophoto/M81_copie/out/zemosaic_temp_master_tiles\\master_tile_016.fits": 0.3770372274434377,
-    "C:/Users/TRISTAN/Desktop/astrophoto/M81_copie/out/zemosaic_temp_master_tiles\\master_tile_045.fits": 0.39630671250711713,
-    "C:/Users/TRISTAN/Desktop/astrophoto/M81_copie/out/zemosaic_temp_master_tiles\\master_tile_061.fits": 0.42861591678880046,
-    "C:/Users/TRISTAN/Desktop/astrophoto/M81_copie/out/zemosaic_temp_master_tiles\\master_tile_062.fits": 0.4265800909630429,
-    "C:/Users/TRISTAN/Desktop/astrophoto/M81_copie/out/zemosaic_temp_master_tiles\\master_tile_063.fits": 0.43059701259830074,
-    "C:/Users/TRISTAN/Desktop/astrophoto/M81_copie/out/zemosaic_temp_master_tiles\\master_tile_064.fits": 0.4275431658040979,
-    "C:/Users/TRISTAN/Desktop/astrophoto/M81_copie/out/zemosaic_temp_master_tiles\\master_tile_065.fits": 0.4330903159283303,
-    "C:/Users/TRISTAN/Desktop/astrophoto/M81_copie/out/zemosaic_temp_master_tiles\\master_tile_066.fits": 0.4431862284430058
+    "C:/Users/TRISTAN/Desktop/astrophoto/NGC4631/NGC4631/zemosaic_temp_master_tiles\\master_tile_000.fits": 0.4258362750778608,
+    "C:/Users/TRISTAN/Desktop/astrophoto/NGC4631/NGC4631/zemosaic_temp_master_tiles\\master_tile_001.fits": 0.47031946258669477,
+    "C:/Users/TRISTAN/Desktop/astrophoto/NGC4631/NGC4631/zemosaic_temp_master_tiles\\master_tile_002.fits": 0.46155517644747934,
+    "C:/Users/TRISTAN/Desktop/astrophoto/NGC4631/NGC4631/zemosaic_temp_master_tiles\\master_tile_003.fits": 0.4595900365445213,
+    "C:/Users/TRISTAN/Desktop/astrophoto/NGC4631/NGC4631/zemosaic_temp_master_tiles\\master_tile_006.fits": 0.4295854475790237,
+    "C:/Users/TRISTAN/Desktop/astrophoto/NGC4631/NGC4631/zemosaic_temp_master_tiles\\master_tile_008.fits": 0.4071291540059174,
+    "C:/Users/TRISTAN/Desktop/astrophoto/NGC4631/NGC4631/zemosaic_temp_master_tiles\\master_tile_010.fits": 0.4168169751095414,
+    "C:/Users/TRISTAN/Desktop/astrophoto/NGC4631/NGC4631/zemosaic_temp_master_tiles\\master_tile_011.fits": 0.44302272153706984,
+    "C:/Users/TRISTAN/Desktop/astrophoto/NGC4631/NGC4631/zemosaic_temp_master_tiles\\rejected_by_quality\\master_tile_004.fits": 0.5085815640058489,
+    "C:/Users/TRISTAN/Desktop/astrophoto/NGC4631/NGC4631/zemosaic_temp_master_tiles\\rejected_by_quality\\master_tile_016.fits": 0.5452723676507457,
+    "C:/Users/TRISTAN/Desktop/astrophoto/NGC4631/NGC4631/zemosaic_temp_master_tiles\\rejected_by_quality\\master_tile_022.fits": 0.6878640857641096
   }
 }

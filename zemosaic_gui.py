@@ -3537,6 +3537,16 @@ class ZeMosaicGUI:
                         config_overrides = None
 
                     try:
+                        try:
+                            import importlib  # noqa: F401  (only for parity with CLI test)
+                            import zemosaic_filter_gui as _zfg_dbg  # type: ignore
+                            self._log_message(
+                                f"[ZGUI] Filter GUI module path: {_zfg_dbg.__file__}",
+                                level="DEBUG",
+                            )
+                        except Exception as dbg_exc:
+                            self._log_message(f"[ZGUI] Unable to resolve filter GUI module path: {dbg_exc}", level="DEBUG")
+                        self._log_message(f"[ZGUI] Launching Filter UI with input_dir={input_dir}", level="DEBUG")
                         filter_result = launch_filter_interface(
                             input_dir,
                             _initial_overrides,

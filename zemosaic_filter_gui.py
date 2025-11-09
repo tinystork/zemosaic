@@ -836,6 +836,86 @@ def launch_filter_interface(
                 print(f"ERROR (Filter GUI): {msg}{detail}")
             return raw_items_input, False, None
 
+        SIP_COEFF_PREFIXES = ("A_", "B_", "AP_", "BP_")
+        SIP_META_KEYS = {"A_ORDER", "B_ORDER", "AP_ORDER", "BP_ORDER"}
+
+        def _header_contains_sip_terms(header_obj: Any) -> bool:
+            """Return True when the header exposes SIP distortion keywords."""
+
+            if header_obj is None:
+                return False
+            try:
+                keys_iter = list(header_obj.keys())  # type: ignore[arg-type]
+            except Exception:
+                try:
+                    keys_iter = list(header_obj)
+                except Exception:
+                    return False
+            for raw_key in keys_iter:
+                if raw_key is None:
+                    continue
+                key_upper = str(raw_key).strip().upper()
+                if not key_upper:
+                    continue
+                if key_upper in SIP_META_KEYS:
+                    return True
+                for prefix in SIP_COEFF_PREFIXES:
+                    if key_upper.startswith(prefix):
+                        return True
+            return False
+
+        def _ensure_sip_suffix_inplace(header_obj: Any):
+            """Append '-SIP' to CTYPE axes when SIP terms are present."""
+
+            if header_obj is None:
+                return None
+            try:
+                has_sip = _header_contains_sip_terms(header_obj)
+            except Exception:
+                has_sip = False
+            if not has_sip:
+                return header_obj
+
+            def _maybe_update(key: str) -> None:
+                try:
+                    value = header_obj[key]
+                except Exception:
+                    try:
+                        value = header_obj.get(key)
+                    except Exception:
+                        value = None
+                if not isinstance(value, str):
+                    return
+                cleaned = value.strip()
+                if not cleaned or cleaned.upper().endswith("-SIP"):
+                    return
+                new_value = f"{cleaned}-SIP"
+                try:
+                    header_obj[key] = new_value
+                except Exception:
+                    try:
+                        header_obj.set(key, new_value)
+                    except Exception:
+                        pass
+
+            _maybe_update("CTYPE1")
+            _maybe_update("CTYPE2")
+            return header_obj
+
+        def _build_wcs_from_header(header_obj):
+            """Instantiate a WCS while normalizing SIP metadata when needed."""
+
+            if header_obj is None:
+                return None
+            try:
+                hdr = _ensure_sip_suffix_inplace(header_obj)
+            except Exception:
+                hdr = header_obj
+            try:
+                return WCS(hdr, naxis=2, relax=True)
+            except Exception:
+                return None
+
         def _write_header_to_fits_local(file_path: str, header_obj) -> None:
             """Safely persist ``header_obj`` into ``file_path`` FITS header."""
 
@@ -869,12 +949,7 @@ def launch_filter_interface(
         def _has_celestial_wcs(header_obj) -> bool:
             """Return True when ``header_obj`` contains a valid celestial WCS."""
 
-            if header_obj is None:
-                return False
-            try:
-                wcs_obj = WCS(header_obj, naxis=2, relax=True)
-            except Exception:
-                return False
+            wcs_obj = _build_wcs_from_header(header_obj)
             return bool(getattr(wcs_obj, "is_celestial", False))
 
         def footprint_wh_deg(wcs_obj: Any) -> tuple[float, float]:
@@ -1155,16 +1230,13 @@ def launch_filter_interface(
                 except Exception:
                     pass
 
-            try:
-                w = WCS(hdr, naxis=2, relax=True)
-                if w is not None and getattr(w, "is_celestial", False):
-                    payload["wcs"] = w
-                    _assign_pa_metadata(payload, w, payload.get("shape"))
-                    fp = _compute_footprint_from_wcs(w, payload.get("shape"))
-                    if fp:
-                        payload["footprint_radec"] = fp
-            except Exception:
-                pass
+            w = _build_wcs_from_header(hdr)
+            if w is not None and getattr(w, "is_celestial", False):
+                payload["wcs"] = w
+                _assign_pa_metadata(payload, w, payload.get("shape"))
+                fp = _compute_footprint_from_wcs(w, payload.get("shape"))
+                if fp:
+                    payload["footprint_radec"] = fp
 
             keep_keys = {
                 key: hdr.get(key)
@@ -1862,11 +1934,16 @@ def launch_filter_interface(
                 root = tk.Toplevel(parent_root)
                 root_is_toplevel = True
                 try:
-                    root.transient(parent_root)
+                    print("[FilterUI] parent_root detected -> using Toplevel (modal)")
                 except Exception:
                     pass
                 try:
-                    root.grab_set()  # modal
+                    root.transient(parent_root)
+                except Exception:
+                    pass
+                # Apply the modal grab immediately (behavior from main branch)
+                try:
+                    root.grab_set()
                 except Exception:
                     pass
             except Exception:
@@ -1890,6 +1967,7 @@ def launch_filter_interface(
             root.protocol("WM_DELETE_WINDOW", root.destroy)
         except Exception:
             pass
+
         # Top-level layout: left plot, right checkboxes/actions
         main = ttk.Frame(root)
         main.pack(fill=tk.BOTH, expand=True)
@@ -1919,6 +1997,70 @@ def launch_filter_interface(
         )
         analyse_btn.grid(row=0, column=0, padx=(0, 6))
         export_btn.grid(row=0, column=1)
+
+        max_button_state = {
+            "active": False,
+            "geometry": None,
+            "used_zoom_state": False,
+        }
+        max_button_normal = _tr("filter_btn_maximize", "Maximize")
+        max_button_restore = _tr("filter_btn_restore", "Restore")
+        max_button_text = tk.StringVar(master=root, value=max_button_normal)
+
+        def _toggle_maximize() -> None:
+            """Toggle between normal size and a maximized state."""
+
+            if not root.winfo_exists():
+                return
+
+            if max_button_state["active"]:
+                # Restore previous geometry/state
+                if max_button_state.get("used_zoom_state"):
+                    try:
+                        root.state("normal")
+                    except Exception:
+                        pass
+                geometry = max_button_state.get("geometry")
+                if isinstance(geometry, str) and geometry:
+                    try:
+                        root.geometry(geometry)
+                    except Exception:
+                        pass
+                max_button_state["active"] = False
+                max_button_state["used_zoom_state"] = False
+                max_button_text.set(max_button_normal)
+                return
+
+            # Save current geometry before maximizing
+            try:
+                max_button_state["geometry"] = root.geometry()
+            except Exception:
+                max_button_state["geometry"] = None
+            max_button_state["used_zoom_state"] = False
+
+            # Prefer native zoomed state when available (mostly on Windows)
+            try:
+                root.state("zoomed")
+                max_button_state["used_zoom_state"] = True
+            except Exception:
+                # Fallback: manually span the primary screen
+                try:
+                    screen_w = root.winfo_screenwidth()
+                    screen_h = root.winfo_screenheight()
+                    root.geometry(f"{screen_w}x{screen_h}+0+0")
+                except Exception:
+                    pass
+
+            max_button_state["active"] = True
+            max_button_text.set(max_button_restore)
+
+        maximise_btn = ttk.Button(
+            btn_bar,
+            textvariable=max_button_text,
+            command=_toggle_maximize,
+            width=10,
+        )
+        maximise_btn.grid(row=0, column=2, padx=(6, 0))
         total_initial_entries = len(items)
 
         if startup_status_messages:
@@ -1991,10 +2133,16 @@ def launch_filter_interface(
             except Exception:
                 pass
 
-        # Matplotlib figure
-        # Use constrained_layout to reduce internal padding and let the
-        # figure adapt to the available space.
-        fig = Figure(figsize=(7.0, 5.0), dpi=100, constrained_layout=True)
+        # Matplotlib figure (manual layout so the axes stay pinned to the bottom)
+        fig = Figure(figsize=(7.0, 5.0), dpi=100)
+        # Disable Matplotlib's automatic layout engines so that manual
+        # adjustments (anchor, subplots_adjust) keep the axes glued to the
+        # bottom edge even when the widget provides extra vertical room.
+        try:
+            if hasattr(fig, "set_layout_engine"):
+                fig.set_layout_engine(None)
+        except Exception:
+            pass
         ax = fig.add_subplot(111)
         ax.set_xlabel(_tr(
             "filter_axis_ra_deg",
@@ -2004,13 +2152,18 @@ def launch_filter_interface(
             "filter_axis_dec_deg",
             "Dec [deg]"
         ))
-        ax.set_aspect("equal", adjustable="datalim")
+        ax.set_aspect("equal", adjustable="box", anchor="C")
+        # Explicit anchor keeps the plot centered vertically when the surface
+        # provides more height than the figure needs.
+        ax.set_anchor("C")
         # For sky-like view, invert RA axis (optional)
         ax.invert_xaxis()
 
         canvas = FigureCanvasTkAgg(fig, master=main)
         canvas_widget = canvas.get_tk_widget()
-        canvas_widget.grid(row=1, column=0, sticky="nsew")
+        # Anchor the plot to the bottom edge so the RA axis remains visible when
+        # extra height is available.
+        canvas_widget.grid(row=1, column=0, sticky="sew")
 
         # Make the Matplotlib figure follow the widget size to avoid
         # large empty borders around the plot.
@@ -2033,6 +2186,13 @@ def launch_filter_interface(
                         fig.subplots_adjust(left=0.06, right=0.995, bottom=0.08, top=0.98)
                 except Exception:
                     pass
+                try:
+                    # Re-apply anchor after subplot adjustments or box-aspect tweaks
+                    # because Matplotlib may reset the position during tight layout
+                    # calculations, which brings the RA axis back to the top.
+                    ax.set_anchor("SW")
+                except Exception:
+                    pass
                 canvas.draw_idle()
             except Exception:
                 pass
@@ -2046,7 +2206,8 @@ def launch_filter_interface(
                     canvas_widget.after_cancel(_resize_job["id"])  # type: ignore[arg-type]
                 _resize_job["id"] = canvas_widget.after(60, lambda: (_apply_resize(), _resize_job.update({"id": None})))
             except Exception:
-                pass
+                _apply_resize()
+                _resize_job["id"] = None
 
         # Bind and trigger once to sync initial size
         try:
@@ -3155,14 +3316,12 @@ def launch_filter_interface(
                         result["error"] = f"header load failed: {exc}"
                         result["duration"] = time.monotonic() - start_ts
                         return result
-                if _has_celestial_wcs(header_payload):
+                existing_wcs = _build_wcs_from_header(header_payload)
+                if existing_wcs is not None and getattr(existing_wcs, "is_celestial", False):
                     result["ok"] = True
                     result["skipped"] = True
-                    try:
-                        result["wcs"] = WCS(header_payload, naxis=2, relax=True)
-                        _assign_pa_metadata(result, result["wcs"], result.get("shape"))
-                    except Exception:
-                        pass
+                    result["wcs"] = existing_wcs
+                    _assign_pa_metadata(result, existing_wcs, result.get("shape"))
                     result["header"] = header_payload
                     result["return_code"] = 0
                     result["duration"] = time.monotonic() - start_ts
@@ -4273,12 +4432,9 @@ def launch_filter_interface(
                             result["corners"] = footprint_pts
                         return result
 
-                    try:
-                        existing = WCS(header_obj, naxis=2, relax=True)
-                        if existing is not None and getattr(existing, "is_celestial", False):
-                            return _on_success("Header", existing)
-                    except Exception:
-                        pass
+                    existing = _build_wcs_from_header(header_obj)
+                    if existing is not None and getattr(existing, "is_celestial", False):
+                        return _on_success("Header", existing)
 
                     last_error: Optional[str] = None
 
@@ -5180,63 +5336,36 @@ def launch_filter_interface(
             bottom.pack(fill=tk.X, expand=False)
         except Exception:
             bottom.pack(fill=tk.X)
-        try:
-            right.update_idletasks()
-            _dbg("Right panel constructed; awaiting controls visibility check…")
-        except Exception:
-            pass
-
-        def _ensure_controls_visible_later():
-            try:
-                # If controls area didn't map yet (themes/geometry lag), give
-                # those rows a larger minimum size and try again shortly.
-                if not bottom.winfo_ismapped() or bottom.winfo_height() < 5:
-                    try:
-                        right.rowconfigure(3, minsize=180)
-                    except Exception:
-                        pass
-                    try:
-                        _dbg("Controls not visible yet; increasing row minsize and retrying…")
-                    except Exception:
-                        pass
-                    root.after(150, _ensure_controls_visible_later)
-                else:
-                    try:
-                        _dbg(f"Controls visible: operations={operations.winfo_height()} actions={actions.winfo_height()} bottom={bottom.winfo_height()}")
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-
-        try:
-            root.after(200, _ensure_controls_visible_later)
-        except Exception as e:
-            _log_message(f"[FilterUI] Scheduling visibility check failed: {e}", level="WARN")
-
-        # Keep controls row visible across resizes or heavy redraws (ASTAP/zoom)
         def _enforce_right_grid(_event: Any | None = None) -> None:
             try:
-                # Ensure the scrollable list (row=2) is the only stretchable row
                 right.rowconfigure(0, weight=0)
                 right.rowconfigure(1, weight=0)
                 right.rowconfigure(2, weight=1)
-                # Maintain a sane minimum height for the bottom controls
                 desired = 0
                 try:
-                    desired = int(operations.winfo_reqheight()) + int(actions.winfo_reqheight()) + int(bottom.winfo_reqheight()) + 12
+                    desired = (
+                        int(operations.winfo_reqheight())
+                        + int(actions.winfo_reqheight())
+                        + int(bottom.winfo_reqheight())
+                        + 12
+                    )
                 except Exception:
                     desired = 180
                 right.rowconfigure(3, weight=0, minsize=max(160, desired))
             except Exception:
-                # Last resort: at least ensure row 3 doesn't collapse fully
                 try:
                     right.rowconfigure(3, minsize=180)
                 except Exception:
                     pass
 
         try:
+            right.update_idletasks()
+            _enforce_right_grid()
+        except Exception:
+            pass
+
+        try:
             right.bind("<Configure>", _enforce_right_grid)
-            root.after_idle(_enforce_right_grid)
         except Exception:
             pass
         result: dict[str, Any] = {
@@ -6983,6 +7112,8 @@ def launch_filter_interface(
             root.destroy()
         root.protocol("WM_DELETE_WINDOW", on_close)
 
+        # (Modal grab already applied when creating the Toplevel.)
+
         # Start modal loop (use wait_window for Toplevel)
         try:
             if root_is_toplevel:
@@ -7202,4 +7333,3 @@ if __name__ == "__main__":
         print(f"[FilterUI] Unhandled error: {_exc}")
         import traceback as _tb
         print(_tb.format_exc())
-

@@ -472,6 +472,8 @@
     "filter_btn_auto_group": "Auto-organiser les Master Tiles",
     "filter_btn_analyse": "Analyser",
     "filter_btn_export_csv": "Exporter en CSV",
+    "filter_btn_maximize": "Agrandir",
+    "filter_btn_restore": "Rétablir",
     "filter_chk_draw_footprints": "Tracer les empreintes WCS",
     "filter_label_astap_instances": "Nombre max. d'instances ASTAP",
     "filter_astap_multi_warning_title": "Avertissement concurrence ASTAP",
