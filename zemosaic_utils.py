@@ -603,6 +603,43 @@ def write_final_fits_uint16_color_aware(
                 hdul.close()
             except Exception:
                 pass
+
+
+def append_alpha_hdu(hdul, alpha_arr):
+    """
+    Ensure an ALPHA image extension (uint8, 0..255) matches *alpha_arr*.
+    Replaces an existing ALPHA HDU while leaving other HDUs untouched.
+    """
+    if hdul is None or alpha_arr is None:
+        return
+    if fits_module_for_utils is None:
+        raise RuntimeError("append_alpha_hdu requires astropy.io.fits")
+
+    alpha = np.asarray(alpha_arr)
+    if alpha.ndim == 3 and alpha.shape[-1] == 1:
+        alpha = alpha[..., 0]
+    elif alpha.ndim > 2:
+        alpha = np.squeeze(alpha)
+    if alpha.ndim != 2:
+        raise ValueError(f"alpha_arr must be 2D, got shape={alpha.shape}")
+    alpha = np.nan_to_num(alpha, nan=0.0, posinf=0.0, neginf=0.0)
+    alpha_u8 = np.clip(alpha, 0, 255).astype(np.uint8, copy=False)
+
+    indices_to_drop: list[int] = []
+    for idx in range(1, len(hdul)):
+        name = getattr(hdul[idx], "name", "")
+        if isinstance(name, str) and name.upper() == "ALPHA":
+            indices_to_drop.append(idx)
+    for idx in reversed(indices_to_drop):
+        del hdul[idx]
+
+    alpha_hdu = fits_module_for_utils.ImageHDU(data=alpha_u8, name="ALPHA")
+    alpha_hdu.header["ALPHADSC"] = ("1=opaque(in), 0=transparent(out)", "")
+    hdul.append(alpha_hdu)
+    try:
+        hdul[0].header["ALPHAEXT"] = (1, "Alpha mask ext present")
+    except Exception:
+        pass
 # --- Fin Définition locale ---
 
 warnings.filterwarnings("ignore", category=FutureWarning)

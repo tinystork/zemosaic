@@ -114,6 +114,7 @@ except Exception:
 UNALIGNED_DIRNAME = "unaligned_by_zemosaic"
 _UNALIGNED_LOCK = Lock()
 
+ALPHA_OPACITY_THRESHOLD = 0.5  # Mask values >= threshold are treated as opaque
 
 def _move_to_unaligned_safe(
     src_path: str | os.PathLike,
@@ -221,11 +222,89 @@ def _move_to_unaligned_safe(
         return "failed", dst
 
 
-def _apply_lecropper_pipeline(arr: np.ndarray | None, cfg: dict | None) -> np.ndarray | None:
-    """Apply quality crop + Alt-Az cleanup if the new lecropper is available."""
+def _normalize_alpha_mask(
+    mask: np.ndarray | None,
+    target_hw: tuple[int, int] | None = None,
+    *,
+    opacity_threshold: float | None = None,
+) -> np.ndarray | None:
+    """Normalize any mask-like array to uint8 alpha (0-255), optionally resizing."""
+
+    if mask is None:
+        return None
+    alpha = np.asarray(mask)
+    if alpha.ndim == 3 and alpha.shape[-1] == 1:
+        alpha = alpha[..., 0]
+    alpha = np.squeeze(alpha)
+    if alpha.ndim != 2:
+        return None
+
+    alpha = np.nan_to_num(alpha, nan=0.0, posinf=0.0, neginf=0.0)
+    max_val = float(np.nanmax(alpha)) if alpha.size else 0.0
+    if alpha.dtype.kind in {"i", "u"} and max_val > 1.0:
+        alpha = alpha.astype(np.float32) / 255.0
+    elif alpha.dtype.kind not in {"f"}:
+        alpha = alpha.astype(np.float32)
+    alpha = np.clip(alpha, 0.0, 1.0).astype(np.float32, copy=False)
+    if opacity_threshold is not None:
+        thresh = float(np.clip(opacity_threshold, 0.0, 1.0))
+        alpha = np.where(alpha >= thresh, 1.0, 0.0).astype(np.float32, copy=False)
+
+    if target_hw and alpha.shape != target_hw:
+        try:
+            import cv2  # type: ignore
+
+            alpha = cv2.resize(
+                alpha,
+                (target_hw[1], target_hw[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        except Exception:
+            return None
+
+    return np.clip(alpha * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+
+def _combine_alpha_masks(primary: np.ndarray | None, secondary: np.ndarray | None) -> np.ndarray | None:
+    """Combine two uint8 alpha maps by multiplying their transparencies."""
+
+    if secondary is None:
+        return primary
+    if primary is None:
+        return secondary
+    if primary.shape != secondary.shape:
+        try:
+            import cv2  # type: ignore
+
+            secondary = cv2.resize(
+                secondary,
+                (primary.shape[1], primary.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
+        except Exception:
+            logger.warning(
+                "Alpha combination skipped due to incompatible shapes: %s vs %s",
+                primary.shape,
+                secondary.shape,
+            )
+            return primary
+
+    p = primary.astype(np.float32) / 255.0
+    s = secondary.astype(np.float32) / 255.0
+    merged = np.clip(p * s, 0.0, 1.0)
+    return np.clip(merged * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+
+def _apply_lecropper_pipeline(
+    arr: np.ndarray | None, cfg: dict | None
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Apply quality crop + Alt-Az cleanup if the new lecropper is available.
+
+    Returns (processed_array, optional_alpha_mask_float).
+    """
 
     if not (_LECROPPER_AVAILABLE and isinstance(arr, np.ndarray) and arr.size):
-        return arr
+        return arr, None
 
     cfg = cfg or {}
     try:
@@ -267,6 +346,7 @@ def _apply_lecropper_pipeline(arr: np.ndarray | None, cfg: dict | None) -> np.nd
         az_nanize = True
 
     out = arr
+    alpha_mask_norm: np.ndarray | None = None
     try:
         if q_enabled and hasattr(lecropper, "quality_crop"):
             out = lecropper.quality_crop(
@@ -278,28 +358,71 @@ def _apply_lecropper_pipeline(arr: np.ndarray | None, cfg: dict | None) -> np.nd
             )
 
         if az_enabled:
-            if hasattr(lecropper, "altZ_cleanup"):
-                out = lecropper.altZ_cleanup(
-                    out,
+            mask2d = None
+            mask_helper = getattr(lecropper, "mask_altaz_artifacts", None)
+            base_for_mask = out
+            if callable(mask_helper):
+                try:
+                    masked, mask2d = mask_helper(
+                        base_for_mask,
+                        margin_percent=az_margin,
+                        decay_ratio=az_decay,
+                        fill_value=None,
+                        return_mask=True,
+                    )
+                except TypeError:
+                    masked = mask_helper(
+                        base_for_mask,
+                        margin_percent=az_margin,
+                        decay_ratio=az_decay,
+                        fill_value=None,
+                    )
+                    mask2d = None
+                if mask2d is None:
+                    out = masked
+                else:
+                    out = base_for_mask
+            elif hasattr(lecropper, "altZ_cleanup"):
+                cleaned = lecropper.altZ_cleanup(
+                    base_for_mask,
                     margin_percent=az_margin,
                     decay=az_decay,
                     nanize=az_nanize,
                 )
+                if isinstance(cleaned, (tuple, list)) and len(cleaned) >= 2:
+                    out, mask2d = cleaned[:2]
+                else:
+                    out = cleaned
             elif hasattr(lecropper, "apply_altaz_cleanup"):
-                out = lecropper.apply_altaz_cleanup(
-                    out,
+                cleaned = lecropper.apply_altaz_cleanup(
+                    base_for_mask,
                     margin_percent=az_margin,
                     decay=az_decay,
                     nanize=az_nanize,
                 )
+                if isinstance(cleaned, (tuple, list)) and len(cleaned) >= 2:
+                    out, mask2d = cleaned[:2]
+                else:
+                    out = cleaned
+
+            if mask2d is not None:
+                alpha_mask_norm = np.asarray(mask2d, dtype=np.float32, copy=False)
+                hard_threshold = 1e-3
+                mask_zero = alpha_mask_norm <= hard_threshold
+                if base_for_mask.ndim == 3:
+                    mask_zero = mask_zero[..., None]
+                if az_nanize:
+                    out = np.where(mask_zero, np.nan, base_for_mask)
+                else:
+                    out = np.where(mask_zero, 0.0, base_for_mask)
     except Exception as exc:
         try:
             logger.warning("lecropper pipeline skipped (err=%s)", exc)
         except Exception:
             pass
-        return arr
+        return arr, None
 
-    return out
+    return out, alpha_mask_norm
 
 
 _MASTER_TILE_ID_LOCK = Lock()
@@ -479,11 +602,12 @@ def load_image_with_optional_alpha(
             alpha = np.clip(alpha, 0, 255).astype(np.uint8, copy=False)
             weights = alpha.astype(np.float32) / 255.0
             weights = np.clip(weights, 0.0, 1.0)
-            if data.ndim == 2:
-                if weights.shape == data.shape:
-                    data = np.where(weights <= 0.0, np.nan, data)
+            mask_zero = weights <= ALPHA_OPACITY_THRESHOLD
+            weights = np.where(mask_zero, 0.0, 1.0)
+            if data.ndim == 2 and weights.shape == data.shape:
+                data = np.where(mask_zero, np.nan, data)
             elif data.ndim == 3 and weights.shape == data.shape[:2]:
-                data = np.where(weights[..., None] <= 0.0, np.nan, data)
+                data = np.where(mask_zero[..., None], np.nan, data)
 
     return data, weights, alpha
 
@@ -2220,7 +2344,17 @@ def _run_phase4_5_inter_master_merge(
                 "altaz_decay": stack_cfg.get("altaz_decay"),
                 "altaz_nanize": stack_cfg.get("altaz_nanize"),
             }
-            super_arr = _apply_lecropper_pipeline(super_arr, pipeline_cfg)
+            super_arr, pipeline_alpha_mask = _apply_lecropper_pipeline(super_arr, pipeline_cfg)
+            if super_arr is None:
+                logger.debug("[P4.5][G%03d] Lecropper pipeline returned empty array", group_id)
+                continue
+            pipeline_alpha_u8 = _normalize_alpha_mask(
+                pipeline_alpha_mask,
+                target_hw=super_arr.shape[:2],
+                opacity_threshold=ALPHA_OPACITY_THRESHOLD,
+            )
+            if pipeline_alpha_u8 is not None:
+                alpha_out = _combine_alpha_masks(alpha_out, pipeline_alpha_u8)
             arr_shape = tuple(super_arr.shape)
             logger.debug(
                 "[P4.5][G%03d] Super array ready: shape=%s, dtype=%s",
@@ -7324,15 +7458,25 @@ def create_master_tile(
         "altaz_decay": altaz_decay,
         "altaz_nanize": altaz_nanize,
     }
-    master_tile_stacked_HWC = _apply_lecropper_pipeline(master_tile_stacked_HWC, pipeline_cfg)
+    master_tile_stacked_HWC, pipeline_alpha_mask = _apply_lecropper_pipeline(master_tile_stacked_HWC, pipeline_cfg)
+    if master_tile_stacked_HWC is None:
+        raise RuntimeError("lecropper pipeline returned no data for master tile")
     alpha_mask_out: np.ndarray | None = None
+    pipeline_alpha_u8 = _normalize_alpha_mask(
+        pipeline_alpha_mask,
+        target_hw=master_tile_stacked_HWC.shape[:2],
+        opacity_threshold=ALPHA_OPACITY_THRESHOLD,
+    )
+    if pipeline_alpha_u8 is not None:
+        alpha_mask_out = pipeline_alpha_u8
     try:
-        arr_for_alpha = np.asarray(master_tile_stacked_HWC)
-        if arr_for_alpha.ndim == 3:
-            valid_mask = np.any(np.isfinite(arr_for_alpha), axis=-1)
-        else:
-            valid_mask = np.isfinite(arr_for_alpha)
-        alpha_mask_out = np.where(valid_mask, 255, 0).astype(np.uint8)
+        if alpha_mask_out is None:
+            arr_for_alpha = np.asarray(master_tile_stacked_HWC)
+            if arr_for_alpha.ndim == 3:
+                valid_mask = np.any(np.isfinite(arr_for_alpha), axis=-1)
+            else:
+                valid_mask = np.isfinite(arr_for_alpha)
+            alpha_mask_out = np.where(valid_mask, 255, 0).astype(np.uint8)
     except Exception:
         alpha_mask_out = None
 
@@ -8347,12 +8491,19 @@ def assemble_final_mosaic_reproject_coadd(
     total_tiles_for_prep = len(master_tile_fits_with_wcs_list)
     for idx, (tile_path, tile_wcs) in enumerate(master_tile_fits_with_wcs_list, 1):
         tile_header = None
+        alpha_mask_arr: np.ndarray | None = None
         with fits.open(tile_path, memmap=False) as hdul:
-            data = hdul[0].data.astype(np.float32)
+            primary_hdu = hdul[0]
+            data = np.asarray(primary_hdu.data, dtype=np.float32, order="C")
             try:
-                tile_header = hdul[0].header.copy()
+                tile_header = primary_hdu.header.copy()
             except Exception:
                 tile_header = None
+            if "ALPHA" in hdul and hdul["ALPHA"].data is not None:
+                try:
+                    alpha_mask_arr = np.asarray(hdul["ALPHA"].data, dtype=np.float32, copy=False)
+                except Exception:
+                    alpha_mask_arr = None
 
         # Master tiles saved via ``save_fits_image`` use the ``HWC`` axis order
         # which stores color images in ``C x H x W`` within the FITS file. When
@@ -8362,6 +8513,18 @@ def assemble_final_mosaic_reproject_coadd(
         if data.ndim == 2:
             data = data[..., np.newaxis]
 
+        if alpha_mask_arr is not None:
+            alpha_mask_arr = np.squeeze(alpha_mask_arr)
+            if alpha_mask_arr.ndim == 3 and alpha_mask_arr.shape[0] == 1:
+                alpha_mask_arr = alpha_mask_arr[0]
+            alpha_mask_arr = np.nan_to_num(alpha_mask_arr, nan=0.0, posinf=0.0, neginf=0.0)
+            max_alpha_val = float(np.nanmax(alpha_mask_arr)) if alpha_mask_arr.size else 0.0
+            if alpha_mask_arr.dtype.kind in {"i", "u"} and max_alpha_val > 1.0:
+                alpha_mask_arr = alpha_mask_arr.astype(np.float32, copy=False) / 255.0
+            elif alpha_mask_arr.dtype.kind not in {"f"}:
+                alpha_mask_arr = alpha_mask_arr.astype(np.float32, copy=False)
+            alpha_mask_arr = np.clip(alpha_mask_arr, 0.0, 1.0)
+
         if (
             apply_crop
             and crop_percent > 1e-3
@@ -8369,6 +8532,7 @@ def assemble_final_mosaic_reproject_coadd(
             and hasattr(zemosaic_utils, "crop_image_and_wcs")
         ):
             try:
+                original_hw = data.shape[:2]
                 cropped, cropped_wcs = zemosaic_utils.crop_image_and_wcs(
                     data,
                     tile_wcs,
@@ -8378,6 +8542,20 @@ def assemble_final_mosaic_reproject_coadd(
                 if cropped is not None and cropped_wcs is not None:
                     data = cropped
                     tile_wcs = cropped_wcs
+                    if (
+                        alpha_mask_arr is not None
+                        and alpha_mask_arr.shape == original_hw
+                        and data.shape[:2] != original_hw
+                    ):
+                        dh = (original_hw[0] - data.shape[0]) // 2
+                        dw = (original_hw[1] - data.shape[1]) // 2
+                        top = max(dh, 0)
+                        left = max(dw, 0)
+                        bottom = top + data.shape[0]
+                        right = left + data.shape[1]
+                        alpha_mask_arr = alpha_mask_arr[top:bottom, left:right]
+                    elif alpha_mask_arr is not None and alpha_mask_arr.shape != data.shape[:2]:
+                        alpha_mask_arr = None
             except Exception:
                 pass
 
@@ -8402,6 +8580,20 @@ def assemble_final_mosaic_reproject_coadd(
                 hdr_for_output = hdr
             except Exception:
                 pass
+        if alpha_mask_arr is not None:
+            if alpha_mask_arr.shape != data.shape[:2]:
+                logger.debug(
+                    "[Alpha] Master tile mask shape mismatch: tile=%s, mask_shape=%s, data_shape=%s",
+                    os.path.basename(str(tile_path)),
+                    alpha_mask_arr.shape,
+                    data.shape,
+                )
+                alpha_mask_arr = None
+            else:
+                zero_mask = alpha_mask_arr <= ALPHA_OPACITY_THRESHOLD
+                if np.any(zero_mask):
+                    data = np.asarray(data, dtype=np.float32, order="C", copy=True)
+                    data[zero_mask[..., None]] = np.nan
 
         tile_entry = {
             "data": data,
@@ -8855,25 +9047,57 @@ def assemble_final_mosaic_reproject_coadd(
         alpha_map=alpha_union,
     )
 
-    # --- ALPHA FINAL: propager l’alpha jusqu’à la sauvegarde ---
+    # --- ALPHA FINAL: propagate union alpha to FITS + PNG ---
     alpha_final = None
     try:
         if alpha_union is not None:
             a = np.asarray(alpha_union)
-            # S'assurer de la forme (H,W)
-            if a.ndim > 2:
-                a = np.squeeze(a)
             if a.ndim == 3 and a.shape[-1] == 1:
                 a = a[..., 0]
-            # Normaliser en uint8 0..255 si ce n’est pas déjà le cas
-            if a.dtype != np.uint8:
-                # Si alpha est [0..1] -> 0..255 ; sinon binaire/poids quelconque -> clamp
-                a = (np.clip(a, 0.0, 1.0) * 255.0).astype(np.uint8)
-            alpha_final = a
-            logger.info("[Alpha] Union mask propagated to Phase 6, shape=%s, dtype=%s", a.shape, a.dtype)
-    except Exception as _e_alpha_norm:
+            elif a.ndim > 2:
+                a = np.squeeze(a)
+            a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+            if a.dtype == np.bool_:
+                a = a.astype(np.uint8) * 255
+            elif np.issubdtype(a.dtype, np.floating):
+                max_val = float(np.nanmax(a)) if a.size else 0.0
+                min_val = float(np.nanmin(a)) if a.size else 0.0
+                if max_val <= 1.0 + 1e-6 and min_val >= -1e-6:
+                    a = (np.clip(a, 0.0, 1.0) * 255.0).astype(np.uint8)
+                else:
+                    a = np.clip(a, 0.0, 255.0).astype(np.uint8)
+            elif a.dtype != np.uint8:
+                a = np.clip(a, 0, 255).astype(np.uint8)
+            if mosaic_data is not None and a.shape[:2] != mosaic_data.shape[:2]:
+                try:
+                    import cv2
+
+                    a = cv2.resize(
+                        a,
+                        (mosaic_data.shape[1], mosaic_data.shape[0]),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                except Exception:
+                    if (
+                        a.shape[0] >= mosaic_data.shape[0]
+                        and a.shape[1] >= mosaic_data.shape[1]
+                    ):
+                        a = a[: mosaic_data.shape[0], : mosaic_data.shape[1]]
+                    else:
+                        raise ValueError(
+                            f"alpha_union shape {a.shape} mismatch with mosaic {mosaic_data.shape}"
+                        )
+            threshold_u8 = int(ALPHA_OPACITY_THRESHOLD * 255)
+            if threshold_u8 > 0:
+                a = np.where(a >= threshold_u8, 255, 0).astype(np.uint8, copy=False)
+            alpha_final = np.ascontiguousarray(a, dtype=np.uint8)
+            logger.info(
+                "phase6: alpha_union received, propagating to alpha_final (uint8 %s)",
+                alpha_final.shape,
+            )
+    except Exception as e_alpha_norm:
         alpha_final = None
-        logger.debug("Alpha union normalization failed: %s", _e_alpha_norm)
+        logger.warning("phase6: alpha propagation failed: %s", e_alpha_norm)
 
     # Defer memmap cleanup to Phase 6 after final save
 
@@ -11903,16 +12127,46 @@ def run_hierarchical_mosaic(
     try:
         if isinstance(final_alpha_map, np.ndarray):
             alpha_candidate = np.asarray(final_alpha_map)
-            if alpha_candidate.ndim > 2:
-                alpha_candidate = np.squeeze(alpha_candidate)
             if alpha_candidate.ndim == 3 and alpha_candidate.shape[-1] == 1:
                 alpha_candidate = alpha_candidate[..., 0]
-            if alpha_candidate.dtype != np.uint8:
-                if np.issubdtype(alpha_candidate.dtype, np.integer):
-                    alpha_candidate = np.clip(alpha_candidate, 0, 255).astype(np.uint8)
-                else:
+            elif alpha_candidate.ndim > 2:
+                alpha_candidate = np.squeeze(alpha_candidate)
+            alpha_candidate = np.nan_to_num(alpha_candidate, nan=0.0, posinf=0.0, neginf=0.0)
+            if alpha_candidate.dtype == np.bool_:
+                alpha_candidate = alpha_candidate.astype(np.uint8) * 255
+            elif np.issubdtype(alpha_candidate.dtype, np.floating):
+                max_val = float(np.nanmax(alpha_candidate)) if alpha_candidate.size else 0.0
+                min_val = float(np.nanmin(alpha_candidate)) if alpha_candidate.size else 0.0
+                if max_val <= 1.0 + 1e-6 and min_val >= -1e-6:
                     alpha_candidate = (np.clip(alpha_candidate, 0.0, 1.0) * 255.0).astype(np.uint8)
-            alpha_final = alpha_candidate
+                else:
+                    alpha_candidate = np.clip(alpha_candidate, 0.0, 255.0).astype(np.uint8)
+            elif alpha_candidate.dtype != np.uint8:
+                alpha_candidate = np.clip(alpha_candidate, 0, 255).astype(np.uint8)
+            if (
+                isinstance(final_mosaic_data_HWC, np.ndarray)
+                and alpha_candidate.shape[:2] != final_mosaic_data_HWC.shape[:2]
+            ):
+                try:
+                    import cv2  # type: ignore
+
+                    alpha_candidate = cv2.resize(
+                        alpha_candidate,
+                        (final_mosaic_data_HWC.shape[1], final_mosaic_data_HWC.shape[0]),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                except Exception:
+                    if (
+                        alpha_candidate.shape[0] >= final_mosaic_data_HWC.shape[0]
+                        and alpha_candidate.shape[1] >= final_mosaic_data_HWC.shape[1]
+                    ):
+                        alpha_candidate = alpha_candidate[
+                            : final_mosaic_data_HWC.shape[0], : final_mosaic_data_HWC.shape[1]
+                        ]
+                    else:
+                        alpha_candidate = None
+            if alpha_candidate is not None:
+                alpha_final = np.ascontiguousarray(alpha_candidate, dtype=np.uint8)
         elif isinstance(final_mosaic_data_HWC, np.ndarray):
             if final_mosaic_coverage_HW is not None:
                 cov = np.nan_to_num(
@@ -11938,7 +12192,8 @@ def run_hierarchical_mosaic(
                     else np.isfinite(final_mosaic_data_HWC)
                 )
                 alpha_final = (mask_valid.astype(np.float32) * 255.0).astype(np.uint8)
-    except Exception:
+    except Exception as exc_alpha_final:
+        logger.warning("phase6: alpha propagation fallback engaged: %s", exc_alpha_final)
         alpha_final = None
 
     current_global_progress = base_progress_phase5 + PROGRESS_WEIGHT_PHASE5_ASSEMBLY
@@ -12053,33 +12308,27 @@ def run_hierarchical_mosaic(
         if not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils): 
             raise RuntimeError("zemosaic_utils non disponible pour sauvegarde FITS.")
         legacy_rgb_flag = bool(legacy_rgb_cube_config)
-        def _append_alpha_extension(target_path: str, alpha_data: np.ndarray | None) -> None:
-            if alpha_data is None or not os.path.exists(target_path):
+        def _attach_alpha_extension(target_path: str, *, log_success: bool = False) -> None:
+            if (
+                alpha_final is None
+                or not target_path
+                or not os.path.exists(target_path)
+                or not (ASTROPY_AVAILABLE and fits)
+                or not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils)
+                or not hasattr(zemosaic_utils, "append_alpha_hdu")
+            ):
                 return
             try:
-                alpha_arr = np.asarray(alpha_data, dtype=np.uint8, copy=False)
-                if alpha_arr.ndim > 2:
-                    alpha_arr = np.squeeze(alpha_arr)
-                if alpha_arr.ndim == 3 and alpha_arr.shape[-1] == 1:
-                    alpha_arr = alpha_arr[..., 0]
                 with fits.open(target_path, mode="update") as hdul_final:
-                    alpha_hdu = None
-                    for hdu in hdul_final:
-                        name = getattr(hdu, "name", "")
-                        if isinstance(name, str) and name.upper() == "ALPHA":
-                            alpha_hdu = hdu
-                            break
-                    if alpha_hdu is not None:
-                        alpha_hdu.data = alpha_arr
-                        alpha_hdu.header["ALPHADSC"] = ("1=opaque(in), 0=transparent(out)", "")
-                    else:
-                        alpha_hdu = fits.ImageHDU(alpha_arr, name="ALPHA")
-                        alpha_hdu.header["ALPHADSC"] = ("1=opaque(in), 0=transparent(out)", "")
-                        hdul_final.append(alpha_hdu)
-                    hdul_final[0].header["ALPHAEXT"] = (1, "Alpha mask ext present")
+                    zemosaic_utils.append_alpha_hdu(hdul_final, alpha_final)
                     hdul_final.flush()
+                if log_success:
+                    logger.info(
+                        "phase6: wrote ALPHA extension (uint8, 0–255), shape=%s",
+                        getattr(alpha_final, "shape", None),
+                    )
             except Exception as exc_alpha:
-                logger.debug("Failed to append/update ALPHA extension to %s: %s", target_path, exc_alpha)
+                logger.warning("phase6: could not write ALPHA extension: %s", exc_alpha)
 
         if bool(save_final_as_uint16_config) and not legacy_rgb_flag:
             if not hasattr(zemosaic_utils, "write_final_fits_uint16_color_aware"):
@@ -12097,7 +12346,7 @@ def run_hierarchical_mosaic(
                 legacy_rgb_cube=legacy_rgb_flag,
                 overwrite=True,
             )
-            _append_alpha_extension(final_fits_path, alpha_final)
+            _attach_alpha_extension(final_fits_path, log_success=True)
             if is_rgb:
                 pcb(
                     "run_info_phase6_saved_uint16_rgb_planes",
@@ -12117,7 +12366,7 @@ def run_hierarchical_mosaic(
                 axis_order="HWC",
                 alpha_mask=alpha_final,
             )
-            _append_alpha_extension(final_fits_path, alpha_final)
+            _attach_alpha_extension(final_fits_path, log_success=True)
 
             if (
                 ZEMOSAIC_UTILS_AVAILABLE
@@ -12135,7 +12384,7 @@ def run_hierarchical_mosaic(
                         legacy_rgb_cube=legacy_rgb_flag,
                         overwrite=True,
                     )
-                    _append_alpha_extension(viewer_fits_path, alpha_final)
+                    _attach_alpha_extension(viewer_fits_path, log_success=False)
                     pcb(
                         "run_info_phase6_viewer_fits_saved",
                         prog=None,
@@ -12210,33 +12459,71 @@ def run_hierarchical_mosaic(
             if alpha_final is not None:
                 try:
                     alpha_src = np.asarray(alpha_final, dtype=np.uint8, copy=False)
-                    if alpha_src.ndim > 2:
-                        alpha_src = np.squeeze(alpha_src)
                     if alpha_src.ndim == 3 and alpha_src.shape[-1] == 1:
                         alpha_src = alpha_src[..., 0]
-                    if alpha_src.shape[0] == final_mosaic_data_HWC.shape[0] and alpha_src.shape[1] == final_mosaic_data_HWC.shape[1]:
-                        alpha_preview = alpha_src[::step, ::step] if step > 1 else alpha_src
-                        if (
-                            alpha_preview.shape[0] >= preview_view.shape[0]
-                            and alpha_preview.shape[1] >= preview_view.shape[1]
-                            and (alpha_preview.shape[0], alpha_preview.shape[1]) != (preview_view.shape[0], preview_view.shape[1])
-                        ):
-                            alpha_preview = alpha_preview[: preview_view.shape[0], : preview_view.shape[1]]
-                        if alpha_preview.shape[0] == preview_view.shape[0] and alpha_preview.shape[1] == preview_view.shape[1]:
-                            mask_zero = alpha_preview <= 0
-                            if np.any(mask_zero):
-                                preview_view = np.array(preview_view, copy=True)
-                                preview_view[mask_zero[..., None]] = np.nan
-                        else:
-                            alpha_preview = None
-                    else:
+                    elif alpha_src.ndim > 2:
+                        alpha_src = np.squeeze(alpha_src)
+                    if alpha_src.shape[:2] != final_mosaic_data_HWC.shape[:2]:
                         logger.debug(
-                            "[Alpha] Preview mask shape mismatch: alpha=%s vs mosaic=%s",
+                            "[Alpha] Preview source mask shape mismatch: alpha=%s vs mosaic=%s",
                             getattr(alpha_src, "shape", None),
                             getattr(final_mosaic_data_HWC, "shape", None),
                         )
+                        try:
+                            import cv2  # type: ignore
+
+                            alpha_src = cv2.resize(
+                                alpha_src,
+                                (final_mosaic_data_HWC.shape[1], final_mosaic_data_HWC.shape[0]),
+                                interpolation=cv2.INTER_NEAREST,
+                            )
+                        except Exception:
+                            alpha_src = None
+                    if alpha_src is None:
+                        alpha_preview = None
+                        raise ValueError("alpha source unavailable for preview masking")
+                    alpha_preview = alpha_src[::step, ::step] if step > 1 else alpha_src
+                    if alpha_preview.shape[:2] != preview_view.shape[:2]:
+                        try:
+                            import cv2  # type: ignore
+
+                            alpha_preview = cv2.resize(
+                                alpha_preview,
+                                (preview_view.shape[1], preview_view.shape[0]),
+                                interpolation=cv2.INTER_NEAREST,
+                            )
+                        except Exception:
+                            if (
+                                alpha_preview.shape[0] >= preview_view.shape[0]
+                                and alpha_preview.shape[1] >= preview_view.shape[1]
+                            ):
+                                alpha_preview = alpha_preview[
+                                    : preview_view.shape[0], : preview_view.shape[1]
+                                ]
+                            else:
+                                alpha_preview = None
+                    if alpha_preview is not None and alpha_preview.shape[:2] == preview_view.shape[:2]:
+                        mask_zero = alpha_preview == 0
+                        if np.any(mask_zero):
+                            preview_view = np.array(preview_view, copy=True)
+                            try:
+                                preview_view[mask_zero[..., None]] = np.nan
+                            except Exception as e_nan:
+                                logger.warning(
+                                    "phase6: preview NaN masking failed: %s (shape preview=%s, alpha=%s)",
+                                    e_nan,
+                                    getattr(preview_view, "shape", None),
+                                    getattr(alpha_preview, "shape", None),
+                                )
+                    else:
+                        alpha_preview = None
                 except Exception as exc_alpha_prev:
-                    logger.debug("[Alpha] Failed to prepare preview alpha mask: %s", exc_alpha_prev)
+                    logger.warning(
+                        "phase6: preview NaN masking failed: %s (shape preview=%s, alpha=%s)",
+                        exc_alpha_prev,
+                        getattr(preview_view, "shape", None),
+                        getattr(alpha_final, "shape", None),
+                    )
                     alpha_preview = None
 
             # Vérifier si la fonction stretch_auto_asifits_like existe dans zemosaic_utils
@@ -12299,6 +12586,8 @@ def run_hierarchical_mosaic(
                             write_success = cv2.imwrite(png_path, img_bgr)
                         if write_success: 
                             pcb("run_success_preview_saved_auto_asifits", prog=None, lvl="SUCCESS", filename=os.path.basename(png_path))
+                            if alpha_png is not None:
+                                logger.info("phase6: preview masked (NaN pre-stretch) and saved as RGBA PNG")
                         else: 
                             pcb("run_warn_preview_imwrite_failed_auto_asifits", prog=None, lvl="WARN", filename=os.path.basename(png_path))
                     except ImportError: 
@@ -12320,8 +12609,9 @@ def run_hierarchical_mosaic(
                         try:
                             import cv2
                             alpha_png_fb = None
-                            if alpha_preview is not None:
-                                alpha_png_fb = np.clip(alpha_preview, 0, 255).astype(np.uint8, copy=False)
+                            alpha_source_fb = alpha_final if alpha_final is not None else alpha_preview
+                            if alpha_source_fb is not None:
+                                alpha_png_fb = np.clip(alpha_source_fb, 0, 255).astype(np.uint8, copy=False)
                                 if alpha_png_fb.shape[:2] != img_u8_fb.shape[:2]:
                                     alpha_png_fb = cv2.resize(
                                         alpha_png_fb,
@@ -12332,6 +12622,7 @@ def run_hierarchical_mosaic(
                                 img_bgra_fb = cv2.cvtColor(img_u8_fb, cv2.COLOR_RGB2BGRA)
                                 img_bgra_fb[..., 3] = alpha_png_fb
                                 cv2.imwrite(png_path_fb, img_bgra_fb)
+                                logger.info("phase6: preview masked (NaN pre-stretch) and saved as RGBA PNG")
                             else:
                                 img_bgr_fb = cv2.cvtColor(img_u8_fb, cv2.COLOR_RGB2BGR)
                                 cv2.imwrite(png_path_fb, img_bgr_fb)
