@@ -218,6 +218,20 @@ print(detect_astap_installation())
 PY
 ```
 
+### ASTAP concurrency guard
+
+Running more than one ASTAP instance in parallel can trigger the `Access violation` pop-up shown by the
+native solver. To keep ZeMosaic/ZeSeestarStacker runs unattended, every ASTAP call now cooperates through
+an inter-process lock:
+
+- The configured `astap_max_instances` value (GUI + `zemosaic_config.json`) becomes a global cap shared by
+  every ZeMosaic utility launched on the same machine. Extra workers simply wait for a free slot.
+- Progress logs mention when we are waiting for another process and resume automatically once the lock is
+  released, eliminating the Windows dialog.
+- Advanced users who prefer the legacy behaviour can set `ZEMOSAIC_ASTAP_DISABLE_IPC_LOCK=1` before
+  launching the tools. Override the lock directory with `ZEMOSAIC_ASTAP_LOCK_DIR=/path/to/tmp` if the
+  default `%TEMP%/zemosaic_astap_slots` is not suitable (portable drives, RAM disks, etc.).
+
 🔧 Build & Compilation (Windows) / Compilation (Windows)
 🇬🇧 Instructions (English)
 To build the standalone executable version of ZeMosaic, follow these steps:

@@ -4,6 +4,7 @@
 * Filter window now opens once via the streaming scanner path in the GUI
 * Restored lightweight WCS footprint previews on large datasets with updated guidance copy
 * Winsorized Phase 3 stacking now auto-recovers from NumPy `ArrayMemoryError` by reducing batch sizes or streaming from disk
+* Suppressed ASTAP "Access violation" pop-ups by coordinating solver launches through a cooperative inter-process lock (opt-out via `ZEMOSAIC_ASTAP_DISABLE_IPC_LOCK`)
 ### Added
 * Solver option "Convert to Luminance" to force mono before plate-solve
 * Added configurable `winsor_worker_limit` (CLI `--winsor-workers` / `-W` and GUI field)

@@ -61,6 +61,16 @@ from concurrent.futures import ProcessPoolExecutor
 
 import multiprocessing
 
+try:
+    import msvcrt
+except ImportError:  # pragma: no cover - only available on Windows
+    msvcrt = None
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - not available on Windows
+    fcntl = None
+
 
 logger = logging.getLogger("ZeMosaicAstrometry")
 # ... (pas besoin de reconfigurer le logger ici s'il hérite du worker)
@@ -153,6 +163,164 @@ def _astap_slot_guard(image_label: str = ""):
         if image_label:
             logger.debug("ASTAP slot release -> %s", image_label)
         semaphore.release()
+
+
+def _env_flag_enabled(key: str) -> bool:
+    raw = os.environ.get(key)
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"1", "true", "on", "yes"}
+
+
+_ASTAP_IPC_LOCK_DISABLED = _env_flag_enabled("ZEMOSAIC_ASTAP_DISABLE_IPC_LOCK")
+_ASTAP_IPC_LOCK_DIR = os.environ.get("ZEMOSAIC_ASTAP_LOCK_DIR") or os.path.join(
+    tempfile.gettempdir(), "zemosaic_astap_slots"
+)
+_ASTAP_IPC_LOCK_SUPPORTED = bool(msvcrt or fcntl)
+_ASTAP_IPC_WAIT_LOG_THRESHOLD_SEC = 2.0
+_ASTAP_IPC_WAIT_LOG_INTERVAL_SEC = 12.0
+_ASTAP_IPC_LOCK_WARNING_EMITTED = False
+
+
+def _initialize_slot_file(path: str) -> None:
+    """Ensure the lock file exists and has at least one byte."""
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+    except Exception:
+        return
+    try:
+        if not os.path.exists(path):
+            with open(path, "wb") as handle:
+                handle.write(b"0")
+                handle.flush()
+        elif os.path.getsize(path) == 0:
+            with open(path, "ab") as handle:
+                handle.write(b"0")
+                handle.flush()
+    except Exception:
+        pass
+
+
+def _open_slot_handle(path: str):
+    try:
+        return open(path, "r+b")
+    except FileNotFoundError:
+        _initialize_slot_file(path)
+        try:
+            return open(path, "r+b")
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def _try_lock_handle(handle) -> bool:
+    if handle is None:
+        return False
+    if msvcrt is not None and os.name == "nt":
+        try:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            return True
+        except OSError:
+            return False
+    if fcntl is not None:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except (BlockingIOError, OSError):
+            return False
+    return False
+
+
+def _unlock_handle(handle) -> None:
+    if handle is None:
+        return
+    try:
+        if msvcrt is not None and os.name == "nt":
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        elif fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+@contextmanager
+def _astap_ipc_slot_guard(image_label: str = "", progress_callback: callable = None):
+    """Cooperate across ZeMosaic/ZeSeestarStacker processes to avoid ASTAP popups."""
+    global _ASTAP_IPC_LOCK_WARNING_EMITTED
+
+    if _ASTAP_IPC_LOCK_DISABLED or not _ASTAP_IPC_LOCK_SUPPORTED:
+        yield
+        return
+
+    slot_count = max(1, get_astap_max_concurrent_instances())
+    try:
+        os.makedirs(_ASTAP_IPC_LOCK_DIR, exist_ok=True)
+    except Exception as exc:
+        if not _ASTAP_IPC_LOCK_WARNING_EMITTED:
+            logger.warning(
+                "ASTAP IPC lock disabled (cannot create %s): %s",
+                _ASTAP_IPC_LOCK_DIR,
+                exc,
+            )
+            _ASTAP_IPC_LOCK_WARNING_EMITTED = True
+        yield
+        return
+
+    slot_paths = []
+    for idx in range(slot_count):
+        slot_path = os.path.join(_ASTAP_IPC_LOCK_DIR, f"slot_{idx}.lock")
+        slot_paths.append(slot_path)
+        _initialize_slot_file(slot_path)
+
+    wait_start = time.monotonic()
+    last_wait_log = wait_start - _ASTAP_IPC_WAIT_LOG_INTERVAL_SEC
+    acquired_handle = None
+    slot_name = None
+
+    while acquired_handle is None:
+        for slot_path in slot_paths:
+            candidate = _open_slot_handle(slot_path)
+            if candidate is None:
+                continue
+            if _try_lock_handle(candidate):
+                acquired_handle = candidate
+                slot_name = os.path.basename(slot_path)
+                break
+            candidate.close()
+        if acquired_handle is not None:
+            break
+        now = time.monotonic()
+        waited = now - wait_start
+        if progress_callback and (
+            waited >= _ASTAP_IPC_WAIT_LOG_THRESHOLD_SEC
+            and (now - last_wait_log) >= _ASTAP_IPC_WAIT_LOG_INTERVAL_SEC
+        ):
+            progress_callback(
+                "  ASTAP Solve: attente qu'une autre instance libère ASTAP (verrou global).",
+                None,
+                "DEBUG",
+            )
+            last_wait_log = now
+        time.sleep(0.2)
+
+    if slot_name:
+        logger.debug("ASTAP IPC slot '%s' acquired for %s", slot_name, image_label or "?")
+
+    try:
+        yield
+    finally:
+        if acquired_handle:
+            _unlock_handle(acquired_handle)
+            acquired_handle.close()
+            if slot_name:
+                logger.debug(
+                    "ASTAP IPC slot '%s' released for %s", slot_name, image_label or "?"
+                )
 
 
 def set_astap_max_concurrent_instances(count: int) -> int:
@@ -890,7 +1058,8 @@ def solve_with_astap(image_fits_path: str,
         # Run ASTAP directly to avoid nested ProcessPoolExecutors from threads (can hang on Windows).
         # We still enforce a strict timeout via subprocess.run inside _run_astap_subprocess.
         with _astap_slot_guard(img_basename_log):
-            astap_process_result = _run_astap_subprocess(cmd_list_astap, current_image_dir, timeout_sec)
+            with _astap_ipc_slot_guard(img_basename_log, progress_callback):
+                astap_process_result = _run_astap_subprocess(cmd_list_astap, current_image_dir, timeout_sec)
         logger.debug(f"ASTAP return code: {astap_process_result.returncode}")
 
         rc_astap = astap_process_result.returncode
