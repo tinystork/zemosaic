@@ -59,7 +59,7 @@
   "mt_quality_gate_erode": "Erode (px)",
   "mt_quality_gate_move_rejects": "Move rejects to folder",
   "mt_quality_gate_tip": "Reject weak or edge-dominated tiles using ZeQualityMT after each master tile is built.",
-  "mt_quality_gate_result": "ZeQualityMT: tile {tile_id} score={score} thr={threshold} → {accepted, select, true{ACCEPT} false{REJECT}}",
+  "mt_quality_gate_result": "ZeQualityMT: tile {tile_id} score={score} thr={threshold} → {status}",
   "mt_quality_gate_moved": "ZeQualityMT: tile {tile_id} moved to {dst}",
   "mt_quality_gate_unavailable": "ZeQualityMT unavailable ({error}); continuing without quality gate.",
     "apply_master_tile_crop_label": "Crop Master Tile Edges:",

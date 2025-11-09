@@ -7235,6 +7235,7 @@ def create_master_tile(
             metrics = quality_gate_eval.get("metrics") or {}
             score = float(quality_gate_eval.get("score", 0.0))
             accepted_flag = bool(quality_gate_eval.get("accepted", True))
+            status_label = "ACCEPT" if accepted_flag else "REJECT"
             pcb_tile(
                 "mt_quality_gate_result",
                 prog=None,
@@ -7243,14 +7244,14 @@ def create_master_tile(
                 path=os.path.basename(temp_fits_filepath),
                 score=f"{score:.3f}",
                 threshold=f"{float(quality_gate_threshold):.3f}",
-                accepted=accepted_flag,
+                status=status_label,
             )
             logger.info(
                 "[ZeQualityMT] tile=%s score=%.3f thr=%.3f -> %s",
                 tile_id,
                 score,
                 float(quality_gate_threshold),
-                "ACCEPT" if accepted_flag else "REJECT",
+                status_label,
             )
             if not accepted_flag:
                 if quality_gate_move_rejects:

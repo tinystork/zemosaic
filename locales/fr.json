@@ -62,7 +62,7 @@
   "mt_quality_gate_erode": "Érosion (px)",
   "mt_quality_gate_move_rejects": "Déplacer les rejets dans un dossier",
   "mt_quality_gate_tip": "Rejeter les tuiles faibles ou dominées par le bord avec ZeQualityMT après la création de chaque Master Tile.",
-  "mt_quality_gate_result": "ZeQualityMT : tuile {tile_id} score={score} thr={threshold} → {accepted, select, true{ACCEPTEE} false{REJETEE}}",
+  "mt_quality_gate_result": "ZeQualityMT : tuile {tile_id} score={score} thr={threshold} → {status}",
   "mt_quality_gate_moved": "ZeQualityMT : tuile {tile_id} déplacée vers {dst}",
   "mt_quality_gate_unavailable": "ZeQualityMT indisponible ({error}) ; poursuite sans filtre qualité.",
     "apply_master_tile_crop_label": "Rogner les Bords des Tuiles Maîtresses :",

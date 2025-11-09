@@ -252,6 +252,8 @@ class ZeMosaicGUI:
                 "cluster_orientation_split_deg": 0.0
             }
 
+        self.config.setdefault("altaz_nanize", True)
+
         for key in (
             "astap_executable_path",
             "astap_data_directory_path",
@@ -1204,14 +1206,19 @@ class ZeMosaicGUI:
         self.quality_crop_advanced_frame = ttk.LabelFrame(crop_options_frame, text="")
         self.quality_crop_advanced_frame.grid(row=crop_opt_row, column=0, columnspan=3, padx=5, pady=(0, 6), sticky="ew")
         self.translatable_widgets["quality_crop_advanced"] = self.quality_crop_advanced_frame
-        for col_idx in range(8):
-            self.quality_crop_advanced_frame.columnconfigure(col_idx, weight=0)
+        self.quality_crop_advanced_frame.columnconfigure(0, weight=1)
+        crop_opt_row += 1
 
-        quality_band_label = ttk.Label(self.quality_crop_advanced_frame, text="")
+        params_row = ttk.Frame(self.quality_crop_advanced_frame)
+        params_row.grid(row=0, column=0, sticky="ew")
+        for col_idx in range(8):
+            params_row.columnconfigure(col_idx, weight=0)
+
+        quality_band_label = ttk.Label(params_row, text="")
         quality_band_label.grid(row=0, column=0, padx=5, pady=3, sticky="w")
         self.translatable_widgets["quality_crop_band_label"] = quality_band_label
         self.quality_crop_band_spinbox = ttk.Spinbox(
-            self.quality_crop_advanced_frame,
+            params_row,
             from_=4,
             to=256,
             increment=4,
@@ -1220,11 +1227,11 @@ class ZeMosaicGUI:
         )
         self.quality_crop_band_spinbox.grid(row=0, column=1, padx=5, pady=3, sticky="w")
 
-        quality_ks_label = ttk.Label(self.quality_crop_advanced_frame, text="")
+        quality_ks_label = ttk.Label(params_row, text="")
         quality_ks_label.grid(row=0, column=2, padx=5, pady=3, sticky="w")
         self.translatable_widgets["quality_crop_ks_label"] = quality_ks_label
         self.quality_crop_ks_spinbox = ttk.Spinbox(
-            self.quality_crop_advanced_frame,
+            params_row,
             from_=0.5,
             to=5.0,
             increment=0.1,
@@ -1234,31 +1241,31 @@ class ZeMosaicGUI:
         )
         self.quality_crop_ks_spinbox.grid(row=0, column=3, padx=5, pady=3, sticky="w")
 
-        quality_margin_label = ttk.Label(self.quality_crop_advanced_frame, text="")
-        quality_margin_label.grid(row=0, column=4, padx=5, pady=3, sticky="w")
-        self.translatable_widgets["quality_crop_margin_label"] = quality_margin_label
-        self.quality_crop_margin_spinbox = ttk.Spinbox(
-            self.quality_crop_advanced_frame,
-            from_=0,
-            to=64,
-            increment=1,
-            textvariable=self.quality_crop_margin_var,
-            width=6,
-        )
-        self.quality_crop_margin_spinbox.grid(row=0, column=5, padx=5, pady=3, sticky="w")
-
-        quality_min_run_label = ttk.Label(self.quality_crop_advanced_frame, text="")
-        quality_min_run_label.grid(row=0, column=6, padx=5, pady=3, sticky="w")
+        quality_min_run_label = ttk.Label(params_row, text="")
+        quality_min_run_label.grid(row=0, column=4, padx=5, pady=3, sticky="w")
         self.translatable_widgets["quality_crop_min_run_label"] = quality_min_run_label
         self.quality_crop_min_run_spinbox = ttk.Spinbox(
-            self.quality_crop_advanced_frame,
+            params_row,
             from_=1,
             to=32,
             increment=1,
             textvariable=self.quality_crop_min_run_var,
             width=6,
         )
-        self.quality_crop_min_run_spinbox.grid(row=0, column=7, padx=5, pady=3, sticky="w")
+        self.quality_crop_min_run_spinbox.grid(row=0, column=5, padx=5, pady=3, sticky="w")
+
+        quality_margin_label = ttk.Label(params_row, text="")
+        quality_margin_label.grid(row=0, column=6, padx=5, pady=3, sticky="w")
+        self.translatable_widgets["quality_crop_margin_label"] = quality_margin_label
+        self.quality_crop_margin_spinbox = ttk.Spinbox(
+            params_row,
+            from_=0,
+            to=64,
+            increment=1,
+            textvariable=self.quality_crop_margin_var,
+            width=6,
+        )
+        self.quality_crop_margin_spinbox.grid(row=0, column=7, padx=5, pady=3, sticky="w")
 
         self._quality_crop_inputs = [
             self.quality_crop_band_spinbox,
@@ -1267,20 +1274,25 @@ class ZeMosaicGUI:
             self.quality_crop_min_run_spinbox,
         ]
 
+        altaz_row = ttk.Frame(self.quality_crop_advanced_frame)
+        altaz_row.grid(row=1, column=0, sticky="ew")
+        for col_idx in range(6):
+            altaz_row.columnconfigure(col_idx, weight=0)
+
         self.altaz_cleanup_check = ttk.Checkbutton(
-            self.quality_crop_advanced_frame,
+            altaz_row,
             text="",
             variable=self.altaz_cleanup_enabled_var,
             command=self._update_altaz_state,
         )
-        self.altaz_cleanup_check.grid(row=1, column=0, padx=5, pady=(6, 3), sticky="w")
+        self.altaz_cleanup_check.grid(row=0, column=0, padx=5, pady=(6, 3), sticky="w")
         self.translatable_widgets["altaz_cleanup_toggle_label"] = self.altaz_cleanup_check
 
-        altaz_margin_label = ttk.Label(self.quality_crop_advanced_frame, text="")
-        altaz_margin_label.grid(row=1, column=1, padx=5, pady=(6, 3), sticky="w")
+        altaz_margin_label = ttk.Label(altaz_row, text="")
+        altaz_margin_label.grid(row=0, column=1, padx=5, pady=(6, 3), sticky="w")
         self.translatable_widgets["altaz_margin_percent_label"] = altaz_margin_label
         self.altaz_margin_spinbox = ttk.Spinbox(
-            self.quality_crop_advanced_frame,
+            altaz_row,
             from_=0.0,
             to=50.0,
             increment=0.5,
@@ -1288,13 +1300,13 @@ class ZeMosaicGUI:
             textvariable=self.altaz_margin_percent_var,
             width=6,
         )
-        self.altaz_margin_spinbox.grid(row=1, column=2, padx=5, pady=(6, 3), sticky="w")
+        self.altaz_margin_spinbox.grid(row=0, column=2, padx=5, pady=(6, 3), sticky="w")
 
-        altaz_decay_label = ttk.Label(self.quality_crop_advanced_frame, text="")
-        altaz_decay_label.grid(row=1, column=3, padx=5, pady=(6, 3), sticky="w")
+        altaz_decay_label = ttk.Label(altaz_row, text="")
+        altaz_decay_label.grid(row=0, column=3, padx=5, pady=(6, 3), sticky="w")
         self.translatable_widgets["altaz_decay_label"] = altaz_decay_label
         self.altaz_decay_spinbox = ttk.Spinbox(
-            self.quality_crop_advanced_frame,
+            altaz_row,
             from_=0.0,
             to=2.0,
             increment=0.05,
@@ -1302,14 +1314,14 @@ class ZeMosaicGUI:
             textvariable=self.altaz_decay_var,
             width=6,
         )
-        self.altaz_decay_spinbox.grid(row=1, column=4, padx=5, pady=(6, 3), sticky="w")
+        self.altaz_decay_spinbox.grid(row=0, column=4, padx=5, pady=(6, 3), sticky="w")
 
         self.altaz_nan_check = ttk.Checkbutton(
-            self.quality_crop_advanced_frame,
-            text="",
+            altaz_row,
+            text=self._tr("altaz_nanize_label", "Alt-Az → NaN"),
             variable=self.altaz_nanize_var,
         )
-        self.altaz_nan_check.grid(row=1, column=5, padx=5, pady=(6, 3), sticky="w")
+        self.altaz_nan_check.grid(row=0, column=5, padx=5, pady=(6, 3), sticky="w")
         self.translatable_widgets["altaz_nanize_label"] = self.altaz_nan_check
 
         self._altaz_inputs = [

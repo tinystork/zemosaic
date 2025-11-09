@@ -107,7 +107,7 @@ DEFAULT_CONFIG = {
     "enable_early_filter": True,
     # --- CLES POUR LE ROGNAGE DES MASTER TUILES ---
     "apply_master_tile_crop": True,       # Désactivé par défaut
-    "master_tile_crop_percent": 5.0,     # Pourcentage par côté si activé (ex: 10%)
+    "master_tile_crop_percent": 3.0,     # Pourcentage par côté si activé (ex: 10%)
     "quality_crop_enabled": False,
     "quality_crop_band_px": 32,
     "quality_crop_k_sigma": 2.0,
