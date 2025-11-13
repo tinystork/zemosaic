@@ -68,7 +68,15 @@ import math
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
-from zemosaic_utils import EXCLUDED_DIRS, is_path_excluded
+from zemosaic_utils import (
+    EXCLUDED_DIRS,
+    compute_global_wcs_descriptor,
+    is_path_excluded,
+    load_global_wcs_descriptor,
+    parse_global_wcs_resolution_override,
+    resolve_global_wcs_output_paths,
+    write_global_wcs_files,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -611,6 +619,16 @@ def launch_filter_interface(
             "max_raw_per_master_tile": 0,
             "apply_master_tile_crop": False,
             "master_tile_crop_percent": 0.0,
+            "auto_detect_seestar": True,
+            "force_seestar_mode": False,
+            "global_wcs_output_path": "global_mosaic_wcs.fits",
+            "global_wcs_pixelscale_mode": "median",
+            "global_wcs_padding_percent": 2.0,
+            "global_wcs_res_override": None,
+            "global_wcs_orientation": "north_up",
+            "global_coadd_method": "kappa_sigma",
+            "global_coadd_k": 2.0,
+            "output_dir": "",
         }
         cfg: Dict[str, Any] | None = None
         solver_settings_payload: Dict[str, Any] = {}
@@ -693,11 +711,23 @@ def launch_filter_interface(
                         "max_raw_per_master_tile": cfg.get("max_raw_per_master_tile", cfg_defaults["max_raw_per_master_tile"]),
                         "apply_master_tile_crop": cfg.get("apply_master_tile_crop", cfg_defaults["apply_master_tile_crop"]),
                         "master_tile_crop_percent": cfg.get("master_tile_crop_percent", cfg_defaults["master_tile_crop_percent"]),
+                        "auto_detect_seestar": cfg.get("auto_detect_seestar", cfg_defaults["auto_detect_seestar"]),
+                        "force_seestar_mode": cfg.get("force_seestar_mode", cfg_defaults["force_seestar_mode"]),
+                        "global_wcs_output_path": cfg.get("global_wcs_output_path", cfg_defaults["global_wcs_output_path"]),
+                        "global_wcs_pixelscale_mode": cfg.get("global_wcs_pixelscale_mode", cfg_defaults["global_wcs_pixelscale_mode"]),
+                        "global_wcs_padding_percent": cfg.get("global_wcs_padding_percent", cfg_defaults["global_wcs_padding_percent"]),
+                        "global_wcs_res_override": cfg.get("global_wcs_res_override", cfg_defaults["global_wcs_res_override"]),
+                        "global_wcs_orientation": cfg.get("global_wcs_orientation", cfg_defaults["global_wcs_orientation"]),
+                        "global_coadd_method": cfg.get("global_coadd_method", cfg_defaults["global_coadd_method"]),
+                        "global_coadd_k": cfg.get("global_coadd_k", cfg_defaults["global_coadd_k"]),
+                        "output_dir": cfg.get("output_dir", cfg_defaults.get("output_dir", "")),
                     })
             except Exception as exc:
                 print(f"WARNING (Filter GUI): failed to load configuration: {exc}")
         elif config_error:
             print(f"WARNING (Filter GUI): configuration module unavailable: {config_error}")
+
+        lang_is_fr = "fr" in str(lang_code).lower()
 
         # Load solver settings (either provided by caller or defaults)
         solver_cls = None
@@ -822,6 +852,7 @@ def launch_filter_interface(
             from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
             from matplotlib.collections import LineCollection
             from matplotlib.colors import to_rgba, hsv_to_rgb
+            from matplotlib.patches import Rectangle
         except ImportError as exc:
             heavy_import_error = exc
 
@@ -1857,6 +1888,225 @@ def launch_filter_interface(
             except Exception:
                 overrides_state = {}
 
+        seestar_tokens = ("seestar", "s30", "s50")
+
+        def _to_builtin(value: Any) -> Any:
+            if isinstance(value, np.generic):
+                return value.item()
+            if isinstance(value, (list, tuple)):
+                return [_to_builtin(v) for v in value]
+            if isinstance(value, dict):
+                return {k: _to_builtin(v) for k, v in value.items()}
+            return value
+
+        def _item_is_seestar(candidate: Any) -> bool:
+            name = ""
+            if hasattr(candidate, "instrument"):
+                try:
+                    name = str(getattr(candidate, "instrument") or "")
+                except Exception:
+                    name = ""
+            if not name and isinstance(candidate, dict):
+                try:
+                    name = str(candidate.get("instrument", "") or "")
+                except Exception:
+                    name = ""
+            header_obj = None
+            if hasattr(candidate, "header"):
+                header_obj = getattr(candidate, "header")
+            elif isinstance(candidate, dict):
+                header_obj = candidate.get("header") or candidate.get("header_subset")
+            if (not name) and header_obj is not None:
+                try:
+                    name = str(header_obj.get("INSTRUME", "") or "")
+                except Exception:
+                    name = ""
+            lowered = name.lower()
+            return any(token in lowered for token in seestar_tokens)
+
+        auto_detect_seestar = bool(cfg_defaults.get("auto_detect_seestar", True))
+        force_seestar_mode = bool(cfg_defaults.get("force_seestar_mode", False))
+        global_output_dir = str(cfg_defaults.get("output_dir") or "").strip()
+        global_wcs_output_cfg = cfg_defaults.get("global_wcs_output_path", "global_mosaic_wcs.fits")
+        global_wcs_pixelscale_cfg = str(cfg_defaults.get("global_wcs_pixelscale_mode", "median") or "median")
+        try:
+            global_wcs_padding_cfg = float(cfg_defaults.get("global_wcs_padding_percent", 2.0) or 0.0)
+        except Exception:
+            global_wcs_padding_cfg = 2.0
+        global_wcs_orientation_cfg = str(cfg_defaults.get("global_wcs_orientation", "north_up") or "north_up")
+        global_wcs_res_override_cfg = parse_global_wcs_resolution_override(
+            cfg_defaults.get("global_wcs_res_override")
+        )
+
+        first_header_candidate = None
+        for entry in raw_files_with_wcs:
+            header_candidate = entry.get("header") or entry.get("header_subset")
+            if header_candidate is not None:
+                first_header_candidate = header_candidate
+                break
+        instrument_hint = ""
+        if first_header_candidate is not None:
+            try:
+                instrument_hint = str(first_header_candidate.get("INSTRUME", "") or "").strip()
+            except Exception:
+                instrument_hint = ""
+        instrument_lower = instrument_hint.lower()
+        auto_detect_hit = auto_detect_seestar and instrument_lower and any(
+            token in instrument_lower for token in seestar_tokens
+        )
+        workflow_mode_config = "seestar" if (force_seestar_mode or auto_detect_hit) else "classic"
+        if workflow_mode_config == "seestar":
+            logger.info(
+                "INFO [FilterGUI] Instrument='%s' → activation du workflow Mosaic-First.",
+                instrument_hint or "Unknown",
+            )
+        else:
+            logger.info("INFO [FilterGUI] Instrument non-Seestar → workflow classique.")
+
+        global_wcs_state: Dict[str, Any] = {
+            "mode": workflow_mode_config,
+            "descriptor": None,
+            "meta": None,
+            "fits_path": None,
+            "json_path": None,
+        }
+        global_wcs_config = {
+            "pixelscale_mode": global_wcs_pixelscale_cfg,
+            "orientation": global_wcs_orientation_cfg,
+            "padding_percent": global_wcs_padding_cfg,
+            "res_override": global_wcs_res_override_cfg,
+            "output_dir": global_output_dir,
+            "output_path": global_wcs_output_cfg,
+        }
+
+        overrides_state.setdefault("workflow_instrument", instrument_hint or "Unknown")
+        overrides_state.setdefault("mode", workflow_mode_config)
+        overrides_state.setdefault(
+            "global_coadd_method", str(cfg_defaults.get("global_coadd_method", "kappa_sigma") or "kappa_sigma")
+        )
+        try:
+            overrides_state.setdefault("global_coadd_k", float(cfg_defaults.get("global_coadd_k", 2.0) or 2.0))
+        except Exception:
+            overrides_state.setdefault("global_coadd_k", 2.0)
+
+        def _build_global_meta_payload(descriptor: dict[str, Any], fits_path: str, json_path: str) -> dict[str, Any]:
+            payload: dict[str, Any] = {}
+            descriptor_meta = descriptor.get("metadata")
+            if isinstance(descriptor_meta, dict):
+                payload.update(descriptor_meta)
+            keys = [
+                "width",
+                "height",
+                "pixel_scale_as_per_px",
+                "pixel_scale_deg_per_px",
+                "padding_percent",
+                "orientation",
+                "orientation_matrix",
+                "ra_wrap_used",
+                "ra_wrap_offset_deg",
+                "ra_span_deg",
+                "dec_span_deg",
+                "center_ra_deg",
+                "center_dec_deg",
+                "files",
+                "nb_images",
+                "resolution_override",
+                "pixel_scale_mode",
+                "timestamp",
+                "source",
+            ]
+            for key in keys:
+                if key in descriptor and key not in payload:
+                    payload[key] = descriptor[key]
+            payload["fits_path"] = fits_path
+            payload["json_path"] = json_path
+            if "nb_images" not in payload or payload["nb_images"] is None:
+                payload["nb_images"] = descriptor.get("nb_images")
+            payload["files"] = payload.get("files") or descriptor.get("files") or []
+            if "source" not in payload:
+                payload["source"] = descriptor.get("source", "computed")
+            return _to_builtin(payload)
+
+        def _prepare_global_wcs(selected_items_for_descriptor: list[Any]) -> tuple[bool, Optional[dict[str, Any]]]:
+            if global_wcs_state.get("meta") and global_wcs_state.get("fits_path"):
+                return True, global_wcs_state.get("meta")
+
+            output_dir_local = global_wcs_config.get("output_dir") or ""
+            if not output_dir_local:
+                logger.warning("Global WCS: output directory undefined, Mosaic-First disabled for this run.")
+                return False, None
+            try:
+                fits_path, json_path = resolve_global_wcs_output_paths(
+                    output_dir_local, global_wcs_config.get("output_path")
+                )
+            except Exception as exc:
+                logger.error("Global WCS: unable to resolve output path: %s", exc)
+                return False, None
+
+            descriptor: Optional[dict[str, Any]] = None
+            try:
+                descriptor = load_global_wcs_descriptor(fits_path, json_path, logger_override=logger)
+            except Exception as exc:
+                logger.warning("Global WCS: unable to load existing descriptor (%s): %s", fits_path, exc)
+                descriptor = None
+
+            if descriptor is None:
+                filtered_items = [it for it in selected_items_for_descriptor if _item_is_seestar(it)]
+                if not filtered_items:
+                    logger.warning(
+                        "Global WCS: no Seestar frames in selection (%d); using all selected frames.",
+                        len(selected_items_for_descriptor),
+                    )
+                    filtered_items = selected_items_for_descriptor
+                else:
+                    non_count = len(selected_items_for_descriptor) - len(filtered_items)
+                    if non_count > 0:
+                        logger.warning("Global WCS: %d non-Seestar frame(s) ignored for Mosaic-First.", non_count)
+                try:
+                    descriptor = compute_global_wcs_descriptor(
+                        filtered_items,
+                        pixel_scale_mode=global_wcs_config.get("pixelscale_mode", "median"),
+                        orientation_mode=global_wcs_config.get("orientation", "north_up"),
+                        padding_percent=float(global_wcs_config.get("padding_percent", 2.0) or 0.0),
+                        resolution_override=global_wcs_config.get("res_override"),
+                        logger_override=logger,
+                    )
+                except Exception as exc:
+                    logger.error("Global WCS: computation failed: %s", exc, exc_info=True)
+                    return False, None
+                try:
+                    write_global_wcs_files(descriptor, fits_path, json_path, logger_override=logger)
+                except Exception as exc:
+                    logger.error("Global WCS: failed to write descriptor: %s", exc, exc_info=True)
+                    return False, None
+                logger.info("Global WCS: descriptor generated at %s", fits_path)
+            else:
+                logger.info("Global WCS: existing descriptor reused from %s", fits_path)
+
+            meta_payload = _build_global_meta_payload(descriptor, fits_path, json_path)
+            global_wcs_state.update(
+                {
+                    "descriptor": descriptor,
+                    "meta": meta_payload,
+                    "fits_path": fits_path,
+                    "json_path": json_path,
+                }
+            )
+            return True, meta_payload
+
+        def _ensure_global_wcs_for_indices(selected_indices: list[int]) -> tuple[bool, Optional[dict[str, Any]]]:
+            if not selected_indices:
+                logger.warning("Global WCS: no frames selected, Mosaic-First cannot proceed.")
+                return False, None
+            selected_payload = []
+            for idx in selected_indices:
+                if 0 <= idx < len(items):
+                    selected_payload.append(items[idx])
+            if not selected_payload:
+                logger.warning("Global WCS: invalid selection, Mosaic-First cancelled.")
+                return False, None
+            return _prepare_global_wcs(selected_payload)
+
         def _sanitize_angle_value(value: Any, default: float = 0.0) -> float:
             """Return a finite angle value in [0, 180], falling back to ``default``."""
 
@@ -2134,11 +2384,41 @@ def launch_filter_interface(
             except Exception:
                 pass
 
-        # Dedicated holder so the Matplotlib canvas can stretch to the full grid cell
+        # Dedicated holder so the Matplotlib canvases can stretch to the full grid cell
         plot_holder = ttk.Frame(main)
         plot_holder.grid(row=1, column=0, sticky="nsew")
         plot_holder.rowconfigure(0, weight=1)
         plot_holder.columnconfigure(0, weight=1)
+
+        preview_tabs = ttk.Notebook(plot_holder)
+        preview_tabs.grid(row=0, column=0, sticky="nsew")
+
+        sky_tab = ttk.Frame(preview_tabs)
+        sky_tab.rowconfigure(0, weight=1)
+        sky_tab.columnconfigure(0, weight=1)
+
+        coverage_tab = ttk.Frame(preview_tabs)
+        coverage_tab.rowconfigure(1, weight=1)
+        coverage_tab.columnconfigure(0, weight=1)
+
+        preview_tabs.add(
+            sky_tab,
+            text=_tr("filter_tab_sky_preview", "Aperçu ciel" if lang_is_fr else "Sky Preview"),
+        )
+        preview_tabs.add(
+            coverage_tab,
+            text=_tr("filter_tab_coverage_map", "Carte de couverture" if lang_is_fr else "Coverage Map"),
+        )
+
+        sky_canvas_frame = ttk.Frame(sky_tab)
+        sky_canvas_frame.grid(row=0, column=0, sticky="nsew")
+
+        coverage_toolbar = ttk.Frame(coverage_tab)
+        coverage_toolbar.grid(row=0, column=0, sticky="ew", padx=2, pady=(0, 4))
+        coverage_canvas_frame = ttk.Frame(coverage_tab)
+        coverage_canvas_frame.grid(row=1, column=0, sticky="nsew")
+        coverage_canvas_frame.rowconfigure(0, weight=1)
+        coverage_canvas_frame.columnconfigure(0, weight=1)
 
         # Matplotlib figure (manual layout so the axes stay pinned to the bottom)
         fig = Figure(figsize=(7.0, 5.0), dpi=100)
@@ -2179,7 +2459,7 @@ def launch_filter_interface(
         except Exception:
             pass
 
-        canvas = FigureCanvasTkAgg(fig, master=plot_holder)
+        canvas = FigureCanvasTkAgg(fig, master=sky_canvas_frame)
         canvas_widget = canvas.get_tk_widget()
         canvas_widget.grid(row=0, column=0, sticky="nsew")
 
@@ -2187,8 +2467,8 @@ def launch_filter_interface(
         # large empty borders around the plot.
         def _apply_resize():
             try:
-                w = max(50, int(plot_holder.winfo_width()))
-                h = max(50, int(plot_holder.winfo_height()))
+                w = max(50, int(sky_canvas_frame.winfo_width()))
+                h = max(50, int(sky_canvas_frame.winfo_height()))
                 # Resize figure using the actual screen DPI reported by Tk so the
                 # Matplotlib canvas matches the widget size even on HiDPI setups.
                 try:
@@ -2244,7 +2524,7 @@ def launch_filter_interface(
 
         # Bind and trigger once to sync initial size
         try:
-            plot_holder.bind("<Configure>", _on_canvas_configure)
+            sky_canvas_frame.bind("<Configure>", _on_canvas_configure)
         except Exception:
             pass
         try:
@@ -2253,8 +2533,117 @@ def launch_filter_interface(
         except Exception:
             pass
 
+        # Coverage map figure (separate Matplotlib canvas)
+        coverage_fig = Figure(figsize=(7.0, 5.0), dpi=100)
+        try:
+            if hasattr(coverage_fig, "set_layout_engine"):
+                coverage_fig.set_layout_engine(None)
+        except Exception:
+            pass
+        coverage_ax = coverage_fig.add_subplot(111)
+        coverage_ax.set_xlabel(_tr("filter_axis_cov_x", "X [px]" if lang_is_fr else "X [px]"))
+        coverage_ax.set_ylabel(_tr("filter_axis_cov_y", "Y [px]" if lang_is_fr else "Y [px]"))
+        coverage_ax.set_aspect("equal")
+        coverage_ax.grid(True, linestyle=":", linewidth=0.6)
+        coverage_canvas = FigureCanvasTkAgg(coverage_fig, master=coverage_canvas_frame)
+        coverage_canvas_widget = coverage_canvas.get_tk_widget()
+        coverage_canvas_widget.grid(row=0, column=0, sticky="nsew")
+
+        def _apply_coverage_resize():
+            try:
+                w = max(50, int(coverage_canvas_frame.winfo_width()))
+                h = max(50, int(coverage_canvas_frame.winfo_height()))
+                try:
+                    widget_dpi = float(coverage_canvas_widget.winfo_fpixels("1i"))
+                    if math.isfinite(widget_dpi) and widget_dpi > 4.0:
+                        coverage_fig.set_dpi(widget_dpi)
+                except Exception:
+                    widget_dpi = coverage_fig.dpi
+                coverage_fig.set_size_inches(w / widget_dpi, h / widget_dpi, forward=True)
+                try:
+                    layout_engine = None
+                    if hasattr(coverage_fig, "get_layout_engine"):
+                        layout_engine = coverage_fig.get_layout_engine()
+                    if layout_engine is None:
+                        coverage_fig.subplots_adjust(left=0.06, right=0.995, bottom=0.08, top=0.995)
+                except Exception:
+                    pass
+                coverage_canvas.draw_idle()
+            except Exception:
+                pass
+
+        try:
+            coverage_canvas_frame.bind("<Configure>", lambda _e=None: _apply_coverage_resize())
+        except Exception:
+            pass
+        try:
+            root.update_idletasks()
+            _apply_coverage_resize()
+        except Exception:
+            pass
+
+        coverage_export_status = tk.StringVar(master=root, value="")
+
+        def _update_coverage_status(message: str, *, warn: bool = False) -> None:
+            try:
+                coverage_export_status.set(message)
+            except Exception:
+                pass
+            log_fn = logger.warning if warn else logger.info
+            try:
+                log_fn("[FilterGUI] %s", message)
+            except Exception:
+                pass
+
+        def _export_coverage_png() -> None:
+            if coverage_canvas is None:
+                _update_coverage_status(
+                    _tr(
+                        "filter_cov_export_unavailable",
+                        "Export indisponible (matplotlib manquant)." if lang_is_fr else "Export unavailable (matplotlib missing).",
+                    ),
+                    warn=True,
+                )
+                return
+            target_dir = global_output_dir or os.getcwd()
+            try:
+                os.makedirs(target_dir, exist_ok=True)
+            except Exception:
+                pass
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            export_path = Path(target_dir) / f"coverage_{timestamp}.png"
+            try:
+                coverage_fig.savefig(export_path, dpi=200)
+                template = _tr(
+                    "filter_cov_export_done",
+                    "Coverage exporté → {name}" if lang_is_fr else "Coverage saved → {name}",
+                )
+                _update_coverage_status(template.format(name=export_path.name))
+            except Exception as exc:
+                _update_coverage_status(
+                    _tr(
+                        "filter_cov_export_failed",
+                        "Échec de l'export." if lang_is_fr else "Coverage export failed.",
+                    ),
+                    warn=True,
+                )
+                logger.debug("Coverage export failed: %s", exc, exc_info=True)
+
+        try:
+            ttk.Button(
+                coverage_toolbar,
+                text=_tr(
+                    "filter_btn_export_coverage",
+                    "Exporter coverage.png" if lang_is_fr else "Export coverage.png",
+                ),
+                command=_export_coverage_png,
+            ).pack(side=tk.LEFT, padx=(0, 6))
+            ttk.Label(coverage_toolbar, textvariable=coverage_export_status).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        except Exception:
+            pass
+
         # Enable mouse-wheel zoom on the plot for easier selection
-        def _setup_wheel_zoom(ax):
+        def _setup_wheel_zoom(ax, canvas_obj):
             base_scale = 1.2  # zoom factor per wheel notch
 
             def _orient_limits(lims):
@@ -2318,16 +2707,17 @@ def launch_filter_interface(
                         ymin -= pad; ymax += pad
 
                     _apply_limits(ax_, xmin, xmax, xinv, ymin, ymax, yinv)
-                    canvas.draw_idle()
+                    canvas_obj.draw_idle()
                 except Exception:
                     pass
 
             try:
-                canvas.mpl_connect('scroll_event', on_scroll)
+                canvas_obj.mpl_connect('scroll_event', on_scroll)
             except Exception:
                 pass
 
-        _setup_wheel_zoom(ax)
+        _setup_wheel_zoom(ax, canvas)
+        _setup_wheel_zoom(coverage_ax, coverage_canvas)
 
         # Lazy recomputation of global center once we have some items
         _center_ready = {"ok": False}
@@ -2341,6 +2731,8 @@ def launch_filter_interface(
             global_center = coords[0] if len(coords) == 1 else average_skycoord(coords)
             ref_ra = float(global_center.ra.to(u.deg).value)
             ref_dec = float(global_center.dec.to(u.deg).value)
+            coverage_projection_state["ref_ra"] = ref_ra
+            coverage_projection_state["ref_dec"] = ref_dec
             _center_ready["ok"] = True
 
         _maybe_update_global_center()
@@ -5433,6 +5825,19 @@ def launch_filter_interface(
             result["selected_indices"] = sel
             # ensure orientation override exported
             _ensure_orientation_override_synced()
+            if workflow_mode_config == "seestar":
+                success, meta_payload = _ensure_global_wcs_for_indices(sel)
+                if success and meta_payload:
+                    overrides_state["global_wcs_meta"] = meta_payload
+                    overrides_state["global_wcs_path"] = meta_payload.get("fits_path")
+                    overrides_state["global_wcs_json"] = meta_payload.get("json_path")
+                    overrides_state["mode"] = "seestar"
+                    global_wcs_state["mode"] = "seestar"
+                else:
+                    overrides_state["mode"] = "classic"
+                    global_wcs_state["mode"] = "classic"
+            else:
+                overrides_state["mode"] = "classic"
             result["overrides"] = overrides_state if overrides_state else None
             result["cancelled"] = False
             # If running as a Toplevel, do not quit the main GUI loop
@@ -5522,6 +5927,9 @@ def launch_filter_interface(
         item_labels: list[str] = []
         footprint_wrapped: list[Optional[np.ndarray]] = []
         centroid_wrapped: list[Optional[tuple[float, float]]] = []
+        coverage_wrapped: list[Optional[np.ndarray]] = []
+        coverage_centroid_wrapped: list[Optional[tuple[float, float]]] = []
+        coverage_cache_version: list[int] = []
         footprints_state: Dict[str, Any] = {
             "collection": None,
             "segments": [],
@@ -5535,9 +5943,372 @@ def launch_filter_interface(
             "indices": [],
             "sizes": [],
         }
+        coverage_projection_state: Dict[str, Any] = {
+            "mode": "fallback",
+            "version": 0,
+            "wcs": None,
+            "width": None,
+            "height": None,
+            "ref_ra": ref_ra,
+            "ref_dec": ref_dec,
+        }
+        coverage_state: Dict[str, Any] = {
+            "collection": None,
+            "segments": [],
+            "colors": [],
+            "indices": [],
+            "linewidths": [],
+            "centroid_offsets": [],
+            "centroid_colors": [],
+            "centroid_sizes": [],
+            "centroid_indices": [],
+            "scatter": None,
+            "bbox": None,
+        }
+        coverage_render_state = {"start": None, "mode": None}
         footprint_budget_state = {"budget": 0, "total_items": 0}
         preview_hint_state = {"active": False}
         visual_build_state = {"indices": [], "cursor": 0, "job": None, "full": True, "footprints_used": 0}
+        coverage_enabled = coverage_canvas is not None
+
+        def _reset_coverage_cache_versions() -> None:
+            if not coverage_enabled:
+                return
+            coverage_cache_version[:] = [-1] * len(items)
+            while len(coverage_wrapped) < len(items):
+                coverage_wrapped.append(None)
+                coverage_centroid_wrapped.append(None)
+            for idx in range(len(coverage_wrapped)):
+                coverage_wrapped[idx] = None
+                coverage_centroid_wrapped[idx] = None
+
+        def _ensure_coverage_collections() -> None:
+            if not coverage_enabled:
+                return
+            if coverage_state["collection"] is None:
+                coll = LineCollection([], linewidths=[], colors=[], alpha=1.0, zorder=3)
+                coverage_ax.add_collection(coll)
+                coverage_state["collection"] = coll
+            if coverage_state["scatter"] is None:
+                sc = coverage_ax.scatter([], [], s=16, alpha=0.9, c="tab:blue", zorder=4)
+                sc.set_offsets(np.empty((0, 2)))
+                sc.set_facecolors(np.empty((0, 4)))
+                sc.set_edgecolors(np.empty((0, 4)))
+                coverage_state["scatter"] = sc
+
+        def _clear_coverage_datasets() -> None:
+            if not coverage_enabled:
+                return
+            coverage_state["segments"].clear()
+            coverage_state["colors"].clear()
+            coverage_state["indices"].clear()
+            coverage_state["linewidths"].clear()
+            coverage_state["centroid_offsets"].clear()
+            coverage_state["centroid_colors"].clear()
+            coverage_state["centroid_sizes"].clear()
+            coverage_state["centroid_indices"].clear()
+            if coverage_state["collection"] is not None:
+                coverage_state["collection"].set_segments([])
+                coverage_state["collection"].set_colors([])
+                coverage_state["collection"].set_linewidths([])
+            if coverage_state["scatter"] is not None:
+                coverage_state["scatter"].set_offsets(np.empty((0, 2)))
+                coverage_state["scatter"].set_facecolors(np.empty((0, 4)))
+                coverage_state["scatter"].set_sizes(np.empty((0,), dtype=float))
+
+        def _ensure_global_descriptor_cached() -> Optional[dict[str, Any]]:
+            descriptor_cached = global_wcs_state.get("descriptor")
+            if descriptor_cached:
+                return descriptor_cached
+            output_dir_local = global_wcs_config.get("output_dir") or ""
+            if not output_dir_local:
+                return None
+            try:
+                fits_path, json_path = resolve_global_wcs_output_paths(
+                    output_dir_local,
+                    global_wcs_config.get("output_path"),
+                )
+            except Exception:
+                return None
+            if not fits_path or not os.path.isfile(fits_path):
+                return None
+            try:
+                descriptor_new = load_global_wcs_descriptor(fits_path, json_path, logger_override=logger)
+            except Exception as exc:
+                logger.debug("Coverage map: unable to load global descriptor: %s", exc)
+                return None
+            global_wcs_state.update(
+                {
+                    "descriptor": descriptor_new,
+                    "fits_path": fits_path,
+                    "json_path": json_path,
+                }
+            )
+            return descriptor_new
+
+        def _apply_coverage_mode_labels(mode: str) -> None:
+            if not coverage_enabled:
+                return
+            if mode == "global":
+                coverage_ax.set_xlabel(_tr("filter_axis_cov_x", "X [px]" if lang_is_fr else "X [px]"))
+                coverage_ax.set_ylabel(_tr("filter_axis_cov_y", "Y [px]" if lang_is_fr else "Y [px]"))
+            else:
+                coverage_ax.set_xlabel(_tr("filter_axis_cov_ra", "ΔAD [deg]" if lang_is_fr else "ΔRA [deg]"))
+                coverage_ax.set_ylabel(_tr("filter_axis_cov_dec", "ΔDec [deg]" if lang_is_fr else "ΔDec [deg]"))
+
+        def _ensure_coverage_projection(force_fallback: bool = False) -> str:
+            if not coverage_enabled:
+                return "disabled"
+            mode_before = coverage_projection_state.get("mode", "fallback")
+            descriptor = None
+            if workflow_mode_config == "seestar" and not force_fallback:
+                descriptor = _ensure_global_descriptor_cached()
+            if descriptor:
+                width = int(descriptor.get("width") or 0)
+                height = int(descriptor.get("height") or 0)
+                header = descriptor.get("header")
+                wcs_obj = None
+                if header is not None:
+                    try:
+                        wcs_obj = WCS(header)
+                    except Exception as exc:
+                        logger.debug("Coverage map: invalid descriptor header: %s", exc)
+                        wcs_obj = None
+                if wcs_obj is not None and width > 0 and height > 0:
+                    if (
+                        mode_before != "global"
+                        or coverage_projection_state.get("width") != width
+                        or coverage_projection_state.get("height") != height
+                    ):
+                        coverage_projection_state["version"] += 1
+                        _clear_coverage_datasets()
+                        _reset_coverage_cache_versions()
+                    coverage_projection_state.update(
+                        {
+                            "mode": "global",
+                            "wcs": wcs_obj,
+                            "width": width,
+                            "height": height,
+                        }
+                    )
+                    _apply_coverage_mode_labels("global")
+                    return "global"
+            if mode_before != "fallback" or force_fallback:
+                coverage_projection_state["version"] += 1
+                coverage_projection_state.update(
+                    {
+                        "mode": "fallback",
+                        "wcs": None,
+                        "width": None,
+                        "height": None,
+                        "ref_ra": ref_ra,
+                        "ref_dec": ref_dec,
+                    }
+                )
+                _clear_coverage_datasets()
+                _reset_coverage_cache_versions()
+                _apply_coverage_mode_labels("fallback")
+            return "fallback"
+
+        def _project_polygon_for_coverage(poly: Optional[np.ndarray]) -> Optional[np.ndarray]:
+            if not coverage_enabled or poly is None:
+                return None
+            arr = np.asarray(poly, dtype=float)
+            if arr.ndim != 2 or arr.shape[1] < 2 or arr.size == 0:
+                return None
+            mode = _ensure_coverage_projection()
+            if mode == "global":
+                wcs_obj = coverage_projection_state.get("wcs")
+                if wcs_obj is None:
+                    return None
+                try:
+                    coords = SkyCoord(ra=arr[:, 0] * u.deg, dec=arr[:, 1] * u.deg, frame="icrs")
+                    x, y = wcs_obj.world_to_pixel(coords)
+                    return np.column_stack([np.asarray(x, dtype=float), np.asarray(y, dtype=float)])
+                except Exception:
+                    return None
+            ref_ra_local = coverage_projection_state.get("ref_ra", ref_ra)
+            ref_dec_local = coverage_projection_state.get("ref_dec", ref_dec)
+            try:
+                ra_vals = [wrap_ra_deg(float(val), ref_ra_local) - ref_ra_local for val in arr[:, 0].tolist()]
+                dec_vals = [float(val) - ref_dec_local for val in arr[:, 1].tolist()]
+                return np.column_stack([np.asarray(ra_vals, dtype=float), np.asarray(dec_vals, dtype=float)])
+            except Exception:
+                return None
+
+        def _project_center_for_coverage(center: Optional[SkyCoord]) -> Optional[tuple[float, float]]:
+            if not coverage_enabled or center is None:
+                return None
+            mode = _ensure_coverage_projection()
+            if mode == "global":
+                wcs_obj = coverage_projection_state.get("wcs")
+                if wcs_obj is None:
+                    return None
+                try:
+                    x, y = wcs_obj.world_to_pixel(center)
+                    return (float(x), float(y))
+                except Exception:
+                    return None
+            ref_ra_local = coverage_projection_state.get("ref_ra", ref_ra)
+            ref_dec_local = coverage_projection_state.get("ref_dec", ref_dec)
+            try:
+                ra_val = wrap_ra_deg(float(center.ra.to(u.deg).value), ref_ra_local) - ref_ra_local
+                dec_val = float(center.dec.to(u.deg).value) - ref_dec_local
+                return (ra_val, dec_val)
+            except Exception:
+                return None
+
+        def _maybe_prepare_coverage_payload(idx: int, footprint: Optional[np.ndarray], center: Optional[SkyCoord]) -> None:
+            if not coverage_enabled:
+                return
+            _ensure_wrapped_capacity(idx)
+            current_version = coverage_projection_state.get("version", 0)
+            if idx < len(coverage_cache_version) and coverage_cache_version[idx] == current_version:
+                return
+            coords = None
+            if footprint is None and 0 <= idx < len(items):
+                try:
+                    footprint = items[idx].ensure_footprint()
+                except Exception:
+                    footprint = None
+            if footprint is not None:
+                coords = _project_polygon_for_coverage(footprint)
+            center_coords = _project_center_for_coverage(center)
+            coverage_wrapped[idx] = coords
+            coverage_centroid_wrapped[idx] = center_coords
+            while len(coverage_cache_version) <= idx:
+                coverage_cache_version.append(-1)
+            coverage_cache_version[idx] = current_version
+
+        def _coverage_color(selected: bool, is_seestar: bool) -> tuple[float, float, float, float]:
+            if is_seestar:
+                base = (0.12, 0.38, 0.85)
+            else:
+                base = (0.93, 0.54, 0.12)
+            alpha = 0.9 if selected else 0.35
+            return (base[0], base[1], base[2], alpha)
+
+        def _append_coverage_entry(idx: int, item: Item, selected: bool) -> None:
+            if not coverage_enabled:
+                return
+            coords = coverage_wrapped[idx]
+            center_cov = coverage_centroid_wrapped[idx]
+            is_seestar_item = _item_is_seestar(item)
+            color = _coverage_color(selected, is_seestar_item)
+            linewidth = 1.8 if selected else 0.9
+            if coords is not None and len(coords) >= 2:
+                try:
+                    closed = np.vstack([coords, coords[0]])
+                except Exception:
+                    closed = coords
+                if closed is not None:
+                    coverage_state["segments"].append(closed)
+                    coverage_state["colors"].append(color)
+                    coverage_state["indices"].append(idx)
+                    coverage_state["linewidths"].append(linewidth if is_seestar_item else linewidth * 0.85)
+            if center_cov is not None:
+                coverage_state["centroid_offsets"].append(center_cov)
+                coverage_state["centroid_colors"].append(color)
+                coverage_state["centroid_sizes"].append(28.0 if selected else 18.0)
+                coverage_state["centroid_indices"].append(idx)
+
+        def _update_coverage_bbox(width: int, height: int) -> None:
+            if not coverage_enabled:
+                return
+            if coverage_state["bbox"] is None:
+                patch = Rectangle((0, 0), width, height, fill=False, linewidth=1.2, edgecolor="tab:red", linestyle="--", alpha=0.9, zorder=5)
+                coverage_ax.add_patch(patch)
+                coverage_state["bbox"] = patch
+            patch = coverage_state["bbox"]
+            try:
+                patch.set_width(width)
+                patch.set_height(height)
+                patch.set_visible(True)
+            except Exception:
+                pass
+
+        def _hide_coverage_bbox() -> None:
+            patch = coverage_state.get("bbox")
+            if patch is not None:
+                try:
+                    patch.set_visible(False)
+                except Exception:
+                    pass
+
+        def _update_coverage_axes_limits() -> None:
+            if not coverage_enabled:
+                return
+            mode = coverage_projection_state.get("mode", "fallback")
+            if mode == "global":
+                width = coverage_projection_state.get("width") or 0
+                height = coverage_projection_state.get("height") or 0
+                if width > 0 and height > 0:
+                    coverage_ax.set_xlim(0, width)
+                    coverage_ax.set_ylim(height, 0)
+                    coverage_ax.set_aspect("equal")
+                    _update_coverage_bbox(int(width), int(height))
+                else:
+                    _hide_coverage_bbox()
+                return
+            _hide_coverage_bbox()
+            xs: list[float] = []
+            ys: list[float] = []
+            for seg in coverage_state["segments"]:
+                if seg is None:
+                    continue
+                xs.extend(seg[:, 0].tolist())
+                ys.extend(seg[:, 1].tolist())
+            for center in coverage_state["centroid_offsets"]:
+                if center is None:
+                    continue
+                xs.append(center[0])
+                ys.append(center[1])
+            if not xs or not ys:
+                return
+            xmin, xmax = min(xs), max(xs)
+            ymin, ymax = min(ys), max(ys)
+            pad_x = max(1e-3, (xmax - xmin) * 0.08 + 0.1)
+            pad_y = max(1e-3, (ymax - ymin) * 0.08 + 0.1)
+            coverage_ax.set_xlim(xmin - pad_x, xmax + pad_x)
+            coverage_ax.set_ylim(ymin - pad_y, ymax + pad_y)
+            try:
+                if coverage_ax.yaxis_inverted():
+                    coverage_ax.invert_yaxis()
+            except Exception:
+                pass
+
+        def _update_coverage_collections() -> None:
+            if not coverage_enabled:
+                return
+            _ensure_coverage_collections()
+            coll = coverage_state.get("collection")
+            if coll is not None:
+                coll.set_segments(coverage_state["segments"])
+                if coverage_state["colors"]:
+                    coll.set_colors(coverage_state["colors"])
+                else:
+                    coll.set_colors([])
+                if coverage_state["linewidths"]:
+                    coll.set_linewidths(np.asarray(coverage_state["linewidths"], dtype=float))
+                else:
+                    coll.set_linewidths([])
+            sc = coverage_state.get("scatter")
+            if sc is not None:
+                if coverage_state["centroid_offsets"]:
+                    sc.set_offsets(np.asarray(coverage_state["centroid_offsets"], dtype=float))
+                    sc.set_facecolors(coverage_state["centroid_colors"])
+                    sc.set_edgecolors(coverage_state["centroid_colors"])
+                    sc.set_sizes(np.asarray(coverage_state["centroid_sizes"], dtype=float))
+                else:
+                    sc.set_offsets(np.empty((0, 2)))
+                    sc.set_facecolors(np.empty((0, 4)))
+                    sc.set_edgecolors(np.empty((0, 4)))
+                    sc.set_sizes(np.empty((0,), dtype=float))
+            _update_coverage_axes_limits()
+            try:
+                coverage_canvas.draw_idle()
+            except Exception:
+                pass
 
         def _ensure_visual_collections() -> None:
             if footprints_state["collection"] is None:
@@ -5624,6 +6395,12 @@ def launch_filter_interface(
                 footprint_wrapped.append(None)
             while idx >= len(centroid_wrapped):
                 centroid_wrapped.append(None)
+            while idx >= len(coverage_wrapped):
+                coverage_wrapped.append(None)
+            while idx >= len(coverage_centroid_wrapped):
+                coverage_centroid_wrapped.append(None)
+            while idx >= len(coverage_cache_version):
+                coverage_cache_version.append(-1)
 
         def _prepare_visual_payload(idx: int) -> None:
             _ensure_wrapped_capacity(idx)
@@ -5648,6 +6425,7 @@ def launch_filter_interface(
                 except Exception:
                     center_val = None
             centroid_wrapped[idx] = center_val
+            _maybe_prepare_coverage_payload(idx, fp, item.center)
 
         def _color_for_item(idx: int, selected: bool) -> tuple[float, float, float, float]:
             base_alpha = 0.9 if selected else 0.35
@@ -5701,6 +6479,11 @@ def launch_filter_interface(
                 centroids_state["colors"].append(color)
                 centroids_state["indices"].append(idx)
                 centroids_state["sizes"].append(28.0 if selected else 18.0)
+            if 0 <= idx < len(items):
+                try:
+                    _append_coverage_entry(idx, items[idx], selected)
+                except Exception:
+                    pass
 
         def _process_visual_build_chunk() -> None:
             visual_build_state["job"] = None
@@ -5712,6 +6495,9 @@ def launch_filter_interface(
                 _clear_visual_datasets()
                 visual_build_state["footprints_used"] = 0
                 _recompute_footprint_budget()
+                if coverage_enabled:
+                    _clear_coverage_datasets()
+                    coverage_render_state["start"] = time.perf_counter()
             for local_idx in range(start, end):
                 idx = visual_build_state["indices"][local_idx]
                 if idx < 0 or idx >= len(items):
@@ -5720,6 +6506,7 @@ def launch_filter_interface(
                 _append_visual_entry(idx)
             _update_line_collection()
             _update_centroid_collection()
+            _update_coverage_collections()
             if end < len(visual_build_state["indices"]):
                 visual_build_state["cursor"] = end
                 try:
@@ -5732,6 +6519,18 @@ def launch_filter_interface(
                 visual_build_state["full"] = True
                 visual_build_state["footprints_used"] = 0
                 _schedule_axes_update()
+                if coverage_enabled and coverage_render_state.get("start") is not None:
+                    elapsed = max(0.0, time.perf_counter() - float(coverage_render_state["start"] or 0.0))
+                    coverage_render_state["start"] = None
+                    try:
+                        logger.debug(
+                            "[FilterGUI] Carte coverage : %d empreinte(s) en %.1f ms (mode=%s)",
+                            len(coverage_state["segments"]),
+                            elapsed * 1000.0,
+                            coverage_projection_state.get("mode", "fallback"),
+                        )
+                    except Exception:
+                        pass
 
         def _schedule_visual_build(indices: Optional[Iterable[int]] = None, *, full: bool = False) -> None:
             if indices is None or full:
@@ -6294,6 +7093,21 @@ def launch_filter_interface(
                     centroid_wrapped.pop(idx)
                 except Exception:
                     pass
+            if idx < len(coverage_wrapped):
+                try:
+                    coverage_wrapped.pop(idx)
+                except Exception:
+                    pass
+            if idx < len(coverage_centroid_wrapped):
+                try:
+                    coverage_centroid_wrapped.pop(idx)
+                except Exception:
+                    pass
+            if idx < len(coverage_cache_version):
+                try:
+                    coverage_cache_version.pop(idx)
+                except Exception:
+                    pass
 
             if use_listbox_mode:
                 if idx < len(selection_state):
@@ -6475,6 +7289,52 @@ def launch_filter_interface(
                     coll.set_edgecolors(colors)
                     coll.set_sizes(np.asarray(sizes, dtype=float))
                     updated = True
+
+            if coverage_enabled and coverage_state["indices"]:
+                cov_colors = list(coverage_state["colors"])
+                cov_linewidths = list(coverage_state["linewidths"])
+                coverage_updated = False
+                for pos, idx in enumerate(coverage_state["indices"]):
+                    if idx not in target or idx >= len(items):
+                        continue
+                    sel = _is_selected(idx)
+                    cov_colors[pos] = _coverage_color(sel, _item_is_seestar(items[idx]))
+                    cov_linewidths[pos] = 1.8 if sel else 0.9
+                    coverage_updated = True
+                if coverage_updated and coverage_state["collection"] is not None:
+                    coverage_state["colors"] = cov_colors
+                    coverage_state["linewidths"] = cov_linewidths
+                    coverage_state["collection"].set_colors(cov_colors)
+                    coverage_state["collection"].set_linewidths(np.asarray(cov_linewidths, dtype=float))
+                    updated = True
+                    try:
+                        coverage_canvas.draw_idle()
+                    except Exception:
+                        pass
+            if coverage_enabled and coverage_state["centroid_indices"]:
+                cov_centroid_colors = list(coverage_state["centroid_colors"])
+                cov_centroid_sizes = list(coverage_state["centroid_sizes"])
+                centroid_cov_updated = False
+                for pos, idx in enumerate(coverage_state["centroid_indices"]):
+                    if idx not in target or idx >= len(items):
+                        continue
+                    sel = _is_selected(idx)
+                    color = _coverage_color(sel, _item_is_seestar(items[idx]))
+                    cov_centroid_colors[pos] = color
+                    cov_centroid_sizes[pos] = 28.0 if sel else 18.0
+                    centroid_cov_updated = True
+                sc = coverage_state.get("scatter")
+                if centroid_cov_updated and sc is not None:
+                    coverage_state["centroid_colors"] = cov_centroid_colors
+                    coverage_state["centroid_sizes"] = cov_centroid_sizes
+                    sc.set_facecolors(cov_centroid_colors)
+                    sc.set_edgecolors(cov_centroid_colors)
+                    sc.set_sizes(np.asarray(cov_centroid_sizes, dtype=float))
+                    updated = True
+                    try:
+                        coverage_canvas.draw_idle()
+                    except Exception:
+                        pass
 
             if updated:
                 try:

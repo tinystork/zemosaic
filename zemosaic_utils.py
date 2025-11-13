@@ -47,9 +47,12 @@
 import os
 import math
 import copy
+import json
 import logging
+import re
+import time
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional, Sequence
 import numpy as np
 # L'import de astropy.io.fits est géré ci-dessous pour définir le flag
 import cv2
@@ -62,12 +65,15 @@ import importlib.util
 # --- Optional Astropy WCS import (lightweight, guarded) ----------------------
 ASTROPY_WCS_AVAILABLE_IN_UTILS = False
 AstropyWCS = None
+proj_plane_pixel_scales = None
 try:  # pragma: no cover - optional dependency path
     from astropy.wcs import WCS as AstropyWCS  # type: ignore
+    from astropy.wcs.utils import proj_plane_pixel_scales  # type: ignore
 
     ASTROPY_WCS_AVAILABLE_IN_UTILS = True
 except Exception:
     AstropyWCS = None
+    proj_plane_pixel_scales = None
 
 # --- GPU/CUDA Availability ----------------------------------------------------
 GPU_AVAILABLE = importlib.util.find_spec("cupy") is not None
@@ -278,6 +284,570 @@ def has_valid_wcs(header) -> bool:
 
     is_valid, _, _ = validate_wcs_header(header)
     return bool(is_valid)
+
+
+def _safe_get_item_value(candidate: Any, attr: str, default: Any = None) -> Any:
+    """Return attribute or dict value from *candidate*."""
+
+    if candidate is None:
+        return default
+    if hasattr(candidate, attr):
+        try:
+            return getattr(candidate, attr)
+        except Exception:
+            pass
+    if isinstance(candidate, dict):
+        try:
+            return candidate.get(attr, default)
+        except Exception:
+            return default
+    return default
+
+
+def _infer_shape_from_item(candidate: Any, wcs_obj: Any = None) -> Optional[tuple[int, int]]:
+    """Infer (H, W) for *candidate* using shape/header/WCS metadata."""
+
+    shape = _safe_get_item_value(candidate, "shape")
+    if isinstance(shape, (list, tuple)) and len(shape) >= 2:
+        try:
+            h = int(shape[0])
+            w = int(shape[1])
+            if h > 0 and w > 0:
+                return (h, w)
+        except Exception:
+            pass
+
+    header = _safe_get_item_value(candidate, "header")
+    if header is None:
+        header = _safe_get_item_value(candidate, "header_subset")
+    if header is not None:
+        getter = header.get if hasattr(header, "get") else header.__getitem__
+        try:
+            naxis1 = int(getter("NAXIS1"))
+            naxis2 = int(getter("NAXIS2"))
+            if naxis1 > 0 and naxis2 > 0:
+                return (naxis2, naxis1)
+        except Exception:
+            pass
+
+    if wcs_obj is not None:
+        for attr in ("pixel_shape", "array_shape"):
+            try:
+                shp = getattr(wcs_obj, attr, None)
+            except Exception:
+                shp = None
+            if shp is None:
+                continue
+            try:
+                if len(shp) >= 2:
+                    ny, nx = int(shp[0]), int(shp[1])
+                    if attr == "pixel_shape":
+                        nx, ny = int(shp[0]), int(shp[1])
+                        return (ny, nx)
+                    if ny > 0 and nx > 0:
+                        return (ny, nx)
+            except Exception:
+                continue
+    return None
+
+
+def _orthonormalize_pc_matrix(matrix: np.ndarray | Sequence[Sequence[float]]) -> Optional[np.ndarray]:
+    """Return an orthonormal approximation of *matrix* suitable for WCS PC."""
+
+    try:
+        mat = np.asarray(matrix, dtype=np.float64)
+    except Exception:
+        return None
+    if mat.ndim != 2 or mat.shape[0] < 2 or mat.shape[1] < 2:
+        return None
+
+    col0 = mat[:, 0]
+    col1 = mat[:, 1]
+    if not np.all(np.isfinite(col0)) or not np.all(np.isfinite(col1)):
+        return None
+
+    norm0 = np.linalg.norm(col0)
+    if norm0 <= 0:
+        return None
+    col0 = col0 / norm0
+    col1 = col1 - np.dot(col1, col0) * col0
+    norm1 = np.linalg.norm(col1)
+    if norm1 <= 0:
+        col1 = np.array([-col0[1], col0[0]])
+        norm1 = np.linalg.norm(col1)
+        if norm1 <= 0:
+            return None
+    col1 = col1 / norm1
+    orientation = np.column_stack((col0, col1))
+    det = np.linalg.det(orientation)
+    if not np.isfinite(det) or det == 0:
+        return None
+    if det < 0:
+        orientation[:, 1] *= -1.0
+    return orientation
+
+
+def _estimate_pc_matrix_from_wcs_list(wcs_objects: Sequence[Any]) -> Optional[np.ndarray]:
+    """Approximate a representative PC matrix from *wcs_objects*."""
+
+    matrices: list[np.ndarray] = []
+    for wcs_obj in wcs_objects:
+        if wcs_obj is None:
+            continue
+        pc_candidate = None
+        try:
+            pc_attr = getattr(wcs_obj.wcs, "pc", None)
+        except Exception:
+            pc_attr = None
+        if pc_attr is not None:
+            try:
+                pc_arr = np.asarray(pc_attr, dtype=np.float64)
+                if pc_arr.ndim == 2 and pc_arr.shape[0] >= 2 and pc_arr.shape[1] >= 2:
+                    pc_candidate = pc_arr[:2, :2]
+            except Exception:
+                pc_candidate = None
+        if pc_candidate is None:
+            cd_mat = _extract_cd_matrix_from_wcs(wcs_obj)
+            if cd_mat is not None:
+                col0 = cd_mat[:, 0]
+                col1 = cd_mat[:, 1]
+                norm0 = float(np.linalg.norm(col0))
+                norm1 = float(np.linalg.norm(col1))
+                if norm0 > 0 and norm1 > 0:
+                    pc_candidate = np.column_stack((col0 / norm0, col1 / norm1))
+        if pc_candidate is None:
+            continue
+        matrices.append(pc_candidate)
+
+    if not matrices:
+        return None
+    median_pc = np.median(np.stack(matrices, axis=0), axis=0)
+    return _orthonormalize_pc_matrix(median_pc)
+
+
+def _compute_pixel_scale_for_wcs(wcs_obj: Any) -> Optional[float]:
+    """Return a representative pixel scale (deg/px) for *wcs_obj*."""
+
+    if wcs_obj is None:
+        return None
+    if proj_plane_pixel_scales is not None:
+        try:
+            scales = proj_plane_pixel_scales(wcs_obj)
+            if scales is not None and len(scales) >= 2:
+                values = np.asarray(scales[:2], dtype=np.float64)
+                values = values[np.isfinite(values) & (values > 0)]
+                if values.size:
+                    return float(np.median(values))
+        except Exception:
+            pass
+
+    cd_mat = _extract_cd_matrix_from_wcs(wcs_obj)
+    if cd_mat is not None:
+        col0 = cd_mat[:, 0]
+        col1 = cd_mat[:, 1]
+        norms = [float(np.linalg.norm(col0)), float(np.linalg.norm(col1))]
+        norms = [val for val in norms if np.isfinite(val) and val > 0]
+        if norms:
+            return float(sum(norms) / len(norms))
+    return None
+
+
+def _analyze_ra_samples(ra_values: Sequence[float]) -> dict[str, float | bool]:
+    """Return wrap-aware interval metadata for *ra_values* (degrees)."""
+
+    sanitized: list[float] = []
+    for val in ra_values:
+        try:
+            coerced = float(val)
+        except Exception:
+            continue
+        if math.isnan(coerced) or math.isinf(coerced):
+            continue
+        sanitized.append(coerced % 360.0)
+
+    if not sanitized:
+        raise ValueError("No valid RA samples provided")
+
+    sanitized.sort()
+    if len(sanitized) == 1:
+        return {
+            "use_wrap": False,
+            "offset_deg": 0.0,
+            "min_unwrapped": sanitized[0],
+            "max_unwrapped": sanitized[0],
+            "span_unwrapped": 0.0,
+            "min_raw": sanitized[0],
+            "max_raw": sanitized[0],
+        }
+
+    diffs = []
+    for i in range(len(sanitized) - 1):
+        diffs.append(sanitized[i + 1] - sanitized[i])
+    diffs.append((sanitized[0] + 360.0) - sanitized[-1])
+    max_gap = max(diffs)
+    gap_idx = diffs.index(max_gap)
+    span_nowrap = sanitized[-1] - sanitized[0]
+    span_nowrap = max(0.0, span_nowrap)
+    wrap_span = 360.0 - max_gap
+    use_wrap = wrap_span + 1e-6 < span_nowrap
+
+    if use_wrap:
+        offset = sanitized[(gap_idx + 1) % len(sanitized)]
+        unwrapped = [((val - offset) % 360.0) for val in sanitized]
+        min_unwrapped = min(unwrapped)
+        max_unwrapped = max(unwrapped)
+        return {
+            "use_wrap": True,
+            "offset_deg": offset,
+            "min_unwrapped": min_unwrapped,
+            "max_unwrapped": max_unwrapped,
+            "span_unwrapped": max_unwrapped - min_unwrapped,
+            "min_raw": sanitized[0],
+            "max_raw": sanitized[-1],
+        }
+
+    return {
+        "use_wrap": False,
+        "offset_deg": 0.0,
+        "min_unwrapped": sanitized[0],
+        "max_unwrapped": sanitized[-1],
+        "span_unwrapped": span_nowrap,
+        "min_raw": sanitized[0],
+        "max_raw": sanitized[-1],
+    }
+
+
+def parse_global_wcs_resolution_override(value: Any) -> Optional[tuple[int, int]]:
+    """Return (W, H) override parsed from *value* (list/tuple/'WxH')."""
+
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple)) and len(value) >= 2:
+        try:
+            w = int(value[0])
+            h = int(value[1])
+            if w > 0 and h > 0:
+                return (w, h)
+        except Exception:
+            return None
+        return None
+    if isinstance(value, str):
+        match = re.match(r"^\s*(\d+)\s*[xX]\s*(\d+)\s*$", value)
+        if match:
+            try:
+                w = int(match.group(1))
+                h = int(match.group(2))
+                if w > 0 and h > 0:
+                    return (w, h)
+            except Exception:
+                return None
+    return None
+
+
+def resolve_global_wcs_output_paths(output_dir: str | Path, configured_path: Optional[str]) -> tuple[str, str]:
+    """Return absolute (fits_path, json_path) for the global WCS artifacts."""
+
+    base_dir = Path(output_dir or ".").expanduser()
+    rel_path = configured_path or "global_mosaic_wcs.fits"
+    rel_path = str(rel_path).strip() or "global_mosaic_wcs.fits"
+    fits_path = Path(rel_path)
+    if not fits_path.is_absolute():
+        fits_path = (base_dir / fits_path).expanduser()
+    fits_abs = fits_path.resolve(strict=False)
+    json_path = fits_abs.with_suffix(".json")
+    return str(fits_abs), str(json_path)
+
+
+def _build_file_records(entries: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collect (path, mtime, size) metadata for each unique file."""
+
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        path = entry.get("path")
+        if not path:
+            continue
+        norm = os.path.abspath(str(path))
+        if norm in seen:
+            continue
+        seen.add(norm)
+        record: dict[str, Any] = {"path": norm}
+        try:
+            stat = os.stat(norm)
+            record["mtime"] = float(stat.st_mtime)
+            record["size"] = int(stat.st_size)
+        except Exception:
+            pass
+        records.append(record)
+    return records
+
+
+def compute_global_wcs_descriptor(
+    items: Sequence[Any],
+    *,
+    pixel_scale_mode: str = "median",
+    orientation_mode: str = "north_up",
+    padding_percent: float = 2.0,
+    resolution_override: Optional[tuple[int, int]] = None,
+    logger_override: Optional[logging.Logger] = None,
+) -> dict[str, Any]:
+    """Compute a global WCS header + metadata from *items*."""
+
+    log = logger_override or logger
+    if not ASTROPY_WCS_AVAILABLE_IN_UTILS or AstropyWCS is None:
+        raise RuntimeError("Astropy WCS is required to compute the global mosaic grid")
+    if not items:
+        raise ValueError("Cannot build a global WCS without input items")
+
+    usable_entries: list[dict[str, Any]] = []
+    ra_samples: list[float] = []
+    dec_samples: list[float] = []
+
+    for item in items:
+        wcs_obj = _safe_get_item_value(item, "wcs")
+        if wcs_obj is None or not getattr(wcs_obj, "is_celestial", False):
+            continue
+        shape = _infer_shape_from_item(item, wcs_obj)
+        if not shape:
+            continue
+        path = _safe_get_item_value(item, "path") or _safe_get_item_value(item, "path_raw")
+        path_str = str(path).strip() if path else None
+        try:
+            axes = (int(shape[1]), int(shape[0]))
+            footprint = wcs_obj.calc_footprint(axes=axes)
+            footprint_arr = np.asarray(footprint, dtype=np.float64)
+            if footprint_arr.ndim != 2 or footprint_arr.shape[1] < 2:
+                continue
+            ra_samples.extend(footprint_arr[:, 0].tolist())
+            dec_samples.extend(footprint_arr[:, 1].tolist())
+        except Exception as exc_fp:
+            log.debug("Global WCS: calc_footprint failed for %s: %s", path_str, exc_fp)
+            continue
+        usable_entries.append({"wcs": wcs_obj, "shape": shape, "path": path_str})
+
+    if not usable_entries:
+        raise ValueError("No valid WCS entries found to build the global grid")
+    if len(ra_samples) < 2 or len(dec_samples) < 2:
+        raise ValueError("Insufficient celestial coverage to determine a bounding box")
+
+    ra_info = _analyze_ra_samples(ra_samples)
+    dec_values = []
+    for dec in dec_samples:
+        try:
+            val = float(dec)
+        except Exception:
+            continue
+        if math.isnan(val) or math.isinf(val):
+            continue
+        dec_values.append(val)
+    if not dec_values:
+        raise ValueError("Unable to derive DEC extent from the provided WCS footprints")
+    dec_min = max(-90.0, min(dec_values))
+    dec_max = min(90.0, max(dec_values))
+    dec_span = max(1e-9, dec_max - dec_min)
+
+    padding_pct = max(0.0, float(padding_percent))
+    padding_multiplier = 1.0 + padding_pct / 100.0
+
+    ra_span = max(1e-9, float(ra_info.get("span_unwrapped") or 0.0))
+    ra_span_padded = ra_span * padding_multiplier
+    dec_span_padded = dec_span * padding_multiplier
+
+    ra_min_unwrapped = float(ra_info.get("min_unwrapped", 0.0))
+    ra_max_unwrapped = float(ra_info.get("max_unwrapped", 0.0))
+    ra_offset = float(ra_info.get("offset_deg", 0.0))
+    ra_pad_delta = (ra_span_padded - ra_span) * 0.5
+    ra_min_unwrapped -= ra_pad_delta
+    ra_max_unwrapped += ra_pad_delta
+    ra_center_unwrapped = 0.5 * (ra_min_unwrapped + ra_max_unwrapped)
+    if bool(ra_info.get("use_wrap", False)):
+        ra_center = (ra_offset + ra_center_unwrapped) % 360.0
+    else:
+        ra_center = 0.5 * (float(ra_info.get("min_raw", 0.0)) + float(ra_info.get("max_raw", 0.0)))
+
+    dec_pad_delta = (dec_span_padded - dec_span) * 0.5
+    dec_min_padded = max(-90.0, dec_min - dec_pad_delta)
+    dec_max_padded = min(90.0, dec_max + dec_pad_delta)
+    dec_center = 0.5 * (dec_min_padded + dec_max_padded)
+
+    scale_candidates = [
+        _compute_pixel_scale_for_wcs(entry["wcs"]) for entry in usable_entries
+    ]
+    scale_candidates = [val for val in scale_candidates if val and val > 0]
+    if not scale_candidates:
+        raise ValueError("Unable to derive pixel scale from the provided WCS objects")
+
+    mode = (pixel_scale_mode or "median").strip().lower()
+    if mode not in {"min", "max", "median"}:
+        mode = "median"
+    if mode == "min":
+        scale_deg = float(min(scale_candidates))
+    elif mode == "max":
+        scale_deg = float(max(scale_candidates))
+    else:
+        scale_deg = float(np.median(scale_candidates))
+    scale_deg = max(scale_deg, 1e-8)
+    scale_arcsec = scale_deg * 3600.0
+
+    if resolution_override is not None:
+        width_px = int(resolution_override[0])
+        height_px = int(resolution_override[1])
+    else:
+        width_px = int(math.ceil(max(1.0, ra_span_padded) / scale_deg))
+        height_px = int(math.ceil(max(1.0, dec_span_padded) / scale_deg))
+    width_px = max(8, width_px)
+    height_px = max(8, height_px)
+
+    orientation_mode_norm = (orientation_mode or "north_up").strip().lower()
+    orientation_matrix = None
+    if orientation_mode_norm == "median_pc":
+        orientation_matrix = _estimate_pc_matrix_from_wcs_list([entry["wcs"] for entry in usable_entries])
+        if orientation_matrix is None:
+            log.warning("Global WCS: median_pc orientation unavailable, falling back to north_up")
+    if orientation_matrix is None:
+        orientation_matrix = np.array([[-1.0, 0.0], [0.0, 1.0]], dtype=np.float64)
+        orientation_mode_norm = "north_up"
+
+    crpix1 = (width_px / 2.0) + 0.5
+    crpix2 = (height_px / 2.0) + 0.5
+    global_wcs = AstropyWCS(naxis=2)
+    global_wcs.wcs.crval = [float(ra_center), float(dec_center)]
+    global_wcs.wcs.crpix = [float(crpix1), float(crpix2)]
+    global_wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    global_wcs.wcs.cunit = ["deg", "deg"]
+    global_wcs.wcs.cdelt = np.array([scale_deg, scale_deg], dtype=np.float64)
+    global_wcs.wcs.pc = orientation_matrix
+    header = global_wcs.to_header(relax=True)
+    header["NAXIS"] = 2
+    header["NAXIS1"] = width_px
+    header["NAXIS2"] = height_px
+
+    files_meta = _build_file_records(usable_entries)
+    descriptor = {
+        "header": header,
+        "width": width_px,
+        "height": height_px,
+        "pixel_scale_deg_per_px": scale_deg,
+        "pixel_scale_as_per_px": scale_arcsec,
+        "padding_percent": padding_pct,
+        "orientation": orientation_mode_norm,
+        "orientation_matrix": orientation_matrix.tolist(),
+        "ra_wrap_used": bool(ra_info.get("use_wrap", False)),
+        "ra_wrap_offset_deg": ra_offset,
+        "ra_span_deg": ra_span_padded,
+        "dec_span_deg": dec_span_padded,
+        "center_ra_deg": ra_center,
+        "center_dec_deg": dec_center,
+        "files": files_meta,
+        "nb_images": len(usable_entries),
+        "resolution_override": bool(resolution_override is not None),
+        "pixel_scale_mode": mode,
+        "timestamp": time.time(),
+        "source": "computed",
+    }
+    return descriptor
+
+
+def _descriptor_to_json_payload(descriptor: dict[str, Any]) -> dict[str, Any]:
+    """Prepare a JSON-serializable payload from *descriptor*."""
+
+    payload = {
+        "width": int(descriptor.get("width", 0)),
+        "height": int(descriptor.get("height", 0)),
+        "pixel_scale_as_per_px": float(descriptor.get("pixel_scale_as_per_px", 0.0)),
+        "pixel_scale_deg_per_px": float(descriptor.get("pixel_scale_deg_per_px", 0.0)),
+        "padding_percent": float(descriptor.get("padding_percent", 0.0)),
+        "orientation": descriptor.get("orientation"),
+        "orientation_matrix": descriptor.get("orientation_matrix"),
+        "ra_wrap_used": bool(descriptor.get("ra_wrap_used", False)),
+        "ra_wrap_offset_deg": float(descriptor.get("ra_wrap_offset_deg", 0.0)),
+        "ra_span_deg": float(descriptor.get("ra_span_deg", 0.0)),
+        "dec_span_deg": float(descriptor.get("dec_span_deg", 0.0)),
+        "center_ra_deg": float(descriptor.get("center_ra_deg", 0.0)),
+        "center_dec_deg": float(descriptor.get("center_dec_deg", 0.0)),
+        "nb_images": int(descriptor.get("nb_images", 0)),
+        "files": descriptor.get("files", []),
+        "resolution_override": bool(descriptor.get("resolution_override", False)),
+        "pixel_scale_mode": descriptor.get("pixel_scale_mode"),
+        "timestamp": float(descriptor.get("timestamp", time.time())),
+        "source": descriptor.get("source", "computed"),
+    }
+    return payload
+
+
+def write_global_wcs_files(
+    descriptor: dict[str, Any],
+    fits_path: str,
+    json_path: str,
+    *,
+    logger_override: Optional[logging.Logger] = None,
+) -> None:
+    """Persist the global WCS header (.fits) and metadata (.json)."""
+
+    log = logger_override or logger
+    if fits_module_for_utils is None:
+        raise RuntimeError("Astropy FITS is required to persist the global WCS header")
+    header = descriptor.get("header")
+    if header is None:
+        raise ValueError("Descriptor missing FITS header data")
+
+    os.makedirs(os.path.dirname(fits_path) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(json_path) or ".", exist_ok=True)
+    primary_hdu = fits_module_for_utils.PrimaryHDU(header=header)
+    hdul = fits_module_for_utils.HDUList([primary_hdu])
+    hdul.writeto(fits_path, overwrite=True, output_verify="silentfix")
+    meta_payload = _descriptor_to_json_payload(descriptor)
+    meta_payload["fits_path"] = fits_path
+    meta_payload["json_path"] = json_path
+    with open(json_path, "w", encoding="utf-8") as handle:
+        json.dump(meta_payload, handle, indent=2, sort_keys=True)
+    log.info("Global WCS artifacts written: %s (%dx%d)", fits_path, descriptor.get("width"), descriptor.get("height"))
+
+
+def load_global_wcs_descriptor(
+    fits_path: str,
+    json_path: Optional[str] = None,
+    *,
+    logger_override: Optional[logging.Logger] = None,
+) -> Optional[dict[str, Any]]:
+    """Load an existing global WCS header + optional JSON metadata."""
+
+    log = logger_override or logger
+    if not fits_path or not os.path.isfile(fits_path):
+        return None
+    if not ASTROPY_WCS_AVAILABLE_IN_UTILS or AstropyWCS is None or fits_module_for_utils is None:
+        raise RuntimeError("Astropy WCS/FITS is required to read the global mosaic header")
+
+    header = fits_module_for_utils.getheader(fits_path, 0)
+    wcs_obj = AstropyWCS(header, naxis=2)
+    width = int(header.get("NAXIS1", 0) or 0)
+    height = int(header.get("NAXIS2", 0) or 0)
+    px_scale = _compute_pixel_scale_for_wcs(wcs_obj) or 0.0
+    meta_payload = None
+    json_candidate = json_path or Path(fits_path).with_suffix(".json")
+    try:
+        if json_candidate and os.path.isfile(json_candidate):
+            with open(json_candidate, "r", encoding="utf-8") as handle:
+                meta_payload = json.load(handle)
+    except Exception as exc_json:
+        log.warning("Global WCS: failed to read JSON metadata (%s): %s", json_candidate, exc_json)
+        meta_payload = None
+
+    descriptor = {
+        "header": header,
+        "wcs": wcs_obj,
+        "width": width,
+        "height": height,
+        "pixel_scale_deg_per_px": px_scale,
+        "pixel_scale_as_per_px": px_scale * 3600.0 if px_scale else 0.0,
+        "files": meta_payload.get("files") if isinstance(meta_payload, dict) else [],
+        "nb_images": meta_payload.get("nb_images") if isinstance(meta_payload, dict) else None,
+        "json_path": str(json_candidate),
+        "fits_path": fits_path,
+        "source": "existing",
+        "metadata": meta_payload,
+    }
+    return descriptor
 
 # --- Lightweight CuPy helpers -------------------------------------------------
 def gpu_is_available() -> bool:

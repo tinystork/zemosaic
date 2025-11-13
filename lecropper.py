@@ -62,6 +62,11 @@ import numpy as np
 from astropy.io import fits
 from typing import Any
 
+try:  # SciPy is optional; fall back gracefully if missing
+    from scipy import ndimage as _NDIMAGE  # type: ignore[import]
+except Exception:  # pragma: no cover - SciPy not installed
+    _NDIMAGE = None
+
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
@@ -148,6 +153,21 @@ def bbox_from_mask(m):
 
 logger = logging.getLogger(__name__)
 
+MIN_COVERAGE_ABS_DEFAULT = 3.0
+MIN_COVERAGE_FRAC_DEFAULT = 0.4
+MORPH_OPEN_PX_DEFAULT = 3
+
+_COVERAGE_EXTNAME_CANDIDATES = (
+    "COVERAGE",
+    "COVER",
+    "COV",
+    "WEIGHT",
+    "WEIGHTS",
+    "WEIGHTMAP",
+)
+_COVERAGE_SIDE_SUFFIXES = ("_coverage", ".coverage", "-coverage")
+_COVERAGE_SIDE_EXTENSIONS = (".fits", ".fit", ".fts")
+
 _ALPHA_EXPORT_SETTINGS: dict[str, Any] | None = None
 
 
@@ -196,6 +216,224 @@ def _get_altaz_alpha_settings():
 
     _ALPHA_EXPORT_SETTINGS = settings
     return settings
+
+
+def _build_altaz_mask_from_coverage(
+    coverage: np.ndarray,
+    min_coverage_abs: float = MIN_COVERAGE_ABS_DEFAULT,
+    min_coverage_frac: float = MIN_COVERAGE_FRAC_DEFAULT,
+    morph_open_px: int = MORPH_OPEN_PX_DEFAULT,
+    margin_percent: float = 5.0,
+    decay: float = 0.15,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build a (good_mask, alpha) pair from a coverage map."""
+
+    cov_arr = np.asarray(coverage, dtype=np.float32)
+    if cov_arr.ndim != 2:
+        raise ValueError(f"coverage must be 2D, got shape={cov_arr.shape}")
+
+    cov_arr = np.nan_to_num(cov_arr, nan=0.0, posinf=0.0, neginf=0.0)
+    cov_arr = np.clip(cov_arr, 0.0, None, out=cov_arr)
+
+    if cov_arr.size == 0:
+        raise ValueError("coverage map is empty")
+
+    if np.any(cov_arr):
+        max_cov = float(np.nanmax(cov_arr))
+    else:
+        max_cov = 0.0
+
+    thr_abs = max(0.0, float(min_coverage_abs))
+    thr_frac_value = max(0.0, float(min_coverage_frac)) * max_cov
+    thr = max(thr_abs, thr_frac_value)
+
+    good = cov_arr >= thr
+    if not np.any(good):
+        if max_cov > 0.0:
+            fallback_thr = max(0.25 * max_cov, 1.0)
+            good = cov_arr >= fallback_thr
+        if not np.any(good):
+            good = cov_arr > 0.0
+    if not np.any(good):
+        raise ValueError("coverage map lacks valid pixels above threshold")
+
+    ndi = _NDIMAGE
+    morph_iters = max(0, int(morph_open_px))
+    if ndi is not None and morph_iters > 0:
+        structure = ndi.generate_binary_structure(2, 1)
+        if morph_iters > 1:
+            structure = ndi.binary_dilation(structure, iterations=morph_iters - 1)
+        cleaned = ndi.binary_opening(good, structure=structure)
+        if np.any(cleaned):
+            good = cleaned
+    elif morph_iters > 0:
+        logger.debug("SciPy not available; skipping morphological cleanup")
+
+    if ndi is not None and np.any(good):
+        dist = ndi.distance_transform_edt(good)
+    else:
+        dist = np.where(good, 1.0, 0.0).astype(np.float32, copy=False)
+
+    h, w = good.shape
+    margin_percent = float(margin_percent)
+    min_dim = float(min(h, w)) if h and w else 0.0
+    margin_px = margin_percent * 0.01 * min_dim
+    if margin_percent <= 0.0 or min_dim == 0.0:
+        margin_px = 0.0
+    else:
+        margin_px = max(1.0, margin_px)
+
+    decay = max(float(decay), 1e-3)
+    alpha = np.zeros_like(dist, dtype=np.float32)
+
+    if margin_px <= 0.0:
+        alpha = good.astype(np.float32, copy=False)
+    else:
+        inside = dist >= margin_px
+        edge = (dist > 0) & (dist < margin_px)
+        alpha[inside] = 1.0
+        if np.any(edge):
+            t = np.clip(dist[edge] / margin_px, 0.0, 1.0)
+            alpha[edge] = np.clip(t ** (1.0 / decay), 0.0, 1.0)
+        alpha[~good] = 0.0
+
+    alpha = np.clip(alpha, 0.0, 1.0, out=alpha)
+
+    logger.info(
+        "AltAz cleanup: using coverage-based mask (thr_abs=%.2f, thr_frac=%.2f, thr=%.2f, morph_open_px=%d)",
+        thr_abs,
+        float(min_coverage_frac),
+        thr,
+        morph_iters,
+    )
+
+    return good.astype(bool, copy=False), alpha.astype(np.float32, copy=False)
+
+
+def _build_low_signal_border_mask(
+    arr: np.ndarray,
+    spatial_shape: tuple[int, int],
+    leading_spatial: bool,
+    margin_percent: float = 5.0,
+    k_sigma: float = 1.0,
+    min_inner_frac: float = 0.2,
+) -> np.ndarray:
+    """
+    Build a 2D float mask [0,1] that downweights low-signal border regions.
+    """
+
+    if len(spatial_shape) != 2:
+        raise ValueError("spatial_shape must be a tuple of (H, W)")
+
+    H, W = int(spatial_shape[0]), int(spatial_shape[1])
+    if H <= 0 or W <= 0:
+        raise ValueError("spatial dimensions must be positive")
+
+    arr_f = np.asarray(arr, dtype=np.float32, copy=False)
+    arr_f = np.nan_to_num(arr_f, nan=0.0, posinf=0.0, neginf=0.0)
+
+    if arr_f.ndim == 2:
+        lum2d = np.abs(arr_f)
+    else:
+        data = arr_f
+        if leading_spatial:
+            if data.shape[0] != H or data.shape[1] != W:
+                if data.size % (H * W) != 0:
+                    raise ValueError("array cannot be reshaped to (H, W, ...)")
+                data = data.reshape(H, W, -1)
+            axes = tuple(range(2, data.ndim))
+        else:
+            if data.shape[-2] != H or data.shape[-1] != W:
+                if data.size % (H * W) != 0:
+                    raise ValueError("array cannot be reshaped to (..., H, W)")
+                data = data.reshape(-1, H, W)
+            axes = tuple(range(0, data.ndim - 2))
+        if axes:
+            lum2d = np.mean(np.abs(data), axis=axes)
+        else:
+            lum2d = np.abs(data)
+
+    lum2d = np.nan_to_num(lum2d, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+    if lum2d.shape != (H, W):
+        lum2d = lum2d.reshape(H, W)
+
+    min_inner_frac = float(np.clip(min_inner_frac, 0.0, 0.45))
+    inner_y0 = int(min_inner_frac * H)
+    inner_y1 = int((1.0 - min_inner_frac) * H)
+    inner_x0 = int(min_inner_frac * W)
+    inner_x1 = int((1.0 - min_inner_frac) * W)
+
+    def _ensure_span(start, end, limit):
+        start = max(0, min(start, limit))
+        end = max(start + 2, min(end, limit))
+        if end - start < 4:
+            center = limit // 2
+            start = max(0, center - 2)
+            end = min(limit, center + 2)
+        return start, end
+
+    inner_y0, inner_y1 = _ensure_span(inner_y0, inner_y1, H)
+    inner_x0, inner_x1 = _ensure_span(inner_x0, inner_x1, W)
+
+    core = lum2d[inner_y0:inner_y1, inner_x0:inner_x1]
+    if core.size == 0:
+        core = lum2d
+
+    med = float(np.median(core))
+    mad = float(np.median(np.abs(core - med)))
+    sigma = 1.4826 * mad if mad > 0 else float(np.std(core))
+    if not np.isfinite(sigma) or sigma <= 0:
+        sigma = float(np.std(lum2d))
+    if not np.isfinite(sigma) or sigma <= 0:
+        sigma = 1e-3
+
+    margin_percent = float(margin_percent)
+    min_dim = float(min(H, W))
+    margin_px = max(1.0, margin_percent * 0.01 * min_dim)
+    band = max(4, int(round(margin_px)))
+    thr_low = med - float(k_sigma) * sigma
+
+    border = np.zeros_like(lum2d, dtype=bool)
+    border[:band, :] = True
+    border[-band:, :] = True
+    border[:, :band] = True
+    border[:, -band:] = True
+
+    low_signal = border & (lum2d < thr_low)
+
+    ndi = _NDIMAGE
+    if ndi is not None and np.any(low_signal):
+        try:
+            low_signal = ndi.binary_opening(low_signal, iterations=1)
+        except Exception:
+            pass
+
+    good = ~low_signal
+    if not np.any(good):
+        return np.ones_like(lum2d, dtype=np.float32)
+
+    if ndi is not None:
+        dist = ndi.distance_transform_edt(good)
+    else:
+        dist = np.where(good, 1.0, 0.0).astype(np.float32, copy=False)
+
+    alpha = np.zeros_like(dist, dtype=np.float32)
+    margin_feather = max(1.0, margin_px)
+
+    if margin_feather <= 0:
+        return good.astype(np.float32, copy=False)
+
+    inside = dist >= margin_feather
+    edge = (dist > 0) & (dist < margin_feather)
+
+    alpha[inside] = 1.0
+    if np.any(edge):
+        t = dist[edge] / margin_feather
+        alpha[edge] = t
+
+    alpha[~good] = 0.0
+    alpha = np.clip(alpha, 0.0, 1.0, out=alpha)
+    return alpha
 
 
 def detect_autocrop_rgb(
@@ -380,6 +618,10 @@ def mask_altaz_artifacts(
     fill_value=0.0,
     return_mask=False,
     hard_threshold=1e-3,
+    coverage: np.ndarray | None = None,
+    min_coverage_abs: float | None = None,
+    min_coverage_frac: float | None = None,
+    morph_open_px: int | None = None,
 ):
     """Softly attenuate Alt-Az rotation artifacts near the corners.
 
@@ -398,6 +640,15 @@ def mask_altaz_artifacts(
         Whether to return the generated mask alongside the image.
     hard_threshold : float
         Threshold below which the mask is considered "off" for fill_value.
+    coverage : np.ndarray, optional
+        Optional coverage map used to derive a data-driven alpha mask.
+    min_coverage_abs : float, optional
+        Absolute coverage threshold. Defaults to :data:`MIN_COVERAGE_ABS_DEFAULT`.
+    min_coverage_frac : float, optional
+        Fraction of max coverage to keep. Defaults to
+        :data:`MIN_COVERAGE_FRAC_DEFAULT`.
+    morph_open_px : int, optional
+        Radius (in pixels) for morphological opening when coverage is used.
     """
 
     arr = np.asarray(full_img, dtype=np.float32)
@@ -421,7 +672,92 @@ def mask_altaz_artifacts(
             spatial_shape = tail_shape
             leading_spatial = False
 
-    mask2d = _radial_falloff_mask(spatial_shape, margin_percent, decay_ratio)
+    coverage_mask = None
+    cov_arr = None
+    if coverage is not None:
+        try:
+            cov_arr = np.asarray(coverage, dtype=np.float32)
+            if cov_arr.ndim > 2:
+                cov_arr = np.squeeze(cov_arr)
+            if cov_arr.ndim != 2:
+                raise ValueError("coverage map must be 2D")
+            if cov_arr.shape != spatial_shape:
+                logger.debug(
+                    "Coverage map ignored due to shape mismatch: %s vs %s",
+                    cov_arr.shape,
+                    spatial_shape,
+                )
+                cov_arr = None
+            elif not np.isfinite(cov_arr).any():
+                logger.debug("Coverage map ignored: no finite values")
+                cov_arr = None
+        except Exception as exc:
+            logger.debug("Coverage map ignored (%s)", exc)
+            cov_arr = None
+
+    if cov_arr is not None:
+        try:
+            cov_abs = MIN_COVERAGE_ABS_DEFAULT if min_coverage_abs is None else float(min_coverage_abs)
+            cov_frac = MIN_COVERAGE_FRAC_DEFAULT if min_coverage_frac is None else float(min_coverage_frac)
+            cov_morph = MORPH_OPEN_PX_DEFAULT if morph_open_px is None else int(morph_open_px)
+        except Exception:
+            cov_abs = MIN_COVERAGE_ABS_DEFAULT
+            cov_frac = MIN_COVERAGE_FRAC_DEFAULT
+            cov_morph = MORPH_OPEN_PX_DEFAULT
+
+        try:
+            _, coverage_mask = _build_altaz_mask_from_coverage(
+                cov_arr,
+                min_coverage_abs=cov_abs,
+                min_coverage_frac=cov_frac,
+                morph_open_px=cov_morph,
+                margin_percent=margin_percent,
+                decay=decay_ratio,
+            )
+        except Exception as exc:
+            logger.warning(
+                "AltAz coverage-based mask failed (%s); falling back to radial feather",
+                exc,
+            )
+            coverage_mask = None
+
+    if coverage_mask is not None:
+        m = np.asarray(coverage_mask, dtype=np.float32)
+        if m.ndim != 2:
+            coverage_mask = None
+        else:
+            m = np.clip(m, 0.0, 1.0, out=m)
+            frac_high = float((m > 0.99).mean())
+            frac_low = float((m < 0.01).mean())
+            if frac_high > 0.98 or frac_low > 0.98:
+                logger.debug(
+                    "Coverage-based mask considered non-discriminative "
+                    "(frac_high=%.3f, frac_low=%.3f); will try signal-based fallback.",
+                    frac_high,
+                    frac_low,
+                )
+                coverage_mask = None
+
+    mask2d = None
+    if coverage_mask is not None:
+        mask2d = np.asarray(coverage_mask, dtype=np.float32, copy=False)
+    else:
+        try:
+            mask2d = _build_low_signal_border_mask(
+                arr,
+                spatial_shape=spatial_shape,
+                leading_spatial=leading_spatial,
+                margin_percent=margin_percent,
+                k_sigma=1.0,
+                min_inner_frac=0.2,
+            )
+            logger.debug("AltAz cleanup: using low-signal border mask fallback")
+        except Exception as exc:
+            logger.debug("Low-signal fallback failed (%s); will use radial feather", exc)
+            mask2d = None
+
+    if mask2d is None:
+        mask2d = _radial_falloff_mask(spatial_shape, margin_percent, decay_ratio)
 
     if arr.ndim == 2:
         masked = arr * mask2d
@@ -455,12 +791,17 @@ def apply_altaz_cleanup(
     margin_percent: float = 5.0,
     decay: float = 0.15,
     nanize: bool = False,
+    coverage: np.ndarray | None = None,
+    min_coverage_abs: float | None = None,
+    min_coverage_frac: float | None = None,
+    morph_open_px: int | None = None,
 ):
     """
     Public helper that mirrors the Alt-Az cleanup expected by ZeMosaic.
 
     The function intentionally avoids any dependency on ZeMosaic so that this
     module stays standalone-friendly.
+    The optional *coverage* argument enables coverage-driven alpha masks.
     """
 
     if image is None:
@@ -472,7 +813,87 @@ def apply_altaz_cleanup(
         margin_percent=margin_percent,
         decay_ratio=decay,
         fill_value=fill_value,
+        coverage=coverage,
+        min_coverage_abs=min_coverage_abs,
+        min_coverage_frac=min_coverage_frac,
+        morph_open_px=morph_open_px,
     )
+
+
+def _sanitize_coverage_array(raw, expected_shape: tuple[int, int] | None = None):
+    if raw is None:
+        return None
+    arr = np.asarray(raw, dtype=np.float32)
+    if arr.ndim > 2:
+        arr = np.squeeze(arr)
+    if arr.ndim != 2:
+        return None
+    if expected_shape is not None and arr.shape != expected_shape:
+        logger.debug("Coverage array rejected due to shape mismatch: %s vs %s", arr.shape, expected_shape)
+        return None
+    if not np.isfinite(arr).any():
+        return None
+    return np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+
+
+def _maybe_extract_coverage_from_hdul(hdul, expected_shape: tuple[int, int] | None = None):
+    if hdul is None:
+        return None
+    for idx in range(1, len(hdul)):
+        hdu = hdul[idx]
+        data = getattr(hdu, "data", None)
+        if data is None:
+            continue
+        arr = _sanitize_coverage_array(data, expected_shape=expected_shape)
+        if arr is None:
+            continue
+        extname = (getattr(hdu, "name", "") or hdu.header.get("EXTNAME", "") or "").upper()
+        bunit = str(hdu.header.get("BUNIT", "")).lower()
+        if (
+            extname in _COVERAGE_EXTNAME_CANDIDATES
+            or "COVER" in extname
+            or "WEIGHT" in extname
+            or "count" in bunit
+        ):
+            logger.info(
+                "Detected coverage HDU '%s' (idx=%d, shape=%s)",
+                extname or f"HDU{idx}",
+                idx,
+                arr.shape,
+            )
+            return arr
+    return None
+
+
+def _maybe_load_sidecar_coverage(in_path: str, expected_shape: tuple[int, int] | None = None):
+    if not in_path:
+        return None
+
+    base, ext = os.path.splitext(in_path)
+    ext_candidates = []
+    if ext:
+        ext_candidates.append(ext)
+    for extra in _COVERAGE_SIDE_EXTENSIONS:
+        if extra not in ext_candidates:
+            ext_candidates.append(extra)
+
+    candidates = []
+    for suffix in _COVERAGE_SIDE_SUFFIXES:
+        for ext_candidate in ext_candidates:
+            candidates.append(f"{base}{suffix}{ext_candidate}")
+
+    for cand in candidates:
+        if not os.path.exists(cand):
+            continue
+        try:
+            with fits.open(cand, memmap=False) as hdul:
+                arr = _sanitize_coverage_array(hdul[0].data, expected_shape=expected_shape)
+                if arr is not None:
+                    logger.info("Detected coverage sidecar %s (shape=%s)", os.path.basename(cand), arr.shape)
+                    return arr
+        except Exception as exc:
+            logger.debug("Failed to load coverage sidecar %s: %s", cand, exc)
+    return None
 
 
 def _trim_color_edges_fullres(R, G, B, rect, step=3, minsize=32, k=3.0):
@@ -577,11 +998,19 @@ def save_cropped_fits(
     altaz_use_nan=False,
 ):
     y0, x0, y1, x1 = rect
+    coverage_full = None
+    spatial_shape: tuple[int, int] | None = None
     # Use memmap=False so the FITS file handle is fully released before
     # potentially overwriting the source file (Windows needs the file closed).
     with fits.open(in_path, mode="readonly", memmap=False) as hdul:
         data = np.asarray(hdul[0].data)
         header = hdul[0].header.copy()
+        if data.ndim >= 2:
+            spatial_shape = (int(data.shape[-2]), int(data.shape[-1]))
+        coverage_full = _maybe_extract_coverage_from_hdul(hdul, expected_shape=spatial_shape)
+
+    if coverage_full is None and spatial_shape is not None:
+        coverage_full = _maybe_load_sidecar_coverage(in_path, expected_shape=spatial_shape)
 
     if data.ndim == 2:
         cropped = data[y0:y1, x0:x1]
@@ -595,33 +1024,49 @@ def save_cropped_fits(
     else:
         cropped = data
 
+    coverage_cropped = None
+    if coverage_full is not None:
+        try:
+            coverage_cropped = coverage_full[y0:y1, x0:x1]
+        except Exception as exc:
+            logger.debug("Coverage crop failed: %s", exc)
+            coverage_cropped = None
+
     alpha_mask = None
     if altaz_cleanup:
         fill_value = np.nan if altaz_use_nan else 0.0
-        if altaz_use_nan:
-            cropped, mask = mask_altaz_artifacts(
-                cropped,
-                margin_percent=altaz_margin,
-                decay_ratio=altaz_decay,
-                fill_value=fill_value,
-                return_mask=True,
+        hard_threshold = 1e-3
+        mask_kwargs: dict[str, Any] = {
+            "margin_percent": altaz_margin,
+            "decay_ratio": altaz_decay,
+            "fill_value": fill_value,
+            "return_mask": True,
+            "hard_threshold": hard_threshold,
+        }
+        if coverage_cropped is not None:
+            mask_kwargs.update(
+                coverage=coverage_cropped,
+                min_coverage_abs=MIN_COVERAGE_ABS_DEFAULT,
+                min_coverage_frac=MIN_COVERAGE_FRAC_DEFAULT,
+                morph_open_px=MORPH_OPEN_PX_DEFAULT,
             )
-            # NOTE [DO-NOT-REMOVE (alpha mask)]: ce masque ALPHA est requis pour
-            # l’édition cosmétique et la transparence de la mosaïque finale.
-            # Ne pas supprimer cette étape : elle garantit l’absence d’arcs noirs.
-            cropped = np.where(mask == 0, np.nan, cropped)
-            mask8 = np.clip(mask, 0.0, 1.0)
-            alpha_mask = np.asarray((mask8 * 255.0).round(), dtype=np.uint8)
+
+        masked_result = mask_altaz_artifacts(
+            cropped,
+            **mask_kwargs,
+        )
+        if isinstance(masked_result, tuple):
+            cropped, mask = masked_result
         else:
-            cropped = mask_altaz_artifacts(
-                cropped,
-                margin_percent=altaz_margin,
-                decay_ratio=altaz_decay,
-                fill_value=fill_value,
-            )
-            alpha_mask = None
-    else:
-        alpha_mask = None
+            cropped, mask = masked_result, None
+
+        if mask is not None:
+            mask = np.asarray(mask, dtype=np.float32, copy=False)
+            if altaz_use_nan:
+                cropped = np.where(mask <= hard_threshold, np.nan, cropped)
+            # NOTE [DO-NOT-REMOVE (alpha mask)]: this alpha map is consumed
+            # downstream for cosmetic editing / transparency in mosaics.
+            alpha_mask = np.clip((mask * 255.0).round(), 0, 255).astype(np.uint8)
 
     # Mise à jour rapide du CRPIX si présent (optionnel)
     if "CRPIX1" in header and "CRPIX2" in header:

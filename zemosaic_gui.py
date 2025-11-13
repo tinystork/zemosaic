@@ -61,6 +61,7 @@ import platform
 import shutil
 import importlib
 import importlib.util
+import json
 from typing import Any, Optional
 
 SYSTEM_NAME = platform.system().lower()
@@ -2480,6 +2481,8 @@ class ZeMosaicGUI:
                 except Exception:
                     astap_sensitivity = self.solver_settings.astap_sensitivity
 
+                output_dir_value = self.output_dir_var.get().strip()
+
                 self.solver_settings.astap_executable_path = astap_exe
                 self.solver_settings.astap_data_directory_path = astap_data
                 self.solver_settings.astap_search_radius_deg = astap_radius
@@ -2494,6 +2497,7 @@ class ZeMosaicGUI:
                     "astap_default_search_radius": astap_radius,
                     "astap_default_downsample": astap_downsample,
                     "astap_default_sensitivity": astap_sensitivity,
+                    "output_dir": output_dir_value,
                 }
                 try:
                     config_overrides.update({
@@ -3520,6 +3524,7 @@ class ZeMosaicGUI:
                     config_overrides = None
                     try:
                         solver_cfg_payload = asdict(self.solver_settings)
+                        output_dir_value = self.output_dir_var.get().strip()
                         config_overrides = {
                             "apply_master_tile_crop": bool(self.apply_master_tile_crop_var.get()),
                             "master_tile_crop_percent": float(self.master_tile_crop_percent_var.get()),
@@ -3540,6 +3545,7 @@ class ZeMosaicGUI:
                             "quality_gate_k_sigma": float(self.quality_gate_k_sigma_var.get()),
                             "quality_gate_erode_px": int(self.quality_gate_erode_var.get()),
                             "quality_gate_move_rejects": bool(self.quality_gate_move_rejects_var.get()),
+                            "output_dir": output_dir_value,
                         }
                     except Exception:
                         # Fallback to minimal payload
@@ -3607,6 +3613,45 @@ class ZeMosaicGUI:
                                     self.config["cluster_panel_threshold"] = float(self.cluster_threshold_var.get())
                                     self.config["cluster_target_groups"] = int(self.cluster_target_groups_var.get())
                                     self.config["cluster_orientation_split_deg"] = float(self.cluster_orientation_split_var.get())
+                                except Exception:
+                                    pass
+                                try:
+                                    workflow_mode_override = overrides_tmp.get("mode")
+                                    if isinstance(workflow_mode_override, str):
+                                        normalized_mode = workflow_mode_override.strip().lower()
+                                        if normalized_mode in ("seestar", "classic"):
+                                            payload = {"mode": normalized_mode}
+                                            self._log_message(
+                                                f"[CLÉ_POUR_GUI: workflow_selected] {json.dumps(payload)}",
+                                                level="INFO",
+                                            )
+                                    global_meta = overrides_tmp.get("global_wcs_meta")
+                                    if isinstance(global_meta, dict) and global_meta:
+                                        try:
+                                            w_val = int(global_meta.get("width") or global_meta.get("W") or 0)
+                                        except Exception:
+                                            w_val = 0
+                                        try:
+                                            h_val = int(global_meta.get("height") or global_meta.get("H") or 0)
+                                        except Exception:
+                                            h_val = 0
+                                        try:
+                                            scale_val = float(
+                                                global_meta.get("pixel_scale_as_per_px")
+                                                or global_meta.get("scale")
+                                                or 0.0
+                                            )
+                                        except Exception:
+                                            scale_val = 0.0
+                                        try:
+                                            nb_val = int(global_meta.get("nb_images") or 0)
+                                        except Exception:
+                                            nb_val = 0
+                                        meta_payload = {"W": w_val, "H": h_val, "scale": scale_val, "nb_images": nb_val}
+                                        self._log_message(
+                                            f"[CLÉ_POUR_GUI: global_wcs_ready] {json.dumps(meta_payload)}",
+                                            level="INFO",
+                                        )
                                 except Exception:
                                     pass
                         except Exception:
