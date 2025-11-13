@@ -56,8 +56,9 @@ import gc
 import logging
 import psutil
 import threading
+import hashlib
+import queue
 from contextlib import contextmanager
-from concurrent.futures import ProcessPoolExecutor
 
 import multiprocessing
 
@@ -70,6 +71,22 @@ try:
     import fcntl
 except ImportError:  # pragma: no cover - not available on Windows
     fcntl = None
+
+try:
+    import ctypes
+except Exception:  # pragma: no cover - very limited Python builds
+    ctypes = None
+
+if os.name == "nt" and ctypes is not None:
+    try:
+        SEM_FAILCRITICALERRORS = 0x0001
+        SEM_NOGPFAULTERRORBOX = 0x0002
+        SEM_NOOPENFILEERRORBOX = 0x8000
+        ctypes.windll.kernel32.SetErrorMode(
+            SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX
+        )
+    except Exception:
+        pass
 
 
 logger = logging.getLogger("ZeMosaicAstrometry")
@@ -180,6 +197,14 @@ _ASTAP_IPC_LOCK_SUPPORTED = bool(msvcrt or fcntl)
 _ASTAP_IPC_WAIT_LOG_THRESHOLD_SEC = 2.0
 _ASTAP_IPC_WAIT_LOG_INTERVAL_SEC = 12.0
 _ASTAP_IPC_LOCK_WARNING_EMITTED = False
+_PER_FILE_LOCK_DIR = os.path.join(tempfile.gettempdir(), "zemo_astap_filelocks")
+os.makedirs(_PER_FILE_LOCK_DIR, exist_ok=True)
+_ASTAP_RATE_MIN_INTERVAL = max(
+    0.0, float(os.environ.get("ZEMOSAIC_ASTAP_RATE_SEC", "0.75") or 0.75)
+)
+_ASTAP_RATE_BURST = max(1, int(os.environ.get("ZEMOSAIC_ASTAP_RATE_BURST", "2") or 2))
+_ASTAP_LAST_LAUNCH_TIMES: list[float] = []
+_ASTAP_RATE_LOCK = threading.Lock()
 
 
 def _initialize_slot_file(path: str) -> None:
@@ -321,6 +346,126 @@ def _astap_ipc_slot_guard(image_label: str = "", progress_callback: callable = N
                 logger.debug(
                     "ASTAP IPC slot '%s' released for %s", slot_name, image_label or "?"
                 )
+
+
+@contextmanager
+def _temp_cwd_isolated(prefix: str = "zemo_astap_run"):
+    """Create a dedicated temporary directory used as cwd for an ASTAP invocation."""
+    root = os.path.join(
+        tempfile.gettempdir(),
+        f"{prefix}_{os.getpid()}_{threading.get_ident()}_{int(time.time()*1000)}",
+    )
+    os.makedirs(root, exist_ok=True)
+    try:
+        yield root
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+@contextmanager
+def _lock_for_image(
+    image_path: str, image_label: str = "", progress_callback: callable = None
+):
+    """
+    Cross-process lock preventing concurrent solves of the same FITS path.
+    """
+    if not image_path:
+        yield
+        return
+    os.makedirs(_PER_FILE_LOCK_DIR, exist_ok=True)
+    digest = hashlib.sha1(os.path.abspath(image_path).encode("utf-8", "ignore")).hexdigest()[:16]
+    lock_path = os.path.join(_PER_FILE_LOCK_DIR, f"{digest}.lock")
+    handle = None
+    acquired = False
+    wait_notified = False
+    start = time.monotonic()
+    label = image_label or os.path.basename(image_path) or image_path
+    try:
+        handle = open(lock_path, "a+b")
+        try:
+            if os.path.getsize(lock_path) == 0:
+                handle.write(b"0")
+                handle.flush()
+        except Exception:
+            pass
+        while not acquired:
+            try:
+                if msvcrt is not None and os.name == "nt":
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    acquired = True
+                elif fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                else:
+                    acquired = True
+            except (OSError, BlockingIOError):
+                pass
+            if not acquired:
+                if not wait_notified and progress_callback:
+                    progress_callback(
+                        f"  ASTAP Solve: attente verrou fichier pour '{label}'.",
+                        None,
+                        "DEBUG_DETAIL",
+                    )
+                    wait_notified = True
+                if time.monotonic() - start > 120:
+                    raise TimeoutError(f"image-level lock timeout for '{label}'")
+                time.sleep(0.1)
+        if progress_callback:
+            progress_callback(
+                f"  ASTAP Solve: verrou fichier acquis pour '{label}'.",
+                None,
+                "DEBUG_DETAIL",
+            )
+        yield
+    finally:
+        try:
+            if handle:
+                if msvcrt is not None and os.name == "nt":
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                elif fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                handle.close()
+        except Exception:
+            pass
+        if progress_callback and acquired:
+            progress_callback(
+                f"  ASTAP Solve: verrou fichier libéré pour '{label}'.",
+                None,
+                "DEBUG_DETAIL",
+            )
+
+
+def _rate_limit_before_launch(progress_callback: callable = None):
+    """Simple token bucket to avoid ASTAP bursts that trigger access violations."""
+    if _ASTAP_RATE_MIN_INTERVAL <= 0:
+        return
+    attempts = 0
+    while True:
+        with _ASTAP_RATE_LOCK:
+            now = time.monotonic()
+            while _ASTAP_LAST_LAUNCH_TIMES and (
+                now - _ASTAP_LAST_LAUNCH_TIMES[0] > _ASTAP_RATE_MIN_INTERVAL
+            ):
+                _ASTAP_LAST_LAUNCH_TIMES.pop(0)
+            if len(_ASTAP_LAST_LAUNCH_TIMES) < _ASTAP_RATE_BURST:
+                _ASTAP_LAST_LAUNCH_TIMES.append(now)
+                return
+            wait_time = max(
+                0.0,
+                _ASTAP_RATE_MIN_INTERVAL
+                - (now - (_ASTAP_LAST_LAUNCH_TIMES[0] if _ASTAP_LAST_LAUNCH_TIMES else now)),
+            )
+        attempts += 1
+        if progress_callback:
+            progress_callback(
+                f"  ASTAP Solve: limitation de débit active, attente {wait_time:.2f}s.",
+                None,
+                "DEBUG_DETAIL" if attempts < 3 else "INFO",
+            )
+        time.sleep(max(0.05, wait_time))
 
 
 def set_astap_max_concurrent_instances(count: int) -> int:
@@ -474,16 +619,77 @@ def extract_center_from_header(original_fits_header) -> "AstropySkyCoord | None"
     return None
 
 
-def _run_astap_subprocess(cmd_list: list, cwd: str, timeout_sec: int):
-    """Fonction exécutée dans un ProcessPoolExecutor pour lancer ASTAP."""
-    return subprocess.run(
+def _run_astap_once(
+    cmd_list: list,
+    timeout_sec: float,
+    progress_callback: callable = None,
+    cwd: str | None = None,
+):
+    """Launch ASTAP once, streaming stdout for logging, and return its rc."""
+    if progress_callback:
+        progress_callback("  ASTAP: lancement du solveur...", None, "DEBUG")
+    creationflags = 0
+    startupinfo = None
+    if os.name == "nt":
+        creationflags |= getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0
+    start_time = time.monotonic()
+    proc = subprocess.Popen(
         cmd_list,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        timeout=timeout_sec,
-        check=False,
-        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        cwd=cwd or None,
+        creationflags=creationflags,
+        startupinfo=startupinfo,
+        text=True,
+        encoding="utf-8",
+        errors="ignore",
+        bufsize=1,
     )
+    reader_done = threading.Event()
+    output_queue: "queue.SimpleQueue[str]" = queue.SimpleQueue()
+
+    def _drain_stdout():
+        try:
+            if proc.stdout:
+                for raw_line in proc.stdout:
+                    output_queue.put(raw_line.rstrip("\r\n"))
+        finally:
+            reader_done.set()
+
+    if proc.stdout:
+        threading.Thread(target=_drain_stdout, daemon=True).start()
+    else:
+        reader_done.set()
+
+    try:
+        while True:
+            while True:
+                try:
+                    decoded = output_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if decoded and progress_callback:
+                    progress_callback(f"  ASTAP> {decoded}", None, "DEBUG_DETAIL")
+            if proc.poll() is not None and reader_done.is_set() and output_queue.empty():
+                break
+            if time.monotonic() - start_time > timeout_sec:
+                proc.kill()
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    pass
+                raise subprocess.TimeoutExpired(cmd_list, timeout_sec)
+            time.sleep(0.05)
+        return proc.returncode or 0
+    finally:
+        if proc.stdout:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
 
 
 def _calculate_pixel_scale_from_header(header: fits.Header, progress_callback: callable = None) -> float | None:
@@ -838,6 +1044,24 @@ def solve_with_astap(image_fits_path: str,
         if progress_callback: progress_callback("ASTAP Solve ERREUR: Astropy non disponible, ASTAP solve annulé.", None, "ERROR")
         return None
 
+    if (
+        os.environ.get("ZEMOSAIC_GUI_MODE") == "1"
+        and threading.current_thread() is threading.main_thread()
+    ):
+        msg = (
+            "ASTAP Solve ERREUR: appel depuis le thread GUI principal détecté. "
+            "Le solver doit être exécuté dans un worker pour éviter tout gel."
+        )
+        logger.error(msg)
+        raise RuntimeError(msg)
+
+    if image_fits_path:
+        image_fits_path = os.path.abspath(image_fits_path)
+    if astap_exe_path:
+        astap_exe_path = os.path.abspath(astap_exe_path)
+    if astap_data_dir:
+        astap_data_dir = os.path.abspath(astap_data_dir)
+
     img_basename_log = os.path.basename(image_fits_path)
     if progress_callback: progress_callback(f"ASTAP Solve: Début pour '{img_basename_log}'", None, "INFO_DETAIL")
     logger.debug(f"ASTAP Solve params (entrée fonction): image='{img_basename_log}', radius={search_radius_deg}, "
@@ -1055,15 +1279,74 @@ def solve_with_astap(image_fits_path: str,
     astap_success = False
 
     try:
-        # Run ASTAP directly to avoid nested ProcessPoolExecutors from threads (can hang on Windows).
-        # We still enforce a strict timeout via subprocess.run inside _run_astap_subprocess.
-        with _astap_slot_guard(img_basename_log):
-            with _astap_ipc_slot_guard(img_basename_log, progress_callback):
-                astap_process_result = _run_astap_subprocess(cmd_list_astap, current_image_dir, timeout_sec)
-        logger.debug(f"ASTAP return code: {astap_process_result.returncode}")
+        max_retries = max(0, int(os.environ.get("ZEMOSAIC_ASTAP_RETRIES", "2") or 2))
+    except Exception:
+        max_retries = 2
+    try:
+        base_backoff = max(
+            0.1, float(os.environ.get("ZEMOSAIC_ASTAP_BACKOFF_SEC", "0.8") or 0.8)
+        )
+    except Exception:
+        base_backoff = 0.8
+    total_attempts = max_retries + 1
 
-        rc_astap = astap_process_result.returncode
-        del astap_process_result
+    try:
+        rc_astap = None
+        with _lock_for_image(image_fits_path, img_basename_log, progress_callback):
+            attempt = 0
+            last_error: Exception | None = None
+            while attempt < total_attempts:
+                attempt += 1
+                try:
+                    if total_attempts > 1 and progress_callback:
+                        progress_callback(
+                            f"  ASTAP Solve: tentative {attempt}/{total_attempts}.",
+                            None,
+                            "DEBUG_DETAIL",
+                        )
+                    with _astap_ipc_slot_guard(img_basename_log, progress_callback):
+                        with _astap_slot_guard(img_basename_log):
+                            _rate_limit_before_launch(progress_callback)
+                            with _temp_cwd_isolated() as isolated_cwd:
+                                rc_astap = _run_astap_once(
+                                    cmd_list_astap,
+                                    timeout_sec,
+                                    progress_callback,
+                                    cwd=isolated_cwd,
+                                )
+                    if rc_astap == 0:
+                        break
+                    raise RuntimeError(f"ASTAP return code {rc_astap}")
+                except subprocess.TimeoutExpired as exc_timeout:
+                    last_error = exc_timeout
+                    if attempt >= total_attempts:
+                        raise
+                    wait = base_backoff * attempt
+                    if progress_callback:
+                        progress_callback(
+                            f"  ASTAP Solve: timeout (tentative {attempt}/{total_attempts}). "
+                            f"Nouvel essai dans {wait:.1f}s.",
+                            None,
+                            "WARN",
+                        )
+                    time.sleep(wait)
+                except Exception as exc_generic:
+                    last_error = exc_generic
+                    if attempt >= total_attempts:
+                        raise
+                    wait = base_backoff * attempt
+                    if progress_callback:
+                        progress_callback(
+                            f"  ASTAP Solve: échec tentative {attempt}/{total_attempts} ({exc_generic}). "
+                            f"Nouvel essai dans {wait:.1f}s.",
+                            None,
+                            "WARN",
+                        )
+                    time.sleep(wait)
+            if rc_astap is None and last_error:
+                raise last_error
+
+        logger.debug("ASTAP return code: %s", rc_astap)
         gc.collect()
         _log_memory_usage(progress_callback, "Après GC post-ASTAP")
 

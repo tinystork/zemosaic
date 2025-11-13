@@ -52,6 +52,7 @@ patch_tk_variables()
 import threading
 import multiprocessing
 import os
+os.environ.setdefault("ZEMOSAIC_GUI_MODE", "1")
 import traceback
 import time
 import subprocess

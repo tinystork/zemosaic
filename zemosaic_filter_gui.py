@@ -51,6 +51,7 @@ from collections import Counter
 from collections.abc import Iterable
 from dataclasses import asdict
 import os
+os.environ.setdefault("ZEMOSAIC_GUI_MODE", "1")
 import sys
 import shutil
 import datetime

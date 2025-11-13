@@ -231,6 +231,10 @@ an inter-process lock:
 - Advanced users who prefer the legacy behaviour can set `ZEMOSAIC_ASTAP_DISABLE_IPC_LOCK=1` before
   launching the tools. Override the lock directory with `ZEMOSAIC_ASTAP_LOCK_DIR=/path/to/tmp` if the
   default `%TEMP%/zemosaic_astap_slots` is not suitable (portable drives, RAM disks, etc.).
+- SetErrorMode is enabled on Windows so ASTAP cannot raise modal crash boxes, and additional guards keep the
+  solver healthy under bursty workloads: per-image file locks, a configurable rate limiter
+  (`ZEMOSAIC_ASTAP_RATE_SEC` / `ZEMOSAIC_ASTAP_RATE_BURST`), and automatic retries with back-off
+  (`ZEMOSAIC_ASTAP_RETRIES`, `ZEMOSAIC_ASTAP_BACKOFF_SEC`).
 
 🔧 Build & Compilation (Windows) / Compilation (Windows)
 🇬🇧 Instructions (English)
