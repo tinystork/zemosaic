@@ -297,6 +297,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "output_dir": "",
             "global_wcs_output_path": "global_mosaic_wcs.fits",
             "coadd_memmap_dir": "",
+            "coadd_use_memmap": True,
+            "coadd_cleanup_memmap": True,
             "auto_detect_seestar": True,
             "force_seestar_mode": False,
             "sds_mode_default": False,
@@ -340,6 +342,42 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "two_pass_coverage_renorm": False,
             "two_pass_cov_sigma_px": 50,
             "two_pass_cov_gain_clip": [0.85, 1.18],
+            "apply_master_tile_crop": True,
+            "master_tile_crop_percent": 3.0,
+            "match_background_for_final": True,
+            "incremental_feather_parity": False,
+            "intertile_photometric_match": True,
+            "intertile_preview_size": 512,
+            "intertile_overlap_min": 0.05,
+            "intertile_sky_percentile": [30.0, 70.0],
+            "intertile_robust_clip_sigma": 2.5,
+            "intertile_global_recenter": True,
+            "intertile_recenter_clip": [0.85, 1.18],
+            "use_auto_intertile": False,
+            "center_out_normalization_p3": True,
+            "p3_center_preview_size": 256,
+            "p3_center_min_overlap_fraction": 0.03,
+            "p3_center_sky_percentile": [25.0, 60.0],
+            "p3_center_robust_clip_sigma": 2.5,
+            "center_out_anchor_mode": "auto_central_quality",
+            "anchor_quality_probe_limit": 12,
+            "anchor_quality_span_range": [0.02, 6.0],
+            "anchor_quality_median_clip_sigma": 2.5,
+            "enable_poststack_anchor_review": True,
+            "poststack_anchor_probe_limit": 8,
+            "poststack_anchor_span_range": [0.004, 10.0],
+            "poststack_anchor_median_clip_sigma": 3.5,
+            "poststack_anchor_min_improvement": 0.12,
+            "poststack_anchor_use_overlap_affine": True,
+            "save_final_as_uint16": False,
+            "legacy_rgb_cube": False,
+            "assembly_process_workers": 0,
+            "auto_limit_frames_per_master_tile": True,
+            "winsor_max_frames_per_pass": 0,
+            "winsor_worker_limit": 10,
+            "max_raw_per_master_tile": 0,
+            "use_gpu_phase5": False,
+            "gpu_id_phase5": 0,
             "logging_level": "INFO",
         }
         for key, fallback in self._default_config_values.items():
@@ -379,6 +417,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         main_layout.addWidget(self._create_instrument_group())
         main_layout.addWidget(self._create_mosaic_group())
         main_layout.addWidget(self._create_quality_group())
+        main_layout.addWidget(self._create_final_assembly_group())
         main_layout.addWidget(self._create_logging_group())
 
         button_row = QHBoxLayout()
@@ -731,6 +770,28 @@ class ZeMosaicQtMainWindow(QMainWindow):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(10)
 
+        tile_crop_group = QGroupBox(
+            self._tr("qt_group_master_tile_crop", "Master tile crop"),
+            group,
+        )
+        tile_crop_layout = QFormLayout(tile_crop_group)
+        tile_crop_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        self._register_checkbox(
+            "apply_master_tile_crop",
+            tile_crop_layout,
+            self._tr("qt_field_apply_master_tile_crop", "Apply master tile crop"),
+        )
+        self._register_double_spinbox(
+            "master_tile_crop_percent",
+            tile_crop_layout,
+            self._tr("qt_field_master_tile_crop_percent", "Crop percent per edge"),
+            minimum=0.0,
+            maximum=25.0,
+            single_step=0.5,
+            decimals=1,
+        )
+        layout.addWidget(tile_crop_group)
+
         crop_group = QGroupBox(
             self._tr("qt_group_quality_crop", "Quality crop"),
             group,
@@ -932,6 +993,386 @@ class ZeMosaicQtMainWindow(QMainWindow):
         }
 
         layout.addWidget(coverage_group)
+
+        return group
+
+    def _create_final_assembly_group(self) -> QGroupBox:
+        group = QGroupBox(
+            self._tr("qt_group_final_assembly", "Final assembly & output"),
+            self,
+        )
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(10)
+
+        general_box = QGroupBox(
+            self._tr("qt_group_final_general", "General output options"),
+            group,
+        )
+        general_layout = QFormLayout(general_box)
+        general_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        method_combo = QComboBox(general_box)
+        method_options = [
+            (
+                "reproject_coadd",
+                self._tr("qt_final_method_reproject", "Reproject co-add"),
+            ),
+            (
+                "incremental",
+                self._tr("qt_final_method_incremental", "Incremental assembly"),
+            ),
+        ]
+        for value, label in method_options:
+            method_combo.addItem(label, value)
+        current_method = str(self.config.get("final_assembly_method", "reproject_coadd"))
+        method_index = next(
+            (idx for idx, (value, _label) in enumerate(method_options) if value == current_method),
+            0,
+        )
+        method_combo.setCurrentIndex(method_index)
+        general_layout.addRow(
+            QLabel(self._tr("qt_field_final_assembly_method", "Assembly method")),
+            method_combo,
+        )
+        self._config_fields["final_assembly_method"] = {
+            "kind": "combobox",
+            "widget": method_combo,
+            "type": str,
+            "value_getter": method_combo.currentData,
+        }
+
+        self._register_checkbox(
+            "match_background_for_final",
+            general_layout,
+            self._tr("qt_field_match_background", "Match background in final mosaic"),
+        )
+        self._register_checkbox(
+            "save_final_as_uint16",
+            general_layout,
+            self._tr("qt_field_save_final_uint16", "Save final mosaic as uint16"),
+        )
+        self._register_checkbox(
+            "legacy_rgb_cube",
+            general_layout,
+            self._tr("qt_field_legacy_rgb_cube", "Legacy RGB cube layout"),
+        )
+        self._register_checkbox(
+            "incremental_feather_parity",
+            general_layout,
+            self._tr("qt_field_incremental_parity", "Force incremental feather parity"),
+        )
+        self._register_checkbox(
+            "auto_limit_frames_per_master_tile",
+            general_layout,
+            self._tr("qt_field_auto_limit_frames", "Auto-limit frames per master tile"),
+        )
+        self._register_checkbox(
+            "coadd_use_memmap",
+            general_layout,
+            self._tr("qt_field_coadd_use_memmap", "Use memory-mapped coadd intermediates"),
+        )
+        self._register_checkbox(
+            "coadd_cleanup_memmap",
+            general_layout,
+            self._tr("qt_field_coadd_cleanup", "Clean up memmap files after run"),
+        )
+
+        self._register_spinbox(
+            "assembly_process_workers",
+            general_layout,
+            self._tr("qt_field_assembly_workers", "Assembly workers (0 = auto)"),
+            minimum=0,
+            maximum=64,
+        )
+        self._register_spinbox(
+            "winsor_max_frames_per_pass",
+            general_layout,
+            self._tr("qt_field_winsor_max_frames", "Winsor max frames / pass (0 = auto)"),
+            minimum=0,
+            maximum=9999,
+        )
+        self._register_spinbox(
+            "winsor_worker_limit",
+            general_layout,
+            self._tr("qt_field_winsor_worker_limit", "Winsor worker limit"),
+            minimum=1,
+            maximum=64,
+        )
+        self._register_spinbox(
+            "max_raw_per_master_tile",
+            general_layout,
+            self._tr("qt_field_max_raw_per_tile", "Max raw frames per master tile (0 = unlimited)"),
+            minimum=0,
+            maximum=9999,
+        )
+        self._register_line_edit(
+            "coadd_memmap_dir",
+            general_layout,
+            self._tr("qt_field_coadd_memmap_dir", "Memmap directory"),
+            browse_action="directory",
+            dialog_title=self._tr(
+                "qt_dialog_select_memmap_dir", "Select memmap directory"
+            ),
+        )
+
+        layout.addWidget(general_box)
+
+        intertile_box = QGroupBox(
+            self._tr("qt_group_intertile", "Intertile blending"),
+            group,
+        )
+        intertile_layout = QFormLayout(intertile_box)
+        intertile_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        self._register_checkbox(
+            "intertile_photometric_match",
+            intertile_layout,
+            self._tr("qt_field_intertile_match", "Photometric match between tiles"),
+        )
+        self._register_checkbox(
+            "use_auto_intertile",
+            intertile_layout,
+            self._tr("qt_field_use_auto_intertile", "Auto-adjust intertile parameters"),
+        )
+        self._register_spinbox(
+            "intertile_preview_size",
+            intertile_layout,
+            self._tr("qt_field_intertile_preview", "Preview size (px)"),
+            minimum=128,
+            maximum=4096,
+            single_step=64,
+        )
+        self._register_double_spinbox(
+            "intertile_overlap_min",
+            intertile_layout,
+            self._tr("qt_field_intertile_overlap", "Minimum overlap"),
+            minimum=0.0,
+            maximum=1.0,
+            single_step=0.01,
+            decimals=2,
+        )
+        self._register_double_pair(
+            "intertile_sky_percentile",
+            intertile_layout,
+            self._tr("qt_field_intertile_sky", "Sky percentile range"),
+            minimum=0.0,
+            maximum=100.0,
+            single_step=0.5,
+            decimals=1,
+            default=(30.0, 70.0),
+        )
+        self._register_double_spinbox(
+            "intertile_robust_clip_sigma",
+            intertile_layout,
+            self._tr("qt_field_intertile_clip", "Robust clip σ"),
+            minimum=0.1,
+            maximum=10.0,
+            single_step=0.1,
+            decimals=2,
+        )
+        self._register_checkbox(
+            "intertile_global_recenter",
+            intertile_layout,
+            self._tr("qt_field_intertile_recenter", "Global recenter after stacking"),
+        )
+        self._register_double_pair(
+            "intertile_recenter_clip",
+            intertile_layout,
+            self._tr("qt_field_intertile_recenter_clip", "Recenter clip range"),
+            minimum=0.1,
+            maximum=5.0,
+            single_step=0.01,
+            decimals=2,
+            default=(0.85, 1.18),
+        )
+
+        layout.addWidget(intertile_box)
+
+        center_box = QGroupBox(
+            self._tr("qt_group_center_out", "Center-out normalization"),
+            group,
+        )
+        center_layout = QFormLayout(center_box)
+        center_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        self._register_checkbox(
+            "center_out_normalization_p3",
+            center_layout,
+            self._tr("qt_field_center_out_enable", "Enable center-out normalization"),
+        )
+        self._register_spinbox(
+            "p3_center_preview_size",
+            center_layout,
+            self._tr("qt_field_center_preview", "Preview size (px)"),
+            minimum=64,
+            maximum=2048,
+            single_step=32,
+        )
+        self._register_double_spinbox(
+            "p3_center_min_overlap_fraction",
+            center_layout,
+            self._tr("qt_field_center_overlap", "Minimum overlap fraction"),
+            minimum=0.0,
+            maximum=1.0,
+            single_step=0.01,
+            decimals=2,
+        )
+        self._register_double_pair(
+            "p3_center_sky_percentile",
+            center_layout,
+            self._tr("qt_field_center_sky", "Sky percentile range"),
+            minimum=0.0,
+            maximum=100.0,
+            single_step=1.0,
+            decimals=1,
+            default=(25.0, 60.0),
+        )
+        self._register_double_spinbox(
+            "p3_center_robust_clip_sigma",
+            center_layout,
+            self._tr("qt_field_center_clip", "Robust clip σ"),
+            minimum=0.1,
+            maximum=10.0,
+            single_step=0.1,
+            decimals=2,
+        )
+
+        anchor_mode_combo = QComboBox(center_box)
+        anchor_mode_options = [
+            (
+                "auto_central_quality",
+                self._tr("qt_center_anchor_auto", "Auto central quality"),
+            ),
+            (
+                "central_only",
+                self._tr("qt_center_anchor_central", "Central only"),
+            ),
+        ]
+        for value, label in anchor_mode_options:
+            anchor_mode_combo.addItem(label, value)
+        current_anchor_mode = str(self.config.get("center_out_anchor_mode", "auto_central_quality"))
+        anchor_mode_index = next(
+            (idx for idx, (value, _label) in enumerate(anchor_mode_options) if value == current_anchor_mode),
+            0,
+        )
+        anchor_mode_combo.setCurrentIndex(anchor_mode_index)
+        center_layout.addRow(
+            QLabel(self._tr("qt_field_center_anchor_mode", "Anchor mode")),
+            anchor_mode_combo,
+        )
+        self._config_fields["center_out_anchor_mode"] = {
+            "kind": "combobox",
+            "widget": anchor_mode_combo,
+            "type": str,
+            "value_getter": anchor_mode_combo.currentData,
+        }
+
+        self._register_spinbox(
+            "anchor_quality_probe_limit",
+            center_layout,
+            self._tr("qt_field_anchor_probe_limit", "Anchor probe limit"),
+            minimum=1,
+            maximum=50,
+        )
+        self._register_double_pair(
+            "anchor_quality_span_range",
+            center_layout,
+            self._tr("qt_field_anchor_span", "Anchor span range"),
+            minimum=0.0,
+            maximum=20.0,
+            single_step=0.01,
+            decimals=3,
+            default=(0.02, 6.0),
+        )
+        self._register_double_spinbox(
+            "anchor_quality_median_clip_sigma",
+            center_layout,
+            self._tr("qt_field_anchor_clip", "Anchor median clip σ"),
+            minimum=0.1,
+            maximum=10.0,
+            single_step=0.1,
+            decimals=2,
+        )
+
+        layout.addWidget(center_box)
+
+        post_box = QGroupBox(
+            self._tr("qt_group_poststack", "Post-stack anchor review"),
+            group,
+        )
+        post_layout = QFormLayout(post_box)
+        post_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        self._register_checkbox(
+            "enable_poststack_anchor_review",
+            post_layout,
+            self._tr("qt_field_poststack_enable", "Enable post-stack review"),
+        )
+        self._register_spinbox(
+            "poststack_anchor_probe_limit",
+            post_layout,
+            self._tr("qt_field_poststack_probe", "Probe limit"),
+            minimum=1,
+            maximum=20,
+        )
+        self._register_double_pair(
+            "poststack_anchor_span_range",
+            post_layout,
+            self._tr("qt_field_poststack_span", "Span range"),
+            minimum=0.0,
+            maximum=20.0,
+            single_step=0.01,
+            decimals=3,
+            default=(0.004, 10.0),
+        )
+        self._register_double_spinbox(
+            "poststack_anchor_median_clip_sigma",
+            post_layout,
+            self._tr("qt_field_poststack_clip", "Median clip σ"),
+            minimum=0.1,
+            maximum=10.0,
+            single_step=0.1,
+            decimals=2,
+        )
+        self._register_double_spinbox(
+            "poststack_anchor_min_improvement",
+            post_layout,
+            self._tr("qt_field_poststack_min_improve", "Min. improvement"),
+            minimum=0.0,
+            maximum=1.0,
+            single_step=0.01,
+            decimals=2,
+        )
+        self._register_checkbox(
+            "poststack_anchor_use_overlap_affine",
+            post_layout,
+            self._tr("qt_field_poststack_use_overlap", "Use overlap affine adjustment"),
+        )
+
+        layout.addWidget(post_box)
+
+        gpu_box = QGroupBox(
+            self._tr("qt_group_gpu", "GPU and acceleration"),
+            group,
+        )
+        gpu_layout = QFormLayout(gpu_box)
+        gpu_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        self._register_checkbox(
+            "use_gpu_phase5",
+            gpu_layout,
+            self._tr("qt_field_use_gpu_phase5", "Use GPU acceleration when available"),
+        )
+        self._register_spinbox(
+            "gpu_id_phase5",
+            gpu_layout,
+            self._tr("qt_field_gpu_id", "Preferred GPU ID"),
+            minimum=-1,
+            maximum=64,
+        )
+
+        layout.addWidget(gpu_box)
 
         return group
 
@@ -1208,6 +1649,62 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "kind": "double_spinbox",
             "widget": spinbox,
             "type": float,
+        }
+
+    def _register_double_pair(
+        self,
+        key: str,
+        layout: QFormLayout,
+        label_text: str,
+        *,
+        minimum: float,
+        maximum: float,
+        single_step: float,
+        decimals: int = 2,
+        default: Sequence[float] | None = None,
+        separator_text: str = "→",
+    ) -> None:
+        container = QWidget()
+        row_layout = QHBoxLayout(container)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(6)
+
+        first_spin = QDoubleSpinBox(container)
+        first_spin.setRange(minimum, maximum)
+        first_spin.setSingleStep(single_step)
+        first_spin.setDecimals(decimals)
+
+        second_spin = QDoubleSpinBox(container)
+        second_spin.setRange(minimum, maximum)
+        second_spin.setSingleStep(single_step)
+        second_spin.setDecimals(decimals)
+
+        pair_value = self.config.get(key, default if default is not None else (minimum, minimum))
+        if not (
+            isinstance(pair_value, (list, tuple))
+            and len(pair_value) >= 2
+        ):
+            pair_value = default if default is not None else (minimum, minimum)
+            self.config[key] = list(pair_value)
+
+        first_spin.setValue(float(pair_value[0]))
+        second_spin.setValue(float(pair_value[1]))
+
+        row_layout.addWidget(first_spin)
+        if separator_text:
+            row_layout.addWidget(QLabel(separator_text, container))
+        row_layout.addWidget(second_spin)
+
+        layout.addRow(QLabel(label_text), container)
+
+        self._config_fields[key] = {
+            "kind": "composite",
+            "widget": (first_spin, second_spin),
+            "type": list,
+            "value_getter": lambda fs=first_spin, ss=second_spin: [
+                float(fs.value()),
+                float(ss.value()),
+            ],
         }
 
     def _collect_config_from_widgets(self) -> None:

@@ -256,7 +256,7 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
 - [ ] Ensure every major group of settings in Tk GUI has an equivalent in Qt GUI:
   - [x] Seestar / instrument-specific toggles.
   - [x] Any special ASTAP options (e.g. max instances, timeout, access-violation auto-dismiss toggles if exposed).
-  - [ ] Advanced options related to two-pass coverage renorm, alpha, etc., if they are in the GUI.
+  - [x] Advanced options related to two-pass coverage renorm, alpha, etc., if they are in the GUI.
 - [ ] Verify localization:
   - [ ] All user-facing strings pass through the localization helper where reasonable.
   - [ ] There is no hard-coded English where a key exists already.
@@ -278,3 +278,4 @@ Use this section to record issues, partial implementations, or TODOs that don’
 - [ ] Qt worker progress currently uses simple per-stage percentages and does not replicate Tk’s weighted progress/ETA smoothing yet.
 - [ ] Qt filter dialog currently focuses on manual include/exclude review; scanning, clustering, and preview tooling still pending.
 - [ ] Qt filter “Run analysis” button currently shows a placeholder message until scanning backend is integrated.
+- [ ] Qt GPU selector currently requires manual numeric ID entry; automatic detection/parity with Tk combo is pending.
