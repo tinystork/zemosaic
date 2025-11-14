@@ -282,6 +282,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
 
+        self._config_path: str | None = self._determine_config_path()
+        self._config_load_notes: List[Tuple[str, str, str, Dict[str, Any]]] = []
+        self._default_config_values: Dict[str, Any] = self._baseline_default_config()
         self.config: Dict[str, Any] = self._load_config()
         self.localizer = self._create_localizer(self.config.get("language", "en"))
         self.setWindowTitle(
@@ -294,98 +297,6 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "warning": self._tr("qt_log_prefix_warning", "[WARNING] "),
             "error": self._tr("qt_log_prefix_error", "[ERROR] "),
         }
-        self._default_config_values: Dict[str, Any] = {
-            "input_dir": "",
-            "output_dir": "",
-            "global_wcs_output_path": "global_mosaic_wcs.fits",
-            "coadd_memmap_dir": "",
-            "coadd_use_memmap": True,
-            "coadd_cleanup_memmap": True,
-            "auto_detect_seestar": True,
-            "force_seestar_mode": False,
-            "sds_mode_default": False,
-            "sds_coverage_threshold": 0.92,
-            "solver_method": "ansvr",
-            "astrometry_api_key": "",
-            "astrometry_timeout": 60,
-            "astrometry_downsample": 2,
-            "astap_executable_path": "",
-            "astap_data_directory_path": "",
-            "astap_default_search_radius": 3.0,
-            "astap_default_downsample": 2,
-            "astap_default_sensitivity": 100,
-            "astap_max_instances": 1,
-            "cluster_panel_threshold": 0.05,
-            "cluster_target_groups": 0,
-            "cluster_orientation_split_deg": 0.0,
-            "inter_master_merge_enable": False,
-            "inter_master_overlap_threshold": 0.60,
-            "inter_master_stack_method": "winsor",
-            "inter_master_min_group_size": 2,
-            "inter_master_max_group": 64,
-            "inter_master_memmap_policy": "auto",
-            "inter_master_local_scale": "final",
-            "inter_master_photometry_intragroup": True,
-            "inter_master_photometry_intersuper": True,
-            "inter_master_photometry_clip_sigma": 3.0,
-            "cache_retention": "run_end",
-            "quality_crop_enabled": False,
-            "quality_crop_band_px": 32,
-            "quality_crop_k_sigma": 2.0,
-            "quality_crop_margin_px": 8,
-            "quality_crop_min_run": 2,
-            "crop_follow_signal": True,
-            "altaz_cleanup_enabled": False,
-            "altaz_margin_percent": 5.0,
-            "altaz_decay": 0.15,
-            "altaz_nanize": True,
-            "quality_gate_enabled": False,
-            "quality_gate_threshold": 0.48,
-            "quality_gate_edge_band_px": 64,
-            "quality_gate_k_sigma": 2.5,
-            "quality_gate_erode_px": 3,
-            "quality_gate_move_rejects": True,
-            "two_pass_coverage_renorm": False,
-            "two_pass_cov_sigma_px": 50,
-            "two_pass_cov_gain_clip": [0.85, 1.18],
-            "apply_master_tile_crop": True,
-            "master_tile_crop_percent": 3.0,
-            "match_background_for_final": True,
-            "incremental_feather_parity": False,
-            "intertile_photometric_match": True,
-            "intertile_preview_size": 512,
-            "intertile_overlap_min": 0.05,
-            "intertile_sky_percentile": [30.0, 70.0],
-            "intertile_robust_clip_sigma": 2.5,
-            "intertile_global_recenter": True,
-            "intertile_recenter_clip": [0.85, 1.18],
-            "use_auto_intertile": False,
-            "center_out_normalization_p3": True,
-            "p3_center_preview_size": 256,
-            "p3_center_min_overlap_fraction": 0.03,
-            "p3_center_sky_percentile": [25.0, 60.0],
-            "p3_center_robust_clip_sigma": 2.5,
-            "center_out_anchor_mode": "auto_central_quality",
-            "anchor_quality_probe_limit": 12,
-            "anchor_quality_span_range": [0.02, 6.0],
-            "anchor_quality_median_clip_sigma": 2.5,
-            "enable_poststack_anchor_review": True,
-            "poststack_anchor_probe_limit": 8,
-            "poststack_anchor_span_range": [0.004, 10.0],
-            "poststack_anchor_median_clip_sigma": 3.5,
-            "poststack_anchor_min_improvement": 0.12,
-            "poststack_anchor_use_overlap_affine": True,
-            "save_final_as_uint16": False,
-            "legacy_rgb_cube": False,
-            "assembly_process_workers": 0,
-            "auto_limit_frames_per_master_tile": True,
-            "winsor_max_frames_per_pass": 0,
-            "winsor_worker_limit": 10,
-            "max_raw_per_master_tile": 0,
-            "use_gpu_phase5": False,
-            "gpu_id_phase5": 0,
-            "logging_level": "INFO",
-        }
         for key, fallback in self._default_config_values.items():
             self.config.setdefault(key, fallback)
         self._config_fields: Dict[str, Dict[str, Any]] = {}
@@ -397,6 +308,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._last_filtered_header_items: List[Any] | None = None
 
         self._setup_ui()
+        self._emit_config_notes()
 
         self.is_processing = False
         self.worker_controller = ZeMosaicQtWorker(self)
@@ -1899,29 +1811,202 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
             self.config[key] = raw_value
 
+    def _baseline_default_config(self) -> Dict[str, Any]:
+        defaults: Dict[str, Any] = {}
+        if zemosaic_config is not None and hasattr(zemosaic_config, "DEFAULT_CONFIG"):
+            try:
+                defaults.update(dict(getattr(zemosaic_config, "DEFAULT_CONFIG")))
+            except Exception:
+                defaults = {}
+        fallback_defaults: Dict[str, Any] = {
+            "input_dir": "",
+            "output_dir": "",
+            "global_wcs_output_path": "global_mosaic_wcs.fits",
+            "coadd_memmap_dir": "",
+            "coadd_use_memmap": True,
+            "coadd_cleanup_memmap": True,
+            "auto_detect_seestar": True,
+            "force_seestar_mode": False,
+            "sds_mode_default": False,
+            "sds_coverage_threshold": 0.92,
+            "solver_method": "ansvr",
+            "astrometry_api_key": "",
+            "astrometry_timeout": 60,
+            "astrometry_downsample": 2,
+            "astap_executable_path": "",
+            "astap_data_directory_path": "",
+            "astap_default_search_radius": 3.0,
+            "astap_default_downsample": 2,
+            "astap_default_sensitivity": 100,
+            "astap_max_instances": 1,
+            "cluster_panel_threshold": 0.05,
+            "cluster_target_groups": 0,
+            "cluster_orientation_split_deg": 0.0,
+            "inter_master_merge_enable": False,
+            "inter_master_overlap_threshold": 0.60,
+            "inter_master_stack_method": "winsor",
+            "inter_master_min_group_size": 2,
+            "inter_master_max_group": 64,
+            "inter_master_memmap_policy": "auto",
+            "inter_master_local_scale": "final",
+            "inter_master_photometry_intragroup": True,
+            "inter_master_photometry_intersuper": True,
+            "inter_master_photometry_clip_sigma": 3.0,
+            "cache_retention": "run_end",
+            "quality_crop_enabled": False,
+            "quality_crop_band_px": 32,
+            "quality_crop_k_sigma": 2.0,
+            "quality_crop_margin_px": 8,
+            "quality_crop_min_run": 2,
+            "crop_follow_signal": True,
+            "altaz_cleanup_enabled": False,
+            "altaz_margin_percent": 5.0,
+            "altaz_decay": 0.15,
+            "altaz_nanize": True,
+            "quality_gate_enabled": False,
+            "quality_gate_threshold": 0.48,
+            "quality_gate_edge_band_px": 64,
+            "quality_gate_k_sigma": 2.5,
+            "quality_gate_erode_px": 3,
+            "quality_gate_move_rejects": True,
+            "two_pass_coverage_renorm": False,
+            "two_pass_cov_sigma_px": 50,
+            "two_pass_cov_gain_clip": [0.85, 1.18],
+            "apply_master_tile_crop": True,
+            "master_tile_crop_percent": 3.0,
+            "match_background_for_final": True,
+            "incremental_feather_parity": False,
+            "intertile_photometric_match": True,
+            "intertile_preview_size": 512,
+            "intertile_overlap_min": 0.05,
+            "intertile_sky_percentile": [30.0, 70.0],
+            "intertile_robust_clip_sigma": 2.5,
+            "intertile_global_recenter": True,
+            "intertile_recenter_clip": [0.85, 1.18],
+            "use_auto_intertile": False,
+            "center_out_normalization_p3": True,
+            "p3_center_preview_size": 256,
+            "p3_center_min_overlap_fraction": 0.03,
+            "p3_center_sky_percentile": [25.0, 60.0],
+            "p3_center_robust_clip_sigma": 2.5,
+            "center_out_anchor_mode": "auto_central_quality",
+            "anchor_quality_probe_limit": 12,
+            "anchor_quality_span_range": [0.02, 6.0],
+            "anchor_quality_median_clip_sigma": 2.5,
+            "enable_poststack_anchor_review": True,
+            "poststack_anchor_probe_limit": 8,
+            "poststack_anchor_span_range": [0.004, 10.0],
+            "poststack_anchor_median_clip_sigma": 3.5,
+            "poststack_anchor_min_improvement": 0.12,
+            "poststack_anchor_use_overlap_affine": True,
+            "save_final_as_uint16": False,
+            "legacy_rgb_cube": False,
+            "assembly_process_workers": 0,
+            "auto_limit_frames_per_master_tile": True,
+            "winsor_max_frames_per_pass": 0,
+            "winsor_worker_limit": 10,
+            "max_raw_per_master_tile": 0,
+            "use_gpu_phase5": False,
+            "gpu_id_phase5": 0,
+            "logging_level": "INFO",
+        }
+        defaults.update(fallback_defaults)
+        defaults.setdefault("language", "en")
+        return defaults
+
+    def _determine_config_path(self) -> str | None:
+        if zemosaic_config is None:
+            return None
+        get_path = getattr(zemosaic_config, "get_config_path", None)
+        if callable(get_path):
+            try:
+                path = get_path()
+            except Exception:
+                return None
+            return str(path)
+        return None
+
     def _load_config(self) -> Dict[str, Any]:
+        config_data: Dict[str, Any] = {}
+        notes: List[Tuple[str, str, str, Dict[str, Any]]] = []
+        config_path = self._config_path
+
         if zemosaic_config is not None and hasattr(zemosaic_config, "load_config"):
-            config = zemosaic_config.load_config()
+            load_func = getattr(zemosaic_config, "load_config")
+            try:
+                loaded_config = load_func()
+            except Exception as exc:  # pragma: no cover - defensive guard
+                notes.append(
+                    (
+                        "error",
+                        "qt_log_config_load_failed",
+                        "Failed to read configuration: {error}",
+                        {"error": str(exc)},
+                    )
+                )
+                loaded_config = {}
+            else:
+                if not isinstance(loaded_config, dict):
+                    notes.append(
+                        (
+                            "warning",
+                            "qt_log_config_invalid_type",
+                            "Configuration file contained unexpected data. Using defaults.",
+                            {},
+                        )
+                    )
+                    loaded_config = {}
+            config_data.update(loaded_config)
         else:  # pragma: no cover - minimal fallback
-            config = {
-                "language": "en",
-                "astap_executable_path": "",
-                "astap_data_directory_path": "",
-                "astap_default_search_radius": 3.0,
-                "astap_default_downsample": 2,
-                "astap_default_sensitivity": 100,
-                "astap_max_instances": 1,
-                "cluster_panel_threshold": 0.05,
-                "cluster_target_groups": 0,
-                "cluster_orientation_split_deg": 0.0,
-                "quality_crop_enabled": False,
-                "quality_crop_band_px": 32,
-                "altaz_cleanup_enabled": False,
-                "global_wcs_output_path": "global_mosaic_wcs.fits",
-                "coadd_memmap_dir": "",
-            }
-        config.setdefault("language", "en")
-        return dict(config)
+            notes.append(
+                (
+                    "warning",
+                    "qt_log_config_fallback",
+                    "Using in-memory defaults because zemosaic_config.load_config is unavailable.",
+                    {},
+                )
+            )
+
+        if config_path:
+            if os.path.exists(config_path):
+                notes.append(
+                    (
+                        "info",
+                        "qt_log_config_loaded_from",
+                        "Loaded configuration from {path}",
+                        {"path": config_path},
+                    )
+                )
+            else:
+                notes.append(
+                    (
+                        "warning",
+                        "qt_log_config_missing",
+                        "No configuration file found at {path}; defaults will be used until saved.",
+                        {"path": config_path},
+                    )
+                )
+
+        merged_config = dict(self._default_config_values)
+        merged_config.update(config_data)
+        merged_config.setdefault("language", "en")
+
+        self._config_load_notes = notes
+        return merged_config
+
+    def _emit_config_notes(self) -> None:
+        if not self._config_load_notes:
+            return
+        try:
+            for level, key, fallback, params in self._config_load_notes:
+                message = self._tr(key, fallback)
+                try:
+                    formatted = message.format(**params)
+                except Exception:
+                    formatted = message
+                self._append_log(formatted, level=level)
+        finally:
+            self._config_load_notes = []
 
     def _save_config(self) -> None:
         if zemosaic_config is not None and hasattr(zemosaic_config, "save_config"):
