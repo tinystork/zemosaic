@@ -27,6 +27,10 @@ It was born out of a need from an astrophotography Discord community called the 
 
 - Configurable `assembly_process_workers` to tune process count for assembly (used by both methods)
 
+- Optional CUDA acceleration for the Mosaic-First reprojection+coadd path (Phase 4). When
+  `use_gpu_phase5` is enabled and a compatible CUDA device is detected, ZeMosaic now leverages the GPU
+  for mean, median, winsorized sigma-clip, and kappa-sigma stacking modes.
+
 
 ---
 
@@ -142,6 +146,15 @@ Configure ASTAP paths
 Select stacking and assembly options
 
 Click Start Hierarchical Mosaic
+
+### GPU helper for Phase 4
+
+Setting `use_gpu_phase5` to `true` (via the worker configuration or overrides) now enables the CUDA helper
+for the entire Mosaic-First reprojection+coadd stage. If a supported GPU is available, ZeMosaic will run
+mean, median, winsorized, and kappa-sigma global stacking directly on the GPU and automatically fall back
+to the CPU only when the helper is unavailable. For integration testing you can optionally set
+`gpu_helper_verify_tolerance` in the global plan to log the max per-pixel delta between the GPU and CPU
+reference implementation.
 
 ### macOS quickstart
 

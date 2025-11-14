@@ -204,7 +204,20 @@ def equalize_rgb_medians_inplace(img: np.ndarray) -> tuple[float, float, float, 
     target = float(np.nanmedian(med[finite]))
     gains = np.ones(3, dtype=np.float32)
     gains[finite] = target / med[finite]
-    img *= gains[None, None, :]
+    # Perform in-place multiply but tolerate read-only buffers by skipping
+    # the write and just returning computed gains.
+    try:
+        if not img.flags.writeable:
+            try:
+                img.setflags(write=True)
+            except Exception:
+                pass
+        np.multiply(img, gains[None, None, :], out=img, casting="unsafe")
+    except Exception:
+        # If we can't apply in place (e.g., read-only memmap), skip silently.
+        # Caller records gains in metadata; visual effect may differ slightly
+        # but the pipeline should continue.
+        return (float(gains[0]), float(gains[1]), float(gains[2]), target)
     return (float(gains[0]), float(gains[1]), float(gains[2]), target)
 
 

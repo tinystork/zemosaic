@@ -188,3 +188,7 @@ build/
 
 # === ZeMosaic: configuration de innosetup ===
 *.iss
+# --- Dossier fichiers test et examples ---
+example/
+tests/
+

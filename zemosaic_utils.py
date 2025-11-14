@@ -819,7 +819,11 @@ def load_global_wcs_descriptor(
         raise RuntimeError("Astropy WCS/FITS is required to read the global mosaic header")
 
     header = fits_module_for_utils.getheader(fits_path, 0)
+    # Build a WCS object from the header even if NAXIS1/2 are missing.
     wcs_obj = AstropyWCS(header, naxis=2)
+    # Some FITS writers reset NAXIS to 0 if no data array is attached. Our
+    # writer persists header-only descriptors; rely on JSON as a fallback for
+    # width/height when NAXIS1/2 are absent or zero.
     width = int(header.get("NAXIS1", 0) or 0)
     height = int(header.get("NAXIS2", 0) or 0)
     px_scale = _compute_pixel_scale_for_wcs(wcs_obj) or 0.0
@@ -832,6 +836,16 @@ def load_global_wcs_descriptor(
     except Exception as exc_json:
         log.warning("Global WCS: failed to read JSON metadata (%s): %s", json_candidate, exc_json)
         meta_payload = None
+
+    # Fallback to JSON width/height if FITS header lacks them
+    try:
+        if (width <= 0 or height <= 0) and isinstance(meta_payload, dict):
+            mw = int(meta_payload.get("width") or 0)
+            mh = int(meta_payload.get("height") or 0)
+            if mw > 0 and mh > 0:
+                width, height = mw, mh
+    except Exception:
+        pass
 
     descriptor = {
         "header": header,
@@ -3404,35 +3418,97 @@ def gpu_assemble_final_mosaic_incremental(*args, **kwargs):
     )
 
 
-def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
-    """CuPy-accelerated reprojection and mean coaddition for a single channel.
+def _sanitize_winsor_limits(limits) -> tuple[float, float]:
+    """Normalize winsorized limits to sane float tuple."""
 
-    Notes
-    - Expects ``data_list`` as list of 2D NumPy arrays (single-channel tiles).
-    - ``wcs_list`` should be a list of WCS objects (or headers convertible to WCS).
-    - ``output_projection`` in ``kwargs`` must be a WCS or a FITS header for the final mosaic grid.
-    - ``match_background`` (or legacy ``match_bg``) subtracts tile median before sampling.
-    - Coverage is returned in [0, 1] as the fraction of inputs contributing per pixel.
-    - Implementation is chunked in rows to limit GPU memory usage.
-    """
-    # Import lazily to avoid importing cupy when GPU is not used
+    if not isinstance(limits, (list, tuple)) or len(limits) < 2:
+        return 0.05, 0.05
+    try:
+        low = float(limits[0])
+        high = float(limits[1])
+    except Exception:
+        return 0.05, 0.05
+    low = max(0.0, min(0.49, low))
+    high = max(0.0, min(0.49, high))
+    return low, high
+
+
+def _winsorized_weighted_average_chunk(
+    stack,
+    weights,
+    winsor_limits,
+    xp_module,
+):
+    """Winsorize stack along axis=0 using *xp_module* (NumPy or CuPy)."""
+
+    xp = xp_module
+    low_frac, high_frac = _sanitize_winsor_limits(winsor_limits)
+    low_pct = max(0.0, min(100.0, low_frac * 100.0))
+    high_pct = max(0.0, min(100.0, 100.0 - high_frac * 100.0))
+    lower = xp.nanpercentile(stack, low_pct, axis=0)
+    upper = xp.nanpercentile(stack, high_pct, axis=0)
+    clipped = xp.clip(stack, lower, upper)
+    weighted = clipped * weights
+    chunk_weight = xp.nansum(weights, axis=0)
+    with xp.errstate(invalid="ignore", divide="ignore"):
+        chunk_result = xp.nansum(weighted, axis=0) / xp.maximum(chunk_weight, 1e-6)
+    chunk_result = xp.nan_to_num(chunk_result, nan=0.0, posinf=0.0, neginf=0.0)
+    chunk_weight = xp.nan_to_num(chunk_weight, nan=0.0, posinf=0.0, neginf=0.0)
+    return chunk_result, chunk_weight
+
+
+def _kappa_sigma_clip_chunk(
+    stack,
+    weights,
+    mean_ref,
+    std_ref,
+    count_ref,
+    *,
+    kappa: float,
+    min_sigma: float,
+    xp_module,
+):
+    """Apply kappa-sigma clipping for a chunk using *xp_module*."""
+
+    xp = xp_module
+    thresh = kappa * xp.maximum(std_ref, min_sigma)
+    diff = xp.abs(stack - mean_ref)
+    accept = diff <= thresh
+    accept = xp.where(count_ref <= 1.5, True, accept)
+    kept_weights = xp.where(accept, weights, 0.0)
+    clip_weight = xp.nansum(kept_weights, axis=0)
+    clip_sum = xp.nansum(stack * kept_weights, axis=0)
+    with xp.errstate(invalid="ignore", divide="ignore"):
+        clipped = xp.where(
+            clip_weight > 0,
+            clip_sum / xp.maximum(clip_weight, 1e-6),
+            mean_ref,
+        )
+    clipped = xp.nan_to_num(clipped, nan=0.0, posinf=0.0, neginf=0.0)
+    clip_weight = xp.nan_to_num(clip_weight, nan=0.0, posinf=0.0, neginf=0.0)
+    return clipped, clip_weight
+
+
+def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
+    """CuPy-accelerated reprojection and coaddition for a single channel."""
+
     import cupy as cp  # type: ignore
     from cupyx.scipy.ndimage import map_coordinates  # type: ignore
+
     ensure_cupy_pool_initialized()
     try:
         from astropy.wcs import WCS as _WCS
     except Exception:
         _WCS = None
 
-    # Resolve final WCS from header or WCS instance
     output_projection = kwargs.get("output_projection")
     if output_projection is None:
         raise ValueError("gpu_reproject_and_coadd requires 'output_projection' (WCS or header)")
     if _WCS is not None and not hasattr(output_projection, "pixel_to_world"):
         try:
             output_wcs = _WCS(output_projection)
-        except Exception as e:
-            raise ValueError(f"Invalid output_projection for WCS: {e}")
+        except Exception as exc:
+            raise ValueError(f"Invalid output_projection for WCS: {exc}") from exc
     else:
         output_wcs = output_projection
 
@@ -3441,81 +3517,57 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
     if len(wcs_list) != n_inputs:
         raise ValueError("data_list and wcs_list must have the same length")
 
-    # Determine background match flag from either name
+    combine_function = str(kwargs.get("combine_function") or "mean").strip().lower()
+    stack_reject_algo = str(kwargs.get("stack_reject_algo") or combine_function).strip().lower()
+    if combine_function == "median":
+        combine_mode = "median"
+    elif combine_function == "kappa_sigma":
+        combine_mode = "kappa_sigma"
+    elif combine_function == "winsorized" or stack_reject_algo in {"winsorized", "winsor", "winsorized_sigma_clip"}:
+        combine_mode = "winsorized"
+    else:
+        combine_mode = "mean"
+
+    winsor_limits = _sanitize_winsor_limits(kwargs.get("winsor_limits", (0.05, 0.05)) or (0.05, 0.05))
+    kappa_sigma_k = float(kwargs.get("coadd_k", kwargs.get("kappa_sigma_k", 2.0)) or 2.0)
     match_background = bool(kwargs.get("match_background", kwargs.get("match_bg", False)))
 
-    # Consume GPU tuning hints for API compatibility (currently unused in V3.2.5 parity path)
-    _ = kwargs.get("bg_preview_size", 512)
-    _ = kwargs.get("intertile_sky_percentile")
-    _ = kwargs.get("intertile_robust_clip_sigma", 2.5)
-
     float32_bytes = np.dtype(np.float32).itemsize
-
-    # Optional precomputed per-tile affine corrections (gain, offset)
     tile_affine = kwargs.get("tile_affine_corrections", None)
     if isinstance(tile_affine, (list, tuple)) and len(tile_affine) == n_inputs:
-        try:
-            # Normalize into list[(float,float)]
-            tile_affine = [
-                (
-                    float(g) if np.isfinite(g) else 1.0,
-                    float(o) if np.isfinite(o) else 0.0,
-                )
-                for (g, o) in tile_affine
-            ]
-        except Exception:
-            tile_affine = None
+        normalized: list[tuple[float, float]] = []
+        for pair in tile_affine:
+            gain_val = 1.0
+            offset_val = 0.0
+            if isinstance(pair, (list, tuple)) and pair:
+                try:
+                    gain_val = float(pair[0])
+                except Exception:
+                    gain_val = 1.0
+                if len(pair) > 1:
+                    try:
+                        offset_val = float(pair[1])
+                    except Exception:
+                        offset_val = 0.0
+            if not np.isfinite(gain_val):
+                gain_val = 1.0
+            if not np.isfinite(offset_val):
+                offset_val = 0.0
+            normalized.append((gain_val, offset_val))
+        tile_affine = normalized
+    else:
+        tile_affine = None
 
-    # Estimate the minimum amount of memory required just for the accumulators.
-    accumulator_bytes = 2 * H * W * float32_bytes
-    # Leave some breathing room for temporary buffers; require at least double the
-    # accumulator footprint to avoid triggering the CuPy allocator hard limit.
-    if not gpu_memory_sufficient(int(accumulator_bytes * 2.5), safety_fraction=0.8):
-        raise RuntimeError("Insufficient GPU memory for reprojection accumulators")
-
-    # Prepare output accumulators on GPU
-    mosaic_sum_gpu = cp.zeros((H, W), dtype=cp.float32)
-    weight_sum_gpu = cp.zeros((H, W), dtype=cp.float32)
-    # Row-chunking to bound memory; tune based on device memory
-    rows_per_chunk = int(kwargs.get("rows_per_chunk", 64))
-    rows_per_chunk = max(32, min(rows_per_chunk, H))
-
-    # Dynamically cap the chunk size based on available GPU memory.
-    max_chunk_bytes = kwargs.get("max_chunk_bytes")
-    if max_chunk_bytes is None:
-        # Default soft cap that will be tightened against free VRAM below.
-        max_chunk_bytes = 128 * 1024 * 1024
-    try:
-        free_bytes, _ = cp.cuda.runtime.memGetInfo()
-        safe_target = max(16 * 1024 * 1024, int(free_bytes * 0.25))
-        max_chunk_bytes = int(min(max_chunk_bytes, safe_target))
-    except Exception:
-        max_chunk_bytes = int(max_chunk_bytes)
-    bytes_per_row_estimate = max(1, W * float32_bytes * 8)
-    adaptive_rows = max(1, max_chunk_bytes // bytes_per_row_estimate)
-    rows_per_chunk = max(32, min(rows_per_chunk, adaptive_rows, H))
-
-    # Build an x-grid once (NumPy on CPU) and reuse
-    x_grid = cp.asarray(cp.arange(W, dtype=cp.float32))  # cp.arange works well; stays on GPU when meshed
-
-    # Iterate over tiles
-    for idx_tile, (img_np, tile_wcs) in enumerate(zip(data_list, wcs_list)):
-        # Basic input validation and convert to float32 without NaN side-effects
-        img = cp.asarray(img_np.astype("float32", copy=False))
-
-        # Apply precomputed gain/offset if provided (GPU path parity with CPU intertile match)
+    def _prepare_tile_arrays(idx: int) -> tuple[cp.ndarray, cp.ndarray]:
+        arr = np.asarray(data_list[idx], dtype=np.float32)
+        img = cp.asarray(arr)
         if tile_affine is not None:
-            try:
-                g, o = tile_affine[idx_tile]
-                if g != 1.0:
-                    img = img * cp.float32(g)
-                if o != 0.0:
-                    img = img + cp.float32(o)
-            except Exception:
-                pass
-
+            gain_val, offset_val = tile_affine[idx]
+            if gain_val != 1.0:
+                img = img * cp.float32(gain_val)
+            if offset_val != 0.0:
+                img = img + cp.float32(offset_val)
         if match_background:
-            # Mirror CPU behaviour: subtract the per-tile median after affine correction.
             try:
                 offset_val = float(cp.nanmedian(img).get())
             except Exception:
@@ -3525,87 +3577,246 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
                     offset_val = 0.0
             if offset_val != 0.0 and np.isfinite(offset_val):
                 img = img - cp.float32(offset_val)
-
-        # Valid mask (1 for finite pixels, 0 otherwise); used for coverage and weighted mean
         mask = cp.isfinite(img).astype(cp.float32)
         img = cp.nan_to_num(img, copy=False, nan=0.0)
+        return img, mask
 
-        # Precompute per-tile: nothing yet; mapping is per-chunk
-        for r0 in range(0, H, rows_per_chunk):
-            r1 = min(H, r0 + rows_per_chunk)
-            # CPU grid for WCS conversion (faster on CPU for WCS than pushing to GPU)
-            # y in [r0, r1), x in [0, W)
-            y = cp.arange(r0, r1, dtype=cp.float32)
-            # Mesh on GPU for map_coordinates usage later
-            yy = y[:, None]
-            xx = x_grid[None, :]
-
-            # Convert output (x, y) -> world -> input (x_in, y_in) using CPU WCS
-            # Fetch to CPU minimal arrays (NumPy) for WCS; then back to GPU as coords
-            y_cpu = cp.asnumpy(yy)
-            x_cpu = cp.asnumpy(xx)
+    def _build_world_chunk_grid(rows_per_chunk: int) -> list[tuple[int, int, np.ndarray, np.ndarray]]:
+        chunk_grid: list[tuple[int, int, np.ndarray, np.ndarray]] = []
+        x_coords = np.arange(W, dtype=np.float32)
+        rows_per_chunk = max(1, min(rows_per_chunk, H))
+        for y0 in range(0, H, rows_per_chunk):
+            y1 = min(H, y0 + rows_per_chunk)
+            y_coords = np.arange(y0, y1, dtype=np.float32)
+            xx_cpu, yy_cpu = np.meshgrid(x_coords, y_coords)
             try:
-                # Astropy WCS expects x, y order
-                ra, dec = output_wcs.wcs_pix2world(x_cpu, y_cpu, 0)
-                x_in, y_in = tile_wcs.wcs_world2pix(ra, dec, 0)
+                ra_chunk, dec_chunk = output_wcs.wcs_pix2world(xx_cpu, yy_cpu, 0)
             except Exception:
-                # If any WCS conversion fails, skip this chunk for this tile
-                continue
+                raise RuntimeError("Failed to convert output grid to world coordinates")
+            chunk_grid.append((y0, y1, np.asarray(ra_chunk), np.asarray(dec_chunk)))
+        return chunk_grid
 
-            x_in_gpu = cp.asarray(x_in, dtype=cp.float32)
-            y_in_gpu = cp.asarray(y_in, dtype=cp.float32)
+    def _sample_tile_chunk(
+        img_gpu: cp.ndarray,
+        mask_gpu: cp.ndarray,
+        tile_wcs,
+        ra_chunk: np.ndarray,
+        dec_chunk: np.ndarray,
+    ) -> tuple[cp.ndarray, cp.ndarray]:
+        try:
+            x_in, y_in = tile_wcs.wcs_world2pix(ra_chunk, dec_chunk, 0)
+        except Exception:
+            shape = ra_chunk.shape
+            zeros = cp.zeros(shape, dtype=cp.float32)
+            return zeros, zeros
+        x_in_gpu = cp.asarray(x_in, dtype=cp.float32)
+        y_in_gpu = cp.asarray(y_in, dtype=cp.float32)
+        h_in, w_in = img_gpu.shape
+        valid = (
+            (x_in_gpu >= -0.5)
+            & (x_in_gpu <= (w_in - 0.5))
+            & (y_in_gpu >= -0.5)
+            & (y_in_gpu <= (h_in - 0.5))
+        )
+        coords = cp.stack([y_in_gpu, x_in_gpu], axis=0)
+        sampled = map_coordinates(img_gpu, coords, order=1, mode="constant", cval=0.0)
+        sampled_mask = map_coordinates(mask_gpu, coords, order=1, mode="constant", cval=0.0)
+        sampled = sampled * sampled_mask * valid.astype(cp.float32)
+        sampled_mask = sampled_mask * valid.astype(cp.float32)
+        return sampled, sampled_mask
 
-            # Build validity mask for in-bounds coordinates
-            h_in, w_in = img.shape
-            valid = (
-                (x_in_gpu >= -0.5)
-                & (x_in_gpu <= (w_in - 0.5))
-                & (y_in_gpu >= -0.5)
-                & (y_in_gpu <= (h_in - 0.5))
-            )
-
-            # Sample image and mask at mapped coordinates (bilinear, constant outside)
-            coords = cp.stack([y_in_gpu, x_in_gpu], axis=0)
-            sampled = map_coordinates(img, coords, order=1, mode="constant", cval=0.0)
-            sampled_mask = map_coordinates(mask, coords, order=1, mode="constant", cval=0.0)
-
-            # Zero out contributions where coords are outside or mask ~ 0
-            sampled = sampled * sampled_mask * valid.astype(cp.float32)
-            sampled_mask = sampled_mask * valid.astype(cp.float32)
-
-            # Accumulate
-            mosaic_sum_gpu[r0:r1, :] += sampled
-            weight_sum_gpu[r0:r1, :] += sampled_mask
-
-    # Finalize: mean combine where weight > 0
-    eps = cp.float32(1e-6)
-    mosaic_gpu = cp.where(weight_sum_gpu > eps, mosaic_sum_gpu / cp.maximum(weight_sum_gpu, eps), 0.0)
-    coverage_gpu = cp.clip(weight_sum_gpu / float(max(1, n_inputs)), 0.0, 1.0)
-
-    # Restore a sensible brightness baseline for FITS output when background matching.
-    # Use the 0.1 percentile guard like before to avoid negative baselines.
-    if match_background:
+    def _finalize_match_background(mosaic_gpu: cp.ndarray) -> cp.ndarray:
+        if not match_background:
+            return mosaic_gpu
         try:
             p01 = float(cp.percentile(mosaic_gpu, 0.1).get())
             if p01 < 0:
                 mosaic_gpu = mosaic_gpu - cp.float32(p01)
         except Exception:
             pass
+        return mosaic_gpu
 
+    def _gpu_mean_path() -> tuple[np.ndarray, np.ndarray]:
+        accumulator_bytes = 2 * H * W * float32_bytes
+        if not gpu_memory_sufficient(int(accumulator_bytes * 2.5), safety_fraction=0.8):
+            raise RuntimeError("Insufficient GPU memory for reprojection accumulators")
+        mosaic_sum_gpu = cp.zeros((H, W), dtype=cp.float32)
+        weight_sum_gpu = cp.zeros((H, W), dtype=cp.float32)
+        rows_per_chunk = int(kwargs.get("rows_per_chunk", 64))
+        rows_per_chunk = max(32, min(rows_per_chunk, H))
+        max_chunk_bytes = int(kwargs.get("max_chunk_bytes") or (128 * 1024 * 1024))
+        try:
+            free_bytes, _ = cp.cuda.runtime.memGetInfo()
+            safe_target = max(16 * 1024 * 1024, int(free_bytes * 0.25))
+            max_chunk_bytes = min(max_chunk_bytes, safe_target)
+        except Exception:
+            pass
+        bytes_per_row_estimate = max(1, W * float32_bytes * 8)
+        adaptive_rows = max(1, max_chunk_bytes // bytes_per_row_estimate)
+        rows_per_chunk = max(32, min(rows_per_chunk, adaptive_rows, H))
+        chunk_grid = _build_world_chunk_grid(rows_per_chunk)
+        for idx_tile, tile_wcs in enumerate(wcs_list):
+            img_gpu, mask_gpu = _prepare_tile_arrays(idx_tile)
+            for y0, y1, ra_chunk, dec_chunk in chunk_grid:
+                sampled, sampled_mask = _sample_tile_chunk(img_gpu, mask_gpu, tile_wcs, ra_chunk, dec_chunk)
+                mosaic_sum_gpu[y0:y1, :] += sampled
+                weight_sum_gpu[y0:y1, :] += sampled_mask
+            del img_gpu, mask_gpu
+        eps = cp.float32(1e-6)
+        mosaic_gpu = cp.where(weight_sum_gpu > eps, mosaic_sum_gpu / cp.maximum(weight_sum_gpu, eps), 0.0)
+        coverage_gpu = cp.clip(weight_sum_gpu / float(max(1, n_inputs)), 0.0, 1.0)
+        mosaic_gpu = _finalize_match_background(mosaic_gpu)
+        return cp.asnumpy(mosaic_gpu).astype(np.float32), cp.asnumpy(coverage_gpu).astype(np.float32)
 
-    # Move back to CPU
+    def _gpu_chunkwise_path(mode: str) -> tuple[np.ndarray, np.ndarray]:
+        rows_hint = int(kwargs.get("rows_per_chunk", 64))
+        chunk_bytes_per_row = max(1, n_inputs * W * float32_bytes * 2)
+        max_chunk_bytes = int(kwargs.get("max_chunk_bytes") or (256 * 1024 * 1024))
+        try:
+            free_bytes, _ = cp.cuda.runtime.memGetInfo()
+            safe_target = max(64 * 1024 * 1024, int(free_bytes * 0.4))
+            max_chunk_bytes = min(max_chunk_bytes, safe_target)
+        except Exception:
+            pass
+        rows_per_chunk = max(1, min(H, max(1, max_chunk_bytes // chunk_bytes_per_row)))
+        rows_per_chunk = max(1, min(rows_hint, rows_per_chunk))
+        tile_cache: list[tuple[cp.ndarray, cp.ndarray]] = []
+        try:
+            for idx in range(n_inputs):
+                tile_cache.append(_prepare_tile_arrays(idx))
+        except Exception as exc:
+            tile_cache.clear()
+            raise RuntimeError("Failed to upload tiles to GPU for chunked combine") from exc
+        mosaic_gpu = cp.zeros((H, W), dtype=cp.float32)
+        coverage_gpu = cp.zeros((H, W), dtype=cp.float32)
+        chunk_grid = _build_world_chunk_grid(rows_per_chunk)
+        for y0, y1, ra_chunk, dec_chunk in chunk_grid:
+            chunk_h = y1 - y0
+            chunk_cube = cp.full((n_inputs, chunk_h, W), cp.nan, dtype=cp.float32)
+            chunk_weight = cp.zeros((n_inputs, chunk_h, W), dtype=cp.float32)
+            for idx_tile, tile_wcs in enumerate(wcs_list):
+                img_gpu, mask_gpu = tile_cache[idx_tile]
+                sampled, sampled_mask = _sample_tile_chunk(img_gpu, mask_gpu, tile_wcs, ra_chunk, dec_chunk)
+                chunk_cube[idx_tile, :, :] = cp.where(sampled_mask > 0, sampled, cp.nan)
+                chunk_weight[idx_tile, :, :] = sampled_mask
+            if mode == "median":
+                chunk_result = cp.nanmedian(chunk_cube, axis=0)
+                chunk_cov = cp.nansum(chunk_weight, axis=0)
+            else:
+                chunk_result, chunk_cov = _winsorized_weighted_average_chunk(
+                    chunk_cube,
+                    chunk_weight,
+                    winsor_limits,
+                    cp,
+                )
+            chunk_result = cp.nan_to_num(chunk_result, nan=0.0, posinf=0.0, neginf=0.0)
+            chunk_cov = cp.nan_to_num(chunk_cov, nan=0.0, posinf=0.0, neginf=0.0)
+            mosaic_gpu[y0:y1, :] = chunk_result
+            coverage_gpu[y0:y1, :] = chunk_cov
+            del chunk_cube, chunk_weight
+        mosaic_gpu = _finalize_match_background(mosaic_gpu)
+        return cp.asnumpy(mosaic_gpu).astype(np.float32), cp.asnumpy(coverage_gpu).astype(np.float32)
+
+    def _gpu_kappa_sigma_path() -> tuple[np.ndarray, np.ndarray]:
+        rows_hint = int(kwargs.get("rows_per_chunk", 64))
+        tile_cache: list[tuple[cp.ndarray, cp.ndarray]] = []
+        try:
+            for idx in range(n_inputs):
+                tile_cache.append(_prepare_tile_arrays(idx))
+        except Exception as exc:
+            tile_cache.clear()
+            raise RuntimeError("Failed to upload tiles for kappa-sigma combine") from exc
+        weight_grid = cp.zeros((H, W), dtype=cp.float32)
+        count_grid = cp.zeros((H, W), dtype=cp.float32)
+        sum_grid = cp.zeros((H, W), dtype=cp.float64)
+        sumsq_grid = cp.zeros((H, W), dtype=cp.float64)
+        rows_stats = max(32, min(rows_hint, H))
+        chunk_stats = _build_world_chunk_grid(rows_stats)
+        for idx_tile, tile_wcs in enumerate(wcs_list):
+            img_gpu, mask_gpu = tile_cache[idx_tile]
+            for y0, y1, ra_chunk, dec_chunk in chunk_stats:
+                sampled, sampled_mask = _sample_tile_chunk(img_gpu, mask_gpu, tile_wcs, ra_chunk, dec_chunk)
+                sum_grid[y0:y1, :] += sampled.astype(cp.float64)
+                sumsq_grid[y0:y1, :] += (sampled ** 2).astype(cp.float64)
+                weight_grid[y0:y1, :] += sampled_mask
+                count_grid[y0:y1, :] += (sampled_mask > 0).astype(cp.float32)
+        weight_safe = cp.maximum(weight_grid, cp.float32(1e-6))
+        mean_map = sum_grid / weight_safe
+        second_moment = sumsq_grid / weight_safe
+        variance = cp.maximum(second_moment - (mean_map ** 2), 0.0)
+        std_map = cp.sqrt(variance, dtype=cp.float64)
+        min_sigma = 0.0
+        finite_mask = cp.isfinite(std_map)
+        if bool(int(cp.any(finite_mask).get())):
+            try:
+                min_sigma = float(cp.percentile(std_map[finite_mask], 5).get())
+            except Exception:
+                min_sigma = 0.0
+        min_sigma = max(min_sigma, 1e-4)
+        chunk_bytes_per_row = max(1, n_inputs * W * float32_bytes * 2)
+        max_chunk_bytes = int(kwargs.get("max_chunk_bytes") or (256 * 1024 * 1024))
+        try:
+            free_bytes, _ = cp.cuda.runtime.memGetInfo()
+            safe_target = max(64 * 1024 * 1024, int(free_bytes * 0.4))
+            max_chunk_bytes = min(max_chunk_bytes, safe_target)
+        except Exception:
+            pass
+        rows_clip = max(1, min(H, max(1, max_chunk_bytes // chunk_bytes_per_row)))
+        rows_clip = max(1, min(rows_hint, rows_clip))
+        chunk_clip = _build_world_chunk_grid(rows_clip)
+        clipped_buffer = cp.zeros((H, W), dtype=cp.float32)
+        clip_weight = cp.zeros((H, W), dtype=cp.float32)
+        for y0, y1, ra_chunk, dec_chunk in chunk_clip:
+            chunk_h = y1 - y0
+            chunk_cube = cp.full((n_inputs, chunk_h, W), cp.nan, dtype=cp.float32)
+            chunk_weight = cp.zeros((n_inputs, chunk_h, W), dtype=cp.float32)
+            for idx_tile, tile_wcs in enumerate(wcs_list):
+                img_gpu, mask_gpu = tile_cache[idx_tile]
+                sampled, sampled_mask = _sample_tile_chunk(img_gpu, mask_gpu, tile_wcs, ra_chunk, dec_chunk)
+                chunk_cube[idx_tile, :, :] = cp.where(sampled_mask > 0, sampled, cp.nan)
+                chunk_weight[idx_tile, :, :] = sampled_mask
+            mean_slice = mean_map[y0:y1, :]
+            std_slice = std_map[y0:y1, :]
+            count_slice = count_grid[y0:y1, :]
+            chunk_result, chunk_cov = _kappa_sigma_clip_chunk(
+                chunk_cube,
+                chunk_weight,
+                mean_slice,
+                std_slice,
+                count_slice,
+                kappa=kappa_sigma_k,
+                min_sigma=min_sigma,
+                xp_module=cp,
+            )
+            clipped_buffer[y0:y1, :] = chunk_result.astype(cp.float32)
+            clip_weight[y0:y1, :] = chunk_cov.astype(cp.float32)
+            del chunk_cube, chunk_weight
+        coverage_gpu = cp.where(clip_weight > 0, clip_weight, weight_grid)
+        clipped_map = cp.where(clip_weight > 0, clipped_buffer, mean_map.astype(cp.float32))
+        clipped_map = _finalize_match_background(clipped_map)
+        return cp.asnumpy(clipped_map).astype(np.float32), cp.asnumpy(coverage_gpu).astype(np.float32)
+
     try:
-        return cp.asnumpy(mosaic_gpu).astype("float32"), cp.asnumpy(coverage_gpu).astype("float32")
+        if combine_mode == "mean":
+            return _gpu_mean_path()
+        if combine_mode == "median":
+            return _gpu_chunkwise_path("median")
+        if combine_mode == "winsorized":
+            return _gpu_chunkwise_path("winsorized")
+        if combine_mode == "kappa_sigma":
+            return _gpu_kappa_sigma_path()
+        raise NotImplementedError(f"Unsupported combine_function '{combine_function}' for GPU coadd")
     finally:
         free_cupy_memory_pools()
 
 
-def reproject_and_coadd_wrapper(
+def _reproject_and_coadd_wrapper_impl(
     data_list,
     wcs_list,
     shape_out,
-    use_gpu=False,
-    cpu_function=None,
+    *,
+    use_gpu: bool = False,
+    cpu_func=None,
     **kwargs,
 ):
     """Dispatch to GPU or CPU reproject+coadd.
@@ -3621,8 +3832,8 @@ def reproject_and_coadd_wrapper(
             logging.getLogger(__name__).warning(
                 "GPU reprojection failed (%s), falling back to CPU", e
             )
-    if cpu_function is None:
-        cpu_function = cpu_reproject_and_coadd
+    if cpu_func is None:
+        cpu_func = cpu_reproject_and_coadd
     # Remove GPU-only extras before CPU call to avoid unexpected kwargs
     gpu_only = {
         "bg_preview_size",
@@ -3636,7 +3847,7 @@ def reproject_and_coadd_wrapper(
     cpu_kwargs = {k: v for k, v in kwargs.items() if k not in gpu_only}
     inputs = list(zip(data_list, wcs_list))
     output_proj = cpu_kwargs.pop("output_projection")
-    return cpu_function(inputs, output_proj, shape_out, **cpu_kwargs)
+    return cpu_func(inputs, output_proj, shape_out, **cpu_kwargs)
 
 
 
@@ -3649,29 +3860,15 @@ def gpu_reproject_and_coadd(data_list, wcs_list, shape_out, **kwargs):
 
 
 def reproject_and_coadd_wrapper(data_list, wcs_list, shape_out, use_gpu=False, cpu_func=None, **kwargs):
-    """Dispatch to CPU or GPU ``reproject_and_coadd`` depending on availability (duplicate alias)."""
-    if use_gpu and gpu_is_available():
-        try:
-            return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs)
-        except Exception as e:  # pragma: no cover
-            import logging
-            logging.getLogger(__name__).warning(
-                "GPU reprojection failed (%s), falling back to CPU", e
-            )
-    input_pairs = list(zip(data_list, wcs_list))
-    output_projection = kwargs.pop("output_projection", None)
-    func = cpu_func or cpu_reproject_and_coadd
-    gpu_only = {
-        "bg_preview_size",
-        "intertile_sky_percentile",
-        "intertile_robust_clip_sigma",
-        "rows_per_chunk",
-        "max_chunk_bytes",
-        # New GPU-only hints
-        "tile_affine_corrections",
-    }
-    cpu_kwargs = {k: v for k, v in kwargs.items() if k not in gpu_only}
-    return func(input_pairs, output_projection, shape_out, **cpu_kwargs)
+    """Dispatch to CPU or GPU ``reproject_and_coadd`` depending on availability."""
+    return _reproject_and_coadd_wrapper_impl(
+        data_list,
+        wcs_list,
+        shape_out,
+        use_gpu=use_gpu,
+        cpu_func=cpu_func,
+        **kwargs,
+    )
 
 
 # --- GPU Percentiles, Hot-Pixels, and Background Map -------------------------
