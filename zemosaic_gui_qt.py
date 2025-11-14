@@ -1358,37 +1358,36 @@ class ZeMosaicQtMainWindow(QMainWindow):
         )
 
         winsor_value = self.config.get("stacking_winsor_limits", (0.05, 0.05))
-        parsed_winsor: Tuple[float, float]
-        if isinstance(winsor_value, str):
-            parts = [segment.strip() for segment in winsor_value.split(",") if segment.strip()]
-            if len(parts) >= 2:
+
+        def _format_winsor_pair(low: float, high: float) -> str:
+            def _fmt(value: float) -> str:
+                text = f"{value:.3f}"
+                if "." in text:
+                    text = text.rstrip("0").rstrip(".")
+                return text or "0"
+
+            return f"{_fmt(low)},{_fmt(high)}"
+
+        def _parse_winsor_value(value: Any) -> Tuple[float, float]:
+            if isinstance(value, str):
+                parts = [segment.strip() for segment in value.split(",") if segment.strip()]
+                if len(parts) >= 2:
+                    try:
+                        return float(parts[0]), float(parts[1])
+                    except ValueError:
+                        return (0.05, 0.05)
+                return (0.05, 0.05)
+            if isinstance(value, (list, tuple)) and len(value) >= 2:
                 try:
-                    parsed_winsor = (float(parts[0]), float(parts[1]))
-                except ValueError:
-                    parsed_winsor = (0.05, 0.05)
-                    self.config["stacking_winsor_limits"] = [
-                        parsed_winsor[0],
-                        parsed_winsor[1],
-                    ]
-                else:
-                    self.config["stacking_winsor_limits"] = [
-                        parsed_winsor[0],
-                        parsed_winsor[1],
-                    ]
-            else:
-                parsed_winsor = (0.05, 0.05)
-                self.config["stacking_winsor_limits"] = [parsed_winsor[0], parsed_winsor[1]]
-        elif isinstance(winsor_value, (list, tuple)) and len(winsor_value) >= 2:
-            try:
-                parsed_winsor = (float(winsor_value[0]), float(winsor_value[1]))
-            except (TypeError, ValueError):
-                parsed_winsor = (0.05, 0.05)
-                self.config["stacking_winsor_limits"] = [parsed_winsor[0], parsed_winsor[1]]
-            else:
-                self.config["stacking_winsor_limits"] = [parsed_winsor[0], parsed_winsor[1]]
-        else:
-            parsed_winsor = (0.05, 0.05)
-            self.config["stacking_winsor_limits"] = [parsed_winsor[0], parsed_winsor[1]]
+                    return float(value[0]), float(value[1])
+                except (TypeError, ValueError):
+                    return (0.05, 0.05)
+            return (0.05, 0.05)
+
+        parsed_winsor = _parse_winsor_value(winsor_value)
+        self.config["stacking_winsor_limits"] = _format_winsor_pair(
+            parsed_winsor[0], parsed_winsor[1]
+        )
 
         winsor_container = QWidget(group)
         winsor_layout = QHBoxLayout(winsor_container)
@@ -1426,11 +1425,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._config_fields["stacking_winsor_limits"] = {
             "kind": "composite",
             "widget": (winsor_low, winsor_high),
-            "type": list,
-            "value_getter": lambda: [
-                float(winsor_low.value()),
-                float(winsor_high.value()),
-            ],
+            "type": str,
+            "value_getter": lambda: _format_winsor_pair(
+                float(winsor_low.value()), float(winsor_high.value())
+            ),
         }
 
         combine_combo = QComboBox(group)
@@ -2577,7 +2575,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "stacking_rejection_algorithm": "winsorized_sigma_clip",
             "stacking_kappa_low": 3.0,
             "stacking_kappa_high": 3.0,
-            "stacking_winsor_limits": [0.05, 0.05],
+            "stacking_winsor_limits": "0.05,0.05",
             "stacking_final_combine_method": "mean",
             "poststack_equalize_rgb": True,
             "apply_radial_weight": False,
