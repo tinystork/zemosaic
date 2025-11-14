@@ -6,7 +6,7 @@ import importlib.util
 import os
 from pathlib import Path
 import math
-from typing import Any, Iterable, List, Sequence, Tuple
+from typing import Any, Iterable, Iterator, List, Sequence, Tuple
 
 
 _pyside_spec = importlib.util.find_spec("PySide6")
@@ -89,6 +89,179 @@ class _NormalizedItem:
     center_ra_deg: float | None = None
     center_dec_deg: float | None = None
     cluster_index: int | None = None
+
+
+def _iter_normalized_entries(
+    payload: Any,
+    initial_overrides: Any,
+    *,
+    scan_recursive: bool,
+) -> Iterator[_NormalizedItem]:
+    """Yield ``_NormalizedItem`` instances without eagerly materialising them."""
+
+    excluded_paths: Sequence[str] = ()
+    if isinstance(initial_overrides, dict):
+        candidate = initial_overrides.get("excluded_paths")
+        if isinstance(candidate, (list, tuple, set)):
+            excluded_paths = [os.fspath(p) for p in candidate]
+
+    def _should_exclude(path: str) -> bool:
+        return any(os.path.normcase(path) == os.path.normcase(entry) for entry in excluded_paths)
+
+    def _build_from_mapping(obj: dict) -> _NormalizedItem:
+        original = obj
+        instrument = None
+        for key in ("instrument", "INSTRUME", "instrument_name"):
+            if key in obj and obj[key]:
+                try:
+                    instrument = str(obj[key])
+                except Exception:
+                    instrument = None
+                if instrument:
+                    break
+        group_label: str | None = None
+        for key in (
+            "group_label",
+            "group",
+            "group_id",
+            "cluster",
+            "cluster_id",
+            "tile_group",
+            "tile_group_id",
+            "master_tile_id",
+        ):
+            if key in obj and obj[key] not in (None, ""):
+                try:
+                    group_label = str(obj[key])
+                except Exception:
+                    group_label = None
+                if group_label:
+                    break
+        if group_label is None and "grouping" in obj:
+            grouping = obj.get("grouping")
+            if isinstance(grouping, dict):
+                for key in ("label", "id", "name"):
+                    candidate = grouping.get(key)
+                    if candidate not in (None, ""):
+                        try:
+                            group_label = str(candidate)
+                        except Exception:
+                            group_label = None
+                        if group_label:
+                            break
+        file_path = str(
+            obj.get("file_path")
+            or obj.get("path")
+            or obj.get("filepath")
+            or obj.get("filename")
+            or obj.get("full_path")
+            or obj.get("fullpath")
+            or obj.get("name")
+            or obj.get("src")
+            or ""
+        )
+        if not file_path and "header" in obj:
+            try:
+                file_path = str(obj["header"].get("FILENAME", ""))
+            except Exception:
+                file_path = ""
+        has_wcs = False
+        for key in ("has_wcs", "wcs_solved", "has_valid_wcs"):
+            if obj.get(key):
+                has_wcs = True
+                break
+        if not has_wcs and "wcs" in obj:
+            has_wcs = obj["wcs"] is not None
+        display_name = file_path or instrument or "Item"
+        include = not _should_exclude(file_path)
+        ra_deg = None
+        dec_deg = None
+        for key in ("center_ra_deg", "ra_deg", "ra"):
+            if key in obj:
+                try:
+                    ra_deg = float(obj[key])
+                except Exception:
+                    ra_deg = None
+                if ra_deg is not None:
+                    break
+        for key in ("center_dec_deg", "dec_deg", "dec"):
+            if key in obj:
+                try:
+                    dec_deg = float(obj[key])
+                except Exception:
+                    dec_deg = None
+                if dec_deg is not None:
+                    break
+        if (ra_deg is None or dec_deg is None) and "header" in obj:
+            try:
+                header_obj = obj["header"]
+            except Exception:
+                header_obj = None
+            if header_obj is not None:
+                ra_from_header, dec_from_header = _extract_center_from_header(header_obj)
+                ra_deg = ra_deg if ra_deg is not None else ra_from_header
+                dec_deg = dec_deg if dec_deg is not None else dec_from_header
+        return _NormalizedItem(
+            original=original,
+            display_name=display_name,
+            file_path=file_path,
+            has_wcs=has_wcs,
+            instrument=instrument,
+            group_label=group_label,
+            include_by_default=include,
+            center_ra_deg=ra_deg,
+            center_dec_deg=dec_deg,
+        )
+
+    def _build_from_path(path_obj: Path) -> _NormalizedItem:
+        file_path = str(path_obj)
+        display_name = path_obj.name or file_path
+        include = not _should_exclude(file_path)
+        return _NormalizedItem(
+            original=file_path,
+            display_name=display_name,
+            file_path=file_path,
+            has_wcs=False,
+            instrument=None,
+            group_label=None,
+            include_by_default=include,
+        )
+
+    if isinstance(payload, (str, os.PathLike)):
+        directory = Path(payload)
+        if directory.is_dir():
+            pattern = "**/*" if scan_recursive else "*"
+            for candidate in directory.glob(pattern):
+                if candidate.is_file():
+                    yield _build_from_path(candidate)
+        elif Path(payload).is_file():
+            yield _build_from_path(Path(payload))
+    elif isinstance(payload, Iterable):
+        for element in payload:
+            if isinstance(element, dict):
+                yield _build_from_mapping(element)
+            elif isinstance(element, (str, os.PathLike)):
+                yield _build_from_path(Path(element))
+            else:
+                yield _NormalizedItem(
+                    original=element,
+                    display_name=str(element),
+                    file_path=str(element),
+                    has_wcs=False,
+                    instrument=None,
+                    group_label=None,
+                    include_by_default=True,
+                )
+    else:
+        yield _NormalizedItem(
+            original=payload,
+            display_name=str(payload),
+            file_path=str(payload),
+            has_wcs=False,
+            instrument=None,
+            group_label=None,
+            include_by_default=True,
+        )
 
 
 def _header_has_wcs(header: Any) -> bool:
@@ -428,6 +601,55 @@ class _DirectoryScanWorker(QObject):
         return default
 
 
+class _StreamIngestWorker(QObject):
+    """Background worker that yields normalized entries in small batches."""
+
+    batch_ready = Signal(list)
+    finished = Signal()
+    error = Signal(str)
+
+    def __init__(
+        self,
+        payload: Any,
+        initial_overrides: Any,
+        *,
+        scan_recursive: bool,
+        batch_size: int,
+    ) -> None:
+        super().__init__()
+        self._payload = payload
+        self._initial_overrides = initial_overrides
+        self._scan_recursive = bool(scan_recursive)
+        self._batch_size = max(1, int(batch_size))
+        self._stop_requested = False
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            iterator = _iter_normalized_entries(
+                self._payload,
+                self._initial_overrides,
+                scan_recursive=self._scan_recursive,
+            )
+            batch: list[_NormalizedItem] = []
+            for entry in iterator:
+                if self._stop_requested:
+                    break
+                batch.append(entry)
+                if len(batch) >= self._batch_size:
+                    self.batch_ready.emit(batch)
+                    batch = []
+            if batch:
+                self.batch_ready.emit(batch)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            self.error.emit(str(exc))
+        finally:
+            self.finished.emit()
+
+    def request_stop(self) -> None:
+        self._stop_requested = True
+
+
 class FilterQtDialog(QDialog):
     """Small Qt dialog allowing users to review candidate files.
 
@@ -466,7 +688,22 @@ class FilterQtDialog(QDialog):
         self._accepted = False
 
         self._localizer = self._load_localizer()
-        self._normalized_items = self._normalize_items(raw_files_with_wcs_or_dir, initial_overrides)
+        self._normalized_items: list[_NormalizedItem] = []
+        self._stream_thread: QThread | None = None
+        self._stream_worker: _StreamIngestWorker | None = None
+        self._streaming_active = False
+        self._streaming_completed = not self._stream_scan
+        self._stream_loaded_count = 0
+        try:
+            self._batch_size = max(1, int(batch_size))
+        except Exception:
+            self._batch_size = 100
+        self._dialog_button_box: QDialogButtonBox | None = None
+
+        if self._stream_scan:
+            self._normalized_items = []
+        else:
+            self._normalized_items = self._normalize_items(raw_files_with_wcs_or_dir, initial_overrides)
 
         overrides = config_overrides or {}
         self._auto_group_requested = bool(overrides.get("filter_auto_group", False))
@@ -505,10 +742,13 @@ class FilterQtDialog(QDialog):
 
         self._preview_canvas = self._create_preview_canvas()
         self._build_ui()
-        self._populate_table()
-        self._update_summary_label()
-        self._schedule_preview_refresh()
-        self._schedule_cluster_refresh()
+        if self._stream_scan:
+            self._prepare_streaming_mode(raw_files_with_wcs_or_dir, initial_overrides)
+        else:
+            self._populate_table()
+            self._update_summary_label()
+            self._schedule_preview_refresh()
+            self._schedule_cluster_refresh()
 
     # ------------------------------------------------------------------
     # Helpers - localization and normalization
@@ -538,178 +778,13 @@ class FilterQtDialog(QDialog):
     ) -> List[_NormalizedItem]:
         """Materialise the input payload into ``_NormalizedItem`` instances."""
 
-        # Extract optional exclusion hints from overrides
-        excluded_paths: Sequence[str] = ()
-        if isinstance(initial_overrides, dict):
-            candidate = initial_overrides.get("excluded_paths")
-            if isinstance(candidate, (list, tuple, set)):
-                excluded_paths = [os.fspath(p) for p in candidate]
-
-        items: list[_NormalizedItem] = []
-
-        def _should_exclude(path: str) -> bool:
-            return any(os.path.normcase(path) == os.path.normcase(entry) for entry in excluded_paths)
-
-        def _build_from_mapping(obj: dict) -> _NormalizedItem:
-            original = obj
-            instrument = None
-            for key in ("instrument", "INSTRUME", "instrument_name"):
-                if key in obj and obj[key]:
-                    try:
-                        instrument = str(obj[key])
-                    except Exception:
-                        instrument = None
-                    if instrument:
-                        break
-            group_label: str | None = None
-            for key in (
-                "group_label",
-                "group",
-                "group_id",
-                "cluster",
-                "cluster_id",
-                "tile_group",
-                "tile_group_id",
-                "master_tile_id",
-            ):
-                if key in obj and obj[key] not in (None, ""):
-                    try:
-                        group_label = str(obj[key])
-                    except Exception:
-                        group_label = None
-                    if group_label:
-                        break
-            if group_label is None and "grouping" in obj:
-                grouping = obj.get("grouping")
-                if isinstance(grouping, dict):
-                    for key in ("label", "id", "name"):
-                        candidate = grouping.get(key)
-                        if candidate not in (None, ""):
-                            try:
-                                group_label = str(candidate)
-                            except Exception:
-                                group_label = None
-                            if group_label:
-                                break
-            file_path = str(
-                obj.get("file_path")
-                or obj.get("path")
-                or obj.get("filepath")
-                or obj.get("filename")
-                or obj.get("full_path")
-                or obj.get("fullpath")
-                or obj.get("name")
-                or obj.get("src")
-                or ""
+        return list(
+            _iter_normalized_entries(
+                payload,
+                initial_overrides,
+                scan_recursive=self._scan_recursive,
             )
-            if not file_path and "header" in obj:
-                try:
-                    file_path = str(obj["header"].get("FILENAME", ""))
-                except Exception:
-                    file_path = ""
-            has_wcs = False
-            for key in ("has_wcs", "wcs_solved", "has_valid_wcs"):
-                if obj.get(key):
-                    has_wcs = True
-                    break
-            if not has_wcs and "wcs" in obj:
-                has_wcs = obj["wcs"] is not None
-            display_name = file_path or instrument or "Item"
-            include = not _should_exclude(file_path)
-            ra_deg = None
-            dec_deg = None
-            for key in ("center_ra_deg", "ra_deg", "ra"):
-                if key in obj:
-                    try:
-                        ra_deg = float(obj[key])
-                    except Exception:
-                        ra_deg = None
-                    if ra_deg is not None:
-                        break
-            for key in ("center_dec_deg", "dec_deg", "dec"):
-                if key in obj:
-                    try:
-                        dec_deg = float(obj[key])
-                    except Exception:
-                        dec_deg = None
-                    if dec_deg is not None:
-                        break
-            if (ra_deg is None or dec_deg is None) and "header" in obj:
-                try:
-                    header_obj = obj["header"]
-                except Exception:
-                    header_obj = None
-                if header_obj is not None:
-                    ra_from_header, dec_from_header = _extract_center_from_header(header_obj)
-                    ra_deg = ra_deg if ra_deg is not None else ra_from_header
-                    dec_deg = dec_deg if dec_deg is not None else dec_from_header
-            return _NormalizedItem(
-                original=original,
-                display_name=display_name,
-                file_path=file_path,
-                has_wcs=has_wcs,
-                instrument=instrument,
-                group_label=group_label,
-                include_by_default=include,
-                center_ra_deg=ra_deg,
-                center_dec_deg=dec_deg,
-            )
-
-        def _build_from_path(path_obj: Path) -> _NormalizedItem:
-            file_path = str(path_obj)
-            display_name = path_obj.name or file_path
-            include = not _should_exclude(file_path)
-            return _NormalizedItem(
-                original=file_path,
-                display_name=display_name,
-                file_path=file_path,
-                has_wcs=False,
-                instrument=None,
-                group_label=None,
-                include_by_default=include,
-            )
-
-        if isinstance(payload, (str, os.PathLike)):
-            directory = Path(payload)
-            if directory.is_dir():
-                pattern = "**/*" if self._scan_recursive else "*"
-                for candidate in directory.glob(pattern):
-                    if candidate.is_file():
-                        items.append(_build_from_path(candidate))
-            elif Path(payload).is_file():
-                items.append(_build_from_path(Path(payload)))
-        elif isinstance(payload, Iterable):
-            for element in payload:
-                if isinstance(element, dict):
-                    items.append(_build_from_mapping(element))
-                elif isinstance(element, (str, os.PathLike)):
-                    items.append(_build_from_path(Path(element)))
-                else:
-                    items.append(
-                        _NormalizedItem(
-                            original=element,
-                            display_name=str(element),
-                            file_path=str(element),
-                            has_wcs=False,
-                            instrument=None,
-                            group_label=None,
-                            include_by_default=True,
-                        )
-                    )
-        else:
-            items.append(
-                _NormalizedItem(
-                    original=payload,
-                    display_name=str(payload),
-                    file_path=str(payload),
-                    has_wcs=False,
-                    instrument=None,
-                    group_label=None,
-                    include_by_default=True,
-                )
-            )
-
-        return items
+        )
 
     # ------------------------------------------------------------------
     # UI creation
@@ -821,37 +896,162 @@ class FilterQtDialog(QDialog):
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
         main_layout.addWidget(button_box)
+        self._dialog_button_box = button_box
+
+    def _prepare_streaming_mode(self, payload: Any, initial_overrides: Any) -> None:
+        """Enable incremental ingestion when the dialog is opened in stream mode."""
+
+        self._stream_loaded_count = 0
+        self._streaming_active = True
+        self._streaming_completed = False
+        self._table.setRowCount(0)
+        self._update_summary_label()
+        loading_text = self._localizer.get("filter.stream.starting", "Discovering frames…")
+        self._status_label.setText(loading_text)
+        self._progress_bar.setRange(0, 0)
+        if self._run_analysis_btn is not None:
+            self._run_analysis_btn.setEnabled(False)
+        ok_button = None
+        if self._dialog_button_box is not None:
+            ok_button = self._dialog_button_box.button(QDialogButtonBox.Ok)
+        if ok_button is not None:
+            ok_button.setEnabled(False)
+        self._start_stream_worker(payload, initial_overrides)
+
+    def _start_stream_worker(self, payload: Any, initial_overrides: Any) -> None:
+        self._stop_stream_worker()
+        self._stream_worker = _StreamIngestWorker(
+            payload,
+            initial_overrides,
+            scan_recursive=self._scan_recursive,
+            batch_size=self._batch_size,
+        )
+        self._stream_thread = QThread(self)
+        self._stream_worker.moveToThread(self._stream_thread)
+        self._stream_thread.started.connect(self._stream_worker.run)
+        self._stream_worker.batch_ready.connect(self._on_stream_batch)
+        self._stream_worker.error.connect(self._on_stream_error)
+        self._stream_worker.finished.connect(self._on_stream_finished)
+        self._stream_worker.finished.connect(self._stream_thread.quit)
+        self._stream_worker.finished.connect(self._stream_worker.deleteLater)
+        self._stream_thread.finished.connect(self._on_stream_thread_finished)
+        self._stream_thread.finished.connect(self._stream_thread.deleteLater)
+        self._stream_thread.start()
+
+    def _on_stream_batch(self, entries: list[_NormalizedItem]) -> None:
+        if not entries:
+            return
+        self._normalized_items.extend(entries)
+        self._append_rows(entries)
+        self._stream_loaded_count += len(entries)
+        message_template = self._localizer.get(
+            "filter.stream.loading",
+            "Discovered {count} frame(s)…",
+            count=self._stream_loaded_count,
+        )
+        try:
+            self._status_label.setText(message_template.format(count=self._stream_loaded_count))
+        except Exception:
+            self._status_label.setText(f"Discovered {self._stream_loaded_count} frame(s)…")
+
+    def _on_stream_finished(self) -> None:
+        self._streaming_active = False
+        self._streaming_completed = True
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setValue(0)
+        total_loaded = len(self._normalized_items)
+        message_template = self._localizer.get(
+            "filter.stream.completed",
+            "Finished loading {count} frame(s).",
+            count=total_loaded,
+        )
+        try:
+            self._status_label.setText(message_template.format(count=total_loaded))
+        except Exception:
+            self._status_label.setText(f"Finished loading {total_loaded} frame(s).")
+        if self._run_analysis_btn is not None:
+            self._run_analysis_btn.setEnabled(True)
+        if self._dialog_button_box is not None:
+            ok_button = self._dialog_button_box.button(QDialogButtonBox.Ok)
+            if ok_button is not None:
+                ok_button.setEnabled(True)
+        self._update_summary_label()
+        self._schedule_preview_refresh()
+        self._schedule_cluster_refresh()
+
+    def _on_stream_error(self, message: str) -> None:
+        if not message:
+            return
+        try:
+            self._status_label.setText(message)
+        except Exception:
+            pass
+
+    def _on_stream_thread_finished(self) -> None:
+        self._stream_thread = None
+        self._stream_worker = None
+
+    def _stop_stream_worker(self) -> None:
+        worker = self._stream_worker
+        thread = self._stream_thread
+        was_running = False
+        if worker is not None:
+            worker.request_stop()
+        if thread is not None:
+            was_running = thread.isRunning()
+            thread.quit()
+            thread.wait(2000)
+        self._stream_worker = None
+        self._stream_thread = None
+        self._streaming_active = False
+        if was_running:
+            self._streaming_completed = False
 
     def _populate_table(self) -> None:
         items = self._normalized_items
         self._table.blockSignals(True)
         self._table.setRowCount(len(items))
         for row, entry in enumerate(items):
-            name_item = QTableWidgetItem(entry.display_name)
-            name_item.setFlags(name_item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-            name_item.setCheckState(Qt.Checked if entry.include_by_default else Qt.Unchecked)
-            self._table.setItem(row, 0, name_item)
-
-            has_wcs_text = (
-                self._localizer.get("filter.value.wcs_present", "Yes")
-                if entry.has_wcs
-                else self._localizer.get("filter.value.wcs_missing", "No")
-            )
-            wcs_item = QTableWidgetItem(has_wcs_text)
-            wcs_item.setFlags(wcs_item.flags() & ~Qt.ItemIsEditable)
-            self._table.setItem(row, 1, wcs_item)
-
-            group_label = entry.group_label or self._localizer.get("filter.value.group_unassigned", "Unassigned")
-            group_item = QTableWidgetItem(group_label)
-            group_item.setFlags(group_item.flags() & ~Qt.ItemIsEditable)
-            self._table.setItem(row, 2, group_item)
-
-            instrument = entry.instrument or self._localizer.get("filter.value.unknown", "Unknown")
-            instrument_item = QTableWidgetItem(instrument)
-            instrument_item.setFlags(instrument_item.flags() & ~Qt.ItemIsEditable)
-            self._table.setItem(row, 3, instrument_item)
-
+            self._populate_row(row, entry)
         self._table.blockSignals(False)
+
+    def _populate_row(self, row: int, entry: _NormalizedItem) -> None:
+        name_item = QTableWidgetItem(entry.display_name)
+        name_item.setFlags(name_item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        name_item.setCheckState(Qt.Checked if entry.include_by_default else Qt.Unchecked)
+        self._table.setItem(row, 0, name_item)
+
+        has_wcs_text = (
+            self._localizer.get("filter.value.wcs_present", "Yes")
+            if entry.has_wcs
+            else self._localizer.get("filter.value.wcs_missing", "No")
+        )
+        wcs_item = QTableWidgetItem(has_wcs_text)
+        wcs_item.setFlags(wcs_item.flags() & ~Qt.ItemIsEditable)
+        self._table.setItem(row, 1, wcs_item)
+
+        group_label = entry.group_label or self._localizer.get("filter.value.group_unassigned", "Unassigned")
+        group_item = QTableWidgetItem(group_label)
+        group_item.setFlags(group_item.flags() & ~Qt.ItemIsEditable)
+        self._table.setItem(row, 2, group_item)
+
+        instrument = entry.instrument or self._localizer.get("filter.value.unknown", "Unknown")
+        instrument_item = QTableWidgetItem(instrument)
+        instrument_item.setFlags(instrument_item.flags() & ~Qt.ItemIsEditable)
+        self._table.setItem(row, 3, instrument_item)
+
+    def _append_rows(self, entries: Sequence[_NormalizedItem]) -> None:
+        if not entries:
+            return
+        start_row = self._table.rowCount()
+        self._table.blockSignals(True)
+        self._table.setRowCount(start_row + len(entries))
+        for offset, entry in enumerate(entries):
+            self._populate_row(start_row + offset, entry)
+        self._table.blockSignals(False)
+        self._update_summary_label()
+        self._schedule_preview_refresh()
+        self._schedule_cluster_refresh()
 
     # ------------------------------------------------------------------
     # Interaction helpers
@@ -944,6 +1144,14 @@ class FilterQtDialog(QDialog):
         return box
 
     def _on_run_analysis(self) -> None:
+        if self._streaming_active and self._stream_thread is not None and self._stream_thread.isRunning():
+            wait_text = self._localizer.get(
+                "filter.stream.wait",
+                "Please wait for frame discovery to finish before running analysis.",
+            )
+            self._status_label.setText(wait_text)
+            return
+
         if self._scan_thread is not None and self._scan_thread.isRunning():
             return
 
@@ -1244,6 +1452,17 @@ class FilterQtDialog(QDialog):
     # ------------------------------------------------------------------
     # QDialog API
     # ------------------------------------------------------------------
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._stop_stream_worker()
+        if self._scan_worker is not None:
+            self._scan_worker.request_stop()
+        if self._scan_thread is not None:
+            self._scan_thread.quit()
+            self._scan_thread.wait(2000)
+            self._scan_thread = None
+        self._scan_worker = None
+        super().closeEvent(event)
+
     def accept(self) -> None:  # noqa: D401 - inherit docstring
         self._accepted = True
         super().accept()
@@ -1311,6 +1530,15 @@ class FilterQtDialog(QDialog):
     def input_items(self) -> List[Any]:
         """Return a shallow copy of the original payload list."""
 
+        if self._stream_scan and not self._streaming_completed:
+            return [
+                entry.original
+                for entry in _iter_normalized_entries(
+                    self._input_payload,
+                    self._initial_overrides,
+                    scan_recursive=self._scan_recursive,
+                )
+            ]
         return [entry.original for entry in self._normalized_items]
 
     # ------------------------------------------------------------------
