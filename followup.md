@@ -108,7 +108,7 @@ This ensures that tools and worker components expecting Tk-style GPU config rema
 
 **Detailed requirements:**
 
-- [ ] Update Qt GPU toggle handler to write both new-style and legacy-style GPU config keys.
+- [x] Update Qt GPU toggle handler to write both new-style and legacy-style GPU config keys.
 - [ ] Ensure config snapshots match those produced by Tk GUI.
 - [ ] Ensure switching backend (Qt ↔ Tk) does not change stacked GPU behavior.
 - [ ] Add notes in followup.md once implemented.

@@ -2542,6 +2542,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
             self.config[key] = raw_value
 
+            if key == "use_gpu_phase5":
+                gpu_enabled = bool(raw_value)
+                self.config["stack_use_gpu"] = gpu_enabled
+                self.config["use_gpu_stack"] = gpu_enabled
+
     def _baseline_default_config(self) -> Dict[str, Any]:
         defaults: Dict[str, Any] = {}
         if zemosaic_config is not None and hasattr(zemosaic_config, "DEFAULT_CONFIG"):
@@ -2650,6 +2655,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "winsor_worker_limit": 10,
             "max_raw_per_master_tile": 0,
             "use_gpu_phase5": False,
+            "stack_use_gpu": False,
+            "use_gpu_stack": False,
             "gpu_selector": "CPU (no GPU)",
             "gpu_id_phase5": 0,
             "logging_level": "INFO",
@@ -2734,6 +2741,38 @@ class ZeMosaicQtMainWindow(QMainWindow):
         merged_config = dict(self._default_config_values)
         merged_config.update(config_data)
         merged_config.setdefault("language", "en")
+
+        def _normalize_bool(value: Any, default: bool = False) -> bool:
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return value != 0
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if normalized in {"1", "true", "yes", "on"}:
+                    return True
+                if normalized in {"0", "false", "no", "off"}:
+                    return False
+                if not normalized:
+                    return default
+            if value is None:
+                return default
+            return bool(value)
+
+        canonical_gpu_pref: Any = merged_config.get("use_gpu_phase5")
+        if canonical_gpu_pref in (None, ""):
+            for legacy_key in ("stack_use_gpu", "use_gpu_stack"):
+                if legacy_key in merged_config:
+                    canonical_gpu_pref = merged_config[legacy_key]
+                    break
+        gpu_enabled = _normalize_bool(canonical_gpu_pref, False)
+        merged_config["use_gpu_phase5"] = gpu_enabled
+        merged_config["stack_use_gpu"] = _normalize_bool(
+            merged_config.get("stack_use_gpu"), gpu_enabled
+        )
+        merged_config["use_gpu_stack"] = _normalize_bool(
+            merged_config.get("use_gpu_stack"), gpu_enabled
+        )
 
         self._loaded_config_snapshot = dict(config_data)
         self._persisted_config_keys = set(config_data.keys()) | set(
