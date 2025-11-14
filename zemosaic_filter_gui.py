@@ -867,6 +867,7 @@ def launch_filter_interface(
             except Exception:
                 print(f"ERROR (Filter GUI): {msg}{detail}")
             return raw_items_input, False, None
+        ASTROPY_AVAILABLE = True
 
         SIP_COEFF_PREFIXES = ("A_", "B_", "AP_", "BP_")
         SIP_META_KEYS = {"A_ORDER", "B_ORDER", "AP_ORDER", "BP_ORDER"}
@@ -1873,11 +1874,15 @@ def launch_filter_interface(
         raw_files_with_wcs: list[Dict[str, Any]] = []
         items: list[Item] = []
         instruments_found: set[str] = set()
+        has_seestar_entries = False
 
         def _materialize_batch(batch: list[Dict[str, Any]]) -> None:
+            nonlocal has_seestar_entries
             for entry in batch:
                 raw_files_with_wcs.append(entry)
                 items.append(Item(entry, len(raw_files_with_wcs) - 1))
+                if not has_seestar_entries and _item_is_seestar(entry):
+                    has_seestar_entries = True
 
         for batch in initial_batches:
             _materialize_batch(batch)
@@ -2093,6 +2098,149 @@ def launch_filter_interface(
                 }
             )
             return True, meta_payload
+
+        def _build_sds_batches_for_indices(
+            selected_indices: list[int],
+            *,
+            coverage_threshold: float = 0.92,
+        ) -> list[list[dict]] | None:
+            descriptor = global_wcs_state.get("descriptor")
+            if not descriptor:
+                return None
+            plan_wcs = descriptor.get("wcs")
+            if plan_wcs is None and ASTROPY_AVAILABLE and WCS:
+                header = descriptor.get("header")
+                if header is None and isinstance(descriptor.get("metadata"), dict):
+                    header = descriptor["metadata"].get("header")
+                try:
+                    if header is not None:
+                        plan_wcs = WCS(header)
+                except Exception:
+                    plan_wcs = None
+            if plan_wcs is None:
+                return None
+            try:
+                width = int(descriptor.get("width") or 0)
+                height = int(descriptor.get("height") or 0)
+            except Exception:
+                width = height = 0
+            if width <= 0 or height <= 0:
+                return None
+
+            entry_infos: list[dict[str, Any]] = []
+
+            def _coerce_item_wcs(candidate_item: Item) -> Any:
+                if candidate_item.wcs is not None:
+                    return candidate_item.wcs
+                if candidate_item.header is not None and ASTROPY_AVAILABLE and WCS:
+                    try:
+                        return WCS(candidate_item.header)
+                    except Exception:
+                        return None
+                return None
+
+            for idx in selected_indices:
+                if not (0 <= idx < len(items)):
+                    continue
+                item_obj = items[idx]
+                if not _item_is_seestar(item_obj.src):
+                    continue
+                local_wcs = _coerce_item_wcs(item_obj)
+                if local_wcs is None:
+                    continue
+                shape_hw = item_obj.shape
+                if shape_hw is None:
+                    shape_hw = item_obj._infer_shape()
+                if (
+                    shape_hw is None
+                    or shape_hw[0] is None
+                    or shape_hw[1] is None
+                    or shape_hw[0] <= 0
+                    or shape_hw[1] <= 0
+                ):
+                    continue
+                try:
+                    rows = np.array([0, 0, shape_hw[0] - 1, shape_hw[0] - 1], dtype=float)
+                    cols = np.array([0, shape_hw[1] - 1, 0, shape_hw[1] - 1], dtype=float)
+                    world_coords = local_wcs.pixel_to_world(cols, rows)
+                    g_cols, g_rows = plan_wcs.world_to_pixel(world_coords)
+                except Exception:
+                    continue
+                if g_cols is None or g_rows is None:
+                    continue
+                try:
+                    x0 = int(np.floor(np.nanmin(g_cols)))
+                    x1 = int(np.ceil(np.nanmax(g_cols))) + 1
+                    y0 = int(np.floor(np.nanmin(g_rows)))
+                    y1 = int(np.ceil(np.nanmax(g_rows))) + 1
+                except Exception:
+                    continue
+                if any(np.isnan(val) for val in (x0, x1, y0, y1)):
+                    continue
+                x0 = max(0, min(width, x0))
+                x1 = max(x0, min(width, x1))
+                y0 = max(0, min(height, y0))
+                y1 = max(y0, min(height, y1))
+                if (x1 - x0) <= 0 or (y1 - y0) <= 0:
+                    continue
+                entry_infos.append({"item": item_obj, "bbox": (y0, y1, x0, x1)})
+
+            if not entry_infos:
+                return None
+
+            grid_h = max(1, min(512, height))
+            grid_w = max(1, min(512, width))
+            scale_y = grid_h / float(height)
+            scale_x = grid_w / float(width)
+            for info in entry_infos:
+                y0, y1, x0, x1 = info["bbox"]
+                g_y0 = max(0, min(grid_h, int(math.floor(y0 * scale_y))))
+                g_y1 = max(g_y0 + 1, min(grid_h, int(math.ceil(y1 * scale_y))))
+                g_x0 = max(0, min(grid_w, int(math.floor(x0 * scale_x))))
+                g_x1 = max(g_x0 + 1, min(grid_w, int(math.ceil(x1 * scale_x))))
+                info["grid_bbox"] = (g_y0, g_y1, g_x0, g_x1)
+
+            coverage_threshold = max(0.10, min(0.99, float(coverage_threshold or 0.92)))
+            total_cells = grid_h * grid_w
+            batches: list[list[dict[str, Any]]] = []
+            remaining = entry_infos
+            while remaining:
+                coverage_grid = np.zeros((grid_h, grid_w), dtype=np.uint8)
+                coverage_cells = 0
+                used_indices: list[int] = []
+                batch_entries: list[dict[str, Any]] = []
+                for idx, info in enumerate(remaining):
+                    gy0, gy1, gx0, gx1 = info.get("grid_bbox", (0, 0, 0, 0))
+                    if gy1 <= gy0 or gx1 <= gx0:
+                        continue
+                    region = coverage_grid[gy0:gy1, gx0:gx1]
+                    already = int(region.sum())
+                    region_cells = (gy1 - gy0) * (gx1 - gx0)
+                    region[...] = 1
+                    gain = max(0, region_cells - already)
+                    if gain <= 0 and batch_entries:
+                        continue
+                    coverage_cells += gain
+                    batch_entries.append(info)
+                    used_indices.append(idx)
+                    fraction = (coverage_cells / total_cells) if total_cells else 1.0
+                    if fraction >= coverage_threshold and batch_entries:
+                        break
+                if not batch_entries:
+                    batch_entries.append(remaining[0])
+                    used_indices = [0]
+                batches.append(batch_entries)
+                used_set = set(used_indices)
+                remaining = [info for idx, info in enumerate(remaining) if idx not in used_set]
+
+            final_groups: list[list[dict]] = []
+            for batch in batches:
+                batch_group: list[dict] = []
+                for info in batch:
+                    batch_group.append(info["item"].src)
+                if batch_group:
+                    final_groups.append(batch_group)
+            return final_groups if final_groups else None
 
         def _ensure_global_wcs_for_indices(selected_indices: list[int]) -> tuple[bool, Optional[dict[str, Any]]]:
             if not selected_indices:
@@ -2758,6 +2906,35 @@ def launch_filter_interface(
 
         instrument_var = tk.StringVar(master=root, value="All")
         instrument_combo: Optional[ttk.Combobox] = None
+        sds_mode_check: ttk.Checkbutton | None = None
+
+        def _instrument_selection_is_seestar() -> bool:
+            chosen = str(instrument_var.get() or "").strip().lower()
+            if not chosen or chosen == "all" or chosen == "unknown":
+                return False
+            return any(token in chosen for token in seestar_tokens)
+
+        def _should_enable_sds_checkbox() -> bool:
+            # Leave the final choice to the user regardless of instrument detection.
+            return True
+
+        def _update_sds_checkbox_state() -> None:
+            if sds_mode_check is None:
+                return
+            if _should_enable_sds_checkbox():
+                try:
+                    sds_mode_check.state(["!disabled"])
+                except Exception:
+                    pass
+            else:
+                try:
+                    sds_mode_check.state(["disabled"])
+                except Exception:
+                    pass
+                try:
+                    sds_mode_var.set(False)
+                except Exception:
+                    pass
 
         def _apply_instrument_filter(*_: object) -> None:
             chosen = instrument_var.get()
@@ -2772,6 +2949,7 @@ def launch_filter_interface(
                 canvas.draw_idle()
             except Exception:
                 pass
+            _update_sds_checkbox_state()
 
         # Threshold controls
         thresh_frame = ttk.LabelFrame(
@@ -4256,6 +4434,21 @@ def launch_filter_interface(
         angle_split_initial = orientation_effective_state["value"] if orientation_effective_state["value"] > 0 else ANGLE_SPLIT_DEFAULT_DEG
         auto_angle_split_var = tk.BooleanVar(master=root, value=True)
         angle_split_deg_var = tk.DoubleVar(master=root, value=float(angle_split_initial))
+        sds_mode_var = tk.BooleanVar(
+            master=root,
+            value=bool(cfg_defaults.get("sds_mode_default", True)),
+        )
+        if isinstance(overrides_state, dict):
+            sds_override_value = overrides_state.get("sds_mode")
+            if sds_override_value is None:
+                g_override = overrides_state.get("global_wcs_plan_override")
+                if isinstance(g_override, dict) and "sds_mode" in g_override:
+                    sds_override_value = g_override.get("sds_mode")
+            if sds_override_value is not None:
+                try:
+                    sds_mode_var.set(bool(sds_override_value))
+                except Exception:
+                    pass
 
         def _current_angle_split_candidate() -> float:
             if angle_split_deg_var is None:
@@ -4277,6 +4470,10 @@ def launch_filter_interface(
                 _update_orientation_effective(_current_angle_split_candidate())
             else:
                 _update_orientation_effective(orientation_effective_state.get("value", 0.0))
+
+        def _sync_sds_override() -> None:
+            if isinstance(overrides_state, dict):
+                overrides_state["sds_mode"] = bool(sds_mode_var.get())
 
         try:
             auto_angle_split_var.trace_add("write", lambda *_: _on_auto_angle_toggle())
@@ -4521,6 +4718,29 @@ def launch_filter_interface(
             angle_spin.grid(row=6, column=1, padx=4, pady=(2, 0), sticky="w")
         except Exception as e:
             _log_message(f"[FilterUI] Angle split spinbox failed: {e}", level="WARN")
+
+        seestar_like_instrument = bool(
+            instrument_lower and any(token in instrument_lower for token in seestar_tokens)
+        )
+        show_sds_toggle = True
+        try:
+            sds_mode_check = ttk.Checkbutton(
+                operations,
+                text=_tr(
+                    "filter_chk_sds_mode",
+                    "ZeSupaDupStack: mosaic batches then final stack",
+                ),
+                variable=sds_mode_var,
+            )
+            sds_mode_check.grid(row=7, column=0, columnspan=3, padx=4, pady=(6, 0), sticky="w")
+            if not show_sds_toggle:
+                try:
+                    sds_mode_check.state(["disabled"])
+                except Exception:
+                    pass
+        except Exception as e:
+            _log_message(f"[FilterUI] ZeSupaDupStack checkbox failed: {e}", level="WARN")
+        _update_sds_checkbox_state()
 
         try:
             footprints_chk = ttk.Checkbutton(
@@ -5342,6 +5562,34 @@ def launch_filter_interface(
 
             def _worker(selected_snapshot: list[int], overcap_pct: int, coverage_enabled: bool) -> None:
                 try:
+                    if bool(sds_mode_var.get()):
+                        success, _meta = _ensure_global_wcs_for_indices(selected_snapshot)
+                        if success:
+                            sds_groups = _build_sds_batches_for_indices(selected_snapshot)
+                            if sds_groups:
+                                _log_async(
+                                    f"ZeSupaDupStack: prepared {len(sds_groups)} coverage batch(es) for preview.",
+                                    "INFO",
+                                )
+                                result_payload = {
+                                    "final_groups": sds_groups,
+                                    "sizes": [len(gr) for gr in sds_groups],
+                                    "coverage_first": True,
+                                    "threshold_used": 0.0,
+                                }
+                                root.after(0, lambda res=result_payload: _apply_result(res))
+                                return
+                            else:
+                                _log_async(
+                                    "ZeSupaDupStack auto-group fallback: coverage batches could not be built.",
+                                    "WARN",
+                                )
+                        else:
+                            _log_async(
+                                "ZeSupaDupStack auto-group fallback: global WCS descriptor unavailable.",
+                                "WARN",
+                            )
+
                     class _FallbackWCS:
                         is_celestial = True
 
@@ -5798,6 +6046,7 @@ def launch_filter_interface(
             "selected_indices": None,
             "overrides": None,
             "cancelled": False,
+            "sds_mode": bool(sds_mode_var.get()),
         }
 
         def _ensure_orientation_override_synced() -> None:
@@ -5809,6 +6058,7 @@ def launch_filter_interface(
 
         def _cancel_overrides_payload() -> dict[str, Any]:
             _ensure_orientation_override_synced()
+            _sync_sds_override()
             payload: dict[str, Any] = {}
             if isinstance(overrides_state, dict) and overrides_state:
                 payload.update(overrides_state)
@@ -5825,6 +6075,8 @@ def launch_filter_interface(
             result["selected_indices"] = sel
             # ensure orientation override exported
             _ensure_orientation_override_synced()
+            _sync_sds_override()
+            result["sds_mode"] = bool(sds_mode_var.get())
             if workflow_mode_config == "seestar":
                 success, meta_payload = _ensure_global_wcs_for_indices(sel)
                 if success and meta_payload:
@@ -5833,11 +6085,24 @@ def launch_filter_interface(
                     overrides_state["global_wcs_json"] = meta_payload.get("json_path")
                     overrides_state["mode"] = "seestar"
                     global_wcs_state["mode"] = "seestar"
+                    if bool(sds_mode_var.get()):
+                        global_override = overrides_state.get("global_wcs_plan_override")
+                        if not isinstance(global_override, dict):
+                            global_override = {}
+                        global_override["sds_mode"] = True
+                        global_override["enabled"] = True
+                        overrides_state["global_wcs_plan_override"] = global_override
+                    elif isinstance(overrides_state.get("global_wcs_plan_override"), dict):
+                        overrides_state["global_wcs_plan_override"].pop("sds_mode", None)
                 else:
                     overrides_state["mode"] = "classic"
                     global_wcs_state["mode"] = "classic"
+                    if isinstance(overrides_state.get("global_wcs_plan_override"), dict):
+                        overrides_state["global_wcs_plan_override"].pop("sds_mode", None)
             else:
                 overrides_state["mode"] = "classic"
+                if isinstance(overrides_state.get("global_wcs_plan_override"), dict):
+                    overrides_state["global_wcs_plan_override"].pop("sds_mode", None)
             result["overrides"] = overrides_state if overrides_state else None
             result["cancelled"] = False
             # If running as a Toplevel, do not quit the main GUI loop
@@ -5862,6 +6127,7 @@ def launch_filter_interface(
             result["selected_indices"] = None
             result["cancelled"] = True
             result["overrides"] = _cancel_overrides_payload()
+            result["sds_mode"] = bool(sds_mode_var.get())
             if root_is_toplevel:
                 try:
                     root.destroy()

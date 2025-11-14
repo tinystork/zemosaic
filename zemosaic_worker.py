@@ -427,6 +427,253 @@ def _apply_lecropper_pipeline(
     return out, alpha_mask_norm
 
 
+def _apply_final_mosaic_quality_pipeline(
+    final_mosaic_data: np.ndarray | None,
+    final_mosaic_coverage: np.ndarray | None,
+    final_alpha_map: np.ndarray | None,
+    pipeline_cfg: dict[str, Any] | None,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """Apply the lecropper-based quality pipeline to the final mosaic."""
+
+    if (
+        final_mosaic_data is None
+        or not pipeline_cfg
+        or not (
+            pipeline_cfg.get("quality_crop_enabled")
+            or pipeline_cfg.get("altaz_cleanup_enabled")
+        )
+    ):
+        return final_mosaic_data, final_mosaic_coverage, final_alpha_map
+
+    processed, pipeline_alpha_mask = _apply_lecropper_pipeline(final_mosaic_data, pipeline_cfg)
+    if processed is not None:
+        final_mosaic_data = processed
+    if pipeline_alpha_mask is not None and final_mosaic_data is not None:
+        pipeline_alpha_u8 = _normalize_alpha_mask(
+            pipeline_alpha_mask,
+            target_hw=final_mosaic_data.shape[:2],
+            opacity_threshold=ALPHA_OPACITY_THRESHOLD,
+        )
+        if pipeline_alpha_u8 is not None:
+            final_alpha_map = _combine_alpha_masks(final_alpha_map, pipeline_alpha_u8)
+            if final_mosaic_coverage is not None:
+                keep_mask = (pipeline_alpha_u8 > 0).astype(np.float32, copy=False)
+                final_mosaic_coverage = np.where(
+                    keep_mask > 0, final_mosaic_coverage, 0.0
+                ).astype(np.float32, copy=False)
+    return final_mosaic_data, final_mosaic_coverage, final_alpha_map
+
+
+def _apply_master_tile_crop_mask_to_mosaic(
+    final_mosaic_data: np.ndarray | None,
+    final_mosaic_coverage: np.ndarray | None,
+    final_alpha_map: np.ndarray | None,
+    *,
+    crop_percent: float,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """Apply a border mask equivalent to the master-tile crop percentage."""
+
+    if final_mosaic_data is None:
+        return final_mosaic_data, final_mosaic_coverage, final_alpha_map
+    try:
+        percent = float(crop_percent or 0.0)
+    except Exception:
+        percent = 0.0
+    if percent <= 0.0:
+        return final_mosaic_data, final_mosaic_coverage, final_alpha_map
+
+    h, w = final_mosaic_data.shape[:2]
+    if h <= 2 or w <= 2:
+        return final_mosaic_data, final_mosaic_coverage, final_alpha_map
+    margin_y = max(1, int(round(h * (percent / 100.0))))
+    margin_x = max(1, int(round(w * (percent / 100.0))))
+    margin_y = min(margin_y, h // 2)
+    margin_x = min(margin_x, w // 2)
+    mask = np.ones((h, w), dtype=np.float32)
+    mask[:margin_y, :] = 0.0
+    mask[h - margin_y :, :] = 0.0
+    mask[:, :margin_x] = 0.0
+    mask[:, w - margin_x :] = 0.0
+
+    if final_mosaic_data.ndim == 3:
+        final_mosaic_data = np.where(mask[..., None] > 0, final_mosaic_data, np.nan)
+    else:
+        final_mosaic_data = np.where(mask > 0, final_mosaic_data, np.nan)
+    if final_mosaic_coverage is not None:
+        final_mosaic_coverage = np.where(mask > 0, final_mosaic_coverage, 0.0).astype(
+            np.float32, copy=False
+        )
+    if final_alpha_map is not None:
+        final_alpha_map = np.where(mask > 0, final_alpha_map, 0).astype(
+            np.uint8, copy=False
+        )
+    return final_mosaic_data, final_mosaic_coverage, final_alpha_map
+
+
+def _prepare_tiles_for_two_pass(
+    collected_tiles: list[tuple[np.ndarray, Any]] | None,
+    fallback_loader: Callable[[], tuple[list[np.ndarray], list[Any]]] | None,
+) -> tuple[list[np.ndarray], list[Any]]:
+    """Build the list of tiles and WCS objects used during the second pass."""
+
+    tiles: list[np.ndarray] = []
+    wcs_list: list[Any] = []
+    if collected_tiles:
+        for arr, twcs in collected_tiles:
+            if arr is None or twcs is None:
+                continue
+            tiles.append(np.asarray(arr, dtype=np.float32))
+            wcs_list.append(twcs)
+    elif fallback_loader is not None:
+        try:
+            tiles, wcs_list = fallback_loader()
+        except Exception:
+            tiles, wcs_list = [], []
+    return tiles, wcs_list
+
+
+def _apply_two_pass_coverage_renorm_if_requested(
+    final_mosaic_data: np.ndarray | None,
+    final_mosaic_coverage: np.ndarray | None,
+    *,
+    two_pass_enabled: bool,
+    two_pass_sigma_px: int,
+    gain_clip_tuple: tuple[float, float],
+    final_output_wcs: Any,
+    final_output_shape_hw: tuple[int, int] | None,
+    use_gpu_two_pass: bool,
+    logger: logging.Logger | None,
+    collected_tiles: list[tuple[np.ndarray, Any]] | None = None,
+    fallback_tile_loader: Callable[[], tuple[list[np.ndarray], list[Any]]] | None = None,
+) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Run the coverage renormalization second pass if configured."""
+
+    if (
+        not two_pass_enabled
+        or final_mosaic_data is None
+        or final_mosaic_coverage is None
+        or final_output_wcs is None
+        or not final_output_shape_hw
+    ):
+        return final_mosaic_data, final_mosaic_coverage
+
+    if logger:
+        logger.info(
+            "[TwoPass] Second pass requested (sigma=%s, clip=%s); coverage shape=%s",
+            two_pass_sigma_px,
+            two_pass_gain_clip,
+            getattr(final_mosaic_coverage, "shape", None),
+        )
+
+    tiles_for_second_pass, wcs_for_second_pass = _prepare_tiles_for_two_pass(
+        collected_tiles,
+        fallback_tile_loader,
+    )
+    if logger:
+        logger.debug(
+            "[TwoPass] Prepared %d tiles for second pass (collected=%s, fallback=%s)",
+            len(tiles_for_second_pass),
+            bool(collected_tiles),
+            fallback_tile_loader is not None,
+        )
+    if not tiles_for_second_pass or not wcs_for_second_pass:
+        if logger:
+            logger.warning(
+                "[TwoPass] No tiles available for coverage renorm; keeping first-pass outputs"
+            )
+        return final_mosaic_data, final_mosaic_coverage
+
+    try:
+        result = run_second_pass_coverage_renorm(
+            tiles_for_second_pass,
+            wcs_for_second_pass,
+            final_output_wcs,
+            final_mosaic_coverage,
+            final_output_shape_hw,
+            sigma_px=two_pass_sigma_px,
+            gain_clip=gain_clip_tuple,
+            logger=logger,
+            use_gpu_two_pass=use_gpu_two_pass,
+        )
+        if result is not None:
+            final_mosaic_data, final_mosaic_coverage = result
+            if logger:
+                logger.info(
+                    "[TwoPass] coverage-renorm OK (σ=%s, clip=[%.3f, %.3f])",
+                    two_pass_sigma_px,
+                    gain_clip_tuple[0],
+                    gain_clip_tuple[1],
+                )
+        else:
+            if logger:
+                logger.warning("[TwoPass] renorm failed → keeping first-pass outputs")
+    except Exception:
+        if logger:
+            logger.exception("[TwoPass] renorm exception → keeping first-pass outputs")
+    return final_mosaic_data, final_mosaic_coverage
+
+
+def _apply_phase5_post_stack_pipeline(
+    final_mosaic_data: np.ndarray | None,
+    final_mosaic_coverage: np.ndarray | None,
+    final_alpha_map: np.ndarray | None,
+    *,
+    enable_lecropper_pipeline: bool,
+    pipeline_cfg: dict[str, Any] | None,
+    enable_master_tile_crop: bool,
+    master_tile_crop_percent: float,
+    two_pass_enabled: bool,
+    two_pass_sigma_px: int,
+    two_pass_gain_clip: tuple[float, float],
+    final_output_wcs: Any,
+    final_output_shape_hw: tuple[int, int] | None,
+    use_gpu_two_pass: bool,
+    logger: logging.Logger | None,
+    collected_tiles: list[tuple[np.ndarray, Any]] | None = None,
+    fallback_two_pass_loader: Callable[[], tuple[list[np.ndarray], list[Any]]] | None = None,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """Run the reusable Phase 5 post-stack operations."""
+
+    if enable_lecropper_pipeline:
+        (
+            final_mosaic_data,
+            final_mosaic_coverage,
+            final_alpha_map,
+        ) = _apply_final_mosaic_quality_pipeline(
+            final_mosaic_data,
+            final_mosaic_coverage,
+            final_alpha_map,
+            pipeline_cfg,
+        )
+
+    if enable_master_tile_crop:
+        (
+            final_mosaic_data,
+            final_mosaic_coverage,
+            final_alpha_map,
+        ) = _apply_master_tile_crop_mask_to_mosaic(
+            final_mosaic_data,
+            final_mosaic_coverage,
+            final_alpha_map,
+            crop_percent=master_tile_crop_percent,
+        )
+
+    final_mosaic_data, final_mosaic_coverage = _apply_two_pass_coverage_renorm_if_requested(
+        final_mosaic_data,
+        final_mosaic_coverage,
+        two_pass_enabled=two_pass_enabled,
+        two_pass_sigma_px=two_pass_sigma_px,
+        gain_clip_tuple=two_pass_gain_clip,
+        final_output_wcs=final_output_wcs,
+        final_output_shape_hw=final_output_shape_hw,
+        use_gpu_two_pass=use_gpu_two_pass,
+        logger=logger,
+        collected_tiles=collected_tiles,
+        fallback_tile_loader=fallback_two_pass_loader,
+    )
+    return final_mosaic_data, final_mosaic_coverage, final_alpha_map
+
+
 _MASTER_TILE_ID_LOCK = Lock()
 _MASTER_TILE_ID_REGISTRY: dict[str, str] = {}
 
@@ -805,6 +1052,183 @@ def _prepare_global_wcs_plan(
         break
 
     return plan
+
+
+def _gather_wcs_items_from_groups(seestar_groups: list[list[dict]] | None) -> list[dict[str, Any]]:
+    """Collect unique entries with usable WCS information from grouped raws."""
+
+    if not seestar_groups:
+        return []
+    entries: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+
+    def _coerce_shape(entry: dict) -> tuple[int, int] | None:
+        shape_candidate = entry.get("shape") or entry.get("phase0_shape") or entry.get("phase1_shape")
+        if isinstance(shape_candidate, (list, tuple)) and len(shape_candidate) >= 2:
+            try:
+                h = int(shape_candidate[0])
+                w = int(shape_candidate[1])
+                if h > 0 and w > 0:
+                    return h, w
+            except Exception:
+                return None
+        height_key = entry.get("height") or entry.get("img_height")
+        width_key = entry.get("width") or entry.get("img_width")
+        if height_key and width_key:
+            try:
+                h = int(height_key)
+                w = int(width_key)
+                if h > 0 and w > 0:
+                    return h, w
+            except Exception:
+                return None
+        return None
+
+    for group in seestar_groups or []:
+        if not isinstance(group, (list, tuple)):
+            continue
+        for entry in group:
+            if not isinstance(entry, dict):
+                continue
+            path_val = entry.get("path_raw") or entry.get("path")
+            norm_path = None
+            if path_val:
+                try:
+                    norm_path = os.path.normcase(os.path.abspath(str(path_val)))
+                except Exception:
+                    try:
+                        norm_path = os.path.normcase(str(path_val))
+                    except Exception:
+                        norm_path = None
+            if norm_path and norm_path in seen_paths:
+                continue
+            wcs_obj = (
+                entry.get("wcs")
+                or entry.get("phase1_wcs")
+                or entry.get("phase0_wcs")
+            )
+            if wcs_obj is None:
+                header = entry.get("header") or entry.get("phase0_header")
+                if header is not None and ASTROPY_AVAILABLE and WCS:
+                    try:
+                        wcs_obj = WCS(header)
+                    except Exception:
+                        wcs_obj = None
+            if wcs_obj is None or not getattr(wcs_obj, "is_celestial", False):
+                continue
+            shape_hw = _coerce_shape(entry)
+            if shape_hw is None:
+                continue
+            entries.append(
+                {
+                    "wcs": wcs_obj,
+                    "shape": shape_hw,
+                    "path": path_val,
+                }
+            )
+            if norm_path:
+                seen_paths.add(norm_path)
+    return entries
+
+
+def _runtime_build_global_wcs_plan(
+    *,
+    seestar_groups: list[list[dict]] | None,
+    global_plan: dict[str, Any],
+    worker_config: dict | None,
+    output_dir: str | None,
+    pcb: callable | None = None,
+) -> bool:
+    """Attempt to compute a global WCS descriptor on the fly when none is available."""
+
+    if global_plan.get("enabled"):
+        return True
+    if not seestar_groups:
+        return False
+    if not (
+        ZEMOSAIC_UTILS_AVAILABLE
+        and zemosaic_utils
+        and hasattr(zemosaic_utils, "compute_global_wcs_descriptor")
+        and hasattr(zemosaic_utils, "write_global_wcs_files")
+        and hasattr(zemosaic_utils, "resolve_global_wcs_output_paths")
+    ):
+        return False
+    output_dir = output_dir or ""
+    if not output_dir:
+        if pcb:
+            pcb("sds_warn_runtime_wcs_no_output_dir", prog=None, lvl="WARN")
+        return False
+    entries = _gather_wcs_items_from_groups(seestar_groups)
+    if not entries:
+        if pcb:
+            pcb("sds_warn_runtime_wcs_failed", prog=None, lvl="WARN", error="no usable WCS entries")
+        return False
+    pixel_scale_mode = str(
+        (worker_config or {}).get("global_wcs_pixelscale_mode", "median") or "median"
+    )
+    orientation_mode = str(
+        (worker_config or {}).get("global_wcs_orientation", "north_up") or "north_up"
+    )
+    try:
+        padding_percent = float((worker_config or {}).get("global_wcs_padding_percent", 2.0) or 0.0)
+    except Exception:
+        padding_percent = 2.0
+    res_override_raw = (worker_config or {}).get("global_wcs_res_override")
+    resolution_override = None
+    parse_res = getattr(zemosaic_utils, "parse_global_wcs_resolution_override", None)
+    if callable(parse_res):
+        try:
+            resolution_override = parse_res(res_override_raw)
+        except Exception:
+            resolution_override = None
+    try:
+        descriptor = zemosaic_utils.compute_global_wcs_descriptor(
+            entries,
+            pixel_scale_mode=pixel_scale_mode,
+            orientation_mode=orientation_mode,
+            padding_percent=padding_percent,
+            resolution_override=resolution_override,
+            logger_override=logger,
+        )
+    except Exception as exc:
+        if pcb:
+            pcb("sds_warn_runtime_wcs_failed", prog=None, lvl="WARN", error=str(exc))
+        return False
+    try:
+        fits_path, json_path = zemosaic_utils.resolve_global_wcs_output_paths(
+            output_dir, (worker_config or {}).get("global_wcs_output_path", "global_mosaic_wcs.fits")
+        )
+    except Exception:
+        fits_path = os.path.join(output_dir, "global_mosaic_wcs.fits")
+        json_path = f"{fits_path}.json"
+    try:
+        zemosaic_utils.write_global_wcs_files(descriptor, fits_path, json_path, logger_override=logger)
+    except Exception as exc:
+        if pcb:
+            pcb("sds_warn_runtime_wcs_failed", prog=None, lvl="WARN", error=str(exc))
+        return False
+    descriptor_loaded = _load_global_wcs_descriptor_safe(fits_path, json_path) or descriptor
+    global_plan.update(
+        {
+            "enabled": True,
+            "fits_path": fits_path,
+            "json_path": json_path,
+            "descriptor": descriptor_loaded,
+            "wcs": descriptor_loaded.get("wcs"),
+            "width": descriptor_loaded.get("width"),
+            "height": descriptor_loaded.get("height"),
+            "meta": _coerce_to_builtin(descriptor_loaded.get("metadata") or {}),
+            "mode": "seestar",
+        }
+    )
+    if pcb:
+        pcb(
+            "sds_info_runtime_wcs_built",
+            prog=None,
+            lvl="INFO_DETAIL",
+            entries=len(entries),
+        )
+    return True
 
 
 def _zequality_accept_override(metrics: dict[str, float], threshold: float) -> bool:
@@ -9914,6 +10338,21 @@ def run_hierarchical_mosaic(
         filter_overrides,
     )
 
+    config_sds_default = worker_config_cache.get("sds_mode_default")
+    if config_sds_default is None:
+        sds_mode_flag = True
+    else:
+        sds_mode_flag = bool(config_sds_default)
+    if isinstance(filter_overrides, dict):
+        if filter_overrides.get("sds_mode"):
+            sds_mode_flag = True
+        plan_override = filter_overrides.get("global_wcs_plan_override")
+        if isinstance(plan_override, dict) and plan_override.get("sds_mode"):
+            sds_mode_flag = True
+    if not global_wcs_plan.get("enabled"):
+        sds_mode_flag = False
+    global_wcs_plan["sds_mode"] = bool(sds_mode_flag)
+
     if global_wcs_plan.get("enabled"):
         logger.info(
             "[Worker] Global WCS descriptor ready (%s)",
@@ -11299,6 +11738,21 @@ def run_hierarchical_mosaic(
             prog=None,
             lvl="INFO_DETAIL",
         )
+    sds_stack_params = {
+        "stack_reject_algo": stack_reject_algo,
+        "stack_weight_method": stack_weight_method,
+        "stack_norm_method": stack_norm_method,
+        "stack_kappa_low": stack_kappa_low,
+        "stack_kappa_high": stack_kappa_high,
+        "stack_final_combine": stack_final_combine,
+        "parsed_winsor_limits": parsed_winsor_limits,
+        "winsor_worker_limit": winsor_worker_limit,
+        "winsor_max_frames_per_pass": winsor_max_frames_per_pass,
+        "apply_radial_weight": apply_radial_weight_config,
+        "radial_feather_fraction": radial_feather_fraction_config,
+        "radial_shape_power": radial_shape_power_config,
+        "poststack_equalize_rgb": poststack_equalize_rgb_config,
+    }
     manual_limit = max_raw_per_master_tile_config
     if (
         not preplan_groups_active
@@ -11428,27 +11882,94 @@ def run_hierarchical_mosaic(
     final_mosaic_coverage_HW = None
     final_alpha_map = None
     master_tiles_results_list: list[tuple[str, Any]] = []
+    final_quality_pipeline_cfg = {
+        "quality_crop_enabled": bool(quality_crop_enabled_config),
+        "quality_crop_band_px": int(quality_crop_band_px_config),
+        "quality_crop_k_sigma": float(quality_crop_k_sigma_config),
+        "quality_crop_margin_px": int(quality_crop_margin_px_config),
+        "quality_crop_min_run": int(quality_crop_min_run_config),
+        "altaz_cleanup_enabled": bool(altaz_cleanup_enabled_config),
+        "altaz_margin_percent": float(altaz_margin_percent_config),
+        "altaz_decay": float(altaz_decay_config),
+        "altaz_nanize": bool(altaz_nanize_config),
+    }
+
+    sds_post_context: dict[str, Any] = {}
+    if sds_mode_flag and not global_wcs_plan.get("enabled"):
+        _runtime_build_global_wcs_plan(
+            seestar_groups=seestar_stack_groups,
+            global_plan=global_wcs_plan,
+            worker_config=worker_config_cache,
+            output_dir=output_folder,
+            pcb=pcb,
+        )
 
     if global_wcs_plan.get("enabled"):
-        mosaic_result = assemble_global_mosaic_first(
-            seestar_stack_groups,
-            global_plan=global_wcs_plan,
-            progress_callback=progress_callback,
-            match_background=match_background_flag,
-            base_progress_phase=base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING,
-            progress_weight_phase=(
-                PROGRESS_WEIGHT_PHASE3_MASTER_TILES
-                + PROGRESS_WEIGHT_PHASE4_GRID_CALC
-                + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
-                + PROGRESS_WEIGHT_PHASE5_ASSEMBLY
-            ),
-            start_time_total_run=start_time_total_run,
-            cache_root=output_folder,
-        )
+        mosaic_result = (None, None, None)
+        if sds_mode_flag:
+            mosaic_result = assemble_global_mosaic_sds(
+                seestar_stack_groups,
+                global_plan=global_wcs_plan,
+                progress_callback=progress_callback,
+                match_background=match_background_flag,
+                base_progress_phase=base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING,
+                progress_weight_phase=(
+                    PROGRESS_WEIGHT_PHASE3_MASTER_TILES
+                    + PROGRESS_WEIGHT_PHASE4_GRID_CALC
+                    + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
+                    + PROGRESS_WEIGHT_PHASE5_ASSEMBLY
+                ),
+                start_time_total_run=start_time_total_run,
+                cache_root=output_folder,
+                stack_params=sds_stack_params,
+                coverage_threshold=0.92,
+                postprocess_context=sds_post_context,
+            )
+        if mosaic_result[0] is None:
+            mosaic_result = assemble_global_mosaic_first(
+                seestar_stack_groups,
+                global_plan=global_wcs_plan,
+                progress_callback=progress_callback,
+                match_background=match_background_flag,
+                base_progress_phase=base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING,
+                progress_weight_phase=(
+                    PROGRESS_WEIGHT_PHASE3_MASTER_TILES
+                    + PROGRESS_WEIGHT_PHASE4_GRID_CALC
+                    + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
+                    + PROGRESS_WEIGHT_PHASE5_ASSEMBLY
+                ),
+                start_time_total_run=start_time_total_run,
+                cache_root=output_folder,
+            )
         final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = mosaic_result
         if final_mosaic_data_HWC is not None:
             final_output_wcs = global_wcs_plan.get("wcs")
             final_output_shape_hw = (final_mosaic_data_HWC.shape[0], final_mosaic_data_HWC.shape[1])
+            sds_tile_pairs = sds_post_context.get("two_pass_tile_pairs")
+            final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = _apply_phase5_post_stack_pipeline(
+                final_mosaic_data_HWC,
+                final_mosaic_coverage_HW,
+                final_alpha_map,
+                enable_lecropper_pipeline=bool(
+                    final_quality_pipeline_cfg.get("quality_crop_enabled")
+                    or final_quality_pipeline_cfg.get("altaz_cleanup_enabled")
+                ),
+                pipeline_cfg=final_quality_pipeline_cfg,
+                enable_master_tile_crop=bool(apply_master_tile_crop_config and not quality_crop_enabled_config),
+                master_tile_crop_percent=float(master_tile_crop_percent_config),
+                two_pass_enabled=bool(two_pass_enabled),
+                two_pass_sigma_px=int(two_pass_sigma_px),
+                two_pass_gain_clip=gain_clip_tuple,
+                final_output_wcs=final_output_wcs,
+                final_output_shape_hw=final_output_shape_hw,
+                use_gpu_two_pass=use_gpu_phase5_flag,
+                logger=logger,
+                collected_tiles=sds_tile_pairs,
+                fallback_two_pass_loader=None,
+            )
+            if isinstance(sds_tile_pairs, list):
+                sds_tile_pairs.clear()
+                sds_post_context.pop("two_pass_tile_pairs", None)
             current_global_progress = min(
                 100.0,
                 base_progress_phase2
@@ -12518,68 +13039,37 @@ def run_hierarchical_mosaic(
 
             current_global_progress = base_progress_phase5 + PROGRESS_WEIGHT_PHASE5_ASSEMBLY
 
-            if two_pass_enabled and final_mosaic_coverage_HW is not None:
-                if logger:
-                    logger.info(
-                        "[TwoPass] Second pass requested (sigma=%s, clip=%s); coverage shape=%s",
-                        two_pass_sigma_px,
-                        gain_clip_tuple,
-                        getattr(final_mosaic_coverage_HW, "shape", None),
+            fallback_two_pass_loader = None
+            if USE_INCREMENTAL_ASSEMBLY:
+                def _load_tiles_for_two_pass_phase5():
+                    return _load_master_tiles_for_two_pass(
+                        valid_master_tiles_for_assembly,
+                        apply_crop=apply_crop_for_assembly,
+                        crop_percent=master_tile_crop_percent_config,
+                        logger=logger,
                     )
-                try:
-                    tiles_for_second_pass: list[np.ndarray] = []
-                    wcs_for_second_pass: list[Any] = []
-                    if collected_tiles_for_second_pass:
-                        for arr, twcs in collected_tiles_for_second_pass:
-                            if arr is None or twcs is None:
-                                continue
-                            tiles_for_second_pass.append(np.asarray(arr, dtype=np.float32))
-                            wcs_for_second_pass.append(twcs)
-                    elif USE_INCREMENTAL_ASSEMBLY:
-                        tiles_for_second_pass, wcs_for_second_pass = _load_master_tiles_for_two_pass(
-                            valid_master_tiles_for_assembly,
-                            apply_crop=apply_crop_for_assembly,
-                            crop_percent=master_tile_crop_percent_config,
-                            logger=logger,
-                        )
-                    if logger:
-                        logger.debug(
-                            "[TwoPass] Prepared %d tiles for second pass (collected=%s, incremental=%s)",
-                            len(tiles_for_second_pass),
-                            bool(collected_tiles_for_second_pass),
-                            USE_INCREMENTAL_ASSEMBLY,
-                        )
-                    if tiles_for_second_pass and wcs_for_second_pass:
-                        result = run_second_pass_coverage_renorm(
-                            tiles_for_second_pass,
-                            wcs_for_second_pass,
-                            final_output_wcs,
-                            final_mosaic_coverage_HW,
-                            final_output_shape_hw,
-                            sigma_px=two_pass_sigma_px,
-                            gain_clip=gain_clip_tuple,
-                            logger=logger,
-                            use_gpu_two_pass=use_gpu_phase5_flag,
-                        )
-                        if result is not None:
-                            final_mosaic_data_HWC, final_mosaic_coverage_HW = result
-                            logger.info(
-                                "[TwoPass] coverage-renorm OK (σ=%s, clip=[%.3f, %.3f])",
-                                two_pass_sigma_px,
-                                gain_clip_tuple[0],
-                                gain_clip_tuple[1],
-                            )
-                        else:
-                            logger.warning("[TwoPass] renorm failed → keeping first-pass outputs")
-                    else:
-                        logger.warning("[TwoPass] No tiles available for coverage renorm; keeping first-pass outputs")
-                except Exception:
-                    logger.exception("[TwoPass] renorm exception → keeping first-pass outputs")
-                finally:
-                    if collected_tiles_for_second_pass is not None:
-                        collected_tiles_for_second_pass.clear()
-                    tiles_for_second_pass = []
-                    wcs_for_second_pass = []
+
+                fallback_two_pass_loader = _load_tiles_for_two_pass_phase5
+            final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = _apply_phase5_post_stack_pipeline(
+                final_mosaic_data_HWC,
+                final_mosaic_coverage_HW,
+                final_alpha_map,
+                enable_lecropper_pipeline=False,
+                pipeline_cfg=final_quality_pipeline_cfg,
+                enable_master_tile_crop=False,
+                master_tile_crop_percent=float(master_tile_crop_percent_config),
+                two_pass_enabled=bool(two_pass_enabled),
+                two_pass_sigma_px=int(two_pass_sigma_px),
+                two_pass_gain_clip=gain_clip_tuple,
+                final_output_wcs=final_output_wcs,
+                final_output_shape_hw=final_output_shape_hw,
+                use_gpu_two_pass=use_gpu_phase5_flag,
+                logger=logger,
+                collected_tiles=collected_tiles_for_second_pass,
+                fallback_two_pass_loader=fallback_two_pass_loader,
+            )
+            if collected_tiles_for_second_pass is not None:
+                collected_tiles_for_second_pass.clear()
 
             _log_memory_usage(progress_callback, "Fin Phase 5 (Assemblage)")
             pcb(
@@ -14014,6 +14504,353 @@ def _assemble_global_mosaic_first_impl(
     finally:
         _cleanup_temp()
 
+
+def assemble_global_mosaic_sds(
+    seastar_groups: list[list[dict]],
+    *,
+    global_plan: dict[str, Any],
+    progress_callback: callable,
+    match_background: bool,
+    base_progress_phase: float | None,
+    progress_weight_phase: float | None,
+    start_time_total_run: float | None,
+    cache_root: str | None,
+    stack_params: dict[str, Any] | None = None,
+    coverage_threshold: float = 0.92,
+    postprocess_context: dict[str, Any] | None = None,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """Batch Mosaic-First workflow that stacks per-batch mosaics in the global WCS."""
+
+    if not global_plan or not global_plan.get("enabled"):
+        return None, None, None
+    if not (ASTROPY_AVAILABLE and WCS):
+        return None, None, None
+
+    try:
+        width = int(global_plan.get("width") or 0)
+        height = int(global_plan.get("height") or 0)
+    except Exception:
+        width = height = 0
+    if width <= 0 or height <= 0:
+        return None, None, None
+
+    plan_wcs = global_plan.get("wcs")
+    try:
+        global_wcs_obj = plan_wcs if isinstance(plan_wcs, WCS) else WCS(plan_wcs)
+    except Exception:
+        global_wcs_obj = None
+    if global_wcs_obj is None:
+        return None, None, None
+
+    pcb = lambda key, prog=None, lvl="INFO", **kwargs: _log_and_callback(
+        key,
+        prog,
+        lvl,
+        callback=progress_callback,
+        **kwargs,
+    )
+
+    def _coerce_wcs(candidate):
+        if candidate is None:
+            return None
+        if isinstance(candidate, WCS):
+            return candidate
+        try:
+            return WCS(candidate)
+        except Exception:
+            try:
+                header = candidate.to_header() if hasattr(candidate, "to_header") else candidate
+                return WCS(header)
+            except Exception:
+                return None
+
+    def _extract_shape(entry: dict) -> tuple[int, int] | None:
+        shape_candidate = entry.get("shape") or entry.get("phase0_shape") or entry.get("phase1_shape")
+        if isinstance(shape_candidate, (list, tuple)) and len(shape_candidate) >= 2:
+            try:
+                h = int(shape_candidate[0])
+                w = int(shape_candidate[1])
+                if h > 0 and w > 0:
+                    return h, w
+            except Exception:
+                pass
+        height_key = entry.get("height") or entry.get("img_height")
+        width_key = entry.get("width") or entry.get("img_width")
+        if height_key and width_key:
+            try:
+                h = int(height_key)
+                w = int(width_key)
+                if h > 0 and w > 0:
+                    return h, w
+            except Exception:
+                return None
+        return None
+
+    entry_infos: list[dict[str, Any]] = []
+    wcs_keys = ("wcs", "phase0_wcs", "phase1_wcs", "header", "phase0_header")
+    for group in seastar_groups or []:
+        if not isinstance(group, (list, tuple)):
+            continue
+        for entry in group:
+            if not isinstance(entry, dict) or not _entry_is_seestar(entry):
+                continue
+            local_wcs = None
+            for key in wcs_keys:
+                local_wcs = _coerce_wcs(entry.get(key))
+                if local_wcs:
+                    break
+            if local_wcs is None:
+                continue
+            shape_hw = _extract_shape(entry)
+            if shape_hw is None:
+                continue
+            h_local, w_local = shape_hw
+            if h_local <= 0 or w_local <= 0:
+                continue
+            try:
+                rows = np.array([0, 0, h_local - 1, h_local - 1], dtype=float)
+                cols = np.array([0, w_local - 1, 0, w_local - 1], dtype=float)
+                world_coords = local_wcs.pixel_to_world(cols, rows)
+                g_cols, g_rows = global_wcs_obj.world_to_pixel(world_coords)
+            except Exception:
+                continue
+            if g_cols is None or g_rows is None:
+                continue
+            try:
+                x0 = int(np.floor(np.nanmin(g_cols)))
+                x1 = int(np.ceil(np.nanmax(g_cols))) + 1
+                y0 = int(np.floor(np.nanmin(g_rows)))
+                y1 = int(np.ceil(np.nanmax(g_rows))) + 1
+            except Exception:
+                continue
+            if any(np.isnan(val) for val in (x0, x1, y0, y1)):
+                continue
+            x0 = max(0, min(width, x0))
+            x1 = max(x0, min(width, x1))
+            y0 = max(0, min(height, y0))
+            y1 = max(y0, min(height, y1))
+            if (x1 - x0) <= 0 or (y1 - y0) <= 0:
+                continue
+            entry_infos.append({"entry": entry, "bbox": (y0, y1, x0, x1)})
+
+    if not entry_infos:
+        pcb("sds_error_no_valid_batches", prog=None, lvl="WARN")
+        return None, None, None
+
+    grid_h = max(1, min(512, height))
+    grid_w = max(1, min(512, width))
+    scale_y = grid_h / float(height)
+    scale_x = grid_w / float(width)
+    for info in entry_infos:
+        y0, y1, x0, x1 = info["bbox"]
+        g_y0 = max(0, min(grid_h, int(math.floor(y0 * scale_y))))
+        g_y1 = max(g_y0 + 1, min(grid_h, int(math.ceil(y1 * scale_y))))
+        g_x0 = max(0, min(grid_w, int(math.floor(x0 * scale_x))))
+        g_x1 = max(g_x0 + 1, min(grid_w, int(math.ceil(x1 * scale_x))))
+        info["grid_bbox"] = (g_y0, g_y1, g_x0, g_x1)
+
+    coverage_threshold = max(0.10, min(0.99, float(coverage_threshold or 0.92)))
+    total_cells = grid_h * grid_w
+    batches: list[list[dict]] = []
+    remaining = entry_infos
+    while remaining:
+        coverage_grid = np.zeros((grid_h, grid_w), dtype=np.uint8)
+        coverage_cells = 0
+        used_indices: list[int] = []
+        batch_entries: list[dict] = []
+        for idx, info in enumerate(remaining):
+            gy0, gy1, gx0, gx1 = info.get("grid_bbox", (0, 0, 0, 0))
+            if gy1 <= gy0 or gx1 <= gx0:
+                continue
+            region = coverage_grid[gy0:gy1, gx0:gx1]
+            already = int(region.sum())
+            region_cells = (gy1 - gy0) * (gx1 - gx0)
+            region[...] = 1
+            gain = max(0, region_cells - already)
+            coverage_cells += gain
+            batch_entries.append(info["entry"])
+            used_indices.append(idx)
+            fraction = (coverage_cells / total_cells) if total_cells else 1.0
+            if fraction >= coverage_threshold and batch_entries:
+                break
+        if not batch_entries:
+            batch_entries.append(remaining[0]["entry"])
+            used_indices = [0]
+        batches.append(batch_entries)
+        used_set = set(used_indices)
+        remaining = [info for idx, info in enumerate(remaining) if idx not in used_set]
+
+    if not batches:
+        pcb("sds_error_no_valid_batches", prog=None, lvl="WARN")
+        return None, None, None
+
+    pcb(
+        "sds_info_batches_built",
+        prog=None,
+        lvl="INFO_DETAIL",
+        count=len(batches),
+        total_entries=len(entry_infos),
+    )
+
+    mosaics: list[np.ndarray] = []
+    coverages: list[np.ndarray | None] = []
+    alphas: list[np.ndarray | None] = []
+    total_batches = len(batches)
+    weight_total = float(progress_weight_phase or 0.0)
+    base_phase = float(base_progress_phase or 0.0)
+    for idx, batch in enumerate(batches):
+        batch_base = base_phase
+        if weight_total and total_batches:
+            batch_base = base_phase + weight_total * (idx / max(1, total_batches))
+        batch_weight = weight_total / max(1, total_batches) if weight_total else weight_total
+        batch_result = _assemble_global_mosaic_first_impl(
+            [batch],
+            global_plan=global_plan,
+            progress_callback=progress_callback,
+            match_background=match_background,
+            base_progress_phase=batch_base,
+            progress_weight_phase=batch_weight,
+            start_time_total_run=start_time_total_run,
+            cache_root=cache_root,
+        )
+        mosaic_arr, coverage_arr, alpha_arr = batch_result
+        if mosaic_arr is None:
+            continue
+        mosaics.append(np.asarray(mosaic_arr, dtype=np.float32, copy=False))
+        coverages.append(np.asarray(coverage_arr, dtype=np.float32, copy=False) if coverage_arr is not None else None)
+        alphas.append(alpha_arr.copy() if isinstance(alpha_arr, np.ndarray) else None)
+
+    if not mosaics:
+        pcb("sds_error_no_valid_batches", prog=None, lvl="WARN")
+        return None, None, None
+
+    if postprocess_context is not None:
+        tile_pairs: list[tuple[np.ndarray, Any]] = []
+        for mosaic in mosaics:
+            if mosaic is None:
+                continue
+            try:
+                wcs_clone = copy.deepcopy(global_wcs_obj)
+            except Exception:
+                wcs_clone = global_wcs_obj
+            tile_pairs.append((mosaic, wcs_clone))
+        postprocess_context["two_pass_tile_pairs"] = tile_pairs
+
+    def _coverage_weight(cov_arr: np.ndarray | None, batch_len: int) -> float:
+        if cov_arr is None:
+            return float(max(1, batch_len))
+        try:
+            arr = np.asarray(cov_arr, dtype=np.float32, copy=False)
+            if arr.ndim != 2:
+                arr = np.squeeze(arr)
+            if arr.ndim != 2:
+                return float(max(1, batch_len))
+            max_cells = 1_000_000
+            stride = max(1, int(math.sqrt(arr.size / max_cells))) if arr.size > max_cells else 1
+            sampled = arr[::stride, ::stride] if stride > 1 else arr
+            sum_val = float(np.nansum(sampled))
+            if not np.isfinite(sum_val) or sum_val <= 0:
+                coverage_pixels = float(np.count_nonzero(sampled > 0))
+                return coverage_pixels if coverage_pixels > 0 else float(max(1, batch_len))
+            return sum_val
+        except Exception:
+            return float(max(1, batch_len))
+
+    weight_values: list[float] = []
+    for idx, cov in enumerate(coverages):
+        batch_len = len(batches[idx]) if idx < len(batches) else 1
+        weight_values.append(_coverage_weight(cov, batch_len))
+    manual_weights: np.ndarray | None
+    if len(weight_values) == len(mosaics):
+        manual_weights = np.asarray(weight_values, dtype=np.float32).reshape((len(weight_values), 1))
+    else:
+        manual_weights = None
+
+    def _stack_mosaics() -> np.ndarray:
+        if not (ZEMOSAIC_ALIGN_STACK_AVAILABLE and zemosaic_align_stack):
+            stack_cube = np.stack(mosaics, axis=0).astype(np.float32, copy=False)
+            if len(mosaics) == 1:
+                return stack_cube[0]
+            combine = str((stack_params or {}).get("stack_final_combine") or "mean").lower()
+            if combine == "median":
+                return np.nanmedian(stack_cube, axis=0).astype(np.float32)
+            return np.nanmean(stack_cube, axis=0).astype(np.float32)
+
+        algo = str((stack_params or {}).get("stack_reject_algo") or "winsorized_sigma_clip").lower()
+        weight_method = (stack_params or {}).get("stack_weight_method", "none")
+        kappa_low = float((stack_params or {}).get("stack_kappa_low", 3.0))
+        kappa_high = float((stack_params or {}).get("stack_kappa_high", 3.0))
+        winsor_limits = (stack_params or {}).get("parsed_winsor_limits", (0.05, 0.05))
+        winsor_workers = int((stack_params or {}).get("winsor_worker_limit", 1))
+        winsor_frames = int((stack_params or {}).get("winsor_max_frames_per_pass", 0))
+
+        if algo in {"winsorized_sigma_clip", "winsorized", "winsor"} and hasattr(
+            zemosaic_align_stack, "stack_winsorized_sigma_clip"
+        ):
+            stacked, _ = zemosaic_align_stack.stack_winsorized_sigma_clip(
+                mosaics,
+                weights=manual_weights,
+                weight_method=weight_method,
+                zconfig=None,
+                kappa=kappa_low,
+                winsor_limits=winsor_limits,
+                apply_rewinsor=True,
+                winsor_max_frames_per_pass=winsor_frames,
+                winsor_max_workers=winsor_workers,
+            )
+            return np.asarray(stacked, dtype=np.float32, copy=False)
+
+        if algo == "kappa_sigma" and hasattr(zemosaic_align_stack, "stack_kappa_sigma_clip"):
+            stacked, _ = zemosaic_align_stack.stack_kappa_sigma_clip(
+                mosaics,
+                weights=manual_weights,
+                weight_method=weight_method,
+                zconfig=None,
+                sigma_low=kappa_low,
+                sigma_high=kappa_high,
+            )
+            return np.asarray(stacked, dtype=np.float32, copy=False)
+
+        stack_cube = np.stack(mosaics, axis=0).astype(np.float32, copy=False)
+        if len(mosaics) == 1:
+            return stack_cube[0]
+        combine = str((stack_params or {}).get("stack_final_combine") or "mean").lower()
+        if combine == "median":
+            return np.nanmedian(stack_cube, axis=0).astype(np.float32)
+        return np.nanmean(stack_cube, axis=0).astype(np.float32)
+
+    try:
+        final_image = _stack_mosaics()
+    except Exception as exc:
+        pcb("sds_error_final_stack_failed", prog=None, lvl="ERROR", error=str(exc))
+        return None, None, None
+
+    final_image = np.asarray(final_image, dtype=np.float32, copy=False)
+
+    final_coverage = None
+    for cov in coverages:
+        if cov is None:
+            continue
+        arr = np.asarray(cov, dtype=np.float32, copy=False)
+        if final_coverage is None:
+            final_coverage = np.zeros_like(arr, dtype=np.float32)
+        final_coverage += arr
+    if final_coverage is None:
+        final_coverage = np.ones((height, width), dtype=np.float32)
+
+    alpha_candidates = [np.asarray(alpha, dtype=np.float32, copy=False) for alpha in alphas if alpha is not None]
+    final_alpha = None
+    if alpha_candidates:
+        alpha_stack = np.stack(alpha_candidates, axis=0)
+        final_alpha = np.nanmax(alpha_stack, axis=0)
+        final_alpha = np.clip(final_alpha, 0, 255).astype(np.uint8, copy=False)
+    else:
+        max_cov = float(np.nanmax(final_coverage)) if final_coverage is not None else 0.0
+        if max_cov > 0:
+            normalized = np.clip((final_coverage / max_cov) * 255.0, 0, 255)
+            final_alpha = normalized.astype(np.uint8, copy=False)
+
+    return final_image, final_coverage, final_alpha
 
 
 def assemble_global_mosaic_first(
