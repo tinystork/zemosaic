@@ -292,6 +292,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "output_dir": "",
             "global_wcs_output_path": "global_mosaic_wcs.fits",
             "coadd_memmap_dir": "",
+            "auto_detect_seestar": True,
+            "force_seestar_mode": False,
+            "sds_mode_default": False,
+            "sds_coverage_threshold": 0.92,
             "astap_executable_path": "",
             "astap_data_directory_path": "",
             "astap_default_search_radius": 3.0,
@@ -366,6 +370,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         main_layout.addWidget(self._create_folders_group())
         main_layout.addWidget(self._create_astap_group())
+        main_layout.addWidget(self._create_instrument_group())
         main_layout.addWidget(self._create_mosaic_group())
         main_layout.addWidget(self._create_quality_group())
         main_layout.addWidget(self._create_logging_group())
@@ -418,6 +423,41 @@ class ZeMosaicQtMainWindow(QMainWindow):
             dialog_title=self._tr(
                 "qt_dialog_select_memmap_dir", "Select Memmap Folder"
             ),
+        )
+
+        return group
+
+    def _create_instrument_group(self) -> QGroupBox:
+        group = QGroupBox(
+            self._tr("qt_group_instrument", "Instrument / Seestar"),
+            self,
+        )
+        layout = QFormLayout(group)
+        layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        self._register_checkbox(
+            "auto_detect_seestar",
+            layout,
+            self._tr("qt_field_auto_detect_seestar", "Auto-detect Seestar frames"),
+        )
+        self._register_checkbox(
+            "force_seestar_mode",
+            layout,
+            self._tr("qt_field_force_seestar", "Force Seestar workflow"),
+        )
+        self._register_checkbox(
+            "sds_mode_default",
+            layout,
+            self._tr("qt_field_sds_mode", "Enable SDS mode by default"),
+        )
+        self._register_double_spinbox(
+            "sds_coverage_threshold",
+            layout,
+            self._tr("qt_field_sds_threshold", "SDS coverage threshold"),
+            minimum=0.0,
+            maximum=1.0,
+            single_step=0.01,
+            decimals=2,
         )
 
         return group
