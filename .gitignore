@@ -188,3 +188,8 @@ build/
 
 # === ZeMosaic: configuration de innosetup ===
 *.iss
+
+# === ZeMosaic: fichiers temporaires divers ===
+tests/
+# --- Examples de fichiers à ignorer dans le dossier tests ---
+example/
