@@ -161,7 +161,7 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
 **Goal:** The Qt GUI actually runs the mosaic worker without freezing.
 
 - [x] Decide on worker threading approach:
-  - [ ] Implement a `QObject`-based worker class (e.g. `ZeMosaicQtWorker`) that runs in a `QThread`, OR
+  - [x] Implement a `QObject`-based worker class (e.g. `ZeMosaicQtWorker`) that runs in a `QThread`, OR
   - [x] Use queue polling with a periodic `QTimer` (multiprocessing worker + queue).
 - [x] The worker must call the existing worker function:
   - [x] `run_hierarchical_mosaic_process(...)` or the equivalent entry used in Tk GUI.

@@ -23,7 +23,7 @@ from dataclasses import asdict
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
 try:
-    from PySide6.QtCore import QObject, QTimer, Signal
+    from PySide6.QtCore import QObject, QThread, QTimer, Signal
     from PySide6.QtGui import QCloseEvent
     from PySide6.QtWidgets import (
         QApplication,
@@ -105,8 +105,56 @@ class _FallbackLocalizer:
         self.language_code = language_code
 
 
+class _WorkerQueueListener(QObject):
+    """Background queue listener that runs inside a dedicated ``QThread``."""
+
+    payload_received = Signal(object)
+    finished = Signal()
+
+    def __init__(
+        self,
+        queue_obj: multiprocessing.Queue,
+        process_alive_checker,
+        parent: QObject | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self._queue = queue_obj
+        self._process_alive_checker = process_alive_checker
+        self._stop_requested = False
+
+    def request_stop(self) -> None:
+        self._stop_requested = True
+
+    def _drain_remaining(self) -> None:
+        while not self._stop_requested:
+            try:
+                payload = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            except Exception:
+                break
+            else:
+                self.payload_received.emit(payload)
+
+    def run(self) -> None:
+        try:
+            while not self._stop_requested:
+                try:
+                    payload = self._queue.get(timeout=0.1)
+                except queue.Empty:
+                    if not self._process_alive_checker():
+                        self._drain_remaining()
+                        break
+                    continue
+                except Exception:
+                    break
+                self.payload_received.emit(payload)
+        finally:
+            self.finished.emit()
+
+
 class ZeMosaicQtWorker(QObject):
-    """Manage the background ZeMosaic worker process and emit Qt signals."""
+    """Manage the background ZeMosaic worker process using a queue listener thread."""
 
     log_message_emitted = Signal(str, str)
     progress_changed = Signal(float)
@@ -119,9 +167,8 @@ class ZeMosaicQtWorker(QObject):
         super().__init__(parent)
         self._queue: multiprocessing.Queue | None = None
         self._process: multiprocessing.Process | None = None
-        self._timer = QTimer(self)
-        self._timer.setInterval(120)
-        self._timer.timeout.connect(self._poll_queue)  # type: ignore[arg-type]
+        self._listener_thread: QThread | None = None
+        self._listener: _WorkerQueueListener | None = None
         self._stop_requested = False
         self._had_error = False
         self._last_error: str = ""
@@ -144,6 +191,7 @@ class ZeMosaicQtWorker(QObject):
             return False
 
         queue_obj: multiprocessing.Queue | None = None
+        process: multiprocessing.Process | None = None
         try:
             queue_obj = multiprocessing.Queue()
             process = multiprocessing.Process(
@@ -155,25 +203,69 @@ class ZeMosaicQtWorker(QObject):
             )
             process.start()
         except Exception as exc:
-            # Clean up any partially created resources
-            try:
-                if queue_obj is not None:
+            if process is not None and process.is_alive():
+                try:
+                    process.terminate()
+                except Exception:
+                    pass
+            if queue_obj is not None:
+                try:
                     queue_obj.close()
-            except Exception:
-                pass
+                except Exception:
+                    pass
             raise RuntimeError(str(exc)) from exc
 
         self._queue = queue_obj
         self._process = process
-        self._timer.start()
         self._stop_requested = False
         self._had_error = False
         self._last_error = ""
         self._finished_emitted = False
+
+        listener_thread = QThread()
+        listener = _WorkerQueueListener(
+            queue_obj,
+            lambda: bool(self._process and self._process.is_alive()),
+        )
+        listener.payload_received.connect(self._handle_payload)  # type: ignore[arg-type]
+        listener.finished.connect(self._on_listener_finished)  # type: ignore[arg-type]
+        listener_thread.started.connect(listener.run)  # type: ignore[arg-type]
+
+        try:
+            listener_thread.start()
+        except Exception as exc:
+            try:
+                listener_thread.quit()
+                listener_thread.wait(200)
+            except Exception:
+                pass
+            listener.deleteLater()
+            if self._process and self._process.is_alive():
+                try:
+                    self._process.terminate()
+                    self._process.join(timeout=0.5)
+                except Exception:
+                    pass
+            if self._queue is not None:
+                try:
+                    self._queue.close()
+                except Exception:
+                    pass
+            self._queue = None
+            self._process = None
+            raise RuntimeError(str(exc)) from exc
+
+        self._listener_thread = listener_thread
+        self._listener = listener
         return True
 
     def stop(self) -> None:
         self._stop_requested = True
+        if self._listener is not None:
+            try:
+                self._listener.request_stop()
+            except Exception:
+                pass
         proc = self._process
         if proc and proc.is_alive():
             try:
@@ -181,96 +273,105 @@ class ZeMosaicQtWorker(QObject):
                 proc.join(timeout=0.5)
             except Exception:
                 pass
-        self._finalize(success=False, message="qt_log_processing_cancelled")
-
-    # ------------------------------------------------------------------
-    # Queue polling
-    # ------------------------------------------------------------------
-    def _poll_queue(self) -> None:
-        queue_obj = self._queue
-        proc = self._process
-        if queue_obj is None or proc is None:
-            self._finalize(success=not self._had_error and not self._stop_requested, message=self._last_error)
-            return
-
-        drained_any = False
-        while True:
-            try:
-                payload = queue_obj.get_nowait()
-            except queue.Empty:
-                break
-            except Exception:
-                break
-
-            drained_any = True
-            try:
-                msg_key, prog, lvl, kwargs = payload
-            except Exception:
-                continue
-            kwargs = kwargs or {}
-
-            if msg_key == "STAGE_PROGRESS":
-                stage_name = str(prog)
-                try:
-                    current_val = int(lvl)
-                except Exception:
-                    current_val = 0
-                try:
-                    total_val = int(kwargs.get("total", 0))
-                except Exception:
-                    total_val = 0
-                if total_val > 0:
-                    percent = max(0.0, min(100.0, (current_val / float(total_val)) * 100.0))
-                else:
-                    percent = 0.0
-                self.progress_changed.emit(percent)
-                self.phase_changed.emit(stage_name, {"current": current_val, "total": total_val})
-                self.stage_progress.emit(stage_name, current_val, total_val)
-                continue
-
-            if msg_key == "PROCESS_ERROR":
-                error_text = str(kwargs.get("error") or prog or "")
-                self._had_error = True
-                self._last_error = error_text or "qt_worker_error_generic"
-                level = str(lvl or "ERROR")
-                if error_text:
-                    self.log_message_emitted.emit(level, error_text)
-                else:
-                    self.log_message_emitted.emit(level, "qt_worker_error_generic")
-                continue
-
-            if msg_key == "PROCESS_DONE":
-                # Let the process exit naturally; finalization happens once it stops.
-                continue
-
-            if isinstance(msg_key, str) and msg_key.startswith("p45_"):
-                # Advanced Phase 4.5 feedback is not yet visualized in Qt.
-                continue
-
-            if isinstance(msg_key, str) and msg_key.upper() == "STATS_UPDATE":
-                if isinstance(kwargs, dict):
-                    self.stats_updated.emit(kwargs)
-                continue
-
-            level = str(lvl or "INFO")
-            message = self._stringify_message(msg_key, prog, kwargs)
-            self.log_message_emitted.emit(level, message)
-
-        if proc is not None and not proc.is_alive():
-            success = not self._had_error and not self._stop_requested
-            message = "" if success else (self._last_error or "qt_log_processing_cancelled")
-            self._finalize(success=success, message=message)
-            return
-
-        if self._stop_requested and not drained_any:
+        # Finalization happens once the listener thread finishes and emits its signal.
+        if self._listener_thread is None:
             self._finalize(success=False, message="qt_log_processing_cancelled")
+
+    # ------------------------------------------------------------------
+    # Queue processing
+    # ------------------------------------------------------------------
+    def _handle_payload(self, payload: object) -> None:
+        try:
+            msg_key, prog, lvl, kwargs = payload  # type: ignore[misc]
+        except Exception:
+            return
+        kwargs = kwargs or {}
+
+        if msg_key == "STAGE_PROGRESS":
+            stage_name = str(prog)
+            try:
+                current_val = int(lvl)
+            except Exception:
+                current_val = 0
+            try:
+                total_val = int(kwargs.get("total", 0))
+            except Exception:
+                total_val = 0
+            if total_val > 0:
+                percent = max(0.0, min(100.0, (current_val / float(total_val)) * 100.0))
+            else:
+                percent = 0.0
+            self.progress_changed.emit(percent)
+            self.phase_changed.emit(stage_name, {"current": current_val, "total": total_val})
+            self.stage_progress.emit(stage_name, current_val, total_val)
+            return
+
+        if msg_key == "PROCESS_ERROR":
+            error_text = str(kwargs.get("error") or prog or "")
+            self._had_error = True
+            self._last_error = error_text or "qt_worker_error_generic"
+            level = str(lvl or "ERROR")
+            if error_text:
+                self.log_message_emitted.emit(level, error_text)
+            else:
+                self.log_message_emitted.emit(level, "qt_worker_error_generic")
+            return
+
+        if msg_key == "PROCESS_DONE":
+            # Process will terminate shortly; finalization occurs in the listener finished handler.
+            return
+
+        if isinstance(msg_key, str) and msg_key.startswith("p45_"):
+            # Advanced Phase 4.5 feedback is not yet visualized in Qt.
+            return
+
+        if isinstance(msg_key, str) and msg_key.upper() == "STATS_UPDATE":
+            if isinstance(kwargs, dict):
+                self.stats_updated.emit(kwargs)
+            return
+
+        level = str(lvl or "INFO")
+        message = self._stringify_message(msg_key, prog, kwargs)
+        self.log_message_emitted.emit(level, message)
+
+    def _on_listener_finished(self) -> None:
+        success = not self._had_error and not self._stop_requested
+        message = "" if success else (self._last_error or "qt_log_processing_cancelled")
+        self._finalize(success=success, message=message)
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+    def _cleanup_listener(self) -> None:
+        listener = self._listener
+        thread = self._listener_thread
+        self._listener = None
+        self._listener_thread = None
+
+        if thread is not None:
+            if listener is not None:
+                try:
+                    listener.request_stop()
+                except Exception:
+                    pass
+            if thread.isRunning():
+                try:
+                    thread.quit()
+                    thread.wait(500)
+                except Exception:
+                    pass
+            if listener is not None:
+                listener.deleteLater()
+            thread.deleteLater()
+        elif listener is not None:
+            try:
+                listener.request_stop()
+            except Exception:
+                pass
+            listener.deleteLater()
+
     def _finalize(self, *, success: bool, message: str) -> None:
-        if self._timer.isActive():
-            self._timer.stop()
+        self._cleanup_listener()
         if self._process is not None:
             try:
                 if self._process.is_alive():
