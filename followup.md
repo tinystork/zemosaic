@@ -262,7 +262,7 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
   - [x] There is no hard-coded English where a key exists already.
 - [ ] Verify configuration:
   - [x] Qt GUI reads existing config files correctly.
-  - [ ] Changes in Qt GUI are reflected in the shared config, visible from Tk GUI as well.
+  - [x] Changes in Qt GUI are reflected in the shared config, visible from Tk GUI as well.
 - [ ] Documentation:
   - [ ] Add docstrings or comments in Qt modules explaining how to launch the Qt GUI (env var + CLI flag).
   - [ ] Ensure errors when PySide6 is missing are clear and non-blocking for Tk users.
