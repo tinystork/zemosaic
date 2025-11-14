@@ -21,7 +21,7 @@ import multiprocessing
 import queue
 import time
 from dataclasses import asdict
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Sequence, Tuple
 
 try:
     from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
@@ -2498,6 +2498,48 @@ class ZeMosaicQtMainWindow(QMainWindow):
         else:
             _update_enabled(True)
 
+    @staticmethod
+    def _normalize_config_bool(value: Any, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value != 0
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"1", "true", "yes", "on"}:
+                return True
+            if normalized in {"0", "false", "no", "off"}:
+                return False
+            if not normalized:
+                return default
+        if value is None:
+            return default
+        return bool(value)
+
+    def _synchronize_gpu_config_keys(
+        self, mapping: MutableMapping[str, Any] | None = None
+    ) -> bool:
+        target = mapping if mapping is not None else getattr(self, "config", None)
+        if target is None:
+            return False
+
+        canonical_value: Any = target.get("use_gpu_phase5")
+        if canonical_value in (None, ""):
+            for legacy_key in ("stack_use_gpu", "use_gpu_stack"):
+                legacy_val = target.get(legacy_key)
+                if legacy_val not in (None, ""):
+                    canonical_value = legacy_val
+                    break
+
+        gpu_enabled = self._normalize_config_bool(canonical_value, False)
+        changed = False
+        for key in ("use_gpu_phase5", "stack_use_gpu", "use_gpu_stack"):
+            previous = target.get(key)
+            if previous != gpu_enabled or not isinstance(previous, bool):
+                changed = True
+            target[key] = gpu_enabled
+        return changed
+
     def _collect_config_from_widgets(self) -> None:
         for key, binding in self._config_fields.items():
             kind = binding["kind"]
@@ -2541,11 +2583,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
                     raw_value = self.config.get(key, raw_value)
 
             self.config[key] = raw_value
-
-            if key == "use_gpu_phase5":
-                gpu_enabled = bool(raw_value)
-                self.config["stack_use_gpu"] = gpu_enabled
-                self.config["use_gpu_stack"] = gpu_enabled
+        self._synchronize_gpu_config_keys()
 
     def _baseline_default_config(self) -> Dict[str, Any]:
         defaults: Dict[str, Any] = {}
@@ -2742,39 +2780,25 @@ class ZeMosaicQtMainWindow(QMainWindow):
         merged_config.update(config_data)
         merged_config.setdefault("language", "en")
 
-        def _normalize_bool(value: Any, default: bool = False) -> bool:
-            if isinstance(value, bool):
-                return value
-            if isinstance(value, (int, float)) and not isinstance(value, bool):
-                return value != 0
-            if isinstance(value, str):
-                normalized = value.strip().lower()
-                if normalized in {"1", "true", "yes", "on"}:
-                    return True
-                if normalized in {"0", "false", "no", "off"}:
-                    return False
-                if not normalized:
-                    return default
-            if value is None:
-                return default
-            return bool(value)
-
         canonical_gpu_pref: Any = merged_config.get("use_gpu_phase5")
         if canonical_gpu_pref in (None, ""):
             for legacy_key in ("stack_use_gpu", "use_gpu_stack"):
                 if legacy_key in merged_config:
                     canonical_gpu_pref = merged_config[legacy_key]
                     break
-        gpu_enabled = _normalize_bool(canonical_gpu_pref, False)
+        gpu_enabled = self._normalize_config_bool(canonical_gpu_pref, False)
         merged_config["use_gpu_phase5"] = gpu_enabled
-        merged_config["stack_use_gpu"] = _normalize_bool(
+        merged_config["stack_use_gpu"] = self._normalize_config_bool(
             merged_config.get("stack_use_gpu"), gpu_enabled
         )
-        merged_config["use_gpu_stack"] = _normalize_bool(
+        merged_config["use_gpu_stack"] = self._normalize_config_bool(
             merged_config.get("use_gpu_stack"), gpu_enabled
         )
+        self._synchronize_gpu_config_keys(merged_config)
 
-        self._loaded_config_snapshot = dict(config_data)
+        loaded_snapshot = dict(config_data)
+        self._synchronize_gpu_config_keys(loaded_snapshot)
+        self._loaded_config_snapshot = loaded_snapshot
         self._persisted_config_keys = set(config_data.keys()) | set(
             self._default_config_values.keys()
         )
@@ -2817,6 +2841,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
     def _serialize_config_for_save(self) -> Dict[str, Any]:
         snapshot: Dict[str, Any] = {}
 
+        self._synchronize_gpu_config_keys()
+
         keys_to_consider: set[str] = set(self._persisted_config_keys)
         keys_to_consider.update(self.config.keys())
         keys_to_consider.update(self._loaded_config_snapshot.keys())
@@ -2828,6 +2854,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 snapshot[key] = self._json_safe_config_value(
                     self._loaded_config_snapshot[key]
                 )
+        self._synchronize_gpu_config_keys(snapshot)
         return snapshot
 
     def _save_config(self) -> None:
@@ -2857,7 +2884,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         if saved:
             self.config.update(snapshot)
-            self._loaded_config_snapshot = dict(snapshot)
+            normalized_snapshot = dict(snapshot)
+            self._synchronize_gpu_config_keys(normalized_snapshot)
+            self._loaded_config_snapshot = normalized_snapshot
             self._persisted_config_keys = set(snapshot.keys())
         else:
             if last_error is None and not self._config_path:
