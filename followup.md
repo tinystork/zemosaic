@@ -160,43 +160,43 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
 
 **Goal:** The Qt GUI actually runs the mosaic worker without freezing.
 
-- [ ] Decide on worker threading approach:
+- [x] Decide on worker threading approach:
   - [ ] Implement a `QObject`-based worker class (e.g. `ZeMosaicQtWorker`) that runs in a `QThread`, OR
-  - [ ] Use `threading.Thread` with a periodic `QTimer` in the GUI to poll progress from a queue.
-- [ ] The worker must call the existing worker function:
-  - [ ] `run_hierarchical_mosaic_process(...)` or the equivalent entry used in Tk GUI.
-  - [ ] It must pass all required parameters (from config and widgets).
+  - [x] Use queue polling with a periodic `QTimer` (multiprocessing worker + queue).
+- [x] The worker must call the existing worker function:
+  - [x] `run_hierarchical_mosaic_process(...)` or the equivalent entry used in Tk GUI.
+  - [x] It must pass all required parameters (from config and widgets).
 
-- [ ] Implement a callback adapter:
-  - [ ] The worker uses a callback compatible with `_log_and_callback` in `zemosaic_worker.py`.
-  - [ ] This callback translates worker events into Qt signals:
-    - [ ] `log_message_emitted(level, message)`.
-    - [ ] `progress_changed(percentage)`.
-    - [ ] `phase_changed(phase_name, extra_info)`.
-    - [ ] `stats_updated(stats_dict)` for tiles/files/ETA, etc.
+- [x] Implement a callback adapter:
+  - [x] The worker uses a callback compatible with `_log_and_callback` in `zemosaic_worker.py`.
+  - [x] This callback translates worker events into Qt signals:
+    - [x] `log_message_emitted(level, message)`.
+    - [x] `progress_changed(percentage)`.
+    - [x] `phase_changed(phase_name, extra_info)`.
+    - [x] `stats_updated(stats_dict)` for tiles/files/ETA, etc.
 
-- [ ] In `ZeMosaicQtMainWindow`:
-  - [ ] Connect slots to these signals to:
-    - [ ] Append localized messages to log widget.
-    - [ ] Update progress bar.
-    - [ ] Update phase label.
-    - [ ] Update ETAs, counters, etc.
-  - [ ] Wire the “Start” button:
-    - [ ] Validate paths and config.
-    - [ ] Save config.
-    - [ ] Start the worker thread.
-  - [ ] Wire the “Stop/Abort” button:
-    - [ ] Use the same stop mechanism as Tk GUI (e.g. setting a stop flag or calling a stop function).
-    - [ ] Ensure the GUI remains responsive when stopping.
+- [x] In `ZeMosaicQtMainWindow`:
+  - [x] Connect slots to these signals to:
+    - [x] Append localized messages to log widget.
+    - [x] Update progress bar.
+    - [x] Update phase label.
+    - [x] Update ETAs, counters, etc.
+  - [x] Wire the “Start” button:
+    - [x] Validate paths and config.
+    - [x] Save config.
+    - [x] Start the worker thread.
+  - [x] Wire the “Stop/Abort” button:
+    - [x] Use the same stop mechanism as Tk GUI (e.g. setting a stop flag or calling a stop function).
+    - [x] Ensure the GUI remains responsive when stopping.
 
-- [ ] When worker finishes:
-  - [ ] Properly clean up the QThread (if used).
-  - [ ] Re-enable Start button.
-  - [ ] Optionally show a small message (“Mosaic completed” or “Stopped by user”).
+- [x] When worker finishes:
+  - [x] Properly clean up the QThread (if used).
+  - [x] Re-enable Start button.
+  - [x] Optionally show a small message (“Mosaic completed” or “Stopped by user”).
 
-- [ ] Ensure:
-  - [ ] No direct GUI updates are done from non-GUI threads (use signals/slots or queued connections).
-  - [ ] There are no crashes when closing the window while a worker is still running (do a best-effort safe stop).
+- [x] Ensure:
+  - [x] No direct GUI updates are done from non-GUI threads (use signals/slots or queued connections).
+  - [x] There are no crashes when closing the window while a worker is still running (do a best-effort safe stop).
 
 
 ## Phase 5 — Qt Filter GUI (`zemosaic_filter_gui_qt.py`)
@@ -275,3 +275,4 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
 Use this section to record issues, partial implementations, or TODOs that don’t map cleanly to a checkbox.
 
 - [ ] Confirm whether Tk GUI currently exposes Phase 4.5 / super-tile controls before mirroring them in Qt.
+- [ ] Qt worker progress currently uses simple per-stage percentages and does not replicate Tk’s weighted progress/ETA smoothing yet.
