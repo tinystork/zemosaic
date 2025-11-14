@@ -158,10 +158,10 @@ Bring Qt worker signal handling to full parity with the Tk GUI so that all struc
 
 **Detailed requirements:**
 
-- [ ] Consume `ETA_UPDATE`, chrono control, raw/master counter, and cluster override payloads within `_handle_payload`.
-- [ ] Emit dedicated Qt signals for each payload type and update the main window labels.
-- [ ] Ensure chrono timers start/stop/reset identically to Tk behavior.
-- [ ] Confirm worker cancellation propagates to timers and status indicators.
+- [x] Consume `ETA_UPDATE`, chrono control, raw/master counter, and cluster override payloads within `_handle_payload`.
+- [x] Emit dedicated Qt signals for each payload type and update the main window labels.
+- [x] Ensure chrono timers start/stop/reset identically to Tk behavior.
+- [x] Confirm worker cancellation propagates to timers and status indicators.
 
 
 ---
@@ -235,3 +235,4 @@ Ensure the coding agent ALWAYS updates this file after completing a task.
 - [x] Task C guard added to `agent.md` and `followup.md`; both now include explicit staging check instructions.
 - [x] 2024-06-30: Audit identified outstanding parity gaps (Tasks B, D-G added); pending implementation.
 - [x] 2025-11-14: Task B implemented and verified — Qt `_handle_payload` now emits structured GPU helper events, and `ZeMosaicQtMainWindow` applies ETA overrides and helper tracking in parity with Tk `_log_message`/`_handle_gpu_helper_*`.
+- [x] 2025-11-14: Task D implemented — Qt worker now consumes `ETA_UPDATE`, chrono, raw/master counter, and `CLUSTER_OVERRIDE` payloads, emits dedicated signals, updates progress labels, and treats `log_key_processing_cancelled` as a proper cancellation path for timers and status indicators.

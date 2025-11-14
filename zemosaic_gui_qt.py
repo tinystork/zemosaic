@@ -201,6 +201,11 @@ class ZeMosaicQtWorker(QObject):
     gpu_helper_event = Signal(str, dict)
     stats_updated = Signal(dict)
     phase45_event = Signal(str, dict, str)
+    eta_updated = Signal(str)
+    chrono_control = Signal(str)
+    raw_file_count_updated = Signal(int, int)
+    master_tile_count_updated = Signal(int, int)
+    cluster_override = Signal(dict)
     finished = Signal(bool, str)
 
     def __init__(self, parent: QObject | None = None) -> None:
@@ -213,6 +218,7 @@ class ZeMosaicQtWorker(QObject):
         self._had_error = False
         self._last_error: str = ""
         self._finished_emitted = False
+        self._cancelled = False
 
     # ------------------------------------------------------------------
     # Lifecycle management
@@ -261,6 +267,7 @@ class ZeMosaicQtWorker(QObject):
         self._had_error = False
         self._last_error = ""
         self._finished_emitted = False
+        self._cancelled = False
 
         listener_thread = QThread()
         listener = _WorkerQueueListener(
@@ -326,6 +333,8 @@ class ZeMosaicQtWorker(QObject):
         except Exception:
             return
         kwargs = kwargs or {}
+        if isinstance(msg_key, str) and msg_key == "log_key_processing_cancelled":
+            self._cancelled = True
 
         if msg_key == "STAGE_PROGRESS":
             stage_name = str(prog)
@@ -360,6 +369,65 @@ class ZeMosaicQtWorker(QObject):
         if msg_key == "PROCESS_DONE":
             # Process will terminate shortly; finalization occurs in the listener finished handler.
             return
+
+        # High-priority control and counter messages mirrored from Tk GUI.
+        if isinstance(msg_key, str):
+            if msg_key.startswith("ETA_UPDATE:"):
+                eta_str = msg_key.split(":", 1)[1].strip() if ":" in msg_key else ""
+                self.eta_updated.emit(eta_str)
+                return
+            if msg_key == "CHRONO_START_REQUEST":
+                self.chrono_control.emit("start")
+                return
+            if msg_key == "CHRONO_STOP_REQUEST":
+                self.chrono_control.emit("stop")
+                return
+            if msg_key.startswith("RAW_FILE_COUNT_UPDATE:"):
+                counts = msg_key.split(":", 1)[1] if ":" in msg_key else ""
+                cur_val = 0
+                tot_val = 0
+                try:
+                    cur_str, tot_str = counts.split("/", 1)
+                    cur_val = int(cur_str.strip())
+                    tot_val = int(tot_str.strip())
+                except Exception:
+                    cur_val = 0
+                    tot_val = 0
+                self.raw_file_count_updated.emit(cur_val, tot_val)
+                return
+            if msg_key.startswith("MASTER_TILE_COUNT_UPDATE:"):
+                counts = msg_key.split(":", 1)[1] if ":" in msg_key else ""
+                cur_val = 0
+                tot_val = 0
+                try:
+                    cur_str, tot_str = counts.split("/", 1)
+                    cur_val = int(cur_str.strip())
+                    tot_val = int(tot_str.strip())
+                except Exception:
+                    cur_val = 0
+                    tot_val = 0
+                self.master_tile_count_updated.emit(cur_val, tot_val)
+                return
+            if msg_key.startswith("CLUSTER_OVERRIDE:"):
+                payload_str = msg_key.split(":", 1)[1] if ":" in msg_key else ""
+                overrides: Dict[str, Any] = {}
+                try:
+                    parts = [segment.strip() for segment in payload_str.split(";") if segment.strip()]
+                    for part in parts:
+                        if part.startswith("panel="):
+                            try:
+                                overrides["cluster_panel_threshold"] = float(part.split("=", 1)[1])
+                            except Exception:
+                                pass
+                        elif part.startswith("target="):
+                            try:
+                                overrides["cluster_target_groups"] = int(part.split("=", 1)[1])
+                            except Exception:
+                                pass
+                except Exception:
+                    overrides = {}
+                self.cluster_override.emit(overrides)
+                return
 
         if isinstance(msg_key, str):
             if msg_key == "global_coadd_info_helper_path":
@@ -407,8 +475,14 @@ class ZeMosaicQtWorker(QObject):
         self.log_message_emitted.emit(level, message)
 
     def _on_listener_finished(self) -> None:
-        success = not self._had_error and not self._stop_requested
-        message = "" if success else (self._last_error or "qt_log_processing_cancelled")
+        success = not self._had_error and not self._stop_requested and not self._cancelled
+        if success:
+            message = ""
+        else:
+            if not self._last_error:
+                message = "qt_log_processing_cancelled"
+            else:
+                message = self._last_error
         self._finalize(success=success, message=message)
 
     # ------------------------------------------------------------------
@@ -594,6 +668,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self.worker_controller.stats_updated.connect(self._on_worker_stats_updated)  # type: ignore[arg-type]
         self.worker_controller.phase45_event.connect(self._on_worker_phase45_event)  # type: ignore[arg-type]
         self.worker_controller.gpu_helper_event.connect(self._on_worker_gpu_helper_event)  # type: ignore[arg-type]
+        self.worker_controller.eta_updated.connect(self._on_worker_eta_updated)  # type: ignore[arg-type]
+        self.worker_controller.chrono_control.connect(self._on_worker_chrono_control)  # type: ignore[arg-type]
+        self.worker_controller.raw_file_count_updated.connect(self._on_worker_raw_file_count_updated)  # type: ignore[arg-type]
+        self.worker_controller.master_tile_count_updated.connect(self._on_worker_master_tile_count_updated)  # type: ignore[arg-type]
+        self.worker_controller.cluster_override.connect(self._on_worker_cluster_override)  # type: ignore[arg-type]
         self.worker_controller.finished.connect(self._on_worker_finished)  # type: ignore[arg-type]
 
         self._elapsed_timer = QTimer(self)
@@ -3759,6 +3838,69 @@ class ZeMosaicQtMainWindow(QMainWindow):
             eta_h, eta_rem = divmod(int(eta_seconds + 0.5), 3600)
             eta_m, eta_s = divmod(eta_rem, 60)
             self._set_eta_display(f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}")
+
+    def _on_worker_eta_updated(self, eta_text: str) -> None:
+        if not isinstance(eta_text, str):
+            return
+        text = eta_text.strip()
+        if not text:
+            placeholder = self._tr("qt_progress_placeholder", "—")
+            self._set_eta_display(placeholder, force=True)
+            return
+        self._set_eta_display(text)
+
+    def _on_worker_chrono_control(self, action: str) -> None:
+        if not isinstance(action, str):
+            return
+        normalized = action.strip().lower()
+        if normalized == "start":
+            self._run_started_monotonic = time.monotonic()
+            self.elapsed_value_label.setText(
+                self._tr("initial_elapsed_time", "00:00:00")
+            )
+            if not self._elapsed_timer.isActive():
+                self._elapsed_timer.start()
+        elif normalized == "stop":
+            self._elapsed_timer.stop()
+
+    def _on_worker_raw_file_count_updated(self, current: int, total: int) -> None:
+        try:
+            cur = int(current)
+        except Exception:
+            cur = 0
+        try:
+            tot = int(total)
+        except Exception:
+            tot = 0
+        if tot < 0:
+            tot = 0
+        if tot > 0:
+            cur = max(0, min(cur, tot))
+        else:
+            cur = max(0, cur)
+        self.files_value_label.setText(f"{cur} / {tot}")
+
+    def _on_worker_master_tile_count_updated(self, current: int, total: int) -> None:
+        try:
+            cur = int(current)
+        except Exception:
+            cur = 0
+        try:
+            tot = int(total)
+        except Exception:
+            tot = 0
+        if tot < 0:
+            tot = 0
+        if tot > 0:
+            cur = max(0, min(cur, tot))
+        else:
+            cur = max(0, cur)
+        self.tiles_value_label.setText(f"{cur} / {tot}")
+
+    def _on_worker_cluster_override(self, overrides: Dict[str, Any]) -> None:
+        if not isinstance(overrides, dict):
+            return
+        self._apply_filter_overrides_to_config(overrides)
 
     def _on_worker_finished(self, success: bool, message: str) -> None:
         self.is_processing = False
