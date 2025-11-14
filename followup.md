@@ -212,18 +212,18 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
     - [x] Solver settings.
     - [x] Config overrides.
 
-- [ ] UI components:
-  - [ ] A QTableView or QListWidget showing:
-    - [ ] Filename.
-    - [ ] Status (WCS ok / missing).
-    - [ ] Group / tile / cluster info if available.
-  - [ ] Controls for:
-    - [ ] Clustering / grouping options also exposed in Tk filter GUI.
-    - [ ] Seestar-specific behaviors if any.
-  - [ ] Buttons:
-    - [ ] “Run analysis / scan”.
-    - [ ] “Validate / OK”.
-    - [ ] “Cancel”.
+- [x] UI components:
+  - [x] A QTableView or QListWidget showing:
+    - [x] Filename.
+    - [x] Status (WCS ok / missing).
+    - [x] Group / tile / cluster info if available.
+  - [x] Controls for:
+    - [x] Clustering / grouping options also exposed in Tk filter GUI.
+    - [x] Seestar-specific behaviors if any.
+  - [x] Buttons:
+    - [x] “Run analysis / scan”.
+    - [x] “Validate / OK”.
+    - [x] “Cancel”.
 
 - [ ] Stream scan and ASTAP interaction:
   - [ ] If scanning directories, use a background thread/QThread to avoid blocking the GUI.
@@ -277,3 +277,4 @@ Use this section to record issues, partial implementations, or TODOs that don’
 - [ ] Confirm whether Tk GUI currently exposes Phase 4.5 / super-tile controls before mirroring them in Qt.
 - [ ] Qt worker progress currently uses simple per-stage percentages and does not replicate Tk’s weighted progress/ETA smoothing yet.
 - [ ] Qt filter dialog currently focuses on manual include/exclude review; scanning, clustering, and preview tooling still pending.
+- [ ] Qt filter “Run analysis” button currently shows a placeholder message until scanning backend is integrated.
