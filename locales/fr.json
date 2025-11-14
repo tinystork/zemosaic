@@ -105,6 +105,7 @@
     "qt_field_force_seestar": "Forcer le mode Seestar",
     "qt_field_sds_mode": "Activer le mode SDS par défaut",
     "qt_field_sds_threshold": "Seuil de couverture SDS",
+    "qt_field_astap_max_instances": "Nombre max. d'instances ASTAP",
     "gui_cache_retention_label": "Rétention du cache :",
     "gui_logging_title": "Journalisation",
     "gui_logging_level": "Niveau de log :",

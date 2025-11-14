@@ -60,6 +60,11 @@ if importlib.util.find_spec("locales.zemosaic_localization") is not None:
 else:  # pragma: no cover - optional dependency guard
     ZeMosaicLocalization = None  # type: ignore[assignment]
 
+if importlib.util.find_spec("zemosaic_astrometry") is not None:
+    from zemosaic_astrometry import set_astap_max_concurrent_instances  # type: ignore
+else:  # pragma: no cover - optional dependency guard
+    set_astap_max_concurrent_instances = None  # type: ignore[assignment]
+
 
 class _FallbackLocalizer:
     """Very small localization shim when the real helper is unavailable."""
@@ -301,6 +306,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "astap_default_search_radius": 3.0,
             "astap_default_downsample": 2,
             "astap_default_sensitivity": 100,
+            "astap_max_instances": 1,
             "cluster_panel_threshold": 0.05,
             "cluster_target_groups": 0,
             "cluster_orientation_split_deg": 0.0,
@@ -506,6 +512,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self._tr("qt_field_astap_sensitivity", "Default sensitivity"),
             minimum=-25,
             maximum=500,
+        )
+        self._register_spinbox(
+            "astap_max_instances",
+            layout,
+            self._tr("qt_field_astap_max_instances", "Max ASTAP instances"),
+            minimum=1,
+            maximum=16,
         )
 
         return group
@@ -1252,6 +1265,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 "astap_default_search_radius": 3.0,
                 "astap_default_downsample": 2,
                 "astap_default_sensitivity": 100,
+                "astap_max_instances": 1,
                 "cluster_panel_threshold": 0.05,
                 "cluster_target_groups": 0,
                 "cluster_orientation_split_deg": 0.0,
@@ -1720,6 +1734,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         search_radius = float(self.config.get("astap_default_search_radius", 3.0) or 3.0)
         astap_downsample = int(self.config.get("astap_default_downsample", 2) or 2)
         astap_sensitivity = int(self.config.get("astap_default_sensitivity", 100) or 100)
+        astap_max_instances = self._resolve_astap_max_instances()
         solver_choice = str(self.config.get("solver_method", "ASTAP") or "ASTAP")
         api_key = str(self.config.get("astrometry_api_key", "") or "")
 
@@ -1735,6 +1750,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 "astap_search_radius_deg": search_radius,
                 "astap_downsample": astap_downsample,
                 "astap_sensitivity": astap_sensitivity,
+                "astap_max_instances": astap_max_instances,
             }
 
         try:
@@ -1761,7 +1777,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
         settings.astap_search_radius_deg = search_radius
         settings.astap_downsample = astap_downsample
         settings.astap_sensitivity = astap_sensitivity
-        return asdict(settings)
+        payload = asdict(settings)
+        payload["astap_max_instances"] = astap_max_instances
+        return payload
 
     def _on_start_clicked(self) -> None:
         self._start_processing(skip_filter_prompt=False)
@@ -1786,6 +1804,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
         self._collect_config_from_widgets()
+        self._apply_astap_concurrency_setting()
         self._save_config()
         if self.is_processing:
             try:
@@ -2052,6 +2071,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
         ):
             if key in overrides:
                 self._update_widget_from_config(key, overrides[key])
+        if "astap_max_instances" in overrides:
+            self._update_widget_from_config("astap_max_instances", overrides["astap_max_instances"])
+            self._apply_astap_concurrency_setting()
 
     def _update_widget_from_config(self, key: str, value: Any) -> None:
         self.config[key] = value
@@ -2093,6 +2115,22 @@ class ZeMosaicQtMainWindow(QMainWindow):
         except Exception:
             return False
         return False
+
+    def _resolve_astap_max_instances(self) -> int:
+        try:
+            value = int(self.config.get("astap_max_instances", 1) or 1)
+        except Exception:
+            value = 1
+        return max(1, value)
+
+    def _apply_astap_concurrency_setting(self) -> None:
+        instances = self._resolve_astap_max_instances()
+        os.environ["ZEMOSAIC_ASTAP_MAX_PROCS"] = str(instances)
+        if set_astap_max_concurrent_instances is not None:
+            try:
+                set_astap_max_concurrent_instances(instances)
+            except Exception:
+                pass
 
 
 def run_qt_main() -> int:
