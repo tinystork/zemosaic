@@ -14209,6 +14209,50 @@ def _assemble_global_mosaic_first_impl(
                 logger.debug("Global coadd per-patch background match failed", exc_info=True)
         return patch, weight, bbox
 
+    def _emit_progress(
+        done_count: int,
+        *,
+        entry: dict | None = None,
+        group_index: int | None = None,
+        entry_index: int | None = None,
+        valid_frames_count: int = 0,
+    ) -> None:
+        prog_value = None
+        if (
+            base_progress_phase is not None
+            and progress_weight_phase is not None
+            and total_images > 0
+        ):
+            prog_value = base_progress_phase + progress_weight_phase * (
+                done_count / max(1, total_images)
+            )
+        entry_path = None
+        if isinstance(entry, dict):
+            entry_path = (
+                entry.get("path_raw")
+                or entry.get("path")
+                or entry.get("path_preprocessed_cache")
+                or entry.get("path_preprocessed")
+            )
+        payload: dict[str, Any] = {
+            "done": int(done_count),
+            "total": int(total_images),
+            "valid": int(max(0, valid_frames_count)),
+            "method": coadd_method,
+        }
+        if entry_path:
+            payload["path"] = os.path.basename(entry_path) or entry_path
+        if group_index is not None:
+            payload["group_index"] = int(group_index)
+        if entry_index is not None:
+            payload["entry_index"] = int(entry_index)
+        pcb(
+            "p4_global_coadd_progress",
+            prog=prog_value,
+            lvl="INFO",
+            **_payload(**payload),
+        )
+
     def _attempt_gpu_helper_route() -> tuple[np.ndarray, np.ndarray, np.ndarray | None, dict[str, int]] | None:
         helper_entries: list[tuple[dict, Any]] = []
         helper_seen = 0
@@ -14291,6 +14335,7 @@ def _assemble_global_mosaic_first_impl(
                     coadd_k=kappa_sigma_k,
                     cpu_func=reproject_and_coadd,
                     use_gpu=True,
+                    allow_cpu_fallback=False,
                     match_background=match_background,
                 )
             except Exception as exc:
@@ -14411,50 +14456,6 @@ def _assemble_global_mosaic_first_impl(
     weight_grid: np.ndarray | None = None
     count_grid: np.ndarray | None = None
     channel_count: int | None = None
-
-    def _emit_progress(
-        done_count: int,
-        *,
-        entry: dict | None = None,
-        group_index: int | None = None,
-        entry_index: int | None = None,
-        valid_frames_count: int = 0,
-    ) -> None:
-        prog_value = None
-        if (
-            base_progress_phase is not None
-            and progress_weight_phase is not None
-            and total_images > 0
-        ):
-            prog_value = base_progress_phase + progress_weight_phase * (
-                done_count / max(1, total_images)
-            )
-        entry_path = None
-        if isinstance(entry, dict):
-            entry_path = (
-                entry.get("path_raw")
-                or entry.get("path")
-                or entry.get("path_preprocessed_cache")
-                or entry.get("path_preprocessed")
-            )
-        payload: dict[str, Any] = {
-            "done": int(done_count),
-            "total": int(total_images),
-            "valid": int(max(0, valid_frames_count)),
-            "method": coadd_method,
-        }
-        if entry_path:
-            payload["path"] = os.path.basename(entry_path) or entry_path
-        if group_index is not None:
-            payload["group_index"] = int(group_index)
-        if entry_index is not None:
-            payload["entry_index"] = int(entry_index)
-        pcb(
-            "p4_global_coadd_progress",
-            prog=prog_value,
-            lvl="INFO",
-            **_payload(**payload),
-        )
 
     images_seen = 0
     valid_frames = 0

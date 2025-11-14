@@ -51,6 +51,7 @@ import json
 import logging
 import re
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 import numpy as np
@@ -3433,6 +3434,13 @@ def _sanitize_winsor_limits(limits) -> tuple[float, float]:
     return low, high
 
 
+def _xp_errstate(xp_module, **kwargs):
+    errstate = getattr(xp_module, "errstate", None)
+    if callable(errstate):
+        return errstate(**kwargs)
+    return nullcontext()
+
+
 def _winsorized_weighted_average_chunk(
     stack,
     weights,
@@ -3450,7 +3458,7 @@ def _winsorized_weighted_average_chunk(
     clipped = xp.clip(stack, lower, upper)
     weighted = clipped * weights
     chunk_weight = xp.nansum(weights, axis=0)
-    with xp.errstate(invalid="ignore", divide="ignore"):
+    with _xp_errstate(xp, invalid="ignore", divide="ignore"):
         chunk_result = xp.nansum(weighted, axis=0) / xp.maximum(chunk_weight, 1e-6)
     chunk_result = xp.nan_to_num(chunk_result, nan=0.0, posinf=0.0, neginf=0.0)
     chunk_weight = xp.nan_to_num(chunk_weight, nan=0.0, posinf=0.0, neginf=0.0)
@@ -3478,7 +3486,7 @@ def _kappa_sigma_clip_chunk(
     kept_weights = xp.where(accept, weights, 0.0)
     clip_weight = xp.nansum(kept_weights, axis=0)
     clip_sum = xp.nansum(stack * kept_weights, axis=0)
-    with xp.errstate(invalid="ignore", divide="ignore"):
+    with _xp_errstate(xp, invalid="ignore", divide="ignore"):
         clipped = xp.where(
             clip_weight > 0,
             clip_sum / xp.maximum(clip_weight, 1e-6),
@@ -3817,6 +3825,7 @@ def _reproject_and_coadd_wrapper_impl(
     *,
     use_gpu: bool = False,
     cpu_func=None,
+    allow_cpu_fallback: bool = True,
     **kwargs,
 ):
     """Dispatch to GPU or CPU reproject+coadd.
@@ -3830,8 +3839,12 @@ def _reproject_and_coadd_wrapper_impl(
         except Exception as e:  # pragma: no cover - GPU failures
             import logging
             logging.getLogger(__name__).warning(
-                "GPU reprojection failed (%s), falling back to CPU", e
+                "GPU reprojection failed (%s)%s",
+                e,
+                "; falling back to CPU" if allow_cpu_fallback else "",
             )
+            if not allow_cpu_fallback:
+                raise
     if cpu_func is None:
         cpu_func = cpu_reproject_and_coadd
     # Remove GPU-only extras before CPU call to avoid unexpected kwargs
@@ -3859,7 +3872,15 @@ def gpu_reproject_and_coadd(data_list, wcs_list, shape_out, **kwargs):
     return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs)
 
 
-def reproject_and_coadd_wrapper(data_list, wcs_list, shape_out, use_gpu=False, cpu_func=None, **kwargs):
+def reproject_and_coadd_wrapper(
+    data_list,
+    wcs_list,
+    shape_out,
+    use_gpu=False,
+    cpu_func=None,
+    allow_cpu_fallback: bool = True,
+    **kwargs,
+):
     """Dispatch to CPU or GPU ``reproject_and_coadd`` depending on availability."""
     return _reproject_and_coadd_wrapper_impl(
         data_list,
@@ -3867,6 +3888,7 @@ def reproject_and_coadd_wrapper(data_list, wcs_list, shape_out, use_gpu=False, c
         shape_out,
         use_gpu=use_gpu,
         cpu_func=cpu_func,
+        allow_cpu_fallback=allow_cpu_fallback,
         **kwargs,
     )
 
