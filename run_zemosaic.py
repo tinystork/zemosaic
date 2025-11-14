@@ -156,15 +156,24 @@ def _notify_qt_backend_unavailable(error: Exception) -> None:
 
 
 def _determine_backend(argv):
-    """Determine which GUI backend should be used."""
+    """Determine which GUI backend should be used.
+
+    The selection prioritises explicit command-line flags over the environment
+    variable so that users can temporarily override their default preference.
+    Use ``--qt-gui`` to force the Qt backend or ``--tk-gui`` to force the
+    classic Tk interface regardless of :envvar:`ZEMOSAIC_GUI_BACKEND`.
+    """
 
     requested_backend = os.environ.get("ZEMOSAIC_GUI_BACKEND", "tk")
     cleaned_args = []
     for arg in argv:
         if arg == "--qt-gui":
             requested_backend = "qt"
-        else:
-            cleaned_args.append(arg)
+            continue
+        if arg == "--tk-gui":
+            requested_backend = "tk"
+            continue
+        cleaned_args.append(arg)
 
     backend = (requested_backend or "tk").strip().lower()
     if backend not in {"tk", "qt"}:
