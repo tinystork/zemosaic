@@ -1104,6 +1104,20 @@ def launch_filter_interface(
             except Exception:
                 root_candidate = Path(str(root))
 
+            # Also exclude the configured output directory subtree to avoid
+            # picking up artifacts like 'global_mosaic_wcs.fits' during input scan
+            out_dir_abs: Optional[Path] = None
+            try:
+                out_dir_val = str(cfg_defaults.get("output_dir") or "").strip()
+                if out_dir_val:
+                    out_dir_abs = Path(os.path.expanduser(os.path.expandvars(out_dir_val))).resolve(strict=False)
+            except Exception:
+                out_dir_abs = None
+            try:
+                wcs_out_base = str(cfg_defaults.get("global_wcs_output_path", "global_mosaic_wcs.fits") or "global_mosaic_wcs.fits").strip().lower()
+            except Exception:
+                wcs_out_base = "global_mosaic_wcs.fits"
+
             if is_path_excluded(root_candidate, EXCLUDED_DIRS):
                 _remember_exclusion(root_candidate, exclusion_msg)
                 if not startup_status_messages:
@@ -1116,6 +1130,13 @@ def launch_filter_interface(
 
             def _should_skip(path_value: Path) -> bool:
                 if not is_path_excluded(path_value, EXCLUDED_DIRS):
+                    # Skip inside output directory
+                    try:
+                        if out_dir_abs is not None and path_value.resolve(strict=False).as_posix().startswith(out_dir_abs.as_posix()):
+                            _remember_exclusion(path_value, exclusion_msg)
+                            return True
+                    except Exception:
+                        pass
                     return False
                 _remember_exclusion(path_value, exclusion_msg)
                 return True
@@ -1135,6 +1156,12 @@ def launch_filter_interface(
                             if entry.is_file() and entry.name.lower().endswith((".fit", ".fits")):
                                 if _should_skip(entry_path):
                                     continue
+                                # Skip the global descriptor FITS by name
+                                try:
+                                    if entry.name.strip().lower() == wcs_out_base:
+                                        continue
+                                except Exception:
+                                    pass
                                 yield entry.path
                 except Exception:
                     return
@@ -1159,6 +1186,11 @@ def launch_filter_interface(
                         candidate = current_dir / fn
                         if _should_skip(candidate):
                             continue
+                        try:
+                            if fn.strip().lower() == wcs_out_base:
+                                continue
+                        except Exception:
+                            pass
                         yield str(candidate)
 
         def _compute_footprint_from_wcs(
@@ -5565,7 +5597,12 @@ def launch_filter_interface(
                     if bool(sds_mode_var.get()):
                         success, _meta = _ensure_global_wcs_for_indices(selected_snapshot)
                         if success:
-                            sds_groups = _build_sds_batches_for_indices(selected_snapshot)
+                            try:
+                                cov_thr = float(cfg_defaults.get("sds_coverage_threshold", 0.92) or 0.92)
+                            except Exception:
+                                cov_thr = 0.92
+                            cov_thr = max(0.10, min(0.99, cov_thr))
+                            sds_groups = _build_sds_batches_for_indices(selected_snapshot, coverage_threshold=cov_thr)
                             if sds_groups:
                                 _log_async(
                                     f"ZeSupaDupStack: prepared {len(sds_groups)} coverage batch(es) for preview.",
@@ -6077,7 +6114,9 @@ def launch_filter_interface(
             _ensure_orientation_override_synced()
             _sync_sds_override()
             result["sds_mode"] = bool(sds_mode_var.get())
-            if workflow_mode_config == "seestar":
+            # Build or load a global WCS descriptor whenever SDS is ON or Seestar workflow is active.
+            require_global_plan = bool(result["sds_mode"]) or (workflow_mode_config == "seestar")
+            if require_global_plan:
                 success, meta_payload = _ensure_global_wcs_for_indices(sel)
                 if success and meta_payload:
                     overrides_state["global_wcs_meta"] = meta_payload
