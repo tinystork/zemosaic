@@ -147,6 +147,33 @@ Select stacking and assembly options
 
 Click Start Hierarchical Mosaic
 
+### Optional Qt interface (preview)
+
+ZeMosaic now ships with an experimental PySide6/Qt interface in addition to the
+classic Tk GUI. Tk remains the default and continues to work even when PySide6
+is not installed.
+
+To try the Qt frontend:
+
+1. Install the optional dependency:
+
+   ```bash
+   pip install PySide6
+   ```
+
+2. Launch ZeMosaic with either of the following options:
+
+   ```bash
+   # Via command-line flag
+   python run_zemosaic.py --qt-gui
+
+   # Or via environment variable
+   ZEMOSAIC_GUI_BACKEND=qt python run_zemosaic.py
+   ```
+
+If PySide6 is unavailable or an import error occurs, ZeMosaic automatically
+falls back to the Tk interface without interrupting your workflow.
+
 ### GPU helper for Phase 4
 
 Setting `use_gpu_phase5` to `true` (via the worker configuration or overrides) now enables the CUDA helper
