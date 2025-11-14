@@ -2,6 +2,12 @@
 
 This file tracks the progress of the PySide6 (Qt) GUI migration and related tasks.
 
+> **Task C Guard — Commit Checklist**
+> - Run `git status followup.md` before committing.
+> - If the file is not staged, update the checklist or add a note explaining the session’s progress.
+
+<!-- Task C Guard: Do not complete a session without editing this file. -->
+
 - Before each coding session, the agent MUST:
   - Read this file.
   - Identify the next unchecked item.
@@ -152,10 +158,10 @@ Ensure the coding agent ALWAYS updates this file after completing a task.
 
 **Detailed requirements:**
 
-- [ ] Add code comments or agent instructions where needed so the next coding actions always:
+- [x] Add code comments or agent instructions where needed so the next coding actions always:
   - Mark completed tasks with `[x]`
   - Add notes or caveats
-- [ ] Ensure this behavior is enforced in subsequent runs.
+- [x] Ensure this behavior is enforced in subsequent runs.
 
 
 ---
@@ -166,3 +172,4 @@ Ensure the coding agent ALWAYS updates this file after completing a task.
 
 - [x] Qt config serialization now normalizes legacy GPU keys to match Tk snapshots.
 - [x] Tk and Qt now coerce legacy GPU defaults so backend switching preserves stacking GPU flags across saves.
+- [x] Task C guard added to `agent.md` and `followup.md`; both now include explicit staging check instructions.
