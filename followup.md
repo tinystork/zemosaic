@@ -277,5 +277,5 @@ Use this section to record issues, partial implementations, or TODOs that don’
 - [x] Confirm whether Tk GUI currently exposes Phase 4.5 / super-tile controls before mirroring them in Qt. The Tk GUI does not expose Phase 4.5 / super-tile controls and Qt parity is not required at this time.
 - [x] Qt worker progress currently uses simple per-stage percentages and does not replicate Tk’s weighted progress/ETA smoothing yet.
 - [x] Qt filter dialog currently focuses on manual include/exclude review; scanning, clustering, and preview tooling still pending.
-- [ ] Qt filter “Run analysis” button currently shows a placeholder message until scanning backend is integrated.
+- [x] Qt filter “Run analysis” button currently shows a placeholder message until scanning backend is integrated.
 - [x] Qt GPU selector now mirrors the Tk combo with automatic GPU detection and retains manual override capability.

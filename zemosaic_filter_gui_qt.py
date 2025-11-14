@@ -947,19 +947,8 @@ class FilterQtDialog(QDialog):
         if self._scan_thread is not None and self._scan_thread.isRunning():
             return
 
-        if not self._stream_scan and not (
-            isinstance(self._input_payload, (str, os.PathLike))
-            and os.path.isdir(self._input_payload)
-        ):
-            message = self._localizer.get(
-                "filter.scan.not_enabled",
-                "Stream scanning is only available when launching from a directory.",
-            )
-            QMessageBox.information(self, self.windowTitle(), message)
-            return
-
         self._status_label.setText(
-            self._localizer.get("filter.scan.starting", "Starting directory analysis…")
+            self._localizer.get("filter.scan.starting", "Starting analysis…")
         )
         self._progress_bar.setValue(0)
         if self._run_analysis_btn is not None:
