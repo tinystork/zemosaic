@@ -1590,6 +1590,44 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self._tr("qt_field_coadd_cleanup", "Clean up memmap files after run"),
         )
 
+        num_workers_label = QLabel(
+            self._tr("num_workers_label", "Processing Threads:"),
+            general_box,
+        )
+        num_workers_spinbox = QSpinBox(general_box)
+        cpu_cores = os.cpu_count() or 0
+        max_spin_workers = 16
+        if cpu_cores:
+            max_spin_workers = max(1, cpu_cores) * 2
+            if max_spin_workers > 32:
+                max_spin_workers = 32
+        num_workers_spinbox.setRange(0, max_spin_workers)
+        raw_num_workers = self.config.get("num_processing_workers", 0)
+        try:
+            parsed_num_workers = int(raw_num_workers)
+        except (TypeError, ValueError):
+            parsed_num_workers = 0
+        if parsed_num_workers < 0:
+            parsed_num_workers = 0
+        if parsed_num_workers > max_spin_workers:
+            parsed_num_workers = max_spin_workers
+        num_workers_spinbox.setValue(parsed_num_workers)
+        self.config["num_processing_workers"] = parsed_num_workers
+        general_layout.addRow(num_workers_label, num_workers_spinbox)
+        num_workers_note = QLabel(
+            self._tr(
+                "num_workers_note", "(0 = auto, based on CPU cores)"
+            ),
+            general_box,
+        )
+        num_workers_note.setWordWrap(True)
+        general_layout.addRow(QLabel(""), num_workers_note)
+        self._config_fields["num_processing_workers"] = {
+            "kind": "spinbox",
+            "widget": num_workers_spinbox,
+            "type": int,
+        }
+
         self._register_spinbox(
             "assembly_process_workers",
             general_layout,
@@ -3124,6 +3162,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
             _coerce_int(cfg.get("inter_master_max_group", 64), 64),
         )
         num_base_workers = _coerce_int(cfg.get("num_processing_workers", 0), 0)
+        if num_base_workers < 0:
+            num_base_workers = 0
 
         apply_master_tile_crop = _coerce_bool(cfg.get("apply_master_tile_crop", True), True)
         master_tile_crop_percent = _coerce_float(cfg.get("master_tile_crop_percent", 3.0), 3.0)
