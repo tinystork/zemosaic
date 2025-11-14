@@ -138,10 +138,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
             layout,
             self._tr("qt_field_global_wcs_output", "Global WCS output path"),
         )
-        self._register_line_edit(
+        self._register_directory_picker(
             "coadd_memmap_dir",
             layout,
             self._tr("qt_field_coadd_memmap_dir", "Memmap directory"),
+            dialog_title=self._tr(
+                "qt_dialog_select_memmap_dir", "Select Memmap Folder"
+            ),
         )
 
         return group
