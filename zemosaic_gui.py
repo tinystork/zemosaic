@@ -415,6 +415,21 @@ class ZeMosaicGUI:
         self._progress_start_time = None
         self._last_global_progress = 0.0
         self._eta_seconds_smoothed = None
+        self._gpu_eta_override = None
+        self._gpu_helper_active = None
+        gpu_eta_profiles = self.config.get("gpu_eta_profiles")
+        if not isinstance(gpu_eta_profiles, dict):
+            gpu_eta_profiles = {}
+        self._gpu_eta_profiles = gpu_eta_profiles
+        self.config["gpu_eta_profiles"] = self._gpu_eta_profiles
+        try:
+            default_gpu_rate = float(self.config.get("gpu_eta_default_rate", 0.85))
+            if default_gpu_rate <= 0:
+                raise ValueError
+        except Exception:
+            default_gpu_rate = 0.85
+            self.config["gpu_eta_default_rate"] = default_gpu_rate
+        self._gpu_eta_default_rate = default_gpu_rate
         # Last filter outcomes to forward to worker (overrides + optional header list)
         self._last_filter_overrides = None
         self._last_filtered_header_items = None
@@ -2760,6 +2775,16 @@ class ZeMosaicGUI:
         if is_control_message:
             return # Ne pas traiter plus loin ces messages de contrôle
 
+        if isinstance(message_key_or_raw, str):
+            if message_key_or_raw == "global_coadd_info_helper_path":
+                self._handle_gpu_helper_start(kwargs)
+            elif message_key_or_raw == "p4_global_coadd_finished":
+                self._handle_gpu_helper_finish(kwargs)
+            elif message_key_or_raw in ("global_coadd_warn_helper_fallback", "global_coadd_warn_helper_unavailable"):
+                helper_name = str(kwargs.get("helper") or "")
+                if "gpu" in helper_name.lower():
+                    self._handle_gpu_helper_abort()
+
         # --- Préparation du contenu textuel du log ---
         # Niveaux pour lesquels on essaie de traduire `message_key_or_raw` comme une clé
         # Inclure aussi CRITICAL/INFO_DETAIL/DEBUG_DETAIL car le worker envoie des clés pour ces niveaux
@@ -2809,6 +2834,8 @@ class ZeMosaicGUI:
         elif current_level_str == "DEBUG_DETAIL": tag_name = "debug_detail_log"
         elif current_level_str == "INFO_DETAIL": tag_name = "info_detail_log"
         # Les niveaux ETA_LEVEL et CHRONO_LEVEL n'ont pas de tag spécifique ici, ils sont interceptés avant.
+        if self._is_gpu_log_entry(message_key_or_raw, log_text_content, kwargs):
+            tag_name = "gpu_log"
 
         # --- Mise à jour des éléments GUI via after_idle ---
         def update_gui_elements():
@@ -2861,9 +2888,228 @@ class ZeMosaicGUI:
                     self.log_text.tag_configure("success_log", foreground="#4CAF50", font=("Consolas", 9, "bold"))
                     self.log_text.tag_configure("debug_detail_log", foreground="gray50", font=("Consolas", 9))
                     self.log_text.tag_configure("info_detail_log", foreground="gray30", font=("Consolas", 9))
+                    self.log_text.tag_configure("gpu_log", foreground="#40E0D0", font=("Consolas", 9, "bold"))
                     self._log_tags_configured = True
             except tk.TclError:
                 pass # Ignorer si log_text n'est pas encore prêt lors d'un appel très précoce
+
+    def _format_eta_string(self, seconds: float, *, prefix: str = "") -> str:
+        try:
+            total = float(seconds)
+        except Exception:
+            total = 0.0
+        prefix_value = prefix
+        if total < 0:
+            prefix_value = prefix_value or "+"
+            total = abs(total)
+        eta_h, eta_rem = divmod(int(total + 0.5), 3600)
+        eta_m, eta_s = divmod(eta_rem, 60)
+        return f"{prefix_value}{eta_h:02d}:{eta_m:02d}:{eta_s:02d}"
+
+    def _set_eta_label_from_seconds(self, seconds: float, *, prefix: str = "") -> None:
+        if not hasattr(self, "eta_var"):
+            return
+        try:
+            formatted = self._format_eta_string(seconds, prefix=prefix)
+        except Exception:
+            formatted = self._tr("initial_eta_value", "--:--:--")
+        try:
+            self.eta_var.set(formatted)
+        except tk.TclError:
+            pass
+
+    def _start_gpu_eta_override(self, seconds: float, helper_name: str) -> None:
+        try:
+            seconds = float(seconds)
+        except Exception:
+            return
+        if seconds <= 0 or not hasattr(self, "root"):
+            return
+        self._stop_gpu_eta_override()
+        self._gpu_eta_override = {
+            "helper": helper_name,
+            "predicted": seconds,
+            "started": time.monotonic(),
+            "after_id": None,
+        }
+        self._tick_gpu_eta_override()
+
+    def _tick_gpu_eta_override(self) -> None:
+        state = getattr(self, "_gpu_eta_override", None)
+        if not state or not hasattr(self, "root") or not hasattr(self.root, "after"):
+            return
+        elapsed = max(0.0, time.monotonic() - state.get("started", time.monotonic()))
+        remaining = state.get("predicted", 0.0) - elapsed
+        if remaining >= 0:
+            self._set_eta_label_from_seconds(remaining)
+        else:
+            self._set_eta_label_from_seconds(abs(remaining), prefix="+")
+        try:
+            state["after_id"] = self.root.after(1000, self._tick_gpu_eta_override)
+        except Exception:
+            state["after_id"] = None
+
+    def _stop_gpu_eta_override(self) -> None:
+        state = getattr(self, "_gpu_eta_override", None)
+        if not state:
+            return
+        after_id = state.get("after_id")
+        if after_id and hasattr(self.root, "after_cancel"):
+            try:
+                self.root.after_cancel(after_id)
+            except Exception:
+                pass
+        self._gpu_eta_override = None
+
+    def _estimate_gpu_eta_seconds(self, helper_name: str, frames: int, channels: int, width: int, height: int) -> Optional[float]:
+        try:
+            width_val = float(width)
+            height_val = float(height)
+        except Exception:
+            return None
+        if width_val <= 0 or height_val <= 0:
+            return None
+        grid_mp = max(1.0, (width_val * height_val) / 1_000_000.0)
+        try:
+            frames_val = int(frames or 0)
+        except Exception:
+            frames_val = 0
+        frames_val = max(1, frames_val)
+        try:
+            channels_val = int(channels or 0)
+        except Exception:
+            channels_val = 0
+        channels_val = max(1, channels_val)
+        units = grid_mp * frames_val * max(1.0, channels_val / 3.0)
+        if units <= 0:
+            return None
+        profile = self._gpu_eta_profiles.get(helper_name)
+        rate = None
+        if isinstance(profile, dict):
+            try:
+                rate = float(profile.get("avg_rate") or 0.0)
+            except Exception:
+                rate = None
+        if not rate or rate <= 0:
+            rate = float(self._gpu_eta_default_rate or 0.85)
+        seconds = rate * units
+        return max(10.0, seconds)
+
+    def _record_gpu_eta_sample(self, helper_name: str, frames: int, channels: int, width: int, height: int, elapsed_seconds: float) -> None:
+        try:
+            elapsed = float(elapsed_seconds)
+        except Exception:
+            return
+        if elapsed <= 0:
+            return
+        try:
+            width_val = float(width)
+            height_val = float(height)
+        except Exception:
+            return
+        if width_val <= 0 or height_val <= 0:
+            return
+        grid_mp = max(1.0, (width_val * height_val) / 1_000_000.0)
+        try:
+            frames_val = int(frames or 0)
+        except Exception:
+            frames_val = 0
+        frames_val = max(1, frames_val)
+        try:
+            channels_val = int(channels or 0)
+        except Exception:
+            channels_val = 0
+        channels_val = max(1, channels_val)
+        units = grid_mp * frames_val * max(1.0, channels_val / 3.0)
+        if units <= 0:
+            return
+        sample_rate = elapsed / units
+        profile = self._gpu_eta_profiles.setdefault(helper_name, {"avg_rate": sample_rate, "samples": 0})
+        samples = int(profile.get("samples", 0))
+        existing_rate = profile.get("avg_rate")
+        alpha = 0.35
+        if existing_rate and samples > 0:
+            new_rate = (1 - alpha) * float(existing_rate) + alpha * sample_rate
+        else:
+            new_rate = sample_rate
+        profile["avg_rate"] = float(new_rate)
+        profile["samples"] = min(50, samples + 1)
+        profile["last_seconds"] = float(elapsed)
+        profile["last_units"] = float(units)
+        if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
+            try:
+                self.config["gpu_eta_profiles"] = self._gpu_eta_profiles
+                zemosaic_config.save_config(self.config)
+            except Exception:
+                pass
+
+    def _handle_gpu_helper_start(self, payload: dict) -> None:
+        payload = payload or {}
+        helper_name = str(payload.get("helper") or "gpu_reproject")
+        frames_val = payload.get("frames") or payload.get("images") or 0
+        channels_val = payload.get("channels") or 0
+        width_val = payload.get("grid_w") or payload.get("W") or 0
+        height_val = payload.get("grid_h") or payload.get("H") or 0
+        try:
+            frames_int = int(frames_val)
+        except Exception:
+            frames_int = 0
+        try:
+            channels_int = int(channels_val)
+        except Exception:
+            channels_int = 0
+        try:
+            width_int = int(width_val)
+        except Exception:
+            width_int = 0
+        try:
+            height_int = int(height_val)
+        except Exception:
+            height_int = 0
+        self._gpu_helper_active = {
+            "helper": helper_name,
+            "frames": frames_int,
+            "channels": channels_int,
+            "grid_w": width_int,
+            "grid_h": height_int,
+        }
+        predicted = self._estimate_gpu_eta_seconds(helper_name, frames_int, channels_int, width_int, height_int)
+        if predicted:
+            self._start_gpu_eta_override(predicted, helper_name)
+
+    def _handle_gpu_helper_finish(self, payload: dict) -> None:
+        payload = payload or {}
+        active = self._gpu_helper_active or {}
+        helper_ref = payload.get("helper") or active.get("helper")
+        helper_name = str(helper_ref) if helper_ref else None
+        frames_val = payload.get("images") or payload.get("frames") or active.get("frames") or 0
+        channels_val = payload.get("channels") or active.get("channels") or 0
+        width_val = payload.get("W") or payload.get("grid_w") or active.get("grid_w") or 0
+        height_val = payload.get("H") or payload.get("grid_h") or active.get("grid_h") or 0
+        elapsed_val = payload.get("elapsed_s")
+        self._stop_gpu_eta_override()
+        self._gpu_helper_active = None
+        if helper_name and width_val and height_val and elapsed_val:
+            self._record_gpu_eta_sample(helper_name, frames_val, channels_val, width_val, height_val, elapsed_val)
+
+    def _handle_gpu_helper_abort(self) -> None:
+        self._stop_gpu_eta_override()
+        self._gpu_helper_active = None
+
+    def _is_gpu_log_entry(self, key_candidate, log_text: str, params: dict) -> bool:
+        def _contains_gpu(value: Any) -> bool:
+            if isinstance(value, str) and "gpu" in value.lower():
+                return True
+            return False
+        if _contains_gpu(key_candidate):
+            return True
+        if isinstance(log_text, str) and _contains_gpu(log_text):
+            return True
+        if isinstance(params, dict):
+            for val in params.values():
+                if _contains_gpu(val):
+                    return True
+        return False
     def _phase45_reset_overlay(self, clear_groups=True):
         if clear_groups:
             self.phase45_groups = {}
@@ -3720,6 +3966,8 @@ class ZeMosaicGUI:
         self._stage_totals.clear()
         for key in self._stage_order:
             self._stage_progress_values[key] = 0.0
+        self._stop_gpu_eta_override()
+        self._gpu_helper_active = None
         try:
             self.eta_var.set(self._tr("initial_eta_value", "--:--:--"))
         except tk.TclError:
@@ -4111,6 +4359,8 @@ class ZeMosaicGUI:
             return
 
         # Finalize according to run outcome (completed or user-cancelled)
+        self._stop_gpu_eta_override()
+        self._gpu_helper_active = None
         self._log_message("CHRONO_STOP_REQUEST", None, "CHRONO_LEVEL")
         self.is_processing = False
         if hasattr(self, 'launch_button') and self.launch_button.winfo_exists():
@@ -4170,6 +4420,8 @@ class ZeMosaicGUI:
         """Immediately stop the running processing by terminating the worker."""
         if not self.is_processing:
             return
+        self._stop_gpu_eta_override()
+        self._gpu_helper_active = None
         self._cancel_requested = True
         try:
             if self.worker_process and self.worker_process.is_alive():

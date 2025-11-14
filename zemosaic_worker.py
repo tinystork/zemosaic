@@ -13268,74 +13268,54 @@ def run_hierarchical_mosaic(
             except Exception as exc_alpha:
                 logger.warning("phase6: could not write ALPHA extension: %s", exc_alpha)
 
-        if bool(save_final_as_uint16_config) and not legacy_rgb_flag:
-            if not hasattr(zemosaic_utils, "write_final_fits_uint16_color_aware"):
-                raise RuntimeError("write_final_fits_uint16_color_aware unavailable in zemosaic_utils")
-            is_rgb = (
-                isinstance(save_array, np.ndarray)
-                and save_array.ndim == 3
-                and save_array.shape[-1] == 3
-            )
-            zemosaic_utils.write_final_fits_uint16_color_aware(
-                final_fits_path,
-                save_array,
-                header=final_header,
-                force_rgb_planes=is_rgb,
-                legacy_rgb_cube=legacy_rgb_flag,
-                overwrite=True,
-            )
-            _attach_alpha_extension(final_fits_path, log_success=True)
-            if is_rgb:
+        is_rgb = (
+            isinstance(save_array, np.ndarray)
+            and save_array.ndim == 3
+            and save_array.shape[-1] == 3
+        )
+        zemosaic_utils.save_fits_image(
+            image_data=save_array,
+            output_path=final_fits_path,
+            header=final_header,
+            overwrite=True,
+            save_as_float=True,
+            legacy_rgb_cube=legacy_rgb_flag,
+            progress_callback=progress_callback,
+            axis_order="HWC",
+            alpha_mask=alpha_final,
+        )
+        _attach_alpha_extension(final_fits_path, log_success=True)
+
+        if (
+            bool(save_final_as_uint16_config)
+            and not legacy_rgb_flag
+            and ZEMOSAIC_UTILS_AVAILABLE
+            and hasattr(zemosaic_utils, "write_final_fits_uint16_color_aware")
+        ):
+            viewer_fits_path = os.path.join(output_folder, f"{output_base_name}_viewer.fits")
+            try:
+                zemosaic_utils.write_final_fits_uint16_color_aware(
+                    viewer_fits_path,
+                    save_array,
+                    header=final_header,
+                    force_rgb_planes=is_rgb,
+                    legacy_rgb_cube=legacy_rgb_flag,
+                    overwrite=True,
+                )
+                _attach_alpha_extension(viewer_fits_path, log_success=False)
                 pcb(
-                    "run_info_phase6_saved_uint16_rgb_planes",
+                    "run_info_phase6_viewer_fits_saved",
                     prog=None,
                     lvl="INFO_DETAIL",
-                    filename=os.path.basename(final_fits_path),
+                    filename=os.path.basename(viewer_fits_path),
                 )
-        else:
-            zemosaic_utils.save_fits_image(
-                image_data=save_array,
-                output_path=final_fits_path,
-                header=final_header,
-                overwrite=True,
-                save_as_float=not save_final_as_uint16_config,
-                legacy_rgb_cube=legacy_rgb_flag,
-                progress_callback=progress_callback,
-                axis_order="HWC",
-                alpha_mask=alpha_final,
-            )
-            _attach_alpha_extension(final_fits_path, log_success=True)
-
-            if (
-                ZEMOSAIC_UTILS_AVAILABLE
-                and hasattr(zemosaic_utils, "write_final_fits_uint16_color_aware")
-            ):
-                viewer_fits_path = os.path.join(output_folder, f"{output_base_name}_viewer.fits")
-                try:
-                    zemosaic_utils.write_final_fits_uint16_color_aware(
-                        viewer_fits_path,
-                        save_array,
-                        header=final_header,
-                        force_rgb_planes=isinstance(save_array, np.ndarray)
-                        and save_array.ndim == 3
-                        and save_array.shape[-1] == 3,
-                        legacy_rgb_cube=legacy_rgb_flag,
-                        overwrite=True,
-                    )
-                    _attach_alpha_extension(viewer_fits_path, log_success=False)
-                    pcb(
-                        "run_info_phase6_viewer_fits_saved",
-                        prog=None,
-                        lvl="INFO_DETAIL",
-                        filename=os.path.basename(viewer_fits_path),
-                    )
-                except Exception as e_viewer:
-                    pcb(
-                        "run_warn_phase6_viewer_fits_failed",
-                        prog=None,
-                        lvl="WARN",
-                        error=str(e_viewer),
-                    )
+            except Exception as e_viewer:
+                pcb(
+                    "run_warn_phase6_viewer_fits_failed",
+                    prog=None,
+                    lvl="WARN",
+                    error=str(e_viewer),
+                )
         
         if final_mosaic_coverage_HW is not None and np.any(final_mosaic_coverage_HW):
             coverage_path = os.path.join(output_folder, f"{output_base_name}_coverage.fits")
@@ -13576,17 +13556,63 @@ def run_hierarchical_mosaic(
     gc.collect()
 
     # Cleanup memmap .dat files now that arrays are released (Windows requires handles closed)
-    try:
-        if bool(coadd_use_memmap_config) and bool(coadd_cleanup_memmap_config) and coadd_memmap_dir_config:
+    def _cleanup_memmap_artifacts():
+        if not (
+            bool(coadd_use_memmap_config)
+            and bool(coadd_cleanup_memmap_config)
+            and coadd_memmap_dir_config
+            and os.path.isdir(coadd_memmap_dir_config)
+        ):
+            return
+        try:
             for _name in os.listdir(coadd_memmap_dir_config):
                 name_l = _name.lower()
-                if name_l.endswith('.dat') and (name_l.startswith('mosaic_') or name_l.startswith('coverage_') or name_l.startswith('zemosaic_')):
+                full_path = os.path.join(coadd_memmap_dir_config, _name)
+                if name_l.endswith(".dat") and (
+                    name_l.startswith("mosaic_")
+                    or name_l.startswith("coverage_")
+                    or name_l.startswith("zemosaic_")
+                ):
                     try:
-                        os.remove(os.path.join(coadd_memmap_dir_config, _name))
+                        os.remove(full_path)
                     except OSError:
                         pass
-    except Exception:
-        pass
+                    continue
+                if os.path.isdir(full_path) and name_l.startswith("mosaic_first_"):
+                    try:
+                        shutil.rmtree(full_path)
+                    except OSError:
+                        pass
+        except Exception:
+            pass
+
+        wcs_candidates: list[str] = []
+        try:
+            if isinstance(global_wcs_plan, dict):
+                if global_wcs_plan.get("fits_path"):
+                    wcs_candidates.append(str(global_wcs_plan.get("fits_path")))
+                if global_wcs_plan.get("json_path"):
+                    wcs_candidates.append(str(global_wcs_plan.get("json_path")))
+        except Exception:
+            pass
+        default_wcs_name = str(
+            (worker_config_cache or {}).get("global_wcs_output_path", "global_mosaic_wcs.fits")
+        ).strip() or "global_mosaic_wcs.fits"
+        if output_folder:
+            wcs_candidates.append(os.path.join(output_folder, default_wcs_name))
+            wcs_candidates.append(os.path.join(output_folder, f"{default_wcs_name}.json"))
+        for candidate in wcs_candidates:
+            if not candidate:
+                continue
+            try:
+                if os.path.isdir(candidate):
+                    continue
+                if os.path.exists(candidate) and "global_mosaic_wcs" in os.path.basename(candidate).lower():
+                    os.remove(candidate)
+            except OSError:
+                pass
+
+    _cleanup_memmap_artifacts()
 
 
 
@@ -13782,6 +13808,11 @@ def _assemble_global_mosaic_first_impl(
         callback=progress_callback,
         **kwargs,
     )
+    helper_progress_cap = 1.0
+    helper_wait_fraction = 0.0
+    cpu_eta_start_time = None
+    cpu_eta_last_emit = 0.0
+    CPU_ETA_MIN_INTERVAL = 4.0
 
     plan_mode = str(global_plan.get("mode") or "").strip().lower()
     plan_meta = global_plan.get("meta") if isinstance(global_plan.get("meta"), dict) else {}
@@ -14209,6 +14240,30 @@ def _assemble_global_mosaic_first_impl(
                 logger.debug("Global coadd per-patch background match failed", exc_info=True)
         return patch, weight, bbox
 
+    def _maybe_emit_cpu_eta(done_count: int) -> None:
+        nonlocal cpu_eta_start_time, cpu_eta_last_emit
+        if helper_progress_cap < 1.0:
+            return
+        if done_count <= 0 or total_images <= 0:
+            return
+        now = time.monotonic()
+        if cpu_eta_start_time is None:
+            cpu_eta_start_time = now
+        if now - cpu_eta_last_emit < CPU_ETA_MIN_INTERVAL:
+            return
+        elapsed = max(0.0, now - cpu_eta_start_time)
+        if elapsed <= 0:
+            return
+        remaining = max(0, total_images - done_count)
+        if remaining <= 0:
+            return
+        seconds_per_frame = elapsed / max(1, done_count)
+        eta_seconds = max(0.0, seconds_per_frame * remaining)
+        h, rem = divmod(int(eta_seconds + 0.5), 3600)
+        m, s = divmod(rem, 60)
+        pcb(f"ETA_UPDATE:{h:02d}:{m:02d}:{s:02d}", prog=None, lvl="ETA_LEVEL")
+        cpu_eta_last_emit = now
+
     def _emit_progress(
         done_count: int,
         *,
@@ -14223,9 +14278,10 @@ def _assemble_global_mosaic_first_impl(
             and progress_weight_phase is not None
             and total_images > 0
         ):
-            prog_value = base_progress_phase + progress_weight_phase * (
-                done_count / max(1, total_images)
-            )
+            frac = done_count / max(1, total_images)
+            if helper_progress_cap < 1.0:
+                frac = min(frac, helper_progress_cap)
+            prog_value = base_progress_phase + progress_weight_phase * frac
         entry_path = None
         if isinstance(entry, dict):
             entry_path = (
@@ -14252,6 +14308,7 @@ def _assemble_global_mosaic_first_impl(
             lvl="INFO",
             **_payload(**payload),
         )
+        _maybe_emit_cpu_eta(int(done_count))
 
     def _attempt_gpu_helper_route() -> tuple[np.ndarray, np.ndarray, np.ndarray | None, dict[str, int]] | None:
         helper_entries: list[tuple[dict, Any]] = []
@@ -14305,6 +14362,26 @@ def _assemble_global_mosaic_first_impl(
             break
         if channel_count is None or channel_count <= 0:
             return None
+        helper_stats = {"frames": int(helper_valid), "channels": int(channel_count)}
+        helper_payload = _payload(
+            helper="gpu_reproject",
+            frames=int(helper_stats["frames"]),
+            channels=int(helper_stats["channels"]),
+            grid_w=int(width),
+            grid_h=int(height),
+        )
+        pcb(
+            "global_coadd_info_helper_path",
+            prog=None,
+            lvl="INFO",
+            **helper_payload,
+        )
+        pcb(
+            "global_coadd_info_helper_magic_wait",
+            prog=None,
+            lvl="INFO_DETAIL",
+            **helper_payload,
+        )
         final_channels: list[np.ndarray] = []
         coverage_map: np.ndarray | None = None
         for channel_idx in range(channel_count):
@@ -14401,13 +14478,14 @@ def _assemble_global_mosaic_first_impl(
             max_cov = float(np.nanmax(coverage_map))
             if max_cov > 0:
                 alpha_map = np.clip((coverage_map / max_cov) * 255.0, 0, 255).astype(np.uint8)
-        helper_stats = {"frames": int(helper_valid), "channels": int(channel_count)}
         if prefetched_frame is not None:
             del prefetched_frame
         _emit_progress(max(helper_seen, total_images), valid_frames_count=int(helper_valid))
         return final_image, coverage_map, alpha_map, helper_stats
 
     if gpu_helper_supported:
+        helper_wait_fraction = 0.12
+        helper_progress_cap = max(0.0, 1.0 - helper_wait_fraction)
         helper_attempt = _attempt_gpu_helper_route()
         if helper_attempt is not None:
             helper_image, helper_coverage, helper_alpha, helper_stats = helper_attempt
@@ -14416,16 +14494,6 @@ def _assemble_global_mosaic_first_impl(
                 final_prog = base_progress_phase + progress_weight_phase
             elapsed = max(0.0, time.monotonic() - start_time)
             pcb(
-                "global_coadd_info_helper_path",
-                prog=None,
-                lvl="INFO",
-                **_payload(
-                    helper="gpu_reproject",
-                    frames=int(helper_stats.get("frames", 0)),
-                    channels=int(helper_stats.get("channels", 0)),
-                ),
-            )
-            pcb(
                 "p4_global_coadd_finished",
                 prog=final_prog,
                 lvl="SUCCESS",
@@ -14433,8 +14501,10 @@ def _assemble_global_mosaic_first_impl(
                     W=int(width),
                     H=int(height),
                     images=int(helper_stats.get("frames", 0)),
+                    channels=int(helper_stats.get("channels", 0)),
                     elapsed_s=float(elapsed),
                     method=coadd_method,
+                    helper="gpu_reproject",
                 ),
             )
             return (
@@ -14443,12 +14513,36 @@ def _assemble_global_mosaic_first_impl(
                 helper_alpha,
             )
         else:
+            helper_progress_cap = 1.0
+            helper_wait_fraction = 0.0
             pcb(
                 "global_coadd_warn_helper_fallback",
                 prog=None,
                 lvl="INFO_DETAIL",
                 **_payload(helper="gpu_reproject", reason="helper_failed"),
             )
+
+    pcb(
+        "global_coadd_info_cpu_path",
+        prog=None,
+        lvl="INFO_DETAIL",
+        **_payload(
+            frames=int(total_images),
+            grid_w=int(width),
+            grid_h=int(height),
+            method=coadd_method,
+        ),
+    )
+    pcb(
+        "global_coadd_info_cpu_magic_wait",
+        prog=None,
+        lvl="INFO_DETAIL",
+        **_payload(
+            frames=int(total_images),
+            grid_w=int(width),
+            grid_h=int(height),
+        ),
+    )
 
     store_patches = coadd_method in {"median", "winsorized", "kappa_sigma"}
     sum_grid: np.ndarray | None = None
