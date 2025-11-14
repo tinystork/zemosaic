@@ -97,6 +97,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "inter_master_photometry_intragroup": True,
             "inter_master_photometry_intersuper": True,
             "inter_master_photometry_clip_sigma": 3.0,
+            "cache_retention": "run_end",
             "quality_crop_enabled": False,
             "quality_crop_band_px": 32,
             "quality_crop_k_sigma": 2.0,
@@ -266,6 +267,30 @@ class ZeMosaicQtMainWindow(QMainWindow):
             single_step=1.0,
             decimals=1,
         )
+
+        cache_combo = QComboBox()
+        cache_options = [
+            ("run_end", self._tr("qt_cache_retention_run_end", "Release caches at run end")),
+            ("per_tile", self._tr("qt_cache_retention_per_tile", "Clear caches after each tile")),
+            ("keep", self._tr("qt_cache_retention_keep", "Keep caches between runs")),
+        ]
+        for value, label in cache_options:
+            cache_combo.addItem(label, value)
+        current_cache_mode = str(self.config.get("cache_retention", "run_end")).lower()
+        cache_index = next(
+            (idx for idx, (value, _label) in enumerate(cache_options) if value == current_cache_mode),
+            0,
+        )
+        cache_combo.setCurrentIndex(cache_index)
+        layout.addRow(
+            QLabel(self._tr("qt_field_cache_retention", "Cache retention")),
+            cache_combo,
+        )
+        self._config_fields["cache_retention"] = {
+            "kind": "combobox",
+            "widget": cache_combo,
+            "type": str,
+        }
 
         phase45_box = QGroupBox(
             self._tr("qt_group_phase45", "Phase 4.5 / Super-tiles"),

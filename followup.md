@@ -115,7 +115,7 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
 
 ### 3.3 Mosaic / clustering parameters
 
-- [ ] Add widgets for:
+- [x] Add widgets for:
   - [x] Cluster panel brightness / threshold.
   - [x] Target number of clusters / master tiles.
   - [x] Cluster orientation split degrees.
