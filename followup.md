@@ -225,10 +225,10 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
     - [x] “Validate / OK”.
     - [x] “Cancel”.
 
-- [ ] Stream scan and ASTAP interaction:
-  - [ ] If scanning directories, use a background thread/QThread to avoid blocking the GUI.
-  - [ ] Respect ASTAP instance limitations and concurrency caps (same logic as Tk filter GUI).
-  - [ ] Display progress of scanning and WCS solving.
+- [x] Stream scan and ASTAP interaction:
+  - [x] If scanning directories, use a background thread/QThread to avoid blocking the GUI.
+  - [x] Respect ASTAP instance limitations and concurrency caps (same logic as Tk filter GUI).
+  - [x] Display progress of scanning and WCS solving.
 
 - [ ] Preview:
   - [ ] If Tk filter GUI displays a field-of-view preview using Matplotlib:

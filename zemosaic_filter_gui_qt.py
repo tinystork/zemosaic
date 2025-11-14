@@ -15,13 +15,15 @@ if _pyside_spec is None:  # pragma: no cover - import guard
         "Install PySide6 or use the Tk interface instead."
     )
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtWidgets import (  # noqa: E402  - imported after availability check
     QApplication,
     QDialog,
     QDialogButtonBox,
     QGridLayout,
     QLabel,
+    QMessageBox,
+    QProgressBar,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -33,6 +35,19 @@ if importlib.util.find_spec("locales.zemosaic_localization") is not None:
     from locales.zemosaic_localization import ZeMosaicLocalization  # type: ignore
 else:  # pragma: no cover - optional dependency guard
     ZeMosaicLocalization = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - optional dependency for metadata extraction
+    from astropy.io import fits
+    from astropy.wcs import WCS
+except Exception:  # pragma: no cover - optional dependency guard
+    fits = None  # type: ignore[assignment]
+    WCS = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - optional dependency guard
+    from zemosaic_astrometry import solve_with_astap, set_astap_max_concurrent_instances
+except Exception:  # pragma: no cover - optional dependency guard
+    solve_with_astap = None  # type: ignore[assignment]
+    set_astap_max_concurrent_instances = None  # type: ignore[assignment]
 
 
 class _FallbackLocalizer:
@@ -59,6 +74,267 @@ class _NormalizedItem:
     instrument: str | None
     group_label: str | None
     include_by_default: bool = True
+
+
+def _header_has_wcs(header: Any) -> bool:
+    """Return ``True`` when the FITS header already contains a valid WCS."""
+
+    if header is None:
+        return False
+    try:
+        if WCS is not None:
+            wcs_obj = WCS(header)
+            if getattr(wcs_obj, "is_celestial", False):
+                return True
+    except Exception:
+        pass
+    for key in ("CTYPE1", "CTYPE2", "CD1_1", "CD2_2", "PC1_1", "PC2_2"):
+        if header.get(key):
+            return True
+    return False
+
+
+def _detect_instrument_from_header(header: Any) -> str | None:
+    """Mimic the Tk GUI heuristics to detect the instrument label."""
+
+    if header is None:
+        return None
+    try:
+        creator_raw = str(header.get("CREATOR", "")).strip()
+        instrume_raw = str(header.get("INSTRUME", "")).strip()
+    except Exception:
+        creator_raw = ""
+        instrume_raw = ""
+    creator = creator_raw.upper()
+    instrume = instrume_raw.upper()
+    if "SEESTAR S50" in creator:
+        return "Seestar S50"
+    if "SEESTAR S30" in creator:
+        return "Seestar S30"
+    if "ASIAIR" in creator:
+        return instrume_raw or "ASIAIR"
+    if instrume.startswith("ZWO ASI") or "ASI" in instrume:
+        return instrume_raw or "ASI (Unknown)"
+    if instrume_raw:
+        return instrume_raw
+    return creator_raw or None
+
+
+class _DirectoryScanWorker(QObject):
+    """Background worker resolving missing WCS entries with ASTAP."""
+
+    progress_changed = Signal(int, str)
+    row_updated = Signal(int, dict)
+    finished = Signal()
+    error = Signal(str)
+
+    def __init__(
+        self,
+        items: List[_NormalizedItem],
+        solver_settings: dict | None,
+        localizer: Any,
+        astap_overrides: dict | None = None,
+    ) -> None:
+        super().__init__()
+        self._items = items
+        self._solver_settings = solver_settings or {}
+        self._localizer = localizer
+        self._overrides = astap_overrides or {}
+        self._stop_requested = False
+
+    @Slot()
+    def run(self) -> None:
+        total = len(self._items)
+        if total == 0:
+            self.progress_changed.emit(0, self._localizer.get("filter.scan.empty", "No files to scan."))
+            self.finished.emit()
+            return
+
+        astap_cfg = self._prepare_astap_configuration()
+        if astap_cfg is None:
+            message = self._localizer.get(
+                "filter.scan.astap_missing",
+                "ASTAP configuration is incomplete; skipping WCS solving.",
+            )
+            self.error.emit(message)
+
+        for index, item in enumerate(self._items):
+            if self._stop_requested:
+                break
+            path = item.file_path
+            message = self._localizer.get(
+                "filter.scan.inspecting",
+                "Inspecting {name}…",
+                name=os.path.basename(path) if path else item.display_name,
+            )
+            self.progress_changed.emit(self._progress_percent(index, total), message)
+            row_update: dict[str, Any] = {}
+            if not path or not os.path.isfile(path):
+                row_update["error"] = self._localizer.get(
+                    "filter.scan.missing",
+                    "File missing or not accessible.",
+                )
+                self.row_updated.emit(index, row_update)
+                continue
+
+            header = None
+            if fits is not None:
+                try:
+                    header = fits.getheader(path, ignore_missing_end=True)
+                except Exception as exc:  # pragma: no cover - passthrough IO error
+                    row_update["error"] = str(exc)
+            else:
+                row_update["error"] = self._localizer.get(
+                    "filter.scan.astropy_missing",
+                    "Astropy is not installed; cannot inspect headers.",
+                )
+
+            has_wcs = _header_has_wcs(header) if header is not None else False
+            instrument = _detect_instrument_from_header(header)
+
+            if astap_cfg is not None and not has_wcs and solve_with_astap is not None and header is not None:
+                solve_message = self._localizer.get(
+                    "filter.scan.solving",
+                    "Solving WCS with ASTAP…",
+                )
+                self.progress_changed.emit(self._progress_percent(index, total), solve_message)
+
+                def _solver_callback(text: str, *_: Any) -> None:
+                    try:
+                        message_text = str(text)
+                    except Exception:
+                        message_text = ""
+                    if message_text:
+                        self.progress_changed.emit(
+                            self._progress_percent(index, total),
+                            message_text,
+                        )
+
+                try:
+                    wcs_result = solve_with_astap(
+                        path,
+                        header,
+                        astap_cfg["exe"],
+                        astap_cfg["data"],
+                        search_radius_deg=astap_cfg["radius"],
+                        downsample_factor=astap_cfg["downsample"],
+                        sensitivity=astap_cfg["sensitivity"],
+                        timeout_sec=astap_cfg["timeout"],
+                        update_original_header_in_place=False,
+                        progress_callback=_solver_callback,
+                    )
+                except Exception as exc:  # pragma: no cover - solver failure path
+                    row_update["error"] = str(exc)
+                else:
+                    if wcs_result is not None and getattr(wcs_result, "is_celestial", False):
+                        has_wcs = True
+                        row_update["solver"] = "ASTAP"
+
+            row_update["has_wcs"] = has_wcs
+            if instrument:
+                row_update["instrument"] = instrument
+            self.row_updated.emit(index, row_update)
+            completed_message = self._localizer.get(
+                "filter.scan.progress",
+                "Processed {done}/{total} files.",
+                done=index + 1,
+                total=total,
+            )
+            self.progress_changed.emit(self._progress_percent(index + 1, total), completed_message)
+
+        self.finished.emit()
+
+    def request_stop(self) -> None:
+        self._stop_requested = True
+
+    def _prepare_astap_configuration(self) -> dict[str, Any] | None:
+        exe_candidates = [
+            self._solver_settings.get("astap_executable_path"),
+            self._solver_settings.get("astap_executable"),
+            self._overrides.get("astap_executable_path"),
+        ]
+        data_candidates = [
+            self._solver_settings.get("astap_data_directory_path"),
+            self._solver_settings.get("astap_data_dir"),
+            self._overrides.get("astap_data_directory_path"),
+        ]
+        exe_path = next((str(p) for p in exe_candidates if p), "")
+        data_dir = next((str(p) for p in data_candidates if p), "")
+        if not exe_path or not os.path.isfile(exe_path):
+            return None
+
+        radius = self._coerce_float(
+            self._solver_settings.get("astap_search_radius_deg"),
+            self._overrides.get("astap_search_radius_deg"),
+            default=None,
+        )
+        downsample = self._coerce_int(
+            self._solver_settings.get("astap_downsample"),
+            self._overrides.get("astap_downsample"),
+            default=None,
+        )
+        sensitivity = self._coerce_int(
+            self._solver_settings.get("astap_sensitivity"),
+            self._overrides.get("astap_sensitivity"),
+            default=None,
+        )
+        timeout = self._coerce_int(
+            self._solver_settings.get("astap_timeout_sec"),
+            self._overrides.get("astap_timeout_sec"),
+            default=180,
+        )
+
+        if set_astap_max_concurrent_instances is not None:
+            concurrency = self._coerce_int(
+                self._solver_settings.get("astap_max_instances"),
+                self._overrides.get("astap_max_instances"),
+                default=None,
+            )
+            if concurrency:
+                try:
+                    set_astap_max_concurrent_instances(concurrency)
+                except Exception:  # pragma: no cover - runtime guard
+                    pass
+
+        return {
+            "exe": exe_path,
+            "data": data_dir,
+            "radius": radius,
+            "downsample": downsample,
+            "sensitivity": sensitivity,
+            "timeout": timeout,
+        }
+
+    @staticmethod
+    def _progress_percent(current: int, total: int) -> int:
+        if total <= 0:
+            return 0
+        try:
+            return min(100, max(0, int((current / total) * 100)))
+        except Exception:  # pragma: no cover - defensive
+            return 0
+
+    @staticmethod
+    def _coerce_float(*values: Any, default: float | None = None) -> float | None:
+        for value in values:
+            if value in (None, "", False):
+                continue
+            try:
+                return float(value)
+            except Exception:
+                continue
+        return default
+
+    @staticmethod
+    def _coerce_int(*values: Any, default: int | None = None) -> int | None:
+        for value in values:
+            if value in (None, "", False):
+                continue
+            try:
+                return int(value)
+            except Exception:
+                continue
+        return default
 
 
 class FilterQtDialog(QDialog):
@@ -107,6 +383,12 @@ class FilterQtDialog(QDialog):
 
         self._table = QTableWidget(self)
         self._summary_label = QLabel(self)
+        self._status_label = QLabel(self)
+        self._progress_bar = QProgressBar(self)
+        self._progress_bar.setRange(0, 100)
+        self._run_analysis_btn: QPushButton | None = None
+        self._scan_thread: QThread | None = None
+        self._scan_worker: _DirectoryScanWorker | None = None
         self._auto_group_checkbox = None
         self._seestar_checkbox = None
 
@@ -318,9 +600,9 @@ class FilterQtDialog(QDialog):
         main_layout.addWidget(self._table)
 
         control_group = QGridLayout()
-        run_scan_btn = QPushButton(self._localizer.get("filter.button.run_scan", "Run analysis"), self)
-        run_scan_btn.clicked.connect(self._on_run_analysis)  # type: ignore[arg-type]
-        control_group.addWidget(run_scan_btn, 0, 0)
+        self._run_analysis_btn = QPushButton(self._localizer.get("filter.button.run_scan", "Run analysis"), self)
+        self._run_analysis_btn.clicked.connect(self._on_run_analysis)  # type: ignore[arg-type]
+        control_group.addWidget(self._run_analysis_btn, 0, 0)
 
         control_row = QGridLayout()
         select_all_btn = QPushButton(self._localizer.get("filter.button.select_all", "Select all"), self)
@@ -332,6 +614,11 @@ class FilterQtDialog(QDialog):
         control_row.addWidget(self._summary_label, 0, 2)
         control_row.setColumnStretch(2, 1)
         control_group.addLayout(control_row, 0, 1, 2, 1)
+        progress_row = QGridLayout()
+        progress_row.addWidget(self._status_label, 0, 0)
+        progress_row.addWidget(self._progress_bar, 0, 1)
+        progress_row.setColumnStretch(1, 1)
+        control_group.addLayout(progress_row, 1, 0, 1, 2)
         main_layout.addLayout(control_group)
 
         options_box = self._create_options_box()
@@ -437,13 +724,45 @@ class FilterQtDialog(QDialog):
         return box
 
     def _on_run_analysis(self) -> None:
-        from PySide6.QtWidgets import QMessageBox
+        if self._scan_thread is not None and self._scan_thread.isRunning():
+            return
 
-        message = self._localizer.get(
-            "filter.message.run_analysis_placeholder",
-            "Automated scanning will be available in a later update.",
+        if not self._stream_scan and not (
+            isinstance(self._input_payload, (str, os.PathLike))
+            and os.path.isdir(self._input_payload)
+        ):
+            message = self._localizer.get(
+                "filter.scan.not_enabled",
+                "Stream scanning is only available when launching from a directory.",
+            )
+            QMessageBox.information(self, self.windowTitle(), message)
+            return
+
+        self._status_label.setText(
+            self._localizer.get("filter.scan.starting", "Starting directory analysis…")
         )
-        QMessageBox.information(self, self.windowTitle(), message)
+        self._progress_bar.setValue(0)
+        if self._run_analysis_btn is not None:
+            self._run_analysis_btn.setEnabled(False)
+
+        solver_settings = self._solver_settings or {}
+        self._scan_worker = _DirectoryScanWorker(
+            self._normalized_items,
+            solver_settings,
+            self._localizer,
+            astap_overrides=self._config_overrides,
+        )
+        self._scan_thread = QThread(self)
+        self._scan_worker.moveToThread(self._scan_thread)
+        self._scan_thread.started.connect(self._scan_worker.run)
+        self._scan_worker.progress_changed.connect(self._on_scan_progress)
+        self._scan_worker.row_updated.connect(self._on_scan_row_update)
+        self._scan_worker.error.connect(self._on_scan_error)
+        self._scan_worker.finished.connect(self._on_scan_finished)
+        self._scan_worker.finished.connect(self._scan_thread.quit)
+        self._scan_worker.finished.connect(self._scan_worker.deleteLater)
+        self._scan_thread.finished.connect(self._scan_thread.deleteLater)
+        self._scan_thread.start()
 
     # ------------------------------------------------------------------
     # QDialog API
@@ -477,6 +796,62 @@ class FilterQtDialog(QDialog):
         if self._seestar_checkbox is not None:
             overrides["filter_seestar_priority"] = bool(self._seestar_checkbox.isChecked())
         return overrides
+
+    # ------------------------------------------------------------------
+    # Scan worker slots
+    # ------------------------------------------------------------------
+    def _on_scan_progress(self, percent: int, message: str) -> None:
+        try:
+            self._progress_bar.setValue(percent)
+        except Exception:
+            pass
+        if message:
+            try:
+                self._status_label.setText(message)
+            except Exception:
+                pass
+
+    def _on_scan_row_update(self, row: int, payload: dict) -> None:
+        if not (0 <= row < len(self._normalized_items)):
+            return
+        entry = self._normalized_items[row]
+        has_wcs = payload.get("has_wcs")
+        if isinstance(has_wcs, bool):
+            entry.has_wcs = has_wcs
+            item = self._table.item(row, 1)
+            if item is not None:
+                text = (
+                    self._localizer.get("filter.value.wcs_present", "Yes")
+                    if has_wcs
+                    else self._localizer.get("filter.value.wcs_missing", "No")
+                )
+                item.setText(text)
+        instrument = payload.get("instrument")
+        if instrument:
+            entry.instrument = instrument
+            item = self._table.item(row, 3)
+            if item is not None:
+                item.setText(str(instrument))
+        self._update_summary_label()
+
+    def _on_scan_error(self, message: str) -> None:
+        if not message:
+            return
+        try:
+            self._status_label.setText(message)
+        except Exception:
+            pass
+
+    def _on_scan_finished(self) -> None:
+        if self._run_analysis_btn is not None:
+            self._run_analysis_btn.setEnabled(True)
+        self._scan_thread = None
+        self._scan_worker = None
+        self._status_label.setText(
+            self._localizer.get("filter.scan.completed", "Analysis completed.")
+        )
+        self._progress_bar.setValue(100)
+        self._update_summary_label()
 
 
 def launch_filter_interface_qt(
