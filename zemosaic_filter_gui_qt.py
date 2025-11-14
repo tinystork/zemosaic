@@ -1078,7 +1078,12 @@ class FilterQtDialog(QDialog):
             overrides["filter_auto_group"] = bool(self._auto_group_checkbox.isChecked())
         if self._seestar_checkbox is not None:
             overrides["filter_seestar_priority"] = bool(self._seestar_checkbox.isChecked())
-        return overrides
+        return overrides or None
+
+    def input_items(self) -> List[Any]:
+        """Return a shallow copy of the original payload list."""
+
+        return [entry.original for entry in self._normalized_items]
 
     # ------------------------------------------------------------------
     # Scan worker slots
@@ -1156,7 +1161,15 @@ def launch_filter_interface_qt(
     config_overrides=None,
     **kwargs,
 ):
-    """Launch the Qt-based filter dialog and return the user selection."""
+    """Launch the Qt-based filter dialog and return the user selection.
+
+    Returns a tuple ``(filtered_list, accepted, overrides)`` mirroring the
+    semantics of the Tk filter dialog. When the user validates the selection,
+    ``filtered_list`` contains the chosen entries and ``overrides`` includes
+    any optional tweaks gathered in the dialog. Cancelling the dialog returns
+    the original input list, ``accepted`` set to ``False`` and ``overrides``
+    set to ``None``.
+    """
 
     app = QApplication.instance()
     owns_app = False
@@ -1178,14 +1191,17 @@ def launch_filter_interface_qt(
 
     try:
         selected = dialog.selected_items()
+        overrides = dialog.overrides()
+        all_items = dialog.input_items()
+        accepted = dialog.was_accepted()
     finally:
         if owns_app:
             app.quit()
 
-    if dialog.was_accepted():
-        return selected, True, dialog.overrides()
+    if accepted:
+        return selected, True, overrides
 
-    return raw_files_with_wcs_or_dir, False, None
+    return all_items, False, None
 
 
 __all__ = ["FilterQtDialog", "launch_filter_interface_qt"]
