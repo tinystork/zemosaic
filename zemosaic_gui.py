@@ -62,7 +62,7 @@ import shutil
 import importlib
 import importlib.util
 import json
-from typing import Any, Optional
+from typing import Any, MutableMapping, Optional
 
 SYSTEM_NAME = platform.system().lower()
 IS_WINDOWS = SYSTEM_NAME == "windows"
@@ -131,6 +131,50 @@ for candidate in config_candidates:
 if not ZEMOSAIC_CONFIG_AVAILABLE:
     detail = _config_errors[-1] if _config_errors else "module introuvable"
     print(f"AVERTISSEMENT (zemosaic_gui): 'zemosaic_config.py' introuvable ({detail}).")
+
+
+def _coerce_gpu_bool(value: Any, default: bool = False) -> bool:
+    """Normalize truthy values that may come from JSON or legacy configs."""
+
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        if not normalized:
+            return default
+    if value is None:
+        return default
+    return bool(value)
+
+
+def _ensure_legacy_gpu_defaults_on_config_module() -> None:
+    """Ensure DEFAULT_CONFIG mirrors the legacy stacking GPU keys."""
+
+    if not ZEMOSAIC_CONFIG_AVAILABLE or not zemosaic_config:
+        return
+    defaults = getattr(zemosaic_config, "DEFAULT_CONFIG", None)
+    if not isinstance(defaults, dict):
+        return
+
+    canonical = _coerce_gpu_bool(defaults.get("use_gpu_phase5"), False)
+    defaults["use_gpu_phase5"] = canonical
+    for key in ("stack_use_gpu", "use_gpu_stack"):
+        defaults[key] = _coerce_gpu_bool(defaults.get(key, canonical), canonical)
+
+
+def _synchronize_legacy_gpu_flags(config_mapping: MutableMapping[str, Any]) -> None:
+    """Align GPU flags in a config mapping for backend parity."""
+
+    canonical = _coerce_gpu_bool(config_mapping.get("use_gpu_phase5"), False)
+    config_mapping["use_gpu_phase5"] = canonical
+    for key in ("stack_use_gpu", "use_gpu_stack"):
+        config_mapping[key] = _coerce_gpu_bool(config_mapping.get(key, canonical), canonical)
 
 # --- Worker Import ---
 run_hierarchical_mosaic = None
@@ -220,11 +264,13 @@ class ZeMosaicGUI:
 
         self.config = {}
         if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
+            _ensure_legacy_gpu_defaults_on_config_module()
             self.config = zemosaic_config.load_config()
+            _synchronize_legacy_gpu_flags(self.config)
         else:
             # Dictionnaire de configuration de secours si zemosaic_config.py n'est pas trouvé
             # ou si le chargement échoue.
-            self.config = { 
+            self.config = {
                 "astap_executable_path": "", "astap_data_directory_path": "",
                 "astap_default_search_radius": 3.0, "astap_default_downsample": 2,
                 "astap_default_sensitivity": 100, "language": "en",
@@ -253,6 +299,8 @@ class ZeMosaicGUI:
                 "cluster_target_groups": 0,
                 "cluster_orientation_split_deg": 0.0
             }
+
+            _synchronize_legacy_gpu_flags(self.config)
 
         self.config.setdefault("altaz_nanize", True)
 
