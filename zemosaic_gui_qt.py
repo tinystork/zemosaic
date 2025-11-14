@@ -366,16 +366,15 @@ class ZeMosaicQtWorker(QObject):
                 payload_dict: Dict[str, Any] = {}
                 if isinstance(kwargs, dict):
                     payload_dict.update(kwargs)
-                helper_name = str(payload_dict.get("helper") or "")
-                if helper_name and "gpu" in helper_name.lower():
-                    self.gpu_helper_event.emit("start", payload_dict)
+                # Mirror Tk behavior: always surface helper start payload;
+                # downstream UI can interpret the helper name as needed.
+                self.gpu_helper_event.emit("start", payload_dict)
             elif msg_key == "p4_global_coadd_finished":
                 payload_dict = {}
                 if isinstance(kwargs, dict):
                     payload_dict.update(kwargs)
-                helper_name = str(payload_dict.get("helper") or "")
-                if helper_name and "gpu" in helper_name.lower():
-                    self.gpu_helper_event.emit("finish", payload_dict)
+                # Mirror Tk behavior: always surface helper finish payload.
+                self.gpu_helper_event.emit("finish", payload_dict)
             elif msg_key in {"global_coadd_warn_helper_fallback", "global_coadd_warn_helper_unavailable"}:
                 payload_dict = {}
                 if isinstance(kwargs, dict):

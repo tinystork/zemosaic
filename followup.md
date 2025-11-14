@@ -143,10 +143,10 @@ Qt currently treats these as plain log lines. Tk extracts and displays:
 
 **Detailed requirements:**
 
-- [ ] Extend Qt `_handle_payload` to detect the same event types as Tk.
-- [ ] Implement Qt-safe equivalents of `_handle_gpu_helper_*`.
-- [ ] Update Qt UI labels / overlays accordingly.
-- [ ] Ensure no business logic duplication; reuse worker payloads.
+- [x] Extend Qt `_handle_payload` to detect the same event types as Tk.
+- [x] Implement Qt-safe equivalents of `_handle_gpu_helper_*`.
+- [x] Update Qt UI labels / overlays accordingly.
+- [x] Ensure no business logic duplication; reuse worker payloads.
 
 
 ---
@@ -233,4 +233,5 @@ Ensure the coding agent ALWAYS updates this file after completing a task.
 - [x] Qt config serialization now normalizes legacy GPU keys to match Tk snapshots.
 - [x] Tk and Qt now coerce legacy GPU defaults so backend switching preserves stacking GPU flags across saves.
 - [x] Task C guard added to `agent.md` and `followup.md`; both now include explicit staging check instructions.
-- [ ] 2024-06-30: Audit identified outstanding parity gaps (Tasks B, D-G added); pending implementation.
+- [x] 2024-06-30: Audit identified outstanding parity gaps (Tasks B, D-G added); pending implementation.
+- [x] 2025-11-14: Task B implemented and verified — Qt `_handle_payload` now emits structured GPU helper events, and `ZeMosaicQtMainWindow` applies ETA overrides and helper tracking in parity with Tk `_log_message`/`_handle_gpu_helper_*`.
