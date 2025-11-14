@@ -4,22 +4,28 @@ astroquery
 reproject
 astroalign
 opencv-python-headless
-psutil
+psutil>=5.9
 fsspec
 bottleneck
 threadpoolctl
 Photutils
 zarr>=2
 packaging
-# --- Optional Dependencies ---
-psutil>=5.9       # Optional: Auto-Tune CPU/I-O
-acstools          # For satellite trail detection (Uncomment if needed)
-# cupy-cuda11x==12.2.0     # For GPU acceleration (EXAMPLE! VERSION MUST MATCH YOUR CUDA TOOLKIT!)
-#                          # Replace '11x' with your CUDA major version (e.g., 11x, 12x)
-                           # Check available versions: https://pypi.org/project/cupy-cuda11x/
-                           # Uncomment and adjust if you have a compatible NVIDIA GPU and CUDA installed.
-wmi; platform_system == "Windows"     # for zemosaic gpu support (windows only)
-shapely # Geometry operations (used by ccdproc)
+shapely                     # Geometry operations (used by ccdproc)
+
+# --- Optional GUI & tooling dependencies ---
+PySide6>=6.6                # Qt interface (PySide6 GUI backend)
+PyQt5                       # Standalone visu.py FITS viewer
+wmi; platform_system == "Windows"     # Windows-only GPU detection helper
+
+# --- Optional science / analysis helpers ---
+acstools                    # Satellite trail detection (enable when needed)
+# matplotlib>=3.7           # Enable Qt filter preview plots when desired
+
+# cupy-cuda11x==12.2.0      # For GPU acceleration (EXAMPLE! VERSION MUST MATCH YOUR CUDA TOOLKIT!)
+#                           # Replace '11x' with your CUDA major version (e.g., 11x, 12x)
+#                           # Check available versions: https://pypi.org/project/cupy-cuda11x/
+#                           # Uncomment and adjust if you have a compatible NVIDIA GPU and CUDA installed.
 
 # ---------------------------------------------------------------------------
 # NOTES ON NUMPY 2.x COMPATIBILITY (IMPORTANT!)
@@ -84,7 +90,7 @@ shapely # Geometry operations (used by ccdproc)
 # ---------------------------------------------------------------------------
 # Dependencies ONLY for visu.py (PyQt5 FITS Viewer Tool)
 # ---------------------------------------------------------------------------
-PyQt5                    # GUI framework for the standalone visu.py viewer
+# PyQt5 is documented in the optional GUI dependencies section above.
 
 # ===========================================================================
 # FIN DES NOTES (Version Française)

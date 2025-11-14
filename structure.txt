@@ -1,31 +1,48 @@
 zemosaic/
 │
-├── run_zemosaic.py               # Script principal de lancement
-├── zemosaic.spec                 # Fichier PyInstaller pour générer l'exe
-├── requirements.txt              # Dépendances
-├── README.md                     # Documentation
+├── CHANGELOG.md                  # Historique des évolutions utilisateur
+├── README.md                     # Présentation et instructions générales
+├── agent.md                      # Consignes opérationnelles pour l'agent
+├── followup.md                   # Journal de progression du portage Qt
+├── requirements.txt              # Dépendances principales et optionnelles
+├── run_zemosaic.py               # Point d'entrée sélectionnant Tk ou Qt
+├── structure.txt                 # Ce fichier : cartographie du dépôt
+├── astap_docs.html               # Documentation intégrée sur ASTAP
+├── quality_manifest.json         # Indicateurs de qualité regroupés
+├── solver_settings.py            # Objet de configuration ASTAP haut-niveau
+├── solver_settings.json          # Paramètres ASTAP sérialisés
+├── __init__.py                   # Initialise le package racine
+├── cuda_utils.py                 # Utilitaires CUDA partagés (compatibilité)
+├── diagnose.py                   # Script de diagnostic d'installation
+├── lecropper.py                  # Logique de recadrage/Alt-Az existante
+├── zemosaic_align_stack.py       # Fonctions d'alignement et d'empilement
+├── zemosaic_astrometry.py        # Intégration ASTAP / résolution WCS
+├── zemosaic_config.py            # Chargement et persistance de la config
+├── zemosaic_filter_gui.py        # Interface filtre (implémentation Tk)
+├── zemosaic_filter_gui_qt.py     # Interface filtre PySide6
+├── zemosaic_gui.py               # Interface graphique principale Tk
+├── zemosaic_gui_qt.py            # Interface graphique principale PySide6
+├── zemosaic_utils.py             # Fonctions utilitaires communes
+├── zemosaic_worker.py            # Orchestrateur de traitement mosaïque
+├── zequalityMT.py                # Outils qualité multi-thread
+├── zewcscleaner.py               # Nettoyage des métadonnées WCS
 │
-├── icon/                         # Icônes de l'application
-│   └── zemosaic.ico              # Icône principale .ico
+├── compile/                      # Scripts de packaging multiplateformes
+│   ├── build_zemosaic_posix.sh   # Construction pour Linux/macOS
+│   └── compile_zemosaic._win.bat # Construction pour Windows
 │
-├── locales/                      # Fichiers de traduction
-│   ├── en.json
-│   └── fr.json
+├── core/                         # Modules partagés par les interfaces
+│   ├── __init__.py
+│   ├── cuda_utils.py             # Détection GPU pour interfaces
+│   └── tk_safe.py                # Aides Tk thread-safe
 │
-├── compile/                      # Outils de compilation
-│   └── build_zemosaic.bat        # Script batch de compilation
+├── icon/                         # Ressources graphiques embarquées
+│   ├── zemosaic.ico
+│   ├── zemosaic_64x64.png
+│   └── zemosaic_icon.png
 │
-├── zemosaic_gui.py               # Interface Tkinter
-├── zemosaic_worker.py            # Thread principal de traitement
-├── zemosaic_align_stack.py       # Fonctions d'alignement
-├── zemosaic_astrometry.py        # Appel ASTAP
-├── zemosaic_localization.py      # Gestion des langues
-├── zemosaic_utils.py             # Fonctions utilitaires
-├── zemosaic_config.py            # Configuration de l'interface
-│
-├── test.py                       # Script de test
-│
-├── .venv/                        # (IGNORÉ) Environnement virtuel Python
-├── build/                        # (IGNORÉ) Temporaire PyInstaller
-├── dist/                         # (IGNORÉ) Contient le .exe généré
-└── __pycache__/                  # (IGNORÉ) Fichiers compilés Python
+└── locales/                      # Internationalisation
+    ├── __init__.py
+    ├── en.json                   # Traductions anglaises
+    ├── fr.json                   # Traductions françaises
+    └── zemosaic_localization.py  # Utilitaire de localisation
