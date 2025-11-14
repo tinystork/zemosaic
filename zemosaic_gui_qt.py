@@ -5,7 +5,8 @@ The Qt interface is optional and can be launched from the regular
 variable ``ZEMOSAIC_GUI_BACKEND=qt`` or by passing the ``--qt-gui``
 command-line flag. When neither of those are supplied the application
 falls back to the classic Tk interface, ensuring existing workflows
-continue to operate without PySide6.
+continue to operate without PySide6. Passing ``--tk-gui`` explicitly
+selects the Tk interface even if the environment variable requests Qt.
 """
 from __future__ import annotations
 
