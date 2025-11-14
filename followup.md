@@ -124,19 +124,19 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
 
 ### 3.4 Cropping / quality / Alt-Az options
 
-- [ ] Quality crop controls:
-  - [ ] Checkbox `quality_crop_enabled`.
-  - [ ] Numeric inputs for band size, k-sigma, margin, etc.
-  - [ ] `crop_follow_signal` toggle.
-- [ ] Alt-Az cleanup controls (lecropper altZ):
-  - [ ] `altaz_cleanup_enabled` checkbox.
-  - [ ] Margin percent.
-  - [ ] Decay.
-  - [ ] `altaz_nanize` toggle.
-- [ ] ZeQualityMT integration:
-  - [ ] If Tk GUI exposes “ZeQualityMT” or “quality filter” toggles/thresholds, add equivalent controls.
-- [ ] Two-pass coverage renormalization:
-  - [ ] Replicate any options that control two-pass renorm, coverage thresholds, etc.
+- [x] Quality crop controls:
+  - [x] Checkbox `quality_crop_enabled`.
+  - [x] Numeric inputs for band size, k-sigma, margin, etc.
+  - [x] `crop_follow_signal` toggle.
+- [x] Alt-Az cleanup controls (lecropper altZ):
+  - [x] `altaz_cleanup_enabled` checkbox.
+  - [x] Margin percent.
+  - [x] Decay.
+  - [x] `altaz_nanize` toggle.
+- [x] ZeQualityMT integration:
+  - [x] If Tk GUI exposes “ZeQualityMT” or “quality filter” toggles/thresholds, add equivalent controls.
+- [x] Two-pass coverage renormalization:
+  - [x] Replicate any options that control two-pass renorm, coverage thresholds, etc.
 
 ### 3.5 Logging / progress panel
 

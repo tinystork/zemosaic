@@ -91,7 +91,23 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "inter_master_photometry_clip_sigma": 3.0,
             "quality_crop_enabled": False,
             "quality_crop_band_px": 32,
+            "quality_crop_k_sigma": 2.0,
+            "quality_crop_margin_px": 8,
+            "quality_crop_min_run": 2,
+            "crop_follow_signal": True,
             "altaz_cleanup_enabled": False,
+            "altaz_margin_percent": 5.0,
+            "altaz_decay": 0.15,
+            "altaz_nanize": True,
+            "quality_gate_enabled": False,
+            "quality_gate_threshold": 0.48,
+            "quality_gate_edge_band_px": 64,
+            "quality_gate_k_sigma": 2.5,
+            "quality_gate_erode_px": 3,
+            "quality_gate_move_rejects": True,
+            "two_pass_coverage_renorm": False,
+            "two_pass_cov_sigma_px": 50,
+            "two_pass_cov_gain_clip": [0.85, 1.18],
         }
         for key, fallback in self._default_config_values.items():
             self.config.setdefault(key, fallback)
@@ -391,24 +407,211 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self._tr("qt_group_quality", "Cropping / quality / Alt-Az"),
             self,
         )
-        layout = QFormLayout(group)
-        layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(10)
 
+        crop_group = QGroupBox(
+            self._tr("qt_group_quality_crop", "Quality crop"),
+            group,
+        )
+        crop_layout = QFormLayout(crop_group)
+        crop_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
         self._register_checkbox(
             "quality_crop_enabled",
-            layout,
+            crop_layout,
             self._tr("qt_field_quality_crop_enabled", "Enable quality crop"),
         )
-        self._register_line_edit(
+        self._register_spinbox(
             "quality_crop_band_px",
-            layout,
-            self._tr("qt_field_quality_crop_band", "Quality crop band (px)"),
+            crop_layout,
+            self._tr("qt_field_quality_crop_band", "Band width (px)"),
+            minimum=4,
+            maximum=256,
+            single_step=4,
+        )
+        self._register_double_spinbox(
+            "quality_crop_k_sigma",
+            crop_layout,
+            self._tr("qt_field_quality_crop_k_sigma", "K-sigma"),
+            minimum=0.5,
+            maximum=5.0,
+            single_step=0.1,
+            decimals=1,
+        )
+        self._register_spinbox(
+            "quality_crop_min_run",
+            crop_layout,
+            self._tr("qt_field_quality_crop_min_run", "Minimum run"),
+            minimum=1,
+            maximum=32,
+        )
+        self._register_spinbox(
+            "quality_crop_margin_px",
+            crop_layout,
+            self._tr("qt_field_quality_crop_margin", "Margin (px)"),
+            minimum=0,
+            maximum=64,
         )
         self._register_checkbox(
+            "crop_follow_signal",
+            crop_layout,
+            self._tr("qt_field_crop_follow_signal", "Follow signal when cropping"),
+        )
+        layout.addWidget(crop_group)
+
+        altaz_group = QGroupBox(
+            self._tr("qt_group_altaz_cleanup", "Alt-Az cleanup"),
+            group,
+        )
+        altaz_layout = QFormLayout(altaz_group)
+        altaz_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        self._register_checkbox(
             "altaz_cleanup_enabled",
-            layout,
+            altaz_layout,
             self._tr("qt_field_altaz_enabled", "Enable Alt-Az cleanup"),
         )
+        self._register_double_spinbox(
+            "altaz_margin_percent",
+            altaz_layout,
+            self._tr("qt_field_altaz_margin", "Margin (%)"),
+            minimum=0.0,
+            maximum=50.0,
+            single_step=0.5,
+            decimals=1,
+        )
+        self._register_double_spinbox(
+            "altaz_decay",
+            altaz_layout,
+            self._tr("qt_field_altaz_decay", "Decay"),
+            minimum=0.0,
+            maximum=2.0,
+            single_step=0.05,
+            decimals=2,
+        )
+        self._register_checkbox(
+            "altaz_nanize",
+            altaz_layout,
+            self._tr("qt_field_altaz_nanize", "Convert Alt-Az gaps to NaN"),
+        )
+        layout.addWidget(altaz_group)
+
+        quality_gate_group = QGroupBox(
+            self._tr("qt_group_quality_gate", "Master tile quality gate"),
+            group,
+        )
+        quality_gate_layout = QFormLayout(quality_gate_group)
+        quality_gate_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        self._register_checkbox(
+            "quality_gate_enabled",
+            quality_gate_layout,
+            self._tr("qt_field_quality_gate_enabled", "Enable quality gate"),
+        )
+        self._register_checkbox(
+            "quality_gate_move_rejects",
+            quality_gate_layout,
+            self._tr("qt_field_quality_gate_move", "Move rejected frames to subfolder"),
+        )
+        self._register_double_spinbox(
+            "quality_gate_threshold",
+            quality_gate_layout,
+            self._tr("qt_field_quality_gate_threshold", "Threshold"),
+            minimum=0.0,
+            maximum=1.0,
+            single_step=0.01,
+            decimals=2,
+        )
+        self._register_spinbox(
+            "quality_gate_edge_band_px",
+            quality_gate_layout,
+            self._tr("qt_field_quality_gate_edge", "Edge band (px)"),
+            minimum=0,
+            maximum=4096,
+        )
+        self._register_double_spinbox(
+            "quality_gate_k_sigma",
+            quality_gate_layout,
+            self._tr("qt_field_quality_gate_k_sigma", "K-sigma"),
+            minimum=0.0,
+            maximum=10.0,
+            single_step=0.1,
+            decimals=1,
+        )
+        self._register_spinbox(
+            "quality_gate_erode_px",
+            quality_gate_layout,
+            self._tr("qt_field_quality_gate_erode", "Erode (px)"),
+            minimum=0,
+            maximum=512,
+        )
+        layout.addWidget(quality_gate_group)
+
+        coverage_group = QGroupBox(
+            self._tr("qt_group_two_pass", "Two-pass coverage renormalization"),
+            group,
+        )
+        coverage_layout = QFormLayout(coverage_group)
+        coverage_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        self._register_checkbox(
+            "two_pass_coverage_renorm",
+            coverage_layout,
+            self._tr(
+                "qt_field_two_pass_enabled",
+                "Enable two-pass coverage renormalization",
+            ),
+        )
+        self._register_spinbox(
+            "two_pass_cov_sigma_px",
+            coverage_layout,
+            self._tr("qt_field_two_pass_sigma", "Sigma radius (px)"),
+            minimum=0,
+            maximum=512,
+            single_step=5,
+        )
+
+        gain_widget = QWidget(coverage_group)
+        gain_layout = QHBoxLayout(gain_widget)
+        gain_layout.setContentsMargins(0, 0, 0, 0)
+        gain_layout.setSpacing(6)
+
+        gain_min_spin = QDoubleSpinBox(gain_widget)
+        gain_min_spin.setRange(0.1, 5.0)
+        gain_min_spin.setSingleStep(0.01)
+        gain_min_spin.setDecimals(2)
+        gain_max_spin = QDoubleSpinBox(gain_widget)
+        gain_max_spin.setRange(0.1, 5.0)
+        gain_max_spin.setSingleStep(0.01)
+        gain_max_spin.setDecimals(2)
+
+        gain_clip = self.config.get("two_pass_cov_gain_clip", [0.85, 1.18])
+        if not (
+            isinstance(gain_clip, (list, tuple))
+            and len(gain_clip) >= 2
+        ):
+            gain_clip = [0.85, 1.18]
+            self.config["two_pass_cov_gain_clip"] = list(gain_clip)
+        gain_min_spin.setValue(float(gain_clip[0]))
+        gain_max_spin.setValue(float(gain_clip[1]))
+
+        gain_layout.addWidget(gain_min_spin)
+        gain_layout.addWidget(QLabel("→", gain_widget))
+        gain_layout.addWidget(gain_max_spin)
+
+        coverage_layout.addRow(
+            QLabel(self._tr("qt_field_two_pass_gain", "Gain clip range")),
+            gain_widget,
+        )
+        self._config_fields["two_pass_cov_gain_clip"] = {
+            "kind": "composite",
+            "widget": (gain_min_spin, gain_max_spin),
+            "type": list,
+            "value_getter": lambda: [
+                float(gain_min_spin.value()),
+                float(gain_max_spin.value()),
+            ],
+        }
+
+        layout.addWidget(coverage_group)
 
         return group
 
@@ -555,9 +758,12 @@ class ZeMosaicQtMainWindow(QMainWindow):
         *,
         minimum: int,
         maximum: int,
+        single_step: int | None = None,
     ) -> None:
         spinbox = QSpinBox()
         spinbox.setRange(minimum, maximum)
+        if single_step is not None:
+            spinbox.setSingleStep(single_step)
         current_value = int(self.config.get(key, minimum))
         spinbox.setValue(current_value)
         layout.addRow(QLabel(label_text), spinbox)
