@@ -143,10 +143,70 @@ Qt currently treats these as plain log lines. Tk extracts and displays:
 
 **Detailed requirements:**
 
-- [x] Extend Qt `_handle_payload` to detect the same event types as Tk.
-- [x] Implement Qt-safe equivalents of `_handle_gpu_helper_*`.
-- [x] Update Qt UI labels / overlays accordingly.
-- [x] Ensure no business logic duplication; reuse worker payloads.
+- [ ] Extend Qt `_handle_payload` to detect the same event types as Tk.
+- [ ] Implement Qt-safe equivalents of `_handle_gpu_helper_*`.
+- [ ] Update Qt UI labels / overlays accordingly.
+- [ ] Ensure no business logic duplication; reuse worker payloads.
+
+
+---
+
+## Task D — Worker payload & progress parity
+
+**Goal:**
+Bring Qt worker signal handling to full parity with the Tk GUI so that all structured payloads are surfaced.
+
+**Detailed requirements:**
+
+- [ ] Consume `ETA_UPDATE`, chrono control, raw/master counter, and cluster override payloads within `_handle_payload`.
+- [ ] Emit dedicated Qt signals for each payload type and update the main window labels.
+- [ ] Ensure chrono timers start/stop/reset identically to Tk behavior.
+- [ ] Confirm worker cancellation propagates to timers and status indicators.
+
+
+---
+
+## Task E — Progress panel completeness
+
+**Goal:**
+Mirror Tk’s logging/progress panel in the Qt UI.
+
+**Detailed requirements:**
+
+- [ ] Add UI elements for master tile counts, remaining raw files, and chrono displays.
+- [ ] Bind the new elements to the signals introduced in Task D.
+- [ ] Persist the additional labels/values in any UI refresh or config snapshot routines.
+- [ ] Validate layout matches Tk ordering and terminology.
+
+
+---
+
+## Task F — Log translation & GPU warnings
+
+**Goal:**
+Ensure Qt log rendering behaves like Tk, including localization formatting and GPU helper highlighting.
+
+**Detailed requirements:**
+
+- [ ] Pass worker-provided kwargs to the localization formatter.
+- [ ] Support the same translation key prefixes that Tk accepts.
+- [ ] Reintroduce GPU warning highlighting / styling equivalent to Tk’s `_is_gpu_log_entry` handling.
+- [ ] Confirm GPU helper fallback messages remain visible and translated.
+
+
+---
+
+## Task G — Localization selector
+
+**Goal:**
+Expose runtime language switching in the Qt GUI consistent with the Tk combobox.
+
+**Detailed requirements:**
+
+- [ ] Add a language selector widget bound to `config["language"]`.
+- [ ] Invoke `localizer.set_language` and refresh all UI text when changed.
+- [ ] Persist the selection in config saves and reloads.
+- [ ] Verify Tk and Qt remain in sync when toggling backends after a language change.
 
 
 ---
@@ -173,3 +233,4 @@ Ensure the coding agent ALWAYS updates this file after completing a task.
 - [x] Qt config serialization now normalizes legacy GPU keys to match Tk snapshots.
 - [x] Tk and Qt now coerce legacy GPU defaults so backend switching preserves stacking GPU flags across saves.
 - [x] Task C guard added to `agent.md` and `followup.md`; both now include explicit staging check instructions.
+- [ ] 2024-06-30: Audit identified outstanding parity gaps (Tasks B, D-G added); pending implementation.
