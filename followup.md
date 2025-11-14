@@ -153,7 +153,7 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
   - [ ] Clear-log button.
   - [ ] Combobox for log level (DEBUG / INFO / WARN / ERROR), bound to config.
 
-- [ ] Ensure there is a clear mapping between logging levels and how lines appear in the log widget (prefix, color, etc. – basic prefix is enough for now).
+- [x] Ensure there is a clear mapping between logging levels and how lines appear in the log widget (prefix, color, etc. – basic prefix is enough for now).
 
 
 ## Phase 4 — Worker integration and threading

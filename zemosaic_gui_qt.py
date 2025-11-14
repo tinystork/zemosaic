@@ -66,6 +66,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         self.config: Dict[str, Any] = self._load_config()
         self.localizer = self._create_localizer(self.config.get("language", "en"))
+        self._log_level_prefixes = {
+            "debug": self._tr("qt_log_prefix_debug", "[DEBUG] "),
+            "info": self._tr("qt_log_prefix_info", "[INFO] "),
+            "success": self._tr("qt_log_prefix_success", "[SUCCESS] "),
+            "warning": self._tr("qt_log_prefix_warning", "[WARNING] "),
+            "error": self._tr("qt_log_prefix_error", "[ERROR] "),
+        }
         self._default_config_values: Dict[str, Any] = {
             "input_dir": "",
             "output_dir": "",
@@ -872,7 +879,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
             try:
                 zemosaic_config.save_config(self.config)
             except Exception as exc:  # pragma: no cover - log instead of raising
-                self._append_log(f"Failed to save configuration: {exc}")
+                self._append_log(
+                    f"Failed to save configuration: {exc}", level="error"
+                )
 
     def _create_localizer(self, language_code: str) -> Any:
         if ZeMosaicLocalization is not None:
@@ -885,11 +894,16 @@ class ZeMosaicQtMainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Events & callbacks
     # ------------------------------------------------------------------
-    def _append_log(self, message: str) -> None:
+    def _append_log(self, message: str, level: str = "info") -> None:
+        normalized_level = level.lower().strip()
+        prefix = self._log_level_prefixes.get(normalized_level)
+        if prefix is None and normalized_level:
+            prefix = f"[{normalized_level.upper()}] "
+        formatted_message = f"{prefix}{message}" if prefix else message
         if hasattr(self, "log_output"):
-            self.log_output.appendPlainText(message)
+            self.log_output.appendPlainText(formatted_message)
         else:  # pragma: no cover - initialization guard
-            print(message)
+            print(formatted_message)
 
     def _on_start_clicked(self) -> None:
         self._collect_config_from_widgets()
@@ -898,12 +912,14 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self._tr(
                 "qt_log_start_placeholder",
                 "Start requested (worker integration pending).",
-            )
+            ),
+            level="info",
         )
 
     def _on_stop_clicked(self) -> None:
         self._append_log(
-            self._tr("qt_log_stop_placeholder", "Stop requested (no worker yet).")
+            self._tr("qt_log_stop_placeholder", "Stop requested (no worker yet)."),
+            level="warning",
         )
 
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
