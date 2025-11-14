@@ -203,14 +203,14 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
 
 **Goal:** Provide a Qt-based alternative to `zemosaic_filter_gui.launch_filter_interface`.
 
-- [ ] Implement the main Qt dialog class, e.g. `FilterQtDialog(QDialog)`:
-  - [ ] Accept parameters matching `launch_filter_interface_qt(...)` signature.
-  - [ ] Store:
-    - [ ] The input directory OR list of file metadata.
-    - [ ] Stream scan configuration.
-    - [ ] Preview cap.
-    - [ ] Solver settings.
-    - [ ] Config overrides.
+- [x] Implement the main Qt dialog class, e.g. `FilterQtDialog(QDialog)`:
+  - [x] Accept parameters matching `launch_filter_interface_qt(...)` signature.
+  - [x] Store:
+    - [x] The input directory OR list of file metadata.
+    - [x] Stream scan configuration.
+    - [x] Preview cap.
+    - [x] Solver settings.
+    - [x] Config overrides.
 
 - [ ] UI components:
   - [ ] A QTableView or QListWidget showing:
@@ -276,3 +276,4 @@ Use this section to record issues, partial implementations, or TODOs that don’
 
 - [ ] Confirm whether Tk GUI currently exposes Phase 4.5 / super-tile controls before mirroring them in Qt.
 - [ ] Qt worker progress currently uses simple per-stage percentages and does not replicate Tk’s weighted progress/ETA smoothing yet.
+- [ ] Qt filter dialog currently focuses on manual include/exclude review; scanning, clustering, and preview tooling still pending.
