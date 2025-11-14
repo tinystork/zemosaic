@@ -236,13 +236,13 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
     - [x] Respect `preview_cap` to avoid plotting thousands of tiles.
   - [x] Update preview when the analysis completes or when settings change.
 
-- [ ] Return semantics:
-  - [ ] On OK:
-    - [ ] Build the `filtered_list` equivalent to the Tk filter GUI’s behavior.
-    - [ ] Build any `overrides` (grouping, master tile caps, etc.).
-    - [ ] Return `(filtered_list, True, overrides)` from `launch_filter_interface_qt`.
-  - [ ] On Cancel or window close:
-    - [ ] Return `(input_list, False, None)` to indicate no changes.
+- [x] Return semantics:
+  - [x] On OK:
+    - [x] Build the `filtered_list` equivalent to the Tk filter GUI’s behavior.
+    - [x] Build any `overrides` (grouping, master tile caps, etc.).
+    - [x] Return `(filtered_list, True, overrides)` from `launch_filter_interface_qt`.
+  - [x] On Cancel or window close:
+    - [x] Return `(input_list, False, None)` to indicate no changes.
 
 - [ ] Integrate with main Qt GUI:
   - [ ] Provide a function or button in `ZeMosaicQtMainWindow` to launch the Qt filter dialog.
