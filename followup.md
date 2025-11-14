@@ -261,7 +261,7 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
   - [x] All user-facing strings pass through the localization helper where reasonable.
   - [x] There is no hard-coded English where a key exists already.
 - [ ] Verify configuration:
-  - [ ] Qt GUI reads existing config files correctly.
+  - [x] Qt GUI reads existing config files correctly.
   - [ ] Changes in Qt GUI are reflected in the shared config, visible from Tk GUI as well.
 - [ ] Documentation:
   - [ ] Add docstrings or comments in Qt modules explaining how to launch the Qt GUI (env var + CLI flag).
