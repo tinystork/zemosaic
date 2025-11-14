@@ -512,6 +512,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         main_layout.addWidget(self._create_instrument_group())
         main_layout.addWidget(self._create_mosaic_group())
         main_layout.addWidget(self._create_quality_group())
+        main_layout.addWidget(self._create_stacking_group())
         main_layout.addWidget(self._create_final_assembly_group())
         main_layout.addWidget(self._create_logging_group())
 
@@ -1227,6 +1228,283 @@ class ZeMosaicQtMainWindow(QMainWindow):
         }
 
         layout.addWidget(coverage_group)
+
+        return group
+
+    def _create_stacking_group(self) -> QGroupBox:
+        group = QGroupBox(
+            self._tr("stacking_options_frame_title", "Stacking Options (Master Tiles)"),
+            self,
+        )
+        layout = QFormLayout(group)
+        layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        norm_combo = QComboBox(group)
+        norm_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        norm_options = [
+            ("none", self._tr("norm_method_none", "None")),
+            ("linear_fit", self._tr("norm_method_linear_fit", "Linear Fit (Sky)")),
+            ("sky_mean", self._tr("norm_method_sky_mean", "Sky Mean Subtraction")),
+        ]
+        for value, label in norm_options:
+            norm_combo.addItem(label, value)
+        current_norm = str(self.config.get("stacking_normalize_method", "linear_fit"))
+        norm_index = next(
+            (idx for idx, (value, _label) in enumerate(norm_options) if value == current_norm),
+            0,
+        )
+        norm_combo.setCurrentIndex(norm_index)
+        layout.addRow(QLabel(self._tr("stacking_norm_method_label", "Normalization:")), norm_combo)
+        self._config_fields["stacking_normalize_method"] = {
+            "kind": "combobox",
+            "widget": norm_combo,
+            "type": str,
+            "value_getter": norm_combo.currentData,
+        }
+
+        weight_combo = QComboBox(group)
+        weight_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        weight_options = [
+            ("none", self._tr("weight_method_none", "None")),
+            ("noise_variance", self._tr("weight_method_noise_variance", "Noise Variance (1/σ²)")),
+            ("noise_fwhm", self._tr("weight_method_noise_fwhm", "Noise + FWHM")),
+        ]
+        for value, label in weight_options:
+            weight_combo.addItem(label, value)
+        current_weight = str(self.config.get("stacking_weighting_method", "noise_variance"))
+        weight_index = next(
+            (idx for idx, (value, _label) in enumerate(weight_options) if value == current_weight),
+            0,
+        )
+        weight_combo.setCurrentIndex(weight_index)
+        layout.addRow(QLabel(self._tr("stacking_weight_method_label", "Weighting:")), weight_combo)
+        self._config_fields["stacking_weighting_method"] = {
+            "kind": "combobox",
+            "widget": weight_combo,
+            "type": str,
+            "value_getter": weight_combo.currentData,
+        }
+
+        reject_combo = QComboBox(group)
+        reject_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        reject_options = [
+            ("none", self._tr("reject_algo_none", "None")),
+            ("kappa_sigma", self._tr("reject_algo_kappa_sigma", "Kappa-Sigma Clip")),
+            (
+                "winsorized_sigma_clip",
+                self._tr("reject_algo_winsorized_sigma_clip", "Winsorized Sigma Clip"),
+            ),
+            ("linear_fit_clip", self._tr("reject_algo_linear_fit_clip", "Linear Fit Clip")),
+        ]
+        for value, label in reject_options:
+            reject_combo.addItem(label, value)
+        current_reject = str(
+            self.config.get("stacking_rejection_algorithm", "winsorized_sigma_clip")
+        )
+        reject_index = next(
+            (idx for idx, (value, _label) in enumerate(reject_options) if value == current_reject),
+            0,
+        )
+        reject_combo.setCurrentIndex(reject_index)
+        layout.addRow(QLabel(self._tr("stacking_reject_algo_label", "Rejection Algorithm:")), reject_combo)
+        self._config_fields["stacking_rejection_algorithm"] = {
+            "kind": "combobox",
+            "widget": reject_combo,
+            "type": str,
+            "value_getter": reject_combo.currentData,
+        }
+
+        self._register_double_spinbox(
+            "stacking_kappa_low",
+            layout,
+            self._tr("stacking_kappa_low_label", "Kappa Low:"),
+            minimum=0.1,
+            maximum=10.0,
+            single_step=0.1,
+            decimals=2,
+        )
+        self._register_double_spinbox(
+            "stacking_kappa_high",
+            layout,
+            self._tr("stacking_kappa_high_label", "Kappa High:"),
+            minimum=0.1,
+            maximum=10.0,
+            single_step=0.1,
+            decimals=2,
+        )
+
+        winsor_value = self.config.get("stacking_winsor_limits", (0.05, 0.05))
+        parsed_winsor: Tuple[float, float]
+        if isinstance(winsor_value, str):
+            parts = [segment.strip() for segment in winsor_value.split(",") if segment.strip()]
+            if len(parts) >= 2:
+                try:
+                    parsed_winsor = (float(parts[0]), float(parts[1]))
+                except ValueError:
+                    parsed_winsor = (0.05, 0.05)
+                    self.config["stacking_winsor_limits"] = [
+                        parsed_winsor[0],
+                        parsed_winsor[1],
+                    ]
+                else:
+                    self.config["stacking_winsor_limits"] = [
+                        parsed_winsor[0],
+                        parsed_winsor[1],
+                    ]
+            else:
+                parsed_winsor = (0.05, 0.05)
+                self.config["stacking_winsor_limits"] = [parsed_winsor[0], parsed_winsor[1]]
+        elif isinstance(winsor_value, (list, tuple)) and len(winsor_value) >= 2:
+            try:
+                parsed_winsor = (float(winsor_value[0]), float(winsor_value[1]))
+            except (TypeError, ValueError):
+                parsed_winsor = (0.05, 0.05)
+                self.config["stacking_winsor_limits"] = [parsed_winsor[0], parsed_winsor[1]]
+            else:
+                self.config["stacking_winsor_limits"] = [parsed_winsor[0], parsed_winsor[1]]
+        else:
+            parsed_winsor = (0.05, 0.05)
+            self.config["stacking_winsor_limits"] = [parsed_winsor[0], parsed_winsor[1]]
+
+        winsor_container = QWidget(group)
+        winsor_layout = QHBoxLayout(winsor_container)
+        winsor_layout.setContentsMargins(0, 0, 0, 0)
+        winsor_layout.setSpacing(6)
+
+        winsor_low = QDoubleSpinBox(winsor_container)
+        winsor_low.setRange(0.0, 0.49)
+        winsor_low.setDecimals(3)
+        winsor_low.setSingleStep(0.01)
+        winsor_low.setValue(parsed_winsor[0])
+
+        winsor_high = QDoubleSpinBox(winsor_container)
+        winsor_high.setRange(0.0, 0.49)
+        winsor_high.setDecimals(3)
+        winsor_high.setSingleStep(0.01)
+        winsor_high.setValue(parsed_winsor[1])
+
+        winsor_layout.addWidget(winsor_low)
+        winsor_layout.addWidget(QLabel("→", winsor_container))
+        winsor_layout.addWidget(winsor_high)
+
+        layout.addRow(
+            QLabel(self._tr("stacking_winsor_limits_label", "Winsor Limits (low,high):")),
+            winsor_container,
+        )
+
+        winsor_note = QLabel(
+            self._tr("stacking_winsor_note", "(e.g., 0.05,0.05 for 5% each side)"),
+            group,
+        )
+        winsor_note.setWordWrap(True)
+        layout.addRow(QLabel(""), winsor_note)
+
+        self._config_fields["stacking_winsor_limits"] = {
+            "kind": "composite",
+            "widget": (winsor_low, winsor_high),
+            "type": list,
+            "value_getter": lambda: [
+                float(winsor_low.value()),
+                float(winsor_high.value()),
+            ],
+        }
+
+        combine_combo = QComboBox(group)
+        combine_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        combine_options = [
+            ("mean", self._tr("combine_method_mean", "Mean")),
+            ("median", self._tr("combine_method_median", "Median")),
+        ]
+        for value, label in combine_options:
+            combine_combo.addItem(label, value)
+        current_combine = str(self.config.get("stacking_final_combine_method", "mean"))
+        combine_index = next(
+            (idx for idx, (value, _label) in enumerate(combine_options) if value == current_combine),
+            0,
+        )
+        combine_combo.setCurrentIndex(combine_index)
+        layout.addRow(
+            QLabel(self._tr("stacking_final_combine_label", "Final Combine:")),
+            combine_combo,
+        )
+        self._config_fields["stacking_final_combine_method"] = {
+            "kind": "combobox",
+            "widget": combine_combo,
+            "type": str,
+            "value_getter": combine_combo.currentData,
+        }
+
+        self._register_checkbox(
+            "poststack_equalize_rgb",
+            layout,
+            self._tr("stacking_post_equalize_rgb_label", "Equalize RGB (per sub-stack):"),
+        )
+
+        radial_checkbox = QCheckBox(
+            self._tr("stacking_apply_radial_label", "Apply Radial Weighting:"),
+            group,
+        )
+        radial_checkbox.setChecked(bool(self.config.get("apply_radial_weight", False)))
+        layout.addRow(radial_checkbox)
+        self._config_fields["apply_radial_weight"] = {
+            "kind": "checkbox",
+            "widget": radial_checkbox,
+            "type": bool,
+        }
+
+        radial_feather = QDoubleSpinBox(group)
+        radial_feather.setRange(0.1, 1.0)
+        radial_feather.setSingleStep(0.05)
+        radial_feather.setDecimals(2)
+        radial_feather.setValue(float(self.config.get("radial_feather_fraction", 0.8)))
+        layout.addRow(
+            QLabel(
+                self._tr(
+                    "stacking_radial_feather_label",
+                    "Radial Feather Fraction (0.1-1.0):",
+                )
+            ),
+            radial_feather,
+        )
+        self._config_fields["radial_feather_fraction"] = {
+            "kind": "double_spinbox",
+            "widget": radial_feather,
+            "type": float,
+        }
+
+        radial_floor = QDoubleSpinBox(group)
+        radial_floor.setRange(0.0, 0.5)
+        radial_floor.setSingleStep(0.01)
+        radial_floor.setDecimals(2)
+        radial_floor.setValue(float(self.config.get("min_radial_weight_floor", 0.0)))
+        layout.addRow(
+            QLabel(
+                self._tr(
+                    "stacking_min_radial_floor_label",
+                    "Min Radial Weight Floor (0.0-0.5):",
+                )
+            ),
+            radial_floor,
+        )
+        radial_floor_note = QLabel(
+            self._tr("stacking_min_radial_floor_note", "(0.0 = no floor)"),
+            group,
+        )
+        radial_floor_note.setWordWrap(True)
+        layout.addRow(QLabel(""), radial_floor_note)
+        self._config_fields["min_radial_weight_floor"] = {
+            "kind": "double_spinbox",
+            "widget": radial_floor,
+            "type": float,
+        }
+
+        def _update_radial_controls(enabled: bool) -> None:
+            radial_feather.setEnabled(enabled)
+            radial_floor.setEnabled(enabled)
+            radial_floor_note.setEnabled(enabled)
+
+        _update_radial_controls(radial_checkbox.isChecked())
+        radial_checkbox.toggled.connect(_update_radial_controls)  # type: ignore[arg-type]
 
         return group
 
@@ -2184,6 +2462,18 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "astap_default_downsample": 2,
             "astap_default_sensitivity": 100,
             "astap_max_instances": 1,
+            "stacking_normalize_method": "linear_fit",
+            "stacking_weighting_method": "noise_variance",
+            "stacking_rejection_algorithm": "winsorized_sigma_clip",
+            "stacking_kappa_low": 3.0,
+            "stacking_kappa_high": 3.0,
+            "stacking_winsor_limits": [0.05, 0.05],
+            "stacking_final_combine_method": "mean",
+            "poststack_equalize_rgb": True,
+            "apply_radial_weight": False,
+            "radial_feather_fraction": 0.8,
+            "min_radial_weight_floor": 0.0,
+            "radial_shape_power": 2.0,
             "cluster_panel_threshold": 0.05,
             "cluster_target_groups": 0,
             "cluster_orientation_split_deg": 0.0,
