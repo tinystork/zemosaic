@@ -119,8 +119,8 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
   - [x] Cluster panel brightness / threshold.
   - [x] Target number of clusters / master tiles.
   - [x] Cluster orientation split degrees.
-  - [ ] Any flags controlling “super-tiles” or phase 4.5 behavior if exposed in Tk GUI.
-- [ ] Bind to corresponding config keys.
+  - [x] Any flags controlling “super-tiles” or phase 4.5 behavior if exposed in Tk GUI.
+- [x] Bind to corresponding config keys.
 
 ### 3.4 Cropping / quality / Alt-Az options
 
