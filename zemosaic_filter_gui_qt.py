@@ -21,11 +21,13 @@ from PySide6.QtWidgets import (  # noqa: E402  - imported after availability che
     QDialog,
     QDialogButtonBox,
     QGridLayout,
+    QHBoxLayout,
     QLabel,
     QMessageBox,
     QProgressBar,
     QPushButton,
     QSplitter,
+    QComboBox,
     QTableWidget,
     QTableWidgetItem,
     QWidget,
@@ -478,6 +480,8 @@ class FilterQtDialog(QDialog):
         self._scan_worker: _DirectoryScanWorker | None = None
         self._auto_group_checkbox = None
         self._seestar_checkbox = None
+        self._astap_instances_combo: QComboBox | None = None
+        self._astap_instances_value = self._resolve_initial_astap_instances()
         self._preview_canvas: FigureCanvasQTAgg | None = None
         self._preview_axes = None
         self._preview_hint_label = QLabel(self)
@@ -876,7 +880,7 @@ class FilterQtDialog(QDialog):
             self._summary_label.setText(f"{selected} / {total}")
 
     def _create_options_box(self):
-        from PySide6.QtWidgets import QCheckBox, QGroupBox, QHBoxLayout
+        from PySide6.QtWidgets import QCheckBox, QGroupBox
 
         box = QGroupBox(self._localizer.get("filter.group.options", "Filter options"), self)
         layout = QHBoxLayout(box)
@@ -894,6 +898,16 @@ class FilterQtDialog(QDialog):
         )
         self._seestar_checkbox.setChecked(self._seestar_priority)
         layout.addWidget(self._seestar_checkbox)
+
+        concurrency_label = QLabel(
+            self._localizer.get("filter_label_astap_instances", "Max ASTAP instances"),
+            box,
+        )
+        layout.addWidget(concurrency_label)
+
+        self._astap_instances_combo = QComboBox(box)
+        self._populate_astap_instances_combo()
+        layout.addWidget(self._astap_instances_combo)
 
         layout.addStretch(1)
         return box
@@ -1078,6 +1092,8 @@ class FilterQtDialog(QDialog):
             overrides["filter_auto_group"] = bool(self._auto_group_checkbox.isChecked())
         if self._seestar_checkbox is not None:
             overrides["filter_seestar_priority"] = bool(self._seestar_checkbox.isChecked())
+        if self._astap_instances_value:
+            overrides["astap_max_instances"] = int(self._astap_instances_value)
         return overrides or None
 
     def input_items(self) -> List[Any]:
@@ -1147,6 +1163,121 @@ class FilterQtDialog(QDialog):
         self._progress_bar.setValue(100)
         self._update_summary_label()
         self._schedule_preview_refresh()
+
+    def _resolve_initial_astap_instances(self) -> int:
+        sources: tuple[Any, ...] = (
+            self._safe_lookup(self._config_overrides, "astap_max_instances"),
+            self._safe_lookup(self._solver_settings, "astap_max_instances"),
+            os.environ.get("ZEMOSAIC_ASTAP_MAX_PROCS"),
+        )
+        for candidate in sources:
+            try:
+                if candidate in (None, "", False):
+                    continue
+                value = int(candidate)
+                if value > 0:
+                    return max(1, value)
+            except Exception:
+                continue
+        return 1
+
+    @staticmethod
+    def _safe_lookup(mapping: Any, key: str) -> Any:
+        if isinstance(mapping, dict):
+            return mapping.get(key)
+        try:
+            return getattr(mapping, key)
+        except Exception:
+            return None
+
+    def _populate_astap_instances_combo(self) -> None:
+        if self._astap_instances_combo is None:
+            return
+        combo = self._astap_instances_combo
+        combo.blockSignals(True)
+        combo.clear()
+        cpu_count = os.cpu_count() or 2
+        cap = max(1, cpu_count // 2)
+        options = {str(i): i for i in range(1, cap + 1)}
+        current = self._astap_instances_value
+        options[str(current)] = current
+        for text, value in sorted(options.items(), key=lambda item: int(item[0])):
+            combo.addItem(text, value)
+        index = combo.findData(current)
+        if index < 0:
+            index = combo.findText(str(current))
+        if index < 0:
+            combo.addItem(str(current), current)
+            index = combo.findData(current)
+        combo.setCurrentIndex(max(0, index))
+        combo.blockSignals(False)
+        combo.currentIndexChanged.connect(self._on_astap_instances_changed)  # type: ignore[arg-type]
+        self._apply_astap_instances_choice(current, warn=False)
+
+    def _on_astap_instances_changed(self, index: int) -> None:
+        if self._astap_instances_combo is None:
+            return
+        value = self._astap_instances_combo.itemData(index)
+        if value is None:
+            try:
+                value = int(self._astap_instances_combo.currentText())
+            except Exception:
+                value = self._astap_instances_value
+        if not self._apply_astap_instances_choice(int(value), warn=True):
+            self._astap_instances_combo.blockSignals(True)
+            target_idx = self._astap_instances_combo.findData(self._astap_instances_value)
+            if target_idx >= 0:
+                self._astap_instances_combo.setCurrentIndex(target_idx)
+            self._astap_instances_combo.blockSignals(False)
+
+    def _apply_astap_instances_choice(self, value: int, *, warn: bool) -> bool:
+        parsed = max(1, int(value))
+        if warn and parsed > 1 and parsed != self._astap_instances_value:
+            title = self._localizer.get("filter_astap_multi_warning_title", "ASTAP Concurrency Warning")
+            message = self._localizer.get(
+                "filter_astap_multi_warning_message",
+                (
+                    "Running more than one ASTAP instance can trigger the \"Access violation\" "
+                    "popup you saw earlier. Only continue if you are ready to dismiss "
+                    "those warnings and understand this mode is not officially supported."
+                ),
+            )
+            continue_label = self._localizer.get(
+                "filter_astap_multi_warning_continue", "Continue anyway"
+            )
+            cancel_label = self._localizer.get(
+                "filter_astap_multi_warning_cancel", "Cancel"
+            )
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle(title)
+            box.setText(message)
+            continue_button = box.addButton(continue_label, QMessageBox.AcceptRole)
+            cancel_button = box.addButton(cancel_label, QMessageBox.RejectRole)
+            box.setDefaultButton(cancel_button)
+            box.exec()
+            if box.clickedButton() is not continue_button:
+                return False
+
+        self._astap_instances_value = parsed
+        if isinstance(self._solver_settings, dict):
+            self._solver_settings["astap_max_instances"] = parsed
+        if isinstance(self._config_overrides, dict):
+            self._config_overrides["astap_max_instances"] = parsed
+        self._set_astap_concurrency_runtime(parsed)
+        return True
+
+    def _set_astap_concurrency_runtime(self, value: int) -> None:
+        try:
+            clamped = max(1, int(value))
+        except Exception:
+            clamped = 1
+        os.environ["ZEMOSAIC_ASTAP_MAX_PROCS"] = str(clamped)
+        if set_astap_max_concurrent_instances is not None:
+            try:
+                set_astap_max_concurrent_instances(clamped)
+            except Exception:
+                pass
 
 
 def launch_filter_interface_qt(

@@ -102,6 +102,7 @@
     "qt_field_force_seestar": "Force Seestar workflow",
     "qt_field_sds_mode": "Enable SDS mode by default",
     "qt_field_sds_threshold": "SDS coverage threshold",
+    "qt_field_astap_max_instances": "Max ASTAP instances",
     "gui_cache_retention_label": "Cache retention:",
     "gui_logging_title": "Logging",
     "gui_logging_level": "Logging level:",
