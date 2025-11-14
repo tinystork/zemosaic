@@ -319,6 +319,45 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._last_filter_overrides: Dict[str, Any] | None = None
         self._last_filtered_header_items: List[Any] | None = None
 
+        self._stage_aliases = {
+            "phase1_scan": "phase1",
+            "phase2_cluster": "phase2",
+            "phase3_master_tiles": "phase3",
+            "phase4_grid": "phase4",
+            "phase4_5": "phase4_5",
+            "phase5_intertile": "phase5",
+            "phase5_incremental": "phase5",
+            "phase5_reproject": "phase5",
+        }
+        self._stage_order = [
+            "phase1",
+            "phase2",
+            "phase3",
+            "phase4",
+            "phase4_5",
+            "phase5",
+            "phase6",
+            "phase7",
+        ]
+        self._stage_weights = {
+            "phase1": 30.0,
+            "phase2": 5.0,
+            "phase3": 35.0,
+            "phase4": 5.0,
+            "phase4_5": 6.0,
+            "phase5": 9.0,
+            "phase6": 8.0,
+            "phase7": 2.0,
+        }
+        self._stage_progress_values: Dict[str, float] = {
+            key: 0.0 for key in self._stage_order
+        }
+        self._stage_times: Dict[str, Dict[str, Any]] = {}
+        self._progress_start_time: float | None = None
+        self._last_global_progress: float = 0.0
+        self._eta_seconds_smoothed: float | None = None
+        self._weighted_progress_active = False
+
         self._setup_ui()
         self._emit_config_notes()
 
@@ -2126,7 +2165,17 @@ class ZeMosaicQtMainWindow(QMainWindow):
         if hasattr(self, "log_output"):
             self.log_output.clear()
 
+    def _reset_progress_tracking(self) -> None:
+        self._stage_progress_values = {key: 0.0 for key in self._stage_order}
+        self._stage_times.clear()
+        self._progress_start_time = None
+        self._last_global_progress = 0.0
+        self._eta_seconds_smoothed = None
+        self._weighted_progress_active = False
+
     def _set_processing_state(self, running: bool) -> None:
+        if running:
+            self._reset_progress_tracking()
         self.start_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
         self.filter_button.setEnabled(not running)
@@ -2144,6 +2193,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self.elapsed_value_label.setText(self._tr("qt_progress_placeholder", "—"))
             self.files_value_label.setText(self._tr("qt_progress_count_placeholder", "0 / 0"))
             self.tiles_value_label.setText(self._tr("qt_progress_count_placeholder", "0 / 0"))
+            self._reset_progress_tracking()
 
     def _normalize_log_level(self, level: str | None) -> str:
         if not level:
@@ -2172,18 +2222,147 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._append_log(translated_message, level=normalized_level)
 
     def _on_worker_progress_changed(self, percent: float) -> None:
+        if self._weighted_progress_active:
+            return
         bounded = int(max(0.0, min(100.0, percent)))
+        self._last_global_progress = float(bounded)
         self.progress_bar.setValue(bounded)
+        if bounded >= 100:
+            self.eta_value_label.setText("00:00:00")
 
     def _on_worker_stage_progress(self, stage: str, current: int, total: int) -> None:
         stage_label = self._format_stage_name(stage)
         self.phase_value_label.setText(stage_label)
-        percent = 0
-        if total > 0:
-            percent = int(max(0.0, min(100.0, (current / float(total)) * 100.0)))
-        self.progress_bar.setValue(percent)
-        if total > 0:
-            self.tiles_value_label.setText(f"{current} / {total}")
+        self._update_stage_progress(stage, current, total)
+
+    def _update_stage_progress(self, stage: str, current: int, total: int) -> None:
+        self._weighted_progress_active = True
+        now = time.monotonic()
+        stage_key = self._stage_aliases.get(stage, stage)
+        if stage_key not in self._stage_progress_values:
+            self._stage_progress_values[stage_key] = 0.0
+
+        try:
+            current_val = int(current)
+        except (TypeError, ValueError):
+            current_val = 0
+        try:
+            total_val = int(total)
+        except (TypeError, ValueError):
+            total_val = 0
+
+        if total_val < 0:
+            total_val = 0
+        if total_val > 0:
+            current_val = max(0, min(current_val, total_val))
+        else:
+            current_val = max(0, current_val)
+
+        timings = self._stage_times.get(stage_key)
+        if timings is None or current_val <= 1:
+            timings = {
+                "start": now,
+                "last": now,
+                "steps": [],
+                "last_count": current_val,
+            }
+            self._stage_times[stage_key] = timings
+        else:
+            last_count = int(timings.get("last_count", 0))
+            if current_val > last_count:
+                delta = now - float(timings.get("last", now))
+                if delta >= 0:
+                    steps = timings.setdefault("steps", [])
+                    steps.append(delta)
+                    if len(steps) > 120:
+                        del steps[: len(steps) - 120]
+                timings["last"] = now
+                timings["last_count"] = current_val
+            else:
+                timings["last"] = now
+                timings["last_count"] = current_val
+
+        if total_val > 0:
+            self.tiles_value_label.setText(f"{current_val} / {total_val}")
+
+        if self._progress_start_time is None:
+            self._progress_start_time = now
+
+        stage_weight = self._stage_weights.get(stage_key)
+        if stage_weight is None:
+            percent = (current_val / float(total_val) * 100.0) if total_val else 0.0
+            percent = max(0.0, min(100.0, percent))
+            percent = max(self._last_global_progress, percent)
+            self._last_global_progress = percent
+            self.progress_bar.setValue(int(percent))
+            steps = timings.get("steps") or []
+            if steps and total_val:
+                avg = sum(steps) / len(steps)
+                remaining_steps = max(0, total_val - current_val)
+                remaining = max(0.0, remaining_steps * avg)
+                if self._eta_seconds_smoothed is None:
+                    smoothed_remaining = remaining
+                else:
+                    alpha = 0.3
+                    smoothed_remaining = (
+                        alpha * remaining
+                        + (1 - alpha) * float(self._eta_seconds_smoothed)
+                    )
+                self._eta_seconds_smoothed = smoothed_remaining
+                eta_h, eta_rem = divmod(int(smoothed_remaining + 0.5), 3600)
+                eta_m, eta_s = divmod(eta_rem, 60)
+                self.eta_value_label.setText(f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}")
+            return
+
+        if stage_key in self._stage_order:
+            stage_index = self._stage_order.index(stage_key)
+            for previous_stage in self._stage_order[:stage_index]:
+                if self._stage_progress_values.get(previous_stage, 0.0) < 1.0:
+                    self._stage_progress_values[previous_stage] = 1.0
+
+        stage_fraction = (current_val / float(total_val)) if total_val else 0.0
+        stage_fraction = max(0.0, min(1.0, stage_fraction))
+        self._stage_progress_values[stage_key] = stage_fraction
+
+        global_progress = 0.0
+        for key in self._stage_order:
+            weight = self._stage_weights.get(key, 0.0)
+            if weight <= 0.0:
+                continue
+            fraction = self._stage_progress_values.get(key, 0.0)
+            if fraction <= 0.0:
+                continue
+            if fraction > 1.0:
+                fraction = 1.0
+            global_progress += weight * fraction
+
+        global_progress = max(self._last_global_progress, min(100.0, global_progress))
+        self._last_global_progress = global_progress
+        self.progress_bar.setValue(int(global_progress))
+
+        if global_progress >= 99.9:
+            self._eta_seconds_smoothed = 0.0
+            self.eta_value_label.setText("00:00:00")
+            return
+
+        if self._progress_start_time is None:
+            return
+        elapsed = now - self._progress_start_time
+        if global_progress > 0.0 and elapsed >= 0.0:
+            fraction_complete = max(1e-6, global_progress / 100.0)
+            estimated_total = elapsed / fraction_complete
+            eta_seconds = max(0.0, estimated_total - elapsed)
+            if self._eta_seconds_smoothed is None:
+                smoothed = eta_seconds
+            else:
+                alpha = 0.3
+                smoothed = (alpha * eta_seconds) + (
+                    (1 - alpha) * float(self._eta_seconds_smoothed)
+                )
+            self._eta_seconds_smoothed = smoothed
+            eta_h, eta_rem = divmod(int(smoothed + 0.5), 3600)
+            eta_m, eta_s = divmod(eta_rem, 60)
+            self.eta_value_label.setText(f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}")
 
     def _on_worker_phase_changed(self, stage: str, payload: Dict[str, Any]) -> None:
         stage_label = self._format_stage_name(stage)
