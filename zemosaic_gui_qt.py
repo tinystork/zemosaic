@@ -21,16 +21,19 @@ import multiprocessing
 import queue
 import time
 from dataclasses import asdict
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
-    from PySide6.QtCore import QObject, QThread, QTimer, Signal
-    from PySide6.QtGui import QCloseEvent
+    from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
+    from PySide6.QtGui import QBrush, QCloseEvent, QColor, QPainter, QPen, QResizeEvent
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
         QComboBox,
         QDoubleSpinBox,
+        QFrame,
+        QGraphicsScene,
+        QGraphicsView,
         QFileDialog,
         QFormLayout,
         QGridLayout,
@@ -162,6 +165,7 @@ class ZeMosaicQtWorker(QObject):
     stage_progress = Signal(str, int, int)
     phase_changed = Signal(str, dict)
     stats_updated = Signal(dict)
+    phase45_event = Signal(str, dict, str)
     finished = Signal(bool, str)
 
     def __init__(self, parent: QObject | None = None) -> None:
@@ -323,7 +327,16 @@ class ZeMosaicQtWorker(QObject):
             return
 
         if isinstance(msg_key, str) and msg_key.startswith("p45_"):
-            # Advanced Phase 4.5 feedback is not yet visualized in Qt.
+            payload_dict: Dict[str, Any] = {}
+            if isinstance(kwargs, dict):
+                payload_dict.update(kwargs)
+            if prog not in (None, "") and "message" not in payload_dict:
+                payload_dict["message"] = prog
+            level_text = str(lvl or "INFO")
+            try:
+                self.phase45_event.emit(msg_key, payload_dict, level_text)
+            except Exception:
+                pass
             return
 
         if isinstance(msg_key, str) and msg_key.upper() == "STATS_UPDATE":
@@ -481,6 +494,16 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._eta_seconds_smoothed: float | None = None
         self._weighted_progress_active = False
 
+        self._phase45_groups: Dict[int, Dict[str, Any]] = {}
+        self._phase45_group_progress: Dict[int, Dict[str, Any]] = {}
+        self._phase45_active: Optional[int] = None
+        self._phase45_last_out: Optional[str] = None
+        self._phase45_overlay_enabled: bool = True
+        self.phase45_status_label: Optional[QLabel] = None
+        self.phase45_overlay_scene: Optional[QGraphicsScene] = None
+        self.phase45_overlay_view: Optional[QGraphicsView] = None
+        self.phase45_overlay_toggle: Optional[QCheckBox] = None
+
         self._setup_ui()
         self._emit_config_notes()
 
@@ -491,6 +514,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self.worker_controller.stage_progress.connect(self._on_worker_stage_progress)  # type: ignore[arg-type]
         self.worker_controller.phase_changed.connect(self._on_worker_phase_changed)  # type: ignore[arg-type]
         self.worker_controller.stats_updated.connect(self._on_worker_stats_updated)  # type: ignore[arg-type]
+        self.worker_controller.phase45_event.connect(self._on_worker_phase45_event)  # type: ignore[arg-type]
         self.worker_controller.finished.connect(self._on_worker_finished)  # type: ignore[arg-type]
 
         self._elapsed_timer = QTimer(self)
@@ -2018,6 +2042,51 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         layout.addLayout(stats_layout)
 
+        phase45_box = QGroupBox(
+            self._tr("qt_phase45_overlay_title", "Phase 4.5 overview"),
+            group,
+        )
+        phase45_layout = QVBoxLayout(phase45_box)
+        phase45_layout.setContentsMargins(6, 6, 6, 6)
+        phase45_layout.setSpacing(6)
+
+        overlay_controls = QHBoxLayout()
+        overlay_controls.setContentsMargins(0, 0, 0, 0)
+        overlay_controls.setSpacing(6)
+
+        overlay_toggle = QCheckBox(
+            self._tr("qt_phase45_overlay_toggle", "Show overlay"),
+            phase45_box,
+        )
+        overlay_toggle.setChecked(True)
+        overlay_toggle.toggled.connect(self._on_phase45_overlay_toggled)  # type: ignore[arg-type]
+        overlay_controls.addWidget(overlay_toggle)
+        overlay_controls.addStretch(1)
+        phase45_layout.addLayout(overlay_controls)
+
+        status_label = QLabel(
+            self._tr("phase45_status_idle", "Phase 4.5 idle"),
+            phase45_box,
+        )
+        status_label.setObjectName("phase45StatusLabel")
+        phase45_layout.addWidget(status_label)
+
+        overlay_scene = QGraphicsScene(phase45_box)
+        overlay_view = QGraphicsView(overlay_scene, phase45_box)
+        overlay_view.setRenderHint(QPainter.Antialiasing, True)
+        overlay_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        overlay_view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        overlay_view.setFrameShape(QFrame.NoFrame)
+        overlay_view.setMinimumHeight(160)
+        phase45_layout.addWidget(overlay_view)
+
+        self.phase45_overlay_toggle = overlay_toggle
+        self.phase45_status_label = status_label
+        self.phase45_overlay_scene = overlay_scene
+        self.phase45_overlay_view = overlay_view
+
+        layout.addWidget(phase45_box)
+
         self.log_output = QPlainTextEdit(group)
         self.log_output.setReadOnly(True)
         self.log_output.setPlaceholderText(
@@ -2037,6 +2106,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "type": str,
             "value_getter": log_level_combo.currentData,
         }
+
+        self._phase45_overlay_enabled = overlay_toggle.isChecked()
+        self._phase45_reset_overlay()
 
         return group
 
@@ -2788,6 +2860,269 @@ class ZeMosaicQtMainWindow(QMainWindow):
         if hasattr(self, "log_output"):
             self.log_output.clear()
 
+    # ------------------------------------------------------------------
+    # Phase 4.5 overlay helpers
+    # ------------------------------------------------------------------
+    def _phase45_log_translated(self, key: str, payload: Dict[str, Any], level: str) -> None:
+        template = self._tr(key, key)
+        try:
+            message = template.format(**payload)
+        except Exception:
+            message = template
+        self._append_log(message, level=level)
+
+    def _phase45_reset_overlay(self, clear_groups: bool = True) -> None:
+        if clear_groups:
+            self._phase45_groups = {}
+            self._phase45_last_out = None
+        self._phase45_group_progress = {}
+        self._phase45_active = None
+        self._update_phase45_status()
+        self._redraw_phase45_overlay()
+
+    def _update_phase45_status(self, status_override: Optional[str] = None) -> None:
+        label = self.phase45_status_label
+        if label is None:
+            return
+        text = status_override
+        if not text:
+            total_groups = len(self._phase45_groups)
+            if total_groups == 0:
+                text = self._tr("phase45_status_idle", "Phase 4.5 idle")
+            else:
+                parts: List[str] = [f"Groups: {total_groups}"]
+                if self._phase45_active is not None:
+                    progress = self._phase45_group_progress.get(self._phase45_active)
+                    if progress and progress.get("total"):
+                        parts.append(
+                            f"Active: G{self._phase45_active} ({progress.get('done', 0)}/{progress.get('total', 0)})"
+                        )
+                    else:
+                        parts.append(f"Active: G{self._phase45_active}")
+                if self._phase45_last_out:
+                    parts.append(f"Super: {self._phase45_last_out}")
+                text = " | ".join(parts)
+        label.setText(text)
+
+    def _phase45_show_message(self, message: str) -> None:
+        scene = self.phase45_overlay_scene
+        view = self.phase45_overlay_view
+        if scene is None or view is None:
+            return
+        width = max(view.viewport().width(), 10)
+        height = max(view.viewport().height(), 10)
+        scene.setSceneRect(0, 0, width, height)
+        scene.clear()
+        text_item = scene.addText(message)
+        text_item.setDefaultTextColor(QColor("#6f7177"))
+        rect = text_item.boundingRect()
+        text_item.setPos((width - rect.width()) / 2.0, (height - rect.height()) / 2.0)
+
+    def _redraw_phase45_overlay(self) -> None:
+        scene = self.phase45_overlay_scene
+        view = self.phase45_overlay_view
+        if scene is None or view is None:
+            return
+        width = max(view.viewport().width(), 10)
+        height = max(view.viewport().height(), 10)
+        scene.setSceneRect(0, 0, width, height)
+        scene.clear()
+        if not self._phase45_overlay_enabled:
+            self._phase45_show_message(
+                self._tr("phase45_overlay_hidden", "Overlay hidden")
+            )
+            return
+        groups = self._phase45_groups or {}
+        if not groups:
+            self._phase45_show_message(
+                self._tr("phase45_overlay_waiting", "Waiting for Phase 4.5...")
+            )
+            return
+        bboxes = [entry.get("bbox") for entry in groups.values() if entry.get("bbox")]
+        if not bboxes:
+            self._phase45_show_message(
+                self._tr("phase45_overlay_no_geo", "No WCS footprints")
+            )
+            return
+        try:
+            ra_min = min(float(entry["ra_min"]) for entry in bboxes)
+            ra_max = max(float(entry["ra_max"]) for entry in bboxes)
+            dec_min = min(float(entry["dec_min"]) for entry in bboxes)
+            dec_max = max(float(entry["dec_max"]) for entry in bboxes)
+        except Exception:
+            self._phase45_show_message(
+                self._tr("phase45_overlay_no_geo", "No WCS footprints")
+            )
+            return
+        ra_span = max(ra_max - ra_min, 1e-6)
+        dec_span = max(dec_max - dec_min, 1e-6)
+        pad = 8.0
+        drawable_w = max(width - (pad * 2.0), 1.0)
+        drawable_h = max(height - (pad * 2.0), 1.0)
+        for gid in sorted(groups):
+            entry = groups[gid]
+            bbox = entry.get("bbox")
+            if not bbox:
+                continue
+            try:
+                ra0 = float(bbox["ra_min"])
+                ra1 = float(bbox["ra_max"])
+                dec0 = float(bbox["dec_min"])
+                dec1 = float(bbox["dec_max"])
+            except Exception:
+                continue
+            x0 = pad + ((ra0 - ra_min) / ra_span) * drawable_w
+            x1 = pad + ((ra1 - ra_min) / ra_span) * drawable_w
+            y0 = pad + ((dec_max - dec1) / dec_span) * drawable_h
+            y1 = pad + ((dec_max - dec0) / dec_span) * drawable_h
+            rect_w = max(1.0, x1 - x0)
+            rect_h = max(1.0, y1 - y0)
+            is_active = gid == self._phase45_active
+            pen = QPen(QColor("#E53935" if is_active else "#8E44AD"))
+            pen.setWidth(2 if is_active else 1)
+            if not is_active:
+                pen.setStyle(Qt.DashLine)
+            brush = QBrush(QColor("#FFCDD2")) if is_active else QBrush(Qt.NoBrush)
+            rect_item = scene.addRect(x0, y0, rect_w, rect_h, pen, brush)
+            if is_active:
+                rect_item.setBrush(brush)
+            label = f"G{gid}"
+            progress = self._phase45_group_progress.get(gid)
+            if is_active and progress and progress.get("total"):
+                label = f"G{gid} {progress.get('done', 0)}/{progress.get('total', 0)}"
+            text_item = scene.addText(label)
+            text_item.setDefaultTextColor(QColor("#2E2E2E" if is_active else "#424242"))
+            font = text_item.font()
+            if is_active:
+                font.setBold(True)
+            else:
+                font.setBold(False)
+            text_item.setFont(font)
+            text_item.setPos(x0 + 4.0, y0 + 4.0)
+
+    def _phase45_handle_groups_layout(self, payload: Dict[str, Any], level: str) -> None:
+        groups_payload = payload.get("groups") or []
+        new_groups: Dict[int, Dict[str, Any]] = {}
+        for entry in groups_payload:
+            try:
+                gid = int(entry.get("group_id"))
+            except Exception:
+                continue
+            new_groups[gid] = {
+                "bbox": entry.get("bbox"),
+                "members": entry.get("members") or [],
+                "repr": entry.get("repr"),
+            }
+        self._phase45_groups = new_groups
+        self._phase45_group_progress = {}
+        self._phase45_active = None
+        self._phase45_last_out = None
+        total = payload.get("total_groups", len(new_groups))
+        self._update_phase45_status()
+        self._redraw_phase45_overlay()
+        self._append_log(
+            f"[P4.5] Overlap layout ready ({len(new_groups)}/{total})",
+            level=level,
+        )
+
+    def _phase45_handle_group_started(self, payload: Dict[str, Any], level: str) -> None:
+        gid = payload.get("group_id")
+        try:
+            gid_int = int(gid)
+        except Exception:
+            gid_int = None
+        chunk = payload.get("chunk")
+        chunks = payload.get("chunks") or payload.get("total")
+        size = payload.get("size")
+        if gid_int is not None:
+            try:
+                total_chunks = int(chunks) if chunks is not None else 0
+            except Exception:
+                total_chunks = 0
+            self._phase45_active = gid_int
+            self._phase45_group_progress[gid_int] = {
+                "done": int(payload.get("done", 0) or 0),
+                "total": total_chunks,
+                "size": size,
+            }
+        self._update_phase45_status()
+        self._redraw_phase45_overlay()
+        if gid_int is not None:
+            chunk_txt = (
+                f"{chunk}/{chunks}" if chunk and chunks else str(chunk) if chunk else "-"
+            )
+            size_txt = f"{size} tiles" if size else "tiles"
+            self._append_log(
+                f"[P4.5] Group G{gid_int} started chunk {chunk_txt} ({size_txt})",
+                level=level,
+            )
+
+    def _phase45_handle_group_progress(self, payload: Dict[str, Any], level: str) -> None:
+        gid = payload.get("group_id")
+        try:
+            gid_int = int(gid)
+        except Exception:
+            gid_int = None
+        done = payload.get("done", 0)
+        total = payload.get("total", 0)
+        size = payload.get("size")
+        try:
+            done_int = int(done)
+        except Exception:
+            done_int = 0
+        try:
+            total_int = int(total)
+        except Exception:
+            total_int = 0
+        if gid_int is not None:
+            progress_entry = self._phase45_group_progress.setdefault(
+                gid_int,
+                {"done": 0, "total": total_int, "size": size},
+            )
+            progress_entry["done"] = done_int
+            if total_int:
+                progress_entry["total"] = total_int
+            if size is not None:
+                progress_entry["size"] = size
+            self._phase45_group_progress[gid_int] = progress_entry
+            self._phase45_active = gid_int
+        self._update_phase45_status()
+        self._redraw_phase45_overlay()
+        if gid_int is not None and total_int:
+            self._append_log(
+                f"[P4.5] Group G{gid_int} progress {done_int}/{total_int}",
+                level=level,
+            )
+
+    def _phase45_handle_group_result(self, payload: Dict[str, Any]) -> None:
+        last_out = payload.get("out")
+        if last_out:
+            self._phase45_last_out = os.path.basename(str(last_out))
+        gid = payload.get("group_id")
+        try:
+            gid_int = int(gid)
+        except Exception:
+            gid_int = None
+        if gid_int is not None:
+            self._phase45_active = gid_int
+        self._update_phase45_status()
+        self._redraw_phase45_overlay()
+
+    def _phase45_handle_finish(self, payload: Dict[str, Any]) -> None:
+        completion_text = self._tr(
+            "phase45_status_complete",
+            "Phase 4.5 complete",
+        )
+        if self._phase45_last_out:
+            completion_text = f"{completion_text} | Super: {self._phase45_last_out}"
+        self._phase45_active = None
+        self._update_phase45_status(status_override=completion_text)
+        self._redraw_phase45_overlay()
+
+    def _on_phase45_overlay_toggled(self, checked: bool) -> None:
+        self._phase45_overlay_enabled = bool(checked)
+        self._redraw_phase45_overlay()
+
     def _reset_progress_tracking(self) -> None:
         self._stage_progress_values = {key: 0.0 for key in self._stage_order}
         self._stage_times.clear()
@@ -2987,6 +3322,31 @@ class ZeMosaicQtMainWindow(QMainWindow):
             eta_m, eta_s = divmod(eta_rem, 60)
             self.eta_value_label.setText(f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}")
 
+    def _on_worker_phase45_event(self, key: str, payload: Dict[str, Any], level: str) -> None:
+        data = payload if isinstance(payload, dict) else {}
+        normalized_level = self._normalize_log_level(level)
+        if key == "p45_start":
+            self._phase45_reset_overlay()
+            self._phase45_log_translated(key, data, normalized_level)
+            return
+        if key == "p45_groups_layout":
+            self._phase45_handle_groups_layout(data, normalized_level)
+            return
+        if key == "p45_group_started":
+            self._phase45_handle_group_started(data, normalized_level)
+            return
+        if key == "p45_group_progress":
+            self._phase45_handle_group_progress(data, normalized_level)
+            return
+        if key == "p45_group_result":
+            self._phase45_handle_group_result(data)
+            return
+        if key == "p45_finished":
+            self._phase45_handle_finish(data)
+            self._phase45_log_translated(key, data, normalized_level)
+            return
+        self._phase45_log_translated(key, data, normalized_level)
+
     def _on_worker_phase_changed(self, stage: str, payload: Dict[str, Any]) -> None:
         stage_label = self._format_stage_name(stage)
         self.phase_value_label.setText(stage_label)
@@ -3053,6 +3413,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
         elapsed_h, remainder = divmod(int(elapsed + 0.5), 3600)
         elapsed_m, elapsed_s = divmod(remainder, 60)
         self.elapsed_value_label.setText(f"{elapsed_h:02d}:{elapsed_m:02d}:{elapsed_s:02d}")
+
+    def resizeEvent(self, event: QResizeEvent) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._redraw_phase45_overlay()
 
     def _format_stage_name(self, stage: str) -> str:
         if not stage:
