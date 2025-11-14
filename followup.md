@@ -257,9 +257,9 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
   - [x] Seestar / instrument-specific toggles.
   - [x] Any special ASTAP options (e.g. max instances, timeout, access-violation auto-dismiss toggles if exposed).
   - [x] Advanced options related to two-pass coverage renorm, alpha, etc., if they are in the GUI.
-- [ ] Verify localization:
-  - [ ] All user-facing strings pass through the localization helper where reasonable.
-  - [ ] There is no hard-coded English where a key exists already.
+- [x] Verify localization:
+  - [x] All user-facing strings pass through the localization helper where reasonable.
+  - [x] There is no hard-coded English where a key exists already.
 - [ ] Verify configuration:
   - [ ] Qt GUI reads existing config files correctly.
   - [ ] Changes in Qt GUI are reflected in the shared config, visible from Tk GUI as well.
