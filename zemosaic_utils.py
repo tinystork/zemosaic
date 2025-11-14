@@ -2898,18 +2898,43 @@ def _ensure_float32_no_nan(arr: np.ndarray) -> np.ndarray:
 
 
 def _rescale_to_u16(arr: np.ndarray) -> np.ndarray:
-    """Scale float32 ``arr`` to the full uint16 range [0, 65535]."""
+    """Scale float32 ``arr`` to the uint16 range using gentle percentile clipping."""
 
     finite_mask = np.isfinite(arr)
     if not np.any(finite_mask):
         return np.zeros(arr.shape, dtype=np.uint16)
 
     finite_values = arr[finite_mask]
-    vmin = float(np.nanmin(finite_values))
-    vmax = float(np.nanmax(finite_values))
-
-    if (not np.isfinite(vmin)) or (not np.isfinite(vmax)) or vmax <= vmin:
+    if finite_values.size == 0:
         return np.zeros(arr.shape, dtype=np.uint16)
+
+    try:
+        q_low = float(np.percentile(finite_values, 0.1))
+        q_high = float(np.percentile(finite_values, 99.9))
+    except Exception:
+        q_low = float(np.nanmin(finite_values))
+        q_high = float(np.nanmax(finite_values))
+
+    if not np.isfinite(q_low) or not np.isfinite(q_high) or q_high <= q_low:
+        q_low = float(np.nanmin(finite_values))
+        q_high = float(np.nanmax(finite_values))
+
+    if not np.isfinite(q_low) or not np.isfinite(q_high) or q_high <= q_low:
+        return np.zeros(arr.shape, dtype=np.uint16)
+
+    span = q_high - q_low
+    vmin = q_low - 0.02 * span
+    vmax = q_high + 0.02 * span
+
+    global_min = float(np.nanmin(finite_values))
+    global_max = float(np.nanmax(finite_values))
+    if np.isfinite(global_min):
+        vmin = max(vmin, global_min)
+    if np.isfinite(global_max):
+        vmax = min(vmax, global_max)
+
+    if vmax <= vmin:
+        vmax = vmin + 1.0
 
     scale = 65535.0 / (vmax - vmin)
     result = np.zeros(arr.shape, dtype=np.float32)
