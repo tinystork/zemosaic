@@ -11,6 +11,7 @@ try:
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
+        QComboBox,
         QDoubleSpinBox,
         QFileDialog,
         QFormLayout,
@@ -78,6 +79,16 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "cluster_panel_threshold": 0.05,
             "cluster_target_groups": 0,
             "cluster_orientation_split_deg": 0.0,
+            "inter_master_merge_enable": False,
+            "inter_master_overlap_threshold": 0.60,
+            "inter_master_stack_method": "winsor",
+            "inter_master_min_group_size": 2,
+            "inter_master_max_group": 64,
+            "inter_master_memmap_policy": "auto",
+            "inter_master_local_scale": "final",
+            "inter_master_photometry_intragroup": True,
+            "inter_master_photometry_intersuper": True,
+            "inter_master_photometry_clip_sigma": 3.0,
             "quality_crop_enabled": False,
             "quality_crop_band_px": 32,
             "altaz_cleanup_enabled": False,
@@ -230,6 +241,148 @@ class ZeMosaicQtMainWindow(QMainWindow):
             single_step=1.0,
             decimals=1,
         )
+
+        phase45_box = QGroupBox(
+            self._tr("qt_group_phase45", "Phase 4.5 / Super-tiles"),
+            group,
+        )
+        phase45_layout = QFormLayout(phase45_box)
+        phase45_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        self._register_checkbox(
+            "inter_master_merge_enable",
+            phase45_layout,
+            self._tr("qt_checkbox_phase45_enable", "Enable inter-master merge"),
+        )
+
+        overlap_spinbox = QDoubleSpinBox()
+        overlap_spinbox.setRange(0.0, 100.0)
+        overlap_spinbox.setDecimals(1)
+        overlap_spinbox.setSingleStep(0.5)
+        overlap_fraction = float(self.config.get("inter_master_overlap_threshold", 0.60))
+        if not 0.0 <= overlap_fraction <= 1.0:
+            overlap_fraction = 0.60
+            self.config["inter_master_overlap_threshold"] = overlap_fraction
+        overlap_spinbox.setValue(overlap_fraction * 100.0)
+        phase45_layout.addRow(
+            QLabel(self._tr("qt_field_phase45_overlap", "Overlap ≥ (%)")),
+            overlap_spinbox,
+        )
+        self._config_fields["inter_master_overlap_threshold"] = {
+            "kind": "double_spinbox",
+            "widget": overlap_spinbox,
+            "type": float,
+            "value_getter": overlap_spinbox.value,
+            "postprocess": lambda value: max(0.0, min(1.0, float(value) / 100.0)),
+        }
+
+        method_combo = QComboBox()
+        method_options = [
+            ("winsor", self._tr("qt_phase45_method_winsor", "Winsorized")),
+            ("mean", self._tr("qt_phase45_method_mean", "Mean")),
+            ("median", self._tr("qt_phase45_method_median", "Median")),
+        ]
+        for value, label in method_options:
+            method_combo.addItem(label, value)
+        current_method = str(self.config.get("inter_master_stack_method", "winsor")).lower()
+        method_index = next(
+            (idx for idx, (value, _label) in enumerate(method_options) if value == current_method),
+            0,
+        )
+        method_combo.setCurrentIndex(method_index)
+        phase45_layout.addRow(
+            QLabel(self._tr("qt_field_phase45_method", "Stack method")),
+            method_combo,
+        )
+        self._config_fields["inter_master_stack_method"] = {
+            "kind": "combobox",
+            "widget": method_combo,
+            "type": str,
+        }
+
+        self._register_spinbox(
+            "inter_master_min_group_size",
+            phase45_layout,
+            self._tr("qt_field_phase45_min_group", "Minimum group size"),
+            minimum=2,
+            maximum=512,
+        )
+        self._register_spinbox(
+            "inter_master_max_group",
+            phase45_layout,
+            self._tr("qt_field_phase45_max_group", "Maximum group size"),
+            minimum=2,
+            maximum=2048,
+        )
+
+        memmap_combo = QComboBox()
+        memmap_options = [
+            ("auto", self._tr("qt_phase45_memmap_auto", "Auto")),
+            ("always", self._tr("qt_phase45_memmap_always", "Always")),
+            ("never", self._tr("qt_phase45_memmap_never", "Never")),
+        ]
+        for value, label in memmap_options:
+            memmap_combo.addItem(label, value)
+        current_policy = str(self.config.get("inter_master_memmap_policy", "auto")).lower()
+        memmap_index = next(
+            (idx for idx, (value, _label) in enumerate(memmap_options) if value == current_policy),
+            0,
+        )
+        memmap_combo.setCurrentIndex(memmap_index)
+        phase45_layout.addRow(
+            QLabel(self._tr("qt_field_phase45_memmap", "Memmap policy")),
+            memmap_combo,
+        )
+        self._config_fields["inter_master_memmap_policy"] = {
+            "kind": "combobox",
+            "widget": memmap_combo,
+            "type": str,
+        }
+
+        scale_combo = QComboBox()
+        scale_options = [
+            ("final", self._tr("qt_phase45_scale_final", "Final scale")),
+            ("native", self._tr("qt_phase45_scale_native", "Native scale")),
+        ]
+        for value, label in scale_options:
+            scale_combo.addItem(label, value)
+        current_scale = str(self.config.get("inter_master_local_scale", "final")).lower()
+        scale_index = next(
+            (idx for idx, (value, _label) in enumerate(scale_options) if value == current_scale),
+            0,
+        )
+        scale_combo.setCurrentIndex(scale_index)
+        phase45_layout.addRow(
+            QLabel(self._tr("qt_field_phase45_local_scale", "Local scale")),
+            scale_combo,
+        )
+        self._config_fields["inter_master_local_scale"] = {
+            "kind": "combobox",
+            "widget": scale_combo,
+            "type": str,
+        }
+
+        self._register_checkbox(
+            "inter_master_photometry_intragroup",
+            phase45_layout,
+            self._tr("qt_field_phase45_intragroup", "Intra-group photometry"),
+        )
+        self._register_checkbox(
+            "inter_master_photometry_intersuper",
+            phase45_layout,
+            self._tr("qt_field_phase45_intersuper", "Inter-super photometry"),
+        )
+        self._register_double_spinbox(
+            "inter_master_photometry_clip_sigma",
+            phase45_layout,
+            self._tr("qt_field_phase45_clip_sigma", "Photometry clip σ"),
+            minimum=0.1,
+            maximum=10.0,
+            single_step=0.1,
+            decimals=2,
+        )
+
+        layout.addRow(phase45_box)
 
         return group
 
@@ -446,35 +599,44 @@ class ZeMosaicQtMainWindow(QMainWindow):
             kind = binding["kind"]
             widget = binding["widget"]
             expected_type = binding["type"]
-            if kind == "checkbox":
-                self.config[key] = bool(widget.isChecked())
-                continue
-
-            if kind == "spinbox":
-                self.config[key] = int(widget.value())
-                continue
-
-            if kind == "double_spinbox":
-                self.config[key] = float(widget.value())
-                continue
-
-            raw_text = widget.text().strip()
-            if expected_type in {int, float}:
-                try:
-                    converted: Any = expected_type(raw_text)  # type: ignore[arg-type]
-                except (TypeError, ValueError):
-                    converted = self.config.get(key)
-            elif expected_type is bool:
-                normalized = raw_text.lower()
-                if normalized in {"1", "true", "yes", "on"}:
-                    converted = True
-                elif normalized in {"0", "false", "no", "off"}:
-                    converted = False
-                else:
-                    converted = self.config.get(key, False)
+            value_getter = binding.get("value_getter")
+            if value_getter is not None:
+                raw_value = value_getter()
+            elif kind == "checkbox":
+                raw_value = bool(widget.isChecked())
+            elif kind == "spinbox":
+                raw_value = int(widget.value())
+            elif kind == "double_spinbox":
+                raw_value = float(widget.value())
+            elif kind == "combobox":
+                data = widget.currentData()
+                raw_value = data if data is not None else widget.currentText()
             else:
-                converted = raw_text
-            self.config[key] = converted
+                raw_text = widget.text().strip()
+                if expected_type in {int, float}:
+                    try:
+                        raw_value = expected_type(raw_text)  # type: ignore[arg-type]
+                    except (TypeError, ValueError):
+                        raw_value = self.config.get(key)
+                elif expected_type is bool:
+                    normalized = raw_text.lower()
+                    if normalized in {"1", "true", "yes", "on"}:
+                        raw_value = True
+                    elif normalized in {"0", "false", "no", "off"}:
+                        raw_value = False
+                    else:
+                        raw_value = self.config.get(key, False)
+                else:
+                    raw_value = raw_text
+
+            postprocess = binding.get("postprocess")
+            if callable(postprocess):
+                try:
+                    raw_value = postprocess(raw_value)
+                except Exception:
+                    raw_value = self.config.get(key, raw_value)
+
+            self.config[key] = raw_value
 
     def _load_config(self) -> Dict[str, Any]:
         if zemosaic_config is not None and hasattr(zemosaic_config, "load_config"):
