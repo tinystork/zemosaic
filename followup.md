@@ -104,14 +104,14 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
 
 ### 3.2 ASTAP configuration panel
 
-- [ ] Widgets for:
-  - [ ] ASTAP executable path.
-  - [ ] ASTAP data directory / star database folder.
-  - [ ] Search radius or FOV hint (if used).
-  - [ ] Downsample factor.
-  - [ ] Sensitivity / limit magnitude or equivalent parameters.
-- [ ] Bind all these widgets to the same config keys used by Tk GUI.
-- [ ] Make sure defaults are identical to Tk behavior.
+- [x] Widgets for:
+  - [x] ASTAP executable path.
+  - [x] ASTAP data directory / star database folder.
+  - [x] Search radius or FOV hint (if used).
+  - [x] Downsample factor.
+  - [x] Sensitivity / limit magnitude or equivalent parameters.
+- [x] Bind all these widgets to the same config keys used by Tk GUI.
+- [x] Make sure defaults are identical to Tk behavior.
 
 ### 3.3 Mosaic / clustering parameters
 
