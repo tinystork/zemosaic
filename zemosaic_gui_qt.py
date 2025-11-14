@@ -15,6 +15,7 @@ try:
         QDoubleSpinBox,
         QFileDialog,
         QFormLayout,
+        QGridLayout,
         QGroupBox,
         QHBoxLayout,
         QLabel,
@@ -115,6 +116,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "two_pass_coverage_renorm": False,
             "two_pass_cov_sigma_px": 50,
             "two_pass_cov_gain_clip": [0.85, 1.18],
+            "logging_level": "INFO",
         }
         for key, fallback in self._default_config_values.items():
             self.config.setdefault(key, fallback)
@@ -625,10 +627,90 @@ class ZeMosaicQtMainWindow(QMainWindow):
     def _create_logging_group(self) -> QGroupBox:
         group = QGroupBox(self._tr("qt_group_logging", "Logging / progress"), self)
         layout = QVBoxLayout(group)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        options_layout = QHBoxLayout()
+        options_layout.setContentsMargins(0, 0, 0, 0)
+        options_layout.setSpacing(6)
+
+        log_level_label = QLabel(self._tr("qt_logging_level", "Logging level:"))
+        options_layout.addWidget(log_level_label)
+
+        log_level_combo = QComboBox(group)
+        level_options = [
+            ("ERROR", self._tr("logging_level_error", "Error")),
+            ("WARN", self._tr("logging_level_warn", "Warn")),
+            ("INFO", self._tr("logging_level_info", "Info")),
+            ("DEBUG", self._tr("logging_level_debug", "Debug")),
+        ]
+        for value, label in level_options:
+            log_level_combo.addItem(label, value)
+        current_level = str(self.config.get("logging_level", "INFO")).upper()
+        current_index = next(
+            (idx for idx, (value, _label) in enumerate(level_options) if value == current_level),
+            2,
+        )
+        log_level_combo.setCurrentIndex(current_index)
+
+        def _on_level_changed(index: int) -> None:
+            selected = log_level_combo.itemData(index)
+            if not selected:
+                selected = "INFO"
+            self.config["logging_level"] = str(selected)
+
+        log_level_combo.currentIndexChanged.connect(_on_level_changed)  # type: ignore[arg-type]
+        options_layout.addWidget(log_level_combo)
+        options_layout.addStretch(1)
+
+        clear_log_button = QPushButton(self._tr("qt_button_clear_log", "Clear log"), group)
+        clear_log_button.clicked.connect(self._clear_log)  # type: ignore[arg-type]
+        options_layout.addWidget(clear_log_button)
+
+        layout.addLayout(options_layout)
 
         self.progress_bar = QProgressBar(group)
         self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
         layout.addWidget(self.progress_bar)
+
+        stats_layout = QGridLayout()
+        stats_layout.setContentsMargins(0, 0, 0, 0)
+        stats_layout.setHorizontalSpacing(12)
+        stats_layout.setVerticalSpacing(4)
+
+        phase_label = QLabel(self._tr("qt_progress_phase_label", "Phase:"), group)
+        self.phase_value_label = QLabel(self._tr("qt_progress_placeholder", "Idle"), group)
+        stats_layout.addWidget(phase_label, 0, 0)
+        stats_layout.addWidget(self.phase_value_label, 0, 1)
+
+        eta_label = QLabel(self._tr("qt_progress_eta_label", "ETA:"), group)
+        self.eta_value_label = QLabel(self._tr("qt_progress_placeholder", "—"), group)
+        stats_layout.addWidget(eta_label, 0, 2)
+        stats_layout.addWidget(self.eta_value_label, 0, 3)
+
+        elapsed_label = QLabel(self._tr("qt_progress_elapsed_label", "Elapsed:"), group)
+        self.elapsed_value_label = QLabel(self._tr("qt_progress_placeholder", "—"), group)
+        stats_layout.addWidget(elapsed_label, 0, 4)
+        stats_layout.addWidget(self.elapsed_value_label, 0, 5)
+
+        files_label = QLabel(self._tr("qt_progress_files_label", "Files:"), group)
+        self.files_value_label = QLabel(
+            self._tr("qt_progress_count_placeholder", "0 / 0"),
+            group,
+        )
+        stats_layout.addWidget(files_label, 1, 0)
+        stats_layout.addWidget(self.files_value_label, 1, 1)
+
+        tiles_label = QLabel(self._tr("qt_progress_tiles_label", "Tiles:"), group)
+        self.tiles_value_label = QLabel(
+            self._tr("qt_progress_count_placeholder", "0 / 0"),
+            group,
+        )
+        stats_layout.addWidget(tiles_label, 1, 2)
+        stats_layout.addWidget(self.tiles_value_label, 1, 3)
+
+        layout.addLayout(stats_layout)
 
         self.log_output = QPlainTextEdit(group)
         self.log_output.setReadOnly(True)
@@ -638,7 +720,17 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 "Worker output will appear here once the integration is complete.",
             )
         )
+        self.log_output.setMinimumHeight(180)
         layout.addWidget(self.log_output)
+
+        self.log_level_combo = log_level_combo
+        self.clear_log_button = clear_log_button
+        self._config_fields["logging_level"] = {
+            "kind": "combobox",
+            "widget": log_level_combo,
+            "type": str,
+            "value_getter": log_level_combo.currentData,
+        }
 
         return group
 
@@ -904,6 +996,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self.log_output.appendPlainText(formatted_message)
         else:  # pragma: no cover - initialization guard
             print(formatted_message)
+
+    def _clear_log(self) -> None:
+        if hasattr(self, "log_output"):
+            self.log_output.clear()
 
     def _on_start_clicked(self) -> None:
         self._collect_config_from_widgets()
