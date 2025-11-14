@@ -100,10 +100,19 @@ Whenever you are invoked to work on this project, you MUST:
 5. **Update `followup.md`**:
    - Check the boxes for the tasks you actually completed.
    - Optionally add notes or small corrections in the “Notes / Known Issues” section.
+   - Task C guard: if `followup.md` is not staged when you review `git status`, stop and update it before proceeding.
 
 6. **Summarize**:
    - After changes, summarize what you did and where.
    - Mention if any TODO or uncertainties were found and where they are left in comments.
+
+### Follow-up Discipline Guard (Task C)
+
+- **Every commit touching Qt migration work MUST edit `followup.md` in the same change set.**
+- Before running tests or drafting the final summary, execute `git status followup.md` to verify it is staged. If it is missing, open the file and:
+  - Mark any completed checklist items with `[x]`.
+  - Add partial progress notes or caveats in the Notes section.
+- Do not defer the update to later commits; Task C mandates that the log mirrors the current session immediately.
 
 You MUST NOT:
 - Reorder tasks.
