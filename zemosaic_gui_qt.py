@@ -205,20 +205,30 @@ class ZeMosaicQtMainWindow(QMainWindow):
         layout = QFormLayout(group)
         layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
 
-        self._register_line_edit(
+        self._register_double_spinbox(
             "cluster_panel_threshold",
             layout,
             self._tr("qt_field_cluster_threshold", "Cluster threshold"),
+            minimum=0.01,
+            maximum=5.0,
+            single_step=0.01,
+            decimals=2,
         )
-        self._register_line_edit(
+        self._register_spinbox(
             "cluster_target_groups",
             layout,
             self._tr("qt_field_cluster_target", "Target groups"),
+            minimum=0,
+            maximum=999,
         )
-        self._register_line_edit(
+        self._register_double_spinbox(
             "cluster_orientation_split_deg",
             layout,
             self._tr("qt_field_cluster_orientation", "Orientation split (°)"),
+            minimum=0.0,
+            maximum=180.0,
+            single_step=1.0,
+            decimals=1,
         )
 
         return group
@@ -413,11 +423,15 @@ class ZeMosaicQtMainWindow(QMainWindow):
         minimum: float,
         maximum: float,
         single_step: float,
+        decimals: int | None = None,
     ) -> None:
         spinbox = QDoubleSpinBox()
         spinbox.setRange(minimum, maximum)
         spinbox.setSingleStep(single_step)
-        spinbox.setDecimals(1 if single_step < 1 else 0)
+        if decimals is not None:
+            spinbox.setDecimals(decimals)
+        else:
+            spinbox.setDecimals(1 if single_step < 1 else 0)
         current_value = float(self.config.get(key, minimum))
         spinbox.setValue(current_value)
         layout.addRow(QLabel(label_text), spinbox)

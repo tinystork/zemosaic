@@ -116,9 +116,9 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
 ### 3.3 Mosaic / clustering parameters
 
 - [ ] Add widgets for:
-  - [ ] Cluster panel brightness / threshold.
-  - [ ] Target number of clusters / master tiles.
-  - [ ] Cluster orientation split degrees.
+  - [x] Cluster panel brightness / threshold.
+  - [x] Target number of clusters / master tiles.
+  - [x] Cluster orientation split degrees.
   - [ ] Any flags controlling “super-tiles” or phase 4.5 behavior if exposed in Tk GUI.
 - [ ] Bind to corresponding config keys.
 
@@ -274,5 +274,4 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
 
 Use this section to record issues, partial implementations, or TODOs that don’t map cleanly to a checkbox.
 
-- [ ] (example) …
-- [ ] …
+- [ ] Confirm whether Tk GUI currently exposes Phase 4.5 / super-tile controls before mirroring them in Qt.
