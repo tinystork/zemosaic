@@ -303,6 +303,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "force_seestar_mode": False,
             "sds_mode_default": False,
             "sds_coverage_threshold": 0.92,
+            "solver_method": "ansvr",
+            "astrometry_api_key": "",
+            "astrometry_timeout": 60,
+            "astrometry_downsample": 2,
             "astap_executable_path": "",
             "astap_data_directory_path": "",
             "astap_default_search_radius": 3.0,
@@ -383,6 +387,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
         for key, fallback in self._default_config_values.items():
             self.config.setdefault(key, fallback)
         self._config_fields: Dict[str, Dict[str, Any]] = {}
+        self.solver_choice_combo: QComboBox | None = None
+        self._solver_panels: Dict[str, QWidget] = {}
+        self._solver_none_hint: QLabel | None = None
 
         self._last_filter_overrides: Dict[str, Any] | None = None
         self._last_filtered_header_items: List[Any] | None = None
@@ -508,13 +515,57 @@ class ZeMosaicQtMainWindow(QMainWindow):
         return group
 
     def _create_astap_group(self) -> QGroupBox:
-        group = QGroupBox(self._tr("qt_group_astap", "ASTAP configuration"), self)
-        layout = QFormLayout(group)
-        layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        group = QGroupBox(self._tr("qt_group_solver", "Plate solving"), self)
+        outer_layout = QVBoxLayout(group)
+        outer_layout.setContentsMargins(8, 8, 8, 8)
+        outer_layout.setSpacing(10)
+
+        selection_box = QGroupBox(
+            self._tr("qt_group_solver_choice", "Solver selection"), group
+        )
+        selection_layout = QFormLayout(selection_box)
+        selection_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        solver_combo = QComboBox(selection_box)
+        solver_options = [
+            ("ASTAP", self._tr("qt_solver_astap", "ASTAP (recommended)")),
+            ("ASTROMETRY", self._tr("qt_solver_astrometry", "Astrometry.net")),
+            ("ANSVR", self._tr("qt_solver_ansvr", "ANSVR (local server)")),
+            ("NONE", self._tr("qt_solver_none", "None (WCS already present)")),
+        ]
+        for value, label in solver_options:
+            solver_combo.addItem(label, value)
+        current_solver = str(self.config.get("solver_method", "ASTAP") or "ASTAP").upper()
+        solver_index = next(
+            (idx for idx, (value, _label) in enumerate(solver_options) if value == current_solver),
+            0,
+        )
+        solver_combo.setCurrentIndex(solver_index)
+        resolved_solver = solver_options[solver_index][0]
+        self.config["solver_method"] = resolved_solver
+        selection_layout.addRow(
+            QLabel(self._tr("qt_field_solver_choice", "Preferred solver"), selection_box),
+            solver_combo,
+        )
+        self.solver_choice_combo = solver_combo
+        self._config_fields["solver_method"] = {
+            "kind": "combobox",
+            "widget": solver_combo,
+            "type": str,
+            "value_getter": solver_combo.currentData,
+        }
+
+        outer_layout.addWidget(selection_box)
+
+        astap_box = QGroupBox(
+            self._tr("qt_group_astap", "ASTAP configuration"), group
+        )
+        astap_layout = QFormLayout(astap_box)
+        astap_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
 
         self._register_line_edit(
             "astap_executable_path",
-            layout,
+            astap_layout,
             self._tr("qt_field_astap_executable", "ASTAP executable"),
             browse_action="file",
             dialog_title=self._tr(
@@ -523,7 +574,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         )
         self._register_line_edit(
             "astap_data_directory_path",
-            layout,
+            astap_layout,
             self._tr("qt_field_astap_data_dir", "ASTAP data directory"),
             browse_action="directory",
             dialog_title=self._tr(
@@ -532,7 +583,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         )
         self._register_double_spinbox(
             "astap_default_search_radius",
-            layout,
+            astap_layout,
             self._tr("qt_field_astap_search_radius", "Default search radius (°)"),
             minimum=0.1,
             maximum=180.0,
@@ -540,27 +591,122 @@ class ZeMosaicQtMainWindow(QMainWindow):
         )
         self._register_spinbox(
             "astap_default_downsample",
-            layout,
+            astap_layout,
             self._tr("qt_field_astap_downsample", "Default downsample"),
             minimum=0,
             maximum=4,
         )
         self._register_spinbox(
             "astap_default_sensitivity",
-            layout,
+            astap_layout,
             self._tr("qt_field_astap_sensitivity", "Default sensitivity"),
             minimum=-25,
             maximum=500,
         )
         self._register_spinbox(
             "astap_max_instances",
-            layout,
+            astap_layout,
             self._tr("qt_field_astap_max_instances", "Max ASTAP instances"),
             minimum=1,
             maximum=16,
         )
 
+        outer_layout.addWidget(astap_box)
+
+        astrometry_box = QGroupBox(
+            self._tr("qt_group_astrometry", "Astrometry.net configuration"), group
+        )
+        astrometry_layout = QFormLayout(astrometry_box)
+        astrometry_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        self._register_line_edit(
+            "astrometry_api_key",
+            astrometry_layout,
+            self._tr("qt_field_astrometry_api_key", "API key"),
+        )
+        self._register_spinbox(
+            "astrometry_timeout",
+            astrometry_layout,
+            self._tr("qt_field_astrometry_timeout", "Timeout (s)"),
+            minimum=10,
+            maximum=600,
+        )
+        self._register_spinbox(
+            "astrometry_downsample",
+            astrometry_layout,
+            self._tr("qt_field_astrometry_downsample", "Blind-solve downsample"),
+            minimum=1,
+            maximum=16,
+        )
+
+        outer_layout.addWidget(astrometry_box)
+
+        ansvr_box = QGroupBox(
+            self._tr("qt_group_ansvr", "ANSVR notes"),
+            group,
+        )
+        ansvr_layout = QVBoxLayout(ansvr_box)
+        ansvr_layout.setContentsMargins(8, 8, 8, 8)
+        ansvr_hint = QLabel(
+            self._tr(
+                "qt_ansvr_hint",
+                "ANSVR uses the local Ansvr service (Astrometry.net server).\n"
+                "Ensure it is installed and running on your system.",
+            ),
+            ansvr_box,
+        )
+        ansvr_hint.setWordWrap(True)
+        ansvr_layout.addWidget(ansvr_hint)
+
+        outer_layout.addWidget(ansvr_box)
+
+        none_hint = QLabel(
+            self._tr(
+                "qt_solver_none_hint",
+                "No plate solving will be performed. Existing WCS headers must be present.",
+            ),
+            group,
+        )
+        none_hint.setWordWrap(True)
+        outer_layout.addWidget(none_hint)
+
+        self._solver_panels = {
+            "ASTAP": astap_box,
+            "ASTROMETRY": astrometry_box,
+            "ANSVR": ansvr_box,
+        }
+        self._solver_none_hint = none_hint
+
+        solver_combo.currentIndexChanged.connect(self._on_solver_choice_changed)  # type: ignore[arg-type]
+        self._update_solver_visibility(resolved_solver)
+
         return group
+
+    def _on_solver_choice_changed(self) -> None:
+        if self.solver_choice_combo is None:
+            return
+        data = self.solver_choice_combo.currentData()
+        if data is None:
+            data = self.solver_choice_combo.currentText()
+        if not isinstance(data, str):
+            data = str(data)
+        normalized = data.upper().strip()
+        if not normalized:
+            normalized = "ASTAP"
+        self.config["solver_method"] = normalized
+        self._update_solver_visibility(normalized)
+
+    def _update_solver_visibility(self, solver_choice: str | None = None) -> None:
+        if solver_choice is None:
+            solver_choice = str(self.config.get("solver_method", "ASTAP") or "ASTAP")
+        normalized = solver_choice.upper().strip()
+        if normalized not in self._solver_panels and normalized != "NONE":
+            normalized = "ASTAP"
+            self.config["solver_method"] = normalized
+        for key, panel in self._solver_panels.items():
+            panel.setVisible(normalized == key)
+        if self._solver_none_hint is not None:
+            self._solver_none_hint.setVisible(normalized == "NONE")
 
     def _create_mosaic_group(self) -> QGroupBox:
         group = QGroupBox(self._tr("qt_group_mosaic", "Mosaic / clustering"), self)
@@ -2592,6 +2738,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
                     idx = widget.findText(str(value))
                 if idx >= 0:
                     widget.setCurrentIndex(idx)
+                if key == "solver_method":
+                    self._update_solver_visibility(str(value))
             else:
                 widget.setText(str(value))
         except Exception:
