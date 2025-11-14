@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import importlib.util
 import os
 from pathlib import Path
+import math
 from typing import Any, Iterable, List, Sequence, Tuple
 
 
@@ -87,6 +88,7 @@ class _NormalizedItem:
     include_by_default: bool = True
     center_ra_deg: float | None = None
     center_dec_deg: float | None = None
+    cluster_index: int | None = None
 
 
 def _header_has_wcs(header: Any) -> bool:
@@ -487,12 +489,26 @@ class FilterQtDialog(QDialog):
         self._preview_hint_label = QLabel(self)
         self._preview_default_hint = ""
         self._preview_refresh_pending = False
+        self._cluster_groups: list[list[_NormalizedItem]] = []
+        self._cluster_threshold_used: float | None = None
+        self._cluster_refresh_pending = False
+        self._preview_color_cycle: tuple[str, ...] = (
+            "#3f7ad6",
+            "#d64b3f",
+            "#3fd65d",
+            "#d6a63f",
+            "#8a3fd6",
+            "#3fc6d6",
+            "#d63fb8",
+            "#6ed63f",
+        )
 
         self._preview_canvas = self._create_preview_canvas()
         self._build_ui()
         self._populate_table()
         self._update_summary_label()
         self._schedule_preview_refresh()
+        self._schedule_cluster_refresh()
 
     # ------------------------------------------------------------------
     # Helpers - localization and normalization
@@ -843,6 +859,7 @@ class FilterQtDialog(QDialog):
     def _handle_item_changed(self, _: QTableWidgetItem) -> None:
         self._update_summary_label()
         self._schedule_preview_refresh()
+        self._schedule_cluster_refresh()
 
     def _select_all(self) -> None:
         self._toggle_all(True)
@@ -860,6 +877,7 @@ class FilterQtDialog(QDialog):
         self._table.blockSignals(False)
         self._update_summary_label()
         self._schedule_preview_refresh()
+        self._schedule_cluster_refresh()
 
     def _update_summary_label(self) -> None:
         total = self._table.rowCount()
@@ -875,9 +893,22 @@ class FilterQtDialog(QDialog):
             total=total,
         )
         try:
-            self._summary_label.setText(summary_text.format(selected=selected, total=total))
+            summary_formatted = summary_text.format(selected=selected, total=total)
         except Exception:
-            self._summary_label.setText(f"{selected} / {total}")
+            summary_formatted = f"{selected} / {total}"
+
+        cluster_count = sum(1 for group in self._cluster_groups if group)
+        if cluster_count:
+            cluster_fragment = self._localizer.get("filter.summary.groups", "{groups} group(s)")
+            try:
+                cluster_formatted = cluster_fragment.format(groups=cluster_count)
+            except Exception:
+                cluster_formatted = f"{cluster_count} group(s)"
+            summary_display = f"{summary_formatted} – {cluster_formatted}"
+        else:
+            summary_display = summary_formatted
+
+        self._summary_label.setText(summary_display)
 
     def _create_options_box(self):
         from PySide6.QtWidgets import QCheckBox, QGroupBox
@@ -983,11 +1014,11 @@ class FilterQtDialog(QDialog):
         entry.center_dec_deg = dec_deg
         return ra_deg, dec_deg
 
-    def _collect_preview_points(self) -> List[Tuple[float, float]]:
+    def _collect_preview_points(self) -> List[Tuple[float, float, int | None]]:
         if self._preview_canvas is None:
             return []
         limit = self._resolve_preview_cap()
-        points: list[Tuple[float, float]] = []
+        points: list[Tuple[float, float, int | None]] = []
         for row, entry in enumerate(self._normalized_items):
             item = self._table.item(row, 0)
             if item is None or item.checkState() != Qt.Checked:
@@ -997,7 +1028,8 @@ class FilterQtDialog(QDialog):
                 ra_deg, dec_deg = self._ensure_entry_coordinates(entry)
             if ra_deg is None or dec_deg is None:
                 continue
-            points.append((ra_deg, dec_deg))
+            cluster_idx = entry.cluster_index if isinstance(entry.cluster_index, int) else None
+            points.append((ra_deg, dec_deg, cluster_idx))
             if limit is not None and len(points) >= limit:
                 break
         return points
@@ -1007,6 +1039,126 @@ class FilterQtDialog(QDialog):
             return
         self._preview_refresh_pending = True
         QTimer.singleShot(0, self._update_preview_plot)
+
+    def _schedule_cluster_refresh(self) -> None:
+        if self._cluster_refresh_pending:
+            return
+        self._cluster_refresh_pending = True
+        QTimer.singleShot(0, self._update_cluster_assignments)
+
+    def _update_cluster_assignments(self) -> None:
+        self._cluster_refresh_pending = False
+        groups, threshold = self._compute_cluster_groups()
+        self._cluster_groups = groups
+        self._cluster_threshold_used = threshold
+
+        assigned_ids: set[int] = set()
+        label_template = self._localizer.get("filter.group.auto_label", "Group {index}")
+        for idx, group in enumerate(groups, start=1):
+            try:
+                label = label_template.format(index=idx)
+            except Exception:
+                label = f"Group {idx}"
+            for entry in group:
+                entry.group_label = label
+                entry.cluster_index = idx - 1
+                assigned_ids.add(id(entry))
+
+        for entry in self._normalized_items:
+            if id(entry) not in assigned_ids:
+                entry.group_label = None
+                entry.cluster_index = None
+
+        unassigned_text = self._localizer.get("filter.value.group_unassigned", "Unassigned")
+        self._table.blockSignals(True)
+        for row, entry in enumerate(self._normalized_items):
+            item = self._table.item(row, 2)
+            if item is None:
+                continue
+            label = entry.group_label or unassigned_text
+            item.setText(label)
+        self._table.blockSignals(False)
+
+        if groups and (self._scan_thread is None or not self._scan_thread.isRunning()):
+            threshold_value = threshold if isinstance(threshold, (int, float)) else 0.0
+            summary_template = self._localizer.get(
+                "filter.cluster.summary",
+                "Auto-grouped {groups} cluster(s) (threshold {threshold:.2f}°)",
+            )
+            try:
+                summary_text = summary_template.format(
+                    groups=len(groups),
+                    threshold=threshold_value,
+                )
+            except Exception:
+                summary_text = f"Auto-grouped {len(groups)} clusters"
+            self._status_label.setText(summary_text)
+
+        self._update_summary_label()
+        self._schedule_preview_refresh()
+
+    def _compute_cluster_groups(self) -> Tuple[List[List[_NormalizedItem]], float | None]:
+        threshold = self._resolve_cluster_threshold()
+        if not isinstance(threshold, (int, float)) or threshold <= 0:
+            return [], threshold
+
+        groups: list[list[_NormalizedItem]] = []
+        centroids: list[Tuple[float, float]] = []
+        for row, entry in enumerate(self._normalized_items):
+            item = self._table.item(row, 0)
+            if item is None or item.checkState() != Qt.Checked:
+                continue
+            ra_deg, dec_deg = entry.center_ra_deg, entry.center_dec_deg
+            if ra_deg is None or dec_deg is None:
+                ra_deg, dec_deg = self._ensure_entry_coordinates(entry)
+            if ra_deg is None or dec_deg is None:
+                continue
+
+            assigned_idx = None
+            for idx, (cen_ra, cen_dec) in enumerate(centroids):
+                distance = self._angular_distance_deg(ra_deg, dec_deg, cen_ra, cen_dec)
+                if distance <= threshold:
+                    assigned_idx = idx
+                    break
+
+            if assigned_idx is None:
+                groups.append([entry])
+                centroids.append((ra_deg, dec_deg))
+            else:
+                groups[assigned_idx].append(entry)
+                count = len(groups[assigned_idx])
+                cen_ra, cen_dec = centroids[assigned_idx]
+                new_ra = cen_ra + (ra_deg - cen_ra) / count
+                new_dec = cen_dec + (dec_deg - cen_dec) / count
+                centroids[assigned_idx] = (new_ra, new_dec)
+
+        non_empty = [group for group in groups if group]
+        return non_empty, threshold
+
+    def _resolve_cluster_threshold(self) -> float:
+        candidates: tuple[Any, ...] = (
+            self._safe_lookup(self._config_overrides, "cluster_panel_threshold"),
+            self._safe_lookup(self._initial_overrides, "cluster_panel_threshold"),
+            self._safe_lookup(self._solver_settings, "cluster_panel_threshold"),
+            self._safe_lookup(self._config_overrides, "panel_clustering_threshold_deg"),
+            self._safe_lookup(self._solver_settings, "panel_clustering_threshold_deg"),
+        )
+        for candidate in candidates:
+            try:
+                value = float(candidate)
+            except Exception:
+                continue
+            if value > 0:
+                return max(0.02, min(5.0, value))
+        return 0.25
+
+    @staticmethod
+    def _angular_distance_deg(ra1: float, dec1: float, ra2: float, dec2: float) -> float:
+        dra = abs(float(ra1) - float(ra2)) % 360.0
+        if dra > 180.0:
+            dra = 360.0 - dra
+        ddec = abs(float(dec1) - float(dec2))
+        return math.hypot(dra, ddec)
 
     def _update_preview_plot(self) -> None:
         self._preview_refresh_pending = False
@@ -1031,8 +1183,39 @@ class FilterQtDialog(QDialog):
             self._preview_canvas.draw_idle()
             return
 
-        ra_values, dec_values = zip(*points)
-        axes.scatter(ra_values, dec_values, c="#3f7ad6", s=24, alpha=0.85, edgecolors="none")
+        grouped_points: dict[int | None, list[Tuple[float, float]]] = {}
+        for ra_deg, dec_deg, group_idx in points:
+            grouped_points.setdefault(group_idx, []).append((ra_deg, dec_deg))
+
+        legend_needed = False
+        for group_idx, coords in grouped_points.items():
+            ra_coords = [coord[0] for coord in coords]
+            dec_coords = [coord[1] for coord in coords]
+            if isinstance(group_idx, int):
+                color = self._preview_color_cycle[group_idx % len(self._preview_color_cycle)]
+                label_template = self._localizer.get("filter.preview.group_label", "Group {index}")
+                try:
+                    label = label_template.format(index=group_idx + 1)
+                except Exception:
+                    label = f"Group {group_idx + 1}"
+                legend_needed = True
+            else:
+                color = "#3f7ad6"
+                label = None
+                if len(grouped_points) > 1:
+                    label = self._localizer.get("filter.preview.group_unassigned", "Unassigned")
+                    legend_needed = True
+
+            scatter_kwargs = dict(c=color, s=24, alpha=0.85, edgecolors="none")
+            if label:
+                scatter_kwargs["label"] = label
+            axes.scatter(ra_coords, dec_coords, **scatter_kwargs)
+
+        if legend_needed and len(grouped_points) > 1:
+            axes.legend(loc="upper right", fontsize="small")
+
+        ra_values = [pt[0] for pt in points]
+        dec_values = [pt[1] for pt in points]
         ra_min, ra_max = min(ra_values), max(ra_values)
         dec_min, dec_max = min(dec_values), max(dec_values)
         if ra_min == ra_max:
@@ -1053,6 +1236,14 @@ class FilterQtDialog(QDialog):
             count=len(points),
             cap=preview_cap_value or "∞",
         )
+        clusters_present = sum(1 for key in grouped_points.keys() if isinstance(key, int))
+        if clusters_present:
+            cluster_fragment = self._localizer.get("filter.preview.groups_hint", "{groups} cluster(s)")
+            try:
+                cluster_formatted = cluster_fragment.format(groups=clusters_present)
+            except Exception:
+                cluster_formatted = f"{clusters_present} cluster(s)"
+            summary_text = f"{summary_text} – {cluster_formatted}"
         try:
             self._preview_hint_label.setText(
                 summary_text.format(count=len(points), cap=preview_cap_value or "∞")
@@ -1086,7 +1277,13 @@ class FilterQtDialog(QDialog):
     def was_accepted(self) -> bool:
         return self._accepted
 
+    def _resolved_wcs_count(self) -> int:
+        return sum(1 for entry in self._normalized_items if entry.has_wcs)
+
     def overrides(self) -> Any:
+        if self._cluster_refresh_pending:
+            self._update_cluster_assignments()
+
         overrides: dict[str, Any] = {}
         if self._auto_group_checkbox is not None:
             overrides["filter_auto_group"] = bool(self._auto_group_checkbox.isChecked())
@@ -1094,6 +1291,32 @@ class FilterQtDialog(QDialog):
             overrides["filter_seestar_priority"] = bool(self._seestar_checkbox.isChecked())
         if self._astap_instances_value:
             overrides["astap_max_instances"] = int(self._astap_instances_value)
+        if self._cluster_groups and self._auto_group_checkbox is not None and self._auto_group_checkbox.isChecked():
+            serialized_groups: list[list[dict[str, Any]]] = []
+            for group in self._cluster_groups:
+                entries_payload: list[dict[str, Any]] = []
+                for entry in group:
+                    if not entry.file_path:
+                        continue
+                    payload = {
+                        "path": entry.file_path,
+                        "has_wcs": bool(entry.has_wcs),
+                    }
+                    if entry.instrument:
+                        payload["instrument"] = entry.instrument
+                    if entry.center_ra_deg is not None and entry.center_dec_deg is not None:
+                        payload["RA"] = entry.center_ra_deg
+                        payload["DEC"] = entry.center_dec_deg
+                    entries_payload.append(payload)
+                if entries_payload:
+                    serialized_groups.append(entries_payload)
+            if serialized_groups:
+                overrides["preplan_master_groups"] = serialized_groups
+        if isinstance(self._cluster_threshold_used, (int, float)) and self._cluster_threshold_used > 0:
+            overrides["cluster_panel_threshold"] = float(self._cluster_threshold_used)
+        resolved_count = self._resolved_wcs_count()
+        if resolved_count:
+            overrides["resolved_wcs_count"] = int(resolved_count)
         return overrides or None
 
     def input_items(self) -> List[Any]:
@@ -1143,6 +1366,7 @@ class FilterQtDialog(QDialog):
             entry.center_dec_deg = float(dec_deg)
         self._update_summary_label()
         self._schedule_preview_refresh()
+        self._schedule_cluster_refresh()
 
     def _on_scan_error(self, message: str) -> None:
         if not message:
@@ -1163,6 +1387,7 @@ class FilterQtDialog(QDialog):
         self._progress_bar.setValue(100)
         self._update_summary_label()
         self._schedule_preview_refresh()
+        self._schedule_cluster_refresh()
 
     def _resolve_initial_astap_instances(self) -> int:
         sources: tuple[Any, ...] = (
