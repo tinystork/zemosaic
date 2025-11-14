@@ -57,6 +57,7 @@ class _NormalizedItem:
     file_path: str
     has_wcs: bool
     instrument: str | None
+    group_label: str | None
     include_by_default: bool = True
 
 
@@ -100,8 +101,14 @@ class FilterQtDialog(QDialog):
         self._localizer = self._load_localizer()
         self._normalized_items = self._normalize_items(raw_files_with_wcs_or_dir, initial_overrides)
 
+        overrides = config_overrides or {}
+        self._auto_group_requested = bool(overrides.get("filter_auto_group", False))
+        self._seestar_priority = bool(overrides.get("filter_seestar_priority", False))
+
         self._table = QTableWidget(self)
         self._summary_label = QLabel(self)
+        self._auto_group_checkbox = None
+        self._seestar_checkbox = None
 
         self._build_ui()
         self._populate_table()
@@ -158,6 +165,36 @@ class FilterQtDialog(QDialog):
                         instrument = None
                     if instrument:
                         break
+            group_label: str | None = None
+            for key in (
+                "group_label",
+                "group",
+                "group_id",
+                "cluster",
+                "cluster_id",
+                "tile_group",
+                "tile_group_id",
+                "master_tile_id",
+            ):
+                if key in obj and obj[key] not in (None, ""):
+                    try:
+                        group_label = str(obj[key])
+                    except Exception:
+                        group_label = None
+                    if group_label:
+                        break
+            if group_label is None and "grouping" in obj:
+                grouping = obj.get("grouping")
+                if isinstance(grouping, dict):
+                    for key in ("label", "id", "name"):
+                        candidate = grouping.get(key)
+                        if candidate not in (None, ""):
+                            try:
+                                group_label = str(candidate)
+                            except Exception:
+                                group_label = None
+                            if group_label:
+                                break
             file_path = str(
                 obj.get("file_path")
                 or obj.get("path")
@@ -189,6 +226,7 @@ class FilterQtDialog(QDialog):
                 file_path=file_path,
                 has_wcs=has_wcs,
                 instrument=instrument,
+                group_label=group_label,
                 include_by_default=include,
             )
 
@@ -202,6 +240,7 @@ class FilterQtDialog(QDialog):
                 file_path=file_path,
                 has_wcs=False,
                 instrument=None,
+                group_label=None,
                 include_by_default=include,
             )
 
@@ -228,6 +267,7 @@ class FilterQtDialog(QDialog):
                             file_path=str(element),
                             has_wcs=False,
                             instrument=None,
+                            group_label=None,
                             include_by_default=True,
                         )
                     )
@@ -239,6 +279,7 @@ class FilterQtDialog(QDialog):
                     file_path=str(payload),
                     has_wcs=False,
                     instrument=None,
+                    group_label=None,
                     include_by_default=True,
                 )
             )
@@ -261,11 +302,12 @@ class FilterQtDialog(QDialog):
         )
         main_layout.addWidget(QLabel(description, self))
 
-        self._table.setColumnCount(3)
+        self._table.setColumnCount(4)
         headers = [
             self._localizer.get("filter.column.file", "File"),
-            self._localizer.get("filter.column.instrument", "Instrument"),
             self._localizer.get("filter.column.wcs", "WCS"),
+            self._localizer.get("filter.column.group", "Group"),
+            self._localizer.get("filter.column.instrument", "Instrument"),
         ]
         self._table.setHorizontalHeaderLabels(headers)
         self._table.verticalHeader().setVisible(False)
@@ -274,6 +316,11 @@ class FilterQtDialog(QDialog):
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.itemChanged.connect(self._handle_item_changed)
         main_layout.addWidget(self._table)
+
+        control_group = QGridLayout()
+        run_scan_btn = QPushButton(self._localizer.get("filter.button.run_scan", "Run analysis"), self)
+        run_scan_btn.clicked.connect(self._on_run_analysis)  # type: ignore[arg-type]
+        control_group.addWidget(run_scan_btn, 0, 0)
 
         control_row = QGridLayout()
         select_all_btn = QPushButton(self._localizer.get("filter.button.select_all", "Select all"), self)
@@ -284,7 +331,11 @@ class FilterQtDialog(QDialog):
         control_row.addWidget(select_none_btn, 0, 1)
         control_row.addWidget(self._summary_label, 0, 2)
         control_row.setColumnStretch(2, 1)
-        main_layout.addLayout(control_row)
+        control_group.addLayout(control_row, 0, 1, 2, 1)
+        main_layout.addLayout(control_group)
+
+        options_box = self._create_options_box()
+        main_layout.addWidget(options_box)
 
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
         button_box.accepted.connect(self.accept)
@@ -301,11 +352,6 @@ class FilterQtDialog(QDialog):
             name_item.setCheckState(Qt.Checked if entry.include_by_default else Qt.Unchecked)
             self._table.setItem(row, 0, name_item)
 
-            instrument = entry.instrument or self._localizer.get("filter.value.unknown", "Unknown")
-            instrument_item = QTableWidgetItem(instrument)
-            instrument_item.setFlags(instrument_item.flags() & ~Qt.ItemIsEditable)
-            self._table.setItem(row, 1, instrument_item)
-
             has_wcs_text = (
                 self._localizer.get("filter.value.wcs_present", "Yes")
                 if entry.has_wcs
@@ -313,7 +359,17 @@ class FilterQtDialog(QDialog):
             )
             wcs_item = QTableWidgetItem(has_wcs_text)
             wcs_item.setFlags(wcs_item.flags() & ~Qt.ItemIsEditable)
-            self._table.setItem(row, 2, wcs_item)
+            self._table.setItem(row, 1, wcs_item)
+
+            group_label = entry.group_label or self._localizer.get("filter.value.group_unassigned", "Unassigned")
+            group_item = QTableWidgetItem(group_label)
+            group_item.setFlags(group_item.flags() & ~Qt.ItemIsEditable)
+            self._table.setItem(row, 2, group_item)
+
+            instrument = entry.instrument or self._localizer.get("filter.value.unknown", "Unknown")
+            instrument_item = QTableWidgetItem(instrument)
+            instrument_item.setFlags(instrument_item.flags() & ~Qt.ItemIsEditable)
+            self._table.setItem(row, 3, instrument_item)
 
         self._table.blockSignals(False)
 
@@ -357,6 +413,38 @@ class FilterQtDialog(QDialog):
         except Exception:
             self._summary_label.setText(f"{selected} / {total}")
 
+    def _create_options_box(self):
+        from PySide6.QtWidgets import QCheckBox, QGroupBox, QHBoxLayout
+
+        box = QGroupBox(self._localizer.get("filter.group.options", "Filter options"), self)
+        layout = QHBoxLayout(box)
+
+        self._auto_group_checkbox = QCheckBox(
+            self._localizer.get("filter.option.auto_group", "Auto-group master tiles"),
+            box,
+        )
+        self._auto_group_checkbox.setChecked(self._auto_group_requested)
+        layout.addWidget(self._auto_group_checkbox)
+
+        self._seestar_checkbox = QCheckBox(
+            self._localizer.get("filter.option.seestar_mode", "Apply Seestar heuristics"),
+            box,
+        )
+        self._seestar_checkbox.setChecked(self._seestar_priority)
+        layout.addWidget(self._seestar_checkbox)
+
+        layout.addStretch(1)
+        return box
+
+    def _on_run_analysis(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        message = self._localizer.get(
+            "filter.message.run_analysis_placeholder",
+            "Automated scanning will be available in a later update.",
+        )
+        QMessageBox.information(self, self.windowTitle(), message)
+
     # ------------------------------------------------------------------
     # QDialog API
     # ------------------------------------------------------------------
@@ -383,8 +471,12 @@ class FilterQtDialog(QDialog):
         return self._accepted
 
     def overrides(self) -> Any:
-        # Placeholder: future iterations will translate UI state into overrides
-        return None
+        overrides: dict[str, Any] = {}
+        if self._auto_group_checkbox is not None:
+            overrides["filter_auto_group"] = bool(self._auto_group_checkbox.isChecked())
+        if self._seestar_checkbox is not None:
+            overrides["filter_seestar_priority"] = bool(self._seestar_checkbox.isChecked())
+        return overrides
 
 
 def launch_filter_interface_qt(
