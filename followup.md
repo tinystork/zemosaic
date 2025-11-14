@@ -140,18 +140,18 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
 
 ### 3.5 Logging / progress panel
 
-- [ ] QTextEdit or QPlainTextEdit for logs.
-- [ ] QProgressBar for global progress.
-- [ ] Labels:
-  - [ ] Current phase name (P1, P2, etc.).
-  - [ ] Elapsed time.
-  - [ ] Estimated remaining time (ETA).
-  - [ ] Files processed / total.
-  - [ ] Tiles processed / total, if available.
+- [x] QTextEdit or QPlainTextEdit for logs.
+- [x] QProgressBar for global progress.
+- [x] Labels:
+  - [x] Current phase name (P1, P2, etc.).
+  - [x] Elapsed time.
+  - [x] Estimated remaining time (ETA).
+  - [x] Files processed / total.
+  - [x] Tiles processed / total, if available.
 
-- [ ] Optionally add:
-  - [ ] Clear-log button.
-  - [ ] Combobox for log level (DEBUG / INFO / WARN / ERROR), bound to config.
+- [x] Optionally add:
+  - [x] Clear-log button.
+  - [x] Combobox for log level (DEBUG / INFO / WARN / ERROR), bound to config.
 
 - [x] Ensure there is a clear mapping between logging levels and how lines appear in the log widget (prefix, color, etc. – basic prefix is enough for now).
 
