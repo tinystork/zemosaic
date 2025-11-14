@@ -137,10 +137,10 @@ Qt currently treats these as plain log lines. Tk extracts and displays:
 
 **Detailed requirements:**
 
-- [ ] Extend Qt `_handle_payload` to detect the same event types as Tk.
-- [ ] Implement Qt-safe equivalents of `_handle_gpu_helper_*`.
-- [ ] Update Qt UI labels / overlays accordingly.
-- [ ] Ensure no business logic duplication; reuse worker payloads.
+- [x] Extend Qt `_handle_payload` to detect the same event types as Tk.
+- [x] Implement Qt-safe equivalents of `_handle_gpu_helper_*`.
+- [x] Update Qt UI labels / overlays accordingly.
+- [x] Ensure no business logic duplication; reuse worker payloads.
 
 
 ---

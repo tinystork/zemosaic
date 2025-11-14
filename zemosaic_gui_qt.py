@@ -198,6 +198,7 @@ class ZeMosaicQtWorker(QObject):
     progress_changed = Signal(float)
     stage_progress = Signal(str, int, int)
     phase_changed = Signal(str, dict)
+    gpu_helper_event = Signal(str, dict)
     stats_updated = Signal(dict)
     phase45_event = Signal(str, dict, str)
     finished = Signal(bool, str)
@@ -359,6 +360,30 @@ class ZeMosaicQtWorker(QObject):
         if msg_key == "PROCESS_DONE":
             # Process will terminate shortly; finalization occurs in the listener finished handler.
             return
+
+        if isinstance(msg_key, str):
+            if msg_key == "global_coadd_info_helper_path":
+                payload_dict: Dict[str, Any] = {}
+                if isinstance(kwargs, dict):
+                    payload_dict.update(kwargs)
+                helper_name = str(payload_dict.get("helper") or "")
+                if helper_name and "gpu" in helper_name.lower():
+                    self.gpu_helper_event.emit("start", payload_dict)
+            elif msg_key == "p4_global_coadd_finished":
+                payload_dict = {}
+                if isinstance(kwargs, dict):
+                    payload_dict.update(kwargs)
+                helper_name = str(payload_dict.get("helper") or "")
+                if helper_name and "gpu" in helper_name.lower():
+                    self.gpu_helper_event.emit("finish", payload_dict)
+            elif msg_key in {"global_coadd_warn_helper_fallback", "global_coadd_warn_helper_unavailable"}:
+                payload_dict = {}
+                if isinstance(kwargs, dict):
+                    payload_dict.update(kwargs)
+                helper_name = str(payload_dict.get("helper") or "")
+                if helper_name and "gpu" in helper_name.lower():
+                    payload_dict.setdefault("reason_key", msg_key)
+                    self.gpu_helper_event.emit("abort", payload_dict)
 
         if isinstance(msg_key, str) and msg_key.startswith("p45_"):
             payload_dict: Dict[str, Any] = {}
@@ -528,6 +553,26 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._eta_seconds_smoothed: float | None = None
         self._weighted_progress_active = False
 
+        self._gpu_eta_override: Dict[str, Any] | None = None
+        self._gpu_helper_active: Dict[str, Any] | None = None
+        gpu_eta_profiles = self.config.get("gpu_eta_profiles")
+        if not isinstance(gpu_eta_profiles, dict):
+            gpu_eta_profiles = {}
+        self._gpu_eta_profiles: Dict[str, Any] = gpu_eta_profiles
+        self.config["gpu_eta_profiles"] = self._gpu_eta_profiles
+        try:
+            default_gpu_rate = float(self.config.get("gpu_eta_default_rate", 0.85))
+            if default_gpu_rate <= 0:
+                raise ValueError
+        except Exception:
+            default_gpu_rate = 0.85
+            self.config["gpu_eta_default_rate"] = default_gpu_rate
+        self._gpu_eta_default_rate: float = default_gpu_rate
+
+        self._gpu_eta_timer = QTimer(self)
+        self._gpu_eta_timer.setInterval(1000)
+        self._gpu_eta_timer.timeout.connect(self._tick_gpu_eta_override)  # type: ignore[arg-type]
+
         self._phase45_groups: Dict[int, Dict[str, Any]] = {}
         self._phase45_group_progress: Dict[int, Dict[str, Any]] = {}
         self._phase45_active: Optional[int] = None
@@ -549,6 +594,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self.worker_controller.phase_changed.connect(self._on_worker_phase_changed)  # type: ignore[arg-type]
         self.worker_controller.stats_updated.connect(self._on_worker_stats_updated)  # type: ignore[arg-type]
         self.worker_controller.phase45_event.connect(self._on_worker_phase45_event)  # type: ignore[arg-type]
+        self.worker_controller.gpu_helper_event.connect(self._on_worker_gpu_helper_event)  # type: ignore[arg-type]
         self.worker_controller.finished.connect(self._on_worker_finished)  # type: ignore[arg-type]
 
         self._elapsed_timer = QTimer(self)
@@ -2961,6 +3007,247 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self.log_output.clear()
 
     # ------------------------------------------------------------------
+    # GPU helper + ETA override helpers
+    # ------------------------------------------------------------------
+    def _is_gpu_eta_override_active(self) -> bool:
+        return bool(self._gpu_eta_override)
+
+    def _set_eta_display(self, text: str, *, force: bool = False) -> None:
+        label = getattr(self, "eta_value_label", None)
+        if label is None:
+            return
+        if not force and self._is_gpu_eta_override_active():
+            return
+        label.setText(text)
+
+    def _format_eta_string(self, seconds: float, *, prefix: str = "") -> str:
+        try:
+            total = float(seconds)
+        except Exception:
+            total = 0.0
+        prefix_value = prefix
+        if total < 0:
+            prefix_value = prefix_value or "+"
+            total = abs(total)
+        eta_h, eta_rem = divmod(int(total + 0.5), 3600)
+        eta_m, eta_s = divmod(eta_rem, 60)
+        return f"{prefix_value}{eta_h:02d}:{eta_m:02d}:{eta_s:02d}"
+
+    def _set_eta_label_from_seconds(self, seconds: float, *, prefix: str = "") -> None:
+        try:
+            formatted = self._format_eta_string(seconds, prefix=prefix)
+        except Exception:
+            formatted = self._tr("qt_progress_placeholder", "—")
+        self._set_eta_display(formatted, force=True)
+
+    def _start_gpu_eta_override(self, seconds: float, helper_name: str) -> None:
+        try:
+            predicted = float(seconds)
+        except Exception:
+            return
+        if predicted <= 0:
+            return
+        self._gpu_eta_override = {
+            "helper": helper_name,
+            "predicted": predicted,
+            "started": time.monotonic(),
+        }
+        if not self._gpu_eta_timer.isActive():
+            self._gpu_eta_timer.start()
+        self._tick_gpu_eta_override()
+
+    def _tick_gpu_eta_override(self) -> None:
+        state = self._gpu_eta_override
+        if not state:
+            if self._gpu_eta_timer.isActive():
+                self._gpu_eta_timer.stop()
+            return
+        started = float(state.get("started", time.monotonic()))
+        predicted = float(state.get("predicted", 0.0))
+        elapsed = max(0.0, time.monotonic() - started)
+        remaining = predicted - elapsed
+        if remaining >= 0:
+            self._set_eta_label_from_seconds(remaining)
+        else:
+            self._set_eta_label_from_seconds(abs(remaining), prefix="+")
+
+    def _stop_gpu_eta_override(self) -> None:
+        self._gpu_eta_override = None
+        if self._gpu_eta_timer.isActive():
+            self._gpu_eta_timer.stop()
+
+    def _estimate_gpu_eta_seconds(
+        self, helper_name: str, frames: int, channels: int, width: int, height: int
+    ) -> Optional[float]:
+        try:
+            width_val = float(width)
+            height_val = float(height)
+        except Exception:
+            return None
+        if width_val <= 0 or height_val <= 0:
+            return None
+        grid_mp = max(1.0, (width_val * height_val) / 1_000_000.0)
+        try:
+            frames_val = int(frames or 0)
+        except Exception:
+            frames_val = 0
+        frames_val = max(1, frames_val)
+        try:
+            channels_val = int(channels or 0)
+        except Exception:
+            channels_val = 0
+        channels_val = max(1, channels_val)
+        units = grid_mp * frames_val * max(1.0, channels_val / 3.0)
+        if units <= 0:
+            return None
+        profile = self._gpu_eta_profiles.get(helper_name)
+        rate: float | None = None
+        if isinstance(profile, dict):
+            try:
+                rate = float(profile.get("avg_rate") or 0.0)
+            except Exception:
+                rate = None
+        if not rate or rate <= 0:
+            rate = float(self._gpu_eta_default_rate or 0.85)
+        seconds = rate * units
+        return max(10.0, seconds)
+
+    def _record_gpu_eta_sample(
+        self,
+        helper_name: str,
+        frames: int,
+        channels: int,
+        width: int,
+        height: int,
+        elapsed_seconds: float,
+    ) -> None:
+        try:
+            elapsed = float(elapsed_seconds)
+        except Exception:
+            return
+        if elapsed <= 0:
+            return
+        try:
+            width_val = float(width)
+            height_val = float(height)
+        except Exception:
+            return
+        if width_val <= 0 or height_val <= 0:
+            return
+        grid_mp = max(1.0, (width_val * height_val) / 1_000_000.0)
+        try:
+            frames_val = int(frames or 0)
+        except Exception:
+            frames_val = 0
+        frames_val = max(1, frames_val)
+        try:
+            channels_val = int(channels or 0)
+        except Exception:
+            channels_val = 0
+        channels_val = max(1, channels_val)
+        units = grid_mp * frames_val * max(1.0, channels_val / 3.0)
+        if units <= 0:
+            return
+        sample_rate = elapsed / units
+        profile = self._gpu_eta_profiles.setdefault(
+            helper_name, {"avg_rate": sample_rate, "samples": 0}
+        )
+        samples = int(profile.get("samples", 0))
+        existing_rate = profile.get("avg_rate")
+        alpha = 0.35
+        if existing_rate and samples > 0:
+            new_rate = (1 - alpha) * float(existing_rate) + alpha * sample_rate
+        else:
+            new_rate = sample_rate
+        profile["avg_rate"] = float(new_rate)
+        profile["samples"] = min(50, samples + 1)
+        profile["last_seconds"] = float(elapsed)
+        profile["last_units"] = float(units)
+        if zemosaic_config is not None and hasattr(zemosaic_config, "save_config"):
+            try:
+                self.config["gpu_eta_profiles"] = self._gpu_eta_profiles
+                zemosaic_config.save_config(self.config)
+            except Exception:
+                pass
+
+    def _handle_gpu_helper_start(self, payload: Dict[str, Any]) -> None:
+        data = payload or {}
+        helper_name = str(data.get("helper") or "gpu_reproject")
+        frames_val = data.get("frames") or data.get("images") or 0
+        channels_val = data.get("channels") or 0
+        width_val = data.get("grid_w") or data.get("W") or 0
+        height_val = data.get("grid_h") or data.get("H") or 0
+        try:
+            frames_int = int(frames_val)
+        except Exception:
+            frames_int = 0
+        try:
+            channels_int = int(channels_val)
+        except Exception:
+            channels_int = 0
+        try:
+            width_int = int(width_val)
+        except Exception:
+            width_int = 0
+        try:
+            height_int = int(height_val)
+        except Exception:
+            height_int = 0
+        self._gpu_helper_active = {
+            "helper": helper_name,
+            "frames": frames_int,
+            "channels": channels_int,
+            "grid_w": width_int,
+            "grid_h": height_int,
+        }
+        predicted = self._estimate_gpu_eta_seconds(
+            helper_name, frames_int, channels_int, width_int, height_int
+        )
+        if predicted:
+            self._start_gpu_eta_override(predicted, helper_name)
+
+    def _handle_gpu_helper_finish(self, payload: Dict[str, Any]) -> None:
+        data = payload or {}
+        active = self._gpu_helper_active or {}
+        helper_ref = data.get("helper") or active.get("helper")
+        helper_name = str(helper_ref) if helper_ref else None
+        frames_val = (
+            data.get("images")
+            or data.get("frames")
+            or active.get("frames")
+            or 0
+        )
+        channels_val = data.get("channels") or active.get("channels") or 0
+        width_val = data.get("W") or data.get("grid_w") or active.get("grid_w") or 0
+        height_val = data.get("H") or data.get("grid_h") or active.get("grid_h") or 0
+        elapsed_val = data.get("elapsed_s")
+        self._stop_gpu_eta_override()
+        self._gpu_helper_active = None
+        if helper_name and width_val and height_val and elapsed_val is not None:
+            self._record_gpu_eta_sample(
+                helper_name,
+                frames_val,
+                channels_val,
+                width_val,
+                height_val,
+                elapsed_val,
+            )
+
+    def _handle_gpu_helper_abort(self) -> None:
+        self._stop_gpu_eta_override()
+        self._gpu_helper_active = None
+
+    def _on_worker_gpu_helper_event(self, event: str, payload: Dict[str, Any]) -> None:
+        event_type = (event or "").lower()
+        data = payload if isinstance(payload, dict) else {}
+        if event_type == "start":
+            self._handle_gpu_helper_start(dict(data))
+        elif event_type == "finish":
+            self._handle_gpu_helper_finish(dict(data))
+        elif event_type == "abort":
+            self._handle_gpu_helper_abort()
+
+    # ------------------------------------------------------------------
     # Phase 4.5 overlay helpers
     # ------------------------------------------------------------------
     def _phase45_log_translated(self, key: str, payload: Dict[str, Any], level: str) -> None:
@@ -3232,6 +3519,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._weighted_progress_active = False
 
     def _set_processing_state(self, running: bool) -> None:
+        self._stop_gpu_eta_override()
+        self._gpu_helper_active = None
         if running:
             self._reset_progress_tracking()
         self.start_button.setEnabled(not running)
@@ -3240,14 +3529,14 @@ class ZeMosaicQtMainWindow(QMainWindow):
         if running:
             self.progress_bar.setValue(0)
             self.phase_value_label.setText(self._tr("qt_progress_placeholder", "Idle"))
-            self.eta_value_label.setText(self._tr("qt_progress_placeholder", "—"))
+            self._set_eta_display(self._tr("qt_progress_placeholder", "—"), force=True)
             self.elapsed_value_label.setText("00:00:00")
             self.files_value_label.setText(self._tr("qt_progress_count_placeholder", "0 / 0"))
             self.tiles_value_label.setText(self._tr("qt_progress_count_placeholder", "0 / 0"))
         else:
             self.progress_bar.setValue(0)
             self.phase_value_label.setText(self._tr("qt_progress_placeholder", "Idle"))
-            self.eta_value_label.setText(self._tr("qt_progress_placeholder", "—"))
+            self._set_eta_display(self._tr("qt_progress_placeholder", "—"), force=True)
             self.elapsed_value_label.setText(self._tr("qt_progress_placeholder", "—"))
             self.files_value_label.setText(self._tr("qt_progress_count_placeholder", "0 / 0"))
             self.tiles_value_label.setText(self._tr("qt_progress_count_placeholder", "0 / 0"))
@@ -3286,7 +3575,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._last_global_progress = float(bounded)
         self.progress_bar.setValue(bounded)
         if bounded >= 100:
-            self.eta_value_label.setText("00:00:00")
+            self._set_eta_display("00:00:00")
 
     def _on_worker_stage_progress(self, stage: str, current: int, total: int) -> None:
         stage_label = self._format_stage_name(stage)
@@ -3369,7 +3658,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 self._eta_seconds_smoothed = smoothed_remaining
                 eta_h, eta_rem = divmod(int(smoothed_remaining + 0.5), 3600)
                 eta_m, eta_s = divmod(eta_rem, 60)
-                self.eta_value_label.setText(f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}")
+                self._set_eta_display(f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}")
             return
 
         if stage_key in self._stage_order:
@@ -3400,7 +3689,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         if global_progress >= 99.9:
             self._eta_seconds_smoothed = 0.0
-            self.eta_value_label.setText("00:00:00")
+            self._set_eta_display("00:00:00")
             return
 
         if self._progress_start_time is None:
@@ -3420,7 +3709,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self._eta_seconds_smoothed = smoothed
             eta_h, eta_rem = divmod(int(smoothed + 0.5), 3600)
             eta_m, eta_s = divmod(eta_rem, 60)
-            self.eta_value_label.setText(f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}")
+            self._set_eta_display(f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}")
 
     def _on_worker_phase45_event(self, key: str, payload: Dict[str, Any], level: str) -> None:
         data = payload if isinstance(payload, dict) else {}
@@ -3470,7 +3759,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         if isinstance(eta_seconds, (int, float)) and eta_seconds >= 0:
             eta_h, eta_rem = divmod(int(eta_seconds + 0.5), 3600)
             eta_m, eta_s = divmod(eta_rem, 60)
-            self.eta_value_label.setText(f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}")
+            self._set_eta_display(f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}")
 
     def _on_worker_finished(self, success: bool, message: str) -> None:
         self.is_processing = False
