@@ -275,7 +275,7 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
 Use this section to record issues, partial implementations, or TODOs that don’t map cleanly to a checkbox.
 
 - [x] Confirm whether Tk GUI currently exposes Phase 4.5 / super-tile controls before mirroring them in Qt. The Tk GUI does not expose Phase 4.5 / super-tile controls and Qt parity is not required at this time.
-- [x] Qt worker progress currently uses simple per-stage percentages and does not replicate Tk’s weighted progress/ETA smoothing yet.
-- [x] Qt filter dialog currently focuses on manual include/exclude review; scanning, clustering, and preview tooling still pending.
-- [x] Qt filter “Run analysis” button currently shows a placeholder message until scanning backend is integrated.
+- [x] Qt worker progress now mirrors the Tk interface with weighted stage progress and ETA smoothing, though very short phases can still produce visible jumps.
+- [x] Qt filter dialog now integrates ASTAP scanning, clustering, and preview features comparable to the Tk workflow.
+- [ ] Qt filter dialog still loads frames eagerly; the `stream_scan` and `batch_size` parameters are stored for future incremental ingestion work.
 - [x] Qt GPU selector now mirrors the Tk combo with automatic GPU detection and retains manual override capability.
