@@ -561,7 +561,7 @@ def _apply_two_pass_coverage_renorm_if_requested(
         logger.info(
             "[TwoPass] Second pass requested (sigma=%s, clip=%s); coverage shape=%s",
             two_pass_sigma_px,
-            two_pass_gain_clip,
+            gain_clip_tuple,
             getattr(final_mosaic_coverage, "shape", None),
         )
 
@@ -10332,26 +10332,64 @@ def run_hierarchical_mosaic(
         """Shortcut to emit log+callback events with the current progress callback."""
         _log_and_callback(msg_key, prog, lvl, callback=progress_callback, **kwargs)
 
+    def _coerce_bool_flag(value) -> bool | None:
+        """Interpret various truthy/falsy representations coming from configs/UI."""
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value != 0
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if not normalized:
+                return None
+            if normalized in {"1", "true", "yes", "on", "enable", "enabled"}:
+                return True
+            if normalized in {"0", "false", "no", "off", "disable", "disabled"}:
+                return False
+        try:
+            return bool(value)
+        except Exception:
+            return None
+
     global_wcs_plan = _prepare_global_wcs_plan(
         output_folder,
         worker_config_cache,
         filter_overrides,
     )
 
-    config_sds_default = worker_config_cache.get("sds_mode_default")
-    if config_sds_default is None:
-        sds_mode_flag = True
-    else:
-        sds_mode_flag = bool(config_sds_default)
+    config_sds_default = _coerce_bool_flag(worker_config_cache.get("sds_mode_default"))
+    override_flag = None
+    override_defined = False
+    plan_override_flag = None
+    plan_override_defined = False
+    plan_override = None
     if isinstance(filter_overrides, dict):
-        if filter_overrides.get("sds_mode"):
-            sds_mode_flag = True
+        if "sds_mode" in filter_overrides:
+            override_flag = _coerce_bool_flag(filter_overrides.get("sds_mode"))
+            override_defined = override_flag is not None
         plan_override = filter_overrides.get("global_wcs_plan_override")
-        if isinstance(plan_override, dict) and plan_override.get("sds_mode"):
-            sds_mode_flag = True
-    if not global_wcs_plan.get("enabled"):
+    if isinstance(plan_override, dict) and "sds_mode" in plan_override:
+        plan_override_flag = _coerce_bool_flag(plan_override.get("sds_mode"))
+        plan_override_defined = plan_override_flag is not None
+    if override_defined:
+        sds_mode_flag = override_flag
+    elif plan_override_defined:
+        sds_mode_flag = plan_override_flag
+    elif config_sds_default is not None:
+        sds_mode_flag = config_sds_default
+    else:
         sds_mode_flag = False
     global_wcs_plan["sds_mode"] = bool(sds_mode_flag)
+
+    try:
+        sds_coverage_threshold_config = float(worker_config_cache.get("sds_coverage_threshold", 0.92))
+    except Exception:
+        sds_coverage_threshold_config = 0.92
+    if not math.isfinite(sds_coverage_threshold_config):
+        sds_coverage_threshold_config = 0.92
+    sds_coverage_threshold_config = max(0.10, min(0.99, sds_coverage_threshold_config))
 
     if global_wcs_plan.get("enabled"):
         logger.info(
@@ -10690,15 +10728,33 @@ def run_hierarchical_mosaic(
     pcb("PHASE_UPDATE:1", prog=None, lvl="ETA_LEVEL")
     
     fits_file_paths = []
+    # Prépare des exclusions supplémentaires: dossier de sortie et WCS global
+    try:
+        _output_abs = os.path.normcase(os.path.abspath(output_folder)) if output_folder else None
+    except Exception:
+        _output_abs = None
+    try:
+        _wcs_out_base = os.path.basename((worker_config_cache or {}).get("global_wcs_output_path", "global_mosaic_wcs.fits")).strip().lower()
+    except Exception:
+        _wcs_out_base = "global_mosaic_wcs.fits"
     # Scan des fichiers FITS dans le dossier d'entrée et ses sous-dossiers
     for root_dir_iter, dirnames_iter, files_in_dir_iter in os.walk(input_folder):
         # Exclure les dossiers interdits dès la descente
         try:
-            dirnames_iter[:] = [
-                d
-                for d in dirnames_iter
-                if not is_path_excluded(Path(root_dir_iter) / d, EXCLUDED_DIRS)
-            ]
+            filtered_dirs = []
+            for d in dirnames_iter:
+                child = Path(root_dir_iter) / d
+                # Exclusion via règle standard
+                if is_path_excluded(child, EXCLUDED_DIRS):
+                    continue
+                # Exclure aussi le sous-arbre du dossier de sortie
+                try:
+                    if _output_abs and os.path.normcase(os.path.abspath(str(child))).startswith(_output_abs):
+                        continue
+                except Exception:
+                    pass
+                filtered_dirs.append(d)
+            dirnames_iter[:] = filtered_dirs
         except Exception:
             dirnames_iter[:] = [
                 d
@@ -10722,6 +10778,12 @@ def run_hierarchical_mosaic(
                 except Exception:
                     if UNALIGNED_DIRNAME in os.path.normpath(full_path).split(os.sep):
                         continue
+                # Ignorer l'artefact du WCS global si présent dans l'arbre d'entrée
+                try:
+                    if _wcs_out_base and file_name_iter.strip().lower() == _wcs_out_base:
+                        continue
+                except Exception:
+                    pass
                 fits_file_paths.append(full_path)
     # Tri global déterministe
     try:
@@ -11894,15 +11956,66 @@ def run_hierarchical_mosaic(
         "altaz_nanize": bool(altaz_nanize_config),
     }
 
+    def _ensure_plan_descriptor_loaded(plan: dict[str, Any]) -> None:
+        if not plan.get("enabled"):
+            return
+        if plan.get("wcs") is not None and plan.get("width") and plan.get("height"):
+            return
+        fits_path = plan.get("fits_path")
+        json_path = plan.get("json_path")
+        descriptor_refresh = _load_global_wcs_descriptor_safe(fits_path, json_path)
+        if descriptor_refresh:
+            plan["descriptor"] = descriptor_refresh
+            plan["wcs"] = descriptor_refresh.get("wcs")
+            plan["width"] = descriptor_refresh.get("width")
+            plan["height"] = descriptor_refresh.get("height")
+            if not plan.get("meta"):
+                meta_payload = descriptor_refresh.get("metadata")
+                if isinstance(meta_payload, dict):
+                    plan["meta"] = _coerce_to_builtin(meta_payload)
+
+    def _plan_has_descriptor_fields(plan: dict[str, Any]) -> bool:
+        if not plan.get("enabled"):
+            return False
+        if plan.get("wcs") is None:
+            return False
+        try:
+            width_ok = int(plan.get("width") or 0) > 0
+            height_ok = int(plan.get("height") or 0) > 0
+        except Exception:
+            width_ok = height_ok = False
+        return width_ok and height_ok
+
+    def _disable_invalid_plan(reason: str, *, emit_warn: bool) -> None:
+        if not global_wcs_plan.get("enabled"):
+            return
+        if emit_warn:
+            pcb("sds_warn_runtime_wcs_failed", prog=None, lvl="WARN", error=reason)
+        global_wcs_plan["enabled"] = False
+        global_wcs_plan["wcs"] = None
+        global_wcs_plan["width"] = None
+        global_wcs_plan["height"] = None
+
     sds_post_context: dict[str, Any] = {}
-    if sds_mode_flag and not global_wcs_plan.get("enabled"):
-        _runtime_build_global_wcs_plan(
+    plan_mode_value = str(global_wcs_plan.get("mode") or "").strip().lower()
+    need_global_plan = bool(plan_mode_value == "seestar")
+
+    _ensure_plan_descriptor_loaded(global_wcs_plan)
+    if global_wcs_plan.get("enabled") and not _plan_has_descriptor_fields(global_wcs_plan):
+        _disable_invalid_plan("global WCS descriptor missing metadata", emit_warn=(sds_mode_flag or need_global_plan))
+
+    if (sds_mode_flag or need_global_plan) and not global_wcs_plan.get("enabled"):
+        built = _runtime_build_global_wcs_plan(
             seestar_groups=seestar_stack_groups,
             global_plan=global_wcs_plan,
             worker_config=worker_config_cache,
             output_dir=output_folder,
             pcb=pcb,
         )
+        if built:
+            _ensure_plan_descriptor_loaded(global_wcs_plan)
+        if global_wcs_plan.get("enabled") and not _plan_has_descriptor_fields(global_wcs_plan):
+            _disable_invalid_plan("runtime WCS descriptor incomplete", emit_warn=True)
 
     if global_wcs_plan.get("enabled"):
         mosaic_result = (None, None, None)
@@ -11922,7 +12035,7 @@ def run_hierarchical_mosaic(
                 start_time_total_run=start_time_total_run,
                 cache_root=output_folder,
                 stack_params=sds_stack_params,
-                coverage_threshold=0.92,
+                coverage_threshold=sds_coverage_threshold_config,
                 postprocess_context=sds_post_context,
             )
         if mosaic_result[0] is None:
@@ -13118,6 +13231,15 @@ def run_hierarchical_mosaic(
         if not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils): 
             raise RuntimeError("zemosaic_utils non disponible pour sauvegarde FITS.")
         legacy_rgb_flag = bool(legacy_rgb_cube_config)
+        # Ensure the final mosaic buffer is a contiguous, writeable ndarray for I/O
+        save_array = None
+        try:
+            if isinstance(final_mosaic_data_HWC, np.ndarray):
+                save_array = np.ascontiguousarray(final_mosaic_data_HWC)
+                if not save_array.flags.writeable:
+                    save_array = save_array.copy()
+        except Exception:
+            save_array = final_mosaic_data_HWC
         def _attach_alpha_extension(target_path: str, *, log_success: bool = False) -> None:
             if (
                 alpha_final is None
@@ -13144,13 +13266,13 @@ def run_hierarchical_mosaic(
             if not hasattr(zemosaic_utils, "write_final_fits_uint16_color_aware"):
                 raise RuntimeError("write_final_fits_uint16_color_aware unavailable in zemosaic_utils")
             is_rgb = (
-                isinstance(final_mosaic_data_HWC, np.ndarray)
-                and final_mosaic_data_HWC.ndim == 3
-                and final_mosaic_data_HWC.shape[-1] == 3
+                isinstance(save_array, np.ndarray)
+                and save_array.ndim == 3
+                and save_array.shape[-1] == 3
             )
             zemosaic_utils.write_final_fits_uint16_color_aware(
                 final_fits_path,
-                final_mosaic_data_HWC,
+                save_array,
                 header=final_header,
                 force_rgb_planes=is_rgb,
                 legacy_rgb_cube=legacy_rgb_flag,
@@ -13166,7 +13288,7 @@ def run_hierarchical_mosaic(
                 )
         else:
             zemosaic_utils.save_fits_image(
-                image_data=final_mosaic_data_HWC,
+                image_data=save_array,
                 output_path=final_fits_path,
                 header=final_header,
                 overwrite=True,
@@ -13186,11 +13308,11 @@ def run_hierarchical_mosaic(
                 try:
                     zemosaic_utils.write_final_fits_uint16_color_aware(
                         viewer_fits_path,
-                        final_mosaic_data_HWC,
+                        save_array,
                         header=final_header,
-                        force_rgb_planes=isinstance(final_mosaic_data_HWC, np.ndarray)
-                        and final_mosaic_data_HWC.ndim == 3
-                        and final_mosaic_data_HWC.shape[-1] == 3,
+                        force_rgb_planes=isinstance(save_array, np.ndarray)
+                        and save_array.ndim == 3
+                        and save_array.shape[-1] == 3,
                         legacy_rgb_cube=legacy_rgb_flag,
                         overwrite=True,
                     )

@@ -49,6 +49,8 @@ DEFAULT_CONFIG = {
     "global_wcs_padding_percent": 2.0,
     "global_wcs_res_override": None,
     "global_wcs_orientation": "north_up",
+    "sds_mode_default": False,
+    "sds_coverage_threshold": 0.92,
     "global_coadd_method": "kappa_sigma",
     "global_coadd_k": 2.0,
     "inter_master_merge_enable": False,

@@ -819,7 +819,11 @@ def load_global_wcs_descriptor(
         raise RuntimeError("Astropy WCS/FITS is required to read the global mosaic header")
 
     header = fits_module_for_utils.getheader(fits_path, 0)
+    # Build a WCS object from the header even if NAXIS1/2 are missing.
     wcs_obj = AstropyWCS(header, naxis=2)
+    # Some FITS writers reset NAXIS to 0 if no data array is attached. Our
+    # writer persists header-only descriptors; rely on JSON as a fallback for
+    # width/height when NAXIS1/2 are absent or zero.
     width = int(header.get("NAXIS1", 0) or 0)
     height = int(header.get("NAXIS2", 0) or 0)
     px_scale = _compute_pixel_scale_for_wcs(wcs_obj) or 0.0
@@ -832,6 +836,16 @@ def load_global_wcs_descriptor(
     except Exception as exc_json:
         log.warning("Global WCS: failed to read JSON metadata (%s): %s", json_candidate, exc_json)
         meta_payload = None
+
+    # Fallback to JSON width/height if FITS header lacks them
+    try:
+        if (width <= 0 or height <= 0) and isinstance(meta_payload, dict):
+            mw = int(meta_payload.get("width") or 0)
+            mh = int(meta_payload.get("height") or 0)
+            if mw > 0 and mh > 0:
+                width, height = mw, mh
+    except Exception:
+        pass
 
     descriptor = {
         "header": header,
