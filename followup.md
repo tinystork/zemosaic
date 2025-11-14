@@ -254,7 +254,7 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
 **Goal:** Bring Qt GUI close to full parity with Tk GUI and tidy up.
 
 - [ ] Ensure every major group of settings in Tk GUI has an equivalent in Qt GUI:
-  - [ ] Seestar / instrument-specific toggles.
+  - [x] Seestar / instrument-specific toggles.
   - [ ] Any special ASTAP options (e.g. max instances, timeout, access-violation auto-dismiss toggles if exposed).
   - [ ] Advanced options related to two-pass coverage renorm, alpha, etc., if they are in the GUI.
 - [ ] Verify localization:
