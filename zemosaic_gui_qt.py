@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 import multiprocessing
@@ -2008,16 +2009,81 @@ class ZeMosaicQtMainWindow(QMainWindow):
         finally:
             self._config_load_notes = []
 
+    def _json_safe_config_value(self, value: Any) -> Any:
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if hasattr(value, "__fspath__"):
+            try:
+                return os.fspath(value)
+            except TypeError:
+                pass
+        if isinstance(value, dict):
+            safe_dict: Dict[str, Any] = {}
+            for key, nested_value in value.items():
+                safe_key = str(key)
+                safe_dict[safe_key] = self._json_safe_config_value(nested_value)
+            return safe_dict
+        if isinstance(value, (list, tuple, set)):
+            return [self._json_safe_config_value(item) for item in value]
+        return str(value)
+
+    def _serialize_config_for_save(self) -> Dict[str, Any]:
+        snapshot: Dict[str, Any] = {}
+        default_keys: Iterable[str]
+        if (
+            zemosaic_config is not None
+            and hasattr(zemosaic_config, "DEFAULT_CONFIG")
+        ):
+            try:
+                default_keys = dict(getattr(zemosaic_config, "DEFAULT_CONFIG")).keys()
+            except Exception:
+                default_keys = self._default_config_values.keys()
+        else:
+            default_keys = self._default_config_values.keys()
+
+        for key in default_keys:
+            if key in self.config:
+                snapshot[key] = self._json_safe_config_value(self.config[key])
+        return snapshot
+
     def _save_config(self) -> None:
+        snapshot = self._serialize_config_for_save()
+        if not snapshot:
+            return
+
+        saved = False
+        last_error: str | None = None
+
         if zemosaic_config is not None and hasattr(zemosaic_config, "save_config"):
             try:
-                zemosaic_config.save_config(self.config)
+                result = zemosaic_config.save_config(snapshot)
             except Exception as exc:  # pragma: no cover - log instead of raising
-                template = self._tr(
-                    "qt_log_save_config_error",
-                    "Failed to save configuration: {error}",
+                last_error = str(exc)
+            else:
+                saved = bool(result) or result is None
+
+        if not saved and self._config_path:
+            try:
+                with open(self._config_path, "w", encoding="utf-8") as handle:
+                    json.dump(snapshot, handle, indent=4, ensure_ascii=False)
+            except Exception as exc:  # pragma: no cover - disk errors are rare
+                last_error = str(exc)
+            else:
+                saved = True
+
+        if saved:
+            self.config.update(snapshot)
+        else:
+            if last_error is None and not self._config_path:
+                last_error = self._tr(
+                    "qt_log_config_path_missing",
+                    "configuration path is not available",
                 )
-                self._append_log(template.format(error=exc), level="error")
+            template = self._tr(
+                "qt_log_save_config_error",
+                "Failed to save configuration: {error}",
+            )
+            self._append_log(template.format(error=last_error or "unknown"), level="error")
 
     def _create_localizer(self, language_code: str) -> Any:
         if ZeMosaicLocalization is not None:
