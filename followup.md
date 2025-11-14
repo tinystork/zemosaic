@@ -62,29 +62,29 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
 
 **Goal:** The Qt main window should be structurally ready but still minimal.
 
-- [ ] In `zemosaic_gui_qt.py`, expand `ZeMosaicQtMainWindow`:
-  - [ ] Add a central widget and a main `QVBoxLayout` or `QGridLayout`.
-  - [ ] Add placeholder `QGroupBox`es or `QFrame`s representing:
-    - [ ] Input/Output folders panel.
-    - [ ] ASTAP configuration panel.
-    - [ ] Mosaic / clustering parameters panel.
-    - [ ] Cropping / quality / Alt-Az options panel.
-    - [ ] Logging / progress panel.
-  - [ ] Add at least:
-    - [ ] A "Start" button (not yet wired).
-    - [ ] A "Stop" or "Abort" button (not yet wired).
+- [x] In `zemosaic_gui_qt.py`, expand `ZeMosaicQtMainWindow`:
+  - [x] Add a central widget and a main `QVBoxLayout` or `QGridLayout`.
+  - [x] Add placeholder `QGroupBox`es or `QFrame`s representing:
+    - [x] Input/Output folders panel.
+    - [x] ASTAP configuration panel.
+    - [x] Mosaic / clustering parameters panel.
+    - [x] Cropping / quality / Alt-Az options panel.
+    - [x] Logging / progress panel.
+  - [x] Add at least:
+    - [x] A "Start" button (not yet wired).
+    - [x] A "Stop" or "Abort" button (not yet wired).
 
-- [ ] Integrate configuration:
-  - [ ] Import `zemosaic_config` and load the default config.
-  - [ ] Populate initial widget values from the config (even if some fields are still placeholders).
-  - [ ] Save config changes:
-    - [ ] On Start click, or
-    - [ ] On window close (whichever is easiest for now).
+- [x] Integrate configuration:
+  - [x] Import `zemosaic_config` and load the default config.
+  - [x] Populate initial widget values from the config (even if some fields are still placeholders).
+  - [x] Save config changes:
+    - [x] On Start click, or
+    - [x] On window close (whichever is easiest for now).
 
-- [ ] Integrate localization infrastructure:
-  - [ ] Import the localization helper (e.g. `ZeMosaicLocalization`).
-  - [ ] Load the selected language the same way Tk GUI does.
-  - [ ] Use translated strings for group titles and button labels where reasonable.
+- [x] Integrate localization infrastructure:
+  - [x] Import the localization helper (e.g. `ZeMosaicLocalization`).
+  - [x] Load the selected language the same way Tk GUI does.
+  - [x] Use translated strings for group titles and button labels where reasonable.
 
 
 ## Phase 3 — Layout and widgets mirroring Tk GUI
