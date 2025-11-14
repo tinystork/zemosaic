@@ -109,7 +109,7 @@ This ensures that tools and worker components expecting Tk-style GPU config rema
 **Detailed requirements:**
 
 - [x] Update Qt GPU toggle handler to write both new-style and legacy-style GPU config keys.
-- [ ] Ensure config snapshots match those produced by Tk GUI.
+- [x] Ensure config snapshots match those produced by Tk GUI.
 - [ ] Ensure switching backend (Qt ↔ Tk) does not change stacked GPU behavior.
 - [ ] Add notes in followup.md once implemented.
 
@@ -164,5 +164,5 @@ Ensure the coding agent ALWAYS updates this file after completing a task.
 
 (Add here any clarifications or partial work notes related to tasks A/B/C)
 
-- [ ] 
-- [ ] 
+- [x] Qt config serialization now normalizes legacy GPU keys to match Tk snapshots.
+- [ ]
