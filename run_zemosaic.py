@@ -128,6 +128,33 @@ print("DEBUG (run_zemosaic): sys.path complet:\n" + "\n".join(sys.path))
 print("-" * 50)
 
 
+def _notify_qt_backend_unavailable(error: Exception) -> None:
+    """Inform the user that the Qt backend cannot be used."""
+
+    print(
+        "[run_zemosaic] Unable to load the Qt interface because the optional PySide6 "
+        "dependency is missing."
+    )
+    print("[run_zemosaic] Install it with `pip install PySide6` to enable the Qt GUI.")
+    print(f"[run_zemosaic] Original import error: {error}")
+    print("[run_zemosaic] Falling back to the classic Tk interface.")
+
+    try:
+        root_warning = tk.Tk()
+        root_warning.withdraw()
+        messagebox.showwarning(
+            "ZeMosaic Qt backend unavailable",
+            (
+                "The PySide6 dependency required for the Qt interface could not be imported.\n\n"
+                "ZeMosaic will continue with the classic Tk interface instead.\n\n"
+                "Install PySide6 with `pip install PySide6` if you wish to use the Qt GUI."
+            ),
+        )
+        root_warning.destroy()
+    except Exception as tk_error:
+        print(f"[run_zemosaic] Unable to display Tk warning dialog: {tk_error}")
+
+
 def _determine_backend(argv):
     """Determine which GUI backend should be used."""
 
@@ -165,11 +192,7 @@ def main(argv=None):
         try:
             from zemosaic.zemosaic_gui_qt import run_qt_main
         except ImportError as qt_import_error:
-            print(
-                "[run_zemosaic] Unable to load the Qt interface (PySide6 missing?)."
-            )
-            print(f"[run_zemosaic] {qt_import_error}")
-            print("[run_zemosaic] Falling back to the Tk interface.")
+            _notify_qt_backend_unavailable(qt_import_error)
             backend = "tk"
         else:
             print("[run_zemosaic] Launching ZeMosaic with the Qt backend.")

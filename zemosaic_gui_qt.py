@@ -45,8 +45,9 @@ try:
     )
 except ImportError as exc:  # pragma: no cover - import guard
     raise ImportError(
-        "PySide6 is required to use the ZeMosaic Qt interface. "
-        "Install PySide6 or use the Tk interface instead."
+        "Unable to import PySide6 which is required for the ZeMosaic Qt interface. "
+        "Install the optional dependency with `pip install PySide6` or continue "
+        "using the Tk interface."
     ) from exc
 
 if importlib.util.find_spec("zemosaic_config") is not None:
