@@ -230,11 +230,11 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
   - [x] Respect ASTAP instance limitations and concurrency caps (same logic as Tk filter GUI).
   - [x] Display progress of scanning and WCS solving.
 
-- [ ] Preview:
-  - [ ] If Tk filter GUI displays a field-of-view preview using Matplotlib:
-    - [ ] Use Matplotlib + `FigureCanvasQTAgg` to embed the plot in the dialog.
-    - [ ] Respect `preview_cap` to avoid plotting thousands of tiles.
-  - [ ] Update preview when the analysis completes or when settings change.
+- [x] Preview:
+  - [x] If Tk filter GUI displays a field-of-view preview using Matplotlib:
+    - [x] Use Matplotlib + `FigureCanvasQTAgg` to embed the plot in the dialog.
+    - [x] Respect `preview_cap` to avoid plotting thousands of tiles.
+  - [x] Update preview when the analysis completes or when settings change.
 
 - [ ] Return semantics:
   - [ ] On OK:

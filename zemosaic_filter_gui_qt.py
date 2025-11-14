@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import importlib.util
 import os
 from pathlib import Path
-from typing import Any, Iterable, List, Sequence
+from typing import Any, Iterable, List, Sequence, Tuple
 
 
 _pyside_spec = importlib.util.find_spec("PySide6")
@@ -15,7 +15,7 @@ if _pyside_spec is None:  # pragma: no cover - import guard
         "Install PySide6 or use the Tk interface instead."
     )
 
-from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot, QTimer
 from PySide6.QtWidgets import (  # noqa: E402  - imported after availability check
     QApplication,
     QDialog,
@@ -25,8 +25,10 @@ from PySide6.QtWidgets import (  # noqa: E402  - imported after availability che
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QWidget,
     QVBoxLayout,
 )
 
@@ -42,6 +44,13 @@ try:  # pragma: no cover - optional dependency for metadata extraction
 except Exception:  # pragma: no cover - optional dependency guard
     fits = None  # type: ignore[assignment]
     WCS = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - optional dependency guard
+    from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+    from matplotlib.figure import Figure
+except Exception:  # pragma: no cover - matplotlib optional
+    FigureCanvasQTAgg = None  # type: ignore[assignment]
+    Figure = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - optional dependency guard
     from zemosaic_astrometry import solve_with_astap, set_astap_max_concurrent_instances
@@ -74,6 +83,8 @@ class _NormalizedItem:
     instrument: str | None
     group_label: str | None
     include_by_default: bool = True
+    center_ra_deg: float | None = None
+    center_dec_deg: float | None = None
 
 
 def _header_has_wcs(header: Any) -> bool:
@@ -118,6 +129,77 @@ def _detect_instrument_from_header(header: Any) -> str | None:
     if instrume_raw:
         return instrume_raw
     return creator_raw or None
+
+
+def _sexagesimal_to_degrees(raw: str, is_ra: bool) -> float | None:
+    """Convert sexagesimal strings to decimal degrees."""
+
+    text = raw.strip().lower().replace("h", ":").replace("m", ":").replace("s", "")
+    parts = [segment for segment in text.replace("°", ":").replace("'", ":").split(":") if segment]
+    if not parts:
+        return None
+
+    try:
+        numbers = [float(part) for part in parts]
+    except Exception:
+        return None
+
+    if is_ra:
+        hours = numbers[0]
+        minutes = numbers[1] if len(numbers) > 1 else 0.0
+        seconds = numbers[2] if len(numbers) > 2 else 0.0
+        return (hours + minutes / 60.0 + seconds / 3600.0) * 15.0
+
+    sign = -1.0 if text.startswith("-") else 1.0
+    degrees = abs(numbers[0])
+    arcmin = numbers[1] if len(numbers) > 1 else 0.0
+    arcsec = numbers[2] if len(numbers) > 2 else 0.0
+    return sign * (degrees + arcmin / 60.0 + arcsec / 3600.0)
+
+
+def _extract_center_from_header(header: Any) -> Tuple[float | None, float | None]:
+    """Attempt to extract the approximate pointing centre from a FITS header."""
+
+    if header is None:
+        return None, None
+
+    def _coerce(value: Any, *, is_ra: bool) -> float | None:
+        if value in (None, ""):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        try:
+            text = str(value).strip()
+        except Exception:
+            return None
+        if not text:
+            return None
+        try:
+            return float(text)
+        except Exception:
+            pass
+        if ":" in text or any(sep in text for sep in ("h", "m", "°", "'")):
+            return _sexagesimal_to_degrees(text, is_ra)
+        return None
+
+    ra_keys = ("CRVAL1", "OBJCTRA", "RA", "RA_DEG", "OBJRA", "OBJRA_DEG")
+    dec_keys = ("CRVAL2", "OBJCTDEC", "DEC", "DEC_DEG", "OBJDEC", "OBJDEC_DEG")
+
+    ra_value = None
+    for key in ra_keys:
+        if key in header:
+            ra_value = _coerce(header.get(key), is_ra=True)
+            if ra_value is not None:
+                break
+
+    dec_value = None
+    for key in dec_keys:
+        if key in header:
+            dec_value = _coerce(header.get(key), is_ra=False)
+            if dec_value is not None:
+                break
+
+    return ra_value, dec_value
 
 
 class _DirectoryScanWorker(QObject):
@@ -233,6 +315,11 @@ class _DirectoryScanWorker(QObject):
             row_update["has_wcs"] = has_wcs
             if instrument:
                 row_update["instrument"] = instrument
+            if header is not None:
+                ra_deg, dec_deg = _extract_center_from_header(header)
+                if ra_deg is not None and dec_deg is not None:
+                    row_update["center_ra_deg"] = ra_deg
+                    row_update["center_dec_deg"] = dec_deg
             self.row_updated.emit(index, row_update)
             completed_message = self._localizer.get(
                 "filter.scan.progress",
@@ -391,10 +478,17 @@ class FilterQtDialog(QDialog):
         self._scan_worker: _DirectoryScanWorker | None = None
         self._auto_group_checkbox = None
         self._seestar_checkbox = None
+        self._preview_canvas: FigureCanvasQTAgg | None = None
+        self._preview_axes = None
+        self._preview_hint_label = QLabel(self)
+        self._preview_default_hint = ""
+        self._preview_refresh_pending = False
 
+        self._preview_canvas = self._create_preview_canvas()
         self._build_ui()
         self._populate_table()
         self._update_summary_label()
+        self._schedule_preview_refresh()
 
     # ------------------------------------------------------------------
     # Helpers - localization and normalization
@@ -502,6 +596,33 @@ class FilterQtDialog(QDialog):
                 has_wcs = obj["wcs"] is not None
             display_name = file_path or instrument or "Item"
             include = not _should_exclude(file_path)
+            ra_deg = None
+            dec_deg = None
+            for key in ("center_ra_deg", "ra_deg", "ra"):
+                if key in obj:
+                    try:
+                        ra_deg = float(obj[key])
+                    except Exception:
+                        ra_deg = None
+                    if ra_deg is not None:
+                        break
+            for key in ("center_dec_deg", "dec_deg", "dec"):
+                if key in obj:
+                    try:
+                        dec_deg = float(obj[key])
+                    except Exception:
+                        dec_deg = None
+                    if dec_deg is not None:
+                        break
+            if (ra_deg is None or dec_deg is None) and "header" in obj:
+                try:
+                    header_obj = obj["header"]
+                except Exception:
+                    header_obj = None
+                if header_obj is not None:
+                    ra_from_header, dec_from_header = _extract_center_from_header(header_obj)
+                    ra_deg = ra_deg if ra_deg is not None else ra_from_header
+                    dec_deg = dec_deg if dec_deg is not None else dec_from_header
             return _NormalizedItem(
                 original=original,
                 display_name=display_name,
@@ -510,6 +631,8 @@ class FilterQtDialog(QDialog):
                 instrument=instrument,
                 group_label=group_label,
                 include_by_default=include,
+                center_ra_deg=ra_deg,
+                center_dec_deg=dec_deg,
             )
 
         def _build_from_path(path_obj: Path) -> _NormalizedItem:
@@ -571,6 +694,34 @@ class FilterQtDialog(QDialog):
     # ------------------------------------------------------------------
     # UI creation
     # ------------------------------------------------------------------
+    def _create_preview_canvas(self) -> FigureCanvasQTAgg | None:
+        """Initialise the Matplotlib preview canvas if Matplotlib is available."""
+
+        self._preview_hint_label.setWordWrap(True)
+        unavailable_text = self._localizer.get(
+            "filter.preview.unavailable",
+            "Matplotlib is not available; preview disabled.",
+        )
+        if Figure is None or FigureCanvasQTAgg is None:
+            self._preview_default_hint = unavailable_text
+            self._preview_hint_label.setText(unavailable_text)
+            return None
+
+        figure = Figure(figsize=(5, 3))
+        canvas = FigureCanvasQTAgg(figure)
+        axes = figure.add_subplot(111)
+        self._preview_axes = axes
+        axes.set_xlabel(self._localizer.get("filter.preview.ra", "Right Ascension (°)"))
+        axes.set_ylabel(self._localizer.get("filter.preview.dec", "Declination (°)"))
+        axes.set_title(self._localizer.get("filter.preview.title", "Sky preview"))
+        axes.grid(True, linestyle=":", linewidth=0.5, alpha=0.5)
+        self._preview_default_hint = self._localizer.get(
+            "filter.preview.hint",
+            "Preview shows the approximate pointing of selected frames (limited by preview cap).",
+        )
+        self._preview_hint_label.setText(self._preview_default_hint)
+        return canvas
+
     def _build_ui(self) -> None:
         title = self._localizer.get("filter.dialog.title", "Filter raw frames")
         self.setWindowTitle(title)
@@ -597,7 +748,29 @@ class FilterQtDialog(QDialog):
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.itemChanged.connect(self._handle_item_changed)
-        main_layout.addWidget(self._table)
+
+        splitter = QSplitter(Qt.Vertical, self)
+        splitter.setChildrenCollapsible(False)
+
+        table_container = QWidget(self)
+        table_layout = QVBoxLayout(table_container)
+        table_layout.setContentsMargins(0, 0, 0, 0)
+        table_layout.addWidget(self._table)
+        splitter.addWidget(table_container)
+
+        preview_container = QWidget(self)
+        preview_layout = QVBoxLayout(preview_container)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_title = QLabel(self._localizer.get("filter.preview.header", "Sky preview"), self)
+        preview_layout.addWidget(preview_title)
+        if self._preview_canvas is not None:
+            preview_layout.addWidget(self._preview_canvas, stretch=1)
+        preview_layout.addWidget(self._preview_hint_label)
+        splitter.addWidget(preview_container)
+
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        main_layout.addWidget(splitter)
 
         control_group = QGridLayout()
         self._run_analysis_btn = QPushButton(self._localizer.get("filter.button.run_scan", "Run analysis"), self)
@@ -665,6 +838,7 @@ class FilterQtDialog(QDialog):
     # ------------------------------------------------------------------
     def _handle_item_changed(self, _: QTableWidgetItem) -> None:
         self._update_summary_label()
+        self._schedule_preview_refresh()
 
     def _select_all(self) -> None:
         self._toggle_all(True)
@@ -681,6 +855,7 @@ class FilterQtDialog(QDialog):
                 item.setCheckState(state)
         self._table.blockSignals(False)
         self._update_summary_label()
+        self._schedule_preview_refresh()
 
     def _update_summary_label(self) -> None:
         total = self._table.rowCount()
@@ -764,6 +939,114 @@ class FilterQtDialog(QDialog):
         self._scan_thread.finished.connect(self._scan_thread.deleteLater)
         self._scan_thread.start()
 
+    def _resolve_preview_cap(self) -> int | None:
+        """Return the integer cap applied to preview points or ``None`` for unlimited."""
+
+        try:
+            if self._preview_cap in (None, ""):
+                return 200
+            cap = int(self._preview_cap)
+            if cap <= 0:
+                return None
+            return cap
+        except Exception:
+            return 200
+
+    def _ensure_entry_coordinates(self, entry: _NormalizedItem) -> Tuple[float | None, float | None]:
+        if entry.center_ra_deg is not None and entry.center_dec_deg is not None:
+            return entry.center_ra_deg, entry.center_dec_deg
+        if fits is None:
+            return None, None
+        path = entry.file_path
+        if not path or not os.path.isfile(path):
+            return None, None
+        try:
+            header = fits.getheader(path, ignore_missing_end=True)
+        except Exception:
+            return None, None
+        ra_deg, dec_deg = _extract_center_from_header(header)
+        entry.center_ra_deg = ra_deg
+        entry.center_dec_deg = dec_deg
+        return ra_deg, dec_deg
+
+    def _collect_preview_points(self) -> List[Tuple[float, float]]:
+        if self._preview_canvas is None:
+            return []
+        limit = self._resolve_preview_cap()
+        points: list[Tuple[float, float]] = []
+        for row, entry in enumerate(self._normalized_items):
+            item = self._table.item(row, 0)
+            if item is None or item.checkState() != Qt.Checked:
+                continue
+            ra_deg, dec_deg = entry.center_ra_deg, entry.center_dec_deg
+            if ra_deg is None or dec_deg is None:
+                ra_deg, dec_deg = self._ensure_entry_coordinates(entry)
+            if ra_deg is None or dec_deg is None:
+                continue
+            points.append((ra_deg, dec_deg))
+            if limit is not None and len(points) >= limit:
+                break
+        return points
+
+    def _schedule_preview_refresh(self) -> None:
+        if self._preview_canvas is None or self._preview_refresh_pending:
+            return
+        self._preview_refresh_pending = True
+        QTimer.singleShot(0, self._update_preview_plot)
+
+    def _update_preview_plot(self) -> None:
+        self._preview_refresh_pending = False
+        if self._preview_axes is None or self._preview_canvas is None:
+            return
+
+        points = self._collect_preview_points()
+        axes = self._preview_axes
+        axes.clear()
+        axes.set_xlabel(self._localizer.get("filter.preview.ra", "Right Ascension (°)"))
+        axes.set_ylabel(self._localizer.get("filter.preview.dec", "Declination (°)"))
+        axes.set_title(self._localizer.get("filter.preview.title", "Sky preview"))
+        axes.grid(True, linestyle=":", linewidth=0.5, alpha=0.5)
+
+        if not points:
+            message = self._localizer.get(
+                "filter.preview.empty",
+                "No WCS information available for the current selection.",
+            )
+            axes.text(0.5, 0.5, message, ha="center", va="center", transform=axes.transAxes)
+            self._preview_hint_label.setText(self._preview_default_hint)
+            self._preview_canvas.draw_idle()
+            return
+
+        ra_values, dec_values = zip(*points)
+        axes.scatter(ra_values, dec_values, c="#3f7ad6", s=24, alpha=0.85, edgecolors="none")
+        ra_min, ra_max = min(ra_values), max(ra_values)
+        dec_min, dec_max = min(dec_values), max(dec_values)
+        if ra_min == ra_max:
+            ra_margin = max(1.0, abs(ra_min) * 0.01 + 0.5)
+        else:
+            ra_margin = (ra_max - ra_min) * 0.05
+        if dec_min == dec_max:
+            dec_margin = max(1.0, abs(dec_min) * 0.01 + 0.5)
+        else:
+            dec_margin = (dec_max - dec_min) * 0.05
+        axes.set_xlim(ra_max + ra_margin, ra_min - ra_margin)
+        axes.set_ylim(dec_min - dec_margin, dec_max + dec_margin)
+        axes.set_aspect("equal", adjustable="datalim")
+        preview_cap_value = self._resolve_preview_cap()
+        summary_text = self._localizer.get(
+            "filter.preview.summary",
+            "Showing {count} frame(s) in preview (cap {cap}).",
+            count=len(points),
+            cap=preview_cap_value or "∞",
+        )
+        try:
+            self._preview_hint_label.setText(
+                summary_text.format(count=len(points), cap=preview_cap_value or "∞")
+            )
+        except Exception:
+            self._preview_hint_label.setText(summary_text)
+        self._preview_canvas.draw_idle()
+
     # ------------------------------------------------------------------
     # QDialog API
     # ------------------------------------------------------------------
@@ -832,7 +1115,13 @@ class FilterQtDialog(QDialog):
             item = self._table.item(row, 3)
             if item is not None:
                 item.setText(str(instrument))
+        ra_deg = payload.get("center_ra_deg")
+        dec_deg = payload.get("center_dec_deg")
+        if isinstance(ra_deg, (int, float)) and isinstance(dec_deg, (int, float)):
+            entry.center_ra_deg = float(ra_deg)
+            entry.center_dec_deg = float(dec_deg)
         self._update_summary_label()
+        self._schedule_preview_refresh()
 
     def _on_scan_error(self, message: str) -> None:
         if not message:
@@ -852,6 +1141,7 @@ class FilterQtDialog(QDialog):
         )
         self._progress_bar.setValue(100)
         self._update_summary_label()
+        self._schedule_preview_refresh()
 
 
 def launch_filter_interface_qt(
