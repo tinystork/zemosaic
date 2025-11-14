@@ -12,6 +12,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import platform
+import shutil
+import subprocess
 import sys
 import multiprocessing
 import queue
@@ -49,6 +52,19 @@ except ImportError as exc:  # pragma: no cover - import guard
         "Install the optional dependency with `pip install PySide6` or continue "
         "using the Tk interface."
     ) from exc
+
+SYSTEM_NAME = platform.system().lower()
+IS_WINDOWS = SYSTEM_NAME == "windows"
+
+if IS_WINDOWS:
+    try:  # pragma: no cover - optional dependency for GPU detection
+        import wmi  # type: ignore
+    except ImportError:  # pragma: no cover - wmi unavailable on non-Windows
+        wmi = None  # type: ignore[assignment]
+else:
+    wmi = None  # type: ignore[assignment]
+
+CUPY_AVAILABLE = importlib.util.find_spec("cupy") is not None
 
 if importlib.util.find_spec("zemosaic_config") is not None:
     import zemosaic_config  # type: ignore
@@ -302,6 +318,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self.setWindowTitle(
             self._tr("qt_window_title_preview", "ZeMosaic (Qt Preview)")
         )
+        self._gpu_devices: List[Tuple[str, int | None]] = self._detect_gpus()
+        if self._gpu_devices:
+            self.config.setdefault("gpu_selector", self._gpu_devices[0][0])
+        else:
+            self.config.setdefault("gpu_selector", "CPU (no GPU)")
         self._log_level_prefixes = {
             "debug": self._tr("qt_log_prefix_debug", "[DEBUG] "),
             "info": self._tr("qt_log_prefix_info", "[INFO] "),
@@ -1475,12 +1496,16 @@ class ZeMosaicQtMainWindow(QMainWindow):
             gpu_layout,
             self._tr("qt_field_use_gpu_phase5", "Use GPU acceleration when available"),
         )
-        self._register_spinbox(
-            "gpu_id_phase5",
+        checkbox_binding = self._config_fields.get("use_gpu_phase5")
+        checkbox_widget: QCheckBox | None = None
+        if isinstance(checkbox_binding, dict):
+            widget_candidate = checkbox_binding.get("widget")
+            if isinstance(widget_candidate, QCheckBox):
+                checkbox_widget = widget_candidate
+        self._register_gpu_selector(
             gpu_layout,
-            self._tr("qt_field_gpu_id", "Preferred GPU ID"),
-            minimum=-1,
-            maximum=64,
+            self._tr("qt_field_gpu_selector", "GPU selector"),
+            checkbox=checkbox_widget,
         )
 
         layout.addWidget(gpu_box)
@@ -1600,6 +1625,69 @@ class ZeMosaicQtMainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Configuration handling
     # ------------------------------------------------------------------
+    def _detect_gpus(self) -> List[Tuple[str, int | None]]:
+        """Return detected GPU devices as ``(label, index)`` tuples."""
+
+        controllers: List[str] = []
+        if IS_WINDOWS and wmi is not None:
+            try:  # pragma: no cover - hardware/OS specific code
+                wmi_client = wmi.WMI()  # type: ignore[attr-defined]
+                controllers = [str(entry.Name) for entry in wmi_client.Win32_VideoController()]
+            except Exception:
+                controllers = []
+
+        if not controllers and shutil.which("nvidia-smi"):
+            try:
+                output = subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+                controllers = [line.strip() for line in output.splitlines() if line.strip()]
+            except Exception:
+                controllers = []
+
+        cuda_names: List[str] = []
+        if CUPY_AVAILABLE:
+            try:  # pragma: no cover - optional dependency
+                import cupy  # type: ignore[import]
+                from cupy.cuda.runtime import getDeviceCount, getDeviceProperties  # type: ignore[attr-defined]
+
+                for idx in range(getDeviceCount()):
+                    props = getDeviceProperties(idx)
+                    name = props.get("name")
+                    if isinstance(name, bytes):
+                        name = name.decode(errors="ignore")
+                    cuda_names.append(str(name))
+            except Exception:
+                cuda_names = []
+
+        def _simplify(name: str) -> str:
+            return name.lower().replace("laptop gpu", "").strip()
+
+        simple_cuda = [_simplify(name) for name in cuda_names]
+        gpus: List[Tuple[str, int | None]] = []
+
+        for display in controllers:
+            simplified = _simplify(display)
+            index = simple_cuda.index(simplified) if simplified in simple_cuda else None
+            gpus.append((display, index))
+
+        if not gpus and cuda_names:
+            gpus = [(name, idx) for idx, name in enumerate(cuda_names)]
+
+        cpu_label = "CPU (no GPU)"
+        gpus.insert(0, (cpu_label, None))
+
+        unique: List[Tuple[str, int | None]] = []
+        seen: set[Tuple[str, int | None]] = set()
+        for entry in gpus:
+            if entry in seen:
+                continue
+            seen.add(entry)
+            unique.append(entry)
+        return unique
+
     def _register_directory_picker(
         self,
         key: str,
@@ -1818,6 +1906,110 @@ class ZeMosaicQtMainWindow(QMainWindow):
             ],
         }
 
+    def _register_gpu_selector(
+        self,
+        layout: QFormLayout,
+        label_text: str,
+        *,
+        checkbox: QCheckBox | None = None,
+    ) -> None:
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.NoInsert)
+
+        cpu_canonical = "CPU (no GPU)"
+        entries: List[Dict[str, Any]] = []
+        devices = self._gpu_devices or [(cpu_canonical, None)]
+
+        seen: set[Tuple[str, int | None]] = set()
+        for display, idx in devices:
+            canonical = display or cpu_canonical
+            display_text = display
+            if idx is None and display.strip().lower() == cpu_canonical.lower():
+                display_text = self._tr("qt_gpu_option_cpu", cpu_canonical)
+                canonical = cpu_canonical
+            key = (canonical, idx)
+            if key in seen:
+                continue
+            seen.add(key)
+            entries.append({"display": display_text, "selector": canonical, "id": idx})
+
+        for entry in entries:
+            combo.addItem(entry["display"], entry)
+
+        stored_selector = str(self.config.get("gpu_selector") or "").strip()
+        stored_id = self.config.get("gpu_id_phase5")
+        target_index = -1
+        for row in range(combo.count()):
+            payload = combo.itemData(row)
+            if isinstance(payload, dict):
+                selector = str(payload.get("selector") or "")
+                if stored_selector and selector == stored_selector:
+                    target_index = row
+                    break
+        if target_index < 0 and isinstance(stored_id, int):
+            for row in range(combo.count()):
+                payload = combo.itemData(row)
+                if isinstance(payload, dict) and payload.get("id") == stored_id:
+                    target_index = row
+                    break
+        if target_index < 0 and combo.count() > 0:
+            target_index = 0
+        if target_index >= 0:
+            combo.setCurrentIndex(target_index)
+            payload = combo.itemData(target_index)
+            if isinstance(payload, dict) and payload.get("selector"):
+                self.config.setdefault("gpu_selector", str(payload["selector"]))
+
+        label = QLabel(label_text)
+        layout.addRow(label, combo)
+
+        def _selector_getter(combo_ref: QComboBox = combo) -> str:
+            payload = combo_ref.currentData()
+            if isinstance(payload, dict) and payload.get("selector") is not None:
+                return str(payload["selector"])
+            text = combo_ref.currentText().strip()
+            return text
+
+        def _gpu_id_getter(combo_ref: QComboBox = combo) -> int | None:
+            payload = combo_ref.currentData()
+            if isinstance(payload, dict):
+                value = payload.get("id")
+                if isinstance(value, int):
+                    return value
+                if value in (None, ""):
+                    return None
+            text = combo_ref.currentText().strip()
+            if not text:
+                return None
+            try:
+                return int(text)
+            except ValueError:
+                return None
+
+        self._config_fields["gpu_selector"] = {
+            "kind": "combobox",
+            "widget": combo,
+            "type": str,
+            "value_getter": _selector_getter,
+        }
+        self._config_fields["gpu_id_phase5"] = {
+            "kind": "combobox",
+            "widget": combo,
+            "type": int,
+            "value_getter": _gpu_id_getter,
+        }
+
+        def _update_enabled(state: bool) -> None:
+            combo.setEnabled(state)
+            label.setEnabled(state)
+
+        if checkbox is not None:
+            _update_enabled(bool(checkbox.isChecked()))
+            checkbox.toggled.connect(_update_enabled)  # type: ignore[arg-type]
+        else:
+            _update_enabled(True)
+
     def _collect_config_from_widgets(self) -> None:
         for key, binding in self._config_fields.items():
             kind = binding["kind"]
@@ -1958,6 +2150,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "winsor_worker_limit": 10,
             "max_raw_per_master_tile": 0,
             "use_gpu_phase5": False,
+            "gpu_selector": "CPU (no GPU)",
             "gpu_id_phase5": 0,
             "logging_level": "INFO",
         }

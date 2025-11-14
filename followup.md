@@ -278,4 +278,4 @@ Use this section to record issues, partial implementations, or TODOs that don’
 - [x] Qt worker progress currently uses simple per-stage percentages and does not replicate Tk’s weighted progress/ETA smoothing yet.
 - [x] Qt filter dialog currently focuses on manual include/exclude review; scanning, clustering, and preview tooling still pending.
 - [ ] Qt filter “Run analysis” button currently shows a placeholder message until scanning backend is integrated.
-- [ ] Qt GPU selector currently requires manual numeric ID entry; automatic detection/parity with Tk combo is pending.
+- [x] Qt GPU selector now mirrors the Tk combo with automatic GPU detection and retains manual override capability.
