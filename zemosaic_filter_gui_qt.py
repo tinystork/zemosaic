@@ -61,6 +61,25 @@ except Exception:  # pragma: no cover - optional dependency guard
     solve_with_astap = None  # type: ignore[assignment]
     set_astap_max_concurrent_instances = None  # type: ignore[assignment]
 
+try:  # pragma: no cover - optional dependency guard
+    from zemosaic_config import DEFAULT_CONFIG as _DEFAULT_GUI_CONFIG  # type: ignore
+except Exception:  # pragma: no cover - optional dependency guard
+    _DEFAULT_GUI_CONFIG = {}
+
+_DEFAULT_GUI_CONFIG_MAP: dict[str, Any] = {}
+if isinstance(_DEFAULT_GUI_CONFIG, dict):
+    try:
+        _DEFAULT_GUI_CONFIG_MAP.update(_DEFAULT_GUI_CONFIG)
+    except Exception:
+        _DEFAULT_GUI_CONFIG_MAP = {}
+
+DEFAULT_FILTER_CONFIG: dict[str, Any] = dict(_DEFAULT_GUI_CONFIG_MAP)
+DEFAULT_FILTER_CONFIG.setdefault("auto_detect_seestar", True)
+DEFAULT_FILTER_CONFIG.setdefault("force_seestar_mode", False)
+DEFAULT_FILTER_CONFIG.setdefault("sds_mode_default", False)
+DEFAULT_FILTER_CONFIG.setdefault("global_coadd_method", "kappa_sigma")
+DEFAULT_FILTER_CONFIG.setdefault("global_coadd_k", 2.0)
+
 
 class _FallbackLocalizer:
     """Very small localization shim when the full helper is unavailable."""
@@ -1488,18 +1507,199 @@ class FilterQtDialog(QDialog):
     def _resolved_wcs_count(self) -> int:
         return sum(1 for entry in self._normalized_items if entry.has_wcs)
 
+    @staticmethod
+    def _normalize_string(value: Any) -> str | None:
+        if value is None:
+            return None
+        try:
+            text = str(value).strip()
+        except Exception:
+            return None
+        return text or None
+
+    def _config_value(self, key: str, default: Any = None) -> Any:
+        sources: tuple[Any, ...] = (
+            self._config_overrides if isinstance(self._config_overrides, dict) else None,
+            self._initial_overrides if isinstance(self._initial_overrides, dict) else None,
+            DEFAULT_FILTER_CONFIG,
+        )
+        for mapping in sources:
+            if not isinstance(mapping, dict):
+                continue
+            if key not in mapping:
+                continue
+            value = mapping.get(key)
+            if value is None:
+                continue
+            if isinstance(value, str):
+                normalized = value.strip()
+                if not normalized:
+                    continue
+                return normalized
+            return value
+        return default
+
+    @staticmethod
+    def _coerce_bool(value: Any, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value in (None, ""):
+            return default
+        if isinstance(value, (int, float)):
+            return bool(value)
+        try:
+            text = str(value).strip().lower()
+        except Exception:
+            return default
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+        return default
+
+    @staticmethod
+    def _coerce_float(value: Any, default: float) -> float:
+        try:
+            result = float(value)
+        except Exception:
+            return default
+        if math.isnan(result) or math.isinf(result):
+            return default
+        return result
+
+    def _detect_primary_instrument_label(self) -> str | None:
+        for entry in self._normalized_items:
+            label = self._normalize_string(entry.instrument)
+            if label:
+                return label
+
+        if fits is not None:
+            header_checks = 0
+            for entry in self._normalized_items:
+                if not entry.file_path or not os.path.isfile(entry.file_path):
+                    continue
+                try:
+                    header = fits.getheader(entry.file_path, ignore_missing_end=True)
+                except Exception:
+                    header = None
+                if header is None:
+                    continue
+                label = _detect_instrument_from_header(header)
+                if label:
+                    return label
+                header_checks += 1
+                if header_checks >= 5:
+                    break
+
+        payload = self._input_payload
+        if isinstance(payload, (list, tuple)):
+            for candidate in payload[:5]:
+                label = None
+                if hasattr(candidate, "instrument"):
+                    try:
+                        label = self._normalize_string(getattr(candidate, "instrument"))
+                    except Exception:
+                        label = None
+                if label:
+                    return label
+                if isinstance(candidate, dict):
+                    label = self._normalize_string(
+                        candidate.get("instrument")
+                        or candidate.get("INSTRUME")
+                        or candidate.get("instrument_name")
+                    )
+                    if label:
+                        return label
+                    header_obj = candidate.get("header") or candidate.get("header_subset")
+                    if header_obj:
+                        header_label = _detect_instrument_from_header(header_obj)
+                        if header_label:
+                            return header_label
+        return None
+
+    def _determine_workflow_mode(self, instrument_label: str | None) -> str:
+        if self._coerce_bool(self._config_value("force_seestar_mode", False), False):
+            return "seestar"
+        auto_detect = self._coerce_bool(self._config_value("auto_detect_seestar", True), True)
+        if auto_detect and instrument_label:
+            lowered = instrument_label.lower()
+            if any(token in lowered for token in ("seestar", "s50", "s30")):
+                return "seestar"
+        return "classic"
+
+    def _build_metadata_overrides(self, existing: dict[str, Any]) -> dict[str, Any]:
+        metadata: dict[str, Any] = {}
+
+        instrument_label = self._normalize_string(existing.get("workflow_instrument"))
+        if not instrument_label:
+            instrument_label = self._detect_primary_instrument_label()
+        instrument_for_mode = instrument_label
+        metadata["workflow_instrument"] = instrument_label or "Unknown"
+
+        mode_value = self._normalize_string(existing.get("mode"))
+        if mode_value:
+            normalized_mode = "seestar" if mode_value.lower().startswith("seestar") else "classic"
+        else:
+            normalized_mode = self._determine_workflow_mode(instrument_for_mode)
+        metadata["mode"] = normalized_mode
+
+        coadd_method = self._normalize_string(existing.get("global_coadd_method"))
+        if not coadd_method:
+            method_candidate = self._config_value("global_coadd_method", "kappa_sigma")
+            coadd_method = self._normalize_string(method_candidate) or "kappa_sigma"
+        metadata["global_coadd_method"] = coadd_method
+
+        coadd_k_candidate = existing.get("global_coadd_k")
+        if coadd_k_candidate is None:
+            coadd_k_candidate = self._config_value("global_coadd_k", 2.0)
+        metadata["global_coadd_k"] = self._coerce_float(coadd_k_candidate, 2.0)
+
+        sds_value = existing.get("sds_mode")
+        if sds_value is None:
+            sds_value = self._config_value("sds_mode_default", False)
+        sds_flag = self._coerce_bool(sds_value, False)
+        metadata["sds_mode"] = sds_flag
+
+        plan_override_existing = existing.get("global_wcs_plan_override")
+        plan_override_payload: dict[str, Any] | None = None
+        if isinstance(plan_override_existing, dict):
+            plan_override_payload = dict(plan_override_existing)
+        if sds_flag:
+            if plan_override_payload is None:
+                plan_override_payload = {}
+            plan_override_payload["sds_mode"] = True
+            plan_override_payload.setdefault("enabled", True)
+        elif plan_override_payload is not None:
+            plan_override_payload.pop("sds_mode", None)
+            if not plan_override_payload:
+                plan_override_payload = None
+        if plan_override_payload is not None:
+            metadata["global_wcs_plan_override"] = plan_override_payload
+        elif "global_wcs_plan_override" in existing:
+            metadata["global_wcs_plan_override"] = None
+
+        return metadata
+
     def overrides(self) -> Any:
         if self._cluster_refresh_pending:
             self._update_cluster_assignments()
 
         overrides: dict[str, Any] = {}
+        if isinstance(self._initial_overrides, dict):
+            try:
+                overrides.update(self._initial_overrides)
+            except Exception:
+                overrides = dict(self._initial_overrides)
+
+        auto_group_enabled = False
         if self._auto_group_checkbox is not None:
-            overrides["filter_auto_group"] = bool(self._auto_group_checkbox.isChecked())
+            auto_group_enabled = bool(self._auto_group_checkbox.isChecked())
+            overrides["filter_auto_group"] = auto_group_enabled
         if self._seestar_checkbox is not None:
             overrides["filter_seestar_priority"] = bool(self._seestar_checkbox.isChecked())
         if self._astap_instances_value:
             overrides["astap_max_instances"] = int(self._astap_instances_value)
-        if self._cluster_groups and self._auto_group_checkbox is not None and self._auto_group_checkbox.isChecked():
+        if self._cluster_groups and auto_group_enabled:
             serialized_groups: list[list[dict[str, Any]]] = []
             for group in self._cluster_groups:
                 entries_payload: list[dict[str, Any]] = []
@@ -1520,11 +1720,21 @@ class FilterQtDialog(QDialog):
                     serialized_groups.append(entries_payload)
             if serialized_groups:
                 overrides["preplan_master_groups"] = serialized_groups
+        elif not auto_group_enabled:
+            overrides.pop("preplan_master_groups", None)
         if isinstance(self._cluster_threshold_used, (int, float)) and self._cluster_threshold_used > 0:
             overrides["cluster_panel_threshold"] = float(self._cluster_threshold_used)
         resolved_count = self._resolved_wcs_count()
         if resolved_count:
             overrides["resolved_wcs_count"] = int(resolved_count)
+
+        metadata_update = self._build_metadata_overrides(overrides)
+        for key, value in metadata_update.items():
+            if key == "global_wcs_plan_override" and value is None:
+                overrides.pop(key, None)
+                continue
+            overrides[key] = value
+
         return overrides or None
 
     def input_items(self) -> List[Any]:

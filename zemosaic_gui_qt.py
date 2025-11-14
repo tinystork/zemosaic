@@ -3957,6 +3957,15 @@ class ZeMosaicQtMainWindow(QMainWindow):
             initial_overrides = None
 
         solver_payload = self._build_solver_settings_dict()
+        try:
+            global_coadd_k_value = float(self.config.get("global_coadd_k", 2.0) or 2.0)
+        except Exception:
+            global_coadd_k_value = 2.0
+        try:
+            global_wcs_padding_value = float(self.config.get("global_wcs_padding_percent", 2.0) or 2.0)
+        except Exception:
+            global_wcs_padding_value = 2.0
+
         config_overrides = {
             "astap_executable_path": str(self.config.get("astap_executable_path", "") or ""),
             "astap_data_directory_path": str(self.config.get("astap_data_directory_path", "") or ""),
@@ -3964,6 +3973,19 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "astap_default_downsample": int(self.config.get("astap_default_downsample", 2) or 2),
             "astap_default_sensitivity": int(self.config.get("astap_default_sensitivity", 100) or 100),
             "output_dir": str(self.config.get("output_dir", "") or ""),
+            "auto_detect_seestar": bool(self.config.get("auto_detect_seestar", True)),
+            "force_seestar_mode": bool(self.config.get("force_seestar_mode", False)),
+            "sds_mode_default": bool(self.config.get("sds_mode_default", False)),
+            "global_coadd_method": str(self.config.get("global_coadd_method", "kappa_sigma") or "kappa_sigma"),
+            "global_coadd_k": global_coadd_k_value,
+            "global_wcs_output_path": str(
+                self.config.get("global_wcs_output_path", "global_mosaic_wcs.fits")
+                or "global_mosaic_wcs.fits"
+            ),
+            "global_wcs_pixelscale_mode": str(self.config.get("global_wcs_pixelscale_mode", "median") or "median"),
+            "global_wcs_padding_percent": global_wcs_padding_value,
+            "global_wcs_orientation": str(self.config.get("global_wcs_orientation", "north_up") or "north_up"),
+            "global_wcs_res_override": self.config.get("global_wcs_res_override"),
             "apply_master_tile_crop": bool(self.config.get("apply_master_tile_crop", True)),
             "master_tile_crop_percent": float(self.config.get("master_tile_crop_percent", 3.0) or 3.0),
             "quality_crop_enabled": bool(self.config.get("quality_crop_enabled", False)),
