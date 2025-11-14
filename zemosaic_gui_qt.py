@@ -96,6 +96,40 @@ else:  # pragma: no cover - optional dependency guard
     set_astap_max_concurrent_instances = None  # type: ignore[assignment]
 
 
+def _coerce_gpu_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        if not normalized:
+            return default
+    if value is None:
+        return default
+    return bool(value)
+
+
+def _ensure_legacy_gpu_defaults_on_config_module() -> None:
+    if zemosaic_config is None:
+        return
+    defaults = getattr(zemosaic_config, "DEFAULT_CONFIG", None)
+    if not isinstance(defaults, dict):
+        return
+
+    defaults["use_gpu_phase5"] = _coerce_gpu_bool(defaults.get("use_gpu_phase5"), False)
+    canonical = defaults["use_gpu_phase5"]
+    for key in ("stack_use_gpu", "use_gpu_stack"):
+        defaults[key] = _coerce_gpu_bool(defaults.get(key, canonical), canonical)
+
+
+_ensure_legacy_gpu_defaults_on_config_module()
+
+
 class _FallbackLocalizer:
     """Very small localization shim when the real helper is unavailable."""
 
