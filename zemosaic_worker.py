@@ -13212,7 +13212,7 @@ def run_hierarchical_mosaic(
         try: final_header.update(final_output_wcs.to_header(relax=True))
         except Exception as e_hdr_wcs: pcb("run_warn_phase6_wcs_to_header_failed", error=str(e_hdr_wcs), lvl="WARN")
     
-    final_header['SOFTWARE']=('ZeMosaic v3.3.0','Mosaic Software') # Incrémente la version 
+    final_header['SOFTWARE']=('ZeMosaic v4.0.0','Mosaic Software') # Incrémente la version 
     final_header['NMASTILE']=(len(master_tiles_results_list),"Master Tiles combined")
     final_header['NRAWINIT']=(num_total_raw_files,"Initial raw images found")
     final_header['NRAWPROC']=(len(all_raw_files_processed_info),"Raw images with WCS processed")
