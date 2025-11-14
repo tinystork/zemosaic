@@ -264,7 +264,7 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
   - [x] Qt GUI reads existing config files correctly.
   - [x] Changes in Qt GUI are reflected in the shared config, visible from Tk GUI as well.
 - [ ] Documentation:
-  - [ ] Add docstrings or comments in Qt modules explaining how to launch the Qt GUI (env var + CLI flag).
+  - [x] Add docstrings or comments in Qt modules explaining how to launch the Qt GUI (env var + CLI flag).
   - [ ] Ensure errors when PySide6 is missing are clear and non-blocking for Tk users.
 
 
@@ -274,7 +274,7 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
 
 Use this section to record issues, partial implementations, or TODOs that don’t map cleanly to a checkbox.
 
-- [ ] Confirm whether Tk GUI currently exposes Phase 4.5 / super-tile controls before mirroring them in Qt.
+- [x] Confirm whether Tk GUI currently exposes Phase 4.5 / super-tile controls before mirroring them in Qt. The Tk GUI does not expose Phase 4.5 / super-tile controls and Qt parity is not required at this time.
 - [ ] Qt worker progress currently uses simple per-stage percentages and does not replicate Tk’s weighted progress/ETA smoothing yet.
 - [ ] Qt filter dialog currently focuses on manual include/exclude review; scanning, clustering, and preview tooling still pending.
 - [ ] Qt filter “Run analysis” button currently shows a placeholder message until scanning backend is integrated.
