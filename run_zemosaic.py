@@ -128,9 +128,52 @@ print("DEBUG (run_zemosaic): sys.path complet:\n" + "\n".join(sys.path))
 print("-" * 50)
 
 
-def main():
+def _determine_backend(argv):
+    """Determine which GUI backend should be used."""
+
+    requested_backend = os.environ.get("ZEMOSAIC_GUI_BACKEND", "tk")
+    cleaned_args = []
+    for arg in argv:
+        if arg == "--qt-gui":
+            requested_backend = "qt"
+        else:
+            cleaned_args.append(arg)
+
+    backend = (requested_backend or "tk").strip().lower()
+    if backend not in {"tk", "qt"}:
+        print(
+            f"[run_zemosaic] Backend '{requested_backend}' is not supported. "
+            "Falling back to Tk."
+        )
+        backend = "tk"
+
+    return backend, cleaned_args
+
+
+def main(argv=None):
     """Fonction principale pour lancer l'application ZeMosaic."""
     print("--- run_zemosaic.py: Entrée dans main() ---")
+
+    if argv is None:
+        argv = sys.argv[1:]
+
+    backend, cleaned_args = _determine_backend(argv)
+    if cleaned_args != argv:
+        sys.argv = [sys.argv[0], *cleaned_args]
+
+    if backend == "qt":
+        try:
+            from zemosaic.zemosaic_gui_qt import run_qt_main
+        except ImportError as qt_import_error:
+            print(
+                "[run_zemosaic] Unable to load the Qt interface (PySide6 missing?)."
+            )
+            print(f"[run_zemosaic] {qt_import_error}")
+            print("[run_zemosaic] Falling back to the Tk interface.")
+            backend = "tk"
+        else:
+            print("[run_zemosaic] Launching ZeMosaic with the Qt backend.")
+            return run_qt_main()
 
     # Vérification de sys.modules au début de main
     if 'zemosaic_worker' in sys.modules:
@@ -156,6 +199,9 @@ def main():
         return 
 
     print("DEBUG (main): ZEMOSAIC_WORKER_AVAILABLE est True. Tentative de création de l'interface graphique.")
+    if backend != "qt":
+        print("[run_zemosaic] Launching ZeMosaic with the Tk backend.")
+
     root = tk.Tk()
     app = ZeMosaicGUI(root)
     root.mainloop()
