@@ -135,7 +135,7 @@ class ZeMosaicQtWorker(QObject):
                     queue_obj.close()
             except Exception:
                 pass
-            raise RuntimeError(f"Failed to start worker process: {exc}") from exc
+            raise RuntimeError(str(exc)) from exc
 
         self._queue = queue_obj
         self._process = process
@@ -155,7 +155,7 @@ class ZeMosaicQtWorker(QObject):
                 proc.join(timeout=0.5)
             except Exception:
                 pass
-        self._finalize(success=False, message=self.tr("Processing cancelled"))
+        self._finalize(success=False, message="qt_log_processing_cancelled")
 
     # ------------------------------------------------------------------
     # Queue polling
@@ -205,12 +205,12 @@ class ZeMosaicQtWorker(QObject):
             if msg_key == "PROCESS_ERROR":
                 error_text = str(kwargs.get("error") or prog or "")
                 self._had_error = True
-                self._last_error = error_text
+                self._last_error = error_text or "qt_worker_error_generic"
                 level = str(lvl or "ERROR")
                 if error_text:
                     self.log_message_emitted.emit(level, error_text)
                 else:
-                    self.log_message_emitted.emit(level, "Worker error")
+                    self.log_message_emitted.emit(level, "qt_worker_error_generic")
                 continue
 
             if msg_key == "PROCESS_DONE":
@@ -232,12 +232,12 @@ class ZeMosaicQtWorker(QObject):
 
         if proc is not None and not proc.is_alive():
             success = not self._had_error and not self._stop_requested
-            message = "" if success else (self._last_error or self.tr("Processing cancelled"))
+            message = "" if success else (self._last_error or "qt_log_processing_cancelled")
             self._finalize(success=success, message=message)
             return
 
         if self._stop_requested and not drained_any:
-            self._finalize(success=False, message=self.tr("Processing cancelled"))
+            self._finalize(success=False, message="qt_log_processing_cancelled")
 
     # ------------------------------------------------------------------
     # Helpers
@@ -274,17 +274,19 @@ class ZeMosaicQtWorker(QObject):
             kv_pairs = ", ".join(f"{key}={value}" for key, value in kwargs.items())
             if kv_pairs:
                 parts.append(kv_pairs)
-        return " | ".join(parts) if parts else "(worker update)"
+        return " | ".join(parts) if parts else "qt_worker_generic_update"
 
 class ZeMosaicQtMainWindow(QMainWindow):
     """Initial Qt main window skeleton with placeholder panels."""
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("ZeMosaic (Qt Preview)")
 
         self.config: Dict[str, Any] = self._load_config()
         self.localizer = self._create_localizer(self.config.get("language", "en"))
+        self.setWindowTitle(
+            self._tr("qt_window_title_preview", "ZeMosaic (Qt Preview)")
+        )
         self._log_level_prefixes = {
             "debug": self._tr("qt_log_prefix_debug", "[DEBUG] "),
             "info": self._tr("qt_log_prefix_info", "[INFO] "),
@@ -1926,9 +1928,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
             try:
                 zemosaic_config.save_config(self.config)
             except Exception as exc:  # pragma: no cover - log instead of raising
-                self._append_log(
-                    f"Failed to save configuration: {exc}", level="error"
+                template = self._tr(
+                    "qt_log_save_config_error",
+                    "Failed to save configuration: {error}",
                 )
+                self._append_log(template.format(error=exc), level="error")
 
     def _create_localizer(self, language_code: str) -> Any:
         if ZeMosaicLocalization is not None:
@@ -2442,7 +2446,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
         try:
             self.worker_controller.stop()
         except Exception as exc:  # pragma: no cover - defensive
-            self._append_log(f"Failed to stop worker cleanly: {exc}", level="error")
+            template = self._tr(
+                "qt_log_stop_failure", "Failed to stop worker cleanly: {error}"
+            )
+            self._append_log(template.format(error=exc), level="error")
         self.stop_button.setEnabled(False)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
@@ -2531,16 +2538,27 @@ class ZeMosaicQtMainWindow(QMainWindow):
         try:
             started = self.worker_controller.start(worker_args, worker_kwargs)
         except Exception as exc:  # pragma: no cover - start failures are rare
-            self._append_log(f"Failed to start worker: {exc}", level="error")
+            log_template = self._tr(
+                "qt_log_start_worker_failure", "Failed to start worker: {error}"
+            )
+            self._append_log(log_template.format(error=exc), level="error")
+            message_template = self._tr(
+                "qt_error_start_worker_generic", "Failed to start worker process."
+            )
             QMessageBox.critical(
                 self,
                 self._tr("qt_error_start_worker_title", "Unable to start worker"),
-                str(exc),
+                f"{message_template}\n{exc}",
             )
             return
 
         if not started:
-            self._append_log("Worker is already running", level="warning")
+            self._append_log(
+                self._tr(
+                    "qt_log_worker_running", "Worker is already running."
+                ),
+                level="warning",
+            )
             return
 
         self.is_processing = True
@@ -2647,7 +2665,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 config_overrides=config_overrides,
             )
         except Exception as exc:  # pragma: no cover - defensive guard
-            self._append_log(f"Filter UI error: {exc}", level="warning")
+            template = self._tr(
+                "qt_log_filter_error", "Filter UI error: {error}"
+            )
+            self._append_log(template.format(error=exc), level="warning")
             QMessageBox.warning(
                 self,
                 self._tr("qt_error_filter_launch", "The filter interface could not be opened."),
