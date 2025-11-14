@@ -244,9 +244,9 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
   - [x] On Cancel or window close:
     - [x] Return `(input_list, False, None)` to indicate no changes.
 
-- [ ] Integrate with main Qt GUI:
-  - [ ] Provide a function or button in `ZeMosaicQtMainWindow` to launch the Qt filter dialog.
-  - [ ] Use the result in the same way the Tk GUI uses the filter result (before launching the main worker).
+- [x] Integrate with main Qt GUI:
+  - [x] Provide a function or button in `ZeMosaicQtMainWindow` to launch the Qt filter dialog.
+  - [x] Use the result in the same way the Tk GUI uses the filter result (before launching the main worker).
 
 
 ## Phase 6 — Polishing and parity

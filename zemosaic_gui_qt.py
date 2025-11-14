@@ -336,6 +336,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self.config.setdefault(key, fallback)
         self._config_fields: Dict[str, Dict[str, Any]] = {}
 
+        self._last_filter_overrides: Dict[str, Any] | None = None
+        self._last_filtered_header_items: List[Any] | None = None
+
         self._setup_ui()
 
         self.is_processing = False
@@ -369,10 +372,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         button_row = QHBoxLayout()
         button_row.addStretch(1)
+        self.filter_button = QPushButton(self._tr("qt_button_filter", "Filter…"))
+        self.filter_button.clicked.connect(self._on_filter_clicked)  # type: ignore[attr-defined]
         self.start_button = QPushButton(self._tr("qt_button_start", "Start"))
         self.stop_button = QPushButton(self._tr("qt_button_stop", "Stop"))
         self.start_button.clicked.connect(self._on_start_clicked)  # type: ignore[attr-defined]
         self.stop_button.clicked.connect(self._on_stop_clicked)  # type: ignore[attr-defined]
+        button_row.addWidget(self.filter_button)
         button_row.addWidget(self.start_button)
         button_row.addWidget(self.stop_button)
         main_layout.addLayout(button_row)
@@ -1256,6 +1262,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
     def _set_processing_state(self, running: bool) -> None:
         self.start_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
+        self.filter_button.setEnabled(not running)
         if running:
             self.progress_bar.setValue(0)
             self.phase_value_label.setText(self._tr("qt_progress_placeholder", "Idle"))
@@ -1385,7 +1392,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
         fallback = stage.replace("_", " ").strip().title()
         return self._tr(key, fallback)
 
-    def _build_worker_invocation(self) -> tuple[Tuple[Any, ...], Dict[str, Any]]:
+    def _build_worker_invocation(
+        self, *, skip_filter_ui: bool
+    ) -> tuple[Tuple[Any, ...], Dict[str, Any]]:
         cfg = self.config
 
         def _coerce_str(value: Any, default: str = "") -> str:
@@ -1654,6 +1663,15 @@ class ZeMosaicQtMainWindow(QMainWindow):
         )
 
         worker_kwargs: Dict[str, Any] = {"solver_settings_dict": solver_settings_dict}
+        if skip_filter_ui:
+            worker_kwargs["skip_filter_ui"] = True
+            if self._last_filter_overrides is not None or self._last_filtered_header_items is not None:
+                worker_kwargs["filter_invoked"] = True
+            if isinstance(self._last_filter_overrides, dict):
+                worker_kwargs["filter_overrides"] = self._last_filter_overrides
+            if isinstance(self._last_filtered_header_items, list):
+                worker_kwargs["filtered_header_items"] = self._last_filtered_header_items
+            worker_kwargs["early_filter_enabled"] = False
         return worker_args, worker_kwargs
 
     def _build_solver_settings_dict(self) -> Dict[str, Any]:
@@ -1706,6 +1724,45 @@ class ZeMosaicQtMainWindow(QMainWindow):
         return asdict(settings)
 
     def _on_start_clicked(self) -> None:
+        self._start_processing(skip_filter_prompt=False)
+
+    def _on_stop_clicked(self) -> None:
+        if not self.is_processing:
+            self._append_log(
+                self._tr("qt_log_stop_ignored", "No processing is currently running."),
+                level="warning",
+            )
+            return
+
+        self._append_log(
+            self._tr("qt_log_stop_requested", "Stop requested."),
+            level="warning",
+        )
+        try:
+            self.worker_controller.stop()
+        except Exception as exc:  # pragma: no cover - defensive
+            self._append_log(f"Failed to stop worker cleanly: {exc}", level="error")
+        self.stop_button.setEnabled(False)
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
+        self._collect_config_from_widgets()
+        self._save_config()
+        if self.is_processing:
+            try:
+                self.worker_controller.stop()
+            except Exception:
+                pass
+        super().closeEvent(event)
+
+    # ------------------------------------------------------------------
+    # Filter integration helpers
+    # ------------------------------------------------------------------
+    def _start_processing(
+        self,
+        *,
+        skip_filter_prompt: bool,
+        predecided_skip_filter_ui: bool | None = None,
+    ) -> None:
         if self.is_processing:
             QMessageBox.warning(
                 self,
@@ -1729,10 +1786,37 @@ class ZeMosaicQtMainWindow(QMainWindow):
             return
 
         self._collect_config_from_widgets()
+
+        skip_filter_ui_for_run = bool(predecided_skip_filter_ui) if predecided_skip_filter_ui is not None else False
+
+        if not skip_filter_prompt and predecided_skip_filter_ui is None:
+            answer = QMessageBox.question(
+                self,
+                self._tr("qt_filter_prompt_title", "Filter range and set clustering?"),
+                self._tr(
+                    "qt_filter_prompt_message",
+                    "Do you want to open the filter window to adjust the range and clustering before processing?",
+                ),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if answer == QMessageBox.No:
+                skip_filter_ui_for_run = True
+                self._clear_filter_results()
+            else:
+                filter_result = self._launch_filter_dialog()
+                if filter_result is True:
+                    skip_filter_ui_for_run = True
+                    self._collect_config_from_widgets()
+                elif filter_result is False:
+                    return
+                else:
+                    skip_filter_ui_for_run = True
+
         self._save_config()
 
         try:
-            worker_args, worker_kwargs = self._build_worker_invocation()
+            worker_args, worker_kwargs = self._build_worker_invocation(skip_filter_ui=skip_filter_ui_for_run)
         except ValueError as exc:
             QMessageBox.warning(self, self._tr("qt_error_invalid_config_title", "Invalid configuration"), str(exc))
             return
@@ -1766,33 +1850,209 @@ class ZeMosaicQtMainWindow(QMainWindow):
             level="info",
         )
 
-    def _on_stop_clicked(self) -> None:
-        if not self.is_processing:
-            self._append_log(
-                self._tr("qt_log_stop_ignored", "No processing is currently running."),
-                level="warning",
+    def _on_filter_clicked(self) -> None:
+        if self.is_processing:
+            QMessageBox.warning(
+                self,
+                self._tr("qt_warning_already_running_title", "Processing in progress"),
+                self._tr(
+                    "qt_warning_already_running_message",
+                    "A processing run is already active.",
+                ),
             )
             return
 
-        self._append_log(
-            self._tr("qt_log_stop_requested", "Stop requested."),
-            level="warning",
-        )
-        try:
-            self.worker_controller.stop()
-        except Exception as exc:  # pragma: no cover - defensive
-            self._append_log(f"Failed to stop worker cleanly: {exc}", level="error")
-        self.stop_button.setEnabled(False)
-
-    def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
         self._collect_config_from_widgets()
-        self._save_config()
-        if self.is_processing:
+        result = self._launch_filter_dialog()
+        if result is True:
+            self._collect_config_from_widgets()
+            self._start_processing(skip_filter_prompt=True, predecided_skip_filter_ui=True)
+
+    def _launch_filter_dialog(self) -> bool | None:
+        input_dir = str(self.config.get("input_dir", "") or "").strip()
+        if not input_dir or not os.path.isdir(input_dir):
+            QMessageBox.warning(
+                self,
+                self._tr("qt_error_invalid_input_dir", "Please select a valid input folder before filtering."),
+            )
+            return None
+
+        if not self._input_dir_contains_fits(input_dir):
+            QMessageBox.warning(
+                self,
+                self._tr("qt_error_no_fits", "No FITS files found in the selected input folder."),
+            )
+            return None
+
+        try:
+            from zemosaic_filter_gui_qt import launch_filter_interface_qt
+        except ImportError as exc:
+            QMessageBox.warning(
+                self,
+                self._tr("qt_error_filter_unavailable", "Qt filter interface is not available."),
+                str(exc),
+            )
+            return None
+
+        initial_overrides: Dict[str, Any] | None = None
+        try:
+            initial_overrides = {
+                "cluster_panel_threshold": float(self.config.get("cluster_panel_threshold", 0.05)),
+                "cluster_target_groups": int(self.config.get("cluster_target_groups", 0)),
+                "cluster_orientation_split_deg": float(self.config.get("cluster_orientation_split_deg", 0.0)),
+            }
+        except Exception:
+            initial_overrides = None
+
+        solver_payload = self._build_solver_settings_dict()
+        config_overrides = {
+            "astap_executable_path": str(self.config.get("astap_executable_path", "") or ""),
+            "astap_data_directory_path": str(self.config.get("astap_data_directory_path", "") or ""),
+            "astap_default_search_radius": float(self.config.get("astap_default_search_radius", 3.0) or 3.0),
+            "astap_default_downsample": int(self.config.get("astap_default_downsample", 2) or 2),
+            "astap_default_sensitivity": int(self.config.get("astap_default_sensitivity", 100) or 100),
+            "output_dir": str(self.config.get("output_dir", "") or ""),
+            "apply_master_tile_crop": bool(self.config.get("apply_master_tile_crop", True)),
+            "master_tile_crop_percent": float(self.config.get("master_tile_crop_percent", 3.0) or 3.0),
+            "quality_crop_enabled": bool(self.config.get("quality_crop_enabled", False)),
+            "quality_crop_band_px": int(self.config.get("quality_crop_band_px", 32) or 32),
+            "quality_crop_k_sigma": float(self.config.get("quality_crop_k_sigma", 2.0) or 2.0),
+            "quality_crop_margin_px": int(self.config.get("quality_crop_margin_px", 8) or 8),
+            "quality_crop_min_run": int(self.config.get("quality_crop_min_run", 2) or 2),
+            "altaz_cleanup_enabled": bool(self.config.get("altaz_cleanup_enabled", False)),
+            "altaz_margin_percent": float(self.config.get("altaz_margin_percent", 5.0) or 5.0),
+            "altaz_decay": float(self.config.get("altaz_decay", 0.15) or 0.15),
+            "altaz_nanize": bool(self.config.get("altaz_nanize", True)),
+            "quality_gate_enabled": bool(self.config.get("quality_gate_enabled", False)),
+            "quality_gate_threshold": float(self.config.get("quality_gate_threshold", 0.48) or 0.48),
+            "quality_gate_edge_band_px": int(self.config.get("quality_gate_edge_band_px", 64) or 64),
+            "quality_gate_k_sigma": float(self.config.get("quality_gate_k_sigma", 2.5) or 2.5),
+            "quality_gate_erode_px": int(self.config.get("quality_gate_erode_px", 3) or 3),
+            "quality_gate_move_rejects": bool(self.config.get("quality_gate_move_rejects", True)),
+            "auto_limit_frames_per_master_tile": bool(self.config.get("auto_limit_frames_per_master_tile", True)),
+            "max_raw_per_master_tile": int(self.config.get("max_raw_per_master_tile", 0) or 0),
+        }
+
+        try:
+            filter_result = launch_filter_interface_qt(
+                input_dir,
+                initial_overrides,
+                stream_scan=True,
+                scan_recursive=True,
+                batch_size=200,
+                preview_cap=1500,
+                solver_settings_dict=solver_payload,
+                config_overrides=config_overrides,
+            )
+        except Exception as exc:  # pragma: no cover - defensive guard
+            self._append_log(f"Filter UI error: {exc}", level="warning")
+            QMessageBox.warning(
+                self,
+                self._tr("qt_error_filter_launch", "The filter interface could not be opened."),
+                str(exc),
+            )
+            return None
+
+        filtered_list: Any = None
+        accepted = True
+        overrides: Dict[str, Any] | None = None
+        if isinstance(filter_result, tuple) and len(filter_result) >= 1:
+            filtered_list = filter_result[0]
+            if len(filter_result) >= 2:
+                try:
+                    accepted = bool(filter_result[1])
+                except Exception:
+                    accepted = True
+            if len(filter_result) >= 3 and isinstance(filter_result[2], dict):
+                overrides = filter_result[2]
+        else:
+            filtered_list = filter_result
+
+        if not accepted:
+            self._append_log(self._tr("qt_log_filter_cancelled", "Filter cancelled by user."), level="warning")
+            self._clear_filter_results()
+            return False
+
+        kept_count = 0
+        total_count = None
+        if isinstance(filtered_list, list):
+            kept_count = len(filtered_list)
+        if isinstance(overrides, dict):
             try:
-                self.worker_controller.stop()
+                total_count = int(overrides.get("resolved_wcs_count"))
             except Exception:
-                pass
-        super().closeEvent(event)
+                total_count = None
+
+        summary = self._tr("qt_log_filter_summary", "Filter validated: kept {kept} files.")
+        try:
+            if total_count is not None:
+                summary = self._tr(
+                    "qt_log_filter_summary_total",
+                    "Filter validated: kept {kept} of {total} files.",
+                ).format(kept=kept_count, total=total_count)
+            else:
+                summary = summary.format(kept=kept_count)
+        except Exception:
+            pass
+        self._append_log(summary, level="info")
+
+        self._last_filter_overrides = overrides if isinstance(overrides, dict) else None
+        self._last_filtered_header_items = filtered_list if isinstance(filtered_list, list) else None
+        self._apply_filter_overrides_to_config(self._last_filter_overrides)
+
+        return True
+
+    def _apply_filter_overrides_to_config(self, overrides: Dict[str, Any] | None) -> None:
+        if not overrides:
+            return
+        for key in (
+            "cluster_panel_threshold",
+            "cluster_target_groups",
+            "cluster_orientation_split_deg",
+        ):
+            if key in overrides:
+                self._update_widget_from_config(key, overrides[key])
+
+    def _update_widget_from_config(self, key: str, value: Any) -> None:
+        self.config[key] = value
+        binding = self._config_fields.get(key)
+        if not binding:
+            return
+        widget = binding.get("widget")
+        kind = binding.get("kind")
+        try:
+            if kind == "checkbox":
+                widget.setChecked(bool(value))
+            elif kind == "spinbox":
+                widget.setValue(int(value))
+            elif kind == "double_spinbox":
+                widget.setValue(float(value))
+            elif kind == "combobox":
+                idx = widget.findData(value)
+                if idx < 0:
+                    idx = widget.findText(str(value))
+                if idx >= 0:
+                    widget.setCurrentIndex(idx)
+            else:
+                widget.setText(str(value))
+        except Exception:
+            pass
+
+    def _clear_filter_results(self) -> None:
+        self._last_filter_overrides = None
+        self._last_filtered_header_items = None
+
+    @staticmethod
+    def _input_dir_contains_fits(input_dir: str) -> bool:
+        try:
+            for root_dir, _dirs, files in os.walk(input_dir):
+                for filename in files:
+                    if filename.lower().endswith((".fit", ".fits")):
+                        return True
+                break
+        except Exception:
+            return False
+        return False
 
 
 def run_qt_main() -> int:
