@@ -11,6 +11,7 @@ try:
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
+        QDoubleSpinBox,
         QFileDialog,
         QFormLayout,
         QGroupBox,
@@ -21,6 +22,7 @@ try:
         QPlainTextEdit,
         QProgressBar,
         QPushButton,
+        QSpinBox,
         QVBoxLayout,
         QWidget,
     )
@@ -72,6 +74,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "astap_data_directory_path": "",
             "astap_default_search_radius": 3.0,
             "astap_default_downsample": 2,
+            "astap_default_sensitivity": 100,
             "cluster_panel_threshold": 0.05,
             "cluster_target_groups": 0,
             "cluster_orientation_split_deg": 0.0,
@@ -158,21 +161,41 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "astap_executable_path",
             layout,
             self._tr("qt_field_astap_executable", "ASTAP executable"),
+            browse_action="file",
+            dialog_title=self._tr(
+                "qt_dialog_select_astap_executable", "Select ASTAP Executable"
+            ),
         )
         self._register_line_edit(
             "astap_data_directory_path",
             layout,
             self._tr("qt_field_astap_data_dir", "ASTAP data directory"),
+            browse_action="directory",
+            dialog_title=self._tr(
+                "qt_dialog_select_astap_data_dir", "Select ASTAP Data Directory"
+            ),
         )
-        self._register_line_edit(
+        self._register_double_spinbox(
             "astap_default_search_radius",
             layout,
-            self._tr("qt_field_astap_search_radius", "Default search radius"),
+            self._tr("qt_field_astap_search_radius", "Default search radius (°)"),
+            minimum=0.1,
+            maximum=180.0,
+            single_step=0.1,
         )
-        self._register_line_edit(
+        self._register_spinbox(
             "astap_default_downsample",
             layout,
             self._tr("qt_field_astap_downsample", "Default downsample"),
+            minimum=0,
+            maximum=4,
+        )
+        self._register_spinbox(
+            "astap_default_sensitivity",
+            layout,
+            self._tr("qt_field_astap_sensitivity", "Default sensitivity"),
+            minimum=-25,
+            maximum=500,
         )
 
         return group
@@ -291,11 +314,55 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "type": str,
         }
 
-    def _register_line_edit(self, key: str, layout: QFormLayout, label_text: str) -> None:
+    def _register_line_edit(
+        self,
+        key: str,
+        layout: QFormLayout,
+        label_text: str,
+        *,
+        browse_action: str | None = None,
+        dialog_title: str | None = None,
+    ) -> None:
         widget = QLineEdit()
         current_value = self.config.get(key)
         widget.setText("" if current_value is None else str(current_value))
-        layout.addRow(QLabel(label_text), widget)
+
+        if browse_action is not None:
+            container = QWidget()
+            row_layout = QHBoxLayout(container)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(6)
+            row_layout.addWidget(widget)
+            browse_button = QPushButton(self._tr("qt_button_browse", "Browse…"))
+
+            def _on_browse() -> None:
+                start_path = widget.text().strip() or str(current_value or "")
+                if not start_path:
+                    start_path = os.getcwd()
+                if browse_action == "file":
+                    selected = QFileDialog.getOpenFileName(
+                        self,
+                        dialog_title
+                        or self._tr("qt_dialog_select_file", "Select File"),
+                        start_path,
+                    )[0]
+                else:
+                    selected = QFileDialog.getExistingDirectory(
+                        self,
+                        dialog_title
+                        or self._tr("qt_dialog_select_directory", "Select Directory"),
+                        start_path,
+                    )
+                if selected:
+                    widget.setText(selected)
+                    self.config[key] = selected
+
+            browse_button.clicked.connect(_on_browse)  # type: ignore[arg-type]
+            row_layout.addWidget(browse_button)
+            layout.addRow(QLabel(label_text), container)
+        else:
+            layout.addRow(QLabel(label_text), widget)
+
         type_source = self._default_config_values.get(key, current_value)
         if type_source is None:
             value_type = str
@@ -317,6 +384,49 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "type": bool,
         }
 
+    def _register_spinbox(
+        self,
+        key: str,
+        layout: QFormLayout,
+        label_text: str,
+        *,
+        minimum: int,
+        maximum: int,
+    ) -> None:
+        spinbox = QSpinBox()
+        spinbox.setRange(minimum, maximum)
+        current_value = int(self.config.get(key, minimum))
+        spinbox.setValue(current_value)
+        layout.addRow(QLabel(label_text), spinbox)
+        self._config_fields[key] = {
+            "kind": "spinbox",
+            "widget": spinbox,
+            "type": int,
+        }
+
+    def _register_double_spinbox(
+        self,
+        key: str,
+        layout: QFormLayout,
+        label_text: str,
+        *,
+        minimum: float,
+        maximum: float,
+        single_step: float,
+    ) -> None:
+        spinbox = QDoubleSpinBox()
+        spinbox.setRange(minimum, maximum)
+        spinbox.setSingleStep(single_step)
+        spinbox.setDecimals(1 if single_step < 1 else 0)
+        current_value = float(self.config.get(key, minimum))
+        spinbox.setValue(current_value)
+        layout.addRow(QLabel(label_text), spinbox)
+        self._config_fields[key] = {
+            "kind": "double_spinbox",
+            "widget": spinbox,
+            "type": float,
+        }
+
     def _collect_config_from_widgets(self) -> None:
         for key, binding in self._config_fields.items():
             kind = binding["kind"]
@@ -324,6 +434,14 @@ class ZeMosaicQtMainWindow(QMainWindow):
             expected_type = binding["type"]
             if kind == "checkbox":
                 self.config[key] = bool(widget.isChecked())
+                continue
+
+            if kind == "spinbox":
+                self.config[key] = int(widget.value())
+                continue
+
+            if kind == "double_spinbox":
+                self.config[key] = float(widget.value())
                 continue
 
             raw_text = widget.text().strip()
@@ -354,6 +472,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 "astap_data_directory_path": "",
                 "astap_default_search_radius": 3.0,
                 "astap_default_downsample": 2,
+                "astap_default_sensitivity": 100,
                 "cluster_panel_threshold": 0.05,
                 "cluster_target_groups": 0,
                 "cluster_orientation_split_deg": 0.0,
