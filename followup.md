@@ -279,3 +279,4 @@ Use this section to record issues, partial implementations, or TODOs that don’
 - [x] Qt filter dialog now integrates ASTAP scanning, clustering, and preview features comparable to the Tk workflow.
 - [x] Qt filter dialog now supports incremental stream ingestion via `_StreamIngestWorker`, and the `stream_scan`/`batch_size` knobs are exercised during directory scans without additional follow-up needs identified.
 - [x] Qt GPU selector now mirrors the Tk combo with automatic GPU detection and retains manual override capability.
+- [x] Qt main window now surfaces Phase 4.5 progress with log messages and an overlay preview similar to the Tk workflow.
