@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from typing import Any, Dict
 
@@ -10,6 +11,7 @@ try:
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
+        QFileDialog,
         QFormLayout,
         QGroupBox,
         QHBoxLayout,
@@ -62,6 +64,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self.config: Dict[str, Any] = self._load_config()
         self.localizer = self._create_localizer(self.config.get("language", "en"))
         self._default_config_values: Dict[str, Any] = {
+            "input_dir": "",
+            "output_dir": "",
             "global_wcs_output_path": "global_mosaic_wcs.fits",
             "coadd_memmap_dir": "",
             "astap_executable_path": "",
@@ -113,6 +117,22 @@ class ZeMosaicQtMainWindow(QMainWindow):
         layout = QFormLayout(group)
         layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
 
+        self._register_directory_picker(
+            "input_dir",
+            layout,
+            self._tr("qt_field_input_dir", "Input folder"),
+            dialog_title=self._tr(
+                "qt_dialog_select_input_dir", "Select Input Folder (raw files)"
+            ),
+        )
+        self._register_directory_picker(
+            "output_dir",
+            layout,
+            self._tr("qt_field_output_dir", "Output folder"),
+            dialog_title=self._tr(
+                "qt_dialog_select_output_dir", "Select Output Folder"
+            ),
+        )
         self._register_line_edit(
             "global_wcs_output_path",
             layout,
@@ -226,6 +246,48 @@ class ZeMosaicQtMainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Configuration handling
     # ------------------------------------------------------------------
+    def _register_directory_picker(
+        self,
+        key: str,
+        layout: QFormLayout,
+        label_text: str,
+        *,
+        dialog_title: str,
+    ) -> None:
+        container = QWidget()
+        row_layout = QHBoxLayout(container)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(6)
+
+        line_edit = QLineEdit()
+        current_value = str(self.config.get(key) or "")
+        line_edit.setText(current_value)
+
+        browse_button = QPushButton(self._tr("qt_button_browse", "Browse…"))
+
+        def _on_browse_clicked() -> None:
+            start_dir = line_edit.text().strip() or current_value or os.getcwd()
+            selected_dir = QFileDialog.getExistingDirectory(
+                self,
+                dialog_title,
+                start_dir,
+            )
+            if selected_dir:
+                line_edit.setText(selected_dir)
+                self.config[key] = selected_dir
+
+        browse_button.clicked.connect(_on_browse_clicked)  # type: ignore[arg-type]
+
+        row_layout.addWidget(line_edit)
+        row_layout.addWidget(browse_button)
+        layout.addRow(QLabel(label_text), container)
+
+        self._config_fields[key] = {
+            "kind": "line_edit",
+            "widget": line_edit,
+            "type": str,
+        }
+
     def _register_line_edit(self, key: str, layout: QFormLayout, label_text: str) -> None:
         widget = QLineEdit()
         current_value = self.config.get(key)

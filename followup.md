@@ -93,13 +93,13 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
 
 ### 3.1 Folders and basic paths
 
-- [ ] Input folder:
-  - [ ] QLineEdit for input directory.
-  - [ ] Button to open a folder dialog.
-  - [ ] Bound to the same config key as in Tk GUI.
-- [ ] Output folder:
-  - [ ] QLineEdit + folder button.
-  - [ ] Bound to proper config key.
+- [x] Input folder:
+  - [x] QLineEdit for input directory.
+  - [x] Button to open a folder dialog.
+  - [x] Bound to the same config key as in Tk GUI.
+- [x] Output folder:
+  - [x] QLineEdit + folder button.
+  - [x] Bound to proper config key.
 - [ ] Temp / intermediate folders if any are exposed in Tk GUI (e.g. master tiles directory).
 
 ### 3.2 ASTAP configuration panel

@@ -26,6 +26,8 @@ DEFAULT_CONFIG = {
     "astap_default_sensitivity": 100,
     "astap_max_instances": 1,
     "language": "en",
+    "input_dir": "",
+    "output_dir": "",
     "num_processing_workers": -1, # -1 pour auto
     "stacking_normalize_method": "linear_fit",
     "stacking_weighting_method": "noise_variance",
@@ -397,6 +399,8 @@ def load_config():
         "astap_data_directory_path",
         "coadd_memmap_dir",
         "gpu_selector",
+        "input_dir",
+        "output_dir",
     ):
         value = current_config.get(key)
         if isinstance(value, str) and value:
