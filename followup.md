@@ -260,7 +260,7 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
 - [x] Verify localization:
   - [x] All user-facing strings pass through the localization helper where reasonable.
   - [x] There is no hard-coded English where a key exists already.
-- [ ] Verify configuration:
+- [x] Verify configuration:
   - [x] Qt GUI reads existing config files correctly.
   - [x] Changes in Qt GUI are reflected in the shared config, visible from Tk GUI as well.
 - [ ] Documentation:

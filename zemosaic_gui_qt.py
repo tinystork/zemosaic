@@ -285,6 +285,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         self._config_path: str | None = self._determine_config_path()
         self._config_load_notes: List[Tuple[str, str, str, Dict[str, Any]]] = []
+        self._loaded_config_snapshot: Dict[str, Any] = {}
+        self._persisted_config_keys: set[str] = set()
         self._default_config_values: Dict[str, Any] = self._baseline_default_config()
         self.config: Dict[str, Any] = self._load_config()
         self.localizer = self._create_localizer(self.config.get("language", "en"))
@@ -1992,6 +1994,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
         merged_config.update(config_data)
         merged_config.setdefault("language", "en")
 
+        self._loaded_config_snapshot = dict(config_data)
+        self._persisted_config_keys = set(config_data.keys()) | set(
+            self._default_config_values.keys()
+        )
+
         self._config_load_notes = notes
         return merged_config
 
@@ -2029,21 +2036,18 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _serialize_config_for_save(self) -> Dict[str, Any]:
         snapshot: Dict[str, Any] = {}
-        default_keys: Iterable[str]
-        if (
-            zemosaic_config is not None
-            and hasattr(zemosaic_config, "DEFAULT_CONFIG")
-        ):
-            try:
-                default_keys = dict(getattr(zemosaic_config, "DEFAULT_CONFIG")).keys()
-            except Exception:
-                default_keys = self._default_config_values.keys()
-        else:
-            default_keys = self._default_config_values.keys()
 
-        for key in default_keys:
+        keys_to_consider: set[str] = set(self._persisted_config_keys)
+        keys_to_consider.update(self.config.keys())
+        keys_to_consider.update(self._loaded_config_snapshot.keys())
+
+        for key in keys_to_consider:
             if key in self.config:
                 snapshot[key] = self._json_safe_config_value(self.config[key])
+            elif key in self._loaded_config_snapshot:
+                snapshot[key] = self._json_safe_config_value(
+                    self._loaded_config_snapshot[key]
+                )
         return snapshot
 
     def _save_config(self) -> None:
@@ -2073,6 +2077,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         if saved:
             self.config.update(snapshot)
+            self._loaded_config_snapshot = dict(snapshot)
+            self._persisted_config_keys = set(snapshot.keys())
         else:
             if last_error is None and not self._config_path:
                 last_error = self._tr(
