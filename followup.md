@@ -13,22 +13,22 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
 
 **Goal:** Get minimal Qt files and a backend selector in place, without changing existing behavior.
 
-- [ ] Create `zemosaic_gui_qt.py` file at repository root (same level as `zemosaic_gui.py`):
-  - [ ] Import PySide6 modules inside a guarded block:
+- [x] Create `zemosaic_gui_qt.py` file at repository root (same level as `zemosaic_gui.py`):
+  - [x] Import PySide6 modules inside a guarded block:
     - `from PySide6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout`
     - Wrapped in `try/except ImportError` with a helpful error message.
-  - [ ] Define a minimal class `ZeMosaicQtMainWindow(QMainWindow)` with:
-    - [ ] A basic central widget.
-    - [ ] A simple layout and a placeholder label or title.
-  - [ ] Define `def run_qt_main():` that:
-    - [ ] Creates a `QApplication` if none exists.
-    - [ ] Instantiates `ZeMosaicQtMainWindow`.
-    - [ ] Shows the main window.
-    - [ ] Runs the Qt event loop.
+  - [x] Define a minimal class `ZeMosaicQtMainWindow(QMainWindow)` with:
+    - [x] A basic central widget.
+    - [x] A simple layout and a placeholder label or title.
+  - [x] Define `def run_qt_main():` that:
+    - [x] Creates a `QApplication` if none exists.
+    - [x] Instantiates `ZeMosaicQtMainWindow`.
+    - [x] Shows the main window.
+    - [x] Runs the Qt event loop.
 
-- [ ] Create `zemosaic_filter_gui_qt.py`:
-  - [ ] Guard PySide6 imports with `try/except ImportError`.
-  - [ ] Add a stub function:
+- [x] Create `zemosaic_filter_gui_qt.py`:
+  - [x] Guard PySide6 imports with `try/except ImportError`.
+  - [x] Add a stub function:
     ```python
     def launch_filter_interface_qt(
         raw_files_with_wcs_or_dir,
@@ -47,15 +47,15 @@ This file tracks the progress of the PySide6 (Qt) GUI migration and related task
         return raw_files_with_wcs_or_dir, False, None
     ```
 
-- [ ] Add a backend selector in `run_zemosaic.py` (or the main entry point used today):
-  - [ ] Read env var `ZEMOSAIC_GUI_BACKEND` (default `"tk"`).
-  - [ ] Optionally parse `--qt-gui` from `sys.argv`, which forces backend = "qt".
-  - [ ] If backend == "qt":
-    - [ ] Try to import `run_qt_main` from `zemosaic_gui_qt`.
-    - [ ] If ImportError (PySide6 missing), print a clear message and fallback to Tk backend.
-  - [ ] If backend == "tk":
-    - [ ] Call the existing Tk GUI entry point (e.g. `zemosaic_gui.main()` or equivalent).
-  - [ ] Ensure that running `python run_zemosaic.py` with no env var behaves exactly like before (Tk only).
+- [x] Add a backend selector in `run_zemosaic.py` (or the main entry point used today):
+  - [x] Read env var `ZEMOSAIC_GUI_BACKEND` (default `"tk"`).
+  - [x] Optionally parse `--qt-gui` from `sys.argv`, which forces backend = "qt".
+  - [x] If backend == "qt":
+    - [x] Try to import `run_qt_main` from `zemosaic_gui_qt`.
+    - [x] If ImportError (PySide6 missing), print a clear message and fallback to Tk backend.
+  - [x] If backend == "tk":
+    - [x] Call the existing Tk GUI entry point (e.g. `zemosaic_gui.main()` or equivalent).
+  - [x] Ensure that running `python run_zemosaic.py` with no env var behaves exactly like before (Tk only).
 
 
 ## Phase 2 — Basic Qt Main Window structure
