@@ -1254,6 +1254,7 @@ class FilterQtDialog(QDialog):
             self.setWindowIcon(icon)
         self._input_payload = raw_files_with_wcs_or_dir
         self._initial_overrides = initial_overrides
+        self._runtime_overrides: dict[str, Any] = {}
         _force_phase45_disabled(self._initial_overrides)
         self._stream_scan = stream_scan
         self._scan_recursive = scan_recursive
