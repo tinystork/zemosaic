@@ -13810,6 +13810,7 @@ def _assemble_global_mosaic_first_impl(
     )
     helper_progress_cap = 1.0
     helper_wait_fraction = 0.0
+    helper_partial_gpu_artifacts = False
     cpu_eta_start_time = None
     cpu_eta_last_emit = 0.0
     CPU_ETA_MIN_INTERVAL = 4.0
@@ -13829,6 +13830,21 @@ def _assemble_global_mosaic_first_impl(
         enriched = dict(descriptor_payload)
         enriched.update(kwargs)
         return enriched
+
+    def _log_helper_cpu_resume(helper_name: str, *, reason: str | None = None, discarded: bool = False) -> None:
+        """Emit a summary INFO log when resuming on CPU after helper issues."""
+        resolved_reason = (reason or "unspecified").strip() or "unspecified"
+        resume_key = (
+            "global_coadd_info_helper_cpu_resume_discarded"
+            if discarded
+            else "global_coadd_info_helper_cpu_resume"
+        )
+        pcb(
+            resume_key,
+            prog=None,
+            lvl="INFO",
+            **_payload(helper=helper_name, reason=resolved_reason),
+        )
 
     def _emit_global_coadd_finished_event(
         *,
@@ -13984,12 +14000,14 @@ def _assemble_global_mosaic_first_impl(
         ):
             align_helper_fn = getattr(zemosaic_align_stack, "equalize_rgb_medians_inplace")
         else:
+            helper_reason = "module_unavailable"
             pcb(
                 "global_coadd_warn_helper_unavailable",
                 prog=None,
                 lvl="INFO_DETAIL",
-                **_payload(helper="align_photometry", reason="module_unavailable"),
+                **_payload(helper="align_photometry", reason=helper_reason),
             )
+            _log_helper_cpu_resume("align_photometry", reason=helper_reason, discarded=False)
 
     gpu_helper_candidate = (
         prefer_gpu_helpers_flag
@@ -13998,12 +14016,14 @@ def _assemble_global_mosaic_first_impl(
         and hasattr(zemosaic_utils, "reproject_and_coadd_wrapper")
     )
     if prefer_gpu_helpers_flag and not gpu_helper_candidate:
+        helper_reason = "helper_unavailable"
         pcb(
             "global_coadd_warn_helper_unavailable",
             prog=None,
             lvl="INFO_DETAIL",
-            **_payload(helper="gpu_reproject", reason="helper_unavailable"),
+            **_payload(helper="gpu_reproject", reason=helper_reason),
         )
+        _log_helper_cpu_resume("gpu_reproject", reason=helper_reason, discarded=False)
     gpu_supported_methods = {"mean", "median", "winsorized", "kappa_sigma"}
     gpu_helper_supported = gpu_helper_candidate and coadd_method in gpu_supported_methods
     if gpu_helper_candidate and not gpu_helper_supported:
@@ -14016,6 +14036,7 @@ def _assemble_global_mosaic_first_impl(
             lvl="INFO_DETAIL",
             **_payload(helper="gpu_reproject", reason=reason, method=coadd_method),
         )
+        _log_helper_cpu_resume("gpu_reproject", reason=reason, discarded=False)
 
     start_route_label = "GPU helper (gpu_reproject)" if gpu_helper_supported else "CPU pipeline"
     start_payload = _payload(
@@ -14368,6 +14389,7 @@ def _assemble_global_mosaic_first_impl(
         _maybe_emit_cpu_eta(int(done_count))
 
     def _attempt_gpu_helper_route() -> tuple[np.ndarray, np.ndarray, np.ndarray | None, dict[str, int]] | None:
+        nonlocal helper_partial_gpu_artifacts
         helper_entries: list[tuple[dict, Any]] = []
         helper_seen = 0
         helper_valid = 0
@@ -14441,6 +14463,7 @@ def _assemble_global_mosaic_first_impl(
         )
         final_channels: list[np.ndarray] = []
         coverage_map: np.ndarray | None = None
+
         for channel_idx in range(channel_count):
             channel_start_time = time.monotonic()
             data_list: list[np.ndarray] = []
@@ -14456,6 +14479,8 @@ def _assemble_global_mosaic_first_impl(
                 data_list.append(np.ascontiguousarray(frame[..., channel_idx], dtype=np.float32))
                 wcs_list_local.append(local_wcs)
             if not data_list:
+                if final_channels:
+                    helper_partial_gpu_artifacts = True
                 return None
             try:
                 chan_mosaic, chan_cov = zemosaic_utils.reproject_and_coadd_wrapper(
@@ -14479,6 +14504,8 @@ def _assemble_global_mosaic_first_impl(
                     channel_idx,
                     exc,
                 )
+                if final_channels:
+                    helper_partial_gpu_artifacts = True
                 return None
             if gpu_verify_tolerance is not None:
                 try:
@@ -14536,6 +14563,8 @@ def _assemble_global_mosaic_first_impl(
                 ),
             )
         if not final_channels or coverage_map is None:
+            if final_channels:
+                helper_partial_gpu_artifacts = True
             return None
         final_image = (
             final_channels[0][..., np.newaxis]
@@ -14573,12 +14602,19 @@ def _assemble_global_mosaic_first_impl(
         else:
             helper_progress_cap = 1.0
             helper_wait_fraction = 0.0
+            helper_reason = "helper_failed"
             pcb(
                 "global_coadd_warn_helper_fallback",
                 prog=None,
                 lvl="INFO_DETAIL",
-                **_payload(helper="gpu_reproject", reason="helper_failed"),
+                **_payload(helper="gpu_reproject", reason=helper_reason),
             )
+            _log_helper_cpu_resume(
+                "gpu_reproject",
+                reason=helper_reason,
+                discarded=bool(helper_partial_gpu_artifacts),
+            )
+            helper_partial_gpu_artifacts = False
 
     pcb(
         "global_coadd_info_cpu_path",

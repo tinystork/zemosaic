@@ -215,6 +215,8 @@
     "global_coadd_helper_channel_progress": "Assistant « {helper} » : canal {channel}/{channels} traité en {elapsed_s:.2f}s ({method}).",
     "global_coadd_info_cpu_path": "Exécution de Mosaic-First sur CPU (images={frames}, grille={grid_w}×{grid_h}px, méthode={method}).",
     "global_coadd_info_cpu_magic_wait": "Le CPU forge la mosaïque à mains nues — merci de patienter...",
+    "global_coadd_info_helper_cpu_resume": "Poursuite sur la voie CPU après incident du helper « {helper} » ({reason}). Aucun artefact GPU à supprimer.",
+    "global_coadd_info_helper_cpu_resume_discarded": "Poursuite sur la voie CPU après incident du helper « {helper} » ({reason}). Artefacts GPU partiels supprimés avant reprise.",
     "sds_info_runtime_wcs_built": "SDS : WCS global construit à l'exécution à partir de {entries} entrée(s).",
     "sds_warn_runtime_wcs_no_output_dir": "SDS : création du WCS runtime impossible, dossier de sortie indisponible.",
     "sds_warn_runtime_wcs_failed": "SDS : échec du WCS runtime : {error}",

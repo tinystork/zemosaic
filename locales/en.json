@@ -212,6 +212,8 @@
     "global_coadd_helper_channel_progress": "Helper '{helper}' processed channel {channel}/{channels} in {elapsed_s:.2f}s ({method}).",
     "global_coadd_info_cpu_path": "Running Mosaic-First on CPU (frames={frames}, grid={grid_w}×{grid_h}px, method={method}).",
     "global_coadd_info_cpu_magic_wait": "CPU is forging the mosaic with bare-metal patience — please stand by...",
+    "global_coadd_info_helper_cpu_resume": "Continuing on CPU path after helper '{helper}' issue ({reason}). No GPU artifacts to discard.",
+    "global_coadd_info_helper_cpu_resume_discarded": "Continuing on CPU path after helper '{helper}' issue ({reason}). Discarded partial GPU artifacts before retry.",
     "sds_info_runtime_wcs_built": "SDS runtime global WCS built from {entries} entry(ies).",
     "sds_warn_runtime_wcs_no_output_dir": "SDS runtime WCS aborted: output directory unavailable.",
     "sds_warn_runtime_wcs_failed": "SDS runtime WCS failed: {error}",
