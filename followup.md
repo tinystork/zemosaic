@@ -226,6 +226,51 @@ Ensure the coding agent ALWAYS updates this file after completing a task.
 
 ---
 
+## Task H — Global WCS / Mosaic-first parity
+
+**Goal:**  
+Ensure the Qt filter GUI provides the same global WCS descriptor and Mosaic-first (SDS) planning behaviour as the Tk filter, using the existing helper modules.
+
+**Detailed requirements:**
+
+- [ ] Extend the Qt filter pipeline to call the same global WCS helpers used by Tk (e.g. descriptor computation and FITS/JSON output) instead of reimplementing any logic.
+- [ ] Ensure Qt filter overrides expose the same keys as Tk when a global WCS is prepared (e.g. `global_wcs_meta`, `global_wcs_path`, `global_wcs_json`, `global_wcs_plan_override` semantics).
+- [ ] Verify that SDS / Mosaic-first workflows behave identically under Tk and Qt (same descriptor reuse by the worker, same user-visible logs and warnings).
+- [ ] Add notes in followup.md once behaviour has been validated on at least one representative dataset.
+
+
+---
+
+## Task I — End-of-run UX & cancellation parity
+
+**Goal:**  
+Align Qt run completion and cancellation behaviour with the Tk GUI so users see consistent prompts and log levels.
+
+**Detailed requirements:**
+
+- [ ] Add an optional “Open output folder” prompt to the Qt GUI on successful completion, mirroring Tk’s platform-specific behaviour.
+- [ ] Treat user-triggered cancellations in Qt as a warning-style completion (`log_key_processing_cancelled`) rather than a generic error, matching Tk’s log level semantics.
+- [ ] Confirm that timers, ETA, tiles/files counters, and phase labels reset identically on completion and on cancellation in both backends.
+- [ ] Document any intentional UX differences (if any remain) in the Notes / Known Issues section.
+
+
+---
+
+## Task J — Final parity audit & config key validation
+
+**Goal:**  
+Lock in full parity between Tk and Qt by validating configuration, worker inputs, and observable behaviour end-to-end.
+
+**Detailed requirements:**
+
+- [ ] Compare saved configuration snapshots produced by Tk and Qt for equivalent sessions and ensure all shared features map to the same keys and values (including GPU, quality gates, coverage, and language).
+- [ ] Verify that worker argument tuples constructed by Tk and Qt (`run_hierarchical_mosaic_process` callers) are semantically aligned for shared parameters (folders, solver/stacking options, quality/crop, GPU flags, etc.).
+- [ ] Run a small parity test matrix (Tk vs Qt, classic vs Mosaic-first) and confirm logs, progress indicators, and outputs are consistent for supported workflows.
+- [ ] Record a short checklist or notes in this file so future changes to worker signatures or config schema can be re-audited against the same criteria.
+
+
+---
+
 ## Notes / Known Issues
 
 (Add here any clarifications or partial work notes related to tasks A/B/C)
