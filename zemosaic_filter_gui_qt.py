@@ -955,6 +955,7 @@ class _StreamIngestWorker(QObject):
         super().__init__()
         self._payload = payload
         self._initial_overrides = initial_overrides
+        self._force_phase45_disabled(self._initial_overrides)
         self._scan_recursive = bool(scan_recursive)
         self._batch_size = max(1, int(batch_size))
         self._stop_requested = False
@@ -1018,12 +1019,14 @@ class FilterQtDialog(QDialog):
             self.setWindowIcon(icon)
         self._input_payload = raw_files_with_wcs_or_dir
         self._initial_overrides = initial_overrides
+        self._force_phase45_disabled(self._initial_overrides)
         self._stream_scan = stream_scan
         self._scan_recursive = scan_recursive
         self._batch_size = batch_size
         self._preview_cap = preview_cap
         self._solver_settings = solver_settings_dict
         self._config_overrides = config_overrides or {}
+        self._force_phase45_disabled(self._config_overrides)
         self._accepted = False
 
         self._localizer = self._load_localizer()
@@ -1088,6 +1091,7 @@ class FilterQtDialog(QDialog):
         )
 
         self._preview_canvas = self._create_preview_canvas()
+        self._activity_log_output: QPlainTextEdit | None = None
         self._log_output: QPlainTextEdit | None = None
         self._scan_recursive_checkbox: QCheckBox | None = None
         self._draw_footprints_checkbox: QCheckBox | None = None
@@ -1293,6 +1297,15 @@ class FilterQtDialog(QDialog):
         auto_btn.clicked.connect(self._on_auto_group_clicked)  # type: ignore[arg-type]
         layout.addWidget(auto_btn, 0, 1)
 
+        astap_label = QLabel(
+            self._localizer.get("filter_label_astap_instances", "Max ASTAP instances"),
+            box,
+        )
+        layout.addWidget(astap_label, 1, 0)
+        self._astap_instances_combo = QComboBox(box)
+        self._populate_astap_instances_combo()
+        layout.addWidget(self._astap_instances_combo, 1, 1)
+
         self._draw_footprints_checkbox = QCheckBox(
             self._localizer.get("filter_chk_draw_footprints", "Draw WCS footprints"),
             box,
@@ -1301,21 +1314,21 @@ class FilterQtDialog(QDialog):
         self._draw_footprints_checkbox.toggled.connect(  # type: ignore[arg-type]
             lambda _checked: self._schedule_preview_refresh()
         )
-        layout.addWidget(self._draw_footprints_checkbox, 1, 0)
+        layout.addWidget(self._draw_footprints_checkbox, 2, 0)
 
         self._write_wcs_checkbox = QCheckBox(
             self._localizer.get("filter_chk_write_wcs", "Write WCS to file"),
             box,
         )
         self._write_wcs_checkbox.setChecked(True)
-        layout.addWidget(self._write_wcs_checkbox, 1, 1)
+        layout.addWidget(self._write_wcs_checkbox, 2, 1)
 
         self._sds_checkbox = QCheckBox(
             self._localizer.get("filter_chk_sds_mode", "Enable ZeSupaDupStack (SDS)"),
             box,
         )
         self._sds_checkbox.setChecked(bool(self._sds_mode_initial))
-        layout.addWidget(self._sds_checkbox, 2, 0, 1, 2)
+        layout.addWidget(self._sds_checkbox, 3, 0, 1, 2)
 
         return box
 
@@ -1665,19 +1678,55 @@ class FilterQtDialog(QDialog):
             "filter.dialog.description",
             "Review the frames that will be used before launching the mosaic process.",
         )
-        main_layout.addWidget(QLabel(description, self))
+        description_label = QLabel(description, self)
+        description_label.setWordWrap(True)
+        main_layout.addWidget(description_label)
+
+        content_splitter = QSplitter(Qt.Horizontal, self)
+        content_splitter.setChildrenCollapsible(False)
+        main_layout.addWidget(content_splitter, 1)
+
+        preview_group = QGroupBox(self._localizer.get("filter.preview.header", "Sky preview"), self)
+        preview_layout = QVBoxLayout(preview_group)
+        preview_layout.setContentsMargins(8, 8, 8, 8)
+        preview_layout.setSpacing(6)
+        if self._preview_canvas is not None:
+            preview_layout.addWidget(self._preview_canvas, stretch=1)
+        preview_layout.addWidget(self._preview_hint_label)
+        content_splitter.addWidget(preview_group)
+
+        controls_container = QWidget(self)
+        controls_layout = QVBoxLayout(controls_container)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(8)
+        content_splitter.addWidget(controls_container)
 
         toolbar_widget = self._create_toolbar_widget()
-        main_layout.addWidget(toolbar_widget)
+        controls_layout.addWidget(toolbar_widget)
 
-        header_container = QWidget(self)
-        header_layout = QHBoxLayout(header_container)
-        header_layout.setContentsMargins(0, 0, 0, 0)
         exclusion_box = self._create_exclusion_box()
+        controls_layout.addWidget(exclusion_box)
+
         instrument_widget = self._create_instrument_row()
-        header_layout.addWidget(exclusion_box, 1)
-        header_layout.addWidget(instrument_widget, 1)
-        main_layout.addWidget(header_container)
+        controls_layout.addWidget(instrument_widget)
+
+        activity_group = QGroupBox(
+            self._localizer.get("filter_log_panel_title", "Activity log"),
+            self,
+        )
+        activity_layout = QVBoxLayout(activity_group)
+        activity_layout.setContentsMargins(8, 8, 8, 8)
+        self._activity_log_output = QPlainTextEdit(activity_group)
+        self._activity_log_output.setReadOnly(True)
+        self._activity_log_output.setMaximumBlockCount(500)
+        self._activity_log_output.setPlaceholderText(
+            self._localizer.get(
+                "filter.activity.placeholder",
+                "Recent filter activity will be listed here.",
+            )
+        )
+        activity_layout.addWidget(self._activity_log_output)
+        controls_layout.addWidget(activity_group, 1)
 
         self._table.setColumnCount(4)
         headers = [
@@ -1693,49 +1742,22 @@ class FilterQtDialog(QDialog):
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.itemChanged.connect(self._handle_item_changed)
 
-        splitter = QSplitter(Qt.Vertical, self)
-        splitter.setChildrenCollapsible(False)
-
-        table_container = QWidget(self)
-        table_layout = QVBoxLayout(table_container)
-        table_layout.setContentsMargins(0, 0, 0, 0)
-        table_layout.addWidget(self._table)
-        splitter.addWidget(table_container)
-
-        preview_container = QWidget(self)
-        preview_layout = QVBoxLayout(preview_container)
-        preview_layout.setContentsMargins(0, 0, 0, 0)
-        preview_title = QLabel(self._localizer.get("filter.preview.header", "Sky preview"), self)
-        preview_layout.addWidget(preview_title)
-        if self._preview_canvas is not None:
-            preview_layout.addWidget(self._preview_canvas, stretch=1)
-        preview_layout.addWidget(self._preview_hint_label)
-        splitter.addWidget(preview_container)
-
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        main_layout.addWidget(splitter)
-
-        control_row = QGridLayout()
-        select_all_btn = QPushButton(
-            self._localizer.get("filter.button.select_all", "Select all"), self
+        images_group = QGroupBox(
+            self._localizer.get("filter_images_check_to_keep", "Images (check to keep)"),
+            self,
         )
-        select_none_btn = QPushButton(
-            self._localizer.get("filter.button.select_none", "Select none"), self
-        )
-        select_all_btn.clicked.connect(self._select_all)  # type: ignore[arg-type]
-        select_none_btn.clicked.connect(self._select_none)  # type: ignore[arg-type]
-        control_row.addWidget(select_all_btn, 0, 0)
-        control_row.addWidget(select_none_btn, 0, 1)
-        control_row.addWidget(self._summary_label, 0, 2)
-        control_row.setColumnStretch(2, 1)
-        main_layout.addLayout(control_row)
+        images_layout = QVBoxLayout(images_group)
+        images_layout.setContentsMargins(8, 8, 8, 8)
+        images_layout.setSpacing(6)
+        images_layout.addWidget(self._table, 1)
 
-        options_box = self._create_options_box()
-        main_layout.addWidget(options_box)
+        controls_layout.addWidget(images_group, 2)
 
         wcs_box = self._create_wcs_controls_box()
-        main_layout.addWidget(wcs_box)
+        controls_layout.addWidget(wcs_box)
+
+        options_box = self._create_options_box()
+        controls_layout.addWidget(options_box)
 
         log_group_box = QGroupBox(
             self._localizer.get("filter.group.log", "Scan / grouping log"), self
@@ -1750,13 +1772,34 @@ class FilterQtDialog(QDialog):
         )
         self._log_output.setPlaceholderText(placeholder)
         log_layout.addWidget(self._log_output)
-        main_layout.addWidget(log_group_box)
+        controls_layout.addWidget(log_group_box, 1)
+
+        actions_widget = QWidget(self)
+        actions_layout = QHBoxLayout(actions_widget)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        actions_layout.setSpacing(8)
+        actions_layout.addWidget(self._summary_label, 1)
+        actions_layout.addStretch(1)
+        select_all_btn = QPushButton(
+            self._localizer.get("filter.button.select_all", "Select all"), self
+        )
+        select_all_btn.clicked.connect(self._select_all)  # type: ignore[arg-type]
+        actions_layout.addWidget(select_all_btn, 0)
+        select_none_btn = QPushButton(
+            self._localizer.get("filter.button.select_none", "Select none"), self
+        )
+        select_none_btn.clicked.connect(self._select_none)  # type: ignore[arg-type]
+        actions_layout.addWidget(select_none_btn, 0)
+        controls_layout.addWidget(actions_widget)
 
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
         button_box.accepted.connect(self.accept)
         button_box.rejected.connect(self.reject)
-        main_layout.addWidget(button_box)
+        controls_layout.addWidget(button_box)
         self._dialog_button_box = button_box
+
+        content_splitter.setStretchFactor(0, 3)
+        content_splitter.setStretchFactor(1, 2)
 
     def _prepare_streaming_mode(self, payload: Any, initial_overrides: Any) -> None:
         """Enable incremental ingestion when the dialog is opened in stream mode."""
@@ -1991,16 +2034,6 @@ class FilterQtDialog(QDialog):
         self._seestar_checkbox.setChecked(self._seestar_priority)
         layout.addWidget(self._seestar_checkbox)
 
-        concurrency_label = QLabel(
-            self._localizer.get("filter_label_astap_instances", "Max ASTAP instances"),
-            box,
-        )
-        layout.addWidget(concurrency_label)
-
-        self._astap_instances_combo = QComboBox(box)
-        self._populate_astap_instances_combo()
-        layout.addWidget(self._astap_instances_combo)
-
         self._scan_recursive_checkbox = QCheckBox(
             self._localizer.get("filter.option.scan_recursive", "Scan subfolders (recursive)"),
             box,
@@ -2015,10 +2048,16 @@ class FilterQtDialog(QDialog):
     def _append_log(self, message: str) -> None:
         if not message:
             return
+        text = str(message)
+        if self._activity_log_output is not None:
+            try:
+                self._activity_log_output.appendPlainText(text)
+            except Exception:
+                pass
         if self._log_output is None:
             return
         try:
-            self._log_output.appendPlainText(str(message))
+            self._log_output.appendPlainText(text)
         except Exception:
             pass
 
@@ -2564,6 +2603,17 @@ class FilterQtDialog(QDialog):
             return default
         return result
 
+    @staticmethod
+    def _force_phase45_disabled(mapping: Any) -> None:
+        """Ensure Phase 4.5 / super-tiles remain disabled in overrides."""
+
+        if not isinstance(mapping, dict):
+            return
+        try:
+            mapping["inter_master_merge_enable"] = False
+        except Exception:
+            pass
+
     def _detect_primary_instrument_label(self) -> str | None:
         for entry in self._normalized_items:
             label = self._normalize_string(entry.instrument)
@@ -2978,7 +3028,9 @@ class FilterQtDialog(QDialog):
                 continue
             overrides[key] = value
 
-        return overrides or None
+        result_overrides = overrides or None
+        self._force_phase45_disabled(result_overrides)
+        return result_overrides
 
     def input_items(self) -> List[Any]:
         """Return a shallow copy of the original payload list."""

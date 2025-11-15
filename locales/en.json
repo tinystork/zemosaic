@@ -557,6 +557,7 @@
     "filter.exclude.result": "Excluded {count} frame(s) beyond {threshold:.1f}°.",
     "filter_images_check_to_keep": "Images (check to keep)",
     "filter_log_panel_title": "Activity log",
+    "filter.activity.placeholder": "Recent filter activity will be listed here.",
     "filter_btn_resolve_wcs": "Resolve missing WCS",
     "filter_btn_auto_group": "Auto-organize Master Tiles",
     "filter_btn_analyse": "Analyse",

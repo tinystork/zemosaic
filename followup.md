@@ -541,6 +541,62 @@ The Qt filter dialog should feel like a one-to-one translation of the Tk window 
   - Notes (2025-11-15): Exercised the updated Qt dialog headlessly via `QT_QPA_PLATFORM=offscreen python3 …` on `example/lights`, triggered the distance exclusion, instrument dropdown, and CSV export (writing `build/test_filter.csv`) to validate the new controls without a visible display.
   - Exclusions, WCS solving, and SDS overrides produce the same worker input (`filtered_list`, `accepted`, `overrides_dict`).
 
+
+## Task Q — Tk filter layout (Qt horizontal split parity)
+
+**Goal:**  
+Make `zemosaic_filter_gui_qt.py` visually match the Tk filter layout with a **horizontal split** (Sky preview on the left, controls on the right), so Seestar users immediately recognize the UI while still hiding Phase 4.5 in Qt.
+
+**Detailed requirements:**
+
+- [x] Main layout skeleton:
+  - In `FilterQtDialog.__init__` / `_build_ui`, replace the vertical stack around the table/preview with a horizontal split using either:
+    - A top-level `QHBoxLayout` with `left_panel` / `right_panel` `QVBoxLayout` children, or
+    - A `QSplitter(Qt.Horizontal)` whose left widget is the preview and right widget hosts all controls.
+  - Mirror Tk’s `main` frame (`main.columnconfigure(0, weight=3)` / `main.columnconfigure(1, weight=2)`): Sky preview must occupy the **full left side**, and the right side must host the stacked control blocks.
+  - Notes: `_build_ui` now builds a horizontal `QSplitter` (preview weight 3 vs control stack 2) and moves the toolbar, exclusion/instrument rows, image table, filter options, WCS block, log, and dialog buttons into the right pane to match Tk’s column layout.
+
+- [x] Sky preview panel:
+  - Wrap the Matplotlib preview in a `QGroupBox` or `QFrame` titled like Tk’s “Sky Preview”.
+  - Embed the existing Matplotlib canvas (`FigureCanvasQTAgg` / custom canvas) inside this group so it stretches with the left panel.
+  - Ensure WCS footprints and cluster colours are drawn identically to Tk (reuse the same footprint metadata and colour palette wired in Tasks N/P).
+  - Notes: `_build_ui` now instantiates a `QGroupBox` titled “Sky preview” on the left splitter pane, hosts the Matplotlib canvas + hint label inside it, and keeps the existing footprint/cluster drawing helpers untouched so colours match the Tk reference.
+
+- [x] Top-right controls:
+  - At the top of the right panel, regroup the status strip + toolbar and the “Exclude by distance to center” + Instrument filter controls, following Tk’s order:
+    - Status label + progress bar + **Analyse / Export CSV / Maximize** buttons.
+    - Distance spinbox + **Exclude > X°** button.
+    - Instrument dropdown bound to the same detection logic as Tk.
+  - Notes: `_build_ui` now stacks the toolbar/status strip first, then the exclusion distance group box, then the instrument filter group, matching the Tk dialog’s top rows.
+
+- [x] Activity log & image list:
+  - Directly below the top controls, add an **Activity log** group (`QGroupBox` + read-only `QPlainTextEdit`) mirroring Tk’s activity log behaviour.
+  - Under the log, keep the **Images (check to keep)** block as its own group, preserving the same scrolling and “check to keep” semantics as Tk (table columns may differ, but the UX must match).
+  - Notes: `_build_ui` now inserts a `QGroupBox` titled `filter_log_panel_title` immediately under the toolbar/exclusion/instrument row, wires `_append_log` to both this activity log and the existing scan log, and wraps the table plus Select All/None summary row inside a `filter_images_check_to_keep` group so the Qt dialog matches Tk’s stacked Activity log → image list structure.
+
+- [x] WCS / master-tile and filter options blocks:
+  - Keep **WCS / Master tile controls** and **Filter options** grouped and ordered like Tk:
+    - Resolve missing WCS, Auto-organize Master tiles, max ASTAP instances.
+    - Draw footprints, Write WCS to file.
+    - SDS / ZeSupaDupStack toggle and related options.
+  - Respect existing Tk parameters for SDS, orientation split, and clustering; Qt must forward the same overrides and use the same option naming where localized strings exist.
+  - Notes: `_create_wcs_controls_box` now hosts the resolve/auto buttons plus the ASTAP concurrency selector, WCS footprint/write checkboxes, and SDS toggle; `_create_options_box` follows it in `_build_ui`, keeping the auto-group/Seestar/recursive toggles grouped just like Tk.
+
+- [x] Scan / grouping log and final buttons:
+  - Place the **Scan / grouping log** panel near the bottom of the right side, using a read-only `QPlainTextEdit` (same semantics as the current log widget).
+  - Keep **Select all**, **Select none**, **OK**, and **Cancel** in the same relative position as Tk (bottom-right), with identical selection and dialog-accept/cancel behaviour.
+  - Notes: `_build_ui` now anchors the Scan / grouping log right above a dedicated bottom action row, and moves the Select all / Select none buttons plus the selection summary label beside the dialog buttons so the bottom of the Qt window mirrors the Tk layout.
+
+- [x] Phase 4.5 visibility & UX guard:
+  - Do **not** introduce any Phase 4.5 / super-tiles controls in the Qt filter dialog; Phase 4.5 must remain GUI-hidden in Qt, consistent with `zemosaic_gui.py` and Tasks K/O.
+  - Avoid “Excel-like” layouts where the table dominates and the preview is stacked underneath; the Qt filter must feel like the Tk window: Sky preview on the left, controls on the right, with similar margins and section ordering.
+  - Notes: FilterQtDialog now sanitizes both incoming overrides/config payloads and the dialog’s outgoing overrides via `_force_phase45_disabled(...)`, so `inter_master_merge_enable` is forcibly set to `False` even if older configs requested Phase 4.5, ensuring the Qt filter never exposes or re-enables super-tiles settings.
+
+**Implementation notes:**
+
+- Treat the Tk filter’s `main` layout (`zemosaic_filter_gui.py`) as the exact visual reference: reproduce the same sections and vertical ordering within the right-side panel.
+- Prefer updating `_build_ui` and the existing helper creators (`_create_preview_canvas`, `_create_wcs_controls_box`, etc.) rather than moving business logic; only layout and Qt signal wiring should change.
+
 ---
 
 ## Notes / Known Issues
