@@ -48,6 +48,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from collections import Counter
 import logging
 import importlib.util
 import os
@@ -462,6 +463,19 @@ def _sanitize_footprint_radec(payload: Any) -> List[Tuple[float, float]] | None:
         points.append((ra, dec))
 
     return points or None
+
+
+def _format_sizes_histogram(sizes: list[int], max_buckets: int = 6) -> str:
+    """Return a compact histogram string for group sizes (Tk parity)."""
+
+    if not sizes:
+        return "[]"
+
+    counter = Counter(sizes)
+    pairs = sorted(counter.items(), key=lambda kv: (-kv[1], -kv[0]))
+    head = ", ".join(f"{size}×{count}" for size, count in pairs[:max_buckets])
+    tail = len(pairs) - max_buckets
+    return head + (f", +{tail} more" if tail > 0 else "")
 
 
 def _iter_normalized_entries(
@@ -1973,6 +1987,22 @@ class FilterQtDialog(QDialog):
                         new_groups[group_idx].append(normalized)
         self._cluster_groups = [group for group in new_groups if group]
 
+        sizes_payload = payload.get("sizes")
+        sizes: list[int] = []
+        if isinstance(sizes_payload, list):
+            for val in sizes_payload:
+                try:
+                    size_int = int(val)
+                except Exception:
+                    continue
+                if size_int > 0:
+                    sizes.append(size_int)
+        if not sizes and groups:
+            try:
+                sizes = [len(group) for group in groups]
+            except Exception:
+                sizes = []
+
         if groups:
             self._status_label.setText(
                 self._localizer.get(
@@ -1981,12 +2011,25 @@ class FilterQtDialog(QDialog):
                 )
             )
         else:
-            self._status_label.setText(
-                self._localizer.get(
-                    "filter.cluster.no_groups",
-                    "No master-tile groups could be prepared.",
+                self._status_label.setText(
+                    self._localizer.get(
+                        "filter.cluster.no_groups",
+                        "No master-tile groups could be prepared.",
+                    )
                 )
+
+        if groups:
+            hist = _format_sizes_histogram(sizes) if sizes else "[]"
+            summary_template = self._localizer.get(
+                "filter_log_groups_summary",
+                "Prepared {g} group(s), sizes: {sizes}.",
             )
+            try:
+                summary_text = summary_template.format(g=len(groups), sizes=hist)
+            except Exception:
+                summary_text = f"Prepared {len(groups)} group(s), sizes: {hist}."
+            self._append_log(summary_text)
+
         self._group_outline_bounds = self._compute_group_outline_bounds(groups)
         self._update_summary_label()
         self._schedule_preview_refresh()

@@ -716,6 +716,8 @@ This includes in particular:
 
   Recommended mitigation: when processing very large mosaics or high-resolution stacks on GPUs with limited VRAM, prefer to (a) disable GPU stacking in the GUI so that the worker uses the CPU implementations, or (b) keep GPU enabled but reduce memory pressure by lowering image sizes, reducing the number of simultaneous frames, or disabling optional GPU helpers (e.g. set `ZEMOSAIC_FORCE_CPU_INTERTILE=1` to force CPU for inter-tile helpers if needed). The worker’s GPU paths are designed to fall back cleanly to CPU when CuPy raises a runtime error, but final CUDA driver teardown may still emit `CUDA_ERROR_OUT_OF_MEMORY` tracebacks to the console if the environment’s global `sys.excepthook` interferes; addressing that hook (or running with GPU disabled for extreme workloads) avoids noisy console output while preserving the main ZeMosaic logs in `zemosaic_worker.log`.
 
+- [x] 2025-11-17: Qt filter Auto-organize now mirrors the Tk filter’s group-size reporting by logging a `filter_log_groups_summary` histogram for master-tile/SDS preplans, reusing the same `sizes` payload that drives red-outline previews so users can see per-group distributions in the Qt log panel.
+
 - [x] 2025-11-15: Current pass found **no remaining unchecked tasks** in this checklist; paused further code changes until new items are added, so the next agent can resume once additional TODOs appear.
 
 ---
