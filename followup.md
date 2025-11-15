@@ -326,6 +326,44 @@ for this release, Phase 4.5 must **not be user-exposed** in Qt, while keeping ru
   - Qt main → run & save config → reopen with Tk and verify Phase 4.5 is still disabled and behaves like before the Qt port.
 
 ---
+
+---
+
+## Task O — Phase 4.5 visibility regression guard (Qt main)
+
+**Goal:**  
+Ensure `zemosaic_gui_qt.py` never exposes Phase 4.5 / super-tiles controls, and that its behaviour stays aligned with `zemosaic_gui.py` for `inter_master_merge_enable`.
+
+**Detailed requirements:**
+
+- [x] Audit current `zemosaic_gui_qt.py`:
+  - Verify whether any Phase 4.5/super-tiles `QGroupBox` or widgets are still visible (e.g. inter-master overlap, stack method, min/max group, memmap policy, photometry options).
+  - Cross-check against Tk: only the same options as `zemosaic_gui.py` should be visible; **no Phase 4.5 group** in Qt.
+
+- [x] Hide or guard Phase 4.5 config UI:
+  - Remove the Phase 4.5 `QGroupBox` from the visible layout or wrap its creation behind a constant (e.g. `ENABLE_PHASE45_UI = False`), making sure it never becomes visible at runtime.
+  - Ensure no Qt menu, shortcut, or debug flag accidentally re-enables it.
+
+- [x] Config parity:
+  - After loading config in Qt, force:
+    ```python
+    self.config["inter_master_merge_enable"] = False
+    ```
+  - When saving config from Qt, always persist `inter_master_merge_enable = False` (never write `True`).
+
+- [x] Sanity checks:
+  - Run a session in Tk main, save config, open Qt main:
+    - Confirm no Phase 4.5 controls are visible.
+    - Confirm `inter_master_merge_enable` is `False` on disk and in memory.
+  - Do the inverse (Qt → Tk) and confirm the same behaviour.
+
+**Implementation notes:**
+
+- Treat `zemosaic_gui.py` as the canonical source: Qt must not expose more knobs than Tk.
+- This task is a regression guard over Task K; if the UI ever re-exposes Phase 4.5, fix it here and keep this section as the reference checklist.
+
+
+---
 ## Task L — Qt Filter GUI feature & layout parity
 
 **Goal:**  
@@ -417,6 +455,91 @@ Bring `FilterQtDialog` closer to the Tk filter GUI for WCS visualisation and con
 - [ ] After implementation, validate the new behaviour on at least one WCS-enabled dataset (e.g. Seestar test set) and record observations here, including any intentional simplifications compared to the Tk coverage map.
 
 ---
+---
+
+## Task P — Qt Filter toolbar, exclusion & SDS controls parity
+
+**Goal:**  
+Bring `zemosaic_filter_gui_qt.py` to **full visual and functional parity** with `zemosaic_filter_gui.py` for the filter window header/toolbar and main control frames:
+
+- Top toolbar row: **Analyse**, **Export CSV**, **Maximize/Restore**.
+- “Exclude by distance to center” frame with `Distance (deg)` and **Exclude > X°**.
+- Instrument selection dropdown.
+- WCS / master-tile controls: **Resolve missing WCS**, **Auto-organize Master tiles**, **Enable ZeSupaDupStack (SDS)**, etc.
+- Sky preview with **visible WCS footprints** whenever WCS exists.
+
+The Qt filter dialog should feel like a one-to-one translation of the Tk window (same sections, same options, même “flow”).
+
+**Detailed requirements:**
+
+- [ ] Top toolbar parity:
+  - Introduce a top row mirroring the Tk filter header:
+    - **Analyse** button:
+      - Same behaviour as the Tk “Analyse” button: triggers the full scan/grouping/WCS analysis workflow.
+      - Reuse the same underlying methods/helpers as Tk where possible; avoid duplicating business logic.
+    - **Export CSV** button:
+      - Call the same or equivalent helper as in Tk to export the current frame/group/clustering table to CSV.
+      - Respect the same CSV format and column order as `zemosaic_filter_gui.py`.
+    - **Maximize / Restore** button:
+      - Toggle between normal layout and “maximized” preview or window state, matching Tk semantics (e.g. enlarge filter window or preview area).
+      - Ensure the button label/icon and state follow the same logic as Tk (Maximize ↔ Restore).
+
+- [ ] “Exclude by distance to center” frame:
+  - Add a `QGroupBox` equivalent to the Tk **“Exclude by distance to center”** frame:
+    - A `QDoubleSpinBox` for **Distance (deg)** (same default and range as Tk).
+    - A button **“Exclude > X°”** (label via localization) that:
+      - Computes the angular distance of each frame from the mosaic center, using the same helper/math as Tk.
+      - Marks frames beyond the threshold as *unchecked* in the Qt table.
+      - Updates `filter_excluded_indices` in the overrides dict in the same way as the Tk filter.
+  - Ensure the “Images (check to keep)” / frame list reflects these exclusions immediately.
+
+- [ ] Instrument selection dropdown:
+  - Add a `QComboBox` for **Instrument** selection in the same place as Tk:
+    - Populate it with the same instrument keys/descriptions as Tk (Seestar S50/S30, ASIAIR, generic INSTRUME, etc.).
+    - When the selection changes, update any instrument summary text and internal filter state just like Tk.
+    - Make sure the default selection matches the Tk behaviour on first scan.
+
+- [ ] WCS / master-tile / SDS controls:
+  - In the WCS/master-tile area, add Qt equivalents for:
+    - **Resolve missing WCS**:
+      - Button that invokes ASTAP solving on frames lacking WCS (reuse existing Qt solving pipeline; just wire the button to it).
+      - Results must update the table’s WCS columns and the `resolved_wcs_count` override.
+    - **Auto-organize Master tiles**:
+      - Button that triggers the same grouping/master-tile re-organisation as Tk (reusing the same helper in the worker/filter logic).
+      - Table grouping/group IDs must match Tk on the same dataset.
+    - **Enable ZeSupaDupStack (SDS)** toggle:
+      - `QCheckBox` bound to the same `sds_mode` / SDS overrides used by the Tk filter.
+      - When enabled, ensure `filter_overrides` contains the same SDS-related keys so the worker enters SDS / ZeSupaDupStack mode exactly like Tk.
+  - Keep existing WCS options (**Draw WCS footprints**, **Write WCS to file**) from Task N; integrate them logically into this block.
+
+- [ ] Sky preview & WCS footprints sanity check:
+  - Verify that, when **Draw WCS footprints** is enabled and WCS exists for the selected frames:
+    - The Matplotlib sky preview shows one rectangle per frame, coloured by group (as implemented in Task N).
+    - This matches the Tk coverage/preview behaviour on the same dataset (within the limitations of Matplotlib vs Tk canvas).
+  - If footprints are not drawn despite WCS being present:
+    - Debug the caching / header → WCS path, reusing the Tk helpers (`footprint_radec` metadata, WCS builders).
+    - Do **not** change worker logic; only fix the Qt preview wiring.
+
+- [ ] Layout / UX alignment:
+  - Re-arrange Qt widgets so the **relative layout** matches Tk as closely as possible:
+    - Top toolbar row (Analyse / Export CSV / Maximize).
+    - Instrument + “Exclude by distance to center” block.
+    - Frame list on the left, Sky preview on the right (or same side-by-side structure as Tk).
+    - Filter options (WCS/SDS/master-tile controls).
+    - Scan / grouping log.
+    - OK / Cancel buttons at the bottom.
+  - Use existing translation keys where possible; only add new keys if something truly has no equivalent in `locales/en.json` / `fr.json`, and update both files accordingly.
+
+**Implementation notes:**
+
+- Treat `zemosaic_filter_gui.py` as the canonical UX and behaviour reference:
+  - For each control mentioned above, locate the Tk implementation and mirror its behaviour in Qt.
+  - Reuse existing non-GUI helpers (ASTAP solving, clustering, SDS mode toggles, distance calculations) instead of re-implementing logic in Qt.
+- When this task is done, run the same dataset through Tk and Qt filters, take side-by-side screenshots, and confirm that:
+  - All buttons/toggles/frames are present in both.
+  - Exclusions, WCS solving, and SDS overrides produce the same worker input (`filtered_list`, `accepted`, `overrides_dict`).
+
+---
 
 ## Notes / Known Issues
 
@@ -439,6 +562,7 @@ Bring `FilterQtDialog` closer to the Tk filter GUI for WCS visualisation and con
 - [x] 2025-11-15: Task L parity review — Confirmed that `FilterQtDialog` implements the stream-scan directory exclusions (`_iter_normalized_entries(...)` + `EXCLUDED_DIRS`/`is_path_excluded`), recursive “Scan subfolders” toggle, WCS column and `resolved_wcs_count` override, `filter_excluded_indices` based on unchecked rows, ASTAP concurrency wiring via `astap_max_instances` and `set_astap_max_concurrent_instances(...)`, and a scrollable log panel for scan/clustering/WCS messages. Behaviour was cross-checked against the Tk `launch_filter_interface` and worker consumers of `filter_overrides`; full end-to-end runs on real Seestar datasets remain recommended outside this harness for final visual validation.
 - [x] 2025-11-16: Task M (global coadd diagnostics & auto-crop) — `compute_global_wcs_descriptor` now logs entry counts plus RA/DEC spans and pixel scale, both Mosaic-first implementations emit coverage summaries (with sparse-coverage hints that point to outlier WCS footprints), and a guarded `global_wcs_autocrop_enabled + margin` flag auto-crops the final mosaic/coverage while updating the in-memory global plan/WCS so downstream consumers inherit the tightened canvas dimensions.
 - [x] 2025-11-16: Task N (Qt filter footprints & WCS write toggle) — `FilterQtDialog` now exposes “Draw WCS footprints” and “Write WCS to file” checkboxes, reuses any `footprint_radec` metadata attached to input items (falling back to on-demand WCS/shape extraction from FITS headers) to draw coloured rectangles over the Matplotlib sky preview, and routes the write toggle through `_DirectoryScanWorker`/`solve_with_astap(...)` so successful ASTAP solves can update on-disk FITS headers; end-to-end visual validation on a real WCS-enabled dataset is still pending (checkbox “validate behaviour on dataset” under Task N remains intentionally unchecked).
+- [x] 2025-11-16: Task O (Qt Phase 4.5 regression guard) — Added `_disable_phase45_config(...)` and now call it during config load/save, widget sync, and worker argument preparation so `inter_master_merge_enable` is forced to `False` even if a stale config or manual edit tried to re-enable Phase 4.5. The UI remains gated behind `ENABLE_PHASE45_UI = False`, and Qt mirrors Tk by refusing to send Phase 4.5 to the worker; manual Tk↔Qt config round-trips will be re-run in the next GUI test session, but static inspection confirms the persisted snapshots and in-memory state stay disabled.
 - [x] 2025-11-15: Console-only Astropy SIP/WCS warning — During some filter runs, the console printed the following message without any entry in `zemosaic_worker.log`:
 
   ```text

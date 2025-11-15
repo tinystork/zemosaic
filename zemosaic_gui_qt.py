@@ -662,7 +662,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         # Phase 4.5 (inter-master merge) must not be user-activable from Qt.
         # Force the flag off regardless of persisted config so the worker never
         # receives an enabled state from this GUI.
-        self.config["inter_master_merge_enable"] = False
+        self._disable_phase45_config()
         self.localizer = self._create_localizer(self.config.get("language", "en"))
         self.setWindowTitle(
             self._tr("qt_window_title_preview", "ZeMosaic (Qt Preview)")
@@ -2815,6 +2815,21 @@ class ZeMosaicQtMainWindow(QMainWindow):
             target[key] = gpu_enabled
         return changed
 
+    def _disable_phase45_config(
+        self, mapping: MutableMapping[str, Any] | None = None
+    ) -> None:
+        """
+        Ensure the Qt GUI never enables Phase 4.5 / super-tiles.
+
+        Even if a config file or legacy Tk session left ``inter_master_merge_enable``
+        enabled, the Qt backend must force it off so the worker never receives a
+        True value from this interface (Task O regression guard).
+        """
+        target = mapping if mapping is not None else getattr(self, "config", None)
+        if target is None:
+            return
+        target["inter_master_merge_enable"] = False
+
     def _collect_config_from_widgets(self) -> None:
         for key, binding in self._config_fields.items():
             kind = binding["kind"]
@@ -2859,6 +2874,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
             self.config[key] = raw_value
         self._synchronize_gpu_config_keys()
+        self._disable_phase45_config()
 
     def _baseline_default_config(self) -> Dict[str, Any]:
         defaults: Dict[str, Any] = {}
@@ -3070,9 +3086,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
             merged_config.get("use_gpu_stack"), gpu_enabled
         )
         self._synchronize_gpu_config_keys(merged_config)
+        self._disable_phase45_config(merged_config)
 
         loaded_snapshot = dict(config_data)
         self._synchronize_gpu_config_keys(loaded_snapshot)
+        self._disable_phase45_config(loaded_snapshot)
         self._loaded_config_snapshot = loaded_snapshot
         self._persisted_config_keys = set(config_data.keys()) | set(
             self._default_config_values.keys()
@@ -3132,7 +3150,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._synchronize_gpu_config_keys(snapshot)
         # Phase 4.5 remains disabled for this release; never persist an enabled
         # state from the Qt GUI, even if an older config file contained True.
-        snapshot["inter_master_merge_enable"] = False
+        self._disable_phase45_config(snapshot)
         return snapshot
 
     def _save_config(self) -> None:
@@ -4232,6 +4250,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self, *, skip_filter_ui: bool
     ) -> tuple[Tuple[Any, ...], Dict[str, Any]]:
         cfg = self.config
+        self._disable_phase45_config(cfg)
 
         def _coerce_str(value: Any, default: str = "") -> str:
             if value is None:
