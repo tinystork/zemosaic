@@ -285,6 +285,122 @@ Implementation notes (2025-11 audit):
 
 
 ---
+## Task K — Phase 4.5 UI parity (Tk vs Qt main window)
+
+**Goal:**  
+Ensure the PySide6 main GUI (`zemosaic_gui_qt.py`) behaves like the Tk main GUI (`zemosaic_gui.py`) regarding Phase 4.5 / “super-tiles”:  
+for this release, Phase 4.5 must **not be user-exposed** in Qt, while keeping runtime logs and overlays working.
+
+**Detailed requirements:**
+
+- [x] Hide or remove the Phase 4.5 / super-tiles group from the Qt main window:
+  - No visible `QGroupBox` / controls for:
+    - `inter_master_merge_enable`
+    - `inter_master_overlap_threshold`
+    - `inter_master_stack_method`
+    - `inter_master_min_group_size`, `inter_master_max_group`
+    - `inter_master_memmap_policy`
+    - `inter_master_local_scale`
+    - `inter_master_photometry_intragroup`, `inter_master_photometry_intersuper`
+    - `inter_master_photometry_clip_sigma`
+  - It is acceptable to keep the code behind a constant like `ENABLE_PHASE45_UI = False`, but the user must not see those controls.
+
+- [x] Mirror Tk behaviour for configuration:
+  - Force `config["inter_master_merge_enable"] = False` after loading config in `zemosaic_gui_qt.py`.
+  - Ensure Qt never writes `True` to `inter_master_merge_enable` when saving config.
+  - Verify that switching between Tk and Qt backends keeps Phase 4.5 disabled in the saved config.
+
+- [x] Preserve Phase 4.5 runtime feedback:
+  - Do **not** remove worker-side Phase 4.5 logic in `zemosaic_worker.py`.
+  - Keep Qt handlers that consume Phase 4.5-related payloads (status lines, overlays, “Phase 4.5 idle/complete” messages).
+  - Ensure the Qt main window still logs/prints Phase 4.5 events exactly like Tk, even though the user cannot enable/disable Phase 4.5 from the GUI.
+
+- [x] Add a short note in this file once the parity is verified (e.g. “Qt main hides Phase 4.5; config and logs match Tk”).
+
+**Implementation notes:**
+
+- Use `zemosaic_gui.py` as behaviour reference; Qt is allowed to structure widgets differently, but not to expose extra knobs.
+- When in doubt, inspect the Tk code path that sets/reads `inter_master_merge_enable` and replicate the same semantics in Qt.
+- Test with:
+  - Tk main → run & save config → open Qt main and verify there are no Phase 4.5 controls and the flag remains `False`.
+  - Qt main → run & save config → reopen with Tk and verify Phase 4.5 is still disabled and behaves like before the Qt port.
+
+---
+## Task L — Qt Filter GUI feature & layout parity
+
+**Goal:**  
+Bring `zemosaic_filter_gui_qt.py` to **full functional and UX parity** with the Tk filter GUI (`zemosaic_filter_gui.py`):  
+same features, same return values, and a similar layout/flow, so users can switch backends without losing any filter capability.
+
+**Detailed requirements:**
+
+- [ ] Feature parity with Tk filter:
+  - Implement stream/continuous scan mode (`stream_mode=True`) in Qt, including:
+    - Directory crawling.
+    - Recursive scan toggle.
+    - Exclusion rules (`EXCLUDED_DIRS`, `is_path_excluded`).
+  - Mirror instrument detection and summary:
+    - Seestar S50/S30, ASIAIR, generic INSTRUME, etc.
+    - Same headers/heuristics as Tk.
+  - Expose WCS-related indicators:
+    - Show which frames are already solved vs not solved.
+    - Count and display `resolved_wcs_count`.
+  - Reproduce grouping / clustering / pre-plan logic:
+    - Master groups / preplan handling.
+    - Any autosplit behaviour (e.g. `autosplit_cap`) used by the worker.
+  - Integrate ZeQualityMT-based quality filtering:
+    - Use the same thresholds & calls as in Tk.
+    - Provide clear UI to enable/disable quality gate, and list how many frames were rejected.
+  - Apply ASTAP concurrency / solver settings parity:
+    - Respect `solver_settings_dict` and `config_overrides`.
+    - Configure ASTAP CLI (path, search radius, downsample, sensitivity, timeout).
+    - Use the same concurrency limit helper (`set_astap_max_concurrent_instances(...)`), if present.
+
+- [ ] Return value and overrides parity:
+  - Ensure the Qt entry point returns the exact same tuple structure as Tk:
+    ```python
+    filtered_list, accepted, overrides_dict
+    ```
+  - `overrides_dict` must contain the same keys as the Tk implementation when applicable, including at least:
+    - `"preplan_master_groups"`
+    - `"autosplit_cap"`
+    - `"filter_excluded_indices"`
+    - `"resolved_wcs_count"`
+    - Any additional keys used by the worker and documented in `zemosaic_filter_gui.py`.
+  - Verify that the worker behaves identically when fed the Qt filter result vs the Tk filter result on the same dataset.
+
+- [ ] Layout / UX parity:
+  - Reproduce the main sections of the Tk filter window as Qt `QGroupBox` / panels:
+    - Instrument summary.
+    - File list / frame table (e.g. `QTableWidget` or `QTreeWidget` with similar columns).
+    - Clustering / grouping controls.
+    - Quality / ZeQualityMT controls.
+    - Global WCS / Mosaic-first controls (complementing Task H).
+    - Log / status area.
+  - Keep the **flow** as close as possible to Tk:
+    - Scan / analyse.
+    - Inspect & toggle frames.
+    - Adjust options (quality, clustering, pre-plan).
+    - Validate (`OK`) or cancel (`Cancel`) with the same semantics.
+
+- [ ] Logging & responsiveness:
+  - Add a clear log/status panel showing:
+    - Scan start/end.
+    - Number of files found / filtered.
+    - Grouping and WCS analysis steps.
+    - ZeQualityMT decisions (e.g. “N frames rejected by quality gate”).
+  - Ensure the Qt filter dialog remains responsive during long operations (use signals/slots, `QThread` or worker threads as appropriate).
+
+- [ ] Update this file once parity is validated:
+  - Mark the items above as `[x]` when implemented and tested on at least one real-world dataset (e.g. Seestar S50 mosaic).
+
+**Implementation notes:**
+
+- Treat `zemosaic_filter_gui.py` as the canonical reference for logic and UX; Qt should **call the same helpers**, not reimplement the business logic.
+- Task H focuses on global WCS / Mosaic-first parity; Task L completes the rest of the feature and layout parity for the filter GUI.
+- When in doubt, diff the Tk filter’s `launch_filter_interface` and associated classes/methods and mirror their behaviour in Qt.
+
+---
 
 ## Notes / Known Issues
 
@@ -302,3 +418,5 @@ Implementation notes (2025-11 audit):
 - [x] 2025-11-15: Task H parity check — Reviewed Tk vs Qt filter global-WCS/SDS paths (`zemosaic_filter_gui.py`, `zemosaic_filter_gui_qt.py`) and worker global-plan logic (`zemosaic_worker.py`), and confirmed that both GUIs emit matching `global_wcs_*` overrides and `sds_mode`/`mode` flags into `filter_overrides` so `_prepare_global_wcs_plan` and `_runtime_build_global_wcs_plan` reuse descriptors and surface the same `global_coadd_*`/`sds_*` log keys. Also ran `pytest -q tests/test_sds_postprocessing.py -s` to exercise the SDS post-stack pipeline; no GUI-level regressions were detected, but a full Seestar dataset run is still recommended outside this harness for end-to-end visual validation.
 - [x] 2025-11-15: Task I implemented — Qt `_on_worker_finished` now distinguishes clean completion, user cancellation, and worker errors; user-triggered cancellations (including filter aborts and Stop-button requests) are surfaced as `log_key_processing_cancelled` at WARN level without hard-error dialogs, successful runs prompt to open the output folder using the same localized strings and platform-specific launch logic as Tk, and the shared `_set_processing_state(False)`/timer helpers ensure ETA, elapsed time, files/tiles counters, and phase labels are reset consistently when runs end under both backends.
 - [x] 2025-11-15: Task J parity audit — Using the bundled example dataset, captured Tk vs Qt `zemosaic_config.json` snapshots for classic and SDS/GPU-on sessions and confirmed that shared keys (GPU, quality crop/gate, coverage/two-pass, language, SDS) match; additionally instrumented both GUIs headlessly to log the full `run_hierarchical_mosaic_process` argument tuples and verified that positional worker arguments and solver settings align for these scenarios, modulo benign differences where Qt includes an explicit `astap_max_instances` hint and Tk eagerly normalizes an empty memmap directory to the output folder (mirroring the worker’s own `(coadd_memmap_dir or output_folder)` fallback).
+- [x] 2025-11-15: Task K (Qt Phase 4.5 UI parity) — Updated `zemosaic_gui_qt.py` so the Phase 4.5 / super-tiles configuration group is guarded behind `ENABLE_PHASE45_UI = False` and therefore hidden from users, forced `config[\"inter_master_merge_enable\"] = False` after loading configuration and before any worker invocation, ensured `_serialize_config_for_save` always persists `inter_master_merge_enable = False`, and confirmed that all Phase 4.5 runtime handlers (signals, logs, and overlay widgets) remain wired identically to the Tk backend for worker-emitted `phase45_event` payloads.
+- [ ] 2025-11-15: Task L in progress — Extended `FilterQtDialog` so the Qt filter GUI now honours stream-scan directory exclusions via `_iter_normalized_entries(...)`, exposes a recursive “Scan subfolders” toggle bound to `scan_recursive`, surfaces WCS state in a dedicated column and `resolved_wcs_count` override, adds `filter_excluded_indices` to the overrides payload based on unchecked rows, wires ASTAP concurrency through `astap_max_instances` and `set_astap_max_concurrent_instances(...)`, and introduces a scrollable log panel that records scan progress and clustering summaries; a future dataset-level audit is still required before marking the Task L checkboxes as completed.

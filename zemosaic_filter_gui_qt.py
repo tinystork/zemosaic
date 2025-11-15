@@ -886,6 +886,8 @@ class FilterQtDialog(QDialog):
         )
 
         self._preview_canvas = self._create_preview_canvas()
+        self._log_output: QPlainTextEdit | None = None
+        self._scan_recursive_checkbox: QCheckBox | None = None
         self._build_ui()
         if self._stream_scan:
             self._prepare_streaming_mode(raw_files_with_wcs_or_dir, initial_overrides)
@@ -1013,20 +1015,27 @@ class FilterQtDialog(QDialog):
         main_layout.addWidget(splitter)
 
         control_group = QGridLayout()
-        self._run_analysis_btn = QPushButton(self._localizer.get("filter.button.run_scan", "Run analysis"), self)
+        self._run_analysis_btn = QPushButton(
+            self._localizer.get("filter.button.run_scan", "Run analysis"), self
+        )
         self._run_analysis_btn.clicked.connect(self._on_run_analysis)  # type: ignore[arg-type]
         control_group.addWidget(self._run_analysis_btn, 0, 0)
 
         control_row = QGridLayout()
-        select_all_btn = QPushButton(self._localizer.get("filter.button.select_all", "Select all"), self)
-        select_none_btn = QPushButton(self._localizer.get("filter.button.select_none", "Select none"), self)
+        select_all_btn = QPushButton(
+            self._localizer.get("filter.button.select_all", "Select all"), self
+        )
+        select_none_btn = QPushButton(
+            self._localizer.get("filter.button.select_none", "Select none"), self
+        )
         select_all_btn.clicked.connect(self._select_all)  # type: ignore[arg-type]
         select_none_btn.clicked.connect(self._select_none)  # type: ignore[arg-type]
         control_row.addWidget(select_all_btn, 0, 0)
         control_row.addWidget(select_none_btn, 0, 1)
         control_row.addWidget(self._summary_label, 0, 2)
         control_row.setColumnStretch(2, 1)
-        control_group.addLayout(control_row, 0, 1, 2, 1)
+        control_group.addLayout(control_row, 0, 1, 1, 1)
+
         progress_row = QGridLayout()
         progress_row.addWidget(self._status_label, 0, 0)
         progress_row.addWidget(self._progress_bar, 0, 1)
@@ -1036,6 +1045,21 @@ class FilterQtDialog(QDialog):
 
         options_box = self._create_options_box()
         main_layout.addWidget(options_box)
+
+        log_group_box = QGroupBox(
+            self._localizer.get("filter.group.log", "Scan / grouping log"), self
+        )
+        log_layout = QVBoxLayout(log_group_box)
+        self._log_output = QPlainTextEdit(log_group_box)
+        self._log_output.setReadOnly(True)
+        self._log_output.setMaximumBlockCount(500)
+        placeholder = self._localizer.get(
+            "filter.log.placeholder",
+            "Scan, clustering, and WCS messages will appear here.",
+        )
+        self._log_output.setPlaceholderText(placeholder)
+        log_layout.addWidget(self._log_output)
+        main_layout.addWidget(log_group_box)
 
         button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, parent=self)
         button_box.accepted.connect(self.accept)
@@ -1254,6 +1278,7 @@ class FilterQtDialog(QDialog):
             summary_display = summary_formatted
 
         self._summary_label.setText(summary_display)
+        self._append_log(summary_display)
 
     def _create_options_box(self):
         from PySide6.QtWidgets import QCheckBox, QGroupBox
@@ -1285,8 +1310,29 @@ class FilterQtDialog(QDialog):
         self._populate_astap_instances_combo()
         layout.addWidget(self._astap_instances_combo)
 
+        self._scan_recursive_checkbox = QCheckBox(
+            self._localizer.get("filter.option.scan_recursive", "Scan subfolders (recursive)"),
+            box,
+        )
+        self._scan_recursive_checkbox.setChecked(self._scan_recursive)
+        self._scan_recursive_checkbox.toggled.connect(self._on_scan_recursive_toggled)  # type: ignore[arg-type]
+        layout.addWidget(self._scan_recursive_checkbox)
+
         layout.addStretch(1)
         return box
+
+    def _append_log(self, message: str) -> None:
+        if not message:
+            return
+        if self._log_output is None:
+            return
+        try:
+            self._log_output.appendPlainText(str(message))
+        except Exception:
+            pass
+
+    def _on_scan_recursive_toggled(self, checked: bool) -> None:
+        self._scan_recursive = bool(checked)
 
     def _on_run_analysis(self) -> None:
         if self._streaming_active and self._stream_thread is not None and self._stream_thread.isRunning():
@@ -2046,6 +2092,19 @@ class FilterQtDialog(QDialog):
         if resolved_count:
             overrides["resolved_wcs_count"] = int(resolved_count)
 
+        excluded_indices: list[int] = []
+        try:
+            for idx, _entry in enumerate(self._normalized_items):
+                item = self._table.item(idx, 0)
+                if item is None:
+                    continue
+                if item.checkState() != Qt.Checked:
+                    excluded_indices.append(idx)
+        except Exception:
+            excluded_indices = []
+        if excluded_indices:
+            overrides["filter_excluded_indices"] = excluded_indices
+
         metadata_update = self._build_metadata_overrides(overrides)
 
         sds_flag = bool(metadata_update.get("sds_mode"))
@@ -2115,6 +2174,7 @@ class FilterQtDialog(QDialog):
                 self._status_label.setText(message)
             except Exception:
                 pass
+            self._append_log(message)
 
     def _on_scan_row_update(self, row: int, payload: dict) -> None:
         if not (0 <= row < len(self._normalized_items)):
@@ -2153,15 +2213,16 @@ class FilterQtDialog(QDialog):
             self._status_label.setText(message)
         except Exception:
             pass
+        self._append_log(message)
 
     def _on_scan_finished(self) -> None:
         if self._run_analysis_btn is not None:
             self._run_analysis_btn.setEnabled(True)
         self._scan_thread = None
         self._scan_worker = None
-        self._status_label.setText(
-            self._localizer.get("filter.scan.completed", "Analysis completed.")
-        )
+        completed_text = self._localizer.get("filter.scan.completed", "Analysis completed.")
+        self._status_label.setText(completed_text)
+        self._append_log(completed_text)
         self._progress_bar.setValue(100)
         self._update_summary_label()
         self._schedule_preview_refresh()

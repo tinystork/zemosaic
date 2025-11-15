@@ -151,6 +151,12 @@ else:  # pragma: no cover - optional dependency guard
     set_astap_max_concurrent_instances = None  # type: ignore[assignment]
 
 
+# Phase 4.5 / super-tiles configuration UI is intentionally hidden for this release.
+# The worker-side implementation and overlays remain available, but users must not
+# be able to toggle Phase 4.5 from the Qt main window.
+ENABLE_PHASE45_UI = False
+
+
 def _load_zemosaic_qicon() -> QIcon | None:
     """Return a QIcon for ZeMosaic using the best available icon file."""
     try:
@@ -653,6 +659,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._persisted_config_keys: set[str] = set()
         self._default_config_values: Dict[str, Any] = self._baseline_default_config()
         self.config: Dict[str, Any] = self._load_config()
+        # Phase 4.5 (inter-master merge) must not be user-activable from Qt.
+        # Force the flag off regardless of persisted config so the worker never
+        # receives an enabled state from this GUI.
+        self.config["inter_master_merge_enable"] = False
         self.localizer = self._create_localizer(self.config.get("language", "en"))
         self.setWindowTitle(
             self._tr("qt_window_title_preview", "ZeMosaic (Qt Preview)")
@@ -1185,147 +1195,148 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "type": str,
         }
 
-        phase45_box = QGroupBox(
-            self._tr("qt_group_phase45", "Phase 4.5 / Super-tiles"),
-            group,
-        )
-        phase45_layout = QFormLayout(phase45_box)
-        phase45_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        if ENABLE_PHASE45_UI:
+            phase45_box = QGroupBox(
+                self._tr("qt_group_phase45", "Phase 4.5 / Super-tiles"),
+                group,
+            )
+            phase45_layout = QFormLayout(phase45_box)
+            phase45_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
 
-        self._register_checkbox(
-            "inter_master_merge_enable",
-            phase45_layout,
-            self._tr("qt_checkbox_phase45_enable", "Enable inter-master merge"),
-        )
+            self._register_checkbox(
+                "inter_master_merge_enable",
+                phase45_layout,
+                self._tr("qt_checkbox_phase45_enable", "Enable inter-master merge"),
+            )
 
-        overlap_spinbox = QDoubleSpinBox()
-        overlap_spinbox.setRange(0.0, 100.0)
-        overlap_spinbox.setDecimals(1)
-        overlap_spinbox.setSingleStep(0.5)
-        overlap_fraction = float(self.config.get("inter_master_overlap_threshold", 0.60))
-        if not 0.0 <= overlap_fraction <= 1.0:
-            overlap_fraction = 0.60
-            self.config["inter_master_overlap_threshold"] = overlap_fraction
-        overlap_spinbox.setValue(overlap_fraction * 100.0)
-        phase45_layout.addRow(
-            QLabel(self._tr("qt_field_phase45_overlap", "Overlap ≥ (%)")),
-            overlap_spinbox,
-        )
-        self._config_fields["inter_master_overlap_threshold"] = {
-            "kind": "double_spinbox",
-            "widget": overlap_spinbox,
-            "type": float,
-            "value_getter": overlap_spinbox.value,
-            "postprocess": lambda value: max(0.0, min(1.0, float(value) / 100.0)),
-        }
+            overlap_spinbox = QDoubleSpinBox()
+            overlap_spinbox.setRange(0.0, 100.0)
+            overlap_spinbox.setDecimals(1)
+            overlap_spinbox.setSingleStep(0.5)
+            overlap_fraction = float(self.config.get("inter_master_overlap_threshold", 0.60))
+            if not 0.0 <= overlap_fraction <= 1.0:
+                overlap_fraction = 0.60
+                self.config["inter_master_overlap_threshold"] = overlap_fraction
+            overlap_spinbox.setValue(overlap_fraction * 100.0)
+            phase45_layout.addRow(
+                QLabel(self._tr("qt_field_phase45_overlap", "Overlap ≥ (%)")),
+                overlap_spinbox,
+            )
+            self._config_fields["inter_master_overlap_threshold"] = {
+                "kind": "double_spinbox",
+                "widget": overlap_spinbox,
+                "type": float,
+                "value_getter": overlap_spinbox.value,
+                "postprocess": lambda value: max(0.0, min(1.0, float(value) / 100.0)),
+            }
 
-        method_combo = QComboBox()
-        method_options = [
-            ("winsor", self._tr("qt_phase45_method_winsor", "Winsorized")),
-            ("mean", self._tr("qt_phase45_method_mean", "Mean")),
-            ("median", self._tr("qt_phase45_method_median", "Median")),
-        ]
-        for value, label in method_options:
-            method_combo.addItem(label, value)
-        current_method = str(self.config.get("inter_master_stack_method", "winsor")).lower()
-        method_index = next(
-            (idx for idx, (value, _label) in enumerate(method_options) if value == current_method),
-            0,
-        )
-        method_combo.setCurrentIndex(method_index)
-        phase45_layout.addRow(
-            QLabel(self._tr("qt_field_phase45_method", "Stack method")),
-            method_combo,
-        )
-        self._config_fields["inter_master_stack_method"] = {
-            "kind": "combobox",
-            "widget": method_combo,
-            "type": str,
-        }
+            method_combo = QComboBox()
+            method_options = [
+                ("winsor", self._tr("qt_phase45_method_winsor", "Winsorized")),
+                ("mean", self._tr("qt_phase45_method_mean", "Mean")),
+                ("median", self._tr("qt_phase45_method_median", "Median")),
+            ]
+            for value, label in method_options:
+                method_combo.addItem(label, value)
+            current_method = str(self.config.get("inter_master_stack_method", "winsor")).lower()
+            method_index = next(
+                (idx for idx, (value, _label) in enumerate(method_options) if value == current_method),
+                0,
+            )
+            method_combo.setCurrentIndex(method_index)
+            phase45_layout.addRow(
+                QLabel(self._tr("qt_field_phase45_method", "Stack method")),
+                method_combo,
+            )
+            self._config_fields["inter_master_stack_method"] = {
+                "kind": "combobox",
+                "widget": method_combo,
+                "type": str,
+            }
 
-        self._register_spinbox(
-            "inter_master_min_group_size",
-            phase45_layout,
-            self._tr("qt_field_phase45_min_group", "Minimum group size"),
-            minimum=2,
-            maximum=512,
-        )
-        self._register_spinbox(
-            "inter_master_max_group",
-            phase45_layout,
-            self._tr("qt_field_phase45_max_group", "Maximum group size"),
-            minimum=2,
-            maximum=2048,
-        )
+            self._register_spinbox(
+                "inter_master_min_group_size",
+                phase45_layout,
+                self._tr("qt_field_phase45_min_group", "Minimum group size"),
+                minimum=2,
+                maximum=512,
+            )
+            self._register_spinbox(
+                "inter_master_max_group",
+                phase45_layout,
+                self._tr("qt_field_phase45_max_group", "Maximum group size"),
+                minimum=2,
+                maximum=2048,
+            )
 
-        memmap_combo = QComboBox()
-        memmap_options = [
-            ("auto", self._tr("qt_phase45_memmap_auto", "Auto")),
-            ("always", self._tr("qt_phase45_memmap_always", "Always")),
-            ("never", self._tr("qt_phase45_memmap_never", "Never")),
-        ]
-        for value, label in memmap_options:
-            memmap_combo.addItem(label, value)
-        current_policy = str(self.config.get("inter_master_memmap_policy", "auto")).lower()
-        memmap_index = next(
-            (idx for idx, (value, _label) in enumerate(memmap_options) if value == current_policy),
-            0,
-        )
-        memmap_combo.setCurrentIndex(memmap_index)
-        phase45_layout.addRow(
-            QLabel(self._tr("qt_field_phase45_memmap", "Memmap policy")),
-            memmap_combo,
-        )
-        self._config_fields["inter_master_memmap_policy"] = {
-            "kind": "combobox",
-            "widget": memmap_combo,
-            "type": str,
-        }
+            memmap_combo = QComboBox()
+            memmap_options = [
+                ("auto", self._tr("qt_phase45_memmap_auto", "Auto")),
+                ("always", self._tr("qt_phase45_memmap_always", "Always")),
+                ("never", self._tr("qt_phase45_memmap_never", "Never")),
+            ]
+            for value, label in memmap_options:
+                memmap_combo.addItem(label, value)
+            current_policy = str(self.config.get("inter_master_memmap_policy", "auto")).lower()
+            memmap_index = next(
+                (idx for idx, (value, _label) in enumerate(memmap_options) if value == current_policy),
+                0,
+            )
+            memmap_combo.setCurrentIndex(memmap_index)
+            phase45_layout.addRow(
+                QLabel(self._tr("qt_field_phase45_memmap", "Memmap policy")),
+                memmap_combo,
+            )
+            self._config_fields["inter_master_memmap_policy"] = {
+                "kind": "combobox",
+                "widget": memmap_combo,
+                "type": str,
+            }
 
-        scale_combo = QComboBox()
-        scale_options = [
-            ("final", self._tr("qt_phase45_scale_final", "Final scale")),
-            ("native", self._tr("qt_phase45_scale_native", "Native scale")),
-        ]
-        for value, label in scale_options:
-            scale_combo.addItem(label, value)
-        current_scale = str(self.config.get("inter_master_local_scale", "final")).lower()
-        scale_index = next(
-            (idx for idx, (value, _label) in enumerate(scale_options) if value == current_scale),
-            0,
-        )
-        scale_combo.setCurrentIndex(scale_index)
-        phase45_layout.addRow(
-            QLabel(self._tr("qt_field_phase45_local_scale", "Local scale")),
-            scale_combo,
-        )
-        self._config_fields["inter_master_local_scale"] = {
-            "kind": "combobox",
-            "widget": scale_combo,
-            "type": str,
-        }
+            scale_combo = QComboBox()
+            scale_options = [
+                ("final", self._tr("qt_phase45_scale_final", "Final scale")),
+                ("native", self._tr("qt_phase45_scale_native", "Native scale")),
+            ]
+            for value, label in scale_options:
+                scale_combo.addItem(label, value)
+            current_scale = str(self.config.get("inter_master_local_scale", "final")).lower()
+            scale_index = next(
+                (idx for idx, (value, _label) in enumerate(scale_options) if value == current_scale),
+                0,
+            )
+            scale_combo.setCurrentIndex(scale_index)
+            phase45_layout.addRow(
+                QLabel(self._tr("qt_field_phase45_local_scale", "Local scale")),
+                scale_combo,
+            )
+            self._config_fields["inter_master_local_scale"] = {
+                "kind": "combobox",
+                "widget": scale_combo,
+                "type": str,
+            }
 
-        self._register_checkbox(
-            "inter_master_photometry_intragroup",
-            phase45_layout,
-            self._tr("qt_field_phase45_intragroup", "Intra-group photometry"),
-        )
-        self._register_checkbox(
-            "inter_master_photometry_intersuper",
-            phase45_layout,
-            self._tr("qt_field_phase45_intersuper", "Inter-super photometry"),
-        )
-        self._register_double_spinbox(
-            "inter_master_photometry_clip_sigma",
-            phase45_layout,
-            self._tr("qt_field_phase45_clip_sigma", "Photometry clip σ"),
-            minimum=0.1,
-            maximum=10.0,
-            single_step=0.1,
-            decimals=2,
-        )
+            self._register_checkbox(
+                "inter_master_photometry_intragroup",
+                phase45_layout,
+                self._tr("qt_field_phase45_intragroup", "Intra-group photometry"),
+            )
+            self._register_checkbox(
+                "inter_master_photometry_intersuper",
+                phase45_layout,
+                self._tr("qt_field_phase45_intersuper", "Inter-super photometry"),
+            )
+            self._register_double_spinbox(
+                "inter_master_photometry_clip_sigma",
+                phase45_layout,
+                self._tr("qt_field_phase45_clip_sigma", "Photometry clip σ"),
+                minimum=0.1,
+                maximum=10.0,
+                single_step=0.1,
+                decimals=2,
+            )
 
-        layout.addRow(phase45_box)
+            layout.addRow(phase45_box)
 
         return group
 
@@ -3164,6 +3175,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
                     self._loaded_config_snapshot[key]
                 )
         self._synchronize_gpu_config_keys(snapshot)
+        # Phase 4.5 remains disabled for this release; never persist an enabled
+        # state from the Qt GUI, even if an older config file contained True.
+        snapshot["inter_master_merge_enable"] = False
         return snapshot
 
     def _save_config(self) -> None:
