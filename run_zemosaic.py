@@ -1,50 +1,50 @@
-# zemosaic/run_zemosaic.py
 """
-╔══════════════════════════════════════════════════════════════════════╗
-║ ZeMosaic / ZeSeestarStacker Project                                  ║
-║                                                                      ║
-║ Auteur  : Tinystork, seigneur des couteaux à beurre (aka Tristan Nauleau)  
-║ Partenaire : J.A.R.V.I.S. (/ˈdʒɑːrvɪs/) — Just a Rather Very Intelligent System  
-║              (aka ChatGPT, Grand Maître du ciselage de code)         ║
-║                                                                      ║
-║ Licence : GNU General Public License v3.0 (GPL-3.0)                  ║
-║                                                                      ║
-║ Description :                                                        ║
-║   Ce programme a été forgé à la lueur des pixels et de la caféine,   ║
-║   dans le but noble de transformer des nuages de photons en art      ║
-║   astronomique. Si vous l’utilisez, pensez à dire “merci”,           ║
-║   à lever les yeux vers le ciel, ou à citer Tinystork et J.A.R.V.I.S.║
-║   (le karma des développeurs en dépend).                             ║
-║                                                                      ║
-║ Avertissement :                                                      ║
-║   Aucune IA ni aucun couteau à beurre n’a été blessé durant le       ║
-║   développement de ce code.                                          ║
-╚══════════════════════════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════════════════════════════════════╗
+║ ZeMosaic / ZeSeestarStacker Project                                               ║
+║                                                                                   ║
+║ Auteur  : Tinystork, seigneur des couteaux à beurre (aka Tristan Nauleau)         ║
+║ Partenaire : J.A.R.V.I.S. (/ˈdʒɑːrvɪs/) — Just a Rather Very Intelligent System   ║
+║              (aka ChatGPT, Grand Maître du ciselage de code)                      ║
+║                                                                                   ║
+║ Licence : GNU General Public License v3.0 (GPL-3.0)                               ║
+║                                                                                   ║
+║ Description :                                                                     ║
+║   Ce programme a été forgé à la lueur des pixels et de la caféine,                ║
+║   dans le but noble de transformer des nuages de photons en art                   ║
+║   astronomique. Si vous l’utilisez, pensez à dire “merci”,                        ║
+║   à lever les yeux vers le ciel, ou à citer Tinystork et J.A.R.V.I.S.             ║
+║   (le karma des développeurs en dépend).                                          ║
+║                                                                                   ║
+║ Avertissement :                                                                   ║
+║   Aucune IA ni aucun couteau à beurre n’a été blessé durant le                    ║
+║   développement de ce code.                                                       ║
+╚═══════════════════════════════════════════════════════════════════════════════════╝
 
 
-╔══════════════════════════════════════════════════════════════════════╗
-║ ZeMosaic / ZeSeestarStacker Project                                  ║
-║                                                                      ║
-║ Author  : Tinystork, Lord of the Butter Knives (aka Tristan Nauleau) ║
-║ Partner : J.A.R.V.I.S. (/ˈdʒɑːrvɪs/) — Just a Rather Very Intelligent System  
-║           (aka ChatGPT, Grand Master of Code Chiseling)              ║
-║                                                                      ║
-║ License : GNU General Public License v3.0 (GPL-3.0)                  ║
-║                                                                      ║
-║ Description:                                                         ║
-║   This program was forged under the sacred light of pixels and       ║
-║   caffeine, with the noble intent of turning clouds of photons into  ║
-║   astronomical art. If you use it, please consider saying “thanks,”  ║
-║   gazing at the stars, or crediting Tinystork and J.A.R.V.I.S. —     ║
-║   developer karma depends on it.                                     ║
-║                                                                      ║
-║ Disclaimer:                                                          ║
-║   No AIs or butter knives were harmed in the making of this code.    ║
-╚══════════════════════════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════════════════════════════════════╗
+║ ZeMosaic / ZeSeestarStacker Project                                               ║
+║                                                                                   ║
+║ Author  : Tinystork, Lord of the Butter Knives (aka Tristan Nauleau)              ║
+║ Partner : J.A.R.V.I.S. (/ˈdʒɑːrvɪs/) — Just a Rather Very Intelligent System      ║
+║           (aka ChatGPT, Grand Master of Code Chiseling)                           ║
+║                                                                                   ║
+║ License : GNU General Public License v3.0 (GPL-3.0)                               ║
+║                                                                                   ║
+║ Description:                                                                      ║
+║   This program was forged under the sacred light of pixels and                    ║
+║   caffeine, with the noble intent of turning clouds of photons into               ║
+║   astronomical art. If you use it, please consider saying “thanks,”               ║
+║   gazing at the stars, or crediting Tinystork and J.A.R.V.I.S. —                  ║
+║   developer karma depends on it.                                                  ║
+║                                                                                   ║
+║ Disclaimer:                                                                       ║
+║   No AIs or butter knives were harmed in the making of this code.                 ║
+╚═══════════════════════════════════════════════════════════════════════════════════╝
 """
 import sys  # Ajout pour sys.path et sys.modules
 import multiprocessing
 import os
+import importlib.util
 import platform
 # import reproject # L'import direct ici n'est pas crucial, mais ne fait pas de mal
 import tkinter as tk
@@ -128,6 +128,15 @@ print("DEBUG (run_zemosaic): sys.path complet:\n" + "\n".join(sys.path))
 print("-" * 50)
 
 
+def _is_pyside6_available() -> bool:
+    """Return True if the optional PySide6 dependency is installed.
+
+    Using importlib.util.find_spec avoids importing the whole Qt stack
+    just to check for availability and keeps startup overhead minimal.
+    """
+    return importlib.util.find_spec("PySide6") is not None
+
+
 def _notify_qt_backend_unavailable(error: Exception) -> None:
     """Inform the user that the Qt backend cannot be used."""
 
@@ -160,18 +169,30 @@ def _determine_backend(argv):
 
     The selection prioritises explicit command-line flags over the environment
     variable so that users can temporarily override their default preference.
-    Use ``--qt-gui`` to force the Qt backend or ``--tk-gui`` to force the
-    classic Tk interface regardless of :envvar:`ZEMOSAIC_GUI_BACKEND`.
+
+    Returns
+    -------
+    backend : str
+        "tk" or "qt".
+    cleaned_args : list[str]
+        argv without the backend flags.
+    explicit_choice : bool
+        True if the user explicitly selected a backend (env or flags).
     """
 
-    requested_backend = os.environ.get("ZEMOSAIC_GUI_BACKEND", "tk")
+    env_backend = os.environ.get("ZEMOSAIC_GUI_BACKEND")
+    requested_backend = env_backend or "tk"
+    explicit_choice = bool(env_backend)  # True if env var is defined
+
     cleaned_args = []
     for arg in argv:
         if arg == "--qt-gui":
             requested_backend = "qt"
+            explicit_choice = True
             continue
         if arg == "--tk-gui":
             requested_backend = "tk"
+            explicit_choice = True
             continue
         cleaned_args.append(arg)
 
@@ -183,7 +204,62 @@ def _determine_backend(argv):
         )
         backend = "tk"
 
-    return backend, cleaned_args
+    return backend, cleaned_args, explicit_choice
+
+
+def _interactive_backend_choice_if_needed(current_backend: str, *, explicit_choice: bool) -> str:
+    """
+    If the user did not explicitly choose a backend (no flags, no env var),
+    show a small Tk popup to propose switching to the Qt interface when
+    PySide6 is available.
+
+    This keeps the behaviour 100% backwards compatible for users who:
+    - already set ZEMOSAIC_GUI_BACKEND, or
+    - pass --qt-gui / --tk-gui on the command line.
+    """
+    # Do nothing if the backend was explicitly chosen
+    if explicit_choice:
+        return current_backend
+
+    # If PySide6 is not available, gently inform the user and stay on Tk
+    if not _is_pyside6_available():
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            messagebox.showinfo(
+                "ZeMosaic - Qt interface unavailable",
+                (
+                    "The new Qt-based interface requires the optional 'PySide6' "
+                    "dependency, which is not installed in this environment.\n\n"
+                    "ZeMosaic will continue with the classic Tk interface for now.\n\n"
+                    "You can install PySide6 later with:\n\n"
+                    "    pip install PySide6\n"
+                ),
+            )
+            root.destroy()
+        except Exception as tk_err:
+            print(f"[run_zemosaic] Unable to display Tk info dialog: {tk_err}")
+        return "tk"
+
+    # PySide6 is available: ask the user if they want to try the Qt UI
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        use_qt = messagebox.askyesno(
+            "ZeMosaic - Choose interface",
+            (
+                "A new Qt-based graphical interface is available.\n\n"
+                "Do you want to use it now?\n\n"
+                "  - Yes: Qt interface (PySide6)\n"
+                "  - No : classic Tk interface\n"
+            ),
+        )
+        root.destroy()
+    except Exception as tk_err:
+        print(f"[run_zemosaic] Unable to display Tk choice dialog: {tk_err}")
+        return current_backend
+
+    return "qt" if use_qt else "tk"
 
 
 def main(argv=None):
@@ -193,9 +269,13 @@ def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
 
-    backend, cleaned_args = _determine_backend(argv)
+    backend, cleaned_args, explicit_choice = _determine_backend(argv)
     if cleaned_args != argv:
         sys.argv = [sys.argv[0], *cleaned_args]
+
+    # Si l'utilisateur n'a rien forcé (ni flags, ni env),
+    # proposer un petit choix Tk/Qt via une popup Tkinter.
+    backend = _interactive_backend_choice_if_needed(backend, explicit_choice=explicit_choice)
 
     if backend == "qt":
         try:
