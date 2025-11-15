@@ -53,6 +53,7 @@ import importlib.util
 import os
 from pathlib import Path
 import math
+import csv
 from typing import Any, Iterable, Iterator, List, Sequence, Tuple
 
 
@@ -63,7 +64,7 @@ if _pyside_spec is None:  # pragma: no cover - import guard
         "Install PySide6 or use the Tk interface instead."
     )
 
-from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot, QTimer
+from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot, QTimer, QRect
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (  # noqa: E402  - imported after availability check
     QApplication,
@@ -78,12 +79,14 @@ from PySide6.QtWidgets import (  # noqa: E402  - imported after availability che
     QPushButton,
     QSplitter,
     QComboBox,
+    QDoubleSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QWidget,
     QVBoxLayout,
     QPlainTextEdit,
     QCheckBox,
+    QFileDialog,
 )
 
 
@@ -1051,10 +1054,18 @@ class FilterQtDialog(QDialog):
         self._progress_bar = QProgressBar(self)
         self._progress_bar.setRange(0, 100)
         self._run_analysis_btn: QPushButton | None = None
+        self._export_csv_btn: QPushButton | None = None
+        self._toolbar_maximize_btn: QPushButton | None = None
+        self._saved_geometry: QRect | None = None
+        self._maximized_state = False
+        self._distance_spin: QDoubleSpinBox | None = None
+        self._instrument_combo: QComboBox | None = None
+        self._instrument_unknown_token = "__unknown__"
         self._scan_thread: QThread | None = None
         self._scan_worker: _DirectoryScanWorker | None = None
         self._auto_group_checkbox: QCheckBox | None = None
         self._seestar_checkbox: QCheckBox | None = None
+        self._sds_checkbox: QCheckBox | None = None
         self._astap_instances_combo: QComboBox | None = None
         self._astap_instances_value = self._resolve_initial_astap_instances()
         self._preview_canvas: FigureCanvasQTAgg | None = None
@@ -1081,6 +1092,30 @@ class FilterQtDialog(QDialog):
         self._scan_recursive_checkbox: QCheckBox | None = None
         self._draw_footprints_checkbox: QCheckBox | None = None
         self._write_wcs_checkbox: QCheckBox | None = None
+        self._sds_mode_initial = self._coerce_bool(
+            (initial_overrides or {}).get("sds_mode")
+            if isinstance(initial_overrides, dict)
+            else None,
+            self._coerce_bool(
+                (config_overrides or {}).get("sds_mode")
+                if isinstance(config_overrides, dict)
+                else None,
+                self._coerce_bool(self._config_value("sds_mode_default", False), False),
+            ),
+        )
+        self._cache_csv_path: str | None = None
+        if self._stream_scan:
+            candidate_dir = None
+            if isinstance(raw_files_with_wcs_or_dir, (str, os.PathLike)):
+                candidate_dir = Path(raw_files_with_wcs_or_dir)
+            elif isinstance(raw_files_with_wcs_or_dir, Path):
+                candidate_dir = raw_files_with_wcs_or_dir
+            if candidate_dir is not None:
+                try:
+                    if candidate_dir.is_dir():
+                        self._cache_csv_path = str(candidate_dir / "headers_cache.csv")
+                except Exception:
+                    self._cache_csv_path = None
         self._build_ui()
         if self._stream_scan:
             self._prepare_streaming_mode(raw_files_with_wcs_or_dir, initial_overrides)
@@ -1157,6 +1192,468 @@ class FilterQtDialog(QDialog):
         self._preview_hint_label.setText(self._preview_default_hint)
         return canvas
 
+    def _create_toolbar_widget(self) -> QWidget:
+        """Build the top toolbar with status indicators and action buttons."""
+
+        container = QWidget(self)
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self._status_label.setWordWrap(True)
+        self._status_label.setText(
+            self._localizer.get("filter_status_ready", "Ready — click Analyse to scan.")
+        )
+        layout.addWidget(self._status_label, 1)
+
+        self._progress_bar.setTextVisible(False)
+        layout.addWidget(self._progress_bar, 0)
+
+        button_row = QHBoxLayout()
+        analyse_label = self._localizer.get("filter_btn_analyse", "Analyse")
+        self._run_analysis_btn = QPushButton(analyse_label, self)
+        self._run_analysis_btn.clicked.connect(self._on_run_analysis)  # type: ignore[arg-type]
+        button_row.addWidget(self._run_analysis_btn)
+
+        export_label = self._localizer.get("filter_btn_export_csv", "Export CSV")
+        self._export_csv_btn = QPushButton(export_label, self)
+        self._export_csv_btn.clicked.connect(self._on_export_csv)  # type: ignore[arg-type]
+        button_row.addWidget(self._export_csv_btn)
+
+        max_normal = self._localizer.get("filter_btn_maximize", "Maximize")
+        self._toolbar_maximize_btn = QPushButton(max_normal, self)
+        self._toolbar_maximize_btn.clicked.connect(self._toggle_maximize_restore)  # type: ignore[arg-type]
+        button_row.addWidget(self._toolbar_maximize_btn)
+
+        layout.addLayout(button_row)
+        return container
+
+    def _create_exclusion_box(self) -> QGroupBox:
+        """Create the 'Exclude by distance to center' controls."""
+
+        title = self._localizer.get(
+            "filter_exclude_by_distance_title",
+            "Exclude by distance to center",
+        )
+        group = QGroupBox(title, self)
+        layout = QHBoxLayout(group)
+        label = QLabel(self._localizer.get("filter_distance_label", "Distance (deg):"), group)
+        layout.addWidget(label)
+        spin = QDoubleSpinBox(group)
+        spin.setDecimals(1)
+        spin.setRange(0.1, 180.0)
+        spin.setSingleStep(0.5)
+        spin.setValue(5.0)
+        spin.setSuffix(" °")
+        self._distance_spin = spin
+        layout.addWidget(spin)
+        button = QPushButton(
+            self._localizer.get("filter_exclude_gt_x", "Exclude > X°"),
+            group,
+        )
+        button.clicked.connect(self._on_exclude_distance)  # type: ignore[arg-type]
+        layout.addWidget(button)
+        return group
+
+    def _create_instrument_row(self) -> QWidget:
+        """Create the instrument selection dropdown row."""
+
+        container = QGroupBox(
+            self._localizer.get("filter.instrument.group", "Instrument filter"),
+            self,
+        )
+        layout = QHBoxLayout(container)
+        label = QLabel(self._localizer.get("filter.instrument.label", "Instrument:"), container)
+        layout.addWidget(label)
+
+        self._instrument_combo = QComboBox(container)
+        self._instrument_combo.currentIndexChanged.connect(  # type: ignore[arg-type]
+            self._apply_instrument_filter
+        )
+        layout.addWidget(self._instrument_combo, 1)
+        self._refresh_instrument_options()
+        return container
+
+    def _create_wcs_controls_box(self) -> QGroupBox:
+        """Create the WCS / master-tile / SDS controls."""
+
+        title = self._localizer.get("filter.group.wcs", "WCS / Master tile controls")
+        box = QGroupBox(title, self)
+        layout = QGridLayout(box)
+
+        resolve_btn = QPushButton(
+            self._localizer.get("filter_btn_resolve_wcs", "Resolve missing WCS"),
+            box,
+        )
+        resolve_btn.clicked.connect(self._on_resolve_wcs_clicked)  # type: ignore[arg-type]
+        layout.addWidget(resolve_btn, 0, 0)
+
+        auto_btn = QPushButton(
+            self._localizer.get("filter_btn_auto_group", "Auto-organize Master Tiles"),
+            box,
+        )
+        auto_btn.clicked.connect(self._on_auto_group_clicked)  # type: ignore[arg-type]
+        layout.addWidget(auto_btn, 0, 1)
+
+        self._draw_footprints_checkbox = QCheckBox(
+            self._localizer.get("filter_chk_draw_footprints", "Draw WCS footprints"),
+            box,
+        )
+        self._draw_footprints_checkbox.setChecked(True)
+        self._draw_footprints_checkbox.toggled.connect(  # type: ignore[arg-type]
+            lambda _checked: self._schedule_preview_refresh()
+        )
+        layout.addWidget(self._draw_footprints_checkbox, 1, 0)
+
+        self._write_wcs_checkbox = QCheckBox(
+            self._localizer.get("filter_chk_write_wcs", "Write WCS to file"),
+            box,
+        )
+        self._write_wcs_checkbox.setChecked(True)
+        layout.addWidget(self._write_wcs_checkbox, 1, 1)
+
+        self._sds_checkbox = QCheckBox(
+            self._localizer.get("filter_chk_sds_mode", "Enable ZeSupaDupStack (SDS)"),
+            box,
+        )
+        self._sds_checkbox.setChecked(bool(self._sds_mode_initial))
+        layout.addWidget(self._sds_checkbox, 2, 0, 1, 2)
+
+        return box
+
+    def _refresh_instrument_options(self) -> None:
+        combo = self._instrument_combo
+        if combo is None:
+            return
+        instruments: set[str] = set()
+        has_unknown = False
+        for entry in self._normalized_items:
+            instrument = (entry.instrument or "").strip()
+            if instrument:
+                instruments.add(instrument)
+            else:
+                has_unknown = True
+
+        all_label = self._localizer.get("filter.instrument.all", "All")
+        unknown_label = self._localizer.get("filter.instrument.unknown", "Unknown")
+
+        current_data = combo.currentData()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem(all_label, None)
+        for name in sorted(instruments):
+            combo.addItem(name, name)
+        if has_unknown:
+            combo.addItem(unknown_label, self._instrument_unknown_token)
+        combo.blockSignals(False)
+
+        # Restore selection when possible
+        index_to_restore = 0
+        if current_data is not None:
+            for idx in range(combo.count()):
+                if combo.itemData(idx) == current_data:
+                    index_to_restore = idx
+                    break
+        combo.setCurrentIndex(index_to_restore)
+
+    def _apply_instrument_filter(self) -> None:
+        combo = self._instrument_combo
+        if combo is None:
+            return
+        target = combo.currentData()
+
+        self._table.blockSignals(True)
+        excluded = 0
+        for row, entry in enumerate(self._normalized_items):
+            item = self._table.item(row, 0)
+            if item is None:
+                continue
+            instrument_label = (entry.instrument or "").strip()
+            keep = True
+            if target is None:
+                keep = True
+            elif target == self._instrument_unknown_token:
+                keep = instrument_label == ""
+            elif isinstance(target, str):
+                keep = instrument_label.lower() == target.lower()
+            if not keep:
+                if item.checkState() != Qt.Unchecked:
+                    item.setCheckState(Qt.Unchecked)
+                    excluded += 1
+            else:
+                if item.checkState() != Qt.Checked:
+                    item.setCheckState(Qt.Checked)
+        self._table.blockSignals(False)
+        if excluded:
+            message = self._localizer.get(
+                "filter.instrument.filtered",
+                "Instrument filter excluded {count} frame(s).",
+            )
+            try:
+                message = message.format(count=excluded)
+            except Exception:
+                pass
+            self._append_log(message)
+            self._status_label.setText(message)
+        self._update_summary_label()
+        self._schedule_preview_refresh()
+        self._schedule_cluster_refresh()
+
+    def _on_resolve_wcs_clicked(self) -> None:
+        message = self._localizer.get("filter.scan.starting", "Starting analysis…")
+        self._status_label.setText(message)
+        self._append_log(message)
+        self._on_run_analysis()
+
+    def _on_auto_group_clicked(self) -> None:
+        self._cluster_refresh_pending = False
+        self._update_cluster_assignments()
+        message = self._localizer.get(
+            "filter.cluster.manual_refresh",
+            "Manual master-tile organisation requested.",
+        )
+        self._append_log(message)
+        self._status_label.setText(message)
+
+    def _compute_global_center(self) -> Tuple[float | None, float | None]:
+        coords: list[Tuple[float, float]] = []
+        for row, entry in enumerate(self._normalized_items):
+            item = self._table.item(row, 0)
+            if item is None or item.checkState() != Qt.Checked:
+                continue
+            ra, dec = entry.center_ra_deg, entry.center_dec_deg
+            if ra is None or dec is None:
+                ra, dec = self._ensure_entry_coordinates(entry)
+            if ra is None or dec is None:
+                continue
+            coords.append((ra, dec))
+
+        if not coords:
+            for entry in self._normalized_items:
+                ra, dec = entry.center_ra_deg, entry.center_dec_deg
+                if ra is None or dec is None:
+                    ra, dec = self._ensure_entry_coordinates(entry)
+                if ra is None or dec is None:
+                    continue
+                coords.append((ra, dec))
+            if not coords:
+                return None, None
+
+        sum_x = sum_y = sum_z = 0.0
+        for ra_deg, dec_deg in coords:
+            ra_rad = math.radians(ra_deg)
+            dec_rad = math.radians(dec_deg)
+            sum_x += math.cos(dec_rad) * math.cos(ra_rad)
+            sum_y += math.cos(dec_rad) * math.sin(ra_rad)
+            sum_z += math.sin(dec_rad)
+
+        count = len(coords)
+        if count == 0:
+            return None, None
+
+        sum_x /= count
+        sum_y /= count
+        sum_z /= count
+
+        ra = math.degrees(math.atan2(sum_y, sum_x))
+        if ra < 0:
+            ra += 360.0
+        hyp = math.hypot(sum_x, sum_y)
+        dec = math.degrees(math.atan2(sum_z, hyp))
+        return ra, dec
+
+    def _on_exclude_distance(self) -> None:
+        if self._distance_spin is None:
+            return
+        threshold = float(self._distance_spin.value())
+        center_ra, center_dec = self._compute_global_center()
+        if center_ra is None or center_dec is None:
+            message = self._localizer.get(
+                "filter.exclude.no_center",
+                "Cannot exclude by distance because no celestial center is available.",
+            )
+            self._append_log(message)
+            self._status_label.setText(message)
+            return
+
+        excluded = 0
+        self._table.blockSignals(True)
+        for row, entry in enumerate(self._normalized_items):
+            item = self._table.item(row, 0)
+            if item is None:
+                continue
+            ra_deg, dec_deg = entry.center_ra_deg, entry.center_dec_deg
+            if ra_deg is None or dec_deg is None:
+                ra_deg, dec_deg = self._ensure_entry_coordinates(entry)
+            if ra_deg is None or dec_deg is None:
+                continue
+            distance = self._angular_distance_deg(ra_deg, dec_deg, center_ra, center_dec)
+            if distance > threshold and item.checkState() != Qt.Unchecked:
+                item.setCheckState(Qt.Unchecked)
+                excluded += 1
+        self._table.blockSignals(False)
+        summary = self._localizer.get(
+            "filter.exclude.result",
+            "Excluded {count} frame(s) beyond {threshold:.1f}°.",
+        )
+        try:
+            summary = summary.format(count=excluded, threshold=threshold)
+        except Exception:
+            pass
+        self._append_log(summary)
+        self._status_label.setText(summary)
+        self._update_summary_label()
+        self._schedule_preview_refresh()
+        self._schedule_cluster_refresh()
+
+    def _toggle_maximize_restore(self) -> None:
+        button = self._toolbar_maximize_btn
+        window = self.window() or self
+        if not self._maximized_state:
+            self._saved_geometry = window.geometry()
+            window.showMaximized()
+            self._maximized_state = True
+            if button is not None:
+                button.setText(self._localizer.get("filter_btn_restore", "Restore"))
+        else:
+            window.showNormal()
+            if self._saved_geometry is not None:
+                window.setGeometry(self._saved_geometry)
+            self._maximized_state = False
+            if button is not None:
+                button.setText(self._localizer.get("filter_btn_maximize", "Maximize"))
+
+    def _on_export_csv(self) -> None:
+        rows = self._gather_csv_rows()
+        if not rows:
+            message = self._localizer.get(
+                "filter.export.empty",
+                "No rows available for CSV export.",
+            )
+            self._append_log(message)
+            self._status_label.setText(message)
+            return
+
+        destination = self._cache_csv_path or self._prompt_csv_path()
+        if not destination:
+            return
+
+        success = self._write_csv_file(destination, rows)
+        if success:
+            self._cache_csv_path = destination
+            message = self._localizer.get(
+                "filter.export.success",
+                "Exported {count} entry(ies) to {path}.",
+            )
+            try:
+                message = message.format(count=len(rows), path=destination)
+            except Exception:
+                pass
+            self._append_log(message)
+            self._status_label.setText(message)
+        else:
+            message = self._localizer.get(
+                "filter.export.error",
+                "Failed to export CSV file.",
+            )
+            self._append_log(message)
+            self._status_label.setText(message)
+
+    def _prompt_csv_path(self) -> str | None:
+        caption = self._localizer.get("filter.export.dialog_title", "Export filter CSV")
+        csv_filter = self._localizer.get("filter.export.csv_filter", "CSV files (*.csv)")
+        path, _filter = QFileDialog.getSaveFileName(
+            self,
+            caption,
+            os.path.expanduser("~/zemosaic_filter.csv"),
+            f"{csv_filter};;All Files (*)",
+        )
+        return path or None
+
+    def _gather_csv_rows(self) -> List[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for entry in self._normalized_items:
+            payload = self._build_csv_row(entry)
+            if payload:
+                rows.append(payload)
+        return rows
+
+    def _build_csv_row(self, entry: _NormalizedItem) -> dict[str, Any] | None:
+        path = entry.file_path
+        if not path:
+            return None
+        header = self._load_header_for_entry(entry)
+        record: dict[str, Any] = {"path": path}
+        for key in ("NAXIS1", "NAXIS2", "CRVAL1", "CRVAL2", "CREATOR", "INSTRUME", "DATE-OBS", "EXPTIME", "FILTER", "OBJECT"):
+            record[key] = header.get(key) if header else None
+
+        if record.get("CRVAL1") is None or record.get("CRVAL2") is None:
+            if entry.center_ra_deg is not None and entry.center_dec_deg is not None:
+                record["CRVAL1"] = entry.center_ra_deg
+                record["CRVAL2"] = entry.center_dec_deg
+
+        footprint = entry.footprint_radec or self._ensure_entry_footprint(entry)
+        for idx in range(1, 5):
+            ra_key = f"FP_RA{idx}"
+            dec_key = f"FP_DEC{idx}"
+            record[ra_key] = ""
+            record[dec_key] = ""
+        if footprint:
+            for idx, (ra_deg, dec_deg) in enumerate(footprint[:4], start=1):
+                record[f"FP_RA{idx}"] = ra_deg
+                record[f"FP_DEC{idx}"] = dec_deg
+
+        return record
+
+    def _load_header_for_entry(self, entry: _NormalizedItem) -> Any:
+        if isinstance(entry.original, dict):
+            header_candidate = entry.original.get("header") or entry.original.get("fits_header")
+            if header_candidate:
+                return header_candidate
+        if fits is None:
+            return None
+        path = entry.file_path
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            return fits.getheader(path, ignore_missing_end=True)
+        except Exception:
+            return None
+
+    def _write_csv_file(self, path: str, rows: List[dict[str, Any]]) -> bool:
+        fieldnames = [
+            "path",
+            "NAXIS1",
+            "NAXIS2",
+            "CRVAL1",
+            "CRVAL2",
+            "FP_RA1",
+            "FP_DEC1",
+            "FP_RA2",
+            "FP_DEC2",
+            "FP_RA3",
+            "FP_DEC3",
+            "FP_RA4",
+            "FP_DEC4",
+            "CREATOR",
+            "INSTRUME",
+            "DATE-OBS",
+            "EXPTIME",
+            "FILTER",
+            "OBJECT",
+        ]
+        try:
+            directory = os.path.dirname(path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            with open(path, "w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow(row)
+            return True
+        except Exception as exc:
+            self._append_log(f"CSV export failed: {exc}")
+            return False
+
     def _build_ui(self) -> None:
         title = self._localizer.get("filter.dialog.title", "Filter raw frames")
         self.setWindowTitle(title)
@@ -1169,6 +1666,18 @@ class FilterQtDialog(QDialog):
             "Review the frames that will be used before launching the mosaic process.",
         )
         main_layout.addWidget(QLabel(description, self))
+
+        toolbar_widget = self._create_toolbar_widget()
+        main_layout.addWidget(toolbar_widget)
+
+        header_container = QWidget(self)
+        header_layout = QHBoxLayout(header_container)
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        exclusion_box = self._create_exclusion_box()
+        instrument_widget = self._create_instrument_row()
+        header_layout.addWidget(exclusion_box, 1)
+        header_layout.addWidget(instrument_widget, 1)
+        main_layout.addWidget(header_container)
 
         self._table.setColumnCount(4)
         headers = [
@@ -1207,13 +1716,6 @@ class FilterQtDialog(QDialog):
         splitter.setStretchFactor(1, 2)
         main_layout.addWidget(splitter)
 
-        control_group = QGridLayout()
-        self._run_analysis_btn = QPushButton(
-            self._localizer.get("filter.button.run_scan", "Run analysis"), self
-        )
-        self._run_analysis_btn.clicked.connect(self._on_run_analysis)  # type: ignore[arg-type]
-        control_group.addWidget(self._run_analysis_btn, 0, 0)
-
         control_row = QGridLayout()
         select_all_btn = QPushButton(
             self._localizer.get("filter.button.select_all", "Select all"), self
@@ -1227,17 +1729,13 @@ class FilterQtDialog(QDialog):
         control_row.addWidget(select_none_btn, 0, 1)
         control_row.addWidget(self._summary_label, 0, 2)
         control_row.setColumnStretch(2, 1)
-        control_group.addLayout(control_row, 0, 1, 1, 1)
-
-        progress_row = QGridLayout()
-        progress_row.addWidget(self._status_label, 0, 0)
-        progress_row.addWidget(self._progress_bar, 0, 1)
-        progress_row.setColumnStretch(1, 1)
-        control_group.addLayout(progress_row, 1, 0, 1, 2)
-        main_layout.addLayout(control_group)
+        main_layout.addLayout(control_row)
 
         options_box = self._create_options_box()
         main_layout.addWidget(options_box)
+
+        wcs_box = self._create_wcs_controls_box()
+        main_layout.addWidget(wcs_box)
 
         log_group_box = QGroupBox(
             self._localizer.get("filter.group.log", "Scan / grouping log"), self
@@ -1376,6 +1874,7 @@ class FilterQtDialog(QDialog):
         for row, entry in enumerate(items):
             self._populate_row(row, entry)
         self._table.blockSignals(False)
+        self._refresh_instrument_options()
 
     def _populate_row(self, row: int, entry: _NormalizedItem) -> None:
         name_item = QTableWidgetItem(entry.display_name)
@@ -1414,6 +1913,7 @@ class FilterQtDialog(QDialog):
         self._update_summary_label()
         self._schedule_preview_refresh()
         self._schedule_cluster_refresh()
+        self._refresh_instrument_options()
 
     # ------------------------------------------------------------------
     # Interaction helpers
@@ -1490,24 +1990,6 @@ class FilterQtDialog(QDialog):
         )
         self._seestar_checkbox.setChecked(self._seestar_priority)
         layout.addWidget(self._seestar_checkbox)
-
-        self._draw_footprints_checkbox = QCheckBox(
-            self._localizer.get("filter_chk_draw_footprints", "Draw WCS footprints"),
-            box,
-        )
-        # Match the Tk filter default: footprints enabled unless explicitly disabled.
-        self._draw_footprints_checkbox.setChecked(True)
-        self._draw_footprints_checkbox.toggled.connect(  # type: ignore[arg-type]
-            lambda _checked: self._schedule_preview_refresh()
-        )
-        layout.addWidget(self._draw_footprints_checkbox)
-
-        self._write_wcs_checkbox = QCheckBox(
-            self._localizer.get("filter_chk_write_wcs", "Write WCS to file"),
-            box,
-        )
-        self._write_wcs_checkbox.setChecked(True)
-        layout.addWidget(self._write_wcs_checkbox)
 
         concurrency_label = QLabel(
             self._localizer.get("filter_label_astap_instances", "Max ASTAP instances"),
@@ -2439,6 +2921,9 @@ class FilterQtDialog(QDialog):
         resolved_count = self._resolved_wcs_count()
         if resolved_count:
             overrides["resolved_wcs_count"] = int(resolved_count)
+
+        if self._sds_checkbox is not None:
+            overrides["sds_mode"] = bool(self._sds_checkbox.isChecked())
 
         excluded_indices: list[int] = []
         try:

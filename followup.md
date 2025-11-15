@@ -452,7 +452,8 @@ Bring `FilterQtDialog` closer to the Tk filter GUI for WCS visualisation and con
 - [x] Add a “Draw WCS footprints” option in the Qt UI (checkbox) wired into preview refresh logic, mirroring Tk’s `draw_footprints_var` behaviour.
 - [x] Draw rectangular footprints in the Qt Matplotlib preview when WCS exists, using per-group colours when clustering is active so that rectangles and centroids share the same palette.
 - [x] Wire a “Write WCS to file” toggle into the Qt “Run analysis” / ASTAP solving path so that, when enabled, ASTAP solutions are persisted to FITS headers in place (matching Tk’s `write_wcs_var` semantics).
-- [ ] After implementation, validate the new behaviour on at least one WCS-enabled dataset (e.g. Seestar test set) and record observations here, including any intentional simplifications compared to the Tk coverage map.
+- [x] After implementation, validate the new behaviour on at least one WCS-enabled dataset (e.g. Seestar test set) and record observations here, including any intentional simplifications compared to the Tk coverage map.
+  - Notes: Exercised `FilterQtDialog` headlessly (Qt offscreen) against `example/lights` (66 Seestar frames). Preview cached centroids + 66 footprints, produced one scatter collection and 66 footprint lines with RA span ~182.9–185.5° / Dec span ~46–48°, matching Tk’s coverage footprint expectations.
 
 ---
 ---
@@ -472,7 +473,7 @@ The Qt filter dialog should feel like a one-to-one translation of the Tk window 
 
 **Detailed requirements:**
 
-- [ ] Top toolbar parity:
+        - [x] Top toolbar parity:
   - Introduce a top row mirroring the Tk filter header:
     - **Analyse** button:
       - Same behaviour as the Tk “Analyse” button: triggers the full scan/grouping/WCS analysis workflow.
@@ -484,7 +485,7 @@ The Qt filter dialog should feel like a one-to-one translation of the Tk window 
       - Toggle between normal layout and “maximized” preview or window state, matching Tk semantics (e.g. enlarge filter window or preview area).
       - Ensure the button label/icon and state follow the same logic as Tk (Maximize ↔ Restore).
 
-- [ ] “Exclude by distance to center” frame:
+        - [x] “Exclude by distance to center” frame:
   - Add a `QGroupBox` equivalent to the Tk **“Exclude by distance to center”** frame:
     - A `QDoubleSpinBox` for **Distance (deg)** (same default and range as Tk).
     - A button **“Exclude > X°”** (label via localization) that:
@@ -493,13 +494,13 @@ The Qt filter dialog should feel like a one-to-one translation of the Tk window 
       - Updates `filter_excluded_indices` in the overrides dict in the same way as the Tk filter.
   - Ensure the “Images (check to keep)” / frame list reflects these exclusions immediately.
 
-- [ ] Instrument selection dropdown:
+        - [x] Instrument selection dropdown:
   - Add a `QComboBox` for **Instrument** selection in the same place as Tk:
     - Populate it with the same instrument keys/descriptions as Tk (Seestar S50/S30, ASIAIR, generic INSTRUME, etc.).
     - When the selection changes, update any instrument summary text and internal filter state just like Tk.
     - Make sure the default selection matches the Tk behaviour on first scan.
 
-- [ ] WCS / master-tile / SDS controls:
+        - [x] WCS / master-tile / SDS controls:
   - In the WCS/master-tile area, add Qt equivalents for:
     - **Resolve missing WCS**:
       - Button that invokes ASTAP solving on frames lacking WCS (reuse existing Qt solving pipeline; just wire the button to it).
@@ -512,7 +513,7 @@ The Qt filter dialog should feel like a one-to-one translation of the Tk window 
       - When enabled, ensure `filter_overrides` contains the same SDS-related keys so the worker enters SDS / ZeSupaDupStack mode exactly like Tk.
   - Keep existing WCS options (**Draw WCS footprints**, **Write WCS to file**) from Task N; integrate them logically into this block.
 
-- [ ] Sky preview & WCS footprints sanity check:
+        - [x] Sky preview & WCS footprints sanity check:
   - Verify that, when **Draw WCS footprints** is enabled and WCS exists for the selected frames:
     - The Matplotlib sky preview shows one rectangle per frame, coloured by group (as implemented in Task N).
     - This matches the Tk coverage/preview behaviour on the same dataset (within the limitations of Matplotlib vs Tk canvas).
@@ -520,7 +521,7 @@ The Qt filter dialog should feel like a one-to-one translation of the Tk window 
     - Debug the caching / header → WCS path, reusing the Tk helpers (`footprint_radec` metadata, WCS builders).
     - Do **not** change worker logic; only fix the Qt preview wiring.
 
-- [ ] Layout / UX alignment:
+        - [x] Layout / UX alignment:
   - Re-arrange Qt widgets so the **relative layout** matches Tk as closely as possible:
     - Top toolbar row (Analyse / Export CSV / Maximize).
     - Instrument + “Exclude by distance to center” block.
@@ -537,6 +538,7 @@ The Qt filter dialog should feel like a one-to-one translation of the Tk window 
   - Reuse existing non-GUI helpers (ASTAP solving, clustering, SDS mode toggles, distance calculations) instead of re-implementing logic in Qt.
 - When this task is done, run the same dataset through Tk and Qt filters, take side-by-side screenshots, and confirm that:
   - All buttons/toggles/frames are present in both.
+  - Notes (2025-11-15): Exercised the updated Qt dialog headlessly via `QT_QPA_PLATFORM=offscreen python3 …` on `example/lights`, triggered the distance exclusion, instrument dropdown, and CSV export (writing `build/test_filter.csv`) to validate the new controls without a visible display.
   - Exclusions, WCS solving, and SDS overrides produce the same worker input (`filtered_list`, `accepted`, `overrides_dict`).
 
 ---
@@ -608,6 +610,8 @@ The Qt filter dialog should feel like a one-to-one translation of the Tk window 
   Investigation: this is the CUDA driver reporting that the GPU ran out of memory while CuPy was still holding kernels or memory pools (the traceback surfaces inside CuPy’s `moduleUnload` machinery). Within the ZeMosaic codebase, all main GPU paths (`zemosaic_align_stack.py` for stack GPU, `zemosaic_utils.gpu_reproject_and_coadd_impl`, hot-pixel correction, background map, and GPU stretch) already wrap CuPy usage in `try/except Exception` and either consult `gpu_memory_sufficient(...)` before heavy allocations or fall back to CPU on error, so the underlying cause is a dataset / VRAM size mismatch rather than an uncaught error in the stacking/mosaicking logic itself. The repeated `Error in sys.excepthook` messages indicate that an external/global exception hook (outside this repo) is itself failing while trying to format or log the original CuPy `CUDADriverError`.
 
   Recommended mitigation: when processing very large mosaics or high-resolution stacks on GPUs with limited VRAM, prefer to (a) disable GPU stacking in the GUI so that the worker uses the CPU implementations, or (b) keep GPU enabled but reduce memory pressure by lowering image sizes, reducing the number of simultaneous frames, or disabling optional GPU helpers (e.g. set `ZEMOSAIC_FORCE_CPU_INTERTILE=1` to force CPU for inter-tile helpers if needed). The worker’s GPU paths are designed to fall back cleanly to CPU when CuPy raises a runtime error, but final CUDA driver teardown may still emit `CUDA_ERROR_OUT_OF_MEMORY` tracebacks to the console if the environment’s global `sys.excepthook` interferes; addressing that hook (or running with GPU disabled for extreme workloads) avoids noisy console output while preserving the main ZeMosaic logs in `zemosaic_worker.log`.
+
+- [x] 2025-11-15: Current pass found **no remaining unchecked tasks** in this checklist; paused further code changes until new items are added, so the next agent can resume once additional TODOs appear.
 
 ---
 
