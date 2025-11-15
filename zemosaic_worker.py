@@ -13830,6 +13830,45 @@ def _assemble_global_mosaic_first_impl(
         enriched.update(kwargs)
         return enriched
 
+    def _emit_global_coadd_finished_event(
+        *,
+        frames: int,
+        channels: int | None,
+        helper_label: str | None,
+    ) -> None:
+        """Emit a single SUCCESS log for the end of the global coadd phase."""
+        final_prog = None
+        if base_progress_phase is not None and progress_weight_phase is not None:
+            final_prog = base_progress_phase + progress_weight_phase
+        elapsed = max(0.0, time.monotonic() - start_time)
+        try:
+            frame_count = int(frames)
+        except Exception:
+            frame_count = 0
+        frame_count = max(0, frame_count)
+        try:
+            channel_count = int(channels) if channels is not None else 0
+        except Exception:
+            channel_count = 0
+        if channel_count <= 0:
+            channel_count = 1
+        payload = _payload(
+            W=int(width),
+            H=int(height),
+            images=frame_count,
+            channels=channel_count,
+            elapsed_s=float(elapsed),
+            method=coadd_method,
+        )
+        if helper_label:
+            payload["helper"] = helper_label
+        pcb(
+            "p4_global_coadd_finished",
+            prog=final_prog,
+            lvl="SUCCESS",
+            **payload,
+        )
+
     def _fail(reason_key: str = "global_coadd_error_failed_fallback", *, level: str = "WARN", **kwargs):
         if reason_key != "global_coadd_error_failed_fallback":
             pcb(reason_key, prog=None, lvl=level, **_payload(**kwargs))
@@ -14521,23 +14560,10 @@ def _assemble_global_mosaic_first_impl(
         helper_attempt = _attempt_gpu_helper_route()
         if helper_attempt is not None:
             helper_image, helper_coverage, helper_alpha, helper_stats = helper_attempt
-            final_prog = None
-            if base_progress_phase is not None and progress_weight_phase is not None:
-                final_prog = base_progress_phase + progress_weight_phase
-            elapsed = max(0.0, time.monotonic() - start_time)
-            pcb(
-                "p4_global_coadd_finished",
-                prog=final_prog,
-                lvl="SUCCESS",
-                **_payload(
-                    W=int(width),
-                    H=int(height),
-                    images=int(helper_stats.get("frames", 0)),
-                    channels=int(helper_stats.get("channels", 0)),
-                    elapsed_s=float(elapsed),
-                    method=coadd_method,
-                    helper="gpu_reproject",
-                ),
+            _emit_global_coadd_finished_event(
+                frames=int(helper_stats.get("frames", 0)),
+                channels=int(helper_stats.get("channels", 0)),
+                helper_label="gpu_reproject",
             )
             return (
                 helper_image.astype(np.float32, copy=False),
@@ -14816,21 +14842,13 @@ def _assemble_global_mosaic_first_impl(
             max_cov = float(np.nanmax(coverage_map))
             if max_cov > 0:
                 alpha_map = np.clip((coverage_map / max_cov) * 255.0, 0, 255).astype(np.uint8)
-        final_prog = None
-        if base_progress_phase is not None and progress_weight_phase is not None:
-            final_prog = base_progress_phase + progress_weight_phase
-        elapsed = max(0.0, time.monotonic() - start_time)
-        pcb(
-            "p4_global_coadd_finished",
-            prog=final_prog,
-            lvl="SUCCESS",
-            **_payload(
-                W=int(width),
-                H=int(height),
-                images=int(valid_frames),
-                elapsed_s=float(elapsed),
-                method=coadd_method,
-            ),
+        computed_channels: int | None = channel_count
+        if computed_channels is None and final_image is not None:
+            computed_channels = final_image.shape[-1] if final_image.ndim >= 3 else 1
+        _emit_global_coadd_finished_event(
+            frames=int(valid_frames),
+            channels=computed_channels,
+            helper_label="cpu",
         )
         sum_grid = None
         sumsq_grid = None
