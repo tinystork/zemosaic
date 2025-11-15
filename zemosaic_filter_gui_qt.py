@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import importlib.util
 import os
 from pathlib import Path
@@ -66,6 +67,28 @@ try:  # pragma: no cover - optional dependency guard
 except Exception:  # pragma: no cover - optional dependency guard
     _DEFAULT_GUI_CONFIG = {}
 
+try:  # pragma: no cover - optional dependency guard
+    from zemosaic_utils import (  # type: ignore
+        EXCLUDED_DIRS,
+        compute_global_wcs_descriptor,
+        is_path_excluded,
+        load_global_wcs_descriptor,
+        parse_global_wcs_resolution_override,
+        resolve_global_wcs_output_paths,
+        write_global_wcs_files,
+    )
+except Exception:  # pragma: no cover - optional dependency guard
+    EXCLUDED_DIRS = frozenset({"unaligned_by_zemosaic"})  # type: ignore[assignment]
+    compute_global_wcs_descriptor = None  # type: ignore[assignment]
+    is_path_excluded = None  # type: ignore[assignment]
+    load_global_wcs_descriptor = None  # type: ignore[assignment]
+    parse_global_wcs_resolution_override = None  # type: ignore[assignment]
+    resolve_global_wcs_output_paths = None  # type: ignore[assignment]
+    write_global_wcs_files = None  # type: ignore[assignment]
+
+
+logger = logging.getLogger(__name__)
+
 _DEFAULT_GUI_CONFIG_MAP: dict[str, Any] = {}
 if isinstance(_DEFAULT_GUI_CONFIG, dict):
     try:
@@ -124,8 +147,33 @@ def _iter_normalized_entries(
         if isinstance(candidate, (list, tuple, set)):
             excluded_paths = [os.fspath(p) for p in candidate]
 
-    def _should_exclude(path: str) -> bool:
-        return any(os.path.normcase(path) == os.path.normcase(entry) for entry in excluded_paths)
+    def _should_exclude(path: Path | str) -> bool:
+        try:
+            path_obj = Path(path)
+        except Exception:
+            path_obj = Path(str(path))
+
+        # Honour explicit per-path exclusions from overrides first.
+        try:
+            norm = os.path.normcase(os.fspath(path_obj))
+        except Exception:
+            norm = os.path.normcase(str(path_obj))
+        for entry in excluded_paths:
+            try:
+                if norm == os.path.normcase(entry):
+                    return True
+            except Exception:
+                continue
+
+        # Then apply global directory-level exclusions for stream-scan parity.
+        try:
+            if is_path_excluded is not None and EXCLUDED_DIRS:
+                if is_path_excluded(path_obj, EXCLUDED_DIRS):
+                    return True
+        except Exception:
+            pass
+
+        return False
 
     def _build_from_mapping(obj: dict) -> _NormalizedItem:
         original = obj
@@ -235,7 +283,7 @@ def _iter_normalized_entries(
     def _build_from_path(path_obj: Path) -> _NormalizedItem:
         file_path = str(path_obj)
         display_name = path_obj.name or file_path
-        include = not _should_exclude(file_path)
+        include = not _should_exclude(path_obj)
         return _NormalizedItem(
             original=file_path,
             display_name=display_name,
@@ -249,12 +297,18 @@ def _iter_normalized_entries(
     if isinstance(payload, (str, os.PathLike)):
         directory = Path(payload)
         if directory.is_dir():
+            if _should_exclude(directory):
+                return
             pattern = "**/*" if scan_recursive else "*"
             for candidate in directory.glob(pattern):
                 if candidate.is_file():
+                    if _should_exclude(candidate):
+                        continue
                     yield _build_from_path(candidate)
         elif Path(payload).is_file():
-            yield _build_from_path(Path(payload))
+            candidate = Path(payload)
+            if not _should_exclude(candidate):
+                yield _build_from_path(candidate)
     elif isinstance(payload, Iterable):
         for element in payload:
             if isinstance(element, dict):
@@ -1680,6 +1734,198 @@ class FilterQtDialog(QDialog):
 
         return metadata
 
+    @staticmethod
+    def _build_global_wcs_meta(descriptor: dict[str, Any], fits_path: str, json_path: str) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        descriptor_meta = descriptor.get("metadata")
+        if isinstance(descriptor_meta, dict):
+            payload.update(descriptor_meta)
+
+        keys = [
+            "width",
+            "height",
+            "pixel_scale_as_per_px",
+            "pixel_scale_deg_per_px",
+            "padding_percent",
+            "orientation",
+            "orientation_matrix",
+            "ra_wrap_used",
+            "ra_wrap_offset_deg",
+            "ra_span_deg",
+            "dec_span_deg",
+            "center_ra_deg",
+            "center_dec_deg",
+            "files",
+            "nb_images",
+            "resolution_override",
+            "pixel_scale_mode",
+            "timestamp",
+            "source",
+        ]
+        for key in keys:
+            if key in descriptor and key not in payload:
+                payload[key] = descriptor[key]
+
+        payload["fits_path"] = fits_path
+        payload["json_path"] = json_path
+        if "nb_images" not in payload or payload["nb_images"] is None:
+            payload["nb_images"] = descriptor.get("nb_images")
+        payload["files"] = payload.get("files") or descriptor.get("files") or []
+        if "source" not in payload:
+            payload["source"] = descriptor.get("source", "computed")
+        return payload
+
+    def _ensure_global_wcs_for_selection(
+        self,
+        require_plan: bool,
+    ) -> tuple[bool, dict[str, Any] | None, dict[str, Any] | None]:
+        if not require_plan:
+            return False, None, None
+
+        try:
+            from astropy.io import fits as _fits  # type: ignore
+            from astropy.wcs import WCS as _WCS  # type: ignore
+        except Exception:
+            return False, None, None
+
+        output_dir_raw = self._config_value("output_dir", "")
+        output_dir = str(output_dir_raw or "").strip()
+        if not output_dir:
+            return False, None, None
+
+        if resolve_global_wcs_output_paths is None or parse_global_wcs_resolution_override is None:
+            return False, None, None
+
+        wcs_output_cfg = self._config_value("global_wcs_output_path", "global_mosaic_wcs.fits")
+        pixelscale_mode = str(self._config_value("global_wcs_pixelscale_mode", "median") or "median")
+        orientation_mode = str(self._config_value("global_wcs_orientation", "north_up") or "north_up")
+        padding_raw = self._config_value("global_wcs_padding_percent", 2.0)
+        try:
+            padding_percent = float(padding_raw if padding_raw is not None else 2.0)
+        except Exception:
+            padding_percent = 2.0
+        res_override_raw = self._config_value("global_wcs_res_override", None)
+        res_override = parse_global_wcs_resolution_override(res_override_raw)
+
+        try:
+            fits_path, json_path = resolve_global_wcs_output_paths(output_dir, wcs_output_cfg)
+        except Exception as exc:
+            try:
+                logger.warning("Global WCS (Qt): unable to resolve output path: %s", exc)
+            except Exception:
+                pass
+            return False, None, None
+
+        descriptor: dict[str, Any] | None = None
+        if load_global_wcs_descriptor is not None:
+            try:
+                descriptor = load_global_wcs_descriptor(fits_path, json_path, logger_override=logger)
+            except Exception:
+                descriptor = None
+
+        if descriptor is None:
+            if compute_global_wcs_descriptor is None:
+                return False, None, None
+
+            selected_entries: list[_NormalizedItem] = []
+            for row, entry in enumerate(self._normalized_items):
+                item = self._table.item(row, 0)
+                if item and item.checkState() == Qt.Checked:
+                    selected_entries.append(entry)
+
+            if not selected_entries:
+                return False, None, None
+
+            seestar_items: list[dict[str, Any]] = []
+            fallback_items: list[dict[str, Any]] = []
+
+            for entry in selected_entries:
+                path = entry.file_path
+                if not path or not os.path.isfile(path):
+                    continue
+                try:
+                    header = _fits.getheader(path, ignore_missing_end=True)
+                except Exception:
+                    header = None
+                if header is None:
+                    continue
+                try:
+                    wcs_obj = _WCS(header)
+                except Exception:
+                    wcs_obj = None
+                if wcs_obj is None or not getattr(wcs_obj, "is_celestial", False):
+                    continue
+
+                shape_hw = None
+                try:
+                    nax1 = header.get("NAXIS1")
+                    nax2 = header.get("NAXIS2")
+                    if isinstance(nax1, (int, float)) and isinstance(nax2, (int, float)):
+                        shape_hw = (int(nax2), int(nax1))
+                except Exception:
+                    shape_hw = None
+
+                item_payload: dict[str, Any] = {"path": path, "wcs": wcs_obj}
+                if shape_hw is not None:
+                    item_payload["shape"] = shape_hw
+
+                is_seestar = False
+                label = entry.instrument
+                if not label:
+                    label = _detect_instrument_from_header(header)
+                try:
+                    if label and any(token in str(label).lower() for token in ("seestar", "s50", "s30")):
+                        is_seestar = True
+                except Exception:
+                    is_seestar = False
+
+                if is_seestar:
+                    seestar_items.append(item_payload)
+                else:
+                    fallback_items.append(item_payload)
+
+            items_for_descriptor = seestar_items or (seestar_items + fallback_items)
+            if not items_for_descriptor:
+                try:
+                    logger.warning("Global WCS (Qt): no usable entries found for descriptor computation.")
+                except Exception:
+                    pass
+                return False, None, None
+
+            try:
+                descriptor = compute_global_wcs_descriptor(
+                    items_for_descriptor,
+                    pixel_scale_mode=pixelscale_mode,
+                    orientation_mode=orientation_mode,
+                    padding_percent=padding_percent,
+                    resolution_override=res_override,
+                    logger_override=logger,
+                )
+            except Exception as exc:
+                try:
+                    logger.error("Global WCS (Qt): computation failed: %s", exc, exc_info=True)
+                except Exception:
+                    pass
+                descriptor = None
+
+            if descriptor is None:
+                return False, None, None
+
+            if write_global_wcs_files is not None:
+                try:
+                    write_global_wcs_files(descriptor, fits_path, json_path, logger_override=logger)
+                except Exception as exc:
+                    try:
+                        logger.error("Global WCS (Qt): failed to write descriptor: %s", exc, exc_info=True)
+                    except Exception:
+                        pass
+
+        if not isinstance(descriptor, dict):
+            return False, None, None
+
+        meta_payload = self._build_global_wcs_meta(descriptor, fits_path, json_path)
+        return True, meta_payload, {"fits_path": fits_path, "json_path": json_path}
+
     def overrides(self) -> Any:
         if self._cluster_refresh_pending:
             self._update_cluster_assignments()
@@ -1729,6 +1975,39 @@ class FilterQtDialog(QDialog):
             overrides["resolved_wcs_count"] = int(resolved_count)
 
         metadata_update = self._build_metadata_overrides(overrides)
+
+        sds_flag = bool(metadata_update.get("sds_mode"))
+        mode_value = str(metadata_update.get("mode") or "").strip().lower()
+        require_global_plan = sds_flag or mode_value == "seestar"
+
+        success = False
+        meta_payload: dict[str, Any] | None = None
+        path_payload: dict[str, Any] | None = None
+        if require_global_plan:
+            success, meta_payload, path_payload = self._ensure_global_wcs_for_selection(True)
+
+        if success and meta_payload and path_payload:
+            overrides["global_wcs_meta"] = meta_payload
+            overrides["global_wcs_path"] = meta_payload.get("fits_path") or path_payload.get("fits_path")
+            overrides["global_wcs_json"] = meta_payload.get("json_path") or path_payload.get("json_path")
+            metadata_update["mode"] = "seestar"
+            if sds_flag:
+                plan_override = metadata_update.get("global_wcs_plan_override")
+                if not isinstance(plan_override, dict):
+                    plan_override = {}
+                plan_override["sds_mode"] = True
+                plan_override.setdefault("enabled", True)
+                metadata_update["global_wcs_plan_override"] = plan_override
+        elif require_global_plan:
+            metadata_update["mode"] = "classic"
+            plan_override = metadata_update.get("global_wcs_plan_override")
+            if isinstance(plan_override, dict):
+                plan_override.pop("sds_mode", None)
+                if not plan_override:
+                    metadata_update["global_wcs_plan_override"] = None
+                else:
+                    metadata_update["global_wcs_plan_override"] = plan_override
+
         for key, value in metadata_update.items():
             if key == "global_wcs_plan_override" and value is None:
                 overrides.pop(key, None)
