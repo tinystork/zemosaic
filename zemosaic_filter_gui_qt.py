@@ -59,6 +59,8 @@ from typing import Any, Callable, Iterable, Iterator, List, Sequence, Tuple
 
 import numpy as np
 
+import numpy as np
+
 
 _pyside_spec = importlib.util.find_spec("PySide6")
 if _pyside_spec is None:  # pragma: no cover - import guard
@@ -134,9 +136,11 @@ except Exception:  # pragma: no cover - optional dependency guard
 try:  # pragma: no cover - optional dependency guard
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
     from matplotlib.figure import Figure
+    from matplotlib.patches import Rectangle
 except Exception:  # pragma: no cover - matplotlib optional
     FigureCanvasQTAgg = None  # type: ignore[assignment]
     Figure = None  # type: ignore[assignment]
+    Rectangle = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - optional dependency guard
     from zemosaic_astrometry import solve_with_astap, set_astap_max_concurrent_instances
@@ -1307,6 +1311,7 @@ class FilterQtDialog(QDialog):
             self._config_value("filter_enable_coverage_first", True),
             True,
         )
+        self._group_outline_bounds: list[tuple[float, float, float, float]] = []
         self._preview_color_cycle: tuple[str, ...] = (
             "#3f7ad6",
             "#d64b3f",
@@ -1968,12 +1973,21 @@ class FilterQtDialog(QDialog):
                         new_groups[group_idx].append(normalized)
         self._cluster_groups = [group for group in new_groups if group]
 
-        self._status_label.setText(
-            self._localizer.get(
-                "filter.cluster.complete",
-                "Master-tile organisation complete.",
+        if groups:
+            self._status_label.setText(
+                self._localizer.get(
+                    "filter.cluster.complete",
+                    "Master-tile organisation complete.",
+                )
             )
-        )
+        else:
+            self._status_label.setText(
+                self._localizer.get(
+                    "filter.cluster.no_groups",
+                    "No master-tile groups could be prepared.",
+                )
+            )
+        self._group_outline_bounds = self._compute_group_outline_bounds(groups)
         self._update_summary_label()
         self._schedule_preview_refresh()
 
@@ -2050,6 +2064,120 @@ class FilterQtDialog(QDialog):
             header = None
         self._header_cache[norm] = header
         return header
+
+    def _compute_group_outline_bounds(self, groups: list[list[dict[str, Any]]]) -> list[tuple[float, float, float, float]]:
+        if not groups:
+            return []
+        path_map: dict[str, _NormalizedItem] = {}
+        for entry in self._normalized_items:
+            if entry.file_path:
+                path_map[os.path.normcase(entry.file_path)] = entry
+        outlines: list[tuple[float, float, float, float]] = []
+        for group in groups:
+            ra_vals: list[float] = []
+            dec_vals: list[float] = []
+            for info in group or []:
+                footprint = self._resolve_group_entry_footprint(info, path_map)
+                if not footprint:
+                    continue
+                for ra_deg, dec_deg in footprint:
+                    if ra_deg is None or dec_deg is None:
+                        continue
+                    try:
+                        ra_val = float(ra_deg)
+                        dec_val = float(dec_deg)
+                    except Exception:
+                        continue
+                    if not (math.isfinite(ra_val) and math.isfinite(dec_val)):
+                        continue
+                    ra_vals.append(ra_val)
+                    dec_vals.append(dec_val)
+            if not ra_vals or not dec_vals:
+                continue
+            ra_min, ra_max = self._normalize_ra_span(ra_vals)
+            dec_min = min(dec_vals)
+            dec_max = max(dec_vals)
+            outlines.append((ra_min, ra_max, dec_min, dec_max))
+        return outlines
+
+    def _resolve_group_entry_footprint(
+        self,
+        info: Any,
+        path_map: dict[str, _NormalizedItem],
+    ) -> List[Tuple[float, float]] | None:
+        entry: _NormalizedItem | None = None
+        if isinstance(info, dict):
+            for key in ("path", "path_raw", "path_preprocessed_cache"):
+                value = info.get(key)
+                if value:
+                    entry = path_map.get(os.path.normcase(str(value)))
+                    if entry is not None:
+                        break
+        if entry is not None:
+            footprint = entry.footprint_radec or self._ensure_entry_footprint(entry)
+            if footprint:
+                return footprint
+        if isinstance(info, dict):
+            footprint_payload = _sanitize_footprint_radec(info.get("footprint_radec"))
+            if footprint_payload:
+                return footprint_payload
+            wcs_obj = info.get("wcs")
+            if wcs_obj is not None:
+                return self._footprint_from_wcs_object(wcs_obj)
+        return None
+
+    @staticmethod
+    def _footprint_from_wcs_object(wcs_obj: Any) -> List[Tuple[float, float]] | None:
+        if wcs_obj is None or not getattr(wcs_obj, "is_celestial", False):
+            return None
+        try:
+            nx = None
+            ny = None
+            if getattr(wcs_obj, "pixel_shape", None):
+                nx, ny = wcs_obj.pixel_shape  # type: ignore[attr-defined]
+            elif getattr(wcs_obj, "array_shape", None):
+                ny, nx = wcs_obj.array_shape  # type: ignore[attr-defined]
+            if nx is None or ny is None:
+                return None
+            corners_pix = [
+                (0.5, 0.5),
+                (float(nx) - 0.5, 0.5),
+                (float(nx) - 0.5, float(ny) - 0.5),
+                (0.5, float(ny) - 0.5),
+            ]
+            footprint: list[Tuple[float, float]] = []
+            for x_pix, y_pix in corners_pix:
+                try:
+                    sky = wcs_obj.pixel_to_world(x_pix, y_pix)
+                    ra_deg = float(getattr(sky, "ra").deg)
+                    dec_deg = float(getattr(sky, "dec").deg)
+                except Exception:
+                    continue
+                footprint.append((ra_deg, dec_deg))
+            return footprint or None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _normalize_ra_span(values: list[float]) -> tuple[float, float]:
+        if not values:
+            return 0.0, 0.0
+        ref = float(np.median(values))
+        adjusted = []
+        for value in values:
+            delta = (value - ref + 180.0) % 360.0 - 180.0
+            adjusted.append(ref + delta)
+        return min(adjusted), max(adjusted)
+
+    def _format_message(self, key: str, default: str, **kwargs: Any) -> str:
+        template = self._localizer.get(key, default)
+        try:
+            return template.format(**kwargs)
+        except Exception:
+            try:
+                return default.format(**kwargs)
+            except Exception:
+                return default
 
     def _resolve_cluster_threshold_override(self) -> float | None:
         candidates = (
@@ -3395,6 +3523,24 @@ class FilterQtDialog(QDialog):
                 xs.append(xs[0])
                 ys.append(ys[0])
                 axes.plot(xs, ys, color=color, linewidth=0.9, alpha=0.8)
+
+        if Rectangle is not None and self._group_outline_bounds:
+            for ra_min, ra_max, dec_min, dec_max in self._group_outline_bounds:
+                width = max(0.0, ra_max - ra_min)
+                height = max(0.0, dec_max - dec_min)
+                if width <= 0 or height <= 0:
+                    continue
+                rect = Rectangle(
+                    (ra_min, dec_min),
+                    width,
+                    height,
+                    linewidth=1.2,
+                    linestyle="--",
+                    edgecolor="#d64b3f",
+                    facecolor="none",
+                    alpha=0.9,
+                )
+                axes.add_patch(rect)
 
         if legend_needed and len(grouped_points) > 1:
             axes.legend(loc="upper right", fontsize="small")
