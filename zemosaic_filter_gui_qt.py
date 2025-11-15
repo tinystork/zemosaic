@@ -71,6 +71,7 @@ from PySide6.QtWidgets import (  # noqa: E402  - imported after availability che
     QDialogButtonBox,
     QGridLayout,
     QHBoxLayout,
+    QGroupBox,
     QLabel,
     QMessageBox,
     QProgressBar,
@@ -81,6 +82,8 @@ from PySide6.QtWidgets import (  # noqa: E402  - imported after availability che
     QTableWidgetItem,
     QWidget,
     QVBoxLayout,
+    QPlainTextEdit,
+    QCheckBox,
 )
 
 
@@ -1364,8 +1367,6 @@ class FilterQtDialog(QDialog):
         self._append_log(summary_display)
 
     def _create_options_box(self):
-        from PySide6.QtWidgets import QCheckBox, QGroupBox
-
         box = QGroupBox(self._localizer.get("filter.group.options", "Filter options"), self)
         layout = QHBoxLayout(box)
 
