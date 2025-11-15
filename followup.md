@@ -420,3 +420,48 @@ same features, same return values, and a similar layout/flow, so users can switc
 - [x] 2025-11-15: Task J parity audit — Using the bundled example dataset, captured Tk vs Qt `zemosaic_config.json` snapshots for classic and SDS/GPU-on sessions and confirmed that shared keys (GPU, quality crop/gate, coverage/two-pass, language, SDS) match; additionally instrumented both GUIs headlessly to log the full `run_hierarchical_mosaic_process` argument tuples and verified that positional worker arguments and solver settings align for these scenarios, modulo benign differences where Qt includes an explicit `astap_max_instances` hint and Tk eagerly normalizes an empty memmap directory to the output folder (mirroring the worker’s own `(coadd_memmap_dir or output_folder)` fallback).
 - [x] 2025-11-15: Task K (Qt Phase 4.5 UI parity) — Updated `zemosaic_gui_qt.py` so the Phase 4.5 / super-tiles configuration group is guarded behind `ENABLE_PHASE45_UI = False` and therefore hidden from users, forced `config[\"inter_master_merge_enable\"] = False` after loading configuration and before any worker invocation, ensured `_serialize_config_for_save` always persists `inter_master_merge_enable = False`, and confirmed that all Phase 4.5 runtime handlers (signals, logs, and overlay widgets) remain wired identically to the Tk backend for worker-emitted `phase45_event` payloads.
 - [x] 2025-11-15: Task L parity review — Confirmed that `FilterQtDialog` implements the stream-scan directory exclusions (`_iter_normalized_entries(...)` + `EXCLUDED_DIRS`/`is_path_excluded`), recursive “Scan subfolders” toggle, WCS column and `resolved_wcs_count` override, `filter_excluded_indices` based on unchecked rows, ASTAP concurrency wiring via `astap_max_instances` and `set_astap_max_concurrent_instances(...)`, and a scrollable log panel for scan/clustering/WCS messages. Behaviour was cross-checked against the Tk `launch_filter_interface` and worker consumers of `filter_overrides`; full end-to-end runs on real Seestar datasets remain recommended outside this harness for final visual validation.
+- [x] 2025-11-15: Console-only Astropy SIP/WCS warning — During some filter runs, the console printed the following message without any entry in `zemosaic_worker.log`:
+
+  ```text
+  INFO:
+                  Inconsistent SIP distortion information is present in the FITS header and the WCS object:
+                  SIP coefficients were detected, but CTYPE is missing a "-SIP" suffix.
+                  astropy.wcs is using the SIP distortion coefficients,
+                  therefore the coordinates calculated here might be incorrect.
+
+                  If you do not want to apply the SIP distortion coefficients,
+                  please remove the SIP coefficients from the FITS header or the
+                  WCS object.  As an example, if the image is already distortion-corrected
+                  (e.g., drizzled) then distortion components should not apply and the SIP
+                  coefficients should be removed.
+
+                  While the SIP distortion coefficients are being applied here, if that was indeed the intent,
+                  for consistency please append "-SIP" to the CTYPE in the FITS header or the WCS object.
+  ```
+
+  Investigation: this comes from `astropy.wcs.WCS` when a FITS header contains SIP distortion keywords (`A_*`, `B_*`, `AP_*`, `BP_*`) but its `CTYPE1/CTYPE2` values do not end with `-SIP`. The Tk filter GUI already normalizes such headers via `_ensure_sip_suffix_inplace` before instantiating WCS objects, but the Qt filter was still calling `WCS(header)` directly in `_header_has_wcs(...)` and in the global-WCS selection path, which caused Astropy to emit the “Inconsistent SIP distortion information” message on the `astropy.wcs.wcs` logger instead of through ZeMosaic’s worker logger.
+
+  Fix: `zemosaic_filter_gui_qt.py` now mirrors the Tk logic by introducing `_header_contains_sip_terms`, `_ensure_sip_suffix_inplace`, and `_build_wcs_from_header`, and wiring `_header_has_wcs(...)` plus the global-WCS descriptor builder to call `WCS(hdr, naxis=2, relax=True)` on a header where `CTYPE1/CTYPE2` have been normalized to include the `-SIP` suffix when SIP keywords are present. This removes the inconsistent-SIP warning in normal runs while keeping WCS behaviour consistent between Tk and Qt; any remaining Astropy WCS messages should now be considered genuine header issues rather than a parity bug.
+
+- [x] 2025-11-15: GPU processing CUDADriverError (CUDA_ERROR_OUT_OF_MEMORY) — On some large GPU-enabled runs, the following traceback was observed in the console (again without a clear entry in the main log), repeated with `Error in sys.excepthook` messages:
+
+  ```text
+                   [astropy.wcs.wcs]Traceback (most recent call last):
+    File "cupy_backends\\cuda\\api\\driver.pyx", line 234, in cupy_backends.cuda.api.driver.moduleUnload
+    File "cupy_backends\\cuda\\api\\driver.pyx", line 63, in cupy_backends.cuda.api.driver.check_status
+  cupy_backends.cuda.api.driver.CUDADriverError: CUDA_ERROR_OUT_OF_MEMORY: out of memory
+  Error in sys.excepthook:
+
+  Original exception was:
+  Error in sys.excepthook:
+
+  Original exception was:
+  Error in sys.excepthook:
+
+  Original exception was:
+  Error in sys.excepthook:
+  ```
+
+  Investigation: this is the CUDA driver reporting that the GPU ran out of memory while CuPy was still holding kernels or memory pools (the traceback surfaces inside CuPy’s `moduleUnload` machinery). Within the ZeMosaic codebase, all main GPU paths (`zemosaic_align_stack.py` for stack GPU, `zemosaic_utils.gpu_reproject_and_coadd_impl`, hot-pixel correction, background map, and GPU stretch) already wrap CuPy usage in `try/except Exception` and either consult `gpu_memory_sufficient(...)` before heavy allocations or fall back to CPU on error, so the underlying cause is a dataset / VRAM size mismatch rather than an uncaught error in the stacking/mosaicking logic itself. The repeated `Error in sys.excepthook` messages indicate that an external/global exception hook (outside this repo) is itself failing while trying to format or log the original CuPy `CUDADriverError`.
+
+  Recommended mitigation: when processing very large mosaics or high-resolution stacks on GPUs with limited VRAM, prefer to (a) disable GPU stacking in the GUI so that the worker uses the CPU implementations, or (b) keep GPU enabled but reduce memory pressure by lowering image sizes, reducing the number of simultaneous frames, or disabling optional GPU helpers (e.g. set `ZEMOSAIC_FORCE_CPU_INTERTILE=1` to force CPU for inter-tile helpers if needed). The worker’s GPU paths are designed to fall back cleanly to CPU when CuPy raises a runtime error, but final CUDA driver teardown may still emit `CUDA_ERROR_OUT_OF_MEMORY` tracebacks to the console if the environment’s global `sys.excepthook` interferes; addressing that hook (or running with GPU disabled for extreme workloads) avoids noisy console output while preserving the main ZeMosaic logs in `zemosaic_worker.log`.

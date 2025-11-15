@@ -406,16 +406,99 @@ def _iter_normalized_entries(
         )
 
 
+SIP_COEFF_PREFIXES = ("A_", "B_", "AP_", "BP_")
+SIP_META_KEYS = {"A_ORDER", "B_ORDER", "AP_ORDER", "BP_ORDER"}
+
+
+def _header_contains_sip_terms(header_obj: Any) -> bool:
+    """Return True when the header exposes SIP distortion keywords."""
+
+    if header_obj is None:
+        return False
+    try:
+        keys_iter = list(header_obj.keys())  # type: ignore[arg-type]
+    except Exception:
+        try:
+            keys_iter = list(header_obj)
+        except Exception:
+            return False
+    for raw_key in keys_iter:
+        if raw_key is None:
+            continue
+        key_upper = str(raw_key).strip().upper()
+        if not key_upper:
+            continue
+        if key_upper in SIP_META_KEYS:
+            return True
+        for prefix in SIP_COEFF_PREFIXES:
+            if key_upper.startswith(prefix):
+                return True
+    return False
+
+
+def _ensure_sip_suffix_inplace(header_obj: Any):
+    """Append '-SIP' to CTYPE axes when SIP terms are present."""
+
+    if header_obj is None:
+        return None
+    try:
+        has_sip = _header_contains_sip_terms(header_obj)
+    except Exception:
+        has_sip = False
+    if not has_sip:
+        return header_obj
+
+    def _maybe_update(key: str) -> None:
+        try:
+            value = header_obj[key]
+        except Exception:
+            try:
+                value = header_obj.get(key)
+            except Exception:
+                value = None
+        if not isinstance(value, str):
+            return
+        cleaned = value.strip()
+        if not cleaned or cleaned.upper().endswith("-SIP"):
+            return
+        new_value = f"{cleaned}-SIP"
+        try:
+            header_obj[key] = new_value
+        except Exception:
+            try:
+                header_obj.set(key, new_value)
+            except Exception:
+                pass
+
+    _maybe_update("CTYPE1")
+    _maybe_update("CTYPE2")
+    return header_obj
+
+
+def _build_wcs_from_header(header_obj: Any):
+    """Instantiate a WCS while normalizing SIP metadata when needed."""
+
+    if header_obj is None or WCS is None:
+        return None
+    try:
+        hdr = _ensure_sip_suffix_inplace(header_obj)
+    except Exception:
+        hdr = header_obj
+    try:
+        return WCS(hdr, naxis=2, relax=True)
+    except Exception:
+        return None
+
+
 def _header_has_wcs(header: Any) -> bool:
     """Return ``True`` when the FITS header already contains a valid WCS."""
 
     if header is None:
         return False
     try:
-        if WCS is not None:
-            wcs_obj = WCS(header)
-            if getattr(wcs_obj, "is_celestial", False):
-                return True
+        wcs_obj = _build_wcs_from_header(header)
+        if getattr(wcs_obj, "is_celestial", False):
+            return True
     except Exception:
         pass
     for key in ("CTYPE1", "CTYPE2", "CD1_1", "CD2_2", "PC1_1", "PC2_2"):
@@ -1902,8 +1985,9 @@ class FilterQtDialog(QDialog):
 
         try:
             from astropy.io import fits as _fits  # type: ignore
-            from astropy.wcs import WCS as _WCS  # type: ignore
         except Exception:
+            return False, None, None
+        if WCS is None:
             return False, None, None
 
         output_dir_raw = self._config_value("output_dir", "")
@@ -1968,7 +2052,11 @@ class FilterQtDialog(QDialog):
                 if header is None:
                     continue
                 try:
-                    wcs_obj = _WCS(header)
+                    hdr = _ensure_sip_suffix_inplace(header)
+                except Exception:
+                    hdr = header
+                try:
+                    wcs_obj = WCS(hdr, naxis=2, relax=True)
                 except Exception:
                     wcs_obj = None
                 if wcs_obj is None or not getattr(wcs_obj, "is_celestial", False):
