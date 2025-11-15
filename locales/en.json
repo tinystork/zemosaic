@@ -755,7 +755,7 @@
     "qt_progress_count_placeholder": "0 / 0",
     "qt_progress_elapsed_label": "Elapsed:",
     "qt_progress_eta_label": "ETA:",
-    "qt_progress_files_label": "Files:",
+    "qt_progress_files_label": "Files remaining:",
     "qt_progress_phase_label": "Phase:",
     "qt_progress_placeholder": "Idle",
     "qt_progress_tiles_label": "Tiles:",

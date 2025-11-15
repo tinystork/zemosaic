@@ -173,10 +173,10 @@ Mirror Tk’s logging/progress panel in the Qt UI.
 
 **Detailed requirements:**
 
-- [ ] Add UI elements for master tile counts, remaining raw files, and chrono displays.
-- [ ] Bind the new elements to the signals introduced in Task D.
-- [ ] Persist the additional labels/values in any UI refresh or config snapshot routines.
-- [ ] Validate layout matches Tk ordering and terminology.
+- [x] Add UI elements for master tile counts, remaining raw files, and chrono displays.
+- [x] Bind the new elements to the signals introduced in Task D.
+- [x] Persist the additional labels/values in any UI refresh or config snapshot routines.
+- [x] Validate layout matches Tk ordering and terminology.
 
 
 ---
@@ -236,3 +236,4 @@ Ensure the coding agent ALWAYS updates this file after completing a task.
 - [x] 2024-06-30: Audit identified outstanding parity gaps (Tasks B, D-G added); pending implementation.
 - [x] 2025-11-14: Task B implemented and verified — Qt `_handle_payload` now emits structured GPU helper events, and `ZeMosaicQtMainWindow` applies ETA overrides and helper tracking in parity with Tk `_log_message`/`_handle_gpu_helper_*`.
 - [x] 2025-11-14: Task D implemented — Qt worker now consumes `ETA_UPDATE`, chrono, raw/master counter, and `CLUSTER_OVERRIDE` payloads, emits dedicated signals, updates progress labels, and treats `log_key_processing_cancelled` as a proper cancellation path for timers and status indicators.
+- [x] 2025-11-15: Task E implemented — Qt logging/progress panel now mirrors Tk ordering/terminology, exposes master tile counts and remaining raw files, and keeps chrono/ETA displays and resets in sync with worker signals.

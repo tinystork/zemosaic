@@ -2165,36 +2165,36 @@ class ZeMosaicQtMainWindow(QMainWindow):
         stats_layout.setHorizontalSpacing(12)
         stats_layout.setVerticalSpacing(4)
 
-        phase_label = QLabel(self._tr("qt_progress_phase_label", "Phase:"), group)
-        self.phase_value_label = QLabel(self._tr("qt_progress_placeholder", "Idle"), group)
-        stats_layout.addWidget(phase_label, 0, 0)
-        stats_layout.addWidget(self.phase_value_label, 0, 1)
-
         eta_label = QLabel(self._tr("qt_progress_eta_label", "ETA:"), group)
         self.eta_value_label = QLabel(self._tr("qt_progress_placeholder", "—"), group)
-        stats_layout.addWidget(eta_label, 0, 2)
-        stats_layout.addWidget(self.eta_value_label, 0, 3)
+        stats_layout.addWidget(eta_label, 0, 0)
+        stats_layout.addWidget(self.eta_value_label, 0, 1)
 
         elapsed_label = QLabel(self._tr("qt_progress_elapsed_label", "Elapsed:"), group)
         self.elapsed_value_label = QLabel(self._tr("qt_progress_placeholder", "—"), group)
-        stats_layout.addWidget(elapsed_label, 0, 4)
-        stats_layout.addWidget(self.elapsed_value_label, 0, 5)
-
-        files_label = QLabel(self._tr("qt_progress_files_label", "Files:"), group)
-        self.files_value_label = QLabel(
-            self._tr("qt_progress_count_placeholder", "0 / 0"),
-            group,
-        )
-        stats_layout.addWidget(files_label, 1, 0)
-        stats_layout.addWidget(self.files_value_label, 1, 1)
+        stats_layout.addWidget(elapsed_label, 0, 2)
+        stats_layout.addWidget(self.elapsed_value_label, 0, 3)
 
         tiles_label = QLabel(self._tr("qt_progress_tiles_label", "Tiles:"), group)
         self.tiles_value_label = QLabel(
             self._tr("qt_progress_count_placeholder", "0 / 0"),
             group,
         )
-        stats_layout.addWidget(tiles_label, 1, 2)
-        stats_layout.addWidget(self.tiles_value_label, 1, 3)
+        stats_layout.addWidget(tiles_label, 0, 4)
+        stats_layout.addWidget(self.tiles_value_label, 0, 5)
+
+        files_label = QLabel(
+            self._tr("qt_progress_files_label", "Files remaining:"),
+            group,
+        )
+        self.files_value_label = QLabel("", group)
+        stats_layout.addWidget(files_label, 1, 0)
+        stats_layout.addWidget(self.files_value_label, 1, 1)
+
+        phase_label = QLabel(self._tr("qt_progress_phase_label", "Phase:"), group)
+        self.phase_value_label = QLabel(self._tr("qt_progress_placeholder", "Idle"), group)
+        stats_layout.addWidget(phase_label, 1, 2)
+        stats_layout.addWidget(self.phase_value_label, 1, 3)
 
         layout.addLayout(stats_layout)
 
@@ -3609,14 +3609,14 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self.phase_value_label.setText(self._tr("qt_progress_placeholder", "Idle"))
             self._set_eta_display(self._tr("qt_progress_placeholder", "—"), force=True)
             self.elapsed_value_label.setText("00:00:00")
-            self.files_value_label.setText(self._tr("qt_progress_count_placeholder", "0 / 0"))
+            self.files_value_label.setText("")
             self.tiles_value_label.setText(self._tr("qt_progress_count_placeholder", "0 / 0"))
         else:
             self.progress_bar.setValue(0)
             self.phase_value_label.setText(self._tr("qt_progress_placeholder", "Idle"))
             self._set_eta_display(self._tr("qt_progress_placeholder", "—"), force=True)
             self.elapsed_value_label.setText(self._tr("qt_progress_placeholder", "—"))
-            self.files_value_label.setText(self._tr("qt_progress_count_placeholder", "0 / 0"))
+            self.files_value_label.setText("")
             self.tiles_value_label.setText(self._tr("qt_progress_count_placeholder", "0 / 0"))
             self._reset_progress_tracking()
 
@@ -3828,7 +3828,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
         files_done = payload.get("files_done")
         files_total = payload.get("files_total")
         if isinstance(files_done, int) and isinstance(files_total, int) and files_total >= 0:
-            self.files_value_label.setText(f"{files_done} / {files_total}")
+            done = max(0, files_done)
+            remaining = max(0, files_total - done)
+            self.files_value_label.setText(str(remaining))
         tiles_done = payload.get("tiles_done")
         tiles_total = payload.get("tiles_total")
         if isinstance(tiles_done, int) and isinstance(tiles_total, int) and tiles_total >= 0:
@@ -3874,11 +3876,12 @@ class ZeMosaicQtMainWindow(QMainWindow):
             tot = 0
         if tot < 0:
             tot = 0
-        if tot > 0:
-            cur = max(0, min(cur, tot))
-        else:
-            cur = max(0, cur)
-        self.files_value_label.setText(f"{cur} / {tot}")
+        if cur < 0:
+            cur = 0
+        if tot > 0 and cur > tot:
+            cur = tot
+        remaining = max(0, tot - cur)
+        self.files_value_label.setText(str(remaining))
 
     def _on_worker_master_tile_count_updated(self, current: int, total: int) -> None:
         try:

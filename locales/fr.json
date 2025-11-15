@@ -740,7 +740,7 @@
     "qt_progress_count_placeholder": "0 / 0",
     "qt_progress_elapsed_label": "Écoulé :",
     "qt_progress_eta_label": "ETA :",
-    "qt_progress_files_label": "Fichiers :",
+    "qt_progress_files_label": "Fichiers restants :",
     "qt_progress_phase_label": "Phase :",
     "qt_progress_placeholder": "Inactif",
     "qt_progress_tiles_label": "Tuiles :",
