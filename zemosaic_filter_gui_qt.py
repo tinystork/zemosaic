@@ -1575,6 +1575,10 @@ class FilterQtDialog(QDialog):
             box,
         )
         self._sds_checkbox.setChecked(bool(self._sds_mode_initial))
+        try:
+            self._sds_checkbox.toggled.connect(self._on_sds_toggled)  # type: ignore[arg-type]
+        except Exception:
+            pass
         layout.addWidget(self._sds_checkbox, 3, 0, 1, 2)
 
         return box
@@ -1700,12 +1704,32 @@ class FilterQtDialog(QDialog):
             self._localizer.get("filter.cluster.running", "Preparing master-tile groups…")
         )
 
-        thread = threading.Thread(
-            target=self._auto_group_background_task,
-            args=(selected_indices,),
-            daemon=True,
-        )
-        thread.start()
+        try:
+            thread = threading.Thread(
+                target=self._auto_group_background_task,
+                args=(selected_indices,),
+                daemon=True,
+            )
+            thread.start()
+        except Exception as exc:
+            # If the background thread cannot be started, fall back to a safe state
+            # and report the issue instead of leaving the button permanently disabled.
+            self._auto_group_running = False
+            if self._auto_group_button is not None:
+                try:
+                    self._auto_group_button.setEnabled(True)
+                except Exception:
+                    pass
+            message = self._localizer.get(
+                "filter.cluster.failed",
+                "Auto-organisation failed: {error}",
+            )
+            try:
+                message = message.format(error=exc)
+            except Exception:
+                message = f"Auto-organisation failed: {exc}"
+            self._append_log(message)
+            self._status_label.setText(message)
 
     def _auto_group_background_task(self, selected_indices: list[int]) -> None:
         messages: list[str] = []
@@ -2121,25 +2145,71 @@ class FilterQtDialog(QDialog):
             dec_vals: list[float] = []
             for info in group or []:
                 footprint = self._resolve_group_entry_footprint(info, path_map)
-                if not footprint:
+                if footprint:
+                    for ra_deg, dec_deg in footprint:
+                        if ra_deg is None or dec_deg is None:
+                            continue
+                        try:
+                            ra_val = float(ra_deg)
+                            dec_val = float(dec_deg)
+                        except Exception:
+                            continue
+                        if not (math.isfinite(ra_val) and math.isfinite(dec_val)):
+                            continue
+                        ra_vals.append(ra_val)
+                        dec_vals.append(dec_val)
                     continue
-                for ra_deg, dec_deg in footprint:
-                    if ra_deg is None or dec_deg is None:
-                        continue
-                    try:
-                        ra_val = float(ra_deg)
-                        dec_val = float(dec_deg)
-                    except Exception:
-                        continue
-                    if not (math.isfinite(ra_val) and math.isfinite(dec_val)):
-                        continue
-                    ra_vals.append(ra_val)
-                    dec_vals.append(dec_val)
+
+                # Fallback: approximate from group entry centre when no footprint is available.
+                center_ra: float | None = None
+                center_dec: float | None = None
+                entry_obj: _NormalizedItem | None = None
+                if isinstance(info, dict):
+                    path_val = None
+                    for key in ("path", "path_raw", "path_preprocessed_cache"):
+                        candidate = info.get(key)
+                        if candidate:
+                            path_val = candidate
+                            break
+                    if path_val:
+                        entry_obj = path_map.get(os.path.normcase(str(path_val)))
+                    if entry_obj is not None:
+                        center_ra = entry_obj.center_ra_deg
+                        center_dec = entry_obj.center_dec_deg
+                        if center_ra is None or center_dec is None:
+                            center_ra, center_dec = self._ensure_entry_coordinates(entry_obj)
+                    if (center_ra is None or center_dec is None) and isinstance(info, dict):
+                        try:
+                            center_ra = float(info.get("RA")) if info.get("RA") is not None else None
+                            center_dec = float(info.get("DEC")) if info.get("DEC") is not None else None
+                        except Exception:
+                            center_ra = None
+                            center_dec = None
+                if center_ra is not None and center_dec is not None:
+                    if math.isfinite(center_ra) and math.isfinite(center_dec):
+                        ra_vals.append(float(center_ra))
+                        dec_vals.append(float(center_dec))
             if not ra_vals or not dec_vals:
                 continue
-            ra_min, ra_max = self._normalize_ra_span(ra_vals)
-            dec_min = min(dec_vals)
-            dec_max = max(dec_vals)
+            ra_min_raw, ra_max_raw = self._normalize_ra_span(ra_vals)
+            dec_min_raw = min(dec_vals)
+            dec_max_raw = max(dec_vals)
+
+            # Ensure non-zero extent so rectangles remain visible even for tiny groups.
+            if ra_min_raw == ra_max_raw:
+                margin_ra = 0.05
+                ra_min = ra_min_raw - margin_ra
+                ra_max = ra_max_raw + margin_ra
+            else:
+                ra_min, ra_max = ra_min_raw, ra_max_raw
+
+            if dec_min_raw == dec_max_raw:
+                margin_dec = 0.05
+                dec_min = dec_min_raw - margin_dec
+                dec_max = dec_max_raw + margin_dec
+            else:
+                dec_min, dec_max = dec_min_raw, dec_max_raw
+
             outlines.append((ra_min, ra_max, dec_min, dec_max))
         return outlines
 
@@ -3125,6 +3195,21 @@ class FilterQtDialog(QDialog):
 
         self._summary_label.setText(summary_display)
         self._append_log(summary_display)
+
+    def _on_sds_toggled(self, checked: bool) -> None:
+        # Reset any previous auto-organisation overrides so the user can
+        # recompute groups after changing SDS mode, and keep the button usable.
+        self._auto_group_override_groups = None
+        self._group_outline_bounds = []
+        if not self._auto_group_running and self._auto_group_button is not None:
+            try:
+                self._auto_group_button.setEnabled(True)
+            except Exception:
+                pass
+        # Refresh cluster and preview so the UI reflects the new mode.
+        self._schedule_cluster_refresh()
+        self._update_summary_label()
+        self._schedule_preview_refresh()
 
     def _create_options_box(self):
         box = QGroupBox(self._localizer.get("filter.group.options", "Filter options"), self)
