@@ -196,6 +196,7 @@
     "run_info_phase4_finished": "Phase 4 finished: Final grid: Shape(H,W)={shape}, CRVAL={crval}",
     "global_coadd_error_descriptor_missing": "Global WCS descriptor missing; Mosaic-First disabled.",
     "global_coadd_error_failed_fallback": "Global Mosaic-First coadd failed; returning to classic workflow.",
+    "p4_global_coadd_started": "P4 - Mosaic-First global coadd starting ({method}) on grid {W}×{H}px with {images} image(s) — route: {route}.",
     "p4_global_coadd_progress": "P4 - Mosaic-First global coadd progress: {done}/{total} image(s) processed.",
     "p4_global_coadd_finished": "P4 - Mosaic-First global coadd finished ({method}) in {elapsed_s:.1f}s — grid {W}×{H}px, {images} image(s).",
     "global_coadd_plan_descriptor": "Mosaic-First plan ready (mode={descriptor_mode}, FITS={descriptor_fits_path}, JSON={descriptor_json_path}).",

@@ -13978,6 +13978,24 @@ def _assemble_global_mosaic_first_impl(
             **_payload(helper="gpu_reproject", reason=reason, method=coadd_method),
         )
 
+    start_route_label = "GPU helper (gpu_reproject)" if gpu_helper_supported else "CPU pipeline"
+    start_payload = _payload(
+        W=int(width),
+        H=int(height),
+        images=int(total_images),
+        method=coadd_method,
+        route=start_route_label,
+        use_gpu_helper=bool(gpu_helper_supported),
+    )
+    if gpu_helper_supported:
+        start_payload["helper"] = "gpu_reproject"
+    pcb(
+        "p4_global_coadd_started",
+        prog=base_progress_phase if base_progress_phase is not None else None,
+        lvl="INFO",
+        **start_payload,
+    )
+
     use_memmap = bool(global_plan.get("coadd_use_memmap", False))
     cleanup_temp_files = bool(global_plan.get("coadd_cleanup_memmap", True))
     memmap_root = (

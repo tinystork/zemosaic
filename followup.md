@@ -465,3 +465,35 @@ same features, same return values, and a similar layout/flow, so users can switc
   Investigation: this is the CUDA driver reporting that the GPU ran out of memory while CuPy was still holding kernels or memory pools (the traceback surfaces inside CuPy’s `moduleUnload` machinery). Within the ZeMosaic codebase, all main GPU paths (`zemosaic_align_stack.py` for stack GPU, `zemosaic_utils.gpu_reproject_and_coadd_impl`, hot-pixel correction, background map, and GPU stretch) already wrap CuPy usage in `try/except Exception` and either consult `gpu_memory_sufficient(...)` before heavy allocations or fall back to CPU on error, so the underlying cause is a dataset / VRAM size mismatch rather than an uncaught error in the stacking/mosaicking logic itself. The repeated `Error in sys.excepthook` messages indicate that an external/global exception hook (outside this repo) is itself failing while trying to format or log the original CuPy `CUDADriverError`.
 
   Recommended mitigation: when processing very large mosaics or high-resolution stacks on GPUs with limited VRAM, prefer to (a) disable GPU stacking in the GUI so that the worker uses the CPU implementations, or (b) keep GPU enabled but reduce memory pressure by lowering image sizes, reducing the number of simultaneous frames, or disabling optional GPU helpers (e.g. set `ZEMOSAIC_FORCE_CPU_INTERTILE=1` to force CPU for inter-tile helpers if needed). The worker’s GPU paths are designed to fall back cleanly to CPU when CuPy raises a runtime error, but final CUDA driver teardown may still emit `CUDA_ERROR_OUT_OF_MEMORY` tracebacks to the console if the environment’s global `sys.excepthook` interferes; addressing that hook (or running with GPU disabled for extreme workloads) avoids noisy console output while preserving the main ZeMosaic logs in `zemosaic_worker.log`.
+
+---
+
+## Task M — Global coadd logging & canvas tightening
+
+**Goal:**  
+Make the end of the Mosaic-first / global coadd phase more observable (logs and GUI) and reduce cases where the final mosaic canvas is much larger than the actual stacked sky area (large empty borders), especially when using the GPU helper path (`helper='gpu_reproject'`).
+
+**Detailed requirements (logging):**
+
+- [x] Add a dedicated start marker for the global coadd phase (e.g. `p4_global_coadd_started`) emitted immediately before attempting the GPU helper or CPU path, including at least: method, target `W×H`, number of frames, and whether GPU/CPU is selected. *(2025-11-16: Added localized `p4_global_coadd_started` log with route metadata emitted ahead of GPU helper / CPU fallbacks.)*
+- [ ] Inside the GPU helper path in `zemosaic_worker.py` (the block that emits `global_coadd_info_helper_path` / `global_coadd_info_helper_magic_wait` and then calls `zemosaic_utils.reproject_and_coadd_wrapper`), add one or more progress-style callbacks (e.g. `global_coadd_helper_channel_progress`) exposing the channel index, total channels, and basic timing so that the GUI and log file show that work is ongoing between “Using helper 'gpu_reproject'…” and `p4_global_coadd_finished`.
+- [ ] When the GPU helper returns successfully, ensure that `p4_global_coadd_finished` is always emitted once per run with consistent payload (`W`, `H`, `images`, `channels`, `elapsed_s`, `method`, `helper`), and that it is visible both in `zemosaic_worker.log` and in the Tk/Qt log consoles at level INFO/SUCCESS.
+- [ ] On helper failures or CPU fallback (paths that emit `global_coadd_warn_helper_unavailable` / `global_coadd_warn_helper_fallback`), add a summary log line making explicit whether the run will continue on CPU, and whether any partial GPU artefacts were discarded.
+
+**Detailed requirements (canvas / WCS diagnostics):**
+
+- [ ] Extend `compute_global_wcs_descriptor` in `zemosaic_utils.py` to log, at DEBUG or INFO level, the main descriptor parameters used to build the global grid: number of usable entries, RA/DEC span before/after padding, chosen pixel scale, resulting `width×height`, and `padding_percent`. The goal is to make it easier to correlate a very large canvas (e.g. 13418×4177) with the underlying WCS footprint and padding choices.
+- [ ] In the SDS / Mosaic-first assembly functions (`assemble_global_mosaic_first` / `assemble_global_mosaic_sds`), add optional debug logs summarizing the coverage grid and batch selection: approximate fraction of the global canvas that ends up with non-zero coverage, and the min/max bounding box (in pixels) where coverage exceeds a small threshold.
+- [ ] Document, in the log or in `followup.md`, the likely cause of mosaics with large empty borders: outlier WCS entries (frames far from the main field or later rejected by quality/coverage gates) expand the RA/DEC bounding box used by `compute_global_wcs_descriptor`, leading to a larger `width×height` even though the final coverage is concentrated in a smaller region.
+
+**Detailed requirements (optional auto-cropping, guarded behind a config flag):**
+
+- [ ] Introduce a configuration flag (e.g. `global_wcs_autocrop_enabled`, default `False`) plus an associated padding parameter (e.g. `global_wcs_autocrop_margin_px` or `%`) controlling whether the final global mosaic should be cropped to the minimal rectangle that contains “useful” data.
+- [ ] When autocrop is enabled and the coadd returns both a mosaic and a coverage/alpha map, compute the tightest bounding box where coverage exceeds a small epsilon (for example coverage > 0 or > a tiny fraction of the maximum), expand it by the configured margin, clamp to the original canvas, and crop both the image and coverage arrays.
+- [ ] Update the global WCS header accordingly: adjust `NAXIS1/2` to the new width/height, and shift `CRPIX1/2` to account for the removed margins so that world coordinates remain correct for the cropped mosaic.
+- [ ] Ensure that downstream consumers (visualization tools, SDS post-processing, and any JSON metadata that records `width`/`height`) see the updated dimensions and still behave correctly; where appropriate, keep the pre-crop descriptor for debugging in the JSON metadata (e.g. `original_width` / `original_height`).
+
+**Implementation notes:**
+
+- The logging part should reuse the existing `pcb(...)` / `_log_and_callback(...)` infrastructure so that new keys (`p4_global_coadd_started`, `global_coadd_helper_channel_progress`, etc.) automatically flow to both Tk and Qt log consoles via localization.
+- Autocropping must remain opt-in at first, to avoid surprising users who rely on a fixed canvas size; start with conservative defaults (no crop) and document any behaviour change in this file once validated on real-world mosaics (like the example where a 13418×4177 canvas effectively contained a ~3922×4684 useful region after manual crop).
