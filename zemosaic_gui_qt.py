@@ -4069,6 +4069,23 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._run_started_monotonic = None
         self._set_processing_state(False)
         self.stop_button.setEnabled(False)
+
+        # Distinguish clean completion from user cancellation and errors.
+        is_cancel = (not success) and (
+            not message
+            or message == "qt_log_processing_cancelled"
+            or message == "log_key_processing_cancelled"
+        )
+
+        if is_cancel:
+            # Mirror Tk semantics: treat user-triggered stops as a warning-style
+            # cancellation using the shared log key, reset the progress panel,
+            # and avoid hard-error dialogs.
+            cancel_key = "log_key_processing_cancelled"
+            translated = self._translate_worker_message(cancel_key, {}, "WARN")
+            self._append_log(translated, level="warning")
+            return
+
         if success:
             completion_message = self._tr(
                 "qt_log_processing_completed", "Processing completed successfully."
@@ -4080,21 +4097,66 @@ class ZeMosaicQtMainWindow(QMainWindow):
                     self._tr("qt_processing_finished_title", "Processing complete"),
                     completion_message,
                 )
-        else:
-            if message:
-                translated = self._translate_worker_message(message)
-            else:
-                translated = self._tr(
-                    "qt_log_processing_cancelled", "Processing cancelled."
+            # Optional post-run prompt to open the output folder, mirroring Tk.
+            output_dir = str(self.config.get("output_dir", "") or "").strip()
+            if (
+                output_dir
+                and os.path.isdir(output_dir)
+                and self.isVisible()
+            ):
+                title = self.localizer.get(
+                    "q_open_output_folder_title",
+                    "Open Output Folder?",
                 )
-            level = "error" if message else "warning"
-            self._append_log(translated, level=level)
-            if self.isVisible():
-                QMessageBox.warning(
+                prompt = self.localizer.get(
+                    "q_open_output_folder_msg",
+                    "Do you want to open the output folder '{folder}'?",
+                    folder=output_dir,
+                )
+                answer = QMessageBox.question(
                     self,
-                    self._tr("qt_processing_stopped_title", "Processing stopped"),
-                    translated,
+                    title,
+                    prompt,
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes,
                 )
+                if answer == QMessageBox.Yes:
+                    try:
+                        if os.name == "nt":
+                            os.startfile(output_dir)  # type: ignore[arg-type]
+                        elif sys.platform == "darwin":
+                            subprocess.Popen(["open", output_dir])
+                        else:
+                            subprocess.Popen(["xdg-open", output_dir])
+                    except Exception as exc:
+                        log_msg = self.localizer.get(
+                            "log_key_error_opening_folder",
+                            "Error opening output folder: {error}",
+                            error=str(exc),
+                        )
+                        self._append_log(log_msg, level="error")
+                        error_title = self.localizer.get(
+                            "error_title",
+                            "Error",
+                        )
+                        error_body = self.localizer.get(
+                            "error_cannot_open_folder",
+                            "Could not open output folder:\n{error}",
+                            error=str(exc),
+                        )
+                        QMessageBox.critical(self, error_title, error_body)
+            return
+
+        # Non-success, non-cancellation path: treat as an error reported by the worker.
+        message_key = message or "qt_worker_error_generic"
+        translated = self._translate_worker_message(message_key, {}, "ERROR")
+        self._append_log(translated, level="error")
+        if self.isVisible():
+            QMessageBox.warning(
+                self,
+                self._tr("qt_processing_stopped_title", "Processing stopped"),
+                translated,
+            )
 
     def _on_elapsed_timer_tick(self) -> None:
         if not self.is_processing or self._run_started_monotonic is None:

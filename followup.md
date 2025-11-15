@@ -253,10 +253,10 @@ Align Qt run completion and cancellation behaviour with the Tk GUI so users see 
 
 **Detailed requirements:**
 
-- [ ] Add an optional “Open output folder” prompt to the Qt GUI on successful completion, mirroring Tk’s platform-specific behaviour.
-- [ ] Treat user-triggered cancellations in Qt as a warning-style completion (`log_key_processing_cancelled`) rather than a generic error, matching Tk’s log level semantics.
-- [ ] Confirm that timers, ETA, tiles/files counters, and phase labels reset identically on completion and on cancellation in both backends.
-- [ ] Document any intentional UX differences (if any remain) in the Notes / Known Issues section.
+- [x] Add an optional “Open output folder” prompt to the Qt GUI on successful completion, mirroring Tk’s platform-specific behaviour.
+- [x] Treat user-triggered cancellations in Qt as a warning-style completion (`log_key_processing_cancelled`) rather than a generic error, matching Tk’s log level semantics.
+- [x] Confirm that timers, ETA, tiles/files counters, and phase labels reset identically on completion and on cancellation in both backends.
+- [x] Document any intentional UX differences (if any remain) in the Notes / Known Issues section.
 
 Implementation notes (2025-11 audit):
 - Fix `_on_worker_finished` in `zemosaic_gui_qt.py` so it calls `_translate_worker_message(message_key_or_raw, params, level)` with proper arguments and does not raise on non-success paths.
@@ -300,3 +300,4 @@ Implementation notes (2025-11 audit):
 - [x] 2025-11-15: Task F implemented — Qt worker now forwards structured `msg_key` + kwargs to the main window, which uses `ZeMosaicLocalization.get(..., **kwargs)` for all user-facing levels, mirrors Tk’s key handling (including `run_*`/`global_coadd_*` prefixes), and highlights GPU-related log entries (including helper fallback warnings) using a dedicated style while keeping the messages localized and visible.
 - [x] 2025-11-15: Task G implemented — Qt main window now exposes a language selector combo initialized from `config["language"]`, drives `localizer.set_language(...)`, and relies on shared `zemosaic_config` persistence so Tk and Qt read/write the same language key when switching backends.
 - [x] 2025-11-15: Task H parity check — Reviewed Tk vs Qt filter global-WCS/SDS paths (`zemosaic_filter_gui.py`, `zemosaic_filter_gui_qt.py`) and worker global-plan logic (`zemosaic_worker.py`), and confirmed that both GUIs emit matching `global_wcs_*` overrides and `sds_mode`/`mode` flags into `filter_overrides` so `_prepare_global_wcs_plan` and `_runtime_build_global_wcs_plan` reuse descriptors and surface the same `global_coadd_*`/`sds_*` log keys. Also ran `pytest -q tests/test_sds_postprocessing.py -s` to exercise the SDS post-stack pipeline; no GUI-level regressions were detected, but a full Seestar dataset run is still recommended outside this harness for end-to-end visual validation.
+- [x] 2025-11-15: Task I implemented — Qt `_on_worker_finished` now distinguishes clean completion, user cancellation, and worker errors; user-triggered cancellations (including filter aborts and Stop-button requests) are surfaced as `log_key_processing_cancelled` at WARN level without hard-error dialogs, successful runs prompt to open the output folder using the same localized strings and platform-specific launch logic as Tk, and the shared `_set_processing_state(False)`/timer helpers ensure ETA, elapsed time, files/tiles counters, and phase labels are reset consistently when runs end under both backends.
