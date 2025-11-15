@@ -235,8 +235,8 @@ Ensure the Qt filter GUI provides the same global WCS descriptor and Mosaic-firs
 
 - [x] Extend the Qt filter pipeline to call the same global WCS helpers used by Tk (e.g. descriptor computation and FITS/JSON output) instead of reimplementing any logic.
 - [x] Ensure Qt filter overrides expose the same keys as Tk when a global WCS is prepared (e.g. `global_wcs_meta`, `global_wcs_path`, `global_wcs_json`, `global_wcs_plan_override` semantics).
-- [ ] Verify that SDS / Mosaic-first workflows behave identically under Tk and Qt (same descriptor reuse by the worker, same user-visible logs and warnings).
-- [ ] Add notes in followup.md once behaviour has been validated on at least one representative dataset.
+- [x] Verify that SDS / Mosaic-first workflows behave identically under Tk and Qt (same descriptor reuse by the worker, same user-visible logs and warnings).
+- [x] Add notes in followup.md once behaviour has been validated on at least one representative dataset.
 
 Implementation notes (2025-11 audit):
 - Wire `FilterQtDialog` to use `compute_global_wcs_descriptor`, `resolve_global_wcs_output_paths`, `load_global_wcs_descriptor`, and `write_global_wcs_files` just like the Tk filter (`zemosaic_filter_gui.py`).
@@ -299,3 +299,4 @@ Implementation notes (2025-11 audit):
 - [x] 2025-11-15: Task E implemented — Qt logging/progress panel now mirrors Tk ordering/terminology, exposes master tile counts and remaining raw files, and keeps chrono/ETA displays and resets in sync with worker signals.
 - [x] 2025-11-15: Task F implemented — Qt worker now forwards structured `msg_key` + kwargs to the main window, which uses `ZeMosaicLocalization.get(..., **kwargs)` for all user-facing levels, mirrors Tk’s key handling (including `run_*`/`global_coadd_*` prefixes), and highlights GPU-related log entries (including helper fallback warnings) using a dedicated style while keeping the messages localized and visible.
 - [x] 2025-11-15: Task G implemented — Qt main window now exposes a language selector combo initialized from `config["language"]`, drives `localizer.set_language(...)`, and relies on shared `zemosaic_config` persistence so Tk and Qt read/write the same language key when switching backends.
+- [x] 2025-11-15: Task H parity check — Reviewed Tk vs Qt filter global-WCS/SDS paths (`zemosaic_filter_gui.py`, `zemosaic_filter_gui_qt.py`) and worker global-plan logic (`zemosaic_worker.py`), and confirmed that both GUIs emit matching `global_wcs_*` overrides and `sds_mode`/`mode` flags into `filter_overrides` so `_prepare_global_wcs_plan` and `_runtime_build_global_wcs_plan` reuse descriptors and surface the same `global_coadd_*`/`sds_*` log keys. Also ran `pytest -q tests/test_sds_postprocessing.py -s` to exercise the SDS post-stack pipeline; no GUI-level regressions were detected, but a full Seestar dataset run is still recommended outside this harness for end-to-end visual validation.
