@@ -2360,51 +2360,6 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         layout.addLayout(stats_layout)
 
-        phase45_box = QGroupBox(
-            self._tr("qt_phase45_overlay_title", "Phase 4.5 overview"),
-            group,
-        )
-        phase45_layout = QVBoxLayout(phase45_box)
-        phase45_layout.setContentsMargins(6, 6, 6, 6)
-        phase45_layout.setSpacing(6)
-
-        overlay_controls = QHBoxLayout()
-        overlay_controls.setContentsMargins(0, 0, 0, 0)
-        overlay_controls.setSpacing(6)
-
-        overlay_toggle = QCheckBox(
-            self._tr("qt_phase45_overlay_toggle", "Show overlay"),
-            phase45_box,
-        )
-        overlay_toggle.setChecked(True)
-        overlay_toggle.toggled.connect(self._on_phase45_overlay_toggled)  # type: ignore[arg-type]
-        overlay_controls.addWidget(overlay_toggle)
-        overlay_controls.addStretch(1)
-        phase45_layout.addLayout(overlay_controls)
-
-        status_label = QLabel(
-            self._tr("phase45_status_idle", "Phase 4.5 idle"),
-            phase45_box,
-        )
-        status_label.setObjectName("phase45StatusLabel")
-        phase45_layout.addWidget(status_label)
-
-        overlay_scene = QGraphicsScene(phase45_box)
-        overlay_view = QGraphicsView(overlay_scene, phase45_box)
-        overlay_view.setRenderHint(QPainter.Antialiasing, True)
-        overlay_view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        overlay_view.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        overlay_view.setFrameShape(QFrame.NoFrame)
-        overlay_view.setMinimumHeight(160)
-        phase45_layout.addWidget(overlay_view)
-
-        self.phase45_overlay_toggle = overlay_toggle
-        self.phase45_status_label = status_label
-        self.phase45_overlay_scene = overlay_scene
-        self.phase45_overlay_view = overlay_view
-
-        layout.addWidget(phase45_box)
-
         self.log_output = QPlainTextEdit(group)
         self.log_output.setReadOnly(True)
         self.log_output.setPlaceholderText(
