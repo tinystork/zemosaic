@@ -86,6 +86,7 @@ from PySide6.QtWidgets import (  # noqa: E402  - imported after availability che
     QSplitter,
     QComboBox,
     QDoubleSpinBox,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QWidget,
@@ -1188,6 +1189,7 @@ class _StreamIngestWorker(QObject):
         super().__init__()
         self._payload = payload
         self._initial_overrides = initial_overrides
+        self._runtime_overrides: dict[str, Any] = {}
         _force_phase45_disabled(self._initial_overrides)
         self._scan_recursive = bool(scan_recursive)
         self._batch_size = max(1, int(batch_size))
@@ -1302,6 +1304,10 @@ class FilterQtDialog(QDialog):
         self._auto_group_checkbox: QCheckBox | None = None
         self._seestar_checkbox: QCheckBox | None = None
         self._sds_checkbox: QCheckBox | None = None
+        self._coverage_checkbox: QCheckBox | None = None
+        self._overcap_spin: QSpinBox | None = None
+        self._auto_angle_checkbox: QCheckBox | None = None
+        self._angle_split_spin: QDoubleSpinBox | None = None
         self._astap_instances_combo: QComboBox | None = None
         self._astap_instances_value = self._resolve_initial_astap_instances()
         self._preview_canvas: FigureCanvasQTAgg | None = None
@@ -1330,6 +1336,14 @@ class FilterQtDialog(QDialog):
             self._config_value("filter_enable_coverage_first", True),
             True,
         )
+        self._overcap_percent_value = self._clamp_overcap_percent(
+            self._config_value("filter_overcap_allowance_pct", 10)
+        )
+        base_angle = _sanitize_angle_value(self._config_value("cluster_orientation_split_deg", 0.0), 0.0)
+        if base_angle <= 0.0:
+            base_angle = ANGLE_SPLIT_DEFAULT_DEG
+        self._auto_angle_enabled = True
+        self._angle_split_value = float(base_angle)
         self._group_outline_bounds: list[tuple[float, float, float, float]] = []
         self._preview_color_cycle: tuple[str, ...] = (
             "#3f7ad6",
@@ -1581,7 +1595,8 @@ class FilterQtDialog(QDialog):
         # Summary label mirroring Tk's "Prepared N group(s), sizes: …"
         self._auto_group_summary_label = QLabel("", box)
         self._auto_group_summary_label.setWordWrap(True)
-        layout.addWidget(self._auto_group_summary_label, 0, 2, 2, 1)
+        layout.addWidget(self._auto_group_summary_label, 0, 2, 7, 1)
+        layout.setColumnStretch(2, 1)
 
         astap_label = QLabel(
             self._localizer.get("filter_label_astap_instances", "Max ASTAP instances"),
@@ -1609,6 +1624,50 @@ class FilterQtDialog(QDialog):
         self._write_wcs_checkbox.setChecked(True)
         layout.addWidget(self._write_wcs_checkbox, 2, 1)
 
+        self._coverage_checkbox = QCheckBox(
+            self._localizer.get(
+                "ui_coverage_first",
+                "Coverage-first clustering (may exceed Max raws/tile)",
+            ),
+            box,
+        )
+        self._coverage_checkbox.setChecked(bool(self._coverage_first_enabled_flag))
+        self._coverage_checkbox.toggled.connect(self._on_coverage_first_toggled)  # type: ignore[arg-type]
+        layout.addWidget(self._coverage_checkbox, 3, 0, 1, 2)
+
+        overcap_label = QLabel(
+            self._localizer.get("ui_overcap_allowance_pct", "Over-cap allowance (%)"),
+            box,
+        )
+        layout.addWidget(overcap_label, 4, 0)
+        self._overcap_spin = QSpinBox(box)
+        self._overcap_spin.setRange(0, 50)
+        self._overcap_spin.setSingleStep(5)
+        self._overcap_spin.setValue(int(self._resolve_overcap_percent()))
+        self._overcap_spin.valueChanged.connect(self._on_overcap_changed)  # type: ignore[arg-type]
+        layout.addWidget(self._overcap_spin, 4, 1)
+
+        self._auto_angle_checkbox = QCheckBox(
+            self._localizer.get("ui_auto_angle_split", "Auto split by orientation"),
+            box,
+        )
+        self._auto_angle_checkbox.setChecked(True)
+        self._auto_angle_checkbox.toggled.connect(self._on_auto_angle_toggled)  # type: ignore[arg-type]
+        layout.addWidget(self._auto_angle_checkbox, 5, 0, 1, 2)
+
+        angle_label = QLabel(
+            self._localizer.get("ui_angle_split_threshold", "Orientation split (deg)"),
+            box,
+        )
+        layout.addWidget(angle_label, 6, 0)
+        self._angle_split_spin = QDoubleSpinBox(box)
+        self._angle_split_spin.setRange(0.0, 180.0)
+        self._angle_split_spin.setSingleStep(0.5)
+        self._angle_split_spin.setDecimals(1)
+        self._angle_split_spin.setValue(float(self._angle_split_value))
+        self._angle_split_spin.valueChanged.connect(self._on_angle_split_changed)  # type: ignore[arg-type]
+        layout.addWidget(self._angle_split_spin, 6, 1)
+
         self._sds_checkbox = QCheckBox(
             self._localizer.get("filter_chk_sds_mode", "Enable ZeSupaDupStack (SDS)"),
             box,
@@ -1618,9 +1677,31 @@ class FilterQtDialog(QDialog):
             self._sds_checkbox.toggled.connect(self._on_sds_toggled)  # type: ignore[arg-type]
         except Exception:
             pass
-        layout.addWidget(self._sds_checkbox, 3, 0, 1, 2)
+        layout.addWidget(self._sds_checkbox, 7, 0, 1, 2)
 
         return box
+
+    def _on_coverage_first_toggled(self, checked: bool) -> None:
+        self._coverage_first_enabled_flag = bool(checked)
+        self._runtime_overrides["filter_enable_coverage_first"] = self._coverage_first_enabled_flag
+
+    def _on_overcap_changed(self, value: int) -> None:
+        clamped = self._clamp_overcap_percent(value)
+        self._overcap_percent_value = clamped
+        self._runtime_overrides["filter_overcap_allowance_pct"] = clamped
+
+    def _on_auto_angle_toggled(self, checked: bool) -> None:
+        self._auto_angle_enabled = bool(checked)
+        if self._auto_angle_enabled:
+            self._runtime_overrides.pop("cluster_orientation_split_deg", None)
+        else:
+            self._runtime_overrides["cluster_orientation_split_deg"] = float(self._angle_split_value)
+
+    def _on_angle_split_changed(self, value: float) -> None:
+        sanitized = _sanitize_angle_value(value, ANGLE_SPLIT_DEFAULT_DEG)
+        self._angle_split_value = sanitized
+        if not self._auto_angle_enabled:
+            self._runtime_overrides["cluster_orientation_split_deg"] = float(sanitized)
 
     def _refresh_instrument_options(self) -> None:
         combo = self._instrument_combo
@@ -2552,6 +2633,8 @@ class FilterQtDialog(QDialog):
         return max_sep
 
     def _resolve_orientation_split_threshold(self) -> float:
+        if hasattr(self, "_auto_angle_enabled") and not getattr(self, "_auto_angle_enabled", True):
+            return max(0.0, float(getattr(self, "_angle_split_value", 0.0) or 0.0))
         candidates = (
             self._safe_lookup(self._config_overrides, "cluster_orientation_split_deg"),
             self._safe_lookup(self._initial_overrides, "cluster_orientation_split_deg"),
@@ -2564,8 +2647,11 @@ class FilterQtDialog(QDialog):
         return 0.0
 
     def _resolve_angle_split_candidate(self) -> float:
-        value = self._config_value("cluster_orientation_split_deg", 0.0)
-        return _sanitize_angle_value(value, 0.0)
+        value = getattr(self, "_angle_split_value", None)
+        if value is not None:
+            return float(value)
+        raw = self._config_value("cluster_orientation_split_deg", 0.0)
+        return _sanitize_angle_value(raw, 0.0)
 
     def _resolve_auto_angle_detect_threshold(self) -> float:
         candidates = (
@@ -2593,11 +2679,10 @@ class FilterQtDialog(QDialog):
         return cap, min_cap
 
     def _resolve_overcap_percent(self) -> int:
-        try:
-            value = int(self._config_value("filter_overcap_allowance_pct", 10))
-        except Exception:
-            value = 10
-        return max(0, min(50, value))
+        value = getattr(self, "_overcap_percent_value", None)
+        if value is not None:
+            return int(value)
+        return self._clamp_overcap_percent(self._config_value("filter_overcap_allowance_pct", 10))
 
     def _coverage_first_enabled(self) -> bool:
         return bool(self._coverage_first_enabled_flag)
@@ -4004,6 +4089,7 @@ class FilterQtDialog(QDialog):
 
     def _config_value(self, key: str, default: Any = None) -> Any:
         sources: tuple[Any, ...] = (
+            self._runtime_overrides if isinstance(self._runtime_overrides, dict) else None,
             self._config_overrides if isinstance(self._config_overrides, dict) else None,
             self._initial_overrides if isinstance(self._initial_overrides, dict) else None,
             DEFAULT_FILTER_CONFIG,
@@ -4041,6 +4127,15 @@ class FilterQtDialog(QDialog):
         if text in {"0", "false", "no", "off"}:
             return False
         return default
+
+    @staticmethod
+    def _clamp_overcap_percent(value: Any, default: int = 10) -> int:
+        try:
+            parsed = int(value)
+        except Exception:
+            parsed = default
+        parsed = max(0, min(50, parsed))
+        return parsed
 
     @staticmethod
     def _coerce_float(value: Any, default: float) -> float:
@@ -4365,6 +4460,16 @@ class FilterQtDialog(QDialog):
         if not isinstance(descriptor, dict):
             return False, None, None
 
+        try:
+            self._global_wcs_state["descriptor"] = descriptor
+            self._global_wcs_state["fits_path"] = fits_path
+            self._global_wcs_state["json_path"] = json_path
+            meta_state = descriptor.get("metadata") if isinstance(descriptor.get("metadata"), dict) else None
+            if meta_state is not None:
+                self._global_wcs_state["meta"] = meta_state
+        except Exception:
+            pass
+
         meta_payload = self._build_global_wcs_meta(descriptor, fits_path, json_path)
         return True, meta_payload, {"fits_path": fits_path, "json_path": json_path}
 
@@ -4419,6 +4524,10 @@ class FilterQtDialog(QDialog):
 
         if self._sds_checkbox is not None:
             overrides["sds_mode"] = bool(self._sds_checkbox.isChecked())
+        overrides["filter_overcap_allowance_pct"] = int(self._resolve_overcap_percent())
+        overrides["filter_enable_coverage_first"] = bool(self._coverage_first_enabled_flag)
+        if hasattr(self, "_auto_angle_enabled") and not getattr(self, "_auto_angle_enabled", True):
+            overrides["cluster_orientation_split_deg"] = float(self._angle_split_value)
 
         excluded_indices: list[int] = []
         try:
