@@ -712,6 +712,17 @@ def _extract_center_from_header(header: Any) -> Tuple[float | None, float | None
     return ra_value, dec_value
 
 
+def _force_phase45_disabled(mapping: Any) -> None:
+    """Ensure Phase 4.5 / super-tiles stay disabled in config dicts."""
+
+    if not isinstance(mapping, dict):
+        return
+    try:
+        mapping["inter_master_merge_enable"] = False
+    except Exception:
+        pass
+
+
 class _DirectoryScanWorker(QObject):
     """Background worker resolving missing WCS entries with ASTAP."""
 
@@ -955,7 +966,7 @@ class _StreamIngestWorker(QObject):
         super().__init__()
         self._payload = payload
         self._initial_overrides = initial_overrides
-        self._force_phase45_disabled(self._initial_overrides)
+        _force_phase45_disabled(self._initial_overrides)
         self._scan_recursive = bool(scan_recursive)
         self._batch_size = max(1, int(batch_size))
         self._stop_requested = False
@@ -1019,14 +1030,14 @@ class FilterQtDialog(QDialog):
             self.setWindowIcon(icon)
         self._input_payload = raw_files_with_wcs_or_dir
         self._initial_overrides = initial_overrides
-        self._force_phase45_disabled(self._initial_overrides)
+        _force_phase45_disabled(self._initial_overrides)
         self._stream_scan = stream_scan
         self._scan_recursive = scan_recursive
         self._batch_size = batch_size
         self._preview_cap = preview_cap
         self._solver_settings = solver_settings_dict
         self._config_overrides = config_overrides or {}
-        self._force_phase45_disabled(self._config_overrides)
+        _force_phase45_disabled(self._config_overrides)
         self._accepted = False
 
         self._localizer = self._load_localizer()
@@ -2603,17 +2614,6 @@ class FilterQtDialog(QDialog):
             return default
         return result
 
-    @staticmethod
-    def _force_phase45_disabled(mapping: Any) -> None:
-        """Ensure Phase 4.5 / super-tiles remain disabled in overrides."""
-
-        if not isinstance(mapping, dict):
-            return
-        try:
-            mapping["inter_master_merge_enable"] = False
-        except Exception:
-            pass
-
     def _detect_primary_instrument_label(self) -> str | None:
         for entry in self._normalized_items:
             label = self._normalize_string(entry.instrument)
@@ -3029,7 +3029,7 @@ class FilterQtDialog(QDialog):
             overrides[key] = value
 
         result_overrides = overrides or None
-        self._force_phase45_disabled(result_overrides)
+        _force_phase45_disabled(result_overrides)
         return result_overrides
 
     def input_items(self) -> List[Any]:
