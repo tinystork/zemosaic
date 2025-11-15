@@ -40,10 +40,9 @@
 ║ Disclaimer:                                                                       ║
 ║   No AIs or butter knives were harmed in the making of this code.                 ║
 ╚═══════════════════════════════════════════════════════════════════════════════════╝
-"""
 
 
-"""PySide6-based ZeMosaic main window.
+PySide6-based ZeMosaic main window.
 
 The Qt interface is optional and can be launched from the regular
 ``run_zemosaic.py`` entry point by either setting the environment
@@ -74,6 +73,7 @@ try:
         QBrush,
         QCloseEvent,
         QColor,
+        QIcon,
         QPainter,
         QPen,
         QResizeEvent,
@@ -102,6 +102,7 @@ try:
         QPushButton,
         QSpinBox,
         QVBoxLayout,
+        QScrollArea,
         QWidget,
     )
 except ImportError as exc:  # pragma: no cover - import guard
@@ -148,6 +149,29 @@ if importlib.util.find_spec("zemosaic_astrometry") is not None:
     from zemosaic_astrometry import set_astap_max_concurrent_instances  # type: ignore
 else:  # pragma: no cover - optional dependency guard
     set_astap_max_concurrent_instances = None  # type: ignore[assignment]
+
+
+def _load_zemosaic_qicon() -> QIcon | None:
+    """Return a QIcon for ZeMosaic using the best available icon file."""
+    try:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        icon_dir = os.path.join(base_path, "icon")
+    except Exception:
+        return None
+
+    candidates = [
+        os.path.join(icon_dir, "zemosaic.ico"),
+        os.path.join(icon_dir, "zemosaic_64x64.png"),
+        os.path.join(icon_dir, "zemosaic_icon.png"),
+    ]
+
+    for path in candidates:
+        try:
+            if os.path.exists(path):
+                return QIcon(path)
+        except Exception:
+            continue
+    return None
 
 
 def _coerce_gpu_bool(value: Any, default: bool = False) -> bool:
@@ -619,6 +643,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
+        icon = _load_zemosaic_qicon()
+        if icon is not None:
+            self.setWindowIcon(icon)
 
         self._config_path: str | None = self._determine_config_path()
         self._config_load_notes: List[Tuple[str, str, str, Dict[str, Any]]] = []
@@ -749,7 +776,18 @@ class ZeMosaicQtMainWindow(QMainWindow):
     # UI construction helpers
     # ------------------------------------------------------------------
     def _setup_ui(self) -> None:
-        central_widget = QWidget(self)
+        # --- central widget wrapped in a scroll area ---
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setCentralWidget(scroll)
+
+        # actual content widget inside scroll area
+        central_widget = QWidget(scroll)
+        scroll.setWidget(central_widget)
+
+        # use the main layout on the content widget instead of the window
         main_layout = QVBoxLayout(central_widget)
         main_layout.setContentsMargins(12, 12, 12, 12)
         main_layout.setSpacing(10)
@@ -825,8 +863,6 @@ class ZeMosaicQtMainWindow(QMainWindow):
         button_row.addWidget(self.start_button)
         button_row.addWidget(self.stop_button)
         main_layout.addLayout(button_row)
-
-        self.setCentralWidget(central_widget)
 
     def _create_folders_group(self) -> QGroupBox:
         group = QGroupBox(self._tr("qt_group_folders", "Folders"), self)

@@ -839,6 +839,33 @@ def launch_filter_interface(
         from core.tk_safe import patch_tk_variables
 
         patch_tk_variables()
+
+        def _apply_zemosaic_icon_to_tk(window):
+            try:
+                import platform
+                from tkinter import PhotoImage
+
+                system_name = platform.system().lower()
+                is_windows = system_name == "windows"
+
+                base_path = os.path.dirname(os.path.abspath(__file__))
+                icon_dir = os.path.join(base_path, "icon")
+
+                ico_path = os.path.join(icon_dir, "zemosaic.ico")
+                png_candidates = [
+                    os.path.join(icon_dir, "zemosaic.png"),
+                    os.path.join(icon_dir, "zemosaic_icon.png"),
+                    os.path.join(icon_dir, "zemosaic_64x64.png"),
+                ]
+
+                if is_windows and os.path.exists(ico_path):
+                    window.iconbitmap(default=ico_path)
+                else:
+                    png_path = next((p for p in png_candidates if os.path.exists(p)), None)
+                    if png_path:
+                        window.iconphoto(True, PhotoImage(file=png_path))
+            except Exception as exc:
+                print(f"[FilterGUI] Impossible d'appliquer l'icône ZeMosaic: {exc}")
         heavy_import_error: ImportError | None = None
         try:
             import numpy as np
@@ -2380,6 +2407,8 @@ def launch_filter_interface(
                 root = tk.Tk()
         else:
             root = tk.Tk()
+
+        _apply_zemosaic_icon_to_tk(root)
 
         root.title(_tr(
             "filter_window_title",

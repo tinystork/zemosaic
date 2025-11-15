@@ -44,7 +44,7 @@
 
 
 
-"""Initial Qt filter dialog for ZeMosaic."""
+# Initial Qt filter dialog for ZeMosaic.
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -64,6 +64,7 @@ if _pyside_spec is None:  # pragma: no cover - import guard
     )
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot, QTimer
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (  # noqa: E402  - imported after availability check
     QApplication,
     QDialog,
@@ -81,6 +82,28 @@ from PySide6.QtWidgets import (  # noqa: E402  - imported after availability che
     QWidget,
     QVBoxLayout,
 )
+
+
+def _load_zemosaic_qicon() -> QIcon | None:
+    try:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        icon_dir = os.path.join(base_path, "icon")
+    except Exception:
+        return None
+
+    candidates = [
+        os.path.join(icon_dir, "zemosaic.ico"),
+        os.path.join(icon_dir, "zemosaic_64x64.png"),
+        os.path.join(icon_dir, "zemosaic_icon.png"),
+    ]
+
+    for path in candidates:
+        try:
+            if os.path.exists(path):
+                return QIcon(path)
+        except Exception:
+            continue
+    return None
 
 
 if importlib.util.find_spec("locales.zemosaic_localization") is not None:
@@ -796,6 +819,9 @@ class FilterQtDialog(QDialog):
         parent: Any | None = None,
     ) -> None:
         super().__init__(parent)
+        icon = _load_zemosaic_qicon()
+        if icon is not None:
+            self.setWindowIcon(icon)
         self._input_payload = raw_files_with_wcs_or_dir
         self._initial_overrides = initial_overrides
         self._stream_scan = stream_scan

@@ -230,29 +230,28 @@ class ZeMosaicGUI:
     def __init__(self, root_window):
         self.root = root_window
 
-        # --- DÉFINIR L'ICÔNE DE LA FENÊTRE AVEC FALLBACK MULTIPLATEFORME ---
+        # --- Définir l'icône ZeMosaic (multi-plateforme) ---
         try:
             base_path = os.path.dirname(os.path.abspath(__file__))
-            ico_path = os.path.join(base_path, "icon", "zemosaic.ico")
+            icon_dir = os.path.join(base_path, "icon")
+
+            ico_path = os.path.join(icon_dir, "zemosaic.ico")
             png_candidates = [
-                os.path.join(base_path, "icon", name)
-                for name in ("zemosaic.png", "zemosaic_icon.png", "zemosaic_64x64.png")
+                os.path.join(icon_dir, "zemosaic.png"),
+                os.path.join(icon_dir, "zemosaic_icon.png"),
+                os.path.join(icon_dir, "zemosaic_64x64.png"),
             ]
 
             if IS_WINDOWS and os.path.exists(ico_path):
                 self.root.iconbitmap(default=ico_path)
             else:
-                png_path = next((path for path in png_candidates if os.path.exists(path)), None)
+                from tkinter import PhotoImage
+
+                png_path = next((p for p in png_candidates if os.path.exists(p)), None)
                 if png_path:
-                    self.root.iconphoto(True, tk.PhotoImage(file=png_path))
-                elif os.path.exists(ico_path):
-                    # Fallback for non-Windows platforms supporting ICO via PhotoImage
-                    self.root.iconphoto(True, tk.PhotoImage(file=ico_path))
-                else:
-                    print("AVERT GUI: icône introuvable (ICO/PNG)")
+                    self.root.iconphoto(True, PhotoImage(file=png_path))
         except Exception as e_icon:
-            print(f"AVERT GUI: icône non appliquée ({e_icon})")
-        # --- FIN DÉFINITION ICÔNE ---
+            print(f"AVERT GUI: icône ZeMosaic non appliquée ({e_icon})")
 
 
         try:
