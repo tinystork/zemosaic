@@ -118,6 +118,9 @@ _UNALIGNED_LOCK = Lock()
 ALPHA_OPACITY_THRESHOLD = 0.5  # Mask values >= threshold are treated as opaque
 QUALITY_GATE_ALPHA_SOFT_THRESHOLD = 0.85  # Partially transparent pixels are ignored during quality gate
 
+GLOBAL_COVERAGE_SUMMARY_THRESHOLD_FRAC = 0.0025
+GLOBAL_COVERAGE_SUMMARY_MIN_ABS = 1e-3
+
 def _move_to_unaligned_safe(
     src_path: str | os.PathLike,
     input_root: str | os.PathLike,
@@ -508,6 +511,254 @@ def _apply_master_tile_crop_mask_to_mosaic(
             np.uint8, copy=False
         )
     return final_mosaic_data, final_mosaic_coverage, final_alpha_map
+
+
+def _compute_coverage_stats(
+    coverage_array: np.ndarray | None,
+    *,
+    threshold_fraction: float = GLOBAL_COVERAGE_SUMMARY_THRESHOLD_FRAC,
+    min_absolute: float = GLOBAL_COVERAGE_SUMMARY_MIN_ABS,
+) -> dict[str, Any] | None:
+    """Compute coarse stats (fraction + bbox) for a coverage array."""
+
+    if coverage_array is None:
+        return None
+    try:
+        arr = np.asarray(coverage_array, dtype=np.float32, copy=False)
+    except Exception:
+        return None
+    if arr.ndim != 2:
+        arr = np.squeeze(arr)
+        if arr.ndim != 2:
+            return None
+    if arr.size <= 0:
+        return None
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    try:
+        max_val = float(np.nanmax(arr))
+    except ValueError:
+        return None
+    if not np.isfinite(max_val) or max_val <= 0:
+        return None
+    threshold = max(float(min_absolute), float(max_val) * float(threshold_fraction))
+    mask = arr > threshold
+    coverage_pixels = int(np.count_nonzero(mask))
+    total_pixels = int(mask.size)
+    if coverage_pixels <= 0 or total_pixels <= 0:
+        return None
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return None
+    y_vals = coords[:, 0]
+    x_vals = coords[:, 1]
+    y0 = int(np.min(y_vals))
+    y1 = int(np.max(y_vals) + 1)
+    x0 = int(np.min(x_vals))
+    x1 = int(np.max(x_vals) + 1)
+    return {
+        "fraction": float(coverage_pixels / total_pixels),
+        "coverage_pixels": coverage_pixels,
+        "total_pixels": total_pixels,
+        "y0": y0,
+        "y1": y1,
+        "x0": x0,
+        "x1": x1,
+        "threshold": float(threshold),
+        "array_height": int(arr.shape[0]),
+        "array_width": int(arr.shape[1]),
+    }
+
+
+def _emit_coverage_summary_log(
+    pcb_fn: Callable | None,
+    *,
+    coverage_array: np.ndarray | None,
+    width: int,
+    height: int,
+    log_key: str,
+    base_payload: dict[str, Any] | None = None,
+    label: str | None = None,
+) -> dict[str, Any] | None:
+    """Emit a localized coverage summary log entry if possible."""
+
+    if pcb_fn is None:
+        return None
+    stats = _compute_coverage_stats(coverage_array)
+    if not stats:
+        return None
+    arr_h = max(1, int(stats.get("array_height") or 1))
+    arr_w = max(1, int(stats.get("array_width") or 1))
+    try:
+        scale_y = float(height) / float(arr_h)
+    except Exception:
+        scale_y = 1.0
+    try:
+        scale_x = float(width) / float(arr_w)
+    except Exception:
+        scale_x = 1.0
+    bbox_y0_px = int(max(0, min(int(height), math.floor(stats["y0"] * scale_y))))
+    bbox_y1_px = int(max(0, min(int(height), math.ceil(stats["y1"] * scale_y))))
+    bbox_x0_px = int(max(0, min(int(width), math.floor(stats["x0"] * scale_x))))
+    bbox_x1_px = int(max(0, min(int(width), math.ceil(stats["x1"] * scale_x))))
+    payload = {
+        "coverage_fraction": float(stats["fraction"]),
+        "coverage_pixels": int(stats["coverage_pixels"]),
+        "width": int(width),
+        "height": int(height),
+        "bbox_y0": bbox_y0_px,
+        "bbox_y1": bbox_y1_px,
+        "bbox_x0": bbox_x0_px,
+        "bbox_x1": bbox_x1_px,
+        "threshold": float(stats["threshold"]),
+        "grid_height": arr_h,
+        "grid_width": arr_w,
+    }
+    if base_payload:
+        payload.update(base_payload)
+    if label and "label" not in payload:
+        payload["label"] = label
+    pcb_fn(log_key, prog=None, lvl="INFO_DETAIL", **payload)
+    if log_key == "global_coadd_coverage_summary" and stats["fraction"] < 0.6:
+        sparse_payload = dict(payload)
+        sparse_payload["coverage_fraction"] = float(stats["fraction"])
+        pcb_fn(
+            "global_coadd_coverage_hint_sparse",
+            prog=None,
+            lvl="INFO_DETAIL",
+            **sparse_payload,
+        )
+    return stats
+
+
+def _auto_crop_global_mosaic_if_requested(
+    final_mosaic_data: np.ndarray | None,
+    final_mosaic_coverage: np.ndarray | None,
+    final_alpha_map: np.ndarray | None,
+    *,
+    enable_autocrop: bool,
+    margin_px: int,
+    pcb: Callable | None = None,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, dict[str, int] | None]:
+    """Crop the global mosaic to the tight coverage bbox when requested."""
+
+    if not enable_autocrop:
+        return final_mosaic_data, final_mosaic_coverage, final_alpha_map, None
+    stats = _compute_coverage_stats(final_mosaic_coverage)
+    if not stats:
+        return final_mosaic_data, final_mosaic_coverage, final_alpha_map, None
+    arr_h = int(stats["array_height"])
+    arr_w = int(stats["array_width"])
+    margin = max(0, int(margin_px or 0))
+    y0 = max(0, stats["y0"] - margin)
+    y1 = min(arr_h, stats["y1"] + margin)
+    x0 = max(0, stats["x0"] - margin)
+    x1 = min(arr_w, stats["x1"] + margin)
+    if y1 - y0 <= 0 or x1 - x0 <= 0:
+        return final_mosaic_data, final_mosaic_coverage, final_alpha_map, None
+    if y0 == 0 and y1 >= arr_h and x0 == 0 and x1 >= arr_w:
+        return final_mosaic_data, final_mosaic_coverage, final_alpha_map, None
+
+    def _crop_array(array: np.ndarray | None) -> np.ndarray | None:
+        if array is None:
+            return None
+        try:
+            arr = np.asarray(array)
+        except Exception:
+            return array
+        if arr.ndim < 2:
+            return array
+        slicer = (slice(y0, y1), slice(x0, x1))
+        if arr.ndim > 2:
+            slicer = slicer + tuple(slice(None) for _ in range(arr.ndim - 2))
+        return arr[slicer]
+
+    cropped_data = _crop_array(final_mosaic_data)
+    cropped_coverage = _crop_array(final_mosaic_coverage)
+    cropped_alpha = _crop_array(final_alpha_map)
+    if pcb is not None:
+        pcb(
+            "global_coadd_info_autocrop_applied",
+            prog=None,
+            lvl="INFO_DETAIL",
+            crop_y0=int(y0),
+            crop_y1=int(y1),
+            crop_x0=int(x0),
+            crop_x1=int(x1),
+            original_height=int(arr_h),
+            original_width=int(arr_w),
+            margin_px=int(margin),
+        )
+    crop_meta = {
+        "x0": int(x0),
+        "y0": int(y0),
+        "width": int(x1 - x0),
+        "height": int(y1 - y0),
+    }
+    return cropped_data, cropped_coverage, cropped_alpha, crop_meta
+
+
+def _apply_autocrop_to_global_plan(
+    plan: dict[str, Any] | None,
+    crop_meta: dict[str, int] | None,
+) -> None:
+    """Update the in-memory global WCS plan so that CRPIX/W×H match the cropped canvas."""
+
+    if not plan or not crop_meta:
+        return
+    width = int(crop_meta.get("width") or 0)
+    height = int(crop_meta.get("height") or 0)
+    if width <= 0 or height <= 0:
+        return
+    x0 = int(crop_meta.get("x0") or 0)
+    y0 = int(crop_meta.get("y0") or 0)
+    new_wcs = None
+    wcs_obj = plan.get("wcs")
+    if wcs_obj is not None:
+        try:
+            header = wcs_obj.to_header(relax=True)
+            header["CRPIX1"] = float(header.get("CRPIX1", 0.0)) - float(x0)
+            header["CRPIX2"] = float(header.get("CRPIX2", 0.0)) - float(y0)
+            header["NAXIS1"] = width
+            header["NAXIS2"] = height
+            new_wcs = WCS(header) if (ASTROPY_AVAILABLE and WCS) else None
+        except Exception:
+            new_wcs = None
+        if new_wcs is None and hasattr(wcs_obj, "wcs"):
+            try:
+                new_wcs = copy.deepcopy(wcs_obj)
+                new_wcs.wcs.crpix[0] -= float(x0)
+                new_wcs.wcs.crpix[1] -= float(y0)
+            except Exception:
+                new_wcs = None
+    if new_wcs is not None:
+        plan["wcs"] = new_wcs
+    plan["width"] = width
+    plan["height"] = height
+    descriptor = plan.get("descriptor")
+    if isinstance(descriptor, dict):
+        descriptor["width"] = width
+        descriptor["height"] = height
+        descriptor["autocrop_offsets"] = {
+            "x0": x0,
+            "y0": y0,
+            "width": width,
+            "height": height,
+        }
+        header_obj = descriptor.get("header")
+        if header_obj is not None:
+            try:
+                header_obj["NAXIS1"] = width
+                header_obj["NAXIS2"] = height
+                header_obj["CRPIX1"] = float(header_obj.get("CRPIX1", 0.0)) - float(x0)
+                header_obj["CRPIX2"] = float(header_obj.get("CRPIX2", 0.0)) - float(y0)
+            except Exception:
+                pass
+    plan["autocrop_offsets"] = {
+        "x0": x0,
+        "y0": y0,
+        "width": width,
+        "height": height,
+    }
 
 
 def _prepare_tiles_for_two_pass(
@@ -10456,6 +10707,14 @@ def run_hierarchical_mosaic(
         sds_coverage_threshold_config = 0.92
     sds_coverage_threshold_config = max(0.10, min(0.99, sds_coverage_threshold_config))
 
+    global_wcs_autocrop_enabled_config = bool(worker_config_cache.get("global_wcs_autocrop_enabled"))
+    try:
+        global_wcs_autocrop_margin_px_config = int(worker_config_cache.get("global_wcs_autocrop_margin_px", 64) or 0)
+    except Exception:
+        global_wcs_autocrop_margin_px_config = 0
+    if global_wcs_autocrop_margin_px_config < 0:
+        global_wcs_autocrop_margin_px_config = 0
+
     if global_wcs_plan.get("enabled"):
         logger.info(
             "[Worker] Global WCS descriptor ready (%s)",
@@ -12121,6 +12380,20 @@ def run_hierarchical_mosaic(
                 cache_root=output_folder,
             )
         final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = mosaic_result
+        autocrop_meta: dict[str, int] | None = None
+        if final_mosaic_data_HWC is not None and global_wcs_autocrop_enabled_config:
+            final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map, autocrop_meta = (
+                _auto_crop_global_mosaic_if_requested(
+                    final_mosaic_data_HWC,
+                    final_mosaic_coverage_HW,
+                    final_alpha_map,
+                    enable_autocrop=True,
+                    margin_px=global_wcs_autocrop_margin_px_config,
+                    pcb=pcb,
+                )
+            )
+            if autocrop_meta:
+                _apply_autocrop_to_global_plan(global_wcs_plan, autocrop_meta)
         if final_mosaic_data_HWC is not None:
             final_output_wcs = global_wcs_plan.get("wcs")
             final_output_shape_hw = (final_mosaic_data_HWC.shape[0], final_mosaic_data_HWC.shape[1])
@@ -14594,6 +14867,15 @@ def _assemble_global_mosaic_first_impl(
                 channels=int(helper_stats.get("channels", 0)),
                 helper_label="gpu_reproject",
             )
+            _emit_coverage_summary_log(
+                pcb,
+                coverage_array=helper_coverage,
+                width=width,
+                height=height,
+                log_key="global_coadd_coverage_summary",
+                base_payload=_payload(route="gpu_helper"),
+                label="gpu_helper",
+            )
             return (
                 helper_image.astype(np.float32, copy=False),
                 helper_coverage.astype(np.float32, copy=False),
@@ -14890,6 +15172,15 @@ def _assemble_global_mosaic_first_impl(
         sumsq_grid = None
         weight_grid = None
         count_grid = None
+        _emit_coverage_summary_log(
+            pcb,
+            coverage_array=coverage_map,
+            width=width,
+            height=height,
+            log_key="global_coadd_coverage_summary",
+            base_payload=_payload(route="cpu"),
+            label="cpu",
+        )
         return final_image.astype(np.float32, copy=False), coverage_map.astype(np.float32, copy=False), alpha_map
     finally:
         _cleanup_temp()
@@ -15038,6 +15329,22 @@ def assemble_global_mosaic_sds(
         g_x0 = max(0, min(grid_w, int(math.floor(x0 * scale_x))))
         g_x1 = max(g_x0 + 1, min(grid_w, int(math.ceil(x1 * scale_x))))
         info["grid_bbox"] = (g_y0, g_y1, g_x0, g_x1)
+    if entry_infos:
+        coverage_overview = np.zeros((grid_h, grid_w), dtype=np.uint8)
+        for info in entry_infos:
+            gy0, gy1, gx0, gx1 = info.get("grid_bbox", (0, 0, 0, 0))
+            if gy1 <= gy0 or gx1 <= gx0:
+                continue
+            coverage_overview[gy0:gy1, gx0:gx1] = 1
+        _emit_coverage_summary_log(
+            pcb,
+            coverage_array=coverage_overview,
+            width=width,
+            height=height,
+            log_key="sds_debug_batch_coverage_summary",
+            base_payload={"entries": len(entry_infos), "route": "sds_prebatch"},
+            label="prebatch",
+        )
 
     coverage_threshold = max(0.10, min(0.99, float(coverage_threshold or 0.92)))
     total_cells = grid_h * grid_w
@@ -15227,6 +15534,16 @@ def assemble_global_mosaic_sds(
         final_coverage += arr
     if final_coverage is None:
         final_coverage = np.ones((height, width), dtype=np.float32)
+
+    _emit_coverage_summary_log(
+        pcb,
+        coverage_array=final_coverage,
+        width=width,
+        height=height,
+        log_key="global_coadd_coverage_summary",
+        base_payload={"route": "sds_final"},
+        label="sds_final",
+    )
 
     alpha_candidates = [np.asarray(alpha, dtype=np.float32, copy=False) for alpha in alphas if alpha is not None]
     final_alpha = None

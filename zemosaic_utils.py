@@ -746,6 +746,23 @@ def compute_global_wcs_descriptor(
         "timestamp": time.time(),
         "source": "computed",
     }
+    try:
+        log.info(
+            "Global WCS descriptor built: entries=%d, RA span=%.3f° (%.3f° padded), "
+            "DEC span=%.3f° (%.3f° padded), scale=%.5f°/px (%.2f\"/px), size=%dx%d px, padding=%.2f%%",
+            len(usable_entries),
+            float(ra_span),
+            float(ra_span_padded),
+            float(dec_span),
+            float(dec_span_padded),
+            float(scale_deg),
+            float(scale_arcsec),
+            int(width_px),
+            int(height_px),
+            float(padding_pct),
+        )
+    except Exception:
+        pass
     return descriptor
 
 

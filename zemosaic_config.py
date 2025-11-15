@@ -95,6 +95,8 @@ DEFAULT_CONFIG = {
     "global_wcs_padding_percent": 2.0,
     "global_wcs_res_override": None,
     "global_wcs_orientation": "north_up",
+    "global_wcs_autocrop_enabled": False,
+    "global_wcs_autocrop_margin_px": 64,
     "sds_mode_default": False,
     "sds_coverage_threshold": 0.92,
     "global_coadd_method": "kappa_sigma",
