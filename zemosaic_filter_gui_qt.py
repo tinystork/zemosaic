@@ -203,6 +203,55 @@ class _NormalizedItem:
     center_ra_deg: float | None = None
     center_dec_deg: float | None = None
     cluster_index: int | None = None
+    footprint_radec: List[Tuple[float, float]] | None = None
+
+
+def _sanitize_footprint_radec(payload: Any) -> List[Tuple[float, float]] | None:
+    """Return a normalised list of (RA, Dec) tuples for a footprint.
+
+    The Tk filter can emit several shapes for footprint metadata (list of
+    tuples, list of dicts with 'RA'/'DEC' or 'ra'/'dec', or a mapping with a
+    ``corners``/``footprint`` key).  This helper mirrors that flexibility so
+    the Qt dialog can reuse pre-computed footprints when available.
+    """
+
+    if payload is None:
+        return None
+
+    # Unwrap common container keys used by the Tk filter / worker.
+    if isinstance(payload, dict):
+        for key in ("footprint_radec", "corners", "footprint"):
+            if key in payload:
+                payload = payload.get(key)
+                break
+
+    if not isinstance(payload, (list, tuple)):
+        return None
+
+    points: list[Tuple[float, float]] = []
+    for entry in payload:
+        ra_val: Any = None
+        dec_val: Any = None
+        if isinstance(entry, dict):
+            ra_val = entry.get("ra")
+            if ra_val is None:
+                ra_val = entry.get("RA")
+            dec_val = entry.get("dec")
+            if dec_val is None:
+                dec_val = entry.get("DEC")
+        elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+            ra_val, dec_val = entry[0], entry[1]
+        else:
+            continue
+
+        try:
+            ra = float(ra_val)
+            dec = float(dec_val)
+        except Exception:
+            continue
+        points.append((ra, dec))
+
+    return points or None
 
 
 def _iter_normalized_entries(
@@ -340,6 +389,12 @@ def _iter_normalized_entries(
                 ra_from_header, dec_from_header = _extract_center_from_header(header_obj)
                 ra_deg = ra_deg if ra_deg is not None else ra_from_header
                 dec_deg = dec_deg if dec_deg is not None else dec_from_header
+        footprint = None
+        for key in ("footprint_radec", "footprint", "corners"):
+            if key in obj:
+                footprint = _sanitize_footprint_radec(obj.get(key))
+                if footprint:
+                    break
         return _NormalizedItem(
             original=original,
             display_name=display_name,
@@ -350,6 +405,7 @@ def _iter_normalized_entries(
             include_by_default=include,
             center_ra_deg=ra_deg,
             center_dec_deg=dec_deg,
+            footprint_radec=footprint,
         )
 
     def _build_from_path(path_obj: Path) -> _NormalizedItem:
@@ -510,6 +566,52 @@ def _header_has_wcs(header: Any) -> bool:
     return False
 
 
+def _write_header_to_fits_local(file_path: str, header_obj: Any) -> None:
+    """Persist ``header_obj`` into the primary HDU header of ``file_path``.
+
+    Mirrors the Tk filter helper so that ASTAP solutions can be written back
+    to disk when the user enables the corresponding option in the Qt GUI.
+    """
+
+    if fits is None or header_obj is None:
+        return
+    if not isinstance(file_path, str) or not file_path:
+        return
+    if not os.path.isfile(file_path):
+        return
+    try:
+        with fits.open(file_path, mode="update", memmap=False) as hdul:  # type: ignore[call-arg]
+            hdul[0].header.update(header_obj)  # type: ignore[index]
+            hdul.flush()
+    except Exception as exc:  # pragma: no cover - defensive I/O guard
+        try:
+            logger.warning("Qt Filter: failed to write WCS header to '%s': %s", file_path, exc)
+        except Exception:
+            pass
+
+
+def _persist_wcs_header_if_requested(path: str, header_obj: Any, write_inplace: bool) -> None:
+    """Persist a solved WCS header to disk when enabled."""
+
+    if not write_inplace:
+        return
+    if not path or header_obj is None:
+        return
+    display_name = os.path.basename(path) or path
+    try:
+        _write_header_to_fits_local(path, header_obj)
+    except Exception as exc:  # pragma: no cover - defensive I/O guard
+        try:
+            logger.warning("Qt Filter: failed to persist WCS for '%s': %s", display_name, exc)
+        except Exception:
+            pass
+    else:
+        try:
+            logger.info("Qt Filter: WCS header written for '%s'", display_name)
+        except Exception:
+            pass
+
+
 def _detect_instrument_from_header(header: Any) -> str | None:
     """Mimic the Tk GUI heuristics to detect the instrument label."""
 
@@ -628,6 +730,7 @@ class _DirectoryScanWorker(QObject):
         self._localizer = localizer
         self._overrides = astap_overrides or {}
         self._stop_requested = False
+        self._write_wcs_to_file = bool(self._overrides.get("write_wcs_to_file", False))
 
     @Slot()
     def run(self) -> None:
@@ -707,7 +810,7 @@ class _DirectoryScanWorker(QObject):
                         downsample_factor=astap_cfg["downsample"],
                         sensitivity=astap_cfg["sensitivity"],
                         timeout_sec=astap_cfg["timeout"],
-                        update_original_header_in_place=False,
+                        update_original_header_in_place=self._write_wcs_to_file,
                         progress_callback=_solver_callback,
                     )
                 except Exception as exc:  # pragma: no cover - solver failure path
@@ -716,6 +819,8 @@ class _DirectoryScanWorker(QObject):
                     if wcs_result is not None and getattr(wcs_result, "is_celestial", False):
                         has_wcs = True
                         row_update["solver"] = "ASTAP"
+                        if self._write_wcs_to_file and header is not None:
+                            _persist_wcs_header_if_requested(path, header, True)
 
             row_update["has_wcs"] = has_wcs
             if instrument:
@@ -948,8 +1053,8 @@ class FilterQtDialog(QDialog):
         self._run_analysis_btn: QPushButton | None = None
         self._scan_thread: QThread | None = None
         self._scan_worker: _DirectoryScanWorker | None = None
-        self._auto_group_checkbox = None
-        self._seestar_checkbox = None
+        self._auto_group_checkbox: QCheckBox | None = None
+        self._seestar_checkbox: QCheckBox | None = None
         self._astap_instances_combo: QComboBox | None = None
         self._astap_instances_value = self._resolve_initial_astap_instances()
         self._preview_canvas: FigureCanvasQTAgg | None = None
@@ -974,6 +1079,8 @@ class FilterQtDialog(QDialog):
         self._preview_canvas = self._create_preview_canvas()
         self._log_output: QPlainTextEdit | None = None
         self._scan_recursive_checkbox: QCheckBox | None = None
+        self._draw_footprints_checkbox: QCheckBox | None = None
+        self._write_wcs_checkbox: QCheckBox | None = None
         self._build_ui()
         if self._stream_scan:
             self._prepare_streaming_mode(raw_files_with_wcs_or_dir, initial_overrides)
@@ -1384,6 +1491,24 @@ class FilterQtDialog(QDialog):
         self._seestar_checkbox.setChecked(self._seestar_priority)
         layout.addWidget(self._seestar_checkbox)
 
+        self._draw_footprints_checkbox = QCheckBox(
+            self._localizer.get("filter_chk_draw_footprints", "Draw WCS footprints"),
+            box,
+        )
+        # Match the Tk filter default: footprints enabled unless explicitly disabled.
+        self._draw_footprints_checkbox.setChecked(True)
+        self._draw_footprints_checkbox.toggled.connect(  # type: ignore[arg-type]
+            lambda _checked: self._schedule_preview_refresh()
+        )
+        layout.addWidget(self._draw_footprints_checkbox)
+
+        self._write_wcs_checkbox = QCheckBox(
+            self._localizer.get("filter_chk_write_wcs", "Write WCS to file"),
+            box,
+        )
+        self._write_wcs_checkbox.setChecked(True)
+        layout.addWidget(self._write_wcs_checkbox)
+
         concurrency_label = QLabel(
             self._localizer.get("filter_label_astap_instances", "Max ASTAP instances"),
             box,
@@ -1438,11 +1563,24 @@ class FilterQtDialog(QDialog):
             self._run_analysis_btn.setEnabled(False)
 
         solver_settings = self._solver_settings or {}
+        astap_overrides: dict[str, Any] = {}
+        if isinstance(self._config_overrides, dict):
+            try:
+                astap_overrides.update(self._config_overrides)
+            except Exception:
+                astap_overrides = dict(self._config_overrides)
+        write_wcs_flag = False
+        if self._write_wcs_checkbox is not None:
+            try:
+                write_wcs_flag = bool(self._write_wcs_checkbox.isChecked())
+            except Exception:
+                write_wcs_flag = False
+        astap_overrides["write_wcs_to_file"] = write_wcs_flag
         self._scan_worker = _DirectoryScanWorker(
             self._normalized_items,
             solver_settings,
             self._localizer,
-            astap_overrides=self._config_overrides,
+            astap_overrides=astap_overrides,
         )
         self._scan_thread = QThread(self)
         self._scan_worker.moveToThread(self._scan_thread)
@@ -1469,6 +1607,15 @@ class FilterQtDialog(QDialog):
         except Exception:
             return 200
 
+    def _should_draw_footprints(self) -> bool:
+        checkbox = self._draw_footprints_checkbox
+        if checkbox is None:
+            return False
+        try:
+            return bool(checkbox.isChecked())
+        except Exception:
+            return False
+
     def _ensure_entry_coordinates(self, entry: _NormalizedItem) -> Tuple[float | None, float | None]:
         if entry.center_ra_deg is not None and entry.center_dec_deg is not None:
             return entry.center_ra_deg, entry.center_dec_deg
@@ -1485,6 +1632,78 @@ class FilterQtDialog(QDialog):
         entry.center_ra_deg = ra_deg
         entry.center_dec_deg = dec_deg
         return ra_deg, dec_deg
+
+    def _ensure_entry_footprint(self, entry: _NormalizedItem) -> List[Tuple[float, float]] | None:
+        """Compute and cache a WCS footprint for ``entry`` when possible."""
+
+        if entry.footprint_radec:
+            return entry.footprint_radec
+        if fits is None or WCS is None:
+            return None
+        path = entry.file_path
+        if not path or not os.path.isfile(path):
+            return None
+        try:
+            header = fits.getheader(path, ignore_missing_end=True)
+        except Exception:
+            return None
+        try:
+            wcs_obj = _build_wcs_from_header(header)
+        except Exception:
+            wcs_obj = None
+        if wcs_obj is None or not getattr(wcs_obj, "is_celestial", False):
+            return None
+
+        nx: int | None = None
+        ny: int | None = None
+        try:
+            nax1 = header.get("NAXIS1")
+            nax2 = header.get("NAXIS2")
+            if isinstance(nax1, (int, float)) and isinstance(nax2, (int, float)):
+                nx = int(nax1)
+                ny = int(nax2)
+        except Exception:
+            nx = ny = None
+        if not nx or not ny:
+            shape = getattr(wcs_obj, "pixel_shape", None)
+            if shape is not None and len(shape) >= 2:
+                try:
+                    nx = int(shape[0])
+                    ny = int(shape[1])
+                except Exception:
+                    nx = ny = None
+        if not nx or not ny:
+            shape = getattr(wcs_obj, "array_shape", None)
+            if shape is not None and len(shape) >= 2:
+                try:
+                    ny = int(shape[0])
+                    nx = int(shape[1])
+                except Exception:
+                    nx = ny = None
+
+        if not nx or not ny or nx <= 0 or ny <= 0:
+            return None
+
+        corners_pix = [
+            (0.5, 0.5),
+            (nx - 0.5, 0.5),
+            (nx - 0.5, ny - 0.5),
+            (0.5, ny - 0.5),
+        ]
+        footprint: list[Tuple[float, float]] = []
+        for x_pix, y_pix in corners_pix:
+            try:
+                sky = wcs_obj.pixel_to_world(x_pix, y_pix)  # type: ignore[attr-defined]
+                ra_deg = float(getattr(sky, "ra").deg)  # type: ignore[attr-defined]
+                dec_deg = float(getattr(sky, "dec").deg)  # type: ignore[attr-defined]
+            except Exception:
+                continue
+            footprint.append((ra_deg, dec_deg))
+
+        if not footprint:
+            return None
+        entry.footprint_radec = footprint
+        return footprint
 
     def _collect_preview_points(self) -> List[Tuple[float, float, int | None]]:
         if self._preview_canvas is None:
@@ -1683,11 +1902,51 @@ class FilterQtDialog(QDialog):
                 scatter_kwargs["label"] = label
             axes.scatter(ra_coords, dec_coords, **scatter_kwargs)
 
+        footprints_for_preview: list[Tuple[list[float], list[float], int | None]] = []
+        if self._should_draw_footprints():
+            footprint_cap = self._resolve_preview_cap()
+            used = 0
+            for row, entry in enumerate(self._normalized_items):
+                item = self._table.item(row, 0)
+                if item is None or item.checkState() != Qt.Checked:
+                    continue
+                fp = entry.footprint_radec or self._ensure_entry_footprint(entry)
+                if not fp:
+                    continue
+                ra_fp = [p[0] for p in fp]
+                dec_fp = [p[1] for p in fp]
+                if not ra_fp or not dec_fp:
+                    continue
+                cluster_idx = entry.cluster_index if isinstance(entry.cluster_index, int) else None
+                footprints_for_preview.append((ra_fp, dec_fp, cluster_idx))
+                used += 1
+                if footprint_cap is not None and used >= footprint_cap:
+                    break
+
+            for ra_fp, dec_fp, cluster_idx in footprints_for_preview:
+                if len(ra_fp) < 2 or len(dec_fp) < 2:
+                    continue
+                if isinstance(cluster_idx, int):
+                    color = self._preview_color_cycle[cluster_idx % len(self._preview_color_cycle)]
+                else:
+                    color = "#7b6fd6"
+                xs = list(ra_fp)
+                ys = list(dec_fp)
+                xs.append(xs[0])
+                ys.append(ys[0])
+                axes.plot(xs, ys, color=color, linewidth=0.9, alpha=0.8)
+
         if legend_needed and len(grouped_points) > 1:
             axes.legend(loc="upper right", fontsize="small")
 
         ra_values = [pt[0] for pt in points]
         dec_values = [pt[1] for pt in points]
+        for ra_fp, dec_fp, _ in footprints_for_preview:
+            ra_values.extend(ra_fp)
+            dec_values.extend(dec_fp)
+        if not ra_values or not dec_values:
+            self._preview_canvas.draw_idle()
+            return
         ra_min, ra_max = min(ra_values), max(ra_values)
         dec_min, dec_max = min(dec_values), max(dec_values)
         if ra_min == ra_max:

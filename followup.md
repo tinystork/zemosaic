@@ -402,6 +402,22 @@ same features, same return values, and a similar layout/flow, so users can switc
 
 ---
 
+## Task N — Qt Filter preview footprints & layout refinements
+
+**Goal:**  
+Bring `FilterQtDialog` closer to the Tk filter GUI for WCS visualisation and controls: keep the same overall flow, reintroduce a “Draw WCS footprints” toggle, and draw frame footprints when WCS data is available.
+
+**Detailed requirements:**
+
+- [x] Mirror Tk preview layout so that the table, sky preview, control row, filter options, log panel and dialog buttons appear in the same vertical order as the Tk filter (file table → sky preview → controls → filter options → scan / grouping log → OK/Cancel).
+- [x] Load and cache WCS footprints (`footprint_radec` from payloads or built from headers/WCS) on-demand for selected rows instead of recomputing them eagerly.
+- [x] Add a “Draw WCS footprints” option in the Qt UI (checkbox) wired into preview refresh logic, mirroring Tk’s `draw_footprints_var` behaviour.
+- [x] Draw rectangular footprints in the Qt Matplotlib preview when WCS exists, using per-group colours when clustering is active so that rectangles and centroids share the same palette.
+- [x] Wire a “Write WCS to file” toggle into the Qt “Run analysis” / ASTAP solving path so that, when enabled, ASTAP solutions are persisted to FITS headers in place (matching Tk’s `write_wcs_var` semantics).
+- [ ] After implementation, validate the new behaviour on at least one WCS-enabled dataset (e.g. Seestar test set) and record observations here, including any intentional simplifications compared to the Tk coverage map.
+
+---
+
 ## Notes / Known Issues
 
 (Add here any clarifications or partial work notes related to tasks A/B/C)
@@ -422,6 +438,7 @@ same features, same return values, and a similar layout/flow, so users can switc
 - [x] 2025-11-15: Phase 4.5 overlay panel removed — Deleted the Phase 4.5 overview `QGroupBox` from the Qt progress section in `zemosaic_gui_qt.py` so worker overlay/log handlers stay live while the GUI no longer exposes the idle overlay frame.
 - [x] 2025-11-15: Task L parity review — Confirmed that `FilterQtDialog` implements the stream-scan directory exclusions (`_iter_normalized_entries(...)` + `EXCLUDED_DIRS`/`is_path_excluded`), recursive “Scan subfolders” toggle, WCS column and `resolved_wcs_count` override, `filter_excluded_indices` based on unchecked rows, ASTAP concurrency wiring via `astap_max_instances` and `set_astap_max_concurrent_instances(...)`, and a scrollable log panel for scan/clustering/WCS messages. Behaviour was cross-checked against the Tk `launch_filter_interface` and worker consumers of `filter_overrides`; full end-to-end runs on real Seestar datasets remain recommended outside this harness for final visual validation.
 - [x] 2025-11-16: Task M (global coadd diagnostics & auto-crop) — `compute_global_wcs_descriptor` now logs entry counts plus RA/DEC spans and pixel scale, both Mosaic-first implementations emit coverage summaries (with sparse-coverage hints that point to outlier WCS footprints), and a guarded `global_wcs_autocrop_enabled + margin` flag auto-crops the final mosaic/coverage while updating the in-memory global plan/WCS so downstream consumers inherit the tightened canvas dimensions.
+- [x] 2025-11-16: Task N (Qt filter footprints & WCS write toggle) — `FilterQtDialog` now exposes “Draw WCS footprints” and “Write WCS to file” checkboxes, reuses any `footprint_radec` metadata attached to input items (falling back to on-demand WCS/shape extraction from FITS headers) to draw coloured rectangles over the Matplotlib sky preview, and routes the write toggle through `_DirectoryScanWorker`/`solve_with_astap(...)` so successful ASTAP solves can update on-disk FITS headers; end-to-end visual validation on a real WCS-enabled dataset is still pending (checkbox “validate behaviour on dataset” under Task N remains intentionally unchecked).
 - [x] 2025-11-15: Console-only Astropy SIP/WCS warning — During some filter runs, the console printed the following message without any entry in `zemosaic_worker.log`:
 
   ```text
