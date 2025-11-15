@@ -238,6 +238,11 @@ Ensure the Qt filter GUI provides the same global WCS descriptor and Mosaic-firs
 - [ ] Verify that SDS / Mosaic-first workflows behave identically under Tk and Qt (same descriptor reuse by the worker, same user-visible logs and warnings).
 - [ ] Add notes in followup.md once behaviour has been validated on at least one representative dataset.
 
+Implementation notes (2025-11 audit):
+- Wire `FilterQtDialog` to use `compute_global_wcs_descriptor`, `resolve_global_wcs_output_paths`, `load_global_wcs_descriptor`, and `write_global_wcs_files` just like the Tk filter (`zemosaic_filter_gui.py`).
+- When SDS/Seestar workflows are active and validation succeeds, populate `global_wcs_meta`, `global_wcs_path`, `global_wcs_json`, and `global_wcs_plan_override` in Qt overrides so `_prepare_global_wcs_plan` sees identical inputs under both GUIs.
+- Align Qt stream-scan behaviour with Tk by honouring `EXCLUDED_DIRS` / `is_path_excluded` so both filters operate on the same effective file set.
+
 
 ---
 
@@ -253,6 +258,11 @@ Align Qt run completion and cancellation behaviour with the Tk GUI so users see 
 - [ ] Confirm that timers, ETA, tiles/files counters, and phase labels reset identically on completion and on cancellation in both backends.
 - [ ] Document any intentional UX differences (if any remain) in the Notes / Known Issues section.
 
+Implementation notes (2025-11 audit):
+- Fix `_on_worker_finished` in `zemosaic_gui_qt.py` so it calls `_translate_worker_message(message_key_or_raw, params, level)` with proper arguments and does not raise on non-success paths.
+- Mirror Tk cancellation semantics: classify user stops as `log_key_processing_cancelled` at WARN level, reset ETA/elapsed/tiles/files/phase labels, and avoid treating them as hard errors in Qt dialogs.
+- Add a platform-aware “Open output folder?” prompt in Qt on successful completion, using the same heuristics and translations as Tk (`zemosaic_gui.py`), and ensure the behaviour is gated on a valid `output_dir`.
+
 
 ---
 
@@ -267,6 +277,11 @@ Lock in full parity between Tk and Qt by validating configuration, worker inputs
 - [ ] Verify that worker argument tuples constructed by Tk and Qt (`run_hierarchical_mosaic_process` callers) are semantically aligned for shared parameters (folders, solver/stacking options, quality/crop, GPU flags, etc.).
 - [ ] Run a small parity test matrix (Tk vs Qt, classic vs Mosaic-first) and confirm logs, progress indicators, and outputs are consistent for supported workflows.
 - [ ] Record a short checklist or notes in this file so future changes to worker signatures or config schema can be re-audited against the same criteria.
+
+Implementation notes (2025-11 audit):
+- For at least one representative dataset, capture `zemosaic_config.json` snapshots after equivalent Tk and Qt sessions (GPU on/off, SDS on/off, ZeQualityMT/coverage settings, language) and diff them to confirm key-level parity.
+- Log the full `worker_args` tuples for Tk and Qt `run_hierarchical_mosaic_process` invocations and compare sequences to ensure every shared semantic parameter is aligned (folders, solver/stacking, quality/crop, GPU, SDS/global WCS, memmap, intertile).
+- Build a small Tk vs Qt parity matrix (classic vs Mosaic-first) noting any acceptable differences (e.g. layout-only) and reference it in this section so future refactors can be re-checked against the same scenarios.
 
 
 ---
