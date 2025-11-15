@@ -25,7 +25,16 @@ from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Sequence
 
 try:
     from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
-    from PySide6.QtGui import QBrush, QCloseEvent, QColor, QPainter, QPen, QResizeEvent
+    from PySide6.QtGui import (
+        QBrush,
+        QCloseEvent,
+        QColor,
+        QPainter,
+        QPen,
+        QResizeEvent,
+        QTextCharFormat,
+        QTextCursor,
+    )
     from PySide6.QtWidgets import (
         QApplication,
         QCheckBox,
@@ -194,7 +203,7 @@ class _WorkerQueueListener(QObject):
 class ZeMosaicQtWorker(QObject):
     """Manage the background ZeMosaic worker process using a queue listener thread."""
 
-    log_message_emitted = Signal(str, str)
+    log_message_emitted = Signal(str, object, dict)
     progress_changed = Signal(float)
     stage_progress = Signal(str, int, int)
     phase_changed = Signal(str, dict)
@@ -360,10 +369,15 @@ class ZeMosaicQtWorker(QObject):
             self._had_error = True
             self._last_error = error_text or "qt_worker_error_generic"
             level = str(lvl or "ERROR")
-            if error_text:
-                self.log_message_emitted.emit(level, error_text)
-            else:
-                self.log_message_emitted.emit(level, "qt_worker_error_generic")
+            payload: Dict[str, Any] = {}
+            if isinstance(kwargs, dict):
+                payload.update(kwargs)
+            if error_text and "error" not in payload:
+                payload["error"] = error_text
+            # For Qt, treat PROCESS_ERROR as a raw error string for display,
+            # while still exposing the structured payload for logs or tooling.
+            message_key_or_raw: Any = error_text or "qt_worker_error_generic"
+            self.log_message_emitted.emit(level, message_key_or_raw, payload)
             return
 
         if msg_key == "PROCESS_DONE":
@@ -471,8 +485,14 @@ class ZeMosaicQtWorker(QObject):
             return
 
         level = str(lvl or "INFO")
-        message = self._stringify_message(msg_key, prog, kwargs)
-        self.log_message_emitted.emit(level, message)
+        payload: Dict[str, Any] = {}
+        if isinstance(kwargs, dict):
+            payload.update(kwargs)
+        if isinstance(msg_key, str):
+            message_key_or_raw: Any = msg_key
+        else:
+            message_key_or_raw = self._stringify_message(msg_key, prog, payload)
+        self.log_message_emitted.emit(level, message_key_or_raw, payload)
 
     def _on_listener_finished(self) -> None:
         success = not self._had_error and not self._stop_requested and not self._cancelled
@@ -688,6 +708,56 @@ class ZeMosaicQtMainWindow(QMainWindow):
         main_layout = QVBoxLayout(central_widget)
         main_layout.setContentsMargins(12, 12, 12, 12)
         main_layout.setSpacing(10)
+
+        language_row = QHBoxLayout()
+        language_row.setContentsMargins(0, 0, 0, 0)
+        language_row.setSpacing(6)
+        language_label = QLabel(
+            self._tr("language_selector_label", "Language:"),
+            central_widget,
+        )
+        language_row.addWidget(language_label)
+
+        available_langs: List[str] = ["en", "fr"]
+        locales_dir = getattr(self.localizer, "locales_dir_abs_path", None)
+        if isinstance(locales_dir, str) and os.path.isdir(locales_dir):
+            try:
+                entries = sorted(
+                    name
+                    for name in os.listdir(locales_dir)
+                    if name.endswith(".json")
+                    and os.path.isfile(os.path.join(locales_dir, name))
+                )
+                detected = [os.path.splitext(name)[0] for name in entries]
+                if detected:
+                    available_langs = detected
+            except Exception:
+                available_langs = ["en", "fr"]
+
+        self.language_combo = QComboBox(central_widget)
+        self.language_combo.addItems(available_langs)
+        current_lang = str(self.config.get("language", "en"))
+        if current_lang in available_langs:
+            self.language_combo.setCurrentText(current_lang)
+        else:
+            self.language_combo.setCurrentText(available_langs[0])
+
+        def _on_language_changed(index: int) -> None:
+            lang = self.language_combo.itemText(index).strip()
+            if not lang:
+                return
+            if hasattr(self.localizer, "set_language"):
+                try:
+                    self.localizer.set_language(lang)
+                except Exception:
+                    pass
+            self.config["language"] = lang
+            self._refresh_translated_ui()
+
+        self.language_combo.currentIndexChanged.connect(_on_language_changed)  # type: ignore[arg-type]
+        language_row.addWidget(self.language_combo)
+        language_row.addStretch(1)
+        main_layout.addLayout(language_row)
 
         main_layout.addWidget(self._create_folders_group())
         main_layout.addWidget(self._create_astap_group())
@@ -3066,17 +3136,37 @@ class ZeMosaicQtMainWindow(QMainWindow):
     def _tr(self, key: str, fallback: str) -> str:
         return self.localizer.get(key, fallback)
 
+    def _refresh_translated_ui(self) -> None:
+        self.setWindowTitle(
+            self._tr("qt_window_title_preview", "ZeMosaic (Qt Preview)")
+        )
+
     # ------------------------------------------------------------------
     # Events & callbacks
     # ------------------------------------------------------------------
-    def _append_log(self, message: str, level: str = "info") -> None:
+    def _append_log(
+        self,
+        message: str,
+        level: str = "info",
+        *,
+        gpu_highlight: bool = False,
+    ) -> None:
         normalized_level = level.lower().strip()
         prefix = self._log_level_prefixes.get(normalized_level)
         if prefix is None and normalized_level:
             prefix = f"[{normalized_level.upper()}] "
         formatted_message = f"{prefix}{message}" if prefix else message
         if hasattr(self, "log_output"):
-            self.log_output.appendPlainText(formatted_message)
+            if gpu_highlight:
+                cursor = self.log_output.textCursor()
+                cursor.movePosition(QTextCursor.End)
+                self.log_output.setTextCursor(cursor)
+                fmt = QTextCharFormat()
+                fmt.setForeground(QColor("#40E0D0"))
+                cursor.insertText(formatted_message + "\n", fmt)
+                self.log_output.setTextCursor(cursor)
+            else:
+                self.log_output.appendPlainText(formatted_message)
         else:  # pragma: no cover - initialization guard
             print(formatted_message)
 
@@ -3634,17 +3724,85 @@ class ZeMosaicQtMainWindow(QMainWindow):
         }
         return mapping.get(normalized, "info")
 
-    def _translate_worker_message(self, message: str) -> str:
-        if message.startswith("log_key_") or message.startswith("qt_"):
-            translated = self._tr(message, message)
-            if translated:
-                return translated
-        return message
+    def _is_gpu_log_entry(
+        self, key_candidate: Any, log_text: str, params: Dict[str, Any] | None
+    ) -> bool:
+        def _contains_gpu(value: Any) -> bool:
+            return isinstance(value, str) and "gpu" in value.lower()
 
-    def _on_worker_log_message(self, level: str, message: str) -> None:
-        normalized_level = self._normalize_log_level(level)
-        translated_message = self._translate_worker_message(str(message))
-        self._append_log(translated_message, level=normalized_level)
+        if _contains_gpu(key_candidate):
+            return True
+        if isinstance(log_text, str) and _contains_gpu(log_text):
+            return True
+        if isinstance(params, dict):
+            for val in params.values():
+                if _contains_gpu(val):
+                    return True
+        return False
+
+    def _translate_worker_message(
+        self,
+        message_key_or_raw: Any,
+        params: Dict[str, Any] | None,
+        level: str | None,
+    ) -> str:
+        params = params or {}
+        # Preserve existing behaviour for raw error strings.
+        if isinstance(message_key_or_raw, str) and level and level.upper() == "ERROR":
+            if not message_key_or_raw.startswith("log_key_") and " " in message_key_or_raw:
+                return message_key_or_raw
+
+        level_str = level.upper() if isinstance(level, str) else "INFO"
+        user_facing_levels = {
+            "INFO",
+            "WARN",
+            "ERROR",
+            "SUCCESS",
+            "CRITICAL",
+            "INFO_DETAIL",
+            "DEBUG_DETAIL",
+        }
+
+        if level_str in user_facing_levels:
+            if isinstance(message_key_or_raw, str):
+                text = self.localizer.get(
+                    message_key_or_raw,
+                    message_key_or_raw,
+                    **params,
+                )
+                if text == f"_{message_key_or_raw}_" and not params:
+                    text = message_key_or_raw
+            else:
+                text = str(message_key_or_raw)
+        else:
+            text = str(message_key_or_raw)
+            if params:
+                try:
+                    text = text.format(**params)
+                except Exception:
+                    pass
+
+        if isinstance(text, str) and (
+            text.startswith("  [Z") or text.startswith("      [Z")
+        ):
+            try:
+                text = text.split("] ", 1)[1]
+            except Exception:
+                pass
+        return text
+
+    def _on_worker_log_message(
+        self, level: str, message_key_or_raw: Any, params: Dict[str, Any]
+    ) -> None:
+        level_str = str(level) if isinstance(level, str) else str(level)
+        translated_message = self._translate_worker_message(
+            message_key_or_raw, params, level_str
+        )
+        normalized_level = self._normalize_log_level(level_str)
+        gpu_highlight = self._is_gpu_log_entry(
+            message_key_or_raw, translated_message, params
+        )
+        self._append_log(translated_message, level=normalized_level, gpu_highlight=gpu_highlight)
 
     def _on_worker_progress_changed(self, percent: float) -> None:
         if self._weighted_progress_active:

@@ -188,10 +188,10 @@ Ensure Qt log rendering behaves like Tk, including localization formatting and G
 
 **Detailed requirements:**
 
-- [ ] Pass worker-provided kwargs to the localization formatter.
-- [ ] Support the same translation key prefixes that Tk accepts.
-- [ ] Reintroduce GPU warning highlighting / styling equivalent to Tk’s `_is_gpu_log_entry` handling.
-- [ ] Confirm GPU helper fallback messages remain visible and translated.
+- [x] Pass worker-provided kwargs to the localization formatter.
+- [x] Support the same translation key prefixes that Tk accepts.
+- [x] Reintroduce GPU warning highlighting / styling equivalent to Tk’s `_is_gpu_log_entry` handling.
+- [x] Confirm GPU helper fallback messages remain visible and translated.
 
 
 ---
@@ -203,10 +203,10 @@ Expose runtime language switching in the Qt GUI consistent with the Tk combobox.
 
 **Detailed requirements:**
 
-- [ ] Add a language selector widget bound to `config["language"]`.
-- [ ] Invoke `localizer.set_language` and refresh all UI text when changed.
-- [ ] Persist the selection in config saves and reloads.
-- [ ] Verify Tk and Qt remain in sync when toggling backends after a language change.
+- [x] Add a language selector widget bound to `config["language"]`.
+- [x] Invoke `localizer.set_language` and refresh all UI text when changed.
+- [x] Persist the selection in config saves and reloads.
+- [x] Verify Tk and Qt remain in sync when toggling backends after a language change.
 
 
 ---
@@ -237,3 +237,5 @@ Ensure the coding agent ALWAYS updates this file after completing a task.
 - [x] 2025-11-14: Task B implemented and verified — Qt `_handle_payload` now emits structured GPU helper events, and `ZeMosaicQtMainWindow` applies ETA overrides and helper tracking in parity with Tk `_log_message`/`_handle_gpu_helper_*`.
 - [x] 2025-11-14: Task D implemented — Qt worker now consumes `ETA_UPDATE`, chrono, raw/master counter, and `CLUSTER_OVERRIDE` payloads, emits dedicated signals, updates progress labels, and treats `log_key_processing_cancelled` as a proper cancellation path for timers and status indicators.
 - [x] 2025-11-15: Task E implemented — Qt logging/progress panel now mirrors Tk ordering/terminology, exposes master tile counts and remaining raw files, and keeps chrono/ETA displays and resets in sync with worker signals.
+- [x] 2025-11-15: Task F implemented — Qt worker now forwards structured `msg_key` + kwargs to the main window, which uses `ZeMosaicLocalization.get(..., **kwargs)` for all user-facing levels, mirrors Tk’s key handling (including `run_*`/`global_coadd_*` prefixes), and highlights GPU-related log entries (including helper fallback warnings) using a dedicated style while keeping the messages localized and visible.
+- [x] 2025-11-15: Task G implemented — Qt main window now exposes a language selector combo initialized from `config["language"]`, drives `localizer.set_language(...)`, and relies on shared `zemosaic_config` persistence so Tk and Qt read/write the same language key when switching backends.
