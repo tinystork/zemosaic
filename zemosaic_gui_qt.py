@@ -752,7 +752,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._phase45_group_progress: Dict[int, Dict[str, Any]] = {}
         self._phase45_active: Optional[int] = None
         self._phase45_last_out: Optional[str] = None
-        self._phase45_overlay_enabled: bool = True
+        self._phase45_overlay_enabled: bool = False
         self.phase45_status_label: Optional[QLabel] = None
         self.phase45_overlay_scene: Optional[QGraphicsScene] = None
         self.phase45_overlay_view: Optional[QGraphicsView] = None
@@ -2380,7 +2380,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "value_getter": log_level_combo.currentData,
         }
 
-        self._phase45_overlay_enabled = overlay_toggle.isChecked()
+        self._phase45_overlay_enabled = False
         self._phase45_reset_overlay()
 
         return group
