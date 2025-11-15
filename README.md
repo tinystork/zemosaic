@@ -174,6 +174,20 @@ To try the Qt frontend:
 If PySide6 is unavailable or an import error occurs, ZeMosaic automatically
 falls back to the Tk interface without interrupting your workflow.
 
+### Global WCS auto-cropping (English)
+
+ZeMosaic can optionally trim the Mosaic-first canvas so the exported FITS only contains sky regions with real coverage.  
+Enable this by setting `global_wcs_autocrop_enabled` to `true` inside `zemosaic_config.py` (see the `DEFAULT_CONFIG` block near the other `global_wcs_*` keys) or in your personal `zemosaic_config.json`.  
+Once enabled, the worker inspects the Phase 5 coverage map, removes empty borders, and shifts the global WCS `CRPIX`/`NAXIS` values automatically so downstream tools see the reduced frame.  
+Use `global_wcs_autocrop_margin_px` (same section) to keep a safety border in pixels—default is 64 px.
+
+### Recadrage automatique du WCS global (Français)
+
+ZeMosaic peut rogner automatiquement la mosaïque finale (mode Mosaic-first) pour ne conserver que la zone réellement couverte par les images.  
+Activez `global_wcs_autocrop_enabled` en le passant à `true` dans `zemosaic_config.py` (section `DEFAULT_CONFIG`, proche des autres clés `global_wcs_*`) ou dans votre fichier `zemosaic_config.json`.  
+Une fois l’option activée, l’ouvrier analyse la carte de couverture de la Phase 5, supprime les bordures vides et ajuste `CRPIX` / `NAXIS` du WCS global afin que les outils en aval utilisent la toile réduite.  
+La marge de sécurité se règle avec `global_wcs_autocrop_margin_px` (en pixels, 64 px par défaut).
+
 ### GPU helper for Phase 4
 
 Setting `use_gpu_phase5` to `true` (via the worker configuration or overrides) now enables the CUDA helper
