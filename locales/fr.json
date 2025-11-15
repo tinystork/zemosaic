@@ -212,6 +212,7 @@
     "global_coadd_warn_helper_fallback": "Assistant « {helper} » a échoué ({reason}) ; retour au pipeline CPU.",
     "global_coadd_info_helper_path": "Assistant « {helper} » utilisé (images={frames}, canaux={channels}, grille={grid_w}×{grid_h}px).",
     "global_coadd_info_helper_magic_wait": "Le GPU mène une bataille magique armé d'un couteau à beurre contre un dragon de fer — merci de patienter...",
+    "global_coadd_helper_channel_progress": "Assistant « {helper} » : canal {channel}/{channels} traité en {elapsed_s:.2f}s ({method}).",
     "global_coadd_info_cpu_path": "Exécution de Mosaic-First sur CPU (images={frames}, grille={grid_w}×{grid_h}px, méthode={method}).",
     "global_coadd_info_cpu_magic_wait": "Le CPU forge la mosaïque à mains nues — merci de patienter...",
     "sds_info_runtime_wcs_built": "SDS : WCS global construit à l'exécution à partir de {entries} entrée(s).",

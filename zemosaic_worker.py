@@ -14403,6 +14403,7 @@ def _assemble_global_mosaic_first_impl(
         final_channels: list[np.ndarray] = []
         coverage_map: np.ndarray | None = None
         for channel_idx in range(channel_count):
+            channel_start_time = time.monotonic()
             data_list: list[np.ndarray] = []
             wcs_list_local: list[Any] = []
             for entry, local_wcs in helper_entries:
@@ -14482,6 +14483,19 @@ def _assemble_global_mosaic_first_impl(
             final_channels.append(np.asarray(chan_mosaic, dtype=np.float32))
             if coverage_map is None:
                 coverage_map = np.asarray(chan_cov, dtype=np.float32)
+            channel_elapsed = max(0.0, time.monotonic() - channel_start_time)
+            pcb(
+                "global_coadd_helper_channel_progress",
+                prog=None,
+                lvl="INFO_DETAIL",
+                **_payload(
+                    helper="gpu_reproject",
+                    method=coadd_method,
+                    channel=int(channel_idx + 1),
+                    channels=int(channel_count),
+                    elapsed_s=float(channel_elapsed),
+                ),
+            )
         if not final_channels or coverage_map is None:
             return None
         final_image = (

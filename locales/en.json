@@ -209,6 +209,7 @@
     "global_coadd_warn_helper_fallback": "Helper '{helper}' failed ({reason}); falling back to CPU pipeline.",
     "global_coadd_info_helper_path": "Using helper '{helper}' (frames={frames}, channels={channels}, grid={grid_w}×{grid_h}px).",
     "global_coadd_info_helper_magic_wait": "GPU is doing a magic battle with a butter knife against an iron dragon — please stand by...",
+    "global_coadd_helper_channel_progress": "Helper '{helper}' processed channel {channel}/{channels} in {elapsed_s:.2f}s ({method}).",
     "global_coadd_info_cpu_path": "Running Mosaic-First on CPU (frames={frames}, grid={grid_w}×{grid_h}px, method={method}).",
     "global_coadd_info_cpu_magic_wait": "CPU is forging the mosaic with bare-metal patience — please stand by...",
     "sds_info_runtime_wcs_built": "SDS runtime global WCS built from {entries} entry(ies).",
