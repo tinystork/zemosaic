@@ -597,6 +597,7 @@
     "filter.cluster.failed_generic": "Unable to prepare master-tile groups.",
     "filter.cluster.failed_short": "Auto-organisation failed.",
     "filter.cluster.complete": "Master-tile organisation complete.",
+    "filter.cluster.sds_ready": "ZeSupaDupStack prepared {count} coverage batch(es).",
     "ui_coverage_first": "Coverage-first clustering (may exceed Max raws/tile)",
     "ui_overcap_allowance_pct": "Over-cap allowance (%)",
     "log_covfirst_start": "Coverage-first clustering: start (threshold={TH} deg, cap={CAP}, min_cap={MIN})",

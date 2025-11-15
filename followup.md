@@ -646,6 +646,7 @@ This includes in particular:
   ```python
   filtered_list, accepted, overrides_dict = launch_filter_interface_qt(...)
   - 2025-11-16: Qt filter now defers auto-organisation to the same worker helpers (`cluster_seestar_stacks_connected`, `_auto_split_groups`, `_merge_small_groups`) used by Tk, stores the resulting `preplan_master_groups` overrides, logs manual requests, and the Resolve Missing WCS button continues to drive `_DirectoryScanWorker` so the ASTAP pipeline honours both solver settings and config overrides; `launch_filter_interface_qt` still returns `(filtered_list, accepted, overrides)`.
+  - 2025-11-17: Fixed Qt instrument detection refresh (Seestar correctly detected in the Instrument filter) and brought the Auto-organize pipeline to feature parity with Tk, including SDS/global-WCS coverage batches, coverage-first logs, and master-group overrides.
 
 ## Notes / Known Issues
 

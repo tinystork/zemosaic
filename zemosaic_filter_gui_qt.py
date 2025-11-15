@@ -57,6 +57,8 @@ import csv
 import threading
 from typing import Any, Callable, Iterable, Iterator, List, Sequence, Tuple
 
+import numpy as np
+
 
 _pyside_spec = importlib.util.find_spec("PySide6")
 if _pyside_spec is None:  # pragma: no cover - import guard
@@ -1295,6 +1297,16 @@ class FilterQtDialog(QDialog):
         self._auto_group_running = False
         self._auto_group_override_groups: list[list[dict[str, Any]]] | None = None
         self._header_cache: dict[str, Any] = {}
+        self._global_wcs_state: dict[str, Any] = {
+            "descriptor": None,
+            "meta": None,
+            "fits_path": None,
+            "json_path": None,
+        }
+        self._coverage_first_enabled_flag = self._coerce_bool(
+            self._config_value("filter_enable_coverage_first", True),
+            True,
+        )
         self._preview_color_cycle: tuple[str, ...] = (
             "#3f7ad6",
             "#d64b3f",
@@ -1691,6 +1703,15 @@ class FilterQtDialog(QDialog):
             except Exception:
                 formatted = f"Auto-organisation failed: {exc}"
             messages.append(formatted)
+        if result_payload and result_payload.get("coverage_first"):
+            groups_count = len(result_payload.get("final_groups") or [])
+            messages.append(
+                self._format_message(
+                    "log_covfirst_done",
+                    "Coverage-first preplan ready: {N} group(s).",
+                    N=groups_count,
+                )
+            )
 
         def _finalize() -> None:
             self._auto_group_running = False
@@ -1721,6 +1742,36 @@ class FilterQtDialog(QDialog):
         selected_indices: list[int],
         messages: list[str],
     ) -> dict[str, Any]:
+        sds_mode = bool(self._sds_checkbox.isChecked()) if self._sds_checkbox is not None else False
+        coverage_enabled = self._coverage_first_enabled()
+        workflow_mode = self._determine_workflow_mode(self._detect_primary_instrument_label())
+        if workflow_mode == "seestar":
+            coverage_enabled = True
+        if sds_mode and compute_global_wcs_descriptor is not None:
+            success, _meta = self._ensure_global_wcs_for_indices(selected_indices)
+            if success:
+                threshold = self._coerce_float(self._config_value("sds_coverage_threshold", 0.92), 0.92)
+                threshold = max(0.10, min(0.99, threshold))
+                sds_groups = self._build_sds_batches_for_indices(
+                    selected_indices,
+                    coverage_threshold=threshold,
+                )
+                if sds_groups:
+                    template = self._localizer.get(
+                        "filter.cluster.sds_ready",
+                        "ZeSupaDupStack prepared {count} coverage batch(es).",
+                    )
+                    try:
+                        messages.append(template.format(count=len(sds_groups)))
+                    except Exception:
+                        messages.append(f"ZeSupaDupStack prepared {len(sds_groups)} coverage batch(es).")
+                    return {
+                        "final_groups": sds_groups,
+                        "sizes": [len(group) for group in sds_groups],
+                        "coverage_first": True,
+                        "threshold_used": 0.0,
+                        "angle_split": 0.0,
+                    }
         candidate_infos: list[dict[str, Any]] = []
         coord_samples: list[tuple[float, float]] = []
         for idx in selected_indices:
@@ -1749,6 +1800,16 @@ class FilterQtDialog(QDialog):
         auto_angle_detect = self._resolve_auto_angle_detect_threshold()
         cap_effective, min_cap = self._resolve_autosplit_caps()
         overcap_pct = self._resolve_overcap_percent()
+        if coverage_enabled:
+            messages.append(
+                self._format_message(
+                    "log_covfirst_start",
+                    "Coverage-first clustering: start (threshold={TH} deg, cap={CAP}, min_cap={MIN})",
+                    TH=f"{threshold_initial:.3f}",
+                    CAP=int(cap_effective),
+                    MIN=int(min_cap),
+                )
+            )
 
         groups_initial = _CLUSTER_CONNECTED(
             candidate_infos,
@@ -1802,6 +1863,17 @@ class FilterQtDialog(QDialog):
             min_cap=int(max(1, min_cap)),
             progress_callback=None,
         )
+        if coverage_enabled:
+            messages.append(
+                self._format_message(
+                    "log_covfirst_autosplit",
+                    "Autosplit applied: cap={CAP}, min_cap={MIN}, groups_in={IN}, groups_out={OUT}",
+                    CAP=int(cap_effective),
+                    MIN=int(min_cap),
+                    IN=len(groups_used),
+                    OUT=len(groups_after_autosplit),
+                )
+            )
 
         cap_allowance = max(int(cap_effective), int(cap_effective * (1 + overcap_pct / 100.0)))
         max_dispersion = None
@@ -1820,6 +1892,15 @@ class FilterQtDialog(QDialog):
             max_dispersion_deg=max_dispersion,
             log_fn=messages.append,
         )
+        if coverage_enabled:
+            messages.append(
+                self._format_message(
+                    "log_covfirst_merge",
+                    "Merged small groups with over-cap allowance={ALLOW}%, final_groups={N}",
+                    ALLOW=int(overcap_pct),
+                    N=len(final_groups),
+                )
+            )
 
         for group in final_groups:
             for info in group:
@@ -2065,6 +2146,214 @@ class FilterQtDialog(QDialog):
         except Exception:
             value = 10
         return max(0, min(50, value))
+
+    def _coverage_first_enabled(self) -> bool:
+        return bool(self._coverage_first_enabled_flag)
+
+    def _ensure_global_wcs_for_indices(
+        self,
+        selected_indices: list[int],
+    ) -> tuple[bool, dict[str, Any] | None]:
+        success, meta_payload, _ = self._ensure_global_wcs_for_selection(True, selected_indices)
+        return success, meta_payload
+
+    def _build_sds_batches_for_indices(
+        self,
+        selected_indices: list[int],
+        *,
+        coverage_threshold: float = 0.92,
+    ) -> list[list[dict[str, Any]]] | None:
+        descriptor = self._global_wcs_state.get("descriptor")
+        if not descriptor or WCS is None:
+            return None
+        plan_wcs = descriptor.get("wcs")
+        if plan_wcs is None:
+            header_obj = descriptor.get("header")
+            if header_obj is None and isinstance(descriptor.get("metadata"), dict):
+                header_obj = descriptor["metadata"].get("header")
+            if header_obj is not None:
+                try:
+                    plan_wcs = WCS(header_obj)
+                except Exception:
+                    plan_wcs = None
+        if plan_wcs is None:
+            return None
+        try:
+            width = int(descriptor.get("width") or 0)
+            height = int(descriptor.get("height") or 0)
+        except Exception:
+            width = height = 0
+        if width <= 0 or height <= 0:
+            return None
+
+        entry_infos: list[dict[str, Any]] = []
+        for idx in selected_indices:
+            if not (0 <= idx < len(self._normalized_items)):
+                continue
+            entry = self._normalized_items[idx]
+            if not self._entry_is_seestar(entry):
+                continue
+            payload, _coords = self._build_candidate_payload(entry)
+            if payload is None:
+                continue
+            local_wcs = payload.get("wcs")
+            if local_wcs is None or not getattr(local_wcs, "is_celestial", False):
+                continue
+            shape_hw = self._coerce_entry_shape(entry, payload)
+            if (
+                shape_hw is None
+                or shape_hw[0] is None
+                or shape_hw[1] is None
+                or shape_hw[0] <= 0
+                or shape_hw[1] <= 0
+            ):
+                continue
+            try:
+                rows = np.array([0, 0, shape_hw[0] - 1, shape_hw[0] - 1], dtype=float)
+                cols = np.array([0, shape_hw[1] - 1, 0, shape_hw[1] - 1], dtype=float)
+                world_coords = local_wcs.pixel_to_world(cols, rows)
+                g_cols, g_rows = plan_wcs.world_to_pixel(world_coords)
+            except Exception:
+                continue
+            if g_cols is None or g_rows is None:
+                continue
+            try:
+                x0 = int(np.floor(np.nanmin(g_cols)))
+                x1 = int(np.ceil(np.nanmax(g_cols))) + 1
+                y0 = int(np.floor(np.nanmin(g_rows)))
+                y1 = int(np.ceil(np.nanmax(g_rows))) + 1
+            except Exception:
+                continue
+            if any(np.isnan(val) for val in (x0, x1, y0, y1)):
+                continue
+            x0 = max(0, min(width, x0))
+            x1 = max(x0 + 1, min(width, x1))
+            y0 = max(0, min(height, y0))
+            y1 = max(y0 + 1, min(height, y1))
+            entry_infos.append({"payload": payload, "bbox": (y0, y1, x0, x1)})
+
+        if not entry_infos:
+            return None
+
+        grid_h = max(1, min(512, height))
+        grid_w = max(1, min(512, width))
+        scale_y = grid_h / float(height)
+        scale_x = grid_w / float(width)
+        for info in entry_infos:
+            y0, y1, x0, x1 = info["bbox"]
+            g_y0 = max(0, min(grid_h, int(math.floor(y0 * scale_y))))
+            g_y1 = max(g_y0 + 1, min(grid_h, int(math.ceil(y1 * scale_y))))
+            g_x0 = max(0, min(grid_w, int(math.floor(x0 * scale_x))))
+            g_x1 = max(g_x0 + 1, min(grid_w, int(math.ceil(x1 * scale_x))))
+            info["grid_bbox"] = (g_y0, g_y1, g_x0, g_x1)
+
+        coverage_threshold = max(0.10, min(0.99, float(coverage_threshold or 0.92)))
+        total_cells = grid_h * grid_w
+        remaining = entry_infos
+        batches: list[list[dict[str, Any]]] = []
+        while remaining:
+            coverage_grid = np.zeros((grid_h, grid_w), dtype=np.uint8)
+            coverage_cells = 0
+            used_indices: list[int] = []
+            batch_entries: list[dict[str, Any]] = []
+            for idx, info in enumerate(remaining):
+                gy0, gy1, gx0, gx1 = info.get("grid_bbox", (0, 0, 0, 0))
+                if gy1 <= gy0 or gx1 <= gx0:
+                    continue
+                region = coverage_grid[gy0:gy1, gx0:gx1]
+                already = int(region.sum())
+                region_cells = (gy1 - gy0) * (gx1 - gx0)
+                region[...] = 1
+                gain = max(0, region_cells - already)
+                if gain <= 0 and batch_entries:
+                    continue
+                coverage_cells += gain
+                batch_entries.append(info)
+                used_indices.append(idx)
+                fraction = (coverage_cells / total_cells) if total_cells else 1.0
+                if fraction >= coverage_threshold and batch_entries:
+                    break
+            if not batch_entries:
+                batch_entries.append(remaining[0])
+                used_indices = [0]
+            batches.append(batch_entries)
+            used = set(used_indices)
+            remaining = [info for idx, info in enumerate(remaining) if idx not in used]
+
+        final_groups: list[list[dict[str, Any]]] = []
+        for batch in batches:
+            group_payload: list[dict[str, Any]] = []
+            for info in batch:
+                payload = info.get("payload")
+                if isinstance(payload, dict):
+                    group_payload.append(dict(payload))
+            if group_payload:
+                final_groups.append(group_payload)
+        return final_groups if final_groups else None
+
+    def _entry_is_seestar(self, entry: _NormalizedItem) -> bool:
+        label = self._normalize_string(entry.instrument)
+        if label and any(token in label.lower() for token in ("seestar", "s50", "s30")):
+            return True
+        original = entry.original
+        header = None
+        if isinstance(original, dict):
+            header = original.get("header") or original.get("header_subset")
+        if header is None:
+            header = self._load_header(entry.file_path)
+        if header is None:
+            return False
+        detected = _detect_instrument_from_header(header)
+        return bool(detected and "seestar" in detected.lower())
+
+    def _coerce_entry_shape(
+        self,
+        entry: _NormalizedItem,
+        payload: dict[str, Any],
+    ) -> tuple[int, int] | None:
+        shape_candidate = payload.get("shape")
+        if isinstance(shape_candidate, (list, tuple)) and len(shape_candidate) >= 2:
+            try:
+                h = int(shape_candidate[0])
+                w = int(shape_candidate[1])
+                if h > 0 and w > 0:
+                    return (h, w)
+            except Exception:
+                pass
+        wcs_obj = payload.get("wcs")
+        if getattr(wcs_obj, "pixel_shape", None):
+            try:
+                ny, nx = wcs_obj.pixel_shape  # type: ignore[attr-defined]
+                h = int(ny)
+                w = int(nx)
+                if h > 0 and w > 0:
+                    return (h, w)
+            except Exception:
+                pass
+        header = None
+        if isinstance(entry.original, dict):
+            header = entry.original.get("header") or entry.original.get("header_subset")
+        if header is None:
+            header = self._load_header(entry.file_path)
+        if header is not None:
+            try:
+                naxis1 = int(header.get("NAXIS1"))
+                naxis2 = int(header.get("NAXIS2"))
+                if naxis2 > 0 and naxis1 > 0:
+                    return (naxis2, naxis1)
+            except Exception:
+                pass
+        return None
+
+    def _format_message(self, key: str, default: str, **kwargs: Any) -> str:
+        template = self._localizer.get(key, default)
+        try:
+            return template.format(**kwargs)
+        except Exception:
+            try:
+                return default.format(**kwargs)
+            except Exception:
+                return default
 
     def _compute_global_center(self) -> Tuple[float | None, float | None]:
         coords: list[Tuple[float, float]] = []
@@ -3410,6 +3699,7 @@ class FilterQtDialog(QDialog):
     def _ensure_global_wcs_for_selection(
         self,
         require_plan: bool,
+        selected_indices: list[int] | None = None,
     ) -> tuple[bool, dict[str, Any] | None, dict[str, Any] | None]:
         if not require_plan:
             return False, None, None
@@ -3461,10 +3751,15 @@ class FilterQtDialog(QDialog):
                 return False, None, None
 
             selected_entries: list[_NormalizedItem] = []
-            for row, entry in enumerate(self._normalized_items):
-                item = self._table.item(row, 0)
-                if item and item.checkState() == Qt.Checked:
-                    selected_entries.append(entry)
+            if selected_indices is None:
+                for row, entry in enumerate(self._normalized_items):
+                    item = self._table.item(row, 0)
+                    if item and item.checkState() == Qt.Checked:
+                        selected_entries.append(entry)
+            else:
+                for idx in selected_indices:
+                    if 0 <= idx < len(self._normalized_items):
+                        selected_entries.append(self._normalized_items[idx])
 
             if not selected_entries:
                 return False, None, None
@@ -3638,7 +3933,7 @@ class FilterQtDialog(QDialog):
         meta_payload: dict[str, Any] | None = None
         path_payload: dict[str, Any] | None = None
         if require_global_plan:
-            success, meta_payload, path_payload = self._ensure_global_wcs_for_selection(True)
+            success, meta_payload, path_payload = self._ensure_global_wcs_for_selection(True, None)
 
         if success and meta_payload and path_payload:
             overrides["global_wcs_meta"] = meta_payload
@@ -3716,9 +4011,12 @@ class FilterQtDialog(QDialog):
                     else self._localizer.get("filter.value.wcs_missing", "No")
                 )
                 item.setText(text)
+        instrument_changed = False
         instrument = payload.get("instrument")
         if instrument:
-            entry.instrument = instrument
+            if entry.instrument != instrument:
+                entry.instrument = instrument
+                instrument_changed = True
             item = self._table.item(row, 3)
             if item is not None:
                 item.setText(str(instrument))
@@ -3730,6 +4028,8 @@ class FilterQtDialog(QDialog):
         self._update_summary_label()
         self._schedule_preview_refresh()
         self._schedule_cluster_refresh()
+        if instrument_changed:
+            self._refresh_instrument_options()
 
     def _on_scan_error(self, message: str) -> None:
         if not message:
@@ -3752,6 +4052,7 @@ class FilterQtDialog(QDialog):
         self._update_summary_label()
         self._schedule_preview_refresh()
         self._schedule_cluster_refresh()
+        self._refresh_instrument_options()
 
     def _resolve_initial_astap_instances(self) -> int:
         sources: tuple[Any, ...] = (

@@ -589,6 +589,7 @@
     "filter.cluster.failed_generic": "Impossible de préparer les groupes de Master Tiles.",
     "filter.cluster.failed_short": "Organisation automatique échouée.",
     "filter.cluster.complete": "Organisation des Master Tiles terminée.",
+    "filter.cluster.sds_ready": "ZeSupaDupStack a préparé {count} lot(s) de couverture.",
     "ui_coverage_first": "Clustering priorité couverture (peut dépasser Max raws/tuile)",
     "ui_overcap_allowance_pct": "Marge de dépassement (%)",
     "log_covfirst_start": "Clustering priorité couverture : début (seuil={TH} deg, cap={CAP}, min_cap={MIN})",
