@@ -4762,12 +4762,14 @@ class ZeMosaicQtMainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 self._tr("qt_error_invalid_input_dir", "Please select a valid input folder before filtering."),
+                self._tr("qt_error_invalid_input_dir", "Please select a valid input folder before filtering."),
             )
             return None
 
         if not self._input_dir_contains_fits(input_dir):
             QMessageBox.warning(
                 self,
+                self._tr("qt_error_no_fits", "No FITS files found in the selected input folder."),
                 self._tr("qt_error_no_fits", "No FITS files found in the selected input folder."),
             )
             return None
