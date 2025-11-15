@@ -720,6 +720,8 @@ This includes in particular:
 
 - [x] 2025-11-15: Current pass found **no remaining unchecked tasks** in this checklist; paused further code changes until new items are added, so the next agent can resume once additional TODOs appear.
 
+- [x] 2025-11-17 (later pass): Brought the Qt filter UI closer to Tk parity for coverage-first / SDS master-tile organisation: added a `QTabWidget` with **Sky Preview** and **Coverage Map** tabs (the latter drawing group footprints in global WCS pixel space with an outer mosaic box), wired SDS auto-group fallbacks to log the same “ZeSupaDupStack auto-group fallback …” messages when the global descriptor or coverage batches are unavailable, surfaced the “Prepared {g} group(s), sizes: …” summary next to the **Auto-organize Master Tiles** button, and ensured both on-open `preplan_master_groups` overrides and manual Auto-organize runs populate `preplan_master_groups` in `overrides` in the same shape the Tk filter uses for the worker.
+
 ---
 
 ## Task M — Global coadd logging & canvas tightening

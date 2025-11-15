@@ -93,6 +93,7 @@ from PySide6.QtWidgets import (  # noqa: E402  - imported after availability che
     QPlainTextEdit,
     QCheckBox,
     QFileDialog,
+    QTabWidget,
 )
 
 
@@ -1306,12 +1307,16 @@ class FilterQtDialog(QDialog):
         self._preview_canvas: FigureCanvasQTAgg | None = None
         self._preview_axes = None
         self._preview_hint_label = QLabel(self)
+        self._coverage_canvas: FigureCanvasQTAgg | None = None
+        self._coverage_axes = None
+        self._preview_tabs: QTabWidget | None = None
         self._preview_default_hint = ""
         self._preview_refresh_pending = False
         self._cluster_groups: list[list[_NormalizedItem]] = []
         self._cluster_threshold_used: float | None = None
         self._cluster_refresh_pending = False
         self._auto_group_button: QPushButton | None = None
+        self._auto_group_summary_label: QLabel | None = None
         self._auto_group_running = False
         self._auto_group_override_groups: list[list[dict[str, Any]]] | None = None
         self._header_cache: dict[str, Any] = {}
@@ -1375,6 +1380,18 @@ class FilterQtDialog(QDialog):
             self._update_summary_label()
             self._schedule_preview_refresh()
             self._schedule_cluster_refresh()
+            # If the caller provided pre-planned master groups, apply them so
+            # that the user immediately sees the same grouping as in Tk.
+            preplanned = None
+            if isinstance(self._initial_overrides, dict):
+                preplanned = self._initial_overrides.get("preplan_master_groups")
+            if isinstance(preplanned, list) and preplanned:
+                try:
+                    sizes = [len(gr) for gr in preplanned if isinstance(gr, list)]
+                    payload = {"final_groups": preplanned, "sizes": sizes}
+                    self._apply_auto_group_result(payload)
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # Helpers - localization and normalization
@@ -1441,6 +1458,23 @@ class FilterQtDialog(QDialog):
             "Preview shows the approximate pointing of selected frames (limited by preview cap).",
         )
         self._preview_hint_label.setText(self._preview_default_hint)
+        return canvas
+
+    def _create_coverage_canvas(self) -> FigureCanvasQTAgg | None:
+        """Initialise the coverage-map Matplotlib canvas (global WCS plane)."""
+
+        if Figure is None or FigureCanvasQTAgg is None:
+            return None
+
+        figure = Figure(figsize=(5, 3))
+        canvas = FigureCanvasQTAgg(figure)
+        axes = figure.add_subplot(111)
+        self._coverage_axes = axes
+        axes.set_xlabel(self._localizer.get("filter_axis_cov_x", "X [px]"))
+        axes.set_ylabel(self._localizer.get("filter_axis_cov_y", "Y [px]"))
+        axes.set_aspect("equal")
+        axes.grid(True, linestyle=":", linewidth=0.6)
+        self._coverage_canvas = canvas
         return canvas
 
     def _create_toolbar_widget(self) -> QWidget:
@@ -1543,6 +1577,11 @@ class FilterQtDialog(QDialog):
         )
         self._auto_group_button.clicked.connect(self._on_auto_group_clicked)  # type: ignore[arg-type]
         layout.addWidget(self._auto_group_button, 0, 1)
+
+        # Summary label mirroring Tk's "Prepared N group(s), sizes: …"
+        self._auto_group_summary_label = QLabel("", box)
+        self._auto_group_summary_label.setWordWrap(True)
+        layout.addWidget(self._auto_group_summary_label, 0, 2, 2, 1)
 
         astap_label = QLabel(
             self._localizer.get("filter_label_astap_instances", "Max ASTAP instances"),
@@ -1815,6 +1854,20 @@ class FilterQtDialog(QDialog):
                         "threshold_used": 0.0,
                         "angle_split": 0.0,
                     }
+                else:
+                    messages.append(
+                        self._localizer.get(
+                            "filter.cluster.sds_no_batches",
+                            "ZeSupaDupStack auto-group fallback: coverage batches could not be built.",
+                        )
+                    )
+            else:
+                messages.append(
+                    self._localizer.get(
+                        "filter.cluster.sds_wcs_unavailable",
+                        "ZeSupaDupStack auto-group fallback: global WCS descriptor unavailable.",
+                    )
+                )
         candidate_infos: list[dict[str, Any]] = []
         coord_samples: list[tuple[float, float]] = []
         for idx in selected_indices:
@@ -2035,26 +2088,34 @@ class FilterQtDialog(QDialog):
                 )
             )
         else:
-                self._status_label.setText(
-                    self._localizer.get(
-                        "filter.cluster.no_groups",
-                        "No master-tile groups could be prepared.",
-                    )
+            self._status_label.setText(
+                self._localizer.get(
+                    "filter.cluster.no_groups",
+                    "No master-tile groups could be prepared.",
                 )
-
-        if groups:
-            hist = _format_sizes_histogram(sizes) if sizes else "[]"
-            summary_template = self._localizer.get(
-                "filter_log_groups_summary",
-                "Prepared {g} group(s), sizes: {sizes}.",
             )
-            try:
-                summary_text = summary_template.format(g=len(groups), sizes=hist)
-            except Exception:
-                summary_text = f"Prepared {len(groups)} group(s), sizes: {hist}."
-            self._append_log(summary_text)
+
+        # Summarise group sizes both in the log and next to the button,
+        # mirroring Tk's "Prepared {g} group(s), sizes: …" behaviour.
+        hist = _format_sizes_histogram(sizes) if sizes else "[]"
+        summary_template = self._localizer.get(
+            "filter_log_groups_summary",
+            "Prepared {g} group(s), sizes: {sizes}.",
+        )
+        try:
+            summary_text = summary_template.format(g=len(groups), sizes=hist)
+        except Exception:
+            summary_text = f"Prepared {len(groups)} group(s), sizes: {hist}."
+        self._append_log(summary_text)
+        if self._auto_group_summary_label is not None:
+            self._auto_group_summary_label.setText(summary_text)
 
         self._group_outline_bounds = self._compute_group_outline_bounds(groups)
+        if self._coverage_axes is not None and self._coverage_canvas is not None:
+            try:
+                self._update_coverage_plot(groups, bool(payload.get("coverage_first")))
+            except Exception:
+                pass
         self._update_summary_label()
         self._schedule_preview_refresh()
 
@@ -2212,6 +2273,156 @@ class FilterQtDialog(QDialog):
 
             outlines.append((ra_min, ra_max, dec_min, dec_max))
         return outlines
+
+    def _update_coverage_plot(
+        self,
+        groups: list[list[dict[str, Any]]] | None,
+        coverage_first: bool | None = None,
+    ) -> None:
+        """Draw a simple coverage map in global WCS pixel space."""
+
+        if self._coverage_axes is None or self._coverage_canvas is None:
+            return
+
+        axes = self._coverage_axes
+        axes.clear()
+
+        descriptor = self._global_wcs_state.get("descriptor")
+        if not isinstance(descriptor, dict) or WCS is None or SkyCoord is None or u is None:
+            self._coverage_canvas.draw_idle()
+            return
+
+        plan_wcs = descriptor.get("wcs")
+        if plan_wcs is None:
+            header_obj = descriptor.get("header")
+            if header_obj is None and isinstance(descriptor.get("metadata"), dict):
+                header_obj = descriptor["metadata"].get("header")
+            if header_obj is not None:
+                try:
+                    plan_wcs = WCS(header_obj)
+                except Exception:
+                    plan_wcs = None
+        if plan_wcs is None:
+            self._coverage_canvas.draw_idle()
+            return
+
+        try:
+            width = int(descriptor.get("width") or 0)
+            height = int(descriptor.get("height") or 0)
+        except Exception:
+            width = height = 0
+        if width <= 0 or height <= 0:
+            self._coverage_canvas.draw_idle()
+            return
+
+        # Build a lookup from path to normalized entry, reusing the same helper
+        # logic as the sky-preview group outlines.
+        path_map: dict[str, _NormalizedItem] = {}
+        for entry in self._normalized_items:
+            if entry.file_path:
+                path_map[os.path.normcase(entry.file_path)] = entry
+
+        rectangles: list[tuple[float, float, float, float]] = []
+        for group in groups or []:
+            xs: list[float] = []
+            ys: list[float] = []
+            for info in group or []:
+                footprint = self._resolve_group_entry_footprint(info, path_map)
+                if not footprint:
+                    continue
+                ra_vals: list[float] = []
+                dec_vals: list[float] = []
+                for ra_deg, dec_deg in footprint:
+                    try:
+                        ra_vals.append(float(ra_deg))
+                        dec_vals.append(float(dec_deg))
+                    except Exception:
+                        continue
+                if not ra_vals or not dec_vals:
+                    continue
+                try:
+                    sky = SkyCoord(ra=ra_vals * u.deg, dec=dec_vals * u.deg, frame="icrs")
+                    x_pix, y_pix = plan_wcs.world_to_pixel(sky)
+                except Exception:
+                    continue
+                try:
+                    xs.extend(float(v) for v in np.asarray(x_pix, dtype=float).ravel().tolist())
+                    ys.extend(float(v) for v in np.asarray(y_pix, dtype=float).ravel().tolist())
+                except Exception:
+                    continue
+            if not xs or not ys:
+                continue
+            try:
+                x_min = float(np.nanmin(xs))
+                x_max = float(np.nanmax(xs))
+                y_min = float(np.nanmin(ys))
+                y_max = float(np.nanmax(ys))
+            except Exception:
+                continue
+            if not (np.isfinite(x_min) and np.isfinite(x_max) and np.isfinite(y_min) and np.isfinite(y_max)):
+                continue
+            if x_max <= x_min or y_max <= y_min:
+                continue
+            rectangles.append((x_min, x_max, y_min, y_max))
+
+        # Draw rectangles for each group coverage in pixel coordinates.
+        global_x_min = 0.0
+        global_y_min = 0.0
+        global_x_max = float(width)
+        global_y_max = float(height)
+
+        for idx, (x_min, x_max, y_min, y_max) in enumerate(rectangles):
+            color = "#3f7ad6"
+            rect = Rectangle(
+                (x_min, y_min),
+                x_max - x_min,
+                y_max - y_min,
+                linewidth=1.0,
+                linestyle="--",
+                edgecolor=color,
+                facecolor="none",
+                alpha=0.75,
+            )
+            axes.add_patch(rect)
+            global_x_min = min(global_x_min, x_min)
+            global_y_min = min(global_y_min, y_min)
+            global_x_max = max(global_x_max, x_max)
+            global_y_max = max(global_y_max, y_max)
+
+        # Outer mosaic extent (dashed red box) similar to Tk.
+        try:
+            border = Rectangle(
+                (0.0, 0.0),
+                float(width),
+                float(height),
+                linewidth=1.6,
+                linestyle="--",
+                edgecolor="#d64b3f",
+                facecolor="none",
+                alpha=0.9,
+            )
+            axes.add_patch(border)
+        except Exception:
+            pass
+
+        if global_x_max <= global_x_min or global_y_max <= global_y_min:
+            axes.set_xlim(0, width)
+            axes.set_ylim(height, 0)
+        else:
+            margin_x = max(8.0, 0.02 * float(width))
+            margin_y = max(8.0, 0.02 * float(height))
+            xmin = max(0.0, global_x_min - margin_x)
+            xmax = min(float(width), global_x_max + margin_x)
+            ymin = max(0.0, global_y_min - margin_y)
+            ymax = min(float(height), global_y_max + margin_y)
+            axes.set_xlim(xmin, xmax)
+            axes.set_ylim(ymax, ymin)  # invert Y for image-like convention
+
+        axes.set_xlabel(self._localizer.get("filter_axis_cov_x", "X [px]"))
+        axes.set_ylabel(self._localizer.get("filter_axis_cov_y", "Y [px]"))
+        axes.grid(True, linestyle=":", linewidth=0.6)
+
+        self._coverage_canvas.draw_idle()
 
     def _resolve_group_entry_footprint(
         self,
@@ -2861,7 +3072,32 @@ class FilterQtDialog(QDialog):
         preview_layout.setContentsMargins(8, 8, 8, 8)
         preview_layout.setSpacing(6)
         if self._preview_canvas is not None:
-            preview_layout.addWidget(self._preview_canvas, stretch=1)
+            tabs = QTabWidget(preview_group)
+            self._preview_tabs = tabs
+
+            sky_container = QWidget(preview_group)
+            sky_layout = QVBoxLayout(sky_container)
+            sky_layout.setContentsMargins(0, 0, 0, 0)
+            sky_layout.setSpacing(0)
+            sky_layout.addWidget(self._preview_canvas, 1)
+            tabs.addTab(
+                sky_container,
+                self._localizer.get("filter_tab_sky_preview", "Sky Preview"),
+            )
+
+            coverage_canvas = self._create_coverage_canvas()
+            if coverage_canvas is not None:
+                coverage_container = QWidget(preview_group)
+                coverage_layout = QVBoxLayout(coverage_container)
+                coverage_layout.setContentsMargins(0, 0, 0, 0)
+                coverage_layout.setSpacing(0)
+                coverage_layout.addWidget(coverage_canvas, 1)
+                tabs.addTab(
+                    coverage_container,
+                    self._localizer.get("filter_tab_coverage_map", "Coverage Map"),
+                )
+
+            preview_layout.addWidget(tabs, 1)
         preview_layout.addWidget(self._preview_hint_label)
         content_splitter.addWidget(preview_group)
 
