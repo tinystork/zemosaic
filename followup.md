@@ -598,6 +598,54 @@ Make `zemosaic_filter_gui_qt.py` visually match the Tk filter layout with a **ho
 - Prefer updating `_build_ui` and the existing helper creators (`_create_preview_canvas`, `_create_wcs_controls_box`, etc.) rather than moving business logic; only layout and Qt signal wiring should change.
 
 ---
+---
+
+## Task R — Wire Qt Filter actions to match Tk behaviour + main GUI
+
+**Goal:**  
+Ensure that every action button / toggle in `zemosaic_filter_gui_qt.py` reproduces **exactly the same behaviour** as in `zemosaic_filter_gui.py`, and that all resulting overrides are correctly propagated back to `zemosaic_gui_qt.py` (main GUI).
+
+This includes in particular:
+- **Resolve missing WCS**
+- **Auto-organize Master tiles**
+- **Auto-group master tiles**
+- **Apply Seestar heuristics**
+- **Enable ZeSupaDupStack (SDS)**
+- **Draw WCS footprints**
+- **Write WCS to file**
+- **Scan subfolders (recursive)**
+- **Select all / Select none**
+
+### 1. Feature-level parity (inside `zemosaic_filter_gui_qt.py`)
+
+- [x] For each control listed above, locate the **Tk implementation** in `zemosaic_filter_gui.py`:
+  - Identify the callback / method that is executed when the Tk button is clicked.
+  - Identify any updates to:
+    - the internal frame list (checked/unchecked),
+    - the cluster / group assignments,
+    - the WCS metadata / headers,
+    - the `overrides_dict` returned to the caller.
+
+- [x] In the Qt filter dialog, make the corresponding slot call the **same helper(s)**:
+  - Prefer calling shared, non-GUI helpers (functions defined near the Tk logic) instead of re-implémenter la logique côté Qt.
+  - If some logic is currently embedded only in the Tk class, refactor it into a shared helper that both Tk and Qt can call.
+
+- [x] Specifically for **Auto-organize Master tiles**:
+  - Reuse the same grouping algorithm as Tk (same inputs, same outputs).
+  - Update group IDs in the Qt table so that the visible groups match Tk for the same dataset.
+  - Ensure `overrides_dict["preplan_master_groups"]` (or équivalent) is filled the same way as in Tk when manual / auto organisation is requested.
+  - Log a message comparable à `"Manual master-tile organisation requested."` in the Qt scan log.
+
+- [x] For **Resolve missing WCS**:
+  - Trigger exactly le même pipeline d’appel ASTAP que Tk (prise en compte de `solver_settings_dict` et `config_overrides`).
+  - Mettre à jour la colonne WCS du tableau, le compteur `resolved_wcs_count` et le log de scan.
+
+### 2. Return values & integration with `zemosaic_gui_qt.py`
+
+- [x] Vérifier que l’API du filtre Qt reste strictement:
+  ```python
+  filtered_list, accepted, overrides_dict = launch_filter_interface_qt(...)
+  - 2025-11-16: Qt filter now defers auto-organisation to the same worker helpers (`cluster_seestar_stacks_connected`, `_auto_split_groups`, `_merge_small_groups`) used by Tk, stores the resulting `preplan_master_groups` overrides, logs manual requests, and the Resolve Missing WCS button continues to drive `_DirectoryScanWorker` so the ASTAP pipeline honours both solver settings and config overrides; `launch_filter_interface_qt` still returns `(filtered_list, accepted, overrides)`.
 
 ## Notes / Known Issues
 

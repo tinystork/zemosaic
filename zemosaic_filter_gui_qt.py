@@ -54,7 +54,8 @@ import os
 from pathlib import Path
 import math
 import csv
-from typing import Any, Iterable, Iterator, List, Sequence, Tuple
+import threading
+from typing import Any, Callable, Iterable, Iterator, List, Sequence, Tuple
 
 
 _pyside_spec = importlib.util.find_spec("PySide6")
@@ -120,9 +121,13 @@ else:  # pragma: no cover - optional dependency guard
 try:  # pragma: no cover - optional dependency for metadata extraction
     from astropy.io import fits
     from astropy.wcs import WCS
+    from astropy.coordinates import SkyCoord
+    import astropy.units as u
 except Exception:  # pragma: no cover - optional dependency guard
     fits = None  # type: ignore[assignment]
     WCS = None  # type: ignore[assignment]
+    SkyCoord = None  # type: ignore[assignment]
+    u = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - optional dependency guard
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
@@ -136,6 +141,202 @@ try:  # pragma: no cover - optional dependency guard
 except Exception:  # pragma: no cover - optional dependency guard
     solve_with_astap = None  # type: ignore[assignment]
     set_astap_max_concurrent_instances = None  # type: ignore[assignment]
+
+try:  # pragma: no cover - optional dependency guard
+    import zemosaic_worker as _zemosaic_worker  # type: ignore
+except Exception:  # pragma: no cover - optional dependency guard
+    _zemosaic_worker = None  # type: ignore[assignment]
+
+if _zemosaic_worker is not None:
+    _CLUSTER_CONNECTED = getattr(_zemosaic_worker, "cluster_seestar_stacks_connected", None)
+    _AUTOSPLIT_GROUPS = getattr(_zemosaic_worker, "_auto_split_groups", None)
+    _COMPUTE_MAX_SEPARATION = getattr(_zemosaic_worker, "_compute_max_angular_separation_deg", None)
+else:  # pragma: no cover - helper fallback
+    _CLUSTER_CONNECTED = None
+    _AUTOSPLIT_GROUPS = None
+    _COMPUTE_MAX_SEPARATION = None
+
+try:  # pragma: no cover - optional dependency guard
+    from zemosaic_filter_gui import (  # type: ignore
+        _merge_small_groups as _tk_merge_small_groups,
+        _split_group_by_orientation as _tk_split_group_by_orientation,
+        _circular_dispersion_deg as _tk_circular_dispersion_deg,
+    )
+except Exception:  # pragma: no cover - helper fallback
+    _tk_merge_small_groups = None  # type: ignore[assignment]
+    _tk_split_group_by_orientation = None  # type: ignore[assignment]
+    _tk_circular_dispersion_deg = None  # type: ignore[assignment]
+
+if _tk_circular_dispersion_deg is None:  # pragma: no cover - fallback copy
+    def _tk_circular_dispersion_deg(values: Iterable[float]) -> float:
+        values_list = [float(v) for v in values if v is not None]
+        if not values_list:
+            return 0.0
+        mean_angle = math.atan2(
+            sum(math.sin(math.radians(v)) for v in values_list),
+            sum(math.cos(math.radians(v)) for v in values_list),
+        )
+        deviations = [
+            math.degrees(math.acos(math.cos(math.radians(v) - mean_angle))) for v in values_list
+        ]
+        return max(deviations) if deviations else 0.0
+
+if _tk_split_group_by_orientation is None:  # pragma: no cover - fallback copy
+    def _tk_split_group_by_orientation(group: list[dict], threshold_deg: float) -> list[list[dict]]:
+        if threshold_deg <= 0.0 or not group:
+            return [group]
+        buckets: list[list[dict]] = []
+        for entry in group:
+            pa = entry.get("PA_DEG")
+            try:
+                pa_value = float(pa)
+            except Exception:
+                pa_value = None
+            if pa_value is None:
+                buckets.append([entry])
+                continue
+            matched = False
+            for bucket in buckets:
+                ref = bucket[0].get("PA_DEG")
+                try:
+                    ref_value = float(ref)
+                except Exception:
+                    ref_value = None
+                if ref_value is None:
+                    continue
+                delta = abs(pa_value - ref_value) % 360.0
+                delta = min(delta, 360.0 - delta)
+                if delta <= threshold_deg:
+                    bucket.append(entry)
+                    matched = True
+                    break
+            if not matched:
+                buckets.append([entry])
+        return buckets
+
+if _tk_merge_small_groups is None:  # pragma: no cover - fallback copy
+    def _tk_merge_small_groups(
+        groups: list[list[dict]],
+        min_size: int,
+        cap: int,
+        *,
+        cap_allowance: int | None = None,
+        compute_dispersion: Callable[[list[tuple[float, float]]], float] | None = None,
+        max_dispersion_deg: float | None = None,
+        log_fn: Callable[[str], None] | None = None,
+    ) -> list[list[dict]]:
+        if not groups or min_size <= 0 or cap <= 0:
+            return groups
+        merged = [False] * len(groups)
+        centers: list[tuple[float, float] | None] = []
+        for group in groups:
+            coords = []
+            for entry in group:
+                ra = entry.get("RA")
+                dec = entry.get("DEC")
+                if ra is None or dec is None:
+                    continue
+                try:
+                    coords.append((float(ra), float(dec)))
+                except Exception:
+                    continue
+            if coords:
+                avg_ra = sum(pt[0] for pt in coords) / len(coords)
+                avg_dec = sum(pt[1] for pt in coords) / len(coords)
+                centers.append((avg_ra, avg_dec))
+            else:
+                centers.append(None)
+
+        allowance = cap_allowance if cap_allowance and cap_allowance > 0 else cap
+        allowance = max(allowance, cap)
+
+        def _distance(a: tuple[float, float] | None, b: tuple[float, float] | None) -> float:
+            if a is None or b is None:
+                return float("inf")
+            dra = abs(a[0] - b[0])
+            ddec = abs(a[1] - b[1])
+            return math.hypot(dra, ddec)
+
+        for idx, group in enumerate(groups):
+            if merged[idx] or len(group) >= min_size:
+                continue
+            nearest = None
+            nearest_dist = float("inf")
+            for other_idx, other in enumerate(groups):
+                if idx == other_idx or merged[other_idx]:
+                    continue
+                dist = _distance(centers[idx], centers[other_idx])
+                if dist < nearest_dist:
+                    nearest_dist = dist
+                    nearest = other_idx
+            if nearest is None:
+                continue
+            if len(groups[nearest]) + len(group) > allowance:
+                continue
+            if compute_dispersion is not None and max_dispersion_deg is not None:
+                coords = []
+                for entry in groups[nearest] + group:
+                    ra = entry.get("RA")
+                    dec = entry.get("DEC")
+                    if ra is None or dec is None:
+                        continue
+                    try:
+                        coords.append((float(ra), float(dec)))
+                    except Exception:
+                        continue
+                try:
+                    dispersion = compute_dispersion(coords)
+                except Exception:
+                    dispersion = None
+                if dispersion is not None and dispersion > max_dispersion_deg:
+                    continue
+            groups[nearest].extend(group)
+            merged[idx] = True
+            if log_fn:
+                log_fn(f"[AutoMerge] Group {idx} merged into {nearest}")
+        return [group for idx, group in enumerate(groups) if not merged[idx]]
+
+
+class _FallbackWCS:
+    """Minimal WCS-like object built from a SkyCoord center."""
+
+    is_celestial = True
+
+    def __init__(self, center_coord: SkyCoord) -> None:
+        self._center = center_coord
+        self.pixel_shape = (1, 1)
+        self.array_shape = (1, 1)
+
+        class _Inner:
+            def __init__(self, center: SkyCoord) -> None:
+                self.crval = (
+                    float(center.ra.to(u.deg).value),
+                    float(center.dec.to(u.deg).value),
+                )
+                self.crpix = (0.5, 0.5)
+
+        self.wcs = _Inner(center_coord)
+
+    def pixel_to_world(self, _x: float, _y: float) -> SkyCoord:
+        return self._center
+
+
+ANGLE_SPLIT_DEFAULT_DEG = 5.0
+AUTO_ANGLE_DETECT_DEFAULT_DEG = 10.0
+
+
+def _sanitize_angle_value(value: Any, default: float) -> float:
+    try:
+        val = float(value)
+    except Exception:
+        return default
+    if math.isnan(val) or math.isinf(val):
+        return default
+    if val < 0.0:
+            return 0.0
+    if val > 180.0:
+        return 180.0
+    return val
 
 try:  # pragma: no cover - optional dependency guard
     from zemosaic_config import DEFAULT_CONFIG as _DEFAULT_GUI_CONFIG  # type: ignore
@@ -1090,6 +1291,10 @@ class FilterQtDialog(QDialog):
         self._cluster_groups: list[list[_NormalizedItem]] = []
         self._cluster_threshold_used: float | None = None
         self._cluster_refresh_pending = False
+        self._auto_group_button: QPushButton | None = None
+        self._auto_group_running = False
+        self._auto_group_override_groups: list[list[dict[str, Any]]] | None = None
+        self._header_cache: dict[str, Any] = {}
         self._preview_color_cycle: tuple[str, ...] = (
             "#3f7ad6",
             "#d64b3f",
@@ -1301,12 +1506,12 @@ class FilterQtDialog(QDialog):
         resolve_btn.clicked.connect(self._on_resolve_wcs_clicked)  # type: ignore[arg-type]
         layout.addWidget(resolve_btn, 0, 0)
 
-        auto_btn = QPushButton(
+        self._auto_group_button = QPushButton(
             self._localizer.get("filter_btn_auto_group", "Auto-organize Master Tiles"),
             box,
         )
-        auto_btn.clicked.connect(self._on_auto_group_clicked)  # type: ignore[arg-type]
-        layout.addWidget(auto_btn, 0, 1)
+        self._auto_group_button.clicked.connect(self._on_auto_group_clicked)  # type: ignore[arg-type]
+        layout.addWidget(self._auto_group_button, 0, 1)
 
         astap_label = QLabel(
             self._localizer.get("filter_label_astap_instances", "Max ASTAP instances"),
@@ -1428,14 +1633,438 @@ class FilterQtDialog(QDialog):
         self._on_run_analysis()
 
     def _on_auto_group_clicked(self) -> None:
-        self._cluster_refresh_pending = False
-        self._update_cluster_assignments()
-        message = self._localizer.get(
-            "filter.cluster.manual_refresh",
-            "Manual master-tile organisation requested.",
+        """Trigger the worker-style clustering pipeline used by the Tk filter."""
+
+        if self._auto_group_running:
+            return
+        if _CLUSTER_CONNECTED is None or _AUTOSPLIT_GROUPS is None:
+            message = self._localizer.get(
+                "filter.cluster.helpers_missing",
+                "Auto-organisation helpers are unavailable; install the worker module.",
+            )
+            self._append_log(message)
+            self._status_label.setText(message)
+            return
+
+        selected_indices = self._collect_selected_indices()
+        if not selected_indices:
+            message = self._localizer.get(
+                "filter.cluster.no_selection",
+                "Select at least one frame before requesting auto-organisation.",
+            )
+            self._append_log(message)
+            self._status_label.setText(message)
+            return
+
+        self._auto_group_running = True
+        if self._auto_group_button is not None:
+            self._auto_group_button.setEnabled(False)
+        self._append_log(
+            self._localizer.get(
+                "filter.cluster.manual_refresh",
+                "Manual master-tile organisation requested.",
+            )
         )
-        self._append_log(message)
-        self._status_label.setText(message)
+        self._status_label.setText(
+            self._localizer.get("filter.cluster.running", "Preparing master-tile groups…")
+        )
+
+        thread = threading.Thread(
+            target=self._auto_group_background_task,
+            args=(selected_indices,),
+            daemon=True,
+        )
+        thread.start()
+
+    def _auto_group_background_task(self, selected_indices: list[int]) -> None:
+        messages: list[str] = []
+        result_payload: dict[str, Any] | None = None
+        try:
+            result_payload = self._compute_auto_groups(selected_indices, messages)
+        except Exception as exc:  # pragma: no cover - defensive guard
+            error_text = self._localizer.get(
+                "filter.cluster.failed",
+                "Auto-organisation failed: {error}",
+            )
+            try:
+                formatted = error_text.format(error=exc)
+            except Exception:
+                formatted = f"Auto-organisation failed: {exc}"
+            messages.append(formatted)
+
+        def _finalize() -> None:
+            self._auto_group_running = False
+            if self._auto_group_button is not None:
+                self._auto_group_button.setEnabled(True)
+            for line in messages:
+                self._append_log(line)
+            if result_payload is None:
+                if not messages:
+                    fallback = self._localizer.get(
+                        "filter.cluster.failed_generic",
+                        "Unable to prepare master-tile groups.",
+                    )
+                    self._append_log(fallback)
+                self._status_label.setText(
+                    self._localizer.get(
+                        "filter.cluster.failed_short",
+                        "Auto-organisation failed.",
+                    )
+                )
+                return
+            self._apply_auto_group_result(result_payload)
+
+        QTimer.singleShot(0, _finalize)
+
+    def _compute_auto_groups(
+        self,
+        selected_indices: list[int],
+        messages: list[str],
+    ) -> dict[str, Any]:
+        candidate_infos: list[dict[str, Any]] = []
+        coord_samples: list[tuple[float, float]] = []
+        for idx in selected_indices:
+            if idx < 0 or idx >= len(self._normalized_items):
+                continue
+            payload, coords = self._build_candidate_payload(self._normalized_items[idx])
+            if payload is None:
+                continue
+            candidate_infos.append(payload)
+            if coords and None not in coords:
+                coord_samples.append((float(coords[0]), float(coords[1])))
+
+        if not candidate_infos:
+            raise RuntimeError("No candidate entries were usable for grouping.")
+        if WCS is None and SkyCoord is None:
+            raise RuntimeError("Astropy is required to compute WCS-based clusters.")
+
+        threshold_override = self._resolve_cluster_threshold_override()
+        threshold_heuristic = self._estimate_threshold_from_coords(coord_samples)
+        threshold_initial = threshold_override if threshold_override and threshold_override > 0 else threshold_heuristic
+        if threshold_initial <= 0:
+            threshold_initial = 0.1
+
+        orientation_threshold = self._resolve_orientation_split_threshold()
+        angle_split_candidate = self._resolve_angle_split_candidate()
+        auto_angle_detect = self._resolve_auto_angle_detect_threshold()
+        cap_effective, min_cap = self._resolve_autosplit_caps()
+        overcap_pct = self._resolve_overcap_percent()
+
+        groups_initial = _CLUSTER_CONNECTED(
+            candidate_infos,
+            float(threshold_initial),
+            None,
+            orientation_split_threshold_deg=float(max(0.0, orientation_threshold)),
+        )
+        if not groups_initial:
+            raise RuntimeError("Worker clustering returned no groups.")
+
+        threshold_used = float(threshold_initial)
+        groups_used = groups_initial
+        angle_split_effective = 0.0
+
+        auto_angle_triggered = False
+        if angle_split_candidate > 0.0 and _tk_split_group_by_orientation is not None and _tk_circular_dispersion_deg is not None:
+            oriented_groups: list[list[dict[str, Any]]] = []
+            triggered = 0
+            for group in groups_used:
+                pa_values: list[float] = []
+                for info in group:
+                    try:
+                        pa = info.get("PA_DEG")
+                        if pa is None:
+                            continue
+                        pa_values.append(float(pa))
+                    except Exception:
+                        continue
+                if not pa_values:
+                    oriented_groups.append(group)
+                    continue
+                dispersion_val = _tk_circular_dispersion_deg(pa_values)
+                if dispersion_val > auto_angle_detect:
+                    oriented_groups.extend(
+                        _tk_split_group_by_orientation(group, angle_split_candidate)
+                    )
+                    triggered += 1
+                else:
+                    oriented_groups.append(group)
+            if triggered > 0:
+                auto_angle_triggered = True
+                angle_split_effective = angle_split_candidate
+                groups_used = oriented_groups
+
+        if not auto_angle_triggered and angle_split_candidate > 0.0:
+            angle_split_effective = angle_split_candidate
+
+        groups_after_autosplit = _AUTOSPLIT_GROUPS(
+            groups_used,
+            cap=int(max(1, cap_effective)),
+            min_cap=int(max(1, min_cap)),
+            progress_callback=None,
+        )
+
+        cap_allowance = max(int(cap_effective), int(cap_effective * (1 + overcap_pct / 100.0)))
+        max_dispersion = None
+        if _COMPUTE_MAX_SEPARATION is not None and threshold_used > 0:
+            max_dispersion = float(threshold_used) * 1.05
+
+        merge_fn = _tk_merge_small_groups or (
+            lambda groups, min_size, cap, **_: groups  # type: ignore[misc]
+        )
+        final_groups = merge_fn(
+            groups_after_autosplit,
+            min_size=int(max(1, min_cap)),
+            cap=int(max(1, cap_effective)),
+            cap_allowance=cap_allowance,
+            compute_dispersion=_COMPUTE_MAX_SEPARATION,
+            max_dispersion_deg=max_dispersion,
+            log_fn=messages.append,
+        )
+
+        for group in final_groups:
+            for info in group:
+                if info.pop("_fallback_wcs_used", False):
+                    info.pop("wcs", None)
+
+        summary_template = self._localizer.get(
+            "filter.cluster.summary",
+            "Auto-grouped {groups} cluster(s) (threshold {threshold:.2f}°)",
+        )
+        try:
+            summary_text = summary_template.format(
+                groups=len(final_groups),
+                threshold=threshold_used,
+            )
+        except Exception:
+            summary_text = f"Auto-grouped {len(final_groups)} cluster(s)"
+        messages.append(summary_text)
+
+        return {
+            "final_groups": final_groups,
+            "sizes": [len(group) for group in final_groups],
+            "coverage_first": True,
+            "threshold_used": threshold_used,
+            "angle_split": angle_split_effective,
+        }
+
+    def _apply_auto_group_result(self, payload: dict[str, Any]) -> None:
+        groups = payload.get("final_groups") or []
+        if not isinstance(groups, list):
+            groups = []
+        self._auto_group_override_groups = groups if groups else None
+        self._cluster_threshold_used = payload.get("threshold_used")
+
+        assignment: dict[str, tuple[int, str]] = {}
+        label_template = self._localizer.get("filter.preview.group_label", "Group {index}")
+        for idx, group in enumerate(groups, start=1):
+            try:
+                label = label_template.format(index=idx)
+            except Exception:
+                label = f"Group {idx}"
+            for entry in group:
+                path = entry.get("path") or entry.get("file_path")
+                if not path:
+                    continue
+                assignment[os.path.normcase(str(path))] = (idx - 1, label)
+
+        for normalized in self._normalized_items:
+            key = os.path.normcase(normalized.file_path or "")
+            if key in assignment:
+                group_idx, label = assignment[key]
+                normalized.cluster_index = group_idx
+                normalized.group_label = label
+            else:
+                normalized.cluster_index = None
+                normalized.group_label = None
+
+        new_groups: list[list[_NormalizedItem]] = [[] for _ in groups]
+        if new_groups:
+            for normalized in self._normalized_items:
+                key = os.path.normcase(normalized.file_path or "")
+                if key in assignment:
+                    group_idx = assignment[key][0]
+                    if 0 <= group_idx < len(new_groups):
+                        new_groups[group_idx].append(normalized)
+        self._cluster_groups = [group for group in new_groups if group]
+
+        self._status_label.setText(
+            self._localizer.get(
+                "filter.cluster.complete",
+                "Master-tile organisation complete.",
+            )
+        )
+        self._update_summary_label()
+        self._schedule_preview_refresh()
+
+    def _build_candidate_payload(
+        self,
+        entry: _NormalizedItem,
+    ) -> tuple[dict[str, Any] | None, tuple[float | None, float | None] | None]:
+        payload: dict[str, Any] = {}
+        original = entry.original
+        if isinstance(original, dict):
+            payload.update(original)
+        path = entry.file_path
+        if not path:
+            return None, None
+        payload.setdefault("path", path)
+        if original and isinstance(original, dict):
+            raw = original.get("path_raw")
+            if raw:
+                payload.setdefault("path_raw", raw)
+        header = payload.get("header") or payload.get("header_subset")
+        if header is None:
+            header = self._load_header(path)
+            if header is not None:
+                payload["header"] = header
+        wcs_obj = payload.get("wcs")
+        if wcs_obj is None and header is not None and WCS is not None:
+            try:
+                wcs_obj = _build_wcs_from_header(header)
+            except Exception:
+                wcs_obj = None
+            if wcs_obj is not None:
+                payload["wcs"] = wcs_obj
+        ra_deg = entry.center_ra_deg
+        dec_deg = entry.center_dec_deg
+        if (ra_deg is None or dec_deg is None) and header is not None:
+            header_ra, header_dec = _extract_center_from_header(header)
+            if ra_deg is None:
+                ra_deg = header_ra
+            if dec_deg is None:
+                dec_deg = header_dec
+        if ra_deg is not None:
+            payload.setdefault("RA", float(ra_deg))
+        if dec_deg is not None:
+            payload.setdefault("DEC", float(dec_deg))
+        center_coord = None
+        if (
+            ra_deg is not None
+            and dec_deg is not None
+            and SkyCoord is not None
+            and u is not None
+        ):
+            try:
+                center_coord = SkyCoord(ra=float(ra_deg) * u.deg, dec=float(dec_deg) * u.deg, frame="icrs")
+            except Exception:
+                center_coord = None
+        if payload.get("wcs") is None and center_coord is not None:
+            payload["wcs"] = _FallbackWCS(center_coord)
+            payload["_fallback_wcs_used"] = True
+        if center_coord is not None:
+            payload.setdefault("center", center_coord)
+        if entry.instrument and not payload.get("instrument"):
+            payload["instrument"] = entry.instrument
+        return payload, (ra_deg, dec_deg)
+
+    def _load_header(self, path: str) -> Any | None:
+        if not path or fits is None:
+            return None
+        norm = os.path.normcase(path)
+        if norm in self._header_cache:
+            return self._header_cache[norm]
+        try:
+            header = fits.getheader(path, ignore_missing_end=True)
+        except Exception:
+            header = None
+        self._header_cache[norm] = header
+        return header
+
+    def _resolve_cluster_threshold_override(self) -> float | None:
+        candidates = (
+            self._safe_lookup(self._config_overrides, "panel_clustering_threshold_deg"),
+            self._safe_lookup(self._initial_overrides, "panel_clustering_threshold_deg"),
+            self._safe_lookup(self._solver_settings, "panel_clustering_threshold_deg"),
+            self._safe_lookup(self._config_overrides, "cluster_panel_threshold"),
+            self._safe_lookup(self._initial_overrides, "cluster_panel_threshold"),
+            self._safe_lookup(self._solver_settings, "cluster_panel_threshold"),
+        )
+        for candidate in candidates:
+            try:
+                value = float(candidate)
+            except Exception:
+                continue
+            if value > 0:
+                return value
+        return None
+
+    def _estimate_threshold_from_coords(self, coords: list[tuple[float, float]]) -> float:
+        dispersion = 0.0
+        if coords:
+            if _COMPUTE_MAX_SEPARATION is not None:
+                try:
+                    dispersion = float(_COMPUTE_MAX_SEPARATION(coords))
+                except Exception:
+                    dispersion = 0.0
+            if not dispersion:
+                dispersion = self._approximate_dispersion(coords)
+        if dispersion <= 0.12:
+            threshold = 0.10
+        elif dispersion <= 0.30:
+            threshold = 0.15
+        else:
+            threshold = 0.05 if dispersion <= 0.60 else 0.20
+        return min(0.20, max(0.08, threshold))
+
+    @staticmethod
+    def _approximate_dispersion(coords: list[tuple[float, float]]) -> float:
+        if len(coords) < 2:
+            return 0.0
+        max_sep = 0.0
+        for i in range(len(coords)):
+            for j in range(i + 1, len(coords)):
+                dra = abs(coords[i][0] - coords[j][0])
+                ddec = abs(coords[i][1] - coords[j][1])
+                max_sep = max(max_sep, math.hypot(dra, ddec))
+        return max_sep
+
+    def _resolve_orientation_split_threshold(self) -> float:
+        candidates = (
+            self._safe_lookup(self._config_overrides, "cluster_orientation_split_deg"),
+            self._safe_lookup(self._initial_overrides, "cluster_orientation_split_deg"),
+            self._safe_lookup(self._solver_settings, "cluster_orientation_split_deg"),
+        )
+        for candidate in candidates:
+            value = _sanitize_angle_value(candidate, 0.0)
+            if value > 0:
+                return value
+        return 0.0
+
+    def _resolve_angle_split_candidate(self) -> float:
+        value = self._config_value("cluster_orientation_split_deg", 0.0)
+        return _sanitize_angle_value(value, 0.0)
+
+    def _resolve_auto_angle_detect_threshold(self) -> float:
+        candidates = (
+            self._safe_lookup(self._config_overrides, "auto_angle_detect_deg"),
+            self._safe_lookup(self._initial_overrides, "auto_angle_detect_deg"),
+            self._safe_lookup(self._solver_settings, "auto_angle_detect_deg"),
+        )
+        for candidate in candidates:
+            value = _sanitize_angle_value(candidate, AUTO_ANGLE_DETECT_DEFAULT_DEG)
+            if value > 0:
+                return value
+        return AUTO_ANGLE_DETECT_DEFAULT_DEG
+
+    def _resolve_autosplit_caps(self) -> tuple[int, int]:
+        try:
+            cap = int(self._config_value("max_raw_per_master_tile", 50))
+        except Exception:
+            cap = 50
+        cap = max(1, min(50, cap))
+        try:
+            min_cap = int(self._config_value("autosplit_min_cap", min(8, cap)))
+        except Exception:
+            min_cap = min(8, cap)
+        min_cap = max(1, min(min_cap, cap))
+        return cap, min_cap
+
+    def _resolve_overcap_percent(self) -> int:
+        try:
+            value = int(self._config_value("filter_overcap_allowance_pct", 10))
+        except Exception:
+            value = 10
+        return max(0, min(50, value))
 
     def _compute_global_center(self) -> Tuple[float | None, float | None]:
         coords: list[Tuple[float, float]] = []
@@ -1994,6 +2623,16 @@ class FilterQtDialog(QDialog):
         self._update_summary_label()
         self._schedule_preview_refresh()
         self._schedule_cluster_refresh()
+
+    def _collect_selected_indices(self) -> list[int]:
+        indices: list[int] = []
+        for row in range(self._table.rowCount()):
+            item = self._table.item(row, 0)
+            if item is None:
+                continue
+            if item.checkState() == Qt.Checked:
+                indices.append(row)
+        return indices
 
     def _update_summary_label(self) -> None:
         total = self._table.rowCount()
@@ -2935,15 +3574,16 @@ class FilterQtDialog(QDialog):
             except Exception:
                 overrides = dict(self._initial_overrides)
 
-        auto_group_enabled = False
         if self._auto_group_checkbox is not None:
-            auto_group_enabled = bool(self._auto_group_checkbox.isChecked())
-            overrides["filter_auto_group"] = auto_group_enabled
+            overrides["filter_auto_group"] = bool(self._auto_group_checkbox.isChecked())
         if self._seestar_checkbox is not None:
             overrides["filter_seestar_priority"] = bool(self._seestar_checkbox.isChecked())
         if self._astap_instances_value:
             overrides["astap_max_instances"] = int(self._astap_instances_value)
-        if self._cluster_groups and auto_group_enabled:
+        if self._auto_group_override_groups:
+            overrides["preplan_master_groups"] = self._auto_group_override_groups
+            overrides.pop("autosplit_cap", None)
+        elif self._cluster_groups:
             serialized_groups: list[list[dict[str, Any]]] = []
             for group in self._cluster_groups:
                 entries_payload: list[dict[str, Any]] = []
@@ -2964,7 +3604,7 @@ class FilterQtDialog(QDialog):
                     serialized_groups.append(entries_payload)
             if serialized_groups:
                 overrides["preplan_master_groups"] = serialized_groups
-        elif not auto_group_enabled:
+        else:
             overrides.pop("preplan_master_groups", None)
         if isinstance(self._cluster_threshold_used, (int, float)) and self._cluster_threshold_used > 0:
             overrides["cluster_panel_threshold"] = float(self._cluster_threshold_used)
