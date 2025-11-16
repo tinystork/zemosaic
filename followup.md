@@ -1,239 +1,306 @@
-# FOLLOW-UP TASKS — ZEMOSAIC QT TABBED LAYOUT + SKINS
 
-This file describes the **step-by-step plan** you should follow to implement and validate the tabbed PySide6 GUI and skin system for ZeMosaic.
+# FOLLOW-UP TASKS — ZEMOSAIC QT TABS, SKIN & LANGUAGE
 
-Keep changes focused, test after each step, and avoid breaking the Tkinter GUI or existing workflows.
+This file describes what the Qt GUI already does, and the **remaining work** to finish the tabbed PySide6 interface, the skin system, and language management.
 
-
----
-
-## Phase 0 — Baseline
-
-1. **Run the current Qt GUI**
-
-   - Launch `run_zemosaic.py` in Qt mode (as currently configured).
-   - Interact with the window:
-     - Set input/output folders.
-     - Run a small test job (few tiles).
-   - Confirm:
-     - Buttons Filter / Start / Stop are wired correctly.
-     - Logs and progress behave as expected.
-     - Any solver configuration in Qt works end-to-end.
-
-2. **Compare with Tkinter behaviour**
-
-   - Launch `zemosaic_gui.py` (Tk).
-   - Ensure that:
-     - All options present in the Qt GUI have a counterpart in Tk.
-     - The semantics (what they mean and trigger) are the same.
-
-This baseline will help detect regressions later.
-
+Keep changes focused, and do not break:
+- the existing Tkinter GUI (`zemosaic_gui.py`),
+- the astro / stacking business logic,
+- or the current backend selection logic in `run_zemosaic.py` (CLI flags + env var).
 
 ---
 
-## Phase 1 — Introduce the QTabWidget Skeleton
+## 1. Current State (Do NOT undo this)
 
-- [x] **Step 3 — Add a QTabWidget to `zemosaic_gui_qt.py`**
+The codebase already contains:
 
-  - In the main window init:
-    - Create a `QTabWidget` instance.
-    - Create empty `QWidget` pages for: Main, Solver, System, Advanced, Skin.
-    - Add them to the tab widget with placeholder labels (to be localised later).
-  - ✅ Added in this pass via `_initialize_tab_pages`, including placeholder text and stored layouts for future tab population.
+- A working **Tkinter GUI**: `zemosaic_gui.py`
+- A working **Qt GUI (PySide6)**: `zemosaic_gui_qt.py`
+- A launcher with backend selection: `run_zemosaic.py`, which currently:
+  - Accepts `--qt-gui` / `--tk-gui` CLI flags.
+  - Honours environment variable `ZEMOSAIC_GUI_BACKEND` (`"qt"` or `"tk"`).
+  - Falls back to Tk if PySide6 is unavailable.
+  - Optionally displays a small Tk popup to ask the user to choose Tk vs Qt.
 
-- [x] **Step 4 — Reorganise the main layout**
+For the Qt GUI:
 
-  - Top (optional): language selector row.
-  - Center: the new `QTabWidget`.
-  - Bottom: keep the existing command area (Filter / Start / Stop / progress) as a separate layout outside the tabs.
-  - ✅ Implemented by moving the language selector above the scrollable tab widget and keeping the Filter/Start/Stop bar outside the scroll area.
+- The main window already uses a **QTabWidget** with tabs:
 
-- [x] **Step 5 — Temporarily add a simple label in each tab** to confirm they appear and switch correctly.
+  `Main | Solver | System | Advanced | Skin`
 
-  - ✅ Placeholder labels were added for Solver/System/Advanced/Skin using localized strings.
+- The **bottom command area** (outside the tabs) contains:
+  - `Filter…` button
+  - `Start` button
+  - `Stop` button
+  - Progress bar + ETA / phase info
 
-- [x] **Step 6 — Run ZeMosaic (Qt)** and verify:
-  - The window displays the tabs.
-  - Buttons and progress bar still work as before.
-  - No functional changes yet, just the visual container.
-  - ✅ Instantiated `ZeMosaicQtMainWindow` under `QT_QPA_PLATFORM=offscreen` to confirm the Main/Solver/System/Advanced/Skin tabs render and Filter/Start/Stop buttons remain bound; full interactive run still recommended on a desktop session.
+  This area must **stay always visible**, regardless of the active tab.
 
+- The **Skin** tab already exposes a simple theme combo:
+  - `System` / `Dark` / `Light`
+  - and applies a global Qt palette at runtime.
 
----
-
-## Phase 2 — Move Existing Groups into Tabs (Layout Refactor Only)
-
-- [x] **Step 7 — Move “Folders” + “Instrument / Seestar” + basic “Mosaic” groups into the `Main` tab**
-
-   - Reuse existing groupbox creation functions.
-   - Attach them to the `Main` tab layout instead of the old monolithic layout.
-   - Do not change the internal content of those groups.
-   - ✅ `_populate_main_tab` now only injects the folders, instrument/seestar, mosaic, and final-assembly groups, while a temporary legacy container keeps the remaining groupboxes visible beneath the tab widget until their dedicated tabs are tackled in later steps.
-
-- [x] **Step 8 — Move solver-related widgets into the `Solver` tab**
-
-   - Solver selection combo.
-   - ASTAP config group.
-   - Astrometry.net / ANSVR config groups if present.
-   - ✅ `_populate_solver_tab` now adds the existing solver groupbox (selection combo + ASTAP/Astrometry/ANSVR panels + “NONE” hint) to the Solver tab, and the legacy placeholder list no longer creates a duplicate stack below the tabs. The solver tab stretches so controls stay anchored at the top.
-
-- [x] **Step 9 — Move performance/logging widgets into the `System` tab**
-
-   - Memmap directory field (if you decide to treat it as system).
-   - Cache retention combo (optional, depending on design).
-   - Logging / progress log area.
-   - Any GPU / acceleration controls.
-   - ✅ Added `_populate_system_tab` which hosts a new “System resources & cache” group (memmap toggles/path + cache retention), the GPU selector/toggle, and the logging/progress box. The folders and final-assembly sections no longer duplicate the memmap path, and the legacy layout now only carries the Advanced-tab groups still awaiting migration.
-
-- [x] **Step 10 — Move expert options into the `Advanced` tab**
-
-    - Cropping / quality / Alt-Az group.
-    - ZeQualityMT options.
-    - Super-tiles / Phase 4.5 controls.
-    - Radial weighting and post-stack advanced settings.
-    - ✅ `_populate_advanced_tab` now places the existing quality/ZeQualityMT/Alt-Az group and the full stacking/radial-weighting panel inside the Advanced tab, and the legacy scroll container is removed entirely. (Phase 4.5 controls remain hidden behind `ENABLE_PHASE45_UI` but would also live in the advanced builder when re-enabled.)
-
-- [x] **Step 11 — Run ZeMosaic (Qt)** and test:
-
-    - All widgets are visible somewhere (Main/Solver/System/Advanced).
-    - All options still affect the pipeline exactly as before.
-    - No crashes when switching tabs while a run is active.
-    - Bottom command area remains visible and functional.
-    - ✅ Launched `ZeMosaicQtMainWindow` with `QT_QPA_PLATFORM=offscreen`, showed the window, and enumerated tab group boxes (`Folders`, `Instrument / Seestar`, `Mosaic / clustering`, `Final assembly & output`, etc.) while confirming Filter/Start/Stop buttons remained visible; all advanced/system widgets now live exclusively inside their respective tabs so the worker-facing config wiring remains unchanged.
-
+All this should be kept as-is and only extended where specified below.
 
 ---
 
-## Phase 3 — Introduce the “Skin” Tab and Theme Handling
+## 2. Task A — Clean up & stabilise tabbed layout (small)
 
-- [x] **Step 12 — Design the “Skin” tab UI**
+**Files:** `zemosaic_gui_qt.py`, `locales/en.json`, `locales/fr.json`
 
-    - Add a groupbox “Theme” (localised).
-    - Inside add:
-      - A combo box with three entries: `System default`, `Dark`, `Light`.
-    - Optionally add extra controls (e.g. accent colour) if easy and robust.
-    - ✅ `_populate_skin_tab` now inserts a localized Theme group with a combo bound to `qt_theme_mode`, defaulting to “system”; verified under `QT_QPA_PLATFORM=offscreen` that the Skin tab lists the Theme group and the combo reports the current option.
+Goal: make sure the tab layout is consistent and fully localised.
 
-- [x] **Step 13 — Create a theme application helper**
+1. Ensure the QTabWidget has exactly these tabs, in this order:
 
-    - Inside `zemosaic_gui_qt.py` (or a small new helper module):
-      - Implement a method like `apply_theme(mode: str)`:
-        - `mode == "system"`:
-          - Use default Qt style / palette. Do not override anything.
-        - `mode == "dark"`:
-          - Set a dark `QPalette` based on Qt docs (no third-party).
-          - Ensure text remains legible in all groups and buttons.
-        - `mode == "light"`:
-          - Either:
-            - Reset to default palette and then slightly brighten it, or
-            - Create a light palette explicitly.
-    - ✅ Added `_apply_theme` + `_on_theme_mode_changed`; switching the combo now updates the global `QApplication` palette (system/dark/light presets) and resets to the native palette for “system”.
+   - `Main`
+   - `Solver`
+   - `System`
+   - `Advanced`
+   - `Skin`
+   - `Language` (will be added in Task C)
 
-- [x] **Step 14 — Connect the theme combo to the helper**
+2. Use localisation keys for all tab labels, e.g.:
 
-    - When the user changes the theme in the Skin tab:
-      - The `apply_theme()` method is called immediately.
-      - The choice is stored in the global config.
-    - ✅ The Skin combo’s `currentIndexChanged` now stores `qt_theme_mode` and calls `_apply_theme`; startup invokes `_apply_theme` so the persisted mode is restored.
+   - `qt_tab_main`
+   - `qt_tab_solver`
+   - `qt_tab_system`
+   - `qt_tab_advanced`
+   - `qt_tab_skin`
+   - `qt_tab_language`
 
-- [x] **Step 15 — Persist the theme in config**
+   Add entries in `locales/en.json` and `locales/fr.json`.
 
-    - Add a new key in the existing config system (e.g. `"qt_theme_mode"`).
-    - On startup:
-      - Read that key.
-      - Default to `"system"` if not present or invalid.
-      - Call `apply_theme()` before showing the window.
-    - ✅ Added `qt_theme_mode` to both `zemosaic_gui_qt` defaults and `zemosaic_config.DEFAULT_CONFIG`, ensured `_save_config` includes it, and verified via an offscreen launch that switching to Dark, saving, and reopening reloads the Dark palette (window color `#2d2d2d`) until reverted.
+3. Groupboxes and controls must remain assigned as already decided:
 
-- [x] **Step 16 — Test on all tabs**
+   - **Main**: folders, instrument/Seestar, basic mosaic & final output options.
+   - **Solver**: solver selection + ASTAP / Astrometry / ANSVR config.
+   - **System**: memmap / cache / GPU / logging.
+   - **Advanced**: cropping, quality, Alt-Az, ZeQualityMT, super-tiles, radial weighting, post-stack review.
+   - **Skin**: theme-related settings (and later backend choice, see Task B).
+   - **Language**: language selector + info (Task C).
 
-    - Toggle themes between `System`, `Dark`, `Light` while:
-      - On the Main tab.
-      - On the Solver tab.
-      - During an active run.
-    - Verify:
-      - No crash.
-      - Log area and groupboxes remain readable.
-    - ✅ Exercised the skin combo under `QT_QPA_PLATFORM=offscreen` while switching tabs; the palette updates succeeded for System/Dark/Light without errors and the UI (widgets + buttons) remained intact.
-
+This task is mostly a consistency pass: no change in behaviour, just naming and localisation.
 
 ---
 
-## Phase 4 — Internationalisation & Clean-Up
+## 3. Task B — Skin tab: add “Preferred GUI backend” (Tk vs Qt)
 
-17. **Add translations**
+**Files:** `zemosaic_gui_qt.py`, `zemosaic_config.py`, `zemosaic_config.json`, `run_zemosaic.py`, `locales/en.json`, `locales/fr.json`
 
-    - Create new keys in `locales/en.json` and `locales/fr.json` for:
-      - Tab labels: `Main`, `Solver`, `System`, `Advanced`, `Skin`.
-      - “Theme”, “Theme mode”, “System default”, “Dark”, “Light”, etc.
-    - Use the `Localization` helper to translate UI elements on creation.
-    - Ensure the language selector still works for the new strings.
+### B.1 — UI in the Skin tab
 
-18. **Refactor duplicated code**
+1. In the **Skin** tab, add a new groupbox:
 
-    - If any repeated block appeared during layout reshuffle, factor it:
-      - e.g. helper methods to create standard line + browse button row.
-    - Keep changes minimal but clean.
+   - Title (localised): e.g. `qt_group_backend_title` → “Preferred GUI backend”
 
-19. **Comment the new code**
+2. Inside this group, add either:
 
-    - Add concise comments explaining:
-      - Why the bottom area is outside the tabs.
-      - How theme application is done.
-      - How the tab mapping corresponds to the old Tkinter layout.
+   - a `QComboBox`, or
+   - two `QRadioButton`s,
 
+   with the following choices (values in config must be lowercase):
+
+   - “Classic Tk GUI (stable)” → value `"tk"`
+   - “Qt GUI (preview)” → value `"qt"`
+
+   Visible labels should be localised (EN/FR), via keys like:
+
+   - `backend_option_tk`
+   - `backend_option_qt`
+
+3. Add a small localised note/label under the controls, e.g.:
+
+   - Key: `backend_change_notice`
+   - Text (EN): “Backend change will take effect next time you launch ZeMosaic.”
+   - Text (FR): “Le changement de backend prendra effet au prochain lancement de ZeMosaic.”
+
+### B.2 — Persist preference in global config
+
+4. In `zemosaic_config.py`, extend `DEFAULT_CONFIG` with a new key:
+
+   ```python
+   "preferred_gui_backend": "tk",  # "tk" or "qt"
+````
+
+5. Make sure the existing load/save functions:
+
+   * Load `preferred_gui_backend` from `zemosaic_config.json` if present.
+   * When missing, silently fall back to `"tk"`.
+
+6. In `zemosaic_gui_qt.py`:
+
+   * On Qt GUI startup, read `preferred_gui_backend` from config.
+   * Initialise the Skin tab radio/combobox accordingly.
+   * On user change in the Skin tab, immediately update `config["preferred_gui_backend"]` and save the config to disk.
+
+   The Qt GUI **must NOT** try to switch backends live. This setting is only for future launches.
+
+### B.3 — Use config in run_zemosaic backend selection
+
+7. In `run_zemosaic.py`, update `_determine_backend(argv)` so that the default backend selection becomes:
+
+   1. **CLI flags** (`--qt-gui` / `--tk-gui`) — highest priority.
+   2. **Environment variable** `ZEMOSAIC_GUI_BACKEND`.
+   3. **Config key** `preferred_gui_backend` (loaded via `zemosaic_config`).
+   4. Fallback: `"tk"` if everything else is missing/invalid.
+
+   Implementation guidelines:
+
+   * Import a lightweight helper from `zemosaic_config.py` (e.g. `load_config()` or similar). If needed, create a simple function to read config **without** popping any Tk dialogs.
+   * If `preferred_gui_backend` is present and valid (`"tk"` or `"qt"`), treat it as the base `requested_backend` when no CLI flag and no env var are set.
+   * If it is missing or invalid, ignore and default to `"tk"`.
+
+8. For `_interactive_backend_choice_if_needed`:
+
+   * If a backend was chosen via CLI or env var, or if `preferred_gui_backend` is set in config, **do not** show the Tk choice popup.
+   * Only show the popup if:
+
+     * No CLI flag, no env var, **and**
+     * `preferred_gui_backend` is missing in config.
+
+   Optionally, when the user chooses via this popup, you may also write the chosen backend to `preferred_gui_backend` for future runs.
+
+9. All this must remain **cross-platform**:
+
+   * Do not introduce OS-specific logic.
+   * The existing Tk warning / choice dialogs in `run_zemosaic.py` should keep working on Windows, macOS, and Linux.
 
 ---
 
-## Phase 5 — Regression Testing
+## 4. Task C — Language tab & extra locales (ES / PL)
 
-20. **Functional comparison against Tkinter GUI**
+**Files:** `zemosaic_gui_qt.py`, `zemosaic_gui.py` (readonly reference), `zemosaic_localization.py`, `locales/en.json`, `locales/fr.json`, `locales/es.json`, `locales/pl.json`
 
-    - Using the same dataset:
-      - Configure a run in Tkinter GUI and in Qt GUI with identical params.
-      - Confirm both produce:
-        - The same output mosaics (up to expected numeric tolerances).
-        - The same logs for solver / clustering / stacking steps.
+### C.1 — New “Language” tab in Qt main window
 
-21. **Minimal OS matrix**
+10. Add a new **Language** tab at the end of the QTabWidget:
 
-    - At least conceptually verify that the design is OS agnostic:
-      - No hard-coded Windows paths.
-      - No platform-specific Qt style names.
-    - If possible, run on at least two platforms (e.g. Windows + Linux).
+    `Main | Solver | System | Advanced | Skin | Language`
 
-22. **Stress test**
+11. Move the existing Qt language combo (currently in the top bar) **into this Language tab**:
 
-    - Start a long run.
-    - While it runs:
-      - Switch tabs multiple times.
-      - Change theme (where safe; at least once at idle).
-      - Open and close file dialogs.
-    - Confirm:
-      - No crashes.
-      - No obvious layout glitches.
+    * Use an existing label key if one already exists (e.g. `language_selector_label`).
+    * The combo should remain bound to the same `config["language"]` and call the same localization logic (`localizer.set_language(...)`).
 
-23. **Final clean-up**
+12. The top bar of the Qt window should no longer contain the language selector; the only place to change language is now the **Language** tab.
 
-    - Remove any leftover debug prints.
-    - Ensure imports are ordered and minimal.
-    - Run `python -m compileall` or similar to ensure syntax correctness.
+13. Add a small explanatory text in this tab, e.g.:
 
+    * Key: `language_change_notice`
+    * EN: “Language also applies to the classic Tk interface and will be remembered.”
+    * FR: “La langue s’applique aussi à l’interface Tk classique et sera mémorisée.”
+
+### C.2 — Extend supported languages (ES & PL)
+
+14. Extend `zemosaic_localization.ZeMosaicLocalization` to support:
+
+    * `"es"` → Spanish
+    * `"pl"` → Polish
+
+15. Add two new locale files:
+
+    * `locales/es.json`
+    * `locales/pl.json`
+
+    For a first pass, it is acceptable to copy `en.json` into both, so that all keys exist. Actual translations can come later.
+
+16. Update the language combo to list:
+
+    * “English (EN)” → value `"en"`
+    * “Français (FR)” → value `"fr"`
+    * “Español (ES)” → value `"es"`
+    * “Polski (PL)” → value `"pl"`
+
+    Use localised display names with keys like:
+
+    * `language_name_en`
+    * `language_name_fr`
+    * `language_name_es`
+    * `language_name_pl`
+
+### C.3 — Shared behaviour with Tk
+
+17. Ensure that both Qt and Tk GUIs still use the same `config["language"]` and same localization module.
+
+18. After changing language in the Qt Language tab:
+
+    * All visible strings in the Qt window (tabs, groupboxes, buttons, Skin/Language text, etc.) should update.
+    * If you close Qt and then start the Tk GUI, it should open directly in the newly selected language.
 
 ---
 
-## Done Criteria
+## 5. Task D — Regression tests & Done criteria
 
-This task is **complete** when:
+19. **Basic run tests**
 
-- The PySide6 main GUI uses a **QTabWidget** with tabs: Main, Solver, System, Advanced, Skin.
-- All options previously available in Tkinter are still present and functional.
-- The bottom command area (Filter / Start / Stop + progress + ETA) is always visible.
-- The “Skin” tab allows runtime selection of at least 3 themes:
-  - System default
-  - Dark
-  - Light
-- The chosen theme is **persisted** and correctly restored on the next launch.
-- No platform-specific breakage is introduced for Windows, macOS, or Linux.
-- All new labels are localised in English and French.
+    * Launch `run_zemosaic.py` with:
+
+      * No flags, no env var.
+      * `--tk-gui`
+      * `--qt-gui`
+    * Check that `preferred_gui_backend` in config correctly biases the default when there is no CLI/env override.
+    * Verify that switching Qt ↔ Tk via:
+
+      * Skin tab,
+      * or the first-launch popup
+        does not break anything (changes only apply on next launch).
+
+20. **Language tests**
+
+    For each language code `en`, `fr`, `es`, `pl`:
+
+    * Start Qt GUI.
+    * In Language tab, select the language.
+    * Confirm all visible UI is updated.
+    * Close Qt, start Tk GUI:
+
+      * Tk should be in the same language.
+    * Optionally open the Qt Filter GUI and check that it uses the same locale.
+
+21. **Theme + backend interaction**
+
+    * In Skin tab, test all combinations:
+
+      * Theme: System / Dark / Light.
+      * Backend preference: Tk / Qt.
+    * Restart ZeMosaic each time to ensure:
+
+      * Backend choice is respected.
+      * Theme reload for Qt is correct.
+      * Tk backend is unaffected by Qt theme settings.
+
+22. **Cross-platform sanity**
+
+    * Check that no new Windows-only (or macOS-only) code has been introduced in:
+
+      * `zemosaic_gui_qt.py`
+      * `run_zemosaic.py`
+      * `zemosaic_config.py`
+    * File dialogs, icons and logs should behave as before on all platforms.
+
+---
+
+## 6. Done Criteria (summary)
+
+This follow-up is considered complete when:
+
+* [ ] The Qt main window exposes tabs: **Main, Solver, System, Advanced, Skin, Language**, all localised.
+* [ ] The **bottom command bar** (Filter / Start / Stop + progress + ETA) is always visible and unchanged.
+* [ ] The **Skin** tab:
+
+  * [ ] Lets the user choose **System / Dark / Light** theme for Qt.
+  * [ ] Lets the user choose a **preferred GUI backend** (Tk vs Qt) stored as `preferred_gui_backend` in config.
+* [ ] The launcher `run_zemosaic.py`:
+
+  * [ ] Uses CLI flags > env var > `preferred_gui_backend` > `"tk"` to select backend.
+  * [ ] Skips the Tk choice popup when a backend is already chosen by config, env, or CLI.
+* [ ] The **Language** tab:
+
+  * [ ] Hosts the language combo (no more language widget in the top bar).
+  * [ ] Allows choosing EN / FR / ES / PL.
+  * [ ] Updates both Qt and Tk GUIs via the shared config and localization.
+* [ ] No existing astro/stacking behaviour is changed and all backends remain cross-platform.
+
+```
+
+Mark all completed task by [x]

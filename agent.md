@@ -1,299 +1,261 @@
-# AGENT MISSION FILE — ZEMOSAIC QT TABBED LAYOUT + SKINS
+AGENT MISSION FILE — ZEMOSAIC QT 2.0
+Tabbed interface • Skin selector • Language manager • Tk/Qt backend switch
 
-You are an autonomous coding agent working on the **ZeMosaic** project.
+You are an autonomous coding agent improving the ZeMosaic application.
+ZeMosaic provides two GUI front-ends:
 
-The repository already contains (non-exhaustive):
+Tkinter GUI (zemosaic_gui.py) — reference implementation
 
-- `run_zemosaic.py`
-- `zemosaic_gui.py`              (Tkinter main GUI – **reference behaviour**)
-- `zemosaic_filter_gui.py`      (Tkinter filter GUI)
-- `zemosaic_gui_qt.py`          (PySide6 main GUI – work in progress)
-- `zemosaic_filter_gui_qt.py`   (PySide6 filter GUI – work in progress)
-- `zemosaic_worker.py`
-- `zemosaic_config.py` / `zemosaic_config.json`
-- `zemosaic_localization.py`
-- `locales/en.json`, `locales/fr.json`
-- `tk_safe.py`
-- various helper modules (astrometry, cleaner, etc.)
+PySide6 / Qt GUI (zemosaic_gui_qt.py) — new interface
 
-Your job now is to:
+The launcher run_zemosaic.py chooses which GUI to run based on:
 
-1. **Refactor the PySide6 main GUI (`zemosaic_gui_qt.py`) to use a tabbed layout**, while keeping **all existing functionality identical** to the current Tkinter GUI (`zemosaic_gui.py`).
-2. Add a new **“Skin”** tab to control the UI color theme (dark / light / system default).
-3. Keep the Qt GUI fully functional on **Windows, macOS and Linux** (icons, file dialogs, fonts, layout).
+CLI flags (--qt-gui, --tk-gui)
 
-The **business logic must not change**. Only the Qt layout and theme handling are allowed to evolve (plus the small config needed for theme selection).
+Environment variable ZEMOSAIC_GUI_BACKEND
 
+User preference in zemosaic_config.json → "preferred_gui_backend"
 
----
+Default → "tk"
 
-## GLOBAL MISSION
+The Qt GUI is now being redesigned to match the Tk feature set, but with a more modern layout.
 
-### Goal
+Your tasks focus on the Qt GUI only, without modifying any stacking / mosaic / solver logic.
 
-Introduce a **QTabWidget-based UI** in `zemosaic_gui_qt.py` with the following tabs:
+🎯 GLOBAL OBJECTIVE
 
-1. **Main** (or “Principal”)
-2. **Solver**
-3. **System**
-4. **Advanced**
-5. **Skin**
+Upgrade the PySide6 GUI (zemosaic_gui_qt.py) to a stable, fully tabbed, themable, multilingual interface while maintaining 100% behavioural parity with the Tkinter GUI.
 
-At the same time:
+✔️ REQUIRED RESULTS
+1. Qt interface layout
 
-- Preserve the **current feature set** and behaviour of ZeMosaic as exposed in `zemosaic_gui.py`.
-- Ensure that the **bottom command area** stays always visible (outside the tabs):
-  - **Filter…** button
-  - **Start** button
-  - **Stop** button
-  - Progress bar + ETA / phase information
+Implement a QTabWidget-based main window with six tabs in this exact order:
 
-The Tkinter GUI must remain untouched and usable. Users can still choose between the old Tk GUI and the new Qt GUI from `run_zemosaic.py` (or the existing launcher logic).
+Main
 
+Solver
 
-### Non-Goals
+System
 
-- Do **NOT** change the stacking / mosaic / astrometry algorithms.
-- Do **NOT** rename or move modules in a way that breaks imports.
-- Do **NOT** add heavy third-party dependencies for theming. Use standard PySide6 / Qt features (QPalette, styles, simple stylesheets).
-- Do **NOT** regress any existing behaviour compared to `zemosaic_gui.py` and the current `zemosaic_gui_qt.py`.
+Advanced
 
+Skin
 
----
+Language
 
-## TAB LAYOUT SPECIFICATION
+All GUI controls already implemented must be moved to these tabs while preserving their behaviour.
 
-You will reorganize the existing groupboxes and controls into these tabs.  
-For each tab, reuse the existing `QGroupBox` creation helpers where possible (e.g. `_create_folders_group`, `_create_solver_group`, etc.) — just move them into the appropriate tab layouts.
+The bottom command bar stays always visible outside the tabs:
 
-### 1. Tab “Main”
+Button Filter…
 
-Purpose: all options required for a **typical run**.
+Button Start
 
-Put here:
+Button Stop
 
-- **Language selector**
-  - The language combo (EN/FR) can be either:
-    - at the very top of the window (above tabs), or
-    - as the first widget inside the “Main” tab.
-  - It must continue to use `zemosaic_localization.py` and the existing i18n mechanism.
+Progress bar
 
-- **Folders group**
-  - Input folder
-  - Output folder
-  - Global WCS output path
-  - (Optional) Memmap directory – can also be moved to “System” if more appropriate.
+ETA / phase information
 
-- **Instrument / Seestar group**
-  - Auto-detect Seestar frames
-  - Force Seestar workflow
-  - Enable SDS mode by default
-  - SDS coverage threshold
+No behavioural change is allowed — only relocation of widgets.
 
-- **Mosaic / clustering (basic controls)**
-  - Cluster threshold
-  - Target groups
-  - Orientation split
-  - Cache retention (unless you decide to classify it under “System / memory”)
+2. Tab contents
+Main tab
 
-- **Final assembly / output options** (if already exposed in Qt GUI)
-  - Method: Reproject co-add / Incremental
-  - Save final mosaic as uint16
-  - Legacy RGB cube options, etc.
+Contains options required for a normal run:
 
-Implementation detail:
+Folders (input/output/global WCS)
 
-- Use a dedicated `QWidget` for the “Main” tab with a vertical layout.
-- Add the above groupboxes in a consistent order (roughly: Language → Folders → Instrument → Mosaic).
+Instrument / Seestar options
 
+Basic mosaic options
 
-### 2. Tab “Solver”
+Final output options
 
-Purpose: everything related to **WCS / plate solving**.
+Solver tab
 
-Put here:
+All solver-related configuration:
 
-- **Solver selection**
-  - Combo box: ASTAP / Astrometry.net / ANSVR / None (or whatever exists today).
+Solver selection
 
-- **ASTAP configuration group**
-  - ASTAP executable
-  - ASTAP data directory
-  - Default search radius
-  - Default downsample
-  - Default sensitivity
-  - Max ASTAP instances (this must keep the same semantics as in Tkinter).
+ASTAP executable / database / parameters
 
-- **Astrometry.net configuration group** (if present)
-  - URL, API key, options.
+Astrometry.net / ANSVR if applicable
 
-- **ANSVR / notes** widgets if they exist.
+System tab
 
-- Any solver-specific hints text (e.g. “None = WCS already present”).
+Low-level and diagnostic settings:
 
+Memmap
 
-### 3. Tab “System”
+Cache retention
 
-Purpose: performance, memory, logging, “machine”-level settings.
+GPU acceleration
 
-Put here:
+Logging controls & live log panel
 
-- From Folders / Mosaic:
-  - Memmap directory (if not left on “Main”).
-  - Cache retention (if you decide it’s more of a memory setting).
+Advanced tab
 
-- **GPU / acceleration group**
-  - Use GPU acceleration when available
-  - GPU selector or device info (if present).
+Expert-only workflow settings:
 
-- **Logging / progress group**
-  - Logging verbosity level combo (if present).
-  - “Clear log” button, log view, phase information, ETA readouts.
-  - Any text or status widgets related purely to diagnostic / debug.
+Quality crop
 
-The idea: the System tab is where users watch logs, performance-related indicators and tune lower-level settings.
+Master tile crop
 
+Alt-Az cleanup
 
-### 4. Tab “Advanced”
+ZeQualityMT options
 
-Purpose: expert and experimental options. A new user should be able to ignore this tab.
+Super-tiles / Phase 4.5
 
-Put here:
+Radial weighting
 
-- **Cropping / quality / Alt-Az**
-  - Master tile crop
-  - Quality crop
-  - Alt-Az cleanup
-  - ZeQualityMT / master tile quality gate
-  - Two-pass coverage renormalization (if present).
+Post-stack anchor review
 
-- **Mosaic / clustering advanced**
-  - Phase 4.5 / super-tiles controls.
-  - Any extra parameters that only affect special workflows (e.g. ZeSupaDupStack).
+All experimental toggles
 
-- **Stacking options (expert)**
-  - Radial weighting options:
-    - Apply radial weighting
-    - Radial feather fraction
-    - Minimum radial weight floor
-  - Post-stack anchor review / inspection options.
-  - Any “experimental” toggles.
+Skin tab
 
-Implementation detail:
+Appearance + backend preference:
 
-- Where possible, reuse existing group-creating functions and only move them into this tab.
-- If some expert options are currently mixed with basic ones, split them into separate groupboxes (e.g. “Basic mosaic options” vs “Advanced mosaic options”) and place the advanced groupbox here.
+Theme mode:
 
+System
 
-### 5. Tab “Skin”
+Dark
 
-Purpose: configure the visual appearance (theme / colors).
+Light
 
-Add a **new groupbox** dedicated to theme selection:
+Persist theme to config
 
-- **Theme mode**
-  - Combo box or radio buttons with at least:
-    - `System default`
-    - `Dark`
-    - `Light`
-  - “System default” must respect the platform’s default Qt style:
-    - Do **not** override palette or style.
-  - “Dark” / “Light” should:
-    - Either use a custom `QPalette` for the application, or
-    - Apply a simple stylesheet.
-    - Keep it lightweight and cross-platform.
+Apply theme live
 
-- **Optional accent controls**
-  - You may add simple color pickers or combos for accent / highlight color, but only if this remains simple and robust.
-  - All labels must be localised via `zemosaic_localization.py`.
+Backend preference:
 
-**Theme persistence:**
+Tk GUI
 
-- Store the selected theme mode and any color settings in the existing config mechanism:
-  - Prefer to reuse `zemosaic_config.py` / its JSON file or whichever settings file is already used for GUI-level options.
-- On startup:
-  - Load the saved theme from config.
-  - Apply it before showing the main window.
-- When users change the theme from the “Skin” tab:
-  - Immediately apply the new theme.
-  - Save the setting for the next run.
+Qt GUI
 
-Cross-platform notes:
+Persist backend to preferred_gui_backend key
 
-- Do not rely on OS-specific APIs.
-- Use Qt standard facilities: `QApplication.setStyle`, `QPalette`, and possibly a simple stylesheet string.
-- Verify that the theme works on Windows, macOS, and Linux (at least conceptually; no OS-specific code).
+Language tab
 
+Multilingual support (shared with Tk):
 
----
+A language QComboBox offering:
 
-## BOTTOM COMMAND AREA (OUTSIDE TABS)
+English (EN)
 
-Regardless of the active tab, the user must always see:
+Français (FR)
 
-- Button **Filter…**
-- Button **Start**
-- Button **Stop**
-- Progress bar
-- ETA / current phase information (as currently done in the Qt GUI)
+Español (ES)
 
-Implementation:
+Polski (PL)
 
-- Create a “bottom toolbar” layout separate from the tab widget, e.g.:
+Must update UI live using zemosaic_localization.py
 
-  - Top: optional language selector
-  - Center: `QTabWidget`
-  - Bottom: `QWidget` with a horizontal layout for buttons + a vertical stack for log/progress if needed.
+Saves language to config
 
-- Reuse existing signal/slot connections. Only move the widgets; do not change what the callbacks do.
+On Qt restart, language loads before widgets
 
+🌍 INTERNATIONALISATION REQUIREMENTS
 
----
+New keys for:
 
-## INTERNATIONALISATION
+Tab labels
 
-- All **new labels** (“Main”, “Solver”, “System”, “Advanced”, “Skin”, theme modes, etc.) must be integrated into the existing i18n system:
-  - Add keys to `locales/en.json` and `locales/fr.json`.
-  - Use `zemosaic_localization.Localization.tr(...)` (or the current helper) for UI text.
-- The language selector in the Qt GUI must continue to function exactly like in the Tkinter GUI: changing language should update visible labels accordingly.
+Skin/backend settings
 
+Language names
 
----
+Notices / hints
 
-## CROSS-PLATFORM REQUIREMENTS
+Add es.json and pl.json, initially clones of English.
 
-- Do not break current support for **Windows, macOS, Linux**:
-  - File/folder dialogs must still open with the system’s native dialog.
-  - Icons (open/close/folder/etc.) must still load correctly. Do not introduce platform-specific icon paths.
-  - Avoid Windows-only code and any `ctypes` tricks inside the GUI module.
+Changing language updates ALL visible Qt widgets instantly.
 
-- Keep imports limited to:
-  - Standard library
-  - Existing project modules
-  - PySide6 / Qt modules already used in the project.
+Tk GUI must pick up the new language on next launch.
 
+🖥️ CROSS-PLATFORM REQUIREMENTS
 
----
+All modifications must remain compatible with:
 
-## IMPLEMENTATION GUIDELINES
+Windows
 
-- Use clear, explicit layouts:
-  - For each tab: `tab_widget = QWidget()`, `layout = QVBoxLayout(tab_widget)`.
-  - Add groupboxes to those layouts.
-  - Add the tabs to a single `QTabWidget`.
+macOS
 
-- Minimise code duplication:
-  - If you see repeated groupbox construction, factor it into helper methods.
+Linux
 
-- Preserve all existing signal/slot connections and callback semantics.
+Rules:
 
-- Add comments where new theme code or tab logic lives, so future contributors can easily understand it.
+Use only standard Qt (PySide6) features
 
-- Re-run / update any unit tests or basic smoke tests if they exist (or provide a simple manual test checklist in `followup.md`).
+File dialogs → system-native
 
-At the end, the **PySide6 main window** must:
+Icons → existing ones only
 
-- Expose the same options as the current Tkinter window.
-- Behave identically for all existing workflows (standard stack, SDS, ZeSupaDupStack, etc.).
-- Provide a clean, tabbed UI suitable for smaller screens.
-- Offer theme selection via the new “Skin” tab.
+No Windows-specific APIs
+
+No OS-specific palette hacks
+
+Qt theme implementation must rely only on:
+
+QApplication.setPalette
+
+QPalette
+
+optional lightweight stylesheet
+
+🧩 NON-GOALS (DO NOT TOUCH)
+
+Stacking logic
+
+Mosaic logic
+
+Cropping pipeline
+
+Worker threads
+
+Solver backends
+
+FITS/PNG creation
+
+Tkinter GUI behaviour
+
+All astro business-logic files
+
+Only Qt GUI layout, theming, and language/backend settings may be changed.
+
+🧱 IMPLEMENTATION GUIDELINES
+
+Keep all existing slots/callbacks untouched.
+
+Move widgets into tabs; do not modify what they do.
+
+Add helper methods for:
+
+Creating tab pages
+
+Applying themes
+
+Refreshing text on language change
+
+Save theme + backend + language directly using zemosaic_config.
+
+✅ DONE WHEN
+
+Qt GUI has 6 functional tabs.
+
+Themes work and persist.
+
+Backend preference in Skin tab works on next launch.
+
+Language tab manages EN/FR/ES/PL.
+
+UI text updates instantly when switching languages.
+
+Tk and Qt share the same config keys.
+
+No functionality is lost compared to Tk GUI.
+
+All workflows run identically.
