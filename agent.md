@@ -1,261 +1,137 @@
-AGENT MISSION FILE — ZEMOSAIC QT 2.0
-Tabbed interface • Skin selector • Language manager • Tk/Qt backend switch
+AGENT MISSION — ZeMosaic GUI + Core Stability
 
-You are an autonomous coding agent improving the ZeMosaic application.
-ZeMosaic provides two GUI front-ends:
+You are an autonomous coding agent working inside the ZeMosaic project.
 
-Tkinter GUI (zemosaic_gui.py) — reference implementation
+The repository contains (non-exhaustive):
+zemosaic_gui.py (Tk), zemosaic_filter_gui.py (Tk),
+zemosaic_gui_qt.py (Qt), zemosaic_filter_gui_qt.py (Qt),
+zemosaic_worker.py, zemosaic_utils.py,
+lecropper.py, zewcscleaner.py,
+zemosaic_astrometry.py, zemosaic_localization.py,
+solver_settings.*, zemosaic_config.*,
+locales/*.json, icons, and helper modules.
 
-PySide6 / Qt GUI (zemosaic_gui_qt.py) — new interface
+Your responsibilities:
 
-The launcher run_zemosaic.py chooses which GUI to run based on:
+1 — GLOBAL RULES
 
-CLI flags (--qt-gui, --tk-gui)
+You must NEVER break:
 
-Environment variable ZEMOSAIC_GUI_BACKEND
+Existing Tkinter GUI behavior.
 
-User preference in zemosaic_config.json → "preferred_gui_backend"
+Existing Seestar mosaic and stacking logic.
 
-Default → "tk"
+The worker pipeline, Phase 4.5 super-tiles, masks, alpha propagation.
 
-The Qt GUI is now being redesigned to match the Tk feature set, but with a more modern layout.
+FITS headers, metadata propagation, and WCS.
 
-Your tasks focus on the Qt GUI only, without modifying any stacking / mosaic / solver logic.
+Batch size = 0 or >1 behavior (strictly preserve).
 
-🎯 GLOBAL OBJECTIVE
+Compatibility Windows / macOS / Linux.
 
-Upgrade the PySide6 GUI (zemosaic_gui_qt.py) to a stable, fully tabbed, themable, multilingual interface while maintaining 100% behavioural parity with the Tkinter GUI.
+Localization system (locales/en.json, locales/fr.json, future locales).
 
-✔️ REQUIRED RESULTS
-1. Qt interface layout
+Icons loading across OSes.
 
-Implement a QTabWidget-based main window with six tabs in this exact order:
+No new dependencies unless explicitly allowed.
 
-Main
+2 — QT GUI MISSION
 
-Solver
+You must progressively build a complete PySide6 GUI, parallel to Tkinter:
 
-System
+Reproduce all features of Tk GUIs (main GUI + filter GUI).
 
-Advanced
+Respect layout specs: scroll areas, QSplitter when requested, 2-column grids, tab structure.
 
-Skin
+Keep clear separation:
 
-Language
+GUI-only code in *_qt.py.
 
-All GUI controls already implemented must be moved to these tabs while preserving their behaviour.
+Business logic untouched.
 
-The bottom command bar stays always visible outside the tabs:
+Strict consistency with translations (_tr()), config fields, and event handlers.
 
-Button Filter…
+3 — FILTER GUI MISSION
 
-Button Start
+Qt filter GUI must reproduce exactly the logic of zemosaic_filter_gui.py.
 
-Button Stop
+Features to mirror:
 
-Progress bar
+Auto-organize master tiles
 
-ETA / phase information
+WCS grouping + preview
 
-No behavioural change is allowed — only relocation of widgets.
+Coverage checks
 
-2. Tab contents
-Main tab
+Prepared groups
 
-Contains options required for a normal run:
+Preplan logging output
 
-Folders (input/output/global WCS)
+Sky preview placement & behavior
 
-Instrument / Seestar options
+Tk version must remain unchanged.
 
-Basic mosaic options
+4 — ASTROMETRY / MASKS MISSION
 
-Final output options
+The codebase uses:
 
-Solver tab
+ASTAP CLI
 
-All solver-related configuration:
+Proprietary alt-az cleanup
 
-Solver selection
+Coverage maps
 
-ASTAP executable / database / parameters
+Alpha masks (NaN/transparent zones)
 
-Astrometry.net / ANSVR if applicable
+Lecropper pipeline
 
-System tab
+You must:
 
-Low-level and diagnostic settings:
+Apply masks properly to FITS 16/32-bit and PNG outputs.
 
-Memmap
+Preserve alpha while downsampling.
 
-Cache retention
+Remove black arcs in mosaics.
 
-GPU acceleration
+Avoid GUI freezes during ASTAP crashes.
 
-Logging controls & live log panel
+5 — SUPER-TILES & MOSAIC LOGIC
 
-Advanced tab
+Ensure Phase 4.5 super-tiles are normalized with each other and master tiles.
 
-Expert-only workflow settings:
+Keep progression logs intact.
 
-Quality crop
+Ensure WCS propagation to all intermediate files.
 
-Master tile crop
+6 — NEW MODES
 
-Alt-Az cleanup
+You may be asked to implement special modes such as:
 
-ZeQualityMT options
+Mosaic-first strategy
 
-Super-tiles / Phase 4.5
+ZeSupaDupStack
 
-Radial weighting
+Blind solve preparations
+These must plug into the existing pipeline without breaking defaults.
 
-Post-stack anchor review
+7 — OUTPUT REQUIREMENTS
 
-All experimental toggles
+Code must be:
 
-Skin tab
+Deterministic
 
-Appearance + backend preference:
+Patch-friendly
 
-Theme mode:
+Minimal changes (only requested scope)
 
-System
+Commented only if necessary
 
-Dark
+Free of accidental refactors
 
-Light
+8 — WHEN IN DOUBT
 
-Persist theme to config
+Always:
 
-Apply theme live
+Preserve existing behavior
 
-Backend preference:
-
-Tk GUI
-
-Qt GUI
-
-Persist backend to preferred_gui_backend key
-
-Language tab
-
-Multilingual support (shared with Tk):
-
-A language QComboBox offering:
-
-English (EN)
-
-Français (FR)
-
-Español (ES)
-
-Polski (PL)
-
-Must update UI live using zemosaic_localization.py
-
-Saves language to config
-
-On Qt restart, language loads before widgets
-
-🌍 INTERNATIONALISATION REQUIREMENTS
-
-New keys for:
-
-Tab labels
-
-Skin/backend settings
-
-Language names
-
-Notices / hints
-
-Add es.json and pl.json, initially clones of English.
-
-Changing language updates ALL visible Qt widgets instantly.
-
-Tk GUI must pick up the new language on next launch.
-
-🖥️ CROSS-PLATFORM REQUIREMENTS
-
-All modifications must remain compatible with:
-
-Windows
-
-macOS
-
-Linux
-
-Rules:
-
-Use only standard Qt (PySide6) features
-
-File dialogs → system-native
-
-Icons → existing ones only
-
-No Windows-specific APIs
-
-No OS-specific palette hacks
-
-Qt theme implementation must rely only on:
-
-QApplication.setPalette
-
-QPalette
-
-optional lightweight stylesheet
-
-🧩 NON-GOALS (DO NOT TOUCH)
-
-Stacking logic
-
-Mosaic logic
-
-Cropping pipeline
-
-Worker threads
-
-Solver backends
-
-FITS/PNG creation
-
-Tkinter GUI behaviour
-
-All astro business-logic files
-
-Only Qt GUI layout, theming, and language/backend settings may be changed.
-
-🧱 IMPLEMENTATION GUIDELINES
-
-Keep all existing slots/callbacks untouched.
-
-Move widgets into tabs; do not modify what they do.
-
-Add helper methods for:
-
-Creating tab pages
-
-Applying themes
-
-Refreshing text on language change
-
-Save theme + backend + language directly using zemosaic_config.
-
-✅ DONE WHEN
-
-Qt GUI has 6 functional tabs.
-
-Themes work and persist.
-
-Backend preference in Skin tab works on next launch.
-
-Language tab manages EN/FR/ES/PL.
-
-UI text updates instantly when switching languages.
-
-Tk and Qt share the same config keys.
-
-No functionality is lost compared to Tk GUI.
-
-All workflows run identically.
+Follow instructions in followup.md
