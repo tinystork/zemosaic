@@ -5,7 +5,7 @@
     "astap_default_downsample": 2,
     "astap_default_sensitivity": 100,
     "astap_max_instances": 8,
-    "language": "fr",
+    "language": "en",
     "preferred_gui_backend": "qt",
     "preferred_gui_backend_explicit": true,
     "qt_theme_mode": "dark",
@@ -103,14 +103,14 @@
     "intertile_overlap_min": 0.05,
     "intertile_sky_percentile": [
         30.0,
-        70.0
+        68.5
     ],
     "intertile_robust_clip_sigma": 2.5,
     "intertile_global_recenter": true,
     "force_resolve_existing_wcs": false,
     "intertile_recenter_clip": [
         0.85,
-        1.18
+        1.08
     ],
     "use_auto_intertile": true,
     "match_background_for_final": true,

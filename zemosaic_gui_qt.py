@@ -164,6 +164,9 @@ LANGUAGE_OPTION_DEFINITIONS = [
     ("fr", "language_name_fr", "Français (FR)"),
     ("es", "language_name_es", "Español (ES)"),
     ("pl", "language_name_pl", "Polski (PL)"),
+    ("de", "language_name_de", "Deutsch (DE)"),
+    ("nl", "language_name_nl", "Nederlands (NL)"),
+    ("is", "language_name_is", "Íslenska (IS)"),
 ]
 
 
@@ -854,6 +857,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
             legacy_widget.deleteLater()
             self._legacy_layout = None
 
+        logging_group = self._create_logging_group()
+        outer_layout.addWidget(logging_group)
+
         button_row = self._build_command_row()
         outer_layout.addLayout(button_row)
 
@@ -912,7 +918,6 @@ class ZeMosaicQtMainWindow(QMainWindow):
     def _populate_system_tab(self, layout: QVBoxLayout) -> None:
         layout.addWidget(self._create_system_resources_group())
         layout.addWidget(self._create_gpu_group())
-        layout.addWidget(self._create_logging_group())
         layout.addStretch(1)
 
     def _populate_advanced_tab(self, layout: QVBoxLayout) -> None:
