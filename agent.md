@@ -1,325 +1,299 @@
-# AGENT MISSION FILE — ZEMOSAIC QT BACKEND PARITY
+# AGENT MISSION FILE — ZEMOSAIC QT TABBED LAYOUT + SKINS
 
 You are an autonomous coding agent working on the **ZeMosaic** project.
 
 The repository already contains (non-exhaustive):
+
 - `run_zemosaic.py`
-- `zemosaic_gui.py`              → legacy Tk main GUI (reference)
-- `zemosaic_gui_qt.py`           → new PySide6 main GUI
-- `zemosaic_filter_gui.py`       → legacy Tk filter GUI (reference)
-- `zemosaic_filter_gui_qt.py`    → new PySide6 filter GUI
+- `zemosaic_gui.py`              (Tkinter main GUI – **reference behaviour**)
+- `zemosaic_filter_gui.py`      (Tkinter filter GUI)
+- `zemosaic_gui_qt.py`          (PySide6 main GUI – work in progress)
+- `zemosaic_filter_gui_qt.py`   (PySide6 filter GUI – work in progress)
 - `zemosaic_worker.py`
+- `zemosaic_config.py` / `zemosaic_config.json`
 - `zemosaic_localization.py`
-- `zemosaic_config.py`
-- `zemosaic_utils.py`
-- `lecropper.py`
-- `zequalityMT.py`
-- `tk_safe.py`
 - `locales/en.json`, `locales/fr.json`
+- `tk_safe.py`
 - various helper modules (astrometry, cleaner, etc.)
 
-The Tkinter GUI and the worker logic are **stable and trusted**.  
-The PySide6 backend already exists and works, but needs **polish and parity**.
+Your job now is to:
 
-Your mission is now in the **PARITY & CLEANUP phase**, not “big new refactor”.
+1. **Refactor the PySide6 main GUI (`zemosaic_gui_qt.py`) to use a tabbed layout**, while keeping **all existing functionality identical** to the current Tkinter GUI (`zemosaic_gui.py`).
+2. Add a new **“Skin”** tab to control the UI color theme (dark / light / system default).
+3. Keep the Qt GUI fully functional on **Windows, macOS and Linux** (icons, file dialogs, fonts, layout).
 
-
-## GLOBAL GOAL
-
-**Goal:**  
-Bring the PySide6 (Qt) GUI to functional parity with the Tk GUI, while keeping
-the astrophotography core untouched and preserving all existing workflows.
-
-More specifically, you must:
-
-1. **Main window parity for Phase 4.5 / Super-tiles**
-   - `zemosaic_gui_qt.py` must mirror the behavior of `zemosaic_gui.py` regarding
-     **Phase 4.5 (inter-master merge / super-tiles)**:
-     - The **Phase 4.5 configuration must not be user-exposed** in the Qt GUI
-       for this release.
-     - The internal config flag `inter_master_merge_enable` must be **forced to `False`**
-       just like in `zemosaic_gui.py`, so the worker never receives an enabled state.
-     - Status messages, logs and overlays related to Phase 4.5 (progress,
-       “Phase 4.5 idle/complete”, overlays, etc.) must continue to work when the
-       worker emits them, just as in the Tk GUI.
-     - Do **not** remove the worker-side Phase 4.5 implementation in
-       `zemosaic_worker.py`. Only ensure that the Qt GUI exposes the **same knobs
-       as the Tk GUI** (i.e. **no visible Phase 4.5 options for now**).
-
-2. **Filter GUI parity**
-   - `zemosaic_filter_gui_qt.py` must be upgraded so that it implements **all
-     functional features** of the Tk filter GUI (`zemosaic_filter_gui.py`),
-     including:
-     - Stream-scan mode (directory crawling with `stream_scan=True`).
-     - Recursive scan toggle.
-     - Exclusion logic with `EXCLUDED_DIRS` / `is_path_excluded`.
-     - Instrument detection display (Seestar S50/S30, ASIAIR, generic INSTRUME, etc.).
-     - WCS presence / absence indicators.
-     - Clustering, grouping and pre-plan logic (master groups / preplan).
-     - ZeQualityMT-based quality filtering, when available.
-     - ASTAP concurrency cap handling.
-     - Handling of `solver_settings_dict` and `config_overrides` exactly like the Tk version.
-     - Any extra metadata or overrides returned by `launch_filter_interface`
-       (e.g. `preplan_master_groups`, `autosplit_cap`, `filter_excluded_indices`,
-       `resolved_wcs_count`, …).
-   - The **layout and UX** should be as close as possible to the Tk GUI:
-     - Sections (frames / group boxes) should mirror the Tk `LabelFrame`
-       structure (instrument summary, file list, clustering, quality gate, etc.).
-     - Controls that exist in Tk (checkbuttons, spinboxes, labels, buttons)
-       must have Qt equivalents (QCheckBox, QSpinBox/QDoubleSpinBox, QComboBox,
-       QTreeWidget/QTableWidget, buttons, etc.).
-     - The user must be able to:
-       - Inspect the list of candidate frames.
-       - Toggle individual frames on/off.
-       - Run analysis / grouping when relevant.
-       - See a clear status/log area.
-       - Validate (`OK`) or cancel (`Cancel`) with semantics identical to Tk.
-
-3. **Respect `followup.md` as the task source of truth**
-   - `followup.md` already contains phases and checklists.
-   - **Do not rewrite** or duplicate `followup.md` here.
-   - Use `followup.md` as the **authoritative list of tasks**:
-     - Do **not** re-implement tasks already marked as `[x]`.
-     - Only work on items that are unchecked or explicitly marked as TODO.
-     - When you complete work, update `followup.md` accordingly.
+The **business logic must not change**. Only the Qt layout and theme handling are allowed to evolve (plus the small config needed for theme selection).
 
 
-## CURRENT FOCUS
+---
 
-You are no longer in the “initial porting” phase. Assume:
+## GLOBAL MISSION
 
-- The Qt main window **compiles and runs**.
-- The Qt filter dialog **exists** but is functionally limited compared to Tk.
+### Goal
 
-Your current focus is:
+Introduce a **QTabWidget-based UI** in `zemosaic_gui_qt.py` with the following tabs:
 
-### FOCUS 1 — Remove Phase 4.5 controls from Qt main window
+1. **Main** (or “Principal”)
+2. **Solver**
+3. **System**
+4. **Advanced**
+5. **Skin**
 
-Work file: `zemosaic_gui_qt.py`.
+At the same time:
 
-Objectives:
+- Preserve the **current feature set** and behaviour of ZeMosaic as exposed in `zemosaic_gui.py`.
+- Ensure that the **bottom command area** stays always visible (outside the tabs):
+  - **Filter…** button
+  - **Start** button
+  - **Stop** button
+  - Progress bar + ETA / phase information
 
-- Ensure `zemosaic_gui_qt.py` **does not expose** a user-visible group for
-  Phase 4.5 / “Super-tiles”.
-  - Concretely: remove or conditionally disable the `QGroupBox` created in
-    `_create_*` methods that exposes:
-    - `qt_group_phase45` / “Phase 4.5 / Super-tiles”
-    - `inter_master_merge_enable` checkbox
-    - `inter_master_overlap_threshold`
-    - `inter_master_stack_method`
-    - `inter_master_min_group_size`, `inter_master_max_group`
-    - `inter_master_memmap_policy`
-    - `inter_master_local_scale`
-    - `inter_master_photometry_intragroup`, `inter_master_photometry_intersuper`
-    - `inter_master_photometry_clip_sigma`
-  - You may:
-    - Completely remove that group from the UI, OR
-    - Guard it behind a clearly disabled code path (e.g. a constant
-      `ENABLE_PHASE45_UI = False` and never set it to `True`).
-    - In all cases, for this release, the **user must not see** Phase 4.5 controls.
-
-- Mirror the Tk behavior on config defaults:
-  - In `__init__`, after loading the config, **force**:
-    ```python
-    self.config["inter_master_merge_enable"] = False
-    ```
-  - Ensure that saving configuration from Qt never writes `True` to
-    `inter_master_merge_enable`.
-
-- Keep Phase 4.5 **runtime feedback**:
-  - The worker still emits `phase45_event` messages.
-  - Logging, status labels (e.g. “Phase 4.5 idle/complete”) and overlays should
-    continue to work, just like in `zemosaic_gui.py`.
-  - Do not remove the overlay classes / handlers, only the *configuration* UI.
-
-### FOCUS 2 — Bring `zemosaic_filter_gui_qt.py` to full feature parity
-
-Work files:
-
-- Primary: `zemosaic_filter_gui_qt.py`
-- Reference: `zemosaic_filter_gui.py` (Tk)
-
-Objectives:
-
-- Study `launch_filter_interface` and the full Tk filter GUI implementation:
-  - Understand:
-    - Stream-scan mode vs legacy list mode.
-    - How batches are loaded and normalized (RA/DEC, WCS, headers).
-    - How instrument detection works.
-    - How groups and clusters are computed and represented.
-    - How ZeQualityMT is used to filter bad frames.
-    - How overrides and metadata are returned.
-  - Reproduce the **same behavior** in Qt:
-    - Same rules for filtering, grouping, and exclusion.
-    - Same data structures in the return tuple.
-
-- UI/Layout parity:
-  - Implement in Qt:
-    - A central list or table of frames (similar to the Tk tree/list).
-    - A filter/status panel with:
-      - Instrument info.
-      - WCS / solved status.
-      - Group/cluster info when available.
-    - Controls for:
-      - Launching analysis / clustering.
-      - Toggling quality filters (ZeQualityMT), when available.
-      - Handling pre-plan / master groups.
-      - Preview limits (if present in Tk).
-  - Use sensible Qt widgets:
-    - `QTableWidget` or `QTreeWidget` for the file list.
-    - `QGroupBox` + `QFormLayout` / `QGridLayout` for sections.
-    - `QCheckBox`, `QSpinBox`, `QDoubleSpinBox`, `QComboBox`,
-      `QProgressBar`, `QLabel`, `QPushButton`, `QPlainTextEdit` for logs, etc.
-
-- Behavior & return values:
-  - Ensure that calling the Qt entry point returns the **same tuple format**
-    as the Tk `launch_filter_interface`:
-    ```python
-    filtered_list, accepted, overrides_dict
-    ```
-  - `overrides_dict` must contain the same keys as the Tk implementation
-    when the corresponding operations are performed:
-    - `"preplan_master_groups"`
-    - `"autosplit_cap"`
-    - `"filter_excluded_indices"`
-    - `"resolved_wcs_count"`
-    - …and any other keys defined in `zemosaic_filter_gui.py`.
-
-- ASTAP / solver settings:
-  - Reuse the same logic as Tk to:
-    - Apply `solver_settings_dict` and `config_overrides`.
-    - Configure ASTAP paths, search radius, downsample, sensitivity, timeout.
-    - Configure ASTAP concurrency via
-      `set_astap_max_concurrent_instances(...)`, if available.
-
-- Logging and UX:
-  - Provide a minimal, but clear log/status area similar to the Tk GUI:
-    - Show important steps: scan start/end, groups built, filters applied.
-    - Show warnings when ZeQualityMT is unavailable or when ASTAP config
-      is incomplete.
-  - Make sure the dialog remains responsive during stream scan and analysis.
-
-### FOCUS 3 — Auto-organize Master tiles / coverage-first parity (Tk vs Qt)
-
-Work files:
-
-- Primary: `zemosaic_filter_gui_qt.py` (class `FilterQtDialog`)
-- Reference: `zemosaic_filter_gui.py` (Tk filter, `_auto_organize_master_tiles` and friends)
-- Diagnostics: `zemosaic_worker.py` (consumer of `filter_overrides`), `zemosaic_gui_qt.py` (how overrides are forwarded)
-
-Objectives (align with Task S in `followup.md`):
-
-- **Visual parity for Auto-organize Master Tiles**
-  - When the user clicks **Auto-organize Master Tiles** in the Qt filter:
-    - the Sky Preview / Coverage Map must show the same red dashed master rectangles
-      as in the Tk filter (outer mosaic box + per-group boxes),
-    - group colours and footprints must match Tk as closely as Matplotlib allows.
-  - Reuse the Tk helpers (`cluster_seestar_stacks_connected`, `_auto_split_groups`,
-    `_merge_small_groups`, `_draw_group_outlines`, etc.) instead of re-implementing logic.
-
-- **Summary & logs parity**
-  - After grouping finishes, update the Qt summary label with the localized
-    `filter_log_groups_summary` string, *exactly like Tk*:
-    - full sizes list in the log,
-    - histogram/compact sizes string in the label.
-  - Emit the same coverage-first log messages (`log_covfirst_start`, `log_covfirst_relax`,
-    `log_covfirst_autosplit`, `log_covfirst_merge`, `log_covfirst_done`) and SDS messages
-    (“ZeSupaDupStack: prepared N coverage batch(es) for preview.”) using the same
-    `msg_key` + `kwargs` so localization stays in sync with Tk.
-
-- **Override payload parity & freeze fix**
-  - Ensure that `launch_filter_interface_qt(...)` returns the same override structure as
-    Tk’s `launch_filter_interface(...)` for the same dataset, especially:
-    - `preplan_master_groups`
-    - SDS / coverage-first flags and thresholds
-    - any `global_wcs_*` keys and `global_wcs_plan_override`
-  - Investigate and fix the **Qt main window freeze** observed after using the filter:
-    - Do not run heavy clustering / coverage code directly in the GUI thread;
-      use worker threads / queued callbacks like Tk.
-    - Compare `zemosaic_worker.log` and the console between Tk and Qt runs and align
-      the payloads until the worker behaves identically.
-
-- **Testing requirements**
-  - Always test changes by running **both**:
-    - Tk main GUI + Tk filter (reference behaviour),
-    - Qt main GUI + Qt filter (PySide6),
-    on the same Seestar test data.
-  - Only consider the task done when:
-    - previews, logs, and summary texts match,
-    - and launching a full run from the Qt main GUI no longer freezes.
-
-> Important: Do **not** touch the astrophotography algorithms (`zemosaic_worker.py`,
-> `lecropper.py`, etc.) beyond reading how they consume `filter_overrides`.  
-> All fixes must be in the Qt/Tk glue and in `zemosaic_filter_gui_qt.py`.
-
-## HARD CONSTRAINTS
-
-These constraints are **non-negotiable**:
-
-1. **Do not break the Tk GUI.**
-   - `zemosaic_gui.py` and `zemosaic_filter_gui.py` must continue to work
-     exactly as before.
-   - Avoid modifying Tk files unless strictly necessary and explicitly
-     requested in `followup.md`.
-
-2. **Do not change the astrophotography/stacking algorithms.**
-   - `zemosaic_worker.py`, `lecropper.py`, `zequalityMT.py`, WCS logic, etc.
-     are the single source of truth for the processing pipeline.
-   - You may call into them, but do not refactor their algorithms here.
-
-3. **Do not introduce heavy new dependencies.**
-   - You may use standard library and existing dependencies.
-   - Do not add new GUI/toolkit dependencies beyond PySide6.
-   - Do not add new C/C++ extensions.
-
-4. **Respect localization.**
-   - All user-visible strings must go through the localization system when
-     practical.
-   - Use keys consistent with existing patterns (`qt_*`, `filter.*`, etc.)
-     and update `locales/en.json` and `locales/fr.json` when new keys are added.
-   - Do not remove or rename existing keys unless strictly necessary and
-     then update both locales accordingly.
-
-5. **Configuration parity:**
-   - When Qt writes configuration, resulting values must be compatible with
-     what the Tk GUI expects (same keys, same types).
-   - Never silently change semantics of existing config keys.
-
-6. **Keep the code organized and readable.**
-   - Follow the existing style and patterns used in `zemosaic_gui.py` and
-     `zemosaic_filter_gui.py`.
-   - Prefer small, focused methods over massive monoliths.
-   - Add comments when behavior is non-obvious (especially where Qt must
-     match Tk behavior exactly).
+The Tkinter GUI must remain untouched and usable. Users can still choose between the old Tk GUI and the new Qt GUI from `run_zemosaic.py` (or the existing launcher logic).
 
 
-## WORKFLOW & CHECKLISTS
+### Non-Goals
 
-- **`followup.md` is the canonical backlog.**
-  - Do not duplicate its content here.
-  - Do not change its structure unless the user explicitly asks.
-  - Use its checklists to decide what to do next.
-
-- When you implement something:
-  - Make small, atomic changes per commit.
-  - Keep the PySide6 code compiling and runnable at all times.
-  - Manually test:
-    - Launch via Tk → Filter → Qt filter (when wired).
-    - Launch Qt main GUI from `run_zemosaic.py` using the documented flags/env.
-
-- When updating `followup.md`:
-  - Mark tasks as `[x]` only after they are fully implemented and manually tested.
-  - Add short notes if something remains partially done or has caveats.
-  - Never mark as `[x]` a task you haven’t implemented and verified.
+- Do **NOT** change the stacking / mosaic / astrometry algorithms.
+- Do **NOT** rename or move modules in a way that breaks imports.
+- Do **NOT** add heavy third-party dependencies for theming. Use standard PySide6 / Qt features (QPalette, styles, simple stylesheets).
+- Do **NOT** regress any existing behaviour compared to `zemosaic_gui.py` and the current `zemosaic_gui_qt.py`.
 
 
-## SUMMARY
+---
 
-Your role:
+## TAB LAYOUT SPECIFICATION
 
-- Be the disciplined **Qt parity and cleanup agent** for ZeMosaic.
-- Make PySide6 GUIs behave like their Tk counterparts, without regressing stability.
-- Remove Phase 4.5 user controls from the Qt main window while preserving logs/overlays.
-- Bring `zemosaic_filter_gui_qt.py` to functional and UX parity with `zemosaic_filter_gui.py`.
-- Always keep `followup.md` in sync with the actual work done.
-- Never break the Tk GUI or the core astrophotography/stacking logic.
+You will reorganize the existing groupboxes and controls into these tabs.  
+For each tab, reuse the existing `QGroupBox` creation helpers where possible (e.g. `_create_folders_group`, `_create_solver_group`, etc.) — just move them into the appropriate tab layouts.
+
+### 1. Tab “Main”
+
+Purpose: all options required for a **typical run**.
+
+Put here:
+
+- **Language selector**
+  - The language combo (EN/FR) can be either:
+    - at the very top of the window (above tabs), or
+    - as the first widget inside the “Main” tab.
+  - It must continue to use `zemosaic_localization.py` and the existing i18n mechanism.
+
+- **Folders group**
+  - Input folder
+  - Output folder
+  - Global WCS output path
+  - (Optional) Memmap directory – can also be moved to “System” if more appropriate.
+
+- **Instrument / Seestar group**
+  - Auto-detect Seestar frames
+  - Force Seestar workflow
+  - Enable SDS mode by default
+  - SDS coverage threshold
+
+- **Mosaic / clustering (basic controls)**
+  - Cluster threshold
+  - Target groups
+  - Orientation split
+  - Cache retention (unless you decide to classify it under “System / memory”)
+
+- **Final assembly / output options** (if already exposed in Qt GUI)
+  - Method: Reproject co-add / Incremental
+  - Save final mosaic as uint16
+  - Legacy RGB cube options, etc.
+
+Implementation detail:
+
+- Use a dedicated `QWidget` for the “Main” tab with a vertical layout.
+- Add the above groupboxes in a consistent order (roughly: Language → Folders → Instrument → Mosaic).
+
+
+### 2. Tab “Solver”
+
+Purpose: everything related to **WCS / plate solving**.
+
+Put here:
+
+- **Solver selection**
+  - Combo box: ASTAP / Astrometry.net / ANSVR / None (or whatever exists today).
+
+- **ASTAP configuration group**
+  - ASTAP executable
+  - ASTAP data directory
+  - Default search radius
+  - Default downsample
+  - Default sensitivity
+  - Max ASTAP instances (this must keep the same semantics as in Tkinter).
+
+- **Astrometry.net configuration group** (if present)
+  - URL, API key, options.
+
+- **ANSVR / notes** widgets if they exist.
+
+- Any solver-specific hints text (e.g. “None = WCS already present”).
+
+
+### 3. Tab “System”
+
+Purpose: performance, memory, logging, “machine”-level settings.
+
+Put here:
+
+- From Folders / Mosaic:
+  - Memmap directory (if not left on “Main”).
+  - Cache retention (if you decide it’s more of a memory setting).
+
+- **GPU / acceleration group**
+  - Use GPU acceleration when available
+  - GPU selector or device info (if present).
+
+- **Logging / progress group**
+  - Logging verbosity level combo (if present).
+  - “Clear log” button, log view, phase information, ETA readouts.
+  - Any text or status widgets related purely to diagnostic / debug.
+
+The idea: the System tab is where users watch logs, performance-related indicators and tune lower-level settings.
+
+
+### 4. Tab “Advanced”
+
+Purpose: expert and experimental options. A new user should be able to ignore this tab.
+
+Put here:
+
+- **Cropping / quality / Alt-Az**
+  - Master tile crop
+  - Quality crop
+  - Alt-Az cleanup
+  - ZeQualityMT / master tile quality gate
+  - Two-pass coverage renormalization (if present).
+
+- **Mosaic / clustering advanced**
+  - Phase 4.5 / super-tiles controls.
+  - Any extra parameters that only affect special workflows (e.g. ZeSupaDupStack).
+
+- **Stacking options (expert)**
+  - Radial weighting options:
+    - Apply radial weighting
+    - Radial feather fraction
+    - Minimum radial weight floor
+  - Post-stack anchor review / inspection options.
+  - Any “experimental” toggles.
+
+Implementation detail:
+
+- Where possible, reuse existing group-creating functions and only move them into this tab.
+- If some expert options are currently mixed with basic ones, split them into separate groupboxes (e.g. “Basic mosaic options” vs “Advanced mosaic options”) and place the advanced groupbox here.
+
+
+### 5. Tab “Skin”
+
+Purpose: configure the visual appearance (theme / colors).
+
+Add a **new groupbox** dedicated to theme selection:
+
+- **Theme mode**
+  - Combo box or radio buttons with at least:
+    - `System default`
+    - `Dark`
+    - `Light`
+  - “System default” must respect the platform’s default Qt style:
+    - Do **not** override palette or style.
+  - “Dark” / “Light” should:
+    - Either use a custom `QPalette` for the application, or
+    - Apply a simple stylesheet.
+    - Keep it lightweight and cross-platform.
+
+- **Optional accent controls**
+  - You may add simple color pickers or combos for accent / highlight color, but only if this remains simple and robust.
+  - All labels must be localised via `zemosaic_localization.py`.
+
+**Theme persistence:**
+
+- Store the selected theme mode and any color settings in the existing config mechanism:
+  - Prefer to reuse `zemosaic_config.py` / its JSON file or whichever settings file is already used for GUI-level options.
+- On startup:
+  - Load the saved theme from config.
+  - Apply it before showing the main window.
+- When users change the theme from the “Skin” tab:
+  - Immediately apply the new theme.
+  - Save the setting for the next run.
+
+Cross-platform notes:
+
+- Do not rely on OS-specific APIs.
+- Use Qt standard facilities: `QApplication.setStyle`, `QPalette`, and possibly a simple stylesheet string.
+- Verify that the theme works on Windows, macOS, and Linux (at least conceptually; no OS-specific code).
+
+
+---
+
+## BOTTOM COMMAND AREA (OUTSIDE TABS)
+
+Regardless of the active tab, the user must always see:
+
+- Button **Filter…**
+- Button **Start**
+- Button **Stop**
+- Progress bar
+- ETA / current phase information (as currently done in the Qt GUI)
+
+Implementation:
+
+- Create a “bottom toolbar” layout separate from the tab widget, e.g.:
+
+  - Top: optional language selector
+  - Center: `QTabWidget`
+  - Bottom: `QWidget` with a horizontal layout for buttons + a vertical stack for log/progress if needed.
+
+- Reuse existing signal/slot connections. Only move the widgets; do not change what the callbacks do.
+
+
+---
+
+## INTERNATIONALISATION
+
+- All **new labels** (“Main”, “Solver”, “System”, “Advanced”, “Skin”, theme modes, etc.) must be integrated into the existing i18n system:
+  - Add keys to `locales/en.json` and `locales/fr.json`.
+  - Use `zemosaic_localization.Localization.tr(...)` (or the current helper) for UI text.
+- The language selector in the Qt GUI must continue to function exactly like in the Tkinter GUI: changing language should update visible labels accordingly.
+
+
+---
+
+## CROSS-PLATFORM REQUIREMENTS
+
+- Do not break current support for **Windows, macOS, Linux**:
+  - File/folder dialogs must still open with the system’s native dialog.
+  - Icons (open/close/folder/etc.) must still load correctly. Do not introduce platform-specific icon paths.
+  - Avoid Windows-only code and any `ctypes` tricks inside the GUI module.
+
+- Keep imports limited to:
+  - Standard library
+  - Existing project modules
+  - PySide6 / Qt modules already used in the project.
+
+
+---
+
+## IMPLEMENTATION GUIDELINES
+
+- Use clear, explicit layouts:
+  - For each tab: `tab_widget = QWidget()`, `layout = QVBoxLayout(tab_widget)`.
+  - Add groupboxes to those layouts.
+  - Add the tabs to a single `QTabWidget`.
+
+- Minimise code duplication:
+  - If you see repeated groupbox construction, factor it into helper methods.
+
+- Preserve all existing signal/slot connections and callback semantics.
+
+- Add comments where new theme code or tab logic lives, so future contributors can easily understand it.
+
+- Re-run / update any unit tests or basic smoke tests if they exist (or provide a simple manual test checklist in `followup.md`).
+
+At the end, the **PySide6 main window** must:
+
+- Expose the same options as the current Tkinter window.
+- Behave identically for all existing workflows (standard stack, SDS, ZeSupaDupStack, etc.).
+- Provide a clean, tabbed UI suitable for smaller screens.
+- Offer theme selection via the new “Skin” tab.
