@@ -174,6 +174,26 @@ To try the Qt frontend:
 If PySide6 is unavailable or an import error occurs, ZeMosaic automatically
 falls back to the Tk interface without interrupting your workflow.
 
+### Force Seestar workflow checkbox
+
+The Main tab of both GUIs exposes two related toggles for Seestar datasets:
+
+- **Auto-detect Seestar frames** stays on by default and inspects the FITS `INSTRUME`
+  header (or any instrument hint provided by the filter UI). When the label
+  contains “Seestar/S50/S30”, ZeMosaic enters the Seestar/Mosaic-First workflow
+  automatically.
+- **Force Seestar workflow** is a manual override. When it is checked, the filter
+  dialog and the worker assume the Mosaic-First path regardless of what the FITS
+  headers say. The filter always prepares/reuses the global WCS descriptor,
+  exports the `global_wcs_meta`/FITS/JSON paths, and sets the workflow mode to
+  `seestar`, so the worker skips the classic per-master-tile stack even if the
+  dataset mixes instruments or carries incomplete metadata.
+
+Enable this override whenever the automatic detection fails (e.g. FITS files
+stripped of `INSTRUME`), or when you deliberately want to run non-Seestar data
+through the Seestar-optimized Mosaic-First pipeline. Disabling it reverts to the
+classic workflow unless the headers clearly advertise Seestar frames.
+
 ### Global WCS auto-cropping (English)
 
 ZeMosaic can optionally trim the Mosaic-first canvas so the exported FITS only contains sky regions with real coverage.  

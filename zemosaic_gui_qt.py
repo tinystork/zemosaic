@@ -77,6 +77,7 @@ try:
         QColor,
         QIcon,
         QPainter,
+        QPalette,
         QPen,
         QResizeEvent,
         QTextCharFormat,
@@ -105,6 +106,7 @@ try:
         QPushButton,
         QScrollArea,
         QSpinBox,
+        QTabWidget,
         QToolButton,
         QVBoxLayout,
         QWidget,
@@ -700,10 +702,15 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._initialize_log_level_prefixes()
         for key, fallback in self._default_config_values.items():
             self.config.setdefault(key, fallback)
+        self.config.setdefault("qt_theme_mode", "system")
         self._config_fields: Dict[str, Dict[str, Any]] = {}
         self.solver_choice_combo: QComboBox | None = None
         self._solver_panels: Dict[str, QWidget] = {}
         self._solver_none_hint: QLabel | None = None
+        self.theme_mode_combo: QComboBox | None = None
+        self.tab_widget: QTabWidget | None = None
+        self._tab_layouts: Dict[str, QVBoxLayout] = {}
+        self._legacy_layout: QVBoxLayout | None = None
 
         self._last_filter_overrides: Dict[str, Any] | None = None
         self._last_filtered_header_items: List[Any] | None = None
@@ -782,6 +789,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self.is_processing = False
 
         self._setup_ui()
+        self._apply_theme(self.config.get("qt_theme_mode", "system"))
         self._emit_config_notes()
         self.worker_controller = ZeMosaicQtWorker(self)
         self.worker_controller.log_message_emitted.connect(self._on_worker_log_message)  # type: ignore[arg-type]
@@ -807,28 +815,55 @@ class ZeMosaicQtMainWindow(QMainWindow):
     # UI construction helpers
     # ------------------------------------------------------------------
     def _setup_ui(self) -> None:
-        # --- central widget wrapped in a scroll area ---
-        scroll = QScrollArea(self)
+        central_widget = QWidget(self)
+        self.setCentralWidget(central_widget)
+
+        outer_layout = QVBoxLayout(central_widget)
+        outer_layout.setContentsMargins(12, 12, 12, 12)
+        outer_layout.setSpacing(10)
+
+        language_row = self._build_language_selector_row(central_widget)
+        outer_layout.addLayout(language_row)
+
+        scroll = QScrollArea(central_widget)
         scroll.setWidgetResizable(True)
-        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.setCentralWidget(scroll)
+        outer_layout.addWidget(scroll, 1)
 
-        # actual content widget inside scroll area
-        central_widget = QWidget(scroll)
-        scroll.setWidget(central_widget)
+        tabs_container = QWidget(scroll)
+        scroll.setWidget(tabs_container)
+        tab_container_layout = QVBoxLayout(tabs_container)
+        tab_container_layout.setContentsMargins(0, 0, 0, 0)
+        tab_container_layout.setSpacing(10)
 
-        # use the main layout on the content widget instead of the window
-        main_layout = QVBoxLayout(central_widget)
-        main_layout.setContentsMargins(12, 12, 12, 12)
-        main_layout.setSpacing(10)
+        self.tab_widget = QTabWidget(tabs_container)
+        tab_container_layout.addWidget(self.tab_widget)
 
-        language_row = QHBoxLayout()
-        language_row.setContentsMargins(0, 0, 0, 0)
-        language_row.setSpacing(6)
-        language_label = QLabel(central_widget)
+        self._initialize_tab_pages()
+
+        self._legacy_layout = None
+        legacy_widget = QWidget(tabs_container)
+        legacy_layout = QVBoxLayout(legacy_widget)
+        legacy_layout.setContentsMargins(0, 0, 0, 0)
+        legacy_layout.setSpacing(10)
+        self._legacy_layout = legacy_layout
+        if self._populate_legacy_placeholder_sections():
+            tab_container_layout.addWidget(legacy_widget)
+        else:
+            legacy_widget.deleteLater()
+            self._legacy_layout = None
+
+        button_row = self._build_command_row()
+        outer_layout.addLayout(button_row)
+
+    def _build_language_selector_row(self, parent: QWidget) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        language_label = QLabel(parent)
         language_label.setText(self._tr("language_selector_label", "Language:"))
-        language_row.addWidget(language_label)
+        row.addWidget(language_label)
 
         available_langs = self._resolve_available_languages()
         self._available_languages = available_langs
@@ -839,7 +874,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             current_lang = available_langs[0]
             self.config["language"] = current_lang
 
-        self.language_menu_button = QToolButton(central_widget)
+        self.language_menu_button = QToolButton(parent)
         self.language_menu_button.setPopupMode(QToolButton.InstantPopup)
         self.language_menu_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
         menu = QMenu(self.language_menu_button)
@@ -854,31 +889,105 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self.language_menu_button.setMenu(menu)
         self._update_language_button_label(current_lang)
         self.language_menu_button.setEnabled(not self.is_processing)
-        language_row.addWidget(self.language_menu_button)
-        language_row.addStretch(1)
-        main_layout.addLayout(language_row)
+        row.addWidget(self.language_menu_button)
+        row.addStretch(1)
+        return row
 
-        main_layout.addWidget(self._create_folders_group())
-        main_layout.addWidget(self._create_astap_group())
-        main_layout.addWidget(self._create_instrument_group())
-        main_layout.addWidget(self._create_mosaic_group())
-        main_layout.addWidget(self._create_quality_group())
-        main_layout.addWidget(self._create_stacking_group())
-        main_layout.addWidget(self._create_final_assembly_group())
-        main_layout.addWidget(self._create_logging_group())
-
-        button_row = QHBoxLayout()
-        button_row.addStretch(1)
+    def _build_command_row(self) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addStretch(1)
         self.filter_button = QPushButton(self._tr("qt_button_filter", "Filter…"))
         self.filter_button.clicked.connect(self._on_filter_clicked)  # type: ignore[attr-defined]
         self.start_button = QPushButton(self._tr("qt_button_start", "Start"))
         self.stop_button = QPushButton(self._tr("qt_button_stop", "Stop"))
         self.start_button.clicked.connect(self._on_start_clicked)  # type: ignore[attr-defined]
         self.stop_button.clicked.connect(self._on_stop_clicked)  # type: ignore[attr-defined]
-        button_row.addWidget(self.filter_button)
-        button_row.addWidget(self.start_button)
-        button_row.addWidget(self.stop_button)
-        main_layout.addLayout(button_row)
+        row.addWidget(self.filter_button)
+        row.addWidget(self.start_button)
+        row.addWidget(self.stop_button)
+        return row
+
+    def _initialize_tab_pages(self) -> None:
+        if self.tab_widget is None:
+            return
+        self._tab_layouts = {}
+        tab_definitions = [
+            ("main", "qt_tab_main_title", "Main"),
+            ("solver", "qt_tab_solver_title", "Solver"),
+            ("system", "qt_tab_system_title", "System"),
+            ("advanced", "qt_tab_advanced_title", "Advanced"),
+            ("skin", "qt_tab_skin_title", "Skin"),
+        ]
+        for key, label_key, fallback in tab_definitions:
+            tab = QWidget(self.tab_widget)
+            layout = QVBoxLayout(tab)
+            layout.setContentsMargins(10, 10, 10, 10)
+            layout.setSpacing(10)
+            self._tab_layouts[key] = layout
+            self.tab_widget.addTab(tab, self._tr(label_key, fallback))
+        self._populate_main_tab(self._tab_layouts["main"])
+        self._populate_solver_tab(self._tab_layouts["solver"])
+        self._populate_system_tab(self._tab_layouts["system"])
+        self._populate_advanced_tab(self._tab_layouts["advanced"])
+        self._populate_skin_tab(self._tab_layouts["skin"])
+
+    def _populate_main_tab(self, layout: QVBoxLayout) -> None:
+        layout.addWidget(self._create_folders_group())
+        layout.addWidget(self._create_instrument_group())
+        layout.addWidget(self._create_mosaic_group())
+        layout.addWidget(self._create_final_assembly_group())
+        layout.addStretch(1)
+
+    def _populate_solver_tab(self, layout: QVBoxLayout) -> None:
+        layout.addWidget(self._create_astap_group())
+        layout.addStretch(1)
+
+    def _populate_system_tab(self, layout: QVBoxLayout) -> None:
+        layout.addWidget(self._create_system_resources_group())
+        layout.addWidget(self._create_gpu_group())
+        layout.addWidget(self._create_logging_group())
+        layout.addStretch(1)
+
+    def _populate_advanced_tab(self, layout: QVBoxLayout) -> None:
+        layout.addWidget(self._create_quality_group())
+        layout.addWidget(self._create_stacking_group())
+        layout.addStretch(1)
+
+    def _populate_skin_tab(self, layout: QVBoxLayout) -> None:
+        layout.addWidget(self._create_skin_group())
+        layout.addStretch(1)
+
+    def _add_placeholder_to_tab(self, tab_key: str) -> None:
+        layout = self._tab_layouts.get(tab_key)
+        if layout is None:
+            return
+        placeholder_key = f"qt_tab_placeholder_{tab_key}"
+        placeholder_text = self._tr(
+            placeholder_key,
+            "This tab is under construction.",
+        )
+        placeholder = QLabel(placeholder_text, self.tab_widget)
+        placeholder.setWordWrap(True)
+        layout.addWidget(placeholder)
+        layout.addStretch(1)
+
+    def _populate_legacy_placeholder_sections(self) -> bool:
+        """Temporarily keep unmigrated groups visible under the tab widget."""
+        if self._legacy_layout is None:
+            return False
+        builders = []
+        added_any = False
+        for builder in builders:
+            try:
+                widget = builder()
+            except Exception:
+                continue
+            self._legacy_layout.addWidget(widget)
+            added_any = True
+        if added_any:
+            self._legacy_layout.addStretch(1)
+        return added_any
 
     def _resolve_available_languages(self) -> List[str]:
         available_langs: List[str] = ["en", "fr"]
@@ -924,15 +1033,6 @@ class ZeMosaicQtMainWindow(QMainWindow):
             layout,
             self._tr("qt_field_global_wcs_output", "Global WCS output path"),
         )
-        self._register_directory_picker(
-            "coadd_memmap_dir",
-            layout,
-            self._tr("qt_field_coadd_memmap_dir", "Memmap directory"),
-            dialog_title=self._tr(
-                "qt_dialog_select_memmap_dir", "Select Memmap Folder"
-            ),
-        )
-
         return group
 
     def _create_instrument_group(self) -> QGroupBox:
@@ -1194,30 +1294,6 @@ class ZeMosaicQtMainWindow(QMainWindow):
             single_step=1.0,
             decimals=1,
         )
-
-        cache_combo = QComboBox()
-        cache_options = [
-            ("run_end", self._tr("qt_cache_retention_run_end", "Release caches at run end")),
-            ("per_tile", self._tr("qt_cache_retention_per_tile", "Clear caches after each tile")),
-            ("keep", self._tr("qt_cache_retention_keep", "Keep caches between runs")),
-        ]
-        for value, label in cache_options:
-            cache_combo.addItem(label, value)
-        current_cache_mode = str(self.config.get("cache_retention", "run_end")).lower()
-        cache_index = next(
-            (idx for idx, (value, _label) in enumerate(cache_options) if value == current_cache_mode),
-            0,
-        )
-        cache_combo.setCurrentIndex(cache_index)
-        layout.addRow(
-            QLabel(self._tr("qt_field_cache_retention", "Cache retention")),
-            cache_combo,
-        )
-        self._config_fields["cache_retention"] = {
-            "kind": "combobox",
-            "widget": cache_combo,
-            "type": str,
-        }
 
         if ENABLE_PHASE45_UI:
             phase45_box = QGroupBox(
@@ -1945,17 +2021,6 @@ class ZeMosaicQtMainWindow(QMainWindow):
             general_layout,
             self._tr("qt_field_auto_limit_frames", "Auto-limit frames per master tile"),
         )
-        self._register_checkbox(
-            "coadd_use_memmap",
-            general_layout,
-            self._tr("qt_field_coadd_use_memmap", "Use memory-mapped coadd intermediates"),
-        )
-        self._register_checkbox(
-            "coadd_cleanup_memmap",
-            general_layout,
-            self._tr("qt_field_coadd_cleanup", "Clean up memmap files after run"),
-        )
-
         num_workers_label = QLabel(
             self._tr("num_workers_label", "Processing Threads:"),
             general_box,
@@ -2021,15 +2086,6 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self._tr("qt_field_max_raw_per_tile", "Max raw frames per master tile (0 = unlimited)"),
             minimum=0,
             maximum=9999,
-        )
-        self._register_line_edit(
-            "coadd_memmap_dir",
-            general_layout,
-            self._tr("qt_field_coadd_memmap_dir", "Memmap directory"),
-            browse_action="directory",
-            dialog_title=self._tr(
-                "qt_dialog_select_memmap_dir", "Select memmap directory"
-            ),
         )
 
         layout.addWidget(general_box)
@@ -2268,16 +2324,110 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         layout.addWidget(post_box)
 
-        gpu_box = QGroupBox(
-            self._tr("qt_group_gpu", "GPU and acceleration"),
-            group,
+        return group
+
+    def _create_system_resources_group(self) -> QGroupBox:
+        group = QGroupBox(
+            self._tr("qt_group_system_resources", "System resources & cache"),
+            self,
         )
-        gpu_layout = QFormLayout(gpu_box)
-        gpu_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        layout = QFormLayout(group)
+        layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        self._register_checkbox(
+            "coadd_use_memmap",
+            layout,
+            self._tr("qt_field_coadd_use_memmap", "Use memory-mapped coadd intermediates"),
+        )
+        self._register_checkbox(
+            "coadd_cleanup_memmap",
+            layout,
+            self._tr("qt_field_coadd_cleanup", "Clean up memmap files after run"),
+        )
+        self._register_directory_picker(
+            "coadd_memmap_dir",
+            layout,
+            self._tr("qt_field_coadd_memmap_dir", "Memmap directory"),
+            dialog_title=self._tr(
+                "qt_dialog_select_memmap_dir", "Select memmap directory"
+            ),
+        )
+
+        cache_combo = QComboBox(group)
+        cache_options = [
+            ("run_end", self._tr("qt_cache_retention_run_end", "Release caches at run end")),
+            ("per_tile", self._tr("qt_cache_retention_per_tile", "Clear caches after each tile")),
+            ("keep", self._tr("qt_cache_retention_keep", "Keep caches between runs")),
+        ]
+        for value, label in cache_options:
+            cache_combo.addItem(label, value)
+        current_cache_mode = str(self.config.get("cache_retention", "run_end")).lower()
+        cache_index = next(
+            (idx for idx, (value, _label) in enumerate(cache_options) if value == current_cache_mode),
+            0,
+        )
+        cache_combo.setCurrentIndex(cache_index)
+        layout.addRow(
+            QLabel(self._tr("qt_field_cache_retention", "Cache retention")),
+            cache_combo,
+        )
+        self._config_fields["cache_retention"] = {
+            "kind": "combobox",
+            "widget": cache_combo,
+            "type": str,
+        }
+
+        return group
+
+    def _create_skin_group(self) -> QGroupBox:
+        group = QGroupBox(
+            self._tr("qt_group_skin_theme", "Theme"),
+            self,
+        )
+        layout = QFormLayout(group)
+        layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        combo = QComboBox(group)
+        combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        options = [
+            ("system", self._tr("qt_theme_option_system", "System default")),
+            ("dark", self._tr("qt_theme_option_dark", "Dark")),
+            ("light", self._tr("qt_theme_option_light", "Light")),
+        ]
+        for value, label in options:
+            combo.addItem(label, value)
+        current_mode = str(self.config.get("qt_theme_mode", "system") or "system").lower()
+        index = next(
+            (idx for idx, (value, _label) in enumerate(options) if value == current_mode),
+            0,
+        )
+        combo.setCurrentIndex(index)
+        layout.addRow(
+            QLabel(self._tr("qt_field_theme_mode", "Theme mode"), group),
+            combo,
+        )
+        self.theme_mode_combo = combo
+        combo.currentIndexChanged.connect(self._on_theme_mode_changed)  # type: ignore[arg-type]
+        self._config_fields["qt_theme_mode"] = {
+            "kind": "combobox",
+            "widget": combo,
+            "type": str,
+            "value_getter": combo.currentData,
+        }
+
+        return group
+
+    def _create_gpu_group(self) -> QGroupBox:
+        group = QGroupBox(
+            self._tr("qt_group_gpu", "GPU and acceleration"),
+            self,
+        )
+        layout = QFormLayout(group)
+        layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
 
         self._register_checkbox(
             "use_gpu_phase5",
-            gpu_layout,
+            layout,
             self._tr("qt_field_use_gpu_phase5", "Use GPU acceleration when available"),
         )
         checkbox_binding = self._config_fields.get("use_gpu_phase5")
@@ -2287,14 +2437,50 @@ class ZeMosaicQtMainWindow(QMainWindow):
             if isinstance(widget_candidate, QCheckBox):
                 checkbox_widget = widget_candidate
         self._register_gpu_selector(
-            gpu_layout,
+            layout,
             self._tr("qt_field_gpu_selector", "GPU selector"),
             checkbox=checkbox_widget,
         )
 
-        layout.addWidget(gpu_box)
-
         return group
+
+    def _on_theme_mode_changed(self, index: int) -> None:
+        if self.theme_mode_combo is None:
+            return
+        data = self.theme_mode_combo.itemData(index)
+        if not isinstance(data, str):
+            data = str(data or "")
+        mode = data.strip().lower() or "system"
+        self.config["qt_theme_mode"] = mode
+        self._apply_theme(mode)
+
+    def _apply_theme(self, mode: str | None) -> None:
+        mode = (mode or "system").strip().lower()
+        palette = QApplication.instance().style().standardPalette()
+        stylesheet = ""
+        if mode == "dark":
+            palette = QPalette()
+            palette.setColor(QPalette.Window, QColor(45, 45, 45))
+            palette.setColor(QPalette.WindowText, QColor(220, 220, 220))
+            palette.setColor(QPalette.Base, QColor(35, 35, 35))
+            palette.setColor(QPalette.AlternateBase, QColor(55, 55, 55))
+            palette.setColor(QPalette.Text, QColor(220, 220, 220))
+            palette.setColor(QPalette.Button, QColor(55, 55, 55))
+            palette.setColor(QPalette.ButtonText, QColor(220, 220, 220))
+            palette.setColor(QPalette.Highlight, QColor(100, 150, 255))
+            palette.setColor(QPalette.HighlightedText, QColor(0, 0, 0))
+            palette.setColor(QPalette.Link, QColor(80, 140, 255))
+        elif mode == "light":
+            palette = QApplication.instance().style().standardPalette()
+            palette.setColor(QPalette.Window, QColor(250, 250, 250))
+            palette.setColor(QPalette.Base, QColor(255, 255, 255))
+            palette.setColor(QPalette.Button, QColor(245, 245, 245))
+            palette.setColor(QPalette.Highlight, QColor(80, 120, 255))
+            palette.setColor(QPalette.HighlightedText, QColor(255, 255, 255))
+        QApplication.setPalette(palette)
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(stylesheet)
 
     def _create_logging_group(self) -> QGroupBox:
         group = QGroupBox(self._tr("qt_group_logging", "Logging / progress"), self)
@@ -3016,6 +3202,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         }
         defaults.update(fallback_defaults)
         defaults.setdefault("language", "en")
+        defaults.setdefault("qt_theme_mode", "system")
         return defaults
 
     def _determine_config_path(self) -> str | None:

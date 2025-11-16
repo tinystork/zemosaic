@@ -70,6 +70,7 @@ DEFAULT_CONFIG = {
     "astap_default_sensitivity": 100,
     "astap_max_instances": 1,
     "language": "en",
+    "qt_theme_mode": "system",
     "input_dir": "",
     "output_dir": "",
     "num_processing_workers": -1, # -1 pour auto
