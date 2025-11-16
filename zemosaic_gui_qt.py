@@ -54,6 +54,7 @@ selects the Tk interface even if the environment variable requests Qt.
 """
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 import os
@@ -69,7 +70,7 @@ from dataclasses import asdict
 from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Sequence, Tuple
 
 try:
-    from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
+    from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, QByteArray
     from PySide6.QtGui import (
         QBrush,
         QCloseEvent,
@@ -79,6 +80,7 @@ try:
         QPalette,
         QPen,
         QResizeEvent,
+        QShowEvent,
         QTextCharFormat,
         QTextCursor,
     )
@@ -107,6 +109,8 @@ try:
         QTabWidget,
         QVBoxLayout,
         QWidget,
+        QSizePolicy,
+        QSplitter,
     )
 except ImportError as exc:  # pragma: no cover - import guard
     raise ImportError(
@@ -158,6 +162,10 @@ else:  # pragma: no cover - optional dependency guard
 # The worker-side implementation and overlays remain available, but users must not
 # be able to toggle Phase 4.5 from the Qt main window.
 ENABLE_PHASE45_UI = False
+
+QT_MAIN_WINDOW_GEOMETRY_KEY = "qt_main_window_geometry"
+QT_MAIN_COLUMNS_STATE_KEY = "qt_main_columns_state"
+QT_MAIN_LEFT_STATE_KEY = "qt_main_left_state"
 
 LANGUAGE_OPTION_DEFINITIONS = [
     ("en", "language_name_en", "English (EN)"),
@@ -718,6 +726,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._tab_layouts: Dict[str, QVBoxLayout] = {}
         self._legacy_layout: QVBoxLayout | None = None
 
+        self._main_columns_splitter: QSplitter | None = None
+        self._main_left_splitter: QSplitter | None = None
+        self._splitter_states_restored = False
+
         self._last_filter_overrides: Dict[str, Any] | None = None
         self._last_filtered_header_items: List[Any] | None = None
         self._worker_start_thread: threading.Thread | None = None
@@ -863,6 +875,108 @@ class ZeMosaicQtMainWindow(QMainWindow):
         button_row = self._build_command_row()
         outer_layout.addLayout(button_row)
 
+        self._apply_saved_window_geometry()
+
+    def _apply_saved_window_geometry(self) -> None:
+        geometry_value = self.config.get(QT_MAIN_WINDOW_GEOMETRY_KEY)
+        geometry = self._normalize_geometry_value(geometry_value)
+        if geometry is None:
+            return
+        x, y, width, height = geometry
+        try:
+            self.setGeometry(x, y, width, height)
+        except Exception:
+            pass
+
+    def _apply_saved_splitter_states(self) -> None:
+        columns_state = self._deserialize_splitter_state(
+            self.config.get(QT_MAIN_COLUMNS_STATE_KEY)
+        )
+        left_state = self._deserialize_splitter_state(
+            self.config.get(QT_MAIN_LEFT_STATE_KEY)
+        )
+        if columns_state is not None and self._main_columns_splitter is not None:
+            try:
+                self._main_columns_splitter.restoreState(columns_state)
+            except Exception:
+                pass
+        if left_state is not None and self._main_left_splitter is not None:
+            try:
+                self._main_left_splitter.restoreState(left_state)
+            except Exception:
+                pass
+
+    def showEvent(self, event: QShowEvent) -> None:  # type: ignore[override]
+        super().showEvent(event)
+        if not self._splitter_states_restored:
+            QTimer.singleShot(0, self._deferred_splitter_restore)
+
+    def _deferred_splitter_restore(self) -> None:
+        if self._splitter_states_restored:
+            return
+        self._apply_saved_splitter_states()
+        self._splitter_states_restored = True
+
+    def _record_splitter_states(self) -> None:
+        if self._main_columns_splitter is not None:
+            encoded_columns = self._serialize_splitter_state(
+                self._main_columns_splitter.saveState()
+            )
+            if encoded_columns is not None:
+                self.config[QT_MAIN_COLUMNS_STATE_KEY] = encoded_columns
+        if self._main_left_splitter is not None:
+            encoded_left = self._serialize_splitter_state(
+                self._main_left_splitter.saveState()
+            )
+            if encoded_left is not None:
+                self.config[QT_MAIN_LEFT_STATE_KEY] = encoded_left
+
+    def _serialize_splitter_state(self, state: QByteArray) -> str | None:
+        if state.isEmpty():
+            return None
+        try:
+            encoded = bytes(state.toBase64()).decode("ascii")
+        except Exception:
+            return None
+        return encoded
+
+    @staticmethod
+    def _deserialize_splitter_state(value: Any) -> QByteArray | None:
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            decoded = base64.b64decode(value)
+        except Exception:
+            return None
+        return QByteArray(decoded)
+
+    def _record_window_geometry(self) -> None:
+        if not hasattr(self, "config"):
+            return
+        rect = self.normalGeometry() if self.isMaximized() else self.geometry()
+        normalized = self._normalize_geometry_value(
+            (rect.x(), rect.y(), rect.width(), rect.height())
+        )
+        if normalized is None:
+            return
+        self.config[QT_MAIN_WINDOW_GEOMETRY_KEY] = list(normalized)
+
+    @staticmethod
+    def _normalize_geometry_value(value: Any) -> tuple[int, int, int, int] | None:
+        if not isinstance(value, (list, tuple)):
+            return None
+        if len(value) < 4:
+            return None
+        try:
+            coords = [int(float(entry)) for entry in value[:4]]
+        except Exception:
+            return None
+        width = max(1, coords[2])
+        height = max(1, coords[3])
+        if width <= 0 or height <= 0:
+            return None
+        return coords[0], coords[1], width, height
+
     def _build_command_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
@@ -905,10 +1019,47 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._populate_language_tab(self._tab_layouts["language"])
 
     def _populate_main_tab(self, layout: QVBoxLayout) -> None:
-        layout.addWidget(self._create_folders_group())
-        layout.addWidget(self._create_instrument_group())
-        layout.addWidget(self._create_mosaic_group())
-        layout.addWidget(self._create_final_assembly_group())
+        parent_widget = layout.parentWidget() or self
+
+        # central horizontal splitter dividing the two columns
+        columns_splitter = QSplitter(Qt.Horizontal, parent_widget)
+        columns_splitter.setChildrenCollapsible(False)
+
+        # left column: folders, mosaic and instrument groups
+        left_splitter = QSplitter(Qt.Vertical, columns_splitter)
+        left_splitter.setChildrenCollapsible(False)
+        folders_group = self._create_folders_group()
+        mosaic_group = self._create_mosaic_group()
+        instrument_group = self._create_instrument_group()
+        left_splitter.addWidget(folders_group)
+        left_splitter.addWidget(mosaic_group)
+        left_splitter.addWidget(instrument_group)
+        left_splitter.setCollapsible(0, False)
+        left_splitter.setCollapsible(1, False)
+        left_splitter.setCollapsible(2, False)
+        left_splitter.setStretchFactor(0, 3)
+        left_splitter.setStretchFactor(1, 2)
+        left_splitter.setStretchFactor(2, 2)
+
+        # right column: final assembly output
+        right_splitter = QSplitter(Qt.Vertical, columns_splitter)
+        right_splitter.setChildrenCollapsible(False)
+        final_group = self._create_final_assembly_group()
+        right_splitter.addWidget(final_group)
+        right_splitter.setCollapsible(0, False)
+        right_splitter.setStretchFactor(0, 1)
+
+        columns_splitter.addWidget(left_splitter)
+        columns_splitter.addWidget(right_splitter)
+        columns_splitter.setCollapsible(0, False)
+        columns_splitter.setCollapsible(1, False)
+        columns_splitter.setStretchFactor(0, 1)
+        columns_splitter.setStretchFactor(1, 1)
+
+        self._main_columns_splitter = columns_splitter
+        self._main_left_splitter = left_splitter
+
+        layout.addWidget(columns_splitter)
         layout.addStretch(1)
 
     def _populate_solver_tab(self, layout: QVBoxLayout) -> None:
@@ -1244,6 +1395,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         group = QGroupBox(self._tr("qt_group_mosaic", "Mosaic / clustering"), self)
         layout = QFormLayout(group)
         layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
 
         self._register_double_spinbox(
             "cluster_panel_threshold",
@@ -3251,6 +3403,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "quality_gate_k_sigma": 2.5,
             "quality_gate_erode_px": 3,
             "quality_gate_move_rejects": True,
+            "qt_main_window_geometry": None,
+            "qt_main_columns_state": None,
+            "qt_main_left_state": None,
             "two_pass_coverage_renorm": False,
             "two_pass_cov_sigma_px": 50,
             "two_pass_cov_gain_clip": [0.85, 1.18],
@@ -4956,6 +5111,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self.stop_button.setEnabled(False)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # type: ignore[override]
+        self._record_splitter_states()
+        self._record_window_geometry()
         self._collect_config_from_widgets()
         self._apply_astap_concurrency_setting()
         self._save_config()

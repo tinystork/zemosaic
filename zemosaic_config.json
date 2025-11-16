@@ -4,11 +4,18 @@
     "astap_default_search_radius": 3.0,
     "astap_default_downsample": 2,
     "astap_default_sensitivity": 100,
-    "astap_max_instances": 8,
+    "astap_max_instances": 16,
     "language": "en",
     "preferred_gui_backend": "qt",
     "preferred_gui_backend_explicit": true,
     "qt_theme_mode": "dark",
+    "qt_main_window_geometry": [
+        3377,
+        73,
+        2306,
+        1101
+    ],
+    "qt_filter_window_geometry": null,
     "input_dir": "C:/Users/TRISTAN/Desktop/astrophoto/zemosaic/example/lights",
     "output_dir": "C:/Users/TRISTAN/Desktop/astrophoto/zemosaic/example/out",
     "num_processing_workers": 0,
@@ -26,7 +33,7 @@
     "use_gpu_phase5": true,
     "gpu_id_phase5": 0,
     "gpu_selector": "NVIDIA GeForce RTX 3070 Laptop GPU",
-    "final_assembly_method": "reproject_coadd",
+    "final_assembly_method": "incremental",
     "auto_detect_seestar": true,
     "force_seestar_mode": false,
     "global_wcs_output_path": "global_mosaic_wcs.fits",
@@ -75,11 +82,11 @@
     "winsor_split_strategy": "sequential",
     "max_raw_per_master_tile": 0,
     "center_out_normalization_p3": true,
-    "center_out_anchor_mode": "auto_central_quality",
+    "center_out_anchor_mode": "central_only",
     "anchor_quality_probe_limit": 12,
     "anchor_quality_span_range": [
         0.02,
-        6.0
+        6.02
     ],
     "anchor_quality_median_clip_sigma": 2.5,
     "enable_poststack_anchor_review": true,
@@ -103,7 +110,7 @@
     "intertile_overlap_min": 0.05,
     "intertile_sky_percentile": [
         30.0,
-        68.5
+        67.0
     ],
     "intertile_robust_clip_sigma": 2.5,
     "intertile_global_recenter": true,

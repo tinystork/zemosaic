@@ -1,137 +1,265 @@
-AGENT MISSION — ZeMosaic GUI + Core Stability
 
-You are an autonomous coding agent working inside the ZeMosaic project.
+# AGENT MISSION FILE — ZEMOSAIC QT MAIN TAB LAYOUT (SPLITTERS ONLY)
+
+You are an autonomous coding agent working on the **ZeMosaic** project.
+
+The repository already contains (relevant for this task):
+
+- `run_zemosaic.py`           → entry point (Tk / Qt selector)
+- `zemosaic_gui.py`           → legacy Tkinter GUI (MUST remain unchanged)
+- `zemosaic_filter_gui.py`    → legacy Tkinter filter GUI (MUST remain unchanged)
+- `zemosaic_gui_qt.py`        → new PySide6 main GUI (this is your ONLY target)
+- `zemosaic_filter_gui_qt.py` → new PySide6 filter GUI (DO NOT touch it in this task)
+- `locales/en.json`, `locales/fr.json`
+- helper modules (astrometry, worker, utils, etc.) — DO NOT modify them for this task.
+
+Your job in this mission:  
+**Refine the layout of the Qt “Main” tab using QSplitter so that the main groups can be resized interactively, without changing any business logic or behaviour.**
+
+
+## GLOBAL CONSTRAINTS
+
+1. **Tkinter GUI must remain 100% untouched and functional.**
+   - Do not modify `zemosaic_gui.py` or `zemosaic_filter_gui.py`.
+
+2. **Non-GUI logic must remain untouched.**
+   - Do not change any code related to:
+     - processing pipeline, worker threads,
+     - configuration loading/saving,
+     - astrometry / stacking / mosaic algorithms,
+     - logging, progress bars, etc.
+
+3. **Scope is intentionally narrow:**
+   - You may only modify:
+     - `zemosaic_gui_qt.py` (imports + layout code),
+   - No other files, no new dependencies, no changes to translation keys.
+
+4. **Keep existing widget creation methods and translation usage.**
+   - The groupbox builders (`_create_folders_group`, `_create_instrument_group`, `_create_mosaic_group`, `_create_final_assembly_group`) must keep:
+     - same titles / `_tr` keys,
+     - same child widgets, fields and bindings.
+
+
+## CURRENT SITUATION (BEFORE YOUR CHANGES)
+
+- The Qt main window builds a `QScrollArea` with a `QTabWidget`.
+- The **Main** tab is populated by `_populate_main_tab(self, layout: QVBoxLayout)`.
+- Inside `_populate_main_tab`, the layout currently uses a fixed `QGridLayout`:
+
+  ```python
+  grid_container = QWidget(parent_widget)
+  grid_layout = QGridLayout(grid_container)
+  ...
+  grid_layout.addWidget(self._create_folders_group(), 0, 0)
+  grid_layout.addWidget(self._create_instrument_group(), 0, 1)
+  grid_layout.addWidget(self._create_mosaic_group(), 1, 0)
+  grid_layout.addWidget(self._create_final_assembly_group(), 1, 1)
+  layout.addWidget(grid_container)
+````
+
+* This forces all cells of the grid row/column to share the same height, leading to a **very tall empty area** in the “Mosaic / clustering” group when “Final assembly” is tall.
+
+The user wants:
+
+* Two main columns (left and right), roughly balanced.
+* Within each column, the groups should be **resizable by the user** (dragging splitter handles).
+* The column widths themselves must also be adjustable.
+* Order of groups remains:
+
+  * Left column: **Folders** (top), **Mosaic / clustering** (bottom).
+  * Right column: **Instrument** (top), **Final assembly output** (bottom).
+
+## MISSION OBJECTIVES
 
-The repository contains (non-exhaustive):
-zemosaic_gui.py (Tk), zemosaic_filter_gui.py (Tk),
-zemosaic_gui_qt.py (Qt), zemosaic_filter_gui_qt.py (Qt),
-zemosaic_worker.py, zemosaic_utils.py,
-lecropper.py, zewcscleaner.py,
-zemosaic_astrometry.py, zemosaic_localization.py,
-solver_settings.*, zemosaic_config.*,
-locales/*.json, icons, and helper modules.
+### Objective 1 — Import and basic setup
+
+1. In `zemosaic_gui_qt.py`, extend the widget imports to include `QSplitter` (and `QSizePolicy` if needed):
 
-Your responsibilities:
+   ```python
+   from PySide6.QtWidgets import (
+       QApplication,
+       QCheckBox,
+       QComboBox,
+       QDoubleSpinBox,
+       QFrame,
+       QGraphicsScene,
+       QGraphicsView,
+       QFileDialog,
+       QFormLayout,
+       QGridLayout,
+       QGroupBox,
+       QHBoxLayout,
+       QLabel,
+       QLineEdit,
+       QMainWindow,
+       QMessageBox,
+       QPlainTextEdit,
+       QProgressBar,
+       QPushButton,
+       QScrollArea,
+       QSpinBox,
+       QTabWidget,
+       QVBoxLayout,
+       QWidget,
+       QSizePolicy,  # NEW
+       QSplitter,    # NEW
+   )
+   ```
 
-1 — GLOBAL RULES
+   * Do **not** remove existing imports even if some are unused.
 
-You must NEVER break:
+### Objective 2 — Replace the grid layout with nested QSplitters
 
-Existing Tkinter GUI behavior.
+Re-implement `_populate_main_tab` to use:
 
-Existing Seestar mosaic and stacking logic.
+* One **horizontal QSplitter** for the two main columns.
+* Two **vertical QSplitters**:
 
-The worker pipeline, Phase 4.5 super-tiles, masks, alpha propagation.
+  * left vertical splitter: Folders + Mosaic group,
+  * right vertical splitter: Instrument + Final assembly group.
 
-FITS headers, metadata propagation, and WCS.
+**Required structure:**
 
-Batch size = 0 or >1 behavior (strictly preserve).
+```text
+Main tab (QVBoxLayout)
+└─ columns_splitter (QSplitter, Qt.Horizontal)
+   ├─ left_column_splitter  (QSplitter, Qt.Vertical)
+   │  ├─ folders_group
+   │  └─ mosaic_group
+   └─ right_column_splitter (QSplitter, Qt.Vertical)
+      ├─ instrument_group
+      └─ final_assembly_group
+```
 
-Compatibility Windows / macOS / Linux.
+Concrete implementation:
 
-Localization system (locales/en.json, locales/fr.json, future locales).
+```python
+def _populate_main_tab(self, layout: QVBoxLayout) -> None:
+    parent_widget = layout.parentWidget() or self
 
-Icons loading across OSes.
+    # --- main horizontal splitter: left column vs right column ---
+    columns_splitter = QSplitter(Qt.Horizontal, parent_widget)
 
-No new dependencies unless explicitly allowed.
+    # ----- LEFT COLUMN: folders + mosaic/clustering (vertical splitter) -----
+    left_splitter = QSplitter(Qt.Vertical, columns_splitter)
 
-2 — QT GUI MISSION
+    folders_group = self._create_folders_group()
+    mosaic_group = self._create_mosaic_group()
 
-You must progressively build a complete PySide6 GUI, parallel to Tkinter:
+    left_splitter.addWidget(folders_group)
+    left_splitter.addWidget(mosaic_group)
 
-Reproduce all features of Tk GUIs (main GUI + filter GUI).
+    # Optional: give reasonable initial sizes (folders taller than mosaic)
+    left_splitter.setStretchFactor(0, 3)
+    left_splitter.setStretchFactor(1, 2)
 
-Respect layout specs: scroll areas, QSplitter when requested, 2-column grids, tab structure.
+    # ----- RIGHT COLUMN: instrument + final assembly (vertical splitter) -----
+    right_splitter = QSplitter(Qt.Vertical, columns_splitter)
 
-Keep clear separation:
+    instrument_group = self._create_instrument_group()
+    final_group = self._create_final_assembly_group()
 
-GUI-only code in *_qt.py.
+    right_splitter.addWidget(instrument_group)
+    right_splitter.addWidget(final_group)
 
-Business logic untouched.
+    # Optional: final assembly slightly taller
+    right_splitter.setStretchFactor(0, 2)
+    right_splitter.setStretchFactor(1, 3)
 
-Strict consistency with translations (_tr()), config fields, and event handlers.
+    # --- Add left and right columns to the main splitter ---
+    columns_splitter.addWidget(left_splitter)
+    columns_splitter.addWidget(right_splitter)
 
-3 — FILTER GUI MISSION
+    # Balance the two main columns (user can override by dragging)
+    columns_splitter.setStretchFactor(0, 1)
+    columns_splitter.setStretchFactor(1, 1)
 
-Qt filter GUI must reproduce exactly the logic of zemosaic_filter_gui.py.
+    # Finally attach to the tab layout
+    layout.addWidget(columns_splitter)
+    layout.addStretch(1)
+```
 
-Features to mirror:
+Constraints:
 
-Auto-organize master tiles
+* Do not change the *contents* of `_create_*_group` methods, only how their returned widgets are arranged.
+* The **scroll area must keep working**:
 
-WCS grouping + preview
+  * No change is needed around the `QScrollArea` or `QTabWidget` creation.
+  * Only replace the internal layout of the `main` tab.
 
-Coverage checks
+### Objective 3 — Keep the Mosaic / clustering group compact
 
-Prepared groups
+To avoid the Mosaic group being stretched to absurd heights when space is available, assign it a vertical size policy that prefers minimal height.
 
-Preplan logging output
+Inside `_create_mosaic_group` (and only there), after creating the `QGroupBox`:
 
-Sky preview placement & behavior
+```python
+def _create_mosaic_group(self) -> QGroupBox:
+    group = QGroupBox(self._tr("qt_group_mosaic", "Mosaic / clustering"), self)
+    layout = QFormLayout(group)
+    layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
 
-Tk version must remain unchanged.
+    # Prevent this group from greedily expanding vertically.
+    group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
 
-4 — ASTROMETRY / MASKS MISSION
+    ...
+    return group
+```
 
-The codebase uses:
+* Do **not** change control creation, labels, or binding of widget values.
 
-ASTAP CLI
+### Objective 4 — Behaviour and testing
 
-Proprietary alt-az cleanup
+After the change, the expected behaviour is:
 
-Coverage maps
+1. **Resizable columns**:
 
-Alpha masks (NaN/transparent zones)
+   * The user can drag the **central vertical splitter handle** to make the left column wider/narrower relative to the right column.
 
-Lecropper pipeline
+2. **Resizable groups within each column**:
 
-You must:
+   * In the left column, the separator between **Folders** and **Mosaic / clustering** can be dragged to change their respective heights.
+   * In the right column, the separator between **Instrument** and **Final assembly** can be dragged similarly.
 
-Apply masks properly to FITS 16/32-bit and PNG outputs.
+3. **No change in functionality**:
 
-Preserve alpha while downsampling.
+   * All input fields, checkboxes, and buttons behave exactly as before.
+   * Running a mosaic must produce identical logs and results compared to the previous Qt version (for the same settings).
 
-Remove black arcs in mosaics.
+4. **Scrollbars still visible when needed**:
 
-Avoid GUI freezes during ASTAP crashes.
+   * The window should still show scrollbars when the overall content is taller or wider than the screen.
+   * Do not disable `setWidgetResizable(True)` or scroll policies.
 
-5 — SUPER-TILES & MOSAIC LOGIC
+## OUT OF SCOPE (DO NOT DO)
 
-Ensure Phase 4.5 super-tiles are normalized with each other and master tiles.
+* Do not add drag-and-drop reordering of groups (this might come later in another mission).
+* Do not modify:
 
-Keep progression logs intact.
+  * other tabs (`solver`, `system`, `advanced`, `skin`, `language`),
+  * `zemosaic_filter_gui_qt.py`,
+  * any back-end processing / worker logic.
+* Do not introduce additional modules, CSS, or stylesheets.
+* Do not change translation keys or add new JSON entries in `locales/`.
 
-Ensure WCS propagation to all intermediate files.
+## DONE CRITERIA
 
-6 — NEW MODES
+This task is considered complete when:
 
-You may be asked to implement special modes such as:
+1. `_populate_main_tab` uses the nested QSplitter structure described above.
+2. `Mosaic / clustering` does not expand ridiculously in height when there is free space.
+3. The user can resize:
 
-Mosaic-first strategy
+   * the width of each column,
+   * the height of the two groups within each column,
+     using standard Qt splitter handles.
+4. No regressions occur in:
 
-ZeSupaDupStack
+   * interaction (all widgets still present and functional),
+   * logging,
+   * mosaic processing results.
+5. Running `python run_zemosaic.py --qt-gui` shows the updated layout and the classic Tk GUI is unchanged when launched normally or with `--tk-gui`.
 
-Blind solve preparations
-These must plug into the existing pipeline without breaking defaults.
+````
 
-7 — OUTPUT REQUIREMENTS
 
-Code must be:
-
-Deterministic
-
-Patch-friendly
-
-Minimal changes (only requested scope)
-
-Commented only if necessary
-
-Free of accidental refactors
-
-8 — WHEN IN DOUBT
-
-Always:
-
-Preserve existing behavior
-
-Follow instructions in followup.md

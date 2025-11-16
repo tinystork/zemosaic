@@ -57,7 +57,10 @@ import psutil
 import threading
 import hashlib
 import queue
+from collections import deque
 from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Any, Callable, Deque, Optional
 
 import multiprocessing
 
@@ -76,7 +79,19 @@ try:
 except Exception:  # pragma: no cover - very limited Python builds
     ctypes = None
 
-if os.name == "nt" and ctypes is not None:
+
+def _env_flag_enabled(key: str) -> bool:
+    raw = os.environ.get(key)
+    if raw is None:
+        return False
+    return str(raw).strip().lower() in {"1", "true", "on", "yes"}
+
+
+ProgressCallback = Callable[[str, Any, str], None]
+
+_KEEP_DIALOGS = _env_flag_enabled("KEEP_DIALOGS")
+
+if os.name == "nt" and ctypes is not None and not _KEEP_DIALOGS:
     try:
         SEM_FAILCRITICALERRORS = 0x0001
         SEM_NOGPFAULTERRORBOX = 0x0002
@@ -621,8 +636,9 @@ def extract_center_from_header(original_fits_header) -> "AstropySkyCoord | None"
 def _run_astap_once(
     cmd_list: list,
     timeout_sec: float,
-    progress_callback: callable = None,
-    cwd: str | None = None,
+    progress_callback: Optional[ProgressCallback] = None,
+    cwd: Optional[str] = None,
+    proc_ready_callback: Optional[Callable[[subprocess.Popen], None]] = None,
 ):
     """Launch ASTAP once, streaming stdout for logging, and return its rc."""
     if progress_callback:
@@ -658,10 +674,18 @@ def _run_astap_once(
         finally:
             reader_done.set()
 
+    reader_thread = None
     if proc.stdout:
-        threading.Thread(target=_drain_stdout, daemon=True).start()
+        reader_thread = threading.Thread(target=_drain_stdout, daemon=True)
+        reader_thread.start()
     else:
         reader_done.set()
+
+    if proc_ready_callback is not None:
+        try:
+            proc_ready_callback(proc)
+        except Exception:
+            logger.debug("ASTAP proc hook raised an exception", exc_info=True)
 
     try:
         while True:
@@ -684,6 +708,11 @@ def _run_astap_once(
             time.sleep(0.05)
         return proc.returncode or 0
     finally:
+        if reader_thread is not None:
+            try:
+                reader_thread.join(timeout=1.0)
+            except Exception:
+                pass
         if proc.stdout:
             try:
                 proc.stdout.close()
@@ -1028,16 +1057,27 @@ def _update_fits_header_with_wcs_za(fits_header_to_update: fits.Header,
 
 # DANS zemosaic_astrometry.py
 
-def solve_with_astap(image_fits_path: str,
-                     original_fits_header: fits.Header,
-                     astap_exe_path: str,
-                     astap_data_dir: str,
-                     search_radius_deg: float | None = None,    # Depuis GUI
-                     downsample_factor: int | None = None,      # Depuis GUI (pour -z)
-                     sensitivity: int | None = None,            # Depuis GUI (pour -sens)
-                     timeout_sec: int = 120,
-                     update_original_header_in_place: bool = False,
-                     progress_callback: callable = None):
+def solve_with_astap(
+    image_fits_path: str,
+    original_fits_header: fits.Header,
+    astap_exe_path: str,
+    astap_data_dir: str,
+    search_radius_deg: float | None = None,    # Depuis GUI
+    downsample_factor: int | None = None,      # Depuis GUI (pour -z)
+    sensitivity: int | None = None,            # Depuis GUI (pour -sens)
+    timeout_sec: int = 120,
+    update_original_header_in_place: bool = False,
+    progress_callback: Optional[ProgressCallback] = None,
+    proc_hook: Optional[Callable[[subprocess.Popen], None]] = None,
+):
+    """Invoke ASTAP to solve the provided FITS file and stream its logging output.
+
+    Parameters
+    ----------
+    proc_hook :
+        Optional callable invoked with the created ``subprocess.Popen`` instance so
+        external watchers (e.g., Qt helpers) can control or inspect the running solver.
+    """
 
     if not ASTROPY_AVAILABLE_ASTROMETRY:
         if progress_callback: progress_callback("ASTAP Solve ERREUR: Astropy non disponible, ASTAP solve annulé.", None, "ERROR")
@@ -1308,11 +1348,12 @@ def solve_with_astap(image_fits_path: str,
                             _rate_limit_before_launch(progress_callback)
                             with _temp_cwd_isolated() as isolated_cwd:
                                 rc_astap = _run_astap_once(
-                                    cmd_list_astap,
-                                    timeout_sec,
-                                    progress_callback,
-                                    cwd=isolated_cwd,
-                                )
+                                cmd_list_astap,
+                                timeout_sec,
+                                progress_callback,
+                                cwd=isolated_cwd,
+                                proc_ready_callback=proc_hook,
+                            )
                     if rc_astap == 0:
                         break
                     raise RuntimeError(f"ASTAP return code {rc_astap}")
@@ -1526,6 +1567,134 @@ def solve_with_ansvr(
     return wcs_obj
 
 
+
+
+@dataclass(frozen=True)
+class AstapTask:
+    """Parameters describing a single ASTAP solve request."""
+
+    image_fits_path: str
+    original_header: Optional[fits.Header]
+    astap_executable_path: str
+    astap_data_directory: str
+    search_radius_deg: Optional[float] = None
+    downsample_factor: Optional[int] = None
+    sensitivity: Optional[int] = None
+    timeout_sec: int = 120
+    update_header_in_place: bool = False
+    progress_callback: Optional[ProgressCallback] = None
+    completion_callback: Optional[Callable[[Any | None, Optional[Exception]], None]] = None
+
+
+class AstapTaskManager:
+    """Queue multiple ASTAP solves and run them sequentially on background threads."""
+
+    def __init__(self) -> None:
+        self._pending: Deque[AstapTask] = deque()
+        self._lock = threading.Lock()
+        self._worker_thread: Optional[threading.Thread] = None
+        self._current_proc: Optional[subprocess.Popen] = None
+        self._shutdown = False
+
+    def submit(self, task: AstapTask) -> None:
+        with self._lock:
+            self._pending.append(task)
+            worker_alive = self._worker_thread is not None and self._worker_thread.is_alive()
+        if not worker_alive:
+            self._start_next()
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._pending.clear()
+            proc = self._current_proc
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    def shutdown(self) -> None:
+        with self._lock:
+            self._shutdown = True
+            self._pending.clear()
+            worker = self._worker_thread
+            proc = self._current_proc
+        if proc is not None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        if worker is not None:
+            worker.join(timeout=0.5)
+
+    def _start_next(self) -> None:
+        with self._lock:
+            if self._shutdown or self._worker_thread is not None and self._worker_thread.is_alive():
+                return
+            if not self._pending:
+                return
+            task = self._pending.popleft()
+            thread = threading.Thread(target=self._run_task, args=(task,), daemon=True)
+            self._worker_thread = thread
+        thread.start()
+
+    def _run_task(self, task: AstapTask) -> None:
+        result: Any | None = None
+        error: Optional[Exception] = None
+
+        def _capture_proc(proc: subprocess.Popen) -> None:
+            with self._lock:
+                self._current_proc = proc
+
+        try:
+            result = solve_with_astap(
+                task.image_fits_path,
+                task.original_header,
+                task.astap_executable_path,
+                task.astap_data_directory,
+                search_radius_deg=task.search_radius_deg,
+                downsample_factor=task.downsample_factor,
+                sensitivity=task.sensitivity,
+                timeout_sec=task.timeout_sec,
+                update_original_header_in_place=task.update_header_in_place,
+                progress_callback=task.progress_callback,
+                proc_hook=_capture_proc,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            error = exc
+        finally:
+            with self._lock:
+                self._current_proc = None
+                self._worker_thread = None
+            callback = task.completion_callback
+            if callback is not None:
+                try:
+                    callback(result, error)
+                except Exception:
+                    logger.exception("AstapTask completion callback raised an exception")
+            if not self._shutdown:
+                self._start_next()
+
+
+_ASTAP_TASK_MANAGER = AstapTaskManager()
+
+
+def submit_astap_task(task: AstapTask) -> None:
+    """Schedule an ASTAP solve to run as soon as the previous task completes."""
+
+    _ASTAP_TASK_MANAGER.submit(task)
+
+
+def cancel_astap_tasks() -> None:
+    """Cancel any pending ASTAP solves and kill the running process."""
+
+    _ASTAP_TASK_MANAGER.cancel()
+
+
+def shutdown_astap_task_manager() -> None:
+    """Stop the ASTAP task manager and ensure no background threads remain."""
+
+    _ASTAP_TASK_MANAGER.shutdown()
 
 
 def solve_with_astrometry_net(

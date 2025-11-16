@@ -1,109 +1,101 @@
-FOLLOW-UP TASKS — ZeMosaic Qt GUI Sprint
 
-This file lists the active tasks for Codex.
-Codex must process tasks in order, checking each [x] as tasks are completed.
+---
 
-✅ CURRENT SPRINT : Qt GUI REFINEMENT (Nov 2025)
-🟦 1 — Refactor Main tab layout (PySide6)
+## `followup.md`
 
-Adapt _populate_main_tab inside zemosaic_gui_qt.py:
+```markdown
+# FOLLOW-UP LOG — ZEMOSAIC QT MAIN TAB (SPLITTER LAYOUT)
 
- Replace vertical stacking by a 2-column “brick” grid
+## Context
 
- Keep same groupboxes (_create_*) unchanged
+Goal of this micro-mission:  
+Replace the fixed grid layout of the **Main** tab in `zemosaic_gui_qt.py` with a QSplitter-based layout so that:
 
- Use QGridLayout inside the "Main" tab only
+- The **left and right columns** can be resized horizontally.
+- Inside each column, the **two main groupboxes** can be resized vertically.
+- The overall look stays close to the Tk version but less “empty” on the left side.
 
- Ensure scroll + logging block placement remain unchanged
+Files touched:  
+- ✅ `zemosaic_gui_qt.py` (ONLY)  
+Files explicitly **not** touched:  
+- ❌ `zemosaic_gui.py`, `zemosaic_filter_gui.py`  
+- ❌ `zemosaic_filter_gui_qt.py`  
+- ❌ any worker / processing / config / localization modules.
 
- No edits to other tabs
 
- No edits to the worker logic
+## Checklist for the agent
 
-🟦 2 — Sky Preview parity in Qt filter GUI
+### 1. Imports
 
-In zemosaic_filter_gui_qt.py:
+- [x] Add `QSplitter` and `QSizePolicy` to the `from PySide6.QtWidgets import ...` block.
+- [x] Keep all existing imports intact.
 
- Add missing red dotted boxes like Tk version
+### 2. Main tab layout
 
- Place sky preview to the left like Tk
+- [x] Replace the existing `QGridLayout`-based `_populate_main_tab` implementation with:
+  - a horizontal `QSplitter` (`columns_splitter`),
+  - two vertical `QSplitter`s (`left_splitter`, `right_splitter`),
+  - left splitter contains: folders group, mosaic group,
+  - right splitter contains: instrument group, final assembly group.
+- [x] Set sensible `setStretchFactor` values for:
+  - left vs right columns,
+  - top vs bottom groups inside each column.
+- [x] Keep the `layout.addWidget(...); layout.addStretch(1)` structure so that the scroll area still wraps the tab.
 
- Restore WCS infos (Prepared group, group boundaries)
+### 3. Mosaic group compactness
 
- Fix Auto-organize master tiles
+- [x] In `_create_mosaic_group`, after constructing the `QGroupBox`, set:
 
- Ensure clicking “Auto organizer” logs steps exactly like Tk
+  ```python
+  group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+  ```
 
- Run tests with real Seestar batches
+* [x] Ensure no other behaviour or bindings in this method are changed.
 
-🟦 3 — ASTAP crash handler (no GUI freeze)
+### 4. Manual tests to perform
 
-In zemosaic_astrometry.py:
+Using a small sample of Seestar lights (or any existing test set):
 
- Ensure ASTAP watcher never freezes Qt
+1. **Layout sanity check**
 
- Confirm background thread shuts down after each run
+   * [ ] Launch `python run_zemosaic.py --qt-gui`.
+   * [ ] Confirm the Main tab shows two columns with four groups:
 
- Improve robustness with multiple simultaneous calls
+     * Left: Folders (top), Mosaic / clustering (bottom).
+     * Right: Instrument (top), Final assembly (bottom).
+   * [ ] Confirm that:
 
- Keep dialogs auto-dismissed unless KEEP_DIALOGS=1
+     * the central vertical splitter can be dragged,
+     * the horizontal splitters in each column can be dragged.
 
- Zero impact on Tk
+2. **Scrolling**
 
-🟦 4 — Alpha mask propagation (Phase 6)
+   * [ ] Resize the window to a smaller height/width and confirm:
 
-In zemosaic_worker.py Phase 6 and PNG preview:
+     * scrollbars appear when expected,
+     * all controls remain reachable.
 
- FITS final mosaic must contain ALPHA ext with 0–255
+3. **Functional regression check**
 
- PNG must actually apply alpha (RGBA)
+   * [ ] Configure a quick mosaic run (same settings as before).
+   * [ ] Run the processing; verify:
 
- Downscaling must preserve alpha (nearest)
+     * logs and console outputs are still produced,
+     * no new warnings/exceptions related to the GUI,
+     * results (mosaic output) are identical or within normal numerical noise.
 
- NaN areas must become transparent
+4. **Tkinter fallback**
 
- No slicing errors
+   * [ ] Launch plain `python run_zemosaic.py` (no `--qt-gui`).
+   * [ ] Confirm the legacy Tkinter GUI still appears and behaves exactly as previously.
 
-🟦 5 — Lecropper autonomous upgrade
+> Manual Qt & Tk GUI checks are pending because this environment cannot launch a display.
 
-In lecropper.py only:
+## Notes / Future ideas (NOT PART OF THIS TASK)
 
- Integrate coverage, min_coverage_abs/frac
+* Potential future mission: add **drag-and-drop reordering** of groupboxes inside each column (e.g., move Mosaic above Folders). This would require a dedicated design (custom container or list-like widget).
+* Potential future mission: expose per-column layout presets (e.g., “balanced”, “left focus”, “right focus”) in the Skin tab.
 
- Add morphological cleanup
+For now, only splitter-based resize is required.
 
- Add feather mask
-
- Write ALPHA channel
-
- The script must remain fully standalone
-
-🟦 6 — Super-tiles normalization
-
-In Phase 4.5:
-
- Ensure super-tiles are photometrically normalized
-
- Normalize also against master tiles
-
- Reduce visible seams
-
- Preserve WCS and metadata
-
-🟦 7 — Mode ZeSupaDupStack
-
-In Qt Filter GUI:
-
- Add toggle (checkbox)
-
- If enabled → mosaic-first strategy overrides default
-
- All quality filters & LeCropper pass remain functional
-
- Zero regression when disabled
-
-📁 DONE / ARCHIVED TASKS
-
-(vider quand sprint suivant commence)
-
- (vide pour l’instant)
+```

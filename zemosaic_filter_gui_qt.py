@@ -49,6 +49,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections import Counter
+import base64
 import datetime
 import logging
 import importlib.util
@@ -71,7 +72,16 @@ if _pyside_spec is None:  # pragma: no cover - import guard
         "Install PySide6 or use the Tk interface instead."
     )
 
-from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot, QTimer, QRect
+from PySide6.QtCore import (
+    QObject,
+    Qt,
+    QThread,
+    Signal,
+    Slot,
+    QTimer,
+    QRect,
+    QByteArray,
+)
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (  # noqa: E402  - imported after availability check
     QApplication,
@@ -95,6 +105,7 @@ from PySide6.QtWidgets import (  # noqa: E402  - imported after availability che
     QPlainTextEdit,
     QCheckBox,
     QFileDialog,
+    QAbstractItemView,
     QTabWidget,
 )
 
@@ -139,12 +150,16 @@ except Exception:  # pragma: no cover - optional dependency guard
 
 try:  # pragma: no cover - optional dependency guard
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+    from matplotlib.collections import LineCollection
     from matplotlib.figure import Figure
+    from matplotlib.colors import to_rgba
     from matplotlib.patches import Rectangle
 except Exception:  # pragma: no cover - matplotlib optional
     FigureCanvasQTAgg = None  # type: ignore[assignment]
+    LineCollection = None  # type: ignore[assignment]
     Figure = None  # type: ignore[assignment]
     Rectangle = None  # type: ignore[assignment]
+    to_rgba = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - optional dependency guard
     from zemosaic_astrometry import solve_with_astap, set_astap_max_concurrent_instances
@@ -350,8 +365,12 @@ def _sanitize_angle_value(value: Any, default: float) -> float:
 
 try:  # pragma: no cover - optional dependency guard
     from zemosaic_config import DEFAULT_CONFIG as _DEFAULT_GUI_CONFIG  # type: ignore
+    from zemosaic_config import load_config as _load_gui_config  # type: ignore
+    from zemosaic_config import save_config as _save_gui_config  # type: ignore
 except Exception:  # pragma: no cover - optional dependency guard
     _DEFAULT_GUI_CONFIG = {}
+    _load_gui_config = None  # type: ignore[assignment]
+    _save_gui_config = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - optional dependency guard
     from zemosaic_utils import (  # type: ignore
@@ -375,6 +394,8 @@ except Exception:  # pragma: no cover - optional dependency guard
 
 logger = logging.getLogger(__name__)
 
+QT_FILTER_WINDOW_GEOMETRY_KEY = "qt_filter_window_geometry"
+
 _DEFAULT_GUI_CONFIG_MAP: dict[str, Any] = {}
 if isinstance(_DEFAULT_GUI_CONFIG, dict):
     try:
@@ -388,6 +409,7 @@ DEFAULT_FILTER_CONFIG.setdefault("force_seestar_mode", False)
 DEFAULT_FILTER_CONFIG.setdefault("sds_mode_default", False)
 DEFAULT_FILTER_CONFIG.setdefault("global_coadd_method", "kappa_sigma")
 DEFAULT_FILTER_CONFIG.setdefault("global_coadd_k", 2.0)
+DEFAULT_FILTER_CONFIG.setdefault(QT_FILTER_WINDOW_GEOMETRY_KEY, None)
 
 
 class _FallbackLocalizer:
@@ -1473,6 +1495,7 @@ class FilterQtDialog(QDialog):
         self._auto_angle_enabled = True
         self._angle_split_value = float(base_angle)
         self._group_outline_bounds: list[tuple[float, float, float, float]] = []
+        self._group_outline_collection: LineCollection | None = None
         self._preview_color_cycle: tuple[str, ...] = (
             "#3f7ad6",
             "#d64b3f",
@@ -1740,6 +1763,9 @@ class FilterQtDialog(QDialog):
         # Summary label mirroring Tk's "Prepared N group(s), sizes: …"
         self._auto_group_summary_label = QLabel("", box)
         self._auto_group_summary_label.setWordWrap(True)
+        initial_summary = self._format_group_summary(0, "[]")
+        self._auto_group_summary_label.setText(initial_summary)
+        self._auto_group_summary_label.setToolTip(initial_summary)
         layout.addWidget(self._auto_group_summary_label, 0, 2, 7, 1)
         layout.setColumnStretch(2, 1)
 
@@ -2002,6 +2028,8 @@ class FilterQtDialog(QDialog):
 
     def _handle_auto_group_empty_selection(self) -> None:
         self._auto_group_running = False
+        self._group_outline_bounds = []
+        self._schedule_preview_refresh()
         summary_text = self._format_group_summary(0, "[]")
         self._append_log(summary_text)
         self._update_auto_group_summary_display(summary_text, summary_text)
@@ -3486,6 +3514,8 @@ class FilterQtDialog(QDialog):
         controls_layout.setContentsMargins(0, 0, 0, 0)
         controls_layout.setSpacing(8)
         content_splitter.addWidget(controls_container)
+        content_splitter.setStretchFactor(0, 3)
+        content_splitter.setStretchFactor(1, 2)
 
         toolbar_widget = self._create_toolbar_widget()
         controls_layout.addWidget(toolbar_widget)
@@ -3525,6 +3555,9 @@ class FilterQtDialog(QDialog):
         self._table.verticalHeader().setVisible(False)
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._table.setDragDropMode(QAbstractItemView.NoDragDrop)
+        self._table.setDragEnabled(False)
+        self._table.setAcceptDrops(False)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.itemChanged.connect(self._handle_item_changed)
 
@@ -3584,8 +3617,64 @@ class FilterQtDialog(QDialog):
         controls_layout.addWidget(button_box)
         self._dialog_button_box = button_box
 
-        content_splitter.setStretchFactor(0, 3)
-        content_splitter.setStretchFactor(1, 2)
+        self._apply_saved_window_geometry()
+
+    def _load_saved_window_geometry(self) -> tuple[int, int, int, int] | None:
+        if _load_gui_config is None:
+            return None
+        try:
+            config = _load_gui_config()
+        except Exception:
+            return None
+        return self._normalize_geometry_value(config.get(QT_FILTER_WINDOW_GEOMETRY_KEY))
+
+    def _capture_current_window_geometry(self) -> tuple[int, int, int, int] | None:
+        rect = self.normalGeometry() if self.isMaximized() else self.geometry()
+        return self._normalize_geometry_value(
+            (rect.x(), rect.y(), rect.width(), rect.height())
+        )
+
+    def _apply_saved_window_geometry(self) -> None:
+        geometry = self._load_saved_window_geometry()
+        if geometry is None:
+            return
+        x, y, width, height = geometry
+        try:
+            self.setGeometry(x, y, width, height)
+        except Exception:
+            pass
+
+    def _persist_window_geometry(self) -> None:
+        if _save_gui_config is None:
+            return
+        geometry = self._capture_current_window_geometry()
+        if geometry is None:
+            return
+        try:
+            config = _load_gui_config() if _load_gui_config else {}
+        except Exception:
+            config = {}
+        config[QT_FILTER_WINDOW_GEOMETRY_KEY] = list(geometry)
+        try:
+            _save_gui_config(config)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _normalize_geometry_value(value: Any) -> tuple[int, int, int, int] | None:
+        if not isinstance(value, (list, tuple)):
+            return None
+        if len(value) < 4:
+            return None
+        try:
+            coords = [int(float(entry)) for entry in value[:4]]
+        except Exception:
+            return None
+        width = max(1, coords[2])
+        height = max(1, coords[3])
+        if width <= 0 or height <= 0:
+            return None
+        return coords[0], coords[1], width, height
 
     def _prepare_streaming_mode(self, payload: Any, initial_overrides: Any) -> None:
         """Enable incremental ingestion when the dialog is opened in stream mode."""
@@ -4364,23 +4453,56 @@ class FilterQtDialog(QDialog):
                 ys.append(ys[0])
                 axes.plot(xs, ys, color=color, linewidth=0.9, alpha=0.8)
 
-        if Rectangle is not None and self._group_outline_bounds:
+        outline_segments: list[list[tuple[float, float]]] = []
+        if self._group_outline_bounds:
             for ra_min, ra_max, dec_min, dec_max in self._group_outline_bounds:
-                width = max(0.0, ra_max - ra_min)
-                height = max(0.0, dec_max - dec_min)
+                width = float(ra_max) - float(ra_min)
+                height = float(dec_max) - float(dec_min)
                 if width <= 0 or height <= 0:
                     continue
-                rect = Rectangle(
-                    (ra_min, dec_min),
-                    width,
-                    height,
-                    linewidth=1.2,
-                    linestyle="--",
-                    edgecolor="#d64b3f",
-                    facecolor="none",
-                    alpha=0.9,
+                outline_segments.append(
+                    [
+                        (float(ra_min), float(dec_min)),
+                        (float(ra_max), float(dec_min)),
+                        (float(ra_max), float(dec_max)),
+                        (float(ra_min), float(dec_max)),
+                        (float(ra_min), float(dec_min)),
+                    ]
                 )
-                axes.add_patch(rect)
+        if outline_segments and LineCollection is not None:
+            outline_color = (
+                to_rgba("red", 0.9)
+                if to_rgba is not None
+                else "#d64b3f"
+            )
+            if self._group_outline_collection is None:
+                coll = LineCollection(
+                    outline_segments,
+                    colors=[outline_color],
+                    linewidths=1.6,
+                    linestyles="--",
+                    alpha=0.9,
+                    zorder=5,
+                )
+                axes.add_collection(coll)
+                self._group_outline_collection = coll
+            else:
+                try:
+                    self._group_outline_collection.set_segments(outline_segments)
+                except Exception:
+                    pass
+            if self._group_outline_collection is not None:
+                try:
+                    self._group_outline_collection.set_color([outline_color])
+                except Exception:
+                    pass
+        else:
+            if self._group_outline_collection is not None:
+                try:
+                    self._group_outline_collection.remove()
+                except Exception:
+                    pass
+                self._group_outline_collection = None
 
         if legend_needed and len(grouped_points) > 1:
             axes.legend(loc="upper right", fontsize="small")
@@ -4433,6 +4555,7 @@ class FilterQtDialog(QDialog):
     # QDialog API
     # ------------------------------------------------------------------
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._persist_window_geometry()
         self._stop_stream_worker()
         if self._scan_worker is not None:
             self._scan_worker.request_stop()

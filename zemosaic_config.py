@@ -73,6 +73,8 @@ DEFAULT_CONFIG = {
     "preferred_gui_backend": "tk",  # "tk" or "qt"
     "preferred_gui_backend_explicit": False,
     "qt_theme_mode": "system",
+    "qt_main_window_geometry": None,
+    "qt_filter_window_geometry": None,
     "input_dir": "",
     "output_dir": "",
     "num_processing_workers": -1,  # -1 pour auto
