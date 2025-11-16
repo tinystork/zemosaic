@@ -118,7 +118,7 @@
     "qt_field_sds_mode": "Schakel de SDS-modus standaard in",
     "qt_field_sds_threshold": "SDS-dekkingsdrempel",
     "qt_field_astap_max_instances": "Max. ASTAP-instanties",
-    "qt_window_title_preview": "ZeMosaic (Qt-voorbeeld)",
+    "qt_window_title_preview": "ZeMosaic V4.1.0 – Superacervandi (Qt-voorbeeld)",
     "qt_worker_generic_update": "Update van de werknemer",
     "qt_worker_error_generic": "Fout van de werknemer",
     "qt_log_save_config_error": "Kan configuratie niet opslaan: {error}",

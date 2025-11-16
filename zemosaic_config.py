@@ -75,6 +75,8 @@ DEFAULT_CONFIG = {
     "qt_theme_mode": "system",
     "qt_main_window_geometry": None,
     "qt_filter_window_geometry": None,
+    "qt_main_columns_state": None,
+    "qt_main_left_state": None,
     "input_dir": "",
     "output_dir": "",
     "num_processing_workers": -1,  # -1 pour auto
