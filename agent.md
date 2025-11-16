@@ -199,6 +199,58 @@ Objectives:
       is incomplete.
   - Make sure the dialog remains responsive during stream scan and analysis.
 
+### FOCUS 3 — Auto-organize Master tiles / coverage-first parity (Tk vs Qt)
+
+Work files:
+
+- Primary: `zemosaic_filter_gui_qt.py` (class `FilterQtDialog`)
+- Reference: `zemosaic_filter_gui.py` (Tk filter, `_auto_organize_master_tiles` and friends)
+- Diagnostics: `zemosaic_worker.py` (consumer of `filter_overrides`), `zemosaic_gui_qt.py` (how overrides are forwarded)
+
+Objectives (align with Task S in `followup.md`):
+
+- **Visual parity for Auto-organize Master Tiles**
+  - When the user clicks **Auto-organize Master Tiles** in the Qt filter:
+    - the Sky Preview / Coverage Map must show the same red dashed master rectangles
+      as in the Tk filter (outer mosaic box + per-group boxes),
+    - group colours and footprints must match Tk as closely as Matplotlib allows.
+  - Reuse the Tk helpers (`cluster_seestar_stacks_connected`, `_auto_split_groups`,
+    `_merge_small_groups`, `_draw_group_outlines`, etc.) instead of re-implementing logic.
+
+- **Summary & logs parity**
+  - After grouping finishes, update the Qt summary label with the localized
+    `filter_log_groups_summary` string, *exactly like Tk*:
+    - full sizes list in the log,
+    - histogram/compact sizes string in the label.
+  - Emit the same coverage-first log messages (`log_covfirst_start`, `log_covfirst_relax`,
+    `log_covfirst_autosplit`, `log_covfirst_merge`, `log_covfirst_done`) and SDS messages
+    (“ZeSupaDupStack: prepared N coverage batch(es) for preview.”) using the same
+    `msg_key` + `kwargs` so localization stays in sync with Tk.
+
+- **Override payload parity & freeze fix**
+  - Ensure that `launch_filter_interface_qt(...)` returns the same override structure as
+    Tk’s `launch_filter_interface(...)` for the same dataset, especially:
+    - `preplan_master_groups`
+    - SDS / coverage-first flags and thresholds
+    - any `global_wcs_*` keys and `global_wcs_plan_override`
+  - Investigate and fix the **Qt main window freeze** observed after using the filter:
+    - Do not run heavy clustering / coverage code directly in the GUI thread;
+      use worker threads / queued callbacks like Tk.
+    - Compare `zemosaic_worker.log` and the console between Tk and Qt runs and align
+      the payloads until the worker behaves identically.
+
+- **Testing requirements**
+  - Always test changes by running **both**:
+    - Tk main GUI + Tk filter (reference behaviour),
+    - Qt main GUI + Qt filter (PySide6),
+    on the same Seestar test data.
+  - Only consider the task done when:
+    - previews, logs, and summary texts match,
+    - and launching a full run from the Qt main GUI no longer freezes.
+
+> Important: Do **not** touch the astrophotography algorithms (`zemosaic_worker.py`,
+> `lecropper.py`, etc.) beyond reading how they consume `filter_overrides`.  
+> All fixes must be in the Qt/Tk glue and in `zemosaic_filter_gui_qt.py`.
 
 ## HARD CONSTRAINTS
 

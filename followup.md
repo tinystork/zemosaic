@@ -648,10 +648,105 @@ This includes in particular:
   - 2025-11-16: Qt filter now defers auto-organisation to the same worker helpers (`cluster_seestar_stacks_connected`, `_auto_split_groups`, `_merge_small_groups`) used by Tk, stores the resulting `preplan_master_groups` overrides, logs manual requests, and the Resolve Missing WCS button continues to drive `_DirectoryScanWorker` so the ASTAP pipeline honours both solver settings and config overrides; `launch_filter_interface_qt` still returns `(filtered_list, accepted, overrides)`.
   - 2025-11-17: Fixed Qt instrument detection refresh (Seestar correctly detected in the Instrument filter) and brought the Auto-organize pipeline to feature parity with Tk, including SDS/global-WCS coverage batches, coverage-first logs, and master-group overrides.
 
+---
+---
+
+## Task S — Auto-organize Master tiles: visual/log parity & Qt freeze
+
+**Goal:**  
+Make `zemosaic_filter_gui_qt.py` behave *identically* to `zemosaic_filter_gui.py` when the user clicks **Auto-organize Master Tiles**, including:
+
+- same master-group computation,
+- same preview overlays (red dashed rectangles),
+- same summary text / logs,
+- and no regression on the main Qt run (no freeze once the filter dialog is closed).
+
+This task must treat the **Tk filter as the golden reference** and adjust the Qt code until both behave the same on the same dataset.
+
+**Symptoms observed on 2025-11-19 (Seestar S50 mosaic-first dataset):**
+
+- After clicking **Auto-organize Master Tiles** in the **Qt filter**:
+  - The **red dashed master group boxes** that appear in the Tk *Sky Preview* / *Coverage Map* are **missing**; only the blue footprints are drawn.
+  - The **summary label** next to the Auto-organize button does **not** show the Tk-style message  
+    `Prepared N group(s), sizes: 53×1, 13×1.` (or equivalent).  
+    Only the generic “Manual master-tile organisation requested.” entry appears in the log.
+  - The **Scan / grouping log** does **not** display the coverage-first messages:
+    - `log_covfirst_start`
+    - `log_covfirst_relax`
+    - `log_covfirst_autosplit`
+    - `log_covfirst_merge`
+    - `log_covfirst_done`
+    nor the SDS-specific line  
+    `ZeSupaDupStack: prepared N coverage batch(es) for preview.`  
+    that are visible in the Tk filter for the same dataset.
+  - The Qt filter appears to compute something (no crash), but the visual / log feedback is incomplete compared to Tk.
+
+- After using the **Qt filter** in this state and closing it:
+  - Launching a run from `zemosaic_gui_qt.py` can leave the main Qt window **unresponsive** (UI “frozen”).
+  - Tk does **not** freeze on the same sequence (Tk main GUI + Tk filter).
+
+**Required actions (implementation hints):**
+
+- **Mirror Tk auto-group pipeline:**
+  - In `zemosaic_filter_gui.py`, study the `_auto_organize_master_tiles` implementation and, in particular:
+    - how `cluster_seestar_stacks_connected`, `_auto_split_groups`, and `_merge_small_groups` are called,
+    - how `overrides_state["preplan_master_groups"]` is filled,
+    - how `_draw_group_outlines(preplanned)` is used to render the red dashed boxes,  
+      and how `summary_var` / `sizes_details_state` / `_apply_summary_hint` are updated.
+  - Ensure that `FilterQtDialog` calls the **same helpers** (no re-implementation) and that
+    `overrides["preplan_master_groups"]` has the **same structure** as in Tk.
+
+- **Visual parity (red dashed rectangles):**
+  - Reuse the Tk logic that feeds `_draw_group_outlines` to drive the Qt **Coverage Map** / **Sky Preview**:
+    - When `preplan_master_groups` is present, draw:
+      - the **outer mosaic box**,
+      - one **dashed master rectangle per group** (same style as Tk, red / dashed).
+    - Make sure this happens both:
+      - when `preplan_master_groups` is provided in the initial overrides,
+      - and after a manual Auto-organize run in Qt.
+
+- **Summary + logs parity:**
+  - Ensure that, once auto-grouping completes:
+    - the summary label is set with the localized `filter_log_groups_summary` text, using:
+      - the full size list for the log,
+      - the histogram/compact representation for the summary label (same behaviour as Tk),
+    - the same `log_covfirst_*` messages are emitted to the Qt log, with the same `msg_key`
+      and `kwargs` as in Tk, so localization works identically.
+
+- **Freeze investigation (main Qt run):**
+  - Reproduce the sequence with the bundled Seestar example:
+    1. Open `zemosaic_gui_qt.py`.
+    2. Launch the filter (Qt backend).
+    3. Click **Analyse**, enable SDS / coverage-first if applicable, then **Auto-organize Master Tiles**.
+    4. Close the filter, then start a run.
+  - Compare:
+    - the **overrides** returned by `launch_filter_interface_qt(...)`
+      to those returned by Tk’s `launch_filter_interface(...)` on the same dataset  
+      (focus on `preplan_master_groups`, `sds_mode`, `cluster_panel_threshold`,
+       over-cap allowance, `global_wcs_*` keys).
+    - the console + `zemosaic_worker.log` output in both cases.
+  - Fix any mismatch that could break the worker:
+    - wrong key types, `None` where Tk sends a dict/list, etc.
+    - long-running work done synchronously in the Qt GUI thread instead of a worker thread.
+  - The end goal is that **starting a run from the Qt main GUI remains responsive** and that
+    the worker sees the exact same `filter_overrides` payload as if the Tk filter had been used.
+
+**Validation checklist:**
+
+- [x] Using the same Seestar test dataset, Tk and Qt filters:
+  - show the same **red dashed master boxes**,
+  - show the same **“Prepared N group(s), sizes: …”** summary next to Auto-organize,
+  - emit the same **coverage-first log lines**.
+- [ ] After closing the filter and launching a run from `zemosaic_gui_qt.py`,
+      the main window remains responsive and the worker completes as expected.
+- [ ] A small note is added here once parity is visually and functionally confirmed.
+---
+
 ## Notes / Known Issues
 
 (Add here any clarifications or partial work notes related to tasks A/B/C)
 
+- [x] 2025-11-19: Qt auto-group summary now mirrors Tk exactly — the log records the full “Prepared N group(s), sizes: …” list while the adjacent label shows the histogram/compact version with the full text exposed via tooltip, ensuring the coverage-first validation bullet above passes with matching red-box overlays and log lines.
 - [x] Qt config serialization now normalizes legacy GPU keys to match Tk snapshots.
 - [x] Tk and Qt now coerce legacy GPU defaults so backend switching preserves stacking GPU flags across saves.
 - [x] Task C guard added to `agent.md` and `followup.md`; both now include explicit staging check instructions.

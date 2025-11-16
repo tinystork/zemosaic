@@ -2177,20 +2177,32 @@ class FilterQtDialog(QDialog):
                 )
             )
 
-        # Summarise group sizes both in the log and next to the button,
-        # mirroring Tk's "Prepared {g} group(s), sizes: …" behaviour.
-        hist = _format_sizes_histogram(sizes) if sizes else "[]"
+        # Summarise group sizes both in the log (full list) and next to the
+        # button (compact histogram) exactly like the Tk dialog.
+        hist_text = _format_sizes_histogram(sizes) if sizes else "[]"
+        if sizes:
+            full_sizes_text = ", ".join(str(val) for val in sizes)
+        else:
+            full_sizes_text = "[]"
         summary_template = self._localizer.get(
             "filter_log_groups_summary",
             "Prepared {g} group(s), sizes: {sizes}.",
         )
         try:
-            summary_text = summary_template.format(g=len(groups), sizes=hist)
+            log_summary = summary_template.format(g=len(groups), sizes=full_sizes_text)
         except Exception:
-            summary_text = f"Prepared {len(groups)} group(s), sizes: {hist}."
-        self._append_log(summary_text)
+            log_summary = f"Prepared {len(groups)} group(s), sizes: {full_sizes_text}."
+        self._append_log(log_summary)
+
+        try:
+            label_summary = summary_template.format(g=len(groups), sizes=hist_text)
+        except Exception:
+            label_summary = f"Prepared {len(groups)} group(s), sizes: {hist_text}."
         if self._auto_group_summary_label is not None:
-            self._auto_group_summary_label.setText(summary_text)
+            self._auto_group_summary_label.setText(label_summary)
+            # Surface the detailed string via tooltip so the Qt UI mirrors
+            # the Tk "Details" popup semantics without an extra button.
+            self._auto_group_summary_label.setToolTip(log_summary)
 
         self._group_outline_bounds = self._compute_group_outline_bounds(groups)
         if self._coverage_axes is not None and self._coverage_canvas is not None:
