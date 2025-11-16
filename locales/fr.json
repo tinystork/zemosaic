@@ -804,6 +804,7 @@
     "qt_group_skin_theme": "Thème",
     "qt_group_backend_title": "Interface graphique préférée",
     "qt_field_preferred_backend": "Interface préférée",
+    "backend_selector_label": "Interface préférée",
     "backend_option_tk": "Interface Tk classique (stable)",
     "backend_option_qt": "Interface Qt (aperçu)",
     "backend_change_notice": "Le changement de backend prendra effet au prochain lancement de ZeMosaic.",

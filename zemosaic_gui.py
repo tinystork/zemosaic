@@ -819,6 +819,50 @@ class ZeMosaicGUI:
             # Le widget a pu être détruit avant que .set() ne soit appelé
             pass
 
+    def _backend_option_entries(self) -> list[tuple[str, str]]:
+        return [
+            ("tk", self._tr("backend_option_tk", "Classic Tk GUI (stable)")),
+            ("qt", self._tr("backend_option_qt", "Qt GUI (preview)")),
+        ]
+
+    def _refresh_backend_combobox(self) -> None:
+        if not getattr(self, "backend_combo", None):
+            return
+        if not hasattr(self.backend_combo, "winfo_exists") or not self.backend_combo.winfo_exists():
+            return
+        entries = self._backend_option_entries()
+        labels = [label for _code, label in entries]
+        try:
+            self.backend_combo["values"] = labels
+        except tk.TclError:
+            return
+        current_code = str(self.config.get("preferred_gui_backend", "tk")).strip().lower()
+        if current_code not in {"tk", "qt"}:
+            current_code = "tk"
+        mapping = {code: label for code, label in entries}
+        display = mapping.get(current_code, labels[0] if labels else "")
+        self.backend_display_var.set(display)
+        self.config.setdefault("preferred_gui_backend", current_code)
+
+    def _on_backend_combo_selected(self, event=None) -> None:
+        if not getattr(self, "backend_combo", None):
+            return
+        selection = self.backend_display_var.get()
+        if not selection:
+            return
+        entries = self._backend_option_entries()
+        mapping = {label: code for code, label in entries}
+        selected_code = mapping.get(selection)
+        if not selected_code:
+            return
+        current_code = str(self.config.get("preferred_gui_backend", "tk")).strip().lower()
+        if current_code == selected_code:
+            return
+        self.config["preferred_gui_backend"] = selected_code
+        self.config["preferred_gui_backend_explicit"] = True
+        if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
+            zemosaic_config.save_config(self.config)
+
     def _combo_to_key(self, event, combo: ttk.Combobox, tk_var: tk.StringVar, keys: list[str], tr_prefix: str):
         """
         Callback pour mettre à jour le tk_var avec la clé correspondante
@@ -929,9 +973,43 @@ class ZeMosaicGUI:
             except Exception: available_langs = ['en', 'fr']
         else: available_langs = ['en', 'fr']
 
-        self.language_combo = ttk.Combobox(lang_select_frame, textvariable=self.current_language_var, 
-                                           values=available_langs, state="readonly", width=5)
+        self.language_combo = ttk.Combobox(
+            lang_select_frame,
+            textvariable=self.current_language_var,
+            values=available_langs,
+            state="readonly",
+            width=5,
+        )
         self.language_combo.pack(side=tk.LEFT)
+
+        backend_frame = ttk.Frame(lang_select_frame)
+        backend_frame.pack(side=tk.RIGHT, padx=(5, 0))
+
+        backend_label = ttk.Label(backend_frame, text="")
+        backend_label.pack(side=tk.LEFT, padx=(0, 5))
+        self.translatable_widgets["backend_selector_label"] = backend_label
+
+        self.backend_display_var = tk.StringVar(master=self.root)
+        backend_combo = ttk.Combobox(
+            backend_frame,
+            textvariable=self.backend_display_var,
+            state="readonly",
+            width=25,
+        )
+        backend_combo.pack(side=tk.LEFT)
+        backend_combo.bind("<<ComboboxSelected>>", self._on_backend_combo_selected)
+        self.backend_combo = backend_combo
+
+        backend_notice_label = ttk.Label(
+            lang_select_frame,
+            text="",
+            wraplength=500,
+            justify=tk.RIGHT,
+        )
+        backend_notice_label.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=(2, 0))
+        self.translatable_widgets["backend_change_notice"] = backend_notice_label
+
+        self._refresh_backend_combobox()
 
         # --- Folder Selection Frame ---
         folders_frame = ttk.LabelFrame(self.scrollable_content_frame, text="", padding="10")
@@ -2137,6 +2215,7 @@ class ZeMosaicGUI:
         # --- RAFRAICHISSEMENT DU NOUVEAU COMBOBOX D'ASSEMBLAGE ---
         if hasattr(self, 'final_assembly_method_combo'):
             self._refresh_combobox(self.final_assembly_method_combo, self.final_assembly_method_var, self.assembly_method_keys, "assembly_method")
+        self._refresh_backend_combobox()
         # ---  ---
         # Mise à jour des textes ETA et Temps Écoulé (déjà correct)
         if not self.is_processing:

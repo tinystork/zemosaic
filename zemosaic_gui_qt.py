@@ -2532,6 +2532,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         if backend == current:
             return
         self.config["preferred_gui_backend"] = backend
+        self.config["preferred_gui_backend_explicit"] = True
         self._save_config()
 
     def _on_language_combo_changed(self, index: int) -> None:

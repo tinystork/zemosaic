@@ -818,6 +818,7 @@
     "qt_group_skin_theme": "Theme",
     "qt_group_backend_title": "Preferred GUI backend",
     "qt_field_preferred_backend": "Preferred backend",
+    "backend_selector_label": "Preferred backend",
     "backend_option_tk": "Classic Tk GUI (stable)",
     "backend_option_qt": "Qt GUI (preview)",
     "backend_change_notice": "Backend change will take effect next time you launch ZeMosaic.",

@@ -186,7 +186,18 @@ def _load_preferred_backend_from_config():
         return None, False
     raw_value = data.get("preferred_gui_backend")
     normalized = _normalize_backend_value(raw_value)
-    return normalized, "preferred_gui_backend" in data
+    explicit_marker = data.get("preferred_gui_backend_explicit")
+    if isinstance(explicit_marker, bool):
+        explicit_flag = explicit_marker
+    elif isinstance(explicit_marker, str):
+        explicit_flag = explicit_marker.strip().lower() in {"1", "true", "yes", "on"}
+    elif isinstance(explicit_marker, (int, float)):
+        explicit_flag = explicit_marker != 0
+    else:
+        explicit_flag = False
+    if not explicit_flag and normalized == "qt":
+        explicit_flag = True
+    return normalized, explicit_flag
 
 
 def _notify_qt_backend_unavailable(error: Exception) -> None:

@@ -64,23 +64,24 @@ IS_MAC = SYSTEM_NAME == "darwin"
 
 DEFAULT_CONFIG = {
     "astap_executable_path": "",
-    "astap_data_directory_path": "", 
-    "astap_default_search_radius": 3.0, 
-    "astap_default_downsample": 2, 
+    "astap_data_directory_path": "",
+    "astap_default_search_radius": 3.0,
+    "astap_default_downsample": 2,
     "astap_default_sensitivity": 100,
     "astap_max_instances": 1,
     "language": "en",
     "preferred_gui_backend": "tk",  # "tk" or "qt"
+    "preferred_gui_backend_explicit": False,
     "qt_theme_mode": "system",
     "input_dir": "",
     "output_dir": "",
-    "num_processing_workers": -1, # -1 pour auto
+    "num_processing_workers": -1,  # -1 pour auto
     "stacking_normalize_method": "linear_fit",
     "stacking_weighting_method": "noise_variance",
-    "stacking_rejection_algorithm": "winsorized_sigma_clip", 
+    "stacking_rejection_algorithm": "winsorized_sigma_clip",
     "stacking_kappa_low": 3.0,
     "stacking_kappa_high": 3.0,
-    "stacking_winsor_limits": "0.05,0.05", # String, sera parsé
+    "stacking_winsor_limits": "0.05,0.05",  # String, sera parsé
     "stacking_final_combine_method": "mean",
     "poststack_equalize_rgb": True,
     "apply_radial_weight": False,
@@ -89,7 +90,7 @@ DEFAULT_CONFIG = {
     "use_gpu_phase5": True,
     "gpu_id_phase5": 0,
     "gpu_selector": "",
-    "final_assembly_method": "reproject_coadd", # Options: "reproject_coadd", "incremental",
+    "final_assembly_method": "reproject_coadd",  # Options: "reproject_coadd", "incremental",
     "auto_detect_seestar": True,
     "force_seestar_mode": False,
     "global_wcs_output_path": "global_mosaic_wcs.fits",
@@ -167,8 +168,8 @@ DEFAULT_CONFIG = {
     # Early GUI filter option (Phase 0 header-only scan)
     "enable_early_filter": True,
     # --- CLES POUR LE ROGNAGE DES MASTER TUILES ---
-    "apply_master_tile_crop": True,       # Désactivé par défaut
-    "master_tile_crop_percent": 3.0,     # Pourcentage par côté si activé (ex: 10%)
+    "apply_master_tile_crop": True,  # Désactivé par défaut
+    "master_tile_crop_percent": 3.0,  # Pourcentage par côté si activé (ex: 10%)
     "quality_crop_enabled": False,
     "quality_crop_band_px": 32,
     "quality_crop_k_sigma": 2.0,
@@ -182,15 +183,15 @@ DEFAULT_CONFIG = {
     "quality_gate_move_rejects": True,
     # --- Alt-Az cleanup (lecropper altZ) ---
     "altaz_cleanup_enabled": False,
-    "altaz_margin_percent": 5.0,   # UI: "AltAz margin %"
-    "altaz_decay": 0.15,           # UI: "AltAz decay"
-    "altaz_nanize": True,          # UI: "Alt-Az → NaN"
+    "altaz_margin_percent": 5.0,  # UI: "AltAz margin %"
+    "altaz_decay": 0.15,  # UI: "AltAz decay"
+    "altaz_nanize": True,  # UI: "Alt-Az → NaN"
     # --- Alt-Az Alpha export ---
     "altaz_export_alpha_fits": True,
     "altaz_export_alpha_sidecar": False,
     "altaz_alpha_sidecar_format": "png",
     # --- Qualité avancée ---
-    "quality_crop_min_run": 2,     # UI: "min run"
+    "quality_crop_min_run": 2,  # UI: "min run"
     "crop_follow_signal": True,
     # --- FIN CLES POUR LE ROGNAGE ---
 }
