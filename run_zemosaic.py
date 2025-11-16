@@ -134,7 +134,21 @@ def _is_pyside6_available() -> bool:
     Using importlib.util.find_spec avoids importing the whole Qt stack
     just to check for availability and keeps startup overhead minimal.
     """
-    return importlib.util.find_spec("PySide6") is not None
+    try:
+        spec = importlib.util.find_spec("PySide6")
+    except Exception:
+        spec = None
+    if spec is not None:
+        return True
+    # Some environments (particularly when Python is launched from a
+    # different venv or from a frozen EXE) may not populate the importlib
+    # cache correctly even though PySide6 is installed.  As a fallback we
+    # attempt a direct import and report success if it works.
+    try:  # pragma: no cover - optional dependency probe
+        import PySide6  # type: ignore  # noqa: F401  (only for availability check)
+    except Exception:
+        return False
+    return True
 
 
 def _notify_qt_backend_unavailable(error: Exception) -> None:

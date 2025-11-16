@@ -470,6 +470,90 @@ def _sanitize_footprint_radec(payload: Any) -> List[Tuple[float, float]] | None:
     return points or None
 
 
+_HEADER_CACHE_KEYS: tuple[str, ...] = (
+    "NAXIS1",
+    "NAXIS2",
+    "CRVAL1",
+    "CRVAL2",
+    "CRPIX1",
+    "CRPIX2",
+    "CTYPE1",
+    "CTYPE2",
+    "CDELT1",
+    "CDELT2",
+    "CD1_1",
+    "CD1_2",
+    "CD2_1",
+    "CD2_2",
+    "PC1_1",
+    "PC1_2",
+    "PC2_1",
+    "PC2_2",
+    "DATE-OBS",
+    "EXPTIME",
+    "FILTER",
+    "OBJECT",
+    "CREATOR",
+    "INSTRUME",
+)
+
+
+def _coerce_header_scalar(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if np is not None:
+        try:
+            if isinstance(value, np.generic):
+                return value.item()
+        except Exception:
+            pass
+    try:
+        return value.item()  # type: ignore[call-arg]
+    except Exception:
+        pass
+    try:
+        return float(value)
+    except Exception:
+        pass
+    try:
+        return str(value)
+    except Exception:
+        return None
+
+
+def _sanitize_header_subset(header_obj: Any) -> dict[str, Any] | None:
+    """Extract a lightweight header mapping similar to the Tk filter."""
+
+    if header_obj is None:
+        return None
+
+    def _lookup(key: str) -> Any:
+        if isinstance(header_obj, dict):
+            return header_obj.get(key)
+        try:
+            return header_obj[key]
+        except Exception:
+            try:
+                return header_obj.get(key)  # type: ignore[call-arg]
+            except Exception:
+                return None
+
+    subset: dict[str, Any] = {}
+    for key in _HEADER_CACHE_KEYS:
+        value = _coerce_header_scalar(_lookup(key))
+        if value is None:
+            continue
+        subset[key] = value
+    if "NAXIS1" in subset and "NAXIS2" in subset:
+        try:
+            subset["shape"] = (int(subset["NAXIS2"]), int(subset["NAXIS1"]))
+        except Exception:
+            pass
+    return subset or None
+
+
 def _format_sizes_histogram(sizes: list[int], max_buckets: int = 6) -> str:
     """Return a compact histogram string for group sizes (Tk parity)."""
 
@@ -619,6 +703,7 @@ def _iter_normalized_entries(
                 ra_deg = ra_deg if ra_deg is not None else ra_from_header
                 dec_deg = dec_deg if dec_deg is not None else dec_from_header
         header_cache = obj.get("header") or obj.get("header_subset")
+        header_cache = _sanitize_header_subset(header_cache)
         footprint = None
         for key in ("footprint_radec", "footprint", "corners"):
             if key in obj:
@@ -1030,13 +1115,14 @@ class _DirectoryScanWorker(QObject):
                     "filter.scan.astropy_missing",
                     "Astropy is not installed; cannot inspect headers.",
                 )
-            if header is not None:
+            sanitized_header = _sanitize_header_subset(header)
+            if sanitized_header is not None:
+                if base_payload is not None:
+                    base_payload["header"] = sanitized_header
                 try:
-                    item.header_cache = header
+                    item.header_cache = sanitized_header
                 except Exception:
                     pass
-                if base_payload is not None:
-                    base_payload["header"] = header
 
             has_wcs = _header_has_wcs(header) if header is not None else False
             instrument = _detect_instrument_from_header(header)
@@ -1082,8 +1168,6 @@ class _DirectoryScanWorker(QObject):
                             item.wcs_cache = wcs_result
                         except Exception:
                             pass
-                        if base_payload is not None:
-                            base_payload["wcs"] = wcs_result
                         if self._write_wcs_to_file and header is not None:
                             _persist_wcs_header_if_requested(path, header, True)
 
@@ -2436,8 +2520,9 @@ class FilterQtDialog(QDialog):
             header = fits.getheader(path, ignore_missing_end=True)
         except Exception:
             header = None
-        self._header_cache[norm] = header
-        return header
+        sanitized = _sanitize_header_subset(header)
+        self._header_cache[norm] = sanitized
+        return sanitized
 
     def _compute_group_outline_bounds(self, groups: list[list[dict[str, Any]]]) -> list[tuple[float, float, float, float]]:
         if not groups:
@@ -3298,18 +3383,14 @@ class FilterQtDialog(QDialog):
 
     def _load_header_for_entry(self, entry: _NormalizedItem) -> Any:
         if isinstance(entry.original, dict):
-            header_candidate = entry.original.get("header") or entry.original.get("fits_header")
+            header_candidate = entry.original.get("header") or entry.original.get("header_subset")
+            header_candidate = _sanitize_header_subset(header_candidate)
             if header_candidate:
                 return header_candidate
-        if fits is None:
-            return None
         path = entry.file_path
         if not path or not os.path.isfile(path):
             return None
-        try:
-            return fits.getheader(path, ignore_missing_end=True)
-        except Exception:
-            return None
+        return self._load_header(path)
 
     def _write_csv_file(self, path: str, rows: List[dict[str, Any]]) -> bool:
         fieldnames = [
@@ -3938,16 +4019,21 @@ class FilterQtDialog(QDialog):
     def _ensure_entry_coordinates(self, entry: _NormalizedItem) -> Tuple[float | None, float | None]:
         if entry.center_ra_deg is not None and entry.center_dec_deg is not None:
             return entry.center_ra_deg, entry.center_dec_deg
-        if fits is None:
+        header_subset = getattr(entry, "header_cache", None)
+        if header_subset is None:
+            path = entry.file_path
+            if not path or not os.path.isfile(path):
+                return None, None
+            header_subset = self._load_header(path)
+            if header_subset is not None:
+                try:
+                    entry.header_cache = header_subset
+                except Exception:
+                    pass
+        if header_subset is None:
             return None, None
-        path = entry.file_path
-        if not path or not os.path.isfile(path):
-            return None, None
-        try:
-            header = fits.getheader(path, ignore_missing_end=True)
-        except Exception:
-            return None, None
-        ra_deg, dec_deg = _extract_center_from_header(header)
+
+        ra_deg, dec_deg = _extract_center_from_header(header_subset)
         entry.center_ra_deg = ra_deg
         entry.center_dec_deg = dec_deg
         if isinstance(entry.original, dict):
@@ -3956,7 +4042,7 @@ class FilterQtDialog(QDialog):
                 entry.original["center_dec_deg"] = dec_deg
                 entry.original["RA"] = ra_deg
                 entry.original["DEC"] = dec_deg
-            entry.original["header"] = header
+            entry.original["header"] = header_subset
         return ra_deg, dec_deg
 
     def _ensure_entry_footprint(self, entry: _NormalizedItem) -> List[Tuple[float, float]] | None:
@@ -3964,14 +4050,20 @@ class FilterQtDialog(QDialog):
 
         if entry.footprint_radec:
             return entry.footprint_radec
-        if fits is None or WCS is None:
+        if WCS is None:
             return None
-        path = entry.file_path
-        if not path or not os.path.isfile(path):
-            return None
-        try:
-            header = fits.getheader(path, ignore_missing_end=True)
-        except Exception:
+        header = getattr(entry, "header_cache", None)
+        if header is None:
+            path = entry.file_path
+            if not path or not os.path.isfile(path):
+                return None
+            header = self._load_header(path)
+            if header is not None:
+                try:
+                    entry.header_cache = header
+                except Exception:
+                    pass
+        if header is None:
             return None
         try:
             wcs_obj = _build_wcs_from_header(header)
@@ -4377,6 +4469,7 @@ class FilterQtDialog(QDialog):
                 payload: dict[str, Any] = dict(original)
             except Exception:
                 payload = {key: original[key] for key in original.keys()}
+            payload.pop("wcs", None)
         else:
             payload = {}
             if isinstance(original, (str, os.PathLike)):
@@ -4412,9 +4505,6 @@ class FilterQtDialog(QDialog):
         )
         if include_header and header_obj is not None:
             payload["header"] = header_obj
-        wcs_obj = payload.get("wcs") or getattr(entry, "wcs_cache", None)
-        if include_header and wcs_obj is not None:
-            payload["wcs"] = wcs_obj
 
         # Surface RA/DEC + footprint metadata for downstream grouping parity.
         ra_deg, dec_deg = entry.center_ra_deg, entry.center_dec_deg

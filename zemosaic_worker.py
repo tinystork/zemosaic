@@ -11209,6 +11209,10 @@ def run_hierarchical_mosaic(
             filter_invoked = True
             filter_accepted = True
             streaming_filter_success = True
+            try:
+                filtered_items = list(header_items_for_filter)
+            except Exception:
+                filtered_items = header_items_for_filter
 
         solver_payload_for_filter = solver_settings if isinstance(solver_settings, dict) else None
         config_payload_for_filter = {

@@ -63,6 +63,7 @@ import subprocess
 import sys
 import multiprocessing
 import queue
+import threading
 import time
 from dataclasses import asdict
 from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Sequence, Tuple
@@ -70,6 +71,7 @@ from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Sequence
 try:
     from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
     from PySide6.QtGui import (
+        QAction,
         QBrush,
         QCloseEvent,
         QColor,
@@ -96,13 +98,15 @@ try:
         QLabel,
         QLineEdit,
         QMainWindow,
+        QMenu,
         QMessageBox,
         QPlainTextEdit,
         QProgressBar,
         QPushButton,
-        QSpinBox,
-        QVBoxLayout,
         QScrollArea,
+        QSpinBox,
+        QToolButton,
+        QVBoxLayout,
         QWidget,
     )
 except ImportError as exc:  # pragma: no cover - import guard
@@ -315,10 +319,22 @@ class ZeMosaicQtWorker(QObject):
         worker_args: Sequence[Any],
         worker_kwargs: Dict[str, Any],
     ) -> bool:
+        spawn_result = self.spawn_worker_process(worker_args, worker_kwargs)
+        if spawn_result is None:
+            return False
+        queue_obj, process = spawn_result
+        self.finalize_spawn(queue_obj, process)
+        return True
+
+    def spawn_worker_process(
+        self,
+        worker_args: Sequence[Any],
+        worker_kwargs: Dict[str, Any],
+    ) -> tuple[multiprocessing.Queue, multiprocessing.Process] | None:
         if run_hierarchical_mosaic_process is None:
             raise RuntimeError("Worker backend is unavailable")
         if self.is_running():
-            return False
+            return None
 
         queue_obj: multiprocessing.Queue | None = None
         process: multiprocessing.Process | None = None
@@ -344,7 +360,13 @@ class ZeMosaicQtWorker(QObject):
                 except Exception:
                     pass
             raise RuntimeError(str(exc)) from exc
+        return queue_obj, process
 
+    def finalize_spawn(
+        self,
+        queue_obj: multiprocessing.Queue,
+        process: multiprocessing.Process,
+    ) -> None:
         self._queue = queue_obj
         self._process = process
         self._stop_requested = False
@@ -358,6 +380,7 @@ class ZeMosaicQtWorker(QObject):
             queue_obj,
             lambda: bool(self._process and self._process.is_alive()),
         )
+        listener.moveToThread(listener_thread)
         listener.payload_received.connect(self._handle_payload)  # type: ignore[arg-type]
         listener.finished.connect(self._on_listener_finished)  # type: ignore[arg-type]
         listener_thread.started.connect(listener.run)  # type: ignore[arg-type]
@@ -388,7 +411,6 @@ class ZeMosaicQtWorker(QObject):
 
         self._listener_thread = listener_thread
         self._listener = listener
-        return True
 
     def stop(self) -> None:
         self._stop_requested = True
@@ -657,6 +679,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._config_load_notes: List[Tuple[str, str, str, Dict[str, Any]]] = []
         self._loaded_config_snapshot: Dict[str, Any] = {}
         self._persisted_config_keys: set[str] = set()
+        self.language_menu_button: QToolButton | None = None
+        self._language_menu: QMenu | None = None
+        self._available_languages: List[str] = []
         self._default_config_values: Dict[str, Any] = self._baseline_default_config()
         self.config: Dict[str, Any] = self._load_config()
         # Phase 4.5 (inter-master merge) must not be user-activable from Qt.
@@ -672,13 +697,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self.config.setdefault("gpu_selector", self._gpu_devices[0][0])
         else:
             self.config.setdefault("gpu_selector", "CPU (no GPU)")
-        self._log_level_prefixes = {
-            "debug": self._tr("qt_log_prefix_debug", "[DEBUG] "),
-            "info": self._tr("qt_log_prefix_info", "[INFO] "),
-            "success": self._tr("qt_log_prefix_success", "[SUCCESS] "),
-            "warning": self._tr("qt_log_prefix_warning", "[WARNING] "),
-            "error": self._tr("qt_log_prefix_error", "[ERROR] "),
-        }
+        self._initialize_log_level_prefixes()
         for key, fallback in self._default_config_values.items():
             self.config.setdefault(key, fallback)
         self._config_fields: Dict[str, Dict[str, Any]] = {}
@@ -688,6 +707,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         self._last_filter_overrides: Dict[str, Any] | None = None
         self._last_filtered_header_items: List[Any] | None = None
+        self._worker_start_thread: threading.Thread | None = None
+        self._worker_start_result: tuple[bool, str | None] | None = None
 
         self._stage_aliases = {
             "phase1_scan": "phase1",
@@ -758,10 +779,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self.phase45_overlay_view: Optional[QGraphicsView] = None
         self.phase45_overlay_toggle: Optional[QCheckBox] = None
 
+        self.is_processing = False
+
         self._setup_ui()
         self._emit_config_notes()
-
-        self.is_processing = False
         self.worker_controller = ZeMosaicQtWorker(self)
         self.worker_controller.log_message_emitted.connect(self._on_worker_log_message)  # type: ignore[arg-type]
         self.worker_controller.progress_changed.connect(self._on_worker_progress_changed)  # type: ignore[arg-type]
@@ -805,50 +826,35 @@ class ZeMosaicQtMainWindow(QMainWindow):
         language_row = QHBoxLayout()
         language_row.setContentsMargins(0, 0, 0, 0)
         language_row.setSpacing(6)
-        language_label = QLabel(
-            self._tr("language_selector_label", "Language:"),
-            central_widget,
-        )
+        language_label = QLabel(central_widget)
+        language_label.setText(self._tr("language_selector_label", "Language:"))
         language_row.addWidget(language_label)
 
-        available_langs: List[str] = ["en", "fr"]
-        locales_dir = getattr(self.localizer, "locales_dir_abs_path", None)
-        if isinstance(locales_dir, str) and os.path.isdir(locales_dir):
-            try:
-                entries = sorted(
-                    name
-                    for name in os.listdir(locales_dir)
-                    if name.endswith(".json")
-                    and os.path.isfile(os.path.join(locales_dir, name))
-                )
-                detected = [os.path.splitext(name)[0] for name in entries]
-                if detected:
-                    available_langs = detected
-            except Exception:
-                available_langs = ["en", "fr"]
-
-        self.language_combo = QComboBox(central_widget)
-        self.language_combo.addItems(available_langs)
+        available_langs = self._resolve_available_languages()
+        self._available_languages = available_langs
         current_lang = str(self.config.get("language", "en"))
-        if current_lang in available_langs:
-            self.language_combo.setCurrentText(current_lang)
-        else:
-            self.language_combo.setCurrentText(available_langs[0])
+        if not available_langs:
+            available_langs = ["en"]
+        if current_lang not in available_langs:
+            current_lang = available_langs[0]
+            self.config["language"] = current_lang
 
-        def _on_language_changed(index: int) -> None:
-            lang = self.language_combo.itemText(index).strip()
-            if not lang:
-                return
-            if hasattr(self.localizer, "set_language"):
-                try:
-                    self.localizer.set_language(lang)
-                except Exception:
-                    pass
-            self.config["language"] = lang
-            self._refresh_translated_ui()
-
-        self.language_combo.currentIndexChanged.connect(_on_language_changed)  # type: ignore[arg-type]
-        language_row.addWidget(self.language_combo)
+        self.language_menu_button = QToolButton(central_widget)
+        self.language_menu_button.setPopupMode(QToolButton.InstantPopup)
+        self.language_menu_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        menu = QMenu(self.language_menu_button)
+        self._language_menu = menu
+        for lang in available_langs:
+            action = QAction(lang.upper(), menu)
+            action.setData(lang)
+            action.setCheckable(True)
+            action.setChecked(lang == current_lang)
+            menu.addAction(action)
+        menu.triggered.connect(self._on_language_action_triggered)  # type: ignore[arg-type]
+        self.language_menu_button.setMenu(menu)
+        self._update_language_button_label(current_lang)
+        self.language_menu_button.setEnabled(not self.is_processing)
+        language_row.addWidget(self.language_menu_button)
         language_row.addStretch(1)
         main_layout.addLayout(language_row)
 
@@ -873,6 +879,24 @@ class ZeMosaicQtMainWindow(QMainWindow):
         button_row.addWidget(self.start_button)
         button_row.addWidget(self.stop_button)
         main_layout.addLayout(button_row)
+
+    def _resolve_available_languages(self) -> List[str]:
+        available_langs: List[str] = ["en", "fr"]
+        locales_dir = getattr(self.localizer, "locales_dir_abs_path", None)
+        if isinstance(locales_dir, str) and os.path.isdir(locales_dir):
+            try:
+                entries = sorted(
+                    name
+                    for name in os.listdir(locales_dir)
+                    if name.endswith(".json")
+                    and os.path.isfile(os.path.join(locales_dir, name))
+                )
+                detected = [os.path.splitext(name)[0] for name in entries]
+                if detected:
+                    available_langs = detected
+            except Exception:
+                available_langs = ["en", "fr"]
+        return available_langs
 
     def _create_folders_group(self) -> QGroupBox:
         group = QGroupBox(self._tr("qt_group_folders", "Folders"), self)
@@ -3204,10 +3228,77 @@ class ZeMosaicQtMainWindow(QMainWindow):
     def _tr(self, key: str, fallback: str) -> str:
         return self.localizer.get(key, fallback)
 
+    def _initialize_log_level_prefixes(self) -> None:
+        self._log_level_prefixes = {
+            "debug": self._tr("qt_log_prefix_debug", "[DEBUG] "),
+            "info": self._tr("qt_log_prefix_info", "[INFO] "),
+            "success": self._tr("qt_log_prefix_success", "[SUCCESS] "),
+            "warning": self._tr("qt_log_prefix_warning", "[WARNING] "),
+            "error": self._tr("qt_log_prefix_error", "[ERROR] "),
+        }
+
     def _refresh_translated_ui(self) -> None:
         self.setWindowTitle(
             self._tr("qt_window_title_preview", "ZeMosaic (Qt Preview)")
         )
+        previous_log = ""
+        if hasattr(self, "log_output"):
+            try:
+                previous_log = self.log_output.toPlainText()
+            except Exception:
+                previous_log = ""
+        old_widget = self.takeCentralWidget()
+        if old_widget is not None:
+            old_widget.deleteLater()
+        self._config_fields = {}
+        self.language_menu_button = None
+        self._language_menu = None
+        self._setup_ui()
+        if previous_log and hasattr(self, "log_output"):
+            try:
+                self.log_output.setPlainText(previous_log)
+            except Exception:
+                pass
+        self._initialize_log_level_prefixes()
+
+    def _on_language_action_triggered(self, action: QAction) -> None:
+        if self.is_processing:
+            return
+        lang = str(action.data() or "").strip()
+        if not lang or lang == self.config.get("language"):
+            return
+        self._apply_language_selection(lang)
+
+    def _apply_language_selection(self, lang: str) -> None:
+        if self.is_processing:
+            return
+        if hasattr(self.localizer, "set_language"):
+            try:
+                self.localizer.set_language(lang)
+            except Exception:
+                pass
+        self.config["language"] = lang
+        self._update_language_button_label(lang)
+        self._set_language_menu_checks(lang)
+        self._refresh_translated_ui()
+
+    def _set_language_menu_checks(self, lang: str) -> None:
+        menu = self._language_menu
+        if menu is None:
+            return
+        for action in menu.actions():
+            try:
+                action.setChecked(str(action.data()) == lang)
+            except Exception:
+                continue
+
+    def _update_language_button_label(self, lang: str) -> None:
+        if self.language_menu_button is None:
+            return
+        try:
+            self.language_menu_button.setText(lang.upper())
+        except Exception:
+            self.language_menu_button.setText(lang)
 
     # ------------------------------------------------------------------
     # Events & callbacks
@@ -3777,6 +3868,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self.files_value_label.setText("")
             self.tiles_value_label.setText(self._tr("qt_progress_count_placeholder", "0 / 0"))
             self._reset_progress_tracking()
+        if self.language_menu_button is not None:
+            self.language_menu_button.setEnabled(not running)
 
     def _normalize_log_level(self, level: str | None) -> str:
         if not level:
@@ -4691,32 +4784,64 @@ class ZeMosaicQtMainWindow(QMainWindow):
             QMessageBox.critical(self, self._tr("qt_error_prepare_worker_title", "Worker preparation failed"), str(exc))
             return
 
-        try:
-            started = self.worker_controller.start(worker_args, worker_kwargs)
-        except Exception as exc:  # pragma: no cover - start failures are rare
-            log_template = self._tr(
-                "qt_log_start_worker_failure", "Failed to start worker: {error}"
-            )
-            self._append_log(log_template.format(error=exc), level="error")
-            message_template = self._tr(
-                "qt_error_start_worker_generic", "Failed to start worker process."
-            )
-            QMessageBox.critical(
-                self,
-                self._tr("qt_error_start_worker_title", "Unable to start worker"),
-                f"{message_template}\n{exc}",
-            )
-            return
+        self._begin_async_worker_start(worker_args, worker_kwargs)
 
-        if not started:
-            self._append_log(
-                self._tr(
-                    "qt_log_worker_running", "Worker is already running."
-                ),
-                level="warning",
-            )
+    def _begin_async_worker_start(
+        self,
+        worker_args: Sequence[Any],
+        worker_kwargs: Dict[str, Any],
+    ) -> None:
+        if self._worker_start_thread is not None:
             return
+        self._worker_start_result = None
+        self.start_button.setEnabled(False)
+        self.filter_button.setEnabled(False)
+        self.stop_button.setEnabled(False)
+        self._append_log(
+            self._tr("qt_log_start_worker_pending", "Spawning worker process…"),
+            level="info",
+        )
 
+        def _runner() -> None:
+            try:
+                spawn_result = self.worker_controller.spawn_worker_process(worker_args, worker_kwargs)
+            except Exception as exc:  # pragma: no cover - start failures are rare
+                self._worker_start_result = (False, str(exc))
+            else:
+                if spawn_result is None:
+                    self._worker_start_result = (False, None)
+                else:
+                    self._worker_start_result = (True, spawn_result)
+
+        thread = threading.Thread(target=_runner, daemon=True)
+        self._worker_start_thread = thread
+        thread.start()
+        QTimer.singleShot(50, self._poll_worker_start_result)
+
+    def _poll_worker_start_result(self) -> None:
+        thread = self._worker_start_thread
+        if thread is None:
+            return
+        if thread.is_alive():
+            QTimer.singleShot(100, self._poll_worker_start_result)
+            return
+        self._worker_start_thread = None
+        result = self._worker_start_result or (False, self._tr("qt_error_start_worker_generic", "Failed to start worker process."))
+        self._worker_start_result = None
+        started, payload = result
+        if started:
+            queue_obj, process = payload  # type: ignore[misc]
+            try:
+                self.worker_controller.finalize_spawn(queue_obj, process)
+            except Exception as exc:
+                self._handle_worker_start_failure(str(exc))
+                return
+            self._finalize_successful_worker_start()
+        else:
+            error_message = payload
+            self._handle_worker_start_failure(error_message if isinstance(error_message, str) else None)
+
+    def _finalize_successful_worker_start(self) -> None:
         self.is_processing = True
         self._run_started_monotonic = time.monotonic()
         self._elapsed_timer.start()
@@ -4725,6 +4850,31 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self._tr("qt_log_processing_started", "Processing started."),
             level="info",
         )
+
+    def _handle_worker_start_failure(self, error_message: str | None) -> None:
+        self.start_button.setEnabled(True)
+        self.filter_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        if error_message:
+            log_template = self._tr(
+                "qt_log_start_worker_failure", "Failed to start worker: {error}"
+            )
+            self._append_log(log_template.format(error=error_message), level="error")
+            message_template = self._tr(
+                "qt_error_start_worker_generic", "Failed to start worker process."
+            )
+            QMessageBox.critical(
+                self,
+                self._tr("qt_error_start_worker_title", "Unable to start worker"),
+                f"{message_template}\n{error_message}",
+            )
+        else:
+            self._append_log(
+                self._tr(
+                    "qt_log_worker_running", "Worker is already running."
+                ),
+                level="warning",
+            )
 
     def _on_filter_clicked(self) -> None:
         if self.is_processing:

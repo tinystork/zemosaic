@@ -56,7 +56,7 @@
     "solver_method": "ASTAP",
     "astrometry_local_path": "",
     "astrometry_api_key": "",
-    "save_final_as_uint16": false,
+    "save_final_as_uint16": true,
     "legacy_rgb_cube": false,
     "coadd_use_memmap": true,
     "coadd_memmap_dir": "",
