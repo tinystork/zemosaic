@@ -418,6 +418,8 @@ class _NormalizedItem:
     center_dec_deg: float | None = None
     cluster_index: int | None = None
     footprint_radec: List[Tuple[float, float]] | None = None
+    header_cache: Any | None = None
+    wcs_cache: Any | None = None
 
 
 def _sanitize_footprint_radec(payload: Any) -> List[Tuple[float, float]] | None:
@@ -616,6 +618,7 @@ def _iter_normalized_entries(
                 ra_from_header, dec_from_header = _extract_center_from_header(header_obj)
                 ra_deg = ra_deg if ra_deg is not None else ra_from_header
                 dec_deg = dec_deg if dec_deg is not None else dec_from_header
+        header_cache = obj.get("header") or obj.get("header_subset")
         footprint = None
         for key in ("footprint_radec", "footprint", "corners"):
             if key in obj:
@@ -633,6 +636,8 @@ def _iter_normalized_entries(
             center_ra_deg=ra_deg,
             center_dec_deg=dec_deg,
             footprint_radec=footprint,
+            header_cache=header_cache,
+            wcs_cache=obj.get("wcs"),
         )
 
     def _build_from_path(path_obj: Path) -> _NormalizedItem:
@@ -1016,6 +1021,11 @@ class _DirectoryScanWorker(QObject):
                     "filter.scan.astropy_missing",
                     "Astropy is not installed; cannot inspect headers.",
                 )
+            if header is not None:
+                try:
+                    item.header_cache = header
+                except Exception:
+                    pass
 
             has_wcs = _header_has_wcs(header) if header is not None else False
             instrument = _detect_instrument_from_header(header)
@@ -1057,6 +1067,10 @@ class _DirectoryScanWorker(QObject):
                     if wcs_result is not None and getattr(wcs_result, "is_celestial", False):
                         has_wcs = True
                         row_update["solver"] = "ASTAP"
+                        try:
+                            item.wcs_cache = wcs_result
+                        except Exception:
+                            pass
                         if self._write_wcs_to_file and header is not None:
                             _persist_wcs_header_if_requested(path, header, True)
 
@@ -2337,10 +2351,20 @@ class FilterQtDialog(QDialog):
                 payload.setdefault("path_raw", raw)
         header = payload.get("header") or payload.get("header_subset")
         if header is None:
+            header_cache = getattr(entry, "header_cache", None)
+            if header_cache is not None:
+                header = header_cache
+                payload["header"] = header_cache
+        if header is None:
             header = self._load_header(path)
             if header is not None:
                 payload["header"] = header
         wcs_obj = payload.get("wcs")
+        if wcs_obj is None:
+            wcs_cache = getattr(entry, "wcs_cache", None)
+            if wcs_cache is not None:
+                wcs_obj = wcs_cache
+                payload["wcs"] = wcs_cache
         if wcs_obj is None and header is not None and WCS is not None:
             try:
                 wcs_obj = _build_wcs_from_header(header)
