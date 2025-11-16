@@ -4076,12 +4076,90 @@ class FilterQtDialog(QDialog):
     # ------------------------------------------------------------------
     # Public helpers queried by ``launch_filter_interface_qt``
     # ------------------------------------------------------------------
+    def _serialize_entry_for_worker(
+        self,
+        entry: _NormalizedItem,
+        row_index: int | None = None,
+        *,
+        include_header: bool = True,
+    ) -> dict[str, Any]:
+        """Return a Tk-compatible dict payload for the given table entry."""
+
+        original = entry.original
+        if isinstance(original, dict):
+            try:
+                payload: dict[str, Any] = dict(original)
+            except Exception:
+                payload = {key: original[key] for key in original.keys()}
+        else:
+            payload = {}
+            if isinstance(original, (str, os.PathLike)):
+                try:
+                    payload["path"] = os.fspath(original)
+                except Exception:
+                    payload["path"] = str(original)
+
+        path_value = entry.file_path or payload.get("path") or payload.get("file_path")
+        if path_value:
+            payload["path"] = str(path_value)
+            payload.setdefault("file_path", payload["path"])
+        if row_index is not None:
+            payload.setdefault("index", row_index)
+
+        payload["has_wcs"] = bool(entry.has_wcs or payload.get("wcs"))
+
+        if entry.instrument and not payload.get("instrument"):
+            payload["instrument"] = entry.instrument
+        if entry.group_label and not payload.get("group_label"):
+            payload["group_label"] = entry.group_label
+
+        # Persist inclusion flag so Tk/worker heuristics behave identically.
+        if "include_by_default" not in payload:
+            payload["include_by_default"] = bool(entry.include_by_default)
+
+        # Attach header / WCS metadata when available so the worker can skip
+        # its own header scan just like it does when Tk provides this list.
+        header_obj = payload.get("header") or payload.get("header_subset")
+        if include_header and header_obj is None and entry.file_path:
+            header_obj = self._load_header(entry.file_path)
+            if header_obj is not None:
+                payload["header"] = header_obj
+        if (
+            include_header
+            and payload.get("wcs") is None
+            and header_obj is not None
+            and WCS is not None
+        ):
+            try:
+                wcs_obj = _build_wcs_from_header(header_obj)
+            except Exception:
+                wcs_obj = None
+            if wcs_obj is not None:
+                payload["wcs"] = wcs_obj
+
+        # Surface RA/DEC + footprint metadata for downstream grouping parity.
+        if include_header:
+            ra_deg, dec_deg = self._ensure_entry_coordinates(entry)
+        else:
+            ra_deg, dec_deg = entry.center_ra_deg, entry.center_dec_deg
+        if ra_deg is not None:
+            payload.setdefault("center_ra_deg", float(ra_deg))
+            payload["RA"] = float(ra_deg)
+        if dec_deg is not None:
+            payload.setdefault("center_dec_deg", float(dec_deg))
+            payload["DEC"] = float(dec_deg)
+        footprint = self._ensure_entry_footprint(entry) if include_header else entry.footprint_radec
+        if footprint:
+            payload["footprint_radec"] = footprint
+
+        return payload
+
     def selected_items(self) -> List[Any]:
         results: list[Any] = []
         for row, entry in enumerate(self._normalized_items):
             item = self._table.item(row, 0)
             if item and item.checkState() == Qt.Checked:
-                results.append(entry.original)
+                results.append(self._serialize_entry_for_worker(entry, row))
         return results
 
     def was_accepted(self) -> bool:
@@ -4603,15 +4681,23 @@ class FilterQtDialog(QDialog):
         """Return a shallow copy of the original payload list."""
 
         if self._stream_scan and not self._streaming_completed:
-            return [
-                entry.original
-                for entry in _iter_normalized_entries(
+            serialized_entries: list[dict[str, Any]] = []
+            for idx, entry in enumerate(
+                _iter_normalized_entries(
                     self._input_payload,
                     self._initial_overrides,
                     scan_recursive=self._scan_recursive,
                 )
-            ]
-        return [entry.original for entry in self._normalized_items]
+            ):
+                serialized_entries.append(
+                    self._serialize_entry_for_worker(entry, idx, include_header=False)
+                )
+            return serialized_entries
+
+        return [
+            self._serialize_entry_for_worker(entry, row)
+            for row, entry in enumerate(self._normalized_items)
+        ]
 
     # ------------------------------------------------------------------
     # Scan worker slots

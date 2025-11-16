@@ -733,7 +733,7 @@ This task must treat the **Tk filter as the golden reference** and adjust the Qt
 
 **Validation checklist:**
 
-- [x] Using the same Seestar test dataset, Tk and Qt filters:
+- [ ] Using the same Seestar test dataset, Tk and Qt filters:
   - show the same **red dashed master boxes**,
   - show the same **“Prepared N group(s), sizes: …”** summary next to Auto-organize,
   - emit the same **coverage-first log lines**.
@@ -746,6 +746,7 @@ This task must treat the **Tk filter as the golden reference** and adjust the Qt
 
 (Add here any clarifications or partial work notes related to tasks A/B/C)
 
+- [x] 2025-11-19: Qt filter serialization was aligned with Tk — both `selected_items()` and the cancel-path now return Tk-style metadata dictionaries (path, header/WCS, coordinates, footprints), so `launch_filter_interface_qt` hands the worker the same payload Tk provides; this removes the post-filter freeze by ensuring `fits_file_paths` isn’t emptied after SDS/coverage runs and the main Qt window stays responsive when processing resumes.
 - [x] 2025-11-19: Qt auto-group summary now mirrors Tk exactly — the log records the full “Prepared N group(s), sizes: …” list while the adjacent label shows the histogram/compact version with the full text exposed via tooltip, ensuring the coverage-first validation bullet above passes with matching red-box overlays and log lines.
 - [x] Qt config serialization now normalizes legacy GPU keys to match Tk snapshots.
 - [x] Tk and Qt now coerce legacy GPU defaults so backend switching preserves stacking GPU flags across saves.
