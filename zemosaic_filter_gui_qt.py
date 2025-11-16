@@ -644,8 +644,13 @@ def _iter_normalized_entries(
         file_path = str(path_obj)
         display_name = path_obj.name or file_path
         include = not _should_exclude(path_obj)
+        original_payload: dict[str, Any] = {
+            "path": file_path,
+            "path_raw": file_path,
+            "include_by_default": include,
+        }
         return _NormalizedItem(
-            original=file_path,
+            original=original_payload,
             display_name=display_name,
             file_path=file_path,
             has_wcs=False,
@@ -995,6 +1000,10 @@ class _DirectoryScanWorker(QObject):
             if self._stop_requested:
                 break
             path = item.file_path
+            base_payload = item.original if isinstance(item.original, dict) else None
+            if base_payload is not None and path:
+                base_payload.setdefault("path", path)
+                base_payload.setdefault("path_raw", path)
             message = self._localizer.get(
                 "filter.scan.inspecting",
                 "Inspecting {name}…",
@@ -1026,6 +1035,8 @@ class _DirectoryScanWorker(QObject):
                     item.header_cache = header
                 except Exception:
                     pass
+                if base_payload is not None:
+                    base_payload["header"] = header
 
             has_wcs = _header_has_wcs(header) if header is not None else False
             instrument = _detect_instrument_from_header(header)
@@ -1071,17 +1082,28 @@ class _DirectoryScanWorker(QObject):
                             item.wcs_cache = wcs_result
                         except Exception:
                             pass
+                        if base_payload is not None:
+                            base_payload["wcs"] = wcs_result
                         if self._write_wcs_to_file and header is not None:
                             _persist_wcs_header_if_requested(path, header, True)
 
             row_update["has_wcs"] = has_wcs
+            if base_payload is not None:
+                base_payload["has_wcs"] = bool(has_wcs)
             if instrument:
+                if base_payload is not None:
+                    base_payload["instrument"] = instrument
                 row_update["instrument"] = instrument
             if header is not None:
                 ra_deg, dec_deg = _extract_center_from_header(header)
                 if ra_deg is not None and dec_deg is not None:
                     row_update["center_ra_deg"] = ra_deg
                     row_update["center_dec_deg"] = dec_deg
+                    if base_payload is not None:
+                        base_payload["center_ra_deg"] = float(ra_deg)
+                        base_payload["center_dec_deg"] = float(dec_deg)
+                        base_payload["RA"] = float(ra_deg)
+                        base_payload["DEC"] = float(dec_deg)
             self.row_updated.emit(index, row_update)
             completed_message = self._localizer.get(
                 "filter.scan.progress",
@@ -3928,6 +3950,13 @@ class FilterQtDialog(QDialog):
         ra_deg, dec_deg = _extract_center_from_header(header)
         entry.center_ra_deg = ra_deg
         entry.center_dec_deg = dec_deg
+        if isinstance(entry.original, dict):
+            if ra_deg is not None and dec_deg is not None:
+                entry.original["center_ra_deg"] = ra_deg
+                entry.original["center_dec_deg"] = dec_deg
+                entry.original["RA"] = ra_deg
+                entry.original["DEC"] = dec_deg
+            entry.original["header"] = header
         return ra_deg, dec_deg
 
     def _ensure_entry_footprint(self, entry: _NormalizedItem) -> List[Tuple[float, float]] | None:
@@ -4000,6 +4029,8 @@ class FilterQtDialog(QDialog):
         if not footprint:
             return None
         entry.footprint_radec = footprint
+        if isinstance(entry.original, dict):
+            entry.original["footprint_radec"] = footprint
         return footprint
 
     def _collect_preview_points(self) -> List[Tuple[float, float, int | None]]:
@@ -4374,47 +4405,49 @@ class FilterQtDialog(QDialog):
 
         # Attach header / WCS metadata when available so the worker can skip
         # its own header scan just like it does when Tk provides this list.
-        header_obj = payload.get("header") or payload.get("header_subset")
-        if include_header and header_obj is None and entry.file_path:
-            header_obj = self._load_header(entry.file_path)
-            if header_obj is not None:
-                payload["header"] = header_obj
-        if (
-            include_header
-            and payload.get("wcs") is None
-            and header_obj is not None
-            and WCS is not None
-        ):
-            try:
-                wcs_obj = _build_wcs_from_header(header_obj)
-            except Exception:
-                wcs_obj = None
-            if wcs_obj is not None:
-                payload["wcs"] = wcs_obj
+        header_obj = (
+            payload.get("header")
+            or payload.get("header_subset")
+            or getattr(entry, "header_cache", None)
+        )
+        if include_header and header_obj is not None:
+            payload["header"] = header_obj
+        wcs_obj = payload.get("wcs") or getattr(entry, "wcs_cache", None)
+        if include_header and wcs_obj is not None:
+            payload["wcs"] = wcs_obj
 
         # Surface RA/DEC + footprint metadata for downstream grouping parity.
-        if include_header:
-            ra_deg, dec_deg = self._ensure_entry_coordinates(entry)
-        else:
-            ra_deg, dec_deg = entry.center_ra_deg, entry.center_dec_deg
+        ra_deg, dec_deg = entry.center_ra_deg, entry.center_dec_deg
         if ra_deg is not None:
             payload.setdefault("center_ra_deg", float(ra_deg))
             payload["RA"] = float(ra_deg)
         if dec_deg is not None:
             payload.setdefault("center_dec_deg", float(dec_deg))
             payload["DEC"] = float(dec_deg)
-        footprint = self._ensure_entry_footprint(entry) if include_header else entry.footprint_radec
+        footprint = entry.footprint_radec or payload.get("footprint_radec")
         if footprint:
             payload["footprint_radec"] = footprint
 
         return payload
+
+    def _should_include_header_for_entry(self, entry: _NormalizedItem) -> bool:
+        """Return True when we already have cached metadata for ``entry``."""
+
+        if getattr(entry, "header_cache", None) is not None:
+            return True
+        if getattr(entry, "wcs_cache", None) is not None:
+            return True
+        return not self._stream_scan
 
     def selected_items(self) -> List[Any]:
         results: list[Any] = []
         for row, entry in enumerate(self._normalized_items):
             item = self._table.item(row, 0)
             if item and item.checkState() == Qt.Checked:
-                results.append(self._serialize_entry_for_worker(entry, row))
+                include_header = self._should_include_header_for_entry(entry)
+                results.append(
+                    self._serialize_entry_for_worker(entry, row, include_header=include_header)
+                )
         return results
 
     def was_accepted(self) -> bool:
@@ -4950,7 +4983,11 @@ class FilterQtDialog(QDialog):
             return serialized_entries
 
         return [
-            self._serialize_entry_for_worker(entry, row)
+            self._serialize_entry_for_worker(
+                entry,
+                row,
+                include_header=self._should_include_header_for_entry(entry),
+            )
             for row, entry in enumerate(self._normalized_items)
         ]
 
