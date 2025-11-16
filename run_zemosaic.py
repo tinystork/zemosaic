@@ -44,11 +44,16 @@
 import sys  # Ajout pour sys.path et sys.modules
 import multiprocessing
 import os
+import json
 import importlib.util
 import platform
 # import reproject # L'import direct ici n'est pas crucial, mais ne fait pas de mal
 import tkinter as tk
 from tkinter import messagebox  # Nécessaire pour la messagebox d'erreur critique
+try:
+    import zemosaic_config
+except ImportError:
+    zemosaic_config = None
 
 # --- Impression de débogage initiale ---
 print("--- run_zemosaic.py: DÉBUT DES IMPORTS ---")
@@ -151,6 +156,39 @@ def _is_pyside6_available() -> bool:
     return True
 
 
+def _normalize_backend_value(candidate):
+    if candidate is None:
+        return None
+    try:
+        normalized = str(candidate).strip().lower()
+    except Exception:
+        return None
+    return normalized if normalized in {"tk", "qt"} else None
+
+
+def _load_preferred_backend_from_config():
+    if zemosaic_config is None:
+        return None, False
+    get_path = getattr(zemosaic_config, "get_config_path", None)
+    if not callable(get_path):
+        return None, False
+    config_path = get_path()
+    if not isinstance(config_path, str) or not config_path:
+        return None, False
+    if not os.path.exists(config_path):
+        return None, False
+    try:
+        with open(config_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception:
+        return None, False
+    if not isinstance(data, dict):
+        return None, False
+    raw_value = data.get("preferred_gui_backend")
+    normalized = _normalize_backend_value(raw_value)
+    return normalized, "preferred_gui_backend" in data
+
+
 def _notify_qt_backend_unavailable(error: Exception) -> None:
     """Inform the user that the Qt backend cannot be used."""
 
@@ -181,8 +219,8 @@ def _notify_qt_backend_unavailable(error: Exception) -> None:
 def _determine_backend(argv):
     """Determine which GUI backend should be used.
 
-    The selection prioritises explicit command-line flags over the environment
-    variable so that users can temporarily override their default preference.
+    The selection prioritises explicit command-line flags, then the environment
+    variable, and finally the saved preference from the user configuration.
 
     Returns
     -------
@@ -191,13 +229,13 @@ def _determine_backend(argv):
     cleaned_args : list[str]
         argv without the backend flags.
     explicit_choice : bool
-        True if the user explicitly selected a backend (env or flags).
+        True if the user explicitly selected a backend (CLI, env, or stored).
     """
 
-    env_backend = os.environ.get("ZEMOSAIC_GUI_BACKEND")
-    requested_backend = env_backend or "tk"
-    explicit_choice = bool(env_backend)  # True if env var is defined
+    config_backend, config_has_preference = _load_preferred_backend_from_config()
 
+    requested_backend = None
+    explicit_choice = False
     cleaned_args = []
     for arg in argv:
         if arg == "--qt-gui":
@@ -210,6 +248,16 @@ def _determine_backend(argv):
             continue
         cleaned_args.append(arg)
 
+    env_raw = os.environ.get("ZEMOSAIC_GUI_BACKEND")
+    env_backend = _normalize_backend_value(env_raw)
+    env_specified = bool(env_raw)
+
+    if requested_backend is None:
+        if env_backend:
+            requested_backend = env_backend
+        elif config_backend:
+            requested_backend = config_backend
+
     backend = (requested_backend or "tk").strip().lower()
     if backend not in {"tk", "qt"}:
         print(
@@ -217,6 +265,8 @@ def _determine_backend(argv):
             "Falling back to Tk."
         )
         backend = "tk"
+
+    explicit_choice = explicit_choice or env_specified or config_has_preference
 
     return backend, cleaned_args, explicit_choice
 

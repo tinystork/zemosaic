@@ -284,22 +284,22 @@ This task is mostly a consistency pass: no change in behaviour, just naming and 
 
 This follow-up is considered complete when:
 
-* [ ] The Qt main window exposes tabs: **Main, Solver, System, Advanced, Skin, Language**, all localised.
-* [ ] The **bottom command bar** (Filter / Start / Stop + progress + ETA) is always visible and unchanged.
-* [ ] The **Skin** tab:
+* [x] The Qt main window exposes tabs: **Main, Solver, System, Advanced, Skin, Language**, all localised.
+* [x] The **bottom command bar** (Filter / Start / Stop + progress + ETA) is always visible and unchanged.
+* [x] The **Skin** tab:
 
-  * [ ] Lets the user choose **System / Dark / Light** theme for Qt.
-  * [ ] Lets the user choose a **preferred GUI backend** (Tk vs Qt) stored as `preferred_gui_backend` in config.
-* [ ] The launcher `run_zemosaic.py`:
+  * [x] Lets the user choose **System / Dark / Light** theme for Qt.
+  * [x] Lets the user choose a **preferred GUI backend** (Tk vs Qt) stored as `preferred_gui_backend` in config.
+* [x] The launcher `run_zemosaic.py`:
 
-  * [ ] Uses CLI flags > env var > `preferred_gui_backend` > `"tk"` to select backend.
-  * [ ] Skips the Tk choice popup when a backend is already chosen by config, env, or CLI.
-* [ ] The **Language** tab:
+  * [x] Uses CLI flags > env var > `preferred_gui_backend` > `"tk"` to select backend.
+  * [x] Skips the Tk choice popup when a backend is already chosen by config, env, or CLI.
+* [x] The **Language** tab:
 
-  * [ ] Hosts the language combo (no more language widget in the top bar).
-  * [ ] Allows choosing EN / FR / ES / PL.
-  * [ ] Updates both Qt and Tk GUIs via the shared config and localization.
-* [ ] No existing astro/stacking behaviour is changed and all backends remain cross-platform.
+  * [x] Hosts the language combo (no more language widget in the top bar).
+  * [x] Allows choosing EN / FR / ES / PL.
+  * [x] Updates both Qt and Tk GUIs via the shared config and localization.
+* [x] No existing astro/stacking behaviour is changed and all backends remain cross-platform.
 
 ```
 

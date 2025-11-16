@@ -71,7 +71,6 @@ from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Sequence
 try:
     from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal
     from PySide6.QtGui import (
-        QAction,
         QBrush,
         QCloseEvent,
         QColor,
@@ -99,7 +98,6 @@ try:
         QLabel,
         QLineEdit,
         QMainWindow,
-        QMenu,
         QMessageBox,
         QPlainTextEdit,
         QProgressBar,
@@ -107,7 +105,6 @@ try:
         QScrollArea,
         QSpinBox,
         QTabWidget,
-        QToolButton,
         QVBoxLayout,
         QWidget,
     )
@@ -161,6 +158,13 @@ else:  # pragma: no cover - optional dependency guard
 # The worker-side implementation and overlays remain available, but users must not
 # be able to toggle Phase 4.5 from the Qt main window.
 ENABLE_PHASE45_UI = False
+
+LANGUAGE_OPTION_DEFINITIONS = [
+    ("en", "language_name_en", "English (EN)"),
+    ("fr", "language_name_fr", "Français (FR)"),
+    ("es", "language_name_es", "Español (ES)"),
+    ("pl", "language_name_pl", "Polski (PL)"),
+]
 
 
 def _load_zemosaic_qicon() -> QIcon | None:
@@ -681,9 +685,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._config_load_notes: List[Tuple[str, str, str, Dict[str, Any]]] = []
         self._loaded_config_snapshot: Dict[str, Any] = {}
         self._persisted_config_keys: set[str] = set()
-        self.language_menu_button: QToolButton | None = None
-        self._language_menu: QMenu | None = None
-        self._available_languages: List[str] = []
+        self.language_combo: QComboBox | None = None
+        self.backend_combo: QComboBox | None = None
         self._default_config_values: Dict[str, Any] = self._baseline_default_config()
         self.config: Dict[str, Any] = self._load_config()
         # Phase 4.5 (inter-master merge) must not be user-activable from Qt.
@@ -822,9 +825,6 @@ class ZeMosaicQtMainWindow(QMainWindow):
         outer_layout.setContentsMargins(12, 12, 12, 12)
         outer_layout.setSpacing(10)
 
-        language_row = self._build_language_selector_row(central_widget)
-        outer_layout.addLayout(language_row)
-
         scroll = QScrollArea(central_widget)
         scroll.setWidgetResizable(True)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
@@ -857,42 +857,6 @@ class ZeMosaicQtMainWindow(QMainWindow):
         button_row = self._build_command_row()
         outer_layout.addLayout(button_row)
 
-    def _build_language_selector_row(self, parent: QWidget) -> QHBoxLayout:
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(6)
-        language_label = QLabel(parent)
-        language_label.setText(self._tr("language_selector_label", "Language:"))
-        row.addWidget(language_label)
-
-        available_langs = self._resolve_available_languages()
-        self._available_languages = available_langs
-        current_lang = str(self.config.get("language", "en"))
-        if not available_langs:
-            available_langs = ["en"]
-        if current_lang not in available_langs:
-            current_lang = available_langs[0]
-            self.config["language"] = current_lang
-
-        self.language_menu_button = QToolButton(parent)
-        self.language_menu_button.setPopupMode(QToolButton.InstantPopup)
-        self.language_menu_button.setToolButtonStyle(Qt.ToolButtonTextOnly)
-        menu = QMenu(self.language_menu_button)
-        self._language_menu = menu
-        for lang in available_langs:
-            action = QAction(lang.upper(), menu)
-            action.setData(lang)
-            action.setCheckable(True)
-            action.setChecked(lang == current_lang)
-            menu.addAction(action)
-        menu.triggered.connect(self._on_language_action_triggered)  # type: ignore[arg-type]
-        self.language_menu_button.setMenu(menu)
-        self._update_language_button_label(current_lang)
-        self.language_menu_button.setEnabled(not self.is_processing)
-        row.addWidget(self.language_menu_button)
-        row.addStretch(1)
-        return row
-
     def _build_command_row(self) -> QHBoxLayout:
         row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
@@ -918,6 +882,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             ("system", "qt_tab_system_title", "System"),
             ("advanced", "qt_tab_advanced_title", "Advanced"),
             ("skin", "qt_tab_skin_title", "Skin"),
+            ("language", "qt_tab_language_title", "Language"),
         ]
         for key, label_key, fallback in tab_definitions:
             tab = QWidget(self.tab_widget)
@@ -931,6 +896,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._populate_system_tab(self._tab_layouts["system"])
         self._populate_advanced_tab(self._tab_layouts["advanced"])
         self._populate_skin_tab(self._tab_layouts["skin"])
+        self._populate_language_tab(self._tab_layouts["language"])
 
     def _populate_main_tab(self, layout: QVBoxLayout) -> None:
         layout.addWidget(self._create_folders_group())
@@ -956,6 +922,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _populate_skin_tab(self, layout: QVBoxLayout) -> None:
         layout.addWidget(self._create_skin_group())
+        layout.addWidget(self._create_backend_group())
+        layout.addStretch(1)
+
+    def _populate_language_tab(self, layout: QVBoxLayout) -> None:
+        layout.addWidget(self._create_language_group())
         layout.addStretch(1)
 
     def _add_placeholder_to_tab(self, tab_key: str) -> None:
@@ -2417,6 +2388,102 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         return group
 
+    def _create_backend_group(self) -> QGroupBox:
+        group = QGroupBox(
+            self._tr("qt_group_backend_title", "Preferred GUI backend"),
+            self,
+        )
+        layout = QFormLayout(group)
+        layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        backend_options = [
+            ("tk", self._tr("backend_option_tk", "Classic Tk GUI (stable)")),
+            ("qt", self._tr("backend_option_qt", "Qt GUI (preview)")),
+        ]
+        combo = QComboBox(group)
+        for value, label in backend_options:
+            combo.addItem(label, value)
+
+        current_backend = str(self.config.get("preferred_gui_backend", "tk")).strip().lower()
+        index = next(
+            (idx for idx, (value, _label) in enumerate(backend_options) if value == current_backend),
+            0,
+        )
+        combo.blockSignals(True)
+        combo.setCurrentIndex(index)
+        combo.blockSignals(False)
+
+        layout.addRow(
+            QLabel(self._tr("qt_field_preferred_backend", "Preferred backend"), group),
+            combo,
+        )
+
+        notice_label = QLabel(
+            self._tr(
+                "backend_change_notice",
+                "Backend change will take effect next time you launch ZeMosaic.",
+            ),
+            group,
+        )
+        notice_label.setWordWrap(True)
+        layout.addRow(notice_label)
+
+        combo.currentIndexChanged.connect(self._on_backend_selection_changed)  # type: ignore[arg-type]
+        self.backend_combo = combo
+
+        return group
+
+    def _create_language_group(self) -> QGroupBox:
+        group = QGroupBox(
+            self._tr("qt_group_language_title", "Language"),
+            self,
+        )
+        layout = QFormLayout(group)
+        layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+
+        language_label = QLabel(self._tr("language_selector_label", "Language:"), group)
+
+        combo = QComboBox(group)
+        available_langs = set(self._resolve_available_languages())
+        option_entries: List[Tuple[str, str]] = []
+        for code, key, fallback in LANGUAGE_OPTION_DEFINITIONS:
+            if code in available_langs or not available_langs:
+                option_entries.append((code, self._tr(key, fallback)))
+        if not option_entries:
+            option_entries = [
+                ("en", self._tr("language_name_en", "English (EN)")),
+                ("fr", self._tr("language_name_fr", "Français (FR)")),
+            ]
+        for code, label_text in option_entries:
+            combo.addItem(label_text, code)
+
+        current_lang = str(self.config.get("language", "en"))
+        option_codes = [code for code, _ in option_entries]
+        if current_lang not in option_codes:
+            current_lang = option_codes[0]
+            self.config["language"] = current_lang
+
+        combo.blockSignals(True)
+        combo.setCurrentIndex(option_codes.index(current_lang))
+        combo.blockSignals(False)
+
+        layout.addRow(language_label, combo)
+
+        notice_label = QLabel(
+            self._tr(
+                "language_change_notice",
+                "Language also applies to the classic Tk interface and will be remembered.",
+            ),
+            group,
+        )
+        notice_label.setWordWrap(True)
+        layout.addRow(notice_label)
+
+        combo.currentIndexChanged.connect(self._on_language_combo_changed)  # type: ignore[arg-type]
+        self.language_combo = combo
+
+        return group
+
     def _create_gpu_group(self) -> QGroupBox:
         group = QGroupBox(
             self._tr("qt_group_gpu", "GPU and acceleration"),
@@ -2453,6 +2520,28 @@ class ZeMosaicQtMainWindow(QMainWindow):
         mode = data.strip().lower() or "system"
         self.config["qt_theme_mode"] = mode
         self._apply_theme(mode)
+
+    def _on_backend_selection_changed(self, index: int) -> None:
+        if self.backend_combo is None:
+            return
+        data = self.backend_combo.itemData(index)
+        backend = str(data or "").strip().lower()
+        if backend not in {"tk", "qt"}:
+            return
+        current = str(self.config.get("preferred_gui_backend", "tk")).strip().lower()
+        if backend == current:
+            return
+        self.config["preferred_gui_backend"] = backend
+        self._save_config()
+
+    def _on_language_combo_changed(self, index: int) -> None:
+        if self.language_combo is None:
+            return
+        data = self.language_combo.itemData(index)
+        lang = str(data or "").strip()
+        if not lang or lang == str(self.config.get("language", "en")).strip():
+            return
+        self._apply_language_selection(lang)
 
     def _apply_theme(self, mode: str | None) -> None:
         mode = (mode or "system").strip().lower()
@@ -3438,8 +3527,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
         if old_widget is not None:
             old_widget.deleteLater()
         self._config_fields = {}
-        self.language_menu_button = None
-        self._language_menu = None
+        self.language_combo = None
+        self.backend_combo = None
         self._setup_ui()
         if previous_log and hasattr(self, "log_output"):
             try:
@@ -3447,14 +3536,6 @@ class ZeMosaicQtMainWindow(QMainWindow):
             except Exception:
                 pass
         self._initialize_log_level_prefixes()
-
-    def _on_language_action_triggered(self, action: QAction) -> None:
-        if self.is_processing:
-            return
-        lang = str(action.data() or "").strip()
-        if not lang or lang == self.config.get("language"):
-            return
-        self._apply_language_selection(lang)
 
     def _apply_language_selection(self, lang: str) -> None:
         if self.is_processing:
@@ -3465,27 +3546,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             except Exception:
                 pass
         self.config["language"] = lang
-        self._update_language_button_label(lang)
-        self._set_language_menu_checks(lang)
         self._refresh_translated_ui()
-
-    def _set_language_menu_checks(self, lang: str) -> None:
-        menu = self._language_menu
-        if menu is None:
-            return
-        for action in menu.actions():
-            try:
-                action.setChecked(str(action.data()) == lang)
-            except Exception:
-                continue
-
-    def _update_language_button_label(self, lang: str) -> None:
-        if self.language_menu_button is None:
-            return
-        try:
-            self.language_menu_button.setText(lang.upper())
-        except Exception:
-            self.language_menu_button.setText(lang)
 
     # ------------------------------------------------------------------
     # Events & callbacks
@@ -4055,8 +4116,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self.files_value_label.setText("")
             self.tiles_value_label.setText(self._tr("qt_progress_count_placeholder", "0 / 0"))
             self._reset_progress_tracking()
-        if self.language_menu_button is not None:
-            self.language_menu_button.setEnabled(not running)
+        if self.language_combo is not None:
+            self.language_combo.setEnabled(not running)
 
     def _normalize_log_level(self, level: str | None) -> str:
         if not level:

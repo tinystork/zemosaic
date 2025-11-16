@@ -6,6 +6,7 @@
     "astap_default_sensitivity": 100,
     "astap_max_instances": 8,
     "language": "en",
+    "preferred_gui_backend": "tk",
     "qt_theme_mode": "dark",
     "input_dir": "C:/Users/TRISTAN/Desktop/astrophoto/zemosaic/example/lights",
     "output_dir": "C:/Users/TRISTAN/Desktop/astrophoto/zemosaic/example/out",
