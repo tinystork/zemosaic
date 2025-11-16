@@ -49,6 +49,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections import Counter
+import datetime
 import logging
 import importlib.util
 import os
@@ -1235,6 +1236,9 @@ class FilterQtDialog(QDialog):
     richer analysis (clustering, previews, stream scanning, ...).
     """
 
+    _async_log_signal = Signal(str, str)
+    _auto_group_finished_signal = Signal(object, object)
+
     def __init__(
         self,
         raw_files_with_wcs_or_dir: Any,
@@ -1272,11 +1276,14 @@ class FilterQtDialog(QDialog):
         self._streaming_active = False
         self._streaming_completed = not self._stream_scan
         self._stream_loaded_count = 0
+        self._preview_empty_logged = False
         try:
             self._batch_size = max(1, int(batch_size))
         except Exception:
             self._batch_size = 100
         self._dialog_button_box: QDialogButtonBox | None = None
+        self._async_log_signal.connect(self._append_log_from_signal)
+        self._auto_group_finished_signal.connect(self._handle_auto_group_finished)
 
         if self._stream_scan:
             self._normalized_items = []
@@ -1388,13 +1395,22 @@ class FilterQtDialog(QDialog):
                 except Exception:
                     self._cache_csv_path = None
         self._build_ui()
+        cache_loaded = bool(self._cache_csv_path and os.path.exists(self._cache_csv_path))
         if self._stream_scan:
             self._prepare_streaming_mode(raw_files_with_wcs_or_dir, initial_overrides)
+            self._debug_log(
+                f"stream_mode=True; pending_start={not self._streaming_completed} "
+                f"csv_loaded={cache_loaded} input_source={self._describe_input_source()}"
+            )
         else:
             self._populate_table()
             self._update_summary_label()
             self._schedule_preview_refresh()
             self._schedule_cluster_refresh()
+            self._debug_log(
+                f"stream_mode=False; pending_start=False csv_loaded={cache_loaded} "
+                f"entries_loaded={len(self._normalized_items)} input_source={self._describe_input_source()}"
+            )
             # If the caller provided pre-planned master groups, apply them so
             # that the user immediately sees the same grouping as in Tk.
             preplanned = None
@@ -1591,6 +1607,14 @@ class FilterQtDialog(QDialog):
             box,
         )
         self._auto_group_button.clicked.connect(self._on_auto_group_clicked)  # type: ignore[arg-type]
+        helpers_ready = bool(_CLUSTER_CONNECTED is not None and _AUTOSPLIT_GROUPS is not None)
+        self._auto_group_button.setEnabled(helpers_ready)
+        if not helpers_ready:
+            tooltip = self._localizer.get(
+                "filter.cluster.helpers_missing",
+                "Auto-organisation helpers are unavailable; install the worker module.",
+            )
+            self._auto_group_button.setToolTip(tooltip)
         layout.addWidget(self._auto_group_button, 0, 1)
 
         # Summary label mirroring Tk's "Prepared N group(s), sizes: …"
@@ -1793,28 +1817,28 @@ class FilterQtDialog(QDialog):
 
         if self._auto_group_running:
             return
-        if _CLUSTER_CONNECTED is None or _AUTOSPLIT_GROUPS is None:
+        helpers_ready = _CLUSTER_CONNECTED is not None and _AUTOSPLIT_GROUPS is not None
+        if not helpers_ready:
             message = self._localizer.get(
                 "filter.cluster.helpers_missing",
                 "Auto-organisation helpers are unavailable; install the worker module.",
             )
-            self._append_log(message)
+            self._append_log(message, level="WARN")
             self._status_label.setText(message)
             return
+
+        if self._auto_group_button is not None:
+            try:
+                self._auto_group_button.setEnabled(False)
+            except Exception:
+                pass
 
         selected_indices = self._collect_selected_indices()
         if not selected_indices:
-            message = self._localizer.get(
-                "filter.cluster.no_selection",
-                "Select at least one frame before requesting auto-organisation.",
-            )
-            self._append_log(message)
-            self._status_label.setText(message)
+            self._handle_auto_group_empty_selection()
             return
 
         self._auto_group_running = True
-        if self._auto_group_button is not None:
-            self._auto_group_button.setEnabled(False)
         self._append_log(
             self._localizer.get(
                 "filter.cluster.manual_refresh",
@@ -1828,7 +1852,11 @@ class FilterQtDialog(QDialog):
         try:
             thread = threading.Thread(
                 target=self._auto_group_background_task,
-                args=(selected_indices,),
+                args=(
+                    selected_indices,
+                    int(self._resolve_overcap_percent()),
+                    bool(self._coverage_first_enabled()),
+                ),
                 daemon=True,
             )
             thread.start()
@@ -1849,14 +1877,36 @@ class FilterQtDialog(QDialog):
                 message = message.format(error=exc)
             except Exception:
                 message = f"Auto-organisation failed: {exc}"
-            self._append_log(message)
+            self._append_log(message, level="ERROR")
             self._status_label.setText(message)
 
-    def _auto_group_background_task(self, selected_indices: list[int]) -> None:
-        messages: list[str] = []
+    def _handle_auto_group_empty_selection(self) -> None:
+        self._auto_group_running = False
+        summary_text = self._format_group_summary(0, "[]")
+        self._append_log(summary_text)
+        self._update_auto_group_summary_display(summary_text, summary_text)
+        self._status_label.setText(summary_text)
+        if self._auto_group_button is not None:
+            try:
+                self._auto_group_button.setEnabled(True)
+            except Exception:
+                pass
+
+    def _auto_group_background_task(
+        self,
+        selected_indices: list[int],
+        overcap_pct: int,
+        coverage_enabled_flag: bool,
+    ) -> None:
+        messages: list[str | tuple[str, str]] = []
         result_payload: dict[str, Any] | None = None
         try:
-            result_payload = self._compute_auto_groups(selected_indices, messages)
+            result_payload = self._compute_auto_groups(
+                selected_indices,
+                overcap_pct,
+                coverage_enabled_flag,
+                messages,
+            )
         except Exception as exc:  # pragma: no cover - defensive guard
             error_text = self._localizer.get(
                 "filter.cluster.failed",
@@ -1866,51 +1916,67 @@ class FilterQtDialog(QDialog):
                 formatted = error_text.format(error=exc)
             except Exception:
                 formatted = f"Auto-organisation failed: {exc}"
-            messages.append(formatted)
+            messages.append((formatted, "ERROR"))
         if result_payload and result_payload.get("coverage_first"):
             groups_count = len(result_payload.get("final_groups") or [])
             messages.append(
                 self._format_message(
                     "log_covfirst_done",
-                    "Coverage-first preplan ready: {N} group(s).",
+                    "Coverage-first preplan ready: {N} groups written to overrides_state.preplan_master_groups",
                     N=groups_count,
                 )
             )
+        self._auto_group_finished_signal.emit(result_payload, list(messages))
 
-        def _finalize() -> None:
-            self._auto_group_running = False
-            if self._auto_group_button is not None:
+    @Slot(object, object)
+    def _handle_auto_group_finished(
+        self,
+        result_payload: object,
+        messages_payload: object,
+    ) -> None:
+        self._auto_group_running = False
+        if self._auto_group_button is not None:
+            try:
                 self._auto_group_button.setEnabled(True)
-            for line in messages:
-                self._append_log(line)
-            if result_payload is None:
-                if not messages:
-                    fallback = self._localizer.get(
-                        "filter.cluster.failed_generic",
-                        "Unable to prepare master-tile groups.",
-                    )
-                    self._append_log(fallback)
-                self._status_label.setText(
-                    self._localizer.get(
-                        "filter.cluster.failed_short",
-                        "Auto-organisation failed.",
-                    )
+            except Exception:
+                pass
+        entries: list[Any] = []
+        if isinstance(messages_payload, list):
+            entries = list(messages_payload)
+        elif messages_payload:
+            entries = [messages_payload]
+        for entry in entries:
+            if isinstance(entry, tuple):
+                text = entry[0]
+                level = entry[1] if len(entry) > 1 else "INFO"
+                self._append_log(str(text), level=str(level))
+            else:
+                self._append_log(str(entry))
+        if not isinstance(result_payload, dict) or not result_payload:
+            if not entries:
+                fallback = self._localizer.get(
+                    "filter.cluster.failed_generic",
+                    "Unable to prepare master-tile groups.",
                 )
-                return
-            self._apply_auto_group_result(result_payload)
-
-        QTimer.singleShot(0, _finalize)
+                self._append_log(fallback, level="WARN")
+            self._status_label.setText(
+                self._localizer.get(
+                    "filter.cluster.failed_short",
+                    "Auto-organisation failed.",
+                )
+            )
+            return
+        self._apply_auto_group_result(result_payload)
 
     def _compute_auto_groups(
         self,
         selected_indices: list[int],
-        messages: list[str],
+        overcap_pct: int,
+        coverage_requested: bool,
+        messages: list[str | tuple[str, str]],
     ) -> dict[str, Any]:
         sds_mode = bool(self._sds_checkbox.isChecked()) if self._sds_checkbox is not None else False
-        coverage_enabled = self._coverage_first_enabled()
-        workflow_mode = self._determine_workflow_mode(self._detect_primary_instrument_label())
-        if workflow_mode == "seestar":
-            coverage_enabled = True
+        coverage_enabled = bool(coverage_requested)
         if sds_mode and compute_global_wcs_descriptor is not None:
             success, _meta = self._ensure_global_wcs_for_indices(selected_indices)
             if success:
@@ -1921,14 +1987,13 @@ class FilterQtDialog(QDialog):
                     coverage_threshold=threshold,
                 )
                 if sds_groups:
-                    template = self._localizer.get(
-                        "filter.cluster.sds_ready",
-                        "ZeSupaDupStack prepared {count} coverage batch(es).",
+                    messages.append(
+                        self._format_message(
+                            "filter.cluster.sds_ready",
+                            "ZeSupaDupStack: prepared {count} coverage batch(es) for preview.",
+                            count=len(sds_groups),
+                        )
                     )
-                    try:
-                        messages.append(template.format(count=len(sds_groups)))
-                    except Exception:
-                        messages.append(f"ZeSupaDupStack prepared {len(sds_groups)} coverage batch(es).")
                     return {
                         "final_groups": sds_groups,
                         "sizes": [len(group) for group in sds_groups],
@@ -1938,16 +2003,22 @@ class FilterQtDialog(QDialog):
                     }
                 else:
                     messages.append(
-                        self._localizer.get(
-                            "filter.cluster.sds_no_batches",
-                            "ZeSupaDupStack auto-group fallback: coverage batches could not be built.",
+                        (
+                            self._localizer.get(
+                                "filter.cluster.sds_no_batches",
+                                "ZeSupaDupStack auto-group fallback: coverage batches could not be built.",
+                            ),
+                            "WARN",
                         )
                     )
             else:
                 messages.append(
-                    self._localizer.get(
-                        "filter.cluster.sds_wcs_unavailable",
-                        "ZeSupaDupStack auto-group fallback: global WCS descriptor unavailable.",
+                    (
+                        self._localizer.get(
+                            "filter.cluster.sds_wcs_unavailable",
+                            "ZeSupaDupStack auto-group fallback: global WCS descriptor unavailable.",
+                        ),
+                        "WARN",
                     )
                 )
         candidate_infos: list[dict[str, Any]] = []
@@ -1973,11 +2044,13 @@ class FilterQtDialog(QDialog):
         if threshold_initial <= 0:
             threshold_initial = 0.1
 
+        auto_angle_enabled = getattr(self, "_auto_angle_enabled", True)
+        manual_angle_mode = not auto_angle_enabled
         orientation_threshold = self._resolve_orientation_split_threshold()
         angle_split_candidate = self._resolve_angle_split_candidate()
         auto_angle_detect = self._resolve_auto_angle_detect_threshold()
         cap_effective, min_cap = self._resolve_autosplit_caps()
-        overcap_pct = self._resolve_overcap_percent()
+        overcap_pct = max(0, min(50, int(overcap_pct)))
         if coverage_enabled:
             messages.append(
                 self._format_message(
@@ -2000,15 +2073,69 @@ class FilterQtDialog(QDialog):
 
         threshold_used = float(threshold_initial)
         groups_used = groups_initial
-        angle_split_effective = 0.0
+        candidate_count = len(candidate_infos)
+        ratio = (len(groups_initial) / float(candidate_count)) if candidate_count else 0.0
+        pathological = candidate_count > 0 and (
+            len(groups_initial) >= candidate_count or ratio >= 0.6
+        )
+        if coverage_enabled and pathological and len(coord_samples) >= 5:
+            p90_value: float | None = None
+            if SkyCoord is not None and u is not None:
+                try:
+                    sc = SkyCoord(
+                        ra=[c[0] for c in coord_samples] * u.deg,
+                        dec=[c[1] for c in coord_samples] * u.deg,
+                        frame="icrs",
+                    )
+                    sep_matrix = sc[:, None].separation(sc[None, :]).deg
+                    if sep_matrix.size:
+                        with np.errstate(invalid="ignore"):
+                            np.fill_diagonal(sep_matrix, np.nan)
+                        nearest = np.nanmin(sep_matrix, axis=1)
+                        finite = nearest[np.isfinite(nearest) & (nearest > 0)]
+                        if finite.size:
+                            p90_value = float(np.nanpercentile(finite, 90))
+                except Exception:
+                    p90_value = None
+            if p90_value and math.isfinite(p90_value):
+                threshold_relaxed = max(threshold_used, float(p90_value) * 1.1)
+                if threshold_relaxed > threshold_used * 1.001:
+                    relaxed_groups = _CLUSTER_CONNECTED(
+                        candidate_infos,
+                        float(threshold_relaxed),
+                        None,
+                        orientation_split_threshold_deg=float(max(0.0, orientation_threshold)),
+                    )
+                    if relaxed_groups and len(relaxed_groups) < len(groups_used):
+                        messages.append(
+                            self._format_message(
+                                "log_covfirst_relax",
+                                "Relaxed epsilon using P90 NN: old={OLD} deg -> new={NEW} deg",
+                                OLD=f"{threshold_used:.3f}",
+                                NEW=f"{threshold_relaxed:.3f}",
+                            )
+                        )
+                        groups_used = relaxed_groups
+                        threshold_used = threshold_relaxed
+
+        angle_split_effective = float(orientation_threshold if orientation_threshold > 0 else 0.0)
+        if manual_angle_mode:
+            angle_split_effective = angle_split_candidate
 
         auto_angle_triggered = False
-        if angle_split_candidate > 0.0 and _tk_split_group_by_orientation is not None and _tk_circular_dispersion_deg is not None:
+        if (
+            auto_angle_enabled
+            and not manual_angle_mode
+            and angle_split_effective <= 0.0
+            and angle_split_candidate > 0.0
+            and _tk_split_group_by_orientation is not None
+            and _tk_circular_dispersion_deg is not None
+        ):
             oriented_groups: list[list[dict[str, Any]]] = []
             triggered = 0
             for group in groups_used:
                 pa_values: list[float] = []
-                for info in group:
+                for info in group or []:
                     try:
                         pa = info.get("PA_DEG")
                         if pa is None:
@@ -2021,9 +2148,7 @@ class FilterQtDialog(QDialog):
                     continue
                 dispersion_val = _tk_circular_dispersion_deg(pa_values)
                 if dispersion_val > auto_angle_detect:
-                    oriented_groups.extend(
-                        _tk_split_group_by_orientation(group, angle_split_candidate)
-                    )
+                    oriented_groups.extend(_tk_split_group_by_orientation(group, angle_split_candidate))
                     triggered += 1
                 else:
                     oriented_groups.append(group)
@@ -2031,9 +2156,18 @@ class FilterQtDialog(QDialog):
                 auto_angle_triggered = True
                 angle_split_effective = angle_split_candidate
                 groups_used = oriented_groups
+                messages.append(
+                    self._format_message(
+                        "filter_log_orientation_autosplit",
+                        "Orientation auto-split enabled: threshold={TH}° for {N} group(s)",
+                        TH=f"{angle_split_effective:.1f}",
+                        N=triggered,
+                    )
+                )
+                self._update_orientation_override_value(angle_split_effective)
 
-        if not auto_angle_triggered and angle_split_candidate > 0.0:
-            angle_split_effective = angle_split_candidate
+        if not auto_angle_triggered:
+            self._update_orientation_override_value(angle_split_effective)
 
         groups_after_autosplit = _AUTOSPLIT_GROUPS(
             groups_used,
@@ -2085,23 +2219,10 @@ class FilterQtDialog(QDialog):
                 if info.pop("_fallback_wcs_used", False):
                     info.pop("wcs", None)
 
-        summary_template = self._localizer.get(
-            "filter.cluster.summary",
-            "Auto-grouped {groups} cluster(s) (threshold {threshold:.2f}°)",
-        )
-        try:
-            summary_text = summary_template.format(
-                groups=len(final_groups),
-                threshold=threshold_used,
-            )
-        except Exception:
-            summary_text = f"Auto-grouped {len(final_groups)} cluster(s)"
-        messages.append(summary_text)
-
         return {
             "final_groups": final_groups,
             "sizes": [len(group) for group in final_groups],
-            "coverage_first": True,
+            "coverage_first": bool(coverage_enabled),
             "threshold_used": threshold_used,
             "angle_split": angle_split_effective,
         }
@@ -2184,25 +2305,10 @@ class FilterQtDialog(QDialog):
             full_sizes_text = ", ".join(str(val) for val in sizes)
         else:
             full_sizes_text = "[]"
-        summary_template = self._localizer.get(
-            "filter_log_groups_summary",
-            "Prepared {g} group(s), sizes: {sizes}.",
-        )
-        try:
-            log_summary = summary_template.format(g=len(groups), sizes=full_sizes_text)
-        except Exception:
-            log_summary = f"Prepared {len(groups)} group(s), sizes: {full_sizes_text}."
+        log_summary = self._format_group_summary(len(groups), full_sizes_text)
         self._append_log(log_summary)
-
-        try:
-            label_summary = summary_template.format(g=len(groups), sizes=hist_text)
-        except Exception:
-            label_summary = f"Prepared {len(groups)} group(s), sizes: {hist_text}."
-        if self._auto_group_summary_label is not None:
-            self._auto_group_summary_label.setText(label_summary)
-            # Surface the detailed string via tooltip so the Qt UI mirrors
-            # the Tk "Details" popup semantics without an extra button.
-            self._auto_group_summary_label.setToolTip(log_summary)
+        label_summary = self._format_group_summary(len(groups), hist_text)
+        self._update_auto_group_summary_display(label_summary, log_summary)
 
         self._group_outline_bounds = self._compute_group_outline_bounds(groups)
         if self._coverage_axes is not None and self._coverage_canvas is not None:
@@ -2597,6 +2703,29 @@ class FilterQtDialog(QDialog):
             except Exception:
                 return default
 
+    def _format_group_summary(self, groups_count: int, sizes_text: str) -> str:
+        template = self._localizer.get(
+            "filter_log_groups_summary",
+            "Prepared {g} group(s), sizes: {sizes}.",
+        )
+        try:
+            return template.format(g=int(groups_count), sizes=sizes_text)
+        except Exception:
+            return f"Prepared {groups_count} group(s), sizes: {sizes_text}."
+
+    def _update_auto_group_summary_display(self, label_text: str, tooltip_text: str | None = None) -> None:
+        if self._auto_group_summary_label is None:
+            return
+        self._auto_group_summary_label.setText(label_text)
+        self._auto_group_summary_label.setToolTip(tooltip_text or label_text)
+
+    def _update_orientation_override_value(self, value: float) -> None:
+        sanitized = _sanitize_angle_value(value, 0.0)
+        if sanitized > 0:
+            self._runtime_overrides["cluster_orientation_split_deg"] = float(sanitized)
+        else:
+            self._runtime_overrides.pop("cluster_orientation_split_deg", None)
+
     def _resolve_cluster_threshold_override(self) -> float | None:
         candidates = (
             self._safe_lookup(self._config_overrides, "panel_clustering_threshold_deg"),
@@ -2679,17 +2808,43 @@ class FilterQtDialog(QDialog):
         return AUTO_ANGLE_DETECT_DEFAULT_DEG
 
     def _resolve_autosplit_caps(self) -> tuple[int, int]:
-        try:
-            cap = int(self._config_value("max_raw_per_master_tile", 50))
-        except Exception:
-            cap = 50
-        cap = max(1, min(50, cap))
-        try:
-            min_cap = int(self._config_value("autosplit_min_cap", min(8, cap)))
-        except Exception:
-            min_cap = min(8, cap)
-        min_cap = max(1, min(min_cap, cap))
-        return cap, min_cap
+        def _coerce_int(value: Any) -> int | None:
+            try:
+                parsed = int(value)
+            except Exception:
+                return None
+            return parsed
+
+        base_cap = _coerce_int(self._config_value("max_raw_per_master_tile", 50)) or 50
+        cap_effective = max(1, min(50, base_cap))
+        cap_candidates = (
+            self._safe_lookup(self._solver_settings, "max_raw_per_master_tile"),
+            self._safe_lookup(self._runtime_overrides, "max_raw_per_master_tile"),
+            self._safe_lookup(self._config_overrides, "max_raw_per_master_tile"),
+            self._safe_lookup(self._initial_overrides, "max_raw_per_master_tile"),
+        )
+        for candidate in cap_candidates:
+            value = _coerce_int(candidate)
+            if value and value > 0:
+                cap_effective = max(1, min(50, value))
+                break
+
+        default_min = _coerce_int(self._config_value("autosplit_min_cap", min(8, cap_effective)))
+        min_cap_effective = default_min if default_min and default_min > 0 else min(8, cap_effective)
+        min_candidates = (
+            self._safe_lookup(self._solver_settings, "autosplit_min_cap"),
+            self._safe_lookup(self._runtime_overrides, "autosplit_min_cap"),
+            self._safe_lookup(self._config_overrides, "autosplit_min_cap"),
+            self._safe_lookup(self._initial_overrides, "autosplit_min_cap"),
+        )
+        for candidate in min_candidates:
+            value = _coerce_int(candidate)
+            if value and value > 0:
+                min_cap_effective = max(1, min(value, cap_effective))
+                break
+
+        min_cap_effective = max(1, min(min_cap_effective, cap_effective))
+        return cap_effective, min_cap_effective
 
     def _resolve_overcap_percent(self) -> int:
         value = getattr(self, "_overcap_percent_value", None)
@@ -2962,7 +3117,7 @@ class FilterQtDialog(QDialog):
                 "filter.exclude.no_center",
                 "Cannot exclude by distance because no celestial center is available.",
             )
-            self._append_log(message)
+            self._append_log(message, level="WARN")
             self._status_label.setText(message)
             return
 
@@ -3020,7 +3175,7 @@ class FilterQtDialog(QDialog):
                 "filter.export.empty",
                 "No rows available for CSV export.",
             )
-            self._append_log(message)
+            self._append_log(message, level="WARN")
             self._status_label.setText(message)
             return
 
@@ -3046,7 +3201,7 @@ class FilterQtDialog(QDialog):
                 "filter.export.error",
                 "Failed to export CSV file.",
             )
-            self._append_log(message)
+            self._append_log(message, level="ERROR")
             self._status_label.setText(message)
 
     def _prompt_csv_path(self) -> str | None:
@@ -3143,7 +3298,7 @@ class FilterQtDialog(QDialog):
                     writer.writerow(row)
             return True
         except Exception as exc:
-            self._append_log(f"CSV export failed: {exc}")
+            self._append_log(f"CSV export failed: {exc}", level="ERROR")
             return False
 
     def _build_ui(self) -> None:
@@ -3316,6 +3471,7 @@ class FilterQtDialog(QDialog):
         loading_text = self._localizer.get("filter.stream.starting", "Discovering frames…")
         self._status_label.setText(loading_text)
         self._progress_bar.setRange(0, 0)
+        self._append_log(loading_text)
         if self._run_analysis_btn is not None:
             self._run_analysis_btn.setEnabled(False)
         ok_button = None
@@ -3357,9 +3513,11 @@ class FilterQtDialog(QDialog):
             count=self._stream_loaded_count,
         )
         try:
-            self._status_label.setText(message_template.format(count=self._stream_loaded_count))
+            resolved = message_template.format(count=self._stream_loaded_count)
         except Exception:
-            self._status_label.setText(f"Discovered {self._stream_loaded_count} frame(s)…")
+            resolved = f"Discovered {self._stream_loaded_count} frame(s)…"
+        self._status_label.setText(resolved)
+        self._append_log(resolved)
 
     def _on_stream_finished(self) -> None:
         self._streaming_active = False
@@ -3373,9 +3531,11 @@ class FilterQtDialog(QDialog):
             count=total_loaded,
         )
         try:
-            self._status_label.setText(message_template.format(count=total_loaded))
+            resolved = message_template.format(count=total_loaded)
         except Exception:
-            self._status_label.setText(f"Finished loading {total_loaded} frame(s).")
+            resolved = f"Finished loading {total_loaded} frame(s)."
+        self._status_label.setText(resolved)
+        self._append_log(resolved)
         if self._run_analysis_btn is not None:
             self._run_analysis_btn.setEnabled(True)
         if self._dialog_button_box is not None:
@@ -3393,6 +3553,7 @@ class FilterQtDialog(QDialog):
             self._status_label.setText(message)
         except Exception:
             pass
+        self._append_log(message, level="ERROR")
 
     def _on_stream_thread_finished(self) -> None:
         self._stream_thread = None
@@ -3528,7 +3689,6 @@ class FilterQtDialog(QDialog):
             summary_display = summary_formatted
 
         self._summary_label.setText(summary_display)
-        self._append_log(summary_display)
 
     def _on_sds_toggled(self, checked: bool) -> None:
         # Reset any previous auto-organisation overrides so the user can
@@ -3574,26 +3734,88 @@ class FilterQtDialog(QDialog):
         layout.addStretch(1)
         return box
 
-    def _append_log(self, message: str) -> None:
+    @Slot(str, str)
+    def _append_log_from_signal(self, message: str, level: str) -> None:
+        self._append_log(message, level=level)
+
+    def _append_log(self, message: str, level: str = "INFO") -> None:
         if not message:
             return
         text = str(message)
+        try:
+            level_upper = str(level or "INFO").upper()
+        except Exception:
+            level_upper = "INFO"
+        try:
+            timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        except Exception:
+            timestamp = "--:--:--"
+        formatted = f"[{timestamp}] [{level_upper}] {text}"
         if self._activity_log_output is not None:
             try:
-                self._activity_log_output.appendPlainText(text)
+                self._activity_log_output.appendPlainText(formatted)
             except Exception:
                 pass
-        if self._log_output is None:
-            return
+        if self._log_output is not None:
+            try:
+                self._log_output.appendPlainText(formatted)
+            except Exception:
+                pass
         try:
-            self._log_output.appendPlainText(text)
+            print(formatted)
         except Exception:
             pass
+        try:
+            log_method = getattr(logger, level_upper.lower(), logger.info)
+        except Exception:
+            log_method = logger.info
+        try:
+            log_method(text)
+        except Exception:
+            try:
+                logger.info(text)
+            except Exception:
+                pass
+
+    def _debug_log(self, message: str, level: str = "INFO") -> None:
+        if not message:
+            return
+        try:
+            stamp = datetime.datetime.now().strftime("%H:%M:%S")
+        except Exception:
+            stamp = "--:--:--"
+        self._append_log(f"[FilterUI {stamp}] {message}", level=level)
+
+    def _describe_input_source(self) -> str:
+        payload = self._input_payload
+        if isinstance(payload, (str, bytes)):
+            return str(payload)
+        try:
+            if isinstance(payload, os.PathLike):
+                return os.fspath(payload)
+        except Exception:
+            pass
+        candidate = None
+        for attr in ("input_dir", "path", "directory", "root"):
+            try:
+                value = getattr(payload, attr, None)
+            except Exception:
+                continue
+            if value:
+                candidate = value
+                break
+        if candidate:
+            try:
+                return os.fspath(candidate)
+            except Exception:
+                return str(candidate)
+        return "<memory payload>"
 
     def _on_scan_recursive_toggled(self, checked: bool) -> None:
         self._scan_recursive = bool(checked)
 
     def _on_run_analysis(self) -> None:
+        self._debug_log("Analyse clicked — preparing scan…")
         if self._streaming_active and self._stream_thread is not None and self._stream_thread.isRunning():
             wait_text = self._localizer.get(
                 "filter.stream.wait",
@@ -3642,6 +3864,7 @@ class FilterQtDialog(QDialog):
         self._scan_worker.finished.connect(self._scan_thread.quit)
         self._scan_worker.finished.connect(self._scan_worker.deleteLater)
         self._scan_thread.finished.connect(self._scan_thread.deleteLater)
+        self._debug_log("[Filter] Analyse clicked — starting directory crawl…")
         self._scan_thread.start()
 
     def _resolve_preview_cap(self) -> int | None:
@@ -3919,10 +4142,18 @@ class FilterQtDialog(QDialog):
                 "filter.preview.empty",
                 "No WCS information available for the current selection.",
             )
+            if not self._preview_empty_logged:
+                hint = self._localizer.get(
+                    "filter.preview.empty_hint",
+                    "No WCS/center information available; the sky preview will remain empty but you can still select files.",
+                )
+                self._append_log(hint, level="WARN")
+                self._preview_empty_logged = True
             axes.text(0.5, 0.5, message, ha="center", va="center", transform=axes.transAxes)
             self._preview_hint_label.setText(self._preview_default_hint)
             self._preview_canvas.draw_idle()
             return
+        self._preview_empty_logged = False
 
         grouped_points: dict[int | None, list[Tuple[float, float]]] = {}
         for ra_deg, dec_deg, group_idx in points:
@@ -4756,7 +4987,7 @@ class FilterQtDialog(QDialog):
             self._status_label.setText(message)
         except Exception:
             pass
-        self._append_log(message)
+        self._append_log(message, level="ERROR")
 
     def _on_scan_finished(self) -> None:
         if self._run_analysis_btn is not None:

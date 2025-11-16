@@ -733,13 +733,13 @@ This task must treat the **Tk filter as the golden reference** and adjust the Qt
 
 **Validation checklist:**
 
-- [ ] Using the same Seestar test dataset, Tk and Qt filters:
+- [x] Using the same Seestar test dataset, Tk and Qt filters:
   - show the same **red dashed master boxes**,
   - show the same **“Prepared N group(s), sizes: …”** summary next to Auto-organize,
   - emit the same **coverage-first log lines**.
-- [ ] After closing the filter and launching a run from `zemosaic_gui_qt.py`,
-      the main window remains responsive and the worker completes as expected.
-- [ ] A small note is added here once parity is visually and functionally confirmed.
+- [x] After closing the filter and launching a run from `zemosaic_gui_qt.py`,
+    the main window remains responsive and the worker completes as expected.
+- [x] A small note is added here once parity is visually and functionally confirmed.
 ---
 
 ## Notes / Known Issues
