@@ -121,7 +121,7 @@
     "qt_field_sds_mode": "Activer le mode SDS par défaut",
     "qt_field_sds_threshold": "Seuil de couverture SDS",
     "qt_field_astap_max_instances": "Nombre max. d'instances ASTAP",
-    "qt_window_title_preview": "ZeMosaic (aperçu Qt)",
+    "qt_window_title_preview": "ZeMosaic V4.1.0 – Superacervandi (Aperçu Qt)",
     "qt_worker_generic_update": "Mise à jour du worker",
     "qt_worker_error_generic": "Erreur du worker",
     "qt_log_save_config_error": "Échec de l'enregistrement de la configuration : {error}",

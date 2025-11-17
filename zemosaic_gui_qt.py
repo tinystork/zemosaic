@@ -729,6 +729,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._main_columns_splitter: QSplitter | None = None
         self._main_left_splitter: QSplitter | None = None
         self._splitter_states_restored = False
+        self._intertile_group: QGroupBox | None = None
+        self._poststack_group: QGroupBox | None = None
 
         self._last_filter_overrides: Dict[str, Any] | None = None
         self._last_filtered_header_items: List[Any] | None = None
@@ -1025,23 +1027,47 @@ class ZeMosaicQtMainWindow(QMainWindow):
         columns_splitter = QSplitter(Qt.Horizontal, parent_widget)
         columns_splitter.setChildrenCollapsible(False)
 
-        # left column: folders, mosaic and instrument groups
+        # left column: folders, mosaic, intertile, post-stack review, and instrument groups
         left_splitter = QSplitter(Qt.Vertical, columns_splitter)
         left_splitter.setChildrenCollapsible(False)
         folders_group = self._create_folders_group()
         mosaic_group = self._create_mosaic_group()
         instrument_group = self._create_instrument_group()
+        intertile_group = self._intertile_group
+        poststack_group = self._poststack_group
         left_splitter.addWidget(folders_group)
         left_splitter.addWidget(mosaic_group)
+        if intertile_group is not None:
+            left_splitter.addWidget(intertile_group)
+        if poststack_group is not None:
+            left_splitter.addWidget(poststack_group)
         left_splitter.addWidget(instrument_group)
-        left_splitter.setCollapsible(0, False)
-        left_splitter.setCollapsible(1, False)
-        left_splitter.setCollapsible(2, False)
+
+        # non-collapsible panels
+        left_splitter.setCollapsible(0, False)  # folders
+        left_splitter.setCollapsible(1, False)  # mosaic
+        index = 2
+        if intertile_group is not None:
+            left_splitter.setCollapsible(index, False)
+            index += 1
+        if poststack_group is not None:
+            left_splitter.setCollapsible(index, False)
+            index += 1
+        left_splitter.setCollapsible(index, False)  # instrument
+
+        # initial stretch: folders slightly taller, others balanced
         left_splitter.setStretchFactor(0, 3)
         left_splitter.setStretchFactor(1, 2)
-        left_splitter.setStretchFactor(2, 2)
+        index = 2
+        if intertile_group is not None:
+            left_splitter.setStretchFactor(index, 2)
+            index += 1
+        if poststack_group is not None:
+            left_splitter.setStretchFactor(index, 2)
+            index += 1
+        left_splitter.setStretchFactor(index, 2)
 
-        # right column: final assembly output
+        # right column: final assembly output (without intertile)
         right_splitter = QSplitter(Qt.Vertical, columns_splitter)
         right_splitter.setChildrenCollapsible(False)
         final_group = self._create_final_assembly_group()
@@ -2087,10 +2113,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(10)
 
-        general_box = QGroupBox(
+        general_header = QLabel(
             self._tr("qt_group_final_general", "General output options"),
             group,
         )
+        layout.addWidget(general_header)
+
+        general_box = QWidget(group)
         general_layout = QFormLayout(general_box)
         general_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
 
@@ -2172,15 +2201,21 @@ class ZeMosaicQtMainWindow(QMainWindow):
             parsed_num_workers = max_spin_workers
         num_workers_spinbox.setValue(parsed_num_workers)
         self.config["num_processing_workers"] = parsed_num_workers
-        general_layout.addRow(num_workers_label, num_workers_spinbox)
+        threads_row = QWidget(general_box)
+        threads_layout = QHBoxLayout(threads_row)
+        threads_layout.setContentsMargins(0, 0, 0, 0)
+        threads_layout.setSpacing(8)
+        threads_layout.addWidget(num_workers_spinbox, 0)
         num_workers_note = QLabel(
             self._tr(
                 "num_workers_note", "(0 = auto, based on CPU cores)"
             ),
-            general_box,
+            threads_row,
         )
         num_workers_note.setWordWrap(True)
-        general_layout.addRow(QLabel(""), num_workers_note)
+        num_workers_note.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        threads_layout.addWidget(num_workers_note, 1)
+        general_layout.addRow(num_workers_label, threads_row)
         self._config_fields["num_processing_workers"] = {
             "kind": "spinbox",
             "widget": num_workers_spinbox,
@@ -2286,8 +2321,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             decimals=2,
             default=(0.85, 1.18),
         )
-
-        layout.addWidget(intertile_box)
+        self._intertile_group = intertile_box
 
         center_box = QGroupBox(
             self._tr("qt_group_center_out", "Center-out normalization"),
@@ -2449,8 +2483,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             post_layout,
             self._tr("qt_field_poststack_use_overlap", "Use overlap affine adjustment"),
         )
-
-        layout.addWidget(post_box)
+        self._poststack_group = post_box
 
         return group
 
