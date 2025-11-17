@@ -1,60 +1,100 @@
-# FOLLOW-UP TASKS — ZEMOSAIC FILTER QT
+# FOLLOW-UP TASK LIST — ZEMOSAIC FILTER GUI QT ENHANCEMENTS
 
-After completing the main AGENT MISSION, perform these follow-up tasks:
+This file defines the exact steps you must execute to complete the mission described in agent.md.
 
-### 1. VALIDATE GROUP OUTLINES
-- Confirm that when frames contain valid WCS:
-  - Group rectangles are visible
-  - They refresh when regrouping occurs
-  - Zooming and panning do not remove the outlines
-- Ensure the legend reflects correct group count and colors.
+---
 
-### 2. PERFORMANCE CHECK
-- Verify that drawing only group outlines eliminates UI freeze when:
-  - 2000+ frames are loaded
-  - Coverage-first clustering is enabled
-  - Orientation split is used
+# ✅ TASK 1 — Replace Flat QTableWidget With Grouped QTreeWidget
 
-### 3. REMOVE RESIDUAL REFERENCES TO REMOVED LOG
-- Remove any functions or handler code referencing:
-  - “scan log”
-  - “grouping log”
-  - “append_to_log”
-  - “log_widget”
-  - or equivalent names
+### 1.1 Create a QTreeWidget to replace the existing images table
+- Insert in the same container where the current QTableWidget is created.
+- Headers: “File”, “WCS”, “Instrument”.
 
-### 4. ENSURE NO REGRESSION IN THESE FEATURES
-- Auto-organize master tiles
-- “Coverage-first clustering”
-- Auto split by orientation
-- Export CSV
-- WCS resolution check
-- ZeSupaDupStack toggle
+### 1.2 Populate the QTreeWidget in `refresh_items()` or equivalent
+For each group:
+- create a `QTreeWidgetItem` as group root
+- set:
+  - checkbox (tri-state)
+  - label = “Group X”
+- append as top-level item
 
-### 5. FINAL POLISH
-- Re-run the preview twice to confirm no exceptions in console.
-- Save+restore window geometry continues to work.
-- Tab switching (Sky Preview / Coverage Map) works without warnings.
+For each image inside the group:
+- create child item with:
+  - checkbox
+  - File name
+  - WCS state
+  - Instrument
 
-### 6. CONSISTENT GROUP BOX SIZE (MATCH FIRST TILE WCS)
-To better reflect the real mosaic:
+### 1.3 Implement checkbox propagation
+- When a group is checked, check all children  
+- When an image is checked:
+  - update group tri-state via:
+    - all checked → group fully checked  
+    - none checked → group unchecked  
+    - mixed → group partially checked  
 
-- For each **group** used in the Qt filter preview:
-  - Identify the **first item in the group** that has a valid WCS footprint.
-  - Compute this tile’s footprint in RA/DEC (four corners).
-  - Derive its approximate **width and height** in degrees:
-    - `width_deg = max(ra) - min(ra)`
-    - `height_deg = max(dec) - min(dec)`
-- When building the **group outline rectangle**:
-  - Use the group’s existing center (mean RA/DEC or current centroid).
-  - Build a rectangle aligned with RA/DEC axes whose **width/height exactly match**
-    `width_deg` / `height_deg` of that first WCS footprint.
-- Apply this only to the **Qt filter GUI** outline drawing:
-  - Do NOT change the worker logic or FITS/WCS data.
-  - Do NOT change how Tk draws its own outlines.
-- If no member of a group has a valid WCS footprint:
-  - Fallback to the current behaviour for that group (no outline or legacy size).
+### 1.4 Ensure internal “kept images” logic matches existing flat model
 
-Verify visually that:
-- Each group box has a coherent size comparable to a single tile footprint.
-- The preview gives a realistic impression of how the future mosaic will look.
+---
+
+# ✅ TASK 2 — Implement Rubber-Band Rectangle Selection in Sky Preview
+
+### 2.1 Add a rectangle selector tool
+Choose one:
+- `matplotlib.widgets.RectangleSelector`, recommended  
+OR  
+- custom callbacks (`on_press`, `on_move`, `on_release`)
+
+### 2.2 Draw selection rectangle as transparent blue overlay
+
+### 2.3 On release:
+- Convert rectangle bounds to RA/DEC using the existing WCS
+- Determine which groups intersect the bounding region:
+  - group footprint test OR
+  - group centroid test
+
+### 2.4 Sync selection with groups list
+- Expand selected groups in the QTreeWidget  
+- Check all selected groups  
+- Highlight group colors in sky preview (optional but recommended)
+
+---
+
+# ✅ TASK 3 — Maintain Sky Preview Stability
+- Ensure your rectangle drawing does not interfere with:
+  - existing coverage map
+  - existing master-tile outlines
+- Add redraw throttling if necessary using QTimer.
+
+---
+
+# ✅ TASK 4 — UI Polish
+- Preserve window geometry persistence using existing keys.
+- Keep localization keys intact.
+- Optional: add “Expand All / Collapse All” buttons if easy.
+
+---
+
+# VALIDATION TESTS
+
+### ✔ Test 1 — Load a Seestar dataset with 10+ groups
+- Groups must display correctly in tree form.
+
+### ✔ Test 2 — Check/uncheck groups
+- All images inside reflect the change.
+
+### ✔ Test 3 — Partial selection
+- Manually check 1 image → group becomes tri-state.
+
+### ✔ Test 4 — Rubber band selection
+- Drawing a rectangle over footprints selects correct groups.
+
+### ✔ Test 5 — Multi-group selection
+- Selecting a large region checks multiple groups.
+
+### ✔ Test 6 — No regression
+- Launch mosaic → identical behavior to previous version.
+
+---
+
+# END OF FOLLOW-UP FILE

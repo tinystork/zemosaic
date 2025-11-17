@@ -100,8 +100,8 @@ from PySide6.QtWidgets import (  # noqa: E402  - imported after availability che
     QComboBox,
     QDoubleSpinBox,
     QSpinBox,
-    QTableWidget,
-    QTableWidgetItem,
+    QTreeWidget,
+    QTreeWidgetItem,
     QWidget,
     QVBoxLayout,
     QPlainTextEdit,
@@ -109,7 +109,25 @@ from PySide6.QtWidgets import (  # noqa: E402  - imported after availability che
     QFileDialog,
     QAbstractItemView,
     QTabWidget,
+    QHeaderView,
 )
+
+
+def _resolve_tristate_flag() -> Qt.ItemFlag:
+    candidates = ("ItemIsTristate", "ItemIsAutoTristate", "ItemIsUserTristate")
+    for name in candidates:
+        flag = getattr(Qt, name, None)
+        if flag is not None:
+            return flag
+        item_flag = getattr(Qt, "ItemFlag", None)
+        if item_flag is not None:
+            derived = getattr(item_flag, name, None)
+            if derived is not None:
+                return derived
+    raise AttributeError("Qt is missing all tristate item flags")
+
+
+_QT_TRISTATE_FLAG = _resolve_tristate_flag()
 
 
 def _load_zemosaic_qicon() -> QIcon | None:
@@ -158,11 +176,13 @@ try:  # pragma: no cover - optional dependency guard
     from matplotlib.figure import Figure
     from matplotlib.colors import to_rgba
     from matplotlib.patches import Rectangle
+    from matplotlib.widgets import RectangleSelector
 except Exception:  # pragma: no cover - matplotlib optional
     FigureCanvasQTAgg = None  # type: ignore[assignment]
     LineCollection = None  # type: ignore[assignment]
     Figure = None  # type: ignore[assignment]
     Rectangle = None  # type: ignore[assignment]
+    RectangleSelector = None  # type: ignore[assignment]
     to_rgba = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - optional dependency guard
@@ -446,6 +466,9 @@ class _NormalizedItem:
     footprint_radec: List[Tuple[float, float]] | None = None
     header_cache: Any | None = None
     wcs_cache: Any | None = None
+
+
+_GroupKey = tuple[int | None, str | None]
 
 
 def _sanitize_footprint_radec(payload: Any) -> List[Tuple[float, float]] | None:
@@ -1537,7 +1560,7 @@ class FilterQtDialog(QDialog):
         self._auto_group_requested = bool(overrides.get("filter_auto_group", False))
         self._seestar_priority = bool(overrides.get("filter_seestar_priority", False))
 
-        self._table = QTableWidget(self)
+        self._tree = QTreeWidget(self)
         self._summary_label = QLabel(self)
         self._status_label = QLabel(self)
         self._progress_bar = QProgressBar(self)
@@ -1599,6 +1622,15 @@ class FilterQtDialog(QDialog):
         self._angle_split_value = float(base_angle)
         self._group_outline_bounds: list[tuple[float, float, float, float]] = []
         self._group_outline_collection: LineCollection | None = None
+        self._entry_check_state: list[bool] = [bool(item.include_by_default) for item in self._normalized_items]
+        self._entry_items: list[QTreeWidgetItem | None] = [None] * len(self._normalized_items)
+        self._group_item_map: dict[_GroupKey, QTreeWidgetItem] = {}
+        self._group_entries: dict[_GroupKey, list[int]] = {}
+        self._cluster_index_to_group_key: dict[int, _GroupKey] = {}
+        self._tree_signal_guard = False
+        self._rectangle_selector: RectangleSelector | None = None
+        self._selected_group_keys: set[_GroupKey] = set()
+        self._selection_bounds: tuple[float, float, float, float] | None = None
         self._preview_color_cycle: tuple[str, ...] = (
             "#3f7ad6",
             "#d64b3f",
@@ -1648,7 +1680,7 @@ class FilterQtDialog(QDialog):
                 f"csv_loaded={cache_loaded} input_source={self._describe_input_source()}"
             )
         else:
-            self._populate_table()
+            self._populate_tree()
             self._update_summary_label()
             self._schedule_preview_refresh()
             self._schedule_cluster_refresh()
@@ -1734,6 +1766,36 @@ class FilterQtDialog(QDialog):
             "Preview shows the approximate pointing of selected frames (limited by preview cap).",
         )
         self._preview_hint_label.setText(self._preview_default_hint)
+        if RectangleSelector is not None:
+            try:
+                selector = RectangleSelector(
+                    axes,
+                    self._on_preview_rectangle_selected,
+                    useblit=True,
+                    button=[1],
+                    minspanx=0.0,
+                    minspany=0.0,
+                    spancoords="data",
+                    interactive=False,
+                    drag_from_anywhere=False,
+                )
+                try:
+                    selector.set_props(
+                        dict(facecolor=(0.2, 0.4, 0.9, 0.2), edgecolor="#3478d6", linewidth=1.2)
+                    )
+                except Exception:
+                    try:
+                        selector.rectprops.update(  # type: ignore[attr-defined]
+                            facecolor=(0.2, 0.4, 0.9, 0.2),
+                            edgecolor="#3478d6",
+                            linewidth=1.2,
+                        )
+                    except Exception:
+                        pass
+                selector.set_active(True)
+                self._rectangle_selector = selector
+            except Exception:
+                self._rectangle_selector = None
         return canvas
 
     def _create_coverage_canvas(self) -> FigureCanvasQTAgg | None:
@@ -2017,12 +2079,9 @@ class FilterQtDialog(QDialog):
             return
         target = combo.currentData()
 
-        self._table.blockSignals(True)
         excluded = 0
+        changed = False
         for row, entry in enumerate(self._normalized_items):
-            item = self._table.item(row, 0)
-            if item is None:
-                continue
             instrument_label = (entry.instrument or "").strip()
             keep = True
             if target is None:
@@ -2032,13 +2091,14 @@ class FilterQtDialog(QDialog):
             elif isinstance(target, str):
                 keep = instrument_label.lower() == target.lower()
             if not keep:
-                if item.checkState() != Qt.Unchecked:
-                    item.setCheckState(Qt.Unchecked)
+                if self._set_entry_checked(row, False):
                     excluded += 1
+                    changed = True
             else:
-                if item.checkState() != Qt.Checked:
-                    item.setCheckState(Qt.Checked)
-        self._table.blockSignals(False)
+                if self._set_entry_checked(row, True):
+                    changed = True
+        if changed:
+            self._after_selection_changed()
         if excluded:
             message = self._localizer.get(
                 "filter.instrument.filtered",
@@ -3392,8 +3452,7 @@ class FilterQtDialog(QDialog):
     def _compute_global_center(self) -> Tuple[float | None, float | None]:
         coords: list[Tuple[float, float]] = []
         for row, entry in enumerate(self._normalized_items):
-            item = self._table.item(row, 0)
-            if item is None or item.checkState() != Qt.Checked:
+            if not self._entry_is_checked(row):
                 continue
             ra, dec = entry.center_ra_deg, entry.center_dec_deg
             if ra is None or dec is None:
@@ -3451,21 +3510,16 @@ class FilterQtDialog(QDialog):
             return
 
         excluded = 0
-        self._table.blockSignals(True)
         for row, entry in enumerate(self._normalized_items):
-            item = self._table.item(row, 0)
-            if item is None:
-                continue
             ra_deg, dec_deg = entry.center_ra_deg, entry.center_dec_deg
             if ra_deg is None or dec_deg is None:
                 ra_deg, dec_deg = self._ensure_entry_coordinates(entry)
             if ra_deg is None or dec_deg is None:
                 continue
             distance = self._angular_distance_deg(ra_deg, dec_deg, center_ra, center_dec)
-            if distance > threshold and item.checkState() != Qt.Unchecked:
-                item.setCheckState(Qt.Unchecked)
-                excluded += 1
-        self._table.blockSignals(False)
+            if distance > threshold:
+                if self._set_entry_checked(row, False):
+                    excluded += 1
         summary = self._localizer.get(
             "filter.exclude.result",
             "Excluded {count} frame(s) beyond {threshold:.1f}°.",
@@ -3714,22 +3768,26 @@ class FilterQtDialog(QDialog):
         activity_layout.addWidget(self._activity_log_output)
         controls_layout.addWidget(activity_group, 1)
 
-        self._table.setColumnCount(4)
+        self._tree.setColumnCount(3)
         headers = [
             self._localizer.get("filter.column.file", "File"),
             self._localizer.get("filter.column.wcs", "WCS"),
-            self._localizer.get("filter.column.group", "Group"),
             self._localizer.get("filter.column.instrument", "Instrument"),
         ]
-        self._table.setHorizontalHeaderLabels(headers)
-        self._table.verticalHeader().setVisible(False)
-        self._table.setSelectionBehavior(QTableWidget.SelectRows)
-        self._table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self._table.setDragDropMode(QAbstractItemView.NoDragDrop)
-        self._table.setDragEnabled(False)
-        self._table.setAcceptDrops(False)
-        self._table.horizontalHeader().setStretchLastSection(True)
-        self._table.itemChanged.connect(self._handle_item_changed)
+        self._tree.setHeaderLabels(headers)
+        self._tree.setExpandsOnDoubleClick(True)
+        self._tree.setUniformRowHeights(True)
+        self._tree.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._tree.setSelectionMode(QAbstractItemView.NoSelection)
+        self._tree.setDragDropMode(QAbstractItemView.NoDragDrop)
+        self._tree.setDragEnabled(False)
+        self._tree.setAcceptDrops(False)
+        header = self._tree.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self._tree.itemChanged.connect(self._handle_tree_item_changed)
 
         images_group = QGroupBox(
             self._localizer.get("filter_images_check_to_keep", "Images (check to keep)"),
@@ -3738,7 +3796,20 @@ class FilterQtDialog(QDialog):
         images_layout = QVBoxLayout(images_group)
         images_layout.setContentsMargins(8, 8, 8, 8)
         images_layout.setSpacing(6)
-        images_layout.addWidget(self._table, 1)
+        tree_controls = QHBoxLayout()
+        tree_controls.setContentsMargins(0, 0, 0, 0)
+        tree_controls.setSpacing(6)
+        expand_btn = QPushButton(self._localizer.get("filter.expand_all", "Expand all"), images_group)
+        expand_btn.setToolTip(self._localizer.get("filter.expand_all.tooltip", "Expand all groups"))
+        expand_btn.clicked.connect(self._expand_all_groups)  # type: ignore[arg-type]
+        collapse_btn = QPushButton(self._localizer.get("filter.collapse_all", "Collapse all"), images_group)
+        collapse_btn.setToolTip(self._localizer.get("filter.collapse_all.tooltip", "Collapse all groups"))
+        collapse_btn.clicked.connect(self._collapse_all_groups)  # type: ignore[arg-type]
+        tree_controls.addWidget(expand_btn)
+        tree_controls.addWidget(collapse_btn)
+        tree_controls.addStretch(1)
+        images_layout.addLayout(tree_controls)
+        images_layout.addWidget(self._tree, 1)
 
         controls_layout.addWidget(images_group, 2)
 
@@ -3837,7 +3908,14 @@ class FilterQtDialog(QDialog):
         self._stream_loaded_count = 0
         self._streaming_active = True
         self._streaming_completed = False
-        self._table.setRowCount(0)
+        self._tree.clear()
+        self._entry_check_state = []
+        self._entry_items = []
+        self._group_item_map = {}
+        self._group_entries = {}
+        self._cluster_index_to_group_key = {}
+        self._selected_group_keys.clear()
+        self._selection_bounds = None
         self._update_summary_label()
         loading_text = self._localizer.get("filter.stream.starting", "Discovering frames…")
         self._status_label.setText(loading_text)
@@ -3946,61 +4024,238 @@ class FilterQtDialog(QDialog):
         if was_running:
             self._streaming_completed = False
 
-    def _populate_table(self) -> None:
-        items = self._normalized_items
-        self._table.blockSignals(True)
-        self._table.setRowCount(len(items))
-        for row, entry in enumerate(items):
-            self._populate_row(row, entry)
-        self._table.blockSignals(False)
+    def _populate_tree(self) -> None:
+        self._ensure_entry_state_capacity()
+        self._rebuild_tree(preserve_expansion=False)
         self._refresh_instrument_options()
-
-    def _populate_row(self, row: int, entry: _NormalizedItem) -> None:
-        name_item = QTableWidgetItem(entry.display_name)
-        name_item.setFlags(name_item.flags() | Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
-        name_item.setCheckState(Qt.Checked if entry.include_by_default else Qt.Unchecked)
-        self._table.setItem(row, 0, name_item)
-
-        has_wcs_text = (
-            self._localizer.get("filter.value.wcs_present", "Yes")
-            if entry.has_wcs
-            else self._localizer.get("filter.value.wcs_missing", "No")
-        )
-        wcs_item = QTableWidgetItem(has_wcs_text)
-        wcs_item.setFlags(wcs_item.flags() & ~Qt.ItemIsEditable)
-        self._table.setItem(row, 1, wcs_item)
-
-        group_label = entry.group_label or self._localizer.get("filter.value.group_unassigned", "Unassigned")
-        group_item = QTableWidgetItem(group_label)
-        group_item.setFlags(group_item.flags() & ~Qt.ItemIsEditable)
-        self._table.setItem(row, 2, group_item)
-
-        instrument = entry.instrument or self._localizer.get("filter.value.unknown", "Unknown")
-        instrument_item = QTableWidgetItem(instrument)
-        instrument_item.setFlags(instrument_item.flags() & ~Qt.ItemIsEditable)
-        self._table.setItem(row, 3, instrument_item)
 
     def _append_rows(self, entries: Sequence[_NormalizedItem]) -> None:
         if not entries:
             return
-        start_row = self._table.rowCount()
-        self._table.blockSignals(True)
-        self._table.setRowCount(start_row + len(entries))
-        for offset, entry in enumerate(entries):
-            self._populate_row(start_row + offset, entry)
-        self._table.blockSignals(False)
+        self._ensure_entry_state_capacity()
+        self._rebuild_tree(preserve_expansion=True)
         self._update_summary_label()
         self._schedule_preview_refresh()
         self._schedule_cluster_refresh()
         self._refresh_instrument_options()
 
+    def _ensure_entry_state_capacity(self) -> None:
+        target = len(self._normalized_items)
+        if len(self._entry_check_state) > target:
+            self._entry_check_state = self._entry_check_state[:target]
+        while len(self._entry_check_state) < target:
+            entry = self._normalized_items[len(self._entry_check_state)]
+            self._entry_check_state.append(bool(entry.include_by_default))
+
+    def _group_key_for_entry(self, entry: _NormalizedItem) -> _GroupKey:
+        cluster_idx = entry.cluster_index if isinstance(entry.cluster_index, int) else None
+        label = entry.group_label.strip() if isinstance(entry.group_label, str) else None
+        if label:
+            return (cluster_idx, label)
+        if cluster_idx is not None:
+            return (cluster_idx, None)
+        return (None, None)
+
+    def _group_label_for_key(self, key: _GroupKey) -> str:
+        cluster_idx, label = key
+        if label:
+            return label
+        if cluster_idx is not None:
+            template = self._localizer.get("filter.preview.group_label", "Group {index}")
+            try:
+                return template.format(index=cluster_idx + 1)
+            except Exception:
+                return f"Group {cluster_idx + 1}"
+        return self._localizer.get("filter.value.group_unassigned", "Unassigned")
+
+    def _rebuild_tree(self, preserve_expansion: bool = True) -> None:
+        if self._tree is None:
+            return
+        self._ensure_entry_state_capacity()
+        expanded_keys: set[_GroupKey] = set()
+        if preserve_expansion:
+            for key, item in self._group_item_map.items():
+                if item is not None and item.isExpanded():
+                    expanded_keys.add(key)
+
+        self._tree_signal_guard = True
+        self._tree.blockSignals(True)
+        self._tree.clear()
+        self._entry_items = [None] * len(self._normalized_items)
+        self._group_item_map = {}
+        self._group_entries = {}
+        self._cluster_index_to_group_key = {}
+
+        groups: dict[_GroupKey, list[int]] = {}
+        for idx, entry in enumerate(self._normalized_items):
+            key = self._group_key_for_entry(entry)
+            groups.setdefault(key, []).append(idx)
+
+        for key, indices in groups.items():
+            if not indices:
+                continue
+            label = self._group_label_for_key(key)
+            group_item = QTreeWidgetItem(self._tree)
+            group_item.setText(0, label)
+            group_item.setFlags(
+                Qt.ItemIsUserCheckable | _QT_TRISTATE_FLAG | Qt.ItemIsEnabled | Qt.ItemIsSelectable
+            )
+            group_item.setCheckState(0, Qt.Unchecked)
+            group_item.setData(0, Qt.UserRole, {"group_key": key})
+            self._group_item_map[key] = group_item
+            self._group_entries[key] = list(indices)
+            cluster_idx, _ = key
+            if isinstance(cluster_idx, int):
+                self._cluster_index_to_group_key[cluster_idx] = key
+            for idx in indices:
+                self._create_entry_item(group_item, idx)
+            self._refresh_group_check_state(group_item)
+            if key in expanded_keys or len(groups) <= 4:
+                group_item.setExpanded(True)
+
+        self._tree.blockSignals(False)
+        self._tree_signal_guard = False
+        if self._selected_group_keys:
+            self._selected_group_keys = {
+                key for key in self._selected_group_keys if key in self._group_item_map
+            }
+
+    def _current_group_entries(self) -> dict[_GroupKey, list[int]]:
+        if self._group_entries:
+            return self._group_entries
+        fallback: dict[_GroupKey, list[int]] = {}
+        for idx, entry in enumerate(self._normalized_items):
+            key = self._group_key_for_entry(entry)
+            fallback.setdefault(key, []).append(idx)
+        self._group_entries = {key: indices for key, indices in fallback.items() if indices}
+        return self._group_entries
+
+    def _create_entry_item(self, parent: QTreeWidgetItem, index: int) -> None:
+        entry = self._normalized_items[index]
+        item = QTreeWidgetItem(parent)
+        item.setText(0, entry.display_name)
+        item.setText(1, self._entry_wcs_text(entry))
+        item.setText(2, self._entry_instrument_text(entry))
+        item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+        state = Qt.Checked if self._entry_check_state[index] else Qt.Unchecked
+        item.setCheckState(0, state)
+        item.setData(0, Qt.UserRole, index)
+        self._entry_items[index] = item
+
+    def _refresh_entry_row(self, index: int) -> None:
+        if not (0 <= index < len(self._entry_items)):
+            return
+        item = self._entry_items[index]
+        if item is None:
+            return
+        entry = self._normalized_items[index]
+        item.setText(1, self._entry_wcs_text(entry))
+        item.setText(2, self._entry_instrument_text(entry))
+
+    def _entry_wcs_text(self, entry: _NormalizedItem) -> str:
+        return (
+            self._localizer.get("filter.value.wcs_present", "Yes")
+            if entry.has_wcs
+            else self._localizer.get("filter.value.wcs_missing", "No")
+        )
+
+    def _entry_instrument_text(self, entry: _NormalizedItem) -> str:
+        return entry.instrument or self._localizer.get("filter.value.unknown", "Unknown")
+
+    def _refresh_group_check_state(self, group_item: QTreeWidgetItem | None) -> None:
+        if group_item is None:
+            return
+        total = group_item.childCount()
+        if total == 0:
+            self._tree_signal_guard = True
+            group_item.setCheckState(0, Qt.Unchecked)
+            self._tree_signal_guard = False
+            return
+        checked = 0
+        for idx in range(total):
+            state = group_item.child(idx).checkState(0)
+            if state == Qt.Checked:
+                checked += 1
+        if checked == 0:
+            state = Qt.Unchecked
+        elif checked == total:
+            state = Qt.Checked
+        else:
+            state = Qt.PartiallyChecked
+        self._tree_signal_guard = True
+        group_item.setCheckState(0, state)
+        self._tree_signal_guard = False
+
     # ------------------------------------------------------------------
     # Interaction helpers
     # ------------------------------------------------------------------
-    def _handle_item_changed(self, _: QTableWidgetItem) -> None:
+    def _handle_tree_item_changed(self, item: QTreeWidgetItem, column: int) -> None:
+        if column != 0 or self._tree_signal_guard:
+            return
+        if item.parent() is None:
+            self._handle_group_item_changed(item)
+        else:
+            self._handle_entry_item_changed(item)
+
+    def _handle_group_item_changed(self, item: QTreeWidgetItem) -> None:
+        state = item.checkState(0)
+        if state == Qt.PartiallyChecked:
+            return
+        desired = state == Qt.Checked
+        self._tree_signal_guard = True
+        for idx in range(item.childCount()):
+            child = item.child(idx)
+            child.setCheckState(0, Qt.Checked if desired else Qt.Unchecked)
+        self._tree_signal_guard = False
+        for idx in range(item.childCount()):
+            entry_idx = item.child(idx).data(0, Qt.UserRole)
+            if isinstance(entry_idx, int):
+                self._entry_check_state[entry_idx] = desired
+        self._after_selection_changed()
+
+    def _handle_entry_item_changed(self, item: QTreeWidgetItem) -> None:
+        entry_idx = item.data(0, Qt.UserRole)
+        if not isinstance(entry_idx, int):
+            return
+        checked = item.checkState(0) == Qt.Checked
+        self._entry_check_state[entry_idx] = checked
+        self._refresh_group_check_state(item.parent())
+        self._after_selection_changed()
+
+    def _after_selection_changed(self) -> None:
         self._update_summary_label()
         self._schedule_preview_refresh()
         self._schedule_cluster_refresh()
+
+    def _entry_is_checked(self, index: int) -> bool:
+        return 0 <= index < len(self._entry_check_state) and self._entry_check_state[index]
+
+    def _set_entry_checked(self, index: int, checked: bool) -> bool:
+        if not (0 <= index < len(self._entry_check_state)):
+            return False
+        if self._entry_check_state[index] == checked:
+            return False
+        self._entry_check_state[index] = checked
+        item = self._entry_items[index]
+        if item is not None:
+            parent = item.parent()
+            self._tree_signal_guard = True
+            item.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
+            self._tree_signal_guard = False
+            self._refresh_group_check_state(parent)
+        return True
+
+    def _expand_all_groups(self) -> None:
+        if self._tree is None:
+            return
+        for idx in range(self._tree.topLevelItemCount()):
+            self._tree.topLevelItem(idx).setExpanded(True)
+
+    def _collapse_all_groups(self) -> None:
+        if self._tree is None:
+            return
+        for idx in range(self._tree.topLevelItemCount()):
+            self._tree.topLevelItem(idx).setExpanded(False)
 
     def _select_all(self) -> None:
         self._toggle_all(True)
@@ -4009,34 +4264,19 @@ class FilterQtDialog(QDialog):
         self._toggle_all(False)
 
     def _toggle_all(self, enabled: bool) -> None:
-        state = Qt.Checked if enabled else Qt.Unchecked
-        self._table.blockSignals(True)
-        for row in range(self._table.rowCount()):
-            item = self._table.item(row, 0)
-            if item is not None:
-                item.setCheckState(state)
-        self._table.blockSignals(False)
-        self._update_summary_label()
-        self._schedule_preview_refresh()
-        self._schedule_cluster_refresh()
+        changed = False
+        for idx in range(len(self._normalized_items)):
+            if self._set_entry_checked(idx, enabled):
+                changed = True
+        if changed:
+            self._after_selection_changed()
 
     def _collect_selected_indices(self) -> list[int]:
-        indices: list[int] = []
-        for row in range(self._table.rowCount()):
-            item = self._table.item(row, 0)
-            if item is None:
-                continue
-            if item.checkState() == Qt.Checked:
-                indices.append(row)
-        return indices
+        return [idx for idx, checked in enumerate(self._entry_check_state) if checked]
 
     def _update_summary_label(self) -> None:
-        total = self._table.rowCount()
-        selected = 0
-        for row in range(total):
-            item = self._table.item(row, 0)
-            if item and item.checkState() == Qt.Checked:
-                selected += 1
+        total = len(self._normalized_items)
+        selected = sum(1 for flag in self._entry_check_state if flag)
         summary_text = self._localizer.get(
             "filter.summary.selected",
             "{selected} of {total} frames selected",
@@ -4370,8 +4610,7 @@ class FilterQtDialog(QDialog):
         limit = self._resolve_preview_cap()
         points: list[Tuple[float, float, int | None]] = []
         for row, entry in enumerate(self._normalized_items):
-            item = self._table.item(row, 0)
-            if item is None or item.checkState() != Qt.Checked:
+            if not self._entry_is_checked(row):
                 continue
             ra_deg, dec_deg = entry.center_ra_deg, entry.center_dec_deg
             if ra_deg is None or dec_deg is None:
@@ -4383,6 +4622,168 @@ class FilterQtDialog(QDialog):
             if limit is not None and len(points) >= limit:
                 break
         return points
+
+    def _on_preview_rectangle_selected(self, eclick, erelease) -> None:
+        if eclick is None or erelease is None:
+            return
+        if eclick.xdata is None or erelease.xdata is None or eclick.ydata is None or erelease.ydata is None:
+            return
+        try:
+            ra1 = float(eclick.xdata)
+            ra2 = float(erelease.xdata)
+            dec1 = float(eclick.ydata)
+            dec2 = float(erelease.ydata)
+        except Exception:
+            return
+        if not all(math.isfinite(value) for value in (ra1, ra2, dec1, dec2)):
+            return
+        ra_min, ra_max = (ra1, ra2) if ra1 <= ra2 else (ra2, ra1)
+        dec_min, dec_max = (dec1, dec2) if dec1 <= dec2 else (dec2, dec1)
+        self._selection_bounds = (ra_min, ra_max, dec_min, dec_max)
+        selected_keys = self._resolve_groups_in_bounds(ra_min, ra_max, dec_min, dec_max)
+        self._apply_group_selection(selected_keys)
+        if selected_keys:
+            message_template = self._localizer.get(
+                "filter.preview.selection_compact",
+                "Selected {count} group(s) from sky preview.",
+            )
+            try:
+                message = message_template.format(count=len(selected_keys))
+            except Exception:
+                message = f"Selected {len(selected_keys)} group(s)."
+            self._status_label.setText(message)
+            self._append_log(message)
+        else:
+            cleared_message = self._localizer.get(
+                "filter.preview.selection_cleared",
+                "No groups intersected the selected region.",
+            )
+            self._status_label.setText(cleared_message)
+            self._append_log(cleared_message)
+        self._schedule_preview_refresh()
+
+    def _resolve_groups_in_bounds(
+        self,
+        ra_min: float,
+        ra_max: float,
+        dec_min: float,
+        dec_max: float,
+    ) -> set[_GroupKey]:
+        candidates = self._group_entries
+        if not candidates:
+            candidates = self._current_group_entries()
+            if not candidates:
+                return set()
+        selected: set[_GroupKey] = set()
+        for key, indices in candidates.items():
+            if not indices:
+                continue
+            if self._group_intersects_bounds(indices, ra_min, ra_max, dec_min, dec_max):
+                selected.add(key)
+        return selected
+
+    def _group_intersects_bounds(
+        self,
+        indices: Sequence[int],
+        ra_min: float,
+        ra_max: float,
+        dec_min: float,
+        dec_max: float,
+    ) -> bool:
+        for idx in indices:
+            if not (0 <= idx < len(self._normalized_items)):
+                continue
+            entry = self._normalized_items[idx]
+            if self._entry_intersects_bounds(entry, ra_min, ra_max, dec_min, dec_max):
+                return True
+        return False
+
+    def _entry_intersects_bounds(
+        self,
+        entry: _NormalizedItem,
+        ra_min: float,
+        ra_max: float,
+        dec_min: float,
+        dec_max: float,
+    ) -> bool:
+        ra_deg, dec_deg = entry.center_ra_deg, entry.center_dec_deg
+        if ra_deg is None or dec_deg is None:
+            ra_deg, dec_deg = self._ensure_entry_coordinates(entry)
+        if (
+            ra_deg is not None
+            and dec_deg is not None
+            and self._point_in_bounds(ra_deg, dec_deg, ra_min, ra_max, dec_min, dec_max)
+        ):
+            return True
+        footprint = entry.footprint_radec or self._ensure_entry_footprint(entry)
+        if footprint:
+            for point_ra, point_dec in footprint:
+                if self._point_in_bounds(point_ra, point_dec, ra_min, ra_max, dec_min, dec_max):
+                    return True
+            ra_values = [pt[0] for pt in footprint]
+            dec_values = [pt[1] for pt in footprint]
+            if ra_values and dec_values:
+                f_ra_min = min(ra_values)
+                f_ra_max = max(ra_values)
+                f_dec_min = min(dec_values)
+                f_dec_max = max(dec_values)
+                if self._rectangles_intersect(
+                    ra_min, ra_max, dec_min, dec_max, f_ra_min, f_ra_max, f_dec_min, f_dec_max
+                ):
+                    return True
+        return False
+
+    @staticmethod
+    def _point_in_bounds(
+        ra: float,
+        dec: float,
+        ra_min: float,
+        ra_max: float,
+        dec_min: float,
+        dec_max: float,
+    ) -> bool:
+        return ra_min <= ra <= ra_max and dec_min <= dec <= dec_max
+
+    @staticmethod
+    def _rectangles_intersect(
+        ra_min_a: float,
+        ra_max_a: float,
+        dec_min_a: float,
+        dec_max_a: float,
+        ra_min_b: float,
+        ra_max_b: float,
+        dec_min_b: float,
+        dec_max_b: float,
+    ) -> bool:
+        return not (
+            ra_max_b < ra_min_a
+            or ra_min_b > ra_max_a
+            or dec_max_b < dec_min_a
+            or dec_min_b > dec_max_a
+        )
+
+    def _apply_group_selection(self, selected_keys: set[_GroupKey]) -> None:
+        if not selected_keys:
+            if self._selected_group_keys:
+                self._selected_group_keys.clear()
+                self._schedule_preview_refresh()
+            return
+        changed = False
+        for key in selected_keys:
+            entries = self._group_entries.get(key)
+            if not entries:
+                continue
+            group_item = self._group_item_map.get(key)
+            if group_item is not None:
+                group_item.setExpanded(True)
+            for idx in entries:
+                if self._set_entry_checked(idx, True):
+                    changed = True
+        self._selected_group_keys = set(selected_keys)
+        if changed:
+            self._after_selection_changed()
+        else:
+            self._schedule_preview_refresh()
 
     def _schedule_preview_refresh(self) -> None:
         if self._preview_canvas is None or self._preview_refresh_pending:
@@ -4432,15 +4833,7 @@ class FilterQtDialog(QDialog):
                 entry.group_label = None
                 entry.cluster_index = None
 
-        unassigned_text = self._localizer.get("filter.value.group_unassigned", "Unassigned")
-        self._table.blockSignals(True)
-        for row, entry in enumerate(self._normalized_items):
-            item = self._table.item(row, 2)
-            if item is None:
-                continue
-            label = entry.group_label or unassigned_text
-            item.setText(label)
-        self._table.blockSignals(False)
+        self._rebuild_tree(preserve_expansion=True)
 
         if groups and (self._scan_thread is None or not self._scan_thread.isRunning()):
             threshold_value = threshold if isinstance(threshold, (int, float)) else 0.0
@@ -4468,8 +4861,7 @@ class FilterQtDialog(QDialog):
         groups: list[list[_NormalizedItem]] = []
         centroids: list[Tuple[float, float]] = []
         for row, entry in enumerate(self._normalized_items):
-            item = self._table.item(row, 0)
-            if item is None or item.checkState() != Qt.Checked:
+            if not self._entry_is_checked(row):
                 continue
             ra_deg, dec_deg = entry.center_ra_deg, entry.center_dec_deg
             if ra_deg is None or dec_deg is None:
@@ -4599,6 +4991,57 @@ class FilterQtDialog(QDialog):
             if label:
                 scatter_kwargs["label"] = label
             axes.scatter(ra_coords, dec_coords, **scatter_kwargs)
+
+        if self._selection_bounds and Rectangle is not None:
+            try:
+                ra_min, ra_max, dec_min, dec_max = self._selection_bounds
+                width = float(ra_max) - float(ra_min)
+                height = float(dec_max) - float(dec_min)
+                if width > 0 and height > 0:
+                    selection_rect = Rectangle(
+                        (float(ra_min), float(dec_min)),
+                        width,
+                        height,
+                        linewidth=1.4,
+                        edgecolor="#1f54d6",
+                        facecolor=(0.1, 0.35, 0.85, 0.18),
+                        linestyle="-",
+                        zorder=4,
+                    )
+                    axes.add_patch(selection_rect)
+            except Exception:
+                pass
+
+        if self._selected_group_keys:
+            highlight_ra: list[float] = []
+            highlight_dec: list[float] = []
+            highlight_limit = self._resolve_preview_cap()
+            added = 0
+            for idx, entry in enumerate(self._normalized_items):
+                if not self._entry_is_checked(idx):
+                    continue
+                ra_val, dec_val = entry.center_ra_deg, entry.center_dec_deg
+                if ra_val is None or dec_val is None:
+                    ra_val, dec_val = self._ensure_entry_coordinates(entry)
+                if ra_val is None or dec_val is None:
+                    continue
+                if highlight_limit is not None and added >= highlight_limit:
+                    break
+                added += 1
+                if self._group_key_for_entry(entry) not in self._selected_group_keys:
+                    continue
+                highlight_ra.append(ra_val)
+                highlight_dec.append(dec_val)
+            if highlight_ra and highlight_dec:
+                axes.scatter(
+                    highlight_ra,
+                    highlight_dec,
+                    s=80,
+                    facecolors="none",
+                    edgecolors="#f5f542",
+                    linewidths=1.5,
+                    zorder=6,
+                )
 
         should_draw_outlines = self._should_draw_group_outlines()
 
@@ -4790,8 +5233,7 @@ class FilterQtDialog(QDialog):
     def selected_items(self) -> List[Any]:
         results: list[Any] = []
         for row, entry in enumerate(self._normalized_items):
-            item = self._table.item(row, 0)
-            if item and item.checkState() == Qt.Checked:
+            if self._entry_is_checked(row):
                 include_header = self._should_include_header_for_entry(entry)
                 results.append(
                     self._serialize_entry_for_worker(entry, row, include_header=include_header)
@@ -5085,8 +5527,7 @@ class FilterQtDialog(QDialog):
             selected_entries: list[_NormalizedItem] = []
             if selected_indices is None:
                 for row, entry in enumerate(self._normalized_items):
-                    item = self._table.item(row, 0)
-                    if item and item.checkState() == Qt.Checked:
+                    if self._entry_is_checked(row):
                         selected_entries.append(entry)
             else:
                 for idx in selected_indices:
@@ -5256,16 +5697,7 @@ class FilterQtDialog(QDialog):
         if hasattr(self, "_auto_angle_enabled") and not getattr(self, "_auto_angle_enabled", True):
             overrides["cluster_orientation_split_deg"] = float(self._angle_split_value)
 
-        excluded_indices: list[int] = []
-        try:
-            for idx, _entry in enumerate(self._normalized_items):
-                item = self._table.item(idx, 0)
-                if item is None:
-                    continue
-                if item.checkState() != Qt.Checked:
-                    excluded_indices.append(idx)
-        except Exception:
-            excluded_indices = []
+        excluded_indices = [idx for idx, checked in enumerate(self._entry_check_state) if not checked]
         if excluded_indices:
             overrides["filter_excluded_indices"] = excluded_indices
 
@@ -5361,28 +5793,18 @@ class FilterQtDialog(QDialog):
         has_wcs = payload.get("has_wcs")
         if isinstance(has_wcs, bool):
             entry.has_wcs = has_wcs
-            item = self._table.item(row, 1)
-            if item is not None:
-                text = (
-                    self._localizer.get("filter.value.wcs_present", "Yes")
-                    if has_wcs
-                    else self._localizer.get("filter.value.wcs_missing", "No")
-                )
-                item.setText(text)
         instrument_changed = False
         instrument = payload.get("instrument")
         if instrument:
             if entry.instrument != instrument:
                 entry.instrument = instrument
                 instrument_changed = True
-            item = self._table.item(row, 3)
-            if item is not None:
-                item.setText(str(instrument))
         ra_deg = payload.get("center_ra_deg")
         dec_deg = payload.get("center_dec_deg")
         if isinstance(ra_deg, (int, float)) and isinstance(dec_deg, (int, float)):
             entry.center_ra_deg = float(ra_deg)
             entry.center_dec_deg = float(dec_deg)
+        self._refresh_entry_row(row)
         self._update_summary_label()
         self._schedule_preview_refresh()
         self._schedule_cluster_refresh()
