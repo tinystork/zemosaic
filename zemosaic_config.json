@@ -12,14 +12,19 @@
     "qt_main_window_geometry": [
         2713,
         80,
-        1892,
+        2327,
         1169
     ],
-    "qt_filter_window_geometry": null,
-    "qt_main_columns_state": "AAAA/wAAAAEAAAACAAABggAAAdMA/////wEAAAABAA==",
-    "qt_main_left_state": "AAAA/wAAAAEAAAADAAABYgAAAPAAAAIEAP////8BAAAAAgA=",
-    "input_dir": "C:/Users/TRISTAN/Desktop/astrophoto/orionbelt/lights",
-    "output_dir": "C:/Users/TRISTAN/Desktop/astrophoto/orionbelt/out",
+    "qt_filter_window_geometry": [
+        3196,
+        266,
+        1474,
+        890
+    ],
+    "qt_main_columns_state": "AAAA/wAAAAEAAAACAAAEKQAACQIA/////wEAAAABAA==",
+    "qt_main_left_state": "AAAA/wAAAAEAAAADAAABCgAAAHUAAALrAP////8BAAAAAgA=",
+    "input_dir": "C:/Users/TRISTAN/Desktop/astrophoto/1114 Backup - lots of shark/1114 Backup - lots of shark/darkshark_mosaic/lights",
+    "output_dir": "C:/Users/TRISTAN/Desktop/astrophoto/1114 Backup - lots of shark/1114 Backup - lots of shark/darkshark_mosaic/out",
     "num_processing_workers": 0,
     "stacking_normalize_method": "linear_fit",
     "stacking_weighting_method": "noise_variance",
@@ -69,7 +74,7 @@
     "astrometry_local_path": "",
     "astrometry_api_key": "",
     "save_final_as_uint16": true,
-    "legacy_rgb_cube": false,
+    "legacy_rgb_cube": true,
     "coadd_use_memmap": true,
     "coadd_memmap_dir": "",
     "coadd_cleanup_memmap": true,
@@ -83,7 +88,7 @@
     "winsor_memmap_fallback": "auto",
     "winsor_split_strategy": "sequential",
     "max_raw_per_master_tile": 0,
-    "center_out_normalization_p3": true,
+    "center_out_normalization_p3": false,
     "center_out_anchor_mode": "central_only",
     "anchor_quality_probe_limit": 12,
     "anchor_quality_span_range": [

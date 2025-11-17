@@ -1614,7 +1614,7 @@ class FilterQtDialog(QDialog):
         self._activity_log_output: QPlainTextEdit | None = None
         self._log_output: QPlainTextEdit | None = None
         self._scan_recursive_checkbox: QCheckBox | None = None
-        self._draw_footprints_checkbox: QCheckBox | None = None
+        self._draw_group_outlines_checkbox: QCheckBox | None = None
         self._write_wcs_checkbox: QCheckBox | None = None
         self._sds_mode_initial = self._coerce_bool(
             (initial_overrides or {}).get("sds_mode")
@@ -1881,15 +1881,15 @@ class FilterQtDialog(QDialog):
         self._populate_astap_instances_combo()
         layout.addWidget(self._astap_instances_combo, 1, 1)
 
-        self._draw_footprints_checkbox = QCheckBox(
-            self._localizer.get("filter_chk_draw_footprints", "Draw WCS footprints"),
+        self._draw_group_outlines_checkbox = QCheckBox(
+            self._localizer.get("filter_chk_draw_footprints", "Draw group WCS outlines"),
             box,
         )
-        self._draw_footprints_checkbox.setChecked(True)
-        self._draw_footprints_checkbox.toggled.connect(  # type: ignore[arg-type]
+        self._draw_group_outlines_checkbox.setChecked(True)
+        self._draw_group_outlines_checkbox.toggled.connect(  # type: ignore[arg-type]
             lambda _checked: self._schedule_preview_refresh()
         )
-        layout.addWidget(self._draw_footprints_checkbox, 2, 0)
+        layout.addWidget(self._draw_group_outlines_checkbox, 2, 0)
 
         self._write_wcs_checkbox = QCheckBox(
             self._localizer.get("filter_chk_write_wcs", "Write WCS to file"),
@@ -4199,8 +4199,8 @@ class FilterQtDialog(QDialog):
         except Exception:
             return 200
 
-    def _should_draw_footprints(self) -> bool:
-        checkbox = self._draw_footprints_checkbox
+    def _should_draw_group_outlines(self) -> bool:
+        checkbox = self._draw_group_outlines_checkbox
         if checkbox is None:
             return False
         try:
@@ -4529,57 +4529,27 @@ class FilterQtDialog(QDialog):
                 scatter_kwargs["label"] = label
             axes.scatter(ra_coords, dec_coords, **scatter_kwargs)
 
-        footprints_for_preview: list[Tuple[list[float], list[float], int | None]] = []
-        if self._should_draw_footprints():
-            footprint_cap = self._resolve_preview_cap()
-            used = 0
-            for row, entry in enumerate(self._normalized_items):
-                item = self._table.item(row, 0)
-                if item is None or item.checkState() != Qt.Checked:
-                    continue
-                fp = entry.footprint_radec or self._ensure_entry_footprint(entry)
-                if not fp:
-                    continue
-                ra_fp = [p[0] for p in fp]
-                dec_fp = [p[1] for p in fp]
-                if not ra_fp or not dec_fp:
-                    continue
-                cluster_idx = entry.cluster_index if isinstance(entry.cluster_index, int) else None
-                footprints_for_preview.append((ra_fp, dec_fp, cluster_idx))
-                used += 1
-                if footprint_cap is not None and used >= footprint_cap:
-                    break
+        should_draw_outlines = self._should_draw_group_outlines()
 
-            for ra_fp, dec_fp, cluster_idx in footprints_for_preview:
-                if len(ra_fp) < 2 or len(dec_fp) < 2:
-                    continue
-                if isinstance(cluster_idx, int):
-                    color = self._preview_color_cycle[cluster_idx % len(self._preview_color_cycle)]
-                else:
-                    color = "#7b6fd6"
-                xs = list(ra_fp)
-                ys = list(dec_fp)
-                xs.append(xs[0])
-                ys.append(ys[0])
-                axes.plot(xs, ys, color=color, linewidth=0.9, alpha=0.8)
-
+        # Store the group outline segments and corners for bounds tracking.
         outline_segments: list[list[tuple[float, float]]] = []
+        outline_corners: list[tuple[float, float]] = []
         if self._group_outline_bounds:
             for ra_min, ra_max, dec_min, dec_max in self._group_outline_bounds:
                 width = float(ra_max) - float(ra_min)
                 height = float(dec_max) - float(dec_min)
                 if width <= 0 or height <= 0:
                     continue
-                outline_segments.append(
-                    [
-                        (float(ra_min), float(dec_min)),
-                        (float(ra_max), float(dec_min)),
-                        (float(ra_max), float(dec_max)),
-                        (float(ra_min), float(dec_max)),
-                        (float(ra_min), float(dec_min)),
-                    ]
-                )
-        if outline_segments and LineCollection is not None:
+                corners = [
+                    (float(ra_min), float(dec_min)),
+                    (float(ra_max), float(dec_min)),
+                    (float(ra_max), float(dec_max)),
+                    (float(ra_min), float(dec_max)),
+                    (float(ra_min), float(dec_min)),
+                ]
+                outline_segments.append(corners)
+                outline_corners.extend(corners)
+        if should_draw_outlines and outline_segments and LineCollection is not None:
             outline_color = (
                 to_rgba("red", 0.9)
                 if to_rgba is not None
@@ -4619,9 +4589,9 @@ class FilterQtDialog(QDialog):
 
         ra_values = [pt[0] for pt in points]
         dec_values = [pt[1] for pt in points]
-        for ra_fp, dec_fp, _ in footprints_for_preview:
-            ra_values.extend(ra_fp)
-            dec_values.extend(dec_fp)
+        for ra_corner, dec_corner in outline_corners:
+            ra_values.append(ra_corner)
+            dec_values.append(dec_corner)
         if not ra_values or not dec_values:
             self._preview_canvas.draw_idle()
             return

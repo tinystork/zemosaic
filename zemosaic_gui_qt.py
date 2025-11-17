@@ -1068,15 +1068,16 @@ class ZeMosaicQtMainWindow(QMainWindow):
         left_splitter.setStretchFactor(index, 2)
 
         # right column: final assembly output (without intertile)
-        right_splitter = QSplitter(Qt.Vertical, columns_splitter)
-        right_splitter.setChildrenCollapsible(False)
-        final_group = self._create_final_assembly_group()
-        right_splitter.addWidget(final_group)
-        right_splitter.setCollapsible(0, False)
-        right_splitter.setStretchFactor(0, 1)
+        right_container = QWidget(columns_splitter)
+        right_layout = QVBoxLayout(right_container)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
+        final_group = self._create_final_assembly_group(right_container)
+        right_layout.addWidget(final_group)
+        right_layout.addStretch(1)
 
         columns_splitter.addWidget(left_splitter)
-        columns_splitter.addWidget(right_splitter)
+        columns_splitter.addWidget(right_container)
         columns_splitter.setCollapsible(0, False)
         columns_splitter.setCollapsible(1, False)
         columns_splitter.setStretchFactor(0, 1)
@@ -2104,16 +2105,23 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         return group
 
-    def _create_final_assembly_group(self) -> QGroupBox:
-        group = QGroupBox(
-            self._tr("qt_group_final_assembly", "Final assembly & output"),
-            self,
-        )
-        layout = QVBoxLayout(group)
+    def _create_final_assembly_group(self, parent: QWidget | None = None) -> QFrame:
+        container = parent or self
+        header_text = self._tr("qt_group_final_assembly", "Final assembly & output")
+        group_frame = QFrame(container)
+        group_frame.setFrameShape(QFrame.StyledPanel)
+        group_frame.setFrameShadow(QFrame.Raised)
+        layout = QVBoxLayout(group_frame)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(10)
 
-        general_box = QWidget(group)
+        title_label = QLabel(header_text, group_frame)
+        title_font = title_label.font()
+        title_font.setBold(True)
+        title_label.setFont(title_font)
+        layout.addWidget(title_label)
+
+        general_box = QWidget(group_frame)
         general_layout = QFormLayout(general_box)
         general_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
 
@@ -2249,7 +2257,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         intertile_box = QGroupBox(
             self._tr("qt_group_intertile", "Intertile blending"),
-            group,
+            group_frame,
         )
         intertile_layout = QFormLayout(intertile_box)
         intertile_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
@@ -2316,10 +2324,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
             default=(0.85, 1.18),
         )
         self._intertile_group = intertile_box
+        layout.addWidget(intertile_box)
 
         center_box = QGroupBox(
             self._tr("qt_group_center_out", "Center-out normalization"),
-            group,
+            group_frame,
         )
         center_layout = QFormLayout(center_box)
         center_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
@@ -2427,7 +2436,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         post_box = QGroupBox(
             self._tr("qt_group_poststack", "Post-stack anchor review"),
-            group,
+            group_frame,
         )
         post_layout = QFormLayout(post_box)
         post_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
@@ -2478,8 +2487,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self._tr("qt_field_poststack_use_overlap", "Use overlap affine adjustment"),
         )
         self._poststack_group = post_box
+        layout.addWidget(post_box)
 
-        return group
+        return group_frame
 
     def _create_system_resources_group(self) -> QGroupBox:
         group = QGroupBox(
@@ -5443,6 +5453,22 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 str(exc),
             )
             return None
+
+        # Keep the main Qt config's notion of the filter window geometry in
+        # sync with the latest value written by the filter dialog so that
+        # saving the main configuration does not overwrite it with a stale
+        # snapshot on application shutdown.
+        try:
+            import zemosaic_config as _zem_cfg  # type: ignore[import]
+        except Exception:
+            _zem_cfg = None  # type: ignore[assignment]
+        if _zem_cfg is not None and hasattr(_zem_cfg, "load_config"):
+            try:
+                latest_cfg = _zem_cfg.load_config()
+            except Exception:
+                latest_cfg = None
+            if isinstance(latest_cfg, dict) and "qt_filter_window_geometry" in latest_cfg:
+                self.config["qt_filter_window_geometry"] = latest_cfg.get("qt_filter_window_geometry")
 
         filtered_list: Any = None
         accepted = True

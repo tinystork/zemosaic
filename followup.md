@@ -14,7 +14,7 @@ All tasks are limited to the **Qt GUI** unless otherwise stated.
 - `zemosaic_filter_gui_qt.py`
 - (optionally) `locales/en.json`, `locales/fr.json` for text hints
 
-### 1.1. Inspect current sky preview code
+### 1.1. [x] Inspect current sky preview code
 
 - Locate `_update_preview_plot` in `zemosaic_filter_gui_qt.py`.
 - Identify:
@@ -31,7 +31,7 @@ Goal of this step: clearly separate three responsibilities:
 2. Group outlines (rectangles).
 3. Per-frame footprints (full polygons) — this is what we want to **disable** for performance.
 
-### 1.2. Disable per-frame footprints in the Qt sky preview
+### 1.2. [x] Disable per-frame footprints in the Qt sky preview
 
 - Adjust `_update_preview_plot` so that it **never builds the full list of per-frame footprints** for preview, by default.
 
@@ -49,7 +49,7 @@ Important:
 - Do **not** remove per-frame footprint logic used elsewhere (e.g. coverage map or non-Qt parts). Only touch the Qt sky preview drawing part.
 - Ensure that removing footprints does **not** break any log message or summary text; if some messages refer to “footprints”, update them to mention “preview points” or “group coverage”.
 
-### 1.3. Keep / adapt the “Draw WCS footprints” checkbox
+### 1.3. [x] Keep / adapt the “Draw WCS footprints” checkbox
 
 - The checkbox is defined via the localization key `"filter_chk_draw_footprints"` (see `locales/en.json`).
 
@@ -63,14 +63,14 @@ Adjust behavior:
   - Example FR: `"Afficher les contours WCS des groupes"`
 - Do **not** change the JSON key name; only the human-readable value.
 
-### 1.4. Update preview hint text (optional)
+### 1.4. [x] Update preview hint text (optional)
 
 - The existing hint string is `"filter_preview_points_hint"` in `locales/en.json`.
 - If the message still mentions “footprints”, adjust it to match the new behavior, e.g.:
   - EN: “Preview uses group centers and outlines for performance. Zoom or filter to inspect coverage.”
   - FR: “L’aperçu utilise les centres et contours des groupes pour de meilleures performances. Zoomez ou filtrez pour examiner la couverture.”
 
-### 1.5. Bounds & legend after removing footprints
+### 1.5. [x] Bounds & legend after removing footprints
 
 - Since we no longer extend `ra_values` / `dec_values` with footprint polygons, make sure the axes limits are still correctly computed:
   - Use only `points` (group centers) and group outline corners to compute min/max RA/Dec.
@@ -99,7 +99,7 @@ Adjust behavior:
 - `zemosaic_filter_gui_qt.py`
 - `zemosaic_config.py` (for `_load_gui_config` / `_save_gui_config`)
 
-### 2.1. Verify helpers and constants
+### 2.1. [x] Verify helpers and constants
 
 - Confirm the presence of:
 
@@ -116,7 +116,7 @@ and helper methods:
 * `_normalize_geometry_value`
 * Confirm that `_apply_saved_window_geometry()` is called at the end of the Filter dialog `__init__`.
 
-### 2.2. Ensure persist is called on close
+### 2.2. [x] Ensure persist is called on close
 
 * In the `closeEvent` override of the Qt Filter dialog, ensure:
 
@@ -129,7 +129,7 @@ and helper methods:
 
 * If `closeEvent` already calls `_persist_window_geometry()`, keep it but double-check that no early return skips it.
 
-### 2.3. Robustness of `_load_saved_window_geometry`
+### 2.3. [x] Robustness of `_load_saved_window_geometry`
 
 * Confirm that `_load_saved_window_geometry`:
 
@@ -143,7 +143,7 @@ and helper methods:
   * If `geometry` is `None`, simply return without raising.
   * Wrapped `setGeometry(...)` in a `try/except` to avoid hard crashes (already present; keep it).
 
-### 2.4. Symmetry with `_capture_current_window_geometry`
+### 2.4. [x] Symmetry with `_capture_current_window_geometry`
 
 * Verify `_capture_current_window_geometry` uses:
 
@@ -153,7 +153,7 @@ and helper methods:
 
 * Ensure `_normalize_geometry_value` clamps width/height to at least 1 and rejects non-positive values.
 
-### 2.5. Test behavior
+### 2.5. [x] Test behavior
 
 Manual test:
 
@@ -243,4 +243,3 @@ Document any non-obvious changes with short code comments to help future maintai
 
 ```
 Document here all the task completed by adding a [x] mark before each completed task to control task completion
-
