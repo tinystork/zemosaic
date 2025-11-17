@@ -48,7 +48,7 @@ import os
 import platform
 import shutil
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 try:  # Tkinter is optional for headless/CLI usage
     import tkinter.filedialog as fd
@@ -369,6 +369,42 @@ def detect_astap_installation() -> Tuple[Optional[str], Optional[str]]:
     return exe_path, data_dir
 
 
+def _coerce_boolish(value: Any, default: Optional[bool] = False) -> Optional[bool]:
+    """Convert diverse truthy/falsy representations to bool."""
+
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"", "none", "auto"}:
+            return default
+        if text in {"1", "true", "yes", "on"}:
+            return True
+        if text in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def _normalize_gpu_flags(config: dict) -> None:
+    """Ensure GPU toggles are synchronised across legacy keys."""
+
+    canonical = _coerce_boolish(config.get("use_gpu_phase5"), None)
+    if canonical is None:
+        for key in ("stack_use_gpu", "use_gpu_stack"):
+            canonical = _coerce_boolish(config.get(key), None)
+            if canonical is not None:
+                break
+    if canonical is None:
+        canonical = False
+    config["use_gpu_phase5"] = canonical
+    for key in ("stack_use_gpu", "use_gpu_stack"):
+        config[key] = _coerce_boolish(config.get(key), canonical)
+
+
 def _apply_astap_platform_defaults(config: dict) -> bool:
     """
     Ensure ASTAP paths are usable on the current platform by auto-detecting
@@ -459,6 +495,7 @@ def load_config():
         if isinstance(value, str) and value:
             current_config[key] = os.path.expanduser(value)
     _apply_astap_platform_defaults(current_config)
+    _normalize_gpu_flags(current_config)
 
     def _env_flag(env_key: str, default: bool) -> bool:
         val = os.environ.get(env_key)
@@ -492,6 +529,7 @@ def load_config():
     return current_config
 
 def save_config(config_data):
+    _normalize_gpu_flags(config_data)
     config_path = get_config_path()
     try:
         # Avant de sauvegarder, s'assurer que config_data ne contient que les clés attendues

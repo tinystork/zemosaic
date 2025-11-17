@@ -5527,6 +5527,37 @@ def _probe_system_resources(
     return info
 
 
+def _emit_gpu_info_summary(progress_callback, resource_info: dict) -> None:
+    """Log a GPU summary message when VRAM information is available."""
+
+    total_mb = resource_info.get("gpu_total_mb")
+    if not total_mb:
+        return
+    free_mb = resource_info.get("gpu_free_mb")
+    device_name = "GPU"
+    if CUPY_AVAILABLE:
+        try:
+            import cupy  # type: ignore
+
+            device = cupy.cuda.Device()
+            device_name = getattr(device, "name", device_name) or device_name
+        except Exception:
+            device_name = "GPU"
+    total_text = f"{float(total_mb):.0f}"
+    free_text = f"{float(free_mb):.0f}" if free_mb is not None else "n/a"
+    try:
+        _log_and_callback(
+            "gpu_info_summary",
+            lvl="INFO",
+            callback=progress_callback,
+            name=device_name,
+            total_mb=total_text,
+            free_mb=free_text,
+        )
+    except Exception:
+        pass
+
+
 def _compute_auto_tile_caps(
     resource_info: dict,
     per_frame_info: dict,
@@ -9868,6 +9899,7 @@ def assemble_final_mosaic_reproject_coadd(
                     cpu_func=reproject_and_coadd,
                     reproject_function=reproject_interp,
                     combine_function="mean",
+                    progress_callback=_pcb,
                     **local_kwargs,
                 )
 
@@ -10812,6 +10844,7 @@ def run_hierarchical_mosaic(
         two_pass_sigma_px=two_pass_cov_sigma_px_config,
         two_pass_gain_clip=two_pass_cov_gain_clip_config,
     )
+    _emit_gpu_info_summary(progress_callback, resource_probe_info)
     two_pass_enabled = bool(resource_probe_info.get("two_pass_enabled", False))
     try:
         two_pass_sigma_px = int(resource_probe_info.get("two_pass_sigma_px", 50) or 50)
@@ -10941,6 +10974,10 @@ def run_hierarchical_mosaic(
                 zemosaic_utils.ensure_cupy_pool_initialized(0)
         except Exception:
             pass
+    if use_gpu_phase5_flag:
+        _log_and_callback("phase5_using_gpu", callback=progress_callback, lvl="INFO")
+    else:
+        _log_and_callback("phase5_using_cpu", callback=progress_callback, lvl="INFO")
     def _cleanup_per_tile_cache(cache_paths: Iterable[str]) -> tuple[int, int]:
         """Remove preprocessed cache files for a completed master tile."""
 
@@ -14774,6 +14811,7 @@ def _assemble_global_mosaic_first_impl(
                     use_gpu=True,
                     allow_cpu_fallback=False,
                     match_background=match_background,
+                    progress_callback=pcb,
                 )
             except Exception as exc:
                 logger.warning(
@@ -14799,6 +14837,7 @@ def _assemble_global_mosaic_first_impl(
                         cpu_func=reproject_and_coadd,
                         use_gpu=False,
                         match_background=match_background,
+                        progress_callback=pcb,
                     )
                     try:
                         diff = float(np.nanmax(np.abs(cpu_mosaic - chan_mosaic)))

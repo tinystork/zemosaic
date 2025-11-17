@@ -829,5 +829,19 @@
     "qt_field_theme_mode": "Theme mode",
     "qt_theme_option_system": "System default",
     "qt_theme_option_dark": "Dark",
-    "qt_theme_option_light": "Light"
+    "qt_theme_option_light": "Light",
+    "gpu_info_summary": "GPU detected: {name} — total {total_mb} MB, free {free_mb} MB.",
+    "phase5_using_gpu": "Phase 5 reprojection will use the GPU.",
+    "phase5_using_cpu": "Phase 5 reprojection running on CPU.",
+    "stack_using_gpu": "Stacking ({helper}) executing on GPU.",
+    "stack_using_cpu": "Stacking ({helper}) executing on CPU.",
+    "gpu_fallback_unavailable": "GPU helper requested but unavailable ({reason}). Falling back to CPU.",
+    "gpu_fallback_insufficient_memory": "GPU helper skipped: estimated {estimated_mb} MB vs allowed {allowed_mb} MB.",
+    "gpu_fallback_runtime_error": "GPU helper error: {error}. Falling back to CPU.",
+    "gpu_helper_stream_tiles": "GPU helper will stream tiles sequentially due to limited memory.",
+    "gpu_chunking_rows": "GPU helper processing rows in batches of {rows}/{height}.",
+    "stack_gpu_fallback_unavailable": "GPU stacking ({helper}) requested but unavailable ({reason}). Falling back to CPU.",
+    "stack_gpu_fallback_insufficient_memory": "GPU stacking ({helper}) skipped: estimated {estimated_mb} MB vs allowed {allowed_mb} MB.",
+    "stack_gpu_fallback_runtime_error": "GPU stacking error for {helper}: {error}. Falling back to CPU.",
+    "stack_gpu_chunking_rows": "GPU stacking ({helper}) processing in {rows}/{height} row chunks."
 }

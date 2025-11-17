@@ -748,6 +748,33 @@ def _free_gpu_pools():
             pass
 
 
+def _gpu_budget_check(estimated_bytes: int, *, safety_fraction: float = 0.75) -> tuple[bool, int | None]:
+    """Return (is_allowed, allowed_bytes) for the requested allocation."""
+
+    func = _callable_or_none(_gpu_memory_ok)
+    if func is None:
+        return True, None
+    try:
+        ok = bool(func(int(estimated_bytes), safety_fraction=safety_fraction))
+    except TypeError:
+        ok = bool(func(int(estimated_bytes)))
+    except Exception:
+        return True, None
+    if ok:
+        return True, None
+    allowed_bytes: int | None = None
+    if GPU_AVAILABLE:
+        try:
+            import cupy as cp  # type: ignore
+
+            free_bytes, _ = cp.cuda.runtime.memGetInfo()
+            clamped = float(max(0.1, min(0.9, float(safety_fraction))))
+            allowed_bytes = int(max(0, free_bytes * clamped))
+        except Exception:
+            allowed_bytes = None
+    return False, allowed_bytes
+
+
 def _gpu_nanpercentile(values: np.ndarray, percentiles):
     """Compute nan-aware percentiles on the GPU and release cached memory."""
 
@@ -773,14 +800,165 @@ def _gpu_nanpercentile(values: np.ndarray, percentiles):
         _free_gpu_pools()
 
 
-def _has_gpu_budget(estimated_bytes: int) -> bool:
-    func = _callable_or_none(_gpu_memory_ok)
-    if func is None:
-        return True
-    try:
-        return bool(func(int(estimated_bytes), safety_fraction=0.75))
-    except Exception:
-        return True
+def _estimate_row_bytes(sample_shape: tuple[int, ...], frame_count: int, dtype_itemsize: int) -> int:
+    """Return bytes required to hold a single row for all frames."""
+
+    if not sample_shape or frame_count <= 0:
+        return 0
+    if len(sample_shape) == 1:
+        # Degenerate shape (H,) – treat trailing extent as 1
+        trailing_elems = 1
+    else:
+        try:
+            trailing_elems = int(np.prod(sample_shape[1:], dtype=np.int64))
+        except Exception:
+            trailing_elems = 0
+    trailing_elems = max(1, trailing_elems)
+    return trailing_elems * frame_count * max(1, dtype_itemsize)
+
+
+def _compute_chunk_rows_from_allowed(
+    allowed_bytes: int | None,
+    frames_list: Sequence[np.ndarray],
+    sample_shape: tuple[int, ...],
+    *,
+    multiplier: float,
+    dtype_itemsize: int = np.dtype(np.float32).itemsize,
+) -> int:
+    """Derive a safe row chunk size from an allowance expressed in bytes."""
+
+    if allowed_bytes is None or allowed_bytes <= 0:
+        return 0
+    usable_bytes = int(max(0, allowed_bytes / max(1.0, multiplier)))
+    if usable_bytes <= 0:
+        return 0
+    frame_count = len(frames_list)
+    row_bytes = _estimate_row_bytes(sample_shape, frame_count, dtype_itemsize)
+    if row_bytes <= 0:
+        return 0
+    rows = max(1, usable_bytes // row_bytes)
+    height = int(sample_shape[0]) if sample_shape else 0
+    if height <= 0:
+        return rows
+    return int(max(1, min(height, rows)))
+
+
+def _plan_gpu_stack_execution(
+    request_gpu: bool,
+    frames_list: Sequence[np.ndarray],
+    *,
+    helper_label: str,
+    multiplier: float,
+    sample_shape: tuple[int, ...],
+    progress_callback: Optional[Callable] = None,
+) -> tuple[bool, int, str | None]:
+    """Return (should_use_gpu, rows_per_chunk, skip_reason) for the requested stacking helper."""
+
+    if not request_gpu:
+        return False, 0, "not_requested"
+    if not frames_list:
+        return False, 0, "no_frames"
+
+    reason: str | None = None
+    if not GPU_AVAILABLE:
+        reason = "gpu_unavailable"
+    gpu_ready = True
+    if reason is None and ZU_AVAILABLE and hasattr(zutils, "gpu_is_available"):
+        try:
+            gpu_ready = bool(zutils.gpu_is_available())
+        except Exception as exc:
+            gpu_ready = False
+            reason = f"gpu_check_failed:{exc!r}"
+    if reason is None and not gpu_ready:
+        reason = "gpu_unavailable"
+
+    if reason is not None:
+        _log_stack_message(
+            "stack_gpu_fallback_unavailable",
+            "WARN",
+            progress_callback,
+            helper=helper_label,
+            reason=str(reason),
+        )
+        return False, 0, reason
+
+    sample_shape = tuple(int(s) for s in sample_shape)
+    height = int(sample_shape[0]) if sample_shape else 0
+    if height <= 0:
+        return False, 0, "invalid_shape"
+
+    per_frame_bytes = int(np.asarray(frames_list[0], dtype=np.float32).nbytes)
+    estimated_bytes = int(per_frame_bytes * len(frames_list) * float(multiplier))
+    ok, allowed_bytes = _gpu_budget_check(estimated_bytes)
+    rows_per_chunk = height
+    if not ok:
+        rows_per_chunk = _compute_chunk_rows_from_allowed(
+            allowed_bytes,
+            frames_list,
+            sample_shape,
+            multiplier=multiplier,
+        )
+        if rows_per_chunk <= 0:
+            estimated_mb = estimated_bytes / (1024.0 ** 2)
+            allowed_mb = (
+                f"{allowed_bytes / (1024.0 ** 2):.1f}"
+                if allowed_bytes is not None and allowed_bytes > 0
+                else "n/a"
+            )
+            _log_stack_message(
+                "stack_gpu_fallback_insufficient_memory",
+                "WARN",
+                progress_callback,
+                helper=helper_label,
+                estimated_mb=f"{estimated_mb:.1f}",
+                allowed_mb=allowed_mb,
+            )
+            return False, 0, "insufficient_memory"
+        if rows_per_chunk < height:
+            _log_stack_message(
+                "stack_gpu_chunking_rows",
+                "INFO_DETAIL",
+                progress_callback,
+                helper=helper_label,
+                rows=int(rows_per_chunk),
+                height=int(height),
+            )
+    return True, int(rows_per_chunk), None
+
+
+def _resolve_chunk_rows_for_gpu_helper(
+    rows_per_chunk: int | None,
+    frames_list: Sequence[np.ndarray],
+    sample_shape: tuple[int, ...],
+    *,
+    multiplier: float,
+    error_label: str,
+) -> int:
+    """Determine a safe row chunk size when calling low-level GPU helpers."""
+
+    height = int(sample_shape[0]) if sample_shape else 0
+    if height <= 0:
+        raise ValueError(f"{error_label}: invalid frame shape")
+    if rows_per_chunk is not None and rows_per_chunk > 0:
+        return int(max(1, min(height, rows_per_chunk)))
+    if not frames_list:
+        raise ValueError(f"{error_label}: empty frame list")
+
+    per_frame_bytes = int(np.asarray(frames_list[0], dtype=np.float32).nbytes)
+    estimated_bytes = int(per_frame_bytes * len(frames_list) * float(multiplier))
+    ok, allowed_bytes = _gpu_budget_check(estimated_bytes)
+    if ok:
+        return height
+
+    chunk_rows = _compute_chunk_rows_from_allowed(
+        allowed_bytes,
+        frames_list,
+        sample_shape,
+        multiplier=multiplier,
+    )
+    if chunk_rows <= 0:
+        raise RuntimeError(f"GPU {error_label}: insufficient memory budget")
+    return chunk_rows
 
 # --- Import des méthodes de stack CPU provenant du projet Seestar ---
 cpu_stack_winsorized = None
@@ -800,7 +978,14 @@ except Exception as e_import_stack:
     print(f"AVERT (zemosaic_align_stack): Optional import of external stack_methods failed: {e_import_stack}")
 
 # --- Implementations GPU simplifiées des méthodes de stack ---
-def gpu_stack_winsorized(frames, *, kappa=3.0, winsor_limits=(0.05, 0.05), apply_rewinsor=True):
+def gpu_stack_winsorized(
+    frames,
+    *,
+    kappa=3.0,
+    winsor_limits=(0.05, 0.05),
+    apply_rewinsor=True,
+    rows_per_chunk: int | None = None,
+):
     """GPU Winsorized Sigma-Clip aligned with CPU logic.
 
     Order matches CPU: winsor -> sigma (median/std on winsorized) -> mean.
@@ -812,99 +997,200 @@ def gpu_stack_winsorized(frames, *, kappa=3.0, winsor_limits=(0.05, 0.05), apply
     if not frames_np:
         raise ValueError("No frames provided")
 
-    per_frame_bytes = frames_np[0].nbytes
-    estimated_bytes = per_frame_bytes * len(frames_np) * 4
-    if not _has_gpu_budget(estimated_bytes):
-        raise RuntimeError("GPU winsorized clip: insufficient memory budget")
+    sample = frames_np[0]
+    sample_shape = sample.shape
+    chunk_rows = _resolve_chunk_rows_for_gpu_helper(
+        rows_per_chunk,
+        frames_np,
+        sample_shape,
+        multiplier=4.0,
+        error_label="winsorized clip",
+    )
 
     _ensure_gpu_pool()
 
     try:
-        arr = cp.stack([cp.asarray(f, dtype=cp.float32) for f in frames_np], axis=0)
-
+        height = int(sample_shape[0])
         low, high = float(winsor_limits[0]), float(winsor_limits[1])
-        # Winsorize along stack axis (0) with NaN-safe quantiles
-        q_low = cp.nanquantile(arr, low, axis=0)
-        q_high = cp.nanquantile(arr, 1.0 - high, axis=0)
-        arr_w = cp.clip(arr, q_low, q_high)
 
-        # Sigma stats from winsorized data (median/std)
-        median_w = cp.nanmedian(arr_w, axis=0)
-        std_w = cp.nanstd(arr_w, axis=0)
-        lower = median_w - (kappa * std_w)
-        upper = median_w + (kappa * std_w)
+        if chunk_rows >= height:
+            arr = cp.stack([cp.asarray(f, dtype=cp.float32) for f in frames_np], axis=0)
+            q_low = cp.nanquantile(arr, low, axis=0)
+            q_high = cp.nanquantile(arr, 1.0 - high, axis=0)
+            arr_w = cp.clip(arr, q_low, q_high)
+            median_w = cp.nanmedian(arr_w, axis=0)
+            std_w = cp.nanstd(arr_w, axis=0)
+            lower = median_w - (kappa * std_w)
+            upper = median_w + (kappa * std_w)
+            mask = (arr >= lower) & (arr <= upper)
+            if apply_rewinsor:
+                arr_clip = cp.where(mask, arr, arr_w)
+            else:
+                arr_clip = cp.where(mask, arr, cp.nan)
+            result = cp.nanmean(arr_clip, axis=0)
+            rejected = 100.0 * float(mask.size - cp.count_nonzero(mask)) / float(mask.size)
+            return cp.asnumpy(result.astype(cp.float32)), float(rejected)
 
-        # Reject original values outside bounds; optionally re-winsorize rejected
-        mask = (arr >= lower) & (arr <= upper)
-        if apply_rewinsor:
-            arr_clip = cp.where(mask, arr, arr_w)
-        else:
+        # Row-chunked path
+        output = np.empty_like(sample, dtype=np.float32)
+        total_pixels = 0
+        kept_pixels = 0
+        for start in range(0, height, chunk_rows):
+            end = min(height, start + chunk_rows)
+            rows_slice = slice(start, end)
+            chunk_np = [np.asarray(f[rows_slice, ...], dtype=np.float32) for f in frames_np]
+            arr = cp.stack([cp.asarray(chunk, dtype=cp.float32) for chunk in chunk_np], axis=0)
+            q_low = cp.nanquantile(arr, low, axis=0)
+            q_high = cp.nanquantile(arr, 1.0 - high, axis=0)
+            arr_w = cp.clip(arr, q_low, q_high)
+            median_w = cp.nanmedian(arr_w, axis=0)
+            std_w = cp.nanstd(arr_w, axis=0)
+            lower = median_w - (kappa * std_w)
+            upper = median_w + (kappa * std_w)
+            mask = (arr >= lower) & (arr <= upper)
+            if apply_rewinsor:
+                arr_clip = cp.where(mask, arr, arr_w)
+            else:
+                arr_clip = cp.where(mask, arr, cp.nan)
+            chunk_result = cp.nanmean(arr_clip, axis=0)
+            output[rows_slice, ...] = cp.asnumpy(chunk_result.astype(cp.float32))
+            chunk_total = mask.size
+            chunk_kept = int(cp.count_nonzero(mask))
+            total_pixels += chunk_total
+            kept_pixels += chunk_kept
+
+        rejected = 0.0
+        if total_pixels > 0:
+            rejected = 100.0 * (total_pixels - kept_pixels) / float(total_pixels)
+        return output, float(rejected)
+    finally:
+        _free_gpu_pools()
+
+
+def gpu_stack_kappa(
+    frames,
+    *,
+    sigma_low=3.0,
+    sigma_high=3.0,
+    rows_per_chunk: int | None = None,
+):
+    import cupy as cp
+
+    frames_np = [np.asarray(f, dtype=np.float32) for f in frames]
+    if not frames_np:
+        raise ValueError("No frames provided")
+
+    sample = frames_np[0]
+    sample_shape = sample.shape
+    chunk_rows = _resolve_chunk_rows_for_gpu_helper(
+        rows_per_chunk,
+        frames_np,
+        sample_shape,
+        multiplier=3.0,
+        error_label="kappa clip",
+    )
+
+    _ensure_gpu_pool()
+
+    try:
+        height = int(sample_shape[0])
+        if chunk_rows >= height:
+            arr = cp.stack([cp.asarray(f) for f in frames_np], axis=0)
+            med = cp.nanmedian(arr, axis=0)
+            std = cp.nanstd(arr, axis=0)
+            low = med - sigma_low * std
+            high = med + sigma_high * std
+            mask = (arr >= low) & (arr <= high)
             arr_clip = cp.where(mask, arr, cp.nan)
+            result = cp.nanmean(arr_clip, axis=0)
+            rejected = 100.0 * float(mask.size - cp.count_nonzero(mask)) / float(mask.size)
+            return cp.asnumpy(result.astype(cp.float32)), float(rejected)
 
-        result = cp.nanmean(arr_clip, axis=0)
-        # Optional safety clip to [0,1] can be applied by caller if needed
-        # result = cp.clip(result, 0.0, 1.0)
-
-        rejected = 100.0 * float(mask.size - cp.count_nonzero(mask)) / float(mask.size)
-        return cp.asnumpy(result.astype(cp.float32)), float(rejected)
+        output = np.empty_like(sample, dtype=np.float32)
+        total_pixels = 0
+        kept_pixels = 0
+        for start in range(0, height, chunk_rows):
+            end = min(height, start + chunk_rows)
+            rows_slice = slice(start, end)
+            chunk_np = [np.asarray(f[rows_slice, ...], dtype=np.float32) for f in frames_np]
+            arr = cp.stack([cp.asarray(chunk) for chunk in chunk_np], axis=0)
+            med = cp.nanmedian(arr, axis=0)
+            std = cp.nanstd(arr, axis=0)
+            low = med - sigma_low * std
+            high = med + sigma_high * std
+            mask = (arr >= low) & (arr <= high)
+            arr_clip = cp.where(mask, arr, cp.nan)
+            chunk_result = cp.nanmean(arr_clip, axis=0)
+            output[rows_slice, ...] = cp.asnumpy(chunk_result.astype(cp.float32))
+            chunk_total = mask.size
+            chunk_kept = int(cp.count_nonzero(mask))
+            total_pixels += chunk_total
+            kept_pixels += chunk_kept
+        rejected = 0.0
+        if total_pixels > 0:
+            rejected = 100.0 * (total_pixels - kept_pixels) / float(total_pixels)
+        return output, float(rejected)
     finally:
         _free_gpu_pools()
 
 
-def gpu_stack_kappa(frames, *, sigma_low=3.0, sigma_high=3.0):
+def gpu_stack_linear(frames, *, sigma=3.0, rows_per_chunk: int | None = None):
     import cupy as cp
 
     frames_np = [np.asarray(f, dtype=np.float32) for f in frames]
     if not frames_np:
         raise ValueError("No frames provided")
 
-    per_frame_bytes = frames_np[0].nbytes
-    estimated_bytes = per_frame_bytes * len(frames_np) * 3
-    if not _has_gpu_budget(estimated_bytes):
-        raise RuntimeError("GPU kappa clip: insufficient memory budget")
+    sample = frames_np[0]
+    sample_shape = sample.shape
+    chunk_rows = _resolve_chunk_rows_for_gpu_helper(
+        rows_per_chunk,
+        frames_np,
+        sample_shape,
+        multiplier=4.0,
+        error_label="linear clip",
+    )
 
     _ensure_gpu_pool()
 
     try:
-        arr = cp.stack([cp.asarray(f) for f in frames_np], axis=0)
-        med = cp.nanmedian(arr, axis=0)
-        std = cp.nanstd(arr, axis=0)
-        low = med - sigma_low * std
-        high = med + sigma_high * std
-        mask = (arr >= low) & (arr <= high)
-        arr_clip = cp.where(mask, arr, cp.nan)
-        result = cp.nanmean(arr_clip, axis=0)
-        rejected = 100.0 * float(mask.size - cp.count_nonzero(mask)) / float(mask.size)
-        return cp.asnumpy(result.astype(cp.float32)), float(rejected)
-    finally:
-        _free_gpu_pools()
+        height = int(sample_shape[0])
+        if chunk_rows >= height:
+            arr = cp.stack([cp.asarray(f) for f in frames_np], axis=0)
+            med = cp.nanmedian(arr, axis=0)
+            resid = arr - med
+            med_r = cp.nanmedian(resid, axis=0)
+            std_r = cp.nanstd(resid, axis=0)
+            mask = cp.abs(resid - med_r) <= sigma * std_r
+            arr_clip = cp.where(mask, arr, cp.nan)
+            result = cp.nanmean(arr_clip, axis=0)
+            rejected = 100.0 * float(mask.size - cp.count_nonzero(mask)) / float(mask.size)
+            return cp.asnumpy(result.astype(cp.float32)), float(rejected)
 
-
-def gpu_stack_linear(frames, *, sigma=3.0):
-    import cupy as cp
-
-    frames_np = [np.asarray(f, dtype=np.float32) for f in frames]
-    if not frames_np:
-        raise ValueError("No frames provided")
-
-    per_frame_bytes = frames_np[0].nbytes
-    estimated_bytes = per_frame_bytes * len(frames_np) * 4
-    if not _has_gpu_budget(estimated_bytes):
-        raise RuntimeError("GPU linear clip: insufficient memory budget")
-
-    _ensure_gpu_pool()
-
-    try:
-        arr = cp.stack([cp.asarray(f) for f in frames_np], axis=0)
-        med = cp.nanmedian(arr, axis=0)
-        resid = arr - med
-        med_r = cp.nanmedian(resid, axis=0)
-        std_r = cp.nanstd(resid, axis=0)
-        mask = cp.abs(resid - med_r) <= sigma * std_r
-        arr_clip = cp.where(mask, arr, cp.nan)
-        result = cp.nanmean(arr_clip, axis=0)
-        rejected = 100.0 * float(mask.size - cp.count_nonzero(mask)) / float(mask.size)
-        return cp.asnumpy(result.astype(cp.float32)), float(rejected)
+        output = np.empty_like(sample, dtype=np.float32)
+        total_pixels = 0
+        kept_pixels = 0
+        for start in range(0, height, chunk_rows):
+            end = min(height, start + chunk_rows)
+            rows_slice = slice(start, end)
+            chunk_np = [np.asarray(f[rows_slice, ...], dtype=np.float32) for f in frames_np]
+            arr = cp.stack([cp.asarray(chunk) for chunk in chunk_np], axis=0)
+            med = cp.nanmedian(arr, axis=0)
+            resid = arr - med
+            med_r = cp.nanmedian(resid, axis=0)
+            std_r = cp.nanstd(resid, axis=0)
+            mask = cp.abs(resid - med_r) <= sigma * std_r
+            arr_clip = cp.where(mask, arr, cp.nan)
+            chunk_result = cp.nanmean(arr_clip, axis=0)
+            output[rows_slice, ...] = cp.asnumpy(chunk_result.astype(cp.float32))
+            chunk_total = mask.size
+            chunk_kept = int(cp.count_nonzero(mask))
+            total_pixels += chunk_total
+            kept_pixels += chunk_kept
+        rejected = 0.0
+        if total_pixels > 0:
+            rejected = 100.0 * (total_pixels - kept_pixels) / float(total_pixels)
+        return output, float(rejected)
     finally:
         _free_gpu_pools()
 
@@ -1196,49 +1482,78 @@ def stack_winsorized_sigma_clip(
             allowed_mb=float(allowed_mb),
         )
 
+    helper_label = "winsorized"
+    can_attempt_gpu, rows_per_chunk, _ = _plan_gpu_stack_execution(
+        use_gpu,
+        frames_list,
+        helper_label=helper_label,
+        multiplier=4.0,
+        sample_shape=sample.shape,
+        progress_callback=progress_callback,
+    )
+
     # --- GPU path (poids ignorés) ---
-    if use_gpu and GPU_AVAILABLE and callable(globals().get("gpu_stack_winsorized", None)):
-        try:
-            if weights_array_full is not None or weight_method_in_use not in ("", "none") or manual_weights:
-                _log_stack_message(
-                    f"[Stack][GPU Winsorized] weight_method='{weight_label_for_log}' requested but not supported on this path -> ignoring weights.",
-                    "INFO",
-                    progress_callback,
-                )
-            gpu_out = gpu_stack_winsorized(frames_list, **kwargs)
-
-            # --- validations de sortie GPU ---
-            if gpu_out is None:
-                raise RuntimeError("GPU returned None")
-            # Support both (image, rejected_pct) and image-only returns
-            if isinstance(gpu_out, (list, tuple)) and len(gpu_out) >= 1:
-                _gpu_img = gpu_out[0]
-                _gpu_rej = float(gpu_out[1]) if len(gpu_out) > 1 else 0.0
-            else:
-                _gpu_img = gpu_out
-                _gpu_rej = 0.0
-            gpu_out = _np.asarray(_gpu_img, dtype=_np.float32)
-            # Sortie attendue: même champs spatiaux que frames_np sans l’axe N
-            exp_shape = sample.shape  # (H,W) ou (H,W,C)
-            if gpu_out.shape != exp_shape:
-                raise RuntimeError(f"GPU returned shape {gpu_out.shape}, expected {exp_shape}")
-            if not _np.any(_np.isfinite(gpu_out)):
-                raise RuntimeError("GPU output has no finite values")
-            # tolérance: > 90% de pixels finis
-            finite_ratio = _np.isfinite(gpu_out).mean()
-            if finite_ratio < 0.9:
-                raise RuntimeError(f"GPU output has too many NaN/Inf (finite_ratio={finite_ratio:.2%})")
-
-            _poststack_rgb_equalization(gpu_out, zconfig, stack_metadata)
-            return gpu_out, float(_gpu_rej)
-
-        except Exception as e:
-            _internal_logger.warning(
-                f"GPU winsorized clip failed or looked invalid → fallback CPU: {type(e).__name__}: {e}",
-                exc_info=True
+    if can_attempt_gpu:
+        _log_stack_message("stack_using_gpu", "INFO", progress_callback, helper=helper_label)
+        gpu_impl = globals().get("gpu_stack_winsorized")
+        if not callable(gpu_impl):
+            _log_stack_message(
+                "stack_gpu_fallback_unavailable",
+                "WARN",
+                progress_callback,
+                helper=helper_label,
+                reason="missing_implementation",
             )
+        else:
+            try:
+                if weights_array_full is not None or weight_method_in_use not in ("", "none") or manual_weights:
+                    _log_stack_message(
+                        f"[Stack][GPU Winsorized] weight_method='{weight_label_for_log}' requested but not supported on this path -> ignoring weights.",
+                        "INFO",
+                        progress_callback,
+                    )
+                gpu_out = gpu_impl(frames_list, rows_per_chunk=rows_per_chunk, **kwargs)
+
+                # --- validations de sortie GPU ---
+                if gpu_out is None:
+                    raise RuntimeError("GPU returned None")
+                # Support both (image, rejected_pct) and image-only returns
+                if isinstance(gpu_out, (list, tuple)) and len(gpu_out) >= 1:
+                    _gpu_img = gpu_out[0]
+                    _gpu_rej = float(gpu_out[1]) if len(gpu_out) > 1 else 0.0
+                else:
+                    _gpu_img = gpu_out
+                    _gpu_rej = 0.0
+                gpu_out = _np.asarray(_gpu_img, dtype=_np.float32)
+                # Sortie attendue: même champs spatiaux que frames_np sans l’axe N
+                exp_shape = sample.shape  # (H,W) ou (H,W,C)
+                if gpu_out.shape != exp_shape:
+                    raise RuntimeError(f"GPU returned shape {gpu_out.shape}, expected {exp_shape}")
+                if not _np.any(_np.isfinite(gpu_out)):
+                    raise RuntimeError("GPU output has no finite values")
+                # tolérance: > 90% de pixels finis
+                finite_ratio = _np.isfinite(gpu_out).mean()
+                if finite_ratio < 0.9:
+                    raise RuntimeError(f"GPU output has too many NaN/Inf (finite_ratio={finite_ratio:.2%})")
+
+                _poststack_rgb_equalization(gpu_out, zconfig, stack_metadata)
+                return gpu_out, float(_gpu_rej)
+
+            except Exception as e:
+                _internal_logger.warning(
+                    f"GPU winsorized clip failed or looked invalid → fallback CPU: {type(e).__name__}: {e}",
+                    exc_info=True
+                )
+                _log_stack_message(
+                    "stack_gpu_fallback_runtime_error",
+                    "WARN",
+                    progress_callback,
+                    helper=helper_label,
+                    error=str(e),
+                )
 
     # --- CPU path ---
+    _log_stack_message("stack_using_cpu", "INFO", progress_callback, helper=helper_label)
     if not callable(globals().get("cpu_stack_winsorized", None)):
         raise RuntimeError("CPU stack_winsorized function unavailable")
 
@@ -1356,10 +1671,13 @@ def stack_kappa_sigma_clip(
                if zconfig else False)
     progress_callback = kwargs.get("progress_callback")
     frames_list = list(frames)
+    if not frames_list:
+        raise ValueError("frames is empty")
     requested_weight_method = str(weight_method or "none").lower().strip()
     weight_method_in_use = requested_weight_method or "none"
     weights_array: np.ndarray | None = None
     weight_stats: dict[str, float] | None = None
+    sample_shape = np.asarray(frames_list[0], dtype=np.float32).shape
 
     if requested_weight_method not in ("", "none"):
         frames_np_for_weights = [np.asarray(f, dtype=np.float32) for f in frames_list]
@@ -1380,20 +1698,49 @@ def stack_kappa_sigma_clip(
             weight_stats = quality_stats
         del frames_np_for_weights
 
-    if use_gpu and GPU_AVAILABLE:
-        try:
-            if weights_array is not None:
+    helper_label = "kappa_sigma"
+    can_attempt_gpu, rows_per_chunk, _ = _plan_gpu_stack_execution(
+        use_gpu,
+        frames_list,
+        helper_label=helper_label,
+        multiplier=3.0,
+        sample_shape=sample_shape,
+        progress_callback=progress_callback,
+    )
+    if can_attempt_gpu:
+        _log_stack_message("stack_using_gpu", "INFO", progress_callback, helper=helper_label)
+        gpu_impl = globals().get("gpu_stack_kappa")
+        if not callable(gpu_impl):
+            _log_stack_message(
+                "stack_gpu_fallback_unavailable",
+                "WARN",
+                progress_callback,
+                helper=helper_label,
+                reason="missing_implementation",
+            )
+        else:
+            try:
+                if weights_array is not None:
+                    _log_stack_message(
+                        f"[Stack][GPU Kappa] weight_method='{weight_method_in_use}' requested but not supported on GPU path; ignoring weights.",
+                        "INFO",
+                        progress_callback,
+                    )
+                gpu_result = gpu_impl(frames_list, rows_per_chunk=rows_per_chunk, **kwargs)
+                stacked_gpu, rejected_gpu = _normalize_stack_output(gpu_result)
+                _poststack_rgb_equalization(stacked_gpu, zconfig, stack_metadata)
+                return stacked_gpu, rejected_gpu
+            except Exception as exc_gpu:
+                _internal_logger.warning("GPU kappa clip failed, fallback CPU", exc_info=True)
                 _log_stack_message(
-                    f"[Stack][GPU Kappa] weight_method='{weight_method_in_use}' requested but not supported on GPU path; ignoring weights.",
-                    "INFO",
+                    "stack_gpu_fallback_runtime_error",
+                    "WARN",
                     progress_callback,
+                    helper=helper_label,
+                    error=str(exc_gpu),
                 )
-            gpu_result = gpu_stack_kappa(frames_list, **kwargs)
-            stacked_gpu, rejected_gpu = _normalize_stack_output(gpu_result)
-            _poststack_rgb_equalization(stacked_gpu, zconfig, stack_metadata)
-            return stacked_gpu, rejected_gpu
-        except Exception:
-            _internal_logger.warning("GPU kappa clip failed, fallback CPU", exc_info=True)
+    # --- CPU path ---
+    _log_stack_message("stack_using_cpu", "INFO", progress_callback, helper=helper_label)
     if cpu_stack_kappa:
         cpu_kwargs = dict(kwargs)
         if weights_array is not None:
@@ -1445,10 +1792,13 @@ def stack_linear_fit_clip(
                if zconfig else False)
     progress_callback = kwargs.get("progress_callback")
     frames_list = list(frames)
+    if not frames_list:
+        raise ValueError("frames is empty")
     requested_weight_method = str(weight_method or "none").lower().strip()
     weight_method_in_use = requested_weight_method or "none"
     weights_array: np.ndarray | None = None
     weight_stats: dict[str, float] | None = None
+    sample_shape = np.asarray(frames_list[0], dtype=np.float32).shape
 
     if requested_weight_method not in ("", "none"):
         frames_np_for_weights = [np.asarray(f, dtype=np.float32) for f in frames_list]
@@ -1469,20 +1819,49 @@ def stack_linear_fit_clip(
             weight_stats = quality_stats
         del frames_np_for_weights
 
-    if use_gpu and GPU_AVAILABLE:
-        try:
-            if weights_array is not None:
+    helper_label = "linear_fit"
+    can_attempt_gpu, rows_per_chunk, _ = _plan_gpu_stack_execution(
+        use_gpu,
+        frames_list,
+        helper_label=helper_label,
+        multiplier=4.0,
+        sample_shape=sample_shape,
+        progress_callback=progress_callback,
+    )
+    if can_attempt_gpu:
+        _log_stack_message("stack_using_gpu", "INFO", progress_callback, helper=helper_label)
+        gpu_impl = globals().get("gpu_stack_linear")
+        if not callable(gpu_impl):
+            _log_stack_message(
+                "stack_gpu_fallback_unavailable",
+                "WARN",
+                progress_callback,
+                helper=helper_label,
+                reason="missing_implementation",
+            )
+        else:
+            try:
+                if weights_array is not None:
+                    _log_stack_message(
+                        f"[Stack][GPU Linear] weight_method='{weight_method_in_use}' requested but not supported on GPU path; ignoring weights.",
+                        "INFO",
+                        progress_callback,
+                    )
+                gpu_result = gpu_impl(frames_list, rows_per_chunk=rows_per_chunk, **kwargs)
+                stacked_gpu, rejected_gpu = _normalize_stack_output(gpu_result)
+                _poststack_rgb_equalization(stacked_gpu, zconfig, stack_metadata)
+                return stacked_gpu, rejected_gpu
+            except Exception as exc_gpu:
+                _internal_logger.warning("GPU linear clip failed, fallback CPU", exc_info=True)
                 _log_stack_message(
-                    f"[Stack][GPU Linear] weight_method='{weight_method_in_use}' requested but not supported on GPU path; ignoring weights.",
-                    "INFO",
+                    "stack_gpu_fallback_runtime_error",
+                    "WARN",
                     progress_callback,
+                    helper=helper_label,
+                    error=str(exc_gpu),
                 )
-            gpu_result = gpu_stack_linear(frames_list, **kwargs)
-            stacked_gpu, rejected_gpu = _normalize_stack_output(gpu_result)
-            _poststack_rgb_equalization(stacked_gpu, zconfig, stack_metadata)
-            return stacked_gpu, rejected_gpu
-        except Exception:
-            _internal_logger.warning("GPU linear clip failed, fallback CPU", exc_info=True)
+    # --- CPU path ---
+    _log_stack_message("stack_using_cpu", "INFO", progress_callback, helper=helper_label)
     if cpu_stack_linear:
         cpu_kwargs = dict(kwargs)
         if weights_array is not None:

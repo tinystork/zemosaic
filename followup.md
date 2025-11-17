@@ -1,236 +1,205 @@
-# FOLLOWUP.md — ZeMosaic Qt filter GUI
+# FOLLOW-UP TASKS — GPU / MEMORY REVIEW CHECKLIST
 
-Ce document guide Codex pour les itérations successives sur l’interface **PySide6** de ZeMosaic, en s’assurant de rester strictement compatible avec :
+This checklist guides you step by step through the GPU/memory review and improvements.
 
-- La logique métier existante (zemosaic_worker, zemosaic_utils, etc.)
-- Le comportement historique du GUI Tkinter (`zemosaic_filter_gui.py`, `zemosaic_gui.py`)
-- Les contraintes de performance (pas de freeze, respect du multi-process, etc.)
+## 0. Read and understand existing GPU helpers
+
+- [x] Open `zemosaic_utils.py` and identify:
+  - `GPU_AVAILABLE`, `gpu_is_available`
+  - `ensure_cupy_pool_initialized`, `free_cupy_memory_pools`
+  - `gpu_memory_sufficient`
+  - GPU reprojection functions (`gpu_assemble_final_mosaic_reproject_coadd`, `gpu_assemble_final_mosaic_incremental`, `reproject_and_coadd_wrapper`, etc.)
+  - GPU image processing helpers (`_percentiles_gpu`, `detect_and_correct_hot_pixels_gpu`, `estimate_background_map_gpu`, etc.)
+- [x] Confirm they are imported and used in:
+  - `zemosaic_align_stack.py`
+  - `zemosaic_worker.py`
+  - Any other modules using GPU paths.
 
-Les fichiers principalement concernés sont :
+Goal: **build a mental map** of where GPU is used and where memory checks already exist.
 
-- `zemosaic_filter_gui_qt.py`
-- `zemosaic_gui_qt.py`
-- (en lecture seule / référence) `zemosaic_filter_gui.py`, `zemosaic_gui.py`, `zemosaic_worker.py`, `zemosaic_utils.py`
 
+## 1. Strengthen and centralise GPU memory checks
 
----
+### 1.1 `gpu_memory_sufficient`
 
-## 0. Contraintes globales (à respecter pour TOUTE modif)
+- [x] In `zemosaic_utils.py`, review `gpu_memory_sufficient(estimated_bytes, safety_fraction=0.75)`.
+- [x] Ensure it:
+  - Returns `True` when `GPU_AVAILABLE` is false (so CPU code does not get blocked).
+  - Uses `memGetInfo()` correctly: compare `estimated_bytes` against `free_bytes * safety_fraction`.
+  - Handles any exceptions (driver issues, etc.) by being permissive, not by disabling GPU entirely.
+- [x] Optionally:
+  - Add a small helper to clamp `safety_fraction` between `0.1` and `0.9` to avoid extreme values.
+  - Add a debug log (guarded by an env var or config flag) when a check fails, so we can see in logs why GPU was refused.
 
-1. **Ne pas casser Tkinter**  
-   - Ne rien modifier dans `zemosaic_gui.py` ni `zemosaic_filter_gui.py` sauf si la tâche le demande explicitement.  
-   - Le workflow historique Tk doit continuer à fonctionner exactement comme aujourd’hui.
+### 1.2 CuPy pool management
 
-2. **Ne pas casser le worker / pipeline**  
-   - Ne pas changer la signature ni la logique de base de `run_hierarchical_mosaic` / `run_hierarchical_mosaic_process` dans `zemosaic_worker.py`.  
-   - Lorsque le filtre Qt appelle le worker, il doit continuer à fournir les mêmes structures de données que le filtre Tk (simplement avec un sous-ensemble de fichiers si nécessaire).
+- [x] Ensure `ensure_cupy_pool_initialized()`:
+  - Is idempotent (uses a `_done` flag).
+  - Optionally accepts a `device_id` but does not crash on invalid IDs.
+- [x] Ensure `free_cupy_memory_pools()`:
+  - Is called at the end of heavy GPU sections (e.g. GPU stacking, GPU reprojection).
+  - Frees both device and pinned memory pools via `cp.get_default_memory_pool().free_all_blocks()` and similar.
 
-3. **Pas de régression sur les modes d’empilement**  
-   - **Ne pas modifier** la sémantique existante de `batch_size` dans le pipeline de stacking (mode `batch_size = 0` et `batch_size > 1` DOIVENT rester inchangés).
+If missing, **add** calls to `free_cupy_memory_pools()` in GPU-heavy functions’ `finally` blocks.
 
-4. **Performance & UI**  
-   - Toute opération lourde (scan, clustering, pré-plan WCS, etc.) doit rester hors du thread UI (thread / process séparé).  
-   - Garder le Sky preview fluide et éviter toute opération O(N_tiles) à chaque event de souris.
 
-5. **Localisation**  
-   - Lors de l’ajout de nouveaux textes visibles (labels, tooltips, menus contextuels), utiliser le localizer Qt (`ZeMosaicLocalization`) quand disponible.  
-   - Prévoir des clés de localisation explicites (ex. `qt_filter_clear_bbox`) mais **ne pas** modifier les fichiers `en.json` / `fr.json` ici (ce sera fait séparément).
+## 2. GPU usage in stacking (`zemosaic_align_stack.py`)
 
+### 2.1 Usage of GPU helpers
 
----
+- [x] Confirm `zemosaic_align_stack.py` imports `zemosaic_utils` and retrieves:
+  - `ensure_cupy_pool_initialized`
+  - `free_cupy_memory_pools`
+  - `gpu_memory_sufficient`
+- [x] Confirm helper functions exist:
+  - `_ensure_gpu_pool()`
+  - `_free_gpu_pools()`
+  - `_has_gpu_budget(estimated_bytes: int) -> bool`
 
-## 1. Rappel du comportement actuel souhaité (déjà implémenté)
+If any of these are missing or duplicate, **harmonise** them to use the central helpers from `zemosaic_utils.py`.
 
-Cette section résume ce que le code actuel est supposé faire, pour que tu ne le casses pas :
+### 2.2 GPU winsorised / kappa-sigma stacking
 
-1. **Affichage des groupes via WCS**  
-   - Lorsque des fichiers avec WCS sont chargés, la carte du ciel (Sky preview) affiche des points (centres des brutes) colorés par groupe.  
-   - Pour limiter les freezes, **seuls les cadres des groupes** (bounding boxes par groupe) sont tracés, pas chaque footprint individuel.
+For GPU stack functions (`gpu_stack_winsorized`, `gpu_stack_kappa` etc.):
 
-2. **Taille des cadres de groupes**  
-   - Chaque cadre de groupe utilise la taille du **premier WCS** de ce groupe comme gabarit (pour refléter la taille réelle d’une master tile sur le ciel).  
-   - Le centre du cadre correspond au centre moyen des RA/DEC du groupe (ou cohérent avec la logique déjà implémentée).
+- [x] Before allocating large arrays (e.g. `(N, H, W)` frames, masks, intermediate buffers):
+  - Compute `estimated_bytes` realistically.
+  - Use `_has_gpu_budget(estimated_bytes)` to decide if the GPU path is allowed.
+- [x] If `_has_gpu_budget` returns `False`:
+  - Log a GPU fallback message (see section 4).
+  - Immediately fall back to CPU stacking (`cpu_stack_winsorized` / `cpu_stack_kappa` etc.).
+- [x] Wrap GPU code in `try / except` to catch:
+  - `cupy.cuda.memory.OutOfMemoryError`
+  - Any other GPU-related exceptions
+- [x] On such exceptions:
+  - Log a `gpu_fallback_runtime_error` message.
+  - Fall back to CPU stacking.
 
-3. **Organisation auto des master tiles**  
-   - Le bouton **“Auto-organize Master Tiles”** applique la même logique que la version Tk :
-     - Clusterisation des brutes.
-     - Éventuelle séparation des groupes par orientation.
-     - Préparation des groupes & sizes transmis au worker.
-   - Sans bounding box utilisateur, toutes les brutes cochées (ou non exclues) sont candidates à l’auto-organisation.
+### 2.3 Chunking logic
 
-4. **Scan / grouping log**  
-   - Le bloc “Scan / grouping log” inutile a été retiré du UI Qt pour alléger l’interface (ne pas le réintroduire).
+- [x] Review `_iter_row_chunks(total_rows, frames, width, itemsize, max_chunk_bytes)`:
+  - Ensure it is used in GPU stacking when dealing with very large images.
+  - If GPU stacking still tries to allocate giant arrays in one go, refactor it to process row chunks instead.
+- [x] Tie `max_chunk_bytes` to:
+  - A reasonable default (e.g. 128–256 MB).
+  - A dynamic limit based on `gpumemory_sufficient` and `memGetInfo()`, to adapt to available memory.
 
+Goal: GPU stacking should **never** exit with a raw OOM; it should either:
+- reduce chunk size automatically, or
+- fall back to CPU with a clear log.
 
----
 
-## 2. NOUVELLE SECTION — Gestion de la bounding box utilisateur
+## 3. GPU usage in final mosaic assembly (`zemosaic_utils.py` + `zemosaic_worker.py`)
 
-Objectif : rendre la **bounding box “Sky Preview” vraiment utile** et intuitive :
+### 3.1 GPU reprojection and coadd functions
 
-- Pouvoir **l’effacer** facilement si elle est mal placée.
-- Lorsque la bounding box est active, **ne sélectionner que les images dont le centre tombe à l’intérieur** pour l’auto-organisation.
-- S’assurer que le **chemin vers le worker** reste identique à celui où l’on passe une liste complète, simplement filtrée.
+- [x] In `zemosaic_utils.py`, locate GPU reprojection/coadd functions (e.g. `gpu_assemble_final_mosaic_reproject_coadd`, `gpu_assemble_final_mosaic_incremental`, `gpu_reproject_and_coadd_impl`, `reproject_and_coadd_wrapper`).
+- [x] Ensure they:
+  - Check `gpu_is_available()` first.
+  - Estimate memory usage for:
+    - Mosaic accumulators (`H x W` float32 arrays for sum/weights).
+    - Any per-tile buffers.
+  - Use `gpu_memory_sufficient` with a reasonable safety margin (e.g. `0.7–0.8`).
+- [x] If memory is insufficient **before** starting GPU work:
+  - Log `gpu_fallback_insufficient_memory`.
+  - Call the CPU implementation (`cpu_reproject_and_coadd` or equivalent).
 
+- [x] Wrap the main GPU code in `try / except` and on exceptions:
+  - Log `gpu_fallback_runtime_error`.
+  - Fall back to CPU if `allow_cpu_fallback` is `True`.
+  - If `allow_cpu_fallback` is `False`, re-raise the exception so the caller can surface a proper error.
 
-### 2.1. Ajouter un mécanisme pour effacer la bounding box
+- [x] Ensure that GPU-only kwargs (like `tile_affine_corrections`, `rows_per_chunk`, GPU-specific tuning parameters) are stripped from kwargs before calling the CPU function.
 
-Fichier principal : `zemosaic_filter_gui_qt.py`
+### 3.2 Worker integration
 
-1. **État interne de la bounding box**  
-   - Identifier où la bounding box de sélection utilisateur est stockée (typiquement quelque chose comme :  
-     - coordonnées pixel dans le plot, et/ou  
-     - bornes RA/DEC `bbox_ra_min`, `bbox_ra_max`, `bbox_dec_min`, `bbox_dec_max`.  
-   - Si ce n’est pas déjà le cas, stocker proprement cet état dans un attribut du dialog (ex : `self._user_bbox_sky = None` ou dict avec les bornes RA/DEC).
+In `zemosaic_worker.py`:
 
-2. **Menu contextuel sur le Sky Preview (clic droit)**  
-   - Sur la zone du graphique (canvas Matplotlib intégré via `FigureCanvasQTAgg`), ajouter la gestion d’un **clic droit** qui ouvre un menu contextuel Qt.  
-   - Menu minimal avec au moins une entrée :
-     - Label anglais par défaut : `"Clear selection bounding box"`  
-       - passer par le localizer quand disponible, clé suggérée : `qt_filter_clear_bbox`.
-   - Quand l’utilisateur clique sur cette entrée :
-     - Supprimer la bounding box graphique (rectangle et/ou overlay) de la figure Matplotlib.
-     - Réinitialiser l’état interne (ex: `self._user_bbox_sky = None`).
-     - Forcer un refresh/redraw du Sky preview pour s’assurer que le cadre disparaît.
+- [x] Identify where the worker chooses final assembly method and GPU usage (Phase 5):
+  - `final_assembly_method` (`reproject`, `incremental`, etc.)
+  - `use_gpu_phase5` or similar flags taken from `global_plan` / config.
+- [x] Ensure the worker:
+  - Passes `use_gpu=True/False` to the reprojection wrappers based on config and availability.
+  - Logs when GPU is requested but `gpu_is_available()` is false (`gpu_fallback_unavailable`).
+  - Logs when GPU is requested but memory is insufficient or a runtime error occurs.
 
-3. **Comportement sans bounding box**  
-   - Si aucune bounding box utilisateur n’est active (**état `None`**), le comportement doit être strictement identique à la situation actuelle : toutes les brutes coché·es restent candidates pour les opérations (analyse, auto-organize, etc.).
-   - Ne jamais filtrer quoi que ce soit quand la bbox est absente.
+Goal: from logs alone, a user should see clearly whether:
+- Phase 5 ran on GPU or CPU,
+- and if CPU, exactly why.
 
 
-### 2.2. Filtrer les images par centre RA/DEC lors de “Auto-organize Master Tiles”
-
-Problème actuel :  
-Même lorsqu’une bounding box est dessinée, le bouton **“Auto-organize Master Tiles”** sélectionne/organise **toutes** les images.  
-Ce que l’on veut : **seules les images dont le centre se trouve dans la bounding box** doivent être considérées comme candidates.
-
-1. **Localiser le point d’entrée de l’auto-organisation Qt**  
-   - Dans `zemosaic_filter_gui_qt.py`, trouver la méthode qui gère le clic sur le bouton **“Auto-organize Master Tiles”** (souvent une slot connectée à un `QPushButton`).  
-   - Identifier là où est construite la liste des `_NormalizedItem` inclus pour clusterisation / organisation (typiquement une liste filtrée à partir de `self._items` ou similaire).
-
-2. **Détermination de l’inclusion dans la bounding box**  
-   - Chaque `_NormalizedItem` possède déjà (ou doit posséder) :  
-     - `center_ra_deg: float | None`  
-     - `center_dec_deg: float | None`  
-   - La bounding box utilisateur doit être exprimée en RA/DEC :  
-     - `bbox_ra_min`, `bbox_ra_max` (en degrés)  
-     - `bbox_dec_min`, `bbox_dec_max` (en degrés)
-   - Ajouter une fonction utilitaire dans le dialog, par exemple :
-
-     ```python
-     def _item_inside_user_bbox(self, item: _NormalizedItem) -> bool:
-         if self._user_bbox_sky is None:
-             return True  # pas de bbox => inclusion totale
-         if item.center_ra_deg is None or item.center_dec_deg is None:
-             return False
-         ra = float(item.center_ra_deg)
-         dec = float(item.center_dec_deg)
-         ra_min, ra_max = self._user_bbox_sky["ra_min"], self._user_bbox_sky["ra_max"]
-         dec_min, dec_max = self._user_bbox_sky["dec_min"], self._user_bbox_sky["dec_max"]
-         # gérer RA qui wrappe à 360 si nécessaire
-         if ra_min <= ra_max:
-             ra_ok = (ra_min <= ra <= ra_max)
-         else:
-             # bbox qui traverse 0h
-             ra_ok = (ra >= ra_min) or (ra <= ra_max)
-         dec_ok = (dec_min <= dec <= dec_max)
-         return ra_ok and dec_ok
-     ```
-
-   - Cette fonction doit être **robuste** et renvoyer `True` pour tous les items lorsque `self._user_bbox_sky` est `None` (pour garder le comportement actuel si aucune bbox n’est en place).
-
-3. **Filtrage avant auto-organisation**  
-   - Juste avant de lancer la logique d’auto-organisation (construction des groupes pour ZeSupaDupStack / SDS, clustering, etc.), filtrer la liste des items candidats :
-
-     ```python
-     candidates = [it for it in all_items if self._item_inside_user_bbox(it)]
-     ```
-
-   - Si, après filtrage :
-     - `len(candidates) == 0` :
-       - Ne pas lancer d’auto-organisation.
-       - Afficher un message d’avertissement (log + éventuellement QMessageBox) du type :  
-         - `"No frames found inside the current selection bounding box."` (clé possible : `qt_filter_bbox_empty_selection`).
-   - Les **groupes** passés au worker doivent être formés **uniquement** à partir de ces `candidates`.
-
-4. **Cohérence avec la vue en arbre (treeview)**  
-   - Lorsque l’auto-organisation est déclenchée avec une bbox active, les brutes en dehors de la bbox ne doivent pas être sélectionnées dans la vue en arbre (coches/selection).  
-   - Adapter la mise à jour du `QTreeWidget` :
-     - Cocher / marquer les items qui appartiennent à un groupe retenu et sont à l’intérieur de la bbox.  
-     - Laisser décochés ceux qui sont hors bbox (même s’ils appartiennent à un cluster théorique global).
-
-5. **Compatibilité avec les groupes existants**  
-   - Si la logique de regroupement s’appuie déjà sur des groupes pré-calculés (cluster connectés) :
-     - Filtrer les groupes en ne gardant que ceux qui contiennent **au moins un item dans la bbox**.
-     - À l’intérieur de chaque groupe retenu, ne conserver que les items dans la bbox pour le passage au worker.
-
-
-### 2.3. Respect du “chemin worker” avec bounding box
-
-Problème exprimé :  
-> “vérifier que dans le cadre de l'utilisation de la boundbox le chemin du worker est honoré comme dans le cas ou une liste complète est passée par ce biais”
-
-Concrètement : lorsque le filtre Qt utilise la bounding box pour réduire le jeu de données, le **chemin d’appel vers le worker** doit rester **strictement le même**, uniquement avec un **sous-ensemble** de fichiers :
-
-1. **Ne pas changer la signature de l’appel au worker**  
-   - La fonction (ou méthode) qui prépare l’appel à `run_hierarchical_mosaic_process` (via le main Qt) ne doit pas changer de signature.
-   - Elle doit recevoir la même structure qu’avant (`selected_entries`, `groups`, `config`, etc.), uniquement avec **moins d’entrées**.
-
-2. **Filtrage en amont uniquement**  
-   - Toute logique liée à la bounding box doit rester **dans le filtre Qt** (`zemosaic_filter_gui_qt.py`).  
-   - Le worker (`zemosaic_worker.py`) ne doit pas être modifié pour cette fonctionnalité : il doit simplement recevoir une liste plus courte et se comporter comme d’habitude.
-
-3. **Validation comportementale**  
-   - Après implémentation :
-     - Cas A : pas de bounding box → l’auto-organisation doit produire exactement le même pré-plan qu’avant (même nombre de groupes, même log “Prepared N group(s), sizes: [...]”).  
-     - Cas B : bounding box couvrant seulement une partie du champ →  
-       - Le log doit montrer moins de groupes ou des tailles plus petites.  
-       - Le worker doit s’exécuter sans erreur, avec les mêmes chemins de sortie qu’avant.  
-       - Aucune différence dans le type/structure des données échangées, hormis le nombre de brutes.
-
-4. **Log de debug optionnel**  
-   - Pour faciliter les tests, ajouter un log INFO côté filtre Qt lors de l’appel à l’auto-organisation quand une bbox est active, par exemple :  
-
-     ```text
-     [QtFilter] Bounding box active: kept X / Y frames for auto-organize.
-     ```
-
-   - Ne pas spammer le log (un message par clic sur le bouton suffit).
-
-
----
-
-## 3. Tests manuels à effectuer
-
-Après les changements, valider au minimum les scénarios suivants :
-
-1. **Sans bounding box**  
-   - Charger un jeu de brutes avec WCS.  
-   - Ne pas dessiner de bounding box.  
-   - Cliquer sur **Auto-organize Master Tiles**.  
-   - Vérifier :
-     - Que le comportement est identique à la version précédente (nombre de groupes, sélection dans l’arbre, log, absence de freeze).
-
-2. **Bounding box partielle**  
-   - Dessiner une bounding box englobant seulement une partie des points du Sky preview.  
-   - Cliquer sur **Auto-organize Master Tiles**.  
-   - Vérifier :
-     - Seules les brutes dont le **centre** tombe dans la bbox sont sélectionnées et passées au worker.  
-     - Le log montre un nombre de groupes et de frames **réduit** par rapport au cas sans bbox.  
-     - La mosaïque produite couvre uniquement la zone de la bbox (dans la logique ZeMosaic).
-
-3. **Effacement de la bounding box**  
-   - Dessiner une bbox.  
-   - Clic droit dans le Sky preview → sélectionner “Clear selection bounding box”.  
-   - Vérifier :
-     - Le cadre disparaît visuellement.  
-     - L’état interne est bien réinitialisé (prochaine auto-organisation = comportement “global”).
-
-4. **Bord de champ / RA wrap**  
-   - Si possible, tester un dataset où la bbox traverse 0h ou frôle les bords du champ.  
-   - Vérifier que la gestion RA min/max ne exclut pas à tort des frames.
-
-
----
-
-Fin du fichier `followup.md`.
+## 4. Logging and localisation
+
+### 4.1 Logging keys
+
+- [x] Add new message keys in the logging / localization layer (if not already present), such as:
+  - `gpu_info_summary` — “GPU detected: {name}, VRAM: {total_mb:.0f} MB, free: {free_mb:.0f} MB.”
+  - `gpu_fallback_unavailable` — “GPU helpers requested but CuPy is not available. Falling back to CPU.”
+  - `gpu_fallback_insufficient_memory` — “GPU memory guard: estimated {estimated_mb:.1f} MB vs allowed {allowed_mb:.1f} MB. Falling back to CPU.”
+  - `gpu_fallback_runtime_error` — “GPU processing error: {error}. Falling back to CPU.”
+- [x] Implement these in both:
+  - `locales/en.json`
+  - `locales/fr.json`
+
+### 4.2 Integration in callbacks
+
+- [x] Use the existing progress callback (`pcb`) / logger in `zemosaic_worker.py` to emit these messages with appropriate log levels:
+  - INFO or INFO_DETAIL for informational messages.
+  - WARN for fallbacks that still complete the run.
+  - ERROR only if the whole run fails.
+
+- [x] Where GPU helpers are used outside the worker (e.g. in `zemosaic_utils.py` utility scripts or GUIs), use Python logging (`logging.getLogger(__name__)`) with consistent messages.
+
+Goal: no GPU-related decision (use or fallback) should be **silent**.
+
+
+## 5. GUI and config alignment
+
+### 5.1 Tk GUI (`zemosaic_gui.py`)
+
+- [x] Ensure GPU-related options in the Tk GUI:
+  - Read and write `use_gpu_phase5` in the configuration.
+  - Synchronise legacy flags (`stack_use_gpu`, `use_gpu_stack`) to this canonical flag via `_synchronize_legacy_gpu_flags`.
+- [x] Confirm that when the Tk GUI launches a run:
+  - The config handed to the worker clearly indicates whether GPU is requested for Phase 5 and/or stacking.
+
+### 5.2 Qt GUI (`zemosaic_gui_qt.py`)
+
+- [x] Mirror the same logic as in Tk:
+  - Maintain a canonical GPU flag in the Qt config.
+  - Ensure the “Use GPU” checkbox/selector sets the correct fields.
+- [x] If there is a GPU selector combobox (CPU/GPU auto/off), ensure:
+  - Values map cleanly to boolean `use_gpu_phase5` (or similar).
+  - Changes are persisted and restored from the config.
+
+### 5.3 Filter Qt GUI (`zemosaic_filter_gui_qt.py`)
+
+- [x] If Mosaic-First / special modes (like ZeSupaDupStack) include GPU hints:
+  - Ensure these hints are passed to the worker in a way consistent with the new GPU policy.
+- [x] Do not introduce duplicate GPU flags; piggyback on the same `use_gpu_phase5` / `stack_use_gpu` values.
+
+
+## 6. Optional: GPU diagnostics helper
+
+If you deem it low risk and helpful:
+
+- [x] Add an optional “GPU diagnostics” helper in `zemosaic_utils.py` that:
+  - Queries device name, total and free VRAM.
+  - Logs a `gpu_info_summary` message once per run.
+- [x] Call it from the worker at the very beginning of `run_hierarchical_mosaic` when GPU is enabled in config.
+
+This is optional but can greatly help users understand what the GPU is doing.
+
+
+## 7. Final sanity checks
+
+- [x] Run the test scenarios (or create synthetic ones) for:
+  - CPU-only system (no CuPy).
+  - GPU present but small VRAM (simulate with aggressive safety fractions and large inputs).
+  - GPU present with plenty of VRAM.
+- [x] Confirm from logs that:
+  - GPU is used when reasonable.
+  - CPU fallback happens only with clear, understandable reasons.
+  - No uncaught OOM or cryptic CuPy errors reach the user.
+
+Once all boxes are checked, the GPU/memory review can be considered complete.
