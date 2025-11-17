@@ -1,123 +1,126 @@
-# AGENT MISSION FILE — ZEMOSAIC FILTER GUI QT — GROUPED LIST + SKY SELECTION
+# AGENT MISSION — ZEMOSAIC QT FILTER UPGRADE
 
-You are a coding agent working on the **ZeMosaic** project, specifically the Qt-based Filter GUI (`zemosaic_filter_gui_qt.py`).  
-Your mission is to enhance the ergonomics of the Filter interface **without modifying the stacking logic, worker behavior, or any Tkinter GUI.**
+You are an autonomous coding agent working inside the **ZeMosaic** project.
 
-Follow this document strictly.  
-Do not modify any file not explicitly listed below unless absolutely required for compatibility.
+Your mission is to modify *only* the PySide6 GUI implementation (`zemosaic_filter_gui_qt.py` and when necessary `zemosaic_gui_qt.py`) **without breaking**:
 
----
+- the Tkinter GUI (`zemosaic_filter_gui.py`, `zemosaic_gui.py`)
+- the worker logic (`zemosaic_worker`)
+- the stacking behaviour (batch_size = 0 and batch_size > 1 must remain untouched)
+- all instrument, WCS, mosaic and SDS logic
+- cross-platform compatibility (Windows / macOS / Linux)
 
-# 🔥 OBJECTIVE SUMMARY
-
-Implement **two major ergonomic upgrades** in `zemosaic_filter_gui_qt.py`:
-
----
-
-## **1. Grouped Images List (replacing the flat QTableWidget)**
-
-Replace the current “Images (check to keep)” flat list with a **group-based hierarchical view**:
-
-### Required:
-
-### ✔ Replace QTableWidget with **QTreeWidget**  
-- Root rows represent groups (Group 1, Group 2, etc.)
-- Child rows represent images inside the group.
-
-### ✔ Group row behavior  
-- Double-click group row → expand/collapse children.
-- Checkbox on group:
-  - checking group → checks all images inside
-  - unchecking group → unchecks all images inside
-  - group must support **tri-state** (partially checked)
-
-### ✔ Image row behavior  
-- Each image retains:
-  - File name  
-  - WCS state (Yes/No)  
-  - Instrument  
-- Checking/unchecking an image updates:
-  - group checkbox state  
-  - internal “checked items” list used by the processing pipeline
-
-### ✔ Internal state must remain **100% compatible** with the existing worker code  
-No change to data structures, only to the GUI representation layer.
+Nothing in the business logic or file formats must be changed.
 
 ---
 
-## **2. User Rectangle Selection in Sky Preview**
+# PRIMARY OBJECTIVES (Qt filter GUI only)
 
-The Matplotlib sky preview must support **rubber-band style selection**:
+## A. FIX GROUP WCS OUTLINES
+- Ensure group-level WCS bounding boxes appear correctly in the Sky Preview when files contain WCS.
+- Improve logic so that outlines are built from groups *even if* only clustering is used (no SDS yet).
+- Do *not* draw per-frame footprints to avoid freezes. Only draw group boxes.
 
-### ✔ Click + drag draws a semi-transparent blue rectangle  
-Use either:
-- `matplotlib.widgets.RectangleSelector`, OR  
-- manual event handling (`button_press_event`, `motion_notify_event`, `button_release_event`)
+## B. CONSISTENT GROUP BOX SIZE
+- Each group’s bounding box must use the **footprint size of the first WCS tile in that group** as template size.
+- The group’s effective box must have the correct width/height in RA/DEC degrees.
+- Orientation stays aligned with RA/DEC axes (no rotation).
 
-### ✔ When drag ends:
-1. Convert rectangle pixel coordinates → RA/DEC bounds  
-2. For each group:
-   - If any WCS footprint or group centroid falls inside the rectangle → group is **selected**
-3. Selected groups must:
-   - Be highlighted in sky preview  
-   - Be auto-expanded in the groups list  
-   - Be auto-checked in the groups list  
-   - Trigger the same “checked items update” logic
-
-### ✔ The existing blue "global WCS frame" must not be removed  
-Your new rectangle must be drawn **in a separate layer**.
+## C. REMOVE USELESS UI ELEMENT
+- Completely remove the “Scan / grouping log” panel from the Qt UI.
+- Remove the widget, its layout entry, and all code that updates this log.
+- Do not remove anything else.
 
 ---
 
-# NON-NEGOTIABLE REQUIREMENTS
+# NEW OBJECTIVES — USER BOUNDING BOX (SELECTION TOOL)
 
-- Do **not** alter stacking logic, group computation logic, WCS extraction logic, or worker communication.
-- Do **not** touch Tkinter implementation (`zemosaic_filter_gui.py`).
-- Do **not** break geometry persistence, localization, or icon loading.
-- Do **not** remove or rename existing signals/slots.
+## D. ADD A USER-SPECIFIC SKY BOUNDING BOX
+The Sky Preview must support a *user-drawn selection bounding box*.
 
----
-
-# FILES YOU ARE AUTHORIZED TO MODIFY
-
-### Mandatory:
-- `zemosaic_filter_gui_qt.py`  
-  (Implementation of grouped list + sky rectangle selection)
-
-### Optional, only if required:
-- `locales/en.json` and `locales/fr.json`  
-  (To add new labels for the grouped list)
-
-No other file must be touched.
+### Requirements:
+1. Add drawing of a user bounding box (drag on Sky Preview).
+2. Store the bounding box internally as RA/DEC limits:
+{ "ra_min": ..., "ra_max": ..., "dec_min": ..., "dec_max": ... }
+3. This bounding box **must not** interfere with group-WCS outlines (both can co-exist).
+4. The bounding box must be optional. When None, everything behaves as today.
 
 ---
 
-# IMPLEMENTATION GUIDELINES
+## E. RIGHT-CLICK TO CLEAR USER BOUNDING BOX
+Add a context menu (right-click on the Sky Preview) with:
 
-## Grouped List
-- Use `QTreeWidget` with:
-  - `setHeaderLabels([“File”, “WCS”, “Instrument”])`
-  - `setColumnCount(3)`
-  - `setExpandsOnDoubleClick(True)`
-  - tri-state enabled via `Qt.ItemIsTristate | Qt.ItemIsUserCheckable`
+- **“Clear selection bounding box”**  
+(use Qt localization system if available)
 
-## Sky Preview
-- Add rectangle selector overlay layer
-- Maintain a list `selected_groups`
-- Ensure update signals do not cause redraw storms (use throttling if needed)
+When clicked:
+- remove the drawn rectangle
+- reset internal state to None
+- refresh the plot
 
----
-
-# ACCEPTANCE CRITERIA
-
-1. Groups appear as collapsible list nodes.  
-2. Group checkbox logic correct (check all, partial state).  
-3. Rectangle drag works reliably.  
-4. Rectangle correctly identifies groups by RA/DEC overlaps.  
-5. Selected groups sync visually and with checkboxes.  
-6. No regression in processing pipeline.  
-7. No GUI freeze or slowdown.
+This action must not disturb group outlines, treeview, or clustering.
 
 ---
 
-# END OF AGENT FILE
+# ADVANCED BEHAVIOUR — BOUNDING BOX INTEGRATION
+
+## F. BOUNDING BOX FILTERING FOR AUTO-ORGANIZE MASTER TILES
+When a user bounding box is active:
+
+- Only the frames **whose center RA/DEC lies inside the bounding box** must be considered candidates.
+- Frames outside must not be included in clustering or grouping.
+- If no frame lies inside the bbox:
+- Cancel auto-organize
+- Show a small warning (QMessageBox or inline log)
+
+### Filtering rule:
+include item if item.center_ra and item.center_dec lie inside bbox RA/DEC
+
+Handle RA wrap-around at 0°/360°.
+
+---
+
+## G. SYNCHRONIZE TREEVIEW WITH BOUNDING BOX FILTER
+After filtering:
+- Only frames inside the bbox may be checked/selected in the tree.
+- Frames outside remain unchecked.
+
+Tree must accurately reflect what will be passed to the worker.
+
+---
+
+# CRITICAL CONSTRAINT — DO NOT MODIFY THE WORKER
+
+## H. WORKER CALL MUST REMAIN IDENTICAL
+The worker (`zemosaic_worker.run_hierarchical_mosaic[_process]`) must:
+
+- receive the **exact same structure** it expects in Tk mode
+- only difference allowed: the list of frames may be shorter (filtered by bbox)
+- no change in data format, keys, object types, or processing steps
+
+Bounding box logic must stay **entirely inside the Qt filter GUI**.
+
+Do NOT modify:
+- `zemosaic_worker.py`
+- `zemosaic_utils.py`
+- any SDS logic
+- any FITS-handling logic
+
+The worker must remain unaware of the bounding box.
+
+---
+
+# I. FINAL VALIDATION
+After implementing everything:
+- Sky preview must show:
+  - user bounding box when drawn
+  - group bounding boxes with correct size
+- Right-click → bounding box disappears
+- Auto-organize must:
+  - use only frames in bbox
+  - produce smaller or identical group sets
+  - never include frames outside bbox
+- Treeview selection matches filtered frames
+- Tk interface remains 100% unchanged
+
+---

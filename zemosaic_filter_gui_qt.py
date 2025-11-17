@@ -83,8 +83,9 @@ from PySide6.QtCore import (
     QTimer,
     QRect,
     QByteArray,
+    QPoint,
 )
-from PySide6.QtGui import QIcon
+from PySide6.QtGui import QIcon, QMovie
 from PySide6.QtWidgets import (  # noqa: E402  - imported after availability check
     QApplication,
     QDialog,
@@ -110,6 +111,7 @@ from PySide6.QtWidgets import (  # noqa: E402  - imported after availability che
     QAbstractItemView,
     QTabWidget,
     QHeaderView,
+    QMenu,
 )
 
 
@@ -1599,6 +1601,9 @@ class FilterQtDialog(QDialog):
         self._cluster_refresh_pending = False
         self._auto_group_button: QPushButton | None = None
         self._auto_group_summary_label: QLabel | None = None
+        self._solve_overlay: QWidget | None = None
+        self._solve_overlay_label: QLabel | None = None
+        self._solve_animation: QMovie | None = None
         self._auto_group_running = False
         self._auto_group_override_groups: list[list[dict[str, Any]]] | None = None
         self._header_cache: dict[str, Any] = {}
@@ -1631,6 +1636,7 @@ class FilterQtDialog(QDialog):
         self._rectangle_selector: RectangleSelector | None = None
         self._selected_group_keys: set[_GroupKey] = set()
         self._selection_bounds: tuple[float, float, float, float] | None = None
+        self._selection_check_snapshot: list[bool] | None = None
         self._preview_color_cycle: tuple[str, ...] = (
             "#3f7ad6",
             "#d64b3f",
@@ -1672,6 +1678,7 @@ class FilterQtDialog(QDialog):
                 except Exception:
                     self._cache_csv_path = None
         self._build_ui()
+        self._build_processing_overlay()
         cache_loaded = bool(self._cache_csv_path and os.path.exists(self._cache_csv_path))
         if self._stream_scan:
             self._prepare_streaming_mode(raw_files_with_wcs_or_dir, initial_overrides)
@@ -1755,6 +1762,8 @@ class FilterQtDialog(QDialog):
 
         figure = Figure(figsize=(5, 3))
         canvas = FigureCanvasQTAgg(figure)
+        canvas.setContextMenuPolicy(Qt.CustomContextMenu)
+        canvas.customContextMenuRequested.connect(self._on_preview_context_menu)  # type: ignore[arg-type]
         axes = figure.add_subplot(111)
         self._preview_axes = axes
         axes.set_xlabel(self._localizer.get("filter.preview.ra", "Right Ascension (°)"))
@@ -2145,6 +2154,33 @@ class FilterQtDialog(QDialog):
         if not selected_indices:
             self._handle_auto_group_empty_selection()
             return
+        filtered_indices = self._filter_indices_by_selection_bounds(selected_indices)
+        if self._selection_bounds is not None:
+            total = len(selected_indices)
+            kept = len(filtered_indices)
+            log_template = self._localizer.get(
+                "qt_filter_bbox_log",
+                "Bounding box active: kept {kept} of {total} frame(s) for auto-organize.",
+            )
+            try:
+                log_message = log_template.format(kept=kept, total=total)
+            except Exception:
+                log_message = f"Bounding box active: kept {kept} / {total} frame(s) for auto-organize."
+            self._append_log(log_message)
+            if kept == 0:
+                warning_text = self._localizer.get(
+                    "qt_filter_bbox_empty_selection",
+                    "No frames found inside the current selection bounding box.",
+                )
+                self._append_log(warning_text, level="WARN")
+                self._status_label.setText(warning_text)
+                try:
+                    QMessageBox.warning(self, self.windowTitle() or "ZeMosaic Filter", warning_text)
+                except Exception:
+                    pass
+                self._handle_auto_group_empty_selection()
+                return
+            selected_indices = filtered_indices
 
         self._auto_group_running = True
         self._append_log(
@@ -2168,9 +2204,11 @@ class FilterQtDialog(QDialog):
                 daemon=True,
             )
             thread.start()
+            self._show_processing_overlay()
         except Exception as exc:
             # If the background thread cannot be started, fall back to a safe state
             # and report the issue instead of leaving the button permanently disabled.
+            self._hide_processing_overlay()
             self._auto_group_running = False
             if self._auto_group_button is not None:
                 try:
@@ -2201,6 +2239,7 @@ class FilterQtDialog(QDialog):
                 self._auto_group_button.setEnabled(True)
             except Exception:
                 pass
+        self._hide_processing_overlay()
 
     def _auto_group_background_task(
         self,
@@ -2275,8 +2314,10 @@ class FilterQtDialog(QDialog):
                     "Auto-organisation failed.",
                 )
             )
+            self._hide_processing_overlay()
             return
         self._apply_auto_group_result(result_payload)
+        self._hide_processing_overlay()
 
     def _compute_auto_groups(
         self,
@@ -3845,6 +3886,136 @@ class FilterQtDialog(QDialog):
 
         self._apply_saved_window_geometry()
 
+    def _build_processing_overlay(self) -> None:
+        overlay = QWidget(self)
+        overlay.setObjectName("filterProcessingOverlay")
+        overlay.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        overlay.hide()
+        overlay.setStyleSheet(
+            "#filterProcessingOverlay { background-color: rgba(0, 0, 0, 0); }"
+            "#filterProcessingOverlayContainer {"
+            " background-color: rgba(0, 0, 0, 150);"
+            " border-radius: 16px;"
+            " padding: 16px;"
+            "}"
+            "QLabel#filterProcessingOverlayLabel { color: white; }"
+        )
+        layout = QVBoxLayout(overlay)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.setAlignment(Qt.AlignCenter)
+
+        container = QWidget(overlay)
+        container.setObjectName("filterProcessingOverlayContainer")
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(24, 24, 24, 24)
+        container_layout.setSpacing(8)
+
+        label = QLabel(container)
+        label.setObjectName("filterProcessingOverlayLabel")
+        label.setAlignment(Qt.AlignCenter)
+        label.setWordWrap(True)
+        animation_path = self._resolve_overlay_animation_path()
+        movie: QMovie | None = None
+        if animation_path:
+            try:
+                movie = QMovie(animation_path)
+            except Exception:
+                movie = None
+            if movie is not None and not movie.isValid():
+                movie = None
+        if movie is not None:
+            label.setMovie(movie)
+        else:
+            label.setText(
+                self._localizer.get("filter.overlay.solving", "Solving WCS, please wait…")
+            )
+
+        container_layout.addWidget(label, 0, Qt.AlignCenter)
+        layout.addWidget(container, 0, Qt.AlignCenter)
+
+        self._solve_overlay = overlay
+        self._solve_overlay_label = label
+        self._solve_animation = movie
+        self._update_overlay_geometry()
+
+    def _resolve_overlay_animation_path(self) -> str | None:
+        """Return the first existing wait-animation GIF path.
+
+        Some environments ship the GIF with duplicate extensions, so we probe
+        several reasonable filenames before falling back to a directory scan.
+        """
+
+        try:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+        except Exception:
+            base_dir = None
+
+        candidate_names = (
+            "wait_animation.gif",
+            "wait_animation.GIF",
+            "wait_animation.gif.gif",
+            "wait_animation.GIF.GIF",
+        )
+
+        search_roots: list[str] = []
+        if base_dir:
+            search_roots.append(os.path.join(base_dir, "gif"))
+        search_roots.append(os.path.join(os.getcwd(), "gif"))
+
+        for root in search_roots:
+            if not root or not os.path.isdir(root):
+                continue
+            for name in candidate_names:
+                candidate = os.path.join(root, name)
+                if os.path.isfile(candidate):
+                    return candidate
+            try:
+                for entry in os.listdir(root):
+                    lower_name = entry.lower()
+                    if not lower_name.startswith("wait_") or not lower_name.endswith(".gif"):
+                        continue
+                    candidate = os.path.join(root, entry)
+                    if os.path.isfile(candidate):
+                        return candidate
+            except Exception:
+                continue
+        return None
+
+    def _update_overlay_geometry(self) -> None:
+        if self._solve_overlay is None:
+            return
+        try:
+            self._solve_overlay.setGeometry(self.rect())
+        except Exception:
+            pass
+
+    def _show_processing_overlay(self) -> None:
+        overlay = self._solve_overlay
+        if overlay is None:
+            return
+        self._update_overlay_geometry()
+        try:
+            overlay.raise_()
+        except Exception:
+            pass
+        overlay.show()
+        if self._solve_animation is not None:
+            try:
+                self._solve_animation.start()
+            except Exception:
+                pass
+
+    def _hide_processing_overlay(self) -> None:
+        if self._solve_animation is not None:
+            try:
+                self._solve_animation.stop()
+            except Exception:
+                pass
+        overlay = self._solve_overlay
+        if overlay is not None:
+            overlay.hide()
+
     def _load_saved_window_geometry(self) -> tuple[int, int, int, int] | None:
         if _load_gui_config is None:
             return None
@@ -3915,7 +4086,7 @@ class FilterQtDialog(QDialog):
         self._group_entries = {}
         self._cluster_index_to_group_key = {}
         self._selected_group_keys.clear()
-        self._selection_bounds = None
+        self._discard_selection_bounds_state()
         self._update_summary_label()
         loading_text = self._localizer.get("filter.stream.starting", "Discovering frames…")
         self._status_label.setText(loading_text)
@@ -4202,15 +4373,10 @@ class FilterQtDialog(QDialog):
         if state == Qt.PartiallyChecked:
             return
         desired = state == Qt.Checked
-        self._tree_signal_guard = True
-        for idx in range(item.childCount()):
-            child = item.child(idx)
-            child.setCheckState(0, Qt.Checked if desired else Qt.Unchecked)
-        self._tree_signal_guard = False
         for idx in range(item.childCount()):
             entry_idx = item.child(idx).data(0, Qt.UserRole)
             if isinstance(entry_idx, int):
-                self._entry_check_state[entry_idx] = desired
+                self._set_entry_checked(entry_idx, desired)
         self._after_selection_changed()
 
     def _handle_entry_item_changed(self, item: QTreeWidgetItem) -> None:
@@ -4218,8 +4384,7 @@ class FilterQtDialog(QDialog):
         if not isinstance(entry_idx, int):
             return
         checked = item.checkState(0) == Qt.Checked
-        self._entry_check_state[entry_idx] = checked
-        self._refresh_group_check_state(item.parent())
+        self._set_entry_checked(entry_idx, checked)
         self._after_selection_changed()
 
     def _after_selection_changed(self) -> None:
@@ -4230,19 +4395,32 @@ class FilterQtDialog(QDialog):
     def _entry_is_checked(self, index: int) -> bool:
         return 0 <= index < len(self._entry_check_state) and self._entry_check_state[index]
 
-    def _set_entry_checked(self, index: int, checked: bool) -> bool:
+    def _set_entry_checked(self, index: int, checked: bool, update_snapshot: bool = True) -> bool:
         if not (0 <= index < len(self._entry_check_state)):
             return False
-        if self._entry_check_state[index] == checked:
+        blocked_by_selection = False
+        if checked and not self._entry_inside_selection_bounds(self._normalized_items[index]):
+            checked = False
+            blocked_by_selection = True
+        current = self._entry_check_state[index]
+        item = self._entry_items[index]
+        if current == checked:
+            if item is not None:
+                parent = item.parent()
+                self._tree_signal_guard = True
+                item.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
+                self._tree_signal_guard = False
+                self._refresh_group_check_state(parent)
             return False
         self._entry_check_state[index] = checked
-        item = self._entry_items[index]
         if item is not None:
             parent = item.parent()
             self._tree_signal_guard = True
             item.setCheckState(0, Qt.Checked if checked else Qt.Unchecked)
             self._tree_signal_guard = False
             self._refresh_group_check_state(parent)
+        if update_snapshot and not blocked_by_selection:
+            self._update_selection_snapshot_entry(index, checked)
         return True
 
     def _expand_all_groups(self) -> None:
@@ -4472,6 +4650,7 @@ class FilterQtDialog(QDialog):
         self._scan_thread.finished.connect(self._scan_thread.deleteLater)
         self._debug_log("[Filter] Analyse clicked — starting directory crawl…")
         self._scan_thread.start()
+        self._show_processing_overlay()
 
     def _resolve_preview_cap(self) -> int | None:
         """Return the integer cap applied to preview points or ``None`` for unlimited."""
@@ -4639,9 +4818,14 @@ class FilterQtDialog(QDialog):
             return
         ra_min, ra_max = (ra1, ra2) if ra1 <= ra2 else (ra2, ra1)
         dec_min, dec_max = (dec1, dec2) if dec1 <= dec2 else (dec2, dec1)
+        if self._selection_bounds is None:
+            self._capture_selection_snapshot()
+        else:
+            self._restore_selection_state_for_reselection()
         self._selection_bounds = (ra_min, ra_max, dec_min, dec_max)
         selected_keys = self._resolve_groups_in_bounds(ra_min, ra_max, dec_min, dec_max)
         self._apply_group_selection(selected_keys)
+        self._apply_selection_bounds_constraints()
         if selected_keys:
             message_template = self._localizer.get(
                 "filter.preview.selection_compact",
@@ -4660,6 +4844,34 @@ class FilterQtDialog(QDialog):
             )
             self._status_label.setText(cleared_message)
             self._append_log(cleared_message)
+        self._schedule_preview_refresh()
+
+    def _on_preview_context_menu(self, point: QPoint) -> None:
+        if self._preview_canvas is None:
+            return
+        menu = QMenu(self._preview_canvas)
+        label = self._localizer.get(
+            "qt_filter_clear_bbox",
+            "Clear selection bounding box",
+        )
+        clear_action = menu.addAction(label)
+        clear_action.setEnabled(self._selection_bounds is not None)
+        clear_action.triggered.connect(lambda: self._clear_preview_selection())  # type: ignore[arg-type]
+        menu.exec(self._preview_canvas.mapToGlobal(point))
+
+    def _clear_preview_selection(self) -> None:
+        if self._selection_bounds is None:
+            return
+        self._selection_bounds = None
+        self._restore_selection_snapshot()
+        if self._selected_group_keys:
+            self._selected_group_keys.clear()
+        cleared_message = self._localizer.get(
+            "filter.preview.selection_cleared",
+            "Selection bounding box cleared.",
+        )
+        self._status_label.setText(cleared_message)
+        self._append_log(cleared_message)
         self._schedule_preview_refresh()
 
     def _resolve_groups_in_bounds(
@@ -4784,6 +4996,95 @@ class FilterQtDialog(QDialog):
             self._after_selection_changed()
         else:
             self._schedule_preview_refresh()
+
+    def _capture_selection_snapshot(self) -> None:
+        if self._selection_check_snapshot is None:
+            self._selection_check_snapshot = list(self._entry_check_state)
+
+    def _restore_selection_state_for_reselection(self) -> None:
+        snapshot = self._selection_check_snapshot
+        if not snapshot or len(snapshot) != len(self._entry_check_state):
+            return
+        changed = False
+        for idx, desired in enumerate(snapshot):
+            if self._set_entry_checked(idx, bool(desired), update_snapshot=False):
+                changed = True
+        if changed:
+            self._after_selection_changed()
+
+    def _restore_selection_snapshot(self) -> None:
+        snapshot = self._selection_check_snapshot
+        self._selection_check_snapshot = None
+        if not snapshot or len(snapshot) != len(self._entry_check_state):
+            return
+        changed = False
+        for idx, desired in enumerate(snapshot):
+            if self._set_entry_checked(idx, bool(desired)):
+                changed = True
+        if changed:
+            self._after_selection_changed()
+        else:
+            self._schedule_preview_refresh()
+
+    def _update_selection_snapshot_entry(self, index: int, checked: bool) -> None:
+        if self._selection_check_snapshot is None:
+            return
+        if not (0 <= index < len(self._selection_check_snapshot)):
+            return
+        self._selection_check_snapshot[index] = bool(checked)
+
+    def _discard_selection_bounds_state(self) -> None:
+        self._selection_bounds = None
+        self._selection_check_snapshot = None
+
+    def _entry_inside_selection_bounds(
+        self,
+        entry: _NormalizedItem,
+        bounds: tuple[float, float, float, float] | None = None,
+    ) -> bool:
+        selection_bounds = bounds if bounds is not None else self._selection_bounds
+        if selection_bounds is None:
+            return True
+        ra_val = entry.center_ra_deg
+        dec_val = entry.center_dec_deg
+        if ra_val is None or dec_val is None:
+            ra_val, dec_val = self._ensure_entry_coordinates(entry)
+        if ra_val is None or dec_val is None:
+            return False
+        ra_min, ra_max, dec_min, dec_max = selection_bounds
+        if ra_min <= ra_max:
+            ra_ok = ra_min <= ra_val <= ra_max
+        else:
+            ra_ok = ra_val >= ra_min or ra_val <= ra_max
+        dec_ok = dec_min <= dec_val <= dec_max
+        return ra_ok and dec_ok
+
+    def _apply_selection_bounds_constraints(self) -> None:
+        if self._selection_bounds is None:
+            return
+        changed = False
+        for idx, entry in enumerate(self._normalized_items):
+            if not self._entry_inside_selection_bounds(entry):
+                # Skip snapshot updates so entries outside the bbox can be restored later.
+                if self._set_entry_checked(idx, False, update_snapshot=False):
+                    changed = True
+                continue
+            # Ensure the snapshot keeps track of entries that remain inside the bbox.
+            if self._selection_check_snapshot is not None:
+                self._update_selection_snapshot_entry(idx, self._entry_check_state[idx])
+        if changed:
+            self._after_selection_changed()
+
+    def _filter_indices_by_selection_bounds(self, indices: Sequence[int]) -> list[int]:
+        if self._selection_bounds is None:
+            return list(indices)
+        filtered: list[int] = []
+        for idx in indices:
+            if 0 <= idx < len(self._normalized_items):
+                entry = self._normalized_items[idx]
+                if self._entry_inside_selection_bounds(entry):
+                    filtered.append(idx)
+        return filtered
 
     def _schedule_preview_refresh(self) -> None:
         if self._preview_canvas is None or self._preview_refresh_pending:
@@ -5132,6 +5433,10 @@ class FilterQtDialog(QDialog):
     # ------------------------------------------------------------------
     # QDialog API
     # ------------------------------------------------------------------
+    def resizeEvent(self, event) -> None:  # type: ignore[override]
+        super().resizeEvent(event)
+        self._update_overlay_geometry()
+
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._persist_window_geometry()
         self._stop_stream_worker()
@@ -5142,6 +5447,7 @@ class FilterQtDialog(QDialog):
             self._scan_thread.wait(2000)
             self._scan_thread = None
         self._scan_worker = None
+        self._hide_processing_overlay()
         super().closeEvent(event)
 
     def accept(self) -> None:  # noqa: D401 - inherit docstring
@@ -5821,6 +6127,7 @@ class FilterQtDialog(QDialog):
         self._append_log(message, level="ERROR")
 
     def _on_scan_finished(self) -> None:
+        self._hide_processing_overlay()
         if self._run_analysis_btn is not None:
             self._run_analysis_btn.setEnabled(True)
         self._scan_thread = None
