@@ -2113,12 +2113,6 @@ class ZeMosaicQtMainWindow(QMainWindow):
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(10)
 
-        general_header = QLabel(
-            self._tr("qt_group_final_general", "General output options"),
-            group,
-        )
-        layout.addWidget(general_header)
-
         general_box = QWidget(group)
         general_layout = QFormLayout(general_box)
         general_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)

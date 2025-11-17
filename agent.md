@@ -1,265 +1,165 @@
+Oui, ce que tu proposes est complètement cohérent 👍
 
-# AGENT MISSION FILE — ZEMOSAIC QT MAIN TAB LAYOUT (SPLITTERS ONLY)
+* Le freeze dans `zemosaic_filter_gui_qt.py` vient très clairement de la boucle qui va chercher *tous* les footprints WCS et les dessine (polygones complets) dans `_update_preview_plot`.
+* On a déjà :
+
+  * les groupes logiques (cluster index),
+  * des couleurs par groupe,
+  * des « outline » de groupes (rectangles) côté Qt.
+    Donc afficher **uniquement les outlines de groupes + les centres** suffit pour donner une excellente intuition de la couverture, sans toucher au métier (clustering, overrides, SDS, etc.).
+* La persistance de géométrie de fenêtre existe déjà pour le main Qt, et un squelette similaire est en place dans `zemosaic_filter_gui_qt.py` (avec `QT_FILTER_WINDOW_GEOMETRY_KEY` et `_persist_window_geometry`), il faut juste sécuriser / finaliser le câblage.
+* Le texte fantôme « Final stacking / output » côté main tab vient très probablement d’un label ou titre dupliqué / mal positionné dans la colonne de droite (groupe « Final assembly & output »). C’est clairement une anomalie de layout Qt, pas du métier.
+
+Du coup, je te propose **deux fichiers prêts à l’emploi** pour Codex : `agent.md` (mission globale) et `followup.md` (check-list détaillée).
+
+---
+
+## `agent.md`
+
+```markdown
+# AGENT MISSION — ZEMOSAIC QT POLISH (V4.1)
 
 You are an autonomous coding agent working on the **ZeMosaic** project.
 
-The repository already contains (relevant for this task):
+The repository contains (among others):
 
-- `run_zemosaic.py`           → entry point (Tk / Qt selector)
-- `zemosaic_gui.py`           → legacy Tkinter GUI (MUST remain unchanged)
-- `zemosaic_filter_gui.py`    → legacy Tkinter filter GUI (MUST remain unchanged)
-- `zemosaic_gui_qt.py`        → new PySide6 main GUI (this is your ONLY target)
-- `zemosaic_filter_gui_qt.py` → new PySide6 filter GUI (DO NOT touch it in this task)
-- `locales/en.json`, `locales/fr.json`
-- helper modules (astrometry, worker, utils, etc.) — DO NOT modify them for this task.
+- `run_zemosaic.py`
+- `zemosaic_gui.py` (Tkinter main GUI – legacy)
+- `zemosaic_filter_gui.py` (Tkinter filter GUI – legacy)
+- `zemosaic_gui_qt.py` (PySide6 main GUI – NEW)
+- `zemosaic_filter_gui_qt.py` (PySide6 filter GUI – NEW)
+- `zemosaic_worker.py` (business logic / phases)
+- `zemosaic_config.py` (config load/save helpers)
+- `zemosaic_localization.py`, `locales/*.json` (i18n)
+- various helpers (`zemosaic_astrometry.py`, `lecropper.py`, etc.)
 
-Your job in this mission:  
-**Refine the layout of the Qt “Main” tab using QSplitter so that the main groups can be resized interactively, without changing any business logic or behaviour.**
+Your job in this mission is **not** to redesign the whole app, but to:
+1. Make the **Qt Filter GUI** (`zemosaic_filter_gui_qt.py`) lighter and smoother (no freezes when drawing the sky preview).
+2. Ensure the **Filter window geometry** is persisted/restored, just like the main Qt window.
+3. Fix a **ghost / duplicate text** issue in the Qt main window, right column of the *Main* tab.
 
+The existing Tkinter GUIs and the worker logic are considered **stable** and must keep working unchanged.
 
-## GLOBAL CONSTRAINTS
+---
 
-1. **Tkinter GUI must remain 100% untouched and functional.**
-   - Do not modify `zemosaic_gui.py` or `zemosaic_filter_gui.py`.
+## GLOBAL PRINCIPLES
 
-2. **Non-GUI logic must remain untouched.**
-   - Do not change any code related to:
-     - processing pipeline, worker threads,
-     - configuration loading/saving,
-     - astrometry / stacking / mosaic algorithms,
-     - logging, progress bars, etc.
+- **Do not break**:
+  - The Tk GUIs (`zemosaic_gui.py`, `zemosaic_filter_gui.py`).
+  - The pipeline logic in `zemosaic_worker.py` (phases, SDS, coverage-first, etc.).
+- **Scope strictly to Qt GUI files** unless a small, clearly necessary shared change is required (`zemosaic_config.py`, localization keys).
+- Keep everything **cross-platform**: Windows, macOS, Linux (no Win32-only hacks).
+- Respect the existing **localization system**:
+  - UI text must go through `zemosaic_localization` and `locales/en.json`, `locales/fr.json` (and other locales if needed).
+- Keep the **SDS / coverage-first logic** intact; we only change what is *drawn* in the preview, not how groups are computed.
+- Prefer **small, focused patches** over large refactors.
 
-3. **Scope is intentionally narrow:**
-   - You may only modify:
-     - `zemosaic_gui_qt.py` (imports + layout code),
-   - No other files, no new dependencies, no changes to translation keys.
+---
 
-4. **Keep existing widget creation methods and translation usage.**
-   - The groupbox builders (`_create_folders_group`, `_create_instrument_group`, `_create_mosaic_group`, `_create_final_assembly_group`) must keep:
-     - same titles / `_tr` keys,
-     - same child widgets, fields and bindings.
+## CONCRETE GOALS
 
+### 1. Sky Preview: show only group coverage, not every footprint
 
-## CURRENT SITUATION (BEFORE YOUR CHANGES)
+Problem:  
+`zemosaic_filter_gui_qt.py` currently collects and draws **full WCS footprints for many frames** in `_update_preview_plot`. On large Seestar runs (thousands of frames), this causes the Qt Filter window to **freeze** when updating the sky preview.
 
-- The Qt main window builds a `QScrollArea` with a `QTabWidget`.
-- The **Main** tab is populated by `_populate_main_tab(self, layout: QVBoxLayout)`.
-- Inside `_populate_main_tab`, the layout currently uses a fixed `QGridLayout`:
+Desired behavior:
 
-  ```python
-  grid_container = QWidget(parent_widget)
-  grid_layout = QGridLayout(grid_container)
-  ...
-  grid_layout.addWidget(self._create_folders_group(), 0, 0)
-  grid_layout.addWidget(self._create_instrument_group(), 0, 1)
-  grid_layout.addWidget(self._create_mosaic_group(), 1, 0)
-  grid_layout.addWidget(self._create_final_assembly_group(), 1, 1)
-  layout.addWidget(grid_container)
-````
+- The **Sky Preview** tab should:
+  - Show one point per frame (or per master/group as it currently does).
+  - Draw **group-level coverage outlines** (rectangles/polygons per group), just like the existing `_group_outline_bounds` / coverage logic.
+  - **NOT** iterate over all frames to build and draw every single footprint polygon for the preview.
 
-* This forces all cells of the grid row/column to share the same height, leading to a **very tall empty area** in the “Mosaic / clustering” group when “Final assembly” is tall.
+Rules:
 
-The user wants:
+- Keep the checkbox **“Draw WCS footprints”** in the UI, but you are allowed to:
+  - Reinterpret it as “Draw group-level WCS outlines” (no per-frame polygons), **or**
+  - Add a hidden / advanced switch so that full per-frame footprints are disabled by default in Qt (for performance).
+- No changes to:
+  - how clustering works,
+  - how groups are saved to overrides,
+  - how the coverage map tab works.
+- The preview summary / legend (“Group 1… Group N, Unassigned”) must still work.
 
-* Two main columns (left and right), roughly balanced.
-* Within each column, the groups should be **resizable by the user** (dragging splitter handles).
-* The column widths themselves must also be adjustable.
-* Order of groups remains:
+Success criteria:
 
-  * Left column: **Folders** (top), **Mosaic / clustering** (bottom).
-  * Right column: **Instrument** (top), **Final assembly output** (bottom).
+- Opening the Qt Filter window on a big dataset (several thousand frames) no longer freezes the GUI when the sky preview updates.
+- The user still gets a clear visual idea of **which group covers what region of the sky**, thanks to colored points and group outlines.
 
-## MISSION OBJECTIVES
+---
 
-### Objective 1 — Import and basic setup
+### 2. Persist window geometry for Qt Filter GUI
 
-1. In `zemosaic_gui_qt.py`, extend the widget imports to include `QSplitter` (and `QSizePolicy` if needed):
+Current state:
 
-   ```python
-   from PySide6.QtWidgets import (
-       QApplication,
-       QCheckBox,
-       QComboBox,
-       QDoubleSpinBox,
-       QFrame,
-       QGraphicsScene,
-       QGraphicsView,
-       QFileDialog,
-       QFormLayout,
-       QGridLayout,
-       QGroupBox,
-       QHBoxLayout,
-       QLabel,
-       QLineEdit,
-       QMainWindow,
-       QMessageBox,
-       QPlainTextEdit,
-       QProgressBar,
-       QPushButton,
-       QScrollArea,
-       QSpinBox,
-       QTabWidget,
-       QVBoxLayout,
-       QWidget,
-       QSizePolicy,  # NEW
-       QSplitter,    # NEW
-   )
-   ```
+- The main Qt window (`zemosaic_gui_qt.py`) already has a geometry persistence mechanism (`QT_MAIN_WINDOW_GEOMETRY_KEY`, `_record_window_geometry`, etc.) stored in the config.
+- `zemosaic_filter_gui_qt.py` already defines `QT_FILTER_WINDOW_GEOMETRY_KEY` and helper methods:
+  - `_load_saved_window_geometry`
+  - `_capture_current_window_geometry`
+  - `_apply_saved_window_geometry`
+  - `_persist_window_geometry`
+  - and calls `_apply_saved_window_geometry()` at the end of `__init__`.
 
-   * Do **not** remove existing imports even if some are unused.
+Goal:
 
-### Objective 2 — Replace the grid layout with nested QSplitters
+- Make sure the **Qt Filter dialog**:
+  - Restores its last position/size when reopened.
+  - Saves its geometry on close.
+- Use the same config backend (`_load_gui_config`, `_save_gui_config` from `zemosaic_config.py`).
+- Do **not** break any Tk geometry persistence.
 
-Re-implement `_populate_main_tab` to use:
+Success criteria:
 
-* One **horizontal QSplitter** for the two main columns.
-* Two **vertical QSplitters**:
+- User resizes/moves the Qt Filter window, closes it, reopens it: the window appears with the same geometry.
+- If the saved geometry is invalid, the dialog falls back gracefully to a reasonable default size/position.
 
-  * left vertical splitter: Folders + Mosaic group,
-  * right vertical splitter: Instrument + Final assembly group.
+---
 
-**Required structure:**
+### 3. Remove ghost / duplicate label in main Qt window (Main tab, right column)
 
-```text
-Main tab (QVBoxLayout)
-└─ columns_splitter (QSplitter, Qt.Horizontal)
-   ├─ left_column_splitter  (QSplitter, Qt.Vertical)
-   │  ├─ folders_group
-   │  └─ mosaic_group
-   └─ right_column_splitter (QSplitter, Qt.Vertical)
-      ├─ instrument_group
-      └─ final_assembly_group
-```
+Problem:
 
-Concrete implementation:
+- In `zemosaic_gui_qt.py`, on the **Main** tab, right column, some users see a **“ghost” text** with something like “Final stacking/output” overlapping the group header area.
+- This is likely due to:
+  - a duplicate `QLabel` with the same text as the `QGroupBox` title, or
+  - a misconfigured layout that leaves a label floating (e.g., a form row with an empty field but a label still visible).
 
-```python
-def _populate_main_tab(self, layout: QVBoxLayout) -> None:
-    parent_widget = layout.parentWidget() or self
+Goal:
 
-    # --- main horizontal splitter: left column vs right column ---
-    columns_splitter = QSplitter(Qt.Horizontal, parent_widget)
-
-    # ----- LEFT COLUMN: folders + mosaic/clustering (vertical splitter) -----
-    left_splitter = QSplitter(Qt.Vertical, columns_splitter)
-
-    folders_group = self._create_folders_group()
-    mosaic_group = self._create_mosaic_group()
-
-    left_splitter.addWidget(folders_group)
-    left_splitter.addWidget(mosaic_group)
-
-    # Optional: give reasonable initial sizes (folders taller than mosaic)
-    left_splitter.setStretchFactor(0, 3)
-    left_splitter.setStretchFactor(1, 2)
-
-    # ----- RIGHT COLUMN: instrument + final assembly (vertical splitter) -----
-    right_splitter = QSplitter(Qt.Vertical, columns_splitter)
-
-    instrument_group = self._create_instrument_group()
-    final_group = self._create_final_assembly_group()
-
-    right_splitter.addWidget(instrument_group)
-    right_splitter.addWidget(final_group)
-
-    # Optional: final assembly slightly taller
-    right_splitter.setStretchFactor(0, 2)
-    right_splitter.setStretchFactor(1, 3)
-
-    # --- Add left and right columns to the main splitter ---
-    columns_splitter.addWidget(left_splitter)
-    columns_splitter.addWidget(right_splitter)
-
-    # Balance the two main columns (user can override by dragging)
-    columns_splitter.setStretchFactor(0, 1)
-    columns_splitter.setStretchFactor(1, 1)
-
-    # Finally attach to the tab layout
-    layout.addWidget(columns_splitter)
-    layout.addStretch(1)
-```
+- Clean up the layout for the right column of the Main tab so that:
+  - Each section has its group box title *only once*.
+  - No stray or overlapping text is visible (even when resizing the window).
 
 Constraints:
 
-* Do not change the *contents* of `_create_*_group` methods, only how their returned widgets are arranged.
-* The **scroll area must keep working**:
+- Keep the **structure** of the Main tab (folders group, instrument/Seestar, solver, stacking options, quality, final assembly & output, system resources, etc.).
+- Do not remove any real parameter from the GUI; only fix layout / label duplication.
 
-  * No change is needed around the `QScrollArea` or `QTabWidget` creation.
-  * Only replace the internal layout of the `main` tab.
+Success criteria:
 
-### Objective 3 — Keep the Mosaic / clustering group compact
+- The “Final assembly & output” (or localized equivalent) group appears correctly, with no ghost text overlay in any language.
+- Resizing the main window does not create overlapping titles or broken layouts.
 
-To avoid the Mosaic group being stretched to absurd heights when space is available, assign it a vertical size policy that prefers minimal height.
+---
 
-Inside `_create_mosaic_group` (and only there), after creating the `QGroupBox`:
+## TESTING & MANUAL CHECKS
 
-```python
-def _create_mosaic_group(self) -> QGroupBox:
-    group = QGroupBox(self._tr("qt_group_mosaic", "Mosaic / clustering"), self)
-    layout = QFormLayout(group)
-    layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+You are encouraged to:
 
-    # Prevent this group from greedily expanding vertically.
-    group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+1. Run `run_zemosaic.py` with Qt mode enabled and open `zemosaic_gui_qt`:
+   - Check the **Main** tab, right column.
+   - Confirm the ghost text is gone.
+2. From the Qt main window, open the **Filter…** button:
+   - On a dataset with hundreds/thousands of frames, let it analyse and draw the **Sky Preview**.
+   - Verify:
+     - The GUI remains responsive (no long freeze).
+     - Group points + outlines look correct.
+   - Resize/move the Filter window, close, reopen via the main window:
+     - Geometry should be restored.
 
-    ...
-    return group
+Document any non-obvious design decisions in code comments, especially around the preview drawing logic and geometry persistence.
+
+Keep changes minimal, focused, and well-structured so that the project maintainers (Tinystork & J.A.R.V.I.S.) can review them easily.
 ```
 
-* Do **not** change control creation, labels, or binding of widget values.
-
-### Objective 4 — Behaviour and testing
-
-After the change, the expected behaviour is:
-
-1. **Resizable columns**:
-
-   * The user can drag the **central vertical splitter handle** to make the left column wider/narrower relative to the right column.
-
-2. **Resizable groups within each column**:
-
-   * In the left column, the separator between **Folders** and **Mosaic / clustering** can be dragged to change their respective heights.
-   * In the right column, the separator between **Instrument** and **Final assembly** can be dragged similarly.
-
-3. **No change in functionality**:
-
-   * All input fields, checkboxes, and buttons behave exactly as before.
-   * Running a mosaic must produce identical logs and results compared to the previous Qt version (for the same settings).
-
-4. **Scrollbars still visible when needed**:
-
-   * The window should still show scrollbars when the overall content is taller or wider than the screen.
-   * Do not disable `setWidgetResizable(True)` or scroll policies.
-
-## OUT OF SCOPE (DO NOT DO)
-
-* Do not add drag-and-drop reordering of groups (this might come later in another mission).
-* Do not modify:
-
-  * other tabs (`solver`, `system`, `advanced`, `skin`, `language`),
-  * `zemosaic_filter_gui_qt.py`,
-  * any back-end processing / worker logic.
-* Do not introduce additional modules, CSS, or stylesheets.
-* Do not change translation keys or add new JSON entries in `locales/`.
-
-## DONE CRITERIA
-
-This task is considered complete when:
-
-1. `_populate_main_tab` uses the nested QSplitter structure described above.
-2. `Mosaic / clustering` does not expand ridiculously in height when there is free space.
-3. The user can resize:
-
-   * the width of each column,
-   * the height of the two groups within each column,
-     using standard Qt splitter handles.
-4. No regressions occur in:
-
-   * interaction (all widgets still present and functional),
-   * logging,
-   * mosaic processing results.
-5. Running `python run_zemosaic.py --qt-gui` shows the updated layout and the classic Tk GUI is unchanged when launched normally or with `--tk-gui`.
-
-````
-
-
+---

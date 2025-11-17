@@ -49,6 +49,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import base64
 import datetime
 import logging
@@ -58,6 +59,7 @@ from pathlib import Path
 import math
 import csv
 import threading
+import time
 from typing import Any, Callable, Iterable, Iterator, List, Sequence, Tuple
 
 import numpy as np
@@ -131,6 +133,8 @@ def _load_zemosaic_qicon() -> QIcon | None:
             continue
     return None
 
+
+PREVIEW_REFRESH_INTERVAL_SEC = 0.15
 
 if importlib.util.find_spec("locales.zemosaic_localization") is not None:
     from locales.zemosaic_localization import ZeMosaicLocalization  # type: ignore
@@ -1103,121 +1107,217 @@ class _DirectoryScanWorker(QObject):
             )
             self.error.emit(message)
 
-        for index, item in enumerate(self._items):
-            if self._stop_requested:
-                break
-            path = item.file_path
-            base_payload = item.original if isinstance(item.original, dict) else None
-            if base_payload is not None and path:
-                base_payload.setdefault("path", path)
-                base_payload.setdefault("path_raw", path)
-            message = self._localizer.get(
-                "filter.scan.inspecting",
-                "Inspecting {name}…",
-                name=os.path.basename(path) if path else item.display_name,
-            )
-            self.progress_changed.emit(self._progress_percent(index, total), message)
-            row_update: dict[str, Any] = {}
-            if not path or not os.path.isfile(path):
-                row_update["error"] = self._localizer.get(
-                    "filter.scan.missing",
-                    "File missing or not accessible.",
-                )
-                self.row_updated.emit(index, row_update)
-                continue
+        concurrency_value = max(1, int(astap_cfg.get("concurrency", 1))) if astap_cfg else 1
+        executor: ThreadPoolExecutor | None = None
+        astap_semaphore: threading.BoundedSemaphore | None = None
+        pending_futures: list[Any] = []
+        processed_count = 0
 
-            header = None
-            if fits is not None:
-                try:
-                    header = fits.getheader(path, ignore_missing_end=True)
-                except Exception as exc:  # pragma: no cover - passthrough IO error
-                    row_update["error"] = str(exc)
-            else:
-                row_update["error"] = self._localizer.get(
-                    "filter.scan.astropy_missing",
-                    "Astropy is not installed; cannot inspect headers.",
+        if astap_cfg is not None:
+            executor = ThreadPoolExecutor(
+                max_workers=concurrency_value,
+                thread_name_prefix="FilterASTAP",
+            )
+            astap_semaphore = threading.BoundedSemaphore(value=concurrency_value)
+
+        def _solve_astap_target(
+            idx: int,
+            entry: _NormalizedItem,
+            image_path: str,
+            header_obj: Any,
+            row_snapshot: dict[str, Any],
+            payload: dict | None,
+            config: dict[str, Any],
+            write_inplace: bool,
+            semaphore: threading.BoundedSemaphore | None,
+        ) -> tuple[int, dict[str, Any]]:
+            display_name = os.path.basename(image_path) or image_path
+            wcs_result = None
+            timeout_val = config.get("timeout") or 180
+            try:
+                if semaphore is not None:
+                    semaphore.acquire()
+                wcs_result = solve_with_astap(
+                    image_path,
+                    header_obj,
+                    config["exe"],
+                    config["data"],
+                    search_radius_deg=config.get("radius"),
+                    downsample_factor=config.get("downsample"),
+                    sensitivity=config.get("sensitivity"),
+                    timeout_sec=timeout_val,
+                    update_original_header_in_place=write_inplace,
                 )
-            sanitized_header = _sanitize_header_subset(header)
-            if sanitized_header is not None:
-                if base_payload is not None:
-                    base_payload["header"] = sanitized_header
+            except Exception as exc:
+                row_snapshot["error"] = str(exc)
+            finally:
+                if semaphore is not None:
+                    try:
+                        semaphore.release()
+                    except Exception:
+                        pass
+
+            if wcs_result is not None and getattr(wcs_result, "is_celestial", False):
+                row_snapshot["solver"] = "ASTAP"
+                row_snapshot["has_wcs"] = True
+                if payload is not None:
+                    payload["has_wcs"] = True
                 try:
-                    item.header_cache = sanitized_header
+                    entry.wcs_cache = wcs_result
                 except Exception:
                     pass
-
-            has_wcs = _header_has_wcs(header) if header is not None else False
-            instrument = _detect_instrument_from_header(header)
-
-            if astap_cfg is not None and not has_wcs and solve_with_astap is not None and header is not None:
-                solve_message = self._localizer.get(
-                    "filter.scan.solving",
-                    "Solving WCS with ASTAP…",
-                )
-                self.progress_changed.emit(self._progress_percent(index, total), solve_message)
-
-                def _solver_callback(text: str, *_: Any) -> None:
+                if write_inplace and header_obj is not None:
                     try:
-                        message_text = str(text)
+                        _persist_wcs_header_if_requested(image_path, header_obj, True)
                     except Exception:
-                        message_text = ""
-                    if message_text:
-                        self.progress_changed.emit(
-                            self._progress_percent(index, total),
-                            message_text,
-                        )
-
-                try:
-                    wcs_result = solve_with_astap(
-                        path,
-                        header,
-                        astap_cfg["exe"],
-                        astap_cfg["data"],
-                        search_radius_deg=astap_cfg["radius"],
-                        downsample_factor=astap_cfg["downsample"],
-                        sensitivity=astap_cfg["sensitivity"],
-                        timeout_sec=astap_cfg["timeout"],
-                        update_original_header_in_place=self._write_wcs_to_file,
-                        progress_callback=_solver_callback,
+                        pass
+            else:
+                if "error" not in row_snapshot:
+                    row_snapshot["error"] = self._localizer.get(
+                        "filter.scan.astap_failed",
+                        "ASTAP failed for {name}.",
+                        name=display_name,
                     )
-                except Exception as exc:  # pragma: no cover - solver failure path
-                    row_update["error"] = str(exc)
+            return idx, row_snapshot
+
+        try:
+            for index, item in enumerate(self._items):
+                if self._stop_requested:
+                    break
+                path = item.file_path
+                base_payload = item.original if isinstance(item.original, dict) else None
+                if base_payload is not None and path:
+                    base_payload.setdefault("path", path)
+                    base_payload.setdefault("path_raw", path)
+                inspect_message = self._localizer.get(
+                    "filter.scan.inspecting",
+                    "Inspecting {name}…",
+                    name=os.path.basename(path) if path else item.display_name,
+                )
+                self.progress_changed.emit(self._progress_percent(processed_count, total), inspect_message)
+                row_update: dict[str, Any] = {}
+
+                if not path or not os.path.isfile(path):
+                    row_update["error"] = self._localizer.get(
+                        "filter.scan.missing",
+                        "File missing or not accessible.",
+                    )
+                    self.row_updated.emit(index, row_update)
+                    processed_count += 1
+                    completion_msg = self._localizer.get(
+                        "filter.scan.progress",
+                        "Processed {done}/{total} files.",
+                        done=processed_count,
+                        total=total,
+                    )
+                    self.progress_changed.emit(self._progress_percent(processed_count, total), completion_msg)
+                    continue
+
+                header = None
+                if fits is not None:
+                    try:
+                        header = fits.getheader(path, ignore_missing_end=True)
+                    except Exception as exc:  # pragma: no cover - passthrough IO error
+                        row_update["error"] = str(exc)
                 else:
-                    if wcs_result is not None and getattr(wcs_result, "is_celestial", False):
-                        has_wcs = True
-                        row_update["solver"] = "ASTAP"
+                    row_update["error"] = self._localizer.get(
+                        "filter.scan.astropy_missing",
+                        "Astropy is not installed; cannot inspect headers.",
+                    )
+                sanitized_header = _sanitize_header_subset(header)
+                if sanitized_header is not None:
+                    if base_payload is not None:
+                        base_payload["header"] = sanitized_header
+                    try:
+                        item.header_cache = sanitized_header
+                    except Exception:
+                        pass
+
+                has_wcs = _header_has_wcs(header) if header is not None else False
+                if base_payload is not None:
+                    base_payload["has_wcs"] = bool(has_wcs)
+                row_update["has_wcs"] = has_wcs
+
+                instrument = _detect_instrument_from_header(header)
+                if instrument:
+                    if base_payload is not None:
+                        base_payload["instrument"] = instrument
+                    row_update["instrument"] = instrument
+
+                if header is not None:
+                    ra_deg, dec_deg = _extract_center_from_header(header)
+                    if ra_deg is not None and dec_deg is not None:
+                        row_update["center_ra_deg"] = ra_deg
+                        row_update["center_dec_deg"] = dec_deg
+                        if base_payload is not None:
+                            base_payload["center_ra_deg"] = float(ra_deg)
+                            base_payload["center_dec_deg"] = float(dec_deg)
+                            base_payload["RA"] = float(ra_deg)
+                            base_payload["DEC"] = float(dec_deg)
+
+                needs_astap = (
+                    astap_cfg is not None
+                    and not has_wcs
+                    and solve_with_astap is not None
+                    and header is not None
+                    and executor is not None
+                )
+                if needs_astap:
+                    solving_message = self._localizer.get(
+                        "filter.scan.solving",
+                        "Solving WCS with ASTAP…",
+                    )
+                    self.progress_changed.emit(self._progress_percent(processed_count, total), solving_message)
+                    if executor is not None:
+                        future = executor.submit(
+                            _solve_astap_target,
+                            index,
+                            item,
+                            path,
+                            header,
+                            row_update.copy(),
+                            base_payload,
+                            astap_cfg,
+                            bool(self._write_wcs_to_file),
+                            astap_semaphore,
+                        )
+                        pending_futures.append(future)
+                        continue
+
+                self.row_updated.emit(index, row_update)
+                processed_count += 1
+                completion_msg = self._localizer.get(
+                    "filter.scan.progress",
+                    "Processed {done}/{total} files.",
+                    done=processed_count,
+                    total=total,
+                )
+                self.progress_changed.emit(self._progress_percent(processed_count, total), completion_msg)
+
+            if pending_futures:
+                for future in as_completed(pending_futures):
+                    if self._stop_requested:
+                        break
+                    try:
+                        idx, solved_row = future.result()
+                    except Exception as exc:
                         try:
-                            item.wcs_cache = wcs_result
+                            self.error.emit(str(exc))
                         except Exception:
                             pass
-                        if self._write_wcs_to_file and header is not None:
-                            _persist_wcs_header_if_requested(path, header, True)
-
-            row_update["has_wcs"] = has_wcs
-            if base_payload is not None:
-                base_payload["has_wcs"] = bool(has_wcs)
-            if instrument:
-                if base_payload is not None:
-                    base_payload["instrument"] = instrument
-                row_update["instrument"] = instrument
-            if header is not None:
-                ra_deg, dec_deg = _extract_center_from_header(header)
-                if ra_deg is not None and dec_deg is not None:
-                    row_update["center_ra_deg"] = ra_deg
-                    row_update["center_dec_deg"] = dec_deg
-                    if base_payload is not None:
-                        base_payload["center_ra_deg"] = float(ra_deg)
-                        base_payload["center_dec_deg"] = float(dec_deg)
-                        base_payload["RA"] = float(ra_deg)
-                        base_payload["DEC"] = float(dec_deg)
-            self.row_updated.emit(index, row_update)
-            completed_message = self._localizer.get(
-                "filter.scan.progress",
-                "Processed {done}/{total} files.",
-                done=index + 1,
-                total=total,
-            )
-            self.progress_changed.emit(self._progress_percent(index + 1, total), completed_message)
+                        continue
+                    self.row_updated.emit(idx, solved_row)
+                    processed_count += 1
+                    completion_msg = self._localizer.get(
+                        "filter.scan.progress",
+                        "Processed {done}/{total} files.",
+                        done=processed_count,
+                        total=total,
+                    )
+                    self.progress_changed.emit(self._progress_percent(processed_count, total), completion_msg)
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
 
         self.finished.emit()
 
@@ -1261,17 +1361,17 @@ class _DirectoryScanWorker(QObject):
             default=180,
         )
 
+        concurrency = self._coerce_int(
+            self._solver_settings.get("astap_max_instances"),
+            self._overrides.get("astap_max_instances"),
+            default=1,
+        )
+        concurrency_value = max(1, int(concurrency or 1))
         if set_astap_max_concurrent_instances is not None:
-            concurrency = self._coerce_int(
-                self._solver_settings.get("astap_max_instances"),
-                self._overrides.get("astap_max_instances"),
-                default=None,
-            )
-            if concurrency:
-                try:
-                    set_astap_max_concurrent_instances(concurrency)
-                except Exception:  # pragma: no cover - runtime guard
-                    pass
+            try:
+                set_astap_max_concurrent_instances(concurrency_value)
+            except Exception:  # pragma: no cover - runtime guard
+                pass
 
         return {
             "exe": exe_path,
@@ -1280,6 +1380,7 @@ class _DirectoryScanWorker(QObject):
             "downsample": downsample,
             "sensitivity": sensitivity,
             "timeout": timeout,
+            "concurrency": concurrency_value,
         }
 
     @staticmethod
@@ -1468,6 +1569,8 @@ class FilterQtDialog(QDialog):
         self._preview_tabs: QTabWidget | None = None
         self._preview_default_hint = ""
         self._preview_refresh_pending = False
+        self._preview_last_refresh = 0.0
+        self._preview_refresh_interval = PREVIEW_REFRESH_INTERVAL_SEC
         self._cluster_groups: list[list[_NormalizedItem]] = []
         self._cluster_threshold_used: float | None = None
         self._cluster_refresh_pending = False
@@ -4237,8 +4340,14 @@ class FilterQtDialog(QDialog):
     def _schedule_preview_refresh(self) -> None:
         if self._preview_canvas is None or self._preview_refresh_pending:
             return
+        now = time.monotonic()
+        interval = max(0.0, self._preview_refresh_interval)
+        elapsed = now - self._preview_last_refresh
+        delay_ms = 0
+        if elapsed < interval:
+            delay_ms = int((interval - elapsed) * 1_000)
         self._preview_refresh_pending = True
-        QTimer.singleShot(0, self._update_preview_plot)
+        QTimer.singleShot(delay_ms, self._update_preview_plot)
 
     def _schedule_cluster_refresh(self) -> None:
         if self._cluster_refresh_pending:
@@ -4362,6 +4471,7 @@ class FilterQtDialog(QDialog):
 
     def _update_preview_plot(self) -> None:
         self._preview_refresh_pending = False
+        self._preview_last_refresh = time.monotonic()
         if self._preview_axes is None or self._preview_canvas is None:
             return
 
