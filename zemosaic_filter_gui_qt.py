@@ -1612,7 +1612,6 @@ class FilterQtDialog(QDialog):
 
         self._preview_canvas = self._create_preview_canvas()
         self._activity_log_output: QPlainTextEdit | None = None
-        self._log_output: QPlainTextEdit | None = None
         self._scan_recursive_checkbox: QCheckBox | None = None
         self._draw_group_outlines_checkbox: QCheckBox | None = None
         self._write_wcs_checkbox: QCheckBox | None = None
@@ -2655,7 +2654,75 @@ class FilterQtDialog(QDialog):
         self._header_cache[norm] = sanitized
         return sanitized
 
-    def _compute_group_outline_bounds(self, groups: list[list[dict[str, Any]]]) -> list[tuple[float, float, float, float]]:
+    def _resolve_group_entry_center(
+        self,
+        info: Any,
+        path_map: dict[str, _NormalizedItem],
+    ) -> tuple[float | None, float | None]:
+        entry_obj: _NormalizedItem | None = None
+        if isinstance(info, _NormalizedItem):
+            entry_obj = info
+        elif isinstance(info, dict):
+            path_val = None
+            for key in ("path", "path_raw", "path_preprocessed_cache"):
+                candidate = info.get(key)
+                if candidate:
+                    path_val = candidate
+                    break
+            if path_val:
+                entry_obj = path_map.get(os.path.normcase(str(path_val)))
+
+        center_ra: float | None = None
+        center_dec: float | None = None
+        if entry_obj is not None:
+            center_ra = entry_obj.center_ra_deg
+            center_dec = entry_obj.center_dec_deg
+            if center_ra is None or center_dec is None:
+                center_ra, center_dec = self._ensure_entry_coordinates(entry_obj)
+
+        if (center_ra is None or center_dec is None) and isinstance(info, dict):
+            try:
+                ra_val = info.get("RA")
+                center_ra = float(ra_val) if ra_val is not None else None
+            except Exception:
+                center_ra = None
+            try:
+                dec_val = info.get("DEC")
+                center_dec = float(dec_val) if dec_val is not None else None
+            except Exception:
+                center_dec = None
+        return center_ra, center_dec
+
+    def _footprint_extent_degrees(
+        self,
+        footprint: List[Tuple[float, float]] | None,
+    ) -> tuple[float, float] | None:
+        if not footprint:
+            return None
+        ra_vals: list[float] = []
+        dec_vals: list[float] = []
+        for ra_val, dec_val in footprint:
+            if ra_val is None or dec_val is None:
+                continue
+            try:
+                ra = float(ra_val)
+                dec = float(dec_val)
+            except Exception:
+                continue
+            if not (math.isfinite(ra) and math.isfinite(dec)):
+                continue
+            ra_vals.append(ra)
+            dec_vals.append(dec)
+        if not ra_vals or not dec_vals:
+            return None
+        ra_min, ra_max = self._normalize_ra_span(ra_vals)
+        width = max(0.0, ra_max - ra_min)
+        dec_min = min(dec_vals)
+        dec_max = max(dec_vals)
+        height = max(0.0, dec_max - dec_min)
+        return width, height
+
+    def _compute_group_outline_bounds(self, groups: list[list[Any]]) -> list[tuple[float, float, float, float]]:
         if not groups:
             return []
         path_map: dict[str, _NormalizedItem] = {}
@@ -2666,8 +2733,14 @@ class FilterQtDialog(QDialog):
         for group in groups:
             ra_vals: list[float] = []
             dec_vals: list[float] = []
+            reference_width: float | None = None
+            reference_height: float | None = None
             for info in group or []:
-                footprint = self._resolve_group_entry_footprint(info, path_map)
+                footprint = self._resolve_group_entry_footprint(
+                    info,
+                    path_map,
+                    allow_header_lookup=reference_width is None,
+                )
                 if footprint:
                     for ra_deg, dec_deg in footprint:
                         if ra_deg is None or dec_deg is None:
@@ -2681,33 +2754,13 @@ class FilterQtDialog(QDialog):
                             continue
                         ra_vals.append(ra_val)
                         dec_vals.append(dec_val)
+                    if reference_width is None:
+                        dims = self._footprint_extent_degrees(footprint)
+                        if dims is not None:
+                            reference_width, reference_height = dims
                     continue
 
-                # Fallback: approximate from group entry centre when no footprint is available.
-                center_ra: float | None = None
-                center_dec: float | None = None
-                entry_obj: _NormalizedItem | None = None
-                if isinstance(info, dict):
-                    path_val = None
-                    for key in ("path", "path_raw", "path_preprocessed_cache"):
-                        candidate = info.get(key)
-                        if candidate:
-                            path_val = candidate
-                            break
-                    if path_val:
-                        entry_obj = path_map.get(os.path.normcase(str(path_val)))
-                    if entry_obj is not None:
-                        center_ra = entry_obj.center_ra_deg
-                        center_dec = entry_obj.center_dec_deg
-                        if center_ra is None or center_dec is None:
-                            center_ra, center_dec = self._ensure_entry_coordinates(entry_obj)
-                    if (center_ra is None or center_dec is None) and isinstance(info, dict):
-                        try:
-                            center_ra = float(info.get("RA")) if info.get("RA") is not None else None
-                            center_dec = float(info.get("DEC")) if info.get("DEC") is not None else None
-                        except Exception:
-                            center_ra = None
-                            center_dec = None
+                center_ra, center_dec = self._resolve_group_entry_center(info, path_map)
                 if center_ra is not None and center_dec is not None:
                     if math.isfinite(center_ra) and math.isfinite(center_dec):
                         ra_vals.append(float(center_ra))
@@ -2718,20 +2771,25 @@ class FilterQtDialog(QDialog):
             dec_min_raw = min(dec_vals)
             dec_max_raw = max(dec_vals)
 
-            # Ensure non-zero extent so rectangles remain visible even for tiny groups.
-            if ra_min_raw == ra_max_raw:
-                margin_ra = 0.05
-                ra_min = ra_min_raw - margin_ra
-                ra_max = ra_max_raw + margin_ra
-            else:
-                ra_min, ra_max = ra_min_raw, ra_max_raw
+            center_ra = (ra_min_raw + ra_max_raw) / 2.0
+            center_dec = (dec_min_raw + dec_max_raw) / 2.0
 
-            if dec_min_raw == dec_max_raw:
-                margin_dec = 0.05
-                dec_min = dec_min_raw - margin_dec
-                dec_max = dec_max_raw + margin_dec
-            else:
-                dec_min, dec_max = dec_min_raw, dec_max_raw
+            width = reference_width
+            height = reference_height
+            if width is None or width <= 0 or height is None or height <= 0:
+                width = ra_max_raw - ra_min_raw
+                height = dec_max_raw - dec_min_raw
+                if width <= 0:
+                    width = 0.10
+                if height <= 0:
+                    height = 0.10
+            width = max(width, 0.01)
+            height = max(height, 0.01)
+
+            ra_min = center_ra - width / 2.0
+            ra_max = center_ra + width / 2.0
+            dec_min = center_dec - height / 2.0
+            dec_max = center_dec + height / 2.0
 
             outlines.append((ra_min, ra_max, dec_min, dec_max))
         return outlines
@@ -2890,9 +2948,13 @@ class FilterQtDialog(QDialog):
         self,
         info: Any,
         path_map: dict[str, _NormalizedItem],
+        *,
+        allow_header_lookup: bool = True,
     ) -> List[Tuple[float, float]] | None:
         entry: _NormalizedItem | None = None
-        if isinstance(info, dict):
+        if isinstance(info, _NormalizedItem):
+            entry = info
+        elif isinstance(info, dict):
             for key in ("path", "path_raw", "path_preprocessed_cache"):
                 value = info.get(key)
                 if value:
@@ -2900,16 +2962,21 @@ class FilterQtDialog(QDialog):
                     if entry is not None:
                         break
         if entry is not None:
-            footprint = entry.footprint_radec or self._ensure_entry_footprint(entry)
+            footprint = entry.footprint_radec
             if footprint:
                 return footprint
+            if allow_header_lookup:
+                footprint = self._ensure_entry_footprint(entry)
+                if footprint:
+                    return footprint
         if isinstance(info, dict):
             footprint_payload = _sanitize_footprint_radec(info.get("footprint_radec"))
             if footprint_payload:
                 return footprint_payload
-            wcs_obj = info.get("wcs")
-            if wcs_obj is not None:
-                return self._footprint_from_wcs_object(wcs_obj)
+            if allow_header_lookup:
+                wcs_obj = info.get("wcs")
+                if wcs_obj is not None:
+                    return self._footprint_from_wcs_object(wcs_obj)
         return None
 
     @staticmethod
@@ -3681,21 +3748,6 @@ class FilterQtDialog(QDialog):
         options_box = self._create_options_box()
         controls_layout.addWidget(options_box)
 
-        log_group_box = QGroupBox(
-            self._localizer.get("filter.group.log", "Scan / grouping log"), self
-        )
-        log_layout = QVBoxLayout(log_group_box)
-        self._log_output = QPlainTextEdit(log_group_box)
-        self._log_output.setReadOnly(True)
-        self._log_output.setMaximumBlockCount(500)
-        placeholder = self._localizer.get(
-            "filter.log.placeholder",
-            "Scan, clustering, and WCS messages will appear here.",
-        )
-        self._log_output.setPlaceholderText(placeholder)
-        log_layout.addWidget(self._log_output)
-        controls_layout.addWidget(log_group_box, 1)
-
         actions_widget = QWidget(self)
         actions_layout = QHBoxLayout(actions_widget)
         actions_layout.setContentsMargins(0, 0, 0, 0)
@@ -4075,11 +4127,6 @@ class FilterQtDialog(QDialog):
                 self._activity_log_output.appendPlainText(formatted)
             except Exception:
                 pass
-        if self._log_output is not None:
-            try:
-                self._log_output.appendPlainText(formatted)
-            except Exception:
-                pass
         try:
             print(formatted)
         except Exception:
@@ -4360,6 +4407,13 @@ class FilterQtDialog(QDialog):
         groups, threshold = self._compute_cluster_groups()
         self._cluster_groups = groups
         self._cluster_threshold_used = threshold
+        if groups:
+            try:
+                self._group_outline_bounds = self._compute_group_outline_bounds(groups)
+            except Exception:
+                self._group_outline_bounds = []
+        else:
+            self._group_outline_bounds = []
 
         assigned_ids: set[int] = set()
         label_template = self._localizer.get("filter.group.auto_label", "Group {index}")
@@ -4478,6 +4532,23 @@ class FilterQtDialog(QDialog):
         points = self._collect_preview_points()
         axes = self._preview_axes
         axes.clear()
+        if self._group_outline_collection is not None:
+            try:
+                self._group_outline_collection.remove()
+            except Exception:
+                pass
+            self._group_outline_collection = None
+        if not self._group_outline_bounds:
+            candidate_groups: list[list[Any]] | None = None
+            if self._auto_group_override_groups:
+                candidate_groups = self._auto_group_override_groups
+            elif self._cluster_groups:
+                candidate_groups = self._cluster_groups
+            if candidate_groups:
+                try:
+                    self._group_outline_bounds = self._compute_group_outline_bounds(candidate_groups)
+                except Exception:
+                    self._group_outline_bounds = []
         axes.set_xlabel(self._localizer.get("filter.preview.ra", "Right Ascension (°)"))
         axes.set_ylabel(self._localizer.get("filter.preview.dec", "Declination (°)"))
         axes.set_title(self._localizer.get("filter.preview.title", "Sky preview"))
@@ -4555,34 +4626,18 @@ class FilterQtDialog(QDialog):
                 if to_rgba is not None
                 else "#d64b3f"
             )
-            if self._group_outline_collection is None:
-                coll = LineCollection(
-                    outline_segments,
-                    colors=[outline_color],
-                    linewidths=1.6,
-                    linestyles="--",
-                    alpha=0.9,
-                    zorder=5,
-                )
-                axes.add_collection(coll)
-                self._group_outline_collection = coll
-            else:
-                try:
-                    self._group_outline_collection.set_segments(outline_segments)
-                except Exception:
-                    pass
-            if self._group_outline_collection is not None:
-                try:
-                    self._group_outline_collection.set_color([outline_color])
-                except Exception:
-                    pass
+            coll = LineCollection(
+                outline_segments,
+                colors=[outline_color],
+                linewidths=1.6,
+                linestyles="--",
+                alpha=0.9,
+                zorder=5,
+            )
+            axes.add_collection(coll)
+            self._group_outline_collection = coll
         else:
-            if self._group_outline_collection is not None:
-                try:
-                    self._group_outline_collection.remove()
-                except Exception:
-                    pass
-                self._group_outline_collection = None
+            self._group_outline_collection = None
 
         if legend_needed and len(grouped_points) > 1:
             axes.legend(loc="upper right", fontsize="small")
