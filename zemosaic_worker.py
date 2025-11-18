@@ -75,7 +75,15 @@ from types import SimpleNamespace
 
 import numpy as np
 
-
+from core.path_helpers import (
+    casefold_path,
+    expand_to_path,
+    normpath_segments,
+    safe_path_exists,
+    safe_path_getsize,
+    safe_path_isdir,
+    safe_path_isfile,
+)
 
 try:
     import lecropper  # noqa: F401
@@ -99,17 +107,28 @@ except Exception:
 _ZEQUALITY_WARNING_EMITTED = False
 _ZEQUALITY_WARNING_LOCK = threading.Lock()
 
+def _fallback_runtime_temp_dir() -> Path:
+    root = Path(tempfile.gettempdir()) / "zemosaic_runtime"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        root = Path(tempfile.gettempdir())
+    return root
+
+
 try:
-    from zemosaic_utils import EXCLUDED_DIRS, is_path_excluded
+    from zemosaic_utils import EXCLUDED_DIRS, is_path_excluded, get_runtime_temp_dir
 except Exception:
     EXCLUDED_DIRS = frozenset({"unaligned_by_zemosaic"})
 
     def is_path_excluded(path, excluded_dirs=None):
         import os
 
-        parts = set(os.path.normpath(str(path)).split(os.sep))
+        parts = set(_normpath_parts(path))
         dirs = set(excluded_dirs) if excluded_dirs else set()
         return any(d in parts for d in (dirs or {"unaligned_by_zemosaic"}))
+
+    get_runtime_temp_dir = _fallback_runtime_temp_dir
 
 
 UNALIGNED_DIRNAME = "unaligned_by_zemosaic"
@@ -120,6 +139,42 @@ QUALITY_GATE_ALPHA_SOFT_THRESHOLD = 0.85  # Partially transparent pixels are ign
 
 GLOBAL_COVERAGE_SUMMARY_THRESHOLD_FRAC = 0.0025
 GLOBAL_COVERAGE_SUMMARY_MIN_ABS = 1e-3
+
+
+def _safe_basename(path: str | os.PathLike | None) -> str:
+    """Return a best-effort basename for logging/UI purposes."""
+
+    if not path:
+        return "<unknown>"
+    try:
+        name = Path(path).name
+        return name or str(path)
+    except Exception:
+        return str(path)
+
+
+def _path_exists(path: str | os.PathLike | None) -> bool:
+    return safe_path_exists(path)
+
+
+def _path_isfile(path: str | os.PathLike | None) -> bool:
+    return safe_path_isfile(path)
+
+
+def _path_isdir(path: str | os.PathLike | None) -> bool:
+    return safe_path_isdir(path)
+
+
+def _path_getsize(path: str | os.PathLike | None) -> int:
+    return safe_path_getsize(path)
+
+
+def _normcase_path(path: str | os.PathLike | None) -> str:
+    return casefold_path(path, expanduser=True)
+
+
+def _normpath_parts(path: str | os.PathLike | None) -> tuple[str, ...]:
+    return normpath_segments(path)
 
 def _move_to_unaligned_safe(
     src_path: str | os.PathLike,
@@ -935,12 +990,24 @@ def _normalize_tile_path(path: str | os.PathLike | None) -> str | None:
     if path is None:
         return None
     try:
-        return os.path.abspath(os.path.realpath(str(path)))
+        return str(Path(path).expanduser().resolve(strict=False))
     except Exception:
         try:
-            return os.path.abspath(str(path))
+            return str(Path(path))
         except Exception:
             return str(path)
+
+
+def _path_display_name(path: str | os.PathLike | None, default: str = "unknown") -> str:
+    """Return a human-friendly file name for logging."""
+
+    if not path:
+        return default
+    try:
+        name = Path(path).name
+        return name or str(path)
+    except Exception:
+        return str(path)
 
 
 def _register_master_tile_identity(path: str | os.PathLike | None, tile_id: str | int | None) -> None:
@@ -998,7 +1065,10 @@ def _resolve_tile_identifier(
     if candidate is None and fallback_idx is not None:
         candidate = f"tile:{int(fallback_idx):04d}"
     elif candidate is None and path:
-        base = os.path.splitext(os.path.basename(str(path)))[0]
+        try:
+            base = Path(path).stem
+        except Exception:
+            base = str(path)
         candidate = f"path:{base}"
     elif candidate is None:
         candidate = "tile:unknown"
@@ -1139,7 +1209,7 @@ def load_image_with_optional_alpha(
             except Exception:
                 alpha = None
 
-    label = tile_label or os.path.basename(str(path))
+    label = tile_label or _path_display_name(path)
     data = _ensure_hwc_master_tile(primary, label)
     data = np.asarray(data, dtype=np.float32, order="C", copy=False)
 
@@ -1165,25 +1235,21 @@ def load_image_with_optional_alpha(
     return data, weights, alpha
 
 
-def _resolve_global_mosaic_path(output_dir: str, candidate: str | None) -> str | None:
+def _resolve_global_mosaic_path(output_dir: str | Path, candidate: str | os.PathLike | None) -> str | None:
     """Return an absolute filesystem path for *candidate* under *output_dir*."""
 
-    if not candidate:
+    candidate_path = expand_to_path(candidate)
+    if candidate_path is None:
         return None
+    base_dir = expand_to_path(output_dir) or Path(".")
+    if not isinstance(base_dir, Path):
+        base_dir = Path(".")
+    if not candidate_path.is_absolute():
+        candidate_path = base_dir / candidate_path
     try:
-        candidate_str = str(candidate).strip()
+        return str(candidate_path.resolve(strict=False))
     except Exception:
-        candidate_str = ""
-    if not candidate_str:
-        return None
-    candidate_str = os.path.expanduser(os.path.expandvars(candidate_str))
-    if not os.path.isabs(candidate_str):
-        base = output_dir or "."
-        candidate_str = os.path.join(base, candidate_str)
-    try:
-        return os.path.abspath(candidate_str)
-    except Exception:
-        return candidate_str
+        return str(candidate_path)
 
 
 def _load_global_wcs_descriptor_safe(fits_path: str, json_path: str | None = None):
@@ -1191,19 +1257,22 @@ def _load_global_wcs_descriptor_safe(fits_path: str, json_path: str | None = Non
 
     if (
         not fits_path
-        or not os.path.exists(fits_path)
         or not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils)
         or not hasattr(zemosaic_utils, "load_global_wcs_descriptor")
     ):
         return None
+    fits_path_obj = Path(fits_path).expanduser()
+    if not fits_path_obj.exists():
+        return None
+    json_path_obj = Path(json_path).expanduser() if json_path else None
     try:
         return zemosaic_utils.load_global_wcs_descriptor(
-            fits_path,
-            json_path,
+            str(fits_path_obj),
+            str(json_path_obj) if json_path_obj else None,
             logger_override=logger,
         )
     except Exception as exc:
-        logger.warning("Global WCS: unable to load descriptor (%s): %s", fits_path, exc)
+        logger.warning("Global WCS: unable to load descriptor (%s): %s", fits_path_obj, exc)
         return None
 
 
@@ -1345,12 +1414,17 @@ def _gather_wcs_items_from_groups(seestar_groups: list[list[dict]] | None) -> li
             norm_path = None
             if path_val:
                 try:
-                    norm_path = os.path.normcase(os.path.abspath(str(path_val)))
-                except Exception:
+                    path_obj = Path(str(path_val)).expanduser()
                     try:
-                        norm_path = os.path.normcase(str(path_val))
+                        resolved = path_obj.resolve(strict=False)
                     except Exception:
-                        norm_path = None
+                        resolved = path_obj
+                    norm_candidate = str(resolved)
+                    if os.name == "nt":
+                        norm_candidate = norm_candidate.lower()
+                    norm_path = norm_candidate
+                except Exception:
+                    norm_path = None
             if norm_path and norm_path in seen_paths:
                 continue
             wcs_obj = (
@@ -1450,7 +1524,8 @@ def _runtime_build_global_wcs_plan(
             output_dir, (worker_config or {}).get("global_wcs_output_path", "global_mosaic_wcs.fits")
         )
     except Exception:
-        fits_path = os.path.join(output_dir, "global_mosaic_wcs.fits")
+        output_dir_path = Path(output_dir)
+        fits_path = str(output_dir_path / "global_mosaic_wcs.fits")
         json_path = f"{fits_path}.json"
     try:
         zemosaic_utils.write_global_wcs_files(descriptor, fits_path, json_path, logger_override=logger)
@@ -1624,18 +1699,19 @@ def _evaluate_quality_gate_metrics(
 def _move_quality_reject_file(src_path: str) -> tuple[str, bool]:
     """Move a rejected master tile alongside its siblings for review."""
     try:
-        base_dir = os.path.dirname(src_path) or "."
-        rej_dir = os.path.join(base_dir, "rejected_by_quality")
-        os.makedirs(rej_dir, exist_ok=True)
-        candidate = os.path.join(rej_dir, os.path.basename(src_path))
-        if os.path.exists(candidate):
-            base, ext = os.path.splitext(candidate)
+        src = Path(src_path)
+        base_dir = src.parent if src.parent != Path("") else Path(".")
+        rej_dir = base_dir / "rejected_by_quality"
+        rej_dir.mkdir(parents=True, exist_ok=True)
+        candidate = rej_dir / src.name
+        if candidate.exists():
+            base = candidate.with_suffix("")
+            ext = candidate.suffix
             idx = 1
-            while os.path.exists(f"{base}_{idx}{ext}"):
+            while (candidate := base.with_name(f"{base.name}_{idx}{ext}")).exists():
                 idx += 1
-            candidate = f"{base}_{idx}{ext}"
-        shutil.move(src_path, candidate)
-        return candidate, True
+        shutil.move(str(src), str(candidate))
+        return str(candidate), True
     except Exception as exc:
         logger.warning("Failed to move rejected master tile %s: %s", src_path, exc)
         return src_path, False
@@ -1940,7 +2016,7 @@ class _InterMasterTile:
 
 
 def _phase45_resolve_tile_shape(path: str | None, tile_wcs: Any) -> tuple[int, int] | None:
-    if path is None or not os.path.exists(path):
+    if path is None or not _path_exists(path):
         return None
     if tile_wcs is not None and getattr(tile_wcs, "pixel_shape", None):
         try:
@@ -2229,12 +2305,17 @@ def _phase45_allocate_stack_storage(
         use_memmap = estimated_bytes > (256 * 1024 * 1024)
     if not use_memmap:
         return np.full((count, h, w, channels), np.nan, dtype=dtype), None
-    directory = temp_dir or tempfile.gettempdir()
-    os.makedirs(directory, exist_ok=True)
-    file_path = os.path.join(directory, f"phase45_stack_{uuid.uuid4().hex}.dat")
-    storage = np.memmap(file_path, dtype=dtype, mode="w+", shape=(count, h, w, channels))
+    directory_path = Path(temp_dir) if temp_dir else get_runtime_temp_dir()
+    try:
+        directory_path.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        directory_path = Path(
+            tempfile.mkdtemp(prefix="phase45_stack_", dir=str(get_runtime_temp_dir()))
+        )
+    file_path = directory_path / f"phase45_stack_{uuid.uuid4().hex}.dat"
+    storage = np.memmap(str(file_path), dtype=dtype, mode="w+", shape=(count, h, w, channels))
     storage[:] = np.nan
-    return storage, file_path
+    return storage, str(file_path)
 
 
 def _phase45_cleanup_storage(storage: np.ndarray | None, memmap_path: str | None) -> None:
@@ -2243,11 +2324,13 @@ def _phase45_cleanup_storage(storage: np.ndarray | None, memmap_path: str | None
             storage.flush()
     except Exception:
         pass
-    if memmap_path and os.path.exists(memmap_path):
-        try:
-            os.remove(memmap_path)
-        except Exception:
-            pass
+    if memmap_path:
+        path_obj = Path(memmap_path)
+        if path_obj.exists():
+            try:
+                path_obj.unlink()
+            except Exception:
+                pass
 
 
 def _run_phase4_5_inter_master_merge(
@@ -2655,7 +2738,7 @@ def _run_phase4_5_inter_master_merge(
                     if not path:
                         continue
                     try:
-                        arr, _, _ = load_image_with_optional_alpha(path, tile_label=os.path.basename(path))
+                        arr, _, _ = load_image_with_optional_alpha(path, tile_label=_safe_basename(path))
                         arr = np.asarray(arr, dtype=np.float32, copy=False)
                         sources.append(_TileAffineSource(path=path, wcs=tile.wcs, data=arr))
                         valid_indices.append(idx_tile)
@@ -2730,7 +2813,7 @@ def _run_phase4_5_inter_master_merge(
             try:
                 first_arr, first_weights, _ = load_image_with_optional_alpha(
                     chunk_tiles[0].path,
-                    tile_label=os.path.basename(chunk_tiles[0].path),
+                    tile_label=_safe_basename(chunk_tiles[0].path),
                 )
                 channels = int(first_arr.shape[-1]) if first_arr.ndim == 3 else 1
                 if channels <= 0:
@@ -2778,7 +2861,7 @@ def _run_phase4_5_inter_master_merge(
                     else:
                         arr, weight_map, _ = load_image_with_optional_alpha(
                             tile.path,
-                            tile_label=os.path.basename(tile.path),
+                            tile_label=_safe_basename(tile.path),
                         )
                     if weight_map is not None:
                         weight_map = np.asarray(weight_map, dtype=np.float32, copy=False)
@@ -3292,10 +3375,10 @@ def _run_phase4_5_inter_master_merge(
             digest = hashlib.sha1(member_signature.encode("utf-8")).hexdigest()[:8]
             super_tile_id = f"super:{representative_idx:04d}_{len(member_indices):02d}_{digest}"
 
-            target_dir = temp_storage_dir or output_folder
-            os.makedirs(target_dir, exist_ok=True)
+            target_dir_path = Path(temp_storage_dir or output_folder).expanduser()
+            target_dir_path.mkdir(parents=True, exist_ok=True)
             super_filename = f"super_tile_{representative_idx:03d}_{uuid.uuid4().hex[:8]}.fits"
-            super_path = os.path.join(target_dir, super_filename)
+            super_path = target_dir_path / super_filename
             logger.debug("[P4.5][G%03d] Saving super tile to %s", group_id, super_path)
             _phase45_gui_message(
                 f"Phase 4.5: group {group_id} writing {super_filename} ({arr_shape})"
@@ -3335,10 +3418,11 @@ def _run_phase4_5_inter_master_merge(
             except Exception:
                 pass
 
+            super_path_str = str(super_path)
             try:
                 zemosaic_utils.save_fits_image(
                     image_data=super_arr,
-                    output_path=super_path,
+                    output_path=super_path_str,
                     header=header,
                     overwrite=True,
                     save_as_float=True,
@@ -3352,13 +3436,13 @@ def _run_phase4_5_inter_master_merge(
                         alpha_hdu = fits.ImageHDU(alpha_out, name="ALPHA")
                         alpha_hdu.header["ALPHADSC"] = ("1=opaque(in), 0=transparent(out)", "")
                         hdus.append(alpha_hdu)
-                    fits.HDUList(hdus).writeto(super_path, overwrite=True)
+                    fits.HDUList(hdus).writeto(super_path_str, overwrite=True)
                 except Exception:
                     continue
 
-            _register_master_tile_identity(super_path, super_tile_id)
+            _register_master_tile_identity(super_path_str, super_tile_id)
 
-            replacements[representative_idx] = (super_path, local_wcs)
+            replacements[representative_idx] = (super_path_str, local_wcs)
             cleanup_paths.extend(tile.path for tile in chunk_tiles if tile.path)
             group_super_counts[group_id] = group_super_counts.get(group_id, 0) + 1
 
@@ -3368,7 +3452,7 @@ def _run_phase4_5_inter_master_merge(
                 prog=None,
                 lvl="INFO_DETAIL",
                 size=len(chunk_tiles),
-                out=os.path.basename(super_path),
+                out=_safe_basename(super_path_str),
                 snr=f"{snr_gain:.2f}",
                 group_id=group_id,
                 chunk=chunk_idx,
@@ -3412,7 +3496,7 @@ def _run_phase4_5_inter_master_merge(
     if cache_retention_mode != "keep":
         removed_count = 0
         for path in cleanup_paths:
-            if not path or not os.path.exists(path):
+            if not path or not _path_exists(path):
                 continue
             try:
                 os.remove(path)
@@ -3428,7 +3512,7 @@ def _run_phase4_5_inter_master_merge(
         candidate_super_tiles = [
             (tidx, entry)
             for tidx, entry in sorted(replacements.items())
-            if entry and entry[0] and os.path.exists(entry[0])
+            if entry and entry[0] and _path_exists(entry[0])
         ]
         if photometry_intersuper and len(candidate_super_tiles) >= 2:
             pcb("p45_norm_start", lvl="INFO_DETAIL", tiles=len(candidate_super_tiles))
@@ -3445,7 +3529,7 @@ def _run_phase4_5_inter_master_merge(
                             raw = hdul[0].data
                             if raw is None:
                                 continue
-                            arr = _ensure_hwc_master_tile(raw, os.path.basename(tpath))
+                            arr = _ensure_hwc_master_tile(raw, _safe_basename(tpath))
                     except Exception as exc:
                         logger.debug("[P4.5] Norm stats failed for %s: %s", tpath, exc)
                         continue
@@ -3567,7 +3651,7 @@ def _run_phase4_5_inter_master_merge(
                         gains = np.clip(gains, gmin, gmax)
                         if np.all(np.abs(gains - 1.0) <= 1e-6):
                             continue
-                        if not tpath or not os.path.exists(tpath):
+                        if not tpath or not _path_exists(tpath):
                             continue
                         try:
                             with fits.open(
@@ -3579,7 +3663,7 @@ def _run_phase4_5_inter_master_merge(
                                 raw = hdul[0].data
                                 if raw is None:
                                     continue
-                                arr = _ensure_hwc_master_tile(raw, os.path.basename(tpath))
+                                arr = _ensure_hwc_master_tile(raw, _safe_basename(tpath))
                                 arr_corr = np.asarray(arr, dtype=np.float32, order="C")
                                 for ch in range(min(arr_corr.shape[-1], gains.size)):
                                     arr_corr[..., ch] *= float(gains[ch])
@@ -3685,7 +3769,7 @@ def _run_phase4_5_inter_master_merge(
                     )
                     for entry_idx, src in enumerate(calib_entries):
                         path = src.path
-                        if not path or not os.path.exists(path):
+                        if not path or not _path_exists(path):
                             continue
                         gain_val, offset_val = corrections[entry_idx]
                         if abs(gain_val - 1.0) <= 1e-6 and abs(offset_val) <= 1e-6:
@@ -3702,7 +3786,7 @@ def _run_phase4_5_inter_master_merge(
                                     continue
                                 arr_hwc = _ensure_hwc_master_tile(
                                     raw_data,
-                                    os.path.basename(path),
+                                    _safe_basename(path),
                                 )
                                 arr_corr = (
                                     arr_hwc * np.float32(gain_val) + np.float32(offset_val)
@@ -3736,7 +3820,7 @@ def _run_phase4_5_inter_master_merge(
                         except Exception as exc:
                             logger.debug(
                                 "[P4.5] Global photometry apply failed for %s: %s",
-                                os.path.basename(path) if path else "<memory>",
+                                _safe_basename(path),
                                 exc,
                             )
                     _phase45_gui_emit(
@@ -3889,7 +3973,7 @@ def _select_quality_anchor(
                 raise ValueError("empty_group")
             wcs_obj = reference_entry.get("wcs")
             cache_path = reference_entry.get("path_preprocessed_cache")
-            if cache_path and os.path.exists(cache_path):
+            if cache_path and _path_exists(cache_path):
                 try:
                     tile_array = np.load(cache_path, mmap_mode="r")
                 except Exception:
@@ -3902,7 +3986,7 @@ def _select_quality_anchor(
                 raw_path = reference_entry.get("path_raw") or reference_entry.get("path")
                 if (
                     raw_path
-                    and os.path.exists(raw_path)
+                    and _path_exists(raw_path)
                     and hasattr(zemosaic_utils, "load_and_validate_fits")
                 ):
                     try:
@@ -4111,7 +4195,7 @@ def _compute_intertile_affine_corrections_from_sources(
     for idx, src in enumerate(sources, 1):
         try:
             tile_arr: np.ndarray
-            label = os.path.basename(src.path) if src.path else None
+            label = _safe_basename(src.path)
             if src.data is not None:
                 tile_arr = _ensure_hwc_master_tile(src.data, label)
             else:
@@ -5013,9 +5097,9 @@ def run_poststack_anchor_review(
         arr: np.ndarray | None = None
         metrics: dict[str, float] | None = None
         try:
-            if path and os.path.exists(path):
+            if path and _path_exists(path):
                 with fits.open(path, memmap=False, do_not_scale_image_data=True) as hdul_mt:
-                    arr = _ensure_hwc_master_tile(hdul_mt[0].data, os.path.basename(path))
+                    arr = _ensure_hwc_master_tile(hdul_mt[0].data, _safe_basename(path))
             if arr is not None:
                 arr = np.asarray(arr, dtype=np.float32)
                 metrics = _compute_master_quality_metrics(arr, sky_low_pct=sky_low_pct, sky_high_pct=sky_high_pct)
@@ -5486,8 +5570,10 @@ def _probe_system_resources(
     info["two_pass_gain_clip"] = gain_clip_tuple
 
     try:
-        target_dir = cache_dir if cache_dir and os.path.isdir(cache_dir) else os.getcwd()
-        du = shutil.disk_usage(target_dir)
+        target_dir = Path(cache_dir).expanduser() if cache_dir else Path.cwd()
+        if not target_dir.is_dir():
+            target_dir = Path.cwd()
+        du = shutil.disk_usage(str(target_dir))
         disk_total_mb = du.total / (1024 * 1024)
         disk_free_mb = du.free / (1024 * 1024)
         info["disk_total_mb"] = disk_total_mb
@@ -5525,6 +5611,37 @@ def _probe_system_resources(
         pass
 
     return info
+
+
+def _emit_gpu_info_summary(progress_callback, resource_info: dict) -> None:
+    """Log a GPU summary message when VRAM information is available."""
+
+    total_mb = resource_info.get("gpu_total_mb")
+    if not total_mb:
+        return
+    free_mb = resource_info.get("gpu_free_mb")
+    device_name = "GPU"
+    if CUPY_AVAILABLE:
+        try:
+            import cupy  # type: ignore
+
+            device = cupy.cuda.Device()
+            device_name = getattr(device, "name", device_name) or device_name
+        except Exception:
+            device_name = "GPU"
+    total_text = f"{float(total_mb):.0f}"
+    free_text = f"{float(free_mb):.0f}" if free_mb is not None else "n/a"
+    try:
+        _log_and_callback(
+            "gpu_info_summary",
+            lvl="INFO",
+            callback=progress_callback,
+            name=device_name,
+            total_mb=total_text,
+            free_mb=free_text,
+        )
+    except Exception:
+        pass
 
 
 def _compute_auto_tile_caps(
@@ -6062,14 +6179,14 @@ def _apply_ram_budget_to_groups(
 
 # --- Configuration du Logging ---
 try:
-    log_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zemosaic_worker.log")
-except NameError:
-    log_file_path = "zemosaic_worker.log"
+    log_file_path = ensure_user_config_dir() / "zemosaic_worker.log"
+except Exception:
+    log_file_path = Path("zemosaic_worker.log")
 
 logger = logging.getLogger("ZeMosaicWorker")
 if not logger.handlers:
     logger.setLevel(logging.DEBUG)
-    fh = logging.FileHandler(log_file_path, mode='w', encoding='utf-8')
+    fh = logging.FileHandler(str(log_file_path), mode='w', encoding='utf-8')
     fh.setLevel(logging.DEBUG)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(module)s.%(funcName)s:%(lineno)d - %(message)s')
     fh.setFormatter(formatter)
@@ -6225,12 +6342,13 @@ def _measure_sequential_read_mbps(file_path: str, bytes_to_read: int = 16 * 1024
     Returns MB/s or None on failure. Uses small sizes to avoid long stalls.
     """
     try:
-        if not (file_path and os.path.exists(file_path)):
+        path_obj = Path(file_path).expanduser()
+        if not path_obj.is_file():
             return None
         size_target = max(block_size, bytes_to_read)
         read_total = 0
         t0 = time.perf_counter()
-        with open(file_path, 'rb', buffering=0) as f:
+        with path_obj.open('rb', buffering=0) as f:
             while read_total < size_target:
                 chunk = f.read(min(block_size, size_target - read_total))
                 if not chunk:
@@ -6248,15 +6366,16 @@ def _measure_sequential_write_mbps(dir_path: str, bytes_to_write: int = 16 * 102
     Writes and deletes a small temporary file. Returns MB/s or None on failure.
     """
     try:
-        if not (dir_path and os.path.isdir(dir_path)):
+        dir_obj = Path(dir_path).expanduser()
+        if not dir_obj.is_dir():
             return None
         import uuid as _uuid
-        tmp_path = os.path.join(dir_path, f"_zemosaic_io_probe_{_uuid.uuid4().hex}.bin")
+        tmp_path = dir_obj / f"_zemosaic_io_probe_{_uuid.uuid4().hex}.bin"
         size_target = max(block_size, bytes_to_write)
         data = os.urandom(block_size)
         written_total = 0
         t0 = time.perf_counter()
-        with open(tmp_path, 'wb', buffering=0) as f:
+        with tmp_path.open('wb', buffering=0) as f:
             while written_total < size_target:
                 to_write = min(block_size, size_target - written_total)
                 f.write(data[:to_write])
@@ -6267,7 +6386,9 @@ def _measure_sequential_write_mbps(dir_path: str, bytes_to_write: int = 16 * 102
                 pass
         dt = max(1e-6, time.perf_counter() - t0)
         try:
-            os.remove(tmp_path)
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
         except Exception:
             pass
         return (written_total / (1024 * 1024)) / dt
@@ -6723,7 +6844,7 @@ def _wait_for_memmap_files(prefixes, timeout=10.0):
         for prefix in prefixes:
             dat_f = prefix + '.dat'
             npy_f = prefix + '.npy'
-            if not (os.path.exists(dat_f) and os.path.getsize(dat_f) > 0 and os.path.exists(npy_f) and os.path.getsize(npy_f) > 0):
+            if not (_path_exists(dat_f) and _path_getsize(dat_f) > 0 and _path_exists(npy_f) and _path_getsize(npy_f) > 0):
                 all_ready = False
                 break
         if all_ready:
@@ -6736,9 +6857,9 @@ def astap_paths_valid(astap_exe_path: str, astap_data_dir: str) -> bool:
     """Return True if ASTAP executable and data directory look valid."""
     return (
         astap_exe_path
-        and os.path.isfile(astap_exe_path)
+        and _path_isfile(astap_exe_path)
         and astap_data_dir
-        and os.path.isdir(astap_data_dir)
+        and _path_isdir(astap_data_dir)
     )
 
 
@@ -6751,10 +6872,10 @@ def _write_header_to_fits(file_path: str, header_obj, pcb=None):
             hdul[0].header.update(header_obj)
             hdul.flush()
         if pcb:
-            pcb("getwcs_info_header_written", lvl="DEBUG_DETAIL", filename=os.path.basename(file_path))
+            pcb("getwcs_info_header_written", lvl="DEBUG_DETAIL", filename=_safe_basename(file_path))
     except Exception as e_update:
         if pcb:
-            pcb("getwcs_warn_header_write_failed", lvl="WARN", filename=os.path.basename(file_path), error=str(e_update))
+            pcb("getwcs_warn_header_write_failed", lvl="WARN", filename=_safe_basename(file_path), error=str(e_update))
 
 
 def solve_with_astrometry(
@@ -6883,7 +7004,7 @@ def reproject_tile_to_mosaic(
     try:
         data, weight_map, _ = load_image_with_optional_alpha(
             tile_path,
-            tile_label=os.path.basename(tile_path),
+            tile_label=_safe_basename(tile_path),
         )
     except Exception:
         return None, None, None, (0, 0, 0, 0)
@@ -7128,7 +7249,7 @@ def _build_alpha_union_map(
         except Exception:
             logger.debug(
                 "Alpha reprojection failed for tile %s (idx=%d)",
-                os.path.basename(str(tile_path)),
+                _safe_basename(tile_path),
                 idx,
                 exc_info=True,
             )
@@ -7348,7 +7469,7 @@ def get_wcs_and_pretreat_raw_file(
     hotpix_mask_dir: str | None = None,
     solver_settings: dict | None = None,
 ):
-    filename = os.path.basename(file_path)
+    filename = _safe_basename(file_path)
     # Utiliser une fonction helper pour les logs internes à cette fonction si _log_and_callback
     # est trop lié à la structure de run_hierarchical_mosaic
     _pcb_local = lambda msg_key, lvl="DEBUG", **kwargs: \
@@ -7359,7 +7480,7 @@ def get_wcs_and_pretreat_raw_file(
             logger.debug("Skip excluded path: %s", file_path)
             return None, None, None, None
     except Exception:
-        if UNALIGNED_DIRNAME in os.path.normpath(file_path).split(os.sep):
+        if UNALIGNED_DIRNAME in _normpath_parts(file_path):
             logger.debug("Skip excluded path: %s", file_path)
             return None, None, None, None
 
@@ -7504,8 +7625,10 @@ def get_wcs_and_pretreat_raw_file(
     # --- Correction Hot Pixels + optional GPU background smoothing ---
     _pcb_local(f"  Correction HP pour '{filename}'...", lvl="DEBUG_DETAIL")
     if hotpix_mask_dir:
-        os.makedirs(hotpix_mask_dir, exist_ok=True)
-        hp_mask_path = os.path.join(hotpix_mask_dir, f"hp_mask_{os.path.splitext(filename)[0]}_{uuid.uuid4().hex}.npy")
+        hotpix_path = Path(hotpix_mask_dir).expanduser()
+        hotpix_path.mkdir(parents=True, exist_ok=True)
+        hp_stem = Path(filename).stem
+        hp_mask_path = str(hotpix_path / f"hp_mask_{hp_stem}_{uuid.uuid4().hex}.npy")
 
     img_data_hp_corrected_adu = None
     try:
@@ -7778,7 +7901,7 @@ def get_wcs_and_pretreat_raw_file(
     _pcb_local("getwcs_action_moving_unsolved_file", lvl="WARN", filename=filename)
     status, destination_path = _move_to_unaligned_safe(
         file_path,
-        os.path.dirname(file_path),
+        Path(file_path).expanduser().parent,
         logger=logger,
     )
 
@@ -7981,7 +8104,7 @@ def create_master_tile(
     header_for_master_tile_base = fits.Header(header_dict_for_master_tile_base.cards if hasattr(header_dict_for_master_tile_base,'cards') else header_dict_for_master_tile_base)
     
     ref_path_raw = ref_info_for_tile.get('path_raw', 'UnknownRawRef')
-    pcb_tile(f"{func_id_log_base}_info_reference_set", prog=None, lvl="DEBUG_DETAIL", ref_index=reference_image_index_in_group, ref_filename=os.path.basename(ref_path_raw), tile_id=tile_id)
+    pcb_tile(f"{func_id_log_base}_info_reference_set", prog=None, lvl="DEBUG_DETAIL", ref_index=reference_image_index_in_group, ref_filename=_safe_basename(ref_path_raw), tile_id=tile_id)
 
     # Acquire a dynamic Phase 3 I/O concurrency slot to avoid disk stalls
     # when the system is busy (e.g., another app reading video files).
@@ -7999,18 +8122,18 @@ def create_master_tile(
         cached_image_file_path = raw_file_info.get('path_preprocessed_cache')
         original_raw_path = raw_file_info.get('path_raw', 'UnknownRawPathForTileImg') # Plus descriptif
 
-        if not (cached_image_file_path and os.path.exists(cached_image_file_path)):
-            pcb_tile(f"{func_id_log_base}_warn_cache_file_missing", prog=None, lvl="WARN", filename=os.path.basename(original_raw_path), cache_path=cached_image_file_path, tile_id=tile_id)
+        if not (cached_image_file_path and _path_exists(cached_image_file_path)):
+            pcb_tile(f"{func_id_log_base}_warn_cache_file_missing", prog=None, lvl="WARN", filename=_safe_basename(original_raw_path), cache_path=cached_image_file_path, tile_id=tile_id)
             continue
         
-        # pcb_tile(f"    {func_id_log_base}_{tile_id}_Img{i}: Lecture cache '{os.path.basename(cached_image_file_path)}'", prog=None, lvl="DEBUG_VERY_DETAIL")
+        # pcb_tile(f"    {func_id_log_base}_{tile_id}_Img{i}: Lecture cache '{_safe_basename(cached_image_file_path)}'", prog=None, lvl="DEBUG_VERY_DETAIL")
         
         try:
             # Throttle concurrent cache reads and use memory-mapped load to reduce RAM spikes
             with _CACHE_IO_SEMAPHORE:
                 img_data_adu = np.load(cached_image_file_path, allow_pickle=False, mmap_mode='r') 
             if not (isinstance(img_data_adu, np.ndarray) and img_data_adu.dtype == np.float32 and img_data_adu.ndim == 3 and img_data_adu.shape[-1] == 3):
-                pcb_tile(f"{func_id_log_base}_warn_invalid_cached_data", prog=None, lvl="WARN", filename=os.path.basename(cached_image_file_path), 
+                pcb_tile(f"{func_id_log_base}_warn_invalid_cached_data", prog=None, lvl="WARN", filename=_safe_basename(cached_image_file_path), 
                          shape=img_data_adu.shape if hasattr(img_data_adu, 'shape') else 'N/A', 
                          dtype=img_data_adu.dtype if hasattr(img_data_adu, 'dtype') else 'N/A', tile_id=tile_id)
                 del img_data_adu; gc.collect(); continue
@@ -8026,7 +8149,7 @@ def create_master_tile(
             # Stocker le dict de header, pas l'objet fits.Header, car c'est ce qui est dans raw_file_info
             tile_original_raw_headers.append(raw_file_info.get('header')) 
         except MemoryError as e_mem_load_cache:
-             pcb_tile(f"{func_id_log_base}_error_memory_loading_cache", prog=None, lvl="ERROR", filename=os.path.basename(cached_image_file_path), error=str(e_mem_load_cache), tile_id=tile_id)
+             pcb_tile(f"{func_id_log_base}_error_memory_loading_cache", prog=None, lvl="ERROR", filename=_safe_basename(cached_image_file_path), error=str(e_mem_load_cache), tile_id=tile_id)
              # Release the concurrency slot before aborting
              try:
                  _PH3_CONCURRENCY_SEMAPHORE.release()
@@ -8034,7 +8157,7 @@ def create_master_tile(
                  pass
              del tile_images_data_HWC_adu, tile_original_raw_headers; gc.collect(); return (None, None), failed_groups_to_retry
         except Exception as e_load_cache:
-            pcb_tile(f"{func_id_log_base}_error_loading_cache", prog=None, lvl="ERROR", filename=os.path.basename(cached_image_file_path), error=str(e_load_cache), tile_id=tile_id)
+            pcb_tile(f"{func_id_log_base}_error_loading_cache", prog=None, lvl="ERROR", filename=_safe_basename(cached_image_file_path), error=str(e_load_cache), tile_id=tile_id)
             logger.error(f"Erreur chargement cache {cached_image_file_path} pour tuile {tile_id}", exc_info=True)
             continue
             
@@ -8417,8 +8540,10 @@ def create_master_tile(
     )
 
     # pcb_tile(f"{func_id_log_base}_info_saving_started", prog=None, lvl="DEBUG_DETAIL", tile_id=tile_id)
+    output_temp_dir_path = Path(output_temp_dir).expanduser()
+    output_temp_dir_path.mkdir(parents=True, exist_ok=True)
     temp_fits_filename = f"master_tile_{tile_id:03d}.fits"
-    temp_fits_filepath = os.path.join(output_temp_dir,temp_fits_filename)
+    temp_fits_path = output_temp_dir_path / temp_fits_filename
 
     try:
         # Créer un nouvel objet Header pour la sauvegarde
@@ -8499,7 +8624,7 @@ def create_master_tile(
 
         if header_for_master_tile_base: # C'est déjà un objet fits.Header
             ref_path_raw_for_hdr = seestar_stack_group_info[reference_image_index_in_group].get('path_raw', 'UnknownRef')
-            header_mt_save['ZMT_REF'] = (os.path.basename(ref_path_raw_for_hdr), 'Reference raw frame for this tile WCS')
+            header_mt_save['ZMT_REF'] = (_safe_basename(ref_path_raw_for_hdr), 'Reference raw frame for this tile WCS')
             keys_from_ref = ['OBJECT','DATE-AVG','FILTER','INSTRUME','FOCALLEN','XPIXSZ','YPIXSZ', 'GAIN', 'OFFSET'] # Ajout GAIN, OFFSET
             for key_h in keys_from_ref:
                 if key_h in header_for_master_tile_base:
@@ -8546,7 +8671,7 @@ def create_master_tile(
 
         zemosaic_utils.save_fits_image(
             image_data=master_tile_stacked_HWC,
-            output_path=temp_fits_filepath,
+            output_path=str(temp_fits_path),
             header=header_mt_save,
             overwrite=True,
             save_as_float=True,
@@ -8555,7 +8680,7 @@ def create_master_tile(
             alpha_mask=alpha_mask_out,
         )
 
-        final_tile_path: Optional[str] = temp_fits_filepath
+        final_tile_path: Optional[str] = str(temp_fits_path)
         final_wcs = wcs_for_master_tile
 
         if quality_gate_eval and quality_gate_eval.get("metrics"):
@@ -8568,7 +8693,7 @@ def create_master_tile(
                 prog=None,
                 lvl="INFO",
                 tile_id=int(tile_id),
-                path=os.path.basename(temp_fits_filepath),
+                path=_safe_basename(temp_fits_path),
                 score=f"{score:.3f}",
                 threshold=f"{float(quality_gate_threshold):.3f}",
                 status=status_label,
@@ -8582,7 +8707,7 @@ def create_master_tile(
             )
             if not accepted_flag:
                 if quality_gate_move_rejects:
-                    moved_path, moved = _move_quality_reject_file(temp_fits_filepath)
+                    moved_path, moved = _move_quality_reject_file(str(temp_fits_path))
                     if moved:
                         pcb_tile(
                             "mt_quality_gate_moved",
@@ -8607,7 +8732,7 @@ def create_master_tile(
             lvl="INFO_DETAIL",
             tile_id=tile_id,
             format_type='float32',
-            filename=os.path.basename(final_tile_path or temp_fits_filepath),
+            filename=_safe_basename(final_tile_path or str(temp_fits_path)),
         )
         # pcb_tile(f"{func_id_log_base}_info_saving_finished", prog=None, lvl="DEBUG_DETAIL", tile_id=tile_id)
         try:
@@ -8867,13 +8992,16 @@ def assemble_final_mosaic_incremental(
 
     internal_temp_dir = False
     if memmap_dir is None:
-        memmap_dir = tempfile.mkdtemp(prefix="zemosaic_memmap_")
+        memmap_dir_path = Path(
+            tempfile.mkdtemp(prefix="zemosaic_memmap_", dir=str(get_runtime_temp_dir()))
+        )
         internal_temp_dir = True
     else:
-        os.makedirs(memmap_dir, exist_ok=True)
-    sum_path = os.path.join(memmap_dir, "SOMME.fits")
-    weight_path = os.path.join(memmap_dir, "WEIGHT.fits")
-    alpha_path = os.path.join(memmap_dir, "ALPHA.fits")
+        memmap_dir_path = Path(memmap_dir).expanduser()
+        memmap_dir_path.mkdir(parents=True, exist_ok=True)
+    sum_path = memmap_dir_path / "SOMME.fits"
+    weight_path = memmap_dir_path / "WEIGHT.fits"
+    alpha_path = memmap_dir_path / "ALPHA.fits"
 
     try:
         fits.writeto(sum_path, np.zeros(sum_shape, dtype=dtype_accumulator), overwrite=True)
@@ -8918,7 +9046,7 @@ def assemble_final_mosaic_incremental(
                     lvl="INFO_DETAIL",
                     tile_num=tile_idx,
                     total_tiles=len(master_tile_fits_with_wcs_list),
-                    filename=os.path.basename(tile_path),
+                    filename=_safe_basename(tile_path),
                 )
                 # Les objets WCS peuvent poser problème lors de la sérialisation.
                 # On transmet donc leurs en-têtes et ils seront reconstruits dans le worker.
@@ -9173,13 +9301,13 @@ def assemble_final_mosaic_incremental(
     if cleanup_memmap:
         for p in (sum_path, weight_path, alpha_path):
             try:
-                os.remove(p)
+                Path(p).unlink()
             except OSError:
                 pass
 
         if internal_temp_dir:
             try:
-                os.rmdir(memmap_dir)
+                memmap_dir_path.rmdir()
             except OSError:
                 pass
 
@@ -9509,7 +9637,7 @@ def assemble_final_mosaic_reproject_coadd(
             if alpha_mask_arr.shape != data.shape[:2]:
                 logger.debug(
                     "[Alpha] Master tile mask shape mismatch: tile=%s, mask_shape=%s, data_shape=%s",
-                    os.path.basename(str(tile_path)),
+                    _safe_basename(tile_path),
                     alpha_mask_arr.shape,
                     data.shape,
                 )
@@ -9805,13 +9933,24 @@ def assemble_final_mosaic_reproject_coadd(
     coverage_mm_path = None
     if use_memmap:
         try:
-            mm_dir = memmap_dir or tempfile.mkdtemp(prefix="zemosaic_coadd_")
-            os.makedirs(mm_dir, exist_ok=True)
-            mosaic_mm_path = os.path.join(mm_dir, f"mosaic_{h}x{w}x{n_channels}.dat")
-            coverage_mm_path = os.path.join(mm_dir, f"coverage_{h}x{w}.dat")
-            mosaic_memmap = np.memmap(mosaic_mm_path, dtype=np.float32, mode='w+', shape=(h, w, n_channels))
-            coverage_memmap = np.memmap(coverage_mm_path, dtype=np.float32, mode='w+', shape=(h, w))
-            _pcb("assemble_debug_memmap_paths", prog=None, lvl="DEBUG_DETAIL", mosaic_path=mosaic_mm_path, coverage_path=coverage_mm_path)
+            if memmap_dir:
+                mm_dir_path = Path(memmap_dir).expanduser()
+                mm_dir_path.mkdir(parents=True, exist_ok=True)
+            else:
+                mm_dir_path = Path(
+                    tempfile.mkdtemp(prefix="zemosaic_coadd_", dir=str(get_runtime_temp_dir()))
+                )
+            mosaic_mm_path = mm_dir_path / f"mosaic_{h}x{w}x{n_channels}.dat"
+            coverage_mm_path = mm_dir_path / f"coverage_{h}x{w}.dat"
+            mosaic_memmap = np.memmap(str(mosaic_mm_path), dtype=np.float32, mode='w+', shape=(h, w, n_channels))
+            coverage_memmap = np.memmap(str(coverage_mm_path), dtype=np.float32, mode='w+', shape=(h, w))
+            _pcb(
+                "assemble_debug_memmap_paths",
+                prog=None,
+                lvl="DEBUG_DETAIL",
+                mosaic_path=str(mosaic_mm_path),
+                coverage_path=str(coverage_mm_path),
+            )
         except Exception as e_mm:
             mosaic_memmap = None
             coverage_memmap = None
@@ -9868,6 +10007,7 @@ def assemble_final_mosaic_reproject_coadd(
                     cpu_func=reproject_and_coadd,
                     reproject_function=reproject_interp,
                     combine_function="mean",
+                    progress_callback=_pcb,
                     **local_kwargs,
                 )
 
@@ -10074,7 +10214,7 @@ def _load_master_tiles_for_two_pass(
     if not master_tile_fits_with_wcs_list:
         return tiles, tiles_wcs
     for tile_path, tile_wcs in master_tile_fits_with_wcs_list:
-        if not tile_path or not os.path.exists(tile_path) or tile_wcs is None:
+        if not tile_path or not _path_exists(tile_path) or tile_wcs is None:
             continue
         try:
             with fits.open(tile_path, memmap=False) as hdul:
@@ -10083,7 +10223,7 @@ def _load_master_tiles_for_two_pass(
             if logger:
                 logger.warning(
                     "[TwoPass] Failed to load master tile %s: %s",
-                    os.path.basename(tile_path),
+                    _safe_basename(tile_path),
                     exc,
                 )
             continue
@@ -10112,14 +10252,14 @@ def _load_master_tiles_for_two_pass(
                 if logger:
                     logger.debug(
                         "[TwoPass] Crop failed for %s: %s",
-                        os.path.basename(tile_path),
+                        _safe_basename(tile_path),
                         exc,
                     )
         tiles.append(np.asarray(data, dtype=np.float32))
         tiles_wcs.append(current_wcs)
         if logger and len(tiles) <= 5:
             logger.debug(
-                "[TwoPass] Loaded tile %s with shape=%s", os.path.basename(tile_path), np.asarray(data).shape
+                "[TwoPass] Loaded tile %s with shape=%s", _safe_basename(tile_path), np.asarray(data).shape
             )
     return tiles, tiles_wcs
 
@@ -10812,6 +10952,7 @@ def run_hierarchical_mosaic(
         two_pass_sigma_px=two_pass_cov_sigma_px_config,
         two_pass_gain_clip=two_pass_cov_gain_clip_config,
     )
+    _emit_gpu_info_summary(progress_callback, resource_probe_info)
     two_pass_enabled = bool(resource_probe_info.get("two_pass_enabled", False))
     try:
         two_pass_sigma_px = int(resource_probe_info.get("two_pass_sigma_px", 50) or 50)
@@ -10871,13 +11012,8 @@ def run_hierarchical_mosaic(
     def _normalize_path_for_matching(path_value: str | None) -> str | None:
         if not path_value:
             return None
-        try:
-            return os.path.normcase(os.path.abspath(path_value))
-        except Exception:
-            try:
-                return os.path.normcase(str(path_value))
-            except Exception:
-                return None
+        normalized = _normcase_path(Path(path_value).expanduser())
+        return normalized or None
 
 
     # Seuil de clustering : valeur de repli à 0.05° si l'option est absente ou non positive
@@ -10941,6 +11077,10 @@ def run_hierarchical_mosaic(
                 zemosaic_utils.ensure_cupy_pool_initialized(0)
         except Exception:
             pass
+    if use_gpu_phase5_flag:
+        _log_and_callback("phase5_using_gpu", callback=progress_callback, lvl="INFO")
+    else:
+        _log_and_callback("phase5_using_cpu", callback=progress_callback, lvl="INFO")
     def _cleanup_per_tile_cache(cache_paths: Iterable[str]) -> tuple[int, int]:
         """Remove preprocessed cache files for a completed master tile."""
 
@@ -10949,35 +11089,41 @@ def run_hierarchical_mosaic(
         seen_paths: set[str] = set()
 
         for path in cache_paths or ():
-            if not isinstance(path, str):
+            if path is None:
                 continue
             try:
-                norm_path = os.path.abspath(path)
+                path_obj = Path(os.fspath(path)).expanduser()
+                try:
+                    resolved = path_obj.resolve(strict=False)
+                except Exception:
+                    resolved = path_obj
+                norm_path = str(resolved)
             except Exception:
-                norm_path = path
-            if norm_path in seen_paths:
+                norm_path = None
+            if not norm_path or norm_path in seen_paths:
                 continue
             seen_paths.add(norm_path)
-            if not isinstance(norm_path, str) or not norm_path.lower().endswith(".npy"):
+            if not norm_path.lower().endswith(".npy"):
                 continue
-            if not os.path.isfile(norm_path):
+            cache_path_obj = Path(norm_path)
+            if not cache_path_obj.is_file():
                 continue
 
             file_size = 0
             try:
-                file_size = os.path.getsize(norm_path)
+                file_size = cache_path_obj.stat().st_size
             except OSError:
                 file_size = 0
 
             try:
-                os.remove(norm_path)
+                cache_path_obj.unlink()
                 removed_count += 1
                 removed_bytes += file_size
-                logger.debug("Removed per-tile cache file: %s", norm_path)
+                logger.debug("Removed per-tile cache file: %s", cache_path_obj)
             except FileNotFoundError:
                 continue
             except OSError as exc_remove:
-                logger.warning("Failed to remove per-tile cache file %s: %s", norm_path, exc_remove)
+                logger.warning("Failed to remove per-tile cache file %s: %s", cache_path_obj, exc_remove)
 
         return removed_count, removed_bytes
 
@@ -11012,7 +11158,13 @@ def run_hierarchical_mosaic(
         lvl="INFO",
         callback=progress_callback,
     )
-    pcb(f"  Config ASTAP: Exe='{os.path.basename(astap_exe_path) if astap_exe_path else 'N/A'}', Data='{os.path.basename(astap_data_dir_param) if astap_data_dir_param else 'N/A'}', Radius={astap_search_radius_config}deg, Downsample={astap_downsample_config}, Sens={astap_sensitivity_config}", prog=None, lvl="DEBUG_DETAIL")
+    pcb(
+        f"  Config ASTAP: Exe='{_safe_basename(astap_exe_path) if astap_exe_path else 'N/A'}', "
+        f"Data='{_safe_basename(astap_data_dir_param) if astap_data_dir_param else 'N/A'}', "
+        f"Radius={astap_search_radius_config}deg, Downsample={astap_downsample_config}, Sens={astap_sensitivity_config}",
+        prog=None,
+        lvl="DEBUG_DETAIL",
+    )
     pcb(f"  Config Workers (GUI): Base demandé='{num_base_workers_config}' (0=auto)", prog=None, lvl="DEBUG_DETAIL")
     pcb(
         f"  Options Stacking (Master Tuiles): Norm='{stack_norm_method}', Weight='{stack_weight_method}', Reject='{stack_reject_algo}', "
@@ -11026,9 +11178,11 @@ def run_hierarchical_mosaic(
     pcb(f"  Options Assemblage Final: Méthode='{final_assembly_method_config}'", prog=None, lvl="DEBUG_DETAIL")
 
     time_per_raw_file_wcs = None; time_per_master_tile_creation = None
-    cache_dir_name = ".zemosaic_img_cache"; temp_image_cache_dir = os.path.join(output_folder, cache_dir_name)
+    cache_dir_name = ".zemosaic_img_cache"
+    temp_image_cache_dir = str(Path(output_folder).expanduser() / cache_dir_name)
+    temp_master_tile_storage_dir: str | None = None
     try:
-        if os.path.exists(temp_image_cache_dir): shutil.rmtree(temp_image_cache_dir)
+        if _path_exists(temp_image_cache_dir): shutil.rmtree(temp_image_cache_dir)
         os.makedirs(temp_image_cache_dir, exist_ok=True)
     except OSError as e_mkdir_cache:
         pcb("run_error_cache_dir_creation_failed", prog=None, lvl="ERROR", directory=temp_image_cache_dir, error=str(e_mkdir_cache)); return
@@ -11054,27 +11208,35 @@ def run_hierarchical_mosaic(
     fits_file_paths = []
     # Prépare des exclusions supplémentaires: dossier de sortie et WCS global
     try:
-        _output_abs = os.path.normcase(os.path.abspath(output_folder)) if output_folder else None
+        _output_abs_path = Path(output_folder).expanduser().resolve() if output_folder else None
+        _output_abs_norm = _normcase_path(_output_abs_path) if _output_abs_path else None
     except Exception:
-        _output_abs = None
+        _output_abs_path = None
+        _output_abs_norm = None
     try:
-        _wcs_out_base = os.path.basename((worker_config_cache or {}).get("global_wcs_output_path", "global_mosaic_wcs.fits")).strip().lower()
+        _wcs_out_base = _safe_basename((worker_config_cache or {}).get("global_wcs_output_path", "global_mosaic_wcs.fits")).strip().lower()
     except Exception:
         _wcs_out_base = "global_mosaic_wcs.fits"
     # Scan des fichiers FITS dans le dossier d'entrée et ses sous-dossiers
     for root_dir_iter, dirnames_iter, files_in_dir_iter in os.walk(input_folder):
+        root_path = Path(root_dir_iter)
         # Exclure les dossiers interdits dès la descente
         try:
             filtered_dirs = []
             for d in dirnames_iter:
-                child = Path(root_dir_iter) / d
+                child = root_path / d
                 # Exclusion via règle standard
                 if is_path_excluded(child, EXCLUDED_DIRS):
                     continue
                 # Exclure aussi le sous-arbre du dossier de sortie
                 try:
-                    if _output_abs and os.path.normcase(os.path.abspath(str(child))).startswith(_output_abs):
-                        continue
+                    if _output_abs_norm:
+                        try:
+                            child_norm = _normcase_path(child.resolve())
+                        except Exception:
+                            child_norm = _normcase_path(child)
+                        if child_norm.startswith(_output_abs_norm):
+                            continue
                 except Exception:
                     pass
                 filtered_dirs.append(d)
@@ -11083,8 +11245,7 @@ def run_hierarchical_mosaic(
             dirnames_iter[:] = [
                 d
                 for d in dirnames_iter
-                if UNALIGNED_DIRNAME
-                not in os.path.normpath(os.path.join(root_dir_iter, d)).split(os.sep)
+                if UNALIGNED_DIRNAME not in (root_path / d).parts
             ]
 
         # Assurer un ordre déterministe quelle que soit la plateforme/FS
@@ -11095,12 +11256,13 @@ def run_hierarchical_mosaic(
 
         for file_name_iter in files_in_dir_iter:
             if file_name_iter.lower().endswith((".fit", ".fits")):
-                full_path = os.path.join(root_dir_iter, file_name_iter)
+                full_path = root_path / file_name_iter
+                full_path_str = str(full_path)
                 try:
                     if is_path_excluded(full_path, EXCLUDED_DIRS):
                         continue
                 except Exception:
-                    if UNALIGNED_DIRNAME in os.path.normpath(full_path).split(os.sep):
+                    if UNALIGNED_DIRNAME in full_path.parts:
                         continue
                 # Ignorer l'artefact du WCS global si présent dans l'arbre d'entrée
                 try:
@@ -11108,7 +11270,7 @@ def run_hierarchical_mosaic(
                         continue
                 except Exception:
                     pass
-                fits_file_paths.append(full_path)
+                fits_file_paths.append(full_path_str)
     # Tri global déterministe
     try:
         fits_file_paths.sort(key=lambda p: p.lower())
@@ -11422,7 +11584,7 @@ def run_hierarchical_mosaic(
                         if is_path_excluded(candidate_path, EXCLUDED_DIRS):
                             continue
                     except Exception:
-                        if UNALIGNED_DIRNAME in os.path.normpath(str(candidate_path)).split(os.sep):
+                        if UNALIGNED_DIRNAME in _normpath_parts(candidate_path):
                             continue
                     filtered_paths.append(candidate_path)
 
@@ -11561,16 +11723,16 @@ def run_hierarchical_mosaic(
                         and header_obj_updated is not None
                     ):
                         # Sauvegarder les données prétraitées en .npy
-                        cache_file_basename = f"preprocessed_{os.path.splitext(os.path.basename(file_path_original))[0]}_{files_processed_count_ph1}.npy"
-                        cached_image_path = os.path.join(temp_image_cache_dir, cache_file_basename)
+                        cache_file_basename = f"preprocessed_{Path(file_path_original).stem}_{files_processed_count_ph1}.npy"
+                        cached_image_path = Path(temp_image_cache_dir) / cache_file_basename
                         try:
-                            np.save(cached_image_path, img_data_adu)
+                            np.save(str(cached_image_path), img_data_adu)
                         except Exception as e_save_npy:
                             pcb(
                                 "run_error_phase1_save_npy_failed",
                                 prog=prog_step_phase1,
                                 lvl="ERROR",
-                                filename=os.path.basename(file_path_original),
+                                filename=_safe_basename(file_path_original),
                                 error=str(e_save_npy),
                             )
                             logger.error(f"Erreur sauvegarde NPY pour {file_path_original}:", exc_info=True)
@@ -11578,7 +11740,7 @@ def run_hierarchical_mosaic(
                             # Stocker les informations pour les phases suivantes
                             entry = {
                                 'path_raw': file_path_original,
-                                'path_preprocessed_cache': cached_image_path,
+                                'path_preprocessed_cache': str(cached_image_path),
                                 'path_hotpix_mask': hp_mask_path,
                                 'wcs': wcs_obj_solved,
                                 'header': header_obj_updated,
@@ -11606,7 +11768,7 @@ def run_hierarchical_mosaic(
                             "run_warn_phase1_wcs_pretreat_failed_or_skipped_thread",
                             prog=prog_step_phase1,
                             lvl="WARN",
-                            filename=os.path.basename(file_path_original),
+                            filename=_safe_basename(file_path_original),
                         )
                         if img_data_adu is not None:
                             del img_data_adu
@@ -11618,7 +11780,7 @@ def run_hierarchical_mosaic(
                         "run_error_phase1_thread_exception",
                         prog=prog_step_phase1,
                         lvl="ERROR",
-                        filename=os.path.basename(file_path_original),
+                        filename=_safe_basename(file_path_original),
                         error=str(exc_thread),
                     )
                     logger.error(
@@ -11733,7 +11895,7 @@ def run_hierarchical_mosaic(
                 )
                 if missing_preplan:
                     try:
-                        preview = ", ".join(os.path.basename(p) for p in missing_preplan[:5] if p)
+                        preview = ", ".join(_safe_basename(p) for p in missing_preplan[:5] if p)
                     except Exception:
                         preview = ""
                     _log_and_callback(
@@ -12205,11 +12367,11 @@ def run_hierarchical_mosaic(
         # Try to pick a representative cached image path from the first group
         if seestar_stack_groups and seestar_stack_groups[0]:
             sample_cache_for_read = seestar_stack_groups[0][0].get('path_preprocessed_cache')
-        if sample_cache_for_read and os.path.exists(sample_cache_for_read):
+        if sample_cache_for_read and _path_exists(sample_cache_for_read):
             io_read_mbps = _measure_sequential_read_mbps(sample_cache_for_read)
             io_read_cat = _categorize_io_speed(io_read_mbps)
         # Write speed on output folder
-        if output_folder and os.path.isdir(output_folder):
+        if output_folder and _path_isdir(output_folder):
             io_write_mbps = _measure_sequential_write_mbps(output_folder)
             io_write_cat = _categorize_io_speed(io_write_mbps)
         pcb(
@@ -12463,9 +12625,9 @@ def run_hierarchical_mosaic(
             _log_memory_usage(progress_callback, "Début Phase 3 (Master Tuiles)")
             pcb("run_info_phase3_started_from_cache", prog=base_progress_phase3, lvl="INFO")
             pcb("PHASE_UPDATE:3", prog=None, lvl="ETA_LEVEL")
-            temp_master_tile_storage_dir = os.path.join(output_folder, "zemosaic_temp_master_tiles")
+            temp_master_tile_storage_dir = str(Path(output_folder).expanduser() / "zemosaic_temp_master_tiles")
             try:
-                if os.path.exists(temp_master_tile_storage_dir): shutil.rmtree(temp_master_tile_storage_dir)
+                if _path_exists(temp_master_tile_storage_dir): shutil.rmtree(temp_master_tile_storage_dir)
                 os.makedirs(temp_master_tile_storage_dir, exist_ok=True)
             except OSError as e_mkdir_mt: 
                 pcb("run_error_phase3_mkdir_failed", prog=current_global_progress, lvl="ERROR", directory=temp_master_tile_storage_dir, error=str(e_mkdir_mt)); return
@@ -12631,7 +12793,7 @@ def run_hierarchical_mosaic(
                     sample_cache = None
                     if seestar_stack_groups and seestar_stack_groups[0]:
                         sample_cache = seestar_stack_groups[0][0].get('path_preprocessed_cache')
-                    if sample_cache and os.path.exists(sample_cache):
+                    if sample_cache and _path_exists(sample_cache):
                         _arr = np.load(sample_cache, mmap_mode='r')
                         per_frame_bytes = int(_arr.size) * int(_arr.dtype.itemsize)
                         _arr = None
@@ -12907,7 +13069,7 @@ def run_hierarchical_mosaic(
                                     filtered_retry_group.append(raw_info)
                                 for dropped in dropped_infos:
                                     try:
-                                        filename = os.path.basename(dropped.get('path_raw', 'UnknownRaw'))
+                                        filename = _safe_basename(dropped.get('path_raw', 'UnknownRaw'))
                                     except Exception:
                                         filename = str(dropped)
                                     pcb(
@@ -13052,31 +13214,31 @@ def run_hierarchical_mosaic(
             total_steps_ph4 = len(master_tiles_results_list)
             for idx_loop, (mt_path_iter,mt_wcs_iter) in enumerate(master_tiles_results_list, 1):
                 # ... (logique de récupération shape, inchangée) ...
-                if not (mt_path_iter and os.path.exists(mt_path_iter) and mt_wcs_iter and mt_wcs_iter.is_celestial): pcb("run_warn_phase4_invalid_master_tile_for_grid", prog=None, lvl="WARN", path=os.path.basename(mt_path_iter if mt_path_iter else "N/A_path")); continue
+                if not (mt_path_iter and _path_exists(mt_path_iter) and mt_wcs_iter and mt_wcs_iter.is_celestial): pcb("run_warn_phase4_invalid_master_tile_for_grid", prog=None, lvl="WARN", path=_safe_basename(mt_path_iter)); continue
                 try:
                     h_mt_loc,w_mt_loc=0,0
                     if mt_wcs_iter.pixel_shape and mt_wcs_iter.pixel_shape[0] > 0 and mt_wcs_iter.pixel_shape[1] > 0 : h_mt_loc,w_mt_loc=mt_wcs_iter.pixel_shape[1],mt_wcs_iter.pixel_shape[0] 
                     else: 
                         with fits.open(mt_path_iter,memmap=True, do_not_scale_image_data=True) as hdul_mt_s:
-                            if hdul_mt_s[0].data is None: pcb("run_warn_phase4_no_data_in_tile_fits", prog=None, lvl="WARN", path=os.path.basename(mt_path_iter)); continue
+                            if hdul_mt_s[0].data is None: pcb("run_warn_phase4_no_data_in_tile_fits", prog=None, lvl="WARN", path=_safe_basename(mt_path_iter)); continue
                             data_shape = hdul_mt_s[0].shape
                             if len(data_shape) == 3:
                                 # data_shape == (height, width, channels)
                                 h_mt_loc,w_mt_loc = data_shape[0],data_shape[1]
                             elif len(data_shape) == 2: h_mt_loc,w_mt_loc = data_shape[0],data_shape[1]
-                            else: pcb("run_warn_phase4_unhandled_tile_shape", prog=None, lvl="WARN", path=os.path.basename(mt_path_iter), shape=data_shape); continue 
+                            else: pcb("run_warn_phase4_unhandled_tile_shape", prog=None, lvl="WARN", path=_safe_basename(mt_path_iter), shape=data_shape); continue 
                             if mt_wcs_iter and mt_wcs_iter.is_celestial and mt_wcs_iter.pixel_shape is None:
                                 try: mt_wcs_iter.pixel_shape=(w_mt_loc,h_mt_loc)
-                                except Exception as e_set_ps: pcb("run_warn_phase4_failed_set_pixel_shape", prog=None, lvl="WARN", path=os.path.basename(mt_path_iter), error=str(e_set_ps))
+                                except Exception as e_set_ps: pcb("run_warn_phase4_failed_set_pixel_shape", prog=None, lvl="WARN", path=_safe_basename(mt_path_iter), error=str(e_set_ps))
                     if h_mt_loc > 0 and w_mt_loc > 0: shapes_list_for_final_grid_hw.append((int(h_mt_loc),int(w_mt_loc))); wcs_list_for_final_grid.append(mt_wcs_iter)
-                    else: pcb("run_warn_phase4_zero_dimensions_tile", prog=None, lvl="WARN", path=os.path.basename(mt_path_iter))
+                    else: pcb("run_warn_phase4_zero_dimensions_tile", prog=None, lvl="WARN", path=_safe_basename(mt_path_iter))
                     now = time.time(); step_times_ph4.append(now - last_time_loop_ph4); last_time_loop_ph4 = now
                     if progress_callback:
                         try:
                             progress_callback("phase4_grid", idx_loop, total_steps_ph4)
                         except Exception:
                             pass
-                except Exception as e_read_tile_shape: pcb("run_error_phase4_reading_tile_shape", prog=None, lvl="ERROR", path=os.path.basename(mt_path_iter), error=str(e_read_tile_shape)); logger.error(f"Erreur lecture shape tuile {os.path.basename(mt_path_iter)}:", exc_info=True); continue
+                except Exception as e_read_tile_shape: pcb("run_error_phase4_reading_tile_shape", prog=None, lvl="ERROR", path=_safe_basename(mt_path_iter), error=str(e_read_tile_shape)); logger.error(f"Erreur lecture shape tuile {_safe_basename(mt_path_iter)}:", exc_info=True); continue
             if not wcs_list_for_final_grid or not shapes_list_for_final_grid_hw or len(wcs_list_for_final_grid) != len(shapes_list_for_final_grid_hw): pcb("run_error_phase4_insufficient_tile_info", prog=(base_progress_phase4 + PROGRESS_WEIGHT_PHASE4_GRID_CALC), lvl="ERROR"); return
             final_mosaic_drizzle_scale = 1.0 
             final_output_wcs, final_output_shape_hw = _calculate_final_mosaic_grid(wcs_list_for_final_grid, shapes_list_for_final_grid_hw, final_mosaic_drizzle_scale, progress_callback)
@@ -13205,10 +13367,10 @@ def run_hierarchical_mosaic(
 
             valid_master_tiles_for_assembly = []
             for mt_p, mt_w in master_tiles_results_list:
-                if mt_p and os.path.exists(mt_p) and mt_w and mt_w.is_celestial: 
+                if mt_p and _path_exists(mt_p) and mt_w and mt_w.is_celestial: 
                     valid_master_tiles_for_assembly.append((mt_p, mt_w))
                 else:
-                    pcb("run_warn_phase5_invalid_tile_skipped_for_assembly", prog=None, lvl="WARN", filename=os.path.basename(mt_p if mt_p else 'N/A')) # Clé de log plus spécifique
+                    pcb("run_warn_phase5_invalid_tile_skipped_for_assembly", prog=None, lvl="WARN", filename=_safe_basename(mt_p if mt_p else 'N/A')) # Clé de log plus spécifique
                     
             if not valid_master_tiles_for_assembly: 
                 pcb("run_error_phase5_no_valid_tiles_for_assembly", prog=(base_progress_phase5 + PROGRESS_WEIGHT_PHASE5_ASSEMBLY), lvl="ERROR")
@@ -13482,7 +13644,8 @@ def run_hierarchical_mosaic(
     _log_memory_usage(progress_callback, "Début Phase 6 (Sauvegarde)")
     pcb("run_info_phase6_started", prog=base_progress_phase6, lvl="INFO")
     output_base_name = f"zemosaic_MT{len(master_tiles_results_list)}_R{len(all_raw_files_processed_info)}"
-    final_fits_path = os.path.join(output_folder, f"{output_base_name}.fits")
+    output_folder_path = Path(output_folder).expanduser()
+    final_fits_path = output_folder_path / f"{output_base_name}.fits"
     
     final_header = fits.Header() 
     if final_output_wcs:
@@ -13523,18 +13686,19 @@ def run_hierarchical_mosaic(
                     save_array = save_array.copy()
         except Exception:
             save_array = final_mosaic_data_HWC
-        def _attach_alpha_extension(target_path: str, *, log_success: bool = False) -> None:
+        def _attach_alpha_extension(target_path: Path, *, log_success: bool = False) -> None:
+            path_obj = Path(target_path)
             if (
                 alpha_final is None
-                or not target_path
-                or not os.path.exists(target_path)
+                or not path_obj
+                or not path_obj.exists()
                 or not (ASTROPY_AVAILABLE and fits)
                 or not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils)
                 or not hasattr(zemosaic_utils, "append_alpha_hdu")
             ):
                 return
             try:
-                with fits.open(target_path, mode="update") as hdul_final:
+                with fits.open(str(path_obj), mode="update") as hdul_final:
                     zemosaic_utils.append_alpha_hdu(hdul_final, alpha_final)
                     hdul_final.flush()
                 if log_success:
@@ -13552,7 +13716,7 @@ def run_hierarchical_mosaic(
         )
         zemosaic_utils.save_fits_image(
             image_data=save_array,
-            output_path=final_fits_path,
+            output_path=str(final_fits_path),
             header=final_header,
             overwrite=True,
             save_as_float=True,
@@ -13569,10 +13733,10 @@ def run_hierarchical_mosaic(
             and ZEMOSAIC_UTILS_AVAILABLE
             and hasattr(zemosaic_utils, "write_final_fits_uint16_color_aware")
         ):
-            viewer_fits_path = os.path.join(output_folder, f"{output_base_name}_viewer.fits")
+            viewer_fits_path = output_folder_path / f"{output_base_name}_viewer.fits"
             try:
                 zemosaic_utils.write_final_fits_uint16_color_aware(
-                    viewer_fits_path,
+                    str(viewer_fits_path),
                     save_array,
                     header=final_header,
                     force_rgb_planes=is_rgb,
@@ -13584,7 +13748,7 @@ def run_hierarchical_mosaic(
                     "run_info_phase6_viewer_fits_saved",
                     prog=None,
                     lvl="INFO_DETAIL",
-                    filename=os.path.basename(viewer_fits_path),
+                    filename=_safe_basename(viewer_fits_path),
                 )
             except Exception as e_viewer:
                 pcb(
@@ -13595,7 +13759,7 @@ def run_hierarchical_mosaic(
                 )
         
         if final_mosaic_coverage_HW is not None and np.any(final_mosaic_coverage_HW):
-            coverage_path = os.path.join(output_folder, f"{output_base_name}_coverage.fits")
+            coverage_path = output_folder_path / f"{output_base_name}_coverage.fits"
             cov_hdr = fits.Header() 
             if ASTROPY_AVAILABLE and final_output_wcs: 
                 try: cov_hdr.update(final_output_wcs.to_header(relax=True))
@@ -13604,19 +13768,19 @@ def run_hierarchical_mosaic(
             cov_hdr['BUNIT']=('count','Pixel contributions or sum of weights')
             zemosaic_utils.save_fits_image(
                 final_mosaic_coverage_HW,
-                coverage_path,
+                str(coverage_path),
                 header=cov_hdr,
                 overwrite=True,
                 save_as_float=True,
                 progress_callback=progress_callback,
                 axis_order="HWC",
             )
-            pcb("run_info_coverage_map_saved", prog=None, lvl="INFO_DETAIL", filename=os.path.basename(coverage_path))
+            pcb("run_info_coverage_map_saved", prog=None, lvl="INFO_DETAIL", filename=_safe_basename(coverage_path))
         
         logger.info("[Alpha] Final mosaic saved with ALPHA=%s", bool(alpha_final is not None))
 
         current_global_progress = base_progress_phase6 + PROGRESS_WEIGHT_PHASE6_SAVE
-        pcb("run_success_mosaic_saved", prog=current_global_progress, lvl="SUCCESS", filename=os.path.basename(final_fits_path))
+        pcb("run_success_mosaic_saved", prog=current_global_progress, lvl="SUCCESS", filename=_safe_basename(final_fits_path))
     except Exception as e_save_m: 
         pcb("run_error_phase6_save_failed", prog=(base_progress_phase6 + PROGRESS_WEIGHT_PHASE6_SAVE), lvl="ERROR", error=str(e_save_m))
         logger.error("Erreur sauvegarde FITS final:", exc_info=True)
@@ -13760,7 +13924,7 @@ def run_hierarchical_mosaic(
                         )
                         * 255
                     ).astype(np.uint8)
-                    png_path = os.path.join(output_folder, f"{output_base_name}_preview.png")
+                    png_path = output_folder_path / f"{output_base_name}_preview.png"
                     try: 
                         import cv2 # Importer cv2 seulement si nécessaire
                         alpha_png = None
@@ -13775,16 +13939,16 @@ def run_hierarchical_mosaic(
                         if alpha_png is not None:
                             img_bgra = cv2.cvtColor(img_u8, cv2.COLOR_RGB2BGRA)
                             img_bgra[..., 3] = alpha_png
-                            write_success = cv2.imwrite(png_path, img_bgra)
+                            write_success = cv2.imwrite(str(png_path), img_bgra)
                         else:
                             img_bgr = cv2.cvtColor(img_u8, cv2.COLOR_RGB2BGR)
-                            write_success = cv2.imwrite(png_path, img_bgr)
+                            write_success = cv2.imwrite(str(png_path), img_bgr)
                         if write_success: 
-                            pcb("run_success_preview_saved_auto_asifits", prog=None, lvl="SUCCESS", filename=os.path.basename(png_path))
+                            pcb("run_success_preview_saved_auto_asifits", prog=None, lvl="SUCCESS", filename=_safe_basename(png_path))
                             if alpha_png is not None:
                                 logger.info("phase6: preview masked (NaN pre-stretch) and saved as RGBA PNG")
                         else: 
-                            pcb("run_warn_preview_imwrite_failed_auto_asifits", prog=None, lvl="WARN", filename=os.path.basename(png_path))
+                            pcb("run_warn_preview_imwrite_failed_auto_asifits", prog=None, lvl="WARN", filename=_safe_basename(png_path))
                     except ImportError: 
                         pcb("run_warn_preview_opencv_missing_for_auto_asifits", prog=None, lvl="WARN")
                     except Exception as e_cv2_prev: 
@@ -13800,7 +13964,7 @@ def run_hierarchical_mosaic(
                      m_stretched_fallback = zemosaic_utils.stretch_percentile_rgb(final_mosaic_data_HWC, p_low=0.5, p_high=99.9, independent_channels=False, asinh_a=0.01 )
                      if m_stretched_fallback is not None:
                         img_u8_fb = (np.clip(m_stretched_fallback.astype(np.float32), 0, 1) * 255).astype(np.uint8)
-                        png_path_fb = os.path.join(output_folder, f"{output_base_name}_preview_fallback.png")
+                        png_path_fb = output_folder_path / f"{output_base_name}_preview_fallback.png"
                         try:
                             import cv2
                             alpha_png_fb = None
@@ -13816,12 +13980,12 @@ def run_hierarchical_mosaic(
                             if alpha_png_fb is not None:
                                 img_bgra_fb = cv2.cvtColor(img_u8_fb, cv2.COLOR_RGB2BGRA)
                                 img_bgra_fb[..., 3] = alpha_png_fb
-                                cv2.imwrite(png_path_fb, img_bgra_fb)
+                                cv2.imwrite(str(png_path_fb), img_bgra_fb)
                                 logger.info("phase6: preview masked (NaN pre-stretch) and saved as RGBA PNG")
                             else:
                                 img_bgr_fb = cv2.cvtColor(img_u8_fb, cv2.COLOR_RGB2BGR)
-                                cv2.imwrite(png_path_fb, img_bgr_fb)
-                            pcb("run_success_preview_saved_fallback", prog=None, lvl="INFO_DETAIL", filename=os.path.basename(png_path_fb))
+                                cv2.imwrite(str(png_path_fb), img_bgr_fb)
+                            pcb("run_success_preview_saved_fallback", prog=None, lvl="INFO_DETAIL", filename=_safe_basename(png_path_fb))
                         except: pass # Ignorer erreur fallback
 
         except Exception as e_stretch_main: 
@@ -13838,54 +14002,56 @@ def run_hierarchical_mosaic(
             bool(coadd_use_memmap_config)
             and bool(coadd_cleanup_memmap_config)
             and coadd_memmap_dir_config
-            and os.path.isdir(coadd_memmap_dir_config)
+            and _path_isdir(coadd_memmap_dir_config)
         ):
             return
         try:
-            for _name in os.listdir(coadd_memmap_dir_config):
-                name_l = _name.lower()
-                full_path = os.path.join(coadd_memmap_dir_config, _name)
-                if name_l.endswith(".dat") and (
+            memmap_cleanup_dir = Path(coadd_memmap_dir_config).expanduser()
+            for entry in memmap_cleanup_dir.iterdir():
+                name_l = entry.name.lower()
+                if entry.is_file() and name_l.endswith(".dat") and (
                     name_l.startswith("mosaic_")
                     or name_l.startswith("coverage_")
                     or name_l.startswith("zemosaic_")
                 ):
                     try:
-                        os.remove(full_path)
+                        entry.unlink()
                     except OSError:
                         pass
                     continue
-                if os.path.isdir(full_path) and name_l.startswith("mosaic_first_"):
+                if entry.is_dir() and name_l.startswith("mosaic_first_"):
                     try:
-                        shutil.rmtree(full_path)
-                    except OSError:
+                        shutil.rmtree(str(entry), ignore_errors=False)
+                    except Exception:
                         pass
         except Exception:
             pass
 
-        wcs_candidates: list[str] = []
+        wcs_candidates: list[Path] = []
         try:
             if isinstance(global_wcs_plan, dict):
                 if global_wcs_plan.get("fits_path"):
-                    wcs_candidates.append(str(global_wcs_plan.get("fits_path")))
+                    wcs_candidates.append(Path(global_wcs_plan.get("fits_path")))
                 if global_wcs_plan.get("json_path"):
-                    wcs_candidates.append(str(global_wcs_plan.get("json_path")))
+                    wcs_candidates.append(Path(global_wcs_plan.get("json_path")))
         except Exception:
             pass
         default_wcs_name = str(
             (worker_config_cache or {}).get("global_wcs_output_path", "global_mosaic_wcs.fits")
         ).strip() or "global_mosaic_wcs.fits"
         if output_folder:
-            wcs_candidates.append(os.path.join(output_folder, default_wcs_name))
-            wcs_candidates.append(os.path.join(output_folder, f"{default_wcs_name}.json"))
+            output_folder_path = Path(output_folder).expanduser()
+            wcs_candidates.append(output_folder_path / default_wcs_name)
+            wcs_candidates.append(output_folder_path / f"{default_wcs_name}.json")
         for candidate in wcs_candidates:
             if not candidate:
                 continue
             try:
-                if os.path.isdir(candidate):
+                candidate_path = Path(candidate)
+                if candidate_path.is_dir():
                     continue
-                if os.path.exists(candidate) and "global_mosaic_wcs" in os.path.basename(candidate).lower():
-                    os.remove(candidate)
+                if candidate_path.exists() and "global_mosaic_wcs" in candidate_path.name.lower():
+                    candidate_path.unlink()
             except OSError:
                 pass
 
@@ -13899,17 +14065,26 @@ def run_hierarchical_mosaic(
     _log_memory_usage(progress_callback, "Début Phase 7 (Nettoyage)")
     pcb("run_info_phase7_cleanup_starting", prog=base_progress_phase7, lvl="INFO")
     pcb("PHASE_UPDATE:7", prog=None, lvl="ETA_LEVEL")
-    try:
-        if cache_retention_mode == "keep":
-            if os.path.exists(temp_image_cache_dir):
-                pcb(
-                    "run_info_temp_preprocessed_cache_kept",
-                    prog=None,
-                    lvl="INFO_DETAIL",
-                    directory=temp_image_cache_dir,
-                )
-        else:
-            if os.path.exists(temp_image_cache_dir):
+    def _log_cleanup_warning(msg_key: str, directory: str | None, exc: Exception) -> None:
+        pcb(
+            msg_key,
+            prog=None,
+            lvl="WARN",
+            directory=directory or "<unknown>",
+            error=str(exc),
+        )
+
+    if cache_retention_mode == "keep":
+        if _path_exists(temp_image_cache_dir):
+            pcb(
+                "run_info_temp_preprocessed_cache_kept",
+                prog=None,
+                lvl="INFO_DETAIL",
+                directory=temp_image_cache_dir,
+            )
+    else:
+        if _path_exists(temp_image_cache_dir):
+            try:
                 shutil.rmtree(temp_image_cache_dir)
                 pcb(
                     "run_info_temp_preprocessed_cache_cleaned",
@@ -13917,20 +14092,37 @@ def run_hierarchical_mosaic(
                     lvl="INFO_DETAIL",
                     directory=temp_image_cache_dir,
                 )
-        if (
-            not two_pass_enabled
-            and os.path.exists(temp_master_tile_storage_dir)
-        ):
-            shutil.rmtree(temp_master_tile_storage_dir)
-            pcb("run_info_temp_master_tiles_fits_cleaned", prog=None, lvl="INFO_DETAIL", directory=temp_master_tile_storage_dir)
-        elif two_pass_enabled and os.path.exists(temp_master_tile_storage_dir):
+            except Exception as cache_exc:
+                _log_cleanup_warning(
+                    "run_warn_phase7_cache_cleanup_failed",
+                    temp_image_cache_dir,
+                    cache_exc,
+                )
+
+    master_tiles_dir = temp_master_tile_storage_dir
+    if master_tiles_dir:
+        if not two_pass_enabled and _path_exists(master_tiles_dir):
+            try:
+                shutil.rmtree(master_tiles_dir)
+                pcb(
+                    "run_info_temp_master_tiles_fits_cleaned",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                    directory=master_tiles_dir,
+                )
+            except Exception as mt_exc:
+                _log_cleanup_warning(
+                    "run_warn_phase7_master_tiles_fits_cleanup_failed",
+                    master_tiles_dir,
+                    mt_exc,
+                )
+        elif two_pass_enabled and _path_exists(master_tiles_dir):
             pcb(
                 "run_info_temp_master_tiles_kept_two_pass",
                 prog=None,
                 lvl="INFO_DETAIL",
-                directory=temp_master_tile_storage_dir,
+                directory=master_tiles_dir,
             )
-    except Exception as e_clean_final: pcb("run_warn_phase7_cleanup_failed", prog=None, lvl="WARN", error=str(e_clean_final))
     current_global_progress = base_progress_phase7 + PROGRESS_WEIGHT_PHASE7_CLEANUP; current_global_progress = min(100, current_global_progress)
     _log_memory_usage(progress_callback, "Fin Phase 7"); pcb("CHRONO_STOP_REQUEST", prog=None, lvl="CHRONO_LEVEL"); update_gui_eta(0)
     total_duration_sec = time.monotonic() - start_time_total_run
@@ -14335,30 +14527,31 @@ def _assemble_global_mosaic_first_impl(
 
     use_memmap = bool(global_plan.get("coadd_use_memmap", False))
     cleanup_temp_files = bool(global_plan.get("coadd_cleanup_memmap", True))
-    memmap_root = (
-        global_plan.get("coadd_memmap_dir")
-        or cache_root
-        or tempfile.gettempdir()
-    )
+    memmap_root_candidate = global_plan.get("coadd_memmap_dir") or cache_root
+    if memmap_root_candidate:
+        memmap_root_path = Path(memmap_root_candidate).expanduser()
+    else:
+        memmap_root_path = ensure_user_config_dir() / "memmap"
     try:
-        if memmap_root:
-            os.makedirs(memmap_root, exist_ok=True)
+        memmap_root_path.mkdir(parents=True, exist_ok=True)
     except Exception:
-        memmap_root = tempfile.gettempdir()
-    run_dir = os.path.join(memmap_root or tempfile.gettempdir(), f"mosaic_first_{uuid.uuid4().hex}")
+        memmap_root_path = get_runtime_temp_dir()
+    run_dir_path = memmap_root_path / f"mosaic_first_{uuid.uuid4().hex}"
     try:
-        os.makedirs(run_dir, exist_ok=True)
+        run_dir_path.mkdir(parents=True, exist_ok=True)
     except Exception:
-        run_dir = tempfile.mkdtemp(prefix="mosaic_first_")
+        run_dir_path = Path(
+            tempfile.mkdtemp(prefix="mosaic_first_", dir=str(get_runtime_temp_dir()))
+        )
 
-    temp_artifacts: list[str] = []
+    temp_artifacts: list[Path] = []
     memmap_handles: list[np.memmap] = []
     patch_entries: list[dict[str, Any]] = []
 
     def _allocate_array(shape, dtype, label):
         if use_memmap:
-            filename = os.path.join(run_dir, f"{label}_{uuid.uuid4().hex}.dat")
-            arr = np.memmap(filename, mode="w+", dtype=dtype, shape=shape)
+            filename = run_dir_path / f"{label}_{uuid.uuid4().hex}.dat"
+            arr = np.memmap(str(filename), mode="w+", dtype=dtype, shape=shape)
             arr[...] = 0
             temp_artifacts.append(filename)
             memmap_handles.append(arr)
@@ -14367,7 +14560,7 @@ def _assemble_global_mosaic_first_impl(
 
     def _cleanup_temp():
         if not cleanup_temp_files:
-            logger.debug("[Worker] Mosaic-First temporary data retained in %s", run_dir)
+            logger.debug("[Worker] Mosaic-First temporary data retained in %s", run_dir_path)
             return
         for handle in memmap_handles:
             try:
@@ -14379,13 +14572,14 @@ def _assemble_global_mosaic_first_impl(
             if not artifact:
                 continue
             try:
-                if os.path.isfile(artifact):
-                    os.remove(artifact)
+                artifact_path = Path(artifact)
+                if artifact_path.is_file():
+                    artifact_path.unlink()
             except Exception:
                 pass
         try:
-            if os.path.isdir(run_dir):
-                shutil.rmtree(run_dir)
+            if run_dir_path.exists():
+                shutil.rmtree(run_dir_path)
         except Exception:
             pass
 
@@ -14432,7 +14626,7 @@ def _assemble_global_mosaic_first_impl(
     def _load_frame(entry: dict) -> np.ndarray | None:
         if not isinstance(entry, dict):
             return None
-        label = os.path.basename(entry.get("path_raw") or entry.get("path") or "frame")
+        label = _safe_basename(entry.get("path_raw") or entry.get("path") or "frame")
         cache_paths = [
             entry.get("path_preprocessed_cache"),
             entry.get("path_preprocessed"),
@@ -14442,7 +14636,7 @@ def _assemble_global_mosaic_first_impl(
             if not path_candidate:
                 continue
             try:
-                if os.path.exists(path_candidate):
+                if _path_exists(path_candidate):
                     arr = np.load(path_candidate, mmap_mode="r")
                     break
             except Exception:
@@ -14456,7 +14650,7 @@ def _assemble_global_mosaic_first_impl(
             raw_path = entry.get("path_raw") or entry.get("path")
             if (
                 raw_path
-                and os.path.exists(raw_path)
+                and _path_exists(raw_path)
                 and hasattr(zemosaic_utils, "load_and_validate_fits")
             ):
                 try:
@@ -14652,7 +14846,7 @@ def _assemble_global_mosaic_first_impl(
             "method": coadd_method,
         }
         if entry_path:
-            payload["path"] = os.path.basename(entry_path) or entry_path
+            payload["path"] = _safe_basename(entry_path)
         if group_index is not None:
             payload["group_index"] = int(group_index)
         if entry_index is not None:
@@ -14774,6 +14968,7 @@ def _assemble_global_mosaic_first_impl(
                     use_gpu=True,
                     allow_cpu_fallback=False,
                     match_background=match_background,
+                    progress_callback=pcb,
                 )
             except Exception as exc:
                 logger.warning(
@@ -14799,6 +14994,7 @@ def _assemble_global_mosaic_first_impl(
                         cpu_func=reproject_and_coadd,
                         use_gpu=False,
                         match_background=match_background,
+                        progress_callback=pcb,
                     )
                     try:
                         diff = float(np.nanmax(np.abs(cpu_mosaic - chan_mosaic)))
@@ -14955,7 +15151,7 @@ def _assemble_global_mosaic_first_impl(
                             **_payload(
                                 group_index=int(group_index),
                                 entry_index=int(entry_index),
-                                path=os.path.basename(entry_path) if entry_path else "unknown",
+                                path=_safe_basename(entry_path) if entry_path else "unknown",
                             ),
                         )
                         continue
@@ -14989,15 +15185,15 @@ def _assemble_global_mosaic_first_impl(
                     if sumsq_grid is not None:
                         sumsq_grid[y0:y1, x0:x1, :] += ((patch_data ** 2) * weighted_patch).astype(np.float64)
                     if store_patches:
-                        data_path = os.path.join(run_dir, f"patch_{valid_frames:05d}.npy")
-                        weight_path = os.path.join(run_dir, f"weight_{valid_frames:05d}.npy")
-                        np.save(data_path, patch_data, allow_pickle=False)
-                        np.save(weight_path, patch_weight, allow_pickle=False)
+                        data_path = run_dir_path / f"patch_{valid_frames:05d}.npy"
+                        weight_path = run_dir_path / f"weight_{valid_frames:05d}.npy"
+                        np.save(str(data_path), patch_data, allow_pickle=False)
+                        np.save(str(weight_path), patch_weight, allow_pickle=False)
                         temp_artifacts.extend([data_path, weight_path])
                         patch_entries.append(
                             {
-                                "data_path": data_path,
-                                "weight_path": weight_path,
+                                "data_path": str(data_path),
+                                "weight_path": str(weight_path),
                                 "bbox": bbox,
                             }
                         )
@@ -15587,3 +15783,27 @@ def assemble_global_mosaic_first(
         start_time_total_run=start_time_total_run,
         cache_root=cache_root,
     )
+def _fallback_app_base_dir() -> Path:
+    try:
+        return Path(__file__).resolve().parent
+    except Exception:
+        return Path.cwd()
+
+
+def _fallback_user_config_dir() -> Path:
+    root = Path.home() / "ZeMosaic"
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return root
+
+
+if ZEMOSAIC_UTILS_AVAILABLE:
+    get_app_base_dir = getattr(zemosaic_utils, "get_app_base_dir", _fallback_app_base_dir)
+    ensure_user_config_dir = getattr(zemosaic_utils, "ensure_user_config_dir", _fallback_user_config_dir)
+    get_runtime_temp_dir = getattr(zemosaic_utils, "get_runtime_temp_dir", _fallback_runtime_temp_dir)
+else:
+    get_app_base_dir = _fallback_app_base_dir
+    ensure_user_config_dir = _fallback_user_config_dir
+    get_runtime_temp_dir = _fallback_runtime_temp_dir

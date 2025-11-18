@@ -60,9 +60,41 @@ import queue
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Deque, Optional
 
 import multiprocessing
+
+from core.path_helpers import expand_to_path, safe_path_exists, safe_path_getsize
+
+try:
+    from zemosaic_utils import get_runtime_temp_dir  # type: ignore
+except Exception:  # pragma: no cover - standalone usage
+    def get_runtime_temp_dir() -> Path:
+        root = Path(tempfile.gettempdir()) / "zemosaic_runtime"
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            root = Path(tempfile.gettempdir())
+        return root
+
+
+def _expand_path(pathish: str | os.PathLike[str] | Path | None, *, expanduser: bool = True) -> Path | None:
+    """Return a Path from *pathish* with optional user/env expansion."""
+
+    return expand_to_path(pathish, expanduser=expanduser, expandvars=expanduser)
+
+
+def _path_display_name(pathish: str | os.PathLike[str] | Path | None) -> str:
+    """Return a human-friendly basename for *pathish*."""
+
+    if pathish is None:
+        return "<inconnu>"
+    try:
+        name = Path(pathish).name
+        return name or str(pathish)
+    except Exception:
+        return str(pathish)
 
 try:
     import msvcrt
@@ -204,15 +236,20 @@ def _env_flag_enabled(key: str) -> bool:
 
 
 _ASTAP_IPC_LOCK_DISABLED = _env_flag_enabled("ZEMOSAIC_ASTAP_DISABLE_IPC_LOCK")
-_ASTAP_IPC_LOCK_DIR = os.environ.get("ZEMOSAIC_ASTAP_LOCK_DIR") or os.path.join(
-    tempfile.gettempdir(), "zemosaic_astap_slots"
+_TEMP_BASE_DIR = get_runtime_temp_dir()
+_ASTAP_IPC_LOCK_DIR = (
+    _expand_path(os.environ.get("ZEMOSAIC_ASTAP_LOCK_DIR"))
+    or (_TEMP_BASE_DIR / "zemosaic_astap_slots")
 )
 _ASTAP_IPC_LOCK_SUPPORTED = bool(msvcrt or fcntl)
 _ASTAP_IPC_WAIT_LOG_THRESHOLD_SEC = 2.0
 _ASTAP_IPC_WAIT_LOG_INTERVAL_SEC = 12.0
 _ASTAP_IPC_LOCK_WARNING_EMITTED = False
-_PER_FILE_LOCK_DIR = os.path.join(tempfile.gettempdir(), "zemo_astap_filelocks")
-os.makedirs(_PER_FILE_LOCK_DIR, exist_ok=True)
+_PER_FILE_LOCK_DIR = _TEMP_BASE_DIR / "zemo_astap_filelocks"
+try:
+    _PER_FILE_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+except Exception:
+    pass
 _ASTAP_RATE_MIN_INTERVAL = max(
     0.0, float(os.environ.get("ZEMOSAIC_ASTAP_RATE_SEC", "0.75") or 0.75)
 )
@@ -221,34 +258,35 @@ _ASTAP_LAST_LAUNCH_TIMES: list[float] = []
 _ASTAP_RATE_LOCK = threading.Lock()
 
 
-def _initialize_slot_file(path: str) -> None:
+def _initialize_slot_file(pathish: str | Path) -> None:
     """Ensure the lock file exists and has at least one byte."""
+
+    path_obj = Path(pathish)
     try:
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
+        path_obj.parent.mkdir(parents=True, exist_ok=True)
     except Exception:
         return
     try:
-        if not os.path.exists(path):
-            with open(path, "wb") as handle:
+        if not safe_path_exists(path_obj):
+            with path_obj.open("wb") as handle:
                 handle.write(b"0")
                 handle.flush()
-        elif os.path.getsize(path) == 0:
-            with open(path, "ab") as handle:
+        elif safe_path_getsize(path_obj) == 0:
+            with path_obj.open("ab") as handle:
                 handle.write(b"0")
                 handle.flush()
     except Exception:
         pass
 
 
-def _open_slot_handle(path: str):
+def _open_slot_handle(pathish: str | Path):
+    path_obj = Path(pathish)
     try:
-        return open(path, "r+b")
+        return path_obj.open("r+b")
     except FileNotFoundError:
-        _initialize_slot_file(path)
+        _initialize_slot_file(path_obj)
         try:
-            return open(path, "r+b")
+            return path_obj.open("r+b")
         except Exception:
             return None
     except Exception:
@@ -298,7 +336,7 @@ def _astap_ipc_slot_guard(image_label: str = "", progress_callback: callable = N
 
     slot_count = max(1, get_astap_max_concurrent_instances())
     try:
-        os.makedirs(_ASTAP_IPC_LOCK_DIR, exist_ok=True)
+        _ASTAP_IPC_LOCK_DIR.mkdir(parents=True, exist_ok=True)
     except Exception as exc:
         if not _ASTAP_IPC_LOCK_WARNING_EMITTED:
             logger.warning(
@@ -310,9 +348,9 @@ def _astap_ipc_slot_guard(image_label: str = "", progress_callback: callable = N
         yield
         return
 
-    slot_paths = []
+    slot_paths: list[Path] = []
     for idx in range(slot_count):
-        slot_path = os.path.join(_ASTAP_IPC_LOCK_DIR, f"slot_{idx}.lock")
+        slot_path = _ASTAP_IPC_LOCK_DIR / f"slot_{idx}.lock"
         slot_paths.append(slot_path)
         _initialize_slot_file(slot_path)
 
@@ -328,7 +366,7 @@ def _astap_ipc_slot_guard(image_label: str = "", progress_callback: callable = N
                 continue
             if _try_lock_handle(candidate):
                 acquired_handle = candidate
-                slot_name = os.path.basename(slot_path)
+                slot_name = slot_path.name
                 break
             candidate.close()
         if acquired_handle is not None:
@@ -365,13 +403,12 @@ def _astap_ipc_slot_guard(image_label: str = "", progress_callback: callable = N
 @contextmanager
 def _temp_cwd_isolated(prefix: str = "zemo_astap_run"):
     """Create a dedicated temporary directory used as cwd for an ASTAP invocation."""
-    root = os.path.join(
-        tempfile.gettempdir(),
-        f"{prefix}_{os.getpid()}_{threading.get_ident()}_{int(time.time()*1000)}",
+    root = Path(tempfile.gettempdir()) / (
+        f"{prefix}_{os.getpid()}_{threading.get_ident()}_{int(time.time()*1000)}"
     )
-    os.makedirs(root, exist_ok=True)
+    root.mkdir(parents=True, exist_ok=True)
     try:
-        yield root
+        yield str(root)
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
@@ -383,21 +420,25 @@ def _lock_for_image(
     """
     Cross-process lock preventing concurrent solves of the same FITS path.
     """
-    if not image_path:
+    image_path_obj = _expand_path(image_path)
+    if image_path_obj is None:
         yield
         return
-    os.makedirs(_PER_FILE_LOCK_DIR, exist_ok=True)
-    digest = hashlib.sha1(os.path.abspath(image_path).encode("utf-8", "ignore")).hexdigest()[:16]
-    lock_path = os.path.join(_PER_FILE_LOCK_DIR, f"{digest}.lock")
+    try:
+        digest_source = str(image_path_obj.resolve(strict=False))
+    except Exception:
+        digest_source = str(image_path_obj)
+    digest = hashlib.sha1(digest_source.encode("utf-8", "ignore")).hexdigest()[:16]
+    lock_path = _PER_FILE_LOCK_DIR / f"{digest}.lock"
     handle = None
     acquired = False
     wait_notified = False
     start = time.monotonic()
-    label = image_label or os.path.basename(image_path) or image_path
+    label = image_label or image_path_obj.name or str(image_path_obj)
     try:
-        handle = open(lock_path, "a+b")
+        handle = lock_path.open("a+b")
         try:
-            if os.path.getsize(lock_path) == 0:
+            if safe_path_getsize(lock_path) == 0:
                 handle.write(b"0")
                 handle.flush()
         except Exception:
@@ -759,10 +800,22 @@ def _calculate_pixel_scale_from_header(header: fits.Header, progress_callback: c
 
 def _parse_wcs_file_content_za(wcs_file_path, image_shape_hw, progress_callback=None):
     # ... (corps de la fonction inchangé, il semble correct)
-    filename_log = os.path.basename(wcs_file_path)
-    if progress_callback: progress_callback(f"  ASTAP WCS Parse: Tentative parsing '{filename_log}' pour shape {image_shape_hw}", None, "DEBUG_DETAIL")
-    if not (os.path.exists(wcs_file_path) and os.path.getsize(wcs_file_path) > 0):
-        if progress_callback: progress_callback(f"    ASTAP WCS Parse ERREUR: Fichier WCS '{filename_log}' non trouvé ou vide.", None, "WARN")
+    path_obj = _expand_path(wcs_file_path, expanduser=False)
+    filename_log = _path_display_name(path_obj or wcs_file_path)
+    open_target = path_obj or wcs_file_path
+    if progress_callback:
+        progress_callback(
+            f"  ASTAP WCS Parse: Tentative parsing '{filename_log}' pour shape {image_shape_hw}",
+            None,
+            "DEBUG_DETAIL",
+        )
+    if not (safe_path_exists(open_target) and safe_path_getsize(open_target) > 0):
+        if progress_callback:
+            progress_callback(
+                f"    ASTAP WCS Parse ERREUR: Fichier WCS '{filename_log}' non trouvé ou vide.",
+                None,
+                "WARN",
+            )
         return None
     if not ASTROPY_AVAILABLE_ASTROMETRY:
         if progress_callback: progress_callback("    ASTAP WCS Parse ERREUR: Astropy non disponible pour parser WCS.", None, "ERROR")
@@ -772,7 +825,7 @@ def _parse_wcs_file_content_za(wcs_file_path, image_shape_hw, progress_callback=
         # FITS CONTINUE cards (not attached to string values) that astropy.io.fits
         # refuses to serialize. Passing the raw header text to AstropyWCS avoids
         # FITS Card verification. If it still fails, strip CONTINUE lines as fallback.
-        with open(wcs_file_path, 'r', errors='replace') as f:
+        with open(open_target, 'r', errors='replace') as f:
             wcs_text_raw = f.read()
         wcs_text_norm = wcs_text_raw.replace('\r\n', '\n').replace('\r', '\n')
         with warnings.catch_warnings():
@@ -811,14 +864,16 @@ def _parse_wcs_file_content_za_v2(wcs_file_path, image_shape_hw, progress_callba
     - Tente WCS via chaine brute puis via fits.Header.
     - Force pixel_shape si possible et sanitise image_shape_hw.
     """
-    filename_log = os.path.basename(wcs_file_path)
+    path_obj = _expand_path(wcs_file_path, expanduser=False)
+    filename_log = _path_display_name(path_obj or wcs_file_path)
+    open_target = path_obj or wcs_file_path
     if progress_callback:
         progress_callback(
             f"  ASTAP WCS Parse: Tentative parsing (v2) '{filename_log}' pour shape {image_shape_hw}",
             None,
             "DEBUG_DETAIL",
         )
-    if not (os.path.exists(wcs_file_path) and os.path.getsize(wcs_file_path) > 0):
+    if not (safe_path_exists(open_target) and safe_path_getsize(open_target) > 0):
         if progress_callback:
             progress_callback(
                 f"    ASTAP WCS Parse ERREUR: Fichier WCS '{filename_log}' non trouve ou vide.",
@@ -846,7 +901,7 @@ def _parse_wcs_file_content_za_v2(wcs_file_path, image_shape_hw, progress_callba
         sane_shape_hw = None
 
     try:
-        with open(wcs_file_path, 'rb') as f:
+        with open(open_target, 'rb') as f:
             raw_bytes = f.read()
         if raw_bytes.startswith(b"\xEF\xBB\xBF"):
             raw_bytes = raw_bytes[3:]
@@ -1094,50 +1149,75 @@ def solve_with_astap(
         logger.error(msg)
         raise RuntimeError(msg)
 
-    if image_fits_path:
-        image_fits_path = os.path.abspath(image_fits_path)
-    if astap_exe_path:
-        astap_exe_path = os.path.abspath(astap_exe_path)
-    if astap_data_dir:
-        astap_data_dir = os.path.abspath(astap_data_dir)
+    image_fits_path = _expand_path(image_fits_path)
+    astap_exe_path = _expand_path(astap_exe_path)
+    astap_data_dir = _expand_path(astap_data_dir)
 
-    img_basename_log = os.path.basename(image_fits_path)
-    if progress_callback: progress_callback(f"ASTAP Solve: Début pour '{img_basename_log}'", None, "INFO_DETAIL")
+    img_basename_log = _path_display_name(image_fits_path)
+    if progress_callback:
+        progress_callback(f"ASTAP Solve: Début pour '{img_basename_log}'", None, "INFO_DETAIL")
     logger.debug(f"ASTAP Solve params (entrée fonction): image='{img_basename_log}', radius={search_radius_deg}, "
                  f"downsample={downsample_factor}, sensitivity={sensitivity}")
 
-    if not (astap_exe_path and os.path.isfile(astap_exe_path)):
-        if progress_callback: progress_callback(f"ASTAP Solve ERREUR: Chemin ASTAP exe invalide: '{astap_exe_path}'.", None, "ERROR")
+    if not (astap_exe_path and astap_exe_path.is_file()):
+        if progress_callback:
+            progress_callback(
+                f"ASTAP Solve ERREUR: Chemin ASTAP exe invalide: '{astap_exe_path}'.",
+                None,
+                "ERROR",
+            )
         return None
-    if not (astap_data_dir and os.path.isdir(astap_data_dir)):
-        if progress_callback: progress_callback(f"ASTAP Solve AVERT: Chemin ASTAP data non spécifié ou invalide: '{astap_data_dir}'. ASTAP pourrait ne pas trouver ses bases.", None, "WARN")
-    if not (image_fits_path and os.path.isfile(image_fits_path)):
-        if progress_callback: progress_callback(f"ASTAP Solve ERREUR: Chemin image FITS invalide: '{image_fits_path}'.", None, "ERROR")
+    if not (image_fits_path and image_fits_path.is_file()):
+        if progress_callback:
+            progress_callback(
+                f"ASTAP Solve ERREUR: Chemin image FITS invalide: '{image_fits_path}'.",
+                None,
+                "ERROR",
+            )
         return None
+    if not (astap_data_dir and astap_data_dir.is_dir()):
+        if progress_callback:
+            progress_callback(
+                f"ASTAP Solve AVERT: Chemin ASTAP data non spécifié ou invalide: '{astap_data_dir}'. ASTAP pourrait ne pas trouver ses bases.",
+                None,
+                "WARN",
+            )
     if original_fits_header is None: # Should not happen if called from worker
         if progress_callback: progress_callback("ASTAP Solve ERREUR: Header FITS original non fourni.", None, "ERROR")
         return None
 
-    current_image_dir = os.path.dirname(image_fits_path)
-    base_image_name_no_ext = os.path.splitext(os.path.basename(image_fits_path))[0]
-    expected_wcs_file_path = os.path.join(current_image_dir, base_image_name_no_ext + ".wcs")
-    expected_ini_file_path = os.path.join(current_image_dir, base_image_name_no_ext + ".ini")
-    astap_log_file_path = os.path.join(current_image_dir, base_image_name_no_ext + ".log")
+    current_image_dir = image_fits_path.parent
+    base_image_name_no_ext = image_fits_path.stem
+    expected_wcs_file_path = current_image_dir / f"{base_image_name_no_ext}.wcs"
+    expected_ini_file_path = current_image_dir / f"{base_image_name_no_ext}.ini"
+    astap_log_file_path = current_image_dir / f"{base_image_name_no_ext}.log"
     files_to_cleanup_by_astap = [expected_wcs_file_path, expected_ini_file_path]
 
     for f_to_clean in files_to_cleanup_by_astap:
-        if os.path.exists(f_to_clean):
-            try: os.remove(f_to_clean)
-            except Exception as e_del_pre:
-                if progress_callback: progress_callback(f"  ASTAP Solve AVERT: Échec nettoyage pré-ASTAP '{os.path.basename(f_to_clean)}': {e_del_pre}", None, "WARN")
-    if os.path.exists(astap_log_file_path):
-        try: os.remove(astap_log_file_path)
-        except Exception as e_del_log_pre:
-            if progress_callback: progress_callback(f"  ASTAP Solve AVERT: Échec nettoyage pré-ASTAP log '{os.path.basename(astap_log_file_path)}': {e_del_log_pre}", None, "WARN")
+        try:
+            if f_to_clean.exists():
+                f_to_clean.unlink()
+        except Exception as e_del_pre:
+            if progress_callback:
+                progress_callback(
+                    f"  ASTAP Solve AVERT: Échec nettoyage pré-ASTAP '{_path_display_name(f_to_clean)}': {e_del_pre}",
+                    None,
+                    "WARN",
+                )
+    try:
+        if astap_log_file_path.exists():
+            astap_log_file_path.unlink()
+    except Exception as e_del_log_pre:
+        if progress_callback:
+            progress_callback(
+                f"  ASTAP Solve AVERT: Échec nettoyage pré-ASTAP log '{_path_display_name(astap_log_file_path)}': {e_del_log_pre}",
+                None,
+                "WARN",
+            )
 
-    cmd_list_astap = [astap_exe_path, "-f", image_fits_path, "-log", "-wcs"]
-    if astap_data_dir and os.path.isdir(astap_data_dir):
-        cmd_list_astap.extend(["-d", astap_data_dir])
+    cmd_list_astap = [str(astap_exe_path), "-f", str(image_fits_path), "-log", "-wcs"]
+    if astap_data_dir and astap_data_dir.is_dir():
+        cmd_list_astap.extend(["-d", str(astap_data_dir)])
 
     # Rétablit l'indication d'échelle ou FOV pour aider ASTAP
     calculated_px_scale = _calculate_pixel_scale_from_header(original_fits_header, progress_callback)
@@ -1391,8 +1471,8 @@ def solve_with_astap(
         _log_memory_usage(progress_callback, "Après GC post-ASTAP")
 
         if rc_astap == 0:
-            if os.path.exists(expected_wcs_file_path) and os.path.getsize(expected_wcs_file_path) > 0:
-                if progress_callback: progress_callback(f"  ASTAP Solve: Résolution OK (code 0). Fichier WCS '{os.path.basename(expected_wcs_file_path)}' trouvé.", None, "INFO_DETAIL")
+            if safe_path_exists(expected_wcs_file_path) and safe_path_getsize(expected_wcs_file_path) > 0:
+                if progress_callback: progress_callback(f"  ASTAP Solve: Résolution OK (code 0). Fichier WCS '{_path_display_name(expected_wcs_file_path)}' trouvé.", None, "INFO_DETAIL")
                 img_height = original_fits_header.get('NAXIS2', 0)
                 img_width = original_fits_header.get('NAXIS1', 0)
                 if img_height == 0 or img_width == 0:
@@ -1423,7 +1503,7 @@ def solve_with_astap(
                     if progress_callback: progress_callback(f"  ASTAP Solve ERREUR: WCS parsé non valide ou non céleste pour '{img_basename_log}'.", None, "ERROR")
                     wcs_solved_obj = None
             else:
-                if progress_callback: progress_callback(f"  ASTAP Solve ERREUR: Code 0 mais fichier .wcs manquant/vide ('{os.path.basename(expected_wcs_file_path)}').", None, "ERROR")
+                if progress_callback: progress_callback(f"  ASTAP Solve ERREUR: Code 0 mais fichier .wcs manquant/vide ('{_path_display_name(expected_wcs_file_path)}').", None, "ERROR")
         else:
             error_msg = f"ASTAP Solve Échec (code {rc_astap}) pour '{img_basename_log}'."
             if rc_astap == 1: error_msg += " (No solution found)."
@@ -1444,24 +1524,24 @@ def solve_with_astap(
     finally:
         if progress_callback: progress_callback(f"  ASTAP Solve: Nettoyage post-exécution (sauf log si échec) pour '{img_basename_log}'...", None, "DEBUG_DETAIL")
         for f_clean_post in files_to_cleanup_by_astap: # .wcs, .ini
-            if os.path.exists(f_clean_post):
+            if safe_path_exists(f_clean_post):
                 try:
                     if f_clean_post == expected_wcs_file_path and astap_success and not update_original_header_in_place:
-                        if progress_callback: progress_callback(f"    ASTAP Clean: Conservation du .wcs: {os.path.basename(f_clean_post)} (succès, pas de MàJ header en place)", None, "DEBUG_DETAIL")
+                        if progress_callback: progress_callback(f"    ASTAP Clean: Conservation du .wcs: {_path_display_name(f_clean_post)} (succès, pas de MàJ header en place)", None, "DEBUG_DETAIL")
                         continue
                     os.remove(f_clean_post)
-                    if progress_callback: progress_callback(f"    ASTAP Clean: Fichier '{os.path.basename(f_clean_post)}' supprimé.", None, "DEBUG_DETAIL")
+                    if progress_callback: progress_callback(f"    ASTAP Clean: Fichier '{_path_display_name(f_clean_post)}' supprimé.", None, "DEBUG_DETAIL")
                 except Exception as e_del_post:
-                    if progress_callback: progress_callback(f"    ASTAP Clean AVERT: Échec nettoyage '{os.path.basename(f_clean_post)}': {e_del_post}", None, "WARN")
+                    if progress_callback: progress_callback(f"    ASTAP Clean AVERT: Échec nettoyage '{_path_display_name(f_clean_post)}': {e_del_post}", None, "WARN")
 
-        if astap_success and os.path.exists(astap_log_file_path):
+        if astap_success and safe_path_exists(astap_log_file_path):
             try:
                 os.remove(astap_log_file_path)
-                if progress_callback: progress_callback(f"    ASTAP Clean: Fichier log ASTAP '{os.path.basename(astap_log_file_path)}' supprimé (succès).", None, "DEBUG_DETAIL")
+                if progress_callback: progress_callback(f"    ASTAP Clean: Fichier log ASTAP '{_path_display_name(astap_log_file_path)}' supprimé (succès).", None, "DEBUG_DETAIL")
             except Exception as e_del_log_succ:
-                if progress_callback: progress_callback(f"    ASTAP Clean AVERT: Échec nettoyage log ASTAP (succès) '{os.path.basename(astap_log_file_path)}': {e_del_log_succ}", None, "WARN")
-        elif not astap_success and os.path.exists(astap_log_file_path):
-             if progress_callback: progress_callback(f"    ASTAP Clean: CONSERVATION du log ASTAP '{os.path.basename(astap_log_file_path)}' (échec solve).", None, "INFO_DETAIL")
+                if progress_callback: progress_callback(f"    ASTAP Clean AVERT: Échec nettoyage log ASTAP (succès) '{_path_display_name(astap_log_file_path)}': {e_del_log_succ}", None, "WARN")
+        elif not astap_success and safe_path_exists(astap_log_file_path):
+             if progress_callback: progress_callback(f"    ASTAP Clean: CONSERVATION du log ASTAP '{_path_display_name(astap_log_file_path)}' (échec solve).", None, "INFO_DETAIL")
 
         gc.collect()
 
@@ -1493,25 +1573,28 @@ def solve_with_ansvr(
             _pcb("Ansvr solve unavailable (missing deps).", "ERROR")
         return None
 
-    if not (image_fits_path and os.path.isfile(image_fits_path) and ansvr_config_path):
+    image_path = _expand_path(image_fits_path)
+    ansvr_config = _expand_path(ansvr_config_path)
+
+    if not (image_path and image_path.is_file() and ansvr_config and ansvr_config.exists()):
         if _pcb:
             _pcb("Ansvr solve input invalid or path missing.", "ERROR")
         return None
 
-    tmp_dir = tempfile.mkdtemp(prefix="ansvr_")
-    output_fits = os.path.join(tmp_dir, "solution.new")
+    tmp_dir = Path(tempfile.mkdtemp(prefix="ansvr_"))
+    output_fits = tmp_dir / "solution.new"
 
     cmd = [
         "solve-field",
         "--no-plots",
         "--overwrite",
         "--config",
-        ansvr_config_path,
+        str(ansvr_config),
         "--dir",
-        tmp_dir,
+        str(tmp_dir),
         "--new-fits",
-        output_fits,
-        image_fits_path,
+        str(output_fits),
+        str(image_path),
     ]
 
     if original_fits_header:
@@ -1537,7 +1620,7 @@ def solve_with_ansvr(
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return None
 
-    if result.returncode != 0 or not os.path.exists(output_fits):
+    if result.returncode != 0 or not safe_path_exists(output_fits):
         if _pcb:
             _pcb("Ansvr: solve-field failed", "WARN")
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -1737,9 +1820,10 @@ def solve_with_astrometry_net(
 
     if not api_key:
         api_key = os.environ.get("ASTROMETRY_API_KEY", "")
-    if not os.path.isfile(image_fits_path) or not api_key:
+    image_path = _expand_path(image_fits_path)
+    if not (image_path and image_path.is_file()) or not api_key:
         if _pcb:
-            path_ok = os.path.isfile(image_fits_path)
+            path_ok = bool(image_path and image_path.is_file())
             key_len = len(api_key) if isinstance(api_key, str) else 0
 
             preview = (
@@ -1753,7 +1837,7 @@ def solve_with_astrometry_net(
             )
         return None
 
-    img_basename_log = os.path.basename(image_fits_path)
+    img_basename_log = _path_display_name(image_path)
     if _pcb:
         _pcb(f"WebANET: Début solving pour '{img_basename_log}'", "INFO_DETAIL")
 
@@ -1773,7 +1857,7 @@ def solve_with_astrometry_net(
     temp_path = None
     wcs_header = None
     try:
-        with fits.open(image_fits_path, memmap=False) as hdul:
+        with fits.open(str(image_path), memmap=False) as hdul:
             data = hdul[0].data
 
         if data is None:
@@ -1827,9 +1911,9 @@ def solve_with_astrometry_net(
                 header_tmp[key] = original_fits_header[key]
 
         with tempfile.NamedTemporaryFile(suffix=".fits", delete=False, mode="wb") as tf:
-            temp_path = tf.name
+            temp_path = Path(tf.name)
         fits.writeto(
-            temp_path,
+            str(temp_path),
             data_int16,
             header=header_tmp,
             overwrite=True,
@@ -1837,7 +1921,7 @@ def solve_with_astrometry_net(
         )
 
         if header_tmp.get("BITPIX") == 16:
-            with fits.open(temp_path, mode="update", memmap=False) as hdul_fix:
+            with fits.open(str(temp_path), mode="update", memmap=False) as hdul_fix:
                 hd0 = hdul_fix[0]
                 hd0.header["BSCALE"] = 1
                 hd0.header["BZERO"] = 32768
@@ -1869,7 +1953,7 @@ def solve_with_astrometry_net(
             _pcb("WebANET: Soumission du job...", "INFO")
 
             _pcb("WebANET: Contacting nova.astrometry.net", "DEBUG")
-        wcs_header = ast.solve_from_image(temp_path, **solve_args)
+        wcs_header = ast.solve_from_image(str(temp_path), **solve_args)
 
         if _pcb:
             if wcs_header:
@@ -1887,9 +1971,9 @@ def solve_with_astrometry_net(
         logger.error("Astrometry.net solve exception", exc_info=True)
         wcs_header = None
     finally:
-        if temp_path and os.path.exists(temp_path):
+        if temp_path:
             try:
-                os.remove(temp_path)
+                temp_path.unlink(missing_ok=True)
             except Exception:
                 pass
         if original_timeout is not None:

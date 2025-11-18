@@ -46,6 +46,32 @@
 import json
 import os
 import traceback # Gardé pour un log d'erreur plus détaillé si besoin (mais pas utilisé activement)
+from pathlib import Path
+
+try:
+    from core.path_helpers import safe_path_getsize
+except Exception:  # pragma: no cover - localization module may be reused standalone
+    def safe_path_getsize(path, *, expanduser: bool = True, default: int = 0):
+        """Fallback size helper when core utilities are unavailable."""
+
+        try:
+            path_obj = Path(path)
+        except Exception:
+            return default
+        if expanduser:
+            try:
+                path_obj = path_obj.expanduser()
+            except Exception:
+                pass
+        try:
+            return path_obj.stat().st_size
+        except Exception:
+            return default
+
+try:
+    from zemosaic_utils import get_app_base_dir  # type: ignore
+except Exception:  # pragma: no cover - standalone usage
+    get_app_base_dir = None
 
 class ZeMosaicLocalization:
     def __init__(self, language_code='en'):
@@ -57,19 +83,29 @@ class ZeMosaicLocalization:
             language_code (str): Code de la langue à charger (ex: 'en', 'fr').
         """
         # print(f"DEBUG (Localization __init__): Initialisation de ZeMosaicLocalization...")
-        try:
-            current_module_path = os.path.abspath(__file__)
-            self.locales_dir_abs_path = os.path.dirname(current_module_path)
-            # print(f"DEBUG (Localization __init__): Dossier des locales déterminé: {self.locales_dir_abs_path}")
-        except NameError:
-            self.locales_dir_abs_path = os.getcwd()
-            print(f"AVERT (Localization __init__): __file__ non défini. Dossier des locales basé sur CWD: {self.locales_dir_abs_path}")
+        base_path: Path | None = None
+        if callable(get_app_base_dir):
+            try:
+                base_path = get_app_base_dir() / "locales"
+            except Exception:
+                base_path = None
+        if base_path is None:
+            try:
+                base_path = Path(__file__).resolve().parent
+            except NameError:
+                base_path = Path.cwd()
+                print(
+                    "AVERT (Localization __init__): __file__ non défini. "
+                    f"Dossier des locales basé sur CWD: {base_path}"
+                )
+        self.locales_dir_path = base_path
+        self.locales_dir_abs_path = str(base_path)
 
         self.language_code = None
         self.translations = {}
         self.fallback_translations = {}
 
-        if not os.path.isdir(self.locales_dir_abs_path):
+        if not self.locales_dir_path.is_dir():
              print(f"ERREUR CRITIQUE (Localization __init__): Dossier des locales '{self.locales_dir_abs_path}' non trouvé ou n'est pas un dossier!")
         else:
             # print("DEBUG (Localization __init__): Tentative de chargement du fallback anglais ('en').")
@@ -85,13 +121,13 @@ class ZeMosaicLocalization:
         # target_dict_name = "fallback_translations" if is_fallback else "translations"
         # print(f"DEBUG (Localization _load_language_file): Début chargement pour '{lang_code_to_load}' (is_fallback={is_fallback}) -> vers self.{target_dict_name}")
         
-        file_path_to_load = os.path.join(self.locales_dir_abs_path, f"{lang_code_to_load}.json")
+        file_path_to_load = self.locales_dir_path / f"{lang_code_to_load}.json"
         # print(f"  Chemin du fichier JSON: {file_path_to_load}")
         
         temp_translations_loaded = {}
         loaded_successfully = False
 
-        if not os.path.isfile(file_path_to_load):
+        if not file_path_to_load.is_file():
             print(f"AVERT (Localization _load_language_file): Fichier de langue '{file_path_to_load}' NON TROUVÉ.")
             if is_fallback and lang_code_to_load == 'en':
                  print(f"  -> ERREUR CRITIQUE: Fallback anglais ('en.json') non trouvé. La traduction sera très limitée.")
@@ -99,7 +135,7 @@ class ZeMosaicLocalization:
             else: self.translations = {}
             return False
 
-        if os.path.getsize(file_path_to_load) == 0:
+        if safe_path_getsize(file_path_to_load) == 0:
             print(f"AVERT (Localization _load_language_file): Fichier de langue '{file_path_to_load}' est VIDE.")
             if is_fallback: self.fallback_translations = {}
             else: self.translations = {}
@@ -107,7 +143,7 @@ class ZeMosaicLocalization:
 
         try:
             # Accept both UTF-8 with and without BOM to avoid JSON decode errors
-            with open(file_path_to_load, 'r', encoding='utf-8-sig') as f:
+            with file_path_to_load.open('r', encoding='utf-8-sig') as f:
                 temp_translations_loaded = json.load(f)
             print(f"INFO (Localization _load_language_file): Traductions pour '{lang_code_to_load}' chargées ({len(temp_translations_loaded)} clés) depuis {file_path_to_load}")
             loaded_successfully = True

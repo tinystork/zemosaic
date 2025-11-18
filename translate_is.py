@@ -4,6 +4,26 @@ import time
 from pathlib import Path
 from deep_translator import GoogleTranslator
 
+try:
+    from zemosaic_utils import get_app_base_dir  # type: ignore
+except Exception:  # pragma: no cover - standalone usage
+    get_app_base_dir = None
+
+
+def _resolve_locales_dir() -> Path:
+    """Return the locales directory regardless of the current working directory."""
+
+    if callable(get_app_base_dir):
+        try:
+            base = Path(get_app_base_dir())
+            return base / "locales"
+        except Exception:
+            pass
+    try:
+        return Path(__file__).resolve().parent / "locales"
+    except Exception:
+        return Path.cwd() / "locales"
+
 def mask_placeholders(text):
     placeholders = []
     def repl(match):
@@ -30,7 +50,7 @@ def translate_chunk(texts, retries=3, delay=1.2):
 
 placeholder_pattern = re.compile(r"\{[^{}]+\}")
 translator = GoogleTranslator(source='en', target='is')
-root = Path('locales')
+root = _resolve_locales_dir()
 en_path = root / 'en.json'
 is_path = root / 'is.json'
 

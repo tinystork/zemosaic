@@ -51,9 +51,13 @@ import json
 import logging
 import re
 import time
+import sys
+import platform
+import tempfile
+from functools import lru_cache
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Iterable, Optional, Sequence
+from typing import Any, Callable, Iterable, Optional, Sequence
 import numpy as np
 # L'import de astropy.io.fits est géré ci-dessous pour définir le flag
 import cv2
@@ -86,6 +90,65 @@ _PREVIEW_WCS_LINEARIZED_LOGGED = False
 
 
 EXCLUDED_DIRS = frozenset({"unaligned_by_zemosaic"})
+
+
+@lru_cache(maxsize=1)
+def get_app_base_dir() -> Path:
+    """Return the base directory that contains ZeMosaic resources."""
+
+    if getattr(sys, "frozen", False):
+        # PyInstaller-style bundles
+        base = getattr(sys, "_MEIPASS", None)
+        if base:
+            return Path(base)
+        try:
+            return Path(sys.executable).resolve().parent
+        except Exception:
+            return Path.cwd()
+    try:
+        return Path(__file__).resolve().parent
+    except Exception:
+        return Path.cwd()
+
+
+@lru_cache(maxsize=1)
+def get_user_config_dir() -> Path:
+    """Return the per-user configuration directory for ZeMosaic."""
+
+    home = Path.home()
+    system = platform.system().lower()
+    if system == "windows":
+        base = os.environ.get("APPDATA")
+        base_path = Path(base) if base else home / "AppData" / "Roaming"
+    elif system == "darwin":
+        base_path = home / "Library" / "Application Support"
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME")
+        base_path = Path(base) if base else home / ".config"
+    return base_path / "ZeMosaic"
+
+
+def ensure_user_config_dir() -> Path:
+    """Create the per-user configuration directory if needed."""
+
+    config_dir = get_user_config_dir()
+    try:
+        config_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return config_dir
+
+
+@lru_cache(maxsize=1)
+def get_runtime_temp_dir() -> Path:
+    """Return a shared temporary directory for ZeMosaic runtime artifacts."""
+
+    base = Path(tempfile.gettempdir()) / "zemosaic_runtime"
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return Path(tempfile.gettempdir())
+    return base
 
 
 def is_path_excluded(path: Path | str, excluded_dirs: Iterable[str] | None = None) -> bool:
@@ -568,13 +631,18 @@ def _build_file_records(entries: Sequence[dict[str, Any]]) -> list[dict[str, Any
         path = entry.get("path")
         if not path:
             continue
-        norm = os.path.abspath(str(path))
-        if norm in seen:
-            continue
-        seen.add(norm)
-        record: dict[str, Any] = {"path": norm}
+        path_obj = Path(str(path)).expanduser()
         try:
-            stat = os.stat(norm)
+            norm_path = path_obj.resolve(strict=False)
+        except Exception:
+            norm_path = path_obj
+        norm_str = str(norm_path)
+        if norm_str in seen:
+            continue
+        seen.add(norm_str)
+        record: dict[str, Any] = {"path": norm_str}
+        try:
+            stat = norm_path.stat()
             record["mtime"] = float(stat.st_mtime)
             record["size"] = int(stat.st_size)
         except Exception:
@@ -809,17 +877,24 @@ def write_global_wcs_files(
     if header is None:
         raise ValueError("Descriptor missing FITS header data")
 
-    os.makedirs(os.path.dirname(fits_path) or ".", exist_ok=True)
-    os.makedirs(os.path.dirname(json_path) or ".", exist_ok=True)
+    fits_path_obj = Path(fits_path).expanduser()
+    json_path_obj = Path(json_path).expanduser()
+    fits_path_obj.parent.mkdir(parents=True, exist_ok=True)
+    json_path_obj.parent.mkdir(parents=True, exist_ok=True)
     primary_hdu = fits_module_for_utils.PrimaryHDU(header=header)
     hdul = fits_module_for_utils.HDUList([primary_hdu])
-    hdul.writeto(fits_path, overwrite=True, output_verify="silentfix")
+    hdul.writeto(str(fits_path_obj), overwrite=True, output_verify="silentfix")
     meta_payload = _descriptor_to_json_payload(descriptor)
-    meta_payload["fits_path"] = fits_path
-    meta_payload["json_path"] = json_path
-    with open(json_path, "w", encoding="utf-8") as handle:
+    meta_payload["fits_path"] = str(fits_path_obj)
+    meta_payload["json_path"] = str(json_path_obj)
+    with json_path_obj.open("w", encoding="utf-8") as handle:
         json.dump(meta_payload, handle, indent=2, sort_keys=True)
-    log.info("Global WCS artifacts written: %s (%dx%d)", fits_path, descriptor.get("width"), descriptor.get("height"))
+    log.info(
+        "Global WCS artifacts written: %s (%dx%d)",
+        fits_path_obj,
+        descriptor.get("width"),
+        descriptor.get("height"),
+    )
 
 
 def load_global_wcs_descriptor(
@@ -831,12 +906,13 @@ def load_global_wcs_descriptor(
     """Load an existing global WCS header + optional JSON metadata."""
 
     log = logger_override or logger
-    if not fits_path or not os.path.isfile(fits_path):
+    fits_path_obj = Path(fits_path).expanduser()
+    if not fits_path or not fits_path_obj.is_file():
         return None
     if not ASTROPY_WCS_AVAILABLE_IN_UTILS or AstropyWCS is None or fits_module_for_utils is None:
         raise RuntimeError("Astropy WCS/FITS is required to read the global mosaic header")
 
-    header = fits_module_for_utils.getheader(fits_path, 0)
+    header = fits_module_for_utils.getheader(str(fits_path_obj), 0)
     # Build a WCS object from the header even if NAXIS1/2 are missing.
     wcs_obj = AstropyWCS(header, naxis=2)
     # Some FITS writers reset NAXIS to 0 if no data array is attached. Our
@@ -846,13 +922,13 @@ def load_global_wcs_descriptor(
     height = int(header.get("NAXIS2", 0) or 0)
     px_scale = _compute_pixel_scale_for_wcs(wcs_obj) or 0.0
     meta_payload = None
-    json_candidate = json_path or Path(fits_path).with_suffix(".json")
+    json_candidate_obj = Path(json_path).expanduser() if json_path else fits_path_obj.with_suffix(".json")
     try:
-        if json_candidate and os.path.isfile(json_candidate):
-            with open(json_candidate, "r", encoding="utf-8") as handle:
+        if json_candidate_obj and json_candidate_obj.is_file():
+            with json_candidate_obj.open("r", encoding="utf-8") as handle:
                 meta_payload = json.load(handle)
     except Exception as exc_json:
-        log.warning("Global WCS: failed to read JSON metadata (%s): %s", json_candidate, exc_json)
+        log.warning("Global WCS: failed to read JSON metadata (%s): %s", json_candidate_obj, exc_json)
         meta_payload = None
 
     # Fallback to JSON width/height if FITS header lacks them
@@ -874,8 +950,8 @@ def load_global_wcs_descriptor(
         "pixel_scale_as_per_px": px_scale * 3600.0 if px_scale else 0.0,
         "files": meta_payload.get("files") if isinstance(meta_payload, dict) else [],
         "nb_images": meta_payload.get("nb_images") if isinstance(meta_payload, dict) else None,
-        "json_path": str(json_candidate),
-        "fits_path": fits_path,
+        "json_path": str(json_candidate_obj),
+        "fits_path": str(fits_path_obj),
         "source": "existing",
         "metadata": meta_payload,
     }
@@ -890,6 +966,27 @@ def gpu_is_available() -> bool:
         return bool(cp.is_available())
     except Exception:
         return False
+
+
+_GPU_MEM_DEBUG = os.environ.get("ZEMOSAIC_GPU_MEM_DEBUG", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "debug",
+}
+
+
+def _normalize_gpu_safety_fraction(value: float | None) -> float:
+    """Clamp ``safety_fraction`` to a reasonable range."""
+
+    default = 0.75
+    if value is None:
+        return default
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return default
+    return float(min(0.9, max(0.1, numeric)))
 
 
 def ensure_cupy_pool_initialized(device_id: int | None = None) -> None:
@@ -951,15 +1048,76 @@ def gpu_memory_sufficient(estimated_bytes: int, safety_fraction: float = 0.75) -
 
     if not gpu_is_available() or estimated_bytes <= 0:
         return True
+    safety = _normalize_gpu_safety_fraction(safety_fraction)
     try:
         import cupy as cp  # type: ignore
         free_bytes, _ = cp.cuda.runtime.memGetInfo()
         # Leave some headroom so we do not hit the allocator limit immediately
-        threshold = int(max(0, free_bytes * safety_fraction))
-        return estimated_bytes <= threshold
-    except Exception:
+        threshold = int(max(0, free_bytes * safety))
+        allowed = estimated_bytes <= threshold
+        if _GPU_MEM_DEBUG and not allowed:
+            logger.debug(
+                "GPU memory guard: estimated=%d bytes, free=%d bytes, "
+                "allowed=%d bytes (safety=%.2f)",
+                int(estimated_bytes),
+                int(free_bytes),
+                int(threshold),
+                safety,
+            )
+        return allowed
+    except Exception as exc:
+        if _GPU_MEM_DEBUG:
+            logger.debug("GPU memory guard: memGetInfo failed (%s); allowing GPU.", exc)
         # If querying memory fails, err on the side of allowing execution
         return True
+
+
+def _get_gpu_allowed_bytes(safety_fraction: float = 0.75) -> int | None:
+    """Return the approximate safe allocation budget in bytes."""
+
+    if not gpu_is_available():
+        return None
+    try:
+        import cupy as cp  # type: ignore
+
+        free_bytes, _ = cp.cuda.runtime.memGetInfo()
+        safe_fraction = max(0.1, min(0.9, float(safety_fraction)))
+        return int(max(0, free_bytes * safe_fraction))
+    except Exception:
+        return None
+
+
+def _format_mebibytes(byte_count: int | None) -> str:
+    if not byte_count or byte_count <= 0:
+        return "n/a"
+    return f"{byte_count / (1024 ** 2):.1f}"
+
+
+def _estimate_tile_cache_bytes(data_list: Sequence[np.ndarray]) -> int:
+    total = 0
+    for tile in data_list:
+        arr = np.asarray(tile, dtype=np.float32)
+        total += arr.nbytes
+    # Each tile allocates an image and a mask on the GPU.
+    return total * 2
+
+
+def _log_gpu_event(
+    message_key: str,
+    level: str = "INFO",
+    progress_callback: Optional[Callable] = None,
+    **kwargs,
+) -> None:
+    """Emit a GPU-related log either via callback or the module logger."""
+
+    if progress_callback and callable(progress_callback):
+        try:
+            progress_callback(message_key, None, level, **kwargs)
+            return
+        except Exception as exc:
+            logger.warning("GPU log callback failed (%s); falling back to module logger.", exc)
+    lvl = getattr(logging, level.upper(), logging.INFO)
+    logger.log(lvl, "[%s] %s", message_key, kwargs if kwargs else "")
 
 
 def _force_cpu_intertile() -> bool:
@@ -2202,7 +2360,7 @@ def load_and_validate_fits(filepath,
                            normalize_to_float32=True, # Si True, normalise la sortie à [0,1]
                            attempt_fix_nonfinite=True,
                            progress_callback=None):
-    filename = os.path.basename(filepath)
+    filename = Path(filepath).name
 
     def _log_util(message, level="DEBUG_DETAIL"):
         if progress_callback and callable(progress_callback):
@@ -2617,7 +2775,7 @@ def detect_and_correct_hot_pixels(image, threshold=3.0, neighborhood_size=5,
         if save_mask_path:
             try:
                 np.save(save_mask_path, mask_accum.astype(np.uint8))
-                _log_util_hp(f"Masque HP sauvegardé vers {os.path.basename(save_mask_path)}", "DEBUG_DETAIL")
+                _log_util_hp(f"Masque HP sauvegardé vers {Path(save_mask_path).name}", "DEBUG_DETAIL")
             except Exception as e_save:
                 _log_util_hp(f"ERREUR sauvegarde masque HP: {e_save}", "WARN")
         del mask_accum
@@ -3165,7 +3323,7 @@ def save_fits_image(image_data: np.ndarray,
         if pcb and callable(pcb): pcb(full_message, None, level)
         else: print(full_message)
 
-    base_output_filename = os.path.basename(output_path)
+    base_output_filename = Path(output_path).name
     _log_util_save(f"Début sauvegarde FITS vers '{base_output_filename}'. SaveAsFloat={save_as_float}", "INFO")
 
     # Utiliser le fits_module_for_utils défini globalement dans ce module
@@ -3542,6 +3700,17 @@ def _kappa_sigma_clip_chunk(
 def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
     """CuPy-accelerated reprojection and coaddition for a single channel."""
 
+    progress_callback = kwargs.pop("progress_callback", None)
+    if not gpu_is_available():
+        _log_gpu_event(
+            "gpu_fallback_unavailable",
+            "WARN",
+            progress_callback,
+            helper="gpu_reproject",
+            reason="gpu_unavailable",
+        )
+        raise RuntimeError("gpu_unavailable")
+
     import cupy as cp  # type: ignore
     from cupyx.scipy.ndimage import map_coordinates  # type: ignore
 
@@ -3688,7 +3857,17 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
 
     def _gpu_mean_path() -> tuple[np.ndarray, np.ndarray]:
         accumulator_bytes = 2 * H * W * float32_bytes
-        if not gpu_memory_sufficient(int(accumulator_bytes * 2.5), safety_fraction=0.8):
+        memory_guard = int(accumulator_bytes * 2.5)
+        if not gpu_memory_sufficient(memory_guard, safety_fraction=0.8):
+            allowed = _get_gpu_allowed_bytes(0.8)
+            _log_gpu_event(
+                "gpu_fallback_insufficient_memory",
+                "WARN",
+                progress_callback,
+                helper="gpu_reproject",
+                estimated_mb=_format_mebibytes(memory_guard),
+                allowed_mb=_format_mebibytes(allowed),
+            )
             raise RuntimeError("Insufficient GPU memory for reprojection accumulators")
         mosaic_sum_gpu = cp.zeros((H, W), dtype=cp.float32)
         weight_sum_gpu = cp.zeros((H, W), dtype=cp.float32)
@@ -3730,13 +3909,38 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
             pass
         rows_per_chunk = max(1, min(H, max(1, max_chunk_bytes // chunk_bytes_per_row)))
         rows_per_chunk = max(1, min(rows_hint, rows_per_chunk))
-        tile_cache: list[tuple[cp.ndarray, cp.ndarray]] = []
-        try:
-            for idx in range(n_inputs):
-                tile_cache.append(_prepare_tile_arrays(idx))
-        except Exception as exc:
-            tile_cache.clear()
-            raise RuntimeError("Failed to upload tiles to GPU for chunked combine") from exc
+        if rows_per_chunk < rows_hint:
+            _log_gpu_event(
+                "gpu_chunking_rows",
+                "INFO_DETAIL",
+                progress_callback,
+                helper="gpu_reproject",
+                rows=int(rows_per_chunk),
+                height=int(H),
+            )
+
+        cache_tiles = True
+        estimated_cache_bytes = _estimate_tile_cache_bytes(data_list)
+        if estimated_cache_bytes > 0 and not gpu_memory_sufficient(
+            int(estimated_cache_bytes * 1.1), safety_fraction=0.75
+        ):
+            cache_tiles = False
+            _log_gpu_event(
+                "gpu_helper_stream_tiles",
+                "INFO_DETAIL",
+                progress_callback,
+                helper="gpu_reproject",
+            )
+
+        tile_cache: list[tuple[cp.ndarray, cp.ndarray]] | None = None
+        if cache_tiles:
+            tile_cache = []
+            try:
+                for idx in range(n_inputs):
+                    tile_cache.append(_prepare_tile_arrays(idx))
+            except Exception as exc:
+                tile_cache.clear()
+                raise RuntimeError("Failed to upload tiles to GPU for chunked combine") from exc
         mosaic_gpu = cp.zeros((H, W), dtype=cp.float32)
         coverage_gpu = cp.zeros((H, W), dtype=cp.float32)
         chunk_grid = _build_world_chunk_grid(rows_per_chunk)
@@ -3745,10 +3949,15 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
             chunk_cube = cp.full((n_inputs, chunk_h, W), cp.nan, dtype=cp.float32)
             chunk_weight = cp.zeros((n_inputs, chunk_h, W), dtype=cp.float32)
             for idx_tile, tile_wcs in enumerate(wcs_list):
-                img_gpu, mask_gpu = tile_cache[idx_tile]
+                if tile_cache is not None:
+                    img_gpu, mask_gpu = tile_cache[idx_tile]
+                else:
+                    img_gpu, mask_gpu = _prepare_tile_arrays(idx_tile)
                 sampled, sampled_mask = _sample_tile_chunk(img_gpu, mask_gpu, tile_wcs, ra_chunk, dec_chunk)
                 chunk_cube[idx_tile, :, :] = cp.where(sampled_mask > 0, sampled, cp.nan)
                 chunk_weight[idx_tile, :, :] = sampled_mask
+                if tile_cache is None:
+                    del img_gpu, mask_gpu
             if mode == "median":
                 chunk_result = cp.nanmedian(chunk_cube, axis=0)
                 chunk_cov = cp.nansum(chunk_weight, axis=0)
@@ -3769,27 +3978,48 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
 
     def _gpu_kappa_sigma_path() -> tuple[np.ndarray, np.ndarray]:
         rows_hint = int(kwargs.get("rows_per_chunk", 64))
-        tile_cache: list[tuple[cp.ndarray, cp.ndarray]] = []
-        try:
-            for idx in range(n_inputs):
-                tile_cache.append(_prepare_tile_arrays(idx))
-        except Exception as exc:
-            tile_cache.clear()
-            raise RuntimeError("Failed to upload tiles for kappa-sigma combine") from exc
+        cache_tiles = True
+        estimated_cache_bytes = _estimate_tile_cache_bytes(data_list)
+        if estimated_cache_bytes > 0 and not gpu_memory_sufficient(
+            int(estimated_cache_bytes * 1.1), safety_fraction=0.75
+        ):
+            cache_tiles = False
+            _log_gpu_event(
+                "gpu_helper_stream_tiles",
+                "INFO_DETAIL",
+                progress_callback,
+                helper="gpu_reproject",
+            )
+        tile_cache: list[tuple[cp.ndarray, cp.ndarray]] | None = None
+        if cache_tiles:
+            tile_cache = []
+            try:
+                for idx in range(n_inputs):
+                    tile_cache.append(_prepare_tile_arrays(idx))
+            except Exception as exc:
+                tile_cache.clear()
+                raise RuntimeError("Failed to upload tiles for kappa-sigma combine") from exc
         weight_grid = cp.zeros((H, W), dtype=cp.float32)
         count_grid = cp.zeros((H, W), dtype=cp.float32)
         sum_grid = cp.zeros((H, W), dtype=cp.float64)
         sumsq_grid = cp.zeros((H, W), dtype=cp.float64)
         rows_stats = max(32, min(rows_hint, H))
         chunk_stats = _build_world_chunk_grid(rows_stats)
+        def _tile_arrays(idx_tile: int) -> tuple[cp.ndarray, cp.ndarray]:
+            if tile_cache is not None:
+                return tile_cache[idx_tile]
+            return _prepare_tile_arrays(idx_tile)
+
         for idx_tile, tile_wcs in enumerate(wcs_list):
-            img_gpu, mask_gpu = tile_cache[idx_tile]
+            img_gpu, mask_gpu = _tile_arrays(idx_tile)
             for y0, y1, ra_chunk, dec_chunk in chunk_stats:
                 sampled, sampled_mask = _sample_tile_chunk(img_gpu, mask_gpu, tile_wcs, ra_chunk, dec_chunk)
                 sum_grid[y0:y1, :] += sampled.astype(cp.float64)
                 sumsq_grid[y0:y1, :] += (sampled ** 2).astype(cp.float64)
                 weight_grid[y0:y1, :] += sampled_mask
                 count_grid[y0:y1, :] += (sampled_mask > 0).astype(cp.float32)
+            if tile_cache is None:
+                del img_gpu, mask_gpu
         weight_safe = cp.maximum(weight_grid, cp.float32(1e-6))
         mean_map = sum_grid / weight_safe
         second_moment = sumsq_grid / weight_safe
@@ -3813,6 +4043,15 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
             pass
         rows_clip = max(1, min(H, max(1, max_chunk_bytes // chunk_bytes_per_row)))
         rows_clip = max(1, min(rows_hint, rows_clip))
+        if rows_clip < rows_hint:
+            _log_gpu_event(
+                "gpu_chunking_rows",
+                "INFO_DETAIL",
+                progress_callback,
+                helper="gpu_reproject",
+                rows=int(rows_clip),
+                height=int(H),
+            )
         chunk_clip = _build_world_chunk_grid(rows_clip)
         clipped_buffer = cp.zeros((H, W), dtype=cp.float32)
         clip_weight = cp.zeros((H, W), dtype=cp.float32)
@@ -3821,10 +4060,12 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
             chunk_cube = cp.full((n_inputs, chunk_h, W), cp.nan, dtype=cp.float32)
             chunk_weight = cp.zeros((n_inputs, chunk_h, W), dtype=cp.float32)
             for idx_tile, tile_wcs in enumerate(wcs_list):
-                img_gpu, mask_gpu = tile_cache[idx_tile]
+                img_gpu, mask_gpu = _tile_arrays(idx_tile)
                 sampled, sampled_mask = _sample_tile_chunk(img_gpu, mask_gpu, tile_wcs, ra_chunk, dec_chunk)
                 chunk_cube[idx_tile, :, :] = cp.where(sampled_mask > 0, sampled, cp.nan)
                 chunk_weight[idx_tile, :, :] = sampled_mask
+                if tile_cache is None:
+                    del img_gpu, mask_gpu
             mean_slice = mean_map[y0:y1, :]
             std_slice = std_map[y0:y1, :]
             count_slice = count_grid[y0:y1, :]
@@ -3868,6 +4109,7 @@ def _reproject_and_coadd_wrapper_impl(
     use_gpu: bool = False,
     cpu_func=None,
     allow_cpu_fallback: bool = True,
+    progress_callback=None,
     **kwargs,
 ):
     """Dispatch to GPU or CPU reproject+coadd.
@@ -3875,18 +4117,33 @@ def _reproject_and_coadd_wrapper_impl(
     - GPU path: uses ``gpu_reproject_and_coadd`` (CuPy). Falls back to CPU on any error.
     - CPU path: calls astropy-reproject's ``reproject_and_coadd``.
     """
-    if use_gpu and gpu_is_available():
-        try:
-            return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs)
-        except Exception as e:  # pragma: no cover - GPU failures
-            import logging
-            logging.getLogger(__name__).warning(
-                "GPU reprojection failed (%s)%s",
-                e,
-                "; falling back to CPU" if allow_cpu_fallback else "",
+    gpu_kwargs = dict(kwargs)
+    if progress_callback is not None:
+        gpu_kwargs["progress_callback"] = progress_callback
+    if use_gpu:
+        if not gpu_is_available():
+            _log_gpu_event(
+                "gpu_fallback_unavailable",
+                "WARN",
+                progress_callback,
+                helper="gpu_reproject",
+                reason="gpu_unavailable",
             )
             if not allow_cpu_fallback:
-                raise
+                raise RuntimeError("gpu_unavailable")
+        else:
+            try:
+                return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **gpu_kwargs)
+            except Exception as e:  # pragma: no cover - GPU failures
+                _log_gpu_event(
+                    "gpu_fallback_runtime_error",
+                    "WARN",
+                    progress_callback,
+                    helper="gpu_reproject",
+                    error=str(e),
+                )
+                if not allow_cpu_fallback:
+                    raise
     if cpu_func is None:
         cpu_func = cpu_reproject_and_coadd
     # Remove GPU-only extras before CPU call to avoid unexpected kwargs
@@ -3921,6 +4178,7 @@ def reproject_and_coadd_wrapper(
     use_gpu=False,
     cpu_func=None,
     allow_cpu_fallback: bool = True,
+    progress_callback=None,
     **kwargs,
 ):
     """Dispatch to CPU or GPU ``reproject_and_coadd`` depending on availability."""
@@ -3931,6 +4189,7 @@ def reproject_and_coadd_wrapper(
         use_gpu=use_gpu,
         cpu_func=cpu_func,
         allow_cpu_fallback=allow_cpu_fallback,
+        progress_callback=progress_callback,
         **kwargs,
     )
 
@@ -3943,10 +4202,16 @@ def _percentiles_gpu(arr2d: np.ndarray, p_low: float, p_high: float) -> tuple[fl
         return float(lo), float(hi)
     import cupy as cp  # type: ignore
     ensure_cupy_pool_initialized()
-    a = cp.asarray(arr2d)
-    lo = cp.percentile(a, p_low)
-    hi = cp.percentile(a, p_high)
-    return float(lo), float(hi)
+    arr_gpu = None
+    try:
+        arr_gpu = cp.asarray(arr2d)
+        lo = cp.percentile(arr_gpu, p_low)
+        hi = cp.percentile(arr_gpu, p_high)
+        return float(lo), float(hi)
+    finally:
+        if arr_gpu is not None:
+            del arr_gpu
+        free_cupy_memory_pools()
 
 
 def detect_and_correct_hot_pixels_gpu(image,

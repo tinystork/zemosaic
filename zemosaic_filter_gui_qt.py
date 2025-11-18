@@ -55,6 +55,7 @@ import datetime
 import logging
 import importlib.util
 import os
+from os import path as ospath
 from pathlib import Path
 import math
 import csv
@@ -65,6 +66,8 @@ from typing import Any, Callable, Iterable, Iterator, List, Sequence, Tuple
 import numpy as np
 
 import numpy as np
+
+from core.path_helpers import casefold_path
 
 
 _pyside_spec = importlib.util.find_spec("PySide6")
@@ -132,23 +135,68 @@ def _resolve_tristate_flag() -> Qt.ItemFlag:
 _QT_TRISTATE_FLAG = _resolve_tristate_flag()
 
 
+FITS_EXTENSIONS = {".fit", ".fits"}
+
+
+def _expand_to_path(value: Any) -> Optional[Path]:
+    """Expand environment variables and ``~`` in ``value`` and return a Path."""
+
+    if value is None:
+        return None
+    if isinstance(value, Path):
+        return value
+    try:
+        text = str(value).strip()
+    except Exception:
+        return None
+    if not text:
+        return None
+    try:
+        expanded = ospath.expandvars(ospath.expanduser(text))
+    except Exception:
+        expanded = text
+    try:
+        return Path(expanded)
+    except Exception:
+        return None
+
+
+def _path_display_name(path: Any, *, default: str = "") -> str:
+    """Return a filesystem-friendly display name."""
+
+    candidate = _expand_to_path(path)
+    if candidate:
+        name = candidate.name
+        return name or str(candidate)
+    return str(path or default or "<unknown>")
+
+
+def _path_is_file(value: Any) -> bool:
+    path = _expand_to_path(value)
+    return bool(path and path.is_file())
+
+
+def _path_is_dir(value: Any) -> bool:
+    path = _expand_to_path(value)
+    return bool(path and path.is_dir())
+
+
 def _load_zemosaic_qicon() -> QIcon | None:
     try:
-        base_path = os.path.dirname(os.path.abspath(__file__))
-        icon_dir = os.path.join(base_path, "icon")
+        icon_dir = get_app_base_dir() / "icon"
     except Exception:
         return None
 
     candidates = [
-        os.path.join(icon_dir, "zemosaic.ico"),
-        os.path.join(icon_dir, "zemosaic_64x64.png"),
-        os.path.join(icon_dir, "zemosaic_icon.png"),
+        icon_dir / "zemosaic.ico",
+        icon_dir / "zemosaic_64x64.png",
+        icon_dir / "zemosaic_icon.png",
     ]
 
     for path in candidates:
         try:
-            if os.path.exists(path):
-                return QIcon(path)
+            if path.is_file():
+                return QIcon(str(path))
         except Exception:
             continue
     return None
@@ -401,6 +449,9 @@ except Exception:  # pragma: no cover - optional dependency guard
 try:  # pragma: no cover - optional dependency guard
     from zemosaic_utils import (  # type: ignore
         EXCLUDED_DIRS,
+        get_app_base_dir,
+        get_user_config_dir,
+        ensure_user_config_dir,
         compute_global_wcs_descriptor,
         is_path_excluded,
         load_global_wcs_descriptor,
@@ -410,6 +461,14 @@ try:  # pragma: no cover - optional dependency guard
     )
 except Exception:  # pragma: no cover - optional dependency guard
     EXCLUDED_DIRS = frozenset({"unaligned_by_zemosaic"})  # type: ignore[assignment]
+    def get_app_base_dir() -> Path:  # type: ignore
+        return Path(__file__).resolve().parent
+    def get_user_config_dir() -> Path:  # type: ignore
+        return Path.home() / "ZeMosaic"
+    def ensure_user_config_dir() -> Path:  # type: ignore
+        path = get_user_config_dir()
+        path.mkdir(parents=True, exist_ok=True)
+        return path
     compute_global_wcs_descriptor = None  # type: ignore[assignment]
     is_path_excluded = None  # type: ignore[assignment]
     load_global_wcs_descriptor = None  # type: ignore[assignment]
@@ -630,7 +689,7 @@ def _iter_normalized_entries(
     if isinstance(initial_overrides, dict):
         candidate = initial_overrides.get("excluded_paths")
         if isinstance(candidate, (list, tuple, set)):
-            excluded_paths = [os.fspath(p) for p in candidate]
+            excluded_paths = tuple(casefold_path(p) for p in candidate)
 
     def _should_exclude(path: Path | str) -> bool:
         try:
@@ -639,16 +698,10 @@ def _iter_normalized_entries(
             path_obj = Path(str(path))
 
         # Honour explicit per-path exclusions from overrides first.
-        try:
-            norm = os.path.normcase(os.fspath(path_obj))
-        except Exception:
-            norm = os.path.normcase(str(path_obj))
+        norm = casefold_path(path_obj)
         for entry in excluded_paths:
-            try:
-                if norm == os.path.normcase(entry):
-                    return True
-            except Exception:
-                continue
+            if norm == entry:
+                return True
 
         # Then apply global directory-level exclusions for stream-scan parity.
         try:
@@ -701,7 +754,7 @@ def _iter_normalized_entries(
                             group_label = None
                         if group_label:
                             break
-        file_path = str(
+        file_path_raw = (
             obj.get("file_path")
             or obj.get("path")
             or obj.get("filepath")
@@ -712,6 +765,8 @@ def _iter_normalized_entries(
             or obj.get("src")
             or ""
         )
+        file_path_path = _expand_to_path(file_path_raw)
+        file_path = str(file_path_path) if file_path_path else str(file_path_raw or "")
         if not file_path and "header" in obj:
             try:
                 file_path = str(obj["header"].get("FILENAME", ""))
@@ -724,7 +779,7 @@ def _iter_normalized_entries(
                 break
         if not has_wcs and "wcs" in obj:
             has_wcs = obj["wcs"] is not None
-        display_name = file_path or instrument or "Item"
+        display_name = _path_display_name(file_path, default=instrument or "Item")
         include = not _should_exclude(file_path)
         ra_deg = None
         dec_deg = None
@@ -948,12 +1003,11 @@ def _write_header_to_fits_local(file_path: str, header_obj: Any) -> None:
 
     if fits is None or header_obj is None:
         return
-    if not isinstance(file_path, str) or not file_path:
-        return
-    if not os.path.isfile(file_path):
+    path_obj = _expand_to_path(file_path)
+    if not path_obj or not path_obj.is_file():
         return
     try:
-        with fits.open(file_path, mode="update", memmap=False) as hdul:  # type: ignore[call-arg]
+        with fits.open(str(path_obj), mode="update", memmap=False) as hdul:  # type: ignore[call-arg]
             hdul[0].header.update(header_obj)  # type: ignore[index]
             hdul.flush()
     except Exception as exc:  # pragma: no cover - defensive I/O guard
@@ -970,9 +1024,12 @@ def _persist_wcs_header_if_requested(path: str, header_obj: Any, write_inplace: 
         return
     if not path or header_obj is None:
         return
-    display_name = os.path.basename(path) or path
+    path_obj = _expand_to_path(path)
+    if not path_obj:
+        return
+    display_name = _path_display_name(path_obj)
     try:
-        _write_header_to_fits_local(path, header_obj)
+        _write_header_to_fits_local(str(path_obj), header_obj)
     except Exception as exc:  # pragma: no cover - defensive I/O guard
         try:
             logger.warning("Qt Filter: failed to persist WCS for '%s': %s", display_name, exc)
@@ -1156,7 +1213,7 @@ class _DirectoryScanWorker(QObject):
             write_inplace: bool,
             semaphore: threading.BoundedSemaphore | None,
         ) -> tuple[int, dict[str, Any]]:
-            display_name = os.path.basename(image_path) or image_path
+            display_name = _path_display_name(image_path)
             wcs_result = None
             timeout_val = config.get("timeout") or 180
             try:
@@ -1217,12 +1274,12 @@ class _DirectoryScanWorker(QObject):
                 inspect_message = self._localizer.get(
                     "filter.scan.inspecting",
                     "Inspecting {name}…",
-                    name=os.path.basename(path) if path else item.display_name,
+                    name=_path_display_name(path) if path else item.display_name,
                 )
                 self.progress_changed.emit(self._progress_percent(processed_count, total), inspect_message)
                 row_update: dict[str, Any] = {}
 
-                if not path or not os.path.isfile(path):
+                if not path or not _path_is_file(path):
                     row_update["error"] = self._localizer.get(
                         "filter.scan.missing",
                         "File missing or not accessible.",
@@ -1360,10 +1417,11 @@ class _DirectoryScanWorker(QObject):
             self._solver_settings.get("astap_data_dir"),
             self._overrides.get("astap_data_directory_path"),
         ]
-        exe_path = next((str(p) for p in exe_candidates if p), "")
-        data_dir = next((str(p) for p in data_candidates if p), "")
-        if not exe_path or not os.path.isfile(exe_path):
+        exe_path_obj = _expand_to_path(next((p for p in exe_candidates if p), None))
+        data_dir_obj = _expand_to_path(next((p for p in data_candidates if p), None))
+        if not (exe_path_obj and exe_path_obj.is_file()):
             return None
+        exe_path = str(exe_path_obj)
 
         radius = self._coerce_float(
             self._solver_settings.get("astap_search_radius_deg"),
@@ -1397,6 +1455,7 @@ class _DirectoryScanWorker(QObject):
                 set_astap_max_concurrent_instances(concurrency_value)
             except Exception:  # pragma: no cover - runtime guard
                 pass
+        data_dir = str(data_dir_obj) if data_dir_obj else ""
 
         return {
             "exe": exe_path,
@@ -1666,20 +1725,17 @@ class FilterQtDialog(QDialog):
         )
         self._cache_csv_path: str | None = None
         if self._stream_scan:
-            candidate_dir = None
-            if isinstance(raw_files_with_wcs_or_dir, (str, os.PathLike)):
-                candidate_dir = Path(raw_files_with_wcs_or_dir)
-            elif isinstance(raw_files_with_wcs_or_dir, Path):
-                candidate_dir = raw_files_with_wcs_or_dir
-            if candidate_dir is not None:
-                try:
-                    if candidate_dir.is_dir():
-                        self._cache_csv_path = str(candidate_dir / "headers_cache.csv")
-                except Exception:
-                    self._cache_csv_path = None
+            candidate_dir = _expand_to_path(raw_files_with_wcs_or_dir)
+            if candidate_dir and candidate_dir.is_dir():
+                self._cache_csv_path = str(candidate_dir / "headers_cache.csv")
         self._build_ui()
         self._build_processing_overlay()
-        cache_loaded = bool(self._cache_csv_path and os.path.exists(self._cache_csv_path))
+        cache_loaded = False
+        if self._cache_csv_path:
+            cache_path_obj = _expand_to_path(self._cache_csv_path)
+            if cache_path_obj and cache_path_obj.is_file():
+                self._cache_csv_path = str(cache_path_obj)
+                cache_loaded = True
         if self._stream_scan:
             self._prepare_streaming_mode(raw_files_with_wcs_or_dir, initial_overrides)
             self._debug_log(
@@ -2596,10 +2652,10 @@ class FilterQtDialog(QDialog):
                 path = entry.get("path") or entry.get("file_path")
                 if not path:
                     continue
-                assignment[os.path.normcase(str(path))] = (idx - 1, label)
+                assignment[casefold_path(path)] = (idx - 1, label)
 
         for normalized in self._normalized_items:
-            key = os.path.normcase(normalized.file_path or "")
+            key = casefold_path(normalized.file_path or "")
             if key in assignment:
                 group_idx, label = assignment[key]
                 normalized.cluster_index = group_idx
@@ -2611,7 +2667,7 @@ class FilterQtDialog(QDialog):
         new_groups: list[list[_NormalizedItem]] = [[] for _ in groups]
         if new_groups:
             for normalized in self._normalized_items:
-                key = os.path.normcase(normalized.file_path or "")
+                key = casefold_path(normalized.file_path or "")
                 if key in assignment:
                     group_idx = assignment[key][0]
                     if 0 <= group_idx < len(new_groups):
@@ -2744,7 +2800,7 @@ class FilterQtDialog(QDialog):
     def _load_header(self, path: str) -> Any | None:
         if not path or fits is None:
             return None
-        norm = os.path.normcase(path)
+        norm = casefold_path(path)
         if norm in self._header_cache:
             return self._header_cache[norm]
         try:
@@ -2771,7 +2827,7 @@ class FilterQtDialog(QDialog):
                     path_val = candidate
                     break
             if path_val:
-                entry_obj = path_map.get(os.path.normcase(str(path_val)))
+                entry_obj = path_map.get(casefold_path(path_val))
 
         center_ra: float | None = None
         center_dec: float | None = None
@@ -2829,7 +2885,7 @@ class FilterQtDialog(QDialog):
         path_map: dict[str, _NormalizedItem] = {}
         for entry in self._normalized_items:
             if entry.file_path:
-                path_map[os.path.normcase(entry.file_path)] = entry
+                path_map[casefold_path(entry.file_path)] = entry
         outlines: list[tuple[float, float, float, float]] = []
         for group in groups:
             ra_vals: list[float] = []
@@ -2941,7 +2997,7 @@ class FilterQtDialog(QDialog):
         path_map: dict[str, _NormalizedItem] = {}
         for entry in self._normalized_items:
             if entry.file_path:
-                path_map[os.path.normcase(entry.file_path)] = entry
+                path_map[casefold_path(entry.file_path)] = entry
 
         rectangles: list[tuple[float, float, float, float]] = []
         for group in groups or []:
@@ -3059,7 +3115,7 @@ class FilterQtDialog(QDialog):
             for key in ("path", "path_raw", "path_preprocessed_cache"):
                 value = info.get(key)
                 if value:
-                    entry = path_map.get(os.path.normcase(str(value)))
+                    entry = path_map.get(casefold_path(value))
                     if entry is not None:
                         break
         if entry is not None:
@@ -3631,10 +3687,18 @@ class FilterQtDialog(QDialog):
     def _prompt_csv_path(self) -> str | None:
         caption = self._localizer.get("filter.export.dialog_title", "Export filter CSV")
         csv_filter = self._localizer.get("filter.export.csv_filter", "CSV files (*.csv)")
+        try:
+            default_dir = ensure_user_config_dir()
+        except Exception:
+            try:
+                default_dir = get_user_config_dir()
+            except Exception:
+                default_dir = Path.home()
+        default_path = str(Path(default_dir) / "zemosaic_filter.csv")
         path, _filter = QFileDialog.getSaveFileName(
             self,
             caption,
-            os.path.expanduser("~/zemosaic_filter.csv"),
+            default_path,
             f"{csv_filter};;All Files (*)",
         )
         return path or None
@@ -3681,9 +3745,9 @@ class FilterQtDialog(QDialog):
             if header_candidate:
                 return header_candidate
         path = entry.file_path
-        if not path or not os.path.isfile(path):
+        if not path or not _path_is_file(path):
             return None
-        return self._load_header(path)
+        return self._load_header(str(_expand_to_path(path) or path))
 
     def _write_csv_file(self, path: str, rows: List[dict[str, Any]]) -> bool:
         fieldnames = [
@@ -3708,10 +3772,12 @@ class FilterQtDialog(QDialog):
             "OBJECT",
         ]
         try:
-            directory = os.path.dirname(path)
-            if directory:
-                os.makedirs(directory, exist_ok=True)
-            with open(path, "w", encoding="utf-8", newline="") as handle:
+            path_obj = _expand_to_path(path)
+            if path_obj is None:
+                raise ValueError("invalid CSV path")
+            if path_obj.parent:
+                path_obj.parent.mkdir(parents=True, exist_ok=True)
+            with path_obj.open("w", encoding="utf-8", newline="") as handle:
                 writer = csv.DictWriter(handle, fieldnames=fieldnames)
                 writer.writeheader()
                 for row in rows:
@@ -3947,7 +4013,7 @@ class FilterQtDialog(QDialog):
         """
 
         try:
-            base_dir = os.path.dirname(os.path.abspath(__file__))
+            base_dir = get_app_base_dir()
         except Exception:
             base_dir = None
 
@@ -3958,26 +4024,28 @@ class FilterQtDialog(QDialog):
             "wait_animation.GIF.GIF",
         )
 
-        search_roots: list[str] = []
+        search_roots: list[Path] = []
         if base_dir:
-            search_roots.append(os.path.join(base_dir, "gif"))
-        search_roots.append(os.path.join(os.getcwd(), "gif"))
+            search_roots.append(base_dir / "gif")
+        try:
+            search_roots.append(Path.cwd() / "gif")
+        except Exception:
+            pass
 
         for root in search_roots:
-            if not root or not os.path.isdir(root):
+            if not root or not root.is_dir():
                 continue
             for name in candidate_names:
-                candidate = os.path.join(root, name)
-                if os.path.isfile(candidate):
-                    return candidate
+                candidate = root / name
+                if candidate.is_file():
+                    return str(candidate)
             try:
-                for entry in os.listdir(root):
-                    lower_name = entry.lower()
+                for entry in root.iterdir():
+                    lower_name = entry.name.lower()
                     if not lower_name.startswith("wait_") or not lower_name.endswith(".gif"):
                         continue
-                    candidate = os.path.join(root, entry)
-                    if os.path.isfile(candidate):
-                        return candidate
+                    if entry.is_file():
+                        return str(entry)
             except Exception:
                 continue
         return None
@@ -4179,20 +4247,50 @@ class FilterQtDialog(QDialog):
         self._stream_thread = None
         self._stream_worker = None
 
-    def _stop_stream_worker(self) -> None:
-        worker = self._stream_worker
-        thread = self._stream_thread
-        was_running = False
+    def _stop_scan_worker(self) -> None:
+        worker = self._scan_worker
+        thread = self._scan_thread
+        self._scan_worker = None
+        self._scan_thread = None
         if worker is not None:
             worker.request_stop()
         if thread is not None:
-            was_running = thread.isRunning()
-            thread.quit()
-            thread.wait(2000)
+            if thread.isRunning():
+                thread.quit()
+                if not thread.wait(5000):
+                    try:
+                        thread.terminate()
+                    except Exception:
+                        pass
+                    thread.wait(1000)
+            try:
+                thread.deleteLater()
+            except Exception:
+                pass
+
+    def _stop_stream_worker(self) -> None:
+        worker = self._stream_worker
+        thread = self._stream_thread
+        was_active = self._streaming_active
         self._stream_worker = None
         self._stream_thread = None
         self._streaming_active = False
-        if was_running:
+        if worker is not None:
+            worker.request_stop()
+        if thread is not None:
+            if thread.isRunning():
+                thread.quit()
+                if not thread.wait(5000):
+                    try:
+                        thread.terminate()
+                    except Exception:
+                        pass
+                    thread.wait(1000)
+            try:
+                thread.deleteLater()
+            except Exception:
+                pass
+        if was_active:
             self._streaming_completed = False
 
     def _populate_tree(self) -> None:
@@ -4680,9 +4778,9 @@ class FilterQtDialog(QDialog):
         header_subset = getattr(entry, "header_cache", None)
         if header_subset is None:
             path = entry.file_path
-            if not path or not os.path.isfile(path):
+            if not path or not _path_is_file(path):
                 return None, None
-            header_subset = self._load_header(path)
+            header_subset = self._load_header(str(_expand_to_path(path) or path))
             if header_subset is not None:
                 try:
                     entry.header_cache = header_subset
@@ -4713,9 +4811,9 @@ class FilterQtDialog(QDialog):
         header = getattr(entry, "header_cache", None)
         if header is None:
             path = entry.file_path
-            if not path or not os.path.isfile(path):
+            if not path or not _path_is_file(path):
                 return None
-            header = self._load_header(path)
+            header = self._load_header(str(_expand_to_path(path) or path))
             if header is not None:
                 try:
                     entry.header_cache = header
@@ -5440,13 +5538,7 @@ class FilterQtDialog(QDialog):
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._persist_window_geometry()
         self._stop_stream_worker()
-        if self._scan_worker is not None:
-            self._scan_worker.request_stop()
-        if self._scan_thread is not None:
-            self._scan_thread.quit()
-            self._scan_thread.wait(2000)
-            self._scan_thread = None
-        self._scan_worker = None
+        self._stop_scan_worker()
         self._hide_processing_overlay()
         super().closeEvent(event)
 
@@ -5631,10 +5723,10 @@ class FilterQtDialog(QDialog):
         if fits is not None:
             header_checks = 0
             for entry in self._normalized_items:
-                if not entry.file_path or not os.path.isfile(entry.file_path):
+                if not entry.file_path or not _path_is_file(entry.file_path):
                     continue
                 try:
-                    header = fits.getheader(entry.file_path, ignore_missing_end=True)
+                    header = fits.getheader(str(_expand_to_path(entry.file_path) or entry.file_path), ignore_missing_end=True)
                 except Exception:
                     header = None
                 if header is None:
@@ -5791,9 +5883,8 @@ class FilterQtDialog(QDialog):
         if WCS is None:
             return False, None, None
 
-        output_dir_raw = self._config_value("output_dir", "")
-        output_dir = str(output_dir_raw or "").strip()
-        if not output_dir:
+        output_dir_path = _expand_to_path(self._config_value("output_dir", ""))
+        if not output_dir_path:
             return False, None, None
 
         if resolve_global_wcs_output_paths is None or parse_global_wcs_resolution_override is None:
@@ -5811,7 +5902,7 @@ class FilterQtDialog(QDialog):
         res_override = parse_global_wcs_resolution_override(res_override_raw)
 
         try:
-            fits_path, json_path = resolve_global_wcs_output_paths(output_dir, wcs_output_cfg)
+            fits_path, json_path = resolve_global_wcs_output_paths(str(output_dir_path), wcs_output_cfg)
         except Exception as exc:
             try:
                 logger.warning("Global WCS (Qt): unable to resolve output path: %s", exc)
@@ -5848,10 +5939,10 @@ class FilterQtDialog(QDialog):
 
             for entry in selected_entries:
                 path = entry.file_path
-                if not path or not os.path.isfile(path):
+                if not path or not _path_is_file(path):
                     continue
                 try:
-                    header = _fits.getheader(path, ignore_missing_end=True)
+                    header = _fits.getheader(str(_expand_to_path(path) or path), ignore_missing_end=True)
                 except Exception:
                     header = None
                 if header is None:
@@ -6303,6 +6394,10 @@ def launch_filter_interface_qt(
         all_items = dialog.input_items()
         accepted = dialog.was_accepted()
     finally:
+        try:
+            dialog.deleteLater()
+        except Exception:
+            pass
         if owns_app:
             app.quit()
 

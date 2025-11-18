@@ -815,5 +815,19 @@
     "qt_field_theme_mode": "Mode de thème",
     "qt_theme_option_system": "Par défaut système",
     "qt_theme_option_dark": "Sombre",
-    "qt_theme_option_light": "Clair"
+    "qt_theme_option_light": "Clair",
+    "gpu_info_summary": "GPU détecté : {name} — total {total_mb} Mo, libre {free_mb} Mo.",
+    "phase5_using_gpu": "La phase 5 de reprojection utilisera le GPU.",
+    "phase5_using_cpu": "La phase 5 de reprojection s'exécute sur CPU.",
+    "stack_using_gpu": "Empilement ({helper}) exécuté sur GPU.",
+    "stack_using_cpu": "Empilement ({helper}) exécuté sur CPU.",
+    "gpu_fallback_unavailable": "Assistant GPU indisponible ({reason}). Retour au CPU.",
+    "gpu_fallback_insufficient_memory": "Assistant GPU ignoré : estimation {estimated_mb} Mo vs limite {allowed_mb} Mo.",
+    "gpu_fallback_runtime_error": "Erreur de l'assistant GPU : {error}. Retour au CPU.",
+    "gpu_helper_stream_tiles": "Assistant GPU en mode flux séquentiel faute de mémoire disponible.",
+    "gpu_chunking_rows": "Assistant GPU traité par blocs de {rows} lignes sur {height}.",
+    "stack_gpu_fallback_unavailable": "Empilement GPU ({helper}) demandé mais indisponible ({reason}). Retour au CPU.",
+    "stack_gpu_fallback_insufficient_memory": "Empilement GPU ({helper}) ignoré : estimation {estimated_mb} Mo vs limite {allowed_mb} Mo.",
+    "stack_gpu_fallback_runtime_error": "Erreur d'empilement GPU pour {helper} : {error}. Retour au CPU.",
+    "stack_gpu_chunking_rows": "Empilement GPU ({helper}) traité par blocs de {rows} lignes sur {height}."
 }
