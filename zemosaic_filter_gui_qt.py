@@ -191,14 +191,20 @@ def _load_zemosaic_qicon() -> QIcon | None:
         icon_dir / "zemosaic.ico",
         icon_dir / "zemosaic_64x64.png",
         icon_dir / "zemosaic_icon.png",
+        icon_dir / "zemosaic.png",
     ]
 
     for path in candidates:
         try:
-            if path.is_file():
-                return QIcon(str(path))
+            if not path.is_file():
+                continue
+            icon = QIcon(str(path))
+            if not icon.isNull():
+                return icon
         except Exception:
             continue
+
+    print(f"[QtFilter] Aucune icône ZeMosaic trouvée dans {icon_dir}")
     return None
 
 

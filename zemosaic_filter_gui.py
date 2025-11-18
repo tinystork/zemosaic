@@ -78,6 +78,7 @@ from zemosaic_utils import (
     parse_global_wcs_resolution_override,
     resolve_global_wcs_output_paths,
     write_global_wcs_files,
+    apply_windows_icon_to_window,
 )
 
 
@@ -891,17 +892,41 @@ def launch_filter_interface(
 
                 ico_path = icon_dir / "zemosaic.ico"
                 png_candidates = [
-                    icon_dir / "zemosaic.png",
-                    icon_dir / "zemosaic_icon.png",
                     icon_dir / "zemosaic_64x64.png",
+                    icon_dir / "zemosaic_icon.png",
+                    icon_dir / "zemosaic.png",
                 ]
 
+                icon_applied = False
                 if is_windows and ico_path.is_file():
-                    window.iconbitmap(default=str(ico_path))
-                else:
-                    png_path = next((p for p in png_candidates if p.is_file()), None)
-                    if png_path:
-                        window.iconphoto(True, PhotoImage(file=str(png_path)))
+                    try:
+                        window.iconbitmap(default=str(ico_path))
+                        icon_applied = True
+                    except Exception as ico_error:
+                        print(f"[FilterGUI] Chargement ICO impossible ({ico_error}); essai PNG.")
+                    else:
+                        try:
+                            window.update_idletasks()
+                        except Exception:
+                            pass
+                    if apply_windows_icon_to_window(window, ico_path, "[FilterGUI]"):
+                        icon_applied = True
+                elif is_windows:
+                    print(f"[FilterGUI] Fichier ICO introuvable: {ico_path}")
+
+                png_path = next((p for p in png_candidates if p.is_file()), None)
+                if png_path:
+                    try:
+                        photo = PhotoImage(file=str(png_path))
+                    except Exception as img_error:
+                        print(f"[FilterGUI] Chargement PNG impossible ({img_error})")
+                    else:
+                        window.iconphoto(True, photo)
+                        setattr(window, "_zemosaic_icon_photo", photo)
+                        icon_applied = True
+
+                if not icon_applied:
+                    print(f"[FilterGUI] Aucune ic�ne ZeMosaic trouv�e dans {icon_dir}")
             except Exception as exc:
                 print(f"[FilterGUI] Impossible d'appliquer l'icône ZeMosaic: {exc}")
         heavy_import_error: ImportError | None = None

@@ -94,21 +94,86 @@ EXCLUDED_DIRS = frozenset({"unaligned_by_zemosaic"})
 
 @lru_cache(maxsize=1)
 def get_app_base_dir() -> Path:
-    """Return the base directory that contains ZeMosaic resources."""
+    """Return the root directory where ZeMosaic resources live."""
 
     if getattr(sys, "frozen", False):
-        # PyInstaller-style bundles
-        base = getattr(sys, "_MEIPASS", None)
-        if base:
-            return Path(base)
-        try:
-            return Path(sys.executable).resolve().parent
-        except Exception:
-            return Path.cwd()
+        frozen_base = getattr(sys, "_MEIPASS", None)
+        if frozen_base:
+            try:
+                base = Path(frozen_base).resolve()
+            except Exception:
+                base = Path(sys.executable).resolve().parent
+        else:
+            base = Path(sys.executable).resolve().parent
+        candidate = base / "zemosaic"
+        return candidate if candidate.is_dir() else base
+
+    try:
+        spec = importlib.util.find_spec("zemosaic")
+        if spec and spec.origin:
+            return Path(spec.origin).resolve().parent
+    except Exception:
+        pass
+
     try:
         return Path(__file__).resolve().parent
     except Exception:
-        return Path.cwd()
+        return Path(os.getcwd())
+
+
+def apply_windows_icon_to_window(window, ico_path: Path | str, log_prefix: str = "[Tk]") -> bool:
+    """Force-set the Windows taskbar/title icon using Win32 APIs when possible."""
+
+    if platform.system().lower() != "windows":
+        return False
+
+    try:
+        import ctypes
+    except Exception:
+        return False
+
+    try:
+        icon_path = Path(ico_path)
+    except Exception:
+        return False
+    if not icon_path.is_file():
+        return False
+
+    try:
+        hwnd = window.winfo_id()
+    except Exception:
+        hwnd = None
+    if not hwnd:
+        return False
+
+    LR_LOADFROMFILE = 0x0010
+    LR_DEFAULTSIZE = 0x0040
+    IMAGE_ICON = 1
+    WM_SETICON = 0x0080
+    ICON_SMALL = 0
+    ICON_BIG = 1
+
+    try:
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        handle = user32.LoadImageW(
+            0,
+            str(icon_path),
+            IMAGE_ICON,
+            0,
+            0,
+            LR_LOADFROMFILE | LR_DEFAULTSIZE,
+        )
+        if not handle:
+            return False
+        user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, handle)
+        user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, handle)
+        return True
+    except Exception as exc:
+        try:
+            print(f"{log_prefix} Unable to refresh Windows icon via Win32: {exc}")
+        except Exception:
+            pass
+        return False
 
 
 @lru_cache(maxsize=1)

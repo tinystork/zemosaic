@@ -64,7 +64,7 @@ import json
 from pathlib import Path
 from typing import Any, MutableMapping, Optional
 
-from zemosaic_utils import get_app_base_dir
+from zemosaic_utils import get_app_base_dir, apply_windows_icon_to_window
 
 SYSTEM_NAME = platform.system().lower()
 IS_WINDOWS = SYSTEM_NAME == "windows"
@@ -240,6 +240,57 @@ if SolverSettings is None:
     raise ImportError(f"solver_settings module is required for ZeMosaic GUI ({detail})")
 
 
+def _apply_zemosaic_icon_to_tk(window):
+    """Apply the ZeMosaic icon to a Tk window using shared lookup rules."""
+
+    try:
+        base_path = get_app_base_dir()
+        icon_dir = base_path / 'icon'
+
+        ico_path = icon_dir / 'zemosaic.ico'
+        png_candidates = [
+            icon_dir / 'zemosaic_64x64.png',
+            icon_dir / 'zemosaic_icon.png',
+            icon_dir / 'zemosaic.png',
+        ]
+
+        icon_applied = False
+        if IS_WINDOWS and ico_path.is_file():
+            try:
+                window.iconbitmap(default=str(ico_path))
+                icon_applied = True
+            except Exception as ico_error:
+                print(f"[TkMain] ICO icon load failed ({ico_error}); trying PNG fallback.")
+            else:
+                try:
+                    window.update_idletasks()
+                except Exception:
+                    pass
+            if apply_windows_icon_to_window(window, ico_path, "[TkMain]"):
+                icon_applied = True
+        elif IS_WINDOWS:
+            print(f"[TkMain] ICO asset missing at {ico_path}")
+        elif ico_path.is_file():
+            # Non-Windows platforms don't use .ico but logging helps debugging.
+            print(f"[TkMain] Skipping ICO on non-Windows platform ({SYSTEM_NAME}).")
+
+        png_path = next((p for p in png_candidates if p.is_file()), None)
+        if png_path:
+            from tkinter import PhotoImage
+
+            try:
+                photo = PhotoImage(file=str(png_path))
+            except Exception as img_error:
+                print(f"[TkMain] PNG icon load failed ({img_error})")
+            else:
+                window.iconphoto(True, photo)
+                setattr(window, "_zemosaic_icon_photo", photo)
+                icon_applied = True
+
+        if not icon_applied:
+            print(f"[TkMain] No ZeMosaic icon assets found in {icon_dir}")
+    except Exception as exc:
+        print(f"[TkMain] Unable to apply ZeMosaic icon: {exc}")
 
 class ZeMosaicGUI:
     def __init__(self, root_window):
@@ -247,27 +298,9 @@ class ZeMosaicGUI:
 
         # --- Définir l'icône ZeMosaic (multi-plateforme) ---
         try:
-            base_path = get_app_base_dir()
-            icon_dir = base_path / "icon"
-
-            ico_path = icon_dir / "zemosaic.ico"
-            png_candidates = [
-                icon_dir / "zemosaic.png",
-                icon_dir / "zemosaic_icon.png",
-                icon_dir / "zemosaic_64x64.png",
-            ]
-
-            if IS_WINDOWS and ico_path.is_file():
-                self.root.iconbitmap(default=str(ico_path))
-            else:
-                from tkinter import PhotoImage
-
-                png_path = next((p for p in png_candidates if p.is_file()), None)
-                if png_path:
-                    self.root.iconphoto(True, PhotoImage(file=str(png_path)))
+            _apply_zemosaic_icon_to_tk(self.root)
         except Exception as e_icon:
             print(f"AVERT GUI: icône ZeMosaic non appliquée ({e_icon})")
-
 
         try:
             self.root.geometry("1050x950") # Légère augmentation pour le nouveau widget

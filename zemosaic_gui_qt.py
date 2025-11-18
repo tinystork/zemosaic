@@ -70,6 +70,12 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Sequence, Tuple
 
+try:  # pragma: no cover - optional dependency guard
+    from zemosaic_utils import get_app_base_dir  # type: ignore
+except Exception:  # pragma: no cover - fallback when utils missing
+    def get_app_base_dir() -> Path:  # type: ignore
+        return Path(__file__).resolve().parent
+
 try:
     from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, QByteArray
     from PySide6.QtGui import (
@@ -210,14 +216,20 @@ def _load_zemosaic_qicon() -> QIcon | None:
         icon_dir / "zemosaic.ico",
         icon_dir / "zemosaic_64x64.png",
         icon_dir / "zemosaic_icon.png",
+        icon_dir / "zemosaic.png",
     ]
 
     for path in candidates:
         try:
-            if path.is_file():
-                return QIcon(str(path))
+            if not path.is_file():
+                continue
+            icon = QIcon(str(path))
+            if not icon.isNull():
+                return icon
         except Exception:
             continue
+
+    print(f"[QtMain] Aucune icône ZeMosaic trouvée dans {icon_dir}")
     return None
 
 
