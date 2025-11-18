@@ -67,6 +67,7 @@ import queue
 import threading
 import time
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Sequence, Tuple
 
 try:
@@ -121,6 +122,26 @@ except ImportError as exc:  # pragma: no cover - import guard
 
 SYSTEM_NAME = platform.system().lower()
 IS_WINDOWS = SYSTEM_NAME == "windows"
+FITS_EXTENSIONS = {".fit", ".fits"}
+
+
+def _expand_to_path(value: Any) -> Optional[Path]:
+    """Expand ``value`` to a ``Path`` relative to the user's home directory."""
+
+    if value is None:
+        return None
+    if isinstance(value, Path):
+        return value
+    try:
+        text_value = str(value).strip()
+    except Exception:
+        return None
+    if not text_value:
+        return None
+    try:
+        return Path(text_value).expanduser()
+    except Exception:
+        return None
 
 if IS_WINDOWS:
     try:  # pragma: no cover - optional dependency for GPU detection
@@ -181,21 +202,20 @@ LANGUAGE_OPTION_DEFINITIONS = [
 def _load_zemosaic_qicon() -> QIcon | None:
     """Return a QIcon for ZeMosaic using the best available icon file."""
     try:
-        base_path = os.path.dirname(os.path.abspath(__file__))
-        icon_dir = os.path.join(base_path, "icon")
+        icon_dir = get_app_base_dir() / "icon"
     except Exception:
         return None
 
     candidates = [
-        os.path.join(icon_dir, "zemosaic.ico"),
-        os.path.join(icon_dir, "zemosaic_64x64.png"),
-        os.path.join(icon_dir, "zemosaic_icon.png"),
+        icon_dir / "zemosaic.ico",
+        icon_dir / "zemosaic_64x64.png",
+        icon_dir / "zemosaic_icon.png",
     ]
 
     for path in candidates:
         try:
-            if os.path.exists(path):
-                return QIcon(path)
+            if path.is_file():
+                return QIcon(str(path))
         except Exception:
             continue
     return None
@@ -692,7 +712,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         if icon is not None:
             self.setWindowIcon(icon)
 
-        self._config_path: str | None = self._determine_config_path()
+        self._config_path: Optional[Path] = self._determine_config_path()
         self._config_load_notes: List[Tuple[str, str, str, Dict[str, Any]]] = []
         self._loaded_config_snapshot: Dict[str, Any] = {}
         self._persisted_config_keys: set[str] = set()
@@ -714,6 +734,18 @@ class ZeMosaicQtMainWindow(QMainWindow):
         else:
             self.config.setdefault("gpu_selector", "CPU (no GPU)")
         self._initialize_log_level_prefixes()
+        for path_key in (
+            "astap_executable_path",
+            "astap_data_directory_path",
+            "coadd_memmap_dir",
+            "input_dir",
+            "output_dir",
+        ):
+            value = self.config.get(path_key)
+            if isinstance(value, str) and value:
+                expanded = _expand_to_path(value)
+                if expanded:
+                    self.config[path_key] = str(expanded)
         for key, fallback in self._default_config_values.items():
             self.config.setdefault(key, fallback)
         self.config.setdefault("qt_theme_mode", "system")
@@ -1146,19 +1178,18 @@ class ZeMosaicQtMainWindow(QMainWindow):
     def _resolve_available_languages(self) -> List[str]:
         available_langs: List[str] = ["en", "fr"]
         locales_dir = getattr(self.localizer, "locales_dir_abs_path", None)
-        if isinstance(locales_dir, str) and os.path.isdir(locales_dir):
+        locales_path = _expand_to_path(locales_dir) if locales_dir else None
+        if locales_path and locales_path.is_dir():
             try:
-                entries = sorted(
-                    name
-                    for name in os.listdir(locales_dir)
-                    if name.endswith(".json")
-                    and os.path.isfile(os.path.join(locales_dir, name))
+                detected = sorted(
+                    entry.stem
+                    for entry in locales_path.iterdir()
+                    if entry.is_file() and entry.suffix.lower() == ".json"
                 )
-                detected = [os.path.splitext(name)[0] for name in entries]
-                if detected:
-                    available_langs = detected
             except Exception:
-                available_langs = ["en", "fr"]
+                detected = []
+            if detected:
+                available_langs = detected
         return available_langs
 
     def _create_folders_group(self) -> QGroupBox:
@@ -2965,7 +2996,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         browse_button = QPushButton(self._tr("qt_button_browse", "Browse…"))
 
         def _on_browse_clicked() -> None:
-            start_dir = line_edit.text().strip() or current_value or os.getcwd()
+            start_dir = line_edit.text().strip() or current_value or str(Path.cwd())
             selected_dir = QFileDialog.getExistingDirectory(
                 self,
                 dialog_title,
@@ -3011,7 +3042,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             def _on_browse() -> None:
                 start_path = widget.text().strip() or str(current_value or "")
                 if not start_path:
-                    start_path = os.getcwd()
+                    start_path = str(Path.cwd())
                 if browse_action == "file":
                     selected = QFileDialog.getOpenFileName(
                         self,
@@ -3492,7 +3523,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         defaults.setdefault("qt_theme_mode", "system")
         return defaults
 
-    def _determine_config_path(self) -> str | None:
+    def _determine_config_path(self) -> Optional[Path]:
         if zemosaic_config is None:
             return None
         get_path = getattr(zemosaic_config, "get_config_path", None)
@@ -3501,7 +3532,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 path = get_path()
             except Exception:
                 return None
-            return str(path)
+            expanded = _expand_to_path(path)
+            if expanded:
+                return expanded
         return None
 
     def _load_config(self) -> Dict[str, Any]:
@@ -3546,13 +3579,14 @@ class ZeMosaicQtMainWindow(QMainWindow):
             )
 
         if config_path:
-            if os.path.exists(config_path):
+            config_path_str = str(config_path)
+            if config_path.exists():
                 notes.append(
                     (
                         "info",
                         "qt_log_config_loaded_from",
                         "Loaded configuration from {path}",
-                        {"path": config_path},
+                        {"path": config_path_str},
                     )
                 )
             else:
@@ -3561,7 +3595,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
                         "warning",
                         "qt_log_config_missing",
                         "No configuration file found at {path}; defaults will be used until saved.",
-                        {"path": config_path},
+                        {"path": config_path_str},
                     )
                 )
 
@@ -3669,7 +3703,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         if not saved and self._config_path:
             try:
-                with open(self._config_path, "w", encoding="utf-8") as handle:
+                self._config_path.parent.mkdir(parents=True, exist_ok=True)
+                with self._config_path.open("w", encoding="utf-8") as handle:
                     json.dump(snapshot, handle, indent=4, ensure_ascii=False)
             except Exception as exc:  # pragma: no cover - disk errors are rare
                 last_error = str(exc)
@@ -4257,7 +4292,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
     def _phase45_handle_group_result(self, payload: Dict[str, Any]) -> None:
         last_out = payload.get("out")
         if last_out:
-            self._phase45_last_out = os.path.basename(str(last_out))
+            try:
+                self._phase45_last_out = Path(str(last_out)).name
+            except Exception:
+                self._phase45_last_out = str(last_out)
         gid = payload.get("group_id")
         try:
             gid_int = int(gid)
@@ -4705,12 +4743,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
                     completion_message,
                 )
             # Optional post-run prompt to open the output folder, mirroring Tk.
-            output_dir = str(self.config.get("output_dir", "") or "").strip()
+            output_dir_path = _expand_to_path(self.config.get("output_dir", "") or "")
             if (
-                output_dir
-                and os.path.isdir(output_dir)
+                output_dir_path
+                and output_dir_path.is_dir()
                 and self.isVisible()
             ):
+                output_dir = str(output_dir_path)
                 title = self.localizer.get(
                     "q_open_output_folder_title",
                     "Open Output Folder?",
@@ -4729,12 +4768,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 )
                 if answer == QMessageBox.Yes:
                     try:
+                        folder_arg = str(output_dir_path)
                         if os.name == "nt":
-                            os.startfile(output_dir)  # type: ignore[arg-type]
+                            os.startfile(folder_arg)  # type: ignore[arg-type]
                         elif sys.platform == "darwin":
-                            subprocess.Popen(["open", output_dir])
+                            subprocess.Popen(["open", folder_arg])
                         else:
-                            subprocess.Popen(["xdg-open", output_dir])
+                            subprocess.Popen(["xdg-open", folder_arg])
                     except Exception as exc:
                         log_msg = self.localizer.get(
                             "log_key_error_opening_folder",
@@ -5343,8 +5383,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self._start_processing(skip_filter_prompt=True, predecided_skip_filter_ui=True)
 
     def _launch_filter_dialog(self) -> bool | None:
-        input_dir = str(self.config.get("input_dir", "") or "").strip()
-        if not input_dir or not os.path.isdir(input_dir):
+        input_dir_raw = self.config.get("input_dir", "") or ""
+        input_dir_path = _expand_to_path(str(input_dir_raw).strip())
+        if not (input_dir_path and input_dir_path.is_dir()):
             QMessageBox.warning(
                 self,
                 self._tr("qt_error_invalid_input_dir", "Please select a valid input folder before filtering."),
@@ -5352,7 +5393,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             )
             return None
 
-        if not self._input_dir_contains_fits(input_dir):
+        if not self._input_dir_contains_fits(input_dir_path):
             QMessageBox.warning(
                 self,
                 self._tr("qt_error_no_fits", "No FITS files found in the selected input folder."),
@@ -5433,7 +5474,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         try:
             filter_result = launch_filter_interface_qt(
-                input_dir,
+                str(input_dir_path),
                 initial_overrides,
                 stream_scan=True,
                 scan_recursive=True,
@@ -5565,13 +5606,19 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._last_filtered_header_items = None
 
     @staticmethod
-    def _input_dir_contains_fits(input_dir: str) -> bool:
+    def _input_dir_contains_fits(input_dir: Path | str) -> bool:
+        if isinstance(input_dir, Path):
+            path_obj = input_dir
+        else:
+            path_obj = _expand_to_path(input_dir)
+            if path_obj is None:
+                return False
+        if not path_obj.is_dir():
+            return False
         try:
-            for root_dir, _dirs, files in os.walk(input_dir):
-                for filename in files:
-                    if filename.lower().endswith((".fit", ".fits")):
-                        return True
-                break
+            for entry in path_obj.iterdir():
+                if entry.is_file() and entry.suffix.lower() in FITS_EXTENSIONS:
+                    return True
         except Exception:
             return False
         return False
@@ -5601,6 +5648,17 @@ def run_qt_main() -> int:
     if app is None:
         app = QApplication(sys.argv)
         owns_app = True
+    else:
+        try:
+            prelaunch_flag = bool(app.property("zemosaic_prelaunch_owner"))
+        except Exception:
+            prelaunch_flag = False
+        if prelaunch_flag:
+            owns_app = True
+            try:
+                app.setProperty("zemosaic_prelaunch_owner", False)
+            except Exception:
+                pass
 
     window = ZeMosaicQtMainWindow()
     window.show()

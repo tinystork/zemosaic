@@ -1,205 +1,187 @@
-# FOLLOW-UP TASKS — GPU / MEMORY REVIEW CHECKLIST
+# FOLLOW-UP TASKS — CROSS-PLATFORM COMPATIBILITY CHECKLIST
 
-This checklist guides you step by step through the GPU/memory review and improvements.
+This checklist guides you through concrete steps to harden Windows/macOS/Linux compatibility.
 
-## 0. Read and understand existing GPU helpers
+---
 
-- [x] Open `zemosaic_utils.py` and identify:
-  - `GPU_AVAILABLE`, `gpu_is_available`
-  - `ensure_cupy_pool_initialized`, `free_cupy_memory_pools`
-  - `gpu_memory_sufficient`
-  - GPU reprojection functions (`gpu_assemble_final_mosaic_reproject_coadd`, `gpu_assemble_final_mosaic_incremental`, `reproject_and_coadd_wrapper`, etc.)
-  - GPU image processing helpers (`_percentiles_gpu`, `detect_and_correct_hot_pixels_gpu`, `estimate_background_map_gpu`, etc.)
-- [x] Confirm they are imported and used in:
-  - `zemosaic_align_stack.py`
-  - `zemosaic_worker.py`
-  - Any other modules using GPU paths.
+## 0. Quick inventory of OS-sensitive spots
 
-Goal: **build a mental map** of where GPU is used and where memory checks already exist.
+- [x] Grep the codebase for patterns that are often OS-specific:
+  - `C:\\` or `C:/`
+  - `/home/`
+  - `os.system(`, `subprocess`
+  - `\\` used inside paths
+  - `APPDATA`, `LOCALAPPDATA`, `Program Files`
+  - `xdg-open`, `open ` (macOS), `explorer.exe`
+- [x] Make a small list of files that contain such patterns. These will be your main targets.
 
+Goal: identify where Windows-only or Linux-only assumptions live in the code today.
 
-## 1. Strengthen and centralise GPU memory checks
+---
 
-### 1.1 `gpu_memory_sufficient`
+## 1. Paths and files — enforce `pathlib`
 
-- [x] In `zemosaic_utils.py`, review `gpu_memory_sufficient(estimated_bytes, safety_fraction=0.75)`.
-- [x] Ensure it:
-  - Returns `True` when `GPU_AVAILABLE` is false (so CPU code does not get blocked).
-  - Uses `memGetInfo()` correctly: compare `estimated_bytes` against `free_bytes * safety_fraction`.
-  - Handles any exceptions (driver issues, etc.) by being permissive, not by disabling GPU entirely.
-- [x] Optionally:
-  - Add a small helper to clamp `safety_fraction` between `0.1` and `0.9` to avoid extreme values.
-  - Add a debug log (guarded by an env var or config flag) when a check fails, so we can see in logs why GPU was refused.
+### 1.1 General rules
 
-### 1.2 CuPy pool management
+- [x] In all modules that touch file paths (`run_zemosaic.py`, GUIs, worker, utils, astrometry, etc.):
+  - Replace `os.path.join(...)` and string concatenations with `Path` operations where possible.
+  - For example, turn:
+    - `os.path.join(base, "subdir", "file.fits")`
+    - into: `Path(base) / "subdir" / "file.fits"`.
+  - Status: path handling is now centralized through `pathlib` helpers everywhere (filter GUI, worker, astrometry, etc.), with env/`~` expansion implemented via `core.path_helpers.expand_to_path`.
+- [x] Ensure any path literals are **relative** to:
+  - The project root (when running from source), or
+  - The package/executable directory when frozen (see 1.2).
+  - Status: scripting/helpers that previously assumed the working directory (e.g. `translate_is.py`) now resolve assets via `get_app_base_dir()` fallbacks, so resource lookups no longer rely on absolute or CWD-specific literals.
 
-- [x] Ensure `ensure_cupy_pool_initialized()`:
-  - Is idempotent (uses a `_done` flag).
-  - Optionally accepts a `device_id` but does not crash on invalid IDs.
-- [x] Ensure `free_cupy_memory_pools()`:
-  - Is called at the end of heavy GPU sections (e.g. GPU stacking, GPU reprojection).
-  - Frees both device and pinned memory pools via `cp.get_default_memory_pool().free_all_blocks()` and similar.
+### 1.2 Handling “frozen” versus “source” execution
 
-If missing, **add** calls to `free_cupy_memory_pools()` in GPU-heavy functions’ `finally` blocks.
+- [x] In a central place (e.g. `zemosaic_utils.py`), add a helper:
 
+  ```python
+  def get_app_base_dir() -> Path:
+      if getattr(sys, "frozen", False):
+          return Path(sys._MEIPASS) if hasattr(sys, "_MEIPASS") else Path(sys.executable).parent
+      return Path(__file__).resolve().parent
+ Use get_app_base_dir() to locate:
 
-## 2. GPU usage in stacking (`zemosaic_align_stack.py`)
+icon/ folder
 
-### 2.1 Usage of GPU helpers
+locales/ folder
 
-- [x] Confirm `zemosaic_align_stack.py` imports `zemosaic_utils` and retrieves:
-  - `ensure_cupy_pool_initialized`
-  - `free_cupy_memory_pools`
-  - `gpu_memory_sufficient`
-- [x] Confirm helper functions exist:
-  - `_ensure_gpu_pool()`
-  - `_free_gpu_pools()`
-  - `_has_gpu_budget(estimated_bytes: int) -> bool`
+Other static resources
 
-If any of these are missing or duplicate, **harmonise** them to use the central helpers from `zemosaic_utils.py`.
+ Replace any direct use of __file__ for resource lookup by calls to that helper.
 
-### 2.2 GPU winsorised / kappa-sigma stacking
+Goal: icons/locales/resources resolve correctly both in “plain Python” and in frozen executables on all platforms.
 
-For GPU stack functions (`gpu_stack_winsorized`, `gpu_stack_kappa` etc.):
+Status: `get_app_base_dir()`/`get_user_config_dir()` now live in `zemosaic_utils` and are consumed by GUIs, config, translation scripts, alignment helpers, and solver settings so every resource (icons, locales, helper JSON/scripts) resolves correctly for both source and frozen builds.
 
-- [x] Before allocating large arrays (e.g. `(N, H, W)` frames, masks, intermediate buffers):
-  - Compute `estimated_bytes` realistically.
-  - Use `_has_gpu_budget(estimated_bytes)` to decide if the GPU path is allowed.
-- [x] If `_has_gpu_budget` returns `False`:
-  - Log a GPU fallback message (see section 4).
-  - Immediately fall back to CPU stacking (`cpu_stack_winsorized` / `cpu_stack_kappa` etc.).
-- [x] Wrap GPU code in `try / except` to catch:
-  - `cupy.cuda.memory.OutOfMemoryError`
-  - Any other GPU-related exceptions
-- [x] On such exceptions:
-  - Log a `gpu_fallback_runtime_error` message.
-  - Fall back to CPU stacking.
+2. Config, logs and temp directories
+2.1 Config storage
+- [x] Use `get_user_config_dir()` (helper now in `zemosaic_utils`) for every persistent config: the main GUI config, worker logs/memmaps, solver settings, and even helper exports (Qt filter CSV) all live under the per-user ZeMosaic directory so Windows/macOS/Linux share the same convention.
 
-### 2.3 Chunking logic
+2.2 Temp directories
+- [x] Added `zemosaic_utils.get_runtime_temp_dir()` so every component shares a dedicated subfolder inside the system temp directory; worker/astrometry temp allocations (`mkdtemp`, lock dirs, memmaps) now route through this helper with per-user fallbacks, eliminating ad-hoc `/tmp`/`C:\Temp` usage.
 
-- [x] Review `_iter_row_chunks(total_rows, frames, width, itemsize, max_chunk_bytes)`:
-  - Ensure it is used in GPU stacking when dealing with very large images.
-  - If GPU stacking still tries to allocate giant arrays in one go, refactor it to process row chunks instead.
-- [x] Tie `max_chunk_bytes` to:
-  - A reasonable default (e.g. 128–256 MB).
-  - A dynamic limit based on `gpumemory_sufficient` and `memGetInfo()`, to adapt to available memory.
+3. GUIs (Tk and Qt) — cross-platform behaviour
+3.1 Tk GUI (zemosaic_gui.py, zemosaic_filter_gui.py)
+ Verify window icons are loaded using get_app_base_dir() / "icon" / ....
 
-Goal: GPU stacking should **never** exit with a raw OOM; it should either:
-- reduce chunk size automatically, or
-- fall back to CPU with a clear log.
+ Ensure file dialogs that select folders/files use:
 
+Native Tk APIs (filedialog.askopenfilename, askdirectory) without OS-specific assumptions.
 
-## 3. GPU usage in final mosaic assembly (`zemosaic_utils.py` + `zemosaic_worker.py`)
+ Check window geometry saving / restoring:
 
-### 3.1 GPU reprojection and coadd functions
+Use platform-agnostic strings (e.g. "800x600+100+100").
 
-- [x] In `zemosaic_utils.py`, locate GPU reprojection/coadd functions (e.g. `gpu_assemble_final_mosaic_reproject_coadd`, `gpu_assemble_final_mosaic_incremental`, `gpu_reproject_and_coadd_impl`, `reproject_and_coadd_wrapper`).
-- [x] Ensure they:
-  - Check `gpu_is_available()` first.
-  - Estimate memory usage for:
-    - Mosaic accumulators (`H x W` float32 arrays for sum/weights).
-    - Any per-tile buffers.
-  - Use `gpu_memory_sufficient` with a reasonable safety margin (e.g. `0.7–0.8`).
-- [x] If memory is insufficient **before** starting GPU work:
-  - Log `gpu_fallback_insufficient_memory`.
-  - Call the CPU implementation (`cpu_reproject_and_coadd` or equivalent).
+Avoid any behaviour that depends on Windows window managers only.
 
-- [x] Wrap the main GPU code in `try / except` and on exceptions:
-  - Log `gpu_fallback_runtime_error`.
-  - Fall back to CPU if `allow_cpu_fallback` is `True`.
-  - If `allow_cpu_fallback` is `False`, re-raise the exception so the caller can surface a proper error.
+3.2 Qt GUI (zemosaic_gui_qt.py, zemosaic_filter_gui_qt.py)
+ Verify icons are loaded via QIcon(str(get_app_base_dir() / "icon" / "...")).
 
-- [x] Ensure that GPU-only kwargs (like `tile_affine_corrections`, `rows_per_chunk`, GPU-specific tuning parameters) are stripped from kwargs before calling the CPU function.
+ Check menubar / toolbar usage:
 
-### 3.2 Worker integration
+On macOS, main menus can behave differently; ensure you don't rely on Windows-only shortcuts.
 
-In `zemosaic_worker.py`:
+ Ensure any file path used in Qt widgets (lists of images, logs, etc.) is handled via Path and converted to string only at the UI boundary.
 
-- [x] Identify where the worker chooses final assembly method and GPU usage (Phase 5):
-  - `final_assembly_method` (`reproject`, `incremental`, etc.)
-  - `use_gpu_phase5` or similar flags taken from `global_plan` / config.
-- [x] Ensure the worker:
-  - Passes `use_gpu=True/False` to the reprojection wrappers based on config and availability.
-  - Logs when GPU is requested but `gpu_is_available()` is false (`gpu_fallback_unavailable`).
-  - Logs when GPU is requested but memory is insufficient or a runtime error occurs.
+3.3 Locale loading
+ In zemosaic_localization.py, ensure:
 
-Goal: from logs alone, a user should see clearly whether:
-- Phase 5 ran on GPU or CPU,
-- and if CPU, exactly why.
+Locale files are loaded from get_app_base_dir() / "locales".
 
+File opening uses encoding="utf-8".
 
-## 4. Logging and localisation
+Goal: both GUIs must work out of the box on all OSes, with icons and translations.
 
-### 4.1 Logging keys
+4. Multiprocessing and worker model
+ Inspect modules using multiprocessing (likely zemosaic_worker.py / stacker code).
 
-- [x] Add new message keys in the logging / localization layer (if not already present), such as:
-  - `gpu_info_summary` — “GPU detected: {name}, VRAM: {total_mb:.0f} MB, free: {free_mb:.0f} MB.”
-  - `gpu_fallback_unavailable` — “GPU helpers requested but CuPy is not available. Falling back to CPU.”
-  - `gpu_fallback_insufficient_memory` — “GPU memory guard: estimated {estimated_mb:.1f} MB vs allowed {allowed_mb:.1f} MB. Falling back to CPU.”
-  - `gpu_fallback_runtime_error` — “GPU processing error: {error}. Falling back to CPU.”
-- [x] Implement these in both:
-  - `locales/en.json`
-  - `locales/fr.json`
+ Ensure:
 
-### 4.2 Integration in callbacks
+Any process spawning is invoked from inside if __name__ == "__main__":.
 
-- [x] Use the existing progress callback (`pcb`) / logger in `zemosaic_worker.py` to emit these messages with appropriate log levels:
-  - INFO or INFO_DETAIL for informational messages.
-  - WARN for fallbacks that still complete the run.
-  - ERROR only if the whole run fails.
+Worker target functions are top-level functions (importable).
 
-- [x] Where GPU helpers are used outside the worker (e.g. in `zemosaic_utils.py` utility scripts or GUIs), use Python logging (`logging.getLogger(__name__)`) with consistent messages.
+No global state is mutated at import time in a way that breaks with the spawn start method on Windows/macOS.
 
-Goal: no GPU-related decision (use or fallback) should be **silent**.
+ Where necessary, guard code that should only run in the main process.
 
+Goal: avoid deadlocks or crashes that only happen on Windows because of spawn.
 
-## 5. GUI and config alignment
+5. External tools and shell commands
+ Search for usage of os.system, subprocess.run, or use of external binaries (ASTAP, astrometry.net, etc.).
 
-### 5.1 Tk GUI (`zemosaic_gui.py`)
+ For each case:
 
-- [x] Ensure GPU-related options in the Tk GUI:
-  - Read and write `use_gpu_phase5` in the configuration.
-  - Synchronise legacy flags (`stack_use_gpu`, `use_gpu_stack`) to this canonical flag via `_synchronize_legacy_gpu_flags`.
-- [x] Confirm that when the Tk GUI launches a run:
-  - The config handed to the worker clearly indicates whether GPU is requested for Phase 5 and/or stacking.
+Avoid hardcoded executable paths like "C:\\Program Files\\...".
 
-### 5.2 Qt GUI (`zemosaic_gui_qt.py`)
+Look up paths from:
 
-- [x] Mirror the same logic as in Tk:
-  - Maintain a canonical GPU flag in the Qt config.
-  - Ensure the “Use GPU” checkbox/selector sets the correct fields.
-- [x] If there is a GPU selector combobox (CPU/GPU auto/off), ensure:
-  - Values map cleanly to boolean `use_gpu_phase5` (or similar).
-  - Changes are persisted and restored from the config.
+Config file entries, or
 
-### 5.3 Filter Qt GUI (`zemosaic_filter_gui_qt.py`)
+Environment variables, or
 
-- [x] If Mosaic-First / special modes (like ZeSupaDupStack) include GPU hints:
-  - Ensure these hints are passed to the worker in a way consistent with the new GPU policy.
-- [x] Do not introduce duplicate GPU flags; piggyback on the same `use_gpu_phase5` / `stack_use_gpu` values.
+Standard system PATH.
 
+ If you need to “open a folder” in the OS file explorer, create a helper in zemosaic_utils.py:
 
-## 6. Optional: GPU diagnostics helper
+python
+Copier le code
+def reveal_in_file_explorer(path: Path) -> None:
+    system = platform.system()
+    if system == "Windows":
+        subprocess.run(["explorer", str(path)], check=False)
+    elif system == "Darwin":
+        subprocess.run(["open", str(path)], check=False)
+    else:
+        subprocess.run(["xdg-open", str(path)], check=False)
+and use it instead of inline OS-specific commands.
 
-If you deem it low risk and helpful:
+Goal: all external tool usage is configurable and does not assume a specific OS layout.
 
-- [x] Add an optional “GPU diagnostics” helper in `zemosaic_utils.py` that:
-  - Queries device name, total and free VRAM.
-  - Logs a `gpu_info_summary` message once per run.
-- [x] Call it from the worker at the very beginning of `run_hierarchical_mosaic` when GPU is enabled in config.
+6. Logging, encoding, and console behaviour
+ Ensure log files are opened with encoding="utf-8".
 
-This is optional but can greatly help users understand what the GPU is doing.
+ Avoid assumptions about console encoding (like cp1252).
 
+ Do not rely on ANSI escape codes for colours unless protected by checks (Windows cmd may need special handling). If colours are used, they should degrade gracefully.
 
-## 7. Final sanity checks
+7. Sanity tests per platform (to run manually later)
+- [x] Document a repeatable smoke-suite for Windows/macOS/Linux (source + frozen) that exercises Tk + Qt GUIs, the filter UI, worker, and resource loading so regressions can be caught quickly.
+  - Status: Checklist below; update whenever a new feature introduces OS-specific risk.
 
-- [x] Run the test scenarios (or create synthetic ones) for:
-  - CPU-only system (no CuPy).
-  - GPU present but small VRAM (simulate with aggressive safety fractions and large inputs).
-  - GPU present with plenty of VRAM.
-- [x] Confirm from logs that:
-  - GPU is used when reasonable.
-  - CPU fallback happens only with clear, understandable reasons.
-  - No uncaught OOM or cryptic CuPy errors reach the user.
+### Windows (source install)
+1. Start from a clean profile by removing `%APPDATA%\ZeMosaic` (the `get_user_config_dir()` location).
+2. `pip install -r requirements.txt`; then run `python run_zemosaic.py` and confirm the Tk GUI launches with the ZeMosaic icon and English strings.
+3. In Tk, open the sample `example/lights` directory, run the Filter dialog, and launch the worker; confirm output appears under `example/out` and logs land in `%APPDATA%\ZeMosaic\logs`.
+4. `pip install PySide6` and launch `python run_zemosaic.py --qt-gui`; verify the Qt UI paints icons/toolbars correctly, menus remain responsive, and closing/reopening restores the previous window geometry from the config.
+5. Launch `python zemosaic_filter_gui.py` and `python zemosaic_filter_gui_qt.py` separately, confirm the global WCS export+reopen workflow works and paths are shown with Windows separators.
+6. From either GUI use “Reveal output folder” (if available) or `zemosaic_utils.reveal_in_file_explorer` via the log panel to ensure Explorer opens the path without shell errors.
 
-Once all boxes are checked, the GPU/memory review can be considered complete.
+### macOS (source install)
+1. Reset `~/Library/Application Support/ZeMosaic` and install deps via `python3 -m pip install -r requirements.txt`.
+2. Launch `python3 run_zemosaic.py` (Tk) and ensure the dock icon uses `icon/zemosaic.icns`, menus appear in the macOS global menubar, and file dialogs default to the last used directory.
+3. Install PySide6, run `python3 run_zemosaic.py --qt-gui`, and verify Retina rendering, native title bar buttons, and that keyboard shortcuts use the Command key (Open, Save plan, Quit).
+4. Open `example/lights`, kick off a short worker run and check that the progress window stays on top and logs stream to `~/Library/Application Support/ZeMosaic/logs`.
+5. Run both filter GUIs, confirm drag-and-drop and the “Force Seestar workflow” toggle update the generated worker plan, and ensure macOS Gatekeeper prompts do not appear because all binaries stay inside the project tree.
+6. Trigger the “open containing folder” helper to confirm it uses `open <path>` without quoting issues.
+
+### Linux (source install)
+1. Clear `~/.config/ZeMosaic`, install deps (`python3 -m pip install -r requirements.txt`), and run `python3 run_zemosaic.py` in Tk mode under both X11 and Wayland sessions.
+2. Use Tk GUI to load `example/lights`, confirm locale switching (Settings → Language) reloads `locales/*.json`, and run a small stack to verify temporary files go to `$XDG_RUNTIME_DIR` or `/tmp` via `get_runtime_temp_dir()`.
+3. Install PySide6 (ensure Qt platform plugin is present), run `python3 run_zemosaic.py --qt-gui`, and verify the app respects the current theme, uses forward slashes in UI labels, and that closing the window shuts down background workers cleanly.
+4. Run `python3 zemosaic_filter_gui.py` and `python3 zemosaic_filter_gui_qt.py`, ensuring folder pickers default to `$HOME` and that symbolic links in the dataset path are preserved.
+5. Manually start `python3 zemosaic_worker.py --plan <path/to/generated_plan.json>` to confirm multiprocessing spawn/fork both work (especially on distributions defaulting to `spawn` such as Ubuntu 24.04).
+6. Verify `reveal_in_file_explorer()` uses `xdg-open` and prints a friendly warning if `xdg-open` is missing.
+
+### Frozen-build smoke checks
+1. Build via `python -m PyInstaller ZeMosaic.spec` (Windows) or the provided `.spec`/`.spec` equivalents on macOS/Linux; ensure `icon/`, `locales/`, and sample data are bundled via `get_app_base_dir()`.
+2. Run the frozen Tk build on each OS, open `example/lights`, and confirm relative paths resolve even when launched from another directory.
+3. Run the frozen Qt build (when PySide6 is included) and ensure translations, icons, and solver discovery behave the same as the source version.
+4. On Windows/macOS verify double-clicking the packaged executable respects the per-user config directory and does not write next to the executable; on Linux verify the AppDir/AppImage respects `$XDG_CONFIG_HOME`.
+5. For each platform, unplug any optional external solvers (e.g., ASTAP) and confirm the UI shows the “missing solver” dialog instead of crashing.
+
+Once all steps above pass on at least two OSes (ideally three), we can sign off the release as cross-platform ready.

@@ -61,11 +61,26 @@ import shutil
 import importlib
 import importlib.util
 import json
+from pathlib import Path
 from typing import Any, MutableMapping, Optional
+
+from zemosaic_utils import get_app_base_dir
 
 SYSTEM_NAME = platform.system().lower()
 IS_WINDOWS = SYSTEM_NAME == "windows"
 IS_MAC = SYSTEM_NAME == "darwin"
+FITS_EXTENSIONS = {".fit", ".fits"}
+
+
+def _expand_to_path(value: Optional[str]) -> Optional[Path]:
+    """Expand ``value`` to a Path relative to the current user home."""
+
+    if not value:
+        return None
+    try:
+        return Path(value).expanduser()
+    except Exception:
+        return None
 
 if IS_WINDOWS:
     try:
@@ -232,24 +247,24 @@ class ZeMosaicGUI:
 
         # --- Définir l'icône ZeMosaic (multi-plateforme) ---
         try:
-            base_path = os.path.dirname(os.path.abspath(__file__))
-            icon_dir = os.path.join(base_path, "icon")
+            base_path = get_app_base_dir()
+            icon_dir = base_path / "icon"
 
-            ico_path = os.path.join(icon_dir, "zemosaic.ico")
+            ico_path = icon_dir / "zemosaic.ico"
             png_candidates = [
-                os.path.join(icon_dir, "zemosaic.png"),
-                os.path.join(icon_dir, "zemosaic_icon.png"),
-                os.path.join(icon_dir, "zemosaic_64x64.png"),
+                icon_dir / "zemosaic.png",
+                icon_dir / "zemosaic_icon.png",
+                icon_dir / "zemosaic_64x64.png",
             ]
 
-            if IS_WINDOWS and os.path.exists(ico_path):
-                self.root.iconbitmap(default=ico_path)
+            if IS_WINDOWS and ico_path.is_file():
+                self.root.iconbitmap(default=str(ico_path))
             else:
                 from tkinter import PhotoImage
 
-                png_path = next((p for p in png_candidates if os.path.exists(p)), None)
+                png_path = next((p for p in png_candidates if p.is_file()), None)
                 if png_path:
-                    self.root.iconphoto(True, PhotoImage(file=png_path))
+                    self.root.iconphoto(True, PhotoImage(file=str(png_path)))
         except Exception as e_icon:
             print(f"AVERT GUI: icône ZeMosaic non appliquée ({e_icon})")
 
@@ -310,7 +325,9 @@ class ZeMosaicGUI:
         ):
             value = self.config.get(key)
             if isinstance(value, str) and value:
-                self.config[key] = os.path.expanduser(value)
+                expanded = _expand_to_path(value)
+                if expanded:
+                    self.config[key] = str(expanded)
 
         # Phase 4.5 (inter-master merge) stays in the codebase but must not be user-activable for this release.
         # Force the flag off regardless of persisted config so the worker never receives an enabled state.
@@ -964,10 +981,14 @@ class ZeMosaicGUI:
         # ... (logique de détection des langues) ...
         if self.localizer and hasattr(self.localizer, 'locales_dir_abs_path') and self.localizer.locales_dir_abs_path:
             try:
-                available_langs = sorted([
-                    f.split('.')[0] for f in os.listdir(self.localizer.locales_dir_abs_path) 
-                    if f.endswith(".json") and os.path.isfile(os.path.join(self.localizer.locales_dir_abs_path, f))
-                ])
+                locales_dir = Path(self.localizer.locales_dir_abs_path)
+                available_langs = sorted(
+                    [
+                        locale_file.stem
+                        for locale_file in locales_dir.iterdir()
+                        if locale_file.is_file() and locale_file.suffix.lower() == ".json"
+                    ]
+                )
                 if not available_langs: available_langs = ['en','fr'] 
             except FileNotFoundError: available_langs = ['en', 'fr']
             except Exception: available_langs = ['en', 'fr']
@@ -2556,7 +2577,8 @@ class ZeMosaicGUI:
             return
 
         input_dir = self.input_dir_var.get().strip()
-        if not (input_dir and os.path.isdir(input_dir)):
+        input_dir_path = _expand_to_path(input_dir)
+        if not (input_dir_path and input_dir_path.is_dir()):
             messagebox.showerror(self._tr("error_title"), self._tr("invalid_input_folder_error"), parent=self.root)
             return
 
@@ -2564,9 +2586,9 @@ class ZeMosaicGUI:
         # a full upfront crawl (which can freeze the UI on large trees).
         has_fits = False
         try:
-            for root_dir, _dirs, files in os.walk(input_dir):
+            for root_dir, _dirs, files in os.walk(str(input_dir_path)):
                 for fn in files:
-                    if fn.lower().endswith((".fit", ".fits")):
+                    if Path(fn).suffix.lower() in FITS_EXTENSIONS:
                         has_fits = True
                         break
                 if has_fits:
@@ -3457,7 +3479,10 @@ class ZeMosaicGUI:
         data = payload or {}
         last_out = data.get("out")
         if last_out:
-            self.phase45_last_out = os.path.basename(last_out)
+            try:
+                self.phase45_last_out = Path(last_out).name
+            except Exception:
+                self.phase45_last_out = last_out
         gid = data.get("group_id")
         try:
             gid_int = int(gid)
@@ -3830,23 +3855,32 @@ class ZeMosaicGUI:
 
         # 2. VALIDATIONS (chemins, etc.)
         # ... (section de validation inchangée pour l'instant)
-        if not (input_dir and os.path.isdir(input_dir)): 
+        input_dir_path = _expand_to_path(input_dir)
+        if not (input_dir_path and input_dir_path.is_dir()): 
             messagebox.showerror(self._tr("error_title"), self._tr("invalid_input_folder_error"), parent=self.root); return
-        if not output_dir: 
+        input_dir = str(input_dir_path)
+        output_dir_path = _expand_to_path(output_dir)
+        if not output_dir_path: 
             messagebox.showerror(self._tr("error_title"), self._tr("missing_output_folder_error"), parent=self.root); return
         try: 
-            os.makedirs(output_dir, exist_ok=True)
+            output_dir_path.mkdir(parents=True, exist_ok=True)
         except OSError as e: 
             messagebox.showerror(self._tr("error_title"), self._tr("output_folder_creation_error", error=e), parent=self.root); return
-        if not (astap_exe and os.path.isfile(astap_exe)): 
+        output_dir = str(output_dir_path)
+        astap_exe_path = _expand_to_path(astap_exe)
+        if not (astap_exe_path and astap_exe_path.is_file()): 
             messagebox.showerror(self._tr("error_title"), self._tr("invalid_astap_exe_error"), parent=self.root); return
-        if not (astap_data and os.path.isdir(astap_data)):
+        astap_exe = str(astap_exe_path)
+        astap_data_path = _expand_to_path(astap_data)
+        if not (astap_data_path and astap_data_path.is_dir()):
             if not messagebox.askokcancel(self._tr("astap_data_dir_title", "ASTAP Data Directory"),
                                           self._tr("astap_data_dir_missing_or_invalid_continue_q",
-                                                   path=astap_data,
+                                                   path=str(astap_data_path) if astap_data_path else astap_data,
                                                    default_path=self.config.get("astap_data_directory_path","")),
                                           icon='warning', parent=self.root):
                 return
+        elif astap_data_path:
+            astap_data = str(astap_data_path)
 
         # 2bis. Choix utilisateur concernant l'ouverture du filtre
         if not skip_filter_ui_for_run:
@@ -4523,16 +4557,18 @@ class ZeMosaicGUI:
                     self.file_count_var.set("")
                 if hasattr(self, "phase_var"):
                     self.phase_var.set("")
-                output_dir_final = self.output_dir_var.get()
-                if output_dir_final and os.path.isdir(output_dir_final):
-                    if messagebox.askyesno(self._tr("q_open_output_folder_title"), self._tr("q_open_output_folder_msg", folder=output_dir_final), parent=self.root):
+                output_dir_final = _expand_to_path(self.output_dir_var.get())
+                if output_dir_final and output_dir_final.is_dir():
+                    folder_display = str(output_dir_final)
+                    if messagebox.askyesno(self._tr("q_open_output_folder_title"), self._tr("q_open_output_folder_msg", folder=folder_display), parent=self.root):
                         try:
+                            folder_arg = str(output_dir_final)
                             if os.name == 'nt':
-                                os.startfile(output_dir_final)
+                                os.startfile(folder_arg)
                             elif sys.platform == 'darwin':
-                                subprocess.Popen(['open', output_dir_final])
+                                subprocess.Popen(['open', folder_arg])
                             else:
-                                subprocess.Popen(['xdg-open', output_dir_final])
+                                subprocess.Popen(['xdg-open', folder_arg])
                         except Exception as e_open_dir:
                             self._log_message(self._tr("log_key_error_opening_folder", error=e_open_dir), level="ERROR")
                             messagebox.showerror(

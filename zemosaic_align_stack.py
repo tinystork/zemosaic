@@ -49,6 +49,7 @@ import os
 import importlib.util
 import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Callable, Any, Iterable, Sequence
 
 GPU_AVAILABLE = importlib.util.find_spec("cupy") is not None
@@ -58,6 +59,15 @@ import logging  # Added for logger fallback
 import time
 import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+
+try:
+    from zemosaic_utils import get_app_base_dir  # type: ignore
+except Exception:  # pragma: no cover - fallback for standalone usage
+    def get_app_base_dir() -> Path:
+        try:
+            return Path(__file__).resolve().parent
+        except Exception:
+            return Path.cwd()
 
 try:  # NumPy 2.x exposes _ArrayMemoryError here
     from numpy.core._exceptions import _ArrayMemoryError as _NumpyArrayMemoryError
@@ -965,10 +975,9 @@ cpu_stack_winsorized = None
 cpu_stack_kappa = None
 cpu_stack_linear = None
 try:
-    import importlib.util, os, pathlib
-    _sm_path = pathlib.Path(__file__).resolve().parents[1] / 'seestar' / 'core' / 'stack_methods.py'
-    if _sm_path.exists():
-        spec = importlib.util.spec_from_file_location('seestar_stack_methods', _sm_path)
+    seestar_root = get_app_base_dir() / "seestar" / "core" / "stack_methods.py"
+    if seestar_root.is_file():
+        spec = importlib.util.spec_from_file_location('seestar_stack_methods', seestar_root)
         _sm = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(_sm)  # type: ignore
         cpu_stack_winsorized = getattr(_sm, '_stack_winsorized_sigma', None)

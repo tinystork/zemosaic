@@ -47,8 +47,31 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
+import shutil
 import threading
+from pathlib import Path
+
+try:
+    from core.path_helpers import safe_path_exists
+except Exception:  # pragma: no cover - standalone usage outside ZeMosaic
+    def safe_path_exists(path, *, expanduser: bool = True):
+        """Best-effort path existence check when core helpers are unavailable."""
+
+        if path is None:
+            return False
+        try:
+            path_obj = Path(path)
+        except Exception:
+            return False
+        if expanduser:
+            try:
+                path_obj = path_obj.expanduser()
+            except Exception:
+                pass
+        try:
+            return path_obj.exists()
+        except Exception:
+            return False
 
 import numpy as np
 
@@ -91,6 +114,83 @@ except Exception:
     _binary_erosion = None
     _binary_dilation = None
 
+IMAGE_EXTENSIONS = (".fits", ".fit", ".fts", ".png", ".tif", ".tiff")
+
+
+def _expand_path(pathish) -> Path | None:
+    """Return a Path with user expansion, tolerating bad inputs."""
+
+    if pathish is None:
+        return None
+    try:
+        path_obj = Path(pathish)
+    except Exception:
+        return None
+    try:
+        return path_obj.expanduser()
+    except Exception:
+        return path_obj
+
+
+def _is_supported_image(path_obj: Path) -> bool:
+    try:
+        return path_obj.suffix.lower() in IMAGE_EXTENSIONS
+    except Exception:
+        return False
+
+
+def _collect_image_files(directory: Path) -> list[Path]:
+    """Return all supported images under *directory* (non-recursive on errors)."""
+
+    files: list[Path] = []
+    if not directory.exists():
+        return files
+    try:
+        iterator = directory.rglob("*")
+    except Exception:
+        return files
+    for candidate in iterator:
+        try:
+            if candidate.is_file() and _is_supported_image(candidate):
+                files.append(candidate)
+        except Exception:
+            continue
+    return files
+
+
+def _common_parent(paths: list[Path]) -> Path:
+    """Best-effort parent directory shared by *paths*."""
+
+    if not paths:
+        return Path.cwd()
+    anchor = paths[0].expanduser().resolve(strict=False).parent
+    shared_parts = list(anchor.parts)
+    for path in paths[1:]:
+        candidate = path.expanduser().resolve(strict=False).parent
+        new_parts: list[str] = []
+        for left, right in zip(shared_parts, candidate.parts):
+            if left != right:
+                break
+            new_parts.append(left)
+        if not new_parts:
+            shared_parts = []
+            break
+        shared_parts = new_parts
+    if shared_parts:
+        return Path(*shared_parts)
+    return anchor
+
+
+def _ensure_unique_destination(target: Path) -> Path:
+    """Return a path that does not exist by suffixing _N if needed."""
+
+    candidate = target
+    index = 1
+    while safe_path_exists(candidate, expanduser=False):
+        candidate = target.with_name(f"{target.stem}_{index}{target.suffix}")
+        index += 1
+    return candidate
+
 
 class BufferPool:
     def __init__(self):
@@ -121,8 +221,8 @@ def _alert_zemosaic_missing(root):
     if _zemosaic_warning_shown:
         return
     _zemosaic_warning_shown = True
-    current = os.path.join(os.getcwd(), "run_zemosaic.py")
-    if os.path.exists(current):
+    current = Path.cwd() / "run_zemosaic.py"
+    if safe_path_exists(current, expanduser=False):
         return
     if messagebox is None:
         return
@@ -134,14 +234,17 @@ def _alert_zemosaic_missing(root):
 
 # ---------------- IO ----------------
 def _read_image(path):
-    ext = os.path.splitext(path)[1].lower()
+    path_obj = _expand_path(path)
+    if path_obj is None:
+        raise ValueError(f"Invalid path: {path!r}")
+    ext = path_obj.suffix.lower()
     if ext in (".fits", ".fit", ".fts") and fits:
-        with fits.open(path, memmap=True, do_not_scale_image_data=True) as hdul:
+        with fits.open(path_obj, memmap=True, do_not_scale_image_data=True) as hdul:
             arr = np.asarray(hdul[0].data, dtype=np.float32)
     else:
         if Image is None:
             raise RuntimeError("Pillow manquant pour lire PNG/TIFF.")
-        arr = np.asarray(Image.open(path).convert("RGB"), dtype=np.float32) / 255.0
+        arr = np.asarray(Image.open(path_obj).convert("RGB"), dtype=np.float32) / 255.0
     # HxW or HxWxC → HxWxC float32
     if arr.ndim == 2:
         arr = arr[..., None]
@@ -424,37 +527,38 @@ def _accept_override(m, thr):
     return False
 
 def run_cli(paths, threshold=0.48, move_rejects=False, edge_band=64, k_sigma=2.5, erode_px=3, progress_callback=None):
-    accepted, rejected, scores = [], [], {}
-    rej_dir = None
-    if move_rejects:
-        root = os.path.commonpath(paths) if len(paths) > 1 else os.path.dirname(paths[0])
-        rej_dir = os.path.join(root, "rejected_by_quality"); os.makedirs(rej_dir, exist_ok=True)
-    total = len(paths)
-    for p in paths:
+    normalized_paths = [_expand_path(p) for p in paths]
+    normalized_paths = [p for p in normalized_paths if p is not None]
+    accepted: list[str] = []
+    rejected: list[str] = []
+    scores: dict[str, float] = {}
+    rej_dir: Path | None = None
+    if move_rejects and normalized_paths:
+        root = _common_parent(normalized_paths)
+        rej_dir = root / "rejected_by_quality"
+        rej_dir.mkdir(parents=True, exist_ok=True)
+    total = len(normalized_paths)
+    for path_obj in normalized_paths:
+        path_str = str(path_obj)
         keep = False
         s = float("nan")
         try:
-            arr = _read_image(p)
+            arr = _read_image(path_obj)
             m = quality_metrics(arr, edge_band=edge_band, k_sigma=k_sigma, erode_px=erode_px)
-            s = m["score"]; scores[p] = s
+            s = m["score"]
+            scores[path_str] = s
             keep = (s <= threshold) or _accept_override(m, threshold)
             if keep:
-                accepted.append(p)
+                accepted.append(path_str)
             else:
-                rejected.append(p)
+                rejected.append(path_str)
                 if rej_dir:
-                    import shutil
-                    dst = os.path.join(rej_dir, os.path.basename(p))
-                    if os.path.exists(dst):
-                        base, ext = os.path.splitext(dst); i = 1
-                        while os.path.exists(f"{base}_{i}{ext}"):
-                            i += 1
-                        dst = f"{base}_{i}{ext}"
-                    shutil.move(p, dst)
+                    dst = _ensure_unique_destination(rej_dir / path_obj.name)
+                    shutil.move(path_obj, dst)
             # Enrichir l’en-tête FITS si possible
-            if p.lower().endswith((".fits", ".fit", ".fts")) and fits:
+            if path_obj.suffix.lower() in (".fits", ".fit", ".fts") and fits:
                 try:
-                    with fits.open(p, mode="update") as hdul:
+                    with fits.open(path_obj, mode="update") as hdul:
                         hdr = hdul[0].header
                         hdr["ZMT_QS"]  = (round(m["score"], 3), "ZeQuality score (0=good)")
                         hdr["ZMT_QBD"] = (int(not keep), "1 if auto-rejected")
@@ -465,11 +569,12 @@ def run_cli(paths, threshold=0.48, move_rejects=False, edge_band=64, k_sigma=2.5
                 except Exception:
                     pass
         except Exception:
-            rejected.append(p); scores[p] = float("nan")
+            rejected.append(path_str)
+            scores[path_str] = float("nan")
         if progress_callback:
             try:
                 idx = len(accepted) + len(rejected)
-                progress_callback(idx, total, p, keep, s if "s" in locals() else float("nan"))
+                progress_callback(idx, total, path_str, keep, s)
             except Exception:
                 pass
     manifest = {"accepted": accepted, "rejected": rejected, "scores": scores}
@@ -569,7 +674,11 @@ class QualityGUI:
         total = max(total, 1)
         self.progress["maximum"] = total
         self.progress["value"] = idx
-        status = f"{idx}/{total} {os.path.basename(path)}"
+        try:
+            name = Path(path).name
+        except Exception:
+            name = str(path) if path else "<unknown>"
+        status = f"{idx}/{total} {name}"
         status += " — accepted" if kept else " — rejected"
         self.status_lbl.config(text=status)
 
@@ -612,11 +721,11 @@ class QualityGUI:
             return
         d = filedialog.askdirectory(title="Pick folder of master tiles")
         if not d: return
-        paths = []
-        for r, _, files in os.walk(d):
-            for fn in files:
-                if fn.lower().endswith((".fits", ".fit", ".fts", ".png", ".tif", ".tiff")):
-                    paths.append(os.path.join(r, fn))
+        directory = _expand_path(d)
+        if directory is None:
+            messagebox.showwarning("Batch aborted", "Chemin invalide.")
+            return
+        paths = _collect_image_files(directory)
         if not paths:
             messagebox.showwarning("Batch aborted", "Aucun master tile trouvé dans ce dossier.")
             return
@@ -693,15 +802,15 @@ def main():
         return
 
     # expand folders
-    files = []
+    files: list[Path] = []
     for p in args.paths:
-        if os.path.isdir(p):
-            for r, _, fs in os.walk(p):
-                for fn in fs:
-                    if fn.lower().endswith((".fits", ".fit", ".fts", ".png", ".tif", ".tiff")):
-                        files.append(os.path.join(r, fn))
+        path_obj = _expand_path(p)
+        if path_obj is None:
+            continue
+        if path_obj.is_dir():
+            files.extend(_collect_image_files(path_obj))
         else:
-            files.append(p)
+            files.append(path_obj)
 
     res = run_cli(
         files,

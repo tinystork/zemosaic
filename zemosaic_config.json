@@ -11,9 +11,9 @@
     "qt_theme_mode": "dark",
     "qt_main_window_geometry": [
         2713,
-        80,
+        31,
         2327,
-        1169
+        1408
     ],
     "qt_filter_window_geometry": [
         3085,
@@ -88,7 +88,7 @@
     "winsor_memmap_fallback": "auto",
     "winsor_split_strategy": "sequential",
     "max_raw_per_master_tile": 0,
-    "center_out_normalization_p3": false,
+    "center_out_normalization_p3": true,
     "center_out_anchor_mode": "central_only",
     "anchor_quality_probe_limit": 12,
     "anchor_quality_span_range": [
@@ -96,7 +96,7 @@
         6.02
     ],
     "anchor_quality_median_clip_sigma": 2.5,
-    "enable_poststack_anchor_review": true,
+    "enable_poststack_anchor_review": false,
     "poststack_anchor_probe_limit": 12,
     "poststack_anchor_span_range": [
         0.004,

@@ -51,6 +51,10 @@ import json
 import logging
 import re
 import time
+import sys
+import platform
+import tempfile
+from functools import lru_cache
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Sequence
@@ -86,6 +90,65 @@ _PREVIEW_WCS_LINEARIZED_LOGGED = False
 
 
 EXCLUDED_DIRS = frozenset({"unaligned_by_zemosaic"})
+
+
+@lru_cache(maxsize=1)
+def get_app_base_dir() -> Path:
+    """Return the base directory that contains ZeMosaic resources."""
+
+    if getattr(sys, "frozen", False):
+        # PyInstaller-style bundles
+        base = getattr(sys, "_MEIPASS", None)
+        if base:
+            return Path(base)
+        try:
+            return Path(sys.executable).resolve().parent
+        except Exception:
+            return Path.cwd()
+    try:
+        return Path(__file__).resolve().parent
+    except Exception:
+        return Path.cwd()
+
+
+@lru_cache(maxsize=1)
+def get_user_config_dir() -> Path:
+    """Return the per-user configuration directory for ZeMosaic."""
+
+    home = Path.home()
+    system = platform.system().lower()
+    if system == "windows":
+        base = os.environ.get("APPDATA")
+        base_path = Path(base) if base else home / "AppData" / "Roaming"
+    elif system == "darwin":
+        base_path = home / "Library" / "Application Support"
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME")
+        base_path = Path(base) if base else home / ".config"
+    return base_path / "ZeMosaic"
+
+
+def ensure_user_config_dir() -> Path:
+    """Create the per-user configuration directory if needed."""
+
+    config_dir = get_user_config_dir()
+    try:
+        config_dir.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return config_dir
+
+
+@lru_cache(maxsize=1)
+def get_runtime_temp_dir() -> Path:
+    """Return a shared temporary directory for ZeMosaic runtime artifacts."""
+
+    base = Path(tempfile.gettempdir()) / "zemosaic_runtime"
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return Path(tempfile.gettempdir())
+    return base
 
 
 def is_path_excluded(path: Path | str, excluded_dirs: Iterable[str] | None = None) -> bool:
@@ -568,13 +631,18 @@ def _build_file_records(entries: Sequence[dict[str, Any]]) -> list[dict[str, Any
         path = entry.get("path")
         if not path:
             continue
-        norm = os.path.abspath(str(path))
-        if norm in seen:
-            continue
-        seen.add(norm)
-        record: dict[str, Any] = {"path": norm}
+        path_obj = Path(str(path)).expanduser()
         try:
-            stat = os.stat(norm)
+            norm_path = path_obj.resolve(strict=False)
+        except Exception:
+            norm_path = path_obj
+        norm_str = str(norm_path)
+        if norm_str in seen:
+            continue
+        seen.add(norm_str)
+        record: dict[str, Any] = {"path": norm_str}
+        try:
+            stat = norm_path.stat()
             record["mtime"] = float(stat.st_mtime)
             record["size"] = int(stat.st_size)
         except Exception:
@@ -809,17 +877,24 @@ def write_global_wcs_files(
     if header is None:
         raise ValueError("Descriptor missing FITS header data")
 
-    os.makedirs(os.path.dirname(fits_path) or ".", exist_ok=True)
-    os.makedirs(os.path.dirname(json_path) or ".", exist_ok=True)
+    fits_path_obj = Path(fits_path).expanduser()
+    json_path_obj = Path(json_path).expanduser()
+    fits_path_obj.parent.mkdir(parents=True, exist_ok=True)
+    json_path_obj.parent.mkdir(parents=True, exist_ok=True)
     primary_hdu = fits_module_for_utils.PrimaryHDU(header=header)
     hdul = fits_module_for_utils.HDUList([primary_hdu])
-    hdul.writeto(fits_path, overwrite=True, output_verify="silentfix")
+    hdul.writeto(str(fits_path_obj), overwrite=True, output_verify="silentfix")
     meta_payload = _descriptor_to_json_payload(descriptor)
-    meta_payload["fits_path"] = fits_path
-    meta_payload["json_path"] = json_path
-    with open(json_path, "w", encoding="utf-8") as handle:
+    meta_payload["fits_path"] = str(fits_path_obj)
+    meta_payload["json_path"] = str(json_path_obj)
+    with json_path_obj.open("w", encoding="utf-8") as handle:
         json.dump(meta_payload, handle, indent=2, sort_keys=True)
-    log.info("Global WCS artifacts written: %s (%dx%d)", fits_path, descriptor.get("width"), descriptor.get("height"))
+    log.info(
+        "Global WCS artifacts written: %s (%dx%d)",
+        fits_path_obj,
+        descriptor.get("width"),
+        descriptor.get("height"),
+    )
 
 
 def load_global_wcs_descriptor(
@@ -831,12 +906,13 @@ def load_global_wcs_descriptor(
     """Load an existing global WCS header + optional JSON metadata."""
 
     log = logger_override or logger
-    if not fits_path or not os.path.isfile(fits_path):
+    fits_path_obj = Path(fits_path).expanduser()
+    if not fits_path or not fits_path_obj.is_file():
         return None
     if not ASTROPY_WCS_AVAILABLE_IN_UTILS or AstropyWCS is None or fits_module_for_utils is None:
         raise RuntimeError("Astropy WCS/FITS is required to read the global mosaic header")
 
-    header = fits_module_for_utils.getheader(fits_path, 0)
+    header = fits_module_for_utils.getheader(str(fits_path_obj), 0)
     # Build a WCS object from the header even if NAXIS1/2 are missing.
     wcs_obj = AstropyWCS(header, naxis=2)
     # Some FITS writers reset NAXIS to 0 if no data array is attached. Our
@@ -846,13 +922,13 @@ def load_global_wcs_descriptor(
     height = int(header.get("NAXIS2", 0) or 0)
     px_scale = _compute_pixel_scale_for_wcs(wcs_obj) or 0.0
     meta_payload = None
-    json_candidate = json_path or Path(fits_path).with_suffix(".json")
+    json_candidate_obj = Path(json_path).expanduser() if json_path else fits_path_obj.with_suffix(".json")
     try:
-        if json_candidate and os.path.isfile(json_candidate):
-            with open(json_candidate, "r", encoding="utf-8") as handle:
+        if json_candidate_obj and json_candidate_obj.is_file():
+            with json_candidate_obj.open("r", encoding="utf-8") as handle:
                 meta_payload = json.load(handle)
     except Exception as exc_json:
-        log.warning("Global WCS: failed to read JSON metadata (%s): %s", json_candidate, exc_json)
+        log.warning("Global WCS: failed to read JSON metadata (%s): %s", json_candidate_obj, exc_json)
         meta_payload = None
 
     # Fallback to JSON width/height if FITS header lacks them
@@ -874,8 +950,8 @@ def load_global_wcs_descriptor(
         "pixel_scale_as_per_px": px_scale * 3600.0 if px_scale else 0.0,
         "files": meta_payload.get("files") if isinstance(meta_payload, dict) else [],
         "nb_images": meta_payload.get("nb_images") if isinstance(meta_payload, dict) else None,
-        "json_path": str(json_candidate),
-        "fits_path": fits_path,
+        "json_path": str(json_candidate_obj),
+        "fits_path": str(fits_path_obj),
         "source": "existing",
         "metadata": meta_payload,
     }
@@ -2284,7 +2360,7 @@ def load_and_validate_fits(filepath,
                            normalize_to_float32=True, # Si True, normalise la sortie à [0,1]
                            attempt_fix_nonfinite=True,
                            progress_callback=None):
-    filename = os.path.basename(filepath)
+    filename = Path(filepath).name
 
     def _log_util(message, level="DEBUG_DETAIL"):
         if progress_callback and callable(progress_callback):
@@ -2699,7 +2775,7 @@ def detect_and_correct_hot_pixels(image, threshold=3.0, neighborhood_size=5,
         if save_mask_path:
             try:
                 np.save(save_mask_path, mask_accum.astype(np.uint8))
-                _log_util_hp(f"Masque HP sauvegardé vers {os.path.basename(save_mask_path)}", "DEBUG_DETAIL")
+                _log_util_hp(f"Masque HP sauvegardé vers {Path(save_mask_path).name}", "DEBUG_DETAIL")
             except Exception as e_save:
                 _log_util_hp(f"ERREUR sauvegarde masque HP: {e_save}", "WARN")
         del mask_accum
@@ -3247,7 +3323,7 @@ def save_fits_image(image_data: np.ndarray,
         if pcb and callable(pcb): pcb(full_message, None, level)
         else: print(full_message)
 
-    base_output_filename = os.path.basename(output_path)
+    base_output_filename = Path(output_path).name
     _log_util_save(f"Début sauvegarde FITS vers '{base_output_filename}'. SaveAsFloat={save_as_float}", "INFO")
 
     # Utiliser le fits_module_for_utils défini globalement dans ce module

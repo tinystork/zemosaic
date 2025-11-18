@@ -43,12 +43,12 @@
 ║   No AIs or butter knives were harmed in the making of this code.                 ║
 ╚═══════════════════════════════════════════════════════════════════════════════════╝
 """
-import os
 import sys
 import traceback
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
+from pathlib import Path
 
 try:
     from astropy.io import fits
@@ -111,7 +111,14 @@ def clean_wcs_header_inplace(hdr) -> int:
             pass
     return deleted
 
-def process_fits(path: str, *, dry_run: bool, backup: bool, only_if_wcs: bool, all_hdus: bool) -> tuple[int, int]:
+def process_fits(
+    path: str | Path,
+    *,
+    dry_run: bool,
+    backup: bool,
+    only_if_wcs: bool,
+    all_hdus: bool,
+) -> tuple[int, int]:
     """
     Returns (deleted_cards_total, edited_hdus_count).
     """
@@ -119,10 +126,11 @@ def process_fits(path: str, *, dry_run: bool, backup: bool, only_if_wcs: bool, a
     edited_hdus = 0
 
     # Pre-check: skip non-files
-    if not os.path.isfile(path):
+    path_obj = Path(path).expanduser()
+    if not path_obj.is_file():
         return (0, 0)
 
-    with fits.open(path, mode="update") as hdul:
+    with fits.open(path_obj, mode="update") as hdul:
         targets = range(len(hdul)) if all_hdus else [0]
         # Optional 'only if WCS' gate: check any target has WCS
         if only_if_wcs:
@@ -132,9 +140,9 @@ def process_fits(path: str, *, dry_run: bool, backup: bool, only_if_wcs: bool, a
 
         if not dry_run and backup:
             try:
-                bak = path + ".bak"
-                if not os.path.exists(bak):
-                    hdul.writeto(bak, overwrite=False, output_verify="fix")
+                bak_path = path_obj.with_name(f"{path_obj.name}.bak")
+                if not bak_path.exists():
+                    hdul.writeto(bak_path, overwrite=False, output_verify="fix")
             except Exception:
                 # Backup is best-effort; continue anyway
                 pass
@@ -223,25 +231,37 @@ class App(tk.Tk):
             title="Select FITS files",
             filetypes=[("FITS files", "*.fits *.fit *.fts"), ("All files", "*.*")]
         )
-        if not paths: return
+        if not paths:
+            return
         for p in paths:
-            if p not in self.paths:
-                self.paths.append(p)
-                self.tree.insert("", "end", values=(p, "", "", ""))
+            path_str = str(Path(p).expanduser())
+            if path_str not in self.paths:
+                self.paths.append(path_str)
+                self.tree.insert("", "end", values=(path_str, "", "", ""))
 
     def add_folder(self):
         folder = filedialog.askdirectory(title="Select folder")
-        if not folder: return
+        if not folder:
+            return
+        root_dir = Path(folder).expanduser()
+        if not root_dir.exists():
+            self._log(f"[WARN] Folder '{root_dir}' does not exist.")
+            return
         count = 0
-        for root, dirs, files in os.walk(folder):
-            for fn in files:
-                if fn.lower().endswith((".fits",".fit",".fts")):
-                    p = os.path.join(root, fn)
-                    if p not in self.paths:
-                        self.paths.append(p)
-                        self.tree.insert("", "end", values=(p, "", "", ""))
-                        count += 1
-            if not self.var_recursive.get():
+        patterns = ("*.fits", "*.fit", "*.fts")
+        recursive = self.var_recursive.get()
+        for pattern in patterns:
+            walker = root_dir.rglob(pattern) if recursive else root_dir.glob(pattern)
+            for candidate in walker:
+                if not candidate.is_file():
+                    continue
+                candidate_str = str(candidate)
+                if candidate_str in self.paths:
+                    continue
+                self.paths.append(candidate_str)
+                self.tree.insert("", "end", values=(candidate_str, "", "", ""))
+                count += 1
+            if not recursive:
                 break
         self._log(f"Added {count} file(s) from folder.")
 
@@ -269,8 +289,9 @@ class App(tk.Tk):
         self.progress.configure(maximum=len(targets), value=0)
         hits = 0
         for i, (iid, path) in enumerate(targets, 1):
+            path_obj = Path(path)
             try:
-                with fits.open(path, memmap=False) as hdul:
+                with fits.open(path_obj, memmap=False) as hdul:
                     targets_hdus = range(len(hdul)) if self.var_all_hdus.get() else [0]
                     has = any(header_has_wcs(hdul[h].header) for h in targets_hdus)
                 status = "WCS: YES" if has else "WCS: NO"
@@ -278,7 +299,7 @@ class App(tk.Tk):
                 self.tree.item(iid, values=(path, status, "", ""))
             except Exception as exc:
                 self.tree.item(iid, values=(path, "ERROR", "", ""))
-                self._log(f"[SCAN][ERROR] {path}: {exc}")
+                self._log(f"[SCAN][ERROR] {path_obj}: {exc}")
             self.progress['value'] = i
             self.update_idletasks()
         self._log(f"Scan done. {hits} / {len(targets)} with WCS.")
@@ -303,9 +324,10 @@ class App(tk.Tk):
         edited_files = 0
 
         for i, (iid, path) in enumerate(targets, 1):
+            path_obj = Path(path)
             try:
                 deleted, edited_hdus = process_fits(
-                    path,
+                    path_obj,
                     dry_run=dry,
                     backup=backup,
                     only_if_wcs=only_if_wcs,
@@ -320,7 +342,7 @@ class App(tk.Tk):
                 self.tree.item(iid, values=(path, status, str(deleted), str(edited_hdus)))
             except Exception as exc:
                 self.tree.item(iid, values=(path, "ERROR", "", ""))
-                self._log(f"[CLEAN][ERROR] {path}: {exc}")
+                self._log(f"[CLEAN][ERROR] {path_obj}: {exc}")
                 traceback.print_exc()
             self.progress['value'] = i
             self.update_idletasks()

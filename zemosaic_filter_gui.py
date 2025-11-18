@@ -45,7 +45,7 @@
 
 from __future__ import annotations
 
-from typing import List, Dict, Any, Optional, Callable
+from typing import List, Dict, Any, Optional, Callable, Sequence
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import asdict
@@ -67,10 +67,13 @@ import math
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 
+from core.path_helpers import casefold_path, expand_to_path, safe_path_exists
+
 from zemosaic_utils import (
     EXCLUDED_DIRS,
     compute_global_wcs_descriptor,
     is_path_excluded,
+    get_app_base_dir,
     load_global_wcs_descriptor,
     parse_global_wcs_resolution_override,
     resolve_global_wcs_output_paths,
@@ -79,6 +82,37 @@ from zemosaic_utils import (
 
 
 logger = logging.getLogger(__name__)
+FITS_EXTENSIONS = {".fit", ".fits"}
+
+
+def _expand_to_path(value: Any) -> Optional[Path]:
+    """Expand environment variables and ``~`` in ``value`` and return a Path."""
+
+    return expand_to_path(value)
+
+
+def _common_path(paths: Sequence[Path]) -> Optional[Path]:
+    """Return the common ancestor for *paths*, or None when unrelated."""
+
+    filtered: list[Path] = [p for p in paths if isinstance(p, Path)]
+    if not filtered:
+        return None
+    common_parts = list(filtered[0].parts)
+    for candidate in filtered[1:]:
+        candidate_parts = list(candidate.parts)
+        limit = min(len(common_parts), len(candidate_parts))
+        idx = 0
+        while idx < limit and common_parts[idx] == candidate_parts[idx]:
+            idx += 1
+        common_parts = common_parts[:idx]
+        if not common_parts:
+            break
+    if not common_parts:
+        return None
+    try:
+        return Path(*common_parts)
+    except Exception:
+        return None
 
 
 # --- Instrument detection helpers -------------------------------------------
@@ -532,11 +566,12 @@ def launch_filter_interface(
     # mismatched parameters and guarantees the presence of the Analyse button.
     if isinstance(raw_files_with_wcs_or_dir, str):
         # Normalize user-provided path for robust directory detection
-        candidate = str(raw_files_with_wcs_or_dir).strip().strip('"').strip("'")
-        candidate = os.path.expanduser(os.path.expandvars(candidate))
-        if os.path.isdir(candidate):
+        candidate_raw = str(raw_files_with_wcs_or_dir).strip().strip('"').strip("'")
+        candidate_path = _expand_to_path(candidate_raw)
+        if candidate_path and candidate_path.is_dir():
             stream_mode = True
-            input_dir = candidate
+            input_dir_path = candidate_path
+            input_dir = str(candidate_path)
         elif stream_scan:
             # Caller requested streaming but provided a non-directory path →
             # fail fast with a safe default.
@@ -548,11 +583,11 @@ def launch_filter_interface(
 
     raw_items_input = raw_files_with_wcs_or_dir
 
-    if input_dir:
-        try:
-            input_dir_path = Path(input_dir).expanduser()
-        except Exception:
-            input_dir_path = Path(input_dir)
+    if input_dir and input_dir_path is None:
+        input_dir_path = _expand_to_path(input_dir)
+        if input_dir_path is not None:
+            input_dir = str(input_dir_path)
+    if input_dir_path:
         try:
             if is_path_excluded(input_dir_path, EXCLUDED_DIRS):
                 excluded_input_dir = True
@@ -640,11 +675,12 @@ def launch_filter_interface(
                 return max(1, fallback)
 
         # Ensure project directory and parent are on sys.path to import project modules
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.dirname(base_dir)
+        base_dir = Path(__file__).resolve().parent
+        project_root = base_dir.parent
         for candidate in (base_dir, project_root):
-            if candidate and candidate not in sys.path:
-                sys.path.insert(0, candidate)
+            candidate_str = str(candidate)
+            if candidate_str and candidate_str not in sys.path:
+                sys.path.insert(0, candidate_str)
 
         pkg_prefix = globals().get("__package__") or ""
 
@@ -760,11 +796,13 @@ def launch_filter_interface(
             sensitivity = solver_settings_payload.get("astap_sensitivity")
 
             if isinstance(exe_path, str) and exe_path:
-                exe_path = os.path.expanduser(exe_path)
-                cfg_defaults["astap_executable_path"] = exe_path
+                exe_path_path = _expand_to_path(exe_path)
+                if exe_path_path:
+                    cfg_defaults["astap_executable_path"] = str(exe_path_path)
             if isinstance(data_path, str) and data_path:
-                data_path = os.path.expanduser(data_path)
-                cfg_defaults["astap_data_directory_path"] = data_path
+                data_path_path = _expand_to_path(data_path)
+                if data_path_path:
+                    cfg_defaults["astap_data_directory_path"] = str(data_path_path)
             if search_radius is not None:
                 cfg_defaults["astap_default_search_radius"] = search_radius
             if downsample is not None:
@@ -848,22 +886,22 @@ def launch_filter_interface(
                 system_name = platform.system().lower()
                 is_windows = system_name == "windows"
 
-                base_path = os.path.dirname(os.path.abspath(__file__))
-                icon_dir = os.path.join(base_path, "icon")
+                base_path = get_app_base_dir()
+                icon_dir = base_path / "icon"
 
-                ico_path = os.path.join(icon_dir, "zemosaic.ico")
+                ico_path = icon_dir / "zemosaic.ico"
                 png_candidates = [
-                    os.path.join(icon_dir, "zemosaic.png"),
-                    os.path.join(icon_dir, "zemosaic_icon.png"),
-                    os.path.join(icon_dir, "zemosaic_64x64.png"),
+                    icon_dir / "zemosaic.png",
+                    icon_dir / "zemosaic_icon.png",
+                    icon_dir / "zemosaic_64x64.png",
                 ]
 
-                if is_windows and os.path.exists(ico_path):
-                    window.iconbitmap(default=ico_path)
+                if is_windows and ico_path.is_file():
+                    window.iconbitmap(default=str(ico_path))
                 else:
-                    png_path = next((p for p in png_candidates if os.path.exists(p)), None)
+                    png_path = next((p for p in png_candidates if p.is_file()), None)
                     if png_path:
-                        window.iconphoto(True, PhotoImage(file=png_path))
+                        window.iconphoto(True, PhotoImage(file=str(png_path)))
             except Exception as exc:
                 print(f"[FilterGUI] Impossible d'appliquer l'icône ZeMosaic: {exc}")
         heavy_import_error: ImportError | None = None
@@ -975,12 +1013,12 @@ def launch_filter_interface(
             except Exception:
                 return None
 
-        def _write_header_to_fits_local(file_path: str, header_obj) -> None:
+        def _write_header_to_fits_local(file_path: str | Path, header_obj) -> None:
             """Safely persist ``header_obj`` into ``file_path`` FITS header."""
 
             if header_obj is None:
                 return
-            with fits.open(file_path, mode="update", memmap=False) as hdul:
+            with fits.open(str(file_path), mode="update", memmap=False) as hdul:
                 hdul[0].header.update(header_obj)
                 hdul.flush()
 
@@ -991,9 +1029,10 @@ def launch_filter_interface(
                 return
             if not isinstance(path_val, str) or not path_val:
                 return
-            display_name = os.path.basename(path_val) or path_val
+            path_obj = _expand_to_path(path_val)
+            display_name = (path_obj.name if path_obj else path_val) or path_val
             try:
-                _write_header_to_fits_local(path_val, hdr_obj)
+                _write_header_to_fits_local(path_obj or path_val, hdr_obj)
             except Exception as exc:  # pragma: no cover - UI logging side effect
                 _log_message(
                     f"[WCS] Failed to write header for '{display_name}': {exc}",
@@ -1103,8 +1142,10 @@ def launch_filter_interface(
 
         MAX_FOOTPRINTS = max_footprints_override or (int(preview_cap or 0) or 3000)
         cache_csv_path: Optional[str] = None
-        if stream_mode and input_dir:
-            cache_csv_path = os.path.join(input_dir, "headers_cache.csv")
+        if stream_mode and input_dir_path:
+            cache_csv_path = str(input_dir_path / "headers_cache.csv")
+        elif stream_mode and input_dir:
+            cache_csv_path = str(Path(input_dir) / "headers_cache.csv")
 
         stream_queue: Optional[queue.Queue] = None
         # Stop flag for the streaming worker to support instant cancel/close
@@ -1134,9 +1175,9 @@ def launch_filter_interface(
             # picking up artifacts like 'global_mosaic_wcs.fits' during input scan
             out_dir_abs: Optional[Path] = None
             try:
-                out_dir_val = str(cfg_defaults.get("output_dir") or "").strip()
+                out_dir_val = _expand_to_path(cfg_defaults.get("output_dir"))
                 if out_dir_val:
-                    out_dir_abs = Path(os.path.expanduser(os.path.expandvars(out_dir_val))).resolve(strict=False)
+                    out_dir_abs = out_dir_val.resolve(strict=False)
             except Exception:
                 out_dir_abs = None
             try:
@@ -1179,7 +1220,7 @@ def launch_filter_interface(
                                 if _should_skip(entry_path):
                                     continue
                                 continue
-                            if entry.is_file() and entry.name.lower().endswith((".fit", ".fits")):
+                            if entry.is_file() and entry_path.suffix.lower() in FITS_EXTENSIONS:
                                 if _should_skip(entry_path):
                                     continue
                                 # Skip the global descriptor FITS by name
@@ -1207,9 +1248,9 @@ def launch_filter_interface(
                         filtered_dirs.append(d)
                     dirs[:] = filtered_dirs
                     for fn in files:
-                        if not fn.lower().endswith((".fit", ".fits")):
-                            continue
                         candidate = current_dir / fn
+                        if candidate.suffix.lower() not in FITS_EXTENSIONS:
+                            continue
                         if _should_skip(candidate):
                             continue
                         try:
@@ -1439,12 +1480,15 @@ def launch_filter_interface(
                     pass
             return info
 
-        def _load_csv_bootstrap(path_csv: str) -> list[Dict[str, Any]]:
+        def _load_csv_bootstrap(path_csv: str | Path) -> list[Dict[str, Any]]:
             rows: list[Dict[str, Any]] = []
+            path_obj = _expand_to_path(path_csv)
+            if path_obj is None or not path_obj.is_file():
+                return rows
             try:
                 import csv
 
-                with open(path_csv, "r", newline="", encoding="utf-8") as handle:
+                with path_obj.open("r", newline="", encoding="utf-8") as handle:
                     reader = csv.DictReader(handle)
                     for row in reader:
                         entry: Dict[str, Any] = {"path": row.get("path", "")}
@@ -1501,9 +1545,17 @@ def launch_filter_interface(
                 return []
             return rows
 
-        def _export_csv(path_csv: str, items_for_csv: list[Dict[str, Any]]) -> None:
+        def _export_csv(path_csv: str | Path, items_for_csv: list[Dict[str, Any]]) -> None:
             try:
                 import csv
+
+                path_obj = _expand_to_path(path_csv)
+                if path_obj is None:
+                    return
+                try:
+                    path_obj.parent.mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
 
                 fieldnames = [
                     "path",
@@ -1523,7 +1575,7 @@ def launch_filter_interface(
                     "FILTER",
                     "OBJECT",
                 ]
-                with open(path_csv, "w", newline="", encoding="utf-8") as handle:
+                with path_obj.open("w", newline="", encoding="utf-8") as handle:
                     writer = csv.DictWriter(handle, fieldnames=fieldnames)
                     writer.writeheader()
                     for item in items_for_csv:
@@ -1659,7 +1711,9 @@ def launch_filter_interface(
 
             stream_state["spawn_worker"] = _spawn_worker
             stream_state["done"] = True
-            if cache_csv_path and os.path.isfile(cache_csv_path):
+            csv_path_obj = _expand_to_path(cache_csv_path)
+            if csv_path_obj and csv_path_obj.is_file():
+                cache_csv_path = str(csv_path_obj)
                 bootstrap_rows = _load_csv_bootstrap(cache_csv_path)
                 if bootstrap_rows:
                     initial_batches.append(bootstrap_rows)
@@ -3356,6 +3410,7 @@ def launch_filter_interface(
 
             log_path = wcs_async_state.get("log_path")
             path_value = payload.get("path")
+            path_obj = _expand_to_path(path_value)
             if ok:
                 _persist_wcs_header_if_requested(path_value, header_obj, write_inplace)
             solver_value = payload.get("solver")
@@ -3385,8 +3440,11 @@ def launch_filter_interface(
                     _log_message(f"[FilterUI] Failed to move problematic file: {move_error}", level="ERROR")
                 if payload.get("moved") and isinstance(idx_val, int):
                     moved_filename = payload.get("move_filename")
-                    if not moved_filename and isinstance(path_value, str):
-                        moved_filename = os.path.basename(path_value)
+                    if not moved_filename:
+                        if path_obj is not None:
+                            moved_filename = path_obj.name
+                        elif isinstance(path_value, str):
+                            moved_filename = path_value
                     info_msg = _tr(
                         "FILTER_FILE_MOVED_UNALIGNED",
                         "Moved problematic file to 'unaligned_by_zemosaic': {filename}",
@@ -3531,21 +3589,21 @@ def launch_filter_interface(
         def _resolve_now_log_base(paths: list[str]) -> Optional[Path]:
             if input_dir_path is not None:
                 return input_dir_path
-            sanitized: list[str] = []
+            sanitized: list[Path] = []
             for entry in paths:
-                if not entry:
+                candidate = _expand_to_path(entry)
+                if candidate is None:
                     continue
                 try:
-                    sanitized.append(os.path.abspath(entry))
+                    sanitized.append(candidate.resolve(strict=False))
                 except Exception:
-                    continue
+                    sanitized.append(candidate)
             if not sanitized:
                 return None
-            try:
-                common = Path(os.path.commonpath(sanitized))
-            except Exception:
+            common = _common_path(sanitized)
+            if common is None:
                 try:
-                    common = Path(sanitized[0]).parent
+                    common = sanitized[0].parent
                 except Exception:
                     return None
             if common.is_file():
@@ -3561,15 +3619,17 @@ def launch_filter_interface(
                 return
             path_val = result.get("path")
             log_dir = resolve_now_state.get("log_dir")
-            try:
-                if log_dir is not None and path_val:
-                    rel_path = os.path.relpath(path_val, str(log_dir))
-                elif path_val:
-                    rel_path = os.path.basename(path_val)
-                else:
-                    rel_path = "<unknown>"
-            except Exception:
-                rel_path = os.path.basename(path_val) if path_val else "<unknown>"
+            path_obj = _expand_to_path(path_val)
+            if log_dir is not None and path_obj is not None:
+                try:
+                    rel_path = path_obj.relative_to(log_dir)
+                except Exception:
+                    rel_path = path_obj.name
+            elif path_obj is not None:
+                rel_path = path_obj.name
+            else:
+                rel_path = "<unknown>"
+            rel_text = str(rel_path)
             status = "OK" if result.get("ok") else "FAIL"
             if result.get("skipped"):
                 status = "SKIP"
@@ -3581,12 +3641,12 @@ def launch_filter_interface(
             except Exception:
                 duration_txt = "-"
             timestamp = datetime.datetime.now().isoformat(timespec="seconds") + "Z"
-            line = f"{timestamp}\t{status}\t{rel_path}\tcode={code_txt}\ttime_s={duration_txt}"
+            line = f"{timestamp}\t{status}\t{rel_text}\tcode={code_txt}\ttime_s={duration_txt}"
             err_msg = result.get("error")
             if err_msg:
                 line += f"\tmsg={err_msg}"
             try:
-                with open(str(log_path), "a", encoding="utf-8") as handle:
+                with Path(log_path).open("a", encoding="utf-8") as handle:
                     handle.write(line + "\n")
             except Exception:
                 pass
@@ -3693,6 +3753,7 @@ def launch_filter_interface(
                 overrides_state["resolved_wcs_count"] = resolved_counter["count"]
             idx_val = result.get("idx")
             path_val = result.get("path")
+            path_obj = _expand_to_path(path_val)
             header_obj = result.get("header")
             wcs_obj = result.get("wcs")
             if isinstance(idx_val, int) and 0 <= idx_val < len(items):
@@ -3719,7 +3780,10 @@ def launch_filter_interface(
                     pending_visual_refresh.add(idx_val)
                     _schedule_visual_refresh_flush()
                     _canvas_draw_idle()
-            name = os.path.basename(path_val) if isinstance(path_val, str) else "<unknown>"
+            if path_obj is not None:
+                name = path_obj.name or str(path_obj)
+            else:
+                name = str(path_val) if path_val else "<unknown>"
             if ok:
                 msg = _tr(
                     "filter_resolve_now_log_ok",
@@ -3790,12 +3854,9 @@ def launch_filter_interface(
             targets: list[tuple[int, str, Any]] = []
             for idx, item in enumerate(items):
                 path_val = getattr(item, "path", None)
-                if not isinstance(path_val, str) or not os.path.isfile(path_val):
+                path_obj = _expand_to_path(path_val)
+                if path_obj is None or not path_obj.is_file():
                     continue
-                try:
-                    path_obj = Path(path_val)
-                except Exception:
-                    path_obj = Path(str(path_val))
                 try:
                     if is_path_excluded(path_obj, EXCLUDED_DIRS):
                         continue
@@ -3807,7 +3868,7 @@ def launch_filter_interface(
                     continue
                 if header_obj is not None and _has_celestial_wcs(header_obj):
                     continue
-                targets.append((idx, path_val, header_obj))
+                    targets.append((idx, str(path_obj), header_obj))
 
             if not targets:
                 idle_msg = _tr(
@@ -3966,6 +4027,13 @@ def launch_filter_interface(
                     "return_code": None,
                     "duration": 0.0,
                 }
+                path_obj = _expand_to_path(path_val)
+                if path_obj is None:
+                    result["error"] = "invalid path"
+                    result["duration"] = time.monotonic() - start_ts
+                    return result
+                path_text = str(path_obj)
+                result["path"] = path_text
                 header_payload = header_obj
                 if header_payload is not None:
                     try:
@@ -3974,7 +4042,7 @@ def launch_filter_interface(
                         pass
                 if header_payload is None:
                     try:
-                        header_payload = fits.getheader(path_val, 0)
+                        header_payload = fits.getheader(path_text, 0)
                     except Exception as exc:
                         result["error"] = f"header load failed: {exc}"
                         result["duration"] = time.monotonic() - start_ts
@@ -4002,19 +4070,14 @@ def launch_filter_interface(
                         except Exception:
                             progress_state["return_code"] = None
 
-                target_name = "<unknown>"
-                if path_val:
-                    try:
-                        target_name = os.path.basename(str(path_val))
-                    except Exception:
-                        target_name = str(path_val)
+                target_name = path_obj.name or path_text
 
                 _log_message(f"[FilterGUI] ASTAP wait slot -> {target_name}", level="DEBUG")
                 try:
                     with astap_slot_semaphore:
                         _log_message(f"[FilterGUI] ASTAP start -> {target_name}", level="DEBUG")
                         wcs_obj = solve_with_astap(
-                            path_val,
+                            path_text,
                             header_payload,
                             astap_exe_path,
                             astap_data_dir,
@@ -4037,7 +4100,7 @@ def launch_filter_interface(
                 result["duration"] = time.monotonic() - start_ts
                 if wcs_obj is not None and getattr(wcs_obj, "is_celestial", False):
                     try:
-                        _write_header_to_fits_local(path_val, header_payload)
+                        _write_header_to_fits_local(path_text, header_payload)
                     except Exception:
                         pass
                     result["ok"] = True
@@ -4065,10 +4128,10 @@ def launch_filter_interface(
                 return
 
             def _normalized(path_value: str) -> str:
-                try:
-                    return os.path.normcase(os.path.abspath(os.path.expanduser(path_value)))
-                except Exception:
-                    return str(path_value)
+                token = casefold_path(path_value, absolute=True, expanduser=True)
+                if token:
+                    return token
+                return str(path_value)
 
             candidates: list[Path] = []
             log_path_candidate = wcs_async_state.get("log_path")
@@ -4248,8 +4311,10 @@ def launch_filter_interface(
             if path_str.startswith(('"', "'")) and path_str.endswith(('"', "'")) and len(path_str) >= 2:
                 path_str = path_str[1:-1]
 
-            expanded = os.path.expanduser(os.path.expandvars(path_str))
-            return expanded
+            path_obj = _expand_to_path(path_str)
+            if path_obj is None:
+                return ""
+            return str(path_obj)
 
         astap_exe_path_raw = cfg_defaults.get('astap_executable_path', '')
         astap_data_dir_raw = cfg_defaults.get('astap_data_directory_path', '')
@@ -4291,35 +4356,36 @@ def launch_filter_interface(
         autosplit_cap = max(1, min(50, autosplit_cap))
         autosplit_min_cap = min(8, autosplit_cap)
 
-        def _astap_path_available(path: str) -> bool:
+        def _astap_path_available(path: Any) -> bool:
             """Return True when the configured ASTAP location looks valid."""
 
-            if not path:
+            path_obj = _expand_to_path(path)
+            if path_obj is None:
                 return False
 
             # Direct file check
-            if os.path.isfile(path):
+            if path_obj.is_file():
                 return True
 
             # macOS packages are directories ending with ``.app``
-            if sys.platform == "darwin" and path.lower().endswith(".app") and os.path.isdir(path):
+            if sys.platform == "darwin" and path_obj.suffix.lower() == ".app" and path_obj.is_dir():
                 return True
 
             # Accept directories that contain the ASTAP binary
-            if os.path.isdir(path):
+            if path_obj.is_dir():
                 exe_name = "astap.exe" if os.name == "nt" else "astap"
-                candidate = os.path.join(path, exe_name)
-                if os.path.isfile(candidate):
+                candidate = path_obj / exe_name
+                if candidate.is_file():
                     return True
 
             # As a generic fallback try resolving via PATH
-            resolved = shutil.which(path) or shutil.which(os.path.basename(path))
+            path_text = str(path_obj)
+            resolved = shutil.which(path_text) or shutil.which(path_obj.name)
             if resolved:
                 return True
 
-            # As a generic fallback accept any existing executable entry.
             try:
-                return os.path.exists(path) and os.access(path, os.X_OK)
+                return safe_path_exists(path_obj, expanduser=False) and os.access(path_text, os.X_OK)
             except Exception:
                 return False
 
@@ -4895,11 +4961,15 @@ def launch_filter_interface(
                 )
                 return
 
-            pending = [
-                (idx, item)
-                for idx, item in enumerate(items)
-                if item.wcs is None and isinstance(item.path, str) and os.path.isfile(item.path)
-            ]
+            pending = []
+            for idx, item in enumerate(items):
+                if item.wcs is not None:
+                    continue
+                path_val = getattr(item, "path", None)
+                path_obj = _expand_to_path(path_val)
+                if path_obj is None or not path_obj.is_file():
+                    continue
+                pending.append((idx, item, path_obj))
             if not pending:
                 msg = _tr("filter_log_no_missing_wcs", "All listed files already include a WCS solution.")
                 summary_var.set(_apply_summary_hint(msg))
@@ -5032,27 +5102,29 @@ def launch_filter_interface(
                 _enqueue_event("log", message, level)
 
             def _solve_one_image_blocking(idx: int, item: Any) -> Dict[str, Any]:
+                raw_path = getattr(item, "path", None)
+                path_obj = _expand_to_path(raw_path)
                 result: Dict[str, Any] = {
                     "idx": idx,
-                    "path": getattr(item, "path", None),
+                    "path": str(path_obj) if path_obj else raw_path,
                     "ok": False,
                 }
                 if wcs_async_state.get("stop"):
                     result["error"] = "cancelled"
                     return result
 
-                path = getattr(item, "path", None)
-                if not isinstance(path, str) or not os.path.isfile(path):
+                if path_obj is None or not path_obj.is_file():
                     result["error"] = "missing file"
                     return result
 
-                file_name = os.path.basename(path)
+                path_text = str(path_obj)
+                file_name = path_obj.name or path_text
                 header_obj = getattr(item, "header", None)
 
                 def _record_failure(error_message: Optional[str]) -> Dict[str, Any]:
                     if error_message:
                         result["error"] = str(error_message)
-                    move_info = _move_problematic_file(path)
+                    move_info = _move_problematic_file(path_text)
                     if move_info.get("moved"):
                         result["moved"] = True
                         result["moved_path"] = move_info.get("destination")
@@ -5066,7 +5138,7 @@ def launch_filter_interface(
                         _enqueue_event("header_loaded", idx, header_obj)
                     elif astap_fits_module is not None and astap_astropy_available:
                         try:
-                            with astap_fits_module.open(path) as hdul_hdr:
+                            with astap_fits_module.open(path_text) as hdul_hdr:
                                 header_obj = hdul_hdr[0].header
                         except Exception as exc:
                             _log_solver_event(
@@ -5380,14 +5452,12 @@ def launch_filter_interface(
                 wcs_async_state["write_inplace"] = write_inplace
 
                 log_dir: Optional[Path] = None
-                for _idx, _item in pending:
-                    candidate_path = getattr(_item, "path", None)
-                    if isinstance(candidate_path, str) and candidate_path:
-                        try:
-                            log_dir = Path(candidate_path).expanduser().resolve().parent
-                        except Exception:
-                            log_dir = Path(os.path.dirname(candidate_path))
-                        break
+                for _idx, _item, path_obj in pending:
+                    try:
+                        log_dir = path_obj.expanduser().resolve().parent
+                    except Exception:
+                        log_dir = path_obj.parent
+                    break
                 if log_dir is None and input_dir:
                     try:
                         log_dir = Path(input_dir).expanduser().resolve()
@@ -5415,7 +5485,7 @@ def launch_filter_interface(
                 pending_futures: list[Any] = []
                 wcs_async_state["pending"] = pending_futures
 
-                for idx, item in pending:
+                for idx, item, _path_obj in pending:
                     if wcs_async_state.get("stop"):
                         break
                     future = executor.submit(_solve_one_image_blocking, idx, item)
@@ -6363,17 +6433,18 @@ def launch_filter_interface(
                 )
             except Exception:
                 return None
-            if not fits_path or not os.path.isfile(fits_path):
+            fits_obj = _expand_to_path(fits_path)
+            if fits_obj is None or not fits_obj.is_file():
                 return None
             try:
-                descriptor_new = load_global_wcs_descriptor(fits_path, json_path, logger_override=logger)
+                descriptor_new = load_global_wcs_descriptor(str(fits_obj), json_path, logger_override=logger)
             except Exception as exc:
                 logger.debug("Coverage map: unable to load global descriptor: %s", exc)
                 return None
             global_wcs_state.update(
                 {
                     "descriptor": descriptor_new,
-                    "fits_path": fits_path,
+                    "fits_path": str(fits_obj),
                     "json_path": json_path,
                 }
             )
@@ -7302,12 +7373,16 @@ def launch_filter_interface(
         def _path_key(value: Any) -> str:
             try:
                 if isinstance(value, str) and value:
-                    return os.path.normcase(os.path.abspath(value))
+                    token = casefold_path(value, absolute=True)
+                    if token:
+                        return token
             except Exception:
                 pass
             try:
                 if isinstance(value, str) and value:
-                    return os.path.normcase(value)
+                    token = casefold_path(value)
+                    if token:
+                        return token
             except Exception:
                 pass
             return str(value) if value is not None else ""
@@ -7508,7 +7583,11 @@ def launch_filter_interface(
 
         def _add_item_row(item: Item) -> None:
             idx = len(item_labels)
-            base = os.path.basename(item.path)
+            path_obj = _expand_to_path(item.path)
+            if path_obj is not None:
+                base = path_obj.name or str(path_obj)
+            else:
+                base = str(item.path) if item.path else "<unknown>"
             instrument_name = (item.instrument or "").strip()
             tag = ""
             if instrument_name and instrument_name != "Unknown":
@@ -7821,7 +7900,11 @@ def launch_filter_interface(
                     except Exception:
                         pass
                     try:
-                        base_name = os.path.basename(items[existing_idx].path)
+                        label_path = _expand_to_path(items[existing_idx].path)
+                        if label_path is not None:
+                            base_name = label_path.name or str(label_path)
+                        else:
+                            base_name = str(items[existing_idx].path) if items[existing_idx].path else "<unknown>"
                         sep_txt = ""
                         if items[existing_idx].center is not None:
                             sep_deg = items[existing_idx].center.separation(global_center).to(u.deg).value
@@ -8039,11 +8122,12 @@ def launch_filter_interface(
             # build a minimal fallback spawner so Analyse still works.
             if not callable(stream_state.get("spawn_worker")):
                 try:
-                    if isinstance(input_dir, str) and os.path.isdir(input_dir):
+                    input_dir_path_obj = _expand_to_path(input_dir)
+                    if input_dir_path_obj and input_dir_path_obj.is_dir():
                         def _fallback_crawl_worker(target_queue: "queue.Queue[list[Dict[str, Any]] | None]", stop_event: threading.Event) -> None:
                             batch: list[Dict[str, Any]] = []
                             minimum_batch = max(1, int(batch_size) if isinstance(batch_size, int) else 100)
-                            for idx, fpath in enumerate(_iter_fits_paths(input_dir, recursive=scan_recursive)):
+                            for idx, fpath in enumerate(_iter_fits_paths(str(input_dir_path_obj), recursive=scan_recursive)):
                                 if stop_event.is_set():
                                     break
                                 item = _minimal_header_payload(fpath)
@@ -8076,11 +8160,12 @@ def launch_filter_interface(
             _trigger_stream_start(force=True)
 
         def _on_export() -> None:
-            path_csv = stream_state.get("csv_path") if isinstance(stream_state.get("csv_path"), str) else cache_csv_path
-            if not path_csv:
+            path_csv_str = stream_state.get("csv_path") if isinstance(stream_state.get("csv_path"), str) else cache_csv_path
+            path_csv_obj = _expand_to_path(path_csv_str)
+            if path_csv_obj is None:
                 return
             try:
-                os.makedirs(os.path.dirname(path_csv), exist_ok=True)
+                path_csv_obj.parent.mkdir(parents=True, exist_ok=True)
             except Exception:
                 pass
             payload: list[Dict[str, Any]] = []
@@ -8107,7 +8192,7 @@ def launch_filter_interface(
                 except Exception:
                     pass
                 payload.append(data)
-            _export_csv(path_csv, payload)
+            _export_csv(path_csv_obj, payload)
             stream_state["csv_loaded"] = True
             stream_state["status_message"] = _tr(
                 "filter_status_ready_csv",
@@ -8117,7 +8202,7 @@ def launch_filter_interface(
                 status_var.set(stream_state["status_message"])
             except Exception:
                 pass
-            _log_message(f"[CSV] Exported {len(payload)} items -> {path_csv}", level="INFO")
+            _log_message(f"[CSV] Exported {len(payload)} items -> {path_csv_obj}", level="INFO")
 
         analyse_btn.configure(command=_on_analyse)
         try:
@@ -8419,43 +8504,45 @@ def launch_filter_interface(
                     return p
                 return None
 
-            excluded_paths: list[str] = []
-            all_src_dirs: list[str] = []
+            excluded_paths: list[Path] = []
+            all_src_dirs: list[Path] = []
             for i in unselected_indices:
                 p = _preferred_src_path(raw_files_with_wcs[i])
-                if p and os.path.isfile(p):
-                    excluded_paths.append(p)
-                    all_src_dirs.append(os.path.dirname(p))
+                path_obj = _expand_to_path(p)
+                if path_obj and path_obj.is_file():
+                    excluded_paths.append(path_obj)
+                    all_src_dirs.append(path_obj.parent)
 
-            dest_base: Optional[str] = None
+            dest_base: Optional[Path] = None
             if all_src_dirs:
-                try:
-                    dest_base = os.path.commonpath(all_src_dirs)
-                except Exception:
+                dest_base = _common_path(all_src_dirs)
+                if dest_base is None:
                     dest_base = all_src_dirs[0]
 
             # If we have a base, move excluded files to '<base>/filtered_by_user'
             if dest_base is not None and excluded_paths:
-                dest_dir = os.path.join(dest_base, "filtered_by_user")
+                dest_dir: Optional[Path] = dest_base / "filtered_by_user"
                 try:
-                    os.makedirs(dest_dir, exist_ok=True)
+                    dest_dir.mkdir(parents=True, exist_ok=True)
                 except Exception:
                     dest_dir = None  # will fallback to per-file folder
 
-                def _unique_dest(path_dir: str, filename: str) -> str:
-                    base, ext = os.path.splitext(filename)
-                    candidate = os.path.join(path_dir, filename)
-                    if not os.path.exists(candidate):
+                def _unique_dest(path_dir: Path, filename: str) -> Path:
+                    name = Path(filename)
+                    stem = name.stem
+                    ext = name.suffix
+                    candidate = path_dir / filename
+                    if not safe_path_exists(candidate, expanduser=False):
                         return candidate
                     # Append timestamp, then counter if still colliding
                     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                    candidate = os.path.join(path_dir, f"{base}_{ts}{ext}")
-                    if not os.path.exists(candidate):
+                    candidate = path_dir / f"{stem}_{ts}{ext}"
+                    if not safe_path_exists(candidate, expanduser=False):
                         return candidate
                     k = 1
                     while True:
-                        candidate = os.path.join(path_dir, f"{base}_{ts}_{k}{ext}")
-                        if not os.path.exists(candidate):
+                        candidate = path_dir / f"{stem}_{ts}_{k}{ext}"
+                        if not safe_path_exists(candidate, expanduser=False):
                             return candidate
                         k += 1
 
@@ -8465,11 +8552,11 @@ def launch_filter_interface(
                         target_dir = dest_dir
                         if target_dir is None:
                             # As fallback, move next to its source directory under a local 'filtered_by_user'
-                            local_dir = os.path.join(os.path.dirname(src_path), "filtered_by_user")
-                            os.makedirs(local_dir, exist_ok=True)
+                            local_dir = src_path.parent / "filtered_by_user"
+                            local_dir.mkdir(parents=True, exist_ok=True)
                             target_dir = local_dir
-                        dest_path = _unique_dest(target_dir, os.path.basename(src_path))
-                        shutil.move(src_path, dest_path)
+                        dest_path = _unique_dest(target_dir, src_path.name)
+                        shutil.move(str(src_path), str(dest_path))
                     except Exception as e:
                         # Non-fatal: keep going
                         print(f"WARN filter_gui: Failed to move '{src_path}' -> filtered_by_user: {e}")
@@ -8524,19 +8611,19 @@ __all__ = ["launch_filter_interface"]
 
 if __name__ == "__main__":
     # Minimal CLI to launch the filter window for a directory.
-    import sys as _sys, os as _os
+    import sys as _sys
     args = _sys.argv[1:]
     if not args:
         print("Usage: python zemosaic_filter_gui.py <input_dir>")
         print("       python -m zemosaic_filter_gui <input_dir>")
         _sys.exit(1)
-    inp = _os.path.expanduser(_os.path.expandvars(args[0]))
-    if not (_os.path.isdir(inp)):
-        print(f"Error: '{inp}' is not a directory")
+    inp_path = _expand_to_path(args[0])
+    if inp_path is None or not inp_path.is_dir():
+        print(f"Error: '{args[0]}' is not a directory")
         _sys.exit(2)
     try:
         res = launch_filter_interface(
-            inp,
+            str(inp_path),
             None,
             stream_scan=True,
             scan_recursive=True,

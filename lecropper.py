@@ -46,7 +46,7 @@ print("INFO: using NEW lecropper (Alt-Az + Quality-crop pipeline)")
 
 import os
 import sys
-import glob
+from pathlib import Path
 import csv
 import traceback
 import tkinter as tk
@@ -861,31 +861,35 @@ def _maybe_extract_coverage_from_hdul(hdul, expected_shape: tuple[int, int] | No
     return None
 
 
-def _maybe_load_sidecar_coverage(in_path: str, expected_shape: tuple[int, int] | None = None):
+def _maybe_load_sidecar_coverage(
+    in_path: str | Path, expected_shape: tuple[int, int] | None = None
+):
     if not in_path:
         return None
 
-    base, ext = os.path.splitext(in_path)
-    ext_candidates = []
-    if ext:
-        ext_candidates.append(ext)
+    path = Path(in_path).expanduser()
+    base = path.with_suffix("")
+    ext_candidates: list[str] = []
+    if path.suffix:
+        ext_candidates.append(path.suffix)
     for extra in _COVERAGE_SIDE_EXTENSIONS:
         if extra not in ext_candidates:
             ext_candidates.append(extra)
 
-    candidates = []
+    candidates: list[Path] = []
     for suffix in _COVERAGE_SIDE_SUFFIXES:
         for ext_candidate in ext_candidates:
-            candidates.append(f"{base}{suffix}{ext_candidate}")
+            candidate_name = f"{base.name}{suffix}{ext_candidate}"
+            candidates.append(base.with_name(candidate_name))
 
     for cand in candidates:
-        if not os.path.exists(cand):
+        if not cand.exists():
             continue
         try:
             with fits.open(cand, memmap=False) as hdul:
                 arr = _sanitize_coverage_array(hdul[0].data, expected_shape=expected_shape)
                 if arr is not None:
-                    logger.info("Detected coverage sidecar %s (shape=%s)", os.path.basename(cand), arr.shape)
+                    logger.info("Detected coverage sidecar %s (shape=%s)", cand.name, arr.shape)
                     return arr
         except Exception as exc:
             logger.debug("Failed to load coverage sidecar %s: %s", cand, exc)
@@ -998,7 +1002,8 @@ def save_cropped_fits(
     spatial_shape: tuple[int, int] | None = None
     # Use memmap=False so the FITS file handle is fully released before
     # potentially overwriting the source file (Windows needs the file closed).
-    with fits.open(in_path, mode="readonly", memmap=False) as hdul:
+    input_path = Path(in_path).expanduser()
+    with fits.open(input_path, mode="readonly", memmap=False) as hdul:
         data = np.asarray(hdul[0].data)
         header = hdul[0].header.copy()
         if data.ndim >= 2:
@@ -1006,7 +1011,7 @@ def save_cropped_fits(
         coverage_full = _maybe_extract_coverage_from_hdul(hdul, expected_shape=spatial_shape)
 
     if coverage_full is None and spatial_shape is not None:
-        coverage_full = _maybe_load_sidecar_coverage(in_path, expected_shape=spatial_shape)
+        coverage_full = _maybe_load_sidecar_coverage(input_path, expected_shape=spatial_shape)
 
     if data.ndim == 2:
         cropped = data[y0:y1, x0:x1]
@@ -1069,8 +1074,8 @@ def save_cropped_fits(
         header["CRPIX1"] = header.get("CRPIX1", 0.0) - x0
         header["CRPIX2"] = header.get("CRPIX2", 0.0) - y0
 
-    base, ext = os.path.splitext(in_path)
-    out_path = f"{base}{out_suffix}{ext}"
+    out_name = f"{input_path.stem}{out_suffix}{input_path.suffix}"
+    out_path = input_path.with_name(out_name)
 
     settings = _get_altaz_alpha_settings()
     hdus = []
@@ -1084,7 +1089,11 @@ def save_cropped_fits(
         alpha_hdu.header["ALPHADSC"] = ("1=opaque(in), 0=transparent(out)", "")
         hdus.append(alpha_hdu)
     fits.HDUList(hdus).writeto(out_path, overwrite=True)
-    logger.info(f"[lecropper] Saved FITS with ALPHA={alpha_mask is not None and settings['fits']} → {out_path}")
+    logger.info(
+        "[lecropper] Saved FITS with ALPHA=%s → %s",
+        bool(alpha_mask is not None and settings["fits"]),
+        out_path,
+    )
 
     if alpha_mask is not None and settings["sidecar"]:
         try:
@@ -1108,14 +1117,15 @@ def save_cropped_fits(
             rgba = Image.fromarray(rgb, mode="RGB")
             A = Image.fromarray(alpha_mask, mode="L")
             rgba.putalpha(A)
-            side_ext = settings["format"] or "png"
-            side_path = os.path.splitext(out_path)[0] + f".alpha.{side_ext}"
+            side_ext = (settings["format"] or "png").lstrip(".")
+            side_name = f"{out_path.stem}.alpha.{side_ext}"
+            side_path = out_path.with_name(side_name)
             rgba.save(side_path)
-            logger.info(f"Saved alpha sidecar {side_path}")
+            logger.info("Saved alpha sidecar %s", side_path)
         except Exception:
             pass
 
-    return out_path
+    return str(out_path)
 
 
 # ---------------------------------- GUI --------------------------------------
@@ -1130,7 +1140,7 @@ class AutoCropApp:
         top.pack(side=tk.TOP, fill=tk.X, padx=8, pady=6)
 
         tk.Label(top, text="Input directory:").pack(side=tk.LEFT)
-        self.dir_var = tk.StringVar(value=os.getcwd())
+        self.dir_var = tk.StringVar(value=str(Path.cwd()))
         self.dir_entry = tk.Entry(top, textvariable=self.dir_var, width=65)
         self.dir_entry.pack(side=tk.LEFT, padx=5)
         tk.Button(top, text="Browse...", command=self.browse_dir).pack(side=tk.LEFT, padx=4)
@@ -1206,22 +1216,32 @@ class AutoCropApp:
     # ------------------ actions GUI ------------------
 
     def browse_dir(self):
-        d = filedialog.askdirectory(initialdir=self.dir_var.get() or os.getcwd())
+        current_dir = self.dir_var.get().strip()
+        initial_dir = current_dir or str(Path.cwd())
+        d = filedialog.askdirectory(initialdir=initial_dir)
         if d:
             self.dir_var.set(d)
             self.refresh_files()
 
     def refresh_files(self):
-        d = self.dir_var.get()
-        pats = ["*.fits", "*.fit", "*.fts"]
-        files = []
-        for p in pats:
-            files += sorted(glob.glob(os.path.join(d, p)))
-        self.files = files
+        directory_str = self.dir_var.get().strip()
+        directory = Path(directory_str).expanduser() if directory_str else Path.cwd()
+        patterns = ("*.fits", "*.fit", "*.fts")
+        ordered: list[Path] = []
+        seen: set[Path] = set()
+        for pattern in patterns:
+            for candidate in sorted(directory.glob(pattern)):
+                if not candidate.is_file():
+                    continue
+                if candidate in seen:
+                    continue
+                seen.add(candidate)
+                ordered.append(candidate)
+        self.files = ordered
         self.listbox.delete(0, tk.END)
-        for f in files:
-            self.listbox.insert(tk.END, os.path.basename(f))
-        self.status.set(f"Found {len(files)} FITS files.")
+        for f in ordered:
+            self.listbox.insert(tk.END, f.name)
+        self.status.set(f"Found {len(ordered)} FITS files.")
 
     def _get_altaz_params(self):
         enabled = bool(self.altaz_var.get())
@@ -1266,12 +1286,12 @@ class AutoCropApp:
                 lum, R, G, B = load_fits_rgb(path)
                 rect = detect_autocrop_rgb(lum, R, G, B, band_px=band, k_sigma=ks, margin_px=margin)
                 self.results[path] = rect
-                label = f"OK  {os.path.basename(path)}"
+                label = f"OK  {path.name}"
                 self.listbox.insert(tk.END, label)
             except Exception as e:
                 print(f"[ERROR] {path}: {e}\n{traceback.format_exc()}", file=sys.stderr)
                 self.results[path] = None
-                label = f"ERR {os.path.basename(path)}"
+                label = f"ERR {path.name}"
                 self.listbox.insert(tk.END, label)
             analyzed += 1
 
@@ -1294,9 +1314,10 @@ class AutoCropApp:
 
     def show_preview(self, path, rect):
         self.ax.clear()
-        self.ax.set_title(os.path.basename(path))
+        path_obj = Path(path)
+        self.ax.set_title(path_obj.name)
         try:
-            lum, R, G, B = load_fits_rgb(path)
+            lum, R, G, B = load_fits_rgb(path_obj)
             # on affiche la luminance (low-stretch pour voir les bords sombres)
             disp = np.power(np.clip(lum, 0, 1), 0.5)
             altaz_enabled, altaz_margin, altaz_decay, _ = self._get_altaz_params()
@@ -1325,17 +1346,18 @@ class AutoCropApp:
         out = filedialog.asksaveasfilename(defaultextension=".csv", initialfile="autocrop_rects.csv")
         if not out:
             return
-        with open(out, "w", newline="") as f:
+        out_path = Path(out)
+        with out_path.open("w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(["file", "y0", "x0", "y1", "x1"])
             for p in self.files:
                 r = self.results.get(p)
                 if r is None:
-                    w.writerow([p, "", "", "", ""])
+                    w.writerow([str(p), "", "", "", ""])
                 else:
                     y0, x0, y1, x1 = r
-                    w.writerow([p, y0, x0, y1, x1])
-        self.status.set(f"CSV exported to {out}")
+                    w.writerow([str(p), y0, x0, y1, x1])
+        self.status.set(f"CSV exported to {out_path}")
 
     def apply_crop(self):
         if not self.results:

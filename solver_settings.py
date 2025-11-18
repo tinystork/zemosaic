@@ -48,7 +48,16 @@ from dataclasses import dataclass, asdict
 import json
 from pathlib import Path
 
-DEFAULT_SETTINGS_FILE = Path(__file__).with_name("solver_settings.json")
+try:
+    from zemosaic_utils import ensure_user_config_dir  # type: ignore
+except Exception:  # pragma: no cover - standalone usage
+    def ensure_user_config_dir() -> Path:
+        root = Path.home() / "ZeMosaic"
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+
+
+DEFAULT_SETTINGS_FILE = ensure_user_config_dir() / "solver_settings.json"
 
 
 @dataclass

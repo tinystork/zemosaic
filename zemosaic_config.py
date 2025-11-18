@@ -50,6 +50,17 @@ import shutil
 from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
+try:
+    from zemosaic_utils import ensure_user_config_dir, get_user_config_dir
+except Exception:  # pragma: no cover - fallback when utils unavailable
+    def get_user_config_dir() -> Path:
+        return Path.home() / "ZeMosaic"
+
+    def ensure_user_config_dir() -> Path:
+        path = get_user_config_dir()
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
 try:  # Tkinter is optional for headless/CLI usage
     import tkinter.filedialog as fd
     import tkinter.messagebox as mb
@@ -209,35 +220,43 @@ def _home_path(*parts: str) -> str:
         return ""
 
 
-def _resolve_astap_executable(candidate: Optional[str]) -> Optional[str]:
-    """Expand and validate a potential ASTAP executable path."""
+def _expand_user_path(candidate: Optional[str]) -> Optional[Path]:
+    """Return a ``Path`` expanded relative to the user's home directory."""
     if not candidate:
         return None
-    expanded = os.path.normpath(os.path.expanduser(candidate.strip()))
-    if os.path.isfile(expanded):
-        return expanded
-    if expanded.lower().endswith(".app") and os.path.isdir(expanded):
-        app_exec = os.path.join(expanded, "Contents", "MacOS", "astap")
-        if os.path.isfile(app_exec):
-            return os.path.normpath(app_exec)
-    if os.path.isdir(expanded):
+    try:
+        return Path(candidate).expanduser()
+    except Exception:
+        return None
+
+
+def _resolve_astap_executable(candidate: Optional[str]) -> Optional[str]:
+    """Expand and validate a potential ASTAP executable path."""
+    expanded = _expand_user_path(candidate.strip() if candidate else None)
+    if expanded is None:
+        return None
+    if expanded.is_file():
+        return str(expanded)
+    if expanded.suffix.lower() == ".app" and expanded.is_dir():
+        app_exec = expanded / "Contents" / "MacOS" / "astap"
+        if app_exec.is_file():
+            return str(app_exec)
+    if expanded.is_dir():
         exe_name = "astap.exe" if IS_WINDOWS else "astap"
-        nested = os.path.join(expanded, exe_name)
-        if os.path.isfile(nested):
-            return os.path.normpath(nested)
-    resolved = shutil.which(expanded) or shutil.which(os.path.basename(expanded))
-    if resolved and os.path.isfile(resolved):
-        return os.path.normpath(resolved)
+        nested = expanded / exe_name
+        if nested.is_file():
+            return str(nested)
+    resolved = shutil.which(str(expanded)) or shutil.which(expanded.name)
+    if resolved and Path(resolved).is_file():
+        return str(Path(resolved))
     return None
 
 
 def _resolve_astap_data_dir(candidate: Optional[str]) -> Optional[str]:
     """Expand and validate a potential ASTAP data directory path."""
-    if not candidate:
-        return None
-    expanded = os.path.normpath(os.path.expanduser(candidate.strip()))
-    if os.path.isdir(expanded):
-        return expanded
+    expanded = _expand_user_path(candidate.strip() if candidate else None)
+    if expanded and expanded.is_dir():
+        return str(expanded)
     return None
 
 
@@ -251,23 +270,22 @@ def _candidate_astap_binary_paths() -> List[str]:
             candidates.append(env_val)
 
     if IS_WINDOWS:
-        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
-        program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
-        for base in (program_files, program_files_x86):
-            if base:
-                candidates.append(os.path.join(base, "astap", exe_name))
+        program_files = os.environ.get("ProgramFiles")
+        program_files_x86 = os.environ.get("ProgramFiles(x86)")
+        for base in filter(None, (program_files, program_files_x86)):
+            candidates.append(str(Path(base).expanduser() / "astap" / exe_name))
         candidates.extend(
             [
-                rf"C:\ASTAP\{exe_name}",
-                rf"C:\astap\{exe_name}",
+                str(Path("C:/ASTAP") / exe_name),
+                str(Path("C:/astap") / exe_name),
             ]
         )
     elif IS_MAC:
         candidates.extend(
             [
-                "/Applications/ASTAP.app",
-                "/Applications/ASTAP/astap",
-                "/Applications/ASTAP.app/Contents/MacOS/astap",
+                str(Path("/Applications/ASTAP.app")),
+                str(Path("/Applications/ASTAP/astap")),
+                str(Path("/Applications/ASTAP.app/Contents/MacOS/astap")),
                 _home_path("Applications", "ASTAP.app"),
                 _home_path("Applications", "ASTAP.app", "Contents", "MacOS", "astap"),
             ]
@@ -275,10 +293,10 @@ def _candidate_astap_binary_paths() -> List[str]:
     else:
         candidates.extend(
             [
-                f"/usr/bin/{exe_name}",
-                f"/usr/local/bin/{exe_name}",
-                f"/opt/astap/{exe_name}",
-                f"/opt/astap/bin/{exe_name}",
+                str(Path("/usr/bin") / exe_name),
+                str(Path("/usr/local/bin") / exe_name),
+                str(Path("/opt/astap") / exe_name),
+                str(Path("/opt/astap/bin") / exe_name),
                 _home_path(".local", "bin", exe_name),
                 _home_path("astap", exe_name),
             ]
@@ -297,31 +315,31 @@ def _candidate_astap_data_dirs(astap_exe_path: Optional[str]) -> List[str]:
             candidates.append(env_val)
 
     if astap_exe_path:
-        exe_dir = os.path.dirname(astap_exe_path)
+        exe_path_obj = Path(astap_exe_path)
+        exe_dir = exe_path_obj.parent
         if exe_dir:
-            candidates.append(exe_dir)
-            candidates.append(os.path.join(exe_dir, "data"))
+            candidates.append(str(exe_dir))
+            candidates.append(str(exe_dir / "data"))
             if IS_MAC:
                 # Bundle Resources folder
                 try:
-                    bundle_root = Path(astap_exe_path).resolve().parents[1]
+                    bundle_root = exe_path_obj.resolve().parents[1]
                     candidates.append(str(bundle_root / "Resources"))
                 except IndexError:
                     pass
 
     if IS_WINDOWS:
-        program_files = os.environ.get("ProgramFiles", r"C:\Program Files")
-        program_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")
-        for base in (program_files, program_files_x86):
-            if base:
-                candidates.append(os.path.join(base, "astap"))
+        program_files = os.environ.get("ProgramFiles")
+        program_files_x86 = os.environ.get("ProgramFiles(x86)")
+        for base in filter(None, (program_files, program_files_x86)):
+            candidates.append(str(Path(base).expanduser() / "astap"))
     elif IS_MAC:
         candidates.extend(
             [
-                "/Applications/ASTAP.app/Contents/Resources",
+                str(Path("/Applications/ASTAP.app/Contents/Resources")),
                 _home_path("Applications", "ASTAP.app", "Contents", "Resources"),
                 _home_path("Library", "Application Support", "ASTAP"),
-                "/Library/Application Support/ASTAP",
+                str(Path("/Library/Application Support/ASTAP")),
             ]
         )
     else:
@@ -439,23 +457,22 @@ def _apply_astap_platform_defaults(config: dict) -> bool:
     return updated
 
 
+_SCRIPT_DIR = Path(__file__).resolve().parent
+
+
 def get_config_path():
     """
     Retourne le chemin du fichier de configuration.
-    Le fichier sera situé dans le même dossier que ce script (zemosaic_config.py).
+    Le fichier est stocké dans le répertoire utilisateur ZeMosaic.
     """
-    # __file__ est le chemin du script actuel (zemosaic_config.py)
-    # os.path.dirname(__file__) donne le dossier contenant ce script
-    # os.path.abspath() assure que le chemin est absolu
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(script_dir, CONFIG_FILE_NAME)
+    return str(ensure_user_config_dir() / CONFIG_FILE_NAME)
 
 def load_config():
-    config_path = get_config_path()
+    config_path = Path(get_config_path())
     current_config = DEFAULT_CONFIG.copy()
-    if os.path.exists(config_path):
+    if config_path.exists():
         try:
-            with open(config_path, 'r', encoding='utf-8') as f: # Spécifier encoding
+            with config_path.open("r", encoding="utf-8") as f:  # Spécifier encoding
                 loaded_config = json.load(f)
                 for key, default_value in DEFAULT_CONFIG.items():
                     current_config[key] = loaded_config.get(key, default_value)
@@ -493,7 +510,9 @@ def load_config():
     ):
         value = current_config.get(key)
         if isinstance(value, str) and value:
-            current_config[key] = os.path.expanduser(value)
+            expanded = _expand_user_path(value)
+            if expanded:
+                current_config[key] = str(expanded)
     _apply_astap_platform_defaults(current_config)
     _normalize_gpu_flags(current_config)
 
@@ -530,7 +549,8 @@ def load_config():
 
 def save_config(config_data):
     _normalize_gpu_flags(config_data)
-    config_path = get_config_path()
+    config_path = Path(get_config_path())
+    config_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         # Avant de sauvegarder, s'assurer que config_data ne contient que les clés attendues
         # pour éviter d'écrire des clés temporaires ou obsolètes.
@@ -555,7 +575,7 @@ def save_config(config_data):
              return False # Ne pas créer un fichier vide
 
 
-        with open(config_path, 'w', encoding='utf-8') as f: # Spécifier encoding
+        with config_path.open("w", encoding="utf-8") as f: # Spécifier encoding
             json.dump(config_to_save, f, indent=4, ensure_ascii=False) # ensure_ascii=False pour les caractères non-ASCII
         print(f"Configuration sauvegardée vers {config_path}")
         return True
