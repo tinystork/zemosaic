@@ -193,3 +193,6 @@ build/
 tests/
 # --- Examples de fichiers à ignorer dans le dossier tests ---
 example/
+
+# === ZeMosaic: outils locaux non versionnés ===
+tools/
