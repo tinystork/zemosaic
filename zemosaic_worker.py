@@ -817,25 +817,76 @@ def _apply_autocrop_to_global_plan(
 
 
 def _prepare_tiles_for_two_pass(
-    collected_tiles: list[tuple[np.ndarray, Any]] | None,
-    fallback_loader: Callable[[], tuple[list[np.ndarray], list[Any]]] | None,
-) -> tuple[list[np.ndarray], list[Any]]:
-    """Build the list of tiles and WCS objects used during the second pass."""
+    collected_tiles: list[tuple] | None,
+    fallback_loader: Callable[[], tuple] | None,
+) -> tuple[list[np.ndarray], list[Any], list[np.ndarray | None]]:
+    """Build the tile, WCS, and coverage lists used during the second pass."""
 
     tiles: list[np.ndarray] = []
     wcs_list: list[Any] = []
+    coverage_list: list[np.ndarray | None] = []
+
+    def _coerce_tile_payload(
+        tile_entry,
+    ) -> tuple[np.ndarray | None, Any | None, np.ndarray | None]:
+        try:
+            if isinstance(tile_entry, (list, tuple)):
+                arr = tile_entry[0] if len(tile_entry) >= 1 else None
+                twcs = tile_entry[1] if len(tile_entry) >= 2 else None
+                cov = tile_entry[2] if len(tile_entry) >= 3 else None
+                return arr, twcs, cov
+        except Exception:
+            pass
+        return None, None, None
+
     if collected_tiles:
-        for arr, twcs in collected_tiles:
+        for entry in collected_tiles:
+            arr, twcs, cov = _coerce_tile_payload(entry)
+            if arr is None or twcs is None:
+                continue
+            arr_np = np.asarray(arr, dtype=np.float32)
+            tiles.append(arr_np)
+            wcs_list.append(twcs)
+            if cov is not None:
+                cov_np = np.asarray(cov, dtype=np.float32, copy=False)
+                if cov_np.ndim > 2:
+                    cov_np = np.squeeze(cov_np)
+                coverage_list.append(np.nan_to_num(cov_np, nan=0.0, posinf=0.0, neginf=0.0))
+            else:
+                if arr_np.ndim >= 3:
+                    mask = np.any(np.isfinite(arr_np), axis=-1)
+                else:
+                    mask = np.isfinite(arr_np)
+                coverage_list.append(mask.astype(np.float32))
+    elif fallback_loader is not None:
+        try:
+            loader_payload = fallback_loader()
+        except Exception:
+            loader_payload = ([], [], [])
+        tiles_from_loader: list[np.ndarray] = []
+        wcs_from_loader: list[Any] = []
+        coverage_from_loader: list[np.ndarray | None] = []
+        if isinstance(loader_payload, tuple) and len(loader_payload) >= 2:
+            tiles_from_loader = list(loader_payload[0] or [])
+            wcs_from_loader = list(loader_payload[1] or [])
+            if len(loader_payload) >= 3:
+                coverage_from_loader = list(loader_payload[2] or [])
+        for idx, arr in enumerate(tiles_from_loader):
+            twcs = wcs_from_loader[idx] if idx < len(wcs_from_loader) else None
             if arr is None or twcs is None:
                 continue
             tiles.append(np.asarray(arr, dtype=np.float32))
             wcs_list.append(twcs)
-    elif fallback_loader is not None:
-        try:
-            tiles, wcs_list = fallback_loader()
-        except Exception:
-            tiles, wcs_list = [], []
-    return tiles, wcs_list
+            cov = coverage_from_loader[idx] if idx < len(coverage_from_loader) else None
+            if cov is None:
+                coverage_list.append(None)
+            else:
+                cov_np = np.asarray(cov, dtype=np.float32, copy=False)
+                if cov_np.ndim > 2:
+                    cov_np = np.squeeze(cov_np)
+                coverage_list.append(np.nan_to_num(cov_np, nan=0.0, posinf=0.0, neginf=0.0))
+
+    return tiles, wcs_list, coverage_list
 
 
 def _apply_two_pass_coverage_renorm_if_requested(
@@ -871,7 +922,11 @@ def _apply_two_pass_coverage_renorm_if_requested(
             getattr(final_mosaic_coverage, "shape", None),
         )
 
-    tiles_for_second_pass, wcs_for_second_pass = _prepare_tiles_for_two_pass(
+    (
+        tiles_for_second_pass,
+        wcs_for_second_pass,
+        coverage_for_second_pass,
+    ) = _prepare_tiles_for_two_pass(
         collected_tiles,
         fallback_tile_loader,
     )
@@ -900,6 +955,7 @@ def _apply_two_pass_coverage_renorm_if_requested(
             gain_clip=gain_clip_tuple,
             logger=logger,
             use_gpu_two_pass=use_gpu_two_pass,
+            tiles_coverage=coverage_for_second_pass,
         )
         if result is not None:
             final_mosaic_data, final_mosaic_coverage = result
@@ -1026,6 +1082,346 @@ def _mask_sds_low_coverage_pixels(
         else:
             mosaic_hwc = np.where(~lowcov_mask, mosaic_hwc, np.nan)
     return mosaic_hwc, coverage_arr, summary
+
+
+def _sanitize_sds_megatile_payload(
+    mosaic_hwc: np.ndarray | None,
+    coverage_hw: np.ndarray | None,
+    alpha_hw: np.ndarray | None = None,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """Mask mega-tiles outside their coverage map so stacking ignores empty pixels."""
+
+    if mosaic_hwc is None:
+        return None, coverage_hw, None
+
+    mosaic_arr = np.asarray(mosaic_hwc, dtype=np.float32, order="C")
+    coverage_arr = None
+    if coverage_hw is not None:
+        coverage_arr = np.asarray(coverage_hw, dtype=np.float32, order="C")
+    elif alpha_hw is not None:
+        try:
+            alpha_arr = np.asarray(alpha_hw, dtype=np.float32, order="C")
+            if alpha_arr.ndim > 2:
+                alpha_arr = np.squeeze(alpha_arr)
+            max_alpha = float(np.nanmax(alpha_arr)) if alpha_arr.size else 0.0
+            if max_alpha > 0.0:
+                coverage_arr = (alpha_arr / max_alpha).astype(np.float32, copy=False)
+        except Exception:
+            coverage_arr = None
+
+    target_shape = mosaic_arr.shape[:2]
+
+    def _coerce_hw_array(arr: np.ndarray | None, *, fill_value: float = 0.0) -> np.ndarray | None:
+        if arr is None:
+            return None
+        arr_np = np.asarray(arr, dtype=np.float32, order="C")
+        if arr_np.ndim > 2:
+            arr_np = np.squeeze(arr_np)
+        if arr_np.ndim == 1:
+            # 1D arrays cannot be meaningfully reshaped -> drop.
+            return None
+        if arr_np.ndim != 2:
+            try:
+                arr_np = arr_np.reshape(target_shape)
+            except Exception:
+                return None
+        if arr_np.shape != target_shape:
+            sanitized = np.full(target_shape, fill_value, dtype=np.float32)
+            h = min(target_shape[0], arr_np.shape[0])
+            w = min(target_shape[1], arr_np.shape[1])
+            sanitized[:h, :w] = arr_np[:h, :w]
+            arr_np = sanitized
+        return arr_np
+
+    if coverage_arr is None:
+        coverage_arr = np.ones(mosaic_arr.shape[:2], dtype=np.float32)
+    else:
+        coerced = _coerce_hw_array(coverage_arr, fill_value=0.0)
+        coverage_arr = coerced if coerced is not None else np.ones(target_shape, dtype=np.float32)
+    coverage_arr = np.nan_to_num(coverage_arr, nan=0.0, posinf=0.0, neginf=0.0)
+    valid_mask = (coverage_arr > 1e-6) & np.isfinite(coverage_arr)
+    if mosaic_arr.ndim == 3:
+        mosaic_arr = np.where(valid_mask[..., None], mosaic_arr, np.nan)
+    else:
+        mosaic_arr = np.where(valid_mask, mosaic_arr, np.nan)
+    coverage_arr = np.where(valid_mask, coverage_arr, 0.0).astype(np.float32, copy=False)
+    alpha_arr_sanitized: np.ndarray | None = None
+    if alpha_hw is not None:
+        alpha_float = _coerce_hw_array(alpha_hw, fill_value=0.0)
+        if alpha_float is not None:
+            alpha_float = np.where(valid_mask, alpha_float, 0.0)
+            alpha_arr_sanitized = np.clip(alpha_float, 0.0, 255.0).astype(np.uint8, copy=False)
+    if alpha_arr_sanitized is None:
+        max_cov = float(np.nanmax(coverage_arr)) if coverage_arr.size else 0.0
+        if max_cov > 0.0:
+            normalized_alpha = np.where(
+                valid_mask,
+                (coverage_arr / max_cov) * 255.0,
+                0.0,
+            )
+            alpha_arr_sanitized = np.clip(normalized_alpha, 0.0, 255.0).astype(np.uint8, copy=False)
+    return mosaic_arr, coverage_arr, alpha_arr_sanitized
+
+
+def _sds_compute_tile_payload(
+    tile_arr: np.ndarray,
+    coverage_arr: np.ndarray | None,
+) -> tuple[np.ndarray, float, dict[str, float]]:
+    """Return (tile_array_float32, positive_median, coverage_stats)."""
+
+    arr = np.asarray(tile_arr, dtype=np.float32, order="C")
+    stats = {"coverage_weight": 0.0, "coverage_pixels": 0, "coverage_max": 0.0}
+    median_val = float(np.nanmedian(arr)) if arr.size else 1.0
+    cov_np: np.ndarray | None = None
+    if coverage_arr is not None:
+        try:
+            cov_np = np.asarray(coverage_arr, dtype=np.float32, order="C")
+        except Exception:
+            cov_np = None
+        if cov_np is not None:
+            if cov_np.ndim > 2:
+                cov_np = np.squeeze(cov_np)
+            if cov_np.ndim != 2:
+                if arr.ndim >= 2 and cov_np.size == arr.shape[0] * arr.shape[1]:
+                    try:
+                        cov_np = cov_np.reshape(arr.shape[0], arr.shape[1])
+                    except Exception:
+                        cov_np = None
+                else:
+                    cov_np = None
+    if cov_np is not None:
+        cov_np = np.nan_to_num(cov_np, nan=0.0, posinf=0.0, neginf=0.0)
+        stats["coverage_weight"] = float(np.nansum(cov_np))
+        stats["coverage_pixels"] = int(np.count_nonzero(cov_np > 0.0))
+        stats["coverage_max"] = float(np.nanmax(cov_np)) if cov_np.size else 0.0
+        threshold = 0.0
+        if stats["coverage_max"] > 0.0:
+            # Ignore extremely low coverage (<1% of the local peak) to avoid noisy edges.
+            threshold = 0.01 * stats["coverage_max"]
+        mask = cov_np > threshold
+        if not np.any(mask):
+            mask = cov_np > 0.0
+        if np.any(mask):
+            masked_vals = arr[mask]
+            if masked_vals.size:
+                median_val = float(np.nanmedian(masked_vals))
+
+    if not math.isfinite(median_val):
+        median_val = 1.0
+    median_val = float(abs(median_val))
+    if median_val <= 0.0:
+        fallback = float(np.nanmedian(np.abs(arr))) if arr.size else 1.0
+        if not math.isfinite(fallback) or fallback <= 0.0:
+            median_val = 1.0
+        else:
+            median_val = fallback
+
+    return arr, median_val, stats
+
+
+def _sds_choose_reference_index(
+    payloads: list[tuple[np.ndarray, float, dict[str, float]]],
+    requested_index: int | None,
+) -> int:
+    """Select a deterministic reference megatile index."""
+
+    count = len(payloads)
+    if count == 0:
+        return 0
+    if isinstance(requested_index, int) and 0 <= requested_index < count:
+        return requested_index
+    best_idx: int | None = None
+    best_weight = -1.0
+    for idx, (_, _, stats) in enumerate(payloads):
+        weight = float(stats.get("coverage_weight", 0.0) or 0.0)
+        if weight > best_weight and weight > 0.0:
+            best_idx = idx
+            best_weight = weight
+    if best_idx is not None:
+        return best_idx
+    # Fallback to central tile when no usable coverage weight is available.
+    central_idx = count // 2
+    if 0 <= central_idx < count:
+        return central_idx
+    return 0
+
+
+def _normalize_sds_megatiles_photometry(
+    mega_tiles: list[np.ndarray],
+    coverages: list[np.ndarray | None] | None = None,
+    *,
+    ref_index: int | None = None,
+    pcb: Callable | None = None,
+) -> list[np.ndarray]:
+    """
+    Normalize mega-tiles against a reference median (coverage-aware when available).
+
+    Returns a new list of float32 mega-tiles.
+    """
+
+    if not mega_tiles:
+        return []
+
+    payloads: list[tuple[np.ndarray, float, dict[str, float]]] = []
+    for idx, tile in enumerate(mega_tiles):
+        cov_arr = coverages[idx] if coverages and idx < len(coverages or []) else None
+        payloads.append(_sds_compute_tile_payload(tile, cov_arr))
+
+    selected_ref = _sds_choose_reference_index(payloads, ref_index)
+    selected_ref = max(0, min(selected_ref, len(payloads) - 1))
+    _, ref_median, ref_stats = payloads[selected_ref]
+    if not math.isfinite(ref_median) or ref_median <= 0.0:
+        ref_median = 1.0
+
+    if pcb:
+        try:
+            pcb(
+                "sds_megatile_reference",
+                prog=None,
+                lvl="INFO_DETAIL",
+                ref_index=int(selected_ref),
+                ref_median=float(ref_median),
+                ref_cov_weight=float(ref_stats.get("coverage_weight", 0.0)),
+                ref_cov_pixels=int(ref_stats.get("coverage_pixels", 0)),
+            )
+        except Exception:
+            pass
+
+    normalized_tiles: list[np.ndarray] = []
+    log_indices = {0, len(payloads) - 1, selected_ref}
+    for idx, (tile_arr, tile_median, stats) in enumerate(payloads):
+        gain = 1.0
+        if idx != selected_ref and tile_median > 0.0:
+            gain = ref_median / tile_median
+        if not math.isfinite(gain) or gain <= 0.0:
+            gain = 1.0
+        if idx == selected_ref:
+            normalized_tiles.append(np.asarray(tile_arr, dtype=np.float32, order="C"))
+        else:
+            normalized_tiles.append((tile_arr * np.float32(gain)).astype(np.float32, copy=False))
+        if pcb and idx in log_indices:
+            try:
+                pcb(
+                    "[SDS] sds_megatile_gain",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                    tile_index=int(idx),
+                    ref_index=int(selected_ref),
+                    gain=float(gain),
+                    ref_median=float(ref_median),
+                    tile_median=float(tile_median),
+                    coverage_weight=float(stats.get("coverage_weight", 0.0)),
+                    coverage_pixels=int(stats.get("coverage_pixels", 0)),
+                )
+            except Exception:
+                pass
+
+    return normalized_tiles
+
+
+def _finalize_sds_global_mosaic(
+    mosaic_hwc: np.ndarray | None,
+    coverage_hw: np.ndarray | None,
+    *,
+    zconfig,
+    pcb,
+    sds_config: dict[str, Any] | None = None,
+    collected_tiles: list[tuple[np.ndarray, Any]] | None = None,
+    final_output_wcs: Any = None,
+    final_output_shape_hw: tuple[int, int] | None = None,
+    pipeline_cfg: dict[str, Any] | None = None,
+    enable_lecropper_pipeline: bool = False,
+    enable_master_tile_crop: bool = False,
+    master_tile_crop_percent: float = 0.0,
+    two_pass_enabled: bool = False,
+    two_pass_sigma_px: int = 0,
+    two_pass_gain_clip: tuple[float, float] = (0.85, 1.18),
+    use_gpu_two_pass: bool = False,
+    enable_autocrop: bool = False,
+    autocrop_margin_px: int = 0,
+    global_plan: dict[str, Any] | None = None,
+    fallback_two_pass_loader=None,
+) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+    """
+    Pipeline spécifique SDS appliqué après la construction de la mosaïque globale.
+
+    Retourne (final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_u8).
+    """
+
+    mosaic_arr = None if mosaic_hwc is None else np.asarray(mosaic_hwc, dtype=np.float32, order="C")
+    coverage_arr = None
+    if coverage_hw is not None:
+        coverage_arr = np.asarray(coverage_hw, dtype=np.float32, order="C")
+    elif mosaic_arr is not None:
+        coverage_arr = np.ones(mosaic_arr.shape[:2], dtype=np.float32)
+
+    try:
+        min_keep = float(getattr(zconfig, "sds_min_coverage_keep", 0.0))
+    except Exception:
+        min_keep = 0.0
+    if sds_config and isinstance(sds_config, dict) and "min_coverage_keep" in sds_config:
+        try:
+            min_keep = float(sds_config.get("min_coverage_keep"))
+        except Exception:
+            pass
+
+    mosaic_arr, coverage_arr, summary = _mask_sds_low_coverage_pixels(
+        mosaic_arr,
+        coverage_arr,
+        min_keep_fraction=min_keep,
+        target_hw=mosaic_arr.shape[:2] if mosaic_arr is not None else None,
+    )
+    try:
+        pcb(
+            "sds_mask_cov_summary",
+            prog=None,
+            lvl="INFO_DETAIL",
+            max_cov=summary.get("max_cov", 0.0),
+            masked_pixels=summary.get("masked_pixels", 0),
+            min_keep_fraction=min_keep,
+        )
+    except Exception:
+        pass
+
+    if mosaic_arr is None:
+        return None, coverage_arr, None
+
+    final_output_shape = final_output_shape_hw or mosaic_arr.shape[:2]
+    final_alpha_map = None
+    mosaic_arr, coverage_arr, final_alpha_map = _apply_phase5_post_stack_pipeline(
+        mosaic_arr,
+        coverage_arr,
+        final_alpha_map,
+        enable_lecropper_pipeline=enable_lecropper_pipeline,
+        pipeline_cfg=pipeline_cfg or {},
+        enable_master_tile_crop=enable_master_tile_crop,
+        master_tile_crop_percent=master_tile_crop_percent,
+        two_pass_enabled=two_pass_enabled,
+        two_pass_sigma_px=two_pass_sigma_px,
+        two_pass_gain_clip=two_pass_gain_clip,
+        final_output_wcs=final_output_wcs,
+        final_output_shape_hw=final_output_shape,
+        use_gpu_two_pass=use_gpu_two_pass,
+        logger=logger,
+        collected_tiles=collected_tiles,
+        fallback_two_pass_loader=fallback_two_pass_loader,
+    )
+
+    autocrop_meta: dict[str, int] | None = None
+    if enable_autocrop and mosaic_arr is not None:
+        mosaic_arr, coverage_arr, final_alpha_map, autocrop_meta = _auto_crop_global_mosaic_if_requested(
+            mosaic_arr,
+            coverage_arr,
+            final_alpha_map,
+            enable_autocrop=True,
+            margin_px=max(0, int(autocrop_margin_px)),
+            pcb=pcb,
+        )
+        if autocrop_meta and global_plan is not None:
+            _apply_autocrop_to_global_plan(global_plan, autocrop_meta)
+
+    final_alpha_u8 = _derive_final_alpha_mask(final_alpha_map, mosaic_arr, coverage_arr, logger)
+    return mosaic_arr, coverage_arr, final_alpha_u8
 
 
 _MASTER_TILE_ID_LOCK = Lock()
@@ -10031,11 +10427,20 @@ def assemble_final_mosaic_reproject_coadd(
                     data = np.asarray(data, dtype=np.float32, order="C", copy=True)
                     data[zero_mask[..., None]] = np.nan
 
+        if alpha_mask_arr is not None:
+            coverage_mask_entry = alpha_mask_arr.astype(np.float32, copy=True)
+        else:
+            valid_pixels = (
+                np.any(np.isfinite(data), axis=-1) if data.ndim == 3 else np.isfinite(data)
+            )
+            coverage_mask_entry = valid_pixels.astype(np.float32)
+
         tile_entry = {
             "data": data,
             "wcs": tile_wcs,
             "path": tile_path,
             "tile_id": _resolve_tile_identifier(tile_path, tile_header, idx - 1),
+            "coverage_mask": coverage_mask_entry,
         }
         effective_tiles.append(tile_entry)
 
@@ -10242,15 +10647,23 @@ def assemble_final_mosaic_reproject_coadd(
         for entry in effective_tiles:
             arr = entry.get("data") if isinstance(entry, dict) else None
             tile_wcs = entry.get("wcs") if isinstance(entry, dict) else None
-            if arr is None:
+            coverage_mask = entry.get("coverage_mask") if isinstance(entry, dict) else None
+            if arr is None or tile_wcs is None:
                 continue
             try:
-                collect_tile_data.append((np.array(arr, copy=True), tile_wcs))
+                arr_copy = np.array(arr, copy=True)
             except Exception:
                 try:
-                    collect_tile_data.append((arr.copy(), tile_wcs))
+                    arr_copy = arr.copy()
                 except Exception:
-                    collect_tile_data.append((np.asarray(arr, dtype=np.float32), tile_wcs))
+                    arr_copy = np.asarray(arr, dtype=np.float32)
+            cov_copy = None
+            if coverage_mask is not None:
+                try:
+                    cov_copy = np.array(coverage_mask, copy=True)
+                except Exception:
+                    cov_copy = np.asarray(coverage_mask, dtype=np.float32)
+            collect_tile_data.append((arr_copy, tile_wcs, cov_copy))
 
 
     # Build kwargs dynamically to remain compatible with different reproject versions
@@ -10594,14 +11007,18 @@ def _load_master_tiles_for_two_pass(
     """Load master tiles from disk for the coverage renormalization pass."""
     tiles: list[np.ndarray] = []
     tiles_wcs: list[Any] = []
+    coverage_masks: list[np.ndarray | None] = []
     if not master_tile_fits_with_wcs_list:
-        return tiles, tiles_wcs
+        return tiles, tiles_wcs, coverage_masks
     for tile_path, tile_wcs in master_tile_fits_with_wcs_list:
         if not tile_path or not _path_exists(tile_path) or tile_wcs is None:
             continue
         try:
             with fits.open(tile_path, memmap=False) as hdul:
                 data = hdul[0].data.astype(np.float32)
+                alpha_arr = None
+                if "ALPHA" in hdul and hdul["ALPHA"].data is not None:
+                    alpha_arr = np.asarray(hdul["ALPHA"].data, dtype=np.float32, copy=False)
         except Exception as exc:
             if logger:
                 logger.warning(
@@ -10614,6 +11031,19 @@ def _load_master_tiles_for_two_pass(
             data = np.moveaxis(data, 0, -1)
         if data.ndim == 2:
             data = data[..., np.newaxis]
+        coverage_map = None
+        if alpha_arr is not None:
+            alpha_arr = np.squeeze(alpha_arr)
+            if alpha_arr.ndim > 2 and alpha_arr.shape[0] == 1:
+                alpha_arr = alpha_arr[0]
+            max_alpha = float(np.nanmax(alpha_arr)) if alpha_arr.size else 0.0
+            if max_alpha > 1.0:
+                alpha_arr = alpha_arr / max_alpha
+            coverage_map = np.clip(alpha_arr, 0.0, 1.0).astype(np.float32, copy=False)
+        else:
+            arr_np = np.asarray(data, dtype=np.float32, copy=False)
+            mask_valid = np.any(np.isfinite(arr_np), axis=-1) if arr_np.ndim == 3 else np.isfinite(arr_np)
+            coverage_map = mask_valid.astype(np.float32)
         current_wcs = tile_wcs
         if (
             apply_crop
@@ -10631,6 +11061,19 @@ def _load_master_tiles_for_two_pass(
                 if cropped_img is not None and cropped_wcs is not None:
                     data = cropped_img
                     current_wcs = cropped_wcs
+                    if coverage_map is not None:
+                        try:
+                            coverage_img = coverage_map[..., np.newaxis]
+                            cropped_cov, _ = zemosaic_utils.crop_image_and_wcs(
+                                coverage_img,
+                                copy.deepcopy(tile_wcs),
+                                float(crop_percent) / 100.0,
+                                progress_callback=None,
+                            )
+                            if cropped_cov is not None:
+                                coverage_map = np.squeeze(cropped_cov)
+                        except Exception:
+                            coverage_map = coverage_map[: data.shape[0], : data.shape[1]]
             except Exception as exc:
                 if logger:
                     logger.debug(
@@ -10640,11 +11083,12 @@ def _load_master_tiles_for_two_pass(
                     )
         tiles.append(np.asarray(data, dtype=np.float32))
         tiles_wcs.append(current_wcs)
+        coverage_masks.append(np.asarray(coverage_map, dtype=np.float32) if coverage_map is not None else None)
         if logger and len(tiles) <= 5:
             logger.debug(
                 "[TwoPass] Loaded tile %s with shape=%s", _safe_basename(tile_path), np.asarray(data).shape
             )
-    return tiles, tiles_wcs
+    return tiles, tiles_wcs, coverage_masks
 
 
 def _derive_final_alpha_mask(
@@ -10722,6 +11166,7 @@ def compute_per_tile_gains_from_coverage(
     gain_clip: tuple[float, float],
     logger=None,
     use_gpu: bool = False,
+    tiles_coverage: list[np.ndarray | None] | None = None,
 ) -> list[float]:
     """Compute multiplicative gains for each tile using the blurred coverage map."""
     if logger:
@@ -10822,7 +11267,24 @@ def compute_per_tile_gains_from_coverage(
         if shape[0] <= 0 or shape[1] <= 0:
             gains.append(1.0)
             continue
-        mask = np.ones(shape[:2], dtype=np.float32)
+        coverage_src = None
+        if tiles_coverage and idx < len(tiles_coverage or []):
+            coverage_src = tiles_coverage[idx]
+        if coverage_src is None:
+            mask = np.ones(shape[:2], dtype=np.float32)
+        else:
+            cov_arr = np.asarray(coverage_src, dtype=np.float32, copy=False)
+            if cov_arr.ndim > 2:
+                cov_arr = np.squeeze(cov_arr)
+            try:
+                mask = np.nan_to_num(cov_arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+            except Exception:
+                mask = np.ones(shape[:2], dtype=np.float32)
+            if mask.shape != tuple(shape[:2]):
+                try:
+                    mask = mask.reshape(shape[:2])
+                except Exception:
+                    mask = np.ones(shape[:2], dtype=np.float32)
         try:
             reproj_mask, _ = reproject_interp(
                 (mask, tile_wcs),
@@ -10834,7 +11296,7 @@ def compute_per_tile_gains_from_coverage(
                 logger.warning("[TwoPass] Mask reprojection failed for tile %d: %s", idx, exc)
             gains.append(1.0)
             continue
-        valid = (reproj_mask > 0.1) & (coverage > 0.0)
+        valid = (reproj_mask > 1e-3) & (coverage > 0.0)
         if not np.any(valid):
             gains.append(1.0)
             if logger and idx < 10:
@@ -10868,6 +11330,7 @@ def run_second_pass_coverage_renorm(
     gain_clip: tuple[float, float],
     logger=None,
     use_gpu_two_pass: bool | None = None,
+    tiles_coverage: list[np.ndarray | None] | None = None,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Apply coverage-based gains to tiles and reproject them for a second pass."""
     if logger:
@@ -10907,6 +11370,7 @@ def run_second_pass_coverage_renorm(
             gain_clip=gain_clip,
             logger=logger,
             use_gpu=use_gpu,
+            tiles_coverage=tiles_coverage,
         )
     except Exception as exc:
         if logger:
@@ -11166,6 +11630,11 @@ def run_hierarchical_mosaic(
             worker_config_cache = zemosaic_config.load_config() or {}
         except Exception:
             worker_config_cache = {}
+
+    try:
+        zconfig = SimpleNamespace(**worker_config_cache)
+    except Exception:
+        zconfig = SimpleNamespace()
 
     def pcb(msg_key, prog=None, lvl="INFO", **kwargs):
         """Shortcut to emit log+callback events with the current progress callback."""
@@ -13033,87 +13502,44 @@ def run_hierarchical_mosaic(
 
             sds_polish_succeeded = False
             if sds_mosaic_data_HWC is not None:
-                final_mosaic_data_HWC = np.asarray(sds_mosaic_data_HWC, dtype=np.float32, order="C")
-                final_mosaic_coverage_HW = (
-                    np.asarray(sds_coverage_HW, dtype=np.float32, order="C")
-                    if sds_coverage_HW is not None
+                final_output_wcs = global_wcs_plan.get("wcs")
+                target_hw = (
+                    (sds_mosaic_data_HWC.shape[0], sds_mosaic_data_HWC.shape[1])
+                    if hasattr(sds_mosaic_data_HWC, "shape")
                     else None
                 )
-                if final_mosaic_coverage_HW is None and final_mosaic_data_HWC is not None:
-                    final_mosaic_coverage_HW = np.ones(final_mosaic_data_HWC.shape[:2], dtype=np.float32)
-                if isinstance(sds_alpha_map, np.ndarray):
-                    final_alpha_map = np.array(sds_alpha_map, copy=True)
-                else:
-                    final_alpha_map = sds_alpha_map
-                target_hw = final_mosaic_data_HWC.shape[:2] if final_mosaic_data_HWC is not None else None
-                (
-                    final_mosaic_data_HWC,
-                    final_mosaic_coverage_HW,
-                    coverage_summary,
-                ) = _mask_sds_low_coverage_pixels(
-                    final_mosaic_data_HWC,
-                    final_mosaic_coverage_HW,
-                    min_keep_fraction=sds_min_coverage_keep_config,
-                    target_hw=target_hw,
+                pcb("phase5_sds_polish_start", prog=None, lvl="INFO")
+                if logger:
+                    logger.info("[SDS] Phase 5 polish on global SDS mosaic (skipping master tiles)")
+                final_mosaic_data_HWC, final_mosaic_coverage_HW, alpha_final = _finalize_sds_global_mosaic(
+                    sds_mosaic_data_HWC,
+                    sds_coverage_HW,
+                    zconfig=zconfig,
+                    pcb=pcb,
+                    sds_config={"min_coverage_keep": sds_min_coverage_keep_config},
+                    collected_tiles=sds_two_pass_tile_pairs,
+                    final_output_wcs=final_output_wcs,
+                    final_output_shape_hw=target_hw,
+                    pipeline_cfg=final_quality_pipeline_cfg,
+                    enable_lecropper_pipeline=bool(
+                        final_quality_pipeline_cfg.get("quality_crop_enabled")
+                        or final_quality_pipeline_cfg.get("altaz_cleanup_enabled")
+                    ),
+                    enable_master_tile_crop=bool(apply_master_tile_crop_config and not quality_crop_enabled_config),
+                    master_tile_crop_percent=float(master_tile_crop_percent_config),
+                    two_pass_enabled=bool(two_pass_enabled),
+                    two_pass_sigma_px=int(two_pass_sigma_px),
+                    two_pass_gain_clip=gain_clip_tuple,
+                    use_gpu_two_pass=use_gpu_phase5_flag,
+                    enable_autocrop=bool(global_wcs_autocrop_enabled_config),
+                    autocrop_margin_px=global_wcs_autocrop_margin_px_config,
+                    global_plan=global_wcs_plan,
+                    fallback_two_pass_loader=None,
                 )
-                try:
-                    pcb(
-                        "sds_coverage_normalized",
-                        prog=None,
-                        lvl="INFO_DETAIL",
-                        max_cov=f"{coverage_summary.get('max_cov', 0.0):.6f}",
-                        min_keep=f"{float(sds_min_coverage_keep_config):.3f}",
-                        masked_pixels=int(coverage_summary.get("masked_pixels", 0)),
-                    )
-                except Exception:
-                    pass
-                autocrop_meta: dict[str, int] | None = None
-                if final_mosaic_data_HWC is not None and global_wcs_autocrop_enabled_config:
-                    final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map, autocrop_meta = (
-                        _auto_crop_global_mosaic_if_requested(
-                            final_mosaic_data_HWC,
-                            final_mosaic_coverage_HW,
-                            final_alpha_map,
-                            enable_autocrop=True,
-                            margin_px=global_wcs_autocrop_margin_px_config,
-                            pcb=pcb,
-                        )
-                    )
-                    if autocrop_meta:
-                        _apply_autocrop_to_global_plan(global_wcs_plan, autocrop_meta)
+                final_alpha_map = alpha_final
                 if final_mosaic_data_HWC is not None:
-                    final_output_wcs = global_wcs_plan.get("wcs")
                     final_output_shape_hw = (final_mosaic_data_HWC.shape[0], final_mosaic_data_HWC.shape[1])
-                    pcb("phase5_sds_polish_start", prog=None, lvl="INFO")
-                    if logger:
-                        logger.info("Phase 5 (SDS): polish-only mode, skipping reproject_and_coadd.")
-                    final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = _apply_phase5_post_stack_pipeline(
-                        final_mosaic_data_HWC,
-                        final_mosaic_coverage_HW,
-                        final_alpha_map,
-                        enable_lecropper_pipeline=bool(
-                            final_quality_pipeline_cfg.get("quality_crop_enabled")
-                            or final_quality_pipeline_cfg.get("altaz_cleanup_enabled")
-                        ),
-                        pipeline_cfg=final_quality_pipeline_cfg,
-                        enable_master_tile_crop=bool(apply_master_tile_crop_config and not quality_crop_enabled_config),
-                        master_tile_crop_percent=float(master_tile_crop_percent_config),
-                        two_pass_enabled=bool(two_pass_enabled),
-                        two_pass_sigma_px=int(two_pass_sigma_px),
-                        two_pass_gain_clip=gain_clip_tuple,
-                        final_output_wcs=final_output_wcs,
-                        final_output_shape_hw=final_output_shape_hw,
-                        use_gpu_two_pass=use_gpu_phase5_flag,
-                        logger=logger,
-                        collected_tiles=sds_two_pass_tile_pairs,
-                        fallback_two_pass_loader=None,
-                    )
-                    alpha_final = _derive_final_alpha_mask(
-                        final_alpha_map,
-                        final_mosaic_data_HWC,
-                        final_mosaic_coverage_HW,
-                        logger,
-                    )
+                    final_output_wcs = global_wcs_plan.get("wcs")
                     current_global_progress = min(
                         100.0,
                         base_progress_phase2
@@ -13125,9 +13551,10 @@ def run_hierarchical_mosaic(
                     )
                     seestar_stack_groups = []
                     sds_polish_succeeded = True
+                    pcb("sds_global_finalize_done", prog=None, lvl="INFO", has_alpha=alpha_final is not None)
                 else:
-                    final_mosaic_data_HWC = None
                     final_mosaic_coverage_HW = None
+                    final_alpha_map = None
             if not sds_polish_succeeded:
                 if not sds_tile_records:
                     pcb("sds_failed_fallback_mosaic_first", prog=None, lvl="WARN")
@@ -13147,61 +13574,58 @@ def run_hierarchical_mosaic(
                         cache_root=output_folder,
                     ) or (None, None, None)
                     final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = mosaic_result
-                    autocrop_meta: dict[str, int] | None = None
-                    if final_mosaic_data_HWC is not None and global_wcs_autocrop_enabled_config:
-                        final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map, autocrop_meta = (
-                            _auto_crop_global_mosaic_if_requested(
-                                final_mosaic_data_HWC,
-                                final_mosaic_coverage_HW,
-                                final_alpha_map,
-                                enable_autocrop=True,
-                                margin_px=global_wcs_autocrop_margin_px_config,
-                                pcb=pcb,
-                            )
-                        )
-                        if autocrop_meta:
-                            _apply_autocrop_to_global_plan(global_wcs_plan, autocrop_meta)
                     if final_mosaic_data_HWC is not None:
                         final_output_wcs = global_wcs_plan.get("wcs")
-                        final_output_shape_hw = (final_mosaic_data_HWC.shape[0], final_mosaic_data_HWC.shape[1])
-                        final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = _apply_phase5_post_stack_pipeline(
+                        target_hw = (
+                            (final_mosaic_data_HWC.shape[0], final_mosaic_data_HWC.shape[1])
+                            if hasattr(final_mosaic_data_HWC, "shape")
+                            else None
+                        )
+                        final_mosaic_data_HWC, final_mosaic_coverage_HW, alpha_final = _finalize_sds_global_mosaic(
                             final_mosaic_data_HWC,
                             final_mosaic_coverage_HW,
-                            final_alpha_map,
+                            zconfig=zconfig,
+                            pcb=pcb,
+                            sds_config={"min_coverage_keep": sds_min_coverage_keep_config},
+                            collected_tiles=None,
+                            final_output_wcs=final_output_wcs,
+                            final_output_shape_hw=target_hw,
+                            pipeline_cfg=final_quality_pipeline_cfg,
                             enable_lecropper_pipeline=bool(
                                 final_quality_pipeline_cfg.get("quality_crop_enabled")
                                 or final_quality_pipeline_cfg.get("altaz_cleanup_enabled")
                             ),
-                            pipeline_cfg=final_quality_pipeline_cfg,
                             enable_master_tile_crop=bool(apply_master_tile_crop_config and not quality_crop_enabled_config),
                             master_tile_crop_percent=float(master_tile_crop_percent_config),
                             two_pass_enabled=bool(two_pass_enabled),
                             two_pass_sigma_px=int(two_pass_sigma_px),
                             two_pass_gain_clip=gain_clip_tuple,
-                            final_output_wcs=final_output_wcs,
-                            final_output_shape_hw=final_output_shape_hw,
                             use_gpu_two_pass=use_gpu_phase5_flag,
-                            logger=logger,
-                            collected_tiles=None,
+                            enable_autocrop=bool(global_wcs_autocrop_enabled_config),
+                            autocrop_margin_px=global_wcs_autocrop_margin_px_config,
+                            global_plan=global_wcs_plan,
                             fallback_two_pass_loader=None,
                         )
-                        alpha_final = _derive_final_alpha_mask(
-                            final_alpha_map,
-                            final_mosaic_data_HWC,
-                            final_mosaic_coverage_HW,
-                            logger,
-                        )
-                        current_global_progress = min(
-                            100.0,
-                            base_progress_phase2
-                            + PROGRESS_WEIGHT_PHASE2_CLUSTERING
-                            + PROGRESS_WEIGHT_PHASE3_MASTER_TILES
-                            + PROGRESS_WEIGHT_PHASE4_GRID_CALC
-                            + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
-                            + PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
-                        )
-                        seestar_stack_groups = []
-                    else:
+                        final_alpha_map = alpha_final
+                        if final_mosaic_data_HWC is not None:
+                            final_output_wcs = global_wcs_plan.get("wcs")
+                            final_output_shape_hw = (
+                                final_mosaic_data_HWC.shape[0],
+                                final_mosaic_data_HWC.shape[1],
+                            )
+                            current_global_progress = min(
+                                100.0,
+                                base_progress_phase2
+                                + PROGRESS_WEIGHT_PHASE2_CLUSTERING
+                                + PROGRESS_WEIGHT_PHASE3_MASTER_TILES
+                                + PROGRESS_WEIGHT_PHASE4_GRID_CALC
+                                + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
+                                + PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
+                            )
+                            seestar_stack_groups = []
+                            sds_polish_succeeded = True
+                            pcb("sds_global_finalize_done", prog=None, lvl="INFO", has_alpha=alpha_final is not None)
+                    if not sds_polish_succeeded:
                         if not sds_fallback_logged:
                             pcb("sds_and_mosaic_first_failed_fallback_mastertiles", prog=None, lvl="WARN")
                             sds_fallback_logged = True
@@ -15827,6 +16251,8 @@ def assemble_global_mosaic_sds(
     if global_wcs_obj is None:
         return None, None, None
 
+    assembly_start = time.monotonic()
+
     pcb = lambda key, prog=None, lvl="INFO", **kwargs: _log_and_callback(
         key,
         prog,
@@ -16229,56 +16655,120 @@ def assemble_global_mosaic_sds(
     mosaics: list[np.ndarray] = []
     coverages: list[np.ndarray | None] = []
     alphas: list[np.ndarray | None] = []
+    pending_tile_payloads: list[tuple[np.ndarray, np.ndarray | None, np.ndarray | None, int]] = []
+    batch_timings: list[float] = []
     total_batches = len(batches)
     weight_total = float(progress_weight_phase or 0.0)
     base_phase = float(base_progress_phase or 0.0)
-    for idx, batch in enumerate(batches):
+
+    def _sds_build_reproject_kwargs(batch_index: int) -> dict[str, Any]:
+        """Helper to keep per-batch reprojection kwargs consistent."""
+
         batch_base = base_phase
         if weight_total and total_batches:
-            batch_base = base_phase + weight_total * (idx / max(1, total_batches))
-        batch_weight = weight_total / max(1, total_batches) if weight_total else weight_total
+            batch_base = base_phase + weight_total * (batch_index / max(1, total_batches))
+        batch_weight = weight_total / max(1, total_batches) if weight_total else 0.0
+        return {
+            "global_plan": global_plan,
+            "progress_callback": progress_callback,
+            "match_background": match_background,
+            "base_progress_phase": batch_base,
+            "progress_weight_phase": batch_weight,
+            "start_time_total_run": start_time_total_run,
+            "cache_root": cache_root,
+        }
+
+    for idx, batch in enumerate(batches):
+        batch_start = time.monotonic()
         batch_result = _assemble_global_mosaic_first_impl(
             [batch],
-            global_plan=global_plan,
-            progress_callback=progress_callback,
-            match_background=match_background,
-            base_progress_phase=batch_base,
-            progress_weight_phase=batch_weight,
-            start_time_total_run=start_time_total_run,
-            cache_root=cache_root,
+            **_sds_build_reproject_kwargs(idx),
         )
         mosaic_arr, coverage_arr, alpha_arr = batch_result
+        batch_elapsed = max(0.0, time.monotonic() - batch_start)
+        batch_timings.append(batch_elapsed)
+        tile_shape_text = (
+            f"{int(mosaic_arr.shape[0])}x{int(mosaic_arr.shape[1])}"
+            if mosaic_arr is not None and mosaic_arr.ndim >= 2
+            else "n/a"
+        )
+        log_message = (
+            f"[SDS] Batch {idx + 1}/{total_batches} | frames={len(batch)} "
+            f"| shape={tile_shape_text} | elapsed={batch_elapsed:.2f}s | success={mosaic_arr is not None}"
+        )
+        try:
+            pcb(
+                log_message,
+                prog=None,
+                lvl="INFO_DETAIL",
+                batch_index=int(idx + 1),
+                total_batches=int(total_batches),
+                images=len(batch),
+                tile_shape=tile_shape_text,
+                elapsed_s=float(batch_elapsed),
+                success=bool(mosaic_arr is not None),
+            )
+        except Exception:
+            pass
         if mosaic_arr is None:
             continue
-        mosaics.append(_safe_asarray(mosaic_arr))
-        coverages.append(_safe_asarray(coverage_arr) if coverage_arr is not None else None)
-        if isinstance(alpha_arr, np.ndarray):
+        mosaic_sanitized, coverage_sanitized, alpha_sanitized = _sanitize_sds_megatile_payload(
+            mosaic_arr,
+            coverage_arr,
+            alpha_arr,
+        )
+        if mosaic_sanitized is None:
+            continue
+        mosaics.append(mosaic_sanitized)
+        coverages.append(coverage_sanitized)
+        if alpha_sanitized is not None:
+            alphas.append(alpha_sanitized)
+        elif isinstance(alpha_arr, np.ndarray):
             alphas.append(_safe_asarray(alpha_arr))
         else:
             alphas.append(alpha_arr.copy() if alpha_arr is not None else None)
-        saved_tile = _persist_sds_tile(
-            mosaics[-1],
-            alphas[-1],
-            coverages[-1],
-            idx + 1,
-        )
-        if saved_tile:
-            tile_records.append(saved_tile)
+        pending_tile_payloads.append((mosaics[-1], alphas[-1], coverages[-1], idx + 1))
 
     if not mosaics:
         pcb("sds_error_no_valid_batches", prog=None, lvl="WARN")
         return None, None, None
 
+    mosaics = _normalize_sds_megatiles_photometry(
+        mosaics,
+        coverages,
+        ref_index=0,
+        pcb=pcb,
+    )
+    if len(pending_tile_payloads) == len(mosaics):
+        pending_tile_payloads = [
+            (
+                mosaics[i],
+                pending_tile_payloads[i][1],
+                coverages[i] if i < len(coverages) else None,
+                pending_tile_payloads[i][3],
+            )
+            for i in range(len(mosaics))
+        ]
+
+    for mosaic_arr, alpha_arr, cov_arr, tile_idx in pending_tile_payloads:
+        saved_tile = _persist_sds_tile(mosaic_arr, alpha_arr, cov_arr, tile_idx)
+        if saved_tile:
+            tile_records.append(saved_tile)
+
     if postprocess_context is not None:
-        tile_pairs: list[tuple[np.ndarray, Any]] = []
-        for mosaic in mosaics:
+        tile_pairs: list[tuple[np.ndarray, Any, np.ndarray | None]] = []
+        for idx, mosaic in enumerate(mosaics):
             if mosaic is None:
                 continue
             try:
                 wcs_clone = copy.deepcopy(global_wcs_obj)
             except Exception:
                 wcs_clone = global_wcs_obj
-            tile_pairs.append((mosaic, wcs_clone))
+            coverage_payload = None
+            if idx < len(coverages):
+                cov_arr = coverages[idx]
+                coverage_payload = np.asarray(cov_arr, dtype=np.float32, copy=True) if cov_arr is not None else None
+            tile_pairs.append((mosaic, wcs_clone, coverage_payload))
         postprocess_context["two_pass_tile_pairs"] = tile_pairs
         if tile_records:
             postprocess_context["sds_tile_records"] = list(tile_records)
@@ -16408,6 +16898,43 @@ def assemble_global_mosaic_sds(
         if max_cov > 0:
             normalized = np.clip((final_coverage / max_cov) * 255.0, 0, 255)
             final_alpha = normalized.astype(np.uint8, copy=False)
+
+    total_elapsed = max(0.0, time.monotonic() - assembly_start)
+    shape_acc_h = 0.0
+    shape_acc_w = 0.0
+    valid_shape_count = 0
+    for tile in mosaics:
+        if tile is None or tile.ndim < 2:
+            continue
+        shape_acc_h += float(tile.shape[0])
+        shape_acc_w += float(tile.shape[1])
+        valid_shape_count += 1
+    avg_height = (shape_acc_h / valid_shape_count) if valid_shape_count else 0.0
+    avg_width = (shape_acc_w / valid_shape_count) if valid_shape_count else 0.0
+    avg_batch_time = (sum(batch_timings) / len(batch_timings)) if batch_timings else 0.0
+    summary_message = (
+        "[SDS] Global summary → mega_tiles={tiles}, avg_shape≈{avg_h:.1f}x{avg_w:.1f}, "
+        "elapsed={elapsed:.2f}s, avg_batch={avg_batch:.2f}s"
+    ).format(
+        tiles=len(mosaics),
+        avg_h=avg_height,
+        avg_w=avg_width,
+        elapsed=total_elapsed,
+        avg_batch=avg_batch_time,
+    )
+    try:
+        pcb(
+            summary_message,
+            prog=None,
+            lvl="INFO_DETAIL",
+            mega_tiles=int(len(mosaics)),
+            avg_height=float(avg_height),
+            avg_width=float(avg_width),
+            elapsed_s=float(total_elapsed),
+            avg_batch_s=float(avg_batch_time),
+        )
+    except Exception:
+        pass
 
     return final_image, final_coverage, final_alpha
 

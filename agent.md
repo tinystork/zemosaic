@@ -1,194 +1,222 @@
-# Agent — SDS Global Mosaic = Final Image (Phase 5 = Polish + Save)
+# Mission — Mettre le mode SDS en conformité avec le workflow “ZeSupaDupStack”
 
-## 1. Mission
+## Rôle de cette mission
 
-Refactor the SDS (Super-Deep Stacking / Mosaic-First) pipeline so that:
+Tu es Codex High.  
+Ta mission est de faire en sorte que le **mode SDS** de ZeMosaic suive exactement le workflow conceptuel décrit ci-dessous, **sans modifier le comportement du mode normal (SDS OFF)**.
 
-- **When SDS is ON**:  
-  - The pipeline is strictly:
-    > `lights → mega-tiles → global super-stack = final mosaic`  
-    - Phase 5 no longer re-runs a full `reproject_and_coadd` over all mega-tiles.
-    - Phase 5 becomes a **polish + save** stage operating on the already-built global SDS mosaic.
-  - Low-coverage, noisy borders are **masked out** early (coverage-based threshold).
-
-- **When SDS is OFF**:  
-  - Preserve the **historical behavior**:
-    > master tiles are built, Phase 3 & 5 work as before, with the standard `assemble_final_mosaic_reproject_coadd`.
-  - No regression, no change in visual results (aside from normal noise).
-
-The main goal is to:
-- **keep the dense, well-covered core**,  
-- **drop very low-coverage “skirts” (mostly noise and seams)**,  
-- and **avoid redundant reproject+coadd passes** when SDS already produced a proper global mosaic.
+Tu dois considérer ce document comme la **spécification fonctionnelle** du mode SDS.
 
 ---
 
-## 2. Current situation (summary)
+## Champ d’action (IMPORTANT)
 
-Today, in SDS mode, the logs show something like:
+### Fichiers que tu peux modifier (code) :
 
-- `P4 - Mosaic-First global coadd finished (kappa_sigma) ... grid 3621×3333px, 6 image(s).`  
-  → SDS builds a **global mosaic from mega-tiles** using a Mosaic-First `reproject_and_coadd`.
+- `zemosaic_worker.py`  
+  - uniquement les parties qui concernent :
+    - la détection du mode SDS,
+    - le pipeline SDS (création de lots, méga-tuiles, renormalisation inter-méga-tiles, stack final),
+    - la finalisation SDS.
 
-- Then, **Phase 5** still runs:
-  - `Phase 5: Final assembly (Reproject & Coadd)...`
-  - `run_info_phase5_finished_reproject_coadd ... shape: (...)`
-  → This is a **full reproject+coadd** over the tiles/mega-tiles again, as in the non-SDS pathway.
+### Fichiers que tu peux éventuellement toucher **légèrement** :
 
-- At save time, we see:
-  - `SAVE_DEBUG: Données image_data reçues - Shape: (3333, 2661, 3) ...`
-  → auto-crop + coverage logic is applied there.
+- `zemosaic_config.py`  
+  - **uniquement** pour ajouter/ajuster des paramètres spécifiques SDS si nécessaire (sans changer les clés existantes ni les valeurs par défaut globales hors SDS).
+- `en.json`, `fr.json`  
+  - pour ajouter des **nouvelles chaînes de log SDS** si tu en as réellement besoin,
+  - sans supprimer ni renommer des clés existantes.
 
-So the SDS idea is already present (mega-tiles + Mosaic-First coadd), but **Phase 5 remains too “heavy”** in SDS mode and still behaves like the generic pipeline.
+### Fichiers que tu ne dois PAS modifier :
 
----
+- `zemosaic_align_stack.py`
+- `lecropper.py`
+- `zemosaic_gui.py`
+- `zemosaic_gui_qt.py`
+- `zemosaic_filter_gui.py`
+- `zemosaic_filter_gui_qt.py`
+- tout autre fichier non listé ci-dessus.
 
-## 3. Target behavior
+### Invariant fondamental
 
-### 3.1 SDS ON
+> Le pipeline **non-SDS (SDS OFF)** doit conserver **strictement le même comportement** qu’avant tes modifications.
 
-Logical pipeline must be:
+- Même séquence de phases (Master Tiles, Phase 4/4.5, Phase 5).
+- Même logique de normalisation/empilement pour les Master Tiles.
+- Même comportement pour `batch_size=0` et `batch_size>1`.
+- Même usage GPU/CPU, memmap, etc.
 
-```text
-Lights (unit frames)
-  → SDS grouping / batch processing
-    → Mega-tiles (each = stack of unit frames on global WCS)
-      → Mosaic-First global coadd (super-stack of mega-tiles)
-        → Coverage-based masking / cropping
-          → Phase 5: polish (renorm/IBN, auto-crop, alpha, save) on the global mosaic
-````
-
-Concretely:
-
-* After **Mosaic-First global coadd** in SDS:
-
-  * Compute / normalize a **coverage map** `coverage_HW`:
-
-    * Either in [0, 1] (fraction of max contributions) or in “number of frames” + normalized variant.
-  * Apply a **minimum coverage threshold** `min_coverage_keep`:
-
-    * Pixels below threshold:
-
-      * `final_mosaic_data_HWC[...] = NaN`
-      * `final_coverage_HW[...] = 0.0`
-  * Expose these as:
-
-    * `final_mosaic_data_HWC` (float32, shape `(H, W, 3)` or `(H, W)` depending on channels)
-    * `final_coverage_HW` (float32, shape `(H, W)`)
-
-* **Phase 5 in SDS mode**:
-
-  * **Does NOT** call `assemble_final_mosaic_reproject_coadd` on the list of tiles/mega-tiles.
-  * Instead, Phase 5 takes:
-
-    * `final_mosaic_data_HWC`
-    * `final_coverage_HW`
-  * And applies:
-
-    * global renorm / IBN (if enabled),
-    * coverage-based auto-crop (as today),
-    * alpha mask building (if applicable),
-    * FITS + coverage + preview export.
-
-### 3.2 SDS OFF
-
-* Keep the **legacy behavior** unchanged:
-
-  * Master tiles are built.
-  * Phase 3 / Phase 5 run the classic:
-
-    * `assemble_final_mosaic_reproject_coadd(...)`
-    * and associated coverage/alpha/crop logic.
-* This must preserve:
-
-  * Historical stacking/coverage behavior.
-  * All existing options (including batch_size=0 / >1 semantics, GPU/CPU fallback, etc.).
+Tu peux facturer un peu de code générique **si cela ne change pas la sortie du mode normal**, mais **tu ne dois jamais modifier la structure générale des phases non-SDS**.
 
 ---
 
-## 4. Scope of changes
+## Workflow SDS (ZeSupaDupStack) — SPÉCIFICATION
 
-Likely impacted files (names based on current project structure):
+Le mode SDS n’est **pas** un mode mosaïque classique.  
+C’est un mode **super-stack par lots**, conçu pour :
 
-* `zemosaic_worker.py` (or equivalent):
+- découper intelligemment les données du Seestar,
+- normaliser *localement*,
+- produire des **méga-tuiles photométriquement propres**,
+- puis les empiler dans **UN SEUL grand stack global**.
 
-  * Orchestration of phases 1–7.
-  * SDS branching logic (SDS ON/OFF).
-  * Calls to:
+Tu dois t’assurer que le code SDS reflète ce workflow de bout en bout.
 
-    * `assemble_global_mosaic_sds` / `assemble_global_mosaic_first`,
-    * `assemble_final_mosaic_reproject_coadd`,
-    * save functions (FITS, coverage, preview).
+### 1️⃣ Entrée : le filtre SDS prépare les lots
 
-* `zemosaic_align_stack.py` (or similar):
+Le filtre (GUI Qt) :
 
-  * Implement or adjust:
+- analyse les positions WCS des images,
+- estime la coverage,
+- applique une taille de lot cible,
+- tient compte des zones de recouvrement.
 
-    * SDS global mosaic coadd,
-    * coverage computation/normalization,
-    * handling of `final_mosaic_data_HWC` + `final_coverage_HW`.
+Il produit une liste de **LOTS SDS** de ce type :
 
-* `zemosaic_config.py` / `solver_settings.py`:
+- Lot 1 : images {1,2,3,…}  
+- Lot 2 : images {…}  
+- etc.
 
-  * New SDS-specific config parameter(s):
-
-    * `min_coverage_keep` (float in [0,1], default e.g. 0.4 or 0.5).
-    * Optionally: distinct `min_coverage_cropping` if needed.
-
-* Possibly: `zemosaic_filter_gui_qt.py` (optional, not mandatory in this mission):
-
-  * If you expose `min_coverage_keep` in GUI (advanced SDS options).
-  * This is a **nice-to-have**, not required for this mission.
+**Important :**  
+En mode SDS, ces **lots SDS remplacent complètement les Master Tiles**.  
+Il ne faut plus reconstruire de Master Tiles dans le pipeline SDS.
 
 ---
 
-## 5. Constraints & Non-goals
+### 2️⃣ Pour chaque lot SDS → création d’une méga-tuile
 
-* **Do not touch**:
+Pour chaque lot, le worker doit :
 
-  * Non-SDS stacking logic (historical pathway).
-  * `batch_size=0` vs `batch_size>1` behavior.
-  * GPU/CPU fallback logic and chunking.
-* Avoid:
+1. **Charger les images du lot**
+   - débayer,
+   - corriger les pixels chauds,
+   - corriger les gradients locaux si nécessaire,
+   - appliquer les mêmes filtres de qualité de base que dans le pipeline classique.
 
-  * Changing existing default visual behavior when SDS is **OFF**.
-* Performance:
+2. **Aligner les images du lot directement sur le WCS global**
+   - pas de WCS intermédiaire “local”,
+   - alignement dans la géométrie finale de la mosaïque.
 
-  * The new SDS path must remain streaming / memory-aware (no huge in-RAM copies unnecessarily).
+3. **Normalisation INTRA-lot**
+   - mettre les images du lot au même niveau photométrique,
+   - harmoniser le fond de ciel (match background),
+   - appliquer la même logique de robustification que pour les Master Tiles :
+     - winsor / kappa, rejet des valeurs extrêmes,
+     - rejet des images floues/ratées si la config l’indique.
 
-Non-goals (for this mission):
+   ➜ Objectif : **une tuile par lot déjà photométriquement propre.**
 
-* No change to:
+4. **Coadd du lot → MEGA-TILE**
+   - effectuer un coadd complet (GPU si disponible),
+   - produire :
+     - une image `H×W×3`,
+     - une carte `coverage H×W`.
 
-  * GUI layout / UX (beyond optional config binding).
-  * Solver / WCS solving behavior.
-  * Non-SDS photometric normalization algorithms (IBN, etc.).
+Le résultat est une **méga-tuile SDS** qui représente l’ensemble du lot comme une seule “super image”.
 
 ---
 
-## 6. Success criteria
+### 3️⃣ Après tous les lots → normalisation INTER-méga-tiles
 
-* When SDS is **ON**:
+Une fois tous les lots traités, on a :
 
-  * Logs clearly show:
+- `MT0, MT1, MT2, ..., MTn` (méga-tiles)  
+- chacune avec une coverage associée.
 
-    * Construction of mega-tiles from unit frames.
-    * A global Mosaic-First coadd on mega-tiles.
-    * Phase 5 operating in **“polish only”** mode, not launching a full `reproject_and_coadd` again.
-  * The final FITS + coverage:
+Chaque méga-tuile peut avoir un niveau de flux/fond légèrement différent.
 
-    * Have low-coverage skirts removed (NaN / 0 coverage).
-    * Show reduced noise and fewer visible seams on borders.
+Tu dois appliquer :
 
-* When SDS is **OFF**:
+1. **Choix d’une méga-tuile de référence**
+   - critère possible :
+     - meilleure coverage,
+     - plus centrale,
+     - ou première, si la config le précise.
+   - cette tuile ancre le flux global (son gain = 1.0).
 
-  * Logs remain identical (or very close) to the historical behavior.
-  * Final outputs remain visually consistent with previous versions.
+2. **Calcul des médianes sur les zones couvertes**
+   - pour chaque méga-tuile :
+     - ne considérer que les pixels où `coverage > 0`,
+     - calculer une médiane robuste (en ignorant NaN et valeurs aberrantes).
 
-* Code:
+3. **Renormalisation globale**
+   - pour chaque méga-tuile (sauf la référence) :
+     - calculer `gain_i = median_ref / median_i`,
+     - appliquer ce gain à toute la méga-tuile.
 
-  * Clear branching on SDS ON/OFF at the worker/orchestration level.
-  * New coverage-threshold parameter is documented and has a safe default.
+➜ Après cette étape, **toutes les méga-tiles doivent être sur la même échelle photométrique**.
 
-````
+---
 
+### 4️⃣ Empilement global des méga-tiles
+
+Une fois toutes les méga-tiles normalisées globalement :
+
+1. **Alignement des méga-tiles dans le WCS final**
+   - elles sont déjà dans le bon WCS,
+   - donc :
+     - pas de reprojection lourde,
+     - tout au plus recomposition/cropping léger si besoin.
+
+2. **Coadd global**
+   - empiler toutes les méga-tiles pour produire :
+     - `sds_mosaic_data_HWC`,
+     - `sds_coverage_HW`,
+     - éventuellement `alpha_map`.
+
+**Important :**  
+À ce stade, **il ne faut plus appliquer de “match background”**.  
+La normalisation globale inter-méga-tiles a déjà aligné les niveaux.
+
+---
+
+### 5️⃣ Finalisation SDS (polish final)
+
+Sur `sds_mosaic_data_HWC` + `sds_coverage_HW` (+ `alpha_map`), appliquer :
+
+1. **Coverage cut**
+   - masque des pixels avec coverage trop faible (coverage normalisée < seuil),
+   - convertir ces pixels en NaN + coverage=0.
+
+2. **Two-pass coverage renorm (optionnel)**
+   - homogénéiser les bordures si l’option est activée.
+
+3. **Quality crop**
+   - utiliser `lecropper` ou ZeQualityMT pour :
+     - éliminer les zones instables,
+     - rogner les bords dégradés.
+
+4. **Alt-Az cleanup**
+   - suppression des zones impactées par rotation de champ ou dérive alt-az.
+
+5. **Autocrop WCS**
+   - cropping final basé sur la coverage valide,
+   - mise à jour du WCS global pour refléter le crop.
+
+---
+
+### 6️⃣ Sauvegarde finale
+
+Le pipeline SDS doit ensuite :
+
+- écrire le FITS final :
+  - image principale,
+  - extension(s) de coverage,
+  - WCS final ajusté (cropped),
+- générer PNG/JPG si demandé,
+- enregistrer :
+  - des métriques de qualité,
+  - des logs sur :
+    - nombre de lots,
+    - temps par lot,
+    - temps total SDS,
+    - index de la méga-tuile de référence et gains appliqués.
+
+---
+
+## Résumé SDS ultra-court
+
+> `SDS = lots → méga-tiles → renorm globale → stack final → polish → save`
+
+Tu dois adapter le code SDS existant pour qu’il respecte ce flux,  
+**sans altérer le pipeline non-SDS**.
