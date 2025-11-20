@@ -1,261 +1,175 @@
-# FOLLOW-UP INSTRUCTIONS — SDS / ZeSupaDupStack Batch Policy Fix
-
-This document gives you a **step-by-step plan** to implement the SDS fixes described in `agent.md`.
-
-Please follow the steps in order and keep changes minimal outside the SDS code paths.
-
 
 ---
 
-## 1. Add SDS batch size config keys
+# 🔁 `followup.md` — Step-by-Step Instructions for Codex
 
-**File:** `zemosaic_config.py`
+```markdown
+# FOLLOW-UP — Step-by-Step Instructions
+### SDS Flow Fix (Option A)
 
-1. Locate `DEFAULT_CONFIG` (the main dict with config defaults).
-2. Add two new entries with safe defaults:
-
-   - `sds_min_batch_size`: `5`
-   - `sds_target_batch_size`: `10`
-
-3. If there is any config load/merge logic elsewhere, ensure that:
-   - If a user config file predates these keys, the defaults still apply.
-   - Values are coerced to integers and at least 1 when used downstream.
-
+This follow-up gives you exact steps to implement the mission described in `agent.md`.
 
 ---
 
-## 2. Update SDS batch building in Qt Filter GUI
+# 1. Open file:
+`zemosaic_worker.py`
 
-**File:** `zemosaic_filter_gui_qt.py`
+Locate the function:
 
-### 2.1. Locate current SDS helpers
+````
 
-1. Find the SDS preview / grouping code, e.g.:
+run_hierarchical_mosaic(...)
 
-   - `_build_sds_batches_for_indices(...)`
-   - the part of `_compute_auto_groups` or similar that calls it when SDS is enabled.
-   - the code that serializes SDS groups into `overrides["preplan_master_groups"]`.
+````
 
-2. Confirm how the current SDS coverage grouping is implemented (grid, WCS descriptor, coverage_threshold).
+Inside, find the block:
 
-### 2.2. Implement coverage + min + target batch policy
+```python
+if global_wcs_plan and global_wcs_plan["enabled"]:
+    mosaic_result = (None, None, None)
 
-1. Introduce a helper in the Qt filter module, something like:
+    if sds_mode_flag:
+        mosaic_result = assemble_global_mosaic_sds(...)
+    if mosaic_result[0] is None:
+        mosaic_result = assemble_global_mosaic_first(...)
 
-   ```python
-   def _build_sds_batches_with_policy(
-       entries: list[dict],
-       descriptor: dict,
-       coverage_threshold: float,
-       min_batch_size: int,
-       target_batch_size: int,
-       logger_fn: Optional[Callable[[str], None]] = None,
-   ) -> list[list[dict]]:
-       ...
-This helper must:
-
-Reuse the existing coverage grid logic used by SDS (no new math).
-
-Apply the algorithm described in section 3.2 of agent.md:
-
-Add frames one by one, updating coverage.
-
-Close batch when:
-
-len(batch) >= min_batch_size and coverage >= threshold, OR
-
-len(batch) >= target_batch_size (forced close).
-
-Merge final leftover batch with the previous one if too small, etc.
-
-Ensure you read sds_min_batch_size / sds_target_batch_size from the config/overrides in the same way sds_coverage_threshold is read:
-
-Use safe defaults (5 / 10) if missing or invalid.
-
-Use max(1, int(value)) to avoid zeros or negatives.
-
-Replace the existing SDS preview function _build_sds_batches_for_indices(...) to call this new helper:
-
-You can:
-
-Either refactor _build_sds_batches_for_indices to become a small wrapper that calls _build_sds_batches_with_policy.
-
-Or integrate the policy directly into the existing function if it’s easier.
-
-Make sure the returned structure (a list of groups/indices) remains fully compatible with:
-
-The tree view that displays SDS groups in the Filter GUI.
-
-The serialization step that writes these groups into overrides["preplan_master_groups"].
-
-2.3. Logging in Filter GUI
-Where SDS preview batches are computed, log at least:
-
-The coverage threshold.
-
-The min and target batch sizes.
-
-The number of SDS batches and their sizes.
-
-Example (textual, later localized):
-
-"SDS preview: thr=0.92, min=5, target=10 → 7 batches [10, 9, 8, ...]"
-
-If the Filter GUI uses a local logger or text widget, route this message there.
-
-3. Update SDS batch building in worker
-File: zemosaic_worker.py
-
-3.1. Locate SDS runtime function
-Find assemble_global_mosaic_sds(...).
-
-Identify where SDS:
-
-Builds its list of Seestar entries (entry_infos or similar).
-
-Builds SDS batches (coverage grid logic).
-
-Logs sds_error_no_valid_batches and falls back to Mosaic-First.
-
-3.2. Create a worker-side batch policy helper
-Introduce a helper function near the SDS code, e.g.:
-
-python
-Copier le code
-def _build_sds_batches_runtime(
-    entry_infos: list[dict],
-    global_plan: dict,
-    coverage_threshold: float,
-    min_batch_size: int,
-    target_batch_size: int,
-    logger: Optional[logging.Logger],
-    pcb_fn: Optional[Callable[..., None]],
-) -> list[list[dict]]:
+    final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = mosaic_result
     ...
-Implement inside this helper the same algorithm as the Qt side:
+````
 
-Same definition of coverage grid and footprint.
+---
 
-Same closure rules:
+# 2. MODIFY THE FLOW ACCORDING TO OPTION A
 
-len(batch) >= min_batch_size and coverage >= threshold → close.
+Replace the logic above with:
 
-len(batch) >= target_batch_size → force close.
+## Case A — SDS is OFF
 
-Same merging of small final leftover batch.
+Insert:
 
-Ensure consistency:
+```python
+if not sds_mode_flag:
+    # SDS is OFF → force master tiles mode
+    final_mosaic_data_HWC = None
+    final_mosaic_coverage_HW = None
+    final_alpha_map = None
+```
 
-Batches are constructed over the same set/order of entry_infos as before.
+And **skip**:
 
-If entry_infos is empty or invalid, return an empty list.
+* `assemble_global_mosaic_sds`
+* `assemble_global_mosaic_first`
 
-3.3. Wire the helper into assemble_global_mosaic_sds
-At the beginning of assemble_global_mosaic_sds, read:
+## Case B — SDS is ON
 
-sds_coverage_threshold
+Implement:
 
-sds_min_batch_size
+```python
+else:
+    # SDS is ON
+    mosaic_result = assemble_global_mosaic_sds(...)
 
-sds_target_batch_size
+    if mosaic_result[0] is None:
+        mosaic_result = assemble_global_mosaic_first(...)
 
-from the config (using the same configuration access pattern as other options).
+    final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = mosaic_result
+```
 
-Before building SDS batches, log the policy via:
+---
 
-The worker logger.
+# 3. LET PHASE 3 HANDLE THE REST
 
-And/or pcb_fn (if available) with a dedicated log key (e.g. "sds_info_batch_policy").
+After the SDS block you will find:
 
-Replace the existing batch building logic in assemble_global_mosaic_sds with _build_sds_batches_runtime(...).
+```python
+if final_mosaic_data_HWC is None:
+    # → classic master tile block (Phase 3)
+```
 
-After batches are built:
+Do **not modify this block**.
 
-If not batches:
+This ensures:
 
-Log sds_error_no_valid_batches with a clear reason.
+* SDS OFF → Phase 3 runs ALWAYS
+* SDS ON → Phase 3 only runs if SDS AND Mosaic-First failed
 
-Fallback to Mosaic-First as done today.
+---
 
-Else:
+# 4. Ensure NO OTHER BEHAVIOR CHANGES
 
-Log how many batches and their sizes (sds_debug_batch_coverage_summary style payload).
+Do **not** touch:
 
-Proceed to run _assemble_global_mosaic_first_impl on each batch and stack the results exactly as before.
+* master tile construction code
+* SDS batch creation
+* normalization pipelines
+* GPU/CPU branches
+* lecropper / alt-az cleanup
+* Phase 4.5 / two-pass
+* Tk GUI
+* Qt GUI (outside SDS mode flag logic)
 
-3.4. Respect preplan groups when possible
-If preplan_master_groups is passed via overrides and SDS is active:
+---
 
-Check whether union of all preplan_master_groups indices matches the set of indices for entry_infos (or at least a significant subset).
+# 5. Add minimal logging (optional but recommended)
 
-If yes:
+When SDS is OFF, add:
 
-Optionally use preplan groups directly as SDS batches:
+```python
+self._log_and_callback(pcb_fn, "info", "sds_off_classic_mastertile")
+```
 
-i.e. convert group indices → entry objects and skip coverage regrouping.
+When SDS is ON:
 
-If no:
+```python
+self._log_and_callback(pcb_fn, "info", "sds_on_megatile_mode")
+```
 
-Keep using coverage-based grouping but log that preplan SDS groups could not be reused.
+If SDS fails:
 
-Important: Do not break existing non-SDS uses of preplan_master_groups.
+```python
+self._log_and_callback(pcb_fn, "warning", "sds_failed_fallback_mosaic_first")
+```
 
-4. Localization updates (only if used)
-Files: locales/en.json, locales/fr.json
+Do NOT create new localization keys unless necessary.
 
-If you introduced new SDS messages that are user-visible (GUI or log pane), create matching keys in:
+---
 
-en.json
+# 6. Test Scenarios
 
-fr.json
+### Test 1 — SDS OFF, Seestar data
 
-Use the existing naming pattern, e.g.:
+* Must ALWAYS go to Phase 3 master tiles.
+* Must NOT call SDS nor Mosaic-First lights.
 
-"sds_log_batch_policy"
+### Test 2 — SDS ON, healthy WCS
 
-"sds_log_batch_summary"
+* SDS → mega-tiles → super-stack
+* Phase 3 bypassed
 
-Ensure:
+### Test 3 — SDS ON, SDS fail
 
-The Qt GUI and/or worker use these keys through the localization layer.
+* SDS fails → Mosaic-First
+* If Mosaic-First fails too → Phase 3
 
-No raw English or French strings remain hard-coded for new messages that are visible to users.
+### Test 4 — Non-Seestar data
 
-5. Sanity checks & non-regression
-After implementation, conceptually verify:
+* Must remain unchanged
 
-SDS ON, Seestar data, many frames:
+---
 
-Worker logs show:
+This completes the modification.
 
-sds_info_batch_policy with coverage, min, target values.
+```
 
-sds_debug_batch_coverage_summary or equivalent summarizing several batches with sizes ≥ sds_min_batch_size.
+---
 
-Filter GUI preview shows a similar batch structure.
+# 🎉 Résultat
 
-The run finishes using SDS (no sds_error_no_valid_batches).
+Avec ces deux fichiers :
 
-SDS OFF or non-Seestar series:
+- SDS OFF = **tu retrouves EXACTEMENT ton pipeline original**  
+  → Master tiles → mosaïque → renorm → save
 
-No SDS batch policy logs.
+- SDS ON =  
+  → reproject lights par batches SDS → stack de mega tiles → P5/P6
 
-Behaviour identical to the previous Mosaic-First / classic pipeline.
-
-Edge case (few frames, e.g. 1–3):
-
-SDS still produces 1 small batch.
-
-No crash; fallback only if coverage grid or WCS is invalid.
-
-No change in:
-
-Phase names and ETA logic in zemosaic_gui_qt.py.
-
-Two-pass coverage renormalization.
-
-Phase 4.5 / inter-master merging.
-
-Classic Tk GUI.
-
-If any of these checks fail, refine the SDS helper functions but keep changes strictly local to SDS logic.

@@ -8410,7 +8410,9 @@ def create_master_tile(
             B = np.nan_to_num(np.asarray(B, dtype=np.float32), nan=0.0)
             lum2d = np.nan_to_num(lum2d, nan=0.0)
 
-            from .lecropper import detect_autocrop_rgb
+            detect_autocrop_rgb = getattr(lecropper, "detect_autocrop_rgb", None)
+            if not callable(detect_autocrop_rgb):
+                raise ImportError("lecropper.detect_autocrop_rgb unavailable")
 
             y0, x0, y1, x1 = detect_autocrop_rgb(
                 lum2d,
@@ -12521,8 +12523,14 @@ def run_hierarchical_mosaic(
             _disable_invalid_plan("runtime WCS descriptor incomplete", emit_warn=True)
 
     if global_wcs_plan.get("enabled"):
-        mosaic_result = (None, None, None)
-        if sds_mode_flag:
+        if not sds_mode_flag:
+            # SDS is OFF: skip mega-tile flows and force the classic master-tile pipeline.
+            final_mosaic_data_HWC = None
+            final_mosaic_coverage_HW = None
+            final_alpha_map = None
+            pcb("sds_off_classic_mastertile", prog=None, lvl="INFO")
+        else:
+            pcb("sds_on_megatile_mode", prog=None, lvl="INFO")
             mosaic_result = assemble_global_mosaic_sds(
                 seestar_stack_groups,
                 global_plan=global_wcs_plan,
@@ -12543,85 +12551,86 @@ def run_hierarchical_mosaic(
                 target_batch_size=sds_target_batch_size_config,
                 preplan_path_groups=preplan_groups_override_paths,
                 postprocess_context=sds_post_context,
-            )
-        if mosaic_result[0] is None:
-            mosaic_result = assemble_global_mosaic_first(
-                seestar_stack_groups,
-                global_plan=global_wcs_plan,
-                progress_callback=progress_callback,
-                match_background=match_background_flag,
-                base_progress_phase=base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING,
-                progress_weight_phase=(
-                    PROGRESS_WEIGHT_PHASE3_MASTER_TILES
-                    + PROGRESS_WEIGHT_PHASE4_GRID_CALC
-                    + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
-                    + PROGRESS_WEIGHT_PHASE5_ASSEMBLY
-                ),
-                start_time_total_run=start_time_total_run,
-                cache_root=output_folder,
-            )
-        final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = mosaic_result
-        autocrop_meta: dict[str, int] | None = None
-        if final_mosaic_data_HWC is not None and global_wcs_autocrop_enabled_config:
-            final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map, autocrop_meta = (
-                _auto_crop_global_mosaic_if_requested(
+            ) or (None, None, None)
+            if mosaic_result[0] is None:
+                pcb("sds_failed_fallback_mosaic_first", prog=None, lvl="WARN")
+                mosaic_result = assemble_global_mosaic_first(
+                    seestar_stack_groups,
+                    global_plan=global_wcs_plan,
+                    progress_callback=progress_callback,
+                    match_background=match_background_flag,
+                    base_progress_phase=base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING,
+                    progress_weight_phase=(
+                        PROGRESS_WEIGHT_PHASE3_MASTER_TILES
+                        + PROGRESS_WEIGHT_PHASE4_GRID_CALC
+                        + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
+                        + PROGRESS_WEIGHT_PHASE5_ASSEMBLY
+                    ),
+                    start_time_total_run=start_time_total_run,
+                    cache_root=output_folder,
+                ) or (None, None, None)
+            final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = mosaic_result
+            autocrop_meta: dict[str, int] | None = None
+            if final_mosaic_data_HWC is not None and global_wcs_autocrop_enabled_config:
+                final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map, autocrop_meta = (
+                    _auto_crop_global_mosaic_if_requested(
+                        final_mosaic_data_HWC,
+                        final_mosaic_coverage_HW,
+                        final_alpha_map,
+                        enable_autocrop=True,
+                        margin_px=global_wcs_autocrop_margin_px_config,
+                        pcb=pcb,
+                    )
+                )
+                if autocrop_meta:
+                    _apply_autocrop_to_global_plan(global_wcs_plan, autocrop_meta)
+            if final_mosaic_data_HWC is not None:
+                final_output_wcs = global_wcs_plan.get("wcs")
+                final_output_shape_hw = (final_mosaic_data_HWC.shape[0], final_mosaic_data_HWC.shape[1])
+                sds_tile_pairs = sds_post_context.get("two_pass_tile_pairs")
+                final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = _apply_phase5_post_stack_pipeline(
                     final_mosaic_data_HWC,
                     final_mosaic_coverage_HW,
                     final_alpha_map,
-                    enable_autocrop=True,
-                    margin_px=global_wcs_autocrop_margin_px_config,
-                    pcb=pcb,
+                    enable_lecropper_pipeline=bool(
+                        final_quality_pipeline_cfg.get("quality_crop_enabled")
+                        or final_quality_pipeline_cfg.get("altaz_cleanup_enabled")
+                    ),
+                    pipeline_cfg=final_quality_pipeline_cfg,
+                    enable_master_tile_crop=bool(apply_master_tile_crop_config and not quality_crop_enabled_config),
+                    master_tile_crop_percent=float(master_tile_crop_percent_config),
+                    two_pass_enabled=bool(two_pass_enabled),
+                    two_pass_sigma_px=int(two_pass_sigma_px),
+                    two_pass_gain_clip=gain_clip_tuple,
+                    final_output_wcs=final_output_wcs,
+                    final_output_shape_hw=final_output_shape_hw,
+                    use_gpu_two_pass=use_gpu_phase5_flag,
+                    logger=logger,
+                    collected_tiles=sds_tile_pairs,
+                    fallback_two_pass_loader=None,
                 )
-            )
-            if autocrop_meta:
-                _apply_autocrop_to_global_plan(global_wcs_plan, autocrop_meta)
-        if final_mosaic_data_HWC is not None:
-            final_output_wcs = global_wcs_plan.get("wcs")
-            final_output_shape_hw = (final_mosaic_data_HWC.shape[0], final_mosaic_data_HWC.shape[1])
-            sds_tile_pairs = sds_post_context.get("two_pass_tile_pairs")
-            final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = _apply_phase5_post_stack_pipeline(
-                final_mosaic_data_HWC,
-                final_mosaic_coverage_HW,
-                final_alpha_map,
-                enable_lecropper_pipeline=bool(
-                    final_quality_pipeline_cfg.get("quality_crop_enabled")
-                    or final_quality_pipeline_cfg.get("altaz_cleanup_enabled")
-                ),
-                pipeline_cfg=final_quality_pipeline_cfg,
-                enable_master_tile_crop=bool(apply_master_tile_crop_config and not quality_crop_enabled_config),
-                master_tile_crop_percent=float(master_tile_crop_percent_config),
-                two_pass_enabled=bool(two_pass_enabled),
-                two_pass_sigma_px=int(two_pass_sigma_px),
-                two_pass_gain_clip=gain_clip_tuple,
-                final_output_wcs=final_output_wcs,
-                final_output_shape_hw=final_output_shape_hw,
-                use_gpu_two_pass=use_gpu_phase5_flag,
-                logger=logger,
-                collected_tiles=sds_tile_pairs,
-                fallback_two_pass_loader=None,
-            )
-            if isinstance(sds_tile_pairs, list):
-                sds_tile_pairs.clear()
-                sds_post_context.pop("two_pass_tile_pairs", None)
-            alpha_final = _derive_final_alpha_mask(
-                final_alpha_map,
-                final_mosaic_data_HWC,
-                final_mosaic_coverage_HW,
-                logger,
-            )
-            current_global_progress = min(
-                100.0,
-                base_progress_phase2
-                + PROGRESS_WEIGHT_PHASE2_CLUSTERING
-                + PROGRESS_WEIGHT_PHASE3_MASTER_TILES
-                + PROGRESS_WEIGHT_PHASE4_GRID_CALC
-                + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
-                + PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
-            )
-            seestar_stack_groups = []
-        else:
-            pcb("global_coadd_error_failed_fallback", prog=None, lvl="WARN")
-            global_wcs_plan["enabled"] = False
+                if isinstance(sds_tile_pairs, list):
+                    sds_tile_pairs.clear()
+                    sds_post_context.pop("two_pass_tile_pairs", None)
+                alpha_final = _derive_final_alpha_mask(
+                    final_alpha_map,
+                    final_mosaic_data_HWC,
+                    final_mosaic_coverage_HW,
+                    logger,
+                )
+                current_global_progress = min(
+                    100.0,
+                    base_progress_phase2
+                    + PROGRESS_WEIGHT_PHASE2_CLUSTERING
+                    + PROGRESS_WEIGHT_PHASE3_MASTER_TILES
+                    + PROGRESS_WEIGHT_PHASE4_GRID_CALC
+                    + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
+                    + PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
+                )
+                seestar_stack_groups = []
+            else:
+                pcb("global_coadd_error_failed_fallback", prog=None, lvl="WARN")
+                global_wcs_plan["enabled"] = False
 
     try:
         setattr(zconfig, "winsor_worker_limit", int(winsor_worker_limit))
