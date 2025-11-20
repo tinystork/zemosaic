@@ -5604,6 +5604,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 "cluster_panel_threshold": float(self.config.get("cluster_panel_threshold", 0.05)),
                 "cluster_target_groups": int(self.config.get("cluster_target_groups", 0)),
                 "cluster_orientation_split_deg": float(self.config.get("cluster_orientation_split_deg", 0.0)),
+                # Synchroniser l’état de la case "Enable SDS mode by default" vers le Filter Qt
+                "sds_mode": bool(self.config.get("sds_mode_default", False)),
             }
         except Exception:
             initial_overrides = None
@@ -5757,6 +5759,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
         ):
             if key in overrides:
                 self._update_widget_from_config(key, overrides[key])
+
+        # Synchroniser le choix SDS du Filter Qt avec la case "Enable SDS mode by default"
+        if "sds_mode" in overrides:
+            self._update_widget_from_config("sds_mode_default", overrides["sds_mode"])
+
         if "astap_max_instances" in overrides:
             self._update_widget_from_config("astap_max_instances", overrides["astap_max_instances"])
             self._apply_astap_concurrency_setting()

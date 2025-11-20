@@ -273,7 +273,7 @@ def _determine_backend(argv):
         elif config_backend:
             requested_backend = config_backend
 
-    backend = (requested_backend or "tk").strip().lower()
+    backend = (requested_backend or "qt").strip().lower()
     if backend not in {"tk", "qt"}:
         print(
             f"[run_zemosaic] Backend '{requested_backend}' is not supported. "
@@ -284,64 +284,6 @@ def _determine_backend(argv):
     explicit_choice = explicit_choice or env_specified or config_has_preference
 
     return backend, cleaned_args, explicit_choice
-
-
-def _interactive_backend_choice_if_needed(current_backend: str, *, explicit_choice: bool) -> str:
-    """
-    If the user did not explicitly choose a backend (no flags, no env var),
-    show a small Tk popup to propose switching to the Qt interface when
-    PySide6 is available.
-
-    This keeps the behaviour 100% backwards compatible for users who:
-    - already set ZEMOSAIC_GUI_BACKEND, or
-    - pass --qt-gui / --tk-gui on the command line.
-    """
-    # Do nothing if the backend was explicitly chosen
-    if explicit_choice:
-        return current_backend
-
-    # If PySide6 is not available, gently inform the user and stay on Tk
-    if not _is_pyside6_available():
-        try:
-            root = tk.Tk()
-            root.withdraw()
-            messagebox.showinfo(
-                "ZeMosaic - Qt interface unavailable",
-                (
-                    "The new Qt-based interface requires the optional 'PySide6' "
-                    "dependency, which is not installed in this environment.\n\n"
-                    "ZeMosaic will continue with the classic Tk interface for now.\n\n"
-                    "You can install PySide6 later with:\n\n"
-                    "    pip install PySide6\n"
-                ),
-            )
-            root.destroy()
-        except Exception as tk_err:
-            print(f"[run_zemosaic] Unable to display Tk info dialog: {tk_err}")
-        return "tk"
-
-    # PySide6 is available: ask the user if they want to try the Qt UI
-    try:
-        root = tk.Tk()
-        root.withdraw()
-        use_qt = messagebox.askyesno(
-            "ZeMosaic - Choose interface",
-            (
-                "A new Qt-based graphical interface is available.\n\n"
-                "Do you want to use it now?\n\n"
-                "  - Yes: Qt interface (PySide6)\n"
-                "  - No : classic Tk interface\n"
-            ),
-        )
-        root.destroy()
-    except Exception as tk_err:
-        print(f"[run_zemosaic] Unable to display Tk choice dialog: {tk_err}")
-        return current_backend
-
-    if use_qt:
-        _play_opening_gif_animation_once()
-
-    return "qt" if use_qt else "tk"
 
 
 _OPENING_GIF_CANDIDATES = (
@@ -594,10 +536,6 @@ def main(argv=None):
     if cleaned_args != argv:
         sys.argv = [sys.argv[0], *cleaned_args]
 
-    # Si l'utilisateur n'a rien forcé (ni flags, ni env),
-    # proposer un petit choix Tk/Qt via une popup Tkinter.
-    backend = _interactive_backend_choice_if_needed(backend, explicit_choice=explicit_choice)
-
     if backend == "qt":
         try:
             from zemosaic.zemosaic_gui_qt import run_qt_main
@@ -606,6 +544,7 @@ def main(argv=None):
             backend = "tk"
         else:
             print("[run_zemosaic] Launching ZeMosaic with the Qt backend.")
+            _play_opening_gif_animation_once()
             return run_qt_main()
 
     # Vérification de sys.modules au début de main

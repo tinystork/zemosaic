@@ -1,174 +1,108 @@
-# Follow-up — Checklist pour aligner le code SDS sur le workflow ZeSupaDupStack
+# Follow-up — Vérifications après patch de synchronisation SDS (Qt main ↔ Qt filter)
 
-Cette checklist te guide pas à pas.  
-Tu dois rester concentré sur **le pipeline SDS** et **ne pas modifier le comportement non-SDS**.
-
----
-
-## Étape 1 — Identifier la bifurcation SDS ON / OFF
-
-1. [x] Dans `zemosaic_worker.py`, localise la fonction principale (souvent `run_hierarchical_mosaic(...)`) qui :
-   - [x] construit le plan WCS global,
-   - [x] décide si SDS est activé,
-   - [x] appelle actuellement `assemble_global_mosaic_sds(...)` ou un équivalent.
-
-2. [x] Vérifie que :
-   - [x] quand SDS est **OFF** :
-     - [x] le pipeline classique (Master Tiles + Phase 5) reste inchangé,
-   - [x] quand SDS est **ON** :
-     - [x] **on n’utilise pas** le Mosaic-First global “toutes brutes d’un coup” comme pipeline de stacking,
-     - [x] mais un pipeline **par lots** conforme au design SDS.
-
-Si actuellement SDS réutilise `assemble_global_mosaic_first_impl(...)` pour stacker toutes les brutes, tu dois **remplacer cette logique par le pipeline par lots**, tout en conservant éventuellement Mosaic-First uniquement comme aide à la construction du WCS global si nécessaire.
+Merci pour les modifications. Voici la checklist à suivre pour valider que tout est correct.
 
 ---
 
-## Étape 2 — Utiliser les LOTS SDS
+## 1. Revue de diff
 
-1. [x] Vérifie comment les lots SDS sont transmis au worker :
-   - [x] via `preplan_path_groups`,
-   - [x] ou via un plan interne SDS.
+Vérifier dans le diff :
 
-2. [x] Assure-toi que, en mode SDS :
+1. **zemosaic_filter_gui_qt.py**
+   - [x] `DEFAULT_FILTER_CONFIG.setdefault("sds_mode_default", True)` est bien devenu :
 
-   - [x] **les lots SDS remplacent la logique “Master Tiles”** :
-     - [x] pas de création de Master Tiles,
-     - [x] pas de Phase 3 classique dans le chemin SDS.
+     ```python
+     DEFAULT_FILTER_CONFIG.setdefault("sds_mode_default", False)
+     ```
 
-3. [x] Si certains morceaux de code Master Tiles sont réutilisables (normalisation, stacking), tu peux les appeler, mais **sans relancer la Phase 3 globale**.
+   - [x] Le calcul de `self._sds_mode_initial` dans `FilterQtDialog.__init__` :
+     - prend d’abord `initial_overrides["sds_mode"]` si présent ;
+     - sinon, lit `config_overrides["sds_mode_default"]` ;
+     - sinon, utilise `DEFAULT_FILTER_CONFIG["sds_mode_default"]` (False).
+   - [x] Aucun autre changement fonctionnel non demandé sur le SDS.
 
----
-
-## Étape 3 — Pour chaque lot SDS → produire une méga-tuile
-
-Pour chaque lot SDS, implémente :
-
-1. [x] Lecture / préparation des brutes :
-   - [x] réutiliser les fonctions déjà existantes pour :
-     - [x] débayer,
-     - [x] corriger les pixels chauds,
-     - [x] appliquer les mêmes pré-traitements que pour les Master Tiles.
-
-2. [x] Alignement des images du lot :
-   - [x] les aligner directement dans le WCS global de la mosaïque.
-
-3. [x] Normalisation intra-lot :
-   - [x] utiliser la même logique de normalisation que pour les Master Tiles :
-     - [x] linear fit / noise variance,
-     - [x] match background local,
-     - [x] rejet sigma / winsor si activé,
-     - [x] filtre d’images floues si déjà implémenté.
-
-4. [x] Coadd du lot :
-   - [x] produire une **méga-tuile** :
-     - [x] image `H×W×3`,
-     - [x] coverage `H×W`.
-
-5. [x] Stocker les méga-tiles dans une structure en mémoire (liste) plutôt que dans des répertoires temporaires vides.
-
-Ajoute des logs raisonnables (INFO / INFO_DETAIL) :  
-- [x] index du lot,  
-- [x] nombre d’images,  
-- [x] temps de traitement du lot.
+2. **zemosaic_gui_qt.py**
+   - [x] Dans `_launch_filter_dialog()` :
+     - `initial_overrides` contient désormais une clé `"sds_mode"` initialisée depuis `self.config["sds_mode_default"]`.
+   - [x] Dans `_apply_filter_overrides_to_config()` :
+     - un bloc gère `if "sds_mode" in overrides: self._update_widget_from_config("sds_mode_default", overrides["sds_mode"])`
+     - [x] La logique existante autour (`cluster_panel_threshold`, `astap_max_instances`, etc.) est intacte.
 
 ---
 
-## Étape 4 — Normalisation inter-méga-tiles
+## 2. Tests fonctionnels
 
-1. [x] Implémente une fonction ou logique interne pour :
+### 2.1. Test de base sans config existante
 
-   - [x] choisir une **méga-tuile de référence** :
-     - [x] idéalement celle avec le meilleur “poids de coverage”,
-     - [x] sinon une stratégie simple (méga-tuile centrale, ou première).
+1. Supprimer ou renommer temporairement le fichier de config utilisateur (`zemosaic_config.json`) pour simuler un premier lancement.
+2. Lancer la GUI Qt principale.
+3. Vérifier :
+   - La case « **Enable SDS mode by default** » est **décochée**.
+4. Ouvrir le filter Qt depuis le bouton dédié.
+5. Vérifier :
+   - La case « **Enable ZeSupaDupStack (SDS)** » est **décochée**.
+   - Fermer sans changer cette case pour ce test.
 
-2. [x] Pour chaque méga-tuile :
-
-   - [x] utiliser sa coverage pour ne prendre en compte que les pixels avec `coverage > 0`,
-   - [x] calculer une médiane robuste (en ignorant NaN).
-
-3. [x] Calculer un gain par méga-tuile :
-
-   - [x] `gain_ref = 1.0` pour la tuile de référence,
-   - [x] pour les autres : `gain_i = median_ref / median_i`,
-   - [x] appliquer ce gain à chaque méga-tuile.
-
-Assure-toi que :
-- [x] aucun gain n’est NaN ou infini (fallback sur 1.0 si problème),
-- [x] les méga-tiles restent dans un type float32 cohérent.
-
-Ajoute un log :
-- [x] index de la méga-tuile de référence,
-- [x] médiane de référence,
-- [x] quelques gains appliqués (au moins min / max / quelques exemples).
+Résultat attendu : **aucune des cases n’est cochée** par défaut.
 
 ---
 
-## Étape 5 — Stack global des méga-tiles
+### 2.2. Propagation Main → Filter
 
-1. [x] Empile toutes les méga-tiles normalisées :
+1. Dans la GUI principale Qt :
+   - Cocher la case « Enable SDS mode by default ».
+   - S’assurer que la config est mise à jour (optionnel : sauvegarde ou autre action déjà existante).
+2. Ouvrir le filter Qt.
+3. Vérifier :
+   - La case « Enable ZeSupaDupStack (SDS) » est **cochée** dès l’ouverture.
 
-   - [x] elles sont déjà dans le bon WCS,
-   - [x] tu peux utiliser un stacker commun (moyenne / winsor / kappa-sigma) pour produire :
-     - [x] `sds_mosaic_data_HWC`,
-     - [x] `sds_coverage_HW`.
+4. Fermer le filter sans changer la case SDS.
 
-2. [x] **Ne réapplique pas de match background à ce stade.**  
-   - [x] la normalisation inter-méga-tiles a déjà aligné les niveaux globaux.
-
-3. [x] Prépare une éventuelle `alpha_map` si nécessaire.
-
----
-
-## Étape 6 — Finalisation SDS
-
-Réutilise au maximum les briques existantes déjà utilisées pour la Phase 5 classique, mais applique-les sur les sorties SDS :
-
-1. [x] Coverage cut :
-   - [x] à partir de `sds_coverage_HW`,
-   - [x] remplace les pixels de coverage trop faible par NaN dans `sds_mosaic_data_HWC` + coverage=0.
-
-2. [x] Two-pass coverage renorm (si activé) :
-   - [x] applique la même logique que pour le pipeline classique.
-
-3. [x] Quality crop :
-   - [x] utilise `lecropper` / ZeQualityMT comme dans la Phase 5 classique,
-   - [x] mets à jour la coverage et l’alpha map en conséquence.
-
-4. [x] Alt-Az cleanup :
-   - [x] pareil que dans le pipeline classique.
-
-5. [x] Autocrop WCS :
-   - [x] applique le cropping basé sur la coverage,
-   - [x] ajuste le WCS global pour refléter ce crop.
+Résultat attendu : **le filter reflète correctement le choix du main**.
 
 ---
 
-## Étape 7 — Sauvegarde finale et fallbacks
+### 2.3. Propagation Filter → Main
 
-1. [x] Quand SDS réussit :
+1. Toujours dans la même session, rouvrir le filter Qt.
+   - Vérifier que la case SDS est toujours dans l’état attendu.
+2. Cette fois, **changer l’état de la case SDS dans le filter** (par exemple, la décocher si elle était cochée).
+3. Valider / OK pour fermer le filter (chemin où les overrides sont renvoyés).
+4. Revenir à la GUI principale Qt.
 
-   - [x] `final_mosaic_data_HWC`, `final_mosaic_coverage_HW`, `final_alpha_map` doivent provenir du pipeline SDS,
-   - [x] on ne relance pas de Phase 5 classique sur les Master Tiles.
+Vérifier :
 
-2. [x] En cas d’échec SDS (erreur, NaN partout, etc.) :
+- La case « **Enable SDS mode by default** » dans le *Main* est synchronisée :
+  - Si la case a été décochée dans le filter → elle doit être décochée dans le main.
+  - Si la case a été cochée dans le filter → elle doit être cochée dans le main.
 
-   - [x] loguer clairement le problème,
-   - [x] utiliser les fallbacks existants (Mosaic-First, puis Master Tiles),
-   - [x] **sans modifier la logique de fallback actuelle**.
+Résultat attendu : **le Main se cale sur le choix du Filter** via `_apply_filter_overrides_to_config`.
 
 ---
 
-## Étape 8 — Vérifications finales
+### 2.4. Persistance de la préférence SDS
 
-Avant de conclure ta modification :
+1. Après avoir modifié l’état SDS via le Filter, déclencher une action qui sauvegarde la configuration (par ex. lancement de traitement, ou toute séquence qui déclenche `save_config` dans `zemosaic_gui_qt.py`).
+2. Quitter la GUI Qt principale.
+3. Relancer ZeMosaic Qt.
+4. Vérifier :
+   - La case « Enable SDS mode by default » est dans le même état qu’au moment de la dernière fermeture.
+5. Ouvrir le filter Qt :
+   - Vérifier que la case « Enable ZeSupaDupStack (SDS) » est également dans le même état.
 
-- [x] vérifie que :
-  - [x] lorsque SDS est OFF, le code ne prend aucun des nouveaux chemins SDS,
-  - [x] les sorties d’un run non-SDS restent identiques ou équivalentes,
-  - [x] les chemins `batch_size=0` et `batch_size>1` ne sont pas impactés.
+Résultat attendu : **la préférence SDS est persistante** et cohérente entre les deux interfaces.
 
-- [x] ne modifie pas :
-  - [x] la structure des phases non-SDS,
-  - [x] les signatures des fonctions publiques existantes.
+---
 
-Tu peux commenter brièvement les sections clés du nouveau pipeline SDS pour documenter le design “lot → méga-tuile → renorm → stack final → polish → save”.
+> ⚠️ Tests manuels 2.1–2.4 non exécutés dans cet environnement : l’interface Qt nécessite un contexte graphique interactif.
+
+
+## 3. Non-régressions
+
+- Vérifier qu’aucun autre comportement SDS n’a été cassé :
+  - Si SDS est activé, le pipeline SDS se comporte comme avant (méga-tiles, global plan, etc.).
+  - Si SDS est désactivé, le pipeline classique continue de fonctionner normalement.
+- Vérifier qu’aucun autre paramètre de filter (clustering, coverage-first, etc.) n’a vu son comportement changer.
+
+Si tous ces tests passent, la synchronisation SDS Qt main ↔ Qt filter est considérée comme **validée**.
+````

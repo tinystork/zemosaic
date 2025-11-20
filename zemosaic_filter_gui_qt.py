@@ -497,7 +497,7 @@ if isinstance(_DEFAULT_GUI_CONFIG, dict):
 DEFAULT_FILTER_CONFIG: dict[str, Any] = dict(_DEFAULT_GUI_CONFIG_MAP)
 DEFAULT_FILTER_CONFIG.setdefault("auto_detect_seestar", True)
 DEFAULT_FILTER_CONFIG.setdefault("force_seestar_mode", False)
-DEFAULT_FILTER_CONFIG.setdefault("sds_mode_default", True)
+DEFAULT_FILTER_CONFIG.setdefault("sds_mode_default", False)
 DEFAULT_FILTER_CONFIG.setdefault("sds_min_batch_size", 5)
 DEFAULT_FILTER_CONFIG.setdefault("sds_target_batch_size", 10)
 DEFAULT_FILTER_CONFIG.setdefault("global_coadd_method", "kappa_sigma")
@@ -1725,10 +1725,10 @@ class FilterQtDialog(QDialog):
             if isinstance(initial_overrides, dict)
             else None,
             self._coerce_bool(
-                (config_overrides or {}).get("sds_mode")
+                (config_overrides or {}).get("sds_mode_default")
                 if isinstance(config_overrides, dict)
                 else None,
-                True,
+                bool(DEFAULT_FILTER_CONFIG.get("sds_mode_default", False)),
             ),
         )
         self._cache_csv_path: str | None = None

@@ -1,222 +1,254 @@
-# Mission — Mettre le mode SDS en conformité avec le workflow “ZeSupaDupStack”
+# Mission — Synchroniser le mode SDS entre la GUI principale Qt et la GUI de filtrage Qt
 
-## Rôle de cette mission
+## Contexte
 
-Tu es Codex High.  
-Ta mission est de faire en sorte que le **mode SDS** de ZeMosaic suive exactement le workflow conceptuel décrit ci-dessous, **sans modifier le comportement du mode normal (SDS OFF)**.
+Dans ZeMosaic, il existe aujourd’hui deux cases à cocher liées au mode SDS (ZeSupaDupStack) :
 
-Tu dois considérer ce document comme la **spécification fonctionnelle** du mode SDS.
+1. **Dans la GUI principale Qt** (`zemosaic_gui_qt.py`, onglet *Main*) :
+   - Case : **"Enable SDS mode by default"**
+   - Cette case est liée à la clé de config `sds_mode_default` (booléen).
 
----
+2. **Dans la GUI de filtrage Qt** (`zemosaic_filter_gui_qt.py`) :
+   - Case : **"Enable ZeSupaDupStack (SDS)"**
+   - Cette case est liée à `sds_mode` (overrides / metadata) et à la config `sds_mode_default` pour certains chemins.
 
-## Champ d’action (IMPORTANT)
+Actuellement :
+- La case du *filter* est **activée par défaut** côté `DEFAULT_FILTER_CONFIG` (`sds_mode_default=True`).
+- La case de la GUI principale est **désactivée par défaut** (`sds_mode_default=False`).
+- La synchronisation n’est que partielle : l’état n’est pas systématiquement partagé entre les deux interfaces.
 
-### Fichiers que tu peux modifier (code) :
+**Objectif ergonomique** :
 
-- `zemosaic_worker.py`  
-  - uniquement les parties qui concernent :
-    - la détection du mode SDS,
-    - le pipeline SDS (création de lots, méga-tuiles, renormalisation inter-méga-tiles, stack final),
-    - la finalisation SDS.
+> Avoir une **préférence SDS unique** (`sds_mode_default`) :
+> - La case *Main* « Enable SDS mode by default » reflète / contrôle `sds_mode_default`.
+> - La case *Filter* « Enable ZeSupaDupStack (SDS) » :
+>   - s’initialise selon `sds_mode_default` (ou un override explicite `sds_mode`) ;
+>   - renvoie son état vers la GUI principale, qui met à jour `sds_mode_default` + sa propre case.
 
-### Fichiers que tu peux éventuellement toucher **légèrement** :
-
-- `zemosaic_config.py`  
-  - **uniquement** pour ajouter/ajuster des paramètres spécifiques SDS si nécessaire (sans changer les clés existantes ni les valeurs par défaut globales hors SDS).
-- `en.json`, `fr.json`  
-  - pour ajouter des **nouvelles chaînes de log SDS** si tu en as réellement besoin,
-  - sans supprimer ni renommer des clés existantes.
-
-### Fichiers que tu ne dois PAS modifier :
-
-- `zemosaic_align_stack.py`
-- `lecropper.py`
-- `zemosaic_gui.py`
-- `zemosaic_gui_qt.py`
-- `zemosaic_filter_gui.py`
-- `zemosaic_filter_gui_qt.py`
-- tout autre fichier non listé ci-dessus.
-
-### Invariant fondamental
-
-> Le pipeline **non-SDS (SDS OFF)** doit conserver **strictement le même comportement** qu’avant tes modifications.
-
-- Même séquence de phases (Master Tiles, Phase 4/4.5, Phase 5).
-- Même logique de normalisation/empilement pour les Master Tiles.
-- Même comportement pour `batch_size=0` et `batch_size>1`.
-- Même usage GPU/CPU, memmap, etc.
-
-Tu peux facturer un peu de code générique **si cela ne change pas la sortie du mode normal**, mais **tu ne dois jamais modifier la structure générale des phases non-SDS**.
+En résumé, **les deux cases doivent se suivre** :
+- Cocher / décocher dans le *Main* → le *Filter* ouvre dans le même état.
+- Cocher / décocher dans le *Filter* → le *Main* met à jour sa case et la config.
 
 ---
 
-## Workflow SDS (ZeSupaDupStack) — SPÉCIFICATION
+## Fichiers à modifier
 
-Le mode SDS n’est **pas** un mode mosaïque classique.  
-C’est un mode **super-stack par lots**, conçu pour :
+Les fichiers sont disponibles dans le repo, et une copie de travail existe aussi dans l’environnement suivant (à titre de référence) :
 
-- découper intelligemment les données du Seestar,
-- normaliser *localement*,
-- produire des **méga-tuiles photométriquement propres**,
-- puis les empiler dans **UN SEUL grand stack global**.
+- `/mnt/data/zemosaic_gui_qt.py`
+- `/mnt/data/zemosaic_filter_gui_qt.py`
 
-Tu dois t’assurer que le code SDS reflète ce workflow de bout en bout.
-
-### 1️⃣ Entrée : le filtre SDS prépare les lots
-
-Le filtre (GUI Qt) :
-
-- analyse les positions WCS des images,
-- estime la coverage,
-- applique une taille de lot cible,
-- tient compte des zones de recouvrement.
-
-Il produit une liste de **LOTS SDS** de ce type :
-
-- Lot 1 : images {1,2,3,…}  
-- Lot 2 : images {…}  
-- etc.
-
-**Important :**  
-En mode SDS, ces **lots SDS remplacent complètement les Master Tiles**.  
-Il ne faut plus reconstruire de Master Tiles dans le pipeline SDS.
+**Ne modifier que ces deux fichiers** pour cette mission.
 
 ---
 
-### 2️⃣ Pour chaque lot SDS → création d’une méga-tuile
+## Détail des modifications à effectuer
 
-Pour chaque lot, le worker doit :
+### 1. zemosaic_filter_gui_qt.py
 
-1. **Charger les images du lot**
-   - débayer,
-   - corriger les pixels chauds,
-   - corriger les gradients locaux si nécessaire,
-   - appliquer les mêmes filtres de qualité de base que dans le pipeline classique.
+#### 1.1. Aligner le défaut `sds_mode_default` sur le main (False)
 
-2. **Aligner les images du lot directement sur le WCS global**
-   - pas de WCS intermédiaire “local”,
-   - alignement dans la géométrie finale de la mosaïque.
+Repérer le bloc de définition de `DEFAULT_FILTER_CONFIG` :
 
-3. **Normalisation INTRA-lot**
-   - mettre les images du lot au même niveau photométrique,
-   - harmoniser le fond de ciel (match background),
-   - appliquer la même logique de robustification que pour les Master Tiles :
-     - winsor / kappa, rejet des valeurs extrêmes,
-     - rejet des images floues/ratées si la config l’indique.
+```python
+DEFAULT_FILTER_CONFIG: dict[str, Any] = dict(_DEFAULT_GUI_CONFIG_MAP)
+DEFAULT_FILTER_CONFIG.setdefault("auto_detect_seestar", True)
+DEFAULT_FILTER_CONFIG.setdefault("force_seestar_mode", False)
+DEFAULT_FILTER_CONFIG.setdefault("sds_mode_default", True)
+DEFAULT_FILTER_CONFIG.setdefault("sds_min_batch_size", 5)
+DEFAULT_FILTER_CONFIG.setdefault("sds_target_batch_size", 10)
+DEFAULT_FILTER_CONFIG.setdefault("global_coadd_method", "kappa_sigma")
+DEFAULT_FILTER_CONFIG.setdefault("global_coadd_k", 2.0)
+````
 
-   ➜ Objectif : **une tuile par lot déjà photométriquement propre.**
+**Modification demandée :**
 
-4. **Coadd du lot → MEGA-TILE**
-   - effectuer un coadd complet (GPU si disponible),
-   - produire :
-     - une image `H×W×3`,
-     - une carte `coverage H×W`.
+* Passer le défaut de `True` à `False` pour être cohérent avec le `fallback_defaults` du main :
 
-Le résultat est une **méga-tuile SDS** qui représente l’ensemble du lot comme une seule “super image”.
+DEFAULT_FILTER_CONFIG.setdefault("sds_mode_default", False)
+```
+
+> Ne pas toucher aux autres lignes (min / target batch size, coadd, etc.).
 
 ---
 
-### 3️⃣ Après tous les lots → normalisation INTER-méga-tiles
+#### 1.2. Initialiser `_sds_mode_initial` à partir de `sds_mode` OU `sds_mode_default`
 
-Une fois tous les lots traités, on a :
+Repérer dans `FilterQtDialog.__init__` le calcul actuel :
 
-- `MT0, MT1, MT2, ..., MTn` (méga-tiles)  
-- chacune avec une coverage associée.
+```python
+self._sds_mode_initial = self._coerce_bool(
+    (initial_overrides or {}).get("sds_mode")
+    if isinstance(initial_overrides, dict)
+    else None,
+    self._coerce_bool(
+        (config_overrides or {}).get("sds_mode")
+        if isinstance(config_overrides, dict)
+        else None,
+        True,
+    ),
+)
+```
 
-Chaque méga-tuile peut avoir un niveau de flux/fond légèrement différent.
+**Objectif :**
 
-Tu dois appliquer :
+1. Priorité à `initial_overrides["sds_mode"]` (si présent).
+2. Sinon, utiliser `config_overrides["sds_mode_default"]` si disponible.
+3. Sinon, fallback sur `DEFAULT_FILTER_CONFIG["sds_mode_default"]` (désormais False).
 
-1. **Choix d’une méga-tuile de référence**
-   - critère possible :
-     - meilleure coverage,
-     - plus centrale,
-     - ou première, si la config le précise.
-   - cette tuile ancre le flux global (son gain = 1.0).
+**Remplacer le bloc par :**
 
-2. **Calcul des médianes sur les zones couvertes**
-   - pour chaque méga-tuile :
-     - ne considérer que les pixels où `coverage > 0`,
-     - calculer une médiane robuste (en ignorant NaN et valeurs aberrantes).
+```python
+self._sds_mode_initial = self._coerce_bool(
+    (initial_overrides or {}).get("sds_mode")
+    if isinstance(initial_overrides, dict)
+    else None,
+    self._coerce_bool(
+        (config_overrides or {}).get("sds_mode_default")
+        if isinstance(config_overrides, dict)
+        else None,
+        bool(DEFAULT_FILTER_CONFIG.get("sds_mode_default", False)),
+    ),
+)
+```
 
-3. **Renormalisation globale**
-   - pour chaque méga-tuile (sauf la référence) :
-     - calculer `gain_i = median_ref / median_i`,
-     - appliquer ce gain à toute la méga-tuile.
+Ne pas modifier la suite, qui associe cette valeur à la case :
 
-➜ Après cette étape, **toutes les méga-tiles doivent être sur la même échelle photométrique**.
-
----
-
-### 4️⃣ Empilement global des méga-tiles
-
-Une fois toutes les méga-tiles normalisées globalement :
-
-1. **Alignement des méga-tiles dans le WCS final**
-   - elles sont déjà dans le bon WCS,
-   - donc :
-     - pas de reprojection lourde,
-     - tout au plus recomposition/cropping léger si besoin.
-
-2. **Coadd global**
-   - empiler toutes les méga-tiles pour produire :
-     - `sds_mosaic_data_HWC`,
-     - `sds_coverage_HW`,
-     - éventuellement `alpha_map`.
-
-**Important :**  
-À ce stade, **il ne faut plus appliquer de “match background”**.  
-La normalisation globale inter-méga-tiles a déjà aligné les niveaux.
-
----
-
-### 5️⃣ Finalisation SDS (polish final)
-
-Sur `sds_mosaic_data_HWC` + `sds_coverage_HW` (+ `alpha_map`), appliquer :
-
-1. **Coverage cut**
-   - masque des pixels avec coverage trop faible (coverage normalisée < seuil),
-   - convertir ces pixels en NaN + coverage=0.
-
-2. **Two-pass coverage renorm (optionnel)**
-   - homogénéiser les bordures si l’option est activée.
-
-3. **Quality crop**
-   - utiliser `lecropper` ou ZeQualityMT pour :
-     - éliminer les zones instables,
-     - rogner les bords dégradés.
-
-4. **Alt-Az cleanup**
-   - suppression des zones impactées par rotation de champ ou dérive alt-az.
-
-5. **Autocrop WCS**
-   - cropping final basé sur la coverage valide,
-   - mise à jour du WCS global pour refléter le crop.
+```python
+self._sds_checkbox = QCheckBox(
+    self._localizer.get("filter_chk_sds_mode", "Enable ZeSupaDupStack (SDS)"),
+    box,
+)
+self._sds_checkbox.setChecked(bool(self._sds_mode_initial))
+...
+```
 
 ---
 
-### 6️⃣ Sauvegarde finale
+### 2. zemosaic_gui_qt.py
 
-Le pipeline SDS doit ensuite :
+Nous avons deux modifications à faire :
 
-- écrire le FITS final :
-  - image principale,
-  - extension(s) de coverage,
-  - WCS final ajusté (cropped),
-- générer PNG/JPG si demandé,
-- enregistrer :
-  - des métriques de qualité,
-  - des logs sur :
-    - nombre de lots,
-    - temps par lot,
-    - temps total SDS,
-    - index de la méga-tuile de référence et gains appliqués.
+1. **Passer l’état SDS du main vers le filter.**
+2. **Récupérer l’état SDS du filter vers le main.**
+
+#### 2.1. Propager `sds_mode_default` → `initial_overrides["sds_mode"]`
+
+Dans `_launch_filter_dialog`, repérer l’endroit où `initial_overrides` est construit :
+
+```python
+initial_overrides: Dict[str, Any] | None = None
+try:
+    initial_overrides = {
+        "cluster_panel_threshold": float(self.config.get("cluster_panel_threshold", 0.05)),
+        "cluster_target_groups": int(self.config.get("cluster_target_groups", 0)),
+        "cluster_orientation_split_deg": float(self.config.get("cluster_orientation_split_deg", 0.0)),
+    }
+except Exception:
+    initial_overrides = None
+```
+
+**Modification demandée :**
+
+* Ajouter une entrée `sds_mode` qui reflète l’état courant de `sds_mode_default` dans la config principale.
+
+Par exemple :
+
+```python
+initial_overrides = {
+    "cluster_panel_threshold": float(self.config.get("cluster_panel_threshold", 0.05)),
+    "cluster_target_groups": int(self.config.get("cluster_target_groups", 0)),
+    "cluster_orientation_split_deg": float(self.config.get("cluster_orientation_split_deg", 0.0)),
+    # Synchroniser l’état de la case "Enable SDS mode by default" vers le Filter Qt
+    "sds_mode": bool(self.config.get("sds_mode_default", False)),
+}
+```
+
+> L’idée est que, lorsque l’utilisateur ouvre le filter, la case « Enable ZeSupaDupStack (SDS) » s’aligne sur ce que l’utilisateur a choisi dans le *Main*.
 
 ---
 
-## Résumé SDS ultra-court
+#### 2.2. Appliquer `overrides["sds_mode"]` au `sds_mode_default` du main
 
-> `SDS = lots → méga-tiles → renorm globale → stack final → polish → save`
+Repérer la méthode :
 
-Tu dois adapter le code SDS existant pour qu’il respecte ce flux,  
-**sans altérer le pipeline non-SDS**.
+```python
+def _apply_filter_overrides_to_config(self, overrides: Dict[str, Any] | None) -> None:
+    if not overrides:
+        return
+    for key in (
+        "cluster_panel_threshold",
+        "cluster_target_groups",
+        "cluster_orientation_split_deg",
+    ):
+        if key in overrides:
+            self._update_widget_from_config(key, overrides[key])
+    if "astap_max_instances" in overrides:
+        self._update_widget_from_config("astap_max_instances", overrides["astap_max_instances"])
+        self._apply_astap_concurrency_setting()
+```
+
+**Modification demandée :**
+
+* Entre la boucle `for key in (...)` et le bloc `if "astap_max_instances" ...`, ajouter un bloc pour synchroniser la préférence SDS :
+
+```python
+def _apply_filter_overrides_to_config(self, overrides: Dict[str, Any] | None) -> None:
+    if not overrides:
+        return
+    for key in (
+        "cluster_panel_threshold",
+        "cluster_target_groups",
+        "cluster_orientation_split_deg",
+    ):
+        if key in overrides:
+            self._update_widget_from_config(key, overrides[key])
+
+    # Synchroniser le choix SDS du Filter Qt avec la case "Enable SDS mode by default"
+    if "sds_mode" in overrides:
+        self._update_widget_from_config("sds_mode_default", overrides["sds_mode"])
+
+    if "astap_max_instances" in overrides:
+        self._update_widget_from_config("astap_max_instances", overrides["astap_max_instances"])
+        self._apply_astap_concurrency_setting()
+```
+
+`_update_widget_from_config("sds_mode_default", ...)` doit déjà :
+
+* mettre à jour `self.config["sds_mode_default"]`, et
+* mettre à jour l’état de la case « Enable SDS mode by default » dans la GUI principale (via la logique existante déjà utilisée pour les autres champs).
+
+---
+
+## Contraintes
+
+* Ne PAS modifier la logique des autres options (coverage, overcap, coadd, etc.).
+* Ne PAS refactoriser le reste du code : la mission est purement cosmétique / synchronisation d’état.
+* Laisser intacte toute la logique SDS existante (plan SDS, `global_wcs_plan_override`, etc.), sauf les points explicitement indiqués ci-dessus.
+* Conserver les noms de fonctions et clés (`sds_mode_default`, `sds_mode`) tels quels.
+
+---
+
+## Résultat attendu (comportement utilisateur)
+
+1. **Au démarrage, si aucune config existante** :
+
+   * `sds_mode_default` = False par défaut (Main + Filter).
+   * La case « Enable SDS mode by default » est décochée.
+   * La case « Enable ZeSupaDupStack (SDS) » est décochée à l’ouverture du filter.
+
+2. **Si l’utilisateur coche la case SDS dans le Main puis ouvre le Filter** :
+
+   * `sds_mode_default` passe à True.
+   * À l’ouverture du Filter, la case « Enable ZeSupaDupStack (SDS) » est **cochée** automatiquement.
+
+3. **Si l’utilisateur change la case SDS dans le Filter et valide** :
+
+   * Les `overrides` contiennent `sds_mode`.
+   * `_apply_filter_overrides_to_config` met à jour `sds_mode_default` avec cette valeur.
+   * La case « Enable SDS mode by default » dans le Main se met à jour automatiquement.
+   * Le JSON de config persistant (via le mécanisme existant) garde cette préférence pour la prochaine session.
+
+Si ces conditions sont remplies, la mission est considérée comme réussie.
+
+````
