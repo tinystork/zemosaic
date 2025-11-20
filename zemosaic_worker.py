@@ -10846,6 +10846,18 @@ def run_hierarchical_mosaic(
     if not math.isfinite(sds_coverage_threshold_config):
         sds_coverage_threshold_config = 0.92
     sds_coverage_threshold_config = max(0.10, min(0.99, sds_coverage_threshold_config))
+    try:
+        sds_min_batch_size_config = int(worker_config_cache.get("sds_min_batch_size", 5) or 5)
+    except Exception:
+        sds_min_batch_size_config = 5
+    if sds_min_batch_size_config <= 0:
+        sds_min_batch_size_config = 1
+    try:
+        sds_target_batch_size_config = int(worker_config_cache.get("sds_target_batch_size", 10) or 10)
+    except Exception:
+        sds_target_batch_size_config = 10
+    if sds_target_batch_size_config < sds_min_batch_size_config:
+        sds_target_batch_size_config = sds_min_batch_size_config
 
     global_wcs_autocrop_enabled_config = bool(worker_config_cache.get("global_wcs_autocrop_enabled"))
     try:
@@ -12527,6 +12539,9 @@ def run_hierarchical_mosaic(
                 cache_root=output_folder,
                 stack_params=sds_stack_params,
                 coverage_threshold=sds_coverage_threshold_config,
+                min_batch_size=sds_min_batch_size_config,
+                target_batch_size=sds_target_batch_size_config,
+                preplan_path_groups=preplan_groups_override_paths,
                 postprocess_context=sds_post_context,
             )
         if mosaic_result[0] is None:
@@ -15386,6 +15401,71 @@ def _assemble_global_mosaic_first_impl(
         _cleanup_temp()
 
 
+def _build_sds_batches_runtime(
+    entry_infos: list[dict[str, Any]],
+    grid_h: int,
+    grid_w: int,
+    *,
+    coverage_threshold: float,
+    min_batch_size: int,
+    target_batch_size: int,
+) -> list[list[dict[str, Any]]]:
+    """Apply SDS batch policy on entry infos using coverage + min/target sizing."""
+
+    if not entry_infos or grid_h <= 0 or grid_w <= 0:
+        return []
+    try:
+        coverage_threshold = float(coverage_threshold)
+    except Exception:
+        coverage_threshold = 0.92
+    coverage_threshold = max(0.10, min(0.99, coverage_threshold))
+    try:
+        min_batch_size = int(min_batch_size)
+    except Exception:
+        min_batch_size = 5
+    try:
+        target_batch_size = int(target_batch_size)
+    except Exception:
+        target_batch_size = 10
+    min_batch_size = max(1, min_batch_size)
+    target_batch_size = max(min_batch_size, target_batch_size)
+
+    total_cells = grid_h * grid_w
+    batches: list[list[dict[str, Any]]] = []
+    current_batch: list[dict[str, Any]] = []
+    coverage_grid = np.zeros((grid_h, grid_w), dtype=np.uint8)
+    coverage_cells = 0
+    for info in entry_infos:
+        bbox = info.get("grid_bbox", (0, 0, 0, 0))
+        if not isinstance(bbox, (list, tuple)) or len(bbox) != 4:
+            continue
+        gy0, gy1, gx0, gx1 = bbox
+        if gy1 <= gy0 or gx1 <= gx0:
+            continue
+        region = coverage_grid[gy0:gy1, gx0:gx1]
+        existing = int(region.sum())
+        region_cells = (gy1 - gy0) * (gx1 - gx0)
+        region[...] = 1
+        gain = max(0, region_cells - existing)
+        coverage_cells += gain
+        current_batch.append(info)
+        batch_len = len(current_batch)
+        coverage_fraction = (coverage_cells / total_cells) if total_cells else 1.0
+        if (batch_len >= min_batch_size and coverage_fraction >= coverage_threshold) or (
+            batch_len >= target_batch_size
+        ):
+            batches.append(current_batch)
+            coverage_grid = np.zeros((grid_h, grid_w), dtype=np.uint8)
+            coverage_cells = 0
+            current_batch = []
+    if current_batch:
+        if len(current_batch) < min_batch_size and batches:
+            batches[-1].extend(current_batch)
+        else:
+            batches.append(current_batch)
+    return batches
+
+
 def assemble_global_mosaic_sds(
     seastar_groups: list[list[dict]],
     *,
@@ -15398,6 +15478,9 @@ def assemble_global_mosaic_sds(
     cache_root: str | None,
     stack_params: dict[str, Any] | None = None,
     coverage_threshold: float = 0.92,
+    min_batch_size: int = 5,
+    target_batch_size: int = 10,
+    preplan_path_groups: list[list[str]] | None = None,
     postprocess_context: dict[str, Any] | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     """Batch Mosaic-First workflow that stacks per-batch mosaics in the global WCS."""
@@ -15512,11 +15595,37 @@ def assemble_global_mosaic_sds(
             y1 = max(y0, min(height, y1))
             if (x1 - x0) <= 0 or (y1 - y0) <= 0:
                 continue
-            entry_infos.append({"entry": entry, "bbox": (y0, y1, x0, x1)})
+            path_norm = _normcase_path(
+                entry.get("path_preprocessed_cache") or entry.get("path_raw") or entry.get("path")
+            )
+            entry_infos.append({"entry": entry, "bbox": (y0, y1, x0, x1), "path_norm": path_norm})
 
     if not entry_infos:
-        pcb("sds_error_no_valid_batches", prog=None, lvl="WARN")
+        pcb("sds_error_no_valid_batches", prog=None, lvl="WARN", reason="no entries with valid WCS")
         return None, None, None
+
+    try:
+        coverage_threshold = float(coverage_threshold or 0.92)
+    except Exception:
+        coverage_threshold = 0.92
+    coverage_threshold = max(0.10, min(0.99, coverage_threshold))
+    try:
+        min_batch_size = max(1, int(min_batch_size))
+    except Exception:
+        min_batch_size = 5
+    try:
+        target_batch_size = max(min_batch_size, int(target_batch_size))
+    except Exception:
+        target_batch_size = max(min_batch_size, 10)
+
+    pcb(
+        "sds_info_batch_policy",
+        prog=None,
+        lvl="INFO_DETAIL",
+        coverage_threshold=coverage_threshold,
+        min_batch_size=min_batch_size,
+        target_batch_size=target_batch_size,
+    )
 
     grid_h = max(1, min(512, height))
     grid_w = max(1, min(512, width))
@@ -15546,41 +15655,87 @@ def assemble_global_mosaic_sds(
             label="prebatch",
         )
 
-    coverage_threshold = max(0.10, min(0.99, float(coverage_threshold or 0.92)))
-    total_cells = grid_h * grid_w
+    batches_infos: list[list[dict[str, Any]]] | None = None
+    if preplan_path_groups:
+        path_lookup = {info.get("path_norm"): info for info in entry_infos if info.get("path_norm")}
+        mapped_batches: list[list[dict[str, Any]]] = []
+        used_paths: set[str] = set()
+        mapped_total_entries = 0
+        for group_paths in preplan_path_groups:
+            if not isinstance(group_paths, (list, tuple)):
+                continue
+            mapped_group: list[dict[str, Any]] = []
+            for path_val in group_paths:
+                norm_key = _normcase_path(path_val)
+                if not norm_key:
+                    continue
+                if norm_key in used_paths:
+                    continue
+                info = path_lookup.get(norm_key)
+                if info is None:
+                    continue
+                mapped_group.append(info)
+                used_paths.add(norm_key)
+            if mapped_group:
+                mapped_batches.append(mapped_group)
+        if mapped_batches:
+            mapped_total_entries = sum(len(batch) for batch in mapped_batches)
+        if mapped_batches and mapped_total_entries == len(entry_infos):
+            batches_infos = mapped_batches
+            pcb("sds_info_preplan_used", prog=None, lvl="INFO_DETAIL", count=len(batches_infos))
+        elif preplan_path_groups:
+            total_entries = len(entry_infos)
+            if total_entries > 0:
+                pcb(
+                    "sds_warn_preplan_unused",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                    matched=mapped_total_entries,
+                    total=total_entries,
+                )
+
+    if batches_infos is None:
+        batches_infos = _build_sds_batches_runtime(
+            entry_infos,
+            grid_h,
+            grid_w,
+            coverage_threshold=coverage_threshold,
+            min_batch_size=min_batch_size,
+            target_batch_size=target_batch_size,
+        )
+
+    if not batches_infos:
+        pcb("sds_error_no_valid_batches", prog=None, lvl="WARN", reason="no valid batches after policy")
+        return None, None, None
+
     batches: list[list[dict]] = []
-    remaining = entry_infos
-    while remaining:
+    coverage_arrays: list[np.ndarray] = []
+    batch_coverages: list[float] = []
+    total_cells = grid_h * grid_w
+    for info_batch in batches_infos:
+        if not info_batch:
+            continue
         coverage_grid = np.zeros((grid_h, grid_w), dtype=np.uint8)
-        coverage_cells = 0
-        used_indices: list[int] = []
-        batch_entries: list[dict] = []
-        for idx, info in enumerate(remaining):
+        for info in info_batch:
             gy0, gy1, gx0, gx1 = info.get("grid_bbox", (0, 0, 0, 0))
             if gy1 <= gy0 or gx1 <= gx0:
                 continue
-            region = coverage_grid[gy0:gy1, gx0:gx1]
-            already = int(region.sum())
-            region_cells = (gy1 - gy0) * (gx1 - gx0)
-            region[...] = 1
-            gain = max(0, region_cells - already)
-            coverage_cells += gain
-            batch_entries.append(info["entry"])
-            used_indices.append(idx)
-            fraction = (coverage_cells / total_cells) if total_cells else 1.0
-            if fraction >= coverage_threshold and batch_entries:
-                break
-        if not batch_entries:
-            batch_entries.append(remaining[0]["entry"])
-            used_indices = [0]
-        batches.append(batch_entries)
-        used_set = set(used_indices)
-        remaining = [info for idx, info in enumerate(remaining) if idx not in used_set]
+            coverage_grid[gy0:gy1, gx0:gx1] = 1
+        coverage_fraction = (
+            float(np.count_nonzero(coverage_grid)) / float(total_cells) if total_cells else 1.0
+        )
+        entries = [info.get("entry") for info in info_batch if isinstance(info.get("entry"), dict)]
+        if not entries:
+            continue
+        batches.append(entries)
+        coverage_arrays.append(coverage_grid)
+        batch_coverages.append(coverage_fraction)
 
     if not batches:
-        pcb("sds_error_no_valid_batches", prog=None, lvl="WARN")
+        pcb("sds_error_no_valid_batches", prog=None, lvl="WARN", reason="empty batches after filtering")
         return None, None, None
 
+    sizes = [len(batch) for batch in batches]
     pcb(
         "sds_info_batches_built",
         prog=None,
@@ -15588,6 +15743,30 @@ def assemble_global_mosaic_sds(
         count=len(batches),
         total_entries=len(entry_infos),
     )
+    sizes_text = "[" + ", ".join(str(size) for size in sizes) + "]"
+    coverage_text = "[" + ", ".join(f"{c:.3f}" for c in batch_coverages) + "]"
+    pcb(
+        "sds_log_batch_summary",
+        prog=None,
+        lvl="INFO_DETAIL",
+        batch_count=len(batches),
+        sizes=sizes_text,
+        coverages=coverage_text,
+        coverage_threshold=coverage_threshold,
+        min_batch_size=min_batch_size,
+        target_batch_size=target_batch_size,
+    )
+    for idx, cov_array in enumerate(coverage_arrays):
+        base_payload = {"entries": sizes[idx] if idx < len(sizes) else 0, "route": f"sds_batch_{idx + 1}"}
+        _emit_coverage_summary_log(
+            pcb,
+            coverage_array=cov_array,
+            width=width,
+            height=height,
+            log_key="sds_debug_batch_coverage_summary",
+            base_payload=base_payload,
+            label=f"batch_{idx + 1}",
+        )
 
     mosaics: list[np.ndarray] = []
     coverages: list[np.ndarray | None] = []

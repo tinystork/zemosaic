@@ -117,6 +117,8 @@ DEFAULT_CONFIG = {
     "global_wcs_autocrop_margin_px": 128,
     "sds_mode_default": False,
     "sds_coverage_threshold": 0.92,
+    "sds_min_batch_size": 5,
+    "sds_target_batch_size": 10,
     "global_coadd_method": "kappa_sigma",
     "global_coadd_k": 2.0,
     "inter_master_merge_enable": False,

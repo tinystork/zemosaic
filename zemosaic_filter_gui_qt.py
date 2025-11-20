@@ -498,6 +498,8 @@ DEFAULT_FILTER_CONFIG: dict[str, Any] = dict(_DEFAULT_GUI_CONFIG_MAP)
 DEFAULT_FILTER_CONFIG.setdefault("auto_detect_seestar", True)
 DEFAULT_FILTER_CONFIG.setdefault("force_seestar_mode", False)
 DEFAULT_FILTER_CONFIG.setdefault("sds_mode_default", True)
+DEFAULT_FILTER_CONFIG.setdefault("sds_min_batch_size", 5)
+DEFAULT_FILTER_CONFIG.setdefault("sds_target_batch_size", 10)
 DEFAULT_FILTER_CONFIG.setdefault("global_coadd_method", "kappa_sigma")
 DEFAULT_FILTER_CONFIG.setdefault("global_coadd_k", 2.0)
 DEFAULT_FILTER_CONFIG.setdefault(QT_FILTER_WINDOW_GEOMETRY_KEY, None)
@@ -2395,11 +2397,34 @@ class FilterQtDialog(QDialog):
             if success:
                 threshold = self._coerce_float(self._config_value("sds_coverage_threshold", 0.92), 0.92)
                 threshold = max(0.10, min(0.99, threshold))
+                min_batch_size = self._coerce_int(
+                    self._config_value("sds_min_batch_size", 5),
+                    default=5,
+                ) or 5
+                min_batch_size = max(1, int(min_batch_size))
+                target_batch_size = self._coerce_int(
+                    self._config_value("sds_target_batch_size", 10),
+                    default=10,
+                ) or 10
+                target_batch_size = max(min_batch_size, int(target_batch_size))
                 sds_groups = self._build_sds_batches_for_indices(
                     selected_indices,
                     coverage_threshold=threshold,
+                    min_batch_size=min_batch_size,
+                    target_batch_size=target_batch_size,
                 )
                 if sds_groups:
+                    sizes = [len(group) for group in sds_groups]
+                    log_text = self._format_message(
+                        "filter.cluster.sds_preview_summary",
+                        "SDS preview: thr={threshold:.2f}, min={min_size}, target={target_size} -> {count} batch(es) {sizes}.",
+                        threshold=threshold,
+                        min_size=min_batch_size,
+                        target_size=target_batch_size,
+                        count=len(sds_groups),
+                        sizes=sizes,
+                    )
+                    self._append_log(log_text)
                     messages.append(
                         self._format_message(
                             "filter.cluster.sds_ready",
@@ -2409,7 +2434,7 @@ class FilterQtDialog(QDialog):
                     )
                     return {
                         "final_groups": sds_groups,
-                        "sizes": [len(group) for group in sds_groups],
+                        "sizes": sizes,
                         "coverage_first": True,
                         "threshold_used": 0.0,
                         "angle_split": 0.0,
@@ -3354,11 +3379,60 @@ class FilterQtDialog(QDialog):
         success, meta_payload, _ = self._ensure_global_wcs_for_selection(True, selected_indices)
         return success, meta_payload
 
+    def _build_sds_batches_with_policy(
+        self,
+        entry_infos: list[dict[str, Any]],
+        grid_h: int,
+        grid_w: int,
+        *,
+        coverage_threshold: float,
+        min_batch_size: int,
+        target_batch_size: int,
+    ) -> list[list[dict[str, Any]]]:
+        if not entry_infos or grid_h <= 0 or grid_w <= 0:
+            return []
+        total_cells = grid_h * grid_w
+        batches: list[list[dict[str, Any]]] = []
+        current_batch: list[dict[str, Any]] = []
+        coverage_grid = np.zeros((grid_h, grid_w), dtype=np.uint8)
+        coverage_cells = 0
+        for info in entry_infos:
+            bbox = info.get("grid_bbox")
+            if not isinstance(bbox, tuple) or len(bbox) != 4:
+                continue
+            gy0, gy1, gx0, gx1 = bbox
+            if gy1 <= gy0 or gx1 <= gx0:
+                continue
+            region = coverage_grid[gy0:gy1, gx0:gx1]
+            region_before = int(region.sum())
+            region_cells = (gy1 - gy0) * (gx1 - gx0)
+            region[...] = 1
+            gain = max(0, region_cells - region_before)
+            coverage_cells += gain
+            current_batch.append(info)
+            batch_len = len(current_batch)
+            coverage_fraction = (coverage_cells / total_cells) if total_cells else 1.0
+            if (batch_len >= min_batch_size and coverage_fraction >= coverage_threshold) or (
+                batch_len >= target_batch_size
+            ):
+                batches.append(current_batch)
+                coverage_grid = np.zeros((grid_h, grid_w), dtype=np.uint8)
+                coverage_cells = 0
+                current_batch = []
+        if current_batch:
+            if len(current_batch) < min_batch_size and batches:
+                batches[-1].extend(current_batch)
+            else:
+                batches.append(current_batch)
+        return batches
+
     def _build_sds_batches_for_indices(
         self,
         selected_indices: list[int],
         *,
         coverage_threshold: float = 0.92,
+        min_batch_size: int = 5,
+        target_batch_size: int = 10,
     ) -> list[list[dict[str, Any]]] | None:
         descriptor = self._global_wcs_state.get("descriptor")
         if not descriptor or WCS is None:
@@ -3445,38 +3519,24 @@ class FilterQtDialog(QDialog):
             info["grid_bbox"] = (g_y0, g_y1, g_x0, g_x1)
 
         coverage_threshold = max(0.10, min(0.99, float(coverage_threshold or 0.92)))
-        total_cells = grid_h * grid_w
-        remaining = entry_infos
-        batches: list[list[dict[str, Any]]] = []
-        while remaining:
-            coverage_grid = np.zeros((grid_h, grid_w), dtype=np.uint8)
-            coverage_cells = 0
-            used_indices: list[int] = []
-            batch_entries: list[dict[str, Any]] = []
-            for idx, info in enumerate(remaining):
-                gy0, gy1, gx0, gx1 = info.get("grid_bbox", (0, 0, 0, 0))
-                if gy1 <= gy0 or gx1 <= gx0:
-                    continue
-                region = coverage_grid[gy0:gy1, gx0:gx1]
-                already = int(region.sum())
-                region_cells = (gy1 - gy0) * (gx1 - gx0)
-                region[...] = 1
-                gain = max(0, region_cells - already)
-                if gain <= 0 and batch_entries:
-                    continue
-                coverage_cells += gain
-                batch_entries.append(info)
-                used_indices.append(idx)
-                fraction = (coverage_cells / total_cells) if total_cells else 1.0
-                if fraction >= coverage_threshold and batch_entries:
-                    break
-            if not batch_entries:
-                batch_entries.append(remaining[0])
-                used_indices = [0]
-            batches.append(batch_entries)
-            used = set(used_indices)
-            remaining = [info for idx, info in enumerate(remaining) if idx not in used]
-
+        try:
+            min_batch_size = max(1, int(min_batch_size))
+        except Exception:
+            min_batch_size = 5
+        try:
+            target_batch_size = max(min_batch_size, int(target_batch_size))
+        except Exception:
+            target_batch_size = max(min_batch_size, 10)
+        batches = self._build_sds_batches_with_policy(
+            entry_infos,
+            grid_h,
+            grid_w,
+            coverage_threshold=coverage_threshold,
+            min_batch_size=min_batch_size,
+            target_batch_size=target_batch_size,
+        )
+        if not batches:
+            return None
         final_groups: list[list[dict[str, Any]]] = []
         for batch in batches:
             group_payload: list[dict[str, Any]] = []
@@ -5719,6 +5779,13 @@ class FilterQtDialog(QDialog):
         if math.isnan(result) or math.isinf(result):
             return default
         return result
+
+    @staticmethod
+    def _coerce_int(value: Any, default: int | None = None) -> int | None:
+        try:
+            return int(value)
+        except Exception:
+            return default
 
     def _detect_primary_instrument_label(self) -> str | None:
         for entry in self._normalized_items:
