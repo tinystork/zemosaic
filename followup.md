@@ -1,130 +1,261 @@
----
+# FOLLOW-UP INSTRUCTIONS — SDS / ZeSupaDupStack Batch Policy Fix
 
-# ✅ **followup.md (step-by-step tasks for Codex)**
+This document gives you a **step-by-step plan** to implement the SDS fixes described in `agent.md`.
 
-```markdown
-# FOLLOW-UP TASKS — CENTRALIZED ETA USING ETACalculator
+Please follow the steps in order and keep changes minimal outside the SDS code paths.
 
-Follow these tasks exactly. Do not modify anything not explicitly listed.
 
 ---
 
-## 1. Import the centralized ETA system
+## 1. Add SDS batch size config keys
 
-In both:
-- `zemosaic_gui.py`
-- `zemosaic_gui_qt.py`
+**File:** `zemosaic_config.py`
 
-Add:
+1. Locate `DEFAULT_CONFIG` (the main dict with config defaults).
+2. Add two new entries with safe defaults:
 
-```python
-from zemosaic_time_utils import ETACalculator, format_eta_hms
-````
+   - `sds_min_batch_size`: `5`
+   - `sds_target_batch_size`: `10`
 
----
+3. If there is any config load/merge logic elsewhere, ensure that:
+   - If a user config file predates these keys, the defaults still apply.
+   - Values are coerced to integers and at least 1 when used downstream.
 
-## 2. Initialize the ETA calculator
-
-In the method that starts the stacking process (Tk: `start_processing`, Qt: corresponding slot):
-
-Add:
-
-```python
-self._eta_calc = ETACalculator(total_items=100)
-self._eta_seconds_smoothed = None
-```
-
-Place this **before launching the worker thread**.
 
 ---
 
-## 3. Replace local ETA math with ETACalculator
+## 2. Update SDS batch building in Qt Filter GUI
 
-Locate the code that handles global progress updates.
-Replace the ETA computation block with:
+**File:** `zemosaic_filter_gui_qt.py`
 
-```python
-self._eta_calc.update(int(global_progress))
-eta = self._eta_calc.get_eta_seconds()
+### 2.1. Locate current SDS helpers
 
-if eta is not None:
-    if self._eta_seconds_smoothed is None:
-        smoothed = eta
-    else:
-        smoothed = 0.3 * eta + 0.7 * self._eta_seconds_smoothed
+1. Find the SDS preview / grouping code, e.g.:
 
-    self._eta_seconds_smoothed = smoothed
+   - `_build_sds_batches_for_indices(...)`
+   - the part of `_compute_auto_groups` or similar that calls it when SDS is enabled.
+   - the code that serializes SDS groups into `overrides["preplan_master_groups"]`.
 
-    eta_str = format_eta_hms(smoothed)
-    self._set_eta_label(eta_str)
-```
+2. Confirm how the current SDS coverage grouping is implemented (grid, WCS descriptor, coverage_threshold).
 
----
+### 2.2. Implement coverage + min + target batch policy
 
-## 4. Preserve GPU/CPU override behavior
+1. Introduce a helper in the Qt filter module, something like:
 
-Locate the worker ETA override handlers.
-Do **NOT** modify them, only ensure that:
+   ```python
+   def _build_sds_batches_with_policy(
+       entries: list[dict],
+       descriptor: dict,
+       coverage_threshold: float,
+       min_batch_size: int,
+       target_batch_size: int,
+       logger_fn: Optional[Callable[[str], None]] = None,
+   ) -> list[list[dict]]:
+       ...
+This helper must:
 
-* When override is active
-  → **Skip ETACalculator update**
+Reuse the existing coverage grid logic used by SDS (no new math).
 
-* When override ends
-  → Resume ETACalculator uninterrupted
+Apply the algorithm described in section 3.2 of agent.md:
 
-The existing override logic must stay exactly as it is.
+Add frames one by one, updating coverage.
 
----
+Close batch when:
 
-## 5. Deduplicate formatting
+len(batch) >= min_batch_size and coverage >= threshold, OR
 
-Remove any local helpers like:
+len(batch) >= target_batch_size (forced close).
 
-* `_format_eta_string`
-* `_human_readable_eta`
-* Any custom hh:mm:ss logic
+Merge final leftover batch with the previous one if too small, etc.
 
-Use instead:
+Ensure you read sds_min_batch_size / sds_target_batch_size from the config/overrides in the same way sds_coverage_threshold is read:
 
-```python
-eta_str = format_eta_hms(seconds)
-```
+Use safe defaults (5 / 10) if missing or invalid.
 
----
+Use max(1, int(value)) to avoid zeros or negatives.
 
-## 6. Do not modify anything else
+Replace the existing SDS preview function _build_sds_batches_for_indices(...) to call this new helper:
 
-* No changes to worker code
-* No changes to queue messages
-* No changes to progress calculation
-* No changes to phase weighting
-* No changes to Tk or Qt layouts
-* No changes to batch size behavior
-* No changes to icons / translations
+You can:
 
----
+Either refactor _build_sds_batches_for_indices to become a small wrapper that calls _build_sds_batches_with_policy.
 
-## 7. Testing checklist
+Or integrate the policy directly into the existing function if it’s easier.
 
-Codex must ensure the following still works:
+Make sure the returned structure (a list of groups/indices) remains fully compatible with:
 
-* ETA updates continuously during stacking
-* Switching between GPU ETA override and global ETA works
-* CPU helper ETA override still forces the displayed ETA
-* Final ETA resets to "Idle" at end
-* Tk and Qt now produce identical ETA behavior
-* No regression in processing flow or performance
+The tree view that displays SDS groups in the Filter GUI.
 
----
+The serialization step that writes these groups into overrides["preplan_master_groups"].
 
-## 8. SDS / Mosaic-First progress integration
+2.3. Logging in Filter GUI
+Where SDS preview batches are computed, log at least:
 
-1. **Phase label parity** — Update `zemosaic_gui_qt.ZeMosaicQtWorker._handle_payload` to mirror the Tk handling of `PHASE_UPDATE:*` so the Qt phase label reflects the worker signals even when no `STAGE_PROGRESS` messages arrive (as seen in SDS runs).
-2. **SDS progress wiring** — Intercept the worker payloads keyed as `p4_global_coadd_progress` (and the matching `..._finished`) in both GUIs. Use their `done`/`total` counts to synthesize a Phase 4 stage update so `_update_stage_progress` and ETACalculator advance even when the worker skips the legacy stage callback.
-3. **More descriptive phase text** — While the SDS handler is active, show an explicit string such as `P4 - Mosaic-First global coadd` in the phase label using localized text so operators can see the actual operation being performed.
-4. **Testing** — Run an SDS sample (e.g., the `example/lights` bundle) and confirm ETA decreases smoothly, the phase label updates past Phase 1, and the tiles/files counters keep matching the log.
+The coverage threshold.
 
----
+The min and target batch sizes.
 
-## End of follow-up
+The number of SDS batches and their sizes.
 
+Example (textual, later localized):
+
+"SDS preview: thr=0.92, min=5, target=10 → 7 batches [10, 9, 8, ...]"
+
+If the Filter GUI uses a local logger or text widget, route this message there.
+
+3. Update SDS batch building in worker
+File: zemosaic_worker.py
+
+3.1. Locate SDS runtime function
+Find assemble_global_mosaic_sds(...).
+
+Identify where SDS:
+
+Builds its list of Seestar entries (entry_infos or similar).
+
+Builds SDS batches (coverage grid logic).
+
+Logs sds_error_no_valid_batches and falls back to Mosaic-First.
+
+3.2. Create a worker-side batch policy helper
+Introduce a helper function near the SDS code, e.g.:
+
+python
+Copier le code
+def _build_sds_batches_runtime(
+    entry_infos: list[dict],
+    global_plan: dict,
+    coverage_threshold: float,
+    min_batch_size: int,
+    target_batch_size: int,
+    logger: Optional[logging.Logger],
+    pcb_fn: Optional[Callable[..., None]],
+) -> list[list[dict]]:
+    ...
+Implement inside this helper the same algorithm as the Qt side:
+
+Same definition of coverage grid and footprint.
+
+Same closure rules:
+
+len(batch) >= min_batch_size and coverage >= threshold → close.
+
+len(batch) >= target_batch_size → force close.
+
+Same merging of small final leftover batch.
+
+Ensure consistency:
+
+Batches are constructed over the same set/order of entry_infos as before.
+
+If entry_infos is empty or invalid, return an empty list.
+
+3.3. Wire the helper into assemble_global_mosaic_sds
+At the beginning of assemble_global_mosaic_sds, read:
+
+sds_coverage_threshold
+
+sds_min_batch_size
+
+sds_target_batch_size
+
+from the config (using the same configuration access pattern as other options).
+
+Before building SDS batches, log the policy via:
+
+The worker logger.
+
+And/or pcb_fn (if available) with a dedicated log key (e.g. "sds_info_batch_policy").
+
+Replace the existing batch building logic in assemble_global_mosaic_sds with _build_sds_batches_runtime(...).
+
+After batches are built:
+
+If not batches:
+
+Log sds_error_no_valid_batches with a clear reason.
+
+Fallback to Mosaic-First as done today.
+
+Else:
+
+Log how many batches and their sizes (sds_debug_batch_coverage_summary style payload).
+
+Proceed to run _assemble_global_mosaic_first_impl on each batch and stack the results exactly as before.
+
+3.4. Respect preplan groups when possible
+If preplan_master_groups is passed via overrides and SDS is active:
+
+Check whether union of all preplan_master_groups indices matches the set of indices for entry_infos (or at least a significant subset).
+
+If yes:
+
+Optionally use preplan groups directly as SDS batches:
+
+i.e. convert group indices → entry objects and skip coverage regrouping.
+
+If no:
+
+Keep using coverage-based grouping but log that preplan SDS groups could not be reused.
+
+Important: Do not break existing non-SDS uses of preplan_master_groups.
+
+4. Localization updates (only if used)
+Files: locales/en.json, locales/fr.json
+
+If you introduced new SDS messages that are user-visible (GUI or log pane), create matching keys in:
+
+en.json
+
+fr.json
+
+Use the existing naming pattern, e.g.:
+
+"sds_log_batch_policy"
+
+"sds_log_batch_summary"
+
+Ensure:
+
+The Qt GUI and/or worker use these keys through the localization layer.
+
+No raw English or French strings remain hard-coded for new messages that are visible to users.
+
+5. Sanity checks & non-regression
+After implementation, conceptually verify:
+
+SDS ON, Seestar data, many frames:
+
+Worker logs show:
+
+sds_info_batch_policy with coverage, min, target values.
+
+sds_debug_batch_coverage_summary or equivalent summarizing several batches with sizes ≥ sds_min_batch_size.
+
+Filter GUI preview shows a similar batch structure.
+
+The run finishes using SDS (no sds_error_no_valid_batches).
+
+SDS OFF or non-Seestar series:
+
+No SDS batch policy logs.
+
+Behaviour identical to the previous Mosaic-First / classic pipeline.
+
+Edge case (few frames, e.g. 1–3):
+
+SDS still produces 1 small batch.
+
+No crash; fallback only if coverage grid or WCS is invalid.
+
+No change in:
+
+Phase names and ETA logic in zemosaic_gui_qt.py.
+
+Two-pass coverage renormalization.
+
+Phase 4.5 / inter-master merging.
+
+Classic Tk GUI.
+
+If any of these checks fail, refine the SDS helper functions but keep changes strictly local to SDS logic.
