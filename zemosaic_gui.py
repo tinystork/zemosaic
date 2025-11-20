@@ -65,11 +65,13 @@ from pathlib import Path
 from typing import Any, MutableMapping, Optional
 
 from zemosaic_utils import get_app_base_dir, apply_windows_icon_to_window
+from zemosaic_time_utils import ETACalculator, format_eta_hms
 
 SYSTEM_NAME = platform.system().lower()
 IS_WINDOWS = SYSTEM_NAME == "windows"
 IS_MAC = SYSTEM_NAME == "darwin"
 FITS_EXTENSIONS = {".fit", ".fits"}
+CPU_HELPER_OVERRIDE_TTL = 5.0
 
 
 def _expand_to_path(value: Optional[str]) -> Optional[Path]:
@@ -511,8 +513,13 @@ class ZeMosaicGUI:
         self._progress_start_time = None
         self._last_global_progress = 0.0
         self._eta_seconds_smoothed = None
+        self._eta_calc: Optional[ETACalculator] = None
+        self._cpu_eta_override_deadline: Optional[float] = None
         self._gpu_eta_override = None
         self._gpu_helper_active = None
+        self._sds_phase_active = False
+        self._sds_phase_done = 0
+        self._sds_phase_total = 0
         gpu_eta_profiles = self.config.get("gpu_eta_profiles")
         if not isinstance(gpu_eta_profiles, dict):
             gpu_eta_profiles = {}
@@ -2842,7 +2849,9 @@ class ZeMosaicGUI:
                         if hasattr(self.eta_var,'set') and callable(self.eta_var.set):
                             try: self.eta_var.set(eta_string_from_worker)
                             except tk.TclError: pass 
-                    if self.root.winfo_exists(): self.root.after_idle(update_eta_label)
+                    if self.root.winfo_exists():
+                        self.root.after_idle(update_eta_label)
+                    self._cpu_eta_override_deadline = time.monotonic() + CPU_HELPER_OVERRIDE_TTL
                 is_control_message = True
             elif message_key_or_raw == "CHRONO_START_REQUEST":
                 if self.root.winfo_exists(): self.root.after_idle(self._start_gui_chrono)
@@ -2904,12 +2913,13 @@ class ZeMosaicGUI:
                         if phase_num is not None:
                             phase_name = self._tr(f"phase_name_{phase_num}")
                             display = self._tr("phase_display_format", "P{num} - {name}", num=phase_num, name=phase_name)
+                            if self._sds_phase_active and phase_num == 4:
+                                return
                         else:
                             normalized_id = phase_id.replace(".", "_")
                             phase_name = self._tr(f"phase_name_{normalized_id}", phase_id)
                             display = self._tr("phase_display_format", "P{num} - {name}", num=phase_id, name=phase_name)
-                        if hasattr(self.phase_var, 'set') and callable(self.phase_var.set):
-                            self.phase_var.set(display)
+                        self._set_phase_label_text(display)
                     except Exception:
                         pass
                 if self.root.winfo_exists(): self.root.after_idle(update_phase_label)
@@ -3042,14 +3052,12 @@ class ZeMosaicGUI:
                     else:
                         self._last_global_progress = current_progress
                     self.progress_bar_var.set(current_progress)
+                    self._update_eta_from_progress(current_progress)
                     if current_progress > 0.0 and getattr(self, "_progress_start_time", None) is None:
                         self._progress_start_time = time.monotonic()
                     if current_progress >= 99.9:
                         self._eta_seconds_smoothed = 0.0
-                        try:
-                            self.eta_var.set("00:00:00")
-                        except tk.TclError:
-                            pass
+                        self._set_eta_label("00:00:00", force=True)
                 except (ValueError, TypeError) as e_prog:
                     # Utiliser le logger de la classe GUI si disponible, sinon print
                     log_func = getattr(self, 'logger.error', print) if hasattr(self, 'logger') else print
@@ -3073,30 +3081,67 @@ class ZeMosaicGUI:
             except tk.TclError:
                 pass # Ignorer si log_text n'est pas encore prêt lors d'un appel très précoce
 
-    def _format_eta_string(self, seconds: float, *, prefix: str = "") -> str:
-        try:
-            total = float(seconds)
-        except Exception:
-            total = 0.0
-        prefix_value = prefix
-        if total < 0:
-            prefix_value = prefix_value or "+"
-            total = abs(total)
-        eta_h, eta_rem = divmod(int(total + 0.5), 3600)
-        eta_m, eta_s = divmod(eta_rem, 60)
-        return f"{prefix_value}{eta_h:02d}:{eta_m:02d}:{eta_s:02d}"
+    def _is_gpu_eta_override_active(self) -> bool:
+        return bool(getattr(self, "_gpu_eta_override", None))
 
-    def _set_eta_label_from_seconds(self, seconds: float, *, prefix: str = "") -> None:
+    def _is_cpu_eta_override_active(self) -> bool:
+        deadline = getattr(self, "_cpu_eta_override_deadline", None)
+        if not deadline:
+            return False
+        if time.monotonic() >= deadline:
+            self._cpu_eta_override_deadline = None
+            return False
+        return True
+
+    def _is_eta_override_active(self) -> bool:
+        return self._is_gpu_eta_override_active() or self._is_cpu_eta_override_active()
+
+    def _set_eta_label(self, text: str, *, force: bool = False) -> None:
         if not hasattr(self, "eta_var"):
             return
+        if not force and self._is_gpu_eta_override_active():
+            return
         try:
-            formatted = self._format_eta_string(seconds, prefix=prefix)
-        except Exception:
-            formatted = self._tr("initial_eta_value", "--:--:--")
-        try:
-            self.eta_var.set(formatted)
+            self.eta_var.set(text)
         except tk.TclError:
             pass
+
+    def _set_eta_label_from_seconds(self, seconds: float, *, prefix: str = "") -> None:
+        formatted = format_eta_hms(seconds, prefix=prefix)
+        self._set_eta_label(formatted, force=True)
+
+    def _set_phase_label_text(self, text: str) -> None:
+        if not hasattr(self, "phase_var") or not self.phase_var:
+            return
+        setter = getattr(self.phase_var, "set", None)
+        if not callable(setter):
+            return
+        try:
+            setter(text)
+        except tk.TclError:
+            pass
+
+    def _update_eta_from_progress(self, global_progress: float) -> None:
+        if self._eta_calc is None or self._is_eta_override_active():
+            return
+        try:
+            bounded = max(0.0, min(100.0, float(global_progress)))
+        except Exception:
+            return
+        try:
+            self._eta_calc.update(int(bounded))
+        except Exception:
+            return
+        eta_seconds = self._eta_calc.get_eta_seconds()
+        if eta_seconds is None:
+            return
+        if self._eta_seconds_smoothed is None:
+            smoothed = eta_seconds
+        else:
+            smoothed = (0.3 * eta_seconds) + (0.7 * self._eta_seconds_smoothed)
+        self._eta_seconds_smoothed = smoothed
+        eta_str = format_eta_hms(smoothed)
+        self._set_eta_label(eta_str)
 
     def _start_gpu_eta_override(self, seconds: float, helper_name: str) -> None:
         try:
@@ -3643,23 +3688,7 @@ class ZeMosaicGUI:
                 self.progress_bar_var.set(percent)
             except tk.TclError:
                 pass
-            steps = timings.get("steps") or []
-            if steps and total_val:
-                avg = sum(steps) / len(steps)
-                remaining_steps = max(0, total_val - current_val)
-                remaining = max(0.0, remaining_steps * avg)
-                if self._eta_seconds_smoothed is None:
-                    smoothed_remaining = remaining
-                else:
-                    alpha = 0.3
-                    smoothed_remaining = (alpha * remaining) + ((1 - alpha) * self._eta_seconds_smoothed)
-                self._eta_seconds_smoothed = smoothed_remaining
-                eta_h, eta_rem = divmod(int(smoothed_remaining + 0.5), 3600)
-                eta_m, eta_s = divmod(eta_rem, 60)
-                try:
-                    self.eta_var.set(f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}")
-                except tk.TclError:
-                    pass
+            self._update_eta_from_progress(percent)
             return
 
         self._stage_totals[stage_key] = total_val
@@ -3694,34 +3723,89 @@ class ZeMosaicGUI:
         except tk.TclError:
             pass
 
+        self._update_eta_from_progress(global_progress)
         if global_progress >= 99.9:
             self._eta_seconds_smoothed = 0.0
-            try:
-                self.eta_var.set("00:00:00")
-            except tk.TclError:
-                pass
+            self._set_eta_label("00:00:00", force=True)
             return
 
-        elapsed = now - self._progress_start_time if self._progress_start_time is not None else 0.0
-        eta_seconds = None
-        if global_progress > 0.0 and elapsed >= 0.0:
-            fraction_complete = max(1e-6, global_progress / 100.0)
-            estimated_total = elapsed / fraction_complete
-            eta_seconds = max(0.0, estimated_total - elapsed)
+    def _format_sds_phase_label(self, done: int, total: int) -> str:
+        try:
+            done_val = int(done)
+        except (TypeError, ValueError):
+            done_val = 0
+        try:
+            total_val = int(total)
+        except (TypeError, ValueError):
+            total_val = 0
+        if total_val <= 0:
+            total_for_display = max(done_val, 0)
+        else:
+            total_for_display = total_val
+        fallback_text = self._tr(
+            "p4_global_coadd_progress",
+            "P4 - Mosaic-First global coadd progress: {done}/{total} image(s) processed.",
+            done=done_val,
+            total=total_for_display,
+        )
+        display = self._tr(
+            "p4_global_coadd_phase_label",
+            fallback_text,
+            done=done_val,
+            total=total_for_display,
+        )
+        if ":" in display:
+            display = display.split(":", 1)[0]
+        display = display.strip()
+        if display:
+            return display
+        return self._tr(
+            "phase_display_format",
+            "P{num} - {name}",
+            num=4,
+            name=self._tr("phase_name_4", "Grid"),
+        )
 
-        if eta_seconds is not None:
-            if self._eta_seconds_smoothed is None:
-                smoothed = eta_seconds
-            else:
-                alpha = 0.3
-                smoothed = (alpha * eta_seconds) + ((1 - alpha) * self._eta_seconds_smoothed)
-            self._eta_seconds_smoothed = smoothed
-            eta_h, eta_rem = divmod(int(smoothed + 0.5), 3600)
-            eta_m, eta_s = divmod(eta_rem, 60)
-            try:
-                self.eta_var.set(f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}")
-            except tk.TclError:
-                pass
+    def _handle_sds_global_coadd_progress(self, payload: MutableMapping[str, Any]) -> None:
+        if not isinstance(payload, MutableMapping):
+            return
+        try:
+            total_val = int(payload.get("total", 0))
+        except (TypeError, ValueError):
+            total_val = 0
+        if total_val <= 0:
+            return
+        try:
+            done_val = int(payload.get("done", 0))
+        except (TypeError, ValueError):
+            done_val = 0
+        done_val = max(0, min(done_val, total_val))
+        self._sds_phase_total = total_val
+        self._sds_phase_done = done_val
+        self._sds_phase_active = True
+        self.on_worker_progress("phase4_grid", done_val, total_val)
+        label = self._format_sds_phase_label(done_val, total_val)
+        self._set_phase_label_text(label)
+
+    def _handle_sds_global_coadd_finished(self, payload: MutableMapping[str, Any]) -> None:
+        if not isinstance(payload, MutableMapping):
+            payload = {}
+        total_val = self._sds_phase_total
+        try:
+            images_val = int(payload.get("images", 0))
+        except (TypeError, ValueError):
+            images_val = 0
+        if total_val <= 0:
+            total_val = max(images_val, self._sds_phase_done)
+        if total_val <= 0:
+            self._sds_phase_active = False
+            return
+        self._sds_phase_total = total_val
+        self._sds_phase_done = total_val
+        self.on_worker_progress("phase4_grid", total_val, total_val)
+        label = self._format_sds_phase_label(total_val, total_val)
+        self._set_phase_label_text(label)
+        self._sds_phase_active = False
         
 
 
@@ -4154,10 +4238,15 @@ class ZeMosaicGUI:
         self._last_global_progress = 0.0
         self._progress_start_time = None
         self._eta_seconds_smoothed = None
+        self._eta_calc = ETACalculator(total_items=100)
+        self._cpu_eta_override_deadline = None
         self._stage_times.clear()
         self._stage_totals.clear()
         for key in self._stage_order:
             self._stage_progress_values[key] = 0.0
+        self._sds_phase_active = False
+        self._sds_phase_done = 0
+        self._sds_phase_total = 0
         self._stop_gpu_eta_override()
         self._gpu_helper_active = None
         try:
@@ -4537,6 +4626,10 @@ class ZeMosaicGUI:
                     self._phase45_handle_group_result(kwargs)
                 elif msg_key == "p45_finished":
                     self._phase45_handle_finish()
+                if msg_key == "p4_global_coadd_progress":
+                    self._handle_sds_global_coadd_progress(kwargs)
+                elif msg_key == "p4_global_coadd_finished":
+                    self._handle_sds_global_coadd_finished(kwargs)
                 self._log_message(msg_key, prog, lvl, **kwargs)
                 # Time-slice: avoid monopolizing Tk thread
                 if time.monotonic() - start_time > 0.03:
@@ -4553,6 +4646,12 @@ class ZeMosaicGUI:
         # Finalize according to run outcome (completed or user-cancelled)
         self._stop_gpu_eta_override()
         self._gpu_helper_active = None
+        self._eta_calc = None
+        self._eta_seconds_smoothed = None
+        self._cpu_eta_override_deadline = None
+        self._sds_phase_active = False
+        self._sds_phase_done = 0
+        self._sds_phase_total = 0
         self._log_message("CHRONO_STOP_REQUEST", None, "CHRONO_LEVEL")
         self.is_processing = False
         if hasattr(self, 'launch_button') and self.launch_button.winfo_exists():

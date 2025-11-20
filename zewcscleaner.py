@@ -49,11 +49,14 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
 from pathlib import Path
+import math
 
 try:
     from astropy.io import fits
+    from astropy.wcs import WCS
+    from astropy.wcs.utils import proj_plane_pixel_scales
 except Exception as exc:
-    print("This tool requires astropy. Install with: pip install astropy")
+    print("This tool requires astropy (io,fits,wcs). Install with: pip install astropy")
     raise
 
 WCS_PREFIXES = (
@@ -110,6 +113,109 @@ def clean_wcs_header_inplace(hdr) -> int:
         except Exception:
             pass
     return deleted
+
+
+def _summarize_wcs_header(hdr):
+    """Return a small WCS summary dict for sanity checks."""
+
+    summary = {
+        "ra_deg": None,
+        "dec_deg": None,
+        "scale_deg": None,
+        "scale_arcsec": None,
+        "width": None,
+        "height": None,
+        "error": None,
+    }
+
+    # Basic geometry from header, if present
+    try:
+        naxis1 = hdr.get("NAXIS1")
+        naxis2 = hdr.get("NAXIS2")
+        summary["width"] = int(naxis1) if naxis1 is not None else None
+        summary["height"] = int(naxis2) if naxis2 is not None else None
+    except Exception:
+        summary["width"] = None
+        summary["height"] = None
+
+    # RA/DEC from CRVAL as a first guess
+    try:
+        ra = hdr.get("CRVAL1")
+        dec = hdr.get("CRVAL2")
+        if ra is not None:
+            summary["ra_deg"] = float(ra)
+        if dec is not None:
+            summary["dec_deg"] = float(dec)
+    except Exception:
+        pass
+
+    # Try to build a WCS object to refine RA/DEC and estimate pixel scale
+    if "WCS" in globals() and WCS is not None:
+        try:
+            w = WCS(hdr)
+            if getattr(w, "is_celestial", False):
+                if summary["ra_deg"] is None or summary["dec_deg"] is None:
+                    try:
+                        crval = w.wcs.crval
+                        if len(crval) >= 2:
+                            summary["ra_deg"] = float(crval[0])
+                            summary["dec_deg"] = float(crval[1])
+                    except Exception:
+                        pass
+                scale_deg = None
+                if "proj_plane_pixel_scales" in globals() and proj_plane_pixel_scales is not None:
+                    try:
+                        scales = proj_plane_pixel_scales(w)
+                        if scales is not None and len(scales) >= 2:
+                            vals = [abs(float(scales[0])), abs(float(scales[1]))]
+                            vals = [v for v in vals if math.isfinite(v) and v > 0]
+                            if vals:
+                                scale_deg = sum(vals) / len(vals)
+                    except Exception:
+                        scale_deg = None
+                if scale_deg is None:
+                    # Fallback: approximate from CD matrix if present
+                    try:
+                        cd11 = float(hdr.get("CD1_1"))
+                        cd12 = float(hdr.get("CD1_2"))
+                        cd21 = float(hdr.get("CD2_1"))
+                        cd22 = float(hdr.get("CD2_2"))
+                        col0_n = math.hypot(cd11, cd21)
+                        col1_n = math.hypot(cd12, cd22)
+                        vals = [v for v in (col0_n, col1_n) if math.isfinite(v) and v > 0]
+                        if vals:
+                            scale_deg = sum(vals) / len(vals)
+                    except Exception:
+                        scale_deg = None
+                if scale_deg is not None:
+                    summary["scale_deg"] = scale_deg
+                    summary["scale_arcsec"] = scale_deg * 3600.0
+        except Exception as exc:
+            summary["error"] = str(exc)
+
+    return summary
+
+
+def _angular_separation_deg(ra1_deg, dec1_deg, ra2_deg, dec2_deg) -> float:
+    """Return great-circle separation in degrees between two sky positions."""
+
+    try:
+        r1 = math.radians(float(ra1_deg))
+        d1 = math.radians(float(dec1_deg))
+        r2 = math.radians(float(ra2_deg))
+        d2 = math.radians(float(dec2_deg))
+    except Exception:
+        return float("nan")
+    cos_sep = (
+        math.sin(d1) * math.sin(d2)
+        + math.cos(d1) * math.cos(d2) * math.cos(r1 - r2)
+    )
+    cos_sep = max(-1.0, min(1.0, cos_sep))
+    try:
+        return math.degrees(math.acos(cos_sep))
+    except Exception:
+        return float("nan")
+
 
 def process_fits(
     path: str | Path,
@@ -213,6 +319,7 @@ class App(tk.Tk):
         self.progress = ttk.Progressbar(bottom, orient="horizontal", mode="determinate")
         self.progress.pack(fill="x", expand=True, side="left")
         ttk.Button(bottom, text="Scan selection", command=self.scan_selection).pack(side="left", padx=(8,0))
+        ttk.Button(bottom, text="Sanity-check WCS", command=self.check_wcs_sanity).pack(side="left", padx=(8,0))
         ttk.Button(bottom, text="Clean selection", command=self.clean_selection).pack(side="left", padx=(8,0))
 
         logf = ttk.LabelFrame(self, text="Log", padding=6)
@@ -279,6 +386,125 @@ class App(tk.Tk):
             vals = self.tree.item(iid, "values")
             if not vals: continue
             yield iid, vals[0]
+
+    def check_wcs_sanity(self):
+        """Check basic WCS consistency across the selected files."""
+        targets = list(self._iter_selected_rows())
+        if not targets:
+            messagebox.showinfo("Sanity check", "Nothing to check.")
+            return
+
+        if "WCS" not in globals() or WCS is None:
+            messagebox.showerror(
+                "Sanity check",
+                "Astropy WCS is not available; cannot perform sanity check.",
+            )
+            return
+
+        self.progress.configure(maximum=len(targets), value=0)
+        summaries = []
+
+        for i, (iid, path) in enumerate(targets, 1):
+            path_obj = Path(path)
+            try:
+                with fits.open(path_obj, memmap=False) as hdul:
+                    hdr = None
+                    for h in range(len(hdul)):
+                        if header_has_wcs(hdul[h].header):
+                            hdr = hdul[h].header
+                            break
+                    if hdr is None:
+                        self.tree.item(iid, values=(path, "NO-WCS", "", ""))
+                        self._log(f"[SANITY] {path_obj}: no WCS found in any HDU.")
+                        continue
+                    summary = _summarize_wcs_header(hdr)
+                    ra = summary.get("ra_deg")
+                    dec = summary.get("dec_deg")
+                    if ra is None or dec is None:
+                        self.tree.item(iid, values=(path, "BAD-WCS", "", ""))
+                        self._log(f"[SANITY] {path_obj}: unable to read WCS center (CRVAL1/2).")
+                        continue
+                    summary["iid"] = iid
+                    summary["path"] = path
+                    summaries.append(summary)
+            except Exception as exc:
+                self.tree.item(iid, values=(path, "ERROR", "", ""))
+                self._log(f"[SANITY][ERROR] {path_obj}: {exc}")
+            self.progress["value"] = i
+            self.update_idletasks()
+
+        if not summaries:
+            self._log("[SANITY] No valid WCS entries to analyze.")
+            return
+
+        # Compute simple cluster statistics
+        ra_vals = [s["ra_deg"] for s in summaries if isinstance(s.get("ra_deg"), (int, float))]
+        dec_vals = [s["dec_deg"] for s in summaries if isinstance(s.get("dec_deg"), (int, float))]
+        scale_vals = [
+            s["scale_arcsec"]
+            for s in summaries
+            if isinstance(s.get("scale_arcsec"), (int, float)) and s["scale_arcsec"] > 0
+        ]
+
+        ra_ref = sum(ra_vals) / len(ra_vals) if ra_vals else None
+        dec_ref = sum(dec_vals) / len(dec_vals) if dec_vals else None
+
+        scale_median = None
+        if scale_vals:
+            sorted_scales = sorted(scale_vals)
+            mid = len(sorted_scales) // 2
+            if len(sorted_scales) % 2:
+                scale_median = sorted_scales[mid]
+            else:
+                scale_median = 0.5 * (sorted_scales[mid - 1] + sorted_scales[mid])
+
+        max_sep_allowed = 5.0      # degrees between centers
+        max_scale_rel_diff = 0.10  # 10% difference in pixel scale
+
+        outliers = 0
+        for s in summaries:
+            reasons = []
+            ra = s.get("ra_deg")
+            dec = s.get("dec_deg")
+            sep = None
+            if ra_ref is not None and dec_ref is not None and ra is not None and dec is not None:
+                sep = _angular_separation_deg(ra_ref, dec_ref, ra, dec)
+                if sep is not None and math.isfinite(sep) and sep > max_sep_allowed:
+                    reasons.append(f"center_separation={sep:.2f}deg")
+            scale = s.get("scale_arcsec")
+            if scale_median is not None and isinstance(scale, (int, float)) and scale > 0:
+                rel = abs(scale - scale_median) / scale_median
+                if rel > max_scale_rel_diff:
+                    reasons.append(f"scale_delta={rel*100:.1f}%")
+
+            if reasons:
+                status = "WCS: OUTLIER"
+                outliers += 1
+            else:
+                status = "WCS: OK"
+
+            self.tree.item(s["iid"], values=(s["path"], status, "", ""))
+            scale_txt = f"{s['scale_arcsec']:.3f}\"/px" if isinstance(s.get("scale_arcsec"), (int, float)) else "n/a"
+            if sep is not None and math.isfinite(sep):
+                self._log(
+                    f"[SANITY] {s['path']}: {status} "
+                    f"(RA={s['ra_deg']:.6f}°, DEC={s['dec_deg']:.6f}°, "
+                    f"scale={scale_txt}, sep={sep:.3f}°, "
+                    f"{', '.join(reasons) if reasons else 'within thresholds'})"
+                )
+            else:
+                self._log(
+                    f"[SANITY] {s['path']}: {status} "
+                    f"(RA={s['ra_deg']:.6f}°, DEC={s['dec_deg']:.6f}°, "
+                    f"scale={scale_txt}, "
+                    f"{', '.join(reasons) if reasons else 'within thresholds'})"
+                )
+
+        if ra_ref is not None and dec_ref is not None:
+            self._log(f"[SANITY] Reference center ≈ RA={ra_ref:.6f}°, DEC={dec_ref:.6f}°.")
+        if scale_median is not None:
+            self._log(f"[SANITY] Median pixel scale ≈ {scale_median:.3f}\"/px.")
+        self._log(f"[SANITY] Done. {outliers} / {len(summaries)} WCS flagged as outliers.")
 
     def scan_selection(self):
         # Update status with YES/NO for WCS presence

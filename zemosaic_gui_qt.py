@@ -72,9 +72,12 @@ from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Sequence
 
 try:  # pragma: no cover - optional dependency guard
     from zemosaic_utils import get_app_base_dir  # type: ignore
+    from zemosaic_time_utils import ETACalculator, format_eta_hms
 except Exception:  # pragma: no cover - fallback when utils missing
     def get_app_base_dir() -> Path:  # type: ignore
         return Path(__file__).resolve().parent
+
+CPU_HELPER_OVERRIDE_TTL = 5.0
 
 try:
     from PySide6.QtCore import QObject, QThread, QTimer, Qt, Signal, QByteArray
@@ -356,6 +359,7 @@ class ZeMosaicQtWorker(QObject):
         self._last_error: str = ""
         self._finished_emitted = False
         self._cancelled = False
+        self._sds_stage_total = 0
 
     # ------------------------------------------------------------------
     # Lifecycle management
@@ -423,6 +427,7 @@ class ZeMosaicQtWorker(QObject):
         self._last_error = ""
         self._finished_emitted = False
         self._cancelled = False
+        self._sds_stage_total = 0
 
         listener_thread = QThread()
         listener = _WorkerQueueListener(
@@ -510,6 +515,11 @@ class ZeMosaicQtWorker(QObject):
             self.stage_progress.emit(stage_name, current_val, total_val)
             return
 
+        if isinstance(msg_key, str) and msg_key.startswith("PHASE_UPDATE:"):
+            phase_id = msg_key.split(":", 1)[1].strip() if ":" in msg_key else ""
+            self.phase_changed.emit("PHASE_UPDATE", {"phase_id": phase_id})
+            return
+
         if msg_key == "PROCESS_ERROR":
             error_text = str(kwargs.get("error") or prog or "")
             self._had_error = True
@@ -532,6 +542,10 @@ class ZeMosaicQtWorker(QObject):
 
         # High-priority control and counter messages mirrored from Tk GUI.
         if isinstance(msg_key, str):
+            if msg_key == "p4_global_coadd_progress":
+                self._handle_sds_phase_progress(kwargs)
+            elif msg_key == "p4_global_coadd_finished":
+                self._handle_sds_phase_finish(kwargs)
             if msg_key.startswith("ETA_UPDATE:"):
                 eta_str = msg_key.split(":", 1)[1].strip() if ":" in msg_key else ""
                 self.eta_updated.emit(eta_str)
@@ -639,6 +653,53 @@ class ZeMosaicQtWorker(QObject):
         else:
             message_key_or_raw = self._stringify_message(msg_key, prog, payload)
         self.log_message_emitted.emit(level, message_key_or_raw, payload)
+
+    def _handle_sds_phase_progress(self, payload: Dict[str, Any]) -> None:
+        if not isinstance(payload, dict):
+            return
+        try:
+            total_val = int(payload.get("total", 0))
+        except (TypeError, ValueError):
+            total_val = 0
+        if total_val <= 0:
+            return
+        try:
+            done_val = int(payload.get("done", 0))
+        except (TypeError, ValueError):
+            done_val = 0
+        done_val = max(0, min(done_val, total_val))
+        self._sds_stage_total = total_val
+        percent = (done_val / float(total_val)) * 100.0 if total_val else 0.0
+        percent = max(0.0, min(100.0, percent))
+        phase_payload: Dict[str, Any] = {
+            "current": done_val,
+            "total": total_val,
+            "sds_phase": True,
+        }
+        self.progress_changed.emit(percent)
+        self.phase_changed.emit("phase4_grid", phase_payload)
+        self.stage_progress.emit("phase4_grid", done_val, total_val)
+
+    def _handle_sds_phase_finish(self, payload: Dict[str, Any]) -> None:
+        payload_dict = payload if isinstance(payload, dict) else {}
+        total_val = self._sds_stage_total
+        if total_val <= 0:
+            try:
+                total_val = int(payload_dict.get("images", 0))
+            except (TypeError, ValueError):
+                total_val = 0
+        if total_val <= 0:
+            return
+        self._sds_stage_total = 0
+        phase_payload: Dict[str, Any] = {
+            "current": total_val,
+            "total": total_val,
+            "sds_phase": True,
+            "sds_final": True,
+        }
+        self.progress_changed.emit(100.0)
+        self.phase_changed.emit("phase4_grid", phase_payload)
+        self.stage_progress.emit("phase4_grid", total_val, total_val)
 
     def _on_listener_finished(self) -> None:
         success = not self._had_error and not self._stop_requested and not self._cancelled
@@ -818,7 +879,12 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._progress_start_time: float | None = None
         self._last_global_progress: float = 0.0
         self._eta_seconds_smoothed: float | None = None
+        self._eta_calc: ETACalculator | None = None
+        self._cpu_eta_override_deadline: float | None = None
         self._weighted_progress_active = False
+        self._sds_phase_active = False
+        self._sds_phase_done = 0
+        self._sds_phase_total = 0
 
         self._gpu_eta_override: Dict[str, Any] | None = None
         self._gpu_helper_active: Dict[str, Any] | None = None
@@ -2072,6 +2138,47 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "widget": combine_combo,
             "type": str,
             "value_getter": combine_combo.currentData,
+        }
+
+        # Global mosaic coadd method (Phase 4)
+        global_coadd_combo = QComboBox(group)
+        global_coadd_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        global_coadd_options = [
+            ("kappa_sigma", self._tr("global_coadd_method_kappa_sigma", "Global coadd: Kappa-Sigma")),
+            ("winsorized", self._tr("global_coadd_method_winsorized", "Global coadd: Winsorized")),
+            ("mean", self._tr("global_coadd_method_mean", "Global coadd: Mean")),
+            ("median", self._tr("global_coadd_method_median", "Global coadd: Median")),
+        ]
+        for value, label in global_coadd_options:
+            global_coadd_combo.addItem(label, value)
+        current_global_coadd = (
+            str(self.config.get("global_coadd_method", "kappa_sigma") or "kappa_sigma")
+            .strip()
+            .lower()
+        )
+        global_coadd_index = next(
+            (
+                idx
+                for idx, (value, _label) in enumerate(global_coadd_options)
+                if value == current_global_coadd
+            ),
+            0,
+        )
+        global_coadd_combo.setCurrentIndex(global_coadd_index)
+        layout.addRow(
+            QLabel(
+                self._tr(
+                    "global_coadd_method_label",
+                    "Global mosaic coadd method:",
+                )
+            ),
+            global_coadd_combo,
+        )
+        self._config_fields["global_coadd_method"] = {
+            "kind": "combobox",
+            "widget": global_coadd_combo,
+            "type": str,
+            "value_getter": global_coadd_combo.currentData,
         }
 
         self._register_checkbox(
@@ -3832,6 +3939,18 @@ class ZeMosaicQtMainWindow(QMainWindow):
     def _is_gpu_eta_override_active(self) -> bool:
         return bool(self._gpu_eta_override)
 
+    def _is_cpu_eta_override_active(self) -> bool:
+        deadline = self._cpu_eta_override_deadline
+        if not deadline:
+            return False
+        if time.monotonic() >= deadline:
+            self._cpu_eta_override_deadline = None
+            return False
+        return True
+
+    def _is_eta_override_active(self) -> bool:
+        return self._is_gpu_eta_override_active() or self._is_cpu_eta_override_active()
+
     def _set_eta_display(self, text: str, *, force: bool = False) -> None:
         label = getattr(self, "eta_value_label", None)
         if label is None:
@@ -3840,25 +3959,30 @@ class ZeMosaicQtMainWindow(QMainWindow):
             return
         label.setText(text)
 
-    def _format_eta_string(self, seconds: float, *, prefix: str = "") -> str:
-        try:
-            total = float(seconds)
-        except Exception:
-            total = 0.0
-        prefix_value = prefix
-        if total < 0:
-            prefix_value = prefix_value or "+"
-            total = abs(total)
-        eta_h, eta_rem = divmod(int(total + 0.5), 3600)
-        eta_m, eta_s = divmod(eta_rem, 60)
-        return f"{prefix_value}{eta_h:02d}:{eta_m:02d}:{eta_s:02d}"
-
     def _set_eta_label_from_seconds(self, seconds: float, *, prefix: str = "") -> None:
-        try:
-            formatted = self._format_eta_string(seconds, prefix=prefix)
-        except Exception:
-            formatted = self._tr("qt_progress_placeholder", "—")
+        formatted = format_eta_hms(seconds, prefix=prefix)
         self._set_eta_display(formatted, force=True)
+
+    def _update_eta_from_progress(self, global_progress: float) -> None:
+        if self._eta_calc is None or self._is_eta_override_active():
+            return
+        try:
+            bounded = max(0.0, min(100.0, float(global_progress)))
+        except Exception:
+            return
+        try:
+            self._eta_calc.update(int(bounded))
+        except Exception:
+            return
+        eta_seconds = self._eta_calc.get_eta_seconds()
+        if eta_seconds is None:
+            return
+        if self._eta_seconds_smoothed is None:
+            smoothed = eta_seconds
+        else:
+            smoothed = (0.3 * eta_seconds) + (0.7 * float(self._eta_seconds_smoothed))
+        self._eta_seconds_smoothed = smoothed
+        self._set_eta_display(format_eta_hms(smoothed))
 
     def _start_gpu_eta_override(self, seconds: float, helper_name: str) -> None:
         try:
@@ -4339,13 +4463,21 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._progress_start_time = None
         self._last_global_progress = 0.0
         self._eta_seconds_smoothed = None
+        self._cpu_eta_override_deadline = None
         self._weighted_progress_active = False
+        self._sds_phase_active = False
+        self._sds_phase_done = 0
+        self._sds_phase_total = 0
 
     def _set_processing_state(self, running: bool) -> None:
         self._stop_gpu_eta_override()
         self._gpu_helper_active = None
         if running:
             self._reset_progress_tracking()
+        else:
+            self._eta_calc = None
+            self._eta_seconds_smoothed = None
+            self._cpu_eta_override_deadline = None
         self.start_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
         self.filter_button.setEnabled(not running)
@@ -4467,12 +4599,15 @@ class ZeMosaicQtMainWindow(QMainWindow):
         bounded = int(max(0.0, min(100.0, percent)))
         self._last_global_progress = float(bounded)
         self.progress_bar.setValue(bounded)
+        self._update_eta_from_progress(float(bounded))
         if bounded >= 100:
-            self._set_eta_display("00:00:00")
+            self._eta_seconds_smoothed = 0.0
+            self._set_eta_display("00:00:00", force=True)
 
     def _on_worker_stage_progress(self, stage: str, current: int, total: int) -> None:
-        stage_label = self._format_stage_name(stage)
-        self.phase_value_label.setText(stage_label)
+        if not (self._sds_phase_active and stage == "phase4_grid"):
+            stage_label = self._format_stage_name(stage)
+            self.phase_value_label.setText(stage_label)
         self._update_stage_progress(stage, current, total)
 
     def _update_stage_progress(self, stage: str, current: int, total: int) -> None:
@@ -4535,23 +4670,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             percent = max(self._last_global_progress, percent)
             self._last_global_progress = percent
             self.progress_bar.setValue(int(percent))
-            steps = timings.get("steps") or []
-            if steps and total_val:
-                avg = sum(steps) / len(steps)
-                remaining_steps = max(0, total_val - current_val)
-                remaining = max(0.0, remaining_steps * avg)
-                if self._eta_seconds_smoothed is None:
-                    smoothed_remaining = remaining
-                else:
-                    alpha = 0.3
-                    smoothed_remaining = (
-                        alpha * remaining
-                        + (1 - alpha) * float(self._eta_seconds_smoothed)
-                    )
-                self._eta_seconds_smoothed = smoothed_remaining
-                eta_h, eta_rem = divmod(int(smoothed_remaining + 0.5), 3600)
-                eta_m, eta_s = divmod(eta_rem, 60)
-                self._set_eta_display(f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}")
+            self._update_eta_from_progress(percent)
             return
 
         if stage_key in self._stage_order:
@@ -4579,30 +4698,12 @@ class ZeMosaicQtMainWindow(QMainWindow):
         global_progress = max(self._last_global_progress, min(100.0, global_progress))
         self._last_global_progress = global_progress
         self.progress_bar.setValue(int(global_progress))
+        self._update_eta_from_progress(global_progress)
 
         if global_progress >= 99.9:
             self._eta_seconds_smoothed = 0.0
-            self._set_eta_display("00:00:00")
+            self._set_eta_display("00:00:00", force=True)
             return
-
-        if self._progress_start_time is None:
-            return
-        elapsed = now - self._progress_start_time
-        if global_progress > 0.0 and elapsed >= 0.0:
-            fraction_complete = max(1e-6, global_progress / 100.0)
-            estimated_total = elapsed / fraction_complete
-            eta_seconds = max(0.0, estimated_total - elapsed)
-            if self._eta_seconds_smoothed is None:
-                smoothed = eta_seconds
-            else:
-                alpha = 0.3
-                smoothed = (alpha * eta_seconds) + (
-                    (1 - alpha) * float(self._eta_seconds_smoothed)
-                )
-            self._eta_seconds_smoothed = smoothed
-            eta_h, eta_rem = divmod(int(smoothed + 0.5), 3600)
-            eta_m, eta_s = divmod(eta_rem, 60)
-            self._set_eta_display(f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}")
 
     def _on_worker_phase45_event(self, key: str, payload: Dict[str, Any], level: str) -> None:
         data = payload if isinstance(payload, dict) else {}
@@ -4630,10 +4731,34 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._phase45_log_translated(key, data, normalized_level)
 
     def _on_worker_phase_changed(self, stage: str, payload: Dict[str, Any]) -> None:
-        stage_label = self._format_stage_name(stage)
+        payload_dict = payload if isinstance(payload, dict) else {}
+        phase_id = payload_dict.get("phase_id")
+        if isinstance(phase_id, str):
+            normalized_id = phase_id.strip()
+            if self._sds_phase_active and normalized_id == "4":
+                return
+            stage_label = self._format_phase_display_from_id(normalized_id)
+            self.phase_value_label.setText(stage_label)
+            return
+
+        sds_phase = bool(payload_dict.get("sds_phase"))
+        if sds_phase:
+            current_val = payload_dict.get("current")
+            total_val = payload_dict.get("total")
+            if isinstance(current_val, int):
+                self._sds_phase_done = current_val
+            if isinstance(total_val, int):
+                self._sds_phase_total = total_val
+            self._sds_phase_active = not payload_dict.get("sds_final", False)
+            stage_label = self._format_sds_phase_label(current_val, total_val)
+        else:
+            if stage == "phase4_grid":
+                self._sds_phase_active = False
+            stage_label = self._format_stage_name(stage)
         self.phase_value_label.setText(stage_label)
-        current = payload.get("current") if isinstance(payload, dict) else None
-        total = payload.get("total") if isinstance(payload, dict) else None
+
+        current = payload_dict.get("current")
+        total = payload_dict.get("total")
         if isinstance(current, int) and isinstance(total, int) and total > 0:
             self.tiles_value_label.setText(f"{current} / {total}")
 
@@ -4652,13 +4777,12 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self.tiles_value_label.setText(f"{tiles_done} / {tiles_total}")
         eta_seconds = payload.get("eta_seconds")
         if isinstance(eta_seconds, (int, float)) and eta_seconds >= 0:
-            eta_h, eta_rem = divmod(int(eta_seconds + 0.5), 3600)
-            eta_m, eta_s = divmod(eta_rem, 60)
-            self._set_eta_display(f"{eta_h:02d}:{eta_m:02d}:{eta_s:02d}")
+            self._set_eta_display(format_eta_hms(eta_seconds))
 
     def _on_worker_eta_updated(self, eta_text: str) -> None:
         if not isinstance(eta_text, str):
             return
+        self._cpu_eta_override_deadline = time.monotonic() + CPU_HELPER_OVERRIDE_TTL
         text = eta_text.strip()
         if not text:
             placeholder = self._tr("qt_progress_placeholder", "—")
@@ -4829,6 +4953,50 @@ class ZeMosaicQtMainWindow(QMainWindow):
     def resizeEvent(self, event: QResizeEvent) -> None:  # type: ignore[override]
         super().resizeEvent(event)
         self._redraw_phase45_overlay()
+
+    def _format_phase_display_from_id(self, phase_id: str) -> str:
+        normalized = (phase_id or "").strip()
+        if not normalized:
+            return self._tr("qt_progress_placeholder", "Idle")
+        template = self._tr("phase_display_format", "P{num} - {name}")
+        if normalized.isdigit():
+            phase_num = int(normalized)
+            phase_name = self._tr(f"phase_name_{phase_num}", normalized)
+            return template.format(num=phase_num, name=phase_name)
+        normalized_key = normalized.replace(".", "_")
+        phase_name = self._tr(f"phase_name_{normalized_key}", normalized)
+        return template.format(num=normalized, name=phase_name)
+
+    def _format_sds_phase_label(self, done: Any, total: Any) -> str:
+        try:
+            done_val = int(done)
+        except (TypeError, ValueError):
+            done_val = 0
+        try:
+            total_val = int(total)
+        except (TypeError, ValueError):
+            total_val = 0
+        if total_val <= 0:
+            total_for_display = max(done_val, 0)
+        else:
+            total_for_display = total_val
+        base_text = self._tr(
+            "p4_global_coadd_progress",
+            "P4 - Mosaic-First global coadd progress: {done}/{total} image(s) processed.",
+        )
+        template = self._tr("p4_global_coadd_phase_label", base_text)
+        try:
+            formatted = template.format(done=done_val, total=total_for_display)
+        except Exception:
+            formatted = template
+        if ":" in formatted:
+            formatted = formatted.split(":", 1)[0]
+        formatted = formatted.strip()
+        if formatted:
+            return formatted
+        fallback_template = self._tr("phase_display_format", "P{num} - {name}")
+        fallback_name = self._tr("phase_name_4", "Grid")
+        return fallback_template.format(num=4, name=fallback_name)
 
     def _format_stage_name(self, stage: str) -> str:
         if not stage:
@@ -5284,6 +5452,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
             QMessageBox.critical(self, self._tr("qt_error_prepare_worker_title", "Worker preparation failed"), str(exc))
             return
 
+        self._eta_calc = ETACalculator(total_items=100)
+        self._eta_seconds_smoothed = None
+        self._cpu_eta_override_deadline = None
+
         self._begin_async_worker_start(worker_args, worker_kwargs)
 
     def _begin_async_worker_start(
@@ -5355,6 +5527,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self.start_button.setEnabled(True)
         self.filter_button.setEnabled(True)
         self.stop_button.setEnabled(False)
+        self._eta_calc = None
+        self._eta_seconds_smoothed = None
+        self._cpu_eta_override_deadline = None
         if error_message:
             log_template = self._tr(
                 "qt_log_start_worker_failure", "Failed to start worker: {error}"
