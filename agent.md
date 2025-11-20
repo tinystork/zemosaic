@@ -1,215 +1,194 @@
+# Agent — SDS Global Mosaic = Final Image (Phase 5 = Polish + Save)
 
-## `agent.md`
+## 1. Mission
 
-````markdown
-# AGENT MISSION FILE — SDS vs Classic Pipeline Flow (Option A)
+Refactor the SDS (Super-Deep Stacking / Mosaic-First) pipeline so that:
 
-You are an autonomous coding agent working on the **ZeMosaic / ZeSeestarStacker** project.
+- **When SDS is ON**:  
+  - The pipeline is strictly:
+    > `lights → mega-tiles → global super-stack = final mosaic`  
+    - Phase 5 no longer re-runs a full `reproject_and_coadd` over all mega-tiles.
+    - Phase 5 becomes a **polish + save** stage operating on the already-built global SDS mosaic.
+  - Low-coverage, noisy borders are **masked out** early (coverage-based threshold).
 
-The repository already contains (non-exhaustive):
+- **When SDS is OFF**:  
+  - Preserve the **historical behavior**:
+    > master tiles are built, Phase 3 & 5 work as before, with the standard `assemble_final_mosaic_reproject_coadd`.
+  - No regression, no change in visual results (aside from normal noise).
 
-- `run_zemosaic.py`
-- `zemosaic_gui.py`, `zemosaic_gui_qt.py`
-- `zemosaic_filter_gui.py`, `zemosaic_filter_gui_qt.py`
-- `zemosaic_worker.py`
-- `zemosaic_align_stack.py`
-- `zemosaic_utils.py`, `zemosaic_config.py`
-- `zequalityMT.py`, `lecropper.py`
-- `locales/en.json`, `locales/fr.json`
-- helper modules (`core/`, `locales/`, etc.)
-
-Your mission is to **restore and enforce the correct high-level pipeline architecture** depending on whether **SDS mode** (ZeSupaDupStack) is enabled or not, while preserving all existing optimizations and scalability (10 000+ frames) and **not breaking** the SDS batch policy already implemented.
+The main goal is to:
+- **keep the dense, well-covered core**,  
+- **drop very low-coverage “skirts” (mostly noise and seams)**,  
+- and **avoid redundant reproject+coadd passes** when SDS already produced a proper global mosaic.
 
 ---
 
-## 1. High-level behaviour (non-negotiable)
+## 2. Current situation (summary)
 
-### 1.1. When SDS is **OFF** (classic mode)
+Today, in SDS mode, the logs show something like:
 
-The worker **must** follow the classic master-tile pipeline:
+- `P4 - Mosaic-First global coadd finished (kappa_sigma) ... grid 3621×3333px, 6 image(s).`  
+  → SDS builds a **global mosaic from mega-tiles** using a Mosaic-First `reproject_and_coadd`.
+
+- Then, **Phase 5** still runs:
+  - `Phase 5: Final assembly (Reproject & Coadd)...`
+  - `run_info_phase5_finished_reproject_coadd ... shape: (...)`
+  → This is a **full reproject+coadd** over the tiles/mega-tiles again, as in the non-SDS pathway.
+
+- At save time, we see:
+  - `SAVE_DEBUG: Données image_data reçues - Shape: (3333, 2661, 3) ...`
+  → auto-crop + coverage logic is applied there.
+
+So the SDS idea is already present (mega-tiles + Mosaic-First coadd), but **Phase 5 remains too “heavy”** in SDS mode and still behaves like the generic pipeline.
+
+---
+
+## 3. Target behavior
+
+### 3.1 SDS ON
+
+Logical pipeline must be:
 
 ```text
-P1 — Astrometry / WCS
-P2 — Clustering / grouping
-P3 — Master Tiles stacking
-P4 — Grid / inter-master / final reprojection
-P5 — Final assembly, cleanup, save
+Lights (unit frames)
+  → SDS grouping / batch processing
+    → Mega-tiles (each = stack of unit frames on global WCS)
+      → Mosaic-First global coadd (super-stack of mega-tiles)
+        → Coverage-based masking / cropping
+          → Phase 5: polish (renorm/IBN, auto-crop, alpha, save) on the global mosaic
 ````
-
-This implies:
-
-* **Master tiles are ALWAYS built when SDS is OFF.**
-* The worker must **reach Phase 3** and run the master-tile stacking code as today.
-* No SDS-specific global mosaic assembly (`assemble_global_mosaic_sds`) or “Mosaic-First lights” (`assemble_global_mosaic_first`) must be used in this SDS-OFF case.
 
 Concretely:
 
-> If SDS is OFF, the **global WCS “seestar mosaic-first” “lights → global_coadd” path must NOT be used.**
-> The final mosaic must come from the **master-tile pipeline**, not from direct reprojection of raw lights.
+* After **Mosaic-First global coadd** in SDS:
 
-### 1.2. When SDS is **ON** (ZeSupaDupStack)
+  * Compute / normalize a **coverage map** `coverage_HW`:
 
-The worker **must** use the SDS mega-tiles pipeline:
+    * Either in [0, 1] (fraction of max contributions) or in “number of frames” + normalized variant.
+  * Apply a **minimum coverage threshold** `min_coverage_keep`:
 
-```text
-P1 — Astrometry / WCS
-P2 — Clustering / grouping
-P3 — (classic master tiles is skipped for SDS)
-P3bis — SDS mega-tiles: RAW lights → global WCS mega-tiles (per SDS batch)
-P4 — Stack mega-tiles (super-stack)
-P5 — Final post-processing (crop, Alt-Az cleanup, 2-pass coverage renorm, save)
-```
+    * Pixels below threshold:
 
-Operationally:
+      * `final_mosaic_data_HWC[...] = NaN`
+      * `final_coverage_HW[...] = 0.0`
+  * Expose these as:
 
-1. Use the Seestar global WCS plan as today.
-2. Build SDS batches (using the **existing SDS batch policy**:
+    * `final_mosaic_data_HWC` (float32, shape `(H, W, 3)` or `(H, W)` depending on channels)
+    * `final_coverage_HW` (float32, shape `(H, W)`)
 
-   * coverage threshold
-   * min batch size
-   * target batch size
-     already implemented in previous changes).
-3. For each SDS batch:
+* **Phase 5 in SDS mode**:
 
-   * reproject the **raw lights** of that batch into the global WCS
-   * run the “Mosaic-First-like” batch-local pipeline to produce **one mega-tile per batch**
-     (image H×W×C + coverage + alpha).
-4. Stack all mega-tiles together using `zemosaic_align_stack`, with coverage-based weighting, into:
+  * **Does NOT** call `assemble_final_mosaic_reproject_coadd` on the list of tiles/mega-tiles.
+  * Instead, Phase 5 takes:
 
-   * `final_mosaic_data_HWC`,
-   * `final_mosaic_coverage_HW`,
-   * `final_alpha_map`.
-5. Pass these to the existing Phase 5/6 code path:
+    * `final_mosaic_data_HWC`
+    * `final_coverage_HW`
+  * And applies:
 
-   * autocrop, lecropper, Alt-Az cleanup, two-pass coverage renorm, save, etc.
+    * global renorm / IBN (if enabled),
+    * coverage-based auto-crop (as today),
+    * alpha mask building (if applicable),
+    * FITS + coverage + preview export.
 
-Fallback behaviour when SDS is ON:
+### 3.2 SDS OFF
 
-* If `assemble_global_mosaic_sds(...)` fails (returns `(None, None, None)` or no batches):
+* Keep the **legacy behavior** unchanged:
 
-  * You may **fallback to `assemble_global_mosaic_first(...)`** as a secondary strategy.
-* If Mosaic-First also fails:
+  * Master tiles are built.
+  * Phase 3 / Phase 5 run the classic:
 
-  * Then, as a last resort, the worker may run the classic Phase 3 master-tile pipeline.
+    * `assemble_final_mosaic_reproject_coadd(...)`
+    * and associated coverage/alpha/crop logic.
+* This must preserve:
 
-But in the **normal SDS-ON case**, the result **must** come from SDS mega-tiles, not from classic master tiles.
+  * Historical stacking/coverage behavior.
+  * All existing options (including batch_size=0 / >1 semantics, GPU/CPU fallback, etc.).
 
 ---
 
-## 2. Scalability requirements (10 000+ frames)
+## 4. Scope of changes
 
-The project is explicitly designed to handle very large image sets (e.g. 10 000 frames or more). You **must not** introduce any change which:
+Likely impacted files (names based on current project structure):
 
-* Materializes a huge H×W×N cube of all frames in memory.
-* Turns any O(N) part of the pipeline into O(N²).
-* Breaks the existing chunking / streaming logic.
+* `zemosaic_worker.py` (or equivalent):
 
-You must:
+  * Orchestration of phases 1–7.
+  * SDS branching logic (SDS ON/OFF).
+  * Calls to:
 
-* Reuse the existing global mosaic / SDS implementation’s chunking and memory management.
-* Ensure all new logic operates on **indices / descriptors**, not raw data blobs.
-* Keep SDS batch building and mega-tile assembly linear in N and tile-size-agnostic.
+    * `assemble_global_mosaic_sds` / `assemble_global_mosaic_first`,
+    * `assemble_final_mosaic_reproject_coadd`,
+    * save functions (FITS, coverage, preview).
 
-Example:
+* `zemosaic_align_stack.py` (or similar):
 
-* If the user has 60 frames, they might end up with ~12 mega-tiles of 5 frames.
-* If the user has 10 000 frames, the same logic must still work, creating a reasonable number of batches, without exhausting memory, using the existing streaming approach.
+  * Implement or adjust:
 
----
+    * SDS global mosaic coadd,
+    * coverage computation/normalization,
+    * handling of `final_mosaic_data_HWC` + `final_coverage_HW`.
 
-## 3. Flow control rules in the worker
+* `zemosaic_config.py` / `solver_settings.py`:
 
-You will adjust the **flow control** in `zemosaic_worker.py` (most likely in `run_hierarchical_mosaic(...)` or equivalent orchestration function):
+  * New SDS-specific config parameter(s):
 
-### 3.1. Define / detect SDS mode flag
+    * `min_coverage_keep` (float in [0,1], default e.g. 0.4 or 0.5).
+    * Optionally: distinct `min_coverage_cropping` if needed.
 
-There is already a `sds_mode_flag` or equivalent boolean derived from:
+* Possibly: `zemosaic_filter_gui_qt.py` (optional, not mandatory in this mission):
 
-* user config,
-* Filter GUI overrides,
-* Seestar detection.
-
-You must reuse this flag; do not invent new ones.
-
-### 3.2. Required decisions
-
-**Case A — SDS OFF**
-
-* **Do NOT call `assemble_global_mosaic_sds`.**
-* **Do NOT call `assemble_global_mosaic_first`.**
-* Force the code so that:
-
-  * `final_mosaic_data_HWC` remains `None` after any global-WCS branch,
-  * causing the worker to fall through into the **classic Phase 3 master-tile pipeline**.
-
-**Case B — SDS ON**
-
-* Call `assemble_global_mosaic_sds(...)` as the **primary** strategy.
-* Only if SDS fails (no batches / returns None):
-
-  * fallback to `assemble_global_mosaic_first(...)`.
-* Only if both SDS and Mosaic-First fail:
-
-  * allow the classic Phase 3 master-tile pipeline as emergency fallback.
-
-### 3.3. Important: do NOT change SDS batch policy
-
-Previous work has implemented:
-
-* `sds_min_batch_size`
-* `sds_target_batch_size`
-* coverage-based SDS grouping both in Filter GUI Qt and worker.
-
-You must **not** modify this logic in this mission. Only adjust:
-
-* when SDS is used vs classic,
-* how we decide to enter or skip SDS / Mosaic-First / Phase 3.
+  * If you expose `min_coverage_keep` in GUI (advanced SDS options).
+  * This is a **nice-to-have**, not required for this mission.
 
 ---
 
-## 4. Logging & diagnostics
+## 5. Constraints & Non-goals
 
-You should preserve and/or slightly improve logging:
+* **Do not touch**:
 
-* When SDS is OFF and we commit to the classic master-tile path:
+  * Non-SDS stacking logic (historical pathway).
+  * `batch_size=0` vs `batch_size>1` behavior.
+  * GPU/CPU fallback logic and chunking.
+* Avoid:
 
-  * Log something like `"sds_off_classic_mastertile_pipeline"` (through the existing logging mechanism).
-* When SDS is ON and SDS mega-tiles is attempted:
+  * Changing existing default visual behavior when SDS is **OFF**.
+* Performance:
 
-  * `"sds_on_mega_tile_pipeline"`.
-* When SDS fails and we fallback to Mosaic-First:
+  * The new SDS path must remain streaming / memory-aware (no huge in-RAM copies unnecessarily).
 
-  * `"sds_failed_fallback_mosaic_first"`.
-* When both SDS and Mosaic-First fail and we fallback to Phase 3:
+Non-goals (for this mission):
 
-  * `"sds_and_mosaic_first_failed_fallback_mastertiles"`.
+* No change to:
 
-Any new log keys should follow the existing style but **do not require UI-visible localization** (they are primarily for logs).
+  * GUI layout / UX (beyond optional config binding).
+  * Solver / WCS solving behavior.
+  * Non-SDS photometric normalization algorithms (IBN, etc.).
 
 ---
 
-## 5. Non-goals (what you MUST NOT do)
+## 6. Success criteria
 
-* Do NOT change Tk GUIs.
-* Do NOT change the Qt Filter GUI behaviour, except where it injects SDS flags into worker overrides (only if necessary to align SDS ON/OFF).
-* Do NOT modify:
+* When SDS is **ON**:
 
-  * ZeQualityMT internals,
-  * lecropper logic,
-  * Alt-Az cleanup,
-  * Two-pass coverage renorm,
-  * Phase 4.5 / inter-master merge internals.
-* Do NOT change GPU / CPU logic or chunking.
-* Do NOT remove / rename existing configuration keys.
+  * Logs clearly show:
 
-Your work is strictly focused on **high-level flow control** in the worker to enforce:
+    * Construction of mega-tiles from unit frames.
+    * A global Mosaic-First coadd on mega-tiles.
+    * Phase 5 operating in **“polish only”** mode, not launching a full `reproject_and_coadd` again.
+  * The final FITS + coverage:
 
-> **SDS OFF → classic master tiles**
-> **SDS ON → mega-tiles from RAW lights + super-stack**
+    * Have low-coverage skirts removed (NaN / 0 coverage).
+    * Show reduced noise and fewer visible seams on borders.
 
-while preserving scalability and existing SDS batch policy.
+* When SDS is **OFF**:
+
+  * Logs remain identical (or very close) to the historical behavior.
+  * Final outputs remain visually consistent with previous versions.
+
+* Code:
+
+  * Clear branching on SDS ON/OFF at the worker/orchestration level.
+  * New coverage-threshold parameter is documented and has a safe default.
 
 ````
-
----
 

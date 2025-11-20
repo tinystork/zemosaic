@@ -3980,6 +3980,9 @@ def _cpu_stack_winsorized_fallback(
         else:
             w = np.asarray(weights, dtype=np.float32)
             # Normalize weight shape to broadcast over (N,H/W[,C])
+            if w.ndim >= 2 and w.shape[0] == arr.shape[0]:
+                if all(dim == 1 for dim in w.shape[1:]):
+                    w = w.reshape((w.shape[0],))
             if w.ndim == 1 and w.shape[0] == arr.shape[0]:
                 # reshape to (N,1,1[,1])
                 extra_dims = (1,) * (arr.ndim - 1)

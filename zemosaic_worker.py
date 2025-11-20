@@ -980,6 +980,54 @@ def _apply_phase5_post_stack_pipeline(
     return final_mosaic_data, final_mosaic_coverage, final_alpha_map
 
 
+def _mask_sds_low_coverage_pixels(
+    mosaic_hwc: np.ndarray | None,
+    coverage_hw: np.ndarray | None,
+    *,
+    min_keep_fraction: float,
+    target_hw: tuple[int, int] | None = None,
+) -> tuple[np.ndarray | None, np.ndarray | None, dict[str, float]]:
+    """Normalize coverage and mask low-coverage pixels for SDS mosaics."""
+
+    summary = {"max_cov": 0.0, "masked_pixels": 0}
+    if coverage_hw is None:
+        return mosaic_hwc, coverage_hw, summary
+    try:
+        coverage_arr = np.asarray(coverage_hw, dtype=np.float32, order="C")
+    except Exception:
+        return mosaic_hwc, coverage_hw, summary
+    if coverage_arr.ndim > 2:
+        coverage_arr = np.squeeze(coverage_arr)
+    if coverage_arr.ndim != 2 and target_hw:
+        try:
+            if coverage_arr.size == int(target_hw[0]) * int(target_hw[1]):
+                coverage_arr = coverage_arr.reshape(target_hw)
+        except Exception:
+            pass
+    if coverage_arr.ndim != 2:
+        return mosaic_hwc, coverage_arr, summary
+    coverage_arr = np.where(np.isfinite(coverage_arr), coverage_arr, 0.0)
+    max_cov = float(np.nanmax(coverage_arr)) if coverage_arr.size else 0.0
+    summary["max_cov"] = max_cov
+    frac = max(0.0, min(1.0, float(min_keep_fraction)))
+    if max_cov <= 0.0 or frac <= 0.0:
+        return mosaic_hwc, coverage_arr, summary
+    coverage_norm = coverage_arr / max_cov if max_cov > 0 else coverage_arr
+    lowcov_mask = coverage_norm < frac
+    masked_pixels = int(np.count_nonzero(lowcov_mask))
+    summary["masked_pixels"] = masked_pixels
+    if masked_pixels == 0:
+        return mosaic_hwc, coverage_arr, summary
+    coverage_arr = coverage_arr.copy()
+    coverage_arr[lowcov_mask] = 0.0
+    if mosaic_hwc is not None:
+        if mosaic_hwc.ndim == 3:
+            mosaic_hwc = np.where((~lowcov_mask)[..., None], mosaic_hwc, np.nan)
+        else:
+            mosaic_hwc = np.where(~lowcov_mask, mosaic_hwc, np.nan)
+    return mosaic_hwc, coverage_arr, summary
+
+
 _MASTER_TILE_ID_LOCK = Lock()
 _MASTER_TILE_ID_REGISTRY: dict[str, str] = {}
 
@@ -5642,6 +5690,339 @@ def _emit_gpu_info_summary(progress_callback, resource_info: dict) -> None:
         )
     except Exception:
         pass
+
+
+def _run_shared_phase45_phase5_pipeline(
+    master_tiles_results_list: list[tuple[str | None, Any]],
+    *,
+    final_output_wcs: Any,
+    final_output_shape_hw: tuple[int, int] | None,
+    temp_master_tile_storage_dir: str | None,
+    output_folder: str,
+    cache_retention_mode: str,
+    phase45_options: dict[str, Any],
+    phase5_options: dict[str, Any],
+    final_quality_pipeline_cfg: dict[str, Any],
+    start_time_total_run: float | None,
+    progress_callback: Callable | None,
+    pcb: Callable[..., None],
+    logger: logging.Logger,
+) -> tuple[
+    list[tuple[str | None, Any]],
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+    np.ndarray | None,
+    float,
+]:
+    """Shared helper that runs Phase 4.5 + Phase 5 on a list of tiles."""
+
+    master_tiles: list[tuple[str | None, Any]] = list(master_tiles_results_list or [])
+    base_progress_phase4_5 = float(phase45_options.get("base_progress") or 0.0)
+    progress_weight_phase4_5 = float(phase45_options.get("progress_weight") or 0.0)
+    phase45_active_flag = bool(phase45_options.get("enable"))
+
+    if phase45_active_flag:
+        pcb("PHASE_UPDATE:4.5", prog=None, lvl="ETA_LEVEL")
+        _log_memory_usage(progress_callback, "Début Phase 4.5 (Inter-Master merge)")
+        inter_cfg_phase45 = {
+            "enable": True,
+            "overlap_threshold": float(phase45_options.get("overlap_threshold", 0.60)),
+            "min_group_size": int(phase45_options.get("min_group_size", 2)),
+            "stack_method": str(phase45_options.get("stack_method", "winsorized_sigma_clip")).lower(),
+            "memmap_policy": str(phase45_options.get("memmap_policy", "auto")).lower(),
+            "local_scale": str(phase45_options.get("local_scale", "native")).lower(),
+            "max_group": int(phase45_options.get("max_group_size", 64)),
+        }
+        worker_cfg = phase45_options.get("worker_config") or {}
+        try:
+            photometry_clip_cfg = float(worker_cfg.get("inter_master_photometry_clip_sigma", 3.0))
+        except Exception:
+            photometry_clip_cfg = 3.0
+        if not math.isfinite(photometry_clip_cfg):
+            photometry_clip_cfg = 3.0
+        inter_cfg_phase45.update(
+            {
+                "photometry_intragroup": bool(worker_cfg.get("inter_master_photometry_intragroup", True)),
+                "photometry_intersuper": bool(worker_cfg.get("inter_master_photometry_intersuper", True)),
+                "photometry_clip_sigma": max(0.1, photometry_clip_cfg),
+            }
+        )
+        gain_clip_cfg = worker_cfg.get("two_pass_cov_gain_clip")
+        if isinstance(gain_clip_cfg, (list, tuple)) and len(gain_clip_cfg) >= 2:
+            try:
+                gmin = float(gain_clip_cfg[0])
+                gmax = float(gain_clip_cfg[1])
+                if math.isfinite(gmin) and math.isfinite(gmax):
+                    if gmin > gmax:
+                        gmin, gmax = gmax, gmin
+                    inter_cfg_phase45["two_pass_cov_gain_clip"] = (gmin, gmax)
+            except Exception:
+                pass
+        stack_cfg_phase45 = dict(phase45_options.get("stack_cfg") or {})
+        master_tiles = _run_phase4_5_inter_master_merge(
+            master_tiles,
+            final_output_wcs,
+            final_output_shape_hw,
+            temp_master_tile_storage_dir,
+            output_folder,
+            cache_retention_mode,
+            inter_cfg_phase45,
+            stack_cfg_phase45,
+            progress_callback,
+            pcb,
+        )
+        _log_memory_usage(progress_callback, "Fin Phase 4.5")
+
+    current_global_progress = base_progress_phase4_5 + progress_weight_phase4_5
+
+    base_progress_phase5 = float(phase5_options.get("base_progress") or current_global_progress)
+    progress_weight_phase5 = float(phase5_options.get("progress_weight") or 0.0)
+    USE_INCREMENTAL_ASSEMBLY = str(phase5_options.get("final_assembly_method") or "").lower() == "incremental"
+    apply_master_tile_crop_config = bool(phase5_options.get("apply_master_tile_crop"))
+    quality_crop_enabled_config = bool(phase5_options.get("quality_crop_enabled"))
+    apply_crop_for_assembly = bool(apply_master_tile_crop_config and not quality_crop_enabled_config)
+    master_tile_crop_percent_config = float(phase5_options.get("master_tile_crop_percent") or 0.0)
+    intertile_match_flag = bool(phase5_options.get("intertile_match_flag"))
+    match_background_flag = bool(phase5_options.get("match_background_flag"))
+    feather_parity_flag = bool(phase5_options.get("feather_parity_flag"))
+    two_pass_enabled = bool(phase5_options.get("two_pass_enabled"))
+    two_pass_sigma_px = int(phase5_options.get("two_pass_sigma_px") or 0)
+    gain_clip_tuple = phase5_options.get("two_pass_gain_clip")
+    two_pass_coverage_renorm_config = bool(phase5_options.get("two_pass_coverage_renorm"))
+    use_gpu_phase5_flag = bool(phase5_options.get("use_gpu_phase5"))
+    assembly_process_workers_config = int(phase5_options.get("assembly_process_workers") or 0)
+    intertile_preview_size_config = phase5_options.get("intertile_preview_size") or 512
+    intertile_overlap_min_config = phase5_options.get("intertile_overlap_min") or 0.05
+    intertile_sky_percentile_tuple = phase5_options.get("intertile_sky_percentile") or (30.0, 70.0)
+    intertile_robust_clip_sigma_config = phase5_options.get("intertile_robust_clip_sigma") or 2.5
+    intertile_global_recenter_config = phase5_options.get("intertile_global_recenter")
+    intertile_recenter_clip_tuple = phase5_options.get("intertile_recenter_clip") or (0.85, 1.18)
+    use_auto_intertile_config = phase5_options.get("use_auto_intertile")
+    coadd_use_memmap_config = bool(phase5_options.get("coadd_use_memmap"))
+    coadd_memmap_dir_config = phase5_options.get("coadd_memmap_dir")
+    start_time_total = start_time_total_run
+    global_anchor_shift = phase5_options.get("global_anchor_shift")
+
+    pcb("PHASE_UPDATE:5", prog=None, lvl="ETA_LEVEL")
+    _log_memory_usage(
+        progress_callback,
+        (
+            "Début Phase 5 (Méthode: "
+            f"{phase5_options.get('final_assembly_method')}, "
+            f"Rognage MT Appliqué: {apply_crop_for_assembly}, "
+            f"QualityCrop: {quality_crop_enabled_config}, "
+            f"%Rognage: {master_tile_crop_percent_config if apply_crop_for_assembly else 'N/A'})"
+        ),
+    )
+
+    incremental_parity_active = (
+        USE_INCREMENTAL_ASSEMBLY
+        and intertile_match_flag
+        and match_background_flag
+        and feather_parity_flag
+    )
+    if incremental_parity_active and two_pass_enabled:
+        two_pass_enabled = False
+        pcb("run_info_incremental_two_pass_parity_disabled", prog=None, lvl="INFO_DETAIL")
+
+    valid_master_tiles_for_assembly = []
+    for mt_p, mt_w in master_tiles:
+        if mt_p and _path_exists(mt_p) and mt_w and mt_w.is_celestial:
+            valid_master_tiles_for_assembly.append((mt_p, mt_w))
+        else:
+            pcb(
+                "run_warn_phase5_invalid_tile_skipped_for_assembly",
+                prog=None,
+                lvl="WARN",
+                filename=_safe_basename(mt_p if mt_p else "N/A"),
+            )
+
+    final_mosaic_data_HWC = None
+    final_mosaic_coverage_HW = None
+    final_alpha_map = None
+    alpha_final = None
+    fallback_two_pass_loader = None
+
+    if not valid_master_tiles_for_assembly:
+        pcb(
+            "run_error_phase5_no_valid_tiles_for_assembly",
+            prog=base_progress_phase5 + progress_weight_phase5,
+            lvl="ERROR",
+        )
+        return master_tiles, None, None, None, None, base_progress_phase5 + progress_weight_phase5
+
+    collected_tiles_for_second_pass: list[tuple[np.ndarray, Any]] | None = (
+        [] if two_pass_enabled and not USE_INCREMENTAL_ASSEMBLY else None
+    )
+    log_key_phase5_failed = ""
+    log_key_phase5_finished = ""
+
+    reproject_coadd_available = (
+        "assemble_final_mosaic_reproject_coadd" in globals()
+        and callable(assemble_final_mosaic_reproject_coadd)
+    )
+    incremental_available = (
+        "assemble_final_mosaic_incremental" in globals()
+        and callable(assemble_final_mosaic_incremental)
+    )
+
+    if USE_INCREMENTAL_ASSEMBLY:
+        if not incremental_available:
+            pcb("run_error_phase5_inc_func_missing", prog=None, lvl="CRITICAL")
+            return master_tiles, None, None, None, None, base_progress_phase5 + progress_weight_phase5
+        pcb("run_info_phase5_started_incremental", prog=base_progress_phase5, lvl="INFO")
+        inc_memmap_dir = temp_master_tile_storage_dir or output_folder
+        try:
+            if use_gpu_phase5_flag:
+                import cupy
+
+                cupy.cuda.Device(0).use()
+        except Exception as e_gpu:
+            logger.warning("GPU incremental assembly init failed, falling back to CPU: %s", e_gpu)
+            use_gpu_phase5_flag = False
+        try:
+            final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = assemble_final_mosaic_incremental(
+                master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly,
+                final_output_wcs=final_output_wcs,
+                final_output_shape_hw=final_output_shape_hw,
+                progress_callback=progress_callback,
+                n_channels=3,
+                apply_crop=apply_crop_for_assembly,
+                crop_percent=master_tile_crop_percent_config,
+                processing_threads=assembly_process_workers_config,
+                memmap_dir=inc_memmap_dir,
+                cleanup_memmap=True,
+                intertile_photometric_match=intertile_match_flag,
+                intertile_preview_size=int(intertile_preview_size_config),
+                intertile_overlap_min=float(intertile_overlap_min_config),
+                intertile_sky_percentile=intertile_sky_percentile_tuple,
+                intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
+                intertile_global_recenter=bool(intertile_global_recenter_config),
+                intertile_recenter_clip=intertile_recenter_clip_tuple,
+                use_auto_intertile=bool(use_auto_intertile_config),
+                match_background=match_background_flag,
+                feather_parity=feather_parity_flag,
+                two_pass_coverage_renorm=two_pass_coverage_renorm_config,
+                base_progress_phase5=base_progress_phase5,
+                progress_weight_phase5=progress_weight_phase5,
+                start_time_total_run=start_time_total,
+                global_anchor_shift=global_anchor_shift,
+            )
+        except Exception as exc:
+            logger.exception("Incremental assembly failed", exc_info=True)
+            final_mosaic_data_HWC = None
+        log_key_phase5_failed = "run_error_phase5_assembly_failed_incremental"
+        log_key_phase5_finished = "run_info_phase5_finished_incremental"
+    else:
+        if not reproject_coadd_available:
+            pcb("run_error_phase5_reproject_coadd_func_missing", prog=None, lvl="CRITICAL")
+            return master_tiles, None, None, None, None, base_progress_phase5 + progress_weight_phase5
+        pcb("run_info_phase5_started_reproject_coadd", prog=base_progress_phase5, lvl="INFO")
+        try:
+            if use_gpu_phase5_flag:
+                import cupy
+
+                cupy.cuda.Device(0).use()
+            final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = assemble_final_mosaic_reproject_coadd(
+                master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly,
+                final_output_wcs=final_output_wcs,
+                final_output_shape_hw=final_output_shape_hw,
+                progress_callback=progress_callback,
+                n_channels=3,
+                match_bg=True,
+                apply_crop=apply_crop_for_assembly,
+                crop_percent=master_tile_crop_percent_config,
+                use_gpu=use_gpu_phase5_flag,
+                use_memmap=bool(coadd_use_memmap_config),
+                memmap_dir=(coadd_memmap_dir_config or output_folder),
+                cleanup_memmap=False,
+                base_progress_phase5=base_progress_phase5,
+                progress_weight_phase5=progress_weight_phase5,
+                start_time_total_run=start_time_total,
+                intertile_photometric_match=intertile_match_flag,
+                intertile_preview_size=int(intertile_preview_size_config),
+                intertile_overlap_min=float(intertile_overlap_min_config),
+                intertile_sky_percentile=intertile_sky_percentile_tuple,
+                intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
+                intertile_global_recenter=bool(intertile_global_recenter_config),
+                intertile_recenter_clip=intertile_recenter_clip_tuple,
+                use_auto_intertile=bool(use_auto_intertile_config),
+                collect_tile_data=collected_tiles_for_second_pass,
+                global_anchor_shift=global_anchor_shift,
+                phase45_enabled=phase45_active_flag,
+            )
+        except Exception as exc:
+            logger.exception("Reproject+Coadd assembly failed", exc_info=True)
+            final_mosaic_data_HWC = None
+        log_key_phase5_failed = "run_error_phase5_assembly_failed_reproject_coadd"
+        log_key_phase5_finished = "run_info_phase5_finished_reproject_coadd"
+
+    if final_mosaic_data_HWC is None:
+        pcb(
+            log_key_phase5_failed or "run_error_phase5_assembly_failed_unknown",
+            prog=base_progress_phase5 + progress_weight_phase5,
+            lvl="ERROR",
+        )
+        return master_tiles, None, None, None, None, base_progress_phase5 + progress_weight_phase5
+
+    current_global_progress = base_progress_phase5 + progress_weight_phase5
+
+    if USE_INCREMENTAL_ASSEMBLY:
+        def _load_tiles_for_two_pass_phase5():
+            return _load_master_tiles_for_two_pass(
+                valid_master_tiles_for_assembly,
+                apply_crop=apply_crop_for_assembly,
+                crop_percent=master_tile_crop_percent_config,
+                logger=logger,
+            )
+
+        fallback_two_pass_loader = _load_tiles_for_two_pass_phase5
+
+    final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = _apply_phase5_post_stack_pipeline(
+        final_mosaic_data_HWC,
+        final_mosaic_coverage_HW,
+        final_alpha_map,
+        enable_lecropper_pipeline=False,
+        pipeline_cfg=final_quality_pipeline_cfg,
+        enable_master_tile_crop=False,
+        master_tile_crop_percent=master_tile_crop_percent_config,
+        two_pass_enabled=bool(two_pass_enabled),
+        two_pass_sigma_px=two_pass_sigma_px,
+        two_pass_gain_clip=gain_clip_tuple,
+        final_output_wcs=final_output_wcs,
+        final_output_shape_hw=final_output_shape_hw,
+        use_gpu_two_pass=use_gpu_phase5_flag,
+        logger=logger,
+        collected_tiles=collected_tiles_for_second_pass,
+        fallback_two_pass_loader=fallback_two_pass_loader,
+    )
+    if collected_tiles_for_second_pass is not None:
+        collected_tiles_for_second_pass.clear()
+
+    alpha_final = _derive_final_alpha_mask(
+        final_alpha_map,
+        final_mosaic_data_HWC,
+        final_mosaic_coverage_HW,
+        logger,
+    )
+
+    _log_memory_usage(progress_callback, "Fin Phase 5 (Assemblage)")
+    pcb(
+        log_key_phase5_finished or "run_info_phase5_finished",
+        prog=current_global_progress,
+        lvl="INFO",
+        shape=final_mosaic_data_HWC.shape if final_mosaic_data_HWC is not None else "N/A",
+    )
+
+    return (
+        master_tiles,
+        final_mosaic_data_HWC,
+        final_mosaic_coverage_HW,
+        final_alpha_map,
+        alpha_final,
+        current_global_progress,
+    )
 
 
 def _compute_auto_tile_caps(
@@ -10860,6 +11241,13 @@ def run_hierarchical_mosaic(
         sds_target_batch_size_config = 10
     if sds_target_batch_size_config < sds_min_batch_size_config:
         sds_target_batch_size_config = sds_min_batch_size_config
+    try:
+        sds_min_coverage_keep_config = float(worker_config_cache.get("sds_min_coverage_keep", 0.4))
+    except Exception:
+        sds_min_coverage_keep_config = 0.4
+    if not math.isfinite(sds_min_coverage_keep_config):
+        sds_min_coverage_keep_config = 0.4
+    sds_min_coverage_keep_config = max(0.0, min(1.0, sds_min_coverage_keep_config))
 
     global_wcs_autocrop_enabled_config = bool(worker_config_cache.get("global_wcs_autocrop_enabled"))
     try:
@@ -12462,6 +12850,79 @@ def run_hierarchical_mosaic(
         "altaz_nanize": bool(altaz_nanize_config),
     }
 
+    global_anchor_shift: tuple[float, float] | None = None
+    sds_runtime_tile_dir: str | None = None
+
+    def _build_phase45_options_dict(base_progress: float) -> dict[str, Any]:
+        stack_cfg_phase45 = {
+            "kappa_low": float(stack_kappa_low),
+            "kappa_high": float(stack_kappa_high),
+            "winsor_limits": parsed_winsor_limits,
+            "winsor_max_frames_per_pass": winsor_max_frames_per_pass_config,
+            "winsor_worker_limit": winsor_worker_limit_config,
+            "normalize_method": stack_norm_method,
+            "stacking_normalize_method": stack_norm_method,
+            "weight_method": stack_weight_method,
+            "reject_algo": stack_reject_algo,
+            "final_combine": stack_final_combine,
+            "stack_norm_method": stack_norm_method,
+            "stack_weight_method": stack_weight_method,
+            "stack_reject_algo": stack_reject_algo,
+            "stack_final_combine": stack_final_combine,
+            "intertile_sky_percentile": intertile_sky_percentile_tuple,
+            "quality_crop_enabled": bool(quality_crop_enabled_config),
+            "quality_crop_band_px": int(quality_crop_band_px_config),
+            "quality_crop_k_sigma": float(quality_crop_k_sigma_config),
+            "quality_crop_margin_px": int(quality_crop_margin_px_config),
+            "quality_crop_min_run": int(quality_crop_min_run_config),
+            "altaz_cleanup_enabled": bool(altaz_cleanup_enabled_config),
+            "altaz_margin_percent": float(altaz_margin_percent_config),
+            "altaz_decay": float(altaz_decay_config),
+            "altaz_nanize": bool(altaz_nanize_config),
+        }
+        return {
+            "enable": bool(inter_master_merge_enable_config),
+            "base_progress": base_progress,
+            "progress_weight": PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER,
+            "overlap_threshold": inter_master_overlap_threshold_config,
+            "min_group_size": inter_master_min_group_size_config,
+            "stack_method": inter_master_stack_method_config,
+            "memmap_policy": inter_master_memmap_policy_config,
+            "local_scale": inter_master_local_scale_config,
+            "max_group_size": inter_master_max_group_config,
+            "worker_config": worker_config_cache,
+            "stack_cfg": stack_cfg_phase45,
+        }
+
+    def _build_phase5_options_dict(base_progress: float, *, final_method: str | None = None) -> dict[str, Any]:
+        return {
+            "base_progress": base_progress,
+            "progress_weight": PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
+            "final_assembly_method": final_method or final_assembly_method_config,
+            "apply_master_tile_crop": apply_master_tile_crop_config,
+            "quality_crop_enabled": quality_crop_enabled_config,
+            "master_tile_crop_percent": master_tile_crop_percent_config,
+            "intertile_match_flag": intertile_match_flag,
+            "match_background_flag": match_background_flag,
+            "feather_parity_flag": feather_parity_flag,
+            "two_pass_enabled": two_pass_enabled,
+            "two_pass_sigma_px": two_pass_sigma_px,
+            "two_pass_gain_clip": gain_clip_tuple,
+            "two_pass_coverage_renorm": two_pass_coverage_renorm_config,
+            "use_gpu_phase5": use_gpu_phase5_flag,
+            "assembly_process_workers": assembly_process_workers_config,
+            "intertile_preview_size": intertile_preview_size_config,
+            "intertile_overlap_min": intertile_overlap_min_config,
+            "intertile_sky_percentile": intertile_sky_percentile_tuple,
+            "intertile_robust_clip_sigma": intertile_robust_clip_sigma_config,
+            "intertile_global_recenter": intertile_global_recenter_config,
+            "intertile_recenter_clip": intertile_recenter_clip_tuple,
+            "use_auto_intertile": use_auto_intertile_config,
+            "coadd_use_memmap": coadd_use_memmap_config,
+            "coadd_memmap_dir": coadd_memmap_dir_config,
+            "global_anchor_shift": global_anchor_shift,
+        }
+
     def _ensure_plan_descriptor_loaded(plan: dict[str, Any]) -> None:
         if not plan.get("enabled"):
             return
@@ -12523,7 +12984,14 @@ def run_hierarchical_mosaic(
         if global_wcs_plan.get("enabled") and not _plan_has_descriptor_fields(global_wcs_plan):
             _disable_invalid_plan("runtime WCS descriptor incomplete", emit_warn=True)
 
+    plan_width: int | None = None
+    plan_height: int | None = None
     if global_wcs_plan.get("enabled"):
+        try:
+            plan_width = int(global_wcs_plan.get("width") or 0)
+            plan_height = int(global_wcs_plan.get("height") or 0)
+        except Exception:
+            plan_width = plan_height = None
         if not sds_mode_flag:
             # SDS is OFF: skip mega-tile flows and force the classic master-tile pipeline.
             final_mosaic_data_HWC = None
@@ -12532,7 +13000,11 @@ def run_hierarchical_mosaic(
             pcb("sds_off_classic_mastertile_pipeline", prog=None, lvl="INFO")
         else:
             pcb("sds_on_mega_tile_pipeline", prog=None, lvl="INFO")
-            mosaic_result = assemble_global_mosaic_sds(
+            (
+                sds_mosaic_data_HWC,
+                sds_coverage_HW,
+                sds_alpha_map,
+            ) = assemble_global_mosaic_sds(
                 seestar_stack_groups,
                 global_plan=global_wcs_plan,
                 progress_callback=progress_callback,
@@ -12552,89 +13024,268 @@ def run_hierarchical_mosaic(
                 target_batch_size=sds_target_batch_size_config,
                 preplan_path_groups=preplan_groups_override_paths,
                 postprocess_context=sds_post_context,
-            ) or (None, None, None)
-            if mosaic_result[0] is None:
-                pcb("sds_failed_fallback_mosaic_first", prog=None, lvl="WARN")
-                mosaic_result = assemble_global_mosaic_first(
-                    seestar_stack_groups,
-                    global_plan=global_wcs_plan,
-                    progress_callback=progress_callback,
-                    match_background=match_background_flag,
-                    base_progress_phase=base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING,
-                    progress_weight_phase=(
-                        PROGRESS_WEIGHT_PHASE3_MASTER_TILES
-                        + PROGRESS_WEIGHT_PHASE4_GRID_CALC
-                        + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
-                        + PROGRESS_WEIGHT_PHASE5_ASSEMBLY
-                    ),
-                    start_time_total_run=start_time_total_run,
-                    cache_root=output_folder,
-                ) or (None, None, None)
-            final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = mosaic_result
-            autocrop_meta: dict[str, int] | None = None
-            if final_mosaic_data_HWC is not None and global_wcs_autocrop_enabled_config:
-                final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map, autocrop_meta = (
-                    _auto_crop_global_mosaic_if_requested(
+            )
+            sds_tile_records = list(sds_post_context.pop("sds_tile_records", []) or [])
+            temp_dir_candidate = sds_post_context.pop("sds_tile_temp_dir", None)
+            if temp_dir_candidate:
+                sds_runtime_tile_dir = temp_dir_candidate
+            sds_two_pass_tile_pairs = sds_post_context.pop("two_pass_tile_pairs", None)
+
+            sds_polish_succeeded = False
+            if sds_mosaic_data_HWC is not None:
+                final_mosaic_data_HWC = np.asarray(sds_mosaic_data_HWC, dtype=np.float32, order="C")
+                final_mosaic_coverage_HW = (
+                    np.asarray(sds_coverage_HW, dtype=np.float32, order="C")
+                    if sds_coverage_HW is not None
+                    else None
+                )
+                if final_mosaic_coverage_HW is None and final_mosaic_data_HWC is not None:
+                    final_mosaic_coverage_HW = np.ones(final_mosaic_data_HWC.shape[:2], dtype=np.float32)
+                if isinstance(sds_alpha_map, np.ndarray):
+                    final_alpha_map = np.array(sds_alpha_map, copy=True)
+                else:
+                    final_alpha_map = sds_alpha_map
+                target_hw = final_mosaic_data_HWC.shape[:2] if final_mosaic_data_HWC is not None else None
+                (
+                    final_mosaic_data_HWC,
+                    final_mosaic_coverage_HW,
+                    coverage_summary,
+                ) = _mask_sds_low_coverage_pixels(
+                    final_mosaic_data_HWC,
+                    final_mosaic_coverage_HW,
+                    min_keep_fraction=sds_min_coverage_keep_config,
+                    target_hw=target_hw,
+                )
+                try:
+                    pcb(
+                        "sds_coverage_normalized",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                        max_cov=f"{coverage_summary.get('max_cov', 0.0):.6f}",
+                        min_keep=f"{float(sds_min_coverage_keep_config):.3f}",
+                        masked_pixels=int(coverage_summary.get("masked_pixels", 0)),
+                    )
+                except Exception:
+                    pass
+                autocrop_meta: dict[str, int] | None = None
+                if final_mosaic_data_HWC is not None and global_wcs_autocrop_enabled_config:
+                    final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map, autocrop_meta = (
+                        _auto_crop_global_mosaic_if_requested(
+                            final_mosaic_data_HWC,
+                            final_mosaic_coverage_HW,
+                            final_alpha_map,
+                            enable_autocrop=True,
+                            margin_px=global_wcs_autocrop_margin_px_config,
+                            pcb=pcb,
+                        )
+                    )
+                    if autocrop_meta:
+                        _apply_autocrop_to_global_plan(global_wcs_plan, autocrop_meta)
+                if final_mosaic_data_HWC is not None:
+                    final_output_wcs = global_wcs_plan.get("wcs")
+                    final_output_shape_hw = (final_mosaic_data_HWC.shape[0], final_mosaic_data_HWC.shape[1])
+                    pcb("phase5_sds_polish_start", prog=None, lvl="INFO")
+                    if logger:
+                        logger.info("Phase 5 (SDS): polish-only mode, skipping reproject_and_coadd.")
+                    final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = _apply_phase5_post_stack_pipeline(
                         final_mosaic_data_HWC,
                         final_mosaic_coverage_HW,
                         final_alpha_map,
-                        enable_autocrop=True,
-                        margin_px=global_wcs_autocrop_margin_px_config,
-                        pcb=pcb,
+                        enable_lecropper_pipeline=bool(
+                            final_quality_pipeline_cfg.get("quality_crop_enabled")
+                            or final_quality_pipeline_cfg.get("altaz_cleanup_enabled")
+                        ),
+                        pipeline_cfg=final_quality_pipeline_cfg,
+                        enable_master_tile_crop=bool(apply_master_tile_crop_config and not quality_crop_enabled_config),
+                        master_tile_crop_percent=float(master_tile_crop_percent_config),
+                        two_pass_enabled=bool(two_pass_enabled),
+                        two_pass_sigma_px=int(two_pass_sigma_px),
+                        two_pass_gain_clip=gain_clip_tuple,
+                        final_output_wcs=final_output_wcs,
+                        final_output_shape_hw=final_output_shape_hw,
+                        use_gpu_two_pass=use_gpu_phase5_flag,
+                        logger=logger,
+                        collected_tiles=sds_two_pass_tile_pairs,
+                        fallback_two_pass_loader=None,
                     )
-                )
-                if autocrop_meta:
-                    _apply_autocrop_to_global_plan(global_wcs_plan, autocrop_meta)
-            if final_mosaic_data_HWC is not None:
-                final_output_wcs = global_wcs_plan.get("wcs")
-                final_output_shape_hw = (final_mosaic_data_HWC.shape[0], final_mosaic_data_HWC.shape[1])
-                sds_tile_pairs = sds_post_context.get("two_pass_tile_pairs")
-                final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = _apply_phase5_post_stack_pipeline(
-                    final_mosaic_data_HWC,
-                    final_mosaic_coverage_HW,
-                    final_alpha_map,
-                    enable_lecropper_pipeline=bool(
-                        final_quality_pipeline_cfg.get("quality_crop_enabled")
-                        or final_quality_pipeline_cfg.get("altaz_cleanup_enabled")
-                    ),
-                    pipeline_cfg=final_quality_pipeline_cfg,
-                    enable_master_tile_crop=bool(apply_master_tile_crop_config and not quality_crop_enabled_config),
-                    master_tile_crop_percent=float(master_tile_crop_percent_config),
-                    two_pass_enabled=bool(two_pass_enabled),
-                    two_pass_sigma_px=int(two_pass_sigma_px),
-                    two_pass_gain_clip=gain_clip_tuple,
-                    final_output_wcs=final_output_wcs,
-                    final_output_shape_hw=final_output_shape_hw,
-                    use_gpu_two_pass=use_gpu_phase5_flag,
-                    logger=logger,
-                    collected_tiles=sds_tile_pairs,
-                    fallback_two_pass_loader=None,
-                )
-                if isinstance(sds_tile_pairs, list):
-                    sds_tile_pairs.clear()
-                    sds_post_context.pop("two_pass_tile_pairs", None)
-                alpha_final = _derive_final_alpha_mask(
-                    final_alpha_map,
-                    final_mosaic_data_HWC,
-                    final_mosaic_coverage_HW,
-                    logger,
-                )
-                current_global_progress = min(
-                    100.0,
-                    base_progress_phase2
-                    + PROGRESS_WEIGHT_PHASE2_CLUSTERING
-                    + PROGRESS_WEIGHT_PHASE3_MASTER_TILES
-                    + PROGRESS_WEIGHT_PHASE4_GRID_CALC
-                    + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
-                    + PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
-                )
-                seestar_stack_groups = []
-            else:
-                if not sds_fallback_logged:
-                    pcb("sds_and_mosaic_first_failed_fallback_mastertiles", prog=None, lvl="WARN")
-                    sds_fallback_logged = True
-                pcb("global_coadd_error_failed_fallback", prog=None, lvl="WARN")
-                global_wcs_plan["enabled"] = False
+                    alpha_final = _derive_final_alpha_mask(
+                        final_alpha_map,
+                        final_mosaic_data_HWC,
+                        final_mosaic_coverage_HW,
+                        logger,
+                    )
+                    current_global_progress = min(
+                        100.0,
+                        base_progress_phase2
+                        + PROGRESS_WEIGHT_PHASE2_CLUSTERING
+                        + PROGRESS_WEIGHT_PHASE3_MASTER_TILES
+                        + PROGRESS_WEIGHT_PHASE4_GRID_CALC
+                        + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
+                        + PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
+                    )
+                    seestar_stack_groups = []
+                    sds_polish_succeeded = True
+                else:
+                    final_mosaic_data_HWC = None
+                    final_mosaic_coverage_HW = None
+            if not sds_polish_succeeded:
+                if not sds_tile_records:
+                    pcb("sds_failed_fallback_mosaic_first", prog=None, lvl="WARN")
+                    mosaic_result = assemble_global_mosaic_first(
+                        seestar_stack_groups,
+                        global_plan=global_wcs_plan,
+                        progress_callback=progress_callback,
+                        match_background=match_background_flag,
+                        base_progress_phase=base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING,
+                        progress_weight_phase=(
+                            PROGRESS_WEIGHT_PHASE3_MASTER_TILES
+                            + PROGRESS_WEIGHT_PHASE4_GRID_CALC
+                            + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
+                            + PROGRESS_WEIGHT_PHASE5_ASSEMBLY
+                        ),
+                        start_time_total_run=start_time_total_run,
+                        cache_root=output_folder,
+                    ) or (None, None, None)
+                    final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = mosaic_result
+                    autocrop_meta: dict[str, int] | None = None
+                    if final_mosaic_data_HWC is not None and global_wcs_autocrop_enabled_config:
+                        final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map, autocrop_meta = (
+                            _auto_crop_global_mosaic_if_requested(
+                                final_mosaic_data_HWC,
+                                final_mosaic_coverage_HW,
+                                final_alpha_map,
+                                enable_autocrop=True,
+                                margin_px=global_wcs_autocrop_margin_px_config,
+                                pcb=pcb,
+                            )
+                        )
+                        if autocrop_meta:
+                            _apply_autocrop_to_global_plan(global_wcs_plan, autocrop_meta)
+                    if final_mosaic_data_HWC is not None:
+                        final_output_wcs = global_wcs_plan.get("wcs")
+                        final_output_shape_hw = (final_mosaic_data_HWC.shape[0], final_mosaic_data_HWC.shape[1])
+                        final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = _apply_phase5_post_stack_pipeline(
+                            final_mosaic_data_HWC,
+                            final_mosaic_coverage_HW,
+                            final_alpha_map,
+                            enable_lecropper_pipeline=bool(
+                                final_quality_pipeline_cfg.get("quality_crop_enabled")
+                                or final_quality_pipeline_cfg.get("altaz_cleanup_enabled")
+                            ),
+                            pipeline_cfg=final_quality_pipeline_cfg,
+                            enable_master_tile_crop=bool(apply_master_tile_crop_config and not quality_crop_enabled_config),
+                            master_tile_crop_percent=float(master_tile_crop_percent_config),
+                            two_pass_enabled=bool(two_pass_enabled),
+                            two_pass_sigma_px=int(two_pass_sigma_px),
+                            two_pass_gain_clip=gain_clip_tuple,
+                            final_output_wcs=final_output_wcs,
+                            final_output_shape_hw=final_output_shape_hw,
+                            use_gpu_two_pass=use_gpu_phase5_flag,
+                            logger=logger,
+                            collected_tiles=None,
+                            fallback_two_pass_loader=None,
+                        )
+                        alpha_final = _derive_final_alpha_mask(
+                            final_alpha_map,
+                            final_mosaic_data_HWC,
+                            final_mosaic_coverage_HW,
+                            logger,
+                        )
+                        current_global_progress = min(
+                            100.0,
+                            base_progress_phase2
+                            + PROGRESS_WEIGHT_PHASE2_CLUSTERING
+                            + PROGRESS_WEIGHT_PHASE3_MASTER_TILES
+                            + PROGRESS_WEIGHT_PHASE4_GRID_CALC
+                            + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
+                            + PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
+                        )
+                        seestar_stack_groups = []
+                    else:
+                        if not sds_fallback_logged:
+                            pcb("sds_and_mosaic_first_failed_fallback_mastertiles", prog=None, lvl="WARN")
+                            sds_fallback_logged = True
+                        pcb("global_coadd_error_failed_fallback", prog=None, lvl="WARN")
+                        global_wcs_plan["enabled"] = False
+                else:
+                    target_height = plan_height if isinstance(plan_height, int) and plan_height > 0 else None
+                    target_width = plan_width if isinstance(plan_width, int) and plan_width > 0 else None
+                    if (target_height is None or target_width is None) and sds_tile_records:
+                        probe_path = sds_tile_records[0][0]
+                        try:
+                            with fits.open(probe_path, memmap=False) as hdul_probe:
+                                data_shape = hdul_probe[0].shape if hdul_probe and hdul_probe[0] is not None else None
+                                if data_shape and len(data_shape) >= 2:
+                                    target_height = int(data_shape[0])
+                                    target_width = int(data_shape[1])
+                        except Exception:
+                            pass
+                    target_shape_hw = None
+                    if target_height and target_width:
+                        target_shape_hw = (target_height, target_width)
+                    phase45_base = (
+                        base_progress_phase2
+                        + PROGRESS_WEIGHT_PHASE2_CLUSTERING
+                        + PROGRESS_WEIGHT_PHASE3_MASTER_TILES
+                        + PROGRESS_WEIGHT_PHASE4_GRID_CALC
+                    )
+                    sds_phase45_options = _build_phase45_options_dict(phase45_base)
+                    sds_phase5_options = _build_phase5_options_dict(
+                        phase45_base + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
+                    )
+                    (
+                        master_tiles_results_list,
+                        final_mosaic_data_HWC,
+                        final_mosaic_coverage_HW,
+                        final_alpha_map,
+                        alpha_final,
+                        current_global_progress,
+                    ) = _run_shared_phase45_phase5_pipeline(
+                        sds_tile_records,
+                        final_output_wcs=global_wcs_plan.get("wcs"),
+                        final_output_shape_hw=target_shape_hw,
+                        temp_master_tile_storage_dir=sds_runtime_tile_dir,
+                        output_folder=output_folder,
+                        cache_retention_mode=cache_retention_mode,
+                        phase45_options=sds_phase45_options,
+                        phase5_options=sds_phase5_options,
+                        final_quality_pipeline_cfg=final_quality_pipeline_cfg,
+                        start_time_total_run=start_time_total_run,
+                        progress_callback=progress_callback,
+                        pcb=pcb,
+                        logger=logger,
+                    )
+                    master_tiles_results_list = list(sds_tile_records)
+                    autocrop_meta = None
+                    if final_mosaic_data_HWC is not None and global_wcs_autocrop_enabled_config:
+                        final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map, autocrop_meta = (
+                            _auto_crop_global_mosaic_if_requested(
+                                final_mosaic_data_HWC,
+                                final_mosaic_coverage_HW,
+                                final_alpha_map,
+                                enable_autocrop=True,
+                                margin_px=global_wcs_autocrop_margin_px_config,
+                                pcb=pcb,
+                            )
+                        )
+                        if autocrop_meta:
+                            _apply_autocrop_to_global_plan(global_wcs_plan, autocrop_meta)
+                    if final_mosaic_data_HWC is not None:
+                        final_output_wcs = global_wcs_plan.get("wcs")
+                        final_output_shape_hw = (final_mosaic_data_HWC.shape[0], final_mosaic_data_HWC.shape[1])
+                        alpha_final = _derive_final_alpha_mask(
+                            final_alpha_map,
+                            final_mosaic_data_HWC,
+                            final_mosaic_coverage_HW,
+                            logger,
+                        )
+                        seestar_stack_groups = []
+                    else:
+                        if not sds_fallback_logged:
+                            pcb("sds_and_mosaic_first_failed_fallback_mastertiles", prog=None, lvl="WARN")
+                            sds_fallback_logged = True
+                        pcb("global_coadd_error_failed_fallback", prog=None, lvl="WARN")
+                        global_wcs_plan["enabled"] = False
 
     try:
         setattr(zconfig, "winsor_worker_limit", int(winsor_worker_limit))
@@ -12668,7 +13319,7 @@ def run_hierarchical_mosaic(
 
             tile_id_order = list(range(len(seestar_stack_groups)))
             center_out_context: CenterOutNormalizationContext | None = None
-            global_anchor_shift: tuple[float, float] = (1.0, 0.0)
+            global_anchor_shift = (1.0, 0.0)
             prestack_anchor_tile_id: int | None = None
             center_out_settings = {
                 "enabled": bool(center_out_normalization_p3_config),
@@ -13289,385 +13940,34 @@ def run_hierarchical_mosaic(
             pcb("run_info_phase4_finished", prog=current_global_progress, lvl="INFO", shape=final_output_shape_hw, crval=final_output_wcs.wcs.crval if final_output_wcs.wcs else 'N/A')
 
             base_progress_phase4_5 = current_global_progress
-            phase45_active_flag = bool(inter_master_merge_enable_config)
-            if inter_master_merge_enable_config:
-                pcb("PHASE_UPDATE:4.5", prog=None, lvl="ETA_LEVEL")
-                _log_memory_usage(progress_callback, "Début Phase 4.5 (Inter-Master merge)")
-                inter_cfg_phase45 = {
-                    "enable": bool(inter_master_merge_enable_config),
-                    "overlap_threshold": float(inter_master_overlap_threshold_config),
-                    "min_group_size": int(inter_master_min_group_size_config),
-                    "stack_method": str(inter_master_stack_method_config).lower(),
-                    "memmap_policy": str(inter_master_memmap_policy_config).lower(),
-                    "local_scale": str(inter_master_local_scale_config).lower(),
-                    "max_group": int(inter_master_max_group_config),
-                }
-                try:
-                    photometry_clip_cfg = float(worker_config_cache.get("inter_master_photometry_clip_sigma", 3.0))
-                except Exception:
-                    photometry_clip_cfg = 3.0
-                if not math.isfinite(photometry_clip_cfg):
-                    photometry_clip_cfg = 3.0
-                inter_cfg_phase45.update(
-                    {
-                        "photometry_intragroup": bool(worker_config_cache.get("inter_master_photometry_intragroup", True)),
-                        "photometry_intersuper": bool(worker_config_cache.get("inter_master_photometry_intersuper", True)),
-                        "photometry_clip_sigma": max(0.1, photometry_clip_cfg),
-                    }
-                )
-                gain_clip_cfg = worker_config_cache.get("two_pass_cov_gain_clip")
-                if isinstance(gain_clip_cfg, (list, tuple)) and len(gain_clip_cfg) >= 2:
-                    try:
-                        gmin = float(gain_clip_cfg[0])
-                        gmax = float(gain_clip_cfg[1])
-                        if math.isfinite(gmin) and math.isfinite(gmax):
-                            if gmin > gmax:
-                                gmin, gmax = gmax, gmin
-                            inter_cfg_phase45["two_pass_cov_gain_clip"] = (gmin, gmax)
-                    except Exception:
-                        pass
-                stack_cfg_phase45 = {
-                    "kappa_low": float(stack_kappa_low),
-                    "kappa_high": float(stack_kappa_high),
-                    "winsor_limits": parsed_winsor_limits,
-                    "winsor_max_frames_per_pass": winsor_max_frames_per_pass_config,
-                    "winsor_worker_limit": winsor_worker_limit_config,
-                    # Phase 4.5 uses GUI stacking options directly; include canonical and legacy keys
-                    "normalize_method": stack_norm_method,
-                    "stacking_normalize_method": stack_norm_method,
-                    "weight_method": stack_weight_method,
-                    "reject_algo": stack_reject_algo,
-                    "final_combine": stack_final_combine,
-                    "stack_norm_method": stack_norm_method,
-                    "stack_weight_method": stack_weight_method,
-                    "stack_reject_algo": stack_reject_algo,
-                    "stack_final_combine": stack_final_combine,
-                    "intertile_sky_percentile": intertile_sky_percentile_tuple,
-                    "quality_crop_enabled": bool(quality_crop_enabled_config),
-                    "quality_crop_band_px": int(quality_crop_band_px_config),
-                    "quality_crop_k_sigma": float(quality_crop_k_sigma_config),
-                    "quality_crop_margin_px": int(quality_crop_margin_px_config),
-                    "quality_crop_min_run": int(quality_crop_min_run_config),
-                    "altaz_cleanup_enabled": bool(altaz_cleanup_enabled_config),
-                    "altaz_margin_percent": float(altaz_margin_percent_config),
-                    "altaz_decay": float(altaz_decay_config),
-                    "altaz_nanize": bool(altaz_nanize_config),
-                }
-                master_tiles_results_list = _run_phase4_5_inter_master_merge(
-                    master_tiles_results_list,
-                    final_output_wcs,
-                    final_output_shape_hw,
-                    temp_master_tile_storage_dir,
-                    output_folder,
-                    cache_retention_mode,
-                    inter_cfg_phase45,
-                    stack_cfg_phase45,
-                    progress_callback,
-                    pcb,
-                )
-                current_global_progress = base_progress_phase4_5 + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
-                _log_memory_usage(progress_callback, "Fin Phase 4.5")
-            else:
-                current_global_progress = base_progress_phase4_5 + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
+            phase45_options = _build_phase45_options_dict(base_progress_phase4_5)
+            base_progress_phase5 = base_progress_phase4_5 + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
+            phase5_options = _build_phase5_options_dict(base_progress_phase5)
 
-        # --- Phase 5 (Assemblage Final) ---
-            base_progress_phase5 = current_global_progress
-            pcb("PHASE_UPDATE:5", prog=None, lvl="ETA_LEVEL")
-            USE_INCREMENTAL_ASSEMBLY = (final_assembly_method_config == "incremental")
-            apply_crop_for_assembly = bool(apply_master_tile_crop_config and not quality_crop_enabled_config)
-            _log_memory_usage(
-                progress_callback,
-                (
-                    "Début Phase 5 (Méthode: "
-                    f"{final_assembly_method_config}, "
-                    f"Rognage MT Appliqué: {apply_crop_for_assembly}, "
-                    f"QualityCrop: {quality_crop_enabled_config}, "
-                    f"%Rognage: {master_tile_crop_percent_config if apply_crop_for_assembly else 'N/A'})"
-                ),
-            )
-            
-            incremental_parity_active = (
-                USE_INCREMENTAL_ASSEMBLY
-                and intertile_match_flag
-                and match_background_flag
-                and feather_parity_flag
-            )
-            if incremental_parity_active and two_pass_enabled:
-                two_pass_enabled = False
-                pcb("run_info_incremental_two_pass_parity_disabled", prog=None, lvl="INFO_DETAIL")
-
-            valid_master_tiles_for_assembly = []
-            for mt_p, mt_w in master_tiles_results_list:
-                if mt_p and _path_exists(mt_p) and mt_w and mt_w.is_celestial: 
-                    valid_master_tiles_for_assembly.append((mt_p, mt_w))
-                else:
-                    pcb("run_warn_phase5_invalid_tile_skipped_for_assembly", prog=None, lvl="WARN", filename=_safe_basename(mt_p if mt_p else 'N/A')) # Clé de log plus spécifique
-                    
-            if not valid_master_tiles_for_assembly: 
-                pcb("run_error_phase5_no_valid_tiles_for_assembly", prog=(base_progress_phase5 + PROGRESS_WEIGHT_PHASE5_ASSEMBLY), lvl="ERROR")
-                # Nettoyage optionnel ici avant de retourner si besoin
-                return
-
-            final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = None, None, None
-            collected_tiles_for_second_pass: list[tuple[np.ndarray, Any]] | None = (
-                [] if two_pass_enabled and not USE_INCREMENTAL_ASSEMBLY else None
-            )
-            log_key_phase5_failed, log_key_phase5_finished = "", ""
-
-            # Vérification de la disponibilité des fonctions d'assemblage
-            # (Tu pourrais les importer en haut du module pour éviter le check 'in globals()' à chaque fois)
-            reproject_coadd_available = ('assemble_final_mosaic_reproject_coadd' in globals() and callable(assemble_final_mosaic_reproject_coadd))
-            incremental_available = ('assemble_final_mosaic_incremental' in globals() and callable(assemble_final_mosaic_incremental))
-
-            if USE_INCREMENTAL_ASSEMBLY:
-                if not incremental_available: 
-                    pcb("run_error_phase5_inc_func_missing", prog=None, lvl="CRITICAL"); return
-                pcb("run_info_phase5_started_incremental", prog=base_progress_phase5, lvl="INFO")
-                inc_memmap_dir = temp_master_tile_storage_dir or output_folder
-                if use_gpu_phase5_flag:
-                    try:
-                        import cupy
-                        cupy.cuda.Device(0).use()
-                        # Incremental GPU path not implemented; use CPU incremental assembly.
-                        final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = assemble_final_mosaic_incremental(
-                            master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly,
-                            final_output_wcs=final_output_wcs,
-                            final_output_shape_hw=final_output_shape_hw,
-                            progress_callback=progress_callback,
-                            n_channels=3,
-                            apply_crop=apply_crop_for_assembly,
-                            crop_percent=master_tile_crop_percent_config,
-                            processing_threads=assembly_process_workers_config,
-                            memmap_dir=inc_memmap_dir,
-                            cleanup_memmap=True,
-                            intertile_photometric_match=intertile_match_flag,
-                            intertile_preview_size=int(intertile_preview_size_config),
-                            intertile_overlap_min=float(intertile_overlap_min_config),
-                            intertile_sky_percentile=intertile_sky_percentile_tuple,
-                            intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
-                            intertile_global_recenter=bool(intertile_global_recenter_config),
-                            intertile_recenter_clip=intertile_recenter_clip_tuple,
-                            use_auto_intertile=bool(use_auto_intertile_config),
-                            match_background=match_background_flag,
-                            feather_parity=feather_parity_flag,
-                            two_pass_coverage_renorm=bool(two_pass_coverage_renorm_config),
-                            base_progress_phase5=base_progress_phase5,
-                            progress_weight_phase5=PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
-                            start_time_total_run=start_time_total_run,
-                            global_anchor_shift=global_anchor_shift,
-                        )
-                    except Exception as e_gpu:
-                        logger.warning("GPU incremental assembly failed, falling back to CPU: %s", e_gpu)
-                        final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = assemble_final_mosaic_incremental(
-                            master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly,
-                            final_output_wcs=final_output_wcs,
-                            final_output_shape_hw=final_output_shape_hw,
-                            progress_callback=progress_callback,
-                            n_channels=3,
-                            apply_crop=apply_crop_for_assembly,
-                            crop_percent=master_tile_crop_percent_config,
-                            processing_threads=assembly_process_workers_config,
-                            memmap_dir=inc_memmap_dir,
-                            cleanup_memmap=True,
-                            intertile_photometric_match=intertile_match_flag,
-                            intertile_preview_size=int(intertile_preview_size_config),
-                            intertile_overlap_min=float(intertile_overlap_min_config),
-                            intertile_sky_percentile=intertile_sky_percentile_tuple,
-                            intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
-                            intertile_global_recenter=bool(intertile_global_recenter_config),
-                            intertile_recenter_clip=intertile_recenter_clip_tuple,
-                            use_auto_intertile=bool(use_auto_intertile_config),
-                            match_background=match_background_flag,
-                            feather_parity=feather_parity_flag,
-                            two_pass_coverage_renorm=bool(two_pass_coverage_renorm_config),
-                            base_progress_phase5=base_progress_phase5,
-                            progress_weight_phase5=PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
-                            start_time_total_run=start_time_total_run,
-                            global_anchor_shift=global_anchor_shift,
-                        )
-                else:
-                    final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = assemble_final_mosaic_incremental(
-                        master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly,
-                        final_output_wcs=final_output_wcs,
-                        final_output_shape_hw=final_output_shape_hw,
-                        progress_callback=progress_callback,
-                        n_channels=3,
-                        apply_crop=apply_crop_for_assembly,
-                        crop_percent=master_tile_crop_percent_config,
-                        processing_threads=assembly_process_workers_config,
-                        memmap_dir=inc_memmap_dir,
-                        cleanup_memmap=True,
-                        intertile_photometric_match=intertile_match_flag,
-                        intertile_preview_size=int(intertile_preview_size_config),
-                        intertile_overlap_min=float(intertile_overlap_min_config),
-                        intertile_sky_percentile=intertile_sky_percentile_tuple,
-                        intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
-                        intertile_global_recenter=bool(intertile_global_recenter_config),
-                        intertile_recenter_clip=intertile_recenter_clip_tuple,
-                        use_auto_intertile=bool(use_auto_intertile_config),
-                        match_background=match_background_flag,
-                        feather_parity=feather_parity_flag,
-                        two_pass_coverage_renorm=bool(two_pass_coverage_renorm_config),
-                        base_progress_phase5=base_progress_phase5,
-                        progress_weight_phase5=PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
-                        start_time_total_run=start_time_total_run,
-                        global_anchor_shift=global_anchor_shift,
-                    )
-                log_key_phase5_failed = "run_error_phase5_assembly_failed_incremental"
-                log_key_phase5_finished = "run_info_phase5_finished_incremental"
-            else: # Méthode Reproject & Coadd
-                if not reproject_coadd_available: 
-                    pcb("run_error_phase5_reproject_coadd_func_missing", prog=None, lvl="CRITICAL"); return
-                pcb("run_info_phase5_started_reproject_coadd", prog=base_progress_phase5, lvl="INFO")
-
-                if use_gpu_phase5_flag:
-                    try:
-                        import cupy
-
-                        cupy.cuda.Device(0).use()
-                        # Use the internal CPU/GPU wrapper with use_gpu=True
-                        final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = assemble_final_mosaic_reproject_coadd(
-                            master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly,
-                            final_output_wcs=final_output_wcs,
-                            final_output_shape_hw=final_output_shape_hw,
-                            progress_callback=progress_callback,
-                            n_channels=3,
-                            match_bg=True,
-                            apply_crop=apply_crop_for_assembly,
-                            crop_percent=master_tile_crop_percent_config,
-                            use_gpu=True,
-                            base_progress_phase5=base_progress_phase5,
-                            progress_weight_phase5=PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
-                            start_time_total_run=start_time_total_run,
-                            intertile_photometric_match=intertile_match_flag,
-                            intertile_preview_size=int(intertile_preview_size_config),
-                            intertile_overlap_min=float(intertile_overlap_min_config),
-                            intertile_sky_percentile=intertile_sky_percentile_tuple,
-                            intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
-                            intertile_global_recenter=bool(intertile_global_recenter_config),
-                            intertile_recenter_clip=intertile_recenter_clip_tuple,
-                            use_auto_intertile=bool(use_auto_intertile_config),
-                            collect_tile_data=collected_tiles_for_second_pass,
-                            global_anchor_shift=global_anchor_shift,
-                            phase45_enabled=phase45_active_flag,
-                        )
-                    except Exception as e_gpu:
-                        logger.warning("GPU reproject_coadd failed, falling back to CPU: %s", e_gpu)
-                        final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = assemble_final_mosaic_reproject_coadd(
-                            master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly,
-                            final_output_wcs=final_output_wcs,
-                            final_output_shape_hw=final_output_shape_hw,
-                            progress_callback=progress_callback,
-                            n_channels=3,
-                            match_bg=True,
-                            apply_crop=apply_crop_for_assembly,
-                            crop_percent=master_tile_crop_percent_config,
-                            use_gpu=False,
-                            use_memmap=bool(coadd_use_memmap_config),
-                            memmap_dir=(coadd_memmap_dir_config or output_folder),
-                            cleanup_memmap=False,
-                            base_progress_phase5=base_progress_phase5,
-                            progress_weight_phase5=PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
-                            start_time_total_run=start_time_total_run,
-                            intertile_photometric_match=intertile_match_flag,
-                            intertile_preview_size=int(intertile_preview_size_config),
-                            intertile_overlap_min=float(intertile_overlap_min_config),
-                            intertile_sky_percentile=intertile_sky_percentile_tuple,
-                            intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
-                            intertile_global_recenter=bool(intertile_global_recenter_config),
-                            intertile_recenter_clip=intertile_recenter_clip_tuple,
-                            use_auto_intertile=bool(use_auto_intertile_config),
-                            collect_tile_data=collected_tiles_for_second_pass,
-                            global_anchor_shift=global_anchor_shift,
-                            phase45_enabled=phase45_active_flag,
-                        )
-                else:
-                    final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = assemble_final_mosaic_reproject_coadd(
-                        master_tile_fits_with_wcs_list=valid_master_tiles_for_assembly,
-                        final_output_wcs=final_output_wcs,
-                        final_output_shape_hw=final_output_shape_hw,
-                        progress_callback=progress_callback,
-                        n_channels=3,
-                        match_bg=True,
-                        apply_crop=apply_crop_for_assembly,
-                        crop_percent=master_tile_crop_percent_config,
-                        use_gpu=use_gpu_phase5_flag,
-                        use_memmap=bool(coadd_use_memmap_config),
-                        memmap_dir=(coadd_memmap_dir_config or output_folder),
-                        cleanup_memmap=False,
-                        base_progress_phase5=base_progress_phase5,
-                        progress_weight_phase5=PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
-                        start_time_total_run=start_time_total_run,
-                        intertile_photometric_match=intertile_match_flag,
-                        intertile_preview_size=int(intertile_preview_size_config),
-                        intertile_overlap_min=float(intertile_overlap_min_config),
-                        intertile_sky_percentile=intertile_sky_percentile_tuple,
-                        intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
-                        intertile_global_recenter=bool(intertile_global_recenter_config),
-                        intertile_recenter_clip=intertile_recenter_clip_tuple,
-                        use_auto_intertile=bool(use_auto_intertile_config),
-                        collect_tile_data=collected_tiles_for_second_pass,
-                        global_anchor_shift=global_anchor_shift,
-                        phase45_enabled=phase45_active_flag,
-                    )
-
-                log_key_phase5_failed = "run_error_phase5_assembly_failed_reproject_coadd"
-                log_key_phase5_finished = "run_info_phase5_finished_reproject_coadd"
-
-            if final_mosaic_data_HWC is None: 
-                pcb(log_key_phase5_failed, prog=(base_progress_phase5 + PROGRESS_WEIGHT_PHASE5_ASSEMBLY), lvl="ERROR")
-                # Nettoyage optionnel ici
-                return
-                
-            current_global_progress = base_progress_phase5 + PROGRESS_WEIGHT_PHASE5_ASSEMBLY
-
-            fallback_two_pass_loader = None
-            if USE_INCREMENTAL_ASSEMBLY:
-                def _load_tiles_for_two_pass_phase5():
-                    return _load_master_tiles_for_two_pass(
-                        valid_master_tiles_for_assembly,
-                        apply_crop=apply_crop_for_assembly,
-                        crop_percent=master_tile_crop_percent_config,
-                        logger=logger,
-                    )
-
-                fallback_two_pass_loader = _load_tiles_for_two_pass_phase5
-            final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = _apply_phase5_post_stack_pipeline(
+            (
+                master_tiles_results_list,
                 final_mosaic_data_HWC,
                 final_mosaic_coverage_HW,
                 final_alpha_map,
-                enable_lecropper_pipeline=False,
-                pipeline_cfg=final_quality_pipeline_cfg,
-                enable_master_tile_crop=False,
-                master_tile_crop_percent=float(master_tile_crop_percent_config),
-                two_pass_enabled=bool(two_pass_enabled),
-                two_pass_sigma_px=int(two_pass_sigma_px),
-                two_pass_gain_clip=gain_clip_tuple,
+                alpha_final,
+                current_global_progress,
+            ) = _run_shared_phase45_phase5_pipeline(
+                master_tiles_results_list,
                 final_output_wcs=final_output_wcs,
                 final_output_shape_hw=final_output_shape_hw,
-                use_gpu_two_pass=use_gpu_phase5_flag,
+                temp_master_tile_storage_dir=temp_master_tile_storage_dir,
+                output_folder=output_folder,
+                cache_retention_mode=cache_retention_mode,
+                phase45_options=phase45_options,
+                phase5_options=phase5_options,
+                final_quality_pipeline_cfg=final_quality_pipeline_cfg,
+                start_time_total_run=start_time_total_run,
+                progress_callback=progress_callback,
+                pcb=pcb,
                 logger=logger,
-                collected_tiles=collected_tiles_for_second_pass,
-                fallback_two_pass_loader=fallback_two_pass_loader,
             )
-            if collected_tiles_for_second_pass is not None:
-                collected_tiles_for_second_pass.clear()
-
-            alpha_final = _derive_final_alpha_mask(
-                final_alpha_map,
-                final_mosaic_data_HWC,
-                final_mosaic_coverage_HW,
-                logger,
-            )
-
-            _log_memory_usage(progress_callback, "Fin Phase 5 (Assemblage)")
-            pcb(
-                log_key_phase5_finished,
-                prog=current_global_progress,
-                lvl="INFO",
-                shape=final_mosaic_data_HWC.shape if final_mosaic_data_HWC is not None else "N/A",
-            )
-            
+            if final_mosaic_data_HWC is None:
+                return
 
     # --- Phase 6 (Sauvegarde) ---
     base_progress_phase6 = current_global_progress
@@ -14088,6 +14388,11 @@ def run_hierarchical_mosaic(
 
     _cleanup_memmap_artifacts()
 
+    if sds_runtime_tile_dir:
+        try:
+            shutil.rmtree(sds_runtime_tile_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
     # --- Phase 7 (Nettoyage) ---
@@ -15571,6 +15876,132 @@ def assemble_global_mosaic_sds(
                 return None
         return None
 
+    tile_records: list[tuple[str, Any]] = []
+    tile_temp_dir: str | None = None
+
+    def _ensure_tile_workspace() -> str | None:
+        nonlocal tile_temp_dir
+        if tile_temp_dir:
+            return tile_temp_dir
+        base_dir = cache_root or get_runtime_temp_dir()
+        try:
+            tile_temp_dir = tempfile.mkdtemp(prefix="sds_tiles_", dir=str(base_dir))
+        except Exception:
+            try:
+                tile_temp_dir = tempfile.mkdtemp(prefix="sds_tiles_")
+            except Exception:
+                tile_temp_dir = None
+        return tile_temp_dir
+
+    def _coverage_bbox_from_array(coverage_arr: np.ndarray | None) -> tuple[int, int, int, int] | None:
+        if coverage_arr is None:
+            return None
+        try:
+            arr = np.asarray(coverage_arr, dtype=np.float32, copy=False)
+            if arr.ndim != 2:
+                arr = np.squeeze(arr)
+            if arr.ndim != 2:
+                return None
+            mask = np.isfinite(arr) & (arr > 1e-6)
+            if not np.any(mask):
+                return None
+            ys = np.any(mask, axis=1)
+            xs = np.any(mask, axis=0)
+            y_idx = np.where(ys)[0]
+            x_idx = np.where(xs)[0]
+            if y_idx.size == 0 or x_idx.size == 0:
+                return None
+            return int(y_idx[0]), int(y_idx[-1]) + 1, int(x_idx[0]), int(x_idx[-1]) + 1
+        except Exception:
+            return None
+
+    def _slice_wcs_for_bbox(tile_wcs: Any, *, x0: int, y0: int, width_px: int, height_px: int) -> Any:
+        if tile_wcs is None:
+            return None
+        try:
+            wcs_copy = copy.deepcopy(tile_wcs)
+        except Exception:
+            wcs_copy = tile_wcs
+        try:
+            if hasattr(wcs_copy, "wcs") and hasattr(wcs_copy.wcs, "crpix"):
+                wcs_copy.wcs.crpix[0] -= float(x0)
+                wcs_copy.wcs.crpix[1] -= float(y0)
+            if hasattr(wcs_copy, "pixel_shape") and width_px > 0 and height_px > 0:
+                try:
+                    wcs_copy.pixel_shape = (width_px, height_px)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return wcs_copy
+
+    def _persist_sds_tile(
+        mosaic_arr: np.ndarray,
+        alpha_arr: np.ndarray | None,
+        coverage_arr: np.ndarray | None,
+        tile_index: int,
+    ) -> tuple[str, Any] | None:
+        bbox = _coverage_bbox_from_array(coverage_arr)
+        if bbox is None:
+            bbox = (0, mosaic_arr.shape[0], 0, mosaic_arr.shape[1])
+        y0, y1, x0, x1 = bbox
+        y0 = max(0, min(mosaic_arr.shape[0], y0))
+        y1 = max(y0 + 1, min(mosaic_arr.shape[0], y1))
+        x0 = max(0, min(mosaic_arr.shape[1], x0))
+        x1 = max(x0 + 1, min(mosaic_arr.shape[1], x1))
+        height_px = y1 - y0
+        width_px = x1 - x0
+        if height_px <= 0 or width_px <= 0:
+            return None
+        tile_wcs = _slice_wcs_for_bbox(global_wcs_obj, x0=x0, y0=y0, width_px=width_px, height_px=height_px)
+        tile_dir = _ensure_tile_workspace()
+        if not tile_dir:
+            return None
+        tile_path = Path(tile_dir) / f"sds_tile_{tile_index:04d}.fits"
+        tile_data = np.asarray(mosaic_arr[y0:y1, x0:x1], dtype=np.float32, copy=False)
+        alpha_tile = None
+        if alpha_arr is not None:
+            try:
+                alpha_tile = np.asarray(alpha_arr[y0:y1, x0:x1], dtype=np.uint8, copy=False)
+            except Exception:
+                alpha_tile = np.asarray(alpha_arr[y0:y1, x0:x1], dtype=np.uint8)
+        header = None
+        if tile_wcs is not None and hasattr(tile_wcs, "to_header"):
+            try:
+                header = tile_wcs.to_header(relax=True)
+            except Exception:
+                header = None
+        try:
+            if ZEMOSAIC_UTILS_AVAILABLE and hasattr(zemosaic_utils, "save_fits_image"):
+                zemosaic_utils.save_fits_image(
+                    image_data=np.ascontiguousarray(tile_data),
+                    output_path=str(tile_path),
+                    header=header,
+                    overwrite=True,
+                    save_as_float=True,
+                    legacy_rgb_cube=False,
+                    progress_callback=None,
+                    axis_order="HWC",
+                    alpha_mask=alpha_tile,
+                )
+            else:
+                primary_data = np.moveaxis(tile_data, -1, 0) if tile_data.ndim == 3 else tile_data
+                hdu = fits.PrimaryHDU(primary_data, header=header)
+                hdus = [hdu]
+                if alpha_tile is not None:
+                    alpha_hdu = fits.ImageHDU(alpha_tile.astype(np.uint8, copy=False), name="ALPHA")
+                    hdus.append(alpha_hdu)
+                fits.HDUList(hdus).writeto(str(tile_path), overwrite=True)
+        except Exception as exc:
+            pcb("sds_warn_tile_save_failed", prog=None, lvl="WARN", error=str(exc), filename=str(tile_path))
+            try:
+                if tile_path.exists():
+                    tile_path.unlink()
+            except Exception:
+                pass
+            return None
+        return str(tile_path), tile_wcs
+
     entry_infos: list[dict[str, Any]] = []
     wcs_keys = ("wcs", "phase0_wcs", "phase1_wcs", "header", "phase0_header")
     for group in seastar_groups or []:
@@ -15789,6 +16220,12 @@ def assemble_global_mosaic_sds(
             label=f"batch_{idx + 1}",
         )
 
+    def _safe_asarray(payload, *, dtype=np.float32):
+        try:
+            return np.asarray(payload, dtype=dtype, copy=False)
+        except ValueError:
+            return np.asarray(payload, dtype=dtype)
+
     mosaics: list[np.ndarray] = []
     coverages: list[np.ndarray | None] = []
     alphas: list[np.ndarray | None] = []
@@ -15813,9 +16250,20 @@ def assemble_global_mosaic_sds(
         mosaic_arr, coverage_arr, alpha_arr = batch_result
         if mosaic_arr is None:
             continue
-        mosaics.append(np.asarray(mosaic_arr, dtype=np.float32, copy=False))
-        coverages.append(np.asarray(coverage_arr, dtype=np.float32, copy=False) if coverage_arr is not None else None)
-        alphas.append(alpha_arr.copy() if isinstance(alpha_arr, np.ndarray) else None)
+        mosaics.append(_safe_asarray(mosaic_arr))
+        coverages.append(_safe_asarray(coverage_arr) if coverage_arr is not None else None)
+        if isinstance(alpha_arr, np.ndarray):
+            alphas.append(_safe_asarray(alpha_arr))
+        else:
+            alphas.append(alpha_arr.copy() if alpha_arr is not None else None)
+        saved_tile = _persist_sds_tile(
+            mosaics[-1],
+            alphas[-1],
+            coverages[-1],
+            idx + 1,
+        )
+        if saved_tile:
+            tile_records.append(saved_tile)
 
     if not mosaics:
         pcb("sds_error_no_valid_batches", prog=None, lvl="WARN")
@@ -15832,6 +16280,10 @@ def assemble_global_mosaic_sds(
                 wcs_clone = global_wcs_obj
             tile_pairs.append((mosaic, wcs_clone))
         postprocess_context["two_pass_tile_pairs"] = tile_pairs
+        if tile_records:
+            postprocess_context["sds_tile_records"] = list(tile_records)
+        if tile_temp_dir:
+            postprocess_context["sds_tile_temp_dir"] = tile_temp_dir
 
     def _coverage_weight(cov_arr: np.ndarray | None, batch_len: int) -> float:
         if cov_arr is None:
@@ -15859,7 +16311,7 @@ def assemble_global_mosaic_sds(
         weight_values.append(_coverage_weight(cov, batch_len))
     manual_weights: np.ndarray | None
     if len(weight_values) == len(mosaics):
-        manual_weights = np.asarray(weight_values, dtype=np.float32).reshape((len(weight_values), 1))
+        manual_weights = np.asarray(weight_values, dtype=np.float32).reshape((len(weight_values),))
     else:
         manual_weights = None
 
@@ -15928,7 +16380,7 @@ def assemble_global_mosaic_sds(
     for cov in coverages:
         if cov is None:
             continue
-        arr = np.asarray(cov, dtype=np.float32, copy=False)
+        arr = _safe_asarray(cov)
         if final_coverage is None:
             final_coverage = np.zeros_like(arr, dtype=np.float32)
         final_coverage += arr
@@ -15945,7 +16397,7 @@ def assemble_global_mosaic_sds(
         label="sds_final",
     )
 
-    alpha_candidates = [np.asarray(alpha, dtype=np.float32, copy=False) for alpha in alphas if alpha is not None]
+    alpha_candidates = [_safe_asarray(alpha) for alpha in alphas if alpha is not None]
     final_alpha = None
     if alpha_candidates:
         alpha_stack = np.stack(alpha_candidates, axis=0)
