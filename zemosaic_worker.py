@@ -12447,6 +12447,7 @@ def run_hierarchical_mosaic(
     final_mosaic_data_HWC = None
     final_mosaic_coverage_HW = None
     final_alpha_map = None
+    sds_fallback_logged = False
     alpha_final: np.ndarray | None = None
     master_tiles_results_list: list[tuple[str, Any]] = []
     final_quality_pipeline_cfg = {
@@ -12528,9 +12529,9 @@ def run_hierarchical_mosaic(
             final_mosaic_data_HWC = None
             final_mosaic_coverage_HW = None
             final_alpha_map = None
-            pcb("sds_off_classic_mastertile", prog=None, lvl="INFO")
+            pcb("sds_off_classic_mastertile_pipeline", prog=None, lvl="INFO")
         else:
-            pcb("sds_on_megatile_mode", prog=None, lvl="INFO")
+            pcb("sds_on_mega_tile_pipeline", prog=None, lvl="INFO")
             mosaic_result = assemble_global_mosaic_sds(
                 seestar_stack_groups,
                 global_plan=global_wcs_plan,
@@ -12629,6 +12630,9 @@ def run_hierarchical_mosaic(
                 )
                 seestar_stack_groups = []
             else:
+                if not sds_fallback_logged:
+                    pcb("sds_and_mosaic_first_failed_fallback_mastertiles", prog=None, lvl="WARN")
+                    sds_fallback_logged = True
                 pcb("global_coadd_error_failed_fallback", prog=None, lvl="WARN")
                 global_wcs_plan["enabled"] = False
 
@@ -12644,6 +12648,9 @@ def run_hierarchical_mosaic(
 
 
     if final_mosaic_data_HWC is None:
+            if sds_mode_flag and not sds_fallback_logged:
+                pcb("sds_and_mosaic_first_failed_fallback_mastertiles", prog=None, lvl="WARN")
+                sds_fallback_logged = True
             # --- Phase 3 (Création Master Tuiles) ---
             base_progress_phase3 = current_global_progress
             _log_memory_usage(progress_callback, "Début Phase 3 (Master Tuiles)")
@@ -15538,7 +15545,12 @@ def assemble_global_mosaic_sds(
                 return None
 
     def _extract_shape(entry: dict) -> tuple[int, int] | None:
-        shape_candidate = entry.get("shape") or entry.get("phase0_shape") or entry.get("phase1_shape")
+        shape_candidate = (
+            entry.get("shape")
+            or entry.get("phase0_shape")
+            or entry.get("phase1_shape")
+            or entry.get("preprocessed_shape")
+        )
         if isinstance(shape_candidate, (list, tuple)) and len(shape_candidate) >= 2:
             try:
                 h = int(shape_candidate[0])

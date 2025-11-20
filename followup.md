@@ -1,28 +1,25 @@
-
----
-
-# 🔁 `followup.md` — Step-by-Step Instructions for Codex
+## `followup.md`
 
 ```markdown
-# FOLLOW-UP — Step-by-Step Instructions
-### SDS Flow Fix (Option A)
+# FOLLOW-UP — SDS vs Classic Pipeline Flow (Option A)
 
-This follow-up gives you exact steps to implement the mission described in `agent.md`.
+This follow-up provides a concrete step-by-step plan to implement the mission described in `agent.md`.
 
 ---
 
-# 1. Open file:
-`zemosaic_worker.py`
+## 1. Identify the orchestration code in `zemosaic_worker.py`
 
-Locate the function:
+1. Open `zemosaic_worker.py`.
+2. Locate the main function that orchestrates all phases (commonly named something like `run_hierarchical_mosaic(...)` or similar).
+3. Inside that function, find the block where:
 
-````
+   - `global_wcs_plan` is built (for Seestar mosaic),
+   - and where the worker currently decides whether to call:
+     - `assemble_global_mosaic_sds(...)`
+     - and/or `assemble_global_mosaic_first(...)`
+   - and assigns `final_mosaic_data_HWC`, `final_mosaic_coverage_HW`, `final_alpha_map`.
 
-run_hierarchical_mosaic(...)
-
-````
-
-Inside, find the block:
+You will typically see something like:
 
 ```python
 if global_wcs_plan and global_wcs_plan["enabled"]:
@@ -34,142 +31,162 @@ if global_wcs_plan and global_wcs_plan["enabled"]:
         mosaic_result = assemble_global_mosaic_first(...)
 
     final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = mosaic_result
-    ...
 ````
 
----
-
-# 2. MODIFY THE FLOW ACCORDING TO OPTION A
-
-Replace the logic above with:
-
-## Case A — SDS is OFF
-
-Insert:
-
-```python
-if not sds_mode_flag:
-    # SDS is OFF → force master tiles mode
-    final_mosaic_data_HWC = None
-    final_mosaic_coverage_HW = None
-    final_alpha_map = None
-```
-
-And **skip**:
-
-* `assemble_global_mosaic_sds`
-* `assemble_global_mosaic_first`
-
-## Case B — SDS is ON
-
-Implement:
-
-```python
-else:
-    # SDS is ON
-    mosaic_result = assemble_global_mosaic_sds(...)
-
-    if mosaic_result[0] is None:
-        mosaic_result = assemble_global_mosaic_first(...)
-
-    final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = mosaic_result
-```
-
----
-
-# 3. LET PHASE 3 HANDLE THE REST
-
-After the SDS block you will find:
+followed later by:
 
 ```python
 if final_mosaic_data_HWC is None:
-    # → classic master tile block (Phase 3)
+    # Phase 3: classic master-tile pipeline
+    ...
+else:
+    # Phase 5/6: postprocessing on final mosaic
+    ...
 ```
 
-Do **not modify this block**.
-
-This ensures:
-
-* SDS OFF → Phase 3 runs ALWAYS
-* SDS ON → Phase 3 only runs if SDS AND Mosaic-First failed
+The exact variable names may vary; adjust accordingly.
 
 ---
 
-# 4. Ensure NO OTHER BEHAVIOR CHANGES
+## 2. Enforce behaviour when SDS is OFF
 
-Do **not** touch:
+Goal: when SDS is OFF → **classic master-tile pipeline MUST run**.
 
-* master tile construction code
-* SDS batch creation
-* normalization pipelines
-* GPU/CPU branches
-* lecropper / alt-az cleanup
-* Phase 4.5 / two-pass
-* Tk GUI
-* Qt GUI (outside SDS mode flag logic)
+1. Ensure you have a boolean flag (e.g. `sds_mode_flag`) indicating whether SDS is active. It may come from:
 
----
+   * configuration,
+   * Filter GUI overrides,
+   * Seestar detection.
 
-# 5. Add minimal logging (optional but recommended)
+2. In the `global_wcs_plan` block, change the logic so that:
 
-When SDS is OFF, add:
+   * If `not sds_mode_flag`:
 
-```python
-self._log_and_callback(pcb_fn, "info", "sds_off_classic_mastertile")
-```
+     * **do NOT call** `assemble_global_mosaic_sds`.
+     * **do NOT call** `assemble_global_mosaic_first`.
+     * Explicitly set:
 
-When SDS is ON:
+       ```python
+       final_mosaic_data_HWC = None
+       final_mosaic_coverage_HW = None
+       final_alpha_map = None
+       ```
+     * Optionally log:
 
-```python
-self._log_and_callback(pcb_fn, "info", "sds_on_megatile_mode")
-```
+       ```python
+       _log_and_callback(pcb_fn, "info", "sds_off_classic_mastertile_pipeline")
+       ```
+   * This guarantees that the later `if final_mosaic_data_HWC is None:` block will execute the classic master-tile Phase 3 pipeline.
 
-If SDS fails:
-
-```python
-self._log_and_callback(pcb_fn, "warning", "sds_failed_fallback_mosaic_first")
-```
-
-Do NOT create new localization keys unless necessary.
+3. Make sure that no other branch accidentally sets `final_mosaic_data_HWC` in the SDS-OFF case.
 
 ---
 
-# 6. Test Scenarios
+## 3. Enforce behaviour when SDS is ON
+
+Goal: when SDS is ON → **SDS mega-tiles pipeline is primary**.
+
+1. In the same orchestration block, handle the SDS ON case:
+
+   ```python
+   if sds_mode_flag and global_wcs_plan and global_wcs_plan["enabled"]:
+       _log_and_callback(pcb_fn, "info", "sds_on_mega_tile_pipeline")
+       mosaic_result = assemble_global_mosaic_sds(...)
+
+       if mosaic_result[0] is None:
+           _log_and_callback(pcb_fn, "warning", "sds_failed_fallback_mosaic_first")
+           mosaic_result = assemble_global_mosaic_first(...)
+
+       final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = mosaic_result
+   ```
+
+2. **Do not** call `assemble_global_mosaic_first` unless SDS fails.
+
+3. After this block:
+
+   * If `final_mosaic_data_HWC` is still `None`:
+
+     * fall back to the classic Phase 3 pipeline:
+
+       ```python
+       _log_and_callback(pcb_fn, "warning", "sds_and_mosaic_first_failed_fallback_mastertiles")
+       # ...run Phase 3 master-tile stacking
+       ```
+   * Else:
+
+     * run the existing Phase 5/6 postprocessing on `final_mosaic_data_HWC` / coverage / alpha.
+
+4. Do not modify the internals of `assemble_global_mosaic_sds` or `assemble_global_mosaic_first` beyond what’s necessary to align with this flow.
+
+---
+
+## 4. Preserve SDS batch policy and scalability
+
+You must **not** touch:
+
+* The SDS batch-building logic:
+
+  * `sds_min_batch_size`, `sds_target_batch_size`,
+  * coverage-based grouping.
+* The chunking / streaming logic in SDS or Mosaic-First backends.
+* Any memory-mapping options or GPU/CPU switching logic.
+
+Sanity checks for scalability (conceptual):
+
+* With 60 frames:
+
+  * SDS ON → a handful of SDS batches (e.g. 10–15 mega-tiles), then one final stack.
+* With 10 000 frames:
+
+  * SDS ON → still builds batches using the same policy without blowing up memory.
+  * The worker never tries to allocate full H×W×10 000 arrays.
+
+If you see any code path that attempts to materialize all frames at once into memory, **do not introduce new ones**. Reuse the existing streaming/tiling approach.
+
+---
+
+## 5. Test matrix (conceptual)
 
 ### Test 1 — SDS OFF, Seestar data
 
-* Must ALWAYS go to Phase 3 master tiles.
-* Must NOT call SDS nor Mosaic-First lights.
+* SDS checkbox off in Filter GUI Qt (and/or config).
+* Run a Seestar dataset.
+* Expectation:
 
-### Test 2 — SDS ON, healthy WCS
+  * Logs should **not** show SDS or Mosaic-First running.
+  * `final_mosaic_data_HWC` should initially be `None`, triggering:
 
-* SDS → mega-tiles → super-stack
-* Phase 3 bypassed
+    * Phase 3 master-tile building,
+    * then normal grid / final assembly.
+  * Final image should be non-black and consistent with classic Tk workflow.
 
-### Test 3 — SDS ON, SDS fail
+### Test 2 — SDS ON, normal case
 
-* SDS fails → Mosaic-First
-* If Mosaic-First fails too → Phase 3
+* SDS checkbox ON, valid Seestar series with good WCS.
+* Expectation:
+
+  * Logs show `"sds_on_mega_tile_pipeline"`.
+  * `assemble_global_mosaic_sds` builds batches and mega-tiles.
+  * No fallback to classic Phase 3.
+  * Final image non-black, produced via SDS.
+
+### Test 3 — SDS ON, SDS failure
+
+* Simulate an SDS failure (e.g. by forcing `assemble_global_mosaic_sds` to return `(None, None, None)` in a controlled test).
+* Expectation:
+
+  * Log `"sds_failed_fallback_mosaic_first"`.
+  * Mosaic-First attempts to build final mosaic.
+  * If Mosaic-First also fails, Phase 3 fallback is used with warning log.
 
 ### Test 4 — Non-Seestar data
 
-* Must remain unchanged
+* Ensure that:
+
+  * Non-Seestar entries do NOT enter SDS or Mosaic-First Seestar-specific global WCS code.
+  * Classic pipeline remains unchanged.
 
 ---
 
-This completes the modification.
-
-```
-
----
-
-# 🎉 Résultat
-
-Avec ces deux fichiers :
-
-- SDS OFF = **tu retrouves EXACTEMENT ton pipeline original**  
-  → Master tiles → mosaïque → renorm → save
-
-- SDS ON =  
-  → reproject lights par batches SDS → stack de mega tiles → P5/P6
+If any of these conceptual tests would fail with your changes, refine the flow control while keeping all constraints above.
 
