@@ -1,254 +1,241 @@
-# Mission — Synchroniser le mode SDS entre la GUI principale Qt et la GUI de filtrage Qt
 
-## Contexte
+### 0. Contexte général
 
-Dans ZeMosaic, il existe aujourd’hui deux cases à cocher liées au mode SDS (ZeSupaDupStack) :
-
-1. **Dans la GUI principale Qt** (`zemosaic_gui_qt.py`, onglet *Main*) :
-   - Case : **"Enable SDS mode by default"**
-   - Cette case est liée à la clé de config `sds_mode_default` (booléen).
-
-2. **Dans la GUI de filtrage Qt** (`zemosaic_filter_gui_qt.py`) :
-   - Case : **"Enable ZeSupaDupStack (SDS)"**
-   - Cette case est liée à `sds_mode` (overrides / metadata) et à la config `sds_mode_default` pour certains chemins.
+Projet : **ZeMosaic V4.1.x – Superacervandi**
+Objectif de cette mission : ajouter une **option globale** dans la configuration + GUI Qt pour **supprimer les fichiers temporaires de traitement une fois le run terminé**, et ne les **conserver qu’en cas de debug**.
 
 Actuellement :
-- La case du *filter* est **activée par défaut** côté `DEFAULT_FILTER_CONFIG` (`sds_mode_default=True`).
-- La case de la GUI principale est **désactivée par défaut** (`sds_mode_default=False`).
-- La synchronisation n’est que partielle : l’état n’est pas systématiquement partagé entre les deux interfaces.
 
-**Objectif ergonomique** :
+* Le groupe *System resources & cache* du **Qt GUI** contient :
 
-> Avoir une **préférence SDS unique** (`sds_mode_default`) :
-> - La case *Main* « Enable SDS mode by default » reflète / contrôle `sds_mode_default`.
-> - La case *Filter* « Enable ZeSupaDupStack (SDS) » :
->   - s’initialise selon `sds_mode_default` (ou un override explicite `sds_mode`) ;
->   - renvoie son état vers la GUI principale, qui met à jour `sds_mode_default` + sa propre case.
+  * `coadd_use_memmap`
+  * `coadd_cleanup_memmap`
+  * `coadd_memmap_dir`
+  * `cache_retention` (run_end / per_tile / keep)
+* Le worker a déjà une fonction `_cleanup_memmap_artifacts()` qui :
 
-En résumé, **les deux cases doivent se suivre** :
-- Cocher / décocher dans le *Main* → le *Filter* ouvre dans le même état.
-- Cocher / décocher dans le *Filter* → le *Main* met à jour sa case et la config.
+  * nettoie certains fichiers `.dat` (`mosaic_*`, `coverage_*`, `zemosaic_*`) **dans le dossier memmap**,
+  * efface certains répertoires `mosaic_first_*` **dans ce même dossier**,
+  * supprime les fichiers WCS globaux `global_mosaic_wcs*.fits` / `.json` associés au plan global.
+* En **Phase 7 (Nettoyage)**, le worker efface :
 
----
+  * le cache des brutes pré-traitées (`temp_image_cache_dir`) selon `cache_retention`,
+  * le dossier des **master tiles FITS** (`temp_master_tile_storage_dir`) seulement si `two_pass_enabled` est `False`,
+  * le dossier SDS runtime (`sds_runtime_tile_dir`) est supprimé sans option centrale.
 
-## Fichiers à modifier
+Limites actuelles :
 
-Les fichiers sont disponibles dans le repo, et une copie de travail existe aussi dans l’environnement suivant (à titre de référence) :
+* Certains artefacts demeurent sur disque **même après succès** :
 
-- `/mnt/data/zemosaic_gui_qt.py`
-- `/mnt/data/zemosaic_filter_gui_qt.py`
+  * répertoires `mosaic_first_<uuid>` (notamment dans le `runtime_temp_dir` ou ailleurs que le memmap dir),
+  * dossiers de master tiles / super / mega tiles,
+  * WCS globaux `global_mosaic_wcs.fits` / `.json` quand le nettoyage memmap n’est pas activé,
+  * fichiers `.dat` comme `coverage_3261x2388.dat`, `mosaic_3261x2388x3.dat` hors du scope strict actuel.
+* Le comportement dépend de plusieurs flags spécifiques (`coadd_use_memmap`, `coadd_cleanup_memmap`, `cache_retention`, etc.) mais **l’utilisateur n’a pas un bouton unique** “je veux que tout ce qui est temporaire disparaisse après le run”.
 
-**Ne modifier que ces deux fichiers** pour cette mission.
+### 1. Objectif fonctionnel
 
----
+Ajouter une **nouvelle option globale** :
 
-## Détail des modifications à effectuer
+> **Checkbox Qt (System)** :
+> `qt_field_cleanup_temp_artifacts`
+> Libellé EN : **“Delete temporary processing files after run”**
+> Libellé FR : **“Supprimer les fichiers temporaires de traitement après l’exécution”**
 
-### 1. zemosaic_filter_gui_qt.py
+* Cette option doit :
 
-#### 1.1. Aligner le défaut `sds_mode_default` sur le main (False)
+  * être **activée par défaut** (`True`),
+  * contrôler un nouveau flag de config (ex. `cleanup_temp_artifacts`),
+  * agir comme **master switch** pour la suppression des artefacts de traitement **non utiles après la fin du run**.
+* Quand **cochée** : on supprime automatiquement les fichiers/dossiers temporaires listés plus bas.
+* Quand **décochée** : on **conserve** ces artefacts pour debug/inspection (sans toucher aux sorties finales classiques : FITS/PNG de la mosaïque finale).
 
-Repérer le bloc de définition de `DEFAULT_FILTER_CONFIG` :
+### 2. Artefacts à traiter
+
+La nouvelle option doit piloter la suppression **après la fin du traitement** (Phase 7) des éléments suivants :
+
+1. **Répertoires `mosaic_first_*`**
+
+   * Dans le **memmap directory** (si configuré) – déjà partiellement géré par `_cleanup_memmap_artifacts`.
+   * Dans le **runtime temp dir global** (`get_runtime_temp_dir()`) ou tout autre emplacement où ces dossiers sont créés.
+2. **Fichiers memmap `.dat`** **inutiles après run** :
+
+   * fichiers `mosaic_*.dat` (ex: `mosaic_3261x2388x3.dat`),
+   * fichiers `coverage_*.dat` (ex: `coverage_3261x2388.dat`),
+   * fichiers `zemosaic_*.dat`.
+3. **Fichiers WCS globaux temporaires** :
+
+   * `global_mosaic_wcs.fits`,
+   * `global_mosaic_wcs.json`,
+   * et tout fichier dont le nom contient `global_mosaic_wcs` généré comme artefact interne, dans le dossier de sortie ou dans le chemin du plan WCS global.
+   * ⚠ Important : **ne pas supprimer** les fichiers WCS dont le nom **ne contient pas** `global_mosaic_wcs` (cases avancées où l’utilisateur fournit un nom spécifique pour archiver le WCS).
+4. **Dossier des Master Tiles / Super/Mega Tiles** :
+
+   * `temp_master_tile_storage_dir` doit être supprimé **même si** `two_pass_enabled == True`, quand `cleanup_temp_artifacts` est activé, car les passes sont terminées et le dossier n’est plus nécessaire.
+5. **Dossier SDS runtime (méga/super tiles)** :
+
+   * `sds_runtime_tile_dir` doit être supprimé **uniquement** si `cleanup_temp_artifacts` est activé. Aujourd’hui il est toujours supprimé.
+
+Règle d’or : **Ne jamais supprimer** :
+
+* La mosaïque finale FITS/PNG/JPEG (quel que soit le format),
+* Les sorties explicitement choisies par l’utilisateur (output folder),
+* Les logs.
+
+### 3. Plomberie de configuration
+
+#### 3.1. Nouveau champ de config
+
+Dans `zemosaic_config.py` :
+
+* Ajouter un booléen `cleanup_temp_artifacts: bool = True` dans la structure principale de configuration (ou dict, selon l’implémentation). 
+* S’assurer que :
+
+  * au **chargement**, si la clé est absente, on retombe sur `True` (compatibilité ascendante),
+  * à la **sauvegarde**, la clé est persistée comme les autres booléens (ex : `coadd_use_memmap`, `coadd_cleanup_memmap`, `cache_retention`, etc.).
+
+#### 3.2. Passage au worker
+
+* Le worker central dans `zemosaic_worker.py` lit déjà une copie de la config (`worker_config_cache`). 
+
+* Introduire un bool interne, par ex. :
+
+  ```python
+  cleanup_temp_artifacts_config = bool(
+      (worker_config_cache or {}).get("cleanup_temp_artifacts", True)
+  )
+  ```
+
+* Ce flag doit être accessible :
+
+  * au moment d’appeler `_cleanup_memmap_artifacts()`,
+  * durant la **Phase 7** quand on gère caches, master tiles et SDS runtime.
+
+### 4. GUI Qt – System / Cache Tab
+
+Fichier : `zemosaic_gui_qt.py`
+
+Dans la méthode `_create_system_resources_group` :
+
+* Ajouter une **nouvelle checkbox** après les options memmap, avant ou après `cache_retention` (à ton choix, mais dans le même group box) :
+
+  * Clé config : `"cleanup_temp_artifacts"`
+  * Texte : `self._tr("qt_field_cleanup_temp_artifacts", "Delete temporary processing files after run")`
+
+* Utiliser `_register_checkbox` comme pour :
+
+  * `coadd_use_memmap`
+  * `coadd_cleanup_memmap`
+
+Exemple conceptuel (ne pas copier tel quel, adapter au style existant) :
 
 ```python
-DEFAULT_FILTER_CONFIG: dict[str, Any] = dict(_DEFAULT_GUI_CONFIG_MAP)
-DEFAULT_FILTER_CONFIG.setdefault("auto_detect_seestar", True)
-DEFAULT_FILTER_CONFIG.setdefault("force_seestar_mode", False)
-DEFAULT_FILTER_CONFIG.setdefault("sds_mode_default", True)
-DEFAULT_FILTER_CONFIG.setdefault("sds_min_batch_size", 5)
-DEFAULT_FILTER_CONFIG.setdefault("sds_target_batch_size", 10)
-DEFAULT_FILTER_CONFIG.setdefault("global_coadd_method", "kappa_sigma")
-DEFAULT_FILTER_CONFIG.setdefault("global_coadd_k", 2.0)
-````
-
-**Modification demandée :**
-
-* Passer le défaut de `True` à `False` pour être cohérent avec le `fallback_defaults` du main :
-
-DEFAULT_FILTER_CONFIG.setdefault("sds_mode_default", False)
-```
-
-> Ne pas toucher aux autres lignes (min / target batch size, coadd, etc.).
-
----
-
-#### 1.2. Initialiser `_sds_mode_initial` à partir de `sds_mode` OU `sds_mode_default`
-
-Repérer dans `FilterQtDialog.__init__` le calcul actuel :
-
-```python
-self._sds_mode_initial = self._coerce_bool(
-    (initial_overrides or {}).get("sds_mode")
-    if isinstance(initial_overrides, dict)
-    else None,
-    self._coerce_bool(
-        (config_overrides or {}).get("sds_mode")
-        if isinstance(config_overrides, dict)
-        else None,
-        True,
+self._register_checkbox(
+    "cleanup_temp_artifacts",
+    layout,
+    self._tr(
+        "qt_field_cleanup_temp_artifacts",
+        "Delete temporary processing files after run",
     ),
+    default_checked=True,  # si supporté par le helper ; sinon gérer via config default
 )
 ```
 
-**Objectif :**
+Le champ doit être correctement relié au dict `self.config` pour être pris en compte dans le worker comme les autres options.
 
-1. Priorité à `initial_overrides["sds_mode"]` (si présent).
-2. Sinon, utiliser `config_overrides["sds_mode_default"]` si disponible.
-3. Sinon, fallback sur `DEFAULT_FILTER_CONFIG["sds_mode_default"]` (désormais False).
+### 5. Worker – Logiciel de nettoyage
 
-**Remplacer le bloc par :**
+Fichier : `zemosaic_worker.py` 
 
-```python
-self._sds_mode_initial = self._coerce_bool(
-    (initial_overrides or {}).get("sds_mode")
-    if isinstance(initial_overrides, dict)
-    else None,
-    self._coerce_bool(
-        (config_overrides or {}).get("sds_mode_default")
-        if isinstance(config_overrides, dict)
-        else None,
-        bool(DEFAULT_FILTER_CONFIG.get("sds_mode_default", False)),
-    ),
-)
-```
+#### 5.1. Refactor de `_cleanup_memmap_artifacts`
 
-Ne pas modifier la suite, qui associe cette valeur à la case :
+* Modifier `_cleanup_memmap_artifacts()` pour qu’elle :
 
-```python
-self._sds_checkbox = QCheckBox(
-    self._localizer.get("filter_chk_sds_mode", "Enable ZeSupaDupStack (SDS)"),
-    box,
-)
-self._sds_checkbox.setChecked(bool(self._sds_mode_initial))
-...
-```
+  * **Reçoive** explicitement les paramètres nécessaires, plutôt que d’utiliser uniquement des variables externes :
 
----
+    * `coadd_use_memmap_config`
+    * `coadd_cleanup_memmap_config`
+    * `coadd_memmap_dir_config`
+    * `worker_config_cache`
+    * `output_folder`
+    * `global_wcs_plan`
+    * `cleanup_temp_artifacts_config`
+    * éventuellement `runtime_temp_dir` via `get_runtime_temp_dir()`
+  * OU, si tu préfères, lire `cleanup_temp_artifacts_config` comme variable fermée mais **ne pas casser** la signature actuelle pour le reste.
 
-### 2. zemosaic_gui_qt.py
+* Comportement souhaité :
 
-Nous avons deux modifications à faire :
+  1. Si `cleanup_temp_artifacts_config` est **False** → **sortir immédiatement** de `_cleanup_memmap_artifacts()` (ne rien supprimer, y compris WCS globaux).
+  2. Si `cleanup_temp_artifacts_config` est **True** :
 
-1. **Passer l’état SDS du main vers le filter.**
-2. **Récupérer l’état SDS du filter vers le main.**
+     * Si `coadd_use_memmap_config` & `coadd_cleanup_memmap_config` & `coadd_memmap_dir_config` sont valides :
 
-#### 2.1. Propager `sds_mode_default` → `initial_overrides["sds_mode"]`
+       * garder la logique actuelle de nettoyage des `.dat` & `mosaic_first_*` dans le **memmap dir**.
+     * En plus, scanner :
 
-Dans `_launch_filter_dialog`, repérer l’endroit où `initial_overrides` est construit :
+       * le `runtime_temp_dir` global (`get_runtime_temp_dir()`),
+       * et supprimer tout répertoire `mosaic_first_*` trouvé à ce niveau (sans effacer d’autres sous-dossiers).
+     * Nettoyage des WCS globaux `global_mosaic_wcs*.fits` / `.json` tel que déjà implémenté aujourd’hui, mais **sans exiger** que le bloc memmap ait tourné (donc même si memmap est désactivé).
 
-```python
-initial_overrides: Dict[str, Any] | None = None
-try:
-    initial_overrides = {
-        "cluster_panel_threshold": float(self.config.get("cluster_panel_threshold", 0.05)),
-        "cluster_target_groups": int(self.config.get("cluster_target_groups", 0)),
-        "cluster_orientation_split_deg": float(self.config.get("cluster_orientation_split_deg", 0.0)),
-    }
-except Exception:
-    initial_overrides = None
-```
+#### 5.2. Phase 7 – Nettoyage général
 
-**Modification demandée :**
+Toujours dans `zemosaic_worker.py` (bloc Phase 7 déjà présent)  :
 
-* Ajouter une entrée `sds_mode` qui reflète l’état courant de `sds_mode_default` dans la config principale.
+* Laisser **inchangé** le comportement de `cache_retention` pour le cache de brutes (temp_image_cache_dir) :
 
-Par exemple :
+  * `cache_retention == "keep"` → on garde le cache,
+  * sinon → on supprime le cache comme aujourd’hui.
+  * Ce comportement est **indépendant** de `cleanup_temp_artifacts` (donc même si `cleanup_temp_artifacts` est False, si l’utilisateur a choisi de ne pas garder le cache, on le nettoie).
+* Ajouter l’usage de `cleanup_temp_artifacts_config` pour :
 
-```python
-initial_overrides = {
-    "cluster_panel_threshold": float(self.config.get("cluster_panel_threshold", 0.05)),
-    "cluster_target_groups": int(self.config.get("cluster_target_groups", 0)),
-    "cluster_orientation_split_deg": float(self.config.get("cluster_orientation_split_deg", 0.0)),
-    # Synchroniser l’état de la case "Enable SDS mode by default" vers le Filter Qt
-    "sds_mode": bool(self.config.get("sds_mode_default", False)),
-}
-```
+  1. **Master tiles / super tiles** (`temp_master_tile_storage_dir`) :
 
-> L’idée est que, lorsque l’utilisateur ouvre le filter, la case « Enable ZeSupaDupStack (SDS) » s’aligne sur ce que l’utilisateur a choisi dans le *Main*.
+     * Aujourd’hui : on ne les supprime que si `two_pass_enabled` est False.
+     * Nouveau : si `cleanup_temp_artifacts_config` est **True**, supprimer **toujours** ce dossier s’il existe, indépendamment de `two_pass_enabled`.
 
----
+       * Si besoin, garder un log de type `run_info_temp_master_tiles_fits_cleaned` déjà existant.
+     * Si `cleanup_temp_artifacts_config` est **False**, ne pas supprimer ce répertoire (même si `two_pass_enabled` est False).
+  2. **SDS runtime dir** (`sds_runtime_tile_dir`) :
 
-#### 2.2. Appliquer `overrides["sds_mode"]` au `sds_mode_default` du main
+     * Aujourd’hui : toujours supprimé via `shutil.rmtree(..., ignore_errors=True)`. 
+     * Nouveau : entourer cet appel d’un test `if cleanup_temp_artifacts_config:` :
 
-Repérer la méthode :
+       * `True` → comportement actuel (supprimer),
+       * `False` → **ne rien faire** (donc le dossier SDS reste pour debug).
+  3. S’il existe d’autres répertoires temporaires clairs (**runtime tiles, caches mosaïque-first, etc.**) qui ne contiennent **jamais** les sorties finales de l’utilisateur, ils peuvent être inclus dans ce même master switch.
 
-```python
-def _apply_filter_overrides_to_config(self, overrides: Dict[str, Any] | None) -> None:
-    if not overrides:
-        return
-    for key in (
-        "cluster_panel_threshold",
-        "cluster_target_groups",
-        "cluster_orientation_split_deg",
-    ):
-        if key in overrides:
-            self._update_widget_from_config(key, overrides[key])
-    if "astap_max_instances" in overrides:
-        self._update_widget_from_config("astap_max_instances", overrides["astap_max_instances"])
-        self._apply_astap_concurrency_setting()
-```
+### 6. Localisation / Traductions
 
-**Modification demandée :**
+Fichiers : `locales/en.json`, `locales/fr.json`, et toutes les autres langues disponibles (es, pl, de, nl, is, …).
 
-* Entre la boucle `for key in (...)` et le bloc `if "astap_max_instances" ...`, ajouter un bloc pour synchroniser la préférence SDS :
+Tu DOIS :
 
-```python
-def _apply_filter_overrides_to_config(self, overrides: Dict[str, Any] | None) -> None:
-    if not overrides:
-        return
-    for key in (
-        "cluster_panel_threshold",
-        "cluster_target_groups",
-        "cluster_orientation_split_deg",
-    ):
-        if key in overrides:
-            self._update_widget_from_config(key, overrides[key])
+1. Ajouter la **clé d’interface** suivante dans **tous les fichiers de langue** :
 
-    # Synchroniser le choix SDS du Filter Qt avec la case "Enable SDS mode by default"
-    if "sds_mode" in overrides:
-        self._update_widget_from_config("sds_mode_default", overrides["sds_mode"])
+   * `"qt_field_cleanup_temp_artifacts": "Delete temporary processing files after run"` (EN)
+   * `"qt_field_cleanup_temp_artifacts": "Supprimer les fichiers temporaires de traitement après l’exécution"` (FR)
+   * Pour les autres langues (ES/PL/DE/NL/IS…), soit :
 
-    if "astap_max_instances" in overrides:
-        self._update_widget_from_config("astap_max_instances", overrides["astap_max_instances"])
-        self._apply_astap_concurrency_setting()
-```
+     * fournir une vraie traduction si tu es sûr,
+     * soit **dupliquer le texte anglais** (mais ne jamais laisser la clé manquante).
 
-`_update_widget_from_config("sds_mode_default", ...)` doit déjà :
+2. Vérifier qu’aucun nouvel identifiant (clé Qt ou log_key) n’est utilisé sans être présent dans **tous** les JSON de localisation.
+   Si tu ajoutes d’autres log messages, ils doivent suivre la même règle.
 
-* mettre à jour `self.config["sds_mode_default"]`, et
-* mettre à jour l’état de la case « Enable SDS mode by default » dans la GUI principale (via la logique existante déjà utilisée pour les autres champs).
+### 7. Invariants à respecter
+
+* Ne rien casser dans le comportement de **stacking**, SDS, Phase 4.5, two-pass renorm, GPU, etc.
+* Ne pas modifier le comportement de :
+
+  * `coadd_use_memmap` (active juste l’usage memmap),
+  * `coadd_cleanup_memmap` (contrôle la suppression des `.dat` *quand* `cleanup_temp_artifacts` est `True`),
+  * `cache_retention`.
+* Ne jamais supprimer les fichiers finaux du dossier de sortie :
+
+  * mosaïque finale FITS / PNG / JPG,
+  * preview finale,
+  * logs.
+* Ne pas introduire de dépendance supplémentaire lourde (pas de nouvelle lib externe).
 
 ---
 
-## Contraintes
-
-* Ne PAS modifier la logique des autres options (coverage, overcap, coadd, etc.).
-* Ne PAS refactoriser le reste du code : la mission est purement cosmétique / synchronisation d’état.
-* Laisser intacte toute la logique SDS existante (plan SDS, `global_wcs_plan_override`, etc.), sauf les points explicitement indiqués ci-dessus.
-* Conserver les noms de fonctions et clés (`sds_mode_default`, `sds_mode`) tels quels.
-
----
-
-## Résultat attendu (comportement utilisateur)
-
-1. **Au démarrage, si aucune config existante** :
-
-   * `sds_mode_default` = False par défaut (Main + Filter).
-   * La case « Enable SDS mode by default » est décochée.
-   * La case « Enable ZeSupaDupStack (SDS) » est décochée à l’ouverture du filter.
-
-2. **Si l’utilisateur coche la case SDS dans le Main puis ouvre le Filter** :
-
-   * `sds_mode_default` passe à True.
-   * À l’ouverture du Filter, la case « Enable ZeSupaDupStack (SDS) » est **cochée** automatiquement.
-
-3. **Si l’utilisateur change la case SDS dans le Filter et valide** :
-
-   * Les `overrides` contiennent `sds_mode`.
-   * `_apply_filter_overrides_to_config` met à jour `sds_mode_default` avec cette valeur.
-   * La case « Enable SDS mode by default » dans le Main se met à jour automatiquement.
-   * Le JSON de config persistant (via le mécanisme existant) garde cette préférence pour la prochaine session.
-
-Si ces conditions sont remplies, la mission est considérée comme réussie.
-
-````

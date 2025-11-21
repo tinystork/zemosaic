@@ -799,7 +799,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._disable_phase45_config()
         self.localizer = self._create_localizer(self.config.get("language", "en"))
         self.setWindowTitle(
-            self._tr("qt_window_title_preview", "ZeMosaic V4.1.0 – Superacervandi (Qt Preview)")
+            self._tr("qt_window_title_preview", "ZeMosaic V4.2.0 – Superacervandi ")
         )
         self._gpu_devices: List[Tuple[str, int | None]] = self._detect_gpus()
         if self._gpu_devices:
@@ -2668,6 +2668,15 @@ class ZeMosaicQtMainWindow(QMainWindow):
             ),
         )
 
+        self._register_checkbox(
+            "cleanup_temp_artifacts",
+            layout,
+            self._tr(
+                "qt_field_cleanup_temp_artifacts",
+                "Delete temporary processing files after run",
+            ),
+        )
+
         cache_combo = QComboBox(group)
         cache_options = [
             ("run_end", self._tr("qt_cache_retention_run_end", "Release caches at run end")),
@@ -3867,7 +3876,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _refresh_translated_ui(self) -> None:
         self.setWindowTitle(
-            self._tr("qt_window_title_preview", "ZeMosaic V4.1.0 – Superacervandi (Qt Preview)")
+            self._tr("qt_window_title_preview", "ZeMosaic V4.2.0 – Superacervandi ")
         )
         previous_log = ""
         if hasattr(self, "log_output"):
