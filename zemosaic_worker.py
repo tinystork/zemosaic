@@ -6498,6 +6498,9 @@ def _compute_auto_tile_caps(
     if per_frame_mb > 0 and usable_vram_mb > 0:
         gpu_hint = max(1, min(cap_candidate, int(math.floor(usable_vram_mb / per_frame_mb))))
 
+    if memmap_enabled and (not user_max_override or user_max_override <= 0):
+        cap_candidate = 0  # allow unlimited when memmap streaming is available
+
     parallel_cap = 1
     if frames_by_ram and cap_candidate > 0:
         parallel_cap = max(1, frames_by_ram // max(1, cap_candidate))
@@ -9042,6 +9045,42 @@ def create_master_tile(
     stack_metadata: dict[str, Any] = {}
 
     current_parallel_plan = parallel_plan or getattr(zconfig, "parallel_plan", None)
+    effective_winsor_frames_per_pass = int(winsor_max_frames_per_pass) if winsor_max_frames_per_pass is not None else 0
+    if effective_winsor_frames_per_pass < 0:
+        effective_winsor_frames_per_pass = 0
+    try:
+        sample_frame = valid_aligned_images[0] if valid_aligned_images else None
+        if sample_frame is not None:
+            per_frame_bytes = int(np.asarray(sample_frame).nbytes)
+            available_bytes = int(psutil.virtual_memory().available)
+            overhead = 3.2
+            target_fraction = 0.55
+            min_pass = max(1, int(getattr(zconfig, "winsor_min_frames_per_pass", 2)))
+            if per_frame_bytes > 0:
+                preemptive_limit = max(
+                    min_pass,
+                    int((available_bytes * target_fraction) // max(1, int(per_frame_bytes * overhead))),
+                )
+                if preemptive_limit < len(valid_aligned_images):
+                    if effective_winsor_frames_per_pass <= 0 or preemptive_limit < effective_winsor_frames_per_pass:
+                        effective_winsor_frames_per_pass = preemptive_limit
+                    try:
+                        setattr(zconfig, "stack_memmap_enabled", True)
+                    except Exception:
+                        pass
+                    try:
+                        pcb_tile(
+                            "stack_mem_preemptive_stream",
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                            frames_per_pass=effective_winsor_frames_per_pass,
+                            tile_id=tile_id,
+                        )
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
     if stack_reject_algo == "winsorized_sigma_clip":
         master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_winsorized_sigma_clip(
             valid_aligned_images,
@@ -9050,7 +9089,7 @@ def create_master_tile(
             kappa=stack_kappa_low,
             winsor_limits=parsed_winsor_limits,
             apply_rewinsor=True,
-            winsor_max_frames_per_pass=int(winsor_max_frames_per_pass) if winsor_max_frames_per_pass is not None else 0,
+            winsor_max_frames_per_pass=effective_winsor_frames_per_pass,
             winsor_max_workers=int(winsor_pool_workers) if winsor_pool_workers is not None else 1,
             stack_metadata=stack_metadata,
             parallel_plan=current_parallel_plan,
@@ -13387,13 +13426,22 @@ def run_hierarchical_mosaic(
         "poststack_equalize_rgb": poststack_equalize_rgb_config,
     }
     manual_limit = max_raw_per_master_tile_config
-    if (
-        not preplan_groups_active
+    memmap_streaming_enabled = bool(auto_caps_info and auto_caps_info.get("memmap"))
+    allow_auto_limit = (
+        auto_limit_frames_per_master_tile_config
         and (cluster_target_groups_config is None or int(cluster_target_groups_config) <= 0)
-        and auto_limit_frames_per_master_tile_config
-    ):
+        and not memmap_streaming_enabled
+    )
+    if allow_auto_limit and seestar_stack_groups:
         try:
-            sample_path = seestar_stack_groups[0][0].get('path_preprocessed_cache')
+            sample_path = None
+            for group in seestar_stack_groups:
+                if group:
+                    sample_path = group[0].get('path_preprocessed_cache')
+                    if sample_path:
+                        break
+            if sample_path is None:
+                raise RuntimeError("auto-limit sample path unavailable")
             sample_arr = np.load(sample_path, mmap_mode='r')
             bytes_per_frame = sample_arr.nbytes
             sample_shape = sample_arr.shape

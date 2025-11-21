@@ -1,211 +1,191 @@
-### [x] Étape 1 — Nouveau flag de configuration
+# Follow-up — Étapes concrètes pour optimiser CPU/GPU (sans changer la logique)
+
+## Étape 0 — Lecture & repérage
+
+1. Parcourir les fichiers clés du worker et du stacker :
+   - `zemosaic_worker.py`
+   - `zemosaic_align_stack.py`
+   - `zemosaic_utils.py` (pour `reproject_and_coadd_wrapper` ou helpers équivalents)
+   - `cuda_utils.py`
+   - `parallel_utils.py` (ou module équivalent si déjà présent)
+   - `zemosaic_config.py`
+
+2. Identifier :
+   - Le type / structure du **parallel plan** (s’il existe déjà).
+   - Où ce plan est calculé (ex. en début de `run_hierarchical_mosaic`) et comment il est injecté dans :
+     - P3 (Master tiles),
+     - Mosaic-First / global coadd,
+     - Phase 4.5,
+     - Phase 5 (Reproject & Coadd / Incremental),
+     - SDS (assemble_global_mosaic_sds / finalize_sds_global_mosaic).
+   - Tous les endroits où on a :
+     - un paramètre `process_workers` / `max_workers` / `assembly_process_workers`,
+     - des boucles séquentielles sur des listes de tiles/frames qui pourraient être parallélisées **sans changer le résultat**.
+
+> Ne PAS modifier l’ordre des phases ni les conditions SDS ON/OFF.
+
+---
+
+## Étape 1 — Consolider / créer le Parallel Plan
+
+1. S’il existe déjà un module type `parallel_utils` :
+   - Le **réutiliser**, ne pas le remplacer.
+   - Ajouter / renforcer :
+     - une fonction pour détecter les capacités :
+       - nb de cœurs logiques (via `multiprocessing.cpu_count()`),
+       - RAM totale / disponible (via `psutil`),
+       - GPU dispo + VRAM (via CuPy ou `cuda_utils`),
+     - une fonction pour construire un plan par “kind” :
+       - `"master_tiles"`, `"mosaic_first"`, `"phase5_global"`, `"sds_megatiles"`, etc.
+
+2. Sinon, créer un petit module dédié :
+   - avec une structure simple (dataclass `ParallelPlan`) contenant :
+     - `cpu_workers`, `use_memmap`, `max_chunk_bytes`,
+     - `rows_per_chunk` / `tiles_per_chunk`,
+     - `use_gpu`, `gpu_rows_per_chunk`.
+
+3. Heuristiques à mettre en place (ou renforcer) :
+   - CPU :
+     - `cpu_workers ≈ cores_logiques * 0.75–0.9`, plafonné par `parallel_max_cpu_workers` (config, 0 = auto).
+   - RAM :
+     - `max_chunk_bytes <= ram_disponible * parallel_target_ram_fraction` (ex. 0.7–0.8).
+   - GPU (si CUDA dispo) :
+     - `use_gpu=True` lorsque :
+       - GPU détecté,
+       - VRAM disponible suffisante pour au moins *un* chunk raisonnable.
+     - `gpu_rows_per_chunk` dimensionné pour consommer 30–60 % de la VRAM libre par chunk.
 
-1. Ouvrir `zemosaic_config.py`. 
+> Le plan doit **toujours** garder une marge de sécurité (RAM/VRAM).
 
-2. Dans la structure de configuration principale (dataclass ou dict), ajouter :
+---
 
-   ```python
-   cleanup_temp_artifacts: bool = True
-   ```
+## Étape 2 — Propager le plan sans changer la logique
 
-3. S’assurer que :
+1. Dans la fonction principale du worker (ex. `run_hierarchical_mosaic` ou équivalent) :
+   - Calculer **une fois** un `global_parallel_plan` (type “global” ou “phase5_global”).
+   - Optionnel : calculer aussi des plans spécifiques (kind `master_tiles`, `sds_megatiles`, etc.) si le code s’y prête.
+   - Stocker ces plans dans :
+     - l’objet config (`zconfig.parallel_plan_*`),
+     - ou un dict partagé (ex. `worker_config_cache["parallel_plan_*"]`).
 
-   * `load_config()` retourne `cleanup_temp_artifacts=True` si la clé est absente du fichier utilisateur.
-   * `save_config()` sérialise cette clé comme les autres booléens.
+2. Dans chaque fonction de haut niveau :
 
-### [x] Étape 2 — GUI Qt (System resources & cache)
+   - P3 — Master Tiles :
+     - Passer un `parallel_plan_master_tiles` aux fonctions de stack/align.
+     - Utiliser `cpu_workers` pour le nombre de workers.
+     - Adapter éventuellement `tiles_per_chunk` / `rows_per_chunk` si déjà supporté.
 
-1. Ouvrir `zemosaic_gui_qt.py`.
+   - Mosaic-First :
+     - Passer `parallel_plan_mosaic_first` au helper global coadd.
+     - Utiliser ses valeurs pour configurer `process_workers`, `rows_per_chunk`, `max_chunk_bytes`.
 
-2. Localiser `_create_system_resources_group(self)` (groupe *System resources & cache*).
+   - Phase 4.5 :
+     - S’il y a des boucles sur des groupes / chunks de tuiles indépendants,  
+       utiliser `cpu_workers` pour paralleriser ces groupes.
 
-3. Ajouter une nouvelle checkbox :
+   - Phase 5 :
+     - Pour le chemin **Reproject & Coadd classique** :
+       - Utiliser `parallel_plan_phase5` pour :
+         - `assembly_process_workers`,
+         - `use_memmap` / `max_chunk_bytes`,
+         - `rows_per_chunk` / `gpu_rows_per_chunk` vers le helper GPU.
+     - Pour le chemin **SDS** :
+       - Utiliser un plan spécifique `parallel_plan_sds` pour :
+         - nombre de méga-tuiles traitées en parallèle,
+         - taille des chunks, tout en gardant un max à 1 job GPU à la fois si nécessaire.
 
-   * Clé : `"cleanup_temp_artifacts"`
-   * Label via localisation :
+> Dans tous ces cas : tu modifies uniquement les *paramètres* de parallélisation, pas la logique métier.
 
-     ```python
-     self._register_checkbox(
-         "cleanup_temp_artifacts",
-         layout,
-         self._tr(
-             "qt_field_cleanup_temp_artifacts",
-             "Delete temporary processing files after run",
-         ),
-     )
-     ```
+---
 
-4. Positionner cette checkbox **dans le même group box** que les options memmap (entre memmap et cache_retention, ou juste après, selon ergonomie).
+## Étape 3 — Optimiser l’usage CPU
 
-5. Vérifier que la valeur est correctement lue/écrite dans `self.config` comme les autres champs (`coadd_use_memmap`, `coadd_cleanup_memmap`, `cache_retention`, etc.).
+1. Identifier les boucles séquentielles qui appliquent un traitement **indépendant** à :
+   - une liste de stacks,
+   - une liste de tiles,
+   - une liste de méga-tuiles SDS.
 
-### [x] Étape 3 — Faire remonter la config vers le worker
+2. Introduire, là où c’est pertinent, des appels à `ProcessPoolExecutor` ou `ThreadPoolExecutor` :
 
-1. Vérifier comment la config est passée au worker (via `run_zemosaic.py` / Qt main window).
-   Normalement, `cleanup_temp_artifacts` sera inclus automatiquement si tu relies bien la checkbox au dict de config.
+   - En respectant `parallel_plan.cpu_workers`.
+   - Sans modifier l’ordre ni la nature des transformations — tu renvoies les mêmes structures qu’avant.
 
-2. Dans `zemosaic_worker.py`, au début de la fonction principale du run (là où on lit `worker_config_cache`), ajouter :
+3. Veiller à ce que :
+   - les tâches envoyées au pool soient assez **grosses** (pas juste un pixel ou une ligne) pour limiter l’overhead Python,
+   - les données transférées entre process restent raisonnables (éviter de passer des cubes gigantesques par pickling : préférer des chemins sur disque/memmap déjà prévus dans le projet si possible).
 
-   ```python
-   cleanup_temp_artifacts_config = bool(
-       (worker_config_cache or {}).get("cleanup_temp_artifacts", True)
-   )
-   ```
+---
 
-3. Garder cette variable accessible aux sections :
+## Étape 4 — Optimiser l’usage GPU
 
-   * `_cleanup_memmap_artifacts()`,
-   * SDS runtime cleanup,
-   * Phase 7 cleanup (cache, master tiles, etc.).
+1. Utiliser exclusivement le / les wrappers GPU existants (par ex. `reproject_and_coadd_wrapper`) :
 
-### [x] Étape 4 — Refactor `_cleanup_memmap_artifacts`
+   - Ne pas écrire de nouveaux kernels custom.
+   - Ne pas modifier l’API publique de ces helpers, seulement leurs paramètres.
 
-1. Toujours dans `zemosaic_worker.py`, localiser `_cleanup_memmap_artifacts()` (tout en bas de la fonction principale actuelle).
+2. Pour chaque usage GPU :
 
-2. Ajouter un early exit :
+   - Appliquer `parallel_plan.gpu_rows_per_chunk` et `parallel_plan.max_chunk_bytes` aux arguments :
+     - `rows_per_chunk` / `max_chunk_bytes` / `process_workers` si supportés.
+   - S’assurer que le code gère proprement :
+     - les `TypeError` liés à des kwargs non supportés,
+     - le fallback CPU en cas d’échec GPU.
 
-   ```python
-   if not cleanup_temp_artifacts_config:
-       return
-   ```
+3. Vérifier que :
+   - les phases GPU-intensives (Mosaic-First, Phase 5 global, SDS global) envoient des chunks **raisonnablement gros** au GPU,
+   - la VRAM n’est jamais saturée (pas d’OOM).
 
-3. Conserver la logique actuelle de suppression des `.dat` et `mosaic_first_*` **dans le memmap dir** **uniquement** si :
+---
 
-   ```python
-   if (
-       bool(coadd_use_memmap_config)
-       and bool(coadd_cleanup_memmap_config)
-       and coadd_memmap_dir_config
-       and _path_isdir(coadd_memmap_dir_config)
-   ):
-       # boucle actuelle sur memmap_cleanup_dir.iterdir()
-   ```
+## Étape 5 — Pas de cap fixe sur le nombre d’images
 
-4. Étendre la suppression des `mosaic_first_*` :
+1. S’assurer qu’aucune partie du code n’introduit de nouvelle limite de type :
 
-   * Après le bloc ci-dessus, récupérer `runtime_temp_dir = get_runtime_temp_dir()` (depuis `zemosaic_utils` ou fallback).
-   * Parcourir les sous-dirs immédiats et supprimer ceux dont le nom commence par `"mosaic_first_"` (sans toucher aux autres).
+   - `min(n_images, 50)` ou `if n_images > 50: truncate`.
+   - Ni sur les tuiles, ni sur les méga-tuiles, ni sur les stacks.
 
-5. **Toujours** (tant que `cleanup_temp_artifacts_config` est True) exécuter la partie sur les WCS globaux :
+2. Si tu vois des “caps” historiques, ils doivent :
+   - soit être retirés (si la logique de sécurité mémoire est désormais assumée par le parallel plan),
+   - soit transformés en heuristiques *douces* (ex. limiter la taille d’un batch en fonction de la mémoire, mais sans jeter des images).
 
-   * garder la construction de `wcs_candidates` (via `global_wcs_plan`, `output_folder`, etc.),
-   * supprimer uniquement les fichiers dont `candidate_path.name.lower()` contient `"global_mosaic_wcs"`.
+---
 
-### [x] Étape 5 — Phase 7 : maîtriser la suppression des artefacts
+## Étape 6 — Logging & vérifications
 
-Toujours dans `zemosaic_worker.py`, bloc **Phase 7 (Nettoyage)**. 
+1. Ajouter des logs (niveau INFO / DEBUG) au début de chaque phase lourde, par ex. :
 
-1. **Cache des brutes pré-traitées** (`temp_image_cache_dir`) :
+   - `parallel_plan_summary` avec :
+     - `phase`, `cpu_workers`, `use_gpu`, `rows_per_chunk`, `max_chunk_bytes`, `gpu_rows_per_chunk`.
 
-   * NE PAS modifier la logique de `cache_retention` :
+2. Vérifier sur un jeu de tests (small / medium / large) :
 
-     * `keep` → log `run_info_temp_preprocessed_cache_kept` et ne rien supprimer,
-     * sinon → suppression + log `run_info_temp_preprocessed_cache_cleaned`.
-   * Cette partie reste **indépendante** du nouveau flag.
+   - que les traitements terminent sans OOM / error,
+   - que les temps de P3 / P4.5 / P5 diminuent sur une machine multi-cœurs + GPU,
+   - que les résultats (FITS, PNG) restent scientifiquement cohérents, avec des différences numériques acceptables uniquement dues au parallélisme.
 
-2. **Master tiles / mega tiles** (`temp_master_tile_storage_dir`) :
+3. Ne jamais modifier :
 
-   * Remplacer la condition actuelle :
+   - les clés de log essentielles déjà utilisées par la GUI ou l’ETA,
+   - les messages d’erreur sur la disponibilité de `reproject`, `astropy`, `fits`, etc.
 
-     ```python
-     if master_tiles_dir:
-         if not two_pass_enabled and _path_exists(master_tiles_dir):
-             # rmtree + log
-     ```
+---
 
-   * Par une logique contrôlée par `cleanup_temp_artifacts_config` :
+## Étape 7 — Validation finale
 
-     ```python
-     if master_tiles_dir and _path_exists(master_tiles_dir):
-         if cleanup_temp_artifacts_config:
-             # rmtree + log (run_info_temp_master_tiles_fits_cleaned, déjà existant)
-         else:
-             # optionnel : log INFO_DETAIL disant que les master tiles sont conservées pour debug
-     ```
+1. Lancer plusieurs scénarios :
 
-   * On ne s’appuie plus sur `two_pass_enabled` pour la suppression une fois le run terminé.
+   - SDS OFF, petite mosaïque, mode CPU-only,
+   - SDS OFF, grosse mosaïque, CPU + GPU,
+   - SDS ON, campagne Seestar multi-nuit, CPU + GPU,
+   - Optionnel : Mosaic-First ON/OFF si cette option existe.
 
-3. **SDS runtime tiles** (`sds_runtime_tile_dir`) :
+2. Vérifier :
 
-   * Remplacer :
+   - que les logs montrent bien une montée de charge CPU/GPU sur les phases attendues,
+   - qu’aucune exception nouvelle n’apparaît,
+   - qu’aucune option utilisateur existante n’a changé de sens.
 
-     ```python
-     if sds_runtime_tile_dir:
-         try:
-             shutil.rmtree(sds_runtime_tile_dir, ignore_errors=True)
-         except Exception:
-             pass
-     ```
-
-   * Par :
-
-     ```python
-     if sds_runtime_tile_dir and cleanup_temp_artifacts_config:
-         try:
-             shutil.rmtree(sds_runtime_tile_dir, ignore_errors=True)
-         except Exception:
-             pass
-     ```
-
-4. Si d’autres répertoires **purement temporaires** liés au traitement sont supprimés dans cette phase, les faire aussi dépendre de `cleanup_temp_artifacts_config`.
-
-### [x] Étape 6 — Localisation complète
-
-1. Ouvrir **tous** les fichiers de localisation dans `locales/` (au moins `en.json`, `fr.json`, `es.json`, `pl.json`, `de.json`, `nl.json`, `is.json` si présents).
-
-2. Ajouter la clé :
-
-   ```json
-   "qt_field_cleanup_temp_artifacts": "Delete temporary processing files after run"
-   ```
-
-   dans `en.json` (Qt section des champs, à côté des autres `qt_field_*`).
-
-3. Dans `fr.json`, ajouter :
-
-   ```json
-   "qt_field_cleanup_temp_artifacts": "Supprimer les fichiers temporaires de traitement après l’exécution"
-   ```
-
-4. Pour toutes les autres langues, ajouter la même clé avec :
-
-   * soit une vraie traduction,
-   * soit la version anglaise, mais **jamais** laisser la clé absente.
-
-5. Vérifier que **toutes** les nouvelles chaînes (s’il y en a d’autres que cette clé) sont également présentes dans tous les JSON.
-
-### [ ] Étape 7 — Tests manuels recommandés
-
-*Non réalisés dans cet environnement (exécution GUI requise).* 
-
-1. **Cas par défaut (nouvelle option cochée)** :
-
-   * Lancer ZeMosaic Qt, vérifier que la checkbox est **cochée** par défaut dans l’onglet *System*.
-   * Faire un run complet avec :
-
-     * memmap activé,
-     * SDS activé ou non,
-     * éventuellement two-pass coverage activé.
-   * À la fin :
-
-     * vérifier que les dossiers `mosaic_first_*`, `temp_master_tile_storage_dir` et `sds_runtime_tile_dir` ont disparu,
-     * vérifier que les `.dat` temporaires (mosaic / coverage) sont supprimés du memmap dir,
-     * vérifier que les `global_mosaic_wcs*.fits/.json` auto-générés ne sont plus présents,
-     * vérifier que les fichiers finaux (FITS/PNG de la mosaïque) sont toujours là.
-
-2. **Cas debug (option décochée)** :
-
-   * Décoche `Delete temporary processing files after run`.
-   * Relancer un run sur un jeu de test.
-   * Vérifier que :
-
-     * `mosaic_first_*`, master tiles, SDS runtime dir sont conservés,
-     * les `.dat` & WCS globaux ne sont plus supprimés,
-     * le cache de brutes suit toujours `cache_retention` (ex : `run_end` continue d’effacer le cache des brutes).
-
-3. **Sanity check cross-langues** :
-
-   * Changer la langue (FR, EN, au moins une 3e langue) et vérifier que le label de la checkbox s’affiche correctement (pas de `%KEY%` brut).
-   * Sur erreur de traduction, corriger les JSONs.
-   * Non réalisé ici (GUI non lancée dans cet environnement).
-
+3. Considérer la mission comme réussie **uniquement** si :
+   - la parallélisation est plus agressive,
+   - la stabilité est préservée,
+   - et aucun comportement fonctionnel du pipeline n’a été modifié.

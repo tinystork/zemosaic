@@ -1520,7 +1520,20 @@ def stack_winsorized_sigma_clip(
             strategy=memory_plan.split_strategy,
         )
 
-        return _stack_winsor_streaming(frames_limit, split_strategy=memory_plan.split_strategy)
+        try:
+            return _stack_winsor_streaming(frames_limit, split_strategy=memory_plan.split_strategy)
+        except (MemoryError, _NumpyArrayMemoryError) as mem_err:
+            new_limit = max(1, frames_limit // 2)
+            if new_limit == frames_limit:
+                raise
+            _log_stack_message(
+                "stack_mem_retry_incremental",
+                "WARN",
+                progress_callback,
+                frames_per_pass=new_limit,
+                error=str(mem_err),
+            )
+            return _stack_winsor_streaming(new_limit, split_strategy=memory_plan.split_strategy)
 
     if memory_plan.mode == "memmap":
         force_memmap_plan = True
