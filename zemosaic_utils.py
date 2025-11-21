@@ -3766,6 +3766,7 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
     """CuPy-accelerated reprojection and coaddition for a single channel."""
 
     progress_callback = kwargs.pop("progress_callback", None)
+    tile_weights_param = kwargs.pop("tile_weights", None)
     if not gpu_is_available():
         _log_gpu_event(
             "gpu_fallback_unavailable",
@@ -3800,6 +3801,43 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
     n_inputs = len(data_list)
     if len(wcs_list) != n_inputs:
         raise ValueError("data_list and wcs_list must have the same length")
+
+    def _normalize_tile_weights(weights_obj) -> list[float]:
+        if weights_obj is None:
+            return [1.0] * n_inputs
+        normalized: list[float] = []
+        try:
+            iterable = list(weights_obj)
+        except Exception:
+            iterable = [weights_obj]
+        for idx in range(n_inputs):
+            try:
+                raw = iterable[idx]
+            except Exception:
+                raw = 1.0
+            try:
+                value = float(raw)
+            except Exception:
+                value = 1.0
+            if not math.isfinite(value) or value <= 0:
+                value = 1.0
+            normalized.append(value)
+        if len(normalized) < n_inputs:
+            normalized.extend([1.0] * (n_inputs - len(normalized)))
+        return normalized
+
+    tile_weights_list = _normalize_tile_weights(tile_weights_param)
+    tile_weighting_active = tile_weights_param is not None
+    try:
+        tile_weights_gpu = cp.asarray(tile_weights_list, dtype=cp.float32)
+    except Exception:
+        tile_weights_gpu = None
+    if tile_weighting_active and logger.isEnabledFor(logging.DEBUG):
+        for idx, w_val in enumerate(tile_weights_list):
+            try:
+                logger.debug("[DEBUG] gpu_coadd: tile %d uses weight %.6f", idx, float(w_val))
+            except Exception:
+                pass
 
     combine_function = str(kwargs.get("combine_function") or "mean").strip().lower()
     stack_reject_algo = str(kwargs.get("stack_reject_algo") or combine_function).strip().lower()
@@ -3951,10 +3989,14 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
         chunk_grid = _build_world_chunk_grid(rows_per_chunk)
         for idx_tile, tile_wcs in enumerate(wcs_list):
             img_gpu, mask_gpu = _prepare_tile_arrays(idx_tile)
+            if tile_weights_gpu is not None:
+                weight_i = tile_weights_gpu[idx_tile]
+            else:
+                weight_i = cp.float32(1.0)
             for y0, y1, ra_chunk, dec_chunk in chunk_grid:
                 sampled, sampled_mask = _sample_tile_chunk(img_gpu, mask_gpu, tile_wcs, ra_chunk, dec_chunk)
-                mosaic_sum_gpu[y0:y1, :] += sampled
-                weight_sum_gpu[y0:y1, :] += sampled_mask
+                mosaic_sum_gpu[y0:y1, :] += sampled * weight_i
+                weight_sum_gpu[y0:y1, :] += sampled_mask * weight_i
             del img_gpu, mask_gpu
         eps = cp.float32(1e-6)
         mosaic_gpu = cp.where(weight_sum_gpu > eps, mosaic_sum_gpu / cp.maximum(weight_sum_gpu, eps), 0.0)
@@ -4018,9 +4060,13 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
                     img_gpu, mask_gpu = tile_cache[idx_tile]
                 else:
                     img_gpu, mask_gpu = _prepare_tile_arrays(idx_tile)
+                if tile_weights_gpu is not None:
+                    weight_i = tile_weights_gpu[idx_tile]
+                else:
+                    weight_i = cp.float32(1.0)
                 sampled, sampled_mask = _sample_tile_chunk(img_gpu, mask_gpu, tile_wcs, ra_chunk, dec_chunk)
                 chunk_cube[idx_tile, :, :] = cp.where(sampled_mask > 0, sampled, cp.nan)
-                chunk_weight[idx_tile, :, :] = sampled_mask
+                chunk_weight[idx_tile, :, :] = sampled_mask * weight_i
                 if tile_cache is None:
                     del img_gpu, mask_gpu
             if mode == "median":
@@ -4077,11 +4123,17 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
 
         for idx_tile, tile_wcs in enumerate(wcs_list):
             img_gpu, mask_gpu = _tile_arrays(idx_tile)
+            if tile_weights_gpu is not None:
+                weight_i = tile_weights_gpu[idx_tile]
+            else:
+                weight_i = cp.float32(1.0)
             for y0, y1, ra_chunk, dec_chunk in chunk_stats:
                 sampled, sampled_mask = _sample_tile_chunk(img_gpu, mask_gpu, tile_wcs, ra_chunk, dec_chunk)
-                sum_grid[y0:y1, :] += sampled.astype(cp.float64)
-                sumsq_grid[y0:y1, :] += (sampled ** 2).astype(cp.float64)
-                weight_grid[y0:y1, :] += sampled_mask
+                weighted_sample = sampled * weight_i
+                weighted_mask = sampled_mask * weight_i
+                sum_grid[y0:y1, :] += weighted_sample.astype(cp.float64)
+                sumsq_grid[y0:y1, :] += (weighted_sample ** 2).astype(cp.float64)
+                weight_grid[y0:y1, :] += weighted_mask
                 count_grid[y0:y1, :] += (sampled_mask > 0).astype(cp.float32)
             if tile_cache is None:
                 del img_gpu, mask_gpu
@@ -4126,9 +4178,13 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
             chunk_weight = cp.zeros((n_inputs, chunk_h, W), dtype=cp.float32)
             for idx_tile, tile_wcs in enumerate(wcs_list):
                 img_gpu, mask_gpu = _tile_arrays(idx_tile)
+                if tile_weights_gpu is not None:
+                    weight_i = tile_weights_gpu[idx_tile]
+                else:
+                    weight_i = cp.float32(1.0)
                 sampled, sampled_mask = _sample_tile_chunk(img_gpu, mask_gpu, tile_wcs, ra_chunk, dec_chunk)
                 chunk_cube[idx_tile, :, :] = cp.where(sampled_mask > 0, sampled, cp.nan)
-                chunk_weight[idx_tile, :, :] = sampled_mask
+                chunk_weight[idx_tile, :, :] = sampled_mask * weight_i
                 if tile_cache is None:
                     del img_gpu, mask_gpu
             mean_slice = mean_map[y0:y1, :]
@@ -4175,6 +4231,7 @@ def _reproject_and_coadd_wrapper_impl(
     cpu_func=None,
     allow_cpu_fallback: bool = True,
     progress_callback=None,
+    tile_weights=None,
     **kwargs,
 ):
     """Dispatch to GPU or CPU reproject+coadd.
@@ -4182,9 +4239,36 @@ def _reproject_and_coadd_wrapper_impl(
     - GPU path: uses ``gpu_reproject_and_coadd`` (CuPy). Falls back to CPU on any error.
     - CPU path: calls astropy-reproject's ``reproject_and_coadd``.
     """
+    def _normalize_tile_weights(weights_obj, n_expected: int) -> list[float] | None:
+        if weights_obj is None:
+            return None
+        normalized: list[float] = []
+        try:
+            iterable = list(weights_obj)
+        except Exception:
+            iterable = [weights_obj]
+        for idx in range(n_expected):
+            try:
+                raw = iterable[idx]
+            except Exception:
+                raw = 1.0
+            try:
+                value = float(raw)
+            except Exception:
+                value = 1.0
+            if not math.isfinite(value) or value <= 0:
+                value = 1.0
+            normalized.append(value)
+        if len(normalized) < n_expected:
+            normalized.extend([1.0] * (n_expected - len(normalized)))
+        return normalized
+
+    normalized_weights = _normalize_tile_weights(tile_weights, len(data_list))
     gpu_kwargs = dict(kwargs)
     if progress_callback is not None:
         gpu_kwargs["progress_callback"] = progress_callback
+    if normalized_weights is not None:
+        gpu_kwargs["tile_weights"] = normalized_weights
     if use_gpu:
         if not gpu_is_available():
             _log_gpu_event(
@@ -4222,6 +4306,15 @@ def _reproject_and_coadd_wrapper_impl(
         "tile_affine_corrections",
     }
     cpu_kwargs = {k: v for k, v in kwargs.items() if k not in gpu_only}
+    if normalized_weights is not None:
+        weight_maps = []
+        for arr, w in zip(data_list, normalized_weights):
+            arr_np = np.asarray(arr, dtype=np.float32)
+            try:
+                weight_maps.append(np.full_like(arr_np, float(w), dtype=np.float32))
+            except Exception:
+                weight_maps.append(np.full(arr_np.shape, float(w), dtype=np.float32))
+        cpu_kwargs["input_weights"] = weight_maps
     inputs = list(zip(data_list, wcs_list))
     output_proj = cpu_kwargs.pop("output_projection")
     return cpu_func(inputs, output_proj, shape_out, **cpu_kwargs)
@@ -4244,6 +4337,7 @@ def reproject_and_coadd_wrapper(
     cpu_func=None,
     allow_cpu_fallback: bool = True,
     progress_callback=None,
+    tile_weights=None,
     **kwargs,
 ):
     """Dispatch to CPU or GPU ``reproject_and_coadd`` depending on availability."""
@@ -4255,6 +4349,7 @@ def reproject_and_coadd_wrapper(
         cpu_func=cpu_func,
         allow_cpu_fallback=allow_cpu_fallback,
         progress_callback=progress_callback,
+        tile_weights=tile_weights,
         **kwargs,
     )
 

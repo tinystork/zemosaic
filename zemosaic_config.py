@@ -105,6 +105,8 @@ DEFAULT_CONFIG = {
     "use_gpu_phase5": True,
     "gpu_id_phase5": 0,
     "gpu_selector": "",
+    "enable_tile_weighting": True,
+    "tile_weight_mode": "n_frames",
     "final_assembly_method": "reproject_coadd",  # Options: "reproject_coadd", "incremental",
     "auto_detect_seestar": True,
     "force_seestar_mode": False,

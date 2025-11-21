@@ -769,7 +769,13 @@ class ZeMosaicGUI:
             master=self.root,
             value=min_impr_initial,
         )
+        if "enable_tile_weighting" not in self.config:
+            self.config["enable_tile_weighting"] = True
         self.use_gpu_phase5_var = tk.BooleanVar(master=self.root, value=self.config.get("use_gpu_phase5", False))
+        self.tile_weighting_var = tk.BooleanVar(
+            master=self.root,
+            value=self.config.get("enable_tile_weighting", True),
+        )
         # Logging level var (keys are ERROR, WARN, INFO, DEBUG)
         self.logging_level_keys = ["ERROR", "WARN", "INFO", "DEBUG"]
         self.logging_level_var = tk.StringVar(master=self.root, value=str(self.config.get("logging_level", "INFO")).upper())
@@ -1758,6 +1764,15 @@ class ZeMosaicGUI:
 
         self.use_gpu_phase5_var.trace_add("write", on_gpu_check)
         on_gpu_check()
+
+        tile_weight_chk = ttk.Checkbutton(
+            final_assembly_options_frame,
+            text=self._tr("tile_weighting_label", "Tile weighting (recommended)"),
+            variable=self.tile_weighting_var,
+        )
+        tile_weight_chk.grid(row=asm_opt_row, column=0, sticky="w", padx=5, pady=3, columnspan=2)
+        self.translatable_widgets["tile_weighting_label"] = tile_weight_chk
+        asm_opt_row += 1
 
         intertile_label = ttk.Label(final_assembly_options_frame, text="")
         intertile_label.grid(row=asm_opt_row, column=0, padx=5, pady=3, sticky="w")
@@ -4339,6 +4354,8 @@ class ZeMosaicGUI:
                 self.config["gpu_id_phase5"] = idx
                 gpu_id = idx
                 break
+        self.config["enable_tile_weighting"] = bool(self.tile_weighting_var.get())
+        self.config["tile_weight_mode"] = self.config.get("tile_weight_mode", "n_frames")
         self.config["quality_gate_enabled"] = bool(quality_gate_enabled_val)
         self.config["quality_gate_threshold"] = float(quality_gate_threshold_val)
         self.config["quality_gate_edge_band_px"] = int(quality_gate_edge_band_val)
@@ -4546,6 +4563,8 @@ class ZeMosaicGUI:
             poststack_use_overlap_cfg,
             self.use_gpu_phase5_var.get(),
             gpu_id,
+            bool(self.tile_weighting_var.get()),
+            self.config.get("tile_weight_mode", "n_frames"),
             self.logging_level_var.get(),
             asdict(self.solver_settings)
             # --- FIN NOUVEAUX ARGUMENTS ---

@@ -2310,6 +2310,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
             general_layout,
             self._tr("qt_field_match_background", "Match background in final mosaic"),
         )
+        tile_weight_checkbox = self._register_checkbox(
+            "enable_tile_weighting",
+            general_layout,
+            self._tr("qt_field_tile_weighting", "Tile weighting (recommended)"),
+        )
         self._register_checkbox(
             "save_final_as_uint16",
             general_layout,
@@ -3206,7 +3211,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "type": value_type,
         }
 
-    def _register_checkbox(self, key: str, layout: QFormLayout, label_text: str) -> None:
+    def _register_checkbox(self, key: str, layout: QFormLayout, label_text: str) -> QCheckBox:
         checkbox = QCheckBox(label_text)
         checkbox.setChecked(bool(self.config.get(key, False)))
         layout.addRow(checkbox)
@@ -3215,6 +3220,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "widget": checkbox,
             "type": bool,
         }
+        return checkbox
 
     def _register_spinbox(
         self,
@@ -3608,6 +3614,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "apply_master_tile_crop": True,
             "master_tile_crop_percent": 3.0,
             "match_background_for_final": True,
+            "enable_tile_weighting": True,
+            "tile_weight_mode": "n_frames",
             "incremental_feather_parity": False,
             "intertile_photometric_match": True,
             "intertile_preview_size": 512,
@@ -5189,6 +5197,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 gpu_id = int(gpu_id_raw)
             except (TypeError, ValueError):
                 gpu_id = None
+        enable_tile_weighting = _coerce_bool(cfg.get("enable_tile_weighting", True), True)
+        tile_weight_mode = _coerce_str(cfg.get("tile_weight_mode", "n_frames")) or "n_frames"
 
         logging_level = _coerce_str(cfg.get("logging_level", "INFO"))
 
@@ -5284,6 +5294,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
             poststack_use_overlap,
             use_gpu_phase5,
             gpu_id,
+            enable_tile_weighting,
+            tile_weight_mode,
             logging_level,
         )
 

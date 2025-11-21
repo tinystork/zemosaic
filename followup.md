@@ -1,70 +1,98 @@
-# Follow-up — Étapes concrètes pour optimiser CPU/GPU (sans changer la logique)
-
-## Étape 0 — Lecture & repérage
-
-- [x] Parcourir les fichiers clés du worker et du stacker (`zemosaic_worker.py`, `zemosaic_align_stack.py`, `zemosaic_utils.py`, `cuda_utils.py`, `parallel_utils.py`, `zemosaic_config.py`).
-- [x] Identifier la structure du **parallel plan**, où il est calculé/injecté (P3, Mosaic-First, Phase 4.5, Phase 5, SDS) et repérer les paramètres/workers parallélisables.
-
-> Ne PAS modifier l’ordre des phases ni les conditions SDS ON/OFF.
 
 ---
 
-## Étape 1 — Consolider / créer le Parallel Plan
+# ✅ **followup.md**
 
-- [x] Réutiliser `parallel_utils` pour centraliser détection CPU/RAM/GPU et construction du plan (dataclass `ParallelPlan`).
-- [x] Créer un module dédié si absent (N/A ici : `parallel_utils` déjà présent).
-- [x] Mettre en place/renforcer les heuristiques (workers ≈ 75–90 % des cœurs, budget RAM/VRAM, activation GPU conditionnelle, tailles de chunks/memmap).
+```markdown
+# Relecture mission + actions demandées
 
-> Le plan doit **toujours** garder une marge de sécurité (RAM/VRAM).
+Salut Codex High,
 
----
-
-## Étape 2 — Propager le plan sans changer la logique
-
-- [x] Calculer une fois un `global_parallel_plan` (option : variantes par “kind”) et le stocker dans la config ou le cache worker.
-- [x] P3 — Master Tiles : passer le plan aux fonctions de stack/align et utiliser `cpu_workers` / chunks si supportés.
-- [x] Mosaic-First : transmettre le plan au global coadd pour `process_workers`, `rows_per_chunk`, `max_chunk_bytes`.
-- [x] Phase 4.5 : plan transmis pour stacking/photométrie intra-master (hints chunk/workers disponibles).
-- [x] Phase 5 : exploiter le plan pour `assembly_process_workers`, memmap/chunk rows CPU/GPU.
-- [x] SDS : appliquer un plan SDS (méga-tuiles, chunks, GPU éventuel, limite à 1 job GPU si besoin).
-
-> Dans tous ces cas : tu modifies uniquement les *paramètres* de parallélisation, pas la logique métier.
+Voici les points à exécuter juste après ton patch :
 
 ---
 
-## Étape 3 — Optimiser l’usage CPU
-
-- [x] Identifier les boucles séquentielles qui appliquent un traitement **indépendant** à des stacks/tiles/méga-tuiles SDS.
-- [x] Introduire, là où c’est pertinent, des appels à `ProcessPoolExecutor` ou `ThreadPoolExecutor` en respectant `parallel_plan.cpu_workers` et sans changer l’ordre des traitements.
-- [x] Garder des tâches suffisamment grosses et limiter les transferts inter-process (s’appuyer sur disque/memmap existants si besoin).
-
----
-
-## Étape 4 — Optimiser l’usage GPU
-
-- [ ] Utiliser exclusivement les wrappers GPU existants (`reproject_and_coadd_wrapper`, etc.) sans nouveaux kernels ni changement d’API publique.
-- [ ] Appliquer les hints du plan (`gpu_rows_per_chunk`, `max_chunk_bytes`, `process_workers` si dispo), gérer les `TypeError` et fallback CPU.
-- [ ] Vérifier que les phases GPU-intensives envoient des chunks raisonnables et que la VRAM reste sous contrôle (pas d’OOM).
+## [x] 1️⃣ Générer un diff clair, propre et minimal  
+- Fichiers modifiés listés exactement dans agent.md  
+- Aucun changement hors du bloc Reproject non-SDS  
+- SDS = zone intouchable (vérifier dans le diff)
 
 ---
 
-## Étape 5 — Pas de cap fixe sur le nombre d’images
+## [x] 2️⃣ Ajouter logs utiles
 
-- [ ] Vérifier qu’aucune nouvelle limite dure (type `min(n_images, 50)` / truncation) n’est introduite sur tiles/méga-tiles/stacks.
-- [ ] Remplacer les anciens caps par des heuristiques souples (basées mémoire) sans jeter d’images si encore présents.
+Dans la Phase 5 non-SDS, ajouter :
+
+````
+
+[INFO] Tile-weighting enabled — mode=N_FRAMES
+[INFO] Weights summary: min=**, max=**, mean=__
+
+```
+
+et côté GPU :
+
+```
+
+[DEBUG] gpu_coadd: tile i uses weight W
+
+```
 
 ---
 
-## Étape 6 — Logging & vérifications
+## [x] 3️⃣ Ajouter le header FITS MT_NFRAMES dans Phase 3
 
-- [ ] Ajouter des logs (niveau INFO/DEBUG) par phase lourde (`parallel_plan_summary`, cpu/gpu rows, chunks, memmap...).
-- [ ] Vérifier sur jeux de tests (small/medium/large) l’absence d’OOM/erreurs, le gain de temps P3/P4.5/P5 et la cohérence scientifique.
-- [ ] Préserver les clés de log et messages d’erreur utilisés par la GUI/ETA.
+Vérifier :
+
+```
+
+MT_NFRAMES = <int>
+
+```
+
+et que cette valeur remonte bien jusque Phase 5.
 
 ---
 
-## Étape 7 — Validation finale
+## [x] 4️⃣ CPU = utiliser input_weights  
+Confirmer que `input_weights` est bien passé comme une liste d’images constantes.
 
-- [ ] Lancer plusieurs scénarios (SDS OFF petite/grosse, SDS ON multi-nuit, CPU-only vs CPU+GPU, Mosaic-First ON/OFF si dispo).
-- [ ] Vérifier montée de charge CPU/GPU, absence d’exceptions et invariance des options utilisateur.
-- [ ] Conclure en validant parallélisation accrue sans régression fonctionnelle.
+---
+
+## [x] 5️⃣ GPU = miroir exact  
+Confirmer que la pondération respecte la formule :
+
+```
+
+sum_gpu += sampled * weight
+weight_gpu += sampled_mask * weight
+
+```
+
+---
+
+## [x] 6️⃣ Ajouter la config + traduction GUI  
+Clé config :
+```
+
+enable_tile_weighting
+
+```
+
+Clé traduction (FR/EN) :
+- “Enable tile weighting”
+- “Pondération des tuiles (recommandé)”
+
+---
+
+## [ ] 7️⃣ Tests automatiques à fournir  
+Captures ou logs indiquant :
+
+- SDS on → aucune modification du flux  
+- Non-SDS + 600/10 frames → pondération correcte  
+- GPU/CPU → cohérence > 99.9% des pixels  
+- Option OFF → pipeline identique à avant
+
+---
+
+Merci !

@@ -6312,6 +6312,8 @@ def _run_shared_phase45_phase5_pipeline(
     start_time_total = start_time_total_run
     global_anchor_shift = phase5_options.get("global_anchor_shift")
     parallel_plan = phase5_options.get("parallel_plan")
+    tile_weighting_enabled_flag = bool(phase5_options.get("tile_weighting_enabled"))
+    tile_weight_mode = str(phase5_options.get("tile_weight_mode") or "n_frames")
 
     pcb("PHASE_UPDATE:5", prog=None, lvl="ETA_LEVEL")
     _log_memory_usage(
@@ -6461,6 +6463,8 @@ def _run_shared_phase45_phase5_pipeline(
                 global_anchor_shift=global_anchor_shift,
                 phase45_enabled=phase45_active_flag,
                 parallel_plan=parallel_plan,
+                enable_tile_weighting=tile_weighting_enabled_flag,
+                tile_weight_mode=tile_weight_mode,
             )
         except Exception as exc:
             logger.exception("Reproject+Coadd assembly failed", exc_info=True)
@@ -6539,7 +6543,7 @@ def _run_shared_phase45_phase5_pipeline(
 def _compute_auto_tile_caps(
     resource_info: dict,
     per_frame_info: dict,
-    policy_max: int = 50,
+    policy_max: int = 0,
     policy_min: int = 8,
     disk_threshold_mb: float = 8192.0,
     user_max_override: int | None = None,
@@ -9514,6 +9518,7 @@ def create_master_tile(
         header_mt_save['ZMT_TYPE']=('Master Tile','ZeMosaic Processed Tile'); header_mt_save['ZMT_ID']=(tile_id,'Master Tile ID')
         header_mt_save['ZMT_NRAW']=(len(seestar_stack_group_info),'Raw frames in this tile group')
         header_mt_save['ZMT_NALGN']=(num_actually_aligned_for_header,'Successfully aligned frames for stack')
+        header_mt_save['MT_NFRAMES'] = (int(num_actually_aligned_for_header), 'Frames stacked into this master tile')
         header_mt_save['ZMT_NORM'] = (str(stack_norm_method), 'Normalization method')
         header_mt_save['ZMT_WGHT'] = (str(stack_weight_method), 'Weighting method')
         if apply_radial_weight: # Log des paramètres radiaux
@@ -10338,6 +10343,8 @@ def assemble_final_mosaic_reproject_coadd(
     global_anchor_shift: tuple[float, float] | None = None,
     phase45_enabled: bool = False,
     parallel_plan: ParallelPlan | None = None,
+    enable_tile_weighting: bool = False,
+    tile_weight_mode: str | None = None,
 ):
     """Assemble les master tiles en utilisant ``reproject_and_coadd``."""
     _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
@@ -10388,6 +10395,21 @@ def assemble_final_mosaic_reproject_coadd(
                 plan_chunk_gpu_hint = max(1, int(chunk_gpu))
             except Exception:
                 plan_chunk_gpu_hint = None
+    try:
+        _pcb(
+            "phase5_plan_hints",
+            prog=None,
+            lvl="INFO_DETAIL",
+            cpu_workers=int(cpu_workers_hint or 0),
+            gpu=bool(use_gpu),
+            rows_cpu=int(plan_rows_cpu_hint or 0),
+            rows_gpu=int(plan_rows_gpu_hint or 0),
+            chunk_cpu_mb=float(plan_chunk_cpu_hint / (1024 ** 2)) if plan_chunk_cpu_hint else 0.0,
+            chunk_gpu_mb=float(plan_chunk_gpu_hint / (1024 ** 2)) if plan_chunk_gpu_hint else 0.0,
+            memmap=bool(use_memmap),
+        )
+    except Exception:
+        pass
 
     # Emit ETA during the preparation phase (before channels start)
     def _update_eta_prepare(done_tiles: int, total_tiles_local: int):
@@ -10517,6 +10539,30 @@ def assemble_final_mosaic_reproject_coadd(
         if hasattr(final_output_wcs, "to_header")
         else final_output_wcs
     )
+    weight_mode_normalized = str(tile_weight_mode or "n_frames").strip().lower()
+    tile_weighting_active = bool(enable_tile_weighting)
+    if weight_mode_normalized not in {"n_frames"}:
+        tile_weighting_active = False
+    tile_weight_values: list[float] = []
+
+    def _extract_tile_weight(header_obj) -> float | None:
+        if header_obj is None:
+            return None
+        getter = header_obj.get if hasattr(header_obj, "get") else None
+        for key in ("MT_NFRAMES", "ZMT_NALGN", "ZMT_NRAW"):
+            try:
+                value = getter(key) if getter else header_obj[key]  # type: ignore[index]
+            except Exception:
+                value = None
+            if value is None:
+                continue
+            try:
+                value_f = float(value)
+            except Exception:
+                continue
+            if math.isfinite(value_f) and value_f > 0:
+                return value_f
+        return None
 
 
     effective_tiles: list[dict[str, Any]] = []
@@ -10636,12 +10682,23 @@ def assemble_final_mosaic_reproject_coadd(
             )
             coverage_mask_entry = valid_pixels.astype(np.float32)
 
+        tile_weight_value = 1.0
+        if tile_weighting_active and weight_mode_normalized == "n_frames":
+            weight_candidate = _extract_tile_weight(tile_header)
+            if weight_candidate is not None:
+                tile_weight_value = float(weight_candidate)
+        if not math.isfinite(tile_weight_value) or tile_weight_value <= 0:
+            tile_weight_value = 1.0
+        if tile_weighting_active:
+            tile_weight_values.append(tile_weight_value)
+
         tile_entry = {
             "data": data,
             "wcs": tile_wcs,
             "path": tile_path,
             "tile_id": _resolve_tile_identifier(tile_path, tile_header, idx - 1),
             "coverage_mask": coverage_mask_entry,
+            "tile_weight": tile_weight_value,
         }
         effective_tiles.append(tile_entry)
 
@@ -10659,6 +10716,26 @@ def assemble_final_mosaic_reproject_coadd(
             _update_eta_prepare(idx, total_tiles_for_prep)
 
 
+    tile_weighting_applied = tile_weighting_active and bool(tile_weight_values)
+    if tile_weighting_applied:
+        weights_arr = np.asarray(tile_weight_values, dtype=np.float64)
+        if weights_arr.size:
+            w_min = float(np.nanmin(weights_arr))
+            w_max = float(np.nanmax(weights_arr))
+            w_mean = float(np.nanmean(weights_arr))
+            try:
+                _pcb("[INFO] Tile-weighting enabled — mode=N_FRAMES", prog=None, lvl="INFO")
+                _pcb(
+                    f"[INFO] Weights summary: min={w_min:.3g}, max={w_max:.3g}, mean={w_mean:.3g}",
+                    prog=None,
+                    lvl="INFO",
+                )
+            except Exception:
+                pass
+        else:
+            tile_weighting_applied = False
+    else:
+        tile_weighting_applied = False
 
     # Optional inter-tile photometric (gain/offset) calibration
     pending_affine_list, nontrivial_affine = _sanitize_affine_corrections(
@@ -10997,6 +11074,12 @@ def assemble_final_mosaic_reproject_coadd(
 
             data_list = [entry.get("data")[..., ch] for entry in valid_entries]
             wcs_list = [entry.get("wcs") for entry in valid_entries]
+            weights_for_entries = None
+            if tile_weighting_applied:
+                weights_for_entries = [
+                    float(entry.get("tile_weight", 1.0)) if isinstance(entry, dict) else 1.0
+                    for entry in valid_entries
+                ]
 
             reproj_call_kwargs = dict(reproj_kwargs)
             if use_gpu:
@@ -11009,6 +11092,9 @@ def assemble_final_mosaic_reproject_coadd(
                         )
 
             def _invoke_reproject(local_kwargs: dict):
+                invoke_kwargs = dict(local_kwargs)
+                if tile_weighting_applied and weights_for_entries is not None:
+                    invoke_kwargs["tile_weights"] = weights_for_entries
                 return reproject_and_coadd_wrapper(
                     data_list=data_list,
                     wcs_list=wcs_list,
@@ -11695,6 +11781,20 @@ def run_second_pass_coverage_renorm(
         reproj_kwargs["rows_per_chunk"] = int(max(1, row_hint))
     if chunk_hint:
         reproj_kwargs["max_chunk_bytes"] = int(max(1, chunk_hint))
+    if logger:
+        try:
+            logger.info(
+                "[TwoPass] Reprojection plan: gpu=%s cpu_workers=%s rows(cpu/gpu)=%s/%s chunk_mb(cpu/gpu)=%.2f/%.2f memmap=%s",
+                use_gpu,
+                cpu_workers_hint or "-",
+                plan_rows_cpu_hint or 0,
+                plan_rows_gpu_hint or 0,
+                (plan_chunk_cpu_hint or 0) / (1024 ** 2),
+                (plan_chunk_gpu_hint or 0) / (1024 ** 2),
+                bool(use_memmap_flag),
+            )
+        except Exception:
+            pass
 
     n_channels = corrected_tiles[0].shape[-1] if corrected_tiles[0].ndim == 3 else 1
     mosaic_channels: list[np.ndarray] = []
@@ -11710,24 +11810,75 @@ def run_second_pass_coverage_renorm(
                 shape_out_hw,
             )
         data_list = [tile[..., ch] if tile.ndim == 3 else tile[..., 0] for tile in corrected_tiles]
-        try:
-            chan_mosaic, chan_cov = zemosaic_utils.reproject_and_coadd_wrapper(
+        def _invoke_reproj(use_gpu_flag: bool, local_kwargs: dict[str, Any]):
+            return zemosaic_utils.reproject_and_coadd_wrapper(
                 data_list=data_list,
                 wcs_list=tiles_wcs,
                 shape_out=shape_out_hw,
-                use_gpu=use_gpu,
+                use_gpu=use_gpu_flag,
                 cpu_func=reproject_and_coadd,
-                **reproj_kwargs,
+                **local_kwargs,
             )
-        except Exception as exc:
+
+        try:
+            chan_mosaic, chan_cov = _invoke_reproj(use_gpu, reproj_kwargs)
+        except TypeError as type_err:
             if logger:
-                logger.warning(
-                    "[TwoPass] Reprojection failed on channel %d: %s",
-                    ch,
-                    exc,
-                    exc_info=True,
-                )
-            return None
+                logger.warning("[TwoPass] GPU reprojection TypeError, attempting recovery: %s", type_err)
+            chan_mosaic = chan_cov = None
+            if use_gpu:
+                retry_kwargs = dict(reproj_kwargs)
+                removed = []
+                err_msg = str(type_err)
+                for key in list(retry_kwargs.keys()):
+                    if f"'{key}'" in err_msg:
+                        removed.append(key)
+                        retry_kwargs.pop(key, None)
+                if removed:
+                    try:
+                        chan_mosaic, chan_cov = _invoke_reproj(True, retry_kwargs)
+                    except Exception as retry_exc:
+                        if logger:
+                            logger.warning(
+                                "[TwoPass] GPU retry failed, switching to CPU: %s (removed=%s)",
+                                retry_exc,
+                                ",".join(removed),
+                            )
+            if chan_mosaic is None or chan_cov is None:
+                try:
+                    chan_mosaic, chan_cov = _invoke_reproj(False, reproj_kwargs)
+                except Exception as cpu_exc:
+                    if logger:
+                        logger.warning(
+                            "[TwoPass] CPU fallback after GPU TypeError failed on channel %d: %s",
+                            ch,
+                            cpu_exc,
+                            exc_info=True,
+                        )
+                    return None
+        except Exception as exc:
+            if use_gpu:
+                try:
+                    chan_mosaic, chan_cov = _invoke_reproj(False, reproj_kwargs)
+                except Exception as cpu_exc:
+                    if logger:
+                        logger.warning(
+                            "[TwoPass] Reprojection failed on channel %d (GPU+CPU): %s / %s",
+                            ch,
+                            exc,
+                            cpu_exc,
+                            exc_info=True,
+                        )
+                    return None
+            else:
+                if logger:
+                    logger.warning(
+                        "[TwoPass] Reprojection failed on channel %d: %s",
+                        ch,
+                        exc,
+                        exc_info=True,
+                    )
+                return None
         chan_mosaic_np = np.asarray(chan_mosaic, dtype=np.float32)
         mosaic_channels.append(chan_mosaic_np)
         if coverage_result is None:
@@ -11878,6 +12029,8 @@ def run_hierarchical_mosaic(
     poststack_anchor_use_overlap_affine_config: bool = True,
     use_gpu_phase5: bool = False,
     gpu_id_phase5: int | None = None,
+    enable_tile_weighting_config: bool | None = None,
+    tile_weight_mode_config: str = "n_frames",
     logging_level_config: str = "INFO",
     solver_settings: dict | None = None,
     skip_filter_ui: bool = False,
@@ -12148,6 +12301,15 @@ def run_hierarchical_mosaic(
         else bool(match_background_for_final_config)
     )
     feather_parity_flag = bool(incremental_feather_parity_config)
+    tile_weighting_enabled_config = _coerce_bool_flag(enable_tile_weighting_config)
+    if tile_weighting_enabled_config is None:
+        tile_weighting_enabled_config = _coerce_bool_flag(worker_config_cache.get("enable_tile_weighting"))
+    if tile_weighting_enabled_config is None:
+        tile_weighting_enabled_config = True
+    weight_mode_value = tile_weight_mode_config or worker_config_cache.get("tile_weight_mode") or "n_frames"
+    tile_weight_mode_config = str(weight_mode_value).strip().lower() or "n_frames"
+    if sds_mode_flag:
+        tile_weighting_enabled_config = False
 
     try:
         if isinstance(intertile_sky_percentile_config, (list, tuple)) and len(intertile_sky_percentile_config) >= 2:
@@ -12819,7 +12981,7 @@ def run_hierarchical_mosaic(
     auto_caps_info = _compute_auto_tile_caps(
         resource_probe_info,
         per_frame_info,
-        policy_max=50,
+        policy_max=0,
         policy_min=8,
         user_max_override=int(max_raw_per_master_tile_config) if max_raw_per_master_tile_config else None,
     )
@@ -13712,10 +13874,14 @@ def run_hierarchical_mosaic(
 
     def _build_phase5_options_dict(base_progress: float, *, final_method: str | None = None) -> dict[str, Any]:
         current_parallel_plan = getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan"))
+        target_method = final_method or final_assembly_method_config
+        tile_weighting_allowed = bool(tile_weighting_enabled_config)
+        if str(target_method or "").lower().strip() != "reproject_coadd":
+            tile_weighting_allowed = False
         return {
             "base_progress": base_progress,
             "progress_weight": PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
-            "final_assembly_method": final_method or final_assembly_method_config,
+            "final_assembly_method": target_method,
             "apply_master_tile_crop": apply_master_tile_crop_config,
             "quality_crop_enabled": quality_crop_enabled_config,
             "master_tile_crop_percent": master_tile_crop_percent_config,
@@ -13739,6 +13905,8 @@ def run_hierarchical_mosaic(
             "coadd_memmap_dir": coadd_memmap_dir_config,
             "global_anchor_shift": global_anchor_shift,
             "parallel_plan": current_parallel_plan,
+            "tile_weighting_enabled": tile_weighting_allowed,
+            "tile_weight_mode": tile_weight_mode_config,
         }
 
     def _ensure_plan_descriptor_loaded(plan: dict[str, Any]) -> None:
