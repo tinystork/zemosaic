@@ -199,6 +199,39 @@ _STACK_LOG_LEVEL_MAP = {
 _STACK_USER_FACING_LEVELS = {"INFO", "WARN", "WARNING", "ERROR", "SUCCESS"}
 
 
+def _extract_parallel_plan_hints(parallel_plan: Any | None) -> dict[str, int | None]:
+    """
+    Return normalized hints (cpu_workers, chunk rows/bytes) from a ParallelPlan-like object.
+
+    Keeps the helper duck-typed so ``zemosaic_align_stack`` can run standalone without
+    importing the full dataclass definition.
+    """
+
+    hints = {
+        "cpu_workers": None,
+        "rows_cpu": None,
+        "rows_gpu": None,
+        "chunk_cpu": None,
+        "chunk_gpu": None,
+    }
+    if parallel_plan is None:
+        return hints
+
+    def _coerce_positive_int(value) -> int | None:
+        try:
+            ivalue = int(value)
+        except Exception:
+            return None
+        return ivalue if ivalue > 0 else None
+
+    hints["cpu_workers"] = _coerce_positive_int(getattr(parallel_plan, "cpu_workers", None))
+    hints["rows_cpu"] = _coerce_positive_int(getattr(parallel_plan, "rows_per_chunk", None))
+    hints["rows_gpu"] = _coerce_positive_int(getattr(parallel_plan, "gpu_rows_per_chunk", None))
+    hints["chunk_cpu"] = _coerce_positive_int(getattr(parallel_plan, "max_chunk_bytes", None))
+    hints["chunk_gpu"] = _coerce_positive_int(getattr(parallel_plan, "gpu_max_chunk_bytes", None))
+    return hints
+
+
 def equalize_rgb_medians_inplace(img: np.ndarray) -> tuple[float, float, float, float]:
     """In-place per-channel median equalization so that median(R)==median(G)==median(B)."""
 
@@ -1210,6 +1243,7 @@ def stack_winsorized_sigma_clip(
     weight_method: str = "none",
     zconfig=None,
     stack_metadata: dict | None = None,
+    parallel_plan=None,
     **kwargs,
 ):
     """
@@ -1244,6 +1278,16 @@ def stack_winsorized_sigma_clip(
                                            getattr(zconfig, 'use_gpu', False))))
         else:
             use_gpu = False
+
+    plan_hints = _extract_parallel_plan_hints(parallel_plan)
+    plan_cpu_workers = plan_hints["cpu_workers"]
+    if plan_cpu_workers:
+        current_workers = kwargs.get("winsor_max_workers", 0)
+        try:
+            current_workers = int(current_workers)
+        except Exception:
+            current_workers = 0
+        kwargs["winsor_max_workers"] = max(1, min(plan_cpu_workers, current_workers or plan_cpu_workers))
 
     progress_callback = kwargs.get("progress_callback")
     requested_weight_method = str(weight_method or "none").lower().strip()
@@ -1500,6 +1544,10 @@ def stack_winsorized_sigma_clip(
         sample_shape=sample.shape,
         progress_callback=progress_callback,
     )
+    plan_row_hint = plan_hints["rows_gpu"] or plan_hints["rows_cpu"]
+    sample_height = int(sample.shape[0]) if sample.ndim >= 1 else 0
+    if plan_row_hint and sample_height > 0:
+        rows_per_chunk = int(max(1, min(sample_height, plan_row_hint)))
 
     # --- GPU path (poids ignorés) ---
     if can_attempt_gpu:
@@ -1666,6 +1714,7 @@ def stack_kappa_sigma_clip(
     weight_method: str = "none",
     zconfig=None,
     stack_metadata: dict | None = None,
+    parallel_plan=None,
     **kwargs,
 ):
     """Wrapper calling GPU or CPU kappa-sigma clip.
@@ -1682,6 +1731,7 @@ def stack_kappa_sigma_clip(
     frames_list = list(frames)
     if not frames_list:
         raise ValueError("frames is empty")
+    plan_hints = _extract_parallel_plan_hints(parallel_plan)
     requested_weight_method = str(weight_method or "none").lower().strip()
     weight_method_in_use = requested_weight_method or "none"
     weights_array: np.ndarray | None = None
@@ -1716,6 +1766,10 @@ def stack_kappa_sigma_clip(
         sample_shape=sample_shape,
         progress_callback=progress_callback,
     )
+    plan_row_hint = plan_hints["rows_gpu"] or plan_hints["rows_cpu"]
+    sample_height = int(sample_shape[0]) if sample_shape else 0
+    if plan_row_hint and sample_height > 0:
+        rows_per_chunk = int(max(1, min(sample_height, plan_row_hint)))
     if can_attempt_gpu:
         _log_stack_message("stack_using_gpu", "INFO", progress_callback, helper=helper_label)
         gpu_impl = globals().get("gpu_stack_kappa")
@@ -1787,6 +1841,7 @@ def stack_linear_fit_clip(
     weight_method: str = "none",
     zconfig=None,
     stack_metadata: dict | None = None,
+    parallel_plan=None,
     **kwargs,
 ):
     """Wrapper calling GPU or CPU linear fit clip.
@@ -1803,6 +1858,7 @@ def stack_linear_fit_clip(
     frames_list = list(frames)
     if not frames_list:
         raise ValueError("frames is empty")
+    plan_hints = _extract_parallel_plan_hints(parallel_plan)
     requested_weight_method = str(weight_method or "none").lower().strip()
     weight_method_in_use = requested_weight_method or "none"
     weights_array: np.ndarray | None = None
@@ -1837,6 +1893,10 @@ def stack_linear_fit_clip(
         sample_shape=sample_shape,
         progress_callback=progress_callback,
     )
+    plan_row_hint = plan_hints["rows_gpu"] or plan_hints["rows_cpu"]
+    sample_height = int(sample_shape[0]) if sample_shape else 0
+    if plan_row_hint and sample_height > 0:
+        rows_per_chunk = int(max(1, min(sample_height, plan_row_hint)))
     if can_attempt_gpu:
         _log_stack_message("stack_using_gpu", "INFO", progress_callback, helper=helper_label)
         gpu_impl = globals().get("gpu_stack_linear")
@@ -3394,6 +3454,7 @@ def stack_aligned_images(
     progress_callback: callable = None,
     zconfig=None,
     stack_metadata: dict | None = None,
+    parallel_plan=None,
 ) -> np.ndarray | None:
     """
     Stacke une liste d'images alignées, appliquant normalisation, pondération (qualité + radiale),
@@ -3416,6 +3477,15 @@ def stack_aligned_images(
             return _internal_logger.debug(f"PCB_FALLBACK_{level}_{prog}: {msg_key} {kwargs}")
 
     _pcb("STACK_IMG_ENTRY: Début stack_aligned_images.", lvl="ERROR") # Log d'entrée
+
+    plan_hints = _extract_parallel_plan_hints(parallel_plan)
+    plan_cpu_workers = plan_hints["cpu_workers"]
+    if plan_cpu_workers:
+        try:
+            winsor_max_workers = int(winsor_max_workers)
+        except Exception:
+            winsor_max_workers = 1
+        winsor_max_workers = max(1, min(plan_cpu_workers, winsor_max_workers or plan_cpu_workers))
 
     valid_images_to_stack = [img for img in aligned_image_data_list if img is not None and isinstance(img, np.ndarray)]
     if not valid_images_to_stack:

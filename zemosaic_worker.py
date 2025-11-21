@@ -98,6 +98,27 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, FI
 # BrokenProcessPool moved under concurrent.futures.process in modern Python
 from concurrent.futures.process import BrokenProcessPool
 
+try:
+    from parallel_utils import (
+        ParallelCapabilities,
+        ParallelPlan,
+        auto_tune_parallel_plan,
+        detect_parallel_capabilities,
+    )
+
+    PARALLEL_HELPERS_AVAILABLE = True
+except Exception:
+    ParallelCapabilities = None  # type: ignore
+    ParallelPlan = None  # type: ignore
+
+    def detect_parallel_capabilities():
+        return None
+
+    def auto_tune_parallel_plan(*args, **kwargs):
+        return None
+
+    PARALLEL_HELPERS_AVAILABLE = False
+
 # ZeQualityMT (quality gate for Master Tiles)
 try:
     from zequalityMT import quality_metrics as _zq_quality_metrics
@@ -902,6 +923,7 @@ def _apply_two_pass_coverage_renorm_if_requested(
     logger: logging.Logger | None,
     collected_tiles: list[tuple[np.ndarray, Any]] | None = None,
     fallback_tile_loader: Callable[[], tuple[list[np.ndarray], list[Any]]] | None = None,
+    parallel_plan: ParallelPlan | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
     """Run the coverage renormalization second pass if configured."""
 
@@ -956,6 +978,7 @@ def _apply_two_pass_coverage_renorm_if_requested(
             logger=logger,
             use_gpu_two_pass=use_gpu_two_pass,
             tiles_coverage=coverage_for_second_pass,
+            parallel_plan=parallel_plan,
         )
         if result is not None:
             final_mosaic_data, final_mosaic_coverage = result
@@ -993,6 +1016,7 @@ def _apply_phase5_post_stack_pipeline(
     logger: logging.Logger | None,
     collected_tiles: list[tuple[np.ndarray, Any]] | None = None,
     fallback_two_pass_loader: Callable[[], tuple[list[np.ndarray], list[Any]]] | None = None,
+    parallel_plan: ParallelPlan | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     """Run the reusable Phase 5 post-stack operations."""
 
@@ -1032,6 +1056,7 @@ def _apply_phase5_post_stack_pipeline(
         logger=logger,
         collected_tiles=collected_tiles,
         fallback_tile_loader=fallback_two_pass_loader,
+        parallel_plan=parallel_plan,
     )
     return final_mosaic_data, final_mosaic_coverage, final_alpha_map
 
@@ -1341,6 +1366,7 @@ def _finalize_sds_global_mosaic(
     autocrop_margin_px: int = 0,
     global_plan: dict[str, Any] | None = None,
     fallback_two_pass_loader=None,
+    parallel_plan: ParallelPlan | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     """
     Pipeline spécifique SDS appliqué après la construction de la mosaïque globale.
@@ -1405,6 +1431,7 @@ def _finalize_sds_global_mosaic(
         logger=logger,
         collected_tiles=collected_tiles,
         fallback_two_pass_loader=fallback_two_pass_loader,
+        parallel_plan=parallel_plan,
     )
 
     autocrop_meta: dict[str, int] | None = None
@@ -3104,6 +3131,7 @@ def _run_phase4_5_inter_master_merge(
                 worker_limit_val = int(stack_cfg.get("winsor_worker_limit", 1))
             except Exception:
                 worker_limit_val = 1
+            current_parallel_plan = getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan"))
             stack_kwargs = {
                 "kappa": kappa_val,
                 "winsor_limits": limits_val,
@@ -3704,7 +3732,11 @@ def _run_phase4_5_inter_master_merge(
                 try:
                     if reject_algo in ("winsor", "winsorized_sigma_clip"):
                         result = zemosaic_align_stack.stack_winsorized_sigma_clip(
-                            frames, weight_method=weight_method, zconfig=None, **stack_kwargs
+                            frames,
+                            weight_method=weight_method,
+                            zconfig=None,
+                            parallel_plan=current_parallel_plan,
+                            **stack_kwargs,
                         )
                         super_arr = result[0] if isinstance(result, (tuple, list)) else result
                     elif reject_algo == "kappa_sigma":
@@ -3723,6 +3755,7 @@ def _run_phase4_5_inter_master_merge(
                                 zconfig=None,
                                 sigma_low=float(stack_cfg.get("kappa_low", 3.0)),
                                 sigma_high=float(stack_cfg.get("kappa_high", stack_cfg.get("kappa_low", 3.0))),
+                                parallel_plan=current_parallel_plan,
                             )
                         if stack_result is not None:
                             super_arr = stack_result[0] if isinstance(stack_result, (tuple, list)) else stack_result
@@ -3732,6 +3765,7 @@ def _run_phase4_5_inter_master_merge(
                             weight_method=weight_method,
                             zconfig=None,
                             sigma=float(stack_cfg.get("kappa_high", stack_cfg.get("kappa_low", 3.0))),
+                            parallel_plan=current_parallel_plan,
                         )
                         super_arr = result[0] if isinstance(result, (tuple, list)) else result
 
@@ -6199,6 +6233,7 @@ def _run_shared_phase45_phase5_pipeline(
     coadd_memmap_dir_config = phase5_options.get("coadd_memmap_dir")
     start_time_total = start_time_total_run
     global_anchor_shift = phase5_options.get("global_anchor_shift")
+    parallel_plan = phase5_options.get("parallel_plan")
 
     pcb("PHASE_UPDATE:5", prog=None, lvl="ETA_LEVEL")
     _log_memory_usage(
@@ -6347,6 +6382,7 @@ def _run_shared_phase45_phase5_pipeline(
                 collect_tile_data=collected_tiles_for_second_pass,
                 global_anchor_shift=global_anchor_shift,
                 phase45_enabled=phase45_active_flag,
+                parallel_plan=parallel_plan,
             )
         except Exception as exc:
             logger.exception("Reproject+Coadd assembly failed", exc_info=True)
@@ -6392,6 +6428,7 @@ def _run_shared_phase45_phase5_pipeline(
         logger=logger,
         collected_tiles=collected_tiles_for_second_pass,
         fallback_two_pass_loader=fallback_two_pass_loader,
+        parallel_plan=parallel_plan,
     )
     if collected_tiles_for_second_pass is not None:
         collected_tiles_for_second_pass.clear()
@@ -8768,6 +8805,7 @@ def create_master_tile(
     center_out_context: CenterOutNormalizationContext | None = None,
     center_out_settings: dict | None = None,
     center_out_rank: int | None = None,
+    parallel_plan: ParallelPlan | None = None,
 ):
     """
     Crée une "master tuile" à partir d'un groupe d'images.
@@ -8790,6 +8828,9 @@ def create_master_tile(
             zconfig = SimpleNamespace()
     else:
         zconfig = SimpleNamespace()
+    if parallel_plan is not None:
+        setattr(zconfig, "parallel_plan", parallel_plan)
+
     # Ensure stacking GPU preference mirrors the Phase 5 GPU intent when not explicitly set.
     try:
         phase5_pref = bool(getattr(zconfig, "use_gpu_phase5"))
@@ -9000,6 +9041,7 @@ def create_master_tile(
 
     stack_metadata: dict[str, Any] = {}
 
+    current_parallel_plan = parallel_plan or getattr(zconfig, "parallel_plan", None)
     if stack_reject_algo == "winsorized_sigma_clip":
         master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_winsorized_sigma_clip(
             valid_aligned_images,
@@ -9011,6 +9053,7 @@ def create_master_tile(
             winsor_max_frames_per_pass=int(winsor_max_frames_per_pass) if winsor_max_frames_per_pass is not None else 0,
             winsor_max_workers=int(winsor_pool_workers) if winsor_pool_workers is not None else 1,
             stack_metadata=stack_metadata,
+            parallel_plan=current_parallel_plan,
         )
     elif stack_reject_algo == "kappa_sigma":
         master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_kappa_sigma_clip(
@@ -9020,6 +9063,7 @@ def create_master_tile(
             sigma_low=stack_kappa_low,
             sigma_high=stack_kappa_high,
             stack_metadata=stack_metadata,
+            parallel_plan=current_parallel_plan,
         )
     elif stack_reject_algo == "linear_fit_clip":
         master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_linear_fit_clip(
@@ -9028,6 +9072,7 @@ def create_master_tile(
             zconfig=zconfig,
             sigma=stack_kappa_high,
             stack_metadata=stack_metadata,
+            parallel_plan=current_parallel_plan,
         )
     else:
         master_tile_stacked_HWC = zemosaic_align_stack.stack_aligned_images(
@@ -9047,6 +9092,7 @@ def create_master_tile(
             progress_callback=progress_callback,
             zconfig=zconfig,
             stack_metadata=stack_metadata,
+            parallel_plan=current_parallel_plan,
         )
     
     del valid_aligned_images; gc.collect() # valid_aligned_images a été passé par valeur (copie de la liste)
@@ -10174,6 +10220,7 @@ def assemble_final_mosaic_reproject_coadd(
     tile_affine_corrections: list[tuple[float, float]] | None = None,
     global_anchor_shift: tuple[float, float] | None = None,
     phase45_enabled: bool = False,
+    parallel_plan: ParallelPlan | None = None,
 ):
     """Assemble les master tiles en utilisant ``reproject_and_coadd``."""
     _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
@@ -10187,6 +10234,43 @@ def assemble_final_mosaic_reproject_coadd(
     )
 
     start_time_phase = time.monotonic()
+    plan_rows_cpu_hint: int | None = None
+    plan_rows_gpu_hint: int | None = None
+    plan_chunk_cpu_hint: int | None = None
+    plan_chunk_gpu_hint: int | None = None
+    if parallel_plan is not None:
+        cpu_workers_hint = getattr(parallel_plan, "cpu_workers", None)
+        try:
+            cpu_workers_hint = int(cpu_workers_hint)
+        except Exception:
+            cpu_workers_hint = None
+        if cpu_workers_hint and cpu_workers_hint > 0:
+            assembly_process_workers = cpu_workers_hint
+        use_memmap = bool(getattr(parallel_plan, "use_memmap", use_memmap))
+        row_cpu = getattr(parallel_plan, "rows_per_chunk", None)
+        if row_cpu is not None:
+            try:
+                plan_rows_cpu_hint = max(1, int(row_cpu))
+            except Exception:
+                plan_rows_cpu_hint = None
+        row_gpu = getattr(parallel_plan, "gpu_rows_per_chunk", None)
+        if row_gpu is not None:
+            try:
+                plan_rows_gpu_hint = max(1, int(row_gpu))
+            except Exception:
+                plan_rows_gpu_hint = None
+        chunk_cpu = getattr(parallel_plan, "max_chunk_bytes", None)
+        if chunk_cpu is not None:
+            try:
+                plan_chunk_cpu_hint = max(1, int(chunk_cpu))
+            except Exception:
+                plan_chunk_cpu_hint = None
+        chunk_gpu = getattr(parallel_plan, "gpu_max_chunk_bytes", None)
+        if chunk_gpu is not None:
+            try:
+                plan_chunk_gpu_hint = max(1, int(chunk_gpu))
+            except Exception:
+                plan_chunk_gpu_hint = None
 
     # Emit ETA during the preparation phase (before channels start)
     def _update_eta_prepare(done_tiles: int, total_tiles_local: int):
@@ -10706,6 +10790,20 @@ def assemble_final_mosaic_reproject_coadd(
         reproj_kwargs["intertile_robust_clip_sigma"] = float(intertile_robust_clip_sigma)
     except Exception:
         reproj_kwargs["intertile_robust_clip_sigma"] = 2.5
+
+    # Apply auto-tune chunking hints when available
+    row_hint = None
+    chunk_hint = None
+    if use_gpu:
+        row_hint = plan_rows_gpu_hint or plan_rows_cpu_hint
+        chunk_hint = plan_chunk_gpu_hint or plan_chunk_cpu_hint
+    else:
+        row_hint = plan_rows_cpu_hint
+        chunk_hint = plan_chunk_cpu_hint
+    if row_hint:
+        reproj_kwargs["rows_per_chunk"] = int(max(1, row_hint))
+    if chunk_hint:
+        reproj_kwargs["max_chunk_bytes"] = int(max(1, chunk_hint))
 
     # If we are going to use the GPU, pass the precomputed affine corrections down
     # so they are applied inside the GPU reprojection (parity with CPU path).
@@ -11331,6 +11429,7 @@ def run_second_pass_coverage_renorm(
     logger=None,
     use_gpu_two_pass: bool | None = None,
     tiles_coverage: list[np.ndarray | None] | None = None,
+    parallel_plan: ParallelPlan | None = None,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Apply coverage-based gains to tiles and reproject them for a second pass."""
     if logger:
@@ -11360,6 +11459,41 @@ def run_second_pass_coverage_renorm(
             logger.warning("[TwoPass] zemosaic_utils unavailable; skipping second pass")
         return None
     use_gpu = bool(use_gpu_two_pass)
+    plan_rows_cpu_hint: int | None = None
+    plan_rows_gpu_hint: int | None = None
+    plan_chunk_cpu_hint: int | None = None
+    plan_chunk_gpu_hint: int | None = None
+    if parallel_plan is not None:
+        try:
+            cpu_hint = int(getattr(parallel_plan, "cpu_workers", 0) or 0)
+        except Exception:
+            cpu_hint = 0
+        if cpu_hint <= 0:
+            cpu_hint = None
+        row_cpu = getattr(parallel_plan, "rows_per_chunk", None)
+        if row_cpu is not None:
+            try:
+                plan_rows_cpu_hint = max(1, int(row_cpu))
+            except Exception:
+                plan_rows_cpu_hint = None
+        row_gpu = getattr(parallel_plan, "gpu_rows_per_chunk", None)
+        if row_gpu is not None:
+            try:
+                plan_rows_gpu_hint = max(1, int(row_gpu))
+            except Exception:
+                plan_rows_gpu_hint = None
+        chunk_cpu = getattr(parallel_plan, "max_chunk_bytes", None)
+        if chunk_cpu is not None:
+            try:
+                plan_chunk_cpu_hint = max(1, int(chunk_cpu))
+            except Exception:
+                plan_chunk_cpu_hint = None
+        chunk_gpu = getattr(parallel_plan, "gpu_max_chunk_bytes", None)
+        if chunk_gpu is not None:
+            try:
+                plan_chunk_gpu_hint = max(1, int(chunk_gpu))
+            except Exception:
+                plan_chunk_gpu_hint = None
     try:
         gains = compute_per_tile_gains_from_coverage(
             tiles,
@@ -11420,6 +11554,19 @@ def run_second_pass_coverage_renorm(
             reproj_kwargs["intermediate_memmap"] = False
     else:
         reproj_kwargs["match_background"] = True
+
+    row_hint = None
+    chunk_hint = None
+    if use_gpu:
+        row_hint = plan_rows_gpu_hint or plan_rows_cpu_hint
+        chunk_hint = plan_chunk_gpu_hint or plan_chunk_cpu_hint
+    else:
+        row_hint = plan_rows_cpu_hint
+        chunk_hint = plan_chunk_cpu_hint
+    if row_hint:
+        reproj_kwargs["rows_per_chunk"] = int(max(1, row_hint))
+    if chunk_hint:
+        reproj_kwargs["max_chunk_bytes"] = int(max(1, chunk_hint))
 
     n_channels = corrected_tiles[0].shape[-1] if corrected_tiles[0].ndim == 3 else 1
     mosaic_channels: list[np.ndarray] = []
@@ -11758,6 +11905,11 @@ def run_hierarchical_mosaic(
         pcb("run_info_cache_retention_mode", prog=None, lvl="INFO_DETAIL", mode=cache_retention_mode)
     except Exception:
         pass
+
+    cleanup_temp_artifacts_value = (worker_config_cache or {}).get("cleanup_temp_artifacts")
+    cleanup_temp_artifacts_config = _coerce_bool_flag(cleanup_temp_artifacts_value)
+    if cleanup_temp_artifacts_config is None:
+        cleanup_temp_artifacts_config = True
 
     # --- Apply logging level from GUI/config ---
     try:
@@ -12154,6 +12306,64 @@ def run_hierarchical_mosaic(
 
     num_total_raw_files = len(fits_file_paths)
     pcb("run_info_found_potential_fits", prog=base_progress_phase1, lvl="INFO_DETAIL", num_files=num_total_raw_files)
+
+    # --- Parallel auto-tune plan (optional) ---
+    parallel_caps: ParallelCapabilities | None = None  # type: ignore[assignment]
+    global_parallel_plan: ParallelPlan | None = None  # type: ignore[assignment]
+    if PARALLEL_HELPERS_AVAILABLE:
+        try:
+            parallel_caps = detect_parallel_capabilities()
+        except Exception as exc_parallel_caps:
+            parallel_caps = None
+            logger.warning("Parallel capability detection failed: %s", exc_parallel_caps)
+        frame_h = 0
+        frame_w = 0
+        if isinstance(global_wcs_plan, dict):
+            try:
+                frame_h = int(global_wcs_plan.get("height") or 0)
+            except Exception:
+                frame_h = 0
+            try:
+                frame_w = int(global_wcs_plan.get("width") or 0)
+            except Exception:
+                frame_w = 0
+        frame_shape = (frame_h, frame_w) if (frame_h > 0 and frame_w > 0) else (frame_h, frame_w)
+        try:
+            global_parallel_plan = auto_tune_parallel_plan(
+                kind="global",
+                frame_shape=frame_shape,
+                n_frames=max(1, num_total_raw_files),
+                bytes_per_pixel=4,
+                config=worker_config_cache,
+                caps=parallel_caps,
+            )
+            worker_config_cache["parallel_plan"] = global_parallel_plan
+            setattr(zconfig, "parallel_plan", global_parallel_plan)
+            if parallel_caps is not None:
+                worker_config_cache["parallel_capabilities"] = parallel_caps
+                setattr(zconfig, "parallel_capabilities", parallel_caps)
+            try:
+                pcb(
+                    "parallel_plan_summary",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                    cpu_workers=int(getattr(global_parallel_plan, "cpu_workers", 0)),
+                    use_gpu=bool(getattr(global_parallel_plan, "use_gpu", False)),
+                    rows=int(getattr(global_parallel_plan, "rows_per_chunk", 0) or 0),
+                    gpu_rows=int(getattr(global_parallel_plan, "gpu_rows_per_chunk", 0) or 0),
+                    memmap=bool(getattr(global_parallel_plan, "use_memmap", False)),
+                    chunk_mb=float(
+                        getattr(global_parallel_plan, "max_chunk_bytes", 0) / (1024 ** 2)
+                        if getattr(global_parallel_plan, "max_chunk_bytes", 0)
+                        else 0.0
+                    ),
+                )
+            except Exception:
+                pass
+        except Exception as exc_parallel_plan:
+            logger.warning("Parallel auto-tune failed: %s", exc_parallel_plan)
+            global_parallel_plan = None
+
     # Kick off a stage progress stream so the GUI progress bar animates
     try:
         if progress_callback and callable(progress_callback):
@@ -13364,6 +13574,7 @@ def run_hierarchical_mosaic(
         }
 
     def _build_phase5_options_dict(base_progress: float, *, final_method: str | None = None) -> dict[str, Any]:
+        current_parallel_plan = getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan"))
         return {
             "base_progress": base_progress,
             "progress_weight": PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
@@ -13390,6 +13601,7 @@ def run_hierarchical_mosaic(
             "coadd_use_memmap": coadd_use_memmap_config,
             "coadd_memmap_dir": coadd_memmap_dir_config,
             "global_anchor_shift": global_anchor_shift,
+            "parallel_plan": current_parallel_plan,
         }
 
     def _ensure_plan_descriptor_loaded(plan: dict[str, Any]) -> None:
@@ -13493,6 +13705,7 @@ def run_hierarchical_mosaic(
                 target_batch_size=sds_target_batch_size_config,
                 preplan_path_groups=preplan_groups_override_paths,
                 postprocess_context=sds_post_context,
+                parallel_plan=getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan")),
             )
             sds_tile_records = list(sds_post_context.pop("sds_tile_records", []) or [])
             temp_dir_candidate = sds_post_context.pop("sds_tile_temp_dir", None)
@@ -13535,6 +13748,7 @@ def run_hierarchical_mosaic(
                     autocrop_margin_px=global_wcs_autocrop_margin_px_config,
                     global_plan=global_wcs_plan,
                     fallback_two_pass_loader=None,
+                    parallel_plan=getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan")),
                 )
                 final_alpha_map = alpha_final
                 if final_mosaic_data_HWC is not None:
@@ -13572,6 +13786,7 @@ def run_hierarchical_mosaic(
                         ),
                         start_time_total_run=start_time_total_run,
                         cache_root=output_folder,
+                        parallel_plan=getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan")),
                     ) or (None, None, None)
                     final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = mosaic_result
                     if final_mosaic_data_HWC is not None:
@@ -13605,6 +13820,7 @@ def run_hierarchical_mosaic(
                             autocrop_margin_px=global_wcs_autocrop_margin_px_config,
                             global_plan=global_wcs_plan,
                             fallback_two_pass_loader=None,
+                            parallel_plan=getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan")),
                         )
                         final_alpha_map = alpha_final
                         if final_mosaic_data_HWC is not None:
@@ -14079,6 +14295,7 @@ def run_hierarchical_mosaic(
                     center_out_context=center_out_context,
                     center_out_settings=center_out_settings if center_out_context else None,
                     center_out_rank=processing_rank,
+                    parallel_plan=getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan")),
                 )
                 future_to_tile_id[future] = assigned_tile_id
                 pending_futures.add(future)
@@ -14753,34 +14970,53 @@ def run_hierarchical_mosaic(
 
     # Cleanup memmap .dat files now that arrays are released (Windows requires handles closed)
     def _cleanup_memmap_artifacts():
-        if not (
+        if not cleanup_temp_artifacts_config:
+            return
+
+        if (
             bool(coadd_use_memmap_config)
             and bool(coadd_cleanup_memmap_config)
             and coadd_memmap_dir_config
             and _path_isdir(coadd_memmap_dir_config)
         ):
-            return
+            try:
+                memmap_cleanup_dir = Path(coadd_memmap_dir_config).expanduser()
+                for entry in memmap_cleanup_dir.iterdir():
+                    name_l = entry.name.lower()
+                    if entry.is_file() and name_l.endswith(".dat") and (
+                        name_l.startswith("mosaic_")
+                        or name_l.startswith("coverage_")
+                        or name_l.startswith("zemosaic_")
+                    ):
+                        try:
+                            entry.unlink()
+                        except OSError:
+                            pass
+                        continue
+                    if entry.is_dir() and name_l.startswith("mosaic_first_"):
+                        try:
+                            shutil.rmtree(str(entry), ignore_errors=False)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
         try:
-            memmap_cleanup_dir = Path(coadd_memmap_dir_config).expanduser()
-            for entry in memmap_cleanup_dir.iterdir():
-                name_l = entry.name.lower()
-                if entry.is_file() and name_l.endswith(".dat") and (
-                    name_l.startswith("mosaic_")
-                    or name_l.startswith("coverage_")
-                    or name_l.startswith("zemosaic_")
-                ):
-                    try:
-                        entry.unlink()
-                    except OSError:
-                        pass
-                    continue
-                if entry.is_dir() and name_l.startswith("mosaic_first_"):
-                    try:
-                        shutil.rmtree(str(entry), ignore_errors=False)
-                    except Exception:
-                        pass
+            runtime_temp_root = get_runtime_temp_dir()
         except Exception:
-            pass
+            runtime_temp_root = None
+        if runtime_temp_root:
+            try:
+                runtime_path = Path(runtime_temp_root).expanduser()
+                if runtime_path.is_dir():
+                    for entry in runtime_path.iterdir():
+                        if entry.is_dir() and entry.name.lower().startswith("mosaic_first_"):
+                            try:
+                                shutil.rmtree(str(entry), ignore_errors=False)
+                            except Exception:
+                                pass
+            except Exception:
+                pass
 
         wcs_candidates: list[Path] = []
         try:
@@ -14812,7 +15048,7 @@ def run_hierarchical_mosaic(
 
     _cleanup_memmap_artifacts()
 
-    if sds_runtime_tile_dir:
+    if sds_runtime_tile_dir and cleanup_temp_artifacts_config:
         try:
             shutil.rmtree(sds_runtime_tile_dir, ignore_errors=True)
         except Exception:
@@ -14860,8 +15096,8 @@ def run_hierarchical_mosaic(
                 )
 
     master_tiles_dir = temp_master_tile_storage_dir
-    if master_tiles_dir:
-        if not two_pass_enabled and _path_exists(master_tiles_dir):
+    if master_tiles_dir and _path_exists(master_tiles_dir):
+        if cleanup_temp_artifacts_config:
             try:
                 shutil.rmtree(master_tiles_dir)
                 pcb(
@@ -14876,9 +15112,9 @@ def run_hierarchical_mosaic(
                     master_tiles_dir,
                     mt_exc,
                 )
-        elif two_pass_enabled and _path_exists(master_tiles_dir):
+        else:
             pcb(
-                "run_info_temp_master_tiles_kept_two_pass",
+                "run_info_temp_master_tiles_retained_cleanup_disabled",
                 prog=None,
                 lvl="INFO_DETAIL",
                 directory=master_tiles_dir,
@@ -15026,6 +15262,7 @@ def _assemble_global_mosaic_first_impl(
     progress_weight_phase: float | None,
     start_time_total_run: float | None,
     cache_root: str | None,
+    parallel_plan: ParallelPlan | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     """Best-effort implementation of the Mosaic-First reprojection+coadd workflow."""
 
@@ -15043,6 +15280,42 @@ def _assemble_global_mosaic_first_impl(
     cpu_eta_start_time = None
     cpu_eta_last_emit = 0.0
     CPU_ETA_MIN_INTERVAL = 4.0
+    plan_rows_cpu_hint: int | None = None
+    plan_rows_gpu_hint: int | None = None
+    plan_chunk_cpu_hint: int | None = None
+    plan_chunk_gpu_hint: int | None = None
+    plan_cpu_workers_hint: int | None = None
+    if parallel_plan is not None:
+        try:
+            cpu_hint = int(getattr(parallel_plan, "cpu_workers", 0) or 0)
+        except Exception:
+            cpu_hint = 0
+        if cpu_hint > 0:
+            plan_cpu_workers_hint = cpu_hint
+        row_cpu = getattr(parallel_plan, "rows_per_chunk", None)
+        if row_cpu is not None:
+            try:
+                plan_rows_cpu_hint = max(1, int(row_cpu))
+            except Exception:
+                plan_rows_cpu_hint = None
+        row_gpu = getattr(parallel_plan, "gpu_rows_per_chunk", None)
+        if row_gpu is not None:
+            try:
+                plan_rows_gpu_hint = max(1, int(row_gpu))
+            except Exception:
+                plan_rows_gpu_hint = None
+        chunk_cpu = getattr(parallel_plan, "max_chunk_bytes", None)
+        if chunk_cpu is not None:
+            try:
+                plan_chunk_cpu_hint = max(1, int(chunk_cpu))
+            except Exception:
+                plan_chunk_cpu_hint = None
+        chunk_gpu = getattr(parallel_plan, "gpu_max_chunk_bytes", None)
+        if chunk_gpu is not None:
+            try:
+                plan_chunk_gpu_hint = max(1, int(chunk_gpu))
+            except Exception:
+                plan_chunk_gpu_hint = None
 
     plan_mode = str(global_plan.get("mode") or "").strip().lower()
     plan_meta = global_plan.get("meta") if isinstance(global_plan.get("meta"), dict) else {}
@@ -15713,6 +15986,13 @@ def _assemble_global_mosaic_first_impl(
                 if final_channels:
                     helper_partial_gpu_artifacts = True
                 return None
+            gpu_reproj_kwargs: dict[str, Any] = {}
+            row_hint_gpu = plan_rows_gpu_hint or plan_rows_cpu_hint
+            if row_hint_gpu:
+                gpu_reproj_kwargs["rows_per_chunk"] = int(max(1, row_hint_gpu))
+            chunk_hint_gpu = plan_chunk_gpu_hint or plan_chunk_cpu_hint
+            if chunk_hint_gpu:
+                gpu_reproj_kwargs["max_chunk_bytes"] = int(max(1, chunk_hint_gpu))
             try:
                 chan_mosaic, chan_cov = zemosaic_utils.reproject_and_coadd_wrapper(
                     data_list=data_list,
@@ -15729,6 +16009,7 @@ def _assemble_global_mosaic_first_impl(
                     allow_cpu_fallback=False,
                     match_background=match_background,
                     progress_callback=pcb,
+                    **gpu_reproj_kwargs,
                 )
             except Exception as exc:
                 logger.warning(
@@ -15740,6 +16021,15 @@ def _assemble_global_mosaic_first_impl(
                     helper_partial_gpu_artifacts = True
                 return None
             if gpu_verify_tolerance is not None:
+                cpu_reproj_kwargs: dict[str, Any] = {}
+                cpu_rows_hint = plan_rows_cpu_hint or plan_rows_gpu_hint
+                if cpu_rows_hint:
+                    cpu_reproj_kwargs["rows_per_chunk"] = int(max(1, cpu_rows_hint))
+                cpu_chunk_hint = plan_chunk_cpu_hint or plan_chunk_gpu_hint
+                if cpu_chunk_hint:
+                    cpu_reproj_kwargs["max_chunk_bytes"] = int(max(1, cpu_chunk_hint))
+                if plan_cpu_workers_hint:
+                    cpu_reproj_kwargs["process_workers"] = int(plan_cpu_workers_hint)
                 try:
                     cpu_mosaic, _ = zemosaic_utils.reproject_and_coadd_wrapper(
                         data_list=data_list,
@@ -15755,6 +16045,7 @@ def _assemble_global_mosaic_first_impl(
                         use_gpu=False,
                         match_background=match_background,
                         progress_callback=pcb,
+                        **cpu_reproj_kwargs,
                     )
                     try:
                         diff = float(np.nanmax(np.abs(cpu_mosaic - chan_mosaic)))
@@ -16227,6 +16518,7 @@ def assemble_global_mosaic_sds(
     target_batch_size: int = 10,
     preplan_path_groups: list[list[str]] | None = None,
     postprocess_context: dict[str, Any] | None = None,
+    parallel_plan: ParallelPlan | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     """Batch Mosaic-First workflow that stacks per-batch mosaics in the global WCS."""
 
@@ -16661,6 +16953,64 @@ def assemble_global_mosaic_sds(
     weight_total = float(progress_weight_phase or 0.0)
     base_phase = float(base_progress_phase or 0.0)
 
+    def _estimate_megatile_bytes() -> int:
+        try:
+            channels_hint = int((stack_params or {}).get("stack_output_channels") or 3)
+        except Exception:
+            channels_hint = 3
+        channels_hint = max(1, channels_hint)
+        return int(
+            max(0, height)
+            * max(0, width)
+            * channels_hint
+            * np.dtype(np.float32).itemsize
+        )
+
+    max_parallel_megatiles = 1
+    if parallel_plan is not None:
+        tiles_hint = getattr(parallel_plan, "tiles_per_chunk", None)
+        if tiles_hint:
+            try:
+                max_parallel_megatiles = max(1, int(tiles_hint))
+            except Exception:
+                max_parallel_megatiles = 1
+        else:
+            try:
+                cpu_workers_hint = int(getattr(parallel_plan, "cpu_workers", 0) or 0)
+            except Exception:
+                cpu_workers_hint = 0
+            if cpu_workers_hint >= 4:
+                max_parallel_megatiles = max(1, min(4, cpu_workers_hint // 2))
+        if getattr(parallel_plan, "use_gpu", False):
+            max_parallel_megatiles = 1
+        chunk_bytes_hint = getattr(parallel_plan, "max_chunk_bytes", None)
+        tile_bytes = _estimate_megatile_bytes()
+        if chunk_bytes_hint and tile_bytes > 0:
+            try:
+                mem_based = max(1, int(chunk_bytes_hint) // tile_bytes)
+            except Exception:
+                mem_based = 1
+            if mem_based > 0:
+                max_parallel_megatiles = max(1, min(max_parallel_megatiles, mem_based))
+    max_parallel_megatiles = max(1, min(total_batches or 1, max_parallel_megatiles))
+    if max_parallel_megatiles <= 0:
+        max_parallel_megatiles = 1
+
+    try:
+        pcb(
+            "sds_parallel_batch_plan",
+            prog=None,
+            lvl="INFO_DETAIL",
+            workers=int(max_parallel_megatiles),
+            total_batches=int(total_batches),
+            plan_cpu_workers=int(getattr(parallel_plan, "cpu_workers", 0) or 0)
+            if parallel_plan is not None
+            else 0,
+            plan_use_gpu=bool(getattr(parallel_plan, "use_gpu", False)) if parallel_plan is not None else False,
+        )
+    except Exception:
+        pass
+
     def _sds_build_reproject_kwargs(batch_index: int) -> dict[str, Any]:
         """Helper to keep per-batch reprojection kwargs consistent."""
 
@@ -16676,17 +17026,16 @@ def assemble_global_mosaic_sds(
             "progress_weight_phase": batch_weight,
             "start_time_total_run": start_time_total_run,
             "cache_root": cache_root,
+            "parallel_plan": parallel_plan,
         }
 
-    for idx, batch in enumerate(batches):
+    def _process_sds_batch(idx: int, batch: list[dict]) -> dict[str, Any]:
         batch_start = time.monotonic()
-        batch_result = _assemble_global_mosaic_first_impl(
+        mosaic_arr, coverage_arr, alpha_arr = _assemble_global_mosaic_first_impl(
             [batch],
             **_sds_build_reproject_kwargs(idx),
         )
-        mosaic_arr, coverage_arr, alpha_arr = batch_result
-        batch_elapsed = max(0.0, time.monotonic() - batch_start)
-        batch_timings.append(batch_elapsed)
+        elapsed = max(0.0, time.monotonic() - batch_start)
         tile_shape_text = (
             f"{int(mosaic_arr.shape[0])}x{int(mosaic_arr.shape[1])}"
             if mosaic_arr is not None and mosaic_arr.ndim >= 2
@@ -16694,7 +17043,7 @@ def assemble_global_mosaic_sds(
         )
         log_message = (
             f"[SDS] Batch {idx + 1}/{total_batches} | frames={len(batch)} "
-            f"| shape={tile_shape_text} | elapsed={batch_elapsed:.2f}s | success={mosaic_arr is not None}"
+            f"| shape={tile_shape_text} | elapsed={elapsed:.2f}s | success={mosaic_arr is not None}"
         )
         try:
             pcb(
@@ -16705,29 +17054,80 @@ def assemble_global_mosaic_sds(
                 total_batches=int(total_batches),
                 images=len(batch),
                 tile_shape=tile_shape_text,
-                elapsed_s=float(batch_elapsed),
+                elapsed_s=float(elapsed),
                 success=bool(mosaic_arr is not None),
             )
         except Exception:
             pass
+        result: dict[str, Any] = {
+            "index": idx,
+            "elapsed": elapsed,
+            "mosaic": None,
+            "coverage": None,
+            "alpha_payload": None,
+        }
         if mosaic_arr is None:
-            continue
+            return result
         mosaic_sanitized, coverage_sanitized, alpha_sanitized = _sanitize_sds_megatile_payload(
             mosaic_arr,
             coverage_arr,
             alpha_arr,
         )
         if mosaic_sanitized is None:
-            continue
-        mosaics.append(mosaic_sanitized)
-        coverages.append(coverage_sanitized)
+            return result
         if alpha_sanitized is not None:
-            alphas.append(alpha_sanitized)
+            alpha_payload = alpha_sanitized
         elif isinstance(alpha_arr, np.ndarray):
-            alphas.append(_safe_asarray(alpha_arr))
+            alpha_payload = _safe_asarray(alpha_arr)
         else:
-            alphas.append(alpha_arr.copy() if alpha_arr is not None else None)
-        pending_tile_payloads.append((mosaics[-1], alphas[-1], coverages[-1], idx + 1))
+            alpha_payload = alpha_arr.copy() if alpha_arr is not None else None
+        result["mosaic"] = mosaic_sanitized
+        result["coverage"] = coverage_sanitized
+        result["alpha_payload"] = alpha_payload
+        return result
+
+    batch_results: list[dict[str, Any]] = []
+
+    def _accumulate_batch_result(batch_result: dict[str, Any] | None) -> None:
+        if not batch_result:
+            return
+        batch_timings.append(batch_result.get("elapsed", 0.0))
+        batch_results.append(batch_result)
+
+    if total_batches and max_parallel_megatiles > 1:
+        with ThreadPoolExecutor(
+            max_parallel_megatiles,
+            thread_name_prefix="ZeMosaic_SDS_",
+        ) as executor:
+            futures = {
+                executor.submit(_process_sds_batch, idx, batch): idx
+                for idx, batch in enumerate(batches)
+            }
+            for future in as_completed(futures):
+                try:
+                    _accumulate_batch_result(future.result())
+                except Exception as exc:
+                    pcb("sds_error_batch_exception", prog=None, lvl="WARN", error=str(exc))
+    else:
+        for idx, batch in enumerate(batches):
+            _accumulate_batch_result(_process_sds_batch(idx, batch))
+
+    batch_results.sort(key=lambda payload: payload.get("index", 0))
+    for result in batch_results:
+        mosaic_payload = result.get("mosaic")
+        if mosaic_payload is None:
+            continue
+        mosaics.append(mosaic_payload)
+        coverages.append(result.get("coverage"))
+        alphas.append(result.get("alpha_payload"))
+        pending_tile_payloads.append(
+            (
+                mosaic_payload,
+                result.get("alpha_payload"),
+                result.get("coverage"),
+                int(result.get("index", 0)) + 1,
+            )
+        )
 
     if not mosaics:
         pcb("sds_error_no_valid_batches", prog=None, lvl="WARN")
@@ -16836,6 +17236,7 @@ def assemble_global_mosaic_sds(
                 apply_rewinsor=True,
                 winsor_max_frames_per_pass=winsor_frames,
                 winsor_max_workers=winsor_workers,
+                parallel_plan=parallel_plan,
             )
             return np.asarray(stacked, dtype=np.float32, copy=False)
 
@@ -16847,6 +17248,7 @@ def assemble_global_mosaic_sds(
                 zconfig=None,
                 sigma_low=kappa_low,
                 sigma_high=kappa_high,
+                parallel_plan=parallel_plan,
             )
             return np.asarray(stacked, dtype=np.float32, copy=False)
 
@@ -16949,6 +17351,7 @@ def assemble_global_mosaic_first(
     progress_weight_phase: float | None,
     start_time_total_run: float | None,
     cache_root: str | None = None,
+    parallel_plan: ParallelPlan | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     """Wrapper preserving legacy signature while using the optimized implementation."""
 
@@ -16961,6 +17364,7 @@ def assemble_global_mosaic_first(
         progress_weight_phase=progress_weight_phase,
         start_time_total_run=start_time_total_run,
         cache_root=cache_root,
+        parallel_plan=parallel_plan,
     )
 def _fallback_app_base_dir() -> Path:
     try:
