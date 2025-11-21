@@ -3326,14 +3326,54 @@ def _run_phase4_5_inter_master_merge(
                     reproject_kwargs["fill_value"] = np.nan
                 if _REPROJECT_INTERP_SUPPORTS_MATCH_BG:
                     reproject_kwargs["match_background"] = True
-                for idx_tile, tile in enumerate(chunk_tiles):
-                    if tile.index in preloaded:
-                        arr = preloaded.pop(tile.index)
-                        weight_map = preloaded_weights.pop(tile.index, None)
-                    else:
+                bytes_per_pixel = np.dtype(np.float32).itemsize
+
+                def _estimate_reprojection_workers() -> int:
+                    """Derive a bounded worker count for intra-group reprojection."""
+
+                    max_workers = min(len(chunk_tiles), max(1, os.cpu_count() or 1))
+                    plan = current_parallel_plan
+                    if plan is not None:
+                        try:
+                            cpu_hint = int(getattr(plan, "cpu_workers", 0) or 0)
+                        except Exception:
+                            cpu_hint = 0
+                        if cpu_hint > 0:
+                            max_workers = min(max_workers, cpu_hint)
+                        try:
+                            chunk_bytes_hint = int(getattr(plan, "max_chunk_bytes", 0) or 0)
+                        except Exception:
+                            chunk_bytes_hint = 0
+                        if (
+                            chunk_bytes_hint > 0
+                            and local_shape
+                            and local_shape[0] > 0
+                            and local_shape[1] > 0
+                        ):
+                            approx_tile_bytes = (
+                                int(local_shape[0])
+                                * int(local_shape[1])
+                                * int(max(1, channels))
+                                * bytes_per_pixel
+                            )
+                            approx_tile_bytes += int(local_shape[0]) * int(local_shape[1]) * bytes_per_pixel
+                            if approx_tile_bytes > 0:
+                                mem_cap = max(1, chunk_bytes_hint // max(approx_tile_bytes, 1))
+                                max_workers = max(1, min(max_workers, mem_cap))
+                    return max(1, min(max_workers, len(chunk_tiles)))
+
+                def _reproject_chunk_tile(
+                    idx_tile: int,
+                    tile_obj,
+                    preload_arr: np.ndarray | None,
+                    preload_weight: np.ndarray | None,
+                ) -> tuple[int, np.ndarray, np.ndarray | None]:
+                    arr = preload_arr
+                    weight_map = preload_weight
+                    if arr is None:
                         arr, weight_map, _ = load_image_with_optional_alpha(
-                            tile.path,
-                            tile_label=_safe_basename(tile.path),
+                            tile_obj.path,
+                            tile_label=_safe_basename(tile_obj.path),
                         )
                     if weight_map is not None:
                         weight_map = np.asarray(weight_map, dtype=np.float32, copy=False)
@@ -3364,7 +3404,7 @@ def _run_phase4_5_inter_master_merge(
                     if weight_map is not None:
                         try:
                             weight_plane, weight_fp = reproject_interp(
-                                (weight_map, tile.wcs),
+                                (weight_map, tile_obj.wcs),
                                 local_wcs,
                                 **reproject_kwargs,
                             )
@@ -3378,10 +3418,9 @@ def _run_phase4_5_inter_master_merge(
                             weight_local = None
                     for ch in range(channels):
                         plane = arr[..., ch]
-                        reproj_plane, footprint = reproject_interp((plane, tile.wcs), local_wcs, **reproject_kwargs)
+                        reproj_plane, footprint = reproject_interp((plane, tile_obj.wcs), local_wcs, **reproject_kwargs)
                         if reproj_plane is None:
-                            success = False
-                            break
+                            raise RuntimeError("reproject_interp returned None")
                         reproj_plane = np.asarray(reproj_plane, dtype=np.float32)
                         if footprint is not None:
                             mask = np.asarray(footprint) <= 0.0
@@ -3392,11 +3431,50 @@ def _run_phase4_5_inter_master_merge(
                         mask_zero = weight_local <= 0.0
                         if mask_zero.shape == reproj.shape[:2]:
                             reproj = np.where(mask_zero[..., None], np.nan, reproj)
-                    if not success:
-                        break
-                    storage[idx_tile, :, :, :] = reproj
-                    frames.append(storage[idx_tile])
-                    frame_weights.append(weight_local)
+                    return idx_tile, reproj, weight_local
+
+                reproject_workers = _estimate_reprojection_workers()
+                reproject_results: list[tuple[int, np.ndarray, np.ndarray | None] | None] = [None] * len(chunk_tiles)
+                reproject_errors: list[str] = []
+
+                if reproject_workers > 1:
+                    with ThreadPoolExecutor(
+                        max_workers=reproject_workers,
+                        thread_name_prefix="ZeMosaic_P45_",
+                    ) as executor:
+                        futures = {}
+                        for idx_tile, tile in enumerate(chunk_tiles):
+                            preload_arr = preloaded.pop(tile.index, None)
+                            preload_weight = preloaded_weights.pop(tile.index, None)
+                            futures[executor.submit(_reproject_chunk_tile, idx_tile, tile, preload_arr, preload_weight)] = idx_tile
+                        for future in as_completed(futures):
+                            idx_tile = futures[future]
+                            try:
+                                reproject_results[idx_tile] = future.result()
+                            except Exception as exc:
+                                reproject_errors.append(str(exc))
+                else:
+                    for idx_tile, tile in enumerate(chunk_tiles):
+                        preload_arr = preloaded.pop(tile.index, None)
+                        preload_weight = preloaded_weights.pop(tile.index, None)
+                        try:
+                            reproject_results[idx_tile] = _reproject_chunk_tile(
+                                idx_tile,
+                                tile,
+                                preload_arr,
+                                preload_weight,
+                            )
+                        except Exception as exc:
+                            reproject_errors.append(str(exc))
+                            break
+
+                if reproject_errors or not all(reproject_results):
+                    success = False
+                else:
+                    for idx_tile, reproj, weight_local in reproject_results:  # type: ignore[misc]
+                        storage[idx_tile, :, :, :] = reproj
+                        frames.append(storage[idx_tile])
+                        frame_weights.append(weight_local)
                 if not success or not frames:
                     success = False
             except Exception:
@@ -11498,17 +11576,23 @@ def run_second_pass_coverage_renorm(
             logger.warning("[TwoPass] zemosaic_utils unavailable; skipping second pass")
         return None
     use_gpu = bool(use_gpu_two_pass)
+    cpu_workers_hint: int | None = None
     plan_rows_cpu_hint: int | None = None
     plan_rows_gpu_hint: int | None = None
     plan_chunk_cpu_hint: int | None = None
     plan_chunk_gpu_hint: int | None = None
+    use_memmap_flag: bool | None = None
     if parallel_plan is not None:
         try:
-            cpu_hint = int(getattr(parallel_plan, "cpu_workers", 0) or 0)
+            cpu_workers_hint = int(getattr(parallel_plan, "cpu_workers", 0) or 0)
         except Exception:
-            cpu_hint = 0
-        if cpu_hint <= 0:
-            cpu_hint = None
+            cpu_workers_hint = None
+        if cpu_workers_hint is not None and cpu_workers_hint <= 0:
+            cpu_workers_hint = None
+        try:
+            use_memmap_flag = bool(getattr(parallel_plan, "use_memmap", False))
+        except Exception:
+            use_memmap_flag = None
         row_cpu = getattr(parallel_plan, "rows_per_chunk", None)
         if row_cpu is not None:
             try:
@@ -11578,6 +11662,7 @@ def run_second_pass_coverage_renorm(
         "reproject_function": reproject_interp,
         "combine_function": "mean",
     }
+    memmap_pref = bool(use_memmap_flag) if use_memmap_flag is not None else False
     try:
         sig = inspect.signature(reproject_and_coadd)
     except Exception:
@@ -11587,12 +11672,16 @@ def run_second_pass_coverage_renorm(
             reproj_kwargs["match_background"] = True
         elif "match_bg" in sig.parameters:
             reproj_kwargs["match_bg"] = True
+        if "process_workers" in sig.parameters and cpu_workers_hint:
+            reproj_kwargs["process_workers"] = int(cpu_workers_hint)
         if "use_memmap" in sig.parameters:
-            reproj_kwargs["use_memmap"] = False
+            reproj_kwargs["use_memmap"] = memmap_pref
         elif "intermediate_memmap" in sig.parameters:
-            reproj_kwargs["intermediate_memmap"] = False
+            reproj_kwargs["intermediate_memmap"] = memmap_pref
     else:
         reproj_kwargs["match_background"] = True
+        if cpu_workers_hint:
+            reproj_kwargs["process_workers"] = int(cpu_workers_hint)
 
     row_hint = None
     chunk_hint = None
