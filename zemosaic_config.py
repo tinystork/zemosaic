@@ -146,6 +146,18 @@ DEFAULT_CONFIG = {
     "coadd_memmap_dir": "",
     "coadd_cleanup_memmap": True,
     "cleanup_temp_artifacts": True,
+    "enable_resource_telemetry": False,
+    "resource_telemetry_interval_sec": 1.5,
+    "resource_telemetry_log_to_csv": True,
+    # Parallel tuning defaults calibrated from resource_telemetry.csv on a 32 GB RAM / 8 GB VRAM host.
+    # These stay moderately conservative and lean on auto-tune to enforce safety checks at runtime.
+    # Applied to both the global plan and the Phase 5 mosaic plan ("global_reproject")
+    # derived from the final mosaic size and number of master tiles.
+    "parallel_autotune_enabled": True,
+    "parallel_target_cpu_load": 0.95,
+    "parallel_target_ram_fraction": 0.9,
+    "parallel_gpu_vram_fraction": 0.8,
+    "parallel_max_cpu_workers": 0,  # 0 → no explicit cap beyond detected logical cores
     # Cache retention policy for Phase 1 preprocessed .npy files.
     # Allowed values: "run_end", "per_tile", "keep".
     "cache_retention": "run_end",

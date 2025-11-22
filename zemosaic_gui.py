@@ -2874,6 +2874,9 @@ class ZeMosaicGUI:
             elif message_key_or_raw == "CHRONO_STOP_REQUEST":
                 if self.root.winfo_exists(): self.root.after_idle(self._stop_gui_chrono)
                 is_control_message = True
+            elif message_key_or_raw.upper() == "STATS_UPDATE":
+                # Ignore resource telemetry in Tk UI (handled only in Qt)
+                is_control_message = True
             # --- Overrides from filter UI launched in worker ---
             elif message_key_or_raw.startswith("CLUSTER_OVERRIDE:"):
                 payload = message_key_or_raw.split(":", 1)[1]

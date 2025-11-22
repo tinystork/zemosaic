@@ -1,186 +1,212 @@
----
+# Mission : Optimiser et paralléliser la Second Pass (Phase 5) du pipeline ZeMosaic
 
-# ✅ **agent.md**
+## 🎯 Objectif global
 
-```markdown
-# 🟦 Mission Codex High — Pondération par profondeur pour Reproject (mode non-SDS)
+La Phase 5 comporte deux sous-étapes :
 
-> 🎯 Objectif : ajouter une pondération physique des master tiles (**N_raw_frames**) dans la Phase 5 (Reproject & Coadd) **UNIQUEMENT** pour le mode non-SDS afin d’empêcher les tuiles peu profondes (ex : 10 brutes) de dégrader les zones bien couvertes (ex : 600 brutes).
+1. **Reproject & Coadd classique**  
+2. **Second Pass Coverage Renormalization (Two-Pass)**
 
-> ⚠ Zone protégée : **Tout le code SDS est sanctuarisé.**  
-> NE PAS modifier :
-> - assemble_global_mosaic_sds
-> - assemble_global_mosaic_first
-> - toute la chaîne SDS (méga-tiles, super-stack, coverage_sds)
-> - aucun fichier/branche/baseline lié au SDS.
+Le premier bloc a déjà été stabilisé.  
+La seconde passe, elle, reste **largement séquentielle**, très lente, et n’émet presque aucune télémétrie.
 
----
+👉 **Ta mission est d’optimiser fortement la Second Pass**, en :
 
-# 🔵 Contrainte majeure
-
-Le pipeline existant doit rester *strictement inchangé* en dehors du bloc de reproject/coadd non-SDS.
-
-- Phase 1–2 : inchangé  
-- Phase 3 (master tiles) : inchangé (sauf ajout header `N_FRAMES`)  
-- Phase 4 : inchangé  
-- Phase 5 SDS : inchangé  
-- Phase 5 non-SDS : **modifié pour intégrer les poids**  
-- Phase 6 : inchangé
+- parallélisant les opérations **au niveau ZeMosaic** (pas reproject lui-même),
+- utilisant **cpu_workers** et **chunking ParallelPlan**,
+- utilisant le **GPU** quand `use_gpu_phase5 = True`,
+- garantissant que **SDS reste strictement intouché**.
 
 ---
 
-# 🧩 Fichiers concernés
+# 🧱 Contexte technique
 
-Tu dois modifier **uniquement** les fichiers suivants :
+La seconde passe est pilotée depuis :
 
+### Fichier :
 - `zemosaic_worker.py`
-- `zemosaic_utils.py`
-- `zemosaic_align_stack.py` (si nécessaire pour accéder à N_raw)
-- Les headers FITS des master tiles (ajout d’un champ `MT_NFRAMES`)
 
-Ne pas toucher aux fichiers SDS (alignement, astrometry, mega tiles).
+### Fonctions clés :
+- `run_second_pass_coverage_renorm(...)`
+- `compute_per_tile_gains_from_coverage(...)`
+- projection du coverage vers chaque tuile
+- boucle `for ch in range(n_channels)` pour reprojection par canal
+- (toute logique entre `[TwoPass] Second pass requested...` et `[TwoPass] coverage-renorm OK`)
 
----
+### Problème actuel :
 
-# 📐 Principe à implémenter
-
-## 1. Récupérer le nombre de brutes par master tile
-Chaque master tile possède déjà une structure `tile_info`.  
-Tu dois y ajouter lors de la Phase 3 :
-
-```
-
-header["MT_NFRAMES"] = <nombre de brutes ayant servi à créer cette tuile>
-
-````
-
-Si le nombre de brutes n'est pas disponible directement, utiliser :
-- la longueur de la liste des frames qui ont servi à créer la tile.
+1. **Boucle par tuile** → Séquentielle  
+2. **Boucle par canal** → Séquentielle  
+3. **Reprojection** exécutée dans 1 appel global, sans chunking ZeMosaic  
+4. **cpu_workers affichés mais non utilisés**  
+5. **gpu=True loggé mais la logique reste CPU-bound majoritairement**  
+6. **Télémétrie Phase 5 minimaliste**  
+7. **rows(cpu/gpu)=0/0** à cause d’absence de découpage pour la TwoPass.
 
 ---
 
-## 2. Préparer un vecteur `tile_weights[]` pour la Phase 5
+# ✔️ Ce que tu dois faire
 
-Dans `zemosaic_worker.py`, juste avant l’appel à `reproject_and_coadd_wrapper`, construire :
+## 1. Paralléliser compute_per_tile_gains_from_coverage
 
-```python
-tile_weights = [ header["MT_NFRAMES"] for each master tile ]
-````
+Dans `compute_per_tile_gains_from_coverage(...)` :
 
-Avec fallback :
+- Chaque tuile est aujourd’hui traitée dans une boucle Python séquentielle.
+- Tu dois utiliser **ThreadPoolExecutor** ou **ProcessPoolExecutor** suivant ParallelPlan :
 
-```python
-if missing: tile_weights[i] = 1
-```
+  - **Si GPU actif (`use_gpu=True`)** → utiliser un **ThreadPoolExecutor**  
+    (les opérations CuPy libèrent le GIL → bénéfice immédiat).
+  
+  - **Si GPU inactif** → utiliser un **ProcessPoolExecutor**  
+    (les opérations NumPy/Scipy/CV2 sont CPU-bound).
+
+### Détails :
+
+Pour chaque tuile :
+
+- projection coverage → WCS tuile
+- calcul médian → gain
+- clamp dans [gain_clip_min, gain_clip_max]
+
+Le parallélisme doit :
+
+- respecter `plan.cpu_workers`
+- respecter les limites mémoire (`max_chunk_bytes`) en batchant intelligemment la liste des tuiles
+- renvoyer les gains dans l’ordre d’origine
+
+⚠️ Interdiction de changer la logique mathématique.  
+Simplement paralléliser.
 
 ---
 
-## 3. Injection dans la voie CPU
+## 2. Paralléliser la reprojection per-channel
 
-Dans `zemosaic_utils.reproject_and_coadd_wrapper`, lorsque la voie CPU Astropy est utilisée :
-
-* Fournir `input_weights` comme une liste **d’images 2D constantes** :
-
-Pour chaque tuile i :
+Aujourd’hui :
 
 ```python
-weight_map = np.full_like(tile_data[i], tile_weights[i], dtype=np.float32)
-```
-
-Puis :
-
-```python
-result = reproject_and_coadd(
-    input_data,
-    wcs_output,
-    input_weights=weight_maps,
-    combine="mean",
+for ch in range(n_channels):
     ...
-)
-```
+    chan_mosaic, chan_cov = _invoke_reproj(...)
+➡️ Cette boucle doit être parallélisée :
 
-Le comportement attendu :
+Stratégie :
+lancer 1 worker par canal quand n_channels >= 2
 
-[
-I(p) = \frac{\sum_i I_i(p) \cdot w_i}{\sum_i w_i}
-]
+sinon 1 seul worker évidemment
 
----
+respecter plan.cpu_workers (ne pas dépasser)
 
-## 4. Injection dans la voie GPU (implémentation interne)
+si GPU actif :
 
-Dans `gpu_reproject_and_coadd_impl()`, remplacer :
+autoriser un seul canal à utiliser le GPU à la fois
+(use_gpu = True uniquement pour 1 task)
 
-```python
-sum_gpu += sampled
-weight_gpu += sampled_mask
-```
+les autres canaux → CPU
+(sinon VRAM saturée)
 
-par **la version pondérée** :
+si GPU inactif :
 
-```python
-sum_gpu += sampled * weight_i
-weight_gpu += sampled_mask * weight_i
-```
+paralléliser tous les canaux en CPU
 
-avec :
+Contraintes :
+Les résultats doivent être recombinés dans l’ordre original [H, W, C].
 
-```python
-weight_i = tile_weights[i]
-```
+_invoke_reproj ne doit pas être modifié.
 
-Cela doit **imiter exactement la logique Astropy** :
+Si l’utilisateur a un GPU 8/12/16 Go → parallèle CPU+GPU hybride automatique.
 
-* `sampled` est l’image reprojetée
-* `sampled_mask` vaut 0/1
-* on multiplie par le poids de la tuile
-* le résultat final est `sum_gpu / weight_gpu`
+3. Ajouter un vrai chunking pour la TwoPass (rows_per_chunk)
+Actuellement, pour TwoPass :
 
----
+bash
+Copier le code
+rows(cpu/gpu) = 0/0
+chunk_mb(cpu/gpu) = 1144MB
+→ aucune découpe.
 
-## 5. API / Config / GUI
+Tu dois :
 
-Ajouter dans `zemosaic_config.py` :
+réutiliser le ParallelPlan appliqué en Phase 5
+(celui obtenu juste avant pour Reproject & Coadd),
 
-```python
-"enable_tile_weighting": true,
-"tile_weight_mode": "n_frames"    # réservé à l'avenir
-```
+découper la coverage + la grille finale en blocs de lignes (row-chunks),
 
-GUI (Qt/Tk) :
+exécuter les opérations lourdes (gaussian blur, reprojection coverage→tile, gains apply) par chunk.
 
-* une case “Tile weighting (recommended)” cochée par défaut
-* pas d’impact sur SDS (désactive option si SDS activé)
+Les chunk doivent être définis par :
 
-## Traductions à ajouter en EN/FR.
+plan.rows_per_chunk (si disponible)
 
-## 6. Tests obligatoires
+ou plan.max_chunk_bytes / plan.gpu_max_chunk_bytes (fallback)
 
-Codex doit valider :
+ou au pire un découpage fixe 512–1024 lignes par chunk si aucun plan n’est disponible
 
-1. Mode non-SDS (`enable_tile_weighting=true`)
+⚠️ Encore une fois : pas de changement mathématique.
 
-   * deux tuiles 600/10 → la 10 contribue ~1,6 % en overlap
-   * pas de régression dans forme/couverture/dimensions
+4. Ajouter télémétrie Phase 5 complète
+Aujourd’hui, aucun STATS_UPDATE n’est émis pendant la seconde passe.
 
-2. Mode non-SDS (`enable_tile_weighting=false`)
-   → comportement identique à avant (flat weighting)
+Tu dois :
 
-3. Mode SDS → aucun changement, aucune régression
+envoyer un STATS_UPDATE au début,
 
-4. GPU vs CPU → même résultat (à tolérance float près)
+un STATS_UPDATE toutes les X tuiles OU tous les X chunks,
 
----
+un STATS_UPDATE à la fin.
 
-# 🟩 Succès =
+Le stats_dict doit contenir (mêmes clés que Phase 3) :
 
-* La Shark Nebula n’est plus détruite par les tuiles faibles
-* Le bruit ne “flood” plus les zones profondes
-* Le pipeline reste 100 % rétrocompatible
-* SDS intact
-* GPU/CPU cohérents
-* Aucun impact sur les autres phases
-* Performance inchangée
+makefile
+Copier le code
+phase_index=5
+phase_name="Phase 5: Two-Pass Coverage Renorm"
+cpu_percent
+ram_used_mb
+gpu_used_mb
+cpu_workers=plan.cpu_workers
+use_gpu=plan.use_gpu
+use_gpu_phase5=true/false
+tiles_done=X
+tiles_total=Y
+chunk_index
+chunk_total
+Tu peux réutiliser _log_and_callback("STATS_UPDATE", ...).
 
-````
+🔒 Ce que tu NE DOIS PAS toucher
+AUCUN fichier/fonction SDS
 
+AUCUNE logique mathématique (gaussian blur, gains, clamp)
+
+AUCUN comportement Phase 1/3
+
+AUCUN paramètre de configuration existant
+
+AUCUN test
+
+AUCUNE signature publique du pipeline
+
+📂 Fichiers à modifier
+Exclusivement :
+
+zemosaic_worker.py
+
+zemosaic_utils.py (si nécessaire pour ajouter un petit helper de parallélisation non-intrusif)
+
+éventuellement parallel_utils.py pour exposer un petit helper parallel_map() réutilisable (non obligatoire)
+
+✔️ Résultat attendu
+Après implémentation :
+
+La seconde passe doit diviser son temps de traitement par 2× à 8× selon CPU/GPU.
+
+Le moniteur de ressources doit montrer :
+
+CPU multi-workers actifs
+
+GPU actif si use_gpu_phase5=True
+
+Le log ne doit plus montrer rows(cpu/gpu)=0/0
+
+La télémétrie Phase 5 doit apparaître clairement dans resource_telemetry.csv
+
+Le pipeline SDS reste strictement identique.

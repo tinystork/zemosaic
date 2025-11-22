@@ -924,6 +924,7 @@ def _apply_two_pass_coverage_renorm_if_requested(
     collected_tiles: list[tuple[np.ndarray, Any]] | None = None,
     fallback_tile_loader: Callable[[], tuple[list[np.ndarray], list[Any]]] | None = None,
     parallel_plan: ParallelPlan | None = None,
+    telemetry_ctrl: ResourceTelemetryController | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
     """Run the coverage renormalization second pass if configured."""
 
@@ -979,6 +980,7 @@ def _apply_two_pass_coverage_renorm_if_requested(
             use_gpu_two_pass=use_gpu_two_pass,
             tiles_coverage=coverage_for_second_pass,
             parallel_plan=parallel_plan,
+            telemetry_ctrl=telemetry_ctrl,
         )
         if result is not None:
             final_mosaic_data, final_mosaic_coverage = result
@@ -1017,6 +1019,7 @@ def _apply_phase5_post_stack_pipeline(
     collected_tiles: list[tuple[np.ndarray, Any]] | None = None,
     fallback_two_pass_loader: Callable[[], tuple[list[np.ndarray], list[Any]]] | None = None,
     parallel_plan: ParallelPlan | None = None,
+    telemetry_ctrl: ResourceTelemetryController | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     """Run the reusable Phase 5 post-stack operations."""
 
@@ -1057,6 +1060,7 @@ def _apply_phase5_post_stack_pipeline(
         collected_tiles=collected_tiles,
         fallback_tile_loader=fallback_two_pass_loader,
         parallel_plan=parallel_plan,
+        telemetry_ctrl=telemetry_ctrl,
     )
     return final_mosaic_data, final_mosaic_coverage, final_alpha_map
 
@@ -6169,6 +6173,53 @@ def _probe_system_resources(
     return info
 
 
+def _sample_runtime_resources_for_telemetry() -> dict:
+    """
+    Retourne un dict léger avec les informations de ressources courantes.
+    Toutes les valeurs sont optionnelles (None en cas d'échec).
+    """
+    info = {
+        "cpu_percent": None,
+        "ram_used_mb": None,
+        "ram_total_mb": None,
+        "ram_available_mb": None,
+        "gpu_used_mb": None,
+        "gpu_total_mb": None,
+        "gpu_free_mb": None,
+    }
+
+    try:
+        import psutil as _ps
+
+        vm = _ps.virtual_memory()
+        info["ram_total_mb"] = vm.total / (1024 * 1024)
+        info["ram_available_mb"] = vm.available / (1024 * 1024)
+        info["ram_used_mb"] = (vm.total - vm.available) / (1024 * 1024)
+        info["cpu_percent"] = _ps.cpu_percent(interval=None)
+    except Exception:
+        pass
+
+    try:
+        if CUPY_AVAILABLE:
+            import cupy  # type: ignore
+
+            try:
+                cupy.cuda.Device().use()
+                free_bytes, total_bytes = cupy.cuda.runtime.memGetInfo()
+                total_mb = total_bytes / (1024 * 1024)
+                free_mb = free_bytes / (1024 * 1024)
+                used_mb = total_mb - free_mb
+                info["gpu_total_mb"] = total_mb
+                info["gpu_free_mb"] = free_mb
+                info["gpu_used_mb"] = used_mb
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return info
+
+
 def _emit_gpu_info_summary(progress_callback, resource_info: dict) -> None:
     """Log a GPU summary message when VRAM information is available."""
 
@@ -6314,6 +6365,10 @@ def _run_shared_phase45_phase5_pipeline(
     parallel_plan = phase5_options.get("parallel_plan")
     tile_weighting_enabled_flag = bool(phase5_options.get("tile_weighting_enabled"))
     tile_weight_mode = str(phase5_options.get("tile_weight_mode") or "n_frames")
+    worker_config_cache = phase45_options.get("worker_config") or {}
+    parallel_caps_option = phase5_options.get("parallel_capabilities")
+    telemetry_ctrl = phase5_options.get("telemetry")
+    sds_mode_phase5 = bool(phase5_options.get("sds_mode"))
 
     pcb("PHASE_UPDATE:5", prog=None, lvl="ETA_LEVEL")
     _log_memory_usage(
@@ -6354,6 +6409,7 @@ def _run_shared_phase45_phase5_pipeline(
     final_alpha_map = None
     alpha_final = None
     fallback_two_pass_loader = None
+    tiles_total_phase5 = len(valid_master_tiles_for_assembly)
 
     if not valid_master_tiles_for_assembly:
         pcb(
@@ -6377,12 +6433,54 @@ def _run_shared_phase45_phase5_pipeline(
         "assemble_final_mosaic_incremental" in globals()
         and callable(assemble_final_mosaic_incremental)
     )
+    parallel_plan_phase5 = parallel_plan
+
+    def _emit_phase5_stats(
+        tiles_done: int,
+        tiles_total_override: int | None = None,
+        force: bool = False,
+        stage: str | None = None,
+    ) -> None:
+        if sds_mode_phase5 or telemetry_ctrl is None:
+            return
+        try:
+            total = tiles_total_override if tiles_total_override is not None else tiles_total_phase5
+            ctx = {
+                "phase_index": 5,
+                "phase_name": "Phase 5: Reproject & Coadd",
+                "tiles_done": int(max(0, tiles_done)),
+                "tiles_total": int(max(0, total)),
+                "use_gpu_phase5": bool(use_gpu_phase5_flag),
+            }
+            if stage:
+                ctx["stage"] = stage
+            plan_ref = parallel_plan_phase5
+            for attr in (
+                "cpu_workers",
+                "rows_per_chunk",
+                "gpu_rows_per_chunk",
+                "max_chunk_bytes",
+                "gpu_max_chunk_bytes",
+                "use_gpu",
+            ):
+                try:
+                    value = getattr(plan_ref, attr)
+                except Exception:
+                    value = None
+                if value is None and isinstance(plan_ref, dict):
+                    value = plan_ref.get(attr)
+                if value is not None:
+                    ctx[attr] = value
+            telemetry_ctrl.emit_stats(ctx, force=force)
+        except Exception:
+            pass
 
     if USE_INCREMENTAL_ASSEMBLY:
         if not incremental_available:
             pcb("run_error_phase5_inc_func_missing", prog=None, lvl="CRITICAL")
             return master_tiles, None, None, None, None, base_progress_phase5 + progress_weight_phase5
         pcb("run_info_phase5_started_incremental", prog=base_progress_phase5, lvl="INFO")
+        _emit_phase5_stats(0, tiles_total_phase5, force=True, stage="start")
         inc_memmap_dir = temp_master_tile_storage_dir or output_folder
         try:
             if use_gpu_phase5_flag:
@@ -6419,6 +6517,7 @@ def _run_shared_phase45_phase5_pipeline(
                 progress_weight_phase5=progress_weight_phase5,
                 start_time_total_run=start_time_total,
                 global_anchor_shift=global_anchor_shift,
+                stats_callback=_emit_phase5_stats,
             )
         except Exception as exc:
             logger.exception("Incremental assembly failed", exc_info=True)
@@ -6430,8 +6529,55 @@ def _run_shared_phase45_phase5_pipeline(
             pcb("run_error_phase5_reproject_coadd_func_missing", prog=None, lvl="CRITICAL")
             return master_tiles, None, None, None, None, base_progress_phase5 + progress_weight_phase5
         pcb("run_info_phase5_started_reproject_coadd", prog=base_progress_phase5, lvl="INFO")
+
+        if PARALLEL_HELPERS_AVAILABLE and not sds_mode_phase5:
+            try:
+                try:
+                    frame_h = int(final_output_shape_hw[0])
+                except Exception:
+                    frame_h = 0
+                try:
+                    frame_w = int(final_output_shape_hw[1])
+                except Exception:
+                    frame_w = 0
+                frame_shape_phase5 = (frame_h, frame_w)
+                try:
+                    n_frames_phase5 = max(1, len(valid_master_tiles_for_assembly))
+                except Exception:
+                    n_frames_phase5 = 1
+                caps_for_phase5 = parallel_caps_option or worker_config_cache.get("parallel_capabilities")
+                if caps_for_phase5 is None:
+                    try:
+                        caps_for_phase5 = detect_parallel_capabilities()
+                    except Exception:
+                        caps_for_phase5 = None
+                parallel_plan_phase5 = auto_tune_parallel_plan(
+                    kind="global_reproject",
+                    frame_shape=frame_shape_phase5,
+                    n_frames=n_frames_phase5,
+                    bytes_per_pixel=4,
+                    config=worker_config_cache,
+                    caps=caps_for_phase5,
+                )
+                worker_config_cache["parallel_plan_phase5"] = parallel_plan_phase5
+                try:
+                    setattr(zconfig, "parallel_plan_phase5", parallel_plan_phase5)
+                except Exception:
+                    pass
+            except Exception as exc_phase5_plan:
+                logger.warning("Phase5 auto-tune failed, falling back to global plan: %s", exc_phase5_plan)
+
+        _emit_phase5_stats(0, tiles_total_phase5, force=True, stage="start")
+        plan_gpu_allowed = bool(getattr(parallel_plan_phase5, "use_gpu", False))
+        if not use_gpu_phase5_flag:
+            effective_use_gpu = False
+        else:
+            effective_use_gpu = bool(plan_gpu_allowed)
+            if not effective_use_gpu and use_gpu_phase5_flag:
+                logger.info("[Phase5] GPU disabled by auto-tune (plan.use_gpu=False)")
+
         try:
-            if use_gpu_phase5_flag:
+            if effective_use_gpu:
                 import cupy
 
                 cupy.cuda.Device(0).use()
@@ -6444,7 +6590,7 @@ def _run_shared_phase45_phase5_pipeline(
                 match_bg=True,
                 apply_crop=apply_crop_for_assembly,
                 crop_percent=master_tile_crop_percent_config,
-                use_gpu=use_gpu_phase5_flag,
+                use_gpu=effective_use_gpu,
                 use_memmap=bool(coadd_use_memmap_config),
                 memmap_dir=(coadd_memmap_dir_config or output_folder),
                 cleanup_memmap=False,
@@ -6462,9 +6608,10 @@ def _run_shared_phase45_phase5_pipeline(
                 collect_tile_data=collected_tiles_for_second_pass,
                 global_anchor_shift=global_anchor_shift,
                 phase45_enabled=phase45_active_flag,
-                parallel_plan=parallel_plan,
+                parallel_plan=parallel_plan_phase5,
                 enable_tile_weighting=tile_weighting_enabled_flag,
                 tile_weight_mode=tile_weight_mode,
+                stats_callback=_emit_phase5_stats,
             )
         except Exception as exc:
             logger.exception("Reproject+Coadd assembly failed", exc_info=True)
@@ -6478,6 +6625,7 @@ def _run_shared_phase45_phase5_pipeline(
             prog=base_progress_phase5 + progress_weight_phase5,
             lvl="ERROR",
         )
+        _emit_phase5_stats(0, tiles_total_phase5, force=True, stage="failed")
         return master_tiles, None, None, None, None, base_progress_phase5 + progress_weight_phase5
 
     current_global_progress = base_progress_phase5 + progress_weight_phase5
@@ -6511,6 +6659,7 @@ def _run_shared_phase45_phase5_pipeline(
         collected_tiles=collected_tiles_for_second_pass,
         fallback_two_pass_loader=fallback_two_pass_loader,
         parallel_plan=parallel_plan,
+        telemetry_ctrl=None if sds_mode_phase5 else telemetry_ctrl,
     )
     if collected_tiles_for_second_pass is not None:
         collected_tiles_for_second_pass.clear()
@@ -6522,6 +6671,7 @@ def _run_shared_phase45_phase5_pipeline(
         logger,
     )
 
+    _emit_phase5_stats(tiles_total_phase5, tiles_total_phase5, force=True, stage="end")
     _log_memory_usage(progress_callback, "Fin Phase 5 (Assemblage)")
     pcb(
         log_key_phase5_finished or "run_info_phase5_finished",
@@ -7417,6 +7567,128 @@ def _log_and_callback(
             # Peut-être afficher la trace pour le debug du callback lui-même
             # logger.debug("Traceback de l'erreur du callback:", exc_info=True)
 
+
+class ResourceTelemetryController:
+    _DEFAULT_FIELDS = [
+        "timestamp_iso",
+        "phase_index",
+        "phase_name",
+        "cpu_percent",
+        "ram_used_mb",
+        "ram_total_mb",
+        "ram_available_mb",
+        "gpu_used_mb",
+        "gpu_total_mb",
+        "gpu_free_mb",
+        "files_done",
+        "files_total",
+        "tiles_done",
+        "tiles_total",
+        "eta_seconds",
+        "cpu_workers",
+        "rows_per_chunk",
+        "gpu_rows_per_chunk",
+        "max_chunk_bytes",
+        "gpu_max_chunk_bytes",
+        "use_gpu",
+        "use_gpu_phase5",
+    ]
+
+    def __init__(self, enabled: bool, interval_sec: float, callback, csv_path: str | None = None):
+        self.enabled = bool(enabled)
+        self.interval_sec = float(interval_sec) if interval_sec and interval_sec > 0 else 1.5
+        if self.interval_sec < 0.5:
+            self.interval_sec = 0.5
+        self._callback = callback
+        self._csv_path = csv_path
+        self._last_sample = 0.0
+        self._csv_file = None
+        self._csv_writer = None
+        self._csv_header_written = False
+
+    def _open_csv_if_needed(self, fieldnames: list[str]) -> None:
+        if not self._csv_path or self._csv_writer is not None:
+            return
+        try:
+            import csv
+
+            dir_path = os.path.dirname(self._csv_path)
+            if dir_path:
+                os.makedirs(dir_path, exist_ok=True)
+            f = open(self._csv_path, "w", newline="", encoding="utf-8")
+            self._csv_file = f
+            self._csv_writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+            self._csv_writer.writeheader()
+            self._csv_header_written = True
+        except Exception:
+            self._csv_path = None
+            self._csv_file = None
+            self._csv_writer = None
+
+    def emit_stats(self, context: dict | None = None, *, force: bool = False) -> None:
+        if not self.enabled or self._callback is None:
+            return
+        import time as _time
+
+        now = _time.monotonic()
+        if (not force) and self._last_sample and (now - self._last_sample) < self.interval_sec:
+            return
+        self._last_sample = now
+
+        base_context = context.copy() if isinstance(context, dict) else {}
+        try:
+            resources = _sample_runtime_resources_for_telemetry()
+        except Exception:
+            resources = {}
+        payload = {}
+        payload.update(base_context)
+        payload.update(resources)
+        payload["timestamp_iso"] = datetime.utcnow().isoformat() + "Z"
+
+        try:
+            _log_and_callback(
+                "STATS_UPDATE",
+                progress_value=None,
+                level="INFO",
+                callback=self._callback,
+                **payload,
+            )
+        except Exception:
+            pass
+
+        if self._csv_path:
+            try:
+                import csv
+
+                if self._csv_writer is None:
+                    fieldnames = list(
+                        dict.fromkeys(self._DEFAULT_FIELDS + sorted(payload.keys()))
+                    )
+                    self._open_csv_if_needed(fieldnames)
+                if self._csv_writer is not None:
+                    self._csv_writer.writerow(payload)
+                    if self._csv_file is not None:
+                        self._csv_file.flush()
+            except Exception:
+                self._csv_path = None
+
+    def maybe_emit_stats(self, context: dict | None = None) -> None:
+        self.emit_stats(context, force=False)
+
+    def close(self) -> None:
+        try:
+            if self._csv_file is not None:
+                self._csv_file.close()
+        except Exception:
+            pass
+        self._csv_file = None
+        self._csv_writer = None
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 
@@ -9742,6 +10014,7 @@ def assemble_final_mosaic_incremental(
     progress_weight_phase5: float | None = None,
     start_time_total_run: float | None = None,
     global_anchor_shift: tuple[float, float] | None = None,
+    stats_callback: Callable[[int, int, bool], None] | None = None,
 ):
     """Assemble les master tiles par co-addition sur disque."""
     import time
@@ -10171,6 +10444,11 @@ def assemble_final_mosaic_incremental(
                             update_gui_eta(total_eta_sec)
                         except Exception:
                             pass
+                if stats_callback:
+                    try:
+                        stats_callback(processed, total_tiles, False)
+                    except Exception:
+                        pass
 
             if tiles_since_flush > 0:
                 hsum.flush()
@@ -10345,6 +10623,7 @@ def assemble_final_mosaic_reproject_coadd(
     parallel_plan: ParallelPlan | None = None,
     enable_tile_weighting: bool = False,
     tile_weight_mode: str | None = None,
+    stats_callback: Callable[[int, int, bool], None] | None = None,
 ):
     """Assemble les master tiles en utilisant ``reproject_and_coadd``."""
     _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
@@ -10357,18 +10636,27 @@ def assemble_final_mosaic_reproject_coadd(
         lvl="DEBUG_DETAIL",
     )
 
+    explicit_workers = None
+    try:
+        if assembly_process_workers and int(assembly_process_workers) > 0:
+            explicit_workers = int(assembly_process_workers)
+            assembly_process_workers = explicit_workers
+    except Exception:
+        explicit_workers = None
+
     start_time_phase = time.monotonic()
     plan_rows_cpu_hint: int | None = None
     plan_rows_gpu_hint: int | None = None
     plan_chunk_cpu_hint: int | None = None
     plan_chunk_gpu_hint: int | None = None
+    cpu_workers_hint = None
     if parallel_plan is not None:
         cpu_workers_hint = getattr(parallel_plan, "cpu_workers", None)
         try:
             cpu_workers_hint = int(cpu_workers_hint)
         except Exception:
             cpu_workers_hint = None
-        if cpu_workers_hint and cpu_workers_hint > 0:
+        if explicit_workers is None and cpu_workers_hint and cpu_workers_hint > 0:
             assembly_process_workers = cpu_workers_hint
         use_memmap = bool(getattr(parallel_plan, "use_memmap", use_memmap))
         row_cpu = getattr(parallel_plan, "rows_per_chunk", None)
@@ -10946,6 +11234,7 @@ def assemble_final_mosaic_reproject_coadd(
 
     # Build kwargs dynamically to remain compatible with different reproject versions
     reproj_kwargs = {}
+    process_workers_supported = False
     try:
         import inspect
         sig = inspect.signature(reproject_and_coadd)
@@ -10954,6 +11243,7 @@ def assemble_final_mosaic_reproject_coadd(
         elif "match_bg" in sig.parameters:
             reproj_kwargs["match_bg"] = match_bg
         if "process_workers" in sig.parameters:
+            process_workers_supported = True
             reproj_kwargs["process_workers"] = assembly_process_workers
         if "use_memmap" in sig.parameters:
             reproj_kwargs["use_memmap"] = use_memmap
@@ -10966,6 +11256,16 @@ def assemble_final_mosaic_reproject_coadd(
     except Exception:
         # If introspection fails just fall back to basic arguments
         reproj_kwargs = {"match_background": match_bg}
+    if assembly_process_workers and not process_workers_supported:
+        try:
+            _pcb(
+                "assemble_info_reproject_process_workers_unsupported",
+                prog=None,
+                lvl="INFO_DETAIL",
+                workers=int(assembly_process_workers),
+            )
+        except Exception:
+            pass
 
     # Provide GPU-only tuning hints (safely ignored by CPU via wrapper filtering)
     try:
@@ -11159,6 +11459,22 @@ def assemble_final_mosaic_reproject_coadd(
                 except Exception:
                     pass
             _update_eta(ch + 1)
+            if stats_callback:
+                try:
+                    tiles_total_ctx = total_tiles_prepared or len(valid_entries)
+                    if tiles_total_ctx <= 0:
+                        tiles_total_ctx = len(valid_entries)
+                    tiles_done_est = tiles_total_ctx
+                    if tiles_total_ctx and total_steps:
+                        tiles_done_est = int(
+                            min(
+                                tiles_total_ctx,
+                                math.ceil(((ch + 1) / total_steps) * tiles_total_ctx),
+                            )
+                        )
+                    stats_callback(tiles_done_est, tiles_total_ctx, False)
+                except Exception:
+                    pass
             _log_memory_usage(progress_callback, f"Phase5 Reproject: mémoire après canal {ch+1}")
     except Exception as e_reproject:
         _pcb("assemble_error_reproject_coadd_call_failed", lvl="ERROR", error=str(e_reproject))
@@ -11457,6 +11773,181 @@ def _derive_final_alpha_mask(
     return alpha_final
 
 
+def _iter_row_chunks(total_rows: int, rows_per_chunk: int) -> Iterable[tuple[int, int]]:
+    """Yield contiguous row slices with a fixed height."""
+    if total_rows <= 0:
+        return
+    step = max(1, rows_per_chunk)
+    for start in range(0, total_rows, step):
+        end = min(total_rows, start + step)
+        yield start, end
+
+
+def _rows_from_chunk_bytes(
+    width: int,
+    itemsize: int,
+    chunk_bytes: int | None,
+    height: int,
+    *,
+    channels: int = 1,
+) -> int | None:
+    """Return an estimated rows_per_chunk derived from a byte budget."""
+    if chunk_bytes is None or chunk_bytes <= 0 or width <= 0 or itemsize <= 0:
+        return None
+    bytes_per_row = max(1, width * max(1, channels) * itemsize)
+    rows = max(1, chunk_bytes // bytes_per_row)
+    return int(min(height, rows))
+
+
+def _chunked_gaussian_blur(
+    coverage: np.ndarray,
+    sigma_px: int,
+    *,
+    use_gpu: bool,
+    rows_per_chunk: int | None,
+    chunk_bytes: int | None,
+    progress_hook=None,
+    logger=None,
+) -> tuple[np.ndarray, str]:
+    """Apply a Gaussian blur in row chunks to control RAM/VRAM usage."""
+    h, w = coverage.shape
+    if sigma_px <= 0 or h == 0 or w == 0:
+        return coverage.copy(), "identity"
+    margin = max(1, int(math.ceil(float(sigma_px) * 4.0)))
+    if rows_per_chunk is None or rows_per_chunk <= 0:
+        rows_per_chunk = _rows_from_chunk_bytes(w, coverage.itemsize, chunk_bytes, h) or h
+    rows_per_chunk = max(rows_per_chunk, margin * 2)
+    rows_per_chunk = min(rows_per_chunk, h)
+
+    def _emit(idx: int, total: int) -> None:
+        if progress_hook is None:
+            return
+        try:
+            progress_hook(idx, total, "blur")
+        except Exception:
+            pass
+
+    chunk_total = max(1, math.ceil(h / rows_per_chunk))
+    if use_gpu and CUPY_AVAILABLE:
+        try:
+            import cupy as cp  # type: ignore
+            from cupyx.scipy.ndimage import gaussian_filter as gpu_gaussian_filter  # type: ignore
+
+            output = np.empty_like(coverage, dtype=np.float32)
+            chunk_idx = 0
+            for y0, y1 in _iter_row_chunks(h, rows_per_chunk):
+                chunk_idx += 1
+                pad_start = max(0, y0 - margin)
+                pad_end = min(h, y1 + margin)
+                cov_chunk_gpu = cp.asarray(coverage[pad_start:pad_end], dtype=cp.float32)
+                blurred_gpu = gpu_gaussian_filter(cov_chunk_gpu, float(sigma_px), truncate=4.0)
+                central = blurred_gpu[(y0 - pad_start) : (y1 - pad_start)]
+                output[y0:y1] = cp.asnumpy(central)
+                _emit(chunk_idx, chunk_total)
+            return output.astype(np.float32, copy=False), "cupy_chunk"
+        except Exception as exc_gpu:
+            if logger:
+                logger.debug("[TwoPass] cupy chunked blur failed: %s", exc_gpu)
+
+    try:
+        from scipy.ndimage import gaussian_filter  # type: ignore
+
+        output = np.empty_like(coverage, dtype=np.float32)
+        chunk_idx = 0
+        for y0, y1 in _iter_row_chunks(h, rows_per_chunk):
+            chunk_idx += 1
+            pad_start = max(0, y0 - margin)
+            pad_end = min(h, y1 + margin)
+            blurred = gaussian_filter(
+                coverage[pad_start:pad_end],
+                sigma=float(sigma_px),
+                truncate=4.0,
+            )
+            output[y0:y1] = blurred[(y0 - pad_start) : (y1 - pad_start)].astype(np.float32, copy=False)
+            _emit(chunk_idx, chunk_total)
+        return output.astype(np.float32, copy=False), "scipy_chunk"
+    except Exception as exc_scipy:
+        if logger:
+            logger.debug("[TwoPass] scipy chunked blur failed: %s", exc_scipy)
+
+    try:
+        import cv2  # type: ignore
+
+        output = np.empty_like(coverage, dtype=np.float32)
+        k = max(3, int(2 * round(float(sigma_px) * 1.5) + 1))
+        chunk_idx = 0
+        for y0, y1 in _iter_row_chunks(h, rows_per_chunk):
+            chunk_idx += 1
+            pad_start = max(0, y0 - margin)
+            pad_end = min(h, y1 + margin)
+            blurred = cv2.GaussianBlur(
+                coverage[pad_start:pad_end],
+                (k, k),
+                sigmaX=float(sigma_px),
+            )
+            output[y0:y1] = blurred[(y0 - pad_start) : (y1 - pad_start)].astype(np.float32, copy=False)
+            _emit(chunk_idx, chunk_total)
+        return output.astype(np.float32, copy=False), "cv2_chunk"
+    except Exception as exc_cv:
+        if logger:
+            logger.debug("[TwoPass] Coverage blur fallback failed: %s", exc_cv)
+
+    return coverage.copy(), "identity"
+
+
+def _compute_tile_gain_task(args: tuple) -> tuple[int, float]:
+    """
+    Worker for per-tile gain computation. Arguments are packed to ease pickling.
+    """
+    (
+        idx,
+        tile,
+        tile_wcs,
+        final_wcs,
+        coverage_shape,
+        coverage_arr,
+        scale_map,
+        gain_min,
+        gain_max,
+        coverage_src,
+    ) = args
+    if tile is None or tile_wcs is None:
+        return idx, 1.0
+    shape = np.asarray(tile).shape
+    if shape[0] <= 0 or shape[1] <= 0:
+        return idx, 1.0
+    cov_arr = None
+    if coverage_src is not None:
+        cov_arr = np.asarray(coverage_src, dtype=np.float32, copy=False)
+        if cov_arr.ndim > 2:
+            cov_arr = np.squeeze(cov_arr)
+    if cov_arr is None:
+        mask = np.ones(shape[:2], dtype=np.float32)
+    else:
+        try:
+            mask = np.nan_to_num(cov_arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+        except Exception:
+            mask = np.ones(shape[:2], dtype=np.float32)
+        if mask.shape != tuple(shape[:2]):
+            try:
+                mask = mask.reshape(shape[:2])
+            except Exception:
+                mask = np.ones(shape[:2], dtype=np.float32)
+    try:
+        reproj_mask, _ = reproject_interp(
+            (mask, tile_wcs),
+            final_wcs,
+            shape_out=coverage_shape,
+        )
+    except Exception:
+        return idx, 1.0
+    valid = (reproj_mask > 1e-3) & (coverage_arr > 0.0)
+    if not np.any(valid):
+        return idx, 1.0
+    med_gain = float(np.median(scale_map[valid]))
+    return idx, float(np.clip(med_gain, gain_min, gain_max))
+
+
 def compute_per_tile_gains_from_coverage(
     tiles: list[np.ndarray],
     tiles_wcs: list[Any],
@@ -11468,12 +11959,40 @@ def compute_per_tile_gains_from_coverage(
     logger=None,
     use_gpu: bool = False,
     tiles_coverage: list[np.ndarray | None] | None = None,
+    parallel_plan: ParallelPlan | dict | None = None,
+    cpu_workers: int | None = None,
+    row_chunk_size: int | None = None,
+    chunk_bytes_limit: int | None = None,
+    progress_emitter=None,
 ) -> list[float]:
     """Compute multiplicative gains for each tile using the blurred coverage map."""
+    tiles_total = len(tiles) if tiles else 0
+
+    def _emit_progress(
+        tiles_done: int,
+        *,
+        chunk_index: int | None = None,
+        chunk_total: int | None = None,
+        stage: str | None = None,
+        force: bool = False,
+    ) -> None:
+        if progress_emitter is None:
+            return
+        try:
+            progress_emitter(
+                tiles_done,
+                chunk_index=chunk_index,
+                chunk_total=chunk_total,
+                stage=stage,
+                force=force,
+            )
+        except Exception:
+            pass
+
     if logger:
         logger.debug(
             "[TwoPass] compute_per_tile_gains_from_coverage start: tiles=%d, coverage_shape=%s, sigma=%s, clip=%s",
-            len(tiles) if tiles else 0,
+            tiles_total,
             getattr(coverage_p1, "shape", None),
             sigma_px,
             gain_clip,
@@ -11495,58 +12014,66 @@ def compute_per_tile_gains_from_coverage(
     gain_min, gain_max = map(float, gain_clip)
     if gain_min > gain_max:
         gain_min, gain_max = gain_max, gain_min
-    if sigma_px > 0:
-        blurred = None
-        blur_source = "identity"
-        if use_gpu and CUPY_AVAILABLE:
+    height, width = coverage.shape
+    plan_rows_hint = None
+    plan_chunk_hint = None
+    plan_workers_hint = None
+    plan_ref = parallel_plan
+    if plan_ref is not None:
+        def _plan_value(key: str):
             try:
-                import cupy as cp  # type: ignore
-                from cupyx.scipy.ndimage import gaussian_filter as gpu_gaussian_filter  # type: ignore
+                return getattr(plan_ref, key)
+            except Exception:
+                if isinstance(plan_ref, dict):
+                    return plan_ref.get(key)
+            return None
 
-                cov_gpu = cp.asarray(coverage, dtype=cp.float32)
-                blurred_gpu = gpu_gaussian_filter(cov_gpu, float(sigma_px))
-                blurred = cp.asnumpy(blurred_gpu)
-                blur_source = "cupy"
-            except Exception as exc_gpu:
-                if logger:
-                    logger.debug(
-                        "[TwoPass] cupy gaussian_filter failed (%s), falling back to CPU",
-                        exc_gpu,
-                    )
-        if blurred is None:
-            try:
-                from scipy.ndimage import gaussian_filter  # type: ignore
+        plan_rows_hint = _plan_value("gpu_rows_per_chunk" if use_gpu else "rows_per_chunk")
+        plan_chunk_hint = _plan_value("gpu_max_chunk_bytes" if use_gpu else "max_chunk_bytes")
+        plan_workers_hint = _plan_value("cpu_workers")
+    if cpu_workers is None and plan_workers_hint:
+        try:
+            cpu_workers = int(plan_workers_hint)
+        except Exception:
+            cpu_workers = None
+    if chunk_bytes_limit is None and plan_chunk_hint:
+        try:
+            chunk_bytes_limit = int(plan_chunk_hint)
+        except Exception:
+            chunk_bytes_limit = None
+    if chunk_bytes_limit is not None and chunk_bytes_limit <= 0:
+        chunk_bytes_limit = None
+    if row_chunk_size is None and plan_rows_hint:
+        try:
+            row_chunk_size = int(plan_rows_hint)
+        except Exception:
+            row_chunk_size = None
+    if row_chunk_size is None or row_chunk_size <= 0:
+        row_chunk_size = _rows_from_chunk_bytes(width, coverage.itemsize, chunk_bytes_limit, height)
+    if row_chunk_size is None or row_chunk_size <= 0:
+        row_chunk_size = min(height, 512 if use_gpu else 1024)
+    row_chunk_size = int(max(1, min(height, row_chunk_size)))
 
-                blurred = gaussian_filter(coverage, sigma=float(sigma_px))
-                blur_source = "scipy"
-            except Exception as exc:
-                if logger:
-                    logger.debug(
-                        "[TwoPass] scipy gaussian_filter failed (%s), trying cv2 fallback",
-                        exc,
-                    )
-                try:
-                    import cv2  # type: ignore
+    def _blur_progress(chunk_idx: int, chunk_total: int, stage: str) -> None:
+        _emit_progress(0, chunk_index=chunk_idx, chunk_total=chunk_total, stage=stage, force=False)
 
-                    k = max(3, int(2 * round(float(sigma_px) * 1.5) + 1))
-                    blurred = cv2.GaussianBlur(coverage, (k, k), sigmaX=float(sigma_px))
-                    blur_source = "cv2"
-                except Exception as exc_cv:
-                    if logger:
-                        logger.warning("[TwoPass] Coverage blur fallback failed: %s", exc_cv)
-        cov_blur = (
-            np.asarray(blurred, dtype=np.float32)
-            if blurred is not None
-            else coverage.copy()
+    cov_blur, blur_source = _chunked_gaussian_blur(
+        coverage,
+        sigma_px,
+        use_gpu=use_gpu,
+        rows_per_chunk=row_chunk_size,
+        chunk_bytes=chunk_bytes_limit,
+        progress_hook=_blur_progress,
+        logger=logger,
+    )
+    if logger:
+        logger.debug(
+            "[TwoPass] Coverage blur applied with sigma=%d using %s (rows_per_chunk=%d, chunk_bytes=%s)",
+            sigma_px,
+            blur_source,
+            row_chunk_size,
+            chunk_bytes_limit if chunk_bytes_limit is not None else "-",
         )
-        if logger:
-            logger.debug(
-                "[TwoPass] Coverage blur applied with sigma=%d using %s", sigma_px, blur_source
-            )
-    else:
-        cov_blur = coverage.copy()
-        if logger:
-            logger.debug("[TwoPass] Coverage blur skipped (sigma=0)")
     eps = np.finfo(np.float32).eps
     scale_map = cov_blur / np.maximum(coverage, eps)
     scale_map = np.clip(scale_map, 0.5, 2.0)
@@ -11559,64 +12086,77 @@ def compute_per_tile_gains_from_coverage(
         )
     if not tiles or not tiles_wcs or len(tiles) != len(tiles_wcs):
         raise ValueError("Tile data and WCS lists must be aligned and non-empty")
-    gains: list[float] = []
-    for idx, (tile, tile_wcs) in enumerate(zip(tiles, tiles_wcs)):
-        if tile is None or tile_wcs is None:
-            gains.append(1.0)
-            continue
-        shape = np.asarray(tile).shape
-        if shape[0] <= 0 or shape[1] <= 0:
-            gains.append(1.0)
-            continue
-        coverage_src = None
-        if tiles_coverage and idx < len(tiles_coverage or []):
-            coverage_src = tiles_coverage[idx]
-        if coverage_src is None:
-            mask = np.ones(shape[:2], dtype=np.float32)
-        else:
-            cov_arr = np.asarray(coverage_src, dtype=np.float32, copy=False)
-            if cov_arr.ndim > 2:
-                cov_arr = np.squeeze(cov_arr)
-            try:
-                mask = np.nan_to_num(cov_arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
-            except Exception:
-                mask = np.ones(shape[:2], dtype=np.float32)
-            if mask.shape != tuple(shape[:2]):
-                try:
-                    mask = mask.reshape(shape[:2])
-                except Exception:
-                    mask = np.ones(shape[:2], dtype=np.float32)
+    if tiles_total <= 0:
+        return []
+
+    if cpu_workers is None or cpu_workers <= 0:
         try:
-            reproj_mask, _ = reproject_interp(
-                (mask, tile_wcs),
-                final_wcs,
-                shape_out=coverage.shape,
-            )
-        except Exception as exc:
-            if logger:
-                logger.warning("[TwoPass] Mask reprojection failed for tile %d: %s", idx, exc)
-            gains.append(1.0)
-            continue
-        valid = (reproj_mask > 1e-3) & (coverage > 0.0)
-        if not np.any(valid):
-            gains.append(1.0)
-            if logger and idx < 10:
-                logger.debug(
-                    "[TwoPass] Tile %d has no valid overlap (mask>0.1 count=%d)",
-                    idx,
-                    int(np.count_nonzero(reproj_mask > 0.1)),
+            cpu_workers = multiprocessing.cpu_count() or os.cpu_count()
+        except Exception:
+            cpu_workers = os.cpu_count()
+    cpu_workers = int(max(1, cpu_workers or 1))
+    max_workers = max(1, min(cpu_workers, tiles_total))
+    if chunk_bytes_limit and coverage.size > 0:
+        est_tile_bytes = max(coverage.nbytes, coverage.size * np.dtype(np.float32).itemsize)
+        est_tile_bytes = max(est_tile_bytes, coverage.size * np.dtype(np.float64).itemsize)
+        est_tile_bytes *= 2
+        max_by_mem = max(1, int(chunk_bytes_limit // max(1, est_tile_bytes)))
+        max_workers = max(1, min(max_workers, max_by_mem))
+    executor_cls = ThreadPoolExecutor if use_gpu else ProcessPoolExecutor
+    progress_interval = max(1, tiles_total // max(1, max_workers * 2))
+
+    def _execute(executor_type):
+        gains_result: list[float] = [1.0] * tiles_total
+        done = 0
+        _emit_progress(0, chunk_index=0, chunk_total=tiles_total, stage="gains", force=True)
+        future_to_idx: dict[Any, int] = {}
+        with executor_type(max_workers=max_workers) as pool:
+            for idx, (tile, tile_wcs) in enumerate(zip(tiles, tiles_wcs)):
+                coverage_src = None
+                if tiles_coverage and idx < len(tiles_coverage or []):
+                    coverage_src = tiles_coverage[idx]
+                fut = pool.submit(
+                    _compute_tile_gain_task,
+                    (
+                        idx,
+                        tile,
+                        tile_wcs,
+                        final_wcs,
+                        coverage.shape,
+                        coverage,
+                        scale_map,
+                        gain_min,
+                        gain_max,
+                        coverage_src,
+                    ),
                 )
-            continue
-        med_gain = float(np.median(scale_map[valid]))
-        gains.append(float(np.clip(med_gain, gain_min, gain_max)))
-        if logger and idx < 10:
-            logger.debug(
-                "[TwoPass] Tile %d gain=%.4f (raw=%.4f, valid_pix=%d)",
-                idx,
-                gains[-1],
-                med_gain,
-                int(np.count_nonzero(valid)),
-            )
+                future_to_idx[fut] = idx
+            for fut in as_completed(future_to_idx):
+                idx_value = future_to_idx.get(fut, None)
+                gain_value: float = 1.0
+                try:
+                    result_idx, gain_value = fut.result()
+                    idx_value = result_idx
+                except Exception as exc_fut:
+                    if logger and idx_value is not None:
+                        logger.warning("[TwoPass] Gain task failed for tile %d: %s", idx_value, exc_fut)
+                if idx_value is not None:
+                    gains_result[idx_value] = float(gain_value)
+                done += 1
+                if done % progress_interval == 0 or done == tiles_total:
+                    _emit_progress(done, chunk_index=done, chunk_total=tiles_total, stage="gains", force=False)
+        _emit_progress(tiles_total, chunk_index=tiles_total, chunk_total=tiles_total, stage="gains", force=True)
+        return gains_result
+
+    try:
+        gains = _execute(executor_cls)
+    except Exception as exc_pool:
+        if not use_gpu and executor_cls is ProcessPoolExecutor:
+            if logger:
+                logger.warning("[TwoPass] Process pool failed, retrying gain computation with threads: %s", exc_pool)
+            gains = _execute(ThreadPoolExecutor)
+        else:
+            raise
     return gains
 
 
@@ -11633,6 +12173,7 @@ def run_second_pass_coverage_renorm(
     use_gpu_two_pass: bool | None = None,
     tiles_coverage: list[np.ndarray | None] | None = None,
     parallel_plan: ParallelPlan | None = None,
+    telemetry_ctrl: ResourceTelemetryController | None = None,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Apply coverage-based gains to tiles and reproject them for a second pass."""
     if logger:
@@ -11669,40 +12210,121 @@ def run_second_pass_coverage_renorm(
     plan_chunk_gpu_hint: int | None = None
     use_memmap_flag: bool | None = None
     if parallel_plan is not None:
+        def _plan_value(key: str):
+            try:
+                return getattr(parallel_plan, key)
+            except Exception:
+                if isinstance(parallel_plan, dict):
+                    return parallel_plan.get(key)
+            return None
+
         try:
-            cpu_workers_hint = int(getattr(parallel_plan, "cpu_workers", 0) or 0)
+            cpu_workers_hint = int(_plan_value("cpu_workers") or 0)
         except Exception:
             cpu_workers_hint = None
         if cpu_workers_hint is not None and cpu_workers_hint <= 0:
             cpu_workers_hint = None
         try:
-            use_memmap_flag = bool(getattr(parallel_plan, "use_memmap", False))
+            use_memmap_flag = bool(_plan_value("use_memmap") or False)
         except Exception:
             use_memmap_flag = None
-        row_cpu = getattr(parallel_plan, "rows_per_chunk", None)
-        if row_cpu is not None:
-            try:
-                plan_rows_cpu_hint = max(1, int(row_cpu))
-            except Exception:
-                plan_rows_cpu_hint = None
-        row_gpu = getattr(parallel_plan, "gpu_rows_per_chunk", None)
-        if row_gpu is not None:
-            try:
-                plan_rows_gpu_hint = max(1, int(row_gpu))
-            except Exception:
-                plan_rows_gpu_hint = None
-        chunk_cpu = getattr(parallel_plan, "max_chunk_bytes", None)
-        if chunk_cpu is not None:
-            try:
-                plan_chunk_cpu_hint = max(1, int(chunk_cpu))
-            except Exception:
-                plan_chunk_cpu_hint = None
-        chunk_gpu = getattr(parallel_plan, "gpu_max_chunk_bytes", None)
-        if chunk_gpu is not None:
-            try:
-                plan_chunk_gpu_hint = max(1, int(chunk_gpu))
-            except Exception:
-                plan_chunk_gpu_hint = None
+        try:
+            plan_rows_cpu_hint = int(_plan_value("rows_per_chunk") or 0) or None
+        except Exception:
+            plan_rows_cpu_hint = None
+        if plan_rows_cpu_hint is not None and plan_rows_cpu_hint <= 0:
+            plan_rows_cpu_hint = None
+        try:
+            plan_rows_gpu_hint = int(_plan_value("gpu_rows_per_chunk") or 0) or None
+        except Exception:
+            plan_rows_gpu_hint = None
+        if plan_rows_gpu_hint is not None and plan_rows_gpu_hint <= 0:
+            plan_rows_gpu_hint = None
+        try:
+            plan_chunk_cpu_hint = int(_plan_value("max_chunk_bytes") or 0) or None
+        except Exception:
+            plan_chunk_cpu_hint = None
+        if plan_chunk_cpu_hint is not None and plan_chunk_cpu_hint <= 0:
+            plan_chunk_cpu_hint = None
+        try:
+            plan_chunk_gpu_hint = int(_plan_value("gpu_max_chunk_bytes") or 0) or None
+        except Exception:
+            plan_chunk_gpu_hint = None
+        if plan_chunk_gpu_hint is not None and plan_chunk_gpu_hint <= 0:
+            plan_chunk_gpu_hint = None
+
+    cov_shape = np.asarray(coverage_p1).shape if coverage_p1 is not None else tuple()
+    cov_h = int(cov_shape[0]) if len(cov_shape) >= 1 and cov_shape[0] else (int(shape_out[0]) if shape_out else 0)
+    cov_w = int(cov_shape[1]) if len(cov_shape) >= 2 and cov_shape[1] else (int(shape_out[1]) if shape_out else 0)
+    bytes_per_sample = np.dtype(np.float32).itemsize
+    if plan_rows_cpu_hint is None:
+        plan_rows_cpu_hint = _rows_from_chunk_bytes(cov_w, bytes_per_sample, plan_chunk_cpu_hint, cov_h)
+    if plan_rows_gpu_hint is None:
+        plan_rows_gpu_hint = _rows_from_chunk_bytes(cov_w, bytes_per_sample, plan_chunk_gpu_hint, cov_h)
+    if plan_rows_cpu_hint is None and cov_h > 0:
+        plan_rows_cpu_hint = min(cov_h, 1024)
+    if plan_rows_gpu_hint is None and cov_h > 0:
+        plan_rows_gpu_hint = min(cov_h, 512 if use_gpu else cov_h)
+    if plan_rows_cpu_hint is None:
+        plan_rows_cpu_hint = 1024
+    if plan_rows_gpu_hint is None:
+        plan_rows_gpu_hint = 512 if use_gpu else 1024
+    effective_row_chunk = plan_rows_gpu_hint if use_gpu else plan_rows_cpu_hint
+    chunk_bytes_effective = plan_chunk_gpu_hint if use_gpu else plan_chunk_cpu_hint
+    tiles_total = len(tiles) if tiles else 0
+
+    def _emit_two_pass_stats(
+        tiles_done: int,
+        *,
+        chunk_index: int | None = None,
+        chunk_total: int | None = None,
+        force: bool = False,
+        stage: str | None = None,
+    ) -> None:
+        if telemetry_ctrl is None:
+            return
+        try:
+            ctx = {
+                "phase_index": 5,
+                "phase_name": "Phase 5: Two-Pass Coverage Renorm",
+                "tiles_done": int(max(0, tiles_done)),
+                "tiles_total": int(max(0, tiles_total)),
+                "cpu_workers": cpu_workers_hint or 0,
+                "use_gpu": bool(use_gpu),
+                "use_gpu_phase5": bool(use_gpu_two_pass),
+            }
+            if stage:
+                ctx["stage"] = stage
+            if plan_rows_cpu_hint is not None:
+                ctx["rows_per_chunk"] = int(plan_rows_cpu_hint)
+            if plan_rows_gpu_hint is not None:
+                ctx["gpu_rows_per_chunk"] = int(plan_rows_gpu_hint)
+            if plan_chunk_cpu_hint is not None:
+                ctx["max_chunk_bytes"] = int(plan_chunk_cpu_hint)
+            if plan_chunk_gpu_hint is not None:
+                ctx["gpu_max_chunk_bytes"] = int(plan_chunk_gpu_hint)
+            _ = telemetry_ctrl.emit_stats(ctx, force=force)
+        except Exception:
+            pass
+
+    def _gains_progress(
+        tiles_done: int,
+        *,
+        chunk_index: int | None = None,
+        chunk_total: int | None = None,
+        stage: str | None = None,
+        force: bool = False,
+    ) -> None:
+        _emit_two_pass_stats(
+            tiles_done,
+            chunk_index=chunk_index,
+            chunk_total=chunk_total,
+            force=force,
+            stage=stage or "gains",
+        )
+
+    _emit_two_pass_stats(0, chunk_index=0, chunk_total=max(1, tiles_total), force=True, stage="start")
+    effective_row_chunk = int(max(1, effective_row_chunk or 1))
     try:
         gains = compute_per_tile_gains_from_coverage(
             tiles,
@@ -11714,6 +12336,11 @@ def run_second_pass_coverage_renorm(
             logger=logger,
             use_gpu=use_gpu,
             tiles_coverage=tiles_coverage,
+            parallel_plan=parallel_plan,
+            cpu_workers=cpu_workers_hint,
+            row_chunk_size=effective_row_chunk,
+            chunk_bytes_limit=chunk_bytes_effective,
+            progress_emitter=_gains_progress,
         )
     except Exception as exc:
         if logger:
@@ -11728,6 +12355,13 @@ def run_second_pass_coverage_renorm(
             float(np.min(finite_gains)) if finite_gains else float("nan"),
             float(np.max(finite_gains)) if finite_gains else float("nan"),
         )
+    _emit_two_pass_stats(
+        tiles_total,
+        chunk_index=tiles_total,
+        chunk_total=max(1, tiles_total),
+        force=False,
+        stage="gains_done",
+    )
     corrected_tiles: list[np.ndarray] = []
     for arr, gain in zip(tiles, gains):
         tile_arr = np.asarray(arr, dtype=np.float32)
@@ -11769,13 +12403,9 @@ def run_second_pass_coverage_renorm(
         if cpu_workers_hint:
             reproj_kwargs["process_workers"] = int(cpu_workers_hint)
 
-    row_hint = None
-    chunk_hint = None
-    if use_gpu:
-        row_hint = plan_rows_gpu_hint or plan_rows_cpu_hint
-        chunk_hint = plan_chunk_gpu_hint or plan_chunk_cpu_hint
-    else:
-        row_hint = plan_rows_cpu_hint
+    row_hint = plan_rows_gpu_hint if use_gpu else plan_rows_cpu_hint
+    chunk_hint = chunk_bytes_effective
+    if chunk_hint is None and use_gpu and plan_chunk_cpu_hint:
         chunk_hint = plan_chunk_cpu_hint
     if row_hint:
         reproj_kwargs["rows_per_chunk"] = int(max(1, row_hint))
@@ -11797,37 +12427,41 @@ def run_second_pass_coverage_renorm(
             pass
 
     n_channels = corrected_tiles[0].shape[-1] if corrected_tiles[0].ndim == 3 else 1
-    mosaic_channels: list[np.ndarray] = []
-    coverage_result: np.ndarray | None = None
+    mosaic_channels: list[np.ndarray | None] = [None] * n_channels
+    coverage_channels: list[np.ndarray | None] = [None] * n_channels
     shape_out_hw = tuple(map(int, shape_out))
-    for ch in range(n_channels):
+
+    def _process_channel(ch_idx: int, use_gpu_flag: bool) -> tuple[int, np.ndarray, np.ndarray]:
         if logger:
             logger.debug(
-                "[TwoPass] Reproject channel %d/%d with %d tiles (shape_out=%s)",
-                ch + 1,
+                "[TwoPass] Reproject channel %d/%d with %d tiles (shape_out=%s, gpu=%s)",
+                ch_idx + 1,
                 n_channels,
                 len(corrected_tiles),
                 shape_out_hw,
+                use_gpu_flag,
             )
-        data_list = [tile[..., ch] if tile.ndim == 3 else tile[..., 0] for tile in corrected_tiles]
-        def _invoke_reproj(use_gpu_flag: bool, local_kwargs: dict[str, Any]):
+        data_list = [tile[..., ch_idx] if tile.ndim == 3 else tile[..., 0] for tile in corrected_tiles]
+
+        def _invoke_reproj(use_gpu_local: bool, local_kwargs: dict[str, Any]):
             return zemosaic_utils.reproject_and_coadd_wrapper(
                 data_list=data_list,
                 wcs_list=tiles_wcs,
                 shape_out=shape_out_hw,
-                use_gpu=use_gpu_flag,
+                use_gpu=use_gpu_local,
                 cpu_func=reproject_and_coadd,
                 **local_kwargs,
             )
 
+        local_kwargs = dict(reproj_kwargs)
         try:
-            chan_mosaic, chan_cov = _invoke_reproj(use_gpu, reproj_kwargs)
+            chan_mosaic, chan_cov = _invoke_reproj(use_gpu_flag, local_kwargs)
         except TypeError as type_err:
             if logger:
                 logger.warning("[TwoPass] GPU reprojection TypeError, attempting recovery: %s", type_err)
             chan_mosaic = chan_cov = None
-            if use_gpu:
-                retry_kwargs = dict(reproj_kwargs)
+            if use_gpu_flag:
+                retry_kwargs = dict(local_kwargs)
                 removed = []
                 err_msg = str(type_err)
                 for key in list(retry_kwargs.keys()):
@@ -11846,59 +12480,123 @@ def run_second_pass_coverage_renorm(
                             )
             if chan_mosaic is None or chan_cov is None:
                 try:
-                    chan_mosaic, chan_cov = _invoke_reproj(False, reproj_kwargs)
+                    chan_mosaic, chan_cov = _invoke_reproj(False, local_kwargs)
                 except Exception as cpu_exc:
                     if logger:
                         logger.warning(
                             "[TwoPass] CPU fallback after GPU TypeError failed on channel %d: %s",
-                            ch,
+                            ch_idx,
                             cpu_exc,
                             exc_info=True,
                         )
-                    return None
+                    raise
         except Exception as exc:
-            if use_gpu:
+            if use_gpu_flag:
                 try:
-                    chan_mosaic, chan_cov = _invoke_reproj(False, reproj_kwargs)
+                    chan_mosaic, chan_cov = _invoke_reproj(False, local_kwargs)
                 except Exception as cpu_exc:
                     if logger:
                         logger.warning(
                             "[TwoPass] Reprojection failed on channel %d (GPU+CPU): %s / %s",
-                            ch,
+                            ch_idx,
                             exc,
                             cpu_exc,
                             exc_info=True,
                         )
-                    return None
+                    raise
             else:
                 if logger:
                     logger.warning(
                         "[TwoPass] Reprojection failed on channel %d: %s",
-                        ch,
+                        ch_idx,
                         exc,
                         exc_info=True,
                     )
-                return None
+                raise
         chan_mosaic_np = np.asarray(chan_mosaic, dtype=np.float32)
-        mosaic_channels.append(chan_mosaic_np)
-        if coverage_result is None:
-            coverage_result = np.asarray(chan_cov, dtype=np.float32)
+        chan_cov_np = np.asarray(chan_cov, dtype=np.float32)
         if logger:
             logger.debug(
                 "[TwoPass] Channel %d done: mosaic_shape=%s, coverage_shape=%s, cov_stats=(min=%.4f, max=%.4f)",
-                ch + 1,
+                ch_idx + 1,
                 getattr(chan_mosaic_np, "shape", None),
-                getattr(coverage_result, "shape", None),
-                float(np.nanmin(coverage_result)) if coverage_result is not None else float("nan"),
-                float(np.nanmax(coverage_result)) if coverage_result is not None else float("nan"),
+                getattr(chan_cov_np, "shape", None),
+                float(np.nanmin(chan_cov_np)) if chan_cov_np is not None else float("nan"),
+                float(np.nanmax(chan_cov_np)) if chan_cov_np is not None else float("nan"),
             )
-    mosaic = (
-        mosaic_channels[0][..., np.newaxis]
-        if n_channels == 1
-        else np.stack(mosaic_channels, axis=-1)
-    )
+        return ch_idx, chan_mosaic_np, chan_cov_np
+
+    reproj_chunk_total = n_channels
+    if n_channels == 1:
+        try:
+            ch_idx, chan_mosaic_np, chan_cov_np = _process_channel(0, use_gpu)
+        except Exception:
+            return None
+        mosaic_channels[0] = chan_mosaic_np
+        coverage_channels[0] = chan_cov_np
+        _emit_two_pass_stats(
+            tiles_total,
+            chunk_index=1,
+            chunk_total=reproj_chunk_total,
+            force=False,
+            stage="reproject",
+        )
+    else:
+        channel_tasks: list[tuple[int, bool]] = []
+        gpu_assigned = False
+        for ch in range(n_channels):
+            use_gpu_flag = bool(use_gpu and not gpu_assigned)
+            if use_gpu_flag:
+                gpu_assigned = True
+            channel_tasks.append((ch, use_gpu_flag))
+        max_channel_workers = max(1, min(n_channels, cpu_workers_hint or n_channels))
+        reproj_failure = False
+        done_channels = 0
+        with ThreadPoolExecutor(max_workers=max_channel_workers) as executor:
+            future_map = {
+                executor.submit(_process_channel, ch_idx, use_gpu_flag): ch_idx for ch_idx, use_gpu_flag in channel_tasks
+            }
+            for fut in as_completed(future_map):
+                try:
+                    ch_idx, chan_mosaic_np, chan_cov_np = fut.result()
+                    mosaic_channels[ch_idx] = chan_mosaic_np
+                    coverage_channels[ch_idx] = chan_cov_np
+                except Exception as exc:
+                    reproj_failure = True
+                    if logger:
+                        logger.warning("[TwoPass] Channel %d reprojection failed: %s", future_map.get(fut, -1), exc)
+                    break
+                done_channels += 1
+                _emit_two_pass_stats(
+                    tiles_total,
+                    chunk_index=done_channels,
+                    chunk_total=reproj_chunk_total,
+                    force=False,
+                    stage="reproject",
+                )
+        if reproj_failure or any(m is None for m in mosaic_channels):
+            return None
+
+    coverage_result: np.ndarray | None = None
+    for cov in coverage_channels:
+        if cov is not None:
+            coverage_result = cov.astype(np.float32, copy=False)
+            break
     if coverage_result is None:
         return None
+    stacked_mosaic = [np.asarray(mc, dtype=np.float32) for mc in mosaic_channels if mc is not None]
+    mosaic = (
+        stacked_mosaic[0][..., np.newaxis]
+        if n_channels == 1
+        else np.stack(stacked_mosaic, axis=-1)
+    )
+    _emit_two_pass_stats(
+        tiles_total,
+        chunk_index=reproj_chunk_total,
+        chunk_total=reproj_chunk_total,
+        force=True,
+        stage="reproject_done",
+    )
     return mosaic.astype(np.float32), coverage_result.astype(np.float32)
 
 
@@ -12250,6 +12948,74 @@ def run_hierarchical_mosaic(
             pcb(f"ETA_UPDATE:{eta_str}", prog=None, lvl="ETA_LEVEL")
 
 
+    try:
+        telemetry_enabled = bool(getattr(zconfig, "enable_resource_telemetry", False))
+    except Exception:
+        telemetry_enabled = False
+    try:
+        telemetry_interval = float(getattr(zconfig, "resource_telemetry_interval_sec", 1.5) or 1.5)
+    except Exception:
+        telemetry_interval = 1.5
+    try:
+        telemetry_log_to_csv = bool(getattr(zconfig, "resource_telemetry_log_to_csv", True))
+    except Exception:
+        telemetry_log_to_csv = True
+    telemetry_csv_path = None
+    if telemetry_log_to_csv and output_folder:
+        try:
+            telemetry_csv_path = os.path.join(output_folder, "resource_telemetry.csv")
+        except Exception:
+            telemetry_csv_path = None
+    telemetry = ResourceTelemetryController(
+        enabled=telemetry_enabled,
+        interval_sec=telemetry_interval,
+        callback=progress_callback,
+        csv_path=telemetry_csv_path,
+    )
+
+    def _telemetry_context(extra: dict | None = None) -> dict:
+        ctx: dict[str, Any] = {}
+        plan_candidate = None
+        try:
+            plan_candidate = getattr(zconfig, "parallel_plan", None)
+        except Exception:
+            plan_candidate = None
+        if plan_candidate is None:
+            try:
+                plan_candidate = worker_config_cache.get("parallel_plan")
+            except Exception:
+                plan_candidate = None
+        if plan_candidate is not None:
+            for attr in (
+                "cpu_workers",
+                "rows_per_chunk",
+                "gpu_rows_per_chunk",
+                "max_chunk_bytes",
+                "gpu_max_chunk_bytes",
+                "use_gpu",
+                "use_gpu_phase5",
+            ):
+                value = None
+                if hasattr(plan_candidate, attr):
+                    try:
+                        value = getattr(plan_candidate, attr)
+                    except Exception:
+                        value = None
+                elif isinstance(plan_candidate, dict):
+                    value = plan_candidate.get(attr)
+                if value is not None:
+                    ctx[attr] = value
+        try:
+            ctx.setdefault("use_gpu_phase5", bool(use_gpu_phase5))
+        except Exception:
+            pass
+        if extra:
+            ctx.update(extra)
+        return ctx
+
+    telemetry.maybe_emit_stats(_telemetry_context({"phase_name": "Init", "phase_index": 0}))
+
+
     resource_probe_info = _probe_system_resources(
         output_folder,
         two_pass_enabled=two_pass_coverage_renorm_config,
@@ -12356,7 +13122,7 @@ def run_hierarchical_mosaic(
     PROGRESS_WEIGHT_PHASE7_CLEANUP = 2
 
     DEFAULT_PHASE_WORKER_RATIO = 1.0
-    ALIGNMENT_PHASE_WORKER_RATIO = 0.5  # Limit aggressive phases to 50% of base workers
+    ALIGNMENT_PHASE_WORKER_RATIO = 1.0  # Phase 3 targets ~90% of logical cores while keeping one free
 
     if use_gpu_phase5 and gpu_id_phase5 is not None and CUPY_AVAILABLE:
         os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -12593,9 +13359,19 @@ def run_hierarchical_mosaic(
     if not fits_file_paths: 
         pcb("run_error_no_fits_found_input", prog=current_global_progress, lvl="ERROR")
         return # Sortie anticipée si aucun fichier FITS n'est trouvé
-
+    
     num_total_raw_files = len(fits_file_paths)
     pcb("run_info_found_potential_fits", prog=base_progress_phase1, lvl="INFO_DETAIL", num_files=num_total_raw_files)
+
+    telemetry.maybe_emit_stats(
+        _telemetry_context(
+            {
+                "phase_name": "Phase 1: Preprocessing",
+                "phase_index": 1,
+                "files_total": num_total_raw_files,
+            }
+        )
+    )
 
     # --- Parallel auto-tune plan (optional) ---
     parallel_caps: ParallelCapabilities | None = None  # type: ignore[assignment]
@@ -13078,6 +13854,17 @@ def run_hierarchical_mosaic(
                     pcb(f"RAW_FILE_COUNT_UPDATE:{files_processed_count_ph1}/{num_total_raw_files}", prog=None, lvl="ETA_LEVEL")
                 except Exception:
                     pass
+
+                telemetry.maybe_emit_stats(
+                    _telemetry_context(
+                        {
+                            "phase_name": "Phase 1: Preprocessing",
+                            "phase_index": 1,
+                            "files_done": files_processed_count_ph1,
+                            "files_total": num_total_raw_files,
+                        }
+                    )
+                )
 
                 prog_step_phase1 = base_progress_phase1 + int(
                     PROGRESS_WEIGHT_PHASE1_RAW_SCAN * (files_processed_count_ph1 / max(1, num_total_raw_files))
@@ -13736,6 +14523,16 @@ def run_hierarchical_mosaic(
             pcb("clusterstacks_warn_auto_limit_failed", prog=None, lvl="WARN", error=str(e_auto))
     current_global_progress = base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING
     num_seestar_stacks_to_process = len(seestar_stack_groups)
+    telemetry.maybe_emit_stats(
+        _telemetry_context(
+            {
+                "phase_name": "Phase 2: Clustering",
+                "phase_index": 2,
+                "files_total": num_total_raw_files,
+                "tiles_total": num_seestar_stacks_to_process,
+            }
+        )
+    )
     _log_memory_usage(progress_callback, "Fin Phase 2"); pcb("run_info_phase2_finished", prog=current_global_progress, lvl="INFO", num_groups=num_seestar_stacks_to_process)
 
 
@@ -13878,6 +14675,16 @@ def run_hierarchical_mosaic(
         tile_weighting_allowed = bool(tile_weighting_enabled_config)
         if str(target_method or "").lower().strip() != "reproject_coadd":
             tile_weighting_allowed = False
+        caps_candidate = None
+        try:
+            caps_candidate = getattr(zconfig, "parallel_capabilities")
+        except Exception:
+            caps_candidate = None
+        if caps_candidate is None:
+            try:
+                caps_candidate = worker_config_cache.get("parallel_capabilities")
+            except Exception:
+                caps_candidate = None
         return {
             "base_progress": base_progress,
             "progress_weight": PROGRESS_WEIGHT_PHASE5_ASSEMBLY,
@@ -13905,6 +14712,9 @@ def run_hierarchical_mosaic(
             "coadd_memmap_dir": coadd_memmap_dir_config,
             "global_anchor_shift": global_anchor_shift,
             "parallel_plan": current_parallel_plan,
+            "parallel_capabilities": caps_candidate,
+            "telemetry": telemetry,
+            "sds_mode": bool(sds_mode_flag),
             "tile_weighting_enabled": tile_weighting_allowed,
             "tile_weight_mode": tile_weight_mode_config,
         }
@@ -14178,6 +14988,15 @@ def run_hierarchical_mosaic(
                     sds_phase5_options = _build_phase5_options_dict(
                         phase45_base + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
                     )
+                    telemetry.maybe_emit_stats(
+                        _telemetry_context(
+                            {
+                                "phase_name": "Phase 5: Assembly",
+                                "phase_index": 5,
+                                "tiles_total": len(sds_tile_records),
+                            }
+                        )
+                    )
                     (
                         master_tiles_results_list,
                         final_mosaic_data_HWC,
@@ -14252,6 +15071,15 @@ def run_hierarchical_mosaic(
             _log_memory_usage(progress_callback, "Début Phase 3 (Master Tuiles)")
             pcb("run_info_phase3_started_from_cache", prog=base_progress_phase3, lvl="INFO")
             pcb("PHASE_UPDATE:3", prog=None, lvl="ETA_LEVEL")
+            telemetry.maybe_emit_stats(
+                _telemetry_context(
+                    {
+                        "phase_name": "Phase 3: Master Tiles",
+                        "phase_index": 3,
+                        "tiles_total": num_seestar_stacks_to_process,
+                    }
+                )
+            )
             temp_master_tile_storage_dir = str(Path(output_folder).expanduser() / "zemosaic_temp_master_tiles")
             try:
                 if _path_exists(temp_master_tile_storage_dir): shutil.rmtree(temp_master_tile_storage_dir)
@@ -14377,12 +15205,39 @@ def run_hierarchical_mosaic(
                 num_seestar_stacks_to_process,
                 ALIGNMENT_PHASE_WORKER_RATIO,
             )
+            # Boost Phase 3 toward ~90% of logical cores while leaving one core free
+            try:
+                target_by_cpu = max(
+                    1,
+                    min(
+                        num_logical_processors - 1,
+                        int(math.ceil(num_logical_processors * 0.9)),
+                    ),
+                )
+            except Exception:
+                target_by_cpu = max(1, num_logical_processors - 1)
+            target_ph3_workers = max(1, min(num_seestar_stacks_to_process, target_by_cpu))
+            if target_ph3_workers > actual_num_workers_ph3:
+                prev_workers = actual_num_workers_ph3
+                actual_num_workers_ph3 = target_ph3_workers
+                try:
+                    pcb(
+                        f"WORKERS_PHASE3: Boost {prev_workers} -> {actual_num_workers_ph3} (90% cores target, keeping one free)",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                    )
+                except Exception:
+                    pass
             if auto_caps_info:
                 try:
                     parallel_cap = int(auto_caps_info.get("parallel_groups", 0))
                 except Exception:
                     parallel_cap = 0
-                if parallel_cap > 0:
+                # Only apply auto-cap when it allows more than one worker; when
+                # heuristics return 1 (e.g., memmap-enabled or missing probes),
+                # let downstream RAM/IO guards decide to avoid pinning Phase 3
+                # to a single worker.
+                if parallel_cap > 1:
                     prev_workers = actual_num_workers_ph3
                     actual_num_workers_ph3 = max(1, min(actual_num_workers_ph3, parallel_cap))
                     if actual_num_workers_ph3 != prev_workers:
@@ -14395,9 +15250,9 @@ def run_hierarchical_mosaic(
                             )
                         except Exception:
                             pass
-            # On Windows, cap Phase 3 concurrency to reduce I/O + CPU contention
+            # On Windows, still respect the reserve-one-core rule but avoid hard-capping at 4
             if os.name == 'nt':
-                actual_num_workers_ph3 = max(1, min(actual_num_workers_ph3, 4))
+                actual_num_workers_ph3 = max(1, min(actual_num_workers_ph3, max(1, num_logical_processors - 1)))
             # Apply IO-based cap if available
             try:
                 if io_ph3_cap is not None:
@@ -14429,7 +15284,12 @@ def run_hierarchical_mosaic(
                 if per_frame_bytes is None or per_frame_bytes <= 0:
                     # Conservative default (Seestar 1080x1920 RGB float32)
                     per_frame_bytes = 1080 * 1920 * 3 * 4
-                frames_per_pass = int(winsor_max_frames_per_pass) if winsor_max_frames_per_pass and int(winsor_max_frames_per_pass) > 0 else 256
+                frames_per_pass_cfg = int(winsor_max_frames_per_pass) if winsor_max_frames_per_pass and int(winsor_max_frames_per_pass) > 0 else 256
+                try:
+                    max_frames_in_group = max(len(g) for g in seestar_stack_groups if g) if seestar_stack_groups else 1
+                except Exception:
+                    max_frames_in_group = 1
+                frames_per_pass = max(1, min(frames_per_pass_cfg, max_frames_in_group))
                 fudge = 2.0
                 per_job_bytes = int(max(1, frames_per_pass) * per_frame_bytes * fudge)
                 allowed = int(avail_bytes * 0.6)
@@ -14646,6 +15506,17 @@ def run_hierarchical_mosaic(
                         except Exception:
                             pass
 
+                    telemetry.maybe_emit_stats(
+                        _telemetry_context(
+                            {
+                                "phase_name": "Phase 3: Master Tiles",
+                                "phase_index": 3,
+                                "tiles_done": tiles_processed_count_ph3,
+                                "tiles_total": num_seestar_stacks_to_process,
+                            }
+                        )
+                    )
+
                     now = time.time()
                     step_times_ph3.append(now - last_time_loop_ph3)
                     last_time_loop_ph3 = now
@@ -14837,6 +15708,15 @@ def run_hierarchical_mosaic(
             _log_memory_usage(progress_callback, "Début Phase 4 (Calcul Grille)")
             pcb("run_info_phase4_started", prog=base_progress_phase4, lvl="INFO")
             pcb("PHASE_UPDATE:4", prog=None, lvl="ETA_LEVEL")
+            telemetry.maybe_emit_stats(
+                _telemetry_context(
+                    {
+                        "phase_name": "Phase 4: Final Grid",
+                        "phase_index": 4,
+                        "tiles_total": len(master_tiles_results_list),
+                    }
+                )
+            )
             wcs_list_for_final_grid = []; shapes_list_for_final_grid_hw = []
             start_time_loop_ph4 = time.time(); last_time_loop_ph4 = start_time_loop_ph4; step_times_ph4 = []
             total_steps_ph4 = len(master_tiles_results_list)
@@ -14866,6 +15746,16 @@ def run_hierarchical_mosaic(
                             progress_callback("phase4_grid", idx_loop, total_steps_ph4)
                         except Exception:
                             pass
+                    telemetry.maybe_emit_stats(
+                        _telemetry_context(
+                            {
+                                "phase_name": "Phase 4: Final Grid",
+                                "phase_index": 4,
+                                "tiles_done": idx_loop,
+                                "tiles_total": total_steps_ph4,
+                            }
+                        )
+                    )
                 except Exception as e_read_tile_shape: pcb("run_error_phase4_reading_tile_shape", prog=None, lvl="ERROR", path=_safe_basename(mt_path_iter), error=str(e_read_tile_shape)); logger.error(f"Erreur lecture shape tuile {_safe_basename(mt_path_iter)}:", exc_info=True); continue
             if not wcs_list_for_final_grid or not shapes_list_for_final_grid_hw or len(wcs_list_for_final_grid) != len(shapes_list_for_final_grid_hw): pcb("run_error_phase4_insufficient_tile_info", prog=(base_progress_phase4 + PROGRESS_WEIGHT_PHASE4_GRID_CALC), lvl="ERROR"); return
             final_mosaic_drizzle_scale = 1.0 
@@ -14890,6 +15780,15 @@ def run_hierarchical_mosaic(
             base_progress_phase5 = base_progress_phase4_5 + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
             phase5_options = _build_phase5_options_dict(base_progress_phase5)
 
+            telemetry.maybe_emit_stats(
+                _telemetry_context(
+                    {
+                        "phase_name": "Phase 5: Assembly",
+                        "phase_index": 5,
+                        "tiles_total": len(master_tiles_results_list),
+                    }
+                )
+            )
             (
                 master_tiles_results_list,
                 final_mosaic_data_HWC,
@@ -14920,6 +15819,15 @@ def run_hierarchical_mosaic(
     pcb("PHASE_UPDATE:6", prog=None, lvl="ETA_LEVEL")
     _log_memory_usage(progress_callback, "Début Phase 6 (Sauvegarde)")
     pcb("run_info_phase6_started", prog=base_progress_phase6, lvl="INFO")
+    telemetry.maybe_emit_stats(
+        _telemetry_context(
+            {
+                "phase_name": "Phase 6: Save",
+                "phase_index": 6,
+                "tiles_total": len(master_tiles_results_list),
+            }
+        )
+    )
     output_base_name = f"zemosaic_MT{len(master_tiles_results_list)}_R{len(all_raw_files_processed_info)}"
     output_folder_path = Path(output_folder).expanduser()
     final_fits_path = output_folder_path / f"{output_base_name}.fits"
@@ -15366,6 +16274,9 @@ def run_hierarchical_mosaic(
     _log_memory_usage(progress_callback, "Début Phase 7 (Nettoyage)")
     pcb("run_info_phase7_cleanup_starting", prog=base_progress_phase7, lvl="INFO")
     pcb("PHASE_UPDATE:7", prog=None, lvl="ETA_LEVEL")
+    telemetry.maybe_emit_stats(
+        _telemetry_context({"phase_name": "Phase 7: Cleanup", "phase_index": 7})
+    )
     def _log_cleanup_warning(msg_key: str, directory: str | None, exc: Exception) -> None:
         pcb(
             msg_key,
@@ -15430,6 +16341,7 @@ def run_hierarchical_mosaic(
     pcb("run_success_processing_completed", prog=current_global_progress, lvl="SUCCESS", duration=f"{total_duration_sec:.2f}")
     gc.collect(); _log_memory_usage(progress_callback, "Fin Run Hierarchical Mosaic (après GC final)")
     _log_alignment_warning_summary()
+    telemetry.close()
     logger.info(f"===== Run Hierarchical Mosaic COMPLETED in {total_duration_sec:.2f}s =====")
 ################################################################################
 ################################################################################

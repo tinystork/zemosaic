@@ -776,6 +776,8 @@
     "qt_group_solver": "Résolution astrométrique",
     "qt_group_solver_choice": "Sélection du solveur",
     "qt_group_system_resources": "Ressources système et cache",
+    "qt_resource_telemetry_group_title": "Télémétrie des ressources",
+    "qt_enable_resource_telemetry_label": "Activer la télémétrie de ressources (moniteur CPU/GPU)",
     "qt_group_two_pass": "Renormalisation en deux passes",
     "qt_log_config_fallback": "Utilisation des valeurs mémoire car zemosaic_config.load_config est indisponible.",
     "qt_log_config_invalid_type": "Le fichier de configuration contient des données inattendues. Utilisation des valeurs par défaut.",

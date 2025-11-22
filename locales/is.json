@@ -118,7 +118,7 @@
     "qt_field_sds_mode": "Virkja SDS ham sjálfgefið",
     "qt_field_sds_threshold": "SDS þekjumörk",
     "qt_field_astap_max_instances": "Hámarks ASTAP tilvik",
-    "qt_window_title_preview": "ZeMosaic V4.2.3 – Superacervandi ",
+    "qt_window_title_preview": "ZeMosaic V4.2.4 – Superacervandi ",
     "qt_worker_generic_update": "Uppfærsla starfsmanna",
     "qt_worker_error_generic": "Vinnumannsvilla",
     "qt_log_save_config_error": "Mistókst að vista stillingar: {error}",
