@@ -12549,23 +12549,23 @@ def run_second_pass_coverage_renorm(
             if use_gpu_flag:
                 gpu_assigned = True
             channel_tasks.append((ch, use_gpu_flag))
-        max_channel_workers = max(1, min(n_channels, cpu_workers_hint or n_channels))
         reproj_failure = False
         done_channels = 0
-        with ThreadPoolExecutor(max_workers=max_channel_workers) as executor:
-            future_map = {
-                executor.submit(_process_channel, ch_idx, use_gpu_flag): ch_idx for ch_idx, use_gpu_flag in channel_tasks
-            }
-            for fut in as_completed(future_map):
-                try:
-                    ch_idx, chan_mosaic_np, chan_cov_np = fut.result()
-                    mosaic_channels[ch_idx] = chan_mosaic_np
-                    coverage_channels[ch_idx] = chan_cov_np
-                except Exception as exc:
-                    reproj_failure = True
-                    if logger:
-                        logger.warning("[TwoPass] Channel %d reprojection failed: %s", future_map.get(fut, -1), exc)
-                    break
+
+        # Process the GPU-designated channel synchronously to avoid thread-context issues.
+        gpu_channel_task: tuple[int, bool] | None = None
+        cpu_channel_tasks: list[tuple[int, bool]] = []
+        for task in channel_tasks:
+            if task[1] and gpu_channel_task is None:
+                gpu_channel_task = task
+            else:
+                cpu_channel_tasks.append((task[0], False))
+
+        if gpu_channel_task is not None:
+            try:
+                ch_idx, chan_mosaic_np, chan_cov_np = _process_channel(*gpu_channel_task)
+                mosaic_channels[ch_idx] = chan_mosaic_np
+                coverage_channels[ch_idx] = chan_cov_np
                 done_channels += 1
                 _emit_two_pass_stats(
                     tiles_total,
@@ -12574,6 +12574,37 @@ def run_second_pass_coverage_renorm(
                     force=False,
                     stage="reproject",
                 )
+            except Exception as exc:
+                reproj_failure = True
+                if logger:
+                    logger.warning("[TwoPass] GPU channel %d reprojection failed: %s", gpu_channel_task[0], exc)
+        if reproj_failure:
+            return None
+
+        if cpu_channel_tasks:
+            max_channel_workers = max(1, min(len(cpu_channel_tasks), cpu_workers_hint or len(cpu_channel_tasks)))
+            with ThreadPoolExecutor(max_workers=max_channel_workers) as executor:
+                future_map = {
+                    executor.submit(_process_channel, ch_idx, False): ch_idx for ch_idx, _ in cpu_channel_tasks
+                }
+                for fut in as_completed(future_map):
+                    try:
+                        ch_idx, chan_mosaic_np, chan_cov_np = fut.result()
+                        mosaic_channels[ch_idx] = chan_mosaic_np
+                        coverage_channels[ch_idx] = chan_cov_np
+                    except Exception as exc:
+                        reproj_failure = True
+                        if logger:
+                            logger.warning("[TwoPass] Channel %d reprojection failed: %s", future_map.get(fut, -1), exc)
+                        break
+                    done_channels += 1
+                    _emit_two_pass_stats(
+                        tiles_total,
+                        chunk_index=done_channels,
+                        chunk_total=reproj_chunk_total,
+                        force=False,
+                        stage="reproject",
+                    )
         if reproj_failure or any(m is None for m in mosaic_channels):
             return None
 

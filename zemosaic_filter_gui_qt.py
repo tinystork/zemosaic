@@ -266,11 +266,17 @@ try:  # pragma: no cover - optional dependency guard
         _merge_small_groups as _tk_merge_small_groups,
         _split_group_by_orientation as _tk_split_group_by_orientation,
         _circular_dispersion_deg as _tk_circular_dispersion_deg,
+        _apply_hard_merge as _tk_apply_hard_merge,
+        DEFAULT_HARD_MERGE_THRESHOLD as _tk_default_hard_merge_threshold,
+        HARD_MERGE_FOV_SCALE as _tk_hard_merge_fov_scale,
     )
 except Exception:  # pragma: no cover - helper fallback
     _tk_merge_small_groups = None  # type: ignore[assignment]
     _tk_split_group_by_orientation = None  # type: ignore[assignment]
     _tk_circular_dispersion_deg = None  # type: ignore[assignment]
+    _tk_apply_hard_merge = None  # type: ignore[assignment]
+    _tk_default_hard_merge_threshold = 10  # type: ignore[assignment]
+    _tk_hard_merge_fov_scale = 1.2  # type: ignore[assignment]
 
 if _tk_circular_dispersion_deg is None:  # pragma: no cover - fallback copy
     def _tk_circular_dispersion_deg(values: Iterable[float]) -> float:
@@ -1732,6 +1738,11 @@ class FilterQtDialog(QDialog):
             "#d63fb8",
             "#6ed63f",
         )
+        try:
+            base_dir = get_app_base_dir()
+        except Exception:
+            base_dir = Path.cwd()
+        self._log_file_path: Path | None = Path(base_dir) / "zemosaic_filter.log"
 
         self._preview_canvas = self._create_preview_canvas()
         self._activity_log_output: QPlainTextEdit | None = None
@@ -2683,6 +2694,21 @@ class FilterQtDialog(QDialog):
                 )
             final_groups = groups_after_autosplit
 
+        hard_merge_fn = _tk_apply_hard_merge
+        if coverage_enabled and hard_merge_fn is not None:
+            hard_merge_threshold = self._resolve_hard_merge_threshold()
+            if hard_merge_threshold > 0:
+                settings_payload = {
+                    "merge_threshold": hard_merge_threshold,
+                    "cap": int(cap_effective),
+                    "overcap_pct": int(overcap_pct),
+                    "fov_scale": _tk_hard_merge_fov_scale,
+                }
+                try:
+                    final_groups = hard_merge_fn(final_groups, settings_payload, messages.append)
+                except Exception as exc:
+                    messages.append(f"[HARD-MERGE] Unable to apply: {exc}")
+
         for group in final_groups:
             for info in group:
                 if info.pop("_fallback_wcs_used", False):
@@ -3435,6 +3461,27 @@ class FilterQtDialog(QDialog):
             min_cap_effective = max(0, min_cap_effective)
         # When cap_effective == 0 the Filter Qt does not impose a split cap.
         return cap_effective, min_cap_effective
+
+    def _resolve_hard_merge_threshold(self) -> int:
+        candidates = (
+            self._safe_lookup(self._runtime_overrides, "merge_threshold"),
+            self._safe_lookup(self._config_overrides, "merge_threshold"),
+            self._safe_lookup(self._initial_overrides, "merge_threshold"),
+            self._safe_lookup(self._solver_settings, "merge_threshold"),
+            self._safe_lookup(self._runtime_overrides, "coverage_merge_threshold"),
+            self._safe_lookup(self._config_overrides, "coverage_merge_threshold"),
+            self._safe_lookup(self._initial_overrides, "coverage_merge_threshold"),
+            self._safe_lookup(self._solver_settings, "coverage_merge_threshold"),
+            self._safe_lookup(self._solver_settings, "hard_merge_threshold"),
+        )
+        for candidate in candidates:
+            try:
+                value = int(candidate)
+            except Exception:
+                continue
+            if value > 0:
+                return value
+        return int(getattr(self, "_default_hard_merge_threshold", _tk_default_hard_merge_threshold))
 
     def _resolve_overcap_percent(self) -> int:
         value = getattr(self, "_overcap_percent_value", None)
@@ -4786,6 +4833,14 @@ class FilterQtDialog(QDialog):
             print(formatted)
         except Exception:
             pass
+        log_path = getattr(self, "_log_file_path", None)
+        if isinstance(log_path, Path):
+            try:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(formatted + "\n")
+            except Exception:
+                pass
         try:
             log_method = getattr(logger, level_upper.lower(), logger.info)
         except Exception:

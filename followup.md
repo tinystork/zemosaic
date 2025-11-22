@@ -1,13 +1,26 @@
-# Follow-up attendu
+🟩 followup.md — Exécution
+Étapes pour Codex
 
-Merci d’inclure dans ta réponse finale :
+[x] Lire intégralement zemosaic_filter_gui.py depuis le repo.
 
-1. [x] Comment tu as parallélisé `compute_per_tile_gains_from_coverage` (type de pool, organisation des batches).
-2. [x] Comment tu as parallélisé la boucle `for ch in range(n_channels)` (CPU ou CPU+GPU hybride).
-3. [x] Comment `ParallelPlan` est utilisé (rows_per_chunk, chunk_mb, cpu_workers).
-4. [x] Comment les STATS_UPDATE Phase 5 ont été ajoutés et quels champs sont fournis.
-5. [ ] Preuve que :
-   - SDS n’a jamais été modifié,
-   - les tests restent verts (pytest échoue avant collecte : `FileNotFoundError` sur la capture),
-   - l’API publique n’a pas bougé.
-6. [x] Comment tu t’assures que la VRAM et la RAM sont respectées pendant la seconde passe.
+[x] Repérer la zone où _merge_small_groups est appelée.
+
+[x] Ajouter une nouvelle fonction :
+def _apply_hard_merge(groups, settings, logger): ...
+
+[x] Implémenter les règles précisées dans agent.md.
+
+[x] Appeler _apply_hard_merge juste après le preplan coverage-first et avant
+la sauvegarde dans overrides_state.preplan_master_groups.
+
+[x] Ajouter le logging dédié.
+
+[x] Ajouter un paramètre merge_threshold = 10 dans les settings si nécessaire.
+
+[x] Exécuter une passe complète de vérification statique.
+
+À tester avec les datasets fournis dans repo
+
+1 dataset fortement recouvrant (Seestar)
+
+1 dataset éclaté en blocs

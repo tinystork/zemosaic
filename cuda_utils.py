@@ -1,81 +1,9 @@
-"""
-╔═══════════════════════════════════════════════════════════════════════════════════╗
-║ ZeMosaic / ZeSeestarStacker Project                                               ║
-║                                                                                   ║
-║ Auteur  : Tinystork, seigneur des couteaux à beurre (aka Tristan Nauleau)         ║
-║ Partenaire : J.A.R.V.I.S. (/ˈdʒɑːrvɪs/) — Just a Rather Very Intelligent System   ║
-║              (aka ChatGPT, Grand Maître du ciselage de code)                      ║
-║                                                                                   ║
-║ Licence : GNU General Public License v3.0 (GPL-3.0)                               ║
-║                                                                                   ║
-║ Description :                                                                     ║
-║   Ce programme a été forgé à la lueur des pixels et de la caféine,                ║
-║   dans le but noble de transformer des nuages de photons en art                   ║
-║   astronomique. Si vous l’utilisez, pensez à dire “merci”,                        ║
-║   à lever les yeux vers le ciel, ou à citer Tinystork et J.A.R.V.I.S.             ║
-║   (le karma des développeurs en dépend).                                          ║
-║                                                                                   ║
-║ Avertissement :                                                                   ║
-║   Aucune IA ni aucun couteau à beurre n’a été blessé durant le                    ║
-║   développement de ce code.                                                       ║
-╚═══════════════════════════════════════════════════════════════════════════════════╝
+"""Compatibility shim for legacy imports.
 
-
-╔═══════════════════════════════════════════════════════════════════════════════════╗
-║ ZeMosaic / ZeSeestarStacker Project                                               ║
-║                                                                                   ║
-║ Author  : Tinystork, Lord of the Butter Knives (aka Tristan Nauleau)              ║
-║ Partner : J.A.R.V.I.S. (/ˈdʒɑːrvɪs/) — Just a Rather Very Intelligent System      ║
-║           (aka ChatGPT, Grand Master of Code Chiseling)                           ║
-║                                                                                   ║
-║ License : GNU General Public License v3.0 (GPL-3.0)                               ║
-║                                                                                   ║
-║ Description:                                                                      ║
-║   This program was forged under the sacred light of pixels and                    ║
-║   caffeine, with the noble intent of turning clouds of photons into               ║
-║   astronomical art. If you use it, please consider saying “thanks,”               ║
-║   gazing at the stars, or crediting Tinystork and J.A.R.V.I.S. —                  ║
-║   developer karma depends on it.                                                  ║
-║                                                                                   ║
-║ Disclaimer:                                                                       ║
-║   No AIs or butter knives were harmed in the making of this code.                 ║
-╚═══════════════════════════════════════════════════════════════════════════════════╝
+The canonical implementation now lives in ``core.cuda_utils`` to keep shared
+helpers in a single place.  Both import paths continue to work to avoid
+breaking existing code.
 """
 
-import os
-import subprocess
-import shutil
-import platform
-import importlib.util
-
-SYSTEM_NAME = platform.system().lower()
-IS_WINDOWS = SYSTEM_NAME == "windows"
-CUPY_AVAILABLE = importlib.util.find_spec("cupy") is not None
-
-
-def gpu_supported() -> bool:
-    """Return ``True`` when CUDA operations are supported on this platform."""
-
-    return IS_WINDOWS and CUPY_AVAILABLE
-
-
-def enforce_nvidia_gpu():
-    """Force l'utilisation du premier GPU NVIDIA via CUDA_VISIBLE_DEVICES."""
-    if not gpu_supported():
-        return False
-    if shutil.which("nvidia-smi") is None:
-        return False
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=index", "--format=csv,noheader"],
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        idx = out.strip().splitlines()[0]
-        if idx:
-            os.environ["CUDA_VISIBLE_DEVICES"] = idx
-            return True
-    except Exception:
-        pass
-    return False
+from core.cuda_utils import *  
 

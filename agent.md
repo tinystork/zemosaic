@@ -1,212 +1,174 @@
-# Mission : Optimiser et paralléliser la Second Pass (Phase 5) du pipeline ZeMosaic
+✅ agent.md — Coverage-First Hard Merge (Seestar-friendly)
+🎯 Mission
 
-## 🎯 Objectif global
+Optimiser la phase de “Coverage-First Preplan” dans zemosaic_filter_gui.py (Qt) afin de réduire le nombre de micro-groupes (1–10 frames) générés lorsque le champ est très recouvrant (ex : Seestar S50).
+⚠️ Sans modifier la logique SDS ou le reste du pipeline.
 
-La Phase 5 comporte deux sous-étapes :
+Objectif :
+→ produire moins de groupes, mais plus robustes, avec un SNR interne plus homogène,
+→ tout en préservant les groupes réellement isolés.
 
-1. **Reproject & Coadd classique**  
-2. **Second Pass Coverage Renormalization (Two-Pass)**
+📌 Règles du “Hard Merge”
 
-Le premier bloc a déjà été stabilisé.  
-La seconde passe, elle, reste **largement séquentielle**, très lente, et n’émet presque aucune télémétrie.
+Le merge est strictement local et non destructif :
 
-👉 **Ta mission est d’optimiser fortement la Second Pass**, en :
+1. Groupes éligibles au merge
 
-- parallélisant les opérations **au niveau ZeMosaic** (pas reproject lui-même),
-- utilisant **cpu_workers** et **chunking ParallelPlan**,
-- utilisant le **GPU** quand `use_gpu_phase5 = True`,
-- garantissant que **SDS reste strictement intouché**.
+Un groupe est candidat s’il vérifie :
 
----
+group.size < merge_threshold
 
-# 🧱 Contexte technique
+valeur par défaut : 10
 
-La seconde passe est pilotée depuis :
+rendre la valeur configurable via solver_settings.py ou un paramètre interne au module
 
-### Fichier :
-- `zemosaic_worker.py`
+groupe non vide et non SDS préalloué
 
-### Fonctions clés :
-- `run_second_pass_coverage_renorm(...)`
-- `compute_per_tile_gains_from_coverage(...)`
-- projection du coverage vers chaque tuile
-- boucle `for ch in range(n_channels)` pour reprojection par canal
-- (toute logique entre `[TwoPass] Second pass requested...` et `[TwoPass] coverage-renorm OK`)
+2. Critère spatial (obligatoire)
 
-### Problème actuel :
+Un micro-groupe A ne peut être fusionné qu’avec un groupe B si :
 
-1. **Boucle par tuile** → Séquentielle  
-2. **Boucle par canal** → Séquentielle  
-3. **Reprojection** exécutée dans 1 appel global, sans chunking ZeMosaic  
-4. **cpu_workers affichés mais non utilisés**  
-5. **gpu=True loggé mais la logique reste CPU-bound majoritairement**  
-6. **Télémétrie Phase 5 minimaliste**  
-7. **rows(cpu/gpu)=0/0** à cause d’absence de découpage pour la TwoPass.
+Distance angulaire des centres < FoV × 1.2
+(déjà disponible via footprint RA/Dec)
+OU
 
----
+Footprints RA/Dec qui se recoupent réellement
+(rectangle intersection stricte)
 
-# ✔️ Ce que tu dois faire
+⚠️ Si A n’a aucun voisin qui respecte cela → NE PAS fusionner.
+→ C’est ce qui protège les paquets éloignés comme dans ta capture.
 
-## 1. Paralléliser compute_per_tile_gains_from_coverage
+3. Critère de taille (cap & overcap)
 
-Dans `compute_per_tile_gains_from_coverage(...)` :
+Si spatialement admissible, fusion autorisée seulement si :
 
-- Chaque tuile est aujourd’hui traitée dans une boucle Python séquentielle.
-- Tu dois utiliser **ThreadPoolExecutor** ou **ProcessPoolExecutor** suivant ParallelPlan :
+size(A) + size(B) ≤ max_raw_per_master_tile × (1 + overcap_allowance_fraction)
 
-  - **Si GPU actif (`use_gpu=True`)** → utiliser un **ThreadPoolExecutor**  
-    (les opérations CuPy libèrent le GIL → bénéfice immédiat).
-  
-  - **Si GPU inactif** → utiliser un **ProcessPoolExecutor**  
-    (les opérations NumPy/Scipy/CV2 sont CPU-bound).
+Remarques :
 
-### Détails :
+utiliser exactement la même valeur slider “overcap allowance (%)”
 
-Pour chaque tuile :
+transformer 10% → 0.10 pour la formule
 
-- projection coverage → WCS tuile
-- calcul médian → gain
-- clamp dans [gain_clip_min, gain_clip_max]
+refuser toute fusion qui dépasse ce plafond
 
-Le parallélisme doit :
+4. Merge unique
 
-- respecter `plan.cpu_workers`
-- respecter les limites mémoire (`max_chunk_bytes`) en batchant intelligemment la liste des tuiles
-- renvoyer les gains dans l’ordre d’origine
+Un micro-groupe ne doit être fusionné qu’une seule fois, pour éviter les chaînes infinies :
 
-⚠️ Interdiction de changer la logique mathématique.  
-Simplement paralléliser.
+A → fusionne dans le meilleur candidat B
 
----
+A disparaît
 
-## 2. Paralléliser la reprojection per-channel
+B est mis à jour
 
-Aujourd’hui :
+A n’est jamais revu
 
-```python
-for ch in range(n_channels):
-    ...
-    chan_mosaic, chan_cov = _invoke_reproj(...)
-➡️ Cette boucle doit être parallélisée :
+5. Ordre de fusion
 
-Stratégie :
-lancer 1 worker par canal quand n_channels >= 2
+Fusionner dans cet ordre :
 
-sinon 1 seul worker évidemment
+micro-groupes les plus petits en premier
 
-respecter plan.cpu_workers (ne pas dépasser)
+puis ceux un peu plus gros
+Cela maximise les fusions réussies.
 
-si GPU actif :
+6. Logging
 
-autoriser un seul canal à utiliser le GPU à la fois
-(use_gpu = True uniquement pour 1 task)
+Ajouter des lignes dans le logger :
 
-les autres canaux → CPU
-(sinon VRAM saturée)
+[HARD-MERGE] Merged group #A (size=4) → group #B (size=12), dist=0.42°, new_size=16
 
-si GPU inactif :
 
-paralléliser tous les canaux en CPU
+Si rejet :
 
-Contraintes :
-Les résultats doivent être recombinés dans l’ordre original [H, W, C].
+[HARD-MERGE] Skip group #A : no eligible neighbour
+[HARD-MERGE] Skip merge #A→#B : would exceed cap (22 > 20)
 
-_invoke_reproj ne doit pas être modifié.
+7. Aucun autre impact
 
-Si l’utilisateur a un GPU 8/12/16 Go → parallèle CPU+GPU hybride automatique.
+Ne rien modifier à :
 
-3. Ajouter un vrai chunking pour la TwoPass (rows_per_chunk)
-Actuellement, pour TwoPass :
+SDS
 
-bash
-Copier le code
-rows(cpu/gpu) = 0/0
-chunk_mb(cpu/gpu) = 1144MB
-→ aucune découpe.
+Auto-tile heuristics
 
-Tu dois :
+Zesupadupstack
 
-réutiliser le ParallelPlan appliqué en Phase 5
-(celui obtenu juste avant pour Reproject & Coadd),
+la logique de coverage map
 
-découper la coverage + la grille finale en blocs de lignes (row-chunks),
+lecropper
 
-exécuter les opérations lourdes (gaussian blur, reprojection coverage→tile, gains apply) par chunk.
+le code Phase 5 et Phase 3
 
-Les chunk doivent être définis par :
+Organiser le code proprement dans une fonction dédiée :
 
-plan.rows_per_chunk (si disponible)
+_apply_hard_merge(groups, settings, logger)
 
-ou plan.max_chunk_bytes / plan.gpu_max_chunk_bytes (fallback)
+à placer dans zemosaic_filter_gui.py, juste après _merge_small_groups() mais appelée après l’étape de preplan, avant affichage GUI et serialization dans overrides_state.preplan_master_groups.
 
-ou au pire un découpage fixe 512–1024 lignes par chunk si aucun plan n’est disponible
+📁 Fichiers à modifier
 
-⚠️ Encore une fois : pas de changement mathématique.
+zemosaic_filter_gui.py (principal)
 
-4. Ajouter télémétrie Phase 5 complète
-Aujourd’hui, aucun STATS_UPDATE n’est émis pendant la seconde passe.
+éventuellement :
 
-Tu dois :
+solver_settings.py (clé config merge_threshold si besoin)
 
-envoyer un STATS_UPDATE au début,
+zemosaic_utils.py (helper rectangle intersection si utilitaire manquant)
 
-un STATS_UPDATE toutes les X tuiles OU tous les X chunks,
+🧪 Tests à passer
+Cas 1 — Seestar ultra-recouvrant (ex : 3500 frames)
 
-un STATS_UPDATE à la fin.
+Entrée : ton dataset typique avec 180+ groupes.
+Attendu :
 
-Le stats_dict doit contenir (mêmes clés que Phase 3) :
+180 → ~30–50 groupes (ordre de grandeur)
 
-makefile
-Copier le code
-phase_index=5
-phase_name="Phase 5: Two-Pass Coverage Renorm"
-cpu_percent
-ram_used_mb
-gpu_used_mb
-cpu_workers=plan.cpu_workers
-use_gpu=plan.use_gpu
-use_gpu_phase5=true/false
-tiles_done=X
-tiles_total=Y
-chunk_index
-chunk_total
-Tu peux réutiliser _log_and_callback("STATS_UPDATE", ...).
+tous les groupes restants ≥ 15–20 frames
 
-🔒 Ce que tu NE DOIS PAS toucher
-AUCUN fichier/fonction SDS
+logs de hard-merge présents
 
-AUCUNE logique mathématique (gaussian blur, gains, clamp)
+aucun dépassement cap
 
-AUCUN comportement Phase 1/3
+Cas 2 — Champs éclatés (comme ta 2ᵉ capture)
 
-AUCUN paramètre de configuration existant
+Entrée : 4–6 clusters éloignés.
+Attendu :
 
-AUCUN test
+aucune fusion
 
-AUCUNE signature publique du pipeline
+logs : “no eligible neighbour”
 
-📂 Fichiers à modifier
-Exclusivement :
+nombre de groupes identique à avant le patch
 
-zemosaic_worker.py
+Cas 3 — Cap faible / overcap faible
 
-zemosaic_utils.py (si nécessaire pour ajouter un petit helper de parallélisation non-intrusif)
+Attendu :
 
-éventuellement parallel_utils.py pour exposer un petit helper parallel_map() réutilisable (non obligatoire)
+fusions refusées proprement
 
-✔️ Résultat attendu
-Après implémentation :
+logs explicites
 
-La seconde passe doit diviser son temps de traitement par 2× à 8× selon CPU/GPU.
+Cas 4 — Cap élevé / overcap élevé
 
-Le moniteur de ressources doit montrer :
+Attendu :
 
-CPU multi-workers actifs
+fusions plus agressives mais toujours locales
 
-GPU actif si use_gpu_phase5=True
+aucune fusion entre zones distantes
 
-Le log ne doit plus montrer rows(cpu/gpu)=0/0
+🔒 Contraintes
 
-La télémétrie Phase 5 doit apparaître clairement dans resource_telemetry.csv
+Ne toucher AUCUNE logique SDS
 
-Le pipeline SDS reste strictement identique.
+Ne rien changer à la structure des master tiles
+
+Aucun impact sur le pipeline standard
+
+Backward compatible
+
+Codex doit produire un patch propre, clair, bien commenté
+
+Le comportement batch size = 0 / >1 ne doit jamais être altéré
+

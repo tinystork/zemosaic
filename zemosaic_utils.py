@@ -1062,12 +1062,23 @@ def ensure_cupy_pool_initialized(device_id: int | None = None) -> None:
     """
     if not gpu_is_available():
         return
+    import cupy as cp  # type: ignore
+    # Always set the CUDA device for the current thread so worker threads obtain
+    # a valid context even if the pools were initialized earlier.
+    try:
+        target_device = int(device_id) if device_id is not None else cp.cuda.Device().id
+    except Exception:
+        target_device = int(device_id) if device_id is not None else 0
+    if target_device is not None:
+        try:
+            cp.cuda.Device(target_device).use()
+        except Exception:
+            pass
     try:
         ensure_cupy_pool_initialized._done  # type: ignore[attr-defined]
         return
     except AttributeError:
         pass
-    import cupy as cp  # type: ignore
     try:
         if device_id is not None:
             cp.cuda.Device(int(device_id)).use()

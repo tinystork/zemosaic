@@ -74,6 +74,7 @@ class SolverSettings:
     astap_search_radius_deg: float = 3.0
     astap_downsample: int = 2
     astap_sensitivity: int = 100
+    merge_threshold: int = 10
     use_auto_intertile: bool = False
     force_resolve_existing_wcs: bool = False
     intertile_offset_limit_adu: float = 50.0
