@@ -202,8 +202,11 @@ def auto_tune_parallel_plan(
     ----------
     kind:
         Hint describing the pipeline phase (``"stack_master_tiles"``,
-        ``"global_reproject"``, ...). Currently informational only but left in
-        place so we can refine heuristics later.
+        ``"global"``, ``"global_reproject"``, ...). Currently informational only
+        but left in place so we can refine heuristics later. The
+        ``"global_reproject"`` hint is used for the Phase 5 final mosaic where
+        ``frame_shape`` is the final mosaic size and ``n_frames`` is the count
+        of master tiles to reproject.
     frame_shape:
         Tuple ``(height, width)`` describing the output grid.
     n_frames:
@@ -223,58 +226,72 @@ def auto_tune_parallel_plan(
 
     autotune_enabled = bool(_extract_config(cfg, "parallel_autotune_enabled", True))
     target_cpu_load = _clamp(
-        _extract_config(cfg, "parallel_target_cpu_load", 0.85),
+        _extract_config(cfg, "parallel_target_cpu_load", 0.95),
         0.1,
         1.0,
-        0.85,
+        0.95,
     )
     target_ram_fraction = _clamp(
-        _extract_config(cfg, "parallel_target_ram_fraction", 0.8),
+        _extract_config(cfg, "parallel_target_ram_fraction", 0.9),
         0.1,
         0.95,
-        0.8,
+        0.9,
     )
     target_gpu_fraction = _clamp(
-        _extract_config(cfg, "parallel_gpu_vram_fraction", 0.5),
+        _extract_config(cfg, "parallel_gpu_vram_fraction", 0.8),
         0.1,
         0.9,
-        0.5,
+        0.8,
     )
     max_cpu_workers = _safe_int(_extract_config(cfg, "parallel_max_cpu_workers", 0), 0)
 
     logical = max(1, caps.cpu_logical_cores)
+    workers = logical
     if autotune_enabled:
-        workers = max(1, int(math.ceil(logical * target_cpu_load)))
-    else:
-        workers = logical
+        # Aim for a higher fraction of logical cores, as observed safe in telemetry on 32 GB / 8 GB GPUs.
+        workers = max(1, int(round(logical * target_cpu_load)))
     if max_cpu_workers > 0:
         workers = min(workers, max_cpu_workers)
     workers = max(1, workers)
 
     height = int(frame_shape[0]) if frame_shape else 0
     width = int(frame_shape[1]) if frame_shape else 0
-    bytes_per_frame, bytes_total = _estimate_bytes(frame_shape, n_frames, max(1, bytes_per_pixel))
+    _, bytes_total = _estimate_bytes(frame_shape, n_frames, max(1, bytes_per_pixel))
+    bytes_per_row = width * max(1, bytes_per_pixel) * max(1, n_frames)
 
-    ram_available = caps.ram_available_bytes or caps.ram_total_bytes
-    ram_budget = int((ram_available or (8 * 1024**3)) * target_ram_fraction)
-    ram_budget = max(ram_budget, 128 * 1024 * 1024)  # never drop below 128 MB per chunk
-    use_memmap = bytes_total > ram_budget
-    max_chunk_bytes = ram_budget // max(workers, 1)
+    # Use a fraction of total RAM (or available) with a safety margin so chunks get larger
+    # without risking system exhaustion. Numbers come from resource_telemetry.csv showing plenty of headroom.
+    ram_total = max(0, int(caps.ram_total_bytes))
+    ram_available = max(0, int(caps.ram_available_bytes))
+    baseline_ram = ram_total or ram_available or (8 * 1024**3)
+    ram_budget_total = int(baseline_ram * target_ram_fraction * 0.95)
+    if ram_available:
+        ram_budget_total = min(ram_budget_total, int(ram_available * 0.98))
+    ram_budget_total = max(ram_budget_total, 256 * 1024 * 1024)  # keep chunks meaningful
+    use_memmap = bytes_total > ram_budget_total
+
+    max_chunk_bytes = ram_budget_total // max(workers, 1)
     max_chunk_bytes = max(32 * 1024 * 1024, max_chunk_bytes)
 
     rows_per_chunk = None
-    if height > 0 and width > 0 and bytes_per_frame > 0:
+    if height > 0 and width > 0 and bytes_per_row > 0:
         rows_per_chunk = _compute_rows_per_chunk(max_chunk_bytes, width, max(1, n_frames), bytes_per_pixel)
         if rows_per_chunk is not None:
-            rows_per_chunk = max(1, min(height, rows_per_chunk))
+            rows_per_chunk = max(4, min(height, rows_per_chunk))
 
     gpu_rows_per_chunk = None
     gpu_chunk_bytes = None
     use_gpu = bool(caps.gpu_available and autotune_enabled)
-    if use_gpu:
-        gpu_free = caps.gpu_vram_free_bytes or caps.gpu_vram_total_bytes
-        if gpu_free:
-            gpu_chunk_bytes = int(max(32 * 1024 * 1024, gpu_free * target_gpu_fraction))
+    if use_gpu and width > 0 and height > 0:
+        gpu_total = max(0, int(caps.gpu_vram_total_bytes or 0))
+        gpu_free = max(0, int(caps.gpu_vram_free_bytes or 0))
+        gpu_baseline = gpu_total or gpu_free
+        if gpu_baseline:
+            # Use VRAM total as the main budget, but still respect current free memory to stay safe.
+            gpu_budget_total = gpu_baseline * target_gpu_fraction * 0.9
+            if gpu_free:
+                gpu_budget_total = min(gpu_budget_total, gpu_free * 0.98)
+            gpu_chunk_bytes = int(max(32 * 1024 * 1024, gpu_budget_total))
             gpu_rows_per_chunk = _compute_rows_per_chunk(
                 gpu_chunk_bytes,
                 width,

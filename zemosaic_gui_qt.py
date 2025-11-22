@@ -799,7 +799,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._disable_phase45_config()
         self.localizer = self._create_localizer(self.config.get("language", "en"))
         self.setWindowTitle(
-            self._tr("qt_window_title_preview", "ZeMosaic V4.2.0 – Superacervandi ")
+            self._tr("qt_window_title_preview", "ZeMosaic V4.2.5 – Superacervandi ")
         )
         self._gpu_devices: List[Tuple[str, int | None]] = self._detect_gpus()
         if self._gpu_devices:
@@ -911,6 +911,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._phase45_active: Optional[int] = None
         self._phase45_last_out: Optional[str] = None
         self._phase45_overlay_enabled: bool = False
+        self.resource_monitor_label: Optional[QLabel] = None
         self.phase45_status_label: Optional[QLabel] = None
         self.phase45_overlay_scene: Optional[QGraphicsScene] = None
         self.phase45_overlay_view: Optional[QGraphicsView] = None
@@ -2310,6 +2311,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
             general_layout,
             self._tr("qt_field_match_background", "Match background in final mosaic"),
         )
+        tile_weight_checkbox = self._register_checkbox(
+            "enable_tile_weighting",
+            general_layout,
+            self._tr("qt_field_tile_weighting", "Tile weighting (recommended)"),
+        )
         self._register_checkbox(
             "save_final_as_uint16",
             general_layout,
@@ -2676,6 +2682,23 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 "Delete temporary processing files after run",
             ),
         )
+
+        telemetry_box = QGroupBox(
+            self._tr("qt_resource_telemetry_group_title", "Resource Telemetry"),
+            group,
+        )
+        telemetry_layout = QFormLayout(telemetry_box)
+        telemetry_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        self._register_checkbox(
+            "enable_resource_telemetry",
+            telemetry_layout,
+            self._tr("qt_enable_resource_telemetry_label", "Enable resource telemetry (CPU/GPU monitor)"),
+        )
+        self.resource_monitor_label = QLabel("")
+        self.resource_monitor_label.setObjectName("resource_monitor_label")
+        self.resource_monitor_label.setWordWrap(True)
+        telemetry_layout.addRow(self.resource_monitor_label)
+        layout.addRow(telemetry_box)
 
         cache_combo = QComboBox(group)
         cache_options = [
@@ -3206,7 +3229,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "type": value_type,
         }
 
-    def _register_checkbox(self, key: str, layout: QFormLayout, label_text: str) -> None:
+    def _register_checkbox(self, key: str, layout: QFormLayout, label_text: str) -> QCheckBox:
         checkbox = QCheckBox(label_text)
         checkbox.setChecked(bool(self.config.get(key, False)))
         layout.addRow(checkbox)
@@ -3215,6 +3238,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "widget": checkbox,
             "type": bool,
         }
+        return checkbox
 
     def _register_spinbox(
         self,
@@ -3608,6 +3632,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "apply_master_tile_crop": True,
             "master_tile_crop_percent": 3.0,
             "match_background_for_final": True,
+            "enable_tile_weighting": True,
+            "tile_weight_mode": "n_frames",
             "incremental_feather_parity": False,
             "intertile_photometric_match": True,
             "intertile_preview_size": 512,
@@ -3876,7 +3902,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _refresh_translated_ui(self) -> None:
         self.setWindowTitle(
-            self._tr("qt_window_title_preview", "ZeMosaic V4.2.0 – Superacervandi ")
+            self._tr("qt_window_title_preview", "ZeMosaic V4.2.5 – Superacervandi ")
         )
         previous_log = ""
         if hasattr(self, "log_output"):
@@ -4497,6 +4523,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self.elapsed_value_label.setText("00:00:00")
             self.files_value_label.setText("")
             self.tiles_value_label.setText(self._tr("qt_progress_count_placeholder", "0 / 0"))
+        if self.resource_monitor_label is not None:
+            self.resource_monitor_label.setText("")
         else:
             self.progress_bar.setValue(0)
             self.phase_value_label.setText(self._tr("qt_progress_placeholder", "Idle"))
@@ -4787,6 +4815,26 @@ class ZeMosaicQtMainWindow(QMainWindow):
         eta_seconds = payload.get("eta_seconds")
         if isinstance(eta_seconds, (int, float)) and eta_seconds >= 0:
             self._set_eta_display(format_eta_hms(eta_seconds))
+
+        cpu_percent = payload.get("cpu_percent")
+        ram_used_mb = payload.get("ram_used_mb")
+        ram_total_mb = payload.get("ram_total_mb")
+        gpu_used_mb = payload.get("gpu_used_mb")
+        gpu_total_mb = payload.get("gpu_total_mb")
+        parts: List[str] = []
+        if isinstance(cpu_percent, (int, float)):
+            parts.append(f"CPU {cpu_percent:4.1f}%")
+        if isinstance(ram_used_mb, (int, float)) and isinstance(ram_total_mb, (int, float)) and ram_total_mb > 0:
+            used_gib = ram_used_mb / 1024.0
+            total_gib = ram_total_mb / 1024.0
+            parts.append(f"RAM {used_gib:4.1f} / {total_gib:4.1f} GiB")
+        if isinstance(gpu_used_mb, (int, float)) and isinstance(gpu_total_mb, (int, float)) and gpu_total_mb > 0:
+            used_gib = gpu_used_mb / 1024.0
+            total_gib = gpu_total_mb / 1024.0
+            gpu_percent = 100.0 * (gpu_used_mb / gpu_total_mb)
+            parts.append(f"GPU {gpu_percent:4.1f}% ({used_gib:4.1f} / {total_gib:4.1f} GiB)")
+        if self.resource_monitor_label is not None:
+            self.resource_monitor_label.setText(" | ".join(parts) if parts else "")
 
     def _on_worker_eta_updated(self, eta_text: str) -> None:
         if not isinstance(eta_text, str):
@@ -5189,6 +5237,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 gpu_id = int(gpu_id_raw)
             except (TypeError, ValueError):
                 gpu_id = None
+        enable_tile_weighting = _coerce_bool(cfg.get("enable_tile_weighting", True), True)
+        tile_weight_mode = _coerce_str(cfg.get("tile_weight_mode", "n_frames")) or "n_frames"
 
         logging_level = _coerce_str(cfg.get("logging_level", "INFO"))
 
@@ -5284,6 +5334,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
             poststack_use_overlap,
             use_gpu_phase5,
             gpu_id,
+            enable_tile_weighting,
+            tile_weight_mode,
             logging_level,
         )
 

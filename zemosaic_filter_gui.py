@@ -45,7 +45,7 @@
 
 from __future__ import annotations
 
-from typing import List, Dict, Any, Optional, Callable, Sequence
+from typing import List, Dict, Any, Optional, Callable, Sequence, Iterable, Mapping
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import asdict
@@ -82,6 +82,7 @@ from zemosaic_utils import (
 )
 
 
+np: Any | None = None
 logger = logging.getLogger(__name__)
 FITS_EXTENSIONS = {".fit", ".fits"}
 
@@ -273,6 +274,311 @@ def _merge_small_groups(
     return [grp for idx, grp in enumerate(groups) if not merged_flags[idx]]
 
 
+DEFAULT_HARD_MERGE_THRESHOLD = 10
+HARD_MERGE_FOV_SCALE = 1.2
+
+
+def _apply_hard_merge(
+    groups: list[list[dict]],
+    settings: Optional[Mapping[str, Any]],
+    logger: Optional[Callable[..., None]],
+) -> list[list[dict]]:
+    """Apply hard-merge heuristics to reduce micro-groups in coverage-first mode."""
+
+    if not groups:
+        return groups
+
+    global np
+    numpy_module = np
+    if numpy_module is None:
+        try:
+            import numpy as numpy_module  # type: ignore
+            np = numpy_module
+        except Exception:
+            numpy_module = None
+
+    settings_payload: Mapping[str, Any] = settings or {}
+
+    def _get_setting(key: str, default: Any = None) -> Any:
+        if isinstance(settings_payload, Mapping):
+            return settings_payload.get(key, default)
+        try:
+            return getattr(settings_payload, key, default)
+        except Exception:
+            return default
+
+    def _coerce_int(value: Any, default: int) -> int:
+        try:
+            return int(value)
+        except Exception:
+            return default
+
+    def _coerce_float(value: Any, default: float) -> float:
+        try:
+            val = float(value)
+        except Exception:
+            return default
+        if math.isnan(val) or math.isinf(val):
+            return default
+        return val
+
+    def _coerce_fraction(value: Any) -> float:
+        frac = _coerce_float(value, 0.0)
+        if frac < 0.0:
+            return 0.0
+        return frac
+
+    def _first_non_none(*candidates: Any) -> Any:
+        for candidate in candidates:
+            if candidate is not None:
+                return candidate
+        return None
+
+    merge_threshold_candidate = _first_non_none(
+        _get_setting("merge_threshold"),
+        _get_setting("hard_merge_threshold"),
+    )
+    merge_threshold = max(1, _coerce_int(merge_threshold_candidate, DEFAULT_HARD_MERGE_THRESHOLD))
+
+    cap_candidate = _first_non_none(
+        _get_setting("cap"),
+        _get_setting("max_raw_per_master_tile"),
+    )
+    cap_value = _coerce_int(cap_candidate, 0)
+    if cap_value <= 0:
+        max_group_size = 0
+        for grp in groups:
+            grp_len = len(grp) if isinstance(grp, list) else 0
+            if grp_len > max_group_size:
+                max_group_size = grp_len
+        if max_group_size <= 0:
+            max_group_size = merge_threshold
+        cap_value = max(merge_threshold, max_group_size)
+    if cap_value <= 0 or merge_threshold <= 0:
+        return groups
+
+    overcap_fraction = _coerce_fraction(
+        _first_non_none(
+            _get_setting("overcap_fraction"),
+            _get_setting("overcap_allowance_fraction"),
+        )
+    )
+    if overcap_fraction <= 0:
+        overcap_pct_candidate = _get_setting("overcap_pct")
+        if overcap_pct_candidate is not None:
+            overcap_fraction = _coerce_fraction(_coerce_float(overcap_pct_candidate, 0.0) / 100.0)
+
+    cap_limit_float = float(cap_value) * (1.0 + max(0.0, overcap_fraction))
+    cap_limit = max(cap_value, int(cap_limit_float))
+
+    fov_scale = _coerce_float(_get_setting("fov_scale"), HARD_MERGE_FOV_SCALE)
+    if fov_scale <= 0 or not math.isfinite(fov_scale):
+        fov_scale = HARD_MERGE_FOV_SCALE
+
+    working_groups = [list(grp) for grp in groups]
+    merged_flags = [False] * len(working_groups)
+    any_change = False
+
+    def _emit(msg: str, level: str = "INFO") -> None:
+        if logger is None or not msg:
+            return
+        try:
+            logger(msg, level)
+        except TypeError:
+            try:
+                logger(msg)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _iter_points(payload: Any) -> Iterable[tuple[float, float]]:
+        if payload is None:
+            return
+        if numpy_module is not None and isinstance(payload, numpy_module.ndarray):
+            if payload.ndim >= 2 and payload.shape[1] >= 2:
+                for row in payload:
+                    yield row[0], row[1]
+            return
+        try:
+            for entry in payload:
+                if entry is None:
+                    continue
+                if isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                    yield entry[0], entry[1]
+                elif isinstance(entry, dict):
+                    ra_val = entry.get("ra") or entry.get("RA")
+                    dec_val = entry.get("dec") or entry.get("DEC")
+                    if ra_val is None or dec_val is None:
+                        continue
+                    yield ra_val, dec_val
+        except TypeError:
+            pass
+
+    def _group_bounds(group: list[dict]) -> Optional[tuple[float, float, float, float]]:
+        ra_vals: list[float] = []
+        dec_vals: list[float] = []
+        for entry in group:
+            if not isinstance(entry, dict):
+                continue
+            payload = (
+                entry.get("footprint_radec")
+                or entry.get("_precomp_fp")
+                or entry.get("corners")
+                or entry.get("footprint")
+            )
+            if payload is None and entry.get("wcs") is not None:
+                fp = _compute_footprint_from_wcs(entry.get("wcs"), entry.get("shape"))
+                if fp:
+                    payload = fp
+            for ra_raw, dec_raw in _iter_points(payload):
+                try:
+                    ra_vals.append(float(ra_raw))
+                    dec_vals.append(float(dec_raw))
+                except Exception:
+                    continue
+        if not ra_vals or not dec_vals:
+            return None
+        return (min(ra_vals), max(ra_vals), min(dec_vals), max(dec_vals))
+
+    def _estimate_group_fov(group: list[dict], bounds: Optional[tuple[float, float, float, float]]) -> Optional[float]:
+        if bounds is not None:
+            ra_span = bounds[1] - bounds[0]
+            dec_span = bounds[3] - bounds[2]
+            diag = math.hypot(ra_span, dec_span)
+            if diag > 0:
+                return diag
+        for entry in group:
+            if not isinstance(entry, dict):
+                continue
+            candidate = (
+                entry.get("phase0_fov_deg")
+                or entry.get("estimated_fov_deg")
+                or entry.get("fov_deg")
+            )
+            if candidate:
+                try:
+                    val = float(candidate)
+                except Exception:
+                    continue
+                if math.isfinite(val) and val > 0:
+                    return val
+        return None
+
+    def _rectangles_intersect(
+        bounds_a: Optional[tuple[float, float, float, float]],
+        bounds_b: Optional[tuple[float, float, float, float]],
+    ) -> bool:
+        if bounds_a is None or bounds_b is None:
+            return False
+        ra_min_a, ra_max_a, dec_min_a, dec_max_a = bounds_a
+        ra_min_b, ra_max_b, dec_min_b, dec_max_b = bounds_b
+        vals = (ra_min_a, ra_max_a, dec_min_a, dec_max_a, ra_min_b, ra_max_b, dec_min_b, dec_max_b)
+        if not all(math.isfinite(val) for val in vals):
+            return False
+        return not (
+            ra_max_b <= ra_min_a
+            or ra_min_b >= ra_max_a
+            or dec_max_b <= dec_min_a
+            or dec_min_b >= dec_max_a
+        )
+
+    metadata: list[dict[str, Any]] = []
+    for idx, group in enumerate(working_groups):
+        bounds = _group_bounds(group)
+        metadata.append(
+            {
+                "index": idx,
+                "size": len(group),
+                "center": _group_center_deg(group),
+                "bounds": bounds,
+                "fov": _estimate_group_fov(group, bounds),
+                "merged": False,
+            }
+        )
+
+    eligible = sorted(
+        (meta for meta in metadata if meta["size"] > 0 and meta["size"] < merge_threshold),
+        key=lambda m: (m["size"], m["index"]),
+    )
+
+    for meta in eligible:
+        idx_a = meta["index"]
+        if meta["merged"]:
+            continue
+        source_group = working_groups[idx_a]
+        if not source_group:
+            meta["merged"] = True
+            continue
+
+        best_idx = None
+        best_dist = float("inf")
+        cap_reject_msg = None
+
+        for neighbour in metadata:
+            idx_b = neighbour["index"]
+            if idx_b == idx_a or neighbour["merged"]:
+                continue
+            target_group = working_groups[idx_b]
+            if not target_group:
+                continue
+            spatial_ok = False
+            if _rectangles_intersect(meta["bounds"], neighbour["bounds"]):
+                spatial_ok = True
+            else:
+                if meta["center"] and neighbour["center"] and meta.get("fov"):
+                    dist_val = _angular_sep_deg(meta["center"], neighbour["center"])
+                    if math.isfinite(dist_val) and dist_val <= float(meta["fov"]) * fov_scale:
+                        spatial_ok = True
+            if not spatial_ok:
+                continue
+            candidate_size = len(source_group) + len(target_group)
+            if candidate_size > cap_limit:
+                cap_reject_msg = f"[HARD-MERGE] Skip merge #{idx_a}→#{idx_b} : would exceed cap ({candidate_size} > {cap_limit})"
+                continue
+            dist_metric = (
+                _angular_sep_deg(meta["center"], neighbour["center"])
+                if meta["center"] and neighbour["center"]
+                else float("inf")
+            )
+            if dist_metric < best_dist:
+                best_dist = dist_metric
+                best_idx = idx_b
+
+        if best_idx is None:
+            if cap_reject_msg:
+                _emit(cap_reject_msg, "INFO")
+            else:
+                _emit(f"[HARD-MERGE] Skip group #{idx_a} : no eligible neighbour", "INFO")
+            continue
+
+        target_group = working_groups[best_idx]
+        source_size = len(source_group)
+        target_size_before = len(target_group)
+        target_group.extend(source_group)
+        working_groups[idx_a] = []
+        meta["merged"] = True
+        merged_flags[idx_a] = True
+
+        metadata[best_idx]["size"] = len(target_group)
+        metadata[best_idx]["center"] = _group_center_deg(target_group)
+        metadata[best_idx]["bounds"] = _group_bounds(target_group)
+        metadata[best_idx]["fov"] = _estimate_group_fov(target_group, metadata[best_idx]["bounds"])
+
+        dist_val = _angular_sep_deg(meta["center"], metadata[best_idx]["center"])
+        dist_str = f"{dist_val:.2f}" if math.isfinite(dist_val) else "n/a"
+        _emit(
+            f"[HARD-MERGE] Merged group #{idx_a} (size={source_size}) → group #{best_idx} "
+            f"(size={target_size_before}), dist={dist_str}°, new_size={len(target_group)}",
+            "INFO",
+        )
+        any_change = True
+
+    if not any_change:
+        return groups
+    return [grp for idx, grp in enumerate(working_groups) if grp and not merged_flags[idx]]
+
+
 ASTAP_CONCURRENCY_STATE = {"config": 1}
 
 
@@ -413,6 +719,77 @@ def _split_group_by_orientation(group: list[dict], threshold_deg: float) -> list
     if len(subgroups) == 1:
         return [group]
     return subgroups
+
+
+def _compute_footprint_from_wcs(
+    wcs_obj: Any,
+    shape_hw: Optional[tuple[int, int]] = None,
+) -> Optional[list[tuple[float, float]]]:
+    """Return a list of (RA, Dec) corners for the provided WCS."""
+
+    if wcs_obj is None or not getattr(wcs_obj, "is_celestial", False):
+        return None
+
+    def _as_deg(angle_obj: Any) -> Optional[float]:
+        if angle_obj is None:
+            return None
+        candidate = getattr(angle_obj, "deg", None)
+        if callable(candidate):
+            try:
+                candidate = candidate()
+            except Exception:
+                candidate = None
+        if candidate is None:
+            candidate = getattr(angle_obj, "degree", None)
+            if callable(candidate):
+                try:
+                    candidate = candidate()
+                except Exception:
+                    candidate = None
+        if candidate is not None:
+            try:
+                return float(candidate)
+            except Exception:
+                pass
+        try:
+            return float(angle_obj)
+        except Exception:
+            return None
+
+    try:
+        if shape_hw is not None and len(shape_hw) >= 2:
+            h, w = float(shape_hw[0]), float(shape_hw[1])
+        else:
+            px_shape = getattr(wcs_obj, "pixel_shape", None)
+            if px_shape and len(px_shape) >= 2:
+                w = float(px_shape[0])
+                h = float(px_shape[1])
+            else:
+                arr_shape = getattr(wcs_obj, "array_shape", None)
+                if arr_shape and len(arr_shape) >= 2:
+                    h = float(arr_shape[0])
+                    w = float(arr_shape[1])
+                else:
+                    return None
+        if h <= 1.0 or w <= 1.0:
+            return None
+        corners = (
+            (0.0, 0.0),
+            (w - 1.0, 0.0),
+            (w - 1.0, h - 1.0),
+            (0.0, h - 1.0),
+        )
+        result: list[tuple[float, float]] = []
+        for x, y in corners:
+            sky = wcs_obj.pixel_to_world(float(x), float(y))
+            ra_v = _as_deg(getattr(sky, "ra", None))
+            dec_v = _as_deg(getattr(sky, "dec", None))
+            if ra_v is None or dec_v is None:
+                return None
+            result.append((ra_v, dec_v))
+        return result
+    except Exception:
+        return None
 
 
 def _format_sizes_histogram(sizes: list[int], max_buckets: int = 6) -> str:
@@ -931,7 +1308,8 @@ def launch_filter_interface(
                 print(f"[FilterGUI] Impossible d'appliquer l'icône ZeMosaic: {exc}")
         heavy_import_error: ImportError | None = None
         try:
-            import numpy as np
+            global np
+            import numpy as np  # type: ignore
             from astropy.coordinates import SkyCoord
             from astropy.io import fits
             from astropy.wcs import WCS
@@ -1284,45 +1662,6 @@ def launch_filter_interface(
                         except Exception:
                             pass
                         yield str(candidate)
-
-        def _compute_footprint_from_wcs(
-            wcs_obj: Any,
-            shape_hw: Optional[tuple[int, int]] = None,
-        ) -> Optional[list[tuple[float, float]]]:
-            if wcs_obj is None or not getattr(wcs_obj, "is_celestial", False):
-                return None
-            try:
-                if shape_hw is not None and len(shape_hw) >= 2:
-                    h, w = float(shape_hw[0]), float(shape_hw[1])
-                else:
-                    px_shape = getattr(wcs_obj, "pixel_shape", None)
-                    if px_shape and len(px_shape) >= 2:
-                        w = float(px_shape[0])
-                        h = float(px_shape[1])
-                    else:
-                        arr_shape = getattr(wcs_obj, "array_shape", None)
-                        if arr_shape and len(arr_shape) >= 2:
-                            h = float(arr_shape[0])
-                            w = float(arr_shape[1])
-                        else:
-                            return None
-                if h <= 1.0 or w <= 1.0:
-                    return None
-                corners = (
-                    (0.0, 0.0),
-                    (w - 1.0, 0.0),
-                    (w - 1.0, h - 1.0),
-                    (0.0, h - 1.0),
-                )
-                result: list[tuple[float, float]] = []
-                for x, y in corners:
-                    sky = wcs_obj.pixel_to_world(float(x), float(y))
-                    ra_v = float(sky.ra.to(u.deg).value)
-                    dec_v = float(sky.dec.to(u.deg).value)
-                    result.append((ra_v, dec_v))
-                return result
-            except Exception:
-                return None
 
         def _compute_position_angle_deg(
             wcs_obj: Any,
@@ -5909,6 +6248,31 @@ def launch_filter_interface(
                             break
                     min_cap_effective = max(1, min(min_cap_effective, cap_effective))
 
+                    hard_merge_threshold = DEFAULT_HARD_MERGE_THRESHOLD
+                    hard_merge_candidates: list[Any] = []
+                    if isinstance(overrides_state, dict):
+                        hard_merge_candidates.extend(
+                            [
+                                overrides_state.get("merge_threshold"),
+                                overrides_state.get("coverage_merge_threshold"),
+                            ]
+                        )
+                    if isinstance(combined_solver_settings, dict):
+                        hard_merge_candidates.extend(
+                            [
+                                combined_solver_settings.get("merge_threshold"),
+                                combined_solver_settings.get("coverage_merge_threshold"),
+                            ]
+                        )
+                    for candidate in hard_merge_candidates:
+                        try:
+                            val = int(candidate)
+                        except Exception:
+                            continue
+                        if val > 0:
+                            hard_merge_threshold = val
+                            break
+
                     if coverage_enabled:
                         start_msg = _tr_safe(
                             "log_covfirst_start",
@@ -6053,6 +6417,17 @@ def launch_filter_interface(
                         max_dispersion_deg=max_dispersion_limit,
                         log_fn=merge_log_fn,
                     )
+                    if coverage_enabled and hard_merge_threshold > 0:
+                        hard_merge_settings = {
+                            "merge_threshold": hard_merge_threshold,
+                            "cap": int(cap_effective),
+                            "overcap_pct": overcap_pct,
+                            "fov_scale": HARD_MERGE_FOV_SCALE,
+                        }
+                        try:
+                            final_groups = _apply_hard_merge(final_groups, hard_merge_settings, _log_async)
+                        except Exception as exc:
+                            _log_async(f"[HARD-MERGE] Unable to apply: {exc}", "DEBUG_DETAIL")
                     if coverage_enabled:
                         merge_msg = _tr_safe(
                             "log_covfirst_merge",
@@ -8632,7 +9007,12 @@ def launch_filter_interface(
         return raw_files_with_wcs, False, None
 
 
-__all__ = ["launch_filter_interface"]
+__all__ = [
+    "launch_filter_interface",
+    "_apply_hard_merge",
+    "DEFAULT_HARD_MERGE_THRESHOLD",
+    "HARD_MERGE_FOV_SCALE",
+]
 
 if __name__ == "__main__":
     # Minimal CLI to launch the filter window for a directory.

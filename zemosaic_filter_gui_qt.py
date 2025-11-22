@@ -266,11 +266,17 @@ try:  # pragma: no cover - optional dependency guard
         _merge_small_groups as _tk_merge_small_groups,
         _split_group_by_orientation as _tk_split_group_by_orientation,
         _circular_dispersion_deg as _tk_circular_dispersion_deg,
+        _apply_hard_merge as _tk_apply_hard_merge,
+        DEFAULT_HARD_MERGE_THRESHOLD as _tk_default_hard_merge_threshold,
+        HARD_MERGE_FOV_SCALE as _tk_hard_merge_fov_scale,
     )
 except Exception:  # pragma: no cover - helper fallback
     _tk_merge_small_groups = None  # type: ignore[assignment]
     _tk_split_group_by_orientation = None  # type: ignore[assignment]
     _tk_circular_dispersion_deg = None  # type: ignore[assignment]
+    _tk_apply_hard_merge = None  # type: ignore[assignment]
+    _tk_default_hard_merge_threshold = 10  # type: ignore[assignment]
+    _tk_hard_merge_fov_scale = 1.2  # type: ignore[assignment]
 
 if _tk_circular_dispersion_deg is None:  # pragma: no cover - fallback copy
     def _tk_circular_dispersion_deg(values: Iterable[float]) -> float:
@@ -839,7 +845,16 @@ def _iter_normalized_entries(
             wcs_cache=obj.get("wcs"),
         )
 
-    def _build_from_path(path_obj: Path) -> _NormalizedItem:
+    def _is_supported_fits(path_obj: Path) -> bool:
+        try:
+            suffix = path_obj.suffix.lower()
+        except Exception:
+            suffix = ""
+        return suffix in FITS_EXTENSIONS
+
+    def _build_from_path(path_obj: Path) -> _NormalizedItem | None:
+        if not _is_supported_fits(path_obj):
+            return None
         file_path = str(path_obj)
         display_name = path_obj.name or file_path
         include = not _should_exclude(path_obj)
@@ -866,19 +881,28 @@ def _iter_normalized_entries(
             pattern = "**/*" if scan_recursive else "*"
             for candidate in directory.glob(pattern):
                 if candidate.is_file():
+                    if not _is_supported_fits(candidate):
+                        continue
                     if _should_exclude(candidate):
                         continue
-                    yield _build_from_path(candidate)
+                    entry = _build_from_path(candidate)
+                    if entry is not None:
+                        yield entry
         elif Path(payload).is_file():
             candidate = Path(payload)
             if not _should_exclude(candidate):
-                yield _build_from_path(candidate)
+                entry = _build_from_path(candidate)
+                if entry is not None:
+                    yield entry
     elif isinstance(payload, Iterable):
         for element in payload:
             if isinstance(element, dict):
                 yield _build_from_mapping(element)
             elif isinstance(element, (str, os.PathLike)):
-                yield _build_from_path(Path(element))
+                path_obj = Path(element)
+                entry = _build_from_path(path_obj)
+                if entry is not None:
+                    yield entry
             else:
                 yield _NormalizedItem(
                     original=element,
@@ -1714,6 +1738,11 @@ class FilterQtDialog(QDialog):
             "#d63fb8",
             "#6ed63f",
         )
+        try:
+            base_dir = get_app_base_dir()
+        except Exception:
+            base_dir = Path.cwd()
+        self._log_file_path: Path | None = Path(base_dir) / "zemosaic_filter.log"
 
         self._preview_canvas = self._create_preview_canvas()
         self._activity_log_output: QPlainTextEdit | None = None
@@ -2607,50 +2636,78 @@ class FilterQtDialog(QDialog):
         if not auto_angle_triggered:
             self._update_orientation_override_value(angle_split_effective)
 
-        groups_after_autosplit = _AUTOSPLIT_GROUPS(
-            groups_used,
-            cap=int(max(1, cap_effective)),
-            min_cap=int(max(1, min_cap)),
-            progress_callback=None,
-        )
-        if coverage_enabled:
-            messages.append(
-                self._format_message(
-                    "log_covfirst_autosplit",
-                    "Autosplit applied: cap={CAP}, min_cap={MIN}, groups_in={IN}, groups_out={OUT}",
-                    CAP=int(cap_effective),
-                    MIN=int(min_cap),
-                    IN=len(groups_used),
-                    OUT=len(groups_after_autosplit),
-                )
+        groups_after_autosplit = groups_used
+        final_groups: list[list[dict[str, Any]]]
+        if cap_effective > 0:
+            groups_after_autosplit = _AUTOSPLIT_GROUPS(
+                groups_used,
+                cap=int(max(1, cap_effective)),
+                min_cap=int(max(1, min_cap)),
+                progress_callback=None,
             )
-
-        cap_allowance = max(int(cap_effective), int(cap_effective * (1 + overcap_pct / 100.0)))
-        max_dispersion = None
-        if _COMPUTE_MAX_SEPARATION is not None and threshold_used > 0:
-            max_dispersion = float(threshold_used) * 1.05
-
-        merge_fn = _tk_merge_small_groups or (
-            lambda groups, min_size, cap, **_: groups  # type: ignore[misc]
-        )
-        final_groups = merge_fn(
-            groups_after_autosplit,
-            min_size=int(max(1, min_cap)),
-            cap=int(max(1, cap_effective)),
-            cap_allowance=cap_allowance,
-            compute_dispersion=_COMPUTE_MAX_SEPARATION,
-            max_dispersion_deg=max_dispersion,
-            log_fn=messages.append,
-        )
-        if coverage_enabled:
-            messages.append(
-                self._format_message(
-                    "log_covfirst_merge",
-                    "Merged small groups with over-cap allowance={ALLOW}%, final_groups={N}",
-                    ALLOW=int(overcap_pct),
-                    N=len(final_groups),
+            if coverage_enabled:
+                messages.append(
+                    self._format_message(
+                        "log_covfirst_autosplit",
+                        "Autosplit applied: cap={CAP}, min_cap={MIN}, groups_in={IN}, groups_out={OUT}",
+                        CAP=int(cap_effective),
+                        MIN=int(min_cap),
+                        IN=len(groups_used),
+                        OUT=len(groups_after_autosplit),
+                    )
                 )
+
+            cap_allowance = max(int(cap_effective), int(cap_effective * (1 + overcap_pct / 100.0)))
+            max_dispersion = None
+            if _COMPUTE_MAX_SEPARATION is not None and threshold_used > 0:
+                max_dispersion = float(threshold_used) * 1.05
+
+            merge_fn = _tk_merge_small_groups or (
+                lambda groups, min_size, cap, **_: groups  # type: ignore[misc]
             )
+            final_groups = merge_fn(
+                groups_after_autosplit,
+                min_size=int(max(1, min_cap)),
+                cap=int(max(1, cap_effective)),
+                cap_allowance=cap_allowance,
+                compute_dispersion=_COMPUTE_MAX_SEPARATION,
+                max_dispersion_deg=max_dispersion,
+                log_fn=messages.append,
+            )
+            if coverage_enabled:
+                messages.append(
+                    self._format_message(
+                        "log_covfirst_merge",
+                        "Merged small groups with over-cap allowance={ALLOW}%, final_groups={N}",
+                        ALLOW=int(overcap_pct),
+                        N=len(final_groups),
+                    )
+                )
+        else:
+            if coverage_enabled:
+                messages.append(
+                    self._format_message(
+                        "log_covfirst_autosplit_unlimited",
+                        "Autosplit skipped: cap=0 (unlimited), groups_in={IN}",
+                        IN=len(groups_used),
+                    )
+                )
+            final_groups = groups_after_autosplit
+
+        hard_merge_fn = _tk_apply_hard_merge
+        if coverage_enabled and hard_merge_fn is not None:
+            hard_merge_threshold = self._resolve_hard_merge_threshold()
+            if hard_merge_threshold > 0:
+                settings_payload = {
+                    "merge_threshold": hard_merge_threshold,
+                    "cap": int(cap_effective),
+                    "overcap_pct": int(overcap_pct),
+                    "fov_scale": _tk_hard_merge_fov_scale,
+                }
+                try:
+                    final_groups = hard_merge_fn(final_groups, settings_payload, messages.append)
+                except Exception as exc:
+                    messages.append(f"[HARD-MERGE] Unable to apply: {exc}")
 
         for group in final_groups:
             for info in group:
@@ -3331,9 +3388,32 @@ class FilterQtDialog(QDialog):
             except Exception:
                 return None
             return parsed
+        def _has_explicit_value(source: Any) -> bool:
+            if not isinstance(source, dict):
+                return False
+            if "max_raw_per_master_tile" not in source:
+                return False
+            value = source.get("max_raw_per_master_tile")
+            if value is None:
+                return False
+            if isinstance(value, str) and not value.strip():
+                return False
+            return True
 
-        base_cap = _coerce_int(self._config_value("max_raw_per_master_tile", 50)) or 50
-        cap_effective = max(1, min(50, base_cap))
+        default_cap = 50
+        base_cap_raw = _coerce_int(self._config_value("max_raw_per_master_tile", default_cap))
+        explicit_config_value = any(
+            _has_explicit_value(source)
+            for source in (self._runtime_overrides, self._config_overrides, self._initial_overrides)
+        )
+        if base_cap_raw is None:
+            cap_effective = default_cap
+        elif base_cap_raw > 0:
+            cap_effective = base_cap_raw
+        elif explicit_config_value:
+            cap_effective = 0  # 0 => unlimited cap enforced by the Filter Qt
+        else:
+            cap_effective = default_cap
         cap_candidates = (
             self._safe_lookup(self._solver_settings, "max_raw_per_master_tile"),
             self._safe_lookup(self._runtime_overrides, "max_raw_per_master_tile"),
@@ -3342,12 +3422,22 @@ class FilterQtDialog(QDialog):
         )
         for candidate in cap_candidates:
             value = _coerce_int(candidate)
-            if value and value > 0:
-                cap_effective = max(1, min(50, value))
+            if value is None:
+                continue
+            if value <= 0:
+                cap_effective = 0
                 break
+            cap_effective = value
+            break
 
-        default_min = _coerce_int(self._config_value("autosplit_min_cap", min(8, cap_effective)))
-        min_cap_effective = default_min if default_min and default_min > 0 else min(8, cap_effective)
+        base_min_guess = min(8, cap_effective) if cap_effective > 0 else 0
+        default_min = _coerce_int(self._config_value("autosplit_min_cap", base_min_guess))
+        if cap_effective > 0:
+            min_cap_effective = (
+                max(1, min(default_min, cap_effective)) if default_min and default_min > 0 else base_min_guess
+            )
+        else:
+            min_cap_effective = max(0, default_min) if default_min is not None else 0
         min_candidates = (
             self._safe_lookup(self._solver_settings, "autosplit_min_cap"),
             self._safe_lookup(self._runtime_overrides, "autosplit_min_cap"),
@@ -3356,12 +3446,42 @@ class FilterQtDialog(QDialog):
         )
         for candidate in min_candidates:
             value = _coerce_int(candidate)
-            if value and value > 0:
+            if value is None:
+                continue
+            if cap_effective > 0 and value > 0:
                 min_cap_effective = max(1, min(value, cap_effective))
                 break
+            if cap_effective == 0:
+                min_cap_effective = max(0, value)
+                break
 
-        min_cap_effective = max(1, min(min_cap_effective, cap_effective))
+        if cap_effective > 0:
+            min_cap_effective = max(1, min(min_cap_effective, cap_effective))
+        else:
+            min_cap_effective = max(0, min_cap_effective)
+        # When cap_effective == 0 the Filter Qt does not impose a split cap.
         return cap_effective, min_cap_effective
+
+    def _resolve_hard_merge_threshold(self) -> int:
+        candidates = (
+            self._safe_lookup(self._runtime_overrides, "merge_threshold"),
+            self._safe_lookup(self._config_overrides, "merge_threshold"),
+            self._safe_lookup(self._initial_overrides, "merge_threshold"),
+            self._safe_lookup(self._solver_settings, "merge_threshold"),
+            self._safe_lookup(self._runtime_overrides, "coverage_merge_threshold"),
+            self._safe_lookup(self._config_overrides, "coverage_merge_threshold"),
+            self._safe_lookup(self._initial_overrides, "coverage_merge_threshold"),
+            self._safe_lookup(self._solver_settings, "coverage_merge_threshold"),
+            self._safe_lookup(self._solver_settings, "hard_merge_threshold"),
+        )
+        for candidate in candidates:
+            try:
+                value = int(candidate)
+            except Exception:
+                continue
+            if value > 0:
+                return value
+        return int(getattr(self, "_default_hard_merge_threshold", _tk_default_hard_merge_threshold))
 
     def _resolve_overcap_percent(self) -> int:
         value = getattr(self, "_overcap_percent_value", None)
@@ -4713,6 +4833,14 @@ class FilterQtDialog(QDialog):
             print(formatted)
         except Exception:
             pass
+        log_path = getattr(self, "_log_file_path", None)
+        if isinstance(log_path, Path):
+            try:
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                with log_path.open("a", encoding="utf-8") as fh:
+                    fh.write(formatted + "\n")
+            except Exception:
+                pass
         try:
             log_method = getattr(logger, level_upper.lower(), logger.info)
         except Exception:

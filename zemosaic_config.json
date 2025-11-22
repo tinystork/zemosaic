@@ -38,6 +38,8 @@
     "radial_feather_fraction": 0.8,
     "radial_shape_power": 2.0,
     "use_gpu_phase5": true,
+    "enable_tile_weighting": true,
+    "tile_weight_mode": "n_frames",
     "gpu_id_phase5": 0,
     "gpu_selector": "NVIDIA GeForce RTX 3070 Laptop GPU",
     "final_assembly_method": "reproject_coadd",
