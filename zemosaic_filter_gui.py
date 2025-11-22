@@ -345,16 +345,8 @@ def _apply_hard_merge(
         _get_setting("max_raw_per_master_tile"),
     )
     cap_value = _coerce_int(cap_candidate, 0)
-    if cap_value <= 0:
-        max_group_size = 0
-        for grp in groups:
-            grp_len = len(grp) if isinstance(grp, list) else 0
-            if grp_len > max_group_size:
-                max_group_size = grp_len
-        if max_group_size <= 0:
-            max_group_size = merge_threshold
-        cap_value = max(merge_threshold, max_group_size)
     if cap_value <= 0 or merge_threshold <= 0:
+        _emit("[HARD-MERGE] Skip: cap is 0/unset, preserving existing groups", "DEBUG_DETAIL")
         return groups
 
     overcap_fraction = _coerce_fraction(
