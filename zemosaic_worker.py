@@ -5906,6 +5906,12 @@ def run_poststack_anchor_review(
 
 
 # --- Helpers for RAM budget enforcement during stacking ---
+_MASTER_TILE_SAFETY_FRACTION = 0.55
+_MASTER_TILE_MEM_OVERHEAD = 3.2
+_MASTER_TILE_HEAVY_FRAME_THRESHOLD = 1024
+_MASTER_TILE_MIN_MEM_BUDGET_MB = 256
+_MASTER_TILE_WINSOR_SAFETY = 0.85
+_MASTER_TILE_FATAL_OVERSUB_FACTOR = 1.35
 def _extract_hw_from_info(raw_info: dict) -> tuple[int, int]:
     """Return (H, W) dimensions inferred from cached metadata."""
 
@@ -5971,6 +5977,123 @@ def _estimate_group_memory_bytes(group: list[dict]) -> tuple[int, int, int, int]
     per_frame_bytes = int(max_h) * int(max_w) * 4
     total_bytes = per_frame_bytes * len(group)
     return total_bytes, per_frame_bytes, max_h, max_w
+
+
+def _plan_master_tile_ram_usage(
+    group: list[dict],
+    *,
+    safety_fraction: float = _MASTER_TILE_SAFETY_FRACTION,
+    overhead_factor: float = _MASTER_TILE_MEM_OVERHEAD,
+    fallback_bytes_per_pixel: int = 4,
+) -> dict:
+    """Return a dict describing the predicted RAM usage for a master tile."""
+
+    plan: dict[str, object] = {
+        "num_frames": len(group) if group else 0,
+        "per_frame_bytes": 0,
+        "total_bytes": 0,
+        "predicted_peak_bytes": 0,
+        "safe_budget_bytes": 0,
+        "available_bytes": 0,
+        "estimation_source": "unknown",
+        "would_exceed_budget": False,
+        "forced_frames_per_pass": 0,
+        "max_height": 0,
+        "max_width": 0,
+    }
+
+    if not group:
+        return plan
+
+    try:
+        safety_fraction = float(safety_fraction)
+    except Exception:
+        safety_fraction = _MASTER_TILE_SAFETY_FRACTION
+    safety_fraction = max(0.05, min(0.95, safety_fraction))
+
+    try:
+        overhead_factor = float(overhead_factor)
+    except Exception:
+        overhead_factor = _MASTER_TILE_MEM_OVERHEAD
+    overhead_factor = max(1.0, min(6.0, overhead_factor))
+
+    total_bytes, per_frame_bytes, max_h, max_w = _estimate_group_memory_bytes(group)
+    plan["max_height"] = max_h
+    plan["max_width"] = max_w
+
+    estimation_source = "metadata" if per_frame_bytes > 0 else "unknown"
+
+    if per_frame_bytes <= 0:
+        sample_path = None
+        for entry in group:
+            candidate = entry.get("path_preprocessed_cache") if isinstance(entry, dict) else None
+            if candidate and _path_exists(candidate):
+                sample_path = candidate
+                break
+        if sample_path:
+            try:
+                with _CACHE_IO_SEMAPHORE:
+                    sample_arr = np.load(sample_path, allow_pickle=False, mmap_mode='r')
+                per_frame_bytes = int(np.prod(sample_arr.shape) * sample_arr.dtype.itemsize)
+                total_bytes = per_frame_bytes * len(group)
+                estimation_source = "cache_sample"
+            except Exception:
+                per_frame_bytes = 0
+            finally:
+                try:
+                    del sample_arr
+                except UnboundLocalError:
+                    pass
+                gc.collect()
+
+    if per_frame_bytes <= 0:
+        if max_h > 0 and max_w > 0:
+            per_frame_bytes = max_h * max_w * max(1, int(fallback_bytes_per_pixel))
+            estimation_source = "metadata_fallback"
+        else:
+            # Conservative 9MP RGB float32 fallback
+            per_frame_bytes = 3000 * 3000 * 3 * max(1, int(fallback_bytes_per_pixel))
+            estimation_source = "fallback_9mp"
+        total_bytes = per_frame_bytes * len(group)
+
+    plan["per_frame_bytes"] = int(per_frame_bytes)
+    plan["total_bytes"] = int(total_bytes)
+    plan["estimation_source"] = estimation_source
+    plan["overhead_factor"] = overhead_factor
+    plan["safety_fraction"] = safety_fraction
+
+    available_bytes = 0
+    if psutil is not None:
+        try:
+            available_bytes = int(psutil.virtual_memory().available)
+        except Exception:
+            available_bytes = 0
+    plan["available_bytes"] = available_bytes
+
+    safe_budget_bytes = 0
+    if available_bytes > 0:
+        safe_budget_bytes = int(available_bytes * safety_fraction)
+        min_budget_bytes = int(_MASTER_TILE_MIN_MEM_BUDGET_MB * (1024 ** 2))
+        if safe_budget_bytes <= 0:
+            safe_budget_bytes = min(available_bytes, min_budget_bytes)
+        else:
+            safe_budget_bytes = min(available_bytes, max(safe_budget_bytes, min_budget_bytes))
+
+    plan["safe_budget_bytes"] = int(safe_budget_bytes)
+
+    predicted_peak_bytes = int(total_bytes * overhead_factor) if total_bytes > 0 else 0
+    plan["predicted_peak_bytes"] = predicted_peak_bytes
+
+    if safe_budget_bytes > 0 and predicted_peak_bytes > safe_budget_bytes:
+        plan["would_exceed_budget"] = True
+
+    forced_frames_per_pass = 0
+    if per_frame_bytes > 0 and safe_budget_bytes > 0:
+        denom = max(1, int(per_frame_bytes * overhead_factor * _MASTER_TILE_WINSOR_SAFETY))
+        forced_frames_per_pass = max(1, safe_budget_bytes // denom)
+    plan["forced_frames_per_pass"] = int(forced_frames_per_pass)
+
+    return plan
 
 
 def _split_group_temporally(group: list[dict], segment_size: int) -> list[list[dict]]:
@@ -9275,6 +9398,272 @@ def create_master_tile(
         pcb_tile(f"{func_id_log_base}_error_invalid_ref_wcs_header", prog=None, lvl="ERROR", tile_id=tile_id)
         return (None, None), failed_groups_to_retry
     
+    def _plan_bytes_to_mb(value) -> float:
+        try:
+            return round(float(value) / (1024 * 1024), 1)
+        except Exception:
+            return 0.0
+
+    ph3_cache_slot_acquired = False
+    ph3_postalign_slot_acquired = False
+
+    def _release_ph3_cache_slot() -> None:
+        nonlocal ph3_cache_slot_acquired
+        if not ph3_cache_slot_acquired:
+            return
+        try:
+            _PH3_CONCURRENCY_SEMAPHORE.release()
+        except Exception:
+            pass
+        ph3_cache_slot_acquired = False
+
+    def _release_ph3_postalign_slot() -> None:
+        nonlocal ph3_postalign_slot_acquired
+        if not ph3_postalign_slot_acquired:
+            return
+        try:
+            _PH3_CONCURRENCY_SEMAPHORE.release()
+        except Exception:
+            pass
+        ph3_postalign_slot_acquired = False
+
+    def _load_cached_image(raw_file_info: dict) -> np.ndarray | None:
+        """Load and validate a cached preprocessed image for this tile."""
+
+        cached_image_file_path = raw_file_info.get('path_preprocessed_cache')
+        original_raw_path = raw_file_info.get('path_raw', 'UnknownRawPathForTileImg')
+
+        if not (cached_image_file_path and _path_exists(cached_image_file_path)):
+            pcb_tile(
+                f"{func_id_log_base}_warn_cache_file_missing",
+                prog=None,
+                lvl="WARN",
+                filename=_safe_basename(original_raw_path),
+                cache_path=cached_image_file_path,
+                tile_id=tile_id,
+            )
+            return None
+
+        try:
+            with _CACHE_IO_SEMAPHORE:
+                img_data_adu = np.load(cached_image_file_path, allow_pickle=False, mmap_mode='r')
+        except MemoryError as e_mem_load_cache:
+            pcb_tile(
+                f"{func_id_log_base}_error_memory_loading_cache",
+                prog=None,
+                lvl="ERROR",
+                filename=_safe_basename(cached_image_file_path),
+                error=str(e_mem_load_cache),
+                tile_id=tile_id,
+            )
+            raise
+        except Exception as e_load_cache:
+            pcb_tile(
+                f"{func_id_log_base}_error_loading_cache",
+                prog=None,
+                lvl="ERROR",
+                filename=_safe_basename(cached_image_file_path),
+                error=str(e_load_cache),
+                tile_id=tile_id,
+            )
+            logger.error(f"Erreur chargement cache {cached_image_file_path} pour tuile {tile_id}", exc_info=True)
+            return None
+
+        if not (
+            isinstance(img_data_adu, np.ndarray)
+            and img_data_adu.dtype == np.float32
+            and img_data_adu.ndim == 3
+            and img_data_adu.shape[-1] == 3
+        ):
+            pcb_tile(
+                f"{func_id_log_base}_warn_invalid_cached_data",
+                prog=None,
+                lvl="WARN",
+                filename=_safe_basename(cached_image_file_path),
+                shape=img_data_adu.shape if hasattr(img_data_adu, 'shape') else 'N/A',
+                dtype=img_data_adu.dtype if hasattr(img_data_adu, 'dtype') else 'N/A',
+                tile_id=tile_id,
+            )
+            del img_data_adu
+            gc.collect()
+            return None
+
+        try:
+            img_data_adu = np.array(img_data_adu, dtype=np.float32, order='C', copy=True)
+        except Exception:
+            img_data_adu = np.ascontiguousarray(img_data_adu, dtype=np.float32)
+
+        return img_data_adu
+
+    ram_plan = _plan_master_tile_ram_usage(seestar_stack_group_info)
+    try:
+        setattr(zconfig, "mastertile_ram_plan", ram_plan)
+    except Exception:
+        pass
+
+    configured_threshold = getattr(zconfig, "stack_heavy_tile_frame_threshold", None)
+    if configured_threshold is None:
+        configured_threshold = getattr(zconfig, "heavy_tile_frame_threshold", None)
+    try:
+        heavy_frame_threshold = max(0, int(configured_threshold))
+    except Exception:
+        heavy_frame_threshold = _MASTER_TILE_HEAVY_FRAME_THRESHOLD
+
+    is_heavy_tile = False
+    heavy_tile_reason: str | None = None
+    num_frames_plan = int(ram_plan.get("num_frames") or len(seestar_stack_group_info))
+    if heavy_frame_threshold and num_frames_plan >= heavy_frame_threshold:
+        is_heavy_tile = True
+        heavy_tile_reason = f"frame_threshold_{heavy_frame_threshold}"
+    if not is_heavy_tile and ram_plan.get("would_exceed_budget"):
+        is_heavy_tile = True
+        heavy_tile_reason = "predicted_peak_exceeds_budget"
+    if not is_heavy_tile and num_frames_plan >= (_MASTER_TILE_HEAVY_FRAME_THRESHOLD * 2):
+        # Secondary guardrail when the config threshold is very high.
+        is_heavy_tile = True
+        heavy_tile_reason = "failsafe_frame_threshold"
+
+    ram_plan["tile_mode"] = "heavy" if is_heavy_tile else "normal"  # type: ignore[index]
+    ram_plan["tile_id"] = tile_id  # type: ignore[index]
+    ram_plan["heavy_reason"] = heavy_tile_reason or "normal"  # type: ignore[index]
+
+    forced_frames_cap = int(ram_plan.get("forced_frames_per_pass") or 0) if is_heavy_tile else 0
+
+    try:
+        pcb_tile(
+            f"{func_id_log_base}_ram_plan",
+            prog=None,
+            lvl="INFO_DETAIL",
+            tile_id=tile_id,
+            num_raw=num_frames_plan,
+            per_frame_mb=_plan_bytes_to_mb(ram_plan.get("per_frame_bytes")),
+            predicted_peak_mb=_plan_bytes_to_mb(ram_plan.get("predicted_peak_bytes")),
+            safe_budget_mb=_plan_bytes_to_mb(ram_plan.get("safe_budget_bytes")),
+            available_mb=_plan_bytes_to_mb(ram_plan.get("available_bytes")),
+            mode="heavy" if is_heavy_tile else "normal",
+            heavy_reason=heavy_tile_reason or "normal",
+            forced_frames_per_pass=forced_frames_cap,
+            estimation_source=ram_plan.get("estimation_source"),
+            )
+    except Exception:
+        pass
+
+    if is_heavy_tile:
+        safe_budget_mb = _plan_bytes_to_mb(ram_plan.get("safe_budget_bytes"))
+        try:
+            current_flag = getattr(zconfig, "stack_memmap_enabled")
+        except Exception:
+            current_flag = None
+        if not current_flag:
+            try:
+                setattr(zconfig, "stack_memmap_enabled", True)
+            except Exception:
+                pass
+        if safe_budget_mb > 0:
+            try:
+                setattr(zconfig, "stack_memmap_budget_mb", float(safe_budget_mb))
+            except Exception:
+                pass
+        try:
+            setattr(zconfig, "mastertile_heavy_tile", True)
+        except Exception:
+            pass
+    else:
+        try:
+            setattr(zconfig, "mastertile_heavy_tile", False)
+        except Exception:
+            pass
+
+    if forced_frames_cap > 0:
+        try:
+            configured_max_pass = getattr(zconfig, "winsor_max_frames_per_pass")
+            configured_max_pass = int(configured_max_pass)
+        except Exception:
+            configured_max_pass = 0
+        if configured_max_pass <= 0 or forced_frames_cap < configured_max_pass:
+            try:
+                setattr(zconfig, "winsor_max_frames_per_pass", forced_frames_cap)
+            except Exception:
+                pass
+        if winsor_max_frames_per_pass is None or winsor_max_frames_per_pass <= 0:
+            winsor_max_frames_per_pass = forced_frames_cap
+        else:
+            winsor_max_frames_per_pass = min(int(winsor_max_frames_per_pass), forced_frames_cap)
+    else:
+        forced_frames_cap = 0
+
+    predicted_peak_bytes = int(ram_plan.get("predicted_peak_bytes") or 0)
+    available_bytes_plan = int(ram_plan.get("available_bytes") or 0)
+    safe_budget_bytes_plan = int(ram_plan.get("safe_budget_bytes") or 0)
+    fatal_ratio_cfg = getattr(zconfig, "mastertile_abort_memory_ratio", None)
+    try:
+        fatal_ratio = float(fatal_ratio_cfg)
+    except Exception:
+        fatal_ratio = _MASTER_TILE_FATAL_OVERSUB_FACTOR
+    fatal_ratio = max(1.05, min(20.0, float(fatal_ratio)))
+
+    tile_memory_fatal = False
+    fatal_reason = None
+    if available_bytes_plan > 0 and predicted_peak_bytes > 0:
+        fatal_limit = available_bytes_plan * fatal_ratio
+        if predicted_peak_bytes >= fatal_limit:
+            tile_memory_fatal = True
+            fatal_reason = "predicted_vs_available"
+    if (
+        not tile_memory_fatal
+        and is_heavy_tile
+        and forced_frames_cap <= 0
+        and ram_plan.get("would_exceed_budget")
+    ):
+        tile_memory_fatal = True
+        fatal_reason = fatal_reason or "no_streaming_budget"
+
+    if tile_memory_fatal:
+        pcb_tile(
+            "mastertile_error_tile_too_large_for_available_ram",
+            prog=None,
+            lvl="ERROR",
+            tile_id=tile_id,
+            predicted_peak_mb=_plan_bytes_to_mb(predicted_peak_bytes),
+            available_mb=_plan_bytes_to_mb(available_bytes_plan),
+            safe_budget_mb=_plan_bytes_to_mb(safe_budget_bytes_plan),
+            heavy_reason=fatal_reason or heavy_tile_reason or "unknown",
+            suggestion="Reduce raws per tile or increase RAM/pagefile",
+        )
+        return (None, None), failed_groups_to_retry
+
+    streaming_supported = False
+    streaming_disable_reason: str | None = None
+    weight_method_lower = (str(stack_weight_method or "").strip().lower())
+    if is_heavy_tile and forced_frames_cap > 0 and stack_reject_algo.strip().lower() == "winsorized_sigma_clip":
+        if weight_method_lower not in {"", "none"}:
+            streaming_disable_reason = f"weight_method_{weight_method_lower}"
+        else:
+            streaming_supported = True
+    elif is_heavy_tile and forced_frames_cap <= 0:
+        streaming_disable_reason = "no_forced_cap"
+    elif is_heavy_tile and stack_reject_algo.strip().lower() != "winsorized_sigma_clip":
+        streaming_disable_reason = f"reject_algo_{stack_reject_algo}"
+
+    ram_plan["streaming_supported"] = streaming_supported  # type: ignore[index]
+    ram_plan["streaming_disable_reason"] = streaming_disable_reason  # type: ignore[index]
+    use_streaming_tile = streaming_supported
+    if use_streaming_tile:
+        pcb_tile(
+            f"{func_id_log_base}_streaming_mode_enabled",
+            prog=None,
+            lvl="INFO",
+            tile_id=tile_id,
+            chunk_limit=forced_frames_cap,
+        )
+    elif is_heavy_tile and streaming_disable_reason:
+        pcb_tile(
+            f"{func_id_log_base}_streaming_mode_disabled",
+            prog=None,
+            lvl="INFO_DETAIL",
+            tile_id=tile_id,
+            reason=streaming_disable_reason,
+        )
     # Conversion du dict en objet astropy.io.fits.Header pour la sauvegarde
     header_for_master_tile_base = fits.Header(header_dict_for_master_tile_base.cards if hasattr(header_dict_for_master_tile_base,'cards') else header_dict_for_master_tile_base)
     
@@ -9285,220 +9674,377 @@ def create_master_tile(
     # when the system is busy (e.g., another app reading video files).
     try:
         _PH3_CONCURRENCY_SEMAPHORE.acquire()
+        ph3_cache_slot_acquired = True
     except Exception:
-        pass
+        ph3_cache_slot_acquired = False
 
-    pcb_tile(f"{func_id_log_base}_info_loading_from_cache_started", prog=None, lvl="DEBUG_DETAIL", num_images=len(seestar_stack_group_info), tile_id=tile_id)
-    
-    tile_images_data_HWC_adu = []
-    tile_original_raw_headers = [] # Liste des dictionnaires de header originaux
+    tile_original_raw_headers: list[Any] = []
+    stack_ready_frames: list[np.ndarray] | None = None
+    streaming_master_tile: np.ndarray | None = None
+    streaming_ingested_frames = 0
 
-    for i, raw_file_info in enumerate(seestar_stack_group_info):
-        cached_image_file_path = raw_file_info.get('path_preprocessed_cache')
-        original_raw_path = raw_file_info.get('path_raw', 'UnknownRawPathForTileImg') # Plus descriptif
-
-        if not (cached_image_file_path and _path_exists(cached_image_file_path)):
-            pcb_tile(f"{func_id_log_base}_warn_cache_file_missing", prog=None, lvl="WARN", filename=_safe_basename(original_raw_path), cache_path=cached_image_file_path, tile_id=tile_id)
-            continue
-        
-        # pcb_tile(f"    {func_id_log_base}_{tile_id}_Img{i}: Lecture cache '{_safe_basename(cached_image_file_path)}'", prog=None, lvl="DEBUG_VERY_DETAIL")
-        
-        try:
-            # Throttle concurrent cache reads and use memory-mapped load to reduce RAM spikes
-            with _CACHE_IO_SEMAPHORE:
-                img_data_adu = np.load(cached_image_file_path, allow_pickle=False, mmap_mode='r') 
-            if not (isinstance(img_data_adu, np.ndarray) and img_data_adu.dtype == np.float32 and img_data_adu.ndim == 3 and img_data_adu.shape[-1] == 3):
-                pcb_tile(f"{func_id_log_base}_warn_invalid_cached_data", prog=None, lvl="WARN", filename=_safe_basename(cached_image_file_path), 
-                         shape=img_data_adu.shape if hasattr(img_data_adu, 'shape') else 'N/A', 
-                         dtype=img_data_adu.dtype if hasattr(img_data_adu, 'dtype') else 'N/A', tile_id=tile_id)
-                del img_data_adu; gc.collect(); continue
-            # Assurer des buffers C-contigus ET écriturables pour l'aligneur
-            # (les memmaps en lecture seule peuvent provoquer des échecs silencieux)
-            try:
-                img_data_adu = np.array(img_data_adu, dtype=np.float32, order='C', copy=True)
-            except Exception:
-                # En cas d'exception, forcer une copie contiguë
-                img_data_adu = np.ascontiguousarray(img_data_adu, dtype=np.float32)
-            
-            tile_images_data_HWC_adu.append(img_data_adu)
-            # Stocker le dict de header, pas l'objet fits.Header, car c'est ce qui est dans raw_file_info
-            tile_original_raw_headers.append(raw_file_info.get('header')) 
-        except MemoryError as e_mem_load_cache:
-             pcb_tile(f"{func_id_log_base}_error_memory_loading_cache", prog=None, lvl="ERROR", filename=_safe_basename(cached_image_file_path), error=str(e_mem_load_cache), tile_id=tile_id)
-             # Release the concurrency slot before aborting
-             try:
-                 _PH3_CONCURRENCY_SEMAPHORE.release()
-             except Exception:
-                 pass
-             del tile_images_data_HWC_adu, tile_original_raw_headers; gc.collect(); return (None, None), failed_groups_to_retry
-        except Exception as e_load_cache:
-            pcb_tile(f"{func_id_log_base}_error_loading_cache", prog=None, lvl="ERROR", filename=_safe_basename(cached_image_file_path), error=str(e_load_cache), tile_id=tile_id)
-            logger.error(f"Erreur chargement cache {cached_image_file_path} pour tuile {tile_id}", exc_info=True)
-            continue
-            
-    # Release the concurrency slot as soon as disk reads are done for this tile
-    try:
-        _PH3_CONCURRENCY_SEMAPHORE.release()
-    except Exception:
-        pass
-
-    if not tile_images_data_HWC_adu:
-        pcb_tile(f"{func_id_log_base}_error_no_valid_images_from_cache", prog=None, lvl="ERROR", tile_id=tile_id)
-        return (None, None), failed_groups_to_retry
-    # pcb_tile(f"{func_id_log_base}_info_loading_from_cache_finished", prog=None, lvl="DEBUG_DETAIL", num_loaded=len(tile_images_data_HWC_adu), tile_id=tile_id)
-
-    pcb_tile(f"{func_id_log_base}_info_intra_tile_alignment_started", prog=None, lvl="DEBUG_DETAIL", num_to_align=len(tile_images_data_HWC_adu), tile_id=tile_id)
-    # Limit concurrency during alignment/stacking as well to reduce peak RAM
-    try:
-        _PH3_CONCURRENCY_SEMAPHORE.acquire()
-    except Exception:
-        pass
-    aligned_images_for_stack, failed_alignment_indices = zemosaic_align_stack.align_images_in_group(
-        image_data_list=tile_images_data_HWC_adu,
-        reference_image_index=reference_image_index_in_group,
-        progress_callback=progress_callback
-    )
-    if failed_alignment_indices:
-        retry_group: list[dict] = []
-        for idx_fail in failed_alignment_indices:
-            if 0 <= idx_fail < len(seestar_stack_group_info):
-                raw_info = seestar_stack_group_info[idx_fail]
-                if isinstance(raw_info, dict):
-                    info_copy = dict(raw_info)
-                    current_retry = int(info_copy.get('retry_attempt', 0))
-                    info_copy['retry_attempt'] = current_retry + 1
-                    origin_chain = list(info_copy.get('retry_origin_chain', []))
-                    origin_chain.append(int(tile_id))
-                    info_copy['retry_origin_chain'] = origin_chain
-                else:
-                    info_copy = raw_info
+    def _queue_retry_from_infos(raw_infos: list[dict | Any]) -> None:
+        retry_group: list[dict | Any] = []
+        for raw_entry in raw_infos:
+            if raw_entry is None:
+                continue
+            if isinstance(raw_entry, dict):
+                info_copy = dict(raw_entry)
+                current_retry = int(info_copy.get('retry_attempt', 0))
+                info_copy['retry_attempt'] = current_retry + 1
+                origin_chain = list(info_copy.get('retry_origin_chain', []))
+                origin_chain.append(int(tile_id))
+                info_copy['retry_origin_chain'] = origin_chain
                 retry_group.append(info_copy)
+            else:
+                retry_group.append(raw_entry)
         if retry_group:
             failed_groups_to_retry.append(retry_group)
 
-    del tile_images_data_HWC_adu; gc.collect()
+    try:
+        pcb_tile(
+            f"{func_id_log_base}_info_loading_from_cache_started",
+            prog=None,
+            lvl="DEBUG_DETAIL",
+            num_images=len(seestar_stack_group_info),
+            tile_id=tile_id,
+        )
 
-    valid_aligned_images = [img for img in aligned_images_for_stack if img is not None]
-    if aligned_images_for_stack:
-        del aligned_images_for_stack # Libérer la liste originale après filtrage
+        if use_streaming_tile:
+            pcb_tile(
+                f"{func_id_log_base}_info_intra_tile_alignment_started",
+                prog=None,
+                lvl="DEBUG_DETAIL",
+                num_to_align=len(seestar_stack_group_info),
+                tile_id=tile_id,
+            )
+            try:
+                reference_frame_data = _load_cached_image(ref_info_for_tile)
+            except MemoryError:
+                return (None, None), failed_groups_to_retry
+            if reference_frame_data is None:
+                pcb_tile(f"{func_id_log_base}_error_no_valid_images_from_cache", prog=None, lvl="ERROR", tile_id=tile_id)
+                return (None, None), failed_groups_to_retry
 
-    num_actually_aligned_for_header = len(valid_aligned_images)
-    pcb_tile(f"{func_id_log_base}_info_intra_tile_alignment_finished", prog=None, lvl="DEBUG_DETAIL", num_aligned=num_actually_aligned_for_header, tile_id=tile_id)
-    
-    if not valid_aligned_images: 
-        pcb_tile(f"{func_id_log_base}_error_no_images_after_alignment", prog=None, lvl="ERROR", tile_id=tile_id)
-        try:
-            _PH3_CONCURRENCY_SEMAPHORE.release()
-        except Exception:
-            pass
-        return (None, None), failed_groups_to_retry
-    
-    pcb_tile(f"{func_id_log_base}_info_stacking_started", prog=None, lvl="DEBUG_DETAIL",
-             num_to_stack=len(valid_aligned_images), tile_id=tile_id) # Les options sont loggées au début
+            streaming_chunk_limit = forced_frames_cap if forced_frames_cap > 0 else max(1, len(seestar_stack_group_info) // 32 or 1)
+            streaming_chunk_limit = max(1, streaming_chunk_limit)
+
+            streaming_state = zemosaic_align_stack.WinsorStreamingState.create(reference_frame_data.shape)
+
+            def _ingest_aligned_arrays(aligned_arrays: list[np.ndarray], raw_infos: list[dict]) -> None:
+                nonlocal streaming_state, streaming_ingested_frames
+                if not aligned_arrays:
+                    return
+                chunk = [np.asarray(arr, dtype=np.float32) for arr in aligned_arrays]
+                try:
+                    chunk_arr = np.stack(chunk, axis=0)
+                except Exception:
+                    return
+                streaming_state, _ = zemosaic_align_stack._reject_outliers_winsorized_sigma_clip(
+                    stacked_array_NHDWC=chunk_arr,
+                    winsor_limits_tuple=parsed_winsor_limits,
+                    sigma_low=stack_kappa_low,
+                    sigma_high=stack_kappa_high,
+                    progress_callback=progress_callback,
+                    max_workers=int(winsor_pool_workers) if winsor_pool_workers is not None else 1,
+                    apply_rewinsor=True,
+                    streaming_state=streaming_state,
+                )
+                streaming_ingested_frames += len(aligned_arrays)
+                for raw_info in raw_infos:
+                    tile_original_raw_headers.append(raw_info.get('header') if isinstance(raw_info, dict) else None)
+
+            _ingest_aligned_arrays([reference_frame_data], [ref_info_for_tile])
+
+            chunk_arrays: list[np.ndarray] = []
+            chunk_infos: list[tuple[int, dict]] = []
+
+            for global_idx, raw_file_info in enumerate(seestar_stack_group_info):
+                if global_idx == reference_image_index_in_group:
+                    continue
+                try:
+                    img_data_adu = _load_cached_image(raw_file_info)
+                except MemoryError:
+                    return (None, None), failed_groups_to_retry
+                if img_data_adu is None:
+                    continue
+                chunk_arrays.append(img_data_adu)
+                chunk_infos.append((global_idx, raw_file_info))
+                if len(chunk_arrays) >= streaming_chunk_limit:
+                    align_input = [reference_frame_data] + chunk_arrays
+                    aligned_chunk, failed_alignment_indices = zemosaic_align_stack.align_images_in_group(
+                        image_data_list=align_input,
+                        reference_image_index=0,
+                        progress_callback=progress_callback,
+                    )
+                    failed_local = {idx - 1 for idx in failed_alignment_indices if idx > 0}
+                    successful_arrays: list[np.ndarray] = []
+                    successful_infos: list[dict] = []
+                    retry_infos: list[dict] = []
+                    for local_idx, (_, raw_info) in enumerate(chunk_infos):
+                        if local_idx in failed_local:
+                            retry_infos.append(raw_info)
+                            continue
+                        aligned = aligned_chunk[local_idx + 1] if aligned_chunk else None
+                        if aligned is None:
+                            retry_infos.append(raw_info)
+                            continue
+                        successful_arrays.append(np.asarray(aligned, dtype=np.float32))
+                        successful_infos.append(raw_info)
+                    if successful_arrays:
+                        _ingest_aligned_arrays(successful_arrays, successful_infos)
+                    if retry_infos:
+                        _queue_retry_from_infos(retry_infos)
+                    chunk_arrays = []
+                    chunk_infos = []
+                    del aligned_chunk
+                    gc.collect()
+
+            if chunk_arrays:
+                align_input = [reference_frame_data] + chunk_arrays
+                aligned_chunk, failed_alignment_indices = zemosaic_align_stack.align_images_in_group(
+                    image_data_list=align_input,
+                    reference_image_index=0,
+                    progress_callback=progress_callback,
+                )
+                failed_local = {idx - 1 for idx in failed_alignment_indices if idx > 0}
+                successful_arrays = []
+                successful_infos = []
+                retry_infos: list[dict] = []
+                for local_idx, (_, raw_info) in enumerate(chunk_infos):
+                    if local_idx in failed_local:
+                        retry_infos.append(raw_info)
+                        continue
+                    aligned = aligned_chunk[local_idx + 1] if aligned_chunk else None
+                    if aligned is None:
+                        retry_infos.append(raw_info)
+                        continue
+                    successful_arrays.append(np.asarray(aligned, dtype=np.float32))
+                    successful_infos.append(raw_info)
+                if successful_arrays:
+                    _ingest_aligned_arrays(successful_arrays, successful_infos)
+                if retry_infos:
+                    _queue_retry_from_infos(retry_infos)
+                del aligned_chunk
+                chunk_arrays = []
+                chunk_infos = []
+                gc.collect()
+
+            del reference_frame_data
+            gc.collect()
+
+            if streaming_ingested_frames <= 0:
+                pcb_tile(f"{func_id_log_base}_error_no_images_after_alignment", prog=None, lvl="ERROR", tile_id=tile_id)
+                return (None, None), failed_groups_to_retry
+
+            stacked_stream, _ = streaming_state.finalize(use_weights=False)
+            streaming_master_tile = np.asarray(stacked_stream, dtype=np.float32)
+            num_actually_aligned_for_header = streaming_ingested_frames
+            pcb_tile(
+                f"{func_id_log_base}_info_intra_tile_alignment_finished",
+                prog=None,
+                lvl="DEBUG_DETAIL",
+                num_aligned=num_actually_aligned_for_header,
+                tile_id=tile_id,
+            )
+        else:
+            tile_images_data_HWC_adu: list[np.ndarray] = []
+            for raw_file_info in seestar_stack_group_info:
+                try:
+                    img_data_adu = _load_cached_image(raw_file_info)
+                except MemoryError:
+                    del tile_images_data_HWC_adu, tile_original_raw_headers
+                    gc.collect()
+                    return (None, None), failed_groups_to_retry
+                if img_data_adu is None:
+                    continue
+                tile_images_data_HWC_adu.append(img_data_adu)
+                tile_original_raw_headers.append(raw_file_info.get('header'))
+
+            if not tile_images_data_HWC_adu:
+                pcb_tile(f"{func_id_log_base}_error_no_valid_images_from_cache", prog=None, lvl="ERROR", tile_id=tile_id)
+                return (None, None), failed_groups_to_retry
+
+            pcb_tile(
+                f"{func_id_log_base}_info_intra_tile_alignment_started",
+                prog=None,
+                lvl="DEBUG_DETAIL",
+                num_to_align=len(tile_images_data_HWC_adu),
+                tile_id=tile_id,
+            )
+            _release_ph3_cache_slot()
+            try:
+                _PH3_CONCURRENCY_SEMAPHORE.acquire()
+                ph3_postalign_slot_acquired = True
+            except Exception:
+                ph3_postalign_slot_acquired = False
+        aligned_images_for_stack, failed_alignment_indices = zemosaic_align_stack.align_images_in_group(
+            image_data_list=tile_images_data_HWC_adu,
+            reference_image_index=reference_image_index_in_group,
+            progress_callback=progress_callback,
+        )
+        if failed_alignment_indices:
+            retry_group: list[dict] = []
+            for idx_fail in failed_alignment_indices:
+                if 0 <= idx_fail < len(seestar_stack_group_info):
+                    raw_info = seestar_stack_group_info[idx_fail]
+                    if isinstance(raw_info, dict):
+                        info_copy = dict(raw_info)
+                        current_retry = int(info_copy.get('retry_attempt', 0))
+                        info_copy['retry_attempt'] = current_retry + 1
+                        origin_chain = list(info_copy.get('retry_origin_chain', []))
+                        origin_chain.append(int(tile_id))
+                        info_copy['retry_origin_chain'] = origin_chain
+                    else:
+                        info_copy = raw_info
+                    retry_group.append(info_copy)
+            if retry_group:
+                failed_groups_to_retry.append(retry_group)
+
+        del tile_images_data_HWC_adu
+        gc.collect()
+
+        valid_aligned_images = [img for img in aligned_images_for_stack if img is not None]
+        if aligned_images_for_stack:
+            del aligned_images_for_stack
+        num_actually_aligned_for_header = len(valid_aligned_images)
+        pcb_tile(
+            f"{func_id_log_base}_info_intra_tile_alignment_finished",
+            prog=None,
+            lvl="DEBUG_DETAIL",
+            num_aligned=num_actually_aligned_for_header,
+            tile_id=tile_id,
+        )
+
+        if not valid_aligned_images:
+            pcb_tile(f"{func_id_log_base}_error_no_images_after_alignment", prog=None, lvl="ERROR", tile_id=tile_id)
+            _release_ph3_postalign_slot()
+            return (None, None), failed_groups_to_retry
+
+        stack_ready_frames = valid_aligned_images
+
+    finally:
+        _release_ph3_cache_slot()
+
+    pcb_tile(
+        f"{func_id_log_base}_info_stacking_started",
+        prog=None,
+        lvl="DEBUG_DETAIL",
+        num_to_stack=int(num_actually_aligned_for_header),
+        tile_id=tile_id,
+    )
 
     stack_metadata: dict[str, Any] = {}
-
+    master_tile_stacked_HWC: np.ndarray | None = None
     current_parallel_plan = parallel_plan or getattr(zconfig, "parallel_plan", None)
-    effective_winsor_frames_per_pass = int(winsor_max_frames_per_pass) if winsor_max_frames_per_pass is not None else 0
-    if effective_winsor_frames_per_pass < 0:
-        effective_winsor_frames_per_pass = 0
-    try:
-        sample_frame = valid_aligned_images[0] if valid_aligned_images else None
-        if sample_frame is not None:
-            per_frame_bytes = int(np.asarray(sample_frame).nbytes)
-            available_bytes = int(psutil.virtual_memory().available)
-            overhead = 3.2
-            target_fraction = 0.55
-            min_pass = max(1, int(getattr(zconfig, "winsor_min_frames_per_pass", 2)))
-            if per_frame_bytes > 0:
-                preemptive_limit = max(
-                    min_pass,
-                    int((available_bytes * target_fraction) // max(1, int(per_frame_bytes * overhead))),
-                )
-                if preemptive_limit < len(valid_aligned_images):
-                    if effective_winsor_frames_per_pass <= 0 or preemptive_limit < effective_winsor_frames_per_pass:
-                        effective_winsor_frames_per_pass = preemptive_limit
-                    try:
-                        setattr(zconfig, "stack_memmap_enabled", True)
-                    except Exception:
-                        pass
-                    try:
-                        pcb_tile(
-                            "stack_mem_preemptive_stream",
-                            prog=None,
-                            lvl="INFO_DETAIL",
-                            frames_per_pass=effective_winsor_frames_per_pass,
-                            tile_id=tile_id,
-                        )
-                    except Exception:
-                        pass
-    except Exception:
-        pass
 
-    if stack_reject_algo == "winsorized_sigma_clip":
-        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_winsorized_sigma_clip(
-            valid_aligned_images,
-            weight_method=stack_weight_method,
-            zconfig=zconfig,
-            kappa=stack_kappa_low,
-            winsor_limits=parsed_winsor_limits,
-            apply_rewinsor=True,
-            winsor_max_frames_per_pass=effective_winsor_frames_per_pass,
-            winsor_max_workers=int(winsor_pool_workers) if winsor_pool_workers is not None else 1,
-            stack_metadata=stack_metadata,
-            parallel_plan=current_parallel_plan,
-        )
-    elif stack_reject_algo == "kappa_sigma":
-        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_kappa_sigma_clip(
-            valid_aligned_images,
-            weight_method=stack_weight_method,
-            zconfig=zconfig,
-            sigma_low=stack_kappa_low,
-            sigma_high=stack_kappa_high,
-            stack_metadata=stack_metadata,
-            parallel_plan=current_parallel_plan,
-        )
-    elif stack_reject_algo == "linear_fit_clip":
-        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_linear_fit_clip(
-            valid_aligned_images,
-            weight_method=stack_weight_method,
-            zconfig=zconfig,
-            sigma=stack_kappa_high,
-            stack_metadata=stack_metadata,
-            parallel_plan=current_parallel_plan,
-        )
+    if streaming_master_tile is not None:
+        master_tile_stacked_HWC = streaming_master_tile
+        zemosaic_align_stack._poststack_rgb_equalization(master_tile_stacked_HWC, zconfig, stack_metadata)
     else:
-        master_tile_stacked_HWC = zemosaic_align_stack.stack_aligned_images(
-            aligned_image_data_list=valid_aligned_images,
-            normalize_method=stack_norm_method,
-            weighting_method=stack_weight_method,
-            rejection_algorithm=stack_reject_algo,
-            final_combine_method=stack_final_combine,
-            sigma_clip_low=stack_kappa_low,
-            sigma_clip_high=stack_kappa_high,
-            winsor_limits=parsed_winsor_limits,
-            minimum_signal_adu_target=0.0,
-            apply_radial_weight=apply_radial_weight,
-            radial_feather_fraction=radial_feather_fraction,
-            radial_shape_power=radial_shape_power,
-            winsor_max_workers=winsor_pool_workers,
-            progress_callback=progress_callback,
-            zconfig=zconfig,
-            stack_metadata=stack_metadata,
-            parallel_plan=current_parallel_plan,
-        )
-    
-    del valid_aligned_images; gc.collect() # valid_aligned_images a été passé par valeur (copie de la liste)
-                                          # mais les arrays NumPy à l'intérieur sont passés par référence.
-                                          # stack_aligned_images travaille sur ces arrays.
-                                          # Il est bon de del ici.
+        if not stack_ready_frames:
+            pcb_tile(f"{func_id_log_base}_error_no_images_after_alignment", prog=None, lvl="ERROR", tile_id=tile_id)
+            _release_ph3_postalign_slot()
+            return (None, None), failed_groups_to_retry
+
+        effective_winsor_frames_per_pass = int(winsor_max_frames_per_pass) if winsor_max_frames_per_pass is not None else 0
+        if effective_winsor_frames_per_pass < 0:
+            effective_winsor_frames_per_pass = 0
+        if forced_frames_cap > 0:
+            if effective_winsor_frames_per_pass <= 0 or forced_frames_cap < effective_winsor_frames_per_pass:
+                effective_winsor_frames_per_pass = forced_frames_cap
+        try:
+            sample_frame = stack_ready_frames[0] if stack_ready_frames else None
+            if sample_frame is not None:
+                per_frame_bytes = int(np.asarray(sample_frame).nbytes)
+                available_bytes = int(psutil.virtual_memory().available)
+                overhead = 3.2
+                target_fraction = 0.55
+                min_pass = max(1, int(getattr(zconfig, "winsor_min_frames_per_pass", 2)))
+                if per_frame_bytes > 0:
+                    preemptive_limit = max(
+                        min_pass,
+                        int((available_bytes * target_fraction) // max(1, int(per_frame_bytes * overhead))),
+                    )
+                    if preemptive_limit < len(stack_ready_frames):
+                        if effective_winsor_frames_per_pass <= 0 or preemptive_limit < effective_winsor_frames_per_pass:
+                            effective_winsor_frames_per_pass = preemptive_limit
+                        try:
+                            setattr(zconfig, "stack_memmap_enabled", True)
+                        except Exception:
+                            pass
+                        try:
+                            pcb_tile(
+                                "stack_mem_preemptive_stream",
+                                prog=None,
+                                lvl="INFO_DETAIL",
+                                frames_per_pass=effective_winsor_frames_per_pass,
+                                tile_id=tile_id,
+                            )
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+        if stack_reject_algo == "winsorized_sigma_clip":
+            master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_winsorized_sigma_clip(
+                stack_ready_frames,
+                weight_method=stack_weight_method,
+                zconfig=zconfig,
+                kappa=stack_kappa_low,
+                winsor_limits=parsed_winsor_limits,
+                apply_rewinsor=True,
+                winsor_max_frames_per_pass=effective_winsor_frames_per_pass,
+                winsor_max_workers=int(winsor_pool_workers) if winsor_pool_workers is not None else 1,
+                stack_metadata=stack_metadata,
+                parallel_plan=current_parallel_plan,
+            )
+        elif stack_reject_algo == "kappa_sigma":
+            master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_kappa_sigma_clip(
+                stack_ready_frames,
+                weight_method=stack_weight_method,
+                zconfig=zconfig,
+                sigma_low=stack_kappa_low,
+                sigma_high=stack_kappa_high,
+                stack_metadata=stack_metadata,
+                parallel_plan=current_parallel_plan,
+            )
+        elif stack_reject_algo == "linear_fit_clip":
+            master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_linear_fit_clip(
+                stack_ready_frames,
+                weight_method=stack_weight_method,
+                zconfig=zconfig,
+                sigma=stack_kappa_high,
+                stack_metadata=stack_metadata,
+                parallel_plan=current_parallel_plan,
+            )
+        else:
+            master_tile_stacked_HWC = zemosaic_align_stack.stack_aligned_images(
+                aligned_image_data_list=stack_ready_frames,
+                normalize_method=stack_norm_method,
+                weighting_method=stack_weight_method,
+                rejection_algorithm=stack_reject_algo,
+                final_combine_method=stack_final_combine,
+                sigma_clip_low=stack_kappa_low,
+                sigma_clip_high=stack_kappa_high,
+                winsor_limits=parsed_winsor_limits,
+                minimum_signal_adu_target=0.0,
+                apply_radial_weight=apply_radial_weight,
+                radial_feather_fraction=radial_feather_fraction,
+                radial_shape_power=radial_shape_power,
+                winsor_max_workers=winsor_pool_workers,
+                progress_callback=progress_callback,
+                zconfig=zconfig,
+                stack_metadata=stack_metadata,
+                parallel_plan=current_parallel_plan,
+            )
+
+        del stack_ready_frames
+        gc.collect()
 
     if master_tile_stacked_HWC is None:
         pcb_tile(f"{func_id_log_base}_error_stacking_failed", prog=None, lvl="ERROR", tile_id=tile_id)
-        try:
-            _PH3_CONCURRENCY_SEMAPHORE.release()
-        except Exception:
-            pass
+        _release_ph3_postalign_slot()
         return (None, None), failed_groups_to_retry
 
     pcb_tile(f"{func_id_log_base}_info_stacking_finished", prog=None, lvl="DEBUG_DETAIL", tile_id=tile_id,
@@ -9954,19 +10500,13 @@ def create_master_tile(
             filename=_safe_basename(final_tile_path or str(temp_fits_path)),
         )
         # pcb_tile(f"{func_id_log_base}_info_saving_finished", prog=None, lvl="DEBUG_DETAIL", tile_id=tile_id)
-        try:
-            _PH3_CONCURRENCY_SEMAPHORE.release()
-        except Exception:
-            pass
+        _release_ph3_postalign_slot()
         return (final_tile_path, final_wcs), failed_groups_to_retry
         
     except Exception as e_save_mt:
         pcb_tile(f"{func_id_log_base}_error_saving", prog=None, lvl="ERROR", tile_id=tile_id, error=str(e_save_mt))
         logger.error(f"Traceback pour {func_id_log_base}_{tile_id} sauvegarde:", exc_info=True)
-        try:
-            _PH3_CONCURRENCY_SEMAPHORE.release()
-        except Exception:
-            pass
+        _release_ph3_postalign_slot()
         return (None, None), failed_groups_to_retry
     finally:
         if 'master_tile_stacked_HWC' in locals() and master_tile_stacked_HWC is not None: 
