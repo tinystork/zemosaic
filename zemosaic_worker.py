@@ -6627,10 +6627,10 @@ def _run_shared_phase45_phase5_pipeline(
     base_progress_phase5 = float(phase5_options.get("base_progress") or current_global_progress)
     progress_weight_phase5 = float(phase5_options.get("progress_weight") or 0.0)
     USE_INCREMENTAL_ASSEMBLY = str(phase5_options.get("final_assembly_method") or "").lower() == "incremental"
-    apply_master_tile_crop_config = bool(phase5_options.get("apply_master_tile_crop"))
+    apply_master_tile_crop_config = False
     quality_crop_enabled_config = bool(phase5_options.get("quality_crop_enabled"))
-    apply_crop_for_assembly = bool(apply_master_tile_crop_config and not quality_crop_enabled_config)
-    master_tile_crop_percent_config = float(phase5_options.get("master_tile_crop_percent") or 0.0)
+    apply_crop_for_assembly = False
+    master_tile_crop_percent_config = 0.0
     intertile_match_flag = bool(phase5_options.get("intertile_match_flag"))
     match_background_flag = bool(phase5_options.get("match_background_flag"))
     feather_parity_flag = bool(phase5_options.get("feather_parity_flag"))
@@ -6638,7 +6638,7 @@ def _run_shared_phase45_phase5_pipeline(
     two_pass_sigma_px = int(phase5_options.get("two_pass_sigma_px") or 0)
     gain_clip_tuple = phase5_options.get("two_pass_gain_clip")
     two_pass_coverage_renorm_config = bool(phase5_options.get("two_pass_coverage_renorm"))
-    use_gpu_phase5_flag = bool(phase5_options.get("use_gpu_phase5"))
+    use_gpu_phase5_flag = False
     assembly_process_workers_config = int(phase5_options.get("assembly_process_workers") or 0)
     intertile_preview_size_config = phase5_options.get("intertile_preview_size") or 512
     intertile_overlap_min_config = phase5_options.get("intertile_overlap_min") or 0.05
@@ -10172,7 +10172,15 @@ def create_master_tile(
 
     ram_plan["streaming_supported"] = streaming_supported  # type: ignore[index]
     ram_plan["streaming_disable_reason"] = streaming_disable_reason  # type: ignore[index]
-    use_streaming_tile = streaming_supported
+    streaming_opt_in = _resolve_config_bool(
+        zconfig,
+        ("mastertile_allow_streaming", "stack_allow_streaming", "winsor_allow_streaming"),
+        False,
+    )
+    if not streaming_opt_in and streaming_supported:
+        streaming_supported = False
+        streaming_disable_reason = streaming_disable_reason or "disabled_by_config"
+    use_streaming_tile = streaming_opt_in and streaming_supported
     if use_streaming_tile:
         pcb_tile(
             f"{func_id_log_base}_streaming_mode_enabled",
@@ -10188,6 +10196,14 @@ def create_master_tile(
             lvl="INFO_DETAIL",
             tile_id=tile_id,
             reason=streaming_disable_reason,
+        )
+    elif not streaming_opt_in:
+        pcb_tile(
+            f"{func_id_log_base}_streaming_mode_disabled",
+            prog=None,
+            lvl="INFO_DETAIL",
+            tile_id=tile_id,
+            reason="disabled_by_config",
         )
     # Conversion du dict en objet astropy.io.fits.Header pour la sauvegarde
     header_for_master_tile_base = fits.Header(header_dict_for_master_tile_base.cards if hasattr(header_dict_for_master_tile_base,'cards') else header_dict_for_master_tile_base)
@@ -14070,7 +14086,7 @@ def run_hierarchical_mosaic(
         sds_min_coverage_keep_config = 0.4
     sds_min_coverage_keep_config = max(0.0, min(1.0, sds_min_coverage_keep_config))
 
-    global_wcs_autocrop_enabled_config = bool(worker_config_cache.get("global_wcs_autocrop_enabled"))
+    global_wcs_autocrop_enabled_config = False
     try:
         global_wcs_autocrop_margin_px_config = int(worker_config_cache.get("global_wcs_autocrop_margin_px", 64) or 0)
     except Exception:

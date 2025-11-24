@@ -108,8 +108,8 @@ DEFAULT_CONFIG = {
     "cluster_orientation_split_deg": 0.0,
     # Master "use GPU wherever possible" toggle. Older configs may only carry
     # use_gpu_phase5/stack_use_gpu/use_gpu_stack, so normalization keeps them in sync.
-    "use_gpu_global": True,
-    "use_gpu_phase5": True,
+    "use_gpu_global": False,
+    "use_gpu_phase5": False,
     "gpu_id_phase5": 0,
     "gpu_selector": "",
     "enable_tile_weighting": True,
@@ -122,7 +122,7 @@ DEFAULT_CONFIG = {
     "global_wcs_padding_percent": 2.0,
     "global_wcs_res_override": None,
     "global_wcs_orientation": "north_up",
-    "global_wcs_autocrop_enabled": True,
+    "global_wcs_autocrop_enabled": False,
     "global_wcs_autocrop_margin_px": 128,
     "sds_mode_default": False,
     "sds_coverage_threshold": 0.92,
@@ -208,7 +208,7 @@ DEFAULT_CONFIG = {
     # Early GUI filter option (Phase 0 header-only scan)
     "enable_early_filter": True,
     # --- CLES POUR LE ROGNAGE DES MASTER TUILES ---
-    "apply_master_tile_crop": True,  # Désactivé par défaut
+    "apply_master_tile_crop": False,  # Désactivé par défaut
     "master_tile_crop_percent": 3.0,  # Pourcentage par côté si activé (ex: 10%)
     "quality_crop_enabled": False,
     "quality_crop_band_px": 32,

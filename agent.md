@@ -1,130 +1,114 @@
-# Agent – Régression photométrique V4WIP vs V4.2.0 (log “post_anchor_keep_old”)
+# Mission : Audit géométrique complet entre V4.2.0 et V4WIP
+# Alignement – Master Tiles – WCS – Reprojection – Coverage
 
 ## Contexte
+Sur un dataset identique, on observe :
 
-Projet : **ZeMosaic / ZeSeestarStacker**  
-Branches concernées :
+### ✔ V4.2.0
+- Aucune erreur WCS.
+- preview.png généré.
+- coverage_xxx.dat généré.
+- mosaïque homogène, pas de patchwork.
+- footprint maîtrisé.
+- couleurs cohérentes.
 
-- `V4.2.0` = **référence** (qualité OK),
-- `V4WIP`  = branche courante avec **perte de qualité photométrique**.
+### ❌ V4WIP
+- Erreur critique Astropy :
+WCS.all_world2pix failed to converge … solution is diverging
 
-Même dataset Seestar, même configuration (SDS off, Phase 5 CPU/GPU selon tests).
+markdown
+Copier le code
+- **Pas de preview.png**.
+- **Pas de fichier de coverage**.
+- **Patchwork visible**, zones sombres/vertes, bruit amplifié.
+- Alignement inter-tuiles incohérent.
 
-Constats :
+### IMPORTANT
+Les logs montrent que :
+- `[RGB-EQ] poststack_equalize_rgb` fonctionne correctement et identiquement en V4.2.0 (gains identiques).  
+➜ **À exclure du périmètre** (ne rien modifier dans la normalisation intra-stack).
+- Les problèmes restants sont cohérents avec :
+- une modification dans le **stacking CPU/GPU**,
+- un changement dans la **géométrie / offsets**,
+- une altération du **WCS interne** des master tiles,
+- un padding différent,
+- un pivot ou une orientation modifiée,
+- une transformation incohérente passée à `reproject_interp`.
 
-1. Les logs `[RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(..., ..., 1.000000)` sont **présents avec les mêmes gains et cibles** dans V4.2.0 et V4WIP.  
-   ⇒ La **normalisation RGB intra-stack n’est pas la cause** de la régression et ne doit pas être modifiée. :contentReference[oaicite:2]{index=2}  
+## OBJECTIF : restaurer la qualité V4.2.0
 
-2. La divergence se situe dans la **phase post-anchor** (choix de l’ancre photométrique et application de l’offset global) dans `zemosaic_worker.py`. :contentReference[oaicite:3]{index=3}  
+L’objectif de cette mission est de :
 
-   - Log V4.2.0 (bon comportement) :
+1. **Comparer précisément V4.2.0 et V4WIP** dans les fichiers :
+ - `zemosaic_align_stack.py`
+ - `zemosaic_align_stack_gpu.py`
 
-     ```text
-     [CLÉ_POUR_GUI: post_anchor_start]
-     [CLÉ_POUR_GUI: post_anchor_selected] (Args: {'tile': 0, 'impr': 0.232318821698048})
-     ... post_anchor_shift ... (Args: {'gain': 0.7865391356567737, 'offset': 3.5014933309171283})
-     apply_photometric: using affine_by_id for 32 tiles
-     apply_photometric: tile=tile:0000 gain=0.78654 offset=3.50149
-     ...
-     ```
+2. **Identifier toute différence** concernant :
+ - la construction de la master tile,
+ - les offsets appliqués,
+ - les translations (dx, dy),
+ - les rotations éventuelles,
+ - l’origine du tableau (origin=upper/lower),
+ - le padding,
+ - la propagation ou non des masques alpha,
+ - le dtype et les arrondis,
+ - la génération du WCS interne (CRPIX, CRVAL, CDELT, CD matrix),
+ - la logique d'estimation du champ,
+ - la forme (shape) finale passée à la Phase 5.
 
-   - Log V4WIP (mauvais comportement) :
+3. **Vérifier les arguments passés à :**
+ - `reproject_interp`
+ - `reproject_exact`
+ - `reproject.adaptive`
+ - ainsi que les valeurs de « output_projection », « order », « boundary ».
 
-     ```text
-     [CLÉ_POUR_GUI: post_anchor_start]
-     [CLÉ_POUR_GUI: post_anchor_keep_old] (Args: {'impr': 0.14600923384024508})
-     ```
+4. **Corriger la branche V4WIP** pour faire respecter EXACTEMENT les règles suivantes :
 
-   ⇒ En V4WIP **aucune ancre n’est acceptée** et **aucune affine photométrique n’est appliquée** aux tiles, d’où le décalage du rouge et la dérive globale visible sur la mosaïque finale.
+ ### 🔥 Règles obligatoires (identiques à V4.2.0)
+ - Même géométrie (shape HxW) des master tiles.
+ - Même orientation (`origin='lower'` ou `'upper'`, selon V4.2.0).
+ - Même padding autour des stars.
+ - Même logique d’offset.
+ - Même normalisation *avant* assemblage.
+ - WCS strictement compatible (CRPIX, CRVAL, CD matrix identiques).
+ - Les master tiles doivent être géométriquement superposables.
+ - La Phase 5 (coadd final) doit recevoir des tuiles compatibles.
 
-3. Dans `zemosaic_worker.py`, la logique refactorisée autour du post-anchor contient :
+5. **Assurer que :**
+ - `preview.png` est de nouveau généré.
+ - `coverage_*.dat` est de nouveau généré.
+ - plus aucune erreur WCS n’apparaît.
+ - la mosaïque finale V4WIP est visuellement identique à V4.2.0.
 
-   ```python
-   same_anchor = False
-   try:
-       if prestack_anchor_id is not None:
-           same_anchor = selected_tile_id == int(prestack_anchor_id)
-   except Exception:
-       same_anchor = False
+## Fichiers à auditer et corriger
+- `zemosaic_align_stack.py`
+- `zemosaic_align_stack_gpu.py`
+- éventuellement :
+- `zemosaic_utils.build_mastertile_wcs`
+- `zemosaic_utils.estimate_pixel_scale`
+- `zemosaic_utils.make_mastertile_projection`
 
-   if same_anchor or improvement < min_improvement:
-       _log_and_callback(
-           "post_anchor_keep_old",
-           lvl="INFO",
-           callback=progress_callback,
-           impr=float(improvement),
-       )
-       ...
-       return master_tiles, anchor_shift
-→ Clé de la régression : l’utilisation de same_anchor or improvement < min_improvement.
-En V4.2.0, la logique équivalente utilisait une condition plus permissive (type same_anchor and improvement < min_improvement ou équivalent), ce qui permettait d’accepter un nouvel ajustement même si l’ancre restait la même, tant que improvement >= min_improvement.
+## Contraintes strictes
+- Ne pas modifier la logique SDS.
+- Ne pas toucher au post-anchor (déjà corrigé).
+- Ne pas toucher à poststack_equalize_rgb.
+- Ne pas modifier l’API GUI.
+- Ne pas changer la gestion CPU/GPU hormis ce qui touche à la géométrie.
 
-Avec le or, dès que same_anchor est True, on tombe systématiquement dans post_anchor_keep_old, même si l’amélioration est significative (impr ≈ 0.146 dans le log V4WIP).
+## Résultat attendu
+1. Un diff clair montrant :
+ - ce qui a changé entre V4.2.0 et V4WIP,
+ - pourquoi ces changements provoquaient des divergences WCS,
+ - ce qui a été corrigé.
 
-Mission
-Comparer la fonction post-anchor entre V4.2.0 et V4WIP (même fichier, même zone) pour confirmer le changement de logique.
+2. Un commit qui restaure :
+ - la géométrie correcte des master tiles,
+ - une WCS fiable,
+ - un reprojetage stable,
+ - preview.png,
+ - coverage.dat,
+ - une mosaïque propre sans patchwork.
 
-Corriger la condition de garde de manière à retrouver le comportement de V4.2.0 :
+3. Une mise à jour du fichier `followup.md`.
 
-si l’amélioration est significative (improvement >= min_improvement), on doit appliquer l’ancre et l’offset même si selected_tile_id == prestack_anchor_id.
-
-on ne doit garder l’ancienne ancre que lorsque :
-
-l’amélioration est inférieure au seuil, ou
-
-les métriques sont manifestement non fiables (cas déjà gérés par le code).
-
-Maintenir intacts :
-
-la logique de sélection des candidats (score, span, robust_sigma, etc.) ;
-
-le garde-fou median_delta (MIN_MEDIAN_REL_DELTA) et le log DEBUG qui signale le contournement éventuel ;
-
-la fonction [RGB-EQ] poststack_equalize_rgb et toute la partie RGB intra-stack (pas de modification de ces fonctions ni de leurs paramètres). zemosaic_worker
-
-S’assurer que, une fois la condition corrigée, le flux V4WIP reproduit le comportement suivant :
-
-log post_anchor_selected avec tile et impr ;
-
-log post_anchor_shift avec gain / offset ;
-
-log apply_photometric: using affine_by_id... et les lignes apply_photometric: tile=tile:XXXX gain=... offset=....
-
-Ne rien changer à la mécanique de Two-Pass coverage, de SDS, ni aux fonctions de stacking GPU/CPU, sauf si une dépendance directe avec la logique d’ancre est clairement identifiée dans le diff.
-
-Fichiers principaux à inspecter
-zemosaic_worker.py
-
-zone autour de la sélection d’ancre / logs post_anchor_* / apply_photometric. zemosaic_worker
-
-Éventuellement pour contexte (lecture seule, pas de modification sauf nécessité démontrée) :
-
-zemosaic_align_stack.py et zemosaic_align_stack_gpu.py pour la logique [RGB-EQ] poststack_equalize_rgb. zemosaic_align_stack
-
-Contraintes
-Pas de nouvelle dépendance externe.
-
-Ne pas dégrader les performances GPU/CPU (pas de boucles Python inutiles).
-
-Ne pas modifier l’API publique ni les signatures des callbacks GUI/log.
-
-Préserver la compatibilité avec les deux GUI (Tk et Qt).
-
-Livrable attendu
-Un patch qui :
-
-corrige la condition de garde post-anchor,
-
-restaure l’application des affines photométriques comme en V4.2.0,
-
-laisse poststack_equalize_rgb inchangé,
-
-conserve les logs et garde-fous existants.
-
-Commentaires dans le code expliquant brièvement la logique :
-
-quand l’ancre est conservée,
-
-quand elle est ré-appliquée,
-
-et pourquoi on ne veut pas bloquer le cas “même ancre mais meilleure affine”.
+Merci d’être exhaustif et rigoureux.
