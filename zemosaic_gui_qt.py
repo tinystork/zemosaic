@@ -3595,7 +3595,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "radial_feather_fraction": 0.8,
             "min_radial_weight_floor": 0.0,
             "radial_shape_power": 2.0,
-            "cluster_panel_threshold": 0.05,
+            "cluster_panel_threshold": 0.12,
             "cluster_target_groups": 0,
             "cluster_orientation_split_deg": 0.0,
             "inter_master_merge_enable": False,
@@ -5137,7 +5137,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         astap_downsample = _coerce_int(cfg.get("astap_default_downsample", 2), 2)
         astap_sensitivity = _coerce_int(cfg.get("astap_default_sensitivity", 100), 100)
 
-        cluster_threshold = _coerce_float(cfg.get("cluster_panel_threshold", 0.05), 0.05)
+        cluster_threshold = _coerce_float(cfg.get("cluster_panel_threshold", 0.12, 0.12))
         cluster_target_groups = _coerce_int(cfg.get("cluster_target_groups", 0), 0)
         cluster_orientation = _coerce_float(cfg.get("cluster_orientation_split_deg", 0.0), 0.0)
 
@@ -5668,7 +5668,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         initial_overrides: Dict[str, Any] | None = None
         try:
             initial_overrides = {
-                "cluster_panel_threshold": float(self.config.get("cluster_panel_threshold", 0.05)),
+                "cluster_panel_threshold": float(self.config.get("cluster_panel_threshold", 0.12)),
                 "cluster_target_groups": int(self.config.get("cluster_target_groups", 0)),
                 "cluster_orientation_split_deg": float(self.config.get("cluster_orientation_split_deg", 0.0)),
                 # Synchroniser l’état de la case "Enable SDS mode by default" vers le Filter Qt
