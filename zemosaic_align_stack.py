@@ -1431,8 +1431,8 @@ def stack_winsorized_sigma_clip(
     )
 
     disable_streaming = _coerce_config_bool(
-        getattr(zconfig, "stack_disable_streaming", getattr(zconfig, "winsor_disable_streaming", True)) if zconfig else True,
-        True,
+        getattr(zconfig, "stack_disable_streaming", getattr(zconfig, "winsor_disable_streaming", False)) if zconfig else False,
+        False,
     )
     if disable_streaming:
         memory_plan.mode = "in_memory"

@@ -1,114 +1,105 @@
-# Mission : Audit géométrique complet entre V4.2.0 et V4WIP
-# Alignement – Master Tiles – WCS – Reprojection – Coverage
+# Mission : Rollback sélectif du commit 08bebf5 (cluster refactor)
+# Objectif : restaurer la géométrie/stacking V4.2.0 sans perdre les commits ultérieurs
 
 ## Contexte
-Sur un dataset identique, on observe :
 
-### ✔ V4.2.0
-- Aucune erreur WCS.
-- preview.png généré.
-- coverage_xxx.dat généré.
-- mosaïque homogène, pas de patchwork.
-- footprint maîtrisé.
-- couleurs cohérentes.
+Le commit `08bebf5` a introduit :
+- une refonte partielle de la logique de clustering / align_stack,
+- des modifications dans la géométrie interne des master tiles,
+- des altérations WCS,
+- et plusieurs désactivations temporaires non souhaitées (streaming, GPU, crop).
 
-### ❌ V4WIP
-- Erreur critique Astropy :
-WCS.all_world2pix failed to converge … solution is diverging
+Conséquences visibles (confirmées par l’analyse comparative V4.2.0 vs V4WIP) :
+- WCS divergents (`WCS.all_world2pix failed to converge`),
+- disparition de preview.png et coverage_xxx.dat,
+- mosaïque patchwork (master tiles mal positionnées),
+- altération Phase 5 (reproject & coadd),
+- pipeline align_stack incompatible avec V4.2.0.
 
-markdown
-Copier le code
-- **Pas de preview.png**.
-- **Pas de fichier de coverage**.
-- **Patchwork visible**, zones sombres/vertes, bruit amplifié.
-- Alignement inter-tuiles incohérent.
+Les tests montrent que la normalisation RGB intra-stack **n’est pas en cause** et ne doit pas être modifiée.
 
-### IMPORTANT
-Les logs montrent que :
-- `[RGB-EQ] poststack_equalize_rgb` fonctionne correctement et identiquement en V4.2.0 (gains identiques).  
-➜ **À exclure du périmètre** (ne rien modifier dans la normalisation intra-stack).
-- Les problèmes restants sont cohérents avec :
-- une modification dans le **stacking CPU/GPU**,
-- un changement dans la **géométrie / offsets**,
-- une altération du **WCS interne** des master tiles,
-- un padding différent,
-- un pivot ou une orientation modifiée,
-- une transformation incohérente passée à `reproject_interp`.
+## Mission
 
-## OBJECTIF : restaurer la qualité V4.2.0
+1. **Identifier précisément les modifications introduites par le commit 08bebf5** dans :
+   - `zemosaic_align_stack.py`
+   - `zemosaic_align_stack_gpu.py`
+   - éventuellement `zemosaic_utils` (WCS, pivot, padding)
+   - et tout autre fichier touché *uniquement* par ce commit.
 
-L’objectif de cette mission est de :
+2. **Supprimer ou réécrire ces modifications**, afin de :
+   - restaurer entièrement la logique de stacking/alignement V4.2.0,
+   - restaurer la géométrie des master tiles,
+   - restaurer les WCS internes corrects,
+   - restaurer la compatibilité avec `reproject`.
 
-1. **Comparer précisément V4.2.0 et V4WIP** dans les fichiers :
- - `zemosaic_align_stack.py`
- - `zemosaic_align_stack_gpu.py`
+3. **Conserver intégralement** :
+   - les commits ultérieurs (GPU path, resume, correctifs d’erreurs),
+   - les améliorations de performances,
+   - les ajouts utiles.
+   → Le rollback doit donc être **sélectif**, pas un revert global.
 
-2. **Identifier toute différence** concernant :
- - la construction de la master tile,
- - les offsets appliqués,
- - les translations (dx, dy),
- - les rotations éventuelles,
- - l’origine du tableau (origin=upper/lower),
- - le padding,
- - la propagation ou non des masques alpha,
- - le dtype et les arrondis,
- - la génération du WCS interne (CRPIX, CRVAL, CDELT, CD matrix),
- - la logique d'estimation du champ,
- - la forme (shape) finale passée à la Phase 5.
+4. **Retirer toutes les “décisions temporaires”** introduites par la tentative de réparation :
 
-3. **Vérifier les arguments passés à :**
- - `reproject_interp`
- - `reproject_exact`
- - `reproject.adaptive`
- - ainsi que les valeurs de « output_projection », « order », « boundary ».
+### A. Streaming / Winsor
+- Retirer les forçages :
+  - `stack_disable_streaming=True`
+  - `winsor_disable_streaming=True`
+- Restaurer les valeurs V4.2.0 :
+  - streaming activé si la configuration utilisateur le permet.
 
-4. **Corriger la branche V4WIP** pour faire respecter EXACTEMENT les règles suivantes :
+### B. GPU désactivé par défaut
+- Restaurer :
+  - `use_gpu_global=True`
+  - `use_gpu_phase5=True`
+- Retirer les forçages `use_gpu_phase5_flag=False`.
 
- ### 🔥 Règles obligatoires (identiques à V4.2.0)
- - Même géométrie (shape HxW) des master tiles.
- - Même orientation (`origin='lower'` ou `'upper'`, selon V4.2.0).
- - Même padding autour des stars.
- - Même logique d’offset.
- - Même normalisation *avant* assemblage.
- - WCS strictement compatible (CRPIX, CRVAL, CD matrix identiques).
- - Les master tiles doivent être géométriquement superposables.
- - La Phase 5 (coadd final) doit recevoir des tuiles compatibles.
+### C. Crops désactivés par défaut
+- Restaurer :
+  - `apply_master_tile_crop=True`
+  - `apply_crop_for_assembly=True`
+  - `global_wcs_autocrop_enabled=True`
 
-5. **Assurer que :**
- - `preview.png` est de nouveau généré.
- - `coverage_*.dat` est de nouveau généré.
- - plus aucune erreur WCS n’apparaît.
- - la mosaïque finale V4WIP est visuellement identique à V4.2.0.
+### D. Assemblage Phase 5 forcé en “no-autocrop”
+- Restaurer le comportamento V4.2.0 :
+  - master tile crop autorisé,
+  - autocrop global actif,
+  - reprojection GPU autorisée.
 
-## Fichiers à auditer et corriger
-- `zemosaic_align_stack.py`
-- `zemosaic_align_stack_gpu.py`
-- éventuellement :
-- `zemosaic_utils.build_mastertile_wcs`
-- `zemosaic_utils.estimate_pixel_scale`
-- `zemosaic_utils.make_mastertile_projection`
+5. **Vérifier** qu'après rollback :
+   - preview.png revient,
+   - coverage_xxx.dat revient,
+   - plus aucun warning WCS,
+   - la mosaïque final retrouve la qualité V4.2.0,
+   - les dimensions / offsets / orientations des master tiles correspondent à V4.2.0,
+   - Phase 5 CPU/GPU produit la même géométrie qu’en V4.2.0.
 
 ## Contraintes strictes
-- Ne pas modifier la logique SDS.
-- Ne pas toucher au post-anchor (déjà corrigé).
-- Ne pas toucher à poststack_equalize_rgb.
-- Ne pas modifier l’API GUI.
-- Ne pas changer la gestion CPU/GPU hormis ce qui touche à la géométrie.
 
-## Résultat attendu
-1. Un diff clair montrant :
- - ce qui a changé entre V4.2.0 et V4WIP,
- - pourquoi ces changements provoquaient des divergences WCS,
- - ce qui a été corrigé.
+- Ne pas toucher aux fonctions SDS.
+- Ne pas toucher à `poststack_equalize_rgb` ni à la normalisation intra-stack.
+- Ne pas supprimer les commits ajoutant des fonctionnalités utiles.
+- Le rollback doit être **focalisé** sur les changements géométriques/WCS/clusters introduits par 08bebf5.
+- Les paths GPU doivent rester fonctionnels.
+- La compatibilité Qt/Tk doit être maintenue.
 
-2. Un commit qui restaure :
- - la géométrie correcte des master tiles,
- - une WCS fiable,
- - un reprojetage stable,
- - preview.png,
- - coverage.dat,
- - une mosaïque propre sans patchwork.
+## Fichiers critiques à traiter
+- `zemosaic_align_stack.py` (CPU)
+- `zemosaic_align_stack_gpu.py` (GPU)
+- `zemosaic_utils` (WCS, pivot, pad)
+- éventuellement :
+  - `parallel_utils`
+  - `zemosaic_worker` (Phase 3 → Phase 5 transitions)
 
-3. Une mise à jour du fichier `followup.md`.
+## Livrables attendus
+1. Un patch annulant proprement les modifications 08bebf5 et rétablissant la version fonctionnelle V4.2.0.
+2. Un rapport clair dans `followup.md` :
+   - quelles parties ont été retirées ou restaurées,
+   - pourquoi elles causaient la régression,
+   - comment le pipeline retrouve sa cohérence.
+3. Une vérification concrète :
+   - preview.png OK
+   - coverage.dat OK
+   - aucune erreur WCS
+   - mosaïque visuellement identique à V4.2.0.
 
-Merci d’être exhaustif et rigoureux.
+Merci d’être chirurgical et de préserver toute la structure extérieure.

@@ -6627,10 +6627,13 @@ def _run_shared_phase45_phase5_pipeline(
     base_progress_phase5 = float(phase5_options.get("base_progress") or current_global_progress)
     progress_weight_phase5 = float(phase5_options.get("progress_weight") or 0.0)
     USE_INCREMENTAL_ASSEMBLY = str(phase5_options.get("final_assembly_method") or "").lower() == "incremental"
-    apply_master_tile_crop_config = False
+    apply_master_tile_crop_config = bool(phase5_options.get("apply_master_tile_crop"))
     quality_crop_enabled_config = bool(phase5_options.get("quality_crop_enabled"))
-    apply_crop_for_assembly = False
-    master_tile_crop_percent_config = 0.0
+    apply_crop_for_assembly = bool(apply_master_tile_crop_config and not quality_crop_enabled_config)
+    try:
+        master_tile_crop_percent_config = float(phase5_options.get("master_tile_crop_percent") or 0.0)
+    except Exception:
+        master_tile_crop_percent_config = 0.0
     intertile_match_flag = bool(phase5_options.get("intertile_match_flag"))
     match_background_flag = bool(phase5_options.get("match_background_flag"))
     feather_parity_flag = bool(phase5_options.get("feather_parity_flag"))
@@ -6638,7 +6641,7 @@ def _run_shared_phase45_phase5_pipeline(
     two_pass_sigma_px = int(phase5_options.get("two_pass_sigma_px") or 0)
     gain_clip_tuple = phase5_options.get("two_pass_gain_clip")
     two_pass_coverage_renorm_config = bool(phase5_options.get("two_pass_coverage_renorm"))
-    use_gpu_phase5_flag = False
+    use_gpu_phase5_flag = bool(phase5_options.get("use_gpu_phase5"))
     assembly_process_workers_config = int(phase5_options.get("assembly_process_workers") or 0)
     intertile_preview_size_config = phase5_options.get("intertile_preview_size") or 512
     intertile_overlap_min_config = phase5_options.get("intertile_overlap_min") or 0.05
@@ -7890,7 +7893,7 @@ def should_use_gpu_for_reproject(
         gpu_pref = _resolve_config_bool(
             config,
             ("use_gpu_phase5", "use_gpu_global", "use_gpu", "stack_use_gpu", "use_gpu_stack"),
-            False,
+            True,
         )
     if not gpu_pref:
         return False
@@ -9831,7 +9834,7 @@ def create_master_tile(
     global_gpu_pref = _resolve_config_bool(
         zconfig,
         ("use_gpu_global", "use_gpu_phase5", "stack_use_gpu", "use_gpu_stack"),
-        False,
+        True,
     )
     try:
         setattr(zconfig, "use_gpu_global", bool(global_gpu_pref))
@@ -10175,7 +10178,7 @@ def create_master_tile(
     streaming_opt_in = _resolve_config_bool(
         zconfig,
         ("mastertile_allow_streaming", "stack_allow_streaming", "winsor_allow_streaming"),
-        False,
+        True,
     )
     if not streaming_opt_in and streaming_supported:
         streaming_supported = False
@@ -13739,23 +13742,23 @@ def run_second_pass_coverage_renorm(
             if use_gpu_flag:
                 gpu_assigned = True
             channel_tasks.append((ch, use_gpu_flag))
+        max_channel_workers = max(1, min(n_channels, cpu_workers_hint or n_channels))
         reproj_failure = False
         done_channels = 0
-
-        # Process the GPU-designated channel synchronously to avoid thread-context issues.
-        gpu_channel_task: tuple[int, bool] | None = None
-        cpu_channel_tasks: list[tuple[int, bool]] = []
-        for task in channel_tasks:
-            if task[1] and gpu_channel_task is None:
-                gpu_channel_task = task
-            else:
-                cpu_channel_tasks.append((task[0], False))
-
-        if gpu_channel_task is not None:
-            try:
-                ch_idx, chan_mosaic_np, chan_cov_np = _process_channel(*gpu_channel_task)
-                mosaic_channels[ch_idx] = chan_mosaic_np
-                coverage_channels[ch_idx] = chan_cov_np
+        with ThreadPoolExecutor(max_workers=max_channel_workers) as executor:
+            future_map = {
+                executor.submit(_process_channel, ch_idx, use_gpu_flag): ch_idx for ch_idx, use_gpu_flag in channel_tasks
+            }
+            for fut in as_completed(future_map):
+                try:
+                    ch_idx, chan_mosaic_np, chan_cov_np = fut.result()
+                    mosaic_channels[ch_idx] = chan_mosaic_np
+                    coverage_channels[ch_idx] = chan_cov_np
+                except Exception as exc:
+                    reproj_failure = True
+                    if logger:
+                        logger.warning("[TwoPass] Channel %d reprojection failed: %s", future_map.get(fut, -1), exc)
+                    break
                 done_channels += 1
                 _emit_two_pass_stats(
                     tiles_total,
@@ -13764,37 +13767,6 @@ def run_second_pass_coverage_renorm(
                     force=False,
                     stage="reproject",
                 )
-            except Exception as exc:
-                reproj_failure = True
-                if logger:
-                    logger.warning("[TwoPass] GPU channel %d reprojection failed: %s", gpu_channel_task[0], exc)
-        if reproj_failure:
-            return None
-
-        if cpu_channel_tasks:
-            max_channel_workers = max(1, min(len(cpu_channel_tasks), cpu_workers_hint or len(cpu_channel_tasks)))
-            with ThreadPoolExecutor(max_workers=max_channel_workers) as executor:
-                future_map = {
-                    executor.submit(_process_channel, ch_idx, False): ch_idx for ch_idx, _ in cpu_channel_tasks
-                }
-                for fut in as_completed(future_map):
-                    try:
-                        ch_idx, chan_mosaic_np, chan_cov_np = fut.result()
-                        mosaic_channels[ch_idx] = chan_mosaic_np
-                        coverage_channels[ch_idx] = chan_cov_np
-                    except Exception as exc:
-                        reproj_failure = True
-                        if logger:
-                            logger.warning("[TwoPass] Channel %d reprojection failed: %s", future_map.get(fut, -1), exc)
-                        break
-                    done_channels += 1
-                    _emit_two_pass_stats(
-                        tiles_total,
-                        chunk_index=done_channels,
-                        chunk_total=reproj_chunk_total,
-                        force=False,
-                        stage="reproject",
-                    )
         if reproj_failure or any(m is None for m in mosaic_channels):
             return None
 
@@ -13982,7 +13954,7 @@ def run_hierarchical_mosaic(
         global_gpu_pref = _resolve_config_bool(
             worker_config_cache,
             ("use_gpu_global", "use_gpu_phase5", "stack_use_gpu", "use_gpu_stack"),
-            False,
+            True,
         )
     else:
         global_gpu_pref = bool(use_gpu_phase5)
@@ -14086,7 +14058,7 @@ def run_hierarchical_mosaic(
         sds_min_coverage_keep_config = 0.4
     sds_min_coverage_keep_config = max(0.0, min(1.0, sds_min_coverage_keep_config))
 
-    global_wcs_autocrop_enabled_config = False
+    global_wcs_autocrop_enabled_config = bool(worker_config_cache.get("global_wcs_autocrop_enabled", True))
     try:
         global_wcs_autocrop_margin_px_config = int(worker_config_cache.get("global_wcs_autocrop_margin_px", 64) or 0)
     except Exception:
@@ -14516,7 +14488,7 @@ def run_hierarchical_mosaic(
     except (TypeError, ValueError):
         cluster_threshold = 0
     SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG = (
-        cluster_threshold if cluster_threshold > 0 else 0.12
+        cluster_threshold if cluster_threshold > 0 else 0.05
 
     )
     # Orientation split threshold (degrees). 0 disables orientation filtering
