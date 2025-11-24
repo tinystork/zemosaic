@@ -102,6 +102,9 @@ DEFAULT_CONFIG = {
     "apply_radial_weight": False,
     "radial_feather_fraction": 0.8,
     "radial_shape_power": 2.0,
+    # Master "use GPU wherever possible" toggle. Older configs may only carry
+    # use_gpu_phase5/stack_use_gpu/use_gpu_stack, so normalization keeps them in sync.
+    "use_gpu_global": True,
     "use_gpu_phase5": True,
     "gpu_id_phase5": 0,
     "gpu_selector": "",
@@ -426,18 +429,24 @@ def _coerce_boolish(value: Any, default: Optional[bool] = False) -> Optional[boo
 
 
 def _normalize_gpu_flags(config: dict) -> None:
-    """Ensure GPU toggles are synchronised across legacy keys."""
+    """
+    Ensure the global GPU toggle (and its legacy aliases) remain synchronised.
 
-    canonical = _coerce_boolish(config.get("use_gpu_phase5"), None)
+    ``use_gpu_global`` is the canonical key, with ``use_gpu_phase5`` kept for
+    backwards compatibility with the worker CLI and config files authored by
+    previous releases.
+    """
+
+    canonical = _coerce_boolish(config.get("use_gpu_global"), None)
     if canonical is None:
-        for key in ("stack_use_gpu", "use_gpu_stack"):
+        for key in ("use_gpu_phase5", "stack_use_gpu", "use_gpu_stack"):
             canonical = _coerce_boolish(config.get(key), None)
             if canonical is not None:
                 break
     if canonical is None:
         canonical = False
-    config["use_gpu_phase5"] = canonical
-    for key in ("stack_use_gpu", "use_gpu_stack"):
+    config["use_gpu_global"] = canonical
+    for key in ("use_gpu_phase5", "stack_use_gpu", "use_gpu_stack"):
         config[key] = _coerce_boolish(config.get(key), canonical)
 
 

@@ -1,174 +1,294 @@
-✅ agent.md — Coverage-First Hard Merge (Seestar-friendly)
-🎯 Mission
+# agent.md
+
+## Mission: Restore RGB photometric normalization in the GPU Phase 5 path
+
+You are working on **ZeMosaic**, an astrophotography mosaic/stacking pipeline written in Python.
+
+The project recently introduced/expanded a **GPU path in Phase 5** (“Reproject & Coadd”, including the optional two-pass coverage renormalization).  
+
+The user observes the following:
+
+- When Phase 5 is run on **CPU**, the final mosaic has:
+  - smooth transitions between tiles,
+  - consistent RGB balance and background levels.
+- When Phase 5 uses the **GPU** path:
+  - seams / boundaries between tiles become visible,
+  - local color/brightness mismatches appear,
+  - suggesting that the **RGB photometric normalization / background matching is not applied (or not applied correctly) in the GPU branch**.
+
+Your mission is to:
+
+1. **Audit Phase 5 CPU vs GPU implementations** and identify where **RGB photometric normalization and background matching** are applied in the CPU pipeline.
+2. **Ensure the GPU path applies *exactly the same* normalization logic**, or a mathematically equivalent implementation, so that:
+   - enabling GPU does **not** change scientific/photometric behaviour,
+   - only performance changes.
+3. **Keep the global workflow, SDS logic and GUI semantics unchanged**:
+   - SDS vs non-SDS pipelines must behave identically as before,
+   - only the internal CPU/GPU computation and normalization implementation is allowed to change.
+
+The goal:  
+> **With GPU enabled, Phase 5 should produce a mosaic that is visually and numerically very close to the CPU reference (no additional seams / color shifts), while still benefiting from GPU acceleration.**
+
+---
+
+## Scope
+
+Focus specifically on:
+
+- **Phase 5 non-SDS final mosaic assembly**:
+  - The main `reproject & coadd` step that combines tiles into the final RGB mosaic.
+- **Phase 5 two-pass coverage renorm (if enabled)**:
+  - Any additional per-pixel / per-region gain adjustment based on coverage maps that affects photometric balance.
+- **The photometric normalization steps**, including (names may differ in code):
+  - inter-tile RGB gain computation,
+  - local / overlap-based renormalization,
+  - background matching / offset corrections,
+  - any scalar or per-channel gain applied to tiles before or after reprojection.
+
+You are **not** allowed to:
+
+- Change how tiles/mega-tiles/lots are defined or grouped.
+- Change which frames belong to which tile or mega-tile.
+- Change the scientific formulae / design of the normalization (unless you are simply rewriting them in a GPU-compatible way).
+- Change GUI/CLI options semantics.
+
+---
 
-Optimiser la phase de “Coverage-First Preplan” dans zemosaic_filter_gui.py (Qt) afin de réduire le nombre de micro-groupes (1–10 frames) générés lorsque le champ est très recouvrant (ex : Seestar S50).
-⚠️ Sans modifier la logique SDS ou le reste du pipeline.
+## Non-goals / constraints
 
-Objectif :
-→ produire moins de groupes, mais plus robustes, avec un SNR interne plus homogène,
-→ tout en préservant les groupes réellement isolés.
+- ❌ Do **not** alter:
+  - SDS (ZeSupaDupStack) logical pipeline,
+  - the way master tiles / mega-tiles are created,
+  - overlap / coverage thresholds.
+- ❌ Do **not** introduce new GUI options or break existing ones.
+- ❌ Do **not** degrade CPU behaviour; CPU-only runs must produce **unchanged results**.
+
+- ✅ It is acceptable to:
+  - Factor common normalization logic into shared helpers,
+  - Introduce GPU-friendly vectorized code (CuPy-based),
+  - Use a hybrid approach (GPU reprojection + CPU normalization) if that is simpler/safer.
+
+- ✅ Numeric equality does **not** have to be bit-perfect:
+  - Small differences due to float precision / interpolation or order of operations are acceptable,
+  - But **visible seams / major RGB shifts are not**.
+
+---
 
-📌 Règles du “Hard Merge”
+## Key files and entry points
 
-Le merge est strictement local et non destructif :
+(Names may differ slightly, adjust to actual repo.)
 
-1. Groupes éligibles au merge
+- **Phase orchestration / worker**  
+  `zemosaic_worker.py`
+  - Phase 5 orchestration:
+    - Non-SDS `reproject & coadd` call,
+    - Optional two-pass coverage renorm.
+  - Look for log lines like:
+    - `[INFO] [Intertile] Overlap pairs at min_overlap=...`
+    - `assemble_info_finished_reproject_coadd`
+    - `Phase 5 finished: Reproject & Coadd completed. Mosaic shape (HWC): ...`
 
-Un groupe est candidat s’il vérifie :
+- **Photometric normalization & coadd helpers**  
+  `zemosaic_utils.py` (and possibly related modules)
+  - Functions for:
+    - building/interpreting coverage maps,
+    - computing/ applying RGB gains,
+    - matching backgrounds,
+    - performing coadd (CPU and GPU).
+  - Look for functions / blocks relating to:
+    - `photometric`, `gain`, `rgb`, `background`, `match`, `renorm`, `coverage`.
 
-group.size < merge_threshold
+- **Align/stack CPU & GPU implementation**  
+  `zemosaic_align_stack.py`  
+  `zemosaic_align_stack_gpu.py`
+  - Show how CPU and GPU paths share or diverge in logic.
+  - Provide patterns for:
+    - using CuPy vs NumPy,
+    - ensuring identical math on CPU & GPU,
+    - fallback logic.
 
-valeur par défaut : 10
+- **Parallel/plan & GPU use**  
+  `parallel_utils.py`
+  - `detect_parallel_capabilities`, `auto_tune_parallel_plan`, etc.
+  - Phase 5 GPU decisions should be consistent with this (but this mission is about **normalization parity**, not re-tuning parallelism).
 
-rendre la valeur configurable via solver_settings.py ou un paramètre interne au module
+- **Config & GUI**  
+  `zemosaic_config.py`
+  - Config flags controlling:
+    - GPU usage,
+    - two-pass coverage renorm,
+    - any photometric/normalization options.
+  - **Do not change semantics**, only ensure GPU uses the same flags.
 
-groupe non vide et non SDS préalloué
+  `zemosaic_gui_qt.py`, `zemosaic_filter_gui_qt.py`
+  - Existing GPU toggle(s) and SDS options; you don’t need to modify the GUI for this mission, only be aware of how the GPU is enabled.
 
-2. Critère spatial (obligatoire)
+---
 
-Un micro-groupe A ne peut être fusionné qu’avec un groupe B si :
+## Desired behaviour (high-level design)
 
-Distance angulaire des centres < FoV × 1.2
-(déjà disponible via footprint RA/Dec)
-OU
+### 1. Map the CPU photometric normalization pipeline (Phase 5)
 
-Footprints RA/Dec qui se recoupent réellement
-(rectangle intersection stricte)
+Identify, for **non-SDS Phase 5 (CPU path)**:
 
-⚠️ Si A n’a aucun voisin qui respecte cela → NE PAS fusionner.
-→ C’est ce qui protège les paquets éloignés comme dans ta capture.
+1. Where per-tile / per-channel gains are computed:
+   - Example: overlap-based RGB gain estimation, background level measurements, etc.
+2. Where those gains are applied:
+   - before reprojection (on tile data),
+   - during coadd,
+   - or after coadd using coverage/gain maps.
+3. Any coverage-based renormalization (two-pass coverage renorm or similar) affecting final RGB/bkg.
 
-3. Critère de taille (cap & overcap)
+Create a **clear sequence** (e.g. comments or docstring) describing:
 
-Si spatialement admissible, fusion autorisée seulement si :
+> “CPU Phase 5 does:  
+>  1) compute per-tile RGB gains,  
+>  2) apply them to each tile,  
+>  3) run reproject & coadd,  
+>  4) optionally run second-pass coverage renorm.”
 
-size(A) + size(B) ≤ max_raw_per_master_tile × (1 + overcap_allowance_fraction)
+This will be the **reference behaviour**.
 
-Remarques :
+---
 
-utiliser exactement la même valeur slider “overcap allowance (%)”
+### 2. Map the GPU Phase 5 path and identify gaps
 
-transformer 10% → 0.10 pour la formule
+For the **GPU Phase 5 path** (non-SDS), identify:
 
-refuser toute fusion qui dépasse ce plafond
+- How the GPU branch is selected (e.g. `use_gpu=True` argument, helper, or condition).
+- Which steps are done on GPU:
+  - reprojection (warp),
+  - coadd,
+  - any weighting,
+  - and whether normalization is applied at all.
+- Where, if anywhere, the current GPU path **skips**:
+  - RGB gain computation,
+  - RGB gain application,
+  - background matching.
 
-4. Merge unique
+Do the same check for the GPU-like path of the **two-pass coverage renorm** if it exists.
 
-Un micro-groupe ne doit être fusionné qu’une seule fois, pour éviter les chaînes infinies :
+The typical problem you need to confirm/fix:
 
-A → fusionne dans le meilleur candidat B
+> GPU path goes straight from raw tiles → reprojection → coadd  
+> without applying the CPU photometric normalization logic.
 
-A disparaît
+---
 
-B est mis à jour
+### 3. Refactor or introduce shared normalization helpers
 
-A n’est jamais revu
+Introduce **shared, well-defined helpers** that perform the photometric normalization, e.g.:
 
-5. Ordre de fusion
+```python
+def compute_tile_rgb_gains(...):
+    """Compute RGB gains / offsets for each tile, using the same math as CPU Phase 5."""
+    ...
 
-Fusionner dans cet ordre :
+def apply_tile_rgb_gains(image, gains, backend="numpy"):
+    """Apply per-channel gains to an image using NumPy or CuPy, depending on backend."""
+    ...
+This is only an example; adjust names and signatures to actual code.
 
-micro-groupes les plus petits en premier
+Key points:
 
-puis ceux un peu plus gros
-Cela maximise les fusions réussies.
+The same core math (formulas, weighting, clipping, etc.) must be used for both CPU and GPU paths.
 
-6. Logging
+The helper may accept a backend / array type or detect whether arrays are NumPy (CPU) or CuPy (GPU) and act accordingly.
 
-Ajouter des lignes dans le logger :
+You may reuse existing CPU-only code by:
 
-[HARD-MERGE] Merged group #A (size=4) → group #B (size=12), dist=0.42°, new_size=16
+generalizing it to work with array-like objects,
 
+or branching internally on np vs cp.
 
-Si rejet :
+4. Ensure GPU path invokes the same normalization logic
+Modify the GPU Phase 5 flow so that:
 
-[HARD-MERGE] Skip group #A : no eligible neighbour
-[HARD-MERGE] Skip merge #A→#B : would exceed cap (22 > 20)
+It calls the same normalization helpers as the CPU path, with:
 
-7. Aucun autre impact
+the same inputs (coverage maps, overlap metrics, etc.),
 
-Ne rien modifier à :
+the same configuration (clip limits, sigma, thresholds).
 
-SDS
+The normalization is applied in the same stage as the CPU pipeline:
 
-Auto-tile heuristics
+either pre-warp on each tile,
 
-Zesupadupstack
+or post-warp using coverage-based maps,
 
-la logique de coverage map
+or both, depending on existing design.
 
-lecropper
+If it is hard to implement everything on GPU, a hybrid approach is acceptable:
 
-le code Phase 5 et Phase 3
+e.g.:
 
-Organiser le code proprement dans une fonction dédiée :
+use GPU for reprojection + coadd,
 
-_apply_hard_merge(groups, settings, logger)
+then transfer to CPU for a final normalization pass with the exact same NumPy-based code as CPU,
 
-à placer dans zemosaic_filter_gui.py, juste après _merge_small_groups() mais appelée après l’étape de preplan, avant affichage GUI et serialization dans overrides_state.preplan_master_groups.
+as long as the photometric result matches the CPU reference (performance may be slightly reduced, but correctness is mandatory).
 
-📁 Fichiers à modifier
+5. Keep two-pass coverage renorm consistent
+If the project implements two-pass coverage renorm:
 
-zemosaic_filter_gui.py (principal)
+Ensure CPU and GPU flows use the same logic and parameters for:
 
-éventuellement :
+coverage smoothing (sigma_px),
 
-solver_settings.py (clé config merge_threshold si besoin)
+gain clipping,
 
-zemosaic_utils.py (helper rectangle intersection si utilitaire manquant)
+gain map application.
 
-🧪 Tests à passer
-Cas 1 — Seestar ultra-recouvrant (ex : 3500 frames)
+If GPU currently bypasses or oversimplifies this step, bring it to feature parity with CPU.
 
-Entrée : ton dataset typique avec 180+ groupes.
-Attendu :
+6. Robustness and fallback
+Re-use the existing GPU→CPU fallback mechanism (if implemented) so that:
 
-180 → ~30–50 groupes (ordre de grandeur)
+If GPU normalization runs out of memory or fails:
 
-tous les groupes restants ≥ 15–20 frames
+log a clear warning,
 
-logs de hard-merge présents
+disable GPU for the rest of the run,
 
-aucun dépassement cap
+recompute Phase 5 on CPU with full normalization.
 
-Cas 2 — Champs éclatés (comme ta 2ᵉ capture)
+Do not leave the user with a partially normalized GPU mosaic.
 
-Entrée : 4–6 clusters éloignés.
-Attendu :
+Testing expectations
+Add or update tests to validate:
 
-aucune fusion
+CPU vs GPU photometric parity:
 
-logs : “no eligible neighbour”
+Build a small synthetic dataset with multiple tiles and overlaps.
 
-nombre de groupes identique à avant le patch
+Run Phase 5:
 
-Cas 3 — Cap faible / overcap faible
+once with CPU-only,
 
-Attendu :
+once with GPU enabled.
 
-fusions refusées proprement
+Compare the resulting mosaics:
 
-logs explicites
+same shape, same WCS,
 
-Cas 4 — Cap élevé / overcap élevé
+similar pixel values.
 
-Attendu :
+It’s acceptable to check:
 
-fusions plus agressives mais toujours locales
+np.allclose(cpu, gpu, rtol=1e-3, atol=1e-3) or similar,
 
-aucune fusion entre zones distantes
+and/or assert that max per-channel difference is below a small threshold.
 
-🔒 Contraintes
+No visible RGB bias:
 
-Ne toucher AUCUNE logique SDS
+Optionally compute statistics per tile region in the final mosaic:
 
-Ne rien changer à la structure des master tiles
+mean / median in overlaps should be close between CPU and GPU runs.
 
-Aucun impact sur le pipeline standard
+No regression for CPU-only:
 
-Backward compatible
+Existing tests for Phase 5 and SDS should pass unchanged.
 
-Codex doit produire un patch propre, clair, bien commenté
+Document (in comments or a short dev note) the assumption:
 
-Le comportement batch size = 0 / >1 ne doit jamais être altéré
-
+“GPU Phase 5 now uses the same photometric normalization as CPU; enabling GPU should only change performance, not photometric behaviour.”

@@ -328,6 +328,19 @@ def _apply_hard_merge(
             return 0.0
         return frac
 
+    def _emit(msg: str, level: str = "INFO") -> None:
+        if logger is None or not msg:
+            return
+        try:
+            logger(msg, level)
+        except TypeError:
+            try:
+                logger(msg)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def _first_non_none(*candidates: Any) -> Any:
         for candidate in candidates:
             if candidate is not None:
@@ -370,19 +383,6 @@ def _apply_hard_merge(
     working_groups = [list(grp) for grp in groups]
     merged_flags = [False] * len(working_groups)
     any_change = False
-
-    def _emit(msg: str, level: str = "INFO") -> None:
-        if logger is None or not msg:
-            return
-        try:
-            logger(msg, level)
-        except TypeError:
-            try:
-                logger(msg)
-            except Exception:
-                pass
-        except Exception:
-            pass
 
     def _iter_points(payload: Any) -> Iterable[tuple[float, float]]:
         if payload is None:

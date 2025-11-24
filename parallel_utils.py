@@ -49,6 +49,31 @@ def _clamp(value: float, low: float, high: float, default: float) -> float:
     return float(min(high, max(low, numeric)))
 
 
+def _coerce_boolish(value: Any, default: bool | None = False) -> bool | None:
+    """Interpret loose truthy/falsy values coming from configs or CLI args."""
+
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if not normalized:
+            return default
+        if normalized in {"1", "true", "yes", "on", "enable", "enabled"}:
+            return True
+        if normalized in {"0", "false", "no", "off", "disable", "disabled"}:
+            return False
+        if normalized in {"none", "auto"}:
+            return default
+    try:
+        return bool(value)
+    except Exception:
+        return default
+
+
 def _extract_config(config: Mapping[str, Any] | None, key: str, default: Any) -> Any:
     if config is None:
         return default
@@ -245,6 +270,16 @@ def auto_tune_parallel_plan(
     )
     max_cpu_workers = _safe_int(_extract_config(cfg, "parallel_max_cpu_workers", 0), 0)
 
+    gpu_pref = _coerce_boolish(_extract_config(cfg, "use_gpu_global", None), None)
+    if gpu_pref is None:
+        for legacy_key in ("use_gpu_phase5", "stack_use_gpu", "use_gpu_stack", "use_gpu"):
+            gpu_pref = _coerce_boolish(_extract_config(cfg, legacy_key, None), None)
+            if gpu_pref is not None:
+                break
+    if gpu_pref is None:
+        gpu_pref = True  # default to legacy behaviour (GPU on when available)
+    gpu_pref = bool(gpu_pref)
+
     logical = max(1, caps.cpu_logical_cores)
     workers = logical
     if autotune_enabled:
@@ -281,7 +316,9 @@ def auto_tune_parallel_plan(
 
     gpu_rows_per_chunk = None
     gpu_chunk_bytes = None
-    use_gpu = bool(caps.gpu_available and autotune_enabled)
+    use_gpu = bool(caps.gpu_available and autotune_enabled and gpu_pref)
+    if not gpu_pref and caps.gpu_available:
+        LOGGER.debug("Global GPU flag disabled GPU usage despite detected capability")
     if use_gpu and width > 0 and height > 0:
         gpu_total = max(0, int(caps.gpu_vram_total_bytes or 0))
         gpu_free = max(0, int(caps.gpu_vram_free_bytes or 0))

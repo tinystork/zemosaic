@@ -261,9 +261,11 @@ def _ensure_legacy_gpu_defaults_on_config_module() -> None:
     if not isinstance(defaults, dict):
         return
 
-    defaults["use_gpu_phase5"] = _coerce_gpu_bool(defaults.get("use_gpu_phase5"), False)
-    canonical = defaults["use_gpu_phase5"]
-    for key in ("stack_use_gpu", "use_gpu_stack"):
+    canonical = _coerce_gpu_bool(defaults.get("use_gpu_global"), None)
+    if canonical is None:
+        canonical = _coerce_gpu_bool(defaults.get("use_gpu_phase5"), False)
+    defaults["use_gpu_global"] = canonical
+    for key in ("use_gpu_phase5", "stack_use_gpu", "use_gpu_stack"):
         defaults[key] = _coerce_gpu_bool(defaults.get(key, canonical), canonical)
 
 
@@ -2869,11 +2871,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
         layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
 
         self._register_checkbox(
-            "use_gpu_phase5",
+            "use_gpu_global",
             layout,
             self._tr("qt_field_use_gpu_phase5", "Use GPU acceleration when available"),
         )
-        checkbox_binding = self._config_fields.get("use_gpu_phase5")
+        checkbox_binding = self._config_fields.get("use_gpu_global")
         checkbox_widget: QCheckBox | None = None
         if isinstance(checkbox_binding, dict):
             widget_candidate = checkbox_binding.get("widget")
@@ -3475,9 +3477,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
         if target is None:
             return False
 
-        canonical_value: Any = target.get("use_gpu_phase5")
+        canonical_value: Any = target.get("use_gpu_global")
         if canonical_value in (None, ""):
-            for legacy_key in ("stack_use_gpu", "use_gpu_stack"):
+            for legacy_key in ("use_gpu_phase5", "stack_use_gpu", "use_gpu_stack"):
                 legacy_val = target.get(legacy_key)
                 if legacy_val not in (None, ""):
                     canonical_value = legacy_val
@@ -3485,7 +3487,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         gpu_enabled = self._normalize_config_bool(canonical_value, False)
         changed = False
-        for key in ("use_gpu_phase5", "stack_use_gpu", "use_gpu_stack"):
+        for key in ("use_gpu_global", "use_gpu_phase5", "stack_use_gpu", "use_gpu_stack"):
             previous = target.get(key)
             if previous != gpu_enabled or not isinstance(previous, bool):
                 changed = True
@@ -3665,6 +3667,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "winsor_max_frames_per_pass": 0,
             "winsor_worker_limit": 10,
             "max_raw_per_master_tile": 0,
+            "use_gpu_global": False,
             "use_gpu_phase5": False,
             "stack_use_gpu": False,
             "use_gpu_stack": False,
@@ -3757,13 +3760,14 @@ class ZeMosaicQtMainWindow(QMainWindow):
         merged_config.update(config_data)
         merged_config.setdefault("language", "en")
 
-        canonical_gpu_pref: Any = merged_config.get("use_gpu_phase5")
+        canonical_gpu_pref: Any = merged_config.get("use_gpu_global")
         if canonical_gpu_pref in (None, ""):
-            for legacy_key in ("stack_use_gpu", "use_gpu_stack"):
+            for legacy_key in ("use_gpu_phase5", "stack_use_gpu", "use_gpu_stack"):
                 if legacy_key in merged_config:
                     canonical_gpu_pref = merged_config[legacy_key]
                     break
         gpu_enabled = self._normalize_config_bool(canonical_gpu_pref, False)
+        merged_config["use_gpu_global"] = gpu_enabled
         merged_config["use_gpu_phase5"] = gpu_enabled
         merged_config["stack_use_gpu"] = self._normalize_config_bool(
             merged_config.get("stack_use_gpu"), gpu_enabled
@@ -5229,7 +5233,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
         poststack_min_improvement = max(0.0, min(1.0, poststack_min_improvement))
         poststack_use_overlap = _coerce_bool(cfg.get("poststack_anchor_use_overlap_affine", True), True)
 
-        use_gpu_phase5 = _coerce_bool(cfg.get("use_gpu_phase5", False), False)
+        use_gpu_global = _coerce_bool(
+            cfg.get("use_gpu_global", cfg.get("use_gpu_phase5", False)), False
+        )
         gpu_id_raw = cfg.get("gpu_id_phase5")
         gpu_id = None
         if gpu_id_raw not in (None, ""):
@@ -5332,7 +5338,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             poststack_median_clip_sigma,
             poststack_min_improvement,
             poststack_use_overlap,
-            use_gpu_phase5,
+            use_gpu_global,
             gpu_id,
             enable_tile_weighting,
             tile_weight_mode,

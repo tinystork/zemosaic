@@ -70,7 +70,8 @@ import importlib.util
 from pathlib import Path
 from threading import Lock
 from dataclasses import dataclass
-from typing import Callable, Any, Iterable, Optional
+from typing import Callable, Any, Iterable, Optional, Mapping
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import numpy as np
@@ -160,6 +161,9 @@ QUALITY_GATE_ALPHA_SOFT_THRESHOLD = 0.85  # Partially transparent pixels are ign
 
 GLOBAL_COVERAGE_SUMMARY_THRESHOLD_FRAC = 0.0025
 GLOBAL_COVERAGE_SUMMARY_MIN_ABS = 1e-3
+
+DEFAULT_INTERTILE_GAIN_LIMITS = (0.75, 1.25)
+DEFAULT_INTERTILE_OFFSET_LIMIT_ADU = 50.0
 
 
 def _safe_basename(path: str | os.PathLike | None) -> str:
@@ -2357,6 +2361,138 @@ def _sanitize_affine_corrections(
         return None, False
 
     return sanitized, True
+
+
+def _clamp_affine_parameters(
+    gain_val: float,
+    offset_val: float,
+    *,
+    enable_clamp: bool,
+    gain_limit_min: float,
+    gain_limit_max: float,
+    affine_offset_limit_adu: float,
+) -> tuple[float, float, bool]:
+    """Clamp gain/offset using the same policy as the CPU photometric path."""
+
+    gain_to_apply = float(gain_val)
+    offset_to_apply = float(offset_val)
+    clamped = False
+    if enable_clamp:
+        if gain_to_apply < gain_limit_min:
+            gain_to_apply = gain_limit_min
+            clamped = True
+        elif gain_to_apply > gain_limit_max:
+            gain_to_apply = gain_limit_max
+            clamped = True
+        limit = float(max(0.0, affine_offset_limit_adu))
+        if limit > 0.0:
+            if abs(offset_to_apply) > limit:
+                offset_to_apply = 0.0
+                clamped = True
+            else:
+                bounded = max(-limit, min(offset_to_apply, limit))
+                if bounded != offset_to_apply:
+                    clamped = True
+                offset_to_apply = bounded
+    return gain_to_apply, offset_to_apply, clamped
+
+
+def _resolve_intertile_affine_limits() -> tuple[float, float, float]:
+    """Return (gain_min, gain_max, offset_limit) from config or defaults."""
+
+    gain_limit_min, gain_limit_max = DEFAULT_INTERTILE_GAIN_LIMITS
+    affine_offset_limit_adu = DEFAULT_INTERTILE_OFFSET_LIMIT_ADU
+    try:
+        cfg = getattr(zconfig, "intertile_gain_limits", None)
+    except Exception:
+        cfg = None
+    if isinstance(cfg, (tuple, list)) and len(cfg) >= 2:
+        try:
+            gain_limit_min = float(cfg[0])
+        except Exception:
+            gain_limit_min = DEFAULT_INTERTILE_GAIN_LIMITS[0]
+        try:
+            gain_limit_max = float(cfg[1])
+        except Exception:
+            gain_limit_max = DEFAULT_INTERTILE_GAIN_LIMITS[1]
+        if not math.isfinite(gain_limit_min) or gain_limit_min <= 0:
+            gain_limit_min = DEFAULT_INTERTILE_GAIN_LIMITS[0]
+        if not math.isfinite(gain_limit_max) or gain_limit_max <= 0:
+            gain_limit_max = DEFAULT_INTERTILE_GAIN_LIMITS[1]
+        if gain_limit_min > gain_limit_max:
+            gain_limit_min, gain_limit_max = gain_limit_max, gain_limit_min
+    try:
+        affine_offset_limit_adu = float(
+            getattr(zconfig, "intertile_offset_limit_adu", DEFAULT_INTERTILE_OFFSET_LIMIT_ADU)
+        )
+    except Exception:
+        affine_offset_limit_adu = DEFAULT_INTERTILE_OFFSET_LIMIT_ADU
+    if not math.isfinite(affine_offset_limit_adu):
+        affine_offset_limit_adu = DEFAULT_INTERTILE_OFFSET_LIMIT_ADU
+    affine_offset_limit_adu = max(0.0, abs(affine_offset_limit_adu))
+    return float(gain_limit_min), float(gain_limit_max), float(affine_offset_limit_adu)
+
+
+def _apply_photometric_gain_offset(
+    array_like: Any,
+    gain: float,
+    offset: float,
+    *,
+    xp_module: Any | None = None,
+) -> Any:
+    """Apply ``array = array * gain + offset`` using either NumPy or CuPy."""
+
+    try:
+        import cupy as cp  # type: ignore
+    except Exception:
+        cp = None  # type: ignore
+
+    xp = xp_module
+    if xp is None:
+        if cp is not None and isinstance(array_like, cp.ndarray):
+            xp = cp
+        else:
+            xp = np
+    if xp is np:
+        arr = np.asarray(array_like, dtype=np.float32, order="C", copy=False)
+        if gain != 1.0:
+            np.multiply(arr, np.float32(gain), out=arr, casting="unsafe")
+        if offset != 0.0:
+            np.add(arr, np.float32(offset), out=arr, casting="unsafe")
+        return arr
+    arr_gpu = xp.asarray(array_like, dtype=xp.float32)
+    if gain != 1.0:
+        arr_gpu *= xp.float32(gain)
+    if offset != 0.0:
+        arr_gpu += xp.float32(offset)
+    return arr_gpu
+
+
+def _resolve_affine_gain_offset_for_tile(
+    tile_id: str | None,
+    affine_lookup: dict[str, tuple[float, float]] | None,
+    *,
+    match_background: bool,
+    gain_limit_min: float,
+    gain_limit_max: float,
+    affine_offset_limit_adu: float,
+) -> tuple[float, float, float, float, bool]:
+    """Return (gain_before, offset_before, gain_after, offset_after, clamped_flag)."""
+
+    if not tile_id or not affine_lookup:
+        return 1.0, 0.0, 1.0, 0.0, False
+    gain_before, offset_before = affine_lookup.get(tile_id, (1.0, 0.0))
+    gain_before = float(gain_before)
+    offset_before = float(offset_before)
+    gain_after, offset_after, clamped = _clamp_affine_parameters(
+        gain_before,
+        offset_before,
+        enable_clamp=bool(match_background),
+        gain_limit_min=float(gain_limit_min),
+        gain_limit_max=float(gain_limit_max),
+        affine_offset_limit_adu=float(affine_offset_limit_adu),
+    )
+    return gain_before, offset_before, gain_after, offset_after, clamped
 
 
 def _select_affine_log_indices(
@@ -6335,6 +6471,9 @@ def _run_shared_phase45_phase5_pipeline(
 
     current_global_progress = base_progress_phase4_5 + progress_weight_phase4_5
 
+    # Reset any lingering GPU fallback markers before Phase 5 begins.
+    reset_phase5_gpu_runtime_state()
+
     base_progress_phase5 = float(phase5_options.get("base_progress") or current_global_progress)
     progress_weight_phase5 = float(phase5_options.get("progress_weight") or 0.0)
     USE_INCREMENTAL_ASSEMBLY = str(phase5_options.get("final_assembly_method") or "").lower() == "incremental"
@@ -6404,6 +6543,17 @@ def _run_shared_phase45_phase5_pipeline(
                 filename=_safe_basename(mt_p if mt_p else "N/A"),
             )
 
+    # Phase 5 CPU photometric normalization overview:
+    #   1) assemble_final_mosaic_reproject_coadd loads every master tile, builds per-tile
+    #      coverage masks, and — when intertile_photometric_match is enabled — calls
+    #      _compute_intertile_affine_corrections_from_sources to derive per-tile (gain, offset)
+    #      corrections that are clamped and applied to the tile arrays before reproject_and_coadd.
+    #   2) reproject_and_coadd then merges the corrected RGB tiles while match_background/
+    #      tile weighting settings are honoured, producing the first-pass mosaic + coverage.
+    #   3) _apply_phase5_post_stack_pipeline optionally triggers the coverage-based renormalization
+    #      (run_second_pass_coverage_renorm → compute_per_tile_gains_from_coverage) so the blurred
+    #      coverage map drives a second reprojection with multiplicative gains identical to the CPU
+    #      reference flow.
     final_mosaic_data_HWC = None
     final_mosaic_coverage_HW = None
     final_alpha_map = None
@@ -6454,6 +6604,8 @@ def _run_shared_phase45_phase5_pipeline(
             }
             if stage:
                 ctx["stage"] = stage
+            disabled, _, _ = phase5_gpu_runtime_state()
+            ctx["gpu_runtime_disabled"] = bool(disabled)
             plan_ref = parallel_plan_phase5
             for attr in (
                 "cpu_workers",
@@ -6568,14 +6720,46 @@ def _run_shared_phase45_phase5_pipeline(
                 logger.warning("Phase5 auto-tune failed, falling back to global plan: %s", exc_phase5_plan)
 
         _emit_phase5_stats(0, tiles_total_phase5, force=True, stage="start")
-        plan_gpu_allowed = bool(getattr(parallel_plan_phase5, "use_gpu", False))
-        if not use_gpu_phase5_flag:
-            effective_use_gpu = False
+        plan_gpu_allowed = _plan_allows_gpu(True, parallel_plan_phase5)
+        effective_use_gpu = should_use_gpu_for_reproject(
+            "phase5_reproject_coadd",
+            phase5_options,
+            parallel_plan_phase5,
+        )
+        if use_gpu_phase5_flag and not plan_gpu_allowed:
+            logger.info("[Phase5] GPU disabled by auto-tune (plan.use_gpu=False)")
+        def _plan_metric(plan_obj: Any, key: str):
+            if plan_obj is None:
+                return None
+            try:
+                return getattr(plan_obj, key)
+            except AttributeError:
+                if isinstance(plan_obj, Mapping):
+                    return plan_obj.get(key)
+            except Exception:
+                return None
+            return None
+        if effective_use_gpu:
+            gpu_rows_planned = _plan_metric(parallel_plan_phase5, "gpu_rows_per_chunk")
+            gpu_chunk_bytes = _plan_metric(parallel_plan_phase5, "gpu_max_chunk_bytes")
+            chunk_mb = (
+                f"{gpu_chunk_bytes / (1024 ** 2):.1f}"
+                if isinstance(gpu_chunk_bytes, (int, float)) and gpu_chunk_bytes
+                else "n/a"
+            )
+            logger.info(
+                "[Phase5] Using GPU for reproject & coadd (rows_per_chunk=%s, chunk_mb=%s)",
+                gpu_rows_planned if gpu_rows_planned else "-",
+                chunk_mb,
+            )
         else:
-            effective_use_gpu = bool(plan_gpu_allowed)
-            if not effective_use_gpu and use_gpu_phase5_flag:
-                logger.info("[Phase5] GPU disabled by auto-tune (plan.use_gpu=False)")
+            cpu_workers_planned = _plan_metric(parallel_plan_phase5, "cpu_workers")
+            logger.info(
+                "[Phase5] Reproject & coadd running on CPU (cpu_workers=%s)",
+                cpu_workers_planned if cpu_workers_planned else "-",
+            )
 
+        plan_for_two_pass = parallel_plan_phase5 or parallel_plan
         try:
             if effective_use_gpu:
                 import cupy
@@ -6654,11 +6838,15 @@ def _run_shared_phase45_phase5_pipeline(
         two_pass_gain_clip=gain_clip_tuple,
         final_output_wcs=final_output_wcs,
         final_output_shape_hw=final_output_shape_hw,
-        use_gpu_two_pass=use_gpu_phase5_flag,
+        use_gpu_two_pass=should_use_gpu_for_reproject(
+            "phase5_two_pass_coverage",
+            phase5_options,
+            plan_for_two_pass,
+        ),
         logger=logger,
         collected_tiles=collected_tiles_for_second_pass,
         fallback_two_pass_loader=fallback_two_pass_loader,
-        parallel_plan=parallel_plan,
+        parallel_plan=plan_for_two_pass,
         telemetry_ctrl=None if sds_mode_phase5 else telemetry_ctrl,
     )
     if collected_tiles_for_second_pass is not None:
@@ -7373,6 +7561,17 @@ except Exception:
     zemosaic_config = None  # type: ignore
     ZEMOSAIC_CONFIG_AVAILABLE = False
 
+try:
+    from zemosaic_align_stack_gpu import (
+        GPUStackingError as _GPUStackingError,
+        gpu_stack_from_arrays as _gpu_stack_from_arrays,
+    )
+    _GPU_STACK_MODULE_AVAILABLE = True
+except Exception:
+    _GPU_STACK_MODULE_AVAILABLE = False
+    _GPUStackingError = RuntimeError
+    _gpu_stack_from_arrays = None
+
 import importlib.util
 
 # Global semaphore to throttle concurrent *.npy cache reads in Phase 3
@@ -7383,6 +7582,173 @@ _CACHE_IO_SEMAPHORE = threading.Semaphore(2 if os.name == 'nt' else 4)
 # It is initialized later inside run_hierarchical_mosaic and can be reassigned
 # by the runtime monitor to change the concurrency cap without restarting pools.
 _PH3_CONCURRENCY_SEMAPHORE = threading.Semaphore(2 if os.name == 'nt' else 4)
+
+
+_GPU_DEVICE_COUNT_CACHE: int | None = None
+_GPU_SEMAPHORE_LOCK = threading.Lock()
+_GPU_EXECUTION_SEMAPHORE: threading.Semaphore | None = None
+
+
+def _probe_gpu_device_count() -> int:
+    """Return detected CUDA device count (best effort)."""
+
+    global _GPU_DEVICE_COUNT_CACHE
+    if _GPU_DEVICE_COUNT_CACHE is not None:
+        return _GPU_DEVICE_COUNT_CACHE
+    if not CUPY_AVAILABLE:
+        _GPU_DEVICE_COUNT_CACHE = 0
+        return _GPU_DEVICE_COUNT_CACHE
+    try:
+        import cupy  # type: ignore
+
+        count = int(cupy.cuda.runtime.getDeviceCount())
+    except Exception:
+        count = 0
+    _GPU_DEVICE_COUNT_CACHE = max(0, count)
+    return _GPU_DEVICE_COUNT_CACHE
+
+
+def _ensure_gpu_execution_semaphore() -> threading.Semaphore:
+    """Initialize (once) the semaphore used to serialize GPU work."""
+
+    global _GPU_EXECUTION_SEMAPHORE
+    if _GPU_EXECUTION_SEMAPHORE is not None:
+        return _GPU_EXECUTION_SEMAPHORE
+    with _GPU_SEMAPHORE_LOCK:
+        if _GPU_EXECUTION_SEMAPHORE is not None:
+            return _GPU_EXECUTION_SEMAPHORE
+        slots = max(1, _probe_gpu_device_count() or 1)
+        _GPU_EXECUTION_SEMAPHORE = threading.Semaphore(slots)
+    return _GPU_EXECUTION_SEMAPHORE
+
+
+@contextmanager
+def _gpu_execution_slot():
+    """
+    Context manager guarding GPU sections so only a limited number of workers
+    execute GPU-heavy code concurrently (typically 1 device == 1 slot).
+    """
+
+    semaphore = _ensure_gpu_execution_semaphore()
+    semaphore.acquire()
+    try:
+        yield
+    finally:
+        semaphore.release()
+
+
+def _resolve_config_bool(
+    source: Mapping[str, Any] | SimpleNamespace | None,
+    keys: Iterable[str],
+    default: bool = False,
+) -> bool:
+    """Best-effort lookup for boolean flags across config/namespace aliases."""
+
+    if source is None:
+        return default
+    for key in keys:
+        value = None
+        try:
+            if isinstance(source, Mapping):
+                value = source.get(key)
+            else:
+                value = getattr(source, key)
+        except AttributeError:
+            continue
+        except Exception:
+            continue
+        if value is None:
+            continue
+        try:
+            return bool(value)
+        except Exception:
+            continue
+    return default
+
+
+def _plan_allows_gpu(global_intent: bool, plan: Any) -> bool:
+    """Return True when both the global GPU intent and the plan allow GPU usage."""
+
+    if not global_intent:
+        return False
+    if plan is None:
+        return global_intent
+    plan_flag = None
+    try:
+        plan_flag = getattr(plan, "use_gpu")
+    except AttributeError:
+        if isinstance(plan, Mapping):
+            plan_flag = plan.get("use_gpu")
+    except Exception:
+        plan_flag = None
+    if plan_flag is None:
+        return global_intent
+    try:
+        return bool(plan_flag)
+    except Exception:
+        return False
+
+_PHASE5_GPU_DISABLED = False
+_PHASE5_GPU_DISABLED_REASON: str | None = None
+_PHASE5_GPU_DISABLED_PHASES: set[str] = set()
+
+
+def reset_phase5_gpu_runtime_state() -> None:
+    """Clear any runtime GPU disablement recorded by Phase 5 steps."""
+
+    global _PHASE5_GPU_DISABLED, _PHASE5_GPU_DISABLED_REASON, _PHASE5_GPU_DISABLED_PHASES
+    _PHASE5_GPU_DISABLED = False
+    _PHASE5_GPU_DISABLED_REASON = None
+    _PHASE5_GPU_DISABLED_PHASES = set()
+
+
+def mark_phase5_gpu_unavailable(phase_name: str | None = None, reason: str | None = None) -> None:
+    """Record that GPU usage for Phase 5 should be disabled for the remainder of the run."""
+
+    global _PHASE5_GPU_DISABLED, _PHASE5_GPU_DISABLED_REASON
+    _PHASE5_GPU_DISABLED = True
+    if phase_name:
+        _PHASE5_GPU_DISABLED_PHASES.add(str(phase_name))
+    _PHASE5_GPU_DISABLED_REASON = reason
+
+
+def phase5_gpu_runtime_state() -> tuple[bool, str | None, set[str]]:
+    """Return ``(disabled, reason, phases)`` to help logs/tests introspect fallback state."""
+
+    return _PHASE5_GPU_DISABLED, _PHASE5_GPU_DISABLED_REASON, set(_PHASE5_GPU_DISABLED_PHASES)
+
+
+def should_use_gpu_for_reproject(
+    phase_name: str,
+    config: Mapping[str, Any] | SimpleNamespace | bool | None,
+    parallel_plan: Any,
+) -> bool:
+    """
+    Decide whether Phase 5 reprojection helpers should run on GPU.
+
+    The decision combines the global GPU intent (GUI/CLI toggle), auto-tune plan,
+    runtime GPU availability, and any fallback flag set after previous failures.
+    """
+
+    if not phase_name:
+        phase_name = "phase5_reproject"
+    if _PHASE5_GPU_DISABLED:
+        return False
+    if isinstance(config, bool):
+        gpu_pref = config
+    else:
+        gpu_pref = _resolve_config_bool(
+            config,
+            ("use_gpu_phase5", "use_gpu_global", "use_gpu", "stack_use_gpu", "use_gpu_stack"),
+            False,
+        )
+    if not gpu_pref:
+        return False
+    if not gpu_is_available():
+        return False
+    if not _plan_allows_gpu(gpu_pref, parallel_plan):
+        return False
+    return True
 
 # --- Basic IO throughput probing helpers (Windows-friendly, OS-agnostic) ---
 def _measure_sequential_read_mbps(file_path: str, bytes_to_read: int = 16 * 1024 * 1024, block_size: int = 1 * 1024 * 1024) -> float | None:
@@ -9114,6 +9480,129 @@ def get_wcs_and_pretreat_raw_file(
 
 # ... (vos imports existants : os, shutil, time, traceback, gc, logging, np, astropy, reproject, et les modules zemosaic_...)
 
+def _stack_master_tile_cpu(
+    aligned_images: list[np.ndarray],
+    *,
+    stack_norm_method: str,
+    stack_weight_method: str,
+    stack_reject_algo: str,
+    stack_kappa_low: float,
+    stack_kappa_high: float,
+    parsed_winsor_limits: tuple[float, float],
+    stack_final_combine: str,
+    apply_radial_weight: bool,
+    radial_feather_fraction: float,
+    radial_shape_power: float,
+    winsor_pool_workers: int | None,
+    winsor_max_frames_per_pass: int | None,
+    progress_callback: Callable | None,
+    zconfig: SimpleNamespace,
+    pcb_tile: Callable | None,
+    tile_id: int,
+    parallel_plan: ParallelPlan | None = None,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """
+    CPU-only stacking core used by Phase 3.
+
+    Returns the stacked image and the metadata dictionary exactly as expected
+    by the downstream logic in ``create_master_tile``.
+    """
+    stack_metadata: dict[str, Any] = {}
+    current_parallel_plan = parallel_plan or getattr(zconfig, "parallel_plan", None)
+    effective_winsor_frames_per_pass = int(winsor_max_frames_per_pass) if winsor_max_frames_per_pass is not None else 0
+    if effective_winsor_frames_per_pass < 0:
+        effective_winsor_frames_per_pass = 0
+
+    try:
+        sample_frame = aligned_images[0] if aligned_images else None
+        if sample_frame is not None:
+            per_frame_bytes = int(np.asarray(sample_frame).nbytes)
+            available_bytes = int(psutil.virtual_memory().available)
+            overhead = 3.2
+            target_fraction = 0.55
+            min_pass = max(1, int(getattr(zconfig, "winsor_min_frames_per_pass", 2)))
+            if per_frame_bytes > 0:
+                preemptive_limit = max(
+                    min_pass,
+                    int((available_bytes * target_fraction) // max(1, int(per_frame_bytes * overhead))),
+                )
+                if preemptive_limit < len(aligned_images):
+                    if effective_winsor_frames_per_pass <= 0 or preemptive_limit < effective_winsor_frames_per_pass:
+                        effective_winsor_frames_per_pass = preemptive_limit
+                    try:
+                        setattr(zconfig, "stack_memmap_enabled", True)
+                    except Exception:
+                        pass
+                    if pcb_tile:
+                        try:
+                            pcb_tile(
+                                "stack_mem_preemptive_stream",
+                                prog=None,
+                                lvl="INFO_DETAIL",
+                                frames_per_pass=effective_winsor_frames_per_pass,
+                                tile_id=tile_id,
+                            )
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+
+    if stack_reject_algo == "winsorized_sigma_clip":
+        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_winsorized_sigma_clip(
+            aligned_images,
+            weight_method=stack_weight_method,
+            zconfig=zconfig,
+            kappa=stack_kappa_low,
+            winsor_limits=parsed_winsor_limits,
+            apply_rewinsor=True,
+            winsor_max_frames_per_pass=effective_winsor_frames_per_pass,
+            winsor_max_workers=int(winsor_pool_workers) if winsor_pool_workers is not None else 1,
+            stack_metadata=stack_metadata,
+            parallel_plan=current_parallel_plan,
+        )
+    elif stack_reject_algo == "kappa_sigma":
+        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_kappa_sigma_clip(
+            aligned_images,
+            weight_method=stack_weight_method,
+            zconfig=zconfig,
+            sigma_low=stack_kappa_low,
+            sigma_high=stack_kappa_high,
+            stack_metadata=stack_metadata,
+            parallel_plan=current_parallel_plan,
+        )
+    elif stack_reject_algo == "linear_fit_clip":
+        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_linear_fit_clip(
+            aligned_images,
+            weight_method=stack_weight_method,
+            zconfig=zconfig,
+            sigma=stack_kappa_high,
+            stack_metadata=stack_metadata,
+            parallel_plan=current_parallel_plan,
+        )
+    else:
+        master_tile_stacked_HWC = zemosaic_align_stack.stack_aligned_images(
+            aligned_image_data_list=aligned_images,
+            normalize_method=stack_norm_method,
+            weighting_method=stack_weight_method,
+            rejection_algorithm=stack_reject_algo,
+            final_combine_method=stack_final_combine,
+            sigma_clip_low=stack_kappa_low,
+            sigma_clip_high=stack_kappa_high,
+            winsor_limits=parsed_winsor_limits,
+            minimum_signal_adu_target=0.0,
+            apply_radial_weight=apply_radial_weight,
+            radial_feather_fraction=radial_feather_fraction,
+            radial_shape_power=radial_shape_power,
+            winsor_max_workers=winsor_pool_workers,
+            progress_callback=progress_callback,
+            zconfig=zconfig,
+            stack_metadata=stack_metadata,
+            parallel_plan=current_parallel_plan,
+        )
+
+    return master_tile_stacked_HWC, stack_metadata
+
+
 def create_master_tile(
     seestar_stack_group_info: list[dict],
     tile_id: int,
@@ -9188,11 +9677,20 @@ def create_master_tile(
     if parallel_plan is not None:
         setattr(zconfig, "parallel_plan", parallel_plan)
 
-    # Ensure stacking GPU preference mirrors the Phase 5 GPU intent when not explicitly set.
+    # Ensure stacking GPU preference mirrors the global GPU intent when not explicitly set.
+    global_gpu_pref = _resolve_config_bool(
+        zconfig,
+        ("use_gpu_global", "use_gpu_phase5", "stack_use_gpu", "use_gpu_stack"),
+        False,
+    )
     try:
-        phase5_pref = bool(getattr(zconfig, "use_gpu_phase5"))
+        setattr(zconfig, "use_gpu_global", bool(global_gpu_pref))
     except Exception:
-        phase5_pref = False
+        pass
+    try:
+        setattr(zconfig, "use_gpu_phase5", bool(global_gpu_pref))
+    except Exception:
+        pass
     try:
         stack_pref = getattr(zconfig, "stack_use_gpu")
     except AttributeError:
@@ -9200,14 +9698,14 @@ def create_master_tile(
     except Exception:
         stack_pref = None
     if stack_pref is None:
-        setattr(zconfig, "stack_use_gpu", phase5_pref)
+        setattr(zconfig, "stack_use_gpu", bool(global_gpu_pref))
     else:
         try:
             setattr(zconfig, "stack_use_gpu", bool(stack_pref))
         except Exception:
-            setattr(zconfig, "stack_use_gpu", phase5_pref)
+            setattr(zconfig, "stack_use_gpu", bool(global_gpu_pref))
     if not hasattr(zconfig, "use_gpu_stack") or getattr(zconfig, "use_gpu_stack") is None:
-        setattr(zconfig, "use_gpu_stack", getattr(zconfig, "stack_use_gpu", phase5_pref))
+        setattr(zconfig, "use_gpu_stack", getattr(zconfig, "stack_use_gpu", bool(global_gpu_pref)))
     try:
         setattr(zconfig, "poststack_equalize_rgb", bool(poststack_equalize_rgb))
     except Exception:
@@ -9396,96 +9894,115 @@ def create_master_tile(
     pcb_tile(f"{func_id_log_base}_info_stacking_started", prog=None, lvl="DEBUG_DETAIL",
              num_to_stack=len(valid_aligned_images), tile_id=tile_id) # Les options sont loggées au début
 
+    master_tile_stacked_HWC: np.ndarray | None = None
     stack_metadata: dict[str, Any] = {}
 
-    current_parallel_plan = parallel_plan or getattr(zconfig, "parallel_plan", None)
-    effective_winsor_frames_per_pass = int(winsor_max_frames_per_pass) if winsor_max_frames_per_pass is not None else 0
-    if effective_winsor_frames_per_pass < 0:
-        effective_winsor_frames_per_pass = 0
-    try:
-        sample_frame = valid_aligned_images[0] if valid_aligned_images else None
-        if sample_frame is not None:
-            per_frame_bytes = int(np.asarray(sample_frame).nbytes)
-            available_bytes = int(psutil.virtual_memory().available)
-            overhead = 3.2
-            target_fraction = 0.55
-            min_pass = max(1, int(getattr(zconfig, "winsor_min_frames_per_pass", 2)))
-            if per_frame_bytes > 0:
-                preemptive_limit = max(
-                    min_pass,
-                    int((available_bytes * target_fraction) // max(1, int(per_frame_bytes * overhead))),
-                )
-                if preemptive_limit < len(valid_aligned_images):
-                    if effective_winsor_frames_per_pass <= 0 or preemptive_limit < effective_winsor_frames_per_pass:
-                        effective_winsor_frames_per_pass = preemptive_limit
-                    try:
-                        setattr(zconfig, "stack_memmap_enabled", True)
-                    except Exception:
-                        pass
-                    try:
-                        pcb_tile(
-                            "stack_mem_preemptive_stream",
-                            prog=None,
-                            lvl="INFO_DETAIL",
-                            frames_per_pass=effective_winsor_frames_per_pass,
-                            tile_id=tile_id,
-                        )
-                    except Exception:
-                        pass
-    except Exception:
-        pass
+    stacking_params = {
+        "stack_norm_method": stack_norm_method,
+        "stack_weight_method": stack_weight_method,
+        "stack_reject_algo": stack_reject_algo,
+        "stack_kappa_low": stack_kappa_low,
+        "stack_kappa_high": stack_kappa_high,
+        "parsed_winsor_limits": parsed_winsor_limits,
+        "stack_final_combine": stack_final_combine,
+        "apply_radial_weight": apply_radial_weight,
+    }
 
-    if stack_reject_algo == "winsorized_sigma_clip":
-        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_winsorized_sigma_clip(
+    current_parallel_plan = parallel_plan or getattr(zconfig, "parallel_plan", None)
+    gpu_allowed_by_config = bool(getattr(zconfig, "use_gpu_stack", getattr(zconfig, "stack_use_gpu", False)))
+    gpu_allowed_by_plan = True
+    if current_parallel_plan is not None:
+        try:
+            gpu_allowed_by_plan = bool(getattr(current_parallel_plan, "use_gpu", True))
+        except Exception:
+            gpu_allowed_by_plan = True
+    gpu_candidate = (
+        _GPU_STACK_MODULE_AVAILABLE
+        and _gpu_stack_from_arrays is not None
+        and gpu_allowed_by_config
+        and gpu_allowed_by_plan
+    )
+
+    if gpu_candidate:
+        try:
+            pcb_tile(
+                "phase3_gpu_attempt",
+                prog=None,
+                lvl="INFO_DETAIL",
+                tile_id=tile_id,
+                frames=len(valid_aligned_images),
+            )
+        except Exception:
+            pass
+        gpu_start = time.perf_counter()
+        try:
+            with _gpu_execution_slot():
+                master_tile_stacked_HWC, stack_metadata = _gpu_stack_from_arrays(
+                    valid_aligned_images,
+                    stacking_params,
+                    parallel_plan=current_parallel_plan,
+                    logger=logger,
+                    pcb_tile=pcb_tile,
+                    tile_id=tile_id,
+                )
+            try:
+                pcb_tile(
+                    "phase3_gpu_success",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                    tile_id=tile_id,
+                    frames=len(valid_aligned_images),
+                    duration_s=time.perf_counter() - gpu_start,
+                )
+            except Exception:
+                pass
+        except _GPUStackingError as exc_gpu:
+            master_tile_stacked_HWC = None
+            stack_metadata = {}
+            try:
+                pcb_tile(
+                    "phase3_gpu_fallback",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                    tile_id=tile_id,
+                    error=str(exc_gpu),
+                )
+            except Exception:
+                pass
+        except Exception as exc_gpu:
+            master_tile_stacked_HWC = None
+            stack_metadata = {}
+            try:
+                pcb_tile(
+                    "phase3_gpu_fallback",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                    tile_id=tile_id,
+                    error=str(exc_gpu),
+                )
+            except Exception:
+                pass
+
+    if master_tile_stacked_HWC is None:
+        master_tile_stacked_HWC, stack_metadata = _stack_master_tile_cpu(
             valid_aligned_images,
-            weight_method=stack_weight_method,
-            zconfig=zconfig,
-            kappa=stack_kappa_low,
-            winsor_limits=parsed_winsor_limits,
-            apply_rewinsor=True,
-            winsor_max_frames_per_pass=effective_winsor_frames_per_pass,
-            winsor_max_workers=int(winsor_pool_workers) if winsor_pool_workers is not None else 1,
-            stack_metadata=stack_metadata,
-            parallel_plan=current_parallel_plan,
-        )
-    elif stack_reject_algo == "kappa_sigma":
-        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_kappa_sigma_clip(
-            valid_aligned_images,
-            weight_method=stack_weight_method,
-            zconfig=zconfig,
-            sigma_low=stack_kappa_low,
-            sigma_high=stack_kappa_high,
-            stack_metadata=stack_metadata,
-            parallel_plan=current_parallel_plan,
-        )
-    elif stack_reject_algo == "linear_fit_clip":
-        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_linear_fit_clip(
-            valid_aligned_images,
-            weight_method=stack_weight_method,
-            zconfig=zconfig,
-            sigma=stack_kappa_high,
-            stack_metadata=stack_metadata,
-            parallel_plan=current_parallel_plan,
-        )
-    else:
-        master_tile_stacked_HWC = zemosaic_align_stack.stack_aligned_images(
-            aligned_image_data_list=valid_aligned_images,
-            normalize_method=stack_norm_method,
-            weighting_method=stack_weight_method,
-            rejection_algorithm=stack_reject_algo,
-            final_combine_method=stack_final_combine,
-            sigma_clip_low=stack_kappa_low,
-            sigma_clip_high=stack_kappa_high,
-            winsor_limits=parsed_winsor_limits,
-            minimum_signal_adu_target=0.0,
+            stack_norm_method=stack_norm_method,
+            stack_weight_method=stack_weight_method,
+            stack_reject_algo=stack_reject_algo,
+            stack_kappa_low=stack_kappa_low,
+            stack_kappa_high=stack_kappa_high,
+            parsed_winsor_limits=parsed_winsor_limits,
+            stack_final_combine=stack_final_combine,
             apply_radial_weight=apply_radial_weight,
             radial_feather_fraction=radial_feather_fraction,
             radial_shape_power=radial_shape_power,
-            winsor_max_workers=winsor_pool_workers,
+            winsor_pool_workers=winsor_pool_workers,
+            winsor_max_frames_per_pass=winsor_max_frames_per_pass,
             progress_callback=progress_callback,
             zconfig=zconfig,
-            stack_metadata=stack_metadata,
-            parallel_plan=current_parallel_plan,
+            pcb_tile=pcb_tile,
+            tile_id=tile_id,
+            parallel_plan=parallel_plan,
         )
     
     del valid_aligned_images; gc.collect() # valid_aligned_images a été passé par valeur (copie de la liste)
@@ -10206,6 +10723,7 @@ def assemble_final_mosaic_incremental(
         nontrivial_detected = True
 
     affine_log_indices = _select_affine_log_indices(pending_affine_list)
+    gain_limit_min, gain_limit_max, affine_offset_limit_adu = _resolve_intertile_affine_limits()
 
     sum_shape = (h, w, n_channels)
     weight_shape = (h, w)
@@ -10288,6 +10806,34 @@ def assemble_final_mosaic_incremental(
                         gain_val = 1.0
                     if not np.isfinite(offset_val):
                         offset_val = 0.0
+                    (
+                        gain_before,
+                        offset_before,
+                        gain_val,
+                        offset_val,
+                        clamp_flag,
+                    ) = _clamp_affine_parameters(
+                        gain_val,
+                        offset_val,
+                        enable_clamp=bool(match_background),
+                        gain_limit_min=gain_limit_min,
+                        gain_limit_max=gain_limit_max,
+                        affine_offset_limit_adu=affine_offset_limit_adu,
+                    )
+                    if clamp_flag:
+                        try:
+                            pcb_asm(
+                                "assemble_warn_affine_clamped",
+                                prog=None,
+                                lvl="INFO_DETAIL",
+                                tile_id=f"inc_tile_{tile_idx}",
+                                gain_before=gain_before,
+                                gain_after=gain_val,
+                                offset_before=offset_before,
+                                offset_after=offset_val,
+                            )
+                        except Exception:
+                            pass
                     if (
                         affine_log_indices
                         and tile_idx in affine_log_indices
@@ -11025,6 +11571,8 @@ def assemble_final_mosaic_reproject_coadd(
     else:
         tile_weighting_applied = False
 
+    gain_limit_min, gain_limit_max, affine_offset_limit_adu = _resolve_intertile_affine_limits()
+
     # Optional inter-tile photometric (gain/offset) calibration
     pending_affine_list, nontrivial_affine = _sanitize_affine_corrections(
         tile_affine_corrections,
@@ -11123,84 +11671,71 @@ def assemble_final_mosaic_reproject_coadd(
         pending_affine_list = None
 
     if pending_affine_list and affine_by_id:
-        if use_gpu:
-            nontrivial_affine = True
-            for entry in effective_tiles:
-                tile_id = entry.get("tile_id")
-                if not tile_id:
-                    continue
-                gain_val, offset_val = affine_by_id.get(tile_id, (1.0, 0.0))
-                logger.info(
-                    "apply_photometric: tile=%s gain=%.5f offset=%.5f",
-                    tile_id,
-                    gain_val,
-                    offset_val,
+        corrected_tiles = 0
+        for tile_entry in effective_tiles:
+            tile_id = tile_entry.get("tile_id")
+            arr_obj = tile_entry.get("data")
+            if not tile_id or arr_obj is None:
+                continue
+            (
+                gain_before,
+                offset_before,
+                gain_to_apply,
+                offset_to_apply,
+                clamped_flag,
+            ) = _resolve_affine_gain_offset_for_tile(
+                tile_id,
+                affine_by_id,
+                match_background=match_bg,
+                gain_limit_min=gain_limit_min,
+                gain_limit_max=gain_limit_max,
+                affine_offset_limit_adu=affine_offset_limit_adu,
+            )
+            if gain_to_apply == 1.0 and offset_to_apply == 0.0:
+                continue
+            try:
+                tile_entry["data"] = _apply_photometric_gain_offset(
+                    arr_obj,
+                    gain_to_apply,
+                    offset_to_apply,
                 )
-        else:
-            corrected_tiles = 0
-            for tile_entry in effective_tiles:
-                tile_id = tile_entry.get("tile_id")
-                if not tile_id or tile_entry.get("data") is None:
-                    continue
-                gain_val, offset_val = affine_by_id.get(tile_id, (1.0, 0.0))
-                try:
-                    arr_np = np.asarray(tile_entry["data"], dtype=np.float32, order="C")
-                    gain_to_apply = float(gain_val)
-                    offset_to_apply = float(offset_val)
-                    if match_bg:
-                        gain_before = gain_to_apply
-                        offset_before = offset_to_apply
-                        if gain_to_apply < gain_limit_min:
-                            gain_to_apply = gain_limit_min
-                        elif gain_to_apply > gain_limit_max:
-                            gain_to_apply = gain_limit_max
-                        if affine_offset_limit_adu > 0.0:
-                            if abs(offset_to_apply) > affine_offset_limit_adu:
-                                offset_to_apply = 0.0
-                            else:
-                                offset_to_apply = max(-affine_offset_limit_adu, min(offset_to_apply, affine_offset_limit_adu))
-                        if gain_to_apply != gain_before or offset_to_apply != offset_before:
-                            try:
-                                _pcb(
-                                    "assemble_warn_affine_clamped",
-                                    prog=None,
-                                    lvl="INFO_DETAIL",
-                                    tile_id=tile_id,
-                                    gain_before=gain_before,
-                                    gain_after=gain_to_apply,
-                                    offset_before=offset_before,
-                                    offset_after=offset_to_apply,
-                                )
-                            except Exception:
-                                pass
-                    if gain_to_apply != 1.0:
-                        np.multiply(arr_np, gain_to_apply, out=arr_np, casting="unsafe")
-                    if offset_to_apply != 0.0:
-                        np.add(arr_np, offset_to_apply, out=arr_np, casting="unsafe")
-                    tile_entry["data"] = arr_np
-                    corrected_tiles += 1
-                    logger.info(
-                        "apply_photometric: tile=%s gain=%.5f offset=%.5f",
-                        tile_id,
-                        gain_to_apply,
-                        offset_to_apply,
-                    )
-                except Exception:
-                    continue
-            if corrected_tiles:
+            except Exception:
+                continue
+            corrected_tiles += 1
+            logger.info(
+                "apply_photometric: tile=%s gain=%.5f offset=%.5f",
+                tile_id,
+                gain_to_apply,
+                offset_to_apply,
+            )
+            if clamped_flag:
                 try:
                     _pcb(
-                        "assemble_info_intertile_photometric_applied",
+                        "assemble_warn_affine_clamped",
                         prog=None,
                         lvl="INFO_DETAIL",
-                        num_tiles=corrected_tiles,
+                        tile_id=tile_id,
+                        gain_before=gain_before,
+                        gain_after=gain_to_apply,
+                        offset_before=offset_before,
+                        offset_after=offset_to_apply,
                     )
                 except Exception:
                     pass
-                nontrivial_affine = True
-            else:
-                nontrivial_affine = False
-                pending_affine_list = None
+        if corrected_tiles:
+            try:
+                _pcb(
+                    "assemble_info_intertile_photometric_applied",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                    num_tiles=corrected_tiles,
+                )
+            except Exception:
+                pass
+            nontrivial_affine = True
+        else:
+            nontrivial_affine = False
+        pending_affine_list = None
     else:
         nontrivial_affine = False
         pending_affine_list = None
@@ -11217,12 +11752,33 @@ def assemble_final_mosaic_reproject_coadd(
             if arr is None or tile_wcs is None:
                 continue
             try:
-                arr_copy = np.array(arr, copy=True)
+                arr_copy = np.asarray(arr, dtype=np.float32, order="C", copy=True)
             except Exception:
                 try:
                     arr_copy = arr.copy()
                 except Exception:
                     arr_copy = np.asarray(arr, dtype=np.float32)
+            if affine_by_id:
+                (
+                    _,
+                    _,
+                    gain_to_apply,
+                    offset_to_apply,
+                    clamped_flag,
+                ) = _resolve_affine_gain_offset_for_tile(
+                    entry.get("tile_id"),
+                    affine_by_id,
+                    match_background=match_bg,
+                    gain_limit_min=gain_limit_min,
+                    gain_limit_max=gain_limit_max,
+                    affine_offset_limit_adu=affine_offset_limit_adu,
+                )
+                if gain_to_apply != 1.0 or offset_to_apply != 0.0:
+                    arr_copy = _apply_photometric_gain_offset(
+                        arr_copy,
+                        gain_to_apply,
+                        offset_to_apply,
+                    )
             cov_copy = None
             if coverage_mask is not None:
                 try:
@@ -11392,21 +11948,47 @@ def assemble_final_mosaic_reproject_coadd(
                         )
 
             def _invoke_reproject(local_kwargs: dict):
+                nonlocal use_gpu
                 invoke_kwargs = dict(local_kwargs)
                 if tile_weighting_applied and weights_for_entries is not None:
                     invoke_kwargs["tile_weights"] = weights_for_entries
-                return reproject_and_coadd_wrapper(
-                    data_list=data_list,
-                    wcs_list=wcs_list,
-                    shape_out=final_output_shape_hw,
-                    output_projection=output_header,
-                    use_gpu=use_gpu,
-                    cpu_func=reproject_and_coadd,
-                    reproject_function=reproject_interp,
-                    combine_function="mean",
-                    progress_callback=_pcb,
-                    **local_kwargs,
-                )
+                try:
+                    return reproject_and_coadd_wrapper(
+                        data_list=data_list,
+                        wcs_list=wcs_list,
+                        shape_out=final_output_shape_hw,
+                        output_projection=output_header,
+                        use_gpu=use_gpu,
+                        cpu_func=reproject_and_coadd,
+                        reproject_function=reproject_interp,
+                        combine_function="mean",
+                        progress_callback=_pcb,
+                        allow_cpu_fallback=not use_gpu,
+                        **local_kwargs,
+                    )
+                except TypeError:
+                    raise
+                except Exception as gpu_exc:
+                    if not use_gpu:
+                        raise
+                    mark_phase5_gpu_unavailable("phase5_reproject_coadd", str(gpu_exc))
+                    use_gpu = False
+                    logger.warning(
+                        "[Phase5] GPU reprojection failed (%s); disabling GPU for remainder of run.",
+                        gpu_exc,
+                    )
+                    return reproject_and_coadd_wrapper(
+                        data_list=data_list,
+                        wcs_list=wcs_list,
+                        shape_out=final_output_shape_hw,
+                        output_projection=output_header,
+                        use_gpu=False,
+                        cpu_func=reproject_and_coadd,
+                        reproject_function=reproject_interp,
+                        combine_function="mean",
+                        progress_callback=_pcb,
+                        **local_kwargs,
+                    )
 
             try:
                 chan_mosaic, chan_cov = _invoke_reproject(reproj_call_kwargs)
@@ -11846,8 +12428,9 @@ def _chunked_gaussian_blur(
                 _emit(chunk_idx, chunk_total)
             return output.astype(np.float32, copy=False), "cupy_chunk"
         except Exception as exc_gpu:
+            mark_phase5_gpu_unavailable("phase5_two_pass_coverage", str(exc_gpu))
             if logger:
-                logger.debug("[TwoPass] cupy chunked blur failed: %s", exc_gpu)
+                logger.warning("[TwoPass] GPU coverage blur failed (%s); falling back to CPU.", exc_gpu)
 
     try:
         from scipy.ndimage import gaussian_filter  # type: ignore
@@ -12066,6 +12649,10 @@ def compute_per_tile_gains_from_coverage(
         progress_hook=_blur_progress,
         logger=logger,
     )
+    if use_gpu:
+        disabled, _, _ = phase5_gpu_runtime_state()
+        if disabled:
+            use_gpu = False
     if logger:
         logger.debug(
             "[TwoPass] Coverage blur applied with sigma=%d using %s (rows_per_chunk=%d, chunk_bytes=%s)",
@@ -12295,6 +12882,8 @@ def run_second_pass_coverage_renorm(
             }
             if stage:
                 ctx["stage"] = stage
+            disabled, _, _ = phase5_gpu_runtime_state()
+            ctx["gpu_runtime_disabled"] = bool(disabled)
             if plan_rows_cpu_hint is not None:
                 ctx["rows_per_chunk"] = int(plan_rows_cpu_hint)
             if plan_rows_gpu_hint is not None:
@@ -12346,6 +12935,10 @@ def run_second_pass_coverage_renorm(
         if logger:
             logger.warning("[TwoPass] Gain computation failed: %s", exc, exc_info=True)
         return None
+    if use_gpu:
+        disabled, _, _ = phase5_gpu_runtime_state()
+        if disabled:
+            use_gpu = False
     if logger:
         finite_gains = [g for g in gains if np.isfinite(g)]
         logger.debug(
@@ -12444,14 +13037,37 @@ def run_second_pass_coverage_renorm(
         data_list = [tile[..., ch_idx] if tile.ndim == 3 else tile[..., 0] for tile in corrected_tiles]
 
         def _invoke_reproj(use_gpu_local: bool, local_kwargs: dict[str, Any]):
-            return zemosaic_utils.reproject_and_coadd_wrapper(
-                data_list=data_list,
-                wcs_list=tiles_wcs,
-                shape_out=shape_out_hw,
-                use_gpu=use_gpu_local,
-                cpu_func=reproject_and_coadd,
-                **local_kwargs,
-            )
+            nonlocal use_gpu
+            try:
+                return zemosaic_utils.reproject_and_coadd_wrapper(
+                    data_list=data_list,
+                    wcs_list=tiles_wcs,
+                    shape_out=shape_out_hw,
+                    use_gpu=use_gpu_local,
+                    cpu_func=reproject_and_coadd,
+                    allow_cpu_fallback=not use_gpu_local,
+                    **local_kwargs,
+                )
+            except TypeError:
+                raise
+            except Exception as gpu_exc:
+                if not use_gpu_local:
+                    raise
+                mark_phase5_gpu_unavailable("phase5_two_pass_coverage", str(gpu_exc))
+                use_gpu = False
+                if logger:
+                    logger.warning(
+                        "[TwoPass] GPU reprojection failed (%s); disabling GPU for remainder of run.",
+                        gpu_exc,
+                    )
+                return zemosaic_utils.reproject_and_coadd_wrapper(
+                    data_list=data_list,
+                    wcs_list=tiles_wcs,
+                    shape_out=shape_out_hw,
+                    use_gpu=False,
+                    cpu_func=reproject_and_coadd,
+                    **local_kwargs,
+                )
 
         local_kwargs = dict(reproj_kwargs)
         try:
@@ -12756,7 +13372,7 @@ def run_hierarchical_mosaic(
     poststack_anchor_median_clip_sigma_config: float = 3.5,
     poststack_anchor_min_improvement_config: float = 0.12,
     poststack_anchor_use_overlap_affine_config: bool = True,
-    use_gpu_phase5: bool = False,
+    use_gpu_phase5: bool | None = None,
     gpu_id_phase5: int | None = None,
     enable_tile_weighting_config: bool | None = None,
     tile_weight_mode_config: str = "n_frames",
@@ -12787,6 +13403,17 @@ def run_hierarchical_mosaic(
             worker_config_cache = zemosaic_config.load_config() or {}
         except Exception:
             worker_config_cache = {}
+
+    if use_gpu_phase5 is None:
+        global_gpu_pref = _resolve_config_bool(
+            worker_config_cache,
+            ("use_gpu_global", "use_gpu_phase5", "stack_use_gpu", "use_gpu_stack"),
+            False,
+        )
+    else:
+        global_gpu_pref = bool(use_gpu_phase5)
+    for key in ("use_gpu_global", "use_gpu_phase5", "stack_use_gpu", "use_gpu_stack"):
+        worker_config_cache[key] = global_gpu_pref
 
     try:
         zconfig = SimpleNamespace(**worker_config_cache)
@@ -13037,7 +13664,7 @@ def run_hierarchical_mosaic(
                 if value is not None:
                     ctx[attr] = value
         try:
-            ctx.setdefault("use_gpu_phase5", bool(use_gpu_phase5))
+            ctx.setdefault("use_gpu_phase5", bool(global_gpu_pref))
         except Exception:
             pass
         if extra:
@@ -13132,7 +13759,7 @@ def run_hierarchical_mosaic(
     except (TypeError, ValueError):
         cluster_threshold = 0
     SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG = (
-        cluster_threshold if cluster_threshold > 0 else 0.05
+        cluster_threshold if cluster_threshold > 0 else 0.12
 
     )
     # Orientation split threshold (degrees). 0 disables orientation filtering
@@ -13155,7 +13782,7 @@ def run_hierarchical_mosaic(
     DEFAULT_PHASE_WORKER_RATIO = 1.0
     ALIGNMENT_PHASE_WORKER_RATIO = 1.0  # Phase 3 targets ~90% of logical cores while keeping one free
 
-    if use_gpu_phase5 and gpu_id_phase5 is not None and CUPY_AVAILABLE:
+    if global_gpu_pref and gpu_id_phase5 is not None and CUPY_AVAILABLE:
         os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id_phase5)
         try:
@@ -13168,14 +13795,14 @@ def run_hierarchical_mosaic(
                 lvl="ERROR",
                 error=str(e),
             )
-            use_gpu_phase5 = False
+            global_gpu_pref = False
     else:
         for v in ("CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER"):
             os.environ.pop(v, None)
 
     # Determine final GPU usage flag only if a valid NVIDIA GPU is selected
     use_gpu_phase5_flag = (
-        use_gpu_phase5
+        global_gpu_pref
         and gpu_id_phase5 is not None
         and CUPY_AVAILABLE
         and gpu_is_available()
@@ -13460,6 +14087,8 @@ def run_hierarchical_mosaic(
         except Exception as exc_parallel_plan:
             logger.warning("Parallel auto-tune failed: %s", exc_parallel_plan)
             global_parallel_plan = None
+
+    global_plan_gpu_pref = _plan_allows_gpu(use_gpu_phase5_flag, global_parallel_plan)
 
     # Kick off a stage progress stream so the GUI progress bar animates
     try:
@@ -14465,7 +15094,7 @@ def run_hierarchical_mosaic(
     global_wcs_plan["winsor_worker_limit"] = int(winsor_worker_limit)
     global_wcs_plan["winsor_max_frames_per_pass"] = int(winsor_max_frames_per_pass)
     global_wcs_plan["use_align_helpers"] = True
-    global_wcs_plan["prefer_gpu_helpers"] = bool(use_gpu_phase5_flag)
+    global_wcs_plan["prefer_gpu_helpers"] = bool(global_plan_gpu_pref)
     pcb(
         f"Winsor worker limit set to {winsor_worker_limit}" + (
             " (ProcessPoolExecutor enabled)" if winsor_worker_limit > 1 else ""
@@ -14870,6 +15499,12 @@ def run_hierarchical_mosaic(
                 pcb("phase5_sds_polish_start", prog=None, lvl="INFO")
                 if logger:
                     logger.info("[SDS] Phase 5 polish on global SDS mosaic (skipping master tiles)")
+                sds_parallel_plan = getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan"))
+                sds_use_gpu = should_use_gpu_for_reproject(
+                    "phase5_two_pass_coverage",
+                    phase5_options,
+                    sds_parallel_plan,
+                )
                 final_mosaic_data_HWC, final_mosaic_coverage_HW, alpha_final = _finalize_sds_global_mosaic(
                     sds_mosaic_data_HWC,
                     sds_coverage_HW,
@@ -14889,12 +15524,12 @@ def run_hierarchical_mosaic(
                     two_pass_enabled=bool(two_pass_enabled),
                     two_pass_sigma_px=int(two_pass_sigma_px),
                     two_pass_gain_clip=gain_clip_tuple,
-                    use_gpu_two_pass=use_gpu_phase5_flag,
+                    use_gpu_two_pass=sds_use_gpu,
                     enable_autocrop=bool(global_wcs_autocrop_enabled_config),
                     autocrop_margin_px=global_wcs_autocrop_margin_px_config,
                     global_plan=global_wcs_plan,
                     fallback_two_pass_loader=None,
-                    parallel_plan=getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan")),
+                    parallel_plan=sds_parallel_plan,
                 )
                 final_alpha_map = alpha_final
                 if final_mosaic_data_HWC is not None:
@@ -14942,6 +15577,12 @@ def run_hierarchical_mosaic(
                             if hasattr(final_mosaic_data_HWC, "shape")
                             else None
                         )
+                        sds_parallel_plan = getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan"))
+                        sds_use_gpu = should_use_gpu_for_reproject(
+                            "phase5_two_pass_coverage",
+                            phase5_options,
+                            sds_parallel_plan,
+                        )
                         final_mosaic_data_HWC, final_mosaic_coverage_HW, alpha_final = _finalize_sds_global_mosaic(
                             final_mosaic_data_HWC,
                             final_mosaic_coverage_HW,
@@ -14961,12 +15602,12 @@ def run_hierarchical_mosaic(
                             two_pass_enabled=bool(two_pass_enabled),
                             two_pass_sigma_px=int(two_pass_sigma_px),
                             two_pass_gain_clip=gain_clip_tuple,
-                            use_gpu_two_pass=use_gpu_phase5_flag,
+                            use_gpu_two_pass=sds_use_gpu,
                             enable_autocrop=bool(global_wcs_autocrop_enabled_config),
                             autocrop_margin_px=global_wcs_autocrop_margin_px_config,
                             global_plan=global_wcs_plan,
                             fallback_two_pass_loader=None,
-                            parallel_plan=getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan")),
+                            parallel_plan=sds_parallel_plan,
                         )
                         final_alpha_map = alpha_final
                         if final_mosaic_data_HWC is not None:
