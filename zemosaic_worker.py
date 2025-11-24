@@ -10444,6 +10444,7 @@ def create_master_tile(
         "parsed_winsor_limits": parsed_winsor_limits,
         "stack_final_combine": stack_final_combine,
         "apply_radial_weight": apply_radial_weight,
+        "poststack_equalize_rgb": poststack_equalize_rgb,
     }
 
     current_parallel_plan = parallel_plan or getattr(zconfig, "parallel_plan", None)
@@ -10482,6 +10483,7 @@ def create_master_tile(
                     logger=logger,
                     pcb_tile=pcb_tile,
                     tile_id=tile_id,
+                    zconfig=zconfig,
                 )
             try:
                 pcb_tile(

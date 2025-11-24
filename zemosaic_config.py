@@ -102,6 +102,10 @@ DEFAULT_CONFIG = {
     "apply_radial_weight": False,
     "radial_feather_fraction": 0.8,
     "radial_shape_power": 2.0,
+    # Mosaic / clustering defaults
+    "cluster_panel_threshold": 0.12,
+    "cluster_target_groups": 0,
+    "cluster_orientation_split_deg": 0.0,
     # Master "use GPU wherever possible" toggle. Older configs may only carry
     # use_gpu_phase5/stack_use_gpu/use_gpu_stack, so normalization keeps them in sync.
     "use_gpu_global": True,

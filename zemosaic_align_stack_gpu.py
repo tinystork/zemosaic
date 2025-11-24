@@ -168,6 +168,114 @@ def _require_supported_features(stacking_params: Mapping[str, Any]) -> None:
         raise GPUStackingError("GPU stack does not yet support radial weighting")
 
 
+def _coerce_config_bool(value: Any, default: bool = True) -> bool:
+    """Best-effort boolean coercion mirroring the CPU stacker."""
+
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, np.integer)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off"}:
+            return False
+        return default
+    try:
+        return bool(value)
+    except Exception:
+        return default
+
+
+def _poststack_rgb_equalization(
+    stacked: np.ndarray | None,
+    stacking_params: Mapping[str, Any] | None = None,
+    zconfig: Any | None = None,
+) -> dict[str, Any]:
+    """
+    Apply optional RGB median equalization and return metadata.
+
+    Keeps GPU-only or mixed GPU/CPU runs consistent with the CPU stacker's
+    per-stack equalization behavior.
+    """
+
+    default_enabled = True
+    enabled = default_enabled
+    try:
+        if stacking_params is not None and hasattr(stacking_params, "get"):
+            enabled = _coerce_config_bool(
+                stacking_params.get("poststack_equalize_rgb", default_enabled),
+                default_enabled,
+            )
+    except Exception:
+        enabled = default_enabled
+
+    if zconfig is not None:
+        try:
+            enabled = _coerce_config_bool(
+                getattr(zconfig, "poststack_equalize_rgb", enabled),
+                enabled,
+            )
+        except Exception:
+            pass
+
+    info = {
+        "enabled": enabled,
+        "applied": False,
+        "gain_r": 1.0,
+        "gain_g": 1.0,
+        "gain_b": 1.0,
+        "target_median": float("nan"),
+    }
+
+    if not enabled or stacked is None or not isinstance(stacked, np.ndarray):
+        return info
+    if stacked.ndim != 3 or stacked.shape[2] != 3:
+        return info
+
+    try:
+        med = np.nanmedian(stacked, axis=(0, 1)).astype(np.float32)
+        finite = np.isfinite(med) & (med > 0)
+        if not np.any(finite):
+            return info
+
+        target = float(np.nanmedian(med[finite]))
+        gains = np.ones(3, dtype=np.float32)
+        gains[finite] = target / med[finite]
+        try:
+            if not stacked.flags.writeable:
+                try:
+                    stacked.setflags(write=True)
+                except Exception:
+                    pass
+            np.multiply(stacked, gains[None, None, :], out=stacked, casting="unsafe")
+        except Exception:
+            np.multiply(stacked, gains[None, None, :], out=None, casting="unsafe")
+
+        info.update(
+            gain_r=float(gains[0]),
+            gain_g=float(gains[1]),
+            gain_b=float(gains[2]),
+            target_median=float(target),
+        )
+        if np.isfinite(target):
+            info["applied"] = True
+            LOGGER.info(
+                "[RGB-EQ][GPU] Applied per-substack RGB equalization: gains=(%.6f,%.6f,%.6f) target=%.6g",
+                gains[0],
+                gains[1],
+                gains[2],
+                target,
+            )
+    except Exception as exc:
+        LOGGER.warning("[RGB-EQ][GPU] Skipped RGB equalization due to error: %s", exc)
+
+    return info
+
+
 def gpu_stack_from_arrays(
     aligned_images: Sequence[np.ndarray],
     stacking_params: Mapping[str, Any] | None,
@@ -176,6 +284,7 @@ def gpu_stack_from_arrays(
     logger: logging.Logger | None = None,
     pcb_tile: Callable[..., Any] | None = None,
     tile_id: int | None = None,
+    zconfig: Any | None = None,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """
     Stack aligned frames on the GPU (CuPy) and return the stacked array + metadata.
@@ -190,6 +299,8 @@ def gpu_stack_from_arrays(
         Optional ``ParallelPlan`` controlling chunk sizes.
     pcb_tile:
         Optional logging callback mirroring ``_log_and_callback`` in the worker.
+    zconfig:
+        Optional configuration namespace mirroring the CPU stacker options.
     """
 
     if logger is None:
@@ -281,6 +392,8 @@ def gpu_stack_from_arrays(
         stacked = stacked[..., 0]
 
     stack_metadata: dict[str, Any] = {}
+    rgb_eq_info = _poststack_rgb_equalization(stacked, stacking_params, zconfig)
+    stack_metadata["rgb_equalization"] = rgb_eq_info
     return stacked, stack_metadata
 
 
@@ -289,6 +402,7 @@ def gpu_stack_from_paths(
     stacking_params: Mapping[str, Any] | None,
     *,
     array_loader: Callable[[Any], np.ndarray] | None = None,
+    zconfig: Any | None = None,
     **kwargs: Any,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     """
@@ -304,7 +418,7 @@ def gpu_stack_from_paths(
     loader = array_loader or _default_array_loader
     for desc in image_descriptors:
         arrays.append(loader(desc))
-    return gpu_stack_from_arrays(arrays, stacking_params, **kwargs)
+    return gpu_stack_from_arrays(arrays, stacking_params, zconfig=zconfig, **kwargs)
 
 
 def _default_array_loader(descriptor: Any) -> np.ndarray:
