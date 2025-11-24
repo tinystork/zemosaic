@@ -3413,7 +3413,8 @@ def save_fits_image(image_data: np.ndarray,
     if image_data is None: _log_util_save(f"ERREUR: Image data est None pour '{base_output_filename}'. Sauvegarde annulée.", "ERROR"); return
     if not isinstance(image_data, np.ndarray): _log_util_save(f"ERREUR: Input doit être NumPy array, reçu {type(image_data)}.", "ERROR"); return
 
-    _log_util_save(f"SAVE_DEBUG: Données image_data reçues - Shape: {image_data.shape}, Dtype: {image_data.dtype}, Range: [{np.nanmin(image_data):.3g} - {np.nanmax(image_data):.3g}], IsFinite: {np.all(np.isfinite(image_data))}", "WARN")
+    image_data_isfinite = bool(np.all(np.isfinite(image_data)))
+    _log_util_save(f"SAVE_DEBUG: Données image_data reçues - Shape: {image_data.shape}, Dtype: {image_data.dtype}, Range: [{np.nanmin(image_data):.3g} - {np.nanmax(image_data):.3g}], IsFinite: {image_data_isfinite}", "WARN")
 
     final_header_to_write = current_fits_module.Header()
     if header is not None:
@@ -3436,11 +3437,12 @@ def save_fits_image(image_data: np.ndarray,
     hdus_to_write = []
     primary_hdu_object = None
     if save_as_float:
-        # Avoid an extra full-size copy if already float32 (important for huge mosaics)
-        if isinstance(image_data, np.ndarray) and image_data.dtype == np.float32:
-            data_to_write_temp = image_data
-        else:
-            data_to_write_temp = image_data.astype(np.float32, copy=False)
+        data_to_write_temp = _ensure_float32_no_nan(image_data)
+        if not image_data_isfinite:
+            _log_util_save(
+                "SAVE_DEBUG: Valeurs non finies détectées. Remplacement par 0.0 avant export float.",
+                "WARN",
+            )
 
         # Ensure a zero floor for better viewer auto-stretch (ASI FITS View, etc.).
         # Some viewers expect the black level to be at 0. If our mosaic carries a
@@ -3638,9 +3640,11 @@ def save_fits_image(image_data: np.ndarray,
         primary_for_log = primary_hdu_object or hdus_to_write[0]
         primary_data = getattr(primary_for_log, 'data', None)
         if primary_data is not None:
+            primary_is_finite = bool(np.all(np.isfinite(primary_data)))
+            before_write_level = "INFO" if primary_is_finite else "WARN"
             _log_util_save(
-                f"SAVE_DEBUG: AVANT écriture - Min: {np.nanmin(primary_data)}, Max: {np.nanmax(primary_data)}, Mean: {np.nanmean(primary_data)}, Std: {np.nanstd(primary_data)}, Dtype: {primary_data.dtype}, Finite: {np.all(np.isfinite(primary_data))}",
-                "ERROR",
+                f"SAVE_DEBUG: AVANT écriture - Min: {np.nanmin(primary_data)}, Max: {np.nanmax(primary_data)}, Mean: {np.nanmean(primary_data)}, Std: {np.nanstd(primary_data)}, Dtype: {primary_data.dtype}, Finite: {primary_is_finite}",
+                before_write_level,
             )
 
         hdul = current_fits_module.HDUList(hdus_to_write)
