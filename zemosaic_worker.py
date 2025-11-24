@@ -5911,7 +5911,6 @@ def run_poststack_anchor_review(
 
     selected_tile_id = int(best_entry.get("tile_id", -1))
     MIN_MEDIAN_REL_DELTA = 0.01
-    median_delta_ok = True
     if current_anchor_entry and current_anchor_entry.get("metrics") and best_entry.get("metrics"):
         old_med = float(current_anchor_entry["metrics"].get("median", 0.0))
         new_med = float(best_entry["metrics"].get("median", 0.0))
@@ -5920,12 +5919,27 @@ def run_poststack_anchor_review(
         median_delta_ok = median_delta >= MIN_MEDIAN_REL_DELTA
     else:
         median_delta = 0.0
+        median_delta_ok = True
 
-    if (
-        selected_tile_id == int(prestack_anchor_id)
-        or improvement < min_improvement
-        or not median_delta_ok
-    ):
+    if not median_delta_ok and improvement >= min_improvement:
+        try:
+            logger.debug(
+                "post_anchor: bypassing median_delta guard (delta=%.5f, thr=%.5f, impr=%.5f)",
+                median_delta,
+                MIN_MEDIAN_REL_DELTA,
+                improvement,
+            )
+        except Exception:
+            pass
+
+    same_anchor = False
+    try:
+        if prestack_anchor_id is not None:
+            same_anchor = selected_tile_id == int(prestack_anchor_id)
+    except Exception:
+        same_anchor = False
+
+    if same_anchor or improvement < min_improvement:
         _log_and_callback(
             "post_anchor_keep_old",
             lvl="INFO",
