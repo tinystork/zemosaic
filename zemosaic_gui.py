@@ -178,18 +178,22 @@ def _ensure_legacy_gpu_defaults_on_config_module() -> None:
     if not isinstance(defaults, dict):
         return
 
-    canonical = _coerce_gpu_bool(defaults.get("use_gpu_phase5"), False)
-    defaults["use_gpu_phase5"] = canonical
-    for key in ("stack_use_gpu", "use_gpu_stack"):
+    canonical = _coerce_gpu_bool(defaults.get("use_gpu_global"), None)
+    if canonical is None:
+        canonical = _coerce_gpu_bool(defaults.get("use_gpu_phase5"), False)
+    defaults["use_gpu_global"] = canonical
+    for key in ("use_gpu_phase5", "stack_use_gpu", "use_gpu_stack"):
         defaults[key] = _coerce_gpu_bool(defaults.get(key, canonical), canonical)
 
 
 def _synchronize_legacy_gpu_flags(config_mapping: MutableMapping[str, Any]) -> None:
     """Align GPU flags in a config mapping for backend parity."""
 
-    canonical = _coerce_gpu_bool(config_mapping.get("use_gpu_phase5"), False)
-    config_mapping["use_gpu_phase5"] = canonical
-    for key in ("stack_use_gpu", "use_gpu_stack"):
+    canonical = _coerce_gpu_bool(config_mapping.get("use_gpu_global"), None)
+    if canonical is None:
+        canonical = _coerce_gpu_bool(config_mapping.get("use_gpu_phase5"), False)
+    config_mapping["use_gpu_global"] = canonical
+    for key in ("use_gpu_phase5", "stack_use_gpu", "use_gpu_stack"):
         config_mapping[key] = _coerce_gpu_bool(config_mapping.get(key, canonical), canonical)
 
 # --- Worker Import ---
@@ -771,7 +775,10 @@ class ZeMosaicGUI:
         )
         if "enable_tile_weighting" not in self.config:
             self.config["enable_tile_weighting"] = True
-        self.use_gpu_phase5_var = tk.BooleanVar(master=self.root, value=self.config.get("use_gpu_phase5", False))
+        self.use_gpu_global_var = tk.BooleanVar(
+            master=self.root,
+            value=self.config.get("use_gpu_global", self.config.get("use_gpu_phase5", False)),
+        )
         self.tile_weighting_var = tk.BooleanVar(
             master=self.root,
             value=self.config.get("enable_tile_weighting", True),
@@ -1729,7 +1736,7 @@ class ZeMosaicGUI:
             final_assembly_options_frame,
             # Keep translation key for backward compatibility, update default text
             text=self._tr("use_gpu_phase5", "Use NVIDIA GPU"),
-            variable=self.use_gpu_phase5_var,
+            variable=self.use_gpu_global_var,
         )
         gpu_chk.grid(row=asm_opt_row, column=0, sticky="w", padx=5, pady=3, columnspan=2)
         asm_opt_row += 1
@@ -1755,14 +1762,14 @@ class ZeMosaicGUI:
         asm_opt_row += 1
 
         def on_gpu_check(*_):
-            if self.use_gpu_phase5_var.get():
+            if self.use_gpu_global_var.get():
                 self._gpu_selector_label.grid()
                 self.gpu_selector_cb.grid()
             else:
                 self._gpu_selector_label.grid_remove()
                 self.gpu_selector_cb.grid_remove()
 
-        self.use_gpu_phase5_var.trace_add("write", on_gpu_check)
+        self.use_gpu_global_var.trace_add("write", on_gpu_check)
         on_gpu_check()
 
         tile_weight_chk = ttk.Checkbutton(
@@ -4343,12 +4350,13 @@ class ZeMosaicGUI:
         self.config["logging_level"] = self.logging_level_var.get()
         self.config["cache_retention"] = self.cache_retention_var.get()
 
-        gpu_phase5_selected = bool(self.use_gpu_phase5_var.get())
-        self.config["use_gpu_phase5"] = gpu_phase5_selected
-        # Propagate the Phase 5 GPU preference to stacking without adding UI controls.
+        gpu_global_selected = bool(self.use_gpu_global_var.get())
+        self.config["use_gpu_global"] = gpu_global_selected
+        self.config["use_gpu_phase5"] = gpu_global_selected
+        # Propagate the global GPU preference to stacking without adding UI controls.
         # Stacking code checks 'stack_use_gpu' first, then legacy fallbacks.
-        self.config["stack_use_gpu"] = gpu_phase5_selected
-        self.config["use_gpu_stack"] = gpu_phase5_selected
+        self.config["stack_use_gpu"] = gpu_global_selected
+        self.config["use_gpu_stack"] = gpu_global_selected
         sel = self.gpu_selector_var.get()
         gpu_id = None
         for disp, idx in self._gpus:
@@ -4564,7 +4572,7 @@ class ZeMosaicGUI:
             poststack_median_clip_sigma_cfg,
             poststack_min_improvement_cfg,
             poststack_use_overlap_cfg,
-            self.use_gpu_phase5_var.get(),
+            self.use_gpu_global_var.get(),
             gpu_id,
             bool(self.tile_weighting_var.get()),
             self.config.get("tile_weight_mode", "n_frames"),
