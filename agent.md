@@ -1,106 +1,130 @@
-# Mission : Audit et correction de la photométrie post-anchor (inter-tiles) entre V4.2.0 et V4WIP
+# Agent – Régression photométrique V4WIP vs V4.2.0 (log “post_anchor_keep_old”)
 
 ## Contexte
 
-Deux runs ont été effectués sur **le même jeu de données** :
+Projet : **ZeMosaic / ZeSeestarStacker**  
+Branches concernées :
 
-- branche **V4.2.0** → résultat visuellement propre, histogrammes RGB cohérents ;
-- branche **courante V4WIP** → légère perte de qualité, canal rouge décalé dans l’histogramme final.
+- `V4.2.0` = **référence** (qualité OK),
+- `V4WIP`  = branche courante avec **perte de qualité photométrique**.
 
-Les logs correspondants sont disponibles (même dataset) :
+Même dataset Seestar, même configuration (SDS off, Phase 5 CPU/GPU selon tests).
 
-- V4.2.0 : `zemosaic_workerV4.2.0.log`
-- V4WIP  : `zemosaic_worker.log`
+Constats :
 
-Analyse préliminaire faite à la main :
+1. Les logs `[RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=(..., ..., 1.000000)` sont **présents avec les mêmes gains et cibles** dans V4.2.0 et V4WIP.  
+   ⇒ La **normalisation RGB intra-stack n’est pas la cause** de la régression et ne doit pas être modifiée. :contentReference[oaicite:2]{index=2}  
 
-- Les lignes `[RGB-EQ] poststack_equalize_rgb ...` montrent **les mêmes gains et cibles** entre V4.2.0 et V4WIP (pour les mêmes master tiles).
-- On peut donc **exclure la normalisation RGB intra-stack** (`poststack_equalize_rgb`) comme cause de la régression.
+2. La divergence se situe dans la **phase post-anchor** (choix de l’ancre photométrique et application de l’offset global) dans `zemosaic_worker.py`. :contentReference[oaicite:3]{index=3}  
 
-En revanche, une différence nette apparaît sur la **phase post-anchor / normalisation photométrique inter-tiles** :
+   - Log V4.2.0 (bon comportement) :
 
-- **V4.2.0** :
-  - présence de lignes du type :
-    - `[CLÉ_POUR_GUI: post_anchor_start]`
-    - `[CLÉ_POUR_GUI: post_anchor_selected]`
-    - `[CLÉ_POUR_GUI: post_anchor_shift] (Args: {'gain': ..., 'offset': ...})`
-    - `apply_photometric: using affine_by_id for N tiles`
-    - `apply_photometric: tile=tile:0000 gain=... offset=...`
-  - ➜ la meilleure ancre est sélectionnée, un couple (gain, offset) est calculé et **appliqué à toutes les tuiles**.
+     ```text
+     [CLÉ_POUR_GUI: post_anchor_start]
+     [CLÉ_POUR_GUI: post_anchor_selected] (Args: {'tile': 0, 'impr': 0.232318821698048})
+     ... post_anchor_shift ... (Args: {'gain': 0.7865391356567737, 'offset': 3.5014933309171283})
+     apply_photometric: using affine_by_id for 32 tiles
+     apply_photometric: tile=tile:0000 gain=0.78654 offset=3.50149
+     ...
+     ```
 
-- **V4WIP** :
-  - on voit :
-    - `[CLÉ_POUR_GUI: post_anchor_start]`
-    - `[CLÉ_POUR_GUI: post_anchor_keep_old] (Args: {'impr': ...})`
-  - mais **aucune** ligne `post_anchor_selected`, `post_anchor_shift` ni `apply_photometric`.
-  - ➜ la logique semble décider de **conserver l’ancre précédente** et ne plus appliquer (ou logguer) l’affine photométrique global, en particulier sur la voie GPU Phase 5.
+   - Log V4WIP (mauvais comportement) :
 
-C’est très probablement la cause de la dérive globale de photométrie et du rendu couleur final.
+     ```text
+     [CLÉ_POUR_GUI: post_anchor_start]
+     [CLÉ_POUR_GUI: post_anchor_keep_old] (Args: {'impr': 0.14600923384024508})
+     ```
 
-## Objectif
+   ⇒ En V4WIP **aucune ancre n’est acceptée** et **aucune affine photométrique n’est appliquée** aux tiles, d’où le décalage du rouge et la dérive globale visible sur la mosaïque finale.
 
-1. **Comparer finement** le code de la photométrie post-anchor et de la sélection d’ancre entre :
-   - branche **V4.2.0** (référence de bon comportement),
-   - branche **V4WIP** (branche courante à corriger).
+3. Dans `zemosaic_worker.py`, la logique refactorisée autour du post-anchor contient :
 
-2. Identifier précisément :
-   - où et comment la logique `post_anchor_selected` / `post_anchor_keep_old` a changé,
-   - pourquoi `apply_photometric` n’est plus appelée / tracée dans V4WIP,
-   - si la voie GPU Phase 5 suit bien la même pipeline que la voie CPU.
+   ```python
+   same_anchor = False
+   try:
+       if prestack_anchor_id is not None:
+           same_anchor = selected_tile_id == int(prestack_anchor_id)
+   except Exception:
+       same_anchor = False
 
-3. **Corriger V4WIP** pour :
-   - rétablir le comportement photométrique de V4.2.0,
-   - garantir que la **meilleure ancre est bien sélectionnée et appliquée**,
-   - s’assurer que l’affine photométrique (gain, offset) est appliqué de façon identique en CPU et GPU,
-   - conserver la compatibilité avec la télémétrie actuelle (logs, CLÉ_POUR_GUI, etc.).
+   if same_anchor or improvement < min_improvement:
+       _log_and_callback(
+           "post_anchor_keep_old",
+           lvl="INFO",
+           callback=progress_callback,
+           impr=float(improvement),
+       )
+       ...
+       return master_tiles, anchor_shift
+→ Clé de la régression : l’utilisation de same_anchor or improvement < min_improvement.
+En V4.2.0, la logique équivalente utilisait une condition plus permissive (type same_anchor and improvement < min_improvement ou équivalent), ce qui permettait d’accepter un nouvel ajustement même si l’ancre restait la même, tant que improvement >= min_improvement.
 
-4. **Ne pas modifier** la logique de normalisation RGB intra-stack :
-   - `poststack_equalize_rgb` est considérée comme correcte et identique à V4.2.0 ;
-   - ne pas changer son comportement, juste s’assurer qu’elle reste appelée comme avant.
+Avec le or, dès que same_anchor est True, on tombe systématiquement dans post_anchor_keep_old, même si l’amélioration est significative (impr ≈ 0.146 dans le log V4WIP).
 
-5. Mettre à jour `followup.md` en expliquant clairement :
-   - l’origine de la régression,
-   - les patches appliqués,
-   - comment valider que la qualité est revenue au niveau de V4.2.0.
+Mission
+Comparer la fonction post-anchor entre V4.2.0 et V4WIP (même fichier, même zone) pour confirmer le changement de logique.
 
-## Périmètre
+Corriger la condition de garde de manière à retrouver le comportement de V4.2.0 :
 
-Fichiers probablement impliqués (liste indicative, à compléter) :
+si l’amélioration est significative (improvement >= min_improvement), on doit appliquer l’ancre et l’offset même si selected_tile_id == prestack_anchor_id.
 
-- `zemosaic_worker.py`
-- `zemosaic_align_stack.py`
-- `zemosaic_align_stack_gpu.py`
-- `zemosaic_utils.py`
-- tout module / fonction contenant :
-  - la logique d’ancre (sélection de la meilleure ancre),
-  - la phase de **post-anchor photometric normalization**,
-  - les appels à `apply_photometric`, `affine_by_id`, etc.,
-  - la distinction CPU / GPU pour la Phase 5.
+on ne doit garder l’ancienne ancre que lorsque :
 
-**Important :**
+l’amélioration est inférieure au seuil, ou
 
-- ❗ **Ne pas toucher au code SDS** (Super/Duper/Stack etc.).  
-  Cette mission concerne uniquement le flux standard (master tiles, mosaïque classique).
-- ❗ Ne pas modifier la logique GUI.
-- ❗ Ne pas modifier la logique interne de `poststack_equalize_rgb` (intra-stack RGB).
-- ❗ Les corrections doivent être **minimales, propres et documentées** (commentaires, docstring si nécessaire).
+les métriques sont manifestement non fiables (cas déjà gérés par le code).
 
-## Livrables attendus
+Maintenir intacts :
 
-1. Un patch complet sur la branche **V4WIP** qui :
-   - restaure la sélection et l’application de la meilleure ancre comme en V4.2.0,
-   - s’assure que **CPU et GPU** suivent la même pipeline photométrique en Phase 5,
-   - maintient les logs caractéristiques (`post_anchor_selected`, `post_anchor_keep_old`, `post_anchor_shift`, `apply_photometric`).
+la logique de sélection des candidats (score, span, robust_sigma, etc.) ;
 
-2. Une description claire des différences trouvées entre V4.2.0 et V4WIP :
-   - fonctions / blocs modifiés,
-   - raison de la régression,
-   - impact sur le résultat.
+le garde-fou median_delta (MIN_MEDIAN_REL_DELTA) et le log DEBUG qui signale le contournement éventuel ;
 
-3. Une mise à jour de `followup.md` (dans ce repo) expliquant :
-   - ce qui a été corrigé,
-   - quels tests reproduire (par exemple rejouer le dataset de référence) pour vérifier :
-     - la présence de `post_anchor_selected` + `apply_photometric` dans les logs,
-     - le retour à une mosaïque photométriquement homogène et à un histogramme RGB cohérent.
+la fonction [RGB-EQ] poststack_equalize_rgb et toute la partie RGB intra-stack (pas de modification de ces fonctions ni de leurs paramètres). zemosaic_worker
 
-Merci d’effectuer un audit rigoureux, de corriger la branche **V4WIP** en conséquence, et de documenter clairement toutes les décisions.
+S’assurer que, une fois la condition corrigée, le flux V4WIP reproduit le comportement suivant :
+
+log post_anchor_selected avec tile et impr ;
+
+log post_anchor_shift avec gain / offset ;
+
+log apply_photometric: using affine_by_id... et les lignes apply_photometric: tile=tile:XXXX gain=... offset=....
+
+Ne rien changer à la mécanique de Two-Pass coverage, de SDS, ni aux fonctions de stacking GPU/CPU, sauf si une dépendance directe avec la logique d’ancre est clairement identifiée dans le diff.
+
+Fichiers principaux à inspecter
+zemosaic_worker.py
+
+zone autour de la sélection d’ancre / logs post_anchor_* / apply_photometric. zemosaic_worker
+
+Éventuellement pour contexte (lecture seule, pas de modification sauf nécessité démontrée) :
+
+zemosaic_align_stack.py et zemosaic_align_stack_gpu.py pour la logique [RGB-EQ] poststack_equalize_rgb. zemosaic_align_stack
+
+Contraintes
+Pas de nouvelle dépendance externe.
+
+Ne pas dégrader les performances GPU/CPU (pas de boucles Python inutiles).
+
+Ne pas modifier l’API publique ni les signatures des callbacks GUI/log.
+
+Préserver la compatibilité avec les deux GUI (Tk et Qt).
+
+Livrable attendu
+Un patch qui :
+
+corrige la condition de garde post-anchor,
+
+restaure l’application des affines photométriques comme en V4.2.0,
+
+laisse poststack_equalize_rgb inchangé,
+
+conserve les logs et garde-fous existants.
+
+Commentaires dans le code expliquant brièvement la logique :
+
+quand l’ancre est conservée,
+
+quand elle est ré-appliquée,
+
+et pourquoi on ne veut pas bloquer le cas “même ancre mais meilleure affine”.

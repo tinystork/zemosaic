@@ -5921,7 +5921,9 @@ def run_poststack_anchor_review(
         median_delta = 0.0
         median_delta_ok = True
 
+    bypass_median_guard = False
     if not median_delta_ok and improvement >= min_improvement:
+        bypass_median_guard = True
         try:
             logger.debug(
                 "post_anchor: bypassing median_delta guard (delta=%.5f, thr=%.5f, impr=%.5f)",
@@ -5939,7 +5941,16 @@ def run_poststack_anchor_review(
     except Exception:
         same_anchor = False
 
-    if same_anchor or improvement < min_improvement:
+    # Keep the existing anchor only when the candidate does not bring enough improvement
+    # or when metrics are unreliable. Re-selecting the same tile cannot block a better
+    # affine because gain/offset may still improve.
+    keep_existing_anchor = False
+    if improvement < min_improvement:
+        keep_existing_anchor = True
+    elif not median_delta_ok and not bypass_median_guard:
+        keep_existing_anchor = True
+
+    if keep_existing_anchor:
         _log_and_callback(
             "post_anchor_keep_old",
             lvl="INFO",
@@ -6034,6 +6045,8 @@ def run_poststack_anchor_review(
 
     anchor_shift = (float(gain_shift), float(offset_shift))
 
+    # Anchor accepted: refresh gain/offset and document the selection even if we re-use
+    # the previously selected tile.
     _log_and_callback(
         "post_anchor_selected",
         lvl="INFO",
@@ -17589,16 +17602,32 @@ def run_hierarchical_mosaic(
                     error=str(e_viewer),
                 )
         
-        if final_mosaic_coverage_HW is not None and np.any(final_mosaic_coverage_HW):
+        coverage_export_arr: np.ndarray | None = None
+        if final_mosaic_coverage_HW is not None:
+            try:
+                coverage_export_arr = np.asarray(final_mosaic_coverage_HW, dtype=np.float32, order="C")
+                if coverage_export_arr.ndim > 2:
+                    coverage_export_arr = np.squeeze(coverage_export_arr)
+                if coverage_export_arr.ndim != 2 or coverage_export_arr.size == 0:
+                    coverage_export_arr = None
+            except Exception:
+                coverage_export_arr = None
+        if coverage_export_arr is not None:
             coverage_path = output_folder_path / f"{output_base_name}_coverage.fits"
-            cov_hdr = fits.Header() 
-            if ASTROPY_AVAILABLE and final_output_wcs: 
-                try: cov_hdr.update(final_output_wcs.to_header(relax=True))
-                except: pass 
-            cov_hdr['EXTNAME']=('COVERAGE','Coverage Map') 
-            cov_hdr['BUNIT']=('count','Pixel contributions or sum of weights')
+            cov_hdr = fits.Header()
+            if ASTROPY_AVAILABLE and final_output_wcs:
+                try:
+                    cov_hdr.update(final_output_wcs.to_header(relax=True))
+                except Exception:
+                    pass
+            cov_hdr["EXTNAME"] = ("COVERAGE", "Coverage Map")
+            cov_hdr["BUNIT"] = ("count", "Pixel contributions or sum of weights")
+            try:
+                coverage_has_signal = bool(np.nanmax(np.abs(coverage_export_arr)) > 0)
+            except Exception:
+                coverage_has_signal = True
             zemosaic_utils.save_fits_image(
-                final_mosaic_coverage_HW,
+                coverage_export_arr,
                 str(coverage_path),
                 header=cov_hdr,
                 overwrite=True,
@@ -17606,7 +17635,17 @@ def run_hierarchical_mosaic(
                 progress_callback=progress_callback,
                 axis_order="HWC",
             )
-            pcb("run_info_coverage_map_saved", prog=None, lvl="INFO_DETAIL", filename=_safe_basename(coverage_path))
+            pcb(
+                "run_info_coverage_map_saved",
+                prog=None,
+                lvl="INFO_DETAIL",
+                filename=_safe_basename(coverage_path),
+            )
+            if not coverage_has_signal:
+                logger.warning(
+                    "Coverage map saved but contains no positive samples (path=%s)",
+                    coverage_path,
+                )
         
         logger.info("[Alpha] Final mosaic saved with ALPHA=%s", bool(alpha_final is not None))
 
@@ -17625,25 +17664,45 @@ def run_hierarchical_mosaic(
     _log_memory_usage(progress_callback, "Fin Sauvegarde FITS (avant preview)")
 
     # --- MODIFIÉ : Génération de la Preview PNG avec stretch_auto_asifits_like ---
-    if final_mosaic_data_HWC is not None and ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils:
+    preview_source: np.ndarray | None = final_mosaic_data_HWC
+    if preview_source is None and final_fits_path.exists() and ASTROPY_AVAILABLE and fits:
+        try:
+            with fits.open(final_fits_path, memmap=False) as hdul_preview_src:
+                data_src = hdul_preview_src[0].data
+                if data_src is not None:
+                    arr = np.asarray(data_src, dtype=np.float32)
+                    if arr.ndim == 3:
+                        preview_source = np.ascontiguousarray(arr)
+                    elif arr.ndim == 2:
+                        preview_source = np.stack([arr, arr, arr], axis=-1)
+        except Exception:
+            preview_source = None
+    if preview_source is not None and ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils:
         pcb("run_info_preview_stretch_started_auto_asifits", prog=None, lvl="INFO_DETAIL") # Log mis à jour
         try:
             # Downscale extremely large mosaics for preview to avoid OOM
             step = 1
             alpha_preview: np.ndarray | None = None
             try:
-                h_prev, w_prev = int(final_mosaic_data_HWC.shape[0]), int(final_mosaic_data_HWC.shape[1])
+                h_prev, w_prev = int(preview_source.shape[0]), int(preview_source.shape[1])
                 max_preview_dim = 4000  # cap the longest side for preview
                 step_h = max(1, h_prev // max_preview_dim)
                 step_w = max(1, w_prev // max_preview_dim)
                 step = max(step_h, step_w)
                 if step > 1:
-                    preview_view = final_mosaic_data_HWC[::step, ::step, :]
-                    pcb("run_info_preview_downscale", prog=None, lvl="INFO_DETAIL", downscale_step=step, src_shape=str(final_mosaic_data_HWC.shape), preview_shape=str(preview_view.shape))
+                    preview_view = preview_source[::step, ::step, :]
+                    pcb(
+                        "run_info_preview_downscale",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                        downscale_step=step,
+                        src_shape=str(preview_source.shape),
+                        preview_shape=str(preview_view.shape),
+                    )
                 else:
-                    preview_view = final_mosaic_data_HWC
+                    preview_view = preview_source
             except Exception:
-                preview_view = final_mosaic_data_HWC
+                preview_view = preview_source
                 step = 1
 
             if alpha_final is not None:
@@ -17653,18 +17712,18 @@ def run_hierarchical_mosaic(
                         alpha_src = alpha_src[..., 0]
                     elif alpha_src.ndim > 2:
                         alpha_src = np.squeeze(alpha_src)
-                    if alpha_src.shape[:2] != final_mosaic_data_HWC.shape[:2]:
+                    if alpha_src.shape[:2] != preview_source.shape[:2]:
                         logger.debug(
                             "[Alpha] Preview source mask shape mismatch: alpha=%s vs mosaic=%s",
                             getattr(alpha_src, "shape", None),
-                            getattr(final_mosaic_data_HWC, "shape", None),
+                            getattr(preview_source, "shape", None),
                         )
                         try:
                             import cv2  # type: ignore
 
                             alpha_src = cv2.resize(
                                 alpha_src,
-                                (final_mosaic_data_HWC.shape[1], final_mosaic_data_HWC.shape[0]),
+                                (preview_source.shape[1], preview_source.shape[0]),
                                 interpolation=cv2.INTER_NEAREST,
                             )
                         except Exception:
@@ -17822,7 +17881,11 @@ def run_hierarchical_mosaic(
         except Exception as e_stretch_main: 
             pcb("run_error_preview_stretch_unexpected_main", prog=None, lvl="ERROR", error=str(e_stretch_main))
             logger.error("Erreur imprévue lors de la génération de la preview:", exc_info=True)
-            
+    else:
+        logger.warning(
+            "Preview generation skipped (reason=%s)",
+            "no_mosaic_data" if preview_source is None else "missing_utils",
+        )
     if 'final_mosaic_data_HWC' in locals() and final_mosaic_data_HWC is not None: del final_mosaic_data_HWC
     if 'final_mosaic_coverage_HW' in locals() and final_mosaic_coverage_HW is not None: del final_mosaic_coverage_HW
     gc.collect()
