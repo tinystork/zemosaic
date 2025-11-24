@@ -13979,6 +13979,16 @@ def run_hierarchical_mosaic(
         worker_config_cache,
         filter_overrides,
     )
+    # Trace légère pour vérifier la présence du pré-plan issu du Filter GUI.
+    try:
+        has_preplan = bool(filter_overrides and isinstance(filter_overrides, dict) and filter_overrides.get("preplan_master_groups"))
+        pcb(
+            f"debug_preplan_gui: overrides_present={bool(filter_overrides)}, preplan_present={has_preplan}",
+            prog=None,
+            lvl="INFO_DETAIL",
+        )
+    except Exception:
+        pass
 
     config_sds_default = _coerce_bool_flag(worker_config_cache.get("sds_mode_default"))
     override_flag = None
@@ -14281,6 +14291,179 @@ def run_hierarchical_mosaic(
         normalized = _normcase_path(Path(path_value).expanduser())
         return normalized or None
 
+    def _count_cached_npy_files(cache_dir: Path) -> int:
+        count = 0
+        try:
+            for child in cache_dir.iterdir():
+                try:
+                    if child.is_file() and child.suffix.lower() == ".npy":
+                        count += 1
+                except Exception:
+                    continue
+        except Exception:
+            return count
+        return count
+
+    def _count_unaligned_fits(input_root: str | os.PathLike) -> int:
+        try:
+            unaligned_dir = Path(input_root).expanduser() / UNALIGNED_DIRNAME
+        except Exception:
+            return 0
+        if not unaligned_dir.is_dir():
+            return 0
+        total = 0
+        for pattern in ("*.fit", "*.fits"):
+            try:
+                total += sum(1 for _ in unaligned_dir.rglob(pattern))
+            except Exception:
+                continue
+        return total
+
+    def _header_to_string(header_obj: Any) -> str | None:
+        if header_obj is None or fits is None:
+            return None
+        try:
+            header_inst = header_obj if isinstance(header_obj, fits.Header) else fits.Header(header_obj)
+            return header_inst.tostring(sep="\n", endcard=False, padding=False)
+        except Exception:
+            return None
+
+    def _wcs_to_header_string(wcs_obj: Any) -> str | None:
+        if wcs_obj is None or WCS is None:
+            return None
+        try:
+            header_inst = wcs_obj.to_header(relax=True)
+            return header_inst.tostring(sep="\n", endcard=False, padding=False)
+        except Exception:
+            return None
+
+    def _string_to_header(header_text: str | None):
+        if not header_text or fits is None:
+            return None
+        try:
+            return fits.Header.fromstring(str(header_text), sep="\n")
+        except Exception:
+            return None
+
+    def _string_to_wcs(wcs_text: str | None):
+        if not wcs_text or WCS is None:
+            return None
+        try:
+            header_inst = fits.Header.fromstring(str(wcs_text), sep="\n")
+        except Exception:
+            return None
+        try:
+            return WCS(header_inst)
+        except Exception:
+            return None
+
+    def _serialize_phase1_entry(entry: dict) -> dict:
+        raw_path = entry.get("path_raw") or entry.get("path")
+        payload = {
+            "path_raw": raw_path,
+            "path_preprocessed_cache": entry.get("path_preprocessed_cache"),
+            "path_hotpix_mask": entry.get("path_hotpix_mask"),
+            "preprocessed_shape": list(entry.get("preprocessed_shape") or ()),
+            "phase0_index": entry.get("phase0_index"),
+            "phase0_shape": entry.get("phase0_shape"),
+        }
+        payload["header"] = _header_to_string(entry.get("header") or entry.get("phase0_header"))
+        payload["wcs_header"] = _wcs_to_header_string(entry.get("wcs") or entry.get("phase0_wcs"))
+        phase0_center = entry.get("phase0_center")
+        if phase0_center is not None:
+            if hasattr(phase0_center, "ra") and hasattr(phase0_center, "dec"):
+                try:
+                    payload["phase0_center"] = [float(phase0_center.ra.deg), float(phase0_center.dec.deg)]
+                except Exception:
+                    pass
+            elif isinstance(phase0_center, (list, tuple)) and len(phase0_center) >= 2:
+                try:
+                    payload["phase0_center"] = [float(phase0_center[0]), float(phase0_center[1])]
+                except Exception:
+                    pass
+        return payload
+
+    def _load_phase1_manifest(manifest_path: Path, expected_paths: list[str] | None) -> list[dict] | None:
+        if not manifest_path.is_file():
+            return None
+        try:
+            with manifest_path.open("r", encoding="utf-8") as f_manifest:
+                data = json.load(f_manifest)
+        except Exception:
+            return None
+        entries_raw = data.get("entries") or data.get("files")
+        if not isinstance(entries_raw, list):
+            return None
+        by_norm_path: dict[str, dict] = {}
+        for record in entries_raw:
+            if not isinstance(record, dict):
+                continue
+            raw_path = record.get("path_raw") or record.get("path")
+            cache_path = record.get("path_preprocessed_cache")
+            if not raw_path or not cache_path or not _path_exists(cache_path):
+                continue
+            header_obj = _string_to_header(record.get("header"))
+            wcs_obj = _string_to_wcs(record.get("wcs_header"))
+            if wcs_obj is None and header_obj is not None and WCS is not None:
+                try:
+                    wcs_obj = WCS(header_obj)
+                except Exception:
+                    wcs_obj = None
+            entry: dict[str, Any] = {
+                "path_raw": raw_path,
+                "path_preprocessed_cache": cache_path,
+                "path_hotpix_mask": record.get("path_hotpix_mask"),
+                "preprocessed_shape": tuple(record.get("preprocessed_shape") or ()),
+                "header": header_obj,
+                "wcs": wcs_obj,
+            }
+            if "phase0_index" in record:
+                entry["phase0_index"] = record.get("phase0_index")
+            if "phase0_shape" in record:
+                entry["phase0_shape"] = record.get("phase0_shape")
+            if "phase0_center" in record:
+                center_val = record.get("phase0_center")
+                if isinstance(center_val, (list, tuple)) and len(center_val) >= 2:
+                    try:
+                        entry["phase0_center"] = (float(center_val[0]), float(center_val[1]))
+                    except Exception:
+                        pass
+            norm = _normalize_path_for_matching(raw_path)
+            if norm:
+                by_norm_path[norm] = entry
+        ordered_entries: list[dict] = []
+        if expected_paths:
+            for p in expected_paths:
+                norm_path = _normalize_path_for_matching(p)
+                if norm_path and norm_path in by_norm_path:
+                    ordered_entries.append(by_norm_path[norm_path])
+        # If nothing matched expected paths, fall back to all entries so callers can decide.
+        if not ordered_entries:
+            ordered_entries = list(by_norm_path.values())
+        return ordered_entries if ordered_entries else None
+
+    def _write_phase1_manifest(manifest_path: Path, entries: list[dict]) -> None:
+        try:
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return
+        serialized = [_serialize_phase1_entry(entry) for entry in entries if isinstance(entry, dict)]
+        payload = {
+            "version": 1,
+            "created_utc": datetime.utcnow().isoformat() + "Z",
+            "entries": serialized,
+        }
+        tmp_path = manifest_path.with_suffix(".tmp")
+        try:
+            with tmp_path.open("w", encoding="utf-8") as f_manifest:
+                json.dump(payload, f_manifest, ensure_ascii=True)
+            tmp_path.replace(manifest_path)
+        except Exception:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
 
     # Seuil de clustering : valeur de repli à 0.05° si l'option est absente ou non positive
     try:
@@ -14445,25 +14628,10 @@ def run_hierarchical_mosaic(
 
     time_per_raw_file_wcs = None; time_per_master_tile_creation = None
     cache_dir_name = ".zemosaic_img_cache"
-    temp_image_cache_dir = str(Path(output_folder).expanduser() / cache_dir_name)
+    cache_dir_path = Path(output_folder).expanduser() / cache_dir_name
+    temp_image_cache_dir = str(cache_dir_path)
+    cache_manifest_path = cache_dir_path / "phase1_manifest.json"
     temp_master_tile_storage_dir: str | None = None
-    try:
-        if _path_exists(temp_image_cache_dir): shutil.rmtree(temp_image_cache_dir)
-        os.makedirs(temp_image_cache_dir, exist_ok=True)
-    except OSError as e_mkdir_cache:
-        pcb("run_error_cache_dir_creation_failed", prog=None, lvl="ERROR", directory=temp_image_cache_dir, error=str(e_mkdir_cache)); return
-    try:
-        cache_probe = _probe_system_resources(
-            temp_image_cache_dir,
-            two_pass_enabled=two_pass_coverage_renorm_config,
-            two_pass_sigma_px=two_pass_cov_sigma_px_config,
-            two_pass_gain_clip=two_pass_cov_gain_clip_config,
-        )
-        for key, value in cache_probe.items():
-            if value is not None:
-                resource_probe_info[key] = value
-    except Exception:
-        pass
 
 # --- Phase 1 (Prétraitement et WCS) ---
     base_progress_phase1 = current_global_progress
@@ -14660,6 +14828,35 @@ def run_hierarchical_mosaic(
         filter_accepted = False
         filter_invoked = bool(filter_invoked_arg)
         streaming_filter_success = False
+
+        # Préparer les groupes préplanifiés même si l'UI du filtre n'est pas relancée.
+        try:
+            raw_groups_override = (
+                filter_overrides.get("preplan_master_groups")
+                if isinstance(filter_overrides, dict)
+                else None
+            )
+            if isinstance(raw_groups_override, list):
+                mapped_groups: list[list[str]] = []
+                for group in raw_groups_override:
+                    if not isinstance(group, (list, tuple)):
+                        continue
+                    normalized_group: list[str] = []
+                    for item in group:
+                        path_val = None
+                        if isinstance(item, dict):
+                            path_val = item.get("path") or item.get("path_raw")
+                        elif isinstance(item, str):
+                            path_val = item
+                        norm_path = _normalize_path_for_matching(path_val)
+                        if norm_path:
+                            normalized_group.append(norm_path)
+                    if normalized_group:
+                        mapped_groups.append(normalized_group)
+                if mapped_groups:
+                    preplan_groups_override_paths = mapped_groups
+        except Exception:
+            pass
 
         launch_filter_interface_fn = None
         if early_filter_enabled:
@@ -14868,6 +15065,7 @@ def run_hierarchical_mosaic(
                         )
                 except Exception:
                     pass
+                # Les groupes préplanifiés ont déjà été extraits plus haut ; si un UI filtre a produit une nouvelle valeur, on l’écrase.
                 try:
                     raw_groups_override = (
                         filter_overrides.get("preplan_master_groups")
@@ -14976,202 +15174,338 @@ def run_hierarchical_mosaic(
         "per_frame_mb": auto_caps_info.get("per_frame_mb"),
     }
 
-    
-    # --- Détermination du nombre de workers de BASE ---
-    effective_base_workers = 0
-    num_logical_processors = os.cpu_count() or 1 
-    
-    if num_base_workers_config <= 0: # Mode automatique (0 de la GUI)
+
+    num_total_raw_files = len(fits_file_paths)
+    if not fits_file_paths:
+        pcb("run_error_phase1_no_valid_raws_after_cache", prog=(base_progress_phase1 + PROGRESS_WEIGHT_PHASE1_RAW_SCAN), lvl="ERROR")
+        return
+
+    unaligned_fits_count = _count_unaligned_fits(input_folder)
+    cached_npy_count = _count_cached_npy_files(cache_dir_path)
+    total_input_files = num_total_raw_files + unaligned_fits_count
+    resume_used = False
+    all_raw_files_processed_info: list[dict] | None = None
+
+    # Calcul des workers de base (réutilisé par les phases ultérieures même en reprise Phase 1)
+    num_logical_processors = os.cpu_count() or 1
+    if num_base_workers_config <= 0:  # Mode automatique (0 de la GUI)
         desired_auto_ratio = 0.75
         effective_base_workers = max(1, int(np.ceil(num_logical_processors * desired_auto_ratio)))
-        pcb(f"WORKERS_CONFIG: Mode Auto. Base de workers calculée: {effective_base_workers} ({desired_auto_ratio*100:.0f}% de {num_logical_processors} processeurs logiques)", prog=None, lvl="INFO_DETAIL")
-    else: # Mode manuel
+        pcb(
+            f"WORKERS_CONFIG: Mode Auto. Base de workers calculée: {effective_base_workers} ({desired_auto_ratio*100:.0f}% de {num_logical_processors} processeurs logiques)",
+            prog=None,
+            lvl="INFO_DETAIL",
+        )
+    else:  # Mode manuel
         effective_base_workers = min(num_base_workers_config, num_logical_processors)
         if effective_base_workers < num_base_workers_config:
-             pcb(f"WORKERS_CONFIG: Demande GUI ({num_base_workers_config}) limitée à {effective_base_workers} (total processeurs logiques: {num_logical_processors}).", prog=None, lvl="WARN")
+            pcb(
+                f"WORKERS_CONFIG: Demande GUI ({num_base_workers_config}) limitée à {effective_base_workers} (total processeurs logiques: {num_logical_processors}).",
+                prog=None,
+                lvl="WARN",
+            )
         pcb(f"WORKERS_CONFIG: Mode Manuel. Base de workers: {effective_base_workers}", prog=None, lvl="INFO_DETAIL")
-    
-    if effective_base_workers <= 0: # Fallback
+
+    if effective_base_workers <= 0:  # Fallback
         effective_base_workers = 1
         pcb(f"WORKERS_CONFIG: AVERT - effective_base_workers était <= 0, forcé à 1.", prog=None, lvl="WARN")
 
-    # Calcul du nombre de workers pour la Phase 1
-    actual_num_workers_ph1 = _compute_phase_workers(
-        effective_base_workers,
-        num_total_raw_files,
-        DEFAULT_PHASE_WORKER_RATIO,
-    )
-    pcb(
-        f"WORKERS_PHASE1: Utilisation de {actual_num_workers_ph1} worker(s). (Base: {effective_base_workers}, Fichiers: {num_total_raw_files})",
-        prog=None,
-        lvl="INFO",
-    )  # Log mis à jour pour plus de clarté
-    
-    start_time_phase1 = time.monotonic()
-    all_raw_files_processed_info_dict = {} # Pour stocker les infos des fichiers traités avec succès
-    files_processed_count_ph1 = 0      # Compteur pour les fichiers soumis au ThreadPoolExecutor
-
-    with ThreadPoolExecutor(max_workers=actual_num_workers_ph1, thread_name_prefix="ZeMosaic_Ph1_") as executor_ph1:
-        batch_size = 200
-        for i in range(0, len(fits_file_paths), batch_size):
-            batch = fits_file_paths[i:i+batch_size]
-            future_to_filepath_ph1 = {
-                executor_ph1.submit(
-                    get_wcs_and_pretreat_raw_file,
-                    f_path,
-                    astap_exe_path,
-                    astap_data_dir_param,
-                    astap_search_radius_config,
-                    astap_downsample_config,
-                    astap_sensitivity_config,
-                    180,
-                    progress_callback,
-                    temp_image_cache_dir,
-                    solver_settings
-                ): f_path for f_path in batch
-            }
-
-            for future in as_completed(future_to_filepath_ph1):
-                file_path_original = future_to_filepath_ph1[future]
-                files_processed_count_ph1 += 1  # Incrémenter pour chaque future terminée
-
-                # Update GUI stage progress (files read / total)
+    if cache_manifest_path.is_file():
+        cached_entries = _load_phase1_manifest(cache_manifest_path, fits_file_paths)
+        if cached_entries:
+            manifest_map: dict[str, dict] = {}
+            for entry in cached_entries:
+                norm = _normalize_path_for_matching(entry.get("path_raw") or entry.get("path"))
+                cache_path = entry.get("path_preprocessed_cache")
+                if not cache_path or not _path_exists(cache_path):
+                    continue
+                if norm:
+                    manifest_map[norm] = entry
+            ordered: list[dict] = []
+            missing: list[str] = []
+            for p in fits_file_paths:
+                norm_path = _normalize_path_for_matching(p)
+                if norm_path and norm_path in manifest_map:
+                    ordered.append(manifest_map[norm_path])
+                else:
+                    missing.append(p)
+            if ordered and len(ordered) == len(fits_file_paths):
+                resume_used = True
+                all_raw_files_processed_info = ordered
+                # Aligner la liste de travail sur le manifeste pour éviter tout rescannage.
+                fits_file_paths = [
+                    entry.get("path_raw") or entry.get("path") for entry in ordered if entry.get("path_raw") or entry.get("path")
+                ]
+                num_total_raw_files = len(fits_file_paths)
                 try:
                     if progress_callback and callable(progress_callback):
-                        progress_callback("phase1_scan", int(files_processed_count_ph1), int(num_total_raw_files))
-                    # Mirror the count so the GUI can show X/N files
-                    pcb(f"RAW_FILE_COUNT_UPDATE:{files_processed_count_ph1}/{num_total_raw_files}", prog=None, lvl="ETA_LEVEL")
+                        progress_callback("phase1_scan", int(num_total_raw_files), int(num_total_raw_files))
+                    pcb(f"RAW_FILE_COUNT_UPDATE:{num_total_raw_files}/{num_total_raw_files}", prog=None, lvl="ETA_LEVEL")
                 except Exception:
                     pass
-
-                telemetry.maybe_emit_stats(
-                    _telemetry_context(
-                        {
-                            "phase_name": "Phase 1: Preprocessing",
-                            "phase_index": 1,
-                            "files_done": files_processed_count_ph1,
-                            "files_total": num_total_raw_files,
-                        }
-                    )
+                pcb(
+                    f"Phase 1 resume: manifest covers selection (entries={len(ordered)}, cached={cached_npy_count}, unaligned={unaligned_fits_count}).",
+                    prog=base_progress_phase1,
+                    lvl="INFO_DETAIL",
                 )
-
-                prog_step_phase1 = base_progress_phase1 + int(
-                    PROGRESS_WEIGHT_PHASE1_RAW_SCAN * (files_processed_count_ph1 / max(1, num_total_raw_files))
-                )
-
-                try:
-                    # Récupérer le résultat de la tâche
-                    img_data_adu, wcs_obj_solved, header_obj_updated, hp_mask_path = future.result()
-
-                    # Si la tâche a réussi (ne retourne pas que des None)
-                    if (
-                        img_data_adu is not None
-                        and wcs_obj_solved is not None
-                        and header_obj_updated is not None
-                    ):
-                        # Sauvegarder les données prétraitées en .npy
-                        cache_file_basename = f"preprocessed_{Path(file_path_original).stem}_{files_processed_count_ph1}.npy"
-                        cached_image_path = Path(temp_image_cache_dir) / cache_file_basename
+            else:
+                # Tentative de secours : faire correspondre par nom de fichier de base
+                # pour gérer les chemins normalisés différemment (UNC, lettres de lecteur, etc.).
+                fallback_ordered: list[dict] = []
+                missing_for_log: list[str] = missing
+                if len(cached_entries) == len(fits_file_paths):
+                    basename_map: dict[str, dict] = {}
+                    for entry in cached_entries:
+                        raw_candidate = entry.get("path_raw") or entry.get("path")
+                        cache_path = entry.get("path_preprocessed_cache")
+                        if not raw_candidate or not cache_path or not _path_exists(cache_path):
+                            continue
                         try:
-                            np.save(str(cached_image_path), img_data_adu)
-                        except Exception as e_save_npy:
-                            pcb(
-                                "run_error_phase1_save_npy_failed",
-                                prog=prog_step_phase1,
-                                lvl="ERROR",
-                                filename=_safe_basename(file_path_original),
-                                error=str(e_save_npy),
-                            )
-                            logger.error(f"Erreur sauvegarde NPY pour {file_path_original}:", exc_info=True)
+                            base = Path(raw_candidate).name.lower()
+                        except Exception:
+                            base = None
+                        if base and base not in basename_map:
+                            basename_map[base] = entry
+                    missing_by_basename: list[str] = []
+                    used_basenames: set[str] = set()
+                    for p in fits_file_paths:
+                        try:
+                            base = Path(p).name.lower()
+                        except Exception:
+                            base = None
+                        entry = basename_map.get(base or "")
+                        if entry and base not in used_basenames:
+                            fallback_ordered.append(entry)
+                            if base:
+                                used_basenames.add(base)
                         else:
-                            # Stocker les informations pour les phases suivantes
-                            entry = {
-                                'path_raw': file_path_original,
-                                'path_preprocessed_cache': str(cached_image_path),
-                                'path_hotpix_mask': hp_mask_path,
-                                'wcs': wcs_obj_solved,
-                                'header': header_obj_updated,
-                                'preprocessed_shape': tuple(int(dim) for dim in getattr(img_data_adu, 'shape', []) or ()),
-                            }
-                            meta = phase0_lookup.get(file_path_original)
-                            if isinstance(meta, dict):
-                                if 'index' in meta:
-                                    entry['phase0_index'] = meta.get('index')
-                                if 'center' in meta:
-                                    entry['phase0_center'] = meta.get('center')
-                                if 'shape' in meta:
-                                    entry['phase0_shape'] = meta.get('shape')
-                                if 'wcs' in meta and 'wcs' not in entry:
-                                    entry['phase0_wcs'] = meta.get('wcs')
-                            all_raw_files_processed_info_dict[file_path_original] = entry
-                        finally:
-                            # Libérer la mémoire des données image dès que possible
-                            del img_data_adu
-                            gc.collect()
-                    else:
-                        # Le fichier a échoué (ex: WCS non résolu et déplacé)
-                        # get_wcs_and_pretreat_raw_file a déjà loggué l'échec spécifique.
+                            missing_by_basename.append(p)
+                    missing_for_log = missing_by_basename
+
+                    if fallback_ordered and len(fallback_ordered) == len(fits_file_paths):
+                        resume_used = True
+                        all_raw_files_processed_info = fallback_ordered
+                        fits_file_paths = [
+                            entry.get("path_raw") or entry.get("path")
+                            for entry in fallback_ordered
+                            if entry.get("path_raw") or entry.get("path")
+                        ]
+                        num_total_raw_files = len(fits_file_paths)
+                        try:
+                            if progress_callback and callable(progress_callback):
+                                progress_callback("phase1_scan", int(num_total_raw_files), int(num_total_raw_files))
+                            pcb(f"RAW_FILE_COUNT_UPDATE:{num_total_raw_files}/{num_total_raw_files}", prog=None, lvl="ETA_LEVEL")
+                        except Exception:
+                            pass
                         pcb(
-                            "run_warn_phase1_wcs_pretreat_failed_or_skipped_thread",
-                            prog=prog_step_phase1,
-                            lvl="WARN",
-                            filename=_safe_basename(file_path_original),
+                            (
+                                "Phase 1 resume (basename fallback): manifest count matches selection "
+                                f"(entries={len(fallback_ordered)}, cached={cached_npy_count}, "
+                                f"unaligned={unaligned_fits_count}, path_mismatch={len(missing)})."
+                            ),
+                            prog=base_progress_phase1,
+                            lvl="INFO_DETAIL",
                         )
-                        if img_data_adu is not None:
-                            del img_data_adu
-                            gc.collect()
-
-                except Exception as exc_thread:
-                    # Erreur imprévue dans la future elle-même
+                if not resume_used and missing_for_log:
                     pcb(
-                        "run_error_phase1_thread_exception",
-                        prog=prog_step_phase1,
-                        lvl="ERROR",
-                        filename=_safe_basename(file_path_original),
-                        error=str(exc_thread),
-                    )
-                    logger.error(
-                        f"Exception non gérée dans le thread Phase 1 pour {file_path_original}:",
-                        exc_info=True,
+                        f"Phase 1 resume skipped: {len(missing_for_log)} file(s) missing from cache/manifest.",
+                        prog=base_progress_phase1,
+                        lvl="INFO_DETAIL",
                     )
 
-                # Log de mémoire et ETA
-                if (
-                    files_processed_count_ph1 % max(1, num_total_raw_files // 10) == 0
-                    or files_processed_count_ph1 == num_total_raw_files
-                ):
-                    _log_memory_usage(
+    if not resume_used:
+        try:
+            if _path_exists(temp_image_cache_dir):
+                shutil.rmtree(temp_image_cache_dir)
+            os.makedirs(temp_image_cache_dir, exist_ok=True)
+        except OSError as e_mkdir_cache:
+            pcb("run_error_cache_dir_creation_failed", prog=None, lvl="ERROR", directory=temp_image_cache_dir, error=str(e_mkdir_cache)); return
+
+        # Calcul du nombre de workers pour la Phase 1
+        actual_num_workers_ph1 = _compute_phase_workers(
+            effective_base_workers,
+            num_total_raw_files,
+            DEFAULT_PHASE_WORKER_RATIO,
+        )
+        pcb(
+            f"WORKERS_PHASE1: Utilisation de {actual_num_workers_ph1} worker(s). (Base: {effective_base_workers}, Fichiers: {num_total_raw_files})",
+            prog=None,
+            lvl="INFO",
+        )  # Log mis à jour pour plus de clarté
+        
+        start_time_phase1 = time.monotonic()
+        all_raw_files_processed_info_dict = {} # Pour stocker les infos des fichiers traités avec succès
+        files_processed_count_ph1 = 0      # Compteur pour les fichiers soumis au ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=actual_num_workers_ph1, thread_name_prefix="ZeMosaic_Ph1_") as executor_ph1:
+            batch_size = 200
+            for i in range(0, len(fits_file_paths), batch_size):
+                batch = fits_file_paths[i:i+batch_size]
+                future_to_filepath_ph1 = {
+                    executor_ph1.submit(
+                        get_wcs_and_pretreat_raw_file,
+                        f_path,
+                        astap_exe_path,
+                        astap_data_dir_param,
+                        astap_search_radius_config,
+                        astap_downsample_config,
+                        astap_sensitivity_config,
+                        180,
                         progress_callback,
-                        f"Phase 1 - Traité {files_processed_count_ph1}/{num_total_raw_files}",
+                        temp_image_cache_dir,
+                        solver_settings
+                    ): f_path for f_path in batch
+                }
+
+                for future in as_completed(future_to_filepath_ph1):
+                    file_path_original = future_to_filepath_ph1[future]
+                    files_processed_count_ph1 += 1  # Incrémenter pour chaque future terminée
+
+                    # Update GUI stage progress (files read / total)
+                    try:
+                        if progress_callback and callable(progress_callback):
+                            progress_callback("phase1_scan", int(files_processed_count_ph1), int(num_total_raw_files))
+                        # Mirror the count so the GUI can show X/N files
+                        pcb(f"RAW_FILE_COUNT_UPDATE:{files_processed_count_ph1}/{num_total_raw_files}", prog=None, lvl="ETA_LEVEL")
+                    except Exception:
+                        pass
+
+                    telemetry.maybe_emit_stats(
+                        _telemetry_context(
+                            {
+                                "phase_name": "Phase 1: Preprocessing",
+                                "phase_index": 1,
+                                "files_done": files_processed_count_ph1,
+                                "files_total": num_total_raw_files,
+                            }
+                        )
                     )
 
-                elapsed_phase1 = time.monotonic() - start_time_phase1
-                if files_processed_count_ph1 > 0:
-                    time_per_raw_file_wcs = elapsed_phase1 / files_processed_count_ph1
-                    eta_phase1_sec = (num_total_raw_files - files_processed_count_ph1) * time_per_raw_file_wcs
-                    current_progress_in_run_percent = base_progress_phase1 + (
-                        files_processed_count_ph1 / max(1, num_total_raw_files)
-                    ) * PROGRESS_WEIGHT_PHASE1_RAW_SCAN
-                    time_per_percent_point_global = (
-                        (time.monotonic() - start_time_total_run) / max(1, current_progress_in_run_percent)
-                        if current_progress_in_run_percent > 0
-                        else (time.monotonic() - start_time_total_run)
+                    prog_step_phase1 = base_progress_phase1 + int(
+                        PROGRESS_WEIGHT_PHASE1_RAW_SCAN * (files_processed_count_ph1 / max(1, num_total_raw_files))
                     )
-                    total_eta_sec = eta_phase1_sec + (
-                        100 - current_progress_in_run_percent
-                    ) * time_per_percent_point_global
-                    update_gui_eta(total_eta_sec)
 
-    # Construire la liste finale des informations des fichiers traités avec succès
-    all_raw_files_processed_info = [
-        all_raw_files_processed_info_dict[fp] 
-        for fp in fits_file_paths 
-        if fp in all_raw_files_processed_info_dict
-    ]
-    
-    if not all_raw_files_processed_info: 
+                    try:
+                        # Récupérer le résultat de la tâche
+                        img_data_adu, wcs_obj_solved, header_obj_updated, hp_mask_path = future.result()
+
+                        # Si la tâche a réussi (ne retourne pas que des None)
+                        if (
+                            img_data_adu is not None
+                            and wcs_obj_solved is not None
+                            and header_obj_updated is not None
+                        ):
+                            # Sauvegarder les données prétraitées en .npy
+                            cache_file_basename = f"preprocessed_{Path(file_path_original).stem}_{files_processed_count_ph1}.npy"
+                            cached_image_path = Path(temp_image_cache_dir) / cache_file_basename
+                            try:
+                                np.save(str(cached_image_path), img_data_adu)
+                            except Exception as e_save_npy:
+                                pcb(
+                                    "run_error_phase1_save_npy_failed",
+                                    prog=prog_step_phase1,
+                                    lvl="ERROR",
+                                    filename=_safe_basename(file_path_original),
+                                    error=str(e_save_npy),
+                                )
+                                logger.error(f"Erreur sauvegarde NPY pour {file_path_original}:", exc_info=True)
+                            else:
+                                # Stocker les informations pour les phases suivantes
+                                entry = {
+                                    'path_raw': file_path_original,
+                                    'path_preprocessed_cache': str(cached_image_path),
+                                    'path_hotpix_mask': hp_mask_path,
+                                    'wcs': wcs_obj_solved,
+                                    'header': header_obj_updated,
+                                    'preprocessed_shape': tuple(int(dim) for dim in getattr(img_data_adu, 'shape', []) or ()),
+                                }
+                                meta = phase0_lookup.get(file_path_original)
+                                if isinstance(meta, dict):
+                                    if 'index' in meta:
+                                        entry['phase0_index'] = meta.get('index')
+                                    if 'center' in meta:
+                                        entry['phase0_center'] = meta.get('center')
+                                    if 'shape' in meta:
+                                        entry['phase0_shape'] = meta.get('shape')
+                                    if 'wcs' in meta and 'wcs' not in entry:
+                                        entry['phase0_wcs'] = meta.get('wcs')
+                                all_raw_files_processed_info_dict[file_path_original] = entry
+                            finally:
+                                # Libérer la mémoire des données image dès que possible
+                                del img_data_adu
+                                gc.collect()
+                        else:
+                            # Le fichier a échoué (ex: WCS non résolu et déplacé)
+                            # get_wcs_and_pretreat_raw_file a déjà loggué l'échec spécifique.
+                            pcb(
+                                "run_warn_phase1_wcs_pretreat_failed_or_skipped_thread",
+                                prog=prog_step_phase1,
+                                lvl="WARN",
+                                filename=_safe_basename(file_path_original),
+                            )
+                            if img_data_adu is not None:
+                                del img_data_adu
+                                gc.collect()
+
+                    except Exception as exc_thread:
+                        # Erreur imprévue dans la future elle-même
+                        pcb(
+                            "run_error_phase1_thread_exception",
+                            prog=prog_step_phase1,
+                            lvl="ERROR",
+                            filename=_safe_basename(file_path_original),
+                            error=str(exc_thread),
+                        )
+                        logger.error(
+                            f"Exception non gérée dans le thread Phase 1 pour {file_path_original}:",
+                            exc_info=True,
+                        )
+
+                    # Log de mémoire et ETA
+                    if (
+                        files_processed_count_ph1 % max(1, num_total_raw_files // 10) == 0
+                        or files_processed_count_ph1 == num_total_raw_files
+                    ):
+                        _log_memory_usage(
+                            progress_callback,
+                            f"Phase 1 - Traité {files_processed_count_ph1}/{num_total_raw_files}",
+                        )
+
+                    elapsed_phase1 = time.monotonic() - start_time_phase1
+                    if files_processed_count_ph1 > 0:
+                        time_per_raw_file_wcs = elapsed_phase1 / files_processed_count_ph1
+                        eta_phase1_sec = (num_total_raw_files - files_processed_count_ph1) * time_per_raw_file_wcs
+                        current_progress_in_run_percent = base_progress_phase1 + (
+                            files_processed_count_ph1 / max(1, num_total_raw_files)
+                        ) * PROGRESS_WEIGHT_PHASE1_RAW_SCAN
+                        time_per_percent_point_global = (
+                            (time.monotonic() - start_time_total_run) / max(1, current_progress_in_run_percent)
+                            if current_progress_in_run_percent > 0
+                            else (time.monotonic() - start_time_total_run)
+                        )
+                        total_eta_sec = eta_phase1_sec + (
+                            100 - current_progress_in_run_percent
+                        ) * time_per_percent_point_global
+                        update_gui_eta(total_eta_sec)
+
+        # Construire la liste finale des informations des fichiers traités avec succès
+        all_raw_files_processed_info = [
+            all_raw_files_processed_info_dict[fp] 
+            for fp in fits_file_paths 
+            if fp in all_raw_files_processed_info_dict
+        ]
+        
+        if not all_raw_files_processed_info: 
+            pcb("run_error_phase1_no_valid_raws_after_cache", prog=(base_progress_phase1 + PROGRESS_WEIGHT_PHASE1_RAW_SCAN), lvl="ERROR")
+            return # Sortie anticipée si aucun fichier n'a pu être traité avec succès
+        try:
+            _write_phase1_manifest(cache_manifest_path, all_raw_files_processed_info)
+        except Exception:
+            pass
+
+    if all_raw_files_processed_info is None:
         pcb("run_error_phase1_no_valid_raws_after_cache", prog=(base_progress_phase1 + PROGRESS_WEIGHT_PHASE1_RAW_SCAN), lvl="ERROR")
-        return # Sortie anticipée si aucun fichier n'a pu être traité avec succès
+        return
 
     current_global_progress = base_progress_phase1 + PROGRESS_WEIGHT_PHASE1_RAW_SCAN
     _log_memory_usage(progress_callback, "Fin Phase 1 (Prétraitement)")
@@ -15201,6 +15535,51 @@ def run_hierarchical_mosaic(
     pcb("PHASE_UPDATE:2", prog=None, lvl="ETA_LEVEL")
     # Use order-invariant connected-components clustering for robustness
     preplan_groups_active = False
+    # Dernière chance : si des groupes préplanifiés existent dans les overrides
+    # mais que ``preplan_groups_override_paths`` n'a pas encore été rempli (par
+    # exemple si l'early filter a été désactivé), on les reconstruit ici.
+    if not preplan_groups_override_paths and isinstance(filter_overrides_arg, dict):
+        try:
+            raw_groups_override = filter_overrides_arg.get("preplan_master_groups")
+            if isinstance(raw_groups_override, list):
+                mapped_groups: list[list[str]] = []
+                for group in raw_groups_override:
+                    if not isinstance(group, (list, tuple)):
+                        continue
+                    normalized_group: list[str] = []
+                    for item in group:
+                        path_val = None
+                        if isinstance(item, dict):
+                            path_val = item.get("path") or item.get("path_raw")
+                        elif isinstance(item, str):
+                            path_val = item
+                        norm_path = _normalize_path_for_matching(path_val)
+                        if norm_path:
+                            normalized_group.append(norm_path)
+                    if normalized_group:
+                        mapped_groups.append(normalized_group)
+                if mapped_groups:
+                    preplan_groups_override_paths = mapped_groups
+                    _log_and_callback(
+                        f"debug_preplan_phase2: received {len(mapped_groups)} preplanned group(s) from overrides.",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                        callback=progress_callback,
+                    )
+            else:
+                _log_and_callback(
+                    "debug_preplan_phase2: filter_overrides present but preplan_master_groups missing or invalid.",
+                    prog=None,
+                    lvl="INFO_DETAIL",
+                    callback=progress_callback,
+                )
+        except Exception as e_dbg:
+            _log_and_callback(
+                f"debug_preplan_phase2: exception while parsing preplan_master_groups: {e_dbg}",
+                prog=None,
+                lvl="INFO_DETAIL",
+                callback=progress_callback,
+            )
     if preplan_groups_override_paths:
         try:
             path_lookup = {
@@ -15208,7 +15587,21 @@ def run_hierarchical_mosaic(
                 for info in all_raw_files_processed_info
                 if isinstance(info, dict)
             }
+            basename_lookup: dict[str, list[dict]] = {}
+            for info in all_raw_files_processed_info:
+                if not isinstance(info, dict):
+                    continue
+                raw_val = info.get("path_raw") or info.get("path")
+                if not raw_val:
+                    continue
+                try:
+                    base = Path(raw_val).name.lower()
+                except Exception:
+                    base = None
+                if base:
+                    basename_lookup.setdefault(base, []).append(info)
             used_paths: set[str] = set()
+            used_basenames: set[str] = set()
             mapped_info_groups: list[list[dict]] = []
             missing_preplan: list[str] = []
             for group_paths in preplan_groups_override_paths:
@@ -15217,19 +15610,54 @@ def run_hierarchical_mosaic(
                     if not path_norm:
                         continue
                     info = path_lookup.get(path_norm)
+                    # Fallback: try basename match (handles letter/UNC changes between filter + resume)
+                    if info is None:
+                        try:
+                            base = Path(path_norm).name.lower()
+                        except Exception:
+                            base = None
+                        if base:
+                            bucket = basename_lookup.get(base) or []
+                            # pick the first unused entry in that bucket
+                            while bucket:
+                                candidate = bucket.pop(0)
+                                cand_norm = _normalize_path_for_matching(
+                                    candidate.get("path_raw") or candidate.get("path")
+                                )
+                                if cand_norm and cand_norm in used_paths:
+                                    continue
+                                info = candidate
+                                break
                     if info is not None:
                         current_group.append(info)
-                        used_paths.add(path_norm)
+                        info_norm = _normalize_path_for_matching(info.get("path_raw") or info.get("path"))
+                        if info_norm:
+                            used_paths.add(info_norm)
+                        try:
+                            base_used = Path(path_norm).name.lower()
+                        except Exception:
+                            base_used = None
+                        if base_used:
+                            used_basenames.add(base_used)
                     else:
                         missing_preplan.append(path_norm)
                 if current_group:
                     mapped_info_groups.append(current_group)
             if mapped_info_groups:
-                leftovers = [
-                    info
-                    for info in all_raw_files_processed_info
-                    if _normalize_path_for_matching(info.get("path_raw") or info.get("path")) not in used_paths
-                ]
+                leftovers = []
+                for info in all_raw_files_processed_info:
+                    if not isinstance(info, dict):
+                        continue
+                    norm_val = _normalize_path_for_matching(info.get("path_raw") or info.get("path"))
+                    if norm_val and norm_val in used_paths:
+                        continue
+                    try:
+                        base_val = Path(info.get("path_raw") or info.get("path") or "").name.lower()
+                    except Exception:
+                        base_val = None
+                    if base_val and base_val in used_basenames:
+                        continue
+                    leftovers.append(info)
                 if leftovers:
                     mapped_info_groups.append(leftovers)
                 seestar_stack_groups = mapped_info_groups
@@ -15237,7 +15665,7 @@ def run_hierarchical_mosaic(
                 _log_and_callback(
                     f"Phase 2: using {len(mapped_info_groups)} preplanned group(s) from filter UI.",
                     prog=None,
-                    lvl="INFO_DETAIL",
+                    lvl="INFO",
                     callback=progress_callback,
                 )
                 if missing_preplan:
@@ -15656,6 +16084,7 @@ def run_hierarchical_mosaic(
     memmap_streaming_enabled = bool(auto_caps_info and auto_caps_info.get("memmap"))
     allow_auto_limit = (
         auto_limit_frames_per_master_tile_config
+        and not preplan_groups_active  # Ne pas éclater un pré-plan fourni par le filtre
         and (cluster_target_groups_config is None or int(cluster_target_groups_config) <= 0)
         and not memmap_streaming_enabled
     )

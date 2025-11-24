@@ -5346,14 +5346,17 @@ class ZeMosaicQtMainWindow(QMainWindow):
         )
 
         worker_kwargs: Dict[str, Any] = {"solver_settings_dict": solver_settings_dict}
+        # Toujours propager les résultats du filtre (préplan, sélection) si disponibles.
+        # Cela garantit que les groupes auto-organisés sont pris en compte même en mode "resume".
+        if self._last_filter_overrides is not None or self._last_filtered_header_items is not None:
+            worker_kwargs["filter_invoked"] = True
+        if isinstance(self._last_filter_overrides, dict):
+            worker_kwargs["filter_overrides"] = self._last_filter_overrides
+        if isinstance(self._last_filtered_header_items, list):
+            worker_kwargs["filtered_header_items"] = self._last_filtered_header_items
+
         if skip_filter_ui:
             worker_kwargs["skip_filter_ui"] = True
-            if self._last_filter_overrides is not None or self._last_filtered_header_items is not None:
-                worker_kwargs["filter_invoked"] = True
-            if isinstance(self._last_filter_overrides, dict):
-                worker_kwargs["filter_overrides"] = self._last_filter_overrides
-            if isinstance(self._last_filtered_header_items, list):
-                worker_kwargs["filtered_header_items"] = self._last_filtered_header_items
             worker_kwargs["early_filter_enabled"] = False
         return worker_args, worker_kwargs
 
