@@ -5137,7 +5137,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         astap_downsample = _coerce_int(cfg.get("astap_default_downsample", 2), 2)
         astap_sensitivity = _coerce_int(cfg.get("astap_default_sensitivity", 100), 100)
 
-        cluster_threshold = _coerce_float(cfg.get("cluster_panel_threshold", 0.12, 0.12))
+        cluster_threshold = _coerce_float(cfg.get("cluster_panel_threshold", 0.12), 0.12)
         cluster_target_groups = _coerce_int(cfg.get("cluster_target_groups", 0), 0)
         cluster_orientation = _coerce_float(cfg.get("cluster_orientation_split_deg", 0.0), 0.0)
 
