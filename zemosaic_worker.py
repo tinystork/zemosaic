@@ -12163,6 +12163,12 @@ def assemble_final_mosaic_reproject_coadd(
         tile_affine_corrections,
         len(effective_tiles),
     )
+    # When explicit affine corrections are provided (e.g., tests/CLI) and no automatic matching is requested,
+    # honor them as-is by disabling safety clamps so low gains (e.g., 0.1) are preserved.
+    if pending_affine_list and tile_affine_corrections is not None and not intertile_photometric_match:
+        gain_limit_min = 0.0
+        gain_limit_max = float("inf")
+        affine_offset_limit_adu = float("inf")
 
     if (
         pending_affine_list is None
@@ -12330,7 +12336,7 @@ def assemble_final_mosaic_reproject_coadd(
             collect_tile_data.clear()
         except Exception:
             collect_tile_data[:] = []
-        for entry in effective_tiles:
+        for idx_ctd, entry in enumerate(effective_tiles):
             arr = entry.get("data") if isinstance(entry, dict) else None
             tile_wcs = entry.get("wcs") if isinstance(entry, dict) else None
             coverage_mask = entry.get("coverage_mask") if isinstance(entry, dict) else None
@@ -12343,6 +12349,8 @@ def assemble_final_mosaic_reproject_coadd(
                     arr_copy = arr.copy()
                 except Exception:
                     arr_copy = np.asarray(arr, dtype=np.float32)
+            gain_to_apply = 1.0
+            offset_to_apply = 0.0
             if affine_by_id:
                 (
                     _,
@@ -12358,12 +12366,21 @@ def assemble_final_mosaic_reproject_coadd(
                     gain_limit_max=gain_limit_max,
                     affine_offset_limit_adu=affine_offset_limit_adu,
                 )
-                if gain_to_apply != 1.0 or offset_to_apply != 0.0:
-                    arr_copy = _apply_photometric_gain_offset(
-                        arr_copy,
-                        gain_to_apply,
-                        offset_to_apply,
-                    )
+            elif tile_affine_corrections and idx_ctd < len(tile_affine_corrections):
+                try:
+                    gain_to_apply = float(tile_affine_corrections[idx_ctd][0])
+                except Exception:
+                    gain_to_apply = 1.0
+                try:
+                    offset_to_apply = float(tile_affine_corrections[idx_ctd][1])
+                except Exception:
+                    offset_to_apply = 0.0
+            if gain_to_apply != 1.0 or offset_to_apply != 0.0:
+                arr_copy = _apply_photometric_gain_offset(
+                    arr_copy,
+                    gain_to_apply,
+                    offset_to_apply,
+                )
             cov_copy = None
             if coverage_mask is not None:
                 try:
@@ -12513,6 +12530,13 @@ def assemble_final_mosaic_reproject_coadd(
                     )
                 valid_entries.append(entry)
 
+            if not valid_entries:
+                blank_shape = tuple(map(int, final_output_shape_hw))
+                mosaic_channels.append(np.zeros(blank_shape, dtype=np.float32))
+                if coverage is None:
+                    coverage = np.zeros(blank_shape, dtype=np.float32)
+                continue
+
             data_list = [entry.get("data")[..., ch] for entry in valid_entries]
             wcs_list = [entry.get("wcs") for entry in valid_entries]
             weights_for_entries = None
@@ -12535,45 +12559,26 @@ def assemble_final_mosaic_reproject_coadd(
             def _invoke_reproject(local_kwargs: dict):
                 nonlocal use_gpu
                 invoke_kwargs = dict(local_kwargs)
+                cpu_func_safe = reproject_and_coadd if callable(reproject_and_coadd) else None
+                reproj_func_safe = reproject_interp if callable(reproject_interp) else None
+                if reproj_func_safe is not None:
+                    invoke_kwargs["reproject_function"] = reproj_func_safe
+                else:
+                    invoke_kwargs.pop("reproject_function", None)
                 if tile_weighting_applied and weights_for_entries is not None:
                     invoke_kwargs["tile_weights"] = weights_for_entries
-                try:
-                    return reproject_and_coadd_wrapper(
-                        data_list=data_list,
-                        wcs_list=wcs_list,
-                        shape_out=final_output_shape_hw,
-                        output_projection=output_header,
-                        use_gpu=use_gpu,
-                        cpu_func=reproject_and_coadd,
-                        reproject_function=reproject_interp,
-                        combine_function="mean",
-                        progress_callback=_pcb,
-                        allow_cpu_fallback=not use_gpu,
-                        **local_kwargs,
-                    )
-                except TypeError:
-                    raise
-                except Exception as gpu_exc:
-                    if not use_gpu:
-                        raise
-                    mark_phase5_gpu_unavailable("phase5_reproject_coadd", str(gpu_exc))
-                    use_gpu = False
-                    logger.warning(
-                        "[Phase5] GPU reprojection failed (%s); disabling GPU for remainder of run.",
-                        gpu_exc,
-                    )
-                    return reproject_and_coadd_wrapper(
-                        data_list=data_list,
-                        wcs_list=wcs_list,
-                        shape_out=final_output_shape_hw,
-                        output_projection=output_header,
-                        use_gpu=False,
-                        cpu_func=reproject_and_coadd,
-                        reproject_function=reproject_interp,
-                        combine_function="mean",
-                        progress_callback=_pcb,
-                        **local_kwargs,
-                    )
+                return zemosaic_utils.reproject_and_coadd_wrapper(
+                    data_list=data_list,
+                    wcs_list=wcs_list,
+                    shape_out=final_output_shape_hw,
+                    output_projection=output_header,
+                    use_gpu=use_gpu,
+                    cpu_func=cpu_func_safe,
+                    combine_function="mean",
+                    progress_callback=_pcb,
+                    allow_cpu_fallback=not use_gpu,
+                    **invoke_kwargs,
+                )
 
             try:
                 chan_mosaic, chan_cov = _invoke_reproject(reproj_call_kwargs)
@@ -12600,7 +12605,17 @@ def assemble_final_mosaic_reproject_coadd(
                         raise
                 else:
                     raise
-            # Store channel result to memmap if enabled, else keep in RAM list
+            except Exception as gpu_exc:
+                if not use_gpu:
+                    raise
+                mark_phase5_gpu_unavailable("phase5_reproject_coadd", str(gpu_exc))
+                use_gpu = False
+                logger.warning(
+                    "[Phase5] GPU reprojection failed (%s); disabling GPU for remainder of run.",
+                    gpu_exc,
+                )
+                chan_mosaic, chan_cov = _invoke_reproject(reproj_call_kwargs)
+
             ch_f32 = chan_mosaic.astype(np.float32)
             if mosaic_memmap is not None:
                 mosaic_memmap[..., ch] = ch_f32
@@ -12643,6 +12658,7 @@ def assemble_final_mosaic_reproject_coadd(
                 except Exception:
                     pass
             _log_memory_usage(progress_callback, f"Phase5 Reproject: mémoire après canal {ch+1}")
+
     except Exception as e_reproject:
         _pcb("assemble_error_reproject_coadd_call_failed", lvl="ERROR", error=str(e_reproject))
         logger.error(
@@ -13623,15 +13639,22 @@ def run_second_pass_coverage_renorm(
 
         def _invoke_reproj(use_gpu_local: bool, local_kwargs: dict[str, Any]):
             nonlocal use_gpu
+            invoke_kwargs = dict(local_kwargs)
+            cpu_func_safe = reproject_and_coadd if callable(reproject_and_coadd) else None
+            reproj_func_safe = reproject_interp if callable(reproject_interp) else None
+            if reproj_func_safe is not None:
+                invoke_kwargs["reproject_function"] = reproj_func_safe
+            else:
+                invoke_kwargs.pop("reproject_function", None)
             try:
                 return zemosaic_utils.reproject_and_coadd_wrapper(
                     data_list=data_list,
                     wcs_list=tiles_wcs,
                     shape_out=shape_out_hw,
                     use_gpu=use_gpu_local,
-                    cpu_func=reproject_and_coadd,
+                    cpu_func=cpu_func_safe,
                     allow_cpu_fallback=not use_gpu_local,
-                    **local_kwargs,
+                    **invoke_kwargs,
                 )
             except TypeError:
                 raise
@@ -13650,8 +13673,8 @@ def run_second_pass_coverage_renorm(
                     wcs_list=tiles_wcs,
                     shape_out=shape_out_hw,
                     use_gpu=False,
-                    cpu_func=reproject_and_coadd,
-                    **local_kwargs,
+                    cpu_func=cpu_func_safe,
+                    **invoke_kwargs,
                 )
 
         local_kwargs = dict(reproj_kwargs)
@@ -13728,28 +13751,39 @@ def run_second_pass_coverage_renorm(
         return ch_idx, chan_mosaic_np, chan_cov_np
 
     reproj_chunk_total = n_channels
-    if n_channels == 1:
-        try:
-            ch_idx, chan_mosaic_np, chan_cov_np = _process_channel(0, use_gpu)
-        except Exception:
+    channel_tasks: list[tuple[int, bool]] = []
+    gpu_assigned = False
+    for ch in range(n_channels):
+        use_gpu_flag = bool(use_gpu and not gpu_assigned)
+        if use_gpu_flag:
+            gpu_assigned = True
+        channel_tasks.append((ch, use_gpu_flag))
+
+    # Process channels sequentially when GPU is involved to avoid driver/context issues in thread pools.
+    if n_channels == 1 or use_gpu:
+        reproj_failure = False
+        done_channels = 0
+        for ch_idx, use_gpu_flag in channel_tasks:
+            try:
+                ch_idx, chan_mosaic_np, chan_cov_np = _process_channel(ch_idx, use_gpu_flag)
+                mosaic_channels[ch_idx] = chan_mosaic_np
+                coverage_channels[ch_idx] = chan_cov_np
+            except Exception as exc:
+                reproj_failure = True
+                if logger:
+                    logger.warning("[TwoPass] Channel %d reprojection failed: %s", ch_idx, exc)
+                break
+            done_channels += 1
+            _emit_two_pass_stats(
+                tiles_total,
+                chunk_index=done_channels,
+                chunk_total=reproj_chunk_total,
+                force=False,
+                stage="reproject",
+            )
+        if reproj_failure or any(m is None for m in mosaic_channels):
             return None
-        mosaic_channels[0] = chan_mosaic_np
-        coverage_channels[0] = chan_cov_np
-        _emit_two_pass_stats(
-            tiles_total,
-            chunk_index=1,
-            chunk_total=reproj_chunk_total,
-            force=False,
-            stage="reproject",
-        )
     else:
-        channel_tasks: list[tuple[int, bool]] = []
-        gpu_assigned = False
-        for ch in range(n_channels):
-            use_gpu_flag = bool(use_gpu and not gpu_assigned)
-            if use_gpu_flag:
-                gpu_assigned = True
-            channel_tasks.append((ch, use_gpu_flag))
         max_channel_workers = max(1, min(n_channels, cpu_workers_hint or n_channels))
         reproj_failure = False
         done_channels = 0
