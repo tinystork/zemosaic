@@ -15,6 +15,7 @@ import time
 from typing import Any, Callable, Mapping, Sequence, TYPE_CHECKING
 
 import numpy as np
+from contextlib import nullcontext
 
 try:  # pragma: no cover - exercised only when CuPy is available
     import cupy as cp  # type: ignore
@@ -412,6 +413,14 @@ def _prepare_frames_and_weights(
 
     radial_map = _compute_radial_weight_map(height, width, channels, stacking_params, logger)
 
+    # Align with CPU behavior: when no radial map is present, the CPU path drops
+    # compact (1x1xC) quality weights due to shape mismatch. Skip them here too
+    # to avoid GPU-only weighting that drifts from the CPU reference.
+    if radial_map is None:
+        quality_weights = None
+        weight_method_used = "none"
+        weight_stats = None
+
     weights_stack: np.ndarray | None = None
     if radial_map is not None or quality_weights is not None:
         combined_weights: list[np.ndarray | None] = []
@@ -454,13 +463,15 @@ def _combine_weighted_chunk(
 
     mask = cp.isfinite(data_gpu)
     safe_weights = cp.where(mask, weights_gpu, cp.zeros_like(weights_gpu))
-    weighted_sum = cp.nansum(data_gpu * safe_weights, axis=0)
-    weight_sum = cp.sum(safe_weights, axis=0)
-    with cp.errstate(divide="ignore", invalid="ignore"):
+    # Match the CPU path's float64 accumulation to minimize parity drift.
+    weighted_sum = cp.nansum(data_gpu * safe_weights, axis=0, dtype=cp.float64)
+    weight_sum = cp.sum(safe_weights, axis=0, dtype=cp.float64)
+    err_ctx = getattr(cp, "errstate", None)
+    with (err_ctx(divide="ignore", invalid="ignore") if callable(err_ctx) else nullcontext()):
         combined = cp.where(weight_sum > 0, weighted_sum / weight_sum, cp.nan)
     needs_fallback = ~cp.isfinite(combined)
     if cp.any(needs_fallback):
-        fallback = cp.nanmean(data_gpu, axis=0)
+        fallback = cp.nanmean(data_gpu.astype(cp.float64, copy=False), axis=0)
         combined = cp.where(needs_fallback, fallback, combined)
     return combined
 

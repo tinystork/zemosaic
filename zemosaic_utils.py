@@ -3873,6 +3873,7 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
     winsor_limits = _sanitize_winsor_limits(kwargs.get("winsor_limits", (0.05, 0.05)) or (0.05, 0.05))
     kappa_sigma_k = float(kwargs.get("coadd_k", kwargs.get("kappa_sigma_k", 2.0)) or 2.0)
     match_background = bool(kwargs.get("match_background", kwargs.get("match_bg", False)))
+    gpu_match_background = bool(kwargs.get("gpu_match_background", False))
 
     float32_bytes = np.dtype(np.float32).itemsize
     tile_affine = kwargs.get("tile_affine_corrections", None)
@@ -3909,7 +3910,7 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
                 img = img * cp.float32(gain_val)
             if offset_val != 0.0:
                 img = img + cp.float32(offset_val)
-        if match_background:
+        if match_background and gpu_match_background:
             try:
                 offset_val = float(cp.nanmedian(img).get())
             except Exception:
@@ -3954,12 +3955,12 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
         x_in_gpu = cp.asarray(x_in, dtype=cp.float32)
         y_in_gpu = cp.asarray(y_in, dtype=cp.float32)
         h_in, w_in = img_gpu.shape
-        valid = (
-            (x_in_gpu >= -0.5)
-            & (x_in_gpu <= (w_in - 0.5))
-            & (y_in_gpu >= -0.5)
-            & (y_in_gpu <= (h_in - 0.5))
-        )
+        # Clamp to avoid sampling outside the input frame (GPU was producing zeros on edges).
+        x_in_gpu = cp.clip(x_in_gpu, 0.0, cp.float32(w_in - 1))
+        y_in_gpu = cp.clip(y_in_gpu, 0.0, cp.float32(h_in - 1))
+        # Rely on map_coordinates' cval handling plus the sampled_mask footprint;
+        # avoid extra clipping that was zeroing edge pixels vs CPU.
+        valid = cp.ones_like(x_in_gpu, dtype=cp.float32)
         coords = cp.stack([y_in_gpu, x_in_gpu], axis=0)
         sampled = map_coordinates(img_gpu, coords, order=1, mode="constant", cval=0.0)
         sampled_mask = map_coordinates(mask_gpu, coords, order=1, mode="constant", cval=0.0)
@@ -4284,11 +4285,23 @@ def _reproject_and_coadd_wrapper_impl(
         return normalized
 
     normalized_weights = _normalize_tile_weights(tile_weights, len(data_list))
+    match_background_flag = bool(kwargs.get("match_background", kwargs.get("match_bg", False)))
+    cpu_accepts_match_bg = False
+    if cpu_func is not None:
+        try:
+            sig = inspect.signature(cpu_func)
+            cpu_accepts_match_bg = ("match_background" in sig.parameters) or ("match_bg" in sig.parameters)
+        except Exception:
+            cpu_accepts_match_bg = False
+    if match_background_flag and not cpu_accepts_match_bg:
+        match_background_flag = False
     gpu_kwargs = dict(kwargs)
     if progress_callback is not None:
         gpu_kwargs["progress_callback"] = progress_callback
     if normalized_weights is not None:
         gpu_kwargs["tile_weights"] = normalized_weights
+    gpu_kwargs["match_background"] = match_background_flag
+    gpu_kwargs["gpu_match_background"] = match_background_flag
     if use_gpu:
         if not gpu_is_available():
             _log_gpu_event(
@@ -4326,6 +4339,9 @@ def _reproject_and_coadd_wrapper_impl(
         "tile_affine_corrections",
     }
     cpu_kwargs = {k: v for k, v in kwargs.items() if k not in gpu_only}
+    if not cpu_accepts_match_bg:
+        cpu_kwargs.pop("match_background", None)
+        cpu_kwargs.pop("match_bg", None)
     if normalized_weights is not None:
         weight_maps = []
         for arr, w in zip(data_list, normalized_weights):

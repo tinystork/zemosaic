@@ -1,172 +1,194 @@
-Mission : Corriger les régressions d’alignement et de couleur introduites après le commit 38c876a
+✅ agent.md — Ready for Codex Max / High
 
-Le commit 38c876a est confirmé comme dernier état fonctionnel.
+Mission: Investigate and fix the **quality difference between CPU and GPU pipelines** so that, for the same input, **GPU output matches CPU output** (same geometry and colors, up to small numerical noise). The GPU path should be **a faster drop-in replacement**, not a different look.
 
-Deux régressions distinctes sont apparues dans V4WIP :
+Branch / scope: current ZeMosaic working branch (do **not** refactor the whole project, focus on CPU vs GPU parity for stacking & mosaic).
 
-Déformation géométrique + mauvais alignement
+---
 
-Dérive colorimétrique vers le vert
+## 🎯 Goals
 
-L’objectif est de corriger les deux, sans toucher à la voie GPU.
+- [ ] Find **where** and **why** the GPU result diverges from the CPU result.
+- [ ] Ensure **identical stacking logic** on CPU and GPU (same math, same reference frame, same photometric behavior).
+- [ ] Fix the GPU pipeline so that:
+  - [ ] There is **no green tint** or color bias vs CPU.
+  - [ ] There is no geometric distortion / misalignment specific to GPU.
+  - [ ] On a given dataset, CPU and GPU produce **visually identical** images, with only small floating-point differences.
+- [ ] Provide a **small comparison harness + tests** to keep CPU/GPU in sync over time.
 
-🎯 Objectifs
+---
 
- Restaurer un WCS valide (plus d’erreur all_world2pix failed to converge)
+## 🧩 Context
 
- Restaurer un alignement géométrique correct équivalent à 38c876a
+The project has two stacking/mosaic pipelines:
 
- Corriger la dérive verte (balance RVB)
+- **CPU reference**:
+  - Main logic in:  
+    - `zemosaic_align_stack.py`
+    - `zemosaic_worker.py` (orchestrates phases, preview generation, etc.)
+  - This path is considered **correct** in terms of geometry, photometry, and color balance.
 
- Garantir la stabilité multi-thread (Phase 3)
+- **GPU pipeline**:
+  - Main logic in:
+    - `zemosaic_align_stack_gpu.py`
+    - Any GPU-specific helper or wrapper (e.g. in `parallel_utils.py` or similar).
+  - The GPU path should be **mathematically equivalent** to the CPU path, only faster.
 
- Ne modifier aucun fichier GPU (zemosaic_align_stack_gpu.py)
+Current issue:
 
-📌 Contexte & Hypothèses
-Hypothèse 1 — Instabilité numérique dans la transformation WCS
+- The **GPU path sometimes produces greenish / color-shifted images**, while the CPU path yields correct colors.
+- The expectation is: **under the same configuration (same input data, same params), CPU and GPU outputs should match**.
 
-Les logs montrent une `UserWarning` d'Astropy :
+Important note:
 
-`WCS.all_world2pix failed to converge`
+- Some external analysis suggested a potential **BGR vs RGB mix-up** (e.g., OpenCV vs FITS channel order). That hypothesis is **unconfirmed**.
+- The CPU path currently looks good, so any change that would affect the **common loader / shared code** must be **carefully validated** and not break CPU output.
 
-**Analyse de l'erreur :**
-Cette erreur indique que l'algorithme itératif utilisé par Astropy pour convertir des coordonnées mondiales (célestes) en coordonnées de pixels n'a pas trouvé de solution stable. Ce n'est pas nécessairement un signe de WCS corrompu, mais plutôt d'une **instabilité numérique**.
+---
 
-**Causes possibles :**
-1.  Les coordonnées mondiales demandées sont très éloignées de la zone de l'image.
-2.  Le modèle de distorsion (WCS) est très prononcé.
-3.  L'appel à `all_world2pix` est connu pour être moins robuste que d'autres fonctions dans certains cas.
+## 🗂️ Files to inspect (non-exhaustive, but high priority)
 
-**Action recommandée par Astropy :**
-La documentation et la communauté Astropy suggèrent de remplacer `wcs.all_world2pix` par `wcs.wcs_world2pix` pour les conversions de paires de coordonnées, car cette dernière implémente un algorithme plus robuste. Le problème n'est donc probablement pas dans la création du WCS (`_parse_wcs_file_content_za_v2`), mais dans son **utilisation**.
+- [ ] `zemosaic_align_stack.py`  
+- [ ] `zemosaic_align_stack_gpu.py`  
+- [ ] `zemosaic_worker.py`  
+- [ ] `zemosaic_time_utils.py` (if used in Phase 3/5 orchestration)
+- [ ] `parallel_utils.py` (for GPU orchestration / CPU/GPU auto-tune)
+- [ ] `zemosaic_config.py` (global GPU toggles, phase-specific flags)
+- [ ] Any GPU helper modules referenced by `zemosaic_align_stack_gpu.py`
+- [ ] Image loading / preview:
+  - `zemosaic_utils.py` (e.g. `load_and_validate_fits`, `debayer_image`, etc.)
+  - Any preview / PNG/PNG-export functions in `zemosaic_worker.py`
 
-Hypothèse 2 — Alignement local (FFT + astroalign) potentiellement touché
+---
 
-⚠️ Très important :
-Si les master tiles elles-mêmes sont déjà déformées, le bug n’est pas uniquement WCS.
+## 🔍 Tasks (step-by-step, with checkboxes)
 
-Dans ce cas, la fonction à inspecter est :
+### 1. Map CPU vs GPU pipelines
 
-`align_images_in_group` dans `zemosaic_align_stack.py`
+- [ ] Identify all code paths involved when:
+  - CPU stacking is used.
+  - GPU stacking is used.
+- [ ] For each **phase** (especially stacking / mosaic / stretch / RGB normalization), list:
+  - [ ] The CPU function(s) called.
+  - [ ] The GPU function(s) called.
+  - [ ] Any differences in parameters, defaults, numeric order of operations.
 
-Cette fonction utilise :
+Goal: have a clear diagram of **which CPU function corresponds to which GPU function**, and where they diverge.
 
-pré-alignement FFT
+---
 
-alignement fin avec `astroalign.register`
+### 2. Build a comparison harness (CPU vs GPU)
 
-Une régression locale (pré-alignement, warp, dtype, normalisation) peut provoquer une déformation même hors WCS.
+Create a small, self-contained **debug / test utility** (can be under `tests/` or a dedicated module) that:
 
-Hypothèse 3 — Dérive colorimétrique vers le vert
+- [ ] Takes a small set of FITS tiles (real or synthetic).
+- [ ] Runs **the CPU pipeline** on that set.
+- [ ] Runs **the GPU pipeline** on the exact same set, with the same configuration.
+- [ ] Compares outputs:
+  - [ ] Per-channel statistics (min, max, mean, median) for R, G, B.
+  - [ ] Per-channel histograms or percentiles.
+  - [ ] Pixel-wise differences: max abs diff, mean abs diff, maybe a norm per channel.
+- [ ] Emits a clear summary:
+  - e.g. “Max difference per channel (R,G,B) = (…)”,
+  - “Median value per channel (CPU vs GPU)”,
+  - “Any channel significantly off compared to the other two?”
 
-Probable cause :
+You can expose this as:
 
-mauvaise balance des gains dans la fonction
-`equalize_rgb_medians_inplace`
-(appelée via `_poststack_rgb_equalization`).
+- a small Python function used by tests, and/or
+- a CLI/debug entry point (e.g. `python -m zemosaic.debug.compare_cpu_gpu ...`).
 
-Cette fonction calcule des gains canal par canal.
-Une médiane faussée, un clipping ou un double-apply provoque rapidement un `green cast`.
+---
 
-📁 Fichiers à analyser et éventuellement corriger
-Priorité 1
+### 3. Locate the source(s) of divergence
 
- **Localiser les appels à `.all_world2pix`** dans le code (probablement dans `zemosaic_worker.py` ou `zemosaic_utils.py`) et les remplacer.
+Using the comparison harness, drill down phase by phase:
 
-Priorité 2
+- [ ] Compare **stacked tiles** CPU vs GPU *before* any stretch/normalization.
+- [ ] Compare **RGB equalization / white balance** steps CPU vs GPU.
+- [ ] Compare **final stretched images** CPU vs GPU (what the user actually sees).
+- [ ] Check:
+  - [ ] Are the differences already visible on the stacked data?
+  - [ ] Or do they appear during equalization / stretching / background subtraction?
+  - [ ] Is there a systematic excess in the **G channel** vs R/B on the GPU path?
 
- `zemosaic_align_stack.py`
+Specifically investigate:
 
-`align_images_in_group`
+- [ ] Any GPU-specific implementation of **RGB normalization / equalization**  
+  (e.g. functions named like `_poststack_rgb_equalization` or similar).
+- [ ] Any GPU-specific **stretch** code  
+  (e.g. `stretch_auto_asifits_like_gpu` vs the CPU `stretch_auto_asifits_like`).
+- [ ] Any difference in the way **weights** or **masks** are applied on CPU vs GPU.
 
-`equalize_rgb_medians_inplace`
+If an earlier hypothesis about **BGR vs RGB** is correct:
 
-`_poststack_rgb_equalization`
+- [ ] Confirm it with **hard evidence**:
+  - Show that at some entry point, data is in BGR for GPU but in RGB for CPU.
+  - Show that a channel swap explains the green tint.
+- [ ] Only then, design a **minimal, controlled fix** (see Constraints below).
 
- `zemosaic_astrometry.py` (si le remplacement de `all_world2pix` ne suffit pas)
+---
 
-`_parse_wcs_file_content_za_v2`
+### 4. Design and implement the fix
 
-🚫 À ne jamais modifier
+Once the root cause is identified:
 
- `zemosaic_align_stack_gpu.py`
+- [ ] Align the GPU logic with the CPU logic:
+  - Same order of operations,
+  - Same formulas,
+  - Same default parameters.
+- [ ] If the bug is a color space issue (e.g. BGR vs RGB):
+  - [ ] Add a **local, explicit conversion** at the correct boundary (e.g. just before feeding OpenCV, or right after retrieving OpenCV output).
+  - [ ] Do **not** add a global “convert all 3-channel images BGR→RGB” in a shared loader unless absolutely proven necessary and validated against the CPU path.
+- [ ] If the bug is in a GPU-specific stretch or equalization:
+  - [ ] Modify the GPU implementation so it matches the CPU math.
+  - [ ] Add comments explaining the rationale and link to the CPU reference implementation.
 
- Tout kernel ou pipeline GPU
-(Le GPU empile seulement → les déformations viennent avant.)
+---
 
-💡 Tâches détaillées
-✔️ Étape 1 — Correction de l'instabilité WCS
+### 5. Add regression tests for CPU/GPU parity
 
- **Action immédiate :** Remplacer les appels à `wcs.all_world2pix` par `wcs.wcs_world2pix`. Cette fonction est plus stable pour les transformations de coordonnées. Il faudra adapter le code si les entrées/sorties diffèrent légèrement (ex: gestion de tableaux).
+Add automated tests (e.g. with `pytest`) that:
 
- **Vérifier** la disparition de la `UserWarning`:
-`WCS.all_world2pix failed to converge`
+- [ ] Use a small deterministic test dataset (synthetic or bundled FITS tiles).
+- [ ] Run both CPU and GPU pipelines with the same configuration.
+- [ ] Assert that:
+  - [ ] CPU and GPU outputs have the same **shape** and dtype.
+  - [ ] Per-channel difference (R,G,B) is below a reasonable epsilon (for example, `max_abs_diff < 1e-3` or similar, depending on scaling).
+  - [ ] There is no systematic channel imbalance (e.g. G much higher on GPU than CPU).
+- [ ] Flag clearly that the CPU path is the **reference**.
 
-✔️ Étape 2 — Validation géométrique
-🎯 Test crucial : mono-thread
+These tests should fail on the current broken state and pass after the fix.
 
-Pour exclure une race condition :
+---
 
- Forcer Phase 3 en mono-thread :
+## 🚫 Constraints / Non-goals
 
-`winsor_worker_limit = 1`
+- [ ] **Do not change** the overall user-facing API, CLI options, or GUI behavior (except maybe adding a debug flag / advanced expert option).
+- [ ] **Do not break** existing behavior of:
+  - SDS / mosaic-first pipeline.
+  - Batch size logic, especially the semantics of:
+    - `batch_size = 0`
+    - `batch_size > 1`
+- [ ] **Do not** refactor unrelated parts of the codebase or introduce large architecture changes.
+- [ ] Avoid “magic” global conversions (e.g. blind `BGR→RGB` on any 3-channel array) that could silently change good CPU behavior.
+- [ ] Keep changes as **local and well-documented** as possible.
 
-`actual_num_workers_ph3 = 1`
+---
 
- Retraiter un dataset problématique
+## ✅ Acceptance Criteria
 
- Comparer master tiles mono-thread vs multi-thread
+- [ ] On the same dataset (same parameters), CPU and GPU images are **visually indistinguishable**:
+  - same framing,
+  - same background,
+  - same color balance (no greenish cast from GPU).
+- [ ] The comparison harness reports **small numeric differences only**, consistent with float math / GPU vs CPU differences.
+- [ ] New tests for CPU/GPU parity are in place and **pass**.
+- [ ] Existing tests still pass.
+- [ ] The GPU path remains clearly faster than CPU for realistic workloads.
 
-Si déformation présente dans les deux → ce n'est pas un bug multi-thread.
+Please summarize in the PR / final note:
 
-🎯 Inspecter l’alignement intra-tile (`align_images_in_group`)
-
-Si les master tiles montrent déjà la déformation, alors :
-
- Instrumenter `align_images_in_group`
-
- Tracer :
-
- `dx, dy` FFT
-
- image source et référence envoyées à `astroalign`
-
- matrice affine retournée par `astroalign.register`
-
- `shape`, `dtype` et normalisation des entrées
-
- Comparer le comportement à celui du commit 38c876a
-
-✔️ Étape 3 — Correction du green cast
-
- Inspecter `equalize_rgb_medians_inplace`
-
- Logguer :
-
- médiane R, G, B
-
- gains appliqués
-
- avant/après
-
- Vérifier pas de double-application
-
- S'assurer que la normalisation RGB est identique à celle de 38c876a
-
- Corriger l’algorithme pour obtenir une balance neutre
-
-✔️ Validation finale
-
-Le correctif est validé lorsque, pour un même dataset :
-
- Plus d’erreur WCS `...failed to converge`.
-
- Les master tiles sont géométriquement correctes.
-
- La mosaïque finale ne présente aucune déformation.
-
- La balance des couleurs est neutre.
-
- Aucun changement n’a touché la voie GPU.
-
- Le comportement est identique ou meilleur que 38c876a.
+- What the precise root cause was.
+- What code was changed.
+- How the new tests guarantee CPU/GPU parity going forward.

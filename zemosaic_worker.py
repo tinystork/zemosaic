@@ -2454,7 +2454,8 @@ def _apply_photometric_gain_offset(
         else:
             xp = np
     if xp is np:
-        arr = np.asarray(array_like, dtype=np.float32, order="C", copy=False)
+        # np.asarray() does not accept ``copy``; np.array(copy=False) preserves views when possible.
+        arr = np.array(array_like, dtype=np.float32, order="C", copy=False)
         if gain != 1.0:
             np.multiply(arr, np.float32(gain), out=arr, casting="unsafe")
         if offset != 0.0:
@@ -12349,38 +12350,6 @@ def assemble_final_mosaic_reproject_coadd(
                     arr_copy = arr.copy()
                 except Exception:
                     arr_copy = np.asarray(arr, dtype=np.float32)
-            gain_to_apply = 1.0
-            offset_to_apply = 0.0
-            if affine_by_id:
-                (
-                    _,
-                    _,
-                    gain_to_apply,
-                    offset_to_apply,
-                    clamped_flag,
-                ) = _resolve_affine_gain_offset_for_tile(
-                    entry.get("tile_id"),
-                    affine_by_id,
-                    match_background=match_bg,
-                    gain_limit_min=gain_limit_min,
-                    gain_limit_max=gain_limit_max,
-                    affine_offset_limit_adu=affine_offset_limit_adu,
-                )
-            elif tile_affine_corrections and idx_ctd < len(tile_affine_corrections):
-                try:
-                    gain_to_apply = float(tile_affine_corrections[idx_ctd][0])
-                except Exception:
-                    gain_to_apply = 1.0
-                try:
-                    offset_to_apply = float(tile_affine_corrections[idx_ctd][1])
-                except Exception:
-                    offset_to_apply = 0.0
-            if gain_to_apply != 1.0 or offset_to_apply != 0.0:
-                arr_copy = _apply_photometric_gain_offset(
-                    arr_copy,
-                    gain_to_apply,
-                    offset_to_apply,
-                )
             cov_copy = None
             if coverage_mask is not None:
                 try:
