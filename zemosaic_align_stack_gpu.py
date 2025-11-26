@@ -682,6 +682,20 @@ def gpu_stack_from_arrays(
     if drop_channel:
         stacked = stacked[..., 0]
 
+    # Validate GPU output before returning to the worker. Falling back to CPU when the
+    # GPU path produces only NaNs or an all-zero array keeps parity with the reference
+    # CPU stacker instead of silently returning unusable data.
+    if not np.any(np.isfinite(stacked)):
+        raise GPUStackingError("GPU stack produced no finite pixels; falling back to CPU")
+    if not np.all(np.isfinite(stacked)):
+        stacked = np.nan_to_num(stacked, nan=0.0, posinf=0.0, neginf=0.0)
+    try:
+        max_abs = float(np.nanmax(np.abs(stacked)))
+    except Exception:
+        max_abs = 0.0
+    if max_abs <= 0.0:
+        raise GPUStackingError("GPU stack produced a zero-valued image; falling back to CPU")
+
     stack_metadata: dict[str, Any] = {
         "weight_method": weight_method_used,
         "weight_stats": weight_stats,

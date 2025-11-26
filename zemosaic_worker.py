@@ -17602,13 +17602,49 @@ def run_hierarchical_mosaic(
                 )
         
         coverage_export_arr: np.ndarray | None = None
+        coverage_has_signal = False
         if final_mosaic_coverage_HW is not None:
             try:
                 coverage_export_arr = np.asarray(final_mosaic_coverage_HW, dtype=np.float32, order="C")
                 if coverage_export_arr.ndim > 2:
                     coverage_export_arr = np.squeeze(coverage_export_arr)
-                if coverage_export_arr.ndim != 2 or coverage_export_arr.size == 0:
+                if coverage_export_arr.ndim == 2 and coverage_export_arr.size > 0:
+                    try:
+                        coverage_has_signal = bool(np.nanmax(np.abs(coverage_export_arr)) > 0)
+                    except Exception:
+                        coverage_has_signal = False
+                else:
                     coverage_export_arr = None
+            except Exception:
+                coverage_export_arr = None
+        if (coverage_export_arr is None or not coverage_has_signal) and (
+            alpha_final is not None or save_array is not None
+        ):
+            try:
+                fallback_cov = None
+                if alpha_final is not None:
+                    alpha_arr = np.asarray(alpha_final, dtype=np.float32, copy=False)
+                    if alpha_arr.ndim > 2:
+                        alpha_arr = np.squeeze(alpha_arr)
+                    max_alpha = float(np.nanmax(alpha_arr)) if alpha_arr.size else 0.0
+                    if max_alpha > 0.0:
+                        fallback_cov = alpha_arr / max_alpha
+                if fallback_cov is None and save_array is not None:
+                    mask_valid = np.isfinite(save_array)
+                    if mask_valid.ndim == 3:
+                        mask_valid = np.any(mask_valid, axis=-1)
+                    fallback_cov = mask_valid.astype(np.float32, copy=False)
+                if fallback_cov is not None:
+                    coverage_export_arr = fallback_cov.astype(np.float32, copy=False)
+                    try:
+                        coverage_has_signal = bool(np.nanmax(np.abs(coverage_export_arr)) > 0)
+                    except Exception:
+                        coverage_has_signal = False
+                    if logger:
+                        logger.info(
+                            "phase6: coverage fallback derived from %s",
+                            "alpha_mask" if alpha_final is not None else "mosaic_valid_mask",
+                        )
             except Exception:
                 coverage_export_arr = None
         if coverage_export_arr is not None:
@@ -17621,10 +17657,6 @@ def run_hierarchical_mosaic(
                     pass
             cov_hdr["EXTNAME"] = ("COVERAGE", "Coverage Map")
             cov_hdr["BUNIT"] = ("count", "Pixel contributions or sum of weights")
-            try:
-                coverage_has_signal = bool(np.nanmax(np.abs(coverage_export_arr)) > 0)
-            except Exception:
-                coverage_has_signal = True
             zemosaic_utils.save_fits_image(
                 coverage_export_arr,
                 str(coverage_path),
@@ -17755,7 +17787,8 @@ def run_hierarchical_mosaic(
                         if np.any(mask_zero):
                             preview_view = np.array(preview_view, copy=True)
                             try:
-                                preview_view[mask_zero[..., None]] = np.nan
+                                # Broadcast the 2D mask across channels without triggering boolean shape errors.
+                                preview_view[mask_zero] = np.nan
                             except Exception as e_nan:
                                 logger.warning(
                                     "phase6: preview NaN masking failed: %s (shape preview=%s, alpha=%s)",

@@ -1,194 +1,258 @@
-✅ agent.md — Ready for Codex Max / High
+✅ Mission
 
-Mission: Investigate and fix the **quality difference between CPU and GPU pipelines** so that, for the same input, **GPU output matches CPU output** (same geometry and colors, up to small numerical noise). The GPU path should be **a faster drop-in replacement**, not a different look.
+Corriger les bandes de jointures photométriques réapparues dans les mosaïques ZeMosaic, en Phase 5 / Reproject & Coadd, sans toucher :
 
-Branch / scope: current ZeMosaic working branch (do **not** refactor the whole project, focus on CPU vs GPU parity for stacking & mosaic).
+au routage CPU/GPU,
 
----
+au pipeline SDS vs non-SDS,
 
-## 🎯 Goals
+ni à la correction de dominante verte / égalisation RGB.
 
-- [ ] Find **where** and **why** the GPU result diverges from the CPU result.
-- [ ] Ensure **identical stacking logic** on CPU and GPU (same math, same reference frame, same photometric behavior).
-- [ ] Fix the GPU pipeline so that:
-  - [ ] There is **no green tint** or color bias vs CPU.
-  - [ ] There is no geometric distortion / misalignment specific to GPU.
-  - [ ] On a given dataset, CPU and GPU produce **visually identical** images, with only small floating-point differences.
-- [ ] Provide a **small comparison harness + tests** to keep CPU/GPU in sync over time.
+Les flux CPU et GPU doivent produire exactement la même image (à bruit numérique près), sans bandes au niveau des bords de tuiles.
 
----
+🧩 Symptôme
 
-## 🧩 Context
+En sortie de Phase 5, la mosaïque finale présente des rectangles visibles qui suivent les contours des master tiles (voir capture fournie par l’utilisateur).
 
-The project has two stacking/mosaic pipelines:
+Le problème est identique en mode CPU et GPU, donc la cause est dans la logique commune à Phase 5, pas dans les kernels GPU eux-mêmes.
 
-- **CPU reference**:
-  - Main logic in:  
-    - `zemosaic_align_stack.py`
-    - `zemosaic_worker.py` (orchestrates phases, preview generation, etc.)
-  - This path is considered **correct** in terms of geometry, photometry, and color balance.
+Avant certaines modifications récentes (RGB equalization / Phase 5 refactor), ces bandes n’étaient pas visibles.
 
-- **GPU pipeline**:
-  - Main logic in:
-    - `zemosaic_align_stack_gpu.py`
-    - Any GPU-specific helper or wrapper (e.g. in `parallel_utils.py` or similar).
-  - The GPU path should be **mathematically equivalent** to the CPU path, only faster.
+🎯 Objectifs détaillés
 
-Current issue:
+Merci de :
 
-- The **GPU path sometimes produces greenish / color-shifted images**, while the CPU path yields correct colors.
-- The expectation is: **under the same configuration (same input data, same params), CPU and GPU outputs should match**.
+ Identifier la cause des bandes de jointure : perte de pondération / masques, ordre de pipeline, renorm désactivée, etc.
 
-Important note:
+ Garantir que chaque tuile passe à nouveau correctement par :
 
-- Some external analysis suggested a potential **BGR vs RGB mix-up** (e.g., OpenCV vs FITS channel order). That hypothesis is **unconfirmed**.
-- The CPU path currently looks good, so any change that would affect the **common loader / shared code** must be **carefully validated** and not break CPU output.
+le pipeline lecropper (quality crop + Alt-Az cleanup quand activé),
 
----
+la map de poids radiale (feathering en bord de champ),
 
-## 🗂️ Files to inspect (non-exhaustive, but high priority)
+la normalisation photométrique/coverage attendue en Phase 5.
 
-- [ ] `zemosaic_align_stack.py`  
-- [ ] `zemosaic_align_stack_gpu.py`  
-- [ ] `zemosaic_worker.py`  
-- [ ] `zemosaic_time_utils.py` (if used in Phase 3/5 orchestration)
-- [ ] `parallel_utils.py` (for GPU orchestration / CPU/GPU auto-tune)
-- [ ] `zemosaic_config.py` (global GPU toggles, phase-specific flags)
-- [ ] Any GPU helper modules referenced by `zemosaic_align_stack_gpu.py`
-- [ ] Image loading / preview:
-  - `zemosaic_utils.py` (e.g. `load_and_validate_fits`, `debayer_image`, etc.)
-  - Any preview / PNG/PNG-export functions in `zemosaic_worker.py`
+ Corriger la photometric blending de Phase 5 pour supprimer les bandes, tout en conservant :
 
----
+ le comportement actuel CPU/GPU (structure du code, toggles, parallel plan),
 
-## 🔍 Tasks (step-by-step, with checkboxes)
+ la correction de dominante verte (RGB median equalization),
 
-### 1. Map CPU vs GPU pipelines
+ la compatibilité SDS (super-tiles / mega-tiles) existante.
 
-- [ ] Identify all code paths involved when:
-  - CPU stacking is used.
-  - GPU stacking is used.
-- [ ] For each **phase** (especially stacking / mosaic / stretch / RGB normalization), list:
-  - [ ] The CPU function(s) called.
-  - [ ] The GPU function(s) called.
-  - [ ] Any differences in parameters, defaults, numeric order of operations.
+ Ajouter des tests unitaires / d’intégration ciblant les jointures, pour éviter toute régression future.
 
-Goal: have a clear diagram of **which CPU function corresponds to which GPU function**, and where they diverge.
+📂 Fichiers & Fonctions concernées
 
----
+Cœur Phase 5 & pipeline qualité (OK à modifier, mais de façon minimale et localisée) :
 
-### 2. Build a comparison harness (CPU vs GPU)
+zemosaic_worker.py
 
-Create a small, self-contained **debug / test utility** (can be under `tests/` or a dedicated module) that:
+_apply_lecropper_pipeline(...)
 
-- [ ] Takes a small set of FITS tiles (real or synthetic).
-- [ ] Runs **the CPU pipeline** on that set.
-- [ ] Runs **the GPU pipeline** on the exact same set, with the same configuration.
-- [ ] Compares outputs:
-  - [ ] Per-channel statistics (min, max, mean, median) for R, G, B.
-  - [ ] Per-channel histograms or percentiles.
-  - [ ] Pixel-wise differences: max abs diff, mean abs diff, maybe a norm per channel.
-- [ ] Emits a clear summary:
-  - e.g. “Max difference per channel (R,G,B) = (…)”,
-  - “Median value per channel (CPU vs GPU)”,
-  - “Any channel significantly off compared to the other two?”
+_apply_final_mosaic_quality_pipeline(...)
 
-You can expose this as:
+_apply_master_tile_crop_mask_to_mosaic(...)
 
-- a small Python function used by tests, and/or
-- a CLI/debug entry point (e.g. `python -m zemosaic.debug.compare_cpu_gpu ...`).
+_apply_phase5_post_stack_pipeline(...)
 
----
+_apply_two_pass_coverage_renorm_if_requested(...)
 
-### 3. Locate the source(s) of divergence
+_apply_final_mosaic_quality_pipeline(...)
 
-Using the comparison harness, drill down phase by phase:
+_mask_sds_low_coverage_pixels(...)
 
-- [ ] Compare **stacked tiles** CPU vs GPU *before* any stretch/normalization.
-- [ ] Compare **RGB equalization / white balance** steps CPU vs GPU.
-- [ ] Compare **final stretched images** CPU vs GPU (what the user actually sees).
-- [ ] Check:
-  - [ ] Are the differences already visible on the stacked data?
-  - [ ] Or do they appear during equalization / stretching / background subtraction?
-  - [ ] Is there a systematic excess in the **G channel** vs R/B on the GPU path?
+_sanitize_sds_megatile_payload(...)
 
-Specifically investigate:
+_auto_crop_global_mosaic_if_requested(...)
 
-- [ ] Any GPU-specific implementation of **RGB normalization / equalization**  
-  (e.g. functions named like `_poststack_rgb_equalization` or similar).
-- [ ] Any GPU-specific **stretch** code  
-  (e.g. `stretch_auto_asifits_like_gpu` vs the CPU `stretch_auto_asifits_like`).
-- [ ] Any difference in the way **weights** or **masks** are applied on CPU vs GPU.
+_emit_coverage_summary_log(...)
 
-If an earlier hypothesis about **BGR vs RGB** is correct:
+Toute fonction strictement nécessaire pour la photometric blending et la propagation des masques/coverage.
 
-- [ ] Confirm it with **hard evidence**:
-  - Show that at some entry point, data is in BGR for GPU but in RGB for CPU.
-  - Show that a channel swap explains the green tint.
-- [ ] Only then, design a **minimal, controlled fix** (see Constraints below).
+Radial weights & égalisation RGB (ne modifier que si absolument nécessaire, et sans casser la correction de dominante verte) :
 
----
+zemosaic_align_stack.py
 
-### 4. Design and implement the fix
+make_radial_weight_map (import via zemosaic_utils)
 
-Once the root cause is identified:
+equalize_rgb_medians_inplace(...)
 
-- [ ] Align the GPU logic with the CPU logic:
-  - Same order of operations,
-  - Same formulas,
-  - Same default parameters.
-- [ ] If the bug is a color space issue (e.g. BGR vs RGB):
-  - [ ] Add a **local, explicit conversion** at the correct boundary (e.g. just before feeding OpenCV, or right after retrieving OpenCV output).
-  - [ ] Do **not** add a global “convert all 3-channel images BGR→RGB” in a shared loader unless absolutely proven necessary and validated against the CPU path.
-- [ ] If the bug is in a GPU-specific stretch or equalization:
-  - [ ] Modify the GPU implementation so it matches the CPU math.
-  - [ ] Add comments explaining the rationale and link to the CPU reference implementation.
+_poststack_rgb_equalization(...)
 
----
+Utilitaires (à toucher seulement si vraiment indispensable) :
 
-### 5. Add regression tests for CPU/GPU parity
+zemosaic_utils.py
 
-Add automated tests (e.g. with `pytest`) that:
+Fonctions liées à reproject_coadd, aux coverage maps et à la gestion WCS.
 
-- [ ] Use a small deterministic test dataset (synthetic or bundled FITS tiles).
-- [ ] Run both CPU and GPU pipelines with the same configuration.
-- [ ] Assert that:
-  - [ ] CPU and GPU outputs have the same **shape** and dtype.
-  - [ ] Per-channel difference (R,G,B) is below a reasonable epsilon (for example, `max_abs_diff < 1e-3` or similar, depending on scaling).
-  - [ ] There is no systematic channel imbalance (e.g. G much higher on GPU than CPU).
-- [ ] Flag clearly that the CPU path is the **reference**.
+🚧 Zones à NE PAS modifier
 
-These tests should fail on the current broken state and pass after the fix.
+Merci de ne pas toucher aux éléments suivants (sauf micro-bug évident et documenté) :
 
----
+ Routage CPU/GPU, détection GPU, ParallelPlan, auto_tune_parallel_plan, detect_parallel_capabilities (parallel_utils.py, zemosaic_worker.py).
 
-## 🚫 Constraints / Non-goals
+ Logique d’orchestration des phases (1 à 5) et SDS vs non-SDS (mécanique globale).
 
-- [ ] **Do not change** the overall user-facing API, CLI options, or GUI behavior (except maybe adding a debug flag / advanced expert option).
-- [ ] **Do not break** existing behavior of:
-  - SDS / mosaic-first pipeline.
-  - Batch size logic, especially the semantics of:
-    - `batch_size = 0`
-    - `batch_size > 1`
-- [ ] **Do not** refactor unrelated parts of the codebase or introduce large architecture changes.
-- [ ] Avoid “magic” global conversions (e.g. blind `BGR→RGB` on any 3-channel array) that could silently change good CPU behavior.
-- [ ] Keep changes as **local and well-documented** as possible.
+ Toggles GUI / propagation des flags GPU (Tk/Qt) :
 
----
+zemosaic_gui.py
 
-## ✅ Acceptance Criteria
+zemosaic_gui_qt.py
 
-- [ ] On the same dataset (same parameters), CPU and GPU images are **visually indistinguishable**:
-  - same framing,
-  - same background,
-  - same color balance (no greenish cast from GPU).
-- [ ] The comparison harness reports **small numeric differences only**, consistent with float math / GPU vs CPU differences.
-- [ ] New tests for CPU/GPU parity are in place and **pass**.
-- [ ] Existing tests still pass.
-- [ ] The GPU path remains clearly faster than CPU for realistic workloads.
+ Clustering / grouping / autosplit (Phase 2 / 3), hard-merge, etc.
 
-Please summarize in the PR / final note:
+ Correction de dominante verte / poststack_equalize_rgb : ne pas revenir en arrière.
 
-- What the precise root cause was.
-- What code was changed.
-- How the new tests guarantee CPU/GPU parity going forward.
+🧠 Hypothèses techniques (pour t’orienter)
+
+Tu peux les vérifier / infirmer, mais ne pas les appliquer aveuglément :
+
+Radial weight map non appliquée / écrasée
+
+make_radial_weight_map peut ne plus être appelé ou utilisé correctement.
+
+Si la map radiale n’est pas appliquée (ou est revenue à un comportement neutre), les tuiles gardent un bord “dur” → bandes visibles.
+
+Coverage map perdue ou uniformisée
+
+Dans _sanitize_sds_megatile_payload, _mask_sds_low_coverage_pixels, _apply_final_mosaic_quality_pipeline, certains fallbacks mettent coverage = ones(...).
+
+Si un chemin de code tombe trop souvent sur ce fallback, la coaddition devient quasi uniforme → contours de tuiles visibles.
+
+Pipeline lecropper non (ou plus) appliqué au global
+
+_apply_lecropper_pipeline & _apply_final_mosaic_quality_pipeline doivent être appelés après la première coadd, avant toute renorm ou cropping final.
+
+Si lecropper ne masque plus les bords/artefacts, les transitions deviennent visibles.
+
+Two-pass renorm désactivée / cassée silencieusement
+
+_apply_two_pass_coverage_renorm_if_requested peut retourner None en cas de problème et laisser le résultat brut.
+
+Si la seconde passe échoue systématiquement (par exemple à cause d’un param GPU/CPU ou parallel_plan), la mosaïque garde un gradient de jointure.
+
+🔬 Plan de travail suggéré
+1. Analyse / diff
+
+ Identifier le dernier commit où les bandes étaient absentes (commit 38c876a ).
+
+ Comparer Phase 5 (fonctions listées plus haut) entre ce commit et HEAD pour isoler :
+
+ changements sur coverage / weights,
+
+ modifications sur lecropper / radial weights,
+
+ ajustements sur RGB equalization.
+
+Documenter dans un commentaire de MR ou dans followup.md :
+
+quelles fonctions ont changé,
+
+quelle partie du pipeline est susceptible d’avoir réintroduit les bandes.
+
+2. Reconstruction du pipeline attendu (concept)
+
+L’objectif est :
+
+Coadd global → première passe (reproject + somme pondérée par coverage/weights).
+
+Pipeline qualité :
+
+ application éventuelle de lecropper sur la mosaïque globale,
+
+ application éventuelle du crop % master tile (quand activé),
+
+ masques/alpha associés correctement injectés dans coverage.
+
+Two-pass renorm (si activée) :
+
+ utiliser la coverage map et/ou les tiles sources pour lisser les variations de fond,
+
+ respecter les limites de gain DEFAULT_INTERTILE_GAIN_LIMITS et offset.
+
+Autocrop global (si activé), en respectant les offsets dans le WCS global.
+
+Merci de :
+
+ Vérifier que cet ordre est bien respecté,
+
+ Corriger les cas où coverage / alpha / masques ne sont pas propagés d’une étape à l’autre.
+
+3. Implémentation
+
+ Corriger les fonctions identifiées pour :
+
+ s’assurer que chaque tile/mosaïque passe par le pipeline lecropper quand activé dans la config,
+
+ garantir que la coverage map :
+
+ est nettoyée des NaN,
+
+ correspond bien à la géométrie de l’image,
+
+ est utilisée comme poids dans la coadd (et non remplacée par ones(...) sauf cas exceptionnel très clairement loggé).
+
+ s’assurer que les masques/bords cropés → coverage = 0, image = NaN (ou 0), de façon cohérente sur CPU et GPU.
+
+ Si nécessaire, renforcer ou réintroduire le radial feathering sur les tiles :
+
+attention : ne pas casser le comportement antérieur en cas de désactivation du feathering dans la config.
+
+4. Tests automatiques
+
+Merci d’ajouter des tests ciblés (dans tests/ — tu peux créer un nouveau fichier si besoin, ex. test_phase5_blending.py) :
+
+ Test de jointure simple CPU
+
+Créer deux “tiles” 2D (ou 3D RGB) de taille identique, avec une zone d’overlap :
+
+tile A = niveau 1.0, tile B = niveau 2.0.
+
+Simuler une coadd + pipeline Phase 5 (en appelant les fonctions internes de façon contrôlée).
+
+Vérifier que dans la zone d’overlap, la transition est lisse (pas de step net).
+
+ Test de jointure avec coverage
+
+Couvrir une zone où seule la tile B est présente → vérifier absence de “bande” en bordure.
+
+ Test lecropper activé
+
+Forcer l’application du pipeline lecropper sur une mosaïque avec un bord clairement marqué et vérifier que ces bords sont masqués (coverage à 0, image à NaN/0).
+
+ Optionnel : test GPU
+
+Si possible, simuler un plan avec use_gpu=True mais en gardant le même code Python, pour vérifier que CPU/GPU retournent des résultats identiques (mêmes masques/coverage).
+
+Les tests ne doivent pas dépendre d’Astropy/Photutils s’il n’y en a pas besoin : privilégier du NumPy pur.
+
+5. Logging / observabilité
+
+ Ajouter des logs INFO_DETAIL / DEBUG centrés sur la coverage/weights en Phase 5 :
+
+fraction de pixels couverts,
+
+bbox coverage,
+
+nombre de pixels masqués par lecropper,
+
+application ou non de la seconde passe.
+
+Veiller à ne pas inonder le log par défaut (niveau INFO). Utiliser de préférence :
+
+lvl="INFO_DETAIL" ou lvl="DEBUG" pour les infos verbeuses.
+
+✅ Critères d’acceptation
+
+La mission est réussie si :
+
+ Les mosaïques CPU et GPU issues du même dataset ne présentent plus de bandes visibles aux jointures de tiles (inspection visuelle + éventuellement différence numérique).
+
+ En désactivant lecropper / radial weights dans la config, le comportement reste cohérent (pas de crash, bandes potentiellement visibles, mais contrôlé).
+
+ La correction de dominante verte est toujours effective (aucun retour à une image verdie).
+
+ Les tests ajoutés passent localement (pytest) et sont stables.
+
+ Aucun changement n’a été apporté au routage CPU/GPU, au clustering ou aux GUI au-delà de ce qui est explicitement demandé.

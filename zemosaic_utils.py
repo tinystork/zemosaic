@@ -4284,6 +4284,25 @@ def _reproject_and_coadd_wrapper_impl(
             normalized.extend([1.0] * (n_expected - len(normalized)))
         return normalized
 
+    def _output_is_valid(mosaic, coverage) -> bool:
+        """Basic sanity check to avoid returning empty/NaN GPU results."""
+
+        try:
+            if mosaic is None or coverage is None:
+                return False
+            mosaic_arr = np.asarray(mosaic)
+            coverage_arr = np.asarray(coverage)
+            if mosaic_arr.size == 0 or coverage_arr.size == 0:
+                return False
+            if not np.isfinite(mosaic_arr).any():
+                return False
+            if not np.isfinite(coverage_arr).any():
+                return False
+            max_cov = float(np.nanmax(np.abs(coverage_arr)))
+            return max_cov > 1e-6
+        except Exception:
+            return False
+
     normalized_weights = _normalize_tile_weights(tile_weights, len(data_list))
     match_background_flag = bool(kwargs.get("match_background", kwargs.get("match_bg", False)))
     cpu_accepts_match_bg = False
@@ -4315,7 +4334,20 @@ def _reproject_and_coadd_wrapper_impl(
                 raise RuntimeError("gpu_unavailable")
         else:
             try:
-                return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **gpu_kwargs)
+                mosaic_gpu, coverage_gpu = gpu_reproject_and_coadd_impl(
+                    data_list, wcs_list, shape_out, **gpu_kwargs
+                )
+                if _output_is_valid(mosaic_gpu, coverage_gpu):
+                    return mosaic_gpu, coverage_gpu
+                _log_gpu_event(
+                    "gpu_fallback_invalid_output",
+                    "WARN",
+                    progress_callback,
+                    helper="gpu_reproject",
+                    reason="invalid_output",
+                )
+                if not allow_cpu_fallback:
+                    raise RuntimeError("gpu_invalid_output")
             except Exception as e:  # pragma: no cover - GPU failures
                 _log_gpu_event(
                     "gpu_fallback_runtime_error",
