@@ -1,105 +1,124 @@
-# Mission : Rollback sélectif du commit 08bebf5 (cluster refactor)
-# Objectif : restaurer la géométrie/stacking V4.2.0 sans perdre les commits ultérieurs
+✅ agent.md (prêt pour Codex High / Max)
 
-## Contexte
+Mission : Corriger la régression d’alignement introduite dans la branche V4WIP
 
-Le commit `08bebf5` a introduit :
-- une refonte partielle de la logique de clustering / align_stack,
-- des modifications dans la géométrie interne des master tiles,
-- des altérations WCS,
-- et plusieurs désactivations temporaires non souhaitées (streaming, GPU, crop).
+🎯 Objectif
 
-Conséquences visibles (confirmées par l’analyse comparative V4.2.0 vs V4WIP) :
-- WCS divergents (`WCS.all_world2pix failed to converge`),
-- disparition de preview.png et coverage_xxx.dat,
-- mosaïque patchwork (master tiles mal positionnées),
-- altération Phase 5 (reproject & coadd),
-- pipeline align_stack incompatible avec V4.2.0.
+Corriger la déformation géométrique observée dans la branche V4WIP lors de l’empilement classique.
+La cause est en amont de la voie GPU : elle provient de la phase d’alignement CPU, plus précisément de la fonction align_images_in_group dans le fichier zemosaic_align_stack.py.
 
-Les tests montrent que la normalisation RGB intra-stack **n’est pas en cause** et ne doit pas être modifiée.
+Le GPU empile simplement les images alignées : ne rien modifier dans la voie GPU.
 
-## Mission
+📌 Contexte + Hypothèse principale
 
-1. **Identifier précisément les modifications introduites par le commit 08bebf5** dans :
-   - `zemosaic_align_stack.py`
-   - `zemosaic_align_stack_gpu.py`
-   - éventuellement `zemosaic_utils` (WCS, pivot, padding)
-   - et tout autre fichier touché *uniquement* par ce commit.
+Dans V4WIP, les images présentent une déformation ou un étirement qui n’existait pas en V4.2.5.
 
-2. **Supprimer ou réécrire ces modifications**, afin de :
-   - restaurer entièrement la logique de stacking/alignement V4.2.0,
-   - restaurer la géométrie des master tiles,
-   - restaurer les WCS internes corrects,
-   - restaurer la compatibilité avec `reproject`.
+La pipeline d’alignement CPU fonctionne en deux étapes :
 
-3. **Conserver intégralement** :
-   - les commits ultérieurs (GPU path, resume, correctifs d’erreurs),
-   - les améliorations de performances,
-   - les ajouts utiles.
-   → Le rollback doit donc être **sélectif**, pas un revert global.
+pré-alignement par FFT / corrélation de phase
 
-4. **Retirer toutes les “décisions temporaires”** introduites par la tentative de réparation :
+alignement fin via astroalign.register(source, target) (transformation affine)
 
-### A. Streaming / Winsor
-- Retirer les forçages :
-  - `stack_disable_streaming=True`
-  - `winsor_disable_streaming=True`
-- Restaurer les valeurs V4.2.0 :
-  - streaming activé si la configuration utilisateur le permet.
+La déformation est générée dans cette étape CPU, jamais dans la voie GPU.
 
-### B. GPU désactivé par défaut
-- Restaurer :
-  - `use_gpu_global=True`
-  - `use_gpu_phase5=True`
-- Retirer les forçages `use_gpu_phase5_flag=False`.
+On suspecte :
 
-### C. Crops désactivés par défaut
-- Restaurer :
-  - `apply_master_tile_crop=True`
-  - `apply_crop_for_assembly=True`
-  - `global_wcs_autocrop_enabled=True`
+soit une modification du pré-alignement FFT (mauvais décalage appliqué en amont)
 
-### D. Assemblage Phase 5 forcé en “no-autocrop”
-- Restaurer le comportamento V4.2.0 :
-  - master tile crop autorisé,
-  - autocrop global actif,
-  - reprojection GPU autorisée.
+soit une déviation des données d'entrée envoyées à astroalign
 
-5. **Vérifier** qu'après rollback :
-   - preview.png revient,
-   - coverage_xxx.dat revient,
-   - plus aucun warning WCS,
-   - la mosaïque final retrouve la qualité V4.2.0,
-   - les dimensions / offsets / orientations des master tiles correspondent à V4.2.0,
-   - Phase 5 CPU/GPU produit la même géométrie qu’en V4.2.0.
+soit une erreur dans l’usage ou l’interprétation de la transformation retournée par astroalign
 
-## Contraintes strictes
+Mais pas un bug GPU.
 
-- Ne pas toucher aux fonctions SDS.
-- Ne pas toucher à `poststack_equalize_rgb` ni à la normalisation intra-stack.
-- Ne pas supprimer les commits ajoutant des fonctionnalités utiles.
-- Le rollback doit être **focalisé** sur les changements géométriques/WCS/clusters introduits par 08bebf5.
-- Les paths GPU doivent rester fonctionnels.
-- La compatibilité Qt/Tk doit être maintenue.
+📁 Fichiers à modifier (et uniquement ceux-là)
 
-## Fichiers critiques à traiter
-- `zemosaic_align_stack.py` (CPU)
-- `zemosaic_align_stack_gpu.py` (GPU)
-- `zemosaic_utils` (WCS, pivot, pad)
-- éventuellement :
-  - `parallel_utils`
-  - `zemosaic_worker` (Phase 3 → Phase 5 transitions)
+zemosaic_align_stack.py
+👉 fonction : align_images_in_group
 
-## Livrables attendus
-1. Un patch annulant proprement les modifications 08bebf5 et rétablissant la version fonctionnelle V4.2.0.
-2. Un rapport clair dans `followup.md` :
-   - quelles parties ont été retirées ou restaurées,
-   - pourquoi elles causaient la régression,
-   - comment le pipeline retrouve sa cohérence.
-3. Une vérification concrète :
-   - preview.png OK
-   - coverage.dat OK
-   - aucune erreur WCS
-   - mosaïque visuellement identique à V4.2.0.
+🚫 Ne pas modifier :
 
-Merci d’être chirurgical et de préserver toute la structure extérieure.
+zemosaic_align_stack_gpu.py
+
+aucune fonction GPU, aucun kernel, aucune logique de coadd.
+
+💡 Tâches à effectuer
+1. Isoler et analyser l’étape fautive
+
+Instrumenter align_images_in_group pour comparer :
+
+le résultat FFT (dx, dy, conf)
+
+les entrées source et target envoyées à astroalign
+
+la transformation affine retournée par astroalign.register()
+
+2. Comparer contre V4.2.5
+
+Pour un même jeu d’images, logguer :
+
+les images “pré-alignées FFT”
+
+la transformation affine retournée
+
+l’image alignée finale
+
+3. Créer un mode “FFT-only” (temporaire, activable par flag interne)
+
+Permettra de tester :
+
+skip_astroalign = True
+
+
+Si la déformation disparaît → la cause est bien dans la seconde étape.
+
+⚠️ Ce flag doit être temporaire et non exposé à l’utilisateur.
+
+4. Corriger la cause
+
+Selon ce que les logs révéleront :
+
+mauvais couple source/target ?
+
+décalage FFT appliqué deux fois ?
+
+cropping / normalisation incorrecte ?
+
+mauvaise orientation / dtype incompatible ?
+
+application erronée de la matrice de transformation ?
+
+L’objectif est de restaurer le comportement exact de V4.2.5.
+
+5. Robustifier l'appel à astroalign
+
+Vérifier input shapes (H, W) vs (H, W, 3)
+
+S'assurer que la normalisation en float32 est identique à V4.2.5
+
+Forcer éventuellement un “sanity check” sur la matrice retournée
+
+6. Ne pas toucher à la partie GPU
+
+Le GPU reçoit des images déjà warpées.
+Toute déformation provient avant l’empilement.
+
+✔️ Validation
+
+Le correctif est réussi si :
+
+un jeu d’images problématique en V4WIP reprend la forme correcte obtenue en V4.2.5
+
+aucune transformation affine aberrante n’apparaît dans les logs
+
+le pipeline CPU reste compatible avec la voie GPU existante
+
+aucun changement ne touche SDS ou GPU
+
+➤ Livrables attendus
+
+Patchs sur zemosaic_align_stack.py
+
+Petits logs de debug pour comparaison V4.2.5 / V4WIP
+
+Aucun changement GPU

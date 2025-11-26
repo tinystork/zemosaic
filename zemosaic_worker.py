@@ -10490,6 +10490,8 @@ def create_master_tile(
         "parsed_winsor_limits": parsed_winsor_limits,
         "stack_final_combine": stack_final_combine,
         "apply_radial_weight": apply_radial_weight,
+        "radial_feather_fraction": radial_feather_fraction,
+        "radial_shape_power": radial_shape_power,
         "poststack_equalize_rgb": poststack_equalize_rgb,
     }
 
