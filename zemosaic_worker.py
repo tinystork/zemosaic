@@ -1026,6 +1026,8 @@ def _apply_phase5_post_stack_pipeline(
     telemetry_ctrl: ResourceTelemetryController | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     """Run the reusable Phase 5 post-stack operations."""
+    # Preserve the 38c876a post-stack ordering (crop → two-pass) to keep CPU/GPU parity.
+    # Any edits here must be validated against the golden CPU/GPU runs.
 
     if enable_lecropper_pipeline:
         (
@@ -12310,6 +12312,10 @@ def assemble_final_mosaic_reproject_coadd(
                 len(effective_tiles),
             )
     else:
+        if intertile_photometric_match and len(effective_tiles) >= 2:
+            logger.info(
+                "apply_photometric: no affine corrections available (skipping normalization)"
+            )
         nontrivial_affine = False
         pending_affine_list = None
 
@@ -13211,40 +13217,12 @@ def compute_per_tile_gains_from_coverage(
     logger=None,
     use_gpu: bool = False,
     tiles_coverage: list[np.ndarray | None] | None = None,
-    parallel_plan: ParallelPlan | dict | None = None,
-    cpu_workers: int | None = None,
-    row_chunk_size: int | None = None,
-    chunk_bytes_limit: int | None = None,
-    progress_emitter=None,
 ) -> list[float]:
     """Compute multiplicative gains for each tile using the blurred coverage map."""
-    tiles_total = len(tiles) if tiles else 0
-
-    def _emit_progress(
-        tiles_done: int,
-        *,
-        chunk_index: int | None = None,
-        chunk_total: int | None = None,
-        stage: str | None = None,
-        force: bool = False,
-    ) -> None:
-        if progress_emitter is None:
-            return
-        try:
-            progress_emitter(
-                tiles_done,
-                chunk_index=chunk_index,
-                chunk_total=chunk_total,
-                stage=stage,
-                force=force,
-            )
-        except Exception:
-            pass
-
     if logger:
         logger.debug(
             "[TwoPass] compute_per_tile_gains_from_coverage start: tiles=%d, coverage_shape=%s, sigma=%s, clip=%s",
-            tiles_total,
+            len(tiles) if tiles else 0,
             getattr(coverage_p1, "shape", None),
             sigma_px,
             gain_clip,
@@ -13266,70 +13244,58 @@ def compute_per_tile_gains_from_coverage(
     gain_min, gain_max = map(float, gain_clip)
     if gain_min > gain_max:
         gain_min, gain_max = gain_max, gain_min
-    height, width = coverage.shape
-    plan_rows_hint = None
-    plan_chunk_hint = None
-    plan_workers_hint = None
-    plan_ref = parallel_plan
-    if plan_ref is not None:
-        def _plan_value(key: str):
+    if sigma_px > 0:
+        blurred = None
+        blur_source = "identity"
+        if use_gpu and CUPY_AVAILABLE:
             try:
-                return getattr(plan_ref, key)
-            except Exception:
-                if isinstance(plan_ref, dict):
-                    return plan_ref.get(key)
-            return None
+                import cupy as cp  # type: ignore
+                from cupyx.scipy.ndimage import gaussian_filter as gpu_gaussian_filter  # type: ignore
 
-        plan_rows_hint = _plan_value("gpu_rows_per_chunk" if use_gpu else "rows_per_chunk")
-        plan_chunk_hint = _plan_value("gpu_max_chunk_bytes" if use_gpu else "max_chunk_bytes")
-        plan_workers_hint = _plan_value("cpu_workers")
-    if cpu_workers is None and plan_workers_hint:
-        try:
-            cpu_workers = int(plan_workers_hint)
-        except Exception:
-            cpu_workers = None
-    if chunk_bytes_limit is None and plan_chunk_hint:
-        try:
-            chunk_bytes_limit = int(plan_chunk_hint)
-        except Exception:
-            chunk_bytes_limit = None
-    if chunk_bytes_limit is not None and chunk_bytes_limit <= 0:
-        chunk_bytes_limit = None
-    if row_chunk_size is None and plan_rows_hint:
-        try:
-            row_chunk_size = int(plan_rows_hint)
-        except Exception:
-            row_chunk_size = None
-    if row_chunk_size is None or row_chunk_size <= 0:
-        row_chunk_size = _rows_from_chunk_bytes(width, coverage.itemsize, chunk_bytes_limit, height)
-    if row_chunk_size is None or row_chunk_size <= 0:
-        row_chunk_size = min(height, 512 if use_gpu else 1024)
-    row_chunk_size = int(max(1, min(height, row_chunk_size)))
+                cov_gpu = cp.asarray(coverage, dtype=cp.float32)
+                blurred_gpu = gpu_gaussian_filter(cov_gpu, float(sigma_px))
+                blurred = cp.asnumpy(blurred_gpu)
+                blur_source = "cupy"
+            except Exception as exc_gpu:
+                if logger:
+                    logger.debug(
+                        "[TwoPass] cupy gaussian_filter failed (%s), falling back to CPU",
+                        exc_gpu,
+                    )
+        if blurred is None:
+            try:
+                from scipy.ndimage import gaussian_filter  # type: ignore
 
-    def _blur_progress(chunk_idx: int, chunk_total: int, stage: str) -> None:
-        _emit_progress(0, chunk_index=chunk_idx, chunk_total=chunk_total, stage=stage, force=False)
+                blurred = gaussian_filter(coverage, sigma=float(sigma_px))
+                blur_source = "scipy"
+            except Exception as exc:
+                if logger:
+                    logger.debug(
+                        "[TwoPass] scipy gaussian_filter failed (%s), trying cv2 fallback",
+                        exc,
+                    )
+                try:
+                    import cv2  # type: ignore
 
-    cov_blur, blur_source = _chunked_gaussian_blur(
-        coverage,
-        sigma_px,
-        use_gpu=use_gpu,
-        rows_per_chunk=row_chunk_size,
-        chunk_bytes=chunk_bytes_limit,
-        progress_hook=_blur_progress,
-        logger=logger,
-    )
-    if use_gpu:
-        disabled, _, _ = phase5_gpu_runtime_state()
-        if disabled:
-            use_gpu = False
-    if logger:
-        logger.debug(
-            "[TwoPass] Coverage blur applied with sigma=%d using %s (rows_per_chunk=%d, chunk_bytes=%s)",
-            sigma_px,
-            blur_source,
-            row_chunk_size,
-            chunk_bytes_limit if chunk_bytes_limit is not None else "-",
+                    k = max(3, int(2 * round(float(sigma_px) * 1.5) + 1))
+                    blurred = cv2.GaussianBlur(coverage, (k, k), sigmaX=float(sigma_px))
+                    blur_source = "cv2"
+                except Exception as exc_cv:
+                    if logger:
+                        logger.warning("[TwoPass] Coverage blur fallback failed: %s", exc_cv)
+        cov_blur = (
+            np.asarray(blurred, dtype=np.float32)
+            if blurred is not None
+            else coverage.copy()
         )
+        if logger:
+            logger.debug(
+                "[TwoPass] Coverage blur applied with sigma=%d using %s", sigma_px, blur_source
+            )
+    else:
+        cov_blur = coverage.copy()
+        if logger:
+            logger.debug("[TwoPass] Coverage blur skipped (sigma=0)")
     eps = np.finfo(np.float32).eps
     scale_map = cov_blur / np.maximum(coverage, eps)
     scale_map = np.clip(scale_map, 0.5, 2.0)
@@ -13342,77 +13308,64 @@ def compute_per_tile_gains_from_coverage(
         )
     if not tiles or not tiles_wcs or len(tiles) != len(tiles_wcs):
         raise ValueError("Tile data and WCS lists must be aligned and non-empty")
-    if tiles_total <= 0:
-        return []
-
-    if cpu_workers is None or cpu_workers <= 0:
-        try:
-            cpu_workers = multiprocessing.cpu_count() or os.cpu_count()
-        except Exception:
-            cpu_workers = os.cpu_count()
-    cpu_workers = int(max(1, cpu_workers or 1))
-    max_workers = max(1, min(cpu_workers, tiles_total))
-    if chunk_bytes_limit and coverage.size > 0:
-        est_tile_bytes = max(coverage.nbytes, coverage.size * np.dtype(np.float32).itemsize)
-        est_tile_bytes = max(est_tile_bytes, coverage.size * np.dtype(np.float64).itemsize)
-        est_tile_bytes *= 2
-        max_by_mem = max(1, int(chunk_bytes_limit // max(1, est_tile_bytes)))
-        max_workers = max(1, min(max_workers, max_by_mem))
-    executor_cls = ThreadPoolExecutor if use_gpu else ProcessPoolExecutor
-    progress_interval = max(1, tiles_total // max(1, max_workers * 2))
-
-    def _execute(executor_type):
-        gains_result: list[float] = [1.0] * tiles_total
-        done = 0
-        _emit_progress(0, chunk_index=0, chunk_total=tiles_total, stage="gains", force=True)
-        future_to_idx: dict[Any, int] = {}
-        with executor_type(max_workers=max_workers) as pool:
-            for idx, (tile, tile_wcs) in enumerate(zip(tiles, tiles_wcs)):
-                coverage_src = None
-                if tiles_coverage and idx < len(tiles_coverage or []):
-                    coverage_src = tiles_coverage[idx]
-                fut = pool.submit(
-                    _compute_tile_gain_task,
-                    (
-                        idx,
-                        tile,
-                        tile_wcs,
-                        final_wcs,
-                        coverage.shape,
-                        coverage,
-                        scale_map,
-                        gain_min,
-                        gain_max,
-                        coverage_src,
-                    ),
-                )
-                future_to_idx[fut] = idx
-            for fut in as_completed(future_to_idx):
-                idx_value = future_to_idx.get(fut, None)
-                gain_value: float = 1.0
-                try:
-                    result_idx, gain_value = fut.result()
-                    idx_value = result_idx
-                except Exception as exc_fut:
-                    if logger and idx_value is not None:
-                        logger.warning("[TwoPass] Gain task failed for tile %d: %s", idx_value, exc_fut)
-                if idx_value is not None:
-                    gains_result[idx_value] = float(gain_value)
-                done += 1
-                if done % progress_interval == 0 or done == tiles_total:
-                    _emit_progress(done, chunk_index=done, chunk_total=tiles_total, stage="gains", force=False)
-        _emit_progress(tiles_total, chunk_index=tiles_total, chunk_total=tiles_total, stage="gains", force=True)
-        return gains_result
-
-    try:
-        gains = _execute(executor_cls)
-    except Exception as exc_pool:
-        if not use_gpu and executor_cls is ProcessPoolExecutor:
-            if logger:
-                logger.warning("[TwoPass] Process pool failed, retrying gain computation with threads: %s", exc_pool)
-            gains = _execute(ThreadPoolExecutor)
+    gains: list[float] = []
+    for idx, (tile, tile_wcs) in enumerate(zip(tiles, tiles_wcs)):
+        if tile is None or tile_wcs is None:
+            gains.append(1.0)
+            continue
+        shape = np.asarray(tile).shape
+        if shape[0] <= 0 or shape[1] <= 0:
+            gains.append(1.0)
+            continue
+        coverage_src = None
+        if tiles_coverage and idx < len(tiles_coverage or []):
+            coverage_src = tiles_coverage[idx]
+        if coverage_src is None:
+            mask = np.ones(shape[:2], dtype=np.float32)
         else:
-            raise
+            cov_arr = np.asarray(coverage_src, dtype=np.float32, copy=False)
+            if cov_arr.ndim > 2:
+                cov_arr = np.squeeze(cov_arr)
+            try:
+                mask = np.nan_to_num(cov_arr, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+            except Exception:
+                mask = np.ones(shape[:2], dtype=np.float32)
+            if mask.shape != tuple(shape[:2]):
+                try:
+                    mask = mask.reshape(shape[:2])
+                except Exception:
+                    mask = np.ones(shape[:2], dtype=np.float32)
+        try:
+            reproj_mask, _ = reproject_interp(
+                (mask, tile_wcs),
+                final_wcs,
+                shape_out=coverage.shape,
+            )
+        except Exception as exc:
+            if logger:
+                logger.warning("[TwoPass] Mask reprojection failed for tile %d: %s", idx, exc)
+            gains.append(1.0)
+            continue
+        valid = (reproj_mask > 1e-3) & (coverage > 0.0)
+        if not np.any(valid):
+            gains.append(1.0)
+            if logger and idx < 10:
+                logger.debug(
+                    "[TwoPass] Tile %d has no valid overlap (mask>0.1 count=%d)",
+                    idx,
+                    int(np.count_nonzero(reproj_mask > 0.1)),
+                )
+            continue
+        med_gain = float(np.median(scale_map[valid]))
+        gains.append(float(np.clip(med_gain, gain_min, gain_max)))
+        if logger and idx < 10:
+            logger.debug(
+                "[TwoPass] Tile %d gain=%.4f (raw=%.4f, valid_pix=%d)",
+                idx,
+                gains[-1],
+                med_gain,
+                int(np.count_nonzero(valid)),
+            )
     return gains
 
 
@@ -13429,7 +13382,6 @@ def run_second_pass_coverage_renorm(
     use_gpu_two_pass: bool | None = None,
     tiles_coverage: list[np.ndarray | None] | None = None,
     parallel_plan: ParallelPlan | None = None,
-    telemetry_ctrl: ResourceTelemetryController | None = None,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Apply coverage-based gains to tiles and reproject them for a second pass."""
     if logger:
@@ -13466,123 +13418,40 @@ def run_second_pass_coverage_renorm(
     plan_chunk_gpu_hint: int | None = None
     use_memmap_flag: bool | None = None
     if parallel_plan is not None:
-        def _plan_value(key: str):
-            try:
-                return getattr(parallel_plan, key)
-            except Exception:
-                if isinstance(parallel_plan, dict):
-                    return parallel_plan.get(key)
-            return None
-
         try:
-            cpu_workers_hint = int(_plan_value("cpu_workers") or 0)
+            cpu_workers_hint = int(getattr(parallel_plan, "cpu_workers", 0) or 0)
         except Exception:
             cpu_workers_hint = None
         if cpu_workers_hint is not None and cpu_workers_hint <= 0:
             cpu_workers_hint = None
         try:
-            use_memmap_flag = bool(_plan_value("use_memmap") or False)
+            use_memmap_flag = bool(getattr(parallel_plan, "use_memmap", False))
         except Exception:
             use_memmap_flag = None
-        try:
-            plan_rows_cpu_hint = int(_plan_value("rows_per_chunk") or 0) or None
-        except Exception:
-            plan_rows_cpu_hint = None
-        if plan_rows_cpu_hint is not None and plan_rows_cpu_hint <= 0:
-            plan_rows_cpu_hint = None
-        try:
-            plan_rows_gpu_hint = int(_plan_value("gpu_rows_per_chunk") or 0) or None
-        except Exception:
-            plan_rows_gpu_hint = None
-        if plan_rows_gpu_hint is not None and plan_rows_gpu_hint <= 0:
-            plan_rows_gpu_hint = None
-        try:
-            plan_chunk_cpu_hint = int(_plan_value("max_chunk_bytes") or 0) or None
-        except Exception:
-            plan_chunk_cpu_hint = None
-        if plan_chunk_cpu_hint is not None and plan_chunk_cpu_hint <= 0:
-            plan_chunk_cpu_hint = None
-        try:
-            plan_chunk_gpu_hint = int(_plan_value("gpu_max_chunk_bytes") or 0) or None
-        except Exception:
-            plan_chunk_gpu_hint = None
-        if plan_chunk_gpu_hint is not None and plan_chunk_gpu_hint <= 0:
-            plan_chunk_gpu_hint = None
-
-    cov_shape = np.asarray(coverage_p1).shape if coverage_p1 is not None else tuple()
-    cov_h = int(cov_shape[0]) if len(cov_shape) >= 1 and cov_shape[0] else (int(shape_out[0]) if shape_out else 0)
-    cov_w = int(cov_shape[1]) if len(cov_shape) >= 2 and cov_shape[1] else (int(shape_out[1]) if shape_out else 0)
-    bytes_per_sample = np.dtype(np.float32).itemsize
-    if plan_rows_cpu_hint is None:
-        plan_rows_cpu_hint = _rows_from_chunk_bytes(cov_w, bytes_per_sample, plan_chunk_cpu_hint, cov_h)
-    if plan_rows_gpu_hint is None:
-        plan_rows_gpu_hint = _rows_from_chunk_bytes(cov_w, bytes_per_sample, plan_chunk_gpu_hint, cov_h)
-    if plan_rows_cpu_hint is None and cov_h > 0:
-        plan_rows_cpu_hint = min(cov_h, 1024)
-    if plan_rows_gpu_hint is None and cov_h > 0:
-        plan_rows_gpu_hint = min(cov_h, 512 if use_gpu else cov_h)
-    if plan_rows_cpu_hint is None:
-        plan_rows_cpu_hint = 1024
-    if plan_rows_gpu_hint is None:
-        plan_rows_gpu_hint = 512 if use_gpu else 1024
-    effective_row_chunk = plan_rows_gpu_hint if use_gpu else plan_rows_cpu_hint
-    chunk_bytes_effective = plan_chunk_gpu_hint if use_gpu else plan_chunk_cpu_hint
-    tiles_total = len(tiles) if tiles else 0
-
-    def _emit_two_pass_stats(
-        tiles_done: int,
-        *,
-        chunk_index: int | None = None,
-        chunk_total: int | None = None,
-        force: bool = False,
-        stage: str | None = None,
-    ) -> None:
-        if telemetry_ctrl is None:
-            return
-        try:
-            ctx = {
-                "phase_index": 5,
-                "phase_name": "Phase 5: Two-Pass Coverage Renorm",
-                "tiles_done": int(max(0, tiles_done)),
-                "tiles_total": int(max(0, tiles_total)),
-                "cpu_workers": cpu_workers_hint or 0,
-                "use_gpu": bool(use_gpu),
-                "use_gpu_phase5": bool(use_gpu_two_pass),
-            }
-            if stage:
-                ctx["stage"] = stage
-            disabled, _, _ = phase5_gpu_runtime_state()
-            ctx["gpu_runtime_disabled"] = bool(disabled)
-            if plan_rows_cpu_hint is not None:
-                ctx["rows_per_chunk"] = int(plan_rows_cpu_hint)
-            if plan_rows_gpu_hint is not None:
-                ctx["gpu_rows_per_chunk"] = int(plan_rows_gpu_hint)
-            if plan_chunk_cpu_hint is not None:
-                ctx["max_chunk_bytes"] = int(plan_chunk_cpu_hint)
-            if plan_chunk_gpu_hint is not None:
-                ctx["gpu_max_chunk_bytes"] = int(plan_chunk_gpu_hint)
-            _ = telemetry_ctrl.emit_stats(ctx, force=force)
-        except Exception:
-            pass
-
-    def _gains_progress(
-        tiles_done: int,
-        *,
-        chunk_index: int | None = None,
-        chunk_total: int | None = None,
-        stage: str | None = None,
-        force: bool = False,
-    ) -> None:
-        _emit_two_pass_stats(
-            tiles_done,
-            chunk_index=chunk_index,
-            chunk_total=chunk_total,
-            force=force,
-            stage=stage or "gains",
-        )
-
-    _emit_two_pass_stats(0, chunk_index=0, chunk_total=max(1, tiles_total), force=True, stage="start")
-    effective_row_chunk = int(max(1, effective_row_chunk or 1))
+        row_cpu = getattr(parallel_plan, "rows_per_chunk", None)
+        if row_cpu is not None:
+            try:
+                plan_rows_cpu_hint = max(1, int(row_cpu))
+            except Exception:
+                plan_rows_cpu_hint = None
+        row_gpu = getattr(parallel_plan, "gpu_rows_per_chunk", None)
+        if row_gpu is not None:
+            try:
+                plan_rows_gpu_hint = max(1, int(row_gpu))
+            except Exception:
+                plan_rows_gpu_hint = None
+        chunk_cpu = getattr(parallel_plan, "max_chunk_bytes", None)
+        if chunk_cpu is not None:
+            try:
+                plan_chunk_cpu_hint = max(1, int(chunk_cpu))
+            except Exception:
+                plan_chunk_cpu_hint = None
+        chunk_gpu = getattr(parallel_plan, "gpu_max_chunk_bytes", None)
+        if chunk_gpu is not None:
+            try:
+                plan_chunk_gpu_hint = max(1, int(chunk_gpu))
+            except Exception:
+                plan_chunk_gpu_hint = None
     try:
         gains = compute_per_tile_gains_from_coverage(
             tiles,
@@ -13594,20 +13463,11 @@ def run_second_pass_coverage_renorm(
             logger=logger,
             use_gpu=use_gpu,
             tiles_coverage=tiles_coverage,
-            parallel_plan=parallel_plan,
-            cpu_workers=cpu_workers_hint,
-            row_chunk_size=effective_row_chunk,
-            chunk_bytes_limit=chunk_bytes_effective,
-            progress_emitter=_gains_progress,
         )
     except Exception as exc:
         if logger:
             logger.warning("[TwoPass] Gain computation failed: %s", exc, exc_info=True)
         return None
-    if use_gpu:
-        disabled, _, _ = phase5_gpu_runtime_state()
-        if disabled:
-            use_gpu = False
     if logger:
         finite_gains = [g for g in gains if np.isfinite(g)]
         logger.debug(
@@ -13617,13 +13477,6 @@ def run_second_pass_coverage_renorm(
             float(np.min(finite_gains)) if finite_gains else float("nan"),
             float(np.max(finite_gains)) if finite_gains else float("nan"),
         )
-    _emit_two_pass_stats(
-        tiles_total,
-        chunk_index=tiles_total,
-        chunk_total=max(1, tiles_total),
-        force=False,
-        stage="gains_done",
-    )
     corrected_tiles: list[np.ndarray] = []
     for arr, gain in zip(tiles, gains):
         tile_arr = np.asarray(arr, dtype=np.float32)
@@ -13665,9 +13518,13 @@ def run_second_pass_coverage_renorm(
         if cpu_workers_hint:
             reproj_kwargs["process_workers"] = int(cpu_workers_hint)
 
-    row_hint = plan_rows_gpu_hint if use_gpu else plan_rows_cpu_hint
-    chunk_hint = chunk_bytes_effective
-    if chunk_hint is None and use_gpu and plan_chunk_cpu_hint:
+    row_hint = None
+    chunk_hint = None
+    if use_gpu:
+        row_hint = plan_rows_gpu_hint or plan_rows_cpu_hint
+        chunk_hint = plan_chunk_gpu_hint or plan_chunk_cpu_hint
+    else:
+        row_hint = plan_rows_cpu_hint
         chunk_hint = plan_chunk_cpu_hint
     if row_hint:
         reproj_kwargs["rows_per_chunk"] = int(max(1, row_hint))
@@ -13689,71 +13546,37 @@ def run_second_pass_coverage_renorm(
             pass
 
     n_channels = corrected_tiles[0].shape[-1] if corrected_tiles[0].ndim == 3 else 1
-    mosaic_channels: list[np.ndarray | None] = [None] * n_channels
-    coverage_channels: list[np.ndarray | None] = [None] * n_channels
+    mosaic_channels: list[np.ndarray] = []
+    coverage_result: np.ndarray | None = None
     shape_out_hw = tuple(map(int, shape_out))
-
-    def _process_channel(ch_idx: int, use_gpu_flag: bool) -> tuple[int, np.ndarray, np.ndarray]:
+    for ch in range(n_channels):
         if logger:
             logger.debug(
-                "[TwoPass] Reproject channel %d/%d with %d tiles (shape_out=%s, gpu=%s)",
-                ch_idx + 1,
+                "[TwoPass] Reproject channel %d/%d with %d tiles (shape_out=%s)",
+                ch + 1,
                 n_channels,
                 len(corrected_tiles),
                 shape_out_hw,
-                use_gpu_flag,
             )
-        data_list = [tile[..., ch_idx] if tile.ndim == 3 else tile[..., 0] for tile in corrected_tiles]
+        data_list = [tile[..., ch] if tile.ndim == 3 else tile[..., 0] for tile in corrected_tiles]
+        def _invoke_reproj(use_gpu_flag: bool, local_kwargs: dict[str, Any]):
+            return zemosaic_utils.reproject_and_coadd_wrapper(
+                data_list=data_list,
+                wcs_list=tiles_wcs,
+                shape_out=shape_out_hw,
+                use_gpu=use_gpu_flag,
+                cpu_func=reproject_and_coadd,
+                **local_kwargs,
+            )
 
-        def _invoke_reproj(use_gpu_local: bool, local_kwargs: dict[str, Any]):
-            nonlocal use_gpu
-            invoke_kwargs = dict(local_kwargs)
-            cpu_func_safe = reproject_and_coadd if callable(reproject_and_coadd) else None
-            reproj_func_safe = reproject_interp if callable(reproject_interp) else None
-            if reproj_func_safe is not None:
-                invoke_kwargs["reproject_function"] = reproj_func_safe
-            else:
-                invoke_kwargs.pop("reproject_function", None)
-            try:
-                return zemosaic_utils.reproject_and_coadd_wrapper(
-                    data_list=data_list,
-                    wcs_list=tiles_wcs,
-                    shape_out=shape_out_hw,
-                    use_gpu=use_gpu_local,
-                    cpu_func=cpu_func_safe,
-                    allow_cpu_fallback=not use_gpu_local,
-                    **invoke_kwargs,
-                )
-            except TypeError:
-                raise
-            except Exception as gpu_exc:
-                if not use_gpu_local:
-                    raise
-                mark_phase5_gpu_unavailable("phase5_two_pass_coverage", str(gpu_exc))
-                use_gpu = False
-                if logger:
-                    logger.warning(
-                        "[TwoPass] GPU reprojection failed (%s); disabling GPU for remainder of run.",
-                        gpu_exc,
-                    )
-                return zemosaic_utils.reproject_and_coadd_wrapper(
-                    data_list=data_list,
-                    wcs_list=tiles_wcs,
-                    shape_out=shape_out_hw,
-                    use_gpu=False,
-                    cpu_func=cpu_func_safe,
-                    **invoke_kwargs,
-                )
-
-        local_kwargs = dict(reproj_kwargs)
         try:
-            chan_mosaic, chan_cov = _invoke_reproj(use_gpu_flag, local_kwargs)
+            chan_mosaic, chan_cov = _invoke_reproj(use_gpu, reproj_kwargs)
         except TypeError as type_err:
             if logger:
                 logger.warning("[TwoPass] GPU reprojection TypeError, attempting recovery: %s", type_err)
             chan_mosaic = chan_cov = None
-            if use_gpu_flag:
-                retry_kwargs = dict(local_kwargs)
+            if use_gpu:
+                retry_kwargs = dict(reproj_kwargs)
                 removed = []
                 err_msg = str(type_err)
                 for key in list(retry_kwargs.keys()):
@@ -13772,134 +13595,59 @@ def run_second_pass_coverage_renorm(
                             )
             if chan_mosaic is None or chan_cov is None:
                 try:
-                    chan_mosaic, chan_cov = _invoke_reproj(False, local_kwargs)
+                    chan_mosaic, chan_cov = _invoke_reproj(False, reproj_kwargs)
                 except Exception as cpu_exc:
                     if logger:
                         logger.warning(
                             "[TwoPass] CPU fallback after GPU TypeError failed on channel %d: %s",
-                            ch_idx,
+                            ch,
                             cpu_exc,
                             exc_info=True,
                         )
-                    raise
+                    return None
         except Exception as exc:
-            if use_gpu_flag:
+            if use_gpu:
                 try:
-                    chan_mosaic, chan_cov = _invoke_reproj(False, local_kwargs)
+                    chan_mosaic, chan_cov = _invoke_reproj(False, reproj_kwargs)
                 except Exception as cpu_exc:
                     if logger:
                         logger.warning(
                             "[TwoPass] Reprojection failed on channel %d (GPU+CPU): %s / %s",
-                            ch_idx,
+                            ch,
                             exc,
                             cpu_exc,
                             exc_info=True,
                         )
-                    raise
+                    return None
             else:
                 if logger:
                     logger.warning(
                         "[TwoPass] Reprojection failed on channel %d: %s",
-                        ch_idx,
+                        ch,
                         exc,
                         exc_info=True,
                     )
-                raise
+                return None
         chan_mosaic_np = np.asarray(chan_mosaic, dtype=np.float32)
-        chan_cov_np = np.asarray(chan_cov, dtype=np.float32)
+        mosaic_channels.append(chan_mosaic_np)
+        if coverage_result is None:
+            coverage_result = np.asarray(chan_cov, dtype=np.float32)
         if logger:
             logger.debug(
                 "[TwoPass] Channel %d done: mosaic_shape=%s, coverage_shape=%s, cov_stats=(min=%.4f, max=%.4f)",
-                ch_idx + 1,
+                ch + 1,
                 getattr(chan_mosaic_np, "shape", None),
-                getattr(chan_cov_np, "shape", None),
-                float(np.nanmin(chan_cov_np)) if chan_cov_np is not None else float("nan"),
-                float(np.nanmax(chan_cov_np)) if chan_cov_np is not None else float("nan"),
+                getattr(coverage_result, "shape", None),
+                float(np.nanmin(coverage_result)) if coverage_result is not None else float("nan"),
+                float(np.nanmax(coverage_result)) if coverage_result is not None else float("nan"),
             )
-        return ch_idx, chan_mosaic_np, chan_cov_np
-
-    reproj_chunk_total = n_channels
-    channel_tasks: list[tuple[int, bool]] = []
-    gpu_assigned = False
-    for ch in range(n_channels):
-        use_gpu_flag = bool(use_gpu and not gpu_assigned)
-        if use_gpu_flag:
-            gpu_assigned = True
-        channel_tasks.append((ch, use_gpu_flag))
-
-    # Process channels sequentially when GPU is involved to avoid driver/context issues in thread pools.
-    if n_channels == 1 or use_gpu:
-        reproj_failure = False
-        done_channels = 0
-        for ch_idx, use_gpu_flag in channel_tasks:
-            try:
-                ch_idx, chan_mosaic_np, chan_cov_np = _process_channel(ch_idx, use_gpu_flag)
-                mosaic_channels[ch_idx] = chan_mosaic_np
-                coverage_channels[ch_idx] = chan_cov_np
-            except Exception as exc:
-                reproj_failure = True
-                if logger:
-                    logger.warning("[TwoPass] Channel %d reprojection failed: %s", ch_idx, exc)
-                break
-            done_channels += 1
-            _emit_two_pass_stats(
-                tiles_total,
-                chunk_index=done_channels,
-                chunk_total=reproj_chunk_total,
-                force=False,
-                stage="reproject",
-            )
-        if reproj_failure or any(m is None for m in mosaic_channels):
-            return None
-    else:
-        max_channel_workers = max(1, min(n_channels, cpu_workers_hint or n_channels))
-        reproj_failure = False
-        done_channels = 0
-        with ThreadPoolExecutor(max_workers=max_channel_workers) as executor:
-            future_map = {
-                executor.submit(_process_channel, ch_idx, use_gpu_flag): ch_idx for ch_idx, use_gpu_flag in channel_tasks
-            }
-            for fut in as_completed(future_map):
-                try:
-                    ch_idx, chan_mosaic_np, chan_cov_np = fut.result()
-                    mosaic_channels[ch_idx] = chan_mosaic_np
-                    coverage_channels[ch_idx] = chan_cov_np
-                except Exception as exc:
-                    reproj_failure = True
-                    if logger:
-                        logger.warning("[TwoPass] Channel %d reprojection failed: %s", future_map.get(fut, -1), exc)
-                    break
-                done_channels += 1
-                _emit_two_pass_stats(
-                    tiles_total,
-                    chunk_index=done_channels,
-                    chunk_total=reproj_chunk_total,
-                    force=False,
-                    stage="reproject",
-                )
-        if reproj_failure or any(m is None for m in mosaic_channels):
-            return None
-
-    coverage_result: np.ndarray | None = None
-    for cov in coverage_channels:
-        if cov is not None:
-            coverage_result = cov.astype(np.float32, copy=False)
-            break
+    mosaic = (
+        mosaic_channels[0][..., np.newaxis]
+        if n_channels == 1
+        else np.stack(mosaic_channels, axis=-1)
+    )
     if coverage_result is None:
         return None
-    stacked_mosaic = [np.asarray(mc, dtype=np.float32) for mc in mosaic_channels if mc is not None]
-    mosaic = (
-        stacked_mosaic[0][..., np.newaxis]
-        if n_channels == 1
-        else np.stack(stacked_mosaic, axis=-1)
-    )
-    _emit_two_pass_stats(
-        tiles_total,
-        chunk_index=reproj_chunk_total,
-        chunk_total=reproj_chunk_total,
-        force=True,
-        stage="reproject_done",
-    )
     return mosaic.astype(np.float32), coverage_result.astype(np.float32)
 
 
@@ -15662,51 +15410,6 @@ def run_hierarchical_mosaic(
     pcb("PHASE_UPDATE:2", prog=None, lvl="ETA_LEVEL")
     # Use order-invariant connected-components clustering for robustness
     preplan_groups_active = False
-    # Dernière chance : si des groupes préplanifiés existent dans les overrides
-    # mais que ``preplan_groups_override_paths`` n'a pas encore été rempli (par
-    # exemple si l'early filter a été désactivé), on les reconstruit ici.
-    if not preplan_groups_override_paths and isinstance(filter_overrides_arg, dict):
-        try:
-            raw_groups_override = filter_overrides_arg.get("preplan_master_groups")
-            if isinstance(raw_groups_override, list):
-                mapped_groups: list[list[str]] = []
-                for group in raw_groups_override:
-                    if not isinstance(group, (list, tuple)):
-                        continue
-                    normalized_group: list[str] = []
-                    for item in group:
-                        path_val = None
-                        if isinstance(item, dict):
-                            path_val = item.get("path") or item.get("path_raw")
-                        elif isinstance(item, str):
-                            path_val = item
-                        norm_path = _normalize_path_for_matching(path_val)
-                        if norm_path:
-                            normalized_group.append(norm_path)
-                    if normalized_group:
-                        mapped_groups.append(normalized_group)
-                if mapped_groups:
-                    preplan_groups_override_paths = mapped_groups
-                    _log_and_callback(
-                        f"debug_preplan_phase2: received {len(mapped_groups)} preplanned group(s) from overrides.",
-                        prog=None,
-                        lvl="INFO_DETAIL",
-                        callback=progress_callback,
-                    )
-            else:
-                _log_and_callback(
-                    "debug_preplan_phase2: filter_overrides present but preplan_master_groups missing or invalid.",
-                    prog=None,
-                    lvl="INFO_DETAIL",
-                    callback=progress_callback,
-                )
-        except Exception as e_dbg:
-            _log_and_callback(
-                f"debug_preplan_phase2: exception while parsing preplan_master_groups: {e_dbg}",
-                prog=None,
-                lvl="INFO_DETAIL",
-                callback=progress_callback,
-            )
     if preplan_groups_override_paths:
         try:
             path_lookup = {
@@ -15714,21 +15417,7 @@ def run_hierarchical_mosaic(
                 for info in all_raw_files_processed_info
                 if isinstance(info, dict)
             }
-            basename_lookup: dict[str, list[dict]] = {}
-            for info in all_raw_files_processed_info:
-                if not isinstance(info, dict):
-                    continue
-                raw_val = info.get("path_raw") or info.get("path")
-                if not raw_val:
-                    continue
-                try:
-                    base = Path(raw_val).name.lower()
-                except Exception:
-                    base = None
-                if base:
-                    basename_lookup.setdefault(base, []).append(info)
             used_paths: set[str] = set()
-            used_basenames: set[str] = set()
             mapped_info_groups: list[list[dict]] = []
             missing_preplan: list[str] = []
             for group_paths in preplan_groups_override_paths:
@@ -15737,54 +15426,21 @@ def run_hierarchical_mosaic(
                     if not path_norm:
                         continue
                     info = path_lookup.get(path_norm)
-                    # Fallback: try basename match (handles letter/UNC changes between filter + resume)
-                    if info is None:
-                        try:
-                            base = Path(path_norm).name.lower()
-                        except Exception:
-                            base = None
-                        if base:
-                            bucket = basename_lookup.get(base) or []
-                            # pick the first unused entry in that bucket
-                            while bucket:
-                                candidate = bucket.pop(0)
-                                cand_norm = _normalize_path_for_matching(
-                                    candidate.get("path_raw") or candidate.get("path")
-                                )
-                                if cand_norm and cand_norm in used_paths:
-                                    continue
-                                info = candidate
-                                break
                     if info is not None:
                         current_group.append(info)
                         info_norm = _normalize_path_for_matching(info.get("path_raw") or info.get("path"))
                         if info_norm:
                             used_paths.add(info_norm)
-                        try:
-                            base_used = Path(path_norm).name.lower()
-                        except Exception:
-                            base_used = None
-                        if base_used:
-                            used_basenames.add(base_used)
                     else:
                         missing_preplan.append(path_norm)
                 if current_group:
                     mapped_info_groups.append(current_group)
             if mapped_info_groups:
-                leftovers = []
-                for info in all_raw_files_processed_info:
-                    if not isinstance(info, dict):
-                        continue
-                    norm_val = _normalize_path_for_matching(info.get("path_raw") or info.get("path"))
-                    if norm_val and norm_val in used_paths:
-                        continue
-                    try:
-                        base_val = Path(info.get("path_raw") or info.get("path") or "").name.lower()
-                    except Exception:
-                        base_val = None
-                    if base_val and base_val in used_basenames:
-                        continue
-                    leftovers.append(info)
+                leftovers = [
+                    info
+                    for info in all_raw_files_processed_info
+                    if _normalize_path_for_matching(info.get("path_raw") or info.get("path")) not in used_paths
+                ]
                 if leftovers:
                     mapped_info_groups.append(leftovers)
                 seestar_stack_groups = mapped_info_groups

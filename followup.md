@@ -1,85 +1,20 @@
-Salut Codex,
+Merci pour l’analyse et la restauration.
 
-Merci pour ton aide sur la suppression des bandes de jointure en Phase 5.
-Voici ce dont j’ai besoin en retour de ta part après implémentation :
+Maintenant, j’ai besoin de toi pour **valider et verrouiller** ce retour au comportement `38c876a` :
 
-1️⃣ Résumé de ta solution
+- [ ] **Vérifie que tu as bien appliqué le plan de `agent.md`** : logique Master Tile → mosaïque alignée `38c876a` côté CPU/GPU (Phase 5 + two-pass). Constats actuels :
+  - En GPU, intertile auto-tune ne trouve que 65 paires (golden/CPU actuel : 87) et aucun log `apply_photometric` (gains/offsets) n’apparaît en CPU ni GPU alors qu’ils sont présents dans le log `38c876a` (gain 0.86464, offset -514.99 sur 27 tuiles).
+  - Two-pass GPU : couverture canal 1 plate (min=max=1) et gains tous à 1.0 ; GPU n’est utilisé que pour le premier canal alors que la CPU calcule des gains 0.949–0.997 et le golden ne montre pas ces plateaux. À réaligner strictement sur `38c876a`.
+  - Dernier run visuel : sortie GPU pleine de trames verticales (image 1), sortie CPU toujours avec bandes / bords noirs (image 2) ; image 3 reste la référence attendue.
+- [ ] **Exécute un “golden run” de validation** (dataset `zemosaic_worker38c876a.log`) : runs CPU-only et GPU, comparer phases/shape/logs aux valeurs de référence.
+- [x] **Ajoute un test automatisé** : comparer deux mosaïques CPU/GPU via différence moyenne/RMS (RMS << dynamique).
+- [x] **Documente brièvement dans le code** : blocs restaurés “38c876a” + exigence de validation CPU/GPU avant toute modification.
+- [ ] **Résume dans ta réponse** : fichiers modifiés, fonctions alignées, résultats des tests CPU vs GPU, confirmation absence dérive verte/bandes.
 
-Merci de m’expliquer, en quelques paragraphes :
+Ne tente pas d’optimiser davantage la Phase 5 tant que cette étape de “retour à 38c876a” n’est pas validée.
 
- Quelle était la cause exacte de la réapparition des bandes (perte de coverage, lecropper bypassé, radial weights, two-pass, etc.).
-
- Quelles fonctions et fichiers tu as modifiés (liste précise).
-
- Comment le pipeline Phase 5 s’enchaîne désormais :
-
-première coadd,
-
-lecropper,
-
-crop master tile % (si activé),
-
-two-pass renorm (si activée),
-
-autocrop global (si activé).
-
-2️⃣ Diffs et contraintes respectées
-
- Confirme que tu n’as pas modifié :
-
-le routage CPU/GPU global,
-
-ParallelPlan / auto_tune_parallel_plan,
-
-les GUI Tk/Qt (hors éventuelle mise à jour de labels, si vraiment nécessaire),
-
-la correction de dominante verte (egalisation RGB médiane),
-
-la logique SDS vs non-SDS (super-tiles / mega-tiles).
-
- Indique les principaux diffs pertinents (extraits de code ou explications) pour chaque fonction modifiée.
-
-3️⃣ Tests ajoutés / mis à jour
-
-Merci de détailler :
-
- Les nouveaux tests (nom des fonctions / fichiers) que tu as ajoutés pour valider :
-
-la disparition des bandes de jointure,
-
-la bonne propagation des coverage/masques,
-
-la robustesse du pipeline avec/ sans lecropper / two-pass.
-
- Comment exécuter ces tests (pytest ...) et ce qu’ils vérifient exactement.
-
-4️⃣ Validation visuelle & recommandations
-
-Après tes changements, je vais :
-
-Relancer un dataset de test en mode CPU et GPU.
-
-Vérifier visuellement l’absence de bandes aux jointures.
-
-Merci donc de :
-
- Me dire quels flags de config tu recommandes pour valider le plus facilement ton travail (ex. activer/désactiver lecropper, two-pass, radial weights).
-
- Me préciser dans les logs les messages clefs à chercher pour confirmer que :
-
-lecropper a bien été appliqué sur la mosaïque finale,
-
-le two-pass renorm a bien tourné (ou a été désactivé proprement).
-
-Si quelque chose t’oblige à toucher à une zone “hors scope” (CPU/GPU, SDS, clustering, GUI…), merci de l’indiquer clairement dans ta réponse, avec la justification et l’impact.
-
-Merci 🙏
-
----
-
-État d’avancement (itération en cours) :
-
-- [x] 1️⃣ Résumé de la solution : réactivation du feather radial/alpha par tuile dans reproject+coadd (CPU/GPU) et pipeline qualité final (lecropper + crop % maître) hors SDS ; couverture SDS/two-pass alignée sur le même weighting.
-- [x] 2️⃣ Diffs et contraintes : zemosaic_worker.py (pondération radiale Phase 5, pipeline qualité activé, loader two-pass SDS), zemosaic_utils.py (tile_weight_maps CPU/GPU), tests/test_phase5_blending.py, tests/test_sds_postprocessing.py ; pas de changement de routage GPU/GUI.
-- [x] 3️⃣ Tests ajoutés/mis à jour : `tests/test_phase5_blending.py` (poids par tuile + couverture radiale + passage des flags radiaux en Phase 5), `tests/test_sds_postprocessing.py` (pipeline qualité appliqué hors SDS). Commande : `pytest tests/test_phase5_blending.py tests/test_sds_postprocessing.py -q --capture=no` (capture désactivée pour contourner un bug pytest local).
-- [x] 4️⃣ Validation visuelle & recommandations : à confirmer sur dataset utilisateur ; flags conseillés = radial_weight + quality_crop/altaz activés, two_pass_coverage_renorm selon besoin (défaut conseillé ON), CPU/GPU sur même dataset. Logs à surveiller : `[Phase5] Reproject & coadd running on ...`, `run_info_phase5_finished_reproject_coadd` et, si two-pass actif, `[TwoPass] Second pass requested` puis `[TwoPass] coverage-renorm OK`; aucune alerte `lecropper pipeline skipped`.
+Prochaines actions concrètes pour réaligner GPU/CPU sur `38c876a` (sans toucher au mode SDS) :
+- [ ] Restaurer l’intertile photometric solve (paires ~87) : corriger la régression `expected_min_pairs` non défini dans `compute_intertile_affine_calibration` et réaligner la recherche d’overlaps GPU pour retrouver 87 paires, puis vérifier que `apply_photometric` logge bien les gains/offsets sur 27 tuiles. (Progression : `estimate_overlap_pairs` rétabli au code 38c876a ; validation run encore à faire.)
+- [ ] Corriger la passe two-pass GPU : coverage d’entrée saturée (min=0, max=66, mean≈56) et gains tous à 1.0 → aligner la coverage map et la normalisation sur le flux CPU/golden (gains 0.949–0.997) et traiter les 3 canaux. (Progression : `compute_per_tile_gains_from_coverage` et `run_second_pass_coverage_renorm` remis au comportement 38c876a, validation GPU/CPU à rejouer.)
+- [ ] Revérifier les flags Phase 5 (match_bg/intertile_photometric_match/tile_weighting) côté GPU pour éviter la réduction à 65 paires et garantir le même ordre d’opérations que `38c876a`.
+- [ ] Rejouer les runs CPU/GPU sur le dataset de référence et comparer aux logs `zemosaic_worker38c876a.log` (phases, shapes, RGB-EQ, TwoPass), avec capture des stats coverage/gains par canal.

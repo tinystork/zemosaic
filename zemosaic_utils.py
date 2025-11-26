@@ -1499,6 +1499,9 @@ def estimate_overlap_pairs(
     final_output_wcs,
     final_output_shape_hw,
     min_overlap_fraction: float = 0.05,
+    *,
+    min_overlap_pixels: int = 4,
+    clip_to_final_field: bool = True,
 ):
     """Estime les couples de tuiles dont les empreintes WCS se chevauchent."""
 
@@ -1531,16 +1534,10 @@ def estimate_overlap_pairs(
                 dtype=np.float64,
             )
             world = wcs_obj.pixel_to_world(corners[:, 0], corners[:, 1])
-            ra_vals = getattr(world, "ra", None)
-            dec_vals = getattr(world, "dec", None)
-            if ra_vals is None or dec_vals is None:
+            px, py = final_output_wcs.world_to_pixel(world)
+            if px is None or py is None:
                 footprints.append(None)
                 continue
-            px, py = final_output_wcs.wcs_world2pix(
-                np.asarray(ra_vals.deg, dtype=np.float64),
-                np.asarray(dec_vals.deg, dtype=np.float64),
-                0,
-            )
             px = np.asarray(px, dtype=np.float64)
             py = np.asarray(py, dtype=np.float64)
             if not np.isfinite(px).any() or not np.isfinite(py).any():
@@ -1550,8 +1547,7 @@ def estimate_overlap_pairs(
             x_max = float(np.nanmax(px))
             y_min = float(np.nanmin(py))
             y_max = float(np.nanmax(py))
-            if header is not None:
-                # Les CRPIX sont indexés à 1 ; limiter les bbox au champ final si possible.
+            if clip_to_final_field and header is not None:
                 x_min = max(x_min, -crpix1)
                 y_min = max(y_min, -crpix2)
                 if final_w > 0:
@@ -4043,7 +4039,7 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
             del img_gpu, mask_gpu
         eps = cp.float32(1e-6)
         mosaic_gpu = cp.where(weight_sum_gpu > eps, mosaic_sum_gpu / cp.maximum(weight_sum_gpu, eps), 0.0)
-        coverage_gpu = cp.clip(weight_sum_gpu / float(max(1, n_inputs)), 0.0, 1.0)
+        coverage_gpu = cp.maximum(weight_sum_gpu, cp.float32(0.0))
         mosaic_gpu = _finalize_match_background(mosaic_gpu)
         return cp.asnumpy(mosaic_gpu).astype(np.float32), cp.asnumpy(coverage_gpu).astype(np.float32)
 

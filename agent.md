@@ -1,258 +1,167 @@
-✅ Mission
+# Mission Codex High/Max – Retour STRICT au comportement du commit `38c876a` (CPU & GPU)
 
-Corriger les bandes de jointures photométriques réapparues dans les mosaïques ZeMosaic, en Phase 5 / Reproject & Coadd, sans toucher :
+## 🎯 Objectif
 
-au routage CPU/GPU,
-
-au pipeline SDS vs non-SDS,
-
-ni à la correction de dominante verte / égalisation RGB.
-
-Les flux CPU et GPU doivent produire exactement la même image (à bruit numérique près), sans bandes au niveau des bords de tuiles.
-
-🧩 Symptôme
-
-En sortie de Phase 5, la mosaïque finale présente des rectangles visibles qui suivent les contours des master tiles (voir capture fournie par l’utilisateur).
-
-Le problème est identique en mode CPU et GPU, donc la cause est dans la logique commune à Phase 5, pas dans les kernels GPU eux-mêmes.
-
-Avant certaines modifications récentes (RGB equalization / Phase 5 refactor), ces bandes n’étaient pas visibles.
-
-🎯 Objectifs détaillés
-
-Merci de :
-
- Identifier la cause des bandes de jointure : perte de pondération / masques, ordre de pipeline, renorm désactivée, etc.
-
- Garantir que chaque tuile passe à nouveau correctement par :
-
-le pipeline lecropper (quality crop + Alt-Az cleanup quand activé),
-
-la map de poids radiale (feathering en bord de champ),
-
-la normalisation photométrique/coverage attendue en Phase 5.
-
- Corriger la photometric blending de Phase 5 pour supprimer les bandes, tout en conservant :
-
- le comportement actuel CPU/GPU (structure du code, toggles, parallel plan),
-
- la correction de dominante verte (RGB median equalization),
-
- la compatibilité SDS (super-tiles / mega-tiles) existante.
-
- Ajouter des tests unitaires / d’intégration ciblant les jointures, pour éviter toute régression future.
-
-📂 Fichiers & Fonctions concernées
-
-Cœur Phase 5 & pipeline qualité (OK à modifier, mais de façon minimale et localisée) :
-
-zemosaic_worker.py
-
-_apply_lecropper_pipeline(...)
-
-_apply_final_mosaic_quality_pipeline(...)
-
-_apply_master_tile_crop_mask_to_mosaic(...)
-
-_apply_phase5_post_stack_pipeline(...)
-
-_apply_two_pass_coverage_renorm_if_requested(...)
-
-_apply_final_mosaic_quality_pipeline(...)
-
-_mask_sds_low_coverage_pixels(...)
-
-_sanitize_sds_megatile_payload(...)
-
-_auto_crop_global_mosaic_if_requested(...)
-
-_emit_coverage_summary_log(...)
-
-Toute fonction strictement nécessaire pour la photometric blending et la propagation des masques/coverage.
-
-Radial weights & égalisation RGB (ne modifier que si absolument nécessaire, et sans casser la correction de dominante verte) :
-
-zemosaic_align_stack.py
-
-make_radial_weight_map (import via zemosaic_utils)
-
-equalize_rgb_medians_inplace(...)
-
-_poststack_rgb_equalization(...)
-
-Utilitaires (à toucher seulement si vraiment indispensable) :
-
-zemosaic_utils.py
-
-Fonctions liées à reproject_coadd, aux coverage maps et à la gestion WCS.
-
-🚧 Zones à NE PAS modifier
-
-Merci de ne pas toucher aux éléments suivants (sauf micro-bug évident et documenté) :
-
- Routage CPU/GPU, détection GPU, ParallelPlan, auto_tune_parallel_plan, detect_parallel_capabilities (parallel_utils.py, zemosaic_worker.py).
-
- Logique d’orchestration des phases (1 à 5) et SDS vs non-SDS (mécanique globale).
-
- Toggles GUI / propagation des flags GPU (Tk/Qt) :
-
-zemosaic_gui.py
-
-zemosaic_gui_qt.py
-
- Clustering / grouping / autosplit (Phase 2 / 3), hard-merge, etc.
-
- Correction de dominante verte / poststack_equalize_rgb : ne pas revenir en arrière.
-
-🧠 Hypothèses techniques (pour t’orienter)
-
-Tu peux les vérifier / infirmer, mais ne pas les appliquer aveuglément :
-
-Radial weight map non appliquée / écrasée
-
-make_radial_weight_map peut ne plus être appelé ou utilisé correctement.
-
-Si la map radiale n’est pas appliquée (ou est revenue à un comportement neutre), les tuiles gardent un bord “dur” → bandes visibles.
-
-Coverage map perdue ou uniformisée
-
-Dans _sanitize_sds_megatile_payload, _mask_sds_low_coverage_pixels, _apply_final_mosaic_quality_pipeline, certains fallbacks mettent coverage = ones(...).
-
-Si un chemin de code tombe trop souvent sur ce fallback, la coaddition devient quasi uniforme → contours de tuiles visibles.
-
-Pipeline lecropper non (ou plus) appliqué au global
-
-_apply_lecropper_pipeline & _apply_final_mosaic_quality_pipeline doivent être appelés après la première coadd, avant toute renorm ou cropping final.
-
-Si lecropper ne masque plus les bords/artefacts, les transitions deviennent visibles.
-
-Two-pass renorm désactivée / cassée silencieusement
-
-_apply_two_pass_coverage_renorm_if_requested peut retourner None en cas de problème et laisser le résultat brut.
-
-Si la seconde passe échoue systématiquement (par exemple à cause d’un param GPU/CPU ou parallel_plan), la mosaïque garde un gradient de jointure.
-
-🔬 Plan de travail suggéré
-1. Analyse / diff
-
- Identifier le dernier commit où les bandes étaient absentes (commit 38c876a ).
-
- Comparer Phase 5 (fonctions listées plus haut) entre ce commit et HEAD pour isoler :
-
- changements sur coverage / weights,
-
- modifications sur lecropper / radial weights,
-
- ajustements sur RGB equalization.
-
-Documenter dans un commentaire de MR ou dans followup.md :
-
-quelles fonctions ont changé,
-
-quelle partie du pipeline est susceptible d’avoir réintroduit les bandes.
-
-2. Reconstruction du pipeline attendu (concept)
-
-L’objectif est :
-
-Coadd global → première passe (reproject + somme pondérée par coverage/weights).
-
-Pipeline qualité :
-
- application éventuelle de lecropper sur la mosaïque globale,
-
- application éventuelle du crop % master tile (quand activé),
-
- masques/alpha associés correctement injectés dans coverage.
-
-Two-pass renorm (si activée) :
-
- utiliser la coverage map et/ou les tiles sources pour lisser les variations de fond,
-
- respecter les limites de gain DEFAULT_INTERTILE_GAIN_LIMITS et offset.
-
-Autocrop global (si activé), en respectant les offsets dans le WCS global.
-
-Merci de :
-
- Vérifier que cet ordre est bien respecté,
-
- Corriger les cas où coverage / alpha / masques ne sont pas propagés d’une étape à l’autre.
-
-3. Implémentation
-
- Corriger les fonctions identifiées pour :
-
- s’assurer que chaque tile/mosaïque passe par le pipeline lecropper quand activé dans la config,
-
- garantir que la coverage map :
-
- est nettoyée des NaN,
-
- correspond bien à la géométrie de l’image,
-
- est utilisée comme poids dans la coadd (et non remplacée par ones(...) sauf cas exceptionnel très clairement loggé).
-
- s’assurer que les masques/bords cropés → coverage = 0, image = NaN (ou 0), de façon cohérente sur CPU et GPU.
-
- Si nécessaire, renforcer ou réintroduire le radial feathering sur les tiles :
-
-attention : ne pas casser le comportement antérieur en cas de désactivation du feathering dans la config.
-
-4. Tests automatiques
-
-Merci d’ajouter des tests ciblés (dans tests/ — tu peux créer un nouveau fichier si besoin, ex. test_phase5_blending.py) :
-
- Test de jointure simple CPU
-
-Créer deux “tiles” 2D (ou 3D RGB) de taille identique, avec une zone d’overlap :
-
-tile A = niveau 1.0, tile B = niveau 2.0.
-
-Simuler une coadd + pipeline Phase 5 (en appelant les fonctions internes de façon contrôlée).
-
-Vérifier que dans la zone d’overlap, la transition est lisse (pas de step net).
-
- Test de jointure avec coverage
-
-Couvrir une zone où seule la tile B est présente → vérifier absence de “bande” en bordure.
-
- Test lecropper activé
-
-Forcer l’application du pipeline lecropper sur une mosaïque avec un bord clairement marqué et vérifier que ces bords sont masqués (coverage à 0, image à NaN/0).
-
- Optionnel : test GPU
-
-Si possible, simuler un plan avec use_gpu=True mais en gardant le même code Python, pour vérifier que CPU/GPU retournent des résultats identiques (mêmes masques/coverage).
-
-Les tests ne doivent pas dépendre d’Astropy/Photutils s’il n’y en a pas besoin : privilégier du NumPy pur.
-
-5. Logging / observabilité
-
- Ajouter des logs INFO_DETAIL / DEBUG centrés sur la coverage/weights en Phase 5 :
-
-fraction de pixels couverts,
-
-bbox coverage,
-
-nombre de pixels masqués par lecropper,
-
-application ou non de la seconde passe.
-
-Veiller à ne pas inonder le log par défaut (niveau INFO). Utiliser de préférence :
-
-lvl="INFO_DETAIL" ou lvl="DEBUG" pour les infos verbeuses.
-
-✅ Critères d’acceptation
-
-La mission est réussie si :
-
- Les mosaïques CPU et GPU issues du même dataset ne présentent plus de bandes visibles aux jointures de tiles (inspection visuelle + éventuellement différence numérique).
-
- En désactivant lecropper / radial weights dans la config, le comportement reste cohérent (pas de crash, bandes potentiellement visibles, mais contrôlé).
-
- La correction de dominante verte est toujours effective (aucun retour à une image verdie).
-
- Les tests ajoutés passent localement (pytest) et sont stables.
-
- Aucun changement n’a été apporté au routage CPU/GPU, au clustering ou aux GUI au-delà de ce qui est explicitement demandé.
+Revenir **strictement** au comportement du commit `38c876a` pour la chaîne classique Master Tile → mosaïque, en CPU **et** en GPU :
+
+- **Même logique, même ordre d’opérations, mêmes poids, mêmes phases**.
+- La voie GPU doit produire **la même image** que la voie CPU (à tolérance float près), comme au commit `38c876a`.
+- **Aucune “amélioration” ni réinterprétation** : on veut **le code de 38c876a**, réintégré dans la base actuelle, en gardant seulement ce qui est nécessaire pour compiler / fonctionner.
+
+Le dernier run **réellement fonctionnel** (CPU = GPU OK) correspond au commit `38c876a`, log enregistré dans :
+- `zemosaic_worker38c876a.log` :contentReference[oaicite:0]{index=0}  
+
+Les images associées montrent :
+- Image 3 = **référence bonne** (GPU/CPU sous `38c876a`).
+- Image 1 (CPU actuel) = bandes de jointure visibles.
+- Image 2 (GPU actuel) = dérive couleur + artefacts.
+
+Le but : **revenir au comportement de l’image 3**, pour CPU et GPU, dans la branche actuelle.
+
+---
+
+## 🗂 Contexte et périmètre
+
+- Repo : **ZeMosaic**
+- Branche de travail : **branche actuelle (ex : `V4WIP` ou équivalent)** – ne pas toucher à l’historique git, travailler via modifications de fichiers.
+- Commit de référence (golden) : `38c876a`
+- Log de référence : `zemosaic_worker38c876a.log` (golden run complet). :contentReference[oaicite:1]{index=1}  
+
+### Fichiers principaux impliqués
+
+À analyser et, si besoin, **ramener exactement à l’état logique de `38c876a`** pour la voie “Master Tiles → Reproject → Coadd” :
+
+- `zemosaic_worker.py` (Phase 3–6, assemblage final, photométrie, normalisation RGB, CPU/GPU, two-pass, etc.) :contentReference[oaicite:2]{index=2}  
+- `zemosaic_align_stack.py` (traitement CPU)
+- `zemosaic_align_stack_gpu.py` (traitement GPU)
+- Éventuellement :
+  - `zemosaic_utils.py`
+  - `zemosaic_astrometry.py`
+  - Toute fonction utilitaire spécifique appelée par la Phase 5 / two-pass / RGB-equalize.
+
+🔒 **Zones à ne pas modifier (sauf nécessité mécanique de compatibilité) :**
+
+- Le mode **SDS / ZeSupaDupStack / Phase 4.5 super-tiles** : **NE PAS TOUCHER LA LOGIQUE SDS**.
+- La logique générale du GUI Tk / Qt, sauf pour adapter à des renommages s’il y en a eu.
+- Le système de télémétrie / ParallelPlan, sauf si un appel / argument doit être réaligné sur l’API précédente.
+
+---
+
+## 🔍 Symptômes actuels
+
+- En mode **CPU**, l’image finale présente des **bandes de jointure photométriques** (différences de fond / couleur entre tuiles) et des bords noirs résiduels (cf. image 2).
+- En mode **GPU**, la mosaïque est largement corrompue (trames verticales massives, cf. image 1), signe que la Phase 5/two-pass GPU diverge fortement du comportement `38c876a`.
+- Ces dérives n’étaient **pas présentes** dans le run de référence `38c876a` : le log montre une Phase 5 propre, avec **RGB equalization maîtrisée** et **two-pass coverage renorm GPU** qui fonctionne correctement (cf. image 3). :contentReference[oaicite:3]{index=3}  
+
+### 📑 Constats logs (référence vs runs actuels)
+
+- Golden (`zemosaic_worker38c876a.log`) : intertile auto-tune → 87 paires, photométrie appliquée (`apply_photometric` sur 27 tuiles), two-pass GPU OK (gains non triviaux).
+- CPU actuel (`zemosaic_workerCPU.log`) : 87 paires trouvées mais **exception** `expected_min_pairs` non défini ⇒ photométrie instable ; two-pass CPU calcule des gains 0.949–0.997 (coverage min=0, max=38, mean≈7.6).
+- GPU actuel (`zemosaic_workerGPU.log`) : seulement 65 paires, même exception `expected_min_pairs` ⇒ aucune correction intertile (`apply_photometric: no affine corrections available`) ; two-pass GPU reçoit une coverage saturée (min=0, max=66, mean≈56) et retourne des gains **tous à 1.0** → mosaïque corrompue.
+
+---
+
+## ✅ Plan de travail (avec cases à cocher)
+
+### 1. Analyse différentielle
+
+- [ ] Cloner / ouvrir deux vues du repo :  
+  - une sur **`38c876a`** (référence)  
+  - une sur la **branche actuelle**.
+- [ ] Faire des diffs focalisés sur :
+  - [ ] `zemosaic_worker.py` :
+    - Phases 3, 4, 5, 6 ;
+    - fonctions du type :
+      - `_apply_phase5_post_stack_pipeline` :contentReference[oaicite:4]{index=4}  
+      - `_apply_two_pass_coverage_renorm_if_requested`
+      - `run_second_pass_coverage_renorm`
+      - `assemble_final_mosaic_reproject_coadd`
+      - `poststack_equalize_rgb` / traitement RGB-EQ dans les Master Tiles (cf. log `[RGB-EQ] poststack_equalize_rgb enabled=True, applied=True, gains=...`). :contentReference[oaicite:5]{index=5}  
+  - [ ] `zemosaic_align_stack.py` et `zemosaic_align_stack_gpu.py` :
+    - Toute différence sur les poids, l’ordre des opérations, les conversions RGB/BGR, les normalisations.
+- [ ] Lister **précisément** toutes les différences **mathématiques / d’ordre d’opérations** entre `38c876a` et la branche actuelle pour la voie MASTER TILE → MOSAIC (CPU & GPU).
+- [ ] Mettre en avant les écarts observés dans les runs récents vs golden :
+  - [ ] Phase 5 intertile : en GPU, le log montre seulement 65 paires (vs 87 en CPU/golden) et aucune trace `apply_photometric`/gains par tuile (absents aussi en CPU actuel) alors qu’ils existent dans le log `38c876a` avec gain=0.86464 offset=-514.99.
+  - [ ] Two-pass coverage : en GPU, la map de couverture de la passe 2 reste plate (cov min=max=1 pour canal 1) et les gains calculés sont tous 1.0, alors que la CPU calcule des gains 0.949–0.997 et le golden effectue la passe GPU sans ces plateaux.
+  - [ ] Vérifier pourquoi la passe 2 GPU n’utilise qu’un seul canal en GPU (canal 1 GPU, canaux 2/3 CPU) et pourquoi les cov stats des canaux 2/3 s’étalent 0–15 alors que le canal 1 reste à 1.
+
+### 2. Restauration STRICTE de la logique `38c876a` pour la voie Master Tile
+
+Objectif : **copier / re-intégrer** la logique de `38c876a` dans la base actuelle, **sans “optimiser” ni “améliorer”**.
+
+- [ ] Pour chaque fonction critique (exemples) :
+  - `assemble_final_mosaic_reproject_coadd`
+  - `_apply_phase5_post_stack_pipeline`
+  - `_apply_two_pass_coverage_renorm_if_requested`
+  - `run_second_pass_coverage_renorm`
+  - tout bloc RGB-EQ / poststack_equalize_rgb
+  - les fonctions de weighting / photometric solve en phase 5  
+  → **Ramener la version `38c876a` telle quelle**, en l’adaptant juste si de **nouveaux paramètres** sont nécessaires pour la compatibilité avec la base actuelle.
+- [ ] S’assurer que **la voie CPU et la voie GPU** appellent **les mêmes fonctions** de photométrie et de normalisation, dans le **même ordre**, avec les **mêmes paramètres** :
+  - pas de code spécifique GPU qui change l’ordre des opérations ;
+  - le GPU ne doit être qu’une **implémentation accélérée**, pas une logique différente.
+- [ ] Vérifier en particulier :
+  - [ ] qu’il n’y a **aucun mélange BGR/RGB** dans la voie GPU (OpenCV / CuPy) ;
+  - [ ] que les gains RGB vérifiés dans le log de 38c876a (`[RGB-EQ] poststack_equalize_rgb ... gains=(1.000000,0.79...,1.03...)`) suivent la **même logique**. :contentReference[oaicite:6]{index=6}  
+  - [ ] que l’intertile photometric solve est exécuté (paires ~87, `apply_photometric` avec gains/offsets) en CPU et GPU comme dans le log `38c876a`.
+  - [ ] que la passe two-pass GPU produit une couverture non triviale (pas cov=1) et des gains non figés à 1.0, avec la même stratégie multi-canaux que la CPU/golden.
+- [ ] S’il y a des nouveaux blocs “géniaux” ajoutés après `38c876a` qui modifient l’algorithme (streaming, nouvelles ponderations, etc.) :
+  - [ ] **Les désactiver** pour la voie Master Tile “classique”.
+  - [ ] Ou les garder **uniquement** si leur présence ne change **strictement rien** au résultat quand ils sont désactivés (i.e. même résultat qu’en 38c876a avec les mêmes settings).
+
+### 3. Respect de la séparation SDS / classique
+
+- [ ] Ne pas modifier la logique SDS (mosaïque d’abord, stacking ensuite, mega-tiles, Phase 4.5, etc.).
+- [ ] S’assurer que les éventuels drapeaux / chemins “SDS vs non-SDS” ne se mélangent pas avec la voie Master Tile classique.
+- [ ] Vérifier que la restauration de la logique `38c876a` ne casse pas :
+  - les callbacks SDS,
+  - la télémétrie / ParallelPlan,
+  - le GUI (Tk / Qt).
+
+### 4. Validation par “golden run” (CPU & GPU)
+
+On dispose d’un **golden run** enregistré dans `zemosaic_worker38c876a.log` (commit bon) qui donne une mosaïque finale `(3237, 2399, 3)` avec second pass GPU OK. :contentReference[oaicite:7]{index=7}  
+
+- [ ] Ajouter (si possible) un petit script/tests qui :
+  - [ ] recharge les **mêmes brutes** que celles du run de référence (voire dossier /example dans le projet);
+  - [ ] lance un run **CPU only** (GPU désactivé) ;
+  - [ ] lance un run **GPU activé**.
+- [ ] Vérifier :
+  - [ ] que les shapes finales sont identiques à celles du log de référence.
+  - [ ] que les logs clés sont présents et cohérents :
+    - `run_info_phase5_started`, `assemble_info_finished_reproject_coadd`, `TwoPass` GPU, `run_info_phase5_finished_reproject_coadd`, etc. :contentReference[oaicite:8]{index=8}  
+  - [ ] que les gains / target du `[RGB-EQ] poststack_equalize_rgb` sont du même ordre de grandeur que dans le log de référence (les valeurs exactes peuvent diverger un peu, mais **pas** au point de donner une dérive verte).
+- [ ] Ajouter, si possible, un test automatique de comparaison CPU vs GPU :
+  - [ ] calculer la **différence absolue moyenne** entre sortie CPU et sortie GPU ;
+  - [ ] vérifier qu’elle est << dynamique de l’image (par ex. RMS < 1% de la plage) ;
+  - [ ] échouer le test si la différence est trop grande.
+
+### 5. Robustesse et non-régression
+
+- [ ] Vérifier que le code compile et tourne sans erreur en :
+  - [ ] mode Tk (GUI classique),
+  - [ ] mode Qt,
+  - [ ] mode CLI si disponible.
+- [ ] S’assurer que :
+  - [ ] aucun paramètre GUI n’a été cassé (GPU toggle, etc.).
+  - [ ] les logs sont toujours produits dans `zemosaic_worker.log` (et éventuellement dans le dossier config utilisateur). :contentReference[oaicite:9]{index=9}  
+- [ ] Documenter dans les commentaires principaux :
+  - [ ] Quel bloc a été **restauré** à l’identique de `38c876a`.
+  - [ ] Qu’il ne faut pas modifier ces blocs sans tests de non-régression CPU/GPU.
+
+---
+
+## ⚠️ Contraintes importantes
+
+- **Pas de refactor “cosmétique”** sur ces blocs : priorité à la **stabilité** et à la **reproductibilité**.
+- Ne **pas** changer les signatures publiques exposées au GUI, sauf nécessité absolue.
+- Si une adaptation est vraiment nécessaire (par ex. ajout d’un paramètre demandé par d’autres parties du code), l’implémenter de façon à ce que, pour les paramètres utilisés dans ce projet, le comportement soit **identique** à `38c876a`.
+
+---
+
+## ✅ Critères de succès
+
+- [ ] Avec le même jeu de données, la voie CPU produit une image visuellement équivalente à l’ancienne “image 3” (pas de bandes de jointure visibles, pas de dérive de couleur).
+- [ ] Avec les mêmes paramètres, la voie GPU produit une image **indiscernable** de la voie CPU (à flot près).
+- [ ] Les logs montrent la même séquence de phases / callbacks que dans `zemosaic_worker38c876a.log`.
+- [ ] Aucun crash ni régression SDS ni GUI.
