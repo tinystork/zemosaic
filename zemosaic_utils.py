@@ -76,6 +76,16 @@ try:  # pragma: no cover - optional dependency path
     from astropy.wcs.utils import proj_plane_pixel_scales  # type: ignore
 
     ASTROPY_WCS_AVAILABLE_IN_UTILS = True
+
+    # Patch Astropy WCS to avoid the iterative `all_world2pix` path that can emit
+    # noisy NoConvergence warnings; rely on the direct wcslib transform instead.
+    if not getattr(AstropyWCS, "_zemo_world_to_pixel_noiter", False):
+        def _world_to_pixel_values_noiter(self, *world_arrays):
+            pixel = self.wcs_world2pix(*world_arrays, 0)
+            return pixel[0] if self.pixel_n_dim == 1 else tuple(pixel)
+
+        AstropyWCS.world_to_pixel_values = _world_to_pixel_values_noiter  # type: ignore[assignment]
+        AstropyWCS._zemo_world_to_pixel_noiter = True  # type: ignore[attr-defined]
 except Exception:
     AstropyWCS = None
     proj_plane_pixel_scales = None
@@ -1520,10 +1530,16 @@ def estimate_overlap_pairs(
                 dtype=np.float64,
             )
             world = wcs_obj.pixel_to_world(corners[:, 0], corners[:, 1])
-            px, py = final_output_wcs.world_to_pixel(world)
-            if px is None or py is None:
+            ra_vals = getattr(world, "ra", None)
+            dec_vals = getattr(world, "dec", None)
+            if ra_vals is None or dec_vals is None:
                 footprints.append(None)
                 continue
+            px, py = final_output_wcs.wcs_world2pix(
+                np.asarray(ra_vals.deg, dtype=np.float64),
+                np.asarray(dec_vals.deg, dtype=np.float64),
+                0,
+            )
             px = np.asarray(px, dtype=np.float64)
             py = np.asarray(py, dtype=np.float64)
             if not np.isfinite(px).any() or not np.isfinite(py).any():

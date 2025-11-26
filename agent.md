@@ -1,124 +1,172 @@
-✅ agent.md (prêt pour Codex High / Max)
+Mission : Corriger les régressions d’alignement et de couleur introduites après le commit 38c876a
 
-Mission : Corriger la régression d’alignement introduite dans la branche V4WIP
+Le commit 38c876a est confirmé comme dernier état fonctionnel.
 
-🎯 Objectif
+Deux régressions distinctes sont apparues dans V4WIP :
 
-Corriger la déformation géométrique observée dans la branche V4WIP lors de l’empilement classique.
-La cause est en amont de la voie GPU : elle provient de la phase d’alignement CPU, plus précisément de la fonction align_images_in_group dans le fichier zemosaic_align_stack.py.
+Déformation géométrique + mauvais alignement
 
-Le GPU empile simplement les images alignées : ne rien modifier dans la voie GPU.
+Dérive colorimétrique vers le vert
 
-📌 Contexte + Hypothèse principale
+L’objectif est de corriger les deux, sans toucher à la voie GPU.
 
-Dans V4WIP, les images présentent une déformation ou un étirement qui n’existait pas en V4.2.5.
+🎯 Objectifs
 
-La pipeline d’alignement CPU fonctionne en deux étapes :
+ Restaurer un WCS valide (plus d’erreur all_world2pix failed to converge)
 
-pré-alignement par FFT / corrélation de phase
+ Restaurer un alignement géométrique correct équivalent à 38c876a
 
-alignement fin via astroalign.register(source, target) (transformation affine)
+ Corriger la dérive verte (balance RVB)
 
-La déformation est générée dans cette étape CPU, jamais dans la voie GPU.
+ Garantir la stabilité multi-thread (Phase 3)
 
-On suspecte :
+ Ne modifier aucun fichier GPU (zemosaic_align_stack_gpu.py)
 
-soit une modification du pré-alignement FFT (mauvais décalage appliqué en amont)
+📌 Contexte & Hypothèses
+Hypothèse 1 — Instabilité numérique dans la transformation WCS
 
-soit une déviation des données d'entrée envoyées à astroalign
+Les logs montrent une `UserWarning` d'Astropy :
 
-soit une erreur dans l’usage ou l’interprétation de la transformation retournée par astroalign
+`WCS.all_world2pix failed to converge`
 
-Mais pas un bug GPU.
+**Analyse de l'erreur :**
+Cette erreur indique que l'algorithme itératif utilisé par Astropy pour convertir des coordonnées mondiales (célestes) en coordonnées de pixels n'a pas trouvé de solution stable. Ce n'est pas nécessairement un signe de WCS corrompu, mais plutôt d'une **instabilité numérique**.
 
-📁 Fichiers à modifier (et uniquement ceux-là)
+**Causes possibles :**
+1.  Les coordonnées mondiales demandées sont très éloignées de la zone de l'image.
+2.  Le modèle de distorsion (WCS) est très prononcé.
+3.  L'appel à `all_world2pix` est connu pour être moins robuste que d'autres fonctions dans certains cas.
 
-zemosaic_align_stack.py
-👉 fonction : align_images_in_group
+**Action recommandée par Astropy :**
+La documentation et la communauté Astropy suggèrent de remplacer `wcs.all_world2pix` par `wcs.wcs_world2pix` pour les conversions de paires de coordonnées, car cette dernière implémente un algorithme plus robuste. Le problème n'est donc probablement pas dans la création du WCS (`_parse_wcs_file_content_za_v2`), mais dans son **utilisation**.
 
-🚫 Ne pas modifier :
+Hypothèse 2 — Alignement local (FFT + astroalign) potentiellement touché
 
-zemosaic_align_stack_gpu.py
+⚠️ Très important :
+Si les master tiles elles-mêmes sont déjà déformées, le bug n’est pas uniquement WCS.
 
-aucune fonction GPU, aucun kernel, aucune logique de coadd.
+Dans ce cas, la fonction à inspecter est :
 
-💡 Tâches à effectuer
-1. Isoler et analyser l’étape fautive
+`align_images_in_group` dans `zemosaic_align_stack.py`
 
-Instrumenter align_images_in_group pour comparer :
+Cette fonction utilise :
 
-le résultat FFT (dx, dy, conf)
+pré-alignement FFT
 
-les entrées source et target envoyées à astroalign
+alignement fin avec `astroalign.register`
 
-la transformation affine retournée par astroalign.register()
+Une régression locale (pré-alignement, warp, dtype, normalisation) peut provoquer une déformation même hors WCS.
 
-2. Comparer contre V4.2.5
+Hypothèse 3 — Dérive colorimétrique vers le vert
 
-Pour un même jeu d’images, logguer :
+Probable cause :
 
-les images “pré-alignées FFT”
+mauvaise balance des gains dans la fonction
+`equalize_rgb_medians_inplace`
+(appelée via `_poststack_rgb_equalization`).
 
-la transformation affine retournée
+Cette fonction calcule des gains canal par canal.
+Une médiane faussée, un clipping ou un double-apply provoque rapidement un `green cast`.
 
-l’image alignée finale
+📁 Fichiers à analyser et éventuellement corriger
+Priorité 1
 
-3. Créer un mode “FFT-only” (temporaire, activable par flag interne)
+ **Localiser les appels à `.all_world2pix`** dans le code (probablement dans `zemosaic_worker.py` ou `zemosaic_utils.py`) et les remplacer.
 
-Permettra de tester :
+Priorité 2
 
-skip_astroalign = True
+ `zemosaic_align_stack.py`
 
+`align_images_in_group`
 
-Si la déformation disparaît → la cause est bien dans la seconde étape.
+`equalize_rgb_medians_inplace`
 
-⚠️ Ce flag doit être temporaire et non exposé à l’utilisateur.
+`_poststack_rgb_equalization`
 
-4. Corriger la cause
+ `zemosaic_astrometry.py` (si le remplacement de `all_world2pix` ne suffit pas)
 
-Selon ce que les logs révéleront :
+`_parse_wcs_file_content_za_v2`
 
-mauvais couple source/target ?
+🚫 À ne jamais modifier
 
-décalage FFT appliqué deux fois ?
+ `zemosaic_align_stack_gpu.py`
 
-cropping / normalisation incorrecte ?
+ Tout kernel ou pipeline GPU
+(Le GPU empile seulement → les déformations viennent avant.)
 
-mauvaise orientation / dtype incompatible ?
+💡 Tâches détaillées
+✔️ Étape 1 — Correction de l'instabilité WCS
 
-application erronée de la matrice de transformation ?
+ **Action immédiate :** Remplacer les appels à `wcs.all_world2pix` par `wcs.wcs_world2pix`. Cette fonction est plus stable pour les transformations de coordonnées. Il faudra adapter le code si les entrées/sorties diffèrent légèrement (ex: gestion de tableaux).
 
-L’objectif est de restaurer le comportement exact de V4.2.5.
+ **Vérifier** la disparition de la `UserWarning`:
+`WCS.all_world2pix failed to converge`
 
-5. Robustifier l'appel à astroalign
+✔️ Étape 2 — Validation géométrique
+🎯 Test crucial : mono-thread
 
-Vérifier input shapes (H, W) vs (H, W, 3)
+Pour exclure une race condition :
 
-S'assurer que la normalisation en float32 est identique à V4.2.5
+ Forcer Phase 3 en mono-thread :
 
-Forcer éventuellement un “sanity check” sur la matrice retournée
+`winsor_worker_limit = 1`
 
-6. Ne pas toucher à la partie GPU
+`actual_num_workers_ph3 = 1`
 
-Le GPU reçoit des images déjà warpées.
-Toute déformation provient avant l’empilement.
+ Retraiter un dataset problématique
 
-✔️ Validation
+ Comparer master tiles mono-thread vs multi-thread
 
-Le correctif est réussi si :
+Si déformation présente dans les deux → ce n'est pas un bug multi-thread.
 
-un jeu d’images problématique en V4WIP reprend la forme correcte obtenue en V4.2.5
+🎯 Inspecter l’alignement intra-tile (`align_images_in_group`)
 
-aucune transformation affine aberrante n’apparaît dans les logs
+Si les master tiles montrent déjà la déformation, alors :
 
-le pipeline CPU reste compatible avec la voie GPU existante
+ Instrumenter `align_images_in_group`
 
-aucun changement ne touche SDS ou GPU
+ Tracer :
 
-➤ Livrables attendus
+ `dx, dy` FFT
 
-Patchs sur zemosaic_align_stack.py
+ image source et référence envoyées à `astroalign`
 
-Petits logs de debug pour comparaison V4.2.5 / V4WIP
+ matrice affine retournée par `astroalign.register`
 
-Aucun changement GPU
+ `shape`, `dtype` et normalisation des entrées
+
+ Comparer le comportement à celui du commit 38c876a
+
+✔️ Étape 3 — Correction du green cast
+
+ Inspecter `equalize_rgb_medians_inplace`
+
+ Logguer :
+
+ médiane R, G, B
+
+ gains appliqués
+
+ avant/après
+
+ Vérifier pas de double-application
+
+ S'assurer que la normalisation RGB est identique à celle de 38c876a
+
+ Corriger l’algorithme pour obtenir une balance neutre
+
+✔️ Validation finale
+
+Le correctif est validé lorsque, pour un même dataset :
+
+ Plus d’erreur WCS `...failed to converge`.
+
+ Les master tiles sont géométriquement correctes.
+
+ La mosaïque finale ne présente aucune déformation.
+
+ La balance des couleurs est neutre.
+
+ Aucun changement n’a touché la voie GPU.
+
+ Le comportement est identique ou meilleur que 38c876a.

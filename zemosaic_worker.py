@@ -2859,9 +2859,15 @@ def _phase45_compute_cutout_wcs(final_wcs: Any, final_shape_hw: tuple[int, int] 
         if sky is None:
             continue
         try:
-            px, py = wcs_copy.world_to_pixel(sky)
-            if px is None or py is None:
+            ra_vals = getattr(sky, "ra", None)
+            dec_vals = getattr(sky, "dec", None)
+            if ra_vals is None or dec_vals is None:
                 continue
+            px, py = wcs_copy.wcs_world2pix(
+                np.asarray(ra_vals.deg, dtype=np.float64),
+                np.asarray(dec_vals.deg, dtype=np.float64),
+                0,
+            )
             px = np.asarray(px, dtype=np.float64)
             py = np.asarray(py, dtype=np.float64)
         except Exception:
@@ -18647,16 +18653,11 @@ def _assemble_global_mosaic_first_impl(
         if footprint_arr.ndim != 2 or footprint_arr.shape[1] < 2:
             return None
         try:
-            xs, ys = global_wcs_obj.world_to_pixel_values(
-                footprint_arr[:, 0], footprint_arr[:, 1]
+            xs, ys = global_wcs_obj.wcs_world2pix(
+                footprint_arr[:, 0], footprint_arr[:, 1], 0
             )
         except Exception:
-            try:
-                xs, ys = global_wcs_obj.world_to_pixel(
-                    footprint_arr[:, 0], footprint_arr[:, 1]
-                )
-            except Exception:
-                return None
+            return None
         xs = np.asarray(xs, dtype=np.float64)
         ys = np.asarray(ys, dtype=np.float64)
         if xs.size == 0 or ys.size == 0:
@@ -19661,7 +19662,15 @@ def assemble_global_mosaic_sds(
                 rows = np.array([0, 0, h_local - 1, h_local - 1], dtype=float)
                 cols = np.array([0, w_local - 1, 0, w_local - 1], dtype=float)
                 world_coords = local_wcs.pixel_to_world(cols, rows)
-                g_cols, g_rows = global_wcs_obj.world_to_pixel(world_coords)
+                ra_vals = getattr(world_coords, "ra", None)
+                dec_vals = getattr(world_coords, "dec", None)
+                if ra_vals is None or dec_vals is None:
+                    continue
+                g_cols, g_rows = global_wcs_obj.wcs_world2pix(
+                    np.asarray(ra_vals.deg, dtype=np.float64),
+                    np.asarray(dec_vals.deg, dtype=np.float64),
+                    0,
+                )
             except Exception:
                 continue
             if g_cols is None or g_rows is None:

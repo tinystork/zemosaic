@@ -862,7 +862,8 @@ def _parse_wcs_file_content_za_v2(wcs_file_path, image_shape_hw, progress_callba
     - Lis en binaire puis nettoie les caracteres non-ASCII (ASTAP peut ecrire des degres/alpha/delta).
     - Supprime les cartes CONTINUE orphelines.
     - Tente WCS via chaine brute puis via fits.Header.
-    - Force pixel_shape si possible et sanitise image_shape_hw.
+    - Force pixel_shape/array_shape si possible et sanitise image_shape_hw.
+    - Valide la matrice CD/PC pour éviter les WCS dégénérés.
     """
     path_obj = _expand_path(wcs_file_path, expanduser=False)
     filename_log = _path_display_name(path_obj or wcs_file_path)
@@ -900,6 +901,156 @@ def _parse_wcs_file_content_za_v2(wcs_file_path, image_shape_hw, progress_callba
     except Exception:
         sane_shape_hw = None
 
+    def _set_wcs_shapes(wcs_obj):
+        """Set pixel_shape/array_shape when possible."""
+        if not wcs_obj or not sane_shape_hw:
+            return
+        h, w = sane_shape_hw
+        if h <= 0 or w <= 0:
+            return
+        try:
+            wcs_obj.pixel_shape = (int(w), int(h))
+        except Exception as e_ps:
+            if progress_callback:
+                progress_callback(
+                    f"    ASTAP WCS Parse AVERT: echec set pixel_shape: {e_ps}",
+                    None,
+                    "WARN",
+                )
+        try:
+            wcs_obj.array_shape = (int(h), int(w))
+        except Exception:
+            pass
+
+    def _extract_cd_matrix_from_kv(kv_map: dict[str, Any]) -> np.ndarray | None:
+        """Reconstruit une matrice CD 2x2 depuis les clés CD/PC/CDELT/SCALE."""
+        try:
+            cd11 = float(kv_map.get("CD1_1")) if "CD1_1" in kv_map else None
+            cd12 = float(kv_map.get("CD1_2")) if "CD1_2" in kv_map else None
+            cd21 = float(kv_map.get("CD2_1")) if "CD2_1" in kv_map else None
+            cd22 = float(kv_map.get("CD2_2")) if "CD2_2" in kv_map else None
+            if None not in (cd11, cd12, cd21, cd22):
+                cd = np.array([[cd11, cd12], [cd21, cd22]], dtype=np.float64)
+                if np.all(np.isfinite(cd)):
+                    return cd
+        except Exception:
+            pass
+        try:
+            pc11 = float(kv_map.get("PC1_1")) if "PC1_1" in kv_map else None
+            pc12 = float(kv_map.get("PC1_2")) if "PC1_2" in kv_map else None
+            pc21 = float(kv_map.get("PC2_1")) if "PC2_1" in kv_map else None
+            pc22 = float(kv_map.get("PC2_2")) if "PC2_2" in kv_map else None
+            cdelt1 = float(kv_map.get("CDELT1")) if "CDELT1" in kv_map else None
+            cdelt2 = float(kv_map.get("CDELT2")) if "CDELT2" in kv_map else None
+            if None not in (pc11, pc12, pc21, pc22, cdelt1, cdelt2):
+                cd = np.array(
+                    [[pc11 * cdelt1, pc12 * cdelt1], [pc21 * cdelt2, pc22 * cdelt2]],
+                    dtype=np.float64,
+                )
+                if np.all(np.isfinite(cd)):
+                    return cd
+        except Exception:
+            pass
+        try:
+            for key in ("SCALE", "PIXSCAL1"):
+                if key in kv_map:
+                    s = float(kv_map[key])
+                    sdeg = s / 3600.0 if s > 1e-3 else s
+                    return np.array([[-sdeg, 0.0], [0.0, sdeg]], dtype=np.float64)
+        except Exception:
+            pass
+        return None
+
+    def _validate_wcs_matrix(wcs_obj) -> tuple[bool, str | None]:
+        """Vérifie la matrice CD/PC et la convergence world<->pixel."""
+        if not wcs_obj or not getattr(wcs_obj, "is_celestial", False):
+            return False, "not_celestial"
+        try:
+            cd = np.array(getattr(wcs_obj.wcs, "cd", None))
+            if cd is None or cd.size == 0 or cd.shape != (2, 2) or not np.all(np.isfinite(cd)):
+                # Astropy peut n'utiliser que PC/CDELT, calculer la matrice équivalente.
+                pc = np.array(getattr(wcs_obj.wcs, "pc", None))
+                cdelt = np.array(getattr(wcs_obj.wcs, "cdelt", None))
+                if pc is not None and cdelt is not None and pc.shape == (2, 2) and cdelt.size >= 2:
+                    cd = np.array(
+                        [[pc[0, 0] * cdelt[0], pc[0, 1] * cdelt[0]], [pc[1, 0] * cdelt[1], pc[1, 1] * cdelt[1]]],
+                        dtype=np.float64,
+                    )
+                else:
+                    return False, "missing_cd_matrix"
+            det = float(np.linalg.det(cd))
+            if not np.isfinite(det) or abs(det) < 1e-15:
+                return False, "singular_cd_matrix"
+            # Vérification round-trip sur CRVAL (centre)
+            crval = getattr(wcs_obj.wcs, "crval", None)
+            crpix = getattr(wcs_obj.wcs, "crpix", None)
+            if crval is not None and crpix is not None and len(crval) >= 2 and len(crpix) >= 2:
+                try:
+                    xw, yw = float(crval[0]), float(crval[1])
+                    px, py = wcs_obj.wcs_world2pix([[xw, yw]], 0)[0]
+                    if not (np.isfinite(px) and np.isfinite(py)):
+                        return False, "crval_roundtrip_nonfinite"
+                except Exception:
+                    return False, "crval_roundtrip_failed"
+            return True, None
+        except Exception as e_val:
+            return False, f"validation_exception_{type(e_val).__name__}"
+
+    def _build_header_from_kv(kv: dict[str, Any]) -> fits.Header:
+        """Construit un Header FITS robuste à partir de toutes les paires clé/valeur."""
+        hdr = fits.Header()
+        hdr["SIMPLE"] = True
+        hdr["NAXIS"] = 2
+        if sane_shape_hw:
+            hdr["NAXIS1"] = int(sane_shape_hw[1])
+            hdr["NAXIS2"] = int(sane_shape_hw[0])
+        for key, val in kv.items():
+            if key in {"COMMENT", "HISTORY", "END", "CONTINUE"}:
+                continue
+            try:
+                hdr[key] = val
+            except Exception:
+                # Ignore cartes non compatibles FITS
+                pass
+        if "WCSAXES" not in hdr or int(hdr.get("WCSAXES", 0) or 0) < 2:
+            hdr["WCSAXES"] = 2
+        return hdr
+
+    def _parse_kv_pairs(lines_iter: list[str]) -> dict[str, Any]:
+        """Parse chaque ligne KEY = VALUE en dict clé/valeur Python."""
+        import re
+
+        kv_local: dict[str, Any] = {}
+        for raw in lines_iter:
+            line = raw.strip()
+            if not line:
+                continue
+            up8 = line[:8].strip().upper()
+            if up8 in {"COMMENT", "HISTORY", "END", "CONTINUE"}:
+                continue
+            m = re.match(r"^\s*([A-Za-z0-9_]+)\s*=\s*(.*)$", line)
+            if not m:
+                continue
+            key = m.group(1).upper()
+            rest = m.group(2)
+            if "/" in rest:
+                rest = rest.split("/", 1)[0].rstrip()
+            rest = rest.strip()
+            if (len(rest) >= 2) and ((rest[0] == rest[-1]) and rest[0] in ("'", '"')):
+                val: object = rest[1:-1]
+            else:
+                upper_rest = rest.upper()
+                if upper_rest in {"T", "F"}:
+                    val = True if upper_rest == "T" else False
+                else:
+                    rest_num = re.sub(r"([0-9])[dD]([+-]?[0-9]+)", r"\1E\2", rest)
+                    try:
+                        val = float(rest_num) if any(c in rest_num for c in (".", "E", "e", "+", "-")) else int(rest_num)
+                    except Exception:
+                        val = rest
+            kv_local[key] = val
+        return kv_local
+
     try:
         with open(open_target, 'rb') as f:
             raw_bytes = f.read()
@@ -919,6 +1070,7 @@ def _parse_wcs_file_content_za_v2(wcs_file_path, image_shape_hw, progress_callba
         lines = wcs_text_norm.split('\n')
         lines_no_continue = [ln for ln in lines if not ln.lstrip().upper().startswith('CONTINUE')]
         cleaned_text = '\n'.join(lines_no_continue)
+        kv_pairs = _parse_kv_pairs(lines_no_continue)
 
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", FITSFixedWarning)
@@ -937,107 +1089,55 @@ def _parse_wcs_file_content_za_v2(wcs_file_path, image_shape_hw, progress_callba
         # If still failing, try manual key/value parse to build a minimal WCS header
         if (not wcs_obj) or (not getattr(wcs_obj, 'is_celestial', False)):
             try:
-                import re
-                kv = {}
-                for raw in lines_no_continue:
-                    line = raw.strip()
-                    if not line:
-                        continue
-                    up8 = line[:8].strip().upper()
-                    if up8 in {"COMMENT", "HISTORY", "END", "CONTINUE"}:
-                        continue
-                    # Try KEY = VALUE / comment
-                    m = re.match(r"^\s*([A-Za-z0-9_]+)\s*=\s*(.*)$", line)
-                    if not m:
-                        continue
-                    key = m.group(1).upper()
-                    rest = m.group(2)
-                    # Strip inline comment
-                    if "/" in rest:
-                        rest = rest.split("/", 1)[0].rstrip()
-                    rest = rest.strip()
-                    # Unquote strings
-                    if (len(rest) >= 2) and ((rest[0] == rest[-1]) and rest[0] in ("'", '"')):
-                        val: object = rest[1:-1]
-                    else:
-                        # Convert FITS-like booleans and numbers (handle D exponents)
-                        if rest.upper() in ("T", "F"):
-                            val = True if rest.upper() == "T" else False
-                        else:
-                            rest_num = re.sub(r"([0-9])[dD]([+-]?[0-9]+)", r"\1E\2", rest)
-                            try:
-                                if "." in rest_num or "E" in rest_num.upper() or "-" in rest_num or "+" in rest_num:
-                                    val = float(rest_num)
-                                else:
-                                    val = int(rest_num)
-                            except Exception:
-                                val = rest
-                    kv[key] = val
-
-                # Build a minimal FITS header with WCS keys only
-                wcs_keys = [
-                    "WCSAXES","CRPIX1","CRPIX2","CRVAL1","CRVAL2",
-                    "CTYPE1","CTYPE2","CUNIT1","CUNIT2",
-                    "CD1_1","CD1_2","CD2_1","CD2_2",
-                    "PC1_1","PC1_2","PC2_1","PC2_2",
-                    "CDELT1","CDELT2","CROTA2","CROTA1",
-                    "LONPOLE","LATPOLE","EQUINOX","RADESYS",
-                ]
-                hdr_min = fits.Header()
-                hdr_min["SIMPLE"] = True
-                hdr_min["NAXIS"] = 2
-                if sane_shape_hw:
-                    hdr_min["NAXIS1"] = int(sane_shape_hw[1])
-                    hdr_min["NAXIS2"] = int(sane_shape_hw[0])
-                for k in wcs_keys:
-                    if k in kv:
-                        try:
-                            hdr_min[k] = kv[k]
-                        except Exception:
-                            pass
-                # If neither CD nor PC/CDELT present, try to infer from SCALE or PIXSCAL1
-                if ("CD1_1" not in hdr_min) and ("PC1_1" not in hdr_min) and ("CDELT1" not in hdr_min):
+                hdr_from_kv = _build_header_from_kv(kv_pairs)
+                # Si aucune matrice n'est présente, tenter d'en déduire une depuis SCALE/PIXSCAL1
+                if not _extract_cd_matrix_from_kv(kv_pairs):
                     for fallback_scale_key in ("SCALE", "PIXSCAL1"):
-                        if fallback_scale_key in kv:
+                        if fallback_scale_key in kv_pairs:
                             try:
-                                s = float(kv[fallback_scale_key])
-                                # assume square pixels, degrees per pixel if units unknown -> convert arcsec to deg if large
-                                if s > 1e-3:  # likely arcsec/pix
-                                    sdeg = s / 3600.0
-                                else:
-                                    sdeg = s
-                                hdr_min["CDELT1"] = -sdeg
-                                hdr_min["CDELT2"] = sdeg
-                                hdr_min["CTYPE1"] = hdr_min.get("CTYPE1", "RA---TAN")
-                                hdr_min["CTYPE2"] = hdr_min.get("CTYPE2", "DEC--TAN")
+                                s = float(kv_pairs[fallback_scale_key])
+                                sdeg = s / 3600.0 if s > 1e-3 else s
+                                hdr_from_kv["CDELT1"] = -sdeg
+                                hdr_from_kv["CDELT2"] = sdeg
+                                hdr_from_kv["CTYPE1"] = hdr_from_kv.get("CTYPE1", "RA---TAN")
+                                hdr_from_kv["CTYPE2"] = hdr_from_kv.get("CTYPE2", "DEC--TAN")
                             except Exception:
                                 pass
                             break
-
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore", FITSFixedWarning)
-                    wcs_obj = AstropyWCS(hdr_min, naxis=2, relax=True)
+                    wcs_obj = AstropyWCS(hdr_from_kv, naxis=2, relax=True)
             except Exception as e_build:
                 last_err = e_build
 
         if wcs_obj and getattr(wcs_obj, 'is_celestial', False):
-            if sane_shape_hw and sane_shape_hw[0] > 0 and sane_shape_hw[1] > 0:
-                try:
-                    wcs_obj.pixel_shape = (int(sane_shape_hw[1]), int(sane_shape_hw[0]))
-                except Exception as e_ps:
-                    if progress_callback:
-                        progress_callback(
-                            f"    ASTAP WCS Parse AVERT: echec set pixel_shape: {e_ps}",
-                            None,
-                            "WARN",
-                        )
-            if progress_callback:
-                progress_callback(
-                    f"    ASTAP WCS Parse: Objet WCS parse (v2) avec succes depuis '{filename_log}'.",
-                    None,
-                    "DEBUG_DETAIL",
-                )
-            return wcs_obj
+            _set_wcs_shapes(wcs_obj)
+            # Si la matrice est manquante ou dégénérée, tenter de la reconstruire depuis les clés brutes
+            is_valid_matrix, reason_invalid = _validate_wcs_matrix(wcs_obj)
+            if (not is_valid_matrix) and kv_pairs:
+                cd_matrix = _extract_cd_matrix_from_kv(kv_pairs)
+                if cd_matrix is not None:
+                    try:
+                        wcs_obj.wcs.cd = cd_matrix
+                        wcs_obj.wcs.set()
+                        is_valid_matrix, reason_invalid = _validate_wcs_matrix(wcs_obj)
+                    except Exception as e_cdset:
+                        reason_invalid = f"cd_set_failed_{e_cdset}"
+            if is_valid_matrix:
+                if progress_callback:
+                    progress_callback(
+                        f"    ASTAP WCS Parse: Objet WCS parse (v2) avec succes depuis '{filename_log}'.",
+                        None,
+                        "DEBUG_DETAIL",
+                    )
+                return wcs_obj
+            else:
+                if progress_callback:
+                    progress_callback(
+                        f"    ASTAP WCS Parse ERREUR: WCS dégénéré '{filename_log}' ({reason_invalid}).",
+                        None,
+                        "WARN",
+                    )
 
         if progress_callback:
             detail = str(last_err) if 'last_err' in locals() and last_err else 'WCS non valide'
