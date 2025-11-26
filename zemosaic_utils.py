@@ -66,6 +66,7 @@ import warnings
 import traceback
 import gc
 import importlib.util
+import inspect
 
 # --- Optional Astropy WCS import (lightweight, guarded) ----------------------
 ASTROPY_WCS_AVAILABLE_IN_UTILS = False
@@ -3787,6 +3788,7 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
 
     progress_callback = kwargs.pop("progress_callback", None)
     tile_weights_param = kwargs.pop("tile_weights", None)
+    tile_weight_maps_param = kwargs.pop("tile_weight_maps", None)
     if not gpu_is_available():
         _log_gpu_event(
             "gpu_fallback_unavailable",
@@ -3904,6 +3906,23 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
     def _prepare_tile_arrays(idx: int) -> tuple[cp.ndarray, cp.ndarray]:
         arr = np.asarray(data_list[idx], dtype=np.float32)
         img = cp.asarray(arr)
+        weight_map_gpu = None
+        if tile_weight_maps_param is not None and idx < len(tile_weight_maps_param or []):
+            wm_candidate = tile_weight_maps_param[idx]
+            if wm_candidate is not None:
+                try:
+                    wm_arr = np.asarray(wm_candidate, dtype=np.float32)
+                    if wm_arr.ndim > 2:
+                        wm_arr = np.squeeze(wm_arr)
+                    if wm_arr.shape != arr.shape:
+                        try:
+                            wm_arr = wm_arr.reshape(arr.shape)
+                        except Exception:
+                            wm_arr = None
+                    if wm_arr is not None:
+                        weight_map_gpu = cp.asarray(wm_arr)
+                except Exception:
+                    weight_map_gpu = None
         if tile_affine is not None:
             gain_val, offset_val = tile_affine[idx]
             if gain_val != 1.0:
@@ -3922,6 +3941,9 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
                 img = img - cp.float32(offset_val)
         mask = cp.isfinite(img).astype(cp.float32)
         img = cp.nan_to_num(img, copy=False, nan=0.0)
+        if weight_map_gpu is not None:
+            weight_map_gpu = cp.maximum(weight_map_gpu, 0.0).astype(cp.float32, copy=False)
+            mask = mask * weight_map_gpu
         return img, mask
 
     def _build_world_chunk_grid(rows_per_chunk: int) -> list[tuple[int, int, np.ndarray, np.ndarray]]:
@@ -4253,6 +4275,7 @@ def _reproject_and_coadd_wrapper_impl(
     allow_cpu_fallback: bool = True,
     progress_callback=None,
     tile_weights=None,
+    tile_weight_maps=None,
     **kwargs,
 ):
     """Dispatch to GPU or CPU reproject+coadd.
@@ -4284,6 +4307,43 @@ def _reproject_and_coadd_wrapper_impl(
             normalized.extend([1.0] * (n_expected - len(normalized)))
         return normalized
 
+    def _normalize_weight_maps(weight_maps_obj, ref_shapes: list[tuple[int, ...]]) -> list[np.ndarray | None] | None:
+        """Coerce optional per-tile weight maps to float32 arrays matching *ref_shapes*."""
+
+        if weight_maps_obj is None:
+            return None
+        try:
+            iterable = list(weight_maps_obj)
+        except Exception:
+            iterable = [weight_maps_obj]
+        normalized: list[np.ndarray | None] = []
+        expected = len(ref_shapes)
+        if len(iterable) < expected:
+            iterable = list(iterable) + [None] * (expected - len(iterable))
+        for idx, ref_shape in enumerate(ref_shapes):
+            wm = iterable[idx]
+            if wm is None:
+                normalized.append(None)
+                continue
+            try:
+                arr = np.asarray(wm, dtype=np.float32)
+            except Exception:
+                normalized.append(None)
+                continue
+            if arr.ndim > 2:
+                arr = np.squeeze(arr)
+            if arr.ndim == 1:
+                normalized.append(None)
+                continue
+            if arr.shape != ref_shape:
+                try:
+                    arr = arr.reshape(ref_shape)
+                except Exception:
+                    normalized.append(None)
+                    continue
+            normalized.append(arr.astype(np.float32, copy=False))
+        return normalized
+
     def _output_is_valid(mosaic, coverage) -> bool:
         """Basic sanity check to avoid returning empty/NaN GPU results."""
 
@@ -4304,21 +4364,19 @@ def _reproject_and_coadd_wrapper_impl(
             return False
 
     normalized_weights = _normalize_tile_weights(tile_weights, len(data_list))
+    try:
+        ref_shapes = [np.asarray(d).shape for d in data_list]
+    except Exception:
+        ref_shapes = [tuple() for _ in data_list]
+    normalized_weight_maps = _normalize_weight_maps(tile_weight_maps, ref_shapes)
     match_background_flag = bool(kwargs.get("match_background", kwargs.get("match_bg", False)))
-    cpu_accepts_match_bg = False
-    if cpu_func is not None:
-        try:
-            sig = inspect.signature(cpu_func)
-            cpu_accepts_match_bg = ("match_background" in sig.parameters) or ("match_bg" in sig.parameters)
-        except Exception:
-            cpu_accepts_match_bg = False
-    if match_background_flag and not cpu_accepts_match_bg:
-        match_background_flag = False
     gpu_kwargs = dict(kwargs)
     if progress_callback is not None:
         gpu_kwargs["progress_callback"] = progress_callback
     if normalized_weights is not None:
         gpu_kwargs["tile_weights"] = normalized_weights
+    if normalized_weight_maps is not None:
+        gpu_kwargs["tile_weight_maps"] = normalized_weight_maps
     gpu_kwargs["match_background"] = match_background_flag
     gpu_kwargs["gpu_match_background"] = match_background_flag
     if use_gpu:
@@ -4360,6 +4418,17 @@ def _reproject_and_coadd_wrapper_impl(
                     raise
     if cpu_func is None:
         cpu_func = cpu_reproject_and_coadd
+    cpu_accepts_match_bg = False
+    cpu_supports_input_weights = False
+    try:
+        sig = inspect.signature(cpu_func)
+        cpu_accepts_match_bg = ("match_background" in sig.parameters) or ("match_bg" in sig.parameters)
+        cpu_supports_input_weights = "input_weights" in sig.parameters
+    except Exception:
+        cpu_accepts_match_bg = False
+        cpu_supports_input_weights = False
+    if match_background_flag and not cpu_accepts_match_bg:
+        match_background_flag = False
     # Remove GPU-only extras before CPU call to avoid unexpected kwargs
     gpu_only = {
         "bg_preview_size",
@@ -4374,7 +4443,18 @@ def _reproject_and_coadd_wrapper_impl(
     if not cpu_accepts_match_bg:
         cpu_kwargs.pop("match_background", None)
         cpu_kwargs.pop("match_bg", None)
-    if normalized_weights is not None:
+    if normalized_weight_maps is not None and cpu_supports_input_weights:
+        weights_for_cpu = []
+        for idx, arr in enumerate(normalized_weight_maps):
+            if arr is None:
+                shape_ref = ref_shapes[idx] if idx < len(ref_shapes) else tuple()
+                if shape_ref and all(dim > 0 for dim in shape_ref):
+                    arr = np.ones(shape_ref, dtype=np.float32)
+                else:
+                    arr = np.ones(shape_out, dtype=np.float32)
+            weights_for_cpu.append(arr)
+        cpu_kwargs["input_weights"] = weights_for_cpu
+    elif normalized_weights is not None:
         weight_maps = []
         for arr, w in zip(data_list, normalized_weights):
             arr_np = np.asarray(arr, dtype=np.float32)
@@ -4406,6 +4486,7 @@ def reproject_and_coadd_wrapper(
     allow_cpu_fallback: bool = True,
     progress_callback=None,
     tile_weights=None,
+    tile_weight_maps=None,
     **kwargs,
 ):
     """Dispatch to CPU or GPU ``reproject_and_coadd`` depending on availability."""
@@ -4418,6 +4499,7 @@ def reproject_and_coadd_wrapper(
         allow_cpu_fallback=allow_cpu_fallback,
         progress_callback=progress_callback,
         tile_weights=tile_weights,
+        tile_weight_maps=tile_weight_maps,
         **kwargs,
     )
 

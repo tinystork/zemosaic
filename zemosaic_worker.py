@@ -6664,6 +6664,19 @@ def _run_shared_phase45_phase5_pipeline(
     parallel_plan = phase5_options.get("parallel_plan")
     tile_weighting_enabled_flag = bool(phase5_options.get("tile_weighting_enabled"))
     tile_weight_mode = str(phase5_options.get("tile_weight_mode") or "n_frames")
+    apply_radial_weight_config = bool(phase5_options.get("apply_radial_weight"))
+    try:
+        radial_feather_fraction_config = float(phase5_options.get("radial_feather_fraction") or 0.0)
+    except Exception:
+        radial_feather_fraction_config = 0.0
+    try:
+        radial_shape_power_config = float(phase5_options.get("radial_shape_power") or 0.0)
+    except Exception:
+        radial_shape_power_config = 0.0
+    try:
+        min_radial_weight_floor_config = float(phase5_options.get("min_radial_weight_floor") or 0.0)
+    except Exception:
+        min_radial_weight_floor_config = 0.0
     worker_config_cache = phase45_options.get("worker_config") or {}
     parallel_caps_option = phase5_options.get("parallel_capabilities")
     telemetry_ctrl = phase5_options.get("telemetry")
@@ -6956,6 +6969,10 @@ def _run_shared_phase45_phase5_pipeline(
                 enable_tile_weighting=tile_weighting_enabled_flag,
                 tile_weight_mode=tile_weight_mode,
                 stats_callback=_emit_phase5_stats,
+                apply_radial_weight=bool(apply_radial_weight_config),
+                radial_feather_fraction=float(radial_feather_fraction_config),
+                radial_shape_power=float(radial_shape_power_config),
+                min_radial_weight_floor=float(min_radial_weight_floor_config),
             )
         except Exception as exc:
             logger.exception("Reproject+Coadd assembly failed", exc_info=True)
@@ -6980,6 +6997,10 @@ def _run_shared_phase45_phase5_pipeline(
                 valid_master_tiles_for_assembly,
                 apply_crop=apply_crop_for_assembly,
                 crop_percent=master_tile_crop_percent_config,
+                apply_radial_weight=bool(apply_radial_weight_config),
+                radial_feather_fraction=float(radial_feather_fraction_config),
+                radial_shape_power=float(radial_shape_power_config),
+                min_radial_weight_floor=float(min_radial_weight_floor_config),
                 logger=logger,
             )
 
@@ -6989,9 +7010,12 @@ def _run_shared_phase45_phase5_pipeline(
         final_mosaic_data_HWC,
         final_mosaic_coverage_HW,
         final_alpha_map,
-        enable_lecropper_pipeline=False,
+        enable_lecropper_pipeline=bool(
+            final_quality_pipeline_cfg.get("quality_crop_enabled")
+            or final_quality_pipeline_cfg.get("altaz_cleanup_enabled")
+        ),
         pipeline_cfg=final_quality_pipeline_cfg,
-        enable_master_tile_crop=False,
+        enable_master_tile_crop=bool(apply_master_tile_crop_config and not quality_crop_enabled_config),
         master_tile_crop_percent=master_tile_crop_percent_config,
         two_pass_enabled=bool(two_pass_enabled),
         two_pass_sigma_px=two_pass_sigma_px,
@@ -11756,6 +11780,10 @@ def assemble_final_mosaic_reproject_coadd(
     enable_tile_weighting: bool = False,
     tile_weight_mode: str | None = None,
     stats_callback: Callable[[int, int, bool], None] | None = None,
+    apply_radial_weight: bool = False,
+    radial_feather_fraction: float = 0.92,
+    radial_shape_power: float = 2.0,
+    min_radial_weight_floor: float = 0.10,
 ):
     """Assemble les master tiles en utilisant ``reproject_and_coadd``."""
     _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
@@ -12101,6 +12129,29 @@ def assemble_final_mosaic_reproject_coadd(
                 np.any(np.isfinite(data), axis=-1) if data.ndim == 3 else np.isfinite(data)
             )
             coverage_mask_entry = valid_pixels.astype(np.float32)
+
+        if apply_radial_weight and ZEMOSAIC_UTILS_AVAILABLE and hasattr(zemosaic_utils, "make_radial_weight_map"):
+            weight_map_entry: np.ndarray | None = None
+            try:
+                weight_map_entry = zemosaic_utils.make_radial_weight_map(
+                    data.shape[0],
+                    data.shape[1],
+                    feather_fraction=float(radial_feather_fraction),
+                    shape_power=float(radial_shape_power),
+                    min_weight_floor=float(min_radial_weight_floor),
+                ).astype(np.float32, copy=False)
+            except Exception:
+                weight_map_entry = None
+            if weight_map_entry is not None:
+                if coverage_mask_entry is None:
+                    coverage_mask_entry = weight_map_entry
+                else:
+                    try:
+                        coverage_mask_entry = (
+                            np.asarray(coverage_mask_entry, dtype=np.float32) * weight_map_entry
+                        ).astype(np.float32, copy=False)
+                    except Exception:
+                        coverage_mask_entry = None
 
         tile_weight_value = 1.0
         if tile_weighting_active and weight_mode_normalized == "n_frames":
@@ -12509,11 +12560,35 @@ def assemble_final_mosaic_reproject_coadd(
             data_list = [entry.get("data")[..., ch] for entry in valid_entries]
             wcs_list = [entry.get("wcs") for entry in valid_entries]
             weights_for_entries = None
-            if tile_weighting_applied:
-                weights_for_entries = [
-                    float(entry.get("tile_weight", 1.0)) if isinstance(entry, dict) else 1.0
-                    for entry in valid_entries
-                ]
+            weight_maps_for_entries: list[np.ndarray] = []
+            for idx_entry, entry in enumerate(valid_entries):
+                wm = entry.get("coverage_mask") if isinstance(entry, dict) else None
+                try:
+                    wm_arr = np.asarray(wm, dtype=np.float32) if wm is not None else None
+                except Exception:
+                    wm_arr = None
+                data_slice = data_list[idx_entry]
+                if wm_arr is None:
+                    wm_arr = np.ones_like(data_slice, dtype=np.float32)
+                else:
+                    if wm_arr.ndim > 2:
+                        wm_arr = np.squeeze(wm_arr)
+                    if wm_arr.shape != data_slice.shape:
+                        try:
+                            wm_arr = wm_arr.reshape(data_slice.shape)
+                        except Exception:
+                            wm_arr = np.ones_like(data_slice, dtype=np.float32)
+                weight_val = 1.0
+                if tile_weighting_applied:
+                    try:
+                        weight_val = float(entry.get("tile_weight", 1.0))
+                    except Exception:
+                        weight_val = 1.0
+                    if not np.isfinite(weight_val) or weight_val <= 0.0:
+                        weight_val = 1.0
+                if weight_val != 1.0:
+                    wm_arr = wm_arr * np.float32(weight_val)
+                weight_maps_for_entries.append(wm_arr)
 
             reproj_call_kwargs = dict(reproj_kwargs)
             if use_gpu:
@@ -12536,6 +12611,8 @@ def assemble_final_mosaic_reproject_coadd(
                     invoke_kwargs.pop("reproject_function", None)
                 if tile_weighting_applied and weights_for_entries is not None:
                     invoke_kwargs["tile_weights"] = weights_for_entries
+                if weight_maps_for_entries is not None:
+                    invoke_kwargs["tile_weight_maps"] = weight_maps_for_entries
                 return zemosaic_utils.reproject_and_coadd_wrapper(
                     data_list=data_list,
                     wcs_list=wcs_list,
@@ -12771,6 +12848,10 @@ def _load_master_tiles_for_two_pass(
     *,
     apply_crop: bool,
     crop_percent: float,
+    apply_radial_weight: bool = False,
+    radial_feather_fraction: float = 0.92,
+    radial_shape_power: float = 2.0,
+    min_radial_weight_floor: float = 0.10,
     logger=None,
 ):
     """Load master tiles from disk for the coverage renormalization pass."""
@@ -12850,6 +12931,24 @@ def _load_master_tiles_for_two_pass(
                         _safe_basename(tile_path),
                         exc,
                     )
+        if apply_radial_weight and ZEMOSAIC_UTILS_AVAILABLE and hasattr(zemosaic_utils, "make_radial_weight_map"):
+            try:
+                radial_map = zemosaic_utils.make_radial_weight_map(
+                    data.shape[0],
+                    data.shape[1],
+                    feather_fraction=float(radial_feather_fraction),
+                    shape_power=float(radial_shape_power),
+                    min_weight_floor=float(min_radial_weight_floor),
+                ).astype(np.float32, copy=False)
+                if coverage_map is None:
+                    coverage_map = radial_map
+                else:
+                    coverage_map = (
+                        np.asarray(coverage_map, dtype=np.float32) * radial_map
+                    ).astype(np.float32, copy=False)
+            except Exception as exc:
+                if logger:
+                    logger.debug("[TwoPass] Radial weight map failed for %s: %s", _safe_basename(tile_path), exc)
         tiles.append(np.asarray(data, dtype=np.float32))
         tiles_wcs.append(current_wcs)
         coverage_masks.append(np.asarray(coverage_map, dtype=np.float32) if coverage_map is not None else None)
@@ -16363,6 +16462,10 @@ def run_hierarchical_mosaic(
             "sds_mode": bool(sds_mode_flag),
             "tile_weighting_enabled": tile_weighting_allowed,
             "tile_weight_mode": tile_weight_mode_config,
+            "apply_radial_weight": apply_radial_weight_config,
+            "radial_feather_fraction": radial_feather_fraction_config,
+            "radial_shape_power": radial_shape_power_config,
+            "min_radial_weight_floor": min_radial_weight_floor_config,
         }
 
     def _ensure_plan_descriptor_loaded(plan: dict[str, Any]) -> None:

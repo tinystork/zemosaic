@@ -74,3 +74,12 @@ le two-pass renorm a bien tourné (ou a été désactivé proprement).
 Si quelque chose t’oblige à toucher à une zone “hors scope” (CPU/GPU, SDS, clustering, GUI…), merci de l’indiquer clairement dans ta réponse, avec la justification et l’impact.
 
 Merci 🙏
+
+---
+
+État d’avancement (itération en cours) :
+
+- [x] 1️⃣ Résumé de la solution : réactivation du feather radial/alpha par tuile dans reproject+coadd (CPU/GPU) et pipeline qualité final (lecropper + crop % maître) hors SDS ; couverture SDS/two-pass alignée sur le même weighting.
+- [x] 2️⃣ Diffs et contraintes : zemosaic_worker.py (pondération radiale Phase 5, pipeline qualité activé, loader two-pass SDS), zemosaic_utils.py (tile_weight_maps CPU/GPU), tests/test_phase5_blending.py, tests/test_sds_postprocessing.py ; pas de changement de routage GPU/GUI.
+- [x] 3️⃣ Tests ajoutés/mis à jour : `tests/test_phase5_blending.py` (poids par tuile + couverture radiale + passage des flags radiaux en Phase 5), `tests/test_sds_postprocessing.py` (pipeline qualité appliqué hors SDS). Commande : `pytest tests/test_phase5_blending.py tests/test_sds_postprocessing.py -q --capture=no` (capture désactivée pour contourner un bug pytest local).
+- [x] 4️⃣ Validation visuelle & recommandations : à confirmer sur dataset utilisateur ; flags conseillés = radial_weight + quality_crop/altaz activés, two_pass_coverage_renorm selon besoin (défaut conseillé ON), CPU/GPU sur même dataset. Logs à surveiller : `[Phase5] Reproject & coadd running on ...`, `run_info_phase5_finished_reproject_coadd` et, si two-pass actif, `[TwoPass] Second pass requested` puis `[TwoPass] coverage-renorm OK`; aucune alerte `lecropper pipeline skipped`.
