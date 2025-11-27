@@ -3451,12 +3451,11 @@ def save_fits_image(image_data: np.ndarray,
     hdus_to_write = []
     primary_hdu_object = None
     if save_as_float:
-        data_to_write_temp = _ensure_float32_no_nan(image_data)
-        if not image_data_isfinite:
-            _log_util_save(
-                "SAVE_DEBUG: Valeurs non finies détectées. Remplacement par 0.0 avant export float.",
-                "WARN",
-            )
+        # Avoid an extra full-size copy if already float32 (important for huge mosaics)
+        if isinstance(image_data, np.ndarray) and image_data.dtype == np.float32:
+            data_to_write_temp = image_data
+        else:
+            data_to_write_temp = image_data.astype(np.float32, copy=False)
 
         # Ensure a zero floor for better viewer auto-stretch (ASI FITS View, etc.).
         # Some viewers expect the black level to be at 0. If our mosaic carries a
