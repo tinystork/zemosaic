@@ -3892,6 +3892,7 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
 
     progress_callback = kwargs.pop("progress_callback", None)
     tile_weights_param = kwargs.pop("tile_weights", None)
+    tile_weight_maps_param = kwargs.pop("tile_weight_maps", None)
     tile_bounds_callback = kwargs.pop("gpu_tile_bounds_callback", None)
     bounds_margin_param = kwargs.pop("gpu_bounds_margin_px", 8.0)
     try:
@@ -4414,7 +4415,15 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
                 if tile_cache is None:
                     del img_gpu, mask_gpu
             if mode == "median":
+                valid_mask = cp.any(cp.isfinite(chunk_cube), axis=0)
+                has_empty = bool(cp.any(~valid_mask).item())
+                if has_empty:
+                    # Avoid "All-NaN slice" warnings from cupy by replacing fully-empty
+                    # slices before calling nanmedian; these pixels will stay zero later.
+                    chunk_cube = cp.where(valid_mask[None, :, :], chunk_cube, cp.float32(0.0))
                 chunk_result = cp.nanmedian(chunk_cube, axis=0)
+                if has_empty:
+                    chunk_result = cp.where(valid_mask, chunk_result, cp.float32(0.0))
                 chunk_cov = cp.nansum(chunk_weight, axis=0)
             else:
                 chunk_result, chunk_cov = _winsorized_weighted_average_chunk(
