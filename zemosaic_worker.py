@@ -67,6 +67,7 @@ import threading
 import itertools
 import platform
 import importlib.util
+import sys
 import warnings
 from pathlib import Path
 from threading import Lock
@@ -93,13 +94,27 @@ from core.path_helpers import (
     safe_path_isfile,
 )
 
+lecropper = None
+_LECROPPER_AVAILABLE = False
 try:
-    import lecropper  # noqa: F401
-
+    if __package__:
+        from . import lecropper as _lecropper_module  # type: ignore
+        lecropper = _lecropper_module
+        sys.modules.setdefault("lecropper", _lecropper_module)
+    else:  # pragma: no cover - standalone script execution
+        import lecropper as _lecropper_module  # type: ignore
+        lecropper = _lecropper_module
     _LECROPPER_AVAILABLE = True
 except Exception:
-    lecropper = None
-    _LECROPPER_AVAILABLE = False
+    try:
+        import lecropper as _lecropper_module  # type: ignore
+        lecropper = _lecropper_module
+        if __package__:
+            sys.modules.setdefault(f"{__package__}.lecropper", _lecropper_module)
+        _LECROPPER_AVAILABLE = True
+    except Exception:
+        lecropper = None
+        _LECROPPER_AVAILABLE = False
 
 
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, FIRST_COMPLETED, as_completed
@@ -921,6 +936,29 @@ def _prepare_tiles_for_two_pass(
     return tiles, wcs_list, coverage_list
 
 
+def _emit_two_pass_telemetry_stage(
+    telemetry_ctrl: ResourceTelemetryController | None,
+    stage: str,
+    *,
+    force: bool = False,
+) -> None:
+    """Emit a standardized telemetry update for the two-pass pipeline."""
+
+    if telemetry_ctrl is None:
+        return
+    try:
+        telemetry_ctrl.emit_stats(
+            {
+                "phase_index": 5,
+                "phase_name": "Phase 5: Reproject & Coadd",
+                "stage": str(stage),
+            },
+            force=force,
+        )
+    except Exception:
+        pass
+
+
 def _apply_two_pass_coverage_renorm_if_requested(
     final_mosaic_data: np.ndarray | None,
     final_mosaic_coverage: np.ndarray | None,
@@ -1004,12 +1042,15 @@ def _apply_two_pass_coverage_renorm_if_requested(
                     gain_clip_tuple[0],
                     gain_clip_tuple[1],
                 )
+            _emit_two_pass_telemetry_stage(telemetry_ctrl, "two_pass_done", force=True)
         else:
             if logger:
                 logger.warning("[TwoPass] renorm failed → keeping first-pass outputs")
+            _emit_two_pass_telemetry_stage(telemetry_ctrl, "two_pass_failed", force=True)
     except Exception:
         if logger:
             logger.exception("[TwoPass] renorm exception → keeping first-pass outputs")
+        _emit_two_pass_telemetry_stage(telemetry_ctrl, "two_pass_error", force=True)
     return final_mosaic_data, final_mosaic_coverage
 
 
@@ -7817,13 +7858,10 @@ try:
 except ImportError:
     from solver_settings import SolverSettings  # type: ignore
 
-try:
-    from .lecropper import detect_autocrop_rgb as _anchor_detect_autocrop
-except ImportError:
-    try:
-        from lecropper import detect_autocrop_rgb as _anchor_detect_autocrop
-    except Exception:
-        _anchor_detect_autocrop = None
+if _LECROPPER_AVAILABLE and lecropper:
+    _anchor_detect_autocrop = getattr(lecropper, "detect_autocrop_rgb", None)
+else:
+    _anchor_detect_autocrop = None
 
 ANCHOR_AUTOCROP_AVAILABLE = callable(_anchor_detect_autocrop)
 
@@ -13470,9 +13508,11 @@ def run_second_pass_coverage_renorm(
     use_gpu_two_pass: bool | None = None,
     tiles_coverage: list[np.ndarray | None] | None = None,
     parallel_plan: ParallelPlan | None = None,
+    telemetry_ctrl: ResourceTelemetryController | None = None,
     gpu_bounds_margin_px: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Apply coverage-based gains to tiles and reproject them for a second pass."""
+
     if logger:
         logger.debug(
             "[TwoPass] run_second_pass_coverage_renorm start: tiles=%d, wcs=%d, coverage_shape=%s, sigma=%s, clip=%s",
@@ -13490,14 +13530,17 @@ def run_second_pass_coverage_renorm(
                 bool(tiles_wcs),
                 coverage_p1 is not None,
             )
+        _emit_two_pass_telemetry_stage(telemetry_ctrl, "two_pass_skipped_inputs", force=True)
         return None
     if not (REPROJECT_AVAILABLE and reproject_and_coadd and reproject_interp):
         if logger:
             logger.warning("[TwoPass] Reproject dependencies unavailable; skipping second pass")
+        _emit_two_pass_telemetry_stage(telemetry_ctrl, "two_pass_skipped_deps", force=True)
         return None
     if not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils):
         if logger:
             logger.warning("[TwoPass] zemosaic_utils unavailable; skipping second pass")
+        _emit_two_pass_telemetry_stage(telemetry_ctrl, "two_pass_skipped_utils", force=True)
         return None
     use_gpu = bool(use_gpu_two_pass)
     bounds_margin_override = None
@@ -13512,6 +13555,7 @@ def run_second_pass_coverage_renorm(
             else:
                 bounds_margin_override = max(0.0, min(256.0, bounds_margin_override))
     two_pass_bounds_logger = _make_gpu_bounds_logger("TwoPass")
+    _emit_two_pass_telemetry_stage(telemetry_ctrl, "two_pass_start", force=True)
     cpu_workers_hint: int | None = None
     plan_rows_cpu_hint: int | None = None
     plan_rows_gpu_hint: int | None = None
