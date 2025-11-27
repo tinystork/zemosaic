@@ -3746,15 +3746,20 @@ def _winsorized_weighted_average_chunk(
     low_frac, high_frac = _sanitize_winsor_limits(winsor_limits)
     low_pct = max(0.0, min(100.0, low_frac * 100.0))
     high_pct = max(0.0, min(100.0, 100.0 - high_frac * 100.0))
-    lower = xp.nanpercentile(stack, low_pct, axis=0)
-    upper = xp.nanpercentile(stack, high_pct, axis=0)
-    clipped = xp.clip(stack, lower, upper)
+    zero_scalar = xp.float32(0.0)
+    valid_mask = xp.any(xp.isfinite(stack), axis=0)
+    stack_eval = xp.where(valid_mask[None, ...], stack, zero_scalar)
+    lower = xp.nanpercentile(stack_eval, low_pct, axis=0)
+    upper = xp.nanpercentile(stack_eval, high_pct, axis=0)
+    clipped = xp.clip(stack_eval, lower, upper)
     weighted = clipped * weights
     chunk_weight = xp.nansum(weights, axis=0)
     with _xp_errstate(xp, invalid="ignore", divide="ignore"):
         chunk_result = xp.nansum(weighted, axis=0) / xp.maximum(chunk_weight, 1e-6)
     chunk_result = xp.nan_to_num(chunk_result, nan=0.0, posinf=0.0, neginf=0.0)
     chunk_weight = xp.nan_to_num(chunk_weight, nan=0.0, posinf=0.0, neginf=0.0)
+    chunk_result = xp.where(valid_mask, chunk_result, zero_scalar)
+    chunk_weight = xp.where(valid_mask, chunk_weight, zero_scalar)
     return chunk_result, chunk_weight
 
 
