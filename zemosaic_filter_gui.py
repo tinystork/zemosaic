@@ -2631,12 +2631,10 @@ def launch_filter_interface(
                     rows = np.array([0, 0, shape_hw[0] - 1, shape_hw[0] - 1], dtype=float)
                     cols = np.array([0, shape_hw[1] - 1, 0, shape_hw[1] - 1], dtype=float)
                     world_coords = local_wcs.pixel_to_world(cols, rows)
-                    g_cols, g_rows = plan_wcs.wcs_world2pix(
-                        np.asarray(world_coords.ra.deg, dtype=np.float64),
-                        np.asarray(world_coords.dec.deg, dtype=np.float64),
-                        0,
-                    )
+                    g_cols, g_rows = plan_wcs.world_to_pixel(world_coords)
                 except Exception:
+                    continue
+                if g_cols is None or g_rows is None:
                     continue
                 try:
                     x0 = int(np.floor(np.nanmin(g_cols)))
@@ -6921,11 +6919,7 @@ def launch_filter_interface(
                     return None
                 try:
                     coords = SkyCoord(ra=arr[:, 0] * u.deg, dec=arr[:, 1] * u.deg, frame="icrs")
-                    x, y = wcs_obj.wcs_world2pix(
-                        np.asarray(coords.ra.deg, dtype=np.float64),
-                        np.asarray(coords.dec.deg, dtype=np.float64),
-                        0,
-                    )
+                    x, y = wcs_obj.world_to_pixel(coords)
                     return np.column_stack([np.asarray(x, dtype=float), np.asarray(y, dtype=float)])
                 except Exception:
                     return None
@@ -6947,11 +6941,7 @@ def launch_filter_interface(
                 if wcs_obj is None:
                     return None
                 try:
-                    x, y = wcs_obj.wcs_world2pix(
-                        np.asarray(center.ra.deg, dtype=np.float64),
-                        np.asarray(center.dec.deg, dtype=np.float64),
-                        0,
-                    )
+                    x, y = wcs_obj.world_to_pixel(center)
                     return (float(x), float(y))
                 except Exception:
                     return None

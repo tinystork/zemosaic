@@ -1430,18 +1430,6 @@ def stack_winsorized_sigma_clip(
         memmap_budget_mb=memmap_budget_mb,
     )
 
-    disable_streaming = _coerce_config_bool(
-        getattr(zconfig, "stack_disable_streaming", getattr(zconfig, "winsor_disable_streaming", False)) if zconfig else False,
-        False,
-    )
-    if disable_streaming:
-        memory_plan.mode = "in_memory"
-        memory_plan.frames_per_pass = None
-        memory_plan.reason = memory_plan.reason or "streaming_disabled"
-        memory_plan.fallback_chain = [
-            item for item in (memory_plan.fallback_chain or []) if item[0] not in {"stream", "incremental"}
-        ]
-
     user_cap_stream = (
         max_frames_per_pass > 0 and len(frames_list) > max_frames_per_pass and memory_plan.mode == "in_memory"
     )
