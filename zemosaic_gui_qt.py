@@ -5439,6 +5439,18 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 self.worker_controller.stop()
             except Exception:
                 pass
+
+        # Explicitly clean up GPU resources before the application fully closes.
+        # This prevents CUDA errors during interpreter shutdown.
+        if CUPY_AVAILABLE and "cupy" in sys.modules:
+            print("[ZeMosaicQt] Cleaning up GPU resources on exit...")
+            try:
+                import cupy
+                cupy.get_default_memory_pool().free_all_blocks()
+                print("[ZeMosaicQt] GPU resources cleaned up successfully.")
+            except Exception as e:
+                print(f"[ZeMosaicQt] Error during GPU cleanup: {e}")
+
         super().closeEvent(event)
 
     # ------------------------------------------------------------------

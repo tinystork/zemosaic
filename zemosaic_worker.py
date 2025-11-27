@@ -7297,6 +7297,7 @@ WCS, SkyCoord, Angle, fits, u = None, None, None, None, None
 try:
     from astropy.io import fits as actual_fits
     from astropy.wcs import WCS as actual_WCS
+    from astropy.wcs import wcs as wcs_module
     from astropy.coordinates import SkyCoord as actual_SkyCoord, Angle as actual_Angle
     from astropy import units as actual_u
     fits, WCS, SkyCoord, Angle, u = actual_fits, actual_WCS, actual_SkyCoord, actual_Angle, actual_u
@@ -12456,6 +12457,15 @@ def run_second_pass_coverage_renorm(
         local_kwargs = dict(reproj_kwargs)
         try:
             chan_mosaic, chan_cov = _invoke_reproj(use_gpu_flag, local_kwargs)
+        except wcs_module.NoConvergence as conv_exc:
+            if logger:
+                logger.warning(
+                    "[TwoPass] WCS convergence failed on channel %d, creating empty patch: %s",
+                    ch_idx,
+                    conv_exc,
+                )
+            chan_mosaic = np.full(shape_out_hw, np.nan, dtype=np.float32)
+            chan_cov = np.zeros(shape_out_hw, dtype=np.float32)
         except TypeError as type_err:
             if logger:
                 logger.warning("[TwoPass] GPU reprojection TypeError, attempting recovery: %s", type_err)
@@ -12481,6 +12491,15 @@ def run_second_pass_coverage_renorm(
             if chan_mosaic is None or chan_cov is None:
                 try:
                     chan_mosaic, chan_cov = _invoke_reproj(False, local_kwargs)
+                except wcs_module.NoConvergence as conv_exc_cpu:
+                    if logger:
+                        logger.warning(
+                            "[TwoPass] WCS convergence failed on channel %d (CPU fallback), creating empty patch: %s",
+                            ch_idx,
+                            conv_exc_cpu,
+                        )
+                    chan_mosaic = np.full(shape_out_hw, np.nan, dtype=np.float32)
+                    chan_cov = np.zeros(shape_out_hw, dtype=np.float32)
                 except Exception as cpu_exc:
                     if logger:
                         logger.warning(
@@ -12494,6 +12513,15 @@ def run_second_pass_coverage_renorm(
             if use_gpu_flag:
                 try:
                     chan_mosaic, chan_cov = _invoke_reproj(False, local_kwargs)
+                except wcs_module.NoConvergence as conv_exc_cpu2:
+                    if logger:
+                        logger.warning(
+                            "[TwoPass] WCS convergence failed on channel %d (CPU fallback), creating empty patch: %s",
+                            ch_idx,
+                            conv_exc_cpu2,
+                        )
+                    chan_mosaic = np.full(shape_out_hw, np.nan, dtype=np.float32)
+                    chan_cov = np.zeros(shape_out_hw, dtype=np.float32)
                 except Exception as cpu_exc:
                     if logger:
                         logger.warning(
@@ -16051,7 +16079,8 @@ def run_hierarchical_mosaic(
                         if np.any(mask_zero):
                             preview_view = np.array(preview_view, copy=True)
                             try:
-                                preview_view[mask_zero[..., None]] = np.nan
+                                # Explicitly assign to all channels for the masked pixels
+                                preview_view[mask_zero] = [np.nan, np.nan, np.nan]
                             except Exception as e_nan:
                                 logger.warning(
                                     "phase6: preview NaN masking failed: %s (shape preview=%s, alpha=%s)",

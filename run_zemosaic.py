@@ -57,6 +57,14 @@ try:
 except ImportError:
     zemosaic_config = None
 
+# Tenter d'importer CUPY_AVAILABLE pour le nettoyage des ressources GPU
+try:
+    # Cet import est placé ici pour s'assurer qu'il est disponible pour le bloc finally.
+    from cuda_utils import CUPY_AVAILABLE
+except ImportError:
+    # Si cuda_utils n'existe pas ou a un problème, on suppose que cupy n'est pas utilisé.
+    CUPY_AVAILABLE = False
+
 # --- Impression de débogage initiale ---
 print("--- run_zemosaic.py: DÉBUT DES IMPORTS ---")
 print(f"Python Executable: {sys.executable}")
@@ -536,48 +544,60 @@ def main(argv=None):
     if cleaned_args != argv:
         sys.argv = [sys.argv[0], *cleaned_args]
 
-    if backend == "qt":
-        try:
-            from zemosaic.zemosaic_gui_qt import run_qt_main
-        except ImportError as qt_import_error:
-            _notify_qt_backend_unavailable(qt_import_error)
-            backend = "tk"
+    try:
+        if backend == "qt":
+            try:
+                from zemosaic.zemosaic_gui_qt import run_qt_main
+            except ImportError as qt_import_error:
+                _notify_qt_backend_unavailable(qt_import_error)
+                backend = "tk"
+            else:
+                print("[run_zemosaic] Launching ZeMosaic with the Qt backend.")
+                _play_opening_gif_animation_once()
+                return run_qt_main()
+
+        # Vérification de sys.modules au début de main
+        if 'zemosaic_worker' in sys.modules:
+            print(f"DEBUG (main): 'zemosaic_worker' EST dans sys.modules. Chemin: {sys.modules['zemosaic_worker'].__file__}")
         else:
-            print("[run_zemosaic] Launching ZeMosaic with the Qt backend.")
-            _play_opening_gif_animation_once()
-            return run_qt_main()
-
-    # Vérification de sys.modules au début de main
-    if 'zemosaic_worker' in sys.modules:
-        print(f"DEBUG (main): 'zemosaic_worker' EST dans sys.modules. Chemin: {sys.modules['zemosaic_worker'].__file__}")
-    else:
-        print("DEBUG (main): 'zemosaic_worker' N'EST PAS dans sys.modules au début de main.")
+            print("DEBUG (main): 'zemosaic_worker' N'EST PAS dans sys.modules au début de main.")
 
 
-    if not ZeMosaicGUI: 
-        print("ZeMosaic ne peut pas démarrer car la classe GUI (ZeMosaicGUI) n'a pas pu être chargée.")
-        return
+        if not ZeMosaicGUI: 
+            print("ZeMosaic ne peut pas démarrer car la classe GUI (ZeMosaicGUI) n'a pas pu être chargée.")
+            return
 
-    if not ZEMOSAIC_WORKER_AVAILABLE:
-        print("Avertissement (run_zemosaic main): Le module worker (zemosaic_worker.py) n'est pas disponible ou n'a pas pu être importé correctement par zemosaic_gui.py.")
-        
-        root_temp_err_worker = tk.Tk()
-        root_temp_err_worker.withdraw() 
-        messagebox.showerror("Erreur de Lancement Critique (Worker)",
-                             "Le module 'zemosaic_worker.py' est introuvable ou contient une erreur d'importation.\n"
-                             "L'application ZeMosaic ne peut pas démarrer correctement.\n\n"
-                             "Veuillez vérifier les logs console pour plus de détails.")
-        root_temp_err_worker.destroy()
-        return 
+        if not ZEMOSAIC_WORKER_AVAILABLE:
+            print("Avertissement (run_zemosaic main): Le module worker (zemosaic_worker.py) n'est pas disponible ou n'a pas pu être importé correctement par zemosaic_gui.py.")
+            
+            root_temp_err_worker = tk.Tk()
+            root_temp_err_worker.withdraw() 
+            messagebox.showerror("Erreur de Lancement Critique (Worker)",
+                                 "Le module 'zemosaic_worker.py' est introuvable ou contient une erreur d'importation.\n"
+                                 "L'application ZeMosaic ne peut pas démarrer correctement.\n\n"
+                                 "Veuillez vérifier les logs console pour plus de détails.")
+            root_temp_err_worker.destroy()
+            return 
 
-    print("DEBUG (main): ZEMOSAIC_WORKER_AVAILABLE est True. Tentative de création de l'interface graphique.")
-    if backend != "qt":
-        print("[run_zemosaic] Launching ZeMosaic with the Tk backend.")
+        print("DEBUG (main): ZEMOSAIC_WORKER_AVAILABLE est True. Tentative de création de l'interface graphique.")
+        if backend != "qt":
+            print("[run_zemosaic] Launching ZeMosaic with the Tk backend.")
 
-    root = tk.Tk()
-    app = ZeMosaicGUI(root)
-    root.mainloop()
-    print("--- run_zemosaic.py: mainloop() terminée ---")
+        root = tk.Tk()
+        app = ZeMosaicGUI(root)
+        root.mainloop()
+        print("--- run_zemosaic.py: mainloop() terminée ---")
+    finally:
+        # Nettoyage des ressources GPU pour éviter les erreurs CUDA à la fermeture.
+        # Cette opération est effectuée inconditionnellement si cupy a été chargé.
+        if CUPY_AVAILABLE and "cupy" in sys.modules:
+            print("[run_zemosaic] Nettoyage des ressources GPU...")
+            try:
+                import cupy
+                cupy.get_default_memory_pool().free_all_blocks()
+                print("[run_zemosaic] Ressources GPU nettoyées avec succès.")
+            except Exception as e:
+                print(f"[run_zemosaic] Erreur lors du nettoyage GPU : {e}")
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()

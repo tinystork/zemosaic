@@ -3767,6 +3767,7 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
 
     progress_callback = kwargs.pop("progress_callback", None)
     tile_weights_param = kwargs.pop("tile_weights", None)
+    tile_paths_param = kwargs.pop("tile_paths", None)
     if not gpu_is_available():
         _log_gpu_event(
             "gpu_fallback_unavailable",
@@ -3924,13 +3925,35 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
         tile_wcs,
         ra_chunk: np.ndarray,
         dec_chunk: np.ndarray,
+        *,
+        tile_path_for_logging: str | None = None,
     ) -> tuple[cp.ndarray, cp.ndarray]:
         try:
-            x_in, y_in = tile_wcs.wcs_world2pix(ra_chunk, dec_chunk, 0)
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", UserWarning)
+                x_in, y_in = tile_wcs.wcs_world2pix(ra_chunk, dec_chunk, 0)
         except Exception:
+            if tile_path_for_logging:
+                logger.warning(
+                    "WCS convergence failed for tile: %s. This may indicate a bad astrometric solution. "
+                    "The affected area will appear as a black patch in the mosaic.",
+                    Path(tile_path_for_logging).name,
+                )
+            else:
+                logger.warning("WCS convergence failed for an unknown tile. An area may be black in the final mosaic.")
             shape = ra_chunk.shape
             zeros = cp.zeros(shape, dtype=cp.float32)
             return zeros, zeros
+
+        if not np.all(np.isfinite(x_in)) or not np.all(np.isfinite(y_in)):
+            if tile_path_for_logging:
+                logger.warning(
+                    "Non-finite values detected in WCS output for tile: %s. Sanitizing before GPU transfer.",
+                    Path(tile_path_for_logging).name,
+                )
+            x_in = np.nan_to_num(x_in, nan=0.0, posinf=0.0, neginf=0.0)
+            y_in = np.nan_to_num(y_in, nan=0.0, posinf=0.0, neginf=0.0)
+
         x_in_gpu = cp.asarray(x_in, dtype=cp.float32)
         y_in_gpu = cp.asarray(y_in, dtype=cp.float32)
         h_in, w_in = img_gpu.shape
@@ -3989,12 +4012,22 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
         chunk_grid = _build_world_chunk_grid(rows_per_chunk)
         for idx_tile, tile_wcs in enumerate(wcs_list):
             img_gpu, mask_gpu = _prepare_tile_arrays(idx_tile)
+            path_for_log = None
+            if tile_paths_param and idx_tile < len(tile_paths_param):
+                path_for_log = str(tile_paths_param[idx_tile])
             if tile_weights_gpu is not None:
                 weight_i = tile_weights_gpu[idx_tile]
             else:
                 weight_i = cp.float32(1.0)
             for y0, y1, ra_chunk, dec_chunk in chunk_grid:
-                sampled, sampled_mask = _sample_tile_chunk(img_gpu, mask_gpu, tile_wcs, ra_chunk, dec_chunk)
+                sampled, sampled_mask = _sample_tile_chunk(
+                    img_gpu,
+                    mask_gpu,
+                    tile_wcs,
+                    ra_chunk,
+                    dec_chunk,
+                    tile_path_for_logging=path_for_log,
+                )
                 mosaic_sum_gpu[y0:y1, :] += sampled * weight_i
                 weight_sum_gpu[y0:y1, :] += sampled_mask * weight_i
             del img_gpu, mask_gpu
@@ -4056,6 +4089,9 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
             chunk_cube = cp.full((n_inputs, chunk_h, W), cp.nan, dtype=cp.float32)
             chunk_weight = cp.zeros((n_inputs, chunk_h, W), dtype=cp.float32)
             for idx_tile, tile_wcs in enumerate(wcs_list):
+                path_for_log = None
+                if tile_paths_param and idx_tile < len(tile_paths_param):
+                    path_for_log = str(tile_paths_param[idx_tile])
                 if tile_cache is not None:
                     img_gpu, mask_gpu = tile_cache[idx_tile]
                 else:
@@ -4064,7 +4100,14 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
                     weight_i = tile_weights_gpu[idx_tile]
                 else:
                     weight_i = cp.float32(1.0)
-                sampled, sampled_mask = _sample_tile_chunk(img_gpu, mask_gpu, tile_wcs, ra_chunk, dec_chunk)
+                sampled, sampled_mask = _sample_tile_chunk(
+                    img_gpu,
+                    mask_gpu,
+                    tile_wcs,
+                    ra_chunk,
+                    dec_chunk,
+                    tile_path_for_logging=path_for_log,
+                )
                 chunk_cube[idx_tile, :, :] = cp.where(sampled_mask > 0, sampled, cp.nan)
                 chunk_weight[idx_tile, :, :] = sampled_mask * weight_i
                 if tile_cache is None:
@@ -4123,12 +4166,22 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
 
         for idx_tile, tile_wcs in enumerate(wcs_list):
             img_gpu, mask_gpu = _tile_arrays(idx_tile)
+            path_for_log = None
+            if tile_paths_param and idx_tile < len(tile_paths_param):
+                path_for_log = str(tile_paths_param[idx_tile])
             if tile_weights_gpu is not None:
                 weight_i = tile_weights_gpu[idx_tile]
             else:
                 weight_i = cp.float32(1.0)
             for y0, y1, ra_chunk, dec_chunk in chunk_stats:
-                sampled, sampled_mask = _sample_tile_chunk(img_gpu, mask_gpu, tile_wcs, ra_chunk, dec_chunk)
+                sampled, sampled_mask = _sample_tile_chunk(
+                    img_gpu,
+                    mask_gpu,
+                    tile_wcs,
+                    ra_chunk,
+                    dec_chunk,
+                    tile_path_for_logging=path_for_log,
+                )
                 weighted_sample = sampled * weight_i
                 weighted_mask = sampled_mask * weight_i
                 sum_grid[y0:y1, :] += weighted_sample.astype(cp.float64)
@@ -4177,12 +4230,22 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
             chunk_cube = cp.full((n_inputs, chunk_h, W), cp.nan, dtype=cp.float32)
             chunk_weight = cp.zeros((n_inputs, chunk_h, W), dtype=cp.float32)
             for idx_tile, tile_wcs in enumerate(wcs_list):
+                path_for_log = None
+                if tile_paths_param and idx_tile < len(tile_paths_param):
+                    path_for_log = str(tile_paths_param[idx_tile])
                 img_gpu, mask_gpu = _tile_arrays(idx_tile)
                 if tile_weights_gpu is not None:
                     weight_i = tile_weights_gpu[idx_tile]
                 else:
                     weight_i = cp.float32(1.0)
-                sampled, sampled_mask = _sample_tile_chunk(img_gpu, mask_gpu, tile_wcs, ra_chunk, dec_chunk)
+                sampled, sampled_mask = _sample_tile_chunk(
+                    img_gpu,
+                    mask_gpu,
+                    tile_wcs,
+                    ra_chunk,
+                    dec_chunk,
+                    tile_path_for_logging=path_for_log,
+                )
                 chunk_cube[idx_tile, :, :] = cp.where(sampled_mask > 0, sampled, cp.nan)
                 chunk_weight[idx_tile, :, :] = sampled_mask * weight_i
                 if tile_cache is None:
@@ -4317,7 +4380,14 @@ def _reproject_and_coadd_wrapper_impl(
         cpu_kwargs["input_weights"] = weight_maps
     inputs = list(zip(data_list, wcs_list))
     output_proj = cpu_kwargs.pop("output_projection")
-    return cpu_func(inputs, output_proj, shape_out, **cpu_kwargs)
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            category=UserWarning,
+            message="'WCS.all_world2pix' failed to converge",
+            module="astropy.wcs.wcsapi.fitswcs",
+        )
+        return cpu_func(inputs, output_proj, shape_out, **cpu_kwargs)
 
 
 
