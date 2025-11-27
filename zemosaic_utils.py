@@ -66,14 +66,23 @@ import warnings
 import traceback
 import gc
 import importlib.util
-import inspect
+
+# Silence Astropy's iterative world2pix warnings globally; we replace them with
+# explicit logs when they matter inside our helpers.
+warnings.filterwarnings(
+    "ignore",
+    message=r"'WCS\.all_world2pix' failed to converge",
+    category=UserWarning,
+)
 
 # --- Optional Astropy WCS import (lightweight, guarded) ----------------------
 ASTROPY_WCS_AVAILABLE_IN_UTILS = False
 AstropyWCS = None
+AstropyNoConvergence = None
 proj_plane_pixel_scales = None
 try:  # pragma: no cover - optional dependency path
     from astropy.wcs import WCS as AstropyWCS  # type: ignore
+    from astropy.wcs import NoConvergence as AstropyNoConvergence  # type: ignore
     from astropy.wcs.utils import proj_plane_pixel_scales  # type: ignore
 
     ASTROPY_WCS_AVAILABLE_IN_UTILS = True
@@ -89,6 +98,7 @@ try:  # pragma: no cover - optional dependency path
         AstropyWCS._zemo_world_to_pixel_noiter = True  # type: ignore[attr-defined]
 except Exception:
     AstropyWCS = None
+    AstropyNoConvergence = None
     proj_plane_pixel_scales = None
 
 # --- GPU/CUDA Availability ----------------------------------------------------
@@ -1534,7 +1544,9 @@ def estimate_overlap_pairs(
                 dtype=np.float64,
             )
             world = wcs_obj.pixel_to_world(corners[:, 0], corners[:, 1])
-            px, py = final_output_wcs.world_to_pixel(world)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                px, py = final_output_wcs.world_to_pixel(world)
             if px is None or py is None:
                 footprints.append(None)
                 continue
@@ -3779,12 +3791,114 @@ def _kappa_sigma_clip_chunk(
     return clipped, clip_weight
 
 
+def _estimate_tile_bounds(
+    tile_wcs,
+    tile_shape_hw: tuple[int, int],
+    output_wcs,
+    mosaic_shape_hw: tuple[int, int],
+    *,
+    margin_px: float = 8.0,
+) -> dict[str, Any]:
+    """Estimate the bounding box (in mosaic pixels) a tile can cover."""
+
+    mosaic_h = int(max(1, mosaic_shape_hw[0]))
+    mosaic_w = int(max(1, mosaic_shape_hw[1]))
+    fallback = {
+        "x0": 0,
+        "x1": mosaic_w,
+        "y0": 0,
+        "y1": mosaic_h,
+        "full_frame": True,
+        "valid_samples": 0,
+        "total_samples": 0,
+        "fallback_reason": "missing_wcs" if tile_wcs is None or output_wcs is None else "invalid_samples",
+        "margin_px": float(max(0.0, margin_px)),
+    }
+    if tile_wcs is None or output_wcs is None:
+        return fallback
+    try:
+        tile_h = int(max(1, int(tile_shape_hw[0])))
+        tile_w = int(max(1, int(tile_shape_hw[1])))
+    except Exception:
+        tile_h = int(max(1, mosaic_h))
+        tile_w = int(max(1, mosaic_w))
+    samples = max(5, min(21, int(max(tile_h, tile_w) / 512.0) * 4 + 5))
+    xs = np.linspace(-0.5, tile_w - 0.5, samples, dtype=np.float64)
+    ys = np.linspace(-0.5, tile_h - 0.5, samples, dtype=np.float64)
+    xx, yy = np.meshgrid(xs, ys)
+    perimeter_mask = np.zeros_like(xx, dtype=bool)
+    perimeter_mask[0, :] = True
+    perimeter_mask[-1, :] = True
+    perimeter_mask[:, 0] = True
+    perimeter_mask[:, -1] = True
+    px = xx[perimeter_mask]
+    py = yy[perimeter_mask]
+    total_samples = int(px.size)
+    if total_samples <= 0:
+        return fallback
+    fallback["total_samples"] = total_samples
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            ra, dec = tile_wcs.wcs_pix2world(px, py, 0)
+    except Exception:
+        fallback["fallback_reason"] = "pix2world_failed"
+        return fallback
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            x_out, y_out = output_wcs.wcs_world2pix(ra, dec, 0)
+    except Exception as exc:
+        reason = "world2pix_failed"
+        if AstropyNoConvergence is not None and isinstance(exc, AstropyNoConvergence):
+            reason = "no_convergence"
+        fallback["fallback_reason"] = reason
+        fallback["valid_samples"] = 0
+        return fallback
+    x_arr = np.asarray(x_out, dtype=np.float64)
+    y_arr = np.asarray(y_out, dtype=np.float64)
+    finite_mask = np.isfinite(x_arr) & np.isfinite(y_arr)
+    valid_samples = int(np.count_nonzero(finite_mask))
+    if valid_samples <= 0:
+        fallback["fallback_reason"] = "no_finite_samples"
+        fallback["valid_samples"] = 0
+        return fallback
+    x_valid = x_arr[finite_mask]
+    y_valid = y_arr[finite_mask]
+    margin = float(max(0.0, margin_px))
+    x0 = max(0, int(math.floor(np.nanmin(x_valid) - margin)))
+    x1 = min(mosaic_w, int(math.ceil(np.nanmax(x_valid) + margin)))
+    y0 = max(0, int(math.floor(np.nanmin(y_valid) - margin)))
+    y1 = min(mosaic_h, int(math.ceil(np.nanmax(y_valid) + margin)))
+    if x0 >= x1 or y0 >= y1:
+        fallback["fallback_reason"] = "degenerate_bbox"
+        fallback["valid_samples"] = valid_samples
+        return fallback
+    return {
+        "x0": int(x0),
+        "x1": int(x1),
+        "y0": int(y0),
+        "y1": int(y1),
+        "full_frame": x0 == 0 and x1 == mosaic_w and y0 == 0 and y1 == mosaic_h,
+        "valid_samples": valid_samples,
+        "total_samples": total_samples,
+        "fallback_reason": None,
+        "margin_px": margin,
+    }
+
+
 def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
     """CuPy-accelerated reprojection and coaddition for a single channel."""
 
     progress_callback = kwargs.pop("progress_callback", None)
     tile_weights_param = kwargs.pop("tile_weights", None)
-    tile_weight_maps_param = kwargs.pop("tile_weight_maps", None)
+    tile_bounds_callback = kwargs.pop("gpu_tile_bounds_callback", None)
+    bounds_margin_param = kwargs.pop("gpu_bounds_margin_px", 8.0)
+    try:
+        tile_bounds_margin_px = float(bounds_margin_param)
+    except Exception:
+        tile_bounds_margin_px = 8.0
+    tile_bounds_margin_px = max(0.0, min(256.0, tile_bounds_margin_px))
     if not gpu_is_available():
         _log_gpu_event(
             "gpu_fallback_unavailable",
@@ -3801,8 +3915,10 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
     ensure_cupy_pool_initialized()
     try:
         from astropy.wcs import WCS as _WCS
+        from astropy.wcs import NoConvergence as _NoConvergence
     except Exception:
         _WCS = None
+        _NoConvergence = None
 
     output_projection = kwargs.get("output_projection")
     if output_projection is None:
@@ -3819,6 +3935,107 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
     n_inputs = len(data_list)
     if len(wcs_list) != n_inputs:
         raise ValueError("data_list and wcs_list must have the same length")
+
+    def _emit_tile_event(tile_index: int, payload: dict[str, Any]) -> None:
+        if tile_bounds_callback is None:
+            return
+        try:
+            tile_bounds_callback(tile_index, dict(payload))
+        except Exception:
+            pass
+
+    tile_bounds: list[dict[str, Any]] = []
+    tile_stats: list[dict[str, int]] = []
+    tile_summary_emitted = False
+
+    def _get_tile_bbox(idx: int) -> tuple[int, int, int, int]:
+        bounds = tile_bounds[idx]
+        x0 = max(0, min(W, int(bounds.get("x0", 0))))
+        x1 = max(0, min(W, int(bounds.get("x1", W))))
+        y0 = max(0, min(H, int(bounds.get("y0", 0))))
+        y1 = max(0, min(H, int(bounds.get("y1", H))))
+        return x0, x1, y0, y1
+
+    for idx, tile_wcs in enumerate(wcs_list):
+        arr_shape = np.shape(data_list[idx])
+        if len(arr_shape) >= 2:
+            tile_shape_hw = (int(arr_shape[-2]), int(arr_shape[-1]))
+        else:
+            tile_shape_hw = (H, W)
+        bounds = _estimate_tile_bounds(
+            tile_wcs,
+            tile_shape_hw,
+            output_wcs,
+            (H, W),
+            margin_px=tile_bounds_margin_px,
+        )
+        tile_bounds.append(bounds)
+        tile_stats.append({"processed_chunks": 0, "skipped_chunks": 0, "discarded_px": 0})
+        bbox_tuple = _get_tile_bbox(idx)
+        fallback_reason = bounds.get("fallback_reason")
+        logger.info(
+            "[GPU_BOUNDING] tile=%d bbox=[x0=%d,x1=%d,y0=%d,y1=%d] valid=%d/%d fallback=%s margin=%.1f",
+            idx,
+            bbox_tuple[0],
+            bbox_tuple[1],
+            bbox_tuple[2],
+            bbox_tuple[3],
+            int(bounds.get("valid_samples", 0)),
+            int(bounds.get("total_samples", 0)),
+            fallback_reason or "no",
+            float(bounds.get("margin_px", tile_bounds_margin_px)),
+        )
+        if fallback_reason:
+            logger.warning(
+                "[GPU_BOUNDING] tile=%d using full mosaic bounds (reason=%s)",
+                idx,
+                fallback_reason,
+            )
+        _emit_tile_event(
+            idx,
+            {
+                "event": "bounds",
+                "bbox": bbox_tuple,
+                "valid_samples": int(bounds.get("valid_samples", 0)),
+                "total_samples": int(bounds.get("total_samples", 0)),
+                "fallback_reason": fallback_reason,
+                "full_frame": bool(bounds.get("full_frame", False)),
+                "margin_px": float(bounds.get("margin_px", tile_bounds_margin_px)),
+            },
+        )
+
+    def _emit_tile_bounds_summary() -> None:
+        nonlocal tile_summary_emitted
+        if tile_summary_emitted:
+            return
+        tile_summary_emitted = True
+        for idx, bounds in enumerate(tile_bounds):
+            stats = tile_stats[idx]
+            processed = int(stats.get("processed_chunks", 0))
+            skipped = int(stats.get("skipped_chunks", 0))
+            discarded = int(stats.get("discarded_px", 0))
+            bbox_tuple = _get_tile_bbox(idx)
+            logger.info(
+                "[GPU_BOUNDING] tile=%d summary processed=%d skipped=%d discarded_px=%d bbox=[x0=%d,x1=%d,y0=%d,y1=%d]",
+                idx,
+                processed,
+                skipped,
+                discarded,
+                bbox_tuple[0],
+                bbox_tuple[1],
+                bbox_tuple[2],
+                bbox_tuple[3],
+            )
+            _emit_tile_event(
+                idx,
+                {
+                    "event": "stats",
+                    "processed_chunks": processed,
+                    "skipped_chunks": skipped,
+                    "discarded_px": discarded,
+                    "bbox": bbox_tuple,
+                },
+            )
 
     def _normalize_tile_weights(weights_obj) -> list[float]:
         if weights_obj is None:
@@ -3958,18 +4175,38 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
         return chunk_grid
 
     def _sample_tile_chunk(
+        tile_idx: int,
         img_gpu: cp.ndarray,
         mask_gpu: cp.ndarray,
         tile_wcs,
         ra_chunk: np.ndarray,
         dec_chunk: np.ndarray,
-    ) -> tuple[cp.ndarray, cp.ndarray]:
+    ) -> tuple[cp.ndarray, cp.ndarray, int]:
+        shape = ra_chunk.shape
+        zero_block = cp.zeros(shape, dtype=cp.float32)
+        if tile_wcs is None:
+            return zero_block, zero_block, int(np.prod(shape))
         try:
-            x_in, y_in = tile_wcs.wcs_world2pix(ra_chunk, dec_chunk, 0)
-        except Exception:
-            shape = ra_chunk.shape
-            zeros = cp.zeros(shape, dtype=cp.float32)
-            return zeros, zeros
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                x_in, y_in = tile_wcs.wcs_world2pix(ra_chunk, dec_chunk, 0)
+        except Exception as exc:
+            reason = "world2pix_failed"
+            if _NoConvergence is not None and isinstance(exc, _NoConvergence):
+                reason = "no_convergence"
+            logger.debug(
+                "[GPU_BOUNDING] tile=%d wcs_world2pix failed (%s)",
+                tile_idx,
+                reason,
+            )
+            _emit_tile_event(
+                tile_idx,
+                {
+                    "event": "warning",
+                    "reason": reason,
+                },
+            )
+            return zero_block, zero_block, int(np.prod(shape))
         x_in_gpu = cp.asarray(x_in, dtype=cp.float32)
         y_in_gpu = cp.asarray(y_in, dtype=cp.float32)
         h_in, w_in = img_gpu.shape
@@ -3982,9 +4219,28 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
         coords = cp.stack([y_in_gpu, x_in_gpu], axis=0)
         sampled = map_coordinates(img_gpu, coords, order=1, mode="constant", cval=0.0)
         sampled_mask = map_coordinates(mask_gpu, coords, order=1, mode="constant", cval=0.0)
-        sampled = sampled * sampled_mask * valid.astype(cp.float32)
-        sampled_mask = sampled_mask * valid.astype(cp.float32)
-        return sampled, sampled_mask
+        valid_float = valid.astype(cp.float32)
+        sampled = sampled * sampled_mask * valid_float
+        sampled_mask = sampled_mask * valid_float
+        try:
+            kept = int(cp.count_nonzero(valid).get())
+        except Exception:
+            kept = int(valid.size)
+        invalid = int(max(0, valid.size - kept))
+        if invalid > 0:
+            logger.debug(
+                "[GPU_BOUNDING] tile=%d discarded %d px (out-of-footprint)",
+                tile_idx,
+                invalid,
+            )
+            _emit_tile_event(
+                tile_idx,
+                {
+                    "event": "discard",
+                    "discarded_px": invalid,
+                },
+            )
+        return sampled, sampled_mask, invalid
 
     def _finalize_match_background(mosaic_gpu: cp.ndarray) -> cp.ndarray:
         if not match_background:
@@ -4026,16 +4282,39 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
         adaptive_rows = max(1, max_chunk_bytes // bytes_per_row_estimate)
         rows_per_chunk = max(32, min(rows_per_chunk, adaptive_rows, H))
         chunk_grid = _build_world_chunk_grid(rows_per_chunk)
+        total_chunks = len(chunk_grid)
         for idx_tile, tile_wcs in enumerate(wcs_list):
+            x0_tile, x1_tile, y0_tile, y1_tile = _get_tile_bbox(idx_tile)
+            if x0_tile >= x1_tile or y0_tile >= y1_tile:
+                tile_stats[idx_tile]["skipped_chunks"] += total_chunks
+                continue
             img_gpu, mask_gpu = _prepare_tile_arrays(idx_tile)
             if tile_weights_gpu is not None:
                 weight_i = tile_weights_gpu[idx_tile]
             else:
                 weight_i = cp.float32(1.0)
             for y0, y1, ra_chunk, dec_chunk in chunk_grid:
-                sampled, sampled_mask = _sample_tile_chunk(img_gpu, mask_gpu, tile_wcs, ra_chunk, dec_chunk)
-                mosaic_sum_gpu[y0:y1, :] += sampled * weight_i
-                weight_sum_gpu[y0:y1, :] += sampled_mask * weight_i
+                y_start = max(y0, y0_tile)
+                y_end = min(y1, y1_tile)
+                if y_start >= y_end:
+                    tile_stats[idx_tile]["skipped_chunks"] += 1
+                    continue
+                tile_stats[idx_tile]["processed_chunks"] += 1
+                chunk_y0 = y_start - y0
+                chunk_y1 = y_end - y0
+                ra_view = ra_chunk[chunk_y0:chunk_y1, x0_tile:x1_tile]
+                dec_view = dec_chunk[chunk_y0:chunk_y1, x0_tile:x1_tile]
+                sampled, sampled_mask, discarded = _sample_tile_chunk(
+                    idx_tile,
+                    img_gpu,
+                    mask_gpu,
+                    tile_wcs,
+                    ra_view,
+                    dec_view,
+                )
+                tile_stats[idx_tile]["discarded_px"] += int(discarded)
+                mosaic_sum_gpu[y_start:y_end, x0_tile:x1_tile] += sampled * weight_i
+                weight_sum_gpu[y_start:y_end, x0_tile:x1_tile] += sampled_mask * weight_i
             del img_gpu, mask_gpu
         eps = cp.float32(1e-6)
         mosaic_gpu = cp.where(weight_sum_gpu > eps, mosaic_sum_gpu / cp.maximum(weight_sum_gpu, eps), 0.0)
@@ -4095,6 +4374,20 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
             chunk_cube = cp.full((n_inputs, chunk_h, W), cp.nan, dtype=cp.float32)
             chunk_weight = cp.zeros((n_inputs, chunk_h, W), dtype=cp.float32)
             for idx_tile, tile_wcs in enumerate(wcs_list):
+                x0_tile, x1_tile, y0_tile, y1_tile = _get_tile_bbox(idx_tile)
+                if x0_tile >= x1_tile or y0_tile >= y1_tile:
+                    tile_stats[idx_tile]["skipped_chunks"] += 1
+                    continue
+                y_start = max(y0, y0_tile)
+                y_end = min(y1, y1_tile)
+                if y_start >= y_end:
+                    tile_stats[idx_tile]["skipped_chunks"] += 1
+                    continue
+                tile_stats[idx_tile]["processed_chunks"] += 1
+                chunk_y0 = y_start - y0
+                chunk_y1 = y_end - y0
+                ra_view = ra_chunk[chunk_y0:chunk_y1, x0_tile:x1_tile]
+                dec_view = dec_chunk[chunk_y0:chunk_y1, x0_tile:x1_tile]
                 if tile_cache is not None:
                     img_gpu, mask_gpu = tile_cache[idx_tile]
                 else:
@@ -4103,9 +4396,21 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
                     weight_i = tile_weights_gpu[idx_tile]
                 else:
                     weight_i = cp.float32(1.0)
-                sampled, sampled_mask = _sample_tile_chunk(img_gpu, mask_gpu, tile_wcs, ra_chunk, dec_chunk)
-                chunk_cube[idx_tile, :, :] = cp.where(sampled_mask > 0, sampled, cp.nan)
-                chunk_weight[idx_tile, :, :] = sampled_mask * weight_i
+                sampled, sampled_mask, discarded = _sample_tile_chunk(
+                    idx_tile,
+                    img_gpu,
+                    mask_gpu,
+                    tile_wcs,
+                    ra_view,
+                    dec_view,
+                )
+                tile_stats[idx_tile]["discarded_px"] += int(discarded)
+                chunk_cube[idx_tile, chunk_y0:chunk_y1, x0_tile:x1_tile] = cp.where(
+                    sampled_mask > 0,
+                    sampled,
+                    cp.nan,
+                )
+                chunk_weight[idx_tile, chunk_y0:chunk_y1, x0_tile:x1_tile] = sampled_mask * weight_i
                 if tile_cache is None:
                     del img_gpu, mask_gpu
             if mode == "median":
@@ -4161,19 +4466,41 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
             return _prepare_tile_arrays(idx_tile)
 
         for idx_tile, tile_wcs in enumerate(wcs_list):
+            x0_tile, x1_tile, y0_tile, y1_tile = _get_tile_bbox(idx_tile)
+            if x0_tile >= x1_tile or y0_tile >= y1_tile:
+                tile_stats[idx_tile]["skipped_chunks"] += len(chunk_stats)
+                continue
             img_gpu, mask_gpu = _tile_arrays(idx_tile)
             if tile_weights_gpu is not None:
                 weight_i = tile_weights_gpu[idx_tile]
             else:
                 weight_i = cp.float32(1.0)
             for y0, y1, ra_chunk, dec_chunk in chunk_stats:
-                sampled, sampled_mask = _sample_tile_chunk(img_gpu, mask_gpu, tile_wcs, ra_chunk, dec_chunk)
+                y_start = max(y0, y0_tile)
+                y_end = min(y1, y1_tile)
+                if y_start >= y_end:
+                    tile_stats[idx_tile]["skipped_chunks"] += 1
+                    continue
+                tile_stats[idx_tile]["processed_chunks"] += 1
+                chunk_y0 = y_start - y0
+                chunk_y1 = y_end - y0
+                ra_view = ra_chunk[chunk_y0:chunk_y1, x0_tile:x1_tile]
+                dec_view = dec_chunk[chunk_y0:chunk_y1, x0_tile:x1_tile]
+                sampled, sampled_mask, discarded = _sample_tile_chunk(
+                    idx_tile,
+                    img_gpu,
+                    mask_gpu,
+                    tile_wcs,
+                    ra_view,
+                    dec_view,
+                )
+                tile_stats[idx_tile]["discarded_px"] += int(discarded)
                 weighted_sample = sampled * weight_i
                 weighted_mask = sampled_mask * weight_i
-                sum_grid[y0:y1, :] += weighted_sample.astype(cp.float64)
-                sumsq_grid[y0:y1, :] += (weighted_sample ** 2).astype(cp.float64)
-                weight_grid[y0:y1, :] += weighted_mask
-                count_grid[y0:y1, :] += (sampled_mask > 0).astype(cp.float32)
+                sum_grid[y_start:y_end, x0_tile:x1_tile] += weighted_sample.astype(cp.float64)
+                sumsq_grid[y_start:y_end, x0_tile:x1_tile] += (weighted_sample ** 2).astype(cp.float64)
+                weight_grid[y_start:y_end, x0_tile:x1_tile] += weighted_mask
+                count_grid[y_start:y_end, x0_tile:x1_tile] += (sampled_mask > 0).astype(cp.float32)
             if tile_cache is None:
                 del img_gpu, mask_gpu
         weight_safe = cp.maximum(weight_grid, cp.float32(1e-6))
@@ -4216,14 +4543,40 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
             chunk_cube = cp.full((n_inputs, chunk_h, W), cp.nan, dtype=cp.float32)
             chunk_weight = cp.zeros((n_inputs, chunk_h, W), dtype=cp.float32)
             for idx_tile, tile_wcs in enumerate(wcs_list):
+                x0_tile, x1_tile, y0_tile, y1_tile = _get_tile_bbox(idx_tile)
+                if x0_tile >= x1_tile or y0_tile >= y1_tile:
+                    tile_stats[idx_tile]["skipped_chunks"] += 1
+                    continue
+                y_start = max(y0, y0_tile)
+                y_end = min(y1, y1_tile)
+                if y_start >= y_end:
+                    tile_stats[idx_tile]["skipped_chunks"] += 1
+                    continue
+                tile_stats[idx_tile]["processed_chunks"] += 1
+                chunk_y0 = y_start - y0
+                chunk_y1 = y_end - y0
+                ra_view = ra_chunk[chunk_y0:chunk_y1, x0_tile:x1_tile]
+                dec_view = dec_chunk[chunk_y0:chunk_y1, x0_tile:x1_tile]
                 img_gpu, mask_gpu = _tile_arrays(idx_tile)
                 if tile_weights_gpu is not None:
                     weight_i = tile_weights_gpu[idx_tile]
                 else:
                     weight_i = cp.float32(1.0)
-                sampled, sampled_mask = _sample_tile_chunk(img_gpu, mask_gpu, tile_wcs, ra_chunk, dec_chunk)
-                chunk_cube[idx_tile, :, :] = cp.where(sampled_mask > 0, sampled, cp.nan)
-                chunk_weight[idx_tile, :, :] = sampled_mask * weight_i
+                sampled, sampled_mask, discarded = _sample_tile_chunk(
+                    idx_tile,
+                    img_gpu,
+                    mask_gpu,
+                    tile_wcs,
+                    ra_view,
+                    dec_view,
+                )
+                tile_stats[idx_tile]["discarded_px"] += int(discarded)
+                chunk_cube[idx_tile, chunk_y0:chunk_y1, x0_tile:x1_tile] = cp.where(
+                    sampled_mask > 0,
+                    sampled,
+                    cp.nan,
+                )
+                chunk_weight[idx_tile, chunk_y0:chunk_y1, x0_tile:x1_tile] = sampled_mask * weight_i
                 if tile_cache is None:
                     del img_gpu, mask_gpu
             mean_slice = mean_map[y0:y1, :]
@@ -4258,6 +4611,10 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
             return _gpu_kappa_sigma_path()
         raise NotImplementedError(f"Unsupported combine_function '{combine_function}' for GPU coadd")
     finally:
+        try:
+            _emit_tile_bounds_summary()
+        except Exception:
+            pass
         free_cupy_memory_pools()
 
 
@@ -4434,6 +4791,8 @@ def _reproject_and_coadd_wrapper_impl(
         "max_chunk_bytes",
         # New GPU-only hints
         "tile_affine_corrections",
+        "gpu_tile_bounds_callback",
+        "gpu_bounds_margin_px",
     }
     cpu_kwargs = {k: v for k, v in kwargs.items() if k not in gpu_only}
     if not cpu_accepts_match_bg:

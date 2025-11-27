@@ -67,12 +67,19 @@ import threading
 import itertools
 import platform
 import importlib.util
+import warnings
 from pathlib import Path
 from threading import Lock
 from dataclasses import dataclass
 from typing import Callable, Any, Iterable, Optional, Mapping
 from contextlib import contextmanager
 from types import SimpleNamespace
+
+warnings.filterwarnings(
+    "ignore",
+    message=r"'WCS\.all_world2pix' failed to converge",
+    category=UserWarning,
+)
 
 import numpy as np
 
@@ -929,6 +936,7 @@ def _apply_two_pass_coverage_renorm_if_requested(
     fallback_tile_loader: Callable[[], tuple[list[np.ndarray], list[Any]]] | None = None,
     parallel_plan: ParallelPlan | None = None,
     telemetry_ctrl: ResourceTelemetryController | None = None,
+    gpu_bounds_margin_px: float | None = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
     """Run the coverage renormalization second pass if configured."""
 
@@ -985,6 +993,7 @@ def _apply_two_pass_coverage_renorm_if_requested(
             tiles_coverage=coverage_for_second_pass,
             parallel_plan=parallel_plan,
             telemetry_ctrl=telemetry_ctrl,
+            gpu_bounds_margin_px=gpu_bounds_margin_px,
         )
         if result is not None:
             final_mosaic_data, final_mosaic_coverage = result
@@ -1019,6 +1028,7 @@ def _apply_phase5_post_stack_pipeline(
     final_output_wcs: Any,
     final_output_shape_hw: tuple[int, int] | None,
     use_gpu_two_pass: bool,
+    gpu_bounds_margin_px: float | None = None,
     logger: logging.Logger | None,
     collected_tiles: list[tuple[np.ndarray, Any]] | None = None,
     fallback_two_pass_loader: Callable[[], tuple[list[np.ndarray], list[Any]]] | None = None,
@@ -1066,6 +1076,7 @@ def _apply_phase5_post_stack_pipeline(
         collected_tiles=collected_tiles,
         fallback_tile_loader=fallback_two_pass_loader,
         parallel_plan=parallel_plan,
+        gpu_bounds_margin_px=gpu_bounds_margin_px,
         telemetry_ctrl=telemetry_ctrl,
     )
     return final_mosaic_data, final_mosaic_coverage, final_alpha_map
@@ -1438,6 +1449,7 @@ def _finalize_sds_global_mosaic(
         final_output_wcs=final_output_wcs,
         final_output_shape_hw=final_output_shape,
         use_gpu_two_pass=use_gpu_two_pass,
+        gpu_bounds_margin_px=None,
         logger=logger,
         collected_tiles=collected_tiles,
         fallback_two_pass_loader=fallback_two_pass_loader,
@@ -2862,7 +2874,9 @@ def _phase45_compute_cutout_wcs(final_wcs: Any, final_shape_hw: tuple[int, int] 
         if sky is None:
             continue
         try:
-            ra_vals = getattr(sky, "ra", None)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                ra_vals = getattr(sky, "ra", None)
             dec_vals = getattr(sky, "dec", None)
             if ra_vals is None or dec_vals is None:
                 continue
@@ -6666,6 +6680,17 @@ def _run_shared_phase45_phase5_pipeline(
     parallel_plan = phase5_options.get("parallel_plan")
     tile_weighting_enabled_flag = bool(phase5_options.get("tile_weighting_enabled"))
     tile_weight_mode = str(phase5_options.get("tile_weight_mode") or "n_frames")
+    bounds_margin_cfg = phase5_options.get("gpu_bounds_margin_px")
+    try:
+        gpu_bounds_margin_phase5 = float(bounds_margin_cfg)
+    except Exception:
+        gpu_bounds_margin_phase5 = None
+    if gpu_bounds_margin_phase5 is not None:
+        if not math.isfinite(gpu_bounds_margin_phase5):
+            gpu_bounds_margin_phase5 = None
+        else:
+            gpu_bounds_margin_phase5 = max(0.0, min(256.0, gpu_bounds_margin_phase5))
+    gpu_bounds_logger_phase5 = _make_gpu_bounds_logger("Phase5")
     apply_radial_weight_config = bool(phase5_options.get("apply_radial_weight"))
     try:
         radial_feather_fraction_config = float(phase5_options.get("radial_feather_fraction") or 0.0)
@@ -7029,6 +7054,7 @@ def _run_shared_phase45_phase5_pipeline(
             phase5_options,
             plan_for_two_pass,
         ),
+        gpu_bounds_margin_px=gpu_bounds_margin_phase5,
         logger=logger,
         collected_tiles=collected_tiles_for_second_pass,
         fallback_two_pass_loader=fallback_two_pass_loader,
@@ -7615,6 +7641,68 @@ if not logger.handlers:
     fh.setFormatter(formatter)
     logger.addHandler(fh)
 logger.info("Logging pour ZeMosaicWorker initialisé. Logs écrits dans: %s", log_file_path)
+
+def _make_gpu_bounds_logger(stage_label: str) -> Callable[[int, dict[str, Any]], None]:
+    """Create a callback that relays GPU bounding diagnostics to the worker log."""
+
+    stage = str(stage_label or "GPU")
+
+    def _log_bounds(tile_index: int, payload: dict[str, Any]) -> None:
+        try:
+            event = str(payload.get("event") or "bounds").lower()
+        except Exception:
+            event = "bounds"
+        bbox = payload.get("bbox") or (0, 0, 0, 0)
+        if isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+            x0, x1, y0, y1 = bbox[:4]
+        else:
+            x0 = x1 = y0 = y1 = 0
+        prefix = f"[GPU_BOUNDING:{stage}] tile={int(tile_index)}"
+        if event == "bounds":
+            valid = int(payload.get("valid_samples", 0))
+            total = int(payload.get("total_samples", 0))
+            margin_px = float(payload.get("margin_px", 0.0))
+            fallback_reason = payload.get("fallback_reason") or "no"
+            logger.info(
+                "%s bbox=[x0=%d,x1=%d,y0=%d,y1=%d] valid=%d/%d fallback=%s margin=%.1f",
+                prefix,
+                x0,
+                x1,
+                y0,
+                y1,
+                valid,
+                total,
+                fallback_reason,
+                margin_px,
+            )
+            return
+        if event == "stats":
+            processed = int(payload.get("processed_chunks", 0))
+            skipped = int(payload.get("skipped_chunks", 0))
+            discarded = int(payload.get("discarded_px", payload.get("discarded", 0)))
+            total = processed + skipped
+            logger.info(
+                "%s chunks=%d processed=%d skipped=%d discarded_px=%d bbox=[x0=%d,x1=%d,y0=%d,y1=%d]",
+                prefix,
+                total,
+                processed,
+                skipped,
+                discarded,
+                x0,
+                x1,
+                y0,
+                y1,
+            )
+            return
+        if event == "warning":
+            logger.warning("%s warning=%s", prefix, payload.get("reason") or "unknown")
+            return
+        if event == "discard":
+            discarded = int(payload.get("discarded_px", payload.get("discarded", 0)))
+            if discarded > 0:
+                logger.debug("%s discarded=%d px (out-of-footprint)", prefix, discarded)
+
+    return _log_bounds
 
 # --- Alignment Warning Tracking ---
 # These warnings come from zemosaic_align_stack when an image fails to align.
@@ -13382,6 +13470,7 @@ def run_second_pass_coverage_renorm(
     use_gpu_two_pass: bool | None = None,
     tiles_coverage: list[np.ndarray | None] | None = None,
     parallel_plan: ParallelPlan | None = None,
+    gpu_bounds_margin_px: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     """Apply coverage-based gains to tiles and reproject them for a second pass."""
     if logger:
@@ -13411,6 +13500,18 @@ def run_second_pass_coverage_renorm(
             logger.warning("[TwoPass] zemosaic_utils unavailable; skipping second pass")
         return None
     use_gpu = bool(use_gpu_two_pass)
+    bounds_margin_override = None
+    if gpu_bounds_margin_px is not None:
+        try:
+            bounds_margin_override = float(gpu_bounds_margin_px)
+        except Exception:
+            bounds_margin_override = None
+        if bounds_margin_override is not None:
+            if not math.isfinite(bounds_margin_override):
+                bounds_margin_override = None
+            else:
+                bounds_margin_override = max(0.0, min(256.0, bounds_margin_override))
+    two_pass_bounds_logger = _make_gpu_bounds_logger("TwoPass")
     cpu_workers_hint: int | None = None
     plan_rows_cpu_hint: int | None = None
     plan_rows_gpu_hint: int | None = None
@@ -13530,6 +13631,10 @@ def run_second_pass_coverage_renorm(
         reproj_kwargs["rows_per_chunk"] = int(max(1, row_hint))
     if chunk_hint:
         reproj_kwargs["max_chunk_bytes"] = int(max(1, chunk_hint))
+    if use_gpu:
+        reproj_kwargs["gpu_tile_bounds_callback"] = two_pass_bounds_logger
+        if bounds_margin_override is not None:
+            reproj_kwargs["gpu_bounds_margin_px"] = bounds_margin_override
     if logger:
         try:
             logger.info(
@@ -18448,11 +18553,20 @@ def _assemble_global_mosaic_first_impl(
         if footprint_arr.ndim != 2 or footprint_arr.shape[1] < 2:
             return None
         try:
-            xs, ys = global_wcs_obj.wcs_world2pix(
-                footprint_arr[:, 0], footprint_arr[:, 1], 0
-            )
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                xs, ys = global_wcs_obj.world_to_pixel_values(
+                    footprint_arr[:, 0], footprint_arr[:, 1]
+                )
         except Exception:
-            return None
+            try:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    xs, ys = global_wcs_obj.world_to_pixel(
+                        footprint_arr[:, 0], footprint_arr[:, 1]
+                    )
+            except Exception:
+                return None
         xs = np.asarray(xs, dtype=np.float64)
         ys = np.asarray(ys, dtype=np.float64)
         if xs.size == 0 or ys.size == 0:
@@ -18705,6 +18819,9 @@ def _assemble_global_mosaic_first_impl(
             chunk_hint_gpu = plan_chunk_gpu_hint or plan_chunk_cpu_hint
             if chunk_hint_gpu:
                 gpu_reproj_kwargs["max_chunk_bytes"] = int(max(1, chunk_hint_gpu))
+            if gpu_bounds_margin_phase5 is not None:
+                gpu_reproj_kwargs["gpu_bounds_margin_px"] = float(gpu_bounds_margin_phase5)
+            gpu_reproj_kwargs["gpu_tile_bounds_callback"] = gpu_bounds_logger_phase5
             try:
                 chan_mosaic, chan_cov = zemosaic_utils.reproject_and_coadd_wrapper(
                     data_list=data_list,
@@ -19457,7 +19574,9 @@ def assemble_global_mosaic_sds(
                 rows = np.array([0, 0, h_local - 1, h_local - 1], dtype=float)
                 cols = np.array([0, w_local - 1, 0, w_local - 1], dtype=float)
                 world_coords = local_wcs.pixel_to_world(cols, rows)
-                ra_vals = getattr(world_coords, "ra", None)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", UserWarning)
+                    ra_vals = getattr(world_coords, "ra", None)
                 dec_vals = getattr(world_coords, "dec", None)
                 if ra_vals is None or dec_vals is None:
                     continue
