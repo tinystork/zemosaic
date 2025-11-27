@@ -801,7 +801,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._disable_phase45_config()
         self.localizer = self._create_localizer(self.config.get("language", "en"))
         self.setWindowTitle(
-            self._tr("qt_window_title_preview", "ZeMosaic V4.2.6 – Superacervandi ")
+            self._tr("qt_window_title_preview", "ZeMosaic V4.2.7 – Superacervandi ")
         )
         self._gpu_devices: List[Tuple[str, int | None]] = self._detect_gpus()
         if self._gpu_devices:
@@ -3906,7 +3906,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _refresh_translated_ui(self) -> None:
         self.setWindowTitle(
-            self._tr("qt_window_title_preview", "ZeMosaic V4.2.6 – Superacervandi ")
+            self._tr("qt_window_title_preview", "ZeMosaic V4.2.7 – Superacervandi ")
         )
         previous_log = ""
         if hasattr(self, "log_output"):
@@ -5137,7 +5137,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         astap_downsample = _coerce_int(cfg.get("astap_default_downsample", 2), 2)
         astap_sensitivity = _coerce_int(cfg.get("astap_default_sensitivity", 100), 100)
 
-        cluster_threshold = _coerce_float(cfg.get("cluster_panel_threshold", 0.12), 0.12)
+        cluster_threshold = _coerce_float(cfg.get("cluster_panel_threshold", 0.07), 0.07)
         cluster_target_groups = _coerce_int(cfg.get("cluster_target_groups", 0), 0)
         cluster_orientation = _coerce_float(cfg.get("cluster_orientation_split_deg", 0.0), 0.0)
 
@@ -5346,14 +5346,17 @@ class ZeMosaicQtMainWindow(QMainWindow):
         )
 
         worker_kwargs: Dict[str, Any] = {"solver_settings_dict": solver_settings_dict}
+        # Toujours propager les résultats du filtre (préplan, sélection) si disponibles.
+        # Cela garantit que les groupes auto-organisés sont pris en compte même en mode "resume".
+        if self._last_filter_overrides is not None or self._last_filtered_header_items is not None:
+            worker_kwargs["filter_invoked"] = True
+        if isinstance(self._last_filter_overrides, dict):
+            worker_kwargs["filter_overrides"] = self._last_filter_overrides
+        if isinstance(self._last_filtered_header_items, list):
+            worker_kwargs["filtered_header_items"] = self._last_filtered_header_items
+
         if skip_filter_ui:
             worker_kwargs["skip_filter_ui"] = True
-            if self._last_filter_overrides is not None or self._last_filtered_header_items is not None:
-                worker_kwargs["filter_invoked"] = True
-            if isinstance(self._last_filter_overrides, dict):
-                worker_kwargs["filter_overrides"] = self._last_filter_overrides
-            if isinstance(self._last_filtered_header_items, list):
-                worker_kwargs["filtered_header_items"] = self._last_filtered_header_items
             worker_kwargs["early_filter_enabled"] = False
         return worker_args, worker_kwargs
 
