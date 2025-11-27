@@ -102,6 +102,10 @@ DEFAULT_CONFIG = {
     "apply_radial_weight": False,
     "radial_feather_fraction": 0.8,
     "radial_shape_power": 2.0,
+    # Mosaic / clustering defaults
+    "cluster_panel_threshold": 0.05,
+    "cluster_target_groups": 0,
+    "cluster_orientation_split_deg": 0.0,
     # Master "use GPU wherever possible" toggle. Older configs may only carry
     # use_gpu_phase5/stack_use_gpu/use_gpu_stack, so normalization keeps them in sync.
     "use_gpu_global": True,
@@ -204,7 +208,7 @@ DEFAULT_CONFIG = {
     # Early GUI filter option (Phase 0 header-only scan)
     "enable_early_filter": True,
     # --- CLES POUR LE ROGNAGE DES MASTER TUILES ---
-    "apply_master_tile_crop": True,  # Désactivé par défaut
+    "apply_master_tile_crop": True,
     "master_tile_crop_percent": 3.0,  # Pourcentage par côté si activé (ex: 10%)
     "quality_crop_enabled": False,
     "quality_crop_band_px": 32,
@@ -444,7 +448,7 @@ def _normalize_gpu_flags(config: dict) -> None:
             if canonical is not None:
                 break
     if canonical is None:
-        canonical = False
+        canonical = True
     config["use_gpu_global"] = canonical
     for key in ("use_gpu_phase5", "stack_use_gpu", "use_gpu_stack"):
         config[key] = _coerce_boolish(config.get(key), canonical)
