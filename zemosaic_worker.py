@@ -12463,6 +12463,7 @@ def run_second_pass_coverage_renorm(
                     "[TwoPass] WCS convergence failed on channel %d, creating empty patch: %s",
                     ch_idx,
                     conv_exc,
+                    exc_info=False,
                 )
             chan_mosaic = np.full(shape_out_hw, np.nan, dtype=np.float32)
             chan_cov = np.zeros(shape_out_hw, dtype=np.float32)
@@ -12497,6 +12498,7 @@ def run_second_pass_coverage_renorm(
                             "[TwoPass] WCS convergence failed on channel %d (CPU fallback), creating empty patch: %s",
                             ch_idx,
                             conv_exc_cpu,
+                            exc_info=False,
                         )
                     chan_mosaic = np.full(shape_out_hw, np.nan, dtype=np.float32)
                     chan_cov = np.zeros(shape_out_hw, dtype=np.float32)
@@ -12519,6 +12521,7 @@ def run_second_pass_coverage_renorm(
                             "[TwoPass] WCS convergence failed on channel %d (CPU fallback), creating empty patch: %s",
                             ch_idx,
                             conv_exc_cpu2,
+                            exc_info=False,
                         )
                     chan_mosaic = np.full(shape_out_hw, np.nan, dtype=np.float32)
                     chan_cov = np.zeros(shape_out_hw, dtype=np.float32)
