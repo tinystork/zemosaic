@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import os
 import copy
+import inspect
 import shutil
 import time
 import traceback
@@ -14043,6 +14044,9 @@ def run_hierarchical_mosaic(
     pcb("PHASE_UPDATE:2", prog=None, lvl="ETA_LEVEL")
     # Use order-invariant connected-components clustering for robustness
     preplan_groups_active = False
+    # If we successfully map preplanned group(s) from the Filter UI then
+    # we enable a strict mode which prevents automatic re-splitting.
+    preplan_groups_strict = False
     if preplan_groups_override_paths:
         try:
             path_lookup = {
@@ -14076,8 +14080,11 @@ def run_hierarchical_mosaic(
                     mapped_info_groups.append(leftovers)
                 seestar_stack_groups = mapped_info_groups
                 preplan_groups_active = True
+                # Respect preplanned groups strictly: avoid any automatic
+                # splitting or caps that would change the number of groups.
+                preplan_groups_strict = True
                 _log_and_callback(
-                    f"Phase 2: using {len(mapped_info_groups)} preplanned group(s) from filter UI.",
+                    f"Phase 2: using {len(mapped_info_groups)} preplanned group(s) from filter UI (strict mode).",
                     prog=None,
                     lvl="INFO_DETAIL",
                     callback=progress_callback,
@@ -14501,7 +14508,17 @@ def run_hierarchical_mosaic(
         and (cluster_target_groups_config is None or int(cluster_target_groups_config) <= 0)
         and not memmap_streaming_enabled
     )
-    if allow_auto_limit and seestar_stack_groups:
+    if preplan_groups_strict and seestar_stack_groups:
+        # A preplan came from the Filter UI and mapped successfully. In
+        # strict mode we must not change the number or composition of the
+        # groups the user specified — skip auto-limit splitting.
+        _log_and_callback(
+            f"Phase 2: preplanned groups present (strict mode) — skipping runtime auto-limit splitting (groups kept = {len(seestar_stack_groups)})",
+            prog=None,
+            lvl="INFO_DETAIL",
+            callback=progress_callback,
+        )
+    elif allow_auto_limit and seestar_stack_groups:
         try:
             sample_path = None
             for group in seestar_stack_groups:
@@ -16421,26 +16438,62 @@ def run_hierarchical_mosaic_process(
             return
         progress_queue.put((message_key_or_raw, progress_value, level, cb_kwargs))
 
-    # Insert the process queue callback in the expected position (after
-    # cluster threshold, target group count, and orientation split parameter).
-    # With the current signature, progress_callback is the 11th positional arg.
-    if len(args) > 10:
-        candidate = args[10]
-        if callable(candidate):
-            # Replace the provided callback without disturbing other
-            # positional arguments.
-            full_args = args[:10] + (queue_callback,) + args[11:]
-        else:
-            # No callback was supplied: insert ours in the expected slot so
-            # that subsequent parameters keep their intended positions.
-            full_args = args[:10] + (queue_callback,) + args[10:]
-    else:
-        # Safety fallback: if the caller did not provide enough positional
-        # arguments to reach the callback slot, append ours so the worker
-        # still runs (mainly for CLI/debug scenarios).
-        full_args = args + (queue_callback,)
+    # Prepare arguments for run_hierarchical_mosaic from the incoming kwargs,
+    # as the GUI sends everything in kwargs.
+    final_kwargs = kwargs.copy()
+    final_kwargs['progress_callback'] = queue_callback
+    final_kwargs['solver_settings'] = solver_settings_dict
+
+    # 1. Rename keys from GUI config name to worker function argument name
+    rename_map = {
+        'input_dir': 'input_folder',
+        'output_dir': 'output_folder',
+        'astap_executable_path': 'astap_exe_path',
+        'astap_data_directory_path': 'astap_data_dir_param',
+        'astap_default_search_radius': 'astap_search_radius_config',
+        'astap_default_downsample': 'astap_downsample_config',
+        'astap_default_sensitivity': 'astap_sensitivity_config',
+        'stacking_normalize_method': 'stack_norm_method',
+        'stacking_weighting_method': 'stack_weight_method',
+        'stacking_rejection_algorithm': 'stack_reject_algo',
+        'stacking_final_combine_method': 'stack_final_combine',
+        'stacking_kappa_low': 'stack_kappa_low',
+        'stacking_kappa_high': 'stack_kappa_high',
+        'cluster_panel_threshold': 'cluster_threshold_config',
+        'cluster_target_groups': 'cluster_target_groups_config',
+        'cluster_orientation_split_deg': 'cluster_orientation_split_deg_config',
+    }
+    for old_key, new_key in rename_map.items():
+        if old_key in final_kwargs:
+            final_kwargs[new_key] = final_kwargs.pop(old_key)
+
+    # 2. Handle special parsing for winsor limits
+    if 'stacking_winsor_limits' in final_kwargs:
+        limits_str = final_kwargs.pop('stacking_winsor_limits')
+        try:
+            parts = [float(p.strip()) for p in str(limits_str).split(',')]
+            final_kwargs['parsed_winsor_limits'] = tuple(parts) if len(parts) == 2 else (0.05, 0.05)
+        except:
+            final_kwargs['parsed_winsor_limits'] = (0.05, 0.05)
+
+    # 3. Add '_config' suffix where it is the convention
+    sig_params = inspect.signature(run_hierarchical_mosaic).parameters
+    for key in list(final_kwargs.keys()):
+        config_key = f"{key}_config"
+        if config_key in sig_params and key not in sig_params:
+             final_kwargs[config_key] = final_kwargs.pop(key)
+
+    # 4. Filter out any keys that are not in the function signature
+    final_kwargs = {k: v for k, v in final_kwargs.items() if k in sig_params}
+
+    # Provide defaults for required arguments that may not be in the GUI config
+    if 'stack_ram_budget_gb_config' not in final_kwargs:
+        final_kwargs['stack_ram_budget_gb_config'] = 0.0
+    if 'num_base_workers_config' not in final_kwargs:
+        final_kwargs['num_base_workers_config'] = 0
+
     try:
-        run_hierarchical_mosaic(*full_args, solver_settings=solver_settings_dict, **kwargs)
+        run_hierarchical_mosaic(**final_kwargs)
     except Exception as e_proc:
         try:
             logger.exception("Worker process crashed before completion")

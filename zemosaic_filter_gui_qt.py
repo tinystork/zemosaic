@@ -5756,6 +5756,9 @@ class FilterQtDialog(QDialog):
         if footprint:
             payload["footprint_radec"] = footprint
 
+        if entry.cluster_index is not None:
+            payload["cluster_index"] = entry.cluster_index
+
         return payload
 
     def _should_include_header_for_entry(self, entry: _NormalizedItem) -> bool:
