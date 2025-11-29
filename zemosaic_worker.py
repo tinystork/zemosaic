@@ -9116,6 +9116,34 @@ def get_wcs_and_pretreat_raw_file(
 
 # ... (vos imports existants : os, shutil, time, traceback, gc, logging, np, astropy, reproject, et les modules zemosaic_...)
 
+def _safe_load_cache(path: str, *, pcb: Callable | None = None, tile_id: int | None = None):
+    """Load a numpy cache with a WinError-1455 aware fallback.
+
+    Attempts a memory-mapped load first (mmap_mode='r'). If an OSError
+    containing WinError 1455 is raised, retries without memmap. Any other
+    exception is re-raised.
+    Returns the loaded numpy array.
+    """
+    try:
+        return np.load(path, allow_pickle=False, mmap_mode="r")
+    except OSError as exc:
+        # Detect Windows paging file insufficiency
+        msg = str(exc)
+        if "WinError 1455" in msg or "1455" in msg or (hasattr(exc, "winerror") and getattr(exc, "winerror") == 1455):
+            try:
+                if pcb is not None:
+                    try:
+                        pcb("stack_mem_fallback_memmap_to_ram", prog=None, lvl="WARN", tile_id=tile_id, path=_safe_basename(path))
+                    except Exception:
+                        pass
+                # Retry without memmap
+                return np.load(path, allow_pickle=False, mmap_mode=None)
+            except Exception:
+                raise
+        # Other OSError: re-raise so caller can handle
+        raise
+
+
 def create_master_tile(
     seestar_stack_group_info: list[dict],
     tile_id: int,
@@ -9239,6 +9267,41 @@ def create_master_tile(
         except Exception:
             pass
     func_id_log_base = "mastertile"
+    # Detect and apply EXTREME_GROUP overrides for very large groups
+    try:
+        num_frames = int(len(seestar_stack_group_info) if seestar_stack_group_info is not None else 0)
+    except Exception:
+        num_frames = 0
+    extreme_group_threshold = int(getattr(zconfig, "extreme_group_threshold", 1000))
+    extreme_group_mode = num_frames >= extreme_group_threshold
+    _extreme_group_originals = {}
+    if extreme_group_mode:
+        try:
+            # Save originals (may be missing)
+            _extreme_group_originals["stack_mem_preemptive_stream_enabled"] = getattr(zconfig, "stack_mem_preemptive_stream_enabled", None)
+            _extreme_group_originals["stack_memmap_enabled"] = getattr(zconfig, "stack_memmap_enabled", None)
+            _extreme_group_originals["winsor_max_frames_per_pass"] = getattr(zconfig, "winsor_max_frames_per_pass", None)
+            # Apply aggressive overrides for the current tile only
+            try:
+                setattr(zconfig, "stack_mem_preemptive_stream_enabled", True)
+            except Exception:
+                pass
+            try:
+                setattr(zconfig, "stack_memmap_enabled", True)
+            except Exception:
+                pass
+            # Cap winsor frames per pass to a conservative value (defaults to 600)
+            winsor_cap = int(getattr(zconfig, "extreme_group_winsor_cap", 600))
+            try:
+                setattr(zconfig, "winsor_max_frames_per_pass", winsor_cap)
+            except Exception:
+                pass
+            try:
+                pcb_tile("mastertile_extreme_group", prog=None, lvl="WARN", tile_id=tile_id, num_frames=num_frames, reason="[EXTREME_GROUP]")
+            except Exception:
+                pass
+        except Exception:
+            _extreme_group_originals = {}
 
     pcb_tile(f"{func_id_log_base}_info_creation_started_from_cache", prog=None, lvl="INFO",
              num_raw=len(seestar_stack_group_info), tile_id=tile_id)
@@ -9308,7 +9371,7 @@ def create_master_tile(
         try:
             # Throttle concurrent cache reads and use memory-mapped load to reduce RAM spikes
             with _CACHE_IO_SEMAPHORE:
-                img_data_adu = np.load(cached_image_file_path, allow_pickle=False, mmap_mode='r') 
+                img_data_adu = _safe_load_cache(cached_image_file_path, pcb=pcb_tile, tile_id=tile_id)
             if not (isinstance(img_data_adu, np.ndarray) and img_data_adu.dtype == np.float32 and img_data_adu.ndim == 3 and img_data_adu.shape[-1] == 3):
                 pcb_tile(f"{func_id_log_base}_warn_invalid_cached_data", prog=None, lvl="WARN", filename=_safe_basename(cached_image_file_path), 
                          shape=img_data_adu.shape if hasattr(img_data_adu, 'shape') else 'N/A', 
@@ -9974,6 +10037,56 @@ def create_master_tile(
         if 'master_tile_stacked_HWC' in locals() and master_tile_stacked_HWC is not None: 
             del master_tile_stacked_HWC
         gc.collect()
+        # Restore any EXTREME_GROUP overrides applied to zconfig for this tile
+        try:
+            if '_extreme_group_originals' in locals() and isinstance(_extreme_group_originals, dict) and getattr(zconfig, None) is not None:
+                try:
+                    if 'stack_mem_preemptive_stream_enabled' in _extreme_group_originals:
+                        orig = _extreme_group_originals.get('stack_mem_preemptive_stream_enabled')
+                        if orig is None:
+                            try:
+                                delattr(zconfig, 'stack_mem_preemptive_stream_enabled')
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                setattr(zconfig, 'stack_mem_preemptive_stream_enabled', orig)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                try:
+                    if 'stack_memmap_enabled' in _extreme_group_originals:
+                        orig = _extreme_group_originals.get('stack_memmap_enabled')
+                        if orig is None:
+                            try:
+                                delattr(zconfig, 'stack_memmap_enabled')
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                setattr(zconfig, 'stack_memmap_enabled', orig)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+                try:
+                    if 'winsor_max_frames_per_pass' in _extreme_group_originals:
+                        orig = _extreme_group_originals.get('winsor_max_frames_per_pass')
+                        if orig is None:
+                            try:
+                                delattr(zconfig, 'winsor_max_frames_per_pass')
+                            except Exception:
+                                pass
+                        else:
+                            try:
+                                setattr(zconfig, 'winsor_max_frames_per_pass', orig)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 
 
