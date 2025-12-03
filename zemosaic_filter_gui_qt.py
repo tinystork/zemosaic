@@ -505,6 +505,7 @@ DEFAULT_FILTER_CONFIG.setdefault("force_seestar_mode", False)
 DEFAULT_FILTER_CONFIG.setdefault("sds_mode_default", False)
 DEFAULT_FILTER_CONFIG.setdefault("sds_min_batch_size", 5)
 DEFAULT_FILTER_CONFIG.setdefault("sds_target_batch_size", 10)
+DEFAULT_FILTER_CONFIG.setdefault("batch_overlap_pct", 40)
 DEFAULT_FILTER_CONFIG.setdefault("global_coadd_method", "kappa_sigma")
 DEFAULT_FILTER_CONFIG.setdefault("global_coadd_k", 2.0)
 DEFAULT_FILTER_CONFIG.setdefault(QT_FILTER_WINDOW_GEOMETRY_KEY, None)
@@ -1672,6 +1673,7 @@ class FilterQtDialog(QDialog):
         self._sds_checkbox: QCheckBox | None = None
         self._coverage_checkbox: QCheckBox | None = None
         self._overcap_spin: QSpinBox | None = None
+        self._overlap_spin: QSpinBox | None = None
         self._auto_angle_checkbox: QCheckBox | None = None
         self._angle_split_spin: QDoubleSpinBox | None = None
         self._astap_instances_combo: QComboBox | None = None
@@ -1709,6 +1711,9 @@ class FilterQtDialog(QDialog):
         )
         self._overcap_percent_value = self._clamp_overcap_percent(
             self._config_value("filter_overcap_allowance_pct", 10)
+        )
+        self._batch_overlap_percent_value = self._clamp_overlap_percent(
+            self._config_value("batch_overlap_pct", 40)
         )
         base_angle = _sanitize_angle_value(self._config_value("cluster_orientation_split_deg", 0.0), 0.0)
         if base_angle <= 0.0:
@@ -2026,7 +2031,7 @@ class FilterQtDialog(QDialog):
         initial_summary = self._format_group_summary(0, "[]")
         self._auto_group_summary_label.setText(initial_summary)
         self._auto_group_summary_label.setToolTip(initial_summary)
-        layout.addWidget(self._auto_group_summary_label, 0, 2, 7, 1)
+        layout.addWidget(self._auto_group_summary_label, 0, 2, 9, 1)
         layout.setColumnStretch(2, 1)
 
         astap_label = QLabel(
@@ -2078,13 +2083,25 @@ class FilterQtDialog(QDialog):
         self._overcap_spin.valueChanged.connect(self._on_overcap_changed)  # type: ignore[arg-type]
         layout.addWidget(self._overcap_spin, 4, 1)
 
+        overlap_label = QLabel(
+            self._localizer.get("ui_batch_overlap_pct", "Overlap between batches (%)"),
+            box,
+        )
+        layout.addWidget(overlap_label, 5, 0)
+        self._overlap_spin = QSpinBox(box)
+        self._overlap_spin.setRange(0, 70)
+        self._overlap_spin.setSingleStep(5)
+        self._overlap_spin.setValue(int(self._resolve_overlap_percent()))
+        self._overlap_spin.valueChanged.connect(self._on_overlap_changed)  # type: ignore[arg-type]
+        layout.addWidget(self._overlap_spin, 5, 1)
+
         self._auto_angle_checkbox = QCheckBox(
             self._localizer.get("ui_auto_angle_split", "Auto split by orientation"),
             box,
         )
         self._auto_angle_checkbox.setChecked(True)
         self._auto_angle_checkbox.toggled.connect(self._on_auto_angle_toggled)  # type: ignore[arg-type]
-        layout.addWidget(self._auto_angle_checkbox, 5, 0, 1, 2)
+        layout.addWidget(self._auto_angle_checkbox, 6, 0, 1, 2)
 
         angle_label = QLabel(
             self._localizer.get("ui_angle_split_threshold", "Orientation split (deg)"),
@@ -2097,7 +2114,7 @@ class FilterQtDialog(QDialog):
         self._angle_split_spin.setDecimals(1)
         self._angle_split_spin.setValue(float(self._angle_split_value))
         self._angle_split_spin.valueChanged.connect(self._on_angle_split_changed)  # type: ignore[arg-type]
-        layout.addWidget(self._angle_split_spin, 6, 1)
+        layout.addWidget(self._angle_split_spin, 7, 1)
 
         self._sds_checkbox = QCheckBox(
             self._localizer.get("filter_chk_sds_mode", "Enable ZeSupaDupStack (SDS)"),
@@ -2108,7 +2125,7 @@ class FilterQtDialog(QDialog):
             self._sds_checkbox.toggled.connect(self._on_sds_toggled)  # type: ignore[arg-type]
         except Exception:
             pass
-        layout.addWidget(self._sds_checkbox, 7, 0, 1, 2)
+        layout.addWidget(self._sds_checkbox, 8, 0, 1, 2)
 
         return box
 
@@ -2120,6 +2137,11 @@ class FilterQtDialog(QDialog):
         clamped = self._clamp_overcap_percent(value)
         self._overcap_percent_value = clamped
         self._runtime_overrides["filter_overcap_allowance_pct"] = clamped
+
+    def _on_overlap_changed(self, value: int) -> None:
+        clamped = self._clamp_overlap_percent(value)
+        self._batch_overlap_percent_value = clamped
+        self._runtime_overrides["batch_overlap_pct"] = clamped
 
     def _on_auto_angle_toggled(self, checked: bool) -> None:
         self._auto_angle_enabled = bool(checked)
@@ -2632,20 +2654,38 @@ class FilterQtDialog(QDialog):
 
         groups_after_autosplit = groups_used
         final_groups: list[list[dict[str, Any]]]
+        overlap_pct = self._resolve_overlap_percent()
+        overlap_fraction = max(0.0, min(0.7, float(overlap_pct) / 100.0))
         if cap_effective > 0:
-            groups_after_autosplit = _AUTOSPLIT_GROUPS(
-                groups_used,
-                cap=int(max(1, cap_effective)),
-                min_cap=int(max(1, min_cap)),
-                progress_callback=None,
-            )
+            if overlap_fraction <= 0.0 and _AUTOSPLIT_GROUPS is not None:
+                groups_after_autosplit = _AUTOSPLIT_GROUPS(
+                    groups_used,
+                    cap=int(max(1, cap_effective)),
+                    min_cap=int(max(1, min_cap)),
+                    progress_callback=None,
+                )
+            else:
+                groups_after_autosplit = []
+                for group in groups_used:
+                    ordered_group = self._sort_group_for_overlap(group)
+                    batches = self._make_overlapping_batches(
+                        ordered_group,
+                        cap=int(max(1, cap_effective)),
+                        overlap_fraction=overlap_fraction,
+                        min_cap=int(max(1, min_cap)),
+                    )
+                    if batches:
+                        groups_after_autosplit.extend(batches)
+                if not groups_after_autosplit:
+                    groups_after_autosplit = groups_used
             if coverage_enabled:
                 messages.append(
                     self._format_message(
                         "log_covfirst_autosplit",
-                        "Autosplit applied: cap={CAP}, min_cap={MIN}, groups_in={IN}, groups_out={OUT}",
+                        "Autosplit applied: cap={CAP}, min_cap={MIN}, overlap={OVER}%, groups_in={IN}, groups_out={OUT}",
                         CAP=int(cap_effective),
                         MIN=int(min_cap),
+                        OVER=int(overlap_pct),
                         IN=len(groups_used),
                         OUT=len(groups_after_autosplit),
                     )
@@ -2687,6 +2727,13 @@ class FilterQtDialog(QDialog):
                     )
                 )
             final_groups = groups_after_autosplit
+
+        self._log_batching_summary(
+            final_groups,
+            cap=int(cap_effective),
+            overlap_fraction=overlap_fraction if cap_effective > 0 else 0.0,
+            messages=messages,
+        )
 
         for group in final_groups:
             for info in group:
@@ -3446,6 +3493,122 @@ class FilterQtDialog(QDialog):
         if value is not None:
             return int(value)
         return self._clamp_overcap_percent(self._config_value("filter_overcap_allowance_pct", 10))
+
+    def _resolve_overlap_percent(self) -> int:
+        value = getattr(self, "_batch_overlap_percent_value", None)
+        if value is not None:
+            return int(value)
+        return self._clamp_overlap_percent(self._config_value("batch_overlap_pct", 40))
+
+    @staticmethod
+    def _sort_group_for_overlap(group: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not group:
+            return []
+
+        def _safe_number(value: Any) -> float:
+            try:
+                number = float(value)
+            except Exception:
+                return math.inf
+            return number if math.isfinite(number) else math.inf
+
+        ordered = sorted(
+            ((idx, info) for idx, info in enumerate(group)),
+            key=lambda item: (_safe_number(item[1].get("RA")), _safe_number(item[1].get("DEC")), item[0]),
+        )
+        return [info for _idx, info in ordered]
+
+    @staticmethod
+    def _make_overlapping_batches(
+        group: list[dict[str, Any]], *, cap: int, overlap_fraction: float, min_cap: int
+    ) -> list[list[dict[str, Any]]]:
+        if not group:
+            return []
+        if cap <= 0 or len(group) <= cap:
+            return [group]
+
+        step = max(1, int(cap * (1.0 - overlap_fraction)))
+        batches: list[list[dict[str, Any]]] = []
+        start = 0
+        n = len(group)
+
+        while start < n:
+            end = min(n, start + cap)
+            batch = group[start:end]
+            if batch:
+                if len(batch) < min_cap and batches and len(batches[-1]) < cap:
+                    batches[-1].extend(batch)
+                else:
+                    batches.append(batch)
+            if end == n:
+                break
+            start += step
+
+        if min_cap > 1 and len(batches) > 1:
+            merged: list[list[dict[str, Any]]] = []
+            for batch in batches:
+                if len(batch) < min_cap and merged:
+                    merged[-1].extend(batch)
+                else:
+                    merged.append(batch)
+            batches = merged
+        return batches
+
+    def _log_batching_summary(
+        self,
+        batches: list[list[dict[str, Any]]],
+        *,
+        cap: int,
+        overlap_fraction: float,
+        messages: list[str | tuple[str, str]] | None,
+    ) -> None:
+        if messages is None:
+            return
+        try:
+            effective_step = max(1, int(cap * (1.0 - overlap_fraction))) if cap > 0 else 0
+            overlap_pct = max(0.0, min(1.0, overlap_fraction))
+            sizes_text = ", ".join(str(len(batch)) for batch in batches) if batches else ""
+            messages.append(
+                self._format_message(
+                    "log_batching_params",
+                    "[Batching] cap={CAP}, overlap={OVER:.2f}, effective step={STEP}",
+                    CAP=int(cap),
+                    OVER=float(overlap_pct),
+                    STEP=int(effective_step),
+                )
+            )
+            messages.append(
+                self._format_message(
+                    "log_batching_sizes",
+                    "[Batching] Created {COUNT} batches, sizes: {SIZES}",
+                    COUNT=len(batches),
+                    SIZES=sizes_text or "<none>",
+                )
+            )
+            previous_paths: set[str] = set()
+            for idx, batch in enumerate(batches, start=1):
+                paths = {
+                    str(
+                        info.get("path")
+                        or info.get("file_path")
+                        or info.get("path_raw")
+                        or f"entry_{id(info)}"
+                    )
+                    for info in batch
+                }
+                overlap_with_prev = len(previous_paths.intersection(paths)) if previous_paths else 0
+                messages.append(
+                    self._format_message(
+                        "log_batching_batch_detail",
+                        "[Batching] Batch {IDX}: size={SIZE}, overlap_with_prev={OVERLAP}",
+                        IDX=int(idx),
+                        SIZE=len(batch),
+                        OVERLAP=int(overlap_with_prev),
+                    )
+                )
+                previous_paths = paths
+        except Exception:
+            return
 
     def _coverage_first_enabled(self) -> bool:
         return bool(self._coverage_first_enabled_flag)
@@ -5852,6 +6015,15 @@ class FilterQtDialog(QDialog):
         return parsed
 
     @staticmethod
+    def _clamp_overlap_percent(value: Any, default: int = 40) -> int:
+        try:
+            parsed = int(value)
+        except Exception:
+            parsed = default
+        parsed = max(0, min(70, parsed))
+        return parsed
+
+    @staticmethod
     def _coerce_float(value: Any, default: float) -> float:
         try:
             result = float(value)
@@ -6244,6 +6416,7 @@ class FilterQtDialog(QDialog):
         if self._sds_checkbox is not None:
             overrides["sds_mode"] = bool(self._sds_checkbox.isChecked())
         overrides["filter_overcap_allowance_pct"] = int(self._resolve_overcap_percent())
+        overrides["batch_overlap_pct"] = int(self._resolve_overlap_percent())
         overrides["filter_enable_coverage_first"] = bool(self._coverage_first_enabled_flag)
         if hasattr(self, "_auto_angle_enabled") and not getattr(self, "_auto_angle_enabled", True):
             overrides["cluster_orientation_split_deg"] = float(self._angle_split_value)
