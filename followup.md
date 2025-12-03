@@ -1,274 +1,48 @@
-# Follow-up checklist – Phase 3 AUTO GPU (Mode C)
+# Follow-up – ASTAP concurrency cap (cpu_count - 2 rule)
 
-Work through the steps in order and tick them as you go.
+Merci d’avoir implémenté la première passe 🙏  
+Voici la checklist de vérification et d’éventuels ajustements.
 
----
+## ✅ Checklist de review
 
-## 1. Understand current Phase 3 stacker wiring
+- [ ] Le helper `compute_astap_recommended_max_instances(...)` est bien présent dans `zemosaic_astrometry.py`, documenté, et sans dépendances inutiles.
+- [ ] Le helper gère proprement les cas edge (cpu_count=None, exceptions) et retourne toujours `>= 1`.
+- [ ] Le helper applique bien la règle : `recommended = min(max(1, cpu - 2), 32)`.
 
-- [x] Open `zemosaic_worker.py` and locate **Phase 3** code:
-  - `create_master_tile(...)`,
-  - any helpers directly responsible for stacking aligned frames into a master tile.
-- [x] Identify where the **CPU stacker** in `zemosaic_align_stack.py` is called.
-- [x] Confirm how `ParallelPlan` (from `parallel_utils`) is obtained and whether it is already
-      available in Phase 3 context.
+### GUI Qt principal
 
----
+- [ ] Le `QSpinBox` `astap_max_instances` utilise maintenant `maximum=compute_astap_recommended_max_instances()`, avec un fallback cohérent en cas d’erreur.
+- [ ] `_resolve_astap_max_instances()` clamp la valeur de config entre 1 et la limite recommandée.
+- [ ] `_apply_astap_concurrency_setting()` utilise toujours `_resolve_astap_max_instances()` et met à jour :
+  - [ ] `os.environ["ZEMOSAIC_ASTAP_MAX_PROCS"]`
+  - [ ] `set_astap_max_concurrent_instances(...)` (si disponible)
+- [ ] Si une ancienne config contient une valeur > limite recommandée, le spinbox affiche bien la valeur clampée après chargement du GUI.
 
-## 2. Cleanly isolate the CPU Phase 3 stacker
+### Filter GUI Qt
 
-- [x] In `zemosaic_worker.py`, extract the existing CPU stacking logic into a dedicated helper:
+- [ ] `zemosaic_filter_gui_qt.py` importe `compute_astap_recommended_max_instances` (avec garde `try/except` si nécessaire).
+- [ ] `_populate_astap_instances_combo()` utilise le helper pour calculer `cap`, avec fallback sur l’ancien comportement (`cpu_count // 2`) en cas d’erreur.
+- [ ] La combo “Max ASTAP instances” propose la plage `[1 .. min(os.cpu_count() - 2, 32)]`.
+- [ ] Le warning multi-instance (popup “Access violation” / “ASTAP Concurrency Warning”) fonctionne toujours dès que l’utilisateur choisit `> 1`.
 
-  - Example: `_stack_master_tile_cpu(image_descriptors, stacking_params, parallel_plan, logger, pcb_tile, ...)`.
+### Config & compat
 
-- [x] Ensure this helper:
-  - uses **exactly the same behaviour** as the current Phase 3 implementation:
-    - memmap vs in-memory,
-    - streaming over rows or tiles,
-    - kappa/winsor/linear-fit clipping,
-    - final combine (mean/median/min/max),
-    - RGB equalization, etc.
-  - returns a tuple `(stacked_array, stack_metadata)` where:
-    - `stacked_array` is `float32`, contiguous, shape `(H, W, C)` or `(H, W)`,
-    - `stack_metadata` contains whatever the CPU path already produces.
+- [ ] `DEFAULT_CONFIG["astap_max_instances"]` est toujours défini et cohérent (1 ou autre valeur raisonnable).
+- [ ] `get_astap_max_instances()` renvoie une valeur `>= 1` et reste compatible avec le reste du code.
+- [ ] Aucun changement n’a été apporté aux pipelines CPU/GPU de stacking / mosaïque.
 
-- [x] Replace direct CPU stacking calls in `create_master_tile(...)` with calls to `_stack_master_tile_cpu(...)`
-      so the current behaviour is preserved.
+## 🧪 Tests manuels à effectuer
 
----
+1. **Machine avec peu de threads (ex: 4 ou 8 threads)**  
+   - [ ] Vérifier que la limite GUI = `min(cpu_count - 2, 32)` (ex: 8 threads → max 6).
+   - [ ] Lancer un run et vérifier dans les logs que la valeur passée à ASTAP correspond bien au réglage choisi (clampé).
+2. **Machine avec beaucoup de threads (ex: 32 ou 64 threads)**  
+   - [ ] Vérifier que la limite GUI n’excède jamais 32.
+3. **Ancienne config qui contenait une valeur élevée**  
+   - [ ] Modifier manuellement `zemosaic_config.json` pour mettre `astap_max_instances` à une valeur absurde (ex: 80).
+   - [ ] Relancer le GUI QT :
+     - [ ] Le spinbox doit afficher une valeur `<= min(cpu_count - 2, 32)`.
+     - [ ] La valeur runtime appliquée à ASTAP doit être identique à celle affichée.
 
-## 3. Wire up the GPU helper for Phase 3
-
-- [x] Open `zemosaic_align_stack_gpu.py` and inspect:
-
-  - `GPUStackingError`,
-  - `_gpu_is_usable(logger)`,
-  - `gpu_stack_from_arrays(...)`,
-  - `gpu_stack_from_paths(...)`.
-
-- [x] In `zemosaic_worker.py`:
-
-  - [x] Add a **lazy import** block at top-level:
-
-    ```python
-    try:
-        from zemosaic_align_stack_gpu import (
-            gpu_stack_from_paths as _p3_gpu_stack_from_paths,
-            GPUStackingError as _P3GPUStackingError,
-            _gpu_is_usable as _p3_gpu_is_usable,
-        )
-        _P3_GPU_HELPERS_AVAILABLE = True
-    except Exception:
-        _p3_gpu_stack_from_paths = None
-        class _P3GPUStackingError(RuntimeError):
-            pass
-        def _p3_gpu_is_usable(logger=None):
-            return False
-        _P3_GPU_HELPERS_AVAILABLE = False
-    ```
-
-  - [x] Ensure this does **not** raise on CPU-only machines.
-
-- [x] Introduce a small Phase-3-specific state holder, e.g. at module or worker level:
-
-  ```python
-  _P3_GPU_STATE = {
-      "allowed": True,          # initial intent
-      "hard_disabled": False,   # becomes True after repeated failure
-      "health_checked": False,
-      "healthy": False,
-      "info_logged": False,
-  }
+Si tout passe cette checklist, on considérera la tâche comme **terminée et stable** pour les utilisateurs “lambda”, tout en gardant la possibilité de tweaker finement via la config/env pour les power users.
 ````
-
----
-
-## 4. Implement Mode C decision logic
-
-* [x] Add a helper in `zemosaic_worker.py`:
-
-  ```python
-  def _phase3_gpu_candidate(parallel_plan, logger) -> bool:
-      if _P3_GPU_STATE["hard_disabled"]:
-          return False
-      if not _P3_GPU_HELPERS_AVAILABLE:
-          return False
-      # Optionally respect ParallelPlan.use_gpu if present:
-      try:
-          if parallel_plan is not None and not getattr(parallel_plan, "use_gpu", True):
-              return False
-      except Exception:
-          pass
-      if not _P3_GPU_STATE["health_checked"]:
-          healthy = bool(_p3_gpu_is_usable(logger))
-          _P3_GPU_STATE["healthy"] = healthy
-          _P3_GPU_STATE["health_checked"] = True
-      return _P3_GPU_STATE["healthy"]
-  ```
-
-* [x] Use this helper in the new `_stack_master_tile_auto(...)` to decide if GPU should be attempted.
-
----
-
-## 5. Implement `_stack_master_tile_auto(...)` with strict retry
-
-* [x] Add a new helper, e.g.:
-
-  ```python
-  def _stack_master_tile_auto(image_descriptors, stacking_params, parallel_plan, logger, pcb_tile, zconfig, ...):
-      # 1) Decide if GPU is a candidate
-      use_gpu_candidate = _phase3_gpu_candidate(parallel_plan, logger)
-
-      # 2) GPU attempt + optional retry
-      if use_gpu_candidate and _p3_gpu_stack_from_paths is not None:
-          # First attempt
-          try:
-              stacked, meta = _p3_gpu_stack_from_paths(
-                  image_descriptors,
-                  stacking_params,
-                  parallel_plan=parallel_plan,
-                  logger=logger,
-                  pcb_tile=pcb_tile,
-                  zconfig=zconfig,
-              )
-              return stacked, meta, True
-          except _P3GPUStackingError as exc:
-              if logger:
-                  logger.warning("[P3][GPU] GPUStackingError on first attempt: %s -- retrying once", exc)
-          except Exception as exc:
-              if logger:
-                  logger.warning("[P3][GPU] Unexpected GPU error on first attempt: %s -- retrying once", exc, exc_info=True)
-
-          # Optional: free pools / tighten chunk before second attempt (next step)
-          # Second attempt
-          try:
-              stacked, meta = _p3_gpu_stack_from_paths(
-                  image_descriptors,
-                  stacking_params,
-                  parallel_plan=parallel_plan,
-                  logger=logger,
-                  pcb_tile=pcb_tile,
-                  zconfig=zconfig,
-              )
-              return stacked, meta, True
-          except Exception as exc:
-              if logger:
-                  logger.error(
-                      "[P3][GPU] Second GPU attempt failed; disabling Phase 3 GPU for this run: %s",
-                      exc,
-                      exc_info=True,
-                  )
-              _P3_GPU_STATE["hard_disabled"] = True
-
-      # 3) CPU fallback (either GPU disabled or both attempts failed)
-      stacked_cpu, meta_cpu = _stack_master_tile_cpu(
-          image_descriptors,
-          stacking_params,
-          parallel_plan=parallel_plan,
-          logger=logger,
-          pcb_tile=pcb_tile,
-          zconfig=zconfig,
-      )
-      return stacked_cpu, meta_cpu, False
-  ```
-
-* [x] Replace all direct Phase 3 stack calls in `create_master_tile(...)` with `_stack_master_tile_auto(...)`.
-
----
-
-## 6. Improve retry for OOM via chunk/pool tuning
-
-* [x] Open `cuda_utils.py` and `zemosaic_utils.py` and look for helpers like:
-
-  * `ensure_cupy_pool_initialized`,
-  * `free_cupy_memory_pools`,
-  * `gpu_memory_sufficient` or similar.
-
-* [x] Between the first and second GPU attempts, do the following **if the error looks memory-related**:
-
-  * [x] Detect OOM errors using either:
-
-    * specific exception classes (`cp.cuda.memory.OutOfMemoryError`),
-    * or a utility like `cuda_utils.is_oom_error(exc)` if present.
-
-  * [x] If OOM:
-
-    * Call `free_cupy_memory_pools()` / equivalent to release cached VRAM.
-    * Optionally recompute a stricter `ParallelPlan` for the retry
-      (smaller `gpu_max_chunk_bytes` / `gpu_rows_per_chunk`), or pass an override
-      `rows_per_chunk` kwarg to the GPU stacker if supported.
-
-* [x] Ensure that this retry logic is safe and does not crash on CPU-only machines
-  (all GPU helpers must be behind guards).
-
----
-
-## 7. Preserve downstream Phase 3 behaviour
-
-* [x] Verify that the output of `_stack_master_tile_auto(...)` has the same shape/dtype
-  as the CPU stacker and is passed through:
-
-  * Lecropper pipeline,
-  * quality cropping,
-  * alpha mask generation,
-  * metadata/telemetry.
-
-* [x] If the GPU path adds extra metadata (e.g. `stack_metadata["rgb_equalization"]`),
-  ensure this doesn’t conflict with existing dictionaries.
-
----
-
-## 8. Logging & diagnostics
-
-* [x] Add a single INFO log at the start of Phase 3 when GPU is used:
-
-  * `"[P3][GPU] Phase 3 GPU auto mode enabled (mode=C, candidate=True)"`.
-
-* [x] Ensure `zemosaic_align_stack_gpu.py` emits `phase3_gpu_chunk_summary`
-  via `pcb_tile` when available.
-
-* [x] Ensure that when GPU is hard-disabled:
-
-  * the worker logs something like:
-
-    * `"[P3][GPU] GPU disabled for remaining Phase 3 tiles after repeated failures."`.
-
----
-
-## 9. Test scenarios
-
-* [x] **CPU-only test** (no CuPy / no CUDA):
-
-  * Imported `zemosaic_worker` and exercised `_phase3_gpu_candidate` in this CPU-only
-    environment to verify GPU helpers remain disabled and do not raise on import.
-  * Run a representative dataset.
-  * Confirm:
-
-    * Phase 3 runs fully on CPU,
-    * output is unchanged compared to pre-GPU code.
-
-* [ ] **Happy GPU path**:
-
-  * On a CUDA machine, run a large dataset (~10k+ frames).
-  * Confirm:
-
-    * GPU is used for all tiles,
-    * chunk sizes make sense in `phase3_gpu_chunk_summary`,
-    * final mosaic shows no coverage holes or strange seams.
-
-  * Status: blocked in this environment due to missing CUDA hardware; leave pending for GPU testbed.
-
-* [ ] **Forced GPU failure**:
-
-  * Temporarily inject a `raise GPUStackingError("test")` in the GPU stacker
-    for one tile, or force an OOM.
-  * Confirm:
-
-    * GPU is attempted once, then retried once,
-    * afterwards, GPU is hard-disabled and the entire remainder of the run is CPU-only,
-    * the tile for which GPU failed is correctly produced via CPU.
-
-  * Status: blocked pending access to a GPU-capable environment to simulate failure.
-
-If any change would require touching Phase 5 or GUI files, stop and document
-your reasoning instead of modifying them in this mission.

@@ -1,249 +1,299 @@
-# Mission: Phase 3 “Mode C” – Automatic GPU with strict fallback to CPU-only
+# ZeMosaic – ASTAP concurrency cap (GUI-aware, cpu_count-2 rule)
 
-## Objective
+## 🧭 Contexte
 
-Restore and solidify the **Phase 3 GPU stacker** using `zemosaic_align_stack_gpu.py`, with a
-simple **automatic behaviour**:
+- ZeMosaic utilise ASTAP pour résoudre les WCS, avec une limite de concurrence globale pilotée par :
+  - `zemosaic_astrometry.set_astap_max_concurrent_instances(...)` :contentReference[oaicite:0]{index=0}  
+  - une valeur de config `astap_max_instances` (persistée dans `zemosaic_config.json`). :contentReference[oaicite:1]{index=1}
+- Dans le **GUI Qt principal**, la section *ASTAP configuration* expose un champ :
+  - `astap_max_instances` via `_register_spinbox(..., minimum=1, maximum=16)` :contentReference[oaicite:2]{index=2}
+- Dans le **Filter GUI Qt**, il existe déjà une logique dynamique de remplissage d’une combo "Max ASTAP instances" :
+  - `_populate_astap_instances_combo()` construit la liste `[1..cap]` avec `cap = max(1, os.cpu_count() // 2)` et applique ensuite `set_astap_max_concurrent_instances(...)`. 
 
-- No new GUI options.
-- Internally, Phase 3 works in **Mode C = AUTO**:
+L’utilisateur souhaite :
+1. Remplacer la limite fixe (8/16) par une limite **dynamique et “safe”** basée sur le nombre de threads CPU.
+2. Règle souhaitée : **max_instances = min(cpu_count - 2, 32)**, avec un plancher à 1 (on laisse 2 threads au système).
+3. Harmoniser le comportement entre le **GUI principal Qt** et le **Filter GUI Qt**, sans casser la compatibilité existante.
 
-  1. If a sane GPU is present → **use GPU for all Phase 3 stacks** (with VRAM-aware chunking).
-  2. On **first GPU failure** (CuPy unavailable, GPU smoke test fails, OOM, `GPUStackingError`, etc.):
-     - attempt **one explicit retry on GPU** after freeing pools / tightening chunking if possible;
-     - if the retry still fails → **disable GPU for the rest of the run** and
-       **recompute the current tile on CPU**.
-  3. Once the GPU has been declared “unusable”, **all remaining Phase 3 stacks run on the CPU**
-     using the existing CPU/memmap/streaming fallback chain.
-
-The goals are:
-
-- keep **exactly the same quality** as the CPU reference path,
-- avoid mixing “half-GPU / half-CPU / partially failed” tiles,
-- avoid catastrophic fallbacks that create coverage holes or weird seams (cf. the Andromeda example).
+⚠️ Important :  
+- Ne pas toucher au pipeline CPU/GPU ni à la logique de stacking / mosaïque.  
+- Ne pas introduire de nouvelles dépendances lourdes.
 
 ---
 
-## Constraints
+## 📂 Fichiers à lire avant toute modification
 
-- **No new GUI controls**.
-  - Tk and Qt GUIs keep their current GPU toggle/semantics if they exist.
-  - Phase 3 behaviour is automatic given the existing config + hardware.
-
-- **No change** to SDS/non-SDS logic, clustering, ZeQualityMT, Lecropper, or Phase 5.
-  This mission focuses on **Phase 3 stacking only**.
-
-- Keep the GPU logic self-contained:
-  - all CuPy imports and GPU helpers live in `zemosaic_align_stack_gpu.py` or `cuda_utils.py`;
-  - `zemosaic_worker.py` must remain importable on CPU-only machines.
-
-- Preserve existing **memmap / streaming / chunking** behaviour in the CPU path:
-  - GPU should accelerate Phase 3,
-  - but must never degrade global quality when it fails → we fall back to the existing CPU stacker.
+- `zemosaic_gui_qt.py`  
+  - Section ASTAP config, enregistrement du spinbox `astap_max_instances`. 
+- `zemosaic_filter_gui_qt.py`  
+  - Gestion de l’UI ASTAP instances `_populate_astap_instances_combo`, `_resolve_initial_astap_instances`, `_apply_astap_instances_choice`, `_prepare_astap_configuration`. 
+- `zemosaic_astrometry.py`  
+  - `set_astap_max_concurrent_instances`, mécanique de sémaphore interne. 
+- `zemosaic_config.py`  
+  - `DEFAULT_CONFIG["astap_max_instances"]`, `get_astap_max_instances()`. 
+- (Optionnel) `en.json` / `fr.json` si tu ajoutes un tooltip explicatif sur la limite. 
 
 ---
 
-## Relevant files
+## 🎯 Objectifs
 
-You will likely need to work in:
-
-- `zemosaic_worker.py`  (Phase 3 orchestration, `create_master_tile`, etc.)
-- `zemosaic_align_stack.py`  (CPU stacker and streaming/memmap logic)
-- `zemosaic_align_stack_gpu.py`  (new GPU stacker for Phase 3 — already present again)
-- `parallel_utils.py`  (ParallelPlan, chunk/autotune info)
-- `cuda_utils.py`  (optional helpers to check GPU health, flush pools, etc.)
-- `zemosaic_utils.py`  (GPU pool helpers used in other places)
-
-Please **do not** modify GUI files (`zemosaic_gui*.py`) or Phase 5 / two-pass code in this mission.
+1. **Introduire une fonction utilitaire unique** qui calcule une limite “recommandée” pour ASTAP en fonction du CPU :  
+   - Règle :  
+     - `cpu = os.cpu_count() or 2`  
+     - `safe = max(1, cpu - 2)` (on laisse 2 threads au système)  
+     - `recommended = min(safe, 32)` (cap “hard” à 32 pour éviter les débordements absurdes).
+2. **Utiliser cette fonction dans le GUI Qt principal** pour :
+   - Fixer dynamiquement le `maximum` du `QSpinBox` `astap_max_instances`.
+   - Clamper la valeur persistée / collectée (ne jamais remonter plus que `recommended` aux workers).
+3. **Réutiliser la même logique dans le Filter GUI Qt** :
+   - Remplacer `cap = max(1, cpu_count // 2)` par l’appel à la même fonction, pour que les deux GUIs soient cohérents.
+4. **S’assurer que `set_astap_max_concurrent_instances(...)` reste la seule source de vérité runtime**, appelée depuis les GUIs avec une valeur déjà clampée par la règle `cpu_count - 2`, max 32.
+5. **Préserver le comportement existant** :
+   - Si un utilisateur a un `astap_max_instances` déjà configuré dans `zemosaic_config.json` :
+     - on charge la valeur, on la clamp entre 1 et `recommended`.
+     - on met à jour l’UI en conséquence.
+   - Si aucune valeur n’est configurée → on peut garder la valeur par défaut (1) ou l’auto-remplacer par `recommended` si tu juges ça plus UX-friendly (voir tâches détaillées ci-dessous).
 
 ---
 
-## Target behaviour in detail
+## ✅ Tâches détaillées
 
-### 1. Centralize Phase 3 GPU usability
+### 1. Créer un helper central pour la limite “safe” ASTAP
 
-Implement / use a small set of helpers so that Phase 3 can ask:
+**Proposition de localisation :** `zemosaic_astrometry.py` (où vit déjà la logique de concurrence ASTAP).
 
-- “Is GPU globally usable for Phase 3?” (result cached for this run)
-- “Should this particular tile use GPU, or has GPU been disabled already?”
+- Ajouter en haut du fichier les imports nécessaires :
+  - `import os` si absent.
+- Ajouter une fonction :
 
-You can base this on the existing `_gpu_is_usable` in `zemosaic_align_stack_gpu.py`:
+```python
+def compute_astap_recommended_max_instances(
+    *,
+    reserve_threads: int = 2,
+    hard_max: int = 32,
+    min_cap: int = 1,
+) -> int:
+    """
+    Compute a 'safe' upper bound for ASTAP concurrency based on CPU count.
 
-- Ensure `_gpu_is_usable(logger)`:
-  - checks CuPy availability,
-  - does a tiny allocation,
-  - caches the result (`_GPU_HEALTH_CHECKED`, `_GPU_HEALTHY`).
+    Rule of thumb:
+      - leave a few threads for the OS / GUI / Python (reserve_threads)
+      - never exceed a conservative hard cap (hard_max)
+    """
+    try:
+        cpu = os.cpu_count() or (reserve_threads + 1)
+    except Exception:
+        cpu = reserve_threads + 1
 
-On the worker side (`zemosaic_worker.py`), maintain **two Phase-3-specific flags**:
-
-- `phase3_gpu_allowed: bool` – initial candidate based on:
-  - `_gpu_is_usable(logger)`,
-  - existing config/ParallelPlan (if `plan.use_gpu` is False, you can short-circuit).
-- `phase3_gpu_hard_disabled: bool` – once set to `True`, GPU is no longer attempted
-  for any subsequent tiles.
-
-These flags should live in a scope shared by all Phase 3 stacks within a run
-(e.g. part of the worker object, or `phase3_state` dict threaded through Phase 3).
-
-### 2. Route Phase 3 stacks through the GPU helper (Mode C behaviour)
-
-In `zemosaic_worker.py`:
-
-- Identify the Phase 3 stack entry point (`create_master_tile(...)`) which currently
-  stacks a list of aligned frames using the CPU stacker.
-
-Refactor it so that:
-
-1. The **CPU implementation** is clearly isolated:
-   - e.g. `_stack_master_tile_cpu(...)` that calls into `zemosaic_align_stack`
-     (with streaming/memmap/autochunk exactly as today).
-
-2. The **GPU attempt** uses `gpu_stack_from_paths(...)` or `gpu_stack_from_arrays(...)`
-   from `zemosaic_align_stack_gpu.py`:
-
-   - Pass:
-     - the aligned images or their cached `.npy` paths (depending on how Phase 3 stores them),
-     - `stacking_params` / `stack_cfg` already used by the CPU stacker,
-     - `parallel_plan` (if available) so `_resolve_rows_per_chunk(...)` can compute
-       rows per chunk from `gpu_max_chunk_bytes` / `gpu_rows_per_chunk`,
-     - the Phase 3 logger and `pcb_tile` callback if available (for chunk telemetry).
-
-   - Respect `GPUStackingError`:
-     - this is the signal that the GPU stacker cannot provide a valid image
-       (NaNs, all zeros, unsupported algo, etc.).
-
-3. Implement **Mode C logic**:
-
-   ```python
-   def _stack_master_tile_auto(...):
-       # phase3_gpu_allowed & phase3_gpu_hard_disabled come from surrounding state
-       if phase3_gpu_allowed and not phase3_gpu_hard_disabled:
-           # First GPU attempt
-           try:
-               result_gpu, meta_gpu = gpu_stack_from_paths(
-                   image_descriptors,
-                   stacking_params,
-                   parallel_plan=parallel_plan,
-                   logger=logger,
-                   pcb_tile=pcb_tile,
-               )
-               used_gpu = True
-               return result_gpu, meta_gpu, used_gpu
-           except GPUStackingError as exc:
-               # GPU path produced unusable data; mark it as “suspect” but not yet hard-disabled
-               logger.warning("[P3][GPU] Stack failed (GPUStackingError): %s -- retrying once on GPU", exc)
-               # Optional: try freeing CuPy pools / tightening chunk size here
-               # (see section 3 below), then one more GPU attempt...
-           except Exception as exc:
-               logger.warning("[P3][GPU] Unexpected GPU error: %s -- retrying once on GPU", exc, exc_info=True)
-               # same retry logic
-           # Second GPU attempt (after clean-up). If it fails again:
-           try:
-               # same call as above, potentially with smaller chunk
-               result_gpu, meta_gpu = gpu_stack_from_paths(...)
-               used_gpu = True
-               return result_gpu, meta_gpu, used_gpu
-           except Exception as exc:
-               logger.error("[P3][GPU] Second GPU attempt failed; disabling Phase 3 GPU for this run: %s", exc, exc_info=True)
-               phase3_gpu_hard_disabled = True
-               # fall through to CPU
-       # CPU fallback (either GPU disabled, or both attempts failed)
-       used_gpu = False
-       result_cpu, meta_cpu = _stack_master_tile_cpu(...)
-       return result_cpu, meta_cpu, used_gpu
+    # Leave some room for the OS and other processes
+    safe = max(min_cap, cpu - reserve_threads)
+    # Apply hard cap to avoid oversubscription on HEDT/servers
+    return max(min_cap, min(safe, hard_max))
 ````
 
-* The *current* tile is always recomputed on CPU after GPU failure,
-  so we never end up with a half-empty super-tile or dropped frames.
-* Once `phase3_gpu_hard_disabled` is `True`, all subsequent tiles go directly to CPU.
+* Exposer cette fonction dans `__all__` si ce pattern est utilisé dans le module (à vérifier).
 
-4. Ensure the rest of `create_master_tile(...)` is agnostic:
+### 2. Utiliser ce helper dans le GUI Qt principal (`zemosaic_gui_qt.py`)
 
-   * It just receives the stacked array (`master_data`) + metadata,
-     feeds it through Lecropper, quality crop, alpha mask, etc.,
-     regardless of whether it came from GPU or CPU.
+#### 2.1. Importer le helper
 
-### 3. Chunking and retry refinement
+* En haut du fichier, près de l’import de `set_astap_max_concurrent_instances`, ajouter :
 
-To minimise OOM and maximise VRAM usage, use existing helpers instead of ad-hoc sizes:
+```python
+from zemosaic_astrometry import (
+    set_astap_max_concurrent_instances,
+    compute_astap_recommended_max_instances,
+)
+```
 
-* In `zemosaic_align_stack_gpu.py`:
+(adapte si le code utilise déjà un `try/except` pour les imports facultatifs).
 
-  * `_resolve_rows_per_chunk(...)` already uses `ParallelPlan` (`gpu_rows_per_chunk`, `gpu_max_chunk_bytes`)
-    and defaults (`DEFAULT_GPU_MAX_CHUNK_BYTES`, `DEFAULT_GPU_ROWS_PER_CHUNK`).
+#### 2.2. Dynamiser la création du spinbox `astap_max_instances`
 
-* Ensure the worker actually passes a `parallel_plan` to the GPU stacker when available.
+Dans `_build_solver_tab` (ou la méthode correspondante où tu appelles `_register_spinbox` sur `astap_max_instances`) :
 
-For the **second GPU attempt** after failure:
+Actuellement :
 
-* If the error is clearly memory-related (e.g. `cp.cuda.memory.OutOfMemoryError`),
-  or you catch a dedicated helper like `cuda_utils.is_oom_error(exc)`:
+```python
+self._register_spinbox(
+    "astap_max_instances",
+    astap_layout,
+    self._tr("qt_field_astap_max_instances", "Max ASTAP instances"),
+    minimum=1,
+    maximum=16,
+)
+```
 
-  * try to:
+Remplacer par quelque chose comme :
 
-    * free CuPy pools (`zemosaic_utils.free_cupy_memory_pools()` or equivalent in `cuda_utils`),
-    * reduce the effective chunk size:
+```python
+try:
+    astap_cap = compute_astap_recommended_max_instances()
+except Exception:
+    astap_cap = 16  # fallback conservative
 
-      * either by constructing a new `ParallelPlan` with smaller `gpu_max_chunk_bytes`,
-      * or by passing an explicit `rows_per_chunk` override to the GPU stacker
-        (you can extend `gpu_stack_from_arrays` kwargs to accept `rows_per_chunk_override`
-        if needed—keep it optional and backwards-compatible).
+self._register_spinbox(
+    "astap_max_instances",
+    astap_layout,
+    self._tr("qt_field_astap_max_instances", "Max ASTAP instances"),
+    minimum=1,
+    maximum=astap_cap,
+)
+```
 
-* If the second attempt still fails:
+Optionnel : tu peux aussi ajouter un tooltip sur le widget (`QSpinBox`) pour expliquer la règle (CPU threads - 2, max 32).
 
-  * **do not try a third time**; set `phase3_gpu_hard_disabled = True`
-    and stick to CPU for the rest of the run.
+#### 2.3. Clamper la valeur de config sur la limite recommandée
 
-### 4. Logging and telemetry
+Dans `_resolve_astap_max_instances` :
 
-Use the existing Phase 3 logging/pcb hooks to emit useful but not noisy messages:
+Actuellement :
 
-* On the first successful GPU tile:
+```python
+def _resolve_astap_max_instances(self) -> int:
+    try:
+        value = int(self.config.get("astap_max_instances", 1) or 1)
+    except Exception:
+        value = 1
+    return max(1, value)
+```
 
-  * `"[P3][GPU] Using GPU stacker for Phase 3 (mode=auto)"`.
-* On each tile (INFO_DETAIL level via `pcb_tile`):
+Remplacer par :
 
-  * `phase3_gpu_chunk_summary` is already implemented in `zemosaic_align_stack_gpu.py` and should be used.
-* On GPU fallback and hard disable:
+```python
+def _resolve_astap_max_instances(self) -> int:
+    try:
+        raw = int(self.config.get("astap_max_instances", 1) or 1)
+    except Exception:
+        raw = 1
+    parsed = max(1, raw)
+    try:
+        cap = compute_astap_recommended_max_instances()
+    except Exception:
+        cap = parsed  # no extra clamp if helper fails
+    return max(1, min(parsed, cap))
+```
 
-  * log once at WARNING/ERROR level that GPU has been disabled for the run,
-    including a short summary of the exception type (`OOM`, `GPUStackingError`, etc.).
+* Optionnel mais recommandé : après avoir chargé la config et initialisé les widgets, si la valeur clamped diffère de la valeur brute, mettre à jour le spinbox via `_update_widget_from_config` pour refléter visuellement le clamp.
 
-This will help diagnose why the system fell back to CPU without flooding the logs.
+#### 2.4. Conserver et utiliser `_apply_astap_concurrency_setting`
 
-### 5. Testing / guardrails
+Ne pas modifier la signature, mais vérifier que l’appel continue d’utiliser la valeur déjà clampée :
 
-Implement and run at least the following tests or manual scenarios:
+```python
+def _apply_astap_concurrency_setting(self) -> None:
+    instances = self._resolve_astap_max_instances()
+    os.environ["ZEMOSAIC_ASTAP_MAX_PROCS"] = str(instances)
+    if set_astap_max_concurrent_instances is not None:
+        try:
+            set_astap_max_concurrent_instances(instances)
+        except Exception:
+            pass
+```
 
-1. **CPU-only machine (no CuPy / no CUDA):**
+La seule différence est que `_resolve_astap_max_instances` ne pourra plus renvoyer une valeur supérieure à `compute_astap_recommended_max_instances()`.
 
-   * The worker imports fine.
-   * Phase 3 runs entirely on CPU (no attempt to import/use CuPy).
-   * Resulting mosaics are identical to current CPU reference.
+### 3. Harmoniser le Filter GUI Qt (`zemosaic_filter_gui_qt.py`)
 
-2. **GPU machine, healthy GPU:**
+#### 3.1. Importer le helper
 
-   * Run a dataset with thousands of frames (like the Andromeda example).
-   * Confirm:
+* En haut du fichier, à côté des imports ASTAP existants (où `set_astap_max_concurrent_instances` est importé), ajouter :
 
-     * Phase 3 uses GPU for all tiles (no hard-disable),
-     * GPU chunking is used (see `phase3_gpu_chunk_summary` rows_per_chunk in logs),
-     * No gaps / holes appear in the final mosaic compared to CPU.
+```python
+from zemosaic_astrometry import compute_astap_recommended_max_instances
+```
 
-3. **Simulated GPU failure:**
+(avec le même pattern `try/except` que pour les autres imports optionnels si nécessaire).
 
-   * Temporarily force a `GPUStackingError` (e.g. by raising in the GPU helper for one test run),
-     or simulate an OOM.
-   * Confirm:
+#### 3.2. Remplacer la logique de cap dans `_populate_astap_instances_combo`
 
-     * GPU is attempted once, retried once, then globally disabled,
-     * the tile where the failure happened is still produced via CPU,
-     * the rest of the run proceeds CPU-only, without artifacts.
+Actuellement :
 
-Do not change any behaviour related to:
+```python
+cpu_count = os.cpu_count() or 2
+cap = max(1, cpu_count // 2)
+options = {str(i): i for i in range(1, cap + 1)}
+```
 
-* Phase 4/5,
-* SDS/non-SDS group logic,
-* ZeQualityMT thresholds,
-* WCS or Lecropper semantics.
+Remplacer par :
+
+```python
+try:
+    cap = compute_astap_recommended_max_instances()
+except Exception:
+    cpu_count = os.cpu_count() or 2
+    cap = max(1, cpu_count // 2)  # fallback actuel
+
+options = {str(i): i for i in range(1, cap + 1)}
+```
+
+Ainsi :
+
+* Le Filter GUI et le Main GUI partagent la même règle de limite.
+* En cas d’échec du helper (import, erreur inattendue), on garde le comportement actuel (`cpu_count // 2`).
+
+#### 3.3. Conserver le warning multi-instance déjà présent
+
+Ne touche pas à `_apply_astap_instances_choice` et au warning utilisateur (message “Access violation popup” etc.). 
+Ce warning doit continuer à s’afficher dès que l’utilisateur dépasse `1` instance, même si la limite max est désormais plus élevée.
+
+### 4. (Optionnel) Ajuster `DEFAULT_CONFIG["astap_max_instances"]`
+
+Dans `zemosaic_config.py`, la valeur par défaut est actuellement :
+
+```python
+"astap_max_instances": 1,
+```
+
+Tu peux soit :
+
+* **A.** La laisser à 1 (comportement plus conservateur par défaut, l’utilisateur monte ensuite la valeur dans le GUI).
+* **B.** L’augmenter à quelque chose comme 4, en sachant qu’elle sera clampée par `compute_astap_recommended_max_instances()`.
+
+**Ne change pas** la signature de `get_astap_max_instances()` ; assure-toi juste qu’elle ne renvoie jamais moins de 1 et laisse le clamp final au niveau des GUIs + runtime setter.
+
+---
+
+## 🔍 Tests / validations attendus
+
+### Tests unitaires / rapides
+
+* Ajouter un petit test (ou au minimum un bloc de debug manuel) pour `compute_astap_recommended_max_instances()` avec différents mocks de `os.cpu_count()` :
+
+  * cpu=4 → recommended=2 (4-2=2)
+  * cpu=8 → recommended=6
+  * cpu=16 → recommended=14 (clampé à 14, < 32)
+  * cpu=64 → safe=62, recommended=32 (clamp hard).
+
+### Tests manuels (GUI)
+
+1. Sur une machine de dev :
+
+   * Lancer `python zemosaic_gui_qt.py`.
+   * Aller dans l’onglet/section **ASTAP configuration**.
+   * Vérifier que le spinbox “Max ASTAP instances” a pour maximum :
+
+     * `min(os.cpu_count() - 2, 32)`.
+2. Modifier la valeur dans le GUI (ex.: mettre le maximum).
+
+   * Fermer puis relancer le GUI.
+   * Vérifier que la valeur affichée après rechargement ne dépasse pas la limite recommandée.
+3. Lancer un run avec plusieurs tuiles nécessitant ASTAP :
+
+   * Vérifier dans les logs que `set_astap_max_concurrent_instances` est bien appelée avec la valeur choisie.
+4. Ouvrir le **Filter GUI Qt** :
+
+   * Vérifier que la combo “Max ASTAP instances” propose les mêmes bornes que le spinbox du main GUI (1 → `recommended`).
+   * Monter à une valeur >1, vérifier que le warning multi-instance s’affiche toujours.
+
+---
+
+## 🧱 Contraintes / garde-fous
+
+* Ne pas modifier :
+
+  * La logique de résolution ASTAP elle-même (commande, options, retries, etc.).
+  * Le comportement CPU/GPU du pipeline de stacking ou Phase 5.
+* Ne pas introduire de nouvelles dépendances (psutil, numpy, etc.) dans des modules qui n’en avaient pas besoin pour cette fonctionnalité.
+* Respecter le style existant (nommage, logging, type hints) pour garder le code lisible et cohérent.
 
