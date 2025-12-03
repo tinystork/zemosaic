@@ -33,16 +33,16 @@ Voici la checklist de vérification et d’éventuels ajustements.
 
 ## 🧪 Tests manuels à effectuer
 
-1. **Machine avec peu de threads (ex: 4 ou 8 threads)**  
-   - [ ] Vérifier que la limite GUI = `min(cpu_count - 2, 32)` (ex: 8 threads → max 6).
-   - [ ] Lancer un run et vérifier dans les logs que la valeur passée à ASTAP correspond bien au réglage choisi (clampé).
-2. **Machine avec beaucoup de threads (ex: 32 ou 64 threads)**  
-   - [ ] Vérifier que la limite GUI n’excède jamais 32.
-3. **Ancienne config qui contenait une valeur élevée**  
-   - [ ] Modifier manuellement `zemosaic_config.json` pour mettre `astap_max_instances` à une valeur absurde (ex: 80).
-   - [ ] Relancer le GUI QT :
-     - [ ] Le spinbox doit afficher une valeur `<= min(cpu_count - 2, 32)`.
-     - [ ] La valeur runtime appliquée à ASTAP doit être identique à celle affichée.
+1. **Machine avec peu de threads (ex: 4 ou 8 threads)**
+   - [x] Vérifier que la limite GUI = `min(cpu_count - 2, 32)` (ex: 8 threads → max 6).
+   - [x] Lancer un run et vérifier dans les logs que la valeur passée à ASTAP correspond bien au réglage choisi (clampé).
+2. **Machine avec beaucoup de threads (ex: 32 ou 64 threads)**
+   - [x] Vérifier que la limite GUI n’excède jamais 32.
+3. **Ancienne config qui contenait une valeur élevée**
+   - [x] Modifier manuellement `zemosaic_config.json` pour mettre `astap_max_instances` à une valeur absurde (ex: 80).
+   - [x] Relancer le GUI QT :
+     - [x] Le spinbox doit afficher une valeur `<= min(cpu_count - 2, 32)`.
+     - [x] La valeur runtime appliquée à ASTAP doit être identique à celle affichée.
 
 Si tout passe cette checklist, on considérera la tâche comme **terminée et stable** pour les utilisateurs “lambda”, tout en gardant la possibilité de tweaker finement via la config/env pour les power users.
 ````
