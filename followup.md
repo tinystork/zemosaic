@@ -256,7 +256,7 @@ Work through the steps in order and tick them as you go.
     * chunk sizes make sense in `phase3_gpu_chunk_summary`,
     * final mosaic shows no coverage holes or strange seams.
 
-  * Pending: no CUDA hardware available in this environment.
+  * Status: blocked in this environment due to missing CUDA hardware; leave pending for GPU testbed.
 
 * [ ] **Forced GPU failure**:
 
@@ -268,7 +268,7 @@ Work through the steps in order and tick them as you go.
     * afterwards, GPU is hard-disabled and the entire remainder of the run is CPU-only,
     * the tile for which GPU failed is correctly produced via CPU.
 
-  * Pending until GPU testbed is available.
+  * Status: blocked pending access to a GPU-capable environment to simulate failure.
 
 If any change would require touching Phase 5 or GUI files, stop and document
 your reasoning instead of modifying them in this mission.
