@@ -70,7 +70,7 @@ import platform
 import importlib.util
 from pathlib import Path
 from threading import Lock
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Any, Iterable, Optional
 from types import SimpleNamespace
 
@@ -7375,6 +7375,32 @@ except Exception:
     zemosaic_config = None  # type: ignore
     ZEMOSAIC_CONFIG_AVAILABLE = False
 
+try:
+    from zemosaic_align_stack_gpu import (
+        gpu_stack_from_paths as _p3_gpu_stack_from_paths,
+        GPUStackingError as _P3GPUStackingError,
+        _gpu_is_usable as _p3_gpu_is_usable,
+    )
+    _P3_GPU_HELPERS_AVAILABLE = True
+except Exception:
+    _p3_gpu_stack_from_paths = None
+
+    class _P3GPUStackingError(RuntimeError):
+        pass
+
+    def _p3_gpu_is_usable(logger=None):
+        return False
+
+    _P3_GPU_HELPERS_AVAILABLE = False
+
+_P3_GPU_STATE = {
+    "allowed": True,
+    "hard_disabled": False,
+    "health_checked": False,
+    "healthy": False,
+    "info_logged": False,
+}
+
 import importlib.util
 
 # Global semaphore to throttle concurrent *.npy cache reads in Phase 3
@@ -9144,6 +9170,315 @@ def _safe_load_cache(path: str, *, pcb: Callable | None = None, tile_id: int | N
         raise
 
 
+def _stack_master_tile_cpu(
+    aligned_images_for_stack: list,
+    *,
+    stack_norm_method: str,
+    stack_weight_method: str,
+    stack_reject_algo: str,
+    stack_kappa_low: float,
+    stack_kappa_high: float,
+    parsed_winsor_limits: tuple[float, float],
+    stack_final_combine: str,
+    apply_radial_weight: bool,
+    radial_feather_fraction: float,
+    radial_shape_power: float,
+    winsor_pool_workers: int | None,
+    winsor_max_frames_per_pass: int | None,
+    progress_callback: callable,
+    zconfig: SimpleNamespace,
+    parallel_plan: ParallelPlan | None,
+    pcb_tile: callable,
+    func_id_log_base: str,
+    tile_id: int,
+) -> tuple[np.ndarray | None, dict[str, Any]]:
+    """Stack aligned images using the existing CPU path.
+
+    Returns stacked data and the accompanying stack metadata.
+    """
+
+    stack_metadata: dict[str, Any] = {}
+
+    current_parallel_plan = parallel_plan or getattr(zconfig, "parallel_plan", None)
+    effective_winsor_frames_per_pass = int(winsor_max_frames_per_pass) if winsor_max_frames_per_pass is not None else 0
+    if effective_winsor_frames_per_pass < 0:
+        effective_winsor_frames_per_pass = 0
+    try:
+        sample_frame = aligned_images_for_stack[0] if aligned_images_for_stack else None
+        if sample_frame is not None:
+            per_frame_bytes = int(np.asarray(sample_frame).nbytes)
+            available_bytes = int(psutil.virtual_memory().available)
+            overhead = 3.2
+            target_fraction = 0.55
+            min_pass = max(1, int(getattr(zconfig, "winsor_min_frames_per_pass", 2)))
+            if per_frame_bytes > 0:
+                preemptive_limit = max(
+                    min_pass,
+                    int((available_bytes * target_fraction) // max(1, int(per_frame_bytes * overhead))),
+                )
+                if preemptive_limit < len(aligned_images_for_stack):
+                    if effective_winsor_frames_per_pass <= 0 or preemptive_limit < effective_winsor_frames_per_pass:
+                        effective_winsor_frames_per_pass = preemptive_limit
+                    try:
+                        setattr(zconfig, "stack_memmap_enabled", True)
+                    except Exception:
+                        pass
+                    try:
+                        pcb_tile(
+                            "stack_mem_preemptive_stream",
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                            frames_per_pass=effective_winsor_frames_per_pass,
+                            tile_id=tile_id,
+                        )
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    if stack_reject_algo == "winsorized_sigma_clip":
+        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_winsorized_sigma_clip(
+            aligned_images_for_stack,
+            weight_method=stack_weight_method,
+            zconfig=zconfig,
+            kappa=stack_kappa_low,
+            winsor_limits=parsed_winsor_limits,
+            apply_rewinsor=True,
+            winsor_max_frames_per_pass=effective_winsor_frames_per_pass,
+            winsor_max_workers=int(winsor_pool_workers) if winsor_pool_workers is not None else 1,
+            stack_metadata=stack_metadata,
+            parallel_plan=current_parallel_plan,
+        )
+    elif stack_reject_algo == "kappa_sigma":
+        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_kappa_sigma_clip(
+            aligned_images_for_stack,
+            weight_method=stack_weight_method,
+            zconfig=zconfig,
+            sigma_low=stack_kappa_low,
+            sigma_high=stack_kappa_high,
+            stack_metadata=stack_metadata,
+            parallel_plan=current_parallel_plan,
+        )
+    elif stack_reject_algo == "linear_fit_clip":
+        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_linear_fit_clip(
+            aligned_images_for_stack,
+            weight_method=stack_weight_method,
+            zconfig=zconfig,
+            sigma=stack_kappa_high,
+            stack_metadata=stack_metadata,
+            parallel_plan=current_parallel_plan,
+        )
+    else:
+        master_tile_stacked_HWC = zemosaic_align_stack.stack_aligned_images(
+            aligned_image_data_list=aligned_images_for_stack,
+            normalize_method=stack_norm_method,
+            weighting_method=stack_weight_method,
+            rejection_algorithm=stack_reject_algo,
+            final_combine_method=stack_final_combine,
+            sigma_clip_low=stack_kappa_low,
+            sigma_clip_high=stack_kappa_high,
+            winsor_limits=parsed_winsor_limits,
+            minimum_signal_adu_target=0.0,
+            apply_radial_weight=apply_radial_weight,
+            radial_feather_fraction=radial_feather_fraction,
+            radial_shape_power=radial_shape_power,
+            winsor_max_workers=winsor_pool_workers,
+            progress_callback=progress_callback,
+            zconfig=zconfig,
+            stack_metadata=stack_metadata,
+            parallel_plan=current_parallel_plan,
+        )
+
+    del aligned_images_for_stack
+    gc.collect()
+
+    return master_tile_stacked_HWC, stack_metadata
+
+
+def _phase3_gpu_candidate(parallel_plan: ParallelPlan | None, logger: logging.Logger | None) -> bool:
+    if _P3_GPU_STATE["hard_disabled"]:
+        return False
+    if not _P3_GPU_STATE.get("allowed", True):
+        return False
+    if not _P3_GPU_HELPERS_AVAILABLE:
+        return False
+    try:
+        if parallel_plan is not None and not getattr(parallel_plan, "use_gpu", True):
+            return False
+    except Exception:
+        pass
+    if not _P3_GPU_STATE["health_checked"]:
+        healthy = bool(_p3_gpu_is_usable(logger))
+        _P3_GPU_STATE["healthy"] = healthy
+        _P3_GPU_STATE["health_checked"] = True
+    return _P3_GPU_STATE["healthy"]
+
+
+def _is_gpu_oom_error(exc: Exception) -> bool:
+    try:
+        import cupy
+        from cupy.cuda import memory
+
+        if isinstance(exc, memory.OutOfMemoryError):
+            return True
+    except Exception:
+        pass
+    try:
+        return "out of memory" in str(exc).lower()
+    except Exception:
+        return False
+
+
+def _shrink_parallel_plan_for_gpu(parallel_plan: ParallelPlan | None) -> ParallelPlan | None:
+    if parallel_plan is None or ParallelPlan is None:
+        return parallel_plan
+    try:
+        current_bytes = getattr(parallel_plan, "gpu_max_chunk_bytes", None)
+        if current_bytes is None or current_bytes <= 0:
+            current_bytes = getattr(parallel_plan, "max_chunk_bytes", None)
+        if current_bytes is None or current_bytes <= 0:
+            current_bytes = 512 * 1024 * 1024
+        tightened_bytes = max(32 * 1024 * 1024, int(current_bytes * 0.5))
+        current_rows = getattr(parallel_plan, "gpu_rows_per_chunk", None)
+        tightened_rows = max(1, int(math.ceil(current_rows / 2))) if current_rows else current_rows
+        return replace(parallel_plan, gpu_max_chunk_bytes=tightened_bytes, gpu_rows_per_chunk=tightened_rows)
+    except Exception:
+        return parallel_plan
+
+
+def _stack_master_tile_auto(
+    image_descriptors: list,
+    *,
+    stack_norm_method: str,
+    stack_weight_method: str,
+    stack_reject_algo: str,
+    stack_kappa_low: float,
+    stack_kappa_high: float,
+    parsed_winsor_limits: tuple[float, float],
+    stack_final_combine: str,
+    poststack_equalize_rgb: bool,
+    apply_radial_weight: bool,
+    radial_feather_fraction: float,
+    radial_shape_power: float,
+    winsor_pool_workers: int | None,
+    winsor_max_frames_per_pass: int | None,
+    progress_callback: callable,
+    zconfig: SimpleNamespace,
+    parallel_plan: ParallelPlan | None,
+    pcb_tile: callable,
+    func_id_log_base: str,
+    tile_id: int,
+    logger: logging.Logger | None,
+) -> tuple[np.ndarray | None, dict[str, Any], bool]:
+    stacking_params = {
+        "stack_norm_method": stack_norm_method,
+        "stack_weight_method": stack_weight_method,
+        "stack_reject_algo": stack_reject_algo,
+        "stack_kappa_low": stack_kappa_low,
+        "stack_kappa_high": stack_kappa_high,
+        "parsed_winsor_limits": parsed_winsor_limits,
+        "stack_final_combine": stack_final_combine,
+        "poststack_equalize_rgb": poststack_equalize_rgb,
+        "apply_radial_weight": apply_radial_weight,
+        "radial_feather_fraction": radial_feather_fraction,
+        "radial_shape_power": radial_shape_power,
+        "winsor_max_frames_per_pass": winsor_max_frames_per_pass,
+    }
+
+    use_gpu_candidate = _phase3_gpu_candidate(parallel_plan, logger)
+    retry_parallel_plan = parallel_plan
+    if use_gpu_candidate and _p3_gpu_stack_from_paths is not None:
+        if logger and not _P3_GPU_STATE.get("info_logged"):
+            try:
+                logger.info("[P3][GPU] Phase 3 GPU auto mode enabled (mode=C, candidate=True)")
+            except Exception:
+                pass
+            _P3_GPU_STATE["info_logged"] = True
+        try:
+            stacked_gpu, meta_gpu = _p3_gpu_stack_from_paths(
+                image_descriptors,
+                stacking_params,
+                parallel_plan=parallel_plan,
+                logger=logger,
+                pcb_tile=pcb_tile,
+                zconfig=zconfig,
+            )
+            _P3_GPU_STATE["healthy"] = True
+            return stacked_gpu, meta_gpu, True
+        except Exception as exc:
+            if isinstance(exc, _P3GPUStackingError):
+                if logger:
+                    logger.warning(
+                        "[P3][GPU] Stack failed (GPUStackingError): %s -- retrying once on GPU",
+                        exc,
+                    )
+            else:
+                if logger:
+                    logger.warning(
+                        "[P3][GPU] Unexpected GPU error: %s -- retrying once on GPU",
+                        exc,
+                        exc_info=True,
+                    )
+            if _is_gpu_oom_error(exc):
+                try:
+                    if ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils and hasattr(
+                        zemosaic_utils, "free_cupy_memory_pools"
+                    ):
+                        zemosaic_utils.free_cupy_memory_pools()
+                except Exception:
+                    pass
+                retry_parallel_plan = _shrink_parallel_plan_for_gpu(parallel_plan)
+        try:
+            stacked_gpu, meta_gpu = _p3_gpu_stack_from_paths(
+                image_descriptors,
+                stacking_params,
+                parallel_plan=retry_parallel_plan,
+                logger=logger,
+                pcb_tile=pcb_tile,
+                zconfig=zconfig,
+            )
+            _P3_GPU_STATE["healthy"] = True
+            return stacked_gpu, meta_gpu, True
+        except Exception as exc:
+            if logger:
+                logger.error(
+                    "[P3][GPU] Second GPU attempt failed; disabling Phase 3 GPU for this run: %s",
+                    exc,
+                    exc_info=True,
+                )
+                try:
+                    logger.warning(
+                        "[P3][GPU] GPU disabled for remaining Phase 3 tiles after repeated failures."
+                    )
+                except Exception:
+                    pass
+            _P3_GPU_STATE["hard_disabled"] = True
+            _P3_GPU_STATE["healthy"] = False
+
+    stacked_cpu, meta_cpu = _stack_master_tile_cpu(
+        image_descriptors,
+        stack_norm_method=stack_norm_method,
+        stack_weight_method=stack_weight_method,
+        stack_reject_algo=stack_reject_algo,
+        stack_kappa_low=stack_kappa_low,
+        stack_kappa_high=stack_kappa_high,
+        parsed_winsor_limits=parsed_winsor_limits,
+        stack_final_combine=stack_final_combine,
+        apply_radial_weight=apply_radial_weight,
+        radial_feather_fraction=radial_feather_fraction,
+        radial_shape_power=radial_shape_power,
+        winsor_pool_workers=winsor_pool_workers,
+        winsor_max_frames_per_pass=winsor_max_frames_per_pass,
+        progress_callback=progress_callback,
+        zconfig=zconfig,
+        parallel_plan=parallel_plan,
+        pcb_tile=pcb_tile,
+        func_id_log_base=func_id_log_base,
+        tile_id=tile_id,
+    )
+    return stacked_cpu, meta_cpu, False
+
+
 def create_master_tile(
     seestar_stack_group_info: list[dict],
     tile_id: int,
@@ -9460,103 +9795,35 @@ def create_master_tile(
     
     pcb_tile(f"{func_id_log_base}_info_stacking_started", prog=None, lvl="DEBUG_DETAIL",
              num_to_stack=len(valid_aligned_images), tile_id=tile_id) # Les options sont loggées au début
+    master_tile_stacked_HWC, stack_metadata, used_gpu = _stack_master_tile_auto(
+        valid_aligned_images,
+        stack_norm_method=stack_norm_method,
+        stack_weight_method=stack_weight_method,
+        stack_reject_algo=stack_reject_algo,
+        stack_kappa_low=stack_kappa_low,
+        stack_kappa_high=stack_kappa_high,
+        parsed_winsor_limits=parsed_winsor_limits,
+        stack_final_combine=stack_final_combine,
+        poststack_equalize_rgb=poststack_equalize_rgb,
+        apply_radial_weight=apply_radial_weight,
+        radial_feather_fraction=radial_feather_fraction,
+        radial_shape_power=radial_shape_power,
+        winsor_pool_workers=winsor_pool_workers,
+        winsor_max_frames_per_pass=winsor_max_frames_per_pass,
+        progress_callback=progress_callback,
+        zconfig=zconfig,
+        parallel_plan=parallel_plan,
+        pcb_tile=pcb_tile,
+        func_id_log_base=func_id_log_base,
+        tile_id=tile_id,
+        logger=logger,
+    )
 
-    stack_metadata: dict[str, Any] = {}
-
-    current_parallel_plan = parallel_plan or getattr(zconfig, "parallel_plan", None)
-    effective_winsor_frames_per_pass = int(winsor_max_frames_per_pass) if winsor_max_frames_per_pass is not None else 0
-    if effective_winsor_frames_per_pass < 0:
-        effective_winsor_frames_per_pass = 0
     try:
-        sample_frame = valid_aligned_images[0] if valid_aligned_images else None
-        if sample_frame is not None:
-            per_frame_bytes = int(np.asarray(sample_frame).nbytes)
-            available_bytes = int(psutil.virtual_memory().available)
-            overhead = 3.2
-            target_fraction = 0.55
-            min_pass = max(1, int(getattr(zconfig, "winsor_min_frames_per_pass", 2)))
-            if per_frame_bytes > 0:
-                preemptive_limit = max(
-                    min_pass,
-                    int((available_bytes * target_fraction) // max(1, int(per_frame_bytes * overhead))),
-                )
-                if preemptive_limit < len(valid_aligned_images):
-                    if effective_winsor_frames_per_pass <= 0 or preemptive_limit < effective_winsor_frames_per_pass:
-                        effective_winsor_frames_per_pass = preemptive_limit
-                    try:
-                        setattr(zconfig, "stack_memmap_enabled", True)
-                    except Exception:
-                        pass
-                    try:
-                        pcb_tile(
-                            "stack_mem_preemptive_stream",
-                            prog=None,
-                            lvl="INFO_DETAIL",
-                            frames_per_pass=effective_winsor_frames_per_pass,
-                            tile_id=tile_id,
-                        )
-                    except Exception:
-                        pass
+        del valid_aligned_images
     except Exception:
         pass
-
-    if stack_reject_algo == "winsorized_sigma_clip":
-        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_winsorized_sigma_clip(
-            valid_aligned_images,
-            weight_method=stack_weight_method,
-            zconfig=zconfig,
-            kappa=stack_kappa_low,
-            winsor_limits=parsed_winsor_limits,
-            apply_rewinsor=True,
-            winsor_max_frames_per_pass=effective_winsor_frames_per_pass,
-            winsor_max_workers=int(winsor_pool_workers) if winsor_pool_workers is not None else 1,
-            stack_metadata=stack_metadata,
-            parallel_plan=current_parallel_plan,
-        )
-    elif stack_reject_algo == "kappa_sigma":
-        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_kappa_sigma_clip(
-            valid_aligned_images,
-            weight_method=stack_weight_method,
-            zconfig=zconfig,
-            sigma_low=stack_kappa_low,
-            sigma_high=stack_kappa_high,
-            stack_metadata=stack_metadata,
-            parallel_plan=current_parallel_plan,
-        )
-    elif stack_reject_algo == "linear_fit_clip":
-        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_linear_fit_clip(
-            valid_aligned_images,
-            weight_method=stack_weight_method,
-            zconfig=zconfig,
-            sigma=stack_kappa_high,
-            stack_metadata=stack_metadata,
-            parallel_plan=current_parallel_plan,
-        )
-    else:
-        master_tile_stacked_HWC = zemosaic_align_stack.stack_aligned_images(
-            aligned_image_data_list=valid_aligned_images,
-            normalize_method=stack_norm_method,
-            weighting_method=stack_weight_method,
-            rejection_algorithm=stack_reject_algo,
-            final_combine_method=stack_final_combine,
-            sigma_clip_low=stack_kappa_low,
-            sigma_clip_high=stack_kappa_high,
-            winsor_limits=parsed_winsor_limits,
-            minimum_signal_adu_target=0.0,
-            apply_radial_weight=apply_radial_weight,
-            radial_feather_fraction=radial_feather_fraction,
-            radial_shape_power=radial_shape_power,
-            winsor_max_workers=winsor_pool_workers,
-            progress_callback=progress_callback,
-            zconfig=zconfig,
-            stack_metadata=stack_metadata,
-            parallel_plan=current_parallel_plan,
-        )
-    
-    del valid_aligned_images; gc.collect() # valid_aligned_images a été passé par valeur (copie de la liste)
-                                          # mais les arrays NumPy à l'intérieur sont passés par référence.
-                                          # stack_aligned_images travaille sur ces arrays.
-                                          # Il est bon de del ici.
+    gc.collect()
 
     if master_tile_stacked_HWC is None:
         pcb_tile(f"{func_id_log_base}_error_stacking_failed", prog=None, lvl="ERROR", tile_id=tile_id)
@@ -9572,6 +9839,7 @@ def create_master_tile(
              # max_val=np.nanmax(master_tile_stacked_HWC),
              # mean_val=np.nanmean(master_tile_stacked_HWC))
 
+    stack_metadata["phase3_used_gpu"] = bool(used_gpu)
     rgb_eq_info = stack_metadata.get("rgb_equalization", {})
     try:
         gain_r = float(rgb_eq_info.get("gain_r", 1.0))

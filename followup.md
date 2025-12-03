@@ -6,22 +6,22 @@ Work through the steps in order and tick them as you go.
 
 ## 1. Understand current Phase 3 stacker wiring
 
-- [ ] Open `zemosaic_worker.py` and locate **Phase 3** code:
+- [x] Open `zemosaic_worker.py` and locate **Phase 3** code:
   - `create_master_tile(...)`,
   - any helpers directly responsible for stacking aligned frames into a master tile.
-- [ ] Identify where the **CPU stacker** in `zemosaic_align_stack.py` is called.
-- [ ] Confirm how `ParallelPlan` (from `parallel_utils`) is obtained and whether it is already
+- [x] Identify where the **CPU stacker** in `zemosaic_align_stack.py` is called.
+- [x] Confirm how `ParallelPlan` (from `parallel_utils`) is obtained and whether it is already
       available in Phase 3 context.
 
 ---
 
 ## 2. Cleanly isolate the CPU Phase 3 stacker
 
-- [ ] In `zemosaic_worker.py`, extract the existing CPU stacking logic into a dedicated helper:
+- [x] In `zemosaic_worker.py`, extract the existing CPU stacking logic into a dedicated helper:
 
   - Example: `_stack_master_tile_cpu(image_descriptors, stacking_params, parallel_plan, logger, pcb_tile, ...)`.
 
-- [ ] Ensure this helper:
+- [x] Ensure this helper:
   - uses **exactly the same behaviour** as the current Phase 3 implementation:
     - memmap vs in-memory,
     - streaming over rows or tiles,
@@ -32,23 +32,23 @@ Work through the steps in order and tick them as you go.
     - `stacked_array` is `float32`, contiguous, shape `(H, W, C)` or `(H, W)`,
     - `stack_metadata` contains whatever the CPU path already produces.
 
-- [ ] Replace direct CPU stacking calls in `create_master_tile(...)` with calls to `_stack_master_tile_cpu(...)`
+- [x] Replace direct CPU stacking calls in `create_master_tile(...)` with calls to `_stack_master_tile_cpu(...)`
       so the current behaviour is preserved.
 
 ---
 
 ## 3. Wire up the GPU helper for Phase 3
 
-- [ ] Open `zemosaic_align_stack_gpu.py` and inspect:
+- [x] Open `zemosaic_align_stack_gpu.py` and inspect:
 
   - `GPUStackingError`,
   - `_gpu_is_usable(logger)`,
   - `gpu_stack_from_arrays(...)`,
   - `gpu_stack_from_paths(...)`.
 
-- [ ] In `zemosaic_worker.py`:
+- [x] In `zemosaic_worker.py`:
 
-  - [ ] Add a **lazy import** block at top-level:
+  - [x] Add a **lazy import** block at top-level:
 
     ```python
     try:
@@ -67,9 +67,9 @@ Work through the steps in order and tick them as you go.
         _P3_GPU_HELPERS_AVAILABLE = False
     ```
 
-  - [ ] Ensure this does **not** raise on CPU-only machines.
+  - [x] Ensure this does **not** raise on CPU-only machines.
 
-- [ ] Introduce a small Phase-3-specific state holder, e.g. at module or worker level:
+- [x] Introduce a small Phase-3-specific state holder, e.g. at module or worker level:
 
   ```python
   _P3_GPU_STATE = {
@@ -77,6 +77,7 @@ Work through the steps in order and tick them as you go.
       "hard_disabled": False,   # becomes True after repeated failure
       "health_checked": False,
       "healthy": False,
+      "info_logged": False,
   }
 ````
 
@@ -84,7 +85,7 @@ Work through the steps in order and tick them as you go.
 
 ## 4. Implement Mode C decision logic
 
-* [ ] Add a helper in `zemosaic_worker.py`:
+* [x] Add a helper in `zemosaic_worker.py`:
 
   ```python
   def _phase3_gpu_candidate(parallel_plan, logger) -> bool:
@@ -105,13 +106,13 @@ Work through the steps in order and tick them as you go.
       return _P3_GPU_STATE["healthy"]
   ```
 
-* [ ] Use this helper in the new `_stack_master_tile_auto(...)` to decide if GPU should be attempted.
+* [x] Use this helper in the new `_stack_master_tile_auto(...)` to decide if GPU should be attempted.
 
 ---
 
 ## 5. Implement `_stack_master_tile_auto(...)` with strict retry
 
-* [ ] Add a new helper, e.g.:
+* [x] Add a new helper, e.g.:
 
   ```python
   def _stack_master_tile_auto(image_descriptors, stacking_params, parallel_plan, logger, pcb_tile, zconfig, ...):
@@ -171,40 +172,40 @@ Work through the steps in order and tick them as you go.
       return stacked_cpu, meta_cpu, False
   ```
 
-* [ ] Replace all direct Phase 3 stack calls in `create_master_tile(...)` with `_stack_master_tile_auto(...)`.
+* [x] Replace all direct Phase 3 stack calls in `create_master_tile(...)` with `_stack_master_tile_auto(...)`.
 
 ---
 
 ## 6. Improve retry for OOM via chunk/pool tuning
 
-* [ ] Open `cuda_utils.py` and `zemosaic_utils.py` and look for helpers like:
+* [x] Open `cuda_utils.py` and `zemosaic_utils.py` and look for helpers like:
 
   * `ensure_cupy_pool_initialized`,
   * `free_cupy_memory_pools`,
   * `gpu_memory_sufficient` or similar.
 
-* [ ] Between the first and second GPU attempts, do the following **if the error looks memory-related**:
+* [x] Between the first and second GPU attempts, do the following **if the error looks memory-related**:
 
-  * [ ] Detect OOM errors using either:
+  * [x] Detect OOM errors using either:
 
     * specific exception classes (`cp.cuda.memory.OutOfMemoryError`),
     * or a utility like `cuda_utils.is_oom_error(exc)` if present.
 
-  * [ ] If OOM:
+  * [x] If OOM:
 
     * Call `free_cupy_memory_pools()` / equivalent to release cached VRAM.
     * Optionally recompute a stricter `ParallelPlan` for the retry
       (smaller `gpu_max_chunk_bytes` / `gpu_rows_per_chunk`), or pass an override
       `rows_per_chunk` kwarg to the GPU stacker if supported.
 
-* [ ] Ensure that this retry logic is safe and does not crash on CPU-only machines
+* [x] Ensure that this retry logic is safe and does not crash on CPU-only machines
   (all GPU helpers must be behind guards).
 
 ---
 
 ## 7. Preserve downstream Phase 3 behaviour
 
-* [ ] Verify that the output of `_stack_master_tile_auto(...)` has the same shape/dtype
+* [x] Verify that the output of `_stack_master_tile_auto(...)` has the same shape/dtype
   as the CPU stacker and is passed through:
 
   * Lecropper pipeline,
@@ -212,21 +213,21 @@ Work through the steps in order and tick them as you go.
   * alpha mask generation,
   * metadata/telemetry.
 
-* [ ] If the GPU path adds extra metadata (e.g. `stack_metadata["rgb_equalization"]`),
+* [x] If the GPU path adds extra metadata (e.g. `stack_metadata["rgb_equalization"]`),
   ensure this doesn’t conflict with existing dictionaries.
 
 ---
 
 ## 8. Logging & diagnostics
 
-* [ ] Add a single INFO log at the start of Phase 3 when GPU is used:
+* [x] Add a single INFO log at the start of Phase 3 when GPU is used:
 
   * `"[P3][GPU] Phase 3 GPU auto mode enabled (mode=C, candidate=True)"`.
 
-* [ ] Ensure `zemosaic_align_stack_gpu.py` emits `phase3_gpu_chunk_summary`
+* [x] Ensure `zemosaic_align_stack_gpu.py` emits `phase3_gpu_chunk_summary`
   via `pcb_tile` when available.
 
-* [ ] Ensure that when GPU is hard-disabled:
+* [x] Ensure that when GPU is hard-disabled:
 
   * the worker logs something like:
 
