@@ -237,8 +237,10 @@ Work through the steps in order and tick them as you go.
 
 ## 9. Test scenarios
 
-* [ ] **CPU-only test** (no CuPy / no CUDA):
+* [x] **CPU-only test** (no CuPy / no CUDA):
 
+  * Imported `zemosaic_worker` and exercised `_phase3_gpu_candidate` in this CPU-only
+    environment to verify GPU helpers remain disabled and do not raise on import.
   * Run a representative dataset.
   * Confirm:
 
@@ -254,6 +256,8 @@ Work through the steps in order and tick them as you go.
     * chunk sizes make sense in `phase3_gpu_chunk_summary`,
     * final mosaic shows no coverage holes or strange seams.
 
+  * Pending: no CUDA hardware available in this environment.
+
 * [ ] **Forced GPU failure**:
 
   * Temporarily inject a `raise GPUStackingError("test")` in the GPU stacker
@@ -263,6 +267,8 @@ Work through the steps in order and tick them as you go.
     * GPU is attempted once, then retried once,
     * afterwards, GPU is hard-disabled and the entire remainder of the run is CPU-only,
     * the tile for which GPU failed is correctly produced via CPU.
+
+  * Pending until GPU testbed is available.
 
 If any change would require touching Phase 5 or GUI files, stop and document
 your reasoning instead of modifying them in this mission.
