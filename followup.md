@@ -1,48 +1,23 @@
-# Follow-up – ASTAP concurrency cap (cpu_count - 2 rule)
+# Follow-up Instructions for Codex
 
-Merci d’avoir implémenté la première passe 🙏  
-Voici la checklist de vérification et d’éventuels ajustements.
+Please verify and iterate according to this checklist:
 
-## ✅ Checklist de review
+## ✔ Functional Checklist
+- [ ] Overlap % parameter appears in the GUI
+- [ ] Default overlap=40% is applied
+- [ ] Autosplit is replaced by overlapping sliding-window batching
+- [ ] Same image may appear in multiple batches
+- [ ] Output structure of batches remains unchanged
+- [ ] No change in Phase 3, 5, or stacking logic
+- [ ] No dependency on ZeQualityMT
+- [ ] Logs clearly show batch sizes and overlap
+- [ ] Setting overlap to 0 reproduces the previous strict partitioning
 
-- [x] Le helper `compute_astap_recommended_max_instances(...)` est bien présent dans `zemosaic_astrometry.py`, documenté, et sans dépendances inutiles.
-- [x] Le helper gère proprement les cas edge (cpu_count=None, exceptions) et retourne toujours `>= 1`.
-- [x] Le helper applique bien la règle : `recommended = min(max(1, cpu - 2), 32)`.
+## ✔ Behavioural Checklist
+- [ ] No more holes in the mosaic even when strong rejections occur
+- [ ] Reproject normalizes overlaps correctly
+- [ ] Stacking remains deterministic
+- [ ] GPU/CPU fallback behaviour unaffected
+- [ ] Performance remains acceptable
 
-### GUI Qt principal
-
-- [x] Le `QSpinBox` `astap_max_instances` utilise maintenant `maximum=compute_astap_recommended_max_instances()`, avec un fallback cohérent en cas d’erreur.
-- [x] `_resolve_astap_max_instances()` clamp la valeur de config entre 1 et la limite recommandée.
-- [x] `_apply_astap_concurrency_setting()` utilise toujours `_resolve_astap_max_instances()` et met à jour :
-  - [x] `os.environ["ZEMOSAIC_ASTAP_MAX_PROCS"]`
-  - [x] `set_astap_max_concurrent_instances(...)` (si disponible)
-- [x] Si une ancienne config contient une valeur > limite recommandée, le spinbox affiche bien la valeur clampée après chargement du GUI.
-
-### Filter GUI Qt
-
-- [x] `zemosaic_filter_gui_qt.py` importe `compute_astap_recommended_max_instances` (avec garde `try/except` si nécessaire).
-- [x] `_populate_astap_instances_combo()` utilise le helper pour calculer `cap`, avec fallback sur l’ancien comportement (`cpu_count // 2`) en cas d’erreur.
-- [x] La combo “Max ASTAP instances” propose la plage `[1 .. min(os.cpu_count() - 2, 32)]`.
-- [x] Le warning multi-instance (popup “Access violation” / “ASTAP Concurrency Warning”) fonctionne toujours dès que l’utilisateur choisit `> 1`.
-
-### Config & compat
-
-- [x] `DEFAULT_CONFIG["astap_max_instances"]` est toujours défini et cohérent (1 ou autre valeur raisonnable).
-- [x] `get_astap_max_instances()` renvoie une valeur `>= 1` et reste compatible avec le reste du code.
-- [x] Aucun changement n’a été apporté aux pipelines CPU/GPU de stacking / mosaïque.
-
-## 🧪 Tests manuels à effectuer
-
-1. **Machine avec peu de threads (ex: 4 ou 8 threads)**  
-   - [ ] Vérifier que la limite GUI = `min(cpu_count - 2, 32)` (ex: 8 threads → max 6).
-   - [ ] Lancer un run et vérifier dans les logs que la valeur passée à ASTAP correspond bien au réglage choisi (clampé).
-2. **Machine avec beaucoup de threads (ex: 32 ou 64 threads)**  
-   - [ ] Vérifier que la limite GUI n’excède jamais 32.
-3. **Ancienne config qui contenait une valeur élevée**  
-   - [ ] Modifier manuellement `zemosaic_config.json` pour mettre `astap_max_instances` à une valeur absurde (ex: 80).
-   - [ ] Relancer le GUI QT :
-     - [ ] Le spinbox doit afficher une valeur `<= min(cpu_count - 2, 32)`.
-     - [ ] La valeur runtime appliquée à ASTAP doit être identique à celle affichée.
-
-Si tout passe cette checklist, on considérera la tâche comme **terminée et stable** pour les utilisateurs “lambda”, tout en gardant la possibilité de tweaker finement via la config/env pour les power users.
-````
+If any part does not validate, refine the implementation and re-submit the patch.
