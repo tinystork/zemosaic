@@ -581,6 +581,20 @@ def main(argv=None):
                                 "[run_zemosaic] Starting Qt event loop after run_qt_main() return "
                                 "to ensure the GUI is displayed."
                             )
+                            visible_windows = [
+                                w for w in app.topLevelWidgets() if getattr(w, "isVisible", lambda: False)()
+                            ]
+                            if not visible_windows:
+                                try:
+                                    from zemosaic.zemosaic_gui_qt import ZeMosaicQtMainWindow
+
+                                    window = ZeMosaicQtMainWindow()
+                                    window.show()
+                                except Exception as fallback_err:
+                                    print(
+                                        "[run_zemosaic] Unable to create/show Qt main window during fallback:",
+                                        fallback_err,
+                                    )
                             exit_code = app.exec()
                 except Exception:
                     pass
