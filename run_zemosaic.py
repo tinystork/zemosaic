@@ -558,47 +558,6 @@ def main(argv=None):
                 print("[run_zemosaic] Launching ZeMosaic with the Qt backend.")
                 _play_opening_gif_animation_once()
                 exit_code = run_qt_main()
-                # Defensive fallback: if the Qt event loop was not started by
-                # run_qt_main (e.g., because a pre-existing QApplication was
-                # reused without entering exec()), try to start it here so the
-                # GUI actually appears for the user.
-                try:
-                    from PySide6.QtWidgets import QApplication
-
-                    app = QApplication.instance()
-                    already_running = False
-                    if app is not None:
-                        try:
-                            already_running = bool(app.property("zemosaic_main_loop_started"))
-                        except Exception:
-                            already_running = False
-                        if not already_running and not app.closingDown():
-                            try:
-                                app.setProperty("zemosaic_main_loop_started", True)
-                            except Exception:
-                                pass
-                            print(
-                                "[run_zemosaic] Starting Qt event loop after run_qt_main() return "
-                                "to ensure the GUI is displayed."
-                            )
-                            visible_windows = [
-                                w for w in app.topLevelWidgets() if getattr(w, "isVisible", lambda: False)()
-                            ]
-                            if not visible_windows:
-                                try:
-                                    from zemosaic.zemosaic_gui_qt import ZeMosaicQtMainWindow
-
-                                    window = ZeMosaicQtMainWindow()
-                                    window.show()
-                                except Exception as fallback_err:
-                                    print(
-                                        "[run_zemosaic] Unable to create/show Qt main window during fallback:",
-                                        fallback_err,
-                                    )
-                            exit_code = app.exec()
-                except Exception:
-                    pass
-
                 return exit_code
 
         # Vérification de sys.modules au début de main
