@@ -390,7 +390,7 @@ def _play_opening_gif_animation_once() -> None:
         return
 
     try:
-        from PySide6.QtCore import QEventLoop, QTimer, Qt
+        from PySide6.QtCore import QTimer, Qt
         from PySide6.QtGui import QMovie
         from PySide6.QtWidgets import QApplication, QLabel
     except Exception as qt_err:
@@ -469,7 +469,6 @@ def _play_opening_gif_animation_once() -> None:
 
     splash.show()
 
-    loop = QEventLoop()
     finished = {"done": False}
 
     def _teardown() -> None:
@@ -484,7 +483,6 @@ def _play_opening_gif_animation_once() -> None:
             splash.close()
         except Exception:
             pass
-        loop.quit()
 
     try:
         movie.finished.connect(_teardown)  # type: ignore[attr-defined]
@@ -522,13 +520,18 @@ def _play_opening_gif_animation_once() -> None:
     QTimer.singleShot(60000, _teardown)  # Safety net in case the GIF never ends
 
     movie.start()
-    loop.exec()
+
+    # Ensure pending events are processed so the splash can appear promptly.
+    try:
+        app.processEvents()
+    except Exception:
+        pass
 
     # When we created a temporary QApplication, keep it alive so that the main
-    # Qt backend can reuse it. We simply ensure pending events are flushed.
+    # Qt backend can reuse it without blocking here.
     if owns_app:
         try:
-            app.processEvents()
+            app.setProperty("zemosaic_prelaunch_owner", True)
         except Exception:
             pass
 
@@ -554,7 +557,49 @@ def main(argv=None):
             else:
                 print("[run_zemosaic] Launching ZeMosaic with the Qt backend.")
                 _play_opening_gif_animation_once()
-                return run_qt_main()
+                exit_code = run_qt_main()
+                # Defensive fallback: if the Qt event loop was not started by
+                # run_qt_main (e.g., because a pre-existing QApplication was
+                # reused without entering exec()), try to start it here so the
+                # GUI actually appears for the user.
+                try:
+                    from PySide6.QtWidgets import QApplication
+
+                    app = QApplication.instance()
+                    already_running = False
+                    if app is not None:
+                        try:
+                            already_running = bool(app.property("zemosaic_main_loop_started"))
+                        except Exception:
+                            already_running = False
+                        if not already_running and not app.closingDown():
+                            try:
+                                app.setProperty("zemosaic_main_loop_started", True)
+                            except Exception:
+                                pass
+                            print(
+                                "[run_zemosaic] Starting Qt event loop after run_qt_main() return "
+                                "to ensure the GUI is displayed."
+                            )
+                            visible_windows = [
+                                w for w in app.topLevelWidgets() if getattr(w, "isVisible", lambda: False)()
+                            ]
+                            if not visible_windows:
+                                try:
+                                    from zemosaic.zemosaic_gui_qt import ZeMosaicQtMainWindow
+
+                                    window = ZeMosaicQtMainWindow()
+                                    window.show()
+                                except Exception as fallback_err:
+                                    print(
+                                        "[run_zemosaic] Unable to create/show Qt main window during fallback:",
+                                        fallback_err,
+                                    )
+                            exit_code = app.exec()
+                except Exception:
+                    pass
+
+                return exit_code
 
         # Vérification de sys.modules au début de main
         if 'zemosaic_worker' in sys.modules:
