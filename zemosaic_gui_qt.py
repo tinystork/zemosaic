@@ -183,8 +183,12 @@ else:  # pragma: no cover - optional dependency guard
     ZeMosaicLocalization = None  # type: ignore[assignment]
 
 if importlib.util.find_spec("zemosaic_astrometry") is not None:
-    from zemosaic_astrometry import set_astap_max_concurrent_instances  # type: ignore
+    from zemosaic_astrometry import (  # type: ignore
+        compute_astap_recommended_max_instances,
+        set_astap_max_concurrent_instances,
+    )
 else:  # pragma: no cover - optional dependency guard
+    compute_astap_recommended_max_instances = None  # type: ignore[assignment]
     set_astap_max_concurrent_instances = None  # type: ignore[assignment]
 
 
@@ -1423,12 +1427,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
             minimum=-25,
             maximum=500,
         )
+        astap_cap = self._compute_astap_cap()
         self._register_spinbox(
             "astap_max_instances",
             astap_layout,
             self._tr("qt_field_astap_max_instances", "Max ASTAP instances"),
             minimum=1,
-            maximum=16,
+            maximum=astap_cap,
         )
 
         outer_layout.addWidget(astap_box)
@@ -5576,6 +5581,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self._apply_astap_concurrency_setting()
 
     def _update_widget_from_config(self, key: str, value: Any) -> None:
+        if key == "astap_max_instances":
+            value = self._clamp_astap_instances_value(value)
         self.config[key] = value
         binding = self._config_fields.get(key)
         if not binding:
@@ -5624,12 +5631,32 @@ class ZeMosaicQtMainWindow(QMainWindow):
             return False
         return False
 
+    def _compute_astap_cap(self) -> int:
+        fallback_cap = 16
+        if compute_astap_recommended_max_instances is None:
+            return fallback_cap
+        try:
+            recommended = int(compute_astap_recommended_max_instances())
+        except Exception:
+            return fallback_cap
+        return max(1, recommended)
+
+    def _clamp_astap_instances_value(self, value: Any) -> int:
+        try:
+            parsed = int(value)
+        except Exception:
+            parsed = 1
+        cap = self._compute_astap_cap()
+        return min(max(1, parsed), cap)
+
     def _resolve_astap_max_instances(self) -> int:
         try:
             value = int(self.config.get("astap_max_instances", 1) or 1)
         except Exception:
             value = 1
-        return max(1, value)
+        clamped = self._clamp_astap_instances_value(value)
+        self.config["astap_max_instances"] = clamped
+        return clamped
 
     def _apply_astap_concurrency_setting(self) -> None:
         instances = self._resolve_astap_max_instances()

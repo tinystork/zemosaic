@@ -179,6 +179,21 @@ _ASTAP_CONCURRENCY_ENV_KEYS = (
 )
 
 
+def compute_astap_recommended_max_instances(
+    *, reserve_threads: int = 2, hard_max: int = 32, min_cap: int = 1
+) -> int:
+    """Compute a safe upper bound for ASTAP concurrency based on CPU count."""
+
+    try:
+        cpu = os.cpu_count()
+    except Exception:
+        cpu = None
+    if cpu is None:
+        cpu = reserve_threads + 1
+    safe = max(min_cap, cpu - reserve_threads)
+    return max(min_cap, min(safe, hard_max))
+
+
 def _resolve_astap_max_procs(default: int = 1) -> int:
     """Return the configured ASTAP concurrency cap."""
     for key in _ASTAP_CONCURRENCY_ENV_KEYS:

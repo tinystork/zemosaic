@@ -242,8 +242,13 @@ except Exception:  # pragma: no cover - matplotlib optional
     to_rgba = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - optional dependency guard
-    from zemosaic_astrometry import solve_with_astap, set_astap_max_concurrent_instances
+    from zemosaic_astrometry import (
+        compute_astap_recommended_max_instances,
+        set_astap_max_concurrent_instances,
+        solve_with_astap,
+    )
 except Exception:  # pragma: no cover - optional dependency guard
+    compute_astap_recommended_max_instances = None  # type: ignore[assignment]
     solve_with_astap = None  # type: ignore[assignment]
     set_astap_max_concurrent_instances = None  # type: ignore[assignment]
 
@@ -6407,14 +6412,26 @@ class FilterQtDialog(QDialog):
         except Exception:
             return None
 
+    def _compute_astap_cap(self) -> int:
+        if compute_astap_recommended_max_instances is not None:
+            try:
+                return int(compute_astap_recommended_max_instances())
+            except Exception:
+                pass
+        cpu_count = os.cpu_count() or 2
+        return max(1, cpu_count // 2)
+
     def _populate_astap_instances_combo(self) -> None:
         if self._astap_instances_combo is None:
             return
         combo = self._astap_instances_combo
         combo.blockSignals(True)
         combo.clear()
-        cpu_count = os.cpu_count() or 2
-        cap = max(1, cpu_count // 2)
+        try:
+            cap = self._compute_astap_cap()
+        except Exception:
+            cpu_count = os.cpu_count() or 2
+            cap = max(1, cpu_count // 2)
         options = {str(i): i for i in range(1, cap + 1)}
         current = self._astap_instances_value
         options[str(current)] = current
@@ -6448,7 +6465,7 @@ class FilterQtDialog(QDialog):
             self._astap_instances_combo.blockSignals(False)
 
     def _apply_astap_instances_choice(self, value: int, *, warn: bool) -> bool:
-        parsed = max(1, int(value))
+        parsed = max(1, min(self._compute_astap_cap(), int(value)))
         if warn and parsed > 1 and parsed != self._astap_instances_value:
             title = self._localizer.get("filter_astap_multi_warning_title", "ASTAP Concurrency Warning")
             message = self._localizer.get(
@@ -6489,6 +6506,10 @@ class FilterQtDialog(QDialog):
             clamped = max(1, int(value))
         except Exception:
             clamped = 1
+        try:
+            clamped = min(clamped, self._compute_astap_cap())
+        except Exception:
+            pass
         os.environ["ZEMOSAIC_ASTAP_MAX_PROCS"] = str(clamped)
         if set_astap_max_concurrent_instances is not None:
             try:
