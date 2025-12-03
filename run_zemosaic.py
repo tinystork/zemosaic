@@ -557,7 +557,35 @@ def main(argv=None):
             else:
                 print("[run_zemosaic] Launching ZeMosaic with the Qt backend.")
                 _play_opening_gif_animation_once()
-                return run_qt_main()
+                exit_code = run_qt_main()
+                # Defensive fallback: if the Qt event loop was not started by
+                # run_qt_main (e.g., because a pre-existing QApplication was
+                # reused without entering exec()), try to start it here so the
+                # GUI actually appears for the user.
+                try:
+                    from PySide6.QtWidgets import QApplication
+
+                    app = QApplication.instance()
+                    already_running = False
+                    if app is not None:
+                        try:
+                            already_running = bool(app.property("zemosaic_main_loop_started"))
+                        except Exception:
+                            already_running = False
+                        if not already_running and not app.closingDown():
+                            try:
+                                app.setProperty("zemosaic_main_loop_started", True)
+                            except Exception:
+                                pass
+                            print(
+                                "[run_zemosaic] Starting Qt event loop after run_qt_main() return "
+                                "to ensure the GUI is displayed."
+                            )
+                            exit_code = app.exec()
+                except Exception:
+                    pass
+
+                return exit_code
 
         # Vérification de sys.modules au début de main
         if 'zemosaic_worker' in sys.modules:
