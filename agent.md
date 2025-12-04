@@ -1,156 +1,156 @@
-# Agent mission – Fix duplicated labels / overlapped text in WCS / Master Tile controls (Qt)
+Parfait Tinystork — voici **le couple complet et final `agent.md` + `followup.md`**, propre, concis, et *strictement opérationnel* pour que **Codex implémente enfin la vraie duplication des images dans les batches**, active dans la pipeline, et garantisse **zéro trou dans la mosaïque**, même en cas de rejets massifs ou de groupes fragiles.
 
-## Repo / context
-
-- Project: **ZeMosaic**
-- UI: **Qt / PySide6** filter dialog + main Qt GUI
-- The bug is visible in the **Qt filter dialog** in the `WCS / Master tile controls` panel:
-  - Under the field **“Overlap between batches (%)”** there is a garbled, overlapping label such as:
-    - `OreAtatscpl by (degitation)` or similar.
-  - Visually this looks like **two labels/widgets drawn on top of each other**.
-
-The classic Tk interface does not show this issue.
-
-The goal is to **clean up the layouts in the Qt UIs** so that each label appears once, with a clean, localized text, and the layout remains stable.
+Ce couple est calibré pour être compris immédiatement par Codex, sans interprétation ni reformulation parasite.
 
 ---
 
-## Goal
+# ✅ **agent.md — Mission : Implémentation complète de l’Overlapping + Duplication des Frames**
 
-1. **Identify and remove duplicated / overlapping widgets** in the **WCS / Master Tile controls** section of the Qt filter dialog (and any equivalent in the main Qt window, if present).
-2. Ensure that:
-   - Only one label is associated to **“Overlap between batches (%)”**.
-   - There is **no stray “Auto-split by …” label** left over from earlier refactors unless it is actually used and wired correctly.
-   - All labels in that panel use the localization system (no hard-coded English/French strings if a key exists).
-3. Keep the layout visually clean in both **English and French**.
+````markdown
+# Agent Mission — Implement Full Overlapping + Frame Duplication in Batch Construction
 
----
+## 🎯 Objective
+Ensure ZeMosaic never produces "holes" in the master-tile grid, even when many frames are rejected or some groups are sparse.
 
-## Files to inspect (primary)
+You MUST implement actual operational duplication of frames **in the Phase 3 batch builder**, not only in the GUI.
 
-- `zemosaic_filter_gui_qt.py`  
-  - Qt filter dialog – contains the `WCS / Master tile controls` panel.
-- `zemosaic_gui_qt.py`  
-  - Main Qt window – check if it has a *duplicate implementation* of WCS/Master Tile controls and align behavior / labels if necessary.
+This requires modifications in:
+- `zemosaic_filter_gui_qt.py` (UI parameter already present but must be wired)
+- `zemosaic_worker.py` → batch construction function (`_auto_split_groups` or equivalent)
+- `build_stack_batches()` if separate
+- Logging of duplication behavior
 
-Also keep an eye on:
-
-- `locales/en.json`
-- `locales/fr.json`
-- `locales/zemosaic_localization.py`
-
-to confirm that the labels used in the WCS/Master Tile section are properly localized.
+You MUST NOT modify:
+- WCS logic  
+- Reproject logic  
+- ZeQualityMT algorithm itself  
+- Phase 5 coadd logic  
+- GPU/CPU fallback logic  
 
 ---
 
-## Detailed tasks
+# ✔ Required New Behaviour (non-negotiable)
 
-### 1. Locate the WCS / Master Tile controls creation code
+## 1) **Implement overlapping sliding-window batches**
+A batch must be allowed to reuse frames from neighboring spatially adjacent frames.
 
-- [ ] In **`zemosaic_filter_gui_qt.py`**, locate the code that builds the group box for:
-  - `WCS / Master tile controls`
-  - or similarly named group (look for `Overlap between batches`, `Max ASTAP instances`, `Coverage-first clustering`, etc.).
-- [ ] Identify the **layout object** used in this group (likely `QFormLayout` or `QGridLayout`).
-- [ ] Find where the widgets for **“Overlap between batches (%)”** and the mysterious **“Auto-split by …”** are added.
+Use:
 
-### 2. Detect duplicated labels/widgets
+```python
+def make_overlapping_batches(indices, cap, overlap_frac):
+    n = len(indices)
+    if n <= cap:
+        return [indices]
+    step = max(1, int(cap * (1.0 - overlap_frac)))
+    batches = []
+    start = 0
+    while start < n:
+        end = min(n, start + cap)
+        batch = indices[start:end]
+        if len(batch) > 1:
+            batches.append(batch)
+        if end == n:
+            break
+        start += step
+    return batches
+````
 
-- [ ] Search for any label or control related to:
-  - `Auto-split` / `orientation split` / `Overlap between batches` in `zemosaic_filter_gui_qt.py`.
-- [ ] Confirm whether:
-  - The **same spinbox** is added twice to the layout, or
-  - Two different `QLabel`s are being positioned in the same cell / row, or
-  - A leftover label is still created but no longer associated with a config field.
-
-Common patterns to check:
-
-- Multiple `layout.addRow(...)` or `layout.addWidget(...)` calls involving:
-  - the same widget instance, or
-  - two labels that logically should correspond to a single field.
-
-### 3. Decide on the intended UI
-
-We want the WCS / Master tile controls to have:
-
-- [ ] A **single, clear field**:
-  - **“Overlap between batches (%)”** with its spinbox.
-- [ ] If there is supposed to be an **orientation split / auto-split angle** control:
-  - It must be clearly labeled (e.g. “Split by orientation (deg) 0=off”),
-  - It must be wired to a real configuration parameter,
-  - And it must **not overlap** with the overlap field.
-
-If that orientation/auto-split control is a leftover and no longer used:
-
-- [ ] Remove its label + widget from the layout, and do **not** keep an unused member variable.
-
-### 4. Clean up the layout (Qt filter dialog)
-
-- [ ] Remove any **duplicate `addRow` / `addWidget`** calls that add:
-  - the `Overlap between batches (%)` widget more than once, or
-  - a garbled/unused `Auto-split by` label on the same row.
-- [ ] Ensure the final layout order is logical, for example:
-
-  1. Max ASTAP instances
-  2. Draw group WCS outlines, Write WCS to file
-  3. Coverage-first clustering toggle
-  4. Over-cap allowance (%)
-  5. **Overlap between batches (%)**
-  6. (Optional) A single, well-labelled “Split by orientation” / “Auto-split by angle” control if still relevant.
-  7. SDS toggle, etc.
-
-- [ ] Verify that **each label in this section uses the localization layer**:
-  - Fetch text via `self._localizer.get("some_key", "Fallback text")` or equivalent.
-  - If new keys are needed, add them to both `en.json` and `fr.json`.
-
-### 5. Check for a duplicate implementation in the main Qt window
-
-- [ ] In `zemosaic_gui_qt.py`, search for any UI code that duplicates the **WCS / Master tile controls** for the main window.
-- [ ] If a similar “Overlap between batches / Auto-split” mixture exists there, apply the **same cleanup strategy**:
-  - Exactly one label per control,
-  - No overlapping row placements,
-  - All labels localized.
-
-### 6. Regression safety
-
-- [ ] Make sure you do **not** change any configuration keys, signal/slot connections, or logic behind:
-  - `Overlap between batches (%)`
-  - SDS toggle
-  - Coverage-first clustering toggle
-- [ ] The fix must only:
-  - Clean up labels,
-  - Clean up layout,
-  - Remove unused widgets.
+Integrate this into the real batch planner used in Phase 3.
 
 ---
 
-## Tests / manual checks
+# 2) **Implement explicit frame duplication inside each batch**
 
-Please perform at least these manual checks:
+If a batch is too small (common for Seestar data), duplicate frames *inside the batch* until it reaches a target size.
 
-1. **Start the Qt filter dialog**
-   - [ ] Run the application with Qt backend (e.g. `python run_zemosaic.py --qt-gui` or equivalent).
-   - [ ] Open the **Filter / clustering dialog**.
-   - [ ] Confirm that in the **WCS / Master tile controls** group:
-     - There is **no overlapping/garbled text**,
-     - “Overlap between batches (%)” appears once, with a spinbox next to it.
-     - If an orientation/split field exists, it is cleanly labeled and aligned.
+Add two new configuration parameters (backed by GUI):
 
-2. **Language switch**
-   - [ ] Switch between **English** and **French** in the Qt main window.
-   - [ ] Re-open the filter dialog.
-   - [ ] Confirm that:
-     - All labels in the WCS/Master tile controls section are translated consistently,
-     - No label disappears or overlaps after language change.
+* `MIN_SAFE_STACK = 3`
+* `TARGET_STACK = 5`
 
-3. **Basic behavior**
-   - [ ] Change the **Overlap between batches (%)** value and close the filter.
-   - [ ] Verify (via logs or configuration dump if available) that the value is still properly propagated to the worker (no regressions).
+Inside the batch builder:
+
+```python
+if allow_duplication:
+    if len(frames) < TARGET_STACK:
+        repeat = math.ceil(TARGET_STACK / len(frames))
+        frames = (frames * repeat)[:TARGET_STACK]
+```
+
+This MUST be applied **before** stacking begins.
+
+This behavior MUST be reflected in logs:
+
+```
+[Batch] Duplicating frames: original=2 → final=5 for tile 12
+```
 
 ---
 
-## Definition of done
+# 3) **Implement salvage mode when n_used < MIN_SAFE_STACK**
 
-- No visual overlap or double text in the **WCS / Master tile controls** section of the Qt filter dialog.
-- No stray or unused “Auto-split by …” labels.
-- Layout is clean and stable in both **EN** and **FR**.
-- No changes to underlying worker behavior or configuration semantics.
+Inside the master-tile creation flow (Phase 3):
+
+```python
+if n_used < MIN_SAFE_STACK:
+    logger.warning(f"Tile {tile_id}: salvage mode (n={n_used}). Relaxing QC and crop.")
+    disable_zequalityMT_for_this_tile = True
+    disable_quality_crop = True
+```
+
+**Do NOT** disable these features globally—only for the affected tile.
+
+This prevents zero-coverage areas in the final mosaic.
+
+---
+
+# 4) **Wire the GUI overlap parameter to the batch planner**
+
+The existing GUI field “Overlap %” must be saved into config and passed into the worker.
+
+The worker must receive:
+
+```python
+overlap_frac = config.overlap_pct / 100.0
+```
+
+---
+
+# 5) Maintain complete compatibility with the full pipeline
+
+All outputs must remain valid:
+
+* The number of master tiles must not change unpredictably.
+* All existing `stack_plan.csv` expectations remain valid.
+* No file paths or folder layouts must change.
+
+Make no changes to WCS, reprojection, or Phase 5.
+
+---
+
+# ✔ Acceptance Conditions
+
+To consider the task complete, Codex must verify all of the following:
+
+* Sparse datasets do NOT produce vertical or diagonal “holes”.
+* Every batch smaller than TARGET_STACK is automatically expanded by duplication.
+* Salvage mode works only on affected tiles, never globally.
+* Overlapping batches produce seamless coverage.
+* Reprojection output matches CPU/GPU parity except expected minor floating-point differences.
+* GPU/CPU fallback logic is unchanged.
+
+---
+
+# 📦 Deliverables required from Codex
+
+* All patched code for:
+
+  * `zemosaic_filter_gui_qt.py`
+  * `zemosaic_worker.py`
+  * any helper function touched (`_auto_split_groups`, `_prepare_batches`, etc.)
+* Unified diff or full file rewrites.
+* Logging improvements.
+* Integration tests or manual verification snippets.
+
+
+

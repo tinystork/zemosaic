@@ -1,38 +1,35 @@
-# Follow-up checklist – duplicated label in WCS / Master Tile controls
+# Follow-Up Checklist for Codex
 
-Please confirm each item before closing the task.
+Please verify and iterate until ALL boxes are checked:
 
-## Implementation review
+## 🔁 Overlapping Batches
+- [ ] Overlapping batch logic implemented in worker
+- [ ] Overlap parameter linked from GUI → config → worker
+- [ ] Logs indicate overlap cap and effective step
 
-- [x] Show the **final snippet** of the layout construction code for the **WCS / Master tile controls** section in `zemosaic_filter_gui_qt.py`.
-  - Include the `addRow` / `addWidget` calls for:
-    - Max ASTAP instances
-    - Coverage-first clustering toggle
-    - Over-cap allowance (%)
-    - Overlap between batches (%)
-    - Any remaining orientation/split control
-- [x] Explicitly point out which **duplicate label / widget(s)** were removed and in which file(s).
-- [x] If any **orientation/auto-split** field remains:
-  - Show how it is labeled and which config field it controls.
+## 🔁 Frame Duplication
+- [ ] batches smaller than TARGET_STACK are expanded via duplication
+- [ ] duplication respects cap and preserves ordering
+- [ ] logs output: "Duplicating frames: original=X → final=Y"
 
-## Localization
+## 🔁 Salvage Mode
+- [ ] salvage triggers only when n_used < MIN_SAFE_STACK
+- [ ] ZeQualityMT disabled only for the salvage tile
+- [ ] quality crop disabled only for the salvage tile
+- [ ] logs output: "Tile N salvage mode"
 
-- [x] List the **localization keys** now used for each label in that group.
-- [x] If new keys were added:
-  - [x] Show the additions to `locales/en.json`.
-  - [x] Show the corresponding entries in `locales/fr.json`.
+## 🔁 Pipeline Safety
+- [ ] No changes to ASTAP, WCS, reprojection logic
+- [ ] Phase 5 untouched
+- [ ] CPU/GPU fallback untouched
+- [ ] Existing output folder structures unchanged
 
-## Visual check (screenshots optional but helpful)
+## 🔁 Behavioural Verification
+- [ ] No more holes in mosaics even with aggressive rejections
+- [ ] Master tiles show stable coverage maps
+- [ ] Reproject output remains smooth between adjacent tiles
+- [ ] Overlapping batches reduce boundary seams
 
-- [ ] Confirm that in the Qt filter dialog:
-  - “Overlap between batches (%)” appears once with a correct label.
-  - There is no garbled or overlapping text below it.
-  - The layout looks aligned and consistent.
-- [ ] Confirm the same after switching language EN ↔ FR.
+If any item is missing or incorrect, revise and re-submit.
+````
 
-## Behavior / regression
-
-- [x] Confirm that the **Overlap between batches (%)** value still flows correctly into the configuration / worker (i.e. no broken connections).
-- [x] Confirm that the change did **not** modify behavior of SDS toggle, coverage-first clustering, or ASTAP instance count.
-
-If any doubts remain, mention them explicitly so they can be tested by the maintainer on real datasets.
