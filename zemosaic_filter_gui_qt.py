@@ -1910,6 +1910,10 @@ class FilterQtDialog(QDialog):
 
         figure = Figure(figsize=(5, 3))
         canvas = FigureCanvasQTAgg(figure)
+        try:
+            canvas.destroyed.connect(self._on_preview_canvas_destroyed)  # type: ignore[attr-defined]
+        except Exception:
+            pass
         canvas.setContextMenuPolicy(Qt.CustomContextMenu)
         canvas.customContextMenuRequested.connect(self._on_preview_context_menu)  # type: ignore[arg-type]
         axes = figure.add_subplot(111)
@@ -1963,6 +1967,10 @@ class FilterQtDialog(QDialog):
 
         figure = Figure(figsize=(5, 3))
         canvas = FigureCanvasQTAgg(figure)
+        try:
+            canvas.destroyed.connect(self._on_coverage_canvas_destroyed)  # type: ignore[attr-defined]
+        except Exception:
+            pass
         axes = figure.add_subplot(111)
         self._coverage_axes = axes
         axes.set_xlabel(self._localizer.get("filter_axis_cov_x", "X [px]"))
@@ -2072,14 +2080,27 @@ class FilterQtDialog(QDialog):
         )
         self._auto_group_button.clicked.connect(self._on_auto_group_clicked)  # type: ignore[arg-type]
         helpers_ready = bool(_CLUSTER_CONNECTED is not None and _AUTOSPLIT_GROUPS is not None)
-        self._auto_group_button.setEnabled(helpers_ready)
+        tooltip = None
         if not helpers_ready:
             tooltip = self._localizer.get(
                 "filter.cluster.helpers_missing",
                 "Auto-organisation helpers are unavailable; install the worker module.",
             )
+        self._auto_group_button.setEnabled(helpers_ready)
+        if tooltip:
             self._auto_group_button.setToolTip(tooltip)
         layout.addWidget(self._auto_group_button, 0, 1)
+
+        manual_label = self._localizer.get(
+            "filter_btn_manual_group",
+            "Manual-organize Master Tiles",
+        )
+        self._manual_group_button = QPushButton(manual_label, box)
+        self._manual_group_button.clicked.connect(self._on_manual_group_clicked)  # type: ignore[arg-type]
+        self._manual_group_button.setEnabled(helpers_ready)
+        if tooltip:
+            self._manual_group_button.setToolTip(tooltip)
+        layout.addWidget(self._manual_group_button, 0, 2)
 
         # Summary label mirroring Tk's "Prepared N group(s), sizes: …"
         self._auto_group_summary_label = QLabel("", box)
@@ -2087,8 +2108,8 @@ class FilterQtDialog(QDialog):
         initial_summary = self._format_group_summary(0, "[]")
         self._auto_group_summary_label.setText(initial_summary)
         self._auto_group_summary_label.setToolTip(initial_summary)
-        layout.addWidget(self._auto_group_summary_label, 0, 2, 11, 1)
-        layout.setColumnStretch(2, 1)
+        layout.addWidget(self._auto_group_summary_label, 0, 3, 11, 1)
+        layout.setColumnStretch(3, 1)
 
         astap_label = QLabel(
             self._localizer.get("filter_label_astap_instances", "Max ASTAP instances"),
@@ -2371,9 +2392,19 @@ class FilterQtDialog(QDialog):
         self._append_log(message)
         self._on_run_analysis()
 
-    def _on_auto_group_clicked(self) -> None:
-        """Trigger the worker-style clustering pipeline used by the Tk filter."""
+    def _on_manual_group_clicked(self) -> None:
+        self._run_manual_master_tile_organisation()
 
+    def _run_manual_master_tile_organisation(self) -> None:
+        self._start_master_tile_organisation(mode="manual")
+
+    def _on_auto_group_clicked(self) -> None:
+        self._start_master_tile_organisation(mode="auto")
+
+    def _start_master_tile_organisation(self, mode: str = "auto") -> None:
+        """Common entry point for manual and auto master-tile generation."""
+
+        normalized_mode = "manual" if str(mode).lower().startswith("manual") else "auto"
         if self._auto_group_running:
             return
         helpers_ready = _CLUSTER_CONNECTED is not None and _AUTOSPLIT_GROUPS is not None
@@ -2386,11 +2417,7 @@ class FilterQtDialog(QDialog):
             self._status_label.setText(message)
             return
 
-        if self._auto_group_button is not None:
-            try:
-                self._auto_group_button.setEnabled(False)
-            except Exception:
-                pass
+        self._set_group_buttons_enabled(False)
 
         selected_indices = self._collect_selected_indices()
         if not selected_indices:
@@ -2424,17 +2451,22 @@ class FilterQtDialog(QDialog):
                 return
             selected_indices = filtered_indices
 
+        log_key = "filter.cluster.manual_refresh"
+        log_default = "Manual master-tile organisation requested."
+        if normalized_mode == "auto":
+            log_key = "filter.cluster.auto_refresh"
+            log_default = "Auto master-tile organisation requested."
         self._auto_group_running = True
-        self._append_log(
-            self._localizer.get(
-                "filter.cluster.manual_refresh",
-                "Manual master-tile organisation requested.",
-            )
-        )
+        self._append_log(self._localizer.get(log_key, log_default))
         self._status_label.setText(
             self._localizer.get("filter.cluster.running", "Preparing master-tile groups…")
         )
 
+        optimize_flag = normalized_mode == "auto"
+        max_raw_snapshot = int(getattr(self, "_max_raw_per_tile_value", 0) or 0)
+        min_safe_snapshot = int(self._config_value("min_safe_stack", 3) or 3)
+        target_stack_snapshot = int(self._config_value("target_stack", 5) or 5)
+        overlap_snapshot = int(self._resolve_overlap_percent())
         try:
             thread = threading.Thread(
                 target=self._auto_group_background_task,
@@ -2442,21 +2474,21 @@ class FilterQtDialog(QDialog):
                     selected_indices,
                     int(self._resolve_overcap_percent()),
                     bool(self._coverage_first_enabled()),
+                    normalized_mode,
+                    optimize_flag,
+                    max_raw_snapshot,
+                    min_safe_snapshot,
+                    target_stack_snapshot,
+                    overlap_snapshot,
                 ),
                 daemon=True,
             )
             thread.start()
             self._show_processing_overlay()
         except Exception as exc:
-            # If the background thread cannot be started, fall back to a safe state
-            # and report the issue instead of leaving the button permanently disabled.
             self._hide_processing_overlay()
             self._auto_group_running = False
-            if self._auto_group_button is not None:
-                try:
-                    self._auto_group_button.setEnabled(True)
-                except Exception:
-                    pass
+            self._set_group_buttons_enabled(True)
             message = self._localizer.get(
                 "filter.cluster.failed",
                 "Auto-organisation failed: {error}",
@@ -2468,6 +2500,15 @@ class FilterQtDialog(QDialog):
             self._append_log(message, level="ERROR")
             self._status_label.setText(message)
 
+    def _set_group_buttons_enabled(self, enabled: bool) -> None:
+        for button in (self._auto_group_button, getattr(self, "_manual_group_button", None)):
+            if button is None:
+                continue
+            try:
+                button.setEnabled(bool(enabled))
+            except Exception:
+                pass
+
     def _handle_auto_group_empty_selection(self) -> None:
         self._auto_group_running = False
         self._group_outline_bounds = []
@@ -2476,11 +2517,7 @@ class FilterQtDialog(QDialog):
         self._append_log(summary_text)
         self._update_auto_group_summary_display(summary_text, summary_text)
         self._status_label.setText(summary_text)
-        if self._auto_group_button is not None:
-            try:
-                self._auto_group_button.setEnabled(True)
-            except Exception:
-                pass
+        self._set_group_buttons_enabled(True)
         self._hide_processing_overlay()
 
     def _auto_group_background_task(
@@ -2488,7 +2525,14 @@ class FilterQtDialog(QDialog):
         selected_indices: list[int],
         overcap_pct: int,
         coverage_enabled_flag: bool,
+        mode: str,
+        optimize_flag: bool,
+        max_raw_cap: int,
+        min_safe_stack: int,
+        target_stack_size: int,
+        overlap_percent: int,
     ) -> None:
+        normalized_mode = "manual" if str(mode).lower().startswith("manual") else "auto"
         messages: list[str | tuple[str, str]] = []
         result_payload: dict[str, Any] | None = None
         try:
@@ -2498,6 +2542,18 @@ class FilterQtDialog(QDialog):
                 coverage_enabled_flag,
                 messages,
             )
+            if isinstance(result_payload, dict):
+                result_payload["mode"] = normalized_mode
+                result_payload["auto_optimised"] = bool(optimize_flag)
+                if optimize_flag:
+                    self._optimize_auto_group_result(
+                        result_payload,
+                        max_raw_cap=int(max_raw_cap),
+                        min_safe_stack=int(min_safe_stack),
+                        target_stack_size=int(target_stack_size),
+                        overlap_percent=int(overlap_percent),
+                        messages=messages,
+                    )
         except Exception as exc:  # pragma: no cover - defensive guard
             error_text = self._localizer.get(
                 "filter.cluster.failed",
@@ -2526,11 +2582,7 @@ class FilterQtDialog(QDialog):
         messages_payload: object,
     ) -> None:
         self._auto_group_running = False
-        if self._auto_group_button is not None:
-            try:
-                self._auto_group_button.setEnabled(True)
-            except Exception:
-                pass
+        self._set_group_buttons_enabled(True)
         entries: list[Any] = []
         if isinstance(messages_payload, list):
             entries = list(messages_payload)
@@ -2881,6 +2933,338 @@ class FilterQtDialog(QDialog):
             "angle_split": angle_split_effective,
         }
 
+    def _optimize_auto_group_result(
+        self,
+        payload: dict[str, Any],
+        *,
+        max_raw_cap: int,
+        min_safe_stack: int,
+        target_stack_size: int,
+        overlap_percent: int,
+        messages: list[str | tuple[str, str]] | None = None,
+    ) -> None:
+        groups = payload.get("final_groups")
+        if not isinstance(groups, list) or not groups:
+            return
+        max_cap = max(0, int(max_raw_cap))
+        min_safe = max(1, int(min_safe_stack))
+        target_stack = max(min_safe, int(target_stack_size))
+        overlap_fraction = max(0.0, min(0.7, float(overlap_percent) / 100.0))
+        threshold = payload.get("threshold_used")
+        try:
+            threshold_float = float(threshold)
+        except Exception:
+            threshold_float = 0.0
+        if not math.isfinite(threshold_float) or threshold_float <= 0:
+            threshold_float = 0.18
+        dispersion_limit = max(0.15, threshold_float * 1.5)
+        cap_limit = max_cap if max_cap > 0 else None
+        desired_target = cap_limit if cap_limit else target_stack
+        path_map = self._build_path_to_entry_map()
+        records = self._build_auto_group_records(groups, path_map)
+        if not records:
+            return
+        sizes_text = ", ".join(str(len(group)) for group in groups if isinstance(group, list))
+        if messages is not None:
+            messages.append(
+                self._format_message(
+                    "auto_optimiser_start",
+                    "[AutoOptimiser] start cap={CAP}, min_safe={MIN}, target={TARGET}, overlap={OVER}% (sizes={SIZES})",
+                    CAP=int(max_cap),
+                    MIN=int(min_safe),
+                    TARGET=int(target_stack),
+                    OVER=int(overlap_fraction * 100),
+                    SIZES=sizes_text or "[]",
+                )
+            )
+
+        records, merge_count = self._merge_group_records_for_auto(
+            records,
+            cap_limit=cap_limit,
+            dispersion_limit=dispersion_limit,
+            desired_target=desired_target,
+        )
+        merged_groups = [record["entries"] for record in records]
+        split_groups, split_count = self._split_large_groups_for_auto(
+            merged_groups,
+            cap_limit=cap_limit,
+            overlap_fraction=overlap_fraction,
+            min_cap=min_safe,
+        )
+        final_records = self._build_auto_group_records(split_groups, path_map)
+        final_records, merge_after_split = self._merge_group_records_for_auto(
+            final_records,
+            cap_limit=cap_limit,
+            dispersion_limit=dispersion_limit,
+            desired_target=desired_target,
+        )
+        optimized_groups = [
+            record["entries"] for record in final_records if isinstance(record.get("entries"), list) and record["entries"]
+        ]
+        if not optimized_groups:
+            optimized_groups = merged_groups
+        payload["final_groups"] = optimized_groups
+        payload["sizes"] = [len(group) for group in optimized_groups]
+
+        if messages is not None:
+            final_sizes = ", ".join(str(len(group)) for group in optimized_groups) or "[]"
+            messages.append(
+                self._format_message(
+                    "auto_optimiser_result",
+                    "[AutoOptimiser] final groups={GROUPS}, merges={MERGES}, splits={SPLITS}, sizes={SIZES}",
+                    GROUPS=len(optimized_groups),
+                    MERGES=int(merge_count + merge_after_split),
+                    SPLITS=int(split_count),
+                    SIZES=final_sizes,
+                )
+            )
+
+    def _build_path_to_entry_map(self) -> dict[str, _NormalizedItem]:
+        path_map: dict[str, _NormalizedItem] = {}
+        for entry in self._normalized_items:
+            if entry.file_path:
+                path_map[casefold_path(entry.file_path)] = entry
+        return path_map
+
+    def _build_auto_group_records(
+        self,
+        groups: list[list[dict[str, Any]]],
+        path_map: dict[str, _NormalizedItem],
+    ) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for group in groups or []:
+            if not group:
+                continue
+            coords = self._gather_group_coordinates(group, path_map)
+            center = self._compute_center_from_coords(coords)
+            dispersion = self._compute_dispersion_for_coords(coords)
+            records.append(
+                {
+                    "entries": list(group),
+                    "coords": coords,
+                    "center": center,
+                    "size": len(group),
+                    "dispersion": dispersion,
+                }
+            )
+        return records
+
+    def _gather_group_coordinates(
+        self,
+        group: list[dict[str, Any]],
+        path_map: dict[str, _NormalizedItem],
+    ) -> list[tuple[float, float]]:
+        coords: list[tuple[float, float]] = []
+        for info in group or []:
+            try:
+                center_ra, center_dec = self._resolve_group_entry_center(info, path_map)
+            except Exception:
+                center_ra = center_dec = None
+            if center_ra is not None and center_dec is not None:
+                try:
+                    ra_val = float(center_ra)
+                    dec_val = float(center_dec)
+                except Exception:
+                    ra_val = dec_val = None
+                if ra_val is not None and dec_val is not None and math.isfinite(ra_val) and math.isfinite(dec_val):
+                    coords.append((ra_val, dec_val))
+                    continue
+            ra_raw = None
+            dec_raw = None
+            if isinstance(info, dict):
+                ra_raw = info.get("RA")
+                dec_raw = info.get("DEC")
+            if ra_raw is None or dec_raw is None:
+                continue
+            try:
+                ra_val = float(ra_raw)
+                dec_val = float(dec_raw)
+            except Exception:
+                continue
+            if math.isfinite(ra_val) and math.isfinite(dec_val):
+                coords.append((ra_val, dec_val))
+        return coords
+
+    @staticmethod
+    def _compute_center_from_coords(coords: list[tuple[float, float]]) -> tuple[float, float] | None:
+        if not coords:
+            return None
+        sum_ra = sum(point[0] for point in coords)
+        sum_dec = sum(point[1] for point in coords)
+        count = len(coords)
+        if count <= 0:
+            return None
+        return (sum_ra / count, sum_dec / count)
+
+    def _compute_dispersion_for_coords(self, coords: list[tuple[float, float]]) -> float:
+        if not coords or len(coords) < 2:
+            return 0.0
+        if _COMPUTE_MAX_SEPARATION is not None:
+            try:
+                dispersion = float(_COMPUTE_MAX_SEPARATION(coords))
+                if math.isfinite(dispersion):
+                    return dispersion
+            except Exception:
+                pass
+        return self._approximate_dispersion(coords)
+
+    @staticmethod
+    def _angular_distance(
+        a: tuple[float, float] | None,
+        b: tuple[float, float] | None,
+    ) -> float:
+        if a is None or b is None:
+            return float("inf")
+        dra = float(a[0]) - float(b[0])
+        ddec = float(a[1]) - float(b[1])
+        return math.hypot(dra, ddec)
+
+    def _merge_group_records_for_auto(
+        self,
+        records: list[dict[str, Any]],
+        *,
+        cap_limit: int | None,
+        dispersion_limit: float,
+        desired_target: int,
+    ) -> tuple[list[dict[str, Any]], int]:
+        if not records:
+            return records, 0
+        desired_target = max(1, int(desired_target))
+        merges = 0
+        max_iterations = max(1, len(records) * 4)
+        iteration = 0
+        while iteration < max_iterations:
+            iteration += 1
+            merged_this_round = False
+            records.sort(key=lambda rec: int(rec.get("size", 0)))
+            for idx in range(len(records)):
+                partner = self._find_auto_merge_partner(
+                    records,
+                    idx,
+                    cap_limit=cap_limit,
+                    dispersion_limit=dispersion_limit,
+                    desired_target=desired_target,
+                )
+                if partner is None:
+                    continue
+                partner_idx, coords, dispersion = partner
+                keep_idx = min(idx, partner_idx)
+                drop_idx = max(idx, partner_idx)
+                keep = records[keep_idx]
+                drop = records[drop_idx]
+                combined_entries = list(keep.get("entries") or []) + list(drop.get("entries") or [])
+                if not combined_entries:
+                    continue
+                if cap_limit is not None and len(combined_entries) > cap_limit:
+                    continue
+                keep["entries"] = combined_entries
+                keep["coords"] = coords or []
+                keep["center"] = self._compute_center_from_coords(coords or [])
+                keep["size"] = len(combined_entries)
+                keep["dispersion"] = dispersion
+                records.pop(drop_idx)
+                merges += 1
+                merged_this_round = True
+                break
+            if not merged_this_round:
+                break
+        return records, merges
+
+    def _find_auto_merge_partner(
+        self,
+        records: list[dict[str, Any]],
+        idx: int,
+        *,
+        cap_limit: int | None,
+        dispersion_limit: float,
+        desired_target: int,
+    ) -> tuple[int, list[tuple[float, float]], float] | None:
+        if idx < 0 or idx >= len(records):
+            return None
+        source = records[idx]
+        source_coords = list(source.get("coords") or [])
+        source_center = source.get("center")
+        if not source_coords or source_center is None:
+            return None
+        source_size = int(source.get("size", len(source_coords)))
+        neighbors: list[tuple[float, int, int]] = []
+        for other_idx, other in enumerate(records):
+            if other_idx == idx:
+                continue
+            other_coords = other.get("coords") or []
+            other_center = other.get("center")
+            if not other_coords or other_center is None:
+                continue
+            other_size = int(other.get("size", len(other_coords)))
+            combined_size = source_size + other_size
+            if cap_limit is not None and combined_size > cap_limit:
+                continue
+            distance = self._angular_distance(source_center, other_center)
+            neighbors.append((distance, other_idx, combined_size))
+        if not neighbors:
+            return None
+        neighbors.sort(key=lambda item: item[0])
+        best_idx: int | None = None
+        best_coords: list[tuple[float, float]] | None = None
+        best_dispersion = 0.0
+        best_score = float("inf")
+        best_distance = float("inf")
+        for distance, other_idx, combined_size in neighbors:
+            combined_coords = source_coords + list(records[other_idx].get("coords") or [])
+            if not combined_coords:
+                continue
+            dispersion = self._compute_dispersion_for_coords(combined_coords)
+            if dispersion_limit > 0 and dispersion > dispersion_limit:
+                continue
+            size_score = abs(desired_target - combined_size)
+            if (
+                size_score < best_score - 1e-6
+                or (abs(size_score - best_score) <= 1e-6 and distance < best_distance)
+            ):
+                best_idx = other_idx
+                best_coords = combined_coords
+                best_dispersion = dispersion
+                best_score = size_score
+                best_distance = distance
+        if best_idx is None or best_coords is None:
+            return None
+        return best_idx, best_coords, best_dispersion
+
+    def _split_large_groups_for_auto(
+        self,
+        groups: list[list[dict[str, Any]]],
+        *,
+        cap_limit: int | None,
+        overlap_fraction: float,
+        min_cap: int,
+    ) -> tuple[list[list[dict[str, Any]]], int]:
+        if not groups:
+            return [], 0
+        if cap_limit is None or cap_limit <= 0:
+            return [list(group) for group in groups], 0
+        overlap_fraction = max(0.0, min(0.7, float(overlap_fraction)))
+        min_cap_effective = max(1, int(min_cap))
+        split_groups: list[list[dict[str, Any]]] = []
+        split_count = 0
+        for group in groups:
+            entries = list(group)
+            if len(entries) <= cap_limit:
+                split_groups.append(entries)
+                continue
+            ordered = self._sort_group_for_overlap(entries)
+            batches = self._make_overlapping_batches(
+                ordered,
+                cap=int(cap_limit),
+                overlap_fraction=overlap_fraction,
+                min_cap=min_cap_effective,
+            )
+            if batches:
+                split_groups.extend(batches)
+                split_count += max(0, len(batches) - 1)
+            else:
+                split_groups.append(entries)
+        return split_groups, split_count
+
     def _apply_auto_group_result(self, payload: dict[str, Any]) -> None:
         groups = payload.get("final_groups") or []
         if not isinstance(groups, list):
@@ -3213,7 +3597,7 @@ class FilterQtDialog(QDialog):
 
         descriptor = self._global_wcs_state.get("descriptor")
         if not isinstance(descriptor, dict) or WCS is None or SkyCoord is None or u is None:
-            self._coverage_canvas.draw_idle()
+            self._safe_draw_coverage_canvas()
             return
 
         plan_wcs = descriptor.get("wcs")
@@ -3227,7 +3611,7 @@ class FilterQtDialog(QDialog):
                 except Exception:
                     plan_wcs = None
         if plan_wcs is None:
-            self._coverage_canvas.draw_idle()
+            self._safe_draw_coverage_canvas()
             return
 
         try:
@@ -3236,7 +3620,7 @@ class FilterQtDialog(QDialog):
         except Exception:
             width = height = 0
         if width <= 0 or height <= 0:
-            self._coverage_canvas.draw_idle()
+            self._safe_draw_coverage_canvas()
             return
 
         # Build a lookup from path to normalized entry, reusing the same helper
@@ -3346,7 +3730,7 @@ class FilterQtDialog(QDialog):
         axes.set_ylabel(self._localizer.get("filter_axis_cov_y", "Y [px]"))
         axes.grid(True, linestyle=":", linewidth=0.6)
 
-        self._coverage_canvas.draw_idle()
+        self._safe_draw_coverage_canvas()
 
     def _resolve_group_entry_footprint(
         self,
@@ -5037,11 +5421,8 @@ class FilterQtDialog(QDialog):
         # recompute groups after changing SDS mode, and keep the button usable.
         self._auto_group_override_groups = None
         self._group_outline_bounds = []
-        if not self._auto_group_running and self._auto_group_button is not None:
-            try:
-                self._auto_group_button.setEnabled(True)
-            except Exception:
-                pass
+        if not self._auto_group_running:
+            self._set_group_buttons_enabled(True)
         # Refresh cluster and preview so the UI reflects the new mode.
         self._schedule_cluster_refresh()
         self._update_summary_label()
@@ -5668,6 +6049,60 @@ class FilterQtDialog(QDialog):
         self._preview_refresh_pending = True
         QTimer.singleShot(delay_ms, self._update_preview_plot)
 
+    def _dispose_preview_canvas(self) -> None:
+        canvas = self._preview_canvas
+        self._preview_canvas = None
+        self._preview_axes = None
+        self._group_outline_collection = None
+        self._preview_refresh_pending = False
+        self._preview_last_refresh = 0.0
+        if self._rectangle_selector is not None:
+            try:
+                self._rectangle_selector.disconnect_events()
+            except Exception:
+                pass
+            try:
+                self._rectangle_selector.set_active(False)
+            except Exception:
+                pass
+            self._rectangle_selector = None
+        if canvas is not None:
+            try:
+                canvas.hide()
+            except Exception:
+                pass
+
+    def _dispose_coverage_canvas(self) -> None:
+        self._coverage_canvas = None
+        self._coverage_axes = None
+
+    def _on_preview_canvas_destroyed(self, _obj: QObject | None = None) -> None:  # pragma: no cover - Qt signal glue
+        self._dispose_preview_canvas()
+
+    def _on_coverage_canvas_destroyed(self, _obj: QObject | None = None) -> None:  # pragma: no cover - Qt signal glue
+        self._dispose_coverage_canvas()
+
+    def _safe_draw_preview_canvas(self) -> None:
+        self._safe_draw_canvas("preview")
+
+    def _safe_draw_coverage_canvas(self) -> None:
+        self._safe_draw_canvas("coverage")
+
+    def _safe_draw_canvas(self, canvas_type: str) -> None:
+        canvas = self._preview_canvas if canvas_type == "preview" else self._coverage_canvas
+        if canvas is None:
+            return
+        try:
+            canvas.draw_idle()
+        except RuntimeError as exc:
+            message = str(exc).lower()
+            if "already deleted" not in message:
+                self._append_log(f"{canvas_type.capitalize()} canvas redraw failed: {exc}", level="WARN")
+            if canvas_type == "preview":
+                self._dispose_preview_canvas()
+            else:
+                self._dispose_coverage_canvas()
+
     def _schedule_cluster_refresh(self) -> None:
         if self._cluster_refresh_pending:
             return
@@ -5831,7 +6266,7 @@ class FilterQtDialog(QDialog):
                 self._preview_empty_logged = True
             axes.text(0.5, 0.5, message, ha="center", va="center", transform=axes.transAxes)
             self._preview_hint_label.setText(self._preview_default_hint)
-            self._preview_canvas.draw_idle()
+            self._safe_draw_preview_canvas()
             return
         self._preview_empty_logged = False
 
@@ -5997,7 +6432,7 @@ class FilterQtDialog(QDialog):
             ra_values.append(ra_corner)
             dec_values.append(dec_corner)
         if not ra_values or not dec_values:
-            self._preview_canvas.draw_idle()
+            self._safe_draw_preview_canvas()
             return
         ra_min, ra_max = min(ra_values), max(ra_values)
         dec_min, dec_max = min(dec_values), max(dec_values)
@@ -6033,7 +6468,7 @@ class FilterQtDialog(QDialog):
             )
         except Exception:
             self._preview_hint_label.setText(summary_text)
-        self._preview_canvas.draw_idle()
+        self._safe_draw_preview_canvas()
 
     # ------------------------------------------------------------------
     # QDialog API
@@ -6047,6 +6482,8 @@ class FilterQtDialog(QDialog):
         self._stop_stream_worker()
         self._stop_scan_worker()
         self._hide_processing_overlay()
+        self._dispose_preview_canvas()
+        self._dispose_coverage_canvas()
         super().closeEvent(event)
 
     def accept(self) -> None:  # noqa: D401 - inherit docstring

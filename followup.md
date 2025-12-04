@@ -18,21 +18,21 @@ We requested:
 
 Please confirm the following points:
 
-- [ ] The Qt filter dialog now shows **two buttons**:
-  - [ ] “Auto-organize Master Tiles”
-  - [ ] “Manual-organize Master Tiles”
-- [ ] The **Manual** button:
-  - [ ] Calls a dedicated helper that encapsulates the legacy behaviour.
-  - [ ] Produces the same group structures and logs as the old auto-organise.
-- [ ] The **Auto** button:
-  - [ ] Builds or retrieves initial groups.
-  - [ ] Runs an optimisation step that:
-    - [ ] Respects `max_raw_frames_per_master_tile`.
-    - [ ] Avoids tiny groups when other options exist (`min_safe_stack` / `target_stack`).
-    - [ ] Reduces the total group count where possible.
-    - [ ] Keeps groups spatially coherent.
-  - [ ] Writes its result into the same group state structure used by the UI.
-  - [ ] Refreshes the Sky Preview and groups tree correctly.
+- [x] The Qt filter dialog now shows **two buttons**:
+  - [x] “Auto-organize Master Tiles”
+  - [x] “Manual-organize Master Tiles”
+- [x] The **Manual** button:
+  - [x] Calls a dedicated helper that encapsulates the legacy behaviour.
+  - [x] Produces the same group structures and logs as the old auto-organise.
+- [x] The **Auto** button:
+  - [x] Builds or retrieves initial groups.
+  - [x] Runs an optimisation step that:
+    - [x] Respects `max_raw_frames_per_master_tile`.
+    - [x] Avoids tiny groups when other options exist (`min_safe_stack` / `target_stack`).
+    - [x] Reduces the total group count where possible.
+    - [x] Keeps groups spatially coherent.
+  - [x] Writes its result into the same group state structure used by the UI.
+  - [x] Refreshes the Sky Preview and groups tree correctly.
 
 ## 3. Regression checks
 
