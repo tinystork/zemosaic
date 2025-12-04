@@ -1,57 +1,46 @@
+# 🔁 Follow-up : Validation & Ajustements
 
-## 🧾 `followup.md` – Checklist pour vérifier que Codex a bien fait le job
+Ceci est la liste des vérifications à effectuer sur votre implémentation.  
+Cochez les cases lors des itérations :
 
-```markdown
-# Follow-up: Auto vs Manual master-tile organisation and optimiser
+## 🔧 Implémentation générale
+- [ ] Le pipeline classique est intact (aucune différence dans les logs/classiques)
+- [ ] `detect_grid_mode()` bascule proprement sans effet secondaire
+- [ ] `run_grid_mode()` est complètement isolé
 
-## 1. What we asked
+## 📥 Lecture du stack_plan.csv
+- [ ] Fonction de parsing robuste
+- [ ] Colonnes ignorées correctement
+- [ ] Paths vérifiés
 
-We requested:
+## 🌐 Construction de la grille
+- [ ] WCS global stable
+- [ ] Conversion RA/Dec → X,Y correcte
+- [ ] Grille régulière générée avec overlap
 
-- A **new “Manual-organize Master Tiles” button** that preserves the **old behaviour** of “Auto-organize Master Tiles”.
-- A redefined **“Auto-organize Master Tiles”** which:
-  - maximises the number of raw frames per master tile (up to the configured max),
-  - minimises the number of groups,
-  - and keeps groups spatially coherent, using existing clustering helpers.
+## 🎛 Sélection des frames
+- [ ] Test intersection tile/frame robuste
+- [ ] Frames assignées à plusieurs tiles si besoin
 
-## 2. What to verify in your changes
+## 🧪 Traitement par tile
+- [ ] Reprojection locale correcte
+- [ ] Empilement avec pondération
+- [ ] Rejet sigma/winsor/kappa OK
+- [ ] Tile sauvegardée dans tiles/
 
-Please confirm the following points:
+## 🧩 Assemblage final
+- [ ] Aucun appel à reproject_and_coadd
+- [ ] Placement direct des pixels basé sur X,Y global
+- [ ] Blending léger OK
+- [ ] Normalisation large-échelle globale OK
 
-- [x] The Qt filter dialog now shows **two buttons**:
-  - [x] “Auto-organize Master Tiles”
-  - [x] “Manual-organize Master Tiles”
-- [x] The **Manual** button:
-  - [x] Calls a dedicated helper that encapsulates the legacy behaviour.
-  - [x] Produces the same group structures and logs as the old auto-organise.
-- [x] The **Auto** button:
-  - [x] Builds or retrieves initial groups.
-  - [x] Runs an optimisation step that:
-    - [x] Respects `max_raw_frames_per_master_tile`.
-    - [x] Avoids tiny groups when other options exist (`min_safe_stack` / `target_stack`).
-    - [x] Reduces the total group count where possible.
-    - [x] Keeps groups spatially coherent.
-  - [x] Writes its result into the same group state structure used by the UI.
-  - [x] Refreshes the Sky Preview and groups tree correctly.
+## 🧪 Tests multi-source
+- [ ] Multi-nuit → correct
+- [ ] Multi-site → correct
+- [ ] Multi-mount → correct
+- [ ] Multi-filtre → cohérent selon le mode choisi
 
-## 3. Regression checks
+## 📝 Logs
+- [ ] Tous les logs taggés `[GRID]`
+- [ ] Aucun log parasite dans le pipeline classique
 
-Please double-check:
-
-- [ ] No frames are lost: every selected frame is assigned to some group in both modes.
-- [ ] Tk filter UI still works (if any shared helpers were changed).
-- [ ] The Coverage Map tab remains unchanged and correct.
-- [ ] Sky Preview updates work with both buttons, and (if implemented) group colouring still corresponds to the underlying grouping.
-- [ ] There are no new warnings or tracebacks in normal use.
-
-## 4. Behaviour sanity tests
-
-On a real Seestar dataset (with hundreds/thousands of frames):
-
-- [ ] Manual mode yields a grouping comparable to previous versions of ZeMosaic.
-- [ ] Auto mode generally:
-  - [ ] Creates **fewer** groups than manual mode (when parameters allow it).
-  - [ ] Produces groups whose sizes gravitate toward the configured max frames per master tile.
-  - [ ] Avoids strange, widely scattered groups.
-
-If any of these expectations are not met, please refine the optimiser logic and re-test.
