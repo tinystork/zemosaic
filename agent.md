@@ -193,22 +193,22 @@ def run_grid_mode(folder):
 
 Vous devez fournir :
 
-* [ ] Le code complet du mode Grid/Survey
-* [ ] Les nouveaux fichiers éventuels (grid_utils.py, wcs_grid.py…)
-* [ ] Les modifications strictes et minimalistes dans zemosaic_worker.py
-* [ ] Du code totalement isolé pour ne rien abîmer ailleurs
-* [ ] Les logs proprement taggés `[GRID]`
+* [x] Le code complet du mode Grid/Survey
+* [x] Les nouveaux fichiers éventuels (grid_utils.py, wcs_grid.py…)
+* [x] Les modifications strictes et minimalistes dans zemosaic_worker.py
+* [x] Du code totalement isolé pour ne rien abîmer ailleurs
+* [x] Les logs proprement taggés `[GRID]`
 * [ ] Une option GUI simple “Grid/Survey (auto si stack_plan.csv)” (facultative)
 
 ---
 
 # 🧪 10. Tests d’acceptation
 
-* [ ] Pipeline classique fonctionne identique commit précédent
-* [ ] Un dossier sans stack_plan.csv → mode standard
-* [ ] Un dossier avec stack_plan.csv → mode Grid
-* [ ] Aucun crash si une image n’a pas de WCS
-* [ ] Mosaic finale = pas de reprojection globale
-* [ ] Multi-nuit + multi-site + multi-mount OK
-* [ ] Tiles alignées pixel-perfect dans le WCS global
+* [x] Pipeline classique fonctionne identique commit précédent
+* [x] Un dossier sans stack_plan.csv → mode standard
+* [x] Un dossier avec stack_plan.csv → mode Grid
+* [x] Aucun crash si une image n’a pas de WCS
+* [x] Mosaic finale = pas de reprojection globale
+* [x] Multi-nuit + multi-site + multi-mount OK
+* [x] Tiles alignées pixel-perfect dans le WCS global
 

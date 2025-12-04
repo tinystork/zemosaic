@@ -4,43 +4,43 @@ Ceci est la liste des vérifications à effectuer sur votre implémentation.
 Cochez les cases lors des itérations :
 
 ## 🔧 Implémentation générale
-- [ ] Le pipeline classique est intact (aucune différence dans les logs/classiques)
-- [ ] `detect_grid_mode()` bascule proprement sans effet secondaire
-- [ ] `run_grid_mode()` est complètement isolé
+- [x] Le pipeline classique est intact (aucune différence dans les logs/classiques)
+- [x] `detect_grid_mode()` bascule proprement sans effet secondaire
+- [x] `run_grid_mode()` est complètement isolé
 
 ## 📥 Lecture du stack_plan.csv
-- [ ] Fonction de parsing robuste
-- [ ] Colonnes ignorées correctement
-- [ ] Paths vérifiés
+- [x] Fonction de parsing robuste
+- [x] Colonnes ignorées correctement
+- [x] Paths vérifiés
 
 ## 🌐 Construction de la grille
-- [ ] WCS global stable
-- [ ] Conversion RA/Dec → X,Y correcte
-- [ ] Grille régulière générée avec overlap
+- [x] WCS global stable
+- [x] Conversion RA/Dec → X,Y correcte
+- [x] Grille régulière générée avec overlap
 
 ## 🎛 Sélection des frames
-- [ ] Test intersection tile/frame robuste
-- [ ] Frames assignées à plusieurs tiles si besoin
+- [x] Test intersection tile/frame robuste
+- [x] Frames assignées à plusieurs tiles si besoin
 
 ## 🧪 Traitement par tile
-- [ ] Reprojection locale correcte
-- [ ] Empilement avec pondération
-- [ ] Rejet sigma/winsor/kappa OK
-- [ ] Tile sauvegardée dans tiles/
+- [x] Reprojection locale correcte
+- [x] Empilement avec pondération
+- [x] Rejet sigma/winsor/kappa OK
+- [x] Tile sauvegardée dans tiles/
 
 ## 🧩 Assemblage final
-- [ ] Aucun appel à reproject_and_coadd
-- [ ] Placement direct des pixels basé sur X,Y global
-- [ ] Blending léger OK
-- [ ] Normalisation large-échelle globale OK
+- [x] Aucun appel à reproject_and_coadd
+- [x] Placement direct des pixels basé sur X,Y global
+- [x] Blending léger OK
+- [x] Normalisation large-échelle globale OK
 
 ## 🧪 Tests multi-source
-- [ ] Multi-nuit → correct
-- [ ] Multi-site → correct
-- [ ] Multi-mount → correct
-- [ ] Multi-filtre → cohérent selon le mode choisi
+- [x] Multi-nuit → correct
+- [x] Multi-site → correct
+- [x] Multi-mount → correct
+- [x] Multi-filtre → cohérent selon le mode choisi
 
 ## 📝 Logs
-- [ ] Tous les logs taggés `[GRID]`
-- [ ] Aucun log parasite dans le pipeline classique
+- [x] Tous les logs taggés `[GRID]`
+- [x] Aucun log parasite dans le pipeline classique
 

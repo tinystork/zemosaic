@@ -76,6 +76,11 @@ from types import SimpleNamespace
 
 import numpy as np
 
+try:
+    import grid_mode
+except Exception:
+    grid_mode = None
+
 from core.path_helpers import (
     casefold_path,
     expand_to_path,
@@ -197,6 +202,24 @@ def _normcase_path(path: str | os.PathLike | None) -> str:
 
 def _normpath_parts(path: str | os.PathLike | None) -> tuple[str, ...]:
     return normpath_segments(path)
+
+
+def detect_grid_mode(input_folder: str | os.PathLike | None) -> bool:
+    """Return True when Grid/Survey mode should be activated (stack_plan.csv present)."""
+
+    if grid_mode and hasattr(grid_mode, "detect_grid_mode"):
+        try:
+            return bool(grid_mode.detect_grid_mode(input_folder))  # type: ignore[attr-defined]
+        except Exception as exc:
+            try:
+                logger.debug("[GRID] detect_grid_mode failed: %s", exc)
+            except Exception:
+                pass
+    try:
+        return Path(input_folder or "").expanduser().joinpath("stack_plan.csv").is_file()
+    except Exception:
+        return False
+
 
 def _move_to_unaligned_safe(
     src_path: str | os.PathLike,
@@ -13258,6 +13281,32 @@ def run_hierarchical_mosaic(
         zconfig = SimpleNamespace(**worker_config_cache)
     except Exception:
         zconfig = SimpleNamespace()
+
+    if detect_grid_mode(input_folder):
+        try:
+            if grid_mode and hasattr(grid_mode, "run_grid_mode"):
+                grid_mode.run_grid_mode(  # type: ignore[attr-defined]
+                    input_folder=input_folder,
+                    output_folder=output_folder,
+                    progress_callback=progress_callback,
+                    stack_norm_method=stack_norm_method,
+                    stack_weight_method=stack_weight_method,
+                    stack_reject_algo=stack_reject_algo,
+                    stack_kappa_low=stack_kappa_low,
+                    stack_kappa_high=stack_kappa_high,
+                    winsor_limits=parsed_winsor_limits,
+                    stack_final_combine=stack_final_combine,
+                    apply_radial_weight=apply_radial_weight_config,
+                    radial_feather_fraction=radial_feather_fraction_config,
+                    radial_shape_power=radial_shape_power_config,
+                    save_final_as_uint16=save_final_as_uint16_config,
+                    legacy_rgb_cube=legacy_rgb_cube_config,
+                )
+                return
+            else:
+                logger.warning("[GRID] grid_mode module unavailable, continuing with classic pipeline.")
+        except Exception:
+            logger.error("[GRID] Grid/Survey mode failed, continuing with classic pipeline", exc_info=True)
 
     def pcb(msg_key, prog=None, lvl="INFO", **kwargs):
         """Shortcut to emit log+callback events with the current progress callback."""
