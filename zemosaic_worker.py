@@ -6944,6 +6944,42 @@ def _chunk_sequence(seq: list[dict], size: int) -> list[list[dict]]:
     return [seq[i:i + size] for i in range(0, len(seq), size)]
 
 
+def make_overlapping_batches(indices: list[int], cap: int, overlap_frac: float) -> list[list[int]]:
+    n = len(indices)
+    if n <= cap:
+        return [indices]
+    step = max(1, int(cap * (1.0 - overlap_frac)))
+    batches: list[list[int]] = []
+    start = 0
+    while start < n:
+        end = min(n, start + cap)
+        batch = indices[start:end]
+        if len(batch) > 1:
+            batches.append(batch)
+        if end == n:
+            break
+        start += step
+    return batches
+
+
+def _sort_group_for_overlap(group: list[dict]) -> list[dict]:
+    if not group:
+        return []
+
+    def _safe_number(value: Any) -> float:
+        try:
+            number = float(value)
+        except Exception:
+            return math.inf
+        return number if math.isfinite(number) else math.inf
+
+    ordered = sorted(
+        ((idx, info) for idx, info in enumerate(group)),
+        key=lambda item: (_safe_number(item[1].get("RA")), _safe_number(item[1].get("DEC")), item[0]),
+    )
+    return [info for _idx, info in ordered]
+
+
 def _auto_split_single_group(
     group: list[dict],
     cap: int,
@@ -9528,6 +9564,9 @@ def create_master_tile(
     center_out_settings: dict | None = None,
     center_out_rank: int | None = None,
     parallel_plan: ParallelPlan | None = None,
+    allow_batch_duplication: bool = True,
+    target_stack_size: int = 5,
+    min_safe_stack_size: int = 3,
 ):
     """
     Crée une "master tuile" à partir d'un groupe d'images.
@@ -9656,9 +9695,35 @@ def create_master_tile(
         if not ASTROPY_AVAILABLE or not fits: pcb_tile(f"{func_id_log_base}_error_astropy_unavailable", prog=None, lvl="ERROR", tile_id=tile_id)
         return (None, None), failed_groups_to_retry
         
-    if not seestar_stack_group_info: 
+    if not seestar_stack_group_info:
         pcb_tile(f"{func_id_log_base}_error_no_images_provided", prog=None, lvl="ERROR", tile_id=tile_id)
         return (None, None), failed_groups_to_retry
+
+    quality_crop_enabled_tile = bool(quality_crop_enabled)
+    quality_gate_enabled_tile = bool(quality_gate_enabled)
+    min_safe_stack_effective = max(1, int(min_safe_stack_size))
+    target_stack_effective = max(min_safe_stack_effective, int(target_stack_size))
+
+    original_batch_size = len(seestar_stack_group_info)
+    if allow_batch_duplication and original_batch_size < target_stack_effective and original_batch_size > 0:
+        repeat = math.ceil(target_stack_effective / original_batch_size)
+        seestar_stack_group_info = (seestar_stack_group_info * repeat)[:target_stack_effective]
+        pcb_tile(
+            f"[Batch] Duplicating frames: original={original_batch_size} → final={len(seestar_stack_group_info)}",
+            prog=None,
+            lvl="INFO_DETAIL",
+            tile_id=int(tile_id),
+        )
+        try:
+            if logger:
+                logger.info(
+                    "[Batch] Duplicating frames: original=%d → final=%d for tile %s",
+                    original_batch_size,
+                    len(seestar_stack_group_info),
+                    str(tile_id),
+                )
+        except Exception:
+            pass
     
     # Choix de l'image de référence (généralement la première du groupe après tri ou la plus centrale)
     reference_image_index_in_group = 0 # Pourrait être plus sophistiqué à l'avenir
@@ -9784,15 +9849,34 @@ def create_master_tile(
 
     num_actually_aligned_for_header = len(valid_aligned_images)
     pcb_tile(f"{func_id_log_base}_info_intra_tile_alignment_finished", prog=None, lvl="DEBUG_DETAIL", num_aligned=num_actually_aligned_for_header, tile_id=tile_id)
-    
-    if not valid_aligned_images: 
+
+    if not valid_aligned_images:
         pcb_tile(f"{func_id_log_base}_error_no_images_after_alignment", prog=None, lvl="ERROR", tile_id=tile_id)
         try:
             _PH3_CONCURRENCY_SEMAPHORE.release()
         except Exception:
             pass
         return (None, None), failed_groups_to_retry
-    
+
+    n_used_for_stack = len(valid_aligned_images)
+    if n_used_for_stack < min_safe_stack_effective:
+        quality_gate_enabled_tile = False
+        quality_crop_enabled_tile = False
+        pcb_tile(
+            f"Tile {tile_id}: salvage mode (n={n_used_for_stack}). Relaxing QC and crop.",
+            prog=None,
+            lvl="WARN",
+        )
+        try:
+            if logger:
+                logger.warning(
+                    "Tile %s: salvage mode (n=%d). Relaxing QC and crop.",
+                    str(tile_id),
+                    n_used_for_stack,
+                )
+        except Exception:
+            pass
+
     pcb_tile(f"{func_id_log_base}_info_stacking_started", prog=None, lvl="DEBUG_DETAIL",
              num_to_stack=len(valid_aligned_images), tile_id=tile_id) # Les options sont loggées au début
     master_tile_stacked_HWC, stack_metadata, used_gpu = _stack_master_tile_auto(
@@ -9915,7 +9999,7 @@ def create_master_tile(
                 )
 
     quality_crop_rect: tuple[int, int, int, int] | None = None
-    if quality_crop_enabled:
+    if quality_crop_enabled_tile:
         try:
             band_px = max(4, int(quality_crop_band_px))
         except Exception:
@@ -10041,7 +10125,7 @@ def create_master_tile(
             )
 
     pipeline_cfg = {
-        "quality_crop_enabled": quality_crop_enabled,
+        "quality_crop_enabled": quality_crop_enabled_tile,
         "quality_crop_band_px": quality_crop_band_px,
         "quality_crop_k_sigma": quality_crop_k_sigma,
         "quality_crop_margin_px": quality_crop_margin_px,
@@ -10080,7 +10164,7 @@ def create_master_tile(
     quality_gate_eval: Optional[dict[str, Any]] = _evaluate_quality_gate_metrics(
         tile_id,
         master_tile_stacked_HWC,
-        enabled=quality_gate_enabled,
+        enabled=quality_gate_enabled_tile,
         threshold=quality_gate_threshold,
         edge_band=quality_gate_edge_band_px,
         k_sigma=quality_gate_k_sigma,
@@ -13323,6 +13407,49 @@ def run_hierarchical_mosaic(
     except Exception:
         pass
 
+    try:
+        batch_overlap_pct_config = float(worker_config_cache.get("batch_overlap_pct", 0.0))
+    except Exception:
+        batch_overlap_pct_config = 0.0
+    batch_overlap_pct_override = None
+    try:
+        if isinstance(filter_overrides, dict) and "batch_overlap_pct" in filter_overrides:
+            batch_overlap_pct_override = float(filter_overrides.get("batch_overlap_pct", batch_overlap_pct_config))
+    except Exception:
+        batch_overlap_pct_override = None
+    if batch_overlap_pct_override is not None:
+        batch_overlap_pct_config = batch_overlap_pct_override
+    overlap_fraction_config = max(0.0, min(0.7, float(batch_overlap_pct_config) / 100.0))
+
+    try:
+        min_safe_stack_config = int(worker_config_cache.get("min_safe_stack", 3) or 3)
+    except Exception:
+        min_safe_stack_config = 3
+    try:
+        target_stack_config = int(worker_config_cache.get("target_stack", 5) or 5)
+    except Exception:
+        target_stack_config = 5
+    allow_duplication_config = _coerce_bool_flag(worker_config_cache.get("allow_batch_duplication", True))
+    if allow_duplication_config is None:
+        allow_duplication_config = True
+    if isinstance(filter_overrides, dict):
+        if "min_safe_stack" in filter_overrides:
+            try:
+                min_safe_stack_config = int(filter_overrides.get("min_safe_stack", min_safe_stack_config))
+            except Exception:
+                pass
+        if "target_stack" in filter_overrides:
+            try:
+                target_stack_config = int(filter_overrides.get("target_stack", target_stack_config))
+            except Exception:
+                pass
+        if "allow_batch_duplication" in filter_overrides:
+            allow_override = _coerce_bool_flag(filter_overrides.get("allow_batch_duplication"))
+            if allow_override is not None:
+                allow_duplication_config = allow_override
+    min_safe_stack_config = max(1, min_safe_stack_config)
+    target_stack_config = max(min_safe_stack_config, target_stack_config)
+
     # --- Harmoniser les méthodes de pondération issues du GUI / CLI / fallback config ---
     requested_stack_weight_method = stack_weight_method
     stack_weight_method_normalized = str(stack_weight_method or "").lower().strip()
@@ -14794,6 +14921,7 @@ def run_hierarchical_mosaic(
     if not seestar_stack_groups:
         pcb("run_error_phase2_no_groups", prog=(base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING), lvl="ERROR")
         return
+    auto_split_cap_value: int | None = None
     if (not preplan_groups_active) and auto_caps_info and seestar_stack_groups:
         try:
             cap_value = int(auto_caps_info.get("cap", 0))
@@ -14801,6 +14929,7 @@ def run_hierarchical_mosaic(
         except Exception:
             cap_value = 0
             min_value = 8
+        auto_split_cap_value = cap_value if cap_value > 0 else None
         if cap_value > 0:
             original_count = len(seestar_stack_groups)
             seestar_stack_groups = _auto_split_groups(
@@ -14847,6 +14976,42 @@ def run_hierarchical_mosaic(
                 limit=max_raw_per_master_tile_config,
             )
         seestar_stack_groups = new_groups
+    overlap_cap = None
+    if max_raw_per_master_tile_config and max_raw_per_master_tile_config > 0:
+        overlap_cap = int(max_raw_per_master_tile_config)
+    elif auto_split_cap_value:
+        overlap_cap = int(auto_split_cap_value)
+    if overlap_fraction_config > 0.0 and overlap_cap and seestar_stack_groups:
+        overlapping_groups: list[list[dict]] = []
+        effective_step = max(1, int(overlap_cap * (1.0 - overlap_fraction_config)))
+        for group in seestar_stack_groups:
+            ordered_group = _sort_group_for_overlap(group)
+            batches_idx = make_overlapping_batches(list(range(len(ordered_group))), overlap_cap, overlap_fraction_config)
+            if not batches_idx and ordered_group:
+                batches_idx = [list(range(len(ordered_group)))]
+            for batch_indices in batches_idx:
+                batch = [ordered_group[i] for i in batch_indices if 0 <= i < len(ordered_group)]
+                if batch:
+                    overlapping_groups.append(batch)
+        if overlapping_groups:
+            pcb(
+                "[Batching] cap overlap applied",
+                prog=None,
+                lvl="INFO_DETAIL",
+                cap=int(overlap_cap),
+                overlap=float(overlap_fraction_config),
+                step=int(effective_step),
+                batches=int(len(overlapping_groups)),
+            )
+            seestar_stack_groups = overlapping_groups
+        else:
+            pcb(
+                "[Batching] overlap skipped (no groups produced)",
+                prog=None,
+                lvl="DEBUG_DETAIL",
+                cap=int(overlap_cap),
+                overlap=float(overlap_fraction_config),
+            )
     cpu_total = os.cpu_count() or 1
     winsor_worker_limit = max(1, min(int(winsor_worker_limit_config), cpu_total))
     winsor_max_frames_per_pass = max(0, int(winsor_max_frames_per_pass_config))
@@ -15890,6 +16055,9 @@ def run_hierarchical_mosaic(
                     center_out_settings=center_out_settings if center_out_context else None,
                     center_out_rank=processing_rank,
                     parallel_plan=getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan")),
+                    allow_batch_duplication=bool(allow_duplication_config),
+                    target_stack_size=int(target_stack_config),
+                    min_safe_stack_size=int(min_safe_stack_config),
                 )
                 future_to_tile_id[future] = assigned_tile_id
                 pending_futures.add(future)
