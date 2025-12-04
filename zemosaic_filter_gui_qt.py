@@ -2107,7 +2107,7 @@ class FilterQtDialog(QDialog):
             self._localizer.get("ui_angle_split_threshold", "Orientation split (deg)"),
             box,
         )
-        layout.addWidget(angle_label, 6, 0)
+        layout.addWidget(angle_label, 7, 0)
         self._angle_split_spin = QDoubleSpinBox(box)
         self._angle_split_spin.setRange(0.0, 180.0)
         self._angle_split_spin.setSingleStep(0.5)
