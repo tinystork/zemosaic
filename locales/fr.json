@@ -554,6 +554,8 @@
     "run_error_phase4_reading_tile_shape": "ERREUR P4 : Échec de lecture de la forme (shape) de Master Tuile.",
     "run_error_preview_stretch_unexpected_main": "ERREUR : Erreur inattendue lors de l'étirement de preview : {error}",
     "filter.group.wcs": "Contrôles WCS / Master Tiles",
+    "filter.wcs.cluster_threshold.label": "Seuil de clustering (°)",
+    "filter.wcs.max_raw_per_tile.label": "Max d'images brutes par master-tuile",
     "filter.instrument.group": "Filtre d'instrument",
     "filter.instrument.label": "Instrument :",
     "filter.instrument.all": "Tous",

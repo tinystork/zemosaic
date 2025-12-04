@@ -562,6 +562,8 @@
     "filter_distance_label": "Distance (deg):",
     "filter_exclude_gt_x": "Exclude > X°",
     "filter.group.wcs": "WCS / Master tile controls",
+    "filter.wcs.cluster_threshold.label": "Cluster threshold (deg)",
+    "filter.wcs.max_raw_per_tile.label": "Max raw frames per master tile",
     "filter.instrument.group": "Instrument filter",
     "filter.instrument.label": "Instrument:",
     "filter.instrument.all": "All",

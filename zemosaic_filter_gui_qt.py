@@ -509,6 +509,8 @@ DEFAULT_FILTER_CONFIG.setdefault("batch_overlap_pct", 40)
 DEFAULT_FILTER_CONFIG.setdefault("allow_batch_duplication", True)
 DEFAULT_FILTER_CONFIG.setdefault("min_safe_stack", 3)
 DEFAULT_FILTER_CONFIG.setdefault("target_stack", 5)
+DEFAULT_FILTER_CONFIG.setdefault("cluster_panel_threshold", 0.0)
+DEFAULT_FILTER_CONFIG.setdefault("max_raw_per_master_tile", 50)
 DEFAULT_FILTER_CONFIG.setdefault("global_coadd_method", "kappa_sigma")
 DEFAULT_FILTER_CONFIG.setdefault("global_coadd_k", 2.0)
 DEFAULT_FILTER_CONFIG.setdefault(QT_FILTER_WINDOW_GEOMETRY_KEY, None)
@@ -547,6 +549,7 @@ class _NormalizedItem:
 
 
 _GroupKey = tuple[int | None, str | None]
+_GroupOutline = tuple[int | None, float, float, float, float]
 
 
 def _sanitize_footprint_radec(payload: Any) -> List[Tuple[float, float]] | None:
@@ -1627,8 +1630,55 @@ class FilterQtDialog(QDialog):
         self._batch_size = batch_size
         self._preview_cap = preview_cap
         self._solver_settings = solver_settings_dict
-        self._config_overrides = config_overrides or {}
+        overrides: dict[str, Any] = {}
+        if isinstance(config_overrides, dict):
+            overrides.update(config_overrides)
+        else:
+            try:
+                overrides.update(dict(config_overrides or {}))
+            except Exception:
+                pass
+        self._config_overrides = overrides
         _force_phase45_disabled(self._config_overrides)
+        if _load_gui_config is not None:
+            try:
+                loaded_cfg = _load_gui_config()
+                if isinstance(loaded_cfg, dict):
+                    for key, value in loaded_cfg.items():
+                        if key not in self._config_overrides:
+                            self._config_overrides[key] = value
+            except Exception:
+                pass
+        raw_cluster_value = self._config_value("cluster_panel_threshold", 0.0)
+        cluster_candidate = 0.0
+        try:
+            cluster_candidate = float(raw_cluster_value)
+        except Exception:
+            cluster_candidate = 0.0
+        if not math.isfinite(cluster_candidate):
+            cluster_candidate = 0.0
+        if cluster_candidate > 0.0:
+            cluster_candidate = min(1.0, cluster_candidate)
+        else:
+            cluster_candidate = 0.0
+        self._cluster_threshold_value = cluster_candidate
+
+        raw_max_raw = self._config_value("max_raw_per_master_tile", 50)
+        max_raw_candidate = 50
+        try:
+            max_raw_candidate = int(raw_max_raw)
+        except Exception:
+            max_raw_candidate = 50
+        max_raw_candidate = max(0, min(500, max_raw_candidate))
+        self._max_raw_per_tile_value = max_raw_candidate
+
+        if isinstance(self._config_overrides, dict):
+            if self._cluster_threshold_value > 0.0:
+                self._config_overrides["cluster_panel_threshold"] = float(self._cluster_threshold_value)
+            else:
+                self._config_overrides.pop("cluster_panel_threshold", None)
+            # Keep the explicit max-raw cap (0 = unlimited) so autosplit respects the choice.
+            self._config_overrides["max_raw_per_master_tile"] = int(self._max_raw_per_tile_value)
         self._accepted = False
 
         self._localizer = self._load_localizer()
@@ -1677,6 +1727,8 @@ class FilterQtDialog(QDialog):
         self._coverage_checkbox: QCheckBox | None = None
         self._overcap_spin: QSpinBox | None = None
         self._overlap_spin: QSpinBox | None = None
+        self._cluster_threshold_spin: QDoubleSpinBox | None = None
+        self._max_raw_per_tile_spin: QSpinBox | None = None
         self._auto_angle_checkbox: QCheckBox | None = None
         self._angle_split_spin: QDoubleSpinBox | None = None
         self._astap_instances_combo: QComboBox | None = None
@@ -1723,7 +1775,7 @@ class FilterQtDialog(QDialog):
             base_angle = ANGLE_SPLIT_DEFAULT_DEG
         self._auto_angle_enabled = True
         self._angle_split_value = float(base_angle)
-        self._group_outline_bounds: list[tuple[float, float, float, float]] = []
+        self._group_outline_bounds: list[_GroupOutline] = []
         self._group_outline_collection: LineCollection | None = None
         self._entry_check_state: list[bool] = [bool(item.include_by_default) for item in self._normalized_items]
         self._entry_items: list[QTreeWidgetItem | None] = [None] * len(self._normalized_items)
@@ -1750,6 +1802,7 @@ class FilterQtDialog(QDialog):
         self._activity_log_output: QPlainTextEdit | None = None
         self._scan_recursive_checkbox: QCheckBox | None = None
         self._draw_group_outlines_checkbox: QCheckBox | None = None
+        self._color_by_group_checkbox: QCheckBox | None = None
         self._write_wcs_checkbox: QCheckBox | None = None
         self._sds_mode_initial = self._coerce_bool(
             (initial_overrides or {}).get("sds_mode")
@@ -2034,7 +2087,7 @@ class FilterQtDialog(QDialog):
         initial_summary = self._format_group_summary(0, "[]")
         self._auto_group_summary_label.setText(initial_summary)
         self._auto_group_summary_label.setToolTip(initial_summary)
-        layout.addWidget(self._auto_group_summary_label, 0, 2, 9, 1)
+        layout.addWidget(self._auto_group_summary_label, 0, 2, 11, 1)
         layout.setColumnStretch(2, 1)
 
         astap_label = QLabel(
@@ -2098,26 +2151,62 @@ class FilterQtDialog(QDialog):
         self._overlap_spin.valueChanged.connect(self._on_overlap_changed)  # type: ignore[arg-type]
         layout.addWidget(self._overlap_spin, 5, 1)
 
+        cluster_label = QLabel(
+            self._localizer.get("filter.wcs.cluster_threshold.label", "Cluster threshold (deg)"),
+            box,
+        )
+        layout.addWidget(cluster_label, 6, 0)
+        self._cluster_threshold_spin = QDoubleSpinBox(box)
+        self._cluster_threshold_spin.setDecimals(3)
+        self._cluster_threshold_spin.setRange(0.0, 1.0)
+        self._cluster_threshold_spin.setSingleStep(0.005)
+        self._cluster_threshold_spin.setValue(float(self._cluster_threshold_value))
+        self._cluster_threshold_spin.setToolTip(
+            "Angular clustering threshold in degrees. 0.0 = auto-detect from coverage. "
+            "Smaller values = more groups, larger values = fewer, bigger groups."
+        )
+        self._cluster_threshold_spin.valueChanged.connect(self._on_cluster_threshold_changed)  # type: ignore[arg-type]
+        layout.addWidget(self._cluster_threshold_spin, 6, 1)
+
+        max_raw_label = QLabel(
+            self._localizer.get(
+                "filter.wcs.max_raw_per_tile.label",
+                "Max raw frames per master tile",
+            ),
+            box,
+        )
+        layout.addWidget(max_raw_label, 7, 0)
+        self._max_raw_per_tile_spin = QSpinBox(box)
+        self._max_raw_per_tile_spin.setRange(0, 500)
+        self._max_raw_per_tile_spin.setSingleStep(5)
+        self._max_raw_per_tile_spin.setValue(int(self._max_raw_per_tile_value))
+        self._max_raw_per_tile_spin.setToolTip(
+            "Hard cap on the number of raw frames per master tile. 0 = unlimited (Qt Filter does not enforce a split cap). "
+            "The worker may still split tiles based on memory constraints."
+        )
+        self._max_raw_per_tile_spin.valueChanged.connect(self._on_max_raw_per_tile_changed)  # type: ignore[arg-type]
+        layout.addWidget(self._max_raw_per_tile_spin, 7, 1)
+
         self._auto_angle_checkbox = QCheckBox(
             self._localizer.get("ui_auto_angle_split", "Auto split by orientation"),
             box,
         )
         self._auto_angle_checkbox.setChecked(True)
         self._auto_angle_checkbox.toggled.connect(self._on_auto_angle_toggled)  # type: ignore[arg-type]
-        layout.addWidget(self._auto_angle_checkbox, 6, 0, 1, 2)
+        layout.addWidget(self._auto_angle_checkbox, 8, 0, 1, 2)
 
         angle_label = QLabel(
             self._localizer.get("ui_angle_split_threshold", "Orientation split (deg)"),
             box,
         )
-        layout.addWidget(angle_label, 7, 0)
+        layout.addWidget(angle_label, 9, 0)
         self._angle_split_spin = QDoubleSpinBox(box)
         self._angle_split_spin.setRange(0.0, 180.0)
         self._angle_split_spin.setSingleStep(0.5)
         self._angle_split_spin.setDecimals(1)
         self._angle_split_spin.setValue(float(self._angle_split_value))
         self._angle_split_spin.valueChanged.connect(self._on_angle_split_changed)  # type: ignore[arg-type]
-        layout.addWidget(self._angle_split_spin, 7, 1)
+        layout.addWidget(self._angle_split_spin, 9, 1)
 
         self._sds_checkbox = QCheckBox(
             self._localizer.get("filter_chk_sds_mode", "Enable ZeSupaDupStack (SDS)"),
@@ -2128,7 +2217,7 @@ class FilterQtDialog(QDialog):
             self._sds_checkbox.toggled.connect(self._on_sds_toggled)  # type: ignore[arg-type]
         except Exception:
             pass
-        layout.addWidget(self._sds_checkbox, 8, 0, 1, 2)
+        layout.addWidget(self._sds_checkbox, 10, 0, 1, 2)
 
         return box
 
@@ -2145,6 +2234,47 @@ class FilterQtDialog(QDialog):
         clamped = self._clamp_overlap_percent(value)
         self._batch_overlap_percent_value = clamped
         self._runtime_overrides["batch_overlap_pct"] = clamped
+
+    def _on_cluster_threshold_changed(self, value: float) -> None:
+        try:
+            candidate = float(value)
+        except Exception:
+            candidate = 0.0
+        if not math.isfinite(candidate):
+            candidate = 0.0
+        # 0.0 ⇒ AUTO; drop the explicit override to keep the original detection logic.
+        if candidate <= 0.0:
+            self._cluster_threshold_value = 0.0
+            if isinstance(self._runtime_overrides, dict):
+                self._runtime_overrides.pop("cluster_panel_threshold", None)
+            if isinstance(self._config_overrides, dict):
+                self._config_overrides.pop("cluster_panel_threshold", None)
+            self._debug_log("Cluster threshold reverted to AUTO (0.0°).")
+        else:
+            sanitized = min(1.0, candidate)
+            self._cluster_threshold_value = sanitized
+            if isinstance(self._runtime_overrides, dict):
+                self._runtime_overrides["cluster_panel_threshold"] = float(sanitized)
+            if isinstance(self._config_overrides, dict):
+                self._config_overrides["cluster_panel_threshold"] = float(sanitized)
+            self._debug_log(f"Cluster threshold override set to {sanitized:.3f}°.")
+        self._persist_qt_filter_config()
+        self._cluster_refresh_pending = True
+
+    def _on_max_raw_per_tile_changed(self, value: int) -> None:
+        try:
+            value_int = int(value)
+        except Exception:
+            value_int = 0
+        value_int = max(0, min(500, value_int))
+        self._max_raw_per_tile_value = value_int
+        if isinstance(self._runtime_overrides, dict):
+            self._runtime_overrides["max_raw_per_master_tile"] = value_int
+        if isinstance(self._config_overrides, dict):
+            # 0 = unlimited, keep the explicit cap so autosplit respects it.
+            self._config_overrides["max_raw_per_master_tile"] = value_int
+        self._debug_log(f"Max raw frames per master tile set to {value_int} (0 = unlimited).")
+        self._persist_qt_filter_config()
 
     def _on_auto_angle_toggled(self, checked: bool) -> None:
         self._auto_angle_enabled = bool(checked)
@@ -2996,15 +3126,15 @@ class FilterQtDialog(QDialog):
         height = max(0.0, dec_max - dec_min)
         return width, height
 
-    def _compute_group_outline_bounds(self, groups: list[list[Any]]) -> list[tuple[float, float, float, float]]:
+    def _compute_group_outline_bounds(self, groups: list[list[Any]]) -> list[_GroupOutline]:
         if not groups:
             return []
         path_map: dict[str, _NormalizedItem] = {}
         for entry in self._normalized_items:
             if entry.file_path:
                 path_map[casefold_path(entry.file_path)] = entry
-        outlines: list[tuple[float, float, float, float]] = []
-        for group in groups:
+        outlines: list[_GroupOutline] = []
+        for group_idx, group in enumerate(groups):
             ra_vals: list[float] = []
             dec_vals: list[float] = []
             reference_width: float | None = None
@@ -3065,7 +3195,7 @@ class FilterQtDialog(QDialog):
             dec_min = center_dec - height / 2.0
             dec_max = center_dec + height / 2.0
 
-            outlines.append((ra_min, ra_max, dec_min, dec_max))
+            outlines.append((group_idx, ra_min, ra_max, dec_min, dec_max))
         return outlines
 
     def _update_coverage_plot(
@@ -4129,6 +4259,21 @@ class FilterQtDialog(QDialog):
             sky_layout.setContentsMargins(0, 0, 0, 0)
             sky_layout.setSpacing(0)
             sky_layout.addWidget(self._preview_canvas, 1)
+            controls_row = QWidget(sky_container)
+            controls_layout = QHBoxLayout(controls_row)
+            controls_layout.setContentsMargins(6, 4, 6, 4)
+            controls_layout.setSpacing(8)
+            color_label = self._localizer.get(
+                "filter.preview.colorize_groups",
+                "Color footprints by group",
+            )
+            color_checkbox = QCheckBox(color_label, controls_row)
+            color_checkbox.setChecked(True)
+            color_checkbox.toggled.connect(lambda _checked: self._schedule_preview_refresh())  # type: ignore[arg-type]
+            controls_layout.addWidget(color_checkbox)
+            controls_layout.addStretch(1)
+            sky_layout.addWidget(controls_row, 0)
+            self._color_by_group_checkbox = color_checkbox
             tabs.addTab(
                 sky_container,
                 self._localizer.get("filter_tab_sky_preview", "Sky Preview"),
@@ -5082,6 +5227,23 @@ class FilterQtDialog(QDialog):
         except Exception:
             return False
 
+    def _should_color_footprints_by_group(self) -> bool:
+        checkbox = self._color_by_group_checkbox
+        if checkbox is None:
+            return True
+        try:
+            return bool(checkbox.isChecked())
+        except Exception:
+            return True
+
+    def _resolve_group_color(self, group_idx: int | None) -> str:
+        if not isinstance(group_idx, int):
+            return "#3f7ad6"
+        cycle = self._preview_color_cycle
+        if not cycle:
+            return "#3f7ad6"
+        return cycle[group_idx % len(cycle)]
+
     def _ensure_entry_coordinates(self, entry: _NormalizedItem) -> Tuple[float | None, float | None]:
         if entry.center_ra_deg is not None and entry.center_dec_deg is not None:
             return entry.center_ra_deg, entry.center_dec_deg
@@ -5682,7 +5844,7 @@ class FilterQtDialog(QDialog):
             ra_coords = [coord[0] for coord in coords]
             dec_coords = [coord[1] for coord in coords]
             if isinstance(group_idx, int):
-                color = self._preview_color_cycle[group_idx % len(self._preview_color_cycle)]
+                color = self._resolve_group_color(group_idx)
                 label_template = self._localizer.get("filter.preview.group_label", "Group {index}")
                 try:
                     label = label_template.format(index=group_idx + 1)
@@ -5757,8 +5919,40 @@ class FilterQtDialog(QDialog):
         # Store the group outline segments and corners for bounds tracking.
         outline_segments: list[list[tuple[float, float]]] = []
         outline_corners: list[tuple[float, float]] = []
+        outline_colors: list[Any] = []
+        colorize_outlines = self._should_color_footprints_by_group()
+        default_outline_color: Any = (
+            to_rgba("red", 0.9) if to_rgba is not None else "#d64b3f"
+        )
         if self._group_outline_bounds:
-            for ra_min, ra_max, dec_min, dec_max in self._group_outline_bounds:
+            for outline_entry in self._group_outline_bounds:
+                group_idx: int | None = None
+                coords: tuple[float, float, float, float] | None = None
+                if isinstance(outline_entry, (list, tuple)):
+                    if len(outline_entry) == 5:
+                        idx_candidate = outline_entry[0]
+                        if isinstance(idx_candidate, int):
+                            group_idx = idx_candidate
+                        try:
+                            ra_min = float(outline_entry[1])
+                            ra_max = float(outline_entry[2])
+                            dec_min = float(outline_entry[3])
+                            dec_max = float(outline_entry[4])
+                            coords = (ra_min, ra_max, dec_min, dec_max)
+                        except Exception:
+                            coords = None
+                    elif len(outline_entry) == 4:
+                        try:
+                            ra_min = float(outline_entry[0])
+                            ra_max = float(outline_entry[1])
+                            dec_min = float(outline_entry[2])
+                            dec_max = float(outline_entry[3])
+                            coords = (ra_min, ra_max, dec_min, dec_max)
+                        except Exception:
+                            coords = None
+                if coords is None:
+                    continue
+                ra_min, ra_max, dec_min, dec_max = coords
                 width = float(ra_max) - float(ra_min)
                 height = float(dec_max) - float(dec_min)
                 if width <= 0 or height <= 0:
@@ -5772,15 +5966,18 @@ class FilterQtDialog(QDialog):
                 ]
                 outline_segments.append(corners)
                 outline_corners.extend(corners)
+                outline_color = default_outline_color
+                if colorize_outlines and isinstance(group_idx, int):
+                    outline_color = (
+                        to_rgba(self._resolve_group_color(group_idx), 0.95)
+                        if to_rgba is not None
+                        else self._resolve_group_color(group_idx)
+                    )
+                outline_colors.append(outline_color)
         if should_draw_outlines and outline_segments and LineCollection is not None:
-            outline_color = (
-                to_rgba("red", 0.9)
-                if to_rgba is not None
-                else "#d64b3f"
-            )
             coll = LineCollection(
                 outline_segments,
-                colors=[outline_color],
+                colors=outline_colors or [default_outline_color],
                 linewidths=1.6,
                 linestyles="--",
                 alpha=0.9,
@@ -6412,6 +6609,8 @@ class FilterQtDialog(QDialog):
             overrides.pop("preplan_master_groups", None)
         if isinstance(self._cluster_threshold_used, (int, float)) and self._cluster_threshold_used > 0:
             overrides["cluster_panel_threshold"] = float(self._cluster_threshold_used)
+
+        overrides["max_raw_per_master_tile"] = int(self._max_raw_per_tile_value)
         resolved_count = self._resolved_wcs_count()
         if resolved_count:
             overrides["resolved_wcs_count"] = int(resolved_count)
@@ -6590,6 +6789,26 @@ class FilterQtDialog(QDialog):
             return getattr(mapping, key)
         except Exception:
             return None
+
+    def _persist_qt_filter_config(self) -> None:
+        if _save_gui_config is None or _load_gui_config is None:
+            return
+        try:
+            existing = _load_gui_config()
+            if not isinstance(existing, dict):
+                existing = dict(DEFAULT_FILTER_CONFIG)
+        except Exception:
+            existing = dict(DEFAULT_FILTER_CONFIG)
+        cfg = dict(existing)
+        if self._cluster_threshold_value > 0.0:
+            cfg["cluster_panel_threshold"] = float(self._cluster_threshold_value)
+        else:
+            cfg.pop("cluster_panel_threshold", None)
+        cfg["max_raw_per_master_tile"] = int(self._max_raw_per_tile_value)
+        try:
+            _save_gui_config(cfg)
+        except Exception:
+            pass
 
     def _compute_astap_cap(self) -> int:
         if compute_astap_recommended_max_instances is not None:

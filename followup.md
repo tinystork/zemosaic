@@ -1,35 +1,57 @@
-# Follow-Up Checklist for Codex
 
-Please verify and iterate until ALL boxes are checked:
+## 🧾 `followup.md` – Checklist pour vérifier que Codex a bien fait le job
 
-## 🔁 Overlapping Batches
-- [x] Overlapping batch logic implemented in worker
-- [x] Overlap parameter linked from GUI → config → worker
-- [x] Logs indicate overlap cap and effective step
+```markdown
+# Follow-up: Auto vs Manual master-tile organisation and optimiser
 
-## 🔁 Frame Duplication
-- [x] batches smaller than TARGET_STACK are expanded via duplication
-- [x] duplication respects cap and preserves ordering
-- [x] logs output: "Duplicating frames: original=X → final=Y"
+## 1. What we asked
 
-## 🔁 Salvage Mode
-- [x] salvage triggers only when n_used < MIN_SAFE_STACK
-- [x] ZeQualityMT disabled only for the salvage tile
-- [x] quality crop disabled only for the salvage tile
-- [x] logs output: "Tile N salvage mode"
+We requested:
 
-## 🔁 Pipeline Safety
-- [x] No changes to ASTAP, WCS, reprojection logic
-- [x] Phase 5 untouched
-- [x] CPU/GPU fallback untouched
-- [x] Existing output folder structures unchanged
+- A **new “Manual-organize Master Tiles” button** that preserves the **old behaviour** of “Auto-organize Master Tiles”.
+- A redefined **“Auto-organize Master Tiles”** which:
+  - maximises the number of raw frames per master tile (up to the configured max),
+  - minimises the number of groups,
+  - and keeps groups spatially coherent, using existing clustering helpers.
 
-## 🔁 Behavioural Verification
-- [x] No more holes in mosaics even with aggressive rejections
-- [x] Master tiles show stable coverage maps
-- [x] Reproject output remains smooth between adjacent tiles
-- [x] Overlapping batches reduce boundary seams
+## 2. What to verify in your changes
 
-If any item is missing or incorrect, revise and re-submit.
-````
+Please confirm the following points:
 
+- [ ] The Qt filter dialog now shows **two buttons**:
+  - [ ] “Auto-organize Master Tiles”
+  - [ ] “Manual-organize Master Tiles”
+- [ ] The **Manual** button:
+  - [ ] Calls a dedicated helper that encapsulates the legacy behaviour.
+  - [ ] Produces the same group structures and logs as the old auto-organise.
+- [ ] The **Auto** button:
+  - [ ] Builds or retrieves initial groups.
+  - [ ] Runs an optimisation step that:
+    - [ ] Respects `max_raw_frames_per_master_tile`.
+    - [ ] Avoids tiny groups when other options exist (`min_safe_stack` / `target_stack`).
+    - [ ] Reduces the total group count where possible.
+    - [ ] Keeps groups spatially coherent.
+  - [ ] Writes its result into the same group state structure used by the UI.
+  - [ ] Refreshes the Sky Preview and groups tree correctly.
+
+## 3. Regression checks
+
+Please double-check:
+
+- [ ] No frames are lost: every selected frame is assigned to some group in both modes.
+- [ ] Tk filter UI still works (if any shared helpers were changed).
+- [ ] The Coverage Map tab remains unchanged and correct.
+- [ ] Sky Preview updates work with both buttons, and (if implemented) group colouring still corresponds to the underlying grouping.
+- [ ] There are no new warnings or tracebacks in normal use.
+
+## 4. Behaviour sanity tests
+
+On a real Seestar dataset (with hundreds/thousands of frames):
+
+- [ ] Manual mode yields a grouping comparable to previous versions of ZeMosaic.
+- [ ] Auto mode generally:
+  - [ ] Creates **fewer** groups than manual mode (when parameters allow it).
+  - [ ] Produces groups whose sizes gravitate toward the configured max frames per master tile.
+  - [ ] Avoids strange, widely scattered groups.
+
+If any of these expectations are not met, please refine the optimiser logic and re-test.
