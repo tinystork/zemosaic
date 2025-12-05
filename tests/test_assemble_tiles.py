@@ -44,7 +44,7 @@ def test_assemble_tiles_skips_invalid_and_succeeds(tmp_path, caplog):
     assert result is not None and result.exists()
     messages = "\n".join(record.getMessage() for record in caplog.records)
     assert "Assembly: tile 2 has empty valid-mask, skipping" in messages
-    assert "Assembly: 1 tiles kept (io_fail=0, channel_mismatch=0, empty_mask=1)" in messages
+    assert "Assembly summary: attempted=2, io_fail=0, channel_mismatch=0, empty_mask=1, kept=1" in messages
 
 
 def test_assemble_tiles_all_invalid_returns_none(tmp_path, caplog):
