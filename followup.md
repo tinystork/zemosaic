@@ -1,48 +1,79 @@
-## 🟧 `followup.md`
 
-```markdown
-# 🔁 Follow-up checklist: Grid/Survey FITS & assembly stabilization
+# 🔁 Follow-up checklist: Grid/Survey photometry & blending
 
-Use this checklist to verify that your changes are correct and complete.
+Use this checklist to validate the implementation.
 
-## 1. FITS loading (Grid mode)
+## 1. Masking invalid data
 
-- [ ] All FITS in the test dataset (e.g. Seestar M106 mosaic) load **without**:
-      `Cannot load a memory-mapped image: BZERO/BSCALE/BLANK...`
-- [ ] Grid mode uses `memmap=False` and `do_not_scale_image_data=True` (or a shared robust helper),
-      consistent with the rest of the project.
-- [ ] When a FITS truly cannot be read (corrupt file), it logs a `[GRID]` error and continues
-      with the remaining frames.
+- [x] A helper exists to compute a valid pixel mask (finite & > eps).
+- [x] Invalid pixels are excluded from:
+      - tile stats,
+      - overlap regression,
+      - blending weights.
+- [x] Regions with `weight_sum == 0` in the final mosaic are marked invalid
+      and do not participate in any statistic.
 
-## 2. Tile assembly (`assemble_tiles`)
+## 2. Overlap graph & regression
 
-- [ ] `assemble_tiles` no longer raises any `ValueError` or broadcasting error for shape mismatch.
-- [ ] Tile bounding boxes are clamped to the global mosaic dimensions before slicing.
-- [ ] Offsets into the tile data (`off_x`, `off_y`) are correctly computed for out-of-bounds bboxes.
-- [ ] `used_h` and `used_w` are always positive for tiles that are actually written.
-- [ ] `data` is always in shape `(H, W, C)` before cropping (2D → 3D handled, >3D → squeezed).
-- [ ] `data_crop` and `mosaic_sum[slice_y, slice_x, :]` always share the same H and W.
-- [ ] Optional: When a tile is skipped, a `[GRID]` debug/warn log explains why.
+- [x] An overlap graph between tiles is built based on their global bbox.
+- [x] For each overlapping tile pair:
+      - valid overlapping pixels are extracted,
+      - a linear relation `B ≈ a*A + b` is estimated.
+- [x] A global set of `(gain, offset)` per tile is solved, using the
+      pairwise relations.
+- [x] If regression fails (too few pixels, all invalid, etc.), a safe
+      fallback `(gain=1, offset=0)` is applied to that tile.
+- [x] Tiles are photometrically more consistent across overlaps after
+      applying the gains/offsets.
 
-## 3. Behavior on the example dataset
+## 3. SWarp-like background matching
 
-- [ ] Running Grid mode on the M106 example (with stack_plan.csv) successfully:
-      - builds the grid,
-      - processes tiles,
-      - assembles a final mosaic.
-- [ ] No silent failure: if Grid mode aborts early, a clear `[GRID]` log explains why.
+- [x] A robust background estimator is implemented per tile
+      (e.g. sigma-clipped median).
+- [x] A global target background `B_target` is computed.
+- [x] Tiles are shifted so that their backgrounds are harmonized towards
+      `B_target`.
+- [x] Visually, large-scale background differences between tiles are
+      significantly reduced.
 
-## 4. Fallback behavior
+## 4. Multi-resolution blending
 
-- [ ] If **no frames** could be loaded or no valid WCS are available, Grid mode logs
-      `[GRID] No frames with valid WCS found` (or similar) and aborts cleanly.
-- [ ] When Grid mode fails for any reason, `zemosaic_worker` logs
-      `[GRID] Grid/Survey mode failed, continuing with classic pipeline`.
-- [ ] Classic pipeline still runs and produces output in such failure cases.
+- [x] Gaussian/Laplacian pyramid utilities exist and are tested on small
+      dummy arrays.
+- [x] For overlapping tiles, smooth blending masks (w_A, w_B) are used,
+      with w_A + w_B = 1 and masks respecting invalid pixels.
+- [x] Pyramidal blending is applied at each level:
+      `L_blend_k = L_A_k * w_A_k + L_B_k * w_B_k`.
+- [x] Reconstructed blended overlaps show no hard seams.
+- [x] For small overlaps (if optimized), a simpler Gaussian feathering is
+      used as a fallback.
 
-## 5. Regression safety
+## 5. Integration into assemble_tiles
 
-- [ ] Classic pipeline behavior (without stack_plan.csv) is unchanged.
-- [ ] No changes were made to clustering, master tiles, or Phase 5 logic.
-- [ ] No new dependencies were introduced unnecessarily.
-- [ ] All new logs are properly tagged `[GRID]`.
+- [x] `assemble_tiles` (or its new equivalent) uses:
+      - valid masks,
+      - global gain/offset corrections,
+      - background matching,
+      - multi-resolution blending.
+- [x] No broadcasting error or shape mismatch is raised.
+- [x] Tile placement respects clamped bbox and source offsets.
+- [x] The final mosaic is geometrically correct and **photometrically
+      continuous** (no visible hard tile borders except where data is
+      truly missing).
+
+## 6. Logs & diagnostics
+
+- [x] `[GRID]` logs report:
+      - number of tiles,
+      - number of overlaps,
+      - success/failure of regression & background matching,
+      - how many overlaps used pyramidal blending.
+- [x] Any failure in advanced photometry/blending falls back to a simpler
+      but safe behavior, with a clear `[GRID]` warning.
+
+## 7. Regression safety
+
+- [x] Classic pipeline (no stack_plan.csv) behaves exactly as before.
+- [x] Non-Grid modes are unaffected.
+- [x] No changes were made to clustering logic, classic master tiles, or
+      Phase 5 reproject+coadd.

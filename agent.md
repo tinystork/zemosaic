@@ -1,211 +1,316 @@
-## 🟦 `agent.md`
+# 🌌 Mission: Photometric harmonization & blending for Grid/Survey mode
 
-````markdown
-# 🛠 Mission: Stabilize Grid/Survey mode FITS loading and tile assembly
+You are Codex-Max.  
+This is a **focused enhancement** of the existing **Grid/Survey mode** implemented in `grid_mode.py`.
 
-You are Codex-Max. This is a **small, focused bugfix mission** on the newly added `grid_mode.py` Grid/Survey pipeline.
+The current Grid mode:
+- Builds a global WCS.
+- Splits the field into geometric tiles.
+- Reprojects frames into tiles and stacks them.
+- Assembles tiles into a global mosaic.
 
-The current behavior:
-- Grid mode is correctly detected and started (stack_plan.csv present).
-- FITS files are listed from stack_plan.csv.
-- But:
-  - FITS loading fails when BZERO/BSCALE/BLANK keywords are present (memmap error).
-  - When this is fixed manually, `assemble_tiles` can crash with a **broadcast shape mismatch**:
-    `ValueError: non-broadcastable output operand with shape (1,1,1) doesn't match the broadcast shape (3,3,1)`.
-  - When Grid mode crashes, the worker falls back to the classic pipeline, but the user gets no mosaic from Grid.
+Result: geometrically correct, but **photometrically broken**:
+- visible rectangular seams,
+- different backgrounds per tile,
+- no proper overlap blending,
+- black/invalid areas visible.
 
 Your mission is to:
-
-1. **Fix FITS opening in Grid mode to be robust and consistent with the rest of ZeMosaic.**
-2. **Fix `assemble_tiles` so tile placement into the global mosaic is safe and correctly clamped.**
-3. **Ensure Grid mode either:**
-   - runs to completion and produces a valid mosaic, **or**
-   - fails cleanly and falls back to the classic pipeline without crashing.
-4. **Do NOT modify the classic pipeline logic.**
+1. Implement **SWarp-like background matching between tiles**.
+2. Implement **multi-resolution (pyramidal) blending** in overlaps.
+3. Implement **linear regression correction** in overlaps (tile-to-tile photometric calibration).
+4. Implement **automatic masking of invalid/empty zones** (avoid using NaNs/zeros as signal).
+5. Do this **ONLY for Grid/Survey mode**, without touching the classic pipeline.
 
 ---
 
 ## 0. Scope & constraints
 
-- Scope: `grid_mode.py` (and at most minimal changes in `zemosaic_worker.py` for error handling / logging).
-- Do NOT touch:
-  - existing clustering / master-tile pipeline,
-  - existing reproject & coadd logic,
-  - GUI code.
-- All Grid-specific logs must remain tagged with `[GRID]`.
+- Scope: `grid_mode.py` (Grid/Survey code path).
+- Optional: tiny adjustments in `zemosaic_worker.py` *only for logging or Grid-specific options*.
+- DO NOT modify:
+  - classic clustering / master-tile / Phase 5 pipeline,
+  - non-Grid mosaic assembly,
+  - GUI, except possibly to add a simple toggle for Grid photometry (optional).
+
+- All logs related to this work must be tagged `[GRID]`.
 
 ---
 
-## 1. FITS loading robustness (BZERO/BSCALE/BLANK)
+## 1. Masking invalid / empty regions
 
-Problem observed in logs:
+Before doing any photometry or blending, we must define **valid pixels**.
 
-- `Failed to open FITS ...: Cannot load a memory-mapped image: BZERO/BSCALE/BLANK header keywords present. Set memmap=False.`
+Requirements:
 
-This happens because the current code in `grid_mode.py` uses something like:
+- In tile processing and global assembly:
+  - A pixel is **valid** if:
+    - it is finite (`np.isfinite`),
+    - AND not equal to a known "empty" value (e.g. 0, or a configurable threshold).
+  - Otherwise it's invalid and must not contribute to the mosaic.
 
-```python
-with fits.open(frame.path, memmap=True) as hdul:
-    header = hdul[0].header
-    data = hdul[0].data
+- Implement helper functions in `grid_mode.py`:
+
+  ```python
+  def compute_valid_mask(data: np.ndarray, *, eps: float = 1e-6) -> np.ndarray:
+      """Return a boolean mask where True = valid pixel."""
 ````
 
-### Requirements:
+* Use this mask to:
 
-* Change FITS loading in Grid mode to be **consistent with the rest of ZeMosaic**:
+  * build `weight_crop` (0 for invalid pixels),
+  * avoid counting invalid pixels in statistics,
+  * avoid using invalid pixels in overlap regression.
 
-  * Use `memmap=False`.
-  * Use `do_not_scale_image_data=True` to avoid surprises with BZERO/BSCALE.
-* If there is already a utility function in the project (e.g. in `zemosaic_utils.py`) that wraps `astropy.io.fits.open` robustly, prefer **reusing that**.
-* Grid mode must **no longer fail** on Seestar FITS or any FITS with BZERO/BSCALE/BLANK.
-
-### Deliverables:
-
-* A single, central helper in `grid_mode.py` (or use an existing shared utility) for opening FITS safely.
-* All WCS/footprint computations and tile processing in Grid mode must use this helper instead of raw `fits.open(..., memmap=True)`.
+* When `weight_sum == 0` in the global mosaic, mark those pixels as invalid (e.g. NaN) and **exclude them from any mean/variance computation** to avoid `nanmean` warnings.
 
 ---
 
-## 2. Fix `assemble_tiles` broadcast / boundary bugs
+## 2. Tile-level background & gain estimation (linear regression in overlaps)
 
-Current crash:
+Goal: each tile should be photometrically consistent with its neighbors.
 
-```text
-ValueError: non-broadcastable output operand with shape (1,1,1) doesn't match the broadcast shape (3,3,1)
+### 2.1. Overlap graph
+
+* After all tiles are created (and before final assembly), build an **overlap graph**:
+
+  ```python
+  class TilePhotometryInfo:
+      tile_id: int
+      bbox: Tuple[int, int, int, int]
+      data: np.ndarray  # or a lightweight representation / stats
+      mask: np.ndarray  # valid pixels
+
+  def build_tile_overlap_graph(tiles: List[TilePhotometryInfo]) -> OverlapGraph:
+      """Determine which tiles overlap in the global mosaic."""
+  ```
+
+* For each pair of tiles that overlap in the global mosaic, compute:
+
+  * intersection region indices `(x0, x1, y0, y1)`,
+  * valid pixels mask in both tiles.
+
+### 2.2. Linear regression in overlaps
+
+For each tile pair `(A, B)` with a non-empty overlap:
+
+* Extract the overlapping valid pixels:
+
+  ```python
+  A_vals, B_vals  # 1D arrays of overlapping pixel values
+  ```
+
+* Fit a simple linear relation:
+
+  ```python
+  B ≈ a * A + b
+  ```
+
+  using robust linear regression (at minimum least-squares with optional clipping of outliers).
+
+* Store for each tile a set of constraints of the form:
+
+  * tile_j ≈ a_ij * tile_i + b_ij.
+
+Then:
+
+* Choose a **reference tile** (e.g. the one with most overlaps or a central tile).
+* Solve for each tile a global `(gain, offset)` pair that best satisfies all pairwise relations.
+
+  * You can do this iteratively (Gauss-Seidel style) or via a small least-squares system.
+  * Aim for simplicity but robustness.
+
+Apply these `(gain, offset)` to tiles before final blending:
+
+```python
+tile_data_corr = gain * tile_data + offset
 ```
 
-This indicates a mismatch between:
+If regression fails (too few pixels, all invalid, etc.):
 
-* the slice on the global mosaic (`mosaic_sum[slice_y, slice_x, :]`), and
-* the cropped tile data (`data_crop`).
-
-Typical cause:
-
-* `tile.bbox` may extend beyond the global mosaic dimensions,
-* or the tile data is larger than the available mosaic region,
-* but the code blindly assumes same H,W on both sides.
-
-### Requirements:
-
-In `assemble_tiles` (in `grid_mode.py`):
-
-1. **Always clamp tile bounding boxes to the global mosaic size**:
-
-   * Let `H_m, W_m, _ = mosaic_sum.shape`.
-   * For each tile with bbox `(tx0, tx1, ty0, ty1)`:
-
-     * clamp to mosaic bounds:
-
-       ```python
-       x0 = max(0, min(tx0, W_m))
-       y0 = max(0, min(ty0, H_m))
-       x1 = max(0, min(tx1, W_m))
-       y1 = max(0, min(ty1, H_m))
-       ```
-     * If `x1 <= x0` or `y1 <= y0`: skip this tile.
-
-2. **Account for possible negative or out-of-bounds bbox**:
-
-   * If the tile bbox starts before 0, we need offsets into the tile data:
-
-     ```python
-     off_x = max(0, -tx0)
-     off_y = max(0, -ty0)
-     ```
-   * Compute the final used height/width:
-
-     ```python
-     used_h = min(h_src - off_y, y1 - y0)
-     used_w = min(w_src - off_x, x1 - x0)
-     ```
-   * If `used_h <= 0` or `used_w <= 0`: skip.
-
-3. **Ensure dimensionality is consistent (H x W x C)**:
-
-   * If a tile is 2D (H x W), convert to H x W x 1:
-
-     ```python
-     if data.ndim == 2:
-         data = data[..., np.newaxis]
-     elif data.ndim > 3:
-         data = np.squeeze(data)
-         if data.ndim == 2:
-             data = data[..., np.newaxis]
-     ```
-   * `data_crop` and `mosaic_sum[slice_y, slice_x, :]` **must have identical H and W**.
-
-4. **Only update mosaic with matching shapes**:
-
-   * After cropping:
-
-     ```python
-     data_crop = data[off_y:off_y + used_h, off_x:off_x + used_w, :]
-     weight_crop = np.ones_like(data_crop, dtype=np.float32)
-     ```
-   * Then:
-
-     ```python
-     mosaic_sum[slice_y, slice_x, :] += data_crop * weight_crop
-     weight_sum[slice_y, slice_x, :] += weight_crop
-     ```
-
-5. Add optional debug logging when tiles are skipped or shapes look suspicious (tag `[GRID]`).
-
-### Deliverables:
-
-* A corrected `assemble_tiles` implementation that:
-
-  * never raises a broadcasting error,
-  * safely handles edge tiles,
-  * places each tile in the correct region of the global mosaic.
+* log a `[GRID]` warning,
+* fall back to neutral `(gain=1, offset=0)` for that relation.
 
 ---
 
-## 3. Error handling & fallback behavior
+## 3. SWarp-like background matching
 
-When Grid mode fails (e.g., no valid frames, or assembly totally impossible), `run_grid_mode` should:
+In addition to pairwise regression, we need a global large-scale background harmonization.
 
-* Log a **clear `[GRID]` error** (already partially in place).
-* Raise a controlled exception or return a clear failure indicator to `zemosaic_worker.run_hierarchical_mosaic`.
-* `zemosaic_worker` should already catch this and log:
+Requirements:
 
-  * `[GRID] Grid/Survey mode failed, continuing with classic pipeline`.
+* Implement a function:
 
-### Requirements:
+  ```python
+  def estimate_tile_background(tile_data: np.ndarray, tile_mask: np.ndarray) -> float:
+      """Return a robust estimate of the background level (e.g. sigma-clipped median)."""
+  ```
 
-* Verify that:
+* For each tile, estimate background `B_i`.
 
-  * If **no frames** could be loaded / have valid WCS, Grid mode aborts early and cleanly.
-  * If `assemble_tiles` still encounters a fatal issue, it logs and fails cleanly.
-* Do NOT change the classic pipeline logic or structure; only ensure that Grid mode failure does not crash the process.
+* Compute a **global target background**, for example:
+
+  ```python
+  B_target = median(B_i over all tiles)
+  ```
+
+* Adjust each tile:
+
+  ```python
+  tile_data -= (B_i - B_target)
+  ```
+
+* This step should be combined with or applied after the linear regression step.
+  A possible order:
+
+  1. Apply regression-based global gain/offset.
+  2. Re-estimate backgrounds.
+  3. Apply a final uniform background shift towards `B_target`.
+
+* Ensure that all operations ignore invalid pixels (use the masks).
 
 ---
 
-## 4. Testing & validation
+## 4. Multi-resolution (pyramidal) blending
 
-Implement basic internal tests / checks:
+Goal: avoid harsh seams by blending tiles across multiple spatial scales.
 
-* Grid mode on the example dataset (the one with 53 frames in stack_plan.csv) must:
+Implement a **multi-resolution blending scheme** for the tiles during final assembly.
+You may use a Laplacian pyramid approach or a simpler Gaussian pyramid, as long as it respects these points:
 
-  * load all FITS without memmap errors,
-  * build a grid,
-  * assemble tiles,
-  * produce a mosaic file in the configured output folder.
-* If you need to add temporary extra logging to verify shapes (H,W,C) during development, keep it tagged `[GRID]` and keep it reasonably concise.
+### 4.1. Blending masks
+
+* For each overlap region between tiles, generate a **smooth blending mask**:
+
+  ```python
+  w_A(x,y) + w_B(x,y) = 1
+  ```
+
+  with `w_A` decreasing smoothly from 1→0 across the overlap, and `w_B` = 1 - `w_A`.
+
+* Masks must be zero on invalid pixels.
+
+### 4.2. Pyramidal blending
+
+* Implement helper functions:
+
+  ```python
+  def build_gaussian_pyramid(image: np.ndarray, levels: int) -> List[np.ndarray]:
+      ...
+
+  def build_laplacian_pyramid(image: np.ndarray, levels: int) -> List[np.ndarray]:
+      ...
+
+  def reconstruct_from_laplacian(pyramid: List[np.ndarray]) -> np.ndarray:
+      ...
+  ```
+
+* For overlapping tiles A and B:
+
+  1. Build Laplacian pyramids LA, LB.
+  2. Build Gaussian pyramids of blending masks wA, wB.
+  3. At each level `k`:
+
+     ```python
+     L_blend_k = LA_k * wA_k + LB_k * wB_k
+     ```
+  4. Reconstruct blended overlap region from `{L_blend_k}`.
+
+* Apply this blending per overlap and integrate back into the global mosaic (respecting masks).
+
+If this feels too heavy for all overlaps, you may:
+
+* Restrict pyramidal blending to overlaps larger than a given size,
+* Use a simpler Gaussian feathering for small overlaps.
 
 ---
 
-## 5. Deliverables summary
+## 5. Integration into `assemble_tiles`
 
-* [ ] Updated FITS loading logic in Grid mode (no more memmap/BZERO/BSCALE errors).
-* [ ] Updated `assemble_tiles` with robust clipping and shape handling.
-* [ ] Confirmed clean fallback behavior to classic pipeline when Grid mode cannot proceed.
-* [ ] No changes to classic pipeline code paths.
-* [ ] Clear `[GRID]` logs for:
+The current `assemble_tiles` function performs:
 
-  * frames loaded,
-  * tiles processed,
-  * any skipped tiles / errors.
+* direct placement of tiles into `mosaic_sum`,
+* additive weights,
+* no advanced blending.
 
+You must refactor `assemble_tiles` (or introduce a new function it calls) to:
 
+1. Load all tiles into memory in a controlled way (or process in batches if necessary).
+2. Build the **TilePhotometryInfo** objects with corrected data and masks.
+3. Perform:
+
+   * invalid zone masking,
+   * overlap regression → global gain/offset calibration,
+   * SWarp-like background adjustment,
+   * multi-resolution blending for overlapping regions.
+4. Fill the global mosaic via:
+
+   * per-tile placement using the masks,
+   * ensuring each pixel uses:
+
+     * a weighted blend of all overlapping tiles,
+     * with photometrically corrected data.
+
+Make sure:
+
+* All shapes `(H, W, C)` are consistent.
+* BBox clamping & offsets (already implemented) remain correct and robust.
+* No broadcasting errors are reintroduced.
+
+---
+
+## 6. Performance considerations
+
+* The example datasets may have tens to hundreds of tiles; design algorithms that are:
+
+  * O(N_tiles) or O(N_overlaps) in time,
+  * memory-aware (avoid storing huge 4D arrays if unnecessary).
+* Prefer iterative / local optimization over full dense matrices when possible.
+* Add logs like:
+
+  ```text
+  [GRID] Photometry: built overlap graph with X edges
+  [GRID] Photometry: solved global gain/offset for N tiles
+  [GRID] Blending: applied pyramidal blending on M overlaps
+  ```
+
+---
+
+## 7. Fallback behavior & safety
+
+If any of these advanced steps fail (e.g. cannot build pyramids, regression unstable):
+
+* Log a clear `[GRID]` warning.
+* Fall back to a simpler behavior:
+
+  * e.g. per-tile background normalization + linear blending without pyramids.
+* Never crash the Grid mode or the entire worker.
+
+Do NOT modify the classic (non-Grid) pipeline.
+
+---
+
+## 8. Deliverables summary
+
+You must deliver:
+
+* [ ] New helper functions in `grid_mode.py` for:
+
+  * valid mask,
+  * background estimation,
+  * overlap regression,
+  * pyramidal blending.
+* [ ] A refactored `assemble_tiles` (or new equivalent) that:
+
+  * uses masks,
+  * applies global photometric calibration,
+  * uses multi-resolution blending,
+  * handles invalid data cleanly.
+* [ ] `[GRID]` logs summarizing:
+
+  * number of tiles,
+  * number of overlaps,
+  * photometry calibration steps,
+  * blending operations.
+* [ ] No regressions in classic pipeline.
 

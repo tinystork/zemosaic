@@ -1,3 +1,47 @@
+"""
+╔═══════════════════════════════════════════════════════════════════════════════════╗
+║ ZeMosaic / ZeSeestarStacker Project                                               ║
+║                                                                                   ║
+║ Auteur  : Tinystork, seigneur des couteaux à beurre (aka Tristan Nauleau)         ║
+║ Partenaire : J.A.R.V.I.S. (/ˈdʒɑːrvɪs/) — Just a Rather Very Intelligent System   ║
+║              (aka ChatGPT, Grand Maître du ciselage de code)                      ║
+║                                                                                   ║
+║ Licence : GNU General Public License v3.0 (GPL-3.0)                               ║
+║                                                                                   ║
+║ Description :                                                                     ║
+║   Ce programme a été forgé à la lueur des pixels et de la caféine,                ║
+║   dans le but noble de transformer des nuages de photons en art                   ║
+║   astronomique. Si vous l’utilisez, pensez à dire “merci”,                        ║
+║   à lever les yeux vers le ciel, ou à citer Tinystork et J.A.R.V.I.S.             ║
+║   (le karma des développeurs en dépend).                                          ║
+║                                                                                   ║
+║ Avertissement :                                                                   ║
+║   Aucune IA ni aucun couteau à beurre n’a été blessé durant le                    ║
+║   développement de ce code.                                                       ║
+╚═══════════════════════════════════════════════════════════════════════════════════╝
+
+
+╔═══════════════════════════════════════════════════════════════════════════════════╗
+║ ZeMosaic / ZeSeestarStacker Project                                               ║
+║                                                                                   ║
+║ Author  : Tinystork, Lord of the Butter Knives (aka Tristan Nauleau)              ║
+║ Partner : J.A.R.V.I.S. (/ˈdʒɑːrvɪs/) — Just a Rather Very Intelligent System      ║
+║           (aka ChatGPT, Grand Master of Code Chiseling)                           ║
+║                                                                                   ║
+║ License : GNU General Public License v3.0 (GPL-3.0)                               ║
+║                                                                                   ║
+║ Description:                                                                      ║
+║   This program was forged under the sacred light of pixels and                    ║
+║   caffeine, with the noble intent of turning clouds of photons into               ║
+║   astronomical art. If you use it, please consider saying “thanks,”               ║
+║   gazing at the stars, or crediting Tinystork and J.A.R.V.I.S. —                  ║
+║   developer karma depends on it.                                                  ║
+║                                                                                   ║
+║ Disclaimer:                                                                       ║
+║   No AIs or butter knives were harmed in the making of this code.                 ║
+╚═══════════════════════════════════════════════════════════════════════════════════╝
+"""
+
 """Grid/Survey processing pipeline for ZeMosaic.
 
 All logic here is isolated from the classic worker workflow and is only
@@ -13,7 +57,7 @@ import math
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -45,6 +89,14 @@ except Exception:  # pragma: no cover - optional dependency
     find_optimal_celestial_wcs = None
     reproject_interp = None
     _REPROJECT_AVAILABLE = False
+
+try:
+    import scipy.ndimage as ndimage
+
+    _NDIMAGE_AVAILABLE = True
+except Exception:  # pragma: no cover - optional dependency
+    ndimage = None
+    _NDIMAGE_AVAILABLE = False
 
 try:
     from zemosaic_align_stack import _reject_outliers_kappa_sigma, _reject_outliers_winsorized_sigma_clip
@@ -149,6 +201,170 @@ class GridModeConfig:
     radial_shape_power: float = 2.0
     save_final_as_uint16: bool = False
     legacy_rgb_cube: bool = False
+
+
+@dataclass
+class TilePhotometryInfo:
+    tile_id: int
+    bbox: tuple[int, int, int, int]
+    data: np.ndarray
+    mask: np.ndarray
+    gain: np.ndarray | None = None
+    offset: np.ndarray | None = None
+    background: np.ndarray | None = None
+
+
+@dataclass
+class TileOverlap:
+    tile_a: int
+    tile_b: int
+    global_bbox: tuple[int, int, int, int]
+    slice_a: tuple[slice, slice]
+    slice_b: tuple[slice, slice]
+    sample_count: int = 0
+
+
+def compute_valid_mask(data: np.ndarray, *, eps: float = 1e-6) -> np.ndarray:
+    """Return a boolean mask where True marks finite, non-empty pixels."""
+
+    arr = np.asarray(data)
+    finite = np.isfinite(arr)
+    if eps <= 0:
+        return finite
+    try:
+        non_empty = np.abs(arr) > eps
+    except Exception:
+        non_empty = np.ones_like(arr, dtype=bool)
+    return finite & non_empty
+
+
+def _sigma_clipped_median(values: np.ndarray, *, sigma: float = 3.0, max_iters: int = 3) -> float:
+    arr = np.asarray(values, dtype=np.float32)
+    arr = arr[np.isfinite(arr)]
+    if arr.size == 0:
+        return float("nan")
+    for _ in range(max_iters):
+        med = float(np.median(arr))
+        if not math.isfinite(med):
+            break
+        diff = arr - med
+        std = float(np.std(diff))
+        if not (math.isfinite(std) and std > 1e-6):
+            break
+        keep = np.abs(diff) <= sigma * std
+        if np.all(keep):
+            break
+        arr = arr[keep]
+        if arr.size == 0:
+            return float("nan")
+    return float(np.median(arr)) if arr.size else float("nan")
+
+
+def estimate_tile_background(tile_data: np.ndarray, tile_mask: np.ndarray, *, sigma: float = 3.0, max_iters: int = 3) -> np.ndarray:
+    """Return a sigma-clipped median background per channel."""
+
+    arr = np.asarray(tile_data, dtype=np.float32)
+    mask = np.asarray(tile_mask, dtype=bool)
+    if arr.ndim == 2:
+        arr = arr[..., np.newaxis]
+    if mask.ndim == 2 and arr.ndim == 3:
+        mask = np.repeat(mask[..., np.newaxis], arr.shape[-1], axis=2)
+    backgrounds: list[float] = []
+    for c in range(arr.shape[-1]):
+        mask_c = mask if mask.ndim == 2 else mask[..., c]
+        vals = arr[..., c][mask_c]
+        if vals.size == 0:
+            backgrounds.append(float("nan"))
+            continue
+        bg = _sigma_clipped_median(vals, sigma=sigma, max_iters=max_iters)
+        backgrounds.append(bg)
+    if not backgrounds:
+        return np.array([], dtype=np.float32)
+    return np.asarray(backgrounds, dtype=np.float32)
+
+
+def _smooth_image_for_pyramid(image: np.ndarray) -> np.ndarray:
+    """Apply a small blur used when constructing Gaussian pyramids."""
+
+    arr = np.asarray(image, dtype=np.float32)
+    if _NDIMAGE_AVAILABLE and ndimage is not None:
+        sigma = (1.0, 1.0, 0.0) if arr.ndim == 3 else 1.0
+        try:
+            return ndimage.gaussian_filter(arr, sigma=sigma, mode="nearest")
+        except Exception:
+            pass
+    if arr.ndim == 2:
+        arr_padded = np.pad(arr, 1, mode="edge")
+        blurred = (
+            arr_padded[:-2, :-2]
+            + arr_padded[:-2, 1:-1]
+            + arr_padded[:-2, 2:]
+            + arr_padded[1:-1, :-2]
+            + arr_padded[1:-1, 1:-1]
+            + arr_padded[1:-1, 2:]
+            + arr_padded[2:, :-2]
+            + arr_padded[2:, 1:-1]
+            + arr_padded[2:, 2:]
+        ) / 9.0
+        return blurred.astype(np.float32, copy=False)
+    arr_padded = np.pad(arr, ((1, 1), (1, 1), (0, 0)), mode="edge")
+    blurred = (
+        arr_padded[:-2, :-2, :]
+        + arr_padded[:-2, 1:-1, :]
+        + arr_padded[:-2, 2:, :]
+        + arr_padded[1:-1, :-2, :]
+        + arr_padded[1:-1, 1:-1, :]
+        + arr_padded[1:-1, 2:, :]
+        + arr_padded[2:, :-2, :]
+        + arr_padded[2:, 1:-1, :]
+        + arr_padded[2:, 2:, :]
+    ) / 9.0
+    return blurred.astype(np.float32, copy=False)
+
+
+def _downsample_image(image: np.ndarray) -> np.ndarray:
+    blurred = _smooth_image_for_pyramid(image)
+    return blurred[::2, ::2, ...]
+
+
+def _upsample_image(image: np.ndarray, target_shape: tuple[int, int]) -> np.ndarray:
+    arr = np.asarray(image, dtype=np.float32)
+    up = np.repeat(np.repeat(arr, 2, axis=0), 2, axis=1)
+    h, w = target_shape
+    return up[:h, :w, ...]
+
+
+def build_gaussian_pyramid(image: np.ndarray, levels: int) -> List[np.ndarray]:
+    pyramid: List[np.ndarray] = []
+    arr = np.asarray(image, dtype=np.float32)
+    pyramid.append(arr)
+    for _ in range(1, max(1, levels)):
+        prev = pyramid[-1]
+        if min(prev.shape[0], prev.shape[1]) < 2:
+            break
+        pyramid.append(_downsample_image(prev))
+    return pyramid
+
+
+def build_laplacian_pyramid(image: np.ndarray, levels: int) -> List[np.ndarray]:
+    g_pyr = build_gaussian_pyramid(image, levels)
+    if not g_pyr:
+        return []
+    laplacian: List[np.ndarray] = []
+    for i in range(len(g_pyr) - 1):
+        upsampled = _upsample_image(g_pyr[i + 1], g_pyr[i].shape[:2])
+        laplacian.append(g_pyr[i] - upsampled)
+    laplacian.append(g_pyr[-1])
+    return laplacian
+
+
+def reconstruct_from_laplacian(pyramid: List[np.ndarray]) -> np.ndarray:
+    if not pyramid:
+        return np.array([], dtype=np.float32)
+    img = pyramid[-1]
+    for lev in reversed(pyramid[:-1]):
+        img = _upsample_image(img, lev.shape[:2]) + lev
+    return img
 
 
 def detect_grid_mode(input_folder: str | os.PathLike[str]) -> bool:
@@ -753,6 +969,272 @@ def _normalize_background(mosaic: np.ndarray, weight_map: np.ndarray) -> np.ndar
     return mosaic
 
 
+def build_tile_overlap_graph(tiles: List[TilePhotometryInfo], mosaic_shape_hw: tuple[int, int]) -> List[TileOverlap]:
+    overlaps: List[TileOverlap] = []
+    if not tiles:
+        return overlaps
+    H_m, W_m = mosaic_shape_hw
+    for idx_a, tile_a in enumerate(tiles):
+        bbox_a = tile_a.bbox
+        for idx_b in range(idx_a + 1, len(tiles)):
+            tile_b = tiles[idx_b]
+            bbox_b = tile_b.bbox
+            x0 = max(bbox_a[0], bbox_b[0], 0)
+            y0 = max(bbox_a[2], bbox_b[2], 0)
+            x1 = min(bbox_a[1], bbox_b[1], W_m)
+            y1 = min(bbox_a[3], bbox_b[3], H_m)
+            if x1 <= x0 or y1 <= y0:
+                continue
+            xa0 = max(0, x0 - bbox_a[0])
+            ya0 = max(0, y0 - bbox_a[2])
+            xa1 = min(tile_a.data.shape[1], x1 - bbox_a[0])
+            ya1 = min(tile_a.data.shape[0], y1 - bbox_a[2])
+            xb0 = max(0, x0 - bbox_b[0])
+            yb0 = max(0, y0 - bbox_b[2])
+            xb1 = min(tile_b.data.shape[1], x1 - bbox_b[0])
+            yb1 = min(tile_b.data.shape[0], y1 - bbox_b[2])
+            if xa1 <= xa0 or ya1 <= ya0 or xb1 <= xb0 or yb1 <= yb0:
+                continue
+            overlaps.append(
+                TileOverlap(
+                    tile_a=tile_a.tile_id,
+                    tile_b=tile_b.tile_id,
+                    global_bbox=(x0, x1, y0, y1),
+                    slice_a=(slice(ya0, ya1), slice(xa0, xa1)),
+                    slice_b=(slice(yb0, yb1), slice(xb0, xb1)),
+                    sample_count=(xa1 - xa0) * (ya1 - ya0),
+                )
+            )
+    return overlaps
+
+
+def _fit_overlap_regression(
+    patch_a: np.ndarray,
+    patch_b: np.ndarray,
+    mask_a: np.ndarray,
+    mask_b: np.ndarray,
+    *,
+    min_samples: int = 16,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Return per-channel slope/offset fitting B ≈ slope * A + offset."""
+
+    A = np.asarray(patch_a, dtype=np.float32)
+    B = np.asarray(patch_b, dtype=np.float32)
+    if A.ndim == 2:
+        A = A[..., np.newaxis]
+    if B.ndim == 2:
+        B = B[..., np.newaxis]
+    mask_a_arr = np.asarray(mask_a, dtype=bool)
+    mask_b_arr = np.asarray(mask_b, dtype=bool)
+    if mask_a_arr.ndim == 2 and A.ndim == 3:
+        mask_a_arr = np.repeat(mask_a_arr[..., np.newaxis], A.shape[-1], axis=2)
+    if mask_b_arr.ndim == 2 and B.ndim == 3:
+        mask_b_arr = np.repeat(mask_b_arr[..., np.newaxis], B.shape[-1], axis=2)
+    channels = A.shape[-1]
+    slopes = np.ones(channels, dtype=np.float32)
+    offsets = np.zeros(channels, dtype=np.float32)
+    total_samples = 0
+    for c in range(channels):
+        valid = mask_a_arr[..., c] & mask_b_arr[..., c] & np.isfinite(A[..., c]) & np.isfinite(B[..., c])
+        vals_a = A[..., c][valid]
+        vals_b = B[..., c][valid]
+        if vals_a.size < min_samples:
+            continue
+        total_samples += int(vals_a.size)
+        x = vals_a
+        y = vals_b
+        A_mat = np.vstack([x, np.ones_like(x)]).T
+        try:
+            coeffs, _, _, _ = np.linalg.lstsq(A_mat, y, rcond=None)
+            slope, intercept = coeffs
+            pred = slope * x + intercept
+            resid = y - pred
+            std = float(np.std(resid))
+            if math.isfinite(std) and std > 0:
+                keep = np.abs(resid) <= 3.0 * std
+                if np.any(~keep):
+                    x = x[keep]
+                    y = y[keep]
+                    if x.size >= min_samples:
+                        A_mat = np.vstack([x, np.ones_like(x)]).T
+                        coeffs, _, _, _ = np.linalg.lstsq(A_mat, y, rcond=None)
+                        slope, intercept = coeffs
+        except Exception:
+            slope, intercept = 1.0, 0.0
+        slope = float(slope)
+        intercept = float(intercept)
+        if not math.isfinite(slope) or abs(slope) < 1e-6:
+            slope = 1.0
+        if not math.isfinite(intercept):
+            intercept = 0.0
+        slopes[c] = slope
+        offsets[c] = intercept
+    return slopes, offsets, total_samples
+
+
+def _solve_global_gain_offset(
+    tiles: List[TilePhotometryInfo],
+    overlaps: List[TileOverlap],
+    overlap_fits: Dict[tuple[int, int], tuple[np.ndarray, np.ndarray, int]],
+    *,
+    max_iters: int = 8,
+) -> tuple[np.ndarray, np.ndarray]:
+    if not tiles:
+        return np.array([], dtype=np.float32), np.array([], dtype=np.float32)
+    channels = tiles[0].data.shape[-1]
+    gains = np.ones((len(tiles), channels), dtype=np.float32)
+    offsets = np.zeros((len(tiles), channels), dtype=np.float32)
+    id_to_idx = {t.tile_id: idx for idx, t in enumerate(tiles)}
+    degree = np.zeros(len(tiles), dtype=np.int32)
+    for ov in overlaps:
+        degree[id_to_idx[ov.tile_a]] += 1
+        degree[id_to_idx[ov.tile_b]] += 1
+    ref_idx = int(np.argmax(degree)) if len(degree) else 0
+
+    for _ in range(max_iters):
+        sum_g = np.zeros_like(gains)
+        sum_o = np.zeros_like(offsets)
+        counts = np.zeros(len(tiles), dtype=np.float32)
+        for ov in overlaps:
+            fit = overlap_fits.get((ov.tile_a, ov.tile_b))
+            if not fit:
+                continue
+            slope, intercept, samples = fit
+            if samples <= 0:
+                continue
+            idx_a = id_to_idx[ov.tile_a]
+            idx_b = id_to_idx[ov.tile_b]
+            slope_safe = np.where(np.abs(slope) < 1e-3, 1.0, slope)
+            weight = max(samples, 1)
+            sugg_g_b = gains[idx_a] / slope_safe
+            sugg_o_b = offsets[idx_a] - sugg_g_b * intercept
+            sum_g[idx_b] += sugg_g_b * weight
+            sum_o[idx_b] += sugg_o_b * weight
+            counts[idx_b] += weight
+
+            sugg_g_a = gains[idx_b] * slope_safe
+            sugg_o_a = offsets[idx_b] + gains[idx_b] * intercept
+            sum_g[idx_a] += sugg_g_a * weight
+            sum_o[idx_a] += sugg_o_a * weight
+            counts[idx_a] += weight
+
+        updated = False
+        for idx in range(len(tiles)):
+            if idx == ref_idx or counts[idx] <= 0:
+                continue
+            avg_g = sum_g[idx] / counts[idx]
+            avg_o = sum_o[idx] / counts[idx]
+            gains[idx] = 0.6 * gains[idx] + 0.4 * avg_g
+            offsets[idx] = 0.6 * offsets[idx] + 0.4 * avg_o
+            updated = True
+        if not updated:
+            break
+
+    gains = np.clip(np.nan_to_num(gains, nan=1.0, posinf=1.0, neginf=1.0), 0.01, 100.0)
+    offsets = np.nan_to_num(offsets, nan=0.0, posinf=0.0, neginf=0.0)
+    return gains, offsets
+
+
+def _build_overlap_blend_masks(mask_a: np.ndarray, mask_b: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Create smooth masks wA, wB with wA + wB = 1 where data is valid."""
+
+    valid_a = mask_a if mask_a.ndim == 2 else np.any(mask_a, axis=-1)
+    valid_b = mask_b if mask_b.ndim == 2 else np.any(mask_b, axis=-1)
+    valid_a_f = valid_a.astype(np.float32, copy=False)
+    valid_b_f = valid_b.astype(np.float32, copy=False)
+    h, w = valid_a_f.shape
+    if h == 0 or w == 0:
+        return np.zeros_like(valid_a_f), np.zeros_like(valid_b_f)
+    if w >= h:
+        ramp = np.linspace(0.0, 1.0, w, dtype=np.float32)
+        wB = np.broadcast_to(ramp, (h, w)).copy()
+    else:
+        ramp = np.linspace(0.0, 1.0, h, dtype=np.float32)[:, np.newaxis]
+        wB = np.broadcast_to(ramp, (h, w)).copy()
+    wA = 1.0 - wB
+    wA *= valid_a_f
+    wB *= valid_b_f
+    total = wA + wB
+    wA = np.where(total > 0, wA / np.clip(total, 1e-6, None), 0.0)
+    wB = np.where(total > 0, wB / np.clip(total, 1e-6, None), 0.0)
+    wA *= (total > 0)
+    wB *= (total > 0)
+    return wA.astype(np.float32, copy=False), wB.astype(np.float32, copy=False)
+
+
+def _blend_overlap_region(
+    patch_a: np.ndarray,
+    patch_b: np.ndarray,
+    mask_a: np.ndarray,
+    mask_b: np.ndarray,
+    *,
+    use_pyramid: bool = True,
+    max_levels: int = 4,
+) -> tuple[np.ndarray | None, np.ndarray | None, bool]:
+    """Blend two overlapping patches; returns blended patch, weight, and pyramid flag."""
+
+    wA, wB = _build_overlap_blend_masks(mask_a, mask_b)
+    total_w = wA + wB
+    if not np.any(total_w > 0):
+        return None, None, False
+    A = np.asarray(patch_a, dtype=np.float32)
+    B = np.asarray(patch_b, dtype=np.float32)
+    if A.ndim == 2:
+        A = A[..., np.newaxis]
+    if B.ndim == 2:
+        B = B[..., np.newaxis]
+    if A.shape != B.shape:
+        min_h = min(A.shape[0], B.shape[0])
+        min_w = min(A.shape[1], B.shape[1])
+        A = A[:min_h, :min_w, ...]
+        B = B[:min_h, :min_w, ...]
+        wA = wA[:min_h, :min_w]
+        wB = wB[:min_h, :min_w]
+        total_w = total_w[:min_h, :min_w]
+    mask_a_full = mask_a if mask_a.ndim == 3 else np.repeat(mask_a[..., np.newaxis], A.shape[-1], axis=2)
+    mask_b_full = mask_b if mask_b.ndim == 3 else np.repeat(mask_b[..., np.newaxis], A.shape[-1], axis=2)
+    A_clean = np.where(mask_a_full, A, 0.0)
+    B_clean = np.where(mask_b_full, B, 0.0)
+    used_pyramid = False
+    blended = None
+    if use_pyramid and min(A.shape[0], A.shape[1]) >= 8 and min(B.shape[0], B.shape[1]) >= 8:
+        try:
+            LA = build_laplacian_pyramid(A_clean, max_levels)
+            LB = build_laplacian_pyramid(B_clean, max_levels)
+            wA_pyr = build_gaussian_pyramid(wA[..., np.newaxis], max_levels)
+            wB_pyr = build_gaussian_pyramid(wB[..., np.newaxis], max_levels)
+            min_len = min(len(LA), len(LB), len(wA_pyr), len(wB_pyr))
+            L_blend: List[np.ndarray] = []
+            for k in range(min_len):
+                wa = wA_pyr[k]
+                wb = wB_pyr[k]
+                mask_sum = wa + wb
+                wa_norm = np.where(mask_sum > 0, wa / np.clip(mask_sum, 1e-6, None), 0.0)
+                wb_norm = np.where(mask_sum > 0, wb / np.clip(mask_sum, 1e-6, None), 0.0)
+                lb_a = LA[k]
+                lb_b = LB[k]
+                if lb_b.shape != lb_a.shape:
+                    lb_b = lb_b[: lb_a.shape[0], : lb_a.shape[1], ...]
+                    wb_norm = wb_norm[: lb_a.shape[0], : lb_a.shape[1], ...]
+                    wa_norm = wa_norm[: lb_a.shape[0], : lb_a.shape[1], ...]
+                L_blend.append(lb_a * wa_norm + lb_b * wb_norm)
+            if L_blend:
+                blended = reconstruct_from_laplacian(L_blend)
+                used_pyramid = True
+        except Exception:
+            used_pyramid = False
+            blended = None
+    if blended is None:
+        total_w_expanded = total_w[..., np.newaxis]
+        blended = np.where(
+            total_w_expanded > 0,
+            (A_clean * wA[..., np.newaxis] + B_clean * wB[..., np.newaxis]) / np.clip(total_w_expanded, 1e-6, None),
+            0.0,
+        )
+    weight_out = total_w.astype(np.float32, copy=False)
+    return blended.astype(np.float32, copy=False), weight_out, used_pyramid
+
+
 def assemble_tiles(
     grid: GridDefinition,
     tiles: Iterable[GridTile],
@@ -772,83 +1254,188 @@ def assemble_tiles(
         _emit("No tiles to assemble", lvl="ERROR", callback=progress_callback)
         return None
 
-    first_tile_data = None
+    tile_infos: list[TilePhotometryInfo] = []
+    channels: int | None = None
     for t in tiles_list:
         try:
             with _open_fits_safely(t.output_path) as hdul:
                 raw_data = hdul[0].data
                 if raw_data is None:
                     raise ValueError("empty data")
-                first_tile_data = _ensure_hwc_array(raw_data)
-            break
+                data = _ensure_hwc_array(raw_data)
         except Exception as exc:
             _emit(f"Assembly: failed to read {t.output_path} ({exc})", lvl="WARN", callback=progress_callback)
             continue
-    if first_tile_data is None:
+
+        c = 1 if data.ndim == 2 else data.shape[-1]
+        if channels is None:
+            channels = c
+        if c != channels:
+            _emit(
+                f"Assembly: tile {t.tile_id} channel mismatch ({c} != {channels}), skipping",
+                lvl="WARN",
+                callback=progress_callback,
+            )
+            continue
+        mask = compute_valid_mask(data)
+        tile_infos.append(TilePhotometryInfo(tile_id=t.tile_id, bbox=t.bbox, data=data, mask=mask))
+
+    if not tile_infos:
         _emit("Unable to read any tile for assembly", lvl="ERROR", callback=progress_callback)
         return None
 
-    channels = 1 if first_tile_data.ndim == 2 else first_tile_data.shape[-1]
+    channels = channels or 1
     mosaic_shape = (grid.global_shape_hw[0], grid.global_shape_hw[1], channels)
     mosaic_sum = np.zeros(mosaic_shape, dtype=np.float32)
     weight_sum = np.zeros(mosaic_shape, dtype=np.float32)
     H_m, W_m, _ = mosaic_sum.shape
+    _emit(f"Photometry: loaded {len(tile_infos)} tiles for assembly", callback=progress_callback)
 
-    for tile in tiles_list:
-        try:
-            with _open_fits_safely(tile.output_path) as hdul:
-                raw_data = hdul[0].data
-                if raw_data is None:
-                    raise ValueError("empty data")
-                data = _ensure_hwc_array(raw_data)
-        except Exception as exc:
-            _emit(f"Assembly: failed to read {tile.output_path} ({exc})", lvl="WARN", callback=progress_callback)
+    overlaps = build_tile_overlap_graph(tile_infos, (H_m, W_m))
+    _emit(f"Photometry: built overlap graph with {len(overlaps)} edges", callback=progress_callback)
+    info_by_id = {info.tile_id: info for info in tile_infos}
+
+    overlap_fits: Dict[tuple[int, int], tuple[np.ndarray, np.ndarray, int]] = {}
+    regression_failures = 0
+    for ov in overlaps:
+        info_a = info_by_id.get(ov.tile_a)
+        info_b = info_by_id.get(ov.tile_b)
+        if info_a is None or info_b is None:
             continue
+        patch_a = info_a.data[ov.slice_a]
+        patch_b = info_b.data[ov.slice_b]
+        mask_a = info_a.mask[ov.slice_a]
+        mask_b = info_b.mask[ov.slice_b]
+        slope, intercept, samples = _fit_overlap_regression(patch_a, patch_b, mask_a, mask_b)
+        if samples <= 0:
+            regression_failures += 1
+            _emit(
+                f"Photometry: overlap {info_a.tile_id}-{info_b.tile_id} regression failed (no valid pixels)",
+                lvl="WARN",
+                callback=progress_callback,
+            )
+            overlap_fits[(ov.tile_a, ov.tile_b)] = (np.ones(channels, dtype=np.float32), np.zeros(channels, dtype=np.float32), 0)
+            continue
+        overlap_fits[(ov.tile_a, ov.tile_b)] = (slope, intercept, samples)
+    if regression_failures:
+        _emit(f"Photometry: {regression_failures} overlap regressions fell back to neutral gains", lvl="WARN", callback=progress_callback)
 
-        tx0, tx1, ty0, ty1 = tile.bbox
+    gains, offsets = _solve_global_gain_offset(tile_infos, overlaps, overlap_fits)
+    _emit(f"Photometry: solved global gain/offset for {len(tile_infos)} tiles", callback=progress_callback)
+
+    for idx, info in enumerate(tile_infos):
+        gain = gains[idx] if gains.size else np.ones(channels, dtype=np.float32)
+        offset = offsets[idx] if offsets.size else np.zeros(channels, dtype=np.float32)
+        info.gain = gain
+        info.offset = offset
+        info.data = (info.data * gain) + offset
+        info.mask = compute_valid_mask(info.data) & info.mask
+
+    backgrounds: list[np.ndarray] = []
+    for info in tile_infos:
+        bg = estimate_tile_background(info.data, info.mask)
+        info.background = bg
+        backgrounds.append(bg)
+    B_target = None
+    try:
+        if backgrounds:
+            stacked_bg = np.stack(backgrounds, axis=0)
+            B_target = np.nanmedian(stacked_bg, axis=0)
+            for info in tile_infos:
+                bg = info.background
+                if bg is None or bg.size == 0:
+                    continue
+                delta = bg - B_target
+                info.data = info.data - delta
+                info.mask = compute_valid_mask(info.data) & info.mask
+            _emit("Photometry: applied background harmonization across tiles", callback=progress_callback)
+    except Exception:
+        _emit("Photometry: background harmonization failed, proceeding without it", lvl="WARN", callback=progress_callback)
+
+    overlap_union: Dict[int, np.ndarray] = {
+        info.tile_id: np.zeros(info.data.shape[:2], dtype=bool) for info in tile_infos
+    }
+    overlaps_used = 0
+    pyramids_used = 0
+    for ov in overlaps:
+        info_a = info_by_id.get(ov.tile_a)
+        info_b = info_by_id.get(ov.tile_b)
+        if info_a is None or info_b is None:
+            continue
+        patch_a = info_a.data[ov.slice_a]
+        patch_b = info_b.data[ov.slice_b]
+        mask_a = info_a.mask[ov.slice_a]
+        mask_b = info_b.mask[ov.slice_b]
+        overlap_union[info_a.tile_id][ov.slice_a] = True
+        overlap_union[info_b.tile_id][ov.slice_b] = True
+        blended, weight_patch, used_pyr = _blend_overlap_region(patch_a, patch_b, mask_a, mask_b, use_pyramid=True)
+        if blended is None or weight_patch is None or not np.any(weight_patch > 0):
+            _emit(
+                f"Blending: overlap {info_a.tile_id}-{info_b.tile_id} had no valid pixels",
+                lvl="WARN",
+                callback=progress_callback,
+            )
+            continue
+        overlaps_used += 1
+        if used_pyr:
+            pyramids_used += 1
+        gx0, gx1, gy0, gy1 = ov.global_bbox
+        region_h = min(blended.shape[0], gy1 - gy0)
+        region_w = min(blended.shape[1], gx1 - gx0)
+        if region_h <= 0 or region_w <= 0:
+            continue
+        gy_slice = slice(gy0, gy0 + region_h)
+        gx_slice = slice(gx0, gx0 + region_w)
+        weight_expanded = np.repeat(weight_patch[:region_h, :region_w][..., np.newaxis], channels, axis=2)
+        mosaic_sum[gy_slice, gx_slice, :] += blended[:region_h, :region_w, :] * weight_expanded
+        weight_sum[gy_slice, gx_slice, :] += weight_expanded
+
+    if overlaps_used:
+        _emit(
+            f"Blending: applied pyramidal blending on {pyramids_used} overlaps (processed {overlaps_used})",
+            callback=progress_callback,
+        )
+
+    for info in tile_infos:
+        tx0, tx1, ty0, ty1 = info.bbox
         x0 = max(0, min(tx0, W_m))
         y0 = max(0, min(ty0, H_m))
         x1 = max(0, min(tx1, W_m))
         y1 = max(0, min(ty1, H_m))
         if x1 <= x0 or y1 <= y0:
-            _emit(f"Assembly: tile {tile.tile_id} bbox outside mosaic, skipping", lvl="DEBUG", callback=progress_callback)
+            _emit(
+                f"Assembly: tile {info.tile_id} bbox outside mosaic, skipping unique region",
+                lvl="DEBUG",
+                callback=progress_callback,
+            )
             continue
-
-        h, w, c = data.shape
+        h, w, c = info.data.shape
         off_x = max(0, -tx0)
         off_y = max(0, -ty0)
         used_w = min(w - off_x, x1 - x0)
         used_h = min(h - off_y, y1 - y0)
         if used_h <= 0 or used_w <= 0:
-            _emit(f"Assembly: tile {tile.tile_id} has no overlap after clamping, skipping", lvl="DEBUG", callback=progress_callback)
-            continue
-        if c != mosaic_sum.shape[2]:
             _emit(
-                f"Assembly: tile {tile.tile_id} channel mismatch ({c} != {mosaic_sum.shape[2]}), skipping",
-                lvl="WARN",
+                f"Assembly: tile {info.tile_id} has no overlap after clamping, skipping unique region",
+                lvl="DEBUG",
                 callback=progress_callback,
             )
             continue
-
-        data_crop = data[off_y : off_y + used_h, off_x : off_x + used_w, :]
-        if data_crop.shape[0] != used_h or data_crop.shape[1] != used_w:
-            _emit(f"Assembly: tile {tile.tile_id} crop shape mismatch, skipping", lvl="WARN", callback=progress_callback)
+        data_crop = info.data[off_y : off_y + used_h, off_x : off_x + used_w, :]
+        mask_crop = info.mask[off_y : off_y + used_h, off_x : off_x + used_w, :]
+        overlap_mask_local = overlap_union[info.tile_id][off_y : off_y + used_h, off_x : off_x + used_w]
+        valid_mask_2d = np.any(mask_crop, axis=-1) if mask_crop.ndim == 3 else mask_crop
+        unique_mask = valid_mask_2d & (~overlap_mask_local)
+        if not np.any(unique_mask):
             continue
+        channel_mask = mask_crop if mask_crop.ndim == 3 else np.repeat(mask_crop[..., np.newaxis], c, axis=2)
+        channel_mask = channel_mask & unique_mask[..., np.newaxis]
+        weight_crop = channel_mask.astype(np.float32, copy=False)
         slice_y = slice(y0, y0 + used_h)
         slice_x = slice(x0, x0 + used_w)
-        target_slice_shape = mosaic_sum[slice_y, slice_x, :].shape[:2]
-        if target_slice_shape != data_crop.shape[:2]:
-            _emit(
-                f"Assembly: tile {tile.tile_id} target slice shape {target_slice_shape} != crop {data_crop.shape[:2]}, skipping",
-                lvl="WARN",
-                callback=progress_callback,
-            )
-            continue
-
-        weight_crop = np.ones_like(data_crop, dtype=np.float32)
-        mosaic_sum[slice_y, slice_x, :] += data_crop * weight_crop
+        mosaic_sum[slice_y, slice_x, :] += np.where(channel_mask, data_crop, 0.0) * weight_crop
         weight_sum[slice_y, slice_x, :] += weight_crop
-        _emit(f"Assembly: placed tile {tile.tile_id}", lvl="DEBUG", callback=progress_callback)
+        _emit(f"Assembly: placed tile {info.tile_id} unique area", lvl="DEBUG", callback=progress_callback)
 
     if not np.any(weight_sum > 0):
         _emit("Assembly: no valid tile data written to mosaic", lvl="ERROR", callback=progress_callback)
@@ -856,7 +1443,6 @@ def assemble_tiles(
 
     with np.errstate(divide="ignore", invalid="ignore"):
         mosaic = np.where(weight_sum > 0, mosaic_sum / np.clip(weight_sum, 1e-6, None), np.nan)
-    mosaic = _normalize_background(mosaic, weight_sum)
     if mosaic.shape[-1] == 1 and not legacy_rgb_cube:
         mosaic = mosaic[..., 0]
         weight_sum = weight_sum[..., 0]
