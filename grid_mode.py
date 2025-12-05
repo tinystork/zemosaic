@@ -40,13 +40,10 @@
 ║ Disclaimer:                                                                       ║
 ║   No AIs or butter knives were harmed in the making of this code.                 ║
 ╚═══════════════════════════════════════════════════════════════════════════════════╝
-"""
-
-"""Grid/Survey processing pipeline for ZeMosaic.
+Grid/Survey processing pipeline for ZeMosaic.
 
 All logic here is isolated from the classic worker workflow and is only
-invoked when a ``stack_plan.csv`` file is present in the input folder.
-"""
+invoked when a ``stack_plan.csv`` file is present in the input folder."""
 
 from __future__ import annotations
 
@@ -55,6 +52,7 @@ import csv
 import logging
 import math
 import os
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -108,6 +106,8 @@ logger = logging.getLogger("zemosaic.grid_mode")
 if not logger.handlers:
     logger.addHandler(logging.NullHandler())
 
+_DEGRADED_WCS_FRAMES: set[str] = set()
+
 
 ProgressCallback = Optional[Callable[[str, object, str], None]]
 
@@ -129,6 +129,30 @@ def _emit(msg: str, *, lvl: str = "INFO", callback: ProgressCallback = None, **k
                 logger.debug("Progress callback failed for %s", tag, exc_info=True)
             except Exception:
                 pass
+
+
+def _log_wcs_degraded(frame: FrameInfo, *, progress_callback: ProgressCallback = None) -> None:
+    """Emit a single degraded-WCS message per frame."""
+
+    key = str(frame.path)
+    if key in _DEGRADED_WCS_FRAMES:
+        return
+    _DEGRADED_WCS_FRAMES.add(key)
+    name = frame.path.name if isinstance(frame.path, Path) else str(frame.path)
+    _emit(f"WCS convergence degraded for frame {name} (distortion-stripped WCS used)", lvl="WARN", callback=progress_callback)
+
+
+def _has_wcs_convergence_warning(caught: list[warnings.WarningMessage] | None) -> bool:
+    if not caught:
+        return False
+    for w in caught:
+        try:
+            text = str(getattr(w, "message", ""))
+        except Exception:
+            text = ""
+        if "all_world2pix" in text or "Reproject encountered WCS" in text:
+            return True
+    return False
 
 
 def _open_fits_safely(path: Path):
@@ -272,7 +296,8 @@ def estimate_tile_background(tile_data: np.ndarray, tile_mask: np.ndarray, *, si
     backgrounds: list[float] = []
     for c in range(arr.shape[-1]):
         mask_c = mask if mask.ndim == 2 else mask[..., c]
-        vals = arr[..., c][mask_c]
+        finite_mask = mask_c & np.isfinite(arr[..., c])
+        vals = arr[..., c][finite_mask]
         if vals.size == 0:
             backgrounds.append(float("nan"))
             continue
@@ -572,15 +597,51 @@ def _frame_fov_deg(frame: FrameInfo) -> float | None:
     return max(h, w) * px_scale
 
 
-def _compute_frame_footprint(frame: FrameInfo, global_wcs: object) -> tuple[float, float, float, float] | None:
+def _strip_wcs_distortion(wcs_obj: object) -> object:
+    """Return a copy of ``wcs_obj`` without SIP/CPDIS/DET2IM distortions."""
+
+    try:
+        wcs_copy = copy.deepcopy(wcs_obj)
+    except Exception:
+        wcs_copy = wcs_obj
+    try:
+        for attr in ("sip", "cpdis", "det2im", "distortion_lookup_table"):
+            if hasattr(wcs_copy, attr):
+                try:
+                    setattr(wcs_copy, attr, None)
+                except Exception:
+                    pass
+        inner = getattr(wcs_copy, "wcs", None)
+        if inner is not None:
+            for attr in ("sip", "cpdis", "det2im"):
+                if hasattr(inner, attr):
+                    try:
+                        setattr(inner, attr, None)
+                    except Exception:
+                        pass
+            try:
+                inner.set_pv([])
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return wcs_copy
+
+
+def _compute_frame_footprint(frame: FrameInfo, global_wcs: object, *, progress_callback: ProgressCallback = None) -> tuple[float, float, float, float] | None:
     if frame.wcs is None or frame.shape_hw is None or not (_ASTROPY_AVAILABLE and SkyCoord):
         return None
     try:
         h, w = frame.shape_hw
         corners_x = np.array([0, w - 1, 0, w - 1], dtype=float)
         corners_y = np.array([0, 0, h - 1, h - 1], dtype=float)
-        sky = frame.wcs.pixel_to_world(corners_x, corners_y)  # type: ignore[call-arg]
-        gx, gy = global_wcs.world_to_pixel(sky)  # type: ignore[attr-defined]
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.filterwarnings("always", category=UserWarning, message=".*all_world2pix.*")
+            warnings.filterwarnings("always", category=UserWarning, message=".*Reproject encountered WCS.*")
+            sky = frame.wcs.pixel_to_world(corners_x, corners_y)  # type: ignore[call-arg]
+            gx, gy = global_wcs.world_to_pixel(sky)  # type: ignore[attr-defined]
+        if _has_wcs_convergence_warning(caught):
+            _log_wcs_degraded(frame, progress_callback=progress_callback)
         xmin = float(np.nanmin(gx))
         xmax = float(np.nanmax(gx))
         ymin = float(np.nanmin(gy))
@@ -591,7 +652,7 @@ def _compute_frame_footprint(frame: FrameInfo, global_wcs: object) -> tuple[floa
 
 
 def _clone_tile_wcs(global_wcs: object, offset_xy: tuple[int, int], shape_hw: tuple[int, int]) -> object:
-    tile_wcs = copy.deepcopy(global_wcs)
+    tile_wcs = _strip_wcs_distortion(global_wcs)
     try:
         offset_x, offset_y = offset_xy
         crpix = np.asarray(tile_wcs.wcs.crpix, dtype=float)  # type: ignore[attr-defined]
@@ -668,6 +729,9 @@ def build_global_grid(
         global_wcs = copy.deepcopy(first.wcs)
         global_shape_hw = first.shape_hw or (0, 0)
 
+    if global_wcs is not None:
+        global_wcs = _strip_wcs_distortion(global_wcs)
+
     if global_wcs is None or global_shape_hw is None:
         _emit("Global WCS calculation failed", lvl="ERROR", callback=progress_callback)
         return None
@@ -684,7 +748,7 @@ def build_global_grid(
 
     global_bounds = []
     for frame in usable_frames:
-        fp = _compute_frame_footprint(frame, global_wcs)
+        fp = _compute_frame_footprint(frame, global_wcs, progress_callback=progress_callback)
         frame.footprint = fp
         if fp is not None:
             global_bounds.append(fp)
@@ -770,6 +834,8 @@ def _reproject_frame_to_tile(
     frame: FrameInfo,
     tile: GridTile,
     tile_shape_hw: tuple[int, int],
+    *,
+    progress_callback: ProgressCallback = None,
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
     if not (_REPROJECT_AVAILABLE and reproject_interp):
         return None, None
@@ -783,19 +849,28 @@ def _reproject_frame_to_tile(
     channels = data.shape[-1] if data.ndim == 3 else 1
     reproj_channels = []
     footprints = []
+    degraded = False
     for c in range(channels):
         arr_2d = data[..., c] if data.ndim == 3 else data
         try:
-            reproj_arr, footprint = reproject_interp(
-                (arr_2d, frame.wcs),
-                output_projection=tile.wcs,
-                shape_out=(tile_shape_hw[0], tile_shape_hw[1]),
-                return_footprint=True,
-            )
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.filterwarnings("always", category=UserWarning, message=".*all_world2pix.*")
+                warnings.filterwarnings("always", category=UserWarning, message=".*Reproject encountered WCS.*")
+                reproj_arr, footprint = reproject_interp(
+                    (arr_2d, frame.wcs),
+                    output_projection=tile.wcs,
+                    shape_out=(tile_shape_hw[0], tile_shape_hw[1]),
+                    return_footprint=True,
+                )
+            if _has_wcs_convergence_warning(caught):
+                degraded = True
         except Exception:
             return None, None
         reproj_channels.append(reproj_arr.astype(np.float32, copy=False))
         footprints.append(footprint.astype(np.float32, copy=False))
+
+    if degraded:
+        _log_wcs_degraded(frame, progress_callback=progress_callback)
 
     reproj_stack = np.stack(reproj_channels, axis=-1)
     footprint_combined = np.nanmax(np.stack(footprints, axis=0), axis=0)
@@ -882,10 +957,15 @@ def _stack_weighted_patches(
         )
 
     data_masked = np.nan_to_num(data_for_combine, nan=0.0)
-    weight_effective = np.where(np.isfinite(data_for_combine), weight_stack, 0.0)
+    finite_mask = np.isfinite(data_for_combine)
+    weight_effective = np.where(finite_mask, weight_stack, 0.0)
     weight_sum = np.sum(weight_effective, axis=0)
+    valid_positions = np.any(finite_mask, axis=0)
+    if not np.any(valid_positions):
+        return np.zeros(data_for_combine.shape[1:], dtype=np.float32)
     if config.stack_final_combine.lower().strip() == "median":
-        result = np.nanmedian(data_for_combine, axis=0)
+        median_input = np.where(valid_positions[np.newaxis, ...], data_for_combine, 0.0)
+        result = np.nanmedian(median_input, axis=0)
     else:
         with np.errstate(divide="ignore", invalid="ignore"):
             result = np.sum(data_masked * weight_effective, axis=0) / np.clip(weight_sum, 1e-6, None)
@@ -907,7 +987,7 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
     weight_maps: list[np.ndarray] = []
 
     for frame in tile.frames:
-        patch, footprint = _reproject_frame_to_tile(frame, tile, tile_shape)
+        patch, footprint = _reproject_frame_to_tile(frame, tile, tile_shape, progress_callback=progress_callback)
         if patch is None or footprint is None:
             _emit(f"Tile {tile.tile_id}: reprojection failed for {frame.path.name}", lvl="WARN", callback=progress_callback)
             continue
@@ -969,6 +1049,83 @@ def _normalize_background(mosaic: np.ndarray, weight_map: np.ndarray) -> np.ndar
     return mosaic
 
 
+def grid_post_equalize_rgb(
+    mosaic: np.ndarray,
+    weight_sum: np.ndarray,
+    *,
+    background_percentile: float = 30.0,
+    progress_callback: ProgressCallback = None,
+) -> np.ndarray:
+    """Equalize RGB channels on low-signal pixels where ``weight_sum > 0``."""
+
+    arr = np.asarray(mosaic, dtype=np.float32)
+    weights = np.asarray(weight_sum, dtype=np.float32) if weight_sum is not None else None
+    if arr.ndim != 3 or arr.shape[-1] != 3 or weights is None:
+        return arr
+    if weights.ndim == 2:
+        weights = np.repeat(weights[..., np.newaxis], 3, axis=2)
+    valid = np.isfinite(arr) & (weights > 0)
+    valid_any = np.any(valid, axis=2)
+    if not np.any(valid_any):
+        _emit("RGB equalization skipped: no valid pixels", lvl="WARN", callback=progress_callback)
+        return arr
+
+    sum_vals = np.sum(np.where(valid, arr, 0.0), axis=2)
+    counts = np.sum(valid.astype(np.float32), axis=2)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        luminance = np.where(counts > 0, sum_vals / np.clip(counts, 1e-6, None), np.nan)
+    lum_finite = luminance[np.isfinite(luminance)]
+    if lum_finite.size == 0:
+        _emit("RGB equalization skipped: no valid background sample", lvl="WARN", callback=progress_callback)
+        return arr
+
+    background_percentile = float(min(max(background_percentile, 0.0), 100.0))
+    try:
+        cutoff = float(np.percentile(lum_finite, background_percentile))
+    except Exception:
+        cutoff = float("nan")
+    if not math.isfinite(cutoff):
+        _emit("RGB equalization skipped: percentile failed", lvl="WARN", callback=progress_callback)
+        return arr
+    bg_mask_2d = np.isfinite(luminance) & (luminance <= cutoff) & valid_any
+    if not np.any(bg_mask_2d):
+        bg_mask_2d = valid_any
+
+    medians = []
+    for c in range(3):
+        chan_mask = bg_mask_2d & valid[..., c]
+        vals = arr[..., c][chan_mask]
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            medians.append(float("nan"))
+        else:
+            medians.append(float(np.median(vals)))
+    medians_arr = np.asarray(medians, dtype=np.float32)
+    finite_chan = np.isfinite(medians_arr)
+    if not np.any(finite_chan):
+        _emit("RGB equalization skipped: no finite channel medians", lvl="WARN", callback=progress_callback)
+        return arr
+    target = float(np.mean(medians_arr[finite_chan]))
+    if not math.isfinite(target) or abs(target) < 1e-6:
+        _emit("RGB equalization skipped: invalid target median", lvl="WARN", callback=progress_callback)
+        return arr
+
+    gains = np.ones(3, dtype=np.float32)
+    for c in range(3):
+        med_c = medians_arr[c]
+        if math.isfinite(med_c) and abs(med_c) >= 1e-6:
+            gains[c] = target / med_c
+    equalized = arr.copy()
+    for c in range(3):
+        mask_c = valid[..., c]
+        if not np.any(mask_c):
+            continue
+        equalized[..., c][mask_c] = arr[..., c][mask_c] * gains[c]
+
+    _emit("Photometry: applied Grid RGB equalization", callback=progress_callback)
+    return equalized
+
+
 def build_tile_overlap_graph(tiles: List[TilePhotometryInfo], mosaic_shape_hw: tuple[int, int]) -> List[TileOverlap]:
     overlaps: List[TileOverlap] = []
     if not tiles:
@@ -1015,7 +1172,7 @@ def _fit_overlap_regression(
     mask_b: np.ndarray,
     *,
     min_samples: int = 16,
-) -> tuple[np.ndarray, np.ndarray, int]:
+) -> tuple[np.ndarray, np.ndarray, int, int]:
     """Return per-channel slope/offset fitting B ≈ slope * A + offset."""
 
     A = np.asarray(patch_a, dtype=np.float32)
@@ -1034,8 +1191,13 @@ def _fit_overlap_regression(
     slopes = np.ones(channels, dtype=np.float32)
     offsets = np.zeros(channels, dtype=np.float32)
     total_samples = 0
+    total_valid_pairs = 0
     for c in range(channels):
         valid = mask_a_arr[..., c] & mask_b_arr[..., c] & np.isfinite(A[..., c]) & np.isfinite(B[..., c])
+        valid_count = int(np.count_nonzero(valid))
+        total_valid_pairs += valid_count
+        if valid_count == 0:
+            continue
         vals_a = A[..., c][valid]
         vals_b = B[..., c][valid]
         if vals_a.size < min_samples:
@@ -1069,7 +1231,7 @@ def _fit_overlap_regression(
             intercept = 0.0
         slopes[c] = slope
         offsets[c] = intercept
-    return slopes, offsets, total_samples
+    return slopes, offsets, total_samples, total_valid_pairs
 
 
 def _solve_global_gain_offset(
@@ -1102,6 +1264,10 @@ def _solve_global_gain_offset(
             slope, intercept, samples = fit
             if samples <= 0:
                 continue
+            slope = np.asarray(slope, dtype=np.float32)
+            intercept = np.asarray(intercept, dtype=np.float32)
+            slope = np.nan_to_num(slope, nan=1.0, posinf=1.0, neginf=1.0)
+            intercept = np.nan_to_num(intercept, nan=0.0, posinf=0.0, neginf=0.0)
             idx_a = id_to_idx[ov.tile_a]
             idx_b = id_to_idx[ov.tile_b]
             slope_safe = np.where(np.abs(slope) < 1e-3, 1.0, slope)
@@ -1242,6 +1408,7 @@ def assemble_tiles(
     *,
     save_final_as_uint16: bool = False,
     legacy_rgb_cube: bool = False,
+    grid_rgb_equalize: bool = True,
     progress_callback: ProgressCallback = None,
 ) -> Path | None:
     """Assemble processed tiles into the final mosaic without global reprojection."""
@@ -1306,16 +1473,27 @@ def assemble_tiles(
         patch_b = info_b.data[ov.slice_b]
         mask_a = info_a.mask[ov.slice_a]
         mask_b = info_b.mask[ov.slice_b]
-        slope, intercept, samples = _fit_overlap_regression(patch_a, patch_b, mask_a, mask_b)
-        if samples <= 0:
+        slope, intercept, samples, valid_pairs = _fit_overlap_regression(patch_a, patch_b, mask_a, mask_b)
+        if valid_pairs <= 0:
             regression_failures += 1
             _emit(
-                f"Photometry: overlap {info_a.tile_id}-{info_b.tile_id} regression failed (no valid pixels)",
+                f"Overlap {info_a.tile_id}-{info_b.tile_id} skipped (no finite pixels)",
                 lvl="WARN",
                 callback=progress_callback,
             )
             overlap_fits[(ov.tile_a, ov.tile_b)] = (np.ones(channels, dtype=np.float32), np.zeros(channels, dtype=np.float32), 0)
             continue
+        if samples <= 0:
+            regression_failures += 1
+            _emit(
+                f"Photometry: overlap {info_a.tile_id}-{info_b.tile_id} regression skipped (insufficient valid samples)",
+                lvl="WARN",
+                callback=progress_callback,
+            )
+            overlap_fits[(ov.tile_a, ov.tile_b)] = (np.ones(channels, dtype=np.float32), np.zeros(channels, dtype=np.float32), 0)
+            continue
+        slope = np.nan_to_num(slope, nan=1.0, posinf=1.0, neginf=1.0)
+        intercept = np.nan_to_num(intercept, nan=0.0, posinf=0.0, neginf=0.0)
         overlap_fits[(ov.tile_a, ov.tile_b)] = (slope, intercept, samples)
     if regression_failures:
         _emit(f"Photometry: {regression_failures} overlap regressions fell back to neutral gains", lvl="WARN", callback=progress_callback)
@@ -1332,23 +1510,50 @@ def assemble_tiles(
         info.mask = compute_valid_mask(info.data) & info.mask
 
     backgrounds: list[np.ndarray] = []
+    valid_backgrounds: list[np.ndarray] = []
     for info in tile_infos:
         bg = estimate_tile_background(info.data, info.mask)
         info.background = bg
         backgrounds.append(bg)
+        if bg is None or bg.size == 0:
+            continue
+        if not np.any(np.isfinite(bg)):
+            continue
+        valid_backgrounds.append(bg)
     B_target = None
     try:
-        if backgrounds:
-            stacked_bg = np.stack(backgrounds, axis=0)
-            B_target = np.nanmedian(stacked_bg, axis=0)
+        if valid_backgrounds:
+            stacked_bg = np.stack(valid_backgrounds, axis=0)
+            med_list: list[float] = []
+            stacked_bg = np.asarray(stacked_bg, dtype=np.float32)
+            if stacked_bg.ndim == 1:
+                stacked_bg = stacked_bg[:, np.newaxis]
+            for c in range(stacked_bg.shape[1]):
+                vals_c = stacked_bg[:, c]
+                vals_c = vals_c[np.isfinite(vals_c)]
+                if vals_c.size == 0:
+                    med_list.append(float("nan"))
+                else:
+                    med_list.append(float(np.median(vals_c)))
+            if med_list:
+                B_target = np.asarray(med_list, dtype=np.float32)
+        if B_target is not None and np.any(np.isfinite(B_target)):
             for info in tile_infos:
                 bg = info.background
                 if bg is None or bg.size == 0:
                     continue
-                delta = bg - B_target
-                info.data = info.data - delta
+                if bg.shape[0] != B_target.shape[0]:
+                    continue
+                valid_chan = np.isfinite(bg) & np.isfinite(B_target)
+                if not np.any(valid_chan):
+                    continue
+                delta = np.zeros_like(B_target, dtype=np.float32)
+                delta[valid_chan] = bg[valid_chan] - B_target[valid_chan]
+                info.data = info.data - delta.reshape((1, 1, -1))
                 info.mask = compute_valid_mask(info.data) & info.mask
             _emit("Photometry: applied background harmonization across tiles", callback=progress_callback)
+        else:
+            _emit("Photometry: background harmonization skipped (no valid backgrounds)", lvl="WARN", callback=progress_callback)
     except Exception:
         _emit("Photometry: background harmonization failed, proceeding without it", lvl="WARN", callback=progress_callback)
 
@@ -1443,6 +1648,8 @@ def assemble_tiles(
 
     with np.errstate(divide="ignore", invalid="ignore"):
         mosaic = np.where(weight_sum > 0, mosaic_sum / np.clip(weight_sum, 1e-6, None), np.nan)
+    if grid_rgb_equalize and mosaic.ndim == 3 and mosaic.shape[-1] == 3:
+        mosaic = grid_post_equalize_rgb(mosaic, weight_sum, progress_callback=progress_callback)
     if mosaic.shape[-1] == 1 and not legacy_rgb_cube:
         mosaic = mosaic[..., 0]
         weight_sum = weight_sum[..., 0]
@@ -1496,6 +1703,7 @@ def run_grid_mode(
     radial_shape_power: float = 2.0,
     save_final_as_uint16: bool = False,
     legacy_rgb_cube: bool = False,
+    grid_rgb_equalize: bool = True,
 ) -> None:
     """Main entry point for Grid/Survey mode."""
 
@@ -1509,6 +1717,14 @@ def run_grid_mode(
         grid_size_factor = float(cfg_disk.get("grid_size_factor", 1.0))
     except Exception:
         grid_size_factor = 1.0
+    try:
+        rgb_cfg = cfg_disk.get("grid_rgb_equalize", grid_rgb_equalize)
+        if isinstance(rgb_cfg, str):
+            grid_rgb_equalize = rgb_cfg.strip().lower() not in {"0", "false", "no", "off"}
+        else:
+            grid_rgb_equalize = bool(rgb_cfg)
+    except Exception:
+        grid_rgb_equalize = bool(grid_rgb_equalize)
 
     config = GridModeConfig(
         grid_size_factor=grid_size_factor,
@@ -1557,6 +1773,7 @@ def run_grid_mode(
         out_dir / "mosaic_grid.fits",
         save_final_as_uint16=save_final_as_uint16,
         legacy_rgb_cube=legacy_rgb_cube,
+        grid_rgb_equalize=grid_rgb_equalize,
         progress_callback=progress_callback,
     )
 

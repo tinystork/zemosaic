@@ -1,316 +1,172 @@
-# 🌌 Mission: Photometric harmonization & blending for Grid/Survey mode
 
-You are Codex-Max.  
-This is a **focused enhancement** of the existing **Grid/Survey mode** implemented in `grid_mode.py`.
+# 🟦 **agent.md (updated)**
 
-The current Grid mode:
-- Builds a global WCS.
-- Splits the field into geometric tiles.
-- Reprojects frames into tiles and stacks them.
-- Assembles tiles into a global mosaic.
+## 🌌 Mission: Stabilize Grid/Survey Mode Photometry, Background, and Color Balance
 
-Result: geometrically correct, but **photometrically broken**:
-- visible rectangular seams,
-- different backgrounds per tile,
-- no proper overlap blending,
-- black/invalid areas visible.
+You are **GPT-5.1-Codex-Max**.
+Your mission is to **improve the photometric consistency and color balance** of the **Grid/Survey mode** implemented in `grid_mode.py`, *without modifying the classic ZeMosaic pipeline*.
 
-Your mission is to:
-1. Implement **SWarp-like background matching between tiles**.
-2. Implement **multi-resolution (pyramidal) blending** in overlaps.
-3. Implement **linear regression correction** in overlaps (tile-to-tile photometric calibration).
-4. Implement **automatic masking of invalid/empty zones** (avoid using NaNs/zeros as signal).
-5. Do this **ONLY for Grid/Survey mode**, without touching the classic pipeline.
+This update focuses on three urgent issues observed during real runs:
 
 ---
 
-## 0. Scope & constraints
+# ✔ **Objective 1 — Make all background & overlap statistics NaN-safe**
 
-- Scope: `grid_mode.py` (Grid/Survey code path).
-- Optional: tiny adjustments in `zemosaic_worker.py` *only for logging or Grid-specific options*.
-- DO NOT modify:
-  - classic clustering / master-tile / Phase 5 pipeline,
-  - non-Grid mosaic assembly,
-  - GUI, except possibly to add a simple toggle for Grid photometry (optional).
+The current Grid mode background/overlap matching emits warnings such as:
 
-- All logs related to this work must be tagged `[GRID]`.
+* `Mean of empty slice`
+* `All-NaN slice encountered`
+* `Degrees of freedom <= 0 for slice`
 
----
+These occur when computing:
 
-## 1. Masking invalid / empty regions
+* background medians,
+* overlap regressions,
+* per-channel estimates,
 
-Before doing any photometry or blending, we must define **valid pixels**.
+on arrays that sometimes contain **no finite pixel at all**.
 
-Requirements:
+### Requirements
 
-- In tile processing and global assembly:
-  - A pixel is **valid** if:
-    - it is finite (`np.isfinite`),
-    - AND not equal to a known "empty" value (e.g. 0, or a configurable threshold).
-  - Otherwise it's invalid and must not contribute to the mosaic.
+1. **Before applying any statistic** (`np.nanmedian`, `np.nanmean`, `np.nanvar`, sigma-clipped stats, etc.):
 
-- Implement helper functions in `grid_mode.py`:
+   ```python
+   finite = np.isfinite(array)
+   if not np.any(finite):
+       # Skip correction, return identity or leave tile unchanged.
+   ```
 
-  ```python
-  def compute_valid_mask(data: np.ndarray, *, eps: float = 1e-6) -> np.ndarray:
-      """Return a boolean mask where True = valid pixel."""
-````
+2. Apply this systematically in:
 
-* Use this mask to:
+   * background estimation per tile
+   * global target background computation
+   * overlap regression sampling
+   * per-channel background matching
 
-  * build `weight_crop` (0 for invalid pixels),
-  * avoid counting invalid pixels in statistics,
-  * avoid using invalid pixels in overlap regression.
+3. If an overlap is empty or invalid, skip it and log:
 
-* When `weight_sum == 0` in the global mosaic, mark those pixels as invalid (e.g. NaN) and **exclude them from any mean/variance computation** to avoid `nanmean` warnings.
-
----
-
-## 2. Tile-level background & gain estimation (linear regression in overlaps)
-
-Goal: each tile should be photometrically consistent with its neighbors.
-
-### 2.1. Overlap graph
-
-* After all tiles are created (and before final assembly), build an **overlap graph**:
-
-  ```python
-  class TilePhotometryInfo:
-      tile_id: int
-      bbox: Tuple[int, int, int, int]
-      data: np.ndarray  # or a lightweight representation / stats
-      mask: np.ndarray  # valid pixels
-
-  def build_tile_overlap_graph(tiles: List[TilePhotometryInfo]) -> OverlapGraph:
-      """Determine which tiles overlap in the global mosaic."""
-  ```
-
-* For each pair of tiles that overlap in the global mosaic, compute:
-
-  * intersection region indices `(x0, x1, y0, y1)`,
-  * valid pixels mask in both tiles.
-
-### 2.2. Linear regression in overlaps
-
-For each tile pair `(A, B)` with a non-empty overlap:
-
-* Extract the overlapping valid pixels:
-
-  ```python
-  A_vals, B_vals  # 1D arrays of overlapping pixel values
-  ```
-
-* Fit a simple linear relation:
-
-  ```python
-  B ≈ a * A + b
-  ```
-
-  using robust linear regression (at minimum least-squares with optional clipping of outliers).
-
-* Store for each tile a set of constraints of the form:
-
-  * tile_j ≈ a_ij * tile_i + b_ij.
-
-Then:
-
-* Choose a **reference tile** (e.g. the one with most overlaps or a central tile).
-* Solve for each tile a global `(gain, offset)` pair that best satisfies all pairwise relations.
-
-  * You can do this iteratively (Gauss-Seidel style) or via a small least-squares system.
-  * Aim for simplicity but robustness.
-
-Apply these `(gain, offset)` to tiles before final blending:
-
-```python
-tile_data_corr = gain * tile_data + offset
+```
+[GRID] Overlap skipped (no finite pixels)
 ```
 
-If regression fails (too few pixels, all invalid, etc.):
+4. All correction steps must function even if *some* tiles or channels contain no valid data.
 
-* log a `[GRID]` warning,
-* fall back to neutral `(gain=1, offset=0)` for that relation.
-
----
-
-## 3. SWarp-like background matching
-
-In addition to pairwise regression, we need a global large-scale background harmonization.
-
-Requirements:
-
-* Implement a function:
-
-  ```python
-  def estimate_tile_background(tile_data: np.ndarray, tile_mask: np.ndarray) -> float:
-      """Return a robust estimate of the background level (e.g. sigma-clipped median)."""
-  ```
-
-* For each tile, estimate background `B_i`.
-
-* Compute a **global target background**, for example:
-
-  ```python
-  B_target = median(B_i over all tiles)
-  ```
-
-* Adjust each tile:
-
-  ```python
-  tile_data -= (B_i - B_target)
-  ```
-
-* This step should be combined with or applied after the linear regression step.
-  A possible order:
-
-  1. Apply regression-based global gain/offset.
-  2. Re-estimate backgrounds.
-  3. Apply a final uniform background shift towards `B_target`.
-
-* Ensure that all operations ignore invalid pixels (use the masks).
+**Goal:** no warnings, stable photometry, no propagation of NaN-based coefficients.
 
 ---
 
-## 4. Multi-resolution (pyramidal) blending
+# ✔ **Objective 2 — Add a global RGB equalization step to Grid Mode**
 
-Goal: avoid harsh seams by blending tiles across multiple spatial scales.
+Grid mode currently produces geometrically correct mosaics but with noticeable **color drift** (e.g., red/green imbalance).
+Classic ZeMosaic uses `poststack_equalize_rgb` to equalize color channels, but Grid mode has no equivalent.
 
-Implement a **multi-resolution blending scheme** for the tiles during final assembly.
-You may use a Laplacian pyramid approach or a simpler Gaussian pyramid, as long as it respects these points:
+### Requirements
 
-### 4.1. Blending masks
+1. After `assemble_tiles()` and background normalization, add a new step:
 
-* For each overlap region between tiles, generate a **smooth blending mask**:
+```python
+grid_post_equalize_rgb(mosaic, weight_sum)
+```
 
-  ```python
-  w_A(x,y) + w_B(x,y) = 1
-  ```
+2. This function must:
 
-  with `w_A` decreasing smoothly from 1→0 across the overlap, and `w_B` = 1 - `w_A`.
+   * operate **only where weight_sum > 0**
+   * compute **per-channel background medians** on a *background mask*
+     (low-signal regions or sampling the lowest X% of pixel intensities)
+   * compute gain factors so that **R, G, B reach the same median**
 
-* Masks must be zero on invalid pixels.
+   Example:
 
-### 4.2. Pyramidal blending
+   ```python
+   target = np.mean([median_R, median_G, median_B])
+   gain_R = target / median_R
+   gain_G = target / median_G
+   gain_B = target / median_B
+   ```
 
-* Implement helper functions:
+3. Gains must be applied to all valid pixels using broadcasting.
 
-  ```python
-  def build_gaussian_pyramid(image: np.ndarray, levels: int) -> List[np.ndarray]:
-      ...
+4. This must produce the same “neutral, natural” color balance as the classic pipeline.
 
-  def build_laplacian_pyramid(image: np.ndarray, levels: int) -> List[np.ndarray]:
-      ...
+5. Expose a runtime flag in Grid mode only:
 
-  def reconstruct_from_laplacian(pyramid: List[np.ndarray]) -> np.ndarray:
-      ...
-  ```
+```python
+grid_rgb_equalize = True  # default
+```
 
-* For overlapping tiles A and B:
-
-  1. Build Laplacian pyramids LA, LB.
-  2. Build Gaussian pyramids of blending masks wA, wB.
-  3. At each level `k`:
-
-     ```python
-     L_blend_k = LA_k * wA_k + LB_k * wB_k
-     ```
-  4. Reconstruct blended overlap region from `{L_blend_k}`.
-
-* Apply this blending per overlap and integrate back into the global mosaic (respecting masks).
-
-If this feels too heavy for all overlaps, you may:
-
-* Restrict pyramidal blending to overlaps larger than a given size,
-* Use a simpler Gaussian feathering for small overlaps.
+6. Do **NOT** modify the classic pipeline’s use of `poststack_equalize_rgb`.
 
 ---
 
-## 5. Integration into `assemble_tiles`
+# ✔ **Objective 3 — Reduce WCS & Reproject warning noise**
 
-The current `assemble_tiles` function performs:
+Astropy occasionally emits:
 
-* direct placement of tiles into `mosaic_sum`,
-* additive weights,
-* no advanced blending.
+* `'WCS.all_world2pix' failed to converge…`
+* `Reproject encountered WCS convergence issues; retrying with distortion-stripped WCS.`
 
-You must refactor `assemble_tiles` (or introduce a new function it calls) to:
+These are expected and handled, but spam the console.
 
-1. Load all tiles into memory in a controlled way (or process in batches if necessary).
-2. Build the **TilePhotometryInfo** objects with corrected data and masks.
-3. Perform:
+### Requirements
 
-   * invalid zone masking,
-   * overlap regression → global gain/offset calibration,
-   * SWarp-like background adjustment,
-   * multi-resolution blending for overlapping regions.
-4. Fill the global mosaic via:
+1. Wrap calls to:
 
-   * per-tile placement using the masks,
-   * ensuring each pixel uses:
+   * `_compute_frame_footprint`
+   * `_reproject_frame_to_tile` → internally uses `reproject_interp`
+   * any `WCS.world_to_pixel` applied repeatedly
 
-     * a weighted blend of all overlapping tiles,
-     * with photometrically corrected data.
+in:
 
-Make sure:
+```python
+with warnings.catch_warnings():
+    warnings.filterwarnings("ignore", category=UserWarning, message=".*all_world2pix.*")
+    warnings.filterwarnings("ignore", category=UserWarning, message=".*Reproject encountered WCS.*")
+```
 
-* All shapes `(H, W, C)` are consistent.
-* BBox clamping & offsets (already implemented) remain correct and robust.
-* No broadcasting errors are reintroduced.
+2. When such events occur, emit **one** log entry:
 
----
+```
+[GRID] WCS convergence degraded for frame XYZ (distortion-stripped WCS used)
+```
 
-## 6. Performance considerations
-
-* The example datasets may have tens to hundreds of tiles; design algorithms that are:
-
-  * O(N_tiles) or O(N_overlaps) in time,
-  * memory-aware (avoid storing huge 4D arrays if unnecessary).
-* Prefer iterative / local optimization over full dense matrices when possible.
-* Add logs like:
-
-  ```text
-  [GRID] Photometry: built overlap graph with X edges
-  [GRID] Photometry: solved global gain/offset for N tiles
-  [GRID] Blending: applied pyramidal blending on M overlaps
-  ```
+3. Classic pipeline handling of WCS must remain **unchanged**.
 
 ---
 
-## 7. Fallback behavior & safety
+# ✔ **Integration Constraints**
 
-If any of these advanced steps fail (e.g. cannot build pyramids, regression unstable):
+* Modify only Grid/Survey code paths (`grid_mode.py`).
 
-* Log a clear `[GRID]` warning.
-* Fall back to a simpler behavior:
+* `zemosaic_worker.py` may be edited **only to call** the new RGB equalization stage or add logging.
 
-  * e.g. per-tile background normalization + linear blending without pyramids.
-* Never crash the Grid mode or the entire worker.
+* Do not modify:
 
-Do NOT modify the classic (non-Grid) pipeline.
+  * clustering logic,
+  * master tiles,
+  * Phase 3 processing,
+  * TwoPass renorm.
+
+* All logs created must be tagged:
+
+```
+[GRID]
+```
+
+* No API breakage, no GUI changes required.
 
 ---
 
-## 8. Deliverables summary
+# ✔ **Deliverables**
 
 You must deliver:
 
-* [ ] New helper functions in `grid_mode.py` for:
+* [ ] A NaN-safe statistical layer for background matching
+* [ ] A NaN-safe overlap regression system
+* [ ] A new `grid_post_equalize_rgb()` function
+* [ ] Integration of color correction into Grid mode
+* [ ] Unified suppression/normalization of WCS warnings
+* [ ] Clean logs with meaningful `[GRID]` diagnostics
+* [ ] Zero impact on the classic ZeMosaic pipeline.
 
-  * valid mask,
-  * background estimation,
-  * overlap regression,
-  * pyramidal blending.
-* [ ] A refactored `assemble_tiles` (or new equivalent) that:
-
-  * uses masks,
-  * applies global photometric calibration,
-  * uses multi-resolution blending,
-  * handles invalid data cleanly.
-* [ ] `[GRID]` logs summarizing:
-
-  * number of tiles,
-  * number of overlaps,
-  * photometry calibration steps,
-  * blending operations.
-* [ ] No regressions in classic pipeline.
+Failure to compute a correction must always fall back to identity (gain=1, offset=0).
 

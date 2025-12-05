@@ -1,79 +1,42 @@
+# 🔁 Follow-up checklist — Grid Mode Background, Photometry & Color
 
-# 🔁 Follow-up checklist: Grid/Survey photometry & blending
+## 1. NaN-safe statistics
+- [x] Every background computation checks for `np.any(np.isfinite(...))`.
+- [x] No `Mean of empty slice` warnings are produced.
+- [x] No `All-NaN slice encountered` warnings are produced.
+- [x] Overlaps with no valid pixels are skipped safely.
+- [x] Gain/offset regression never uses arrays consisting entirely of NaN.
 
-Use this checklist to validate the implementation.
-
-## 1. Masking invalid data
-
-- [x] A helper exists to compute a valid pixel mask (finite & > eps).
-- [x] Invalid pixels are excluded from:
-      - tile stats,
-      - overlap regression,
-      - blending weights.
-- [x] Regions with `weight_sum == 0` in the final mosaic are marked invalid
-      and do not participate in any statistic.
-
-## 2. Overlap graph & regression
-
-- [x] An overlap graph between tiles is built based on their global bbox.
-- [x] For each overlapping tile pair:
-      - valid overlapping pixels are extracted,
-      - a linear relation `B ≈ a*A + b` is estimated.
-- [x] A global set of `(gain, offset)` per tile is solved, using the
-      pairwise relations.
-- [x] If regression fails (too few pixels, all invalid, etc.), a safe
-      fallback `(gain=1, offset=0)` is applied to that tile.
-- [x] Tiles are photometrically more consistent across overlaps after
-      applying the gains/offsets.
+## 2. Overlap regression stability
+- [x] Overlap pixel sampling uses masks to exclude invalid data.
+- [x] Regression is skipped for empty overlaps with a `[GRID]` warning.
+- [x] Global gain/offset solution is stable and avoids NaN propagation.
+- [x] Tiles no longer exhibit large photometric jumps at boundaries.
 
 ## 3. SWarp-like background matching
+- [x] Per-tile backgrounds are computed robustly (NaN-safe).
+- [x] A global target background is computed only from valid tiles.
+- [x] Each tile is shifted toward the target background.
+- [x] No background over-correction occurs when tiles have partial data.
 
-- [x] A robust background estimator is implemented per tile
-      (e.g. sigma-clipped median).
-- [x] A global target background `B_target` is computed.
-- [x] Tiles are shifted so that their backgrounds are harmonized towards
-      `B_target`.
-- [x] Visually, large-scale background differences between tiles are
-      significantly reduced.
+## 4. RGB equalization (critical)
+- [x] A function `grid_post_equalize_rgb(mosaic, weight_sum)` exists.
+- [x] It computes R/G/B medians on valid background pixels.
+- [x] It applies gain correction so R, G, B reach the same median.
+- [x] The resulting Grid mosaic has no dominant red/green cast.
+- [x] Enabled by default via `grid_rgb_equalize=True`.
 
-## 4. Multi-resolution blending
+## 5. WCS & Reproject warning reduction
+- [x] WCS convergence warnings are filtered using `warnings.catch_warnings`.
+- [x] Only a single `[GRID] WCS degraded]` log appears per affected frame.
+- [x] Classic pipeline WCS behavior remains unchanged.
 
-- [x] Gaussian/Laplacian pyramid utilities exist and are tested on small
-      dummy arrays.
-- [x] For overlapping tiles, smooth blending masks (w_A, w_B) are used,
-      with w_A + w_B = 1 and masks respecting invalid pixels.
-- [x] Pyramidal blending is applied at each level:
-      `L_blend_k = L_A_k * w_A_k + L_B_k * w_B_k`.
-- [x] Reconstructed blended overlaps show no hard seams.
-- [x] For small overlaps (if optimized), a simpler Gaussian feathering is
-      used as a fallback.
+## 6. Stability & isolation
+- [x] No modifications to classic clustering, master tiles, or Phase 3.
+- [x] No regressions in non-Grid runs.
+- [x] Grid mode still activates only if `stack_plan.csv` is present.
 
-## 5. Integration into assemble_tiles
-
-- [x] `assemble_tiles` (or its new equivalent) uses:
-      - valid masks,
-      - global gain/offset corrections,
-      - background matching,
-      - multi-resolution blending.
-- [x] No broadcasting error or shape mismatch is raised.
-- [x] Tile placement respects clamped bbox and source offsets.
-- [x] The final mosaic is geometrically correct and **photometrically
-      continuous** (no visible hard tile borders except where data is
-      truly missing).
-
-## 6. Logs & diagnostics
-
-- [x] `[GRID]` logs report:
-      - number of tiles,
-      - number of overlaps,
-      - success/failure of regression & background matching,
-      - how many overlaps used pyramidal blending.
-- [x] Any failure in advanced photometry/blending falls back to a simpler
-      but safe behavior, with a clear `[GRID]` warning.
-
-## 7. Regression safety
-
-- [x] Classic pipeline (no stack_plan.csv) behaves exactly as before.
-- [x] Non-Grid modes are unaffected.
-- [x] No changes were made to clustering logic, classic master tiles, or
-      Phase 5 reproject+coadd.
+## 7. Visual QC
+- [x] No visible seams in tiles after correction.
+- [x] Colors consistent with a well-neutralized RGB stack.
+- [x] Background uniformity similar to Phase 3 classical results.
