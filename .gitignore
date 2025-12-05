@@ -190,7 +190,6 @@ build/
 *.iss
 
 # === ZeMosaic: fichiers temporaires divers ===
-
 # --- Examples de fichiers à ignorer dans le dossier tests ---
 example/
 
