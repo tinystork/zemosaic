@@ -59,7 +59,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from zemosaic_utils import debayer_image, load_and_validate_fits
+from zemosaic_utils import debayer_image, load_and_validate_fits, save_fits_image
 
 try:  # Optional heavy deps – handled gracefully if missing
     from astropy.io import fits
@@ -172,7 +172,13 @@ def _open_fits_safely(path: Path):
 
 
 def _ensure_hwc_array(data: np.ndarray) -> np.ndarray:
-    """Return data as HxWxC, squeezing extras and converting 2D to 3D."""
+    """Return ``data`` as float32 ``H x W x C``.
+
+    Input images may be ``H x W``, ``H x W x C`` (channels-last) or ``C x H x W``
+    (channels-first). Extra singleton dimensions are squeezed and a lone
+    channel dimension is appended for monochrome inputs so downstream code can
+    consistently treat images as HWC.
+    """
 
     arr = np.asarray(data)
     if arr.ndim > 3:
@@ -187,6 +193,42 @@ def _ensure_hwc_array(data: np.ndarray) -> np.ndarray:
     if arr.ndim == 2:
         arr = arr[..., np.newaxis]
     return arr.astype(np.float32, copy=False)
+
+
+def _log_image_stats(
+    *,
+    label: str,
+    array: np.ndarray,
+    callback: ProgressCallback = None,
+    prefix: str = "DEBUG_SHAPE_WRITE",
+) -> None:
+    """Emit a standardized ``[GRID]`` log describing array shape and per-channel stats."""
+
+    arr = np.asarray(array)
+    stats: list[str] = []
+    if arr.ndim == 3:
+        for idx in range(arr.shape[-1]):
+            plane = arr[..., idx]
+            finite = np.isfinite(plane)
+            if np.any(finite):
+                cmin = float(np.nanmin(plane[finite]))
+                cmax = float(np.nanmax(plane[finite]))
+            else:
+                cmin = float("nan")
+                cmax = float("nan")
+            stats.append(f"c{idx}:min={cmin:.6g} max={cmax:.6g}")
+    else:
+        finite = np.isfinite(arr)
+        if np.any(finite):
+            stats.append(f"min={float(np.nanmin(arr[finite])):.6g} max={float(np.nanmax(arr[finite])):.6g}")
+        else:
+            stats.append("min=nan max=nan")
+    stats_str = ", ".join(stats)
+    _emit(
+        f"{prefix} {label} shape={arr.shape} dtype={arr.dtype} stats=[{stats_str}]",
+        lvl="DEBUG",
+        callback=callback,
+    )
 
 
 @dataclass
@@ -1057,6 +1099,8 @@ def assign_frames_to_tiles(frames: Iterable[FrameInfo], tiles: Iterable[GridTile
 def _load_image_with_optional_alpha(
     path: Path, *, progress_callback: ProgressCallback = None
 ) -> tuple[np.ndarray, np.ndarray | None]:
+    """Load a FITS frame as float32 ``H x W x C`` plus optional alpha mask."""
+
     if not (_ASTROPY_AVAILABLE and fits):
         raise RuntimeError("Astropy FITS support unavailable")
     data = None
@@ -1181,6 +1225,8 @@ def _reproject_frame_to_tile(
     *,
     progress_callback: ProgressCallback = None,
     ) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Reproject a frame to the tile footprint, returning HWC data and a 2-D footprint."""
+
     if not (_REPROJECT_AVAILABLE and reproject_interp):
         return None, None
     if frame.wcs is None:
@@ -1323,10 +1369,13 @@ def _normalize_patches(
 ) -> tuple[list[np.ndarray], float]:
     """Scale each patch using the requested normalization method.
 
-    ``method`` mirrors the classic stacker choices: ``"median"`` / ``"none"`` /
-    ``"linear_fit"``. When ``reference_median`` is provided it is reused so that
-    multiple chunks share the same photometric reference. The value used is
-    returned so callers can pass it back on the next invocation.
+    ``patches`` are expected to be homogeneous arrays shaped ``H x W x C`` (or
+    ``H x W`` for monochrome) so per-channel gains preserve the RGB structure
+    during stacking. ``method`` mirrors the classic stacker choices:
+    ``"median"`` / ``"none"`` / ``"linear_fit"``. When ``reference_median`` is
+    provided it is reused so that multiple chunks share the same photometric
+    reference. The value used is returned so callers can pass it back on the
+    next invocation.
     """
 
     if not patches:
@@ -1383,7 +1432,12 @@ def _stack_weighted_patches(
     return_weight_sum: bool = False,
     return_ref_median: bool = False,
 ) -> np.ndarray | tuple | None:
-    """Stack patches with optional sigma clipping and shared photometric anchor."""
+    """Stack patches with optional sigma clipping and shared photometric anchor.
+
+    ``patches`` and ``weights`` must be aligned ``H x W x C`` (or ``H x W``) to
+    ensure combination happens per channel. The output preserves this layout and
+    stays in float32 for downstream processing.
+    """
 
     if not patches:
         return None
@@ -1579,21 +1633,24 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
         header = tile.wcs.to_header() if hasattr(tile.wcs, "to_header") else None  # type: ignore[attr-defined]
     except Exception:
         header = None
-    output_data = stacked
-    if config.legacy_rgb_cube and stacked.ndim == 3 and stacked.shape[-1] in (1, 3):
-        output_data = np.moveaxis(stacked, -1, 0)
-        _emit(
-            f"Tile {tile.tile_id}: legacy_rgb_cube=True -> data shape {output_data.shape}",
-            lvl="DEBUG",
-            callback=progress_callback,
-        )
-    _emit(
-        f"Tile {tile.tile_id}: writing FITS shape={output_data.shape} dtype={output_data.dtype}",
-        lvl="DEBUG",
+    output_data = np.asarray(stacked, dtype=np.float32, copy=False)
+    axis_order = "HWC" if output_data.ndim == 3 else None
+    _log_image_stats(
+        label=f"tile_{tile.tile_id:04d}.fits",
+        array=output_data,
         callback=progress_callback,
     )
     try:
-        fits.writeto(output_path, output_data.astype(np.float32), header=header, overwrite=True)
+        save_fits_image(
+            image_data=output_data,
+            output_path=str(output_path),
+            header=header,
+            overwrite=True,
+            save_as_float=True,
+            legacy_rgb_cube=config.legacy_rgb_cube,
+            progress_callback=progress_callback,
+            axis_order=axis_order,
+        )
     except Exception as exc:
         _emit(f"Tile {tile.tile_id}: failed to write FITS ({exc})", lvl="ERROR", callback=progress_callback)
         return None
@@ -2451,23 +2508,24 @@ def assemble_tiles(
             header = grid.global_wcs.to_header() if hasattr(grid.global_wcs, "to_header") else None  # type: ignore[attr-defined]
         except Exception:
             header = None
-        output_data = mosaic
-        if legacy_rgb_cube and output_data.ndim == 3 and output_data.shape[-1] in (1, 3):
-            output_data = np.moveaxis(output_data, -1, 0)
-        output_dtype = np.uint16 if save_final_as_uint16 else np.float32
-        output_data = output_data.astype(output_dtype)
-        _emit(
-            (
-                "Mosaic: writing FITS "
-                f"shape={output_data.shape} dtype={output_data.dtype} "
-                f"legacy_rgb_cube={legacy_rgb_cube} save_uint16={save_final_as_uint16}"
-            ),
-            lvl="DEBUG",
+        output_data = np.asarray(mosaic, dtype=np.float32, copy=False)
+        axis_order = "HWC" if output_data.ndim == 3 else None
+        _log_image_stats(
+            label=Path(output_path).name,
+            array=output_data,
             callback=progress_callback,
         )
         try:
-            fits.writeto(output_path, output_data, header=header, overwrite=True)
-            # Save weight map for diagnostics
+            save_fits_image(
+                image_data=output_data,
+                output_path=str(output_path),
+                header=header,
+                overwrite=True,
+                save_as_float=not save_final_as_uint16,
+                legacy_rgb_cube=legacy_rgb_cube,
+                progress_callback=progress_callback,
+                axis_order=axis_order,
+            )
             try:
                 weight_hdu = fits.ImageHDU(weight_sum.astype(np.float32), name="WEIGHT")
                 with fits.open(output_path, mode="append", memmap=False, do_not_scale_image_data=True) as hdul:
