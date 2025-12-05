@@ -97,10 +97,15 @@ except Exception:  # pragma: no cover - optional dependency
     _NDIMAGE_AVAILABLE = False
 
 try:
-    from zemosaic_align_stack import _reject_outliers_kappa_sigma, _reject_outliers_winsorized_sigma_clip
+    from zemosaic_align_stack import (
+        _reject_outliers_kappa_sigma,
+        _reject_outliers_winsorized_sigma_clip,
+        equalize_rgb_medians_inplace,
+    )
 except Exception:  # pragma: no cover - worker remains functional without rejection helpers
     _reject_outliers_kappa_sigma = None
     _reject_outliers_winsorized_sigma_clip = None
+    equalize_rgb_medians_inplace = None
 
 logger = logging.getLogger("zemosaic.grid_mode")
 if not logger.handlers:
@@ -220,6 +225,7 @@ class GridModeConfig:
     stack_kappa_high: float = 3.0
     winsor_limits: tuple[float, float] = (0.05, 0.05)
     stack_final_combine: str = "mean"
+    stack_chunk_budget_mb: float = 512.0
     apply_radial_weight: bool = False
     radial_feather_fraction: float = 0.8
     radial_shape_power: float = 2.0
@@ -906,33 +912,56 @@ def _compute_frame_weight(frame: FrameInfo, patch: np.ndarray, footprint: np.nda
     return exposure_w * bortle_w * max(snr, 1e-3)
 
 
-def _normalize_patches(patches: list[np.ndarray]) -> list[np.ndarray]:
+def _normalize_patches(
+    patches: list[np.ndarray],
+    reference_median: float | None = None,
+) -> tuple[list[np.ndarray], float]:
+    """Scale each patch to a common median.
+
+    When ``reference_median`` is provided it is reused so that multiple chunks
+    share the same photometric reference. The value used is returned so callers
+    can pass it back on the next invocation.
+    """
+
     if not patches:
-        return patches
-    ref_patch = patches[0]
-    finite = np.isfinite(ref_patch)
-    ref_median = float(np.nanmedian(ref_patch[finite])) if np.any(finite) else 1.0
-    ref_median = ref_median if math.isfinite(ref_median) and ref_median != 0 else 1.0
+        return [], reference_median if reference_median is not None else 1.0
+    ref_median = reference_median
+    if ref_median is None:
+        ref_patch = patches[0]
+        finite = np.isfinite(ref_patch)
+        ref_median = float(np.nanmedian(ref_patch[finite])) if np.any(finite) else 1.0
+        ref_median = ref_median if math.isfinite(ref_median) and ref_median != 0 else 1.0
+
     normalized: list[np.ndarray] = []
     for patch in patches:
         patch_norm = patch
         finite_patch = np.isfinite(patch_norm)
         med = float(np.nanmedian(patch_norm[finite_patch])) if np.any(finite_patch) else ref_median
         med = med if math.isfinite(med) and med != 0 else ref_median
-        patch_norm = patch_norm * (ref_median / med)
+        try:
+            scale = ref_median / med
+        except Exception:
+            scale = 1.0
+        patch_norm = patch_norm * scale
         normalized.append(patch_norm.astype(np.float32, copy=False))
-    return normalized
+    return normalized, float(ref_median)
 
 
 def _stack_weighted_patches(
     patches: list[np.ndarray],
     weights: list[np.ndarray],
     config: GridModeConfig,
-) -> np.ndarray | None:
+    *,
+    reference_median: float | None = None,
+    return_weight_sum: bool = False,
+    return_ref_median: bool = False,
+) -> np.ndarray | tuple | None:
+    """Stack patches with optional sigma clipping and shared photometric anchor."""
+
     if not patches:
         return None
     # Ensure shapes match and promote to float32
-    normalized = _normalize_patches(patches)
+    normalized, ref_median_used = _normalize_patches(patches, reference_median)
     data_stack = np.stack(normalized, axis=0).astype(np.float32, copy=False)
     weight_stack = np.stack(weights, axis=0).astype(np.float32, copy=False)
     data_stack = np.where(weight_stack > 0, data_stack, np.nan)
@@ -962,14 +991,22 @@ def _stack_weighted_patches(
     weight_sum = np.sum(weight_effective, axis=0)
     valid_positions = np.any(finite_mask, axis=0)
     if not np.any(valid_positions):
-        return np.zeros(data_for_combine.shape[1:], dtype=np.float32)
-    if config.stack_final_combine.lower().strip() == "median":
-        median_input = np.where(valid_positions[np.newaxis, ...], data_for_combine, 0.0)
-        result = np.nanmedian(median_input, axis=0)
+        empty = np.zeros(data_for_combine.shape[1:], dtype=np.float32)
+        outputs = [empty]
     else:
-        with np.errstate(divide="ignore", invalid="ignore"):
-            result = np.sum(data_masked * weight_effective, axis=0) / np.clip(weight_sum, 1e-6, None)
-    return result.astype(np.float32, copy=False)
+        if config.stack_final_combine.lower().strip() == "median":
+            median_input = np.where(valid_positions[np.newaxis, ...], data_for_combine, 0.0)
+            result = np.nanmedian(median_input, axis=0)
+        else:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                result = np.sum(data_masked * weight_effective, axis=0) / np.clip(weight_sum, 1e-6, None)
+        outputs = [result.astype(np.float32, copy=False)]
+
+    if return_weight_sum:
+        outputs.append(weight_sum.astype(np.float32, copy=False))
+    if return_ref_median:
+        outputs.append(ref_median_used)
+    return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
 
 def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, progress_callback: ProgressCallback = None) -> Path | None:
@@ -985,6 +1022,60 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
     tile_shape = (tile.bbox[3] - tile.bbox[2], tile.bbox[1] - tile.bbox[0])
     aligned_patches: list[np.ndarray] = []
     weight_maps: list[np.ndarray] = []
+    # Keep the working set bounded so very large stacks (thousands of frames)
+    # do not explode memory usage.
+    try:
+        budget_mb = float(getattr(config, "stack_chunk_budget_mb", 512.0) or 512.0)
+    except Exception:
+        budget_mb = 512.0
+    if budget_mb <= 0:
+        budget_mb = 512.0
+    target_chunk_bytes = max(64.0, budget_mb) * 1024 * 1024
+    per_frame_bytes: float | None = None
+    chunk_limit = len(tile.frames)
+    running_sum: np.ndarray | None = None
+    running_weight: np.ndarray | None = None
+    reference_median: float | None = None
+    chunk_failed = False
+
+    def flush_chunk() -> None:
+        """Stack the current chunk and fold it into the running accumulator."""
+
+        nonlocal running_sum, running_weight, reference_median, chunk_failed
+        if chunk_failed or not aligned_patches:
+            aligned_patches.clear()
+            weight_maps.clear()
+            return
+        res = _stack_weighted_patches(
+            aligned_patches,
+            weight_maps,
+            config,
+            reference_median=reference_median,
+            return_weight_sum=True,
+            return_ref_median=True,
+        )
+        if not isinstance(res, tuple) or len(res) < 2:
+            chunk_failed = True
+            _emit(f"Tile {tile.tile_id}: stacking failed for chunk", lvl="ERROR", callback=progress_callback)
+        else:
+            stacked_chunk = res[0]
+            weight_sum = res[1]
+            ref_med_out = res[2] if len(res) >= 3 else reference_median
+            if stacked_chunk is None or weight_sum is None:
+                chunk_failed = True
+                _emit(f"Tile {tile.tile_id}: stacking failed for chunk", lvl="ERROR", callback=progress_callback)
+            else:
+                if ref_med_out is not None:
+                    reference_median = ref_med_out
+                weighted = stacked_chunk * weight_sum
+                if running_sum is None:
+                    running_sum = weighted
+                    running_weight = weight_sum
+                else:
+                    running_sum = running_sum + weighted
+                    running_weight = running_weight + weight_sum
+        aligned_patches.clear()
+        weight_maps.clear()
 
     for frame in tile.frames:
         patch, footprint = _reproject_frame_to_tile(frame, tile, tile_shape, progress_callback=progress_callback)
@@ -996,17 +1087,39 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
         if patch.ndim == 3 and weight_map.ndim == 2:
             weight_map = np.repeat(weight_map[..., np.newaxis], patch.shape[-1], axis=2)
         weight_map *= weight_scalar
+
+        if per_frame_bytes is None:
+            per_frame_bytes = float(patch.nbytes + weight_map.nbytes)
+            per_frame_bytes = per_frame_bytes if per_frame_bytes > 0 else float(patch.size * 4)
+            chunk_limit = int(target_chunk_bytes // max(per_frame_bytes, 1.0))
+            if chunk_limit <= 0:
+                chunk_limit = 1
+            chunk_limit = min(chunk_limit, len(tile.frames))
+            # Cap the chunk to avoid stacking too many frames at once even if the budget allows it.
+            if len(tile.frames) > 256:
+                chunk_limit = min(chunk_limit, 256)
+            if len(tile.frames) > chunk_limit:
+                est_chunk_mb = (per_frame_bytes * chunk_limit) / (1024 ** 2)
+                _emit(
+                    f"Tile {tile.tile_id}: chunked stacking enabled "
+                    f"({len(tile.frames)} frames -> chunk_size={chunk_limit}, ~{est_chunk_mb:.1f} MB)",
+                    callback=progress_callback,
+                )
         aligned_patches.append(patch)
         weight_maps.append(weight_map)
+        if len(aligned_patches) >= chunk_limit:
+            flush_chunk()
+            if chunk_failed:
+                break
 
-    if not aligned_patches:
+    flush_chunk()
+    if chunk_failed or running_sum is None or running_weight is None:
         _emit(f"Tile {tile.tile_id}: no usable patches", lvl="WARN", callback=progress_callback)
         return None
 
-    stacked = _stack_weighted_patches(aligned_patches, weight_maps, config)
-    if stacked is None:
-        _emit(f"Tile {tile.tile_id}: stacking failed", lvl="ERROR", callback=progress_callback)
-        return None
+    with np.errstate(divide="ignore", invalid="ignore"):
+        stacked = running_sum / np.clip(running_weight, 1e-6, None)
+    stacked = np.where(np.isfinite(stacked), stacked, 0.0).astype(np.float32, copy=False)
 
     tiles_dir = output_dir / "tiles"
     try:
@@ -1056,74 +1169,86 @@ def grid_post_equalize_rgb(
     background_percentile: float = 30.0,
     progress_callback: ProgressCallback = None,
 ) -> np.ndarray:
-    """Equalize RGB channels on low-signal pixels where ``weight_sum > 0``."""
+    """Equalize RGB channels using the classic median logic on valid pixels."""
 
     arr = np.asarray(mosaic, dtype=np.float32)
     weights = np.asarray(weight_sum, dtype=np.float32) if weight_sum is not None else None
-    if arr.ndim != 3 or arr.shape[-1] != 3 or weights is None:
-        return arr
-    if weights.ndim == 2:
-        weights = np.repeat(weights[..., np.newaxis], 3, axis=2)
-    valid = np.isfinite(arr) & (weights > 0)
-    valid_any = np.any(valid, axis=2)
-    if not np.any(valid_any):
-        _emit("RGB equalization skipped: no valid pixels", lvl="WARN", callback=progress_callback)
+    if arr.ndim != 3 or arr.shape[-1] != 3:
+        _emit("RGB equalization: skipped (non-RGB mosaic)", lvl="DEBUG", callback=progress_callback)
         return arr
 
-    sum_vals = np.sum(np.where(valid, arr, 0.0), axis=2)
-    counts = np.sum(valid.astype(np.float32), axis=2)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        luminance = np.where(counts > 0, sum_vals / np.clip(counts, 1e-6, None), np.nan)
-    lum_finite = luminance[np.isfinite(luminance)]
-    if lum_finite.size == 0:
-        _emit("RGB equalization skipped: no valid background sample", lvl="WARN", callback=progress_callback)
-        return arr
-
-    background_percentile = float(min(max(background_percentile, 0.0), 100.0))
     try:
-        cutoff = float(np.percentile(lum_finite, background_percentile))
-    except Exception:
-        cutoff = float("nan")
-    if not math.isfinite(cutoff):
-        _emit("RGB equalization skipped: percentile failed", lvl="WARN", callback=progress_callback)
-        return arr
-    bg_mask_2d = np.isfinite(luminance) & (luminance <= cutoff) & valid_any
-    if not np.any(bg_mask_2d):
-        bg_mask_2d = valid_any
+        arr_work = np.array(arr, dtype=np.float32, copy=True)
+        weight_mask = None
+        if weights is not None:
+            try:
+                if weights.ndim == 2:
+                    weights = weights[..., np.newaxis]
+                if weights.ndim == 3 and weights.shape[-1] == 1:
+                    weights = np.repeat(weights, 3, axis=2)
+                weights = np.broadcast_to(weights, arr_work.shape)
+                weight_mask = (weights > 0) & np.isfinite(weights)
+            except Exception:
+                weight_mask = None
 
-    medians = []
-    for c in range(3):
-        chan_mask = bg_mask_2d & valid[..., c]
-        vals = arr[..., c][chan_mask]
-        vals = vals[np.isfinite(vals)]
-        if vals.size == 0:
-            medians.append(float("nan"))
-        else:
-            medians.append(float(np.median(vals)))
-    medians_arr = np.asarray(medians, dtype=np.float32)
-    finite_chan = np.isfinite(medians_arr)
-    if not np.any(finite_chan):
-        _emit("RGB equalization skipped: no finite channel medians", lvl="WARN", callback=progress_callback)
-        return arr
-    target = float(np.mean(medians_arr[finite_chan]))
-    if not math.isfinite(target) or abs(target) < 1e-6:
-        _emit("RGB equalization skipped: invalid target median", lvl="WARN", callback=progress_callback)
-        return arr
+        valid = np.isfinite(arr_work)
+        if weight_mask is not None:
+            valid = valid & weight_mask
+        if not np.any(valid):
+            _emit("RGB equalization: skipped (no valid pixels)", lvl="WARN", callback=progress_callback)
+            return arr
 
-    gains = np.ones(3, dtype=np.float32)
-    for c in range(3):
-        med_c = medians_arr[c]
-        if math.isfinite(med_c) and abs(med_c) >= 1e-6:
-            gains[c] = target / med_c
-    equalized = arr.copy()
-    for c in range(3):
-        mask_c = valid[..., c]
-        if not np.any(mask_c):
-            continue
-        equalized[..., c][mask_c] = arr[..., c][mask_c] * gains[c]
+        arr_work = np.where(valid, arr_work, np.nan)
 
-    _emit("Photometry: applied Grid RGB equalization", callback=progress_callback)
-    return equalized
+        medians: list[float] = []
+        counts: list[int] = []
+        for c in range(3):
+            vals = arr_work[..., c]
+            vals = vals[np.isfinite(vals)]
+            counts.append(int(vals.size))
+            medians.append(float(np.median(vals)) if vals.size else float("nan"))
+
+        medians_arr = np.asarray(medians, dtype=np.float32)
+        if any(count == 0 for count in counts):
+            _emit("RGB equalization: skipped (channel missing valid pixels)", lvl="WARN", callback=progress_callback)
+            return arr
+        finite_chan = np.isfinite(medians_arr) & (medians_arr > 0)
+        if not np.any(finite_chan):
+            _emit("RGB equalization: skipped (no finite positive channel medians)", lvl="WARN", callback=progress_callback)
+            return arr
+        target = float(np.nanmedian(medians_arr[finite_chan]))
+        if not math.isfinite(target) or abs(target) < 1e-6:
+            _emit("RGB equalization: skipped (invalid target median)", lvl="WARN", callback=progress_callback)
+            return arr
+
+        try:
+            if equalize_rgb_medians_inplace:
+                equalized = arr_work.copy()
+                gain_r, gain_g, gain_b, target_used = equalize_rgb_medians_inplace(equalized)
+                gains = np.array([gain_r, gain_g, gain_b], dtype=np.float32)
+                if not math.isfinite(target_used):
+                    target_used = target
+                target = target_used
+            else:
+                gains = np.ones(3, dtype=np.float32)
+                gains[finite_chan] = target / medians_arr[finite_chan]
+                equalized = arr_work * gains.reshape((1, 1, 3))
+        except Exception as exc:
+            _emit(f"RGB equalization: skipped (error during equalization: {exc})", lvl="WARN", callback=progress_callback)
+            return arr
+
+        _emit(
+            "RGB equalization: applied (reused classic poststack_equalize_rgb); "
+            f"gains=({gains[0]:.6f},{gains[1]:.6f},{gains[2]:.6f}), "
+            f"medians=({medians_arr[0]:.6g},{medians_arr[1]:.6g},{medians_arr[2]:.6g}), "
+            f"target={target:.6g}",
+            lvl="INFO",
+            callback=progress_callback,
+        )
+        return equalized
+    except Exception as exc:
+        _emit(f"RGB equalization: skipped (unexpected error: {exc})", lvl="WARN", callback=progress_callback)
+        return arr
 
 
 def build_tile_overlap_graph(tiles: List[TilePhotometryInfo], mosaic_shape_hw: tuple[int, int]) -> List[TileOverlap]:
@@ -1649,7 +1774,18 @@ def assemble_tiles(
     with np.errstate(divide="ignore", invalid="ignore"):
         mosaic = np.where(weight_sum > 0, mosaic_sum / np.clip(weight_sum, 1e-6, None), np.nan)
     if grid_rgb_equalize and mosaic.ndim == 3 and mosaic.shape[-1] == 3:
+        _emit(
+            f"RGB equalization: calling grid_post_equalize_rgb (shape={mosaic.shape})",
+            lvl="DEBUG",
+            callback=progress_callback,
+        )
         mosaic = grid_post_equalize_rgb(mosaic, weight_sum, progress_callback=progress_callback)
+    else:
+        _emit(
+            f"RGB equalization: skipped (grid_rgb_equalize={grid_rgb_equalize}, shape={mosaic.shape})",
+            lvl="DEBUG",
+            callback=progress_callback,
+        )
     if mosaic.shape[-1] == 1 and not legacy_rgb_cube:
         mosaic = mosaic[..., 0]
         weight_sum = weight_sum[..., 0]
@@ -1725,6 +1861,21 @@ def run_grid_mode(
             grid_rgb_equalize = bool(rgb_cfg)
     except Exception:
         grid_rgb_equalize = bool(grid_rgb_equalize)
+    chunk_budget_mb = 512.0
+    try:
+        gb_val = cfg_disk.get("grid_chunk_ram_gb")
+        if gb_val is not None:
+            chunk_budget_mb = float(gb_val) * 1024.0
+    except Exception:
+        pass
+    try:
+        mb_val = cfg_disk.get("grid_chunk_ram_mb", cfg_disk.get("grid_chunk_ram"))
+        if mb_val is not None:
+            chunk_budget_mb = float(mb_val)
+    except Exception:
+        pass
+    if chunk_budget_mb <= 0:
+        chunk_budget_mb = 512.0
 
     config = GridModeConfig(
         grid_size_factor=grid_size_factor,
@@ -1736,6 +1887,7 @@ def run_grid_mode(
         stack_kappa_high=stack_kappa_high,
         winsor_limits=winsor_limits,
         stack_final_combine=stack_final_combine,
+        stack_chunk_budget_mb=chunk_budget_mb,
         apply_radial_weight=apply_radial_weight,
         radial_feather_fraction=radial_feather_fraction,
         radial_shape_power=radial_shape_power,
