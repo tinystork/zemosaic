@@ -622,6 +622,36 @@ def _frame_fov_deg(frame: FrameInfo) -> float | None:
     return max(h, w) * px_scale
 
 
+def _is_degenerate_global_wcs(
+    frames: list[FrameInfo],
+    global_wcs: object,
+    global_shape_hw: tuple[int, int],
+) -> bool:
+    """Return ``True`` when the proposed global WCS is clearly too small."""
+
+    try:
+        h_m, w_m = (int(global_shape_hw[0]), int(global_shape_hw[1]))
+    except Exception:
+        return True
+
+    MIN_SIZE = 256
+    if h_m < MIN_SIZE or w_m < MIN_SIZE:
+        return True
+
+    valid_frames = [f for f in frames if getattr(f, "shape_hw", None)]
+    if valid_frames:
+        try:
+            mean_h = int(np.mean([f.shape_hw[0] for f in valid_frames]))  # type: ignore[index]
+            mean_w = int(np.mean([f.shape_hw[1] for f in valid_frames]))  # type: ignore[index]
+        except Exception:
+            mean_h = mean_w = 0
+        if mean_h > 0 and mean_w > 0:
+            if h_m < 0.5 * mean_h or w_m < 0.5 * mean_w:
+                return True
+
+    return False
+
+
 def _strip_wcs_distortion(wcs_obj: object) -> object:
     """Return a copy of ``wcs_obj`` without SIP/CPDIS/DET2IM distortions."""
 
@@ -651,6 +681,75 @@ def _strip_wcs_distortion(wcs_obj: object) -> object:
     except Exception:
         pass
     return wcs_copy
+
+
+def _pick_first_valid_frame(frames: list[FrameInfo]) -> FrameInfo:
+    """Return the first frame carrying both WCS and shape information."""
+
+    for frame in frames:
+        if getattr(frame, "wcs", None) is not None and getattr(frame, "shape_hw", None):
+            return frame
+    raise RuntimeError("[GRID] fallback WCS: no valid frame with WCS/shape")
+
+
+def _build_fallback_global_wcs(
+    frames: list[FrameInfo], *, progress_callback: ProgressCallback = None
+) -> tuple[object, tuple[int, int], list[tuple[int, int, int, int]], tuple[int, int]]:
+    """Construct a conservative global WCS from one valid frame."""
+
+    base_frame = _pick_first_valid_frame(frames)
+    try:
+        base_wcs = copy.deepcopy(base_frame.wcs)
+    except Exception:
+        base_wcs = base_frame.wcs
+
+    fallback_wcs = _strip_wcs_distortion(base_wcs)
+    bounds_with_frames: list[tuple[FrameInfo, tuple[float, float, float, float]]] = []
+    for frame in frames:
+        if frame.wcs is None or frame.shape_hw is None:
+            continue
+        fp = _compute_frame_footprint(frame, fallback_wcs, progress_callback=progress_callback)
+        if fp is None:
+            _emit(
+                f"[GRID] fallback WCS: skipping frame {frame.path} (invalid footprint)",
+                lvl="WARN",
+                callback=progress_callback,
+            )
+            continue
+        bounds_with_frames.append((frame, fp))
+
+    if not bounds_with_frames:
+        raise RuntimeError("[GRID] fallback WCS: could not compute any footprint")
+
+    bounds = [b for _, b in bounds_with_frames]
+    min_x = math.floor(min(b[0] for b in bounds))
+    max_x = math.ceil(max(b[1] for b in bounds))
+    min_y = math.floor(min(b[2] for b in bounds))
+    max_y = math.ceil(max(b[3] for b in bounds))
+
+    width = int(max_x - min_x)
+    height = int(max_y - min_y)
+    global_shape_hw = (height, width)
+    offset_x, offset_y = int(min_x), int(min_y)
+
+    local_bounds: list[tuple[int, int, int, int]] = []
+    for frame, fp in bounds_with_frames:
+        fx0, fx1, fy0, fy1 = fp
+        local_fp = (
+            int(round(fx0 - offset_x)),
+            int(round(fx1 - offset_x)),
+            int(round(fy0 - offset_y)),
+            int(round(fy1 - offset_y)),
+        )
+        frame.footprint = local_fp
+        local_bounds.append(local_fp)
+
+    _emit(
+        f"[GRID] fallback WCS bounds from {len(bounds)} frame(s): shape_hw={global_shape_hw}",
+        callback=progress_callback,
+    )
+
+    return fallback_wcs, global_shape_hw, local_bounds, (offset_x, offset_y)
 
 
 def _compute_frame_footprint(frame: FrameInfo, global_wcs: object, *, progress_callback: ProgressCallback = None) -> tuple[float, float, float, float] | None:
@@ -757,6 +856,8 @@ def build_global_grid(
         except Exception:
             target_resolution = None
 
+    fallback_bounds: list[tuple[int, int, int, int]] | None = None
+    fallback_offset = (0, 0)
     try:
         global_wcs, global_shape_hw = find_optimal_celestial_wcs(
             inputs_for_wcs,
@@ -784,7 +885,29 @@ def build_global_grid(
             callback=progress_callback,
         )
 
-    if global_wcs is not None:
+    if global_wcs is not None and global_shape_hw is not None:
+        if _is_degenerate_global_wcs(usable_frames, global_wcs, global_shape_hw):
+            _emit(
+                f"[GRID] Optimal global WCS looks degenerate (shape_hw={global_shape_hw}), falling back to safer WCS",
+                lvl="WARN",
+                callback=progress_callback,
+            )
+            try:
+                global_wcs, global_shape_hw, fallback_bounds, fallback_offset = _build_fallback_global_wcs(
+                    usable_frames, progress_callback=progress_callback
+                )
+                _emit(
+                    f"[GRID] Fallback global WCS: shape_hw={global_shape_hw} (bounds from {len(fallback_bounds)} frame(s))",
+                    callback=progress_callback,
+                )
+            except Exception as exc:
+                fallback_bounds = None
+                fallback_offset = (0, 0)
+                _emit(f"[GRID] Fallback global WCS construction failed ({exc})", lvl="WARN", callback=progress_callback)
+        else:
+            _emit(f"[GRID] Optimal global WCS accepted: shape_hw={global_shape_hw}", callback=progress_callback)
+
+    if global_wcs is not None and fallback_bounds is None:
         global_wcs = _strip_wcs_distortion(global_wcs)
 
     if global_wcs is None or global_shape_hw is None:
@@ -801,54 +924,67 @@ def build_global_grid(
     overlap_fraction = max(0.0, min(0.9, float(overlap_fraction)))
     step_px = max(1, int(round(tile_size_px * (1.0 - overlap_fraction))))
 
-    global_bounds = []
-    for frame in usable_frames:
-        fp = _compute_frame_footprint(frame, global_wcs, progress_callback=progress_callback)
-        frame.footprint = fp
-        if fp is not None:
-            global_bounds.append(fp)
-    if global_bounds:
-        min_x = int(math.floor(min(b[0] for b in global_bounds)))
-        max_x = int(math.ceil(max(b[1] for b in global_bounds)))
-        min_y = int(math.floor(min(b[2] for b in global_bounds)))
-        max_y = int(math.ceil(max(b[3] for b in global_bounds)))
-        offset_x = min_x
-        offset_y = min_y
-        width = int(math.ceil(max_x - min_x))
-        height = int(math.ceil(max_y - min_y))
-        if width <= 0 or height <= 0:
-            _emit(
-                "[GRID] Invalid global bounds computed (non-positive extent), aborting grid construction",
-                lvl="ERROR",
-                callback=progress_callback,
-            )
-            return None
-        global_shape_hw = (height, width)
-        _emit(
-            f"[GRID] global_bounds count={len(global_bounds)}, min_x={min_x}, max_x={max_x}, min_y={min_y}, max_y={max_y}",
-            callback=progress_callback,
-        )
-        _emit(
-            f"[GRID] global canvas shape_hw={global_shape_hw}, offset=({offset_x}, {offset_y})",
-            callback=progress_callback,
-        )
-        local_bounds: list[tuple[int, int, int, int]] = []
-        for frame in usable_frames:
-            if frame.footprint is None:
-                continue
-            fx0, fx1, fy0, fy1 = frame.footprint
-            local_fp = (
-                int(round(fx0 - offset_x)),
-                int(round(fx1 - offset_x)),
-                int(round(fy0 - offset_y)),
-                int(round(fy1 - offset_y)),
-            )
-            frame.footprint = local_fp
-            local_bounds.append(local_fp)
-        global_bounds = local_bounds
+    offset_x, offset_y = fallback_offset
+    if fallback_bounds is not None:
+        global_bounds = fallback_bounds
+        min_x = offset_x
+        min_y = offset_y
+        max_x = offset_x + int(math.ceil(max(b[1] for b in global_bounds)))
+        max_y = offset_y + int(math.ceil(max(b[3] for b in global_bounds)))
+        if global_shape_hw == (0, 0):
+            width = int(math.ceil(max_x - min_x))
+            height = int(math.ceil(max_y - min_y))
+            global_shape_hw = (height, width)
     else:
-        _emit("[GRID] No valid footprints available to define global bounds", lvl="ERROR", callback=progress_callback)
-        return None
+        global_bounds = []
+        for frame in usable_frames:
+            fp = _compute_frame_footprint(frame, global_wcs, progress_callback=progress_callback)
+            frame.footprint = fp
+            if fp is not None:
+                global_bounds.append(fp)
+        if global_bounds:
+            min_x = int(math.floor(min(b[0] for b in global_bounds)))
+            max_x = int(math.ceil(max(b[1] for b in global_bounds)))
+            min_y = int(math.floor(min(b[2] for b in global_bounds)))
+            max_y = int(math.ceil(max(b[3] for b in global_bounds)))
+            offset_x = min_x
+            offset_y = min_y
+            width = int(math.ceil(max_x - min_x))
+            height = int(math.ceil(max_y - min_y))
+            if width <= 0 or height <= 0:
+                _emit(
+                    "[GRID] Invalid global bounds computed (non-positive extent), aborting grid construction",
+                    lvl="ERROR",
+                    callback=progress_callback,
+                )
+                return None
+            global_shape_hw = (height, width)
+            local_bounds: list[tuple[int, int, int, int]] = []
+            for frame in usable_frames:
+                if frame.footprint is None:
+                    continue
+                fx0, fx1, fy0, fy1 = frame.footprint
+                local_fp = (
+                    int(round(fx0 - offset_x)),
+                    int(round(fx1 - offset_x)),
+                    int(round(fy0 - offset_y)),
+                    int(round(fy1 - offset_y)),
+                )
+                frame.footprint = local_fp
+                local_bounds.append(local_fp)
+            global_bounds = local_bounds
+        else:
+            _emit("[GRID] No valid footprints available to define global bounds", lvl="ERROR", callback=progress_callback)
+            return None
+
+    _emit(
+        f"[GRID] global_bounds count={len(global_bounds)}, min_x={min_x}, max_x={max_x}, min_y={min_y}, max_y={max_y}",
+        callback=progress_callback,
+    )
+    _emit(
+        f"[GRID] global canvas shape_hw={global_shape_hw}, offset=({offset_x}, {offset_y})",
+        callback=progress_callback,
+    )
 
     tiles: list[GridTile] = []
     min_x_local = 0

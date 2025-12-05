@@ -16,7 +16,7 @@
 
 ## Tâches
 
-### [ ] 1. Ajouter `_is_degenerate_global_wcs(...)` dans `grid_mode.py`
+### [x] 1. Ajouter `_is_degenerate_global_wcs(...)` dans `grid_mode.py`
 
 - Implémenter la fonction :
 
@@ -34,7 +34,7 @@
 
 ---
 
-### [ ] 2. Ajouter `_pick_first_valid_frame(...)` & `_build_fallback_global_wcs(...)`
+### [x] 2. Ajouter `_pick_first_valid_frame(...)` & `_build_fallback_global_wcs(...)`
 
 * Implémenter `_pick_first_valid_frame(frames)` qui :
 
@@ -59,7 +59,7 @@
 
 ---
 
-### [ ] 3. Intégrer le garde-fou dans `build_global_grid(...)`
+### [x] 3. Intégrer le garde-fou dans `build_global_grid(...)`
 
 * Localiser l’appel à `find_optimal_celestial_wcs(...)` dans `build_global_grid`.
 
@@ -92,7 +92,7 @@
 
 ---
 
-### [ ] 4. Vérifier la cohérence avec le reste du Grid mode
+### [x] 4. Vérifier la cohérence avec le reste du Grid mode
 
 * Confirmer que :
 
@@ -102,7 +102,7 @@
 
 ---
 
-### [ ] 5. Ajouter / compléter les logs `[GRID]`
+### [x] 5. Ajouter / compléter les logs `[GRID]`
 
 * Vérifier que les nouveaux logs suivants existent :
 
