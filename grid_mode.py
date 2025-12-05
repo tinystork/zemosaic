@@ -107,9 +107,10 @@ except Exception:  # pragma: no cover - worker remains functional without reject
     _reject_outliers_winsorized_sigma_clip = None
     equalize_rgb_medians_inplace = None
 
-logger = logging.getLogger("zemosaic.grid_mode")
-if not logger.handlers:
-    logger.addHandler(logging.NullHandler())
+logger = logging.getLogger("ZeMosaicWorker").getChild("grid_mode")
+# Propagate to the worker logger without attaching a NullHandler so Grid messages
+# share the same output stream.
+logger.propagate = True
 
 _DEGRADED_WCS_FRAMES: set[str] = set()
 

@@ -6,11 +6,12 @@ This file tracks the progress of the Grid mode mission described in `agent.md`.
 
 ### A. Grid mode logging integration
 
-- [ ] A1 – Replace the `NullHandler`-based logger in `grid_mode.py` so that `_emit(...)` logs go to the same place as `ZeMosaicWorker`:
+- [x] A1 – Replace the `NullHandler`-based logger in `grid_mode.py` so that `_emit(...)` logs go to the same place as `ZeMosaicWorker`:
   - Use either the `"ZeMosaicWorker"` logger or ensure `"zemosaic.grid_mode"` propagates to a non-null parent.
   - Remove any `NullHandler` that swallows messages.
-- [ ] A2 – Ensure `_emit(...)` consistently prefixes messages with `"[GRID]"` (if not already done).
-- [ ] A3 – Add a small logging smoke test (e.g. `tests/test_grid_mode_logging.py`) that verifies `_emit(...)` output is captured by a handler attached to the main logger.
+- [x] A2 – Ensure `_emit(...)` consistently prefixes messages with `"[GRID]"` (if not already done).
+- [x] A3 – Add a small logging smoke test (e.g. `tests/test_grid_mode_logging.py`) that verifies `_emit(...)` output is captured by a handler attached to the main logger.
+  - Notes: Grid-mode logger now uses the `ZeMosaicWorker` hierarchy directly, and a pytest smoke test captures the `[GRID]` message via `caplog`.
 
 ### B. Assembly robustness and explicit logs
 
