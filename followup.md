@@ -1,97 +1,150 @@
-# ZeMosaic – Grid / Survey mode hardening – Follow-up
+# ✅ Suivi des tâches — Grid Mode & WCS global
 
-This file tracks the progress of the Grid mode mission described in `agent.md`.
+## Instructions pour Codex
 
-## Checklist
-
-### A. Grid mode logging integration
-
-- [x] A1 – Replace the `NullHandler`-based logger in `grid_mode.py` so that `_emit(...)` logs go to the same place as `ZeMosaicWorker`:
-  - Use either the `"ZeMosaicWorker"` logger or ensure `"zemosaic.grid_mode"` propagates to a non-null parent.
-  - Remove any `NullHandler` that swallows messages.
-- [x] A2 – Ensure `_emit(...)` consistently prefixes messages with `"[GRID]"` (if not already done).
-- [x] A3 – Add a small logging smoke test (e.g. `tests/test_grid_mode_logging.py`) that verifies `_emit(...)` output is captured by a handler attached to the main logger.
-  - Notes: Grid-mode logger now uses the `ZeMosaicWorker` hierarchy directly, and a pytest smoke test captures the `[GRID]` message via `caplog`.
-
-### B. Assembly robustness and explicit logs
-
-- [x] B1 – In `assemble_tiles(...)`, add/verify logs for:
-  - Computing `tiles_list` and handling the case where `len(tiles_list) == 0`.
-  - I/O failures for tiles (`Assembly: failed to read ...`).
-  - Channel mismatch skips.
-  - Empty valid-mask skips.
-  - Final summary of kept tiles and failure counts.
-- [x] B2 – Ensure the “no tile infos” case:
-  - Logs an explicit error summarizing `attempted`, `io_fail`, `channel_mismatch`, `empty_mask`, `kept=0`.
-  - Returns `None` (no exceptions raised from inside `assemble_tiles`).
-- [x] B3 – Make salvage mode logging explicit:
-  - Log when salvage starts (no valid data in initial mosaic).
-  - Log whether salvage succeeded or failed.
-  - On salvage failure, return `None` with a clear log message.
-- [x] B4 – On successful assembly:
-  - Log the final mosaic `shape` and `dtype` before writing FITS.
-- [x] B5 – Add at least one test case exercising assembly robustness:
-  - Case with mixed valid and invalid tiles → assembly succeeds and logs skips.
-  - Case with all tiles invalid → `assemble_tiles(...)` returns `None` and logs a detailed failure summary.
-
-### C. RGB equalization parity (Grid vs classic)
-
-- [x] C1 – Review and, if needed, refactor `grid_post_equalize_rgb(...)` in `grid_mode.py` so that:
-  - It uses `equalize_rgb_medians_inplace(...)` from `zemosaic_align_stack.py` where available.
-  - Its behaviour (medians, gains) matches the classic pipeline’s logic.
-- [x] C1 – Review and, if needed, refactor `grid_post_equalize_rgb(...)` in `grid_mode.py` so that:
-  - It uses `equalize_rgb_medians_inplace(...)` from `zemosaic_align_stack.py` where available.
-  - Its behaviour (medians, gains) matches the classic pipeline’s logic.
-- [x] C2 – Add detailed logs around RGB equalization in Grid mode:
-  - Before calling `grid_post_equalize_rgb(...)`:
-    - Log that RGB equalization is being invoked, with mosaic shape and weight shape.
-  - Inside `grid_post_equalize_rgb(...)`:
-    - Log when equalization is applied, including gains, medians, and target.
-    - Log all skip reasons (non-RGB, no valid pixels, missing channel, invalid target, error).
-- [x] C3 – Ensure `grid_rgb_equalize` flag precedence is well-defined and documented:
-  - Config (`grid_rgb_equalize` on disk) vs. parameter vs. default.
-  - Log the final effective value and its source as `enabled=..., source=...`.
-- [x] C4 – In `zemosaic_worker.py`:
-  - Introduce a clearly named `grid_rgb_equalize_flag` derived from the same config/UI semantics as `poststack_equalize_rgb` (or sensibly documented).
-  - Log the value and source in the Grid branch.
-  - Pass it explicitly as `grid_rgb_equalize=grid_rgb_equalize_flag` to `grid_mode.run_grid_mode(...)`.
-- [x] C5 – Add a unit test (e.g. `tests/test_grid_mode_rgb_equalize.py`) to compare:
-  - `equalize_rgb_medians_inplace(arr_classic)` vs. `grid_post_equalize_rgb(arr_grid, weight_sum=None, ...)`.
-  - Assert that resulting channel medians are equal within a small tolerance.
-
-### D. Worker fallback behaviour
-
-- [x] D1 – Confirm that `run_hierarchical_mosaic(...)`:
-  - Detects Grid mode using `detect_grid_mode(...)`.
-  - Logs a line like `"[GRID] Invoking grid_mode.run_grid_mode(...) with grid_rgb_equalize=..., stack_norm=..., ..."`.
-  - Calls `grid_mode.run_grid_mode(...)` inside a `try` block.
-  - On success: returns early (does not run classic pipeline).
-- [x] D2 – On Grid mode exceptions:
-  - Logs an ERROR with `exc_info=True` and a clear message:
-    - `"[GRID] Grid/Survey mode failed, continuing with classic pipeline"`.
-  - Then continues with the classic pipeline unchanged.
-- [ ] D3 – (Optional) Add a small regression test or harness:
-  - Using a fake Grid project, verify that:
-    - Partial tile failures don’t break Grid mode.
-    - Total failure leads to a logged fallback to classic pipeline.
-
-### E. Regression & sanity checks
-
-- [ ] E1 – Run the existing test suite; fix any regressions caused by changes in logging or imports.
-- [ ] E2 – Verify that a **non-Grid** project behaves identically to the previous version:
-  - Same logs (aside from harmless extra debug).
-  - Same outputs.
-- [ ] E3 – Verify that classic pipeline RGB equalization (`poststack_equalize_rgb`) is unchanged.
-- [ ] E4 – Optionally, run a small real-world Grid project (if available) and inspect:
-  - `zemosaic_worker.log` for the new `[GRID]` messages.
-  - Final mosaic colours vs. classic pipeline (sanity check for RGB parity).
+1. Lire `agent.md` entièrement.
+2. Reprendre la liste ci-dessous et traiter la **première tâche non cochée**.
+3. Après chaque modification :
+   - Mettre à jour ce fichier `followup.md` en cochant la tâche effectuée (`[x]`),
+   - Ajouter, si utile, un court commentaire en dessous (ce qui a été fait, fichiers touchés).
+4. Répéter jusqu’à ce qu’il n’y ait plus de tâche non cochée.
 
 ---
 
-## Notes / Journal
+## Tâches
 
-Use this section to jot down important decisions, gotchas, or future ideas.
+### [ ] 1. Analyser l’existant dans `build_global_grid`
 
-- [ ] (Example) Consider a future config key to *not* raise on empty mosaic in Grid mode but silently skip Grid and go classic, if that ever becomes desirable.
-- [ ] Pytest run with `PYTHONPATH=.` currently reports pre-existing failures in phase5 blending/GPU tests (tile weight and GPU harness expectations); see test output for details.
+- Identifier comment :
+  - `global_bounds` est construit,
+  - `global_shape_hw` est calculé,
+  - `global_wcs` est choisi (optimal vs fallback),
+  - `crpix` / `crval` sont éventuellement modifiés.
+- Lister rapidement les points critiques dans un commentaire de code ou une note dans ce fichier.
+
+---
+
+### [ ] 2. Introduire l’offset global `(offset_x, offset_y)` et recalculer `global_shape_hw`
+
+- À partir de `global_bounds`, calculer :
+  - `min_x`, `max_x`, `min_y`, `max_y`,
+  - `offset_x = min_x`, `offset_y = min_y`,
+  - `width = max_x - min_x`, `height = max_y - min_y`,
+  - `global_shape_hw = (height, width)`.
+- Gérer proprement le cas où `global_bounds` est vide (log explicite + sortie clean du Grid mode si nécessaire).
+
+---
+
+### [ ] 3. Appliquer l’offset à toutes les bboxes / footprints utilisées pour les tuiles
+
+- Adapter le code pour que toutes les bboxes utilisées lors de l’assemblage soient transformées en coordonnées **locales** via :
+
+  ```python
+  local_x0 = x0 - offset_x
+  local_x1 = x1 - offset_x
+  local_y0 = y0 - offset_y
+  local_y1 = y1 - offset_y
+````
+
+* S’assurer que les structures de données qui stockent les bboxes (frames, tiles, etc.) utilisent désormais ces coordonnées locales pour le placement dans le canvas global.
+
+---
+
+### [ ] 4. Nettoyer / sécuriser la gestion de `crpix` / `crval`
+
+* Vérifier s’il existe un code qui :
+
+  * modifie `global_wcs.wcs.crpix` après coup (par ex. pour le recentrer),
+  * sans ajuster `crval`.
+* Pour cette mission :
+
+  * Soit **supprimer** ces modifications et s’appuyer uniquement sur l’offset pixel,
+  * Soit, si vraiment nécessaire, mettre à jour `crval` correctement pour conserver la géométrie (et documenter clairement ce choix).
+* Commenter dans le code que la stratégie retenue est d’utiliser un offset pixel global pour garder le WCS cohérent.
+
+---
+
+### [ ] 5. Améliorer le fallback quand `find_optimal_celestial_wcs` échoue
+
+* Lorsqu’aucun WCS optimal n’est trouvé :
+
+  * Utiliser le WCS du premier frame ou un autre WCS fallback comme actuellement,
+  * Calculer les footprints de **tous** les frames dans ce WCS,
+  * Construire `global_bounds` et appliquer la même logique :
+
+    * offset `(offset_x, offset_y)`,
+    * `global_shape_hw` dérivé des bounds.
+* Si aucun footprint valide n’est obtenable, loguer clairement et abandonner proprement le Grid mode.
+
+---
+
+### [ ] 6. Ajouter/renforcer les contrôles WCS & rejets de frames invalides
+
+* Dans `_load_frame_wcs` / `_compute_frame_footprint` :
+
+  * Rejeter les frames avec WCS incomplet / incohérent,
+  * Rejeter les footprints manifestement invalides (NaN majoritaire, taille nulle, etc.).
+* Ajouter des logs `[GRID]` pour chaque frame rejetée avec la raison.
+
+---
+
+### [ ] 7. Ajouter des logs `[GRID]` détaillés
+
+* Après tentative de `find_optimal_celestial_wcs` :
+
+  * Succès / échec + fallback.
+* Après calcul de `global_bounds` + canvas :
+
+  * `min_x`, `max_x`, `min_y`, `max_y`,
+  * `global_shape_hw`,
+  * `offset_x`, `offset_y`.
+* Pendant l’assemblage des tuiles :
+
+  * Nombre de tuiles valides,
+  * Nombre de tuiles rejetées car hors canvas,
+  * Exemple de bboxes après offset.
+
+---
+
+### [ ] 8. Tests synthétiques & validation
+
+* Si possible, ajouter un petit test (ou script) qui :
+
+  * simule quelques frames/WCS,
+  * force un échec de `find_optimal_celestial_wcs`,
+  * vérifie que :
+
+    * `global_shape_hw` est positif,
+    * l’offset est appliqué,
+    * aucune bbox finale n’est négative.
+* Documenter brièvement dans ce fichier le résultat du test (succès / observations).
+
+---
+
+### [ ] 9. Test de régression sur dataset réel (Grid mode)
+
+* Lancer le Grid mode sur le dataset réel qui produisait `bbox_extent=(-1:2,-1:2)`.
+* Vérifier :
+
+  * qu’il n’y a plus de bboxes négatives dans les logs,
+  * que la mosaïque contient des données visibles,
+  * que le message "no valid tile data written to mosaic" n’apparaît plus (sauf cas vraiment dégénérés).
+* Noter ici le résultat avec la date et le dataset utilisé.
+
+---
+
+### [ ] 10. Vérifier la non-régression des autres modes
+
+* Vérifier que :
+
+  * le pipeline classique (hors Grid mode) n’est pas affecté,
+  * le Grid mode se comporte comme avant quand `find_optimal_celestial_wcs` réussit et que les bounds sont déjà propres,
+  * les performances restent acceptables.
+* Si tout est bon, cocher cette tâche et éventuellement ajouter une note.
+
+---
+
+## Notes / Journal de bord
+
+> Ajouter ici au fil de l’eau les remarques, décisions, datasets utilisés pour les tests, etc.
 
