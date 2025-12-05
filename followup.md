@@ -8,17 +8,17 @@
 
 ### 1. Instrumentation & diagnostics
 
-- [ ] Add detailed `[GRID]` logs in `_load_image_with_optional_alpha` showing:
-  - [ ] Raw FITS data shape/dtype.
-  - [ ] Shape after `_ensure_hwc_array` (H,W,C) and channel count.
-- [ ] Add logs in `_reproject_frame_to_tile` for each frame:
-  - [ ] Frame basename, tile id, `reproj_stack.shape`.
-- [ ] Add logs in `process_tile`:
-  - [ ] Tile id, number of frames, `tile_shape`, stacked patch shape before writing.
-- [ ] Add logs in assembly phase:
-  - [ ] Mosaic canvas shape/dtype at allocation.
-  - [ ] Mosaic shape just before RGB equalization, with explicit reason when equalization is skipped.
-- [ ] Log one-line stacking config summary in `run_grid_mode` (norm, weight, reject, winsor, combine, radial params, rgb_equalize).
+- [x] Add detailed `[GRID]` logs in `_load_image_with_optional_alpha` showing:
+  - [x] Raw FITS data shape/dtype.
+  - [x] Shape after `_ensure_hwc_array` (H,W,C) and channel count.
+- [x] Add logs in `_reproject_frame_to_tile` for each frame:
+  - [x] Frame basename, tile id, `reproj_stack.shape`.
+- [x] Add logs in `process_tile`:
+  - [x] Tile id, number of frames, `tile_shape`, stacked patch shape before writing.
+- [x] Add logs in assembly phase:
+  - [x] Mosaic canvas shape/dtype at allocation.
+  - [x] Mosaic shape just before RGB equalization, with explicit reason when equalization is skipped.
+- [x] Log one-line stacking config summary in `run_grid_mode` (norm, weight, reject, winsor, combine, radial params, rgb_equalize).
 
 ### 2. FITS loading & RGB handling
 

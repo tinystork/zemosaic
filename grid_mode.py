@@ -1049,11 +1049,15 @@ def assign_frames_to_tiles(frames: Iterable[FrameInfo], tiles: Iterable[GridTile
         _emit(f"Tile {tile.tile_id}: assigned {len(tile.frames)} frame(s)", lvl="DEBUG", callback=progress_callback)
 
 
-def _load_image_with_optional_alpha(path: Path) -> tuple[np.ndarray, np.ndarray | None]:
+def _load_image_with_optional_alpha(
+    path: Path, *, progress_callback: ProgressCallback = None
+) -> tuple[np.ndarray, np.ndarray | None]:
     if not (_ASTROPY_AVAILABLE and fits):
         raise RuntimeError("Astropy FITS support unavailable")
     with _open_fits_safely(path) as hdul:
         data = hdul[0].data
+        raw_shape = getattr(data, "shape", None)
+        raw_dtype = getattr(data, "dtype", None)
         alpha_hdu = hdul["ALPHA"] if "ALPHA" in hdul else None
         alpha = None
         if alpha_hdu is not None and alpha_hdu.data is not None:
@@ -1062,6 +1066,16 @@ def _load_image_with_optional_alpha(path: Path) -> tuple[np.ndarray, np.ndarray 
             except Exception:
                 alpha = None
     arr = _ensure_hwc_array(data)
+    channels = arr.shape[-1] if arr.ndim == 3 else 1
+    _emit(
+        (
+            "DEBUG_SHAPE: loaded frame "
+            f"'{path.name}' raw_shape={raw_shape} raw_dtype={raw_dtype} "
+            f"hwc_shape={arr.shape} channels={channels}"
+        ),
+        lvl="DEBUG",
+        callback=progress_callback,
+    )
     weights = None
     if alpha is not None:
         alpha = np.squeeze(alpha)
@@ -1078,13 +1092,15 @@ def _reproject_frame_to_tile(
     tile_shape_hw: tuple[int, int],
     *,
     progress_callback: ProgressCallback = None,
-) -> tuple[np.ndarray | None, np.ndarray | None]:
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
     if not (_REPROJECT_AVAILABLE and reproject_interp):
         return None, None
     if frame.wcs is None:
         return None, None
     try:
-        data, alpha_weights = _load_image_with_optional_alpha(frame.path)
+        data, alpha_weights = _load_image_with_optional_alpha(
+            frame.path, progress_callback=progress_callback
+        )
     except Exception:
         return None, None
 
@@ -1115,6 +1131,14 @@ def _reproject_frame_to_tile(
         _log_wcs_degraded(frame, progress_callback=progress_callback)
 
     reproj_stack = np.stack(reproj_channels, axis=-1)
+    _emit(
+        (
+            "DEBUG_SHAPE: reprojection complete "
+            f"tile={tile.tile_id} frame={frame.path.name} shape={reproj_stack.shape}"
+        ),
+        lvl="DEBUG",
+        callback=progress_callback,
+    )
     footprint_combined = np.nanmax(np.stack(footprints, axis=0), axis=0)
     if alpha_weights is not None:
         try:
@@ -1256,6 +1280,14 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
         return None
 
     tile_shape = (tile.bbox[3] - tile.bbox[2], tile.bbox[1] - tile.bbox[0])
+    _emit(
+        (
+            "DEBUG_SHAPE: tile "
+            f"{tile.tile_id} start frames={len(tile.frames)} tile_shape={tile_shape}"
+        ),
+        lvl="DEBUG",
+        callback=progress_callback,
+    )
     aligned_patches: list[np.ndarray] = []
     weight_maps: list[np.ndarray] = []
     # Keep the working set bounded so very large stacks (thousands of frames)
@@ -1356,6 +1388,14 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
     with np.errstate(divide="ignore", invalid="ignore"):
         stacked = running_sum / np.clip(running_weight, 1e-6, None)
     stacked = np.where(np.isfinite(stacked), stacked, 0.0).astype(np.float32, copy=False)
+    _emit(
+        (
+            "DEBUG_SHAPE: tile "
+            f"{tile.tile_id} stacked patch shape={stacked.shape} weight_shape={running_weight.shape}"
+        ),
+        lvl="DEBUG",
+        callback=progress_callback,
+    )
 
     tiles_dir = output_dir / "tiles"
     try:
@@ -1902,6 +1942,11 @@ def assemble_tiles(
     mosaic_sum = np.zeros(mosaic_shape, dtype=np.float32)
     weight_sum = np.zeros(mosaic_shape, dtype=np.float32)
     H_m, W_m, _ = mosaic_sum.shape
+    _emit(
+        f"DEBUG_SHAPE: mosaic canvas allocated shape={mosaic_sum.shape} dtype={mosaic_sum.dtype}",
+        lvl="DEBUG",
+        callback=progress_callback,
+    )
     _emit(f"Photometry: loaded {len(tile_infos)} tiles for assembly", callback=progress_callback)
 
     overlaps = build_tile_overlap_graph(tile_infos, (H_m, W_m))
@@ -2156,7 +2201,19 @@ def assemble_tiles(
 
     with np.errstate(divide="ignore", invalid="ignore"):
         mosaic = np.where(weight_sum > 0, mosaic_sum / np.clip(weight_sum, 1e-6, None), np.nan)
-    if grid_rgb_equalize and mosaic.ndim == 3 and mosaic.shape[-1] == 3:
+    if not grid_rgb_equalize:
+        _emit(
+            f"RGB equalization: skipped (grid_rgb_equalize=False, shape={mosaic.shape})",
+            lvl="DEBUG",
+            callback=progress_callback,
+        )
+    elif mosaic.ndim != 3 or mosaic.shape[-1] != 3:
+        _emit(
+            f"RGB equalization: skipped (non-RGB mosaic shape={mosaic.shape})",
+            lvl="DEBUG",
+            callback=progress_callback,
+        )
+    else:
         weight_shape = getattr(weight_sum, "shape", None)
         _emit(
             f"RGB equalization: calling grid_post_equalize_rgb (shape={mosaic.shape}, weight_shape={weight_shape})",
@@ -2164,12 +2221,6 @@ def assemble_tiles(
             callback=progress_callback,
         )
         mosaic = grid_post_equalize_rgb(mosaic, weight_sum, progress_callback=progress_callback)
-    else:
-        _emit(
-            f"RGB equalization: skipped (grid_rgb_equalize={grid_rgb_equalize}, shape={mosaic.shape})",
-            lvl="DEBUG",
-            callback=progress_callback,
-        )
     _emit(
         f"Assembly: final mosaic prepared (shape={mosaic.shape}, dtype={mosaic.dtype})",
         callback=progress_callback,
@@ -2320,6 +2371,19 @@ def run_grid_mode(
         radial_shape_power=radial_shape_power,
         save_final_as_uint16=save_final_as_uint16,
         legacy_rgb_cube=legacy_rgb_cube,
+    )
+    _emit(
+        (
+            "Stacking config: "
+            f"norm={config.stack_norm_method}, weight={config.stack_weight_method}, "
+            f"reject={config.stack_reject_algo}, winsor={config.winsor_limits}, "
+            f"combine={config.stack_final_combine}, "
+            f"radial={config.apply_radial_weight} "
+            f"(feather={config.radial_feather_fraction}, power={config.radial_shape_power}), "
+            f"rgb_equalize={grid_rgb_equalize}"
+        ),
+        lvl="INFO",
+        callback=progress_callback,
     )
 
     csv_path = Path(input_folder).expanduser() / "stack_plan.csv"
