@@ -15,22 +15,22 @@ This file tracks the progress of the Grid mode mission described in `agent.md`.
 
 ### B. Assembly robustness and explicit logs
 
-- [ ] B1 – In `assemble_tiles(...)`, add/verify logs for:
+- [x] B1 – In `assemble_tiles(...)`, add/verify logs for:
   - Computing `tiles_list` and handling the case where `len(tiles_list) == 0`.
   - I/O failures for tiles (`Assembly: failed to read ...`).
   - Channel mismatch skips.
   - Empty valid-mask skips.
   - Final summary of kept tiles and failure counts.
-- [ ] B2 – Ensure the “no tile infos” case:
+- [x] B2 – Ensure the “no tile infos” case:
   - Logs an explicit error summarizing `attempted`, `io_fail`, `channel_mismatch`, `empty_mask`, `kept=0`.
   - Returns `None` (no exceptions raised from inside `assemble_tiles`).
-- [ ] B3 – Make salvage mode logging explicit:
+- [x] B3 – Make salvage mode logging explicit:
   - Log when salvage starts (no valid data in initial mosaic).
   - Log whether salvage succeeded or failed.
   - On salvage failure, return `None` with a clear log message.
-- [ ] B4 – On successful assembly:
+- [x] B4 – On successful assembly:
   - Log the final mosaic `shape` and `dtype` before writing FITS.
-- [ ] B5 – Add at least one test case exercising assembly robustness:
+- [x] B5 – Add at least one test case exercising assembly robustness:
   - Case with mixed valid and invalid tiles → assembly succeeds and logs skips.
   - Case with all tiles invalid → `assemble_tiles(...)` returns `None` and logs a detailed failure summary.
 
@@ -39,7 +39,10 @@ This file tracks the progress of the Grid mode mission described in `agent.md`.
 - [ ] C1 – Review and, if needed, refactor `grid_post_equalize_rgb(...)` in `grid_mode.py` so that:
   - It uses `equalize_rgb_medians_inplace(...)` from `zemosaic_align_stack.py` where available.
   - Its behaviour (medians, gains) matches the classic pipeline’s logic.
-- [ ] C2 – Add detailed logs around RGB equalization in Grid mode:
+- [x] C1 – Review and, if needed, refactor `grid_post_equalize_rgb(...)` in `grid_mode.py` so that:
+  - It uses `equalize_rgb_medians_inplace(...)` from `zemosaic_align_stack.py` where available.
+  - Its behaviour (medians, gains) matches the classic pipeline’s logic.
+- [x] C2 – Add detailed logs around RGB equalization in Grid mode:
   - Before calling `grid_post_equalize_rgb(...)`:
     - Log that RGB equalization is being invoked, with mosaic shape and weight shape.
   - Inside `grid_post_equalize_rgb(...)`:
@@ -52,7 +55,7 @@ This file tracks the progress of the Grid mode mission described in `agent.md`.
   - Introduce a clearly named `grid_rgb_equalize_flag` derived from the same config/UI semantics as `poststack_equalize_rgb` (or sensibly documented).
   - Log the value and source in the Grid branch.
   - Pass it explicitly as `grid_rgb_equalize=grid_rgb_equalize_flag` to `grid_mode.run_grid_mode(...)`.
-- [ ] C5 – Add a unit test (e.g. `tests/test_grid_mode_rgb_equalize.py`) to compare:
+- [x] C5 – Add a unit test (e.g. `tests/test_grid_mode_rgb_equalize.py`) to compare:
   - `equalize_rgb_medians_inplace(arr_classic)` vs. `grid_post_equalize_rgb(arr_grid, weight_sum=None, ...)`.
   - Assert that resulting channel medians are equal within a small tolerance.
 

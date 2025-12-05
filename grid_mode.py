@@ -1174,8 +1174,13 @@ def grid_post_equalize_rgb(
 
     arr = np.asarray(mosaic, dtype=np.float32)
     weights = np.asarray(weight_sum, dtype=np.float32) if weight_sum is not None else None
+    weight_shape = getattr(weights, "shape", None)
     if arr.ndim != 3 or arr.shape[-1] != 3:
-        _emit("RGB equalization: skipped (non-RGB mosaic)", lvl="DEBUG", callback=progress_callback)
+        _emit(
+            f"RGB equalization: skipped (non-RGB mosaic with shape={arr.shape})",
+            lvl="DEBUG",
+            callback=progress_callback,
+        )
         return arr
 
     try:
@@ -1195,8 +1200,13 @@ def grid_post_equalize_rgb(
         valid = np.isfinite(arr_work)
         if weight_mask is not None:
             valid = valid & weight_mask
-        if not np.any(valid):
-            _emit("RGB equalization: skipped (no valid pixels)", lvl="WARN", callback=progress_callback)
+        valid_pixels = int(np.count_nonzero(valid))
+        if valid_pixels == 0:
+            _emit(
+                f"RGB equalization: skipped (no valid pixels, weight_shape={weight_shape})",
+                lvl="WARN",
+                callback=progress_callback,
+            )
             return arr
 
         arr_work = np.where(valid, arr_work, np.nan)
@@ -1211,18 +1221,31 @@ def grid_post_equalize_rgb(
 
         medians_arr = np.asarray(medians, dtype=np.float32)
         if any(count == 0 for count in counts):
-            _emit("RGB equalization: skipped (channel missing valid pixels)", lvl="WARN", callback=progress_callback)
+            _emit(
+                "RGB equalization: skipped (channel missing valid pixels)",
+                lvl="WARN",
+                callback=progress_callback,
+            )
             return arr
         finite_chan = np.isfinite(medians_arr) & (medians_arr > 0)
         if not np.any(finite_chan):
-            _emit("RGB equalization: skipped (no finite positive channel medians)", lvl="WARN", callback=progress_callback)
+            _emit(
+                "RGB equalization: skipped (no finite positive channel medians)",
+                lvl="WARN",
+                callback=progress_callback,
+            )
             return arr
         target = float(np.nanmedian(medians_arr[finite_chan]))
         if not math.isfinite(target) or abs(target) < 1e-6:
-            _emit("RGB equalization: skipped (invalid target median)", lvl="WARN", callback=progress_callback)
+            _emit(
+                f"RGB equalization: skipped (invalid target median={target})",
+                lvl="WARN",
+                callback=progress_callback,
+            )
             return arr
 
         try:
+            helper_used = bool(equalize_rgb_medians_inplace)
             if equalize_rgb_medians_inplace:
                 equalized = arr_work.copy()
                 gain_r, gain_g, gain_b, target_used = equalize_rgb_medians_inplace(equalized)
@@ -1239,10 +1262,13 @@ def grid_post_equalize_rgb(
             return arr
 
         _emit(
-            "RGB equalization: applied (reused classic poststack_equalize_rgb); "
-            f"gains=({gains[0]:.6f},{gains[1]:.6f},{gains[2]:.6f}), "
-            f"medians=({medians_arr[0]:.6g},{medians_arr[1]:.6g},{medians_arr[2]:.6g}), "
-            f"target={target:.6g}",
+            (
+                "RGB equalization: applied "
+                + ("(classic helper); " if helper_used else "(manual medians); ")
+                + f"gains=({gains[0]:.6f},{gains[1]:.6f},{gains[2]:.6f}), "
+                + f"medians=({medians_arr[0]:.6g},{medians_arr[1]:.6g},{medians_arr[2]:.6g}), "
+                + f"counts={counts}, target={target:.6g}, weight_shape={weight_shape}"
+            ),
             lvl="INFO",
             callback=progress_callback,
         )
@@ -1549,11 +1575,24 @@ def assemble_tiles(
 
     tiles_seq = list(tiles)
     tiles_list = [t for t in tiles_seq if t.output_path and t.output_path.is_file()]
+    missing_outputs = max(0, len(tiles_seq) - len(tiles_list))
+    _emit(
+        (
+            "Assembly: scanning tiles for output files "
+            f"(received={len(tiles_seq)}, with_files={len(tiles_list)}, missing_outputs={missing_outputs})"
+        ),
+        lvl="DEBUG",
+        callback=progress_callback,
+    )
     if not tiles_list:
         sample_paths = [str(t.output_path) for t in tiles_seq if getattr(t, "output_path", None)]
         sample_preview = ", ".join(sample_paths[:3]) if sample_paths else "<no paths>"
         _emit(
-            f"No tiles to assemble (len(tiles)={len(tiles_seq)}, len(tiles_list)=0). Sample output paths: {sample_preview}",
+            (
+                "No tiles to assemble; none of the expected outputs were found. "
+                f"Assembly summary: received={len(tiles_seq)}, with_files=0, io_fail=0, "
+                f"channel_mismatch=0, empty_mask=0, kept=0. Sample output paths: {sample_preview}"
+            ),
             lvl="ERROR",
             callback=progress_callback,
         )
@@ -1616,8 +1655,9 @@ def assemble_tiles(
 
     _emit(
         (
-            f"Assembly: {len(tile_infos)} tiles kept "
-            f"(io_fail={io_failures}, channel_mismatch={channel_mismatches}, empty_mask={empty_masks})"
+            "Assembly summary: "
+            f"attempted={len(tiles_list)}, io_fail={io_failures}, channel_mismatch={channel_mismatches}, "
+            f"empty_mask={empty_masks}, kept={len(tile_infos)}"
         ),
         callback=progress_callback,
     )
@@ -1882,8 +1922,9 @@ def assemble_tiles(
     with np.errstate(divide="ignore", invalid="ignore"):
         mosaic = np.where(weight_sum > 0, mosaic_sum / np.clip(weight_sum, 1e-6, None), np.nan)
     if grid_rgb_equalize and mosaic.ndim == 3 and mosaic.shape[-1] == 3:
+        weight_shape = getattr(weight_sum, "shape", None)
         _emit(
-            f"RGB equalization: calling grid_post_equalize_rgb (shape={mosaic.shape})",
+            f"RGB equalization: calling grid_post_equalize_rgb (shape={mosaic.shape}, weight_shape={weight_shape})",
             lvl="DEBUG",
             callback=progress_callback,
         )
@@ -1894,6 +1935,10 @@ def assemble_tiles(
             lvl="DEBUG",
             callback=progress_callback,
         )
+    _emit(
+        f"Assembly: final mosaic prepared (shape={mosaic.shape}, dtype={mosaic.dtype})",
+        callback=progress_callback,
+    )
     if mosaic.shape[-1] == 1 and not legacy_rgb_cube:
         mosaic = mosaic[..., 0]
         weight_sum = weight_sum[..., 0]
