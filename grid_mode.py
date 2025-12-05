@@ -1992,13 +1992,37 @@ def run_grid_mode(
     radial_shape_power: float = 2.0,
     save_final_as_uint16: bool = False,
     legacy_rgb_cube: bool = False,
-    grid_rgb_equalize: bool = True,
+    grid_rgb_equalize: bool | None = True,
 ) -> None:
     """Main entry point for Grid/Survey mode."""
 
+    def _coerce_bool_flag(value: object) -> bool | None:
+        """Interpret truthy/falsy flags from config, UI, or defaults."""
+
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value != 0
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if not normalized:
+                return None
+            if normalized in {"1", "true", "yes", "on", "enable", "enabled"}:
+                return True
+            if normalized in {"0", "false", "no", "off", "disable", "disabled"}:
+                return False
+        try:
+            return bool(value)
+        except Exception:
+            return None
+
     _emit("Grid/Survey mode activated (stack_plan.csv detected)", callback=progress_callback)
     cfg_disk = _load_config_from_disk()
-    rgb_source = "param"
+    # Precedence: on-disk config (grid_rgb_equalize/poststack_equalize_rgb) →
+    # caller parameter → built-in default (True).
+    rgb_source = "default" if grid_rgb_equalize is None else "param"
     try:
         overlap_fraction = float(cfg_disk.get("batch_overlap_pct", 0.0)) / 100.0
     except Exception:
@@ -2008,15 +2032,22 @@ def run_grid_mode(
     except Exception:
         grid_size_factor = 1.0
     try:
-        rgb_cfg = cfg_disk.get("grid_rgb_equalize", grid_rgb_equalize)
-        if "grid_rgb_equalize" in cfg_disk:
+        rgb_cfg = _coerce_bool_flag(cfg_disk.get("grid_rgb_equalize"))
+        if rgb_cfg is None:
+            rgb_cfg = _coerce_bool_flag(cfg_disk.get("poststack_equalize_rgb"))
+        if rgb_cfg is not None:
+            grid_rgb_equalize = rgb_cfg
             rgb_source = "config"
-        if isinstance(rgb_cfg, str):
-            grid_rgb_equalize = rgb_cfg.strip().lower() not in {"0", "false", "no", "off"}
+        if grid_rgb_equalize is None:
+            grid_rgb_equalize = True
         else:
-            grid_rgb_equalize = bool(rgb_cfg)
+            parsed_param = _coerce_bool_flag(grid_rgb_equalize)
+            if parsed_param is not None:
+                grid_rgb_equalize = parsed_param
     except Exception:
-        grid_rgb_equalize = bool(grid_rgb_equalize)
+        grid_rgb_equalize = True if grid_rgb_equalize is None else bool(grid_rgb_equalize)
+
+    grid_rgb_equalize = bool(grid_rgb_equalize)
     _emit(
         f"Grid mode RGB equalization: enabled={grid_rgb_equalize} (source={rgb_source})",
         lvl="INFO",
