@@ -47,6 +47,7 @@ invoked when a ``stack_plan.csv`` file is present in the input folder."""
 
 from __future__ import annotations
 
+import concurrent.futures
 import copy
 import csv
 import logging
@@ -104,6 +105,14 @@ except Exception:  # pragma: no cover - optional dependency
     _NDIMAGE_AVAILABLE = False
 
 try:
+    import cupy as cp
+
+    _CUPY_AVAILABLE = True
+except Exception:  # pragma: no cover - GPU libraries missing
+    cp = None
+    _CUPY_AVAILABLE = False
+
+try:
     from zemosaic_align_stack import (
         _reject_outliers_kappa_sigma,
         _reject_outliers_winsorized_sigma_clip,
@@ -113,6 +122,11 @@ except Exception:  # pragma: no cover - worker remains functional without reject
     _reject_outliers_kappa_sigma = None
     _reject_outliers_winsorized_sigma_clip = None
     equalize_rgb_medians_inplace = None
+
+try:
+    from zemosaic_stack_core import stack_core
+except Exception:
+    stack_core = None
 
 logger = logging.getLogger("ZeMosaicWorker").getChild("grid_mode")
 # Propagate to the worker logger without attaching a NullHandler so Grid messages
@@ -285,6 +299,7 @@ class GridModeConfig:
     radial_shape_power: float = 2.0
     save_final_as_uint16: bool = False
     legacy_rgb_cube: bool = False
+    use_gpu: bool = False
 
 
 @dataclass
@@ -1366,6 +1381,44 @@ def _fit_linear_scale(ref_patch: np.ndarray, patch: np.ndarray) -> tuple[np.ndar
     return np.asarray(slopes, dtype=np.float32), np.asarray(intercepts, dtype=np.float32)
 
 
+def _fit_linear_scale_gpu(ref_patch: cp.ndarray, patch: cp.ndarray) -> tuple[cp.ndarray, cp.ndarray]:
+    """Estimate per-channel linear transform aligning ``patch`` to ``ref_patch`` (GPU version)."""
+
+    ref_arr = cp.asarray(ref_patch, dtype=cp.float32)
+    patch_arr = cp.asarray(patch, dtype=cp.float32)
+    if ref_arr.ndim == 2:
+        ref_arr = ref_arr[..., cp.newaxis]
+    if patch_arr.ndim == 2:
+        patch_arr = patch_arr[..., cp.newaxis]
+    if ref_arr.shape != patch_arr.shape:
+        return cp.ones(ref_arr.shape[-1:], dtype=cp.float32), cp.zeros(ref_arr.shape[-1:], dtype=cp.float32)
+
+    ref_flat = ref_arr.reshape(-1, ref_arr.shape[-1])
+    patch_flat = patch_arr.reshape(-1, patch_arr.shape[-1])
+    finite = cp.isfinite(ref_flat) & cp.isfinite(patch_flat)
+    slopes = cp.ones(ref_arr.shape[-1:], dtype=cp.float32)
+    intercepts = cp.zeros(ref_arr.shape[-1:], dtype=cp.float32)
+    for c in range(ref_arr.shape[-1]):
+        mask_c = finite[:, c]
+        if not cp.any(mask_c):
+            slopes[c] = 1.0
+            intercepts[c] = 0.0
+            continue
+        x = patch_flat[mask_c, c]
+        y = ref_flat[mask_c, c]
+        x_mean = float(cp.nanmean(x))
+        y_mean = float(cp.nanmean(y))
+        var = float(cp.nanvar(x))
+        cov = float(cp.nanmean((x - x_mean) * (y - y_mean))) if var > 0 else 0.0
+        slope = cov / var if var > 0 else 1.0
+        slope = slope if math.isfinite(slope) and slope != 0 else 1.0
+        intercept = y_mean - slope * x_mean
+        intercept = intercept if math.isfinite(intercept) else 0.0
+        slopes[c] = slope
+        intercepts[c] = intercept
+    return slopes, intercepts
+
+
 def _normalize_patches(
     patches: list[np.ndarray],
     reference_median: float | None = None,
@@ -1428,6 +1481,59 @@ def _normalize_patches(
     return normalized, float(ref_median)
 
 
+def _normalize_patches_gpu(
+    patches: list[cp.ndarray],
+    reference_median: float | None = None,
+    *,
+    method: str = "median",
+) -> tuple[list[cp.ndarray], float]:
+    """Scale each patch using the requested normalization method (GPU version)."""
+
+    if not patches:
+        default_ref = reference_median if reference_median is not None else 1.0
+        return [], default_ref
+
+    method_norm = (method or "median").strip().lower()
+    ref_patch = patches[0]
+    ref_finite = cp.isfinite(ref_patch)
+    ref_median = reference_median
+    if ref_median is None:
+        ref_median = float(cp.nanmedian(ref_patch[ref_finite])) if cp.any(ref_finite) else 1.0
+        ref_median = ref_median if math.isfinite(ref_median) and ref_median != 0 else 1.0
+
+    normalized: list[cp.ndarray] = []
+    if method_norm in {"none", "unit", "unity"}:
+        ref_used = ref_median if ref_median is not None else 1.0
+        normalized = [cp.asarray(p, dtype=cp.float32) for p in patches]
+        return normalized, float(ref_used)
+
+    if method_norm in {"linear_fit", "linear"}:
+        slopes, intercepts = _fit_linear_scale_gpu(cp.asarray(ref_patch), cp.asarray(ref_patch))
+        ref_used = float(ref_median)
+        for patch in patches:
+            try:
+                s, b = _fit_linear_scale_gpu(ref_patch, patch)
+            except Exception:
+                s, b = slopes, intercepts
+            patch_norm = (cp.asarray(patch, dtype=cp.float32, copy=False) * s.reshape((1, 1, -1))) + b.reshape((1, 1, -1))
+            normalized.append(patch_norm.astype(cp.float32, copy=False))
+        return normalized, float(ref_used)
+
+    # Default: median scaling
+    for patch in patches:
+        patch_arr = cp.asarray(patch, dtype=cp.float32, copy=False)
+        finite_patch = cp.isfinite(patch_arr)
+        med = float(cp.nanmedian(patch_arr[finite_patch])) if cp.any(finite_patch) else ref_median
+        med = med if math.isfinite(med) and med != 0 else ref_median
+        try:
+            scale = ref_median / med
+        except Exception:
+            scale = 1.0
+        patch_norm = patch_arr * scale
+        normalized.append(patch_norm.astype(cp.float32, copy=False))
+    return normalized, float(ref_median)
+
+
 def _stack_weighted_patches(
     patches: list[np.ndarray],
     weights: list[np.ndarray],
@@ -1452,51 +1558,180 @@ def _stack_weighted_patches(
         reference_median,
         method=config.stack_norm_method,
     )
-    data_stack = np.stack(normalized, axis=0).astype(np.float32, copy=False)
-    weight_stack = np.stack(weights, axis=0).astype(np.float32, copy=False)
-    data_stack = np.where(weight_stack > 0, data_stack, np.nan)
-
-    rejection = config.stack_reject_algo.lower().strip()
-    data_for_combine = data_stack
-    if rejection in {"kappa_sigma", "kappa"} and _reject_outliers_kappa_sigma:
-        data_for_combine, _ = _reject_outliers_kappa_sigma(
-            data_stack,
-            config.stack_kappa_low,
-            config.stack_kappa_high,
-            progress_callback=None,
+    if stack_core:
+        stack_config = {
+            'normalize_method': 'none',
+            'rejection_algorithm': config.stack_reject_algo,
+            'final_combine_method': config.stack_final_combine,
+            'sigma_clip_low': config.stack_kappa_low,
+            'sigma_clip_high': config.stack_kappa_high,
+        }
+        stacked, rejected_pct, weight_sum = stack_core(
+            images=normalized,
+            weights=weights,
+            stack_config=stack_config,
+            backend='cpu',
         )
-    elif rejection in {"winsorized_sigma_clip", "winsor"} and _reject_outliers_winsorized_sigma_clip:
-        data_for_combine, _ = _reject_outliers_winsorized_sigma_clip(
-            data_stack,
-            config.winsor_limits,
-            config.stack_kappa_low,
-            config.stack_kappa_high,
-            progress_callback=None,
-            max_workers=1,
-        )
-
-    data_masked = np.nan_to_num(data_for_combine, nan=0.0)
-    finite_mask = np.isfinite(data_for_combine)
-    weight_effective = np.where(finite_mask, weight_stack, 0.0)
-    weight_sum = np.sum(weight_effective, axis=0)
-    valid_positions = np.any(finite_mask, axis=0)
-    if not np.any(valid_positions):
-        empty = np.zeros(data_for_combine.shape[1:], dtype=np.float32)
-        outputs = [empty]
+        outputs = [stacked]
+        if return_weight_sum:
+            outputs.append(weight_sum)
+        if return_ref_median:
+            outputs.append(ref_median_used)
+        return tuple(outputs) if len(outputs) > 1 else outputs[0]
     else:
-        if config.stack_final_combine.lower().strip() == "median":
-            median_input = np.where(valid_positions[np.newaxis, ...], data_for_combine, 0.0)
-            result = np.nanmedian(median_input, axis=0)
-        else:
-            with np.errstate(divide="ignore", invalid="ignore"):
-                result = np.sum(data_masked * weight_effective, axis=0) / np.clip(weight_sum, 1e-6, None)
-        outputs = [result.astype(np.float32, copy=False)]
+        # Fallback to old logic if stack_core not available
+        data_stack = np.stack(normalized, axis=0).astype(np.float32, copy=False)
+        weight_stack = np.stack(weights, axis=0).astype(np.float32, copy=False)
+        data_stack = np.where(weight_stack > 0, data_stack, np.nan)
 
-    if return_weight_sum:
-        outputs.append(weight_sum.astype(np.float32, copy=False))
-    if return_ref_median:
-        outputs.append(ref_median_used)
-    return outputs[0] if len(outputs) == 1 else tuple(outputs)
+        rejection = config.stack_reject_algo.lower().strip()
+        data_for_combine = data_stack
+        if rejection in {"kappa_sigma", "kappa"} and _reject_outliers_kappa_sigma:
+            data_for_combine, _ = _reject_outliers_kappa_sigma(
+                data_stack,
+                config.stack_kappa_low,
+                config.stack_kappa_high,
+                progress_callback=None,
+            )
+        elif rejection in {"winsorized_sigma_clip", "winsor"} and _reject_outliers_winsorized_sigma_clip:
+            data_for_combine, _ = _reject_outliers_winsorized_sigma_clip(
+                data_stack,
+                config.winsor_limits,
+                config.stack_kappa_low,
+                config.stack_kappa_high,
+                progress_callback=None,
+                max_workers=1,
+            )
+
+        data_masked = np.nan_to_num(data_for_combine, nan=0.0)
+        finite_mask = np.isfinite(data_for_combine)
+        weight_effective = np.where(finite_mask, weight_stack, 0.0)
+        weight_sum = np.sum(weight_effective, axis=0)
+        valid_positions = np.any(finite_mask, axis=0)
+        if not np.any(valid_positions):
+            empty = np.zeros(data_for_combine.shape[1:], dtype=np.float32)
+            outputs = [empty]
+        else:
+            if config.stack_final_combine.lower().strip() == "median":
+                median_input = np.where(valid_positions[np.newaxis, ...], data_for_combine, 0.0)
+                result = np.nanmedian(median_input, axis=0)
+            else:
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    result = np.sum(data_masked * weight_effective, axis=0) / np.clip(weight_sum, 1e-6, None)
+            outputs = [result.astype(np.float32, copy=False)]
+
+        if return_weight_sum:
+            outputs.append(weight_sum.astype(np.float32, copy=False))
+        if return_ref_median:
+            outputs.append(ref_median_used)
+        return outputs[0] if len(outputs) == 1 else tuple(outputs)
+
+
+def _stack_weighted_patches_gpu(
+    patches: list[np.ndarray],
+    weights: list[np.ndarray],
+    config: GridModeConfig,
+    *,
+    reference_median: float | None = None,
+    return_weight_sum: bool = False,
+    return_ref_median: bool = False,
+) -> np.ndarray | tuple | None:
+    """Stack patches with GPU acceleration and optional sigma clipping."""
+    if not _CUPY_AVAILABLE:
+        return _stack_weighted_patches(
+            patches, weights, config, reference_median=reference_median, return_weight_sum=return_weight_sum, return_ref_median=return_ref_median
+        )
+    try:
+        # Convert to CuPy
+        cp_patches = [cp.asarray(p, dtype=cp.float32) for p in patches]
+        cp_weights = [cp.asarray(w, dtype=cp.float32) for w in weights]
+
+        # Normalize patches using CuPy
+        normalized, ref_median_used = _normalize_patches_gpu(cp_patches, reference_median, method=config.stack_norm_method)
+        if stack_core:
+            stack_config = {
+                'normalize_method': 'none',
+                'rejection_algorithm': config.stack_reject_algo,
+                'final_combine_method': config.stack_final_combine,
+                'sigma_clip_low': config.stack_kappa_low,
+                'sigma_clip_high': config.stack_kappa_high,
+            }
+            stacked, rejected_pct, weight_sum = stack_core(
+                images=normalized,
+                weights=cp_weights,
+                stack_config=stack_config,
+                backend='gpu',
+            )
+            # Convert back to cp arrays for compatibility
+            stacked = cp.asarray(stacked, dtype=cp.float32)
+            weight_sum = cp.asarray(weight_sum, dtype=cp.float32)
+            outputs = [stacked]
+            if return_weight_sum:
+                outputs.append(weight_sum)
+            if return_ref_median:
+                outputs.append(ref_median_used)
+            return tuple(outputs) if len(outputs) > 1 else outputs[0]
+        else:
+            # Fallback to old logic if stack_core not available
+            data_stack = cp.stack(normalized, axis=0)
+            weight_stack = cp.stack(cp_weights, axis=0)
+            data_stack = cp.where(weight_stack > 0, data_stack, cp.nan)
+
+            # Rejection - need to convert to numpy for rejection functions
+            rejection = config.stack_reject_algo.lower().strip()
+            data_for_combine = data_stack
+            if rejection in {"kappa_sigma", "kappa"} and _reject_outliers_kappa_sigma:
+                data_np = cp.asnumpy(data_stack)
+                data_rejected, _ = _reject_outliers_kappa_sigma(
+                    data_np,
+                    config.stack_kappa_low,
+                    config.stack_kappa_high,
+                    progress_callback=None,
+                )
+                data_for_combine = cp.asarray(data_rejected, dtype=cp.float32)
+            elif rejection in {"winsorized_sigma_clip", "winsor"} and _reject_outliers_winsorized_sigma_clip:
+                data_np = cp.asnumpy(data_stack)
+                data_rejected, _ = _reject_outliers_winsorized_sigma_clip(
+                    data_np,
+                    config.winsor_limits,
+                    config.stack_kappa_low,
+                    config.stack_kappa_high,
+                    progress_callback=None,
+                    max_workers=1,
+                )
+                data_for_combine = cp.asarray(data_rejected, dtype=cp.float32)
+
+            data_masked = cp.nan_to_num(data_for_combine, nan=0.0)
+            finite_mask = cp.isfinite(data_for_combine)
+            weight_effective = cp.where(finite_mask, weight_stack, 0.0)
+            weight_sum = cp.sum(weight_effective, axis=0)
+            valid_positions = cp.any(finite_mask, axis=0)
+            if not cp.any(valid_positions):
+                empty = cp.zeros(data_for_combine.shape[1:], dtype=cp.float32)
+                outputs = [cp.asnumpy(empty)]
+            else:
+                if config.stack_final_combine.lower().strip() == "median":
+                    # For median, convert to numpy
+                    data_np = cp.asnumpy(data_for_combine)
+                    valid_np = cp.asnumpy(valid_positions)
+                    median_input = np.where(valid_np[np.newaxis, ...], data_np, 0.0)
+                    result = np.nanmedian(median_input, axis=0)
+                    outputs = [cp.asarray(result, dtype=cp.float32)]
+                else:
+                    with cp.errstate(divide="ignore", invalid="ignore"):
+                        result = cp.sum(data_masked * weight_effective, axis=0) / cp.clip(weight_sum, 1e-6, None)
+                    outputs = [result]
+
+            if return_weight_sum:
+                outputs.append(cp.asnumpy(weight_sum))
+            if return_ref_median:
+                outputs.append(ref_median_used)
+            return cp.asnumpy(outputs[0]) if len(outputs) == 1 else tuple(cp.asnumpy(o) for o in outputs)
+    except Exception as e:
+        _emit(f"GPU stack failed, falling back to CPU: {e}", lvl="WARN")
+        return _stack_weighted_patches(
+            patches, weights, config, reference_median=reference_median, return_weight_sum=return_weight_sum, return_ref_median=return_ref_median
+        )
 
 
 def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, progress_callback: ProgressCallback = None) -> Path | None:
@@ -1544,14 +1779,24 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
             aligned_patches.clear()
             weight_maps.clear()
             return
-        res = _stack_weighted_patches(
-            aligned_patches,
-            weight_maps,
-            config,
-            reference_median=reference_median,
-            return_weight_sum=True,
-            return_ref_median=True,
-        )
+        if config.use_gpu:
+            res = _stack_weighted_patches_gpu(
+                aligned_patches,
+                weight_maps,
+                config,
+                reference_median=reference_median,
+                return_weight_sum=True,
+                return_ref_median=True,
+            )
+        else:
+            res = _stack_weighted_patches(
+                aligned_patches,
+                weight_maps,
+                config,
+                reference_median=reference_median,
+                return_weight_sum=True,
+                return_ref_median=True,
+            )
         if not isinstance(res, tuple) or len(res) < 2:
             chunk_failed = True
             _emit(f"Tile {tile.tile_id}: stacking failed for chunk", lvl="ERROR", callback=progress_callback)
@@ -2629,6 +2874,21 @@ def _load_config_from_disk() -> dict:
         return {}
 
 
+def _get_effective_grid_workers(config: dict) -> int:
+    """Determine the effective number of workers for grid tile processing.
+
+    If grid_workers > 0, use that value. Otherwise, compute auto_workers = max(1, os.cpu_count() - 2).
+    """
+    grid_workers = config.get("grid_workers", 0)
+    if grid_workers > 0:
+        effective = int(grid_workers)
+    else:
+        cpu_count = os.cpu_count() or 1
+        effective = max(1, cpu_count - 2)
+    _emit(f"using {effective} workers for tile processing")
+    return effective
+
+
 def run_grid_mode(
     input_folder: str,
     output_folder: str,
@@ -2647,6 +2907,7 @@ def run_grid_mode(
     save_final_as_uint16: bool = False,
     legacy_rgb_cube: bool = False,
     grid_rgb_equalize: bool | None = True,
+    grid_use_gpu: bool | None = None,
 ) -> None:
     """Main entry point for Grid/Survey mode."""
 
@@ -2674,6 +2935,9 @@ def run_grid_mode(
 
     _emit("Grid/Survey mode activated (stack_plan.csv detected)", callback=progress_callback)
     cfg_disk = _load_config_from_disk()
+    if grid_use_gpu is None:
+        grid_use_gpu = cfg_disk.get("use_gpu_grid", False)
+    _emit(f"GPU requested = {grid_use_gpu}")
     # Precedence: on-disk config (grid_rgb_equalize/poststack_equalize_rgb) →
     # caller parameter → built-in default (True).
     rgb_source = "default" if grid_rgb_equalize is None else "param"
@@ -2739,6 +3003,7 @@ def run_grid_mode(
         radial_shape_power=radial_shape_power,
         save_final_as_uint16=save_final_as_uint16,
         legacy_rgb_cube=legacy_rgb_cube,
+        use_gpu=grid_use_gpu,
     )
     _emit(
         (
@@ -2775,8 +3040,16 @@ def run_grid_mode(
     except Exception:
         pass
 
-    for tile in grid.tiles:
-        process_tile(tile, out_dir, config, progress_callback=progress_callback)
+    num_workers = _get_effective_grid_workers(cfg_disk)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {executor.submit(process_tile, tile, out_dir, config, progress_callback=progress_callback): tile for tile in grid.tiles}
+        for future in concurrent.futures.as_completed(futures):
+            tile = futures[future]
+            try:
+                result = future.result()
+                _emit(f"[GRID] Tile {tile.tile_id} completed", callback=progress_callback)
+            except Exception as exc:
+                _emit(f"Tile {tile.tile_id} failed with error: {exc}", lvl="ERROR", callback=progress_callback)
 
     mosaic_path = assemble_tiles(
         grid,

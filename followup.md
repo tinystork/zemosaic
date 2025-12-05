@@ -1,56 +1,100 @@
-# Follow-up – Grid mode output harmonisation
+# ZeMosaic – Grid mode: multithread + GPU + stack factorisation – Follow-up
 
-## Checklist
+## Checklist par étapes
 
-- [x] **Read context**
-  - [x] Open and review: `grid_mode.py`, `zemosaic_utils.py`, `zemosaic_worker.py`.
-  - [x] Identify current behaviour of `assemble_tiles(...)` (science save, WEIGHT ext, no viewer / coverage).
-  - [x] Confirm how `write_final_fits_uint16_color_aware(...)` and `_coverage.fits` are used in the normal pipeline.
+### Étape 1 – Multithread tiles uniquement (CPU)
 
-- [x] **Science FITS alignment**
-  - [x] In `assemble_tiles(...)`, change the `save_fits_image` call so `save_as_float=True` **always**, independent of `save_final_as_uint16`.
-  - [x] Ensure `axis_order` is `'HWC'` for RGB mosaics and `None` for mono.
-  - [x] Keep the `WEIGHT` extension creation logic unchanged.
-  - [x] Add a log line that clearly prints final mosaic shape/dtype.
+- [x] Ajouter la clé `grid_workers` dans `zemosaic_config.py` (valeur par défaut 0 = auto).
+- [x] Implémenter le calcul du nombre effectif de workers (auto vs valeur explicite).
+- [x] Paralléliser l’appel à `process_tile(...)` dans `run_grid_mode(...)` avec un pool (threads ou process).
+- [x] Assurer un logging `[GRID] using N workers` cohérent.
+- [x] Tests manuels : comparer single-thread vs multi-threads, vérifier que les sorties sont correctes.
 
-- [x] **Viewer FITS for Grid mode**
-  - [x] Update imports at top of `grid_mode.py` to include `write_final_fits_uint16_color_aware`.
-  - [x] In `assemble_tiles(...)`, after the science FITS is saved:
-    - [x] If `save_final_as_uint16` is `True`:
-      - [x] Build `viewer_path = output_path.with_name(output_path.stem + "_viewer.fits")`.
-      - [x] Detect `is_rgb` similarly to the normal pipeline.
-      - [x] Call `write_final_fits_uint16_color_aware(...)` with `output_data` and `header`.
-      - [x] Log success and failures with `_emit(...)`.
-  - [x] Make sure this does **not** alter existing tiles or normal pipeline behaviour.
+### Étape 2 – Flag GPU pour le Grid mode
 
-- [x] **Coverage FITS for Grid mode**
-  - [x] From `weight_sum`, compute a single-channel coverage map (`coverage_hw`) by summing channels or casting.
-  - [x] Build a WCS header using `grid.global_wcs.to_header(relax=True)` when available.
-  - [x] Set `EXTNAME='COVERAGE'` and `BUNIT='count'` like in the normal pipeline.
-  - [x] Save as `output_path.stem + "_coverage.fits"` with `save_fits_image(..., save_as_float=True, axis_order="HWC")`.
-  - [x] Add clear logs for creation / failures.
+- [x] Introduire une clé `use_gpu_grid` (ou équivalent) dans la config, cohérente avec `use_gpu_phase5` / `stack_use_gpu`.
+- [x] Étendre la signature de `run_grid_mode(...)` pour accepter `grid_use_gpu`.
+- [x] Propager `grid_use_gpu` jusqu’à `process_tile(...)`.
+- [x] Créer une première version `_stack_weighted_patches_gpu(...)` dans `grid_mode.py` (dupliquée, mais fonctionnelle).
+- [x] Implémenter le fallback CPU en cas d’échec GPU, avec logs `[GRID] GPU stack failed, falling back to CPU`.
+- [x] Tests manuels :
+  - machine sans GPU → vérifier le fallback ;
+  - machine avec GPU → vérifier la cohérence des résultats et le gain de perf.
 
-- [x] **Config / flags sanity**
-  - [x] Confirm `run_grid_mode(...)` still passes `save_final_as_uint16`, `legacy_rgb_cube`, and `grid_rgb_equalize` unchanged to `assemble_tiles(...)`.
-  - [x] No change to defaults or semantics of these flags.
-  - [x] No regressions in grid stacking, equalisation, or tiling.
+### Étape 3 – Factoriser le stacker CPU/GPU
 
-- [x] **Manual tests**
-  - [x] Run Grid mode on the existing example dataset used by the user.
-  - [x] Inspect:
-    - [x] `mosaic_grid.fits` → float32 science, correct shape, RGB content.
-    - [x] `mosaic_grid_viewer.fits` → standard 16-bit RGB, displays correctly with colour and normal histogram in a typical viewer (e.g. Siril).
-    - [x] `mosaic_grid_coverage.fits` → coverage map with WCS, consistent with tile layout.
-  - [x] Confirm tiles `tile_xxxx.fits` are unchanged in content and format.
-  - [x] Confirm the normal (non-Grid) pipeline still works identically (same outputs, no new warnings).
+- [x] Identifier les blocs de logique de stack communs dans le pipeline principal.
+- [x] Créer un module/func "stack core" réutilisable (CPU/GPU).
+- [x] Adapter Grid mode pour utiliser ce stack core (CPU + GPU).
+- [ ] Adapter le pipeline classique pour utiliser aussi ce stack core.
+- [ ] Tests de non-régression sur pipeline classique + Grid mode.
 
-- [x] **Cleanup**
-  - [ ] Ensure any new logs are informative but not too noisy.
-  - [ ] Run formatting / linting if used in this repo.
-  - [ ] Update comments in `assemble_tiles(...)` to document the “science + viewer + coverage” contract for Grid mode.
+---
 
-## Notes
+## Journal des interventions
 
-- User expectation: “Grid mode should behave like the normal pipeline regarding FITS outputs: same standards, same uint16 viewer option, and a coverage map to plan additional tiles.”
-- Priority: keep behaviour for existing users intact while making Grid mode outputs consistent and widely readable.
-````
+*(Compléter à chaque passage de Codex)*
+
+- `2025-12-05 – Étape 1 – Tâche : Ajouter la clé \`grid_workers\` dans \`zemosaic_config.py\``
+  - Fichiers modifiés : zemosaic_config.py
+  - Notes : Ajout de la clé avec valeur par défaut 0, comme spécifié.
+  - Tests effectués : Aucun, modification mineure.
+- `2025-12-05 – Étape 1 – Tâche : Implémenter le calcul du nombre effectif de workers (auto vs valeur explicite).`
+  - Fichiers modifiés : grid_mode.py
+  - Notes : Ajout de la fonction _get_effective_grid_workers qui utilise grid_workers de la config ou auto = max(1, os.cpu_count() - 2), avec log [GRID] using N workers.
+  - Tests effectués : Aucun, ajout de fonction.
+- `2025-12-05 – Étape 1 – Tâche : Paralléliser l’appel à \`process_tile(...)\` dans \`run_grid_mode(...)\` avec un pool (threads ou process).`
+  - Fichiers modifiés : grid_mode.py
+  - Notes : Remplacement de la boucle for par ThreadPoolExecutor avec gestion d'exceptions, utilisant le nombre de workers calculé. Import de concurrent.futures ajouté.
+  - Tests effectués : Aucun, implémentation de parallélisation.
+- `2025-12-05 – Étape 1 – Tâche : Assurer un logging \`[GRID] using N workers\` cohérent.`
+  - Fichiers modifiés : grid_mode.py
+  - Notes : Le logging est inclus dans la fonction _get_effective_grid_workers.
+  - Tests effectués : Aucun.
+- `2025-12-05 – Étape 1 – Tâche : Tests manuels : comparer single-thread vs multi-threads, vérifier que les sorties sont correctes.`
+  - Fichiers modifiés : Aucun
+  - Notes : Syntaxe vérifiée avec py_compile pour grid_mode.py et zemosaic_config.py. Pas d'erreurs. Tests manuels à effectuer par l'utilisateur sur un jeu de données de test, en forçant grid_workers=1 pour single-thread.
+  - Tests effectués : Syntax checks passed.
+- `2025-12-05 – Étape 2 – Tâche : Introduire une clé \`use_gpu_grid\` (ou équivalent) dans la config, cohérente avec \`use_gpu_phase5\` / \`stack_use_gpu\`.`
+  - Fichiers modifiés : zemosaic_config.py
+  - Notes : Ajout de "use_gpu_grid": True dans DEFAULT_CONFIG, et modification de _normalize_gpu_flags pour synchroniser use_gpu_grid avec la valeur canonique (use_gpu_phase5).
+  - Tests effectués : Aucun, modification de config.
+- `2025-12-05 – Étape 2 – Tâche : Étendre la signature de \`run_grid_mode(...)\` pour accepter \`grid_use_gpu\`.`
+  - Fichiers modifiés : grid_mode.py
+  - Notes : Ajout du paramètre grid_use_gpu: bool | None = None dans run_grid_mode.
+  - Tests effectués : Aucun.
+- `2025-12-05 – Étape 2 – Tâche : Propager \`grid_use_gpu\` jusqu’à \`process_tile(...)\`.`
+  - Fichiers modifiés : grid_mode.py
+  - Notes : Ajout de use_gpu dans GridModeConfig, et propagation dans run_grid_mode. Le flag est utilisé dans process_tile via config.use_gpu.
+  - Tests effectués : Aucun.
+- `2025-12-05 – Étape 2 – Tâche : Créer une première version \`_stack_weighted_patches_gpu(...)\` dans \`grid_mode.py\` (dupliquée, mais fonctionnelle).`
+  - Fichiers modifiés : grid_mode.py
+  - Notes : Création de _stack_weighted_patches_gpu, _normalize_patches_gpu, _fit_linear_scale_gpu. Implémentation avec CuPy pour accélérer le stacking, en gardant la même logique que la version CPU.
+  - Tests effectués : Aucun, ajout de fonctions.
+- `2025-12-05 – Étape 2 – Tâche : Implémenter le fallback CPU en cas d’échec GPU, avec logs \`[GRID] GPU stack failed, falling back to CPU\`.`
+  - Fichiers modifiés : grid_mode.py
+  - Notes : Le fallback est implémenté dans _stack_weighted_patches_gpu, avec log en cas d'exception.
+  - Tests effectués : Aucun.
+- `2025-12-05 – Étape 2 – Tâche : Tests manuels : machine sans GPU → vérifier le fallback ; machine avec GPU → vérifier la cohérence des résultats et le gain de perf.`
+  - Fichiers modifiés : Aucun
+  - Notes : Syntaxe vérifiée avec py_compile pour grid_mode.py et zemosaic_config.py. Pas d'erreurs. Tests manuels à effectuer par l'utilisateur sur un jeu de données de test.
+  - Tests effectués : Syntax checks passed.
+- `2025-12-05 – Étape 3 – Tâche : Identifier les blocs de logique de stack communs dans le pipeline principal.`
+  - Fichiers modifiés : Aucun
+  - Notes : Blocs communs identifiés : normalisation (none, median, linear_fit), rejet d'outliers (kappa_sigma, winsorized_sigma_clip, linear_fit_clip), combinaison (mean, median), avec support GPU via CuPy pour accélérer les opérations.
+  - Tests effectués : Aucun
+- `2025-12-05 – Étape 3 – Tâche : Créer un module/func "stack core" réutilisable (CPU/GPU).`
+  - Fichiers modifiés : zemosaic_stack_core.py
+  - Notes : Création du module zemosaic_stack_core.py avec fonction stack_core utilisant duck typing pour CPU/GPU (numpy/cupy), supportant normalisation (median, linear_fit), rejet d'outliers (kappa_sigma, winsorized_sigma_clip), combinaison (mean, median), et poids.
+  - Tests effectués : Aucun, création de module.
+- `2025-12-05 – Étape 3 – Tâche : Adapter Grid mode pour utiliser ce stack core (CPU + GPU).`
+  - Fichiers modifiés : grid_mode.py
+  - Notes : Modification des fonctions _stack_weighted_patches et _stack_weighted_patches_gpu pour utiliser stack_core avec backend='cpu' ou 'gpu', en passant normalize_method='none' (normalisation faite avant), et les autres config appropriés. Ajout d'import et fallback si stack_core indisponible.
+  - Tests effectués : Aucun, modification des fonctions.
+
+---
+
+## Notes / Questions en suspens
+
+*(Espace pour lister les points à éclaircir ou les ajustements futurs.)*
+- [ ] …

@@ -1,300 +1,241 @@
-## `agent.md`
+# ZeMosaic – Grid mode: multithread + GPU + stack factorisation
 
-# ZeMosaic – Grid mode output harmonisation
+## Contexte
 
-## 0. Context
+ZeMosaic dispose d’un **Grid mode** (voir `grid_mode.py`) qui :
+- lit un CSV de tuiles,
+- reprojette les images sources sur une grille régulière,
+- empile par tuile via `_stack_weighted_patches(...)`,
+- assemble ensuite la mosaïque finale.
 
-Project: `zemosaic` (ZeMosaic).
+Aujourd’hui :
+- le **Grid mode est 100% CPU, single-thread**, sans GPU ;
+- il duplique une mini-logique de stacking déjà présente dans le pipeline principal
+  (`zemosaic_worker.py`, `zemosaic_align_stack.py`, `zemosaic_align_stack_gpu.py`) ;
+- il ne profite pas du **GPU** ni des stratégies de parallélisation existantes
+  (`parallel_utils.py`, `zemosaic_config.py`).
 
-Goal: **Grid/Survey mode must produce the same kind of FITS outputs as the classic pipeline**, i.e.:
+Objectif global :  
+**Étendre le Grid mode** pour qu’il profite :
+- du **multithreading / multiprocess** au niveau des tuiles,
+- du **GPU** pour le stacking des tuiles,
+- et, à terme, d’une **factorisation** du stacker CPU/GPU pour réduire les duplications.
 
-- 1 **science FITS** in float32 with full WCS (RGB cube if colour).
-- 1 optional **viewer FITS** in 16-bit “standard” RGB format, controlled by the same `save_final_as_uint16` flag and using the same helper as the normal pipeline.
-- 1 optional **coverage FITS** (`*_coverage.fits`) describing pixel coverage / weight, also with WCS.
-
-Right now, Grid mode:
-- writes `mosaic_grid.fits` via `save_fits_image(..., save_as_float = not save_final_as_uint16, ...)`,
-- appends a `WEIGHT` extension directly on that file,
-- does **not** call `write_final_fits_uint16_color_aware`,
-- does **not** write a `_coverage.fits`.
-
-This is a behavioural divergence from the “normal” pipeline and produces FITS that some viewers interpret as grayscale with strange histograms, even though the data are RGB.
-
-Keep all existing behaviour of **tiles** (`tile_xxxx.fits`) and **normal pipeline** completely unchanged.
+⚠️ Important :
+- Implémentation **incrémentale en 3 étapes**.
+- Toujours finir complètement une étape (et mettre à jour `followup.md`) avant d’attaquer la suivante.
+- Ne pas casser le comportement actuel (Grid doit continuer à produire des tuiles correctes, même si lent).
 
 ---
 
-## 1. Files to inspect first
+## Fichiers concernés (principaux)
 
 - `grid_mode.py`
-  - `assemble_tiles(...)`
-  - `run_grid_mode(...)`
-  - any helper that computes/uses `weight_sum`, `overlap_*`, etc.
-- `zemosaic_utils.py`
-  - `save_fits_image(...)`
-  - `write_final_fits_uint16_color_aware(...)`
 - `zemosaic_worker.py`
-  - Phase 6: final mosaic save logic
-  - how `_coverage.fits` is produced
-- (read-only) `zemosaic_config.py` if needed for flags.
-
-Do **not** change the overall grid logic, clustering, stacking or tile generation; we only harmonise the **final outputs**.
-
----
-
-## 2. Target behaviour
-
-### 2.1 Science FITS (Grid mode)
-
-For the main Grid mosaic `mosaic_grid.fits`:
-
-- Always save **as float32** with WCS, same as the normal pipeline.
-- This file is the **science** product, equivalent to `final_fits_path` in `zemosaic_worker.py`.
-
-Concretely in `assemble_tiles(...)`:
-
-- After RGB equalisation and before saving, we already build:
-
-  ```python
-  output_data = np.asarray(mosaic, dtype=np.float32, copy=False)
-  axis_order = "HWC" if output_data.ndim == 3 else None
-````
-
-* Replace the current call to `save_fits_image`:
-
-  ```python
-  save_fits_image(
-      image_data=output_data,
-      output_path=str(output_path),
-      header=header,
-      overwrite=True,
-      save_as_float=not save_final_as_uint16,  # OLD
-      legacy_rgb_cube=legacy_rgb_cube,
-      progress_callback=progress_callback,
-      axis_order=axis_order,
-  )
-  ```
-
-  by:
-
-  ```python
-  save_fits_image(
-      image_data=output_data,
-      output_path=str(output_path),
-      header=header,
-      overwrite=True,
-      save_as_float=True,          # always float32, like normal pipeline
-      legacy_rgb_cube=legacy_rgb_cube,
-      progress_callback=progress_callback,
-      axis_order=axis_order,
-  )
-  ```
-
-* Keep the existing `WEIGHT` extension append logic as-is (this is useful science metadata).
-
-### 2.2 Viewer FITS for Grid mode
-
-Grid mode must also produce a **viewer FITS** in 16-bit RGB when `save_final_as_uint16` is `True`, using the **same helper** as the normal pipeline.
-
-Implementation details:
-
-1. At the top of `grid_mode.py`, extend the utils import:
-
-   ```python
-   from zemosaic_utils import debayer_image, load_and_validate_fits, save_fits_image
-   ```
-
-   → change to:
-
-   ```python
-   from zemosaic_utils import (
-       debayer_image,
-       load_and_validate_fits,
-       save_fits_image,
-       write_final_fits_uint16_color_aware,
-   )
-   ```
-
-2. In `assemble_tiles(...)`, **after** the successful save of `mosaic_grid.fits` and the optional `WEIGHT` extension, add a new block to build a viewer FITS:
-
-   * Only if:
-
-     * `save_final_as_uint16` is `True`,
-     * and `output_data.ndim == 3` and `output_data.shape[-1] in (3, 4)` (RGB(A)), or if you prefer, follow the same “is_rgb” logic as in `zemosaic_worker`.
-
-   * Compute a viewer path:
-
-     ```python
-     viewer_path = output_path.with_name(output_path.stem + "_viewer.fits")
-     ```
-
-   * Call `write_final_fits_uint16_color_aware(...)`:
-
-     ```python
-     try:
-         is_rgb = output_data.ndim == 3 and output_data.shape[-1] >= 3
-         write_final_fits_uint16_color_aware(
-             str(viewer_path),
-             output_data,      # HWC float32
-             header=header,
-             force_rgb_planes=is_rgb,
-             legacy_rgb_cube=legacy_rgb_cube,
-             overwrite=True,
-         )
-         _emit(
-             f"Grid viewer FITS saved to {viewer_path}",
-             lvl="INFO",
-             callback=progress_callback,
-         )
-     except Exception as exc_viewer:
-         _emit(
-             f"Grid viewer FITS save failed ({exc_viewer})",
-             lvl="WARN",
-             callback=progress_callback,
-         )
-     ```
-
-   * Do **not** attach an ALPHA extension here unless it’s trivial. Alpha is optional for the user’s use-case; the key requirement is a clean RGB cube readable by mainstream software (Siril, etc.).
-
-### 2.3 Coverage FITS for Grid mode
-
-Grid mode already keeps a `weight_sum` array during assembly. We want a separate **coverage map** saved as `mosaic_grid_coverage.fits` (or `{output_stem}_coverage.fits`), with a similar header to the normal pipeline.
-
-Implementation:
-
-1. In `assemble_tiles(...)`, after `weight_sum` is fully accumulated and after the main mosaic is saved, compute a coverage HW array:
-
-   ```python
-   coverage_hw: np.ndarray | None = None
-   try:
-       if weight_sum.ndim == 3:
-           coverage_hw = np.sum(weight_sum, axis=-1).astype(np.float32, copy=False)
-       else:
-           coverage_hw = weight_sum.astype(np.float32, copy=False)
-   except Exception as exc_cov:
-       _emit(
-           f"Coverage: failed to derive coverage map from weight_sum ({exc_cov})",
-           lvl="WARN",
-           callback=progress_callback,
-       )
-       coverage_hw = None
-   ```
-
-2. If `coverage_hw` is not `None` and has at least some non-zero pixels, build a coverage header:
-
-   ```python
-   if coverage_hw is not None and np.any(coverage_hw > 0):
-       cov_header = fits.Header()
-       try:
-           if getattr(grid, "global_wcs", None) is not None and hasattr(grid.global_wcs, "to_header"):
-               cov_header.update(grid.global_wcs.to_header(relax=True))  # type: ignore[attr-defined]
-       except Exception:
-           pass
-       cov_header["EXTNAME"] = ("COVERAGE", "Coverage Map")
-       cov_header["BUNIT"] = ("count", "Pixel contributions or sum of weights")
-   ```
-
-3. Save coverage as a separate FITS:
-
-   ```python
-   cov_path = output_path.with_name(output_path.stem + "_coverage.fits")
-   try:
-       save_fits_image(
-           image_data=coverage_hw,
-           output_path=str(cov_path),
-           header=cov_header,
-           overwrite=True,
-           save_as_float=True,
-           axis_order="HWC",
-       )
-       _emit(
-           f"Grid coverage map saved to {cov_path}",
-           lvl="INFO",
-           callback=progress_callback,
-       )
-   except Exception as exc_cov_save:
-       _emit(
-           f"Coverage: failed to save {cov_path} ({exc_cov_save})",
-           lvl="WARN",
-           callback=progress_callback,
-       )
-   ```
-
-This mimics the `_coverage.fits` creation from `zemosaic_worker.py`, but using `grid.global_wcs` and `weight_sum`.
+- `zemosaic_config.py`
+- `zemosaic_gui_qt.py` (pour la propagation des options depuis le GUI si nécessaire)
+- `parallel_utils.py` (pour s’inspirer de la logique de calcul d’auto workers)
+- éventuellement :
+  - `zemosaic_align_stack.py`
+  - `zemosaic_align_stack_gpu.py`
 
 ---
 
-## 3. Respect GUI / config flags
+## Contraintes générales
 
-* `run_grid_mode(...)` already receives:
-
-  * `save_final_as_uint16`,
-  * `legacy_rgb_cube`,
-  * `grid_rgb_equalize`,
-    and passes them to `assemble_tiles(...)`.
-    Keep this path intact; just change the **internal handling** in `assemble_tiles(...)` as described.
-
-* Do **not** change the semantics or default values of these flags.
-
----
-
-## 4. Logging
-
-* Reuse the existing `_emit(...)` pattern.
-* Add a few clear log lines with prefix `[GRID]` or “Grid viewer / Grid coverage” so that `zemosaic_worker.log` clearly shows:
-
-  * final mosaic shape & dtype,
-  * viewer FITS path when created,
-  * coverage FITS path when created,
-  * any failure with a short but explicit message.
+- Ne pas casser la **voie classique** (pipeline non-grid).
+- Ne pas modifier la sémantique des stackers existants (kappa-sigma, Winsor, radial weighting, etc.).
+- Logguer clairement les actions Grid mode avec des tags `[GRID]` :
+  - `[GRID] workers=...`
+  - `[GRID] GPU=ON/OFF`
+  - `[GRID] tile X processed by worker pid=...`, etc.
+- Garder le comportement par défaut **safe** :
+  - si config/flags absents → comportement actuel (single-thread CPU, pas de GPU).
+  - si GPU indisponible ou erreur → fallback CPU propre, sans crash.
 
 ---
 
-## 5. Tests / sanity checks
+## Étape 1 – Multithread tiles uniquement (CPU)
 
-Add or update tests if present, but at minimum:
+### Objectif
 
-1. **Manual sanity script** (you can add it as a docstring snippet in comments):
+Paralléliser le travail par tuile dans `run_grid_mode(...)`, sans changer la logique interne de `process_tile(...)` ni `_stack_weighted_patches(...)`.
 
-   ```python
-   from astropy.io import fits
-   import numpy as np
+L’idée :
+- **Chaque tuile est indépendante** -> on peut distribuer `process_tile(tile, ...)` sur plusieurs workers ;
+- Utiliser un petit pool (threads ou process) pour accélérer :
+  - la reprojection des frames vers la tuile,
+  - le stacking intra-tile.
 
-   # Science FITS (float32)
-   h = fits.open("mosaic_grid.fits", do_not_scale_image_data=True)
-   sci = h[0].data
-   print(sci.shape, sci.dtype)      # expect (H, W, 3) or (3, H, W) depending on axis_order (check)
-   h.close()
+### Tâches
 
-   # Viewer FITS (uint16/int16)
-   v = fits.open("mosaic_grid_viewer.fits", do_not_scale_image_data=True)
-   arr = v[0].data
-   print(arr.shape, arr.dtype)      # expect cube RGB with int16 (BITPIX=16 + BZERO)
-   v.close()
+- [ ] **Ajouter un paramètre de config `grid_workers`**
+  - Ajouter une clé `grid_workers` dans la config (`zemosaic_config.py`), dans la section appropriée (Grid/Survey).
+  - Valeur par défaut : `0` (signifie “auto”).
+  - Documenter la clé dans les commentaires du JSON de config.
 
-   # Coverage
-   c = fits.open("mosaic_grid_coverage.fits", do_not_scale_image_data=True)
-   cov = c[0].data
-   print(cov.shape, cov.dtype)      # expect (H, W) float32
-   c.close()
-   ```
+- [ ] **Implémenter un helper pour calculer le nombre de workers effectif**
+  - Dans `grid_mode.py` ou via un petit helper commun :
+    - Si `grid_workers > 0` → utiliser cette valeur.
+    - Si `grid_workers <= 0` → calculer `auto_workers = max(1, os.cpu_count() - 2)` (ou logique similaire inspirée de `parallel_utils`).
+    - Logguer via `[GRID] using N workers for tile processing`.
 
-2. Confirm that:
+- [ ] **Paralléliser l’appel à `process_tile` dans `run_grid_mode(...)`**
+  - Localiser la boucle actuelle du type :
+    - `for tile in grid.tiles: process_tile(tile, ...)`
+  - La remplacer par l’utilisation d’un pool (`concurrent.futures`):
+    - Soit `ThreadPoolExecutor`, soit `ProcessPoolExecutor` (au choix, mais garder ça cohérent avec le reste du projet si une préférence existe).
+    - Envoyer une tâche par tuile.
+    - Gérer proprement les exceptions :
+      - si une tuile plante, logger un message `[GRID] Tile X failed with error: ...` et continuer avec les autres tuiles ;
+      - ne pas faire échouer tout le Grid mode pour une seule tuile.
+  - Assurer que la barre de progression / callback `progress_callback` continue de fonctionner :
+    - soit via des mises à jour dans `process_tile`,
+    - soit via un wrapper qui reporte la progression.
 
-   * tiles (`tile_0001.fits`, etc.) are unchanged,
-   * normal pipeline outputs are unchanged,
-   * Grid mode now behaves just like normal pipeline from user perspective:
-
-     * science float32,
-     * viewer 16-bit RGB readable in mainstream astro tools,
-     * coverage map available for planning.
+- [ ] **Tests manuels – Étape 1**
+  - Lancer Grid mode sur un petit jeu de données de test :
+    - comparer :
+      - single-thread (forcer `grid_workers=1`)
+      - multi-threads (laisser `grid_workers=0` ou mettre une valeur >1)
+    - vérifier que :
+      - les tuiles produites sont identiques (ou numériquement quasi-identiques, dans les limites de l’ordonnancement CPU) ;
+      - la mosaïque finale est identique ;
+      - les logs montrent bien `[GRID] using N workers`.
+  - En cas de problème, corriger avant de passer à l’étape 2.
 
 ---
 
-## 6. Constraints
+## Étape 2 – Flag GPU pour le Grid mode
 
-* Do not change the clustering, stacking or alignment logic.
-* Do not touch the semantics of `grid_rgb_equalize`.
-* Avoid heavy refactors; keep edits local to `grid_mode.py` (and imports) unless strictly needed.
-* Keep code style consistent with existing file (logging style, typing, etc.).
+### Objectif
 
+Permettre à Grid mode de réutiliser le **flag GPU global** déjà présent dans le pipeline, pour décider si le stacking des tuiles se fait :
+- en CPU (comportement actuel),
+- ou en GPU (via une nouvelle fonction `_stack_weighted_patches_gpu(...)` ou équivalent).
+
+**Note** : à cette étape, l’objectif est d’introduire le chemin GPU proprement, **pas encore de factoriser le stacker**.
+
+### Tâches
+
+- [ ] **Propager un flag `grid_use_gpu` depuis la config**
+  - S’appuyer sur la logique existante de `zemosaic_config._normalize_gpu_flags(...)` qui synchronise :
+    - `use_gpu_phase5`
+    - `stack_use_gpu`
+    - `use_gpu_stack`
+  - Décider d’une clé canonique pour le Grid, par exemple :
+    - `use_gpu_grid` (nouvelle clé).
+  - Comportement recommandé :
+    - si `use_gpu_grid` n’est pas explicitement défini dans la config, utiliser la même valeur que `use_gpu_phase5` / `stack_use_gpu` (pour rester cohérent avec le pipeline principal).
+    - logguer la valeur finale : `[GRID] GPU requested = True/False`.
+
+- [ ] **Étendre la signature de `run_grid_mode(...)`**
+  - Ajouter un paramètre keyword, par exemple `grid_use_gpu: bool | None = None`.
+  - Si `grid_use_gpu` est `None`, le remplir à partir de la config (cf. précédent point).
+  - Faire passer ce flag jusqu’à `process_tile(...)` (ajouter un paramètre ou encapsuler dans la config `GridModeConfig` si elle existe).
+
+- [ ] **Créer un chemin `_stack_weighted_patches_gpu(...)` (version minimale)**
+  - Dans `grid_mode.py` (étape 2 = duplication assumée) :
+    - ajouter une fonction `_stack_weighted_patches_gpu(...)` qui :
+      - prend les mêmes paramètres que `_stack_weighted_patches(...)` (patches, weights, config, reference_median, etc.) ;
+      - essaie de convertir les données en CuPy et d’appliquer la même logique de stacking que la version CPU (kappa-sigma, Winsor, combine, radial weighting) ;
+      - s’appuie autant que possible sur des helpers existants de `zemosaic_align_stack_gpu.py` si c’est simple ;
+      - retourne les mêmes types (image stacked + weight_sum + ref_median_used).
+  - Important : en cas d’**ImportError / erreur CuPy / autre exception GPU** :
+    - logger une alerte `[GRID] GPU stack failed, falling back to CPU` ;
+    - retourner `None` ou déclencher un fallback CPU explicite depuis l’appelant.
+
+- [ ] **Utiliser le flag dans `process_tile(...)`**
+  - Dans la fonction interne qui empile les chunks (`flush_chunk` ou équivalent) :
+    - si `grid_use_gpu` est `True` :
+      - tenter d’appeler `_stack_weighted_patches_gpu(...)`.
+      - si ça échoue → fallback sur `_stack_weighted_patches(...)` + log claire.
+    - si `grid_use_gpu` est `False` :
+      - utiliser directement `_stack_weighted_patches(...)` (comportement actuel).
+
+- [ ] **Tests manuels – Étape 2**
+  - 2 jeux de tests :
+    - machine **sans GPU** :
+      - activer `use_gpu_grid=True` et vérifier que le code :
+        - loggue bien un fallback CPU ;
+        - ne crash pas ;
+        - produit une mosaïque correcte.
+    - machine **avec GPU** :
+      - comparer Grid mode avec/ sans GPU sur un dataset représentatif ;
+      - vérifier que :
+        - les résultats sont numériquement proches (compte tenu des différences CPU/GPU) ;
+        - le gain de performance est observable ;
+        - aucun artefact évident (tuiles vides, NaN, etc.).
+
+---
+
+## Étape 3 – Factoriser le stacker CPU/GPU
+
+### Objectif
+
+Réduire la duplication de code entre :
+- le stacker “classique” (pipeline principal),
+- le stacker Grid mode (CPU & GPU).
+
+L’idée est de créer un **“stack core”** réutilisable par les deux chemins.
+
+### Tâches
+
+- [ ] **Identifier le cœur de logique de stack dans le pipeline principal**
+  - Localiser dans :
+    - `zemosaic_align_stack.py`
+    - `zemosaic_align_stack_gpu.py`
+    - potentiellement `zemosaic_worker.py`
+  - Les fonctions / blocs qui :
+    - normalisent les frames (`linear_fit`, etc.),
+    - gèrent les poids (`noise_variance`, etc.),
+    - font le rejet (kappa-sigma, Winsor),
+    - combinent (mean, median, percentile),
+    - appliquent le radial weighting (si activé).
+
+- [ ] **Créer un module/func commun de stack**
+  - Créer une fonction ou un petit ensemble de fonctions “core”, par exemple dans un module commun (`zemosaic_utils.py` ou un nouveau `zemosaic_stack_core.py`), qui :
+    - prend un stack d’images + poids (CPU ou GPU),
+    - applique la pipeline de normalisation + weight + rejet + combine + radial,
+    - ne dépend que de :
+      - `numpy` ou `cupy` (via abstraction),
+      - la config de stack (déjà présente).
+  - Implémenter une petite abstraction “backend” CPU/GPU pour éviter de dupliquer toute la logique :
+    - soit via duck typing (np vs cp),
+    - soit via deux wrappers plus fins.
+
+- [ ] **Adapter Grid mode pour utiliser ce stack core**
+  - Remplacer :
+    - `_stack_weighted_patches(...)` (CPU)
+    - `_stack_weighted_patches_gpu(...)` (GPU)
+  - par des appels au stack core :
+    - en préparant les tensors `H x W x C` + poids dans le bon backend (CPU/GPU).
+  - Assurer que les résultats restent compatibles avec le reste du code Grid.
+
+- [ ] **Adapter le pipeline classique pour utiliser aussi le stack core**
+  - Là où c’est raisonnable (sans tout casser d’un coup), remplacer la logique locale par des appels au stack core.
+  - S’assurer que les tests / comportements existants restent valides.
+
+- [ ] **Tests manuels – Étape 3**
+  - Comparer :
+    - ancienne version (avant factorisation) ;
+    - nouvelle version (après factorisation) ;
+  - sur :
+    - pipeline classique,
+    - Grid mode (CPU + GPU si dispo).
+  - Vérifier qu’il n’y a pas de régression visible (histogrammes, couleurs, couverture).
+
+---
+
+## Règles de travail pour Codex
+
+- Toujours commencer par **relire `agent.md` et `followup.md`**.
+- Ne travailler que sur la **prochaine tâche non cochée**.
+- Une fois la tâche terminée :
+  - mettre la case en `[x]` dans `followup.md`,
+  - ajouter un bref log sous forme de bullet point :
+    - fichier touché,
+    - décisions prises,
+    - points d’attention éventuels.
+- Ne pas lancer l’étape suivante tant que l’étape courante n’est pas terminée et validée.
+- En cas de doute, ajouter un commentaire dans le code **sans modifier la logique** plutôt que d’inventer un comportement risqué.
