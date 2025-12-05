@@ -1,96 +1,66 @@
+# ZeMosaic – Grid mode RGB / shape fix – Follow-up
 
-## 📝 `followup.md`
+## Contexte / symptômes observés
 
-```markdown
-# Follow-up – Grid Mode RGB + stacking parity
+- Dataset Seestar RGB.
+- Pipeline classique : master tiles correctes, images RGB 1080x1920, empilées proprement.
+- Grid mode :
+  - Logs montrent des frames chargées en `raw_shape=(1920,1080)` et `hwc_shape=(1920,1080,3)` avec `axis_orig=HWC, bayer=GRBG, debayered=True`.   
+  - Reprojection par tile produit des arrays `shape=(1920,1920,3)` ou `(1920,1254,3)` (tile_size_px=1920, overlap=0.4).   
+  - Les `tile_000X.fits` semblent avoir une géométrie interprétée comme ~`3 x 1920` et la mosaïque finale apparaît **en niveaux de gris**, alors que la géométrie est globalement correcte.
 
-## Checklist
-
-### 1. Instrumentation & diagnostics
-
-- [x] Add detailed `[GRID]` logs in `_load_image_with_optional_alpha` showing:
-  - [x] Raw FITS data shape/dtype.
-  - [x] Shape after `_ensure_hwc_array` (H,W,C) and channel count.
-- [x] Add logs in `_reproject_frame_to_tile` for each frame:
-  - [x] Frame basename, tile id, `reproj_stack.shape`.
-- [x] Add logs in `process_tile`:
-  - [x] Tile id, number of frames, `tile_shape`, stacked patch shape before writing.
-- [x] Add logs in assembly phase:
-  - [x] Mosaic canvas shape/dtype at allocation.
-  - [x] Mosaic shape just before RGB equalization, with explicit reason when equalization is skipped.
-- [x] Log one-line stacking config summary in `run_grid_mode` (norm, weight, reject, winsor, combine, radial params, rgb_equalize).
-
-### 2. FITS loading & RGB handling
-
-- [x] Integrate `zemosaic_utils.load_and_validate_fits` into `_load_image_with_optional_alpha` (or equivalent helper).
-- [x] Detect Bayer / mono Seestar frames (using header `BAYERPAT` or other metadata).
-- [x] For 2D Bayer images, call `debayer_image(...)` to produce RGB HWC float32.
-- [x] Ensure non-Bayer RGB FITS are preserved as 3-channel HWC.
-- [x] Ensure `_ensure_hwc_array` always returns HWC with C=3 for RGB cases, C=1 for genuine mono.
-- [x] Ensure alpha maps (when present) are correctly shaped/broadcast for RGB data.
-- [ ] Confirm via logs that grid mode sees RGB frames as `(..., 3)` for the user’s dataset.
-
-### 3. Stacking semantics parity
-
-- [x] Review classic stacking behaviour in `zemosaic_align_stack.py` and `create_master_tile`.
-- [x] Document any unavoidable differences between grid mode stacking and classic stacking in comments.
-- [x] Verify `_stack_weighted_patches` correctly honors:
-  - [x] `stack_norm_method` semantics.
-  - [x] `stack_weight_method` semantics.
-  - [x] `stack_reject_algo` (`winsorized_sigma_clip`, `kappa_sigma`, `none`).
-  - [x] `winsor_limits`.
-  - [x] `stack_final_combine` (`mean` vs `median`).
-- [x] Ensure stacking operates channel-wise (patches `(H,W,C)` with C=1 or 3).
-- [x] Ensure return types remain consistent (`stacked`, `weight_sum`, `ref_median_used`).
-
-### 4. Mosaic assembly & RGB equalization
-
-- [x] Ensure mosaic canvas is created with C derived from the first valid tile (`(H_global, W_global, C)`).
-- [x] Handle mixed mono/RGB tiles gracefully (convert mono to RGB or issue clear warning).
-- [x] Ensure `grid_post_equalize_rgb` is only called when mosaic is truly RGB (`ndim==3` and `C==3`).
-- [x] Keep clear logs when `grid_rgb_equalize=True` but equalization is skipped (shape + reason).
-- [ ] Confirm via logs that on the user’s dataset, final mosaic shape is `(H,W,3)` and RGB equalization runs.
-
-### 5. FITS output layout & compatibility
-
-- [x] Ensure tile FITS are written as HWC `(H,W,3)` for RGB data by default.
-- [x] Respect `legacy_rgb_cube` option by writing CHW `(3,H,W)` when enabled.
-- [x] Ensure final mosaic is written as HWC by default; support uint16 output when `save_final_as_uint16=True`.
-- [x] Add logs just before writing each FITS (tile and mosaic) showing final shape/dtype.
-
-### 6. Tests & sanity checks
-
-- [ ] Add a small test module (e.g. `tests/test_grid_mode_rgb.py`) with synthetic RGB data and a simple WCS:
-  - [ ] Build a minimal `GridDefinition` with 1–2 tiles and 2–3 frames.
-  - [ ] Run `process_tile` and assembly logic.
-  - [ ] Assert stacked tiles and mosaic have 3 channels.
-  - [ ] Assert `grid_post_equalize_rgb` preserves shape.
-- [ ] Document in this file a manual QA procedure using the user’s real dataset.
-
-### 7. Manual QA (real data)
-
-- [ ] Run Grid Mode on the user’s mosaic dataset (the one producing the current mono mosaic).
-- [ ] Inspect a few `tile_XXXX.fits` and `mosaic_grid.fits` with `astropy.io.fits.getdata`:
-  - [ ] Confirm they are RGB `(H,W,3)` with reasonable ranges.
-- [ ] Visually compare:
-  - [ ] Colors vs classic pipeline mosaic.
-  - [ ] Absence of odd color tints due to mis-applied equalization.
+Hypothèse forte : bug dans la conversion HWC → cube FITS + normalisation RGB, différents du pipeline classique.
 
 ---
 
-## Notes & decisions
+## Tâches (à cocher au fur et à mesure)
 
-- [ ] Confirmed which function(s) in the classic pipeline perform debayer + RGB normalization, and whether they can be reused directly in Grid Mode.
-- [x] Documented any non-trivial differences between Grid Mode stacking and classic stacking here.
-  - Grid mode keeps `stack_weight_method=noise_fwhm` as a variance-only fallback because per-frame FWHM metrics are unavailable during tile reprojection; a DEBUG log notes the substitution.
-- [ ] If some behaviour differences are intentional (e.g. different weighting to favor survey uniformity), explain them briefly.
+### 1. Cartographie des shapes et conversions
+- [ ] Revue complète de la chaîne images dans `grid_mode.py` (lecture → reprojection → stacking → écriture).
+- [ ] Ajout de logs `[GRID] DEBUG_SHAPE_WRITE` juste avant l’écriture de chaque tile FITS, incluant shape et stats par canal.
+
+### 2. Alignement avec `zemosaic_utils` pour l’écriture FITS
+- [ ] Revue de `zemosaic_utils.py` pour identifier la convention standard des cubes RGB et les helpers d’écriture.
+- [ ] Remplacement de toute logique custom dans `grid_mode.py` par l’utilisation de ces helpers (ou nouvelle fonction utilitaire partagée).
+- [ ] Vérification que l’ordre des axes dans le FITS est **identique** à celui du pipeline classique.
+
+### 3. Normalisation RGB
+- [ ] Vérification de l’appel de la normalisation RGB dans le pipeline classique (ex: `equalize_rgb_medians_inplace`).
+- [ ] Mise en conformité de Grid mode :
+  - usage du même helper,
+  - respect du flag `grid_rgb_equalize`,
+  - traitement canal par canal sans aplatir la structure RGB.
+
+### 4. Méthodes de stacking
+- [ ] Comparaison des méthodes de stacking Grid vs pipeline classique (moyenne, médiane, sigma-kappa, etc.).
+- [ ] Harmonisation :
+  - utilisation des mêmes fonctions/utilities,
+  - même sémantique d’options et de rejets.
+
+### 5. Test de non-régression
+- [ ] Création d’un test minimal (ou script) avec un dataset synthétique RGB HWC :
+  - ex: 3 canaux bien distincts (R, G, B) sur une tile.
+- [ ] Exécution de Grid mode pour produire une `tile_0001.fits`.
+- [ ] Relecture avec `zemosaic_utils.load_and_validate_fits` pour vérifier :
+  - shape conforme,
+  - 3 canaux distincts.
+- [ ] (Optionnel) Génération d’une image PNG de debug pour confirmer visuellement la couleur.
 
 ---
 
-## Known issues / open questions
+## Notes / pièges à éviter
 
-Use this section to record anything unresolved:
+- Ne pas changer la convention globale de shape pour tout le projet sans y être explicitement invité.
+- Ne pas casser le pipeline classique : toute modification dans `zemosaic_utils` doit rester rétrocompatible.
+- Éviter les conversions multiples HWC ↔ CHW inutiles qui peuvent introduire des erreurs silencieuses.
 
-- [ ] Do we need an explicit config flag to force mono-only grid mode for some users?
-- [ ] Are there performance concerns when debayering inside Grid Mode for very large surveys? If yes, note potential mitigations (caching, pre-debayering, etc.).
-````
+---
+
+## Résultat attendu
+
+- Les tiles produites par Grid mode (`tile_000X.fits`) :
+  - ont la même structure RGB que celles du pipeline classique,
+  - sont correctement interprétées comme RGB par les viewers et par `zemosaic_utils`,
+  - ne “collapsent” pas en quelque chose qui ressemble à un `3 x 1920` gris.
+- La mosaïque finale en mode Grid est en **couleur correcte**, avec la même qualité de normalisation RGB et de stacking que la mosaïque classique.
+
