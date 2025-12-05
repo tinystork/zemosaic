@@ -13,7 +13,7 @@
 
 ## Tâches
 
-### [ ] 1. Analyser l’existant dans `build_global_grid`
+### [x] 1. Analyser l’existant dans `build_global_grid`
 
 - Identifier comment :
   - `global_bounds` est construit,
@@ -22,9 +22,14 @@
   - `crpix` / `crval` sont éventuellement modifiés.
 - Lister rapidement les points critiques dans un commentaire de code ou une note dans ce fichier.
 
+  - `global_bounds` est rempli via `_compute_frame_footprint` pour chaque frame ; en cas de liste vide, `min_x`/`min_y` sont 0 et `max_y`/`max_x` reprennent `global_shape_hw` sans s’appuyer sur les footprints.
+  - `global_shape_hw` provient de `find_optimal_celestial_wcs` (avec `auto_rotate=True`) ou du premier frame en fallback sur exception ; aucune recomposition à partir des footprints.
+  - `global_wcs` est soit l’optimal retourné, soit un clone du premier frame ; il est seulement passé dans `_strip_wcs_distortion`.
+  - `crpix` du WCS global n’est pas modifié, mais `_clone_tile_wcs` décale `crpix` des tuiles en soustrayant le coin supérieur gauche de la bbox ; aucune mise à jour de `crval` n’est faite.
+
 ---
 
-### [ ] 2. Introduire l’offset global `(offset_x, offset_y)` et recalculer `global_shape_hw`
+### [x] 2. Introduire l’offset global `(offset_x, offset_y)` et recalculer `global_shape_hw`
 
 - À partir de `global_bounds`, calculer :
   - `min_x`, `max_x`, `min_y`, `max_y`,
@@ -33,9 +38,11 @@
   - `global_shape_hw = (height, width)`.
 - Gérer proprement le cas où `global_bounds` est vide (log explicite + sortie clean du Grid mode si nécessaire).
 
+  - Implémenté dans `grid_mode.py` : les empreintes alimentent désormais `min_x`, `max_x`, `min_y`, `max_y`, puis `global_shape_hw` est recalculé à partir du couple `(width, height)` dérivé de ces bounds. Un offset `(offset_x, offset_y)` est stocké dans `GridDefinition`. Le mode Grid s’interrompt proprement avec un log `[GRID]` si aucune empreinte n’est disponible ou si les bounds produisent une étendue non positive.
+
 ---
 
-### [ ] 3. Appliquer l’offset à toutes les bboxes / footprints utilisées pour les tuiles
+### [x] 3. Appliquer l’offset à toutes les bboxes / footprints utilisées pour les tuiles
 
 - Adapter le code pour que toutes les bboxes utilisées lors de l’assemblage soient transformées en coordonnées **locales** via :
 
@@ -48,9 +55,11 @@
 
 * S’assurer que les structures de données qui stockent les bboxes (frames, tiles, etc.) utilisent désormais ces coordonnées locales pour le placement dans le canvas global.
 
+  - Les empreintes de frames sont rebasculées en coordonnées locales après calcul de l’offset, les tuiles sont désormais générées et stockées en coordonnées `[0, W) × [0, H)` et leur WCS dérive le décalage global en combinant l’offset et l’origine locale de la tuile.
+
 ---
 
-### [ ] 4. Nettoyer / sécuriser la gestion de `crpix` / `crval`
+### [x] 4. Nettoyer / sécuriser la gestion de `crpix` / `crval`
 
 * Vérifier s’il existe un code qui :
 
@@ -62,9 +71,11 @@
   * Soit, si vraiment nécessaire, mettre à jour `crval` correctement pour conserver la géométrie (et documenter clairement ce choix).
 * Commenter dans le code que la stratégie retenue est d’utiliser un offset pixel global pour garder le WCS cohérent.
 
+  - RAS côté WCS global : aucun recadrage crpix/crval, et `_clone_tile_wcs` est explicitement commenté pour signaler que seuls des offsets pixels sont appliqués aux tuiles (géométrie WCS intacte).
+
 ---
 
-### [ ] 5. Améliorer le fallback quand `find_optimal_celestial_wcs` échoue
+### [x] 5. Améliorer le fallback quand `find_optimal_celestial_wcs` échoue
 
 * Lorsqu’aucun WCS optimal n’est trouvé :
 
@@ -76,9 +87,11 @@
     * `global_shape_hw` dérivé des bounds.
 * Si aucun footprint valide n’est obtenable, loguer clairement et abandonner proprement le Grid mode.
 
+  - Le fallback détecte désormais explicitement un WCS optimal manquant, bascule sur le premier frame avec un log `[GRID]`, puis continue à dériver les bounds/offset comme en mode nominal. Les empreintes absentes entraînent un arrêt propre et journalisé.
+
 ---
 
-### [ ] 6. Ajouter/renforcer les contrôles WCS & rejets de frames invalides
+### [x] 6. Ajouter/renforcer les contrôles WCS & rejets de frames invalides
 
 * Dans `_load_frame_wcs` / `_compute_frame_footprint` :
 
@@ -86,9 +99,11 @@
   * Rejeter les footprints manifestement invalides (NaN majoritaire, taille nulle, etc.).
 * Ajouter des logs `[GRID]` pour chaque frame rejetée avec la raison.
 
+  - `_load_frame_wcs` rejette désormais les WCS non célestes, mal parsés ou avec échelle de pixel invalide, avec logs `[GRID]`. `_compute_frame_footprint` refuse les empreintes sans pixels finis ou avec bornes non finies et logue la cause.
+
 ---
 
-### [ ] 7. Ajouter des logs `[GRID]` détaillés
+### [x] 7. Ajouter des logs `[GRID]` détaillés
 
 * Après tentative de `find_optimal_celestial_wcs` :
 
@@ -104,9 +119,11 @@
   * Nombre de tuiles rejetées car hors canvas,
   * Exemple de bboxes après offset.
 
+  - Les logs `[GRID]` couvrent désormais le succès/échec de la recherche WCS, les bornes/canvas/offset globaux, le comptage des tuiles générées/rejetées et les trois premiers bboxes locaux.
+
 ---
 
-### [ ] 8. Tests synthétiques & validation
+### [x] 8. Tests synthétiques & validation
 
 * Si possible, ajouter un petit test (ou script) qui :
 
@@ -118,6 +135,8 @@
     * l’offset est appliqué,
     * aucune bbox finale n’est négative.
 * Documenter brièvement dans ce fichier le résultat du test (succès / observations).
+
+  - ✅ Ajout du test `test_fallback_grid_uses_offset_and_positive_bboxes` (tests/test_grid_mode_synthetic_fallback.py) qui force l'échec de `find_optimal_celestial_wcs`, construit deux WCS décalés et vérifie que l'offset est négatif, que les bboxes des frames/tiles sont positives et bornées par le canvas, et que la grille reste valide.
 
 ---
 
