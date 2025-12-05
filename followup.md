@@ -36,7 +36,7 @@ This file tracks the progress of the Grid mode mission described in `agent.md`.
 
 ### C. RGB equalization parity (Grid vs classic)
 
-- [ ] C1 – Review and, if needed, refactor `grid_post_equalize_rgb(...)` in `grid_mode.py` so that:
+- [x] C1 – Review and, if needed, refactor `grid_post_equalize_rgb(...)` in `grid_mode.py` so that:
   - It uses `equalize_rgb_medians_inplace(...)` from `zemosaic_align_stack.py` where available.
   - Its behaviour (medians, gains) matches the classic pipeline’s logic.
 - [x] C1 – Review and, if needed, refactor `grid_post_equalize_rgb(...)` in `grid_mode.py` so that:
@@ -48,10 +48,10 @@ This file tracks the progress of the Grid mode mission described in `agent.md`.
   - Inside `grid_post_equalize_rgb(...)`:
     - Log when equalization is applied, including gains, medians, and target.
     - Log all skip reasons (non-RGB, no valid pixels, missing channel, invalid target, error).
-- [ ] C3 – Ensure `grid_rgb_equalize` flag precedence is well-defined and documented:
+- [x] C3 – Ensure `grid_rgb_equalize` flag precedence is well-defined and documented:
   - Config (`grid_rgb_equalize` on disk) vs. parameter vs. default.
   - Log the final effective value and its source as `enabled=..., source=...`.
-- [ ] C4 – In `zemosaic_worker.py`:
+- [x] C4 – In `zemosaic_worker.py`:
   - Introduce a clearly named `grid_rgb_equalize_flag` derived from the same config/UI semantics as `poststack_equalize_rgb` (or sensibly documented).
   - Log the value and source in the Grid branch.
   - Pass it explicitly as `grid_rgb_equalize=grid_rgb_equalize_flag` to `grid_mode.run_grid_mode(...)`.
@@ -61,12 +61,12 @@ This file tracks the progress of the Grid mode mission described in `agent.md`.
 
 ### D. Worker fallback behaviour
 
-- [ ] D1 – Confirm that `run_hierarchical_mosaic(...)`:
+- [x] D1 – Confirm that `run_hierarchical_mosaic(...)`:
   - Detects Grid mode using `detect_grid_mode(...)`.
   - Logs a line like `"[GRID] Invoking grid_mode.run_grid_mode(...) with grid_rgb_equalize=..., stack_norm=..., ..."`.
   - Calls `grid_mode.run_grid_mode(...)` inside a `try` block.
   - On success: returns early (does not run classic pipeline).
-- [ ] D2 – On Grid mode exceptions:
+- [x] D2 – On Grid mode exceptions:
   - Logs an ERROR with `exc_info=True` and a clear message:
     - `"[GRID] Grid/Survey mode failed, continuing with classic pipeline"`.
   - Then continues with the classic pipeline unchanged.
@@ -93,4 +93,5 @@ This file tracks the progress of the Grid mode mission described in `agent.md`.
 Use this section to jot down important decisions, gotchas, or future ideas.
 
 - [ ] (Example) Consider a future config key to *not* raise on empty mosaic in Grid mode but silently skip Grid and go classic, if that ever becomes desirable.
+- [ ] Pytest run with `PYTHONPATH=.` currently reports pre-existing failures in phase5 blending/GPU tests (tile weight and GPU harness expectations); see test output for details.
 

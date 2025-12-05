@@ -13304,24 +13304,32 @@ def run_hierarchical_mosaic(
         except Exception:
             return None
 
-    rgb_equalize_source = "argument"
-    rgb_equalize_flag = bool(poststack_equalize_rgb_config)
+    grid_rgb_equalize_source = "argument"
+    grid_rgb_equalize_flag = _coerce_bool_flag(poststack_equalize_rgb_config)
     cfg_rgb = _coerce_bool_flag(worker_config_cache.get("grid_rgb_equalize"))
     if cfg_rgb is None:
         cfg_rgb = _coerce_bool_flag(worker_config_cache.get("poststack_equalize_rgb"))
     if cfg_rgb is not None:
-        rgb_equalize_source = "config"
-        rgb_equalize_flag = cfg_rgb
-    poststack_equalize_rgb_config = bool(rgb_equalize_flag)
-    setattr(zconfig, "poststack_equalize_rgb", bool(rgb_equalize_flag))
+        grid_rgb_equalize_source = "config"
+        grid_rgb_equalize_flag = cfg_rgb
+    if grid_rgb_equalize_flag is None:
+        grid_rgb_equalize_flag = True
+        grid_rgb_equalize_source = "default"
+    poststack_equalize_rgb_config = bool(grid_rgb_equalize_flag)
+    setattr(zconfig, "poststack_equalize_rgb", bool(grid_rgb_equalize_flag))
 
     if detect_grid_mode(input_folder):
         try:
             if grid_mode and hasattr(grid_mode, "run_grid_mode"):
                 logger.info(
-                    "[GRID] Invoking grid_mode with RGBEqualize=%s (source=%s)",
-                    rgb_equalize_flag,
-                    rgb_equalize_source,
+                    "[GRID] Invoking grid_mode.run_grid_mode(...) with "
+                    "grid_rgb_equalize=%s (source=%s), stack_norm=%s, stack_weight=%s, reject_algo=%s, combine=%s",
+                    grid_rgb_equalize_flag,
+                    grid_rgb_equalize_source,
+                    stack_norm_method,
+                    stack_weight_method,
+                    stack_reject_algo,
+                    stack_final_combine,
                 )
                 grid_mode.run_grid_mode(  # type: ignore[attr-defined]
                     input_folder=input_folder,
@@ -13339,7 +13347,7 @@ def run_hierarchical_mosaic(
                     radial_shape_power=radial_shape_power_config,
                     save_final_as_uint16=save_final_as_uint16_config,
                     legacy_rgb_cube=legacy_rgb_cube_config,
-                    grid_rgb_equalize=rgb_equalize_flag,
+                    grid_rgb_equalize=grid_rgb_equalize_flag,
                 )
                 return
             else:
