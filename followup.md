@@ -16,32 +16,32 @@ Hypothèse forte : bug dans la conversion HWC → cube FITS + normalisation RGB,
 ## Tâches (à cocher au fur et à mesure)
 
 ### 1. Cartographie des shapes et conversions
-- [ ] Revue complète de la chaîne images dans `grid_mode.py` (lecture → reprojection → stacking → écriture).
-- [ ] Ajout de logs `[GRID] DEBUG_SHAPE_WRITE` juste avant l’écriture de chaque tile FITS, incluant shape et stats par canal.
+- [x] Revue complète de la chaîne images dans `grid_mode.py` (lecture → reprojection → stacking → écriture).
+- [x] Ajout de logs `[GRID] DEBUG_SHAPE_WRITE` juste avant l’écriture de chaque tile FITS, incluant shape et stats par canal.
 
 ### 2. Alignement avec `zemosaic_utils` pour l’écriture FITS
-- [ ] Revue de `zemosaic_utils.py` pour identifier la convention standard des cubes RGB et les helpers d’écriture.
-- [ ] Remplacement de toute logique custom dans `grid_mode.py` par l’utilisation de ces helpers (ou nouvelle fonction utilitaire partagée).
-- [ ] Vérification que l’ordre des axes dans le FITS est **identique** à celui du pipeline classique.
+- [x] Revue de `zemosaic_utils.py` pour identifier la convention standard des cubes RGB et les helpers d’écriture.
+- [x] Remplacement de toute logique custom dans `grid_mode.py` par l’utilisation de ces helpers (ou nouvelle fonction utilitaire partagée).
+- [x] Vérification que l’ordre des axes dans le FITS est **identique** à celui du pipeline classique.
 
 ### 3. Normalisation RGB
-- [ ] Vérification de l’appel de la normalisation RGB dans le pipeline classique (ex: `equalize_rgb_medians_inplace`).
-- [ ] Mise en conformité de Grid mode :
+- [x] Vérification de l’appel de la normalisation RGB dans le pipeline classique (ex: `equalize_rgb_medians_inplace`).
+- [x] Mise en conformité de Grid mode :
   - usage du même helper,
   - respect du flag `grid_rgb_equalize`,
   - traitement canal par canal sans aplatir la structure RGB.
 
 ### 4. Méthodes de stacking
-- [ ] Comparaison des méthodes de stacking Grid vs pipeline classique (moyenne, médiane, sigma-kappa, etc.).
-- [ ] Harmonisation :
+- [x] Comparaison des méthodes de stacking Grid vs pipeline classique (moyenne, médiane, sigma-kappa, etc.).
+- [x] Harmonisation :
   - utilisation des mêmes fonctions/utilities,
   - même sémantique d’options et de rejets.
 
 ### 5. Test de non-régression
-- [ ] Création d’un test minimal (ou script) avec un dataset synthétique RGB HWC :
+- [x] Création d’un test minimal (ou script) avec un dataset synthétique RGB HWC :
   - ex: 3 canaux bien distincts (R, G, B) sur une tile.
-- [ ] Exécution de Grid mode pour produire une `tile_0001.fits`.
-- [ ] Relecture avec `zemosaic_utils.load_and_validate_fits` pour vérifier :
+- [x] Exécution de Grid mode pour produire une `tile_0001.fits`.
+- [x] Relecture avec `zemosaic_utils.load_and_validate_fits` pour vérifier :
   - shape conforme,
   - 3 canaux distincts.
 - [ ] (Optionnel) Génération d’une image PNG de debug pour confirmer visuellement la couleur.
