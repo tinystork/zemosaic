@@ -777,25 +777,45 @@ def build_global_grid(
             )
             return None
         global_shape_hw = (height, width)
+        local_bounds: list[tuple[int, int, int, int]] = []
+        for frame in usable_frames:
+            if frame.footprint is None:
+                continue
+            fx0, fx1, fy0, fy1 = frame.footprint
+            local_fp = (
+                int(round(fx0 - offset_x)),
+                int(round(fx1 - offset_x)),
+                int(round(fy0 - offset_y)),
+                int(round(fy1 - offset_y)),
+            )
+            frame.footprint = local_fp
+            local_bounds.append(local_fp)
+        global_bounds = local_bounds
     else:
         _emit("[GRID] No valid footprints available to define global bounds", lvl="ERROR", callback=progress_callback)
         return None
 
     tiles: list[GridTile] = []
-    y0 = min_y
+    min_x_local = 0
+    max_x_local = int(global_shape_hw[1])
+    min_y_local = 0
+    max_y_local = int(global_shape_hw[0])
+    y0 = min_y_local
     tile_id = 1
-    while y0 < max_y:
-        x0 = min_x
-        while x0 < max_x:
+    while y0 < max_y_local:
+        x0 = min_x_local
+        while x0 < max_x_local:
             bbox_xmin = int(x0)
-            bbox_xmax = int(min(x0 + tile_size_px, max_x))
+            bbox_xmax = int(min(x0 + tile_size_px, max_x_local))
             bbox_ymin = int(y0)
-            bbox_ymax = int(min(y0 + tile_size_px, max_y))
+            bbox_ymax = int(min(y0 + tile_size_px, max_y_local))
             shape_hw = (bbox_ymax - bbox_ymin, bbox_xmax - bbox_xmin)
             if shape_hw[0] <= 0 or shape_hw[1] <= 0:
                 x0 += step_px
                 continue
-            tile_wcs = _clone_tile_wcs(global_wcs, (bbox_xmin, bbox_ymin), shape_hw)
+            tile_wcs = _clone_tile_wcs(
+                global_wcs, (offset_x + bbox_xmin, offset_y + bbox_ymin), shape_hw
+            )
             tiles.append(GridTile(tile_id=tile_id, bbox=(bbox_xmin, bbox_xmax, bbox_ymin, bbox_ymax), wcs=tile_wcs))
             tile_id += 1
             x0 += step_px

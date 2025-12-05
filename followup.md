@@ -42,7 +42,7 @@
 
 ---
 
-### [ ] 3. Appliquer l’offset à toutes les bboxes / footprints utilisées pour les tuiles
+### [x] 3. Appliquer l’offset à toutes les bboxes / footprints utilisées pour les tuiles
 
 - Adapter le code pour que toutes les bboxes utilisées lors de l’assemblage soient transformées en coordonnées **locales** via :
 
@@ -54,6 +54,8 @@
 ````
 
 * S’assurer que les structures de données qui stockent les bboxes (frames, tiles, etc.) utilisent désormais ces coordonnées locales pour le placement dans le canvas global.
+
+  - Les empreintes de frames sont rebasculées en coordonnées locales après calcul de l’offset, les tuiles sont désormais générées et stockées en coordonnées `[0, W) × [0, H)` et leur WCS dérive le décalage global en combinant l’offset et l’origine locale de la tuile.
 
 ---
 
