@@ -1,149 +1,158 @@
-# ✅ Suivi des tâches — Logging diagnostic Grid Mode (H/W, bbox, shapes)
+## `followup.md`
+
+```markdown
+# ✅ Suivi des tâches — Garde-fou WCS dégénéré & Fallback Grid Mode
 
 ## Instructions pour Codex
 
 1. Lire `agent.md` entièrement.
-2. Prendre la **première tâche non cochée** ci-dessous.
-3. Après modification :
-   - Mettre à jour ce fichier en cochant la tâche (`[x]`),
-   - Ajouter, si utile, une courte note (fichiers / fonctions modifiés).
-4. Répéter jusqu’à ce que toutes les tâches nécessaires au logging soient cochées.
+2. Traiter la **première tâche non cochée** ci-dessous.
+3. Après chaque modification :
+   - cocher la tâche (`[x]`),
+   - ajouter, si utile, une brève note (fonctions modifiées, décisions prises).
+4. Répéter jusqu’à ce que toutes les tâches pertinentes soient cochées.
 
 ---
 
 ## Tâches
 
-### [ ] 1. Localiser la fonction d’assemblage des tuiles
+### [ ] 1. Ajouter `_is_degenerate_global_wcs(...)` dans `grid_mode.py`
 
-- Identifier, dans `grid_mode.py`, la fonction qui :
-  - crée la mosaïque finale (allocation de `mosaic_sum`, `mosaic_weight`, etc.),
-  - boucle sur les tuiles / `tiles_info`,
-  - applique clamp / offsets / copie des pixels dans la mosaïque.
-- Noter son nom et les paramètres principaux (commentaire dans le code ou dans cette section).
-
----
-
-### [ ] 2. Logger la taille du canvas global
-
-- Juste après l’allocation de la mosaïque, ajouter un log :
+- Implémenter la fonction :
 
   ```python
-  H_m, W_m, C_m = mosaic_sum.shape
-  logger.info(
-      "[GRID-ASM] mosaic canvas created: shape_hw=(%d, %d), channels=%d",
-      H_m, W_m, C_m,
-  )
+  def _is_degenerate_global_wcs(frames, global_wcs, global_shape_hw) -> bool:
+      ...
 ````
 
-* Si un offset global est stocké dans un objet `grid` ou équivalent, le logger aussi :
+* Critères à inclure (au minimum) :
+
+  * `MIN_SIZE` (ex: 256) sur `H_m` et `W_m`,
+  * comparaison avec la taille moyenne des frames (`shape_hw`).
+* Importer `numpy` si nécessaire (`np.mean`).
+* Ne pas appeler cette fonction encore à ce stade (juste l’implémenter).
+
+---
+
+### [ ] 2. Ajouter `_pick_first_valid_frame(...)` & `_build_fallback_global_wcs(...)`
+
+* Implémenter `_pick_first_valid_frame(frames)` qui :
+
+  * retourne le premier frame ayant un WCS et un `shape_hw` valides,
+  * lève un `RuntimeError` si aucun frame valide n’est trouvé.
+
+* Implémenter `_build_fallback_global_wcs(frames)` qui :
+
+  * sélectionne `base_frame = _pick_first_valid_frame(frames)`,
+  * copie son WCS (`copy.deepcopy(base_frame.wcs)`),
+  * calcule les footprints de chaque frame dans ce WCS de base (en réutilisant si possible une fonction existante type `_compute_frame_footprint`),
+  * construit `bounds` = liste de `(x0, x1, y0, y1)`,
+  * si `bounds` est vide → `RuntimeError` explicite,
+  * derive `min_x, max_x, min_y, max_y`, puis `global_shape_hw=(height, width)` et `(offset_x, offset_y)`,
+  * applique `_strip_wcs_distortion` au WCS de base,
+  * renvoie `(fallback_wcs, global_shape_hw, bounds)`.
+
+* Ajouter des logs `[GRID]` pertinents :
+
+  * erreurs de footprint,
+  * résumé du fallback (nb de frames utilisés, shape_hw).
+
+---
+
+### [ ] 3. Intégrer le garde-fou dans `build_global_grid(...)`
+
+* Localiser l’appel à `find_optimal_celestial_wcs(...)` dans `build_global_grid`.
+
+* Adapter la logique pour :
 
   ```python
-  logger.info("[GRID-ASM] global offset=(%d, %d)", offset_x, offset_y)
+  global_wcs, global_shape_hw = find_optimal_celestial_wcs(...)
+
+  if _is_degenerate_global_wcs(frames, global_wcs, global_shape_hw):
+      logger.warning(
+          "[GRID] Optimal global WCS looks degenerate (shape_hw=%s), falling back to safer WCS",
+          global_shape_hw,
+      )
+      global_wcs, global_shape_hw, global_bounds = _build_fallback_global_wcs(frames)
+      logger.info(
+          "[GRID] Fallback global WCS: shape_hw=%s",
+          global_shape_hw,
+      )
+  else:
+      logger.info(
+          "[GRID] Optimal global WCS accepted: shape_hw=%s",
+          global_shape_hw,
+      )
+      # global_bounds calculé comme avant
   ```
 
-  (uniquement si cette info est disponible proprement).
+* S’assurer que `global_bounds` est bien défini dans les deux branches (optimal et fallback).
+
+* Ne pas casser le chemin optimal existant.
 
 ---
 
-### [ ] 3. Logger, pour chaque tuile, la bbox originale et la taille des données
+### [ ] 4. Vérifier la cohérence avec le reste du Grid mode
 
-* Dans la boucle qui traite chaque tuile :
+* Confirmer que :
 
-  * Ajouter un log `.debug` de type :
-
-    ```python
-    logger.debug(
-        "[GRID-ASM] tile %s: original bbox=(x:%d-%d, y:%d-%d), data_shape=%s",
-        tile_id,
-        tx0, tx1, ty0, ty1,
-        data.shape if data is not None else None,
-    )
-    ```
-
-* S’assurer que `tile_id`, `tx0`, `tx1`, `ty0`, `ty1` et `data` sont bien définis à cet endroit.
+  * le reste du code (calcul des offsets, `global_canvas shape_hw`, bboxes de tuiles) continue à utiliser `global_shape_hw` et `global_bounds` de manière cohérente.
+* Vérifier qu’aucune dépendance implicite à l’ancienne valeur de `shape_hw` n’est cassée.
+* Si un ajustement mineur est nécessaire (par ex. stockage d’un offset global dans une structure), le noter ici.
 
 ---
 
-### [ ] 4. Logger la bbox clampée dans le canvas
+### [ ] 5. Ajouter / compléter les logs `[GRID]`
 
-* Après clamp de la bbox globale dans `[0, W_m] × [0, H_m]` (typiquement `x0, x1, y0, y1`) :
+* Vérifier que les nouveaux logs suivants existent :
 
-  * Ajouter un log `.debug` :
+  * warning quand le WCS optimal est jugé dégénéré,
+  * info sur le WCS fallback (shape_hw, éventuellement nombre de frames/bounds).
+* Garder les logs existants sur :
 
-    ```python
-    logger.debug(
-        "[GRID-ASM] tile %s: clamped bbox=(x:%d-%d, y:%d-%d) within canvas (W=%d, H=%d)",
-        tile_id,
-        x0, x1, y0, y1,
-        W_m, H_m,
-    )
-    ```
+  * `global_bounds count=...`,
+  * `global canvas shape_hw=..., offset=...`.
 
 ---
 
-### [ ] 5. Logger offsets et `used_w` / `used_h`
+### [ ] 6. Test sur le dataset problématique (WCS 2×2)
 
-* Après calcul de `off_x`, `off_y`, `used_w`, `used_h` :
+* Lancer le Grid mode sur le dataset qui produisait le WCS `shape_hw=(2, 2)` / canvas 3×3.
 
-  * Ajouter un log `.debug` :
+* Vérifier dans les logs que :
 
-    ```python
-    logger.debug(
-        "[GRID-ASM] tile %s: off_x=%d, off_y=%d, used_w=%d, used_h=%d",
-        tile_id,
-        off_x, off_y, used_w, used_h,
-    )
-    ```
+  * `[GRID] Optimal global WCS looks degenerate...` apparaît,
+  * `[GRID] Fallback global WCS: shape_hw=...` apparaît,
+  * la mosaïque finale `mosaic_grid.fits` a une taille raisonnable (beaucoup plus que 3×3).
 
----
+* Vérifier visuellement que la mosaïque contient bien du signal.
 
-### [ ] 6. Logger les motifs de rejet (`continue` / skip)
-
-* Partout où le code **skip** une tuile (conditions `if ...: continue`), ajouter un log `.warning` explicite, par ex. :
-
-  * Bbox vide après clamp :
-
-    ```python
-    logger.warning(
-        "[GRID-ASM] tile %s: skipped because clamped bbox is empty (x0=%d, x1=%d, y0=%d, y1=%d) within canvas (W=%d, H=%d)",
-        tile_id, x0, x1, y0, y1, W_m, H_m,
-    )
-    ```
-
-  * `used_w` / `used_h` <= 0 :
-
-    ```python
-    logger.warning(
-        "[GRID-ASM] tile %s: skipped because used_w/used_h <= 0 (used_w=%d, used_h=%d, off_x=%d, off_y=%d)",
-        tile_id, used_w, used_h, off_x, off_y,
-    )
-    ```
-
-  * Autres raisons (masque vide, problème de lecture, etc.) : ajouter aussi un warning `[GRID-ASM]` avec la raison.
+* Noter ici le résultat (date, taille finale observée).
 
 ---
 
-### [ ] 7. Vérifier que la logique métier est inchangée
+### [ ] 7. Test sur un dataset sain (où `find_optimal_celestial_wcs` marchait déjà bien)
 
-* Confirmer que les modifications apportées sont uniquement des ajouts de `logger.debug` / `logger.info` / `logger.warning`.
-* Ne pas modifier :
+* Lancer le Grid mode sur un dataset pour lequel :
 
-  * les valeurs de `H_m`, `W_m`, `tx0/tx1/ty0/ty1`,
-  * les formules de clamp,
-  * les conditions `if` existantes, sauf pour y insérer des logs.
-* Si une modification non triviale s’avère nécessaire, la noter clairement ici.
+  * le Grid mode marchait bien avant les changements,
+  * ou au minimum où la géométrie globale est connue/raisonnable.
+* Vérifier que :
+
+  * le garde-fou **n’est pas déclenché** (log “Optimal global WCS accepted”),
+  * le résultat visuel et la taille de la mosaïque sont cohérents avec l’avant-patch.
 
 ---
 
-### [ ] 8. Test rapide sur le dataset problématique
+### [ ] 8. Vérification de non-régression globale
 
-* Lancer un Grid mode sur le dataset connu comme problématique.
-* Vérifier que les logs contiennent :
+* Vérifier que :
 
-  * le log `[GRID-ASM] mosaic canvas created...`,
-  * un bloc de logs `[GRID-ASM]` pour chaque tuile (au moins la tuile 1),
-  * des warnings `[GRID-ASM] tile X: skipped because ...` le cas échéant.
-* Noter ici (en quelques mots) le résultat et la date du test.
+  * le pipeline classique (hors Grid mode) n’a pas été impacté (pas de modification dans d’autres fichiers),
+  * le Grid mode ne plante pas sur de petits jeux de données (2–3 images),
+  * les performances restent acceptables.
+
+* Si tout est bon, cocher cette tâche et ajouter une courte note de validation.
 
 ---
 
@@ -151,6 +160,6 @@
 
 > Utiliser cette section pour consigner :
 >
-> * nom de la fonction d’assemblage,
-> * éventuelles subtilités rencontrées,
-> * résultats des tests sur dataset réel.
+> * les valeurs de `MIN_SIZE` retenues,
+> * les observations sur les tailles de mosaïque obtenues,
+> * les éventuels ajustements faits en plus du plan.
