@@ -1,46 +1,48 @@
-# 🔁 Follow-up : Validation & Ajustements
+## 🟧 `followup.md`
 
-Ceci est la liste des vérifications à effectuer sur votre implémentation.  
-Cochez les cases lors des itérations :
+```markdown
+# 🔁 Follow-up checklist: Grid/Survey FITS & assembly stabilization
 
-## 🔧 Implémentation générale
-- [x] Le pipeline classique est intact (aucune différence dans les logs/classiques)
-- [x] `detect_grid_mode()` bascule proprement sans effet secondaire
-- [x] `run_grid_mode()` est complètement isolé
+Use this checklist to verify that your changes are correct and complete.
 
-## 📥 Lecture du stack_plan.csv
-- [x] Fonction de parsing robuste
-- [x] Colonnes ignorées correctement
-- [x] Paths vérifiés
+## 1. FITS loading (Grid mode)
 
-## 🌐 Construction de la grille
-- [x] WCS global stable
-- [x] Conversion RA/Dec → X,Y correcte
-- [x] Grille régulière générée avec overlap
+- [ ] All FITS in the test dataset (e.g. Seestar M106 mosaic) load **without**:
+      `Cannot load a memory-mapped image: BZERO/BSCALE/BLANK...`
+- [ ] Grid mode uses `memmap=False` and `do_not_scale_image_data=True` (or a shared robust helper),
+      consistent with the rest of the project.
+- [ ] When a FITS truly cannot be read (corrupt file), it logs a `[GRID]` error and continues
+      with the remaining frames.
 
-## 🎛 Sélection des frames
-- [x] Test intersection tile/frame robuste
-- [x] Frames assignées à plusieurs tiles si besoin
+## 2. Tile assembly (`assemble_tiles`)
 
-## 🧪 Traitement par tile
-- [x] Reprojection locale correcte
-- [x] Empilement avec pondération
-- [x] Rejet sigma/winsor/kappa OK
-- [x] Tile sauvegardée dans tiles/
+- [ ] `assemble_tiles` no longer raises any `ValueError` or broadcasting error for shape mismatch.
+- [ ] Tile bounding boxes are clamped to the global mosaic dimensions before slicing.
+- [ ] Offsets into the tile data (`off_x`, `off_y`) are correctly computed for out-of-bounds bboxes.
+- [ ] `used_h` and `used_w` are always positive for tiles that are actually written.
+- [ ] `data` is always in shape `(H, W, C)` before cropping (2D → 3D handled, >3D → squeezed).
+- [ ] `data_crop` and `mosaic_sum[slice_y, slice_x, :]` always share the same H and W.
+- [ ] Optional: When a tile is skipped, a `[GRID]` debug/warn log explains why.
 
-## 🧩 Assemblage final
-- [x] Aucun appel à reproject_and_coadd
-- [x] Placement direct des pixels basé sur X,Y global
-- [x] Blending léger OK
-- [x] Normalisation large-échelle globale OK
+## 3. Behavior on the example dataset
 
-## 🧪 Tests multi-source
-- [x] Multi-nuit → correct
-- [x] Multi-site → correct
-- [x] Multi-mount → correct
-- [x] Multi-filtre → cohérent selon le mode choisi
+- [ ] Running Grid mode on the M106 example (with stack_plan.csv) successfully:
+      - builds the grid,
+      - processes tiles,
+      - assembles a final mosaic.
+- [ ] No silent failure: if Grid mode aborts early, a clear `[GRID]` log explains why.
 
-## 📝 Logs
-- [x] Tous les logs taggés `[GRID]`
-- [x] Aucun log parasite dans le pipeline classique
+## 4. Fallback behavior
 
+- [ ] If **no frames** could be loaded or no valid WCS are available, Grid mode logs
+      `[GRID] No frames with valid WCS found` (or similar) and aborts cleanly.
+- [ ] When Grid mode fails for any reason, `zemosaic_worker` logs
+      `[GRID] Grid/Survey mode failed, continuing with classic pipeline`.
+- [ ] Classic pipeline still runs and produces output in such failure cases.
+
+## 5. Regression safety
+
+- [ ] Classic pipeline behavior (without stack_plan.csv) is unchanged.
+- [ ] No changes were made to clustering, master tiles, or Phase 5 logic.
+- [ ] No new dependencies were introduced unnecessarily.
+- [ ] All new logs are properly tagged `[GRID]`.

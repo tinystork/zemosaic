@@ -271,12 +271,14 @@ def _load_frame_wcs(frame: FrameInfo, *, progress_callback: ProgressCallback = N
         _emit("Astropy not available for WCS parsing", lvl="ERROR", callback=progress_callback)
         return False
     try:
-        with fits.open(frame.path, memmap=True) as hdul:
+        with fits.open(frame.path, memmap=False, do_not_scale_image_data=True) as hdul:
+            # do_not_scale_image_data=True pour ne pas se faire surprendre par BZERO/BSCALE
             header = hdul[0].header
             data = hdul[0].data
     except Exception as exc:
         _emit(f"Failed to open FITS {frame.path}: {exc}", lvl="ERROR", callback=progress_callback)
         return False
+
 
     try:
         frame.wcs = WCS(header)

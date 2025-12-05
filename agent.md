@@ -1,214 +1,211 @@
-# 🧩 Mission : Ajouter un nouveau « Mode Grid/Survey » dans ZeMosaic  
-### 🎯 Objectif
+## 🟦 `agent.md`
 
-Ajouter une **voie de traitement entièrement nouvelle**, **activée uniquement si** un fichier `stack_plan.csv` est présent dans le dossier d’entrée.  
-**Le pipeline classique actuel ne doit JAMAIS être modifié.**
+````markdown
+# 🛠 Mission: Stabilize Grid/Survey mode FITS loading and tile assembly
 
-Le Mode Grid/Survey permet de :
+You are Codex-Max. This is a **small, focused bugfix mission** on the newly added `grid_mode.py` Grid/Survey pipeline.
 
-- traiter des images multi-nuits / multi-sites / multi-mount / multi-sessions  
-- ignorer complètement le clustering traditionnel  
-- créer des master tiles **géométriques** basées sur une grille WCS régulière  
-- assembler la mosaïque finale **sans aucune reprojection globale**  
-- utiliser les infos de `stack_plan.csv` *sans jamais appeler Zenalyser*
+The current behavior:
+- Grid mode is correctly detected and started (stack_plan.csv present).
+- FITS files are listed from stack_plan.csv.
+- But:
+  - FITS loading fails when BZERO/BSCALE/BLANK keywords are present (memmap error).
+  - When this is fixed manually, `assemble_tiles` can crash with a **broadcast shape mismatch**:
+    `ValueError: non-broadcastable output operand with shape (1,1,1) doesn't match the broadcast shape (3,3,1)`.
+  - When Grid mode crashes, the worker falls back to the classic pipeline, but the user gets no mosaic from Grid.
+
+Your mission is to:
+
+1. **Fix FITS opening in Grid mode to be robust and consistent with the rest of ZeMosaic.**
+2. **Fix `assemble_tiles` so tile placement into the global mosaic is safe and correctly clamped.**
+3. **Ensure Grid mode either:**
+   - runs to completion and produces a valid mosaic, **or**
+   - fails cleanly and falls back to the classic pipeline without crashing.
+4. **Do NOT modify the classic pipeline logic.**
 
 ---
 
-# 🧱 0. Règles de codage obligatoires
+## 0. Scope & constraints
 
-- ❗ Ne modifier **aucune logic path** du pipeline standard.  
-- ❗ Ne pas toucher aux fichiers existants liés au clustering classique.  
-- ✔ Ajouter une **nouvelle voie** dans `zemosaic_worker.py` (ou un fichier séparé importé).  
-- ✔ Condition d’activation : la présence de `stack_plan.csv` dans le dossier d’entrée.  
-- ✔ Encapsuler tout le code Grid/Survey dans des fonctions dédiées (`run_grid_mode`, etc.).  
-- ✔ PAS de duplication de code inutile.  
-- ✔ Le pipeline classique doit fonctionner **strictement à l’identique**.
+- Scope: `grid_mode.py` (and at most minimal changes in `zemosaic_worker.py` for error handling / logging).
+- Do NOT touch:
+  - existing clustering / master-tile pipeline,
+  - existing reproject & coadd logic,
+  - GUI code.
+- All Grid-specific logs must remain tagged with `[GRID]`.
 
 ---
 
-# 🧭 1. Détection du Mode Grid/Survey
+## 1. FITS loading robustness (BZERO/BSCALE/BLANK)
 
-Dans `zemosaic_worker.py` :
+Problem observed in logs:
 
-- Ajouter une fonction :  
-  `detect_grid_mode(input_folder) → bool`  
-  qui retourne True si `stack_plan.csv` existe dans le dossier.
+- `Failed to open FITS ...: Cannot load a memory-mapped image: BZERO/BSCALE/BLANK header keywords present. Set memmap=False.`
 
-- Dans la fonction principale :  
+This happens because the current code in `grid_mode.py` uses something like:
 
 ```python
-if detect_grid_mode(folder):
-    return run_grid_mode(folder)
-else:
-    return run_standard_mode(folder)
+with fits.open(frame.path, memmap=True) as hdul:
+    header = hdul[0].header
+    data = hdul[0].data
 ````
 
-Aucun autre changement au pipeline standard.
+### Requirements:
+
+* Change FITS loading in Grid mode to be **consistent with the rest of ZeMosaic**:
+
+  * Use `memmap=False`.
+  * Use `do_not_scale_image_data=True` to avoid surprises with BZERO/BSCALE.
+* If there is already a utility function in the project (e.g. in `zemosaic_utils.py`) that wraps `astropy.io.fits.open` robustly, prefer **reusing that**.
+* Grid mode must **no longer fail** on Seestar FITS or any FITS with BZERO/BSCALE/BLANK.
+
+### Deliverables:
+
+* A single, central helper in `grid_mode.py` (or use an existing shared utility) for opening FITS safely.
+* All WCS/footprint computations and tile processing in Grid mode must use this helper instead of raw `fits.open(..., memmap=True)`.
 
 ---
 
-# 🌐 2. Lecture de `stack_plan.csv`
+## 2. Fix `assemble_tiles` broadcast / boundary bugs
 
-Créer une fonction :
+Current crash:
 
-```python
-load_stack_plan(csv_path) → List[FrameInfo]
+```text
+ValueError: non-broadcastable output operand with shape (1,1,1) doesn't match the broadcast shape (3,3,1)
 ```
 
-Chaque `FrameInfo` doit contenir :
+This indicates a mismatch between:
 
-* file_path
-* exposure (float)
-* bortle (string or category)
-* filter
-* batch_id (string)
-* order (int)
+* the slice on the global mosaic (`mosaic_sum[slice_y, slice_x, :]`), and
+* the cropped tile data (`data_crop`).
 
-Tout le reste est ignoré.
+Typical cause:
 
----
+* `tile.bbox` may extend beyond the global mosaic dimensions,
+* or the tile data is larger than the available mosaic region,
+* but the code blindly assumes same H,W on both sides.
 
-# 🗺️ 3. Construction du WCS global + grille géométrique
+### Requirements:
 
-Créer une fonction :
+In `assemble_tiles` (in `grid_mode.py`):
 
-```python
-build_global_grid(frames, grid_size_factor, overlap_factor)
-```
+1. **Always clamp tile bounding boxes to the global mosaic size**:
 
-* Lire le WCS de chaque `file_path`.
-* Reprojeter les centres RA/Dec → coords X,Y d’un WCS global.
-* Déterminer le bounding-box global.
-* Construire une grille régulière :
+   * Let `H_m, W_m, _ = mosaic_sum.shape`.
+   * For each tile with bbox `(tx0, tx1, ty0, ty1)`:
 
-  * Taille du carré = (FOV / grid_size_factor)
-  * Overlap = overlap_factor (valeur GUI existante)
+     * clamp to mosaic bounds:
 
-Retour attendu :
+       ```python
+       x0 = max(0, min(tx0, W_m))
+       y0 = max(0, min(ty0, H_m))
+       x1 = max(0, min(tx1, W_m))
+       y1 = max(0, min(ty1, H_m))
+       ```
+     * If `x1 <= x0` or `y1 <= y0`: skip this tile.
 
-```python
-return tiles  # List[Tile]
-```
+2. **Account for possible negative or out-of-bounds bbox**:
 
-Chaque `Tile` contient :
+   * If the tile bbox starts before 0, we need offsets into the tile data:
 
-* tile_id
-* bounding box
-* WCS local (aligné avec WCS global)
-* liste vide d’images
+     ```python
+     off_x = max(0, -tx0)
+     off_y = max(0, -ty0)
+     ```
+   * Compute the final used height/width:
 
----
+     ```python
+     used_h = min(h_src - off_y, y1 - y0)
+     used_w = min(w_src - off_x, x1 - x0)
+     ```
+   * If `used_h <= 0` or `used_w <= 0`: skip.
 
-# 📥 4. Affectation des brutes aux tiles (footprint test)
+3. **Ensure dimensionality is consistent (H x W x C)**:
 
-Créer une fonction :
+   * If a tile is 2D (H x W), convert to H x W x 1:
 
-```python
-assign_frames_to_tiles(frames, tiles)
-```
+     ```python
+     if data.ndim == 2:
+         data = data[..., np.newaxis]
+     elif data.ndim > 3:
+         data = np.squeeze(data)
+         if data.ndim == 2:
+             data = data[..., np.newaxis]
+     ```
+   * `data_crop` and `mosaic_sum[slice_y, slice_x, :]` **must have identical H and W**.
 
-Pour chaque frame :
+4. **Only update mosaic with matching shapes**:
 
-* Déterminer quels tiles elle intersecte (test centre+FOV ou polygon).
-* Ajouter le frame dans `tile.frames`.
+   * After cropping:
 
-✔ Une brute peut aller dans plusieurs tiles → comportement normal.
+     ```python
+     data_crop = data[off_y:off_y + used_h, off_x:off_x + used_w, :]
+     weight_crop = np.ones_like(data_crop, dtype=np.float32)
+     ```
+   * Then:
 
----
+     ```python
+     mosaic_sum[slice_y, slice_x, :] += data_crop * weight_crop
+     weight_sum[slice_y, slice_x, :] += weight_crop
+     ```
 
-# 🧪 5. Coadd local (SupaDupStack-like) par tile
+5. Add optional debug logging when tiles are skipped or shapes look suspicious (tag `[GRID]`).
 
-Créer une fonction :
+### Deliverables:
 
-```python
-process_tile(tile, output_folder)
-```
+* A corrected `assemble_tiles` implementation that:
 
-Pour chaque tile :
-
-1. Pour chaque frame :
-
-   * charger la zone intersectante
-   * reprojeter la zone dans le WCS du tile
-2. Empiler :
-
-   * normalisation photométrique locale
-   * pondération (SNR, bortle, expo)
-   * sigma/winsor/kappa
-3. Sauvegarder le résultat dans :
-   `output_folder/tiles/tile_<id>.fits`
-
----
-
-# 🧩 6. Assemblage final (sans reprojection globale)
-
-Créer une fonction :
-
-```python
-assemble_tiles(tiles, wcs_global, output_path)
-```
-
-* Allouer l’image de sortie complète.
-* Pour chaque tile :
-
-  * placer directement ses pixels aux coordonnées globales (pas de reprojection)
-  * cumuler selon une carte de poids interne
-* Après assemblage :
-
-  * appliquer une **normalisation large échelle** (fond global)
-
-Résultat final écrit dans :
-`mosaic_grid.fits`
+  * never raises a broadcasting error,
+  * safely handles edge tiles,
+  * places each tile in the correct region of the global mosaic.
 
 ---
 
-# 🧲 7. Intégration complète
+## 3. Error handling & fallback behavior
 
-Créer une fonction maître :
+When Grid mode fails (e.g., no valid frames, or assembly totally impossible), `run_grid_mode` should:
 
-```python
-def run_grid_mode(folder):
-    frames = load_stack_plan()
-    tiles = build_global_grid()
-    assign_frames_to_tiles()
-    for tile in tiles:
-        process_tile(tile)
-    assemble_tiles()
-```
+* Log a **clear `[GRID]` error** (already partially in place).
+* Raise a controlled exception or return a clear failure indicator to `zemosaic_worker.run_hierarchical_mosaic`.
+* `zemosaic_worker` should already catch this and log:
 
----
+  * `[GRID] Grid/Survey mode failed, continuing with classic pipeline`.
 
-# 📌 8. Respect absolu du pipeline classique
+### Requirements:
 
-* Le mode Grid/Survey **n’a pas le droit** de toucher :
+* Verify that:
 
-  * clustering classique
-  * master tiles actuelles
-  * phases 3–5 actuelles
-* Ce mode constitue un **pipeline parallèle** 100% indépendant.
+  * If **no frames** could be loaded / have valid WCS, Grid mode aborts early and cleanly.
+  * If `assemble_tiles` still encounters a fatal issue, it logs and fails cleanly.
+* Do NOT change the classic pipeline logic or structure; only ensure that Grid mode failure does not crash the process.
 
 ---
 
-# 📦 9. Livrables Codex
+## 4. Testing & validation
 
-Vous devez fournir :
+Implement basic internal tests / checks:
 
-* [x] Le code complet du mode Grid/Survey
-* [x] Les nouveaux fichiers éventuels (grid_utils.py, wcs_grid.py…)
-* [x] Les modifications strictes et minimalistes dans zemosaic_worker.py
-* [x] Du code totalement isolé pour ne rien abîmer ailleurs
-* [x] Les logs proprement taggés `[GRID]`
-* [ ] Une option GUI simple “Grid/Survey (auto si stack_plan.csv)” (facultative)
+* Grid mode on the example dataset (the one with 53 frames in stack_plan.csv) must:
+
+  * load all FITS without memmap errors,
+  * build a grid,
+  * assemble tiles,
+  * produce a mosaic file in the configured output folder.
+* If you need to add temporary extra logging to verify shapes (H,W,C) during development, keep it tagged `[GRID]` and keep it reasonably concise.
 
 ---
 
-# 🧪 10. Tests d’acceptation
+## 5. Deliverables summary
 
-* [x] Pipeline classique fonctionne identique commit précédent
-* [x] Un dossier sans stack_plan.csv → mode standard
-* [x] Un dossier avec stack_plan.csv → mode Grid
-* [x] Aucun crash si une image n’a pas de WCS
-* [x] Mosaic finale = pas de reprojection globale
-* [x] Multi-nuit + multi-site + multi-mount OK
-* [x] Tiles alignées pixel-perfect dans le WCS global
+* [ ] Updated FITS loading logic in Grid mode (no more memmap/BZERO/BSCALE errors).
+* [ ] Updated `assemble_tiles` with robust clipping and shape handling.
+* [ ] Confirmed clean fallback behavior to classic pipeline when Grid mode cannot proceed.
+* [ ] No changes to classic pipeline code paths.
+* [ ] Clear `[GRID]` logs for:
+
+  * frames loaded,
+  * tiles processed,
+  * any skipped tiles / errors.
+
+
 
