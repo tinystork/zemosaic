@@ -210,10 +210,10 @@ class GridTile:
 class GridDefinition:
     global_wcs: object
     global_shape_hw: tuple[int, int]
-    offset_xy: tuple[int, int] = (0, 0)
     tile_size_px: int
     overlap_fraction: float
     tiles: list[GridTile]
+    offset_xy: tuple[int, int] = (0, 0)
 
 
 @dataclass

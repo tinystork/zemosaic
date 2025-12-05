@@ -123,7 +123,7 @@
 
 ---
 
-### [ ] 8. Tests synthétiques & validation
+### [x] 8. Tests synthétiques & validation
 
 * Si possible, ajouter un petit test (ou script) qui :
 
@@ -135,6 +135,8 @@
     * l’offset est appliqué,
     * aucune bbox finale n’est négative.
 * Documenter brièvement dans ce fichier le résultat du test (succès / observations).
+
+  - ✅ Ajout du test `test_fallback_grid_uses_offset_and_positive_bboxes` (tests/test_grid_mode_synthetic_fallback.py) qui force l'échec de `find_optimal_celestial_wcs`, construit deux WCS décalés et vérifie que l'offset est négatif, que les bboxes des frames/tiles sont positives et bornées par le canvas, et que la grille reste valide.
 
 ---
 
