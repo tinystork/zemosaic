@@ -32,31 +32,31 @@
 
 ### 3. Stacking semantics parity
 
-- [ ] Review classic stacking behaviour in `zemosaic_align_stack.py` and `create_master_tile`.
-- [ ] Document any unavoidable differences between grid mode stacking and classic stacking in comments.
-- [ ] Verify `_stack_weighted_patches` correctly honors:
-  - [ ] `stack_norm_method` semantics.
-  - [ ] `stack_weight_method` semantics.
-  - [ ] `stack_reject_algo` (`winsorized_sigma_clip`, `kappa_sigma`, `none`).
-  - [ ] `winsor_limits`.
-  - [ ] `stack_final_combine` (`mean` vs `median`).
-- [ ] Ensure stacking operates channel-wise (patches `(H,W,C)` with C=1 or 3).
-- [ ] Ensure return types remain consistent (`stacked`, `weight_sum`, `ref_median_used`).
+- [x] Review classic stacking behaviour in `zemosaic_align_stack.py` and `create_master_tile`.
+- [x] Document any unavoidable differences between grid mode stacking and classic stacking in comments.
+- [x] Verify `_stack_weighted_patches` correctly honors:
+  - [x] `stack_norm_method` semantics.
+  - [x] `stack_weight_method` semantics.
+  - [x] `stack_reject_algo` (`winsorized_sigma_clip`, `kappa_sigma`, `none`).
+  - [x] `winsor_limits`.
+  - [x] `stack_final_combine` (`mean` vs `median`).
+- [x] Ensure stacking operates channel-wise (patches `(H,W,C)` with C=1 or 3).
+- [x] Ensure return types remain consistent (`stacked`, `weight_sum`, `ref_median_used`).
 
 ### 4. Mosaic assembly & RGB equalization
 
-- [ ] Ensure mosaic canvas is created with C derived from the first valid tile (`(H_global, W_global, C)`).
-- [ ] Handle mixed mono/RGB tiles gracefully (convert mono to RGB or issue clear warning).
-- [ ] Ensure `grid_post_equalize_rgb` is only called when mosaic is truly RGB (`ndim==3` and `C==3`).
-- [ ] Keep clear logs when `grid_rgb_equalize=True` but equalization is skipped (shape + reason).
+- [x] Ensure mosaic canvas is created with C derived from the first valid tile (`(H_global, W_global, C)`).
+- [x] Handle mixed mono/RGB tiles gracefully (convert mono to RGB or issue clear warning).
+- [x] Ensure `grid_post_equalize_rgb` is only called when mosaic is truly RGB (`ndim==3` and `C==3`).
+- [x] Keep clear logs when `grid_rgb_equalize=True` but equalization is skipped (shape + reason).
 - [ ] Confirm via logs that on the user’s dataset, final mosaic shape is `(H,W,3)` and RGB equalization runs.
 
 ### 5. FITS output layout & compatibility
 
-- [ ] Ensure tile FITS are written as HWC `(H,W,3)` for RGB data by default.
-- [ ] Respect `legacy_rgb_cube` option by writing CHW `(3,H,W)` when enabled.
-- [ ] Ensure final mosaic is written as HWC by default; support uint16 output when `save_final_as_uint16=True`.
-- [ ] Add logs just before writing each FITS (tile and mosaic) showing final shape/dtype.
+- [x] Ensure tile FITS are written as HWC `(H,W,3)` for RGB data by default.
+- [x] Respect `legacy_rgb_cube` option by writing CHW `(3,H,W)` when enabled.
+- [x] Ensure final mosaic is written as HWC by default; support uint16 output when `save_final_as_uint16=True`.
+- [x] Add logs just before writing each FITS (tile and mosaic) showing final shape/dtype.
 
 ### 6. Tests & sanity checks
 
@@ -81,7 +81,8 @@
 ## Notes & decisions
 
 - [ ] Confirmed which function(s) in the classic pipeline perform debayer + RGB normalization, and whether they can be reused directly in Grid Mode.
-- [ ] Documented any non-trivial differences between Grid Mode stacking and classic stacking here.
+- [x] Documented any non-trivial differences between Grid Mode stacking and classic stacking here.
+  - Grid mode keeps `stack_weight_method=noise_fwhm` as a variance-only fallback because per-frame FWHM metrics are unavailable during tile reprojection; a DEBUG log notes the substitution.
 - [ ] If some behaviour differences are intentional (e.g. different weighting to favor survey uniformity), explain them briefly.
 
 ---

@@ -1239,58 +1239,137 @@ def _reproject_frame_to_tile(
     return reproj_stack, footprint_combined
 
 
-def _compute_frame_weight(frame: FrameInfo, patch: np.ndarray, footprint: np.ndarray) -> float:
-    exposure_w = max(frame.exposure, 1e-3)
-    bortle_w = 1.0
-    if frame.bortle:
-        try:
-            bortle_num = float("".join(ch for ch in frame.bortle if (ch.isdigit() or ch == ".")))
-            bortle_w = 1.0 / max(1.0, bortle_num)
-        except Exception:
-            bortle_w = 1.0
+def _compute_frame_weight(
+    frame: FrameInfo, patch: np.ndarray, footprint: np.ndarray, config: GridModeConfig
+) -> float:
+    """Return a scalar weight honoring the configured strategy.
+
+    Supported strategies mirror the classic stacker subset used in Grid mode:
+    ``noise_variance`` (default), ``noise_fwhm`` (falls back to variance),
+    ``none``/``unit``. Exposure is folded in to reward longer integrations.
+    """
+
+    method = (config.stack_weight_method or "noise_variance").strip().lower()
     finite = np.isfinite(patch)
+    exposure_w = max(frame.exposure, 1e-3)
     if not np.any(finite):
-        return exposure_w * bortle_w
+        return exposure_w
+
     try:
-        median_val = float(np.nanmedian(patch[finite]))
         noise = float(np.nanstd(patch[finite]))
-        snr = median_val / max(noise, 1e-6)
     except Exception:
-        snr = 1.0
-    return exposure_w * bortle_w * max(snr, 1e-3)
+        noise = 0.0
+    noise = noise if math.isfinite(noise) else 0.0
+    if method in {"none", "unit", "unity"}:
+        return exposure_w
+    if method in {"noise_fwhm"}:
+        # Grid mode does not compute per-frame FWHM metrics; fall back to variance-only weighting.
+        _emit(
+            "Tile stacking: weight_method=noise_fwhm fallback to variance-only (no FWHM estimates)",
+            lvl="DEBUG",
+        )
+    variance = max(noise * noise, 1e-8)
+    inv_var = 1.0 / variance
+    return exposure_w * inv_var
+
+
+def _fit_linear_scale(ref_patch: np.ndarray, patch: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Estimate per-channel linear transform aligning ``patch`` to ``ref_patch``.
+
+    Returns ``(slope, intercept)`` arrays broadcastable to ``patch``. Falls back
+    to unity/zero when regression is ill-conditioned.
+    """
+
+    ref_arr = np.asarray(ref_patch, dtype=np.float32)
+    patch_arr = np.asarray(patch, dtype=np.float32)
+    if ref_arr.ndim == 2:
+        ref_arr = ref_arr[..., np.newaxis]
+    if patch_arr.ndim == 2:
+        patch_arr = patch_arr[..., np.newaxis]
+    if ref_arr.shape != patch_arr.shape:
+        return np.ones(ref_arr.shape[-1:], dtype=np.float32), np.zeros(ref_arr.shape[-1:], dtype=np.float32)
+
+    ref_flat = ref_arr.reshape(-1, ref_arr.shape[-1])
+    patch_flat = patch_arr.reshape(-1, patch_arr.shape[-1])
+    finite = np.isfinite(ref_flat) & np.isfinite(patch_flat)
+    slopes: list[float] = []
+    intercepts: list[float] = []
+    for c in range(ref_arr.shape[-1]):
+        mask_c = finite[:, c]
+        if not np.any(mask_c):
+            slopes.append(1.0)
+            intercepts.append(0.0)
+            continue
+        x = patch_flat[mask_c, c]
+        y = ref_flat[mask_c, c]
+        x_mean = float(np.nanmean(x))
+        y_mean = float(np.nanmean(y))
+        var = float(np.nanvar(x))
+        cov = float(np.nanmean((x - x_mean) * (y - y_mean))) if var > 0 else 0.0
+        slope = cov / var if var > 0 else 1.0
+        slope = slope if math.isfinite(slope) and slope != 0 else 1.0
+        intercept = y_mean - slope * x_mean
+        intercept = intercept if math.isfinite(intercept) else 0.0
+        slopes.append(slope)
+        intercepts.append(intercept)
+    return np.asarray(slopes, dtype=np.float32), np.asarray(intercepts, dtype=np.float32)
 
 
 def _normalize_patches(
     patches: list[np.ndarray],
     reference_median: float | None = None,
+    *,
+    method: str = "median",
 ) -> tuple[list[np.ndarray], float]:
-    """Scale each patch to a common median.
+    """Scale each patch using the requested normalization method.
 
-    When ``reference_median`` is provided it is reused so that multiple chunks
-    share the same photometric reference. The value used is returned so callers
-    can pass it back on the next invocation.
+    ``method`` mirrors the classic stacker choices: ``"median"`` / ``"none"`` /
+    ``"linear_fit"``. When ``reference_median`` is provided it is reused so that
+    multiple chunks share the same photometric reference. The value used is
+    returned so callers can pass it back on the next invocation.
     """
 
     if not patches:
-        return [], reference_median if reference_median is not None else 1.0
+        default_ref = reference_median if reference_median is not None else 1.0
+        return [], default_ref
+
+    method_norm = (method or "median").strip().lower()
+    ref_patch = patches[0]
+    ref_finite = np.isfinite(ref_patch)
     ref_median = reference_median
     if ref_median is None:
-        ref_patch = patches[0]
-        finite = np.isfinite(ref_patch)
-        ref_median = float(np.nanmedian(ref_patch[finite])) if np.any(finite) else 1.0
+        ref_median = float(np.nanmedian(ref_patch[ref_finite])) if np.any(ref_finite) else 1.0
         ref_median = ref_median if math.isfinite(ref_median) and ref_median != 0 else 1.0
 
     normalized: list[np.ndarray] = []
+    if method_norm in {"none", "unit", "unity"}:
+        ref_used = ref_median if ref_median is not None else 1.0
+        normalized = [np.asarray(p, dtype=np.float32, copy=False) for p in patches]
+        return normalized, float(ref_used)
+
+    if method_norm in {"linear_fit", "linear"}:
+        slopes, intercepts = _fit_linear_scale(np.asarray(ref_patch), np.asarray(ref_patch))
+        ref_used = float(ref_median)
+        for patch in patches:
+            try:
+                s, b = _fit_linear_scale(ref_patch, patch)
+            except Exception:
+                s, b = slopes, intercepts
+            patch_norm = (np.asarray(patch, dtype=np.float32, copy=False) * s.reshape((1, 1, -1))) + b.reshape((1, 1, -1))
+            normalized.append(patch_norm.astype(np.float32, copy=False))
+        return normalized, float(ref_used)
+
+    # Default: median scaling
     for patch in patches:
-        patch_norm = patch
-        finite_patch = np.isfinite(patch_norm)
-        med = float(np.nanmedian(patch_norm[finite_patch])) if np.any(finite_patch) else ref_median
+        patch_arr = np.asarray(patch, dtype=np.float32, copy=False)
+        finite_patch = np.isfinite(patch_arr)
+        med = float(np.nanmedian(patch_arr[finite_patch])) if np.any(finite_patch) else ref_median
         med = med if math.isfinite(med) and med != 0 else ref_median
         try:
             scale = ref_median / med
         except Exception:
             scale = 1.0
-        patch_norm = patch_norm * scale
+        patch_norm = patch_arr * scale
         normalized.append(patch_norm.astype(np.float32, copy=False))
     return normalized, float(ref_median)
 
@@ -1309,7 +1388,11 @@ def _stack_weighted_patches(
     if not patches:
         return None
     # Ensure shapes match and promote to float32
-    normalized, ref_median_used = _normalize_patches(patches, reference_median)
+    normalized, ref_median_used = _normalize_patches(
+        patches,
+        reference_median,
+        method=config.stack_norm_method,
+    )
     data_stack = np.stack(normalized, axis=0).astype(np.float32, copy=False)
     weight_stack = np.stack(weights, axis=0).astype(np.float32, copy=False)
     data_stack = np.where(weight_stack > 0, data_stack, np.nan)
@@ -1438,7 +1521,7 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
         if patch is None or footprint is None:
             _emit(f"Tile {tile.tile_id}: reprojection failed for {frame.path.name}", lvl="WARN", callback=progress_callback)
             continue
-        weight_scalar = _compute_frame_weight(frame, patch, footprint)
+        weight_scalar = _compute_frame_weight(frame, patch, footprint, config)
         weight_map = np.clip(np.asarray(footprint, dtype=np.float32), 0.0, 1.0)
         if patch.ndim == 3 and weight_map.ndim == 2:
             weight_map = np.repeat(weight_map[..., np.newaxis], patch.shape[-1], axis=2)
@@ -1496,8 +1579,21 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
         header = tile.wcs.to_header() if hasattr(tile.wcs, "to_header") else None  # type: ignore[attr-defined]
     except Exception:
         header = None
+    output_data = stacked
+    if config.legacy_rgb_cube and stacked.ndim == 3 and stacked.shape[-1] in (1, 3):
+        output_data = np.moveaxis(stacked, -1, 0)
+        _emit(
+            f"Tile {tile.tile_id}: legacy_rgb_cube=True -> data shape {output_data.shape}",
+            lvl="DEBUG",
+            callback=progress_callback,
+        )
+    _emit(
+        f"Tile {tile.tile_id}: writing FITS shape={output_data.shape} dtype={output_data.dtype}",
+        lvl="DEBUG",
+        callback=progress_callback,
+    )
     try:
-        fits.writeto(output_path, stacked.astype(np.float32), header=header, overwrite=True)
+        fits.writeto(output_path, output_data.astype(np.float32), header=header, overwrite=True)
     except Exception as exc:
         _emit(f"Tile {tile.tile_id}: failed to write FITS ({exc})", lvl="ERROR", callback=progress_callback)
         return None
@@ -1962,6 +2058,7 @@ def assemble_tiles(
         return None
 
     tile_infos: list[TilePhotometryInfo] = []
+    pending_tiles: list[tuple[GridTile, np.ndarray, np.ndarray, int]] = []
     channels: int | None = None
     io_failures = 0
     channel_mismatches = 0
@@ -1983,16 +2080,9 @@ def assemble_tiles(
             continue
 
         c = 1 if data.ndim == 2 else data.shape[-1]
-        if channels is None:
-            channels = c
+        channels = channels if channels is not None else c
         if c != channels:
             channel_mismatches += 1
-            _emit(
-                f"Assembly: tile {t.tile_id} channel mismatch ({c} != {channels}), skipping",
-                lvl="WARN",
-                callback=progress_callback,
-            )
-            continue
         mask = compute_valid_mask(data)
         if not np.any(mask):
             empty_masks += 1
@@ -2002,7 +2092,7 @@ def assemble_tiles(
                 callback=progress_callback,
             )
             continue
-        tile_infos.append(TilePhotometryInfo(tile_id=t.tile_id, bbox=t.bbox, data=data, mask=mask))
+        pending_tiles.append((t, data, mask, c))
 
     if not tile_infos:
         _emit(
@@ -2016,6 +2106,36 @@ def assemble_tiles(
         )
         return None
 
+    target_channels = 3 if any(c == 3 for _, _, _, c in pending_tiles) else (channels or 1)
+    for t, data, mask, c in pending_tiles:
+        data_conv = data
+        mask_conv = mask
+        if c != target_channels:
+            if c == 1 and target_channels == 3:
+                data_conv = np.repeat(data, 3, axis=-1)
+                mask_conv = np.repeat(mask[..., np.newaxis], 3, axis=2) if mask.ndim == 2 else np.repeat(mask, 3, axis=-1)
+                _emit(
+                    f"Assembly: tile {t.tile_id} mono->RGB expansion applied to match mosaic",
+                    lvl="WARN",
+                    callback=progress_callback,
+                )
+            elif c == 3 and target_channels == 1:
+                data_conv = np.nanmean(data, axis=-1, keepdims=True)
+                mask_conv = compute_valid_mask(data_conv) & (mask if mask.ndim == 3 else mask[..., np.newaxis])
+                _emit(
+                    f"Assembly: tile {t.tile_id} RGB collapsed to mono to match mosaic",
+                    lvl="WARN",
+                    callback=progress_callback,
+                )
+            else:
+                _emit(
+                    f"Assembly: tile {t.tile_id} channel mismatch ({c} -> {target_channels}), skipping",
+                    lvl="WARN",
+                    callback=progress_callback,
+                )
+                continue
+        tile_infos.append(TilePhotometryInfo(tile_id=t.tile_id, bbox=t.bbox, data=data_conv, mask=mask_conv))
+
     _emit(
         (
             "Assembly summary: "
@@ -2025,7 +2145,15 @@ def assemble_tiles(
         callback=progress_callback,
     )
 
-    channels = channels or 1
+    if not tile_infos:
+        _emit(
+            "Assembly: no usable tiles after channel harmonization",
+            lvl="ERROR",
+            callback=progress_callback,
+        )
+        return None
+
+    channels = target_channels or 1
     mosaic_shape = (grid.global_shape_hw[0], grid.global_shape_hw[1], channels)
     mosaic_sum = np.zeros(mosaic_shape, dtype=np.float32)
     weight_sum = np.zeros(mosaic_shape, dtype=np.float32)
@@ -2323,7 +2451,20 @@ def assemble_tiles(
             header = grid.global_wcs.to_header() if hasattr(grid.global_wcs, "to_header") else None  # type: ignore[attr-defined]
         except Exception:
             header = None
-        output_data = mosaic.astype(np.uint16) if save_final_as_uint16 else mosaic.astype(np.float32)
+        output_data = mosaic
+        if legacy_rgb_cube and output_data.ndim == 3 and output_data.shape[-1] in (1, 3):
+            output_data = np.moveaxis(output_data, -1, 0)
+        output_dtype = np.uint16 if save_final_as_uint16 else np.float32
+        output_data = output_data.astype(output_dtype)
+        _emit(
+            (
+                "Mosaic: writing FITS "
+                f"shape={output_data.shape} dtype={output_data.dtype} "
+                f"legacy_rgb_cube={legacy_rgb_cube} save_uint16={save_final_as_uint16}"
+            ),
+            lvl="DEBUG",
+            callback=progress_callback,
+        )
         try:
             fits.writeto(output_path, output_data, header=header, overwrite=True)
             # Save weight map for diagnostics
