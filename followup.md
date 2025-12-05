@@ -59,7 +59,7 @@
 
 ---
 
-### [ ] 4. Nettoyer / sécuriser la gestion de `crpix` / `crval`
+### [x] 4. Nettoyer / sécuriser la gestion de `crpix` / `crval`
 
 * Vérifier s’il existe un code qui :
 
@@ -71,9 +71,11 @@
   * Soit, si vraiment nécessaire, mettre à jour `crval` correctement pour conserver la géométrie (et documenter clairement ce choix).
 * Commenter dans le code que la stratégie retenue est d’utiliser un offset pixel global pour garder le WCS cohérent.
 
+  - RAS côté WCS global : aucun recadrage crpix/crval, et `_clone_tile_wcs` est explicitement commenté pour signaler que seuls des offsets pixels sont appliqués aux tuiles (géométrie WCS intacte).
+
 ---
 
-### [ ] 5. Améliorer le fallback quand `find_optimal_celestial_wcs` échoue
+### [x] 5. Améliorer le fallback quand `find_optimal_celestial_wcs` échoue
 
 * Lorsqu’aucun WCS optimal n’est trouvé :
 
@@ -85,9 +87,11 @@
     * `global_shape_hw` dérivé des bounds.
 * Si aucun footprint valide n’est obtenable, loguer clairement et abandonner proprement le Grid mode.
 
+  - Le fallback détecte désormais explicitement un WCS optimal manquant, bascule sur le premier frame avec un log `[GRID]`, puis continue à dériver les bounds/offset comme en mode nominal. Les empreintes absentes entraînent un arrêt propre et journalisé.
+
 ---
 
-### [ ] 6. Ajouter/renforcer les contrôles WCS & rejets de frames invalides
+### [x] 6. Ajouter/renforcer les contrôles WCS & rejets de frames invalides
 
 * Dans `_load_frame_wcs` / `_compute_frame_footprint` :
 
@@ -95,9 +99,11 @@
   * Rejeter les footprints manifestement invalides (NaN majoritaire, taille nulle, etc.).
 * Ajouter des logs `[GRID]` pour chaque frame rejetée avec la raison.
 
+  - `_load_frame_wcs` rejette désormais les WCS non célestes, mal parsés ou avec échelle de pixel invalide, avec logs `[GRID]`. `_compute_frame_footprint` refuse les empreintes sans pixels finis ou avec bornes non finies et logue la cause.
+
 ---
 
-### [ ] 7. Ajouter des logs `[GRID]` détaillés
+### [x] 7. Ajouter des logs `[GRID]` détaillés
 
 * Après tentative de `find_optimal_celestial_wcs` :
 
@@ -112,6 +118,8 @@
   * Nombre de tuiles valides,
   * Nombre de tuiles rejetées car hors canvas,
   * Exemple de bboxes après offset.
+
+  - Les logs `[GRID]` couvrent désormais le succès/échec de la recherche WCS, les bornes/canvas/offset globaux, le comptage des tuiles générées/rejetées et les trois premiers bboxes locaux.
 
 ---
 

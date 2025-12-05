@@ -553,10 +553,11 @@ def _load_frame_wcs(frame: FrameInfo, *, progress_callback: ProgressCallback = N
 
     try:
         frame.wcs = WCS(header)
-    except Exception:
+    except Exception as exc:
         frame.wcs = None
+        _emit(f"[GRID] Failed to parse WCS from {frame.path}: {exc}", lvl="WARN", callback=progress_callback)
     if frame.wcs is None or not getattr(frame.wcs, "is_celestial", False):
-        _emit(f"No usable WCS in {frame.path}", lvl="WARN", callback=progress_callback)
+        _emit(f"[GRID] No usable celestial WCS in {frame.path}", lvl="WARN", callback=progress_callback)
         return False
 
     shape_hw = None
@@ -575,6 +576,22 @@ def _load_frame_wcs(frame: FrameInfo, *, progress_callback: ProgressCallback = N
         _emit(f"Cannot derive image shape for {frame.path}", lvl="WARN", callback=progress_callback)
         return False
     frame.shape_hw = shape_hw
+    try:
+        px_scale = _extract_pixel_scale_deg(frame.wcs)
+        if px_scale is None or not math.isfinite(px_scale) or px_scale <= 0:
+            _emit(
+                f"[GRID] Rejecting frame {frame.path}: invalid pixel scale",
+                lvl="WARN",
+                callback=progress_callback,
+            )
+            frame.wcs = None
+            frame.shape_hw = None
+            return False
+    except Exception:
+        _emit(f"[GRID] Rejecting frame {frame.path}: pixel scale check failed", lvl="WARN", callback=progress_callback)
+        frame.wcs = None
+        frame.shape_hw = None
+        return False
     return True
 
 
@@ -650,10 +667,25 @@ def _compute_frame_footprint(frame: FrameInfo, global_wcs: object, *, progress_c
             gx, gy = global_wcs.world_to_pixel(sky)  # type: ignore[attr-defined]
         if _has_wcs_convergence_warning(caught):
             _log_wcs_degraded(frame, progress_callback=progress_callback)
-        xmin = float(np.nanmin(gx))
-        xmax = float(np.nanmax(gx))
-        ymin = float(np.nanmin(gy))
-        ymax = float(np.nanmax(gy))
+        finite_mask = np.isfinite(gx) & np.isfinite(gy)
+        if not np.any(finite_mask):
+            _emit(
+                f"[GRID] Rejecting frame {frame.path}: footprint projection yielded no finite pixels",
+                lvl="WARN",
+                callback=progress_callback,
+            )
+            return None
+        xmin = float(np.nanmin(gx[finite_mask]))
+        xmax = float(np.nanmax(gx[finite_mask]))
+        ymin = float(np.nanmin(gy[finite_mask]))
+        ymax = float(np.nanmax(gy[finite_mask]))
+        if not all(math.isfinite(v) for v in (xmin, xmax, ymin, ymax)):
+            _emit(
+                f"[GRID] Rejecting frame {frame.path}: non-finite footprint bounds",
+                lvl="WARN",
+                callback=progress_callback,
+            )
+            return None
         return xmin, xmax, ymin, ymax
     except Exception:
         return None
@@ -664,6 +696,7 @@ def _clone_tile_wcs(global_wcs: object, offset_xy: tuple[int, int], shape_hw: tu
     try:
         offset_x, offset_y = offset_xy
         crpix = np.asarray(tile_wcs.wcs.crpix, dtype=float)  # type: ignore[attr-defined]
+        # Keep the global WCS geometry intact and shift tiles via pixel offsets only.
         tile_wcs.wcs.crpix = crpix - np.asarray([offset_x, offset_y], dtype=float)  # type: ignore[attr-defined]
         tile_wcs.wcs.naxis1 = int(shape_hw[1])  # type: ignore[attr-defined]
         tile_wcs.wcs.naxis2 = int(shape_hw[0])  # type: ignore[attr-defined]
@@ -731,11 +764,25 @@ def build_global_grid(
             auto_rotate=True,
             projection="TAN",
         )
+        if global_wcs is not None and global_shape_hw is not None:
+            _emit(
+                f"[GRID] Optimal global WCS found: crpix={getattr(global_wcs.wcs, 'crpix', None)}, shape_hw={global_shape_hw}",
+                callback=progress_callback,
+            )
     except Exception as exc:
-        _emit(f"find_optimal_celestial_wcs failed ({exc}), using first frame WCS", lvl="WARN", callback=progress_callback)
+        _emit(f"[GRID] find_optimal_celestial_wcs failed ({exc})", lvl="WARN", callback=progress_callback)
+        global_wcs = None
+        global_shape_hw = None
+
+    if global_wcs is None or global_shape_hw is None:
         first = usable_frames[0]
         global_wcs = copy.deepcopy(first.wcs)
         global_shape_hw = first.shape_hw or (0, 0)
+        _emit(
+            f"[GRID] Falling back to first-frame WCS from {first.path} with initial shape_hw={global_shape_hw}",
+            lvl="WARN",
+            callback=progress_callback,
+        )
 
     if global_wcs is not None:
         global_wcs = _strip_wcs_distortion(global_wcs)
@@ -777,6 +824,14 @@ def build_global_grid(
             )
             return None
         global_shape_hw = (height, width)
+        _emit(
+            f"[GRID] global_bounds count={len(global_bounds)}, min_x={min_x}, max_x={max_x}, min_y={min_y}, max_y={max_y}",
+            callback=progress_callback,
+        )
+        _emit(
+            f"[GRID] global canvas shape_hw={global_shape_hw}, offset=({offset_x}, {offset_y})",
+            callback=progress_callback,
+        )
         local_bounds: list[tuple[int, int, int, int]] = []
         for frame in usable_frames:
             if frame.footprint is None:
@@ -802,6 +857,7 @@ def build_global_grid(
     max_y_local = int(global_shape_hw[0])
     y0 = min_y_local
     tile_id = 1
+    rejected_tiles = 0
     while y0 < max_y_local:
         x0 = min_x_local
         while x0 < max_x_local:
@@ -811,17 +867,26 @@ def build_global_grid(
             bbox_ymax = int(min(y0 + tile_size_px, max_y_local))
             shape_hw = (bbox_ymax - bbox_ymin, bbox_xmax - bbox_xmin)
             if shape_hw[0] <= 0 or shape_hw[1] <= 0:
+                rejected_tiles += 1
                 x0 += step_px
                 continue
             tile_wcs = _clone_tile_wcs(
                 global_wcs, (offset_x + bbox_xmin, offset_y + bbox_ymin), shape_hw
             )
             tiles.append(GridTile(tile_id=tile_id, bbox=(bbox_xmin, bbox_xmax, bbox_ymin, bbox_ymax), wcs=tile_wcs))
+            if tile_id <= 3:
+                _emit(
+                    f"[GRID] Tile bbox (local) id={tile_id}: x=({bbox_xmin},{bbox_xmax}) y=({bbox_ymin},{bbox_ymax})",
+                    callback=progress_callback,
+                )
             tile_id += 1
             x0 += step_px
         y0 += step_px
 
-    _emit(f"Global grid ready: {len(tiles)} tile(s), tile_size_px={tile_size_px}, overlap={overlap_fraction:.3f}", callback=progress_callback)
+    _emit(
+        f"[GRID] Global grid ready: {len(tiles)} tile(s), rejected={rejected_tiles}, tile_size_px={tile_size_px}, overlap={overlap_fraction:.3f}",
+        callback=progress_callback,
+    )
     return GridDefinition(
         global_wcs=global_wcs,
         global_shape_hw=(int(global_shape_hw[0]), int(global_shape_hw[1])),
