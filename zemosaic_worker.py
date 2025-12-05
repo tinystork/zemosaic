@@ -13282,38 +13282,9 @@ def run_hierarchical_mosaic(
     except Exception:
         zconfig = SimpleNamespace()
 
-    if detect_grid_mode(input_folder):
-        try:
-            if grid_mode and hasattr(grid_mode, "run_grid_mode"):
-                grid_mode.run_grid_mode(  # type: ignore[attr-defined]
-                    input_folder=input_folder,
-                    output_folder=output_folder,
-                    progress_callback=progress_callback,
-                    stack_norm_method=stack_norm_method,
-                    stack_weight_method=stack_weight_method,
-                    stack_reject_algo=stack_reject_algo,
-                    stack_kappa_low=stack_kappa_low,
-                    stack_kappa_high=stack_kappa_high,
-                    winsor_limits=parsed_winsor_limits,
-                    stack_final_combine=stack_final_combine,
-                    apply_radial_weight=apply_radial_weight_config,
-                    radial_feather_fraction=radial_feather_fraction_config,
-                    radial_shape_power=radial_shape_power_config,
-                    save_final_as_uint16=save_final_as_uint16_config,
-                    legacy_rgb_cube=legacy_rgb_cube_config,
-                )
-                return
-            else:
-                logger.warning("[GRID] grid_mode module unavailable, continuing with classic pipeline.")
-        except Exception:
-            logger.error("[GRID] Grid/Survey mode failed, continuing with classic pipeline", exc_info=True)
-
-    def pcb(msg_key, prog=None, lvl="INFO", **kwargs):
-        """Shortcut to emit log+callback events with the current progress callback."""
-        _log_and_callback(msg_key, prog, lvl, callback=progress_callback, **kwargs)
-
     def _coerce_bool_flag(value) -> bool | None:
         """Interpret various truthy/falsy representations coming from configs/UI."""
+
         if value is None:
             return None
         if isinstance(value, bool):
@@ -13332,6 +13303,53 @@ def run_hierarchical_mosaic(
             return bool(value)
         except Exception:
             return None
+
+    rgb_equalize_source = "argument"
+    rgb_equalize_flag = bool(poststack_equalize_rgb_config)
+    cfg_rgb = _coerce_bool_flag(worker_config_cache.get("grid_rgb_equalize"))
+    if cfg_rgb is None:
+        cfg_rgb = _coerce_bool_flag(worker_config_cache.get("poststack_equalize_rgb"))
+    if cfg_rgb is not None:
+        rgb_equalize_source = "config"
+        rgb_equalize_flag = cfg_rgb
+    poststack_equalize_rgb_config = bool(rgb_equalize_flag)
+    setattr(zconfig, "poststack_equalize_rgb", bool(rgb_equalize_flag))
+
+    if detect_grid_mode(input_folder):
+        try:
+            if grid_mode and hasattr(grid_mode, "run_grid_mode"):
+                logger.info(
+                    "[GRID] Invoking grid_mode with RGBEqualize=%s (source=%s)",
+                    rgb_equalize_flag,
+                    rgb_equalize_source,
+                )
+                grid_mode.run_grid_mode(  # type: ignore[attr-defined]
+                    input_folder=input_folder,
+                    output_folder=output_folder,
+                    progress_callback=progress_callback,
+                    stack_norm_method=stack_norm_method,
+                    stack_weight_method=stack_weight_method,
+                    stack_reject_algo=stack_reject_algo,
+                    stack_kappa_low=stack_kappa_low,
+                    stack_kappa_high=stack_kappa_high,
+                    winsor_limits=parsed_winsor_limits,
+                    stack_final_combine=stack_final_combine,
+                    apply_radial_weight=apply_radial_weight_config,
+                    radial_feather_fraction=radial_feather_fraction_config,
+                    radial_shape_power=radial_shape_power_config,
+                    save_final_as_uint16=save_final_as_uint16_config,
+                    legacy_rgb_cube=legacy_rgb_cube_config,
+                    grid_rgb_equalize=rgb_equalize_flag,
+                )
+                return
+            else:
+                logger.warning("[GRID] grid_mode module unavailable, continuing with classic pipeline.")
+        except Exception:
+            logger.error("[GRID] Grid/Survey mode failed, continuing with classic pipeline", exc_info=True)
+
+    def pcb(msg_key, prog=None, lvl="INFO", **kwargs):
+        """Shortcut to emit log+callback events with the current progress callback."""
+        _log_and_callback(msg_key, prog, lvl, callback=progress_callback, **kwargs)
 
     global_wcs_plan = _prepare_global_wcs_plan(
         output_folder,
