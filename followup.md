@@ -7,42 +7,42 @@
 
 ### 1. Enrich `assemble_tiles(...)` logging
 
-- [ ] Add detailed logs for each early-return condition:
-  - [ ] Astropy/FITS unavailable (with flags).
-  - [ ] `tiles_list` empty (with counts and sample paths).
-  - [ ] `tile_infos` empty (with summary: io_fail, channel_mismatch, empty_mask, kept=0).
-  - [ ] `weight_sum` all zeros (with counts and hint).
-- [ ] Track per-tile failure reasons with counters:
-  - [ ] I/O failures.
-  - [ ] Channel mismatches.
-  - [ ] Empty valid masks.
-- [ ] Emit a summary line after building `tile_infos`.
-- [ ] Ensure all logs use `_emit(...)` and follow the existing `[GRID]` / logging style.
+- [x] Add detailed logs for each early-return condition:
+  - [x] Astropy/FITS unavailable (with flags).
+  - [x] `tiles_list` empty (with counts and sample paths).
+  - [x] `tile_infos` empty (with summary: io_fail, channel_mismatch, empty_mask, kept=0).
+  - [x] `weight_sum` all zeros (with counts and hint).
+- [x] Track per-tile failure reasons with counters:
+  - [x] I/O failures.
+  - [x] Channel mismatches.
+  - [x] Empty valid masks.
+- [x] Emit a summary line after building `tile_infos`.
+- [x] Ensure all logs use `_emit(...)` and follow the existing `[GRID]` / logging style.
 
 ### 2. Relax logic & salvage assembly
 
-- [ ] Modify the `weight_sum` check to:
-  - [ ] Log a warning when `weight_sum` is all zeros.
-  - [ ] Attempt a salvage assembly using a simple, relaxed placement of tiles into the mosaic.
-  - [ ] Only `return None` if both nominal and salvage paths fail to write any data.
-- [ ] Add a log indicating when the salvage path is used:
-  - [ ] `"Assembly: salvage assembly succeeded..."` or similar.
-- [ ] Keep overlap/photometry logic intact for the normal successful path.
+- [x] Modify the `weight_sum` check to:
+  - [x] Log a warning when `weight_sum` is all zeros.
+  - [x] Attempt a salvage assembly using a simple, relaxed placement of tiles into the mosaic.
+  - [x] Only `return None` if both nominal and salvage paths fail to write any data.
+- [x] Add a log indicating when the salvage path is used:
+  - [x] `"Assembly: salvage assembly succeeded..."` or similar.
+- [x] Keep overlap/photometry logic intact for the normal successful path.
 
 ### 3. RGB equalization coherence (Grid vs classic)
 
-- [ ] Audit current RGB equalization flags and usage in:
-  - [ ] `zemosaic_worker.py` (classic pipeline, phase 3+5).
-  - [ ] `grid_mode.py` (`grid_rgb_equalize`, `grid_post_equalize_rgb`).
-- [ ] Introduce a single, explicit boolean for “final RGB equalization enabled?”:
-  - [ ] Derive it from config/GUI in `run_hierarchical_mosaic(...)`.
-  - [ ] Use it for the classic pipeline’s final assembly (`RGBEqualize`).
-  - [ ] Pass it explicitly to `grid_mode.run_grid_mode(..., grid_rgb_equalize=...)`.
-- [ ] Adjust config overlay in `grid_mode.run_grid_mode(...)` so that:
-  - [ ] The final `grid_rgb_equalize` state is well-defined and logged.
-- [ ] Add minimal sanity logs:
-  - [ ] In `run_hierarchical_mosaic(...)`: log `[GRID] Invoking grid_mode with RGBEqualize=...`.
-  - [ ] In `assemble_tiles(...)`: log the effective RGB equalization state when calling `grid_post_equalize_rgb(...)`.
+- [x] Audit current RGB equalization flags and usage in:
+  - [x] `zemosaic_worker.py` (classic pipeline, phase 3+5).
+  - [x] `grid_mode.py` (`grid_rgb_equalize`, `grid_post_equalize_rgb`).
+- [x] Introduce a single, explicit boolean for “final RGB equalization enabled?”:
+  - [x] Derive it from config/GUI in `run_hierarchical_mosaic(...)`.
+  - [x] Use it for the classic pipeline’s final assembly (`RGBEqualize`).
+  - [x] Pass it explicitly to `grid_mode.run_grid_mode(..., grid_rgb_equalize=...)`.
+- [x] Adjust config overlay in `grid_mode.run_grid_mode(...)` so that:
+  - [x] The final `grid_rgb_equalize` state is well-defined and logged.
+- [x] Add minimal sanity logs:
+  - [x] In `run_hierarchical_mosaic(...)`: log `[GRID] Invoking grid_mode with RGBEqualize=...`.
+  - [x] In `assemble_tiles(...)`: log the effective RGB equalization state when calling `grid_post_equalize_rgb(...)`.
 
 ### 4. Tests / validation
 
