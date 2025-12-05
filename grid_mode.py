@@ -1539,15 +1539,30 @@ def assemble_tiles(
     """Assemble processed tiles into the final mosaic without global reprojection."""
 
     if not (_ASTROPY_AVAILABLE and fits):
-        _emit("Astropy unavailable, cannot assemble mosaic", lvl="ERROR", callback=progress_callback)
+        _emit(
+            f"Astropy unavailable, cannot assemble mosaic (fallback to classic?). _ASTROPY_AVAILABLE={_ASTROPY_AVAILABLE}, fits_present={bool(fits)}",
+            lvl="ERROR",
+            callback=progress_callback,
+        )
         return None
-    tiles_list = [t for t in tiles if t.output_path and t.output_path.is_file()]
+
+    tiles_seq = list(tiles)
+    tiles_list = [t for t in tiles_seq if t.output_path and t.output_path.is_file()]
     if not tiles_list:
-        _emit("No tiles to assemble", lvl="ERROR", callback=progress_callback)
+        sample_paths = [str(t.output_path) for t in tiles_seq if getattr(t, "output_path", None)]
+        sample_preview = ", ".join(sample_paths[:3]) if sample_paths else "<no paths>"
+        _emit(
+            f"No tiles to assemble (len(tiles)={len(tiles_seq)}, len(tiles_list)=0). Sample output paths: {sample_preview}",
+            lvl="ERROR",
+            callback=progress_callback,
+        )
         return None
 
     tile_infos: list[TilePhotometryInfo] = []
     channels: int | None = None
+    io_failures = 0
+    channel_mismatches = 0
+    empty_masks = 0
     for t in tiles_list:
         try:
             with _open_fits_safely(t.output_path) as hdul:
@@ -1556,13 +1571,19 @@ def assemble_tiles(
                     raise ValueError("empty data")
                 data = _ensure_hwc_array(raw_data)
         except Exception as exc:
-            _emit(f"Assembly: failed to read {t.output_path} ({exc})", lvl="WARN", callback=progress_callback)
+            io_failures += 1
+            _emit(
+                f"Assembly: failed to read {t.output_path} ({exc})",
+                lvl="WARN",
+                callback=progress_callback,
+            )
             continue
 
         c = 1 if data.ndim == 2 else data.shape[-1]
         if channels is None:
             channels = c
         if c != channels:
+            channel_mismatches += 1
             _emit(
                 f"Assembly: tile {t.tile_id} channel mismatch ({c} != {channels}), skipping",
                 lvl="WARN",
@@ -1570,11 +1591,35 @@ def assemble_tiles(
             )
             continue
         mask = compute_valid_mask(data)
+        if not np.any(mask):
+            empty_masks += 1
+            _emit(
+                f"Assembly: tile {t.tile_id} has empty valid-mask, skipping",
+                lvl="WARN",
+                callback=progress_callback,
+            )
+            continue
         tile_infos.append(TilePhotometryInfo(tile_id=t.tile_id, bbox=t.bbox, data=data, mask=mask))
 
     if not tile_infos:
-        _emit("Unable to read any tile for assembly", lvl="ERROR", callback=progress_callback)
+        _emit(
+            (
+                "Unable to read any tile for assembly. "
+                f"Assembly summary: attempted={len(tiles_list)}, io_fail={io_failures}, "
+                f"channel_mismatch={channel_mismatches}, empty_mask={empty_masks}, kept=0"
+            ),
+            lvl="ERROR",
+            callback=progress_callback,
+        )
         return None
+
+    _emit(
+        (
+            f"Assembly: {len(tile_infos)} tiles kept "
+            f"(io_fail={io_failures}, channel_mismatch={channel_mismatches}, empty_mask={empty_masks})"
+        ),
+        callback=progress_callback,
+    )
 
     channels = channels or 1
     mosaic_shape = (grid.global_shape_hw[0], grid.global_shape_hw[1], channels)
@@ -1768,8 +1813,70 @@ def assemble_tiles(
         _emit(f"Assembly: placed tile {info.tile_id} unique area", lvl="DEBUG", callback=progress_callback)
 
     if not np.any(weight_sum > 0):
-        _emit("Assembly: no valid tile data written to mosaic", lvl="ERROR", callback=progress_callback)
-        return None
+        try:
+            min_x0 = min(info.bbox[0] for info in tile_infos)
+            max_x1 = max(info.bbox[1] for info in tile_infos)
+            min_y0 = min(info.bbox[2] for info in tile_infos)
+            max_y1 = max(info.bbox[3] for info in tile_infos)
+            bbox_hint = f"bbox_extent=({min_x0}:{max_x1},{min_y0}:{max_y1})"
+        except Exception:
+            bbox_hint = "bbox_extent=unavailable"
+        _emit(
+            (
+                "Assembly: no valid tile data written to mosaic. "
+                f"Tiles kept={len(tile_infos)}; {bbox_hint}. "
+                "All tiles may have been fully masked out or outside the global canvas."
+            ),
+            lvl="WARN",
+            callback=progress_callback,
+        )
+        _emit("Assembly: attempting salvage assembly with relaxed placement", lvl="WARN", callback=progress_callback)
+
+        salvage_sum = np.zeros_like(mosaic_sum)
+        salvage_weight = np.zeros_like(weight_sum)
+        salvage_placed = 0
+        for info in tile_infos:
+            tx0, tx1, ty0, ty1 = info.bbox
+            x0 = max(0, min(tx0, W_m))
+            y0 = max(0, min(ty0, H_m))
+            x1 = max(0, min(tx1, W_m))
+            y1 = max(0, min(ty1, H_m))
+            if x1 <= x0 or y1 <= y0:
+                continue
+            h, w, c = info.data.shape
+            off_x = max(0, -tx0)
+            off_y = max(0, -ty0)
+            used_w = min(w - off_x, x1 - x0)
+            used_h = min(h - off_y, y1 - y0)
+            if used_h <= 0 or used_w <= 0:
+                continue
+            data_crop = info.data[off_y : off_y + used_h, off_x : off_x + used_w, :]
+            mask_crop = compute_valid_mask(data_crop) & info.mask[off_y : off_y + used_h, off_x : off_x + used_w, :]
+            if not np.any(mask_crop):
+                continue
+            channel_mask = mask_crop if mask_crop.ndim == 3 else np.repeat(mask_crop[..., np.newaxis], c, axis=2)
+            weight_crop = channel_mask.astype(np.float32, copy=False)
+            slice_y = slice(y0, y0 + used_h)
+            slice_x = slice(x0, x0 + used_w)
+            salvage_sum[slice_y, slice_x, :] += np.where(channel_mask, data_crop, 0.0) * weight_crop
+            salvage_weight[slice_y, slice_x, :] += weight_crop
+            salvage_placed += 1
+
+        if not np.any(salvage_weight > 0):
+            _emit(
+                "Assembly: salvage assembly failed (no valid tile data after salvage)",
+                lvl="ERROR",
+                callback=progress_callback,
+            )
+            return None
+
+        mosaic_sum = salvage_sum
+        weight_sum = salvage_weight
+        _emit(
+            f"Assembly: salvage assembly succeeded (placed {salvage_placed} tiles)",
+            lvl="WARN",
+            callback=progress_callback,
+        )
 
     with np.errstate(divide="ignore", invalid="ignore"):
         mosaic = np.where(weight_sum > 0, mosaic_sum / np.clip(weight_sum, 1e-6, None), np.nan)
@@ -1845,6 +1952,7 @@ def run_grid_mode(
 
     _emit("Grid/Survey mode activated (stack_plan.csv detected)", callback=progress_callback)
     cfg_disk = _load_config_from_disk()
+    rgb_source = "param"
     try:
         overlap_fraction = float(cfg_disk.get("batch_overlap_pct", 0.0)) / 100.0
     except Exception:
@@ -1855,12 +1963,19 @@ def run_grid_mode(
         grid_size_factor = 1.0
     try:
         rgb_cfg = cfg_disk.get("grid_rgb_equalize", grid_rgb_equalize)
+        if "grid_rgb_equalize" in cfg_disk:
+            rgb_source = "config"
         if isinstance(rgb_cfg, str):
             grid_rgb_equalize = rgb_cfg.strip().lower() not in {"0", "false", "no", "off"}
         else:
             grid_rgb_equalize = bool(rgb_cfg)
     except Exception:
         grid_rgb_equalize = bool(grid_rgb_equalize)
+    _emit(
+        f"Grid mode RGB equalization: enabled={grid_rgb_equalize} (source={rgb_source})",
+        lvl="INFO",
+        callback=progress_callback,
+    )
     chunk_budget_mb = 512.0
     try:
         gb_val = cfg_disk.get("grid_chunk_ram_gb")
