@@ -1,256 +1,376 @@
-# 🎯 Mission Codex — Garde-fou WCS global dégénéré + Fallback robuste en Grid Mode
+# Agent – Grid Mode RGB + stacking parity
 
-## Contexte
+## Context
 
-Avec les nouveaux logs `[GRID]` et `[GRID-ASM]`, on a compris que :
+Project: **ZeMosaic / Grid & Survey mode**
 
-- En Grid mode, `find_optimal_celestial_wcs(...)` retourne parfois un WCS global avec :
-  - `shape_hw=(2, 2)` → puis un canvas final `global_shape_hw=(3, 3)`.
-- Le pipeline classique (Phase 4) pour le **même dataset** produit une mosaïque parfaitement raisonnable (~3200×2100 px).
-- Grâce aux logs, on sait maintenant que :
-  - les `global_bounds` et l’offset sont cohérents,
-  - les bboxes de tuile sont bien alignées sur le canvas,
-  - l’assemblage place la tuile correctement dans le canvas **3×3** (donc l’assemblage n’est plus en cause).
-
-Conclusion :  
-👉 Le **vrai problème** est désormais la **WCS globale dégénérée** (trop petite) retournée par `find_optimal_celestial_wcs` dans certains cas.
-
-Nous voulons :
-
-1. Détecter ces cas de WCS “dégénérés” (ex : `shape_hw` ridicule par rapport aux frames).
-2. **Basculer automatiquement sur un fallback “safe”** basé sur les WCS des frames, même si ce n’est pas optimal, mais suffisamment grand/robuste pour construire une mosaïque utile.
-3. Ne pas casser les cas où `find_optimal_celestial_wcs` fonctionne bien.
-
----
-
-## Fichiers concernés
+Files primarily involved:
 
 - `grid_mode.py`
-  - Fonction principale : `build_global_grid(...)`
-    - Là où `find_optimal_celestial_wcs` est appelé.
-    - Là où le WCS global et `global_shape_hw` sont définis.
-  - Ajout de deux helpers :
-    - `_is_degenerate_global_wcs(...)`
-    - `_build_fallback_global_wcs(...)`
-  - Utilisation de ces helpers dans `build_global_grid`.
+- `zemosaic_worker.py` (only for wiring & config forwarding, *no heavy refactor here*)
+- `zemosaic_utils.py` (for reusing existing FITS loading / debayer logic, if needed)
 
-Éventuellement (selon l’implémentation actuelle) :
+Current symptoms (from user logs and visual output):
 
-- Une fonction utilitaire existante pour calculer les footprints dans un WCS donné, par exemple :
-  - `_compute_frame_footprint(...)`
-  - ou équivalent (à réutiliser).
+- Grid mode runs to completion, builds tiles, and assembles a final mosaic without throwing.
+- All tiles and the final `mosaic_grid.fits` are **monochrome** with a single channel (shape `(H, W, 1)`).
+- When converting some tiles to PNG, dimensions appear as `1 x 1920` instead of `1080 x 1920 x 3` as expected for RGB.
+- Log excerpt:
 
----
+  - Final mosaic is prepared as `shape=(3272, 2406, 1)` and RGB equalization is skipped because the mosaic is not RGB. :contentReference[oaicite:0]{index=0}  
+  - Tiles are defined with `tile_size_px=1920` and bbox coordinates are correct; the **geometry/WCS is OK**, the problem is the **data layout / channels**.
 
-## Objectifs
+Goal for this agent:
 
-1. **Ajouter un validateur de WCS global** : `_is_degenerate_global_wcs(frames, global_wcs, global_shape_hw)` qui retourne `True` si le WCS proposé est manifestement aberrant (trop petit) par rapport aux frames.
-2. **Ajouter un fallback** : `_build_fallback_global_wcs(frames)` qui :
-   - prend le WCS d’un frame valide comme base (ex : le premier),
-   - projette les footprints de tous les frames dans ce WCS,
-   - en déduit un canvas global raisonnable (`global_shape_hw`) et des `global_bounds`.
-3. Dans `build_global_grid` :
-   - après l’appel à `find_optimal_celestial_wcs`, utiliser `_is_degenerate_global_wcs` pour décider si on garde ce WCS ou si on active le fallback.
-   - logger clairement quand le fallback est utilisé.
-4. Ne pas toucher à la logique d’assemblage actuelle (offset, bboxes, etc.), qui fonctionne déjà correctement une fois qu’on a une WCS et un canvas plausibles.
+1. Make **Grid/Survey mode** handle **RGB data** correctly (3 channels), in a way that is consistent with the classic hierarchical pipeline.
+2. Ensure stacking behaviour in grid mode (**norm, weights, reject algo, combine**) matches the main stacking pipeline semantics.
+3. Add explicit logging around shapes and channel counts so future regressions are easy to spot.
+4. Preserve backward compatibility for mono / legacy datasets where possible.
 
 ---
 
-## Détails d’implémentation
+## High-level plan
 
-### 1. Ajouter `_is_degenerate_global_wcs(...)`
+1. **Instrumentation & diagnostics** – log shapes / channels at key stages so we can verify behaviour.
+2. **Fix FITS loading / channel handling in Grid Mode** – ensure `_load_image_with_optional_alpha` and `_reproject_frame_to_tile` produce the correct H×W×C arrays.
+3. **Verify & align stacking semantics** – ensure `_stack_weighted_patches` reflects `stack_norm_method`, `stack_weight_method`, `stack_reject_algo`, `stack_final_combine` in the same spirit as `create_master_tile` / classic stacking.
+4. **Fix mosaic assembly & RGB equalization** – ensure final mosaic is RGB when input is RGB, and that `grid_post_equalize_rgb` is actually used.
+5. **Add small regression tests / sanity checks** – at least smoke tests and logging.
 
-Dans `grid_mode.py`, ajouter une fonction :
+Work incrementally and keep `followup.md` updated (checked tasks, notes, regressions).
+
+---
+
+## 1. Instrumentation & diagnostics
+
+**File:** `grid_mode.py`
+
+### 1.1. Log channel / shape info at frame load & reprojection
+
+Add detailed `[GRID]` logs in these functions:
+
+- `_load_image_with_optional_alpha`
+- `_reproject_frame_to_tile`
+- `process_tile`
+- Assembly phase functions (where the final mosaic array is created and RGB equalization is called)
+
+Concretely:
+
+- After `_ensure_hwc_array(data)` in `_load_image_with_optional_alpha`, log:
+
+  - Original FITS data shape and dtype (`hdul[0].data.shape`, `dtype`)
+  - Shape after `_ensure_hwc_array` (H, W, C)
+  - Whether `C == 1` or `C == 3`
+
+- In `_reproject_frame_to_tile`, after computing `reproj_stack`:
+
+  - Log the tile id, frame path (basename), and `reproj_stack.shape`.
+
+- In `process_tile`, just before calling `_stack_weighted_patches` and just before writing the tile FITS:
+
+  - Log the number of frames, tile bbox, tile_shape, and the shape of the stacked result.
+
+- In the assembly phase:
+
+  - When allocating the mosaic canvas, log its shape and dtype.
+  - Just before calling `grid_post_equalize_rgb`, log the current mosaic shape and the fact that equalization will or will not run (include the reason when skipping).
+
+Make logs explicit, e.g.:
+
+- `[GRID] DEBUG_SHAPE: loaded frame 'Light_xxx.fit' raw=(H,W,?) hwc=(H,W,C)`
+- `[GRID] DEBUG_SHAPE: tile 3 stacked patch shape=(H,W,C)`
+- `[GRID] DEBUG_SHAPE: mosaic before RGB equalization shape=(H,W,C)`
+
+This will confirm whether the monochrome behaviour comes from FITS loading or from the stacking/assembly steps.
+
+### 1.2. Log stacking configuration
+
+In `run_grid_mode`, after assembling `GridModeConfig`, log a single summary line:
+
+- `stack_norm_method`
+- `stack_weight_method`
+- `stack_reject_algo`
+- `winsor_limits`
+- `stack_final_combine`
+- `apply_radial_weight`, `radial_feather_fraction`, `radial_shape_power`
+- `grid_rgb_equalize`
+
+Example:
 
 ```python
-def _is_degenerate_global_wcs(
-    frames: list["FrameInfo"],
-    global_wcs: "WCS",
-    global_shape_hw: tuple[int, int],
-) -> bool:
-    """
-    Retourne True si le WCS global proposé est manifestement aberrant
-    par rapport aux frames d'entrée.
-    """
-    H_m, W_m = global_shape_hw
-
-    # 1) Taille minimale absolue (à ajuster si besoin)
-    MIN_SIZE = 256
-    if H_m < MIN_SIZE or W_m < MIN_SIZE:
-        return True
-
-    # 2) Comparaison avec la taille moyenne des frames
-    valid_frames = [f for f in frames if getattr(f, "shape_hw", None)]
-    if valid_frames:
-        mean_h = int(np.mean([f.shape_hw[0] for f in valid_frames]))
-        mean_w = int(np.mean([f.shape_hw[1] for f in valid_frames]))
-        # Si le canvas est plus petit que ~50% d'un frame moyen, c'est suspect.
-        if H_m < 0.5 * mean_h or W_m < 0.5 * mean_w:
-            return True
-
-    # 3) (Optionnel) On pourrait ajouter un test sur l'étendue réelle
-    # des footprints dans ce WCS, mais le MIN_SIZE + comparaison moyenne
-    # suffisent pour un premier garde-fou.
-    return False
+_emit(
+    "[GRID] Stacking config: norm={config.stack_norm_method}, "
+    f"weight={config.stack_weight_method}, reject={config.stack_reject_algo}, "
+    f"winsor={config.winsor_limits}, combine={config.stack_final_combine}, "
+    f"radial={config.apply_radial_weight} "
+    f"(feather={config.radial_feather_fraction}, power={config.radial_shape_power}), "
+    f"rgb_equalize={grid_rgb_equalize}",
+    lvl="INFO",
+    callback=progress_callback,
+)
 ````
 
-Contraintes :
+---
 
-* Utiliser `np.mean` si `numpy` est déjà importé dans ce module (sinon, l’importer en haut du fichier).
-* Le type `FrameInfo` et `WCS` peuvent être importés ou typés en forward ref (`"WCS"`).
+## 2. Fix FITS loading & RGB handling in Grid Mode
 
-### 2. Ajouter `_build_fallback_global_wcs(frames)`
+**File:** `grid_mode.py` (primary), optionally `zemosaic_utils.py` for reuse.
 
-Ajouter une fonction qui :
+Currently, `_load_image_with_optional_alpha` reads:
 
-1. Choisit un frame de base (par ex. le **premier frame valide** dans la liste).
+* `data = hdul[0].data`
+* Then passes it to `_ensure_hwc_array`, which converts:
 
-   ```python
-   def _pick_first_valid_frame(frames: list["FrameInfo"]) -> "FrameInfo":
-       for f in frames:
-           if getattr(f, "wcs", None) is not None and getattr(f, "shape_hw", None):
-               return f
-       raise RuntimeError("[GRID] fallback WCS: no valid frame with WCS/shape")
-   ```
+  * 2D arrays → `(H, W, 1)`
+  * 3D arrays with C/H/W in first axis or last axis → `(H, W, C)`
 
-2. Copie son WCS :
+This means:
 
-   ```python
-   base_frame = _pick_first_valid_frame(frames)
-   base_wcs = copy.deepcopy(base_frame.wcs)
-   ```
+* Seestar raw Bayer FITS (2D) become `(H, W, 1)` and are never debayered to RGB.
+* The whole Grid Mode pipeline then works on a single channel → final mosaic `(H, W, 1)` and RGB equalization is skipped.
 
-3. Pour chaque frame valide, calcule son footprint dans le repère de `base_wcs`.
-   L’objectif est d’obtenir une liste de bounds `(x0, x1, y0, y1)` dans ce WCS.
-   Si une fonction utilitaire existe déjà (ex : `_compute_frame_footprint(global_wcs, frame)`), la réutiliser.
+### 2.1. Decide on the source of RGB data
 
-   Pseudo-code :
+Goal: Grid Mode should operate on **the same type of images as the classic pipeline**:
 
-   ```python
-   bounds: list[tuple[float, float, float, float]] = []
-   for frame in frames:
-       try:
-           x0, x1, y0, y1 = _compute_frame_footprint(base_wcs, frame)
-           bounds.append((x0, x1, y0, y1))
-       except Exception:
-           logger.warning("[GRID] fallback WCS: failed to compute footprint for frame %s", getattr(frame, "id", "?"))
-           continue
-   ```
+* For Seestar / Bayer FITS: pipeline converts to RGB using `zemosaic_utils.debayer_image(...)`.
+* For already RGB FITS (e.g. external pre-stacked masters): we should keep them as 3-channel images (H, W, 3).
 
-4. Si `bounds` est vide, lever une erreur claire :
+Implementation guidelines:
 
-   ```python
-   if not bounds:
-       raise RuntimeError("[GRID] fallback WCS: could not compute any footprint")
-   ```
+1. **Try to reuse `zemosaic_utils.load_and_validate_fits`**:
 
-5. À partir de ces bounds, calculer :
+   * It already handles BZERO/BSCALE, axis ordering (CHW vs HWC), NaN sanitization, etc.
+   * It can return an array that is either 2D (mono) or 3D (HWC).
 
-   ```python
-   min_x = math.floor(min(b[0] for b in bounds))
-   max_x = math.ceil(max(b[1] for b in bounds))
-   min_y = math.floor(min(b[2] for b in bounds))
-   max_y = math.ceil(max(b[3] for b in bounds))
+2. If you integrate `load_and_validate_fits`:
 
-   width = int(max_x - min_x)
-   height = int(max_y - min_y)
-   global_shape_hw = (height, width)
+   * Import it at top of `grid_mode.py`:
 
-   offset_x, offset_y = min_x, min_y
-   ```
+     ```python
+     from zemosaic_utils import load_and_validate_fits, debayer_image
+     ```
 
-6. Enregistrer ces `bounds` comme `global_bounds` et, si besoin, l’offset dans une structure existante (par exemple attachée à l’objet grid).
-   Le but est de rester cohérent avec l’offset/bboxes déjà utilisés ailleurs.
+   * In `_load_image_with_optional_alpha`:
 
-7. Appliquer `_strip_wcs_distortion(base_wcs)` si c’est le comportement standard :
+     * Replace the raw `hdul[0].data` logic by:
 
-   ```python
-   fallback_wcs = _strip_wcs_distortion(base_wcs)
-   return fallback_wcs, global_shape_hw, bounds
-   ```
+       ```python
+       img, header, info = load_and_validate_fits(path, normalize_to_float32=True, attempt_fix_nonfinite=True, progress_callback=None)
+       ```
 
-### 3. Intégrer le garde-fou & fallback dans `build_global_grid(...)`
+     * If `img is None`, raise or propagate an error so the frame is skipped with a `[GRID]` warning.
 
-Dans `build_global_grid`, là où on appelle actuellement :
+   * Use the header and/or `info` to detect whether the image is mono Bayer that needs debayering:
 
-```python
-global_wcs, global_shape_hw = find_optimal_celestial_wcs(...)
-```
+     * Check `BAYERPAT` in the header.
+     * Or, rely on project conventions (e.g. Seestar FITS are 2D; dedicated config flag if needed).
 
-adapter en :
+3. **Debayer when necessary**:
 
-```python
-global_wcs, global_shape_hw = find_optimal_celestial_wcs(...)
+   * If `img.ndim == 2` and you detect a Bayer pattern:
 
-if _is_degenerate_global_wcs(frames, global_wcs, global_shape_hw):
-    logger.warning(
-        "[GRID] Optimal global WCS looks degenerate (shape_hw=%s), falling back to safer WCS",
-        global_shape_hw,
-    )
-    global_wcs, global_shape_hw, global_bounds = _build_fallback_global_wcs(frames)
-    logger.info(
-        "[GRID] Fallback global WCS: shape_hw=%s (bounds from %d frames)",
-        global_shape_hw, len(frames),
-    )
-else:
-    logger.info(
-        "[GRID] Optimal global WCS accepted: shape_hw=%s",
-        global_shape_hw,
-    )
-    # global_bounds sera calculé comme avant (footprints dans global_wcs)
-```
+     ```python
+     bayer_pattern = header.get("BAYERPAT", "GRBG")
+     img_rgb = debayer_image(img, bayer_pattern=bayer_pattern)
+     ```
 
-Remarques :
+   * Ensure `img_rgb` is normalized to [0, 1] float32 in HWC format.
 
-* Il faut que `_build_fallback_global_wcs` renvoie aussi `global_bounds` (ou une structure équivalente) si le reste du code s’appuie dessus.
-* Dans la branche “non dégénérée”, on garde le comportement actuel.
+4. **Ensure non-Bayer images stay as they are**:
 
-### 4. Logging
+   * If `img.ndim == 3` and appears to be RGB (C in last axis or first axis) rely on `load_and_validate_fits` axis handling.
+   * After that, pass the image to `_ensure_hwc_array` to guarantee `(H, W, C)`.
 
-* Ajouter les logs `[GRID]` indiqués ci-dessus :
+5. **Return HWC in `_load_image_with_optional_alpha`**:
 
-  * warning si WCS jugé dégénéré,
-  * info sur le fallback (shape, nb de frames utilisés).
-* Conserver les logs déjà en place sur :
+   * After the above, `_ensure_hwc_array` should give you `(H, W, C)`; `C` will be 3 for RGB data.
+   * Only if the input is truly mono (e.g. a genuine grayscale survey image) should `C` remain 1.
 
-  * `global_bounds count=...`,
-  * `global canvas shape_hw=..., offset=...`.
+6. **Alpha channel**:
+
+   * Keep the alpha logic as is, but ensure that if the alpha HDU is 2D and the data is RGB, alpha is broadcast/expanded to `(H, W, C)`.
+
+End goal:
+
+* For Seestar lights in Grid Mode: **H×W×3 RGB arrays**, same photometric scale as the rest of the pipeline.
+
+### 2.2. Check `_reproject_frame_to_tile` uses all channels
+
+Function currently:
+
+* Calls `_load_image_with_optional_alpha` → `data` (H, W, C) and `alpha_weights`.
+* Sets `channels = data.shape[-1] if data.ndim == 3 else 1`.
+* Loops over `c in range(channels)` and reprojects `data[..., c]`.
+
+Verify / ensure:
+
+* For RGB images, `channels == 3` and `reproj_stack.shape == (tile_h, tile_w, 3)`.
+* For genuine mono images, `channels == 1` and you end with `(tile_h, tile_w, 1)`.
+
+Keep the existing `alpha_weights` handling but ensure:
+
+* If `alpha_weights` is 2D and `data` has 3 channels, broadcast alpha to 3 channels when applying it.
 
 ---
 
-## Tests & Validation
+## 3. Verify & align stacking semantics
 
-1. **Dataset problématique actuel (celui qui donne un WCS 2×2)**
+**File:** `grid_mode.py`
 
-   * Vérifier que les logs contiennent :
+Function: `_stack_weighted_patches` + surrounding chunked stacking logic in `process_tile`.
 
-     * `[GRID] Optimal global WCS looks degenerate...`
-     * `[GRID] Fallback global WCS: shape_hw=...`
-   * Vérifier que :
+Goal: Make Grid Mode stacking behave like classic stacking with respect to:
 
-     * le Grid mode ne s’arrête plus avec une mosaïque 3×3,
-     * la mosaïque grid a une taille raisonnable et contient des données visibles.
+* `stack_norm_method`: e.g. `"none"`, `"linear_fit"`, etc.
+* `stack_weight_method`: e.g. `"noise_variance"`, `"none"`, etc.
+* `stack_reject_algo`: `"winsorized_sigma_clip"`, `"kappa_sigma"`, or `"none"`.
+* `winsor_limits`: e.g. `(0.05, 0.05)`.
+* `stack_final_combine`: `"mean"` or `"median"`.
 
-2. **Dataset sain où `find_optimal_celestial_wcs` marche déjà bien**
+Tasks:
 
-   * Vérifier que :
+1. **Review how classic stacking interprets these parameters**:
 
-     * le garde-fou **n’est pas déclenché** (logs `Optimal global WCS accepted`),
-     * le comportement reste identique à avant (taille de mosaïque, visuel, etc.).
+   * Look into `zemosaic_align_stack.py` and `zemosaic_worker.create_master_tile` for reference.
+   * Identify how `linear_fit` normalization and `noise_variance` weighting are implemented in the standard pipeline.
 
-3. **Non-régression**
+2. **Document any differences in comments**:
 
-   * Grid mode désactivé → pipeline classique inchangé.
-   * Grid mode sur des petits jeux de données (2–3 images) → ajuster éventuellement `MIN_SIZE` si besoin (on peut descendre de 256 à 128 si les tests montrent que c’est trop strict).
+   * If grid mode cannot exactly mirror the classic behaviour (e.g. due to different data shapes or constraints), document the deviation in comments at top of `_stack_weighted_patches`.
+
+3. **Ensure `_stack_weighted_patches` uses config correctly**:
+
+   * For rejection:
+
+     * If `config.stack_reject_algo` is `winsorized_sigma_clip` or `winsor`, use `_reject_outliers_winsorized_sigma_clip`.
+     * If `kappa_sigma` or `kappa`, use `_reject_outliers_kappa_sigma`.
+     * If `"none"` or unrecognized, skip rejection.
+
+   * For final combine:
+
+     * `"mean"` → weighted sum / weight_sum.
+     * `"median"` → median over valid positions.
+
+   * Make sure all these branches are already correct; if not, fix & add comments.
+
+4. **Channel-wise stacking**
+
+   * Stacking should work identically per channel:
+
+     * `patches` should be `(H, W, C)`.
+     * The code should allow C=1 or C=3 seamlessly (no hardcoded assumption that C=1).
+     * All normalization and rejection should operate over the frame axis, not across channels.
+
+5. **Return types**
+
+   * `_stack_weighted_patches` should always return:
+
+     * `(stacked, weight_sum, ref_median_used)` when `return_weight_sum=True` and `return_ref_median=True`.
+     * Ensure `stacked.shape` matches `(H, W, C)` and `weight_sum.shape` matches `(H, W, C)`.
 
 ---
 
-## Critères d’acceptation
+## 4. Fix mosaic assembly & RGB equalization
 
-* ✅ Les cas où `find_optimal_celestial_wcs` renvoie un WCS manifestement trop petit activent le fallback, et le Grid mode produit une mosaïque de taille raisonnable avec du signal.
-* ✅ Les cas “normaux” où le WCS optimal est correct ne déclenchent pas le fallback et continuent de fonctionner comme avant.
-* ✅ Aucun crash ou régression majeure dans les autres chemins (pipeline classique non touché).
-* ✅ Les logs `[GRID]` permettent de vérifier facilement si le WCS optimal a été accepté ou si on est passé en fallback.
+**File:** `grid_mode.py`
 
-Merci 🙏
+1. **Creation of the mosaic canvas**
 
+   * In the assembly phase (where tiles are read from disk and blended):
+
+     * Ensure the canvas is created with shape `(H_global, W_global, C)` where `C` comes from the first valid tile.
+     * If some tiles are mono and others RGB, log a warning and either:
+
+       * Convert mono tiles to RGB by duplicating the channel; or
+       * Skip RGB equalization and state why.
+
+2. **RGB equalization**
+
+   * Function `grid_post_equalize_rgb` already expects an RGB mosaic and logs:
+
+     * `"RGB equalization: skipped (non-RGB mosaic with shape=...)"` in the current logs.
+
+   * Make sure that:
+
+     * We call `grid_post_equalize_rgb` **only when** `mosaic.ndim == 3` and `mosaic.shape[-1] == 3`.
+     * When `grid_rgb_equalize=True` but `mosaic` is not RGB, we keep the log but ensure it’s clear (include shape, why it’s mono).
+
+3. **Photometry and blending**
+
+   * Verify that photometry and pyramidal blending continue to work with multi-channel arrays:
+
+     * Either they already support HWC arrays, or they operate per channel.
+     * If there are any assumptions of 2D arrays, adapt them to handle `(H, W, C)` generically.
+
+---
+
+## 5. FITS output layout & backward compatibility
+
+**File:** `grid_mode.py`
+
+1. **Tile FITS**
+
+   * For RGB data, write the tile as HWC (H, W, 3) in the main HDU, consistent with what other parts of ZeMosaic expect.
+   * If there is a `legacy_rgb_cube` option (`C, H, W`), respect it:
+
+     * If `legacy_rgb_cube=True`, move axis from HWC to CHW before writing.
+
+2. **Final mosaic**
+
+   * Same approach: write final mosaic as HWC by default (H, W, 3).
+   * If `save_final_as_uint16=True`, ensure proper scaling from float32 [0, 1] (or ADU range) to uint16.
+
+3. **Channel count sanity check**
+
+   * Immediately before writing each FITS, log:
+
+     * Tile id (or `mosaic_grid`)
+     * Final data shape and dtype.
+
+---
+
+## 6. Tests & sanity checks
+
+### 6.1. Small regression / smoke tests
+
+If there is an existing tests folder, add at least a small test module, e.g. `tests/test_grid_mode_rgb.py`:
+
+* Use tiny synthetic images (e.g. 16×16 RGB with simple patterns) and a dummy WCS.
+* Build a minimal `GridDefinition` with 1–2 tiles and 2–3 frames.
+* Run `process_tile` and the assembly logic.
+
+Assertions:
+
+* Stacked tile has 3 channels.
+* Mosaic has 3 channels.
+* `grid_post_equalize_rgb` does not raise and does not change the shape.
+* When `grid_rgb_equalize=False`, mosaic data is unchanged except for rounding differences.
+
+### 6.2. Manual QA scenario
+
+Document in `followup.md`:
+
+* Steps to reproduce on the example dataset used by the user:
+
+  1. Run ZeMosaic with Grid Mode on the existing `stack_plan.csv`.
+  2. Inspect one tile FITS and the final `mosaic_grid.fits` using `astropy.io.fits.getdata`.
+  3. Confirm shapes `(H, W, 3)` and visually check that:
+
+     * Colors match those from the classic pipeline.
+     * RGB equalization doesn’t introduce strange tints.
+
+---
+
+## 7. Constraints & style
+
+* Keep changes **localized to Grid Mode** as much as possible.
+* Avoid breaking existing mono-only workflows (if any); log clearly when mono mode is used.
+* Use existing logging helper `_emit` for all messages.
+* Follow the project’s style and type hints (PEP-8, annotations, etc.).
+* Update `followup.md`:
+
+  * Mark tasks as `[x]` when completed.
+  * Add notes for deviations or blockers.
+
+If you need to decide between **perfect parity** and **reasonable similarity** with the classic pipeline, choose **reasonable similarity**, document the difference, and move on.
