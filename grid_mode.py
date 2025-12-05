@@ -79,6 +79,29 @@ def _emit(msg: str, *, lvl: str = "INFO", callback: ProgressCallback = None, **k
                 pass
 
 
+def _open_fits_safely(path: Path):
+    """Open a FITS file with the robust settings used across Grid mode."""
+
+    if not (_ASTROPY_AVAILABLE and fits):
+        raise RuntimeError("Astropy FITS support unavailable")
+    return fits.open(path, memmap=False, do_not_scale_image_data=True)
+
+
+def _ensure_hwc_array(data: np.ndarray) -> np.ndarray:
+    """Return data as HxWxC, squeezing extras and converting 2D to 3D."""
+
+    arr = np.asarray(data)
+    if arr.ndim > 3:
+        arr = np.squeeze(arr)
+    if arr.ndim == 2:
+        arr = arr[..., np.newaxis]
+    elif arr.ndim == 3 and arr.shape[0] in (1, 3):
+        arr = np.moveaxis(arr, 0, -1)
+    if arr.ndim == 2:
+        arr = arr[..., np.newaxis]
+    return arr.astype(np.float32, copy=False)
+
+
 @dataclass
 class FrameInfo:
     path: Path
@@ -271,8 +294,7 @@ def _load_frame_wcs(frame: FrameInfo, *, progress_callback: ProgressCallback = N
         _emit("Astropy not available for WCS parsing", lvl="ERROR", callback=progress_callback)
         return False
     try:
-        with fits.open(frame.path, memmap=False, do_not_scale_image_data=True) as hdul:
-            # do_not_scale_image_data=True pour ne pas se faire surprendre par BZERO/BSCALE
+        with _open_fits_safely(frame.path) as hdul:
             header = hdul[0].header
             data = hdul[0].data
     except Exception as exc:
@@ -508,7 +530,7 @@ def assign_frames_to_tiles(frames: Iterable[FrameInfo], tiles: Iterable[GridTile
 def _load_image_with_optional_alpha(path: Path) -> tuple[np.ndarray, np.ndarray | None]:
     if not (_ASTROPY_AVAILABLE and fits):
         raise RuntimeError("Astropy FITS support unavailable")
-    with fits.open(path, memmap=True, do_not_scale_image_data=True) as hdul:
+    with _open_fits_safely(path) as hdul:
         data = hdul[0].data
         alpha_hdu = hdul["ALPHA"] if "ALPHA" in hdul else None
         alpha = None
@@ -517,11 +539,7 @@ def _load_image_with_optional_alpha(path: Path) -> tuple[np.ndarray, np.ndarray 
                 alpha = np.asarray(alpha_hdu.data, dtype=np.float32)
             except Exception:
                 alpha = None
-    arr = np.asarray(data, dtype=np.float32)
-    if arr.ndim == 2:
-        arr = arr[..., np.newaxis]
-    elif arr.ndim == 3 and arr.shape[0] in (1, 3):
-        arr = np.moveaxis(arr, 0, -1)
+    arr = _ensure_hwc_array(data)
     weights = None
     if alpha is not None:
         alpha = np.squeeze(alpha)
@@ -757,10 +775,14 @@ def assemble_tiles(
     first_tile_data = None
     for t in tiles_list:
         try:
-            with fits.open(t.output_path, memmap=True) as hdul:
-                first_tile_data = np.asarray(hdul[0].data, dtype=np.float32)
+            with _open_fits_safely(t.output_path) as hdul:
+                raw_data = hdul[0].data
+                if raw_data is None:
+                    raise ValueError("empty data")
+                first_tile_data = _ensure_hwc_array(raw_data)
             break
-        except Exception:
+        except Exception as exc:
+            _emit(f"Assembly: failed to read {t.output_path} ({exc})", lvl="WARN", callback=progress_callback)
             continue
     if first_tile_data is None:
         _emit("Unable to read any tile for assembly", lvl="ERROR", callback=progress_callback)
@@ -770,29 +792,67 @@ def assemble_tiles(
     mosaic_shape = (grid.global_shape_hw[0], grid.global_shape_hw[1], channels)
     mosaic_sum = np.zeros(mosaic_shape, dtype=np.float32)
     weight_sum = np.zeros(mosaic_shape, dtype=np.float32)
+    H_m, W_m, _ = mosaic_sum.shape
 
     for tile in tiles_list:
         try:
-            with fits.open(tile.output_path, memmap=True) as hdul:
-                data = np.asarray(hdul[0].data, dtype=np.float32)
+            with _open_fits_safely(tile.output_path) as hdul:
+                raw_data = hdul[0].data
+                if raw_data is None:
+                    raise ValueError("empty data")
+                data = _ensure_hwc_array(raw_data)
         except Exception as exc:
             _emit(f"Assembly: failed to read {tile.output_path} ({exc})", lvl="WARN", callback=progress_callback)
             continue
-        if data.ndim == 2:
-            data = data[..., np.newaxis]
+
         tx0, tx1, ty0, ty1 = tile.bbox
-        h, w = data.shape[:2]
-        target_h = min(h, ty1 - ty0)
-        target_w = min(w, tx1 - tx0)
-        if target_h <= 0 or target_w <= 0:
+        x0 = max(0, min(tx0, W_m))
+        y0 = max(0, min(ty0, H_m))
+        x1 = max(0, min(tx1, W_m))
+        y1 = max(0, min(ty1, H_m))
+        if x1 <= x0 or y1 <= y0:
+            _emit(f"Assembly: tile {tile.tile_id} bbox outside mosaic, skipping", lvl="DEBUG", callback=progress_callback)
             continue
-        slice_y = slice(ty0, ty0 + target_h)
-        slice_x = slice(tx0, tx0 + target_w)
-        data_crop = data[:target_h, :target_w, :]
+
+        h, w, c = data.shape
+        off_x = max(0, -tx0)
+        off_y = max(0, -ty0)
+        used_w = min(w - off_x, x1 - x0)
+        used_h = min(h - off_y, y1 - y0)
+        if used_h <= 0 or used_w <= 0:
+            _emit(f"Assembly: tile {tile.tile_id} has no overlap after clamping, skipping", lvl="DEBUG", callback=progress_callback)
+            continue
+        if c != mosaic_sum.shape[2]:
+            _emit(
+                f"Assembly: tile {tile.tile_id} channel mismatch ({c} != {mosaic_sum.shape[2]}), skipping",
+                lvl="WARN",
+                callback=progress_callback,
+            )
+            continue
+
+        data_crop = data[off_y : off_y + used_h, off_x : off_x + used_w, :]
+        if data_crop.shape[0] != used_h or data_crop.shape[1] != used_w:
+            _emit(f"Assembly: tile {tile.tile_id} crop shape mismatch, skipping", lvl="WARN", callback=progress_callback)
+            continue
+        slice_y = slice(y0, y0 + used_h)
+        slice_x = slice(x0, x0 + used_w)
+        target_slice_shape = mosaic_sum[slice_y, slice_x, :].shape[:2]
+        if target_slice_shape != data_crop.shape[:2]:
+            _emit(
+                f"Assembly: tile {tile.tile_id} target slice shape {target_slice_shape} != crop {data_crop.shape[:2]}, skipping",
+                lvl="WARN",
+                callback=progress_callback,
+            )
+            continue
+
         weight_crop = np.ones_like(data_crop, dtype=np.float32)
         mosaic_sum[slice_y, slice_x, :] += data_crop * weight_crop
         weight_sum[slice_y, slice_x, :] += weight_crop
         _emit(f"Assembly: placed tile {tile.tile_id}", lvl="DEBUG", callback=progress_callback)
+
+    if not np.any(weight_sum > 0):
+        _emit("Assembly: no valid tile data written to mosaic", lvl="ERROR", callback=progress_callback)
+        return None
 
     with np.errstate(divide="ignore", invalid="ignore"):
         mosaic = np.where(weight_sum > 0, mosaic_sum / np.clip(weight_sum, 1e-6, None), np.nan)
@@ -813,7 +873,7 @@ def assemble_tiles(
             # Save weight map for diagnostics
             try:
                 weight_hdu = fits.ImageHDU(weight_sum.astype(np.float32), name="WEIGHT")
-                with fits.open(output_path, mode="append") as hdul:
+                with fits.open(output_path, mode="append", memmap=False, do_not_scale_image_data=True) as hdul:
                     hdul.append(weight_hdu)
             except Exception:
                 pass
@@ -885,12 +945,15 @@ def run_grid_mode(
     frames = load_stack_plan(csv_path, progress_callback=progress_callback)
     if not frames:
         _emit("Grid mode aborted: no frames loaded", lvl="ERROR", callback=progress_callback)
-        return
+        raise RuntimeError("Grid mode failed: no frames loaded")
 
     grid = build_global_grid(frames, grid_size_factor, overlap_fraction, progress_callback=progress_callback)
     if grid is None:
         _emit("Grid mode aborted: unable to build grid", lvl="ERROR", callback=progress_callback)
-        return
+        raise RuntimeError("Grid mode failed: unable to build grid")
+    if not grid.tiles:
+        _emit("Grid mode aborted: no grid tiles generated", lvl="ERROR", callback=progress_callback)
+        raise RuntimeError("Grid mode failed: no tiles to process")
 
     assign_frames_to_tiles(frames, grid.tiles, progress_callback=progress_callback)
     out_dir = Path(output_folder).expanduser()
@@ -902,7 +965,7 @@ def run_grid_mode(
     for tile in grid.tiles:
         process_tile(tile, out_dir, config, progress_callback=progress_callback)
 
-    assemble_tiles(
+    mosaic_path = assemble_tiles(
         grid,
         grid.tiles,
         out_dir / "mosaic_grid.fits",
@@ -910,5 +973,9 @@ def run_grid_mode(
         legacy_rgb_cube=legacy_rgb_cube,
         progress_callback=progress_callback,
     )
+
+    if mosaic_path is None:
+        _emit("Grid mode aborted: assembly failed", lvl="ERROR", callback=progress_callback)
+        raise RuntimeError("Grid mode failed during assembly")
 
     _emit("Grid/Survey mode completed", lvl="SUCCESS", callback=progress_callback)
