@@ -59,7 +59,12 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from zemosaic_utils import debayer_image, load_and_validate_fits, save_fits_image
+from zemosaic_utils import (
+    debayer_image,
+    load_and_validate_fits,
+    save_fits_image,
+    write_final_fits_uint16_color_aware,
+)
 
 try:  # Optional heavy deps – handled gracefully if missing
     from astropy.io import fits
@@ -2079,7 +2084,12 @@ def assemble_tiles(
     grid_rgb_equalize: bool = True,
     progress_callback: ProgressCallback = None,
 ) -> Path | None:
-    """Assemble processed tiles into the final mosaic without global reprojection."""
+    """Assemble processed tiles into the final mosaic without global reprojection.
+
+    Saves the science mosaic as float32 FITS with WEIGHT extension.
+    Optionally saves a uint16 viewer FITS for standard display.
+    Saves a coverage map FITS to show data density.
+    """
 
     if not (_ASTROPY_AVAILABLE and fits):
         _emit(
@@ -2521,7 +2531,7 @@ def assemble_tiles(
                 output_path=str(output_path),
                 header=header,
                 overwrite=True,
-                save_as_float=not save_final_as_uint16,
+                save_as_float=True,
                 legacy_rgb_cube=legacy_rgb_cube,
                 progress_callback=progress_callback,
                 axis_order=axis_order,
@@ -2535,6 +2545,77 @@ def assemble_tiles(
         except Exception as exc:
             _emit(f"Failed to write mosaic {output_path} ({exc})", lvl="ERROR", callback=progress_callback)
             return None
+
+    if save_final_as_uint16:
+        viewer_path = output_path.with_name(output_path.stem + "_viewer.fits")
+        try:
+            is_rgb = output_data.ndim == 3 and output_data.shape[-1] >= 3
+            write_final_fits_uint16_color_aware(
+                str(viewer_path),
+                output_data,
+                header=header,
+                force_rgb_planes=is_rgb,
+                legacy_rgb_cube=legacy_rgb_cube,
+                overwrite=True,
+            )
+            _emit(
+                f"Grid viewer FITS saved to {viewer_path}",
+                lvl="INFO",
+                callback=progress_callback,
+            )
+        except Exception as exc_viewer:
+            _emit(
+                f"Grid viewer FITS save failed ({exc_viewer})",
+                lvl="WARN",
+                callback=progress_callback,
+            )
+
+    coverage_hw: np.ndarray | None = None
+    try:
+        if weight_sum.ndim == 3:
+            coverage_hw = np.sum(weight_sum, axis=-1).astype(np.float32, copy=False)
+        else:
+            coverage_hw = weight_sum.astype(np.float32, copy=False)
+    except Exception as exc_cov:
+        _emit(
+            f"Coverage: failed to derive coverage map from weight_sum ({exc_cov})",
+            lvl="WARN",
+            callback=progress_callback,
+        )
+        coverage_hw = None
+
+    if coverage_hw is not None and np.any(coverage_hw > 0):
+        cov_header = fits.Header()
+        try:
+            if getattr(grid, "global_wcs", None) is not None and hasattr(grid.global_wcs, "to_header"):
+                cov_header.update(grid.global_wcs.to_header(relax=True))  # type: ignore[attr-defined]
+        except Exception:
+            pass
+        cov_header["EXTNAME"] = ("COVERAGE", "Coverage Map")
+        cov_header["BUNIT"] = ("count", "Pixel contributions or sum of weights")
+
+        cov_path = output_path.with_name(output_path.stem + "_coverage.fits")
+        try:
+            save_fits_image(
+                image_data=coverage_hw,
+                output_path=str(cov_path),
+                header=cov_header,
+                overwrite=True,
+                save_as_float=True,
+                axis_order="HWC",
+            )
+            _emit(
+                f"Grid coverage map saved to {cov_path}",
+                lvl="INFO",
+                callback=progress_callback,
+            )
+        except Exception as exc_cov_save:
+            _emit(
+                f"Coverage: failed to save {cov_path} ({exc_cov_save})",
+                lvl="WARN",
+                callback=progress_callback,
+            )
+
     _emit(f"Final mosaic saved to {output_path}", callback=progress_callback)
     return output_path
 
