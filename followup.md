@@ -13,7 +13,7 @@
 
 ## Tâches
 
-### [ ] 1. Analyser l’existant dans `build_global_grid`
+### [x] 1. Analyser l’existant dans `build_global_grid`
 
 - Identifier comment :
   - `global_bounds` est construit,
@@ -21,6 +21,11 @@
   - `global_wcs` est choisi (optimal vs fallback),
   - `crpix` / `crval` sont éventuellement modifiés.
 - Lister rapidement les points critiques dans un commentaire de code ou une note dans ce fichier.
+
+  - `global_bounds` est rempli via `_compute_frame_footprint` pour chaque frame ; en cas de liste vide, `min_x`/`min_y` sont 0 et `max_y`/`max_x` reprennent `global_shape_hw` sans s’appuyer sur les footprints.
+  - `global_shape_hw` provient de `find_optimal_celestial_wcs` (avec `auto_rotate=True`) ou du premier frame en fallback sur exception ; aucune recomposition à partir des footprints.
+  - `global_wcs` est soit l’optimal retourné, soit un clone du premier frame ; il est seulement passé dans `_strip_wcs_distortion`.
+  - `crpix` du WCS global n’est pas modifié, mais `_clone_tile_wcs` décale `crpix` des tuiles en soustrayant le coin supérieur gauche de la bbox ; aucune mise à jour de `crval` n’est faite.
 
 ---
 
