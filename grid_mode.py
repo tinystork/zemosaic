@@ -2151,7 +2151,7 @@ def assemble_tiles(
             continue
         pending_tiles.append((t, data, mask, c))
 
-    if not tile_infos:
+    if not pending_tiles:
         _emit(
             (
                 "Unable to read any tile for assembly. "
