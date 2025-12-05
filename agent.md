@@ -1,232 +1,203 @@
-
-# 🎯 Mission Codex — Stabiliser le WCS global & le canvas en Grid Mode
+# 🎯 Mission Codex — Logger ultra-verbeux du Grid Mode (diagnostic H/W, bbox, shapes)
 
 ## Contexte
 
-Le **Grid mode** échoue parfois avec des tuiles ayant des bounding boxes du type `(-1, 2, -1, 2)` et aboutit à un mosaic final vide ou presque vide (logs du style `bbox_extent=(-1:2,-1:2)` puis "no valid tile data written to mosaic").
+Le Grid mode ne plante plus, mais il produit parfois une mosaïque vide ou quasi vide alors que :
+- des tuiles sont bien générées,
+- les fichiers `tile_XXXX.fits` existent,
+- mais l’assemblage conclut que les tuiles n’ont “pas de recouvrement exploitable”.
 
-Les symptômes apparaissent notamment quand `find_optimal_celestial_wcs` échoue et que le code bascule sur un **fallback de WCS global** basé sur le premier frame, sans recalcul correct du canvas à partir des footprints réels.
+On soupçonne un **problème de cohérence géométrique** entre :
+- la taille du canvas global (`global_shape_hw` → `H_m`, `W_m`),
+- les bounding boxes des tuiles (`bbox`),
+- la taille réelle des données de tuile (`info.data.shape`),
+- les offsets / clamps appliqués dans l’assemblage.
 
-Le problème conceptuel :  
-👉 les tuiles sont définies dans un repère pixel qui ne correspond pas à la vraie enveloppe des footprints, avec des coordonnées parfois négatives ou hors du canvas.
-
-Nous voulons **stabiliser la construction du WCS global et du canvas** en Grid mode, en dérivant la taille & l’origine du canvas depuis les footprints, et en garantissant que **toutes les bounding boxes finale vivent dans un repère strictement positif** `[0, width) × [0, height)`.
+Objectif de cette mission :  
+👉 Ajouter des **logs détaillés et lisibles** pour voir noir sur blanc *où* les choses partent en sucette, sans encore modifier la logique métier.
 
 ---
 
 ## Fichiers concernés
 
 - `grid_mode.py`
-  - Fonction principale : `build_global_grid(...)`
-  - Fonctions satellites potentielles : `_compute_frame_footprint`, structures de données qui stockent bboxes / footprints / tiles.
-- Éventuellement (si nécessaire pour l’offset) :
-  - L’endroit où les tuiles sont assemblées en mosaic (si dans `grid_mode.py` ou dans une fonction appelée par `zemosaic_worker`).
+  - Fonction(s) d’assemblage des tuiles en mosaïque, par ex. quelque chose du style :
+    - `assemble_tiles(...)`
+    - ou une fonction équivalente appelée depuis `run_grid_mode`.
+
+L’idée est de **limiter les changements au logging** dans la zone où la mosaïque finale est construite à partir des tuiles.
 
 ---
 
-## Objectif global
+## Objectif de la mission
 
-1. **Toujours** dériver la taille du canvas global (`global_shape_hw`) et l’origine de notre repère pixel à partir des **footprints** (liste de bounding boxes `global_bounds`).
-2. Introduire un **offset global `(offset_x, offset_y)`** dérivé de `min_x` / `min_y` pour que toutes les bboxes/tuiles soient remappées dans un repère positif.
-3. **Ne pas bricoler `crpix` seul** :
-   - Par défaut, ne PAS déplacer `crpix` si ce n’est pas nécessaire.
-   - Si un déplacement de `crpix` s’avère indispensable, ajuster aussi `crval` de façon cohérente (sinon, on casse la correspondance ciel/pixel). Dans un premier temps, privilégier une solution **pixel-level (offset)** sans toucher au WCS.
-4. Améliorer le **logging** autour du calcul du WCS global, du fallback, de `global_bounds` et des bboxes finales pour diagnostiquer les futurs cas.
+1. Ajouter des logs `[GRID-ASM]` **au moment de l’assemblage** qui affichent clairement :
+   - la taille du canvas global (`H_m`, `W_m`, `global_shape_hw`),
+   - l’offset global utilisé (s’il existe),
+   - pour chaque tuile (au moins les premières, ou toutes si raisonnable) :
+     - l’ID de la tuile,
+     - sa bbox “globale” (avant offset/clamp),
+     - sa bbox “locale” après offset,
+     - la bbox finale après clamp dans le canvas,
+     - la taille réelle des données de la tuile (`info.data.shape`),
+     - les valeurs `used_w` / `used_h` utilisées pour peindre dans la mosaïque,
+     - le motif exact de rejet ("bbox outside mosaic", "no overlap after clamping", etc.).
+2. Ne **rien changer** (pour l’instant) à la logique d’assemblage elle-même : uniquement du logging.
+3. Faciliter la corrélation avec les traces déjà existantes (`[GRID] Global grid ready`, `[GRID] global canvas shape_hw=...`, etc.).
 
 ---
 
-## Détails de l’implémentation
+## Détails d’implémentation
 
-### 1. Calcul robuste du canvas global
+### 1. Localiser le cœur de l’assemblage
 
-Dans `build_global_grid(...)`, après avoir calculé les footprints des frames dans le repère du WCS global (réel ou fallback), il existe déjà (ou doit exister) une structure `global_bounds`, typiquement une liste de quadruplets `(x0, x1, y0, y1)`.
+Dans `grid_mode.py` :
 
-**Étapes à ajouter / renforcer :**
-
-1. **Si `global_bounds` n’est pas vide** :
-
-   ```python
-   min_x = math.floor(min(b[0] for b in global_bounds))
-   max_x = math.ceil(max(b[1] for b in global_bounds))
-   min_y = math.floor(min(b[2] for b in global_bounds))
-   max_y = math.ceil(max(b[3] for b in global_bounds))
-````
-
-2. Définir un **offset global** :
-
-   ```python
-   offset_x = min_x
-   offset_y = min_y
-   width = int(math.ceil(max_x - min_x))
-   height = int(math.ceil(max_y - min_y))
-   global_shape_hw = (height, width)
-   ```
-
-3. **Ne pas modifier `global_wcs.wcs.crpix` par défaut.**
-   On considère que le WCS global décrit une géométrie valide, et on **relocalise les bboxes** dans un repère `[0, width) × [0, height)` grâce à l’offset.
-   → C’est la solution la plus simple et la moins risquée pour la cohérence astrométrique.
-
-4. Pour chaque bbox/footprint utilisé ensuite (par exemple lors de la construction des tuiles), appliquer :
-
-   ```python
-   # Anciennes coordonnées globales
-   x0, x1, y0, y1 = original_bbox  # dans le repère global initial
-
-   # Nouvelles coordonnées relatives au canvas
-   local_x0 = x0 - offset_x
-   local_x1 = x1 - offset_x
-   local_y0 = y0 - offset_y
-   local_y1 = y1 - offset_y
-
-   # Stocker/utiliser (local_x0, local_x1, local_y0, local_y1) pour le placement dans le mosaic
-   ```
-
-   **But :** toutes les bboxes utilisées pour l’assemblage sont désormais **positives** et limitées à la taille du canvas.
-
-5. Si `global_bounds` est vide (cas pathologique) :
-
-   * Garder le fallback actuel **mais** :
-
-     * loguer clairement la situation,
-     * éventuellement ne pas lancer Grid mode du tout et basculer sur le pipeline classique.
-
-6. Après ça, appeler comme aujourd’hui `_strip_wcs_distortion(global_wcs)` si c’est déjà le comportement standard, mais **sans toucher à `crpix`/`crval`** à ce stade.
-
-### 2. Gestion prudente de `crpix` / `crval` (bémol important)
-
-* Dans cette mission, **ne pas implémenter** de recentrage agressif du WCS du style :
+- Identifier la fonction qui construit la mosaïque finale à partir des tuiles. Elle ressemble typiquement à :
 
   ```python
-  center_x = (min_x + max_x) / 2.0
-  center_y = (min_y + max_y) / 2.0
-  global_wcs.wcs.crpix = [center_x, center_y]
+  def assemble_tiles(...):
+      mosaic_sum = np.zeros(...)
+      mosaic_weight = np.zeros(...)
+      H_m, W_m, _ = mosaic_sum.shape
+      for tile_id, info in tiles_info.items():
+          # lecture de info.data, info.mask, info.bbox, etc.
+          ...
+````
+
+* C’est **à l’intérieur de cette boucle** sur les tuiles que nous voulons ajouter les logs `[GRID-ASM]`.
+
+### 2. Logger la taille du canvas global une seule fois
+
+Au début de l’assemblage (juste après l’allocation de la mosaïque) :
+
+```python
+H_m, W_m, C_m = mosaic_sum.shape
+logger.info(
+    "[GRID-ASM] mosaic canvas created: shape_hw=(%d, %d), channels=%d",
+    H_m, W_m, C_m,
+)
+```
+
+Si une structure type `grid.global_offset` ou similaire existe, la logger aussi :
+
+```python
+if hasattr(grid, "global_offset"):
+    ox, oy = grid.global_offset
+    logger.info("[GRID-ASM] global offset=(%d, %d)", ox, oy)
+```
+
+Sinon, ne rien inventer : se limiter au shape.
+
+### 3. Logger, pour chaque tuile, le cycle complet bbox → clamp → used_w/h
+
+Dans la boucle sur les tuiles, repérer les éléments suivants :
+
+* La bbox “globale” de la tuile (avant clamp) : typiquement `tx0, tx1, ty0, ty1`.
+* La taille des données : `info.data.shape` → `(h, w, c)` ou `(h, w)`.
+
+Juste avant le clamp, loguer :
+
+```python
+logger.debug(
+    "[GRID-ASM] tile %s: original bbox=(x:%d-%d, y:%d-%d), data_shape=%s",
+    tile_id,
+    tx0, tx1, ty0, ty1,
+    getattr(info, "data", None).shape if getattr(info, "data", None) is not None else None,
+)
+```
+
+Après le clamp / recomputation de `x0, x1, y0, y1` :
+
+```python
+logger.debug(
+    "[GRID-ASM] tile %s: clamped bbox=(x:%d-%d, y:%d-%d) within canvas (W=%d, H=%d)",
+    tile_id,
+    x0, x1, y0, y1,
+    W_m, H_m,
+)
+```
+
+Après calcul de `off_x`, `off_y`, `used_w`, `used_h` :
+
+```python
+logger.debug(
+    "[GRID-ASM] tile %s: off_x=%d, off_y=%d, used_w=%d, used_h=%d",
+    tile_id,
+    off_x, off_y, used_w, used_h,
+)
+```
+
+### 4. Logger le motif exact de rejet
+
+Partout où il existe un `continue` / “skip” pour la tuile, ajouter un log explicite `[GRID-ASM]`.
+
+Exemples typiques :
+
+* Si la bbox est complètement hors canvas :
+
+  ```python
+  if x1 <= x0 or y1 <= y0:
+      logger.warning(
+          "[GRID-ASM] tile %s: skipped because clamped bbox is empty (x0=%d, x1=%d, y0=%d, y1=%d) within canvas (W=%d, H=%d)",
+          tile_id, x0, x1, y0, y1, W_m, H_m,
+      )
+      continue
   ```
 
-  sans ajuster `crval`.
+* Si `used_w` / `used_h` <= 0 :
 
-* Si tu identifies un endroit du code où un tel changement existe déjà ou a été tenté, il faut :
+  ```python
+  if used_w <= 0 or used_h <= 0:
+      logger.warning(
+          "[GRID-ASM] tile %s: skipped because used_w/used_h <= 0 (used_w=%d, used_h=%d, off_x=%d, off_y=%d)",
+          tile_id, used_w, used_h, off_x, off_y,
+      )
+      continue
+  ```
 
-  * soit **le supprimer** au profit de la logique d’offset,
-  * soit **le corriger proprement** en recalculant `crval` pour conserver la même géométrie.
-    Dans le doute, **préférer supprimer/ignorer** ce recentrage pour cette mission, et documenter en commentaire qu’on a choisi une approche par offset.
+* Si la tuile est rejetée plus tard, par exemple pour masque vide ou autre condition, ajouter un warning similaire avec `[GRID-ASM]` et la raison.
 
-### 3. Fallback quand `find_optimal_celestial_wcs` échoue
+### 5. Limiter le bruit si besoin
 
-* Quand `find_optimal_celestial_wcs` échoue (retour `None`, exception, etc.), la logique actuelle semble :
+Si la boucle peut potentiellement traiter des centaines de tuiles, mais qu’on veut éviter un log trop verbeux, on peut :
 
-  * prendre le WCS du premier frame,
-  * et `global_shape_hw` ~ `shape_hw` du premier frame.
+* laisser tous les logs `.debug` (ils ne seront visibles qu’en niveau DEBUG),
+* garder les `.warning` pour les rejets seulement.
 
-* Modifier cette partie pour :
+Ne **pas** introduire de logique conditionnelle (type “si tile_id <= 10” pour limiter) sans demande explicite : pour l’instant, il vaut mieux avoir l’info complète en DEBUG.
 
-  1. **Toujours** calculer les footprints de tous les frames dans ce WCS fallback.
-  2. Construire `global_bounds` avec ces footprints.
-  3. Appliquer exactement la **même logique d’offset et de recalcul du canvas** que décrite plus haut : `offset_x/offset_y`, `global_shape_hw = (height, width)`.
-  4. Si **aucun footprint valide** n’est trouvé, loguer clairement et abandonner proprement le Grid mode.
+### 6. Ne pas modifier la logique métier
 
-### 4. Validation WCS + filtres de sécurité
+Important :
+👉 Ne modifier **aucun calcul**, **aucun clamp**, **aucune condition de rejet**, seulement ajouter des logs.
 
-Dans `_load_frame_wcs` / `_compute_frame_footprint` :
-
-* Rajouter des contrôles simples :
-
-  * WCS incomplet / incohérent → frame ignoré.
-  * Footprint vide / NaN majoritaire → frame ignoré.
-* Loguer clairement les frames rejetés et pourquoi, avec un tag `"[GRID]"`.
-
-### 5. Logging à améliorer
-
-Ajouter des logs explicites (avec tag `[GRID]`) à des points clefs :
-
-1. **Après tentative de `find_optimal_celestial_wcs`** :
-
-   * Succès :
-
-     * `"[GRID] Optimal global WCS found: crval=(...), crpix=(...), shape_hw=(h, w)"`
-   * Échec + fallback :
-
-     * `"[GRID] Optimal global WCS failed, falling back to first-frame WCS: frame=<id>, initial shape_hw=(h, w)"`
-
-2. **Après calcul de `global_bounds` et du canvas** :
-
-   ```text
-   [GRID] global_bounds count=N, min_x=..., max_x=..., min_y=..., max_y=...
-   [GRID] global canvas shape_hw=(height, width), offset=(offset_x, offset_y)
-   ```
-
-3. **Avant/pendant l’assemblage des tuiles** :
-
-   * Nombre de tuiles valides, nombre de tuiles rejetées pour cause de bbox hors canvas, etc.
-   * Exemples de bboxes après application de l’offset pour vérifier qu’on n’a plus de coordonnées négatives.
+Cela permettra d’isoler précisément la cause géométrique lors du prochain run, sans introduire de nouveaux bugs fonctionnels en même temps.
 
 ---
 
-## Plan de travail (ordre recommandé)
+## Tests / Validation
 
-1. **Lire** la logique existante dans `build_global_grid` et identifier :
+* Lancer un Grid mode sur le dataset problématique.
+* Vérifier que les logs contiennent des lignes `[GRID-ASM]` :
 
-   * où `global_bounds` est calculé,
-   * comment `global_shape_hw` est actuellement dérivé,
-   * où `crpix` est potentiellement modifié.
-2. **Introduire l’offset (min_x, min_y)** et recalculer `global_shape_hw` à partir de `global_bounds`.
-3. **Propager l’offset** à toutes les bboxes utilisées pour les tuiles / frames dans le canvas.
-4. **Nettoyer / désactiver** tout recentrage WCS qui modifie `crpix` seule sans ajuster `crval`.
-5. **Renforcer le fallback** quand `find_optimal_celestial_wcs` échoue :
-
-   * calcul des footprints,
-   * global_bounds,
-   * offset + canvas.
-6. **Ajouter les logs `[GRID]`** détaillés décrits ci-dessus.
-7. **Tests & validation** (voir section suivante).
-8. Mettre à jour `followup.md` pour cocher la tâche une fois validée.
-
----
-
-## Tests & validation
-
-### 1. Tests synthétiques (si possible dans le code / un petit script)
-
-* Construire un petit set de WCS/frames (syntétiques ou réels) avec :
-
-  * 2–3 frames décalés,
-  * un `find_optimal_celestial_wcs` forcé à échouer (mock / paramètre).
-* Vérifier :
-
-  * que `global_bounds` contient des valeurs cohérentes,
-  * que `offset_x` / `offset_y` sont bien appliqués,
-  * que toutes les bboxes finales sont dans `[0, width) × [0, height)`.
-
-### 2. Test réel Grid mode (dataset problématique)
-
-* Lancer le Grid mode sur le dataset qui produisait les logs `bbox_extent=(-1:2,-1:2)`.
-* Vérifier dans les logs :
-
-  * la présence des nouveaux messages `[GRID]` sur global_bounds, canvas, offset.
-  * l’absence de bboxes négatives,
-  * l’absence de message "no valid tile data written to mosaic".
-* Vérifier que la mosaïque produite contient bien des données visibles (pas une image vide).
-
-### 3. Tests de non-régression
-
-* Vérifier que :
-
-  * le pipeline classique (hors Grid mode) reste inchangé.
-  * le Grid mode se comporte comme avant lorsque `find_optimal_celestial_wcs` **réussit** et que les footprints étaient déjà dans un repère propre (offset 0 ou négligeable).
-  * les performances restent comparables.
+  * la taille du canvas `shape_hw`,
+  * les `bbox` originales / clampées,
+  * la `data_shape`,
+  * les `off_x`, `off_y`, `used_w`, `used_h`,
+  * les raisons de rejet éventuel pour chaque tuile.
+* Conserver ce log pour analyse (il servira de base pour une mission suivante de correction fine).
 
 ---
 
 ## Critères d’acceptation
 
-* ✅ Plus de bboxes du type `(-1:2,-1:2)` : toutes les bboxes utilisées pour le placement dans le canvas sont positives et dans les bornes du canvas.
-* ✅ Le Grid mode ne produit plus de mosaïque "vide" dans les cas où les données sont valides.
-* ✅ Le fallback en cas d’échec de `find_optimal_celestial_wcs` utilise quand même les footprints pour dimensionner le canvas et définir l’offset.
-* ✅ Le WCS global n’est plus modifié "à la hache" via un changement de `crpix` seul ; soit on ne le déplace pas, soit on documente et corrige proprement `crval` (dans cette mission, privilégier l’offset sans toucher au WCS).
-* ✅ Les logs `[GRID]` permettent de diagnostiquer clairement :
+* ✅ Les logs `[GRID-ASM]` permettent de reconstituer, pour chaque tuile, le chemin complet :
 
-  * le WCS global choisi (optimal ou fallback),
-  * les bounds et le canvas,
-  * le nombre de tuiles valides / rejetées.
+  * canvas global → bbox → clamp → offsets → used_w/h → décision (placer ou skip).
+* ✅ Aucun changement de logique métier : Grid mode se comporte identiquement à avant, mais avec plus d’informations dans le log.
+* ✅ Le dataset problématique produit désormais un log suffisamment verbeux pour comprendre *exactement* pourquoi la mosaïque reste vide ou minuscule.
 
 Merci 🙏
+
 
