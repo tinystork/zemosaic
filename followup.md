@@ -1,65 +1,92 @@
-## ✅ `followup.md`
+# ZeMosaic – Grid / Survey mode hardening – Follow-up
 
-```markdown
-# Follow-up – Grid mode assembly & RGB consistency
+This file tracks the progress of the Grid mode mission described in `agent.md`.
 
-## Task checklist
+## Checklist
 
-### 1. Enrich `assemble_tiles(...)` logging
+### A. Grid mode logging integration
 
-- [x] Add detailed logs for each early-return condition:
-  - [x] Astropy/FITS unavailable (with flags).
-  - [x] `tiles_list` empty (with counts and sample paths).
-  - [x] `tile_infos` empty (with summary: io_fail, channel_mismatch, empty_mask, kept=0).
-  - [x] `weight_sum` all zeros (with counts and hint).
-- [x] Track per-tile failure reasons with counters:
-  - [x] I/O failures.
-  - [x] Channel mismatches.
-  - [x] Empty valid masks.
-- [x] Emit a summary line after building `tile_infos`.
-- [x] Ensure all logs use `_emit(...)` and follow the existing `[GRID]` / logging style.
+- [ ] A1 – Replace the `NullHandler`-based logger in `grid_mode.py` so that `_emit(...)` logs go to the same place as `ZeMosaicWorker`:
+  - Use either the `"ZeMosaicWorker"` logger or ensure `"zemosaic.grid_mode"` propagates to a non-null parent.
+  - Remove any `NullHandler` that swallows messages.
+- [ ] A2 – Ensure `_emit(...)` consistently prefixes messages with `"[GRID]"` (if not already done).
+- [ ] A3 – Add a small logging smoke test (e.g. `tests/test_grid_mode_logging.py`) that verifies `_emit(...)` output is captured by a handler attached to the main logger.
 
-### 2. Relax logic & salvage assembly
+### B. Assembly robustness and explicit logs
 
-- [x] Modify the `weight_sum` check to:
-  - [x] Log a warning when `weight_sum` is all zeros.
-  - [x] Attempt a salvage assembly using a simple, relaxed placement of tiles into the mosaic.
-  - [x] Only `return None` if both nominal and salvage paths fail to write any data.
-- [x] Add a log indicating when the salvage path is used:
-  - [x] `"Assembly: salvage assembly succeeded..."` or similar.
-- [x] Keep overlap/photometry logic intact for the normal successful path.
+- [ ] B1 – In `assemble_tiles(...)`, add/verify logs for:
+  - Computing `tiles_list` and handling the case where `len(tiles_list) == 0`.
+  - I/O failures for tiles (`Assembly: failed to read ...`).
+  - Channel mismatch skips.
+  - Empty valid-mask skips.
+  - Final summary of kept tiles and failure counts.
+- [ ] B2 – Ensure the “no tile infos” case:
+  - Logs an explicit error summarizing `attempted`, `io_fail`, `channel_mismatch`, `empty_mask`, `kept=0`.
+  - Returns `None` (no exceptions raised from inside `assemble_tiles`).
+- [ ] B3 – Make salvage mode logging explicit:
+  - Log when salvage starts (no valid data in initial mosaic).
+  - Log whether salvage succeeded or failed.
+  - On salvage failure, return `None` with a clear log message.
+- [ ] B4 – On successful assembly:
+  - Log the final mosaic `shape` and `dtype` before writing FITS.
+- [ ] B5 – Add at least one test case exercising assembly robustness:
+  - Case with mixed valid and invalid tiles → assembly succeeds and logs skips.
+  - Case with all tiles invalid → `assemble_tiles(...)` returns `None` and logs a detailed failure summary.
 
-### 3. RGB equalization coherence (Grid vs classic)
+### C. RGB equalization parity (Grid vs classic)
 
-- [x] Audit current RGB equalization flags and usage in:
-  - [x] `zemosaic_worker.py` (classic pipeline, phase 3+5).
-  - [x] `grid_mode.py` (`grid_rgb_equalize`, `grid_post_equalize_rgb`).
-- [x] Introduce a single, explicit boolean for “final RGB equalization enabled?”:
-  - [x] Derive it from config/GUI in `run_hierarchical_mosaic(...)`.
-  - [x] Use it for the classic pipeline’s final assembly (`RGBEqualize`).
-  - [x] Pass it explicitly to `grid_mode.run_grid_mode(..., grid_rgb_equalize=...)`.
-- [x] Adjust config overlay in `grid_mode.run_grid_mode(...)` so that:
-  - [x] The final `grid_rgb_equalize` state is well-defined and logged.
-- [x] Add minimal sanity logs:
-  - [x] In `run_hierarchical_mosaic(...)`: log `[GRID] Invoking grid_mode with RGBEqualize=...`.
-  - [x] In `assemble_tiles(...)`: log the effective RGB equalization state when calling `grid_post_equalize_rgb(...)`.
+- [ ] C1 – Review and, if needed, refactor `grid_post_equalize_rgb(...)` in `grid_mode.py` so that:
+  - It uses `equalize_rgb_medians_inplace(...)` from `zemosaic_align_stack.py` where available.
+  - Its behaviour (medians, gains) matches the classic pipeline’s logic.
+- [ ] C2 – Add detailed logs around RGB equalization in Grid mode:
+  - Before calling `grid_post_equalize_rgb(...)`:
+    - Log that RGB equalization is being invoked, with mosaic shape and weight shape.
+  - Inside `grid_post_equalize_rgb(...)`:
+    - Log when equalization is applied, including gains, medians, and target.
+    - Log all skip reasons (non-RGB, no valid pixels, missing channel, invalid target, error).
+- [ ] C3 – Ensure `grid_rgb_equalize` flag precedence is well-defined and documented:
+  - Config (`grid_rgb_equalize` on disk) vs. parameter vs. default.
+  - Log the final effective value and its source as `enabled=..., source=...`.
+- [ ] C4 – In `zemosaic_worker.py`:
+  - Introduce a clearly named `grid_rgb_equalize_flag` derived from the same config/UI semantics as `poststack_equalize_rgb` (or sensibly documented).
+  - Log the value and source in the Grid branch.
+  - Pass it explicitly as `grid_rgb_equalize=grid_rgb_equalize_flag` to `grid_mode.run_grid_mode(...)`.
+- [ ] C5 – Add a unit test (e.g. `tests/test_grid_mode_rgb_equalize.py`) to compare:
+  - `equalize_rgb_medians_inplace(arr_classic)` vs. `grid_post_equalize_rgb(arr_grid, weight_sum=None, ...)`.
+  - Assert that resulting channel medians are equal within a small tolerance.
 
-### 4. Tests / validation
+### D. Worker fallback behaviour
 
-- [ ] Happy-path grid run with RGB equalization ON.
-- [ ] Dataset with a few broken tiles:
-  - [ ] Confirm they are skipped and mosaic is still produced.
-- [ ] Edge-case where masks/overlaps zero out `weight_sum`:
-  - [ ] Confirm salvage path is attempted and logged.
-- [ ] Compare ON/OFF RGB equalization across:
-  - [ ] Classic pipeline.
-  - [ ] Grid mode.
-  - [ ] Ensure behaviours are consistent with the chosen toggle.
+- [ ] D1 – Confirm that `run_hierarchical_mosaic(...)`:
+  - Detects Grid mode using `detect_grid_mode(...)`.
+  - Logs a line like `"[GRID] Invoking grid_mode.run_grid_mode(...) with grid_rgb_equalize=..., stack_norm=..., ..."`.
+  - Calls `grid_mode.run_grid_mode(...)` inside a `try` block.
+  - On success: returns early (does not run classic pipeline).
+- [ ] D2 – On Grid mode exceptions:
+  - Logs an ERROR with `exc_info=True` and a clear message:
+    - `"[GRID] Grid/Survey mode failed, continuing with classic pipeline"`.
+  - Then continues with the classic pipeline unchanged.
+- [ ] D3 – (Optional) Add a small regression test or harness:
+  - Using a fake Grid project, verify that:
+    - Partial tile failures don’t break Grid mode.
+    - Total failure leads to a logged fallback to classic pipeline.
 
-## Notes / Decisions
+### E. Regression & sanity checks
 
-- [ ] Document any behavioural change that could affect existing users (e.g. salvaged mosaics where previous versions aborted).
-- [ ] If any unexpected side-effects appear, describe them here and propose follow-up tasks.
-````
+- [ ] E1 – Run the existing test suite; fix any regressions caused by changes in logging or imports.
+- [ ] E2 – Verify that a **non-Grid** project behaves identically to the previous version:
+  - Same logs (aside from harmless extra debug).
+  - Same outputs.
+- [ ] E3 – Verify that classic pipeline RGB equalization (`poststack_equalize_rgb`) is unchanged.
+- [ ] E4 – Optionally, run a small real-world Grid project (if available) and inspect:
+  - `zemosaic_worker.log` for the new `[GRID]` messages.
+  - Final mosaic colours vs. classic pipeline (sanity check for RGB parity).
 
-Si tu veux, je peux ensuite t’aider à préparer un petit jeu d’images “test grid mode” pour valider rapidement les cas happy-path / salvage avant que tu pushes sur `V4WIP` 😄
+---
+
+## Notes / Journal
+
+Use this section to jot down important decisions, gotchas, or future ideas.
+
+- [ ] (Example) Consider a future config key to *not* raise on empty mosaic in Grid mode but silently skip Grid and go classic, if that ever becomes desirable.
+
