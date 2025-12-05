@@ -210,6 +210,7 @@ class GridTile:
 class GridDefinition:
     global_wcs: object
     global_shape_hw: tuple[int, int]
+    offset_xy: tuple[int, int] = (0, 0)
     tile_size_px: int
     overlap_fraction: float
     tiles: list[GridTile]
@@ -760,13 +761,25 @@ def build_global_grid(
         if fp is not None:
             global_bounds.append(fp)
     if global_bounds:
-        min_x = math.floor(min(b[0] for b in global_bounds))
-        max_x = math.ceil(max(b[1] for b in global_bounds))
-        min_y = math.floor(min(b[2] for b in global_bounds))
-        max_y = math.ceil(max(b[3] for b in global_bounds))
+        min_x = int(math.floor(min(b[0] for b in global_bounds)))
+        max_x = int(math.ceil(max(b[1] for b in global_bounds)))
+        min_y = int(math.floor(min(b[2] for b in global_bounds)))
+        max_y = int(math.ceil(max(b[3] for b in global_bounds)))
+        offset_x = min_x
+        offset_y = min_y
+        width = int(math.ceil(max_x - min_x))
+        height = int(math.ceil(max_y - min_y))
+        if width <= 0 or height <= 0:
+            _emit(
+                "[GRID] Invalid global bounds computed (non-positive extent), aborting grid construction",
+                lvl="ERROR",
+                callback=progress_callback,
+            )
+            return None
+        global_shape_hw = (height, width)
     else:
-        min_x = min_y = 0
-        max_y, max_x = global_shape_hw
+        _emit("[GRID] No valid footprints available to define global bounds", lvl="ERROR", callback=progress_callback)
+        return None
 
     tiles: list[GridTile] = []
     y0 = min_y
@@ -792,6 +805,7 @@ def build_global_grid(
     return GridDefinition(
         global_wcs=global_wcs,
         global_shape_hw=(int(global_shape_hw[0]), int(global_shape_hw[1])),
+        offset_xy=(offset_x if global_bounds else 0, offset_y if global_bounds else 0),
         tile_size_px=tile_size_px,
         overlap_fraction=overlap_fraction,
         tiles=tiles,

@@ -29,7 +29,7 @@
 
 ---
 
-### [ ] 2. Introduire l’offset global `(offset_x, offset_y)` et recalculer `global_shape_hw`
+### [x] 2. Introduire l’offset global `(offset_x, offset_y)` et recalculer `global_shape_hw`
 
 - À partir de `global_bounds`, calculer :
   - `min_x`, `max_x`, `min_y`, `max_y`,
@@ -37,6 +37,8 @@
   - `width = max_x - min_x`, `height = max_y - min_y`,
   - `global_shape_hw = (height, width)`.
 - Gérer proprement le cas où `global_bounds` est vide (log explicite + sortie clean du Grid mode si nécessaire).
+
+  - Implémenté dans `grid_mode.py` : les empreintes alimentent désormais `min_x`, `max_x`, `min_y`, `max_y`, puis `global_shape_hw` est recalculé à partir du couple `(width, height)` dérivé de ces bounds. Un offset `(offset_x, offset_y)` est stocké dans `GridDefinition`. Le mode Grid s’interrompt proprement avec un log `[GRID]` si aucune empreinte n’est disponible ou si les bounds produisent une étendue non positive.
 
 ---
 
