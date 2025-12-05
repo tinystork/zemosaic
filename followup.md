@@ -22,12 +22,12 @@
 
 ### 2. FITS loading & RGB handling
 
-- [ ] Integrate `zemosaic_utils.load_and_validate_fits` into `_load_image_with_optional_alpha` (or equivalent helper).
-- [ ] Detect Bayer / mono Seestar frames (using header `BAYERPAT` or other metadata).
-- [ ] For 2D Bayer images, call `debayer_image(...)` to produce RGB HWC float32.
-- [ ] Ensure non-Bayer RGB FITS are preserved as 3-channel HWC.
-- [ ] Ensure `_ensure_hwc_array` always returns HWC with C=3 for RGB cases, C=1 for genuine mono.
-- [ ] Ensure alpha maps (when present) are correctly shaped/broadcast for RGB data.
+- [x] Integrate `zemosaic_utils.load_and_validate_fits` into `_load_image_with_optional_alpha` (or equivalent helper).
+- [x] Detect Bayer / mono Seestar frames (using header `BAYERPAT` or other metadata).
+- [x] For 2D Bayer images, call `debayer_image(...)` to produce RGB HWC float32.
+- [x] Ensure non-Bayer RGB FITS are preserved as 3-channel HWC.
+- [x] Ensure `_ensure_hwc_array` always returns HWC with C=3 for RGB cases, C=1 for genuine mono.
+- [x] Ensure alpha maps (when present) are correctly shaped/broadcast for RGB data.
 - [ ] Confirm via logs that grid mode sees RGB frames as `(..., 3)` for the user’s dataset.
 
 ### 3. Stacking semantics parity

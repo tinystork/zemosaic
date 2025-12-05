@@ -59,6 +59,8 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from zemosaic_utils import debayer_image, load_and_validate_fits
+
 try:  # Optional heavy deps – handled gracefully if missing
     from astropy.io import fits
     from astropy.wcs import WCS
@@ -177,8 +179,11 @@ def _ensure_hwc_array(data: np.ndarray) -> np.ndarray:
         arr = np.squeeze(arr)
     if arr.ndim == 2:
         arr = arr[..., np.newaxis]
-    elif arr.ndim == 3 and arr.shape[0] in (1, 3):
-        arr = np.moveaxis(arr, 0, -1)
+    elif arr.ndim == 3:
+        if arr.shape[0] in (1, 3):
+            arr = np.moveaxis(arr, 0, -1)
+        elif arr.shape[-1] not in (1, 3) and arr.shape[0] in (arr.shape[1], arr.shape[2]):
+            arr = np.moveaxis(arr, 0, -1)
     if arr.ndim == 2:
         arr = arr[..., np.newaxis]
     return arr.astype(np.float32, copy=False)
@@ -1054,35 +1059,118 @@ def _load_image_with_optional_alpha(
 ) -> tuple[np.ndarray, np.ndarray | None]:
     if not (_ASTROPY_AVAILABLE and fits):
         raise RuntimeError("Astropy FITS support unavailable")
-    with _open_fits_safely(path) as hdul:
-        data = hdul[0].data
-        raw_shape = getattr(data, "shape", None)
-        raw_dtype = getattr(data, "dtype", None)
-        alpha_hdu = hdul["ALPHA"] if "ALPHA" in hdul else None
-        alpha = None
-        if alpha_hdu is not None and alpha_hdu.data is not None:
-            try:
-                alpha = np.asarray(alpha_hdu.data, dtype=np.float32)
-            except Exception:
-                alpha = None
+    data = None
+    header = None
+    alpha = None
+    info = None
+    try:
+        data, header, info = load_and_validate_fits(
+            path,
+            normalize_to_float32=False,
+            attempt_fix_nonfinite=True,
+            progress_callback=progress_callback,
+        )
+        alpha = info.get("alpha_mask") if isinstance(info, dict) else None
+    except Exception as exc:
+        _emit(
+            f"[GRID] Failed to load FITS via load_and_validate_fits ({exc}); falling back to raw read",
+            lvl="WARN",
+            callback=progress_callback,
+        )
+        with _open_fits_safely(path) as hdul:
+            data = hdul[0].data
+            header = hdul[0].header if hasattr(hdul[0], "header") else None
+            alpha_hdu = hdul["ALPHA"] if "ALPHA" in hdul else None
+            if alpha_hdu is not None and alpha_hdu.data is not None:
+                try:
+                    alpha = np.asarray(alpha_hdu.data, dtype=np.float32)
+                except Exception:
+                    alpha = None
+
+    if data is None:
+        raise RuntimeError(f"Failed to load frame {path}")
+
+    raw_shape = getattr(data, "shape", None)
+    raw_dtype = getattr(data, "dtype", None)
+    axis_original = None
+    if isinstance(info, dict):
+        axis_original = info.get("axis_order_original")
+
+    header = header or getattr(data, "header", None) or {}
+    bayer_pattern = None
+    try:
+        if hasattr(header, "get"):
+            bayer_pattern = header.get("BAYERPAT", header.get("CFAIMAGE", None))
+    except Exception:
+        bayer_pattern = None
+    if isinstance(bayer_pattern, str):
+        bayer_pattern = bayer_pattern.upper()
+        if bayer_pattern not in {"GRBG", "RGGB", "GBRG", "BGGR"}:
+            bayer_pattern = None
+    else:
+        bayer_pattern = None
+
+    debayer_applied = False
+    data = np.asarray(data, dtype=np.float32, copy=False)
+    if data.ndim == 2 and bayer_pattern:
+        finite_mask = np.isfinite(data)
+        if np.any(finite_mask):
+            data_min = float(np.nanmin(data[finite_mask]))
+            data_max = float(np.nanmax(data[finite_mask]))
+        else:
+            data_min = 0.0
+            data_max = 0.0
+        data_range = data_max - data_min
+        if data_range > 1e-9:
+            norm = (data - data_min) / data_range
+        elif np.any(finite_mask):
+            norm = np.full_like(data, 0.5, dtype=np.float32)
+        else:
+            norm = np.zeros_like(data, dtype=np.float32)
+        norm = np.clip(norm, 0.0, 1.0)
+        try:
+            rgb_norm = debayer_image(norm, bayer_pattern, progress_callback=progress_callback)
+            if data_range > 1e-9:
+                data = rgb_norm * data_range + data_min
+            else:
+                data = np.full_like(rgb_norm, data_min, dtype=np.float32)
+            debayer_applied = True
+        except Exception as exc:
+            _emit(
+                f"[GRID] Debayer failed for {path.name} pattern={bayer_pattern}: {exc}",
+                lvl="WARN",
+                callback=progress_callback,
+            )
+            data = np.stack([data] * 3, axis=-1)
+            debayer_applied = True
+
     arr = _ensure_hwc_array(data)
     channels = arr.shape[-1] if arr.ndim == 3 else 1
     _emit(
         (
             "DEBUG_SHAPE: loaded frame "
             f"'{path.name}' raw_shape={raw_shape} raw_dtype={raw_dtype} "
-            f"hwc_shape={arr.shape} channels={channels}"
+            f"axis_orig={axis_original} bayer={bayer_pattern or '<none>'} "
+            f"debayered={debayer_applied} hwc_shape={arr.shape} channels={channels}"
         ),
         lvl="DEBUG",
         callback=progress_callback,
     )
     weights = None
     if alpha is not None:
+        alpha = np.asarray(alpha, dtype=np.float32)
         alpha = np.squeeze(alpha)
+        alpha = np.clip(alpha, 0.0, 255.0) / 255.0
+        if alpha.ndim == 3 and alpha.shape[0] in (1, 3):
+            alpha = np.moveaxis(alpha, 0, -1)
+        if alpha.ndim == 3 and alpha.shape[-1] == 1:
+            alpha = np.squeeze(alpha, axis=-1)
         if alpha.ndim == 2:
-            weights = np.clip(alpha, 0.0, 255.0) / 255.0
-        elif alpha.ndim == 3 and alpha.shape[0] in (1, 3):
-            weights = np.clip(np.moveaxis(alpha, 0, -1), 0.0, 255.0) / 255.0
+            weights = alpha
+        elif alpha.ndim == 3 and alpha.shape[-1] == arr.shape[-1]:
+            weights = alpha
+        elif alpha.ndim == 3 and alpha.shape[-1] == 1 and arr.shape[-1] == 3:
+            weights = np.repeat(alpha, 3, axis=-1)
     return arr, weights
 
 
