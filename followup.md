@@ -8,26 +8,26 @@
 
 ### 1. Instrumentation & diagnostics
 
-- [ ] Add detailed `[GRID]` logs in `_load_image_with_optional_alpha` showing:
-  - [ ] Raw FITS data shape/dtype.
-  - [ ] Shape after `_ensure_hwc_array` (H,W,C) and channel count.
-- [ ] Add logs in `_reproject_frame_to_tile` for each frame:
-  - [ ] Frame basename, tile id, `reproj_stack.shape`.
-- [ ] Add logs in `process_tile`:
-  - [ ] Tile id, number of frames, `tile_shape`, stacked patch shape before writing.
-- [ ] Add logs in assembly phase:
-  - [ ] Mosaic canvas shape/dtype at allocation.
-  - [ ] Mosaic shape just before RGB equalization, with explicit reason when equalization is skipped.
-- [ ] Log one-line stacking config summary in `run_grid_mode` (norm, weight, reject, winsor, combine, radial params, rgb_equalize).
+- [x] Add detailed `[GRID]` logs in `_load_image_with_optional_alpha` showing:
+  - [x] Raw FITS data shape/dtype.
+  - [x] Shape after `_ensure_hwc_array` (H,W,C) and channel count.
+- [x] Add logs in `_reproject_frame_to_tile` for each frame:
+  - [x] Frame basename, tile id, `reproj_stack.shape`.
+- [x] Add logs in `process_tile`:
+  - [x] Tile id, number of frames, `tile_shape`, stacked patch shape before writing.
+- [x] Add logs in assembly phase:
+  - [x] Mosaic canvas shape/dtype at allocation.
+  - [x] Mosaic shape just before RGB equalization, with explicit reason when equalization is skipped.
+- [x] Log one-line stacking config summary in `run_grid_mode` (norm, weight, reject, winsor, combine, radial params, rgb_equalize).
 
 ### 2. FITS loading & RGB handling
 
-- [ ] Integrate `zemosaic_utils.load_and_validate_fits` into `_load_image_with_optional_alpha` (or equivalent helper).
-- [ ] Detect Bayer / mono Seestar frames (using header `BAYERPAT` or other metadata).
-- [ ] For 2D Bayer images, call `debayer_image(...)` to produce RGB HWC float32.
-- [ ] Ensure non-Bayer RGB FITS are preserved as 3-channel HWC.
-- [ ] Ensure `_ensure_hwc_array` always returns HWC with C=3 for RGB cases, C=1 for genuine mono.
-- [ ] Ensure alpha maps (when present) are correctly shaped/broadcast for RGB data.
+- [x] Integrate `zemosaic_utils.load_and_validate_fits` into `_load_image_with_optional_alpha` (or equivalent helper).
+- [x] Detect Bayer / mono Seestar frames (using header `BAYERPAT` or other metadata).
+- [x] For 2D Bayer images, call `debayer_image(...)` to produce RGB HWC float32.
+- [x] Ensure non-Bayer RGB FITS are preserved as 3-channel HWC.
+- [x] Ensure `_ensure_hwc_array` always returns HWC with C=3 for RGB cases, C=1 for genuine mono.
+- [x] Ensure alpha maps (when present) are correctly shaped/broadcast for RGB data.
 - [ ] Confirm via logs that grid mode sees RGB frames as `(..., 3)` for the user’s dataset.
 
 ### 3. Stacking semantics parity

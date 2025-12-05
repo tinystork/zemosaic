@@ -59,6 +59,8 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from zemosaic_utils import debayer_image, load_and_validate_fits
+
 try:  # Optional heavy deps – handled gracefully if missing
     from astropy.io import fits
     from astropy.wcs import WCS
@@ -177,8 +179,11 @@ def _ensure_hwc_array(data: np.ndarray) -> np.ndarray:
         arr = np.squeeze(arr)
     if arr.ndim == 2:
         arr = arr[..., np.newaxis]
-    elif arr.ndim == 3 and arr.shape[0] in (1, 3):
-        arr = np.moveaxis(arr, 0, -1)
+    elif arr.ndim == 3:
+        if arr.shape[0] in (1, 3):
+            arr = np.moveaxis(arr, 0, -1)
+        elif arr.shape[-1] not in (1, 3) and arr.shape[0] in (arr.shape[1], arr.shape[2]):
+            arr = np.moveaxis(arr, 0, -1)
     if arr.ndim == 2:
         arr = arr[..., np.newaxis]
     return arr.astype(np.float32, copy=False)
@@ -1049,26 +1054,123 @@ def assign_frames_to_tiles(frames: Iterable[FrameInfo], tiles: Iterable[GridTile
         _emit(f"Tile {tile.tile_id}: assigned {len(tile.frames)} frame(s)", lvl="DEBUG", callback=progress_callback)
 
 
-def _load_image_with_optional_alpha(path: Path) -> tuple[np.ndarray, np.ndarray | None]:
+def _load_image_with_optional_alpha(
+    path: Path, *, progress_callback: ProgressCallback = None
+) -> tuple[np.ndarray, np.ndarray | None]:
     if not (_ASTROPY_AVAILABLE and fits):
         raise RuntimeError("Astropy FITS support unavailable")
-    with _open_fits_safely(path) as hdul:
-        data = hdul[0].data
-        alpha_hdu = hdul["ALPHA"] if "ALPHA" in hdul else None
-        alpha = None
-        if alpha_hdu is not None and alpha_hdu.data is not None:
-            try:
-                alpha = np.asarray(alpha_hdu.data, dtype=np.float32)
-            except Exception:
-                alpha = None
+    data = None
+    header = None
+    alpha = None
+    info = None
+    try:
+        data, header, info = load_and_validate_fits(
+            path,
+            normalize_to_float32=False,
+            attempt_fix_nonfinite=True,
+            progress_callback=progress_callback,
+        )
+        alpha = info.get("alpha_mask") if isinstance(info, dict) else None
+    except Exception as exc:
+        _emit(
+            f"[GRID] Failed to load FITS via load_and_validate_fits ({exc}); falling back to raw read",
+            lvl="WARN",
+            callback=progress_callback,
+        )
+        with _open_fits_safely(path) as hdul:
+            data = hdul[0].data
+            header = hdul[0].header if hasattr(hdul[0], "header") else None
+            alpha_hdu = hdul["ALPHA"] if "ALPHA" in hdul else None
+            if alpha_hdu is not None and alpha_hdu.data is not None:
+                try:
+                    alpha = np.asarray(alpha_hdu.data, dtype=np.float32)
+                except Exception:
+                    alpha = None
+
+    if data is None:
+        raise RuntimeError(f"Failed to load frame {path}")
+
+    raw_shape = getattr(data, "shape", None)
+    raw_dtype = getattr(data, "dtype", None)
+    axis_original = None
+    if isinstance(info, dict):
+        axis_original = info.get("axis_order_original")
+
+    header = header or getattr(data, "header", None) or {}
+    bayer_pattern = None
+    try:
+        if hasattr(header, "get"):
+            bayer_pattern = header.get("BAYERPAT", header.get("CFAIMAGE", None))
+    except Exception:
+        bayer_pattern = None
+    if isinstance(bayer_pattern, str):
+        bayer_pattern = bayer_pattern.upper()
+        if bayer_pattern not in {"GRBG", "RGGB", "GBRG", "BGGR"}:
+            bayer_pattern = None
+    else:
+        bayer_pattern = None
+
+    debayer_applied = False
+    data = np.asarray(data, dtype=np.float32, copy=False)
+    if data.ndim == 2 and bayer_pattern:
+        finite_mask = np.isfinite(data)
+        if np.any(finite_mask):
+            data_min = float(np.nanmin(data[finite_mask]))
+            data_max = float(np.nanmax(data[finite_mask]))
+        else:
+            data_min = 0.0
+            data_max = 0.0
+        data_range = data_max - data_min
+        if data_range > 1e-9:
+            norm = (data - data_min) / data_range
+        elif np.any(finite_mask):
+            norm = np.full_like(data, 0.5, dtype=np.float32)
+        else:
+            norm = np.zeros_like(data, dtype=np.float32)
+        norm = np.clip(norm, 0.0, 1.0)
+        try:
+            rgb_norm = debayer_image(norm, bayer_pattern, progress_callback=progress_callback)
+            if data_range > 1e-9:
+                data = rgb_norm * data_range + data_min
+            else:
+                data = np.full_like(rgb_norm, data_min, dtype=np.float32)
+            debayer_applied = True
+        except Exception as exc:
+            _emit(
+                f"[GRID] Debayer failed for {path.name} pattern={bayer_pattern}: {exc}",
+                lvl="WARN",
+                callback=progress_callback,
+            )
+            data = np.stack([data] * 3, axis=-1)
+            debayer_applied = True
+
     arr = _ensure_hwc_array(data)
+    channels = arr.shape[-1] if arr.ndim == 3 else 1
+    _emit(
+        (
+            "DEBUG_SHAPE: loaded frame "
+            f"'{path.name}' raw_shape={raw_shape} raw_dtype={raw_dtype} "
+            f"axis_orig={axis_original} bayer={bayer_pattern or '<none>'} "
+            f"debayered={debayer_applied} hwc_shape={arr.shape} channels={channels}"
+        ),
+        lvl="DEBUG",
+        callback=progress_callback,
+    )
     weights = None
     if alpha is not None:
+        alpha = np.asarray(alpha, dtype=np.float32)
         alpha = np.squeeze(alpha)
+        alpha = np.clip(alpha, 0.0, 255.0) / 255.0
+        if alpha.ndim == 3 and alpha.shape[0] in (1, 3):
+            alpha = np.moveaxis(alpha, 0, -1)
+        if alpha.ndim == 3 and alpha.shape[-1] == 1:
+            alpha = np.squeeze(alpha, axis=-1)
         if alpha.ndim == 2:
-            weights = np.clip(alpha, 0.0, 255.0) / 255.0
-        elif alpha.ndim == 3 and alpha.shape[0] in (1, 3):
-            weights = np.clip(np.moveaxis(alpha, 0, -1), 0.0, 255.0) / 255.0
+            weights = alpha
+        elif alpha.ndim == 3 and alpha.shape[-1] == arr.shape[-1]:
+            weights = alpha
+        elif alpha.ndim == 3 and alpha.shape[-1] == 1 and arr.shape[-1] == 3:
+            weights = np.repeat(alpha, 3, axis=-1)
     return arr, weights
 
 
@@ -1078,13 +1180,15 @@ def _reproject_frame_to_tile(
     tile_shape_hw: tuple[int, int],
     *,
     progress_callback: ProgressCallback = None,
-) -> tuple[np.ndarray | None, np.ndarray | None]:
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
     if not (_REPROJECT_AVAILABLE and reproject_interp):
         return None, None
     if frame.wcs is None:
         return None, None
     try:
-        data, alpha_weights = _load_image_with_optional_alpha(frame.path)
+        data, alpha_weights = _load_image_with_optional_alpha(
+            frame.path, progress_callback=progress_callback
+        )
     except Exception:
         return None, None
 
@@ -1115,6 +1219,14 @@ def _reproject_frame_to_tile(
         _log_wcs_degraded(frame, progress_callback=progress_callback)
 
     reproj_stack = np.stack(reproj_channels, axis=-1)
+    _emit(
+        (
+            "DEBUG_SHAPE: reprojection complete "
+            f"tile={tile.tile_id} frame={frame.path.name} shape={reproj_stack.shape}"
+        ),
+        lvl="DEBUG",
+        callback=progress_callback,
+    )
     footprint_combined = np.nanmax(np.stack(footprints, axis=0), axis=0)
     if alpha_weights is not None:
         try:
@@ -1256,6 +1368,14 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
         return None
 
     tile_shape = (tile.bbox[3] - tile.bbox[2], tile.bbox[1] - tile.bbox[0])
+    _emit(
+        (
+            "DEBUG_SHAPE: tile "
+            f"{tile.tile_id} start frames={len(tile.frames)} tile_shape={tile_shape}"
+        ),
+        lvl="DEBUG",
+        callback=progress_callback,
+    )
     aligned_patches: list[np.ndarray] = []
     weight_maps: list[np.ndarray] = []
     # Keep the working set bounded so very large stacks (thousands of frames)
@@ -1356,6 +1476,14 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
     with np.errstate(divide="ignore", invalid="ignore"):
         stacked = running_sum / np.clip(running_weight, 1e-6, None)
     stacked = np.where(np.isfinite(stacked), stacked, 0.0).astype(np.float32, copy=False)
+    _emit(
+        (
+            "DEBUG_SHAPE: tile "
+            f"{tile.tile_id} stacked patch shape={stacked.shape} weight_shape={running_weight.shape}"
+        ),
+        lvl="DEBUG",
+        callback=progress_callback,
+    )
 
     tiles_dir = output_dir / "tiles"
     try:
@@ -1902,6 +2030,11 @@ def assemble_tiles(
     mosaic_sum = np.zeros(mosaic_shape, dtype=np.float32)
     weight_sum = np.zeros(mosaic_shape, dtype=np.float32)
     H_m, W_m, _ = mosaic_sum.shape
+    _emit(
+        f"DEBUG_SHAPE: mosaic canvas allocated shape={mosaic_sum.shape} dtype={mosaic_sum.dtype}",
+        lvl="DEBUG",
+        callback=progress_callback,
+    )
     _emit(f"Photometry: loaded {len(tile_infos)} tiles for assembly", callback=progress_callback)
 
     overlaps = build_tile_overlap_graph(tile_infos, (H_m, W_m))
@@ -2156,7 +2289,19 @@ def assemble_tiles(
 
     with np.errstate(divide="ignore", invalid="ignore"):
         mosaic = np.where(weight_sum > 0, mosaic_sum / np.clip(weight_sum, 1e-6, None), np.nan)
-    if grid_rgb_equalize and mosaic.ndim == 3 and mosaic.shape[-1] == 3:
+    if not grid_rgb_equalize:
+        _emit(
+            f"RGB equalization: skipped (grid_rgb_equalize=False, shape={mosaic.shape})",
+            lvl="DEBUG",
+            callback=progress_callback,
+        )
+    elif mosaic.ndim != 3 or mosaic.shape[-1] != 3:
+        _emit(
+            f"RGB equalization: skipped (non-RGB mosaic shape={mosaic.shape})",
+            lvl="DEBUG",
+            callback=progress_callback,
+        )
+    else:
         weight_shape = getattr(weight_sum, "shape", None)
         _emit(
             f"RGB equalization: calling grid_post_equalize_rgb (shape={mosaic.shape}, weight_shape={weight_shape})",
@@ -2164,12 +2309,6 @@ def assemble_tiles(
             callback=progress_callback,
         )
         mosaic = grid_post_equalize_rgb(mosaic, weight_sum, progress_callback=progress_callback)
-    else:
-        _emit(
-            f"RGB equalization: skipped (grid_rgb_equalize={grid_rgb_equalize}, shape={mosaic.shape})",
-            lvl="DEBUG",
-            callback=progress_callback,
-        )
     _emit(
         f"Assembly: final mosaic prepared (shape={mosaic.shape}, dtype={mosaic.dtype})",
         callback=progress_callback,
@@ -2320,6 +2459,19 @@ def run_grid_mode(
         radial_shape_power=radial_shape_power,
         save_final_as_uint16=save_final_as_uint16,
         legacy_rgb_cube=legacy_rgb_cube,
+    )
+    _emit(
+        (
+            "Stacking config: "
+            f"norm={config.stack_norm_method}, weight={config.stack_weight_method}, "
+            f"reject={config.stack_reject_algo}, winsor={config.winsor_limits}, "
+            f"combine={config.stack_final_combine}, "
+            f"radial={config.apply_radial_weight} "
+            f"(feather={config.radial_feather_fraction}, power={config.radial_shape_power}), "
+            f"rgb_equalize={grid_rgb_equalize}"
+        ),
+        lvl="INFO",
+        callback=progress_callback,
     )
 
     csv_path = Path(input_folder).expanduser() / "stack_plan.csv"
