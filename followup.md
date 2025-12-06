@@ -1,100 +1,76 @@
-# ZeMosaic – Grid mode: multithread + GPU + stack factorisation – Follow-up
+# followup.md — Vérifications après patch Grid mode
 
-## Checklist par étapes
+## 1. Ce que tu dois vérifier dans le code
 
-### Étape 1 – Multithread tiles uniquement (CPU)
+1. Ouvre `grid_mode.py` et va dans la fonction `build_global_grid`.
+2. Confirme que :
+   - La partie “construction de la grille” utilise désormais des **boucles `for j in range(n_tiles_y)` / `for i in range(n_tiles_x)`** au lieu d’une double boucle `while`.
+   - `MAX_TILES` est bien défini et utilisé à la fois :
+     - pour logger un warning si `n_tiles_estimated > MAX_TILES`,
+     - et pour lever un `RuntimeError` si `len(tiles) > MAX_TILES` pendant la construction.
+   - Le log final de la fonction est présent :
+     ```python
+     _emit(
+         f"[GRID] DEBUG: grid definition ready with {len(tiles)} tile(s) "
+         f"(rejected={rejected_tiles}, est={n_tiles_estimated})",
+         callback=progress_callback,
+     )
+     ```
 
-- [x] Ajouter la clé `grid_workers` dans `zemosaic_config.py` (valeur par défaut 0 = auto).
-- [x] Implémenter le calcul du nombre effectif de workers (auto vs valeur explicite).
-- [x] Paralléliser l’appel à `process_tile(...)` dans `run_grid_mode(...)` avec un pool (threads ou process).
-- [x] Assurer un logging `[GRID] using N workers` cohérent.
-- [x] Tests manuels : comparer single-thread vs multi-threads, vérifier que les sorties sont correctes.
+## 2. Ce que tu dois vérifier dans les logs en lançant un run
 
-### Étape 2 – Flag GPU pour le Grid mode
+[ ] Relance ZeMosaic sur le **même dataset** qu’avant (celui qui freezait), toujours en Grid mode.
 
-- [x] Introduire une clé `use_gpu_grid` (ou équivalent) dans la config, cohérente avec `use_gpu_phase5` / `stack_use_gpu`.
-- [x] Étendre la signature de `run_grid_mode(...)` pour accepter `grid_use_gpu`.
-- [x] Propager `grid_use_gpu` jusqu’à `process_tile(...)`.
-- [x] Créer une première version `_stack_weighted_patches_gpu(...)` dans `grid_mode.py` (dupliquée, mais fonctionnelle).
-- [x] Implémenter le fallback CPU en cas d’échec GPU, avec logs `[GRID] GPU stack failed, falling back to CPU`.
-- [x] Tests manuels :
-  - machine sans GPU → vérifier le fallback ;
-  - machine avec GPU → vérifier la cohérence des résultats et le gain de perf.
+Dans `zemosaic_worker.log` :
 
-### Étape 3 – Factoriser le stacker CPU/GPU
+1. [ ] Vérifie que tu vois la séquence :
 
-- [x] Identifier les blocs de logique de stack communs dans le pipeline principal.
-- [x] Créer un module/func "stack core" réutilisable (CPU/GPU).
-- [x] Adapter Grid mode pour utiliser ce stack core (CPU + GPU).
-- [ ] Adapter le pipeline classique pour utiliser aussi ce stack core.
-- [ ] Tests de non-régression sur pipeline classique + Grid mode.
+   ```text
+   [GRID] [GRID] DEBUG: estimated tiles: 6 (3 rows x 2 cols) for canvas (3272, 2406)
+   [GRID] [GRID] DEBUG: entering tile grid construction: tile_size_px=1920, step_px=1152, n_frames=53
+   ...
+   [GRID] [GRID] DEBUG: grid definition ready with X tile(s) (rejected=Y, est=6)
+````
 
----
+* `X` doit être raisonnable (quelques tuiles, pas des centaines de milliers).
+* Il est normal de voir quelques lignes `DEBUG: built XX tile(s) so far`, mais **pas** des centaines de milliers.
 
-## Journal des interventions
+2. [ ] Vérifie que le worker **continue après** la ligne "grid definition ready…" :
 
-*(Compléter à chaque passage de Codex)*
+   * Tu dois voir des logs correspondant à `assign_frames_to_tiles`,
+   * Puis à l’empilement des tiles et à l’assemblage final.
 
-- `2025-12-05 – Étape 1 – Tâche : Ajouter la clé \`grid_workers\` dans \`zemosaic_config.py\``
-  - Fichiers modifiés : zemosaic_config.py
-  - Notes : Ajout de la clé avec valeur par défaut 0, comme spécifié.
-  - Tests effectués : Aucun, modification mineure.
-- `2025-12-05 – Étape 1 – Tâche : Implémenter le calcul du nombre effectif de workers (auto vs valeur explicite).`
-  - Fichiers modifiés : grid_mode.py
-  - Notes : Ajout de la fonction _get_effective_grid_workers qui utilise grid_workers de la config ou auto = max(1, os.cpu_count() - 2), avec log [GRID] using N workers.
-  - Tests effectués : Aucun, ajout de fonction.
-- `2025-12-05 – Étape 1 – Tâche : Paralléliser l’appel à \`process_tile(...)\` dans \`run_grid_mode(...)\` avec un pool (threads ou process).`
-  - Fichiers modifiés : grid_mode.py
-  - Notes : Remplacement de la boucle for par ThreadPoolExecutor avec gestion d'exceptions, utilisant le nombre de workers calculé. Import de concurrent.futures ajouté.
-  - Tests effectués : Aucun, implémentation de parallélisation.
-- `2025-12-05 – Étape 1 – Tâche : Assurer un logging \`[GRID] using N workers\` cohérent.`
-  - Fichiers modifiés : grid_mode.py
-  - Notes : Le logging est inclus dans la fonction _get_effective_grid_workers.
-  - Tests effectués : Aucun.
-- `2025-12-05 – Étape 1 – Tâche : Tests manuels : comparer single-thread vs multi-threads, vérifier que les sorties sont correctes.`
-  - Fichiers modifiés : Aucun
-  - Notes : Syntaxe vérifiée avec py_compile pour grid_mode.py et zemosaic_config.py. Pas d'erreurs. Tests manuels à effectuer par l'utilisateur sur un jeu de données de test, en forçant grid_workers=1 pour single-thread.
-  - Tests effectués : Syntax checks passed.
-- `2025-12-05 – Étape 2 – Tâche : Introduire une clé \`use_gpu_grid\` (ou équivalent) dans la config, cohérente avec \`use_gpu_phase5\` / \`stack_use_gpu\`.`
-  - Fichiers modifiés : zemosaic_config.py
-  - Notes : Ajout de "use_gpu_grid": True dans DEFAULT_CONFIG, et modification de _normalize_gpu_flags pour synchroniser use_gpu_grid avec la valeur canonique (use_gpu_phase5).
-  - Tests effectués : Aucun, modification de config.
-- `2025-12-05 – Étape 2 – Tâche : Étendre la signature de \`run_grid_mode(...)\` pour accepter \`grid_use_gpu\`.`
-  - Fichiers modifiés : grid_mode.py
-  - Notes : Ajout du paramètre grid_use_gpu: bool | None = None dans run_grid_mode.
-  - Tests effectués : Aucun.
-- `2025-12-05 – Étape 2 – Tâche : Propager \`grid_use_gpu\` jusqu’à \`process_tile(...)\`.`
-  - Fichiers modifiés : grid_mode.py
-  - Notes : Ajout de use_gpu dans GridModeConfig, et propagation dans run_grid_mode. Le flag est utilisé dans process_tile via config.use_gpu.
-  - Tests effectués : Aucun.
-- `2025-12-05 – Étape 2 – Tâche : Créer une première version \`_stack_weighted_patches_gpu(...)\` dans \`grid_mode.py\` (dupliquée, mais fonctionnelle).`
-  - Fichiers modifiés : grid_mode.py
-  - Notes : Création de _stack_weighted_patches_gpu, _normalize_patches_gpu, _fit_linear_scale_gpu. Implémentation avec CuPy pour accélérer le stacking, en gardant la même logique que la version CPU.
-  - Tests effectués : Aucun, ajout de fonctions.
-- `2025-12-05 – Étape 2 – Tâche : Implémenter le fallback CPU en cas d’échec GPU, avec logs \`[GRID] GPU stack failed, falling back to CPU\`.`
-  - Fichiers modifiés : grid_mode.py
-  - Notes : Le fallback est implémenté dans _stack_weighted_patches_gpu, avec log en cas d'exception.
-  - Tests effectués : Aucun.
-- `2025-12-05 – Étape 2 – Tâche : Tests manuels : machine sans GPU → vérifier le fallback ; machine avec GPU → vérifier la cohérence des résultats et le gain de perf.`
-  - Fichiers modifiés : Aucun
-  - Notes : Syntaxe vérifiée avec py_compile pour grid_mode.py et zemosaic_config.py. Pas d'erreurs. Tests manuels à effectuer par l'utilisateur sur un jeu de données de test.
-  - Tests effectués : Syntax checks passed.
-- `2025-12-05 – Étape 3 – Tâche : Identifier les blocs de logique de stack communs dans le pipeline principal.`
-  - Fichiers modifiés : Aucun
-  - Notes : Blocs communs identifiés : normalisation (none, median, linear_fit), rejet d'outliers (kappa_sigma, winsorized_sigma_clip, linear_fit_clip), combinaison (mean, median), avec support GPU via CuPy pour accélérer les opérations.
-  - Tests effectués : Aucun
-- `2025-12-05 – Étape 3 – Tâche : Créer un module/func "stack core" réutilisable (CPU/GPU).`
-  - Fichiers modifiés : zemosaic_stack_core.py
-  - Notes : Création du module zemosaic_stack_core.py avec fonction stack_core utilisant duck typing pour CPU/GPU (numpy/cupy), supportant normalisation (median, linear_fit), rejet d'outliers (kappa_sigma, winsorized_sigma_clip), combinaison (mean, median), et poids.
-  - Tests effectués : Aucun, création de module.
-- `2025-12-05 – Étape 3 – Tâche : Adapter Grid mode pour utiliser ce stack core (CPU + GPU).`
-  - Fichiers modifiés : grid_mode.py
-  - Notes : Modification des fonctions _stack_weighted_patches et _stack_weighted_patches_gpu pour utiliser stack_core avec backend='cpu' ou 'gpu', en passant normalize_method='none' (normalisation faite avant), et les autres config appropriés. Ajout d'import et fallback si stack_core indisponible.
-  - Tests effectués : Aucun, modification des fonctions.
+3. [ ] Vérifie qu’il n’y a :
 
----
+   * ni freeze,
+   * ni `Traceback` lié à `RuntimeError("Grid tile generation aborted: too many tiles(...)")` sur ce dataset (tu ne devrais pas atteindre `MAX_TILES` dans ce cas).
 
-## Notes / Questions en suspens
+## 3. Si quelque chose ne va pas
 
-*(Espace pour lister les points à éclaircir ou les ajustements futurs.)*
-- [ ] …
+* Si tu vois encore un spam massif de :
+
+  ```text
+  [GRID] [GRID] DEBUG: built XXXXX tile(s) so far
+  ```
+
+  sans jamais voir :
+
+  ```text
+  [GRID] [GRID] DEBUG: grid definition ready with ...
+  ```
+
+  alors :
+
+  * Copie dans le prochain message :
+
+    * le bloc de code complet de la construction de la grille dans `build_global_grid` (boucles `for` + logs),
+    * et les lignes de log depuis `DEBUG: estimated tiles...` jusqu’au dernier `DEBUG: built ... tile(s) so far`.
+
+* Si au contraire tu obtiens une exception `Grid tile generation aborted: too many tiles (...)` :
+
+  * Copie aussi :
+
+    * le message complet de l’erreur,
+    * les valeurs de `global_shape_hw`, `tile_size_px`, `step_px`, `n_tiles_y`, `n_tiles_x`, `n_tiles_estimated` (tu peux les récupérer dans le log ou ajouter un log temporaire).
+
+Avec ces éléments, on pourra ajuster finement la formule de `n_tiles_y` / `n_tiles_x` ou le seuil `MAX_TILES` si nécessaire.

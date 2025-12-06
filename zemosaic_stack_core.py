@@ -28,6 +28,11 @@ if GPU_AVAILABLE:
 else:
     cp = None
 
+try:
+    from zemosaic_align_stack import _reject_outliers_kappa_sigma
+except Exception:
+    _reject_outliers_kappa_sigma = None
+
 def get_backend_module(backend: str):
     """Return the array module for the given backend ('cpu' or 'gpu')."""
     if backend == 'gpu':
@@ -121,15 +126,28 @@ def stack_core(
     # Outlier rejection
     rejected_pct = 0.0
     if rejection_algorithm == 'kappa_sigma':
-        med = xp.nanmedian(stacked, axis=0)
-        std = xp.nanstd(stacked, axis=0)
-        low = med - sigma_clip_low * std
-        high = med + sigma_clip_high * std
-        mask = (stacked >= low) & (stacked <= high)
-        rejected_count = float(xp.sum(~mask))
-        total_count = float(xp.prod(xp.array(mask.shape)))
-        rejected_pct = 100.0 * rejected_count / total_count if total_count > 0 else 0.0
-        stacked = xp.where(mask, stacked, xp.nan)
+        if _reject_outliers_kappa_sigma is not None:
+            if backend == 'gpu':
+                data_np = cp.asnumpy(stacked)
+                data_rejected, rejection_mask = _reject_outliers_kappa_sigma(data_np, sigma_clip_low, sigma_clip_high, progress_callback=progress_callback)
+                stacked = cp.asarray(data_rejected, dtype=cp.float32)
+            else:
+                data_rejected, rejection_mask = _reject_outliers_kappa_sigma(stacked, sigma_clip_low, sigma_clip_high, progress_callback=progress_callback)
+                stacked = data_rejected
+            rejected_count = np.sum(~rejection_mask)
+            total_count = stacked.size
+            rejected_pct = 100.0 * rejected_count / total_count if total_count > 0 else 0.0
+        else:
+            # Fallback to simple rejection
+            med = xp.nanmedian(stacked, axis=0)
+            std = xp.nanstd(stacked, axis=0)
+            low = med - sigma_clip_low * std
+            high = med + sigma_clip_high * std
+            mask = (stacked >= low) & (stacked <= high)
+            rejected_count = float(xp.sum(~mask))
+            total_count = float(xp.prod(xp.array(mask.shape)))
+            rejected_pct = 100.0 * rejected_count / total_count if total_count > 0 else 0.0
+            stacked = xp.where(mask, stacked, xp.nan)
     elif rejection_algorithm == 'winsorized_sigma_clip':
         # Placeholder: simplified winsorized
         # Full implementation would winsorize first, then clip.

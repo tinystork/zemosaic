@@ -1,241 +1,303 @@
-# ZeMosaic – Grid mode: multithread + GPU + stack factorisation
+# agent.md — Mission Grid mode / Infinite loop sur la grille de tuiles
 
-## Contexte
+## 1. Contexte
 
-ZeMosaic dispose d’un **Grid mode** (voir `grid_mode.py`) qui :
-- lit un CSV de tuiles,
-- reprojette les images sources sur une grille régulière,
-- empile par tuile via `_stack_weighted_patches(...)`,
-- assemble ensuite la mosaïque finale.
+Projet : **ZeMosaic**, branche actuelle : `V4WIP` (en pratique, tu travailles sur le code tel qu’il est dans le repo local de l’utilisateur).
 
-Aujourd’hui :
-- le **Grid mode est 100% CPU, single-thread**, sans GPU ;
-- il duplique une mini-logique de stacking déjà présente dans le pipeline principal
-  (`zemosaic_worker.py`, `zemosaic_align_stack.py`, `zemosaic_align_stack_gpu.py`) ;
-- il ne profite pas du **GPU** ni des stratégies de parallélisation existantes
-  (`parallel_utils.py`, `zemosaic_config.py`).
+Le **Grid/Survey mode** se base sur `grid_mode.py` pour :
 
-Objectif global :  
-**Étendre le Grid mode** pour qu’il profite :
-- du **multithreading / multiprocess** au niveau des tuiles,
-- du **GPU** pour le stacking des tuiles,
-- et, à terme, d’une **factorisation** du stacker CPU/GPU pour réduire les duplications.
+1. Construire un WCS global + un canevas (`build_global_grid`).
+2. Générer une grille régulière de tuiles (tiles) sur ce canevas.
+3. Assigner les frames aux tuiles, puis les empiler.
 
-⚠️ Important :
-- Implémentation **incrémentale en 3 étapes**.
-- Toujours finir complètement une étape (et mettre à jour `followup.md`) avant d’attaquer la suivante.
-- Ne pas casser le comportement actuel (Grid doit continuer à produire des tuiles correctes, même si lent).
+Actuellement :
 
----
+- Le WCS global se calcule bien (avec un fallback correct quand `shape_hw` dégénère).
+- Le problème se produit **juste après** le log :
 
-## Fichiers concernés (principaux)
+  ```text
+  [GRID] [GRID] DEBUG: entering tile grid construction: tile_size_px=1920, step_px=1152, n_frames=53
+````
 
-- `grid_mode.py`
-- `zemosaic_worker.py`
-- `zemosaic_config.py`
-- `zemosaic_gui_qt.py` (pour la propagation des options depuis le GUI si nécessaire)
-- `parallel_utils.py` (pour s’inspirer de la logique de calcul d’auto workers)
-- éventuellement :
-  - `zemosaic_align_stack.py`
-  - `zemosaic_align_stack_gpu.py`
+* On voit dans le log :
 
----
+  ```text
+  [GRID] [GRID] DEBUG: estimated tiles: 6 (3 rows x 2 cols) for canvas (3272, 2406)
+  [GRID] [GRID] DEBUG: entering tile grid construction: tile_size_px=1920, step_px=1152, n_frames=53
+  [GRID] [GRID] DEBUG: built 50 tile(s) so far
+  [GRID] [GRID] DEBUG: built 100 tile(s) so far
+  ...
+  [GRID] [GRID] DEBUG: built 565000 tile(s) so far
+  ```
 
-## Contraintes générales
+* On **ne voit jamais** la ligne :
 
-- Ne pas casser la **voie classique** (pipeline non-grid).
-- Ne pas modifier la sémantique des stackers existants (kappa-sigma, Winsor, radial weighting, etc.).
-- Logguer clairement les actions Grid mode avec des tags `[GRID]` :
-  - `[GRID] workers=...`
-  - `[GRID] GPU=ON/OFF`
-  - `[GRID] tile X processed by worker pid=...`, etc.
-- Garder le comportement par défaut **safe** :
-  - si config/flags absents → comportement actuel (single-thread CPU, pas de GPU).
-  - si GPU indisponible ou erreur → fallback CPU propre, sans crash.
+  ```text
+  [GRID] [GRID] DEBUG: grid definition ready with X tile(s) (rejected=Y, est=Z)
+  ```
 
----
+=> La fonction de construction de la grille ne termine jamais (boucle “infinie” ou quasi infinie).
+=> Le worker reste figé sans crash, car aucune exception n’est levée.
 
-## Étape 1 – Multithread tiles uniquement (CPU)
+Dans le fichier `grid_mode.py` (version actuelle), autour de `build_global_grid`, il y a un bloc de type :
 
-### Objectif
+```python
+H, W = global_shape_hw
+step_y = step_px
+step_x = step_px
+n_tiles_y = max(1, math.ceil((H - tile_size_px) / step_y) + 1)
+n_tiles_x = max(1, math.ceil((W - tile_size_px) / step_x) + 1)
+n_tiles_estimated = n_tiles_y * n_tiles_x
+_emit("[GRID] DEBUG: estimated tiles: ...")
 
-Paralléliser le travail par tuile dans `run_grid_mode(...)`, sans changer la logique interne de `process_tile(...)` ni `_stack_weighted_patches(...)`.
+MAX_TILES = 50000
+# éventuellement un warning si n_tiles_estimated > MAX_TILES
 
-L’idée :
-- **Chaque tuile est indépendante** -> on peut distribuer `process_tile(tile, ...)` sur plusieurs workers ;
-- Utiliser un petit pool (threads ou process) pour accélérer :
-  - la reprojection des frames vers la tuile,
-  - le stacking intra-tile.
+_emit("[GRID] DEBUG: entering tile grid construction: ...")
 
-### Tâches
+tiles: list[GridTile] = []
+min_x_local = 0
+max_x_local = int(global_shape_hw[1])
+min_y_local = 0
+max_y_local = int(global_shape_hw[0])
+y0 = min_y_local
+tile_id = 1
+rejected_tiles = 0
+while y0 < max_y_local:
+    x0 = min_x_local
+    while x0 < max_x_local:
+        # calcul bbox, shape_hw, tile_wcs
+        # ...
+    # création de la tile, incrément de tile_id, x0, etc.
+y0 += step_px
+```
 
-- [ ] **Ajouter un paramètre de config `grid_workers`**
-  - Ajouter une clé `grid_workers` dans la config (`zemosaic_config.py`), dans la section appropriée (Grid/Survey).
-  - Valeur par défaut : `0` (signifie “auto”).
-  - Documenter la clé dans les commentaires du JSON de config.
+Problèmes probables :
 
-- [ ] **Implémenter un helper pour calculer le nombre de workers effectif**
-  - Dans `grid_mode.py` ou via un petit helper commun :
-    - Si `grid_workers > 0` → utiliser cette valeur.
-    - Si `grid_workers <= 0` → calculer `auto_workers = max(1, os.cpu_count() - 2)` (ou logique similaire inspirée de `parallel_utils`).
-    - Logguer via `[GRID] using N workers for tile processing`.
+* Structure en `while` fragile, avec un mélange entre :
 
-- [ ] **Paralléliser l’appel à `process_tile` dans `run_grid_mode(...)`**
-  - Localiser la boucle actuelle du type :
-    - `for tile in grid.tiles: process_tile(tile, ...)`
-  - La remplacer par l’utilisation d’un pool (`concurrent.futures`):
-    - Soit `ThreadPoolExecutor`, soit `ProcessPoolExecutor` (au choix, mais garder ça cohérent avec le reste du projet si une préférence existe).
-    - Envoyer une tâche par tuile.
-    - Gérer proprement les exceptions :
-      - si une tuile plante, logger un message `[GRID] Tile X failed with error: ...` et continuer avec les autres tuiles ;
-      - ne pas faire échouer tout le Grid mode pour une seule tuile.
-  - Assurer que la barre de progression / callback `progress_callback` continue de fonctionner :
-    - soit via des mises à jour dans `process_tile`,
-    - soit via un wrapper qui reporte la progression.
+  * Incréments de `x0` et `y0`,
+  * Création de la tile (et logs) **mal indentée** par rapport à la boucle interne.
+* Le code construit un nombre de tuiles totalement incohérent avec `n_tiles_estimated` (6 attendues vs > 500 000).
+* Le garde-fou sur `MAX_TILES` n’est visiblement pas efficace (mal placé ou jamais déclenché dans la version réelle).
 
-- [ ] **Tests manuels – Étape 1**
-  - Lancer Grid mode sur un petit jeu de données de test :
-    - comparer :
-      - single-thread (forcer `grid_workers=1`)
-      - multi-threads (laisser `grid_workers=0` ou mettre une valeur >1)
-    - vérifier que :
-      - les tuiles produites sont identiques (ou numériquement quasi-identiques, dans les limites de l’ordonnancement CPU) ;
-      - la mosaïque finale est identique ;
-      - les logs montrent bien `[GRID] using N workers`.
-  - En cas de problème, corriger avant de passer à l’étape 2.
+**Objectif global :**
+
+* Corriger définitivement la construction de la grille pour qu’elle soit :
+
+  * Déterministe,
+  * Bornée,
+  * Lisible (préférence pour des `for` explicites plutôt que des `while` fragiles),
+  * Protégée par un garde-fou (`MAX_TILES`).
 
 ---
 
-## Étape 2 – Flag GPU pour le Grid mode
+## 2. Fichiers concernés
 
-### Objectif
+* `grid_mode.py`
 
-Permettre à Grid mode de réutiliser le **flag GPU global** déjà présent dans le pipeline, pour décider si le stacking des tuiles se fait :
-- en CPU (comportement actuel),
-- ou en GPU (via une nouvelle fonction `_stack_weighted_patches_gpu(...)` ou équivalent).
-
-**Note** : à cette étape, l’objectif est d’introduire le chemin GPU proprement, **pas encore de factoriser le stacker**.
-
-### Tâches
-
-- [ ] **Propager un flag `grid_use_gpu` depuis la config**
-  - S’appuyer sur la logique existante de `zemosaic_config._normalize_gpu_flags(...)` qui synchronise :
-    - `use_gpu_phase5`
-    - `stack_use_gpu`
-    - `use_gpu_stack`
-  - Décider d’une clé canonique pour le Grid, par exemple :
-    - `use_gpu_grid` (nouvelle clé).
-  - Comportement recommandé :
-    - si `use_gpu_grid` n’est pas explicitement défini dans la config, utiliser la même valeur que `use_gpu_phase5` / `stack_use_gpu` (pour rester cohérent avec le pipeline principal).
-    - logguer la valeur finale : `[GRID] GPU requested = True/False`.
-
-- [ ] **Étendre la signature de `run_grid_mode(...)`**
-  - Ajouter un paramètre keyword, par exemple `grid_use_gpu: bool | None = None`.
-  - Si `grid_use_gpu` est `None`, le remplir à partir de la config (cf. précédent point).
-  - Faire passer ce flag jusqu’à `process_tile(...)` (ajouter un paramètre ou encapsuler dans la config `GridModeConfig` si elle existe).
-
-- [ ] **Créer un chemin `_stack_weighted_patches_gpu(...)` (version minimale)**
-  - Dans `grid_mode.py` (étape 2 = duplication assumée) :
-    - ajouter une fonction `_stack_weighted_patches_gpu(...)` qui :
-      - prend les mêmes paramètres que `_stack_weighted_patches(...)` (patches, weights, config, reference_median, etc.) ;
-      - essaie de convertir les données en CuPy et d’appliquer la même logique de stacking que la version CPU (kappa-sigma, Winsor, combine, radial weighting) ;
-      - s’appuie autant que possible sur des helpers existants de `zemosaic_align_stack_gpu.py` si c’est simple ;
-      - retourne les mêmes types (image stacked + weight_sum + ref_median_used).
-  - Important : en cas d’**ImportError / erreur CuPy / autre exception GPU** :
-    - logger une alerte `[GRID] GPU stack failed, falling back to CPU` ;
-    - retourner `None` ou déclencher un fallback CPU explicite depuis l’appelant.
-
-- [ ] **Utiliser le flag dans `process_tile(...)`**
-  - Dans la fonction interne qui empile les chunks (`flush_chunk` ou équivalent) :
-    - si `grid_use_gpu` est `True` :
-      - tenter d’appeler `_stack_weighted_patches_gpu(...)`.
-      - si ça échoue → fallback sur `_stack_weighted_patches(...)` + log claire.
-    - si `grid_use_gpu` est `False` :
-      - utiliser directement `_stack_weighted_patches(...)` (comportement actuel).
-
-- [ ] **Tests manuels – Étape 2**
-  - 2 jeux de tests :
-    - machine **sans GPU** :
-      - activer `use_gpu_grid=True` et vérifier que le code :
-        - loggue bien un fallback CPU ;
-        - ne crash pas ;
-        - produit une mosaïque correcte.
-    - machine **avec GPU** :
-      - comparer Grid mode avec/ sans GPU sur un dataset représentatif ;
-      - vérifier que :
-        - les résultats sont numériquement proches (compte tenu des différences CPU/GPU) ;
-        - le gain de performance est observable ;
-        - aucun artefact évident (tuiles vides, NaN, etc.).
+Ne touche à aucun autre fichier sauf si absolument nécessaire pour faire passer les imports ou types.
+La mission doit être confinée à la **construction de la grille de tuiles** dans `build_global_grid`.
 
 ---
 
-## Étape 3 – Factoriser le stacker CPU/GPU
+## 3. Tâches à accomplir
 
-### Objectif
+### Tâche 1 – Remplacer la double boucle `while` par des boucles bornées en `for`
 
-Réduire la duplication de code entre :
-- le stacker “classique” (pipeline principal),
-- le stacker Grid mode (CPU & GPU).
+Dans `build_global_grid`, juste après le log :
 
-L’idée est de créer un **“stack core”** réutilisable par les deux chemins.
+```python
+_emit(
+    f"[GRID] DEBUG: entering tile grid construction: "
+    f"tile_size_px={tile_size_px}, step_px={step_px}, "
+    f"n_frames={len(usable_frames)}",
+    callback=progress_callback,
+)
+```
 
-### Tâches
+**Remplace complètement** la logique de construction de la grille par quelque chose de ce genre :
 
-- [ ] **Identifier le cœur de logique de stack dans le pipeline principal**
-  - Localiser dans :
-    - `zemosaic_align_stack.py`
-    - `zemosaic_align_stack_gpu.py`
-    - potentiellement `zemosaic_worker.py`
-  - Les fonctions / blocs qui :
-    - normalisent les frames (`linear_fit`, etc.),
-    - gèrent les poids (`noise_variance`, etc.),
-    - font le rejet (kappa-sigma, Winsor),
-    - combinent (mean, median, percentile),
-    - appliquent le radial weighting (si activé).
+```python
+tiles: list[GridTile] = []
 
-- [ ] **Créer un module/func commun de stack**
-  - Créer une fonction ou un petit ensemble de fonctions “core”, par exemple dans un module commun (`zemosaic_utils.py` ou un nouveau `zemosaic_stack_core.py`), qui :
-    - prend un stack d’images + poids (CPU ou GPU),
-    - applique la pipeline de normalisation + weight + rejet + combine + radial,
-    - ne dépend que de :
-      - `numpy` ou `cupy` (via abstraction),
-      - la config de stack (déjà présente).
-  - Implémenter une petite abstraction “backend” CPU/GPU pour éviter de dupliquer toute la logique :
-    - soit via duck typing (np vs cp),
-    - soit via deux wrappers plus fins.
+min_x_local = 0
+max_x_local = int(global_shape_hw[1])
+min_y_local = 0
+max_y_local = int(global_shape_hw[0])
 
-- [ ] **Adapter Grid mode pour utiliser ce stack core**
-  - Remplacer :
-    - `_stack_weighted_patches(...)` (CPU)
-    - `_stack_weighted_patches_gpu(...)` (GPU)
-  - par des appels au stack core :
-    - en préparant les tensors `H x W x C` + poids dans le bon backend (CPU/GPU).
-  - Assurer que les résultats restent compatibles avec le reste du code Grid.
+tile_id = 1
+rejected_tiles = 0
 
-- [ ] **Adapter le pipeline classique pour utiliser aussi le stack core**
-  - Là où c’est raisonnable (sans tout casser d’un coup), remplacer la logique locale par des appels au stack core.
-  - S’assurer que les tests / comportements existants restent valides.
+for j in range(n_tiles_y):
+    y0 = min_y_local + j * step_px
+    if y0 >= max_y_local:
+        break
 
-- [ ] **Tests manuels – Étape 3**
-  - Comparer :
-    - ancienne version (avant factorisation) ;
-    - nouvelle version (après factorisation) ;
-  - sur :
-    - pipeline classique,
-    - Grid mode (CPU + GPU si dispo).
-  - Vérifier qu’il n’y a pas de régression visible (histogrammes, couleurs, couverture).
+    for i in range(n_tiles_x):
+        x0 = min_x_local + i * step_px
+        if x0 >= max_x_local:
+            break
+
+        bbox_xmin = int(x0)
+        bbox_xmax = int(min(x0 + tile_size_px, max_x_local))
+        bbox_ymin = int(y0)
+        bbox_ymax = int(min(y0 + tile_size_px, max_y_local))
+
+        shape_hw = (bbox_ymax - bbox_ymin, bbox_xmax - bbox_xmin)
+        if shape_hw[0] <= 0 or shape_hw[1] <= 0:
+            rejected_tiles += 1
+            continue
+
+        tile_wcs = _clone_tile_wcs(
+            global_wcs,
+            (offset_x + bbox_xmin, offset_y + bbox_ymin),
+            shape_hw,
+        )
+
+        tile = GridTile(
+            tile_id=tile_id,
+            bbox=(bbox_xmin, bbox_xmax, bbox_ymin, bbox_ymax),
+            wcs=tile_wcs,
+        )
+        tiles.append(tile)
+
+        if len(tiles) > MAX_TILES:
+            _emit(
+                f"[GRID] ERROR: built {len(tiles)} tiles > MAX_TILES={MAX_TILES}, "
+                "aborting grid generation to avoid freeze",
+                lvl="ERROR",
+                callback=progress_callback,
+            )
+            raise RuntimeError(
+                f"Grid tile generation aborted: too many tiles ({len(tiles)})"
+            )
+
+        if len(tiles) % 50 == 0:
+            _emit(
+                f"[GRID] DEBUG: built {len(tiles)} tile(s) so far",
+                callback=progress_callback,
+            )
+
+        tile_id += 1
+```
+
+Points importants :
+
+* **Plus de `while y0 < max_y_local` + `while x0 < max_x_local`** : on s’appuie sur `n_tiles_y` / `n_tiles_x` calculés plus haut.
+* Les `break` sur `y0 >= max_y_local` ou `x0 >= max_x_local` sont là pour gérer les cas où la formule de `n_tiles_y` / `n_tiles_x` donne un peu trop de tuiles par rapport au canvas réel.
+* On conserve les variables déjà en place :
+
+  * `tile_size_px`, `step_px`
+  * `offset_x`, `offset_y`
+  * `global_shape_hw`
+  * `MAX_TILES`
+* On utilise toujours `_clone_tile_wcs` pour construire le WCS de la tuile.
+
+À la fin de la construction, conserver / ajouter :
+
+```python
+_emit(
+    f"[GRID] DEBUG: grid definition ready with {len(tiles)} tile(s) "
+    f"(rejected={rejected_tiles}, est={n_tiles_estimated})",
+    callback=progress_callback,
+)
+
+return GridDefinition(
+    global_wcs=global_wcs,
+    global_shape_hw=(int(global_shape_hw[0]), int(global_shape_hw[1])),
+    offset_xy=(offset_x if global_bounds else 0, offset_y if global_bounds else 0),
+    tile_size_px=tile_size_px,
+    overlap_fraction=overlap_fraction,
+    tiles=tiles,
+)
+```
+
+### Tâche 2 – Garde-fou MAX_TILES cohérent
+
+* S’assurer que :
+
+  ```python
+  MAX_TILES = 50000
+  ```
+
+  est défini dans la fonction (ou en haut du module) de façon claire.
+* Gérer **deux niveaux** :
+
+  1. Avertissement si `n_tiles_estimated > MAX_TILES` (simple warning, mais on continue) :
+
+     ```python
+     if n_tiles_estimated > MAX_TILES:
+         _emit(
+             f"[GRID] WARNING: estimated tiles ({n_tiles_estimated}) exceeds MAX_TILES={MAX_TILES}, "
+             "proceeding but freeze risk exists",
+             lvl="WARNING",
+             callback=progress_callback,
+         )
+     ```
+  2. Protection stricte en cours de construction (voir code ci-dessus) : si `len(tiles) > MAX_TILES`, on log en ERROR + on lève `RuntimeError`.
+
+Ainsi, en cas de configuration totalement dégénérée ou bug futur, on aura au pire un **Grid mode abort propre** et non un freeze.
+
+### Tâche 3 – Logs de debug robustes
+
+* Vérifier que les logs suivants existent **et sont atteints** :
+
+  * Après calcul des estimations :
+
+    ```python
+    _emit(
+        f"[GRID] DEBUG: estimated tiles: {n_tiles_estimated} "
+        f"({n_tiles_y} rows x {n_tiles_x} cols) for canvas {global_shape_hw}",
+        callback=progress_callback,
+    )
+    ```
+
+  * Après la construction de la grille :
+
+    ```python
+    _emit(
+        f"[GRID] DEBUG: grid definition ready with {len(tiles)} tile(s) "
+        f"(rejected={rejected_tiles}, est={n_tiles_estimated})",
+        callback=progress_callback,
+    )
+    ```
+
+* Ne pas changer le format des logs déjà existants, sauf ajout de `lvl="WARNING"` ou `lvl="ERROR"` quand c’est réellement pertinent.
 
 ---
 
-## Règles de travail pour Codex
+## 4. Critères d’acceptation
 
-- Toujours commencer par **relire `agent.md` et `followup.md`**.
-- Ne travailler que sur la **prochaine tâche non cochée**.
-- Une fois la tâche terminée :
-  - mettre la case en `[x]` dans `followup.md`,
-  - ajouter un bref log sous forme de bullet point :
-    - fichier touché,
-    - décisions prises,
-    - points d’attention éventuels.
-- Ne pas lancer l’étape suivante tant que l’étape courante n’est pas terminée et validée.
-- En cas de doute, ajouter un commentaire dans le code **sans modifier la logique** plutôt que d’inventer un comportement risqué.
+La mission est réussie si :
+
+1. Sur le dataset problématique de l’utilisateur (canvas `(3272, 2406)`, `tile_size_px=1920`, `step_px=1152`, `n_tiles_estimated=6`):
+
+   * Le log montre :
+
+     * Les lignes `DEBUG: estimated tiles: 6 (3 rows x 2 cols) ...`
+     * La ligne `DEBUG: grid definition ready with X tile(s) (rejected=Y, est=6)` avec `X` raisonnable (typiquement entre 4 et 6).
+   * **Aucun** spam de `DEBUG: built XXX tile(s) so far` au-delà de quelques centaines au maximum (en pratique ici, < 100).
+   * Le worker **ne freeze plus** : `build_global_grid` retourne, et le pipeline continue vers `assign_frames_to_tiles` puis l’empilement des tuiles.
+
+2. En cas de configuration extrême (par exemple si quelqu’un force un `grid_size_factor` minuscule), le code :
+
+   * Émet un warning si `n_tiles_estimated` > `MAX_TILES`.
+   * Lève un `RuntimeError` avec un message explicite si `len(tiles)` > `MAX_TILES`, au lieu de rester bloqué.
+
+3. Aucune régression sur le comportement “normal” :
+
+   * Les tuiles couvrent toujours le canvas global de manière logique.
+   * Les offsets WCS (`offset_x`, `offset_y`) sont toujours pris en compte comme avant.
+   * Le type de retour (`GridDefinition`) et ses champs ne changent pas (sauf éventuellement ajout de valeurs plus strictement typées).
+
+---
+
+## 5. Style & contraintes
+
+* Python 3.10+, typage déjà présent : conserve/complète les hints quand c’est simple.
+* Pas de refacto global : concentre-toi uniquement sur la construction de la grille dans `build_global_grid`.
+* Garde le style des logs existants (`_emit(...)`) et la signature de la fonction.
+
+Merci 😊
+

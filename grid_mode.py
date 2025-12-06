@@ -937,20 +937,16 @@ def build_global_grid(
                 f"[GRID] Optimal global WCS found: crpix={getattr(global_wcs.wcs, 'crpix', None)}, shape_hw={global_shape_hw}",
                 callback=progress_callback,
             )
+
     except Exception as exc:
+
         _emit(f"[GRID] find_optimal_celestial_wcs failed ({exc})", lvl="WARN", callback=progress_callback)
+
         global_wcs = None
+
         global_shape_hw = None
 
-    if global_wcs is None or global_shape_hw is None:
-        first = usable_frames[0]
-        global_wcs = copy.deepcopy(first.wcs)
-        global_shape_hw = first.shape_hw or (0, 0)
-        _emit(
-            f"[GRID] Falling back to first-frame WCS from {first.path} with initial shape_hw={global_shape_hw}",
-            lvl="WARN",
-            callback=progress_callback,
-        )
+
 
     if global_wcs is not None and global_shape_hw is not None:
         if _is_degenerate_global_wcs(usable_frames, global_wcs, global_shape_hw):
@@ -993,15 +989,25 @@ def build_global_grid(
 
     offset_x, offset_y = fallback_offset
     if fallback_bounds is not None:
+        # The fallback function has already normalized the frame footprints into a local
+        # (0-based) coordinate system and returned the correct global_shape_hw.
+        # We must use these local coordinates for all geometry calculations.
+        # The original offset is preserved for WCS adjustments later.
         global_bounds = fallback_bounds
-        min_x = offset_x
-        min_y = offset_y
-        max_x = offset_x + int(math.ceil(max(b[1] for b in global_bounds)))
-        max_y = offset_y + int(math.ceil(max(b[3] for b in global_bounds)))
+        min_x = 0
+        min_y = 0
+        max_x = global_shape_hw[1]
+        max_y = global_shape_hw[0]
+        # Fallback footprints are already local, canvas shape is determined.
+        # We just need to define the local bounds for logging.
+        # The original offset is preserved in (offset_x, offset_y) for WCS cloning.
         if global_shape_hw == (0, 0):
-            width = int(math.ceil(max_x - min_x))
-            height = int(math.ceil(max_y - min_y))
-            global_shape_hw = (height, width)
+            if global_bounds:
+                # Should not happen if _build_fallback_global_wcs is correct, but as a safeguard:
+                width = int(math.ceil(max(b[1] for b in global_bounds)))
+                height = int(math.ceil(max(b[3] for b in global_bounds)))
+                global_shape_hw = (height, width)
+                max_x, max_y = global_shape_hw[1], global_shape_hw[0]
     else:
         global_bounds = []
         for frame in usable_frames:
@@ -1053,6 +1059,32 @@ def build_global_grid(
         callback=progress_callback,
     )
 
+    # Estimate number of tiles to avoid excessive generation
+    H, W = global_shape_hw
+    step_y = step_px
+    step_x = step_px
+    n_tiles_y = max(1, math.ceil((H - tile_size_px) / step_y) + 1)
+    n_tiles_x = max(1, math.ceil((W - tile_size_px) / step_x) + 1)
+    n_tiles_estimated = n_tiles_y * n_tiles_x
+    _emit(
+        f"[GRID] DEBUG: estimated tiles: {n_tiles_estimated} "
+        f"({n_tiles_y} rows x {n_tiles_x} cols) for canvas {global_shape_hw}",
+        callback=progress_callback,
+    )
+    MAX_TILES = 50000
+    if n_tiles_estimated > MAX_TILES:
+        _emit(
+            f"[GRID] WARNING: estimated tiles ({n_tiles_estimated}) exceeds MAX_TILES={MAX_TILES}, "
+            "proceeding but freeze risk exists",
+            callback=progress_callback,
+        )
+    _emit(
+        f"[GRID] DEBUG: entering tile grid construction: "
+        f"tile_size_px={tile_size_px}, step_px={step_px}, "
+        f"n_frames={len(usable_frames)}",
+        callback=progress_callback,
+    )
+
     tiles: list[GridTile] = []
     min_x_local = 0
     max_x_local = int(global_shape_hw[1])
@@ -1076,10 +1108,20 @@ def build_global_grid(
             tile_wcs = _clone_tile_wcs(
                 global_wcs, (offset_x + bbox_xmin, offset_y + bbox_ymin), shape_hw
             )
-            tiles.append(GridTile(tile_id=tile_id, bbox=(bbox_xmin, bbox_xmax, bbox_ymin, bbox_ymax), wcs=tile_wcs))
-            if tile_id <= 3:
+            tile = GridTile(tile_id=tile_id, bbox=(bbox_xmin, bbox_xmax, bbox_ymin, bbox_ymax), wcs=tile_wcs)
+            tiles.append(tile)
+            if len(tiles) > MAX_TILES:
                 _emit(
-                    f"[GRID] Tile bbox (local) id={tile_id}: x=({bbox_xmin},{bbox_xmax}) y=({bbox_ymin},{bbox_ymax})",
+                    f"[GRID] ERROR: built {len(tiles)} tiles > MAX_TILES={MAX_TILES}, "
+                    "aborting grid generation to avoid freeze",
+                    callback=progress_callback,
+                )
+                raise RuntimeError(
+                    f"Grid tile generation aborted: too many tiles ({len(tiles)})"
+                )
+            if len(tiles) % 50 == 0:
+                _emit(
+                    f"[GRID] DEBUG: built {len(tiles)} tile(s) so far",
                     callback=progress_callback,
                 )
             tile_id += 1
@@ -1087,7 +1129,8 @@ def build_global_grid(
         y0 += step_px
 
     _emit(
-        f"[GRID] Global grid ready: {len(tiles)} tile(s), rejected={rejected_tiles}, tile_size_px={tile_size_px}, overlap={overlap_fraction:.3f}",
+        f"[GRID] DEBUG: grid definition ready with {len(tiles)} tile(s) "
+        f"(rejected={rejected_tiles}, est={n_tiles_estimated})",
         callback=progress_callback,
     )
     return GridDefinition(
@@ -1515,13 +1558,13 @@ def _normalize_patches_gpu(
                 s, b = _fit_linear_scale_gpu(ref_patch, patch)
             except Exception:
                 s, b = slopes, intercepts
-            patch_norm = (cp.asarray(patch, dtype=cp.float32, copy=False) * s.reshape((1, 1, -1))) + b.reshape((1, 1, -1))
-            normalized.append(patch_norm.astype(cp.float32, copy=False))
+            patch_norm = (cp.asarray(patch, dtype=cp.float32) * s.reshape((1, 1, -1))) + b.reshape((1, 1, -1))
+            normalized.append(patch_norm.astype(cp.float32))
         return normalized, float(ref_used)
 
     # Default: median scaling
     for patch in patches:
-        patch_arr = cp.asarray(patch, dtype=cp.float32, copy=False)
+        patch_arr = cp.asarray(patch, dtype=cp.float32)
         finite_patch = cp.isfinite(patch_arr)
         med = float(cp.nanmedian(patch_arr[finite_patch])) if cp.any(finite_patch) else ref_median
         med = med if math.isfinite(med) and med != 0 else ref_median
@@ -1530,7 +1573,7 @@ def _normalize_patches_gpu(
         except Exception:
             scale = 1.0
         patch_norm = patch_arr * scale
-        normalized.append(patch_norm.astype(cp.float32, copy=False))
+        normalized.append(patch_norm.astype(cp.float32))
     return normalized, float(ref_median)
 
 
@@ -1635,12 +1678,15 @@ def _stack_weighted_patches_gpu(
     reference_median: float | None = None,
     return_weight_sum: bool = False,
     return_ref_median: bool = False,
+    progress_callback: ProgressCallback = None,
 ) -> np.ndarray | tuple | None:
     """Stack patches with GPU acceleration and optional sigma clipping."""
     if not _CUPY_AVAILABLE:
         return _stack_weighted_patches(
             patches, weights, config, reference_median=reference_median, return_weight_sum=return_weight_sum, return_ref_median=return_ref_median
         )
+    if config.use_gpu:
+        _emit("GPU stacking started", lvl="DEBUG", callback=progress_callback)
     try:
         # Convert to CuPy
         cp_patches = [cp.asarray(p, dtype=cp.float32) for p in patches]
@@ -1755,8 +1801,11 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
     )
     aligned_patches: list[np.ndarray] = []
     weight_maps: list[np.ndarray] = []
-    # Keep the working set bounded so very large stacks (thousands of frames)
-    # do not explode memory usage.
+    # Chunking logic to control memory usage per tile.
+    # stack_chunk_budget_mb is the max MB per tile for stacking.
+    # Per-tile RAM ≈ chunk_limit × per_frame_bytes + tile_canvas_bytes
+    # Total RAM ≈ grid_workers × per_tile_memory
+    # grid_workers is the number of parallel tiles processed.
     try:
         budget_mb = float(getattr(config, "stack_chunk_budget_mb", 512.0) or 512.0)
     except Exception:
@@ -2579,6 +2628,9 @@ def assemble_tiles(
     overlap_union: Dict[int, np.ndarray] = {
         info.tile_id: np.zeros(info.data.shape[:2], dtype=bool) for info in tile_infos
     }
+    global_valid_pixels = 0
+    global_overlap_pixels = 0
+    global_unique_pixels = 0
     overlaps_used = 0
     pyramids_used = 0
     for ov in overlaps:
@@ -2590,8 +2642,6 @@ def assemble_tiles(
         patch_b = info_b.data[ov.slice_b]
         mask_a = info_a.mask[ov.slice_a]
         mask_b = info_b.mask[ov.slice_b]
-        overlap_union[info_a.tile_id][ov.slice_a] = True
-        overlap_union[info_b.tile_id][ov.slice_b] = True
         blended, weight_patch, used_pyr = _blend_overlap_region(patch_a, patch_b, mask_a, mask_b, use_pyramid=True)
         if blended is None or weight_patch is None or not np.any(weight_patch > 0):
             _emit(
@@ -2600,6 +2650,14 @@ def assemble_tiles(
                 callback=progress_callback,
             )
             continue
+        # Mark overlap regions only after successful blending to avoid holes
+        overlap_union[info_a.tile_id][ov.slice_a] = True
+        overlap_union[info_b.tile_id][ov.slice_b] = True
+        _emit(
+            f"Blending: overlap {info_a.tile_id}-{info_b.tile_id} blended successfully",
+            lvl="DEBUG",
+            callback=progress_callback,
+        )
         overlaps_used += 1
         if used_pyr:
             pyramids_used += 1
@@ -2626,6 +2684,7 @@ def assemble_tiles(
         y0 = max(0, min(ty0, H_m))
         x1 = max(0, min(tx1, W_m))
         y1 = max(0, min(ty1, H_m))
+        _emit(f"Tile {info.tile_id} mosaic bbox: x={x0}-{x1}, y={y0}-{y1}", lvl="DEBUG", callback=progress_callback)
         if x1 <= x0 or y1 <= y0:
             _emit(
                 f"Assembly: tile {info.tile_id} bbox outside mosaic, skipping unique region",
@@ -2650,6 +2709,13 @@ def assemble_tiles(
         overlap_mask_local = overlap_union[info.tile_id][off_y : off_y + used_h, off_x : off_x + used_w]
         valid_mask_2d = np.any(mask_crop, axis=-1) if mask_crop.ndim == 3 else mask_crop
         unique_mask = valid_mask_2d & (~overlap_mask_local)
+        n_valid_pixels = int(np.sum(valid_mask_2d))
+        n_overlap_pixels = int(np.sum(overlap_mask_local & valid_mask_2d))
+        n_unique_pixels = n_valid_pixels - n_overlap_pixels
+        _emit(f"Tile {info.tile_id} coverage: valid={n_valid_pixels}, overlap={n_overlap_pixels}, unique={n_unique_pixels}", callback=progress_callback)
+        global_valid_pixels += n_valid_pixels
+        global_overlap_pixels += n_overlap_pixels
+        global_unique_pixels += n_unique_pixels
         if not np.any(unique_mask):
             continue
         channel_mask = mask_crop if mask_crop.ndim == 3 else np.repeat(mask_crop[..., np.newaxis], c, axis=2)
@@ -2660,6 +2726,10 @@ def assemble_tiles(
         mosaic_sum[slice_y, slice_x, :] += np.where(channel_mask, data_crop, 0.0) * weight_crop
         weight_sum[slice_y, slice_x, :] += weight_crop
         _emit(f"Assembly: placed tile {info.tile_id} unique area", lvl="DEBUG", callback=progress_callback)
+
+    _emit(f"Global coverage: valid={global_valid_pixels}, overlap={global_overlap_pixels}, unique={global_unique_pixels}", callback=progress_callback)
+    mosaic_size = H_m * W_m
+    _emit(f"Mosaic size: {mosaic_size} pixels", callback=progress_callback)
 
     if not np.any(weight_sum > 0):
         try:
@@ -2878,13 +2948,18 @@ def _get_effective_grid_workers(config: dict) -> int:
     """Determine the effective number of workers for grid tile processing.
 
     If grid_workers > 0, use that value. Otherwise, compute auto_workers = max(1, os.cpu_count() - 2).
+    Can be forced to 1 for debugging with ZEMOSAIC_GRID_FORCE_SINGLE_THREAD.
     """
-    grid_workers = config.get("grid_workers", 0)
-    if grid_workers > 0:
-        effective = int(grid_workers)
+    if os.environ.get("ZEMOSAIC_GRID_FORCE_SINGLE_THREAD", "").lower() in ("1", "true", "yes"):
+        effective = 1
+        _emit("Forcing single-thread mode for debugging (ZEMOSAIC_GRID_FORCE_SINGLE_THREAD set)")
     else:
-        cpu_count = os.cpu_count() or 1
-        effective = max(1, cpu_count - 2)
+        grid_workers = config.get("grid_workers", 0)
+        if grid_workers > 0:
+            effective = int(grid_workers)
+        else:
+            cpu_count = os.cpu_count() or 1
+            effective = max(1, cpu_count - 2)
     _emit(f"using {effective} workers for tile processing")
     return effective
 
@@ -3005,6 +3080,7 @@ def run_grid_mode(
         legacy_rgb_cube=legacy_rgb_cube,
         use_gpu=grid_use_gpu,
     )
+
     _emit(
         (
             "Stacking config: "
@@ -3033,6 +3109,11 @@ def run_grid_mode(
         _emit("Grid mode aborted: no grid tiles generated", lvl="ERROR", callback=progress_callback)
         raise RuntimeError("Grid mode failed: no tiles to process")
 
+    _emit(
+        f"[GRID] DEBUG: grid_def received with {len(grid.tiles)} tile(s)",
+        callback=progress_callback,
+    )
+
     assign_frames_to_tiles(frames, grid.tiles, progress_callback=progress_callback)
     out_dir = Path(output_folder).expanduser()
     try:
@@ -3040,7 +3121,13 @@ def run_grid_mode(
     except Exception:
         pass
 
+    _emit(
+        f"[GRID] DEBUG: starting tile processing over {len(grid.tiles)} tile(s)",
+        callback=progress_callback,
+    )
+
     num_workers = _get_effective_grid_workers(cfg_disk)
+    _emit(f"Memory telemetry: grid_workers={num_workers}, stack_chunk_budget_mb={config.stack_chunk_budget_mb}", callback=progress_callback)
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
         futures = {executor.submit(process_tile, tile, out_dir, config, progress_callback=progress_callback): tile for tile in grid.tiles}
         for future in concurrent.futures.as_completed(futures):
@@ -3050,6 +3137,10 @@ def run_grid_mode(
                 _emit(f"[GRID] Tile {tile.tile_id} completed", callback=progress_callback)
             except Exception as exc:
                 _emit(f"Tile {tile.tile_id} failed with error: {exc}", lvl="ERROR", callback=progress_callback)
+            # Optional GC after each tile for memory safety (disabled by default)
+            if os.environ.get("ZEMOSAIC_GRID_SAFE_GC", "").lower() in ("1", "true", "yes"):
+                import gc
+                gc.collect()
 
     mosaic_path = assemble_tiles(
         grid,
