@@ -47,7 +47,6 @@ invoked when a ``stack_plan.csv`` file is present in the input folder."""
 
 from __future__ import annotations
 
-import concurrent.futures
 import copy
 import csv
 import logging
@@ -105,14 +104,6 @@ except Exception:  # pragma: no cover - optional dependency
     _NDIMAGE_AVAILABLE = False
 
 try:
-    import cupy as cp
-
-    _CUPY_AVAILABLE = True
-except Exception:  # pragma: no cover - GPU libraries missing
-    cp = None
-    _CUPY_AVAILABLE = False
-
-try:
     from zemosaic_align_stack import (
         _reject_outliers_kappa_sigma,
         _reject_outliers_winsorized_sigma_clip,
@@ -122,11 +113,6 @@ except Exception:  # pragma: no cover - worker remains functional without reject
     _reject_outliers_kappa_sigma = None
     _reject_outliers_winsorized_sigma_clip = None
     equalize_rgb_medians_inplace = None
-
-try:
-    from zemosaic_stack_core import stack_core
-except Exception:
-    stack_core = None
 
 logger = logging.getLogger("ZeMosaicWorker").getChild("grid_mode")
 # Propagate to the worker logger without attaching a NullHandler so Grid messages
@@ -299,7 +285,6 @@ class GridModeConfig:
     radial_shape_power: float = 2.0
     save_final_as_uint16: bool = False
     legacy_rgb_cube: bool = False
-    use_gpu: bool = False
 
 
 @dataclass
@@ -816,8 +801,6 @@ def _build_fallback_global_wcs(
         callback=progress_callback,
     )
 
-
-
     return fallback_wcs, global_shape_hw, local_bounds, (offset_x, offset_y)
 
 
@@ -939,16 +922,20 @@ def build_global_grid(
                 f"[GRID] Optimal global WCS found: crpix={getattr(global_wcs.wcs, 'crpix', None)}, shape_hw={global_shape_hw}",
                 callback=progress_callback,
             )
-
     except Exception as exc:
-
         _emit(f"[GRID] find_optimal_celestial_wcs failed ({exc})", lvl="WARN", callback=progress_callback)
-
         global_wcs = None
-
         global_shape_hw = None
 
-
+    if global_wcs is None or global_shape_hw is None:
+        first = usable_frames[0]
+        global_wcs = copy.deepcopy(first.wcs)
+        global_shape_hw = first.shape_hw or (0, 0)
+        _emit(
+            f"[GRID] Falling back to first-frame WCS from {first.path} with initial shape_hw={global_shape_hw}",
+            lvl="WARN",
+            callback=progress_callback,
+        )
 
     if global_wcs is not None and global_shape_hw is not None:
         if _is_degenerate_global_wcs(usable_frames, global_wcs, global_shape_hw):
@@ -1000,13 +987,6 @@ def build_global_grid(
             width = int(math.ceil(max_x - min_x))
             height = int(math.ceil(max_y - min_y))
             global_shape_hw = (height, width)
-        _emit(
-            f"[GRID][DEBUG] Fallback geometry: "
-            f"offset=({offset_x},{offset_y}), "
-            f"min=({min_x},{min_y}), max=({max_x},{max_y}), "
-            f"global_shape_hw={global_shape_hw}",
-            callback=progress_callback,
-        )
     else:
         global_bounds = []
         for frame in usable_frames:
@@ -1049,40 +1029,12 @@ def build_global_grid(
             _emit("[GRID] No valid footprints available to define global bounds", lvl="ERROR", callback=progress_callback)
             return None
 
-
-
     _emit(
         f"[GRID] global_bounds count={len(global_bounds)}, min_x={min_x}, max_x={max_x}, min_y={min_y}, max_y={max_y}",
         callback=progress_callback,
     )
     _emit(
         f"[GRID] global canvas shape_hw={global_shape_hw}, offset=({offset_x}, {offset_y})",
-        callback=progress_callback,
-    )
-
-    # Estimate number of tiles to avoid excessive generation
-    H, W = global_shape_hw
-    step_y = step_px
-    step_x = step_px
-    n_tiles_y = max(1, math.ceil((H - tile_size_px) / step_y) + 1)
-    n_tiles_x = max(1, math.ceil((W - tile_size_px) / step_x) + 1)
-    n_tiles_estimated = n_tiles_y * n_tiles_x
-    _emit(
-        f"[GRID] DEBUG: estimated tiles: {n_tiles_estimated} "
-        f"({n_tiles_y} rows x {n_tiles_x} cols) for canvas {global_shape_hw}",
-        callback=progress_callback,
-    )
-    MAX_TILES = 50000
-    if n_tiles_estimated > MAX_TILES:
-        _emit(
-            f"[GRID] WARNING: estimated tiles ({n_tiles_estimated}) exceeds MAX_TILES={MAX_TILES}, "
-            "proceeding but freeze risk exists",
-            callback=progress_callback,
-        )
-    _emit(
-        f"[GRID] DEBUG: entering tile grid construction: "
-        f"tile_size_px={tile_size_px}, step_px={step_px}, "
-        f"n_frames={len(usable_frames)}",
         callback=progress_callback,
     )
 
@@ -1109,27 +1061,10 @@ def build_global_grid(
             tile_wcs = _clone_tile_wcs(
                 global_wcs, (offset_x + bbox_xmin, offset_y + bbox_ymin), shape_hw
             )
-            tile = GridTile(tile_id=tile_id, bbox=(bbox_xmin, bbox_xmax, bbox_ymin, bbox_ymax), wcs=tile_wcs)
-            tiles.append(tile)
+            tiles.append(GridTile(tile_id=tile_id, bbox=(bbox_xmin, bbox_xmax, bbox_ymin, bbox_ymax), wcs=tile_wcs))
             if tile_id <= 3:
                 _emit(
-                    f"[GRID][DEBUG] Tile bbox local id={tile_id}: "
-                    f"x=({bbox_xmin},{bbox_xmax}) y=({bbox_ymin},{bbox_ymax}) "
-                    f"shape_hw={shape_hw}",
-                    callback=progress_callback,
-                )
-            if len(tiles) > MAX_TILES:
-                _emit(
-                    f"[GRID] ERROR: built {len(tiles)} tiles > MAX_TILES={MAX_TILES}, "
-                    "aborting grid generation to avoid freeze",
-                    callback=progress_callback,
-                )
-                raise RuntimeError(
-                    f"Grid tile generation aborted: too many tiles ({len(tiles)})"
-                )
-            if len(tiles) % 50 == 0:
-                _emit(
-                    f"[GRID] DEBUG: built {len(tiles)} tile(s) so far",
+                    f"[GRID] Tile bbox (local) id={tile_id}: x=({bbox_xmin},{bbox_xmax}) y=({bbox_ymin},{bbox_ymax})",
                     callback=progress_callback,
                 )
             tile_id += 1
@@ -1137,8 +1072,7 @@ def build_global_grid(
         y0 += step_px
 
     _emit(
-        f"[GRID] DEBUG: grid definition ready with {len(tiles)} tile(s) "
-        f"(rejected={rejected_tiles}, est={n_tiles_estimated})",
+        f"[GRID] Global grid ready: {len(tiles)} tile(s), rejected={rejected_tiles}, tile_size_px={tile_size_px}, overlap={overlap_fraction:.3f}",
         callback=progress_callback,
     )
     return GridDefinition(
@@ -1432,44 +1366,6 @@ def _fit_linear_scale(ref_patch: np.ndarray, patch: np.ndarray) -> tuple[np.ndar
     return np.asarray(slopes, dtype=np.float32), np.asarray(intercepts, dtype=np.float32)
 
 
-def _fit_linear_scale_gpu(ref_patch: cp.ndarray, patch: cp.ndarray) -> tuple[cp.ndarray, cp.ndarray]:
-    """Estimate per-channel linear transform aligning ``patch`` to ``ref_patch`` (GPU version)."""
-
-    ref_arr = cp.asarray(ref_patch, dtype=cp.float32)
-    patch_arr = cp.asarray(patch, dtype=cp.float32)
-    if ref_arr.ndim == 2:
-        ref_arr = ref_arr[..., cp.newaxis]
-    if patch_arr.ndim == 2:
-        patch_arr = patch_arr[..., cp.newaxis]
-    if ref_arr.shape != patch_arr.shape:
-        return cp.ones(ref_arr.shape[-1:], dtype=cp.float32), cp.zeros(ref_arr.shape[-1:], dtype=cp.float32)
-
-    ref_flat = ref_arr.reshape(-1, ref_arr.shape[-1])
-    patch_flat = patch_arr.reshape(-1, patch_arr.shape[-1])
-    finite = cp.isfinite(ref_flat) & cp.isfinite(patch_flat)
-    slopes = cp.ones(ref_arr.shape[-1:], dtype=cp.float32)
-    intercepts = cp.zeros(ref_arr.shape[-1:], dtype=cp.float32)
-    for c in range(ref_arr.shape[-1]):
-        mask_c = finite[:, c]
-        if not cp.any(mask_c):
-            slopes[c] = 1.0
-            intercepts[c] = 0.0
-            continue
-        x = patch_flat[mask_c, c]
-        y = ref_flat[mask_c, c]
-        x_mean = float(cp.nanmean(x))
-        y_mean = float(cp.nanmean(y))
-        var = float(cp.nanvar(x))
-        cov = float(cp.nanmean((x - x_mean) * (y - y_mean))) if var > 0 else 0.0
-        slope = cov / var if var > 0 else 1.0
-        slope = slope if math.isfinite(slope) and slope != 0 else 1.0
-        intercept = y_mean - slope * x_mean
-        intercept = intercept if math.isfinite(intercept) else 0.0
-        slopes[c] = slope
-        intercepts[c] = intercept
-    return slopes, intercepts
-
-
 def _normalize_patches(
     patches: list[np.ndarray],
     reference_median: float | None = None,
@@ -1532,59 +1428,6 @@ def _normalize_patches(
     return normalized, float(ref_median)
 
 
-def _normalize_patches_gpu(
-    patches: list[cp.ndarray],
-    reference_median: float | None = None,
-    *,
-    method: str = "median",
-) -> tuple[list[cp.ndarray], float]:
-    """Scale each patch using the requested normalization method (GPU version)."""
-
-    if not patches:
-        default_ref = reference_median if reference_median is not None else 1.0
-        return [], default_ref
-
-    method_norm = (method or "median").strip().lower()
-    ref_patch = patches[0]
-    ref_finite = cp.isfinite(ref_patch)
-    ref_median = reference_median
-    if ref_median is None:
-        ref_median = float(cp.nanmedian(ref_patch[ref_finite])) if cp.any(ref_finite) else 1.0
-        ref_median = ref_median if math.isfinite(ref_median) and ref_median != 0 else 1.0
-
-    normalized: list[cp.ndarray] = []
-    if method_norm in {"none", "unit", "unity"}:
-        ref_used = ref_median if ref_median is not None else 1.0
-        normalized = [cp.asarray(p, dtype=cp.float32) for p in patches]
-        return normalized, float(ref_used)
-
-    if method_norm in {"linear_fit", "linear"}:
-        slopes, intercepts = _fit_linear_scale_gpu(cp.asarray(ref_patch), cp.asarray(ref_patch))
-        ref_used = float(ref_median)
-        for patch in patches:
-            try:
-                s, b = _fit_linear_scale_gpu(ref_patch, patch)
-            except Exception:
-                s, b = slopes, intercepts
-            patch_norm = (cp.asarray(patch, dtype=cp.float32) * s.reshape((1, 1, -1))) + b.reshape((1, 1, -1))
-            normalized.append(patch_norm.astype(cp.float32))
-        return normalized, float(ref_used)
-
-    # Default: median scaling
-    for patch in patches:
-        patch_arr = cp.asarray(patch, dtype=cp.float32)
-        finite_patch = cp.isfinite(patch_arr)
-        med = float(cp.nanmedian(patch_arr[finite_patch])) if cp.any(finite_patch) else ref_median
-        med = med if math.isfinite(med) and med != 0 else ref_median
-        try:
-            scale = ref_median / med
-        except Exception:
-            scale = 1.0
-        patch_norm = patch_arr * scale
-        normalized.append(patch_norm.astype(cp.float32))
-    return normalized, float(ref_median)
-
-
 def _stack_weighted_patches(
     patches: list[np.ndarray],
     weights: list[np.ndarray],
@@ -1609,183 +1452,51 @@ def _stack_weighted_patches(
         reference_median,
         method=config.stack_norm_method,
     )
-    if stack_core:
-        stack_config = {
-            'normalize_method': 'none',
-            'rejection_algorithm': config.stack_reject_algo,
-            'final_combine_method': config.stack_final_combine,
-            'sigma_clip_low': config.stack_kappa_low,
-            'sigma_clip_high': config.stack_kappa_high,
-        }
-        stacked, rejected_pct, weight_sum = stack_core(
-            images=normalized,
-            weights=weights,
-            stack_config=stack_config,
-            backend='cpu',
+    data_stack = np.stack(normalized, axis=0).astype(np.float32, copy=False)
+    weight_stack = np.stack(weights, axis=0).astype(np.float32, copy=False)
+    data_stack = np.where(weight_stack > 0, data_stack, np.nan)
+
+    rejection = config.stack_reject_algo.lower().strip()
+    data_for_combine = data_stack
+    if rejection in {"kappa_sigma", "kappa"} and _reject_outliers_kappa_sigma:
+        data_for_combine, _ = _reject_outliers_kappa_sigma(
+            data_stack,
+            config.stack_kappa_low,
+            config.stack_kappa_high,
+            progress_callback=None,
         )
-        outputs = [stacked]
-        if return_weight_sum:
-            outputs.append(weight_sum)
-        if return_ref_median:
-            outputs.append(ref_median_used)
-        return tuple(outputs) if len(outputs) > 1 else outputs[0]
+    elif rejection in {"winsorized_sigma_clip", "winsor"} and _reject_outliers_winsorized_sigma_clip:
+        data_for_combine, _ = _reject_outliers_winsorized_sigma_clip(
+            data_stack,
+            config.winsor_limits,
+            config.stack_kappa_low,
+            config.stack_kappa_high,
+            progress_callback=None,
+            max_workers=1,
+        )
+
+    data_masked = np.nan_to_num(data_for_combine, nan=0.0)
+    finite_mask = np.isfinite(data_for_combine)
+    weight_effective = np.where(finite_mask, weight_stack, 0.0)
+    weight_sum = np.sum(weight_effective, axis=0)
+    valid_positions = np.any(finite_mask, axis=0)
+    if not np.any(valid_positions):
+        empty = np.zeros(data_for_combine.shape[1:], dtype=np.float32)
+        outputs = [empty]
     else:
-        # Fallback to old logic if stack_core not available
-        data_stack = np.stack(normalized, axis=0).astype(np.float32, copy=False)
-        weight_stack = np.stack(weights, axis=0).astype(np.float32, copy=False)
-        data_stack = np.where(weight_stack > 0, data_stack, np.nan)
-
-        rejection = config.stack_reject_algo.lower().strip()
-        data_for_combine = data_stack
-        if rejection in {"kappa_sigma", "kappa"} and _reject_outliers_kappa_sigma:
-            data_for_combine, _ = _reject_outliers_kappa_sigma(
-                data_stack,
-                config.stack_kappa_low,
-                config.stack_kappa_high,
-                progress_callback=None,
-            )
-        elif rejection in {"winsorized_sigma_clip", "winsor"} and _reject_outliers_winsorized_sigma_clip:
-            data_for_combine, _ = _reject_outliers_winsorized_sigma_clip(
-                data_stack,
-                config.winsor_limits,
-                config.stack_kappa_low,
-                config.stack_kappa_high,
-                progress_callback=None,
-                max_workers=1,
-            )
-
-        data_masked = np.nan_to_num(data_for_combine, nan=0.0)
-        finite_mask = np.isfinite(data_for_combine)
-        weight_effective = np.where(finite_mask, weight_stack, 0.0)
-        weight_sum = np.sum(weight_effective, axis=0)
-        valid_positions = np.any(finite_mask, axis=0)
-        if not np.any(valid_positions):
-            empty = np.zeros(data_for_combine.shape[1:], dtype=np.float32)
-            outputs = [empty]
+        if config.stack_final_combine.lower().strip() == "median":
+            median_input = np.where(valid_positions[np.newaxis, ...], data_for_combine, 0.0)
+            result = np.nanmedian(median_input, axis=0)
         else:
-            if config.stack_final_combine.lower().strip() == "median":
-                median_input = np.where(valid_positions[np.newaxis, ...], data_for_combine, 0.0)
-                result = np.nanmedian(median_input, axis=0)
-            else:
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    result = np.sum(data_masked * weight_effective, axis=0) / np.clip(weight_sum, 1e-6, None)
-            outputs = [result.astype(np.float32, copy=False)]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                result = np.sum(data_masked * weight_effective, axis=0) / np.clip(weight_sum, 1e-6, None)
+        outputs = [result.astype(np.float32, copy=False)]
 
-        if return_weight_sum:
-            outputs.append(weight_sum.astype(np.float32, copy=False))
-        if return_ref_median:
-            outputs.append(ref_median_used)
-        return outputs[0] if len(outputs) == 1 else tuple(outputs)
-
-
-def _stack_weighted_patches_gpu(
-    patches: list[np.ndarray],
-    weights: list[np.ndarray],
-    config: GridModeConfig,
-    *,
-    reference_median: float | None = None,
-    return_weight_sum: bool = False,
-    return_ref_median: bool = False,
-    progress_callback: ProgressCallback = None,
-) -> np.ndarray | tuple | None:
-    """Stack patches with GPU acceleration and optional sigma clipping."""
-    if not _CUPY_AVAILABLE:
-        return _stack_weighted_patches(
-            patches, weights, config, reference_median=reference_median, return_weight_sum=return_weight_sum, return_ref_median=return_ref_median
-        )
-    if config.use_gpu:
-        _emit("GPU stacking started", lvl="DEBUG", callback=progress_callback)
-    try:
-        # Convert to CuPy
-        cp_patches = [cp.asarray(p, dtype=cp.float32) for p in patches]
-        cp_weights = [cp.asarray(w, dtype=cp.float32) for w in weights]
-
-        # Normalize patches using CuPy
-        normalized, ref_median_used = _normalize_patches_gpu(cp_patches, reference_median, method=config.stack_norm_method)
-        if stack_core:
-            stack_config = {
-                'normalize_method': 'none',
-                'rejection_algorithm': config.stack_reject_algo,
-                'final_combine_method': config.stack_final_combine,
-                'sigma_clip_low': config.stack_kappa_low,
-                'sigma_clip_high': config.stack_kappa_high,
-            }
-            stacked, rejected_pct, weight_sum = stack_core(
-                images=normalized,
-                weights=cp_weights,
-                stack_config=stack_config,
-                backend='gpu',
-            )
-            # Convert back to cp arrays for compatibility
-            stacked = cp.asarray(stacked, dtype=cp.float32)
-            weight_sum = cp.asarray(weight_sum, dtype=cp.float32)
-            outputs = [stacked]
-            if return_weight_sum:
-                outputs.append(weight_sum)
-            if return_ref_median:
-                outputs.append(ref_median_used)
-            return tuple(outputs) if len(outputs) > 1 else outputs[0]
-        else:
-            # Fallback to old logic if stack_core not available
-            data_stack = cp.stack(normalized, axis=0)
-            weight_stack = cp.stack(cp_weights, axis=0)
-            data_stack = cp.where(weight_stack > 0, data_stack, cp.nan)
-
-            # Rejection - need to convert to numpy for rejection functions
-            rejection = config.stack_reject_algo.lower().strip()
-            data_for_combine = data_stack
-            if rejection in {"kappa_sigma", "kappa"} and _reject_outliers_kappa_sigma:
-                data_np = cp.asnumpy(data_stack)
-                data_rejected, _ = _reject_outliers_kappa_sigma(
-                    data_np,
-                    config.stack_kappa_low,
-                    config.stack_kappa_high,
-                    progress_callback=None,
-                )
-                data_for_combine = cp.asarray(data_rejected, dtype=cp.float32)
-            elif rejection in {"winsorized_sigma_clip", "winsor"} and _reject_outliers_winsorized_sigma_clip:
-                data_np = cp.asnumpy(data_stack)
-                data_rejected, _ = _reject_outliers_winsorized_sigma_clip(
-                    data_np,
-                    config.winsor_limits,
-                    config.stack_kappa_low,
-                    config.stack_kappa_high,
-                    progress_callback=None,
-                    max_workers=1,
-                )
-                data_for_combine = cp.asarray(data_rejected, dtype=cp.float32)
-
-            data_masked = cp.nan_to_num(data_for_combine, nan=0.0)
-            finite_mask = cp.isfinite(data_for_combine)
-            weight_effective = cp.where(finite_mask, weight_stack, 0.0)
-            weight_sum = cp.sum(weight_effective, axis=0)
-            valid_positions = cp.any(finite_mask, axis=0)
-            if not cp.any(valid_positions):
-                empty = cp.zeros(data_for_combine.shape[1:], dtype=cp.float32)
-                outputs = [cp.asnumpy(empty)]
-            else:
-                if config.stack_final_combine.lower().strip() == "median":
-                    # For median, convert to numpy
-                    data_np = cp.asnumpy(data_for_combine)
-                    valid_np = cp.asnumpy(valid_positions)
-                    median_input = np.where(valid_np[np.newaxis, ...], data_np, 0.0)
-                    result = np.nanmedian(median_input, axis=0)
-                    outputs = [cp.asarray(result, dtype=cp.float32)]
-                else:
-                    with cp.errstate(divide="ignore", invalid="ignore"):
-                        result = cp.sum(data_masked * weight_effective, axis=0) / cp.clip(weight_sum, 1e-6, None)
-                    outputs = [result]
-
-            if return_weight_sum:
-                outputs.append(cp.asnumpy(weight_sum))
-            if return_ref_median:
-                outputs.append(ref_median_used)
-            return cp.asnumpy(outputs[0]) if len(outputs) == 1 else tuple(cp.asnumpy(o) for o in outputs)
-    except Exception as e:
-        _emit(f"GPU stack failed, falling back to CPU: {e}", lvl="WARN")
-        return _stack_weighted_patches(
-            patches, weights, config, reference_median=reference_median, return_weight_sum=return_weight_sum, return_ref_median=return_ref_median
-        )
+    if return_weight_sum:
+        outputs.append(weight_sum.astype(np.float32, copy=False))
+    if return_ref_median:
+        outputs.append(ref_median_used)
+    return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
 
 def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, progress_callback: ProgressCallback = None) -> Path | None:
@@ -1807,14 +1518,10 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
         lvl="DEBUG",
         callback=progress_callback,
     )
-    _emit(f"Tile {tile.tile_id}: using {'GPU' if config.use_gpu else 'CPU'} for stacking", callback=progress_callback)
     aligned_patches: list[np.ndarray] = []
     weight_maps: list[np.ndarray] = []
-    # Chunking logic to control memory usage per tile.
-    # stack_chunk_budget_mb is the max MB per tile for stacking.
-    # Per-tile RAM ≈ chunk_limit × per_frame_bytes + tile_canvas_bytes
-    # Total RAM ≈ grid_workers × per_tile_memory
-    # grid_workers is the number of parallel tiles processed.
+    # Keep the working set bounded so very large stacks (thousands of frames)
+    # do not explode memory usage.
     try:
         budget_mb = float(getattr(config, "stack_chunk_budget_mb", 512.0) or 512.0)
     except Exception:
@@ -1837,24 +1544,14 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
             aligned_patches.clear()
             weight_maps.clear()
             return
-        if config.use_gpu:
-            res = _stack_weighted_patches_gpu(
-                aligned_patches,
-                weight_maps,
-                config,
-                reference_median=reference_median,
-                return_weight_sum=True,
-                return_ref_median=True,
-            )
-        else:
-            res = _stack_weighted_patches(
-                aligned_patches,
-                weight_maps,
-                config,
-                reference_median=reference_median,
-                return_weight_sum=True,
-                return_ref_median=True,
-            )
+        res = _stack_weighted_patches(
+            aligned_patches,
+            weight_maps,
+            config,
+            reference_median=reference_median,
+            return_weight_sum=True,
+            return_ref_median=True,
+        )
         if not isinstance(res, tuple) or len(res) < 2:
             chunk_failed = True
             _emit(f"Tile {tile.tile_id}: stacking failed for chunk", lvl="ERROR", callback=progress_callback)
@@ -1936,14 +1633,6 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
     except Exception:
         pass
     output_path = tiles_dir / f"tile_{tile.tile_id:04d}.fits"
-
-    # Compute fractions for logging
-    nan_fraction = float(np.mean(np.isnan(stacked)))
-    zero_fraction = float(np.mean(np.abs(stacked) <= 1e-10))
-    _emit(
-        f"[GRID][TILE_GEOM] id={tile.tile_id} path={output_path.name} shape={stacked.shape} bbox={tile.bbox} nan_frac={nan_fraction:.6f} zero_frac={zero_fraction:.6f}",
-        callback=progress_callback,
-    )
     header = None
     try:
         header = tile.wcs.to_header() if hasattr(tile.wcs, "to_header") else None  # type: ignore[attr-defined]
@@ -2645,9 +2334,6 @@ def assemble_tiles(
     overlap_union: Dict[int, np.ndarray] = {
         info.tile_id: np.zeros(info.data.shape[:2], dtype=bool) for info in tile_infos
     }
-    global_valid_pixels = 0
-    global_overlap_pixels = 0
-    global_unique_pixels = 0
     overlaps_used = 0
     pyramids_used = 0
     for ov in overlaps:
@@ -2659,6 +2345,8 @@ def assemble_tiles(
         patch_b = info_b.data[ov.slice_b]
         mask_a = info_a.mask[ov.slice_a]
         mask_b = info_b.mask[ov.slice_b]
+        overlap_union[info_a.tile_id][ov.slice_a] = True
+        overlap_union[info_b.tile_id][ov.slice_b] = True
         blended, weight_patch, used_pyr = _blend_overlap_region(patch_a, patch_b, mask_a, mask_b, use_pyramid=True)
         if blended is None or weight_patch is None or not np.any(weight_patch > 0):
             _emit(
@@ -2667,14 +2355,6 @@ def assemble_tiles(
                 callback=progress_callback,
             )
             continue
-        # Mark overlap regions only after successful blending to avoid holes
-        overlap_union[info_a.tile_id][ov.slice_a] = True
-        overlap_union[info_b.tile_id][ov.slice_b] = True
-        _emit(
-            f"Blending: overlap {info_a.tile_id}-{info_b.tile_id} blended successfully",
-            lvl="DEBUG",
-            callback=progress_callback,
-        )
         overlaps_used += 1
         if used_pyr:
             pyramids_used += 1
@@ -2701,7 +2381,6 @@ def assemble_tiles(
         y0 = max(0, min(ty0, H_m))
         x1 = max(0, min(tx1, W_m))
         y1 = max(0, min(ty1, H_m))
-        _emit(f"Tile {info.tile_id} mosaic bbox: x={x0}-{x1}, y={y0}-{y1}", lvl="DEBUG", callback=progress_callback)
         if x1 <= x0 or y1 <= y0:
             _emit(
                 f"Assembly: tile {info.tile_id} bbox outside mosaic, skipping unique region",
@@ -2726,13 +2405,6 @@ def assemble_tiles(
         overlap_mask_local = overlap_union[info.tile_id][off_y : off_y + used_h, off_x : off_x + used_w]
         valid_mask_2d = np.any(mask_crop, axis=-1) if mask_crop.ndim == 3 else mask_crop
         unique_mask = valid_mask_2d & (~overlap_mask_local)
-        n_valid_pixels = int(np.sum(valid_mask_2d))
-        n_overlap_pixels = int(np.sum(overlap_mask_local & valid_mask_2d))
-        n_unique_pixels = n_valid_pixels - n_overlap_pixels
-        _emit(f"Tile {info.tile_id} coverage: valid={n_valid_pixels}, overlap={n_overlap_pixels}, unique={n_unique_pixels}", callback=progress_callback)
-        global_valid_pixels += n_valid_pixels
-        global_overlap_pixels += n_overlap_pixels
-        global_unique_pixels += n_unique_pixels
         if not np.any(unique_mask):
             continue
         channel_mask = mask_crop if mask_crop.ndim == 3 else np.repeat(mask_crop[..., np.newaxis], c, axis=2)
@@ -2743,50 +2415,6 @@ def assemble_tiles(
         mosaic_sum[slice_y, slice_x, :] += np.where(channel_mask, data_crop, 0.0) * weight_crop
         weight_sum[slice_y, slice_x, :] += weight_crop
         _emit(f"Assembly: placed tile {info.tile_id} unique area", lvl="DEBUG", callback=progress_callback)
-
-    _emit(f"Global coverage: valid={global_valid_pixels}, overlap={global_overlap_pixels}, unique={global_unique_pixels}", callback=progress_callback)
-
-    # Coverage cropping and WCS adjustment (refactored for clarity and correctness)
-    _emit(f"[GRID][DEBUG] Assembly BEFORE cropping rollback: mosaic_shape={mosaic_sum.shape}, weight_sum_shape={weight_sum.shape}, global_shape_hw={grid.global_shape_hw}", callback=progress_callback)
-    # coverage_mask = np.any(weight_sum > 0, axis=-1)
-    # if np.any(coverage_mask):
-    #     ys, xs = np.where(coverage_mask)
-    #     y0, y1 = int(ys.min()), int(ys.max()) + 1
-    #     x0, x1 = int(xs.min()), int(xs.max()) + 1
-    #     _emit(f"[GRID] Coverage bbox found: x=[{x0}:{x1}], y=[{y0}:{y1}] in canvas shape {weight_sum.shape[:2]}", callback=progress_callback)
-    #
-    #     # Check if cropping is actually needed.
-    #     if x0 > 0 or y0 > 0 or x1 < weight_sum.shape[1] or y1 < weight_sum.shape[0]:
-    #         _emit("[GRID] Applying coverage cropping to mosaic and weights...", callback=progress_callback)
-    #         mosaic_sum = mosaic_sum[y0:y1, x0:x1, :]
-    #         weight_sum = weight_sum[y0:y1, x0:x1, :]
-    #
-    #         new_shape_hw = (mosaic_sum.shape[0], mosaic_sum.shape[1])
-    #         _emit(f"[GRID] Cropping complete. New shape: {new_shape_hw}", callback=progress_callback)
-    #
-    #         try:
-    #             # WCS adjustment must be done on the grid.global_wcs object itself
-    #             # to ensure all subsequent uses (e.g., coverage map) are correct.
-    #             if hasattr(grid.global_wcs, "wcs") and hasattr(grid.global_wcs.wcs, "crpix"):
-    #                 # Adjust CRPIX in place. No deepcopy needed if we are careful.
-    #                 grid.global_wcs.wcs.crpix[0] -= x0
-    #                 grid.global_wcs.wcs.crpix[1] -= y0
-    #                 grid.global_shape_hw = new_shape_hw
-    #                 _emit(f"[GRID] WCS CRPIX adjusted by (-{x0}, -{y0}) for new shape.", callback=progress_callback)
-    #             else:
-    #                 _emit("[GRID] WCS object lacks .wcs.crpix attribute, cannot adjust.", lvl="WARN", callback=progress_callback)
-    #         except Exception as e:
-    #             _emit(f"[GRID] Failed to adjust WCS: {e}", lvl="ERROR", callback=progress_callback)
-    #     else:
-    #         _emit("[GRID] Coverage is full; no cropping needed.", callback=progress_callback)
-    # else:
-    #     _emit("[GRID] No coverage data found, skipping cropping.", lvl="WARN", callback=progress_callback)
-    #
-    # TODO: Re-implement coverage-aware cropping using the same logic as the classic pipeline,
-    # once GPU/MultiThread tiles are fully validated.
-
-    mosaic_size = H_m * W_m
-    _emit(f"Mosaic size: {mosaic_size} pixels", callback=progress_callback)
 
     if not np.any(weight_sum > 0):
         try:
@@ -2887,7 +2515,6 @@ def assemble_tiles(
     header = None
     if _ASTROPY_AVAILABLE and fits:
         try:
-            # The grid.global_wcs is now correctly adjusted for cropping.
             header = grid.global_wcs.to_header() if hasattr(grid.global_wcs, "to_header") else None  # type: ignore[attr-defined]
         except Exception:
             header = None
@@ -3002,26 +2629,6 @@ def _load_config_from_disk() -> dict:
         return {}
 
 
-def _get_effective_grid_workers(config: dict) -> int:
-    """Determine the effective number of workers for grid tile processing.
-
-    If grid_workers > 0, use that value. Otherwise, compute auto_workers = max(1, os.cpu_count() - 2).
-    Can be forced to 1 for debugging with ZEMOSAIC_GRID_FORCE_SINGLE_THREAD.
-    """
-    if os.environ.get("ZEMOSAIC_GRID_FORCE_SINGLE_THREAD", "").lower() in ("1", "true", "yes"):
-        effective = 1
-        _emit("Forcing single-thread mode for debugging (ZEMOSAIC_GRID_FORCE_SINGLE_THREAD set)")
-    else:
-        grid_workers = config.get("grid_workers", 0)
-        if grid_workers > 0:
-            effective = int(grid_workers)
-        else:
-            cpu_count = os.cpu_count() or 1
-            effective = max(1, cpu_count - 2)
-    _emit(f"using {effective} workers for tile processing")
-    return effective
-
-
 def run_grid_mode(
     input_folder: str,
     output_folder: str,
@@ -3040,7 +2647,6 @@ def run_grid_mode(
     save_final_as_uint16: bool = False,
     legacy_rgb_cube: bool = False,
     grid_rgb_equalize: bool | None = True,
-    use_gpu: bool | None = None,
 ) -> None:
     """Main entry point for Grid/Survey mode."""
 
@@ -3068,9 +2674,6 @@ def run_grid_mode(
 
     _emit("Grid/Survey mode activated (stack_plan.csv detected)", callback=progress_callback)
     cfg_disk = _load_config_from_disk()
-    if use_gpu is None:
-        use_gpu = cfg_disk.get("use_gpu_grid", False)
-    _emit(f"GPU requested = {use_gpu}")
     # Precedence: on-disk config (grid_rgb_equalize/poststack_equalize_rgb) →
     # caller parameter → built-in default (True).
     rgb_source = "default" if grid_rgb_equalize is None else "param"
@@ -3136,9 +2739,7 @@ def run_grid_mode(
         radial_shape_power=radial_shape_power,
         save_final_as_uint16=save_final_as_uint16,
         legacy_rgb_cube=legacy_rgb_cube,
-        use_gpu=use_gpu,
     )
-
     _emit(
         (
             "Stacking config: "
@@ -3147,7 +2748,7 @@ def run_grid_mode(
             f"combine={config.stack_final_combine}, "
             f"radial={config.apply_radial_weight} "
             f"(feather={config.radial_feather_fraction}, power={config.radial_shape_power}), "
-            f"rgb_equalize={grid_rgb_equalize}, use_gpu={config.use_gpu}"
+            f"rgb_equalize={grid_rgb_equalize}"
         ),
         lvl="INFO",
         callback=progress_callback,
@@ -3167,11 +2768,6 @@ def run_grid_mode(
         _emit("Grid mode aborted: no grid tiles generated", lvl="ERROR", callback=progress_callback)
         raise RuntimeError("Grid mode failed: no tiles to process")
 
-    _emit(
-        f"[GRID] DEBUG: grid_def received with {len(grid.tiles)} tile(s)",
-        callback=progress_callback,
-    )
-
     assign_frames_to_tiles(frames, grid.tiles, progress_callback=progress_callback)
     out_dir = Path(output_folder).expanduser()
     try:
@@ -3179,26 +2775,8 @@ def run_grid_mode(
     except Exception:
         pass
 
-    _emit(
-        f"[GRID] DEBUG: starting tile processing over {len(grid.tiles)} tile(s)",
-        callback=progress_callback,
-    )
-
-    num_workers = _get_effective_grid_workers(cfg_disk)
-    _emit(f"Memory telemetry: grid_workers={num_workers}, stack_chunk_budget_mb={config.stack_chunk_budget_mb}", callback=progress_callback)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-        futures = {executor.submit(process_tile, tile, out_dir, config, progress_callback=progress_callback): tile for tile in grid.tiles}
-        for future in concurrent.futures.as_completed(futures):
-            tile = futures[future]
-            try:
-                result = future.result()
-                _emit(f"[GRID] Tile {tile.tile_id} completed", callback=progress_callback)
-            except Exception as exc:
-                _emit(f"Tile {tile.tile_id} failed with error: {exc}", lvl="ERROR", callback=progress_callback)
-            # Optional GC after each tile for memory safety (disabled by default)
-            if os.environ.get("ZEMOSAIC_GRID_SAFE_GC", "").lower() in ("1", "true", "yes"):
-                import gc
-                gc.collect()
+    for tile in grid.tiles:
+        process_tile(tile, out_dir, config, progress_callback=progress_callback)
 
     mosaic_path = assemble_tiles(
         grid,

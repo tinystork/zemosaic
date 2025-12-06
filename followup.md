@@ -1,76 +1,58 @@
-# followup.md — Vérifications après patch Grid mode
 
-## 1. Ce que tu dois vérifier dans le code
+## `followup.md`
 
-1. Ouvre `grid_mode.py` et va dans la fonction `build_global_grid`.
-2. Confirme que :
-   - La partie “construction de la grille” utilise désormais des **boucles `for j in range(n_tiles_y)` / `for i in range(n_tiles_x)`** au lieu d’une double boucle `while`.
-   - `MAX_TILES` est bien défini et utilisé à la fois :
-     - pour logger un warning si `n_tiles_estimated > MAX_TILES`,
-     - et pour lever un `RuntimeError` si `len(tiles) > MAX_TILES` pendant la construction.
-   - Le log final de la fonction est présent :
-     ```python
-     _emit(
-         f"[GRID] DEBUG: grid definition ready with {len(tiles)} tile(s) "
-         f"(rejected={rejected_tiles}, est={n_tiles_estimated})",
-         callback=progress_callback,
-     )
-     ```
+### Ce que tu dois vérifier dans le code
 
-## 2. Ce que tu dois vérifier dans les logs en lançant un run
+1. [x] Les fonctions suivantes dans `grid_mode.py` correspondent structurellement à celles de `grid_mode_last_good_geometry.py`, à quelques logs près :
 
-[ ] Relance ZeMosaic sur le **même dataset** qu’avant (celui qui freezait), toujours en Grid mode.
+   * [x] `_compute_frame_footprint`
+   * [x] `_build_fallback_global_wcs`
+   * [x] `_is_degenerate_global_wcs`
+   * [x] `_clone_tile_wcs`
+   * [x] `build_global_grid`
+   * [x] `assign_frames_to_tiles`
+   * [x] `assemble_tiles` (partie géométrie : canvas, placement, pas de cropping).
 
-Dans `zemosaic_worker.log` :
+2. [x] L’offset `(offset_x, offset_y)` est utilisé **exactement une fois** pour :
 
-1. [ ] Vérifie que tu vois la séquence :
+   * [x] normaliser les footprints / global bounds,
+   * [x] ajuster le WCS des tiles via `_clone_tile_wcs`,
+   * [x] **pas** pour décaler plusieurs fois les bboxes.
 
-   ```text
-   [GRID] [GRID] DEBUG: estimated tiles: 6 (3 rows x 2 cols) for canvas (3272, 2406)
-   [GRID] [GRID] DEBUG: entering tile grid construction: tile_size_px=1920, step_px=1152, n_frames=53
-   ...
-   [GRID] [GRID] DEBUG: grid definition ready with X tile(s) (rejected=Y, est=6)
-````
+3. [x] `GridDefinition.global_shape_hw` et `mosaic_shape` dans `assemble_tiles` sont égaux.
 
-* `X` doit être raisonnable (quelques tuiles, pas des centaines de milliers).
-* Il est normal de voir quelques lignes `DEBUG: built XX tile(s) so far`, mais **pas** des centaines de milliers.
+4. [x] Aucune logique de cropping final n’est appliquée (plus de `coverage_mask` → recalcule WCS / shape).
 
-2. [ ] Vérifie que le worker **continue après** la ligne "grid definition ready…" :
+5. [x] Le code GPU / multithread / chunking n’a pas été modifié en dehors de l’adaptation aux nouvelles shapes.
 
-   * Tu dois voir des logs correspondant à `assign_frames_to_tiles`,
-   * Puis à l’empilement des tiles et à l’assemblage final.
+---
 
-3. [ ] Vérifie qu’il n’y a :
+### Tests à lancer (manuels)
 
-   * ni freeze,
-   * ni `Traceback` lié à `RuntimeError("Grid tile generation aborted: too many tiles(...)")` sur ce dataset (tu ne devrais pas atteindre `MAX_TILES` dans ce cas).
+1. **Run Grid mode – CPU only**
 
-## 3. Si quelque chose ne va pas
+   * Désactiver le GPU (config `use_gpu=False`).
+   * Lancer ZeMosaic sur le dataset M106 avec `stack_plan.csv`.
+   * Vérifier :
 
-* Si tu vois encore un spam massif de :
+     * [ ] Les tiles `tile_0001.fits` → `tile_0009.fits` ont les mêmes dimensions qu’avant (1920×1920, 1920×1254, 968×1920, 968×1254, 968×102, etc.).
+     * [ ] Sur `tile_0008.fits`, le champ est **completement rempli** comme sur la version “last good” (plus de gros trous ou cadrage décalé).
+     * [ ] La mosaïque finale ressemble visuellement à la référence (image 2 passée par l’utilisateur), avec le même champ couvert.
 
-  ```text
-  [GRID] [GRID] DEBUG: built XXXXX tile(s) so far
-  ```
+2. **Run Grid mode – GPU ON**
 
-  sans jamais voir :
+   * Activer le GPU via la config / GUI.
+   * Refaire le même run.
+   * Vérifier :
 
-  ```text
-  [GRID] [GRID] DEBUG: grid definition ready with ...
-  ```
+     * [ ] Les tiles ont les mêmes bboxes et shapes que le run CPU.
+     * [ ] La mosaïque finale est géométriquement identique (seules de petites différences numériques sont acceptables).
+     * [ ] Pas d’erreur de “shape mismatch” ou de problème de casting.
 
-  alors :
+3. **Logs de validation**
 
-  * Copie dans le prochain message :
+   * Vérifier que les logs `[GRID][TILE_GEOM]` et `[GRID][TILE_LAYOUT]` sont présents et cohérents :
 
-    * le bloc de code complet de la construction de la grille dans `build_global_grid` (boucles `for` + logs),
-    * et les lignes de log depuis `DEBUG: estimated tiles...` jusqu’au dernier `DEBUG: built ... tile(s) so far`.
-
-* Si au contraire tu obtiens une exception `Grid tile generation aborted: too many tiles (...)` :
-
-  * Copie aussi :
-
-    * le message complet de l’erreur,
-    * les valeurs de `global_shape_hw`, `tile_size_px`, `step_px`, `n_tiles_y`, `n_tiles_x`, `n_tiles_estimated` (tu peux les récupérer dans le log ou ajouter un log temporaire).
-
-Avec ces éléments, on pourra ajuster finement la formule de `n_tiles_y` / `n_tiles_x` ou le seuil `MAX_TILES` si nécessaire.
+     * [ ] `global canvas shape_hw` est identique entre `build_global_grid` et `assemble_tiles`.
+     * [ ] Les bboxes des tiles forment une grille cohérente, sans trous ni décalages.
+   * Optionnel : comparer rapidement les logs actuels à ceux d’un run avec `grid_mode_last_good_geometry.py` pour s’assurer que la géométrie est la même.
