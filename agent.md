@@ -1,353 +1,268 @@
 
 ### Mission
 
-Ajouter un bouton **« Analyse »** dans l’interface Qt de ZeMosaic (`zemosaic_gui_qt.py`) **sans toucher au worker / à la pipeline** :
+Quand l’utilisateur clique sur le bouton **“Analyse”** dans la GUI Qt de ZeMosaic :
 
-* Le bouton **n’apparaît que si** un backend d’analyse est détecté dans l’arborescence :
+* **Lancer automatiquement ZeAnalyser** (si ce backend a été détecté),
+* en utilisant **`subprocess.Popen()`**, de façon :
 
-  * **ZeAnalyser** : dossier `zeanalyser` présent dans le **répertoire parent** de `zemosaic`.
-  * **Beforehand** : dossier `seestar/beforehand` présent sous le même parent.
-* Si **les deux** existent, **ZeAnalyser est prioritaire**.
-* Le clic sur le bouton n’a, pour l’instant, qu’un comportement minimal : log + message utilisateur indiquant quel backend a été détecté (l’intégration “profonde” viendra plus tard).
-* La fonctionnalité est **limitée à la GUI Qt**. Le vieux GUI Tk **ne doit pas être modifié**.
+  * **non bloquante** (ZeMosaic continue à tourner),
+  * **multi-plateforme** (Windows / Linux / macOS),
+  * **robuste** (messages clairs si le script/ Python n’est pas trouvés, aucune exception non gérée).
+
+Le backend **Beforehand** reste pour l’instant non câblé (message explicite seulement).
 
 ---
 
 ### Contexte
 
-* Le projet est organisé typiquement comme ceci :
+* Fichiers principaux déjà en place :
+
+  * `zemosaic_gui_qt.py` : GUI principale Qt de ZeMosaic.
+  * `zemosaic_utils.get_app_base_dir()` : renvoie le dossier `zemosaic` même en mode PyInstaller.
+  * `path_helpers.safe_path_isdir` : utilitaire robuste pour tester l’existence d’un dossier.
+  * `_detect_analysis_backend()` (déjà créé précédemment) :
+    retourne un tuple `(backend, root)` :
+
+    * `backend` ∈ `{"none", "zeanalyser", "beforehand"}`,
+    * `root` : `Path` vers le dossier racine du backend, ou `None`.
+
+* La GUI a déjà :
+
+  * un bouton **Analyse** dans `zemosaic_gui_qt.py`,
+  * un handler qui, pour l’instant, affiche un `QMessageBox` disant que l’intégration n’est pas encore câblée.
+
+* ZeAnalyser est attendu dans la structure suivante :
 
   ```text
   .../zeseestarstacker/
       zemosaic/
-          zemosaic_gui_qt.py
-          zemosaic_utils.py
-          ...
       zeanalyser/
-          ...
-      seestar/
-          beforehand/
-              ...
+          analyse_gui_qt.py   <-- script à lancer
   ```
-
-* `zemosaic_utils.get_app_base_dir()` renvoie le répertoire de base de ZeMosaic (le dossier `zemosaic`, même en mode PyInstaller).
-
-* Le **parent** de ce répertoire est la racine “toolbox” ZeSeestarStacker dans laquelle se trouvent éventuellement `zeanalyser` et `seestar/beforehand`.
-
-* Il existe déjà des helpers robustes pour les chemins dans `path_helpers.py` (`safe_path_isdir`).
-
-Objectif : utiliser ces briques pour détecter automatiquement la présence d’un outil d’analyse et conditionner l’affichage du bouton dans `zemosaic_gui_qt.py`.
 
 ---
 
 ### Fichiers à modifier
 
 1. `zemosaic_gui_qt.py`
-2. (Optionnel, mais recommandé) `zemosaic_localization.py`
-   → pour ajouter la clé de traduction du bouton « Analyse » si nécessaire.
-
-> **Important :** ne pas toucher aux autres modules (worker, grid_mode, align, stack, etc.).
-> Aucune modification de la logique scientifique / de la pipeline.
+   (uniquement, ne pas toucher au Tk GUI ni au worker).
 
 ---
 
-### Détails de l’implémentation
+### Tâches détaillées
 
-#### 1. Importer `safe_path_isdir`
+#### 1. Vérifier / consolider l’état interne du backend d’analyse
 
-Dans `zemosaic_gui_qt.py`, il y a déjà un bloc `try/except` en haut du fichier qui importe `get_app_base_dir` :
+Dans la classe principale de la GUI Qt (par ex. `ZeMosaicQtMainWindow` — utiliser le vrai nom présent dans le fichier) :
 
-```python
-try:
-    from zemosaic_utils import get_app_base_dir  # type: ignore
-    from zemosaic_time_utils import ETACalculator, format_eta_hms
-except Exception:  # pragma: no cover - fallback when utils missing
-    def get_app_base_dir() -> Path:  # type: ignore
-        return Path(__file__).resolve().parent
-```
+* S’assurer qu’il existe deux attributs d’instance :
 
-À adapter comme suit :
+  ```python
+  self.analysis_backend: AnalysisBackend = "none"
+  self.analysis_backend_root: Optional[Path] = None
+  ```
 
-* Ajouter l’import de `safe_path_isdir` dans le `try` :
+* Après chargement de la configuration et avant la construction de la barre de boutons, appeler :
 
-```python
-try:
-    from zemosaic_utils import get_app_base_dir  # type: ignore
-    from zemosaic_time_utils import ETACalculator, format_eta_hms
-    from path_helpers import safe_path_isdir
-except Exception:  # pragma: no cover - fallback when utils missing
-    def get_app_base_dir() -> Path:  # type: ignore
-        return Path(__file__).resolve().parent
+  ```python
+  self.analysis_backend, self.analysis_backend_root = _detect_analysis_backend()
+  ```
 
-    def safe_path_isdir(pathish: str | os.PathLike | None, *, expanduser: bool = True) -> bool:
-        """Fallback minimaliste pour éviter un crash si path_helpers n'est pas dispo."""
-        if pathish is None:
-            return False
-        try:
-            text = os.path.expanduser(str(pathish)) if expanduser else str(pathish)
-            return os.path.isdir(text)
-        except Exception:
-            return False
-```
+* Le bouton **Analyse** doit **seulement** être visible si `analysis_backend != "none"`.
 
-* `os` est déjà importé dans ce fichier ; sinon, l’ajouter en haut.
+  Exemple dans la méthode qui construit la barre de commandes :
 
-#### 2. Créer un petit helper de détection de backend
+  ```python
+  if self.analysis_backend != "none":
+      self.analysis_button = QPushButton(self._tr("qt_button_analyse", "Analyse"))
+      self.analysis_button.clicked.connect(self._on_analysis_clicked)
+      row.addWidget(self.analysis_button)
+  else:
+      self.analysis_button = None
+  ```
 
-Toujours dans `zemosaic_gui_qt.py`, au niveau des helpers privés (par exemple à proximité de `_expand_to_path`), ajouter :
+> Ne pas changer l’ordre ni le comportement des boutons existants (`Filter`, `Start`, `Stop`).
+
+#### 2. Créer une méthode privée robuste pour lancer le backend
+
+Ajouter dans `zemosaic_gui_qt.py`, dans la classe principale, une nouvelle méthode privée :
 
 ```python
-from typing import Literal, Tuple
-
-AnalysisBackend = Literal["none", "zeanalyser", "beforehand"]
-
-
-def _detect_analysis_backend() -> Tuple[AnalysisBackend, Optional[Path]]:
+def _launch_analysis_backend(self) -> None:
     """
-    Inspecte l'arborescence autour de ZeMosaic pour trouver un backend d'analyse.
+    Launch the selected analysis backend in a separate process (non-blocking).
 
-    Logique :
-      - base_dir = get_app_base_dir()  -> dossier zemosaic
-      - toolbox_root = base_dir.parent
-      - Si toolbox_root / "zeanalyser" est un dossier  -> "zeanalyser"
-      - Sinon si toolbox_root / "seestar" / "beforehand" est un dossier -> "beforehand"
-      - Sinon -> "none"
+    - If backend == "zeanalyser": run analyse_gui_qt.py using the current Python
+      interpreter (sys.executable).
+    - If backend == "beforehand": for now, only show an informational message.
+    - If no backend or script is missing: show a warning and return gracefully.
     """
+    backend = getattr(self, "analysis_backend", "none")
+    root = getattr(self, "analysis_backend_root", None)
 
-    try:
-        base_dir = get_app_base_dir()
-    except Exception:
-        return "none", None
-
-    toolbox_root = base_dir.parent
-
-    zeanalyser_dir = toolbox_root / "zeanalyser"
-    beforehand_dir = toolbox_root / "seestar" / "beforehand"
-
-    # Priorité à ZeAnalyser si les deux existent
-    if safe_path_isdir(zeanalyser_dir):
-        return "zeanalyser", zeanalyser_dir
-
-    if safe_path_isdir(beforehand_dir):
-        return "beforehand", beforehand_dir
-
-    return "none", None
-```
-
-#### 3. Ajouter un état interne au `ZeMosaicQtMainWindow`
-
-Dans `ZeMosaicQtMainWindow.__init__` :
-
-* Initialiser deux nouveaux attributs d’instance :
-
-```python
-self.analysis_backend: AnalysisBackend = "none"
-self.analysis_backend_root: Optional[Path] = None
-```
-
-* Après le chargement de la configuration et avant la construction des widgets (idéalement avant `_initialize_tab_pages()` ou équivalent), appeler le helper :
-
-```python
-self.analysis_backend, self.analysis_backend_root = _detect_analysis_backend()
-```
-
-L’idée : la détection est faite **une seule fois au démarrage** de la fenêtre.
-
-#### 4. Créer le bouton « Analyse » dans la barre de commandes
-
-Dans la méthode `_build_command_row` de `ZeMosaicQtMainWindow`, on a actuellement quelque chose du genre :
-
-```python
-def _build_command_row(self) -> QHBoxLayout:
-    row = QHBoxLayout()
-    row.setContentsMargins(0, 0, 0, 0)
-    row.addStretch(1)
-    self.filter_button = QPushButton(self._tr("qt_button_filter", "Filter…"))
-    ...
-    self.start_button = QPushButton(self._tr("qt_button_start", "Start"))
-    self.stop_button = QPushButton(self._tr("qt_button_stop", "Stop"))
-    ...
-    row.addWidget(self.filter_button)
-    row.addWidget(self.start_button)
-    row.addWidget(self.stop_button)
-    return row
-```
-
-À adapter comme suit :
-
-1. Déclarer un `self.analysis_button: QPushButton | None` dans `__init__` (pour typage et clarté) :
-
-   ```python
-   self.analysis_button: QPushButton | None = None
-   ```
-
-2. Dans `_build_command_row` :
-
-   ```python
-   def _build_command_row(self) -> QHBoxLayout:
-       row = QHBoxLayout()
-       row.setContentsMargins(0, 0, 0, 0)
-       row.addStretch(1)
-
-       self.filter_button = QPushButton(self._tr("qt_button_filter", "Filter…"))
-       self.filter_button.clicked.connect(self._on_filter_clicked)  # type: ignore[attr-defined]
-
-       self.start_button = QPushButton(self._tr("qt_button_start", "Start"))
-       self.start_button.clicked.connect(self._on_start_clicked)  # type: ignore[attr-defined]
-
-       self.stop_button = QPushButton(self._tr("qt_button_stop", "Stop"))
-       self.stop_button.clicked.connect(self._on_stop_clicked)  # type: ignore[attr-defined]
-
-       # Bouton "Analyse" uniquement si un backend est détecté
-       self.analysis_button = None
-       if self.analysis_backend != "none":
-           label = self._tr("qt_button_analyse", "Analyse")
-           self.analysis_button = QPushButton(label)
-           self.analysis_button.clicked.connect(self._on_analysis_clicked)  # type: ignore[attr-defined]
-
-           # Optionnel : tooltip indiquant le backend choisi
-           if self.analysis_backend == "zeanalyser":
-               self.analysis_button.setToolTip("Launch ZeAnalyser (quality analysis)")
-           elif self.analysis_backend == "beforehand":
-               self.analysis_button.setToolTip("Launch Beforehand analysis")
-       # Ajout dans la ligne : Filter, Start, Stop, Analyse
-       row.addWidget(self.filter_button)
-       row.addWidget(self.start_button)
-       row.addWidget(self.stop_button)
-       if self.analysis_button is not None:
-           row.addWidget(self.analysis_button)
-
-       return row
-   ```
-
-* **Important :** ne pas changer l’ordre existant des autres boutons, juste rajouter `Analyse` à droite.
-
-#### 5. Gérer le clic sur le bouton « Analyse »
-
-Ajouter une méthode privée dans `ZeMosaicQtMainWindow` :
-
-```python
-def _on_analysis_clicked(self) -> None:
-    """
-    Handler temporaire pour le bouton 'Analyse'.
-
-    Pour l'instant :
-      - logge le backend détecté
-      - affiche un message informatif à l'utilisateur
-    La vraie intégration (lancement auto de ZeAnalyser / Beforehand avec paramètres)
-    sera faite plus tard.
-    """
-    backend = self.analysis_backend
-    root = self.analysis_backend_root
-
-    # Sécurité : si plus de backend détecté, désactiver le bouton
     if backend == "none" or root is None:
-        if self.analysis_button is not None:
-            self.analysis_button.setEnabled(False)
-        self._append_log("[INFO] [Analyse] No analysis backend available anymore.")
         QMessageBox.information(
             self,
             "Analysis",
-            "No analysis backend is available. Please check your installation.",
+            "No analysis backend is available near this ZeMosaic installation.",
         )
         return
 
-    # Message selon le backend
     if backend == "zeanalyser":
-        title = "ZeAnalyser detected"
-        msg = (
-            f"ZeAnalyser installation detected here:\n\n{root}\n\n"
-            "The integration is not wired yet.\n"
-            "You can launch ZeAnalyser manually from this folder for now."
+        script = root / "analyse_gui_qt.py"
+        backend_label = "ZeAnalyser"
+    elif backend == "beforehand":
+        # For now, we do not auto-launch Beforehand, just inform the user.
+        QMessageBox.information(
+            self,
+            "Beforehand detected",
+            f"A 'beforehand' analysis workflow was detected here:\n\n{root}\n\n"
+            "Automatic launch is not wired yet. "
+            "You can still run your Beforehand tools manually from this folder.",
         )
+        return
     else:
-        title = "Beforehand analysis detected"
-        msg = (
-            f"'beforehand' analysis workflow detected here:\n\n{root}\n\n"
-            "The integration is not wired yet.\n"
-            "You can run your Beforehand tools manually from this folder."
+        QMessageBox.warning(
+            self,
+            "Analysis",
+            f"Unknown analysis backend: {backend}",
         )
+        return
 
-    self._append_log(f"[INFO] [Analyse] Backend={backend}, root={root}")
-    QMessageBox.information(self, title, msg)
+    # At this point we are in the ZeAnalyser case
+    if not script.is_file():
+        QMessageBox.warning(
+            self,
+            "Analysis",
+            f"Cannot find the analysis script:\n{script}",
+        )
+        return
+
+    # Use the same Python executable as the running ZeMosaic process
+    import sys
+    import subprocess
+
+    cmd = [sys.executable, str(script)]
+
+    # Optional: log the command for debugging purposes
+    try:
+        self._append_log(f"[INFO] [Analysis] Launching {backend_label}: {' '.join(cmd)}")
+    except Exception:
+        # Never fail just because logging failed
+        pass
+
+    try:
+        # Non-blocking launch; ZeMosaic stays responsive.
+        subprocess.Popen(
+            cmd,
+            cwd=str(root),
+            close_fds=False,  # portable, safe default
+            shell=False,      # avoid shell injection issues
+            creationflags=0,  # let OS decide; we keep it simple/portable
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        QMessageBox.critical(
+            self,
+            "Analysis launch failed",
+            f"Failed to launch {backend_label}.\n\n"
+            f"Script: {script}\n"
+            f"Error: {exc}",
+        )
 ```
 
-* `_append_log` existe déjà dans cette classe (utilisé pour la zone de log en bas).
-* Ce handler ne modifie **aucun** comportement existant du pipeline : il ne lance pour l’instant que des messages.
+Points importants :
 
-> **Phase 2 ultérieure (hors scope de cette mission)** : remplacer le contenu de `_on_analysis_clicked` par un véritable lancement de ZeAnalyser / Beforehand (subprocess, arguments CLI, etc.).
+* Utiliser **`sys.executable`** pour être sûr de lancer ZeAnalyser avec le **même Python** que ZeMosaic (évite les problèmes de venv).
+* `cwd=root` : ZeAnalyser se lance dans son propre dossier (utile s’il dépend de chemins relatifs).
+* `shell=False` : plus sûr et plus portable.
+* Capturer **toutes** les exceptions et afficher une `QMessageBox` **sans faire crasher ZeMosaic**.
+* `_append_log` est appelée dans un `try/except` très large pour ne jamais faire échouer le lancement.
 
-#### 6. Internationalisation (optionnel mais propre)
+#### 3. Connecter le bouton à cette méthode
 
-Dans `zemosaic_localization.py` :
+Modifier le handler de clic existant pour qu’il appelle simplement `_launch_analysis_backend` :
 
-* Ajouter une entrée pour la clé `qt_button_analyse` dans les dictionnaires EN/FR :
+```python
+def _on_analysis_clicked(self) -> None:
+    """Slot called when the 'Analyse' button is clicked."""
+    self._launch_analysis_backend()
+```
 
-  * EN : `"qt_button_analyse": "Analyse"`
-  * FR : `"qt_button_analyse": "Analyse"`
+Supprimer les anciennes `QMessageBox` “ZeAnalyser detected… The integration is not wired yet.”
+Toute la logique est maintenant dans `_launch_analysis_backend`.
 
-Si le fichier possède déjà une convention spécifique pour les boutons, s’y conformer (ordre, commentaires, etc.).
+#### 4. Imports nécessaires
+
+En haut de `zemosaic_gui_qt.py` :
+
+* Vérifier que `Path` est importé depuis `pathlib` (normalement oui).
+* Ajouter si besoin :
+
+  ```python
+  import sys
+  import subprocess
+  ```
+
+> Ne pas ajouter d’autres dépendances.
 
 ---
 
 ### Contraintes
 
-* **Ne pas toucher** :
+* **Ne pas modifier :**
 
-  * `zemosaic_gui.py` (GUI Tk).
-  * `zemosaic_worker.py`, `grid_mode.py`, `zemosaic_stack_core.py`, etc.
-  * La logique de stacking / grid / GPU / multithread déjà en place.
-* Pas de nouvelle dépendance externe.
-* La fonctionnalité doit rester **gracieuse** en cas d’erreur :
-  → en cas d’exception lors de la détection, on retombe sur `backend="none"` et le bouton n’apparaît simplement pas.
+  * `zemosaic_gui.py` (GUI Tk),
+  * `zemosaic_worker.py`,
+  * `grid_mode.py`,
+  * ni aucun module scientifique (stacking / alignment / GPU).
+* Aucun changement de comportement de pipeline, seulement **un lancement externe d’outil**.
+* En cas de problème (pas de backend, script manquant, erreur de lancement),
+  **ZeMosaic doit rester stable et utilisable**.
 
 ---
 
 ### Tests attendus
 
-1. **Cas 1 : aucun backend**
+1. **ZeAnalyser présent, script présent**
 
-   * Arborescence sans `zeanalyser` ni `seestar/beforehand`.
+   * Arborescence : `…/zeseestarstacker/zemosaic` + `…/zeseestarstacker/zeanalyser/analyse_gui_qt.py` existe.
    * Lancer ZeMosaic Qt.
-   * Vérifier que :
+   * Vérifier :
 
-     * Aucun bouton « Analyse » n’est visible dans la barre `Filter / Start / Stop`.
-     * Aucun log lié à l’analyse n’apparaît.
+     * Le bouton **Analyse** est visible.
+     * Clic → ouverture d’une nouvelle fenêtre ZeAnalyser.
+     * ZeMosaic reste réactif (on peut naviguer, lancer une mosaïque, etc.).
+     * Le log affiche un message du type :
+       `"[INFO] [Analysis] Launching ZeAnalyser: <cmd>"`.
 
-2. **Cas 2 : uniquement Beforehand**
+2. **ZeAnalyser détecté mais script manquant**
 
-   * Créer un dossier `seestar/beforehand` à côté de `zemosaic`.
-   * Lancer ZeMosaic Qt.
-   * Vérifier que :
+   * Supprimer/renommer `analyse_gui_qt.py`.
+   * Clic sur **Analyse** :
 
-     * Un bouton « Analyse » apparaît.
-     * Le tooltip mentionne Beforehand.
-     * Clic sur le bouton → message `Beforehand` + log `[Analyse] Backend=beforehand`.
+     * Message `Cannot find the analysis script: ...`.
+     * Pas d’exception dans la console.
+     * ZeMosaic continue de fonctionner normalement.
 
-3. **Cas 3 : ZeAnalyser + Beforehand**
+3. **Uniquement Beforehand détecté**
 
-   * Créer `zeanalyser` **et** `seestar/beforehand`.
-   * Lancer ZeMosaic Qt.
-   * Vérifier que :
+   * Pas de `zeanalyser`, mais présence de `seestar/beforehand`.
+   * Clic sur **Analyse** :
 
-     * Le bouton « Analyse » est présent.
-     * Le tooltip mentionne ZeAnalyser.
-     * Clic → message ZeAnalyser + log `Backend=zeanalyser`.
+     * Message d’info expliquant que Beforehand est détecté, mais pas encore câblé.
+     * Pas de tentative de `subprocess.Popen()`.
 
-4. **Cas 4 : backend supprimé en cours de route (edge case)**
+4. **Aucun backend**
 
-   * Lancer ZeMosaic avec `zeanalyser` présent.
-   * Supprimer (ou renommer) le dossier `zeanalyser` pendant que la GUI tourne.
-   * Cliquer sur « Analyse » :
+   * Aucune des structures attendues n’existe.
+   * Le bouton Analyse **ne doit pas apparaître** (ou être désactivé).
+   * Aucun message d’erreur au clic (si le bouton est invisible, pas de clic possible).
 
-     * Le code doit gérer le cas proprement : soit message “no backend available anymore”, soit bouton désactivé.
+5. **Multi-plateforme (au moins check basique)**
 
----
+   * Lancer dans un environnement Linux/Mac si dispo, juste pour vérifier qu’il n’y a :
 
-### Hors scope
-
-* Intégration directe avec ZeAnalyser (CLI, API, etc.).
-* Passage automatique des chemins d’input/output à ZeAnalyser / Beforehand.
-* Modifications du worker, du pipeline, ou du grid mode.
-* Portage de la fonctionnalité vers le GUI Tk.
+     * ni `shell=True`,
+     * ni chemins Windows hardcodés.
 

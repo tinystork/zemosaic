@@ -5449,49 +5449,90 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self._collect_config_from_widgets()
             self._start_processing(skip_filter_prompt=True, predecided_skip_filter_ui=True)
 
-    def _on_analysis_clicked(self) -> None:
+    def _launch_analysis_backend(self) -> None:
         """
-        Handler temporaire pour le bouton 'Analyse'.
+        Launch the selected analysis backend in a separate process (non-blocking).
 
-        Pour l'instant :
-          - logge le backend détecté
-          - affiche un message informatif à l'utilisateur
-        La vraie intégration (lancement auto de ZeAnalyser / Beforehand avec paramètres)
-        sera faite plus tard.
+        - If backend == "zeanalyser": run analyse_gui_qt.py using the current Python
+          interpreter (sys.executable).
+        - If backend == "beforehand": for now, only show an informational message.
+        - If no backend or script is missing: show a warning and return gracefully.
         """
-        backend = self.analysis_backend
-        root = self.analysis_backend_root
+        backend = getattr(self, "analysis_backend", "none")
+        root = getattr(self, "analysis_backend_root", None)
 
-        # Sécurité : si plus de backend détecté, désactiver le bouton
         if backend == "none" or root is None:
-            if self.analysis_button is not None:
-                self.analysis_button.setEnabled(False)
-            self._append_log("[INFO] [Analyse] No analysis backend available anymore.")
             QMessageBox.information(
                 self,
                 "Analysis",
-                "No analysis backend is available. Please check your installation.",
+                "No analysis backend is available near this ZeMosaic installation.",
             )
             return
 
-        # Message selon le backend
         if backend == "zeanalyser":
-            title = "ZeAnalyser detected"
-            msg = (
-                f"ZeAnalyser installation detected here:\n\n{root}\n\n"
-                "The integration is not wired yet.\n"
-                "You can launch ZeAnalyser manually from this folder for now."
+            script = root / "analyse_gui_qt.py"
+            backend_label = "ZeAnalyser"
+        elif backend == "beforehand":
+            # For now, we do not auto-launch Beforehand, just inform the user.
+            QMessageBox.information(
+                self,
+                "Beforehand detected",
+                f"A 'beforehand' analysis workflow was detected here:\n\n{root}\n\n"
+                "Automatic launch is not wired yet. "
+                "You can still run your Beforehand tools manually from this folder.",
             )
+            return
         else:
-            title = "Beforehand analysis detected"
-            msg = (
-                f"'beforehand' analysis workflow detected here:\n\n{root}\n\n"
-                "The integration is not wired yet.\n"
-                "You can run your Beforehand tools manually from this folder."
+            QMessageBox.warning(
+                self,
+                "Analysis",
+                f"Unknown analysis backend: {backend}",
+            )
+            return
+
+        # At this point we are in the ZeAnalyser case
+        if not script.is_file():
+            QMessageBox.warning(
+                self,
+                "Analysis",
+                f"Cannot find the analysis script:\n{script}",
+            )
+            return
+
+        # Use the same Python executable as the running ZeMosaic process
+        import sys
+        import subprocess
+
+        cmd = [sys.executable, str(script)]
+
+        # Optional: log the command for debugging purposes
+        try:
+            self._append_log(f"[INFO] [Analysis] Launching {backend_label}: {' '.join(cmd)}")
+        except Exception:
+            # Never fail just because logging failed
+            pass
+
+        try:
+            # Non-blocking launch; ZeMosaic stays responsive.
+            subprocess.Popen(
+                cmd,
+                cwd=str(root),
+                close_fds=False,  # portable, safe default
+                shell=False,      # avoid shell injection issues
+                creationflags=0,  # let OS decide; we keep it simple/portable
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            QMessageBox.critical(
+                self,
+                "Analysis launch failed",
+                f"Failed to launch {backend_label}.\n\n"
+                f"Script: {script}\n"
+                f"Error: {exc}",
             )
 
-        self._append_log(f"[INFO] [Analyse] Backend={backend}, root={root}")
-        QMessageBox.information(self, title, msg)
+    def _on_analysis_clicked(self) -> None:
+        """Slot called when the 'Analyse' button is clicked."""
+        self._launch_analysis_backend()
 
     def _launch_filter_dialog(self) -> bool | None:
         input_dir_raw = self.config.get("input_dir", "") or ""
