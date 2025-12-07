@@ -1287,6 +1287,22 @@ def _reproject_frame_to_tile(
                 footprint_combined *= np.nanmax(alpha_weights, axis=-1)
         except Exception:
             pass
+    # [GRIDCOV] Instrumentation for diagnostics
+    finite_frac = float(np.isfinite(reproj_stack).mean()) if reproj_stack.size else 0.0
+    nan_frac = float(np.isnan(reproj_stack).mean()) if reproj_stack.size else 0.0
+    if footprint_combined is not None:
+        nonzero_weight_frac = float((footprint_combined > 0).mean()) if footprint_combined.size else 0.0
+    else:
+        nonzero_weight_frac = -1.0  # sentinel
+    _emit(
+        f"[GRIDCOV] tile_id={tile.tile_id} frame={frame.path.name} "
+        f"patch_shape={reproj_stack.shape} "
+        f"finite_frac={finite_frac:.3f} "
+        f"nan_frac={nan_frac:.3f} "
+        f"nonzero_weight_frac={nonzero_weight_frac:.3f}",
+        lvl="DEBUG",
+        callback=progress_callback,
+    )
     return reproj_stack, footprint_combined
 
 
@@ -1518,6 +1534,14 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
         lvl="DEBUG",
         callback=progress_callback,
     )
+    _emit(
+        f"[GRIDCOV] tile_id={tile.tile_id} "
+        f"bbox={tile.bbox} "
+        f"tile_shape={tile_shape} "
+        f"frames_in_tile={len(tile.frames)}",
+        lvl="INFO",
+        callback=progress_callback,
+    )
     aligned_patches: list[np.ndarray] = []
     weight_maps: list[np.ndarray] = []
     # Keep the working set bounded so very large stacks (thousands of frames)
@@ -1624,6 +1648,23 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
             f"{tile.tile_id} stacked patch shape={stacked.shape} weight_shape={running_weight.shape}"
         ),
         lvl="DEBUG",
+        callback=progress_callback,
+    )
+    # [GRIDCOV] Instrumentation for diagnostics
+    if stacked.ndim == 3:
+        stacked_gray = np.mean(stacked, axis=-1)
+    else:
+        stacked_gray = stacked
+    finite_frac = float(np.isfinite(stacked_gray).mean()) if stacked_gray.size else 0.0
+    nan_frac = float(np.isnan(stacked_gray).mean()) if stacked_gray.size else 0.0
+    nonzero_frac = float((stacked_gray != 0).mean()) if stacked_gray.size else 0.0
+    _emit(
+        f"[GRIDCOV] tile_id={tile.tile_id} "
+        f"stacked_shape={stacked.shape} "
+        f"finite_frac={finite_frac:.3f} "
+        f"nan_frac={nan_frac:.3f} "
+        f"nonzero_frac={nonzero_frac:.3f}",
+        lvl="INFO",
         callback=progress_callback,
     )
 

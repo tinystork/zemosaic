@@ -1,187 +1,230 @@
+# Mission
 
-## `agent.md`
+Instrument the **Grid mode** in ZeMosaic to understand why most pixels in the final tiles are zero, even though:
+- the global canvas and grid geometry are correct,
+- tiles receive the expected number of frames,
+- all 9 tiles are written and loaded for assembly.
 
-### Contexte
-
-Projet : **ZeMosaic – Grid/Survey mode**
-
-Deux versions de `grid_mode.py` :
-
-* `grid_mode_last_good_geometry.py` :
-
-  * géométrie / WCS / footprints / coverage **corrects**
-  * pas de GPU, pas de multithreading, pas de chunking.
-* `grid_mode.py` (actuel) :
-
-  * ajoute **GPU**, **multithread** (ThreadPoolExecutor), **chunking**, nouveaux logs et photométrie / blending plus sophistiqués
-  * **mais** la mosaïque produite est géométriquement fausse :
-
-    * certaines tiles (ex : `tile_0008.fits`) ne couvrent pas la bonne zone,
-    * la mosaïque finale ne ressemble plus à celle produite par la version “last good”.
-
-Objectif : **revenir à la géométrie exacte de `grid_mode_last_good_geometry.py`**, tout en gardant :
-
-* le support GPU / CPU,
-* le multithreading des tiles,
-* le chunking,
-* les nouveaux logs de debug (TILE_GEOM, DEBUG_SHAPE, etc.),
-* les nouveaux comportements de stacking (norm/weight/reject/combine identiques au worker).
+Goal: **add diagnostics only** (no functional changes) to see, for each tile and each frame:
+- how much of the tile is actually covered by reprojected data,
+- how much of the tile’s weight map is non-zero,
+- whether this differs between the last-known-good Grid mode and the current one.
 
 ---
 
-### Objectif global
+## Context
 
-> **Faire en sorte que le Grid mode produise exactement la même couverture / géométrie (bboxes, offsets, WCS) que `grid_mode_last_good_geometry.py`, en conservant le pipeline de stacking CPU/GPU/multithread existant.**
+- Project: **ZeMosaic** (Grid/Survey mode).
+- Files:
+  - `grid_mode_last_know_geomtric_tiles_ok.py` → last known good Grid mode (tiles and coverage correct).
+  - `grid_mode.py` → current Grid mode (tiles incomplete, lots of black area).
+- Worker uses one of these grid_mode implementations from `zemosaic_worker.py` via `run_hierarchical_mosaic`.
 
-La mosaïque finale doit être **indistinguable** de la version “last good” pour un même `stack_plan.csv` (même champ couvert, même placement relatif des sources), que le GPU soit activé ou non.
+Facts from logs:
 
----
+- Global canvas is identical between good and faulty runs:
+  - `global canvas shape_hw=(3272, 2406), offset=(-664, -669)`.
+- Tile bboxes are identical (same 3×3 grid).
+- Tile assignment is identical:
+  - Tile 1: 53 frames, Tile 2: 51, Tile 3: 6, ..., Tile 9: 6.
+- In the faulty run, we see for each tile:
+  - `nan_frac=0.0` (no NaNs),
+  - **huge** `zero_frac` (0.6–0.9), meaning most pixels in the stacked tile are exactly zero.
+- Overlap graph reports many overlaps as “no finite pixels” even though we visually expect overlaps.
 
-### Périmètre
+This strongly suggests the issue is **inside the tile stacking path**, specifically:
+- `_reproject_frame_to_tile(...)` (how patches are positioned),
+- how the footprint/weight map is applied and accumulated.
 
-Fichiers à modifier uniquement :
-
-* `grid_mode.py`
-
-Fichier de référence (lecture seule, pour copier la géométrie) :
-
-* `grid_mode_last_good_geometry.py`
-
-**Ne pas toucher** dans cette mission :
-
-* `zemosaic_worker.py`
-* `zemosaic_align_stack.py` / `zemosaic_align_stack_gpu.py`
-* `zemosaic_stack_core.py`
-* Toute la GUI (Tk / Qt)
-* Le pipeline classique hors Grid mode.
-
----
-
-### Stratégie
-
-On va séparer **géométrie** et **stacking** :
-
-* **Géométrie (WCS, canvas, tiles, bboxes, assignation)**
-  → doit être **copiée / revertée** depuis `grid_mode_last_good_geometry.py`, en conservant seulement les nouveaux logs non intrusifs.
-* **Stacking (CPU/GPU, multithreading, chunking, photométrie interne à la tile)**
-  → reste tel qu’implémenté dans la nouvelle version.
+We want to **trace coverage** without changing the numerical behaviour.
 
 ---
 
-### Tâches détaillées
+## Constraints
 
-#### 1. Restaurer la géométrie depuis `grid_mode_last_good_geometry.py`
-
-1. Ouvrir **les deux fichiers** :
-
-   * `grid_mode.py` (actuel)
-   * `grid_mode_last_good_geometry.py` (version “last good”)
-
-2. Pour les blocs suivants, **copier/coller la version “last good”** dans `grid_mode.py`, puis réadapter seulement ce qui est nécessaire aux nouvelles signatures / logs :
-
-   * `_compute_frame_footprint(...)`
-   * `_build_fallback_global_wcs(...)`
-   * `_is_degenerate_global_wcs(...)` (si différent)
-   * `_clone_tile_wcs(...)`
-   * `build_global_grid(...)`
-   * `assign_frames_to_tiles(...)`
-   * `TilePhotometryInfo`, `TileOverlap` (si la structure a changé côté géométrie pure)
-   * `assemble_tiles(...)` pour la **partie géométrique** :
-
-     * allocation du canvas global,
-     * interprétation de `GridTile.bbox`,
-     * placement des tiles dans la mosaïque (indices y/x),
-     * gestion du `coverage_mask` / `weight_sum` **sans cropping supplémentaire**.
-
-3. Lors de ce “revert ciblé” :
-
-   * **Conserver** les nouveaux logs utiles (TILE_GEOM, DEBUG_SHAPE, DEBUG_SHAPE_WRITE, coverage/unique/overlap, etc.).
-   * **Ne pas réintroduire** le cropping agressif qui avait été ajouté :
-     la mosaïque doit rester au **canvas global complet** (NaN ou 0 dans les zones vides), comme la version “last good”.
-   * S’assurer que :
-
-     * `GridDefinition.global_shape_hw`,
-     * `GridDefinition.offset_xy`,
-     * les `bbox` des `GridTile`,
-     * et les WCS des tiles via `_clone_tile_wcs`
-       sont gérés **exactement comme dans `grid_mode_last_good_geometry.py`**.
-
-4. Vérifier la cohérence des **offsets** :
-
-   * dans le cas fallback (`_build_fallback_global_wcs`), les footprints retournés sont déjà normalisés dans un repère local → ne pas re-normaliser une seconde fois.
-   * l’offset global `(offset_x, offset_y)` doit être utilisé **une seule fois** pour :
-
-     * ajuster `global_shape_hw`,
-     * paramétrer `_clone_tile_wcs` (CRPIX global → CRPIX local tile),
-     * **mais pas** pour décaler à nouveau les `bbox` ou les footprints.
-
-#### 2. S’assurer que le stacking (CPU/GPU) utilise la nouvelle géométrie sans l’altérer
-
-1. Ne pas modifier :
-
-   * la logique de chunking dans `process_tile`,
-   * le choix CPU vs GPU,
-   * les fonctions `_fit_linear_scale_gpu`, `_normalize_patches_gpu`, `_stack_weighted_patches_gpu`,
-   * les appels à `stack_core` côté CPU si présents.
-
-2. Vérifier simplement que `process_tile(...)` continue d’utiliser :
-
-   * `tile_shape_hw` dérivé de `tile.bbox` selon la géométrie “last good”,
-   * les WCS de `tile.wcs` créés par `_clone_tile_wcs` restauré.
-
-3. Conserver les logs de debug existants sur :
-
-   * shape des patches,
-   * fraction de NaN/zeros,
-   * budget mémoire / chunking.
-
-Aucune modification mathématique n’est attendue dans ces fonctions.
-
-#### 3. Ajouter de la télémétrie précise pour valider la géométrie
-
-1. Dans `build_global_grid(...)` :
-
-   * logger `global_shape_hw`, `offset_xy`, nombre de tiles, et la liste **résumée** des bboxes (min/max x/y).
-   * Exemple de log (déjà en partie présent, à vérifier) :
-     `[GRID][TILE_LAYOUT] tile_id=8 bbox=(1152,2406,2304,3272) shape_hw=(968,1254)`
-
-2. Dans `process_tile(...)` ou juste après la sauvegarde des tiles :
-
-   * conserver / compléter le log de type :
-     `[GRID][TILE_GEOM] id=8 path=tile_0008.fits shape=(H,W,C) bbox=(xmin,xmax,ymin,ymax)`
-
-3. Dans `assemble_tiles(...)` :
-
-   * avant d’écrire la mosaïque finale, logguer :
-
-     * `mosaic_shape`,
-     * `global_shape_hw` (doit être identique),
-     * la somme des zones `unique` vs `overlap`.
-
-Ces logs servent uniquement à valider que la géométrie restaurée est cohérente, pas à modifier la logique.
+- **Do not change functional logic**:
+  - No changes to WCS math,
+  - No changes to reproject parameters,
+  - No changes to multithreading / chunking / GPU flags,
+  - No changes to the actual stacking algorithm.
+- Only add logging with a distinctive prefix, e.g. `"[GRIDCOV]"`.
+- Logging must be reasonably compact:
+  - Use `INFO` for per-tile summaries,
+  - Use `DEBUG` for per-frame/per-patch details.
+- Apply the same instrumentation to:
+  - `grid_mode_last_know_geomtric_tiles_ok.py`,
+  - `grid_mode.py`,
+  so we can run the same dataset and diff the logs.
 
 ---
 
-### Contraintes / Invariants
+## Files to modify
 
-* Ne rien casser dans le mode classique.
-* Ne pas supprimer les optimisations GPU/multithread déjà en place.
-* Ne pas réintroduire de cropping automatique de la mosaïque finale :
-  **la logique de recadrage est gérée plus tard par la pipeline classique**, pas par Grid.
-* S’assurer que les tiles `tile_0001.fits`, `tile_0002.fits`, ..., `tile_0009.fits` ont :
+- `grid_mode_last_know_geomtric_tiles_ok.py`
+- `grid_mode.py`
 
-  * des shapes cohérentes avec `global_shape_hw` et la taille de tuile choisie,
-  * des contenus compatibles avec la version “last good” (visuellement et en termes de placement des sources).
+Focus on:
+
+- `process_tile(...)`
+- `_reproject_frame_to_tile(...)` (or the equivalent helper used for per-frame reprojection)
+- `assemble_tiles(...)` (optional small summary at the end)
 
 ---
 
-### Résultat attendu
+## What to add (diagnostics)
 
-Avec le dataset de test M106 (le même `stack_plan.csv` que la référence) :
+### 1. In `_reproject_frame_to_tile(...)`
 
-* Le Grid mode produit :
+After computing the **reprojected patch** and **footprint/weight map**, add logs like:
 
-  * une mosaïque finale **géométriquement identique** à celle produite par `grid_mode_last_good_geometry.py`,
-  * des tiles `tile_xxxx.fits` correctement cadrées (plus de “zone manquante” sur `tile_0008.fits`),
-  * ce résultat est indépendant du flag GPU (ON/OFF).
+- At DEBUG level:
+
+```python
+finite_frac = float(np.isfinite(patch).mean()) if patch.size else 0.0
+nan_frac = float(np.isnan(patch).mean()) if patch.size else 0.0
+
+if weight_map is not None:
+    nonzero_weight_frac = float((weight_map > 0).mean()) if weight_map.size else 0.0
+else:
+    nonzero_weight_frac = -1.0  # sentinel
+
+_emit(
+    f"[GRIDCOV] tile_id={tile.tile_id} frame={frame.path.name} "
+    f"patch_shape={patch.shape} "
+    f"finite_frac={finite_frac:.3f} "
+    f"nan_frac={nan_frac:.3f} "
+    f"nonzero_weight_frac={nonzero_weight_frac:.3f}",
+    lvl="DEBUG",
+    callback=progress_callback,
+)
+````
+
+If feasible, also log a *coarse* bounding box of non-zero weights in tile coordinates (no need for per-pixel dumps), e.g.:
+
+```python
+if weight_map is not None and weight_map.any():
+    ys, xs = np.where(weight_map > 0)
+    y0, y1 = int(ys.min()), int(ys.max())
+    x0, x1 = int(xs.min()), int(xs.max())
+    _emit(
+        f"[GRIDCOV] tile_id={tile.tile_id} frame={frame.path.name} "
+        f"weight_bbox_local=(x0={x0}, x1={x1}, y0={y0}, y1={y1})",
+        lvl="DEBUG",
+        callback=progress_callback,
+    )
+```
+
+> Important: do **not** change the returned arrays. Only compute stats and log them.
+
+### 2. In `process_tile(...)`
+
+After building `tile_shape` and before looping over frames:
+
+```python
+_emit(
+    f"[GRIDCOV] tile_id={tile.tile_id} "
+    f"bbox={tile.bbox} "
+    f"tile_shape={tile_shape} "
+    f"frames_in_tile={len(tile.frames)}",
+    lvl="INFO",
+    callback=progress_callback,
+)
+```
+
+After all chunks are flushed and `stacked` is computed (just before saving):
+
+* Compute coverage stats:
+
+```python
+if stacked.ndim == 3:
+    stacked_gray = np.mean(stacked, axis=-1)
+else:
+    stacked_gray = stacked
+
+finite_frac = float(np.isfinite(stacked_gray).mean()) if stacked_gray.size else 0.0
+nan_frac = float(np.isnan(stacked_gray).mean()) if stacked_gray.size else 0.0
+nonzero_frac = float((stacked_gray != 0).mean()) if stacked_gray.size else 0.0
+
+_emit(
+    f"[GRIDCOV] tile_id={tile.tile_id} "
+    f"stacked_shape={stacked.shape} "
+    f"finite_frac={finite_frac:.3f} "
+    f"nan_frac={nan_frac:.3f} "
+    f"nonzero_frac={nonzero_frac:.3f}",
+    lvl="INFO",
+    callback=progress_callback,
+)
+```
+
+Optionally (if cheap), we can also log the min/max to see if we’re clipping everything to 0:
+
+```python
+if stacked_gray.size:
+    vmin = float(np.nanmin(stacked_gray))
+    vmax = float(np.nanmax(stacked_gray))
+else:
+    vmin = vmax = 0.0
+
+_emit(
+    f"[GRIDCOV] tile_id={tile.tile_id} "
+    f"stacked_min={vmin:.3e} "
+    f"stacked_max={vmax:.3e}",
+    lvl="DEBUG",
+    callback=progress_callback,
+)
+```
+
+### 3. (Optional) In `assemble_tiles(...)`
+
+After loading each tile FITS file:
+
+* log coverage per tile (read back from disk) to check that what we wrote is what we read:
+
+```python
+img = loaded_tile_array  # H×W×C or H×W
+
+if img.ndim == 3:
+    gray = np.mean(img, axis=-1)
+else:
+    gray = img
+
+finite_frac = float(np.isfinite(gray).mean()) if gray.size else 0.0
+nonzero_frac = float((gray != 0).mean()) if gray.size else 0.0
+
+_emit(
+    f"[GRIDCOV] assemble: tile_id={tile_id} "
+    f"shape={img.shape} finite_frac={finite_frac:.3f} "
+    f"nonzero_frac={nonzero_frac:.3f}",
+    lvl="INFO",
+    callback=progress_callback,
+)
+```
+
+This lets us verify that there is no bug between `save_fits_image(...)` and `load_fits_image(...)`.
+
+---
+
+## How to use the diagnostics (for the human)
+
+After implementing the above in **both** Grid modes:
+
+1. Run the **last-known-good** Grid mode on the same `stack_plan.csv`.
+2. Run the **current** Grid mode on the same dataset.
+3. Compare only lines starting with `[GRIDCOV]` between the two logs.
+
+Look for:
+
+* Tiles where:
+
+  * `nonzero_frac` is high in the good version but very low in the faulty version.
+* Frames where:
+
+  * `nonzero_weight_frac` is high in good but ~0 in faulty,
+  * or `weight_bbox_local` is much smaller / shifted in faulty.
+* Any systematic pattern:
+
+  * e.g. only some tiles affected,
+  * only some frames (with particular WCS warnings) affected.
+
+Once the divergence is located, we can then implement a **minimal fix** in `grid_mode.py` at the reprojection/weight-map level, while keeping threading/GPU intact.
 

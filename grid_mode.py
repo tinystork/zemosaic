@@ -1014,6 +1014,7 @@ def build_global_grid(
             frame.footprint = fp
             if fp is not None:
                 global_bounds.append(fp)
+                _emit(f"[GRIDDIAG] frame={frame.path.name} footprint_local={frame.footprint}", lvl="DEBUG", callback=progress_callback)
         if global_bounds:
             min_x = int(math.floor(min(b[0] for b in global_bounds)))
             max_x = int(math.ceil(max(b[1] for b in global_bounds)))
@@ -1059,6 +1060,7 @@ def build_global_grid(
         f"[GRID] global canvas shape_hw={global_shape_hw}, offset=({offset_x}, {offset_y})",
         callback=progress_callback,
     )
+    _emit(f"[GRIDDIAG] global_shape_hw={global_shape_hw} offset_xy=({offset_x}, {offset_y}) global_bounds=({min_x}, {max_x}, {min_y}, {max_y})", lvl="INFO", callback=progress_callback)
 
     # Estimate number of tiles to avoid excessive generation
     H, W = global_shape_hw
@@ -1141,6 +1143,9 @@ def build_global_grid(
         f"(rejected={rejected_tiles}, est={n_tiles_estimated})",
         callback=progress_callback,
     )
+    for tile in tiles:
+        shape_hw = (tile.bbox[3] - tile.bbox[2], tile.bbox[1] - tile.bbox[0])
+        _emit(f"[GRIDDIAG] tile_id={tile.tile_id} bbox={tile.bbox} shape_hw={shape_hw}", lvl="INFO", callback=progress_callback)
     return GridDefinition(
         global_wcs=global_wcs,
         global_shape_hw=(int(global_shape_hw[0]), int(global_shape_hw[1])),
@@ -1353,6 +1358,22 @@ def _reproject_frame_to_tile(
                 footprint_combined *= np.nanmax(alpha_weights, axis=-1)
         except Exception:
             pass
+    # [GRIDCOV] Instrumentation for diagnostics
+    finite_frac = float(np.isfinite(reproj_stack).mean()) if reproj_stack.size else 0.0
+    nan_frac = float(np.isnan(reproj_stack).mean()) if reproj_stack.size else 0.0
+    if footprint_combined is not None:
+        nonzero_weight_frac = float((footprint_combined > 0).mean()) if footprint_combined.size else 0.0
+    else:
+        nonzero_weight_frac = -1.0  # sentinel
+    _emit(
+        f"[GRIDCOV] tile_id={tile.tile_id} frame={frame.path.name} "
+        f"patch_shape={reproj_stack.shape} "
+        f"finite_frac={finite_frac:.3f} "
+        f"nan_frac={nan_frac:.3f} "
+        f"nonzero_weight_frac={nonzero_weight_frac:.3f}",
+        lvl="DEBUG",
+        callback=progress_callback,
+    )
     return reproj_stack, footprint_combined
 
 
@@ -1807,6 +1828,14 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
         lvl="DEBUG",
         callback=progress_callback,
     )
+    _emit(
+        f"[GRIDCOV] tile_id={tile.tile_id} "
+        f"bbox={tile.bbox} "
+        f"tile_shape={tile_shape} "
+        f"frames_in_tile={len(tile.frames)}",
+        lvl="INFO",
+        callback=progress_callback,
+    )
     _emit(f"Tile {tile.tile_id}: using {'GPU' if config.use_gpu else 'CPU'} for stacking", callback=progress_callback)
     aligned_patches: list[np.ndarray] = []
     weight_maps: list[np.ndarray] = []
@@ -1927,6 +1956,23 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
             f"{tile.tile_id} stacked patch shape={stacked.shape} weight_shape={running_weight.shape}"
         ),
         lvl="DEBUG",
+        callback=progress_callback,
+    )
+    # [GRIDCOV] Instrumentation for diagnostics
+    if stacked.ndim == 3:
+        stacked_gray = np.mean(stacked, axis=-1)
+    else:
+        stacked_gray = stacked
+    finite_frac = float(np.isfinite(stacked_gray).mean()) if stacked_gray.size else 0.0
+    nan_frac = float(np.isnan(stacked_gray).mean()) if stacked_gray.size else 0.0
+    nonzero_frac = float((stacked_gray != 0).mean()) if stacked_gray.size else 0.0
+    _emit(
+        f"[GRIDCOV] tile_id={tile.tile_id} "
+        f"stacked_shape={stacked.shape} "
+        f"finite_frac={finite_frac:.3f} "
+        f"nan_frac={nan_frac:.3f} "
+        f"nonzero_frac={nonzero_frac:.3f}",
+        lvl="INFO",
         callback=progress_callback,
     )
 
