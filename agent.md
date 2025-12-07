@@ -1,256 +1,353 @@
-### 🔍 Ce qu’on a vu dans le code (sans blabla)
 
-* `process_tile`, `_reproject_frame_to_tile`, géométrie du canevas, bboxes, assignation des frames → **identiques** entre `grid_mode_last_know_geomtric_tiles_ok.py` et le `grid_mode.py` actuel.
-* Le gros changement **fonctionnel** est dans **`_stack_weighted_patches`** :
+### Mission
 
-  * **Ancienne version (OK)** : implémentation maison du stacking/sigma-clipping.
-  * **Nouvelle version (FAULTY)** : `_stack_weighted_patches` essaie de **passer par le core stacker** (`stack_core`) et son écosystème (winsorized sigma-clip, weights, etc.), avec une grosse couche de logique autour.
+Ajouter un bouton **« Analyse »** dans l’interface Qt de ZeMosaic (`zemosaic_gui_qt.py`) **sans toucher au worker / à la pipeline** :
 
-👉 C’est exactement là que tu peux te retrouver avec :
+* Le bouton **n’apparaît que si** un backend d’analyse est détecté dans l’arborescence :
 
-* des zones où les stats voient “rien” → `Mean of empty slice`, `All-NaN slice`, etc.
-* des poids qui tombent à zéro sur la majorité des pixels,
-* donc des tuiles avec juste une bande de signal et 70–80 % de zéros.
-
-**Conclusion bourrine mais rationnelle :**
-On arrête de faire du zèle : on remet **exactement** l’implémentation de `_stack_weighted_patches` de la version OK dans le `grid_mode.py` actuel, et on ne touche à rien d’autre (ni GPU, ni multithread, ni géométrie).
+  * **ZeAnalyser** : dossier `zeanalyser` présent dans le **répertoire parent** de `zemosaic`.
+  * **Beforehand** : dossier `seestar/beforehand` présent sous le même parent.
+* Si **les deux** existent, **ZeAnalyser est prioritaire**.
+* Le clic sur le bouton n’a, pour l’instant, qu’un comportement minimal : log + message utilisateur indiquant quel backend a été détecté (l’intégration “profonde” viendra plus tard).
+* La fonctionnalité est **limitée à la GUI Qt**. Le vieux GUI Tk **ne doit pas être modifié**.
 
 ---
 
-## ✅ Ce qu’on va demander à Codex
+### Contexte
 
-Je te fais un **agent.md / followup.md** spécial “REVERT `_stack_weighted_patches`” que tu peux donner tel quel.
+* Le projet est organisé typiquement comme ceci :
 
-### `agent.md`
+  ```text
+  .../zeseestarstacker/
+      zemosaic/
+          zemosaic_gui_qt.py
+          zemosaic_utils.py
+          ...
+      zeanalyser/
+          ...
+      seestar/
+          beforehand/
+              ...
+  ```
 
-````markdown
-# Mission
+* `zemosaic_utils.get_app_base_dir()` renvoie le répertoire de base de ZeMosaic (le dossier `zemosaic`, même en mode PyInstaller).
 
-Restore the **last-known-good tile stacking behaviour** in Grid mode by reverting
-`_stack_weighted_patches` in the current `grid_mode.py` to the implementation
-from `grid_mode_last_know_geomtric_tiles_ok.py`.
+* Le **parent** de ce répertoire est la racine “toolbox” ZeSeestarStacker dans laquelle se trouvent éventuellement `zeanalyser` et `seestar/beforehand`.
 
-Goal: make grid tiles (`tile_000x.fits`) produced by the current Grid mode
-**numerically consistent** with the “good geometry” version, without touching:
+* Il existe déjà des helpers robustes pour les chemins dans `path_helpers.py` (`safe_path_isdir`).
 
-- tile geometry,
-- global WCS,
-- multithreading,
-- GPU-specific code.
+Objectif : utiliser ces briques pour détecter automatiquement la présence d’un outil d’analyse et conditionner l’affichage du bouton dans `zemosaic_gui_qt.py`.
 
 ---
 
-## Context
+### Fichiers à modifier
 
-The user has two Grid mode implementations:
+1. `zemosaic_gui_qt.py`
+2. (Optionnel, mais recommandé) `zemosaic_localization.py`
+   → pour ajouter la clé de traduction du bouton « Analyse » si nécessaire.
 
-- `grid_mode_last_know_geomtric_tiles_ok.py` → old Grid mode:
-  - tiles are *geometrically* correct,
-  - tile content is complete (no large black zones),
-  - no GPU/multithread integration.
-- `grid_mode.py` (current) → new Grid mode:
-  - same grid geometry (same global canvas, tile bboxes, frame counts per tile),
-  - GPU + multithread integration,
-  - **but** tiles 1–5, 7, 8 are much more “empty”:
-    - only a narrow band of signal,
-    - 60–80 % of pixels are exactly zero (`zero_frac` high),
-  - lots of `RuntimeWarning: Mean of empty slice / All-NaN slice / DoF <= 0`
-    from Astropy/NumPy stats.
+> **Important :** ne pas toucher aux autres modules (worker, grid_mode, align, stack, etc.).
+> Aucune modification de la logique scientifique / de la pipeline.
 
-Code analysis shows:
+---
 
-- `process_tile(...)` is almost identical between both versions, except for
-  extra logging and GPU/CPU messages.
-- `_reproject_frame_to_tile(...)` is identical (geometry and reproject logic).
-- Grid geometry (global canvas, bboxes) and frame→tile assignment are identical.
+### Détails de l’implémentation
 
-The **only significant functional difference** is the implementation of:
+#### 1. Importer `safe_path_isdir`
+
+Dans `zemosaic_gui_qt.py`, il y a déjà un bloc `try/except` en haut du fichier qui importe `get_app_base_dir` :
 
 ```python
-def _stack_weighted_patches(...):
+try:
+    from zemosaic_utils import get_app_base_dir  # type: ignore
+    from zemosaic_time_utils import ETACalculator, format_eta_hms
+except Exception:  # pragma: no cover - fallback when utils missing
+    def get_app_base_dir() -> Path:  # type: ignore
+        return Path(__file__).resolve().parent
+```
+
+À adapter comme suit :
+
+* Ajouter l’import de `safe_path_isdir` dans le `try` :
+
+```python
+try:
+    from zemosaic_utils import get_app_base_dir  # type: ignore
+    from zemosaic_time_utils import ETACalculator, format_eta_hms
+    from path_helpers import safe_path_isdir
+except Exception:  # pragma: no cover - fallback when utils missing
+    def get_app_base_dir() -> Path:  # type: ignore
+        return Path(__file__).resolve().parent
+
+    def safe_path_isdir(pathish: str | os.PathLike | None, *, expanduser: bool = True) -> bool:
+        """Fallback minimaliste pour éviter un crash si path_helpers n'est pas dispo."""
+        if pathish is None:
+            return False
+        try:
+            text = os.path.expanduser(str(pathish)) if expanduser else str(pathish)
+            return os.path.isdir(text)
+        except Exception:
+            return False
+```
+
+* `os` est déjà importé dans ce fichier ; sinon, l’ajouter en haut.
+
+#### 2. Créer un petit helper de détection de backend
+
+Toujours dans `zemosaic_gui_qt.py`, au niveau des helpers privés (par exemple à proximité de `_expand_to_path`), ajouter :
+
+```python
+from typing import Literal, Tuple
+
+AnalysisBackend = Literal["none", "zeanalyser", "beforehand"]
+
+
+def _detect_analysis_backend() -> Tuple[AnalysisBackend, Optional[Path]]:
+    """
+    Inspecte l'arborescence autour de ZeMosaic pour trouver un backend d'analyse.
+
+    Logique :
+      - base_dir = get_app_base_dir()  -> dossier zemosaic
+      - toolbox_root = base_dir.parent
+      - Si toolbox_root / "zeanalyser" est un dossier  -> "zeanalyser"
+      - Sinon si toolbox_root / "seestar" / "beforehand" est un dossier -> "beforehand"
+      - Sinon -> "none"
+    """
+
+    try:
+        base_dir = get_app_base_dir()
+    except Exception:
+        return "none", None
+
+    toolbox_root = base_dir.parent
+
+    zeanalyser_dir = toolbox_root / "zeanalyser"
+    beforehand_dir = toolbox_root / "seestar" / "beforehand"
+
+    # Priorité à ZeAnalyser si les deux existent
+    if safe_path_isdir(zeanalyser_dir):
+        return "zeanalyser", zeanalyser_dir
+
+    if safe_path_isdir(beforehand_dir):
+        return "beforehand", beforehand_dir
+
+    return "none", None
+```
+
+#### 3. Ajouter un état interne au `ZeMosaicQtMainWindow`
+
+Dans `ZeMosaicQtMainWindow.__init__` :
+
+* Initialiser deux nouveaux attributs d’instance :
+
+```python
+self.analysis_backend: AnalysisBackend = "none"
+self.analysis_backend_root: Optional[Path] = None
+```
+
+* Après le chargement de la configuration et avant la construction des widgets (idéalement avant `_initialize_tab_pages()` ou équivalent), appeler le helper :
+
+```python
+self.analysis_backend, self.analysis_backend_root = _detect_analysis_backend()
+```
+
+L’idée : la détection est faite **une seule fois au démarrage** de la fenêtre.
+
+#### 4. Créer le bouton « Analyse » dans la barre de commandes
+
+Dans la méthode `_build_command_row` de `ZeMosaicQtMainWindow`, on a actuellement quelque chose du genre :
+
+```python
+def _build_command_row(self) -> QHBoxLayout:
+    row = QHBoxLayout()
+    row.setContentsMargins(0, 0, 0, 0)
+    row.addStretch(1)
+    self.filter_button = QPushButton(self._tr("qt_button_filter", "Filter…"))
     ...
-````
+    self.start_button = QPushButton(self._tr("qt_button_start", "Start"))
+    self.stop_button = QPushButton(self._tr("qt_button_stop", "Stop"))
+    ...
+    row.addWidget(self.filter_button)
+    row.addWidget(self.start_button)
+    row.addWidget(self.stop_button)
+    return row
+```
 
-* In `grid_mode_last_know_geomtric_tiles_ok.py`:
+À adapter comme suit :
 
-  * pure “legacy” implementation using NumPy, doing local normalization,
-    sigma-clipping and combining patches.
-* In `grid_mode.py`:
-
-  * `_stack_weighted_patches` tries to delegate to a **shared core stacker**
-    (via `stack_core`/`stack_core_gpu` logic) with a larger config surface.
-  * This new path is much more complex and is the most likely cause of:
-
-    * tiles being under-filled,
-    * weights suppressed over large areas,
-    * many NaN/empty-slice warnings from stats.
-
-The user wants a **“bourrin but safe” fix**:
-
-> “Just make the current grid mode stack tiles like the old one again, without
-> breaking the code tree or over-refactoring.”
-
----
-
-## Files to modify
-
-* `grid_mode.py` (current Grid mode, faulty tile content)
-* `grid_mode_last_know_geomtric_tiles_ok.py` (reference for the correct stacking)
-
-Do **NOT** modify:
-
-* `zemosaic_worker.py`
-* the classic stacking pipeline
-* GPU-specific helpers (`_stack_weighted_patches_gpu`, etc.)
-* WCS/global grid construction logic
-* tile geometry or frame assignment
-
----
-
-## Requirements
-
-### 1. Restore legacy `_stack_weighted_patches` in `grid_mode.py`
-
-1. Open `grid_mode_last_know_geomtric_tiles_ok.py` and locate:
+1. Déclarer un `self.analysis_button: QPushButton | None` dans `__init__` (pour typage et clarté) :
 
    ```python
-   def _stack_weighted_patches(
-       patches: list[np.ndarray],
-       weights: list[np.ndarray],
-       config: GridModeConfig,
-       *,
-       reference_median: float | None = None,
-       return_weight_sum: bool = False,
-       return_ref_median: bool = False,
-   ) -> np.ndarray | tuple | None:
-       ...
+   self.analysis_button: QPushButton | None = None
    ```
 
-   This is the **last-known-good** implementation.
+2. Dans `_build_command_row` :
 
-2. Open `grid_mode.py` and locate the *same* function definition.
+   ```python
+   def _build_command_row(self) -> QHBoxLayout:
+       row = QHBoxLayout()
+       row.setContentsMargins(0, 0, 0, 0)
+       row.addStretch(1)
 
-3. **Replace the entire body** of `_stack_weighted_patches` in `grid_mode.py`
-   with the body from `grid_mode_last_know_geomtric_tiles_ok.py`, preserving:
+       self.filter_button = QPushButton(self._tr("qt_button_filter", "Filter…"))
+       self.filter_button.clicked.connect(self._on_filter_clicked)  # type: ignore[attr-defined]
 
-   * the same signature (arguments, type hints, return type),
-   * any docstring that’s useful (you can keep the newer docstring if you like,
-     as long as the behaviour matches the old implementation).
+       self.start_button = QPushButton(self._tr("qt_button_start", "Start"))
+       self.start_button.clicked.connect(self._on_start_clicked)  # type: ignore[attr-defined]
 
-   In other words:
+       self.stop_button = QPushButton(self._tr("qt_button_stop", "Stop"))
+       self.stop_button.clicked.connect(self._on_stop_clicked)  # type: ignore[attr-defined]
 
-   * `_stack_weighted_patches` in `grid_mode.py` must behave **exactly like**
-     the version in `grid_mode_last_know_geomtric_tiles_ok.py`.
-   * **Remove or ignore** the delegation to `stack_core` / shared stacker inside
-     `_stack_weighted_patches`. Grid mode should use its own legacy stacker
-     again for CPU.
+       # Bouton "Analyse" uniquement si un backend est détecté
+       self.analysis_button = None
+       if self.analysis_backend != "none":
+           label = self._tr("qt_button_analyse", "Analyse")
+           self.analysis_button = QPushButton(label)
+           self.analysis_button.clicked.connect(self._on_analysis_clicked)  # type: ignore[attr-defined]
 
-4. Make sure the restored implementation:
+           # Optionnel : tooltip indiquant le backend choisi
+           if self.analysis_backend == "zeanalyser":
+               self.analysis_button.setToolTip("Launch ZeAnalyser (quality analysis)")
+           elif self.analysis_backend == "beforehand":
+               self.analysis_button.setToolTip("Launch Beforehand analysis")
+       # Ajout dans la ligne : Filter, Start, Stop, Analyse
+       row.addWidget(self.filter_button)
+       row.addWidget(self.start_button)
+       row.addWidget(self.stop_button)
+       if self.analysis_button is not None:
+           row.addWidget(self.analysis_button)
 
-   * still returns:
+       return row
+   ```
 
-     * either a single `np.ndarray`,
-     * or a tuple containing `(stacked, weight_sum, ref_median)` when
-       `return_weight_sum` / `return_ref_median` are `True`,
-   * still operates on H×W×C (or H×W) layout, as in the old file,
-   * preserves float32 outputs (as in the old file).
+* **Important :** ne pas changer l’ordre existant des autres boutons, juste rajouter `Analyse` à droite.
 
-### 2. Keep GPU / multithread support intact
+#### 5. Gérer le clic sur le bouton « Analyse »
 
-* Do **NOT** modify `_stack_weighted_patches_gpu` (if present) or any CuPy-based
-  helper.
-* Do **NOT** modify:
+Ajouter une méthode privée dans `ZeMosaicQtMainWindow` :
 
-  * how `process_tile(...)` decides between GPU and CPU paths (it should still
-    choose GPU if `config.use_gpu` is True and the GPU helper is available),
-  * chunking logic or ThreadPool usage.
+```python
+def _on_analysis_clicked(self) -> None:
+    """
+    Handler temporaire pour le bouton 'Analyse'.
 
-The only behavioural change must be:
+    Pour l'instant :
+      - logge le backend détecté
+      - affiche un message informatif à l'utilisateur
+    La vraie intégration (lancement auto de ZeAnalyser / Beforehand avec paramètres)
+    sera faite plus tard.
+    """
+    backend = self.analysis_backend
+    root = self.analysis_backend_root
 
-* When Grid mode stacks tile patches on **CPU**, it uses the **legacy**
-  `_stack_weighted_patches` behaviour from the good version.
+    # Sécurité : si plus de backend détecté, désactiver le bouton
+    if backend == "none" or root is None:
+        if self.analysis_button is not None:
+            self.analysis_button.setEnabled(False)
+        self._append_log("[INFO] [Analyse] No analysis backend available anymore.")
+        QMessageBox.information(
+            self,
+            "Analysis",
+            "No analysis backend is available. Please check your installation.",
+        )
+        return
 
-### 3. Clean up any dead code introduced by the revert
+    # Message selon le backend
+    if backend == "zeanalyser":
+        title = "ZeAnalyser detected"
+        msg = (
+            f"ZeAnalyser installation detected here:\n\n{root}\n\n"
+            "The integration is not wired yet.\n"
+            "You can launch ZeAnalyser manually from this folder for now."
+        )
+    else:
+        title = "Beforehand analysis detected"
+        msg = (
+            f"'beforehand' analysis workflow detected here:\n\n{root}\n\n"
+            "The integration is not wired yet.\n"
+            "You can run your Beforehand tools manually from this folder."
+        )
 
-After restoring the old `_stack_weighted_patches` body:
+    self._append_log(f"[INFO] [Analyse] Backend={backend}, root={root}")
+    QMessageBox.information(self, title, msg)
+```
 
-* If there are imports in `grid_mode.py` that are now **only used by the
-  “new” stack_core path** and no longer referenced, you may:
+* `_append_log` existe déjà dans cette classe (utilisé pour la zone de log en bas).
+* Ce handler ne modifie **aucun** comportement existant du pipeline : il ne lance pour l’instant que des messages.
 
-  * either keep them (harmless but a bit noisy),
-  * or **safely remove** them if you can confirm they are not used anywhere
-    else in `grid_mode.py`.
+> **Phase 2 ultérieure (hors scope de cette mission)** : remplacer le contenu de `_on_analysis_clicked` par un véritable lancement de ZeAnalyser / Beforehand (subprocess, arguments CLI, etc.).
 
-Do **not** remove any GPU-related imports unless you are sure they are unused.
+#### 6. Internationalisation (optionnel mais propre)
 
-### 4. Keep logs and diagnostics
+Dans `zemosaic_localization.py` :
 
-* Keep any existing logging in `process_tile` / `assemble_tiles`:
+* Ajouter une entrée pour la clé `qt_button_analyse` dans les dictionnaires EN/FR :
 
-  * `[GRID][TILE_GEOM] ... nan_frac=... zero_frac=...`,
-  * other `[GRID]` and `DEBUG_SHAPE` logs.
-* You may add a **single** INFO log when `_stack_weighted_patches` is called,
-  indicating that the **legacy stacker** is used for CPU in Grid mode, to make
-  future debugging easier.
+  * EN : `"qt_button_analyse": "Analyse"`
+  * FR : `"qt_button_analyse": "Analyse"`
 
----
-
-## Tests
-
-Use the same dataset that produced:
-
-* `zemosaic_worker_ok.log` (tiles correct, last-known-good grid)
-* `zemosaic_worker_faulty.log` (tiles incomplete, current grid)
-
-### Test 1 – Basic regression of Grid mode with fixed `_stack_weighted_patches`
-
-1. Run `zemosaic_worker.py` using the **current** `grid_mode.py` with the
-   restored `_stack_weighted_patches`.
-2. Ensure Grid mode runs to completion (no new exceptions).
-
-### Test 2 – Compare tiles vs last-known-good
-
-1. For at least tiles 1, 2, 4, 5, 7, 8:
-
-   * Load `tile_000X.fits` produced by:
-
-     * **last-known-good** `grid_mode_last_know_geomtric_tiles_ok.py`,
-     * **current** `grid_mode.py` (after the revert).
-
-2. Check:
-
-   * Shapes and dtypes are identical.
-   * Visual content is now similar:
-
-     * tiles are no longer “mostly black” in the current version,
-     * the narrow bands of signal seen previously are replaced by fuller,
-       more homogeneous coverage similar to the old version.
-
-3. Optionally, compute quick stats (per-tile):
-
-   * min / max / median,
-   * fraction of non-zero pixels,
-   * and compare between old vs new.
-
-   They should be close (allow for very small floating-point differences).
-
-### Test 3 – GPU sanity (if possible)
-
-If you have a config where `config.use_gpu` is True for Grid mode:
-
-1. Run Grid mode with GPU enabled.
-2. Confirm:
-
-   * the pipeline still runs without error,
-   * tiles look visually consistent (no regression introduced by the revert).
+Si le fichier possède déjà une convention spécifique pour les boutons, s’y conformer (ordre, commentaires, etc.).
 
 ---
 
-## Constraints
+### Contraintes
 
-* Only touch `_stack_weighted_patches` in `grid_mode.py` and any negligible
-  dead imports created by this change.
-* Do NOT change geometry, WCS, tile indexing, or multithreading.
-* Do NOT modify the classic pipeline stacker; this mission is **Grid mode only**.
-* The goal is a **minimal, robust revert** to the old, working per-tile stacker.
+* **Ne pas toucher** :
+
+  * `zemosaic_gui.py` (GUI Tk).
+  * `zemosaic_worker.py`, `grid_mode.py`, `zemosaic_stack_core.py`, etc.
+  * La logique de stacking / grid / GPU / multithread déjà en place.
+* Pas de nouvelle dépendance externe.
+* La fonctionnalité doit rester **gracieuse** en cas d’erreur :
+  → en cas d’exception lors de la détection, on retombe sur `backend="none"` et le bouton n’apparaît simplement pas.
+
+---
+
+### Tests attendus
+
+1. **Cas 1 : aucun backend**
+
+   * Arborescence sans `zeanalyser` ni `seestar/beforehand`.
+   * Lancer ZeMosaic Qt.
+   * Vérifier que :
+
+     * Aucun bouton « Analyse » n’est visible dans la barre `Filter / Start / Stop`.
+     * Aucun log lié à l’analyse n’apparaît.
+
+2. **Cas 2 : uniquement Beforehand**
+
+   * Créer un dossier `seestar/beforehand` à côté de `zemosaic`.
+   * Lancer ZeMosaic Qt.
+   * Vérifier que :
+
+     * Un bouton « Analyse » apparaît.
+     * Le tooltip mentionne Beforehand.
+     * Clic sur le bouton → message `Beforehand` + log `[Analyse] Backend=beforehand`.
+
+3. **Cas 3 : ZeAnalyser + Beforehand**
+
+   * Créer `zeanalyser` **et** `seestar/beforehand`.
+   * Lancer ZeMosaic Qt.
+   * Vérifier que :
+
+     * Le bouton « Analyse » est présent.
+     * Le tooltip mentionne ZeAnalyser.
+     * Clic → message ZeAnalyser + log `Backend=zeanalyser`.
+
+4. **Cas 4 : backend supprimé en cours de route (edge case)**
+
+   * Lancer ZeMosaic avec `zeanalyser` présent.
+   * Supprimer (ou renommer) le dossier `zeanalyser` pendant que la GUI tourne.
+   * Cliquer sur « Analyse » :
+
+     * Le code doit gérer le cas proprement : soit message “no backend available anymore”, soit bouton désactivé.
+
+---
+
+### Hors scope
+
+* Intégration directe avec ZeAnalyser (CLI, API, etc.).
+* Passage automatique des chemins d’input/output à ZeAnalyser / Beforehand.
+* Modifications du worker, du pipeline, ou du grid mode.
+* Portage de la fonctionnalité vers le GUI Tk.
 

@@ -641,6 +641,7 @@
     "FILTER_WCS_FAIL_MOVED": "Échec de la résolution WCS ; fichier déplacé vers « unaligned_by_zemosaic ».",
     "FILTER_REFRESH_AFTER_MOVE": "Liste rafraîchie après exclusion des fichiers non alignés.",
     "qt_ansvr_hint": "ANSVR utilise le service local Ansvr (serveur Astrometry.net).\nAssurez-vous qu'il est installé et en cours d'exécution sur votre système.",
+    "qt_button_analyse": "Analyser",
     "qt_button_browse": "Parcourir…",
     "qt_button_clear_log": "Effacer le journal",
     "qt_button_filter": "Filtrer…",
