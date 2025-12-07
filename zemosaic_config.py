@@ -91,6 +91,7 @@ DEFAULT_CONFIG = {
     "input_dir": "",
     "output_dir": "",
     "num_processing_workers": -1,  # -1 pour auto
+    "grid_workers": 0,  # 0 = auto
     "stacking_normalize_method": "linear_fit",
     "stacking_weighting_method": "noise_variance",
     "stacking_rejection_algorithm": "winsorized_sigma_clip",
@@ -107,6 +108,7 @@ DEFAULT_CONFIG = {
     "min_safe_stack": 3,
     "target_stack": 5,
     "use_gpu_phase5": True,
+    "use_gpu_grid": True,
     "gpu_id_phase5": 0,
     "gpu_selector": "",
     "enable_tile_weighting": True,
@@ -443,6 +445,7 @@ def _normalize_gpu_flags(config: dict) -> None:
     config["use_gpu_phase5"] = canonical
     for key in ("stack_use_gpu", "use_gpu_stack"):
         config[key] = _coerce_boolish(config.get(key), canonical)
+    config["use_gpu_grid"] = _coerce_boolish(config.get("use_gpu_grid"), canonical)
 
 
 def _apply_astap_platform_defaults(config: dict) -> bool:

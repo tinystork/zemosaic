@@ -4302,6 +4302,34 @@ def _reproject_and_coadd_wrapper_impl(
     - GPU path: uses ``gpu_reproject_and_coadd`` (CuPy). Falls back to CPU on any error.
     - CPU path: calls astropy-reproject's ``reproject_and_coadd``.
     """
+    def _sanitize_wcs_for_reproject(wcs_obj):
+        try:
+            wcs_copy = copy.deepcopy(wcs_obj)
+        except Exception:
+            wcs_copy = wcs_obj
+        try:
+            for attr in ("sip", "cpdis", "det2im", "distortion_lookup_table"):
+                if hasattr(wcs_copy, attr):
+                    try:
+                        setattr(wcs_copy, attr, None)
+                    except Exception:
+                        pass
+            inner = getattr(wcs_copy, "wcs", None)
+            if inner is not None:
+                for attr in ("sip", "cpdis", "det2im"):
+                    if hasattr(inner, attr):
+                        try:
+                            setattr(inner, attr, None)
+                        except Exception:
+                            pass
+                try:
+                    inner.set_pv([])
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return wcs_copy
+
     def _normalize_tile_weights(weights_obj, n_expected: int) -> list[float] | None:
         if weights_obj is None:
             return None
@@ -4380,14 +4408,38 @@ def _reproject_and_coadd_wrapper_impl(
         cpu_kwargs["input_weights"] = weight_maps
     inputs = list(zip(data_list, wcs_list))
     output_proj = cpu_kwargs.pop("output_projection")
-    with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            category=UserWarning,
-            message="'WCS.all_world2pix' failed to converge",
-            module="astropy.wcs.wcsapi.fitswcs",
-        )
-        return cpu_func(inputs, output_proj, shape_out, **cpu_kwargs)
+    def _run_reproject(inp, out_proj):
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                category=UserWarning,
+                message="'WCS.all_world2pix' failed to converge",
+                module="astropy.wcs.wcsapi.fitswcs",
+            )
+            return cpu_func(inp, out_proj, shape_out, **cpu_kwargs)
+
+    try:
+        return _run_reproject(inputs, output_proj)
+    except Exception as exc:
+        try:
+            from astropy.wcs import wcs as wcs_module  # type: ignore
+
+            conv_cls = getattr(wcs_module, "NoConvergence", Exception)
+        except Exception:
+            conv_cls = Exception
+        needs_sanitize = isinstance(exc, conv_cls) or "all_world2pix" in str(exc)
+        if not needs_sanitize:
+            raise
+        try:
+            sanitized_inputs = [(arr, _sanitize_wcs_for_reproject(w)) for arr, w in inputs]
+            sanitized_output = _sanitize_wcs_for_reproject(output_proj)
+            logger.warning(
+                "Reproject encountered WCS convergence issues; retrying with distortion-stripped WCS.",
+                exc_info=False,
+            )
+            return _run_reproject(sanitized_inputs, sanitized_output)
+        except Exception:
+            raise
 
 
 

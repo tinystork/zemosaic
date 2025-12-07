@@ -1,0 +1,43 @@
+2025-12-06 00:59:44,925 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:7303 - Logging pour ZeMosaicWorker initialisé. Logs écrits dans: zemosaic_worker.log
+2025-12-06 00:59:45,065 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:7365 - Bibliothèque Astropy importée.
+2025-12-06 00:59:45,065 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:7378 - Bibliothèque 'reproject' importée.
+2025-12-06 00:59:45,066 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:7408 - Module 'zemosaic_utils' importé.
+2025-12-06 00:59:45,066 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:7410 - Module 'zemosaic_astrometry' importé.
+2025-12-06 00:59:45,066 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:7412 - Module 'zemosaic_align_stack' importé.
+2025-12-06 00:59:45,079 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:7303 - Logging pour ZeMosaicWorker initialisé. Logs écrits dans: zemosaic_worker.log
+2025-12-06 00:59:45,080 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:7365 - Bibliothèque Astropy importée.
+2025-12-06 00:59:45,080 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:7378 - Bibliothèque 'reproject' importée.
+2025-12-06 00:59:45,080 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:7408 - Module 'zemosaic_utils' importé.
+2025-12-06 00:59:45,080 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:7410 - Module 'zemosaic_astrometry' importé.
+2025-12-06 00:59:45,080 - ZeMosaicWorker - INFO - zemosaic_worker.<module>:7412 - Module 'zemosaic_align_stack' importé.
+2025-12-06 00:59:45,253 - ZeMosaicWorker - INFO - zemosaic_worker.run_hierarchical_mosaic:13324 - [GRID] Invoking grid_mode.run_grid_mode(...) with grid_rgb_equalize=True (source=config), stack_norm=linear_fit, stack_weight=noise_variance, reject_algo=winsorized_sigma_clip, combine=mean
+2025-12-06 00:59:45,253 - ZeMosaicWorker.grid_mode - INFO - grid_mode._emit:148 - [GRID] Grid/Survey mode activated (stack_plan.csv detected)
+2025-12-06 00:59:45,256 - ZeMosaicWorker.grid_mode - INFO - grid_mode._emit:148 - [GRID] GPU requested = True
+2025-12-06 00:59:45,256 - ZeMosaicWorker.grid_mode - INFO - grid_mode._emit:148 - [GRID] Grid mode RGB equalization: enabled=True (source=config)
+2025-12-06 00:59:45,256 - ZeMosaicWorker.grid_mode - INFO - grid_mode._emit:148 - [GRID] Stacking config: norm=linear_fit, weight=noise_variance, reject=winsorized_sigma_clip, winsor=(0.05, 0.05), combine=mean, radial=False (feather=0.8, power=2.0), rgb_equalize=True
+2025-12-06 00:59:45,281 - ZeMosaicWorker.grid_mode - INFO - grid_mode._emit:148 - [GRID] Loaded 53 frame(s) from stack_plan.csv
+2025-12-06 00:59:45,955 - ZeMosaicWorker.grid_mode - INFO - grid_mode._emit:148 - [GRID] [GRID] Optimal global WCS found: crpix=[1.36573436 1.54260782], shape_hw=(2, 2)
+2025-12-06 00:59:45,955 - ZeMosaicWorker.grid_mode - WARNING - grid_mode._emit:148 - [GRID] [GRID] Optimal global WCS looks degenerate (shape_hw=(2, 2)), falling back to safer WCS
+2025-12-06 00:59:46,042 - ZeMosaicWorker.grid_mode - INFO - grid_mode._emit:148 - [GRID] [GRID] fallback WCS bounds from 53 frame(s): shape_hw=(3272, 2406)
+2025-12-06 00:59:46,042 - ZeMosaicWorker.grid_mode - INFO - grid_mode._emit:148 - [GRID] [GRID] Fallback global WCS: shape_hw=(3272, 2406) (bounds from 53 frame(s))
+2025-12-06 00:59:46,043 - ZeMosaicWorker.grid_mode - INFO - grid_mode._emit:148 - [GRID] [GRID] global_bounds count=53, min_x=-664, max_x=1741, min_y=-669, max_y=2602
+2025-12-06 00:59:46,043 - ZeMosaicWorker.grid_mode - INFO - grid_mode._emit:148 - [GRID] [GRID] global canvas shape_hw=(3272, 2406), offset=(-664, -669)
+2025-12-06 00:59:46,043 - ZeMosaicWorker.grid_mode - INFO - grid_mode._emit:148 - [GRID] [GRID] DEBUG: estimated tiles: 6 (3 rows x 2 cols) for canvas (3272, 2406)
+2025-12-06 00:59:46,043 - ZeMosaicWorker.grid_mode - INFO - grid_mode._emit:148 - [GRID] [GRID] DEBUG: entering tile grid construction: tile_size_px=1920, step_px=1152, n_frames=53
+2025-12-06 00:59:46,055 - ZeMosaicWorker.grid_mode - INFO - grid_mode._emit:148 - [GRID] [GRID] DEBUG: built 50 tile(s) so far
+2025-12-06 00:59:46,069 - ZeMosaicWorker.grid_mode - INFO - grid_mode._emit:148 - [GRID] [GRID] DEBUG: built 100 tile(s) so far
+2025-12-06 00:59:46,082 - ZeMosaicWorker.grid_mode - INFO - grid_mode._emit:148 - [GRID] [GRID] DEBUG: built 150 tile(s) so far
+2025-12-06 00:59:46,095 - ZeMosaicWorker.grid_mode - INFO - grid_mode._emit:148 - [GRID] [GRID] DEBUG: built 200 tile(s) so far
+2025-12-06 00:59:46,108 - ZeMosaicWorker.grid_mode - INFO - grid_mode._emit:148 - [GRID] [GRID] DEBUG: built 250 tile(s) so far
+2025-12-06 00:59:46,125 - ZeMosaicWorker.grid_mode - INFO - grid_mode._emit:148 - [GRID] [GRID] DEBUG: built 300 tile(s) so far
+2025-12-06 00:59:46,140 - ZeMosaicWorker.grid_mode - INFO - grid_mode._emit:148 - [GRID] [GRID] DEBUG: built 350 tile(s) so far
+2025-12-06 00:59:46,155 - ZeMosaicWorker.grid_mode - INFO - grid_mode._emit:148 - [GRID] [GRID] DEBUG: built 400 tile(s) so far
+
+50000 identiques je les ai supprimées
+
+2025-12-06 01:02:38,871 - ZeMosaicWorker.grid_mode - INFO - grid_mode._emit:148 - [GRID] [GRID] DEBUG: built 564900 tile(s) so far
+2025-12-06 01:02:38,886 - ZeMosaicWorker.grid_mode - INFO - grid_mode._emit:148 - [GRID] [GRID] DEBUG: built 564950 tile(s) so far
+2025-12-06 01:02:38,901 - ZeMosaicWorker.grid_mode - INFO - grid_mode._emit:148 - [GRID] [GRID] DEBUG: built 565000 tile(s) so far
+2025-12-06 01:02:38,914 - ZeMosaicWorker.grid_mode - INFO - grid_mode._emit:148 - [GRID] [GRID] DEBUG: built 565050 tile(s) so far
+2025-12-06 01:02:38,926 - ZeMosaicWorker.grid_mode - INFO - grid_mode._emit:148 - [GRID] [GRID] DEBUG: built 565100 tile(s) so far
+ici j'arr^te le traitement

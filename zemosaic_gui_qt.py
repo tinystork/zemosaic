@@ -73,9 +73,20 @@ from typing import Any, Dict, Iterable, List, MutableMapping, Optional, Sequence
 try:  # pragma: no cover - optional dependency guard
     from zemosaic_utils import get_app_base_dir  # type: ignore
     from zemosaic_time_utils import ETACalculator, format_eta_hms
+    from core.path_helpers import safe_path_isdir
 except Exception:  # pragma: no cover - fallback when utils missing
     def get_app_base_dir() -> Path:  # type: ignore
         return Path(__file__).resolve().parent
+
+    def safe_path_isdir(pathish: str | os.PathLike | None, *, expanduser: bool = True) -> bool:
+        """Fallback minimaliste pour éviter un crash si path_helpers n'est pas dispo."""
+        if pathish is None:
+            return False
+        try:
+            text = os.path.expanduser(str(pathish)) if expanduser else str(pathish)
+            return os.path.isdir(text)
+        except Exception:
+            return False
 
 CPU_HELPER_OVERRIDE_TTL = 5.0
 
@@ -151,6 +162,43 @@ def _expand_to_path(value: Any) -> Optional[Path]:
         return Path(text_value).expanduser()
     except Exception:
         return None
+
+
+from typing import Literal, Tuple
+
+AnalysisBackend = Literal["none", "zeanalyser", "beforehand"]
+
+
+def _detect_analysis_backend() -> Tuple[AnalysisBackend, Optional[Path]]:
+    """
+    Inspecte l'arborescence autour de ZeMosaic pour trouver un backend d'analyse.
+
+    Logique :
+      - base_dir = get_app_base_dir()  -> dossier zemosaic
+      - toolbox_root = base_dir.parent
+      - Si toolbox_root / "zeanalyser" est un dossier  -> "zeanalyser"
+      - Sinon si toolbox_root / "seestar" / "beforehand" est un dossier -> "beforehand"
+      - Sinon -> "none"
+    """
+
+    try:
+        base_dir = get_app_base_dir()
+    except Exception:
+        return "none", None
+
+    toolbox_root = base_dir.parent
+
+    zeanalyser_dir = toolbox_root / "zeanalyser"
+    beforehand_dir = toolbox_root / "seestar" / "beforehand"
+
+    # Priorité à ZeAnalyser si les deux existent
+    if safe_path_isdir(zeanalyser_dir):
+        return "zeanalyser", zeanalyser_dir
+
+    if safe_path_isdir(beforehand_dir):
+        return "beforehand", beforehand_dir
+
+    return "none", None
 
 if IS_WINDOWS:
     try:  # pragma: no cover - optional dependency for GPU detection
@@ -793,6 +841,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._config_load_notes: List[Tuple[str, str, str, Dict[str, Any]]] = []
         self._loaded_config_snapshot: Dict[str, Any] = {}
         self._persisted_config_keys: set[str] = set()
+        self.analysis_backend: AnalysisBackend = "none"
+        self.analysis_backend_root: Optional[Path] = None
+        self.analysis_button: QPushButton | None = None
         self.language_combo: QComboBox | None = None
         self.backend_combo: QComboBox | None = None
         self._default_config_values: Dict[str, Any] = self._baseline_default_config()
@@ -801,9 +852,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
         # Force the flag off regardless of persisted config so the worker never
         # receives an enabled state from this GUI.
         self._disable_phase45_config()
+        self.analysis_backend, self.analysis_backend_root = _detect_analysis_backend()
         self.localizer = self._create_localizer(self.config.get("language", "en"))
         self.setWindowTitle(
-            self._tr("qt_window_title_preview", "ZeMosaic V4.2.8 – Superacervandi ")
+            self._tr("qt_window_title_preview", "ZeMosaic V4.2.9 grid_mode – Superacervandi ")
         )
         self._gpu_devices: List[Tuple[str, int | None]] = self._detect_gpus()
         if self._gpu_devices:
@@ -1104,9 +1156,25 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self.stop_button = QPushButton(self._tr("qt_button_stop", "Stop"))
         self.start_button.clicked.connect(self._on_start_clicked)  # type: ignore[attr-defined]
         self.stop_button.clicked.connect(self._on_stop_clicked)  # type: ignore[attr-defined]
+
+        # Bouton "Analyse" uniquement si un backend est détecté
+        self.analysis_button = None
+        if self.analysis_backend != "none":
+            label = self._tr("qt_button_analyse", "Analyse")
+            self.analysis_button = QPushButton(label)
+            self.analysis_button.clicked.connect(self._on_analysis_clicked)  # type: ignore[attr-defined]
+
+            # Optionnel : tooltip indiquant le backend choisi
+            if self.analysis_backend == "zeanalyser":
+                self.analysis_button.setToolTip("Launch ZeAnalyser (quality analysis)")
+            elif self.analysis_backend == "beforehand":
+                self.analysis_button.setToolTip("Launch Beforehand analysis")
+
         row.addWidget(self.filter_button)
         row.addWidget(self.start_button)
         row.addWidget(self.stop_button)
+        if self.analysis_button is not None:
+            row.addWidget(self.analysis_button)
         return row
 
     def _initialize_tab_pages(self) -> None:
@@ -3907,7 +3975,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _refresh_translated_ui(self) -> None:
         self.setWindowTitle(
-            self._tr("qt_window_title_preview", "ZeMosaic V4.2.8 – Superacervandi ")
+            self._tr("qt_window_title_preview", "ZeMosaic V4.2.9 grid_mode – Superacervandi ")
         )
         previous_log = ""
         if hasattr(self, "log_output"):
@@ -5380,6 +5448,91 @@ class ZeMosaicQtMainWindow(QMainWindow):
         if result is True:
             self._collect_config_from_widgets()
             self._start_processing(skip_filter_prompt=True, predecided_skip_filter_ui=True)
+
+    def _launch_analysis_backend(self) -> None:
+        """
+        Launch the selected analysis backend in a separate process (non-blocking).
+
+        - If backend == "zeanalyser": run analyse_gui_qt.py using the current Python
+          interpreter (sys.executable).
+        - If backend == "beforehand": for now, only show an informational message.
+        - If no backend or script is missing: show a warning and return gracefully.
+        """
+        backend = getattr(self, "analysis_backend", "none")
+        root = getattr(self, "analysis_backend_root", None)
+
+        if backend == "none" or root is None:
+            QMessageBox.information(
+                self,
+                "Analysis",
+                "No analysis backend is available near this ZeMosaic installation.",
+            )
+            return
+
+        if backend == "zeanalyser":
+            script = root / "analyse_gui_qt.py"
+            backend_label = "ZeAnalyser"
+        elif backend == "beforehand":
+            # For now, we do not auto-launch Beforehand, just inform the user.
+            QMessageBox.information(
+                self,
+                "Beforehand detected",
+                f"A 'beforehand' analysis workflow was detected here:\n\n{root}\n\n"
+                "Automatic launch is not wired yet. "
+                "You can still run your Beforehand tools manually from this folder.",
+            )
+            return
+        else:
+            QMessageBox.warning(
+                self,
+                "Analysis",
+                f"Unknown analysis backend: {backend}",
+            )
+            return
+
+        # At this point we are in the ZeAnalyser case
+        if not script.is_file():
+            QMessageBox.warning(
+                self,
+                "Analysis",
+                f"Cannot find the analysis script:\n{script}",
+            )
+            return
+
+        # Use the same Python executable as the running ZeMosaic process
+        import sys
+        import subprocess
+
+        cmd = [sys.executable, str(script)]
+
+        # Optional: log the command for debugging purposes
+        try:
+            self._append_log(f"[INFO] [Analysis] Launching {backend_label}: {' '.join(cmd)}")
+        except Exception:
+            # Never fail just because logging failed
+            pass
+
+        try:
+            # Non-blocking launch; ZeMosaic stays responsive.
+            subprocess.Popen(
+                cmd,
+                cwd=str(root),
+                close_fds=False,  # portable, safe default
+                shell=False,      # avoid shell injection issues
+                creationflags=0,  # let OS decide; we keep it simple/portable
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            QMessageBox.critical(
+                self,
+                "Analysis launch failed",
+                f"Failed to launch {backend_label}.\n\n"
+                f"Script: {script}\n"
+                f"Error: {exc}",
+            )
+
+    def _on_analysis_clicked(self) -> None:
+        """Slot called when the 'Analyse' button is clicked."""
+        self._launch_analysis_backend()
 
     def _launch_filter_dialog(self) -> bool | None:
         input_dir_raw = self.config.get("input_dir", "") or ""
