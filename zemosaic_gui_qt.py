@@ -803,7 +803,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._disable_phase45_config()
         self.localizer = self._create_localizer(self.config.get("language", "en"))
         self.setWindowTitle(
-            self._tr("qt_window_title_preview", "ZeMosaic V4.2.8 – Superacervandi ")
+            self._tr("qt_window_title_preview", "ZeMosaic V4.2.9 grid_mode – Superacervandi ")
         )
         self._gpu_devices: List[Tuple[str, int | None]] = self._detect_gpus()
         if self._gpu_devices:
@@ -3907,7 +3907,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _refresh_translated_ui(self) -> None:
         self.setWindowTitle(
-            self._tr("qt_window_title_preview", "ZeMosaic V4.2.8 – Superacervandi ")
+            self._tr("qt_window_title_preview", "ZeMosaic V4.2.9 grid_mode – Superacervandi ")
         )
         previous_log = ""
         if hasattr(self, "log_output"):

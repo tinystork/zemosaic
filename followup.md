@@ -1,62 +1,40 @@
-
-### ✅ followup.md
+### `followup.md`
 
 ```markdown
-# Grid coverage diagnostics – follow-up checklist
+# Grid mode – legacy stacker revert – Follow-up
 
-## Instrumentation
+## Checklist
 
-- [x] In **both** `grid_mode_last_know_geomtric_tiles_ok.py` and `grid_mode.py`:
-  - [x] Locate `_reproject_frame_to_tile(...)` (or equivalent reprojection helper).
-  - [x] After computing `patch` and `weight_map`, log:
-        - [x] `patch_shape`
-        - [x] `finite_frac` (`isfinite(patch).mean()`)
-        - [x] `nan_frac`
-        - [x] `nonzero_weight_frac` (`(weight_map > 0).mean()` or `-1` if no map)
-        - [ ] Optional: local `weight_bbox` where weight_map > 0
-        - [x] Use prefix `[GRIDCOV]` and `frame={frame.path.name}`, `tile_id={tile.tile_id}`.
-  - [x] In `process_tile(...)`, before the frame loop, log per tile:
-        - [x] `tile_id`, `bbox`, `tile_shape`, `frames_in_tile`
-        - [x] Prefix `[GRIDCOV]`, level INFO.
-  - [x] In `process_tile(...)`, after computing `stacked` (just before saving), log:
-        - [x] `stacked_shape`
-        - [x] `finite_frac` on a gray version
-        - [x] `nan_frac`
-        - [x] `nonzero_frac` (`(stacked_gray != 0).mean()`)
-        - [ ] Optional: `stacked_min`, `stacked_max`
-        - [x] Prefix `[GRIDCOV]`, level INFO/DEBUG.
-  - [ ] (Optional) In `assemble_tiles(...)`, after reading each tile FITS:
-        - [ ] Log `shape`, `finite_frac`, `nonzero_frac` with prefix `[GRIDCOV]`.
+- [x] Located `_stack_weighted_patches` in:
+      - [x] `grid_mode_last_know_geomtric_tiles_ok.py` (reference)
+      - [x] `grid_mode.py` (current)
+- [x] Replaced the entire body of `_stack_weighted_patches` in `grid_mode.py`
+      with the implementation from `grid_mode_last_know_geomtric_tiles_ok.py`.
+- [x] Ensured the function signature (parameters / return type) matches exactly.
+- [x] Verified that CPU Grid mode now uses the legacy stacker logic:
+      - [x] No delegation to `stack_core` / shared core stacker inside
+            `_stack_weighted_patches`.
+- [x] Kept GPU helpers (`_stack_weighted_patches_gpu`, etc.) unchanged.
+- [x] Left multithread / chunking logic in `process_tile(...)` untouched.
+- [ ] Optionally removed any unused imports that were only needed for the new
+      stack_core-based `_stack_weighted_patches` implementation.
 
-## Runs
+## Tests
 
-- [ ] Run **last-good** Grid mode (OK geometry) on the reference dataset with verbose logging:
-      - [ ] Save worker log as e.g. `zemosaic_worker_grid_ok_coverage.log`.
-- [ ] Run **current** Grid mode (faulty) on the same dataset:
-      - [ ] Save worker log as e.g. `zemosaic_worker_grid_faulty_coverage.log`.
+- [ ] Ran Grid mode on the reference dataset with the fixed `grid_mode.py`.
+- [ ] Confirmed the pipeline completes without errors.
+- [ ] Compared `tile_000X.fits` (1, 2, 4, 5, 7, 8) between:
+      - [ ] last-known-good grid,
+      - [ ] current grid with legacy `_stack_weighted_patches`.
+- [ ] Observed that tiles in the current grid are no longer “mostly empty”:
+      - [ ] fraction of non-zero pixels per tile is close to the old version.
+- [ ] (Optional) Verified GPU Grid mode still runs if enabled.
 
-## Comparison
+## Notes / Observations
 
-- [ ] Using a diff tool (WinMerge / Meld / VSCode), compare only `[GRIDCOV]` lines.
-- [ ] For each `tile_id`, compare:
-      - [ ] `tile_shape`, `frames_in_tile` (should match).
-      - [ ] `stacked nonzero_frac` (expected to be much lower in faulty).
-- [ ] For each (tile, frame) pair, compare:
-      - [ ] `patch_shape` (should usually match).
-      - [ ] `finite_frac` and `nonzero_weight_frac`.
-      - [ ] `weight_bbox_local` (look for shrinkage/offset in faulty version).
-- [ ] Note any patterns:
-      - [ ] Specific tiles more affected?
-      - [ ] Specific frames (e.g. those with WCS warnings) more affected?
-      - [ ] Systematic offset of `weight_bbox` in faulty version?
-
-## Fix preparation
-
-- [ ] Summarise where coverage diverges:
-      - [ ] e.g. “Reprojected weight map is much smaller / shifted in faulty version for tiles X/Y”.
-- [ ] Propose a **minimal** geometric fix in `grid_mode.py` at the reprojection/weight-map level, keeping:
-      - [ ] multithreading behaviour unchanged,
-      - [ ] GPU flags untouched,
-      - [ ] stacking formulas unchanged.
-- [ ] After fixing, remove or downgrade `[GRIDCOV]` logs to DEBUG for normal usage.
+- [ ] Document here any remaining differences between old vs new tiles
+      (acceptable small floating-point differences vs larger discrepancies).
+- [ ] If further issues remain after this revert, they should now be isolated
+      to other parts of Grid mode (e.g., photometric equalization or final
+      assembly), which can be addressed in a separate mission.
 ````

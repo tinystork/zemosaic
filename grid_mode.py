@@ -1630,73 +1630,51 @@ def _stack_weighted_patches(
         reference_median,
         method=config.stack_norm_method,
     )
-    if stack_core:
-        stack_config = {
-            'normalize_method': 'none',
-            'rejection_algorithm': config.stack_reject_algo,
-            'final_combine_method': config.stack_final_combine,
-            'sigma_clip_low': config.stack_kappa_low,
-            'sigma_clip_high': config.stack_kappa_high,
-        }
-        stacked, rejected_pct, weight_sum = stack_core(
-            images=normalized,
-            weights=weights,
-            stack_config=stack_config,
-            backend='cpu',
+    data_stack = np.stack(normalized, axis=0).astype(np.float32, copy=False)
+    weight_stack = np.stack(weights, axis=0).astype(np.float32, copy=False)
+    data_stack = np.where(weight_stack > 0, data_stack, np.nan)
+
+    rejection = config.stack_reject_algo.lower().strip()
+    data_for_combine = data_stack
+    if rejection in {"kappa_sigma", "kappa"} and _reject_outliers_kappa_sigma:
+        data_for_combine, _ = _reject_outliers_kappa_sigma(
+            data_stack,
+            config.stack_kappa_low,
+            config.stack_kappa_high,
+            progress_callback=None,
         )
-        outputs = [stacked]
-        if return_weight_sum:
-            outputs.append(weight_sum)
-        if return_ref_median:
-            outputs.append(ref_median_used)
-        return tuple(outputs) if len(outputs) > 1 else outputs[0]
+    elif rejection in {"winsorized_sigma_clip", "winsor"} and _reject_outliers_winsorized_sigma_clip:
+        data_for_combine, _ = _reject_outliers_winsorized_sigma_clip(
+            data_stack,
+            config.winsor_limits,
+            config.stack_kappa_low,
+            config.stack_kappa_high,
+            progress_callback=None,
+            max_workers=1,
+        )
+
+    data_masked = np.nan_to_num(data_for_combine, nan=0.0)
+    finite_mask = np.isfinite(data_for_combine)
+    weight_effective = np.where(finite_mask, weight_stack, 0.0)
+    weight_sum = np.sum(weight_effective, axis=0)
+    valid_positions = np.any(finite_mask, axis=0)
+    if not np.any(valid_positions):
+        empty = np.zeros(data_for_combine.shape[1:], dtype=np.float32)
+        outputs = [empty]
     else:
-        # Fallback to old logic if stack_core not available
-        data_stack = np.stack(normalized, axis=0).astype(np.float32, copy=False)
-        weight_stack = np.stack(weights, axis=0).astype(np.float32, copy=False)
-        data_stack = np.where(weight_stack > 0, data_stack, np.nan)
-
-        rejection = config.stack_reject_algo.lower().strip()
-        data_for_combine = data_stack
-        if rejection in {"kappa_sigma", "kappa"} and _reject_outliers_kappa_sigma:
-            data_for_combine, _ = _reject_outliers_kappa_sigma(
-                data_stack,
-                config.stack_kappa_low,
-                config.stack_kappa_high,
-                progress_callback=None,
-            )
-        elif rejection in {"winsorized_sigma_clip", "winsor"} and _reject_outliers_winsorized_sigma_clip:
-            data_for_combine, _ = _reject_outliers_winsorized_sigma_clip(
-                data_stack,
-                config.winsor_limits,
-                config.stack_kappa_low,
-                config.stack_kappa_high,
-                progress_callback=None,
-                max_workers=1,
-            )
-
-        data_masked = np.nan_to_num(data_for_combine, nan=0.0)
-        finite_mask = np.isfinite(data_for_combine)
-        weight_effective = np.where(finite_mask, weight_stack, 0.0)
-        weight_sum = np.sum(weight_effective, axis=0)
-        valid_positions = np.any(finite_mask, axis=0)
-        if not np.any(valid_positions):
-            empty = np.zeros(data_for_combine.shape[1:], dtype=np.float32)
-            outputs = [empty]
+        if config.stack_final_combine.lower().strip() == "median":
+            median_input = np.where(valid_positions[np.newaxis, ...], data_for_combine, 0.0)
+            result = np.nanmedian(median_input, axis=0)
         else:
-            if config.stack_final_combine.lower().strip() == "median":
-                median_input = np.where(valid_positions[np.newaxis, ...], data_for_combine, 0.0)
-                result = np.nanmedian(median_input, axis=0)
-            else:
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    result = np.sum(data_masked * weight_effective, axis=0) / np.clip(weight_sum, 1e-6, None)
-            outputs = [result.astype(np.float32, copy=False)]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                result = np.sum(data_masked * weight_effective, axis=0) / np.clip(weight_sum, 1e-6, None)
+        outputs = [result.astype(np.float32, copy=False)]
 
-        if return_weight_sum:
-            outputs.append(weight_sum.astype(np.float32, copy=False))
-        if return_ref_median:
-            outputs.append(ref_median_used)
-        return outputs[0] if len(outputs) == 1 else tuple(outputs)
+    if return_weight_sum:
+        outputs.append(weight_sum.astype(np.float32, copy=False))
+    if return_ref_median:
+        outputs.append(ref_median_used)
+    return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
 
 def _stack_weighted_patches_gpu(
