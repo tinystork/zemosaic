@@ -30,9 +30,9 @@
 
 ### 3. Stacking par tuile
 
-- [ ] Vérifier que toutes les tuiles sont empilées via `stack_core` (CPU/GPU) avec les bons paramètres.
-- [ ] Confirmer que pour les images RGB, `equalize_rgb_medians_inplace` est appelé **avant** tout calcul de stats de fond/scaling.
-- [ ] S’assurer que `compute_valid_mask` est utilisé pour produire une `tile_mask` cohérente.
+- [x] Vérifier que toutes les tuiles sont empilées via `stack_core` (CPU/GPU) avec les bons paramètres.
+- [x] Confirmer que pour les images RGB, `equalize_rgb_medians_inplace` est appelé **avant** tout calcul de stats de fond/scaling.
+- [x] S’assurer que `compute_valid_mask` est utilisé pour produire une `tile_mask` cohérente.
 
 **Test :**
 
@@ -43,13 +43,13 @@
 
 ### 4. Normalisation photométrique inter-tile
 
-- [ ] Identifier la tuile de référence utilisée pour la photométrie.
-- [ ] Vérifier que :
+- [x] Identifier la tuile de référence utilisée pour la photométrie.
+- [x] Vérifier que :
 
   - un `common_mask` correctement construit (intersection de masques valides) est utilisé,
   - si l’overlap est insuffisant → log WARN et pas de scaling.
 
-- [ ] Confirmer l’appel à :
+- [x] Confirmer l’appel à :
 
   ```python
   gains, offsets = compute_tile_photometric_scaling(ref_patch, tgt_patch, mask=common_mask)
@@ -57,7 +57,7 @@
   info.mask = compute_valid_mask(info.data) & info.mask
 ````
 
-* [ ] Vérifier que les logs `[GRID] Photometry` montrent des gains/offsets **finis** et raisonnables.
+* [x] Vérifier que les logs `[GRID] Photometry` montrent des gains/offsets **finis** et raisonnables.
 
 **Validation pratique :**
 
@@ -68,16 +68,16 @@
 
 ### 5. Assemblage des tuiles en mosaïque
 
-* [ ] Ouvrir `assemble_tiles(...)` dans `grid_mode.py`.
+* [x] Ouvrir `assemble_tiles(...)` dans `grid_mode.py`.
 
-* [ ] Vérifier que :
+* [x] Vérifier que :
 
   * la mosaïque globale est allouée avec `global_shape_hw`,
   * pour chaque tuile, on indexe `mosaic_data[y0:y1, x0:x1]` avec la `bbox`,
   * on cumule les contributions pondérées (poids = masque ou coverage),
   * à la fin, on divise par les poids là où ils sont > 0.
 
-* [ ] S’assurer qu’aucune reproject globale supplémentaire (type `reproject_interp` vers une nouvelle WCS) n’est faite à ce stade.
+* [x] S’assurer qu’aucune reproject globale supplémentaire (type `reproject_interp` vers une nouvelle WCS) n’est faite à ce stade.
 
 **Test visuel :**
 
