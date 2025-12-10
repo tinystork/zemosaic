@@ -186,5 +186,6 @@ En cas de doute, revenir aux objectifs simples :
 - [x] Égalisation RGB appliquée au moment post-stack par tuile (skip si mono, log dédié).
 - [x] Masque de recouvrement coverage/WCS implémenté et utilisé dans `compute_tile_photometric_scaling` + logs dédiés.
 - [x] Revue des optimisations simples (dtypes, reproject redondants, SciPy dans les boucles) à compléter si nécessaire.
+- [x] Métriques loggées : médianes post-scaling par tuile et écart-type inter-tuiles.
 
 # Note pour moi même:
