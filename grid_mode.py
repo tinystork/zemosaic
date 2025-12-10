@@ -1115,18 +1115,27 @@ def build_global_grid(
                 rejected_tiles += 1
                 x0 += step_px
                 continue
+            if bbox_xmin < 0 or bbox_ymin < 0 or bbox_xmax > max_x_local or bbox_ymax > max_y_local:
+                _emit(
+                    f"[GRID] ERROR: tile bbox out of global canvas bounds: "
+                    f"bbox=({bbox_xmin},{bbox_xmax},{bbox_ymin},{bbox_ymax}) canvas={global_shape_hw}",
+                    lvl="ERROR",
+                    callback=progress_callback,
+                )
+                rejected_tiles += 1
+                x0 += step_px
+                continue
             tile_wcs = _clone_tile_wcs(
                 global_wcs, (offset_x + bbox_xmin, offset_y + bbox_ymin), shape_hw
             )
             tile = GridTile(tile_id=tile_id, bbox=(bbox_xmin, bbox_xmax, bbox_ymin, bbox_ymax), wcs=tile_wcs)
             tiles.append(tile)
-            if tile_id <= 3:
-                _emit(
-                    f"[GRID][DEBUG] Tile bbox local id={tile_id}: "
-                    f"x=({bbox_xmin},{bbox_xmax}) y=({bbox_ymin},{bbox_ymax}) "
-                    f"shape_hw={shape_hw}",
-                    callback=progress_callback,
-                )
+            _emit(
+                f"[GRID][DEBUG] Tile id={tile_id} bbox=({bbox_xmin},{bbox_xmax},{bbox_ymin},{bbox_ymax}) "
+                f"shape_hw={shape_hw}",
+                lvl="DEBUG",
+                callback=progress_callback,
+            )
             if len(tiles) > MAX_TILES:
                 _emit(
                     f"[GRID] ERROR: built {len(tiles)} tiles > MAX_TILES={MAX_TILES}, "
