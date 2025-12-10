@@ -1321,8 +1321,10 @@ def _reproject_frame_to_tile(
         return None, None
 
     channels = data.shape[-1] if data.ndim == 3 else 1
-    reproj_channels = []
-    footprints = []
+    reproj_stack = np.empty(
+        (tile_shape_hw[0], tile_shape_hw[1], channels), dtype=np.float32
+    )
+    combined_footprint: np.ndarray | None = None
     degraded = False
     for c in range(channels):
         arr_2d = data[..., c] if data.ndim == 3 else data
@@ -1340,13 +1342,16 @@ def _reproject_frame_to_tile(
                 degraded = True
         except Exception:
             return None, None
-        reproj_channels.append(reproj_arr.astype(np.float32, copy=False))
-        footprints.append(footprint.astype(np.float32, copy=False))
+        reproj_stack[..., c] = np.asarray(reproj_arr, dtype=np.float32, copy=False)
+        footprint_f32 = np.asarray(footprint, dtype=np.float32, copy=False)
+        if combined_footprint is None:
+            combined_footprint = np.array(footprint_f32, copy=True)
+        else:
+            np.maximum(combined_footprint, footprint_f32, out=combined_footprint)
 
     if degraded:
         _log_wcs_degraded(frame, progress_callback=progress_callback)
 
-    reproj_stack = np.stack(reproj_channels, axis=-1)
     _emit(
         (
             "DEBUG_SHAPE: reprojection complete "
@@ -1355,7 +1360,7 @@ def _reproject_frame_to_tile(
         lvl="DEBUG",
         callback=progress_callback,
     )
-    footprint_combined = np.nanmax(np.stack(footprints, axis=0), axis=0)
+    footprint_combined = combined_footprint
     if alpha_weights is not None:
         try:
             if alpha_weights.ndim == 2:
