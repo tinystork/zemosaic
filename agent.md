@@ -155,6 +155,8 @@ load → debayer → normalisation per-frame / per-tile (si besoin)
 
 Objectif : créer une petite API réutilisable qui permette à Grid Mode de faire une **normalisation inter-tile** à partir de scalaires simples (gain + offset par tuile et par canal).
 
+**Note :** Dans ce ticket, ces helpers (`compute_tile_photometric_scaling` / `apply_tile_photometric_scaling`) ne doivent être utilisés que par `grid_mode.py`. Ne pas les brancher dans la pipeline classique tant que leur comportement n’a pas été validé sur Grid Mode.
+
 1. Créer un helper dans un module déjà central (au choix) :
 
    * soit dans `zemosaic_stack_core.py`,
@@ -264,6 +266,7 @@ def apply_tile_photometric_scaling(
 
      * les helpers de scaling doivent ignorer les pixels non valides,
      * les éventuels NaN restants dans la tuile ne doivent pas faire diverger les min/max / médianes ni produire des gains/offsets `inf`/`nan`.
+   * Le scaling photométrique doit uniquement modifier les valeurs de données valides. Les NaN existants (zones hors coverage) doivent rester NaN, et les cartes de coverage / poids / alpha utilisées pour le feathering ne doivent pas être modifiées par ces helpers.
 
 ---
 
@@ -327,3 +330,9 @@ Dans ce ticket, ne viser que les gains faciles et non risqués :
 
   * continue de fonctionner **strictement comme avant**,
   * les tests/runs existants ne montrent pas de régression.
+
+
+Non-objectifs :
+  * Ne pas introduire de modèle de fond 2D (Option B) dans ce ticket.
+  * Ne pas toucher à la pipeline classique.
+  * Ne pas modifier la logique de feathering au-delà de ce ticket.

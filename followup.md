@@ -48,8 +48,7 @@
 
 5. Enfin, lui faire ajouter les appels à `equalize_rgb_medians_inplace` au moment opportun :
 
-   * d’abord proposer la solution préférée : sur les frames d’une tuile **après débayerisation et avant stacking local**,
-   * si la structure du code ne le permet pas facilement, accepter une version “sur les tiles stackées” mais **avant** la normalisation inter-tile,
+   * appliquer sur la tuile stackée, avant la normalisation inter-tile,
    * dans tous les cas :
      * ne rien faire si l’image est mono-canal,
      * ajouter un log pour confirmer que l’égalisation RGB a bien été appelée.
@@ -118,7 +117,7 @@
   * En cas de doute sur le nombre de canaux, logguer la forme de la tuile.
 
 * **Ordre des opérations pour RGB :**
-  * Priorité à “débayer → égalisation RGB → stacking local”.
+  * Priorité à “débayer → stacking local → égalisation RGB (post-stack, par tuile) → normalisation inter-tile”.
   * Ne jamais appliquer l’égalisation RGB après la normalisation inter-tile, pour ne pas casser les gains/offsets déjà calculés.
 
 * **GPU vs CPU :**
@@ -139,4 +138,5 @@ En cas de doute, revenir aux objectifs simples :
 * et Grid Mode qui reste globalement au même ordre de grandeur de temps de calcul qu’avant.
 
 # Note pour moi même:
+```
 ````
