@@ -1333,22 +1333,28 @@ def _reproject_frame_to_tile(
             with warnings.catch_warnings(record=True) as caught:
                 warnings.filterwarnings("always", category=UserWarning, message=".*all_world2pix.*")
                 warnings.filterwarnings("always", category=UserWarning, message=".*Reproject encountered WCS.*")
-                reproj_arr, footprint = reproject_interp(
-                    (arr_2d, frame.wcs),
-                    output_projection=tile.wcs,
-                    shape_out=(tile_shape_hw[0], tile_shape_hw[1]),
-                    return_footprint=True,
-                )
+                if combined_footprint is None:
+                    reproj_arr, footprint = reproject_interp(
+                        (arr_2d, frame.wcs),
+                        output_projection=tile.wcs,
+                        shape_out=(tile_shape_hw[0], tile_shape_hw[1]),
+                        return_footprint=True,
+                    )
+                else:
+                    reproj_arr = reproject_interp(
+                        (arr_2d, frame.wcs),
+                        output_projection=tile.wcs,
+                        shape_out=(tile_shape_hw[0], tile_shape_hw[1]),
+                        return_footprint=False,
+                    )
             if _has_wcs_convergence_warning(caught):
                 degraded = True
         except Exception:
             return None, None
         reproj_stack[..., c] = np.asarray(reproj_arr, dtype=np.float32, copy=False)
-        footprint_f32 = np.asarray(footprint, dtype=np.float32, copy=False)
         if combined_footprint is None:
+            footprint_f32 = np.asarray(footprint, dtype=np.float32, copy=False)
             combined_footprint = np.array(footprint_f32, copy=True)
-        else:
-            np.maximum(combined_footprint, footprint_f32, out=combined_footprint)
 
     if degraded:
         _log_wcs_degraded(frame, progress_callback=progress_callback)
