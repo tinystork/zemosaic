@@ -1,20 +1,20 @@
 
 ### 🎯 Mission
 
-1. **Corriger la géométrie des tiles dans Grid Mode**
+1. [x] **Corriger la géométrie des tiles dans Grid Mode**
 
    * assurer que *toutes* les reprojections utilisent **exactement la même WCS** et **exactement le même canevas (shape_out)**
    * supprimer les décalages accumulés actuellement visibles dans la mosaïque
 
-2. **Activer et appliquer la normalisation photométrique inter-tile**
+2. [ ] **Activer et appliquer la normalisation photométrique inter-tile**
 
    * compute_tile_photometric_scaling + apply_tile_photometric_scaling
    * utiliser un masque de recouvrement coverage/WCS
    * appliquer *avant* la reprojection
 
-3. **Réintroduire correctement l’égalisation RGB par tuile**
+3. [ ] **Réintroduire correctement l’égalisation RGB par tuile**
 
-4. **Garantir un pipeline cohérent, sans fallback silencieux**
+4. [ ] **Garantir un pipeline cohérent, sans fallback silencieux**
 
 ---
 
