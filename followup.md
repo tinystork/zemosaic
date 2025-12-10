@@ -16,10 +16,10 @@
 
 ### 2. BBox de tuiles & alignement
 
-- [ ] Inspecter la fonction qui crée les `GridTile` et leurs `bbox`.
-- [ ] S’assurer que les `bbox` sont calculées en pixels du canevas global (via WCS), pas à partir d’une simple grille row/col.
-- [ ] Ajouter un log DEBUG pour chaque tuile : `tile_id`, `bbox`, `tile_shape_hw`.
-- [ ] Vérifier que pour chaque tuile : `0 <= xmin < xmax <= global_width` et idem pour y.
+- [x] Inspecter la fonction qui crée les `GridTile` et leurs `bbox`.
+- [x] S’assurer que les `bbox` sont calculées en pixels du canevas global (via WCS), pas à partir d’une simple grille row/col.
+- [x] Ajouter un log DEBUG pour chaque tuile : `tile_id`, `bbox`, `tile_shape_hw`.
+- [x] Vérifier que pour chaque tuile : `0 <= xmin < xmax <= global_width` et idem pour y.
 
 **Validation pratique :**
 
