@@ -2483,7 +2483,7 @@ def assemble_tiles(
     legacy_rgb_cube: bool = False,
     grid_rgb_equalize: bool = True,
     progress_callback: ProgressCallback = None,
-) -> Path | None:
+    ) -> Path | None:
     """Assemble processed tiles into the final mosaic without global reprojection.
 
     Saves the science mosaic as float32 FITS with WEIGHT extension.
@@ -2498,6 +2498,61 @@ def assemble_tiles(
             callback=progress_callback,
         )
         return None
+
+    def _combine_mask_with_coverage(mask: np.ndarray, coverage_mask: np.ndarray | None) -> np.ndarray:
+        combined_mask = np.asarray(mask, dtype=bool)
+        if coverage_mask is None:
+            return combined_mask
+        try:
+            cov_mask = np.asarray(coverage_mask, dtype=bool)
+            if cov_mask.ndim == 2 and combined_mask.ndim == 3:
+                cov_mask = np.repeat(cov_mask[..., np.newaxis], combined_mask.shape[-1], axis=2)
+            if cov_mask.shape == combined_mask.shape:
+                return combined_mask & cov_mask
+            _emit(
+                "[GRID] Coverage mask shape mismatch when combining with tile mask; using finite mask only",
+                lvl="WARN",
+                callback=progress_callback,
+            )
+        except Exception:
+            _emit(
+                "[GRID] Coverage mask combination failed; using finite mask only",
+                lvl="WARN",
+                callback=progress_callback,
+            )
+        return combined_mask
+
+    def _log_tile_medians(label: str, data: np.ndarray, mask: np.ndarray | None = None) -> None:
+        arr = np.asarray(data, dtype=np.float32)
+        if arr.ndim == 2:
+            arr = arr[..., np.newaxis]
+        try:
+            mask_arr = compute_valid_mask(arr)
+            if mask is not None:
+                cov_mask = np.asarray(mask, dtype=bool)
+                if cov_mask.ndim == 2 and arr.ndim == 3:
+                    cov_mask = np.repeat(cov_mask[..., np.newaxis], arr.shape[-1], axis=2)
+                try:
+                    mask_arr = mask_arr & np.broadcast_to(cov_mask, arr.shape)
+                except Exception:
+                    pass
+        except Exception:
+            mask_arr = None
+
+        stats: list[str] = []
+        for idx in range(arr.shape[-1]):
+            try:
+                if mask_arr is None:
+                    valid_vals = arr[..., idx][np.isfinite(arr[..., idx])]
+                else:
+                    channel_mask = mask_arr if mask_arr.ndim == 2 else mask_arr[..., idx]
+                    valid_vals = arr[..., idx][channel_mask]
+                median_val = float(np.nanmedian(valid_vals)) if valid_vals.size else float("nan")
+            except Exception:
+                median_val = float("nan")
+            stats.append(f"c{idx}_median={median_val:.6g}")
+        stats_str = ", ".join(stats)
+        _emit(f"Photometry: {label} {stats_str}", lvl="DEBUG", callback=progress_callback)
 
     tiles_seq = list(tiles)
     tiles_list = [t for t in tiles_seq if t.output_path and t.output_path.is_file()]
@@ -2565,22 +2620,21 @@ def assemble_tiles(
         if c != channels:
             channel_mismatches += 1
         mask = compute_valid_mask(data)
-        if coverage_mask is not None:
+        mask = _combine_mask_with_coverage(mask, coverage_mask)
+
+        if c == 3 and equalize_rgb_medians_inplace is not None:
             try:
-                cov_mask = coverage_mask
-                if cov_mask.ndim == 2 and mask.ndim == 3:
-                    cov_mask = np.repeat(cov_mask[..., np.newaxis], mask.shape[-1], axis=2)
-                if cov_mask.shape == mask.shape:
-                    mask = mask & cov_mask
-                else:
-                    _emit(
-                        f"Assembly: tile {t.tile_id} coverage mask shape mismatch (coverage={cov_mask.shape}, mask={mask.shape})",
-                        lvl="WARN",
-                        callback=progress_callback,
-                    )
+                equalize_rgb_medians_inplace(data)
+                _emit(
+                    f"Photometry: tile {t.tile_id} RGB median equalization applied pre-scaling",
+                    lvl="DEBUG",
+                    callback=progress_callback,
+                )
+                mask = compute_valid_mask(data)
+                mask = _combine_mask_with_coverage(mask, coverage_mask)
             except Exception:
                 _emit(
-                    f"Assembly: tile {t.tile_id} coverage mask application failed; using finite mask only",
+                    f"Photometry: tile {t.tile_id} RGB equalization failed; proceeding without it",
                     lvl="WARN",
                     callback=progress_callback,
                 )
@@ -2668,6 +2722,9 @@ def assemble_tiles(
             callback=progress_callback,
         )
         return None
+
+    for info in tile_infos:
+        _log_tile_medians(f"tile {info.tile_id} pre-scale", info.data, mask=info.mask)
 
     def _tile_has_signal(info: TilePhotometryInfo) -> bool:
         data = np.asarray(info.data, dtype=np.float32)
@@ -2785,11 +2842,21 @@ def assemble_tiles(
                     )
                     continue
                 try:
+                    _log_tile_medians(
+                        f"tile {info.tile_id} pre-scale vs ref {reference_info.tile_id}",
+                        tgt_patch,
+                        mask=common_mask,
+                    )
                     gains, offsets = compute_tile_photometric_scaling(
                         ref_patch, tgt_patch, mask=common_mask
                     )
                     info.data = apply_tile_photometric_scaling(info.data, gains, offsets)
                     info.mask = compute_valid_mask(info.data) & info.mask
+                    _log_tile_medians(
+                        f"tile {info.tile_id} post-scale vs ref {reference_info.tile_id}",
+                        info.data,
+                        mask=info.mask,
+                    )
                     _emit(
                         f"Photometry: tile {info.tile_id} scaled vs ref {reference_info.tile_id} "
                         f"gains={gains.tolist()} offsets={offsets.tolist()}",

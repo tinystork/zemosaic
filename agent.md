@@ -6,7 +6,7 @@
    * assurer que *toutes* les reprojections utilisent **exactement la même WCS** et **exactement le même canevas (shape_out)**
    * supprimer les décalages accumulés actuellement visibles dans la mosaïque
 
-2. [ ] **Activer et appliquer la normalisation photométrique inter-tile**
+2. [x] **Activer et appliquer la normalisation photométrique inter-tile**
 
    * compute_tile_photometric_scaling + apply_tile_photometric_scaling
    * utiliser un masque de recouvrement coverage/WCS
