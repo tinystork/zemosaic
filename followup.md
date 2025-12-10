@@ -2,10 +2,10 @@
 
 ### 1. Géométrie & canevas global
 
-- [ ] Rechercher dans `grid_mode.py` l’endroit où la WCS globale et la taille de canevas sont définies.
-- [ ] Vérifier qu’il existe une structure unique (ex. `GridDefinition.global_wcs`, `GridDefinition.global_shape_hw`) utilisée partout.
-- [ ] Confirmer que **toutes les allocations** de tableaux globaux (mosaïque, coverage, alpha) utilisent **exactement** `global_shape_hw`.
-- [ ] Vérifier que **personne** ne recalcule la taille globale à partir des tuiles.
+- [x] Rechercher dans `grid_mode.py` l’endroit où la WCS globale et la taille de canevas sont définies.
+- [x] Vérifier qu’il existe une structure unique (ex. `GridDefinition.global_wcs`, `GridDefinition.global_shape_hw`) utilisée partout.
+- [x] Confirmer que **toutes les allocations** de tableaux globaux (mosaïque, coverage, alpha) utilisent **exactement** `global_shape_hw`.
+- [x] Vérifier que **personne** ne recalcule la taille globale à partir des tuiles.
 
 **Test rapide :**
 
