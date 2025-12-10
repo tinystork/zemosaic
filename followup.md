@@ -184,7 +184,7 @@ En cas de doute, revenir aux objectifs simples :
 - [x] Helpers de photométrie pour les tuiles créés et loggés (gains/offsets, min/med/max) en float32.
 - [x] Helpers branchés dans `grid_mode.py` avec choix d’une tuile de référence saine et scaling appliqué avant l’assemblage.
 - [x] Égalisation RGB appliquée au moment post-stack par tuile (skip si mono, log dédié).
-- [ ] Masque de recouvrement coverage/WCS implémenté et utilisé dans `compute_tile_photometric_scaling` + logs dédiés.
+- [x] Masque de recouvrement coverage/WCS implémenté et utilisé dans `compute_tile_photometric_scaling` + logs dédiés.
 - [ ] Revue des optimisations simples (dtypes, reproject redondants, SciPy dans les boucles) à compléter si nécessaire.
 
 # Note pour moi même:

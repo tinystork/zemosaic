@@ -420,7 +420,7 @@ Non-objectifs :
 * [x] Ajouter les helpers `compute_tile_photometric_scaling` / `apply_tile_photometric_scaling` pour la normalisation inter-tile (float32, logs min/med/max, masques NaN safe).
 * [x] Brancher ces helpers dans `grid_mode.py` avec sélection d’une tuile de référence et application du scaling avant l’assemblage global.
 * [x] Réintroduire l’égalisation RGB par tuile juste après le stacking local.
-* [ ] Ajouter et exploiter un masque de recouvrement basé sur la coverage / WCS pour le calcul des gains/offsets (Option C).
+* [x] Ajouter et exploiter un masque de recouvrement basé sur la coverage / WCS pour le calcul des gains/offsets (Option C).
 * [ ] Effectuer le passage de perf minimal (réduction des reproject redondants / filtres SciPy et vérification des dtypes) si nécessaire.
 
 ````
