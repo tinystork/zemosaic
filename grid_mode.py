@@ -314,6 +314,7 @@ class TilePhotometryInfo:
     bbox: tuple[int, int, int, int]
     data: np.ndarray
     mask: np.ndarray
+    coverage_mask: np.ndarray | None = None
     gain: np.ndarray | None = None
     offset: np.ndarray | None = None
     background: np.ndarray | None = None
@@ -1936,9 +1937,36 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
         _emit(f"Tile {tile.tile_id}: no usable patches", lvl="WARN", callback=progress_callback)
         return None
 
+    if _CUPY_AVAILABLE:
+        try:
+            if isinstance(running_sum, cp.ndarray):
+                running_sum = cp.asnumpy(running_sum)
+            if isinstance(running_weight, cp.ndarray):
+                running_weight = cp.asnumpy(running_weight)
+        except Exception:
+            pass
     with np.errstate(divide="ignore", invalid="ignore"):
         stacked = running_sum / np.clip(running_weight, 1e-6, None)
     stacked = np.where(np.isfinite(stacked), stacked, 0.0).astype(np.float32, copy=False)
+    coverage_mask_alpha: np.ndarray | None = None
+    try:
+        coverage_mask_bool = (
+            np.any(running_weight > 0, axis=-1)
+            if running_weight.ndim == 3
+            else (running_weight > 0)
+        )
+        coverage_mask_alpha = np.asarray(coverage_mask_bool, dtype=np.uint8, copy=False) * 255
+        _emit(
+            f"[GRIDCOV] tile_id={tile.tile_id} coverage_mask pixels={int(np.sum(coverage_mask_bool))}",
+            lvl="DEBUG",
+            callback=progress_callback,
+        )
+    except Exception:
+        _emit(
+            f"[GRIDCOV] tile_id={tile.tile_id} coverage mask derivation failed; proceeding without ALPHA",
+            lvl="WARN",
+            callback=progress_callback,
+        )
     _emit(
         (
             "DEBUG_SHAPE: tile "
@@ -2020,6 +2048,7 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
             legacy_rgb_cube=config.legacy_rgb_cube,
             progress_callback=progress_callback,
             axis_order=axis_order,
+            alpha_mask=coverage_mask_alpha,
         )
     except Exception as exc:
         _emit(f"Tile {tile.tile_id}: failed to write FITS ({exc})", lvl="ERROR", callback=progress_callback)
@@ -2490,18 +2519,32 @@ def assemble_tiles(
         return None
 
     tile_infos: list[TilePhotometryInfo] = []
-    pending_tiles: list[tuple[GridTile, np.ndarray, np.ndarray, int]] = []
+    pending_tiles: list[tuple[GridTile, np.ndarray, np.ndarray, int, np.ndarray | None]] = []
     channels: int | None = None
     io_failures = 0
     channel_mismatches = 0
     empty_masks = 0
     for t in tiles_list:
+        coverage_mask: np.ndarray | None = None
         try:
             with _open_fits_safely(t.output_path) as hdul:
                 raw_data = hdul[0].data
                 if raw_data is None:
                     raise ValueError("empty data")
                 data = _ensure_hwc_array(raw_data)
+                try:
+                    if "ALPHA" in hdul:
+                        alpha_arr = np.asarray(hdul["ALPHA"].data)
+                        if alpha_arr is not None:
+                            if alpha_arr.ndim > 2:
+                                alpha_arr = alpha_arr[..., 0]
+                            coverage_mask = np.asarray(alpha_arr > 0, dtype=bool)
+                except Exception:
+                    _emit(
+                        f"Assembly: failed to read ALPHA coverage for tile {t.tile_id}; proceeding with finite mask",
+                        lvl="WARN",
+                        callback=progress_callback,
+                    )
         except Exception as exc:
             io_failures += 1
             _emit(
@@ -2516,6 +2559,25 @@ def assemble_tiles(
         if c != channels:
             channel_mismatches += 1
         mask = compute_valid_mask(data)
+        if coverage_mask is not None:
+            try:
+                cov_mask = coverage_mask
+                if cov_mask.ndim == 2 and mask.ndim == 3:
+                    cov_mask = np.repeat(cov_mask[..., np.newaxis], mask.shape[-1], axis=2)
+                if cov_mask.shape == mask.shape:
+                    mask = mask & cov_mask
+                else:
+                    _emit(
+                        f"Assembly: tile {t.tile_id} coverage mask shape mismatch (coverage={cov_mask.shape}, mask={mask.shape})",
+                        lvl="WARN",
+                        callback=progress_callback,
+                    )
+            except Exception:
+                _emit(
+                    f"Assembly: tile {t.tile_id} coverage mask application failed; using finite mask only",
+                    lvl="WARN",
+                    callback=progress_callback,
+                )
         if not np.any(mask):
             empty_masks += 1
             _emit(
@@ -2524,7 +2586,7 @@ def assemble_tiles(
                 callback=progress_callback,
             )
             continue
-        pending_tiles.append((t, data, mask, c))
+        pending_tiles.append((t, data, mask, c, coverage_mask))
 
     if not pending_tiles:
         _emit(
@@ -2538,14 +2600,17 @@ def assemble_tiles(
         )
         return None
 
-    target_channels = 3 if any(c == 3 for _, _, _, c in pending_tiles) else (channels or 1)
-    for t, data, mask, c in pending_tiles:
+    target_channels = 3 if any(c == 3 for _, _, _, c, _ in pending_tiles) else (channels or 1)
+    for t, data, mask, c, coverage_mask in pending_tiles:
         data_conv = data
         mask_conv = mask
+        cov_conv = coverage_mask
         if c != target_channels:
             if c == 1 and target_channels == 3:
                 data_conv = np.repeat(data, 3, axis=-1)
                 mask_conv = np.repeat(mask[..., np.newaxis], 3, axis=2) if mask.ndim == 2 else np.repeat(mask, 3, axis=-1)
+                if coverage_mask is not None and coverage_mask.ndim == 2:
+                    cov_conv = np.repeat(coverage_mask[..., np.newaxis], 3, axis=2)
                 _emit(
                     f"Assembly: tile {t.tile_id} mono->RGB expansion applied to match mosaic",
                     lvl="WARN",
@@ -2554,6 +2619,11 @@ def assemble_tiles(
             elif c == 3 and target_channels == 1:
                 data_conv = np.nanmean(data, axis=-1, keepdims=True)
                 mask_conv = compute_valid_mask(data_conv) & (mask if mask.ndim == 3 else mask[..., np.newaxis])
+                if coverage_mask is not None:
+                    if coverage_mask.ndim == 2:
+                        cov_conv = coverage_mask
+                    elif coverage_mask.ndim == 3:
+                        cov_conv = np.any(coverage_mask, axis=-1)
                 _emit(
                     f"Assembly: tile {t.tile_id} RGB collapsed to mono to match mosaic",
                     lvl="WARN",
@@ -2566,7 +2636,15 @@ def assemble_tiles(
                     callback=progress_callback,
                 )
                 continue
-        tile_infos.append(TilePhotometryInfo(tile_id=t.tile_id, bbox=t.bbox, data=data_conv, mask=mask_conv))
+        tile_infos.append(
+            TilePhotometryInfo(
+                tile_id=t.tile_id,
+                bbox=t.bbox,
+                data=data_conv,
+                mask=mask_conv,
+                coverage_mask=cov_conv if cov_conv is not None else None,
+            )
+        )
 
     _emit(
         (
@@ -2638,6 +2716,20 @@ def assemble_tiles(
                 tgt_patch = info.data[slice_tgt]
                 mask_ref = compute_valid_mask(ref_patch)
                 mask_tgt = compute_valid_mask(tgt_patch)
+                cov_ref = None
+                cov_tgt = None
+                try:
+                    if reference_info.coverage_mask is not None:
+                        cov_ref = reference_info.coverage_mask[slice_ref]
+                        if cov_ref.ndim == 3:
+                            cov_ref = np.any(cov_ref, axis=-1)
+                    if info.coverage_mask is not None:
+                        cov_tgt = info.coverage_mask[slice_tgt]
+                        if cov_tgt.ndim == 3:
+                            cov_tgt = np.any(cov_tgt, axis=-1)
+                except Exception:
+                    cov_ref = None
+                    cov_tgt = None
 
                 def _overlap_mask_from_coverage(mask_a: np.ndarray, mask_b: np.ndarray) -> np.ndarray:
                     mask_a = np.asarray(mask_a, dtype=bool)
@@ -2656,8 +2748,10 @@ def assemble_tiles(
                             pass
                     return overlap_mask
 
-                coverage_mask = _overlap_mask_from_coverage(mask_ref, mask_tgt)
-                if not np.any(coverage_mask):
+                coverage_mask = None
+                if cov_ref is not None and cov_tgt is not None:
+                    coverage_mask = _overlap_mask_from_coverage(cov_ref, cov_tgt)
+                if coverage_mask is None or not np.any(coverage_mask):
                     _emit(
                         f"[GRID] Coverage not available for tile {info.tile_id}, falling back to finite-pixel mask.",
                         lvl="INFO",
@@ -2665,6 +2759,11 @@ def assemble_tiles(
                     )
                     common_mask = mask_ref & mask_tgt
                 else:
+                    _emit(
+                        f"[GRID] Coverage overlap for tile {info.tile_id} vs ref {reference_info.tile_id}: pixels={int(np.sum(coverage_mask))}",
+                        lvl="DEBUG",
+                        callback=progress_callback,
+                    )
                     common_mask = coverage_mask & mask_ref & mask_tgt
                 n_common = int(np.sum(common_mask))
                 _emit(
