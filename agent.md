@@ -1,268 +1,289 @@
 
-### Mission
+## `agent.md` – Grid Mode Photometric Fix & Perf Pass (Option A)
 
-Quand l’utilisateur clique sur le bouton **“Analyse”** dans la GUI Qt de ZeMosaic :
+### 1. Mission
 
-* **Lancer automatiquement ZeAnalyser** (si ce backend a été détecté),
-* en utilisant **`subprocess.Popen()`**, de façon :
+**Objectif principal :**
+Rendre le **Grid Mode** photométriquement propre (plus de damier, plus de voile verdâtre) en **réutilisant la logique de normalisation déjà existante dans la pipeline classique**, sans casser :
 
-  * **non bloquante** (ZeMosaic continue à tourner),
-  * **multi-plateforme** (Windows / Linux / macOS),
-  * **robuste** (messages clairs si le script/ Python n’est pas trouvés, aucune exception non gérée).
+* le support GPU (CuPy),
+* le multi-thread / multi-process,
+* ni le comportement de la pipeline classique.
 
-Le backend **Beforehand** reste pour l’instant non câblé (message explicite seulement).
-
----
-
-### Contexte
-
-* Fichiers principaux déjà en place :
-
-  * `zemosaic_gui_qt.py` : GUI principale Qt de ZeMosaic.
-  * `zemosaic_utils.get_app_base_dir()` : renvoie le dossier `zemosaic` même en mode PyInstaller.
-  * `path_helpers.safe_path_isdir` : utilitaire robuste pour tester l’existence d’un dossier.
-  * `_detect_analysis_backend()` (déjà créé précédemment) :
-    retourne un tuple `(backend, root)` :
-
-    * `backend` ∈ `{"none", "zeanalyser", "beforehand"}`,
-    * `root` : `Path` vers le dossier racine du backend, ou `None`.
-
-* La GUI a déjà :
-
-  * un bouton **Analyse** dans `zemosaic_gui_qt.py`,
-  * un handler qui, pour l’instant, affiche un `QMessageBox` disant que l’intégration n’est pas encore câblée.
-
-* ZeAnalyser est attendu dans la structure suivante :
-
-  ```text
-  .../zeseestarstacker/
-      zemosaic/
-      zeanalyser/
-          analyse_gui_qt.py   <-- script à lancer
-  ```
+En parallèle, faire un **1er passage d’optimisation** sur les points les plus coûteux (reproject redondants, dtypes, SciPy inutilement invoqué en boucle).
 
 ---
 
-### Fichiers à modifier
+### 2. Contexte (à lire AVANT de coder)
 
-1. `zemosaic_gui_qt.py`
-   (uniquement, ne pas toucher au Tk GUI ni au worker).
+Actuellement :
+
+* La **pipeline classique** produit une mosaïque propre :
+
+  * normalisation inter-frame,
+  * renorm de couverture / deux-pass,
+  * égalisation RGB (`equalize_rgb_medians_inplace`),
+  * assembly global cohérent.
+* Le **Grid Mode** produit une mosaïque :
+
+  * avec tuiles à des niveaux de flux très différents,
+  * avec un fond hétérogène (beige/vert),
+  * avec des bandes verticales / horizontales de couleur,
+  * avec un feathering inefficace.
+
+Le diagnostic est :
+
+1. **La photométrie n’est pas appliquée correctement dans Grid Mode :**
+
+   * pas de normalisation inter-tile robuste,
+   * pas (ou peu) d’égalisation RGB,
+   * ordre d’opérations sous-optimal (reprojection avant renorm, etc.).
+2. **Grid Mode est anormalement lent**, notamment parce que :
+
+   * il y a trop d’appels à `reproject_interp` (et parfois par canal),
+   * SciPy / ndimage est utilisé en CPU dans des boucles lourdes,
+   * les dtypes sont parfois en float64,
+   * le feathering est fait tuile par tuile, en CPU pur.
+
+La mission **n’est PAS** de tout réécrire, mais de :
+
+* **réutiliser au maximum les briques existantes** de la pipeline classique,
+* corriger l’ordre des étapes dans Grid Mode,
+* limiter les recalculs et dtypes coûteux.
 
 ---
 
-### Tâches détaillées
+### 3. Fichiers concernés
 
-#### 1. Vérifier / consolider l’état interne du backend d’analyse
+Travail **principal** dans :
 
-Dans la classe principale de la GUI Qt (par ex. `ZeMosaicQtMainWindow` — utiliser le vrai nom présent dans le fichier) :
+* `grid_mode.py` 
 
-* S’assurer qu’il existe deux attributs d’instance :
+Lecture / réutilisation de logique dans :
 
-  ```python
-  self.analysis_backend: AnalysisBackend = "none"
-  self.analysis_backend_root: Optional[Path] = None
-  ```
+* `zemosaic_worker.py` (Phase 5, post-stack pipeline, deux-pass, renorm) 
+* `zemosaic_stack_core.py` (backend stacker CPU/GPU, logique commune) 
+* `zemosaic_utils.py` (helpers utilisés partout, notamment WCS / coverage / temp dir) 
+* `zemosaic_align_stack.py` (rejet + `equalize_rgb_medians_inplace`) – déjà importé dans `grid_mode.py`.
 
-* Après chargement de la configuration et avant la construction de la barre de boutons, appeler :
+**Important :**
 
-  ```python
-  self.analysis_backend, self.analysis_backend_root = _detect_analysis_backend()
-  ```
+* Ne pas casser les call-sites actuels de `zemosaic_worker.py`.
+* Ne pas modifier les interfaces publiques de `stack_core` (sauf ajout de paramètres optionnels rétro-compatibles).
 
-* Le bouton **Analyse** doit **seulement** être visible si `analysis_backend != "none"`.
+---
 
-  Exemple dans la méthode qui construit la barre de commandes :
+### 4. Comportement cible (fonctionnel)
 
-  ```python
-  if self.analysis_backend != "none":
-      self.analysis_button = QPushButton(self._tr("qt_button_analyse", "Analyse"))
-      self.analysis_button.clicked.connect(self._on_analysis_clicked)
-      row.addWidget(self.analysis_button)
-  else:
-      self.analysis_button = None
-  ```
+1. **Photométrie Grid Mode alignée avec la pipeline classique :**
 
-> Ne pas changer l’ordre ni le comportement des boutons existants (`Filter`, `Start`, `Stop`).
+   * Chaque **master-tile Grid** doit être photométriquement comparable à une **master-tile classique** :
 
-#### 2. Créer une méthode privée robuste pour lancer le backend
+     * même ordre de normalisation (gains / offsets),
+     * même traitement des outliers (Winsor / kappa-sigma déjà gérés par `stack_core`),
+     * possibilité de renorm globale (deux-pass / coverage renorm) appliquée à la mosaïque finale.
 
-Ajouter dans `zemosaic_gui_qt.py`, dans la classe principale, une nouvelle méthode privée :
+   * À la fin :
+
+     * **plus de damier**,
+     * fond de ciel globalement homogène,
+     * couleurs cohérentes,
+     * feathering utile (au lieu d’amplifier les défauts).
+
+2. **Égalisation RGB systématique pour les tuiles couleur :**
+
+   * Lorsque les tuiles sont RGB, **appliquer `equalize_rgb_medians_inplace`** (déjà importée depuis `zemosaic_align_stack`) **à un moment cohérent** :
+
+     * soit au niveau des frames individuelles AVANT stacking local,
+     * soit sur les master-tiles AVANT assembly global.
+   * Objectif : supprimer les dominantes canal-par-canal qui génèrent les bandes vert/magenta.
+
+3. **Ordre des opérations corrigé :**
+
+   Éviter le pipeline actuel :
+
+   ```text
+   load → debayer → stack local tile → reprojection → feather → assemble
+   ```
+
+   En faveur d’un ordre plus sain :
+
+   ```text
+   load → debayer → normalisation per-frame / per-tile → stack local tile
+        → normalisation inter-tile (gain/offset global)
+        → reprojection sur canevas global
+        → feather + assembly
+   ```
+
+4. **Perfs acceptables sur gros datasets :**
+
+   * Pas de changement d’API côté GUI / utilisateur dans ce ticket.
+   * Réduire les coûts évidents **sans** toucher à la sémantique :
+
+     * utiliser float32 par défaut,
+     * limiter les reprojects redondants,
+     * éviter les filtres SciPy inutiles,
+     * réutiliser les données et WCS déjà calculés.
+
+---
+
+### 5. Plan de travail concret
+
+#### Étape 1 – Localiser et comprendre la photométrie classique
+
+1. Dans `zemosaic_worker.py` :
+
+   * Repérer les fonctions responsables de la **Phase 5** :
+
+     * `_apply_phase5_post_stack_pipeline(...)`,
+     * `_apply_two_pass_coverage_renorm_if_requested(...)`,
+     * ainsi que l’appel à `run_second_pass_coverage_renorm(...)` si accessible. 
+
+   * Comprendre :
+
+     * comment les gains / renorms sont calculés,
+     * à quel moment ils sont appliqués (avant / après reprojection),
+     * comment la coverage est utilisée pour stabiliser la photométrie.
+
+2. **Ne pas modifier ces fonctions dans ce ticket**, mais t’en servir comme **référence** pour définir une version “light” adaptée au Grid Mode.
+
+---
+
+#### Étape 2 – Ajouter un helper de normalisation pour les tuiles
+
+Objectif : créer une petite API réutilisable qui permette à Grid Mode de faire une **normalisation inter-tile** à partir de scalaires simples (gain + offset par tuile et par canal).
+
+1. Créer un helper dans un module déjà central (au choix) :
+
+   * soit dans `zemosaic_stack_core.py`,
+   * soit dans `zemosaic_utils.py` si c’est plus naturel.
+
+2. Signature proposée (ajustable tant que c’est clair) :
 
 ```python
-def _launch_analysis_backend(self) -> None:
+def compute_tile_photometric_scaling(
+    reference_tile: np.ndarray,
+    target_tile: np.ndarray,
+    *,
+    mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Launch the selected analysis backend in a separate process (non-blocking).
+    Calcule (gain, offset) par canal pour amener target_tile vers reference_tile
+    dans les zones définies par mask (ou sur toute l'image si mask est None).
 
-    - If backend == "zeanalyser": run analyse_gui_qt.py using the current Python
-      interpreter (sys.executable).
-    - If backend == "beforehand": for now, only show an informational message.
-    - If no backend or script is missing: show a warning and return gracefully.
+    Retourne:
+      gains:  shape (C,) ou (1,)
+      offsets: shape (C,) ou (1,)
     """
-    backend = getattr(self, "analysis_backend", "none")
-    root = getattr(self, "analysis_backend_root", None)
-
-    if backend == "none" or root is None:
-        QMessageBox.information(
-            self,
-            "Analysis",
-            "No analysis backend is available near this ZeMosaic installation.",
-        )
-        return
-
-    if backend == "zeanalyser":
-        script = root / "analyse_gui_qt.py"
-        backend_label = "ZeAnalyser"
-    elif backend == "beforehand":
-        # For now, we do not auto-launch Beforehand, just inform the user.
-        QMessageBox.information(
-            self,
-            "Beforehand detected",
-            f"A 'beforehand' analysis workflow was detected here:\n\n{root}\n\n"
-            "Automatic launch is not wired yet. "
-            "You can still run your Beforehand tools manually from this folder.",
-        )
-        return
-    else:
-        QMessageBox.warning(
-            self,
-            "Analysis",
-            f"Unknown analysis backend: {backend}",
-        )
-        return
-
-    # At this point we are in the ZeAnalyser case
-    if not script.is_file():
-        QMessageBox.warning(
-            self,
-            "Analysis",
-            f"Cannot find the analysis script:\n{script}",
-        )
-        return
-
-    # Use the same Python executable as the running ZeMosaic process
-    import sys
-    import subprocess
-
-    cmd = [sys.executable, str(script)]
-
-    # Optional: log the command for debugging purposes
-    try:
-        self._append_log(f"[INFO] [Analysis] Launching {backend_label}: {' '.join(cmd)}")
-    except Exception:
-        # Never fail just because logging failed
-        pass
-
-    try:
-        # Non-blocking launch; ZeMosaic stays responsive.
-        subprocess.Popen(
-            cmd,
-            cwd=str(root),
-            close_fds=False,  # portable, safe default
-            shell=False,      # avoid shell injection issues
-            creationflags=0,  # let OS decide; we keep it simple/portable
-        )
-    except Exception as exc:  # pragma: no cover - defensive
-        QMessageBox.critical(
-            self,
-            "Analysis launch failed",
-            f"Failed to launch {backend_label}.\n\n"
-            f"Script: {script}\n"
-            f"Error: {exc}",
-        )
 ```
 
-Points importants :
+3. Implémentation :
 
-* Utiliser **`sys.executable`** pour être sûr de lancer ZeAnalyser avec le **même Python** que ZeMosaic (évite les problèmes de venv).
-* `cwd=root` : ZeAnalyser se lance dans son propre dossier (utile s’il dépend de chemins relatifs).
-* `shell=False` : plus sûr et plus portable.
-* Capturer **toutes** les exceptions et afficher une `QMessageBox` **sans faire crasher ZeMosaic**.
-* `_append_log` est appelée dans un `try/except` très large pour ne jamais faire échouer le lancement.
+   * Travailler en **float32**.
+   * Pour chaque canal :
 
-#### 3. Connecter le bouton à cette méthode
+     * calculer un **fond de ciel** robuste (par ex. médiane) pour ref et target,
+     * calculer un **gain** basé sur les médianes ou une régression simple sur les pixels de fond,
+     * ignorer les NaN et les valeurs non finies.
+   * Retourner des gains / offsets scalaires (pas besoin de carte 2D à ce stade).
 
-Modifier le handler de clic existant pour qu’il appelle simplement `_launch_analysis_backend` :
+4. Créer un second helper :
 
 ```python
-def _on_analysis_clicked(self) -> None:
-    """Slot called when the 'Analyse' button is clicked."""
-    self._launch_analysis_backend()
+def apply_tile_photometric_scaling(
+    tile: np.ndarray,
+    gains: np.ndarray,
+    offsets: np.ndarray,
+) -> np.ndarray:
+    """Applique gain/offset par canal, retourne un nouveau tile float32."""
 ```
 
-Supprimer les anciennes `QMessageBox` “ZeAnalyser detected… The integration is not wired yet.”
-Toute la logique est maintenant dans `_launch_analysis_backend`.
-
-#### 4. Imports nécessaires
-
-En haut de `zemosaic_gui_qt.py` :
-
-* Vérifier que `Path` est importé depuis `pathlib` (normalement oui).
-* Ajouter si besoin :
-
-  ```python
-  import sys
-  import subprocess
-  ```
-
-> Ne pas ajouter d’autres dépendances.
+5. Ajouter des logs DEBUG optionnels (min/max/median après correction).
 
 ---
 
-### Contraintes
+#### Étape 3 – Brancher ce helper dans `grid_mode.py`
 
-* **Ne pas modifier :**
+1. Localiser dans `grid_mode.py` :
 
-  * `zemosaic_gui.py` (GUI Tk),
-  * `zemosaic_worker.py`,
-  * `grid_mode.py`,
-  * ni aucun module scientifique (stacking / alignment / GPU).
-* Aucun changement de comportement de pipeline, seulement **un lancement externe d’outil**.
-* En cas de problème (pas de backend, script manquant, erreur de lancement),
-  **ZeMosaic doit rester stable et utilisable**.
+   * la boucle qui **fabrique les tuiles** (stack local des frames d’une tuile),
+   * la partie qui **assemble les tuiles** dans le canevas global (reprojection et coadd).
+
+2. Adapter le flux :
+
+   * choisir une tuile de référence stable :
+
+     * par exemple la première tuile bien couverte,
+     * ou une tuile centrale,
+     * enregistrer cette référence dans une variable claire (`reference_tile`).
+
+   * Pour chaque tuile “target” :
+
+     * avant de la reprojeter, calculer `(gains, offsets)` par rapport à `reference_tile`
+       en utilisant `compute_tile_photometric_scaling(...)`,
+     * appliquer `apply_tile_photometric_scaling(...)` sur la tuile (`float32`),
+     * seulement ensuite procéder à la reprojection sur le canevas global.
+
+3. Précautions :
+
+   * Ne jamais forcer du float64, rester sur du float32.
+   * Respecter la forme HWC :
+
+     * si la tuile est mono-canal, la représenter temporairement en `(H, W, 1)` pour les helpers.
+   * Gérer proprement les NaN : tout traitement doit les ignorer, pas les propager en `inf`.
 
 ---
 
-### Tests attendus
+#### Étape 4 – Réintroduire l’égalisation RGB
 
-1. **ZeAnalyser présent, script présent**
+1. Toujours dans `grid_mode.py` :
 
-   * Arborescence : `…/zeseestarstacker/zemosaic` + `…/zeseestarstacker/zeanalyser/analyse_gui_qt.py` existe.
-   * Lancer ZeMosaic Qt.
-   * Vérifier :
+   * repérer le moment où une pile d’images RGB d’une tuile est disponible **avant stacking**.
+   * si possible, appeler `equalize_rgb_medians_inplace(...)` sur ces images (ou au moins sur les tiles résultantes) pour aligner les canaux.
 
-     * Le bouton **Analyse** est visible.
-     * Clic → ouverture d’une nouvelle fenêtre ZeAnalyser.
-     * ZeMosaic reste réactif (on peut naviguer, lancer une mosaïque, etc.).
-     * Le log affiche un message du type :
-       `"[INFO] [Analysis] Launching ZeAnalyser: <cmd>"`.
+2. Conditions :
 
-2. **ZeAnalyser détecté mais script manquant**
+   * Ne pas casser la prise en charge mono-canal : ne rien faire si `C == 1`.
+   * S’assurer que cette égalisation est **cohérente** avec la logique de la pipeline classique (même type de données, même ordre approx.).
 
-   * Supprimer/renommer `analyse_gui_qt.py`.
-   * Clic sur **Analyse** :
+---
 
-     * Message `Cannot find the analysis script: ...`.
-     * Pas d’exception dans la console.
-     * ZeMosaic continue de fonctionner normalement.
+#### Étape 5 – Nettoyage / perf minimal
 
-3. **Uniquement Beforehand détecté**
+Dans ce ticket, ne viser que les gains faciles et non risqués :
 
-   * Pas de `zeanalyser`, mais présence de `seestar/beforehand`.
-   * Clic sur **Analyse** :
+1. **Dtypes :**
 
-     * Message d’info expliquant que Beforehand est détecté, mais pas encore câblé.
-     * Pas de tentative de `subprocess.Popen()`.
+   * s’assurer que les arrays créés dans Grid Mode sont en `np.float32` / `cp.float32` par défaut.
+   * éviter les promotions implicites en float64.
 
-4. **Aucun backend**
+2. **Reprojects redondants :**
 
-   * Aucune des structures attendues n’existe.
-   * Le bouton Analyse **ne doit pas apparaître** (ou être désactivé).
-   * Aucun message d’erreur au clic (si le bouton est invisible, pas de clic possible).
+   * quand une tuile a déjà été reprojetée une fois sur le canevas global, ne pas la reprojeter par canal ou à nouveau si ce n’est pas strictement nécessaire.
+   * mutualiser la reprojection sur un array HWC complet quand c’est possible.
 
-5. **Multi-plateforme (au moins check basique)**
+3. **SciPy / ndimage :**
 
-   * Lancer dans un environnement Linux/Mac si dispo, juste pour vérifier qu’il n’y a :
+   * garder l’import, mais éviter les appels répétés dans les boucles les plus grosses,
+   * si un filtre (ex : léger Gaussian) est utilisé juste pour lissage de coverage, ne l’appliquer qu’une fois sur une carte de coverage, pas sur toutes les tuiles.
 
-     * ni `shell=True`,
-     * ni chemins Windows hardcodés.
+---
 
+### 6. Critères d’acceptation
+
+* Sur un dataset représentatif de Grid Mode :
+
+  * la mosaïque **n’a plus de damier visible**,
+  * le fond est raisonnablement uniforme (à stretch égal),
+  * les dominantes de couleur par tuile sont fortement réduites.
+
+* Le temps de run Grid Mode :
+
+  * reste dans le même ordre de grandeur que la version actuelle,
+  * ou s’améliore légèrement,
+  * en tout cas ne **double pas**.
+
+* La pipeline classique :
+
+  * continue de fonctionner **strictement comme avant**,
+  * les tests/runs existants ne montrent pas de régression.

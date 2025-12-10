@@ -1,90 +1,86 @@
 
-### Objectif du followup
+## `followup.md` – Comment guider Codex et vérifier le travail
 
-Après le premier passage de Codex :
+### 1. Séquence d’utilisation pour Codex
 
-* Vérifier que la logique de lancement via `subprocess.Popen()` est correctement implémentée.
-* S’assurer que le comportement est robuste, qu’aucun crash n’apparaît.
-* Ajuster les détails (logs, messages, imports) si nécessaire.
+1. Ouvrir dans l’IDE :
 
----
+   * `grid_mode.py` 
+   * `zemosaic_stack_core.py` 
+   * `zemosaic_worker.py` 
 
-### Check-list de vérification
+2. Demander à Codex :
 
-1. **État interne** [x]
+   * de **lister les fonctions** de Phase 5 dans `zemosaic_worker.py` liées à la photométrie / renorm,
+   * de te montrer où est appelé `equalize_rgb_medians_inplace` dans la pipeline classique.
 
-   * `self.analysis_backend` et `self.analysis_backend_root` existent dans la classe principale.
-   * `_detect_analysis_backend()` est appelé une fois à l’init et son résultat est stocké.
+3. Lui faire implémenter les deux helpers dans `zemosaic_stack_core.py` ou `zemosaic_utils.py` :
 
-2. **Bouton Analyse** [x]
+   * `compute_tile_photometric_scaling(...)`,
+   * `apply_tile_photometric_scaling(...)`.
 
-   * Le bouton est uniquement créé si `analysis_backend != "none"`.
-   * Il est connecté à une méthode `self._on_analysis_clicked`.
-   * Le reste de la barre de boutons (`Filter`, `Start`, `Stop`) est inchangé.
+4. Ensuite, dans `grid_mode.py` :
 
-3. **Méthode `_launch_analysis_backend`** [x]
+   * lui demander de brancher ces helpers :
 
-   * La méthode existe, et :
+     * choix d’une tuile de référence,
+     * calcul et application du scaling photométrique sur chaque tuile avant reprojection.
 
-     * lit bien `self.analysis_backend` et `self.analysis_backend_root`,
-     * gère clairement les cas :
-
-       * `backend == "none"` ou `root is None`,
-       * `backend == "zeanalyser"` (script défini),
-       * `backend == "beforehand"` (info only),
-       * backend inconnu (warning).
-   * Elle construit un chemin `script = root / "analyse_gui_qt.py"` pour ZeAnalyser.
-   * Elle teste `script.is_file()` avant de lancer le process.
-   * En cas d’erreur, elle affiche un `QMessageBox.critical`/`warning` **sans lever d’exception non attrapée**.
-
-4. **Lancement du process** [x]
-
-   * Utilise bien :
-
-     ```python
-     cmd = [sys.executable, str(script)]
-     subprocess.Popen(
-         cmd,
-         cwd=str(root),
-         close_fds=False,
-         shell=False,
-         creationflags=0,
-     )
-     ```
-
-   * `sys` et `subprocess` sont correctement importés.
-
-   * Pas de `shell=True`, pas de chemin hardcodé spécifique à Windows.
-
-   * `_append_log` est appelé avec un `try/except` défensif.
-
-5. **Handler de clic** [x]
-
-   * `_on_analysis_clicked` ne contient plus la vieille `QMessageBox` "integration not wired yet".
-   * Il se contente d’appeler `self._launch_analysis_backend()`.
-
-6. **Comportement utilisateur** [x]
-
-   * ZeMosaic ne "freeze" pas quand on clique sur Analyse.
-   * En cas de script manquant, le message est explicite et ZeMosaic reste utilisable.
-   * La fenêtre ZeAnalyser qui s’ouvre est totalement indépendante (redimensionnable, etc.).
+5. Enfin, lui faire ajouter les appels à `equalize_rgb_medians_inplace` au moment opportun (frames d’une tuile ou master-tile).
 
 ---
 
-### Si quelque chose ne va pas…
+### 2. Checks manuels à faire après patch
 
-* **Le bouton Analyse ne lance rien et pas de message :**
+1. **Compilation / exécution basique :**
 
-  * Vérifier que `_on_analysis_clicked` appelle bien `_launch_analysis_backend`.
-  * Ajouter temporairement un log au début de `_launch_analysis_backend` pour confirmer l’appel.
+   * Lancer ZeMosaic comme d’habitude (Tk ou Qt peu importe).
+   * Vérifier qu’aucun import ne casse :
 
-* **Exception dans la console au clic :**
+     * pas de `ImportError`,
+     * pas de `AttributeError` sur les nouveaux helpers.
 
-  * Vérifier que tous les imports (`sys`, `subprocess`, `Path`) sont présents.
-  * Vérifier que toutes les branches de `_launch_analysis_backend` se terminent par un `return` ou un `Popen` entouré d’un `try/except`.
+2. **Run Grid Mode sur un dataset de test :**
 
-* **ZeAnalyser ne se lance pas mais aucune erreur :**
+   * Reprendre exactement le dataset qui a produit les deux images que tu m’as montrées (classique vs Grid).
+   * Lancer Grid Mode avec les mêmes paramètres que précédemment.
 
-  * Vérifier que `script.is_file()` retourne `True` (logger `script`).
-  * Vérifier que `sys.executable` pointe vers un Python correct (logger `sys.executable` dans `_append_log` si besoin).
-  * Sur Windows, vérifier que l’antivirus ne bloque pas l’exécution d’un nouveau processus Python.
+3. **Comparer visuellement :**
+
+   * le damier doit être **fortement atténué** ou disparu,
+   * les tuiles ne doivent plus “claquer” par paquets,
+   * les bandes de couleur doivent être nettement réduites.
+
+4. **Surveiller les logs :**
+
+   * logs `[GRID]` :
+
+     * vérifier la présence de logs DEBUG sur les min/max/median des tuiles avant/après scaling,
+     * surveiller les éventuels warnings `nan` / `inf`.
+
+   * si tu vois un message type “photometric scaling disabled / fallback”, c’est que la nouvelle logique n’est pas réellement utilisée → à corriger.
+
+5. **Impact sur le temps de run :**
+
+   * noter grossièrement le temps total de traitement **avant** / **après** sur le même dataset,
+   * si le temps a explosé, regarder :
+
+     * le nombre d’appels à `reproject_interp`,
+     * d’éventuels filtres SciPy encore placés dans des boucles.
+
+---
+
+### 3. Points à surveiller / pièges possibles
+
+* **NaN / inf :**
+  S’assurer que les helpers photométriques ignorent correctement les pixels non finis, surtout dans les zones de jointure.
+
+* **RGB vs mono :**
+  Ne pas forcer l’égalisation RGB sur des tuiles mono-canal.
+
+* **GPU vs CPU :**
+  Les helpers photométriques peuvent rester en NumPy CPU, tant qu’ils travaillent sur les tiles **après rapatriement** depuis le GPU. Ne pas essayer d’optimiser ça en CuPy dans ce ticket.
+
+* **Compatibilité :**
+  Ne pas changer les interfaces publiques de `stack_core` ni des fonctions déjà utilisées par la pipeline classique.
+
