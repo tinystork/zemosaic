@@ -61,8 +61,8 @@ Si un fallback apparaît → la géométrie n’est toujours pas correcte.
 ### 4 — Checklist finale
 
 * [x] shape_hw transmis à toutes les reprojections
-* [ ] scaling appliqué avant reprojection
-* [ ] equalize_rgb_medians_inplace appliqué avant scaling
+* [x] scaling appliqué avant reprojection
+* [x] equalize_rgb_medians_inplace appliqué avant scaling
 * [ ] CRPIX mis à jour une seule fois
 * [ ] plus de damier
 * [ ] plus de bandes verticales
