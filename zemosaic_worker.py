@@ -805,6 +805,18 @@ def _apply_autocrop_to_global_plan(
 
     if not plan or not crop_meta:
         return
+    if plan.get("autocrop_applied"):
+        try:
+            existing = plan.get("autocrop_offsets") or {}
+            if (
+                int(existing.get("x0", -1)) == int(crop_meta.get("x0", -2))
+                and int(existing.get("y0", -1)) == int(crop_meta.get("y0", -2))
+                and int(existing.get("width", -1)) == int(crop_meta.get("width", -2))
+                and int(existing.get("height", -1)) == int(crop_meta.get("height", -2))
+            ):
+                return
+        except Exception:
+            return
     width = int(crop_meta.get("width") or 0)
     height = int(crop_meta.get("height") or 0)
     if width <= 0 or height <= 0:
@@ -859,6 +871,7 @@ def _apply_autocrop_to_global_plan(
         "width": width,
         "height": height,
     }
+    plan["autocrop_applied"] = True
 
 
 def _prepare_tiles_for_two_pass(
