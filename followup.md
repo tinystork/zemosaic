@@ -137,6 +137,13 @@ En cas de doute, revenir aux objectifs simples :
 * égalisation RGB calée au même moment logique que dans la pipeline classique,
 * et Grid Mode qui reste globalement au même ordre de grandeur de temps de calcul qu’avant.
 
+# Checklist de suivi
+
+- [x] Helpers de photométrie pour les tuiles créés et loggés (gains/offsets, min/med/max) en float32.
+- [x] Helpers branchés dans `grid_mode.py` avec choix d’une tuile de référence saine et scaling appliqué avant l’assemblage.
+- [x] Égalisation RGB appliquée au moment post-stack par tuile (skip si mono, log dédié).
+- [ ] Revue des optimisations simples (dtypes, reproject redondants, SciPy dans les boucles) à compléter si nécessaire.
+
 # Note pour moi même:
 ```
 ````

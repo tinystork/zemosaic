@@ -124,8 +124,14 @@ except Exception:  # pragma: no cover - worker remains functional without reject
     equalize_rgb_medians_inplace = None
 
 try:
-    from zemosaic_stack_core import stack_core
+    from zemosaic_stack_core import (
+        apply_tile_photometric_scaling,
+        compute_tile_photometric_scaling,
+        stack_core,
+    )
 except Exception:
+    apply_tile_photometric_scaling = None
+    compute_tile_photometric_scaling = None
     stack_core = None
 
 logger = logging.getLogger("ZeMosaicWorker").getChild("grid_mode")
@@ -1954,6 +1960,25 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
         callback=progress_callback,
     )
 
+    if (
+        stacked.ndim == 3
+        and stacked.shape[-1] == 3
+        and equalize_rgb_medians_inplace is not None
+    ):
+        try:
+            equalize_rgb_medians_inplace(stacked)
+            _emit(
+                f"[GRID] Tile {tile.tile_id}: RGB equalization applied post-stack",
+                lvl="DEBUG",
+                callback=progress_callback,
+            )
+        except Exception:
+            _emit(
+                f"[GRID] Tile {tile.tile_id}: RGB equalization failed, proceeding without it",
+                lvl="WARN",
+                callback=progress_callback,
+            )
+
     tiles_dir = output_dir / "tiles"
     try:
         tiles_dir.mkdir(parents=True, exist_ok=True)
@@ -2554,6 +2579,92 @@ def assemble_tiles(
             callback=progress_callback,
         )
         return None
+
+    def _tile_has_signal(info: TilePhotometryInfo) -> bool:
+        data = np.asarray(info.data, dtype=np.float32)
+        mask = np.asarray(info.mask, dtype=bool)
+        if data.size == 0 or mask.size == 0:
+            return False
+        if mask.ndim == 2 and data.ndim == 3:
+            mask = mask[..., np.newaxis]
+        valid = np.isfinite(data) & (mask if mask.shape == data.shape else compute_valid_mask(data))
+        if not np.any(valid):
+            return False
+        vals = data[valid]
+        return vals.size > 0 and float(np.nanmax(vals)) > float(np.nanmin(vals))
+
+    def _overlap_slices(bbox_a: tuple[int, int, int, int], bbox_b: tuple[int, int, int, int]):
+        x0 = max(bbox_a[0], bbox_b[0])
+        x1 = min(bbox_a[1], bbox_b[1])
+        y0 = max(bbox_a[2], bbox_b[2])
+        y1 = min(bbox_a[3], bbox_b[3])
+        if x0 >= x1 or y0 >= y1:
+            return None
+        slice_a = (slice(y0 - bbox_a[2], y1 - bbox_a[2]), slice(x0 - bbox_a[0], x1 - bbox_a[0]))
+        slice_b = (slice(y0 - bbox_b[2], y1 - bbox_b[2]), slice(x0 - bbox_b[0], x1 - bbox_b[0]))
+        return slice_a, slice_b
+
+    if compute_tile_photometric_scaling and apply_tile_photometric_scaling:
+        reference_info = next((info for info in tile_infos if _tile_has_signal(info)), None)
+        if reference_info is None:
+            _emit(
+                "Photometry: no suitable reference tile found; inter-tile scaling skipped",
+                lvl="WARN",
+                callback=progress_callback,
+            )
+        else:
+            _emit(
+                f"Photometry: reference tile selected id={reference_info.tile_id}",
+                callback=progress_callback,
+            )
+            for info in tile_infos:
+                if info is reference_info:
+                    continue
+                overlap = _overlap_slices(reference_info.bbox, info.bbox)
+                if overlap is None:
+                    _emit(
+                        f"Photometry: tile {info.tile_id} has no overlap with reference; scaling skipped",
+                        lvl="WARN",
+                        callback=progress_callback,
+                    )
+                    continue
+                slice_ref, slice_tgt = overlap
+                ref_patch = reference_info.data[slice_ref]
+                tgt_patch = info.data[slice_tgt]
+                mask_ref = compute_valid_mask(ref_patch)
+                mask_tgt = compute_valid_mask(tgt_patch)
+                common_mask = mask_ref & mask_tgt
+                if not np.any(common_mask):
+                    _emit(
+                        f"Photometry: tile {info.tile_id} overlap with reference lacks valid pixels; scaling skipped",
+                        lvl="WARN",
+                        callback=progress_callback,
+                    )
+                    continue
+                try:
+                    gains, offsets = compute_tile_photometric_scaling(
+                        ref_patch, tgt_patch, mask=common_mask
+                    )
+                    info.data = apply_tile_photometric_scaling(info.data, gains, offsets)
+                    info.mask = compute_valid_mask(info.data) & info.mask
+                    _emit(
+                        f"Photometry: tile {info.tile_id} scaled vs ref {reference_info.tile_id} "
+                        f"gains={gains.tolist()} offsets={offsets.tolist()}",
+                        lvl="DEBUG",
+                        callback=progress_callback,
+                    )
+                except Exception as exc:
+                    _emit(
+                        f"Photometry: scaling tile {info.tile_id} vs ref failed ({exc}); neutral applied",
+                        lvl="WARN",
+                        callback=progress_callback,
+                    )
+    else:
+        _emit(
+            "Photometry: helper functions unavailable; inter-tile scaling skipped",
+            lvl="WARN",
+            callback=progress_callback,
+        )
 
     channels = target_channels or 1
     mosaic_shape = (grid.global_shape_hw[0], grid.global_shape_hw[1], channels)

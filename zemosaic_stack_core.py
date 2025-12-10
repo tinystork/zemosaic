@@ -19,8 +19,11 @@
 ╚═══════════════════════════════════════════════════════════════════════════════════╝
 """
 
-import numpy as np
+import logging
 import importlib.util
+import math
+
+import numpy as np
 
 GPU_AVAILABLE = importlib.util.find_spec("cupy") is not None
 if GPU_AVAILABLE:
@@ -33,6 +36,9 @@ try:
 except Exception:
     _reject_outliers_kappa_sigma = None
 
+
+logger = logging.getLogger("ZeMosaicWorker").getChild("stack_core")
+
 def get_backend_module(backend: str):
     """Return the array module for the given backend ('cpu' or 'gpu')."""
     if backend == 'gpu':
@@ -43,6 +49,157 @@ def get_backend_module(backend: str):
         return np
     else:
         raise ValueError(f"Unsupported backend: {backend}")
+
+
+def _ensure_hwc_tile(tile: np.ndarray) -> np.ndarray:
+    """Return ``tile`` as float32 ``H x W x C``.
+
+    Accepts ``H x W`` or ``H x W x C`` (channels last) and best-effort converts
+    channels-first inputs (``C x H x W``) when ``C`` is small compared to the
+    spatial dimensions. Extra singleton dimensions are squeezed so downstream
+    code can uniformly operate on ``HWC`` arrays.
+    """
+
+    arr = np.asarray(tile, dtype=np.float32)
+    if arr.ndim == 2:
+        return arr[..., np.newaxis]
+    if arr.ndim != 3:
+        raise ValueError(f"Expected 2D or 3D tile, got shape={arr.shape}")
+    if arr.shape[0] <= 4 and arr.shape[0] < arr.shape[1] and arr.shape[0] < arr.shape[2]:
+        arr = np.moveaxis(arr, 0, -1)
+    return np.squeeze(arr, axis=0) if arr.shape[0] == 1 else arr
+
+
+def _channel_mask(mask: np.ndarray | None, shape_hw: tuple[int, int], channel: int, channels: int) -> np.ndarray | None:
+    if mask is None:
+        return None
+    mask_arr = np.asarray(mask, dtype=bool)
+    if mask_arr.shape[:2] != shape_hw:
+        return None
+    if mask_arr.ndim == 2:
+        return mask_arr
+    if mask_arr.ndim == 3:
+        if mask_arr.shape[-1] == channels:
+            return mask_arr[..., channel]
+        if mask_arr.shape[-1] == 1:
+            return mask_arr[..., 0]
+    return None
+
+
+def _log_tile_channel_stats(label: str, tile: np.ndarray, *, mask: np.ndarray | None = None) -> None:
+    try:
+        arr = _ensure_hwc_tile(tile)
+    except Exception:
+        return
+    channels = arr.shape[-1]
+    for c in range(channels):
+        mask_c = _channel_mask(mask, arr.shape[:2], c, channels)
+        valid = np.isfinite(arr[..., c]) if mask_c is None else (np.isfinite(arr[..., c]) & mask_c)
+        if not np.any(valid):
+            logger.debug("%s channel %s stats: no valid pixels", label, c)
+            continue
+        vals = arr[..., c][valid]
+        mn = float(np.nanmin(vals)) if vals.size else float("nan")
+        med = float(np.nanmedian(vals)) if vals.size else float("nan")
+        mx = float(np.nanmax(vals)) if vals.size else float("nan")
+        logger.debug("%s channel %s stats: min=%.6f median=%.6f max=%.6f", label, c, mn, med, mx)
+
+
+def compute_tile_photometric_scaling(
+    reference_tile: np.ndarray,
+    target_tile: np.ndarray,
+    *,
+    mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute per-channel gain/offset to align ``target_tile`` to ``reference_tile``.
+
+    Both tiles are interpreted as ``H x W x C`` and converted to ``float32``.
+    If no valid pixels are found for a channel, ``gain=1`` and ``offset=0`` are
+    returned for that channel.
+    """
+
+    ref = _ensure_hwc_tile(reference_tile)
+    tgt = _ensure_hwc_tile(target_tile)
+    if ref.shape != tgt.shape:
+        raise ValueError(f"Reference and target tiles must share the same shape; got {ref.shape} vs {tgt.shape}")
+
+    channels = ref.shape[-1]
+    gains = np.ones((channels,), dtype=np.float32)
+    offsets = np.zeros((channels,), dtype=np.float32)
+
+    _log_tile_channel_stats("[GRIDPHO] reference (pre)", ref, mask=mask)
+    _log_tile_channel_stats("[GRIDPHO] target (pre)", tgt, mask=mask)
+
+    for c in range(channels):
+        mask_c = _channel_mask(mask, ref.shape[:2], c, channels)
+        valid = np.isfinite(ref[..., c]) & np.isfinite(tgt[..., c])
+        if mask_c is not None:
+            valid &= mask_c
+        if not np.any(valid):
+            logger.debug("[GRIDPHO] channel %s: no valid pixels; scaling disabled (gain=1 offset=0)", c)
+            continue
+
+        ref_vals = ref[..., c][valid]
+        tgt_vals = tgt[..., c][valid]
+        ref_median = float(np.nanmedian(ref_vals)) if ref_vals.size else float("nan")
+        tgt_median = float(np.nanmedian(tgt_vals)) if tgt_vals.size else float("nan")
+
+        if not math.isfinite(ref_median) or not math.isfinite(tgt_median) or tgt_median == 0:
+            logger.debug(
+                "[GRIDPHO] channel %s: invalid medians (ref=%s target=%s); neutral scaling applied",
+                c,
+                ref_median,
+                tgt_median,
+            )
+            continue
+
+        gain = ref_median / tgt_median
+        offset = ref_median - (gain * tgt_median)
+
+        gain = 1.0 if not math.isfinite(gain) else float(gain)
+        offset = 0.0 if not math.isfinite(offset) else float(offset)
+        gains[c] = np.float32(gain)
+        offsets[c] = np.float32(offset)
+        logger.debug(
+            "[GRIDPHO] channel %s scaling computed: gain=%.6f offset=%.6f (ref_med=%.6f tgt_med=%.6f)",
+            c,
+            gain,
+            offset,
+            ref_median,
+            tgt_median,
+        )
+
+    gains = np.nan_to_num(gains, nan=1.0, posinf=1.0, neginf=1.0).astype(np.float32, copy=False)
+    offsets = np.nan_to_num(offsets, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+    return gains, offsets
+
+
+def apply_tile_photometric_scaling(
+    tile: np.ndarray, gains: np.ndarray, offsets: np.ndarray
+) -> np.ndarray:
+    """Apply per-channel gain/offset to ``tile`` and return a new ``float32`` array."""
+
+    arr = _ensure_hwc_tile(tile)
+    channels = arr.shape[-1]
+    gains = np.asarray(gains, dtype=np.float32).reshape((channels,))
+    offsets = np.asarray(offsets, dtype=np.float32).reshape((channels,))
+
+    _log_tile_channel_stats("[GRIDPHO] target (pre-apply)", arr)
+
+    scaled = np.array(arr, dtype=np.float32, copy=True)
+    valid = np.isfinite(arr)
+    if scaled.ndim == 2:
+        scaled = scaled[..., np.newaxis]
+        valid = valid[..., np.newaxis]
+    for c in range(channels):
+        channel_mask = valid[..., c]
+        if not np.any(channel_mask):
+            logger.debug("[GRIDPHO] channel %s: no valid pixels to scale; left untouched", c)
+            continue
+        scaled[..., c][channel_mask] = (scaled[..., c][channel_mask] * gains[c]) + offsets[c]
+
+    _log_tile_channel_stats("[GRIDPHO] target (post-apply)", scaled)
+    return scaled.astype(np.float32, copy=False)
 
 def stack_core(
     images,
