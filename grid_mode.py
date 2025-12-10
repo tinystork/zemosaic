@@ -2633,8 +2633,41 @@ def assemble_tiles(
                 tgt_patch = info.data[slice_tgt]
                 mask_ref = compute_valid_mask(ref_patch)
                 mask_tgt = compute_valid_mask(tgt_patch)
-                common_mask = mask_ref & mask_tgt
-                if not np.any(common_mask):
+
+                def _overlap_mask_from_coverage(mask_a: np.ndarray, mask_b: np.ndarray) -> np.ndarray:
+                    mask_a = np.asarray(mask_a, dtype=bool)
+                    mask_b = np.asarray(mask_b, dtype=bool)
+                    if mask_a.shape != mask_b.shape:
+                        return np.zeros(mask_a.shape[:2], dtype=bool)
+                    m_a = mask_a if mask_a.ndim == 2 else np.any(mask_a, axis=-1)
+                    m_b = mask_b if mask_b.ndim == 2 else np.any(mask_b, axis=-1)
+                    overlap_mask = m_a & m_b
+                    if not np.any(overlap_mask):
+                        return overlap_mask
+                    if _NDIMAGE_AVAILABLE and ndimage is not None:
+                        try:
+                            overlap_mask = ndimage.binary_erosion(overlap_mask, iterations=1, border_value=0)
+                        except Exception:
+                            pass
+                    return overlap_mask
+
+                coverage_mask = _overlap_mask_from_coverage(mask_ref, mask_tgt)
+                if not np.any(coverage_mask):
+                    _emit(
+                        f"[GRID] Coverage not available for tile {info.tile_id}, falling back to finite-pixel mask.",
+                        lvl="INFO",
+                        callback=progress_callback,
+                    )
+                    common_mask = mask_ref & mask_tgt
+                else:
+                    common_mask = coverage_mask & mask_ref & mask_tgt
+                n_common = int(np.sum(common_mask))
+                _emit(
+                    f"Photometry: tile {info.tile_id} overlap with ref {reference_info.tile_id} common pixels={n_common}",
+                    lvl="DEBUG",
+                    callback=progress_callback,
+                )
+                if n_common <= 0:
                     _emit(
                         f"Photometry: tile {info.tile_id} overlap with reference lacks valid pixels; scaling skipped",
                         lvl="WARN",
