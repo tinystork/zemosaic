@@ -1,4 +1,3 @@
-
 ## `agent.md` – Grid Mode Photometric Fix & Perf Pass (Option A)
 
 ### 1. Mission
@@ -57,13 +56,13 @@ La mission **n’est PAS** de tout réécrire, mais de :
 
 Travail **principal** dans :
 
-* `grid_mode.py` 
+* `grid_mode.py`
 
 Lecture / réutilisation de logique dans :
 
-* `zemosaic_worker.py` (Phase 5, post-stack pipeline, deux-pass, renorm) 
-* `zemosaic_stack_core.py` (backend stacker CPU/GPU, logique commune) 
-* `zemosaic_utils.py` (helpers utilisés partout, notamment WCS / coverage / temp dir) 
+* `zemosaic_worker.py` (Phase 5, post-stack pipeline, deux-pass, renorm)
+* `zemosaic_stack_core.py` (backend stacker CPU/GPU, logique commune)
+* `zemosaic_utils.py` (helpers utilisés partout, notamment WCS / coverage / temp dir)
 * `zemosaic_align_stack.py` (rejet + `equalize_rgb_medians_inplace`) – déjà importé dans `grid_mode.py`.
 
 **Important :**
@@ -92,10 +91,11 @@ Lecture / réutilisation de logique dans :
 
 2. **Égalisation RGB systématique pour les tuiles couleur :**
 
-   * Lorsque les tuiles sont RGB, **appliquer `equalize_rgb_medians_inplace`** (déjà importée depuis `zemosaic_align_stack`) **à un moment cohérent** :
+   * Lorsque les tuiles sont RGB, **appliquer `equalize_rgb_medians_inplace`** (déjà importée depuis `zemosaic_align_stack`) **à un moment cohérent avec la pipeline classique** :
 
-     * soit au niveau des frames individuelles AVANT stacking local,
-     * soit sur les master-tiles AVANT assembly global.
+     * Dans la pipeline classique, `equalize_rgb_medians_inplace` est appliquée par substack après stacking (post-stack), pas par frame.
+     * Pour Grid Mode, appliquer la même logique : exécuter `equalize_rgb_medians_inplace` une fois par tuile, juste après le stacking local de la tuile et **avant** la normalisation inter-tuiles, plutôt que sur chaque frame.
+
    * Objectif : supprimer les dominantes canal-par-canal qui génèrent les bandes vert/magenta.
 
 3. **Ordre des opérations corrigé :**
@@ -104,16 +104,18 @@ Lecture / réutilisation de logique dans :
 
    ```text
    load → debayer → stack local tile → reprojection → feather → assemble
-   ```
+````
 
-   En faveur d’un ordre plus sain :
+En faveur d’un ordre plus sain :
 
-   ```text
-   load → debayer → normalisation per-frame / per-tile → stack local tile
-        → normalisation inter-tile (gain/offset global)
-        → reprojection sur canevas global
-        → feather + assembly
-   ```
+```text
+load → debayer → normalisation per-frame / per-tile (si besoin)
+     → stack local tile
+     → égalisation RGB (si C == 3)
+     → normalisation inter-tile (gain/offset global)
+     → reprojection sur canevas global
+     → feather + assembly
+```
 
 4. **Perfs acceptables sur gros datasets :**
 
@@ -137,7 +139,7 @@ Lecture / réutilisation de logique dans :
 
      * `_apply_phase5_post_stack_pipeline(...)`,
      * `_apply_two_pass_coverage_renorm_if_requested(...)`,
-     * ainsi que l’appel à `run_second_pass_coverage_renorm(...)` si accessible. 
+     * ainsi que l’appel à `run_second_pass_coverage_renorm(...)` si accessible.
 
    * Comprendre :
 
@@ -145,7 +147,7 @@ Lecture / réutilisation de logique dans :
      * à quel moment ils sont appliqués (avant / après reprojection),
      * comment la coverage est utilisée pour stabiliser la photométrie.
 
-2. **Ne pas modifier ces fonctions dans ce ticket**, mais t’en servir comme **référence** pour définir une version “light” adaptée au Grid Mode.
+2. **Ne pas modifier ces fonctions dans ce ticket**, mais s’en servir comme **référence** pour définir une version “light” adaptée au Grid Mode.
 
 ---
 
@@ -172,7 +174,7 @@ def compute_tile_photometric_scaling(
     dans les zones définies par mask (ou sur toute l'image si mask est None).
 
     Retourne:
-      gains:  shape (C,) ou (1,)
+      gains:   shape (C,) ou (1,)
       offsets: shape (C,) ou (1,)
     """
 ```
@@ -180,12 +182,26 @@ def compute_tile_photometric_scaling(
 3. Implémentation :
 
    * Travailler en **float32**.
+
+   * Ramener les tuiles au format HWC ; si mono-canal, utiliser une forme `(H, W, 1)`.
+
    * Pour chaque canal :
 
-     * calculer un **fond de ciel** robuste (par ex. médiane) pour ref et target,
-     * calculer un **gain** basé sur les médianes ou une régression simple sur les pixels de fond,
-     * ignorer les NaN et les valeurs non finies.
+     * construire un masque de pixels valides (`np.isfinite` + éventuelle `mask` passée en paramètre),
+     * si **aucun** pixel valide pour ce canal dans `reference_tile` **ou** `target_tile` :
+
+       * ne pas calculer de scaling réel,
+       * fixer `gain = 1.0`, `offset = 0.0` pour ce canal,
+       * logguer un warning `DEBUG`/`INFO` (par ex. : “no valid pixels, scaling disabled for tile X, channel Y”),
+     * sinon :
+
+       * calculer un **fond de ciel** robuste (par ex. médiane) pour ref et target,
+       * calculer un **gain** basé sur les médianes ou une régression simple,
+       * ignorer les NaN et les valeurs non finies.
+
    * Retourner des gains / offsets scalaires (pas besoin de carte 2D à ce stade).
+
+   * Garantir que les tableaux `gains` et `offsets` ne contiennent ni `NaN` ni `inf` (remplacer par 1/0 en fallback si nécessaire).
 
 4. Créer un second helper :
 
@@ -195,10 +211,19 @@ def apply_tile_photometric_scaling(
     gains: np.ndarray,
     offsets: np.ndarray,
 ) -> np.ndarray:
-    """Applique gain/offset par canal, retourne un nouveau tile float32."""
+    """
+    Applique gain/offset par canal, retourne un nouveau tile float32.
+    Ne modifie pas le tableau d'entrée in-place.
+    """
 ```
 
-5. Ajouter des logs DEBUG optionnels (min/max/median après correction).
+5. Ajouter des logs DEBUG optionnels :
+
+   * avant scaling : min/max/median par canal,
+   * gains/offsets calculés,
+   * après scaling : min/max/median par canal.
+
+   Ces logs servent à vérifier que le scaling est **réellement appliqué** et reste sain.
 
 ---
 
@@ -211,15 +236,20 @@ def apply_tile_photometric_scaling(
 
 2. Adapter le flux :
 
-   * choisir une tuile de référence stable :
+   * Choix de la tuile de référence :
 
-     * par exemple la première tuile bien couverte,
-     * ou une tuile centrale,
-     * enregistrer cette référence dans une variable claire (`reference_tile`).
+     * ne pas prendre “bêtement” la toute première tuile,
+     * parcourir les tiles stackées et sélectionner la **première tuile “saine”** :
+
+       * coverage suffisante (pas entièrement NaN),
+       * min/max finies,
+       * dynamique non nulle (min < max),
+     * enregistrer cette tuile dans une variable claire, par ex. `reference_tile_data` / `reference_tile_id`.
 
    * Pour chaque tuile “target” :
 
-     * avant de la reprojeter, calculer `(gains, offsets)` par rapport à `reference_tile`
+     * vérifier qu’elle contient des pixels valides ; si entièrement NaN → la laisser telle quelle dans l’assemblage, mais **ne pas** calculer de scaling (gain=1, offset=0 + log),
+     * avant de la reprojeter, calculer `(gains, offsets)` par rapport à `reference_tile_data`
        en utilisant `compute_tile_photometric_scaling(...)`,
      * appliquer `apply_tile_photometric_scaling(...)` sur la tuile (`float32`),
      * seulement ensuite procéder à la reprojection sur le canevas global.
@@ -230,7 +260,10 @@ def apply_tile_photometric_scaling(
    * Respecter la forme HWC :
 
      * si la tuile est mono-canal, la représenter temporairement en `(H, W, 1)` pour les helpers.
-   * Gérer proprement les NaN : tout traitement doit les ignorer, pas les propager en `inf`.
+   * Gérer proprement les NaN :
+
+     * les helpers de scaling doivent ignorer les pixels non valides,
+     * les éventuels NaN restants dans la tuile ne doivent pas faire diverger les min/max / médianes ni produire des gains/offsets `inf`/`nan`.
 
 ---
 
@@ -238,13 +271,14 @@ def apply_tile_photometric_scaling(
 
 1. Toujours dans `grid_mode.py` :
 
-   * repérer le moment où une pile d’images RGB d’une tuile est disponible **avant stacking**.
-   * si possible, appeler `equalize_rgb_medians_inplace(...)` sur ces images (ou au moins sur les tiles résultantes) pour aligner les canaux.
+   * Repérer le moment où la tuile RGB stackée est disponible **juste après le stacking local**.
+   * Appeler `equalize_rgb_medians_inplace(...)` sur la tuile stackée, **avant** la normalisation inter-tile (`compute_tile_photometric_scaling` / `apply_tile_photometric_scaling`), exactement comme dans la pipeline classique.
 
 2. Conditions :
 
    * Ne pas casser la prise en charge mono-canal : ne rien faire si `C == 1`.
    * S’assurer que cette égalisation est **cohérente** avec la logique de la pipeline classique (même type de données, même ordre approx.).
+   * Ajouter un log indiquant quand l’égalisation RGB est appliquée (et sur combien de frames / canaux).
 
 ---
 
@@ -276,6 +310,12 @@ Dans ce ticket, ne viser que les gains faciles et non risqués :
   * la mosaïque **n’a plus de damier visible**,
   * le fond est raisonnablement uniforme (à stretch égal),
   * les dominantes de couleur par tuile sont fortement réduites.
+
+* Les logs `[GRID]` montrent :
+
+  * des min/max/median cohérents avant/après scaling,
+  * des `gains/offsets` finis (pas de `nan`/`inf`),
+  * des messages clairs quand le scaling est désactivé pour une tuile (par ex. “no valid pixels”).
 
 * Le temps de run Grid Mode :
 
