@@ -1657,8 +1657,36 @@ def _stack_weighted_patches(
         reference_median,
         method=config.stack_norm_method,
     )
-    data_stack = np.stack(normalized, axis=0).astype(np.float32)
     weight_stack = np.stack(weights, axis=0).astype(np.float32)
+
+    if stack_core:
+        stack_config = {
+            "normalize_method": "none",  # already normalized above
+            "rejection_algorithm": config.stack_reject_algo,
+            "final_combine_method": config.stack_final_combine,
+            "sigma_clip_low": config.stack_kappa_low,
+            "sigma_clip_high": config.stack_kappa_high,
+        }
+        try:
+            stacked, rejected_pct, weight_sum = stack_core(
+                images=normalized,
+                weights=weight_stack,
+                stack_config=stack_config,
+                backend="cpu",
+            )
+            outputs = [np.asarray(stacked, dtype=np.float32)]
+            if return_weight_sum:
+                outputs.append(np.asarray(weight_sum, dtype=np.float32))
+            if return_ref_median:
+                outputs.append(ref_median_used)
+            return outputs[0] if len(outputs) == 1 else tuple(outputs)
+        except Exception as exc:  # pragma: no cover - defensive fallback
+            _emit(
+                f"Tile stacking: stack_core CPU path failed ({exc}); falling back to legacy combine",
+                lvl="WARN",
+            )
+
+    data_stack = np.stack(normalized, axis=0).astype(np.float32)
     data_stack = np.where(weight_stack > 0, data_stack, np.nan)
 
     rejection = config.stack_reject_algo.lower().strip()
@@ -1729,6 +1757,7 @@ def _stack_weighted_patches_gpu(
         # Normalize patches using CuPy
         normalized, ref_median_used = _normalize_patches_gpu(cp_patches, reference_median, method=config.stack_norm_method)
         if stack_core:
+            weight_stack = cp.stack(cp_weights, axis=0)
             stack_config = {
                 'normalize_method': 'none',
                 'rejection_algorithm': config.stack_reject_algo,
@@ -1738,7 +1767,7 @@ def _stack_weighted_patches_gpu(
             }
             stacked, rejected_pct, weight_sum = stack_core(
                 images=normalized,
-                weights=cp_weights,
+                weights=weight_stack,
                 stack_config=stack_config,
                 backend='gpu',
             )
@@ -1970,6 +1999,10 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
             if running_weight.ndim == 3
             else (running_weight > 0)
         )
+        tile_valid_mask = compute_valid_mask(stacked)
+        if tile_valid_mask.ndim == 3:
+            tile_valid_mask = np.any(tile_valid_mask, axis=-1)
+        coverage_mask_bool = coverage_mask_bool & tile_valid_mask
         coverage_mask_alpha = np.asarray(coverage_mask_bool, dtype=np.uint8) * 255
         _emit(
             f"[GRIDCOV] tile_id={tile.tile_id} coverage_mask pixels={int(np.sum(coverage_mask_bool))}",
@@ -2631,6 +2664,23 @@ def assemble_tiles(
         mask = compute_valid_mask(data)
         mask = _combine_mask_with_coverage(mask, coverage_mask)
 
+        bbox_w = t.bbox[1] - t.bbox[0]
+        bbox_h = t.bbox[3] - t.bbox[2]
+        if bbox_w <= 0 or bbox_h <= 0:
+            _emit(
+                f"Assembly: tile {t.tile_id} has invalid bbox {t.bbox}; skipping",
+                lvl="ERROR",
+                callback=progress_callback,
+            )
+            continue
+        if data.shape[0] != bbox_h or data.shape[1] != bbox_w:
+            _emit(
+                f"Assembly: tile {t.tile_id} data shape {data.shape[:2]} mismatches bbox size {(bbox_h, bbox_w)}; skipping",
+                lvl="ERROR",
+                callback=progress_callback,
+            )
+            continue
+
         if c == 3 and equalize_rgb_medians_inplace is not None:
             try:
                 _log_tile_medians(
@@ -2868,6 +2918,18 @@ def assemble_tiles(
                     gains, offsets = compute_tile_photometric_scaling(
                         ref_patch, tgt_patch, mask=common_mask
                     )
+                    gains = np.asarray(gains, dtype=np.float32)
+                    offsets = np.asarray(offsets, dtype=np.float32)
+                    finite_gains = np.isfinite(gains)
+                    finite_offsets = np.isfinite(offsets)
+                    if not (np.all(finite_gains) and np.all(finite_offsets)):
+                        _emit(
+                            f"Photometry: non-finite gains/offsets for tile {info.tile_id}; applying neutral scale",
+                            lvl="WARN",
+                            callback=progress_callback,
+                        )
+                        gains = np.ones_like(gains, dtype=np.float32)
+                        offsets = np.zeros_like(offsets, dtype=np.float32)
                     info.data = apply_tile_photometric_scaling(info.data, gains, offsets)
                     info.mask = compute_valid_mask(info.data) & info.mask
                     _log_tile_medians(
