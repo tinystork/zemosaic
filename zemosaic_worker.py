@@ -874,6 +874,148 @@ def _apply_autocrop_to_global_plan(
     plan["autocrop_applied"] = True
 
 
+def _finalize_grid_mode_outputs(
+    grid_result,
+    *,
+    enable_autocrop: bool,
+    autocrop_margin_px: int,
+    legacy_rgb_cube: bool,
+    logger: logging.Logger | None = None,
+) -> bool:
+    """Finalize Grid mode outputs (optional autocrop + header updates).
+
+    Returns True if the grid outputs were successfully validated and saved.
+    """
+
+    log = logger or logging.getLogger("ZeMosaicWorker").getChild("grid_finalize")
+    mosaic_path = getattr(grid_result, "mosaic_path", None)
+    if not mosaic_path:
+        log.warning("[GRID] No mosaic_path provided by grid mode result")
+        return False
+    mosaic_path = Path(mosaic_path)
+    if not mosaic_path.is_file():
+        log.warning("[GRID] Mosaic file missing at %s", mosaic_path)
+        return False
+
+    coverage_path = getattr(grid_result, "coverage_path", None)
+    mosaic_header = None
+    weight_data = None
+    try:
+        with fits.open(mosaic_path, memmap=False, do_not_scale_image_data=True) as hdul:
+            mosaic_data = np.asarray(hdul[0].data, dtype=np.float32)
+            mosaic_header = hdul[0].header.copy()
+            if "WEIGHT" in hdul:
+                weight_data = np.asarray(hdul["WEIGHT"].data, dtype=np.float32)
+    except Exception:
+        log.warning("[GRID] Failed to read grid mosaic for post-processing", exc_info=True)
+        return False
+
+    coverage_data = None
+    if weight_data is not None:
+        coverage_data = weight_data
+    if coverage_data is None and coverage_path:
+        try:
+            cov_path_obj = Path(coverage_path)
+            if cov_path_obj.is_file():
+                with fits.open(cov_path_obj, memmap=False, do_not_scale_image_data=True) as cov_hdul:
+                    coverage_data = np.asarray(cov_hdul[0].data, dtype=np.float32)
+        except Exception:
+            log.warning("[GRID] Failed to read grid coverage map; falling back to finite mask", exc_info=True)
+            coverage_data = None
+    if coverage_data is None:
+        if mosaic_data.ndim >= 3:
+            coverage_data = np.any(np.isfinite(mosaic_data), axis=-1).astype(np.float32)
+        else:
+            coverage_data = np.isfinite(mosaic_data).astype(np.float32)
+
+    global_wcs = getattr(grid_result, "global_wcs", None)
+    if global_wcs is None and ASTROPY_AVAILABLE and WCS and mosaic_header is not None:
+        try:
+            global_wcs = WCS(mosaic_header)
+        except Exception:
+            global_wcs = None
+
+    plan_header = mosaic_header.copy() if mosaic_header is not None else None
+    global_plan = {
+        "wcs": global_wcs,
+        "width": int(mosaic_data.shape[1]) if mosaic_data is not None else None,
+        "height": int(mosaic_data.shape[0]) if mosaic_data is not None else None,
+        "descriptor": {"header": plan_header} if plan_header is not None else {},
+    }
+
+    cropped_mosaic, cropped_cov, _, crop_meta = _auto_crop_global_mosaic_if_requested(
+        mosaic_data,
+        coverage_data,
+        None,
+        enable_autocrop=bool(enable_autocrop),
+        margin_px=max(0, int(autocrop_margin_px)),
+        pcb=None,
+    )
+    if crop_meta:
+        _apply_autocrop_to_global_plan(global_plan, crop_meta)
+        mosaic_data = cropped_mosaic
+        coverage_data = cropped_cov
+        if weight_data is not None:
+            weight_data = coverage_data
+        log.info(
+            "[GRID] Autocrop applied to grid mosaic (x0=%s, y0=%s, w=%s, h=%s)",
+            crop_meta.get("x0"),
+            crop_meta.get("y0"),
+            crop_meta.get("width"),
+            crop_meta.get("height"),
+        )
+
+    header_to_use = None
+    descriptor = global_plan.get("descriptor") if isinstance(global_plan.get("descriptor"), dict) else None
+    if descriptor:
+        header_candidate = descriptor.get("header")
+        if header_candidate is not None:
+            header_to_use = header_candidate
+    if header_to_use is None:
+        header_to_use = mosaic_header
+
+    try:
+        axis_order = "HWC" if mosaic_data.ndim == 3 else None
+        save_fits_image(
+            image_data=mosaic_data,
+            output_path=str(mosaic_path),
+            header=header_to_use,
+            overwrite=True,
+            save_as_float=True,
+            legacy_rgb_cube=legacy_rgb_cube,
+            axis_order=axis_order,
+        )
+        if weight_data is not None:
+            weight_hdu = fits.ImageHDU(np.asarray(weight_data, dtype=np.float32), name="WEIGHT")
+            with fits.open(mosaic_path, mode="append", memmap=False, do_not_scale_image_data=True) as hdul:
+                hdul.append(weight_hdu)
+    except Exception:
+        log.warning("[GRID] Failed to write finalized grid mosaic", exc_info=True)
+        return False
+
+    if coverage_path and coverage_data is not None:
+        cov_header = None
+        try:
+            if global_plan.get("wcs") is not None and hasattr(global_plan.get("wcs"), "to_header"):
+                cov_header = global_plan.get("wcs").to_header(relax=True)
+        except Exception:
+            cov_header = None
+        try:
+            save_fits_image(
+                image_data=coverage_data,
+                output_path=str(coverage_path),
+                header=cov_header,
+                overwrite=True,
+                save_as_float=True,
+                axis_order="HWC" if coverage_data.ndim == 3 else None,
+            )
+        except Exception:
+            log.warning("[GRID] Failed to update grid coverage map after autocrop", exc_info=True)
+
+    log.info("[GRID] Grid mosaic finalized at %s", mosaic_path)
+    return True
+
+
 def _prepare_tiles_for_two_pass(
     collected_tiles: list[tuple] | None,
     fallback_loader: Callable[[], tuple] | None,
@@ -13331,7 +13473,16 @@ def run_hierarchical_mosaic(
     poststack_equalize_rgb_config = bool(grid_rgb_equalize_flag)
     setattr(zconfig, "poststack_equalize_rgb", bool(grid_rgb_equalize_flag))
 
+    global_wcs_autocrop_enabled_config = bool(worker_config_cache.get("global_wcs_autocrop_enabled"))
+    try:
+        global_wcs_autocrop_margin_px_config = int(worker_config_cache.get("global_wcs_autocrop_margin_px", 64) or 0)
+    except Exception:
+        global_wcs_autocrop_margin_px_config = 0
+    if global_wcs_autocrop_margin_px_config < 0:
+        global_wcs_autocrop_margin_px_config = 0
+
     if detect_grid_mode(input_folder):
+        grid_result = None
         if grid_mode and hasattr(grid_mode, "run_grid_mode"):
             try:
                 logger.info(
@@ -13344,7 +13495,7 @@ def run_hierarchical_mosaic(
                     stack_reject_algo,
                     stack_final_combine,
                 )
-                grid_mode.run_grid_mode(  # type: ignore[attr-defined]
+                grid_result = grid_mode.run_grid_mode(  # type: ignore[attr-defined]
                     input_folder=input_folder,
                     output_folder=output_folder,
                     progress_callback=progress_callback,
@@ -13362,13 +13513,25 @@ def run_hierarchical_mosaic(
                     legacy_rgb_cube=legacy_rgb_cube_config,
                     grid_rgb_equalize=grid_rgb_equalize_flag,
                 )
-                return
-            except Exception:
-                logger.error("[GRID] Grid/Survey mode failed; aborting without classic fallback", exc_info=True)
-                raise
-        error_msg = "[GRID] grid_mode module unavailable; aborting (no classic fallback)."
-        logger.error(error_msg)
-        raise RuntimeError(error_msg)
+                finalized = _finalize_grid_mode_outputs(
+                    grid_result,
+                    enable_autocrop=bool(global_wcs_autocrop_enabled_config),
+                    autocrop_margin_px=global_wcs_autocrop_margin_px_config,
+                    legacy_rgb_cube=bool(legacy_rgb_cube_config),
+                    logger=logger,
+                )
+                if finalized:
+                    logger.info("[GRID] Grid pipeline completed; classic pipeline skipped")
+                    return
+                logger.warning(
+                    "[GRID] Fallback to classic pipeline: reason=grid output missing or post-processing failed"
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[GRID] Fallback to classic pipeline: reason=%s", exc, exc_info=True
+                )
+        else:
+            logger.warning("[GRID] Fallback to classic pipeline: reason=grid_mode module unavailable")
 
     def pcb(msg_key, prog=None, lvl="INFO", **kwargs):
         """Shortcut to emit log+callback events with the current progress callback."""
@@ -13430,14 +13593,6 @@ def run_hierarchical_mosaic(
     if not math.isfinite(sds_min_coverage_keep_config):
         sds_min_coverage_keep_config = 0.4
     sds_min_coverage_keep_config = max(0.0, min(1.0, sds_min_coverage_keep_config))
-
-    global_wcs_autocrop_enabled_config = bool(worker_config_cache.get("global_wcs_autocrop_enabled"))
-    try:
-        global_wcs_autocrop_margin_px_config = int(worker_config_cache.get("global_wcs_autocrop_margin_px", 64) or 0)
-    except Exception:
-        global_wcs_autocrop_margin_px_config = 0
-    if global_wcs_autocrop_margin_px_config < 0:
-        global_wcs_autocrop_margin_px_config = 0
 
     if global_wcs_plan.get("enabled"):
         logger.info(
