@@ -124,9 +124,9 @@
 
 ### 8. Tests finaux de non-régression
 
-* [ ] Tester le flux **classique** (sans `stack_plan.csv`) → résultat identique à avant la mission.
-* [ ] Tester Grid Mode en CPU-only.
-* [ ] Tester Grid Mode en GPU (si disponible).
+* [x] Tester le flux **classique** (sans `stack_plan.csv`) → résultat identique à avant la mission. (pytest `tests/test_extreme_group_cleanup.py`)
+* [ ] Tester Grid Mode en CPU-only. (échec : `tests/test_grid_mode_scalability.py::test_grid_mode_scalability_many_frames` a terminé en FAIL — chunking non détecté)
+* [ ] Tester Grid Mode en GPU (si disponible). (skippé : CuPy non disponible dans l'environnement)
 * [ ] Comparer visuellement Grid vs classique : mêmes positions d’objets, fond homogène.
 
 Quand tous les items ci-dessus sont cochés, la mission Grid Mode peut être considérée comme terminée.
