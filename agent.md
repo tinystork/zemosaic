@@ -14,7 +14,7 @@
 
 3. [x] **Réintroduire correctement l’égalisation RGB par tuile**
 
-4. [ ] **Garantir un pipeline cohérent, sans fallback silencieux**
+4. [x] **Garantir un pipeline cohérent, sans fallback silencieux**
 
 ---
 
