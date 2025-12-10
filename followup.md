@@ -1,132 +1,148 @@
-## `followup.md` – Checklist Grid Mode Geometry & Photometry
+# Mission: Fix GRID coverage/mask broadcast bug in photometric inter-tile match
 
-### 1. Géométrie & canevas global
+## High-level goal
 
-- [x] Rechercher dans `grid_mode.py` l’endroit où la WCS globale et la taille de canevas sont définies.
-- [x] Vérifier qu’il existe une structure unique (ex. `GridDefinition.global_wcs`, `GridDefinition.global_shape_hw`) utilisée partout.
-- [x] Confirmer que **toutes les allocations** de tableaux globaux (mosaïque, coverage, alpha) utilisent **exactement** `global_shape_hw`.
-- [x] Vérifier que **personne** ne recalcule la taille globale à partir des tuiles.
+The GRID pipeline currently falls back to the classic pipeline because of a `ValueError` raised during the inter-tile photometric matching step.
 
-**Test rapide :**
+The root cause is a shape mismatch between:
 
-- Lancer un run Grid sur un dataset de test.
-- Vérifier dans le log `[GRID]` que la shape globale est la même du début à la fin.
+- `coverage_mask`: 2D boolean array `(H, W)` produced from coverage maps, and
+- `mask_ref`, `mask_tgt`: 3D boolean arrays `(H, W, C)` produced from RGB tile data.
 
----
+Numpy cannot broadcast `(H, W)` with `(H, W, 3)`, so the expression
 
-### 2. BBox de tuiles & alignement
-
-- [x] Inspecter la fonction qui crée les `GridTile` et leurs `bbox`.
-- [x] S’assurer que les `bbox` sont calculées en pixels du canevas global (via WCS), pas à partir d’une simple grille row/col.
-- [x] Ajouter un log DEBUG pour chaque tuile : `tile_id`, `bbox`, `tile_shape_hw`.
-- [x] Vérifier que pour chaque tuile : `0 <= xmin < xmax <= global_width` et idem pour y.
-
-**Validation pratique :**
-
-- Utiliser un dataset où le flux classique produit une mosaïque correcte.
-- Comparer dans un viewer (DS9, Siril, etc.) la position de quelques étoiles sur la mosaïque classique vs Grid : elles doivent coïncider à ±1 pixel.
-
----
-
-### 3. Stacking par tuile
-
-- [x] Vérifier que toutes les tuiles sont empilées via `stack_core` (CPU/GPU) avec les bons paramètres.
-- [x] Confirmer que pour les images RGB, `equalize_rgb_medians_inplace` est appelé **avant** tout calcul de stats de fond/scaling.
-- [x] S’assurer que `compute_valid_mask` est utilisé pour produire une `tile_mask` cohérente.
-
-**Test :**
-
-- Activer le logging DEBUG pour le Grid Mode.
-- Vérifier que chaque tuile a des stats raisonnables (min/median/max) dans les logs, sans NaN généralisé.
-
----
-
-### 4. Normalisation photométrique inter-tile
-
-- [x] Identifier la tuile de référence utilisée pour la photométrie.
-- [x] Vérifier que :
-
-  - un `common_mask` correctement construit (intersection de masques valides) est utilisé,
-  - si l’overlap est insuffisant → log WARN et pas de scaling.
-
-- [x] Confirmer l’appel à :
-
-  ```python
-  gains, offsets = compute_tile_photometric_scaling(ref_patch, tgt_patch, mask=common_mask)
-  info.data = apply_tile_photometric_scaling(info.data, gains, offsets)
-  info.mask = compute_valid_mask(info.data) & info.mask
+```python
+common_mask = coverage_mask & mask_ref & mask_tgt
 ````
 
-* [x] Vérifier que les logs `[GRID] Photometry` montrent des gains/offsets **finis** et raisonnables.
+throws a `ValueError: operands could not be broadcast together with shapes (H,W) (H,W,3)` and the worker code catches this and triggers a fallback to the classic pipeline.
 
-**Validation pratique :**
-
-* Lancer un run Grid.
-* Inspecter la mosaïque : aucune bande verticale ou horizontale nette entre tuiles ne doit être visible (au moins au premier ordre).
+The mission is to **fix the construction of `common_mask` so that 2D coverage masks work correctly with 3D RGB masks**, and to do so in a way that is robust and consistent with the existing helper logic used elsewhere in `grid_mode.py`.
 
 ---
 
-### 5. Assemblage des tuiles en mosaïque
+## Context
 
-* [x] Ouvrir `assemble_tiles(...)` dans `grid_mode.py`.
+* Project: ZeMosaic
+* Main file to modify: `grid_mode.py`
+* Related but **not to be changed** in this mission: `zemosaic_worker.py`
 
-* [x] Vérifier que :
+You will find in `grid_mode.py`:
 
-  * la mosaïque globale est allouée avec `global_shape_hw`,
-  * pour chaque tuile, on indexe `mosaic_data[y0:y1, x0:x1]` avec la `bbox`,
-  * on cumule les contributions pondérées (poids = masque ou coverage),
-  * à la fin, on divise par les poids là où ils sont > 0.
+1. A helper function that already handles coverage vs combined masks:
 
-* [x] S’assurer qu’aucune reproject globale supplémentaire (type `reproject_interp` vers une nouvelle WCS) n’est faite à ce stade.
+   ```python
+   def _combine_mask_with_coverage(combined_mask: np.ndarray,
+                                   coverage_mask: np.ndarray | None,
+                                   ...) -> np.ndarray:
+       ...
+       if cov_mask.ndim == 2 and combined_mask.ndim == 3:
+           cov_mask = np.repeat(cov_mask[..., np.newaxis], combined_mask.shape[-1], axis=2)
+       ...
+       return combined_mask & cov_mask
+   ```
 
-**Test visuel :**
+   This shows the intended way to make a 2D coverage mask compatible with a 3D RGB mask.
 
-* Comparer la mosaïque Grid et la mosaïque classique sur le même dataset.
-* Vérifier que les bords de tuiles ne forment plus de “marches d’escalier” ou de décalages.
+2. Later, in the **grid photometric inter-tile matching loop**, there is a block similar to:
 
----
+   ```python
+   coverage_mask = None
+   if cov_ref is not None and cov_tgt is not None:
+       coverage_mask = _overlap_mask_from_coverage(cov_ref, cov_tgt)
 
-### 6. Autocrop & CRPIX/NAXIS
+   if coverage_mask is None or not np.any(coverage_mask):
+       common_mask = mask_ref & mask_tgt
+   else:
+       _emit(
+           f"[GRID] Coverage overlap for tile {info.tile_id} vs ref {reference_info.tile_id}: "
+           f"pixels={int(np.sum(coverage_mask))}",
+           lvl="DEBUG",
+           callback=progress_callback,
+       )
+       common_mask = coverage_mask & mask_ref & mask_tgt   # <-- BUG HERE
+   ```
 
-* [x] Vérifier dans `zemosaic_worker.py` que l’autocrop global se fait via `_auto_crop_global_mosaic_if_requested` puis `_apply_autocrop_to_global_plan`.
-* [x] S’assurer que `grid_mode.py` ne modifie pas lui-même `CRPIX1/2` ou `NAXIS1/2` après coup.
-* [x] Confirmer que le plan retourné au worker contient la bonne largeur/hauteur après autocrop.
+   At this point:
 
-**Test :**
+   * `coverage_mask` is typically 2D `(H, W)`.
+   * `mask_ref` and `mask_tgt` are likely 3D `(H, W, C)`.
 
-* Faire un run avec autocrop activé.
-* Vérifier que la taille de la mosaïque correspond à la coverage utile (pas de grosses bordures vides).
-
----
-
-### 7. Fallback & logs
-
-* [x] Examiner le code Grid dans `zemosaic_worker.py` :
-
-  * en cas de succès Grid → **pas** de fallback.
-  * en cas d’échec (`run_grid_mode` lève) → fallback explicite avec log clair.
-
-* [x] Ajouter si besoin un log type :
-
-  ```python
-  logger.warning("[GRID] Fallback to classic pipeline: reason=%s", reason)
-  ```
-
-* [x] S’assurer qu’aucun fallback ne se déclenche sur un dataset sain.
-
-**Validation :**
-
-* Lancer plusieurs runs Grid sur un dataset valide.
-* Vérifier dans les logs qu’il n’y a **aucune** ligne mentionnant un fallback Grid → classique.
-* Vérifier que le fichier de mosaïque Grid est bien produit (nom et chemin attendus).
+This is the **only part to fix** for this mission.
 
 ---
 
-### 8. Tests finaux de non-régression
+## Requirements
 
-* [x] Tester le flux **classique** (sans `stack_plan.csv`) → résultat identique à avant la mission. (pytest `tests/test_extreme_group_cleanup.py`)
-* [ ] Tester Grid Mode en CPU-only. (échec : `tests/test_grid_mode_scalability.py::test_grid_mode_scalability_many_frames` a terminé en FAIL — chunking non détecté)
-* [ ] Tester Grid Mode en GPU (si disponible). (skippé : CuPy non disponible dans l'environnement)
-* [ ] Comparer visuellement Grid vs classique : mêmes positions d’objets, fond homogène.
+### 1. Make coverage/mask combination RGB-safe
 
-Quand tous les items ci-dessus sont cochés, la mission Grid Mode peut être considérée comme terminée.
+Replace the naïve line:
+
+```python
+common_mask = coverage_mask & mask_ref & mask_tgt
+```
+
+by logic that:
+
+1. Converts `coverage_mask` to a boolean numpy array (`np.asarray(..., dtype=bool)`).
+
+2. If `coverage_mask` is 2D and `mask_ref` is 3D (RGB), **broadcast/expand** the coverage mask to 3D:
+
+   * You may either:
+
+     * Use `np.repeat(cov_mask[..., np.newaxis], mask_ref.shape[-1], axis=2)`, or
+     * Use `np.broadcast_to`, as long as the resulting shape is exactly `mask_ref.shape`.
+
+3. Verifies that the final coverage mask shape matches `mask_ref.shape` (and implicitly `mask_tgt.shape`).
+
+4. If shapes are compatible, computes:
+
+   ```python
+   common_mask = cov_mask & mask_ref & mask_tgt
+   ```
+
+5. If shapes are **not** compatible (for any reason), logs a WARN (using `_emit` with `lvl="WARN"`) and falls back to:
+
+   ```python
+   common_mask = mask_ref & mask_tgt
+   ```
+
+This behavior must be robust: **no exception is allowed** to propagate out of this section due to shape mismatch.
+
+### 2. Use existing logging style
+
+* Use the existing `_emit(..., lvl="WARN", callback=progress_callback)` helper if available in this scope.
+* The message should clearly indicate that there was a coverage mask shape mismatch and that the code is falling back to a finite-pixel mask (`mask_ref & mask_tgt`).
+
+Example style:
+
+```python
+_emit(
+    "[GRID] Coverage mask shape mismatch in photometric match; "
+    "falling back to finite-pixel mask.",
+    lvl="WARN",
+    callback=progress_callback,
+)
+```
+
+### 3. Do not change other behavior
+
+* Do **not** change how `coverage_mask` is computed (`_overlap_mask_from_coverage` stays as-is).
+* Do **not** change any GPU / multithreading logic.
+* Do **not** touch any other parts of `grid_mode.py` not directly related to `common_mask` in the photometric tile-matching section.
+* Do **not** modify `zemosaic_worker.py` in this mission.
+
+---
+
+## Acceptance criteria
+
+* The previous `ValueError: operands could not be broadcast together with shapes (1920,768) (1920,768,3)` no longer occurs.
+* In runs where `cov_ref` and `cov_tgt` are both available, the GRID pipeline:
+
+  * Proceeds through the photometric inter-tile matching phase without raising,
+  * Does **not** trigger the “[GRID] Fallback to classic pipeline: reason=...” warning solely because of this mask mismatch.
+* Logs:
+
+  * The existing DEBUG message about coverage overlap is preserved.
+  * In case of incompatible coverage mask shape, a single WARN is emitted and the code falls back to `mask_ref & mask_tgt`.
+
