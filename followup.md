@@ -88,9 +88,9 @@
 
 ### 6. Autocrop & CRPIX/NAXIS
 
-* [ ] Vérifier dans `zemosaic_worker.py` que l’autocrop global se fait via `_auto_crop_global_mosaic_if_requested` puis `_apply_autocrop_to_global_plan`.
-* [ ] S’assurer que `grid_mode.py` ne modifie pas lui-même `CRPIX1/2` ou `NAXIS1/2` après coup.
-* [ ] Confirmer que le plan retourné au worker contient la bonne largeur/hauteur après autocrop.
+* [x] Vérifier dans `zemosaic_worker.py` que l’autocrop global se fait via `_auto_crop_global_mosaic_if_requested` puis `_apply_autocrop_to_global_plan`.
+* [x] S’assurer que `grid_mode.py` ne modifie pas lui-même `CRPIX1/2` ou `NAXIS1/2` après coup.
+* [x] Confirmer que le plan retourné au worker contient la bonne largeur/hauteur après autocrop.
 
 **Test :**
 
@@ -101,18 +101,18 @@
 
 ### 7. Fallback & logs
 
-* [ ] Examiner le code Grid dans `zemosaic_worker.py` :
+* [x] Examiner le code Grid dans `zemosaic_worker.py` :
 
   * en cas de succès Grid → **pas** de fallback.
   * en cas d’échec (`run_grid_mode` lève) → fallback explicite avec log clair.
 
-* [ ] Ajouter si besoin un log type :
+* [x] Ajouter si besoin un log type :
 
   ```python
   logger.warning("[GRID] Fallback to classic pipeline: reason=%s", reason)
   ```
 
-* [ ] S’assurer qu’aucun fallback ne se déclenche sur un dataset sain.
+* [x] S’assurer qu’aucun fallback ne se déclenche sur un dataset sain.
 
 **Validation :**
 

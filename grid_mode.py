@@ -330,6 +330,20 @@ class TileOverlap:
     sample_count: int = 0
 
 
+@dataclass
+class GridAssemblyResult:
+    mosaic_path: Path
+    coverage_path: Path | None
+
+
+@dataclass
+class GridRunResult:
+    mosaic_path: Path
+    coverage_path: Path | None
+    global_wcs: object | None
+    global_shape_hw: tuple[int, int] | None
+
+
 def compute_valid_mask(data: np.ndarray, *, eps: float = 1e-6) -> np.ndarray:
     """Return a boolean mask where True marks finite, non-empty pixels."""
 
@@ -2525,7 +2539,7 @@ def assemble_tiles(
     legacy_rgb_cube: bool = False,
     grid_rgb_equalize: bool = True,
     progress_callback: ProgressCallback = None,
-    ) -> Path | None:
+    ) -> GridAssemblyResult | None:
     """Assemble processed tiles into the final mosaic without global reprojection.
 
     Saves the science mosaic as float32 FITS with WEIGHT extension.
@@ -2540,6 +2554,8 @@ def assemble_tiles(
             callback=progress_callback,
         )
         return None
+
+    coverage_path: Path | None = None
 
     def _combine_mask_with_coverage(mask: np.ndarray, coverage_mask: np.ndarray | None) -> np.ndarray:
         combined_mask = np.asarray(mask, dtype=bool)
@@ -3452,6 +3468,7 @@ def assemble_tiles(
                 lvl="INFO",
                 callback=progress_callback,
             )
+            coverage_path = cov_path
         except Exception as exc_cov_save:
             _emit(
                 f"Coverage: failed to save {cov_path} ({exc_cov_save})",
@@ -3460,7 +3477,7 @@ def assemble_tiles(
             )
 
     _emit(f"Final mosaic saved to {output_path}", callback=progress_callback)
-    return output_path
+    return GridAssemblyResult(mosaic_path=output_path, coverage_path=coverage_path)
 
 
 def _load_config_from_disk() -> dict:
@@ -3511,7 +3528,7 @@ def run_grid_mode(
     legacy_rgb_cube: bool = False,
     grid_rgb_equalize: bool | None = True,
     use_gpu: bool | None = None,
-) -> None:
+) -> GridRunResult:
     """Main entry point for Grid/Survey mode."""
 
     def _coerce_bool_flag(value: object) -> bool | None:
@@ -3670,7 +3687,7 @@ def run_grid_mode(
                 import gc
                 gc.collect()
 
-    mosaic_path = assemble_tiles(
+    assembly_result = assemble_tiles(
         grid,
         grid.tiles,
         out_dir / "mosaic_grid.fits",
@@ -3680,8 +3697,14 @@ def run_grid_mode(
         progress_callback=progress_callback,
     )
 
-    if mosaic_path is None:
+    if assembly_result is None:
         _emit("Grid mode aborted: assembly failed", lvl="ERROR", callback=progress_callback)
         raise RuntimeError("Grid mode failed during assembly")
 
     _emit("Grid/Survey mode completed", lvl="SUCCESS", callback=progress_callback)
+    return GridRunResult(
+        mosaic_path=assembly_result.mosaic_path,
+        coverage_path=assembly_result.coverage_path,
+        global_wcs=getattr(grid, "global_wcs", None),
+        global_shape_hw=tuple(grid.global_shape_hw) if hasattr(grid, "global_shape_hw") else None,
+    )
