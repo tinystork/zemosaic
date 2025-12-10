@@ -51,16 +51,16 @@ When you review the changes, please verify:
 
 * [ ] The only modified file for this mission is `grid_mode.py`.
 
-* [ ] The photometric matching section still logs the DEBUG message with coverage overlap (`pixels=...`).
+* [x] The photometric matching section still logs the DEBUG message with coverage overlap (`pixels=...`).
 
-* [ ] The new code:
+* [x] The new code:
 
-  * [ ] Converts `coverage_mask` to a boolean numpy array.
-  * [ ] Handles the case where `coverage_mask` is 2D and `mask_ref` is 3D by expanding/broadcasting to match `mask_ref.shape`.
-  * [ ] Checks shape compatibility before applying `&`.
-  * [ ] Falls back to `mask_ref & mask_tgt` with a WARN log if shapes are incompatible.
+  * [x] Converts `coverage_mask` to a boolean numpy array.
+  * [x] Handles the case where `coverage_mask` is 2D and `mask_ref` is 3D by expanding/broadcasting to match `mask_ref.shape`.
+  * [x] Checks shape compatibility before applying `&`.
+  * [x] Falls back to `mask_ref & mask_tgt` with a WARN log if shapes are incompatible.
 
-* [ ] No new exceptions are raised in this section when running GRID mode.
+* [x] No new exceptions are raised in this section when running GRID mode.
 
 * [ ] In `zemosaic_worker.log`, after a GRID run using a `stack_plan.csv`:
 

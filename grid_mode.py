@@ -2911,7 +2911,19 @@ def assemble_tiles(
                         lvl="DEBUG",
                         callback=progress_callback,
                     )
-                    common_mask = coverage_mask & mask_ref & mask_tgt
+                    cov_mask = np.asarray(coverage_mask, dtype=bool)
+                    if cov_mask.ndim == 2 and mask_ref.ndim == 3:
+                        cov_mask = np.repeat(cov_mask[..., np.newaxis], mask_ref.shape[-1], axis=2)
+                    if cov_mask.shape != mask_ref.shape or cov_mask.shape != mask_tgt.shape:
+                        _emit(
+                            "[GRID] Coverage mask shape mismatch in photometric match; "
+                            "falling back to finite-pixel mask.",
+                            lvl="WARN",
+                            callback=progress_callback,
+                        )
+                        common_mask = mask_ref & mask_tgt
+                    else:
+                        common_mask = cov_mask & mask_ref & mask_tgt
                 n_common = int(np.sum(common_mask))
                 _emit(
                     f"Photometry: tile {info.tile_id} overlap with ref {reference_info.tile_id} common pixels={n_common}",
