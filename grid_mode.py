@@ -2815,6 +2815,51 @@ def assemble_tiles(
     except Exception:
         _emit("Photometry: background harmonization failed, proceeding without it", lvl="WARN", callback=progress_callback)
 
+    def _tile_channel_medians(tile_data: np.ndarray, tile_mask: np.ndarray) -> np.ndarray:
+        arr = np.asarray(tile_data, dtype=np.float32)
+        m = np.asarray(tile_mask, dtype=bool)
+        if arr.ndim == 2:
+            arr = arr[..., np.newaxis]
+        if m.ndim == 2 and arr.ndim == 3:
+            m = np.repeat(m[..., np.newaxis], arr.shape[-1], axis=2)
+        if arr.shape != m.shape:
+            m = compute_valid_mask(arr)
+        med_list: list[float] = []
+        for c in range(arr.shape[-1]):
+            valid = m[..., c] if m.ndim == 3 else m
+            vals = arr[..., c][valid] if arr.ndim == 3 else arr[valid]
+            med_list.append(float(np.median(vals)) if vals.size else float("nan"))
+        return np.asarray(med_list, dtype=np.float32)
+
+    per_tile_medians: list[tuple[int, np.ndarray]] = []
+    for info in tile_infos:
+        medians = _tile_channel_medians(info.data, info.mask)
+        per_tile_medians.append((info.tile_id, medians))
+        _emit(
+            f"[GRID][METRICS] Tile {info.tile_id} post-scaling medians: {medians.tolist()}",
+            lvl="DEBUG",
+            callback=progress_callback,
+        )
+
+    if per_tile_medians:
+        stacked = np.stack([m for _, m in per_tile_medians], axis=0)
+        for c in range(stacked.shape[1]):
+            vals = stacked[:, c]
+            finite_vals = vals[np.isfinite(vals)]
+            if finite_vals.size == 0:
+                _emit(
+                    f"[GRID][METRICS] Inter-tile median stddev (channel {c}): skipped (no finite samples)",
+                    lvl="WARN",
+                    callback=progress_callback,
+                )
+                continue
+            median_val = float(np.median(finite_vals))
+            std_val = float(np.std(finite_vals))
+            _emit(
+                f"[GRID][METRICS] Inter-tile median stddev (channel {c}): {std_val:.6g} ADU (median={median_val:.6g}, tiles={finite_vals.size})",
+                callback=progress_callback,
+            )
+
     overlap_union: Dict[int, np.ndarray] = {
         info.tile_id: np.zeros(info.data.shape[:2], dtype=bool) for info in tile_infos
     }

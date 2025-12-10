@@ -422,6 +422,7 @@ Non-objectifs :
 * [x] Réintroduire l’égalisation RGB par tuile juste après le stacking local.
 * [x] Ajouter et exploiter un masque de recouvrement basé sur la coverage / WCS pour le calcul des gains/offsets (Option C).
 * [x] Effectuer le passage de perf minimal (réduction des reproject redondants / filtres SciPy et vérification des dtypes) si nécessaire.
+* [x] Journaliser les médianes post-scaling et l’écart-type inter-tuiles pour suivre la cohérence photométrique.
 
 ````
 
