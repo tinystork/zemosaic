@@ -12,7 +12,7 @@
    * utiliser un masque de recouvrement coverage/WCS
    * appliquer *avant* la reprojection
 
-3. [ ] **Réintroduire correctement l’égalisation RGB par tuile**
+3. [x] **Réintroduire correctement l’égalisation RGB par tuile**
 
 4. [ ] **Garantir un pipeline cohérent, sans fallback silencieux**
 

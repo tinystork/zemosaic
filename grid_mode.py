@@ -2624,17 +2624,26 @@ def assemble_tiles(
 
         if c == 3 and equalize_rgb_medians_inplace is not None:
             try:
-                equalize_rgb_medians_inplace(data)
+                _log_tile_medians(
+                    f"tile {t.tile_id} pre-equalize", data, mask=mask
+                )
+                gains = equalize_rgb_medians_inplace(data)
+                mask = compute_valid_mask(data)
+                mask = _combine_mask_with_coverage(mask, coverage_mask)
+                _log_tile_medians(
+                    f"tile {t.tile_id} post-equalize", data, mask=mask
+                )
                 _emit(
-                    f"Photometry: tile {t.tile_id} RGB median equalization applied pre-scaling",
+                    (
+                        f"Photometry: tile {t.tile_id} RGB median equalization applied pre-scaling "
+                        f"gains=({gains[0]:.6g},{gains[1]:.6g},{gains[2]:.6g}) target={gains[3]:.6g}"
+                    ),
                     lvl="DEBUG",
                     callback=progress_callback,
                 )
-                mask = compute_valid_mask(data)
-                mask = _combine_mask_with_coverage(mask, coverage_mask)
-            except Exception:
+            except Exception as exc:
                 _emit(
-                    f"Photometry: tile {t.tile_id} RGB equalization failed; proceeding without it",
+                    f"Photometry: tile {t.tile_id} RGB equalization failed; proceeding without it ({exc})",
                     lvl="WARN",
                     callback=progress_callback,
                 )
