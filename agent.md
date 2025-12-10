@@ -1,4 +1,5 @@
-## `agent.md` – Grid Mode Photometric Fix & Perf Pass (Option A)
+
+## `agent.md` – Grid Mode Photometric Fix & Perf Pass 
 
 ### 1. Mission
 
@@ -85,6 +86,15 @@ Lecture / réutilisation de logique dans :
    * À la fin :
 
      * **plus de damier**,
+
+**Renormalisation globale (deux-pass)**
+
+Si la configuration utilisateur active la renormalisation deux-pass/coverage,
+Grid Mode doit, lorsque c’est techniquement possible, réutiliser la logique existante
+(`_apply_two_pass_coverage_renorm_if_requested`) après l’assemblage global.
+
+Si l’intégration n’est pas triviale dans ce ticket, considérer cette étape comme optionnelle
+tout en s’assurant que la Phase 5 classique reste inchangée.
      * fond de ciel globalement homogène,
      * couleurs cohérentes,
      * feathering utile (au lieu d’amplifier les défauts).
@@ -112,7 +122,7 @@ En faveur d’un ordre plus sain :
 load → debayer → normalisation per-frame / per-tile (si besoin)
      → stack local tile
      → égalisation RGB (si C == 3)
-     → normalisation inter-tile (gain/offset global)
+     → normalisation inter-tile (gain/offset global) avec masque basé sur la coverage WCS
      → reprojection sur canevas global
      → feather + assembly
 ```
@@ -181,25 +191,53 @@ def compute_tile_photometric_scaling(
     """
 ```
 
-3. Implémentation :
+3. Implémentation (avec masque basé sur la coverage / WCS) :
 
    * Travailler en **float32**.
 
    * Ramener les tuiles au format HWC ; si mono-canal, utiliser une forme `(H, W, 1)`.
 
-   * Pour chaque canal :
+   * Construire un **masque de fond basé sur la coverage WCS**, plutôt qu’un simple masque percentile global :
 
-     * construire un masque de pixels valides (`np.isfinite` + éventuelle `mask` passée en paramètre),
-     * si **aucun** pixel valide pour ce canal dans `reference_tile` **ou** `target_tile` :
+     * Le Grid Mode dispose déjà de cartes de coverage / poids / alpha (ex. nombre de contributions par pixel, ou cartes utilisées pour l’assemblage et le feathering).
+     * L’objectif est d’utiliser ces informations pour ne comparer que les zones où **référence et cible ont une coverage suffisante et stable**, et ignorer :
 
-       * ne pas calculer de scaling réel,
-       * fixer `gain = 1.0`, `offset = 0.0` pour ce canal,
-       * logguer un warning `DEBUG`/`INFO` (par ex. : “no valid pixels, scaling disabled for tile X, channel Y”),
-     * sinon :
+       * les bords à coverage faible,
+       * les zones extrapolées / NaN,
+       * les zones empilées avec très peu de frames.
 
-       * calculer un **fond de ciel** robuste (par ex. médiane) pour ref et target,
-       * calculer un **gain** basé sur les médianes ou une régression simple,
-       * ignorer les NaN et les valeurs non finies.
+   * Stratégie recommandée :
+
+     1. Pour chaque tuile (référence et target), construire une **carte de coverage binaire** à partir des données disponibles :
+
+        * pixels `True` là où les données sont valides (non-NaN),
+        * si une carte de poids/coverage explicite existe déjà, l’utiliser (ex. coverage >= 1 ou >= seuil).
+     2. Ramener ces cartes sur une même grille logique :
+
+        * soit en se basant sur la grille de la tuile (masque en coordonnées de la tuile),
+        * soit, si disponible, en réutilisant la même logique WCS que celle employée pour projeter les tiles sur le canevas global.
+     3. Définir `mask` comme l’**intersection** :
+
+        * pixels valides dans `reference_tile`,
+        * pixels valides dans `target_tile`,
+        * coverage au-dessus d’un seuil minimal dans les deux.
+     4. Éventuellement, **érosion légère** du masque (1–2 pixels) pour retirer les bords de tuile les plus bruités / mal couverts.
+
+   * Une fois `mask` défini :
+
+     * pour chaque canal :
+
+       * construire un masque de pixels valides : `valid = np.isfinite(ref_channel) & np.isfinite(tgt_channel) & mask`,
+       * si **aucun** pixel valide pour ce canal dans `reference_tile` **ou** `target_tile` :
+
+         * ne pas calculer de scaling réel,
+         * fixer `gain = 1.0`, `offset = 0.0` pour ce canal,
+         * logguer un warning `DEBUG`/`INFO` (par ex. : “no valid pixels in overlap, scaling disabled for tile X, channel Y”),
+       * sinon :
+
+         * calculer un **fond de ciel** robuste (par ex. médiane sur les pixels `valid`) pour ref et target,
+         * calculer un **gain** basé sur les médianes (ou une petite régression robuste),
+         * optionnel : borner le gain dans un intervalle raisonnable (par ex. `[0.5, 2.0]`).
 
    * Retourner des gains / offsets scalaires (pas besoin de carte 2D à ce stade).
 
@@ -246,13 +284,41 @@ def apply_tile_photometric_scaling(
        * coverage suffisante (pas entièrement NaN),
        * min/max finies,
        * dynamique non nulle (min < max),
-     * enregistrer cette tuile dans une variable claire, par ex. `reference_tile_data` / `reference_tile_id`.
+     * enregistrer cette tuile dans une variable claire, par ex. `reference_tile_data` / `reference_tile_id`,
+     * si une carte de coverage / poids par tuile existe déjà, garder aussi la coverage de référence.
+
+**Cas limite : aucune tuile saine trouvée**
+
+Si aucune tuile ne satisfait les critères de validité (coverage > 0, min/max finies, dynamique non nulle), alors :
+
+- log WARNING : "[GRID] Photometric scaling disabled: no valid reference tile found (all tiles invalid)";
+- désactiver entièrement la normalisation inter-tile pour ce run ;
+- traiter toutes les tuiles comme identiques : gain = 1.0, offset = 0.0.
+
+Ce fallback empêche un plantage et garantit un comportement déterministe même sur un dataset sévèrement corrompu.
 
    * Pour chaque tuile “target” :
 
      * vérifier qu’elle contient des pixels valides ; si entièrement NaN → la laisser telle quelle dans l’assemblage, mais **ne pas** calculer de scaling (gain=1, offset=0 + log),
-     * avant de la reprojeter, calculer `(gains, offsets)` par rapport à `reference_tile_data`
-       en utilisant `compute_tile_photometric_scaling(...)`,
+     * construire, pour le couple (référence, target), un **masque de recouvrement** basé sur la coverage WCS :
+
+       * utiliser les cartes de coverage / poids des deux tuiles si disponibles,
+       * sinon, utiliser au minimum la condition “données valides dans les deux tuiles”,
+       * éventuellement éroder ce masque pour écarter les bords.
+
+**Fallback si la coverage n’est pas disponible**
+
+Si aucune carte de coverage/poids n’est accessible pour une tuile :
+
+- construire un masque minimal basé sur les pixels valides :
+  `base_mask = np.isfinite(ref_tile) & np.isfinite(target_tile)`
+- utiliser exclusivement ce masque ;
+- log INFO : "[GRID] Coverage not available for tile X, falling back to finite-pixel mask."
+
+Ce fallback garantit que le scaling ne dépend jamais exclusivement de la présence d’une carte de coverage.
+     * appeler `compute_tile_photometric_scaling(...)` avec ce `mask` :
+
+       * `(gains, offsets) = compute_tile_photometric_scaling(reference_tile_data, target_tile_data, mask=overlap_mask)`,
      * appliquer `apply_tile_photometric_scaling(...)` sur la tuile (`float32`),
      * seulement ensuite procéder à la reprojection sur le canevas global.
 
@@ -267,6 +333,16 @@ def apply_tile_photometric_scaling(
      * les helpers de scaling doivent ignorer les pixels non valides,
      * les éventuels NaN restants dans la tuile ne doivent pas faire diverger les min/max / médianes ni produire des gains/offsets `inf`/`nan`.
    * Le scaling photométrique doit uniquement modifier les valeurs de données valides. Les NaN existants (zones hors coverage) doivent rester NaN, et les cartes de coverage / poids / alpha utilisées pour le feathering ne doivent pas être modifiées par ces helpers.
+
+**Interaction avec feathering**
+
+Le scaling photométrique ne doit jamais modifier :
+
+- les cartes de coverage / poids / alpha ;
+- les NaN représentant les zones hors champ.
+
+Le feathering doit continuer de fonctionner sur les cartes de poids originales.  
+Le scaling n’affecte que les valeurs valides (float32) de la tuile.
 
 ---
 
@@ -302,7 +378,7 @@ Dans ce ticket, ne viser que les gains faciles et non risqués :
 3. **SciPy / ndimage :**
 
    * garder l’import, mais éviter les appels répétés dans les boucles les plus grosses,
-   * si un filtre (ex : léger Gaussian) est utilisé juste pour lissage de coverage, ne l’appliquer qu’une fois sur une carte de coverage, pas sur toutes les tuiles.
+   * si un filtre (ex. léger Gaussian) est utilisé juste pour lissage de coverage, ne l’appliquer qu’une fois sur une carte de coverage, pas sur toutes les tuiles.
 
 ---
 
@@ -331,17 +407,22 @@ Dans ce ticket, ne viser que les gains faciles et non risqués :
   * continue de fonctionner **strictement comme avant**,
   * les tests/runs existants ne montrent pas de régression.
 
-
 Non-objectifs :
-  * Ne pas introduire de modèle de fond 2D (Option B) dans ce ticket.
-  * Ne pas toucher à la pipeline classique.
-  * Ne pas modifier la logique de feathering au-delà de ce ticket.
+
+* Ne pas introduire de modèle de fond 2D (Option B) dans ce ticket.
+* Ne pas toucher à la pipeline classique.
+* Ne pas modifier la logique de feathering au-delà de ce ticket.
 
 ---
 
 ### Suivi d’implémentation
 
-- [x] Ajouter les helpers `compute_tile_photometric_scaling` / `apply_tile_photometric_scaling` pour la normalisation inter-tile (float32, logs min/med/max, masques NaN safe).
-- [x] Brancher ces helpers dans `grid_mode.py` avec sélection d’une tuile de référence et application du scaling avant l’assemblage global.
-- [x] Réintroduire l’égalisation RGB par tuile juste après le stacking local.
-- [ ] Effectuer le passage de perf minimal (réduction des reproject redondants / filtres SciPy et vérification des dtypes) si nécessaire.
+* [x] Ajouter les helpers `compute_tile_photometric_scaling` / `apply_tile_photometric_scaling` pour la normalisation inter-tile (float32, logs min/med/max, masques NaN safe).
+* [x] Brancher ces helpers dans `grid_mode.py` avec sélection d’une tuile de référence et application du scaling avant l’assemblage global.
+* [x] Réintroduire l’égalisation RGB par tuile juste après le stacking local.
+* [ ] Ajouter et exploiter un masque de recouvrement basé sur la coverage / WCS pour le calcul des gains/offsets (Option C).
+* [ ] Effectuer le passage de perf minimal (réduction des reproject redondants / filtres SciPy et vérification des dtypes) si nécessaire.
+
+````
+
+---
