@@ -67,5 +67,5 @@ Si un fallback apparaît → la géométrie n’est toujours pas correcte.
 * [ ] plus de damier
 * [ ] plus de bandes verticales
 * [ ] coverage correcte
-* [ ] aucun fallback
+* [x] aucun fallback
 

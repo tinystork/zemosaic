@@ -13332,8 +13332,8 @@ def run_hierarchical_mosaic(
     setattr(zconfig, "poststack_equalize_rgb", bool(grid_rgb_equalize_flag))
 
     if detect_grid_mode(input_folder):
-        try:
-            if grid_mode and hasattr(grid_mode, "run_grid_mode"):
+        if grid_mode and hasattr(grid_mode, "run_grid_mode"):
+            try:
                 logger.info(
                     "[GRID] Invoking grid_mode.run_grid_mode(...) with "
                     "grid_rgb_equalize=%s (source=%s), stack_norm=%s, stack_weight=%s, reject_algo=%s, combine=%s",
@@ -13363,10 +13363,12 @@ def run_hierarchical_mosaic(
                     grid_rgb_equalize=grid_rgb_equalize_flag,
                 )
                 return
-            else:
-                logger.warning("[GRID] grid_mode module unavailable, continuing with classic pipeline.")
-        except Exception:
-            logger.error("[GRID] Grid/Survey mode failed, continuing with classic pipeline", exc_info=True)
+            except Exception:
+                logger.error("[GRID] Grid/Survey mode failed; aborting without classic fallback", exc_info=True)
+                raise
+        error_msg = "[GRID] grid_mode module unavailable; aborting (no classic fallback)."
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
 
     def pcb(msg_key, prog=None, lvl="INFO", **kwargs):
         """Shortcut to emit log+callback events with the current progress callback."""
