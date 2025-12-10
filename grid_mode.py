@@ -217,7 +217,7 @@ def _ensure_hwc_array(data: np.ndarray) -> np.ndarray:
             arr = np.moveaxis(arr, 0, -1)
     if arr.ndim == 2:
         arr = arr[..., np.newaxis]
-    return arr.astype(np.float32, copy=False)
+    return arr.astype(np.float32)
 
 
 def _log_image_stats(
@@ -413,7 +413,7 @@ def _smooth_image_for_pyramid(image: np.ndarray) -> np.ndarray:
             + arr_padded[2:, 1:-1]
             + arr_padded[2:, 2:]
         ) / 9.0
-        return blurred.astype(np.float32, copy=False)
+        return blurred.astype(np.float32)
     arr_padded = np.pad(arr, ((1, 1), (1, 1), (0, 0)), mode="edge")
     blurred = (
         arr_padded[:-2, :-2, :]
@@ -426,7 +426,7 @@ def _smooth_image_for_pyramid(image: np.ndarray) -> np.ndarray:
         + arr_padded[2:, 1:-1, :]
         + arr_padded[2:, 2:, :]
     ) / 9.0
-    return blurred.astype(np.float32, copy=False)
+    return blurred.astype(np.float32)
 
 
 def _downsample_image(image: np.ndarray) -> np.ndarray:
@@ -1238,7 +1238,7 @@ def _load_image_with_optional_alpha(
         bayer_pattern = None
 
     debayer_applied = False
-    data = np.asarray(data, dtype=np.float32, copy=False)
+    data = np.asarray(data, dtype=np.float32)
     if data.ndim == 2 and bayer_pattern:
         finite_mask = np.isfinite(data)
         if np.any(finite_mask):
@@ -1351,9 +1351,9 @@ def _reproject_frame_to_tile(
                 degraded = True
         except Exception:
             return None, None
-        reproj_stack[..., c] = np.asarray(reproj_arr, dtype=np.float32, copy=False)
+        reproj_stack[..., c] = np.asarray(reproj_arr, dtype=np.float32)
         if combined_footprint is None:
-            footprint_f32 = np.asarray(footprint, dtype=np.float32, copy=False)
+            footprint_f32 = np.asarray(footprint, dtype=np.float32)
             combined_footprint = np.array(footprint_f32, copy=True)
 
     if degraded:
@@ -1541,7 +1541,7 @@ def _normalize_patches(
     normalized: list[np.ndarray] = []
     if method_norm in {"none", "unit", "unity"}:
         ref_used = ref_median if ref_median is not None else 1.0
-        normalized = [np.asarray(p, dtype=np.float32, copy=False) for p in patches]
+        normalized = [np.asarray(p, dtype=np.float32) for p in patches]
         return normalized, float(ref_used)
 
     if method_norm in {"linear_fit", "linear"}:
@@ -1552,13 +1552,13 @@ def _normalize_patches(
                 s, b = _fit_linear_scale(ref_patch, patch)
             except Exception:
                 s, b = slopes, intercepts
-            patch_norm = (np.asarray(patch, dtype=np.float32, copy=False) * s.reshape((1, 1, -1))) + b.reshape((1, 1, -1))
-            normalized.append(patch_norm.astype(np.float32, copy=False))
+            patch_norm = (np.asarray(patch, dtype=np.float32) * s.reshape((1, 1, -1))) + b.reshape((1, 1, -1))
+            normalized.append(patch_norm.astype(np.float32))
         return normalized, float(ref_used)
 
     # Default: median scaling
     for patch in patches:
-        patch_arr = np.asarray(patch, dtype=np.float32, copy=False)
+        patch_arr = np.asarray(patch, dtype=np.float32)
         finite_patch = np.isfinite(patch_arr)
         med = float(np.nanmedian(patch_arr[finite_patch])) if np.any(finite_patch) else ref_median
         med = med if math.isfinite(med) and med != 0 else ref_median
@@ -1567,7 +1567,7 @@ def _normalize_patches(
         except Exception:
             scale = 1.0
         patch_norm = patch_arr * scale
-        normalized.append(patch_norm.astype(np.float32, copy=False))
+        normalized.append(patch_norm.astype(np.float32))
     return normalized, float(ref_median)
 
 
@@ -1648,8 +1648,8 @@ def _stack_weighted_patches(
         reference_median,
         method=config.stack_norm_method,
     )
-    data_stack = np.stack(normalized, axis=0).astype(np.float32, copy=False)
-    weight_stack = np.stack(weights, axis=0).astype(np.float32, copy=False)
+    data_stack = np.stack(normalized, axis=0).astype(np.float32)
+    weight_stack = np.stack(weights, axis=0).astype(np.float32)
     data_stack = np.where(weight_stack > 0, data_stack, np.nan)
 
     rejection = config.stack_reject_algo.lower().strip()
@@ -1686,10 +1686,10 @@ def _stack_weighted_patches(
         else:
             with np.errstate(divide="ignore", invalid="ignore"):
                 result = np.sum(data_masked * weight_effective, axis=0) / np.clip(weight_sum, 1e-6, None)
-        outputs = [result.astype(np.float32, copy=False)]
+        outputs = [result.astype(np.float32)]
 
     if return_weight_sum:
-        outputs.append(weight_sum.astype(np.float32, copy=False))
+        outputs.append(weight_sum.astype(np.float32))
     if return_ref_median:
         outputs.append(ref_median_used)
     return outputs[0] if len(outputs) == 1 else tuple(outputs)
@@ -1953,7 +1953,7 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
             pass
     with np.errstate(divide="ignore", invalid="ignore"):
         stacked = running_sum / np.clip(running_weight, 1e-6, None)
-    stacked = np.where(np.isfinite(stacked), stacked, 0.0).astype(np.float32, copy=False)
+    stacked = np.where(np.isfinite(stacked), stacked, 0.0).astype(np.float32)
     coverage_mask_alpha: np.ndarray | None = None
     try:
         coverage_mask_bool = (
@@ -1961,7 +1961,7 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
             if running_weight.ndim == 3
             else (running_weight > 0)
         )
-        coverage_mask_alpha = np.asarray(coverage_mask_bool, dtype=np.uint8, copy=False) * 255
+        coverage_mask_alpha = np.asarray(coverage_mask_bool, dtype=np.uint8) * 255
         _emit(
             f"[GRIDCOV] tile_id={tile.tile_id} coverage_mask pixels={int(np.sum(coverage_mask_bool))}",
             lvl="DEBUG",
@@ -2037,7 +2037,7 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
         header = tile.wcs.to_header() if hasattr(tile.wcs, "to_header") else None  # type: ignore[attr-defined]
     except Exception:
         header = None
-    output_data = np.asarray(stacked, dtype=np.float32, copy=False)
+    output_data = np.asarray(stacked, dtype=np.float32)
     axis_order = "HWC" if output_data.ndim == 3 else None
     _log_image_stats(
         label=f"tile_{tile.tile_id:04d}.fits",
@@ -2379,8 +2379,8 @@ def _build_overlap_blend_masks(mask_a: np.ndarray, mask_b: np.ndarray) -> tuple[
 
     valid_a = mask_a if mask_a.ndim == 2 else np.any(mask_a, axis=-1)
     valid_b = mask_b if mask_b.ndim == 2 else np.any(mask_b, axis=-1)
-    valid_a_f = valid_a.astype(np.float32, copy=False)
-    valid_b_f = valid_b.astype(np.float32, copy=False)
+    valid_a_f = valid_a.astype(np.float32)
+    valid_b_f = valid_b.astype(np.float32)
     h, w = valid_a_f.shape
     if h == 0 or w == 0:
         return np.zeros_like(valid_a_f), np.zeros_like(valid_b_f)
@@ -2398,7 +2398,7 @@ def _build_overlap_blend_masks(mask_a: np.ndarray, mask_b: np.ndarray) -> tuple[
     wB = np.where(total > 0, wB / np.clip(total, 1e-6, None), 0.0)
     wA *= (total > 0)
     wB *= (total > 0)
-    return wA.astype(np.float32, copy=False), wB.astype(np.float32, copy=False)
+    return wA.astype(np.float32), wB.astype(np.float32)
 
 
 def _blend_overlap_region(
@@ -2470,8 +2470,8 @@ def _blend_overlap_region(
             (A_clean * wA[..., np.newaxis] + B_clean * wB[..., np.newaxis]) / np.clip(total_w_expanded, 1e-6, None),
             0.0,
         )
-    weight_out = total_w.astype(np.float32, copy=False)
-    return blended.astype(np.float32, copy=False), weight_out, used_pyramid
+    weight_out = total_w.astype(np.float32)
+    return blended.astype(np.float32), weight_out, used_pyramid
 
 
 def assemble_tiles(
@@ -3060,7 +3060,7 @@ def assemble_tiles(
             continue
         channel_mask = mask_crop if mask_crop.ndim == 3 else np.repeat(mask_crop[..., np.newaxis], c, axis=2)
         channel_mask = channel_mask & unique_mask[..., np.newaxis]
-        weight_crop = channel_mask.astype(np.float32, copy=False)
+        weight_crop = channel_mask.astype(np.float32)
         slice_y = slice(y0, y0 + used_h)
         slice_x = slice(x0, x0 + used_w)
         mosaic_sum[slice_y, slice_x, :] += np.where(channel_mask, data_crop, 0.0) * weight_crop
@@ -3154,7 +3154,7 @@ def assemble_tiles(
             if not np.any(mask_crop):
                 continue
             channel_mask = mask_crop if mask_crop.ndim == 3 else np.repeat(mask_crop[..., np.newaxis], c, axis=2)
-            weight_crop = channel_mask.astype(np.float32, copy=False)
+            weight_crop = channel_mask.astype(np.float32)
             slice_y = slice(y0, y0 + used_h)
             slice_x = slice(x0, x0 + used_w)
             salvage_sum[slice_y, slice_x, :] += np.where(channel_mask, data_crop, 0.0) * weight_crop
@@ -3214,7 +3214,7 @@ def assemble_tiles(
             header = grid.global_wcs.to_header() if hasattr(grid.global_wcs, "to_header") else None  # type: ignore[attr-defined]
         except Exception:
             header = None
-        output_data = np.asarray(mosaic, dtype=np.float32, copy=False)
+        output_data = np.asarray(mosaic, dtype=np.float32)
         axis_order = "HWC" if output_data.ndim == 3 else None
         _log_image_stats(
             label=Path(output_path).name,
@@ -3269,9 +3269,9 @@ def assemble_tiles(
     coverage_hw: np.ndarray | None = None
     try:
         if weight_sum.ndim == 3:
-            coverage_hw = np.sum(weight_sum, axis=-1).astype(np.float32, copy=False)
+            coverage_hw = np.sum(weight_sum, axis=-1).astype(np.float32)
         else:
-            coverage_hw = weight_sum.astype(np.float32, copy=False)
+            coverage_hw = weight_sum.astype(np.float32)
     except Exception as exc_cov:
         _emit(
             f"Coverage: failed to derive coverage map from weight_sum ({exc_cov})",
