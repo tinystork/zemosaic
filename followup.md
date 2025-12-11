@@ -30,9 +30,9 @@
 
 ### 3. Stacking par tuile
 
-- [ ] Vérifier que toutes les tuiles sont empilées via `stack_core` (CPU/GPU) avec les bons paramètres.
-- [ ] Confirmer que pour les images RGB, `equalize_rgb_medians_inplace` est appelé **avant** tout calcul de stats de fond/scaling.
-- [ ] S’assurer que `compute_valid_mask` est utilisé pour produire une `tile_mask` cohérente.
+- [x] Vérifier que toutes les tuiles sont empilées via `stack_core` (CPU/GPU) avec les bons paramètres.
+- [x] Confirmer que pour les images RGB, `equalize_rgb_medians_inplace` est appelé **avant** tout calcul de stats de fond/scaling.
+- [x] S’assurer que `compute_valid_mask` est utilisé pour produire une `tile_mask` cohérente.
 
 **Test :**
 
