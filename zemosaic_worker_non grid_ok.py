@@ -48,7 +48,6 @@ from __future__ import annotations
 
 import os
 import copy
-import inspect
 import shutil
 import time
 import traceback
@@ -70,16 +69,11 @@ import platform
 import importlib.util
 from pathlib import Path
 from threading import Lock
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Callable, Any, Iterable, Optional
 from types import SimpleNamespace
 
 import numpy as np
-
-try:
-    import grid_mode
-except Exception:
-    grid_mode = None
 
 from core.path_helpers import (
     casefold_path,
@@ -158,12 +152,6 @@ except Exception:
     get_runtime_temp_dir = _fallback_runtime_temp_dir
 
 
-try:
-    from zemosaic_align_stack import _poststack_rgb_equalization
-except Exception:
-    _poststack_rgb_equalization = None
-
-
 UNALIGNED_DIRNAME = "unaligned_by_zemosaic"
 _UNALIGNED_LOCK = Lock()
 
@@ -208,24 +196,6 @@ def _normcase_path(path: str | os.PathLike | None) -> str:
 
 def _normpath_parts(path: str | os.PathLike | None) -> tuple[str, ...]:
     return normpath_segments(path)
-
-
-def detect_grid_mode(input_folder: str | os.PathLike | None) -> bool:
-    """Return True when Grid/Survey mode should be activated (stack_plan.csv present)."""
-
-    if grid_mode and hasattr(grid_mode, "detect_grid_mode"):
-        try:
-            return bool(grid_mode.detect_grid_mode(input_folder))  # type: ignore[attr-defined]
-        except Exception as exc:
-            try:
-                logger.debug("[GRID] detect_grid_mode failed: %s", exc)
-            except Exception:
-                pass
-    try:
-        return Path(input_folder or "").expanduser().joinpath("stack_plan.csv").is_file()
-    except Exception:
-        return False
-
 
 def _move_to_unaligned_safe(
     src_path: str | os.PathLike,
@@ -811,18 +781,6 @@ def _apply_autocrop_to_global_plan(
 
     if not plan or not crop_meta:
         return
-    if plan.get("autocrop_applied"):
-        try:
-            existing = plan.get("autocrop_offsets") or {}
-            if (
-                int(existing.get("x0", -1)) == int(crop_meta.get("x0", -2))
-                and int(existing.get("y0", -1)) == int(crop_meta.get("y0", -2))
-                and int(existing.get("width", -1)) == int(crop_meta.get("width", -2))
-                and int(existing.get("height", -1)) == int(crop_meta.get("height", -2))
-            ):
-                return
-        except Exception:
-            return
     width = int(crop_meta.get("width") or 0)
     height = int(crop_meta.get("height") or 0)
     if width <= 0 or height <= 0:
@@ -877,7 +835,6 @@ def _apply_autocrop_to_global_plan(
         "width": width,
         "height": height,
     }
-    plan["autocrop_applied"] = True
 
 
 def _prepare_tiles_for_two_pass(
@@ -1041,56 +998,6 @@ def _apply_two_pass_coverage_renorm_if_requested(
         if logger:
             logger.exception("[TwoPass] renorm exception → keeping first-pass outputs")
     return final_mosaic_data, final_mosaic_coverage
-
-
-def _apply_final_mosaic_rgb_equalization(
-    final_mosaic_data: np.ndarray | None,
-    *,
-    zconfig=None,
-    logger: logging.Logger | None = None,
-):
-    """Apply final RGB equalization to the mosaic using the poststack helper."""
-
-    default_info = {
-        "enabled": False,
-        "applied": False,
-        "gain_r": 1.0,
-        "gain_g": 1.0,
-        "gain_b": 1.0,
-        "target_median": float("nan"),
-    }
-
-    if final_mosaic_data is None or not isinstance(final_mosaic_data, np.ndarray):
-        return final_mosaic_data, default_info
-
-    if _poststack_rgb_equalization is None:
-        if logger:
-            logger.debug("[RGB-EQ] final mosaic equalization skipped: helper unavailable")
-        return final_mosaic_data, default_info
-
-    try:
-        info = _poststack_rgb_equalization(final_mosaic_data, zconfig=zconfig, stack_metadata=None)
-    except Exception as exc:
-        if logger:
-            logger.warning("[RGB-EQ] final mosaic equalization failed: %s", exc)
-        return final_mosaic_data, default_info
-
-    if not isinstance(info, dict):
-        info = default_info
-    else:
-        for key, value in default_info.items():
-            info.setdefault(key, value)
-
-    if logger is not None and info.get("applied"):
-        logger.info(
-            "[RGB-EQ] final mosaic: applied=True, gains=(%.6f, %.6f, %.6f), target_median=%.2f",
-            info.get("gain_r", 1.0),
-            info.get("gain_g", 1.0),
-            info.get("gain_b", 1.0),
-            info.get("target_median", float("nan")),
-        )
-
-    return final_mosaic_data, info
 
 
 def _apply_phase5_post_stack_pipeline(
@@ -6358,7 +6265,6 @@ def _run_shared_phase45_phase5_pipeline(
     start_time_total_run: float | None,
     progress_callback: Callable | None,
     pcb: Callable[..., None],
-    zconfig: Any | None = None,
     logger: logging.Logger,
 ) -> tuple[
     list[tuple[str | None, Any]],
@@ -6369,9 +6275,6 @@ def _run_shared_phase45_phase5_pipeline(
     float,
 ]:
     """Shared helper that runs Phase 4.5 + Phase 5 on a list of tiles."""
-
-    if zconfig is None:
-        zconfig = SimpleNamespace()
 
     master_tiles: list[tuple[str | None, Any]] = list(master_tiles_results_list or [])
     base_progress_phase4_5 = float(phase45_options.get("base_progress") or 0.0)
@@ -6466,12 +6369,6 @@ def _run_shared_phase45_phase5_pipeline(
     parallel_caps_option = phase5_options.get("parallel_capabilities")
     telemetry_ctrl = phase5_options.get("telemetry")
     sds_mode_phase5 = bool(phase5_options.get("sds_mode"))
-    final_mosaic_rgb_equalize_enabled = bool(
-        phase5_options.get(
-            "final_mosaic_rgb_equalize_enabled",
-            getattr(zconfig, "final_mosaic_rgb_equalize_enabled", False),
-        )
-    )
 
     pcb("PHASE_UPDATE:5", prog=None, lvl="ETA_LEVEL")
     _log_memory_usage(
@@ -6744,21 +6641,13 @@ def _run_shared_phase45_phase5_pipeline(
 
         fallback_two_pass_loader = _load_tiles_for_two_pass_phase5
 
-    enable_final_lecropper = False
-    if final_quality_pipeline_cfg:
-        enable_final_lecropper = bool(
-            final_quality_pipeline_cfg.get("quality_crop_enabled")
-            or final_quality_pipeline_cfg.get("altaz_cleanup_enabled")
-        )
-    enable_final_master_crop = bool(apply_master_tile_crop_config and not quality_crop_enabled_config)
-
     final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = _apply_phase5_post_stack_pipeline(
         final_mosaic_data_HWC,
         final_mosaic_coverage_HW,
         final_alpha_map,
-        enable_lecropper_pipeline=enable_final_lecropper,
+        enable_lecropper_pipeline=False,
         pipeline_cfg=final_quality_pipeline_cfg,
-        enable_master_tile_crop=enable_final_master_crop,
+        enable_master_tile_crop=False,
         master_tile_crop_percent=master_tile_crop_percent_config,
         two_pass_enabled=bool(two_pass_enabled),
         two_pass_sigma_px=two_pass_sigma_px,
@@ -6774,32 +6663,6 @@ def _run_shared_phase45_phase5_pipeline(
     )
     if collected_tiles_for_second_pass is not None:
         collected_tiles_for_second_pass.clear()
-
-    final_rgb_eq_info = None
-
-# NOTE:
-# We temporarily disable final mosaic RGB equalization.
-# Master tiles are already RGB-normalized individually, and
-# applying the same algorithm again on the assembled mosaic
-# has been shown to produce a strong green cast.
-#
-# if (
-#     final_mosaic_rgb_equalize_enabled
-#     and final_mosaic_data_HWC is not None
-#     and not sds_mode_phase5
-# ):
-#     try:
-#         final_mosaic_data_HWC, final_rgb_eq_info = _apply_final_mosaic_rgb_equalization(
-#             final_mosaic_data_HWC,
-#             zconfig=zconfig,
-#             logger=logger,
-#         )
-#     except Exception as exc:
-#         if logger:
-#             logger.warning(
-#                 "[RGB-EQ] Unexpected error during final mosaic RGB equalization: %s",
-#                 exc,
-#             )
 
     alpha_final = _derive_final_alpha_mask(
         final_alpha_map,
@@ -7078,42 +6941,6 @@ def _chunk_sequence(seq: list[dict], size: int) -> list[list[dict]]:
     if size <= 0:
         return [seq]
     return [seq[i:i + size] for i in range(0, len(seq), size)]
-
-
-def make_overlapping_batches(indices: list[int], cap: int, overlap_frac: float) -> list[list[int]]:
-    n = len(indices)
-    if n <= cap:
-        return [indices]
-    step = max(1, int(cap * (1.0 - overlap_frac)))
-    batches: list[list[int]] = []
-    start = 0
-    while start < n:
-        end = min(n, start + cap)
-        batch = indices[start:end]
-        if len(batch) > 1:
-            batches.append(batch)
-        if end == n:
-            break
-        start += step
-    return batches
-
-
-def _sort_group_for_overlap(group: list[dict]) -> list[dict]:
-    if not group:
-        return []
-
-    def _safe_number(value: Any) -> float:
-        try:
-            number = float(value)
-        except Exception:
-            return math.inf
-        return number if math.isfinite(number) else math.inf
-
-    ordered = sorted(
-        ((idx, info) for idx, info in enumerate(group)),
-        key=lambda item: (_safe_number(item[1].get("RA")), _safe_number(item[1].get("DEC")), item[0]),
-    )
-    return [info for _idx, info in ordered]
 
 
 def _auto_split_single_group(
@@ -7470,7 +7297,6 @@ WCS, SkyCoord, Angle, fits, u = None, None, None, None, None
 try:
     from astropy.io import fits as actual_fits
     from astropy.wcs import WCS as actual_WCS
-    from astropy.wcs import wcs as wcs_module
     from astropy.coordinates import SkyCoord as actual_SkyCoord, Angle as actual_Angle
     from astropy import units as actual_u
     fits, WCS, SkyCoord, Angle, u = actual_fits, actual_WCS, actual_SkyCoord, actual_Angle, actual_u
@@ -7546,32 +7372,6 @@ try:
 except Exception:
     zemosaic_config = None  # type: ignore
     ZEMOSAIC_CONFIG_AVAILABLE = False
-
-try:
-    from zemosaic_align_stack_gpu import (
-        gpu_stack_from_paths as _p3_gpu_stack_from_paths,
-        GPUStackingError as _P3GPUStackingError,
-        _gpu_is_usable as _p3_gpu_is_usable,
-    )
-    _P3_GPU_HELPERS_AVAILABLE = True
-except Exception:
-    _p3_gpu_stack_from_paths = None
-
-    class _P3GPUStackingError(RuntimeError):
-        pass
-
-    def _p3_gpu_is_usable(logger=None):
-        return False
-
-    _P3_GPU_HELPERS_AVAILABLE = False
-
-_P3_GPU_STATE = {
-    "allowed": True,
-    "hard_disabled": False,
-    "health_checked": False,
-    "healthy": False,
-    "info_logged": False,
-}
 
 import importlib.util
 
@@ -9314,343 +9114,6 @@ def get_wcs_and_pretreat_raw_file(
 
 # ... (vos imports existants : os, shutil, time, traceback, gc, logging, np, astropy, reproject, et les modules zemosaic_...)
 
-def _safe_load_cache(path: str, *, pcb: Callable | None = None, tile_id: int | None = None):
-    """Load a numpy cache with a WinError-1455 aware fallback.
-
-    Attempts a memory-mapped load first (mmap_mode='r'). If an OSError
-    containing WinError 1455 is raised, retries without memmap. Any other
-    exception is re-raised.
-    Returns the loaded numpy array.
-    """
-    try:
-        return np.load(path, allow_pickle=False, mmap_mode="r")
-    except OSError as exc:
-        # Detect Windows paging file insufficiency
-        msg = str(exc)
-        if "WinError 1455" in msg or "1455" in msg or (hasattr(exc, "winerror") and getattr(exc, "winerror") == 1455):
-            try:
-                if pcb is not None:
-                    try:
-                        pcb("stack_mem_fallback_memmap_to_ram", prog=None, lvl="WARN", tile_id=tile_id, path=_safe_basename(path))
-                    except Exception:
-                        pass
-                # Retry without memmap
-                return np.load(path, allow_pickle=False, mmap_mode=None)
-            except Exception:
-                raise
-        # Other OSError: re-raise so caller can handle
-        raise
-
-
-def _stack_master_tile_cpu(
-    aligned_images_for_stack: list,
-    *,
-    stack_norm_method: str,
-    stack_weight_method: str,
-    stack_reject_algo: str,
-    stack_kappa_low: float,
-    stack_kappa_high: float,
-    parsed_winsor_limits: tuple[float, float],
-    stack_final_combine: str,
-    apply_radial_weight: bool,
-    radial_feather_fraction: float,
-    radial_shape_power: float,
-    winsor_pool_workers: int | None,
-    winsor_max_frames_per_pass: int | None,
-    progress_callback: callable,
-    zconfig: SimpleNamespace,
-    parallel_plan: ParallelPlan | None,
-    pcb_tile: callable,
-    func_id_log_base: str,
-    tile_id: int,
-) -> tuple[np.ndarray | None, dict[str, Any]]:
-    """Stack aligned images using the existing CPU path.
-
-    Returns stacked data and the accompanying stack metadata.
-    """
-
-    stack_metadata: dict[str, Any] = {}
-
-    current_parallel_plan = parallel_plan or getattr(zconfig, "parallel_plan", None)
-    effective_winsor_frames_per_pass = int(winsor_max_frames_per_pass) if winsor_max_frames_per_pass is not None else 0
-    if effective_winsor_frames_per_pass < 0:
-        effective_winsor_frames_per_pass = 0
-    try:
-        sample_frame = aligned_images_for_stack[0] if aligned_images_for_stack else None
-        if sample_frame is not None:
-            per_frame_bytes = int(np.asarray(sample_frame).nbytes)
-            available_bytes = int(psutil.virtual_memory().available)
-            overhead = 3.2
-            target_fraction = 0.55
-            min_pass = max(1, int(getattr(zconfig, "winsor_min_frames_per_pass", 2)))
-            if per_frame_bytes > 0:
-                preemptive_limit = max(
-                    min_pass,
-                    int((available_bytes * target_fraction) // max(1, int(per_frame_bytes * overhead))),
-                )
-                if preemptive_limit < len(aligned_images_for_stack):
-                    if effective_winsor_frames_per_pass <= 0 or preemptive_limit < effective_winsor_frames_per_pass:
-                        effective_winsor_frames_per_pass = preemptive_limit
-                    try:
-                        setattr(zconfig, "stack_memmap_enabled", True)
-                    except Exception:
-                        pass
-                    try:
-                        pcb_tile(
-                            "stack_mem_preemptive_stream",
-                            prog=None,
-                            lvl="INFO_DETAIL",
-                            frames_per_pass=effective_winsor_frames_per_pass,
-                            tile_id=tile_id,
-                        )
-                    except Exception:
-                        pass
-    except Exception:
-        pass
-
-    if stack_reject_algo == "winsorized_sigma_clip":
-        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_winsorized_sigma_clip(
-            aligned_images_for_stack,
-            weight_method=stack_weight_method,
-            zconfig=zconfig,
-            kappa=stack_kappa_low,
-            winsor_limits=parsed_winsor_limits,
-            apply_rewinsor=True,
-            winsor_max_frames_per_pass=effective_winsor_frames_per_pass,
-            winsor_max_workers=int(winsor_pool_workers) if winsor_pool_workers is not None else 1,
-            stack_metadata=stack_metadata,
-            parallel_plan=current_parallel_plan,
-        )
-    elif stack_reject_algo == "kappa_sigma":
-        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_kappa_sigma_clip(
-            aligned_images_for_stack,
-            weight_method=stack_weight_method,
-            zconfig=zconfig,
-            sigma_low=stack_kappa_low,
-            sigma_high=stack_kappa_high,
-            stack_metadata=stack_metadata,
-            parallel_plan=current_parallel_plan,
-        )
-    elif stack_reject_algo == "linear_fit_clip":
-        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_linear_fit_clip(
-            aligned_images_for_stack,
-            weight_method=stack_weight_method,
-            zconfig=zconfig,
-            sigma=stack_kappa_high,
-            stack_metadata=stack_metadata,
-            parallel_plan=current_parallel_plan,
-        )
-    else:
-        master_tile_stacked_HWC = zemosaic_align_stack.stack_aligned_images(
-            aligned_image_data_list=aligned_images_for_stack,
-            normalize_method=stack_norm_method,
-            weighting_method=stack_weight_method,
-            rejection_algorithm=stack_reject_algo,
-            final_combine_method=stack_final_combine,
-            sigma_clip_low=stack_kappa_low,
-            sigma_clip_high=stack_kappa_high,
-            winsor_limits=parsed_winsor_limits,
-            minimum_signal_adu_target=0.0,
-            apply_radial_weight=apply_radial_weight,
-            radial_feather_fraction=radial_feather_fraction,
-            radial_shape_power=radial_shape_power,
-            winsor_max_workers=winsor_pool_workers,
-            progress_callback=progress_callback,
-            zconfig=zconfig,
-            stack_metadata=stack_metadata,
-            parallel_plan=current_parallel_plan,
-        )
-
-    del aligned_images_for_stack
-    gc.collect()
-
-    return master_tile_stacked_HWC, stack_metadata
-
-
-def _phase3_gpu_candidate(parallel_plan: ParallelPlan | None, logger: logging.Logger | None) -> bool:
-    if _P3_GPU_STATE["hard_disabled"]:
-        return False
-    if not _P3_GPU_STATE.get("allowed", True):
-        return False
-    if not _P3_GPU_HELPERS_AVAILABLE:
-        return False
-    try:
-        if parallel_plan is not None and not getattr(parallel_plan, "use_gpu", True):
-            return False
-    except Exception:
-        pass
-    if not _P3_GPU_STATE["health_checked"]:
-        healthy = bool(_p3_gpu_is_usable(logger))
-        _P3_GPU_STATE["healthy"] = healthy
-        _P3_GPU_STATE["health_checked"] = True
-    return _P3_GPU_STATE["healthy"]
-
-
-def _is_gpu_oom_error(exc: Exception) -> bool:
-    try:
-        import cupy
-        from cupy.cuda import memory
-
-        if isinstance(exc, memory.OutOfMemoryError):
-            return True
-    except Exception:
-        pass
-    try:
-        return "out of memory" in str(exc).lower()
-    except Exception:
-        return False
-
-
-def _shrink_parallel_plan_for_gpu(parallel_plan: ParallelPlan | None) -> ParallelPlan | None:
-    if parallel_plan is None or ParallelPlan is None:
-        return parallel_plan
-    try:
-        current_bytes = getattr(parallel_plan, "gpu_max_chunk_bytes", None)
-        if current_bytes is None or current_bytes <= 0:
-            current_bytes = getattr(parallel_plan, "max_chunk_bytes", None)
-        if current_bytes is None or current_bytes <= 0:
-            current_bytes = 512 * 1024 * 1024
-        tightened_bytes = max(32 * 1024 * 1024, int(current_bytes * 0.5))
-        current_rows = getattr(parallel_plan, "gpu_rows_per_chunk", None)
-        tightened_rows = max(1, int(math.ceil(current_rows / 2))) if current_rows else current_rows
-        return replace(parallel_plan, gpu_max_chunk_bytes=tightened_bytes, gpu_rows_per_chunk=tightened_rows)
-    except Exception:
-        return parallel_plan
-
-
-def _stack_master_tile_auto(
-    image_descriptors: list,
-    *,
-    stack_norm_method: str,
-    stack_weight_method: str,
-    stack_reject_algo: str,
-    stack_kappa_low: float,
-    stack_kappa_high: float,
-    parsed_winsor_limits: tuple[float, float],
-    stack_final_combine: str,
-    poststack_equalize_rgb: bool,
-    apply_radial_weight: bool,
-    radial_feather_fraction: float,
-    radial_shape_power: float,
-    winsor_pool_workers: int | None,
-    winsor_max_frames_per_pass: int | None,
-    progress_callback: callable,
-    zconfig: SimpleNamespace,
-    parallel_plan: ParallelPlan | None,
-    pcb_tile: callable,
-    func_id_log_base: str,
-    tile_id: int,
-    logger: logging.Logger | None,
-) -> tuple[np.ndarray | None, dict[str, Any], bool]:
-    stacking_params = {
-        "stack_norm_method": stack_norm_method,
-        "stack_weight_method": stack_weight_method,
-        "stack_reject_algo": stack_reject_algo,
-        "stack_kappa_low": stack_kappa_low,
-        "stack_kappa_high": stack_kappa_high,
-        "parsed_winsor_limits": parsed_winsor_limits,
-        "stack_final_combine": stack_final_combine,
-        "poststack_equalize_rgb": poststack_equalize_rgb,
-        "apply_radial_weight": apply_radial_weight,
-        "radial_feather_fraction": radial_feather_fraction,
-        "radial_shape_power": radial_shape_power,
-        "winsor_max_frames_per_pass": winsor_max_frames_per_pass,
-    }
-
-    use_gpu_candidate = _phase3_gpu_candidate(parallel_plan, logger)
-    retry_parallel_plan = parallel_plan
-    if use_gpu_candidate and _p3_gpu_stack_from_paths is not None:
-        if logger and not _P3_GPU_STATE.get("info_logged"):
-            try:
-                logger.info("[P3][GPU] Phase 3 GPU auto mode enabled (mode=C, candidate=True)")
-            except Exception:
-                pass
-            _P3_GPU_STATE["info_logged"] = True
-        try:
-            stacked_gpu, meta_gpu = _p3_gpu_stack_from_paths(
-                image_descriptors,
-                stacking_params,
-                parallel_plan=parallel_plan,
-                logger=logger,
-                pcb_tile=pcb_tile,
-                zconfig=zconfig,
-            )
-            _P3_GPU_STATE["healthy"] = True
-            return stacked_gpu, meta_gpu, True
-        except Exception as exc:
-            if isinstance(exc, _P3GPUStackingError):
-                if logger:
-                    logger.warning(
-                        "[P3][GPU] Stack failed (GPUStackingError): %s -- retrying once on GPU",
-                        exc,
-                    )
-            else:
-                if logger:
-                    logger.warning(
-                        "[P3][GPU] Unexpected GPU error: %s -- retrying once on GPU",
-                        exc,
-                        exc_info=True,
-                    )
-            if _is_gpu_oom_error(exc):
-                try:
-                    if ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils and hasattr(
-                        zemosaic_utils, "free_cupy_memory_pools"
-                    ):
-                        zemosaic_utils.free_cupy_memory_pools()
-                except Exception:
-                    pass
-                retry_parallel_plan = _shrink_parallel_plan_for_gpu(parallel_plan)
-        try:
-            stacked_gpu, meta_gpu = _p3_gpu_stack_from_paths(
-                image_descriptors,
-                stacking_params,
-                parallel_plan=retry_parallel_plan,
-                logger=logger,
-                pcb_tile=pcb_tile,
-                zconfig=zconfig,
-            )
-            _P3_GPU_STATE["healthy"] = True
-            return stacked_gpu, meta_gpu, True
-        except Exception as exc:
-            if logger:
-                logger.error(
-                    "[P3][GPU] Second GPU attempt failed; disabling Phase 3 GPU for this run: %s",
-                    exc,
-                    exc_info=True,
-                )
-                try:
-                    logger.warning(
-                        "[P3][GPU] GPU disabled for remaining Phase 3 tiles after repeated failures."
-                    )
-                except Exception:
-                    pass
-            _P3_GPU_STATE["hard_disabled"] = True
-            _P3_GPU_STATE["healthy"] = False
-
-    stacked_cpu, meta_cpu = _stack_master_tile_cpu(
-        image_descriptors,
-        stack_norm_method=stack_norm_method,
-        stack_weight_method=stack_weight_method,
-        stack_reject_algo=stack_reject_algo,
-        stack_kappa_low=stack_kappa_low,
-        stack_kappa_high=stack_kappa_high,
-        parsed_winsor_limits=parsed_winsor_limits,
-        stack_final_combine=stack_final_combine,
-        apply_radial_weight=apply_radial_weight,
-        radial_feather_fraction=radial_feather_fraction,
-        radial_shape_power=radial_shape_power,
-        winsor_pool_workers=winsor_pool_workers,
-        winsor_max_frames_per_pass=winsor_max_frames_per_pass,
-        progress_callback=progress_callback,
-        zconfig=zconfig,
-        parallel_plan=parallel_plan,
-        pcb_tile=pcb_tile,
-        func_id_log_base=func_id_log_base,
-        tile_id=tile_id,
-    )
-    return stacked_cpu, meta_cpu, False
-
-
 def create_master_tile(
     seestar_stack_group_info: list[dict],
     tile_id: int,
@@ -9700,9 +9163,6 @@ def create_master_tile(
     center_out_settings: dict | None = None,
     center_out_rank: int | None = None,
     parallel_plan: ParallelPlan | None = None,
-    allow_batch_duplication: bool = True,
-    target_stack_size: int = 5,
-    min_safe_stack_size: int = 3,
 ):
     """
     Crée une "master tuile" à partir d'un groupe d'images.
@@ -9777,41 +9237,6 @@ def create_master_tile(
         except Exception:
             pass
     func_id_log_base = "mastertile"
-    # Detect and apply EXTREME_GROUP overrides for very large groups
-    try:
-        num_frames = int(len(seestar_stack_group_info) if seestar_stack_group_info is not None else 0)
-    except Exception:
-        num_frames = 0
-    extreme_group_threshold = int(getattr(zconfig, "extreme_group_threshold", 1000))
-    extreme_group_mode = num_frames >= extreme_group_threshold
-    _extreme_group_originals = {}
-    if extreme_group_mode:
-        try:
-            # Save originals (may be missing)
-            _extreme_group_originals["stack_mem_preemptive_stream_enabled"] = getattr(zconfig, "stack_mem_preemptive_stream_enabled", None)
-            _extreme_group_originals["stack_memmap_enabled"] = getattr(zconfig, "stack_memmap_enabled", None)
-            _extreme_group_originals["winsor_max_frames_per_pass"] = getattr(zconfig, "winsor_max_frames_per_pass", None)
-            # Apply aggressive overrides for the current tile only
-            try:
-                setattr(zconfig, "stack_mem_preemptive_stream_enabled", True)
-            except Exception:
-                pass
-            try:
-                setattr(zconfig, "stack_memmap_enabled", True)
-            except Exception:
-                pass
-            # Cap winsor frames per pass to a conservative value (defaults to 600)
-            winsor_cap = int(getattr(zconfig, "extreme_group_winsor_cap", 600))
-            try:
-                setattr(zconfig, "winsor_max_frames_per_pass", winsor_cap)
-            except Exception:
-                pass
-            try:
-                pcb_tile("mastertile_extreme_group", prog=None, lvl="WARN", tile_id=tile_id, num_frames=num_frames, reason="[EXTREME_GROUP]")
-            except Exception:
-                pass
-        except Exception:
-            _extreme_group_originals = {}
 
     pcb_tile(f"{func_id_log_base}_info_creation_started_from_cache", prog=None, lvl="INFO",
              num_raw=len(seestar_stack_group_info), tile_id=tile_id)
@@ -9831,35 +9256,9 @@ def create_master_tile(
         if not ASTROPY_AVAILABLE or not fits: pcb_tile(f"{func_id_log_base}_error_astropy_unavailable", prog=None, lvl="ERROR", tile_id=tile_id)
         return (None, None), failed_groups_to_retry
         
-    if not seestar_stack_group_info:
+    if not seestar_stack_group_info: 
         pcb_tile(f"{func_id_log_base}_error_no_images_provided", prog=None, lvl="ERROR", tile_id=tile_id)
         return (None, None), failed_groups_to_retry
-
-    quality_crop_enabled_tile = bool(quality_crop_enabled)
-    quality_gate_enabled_tile = bool(quality_gate_enabled)
-    min_safe_stack_effective = max(1, int(min_safe_stack_size))
-    target_stack_effective = max(min_safe_stack_effective, int(target_stack_size))
-
-    original_batch_size = len(seestar_stack_group_info)
-    if allow_batch_duplication and original_batch_size < target_stack_effective and original_batch_size > 0:
-        repeat = math.ceil(target_stack_effective / original_batch_size)
-        seestar_stack_group_info = (seestar_stack_group_info * repeat)[:target_stack_effective]
-        pcb_tile(
-            f"[Batch] Duplicating frames: original={original_batch_size} → final={len(seestar_stack_group_info)}",
-            prog=None,
-            lvl="INFO_DETAIL",
-            tile_id=int(tile_id),
-        )
-        try:
-            if logger:
-                logger.info(
-                    "[Batch] Duplicating frames: original=%d → final=%d for tile %s",
-                    original_batch_size,
-                    len(seestar_stack_group_info),
-                    str(tile_id),
-                )
-        except Exception:
-            pass
     
     # Choix de l'image de référence (généralement la première du groupe après tri ou la plus centrale)
     reference_image_index_in_group = 0 # Pourrait être plus sophistiqué à l'avenir
@@ -9907,7 +9306,7 @@ def create_master_tile(
         try:
             # Throttle concurrent cache reads and use memory-mapped load to reduce RAM spikes
             with _CACHE_IO_SEMAPHORE:
-                img_data_adu = _safe_load_cache(cached_image_file_path, pcb=pcb_tile, tile_id=tile_id)
+                img_data_adu = np.load(cached_image_file_path, allow_pickle=False, mmap_mode='r') 
             if not (isinstance(img_data_adu, np.ndarray) and img_data_adu.dtype == np.float32 and img_data_adu.ndim == 3 and img_data_adu.shape[-1] == 3):
                 pcb_tile(f"{func_id_log_base}_warn_invalid_cached_data", prog=None, lvl="WARN", filename=_safe_basename(cached_image_file_path), 
                          shape=img_data_adu.shape if hasattr(img_data_adu, 'shape') else 'N/A', 
@@ -9985,65 +9384,114 @@ def create_master_tile(
 
     num_actually_aligned_for_header = len(valid_aligned_images)
     pcb_tile(f"{func_id_log_base}_info_intra_tile_alignment_finished", prog=None, lvl="DEBUG_DETAIL", num_aligned=num_actually_aligned_for_header, tile_id=tile_id)
-
-    if not valid_aligned_images:
+    
+    if not valid_aligned_images: 
         pcb_tile(f"{func_id_log_base}_error_no_images_after_alignment", prog=None, lvl="ERROR", tile_id=tile_id)
         try:
             _PH3_CONCURRENCY_SEMAPHORE.release()
         except Exception:
             pass
         return (None, None), failed_groups_to_retry
-
-    n_used_for_stack = len(valid_aligned_images)
-    if n_used_for_stack < min_safe_stack_effective:
-        quality_gate_enabled_tile = False
-        quality_crop_enabled_tile = False
-        pcb_tile(
-            f"Tile {tile_id}: salvage mode (n={n_used_for_stack}). Relaxing QC and crop.",
-            prog=None,
-            lvl="WARN",
-        )
-        try:
-            if logger:
-                logger.warning(
-                    "Tile %s: salvage mode (n=%d). Relaxing QC and crop.",
-                    str(tile_id),
-                    n_used_for_stack,
-                )
-        except Exception:
-            pass
-
+    
     pcb_tile(f"{func_id_log_base}_info_stacking_started", prog=None, lvl="DEBUG_DETAIL",
              num_to_stack=len(valid_aligned_images), tile_id=tile_id) # Les options sont loggées au début
-    master_tile_stacked_HWC, stack_metadata, used_gpu = _stack_master_tile_auto(
-        valid_aligned_images,
-        stack_norm_method=stack_norm_method,
-        stack_weight_method=stack_weight_method,
-        stack_reject_algo=stack_reject_algo,
-        stack_kappa_low=stack_kappa_low,
-        stack_kappa_high=stack_kappa_high,
-        parsed_winsor_limits=parsed_winsor_limits,
-        stack_final_combine=stack_final_combine,
-        poststack_equalize_rgb=poststack_equalize_rgb,
-        apply_radial_weight=apply_radial_weight,
-        radial_feather_fraction=radial_feather_fraction,
-        radial_shape_power=radial_shape_power,
-        winsor_pool_workers=winsor_pool_workers,
-        winsor_max_frames_per_pass=winsor_max_frames_per_pass,
-        progress_callback=progress_callback,
-        zconfig=zconfig,
-        parallel_plan=parallel_plan,
-        pcb_tile=pcb_tile,
-        func_id_log_base=func_id_log_base,
-        tile_id=tile_id,
-        logger=logger,
-    )
 
+    stack_metadata: dict[str, Any] = {}
+
+    current_parallel_plan = parallel_plan or getattr(zconfig, "parallel_plan", None)
+    effective_winsor_frames_per_pass = int(winsor_max_frames_per_pass) if winsor_max_frames_per_pass is not None else 0
+    if effective_winsor_frames_per_pass < 0:
+        effective_winsor_frames_per_pass = 0
     try:
-        del valid_aligned_images
+        sample_frame = valid_aligned_images[0] if valid_aligned_images else None
+        if sample_frame is not None:
+            per_frame_bytes = int(np.asarray(sample_frame).nbytes)
+            available_bytes = int(psutil.virtual_memory().available)
+            overhead = 3.2
+            target_fraction = 0.55
+            min_pass = max(1, int(getattr(zconfig, "winsor_min_frames_per_pass", 2)))
+            if per_frame_bytes > 0:
+                preemptive_limit = max(
+                    min_pass,
+                    int((available_bytes * target_fraction) // max(1, int(per_frame_bytes * overhead))),
+                )
+                if preemptive_limit < len(valid_aligned_images):
+                    if effective_winsor_frames_per_pass <= 0 or preemptive_limit < effective_winsor_frames_per_pass:
+                        effective_winsor_frames_per_pass = preemptive_limit
+                    try:
+                        setattr(zconfig, "stack_memmap_enabled", True)
+                    except Exception:
+                        pass
+                    try:
+                        pcb_tile(
+                            "stack_mem_preemptive_stream",
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                            frames_per_pass=effective_winsor_frames_per_pass,
+                            tile_id=tile_id,
+                        )
+                    except Exception:
+                        pass
     except Exception:
         pass
-    gc.collect()
+
+    if stack_reject_algo == "winsorized_sigma_clip":
+        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_winsorized_sigma_clip(
+            valid_aligned_images,
+            weight_method=stack_weight_method,
+            zconfig=zconfig,
+            kappa=stack_kappa_low,
+            winsor_limits=parsed_winsor_limits,
+            apply_rewinsor=True,
+            winsor_max_frames_per_pass=effective_winsor_frames_per_pass,
+            winsor_max_workers=int(winsor_pool_workers) if winsor_pool_workers is not None else 1,
+            stack_metadata=stack_metadata,
+            parallel_plan=current_parallel_plan,
+        )
+    elif stack_reject_algo == "kappa_sigma":
+        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_kappa_sigma_clip(
+            valid_aligned_images,
+            weight_method=stack_weight_method,
+            zconfig=zconfig,
+            sigma_low=stack_kappa_low,
+            sigma_high=stack_kappa_high,
+            stack_metadata=stack_metadata,
+            parallel_plan=current_parallel_plan,
+        )
+    elif stack_reject_algo == "linear_fit_clip":
+        master_tile_stacked_HWC, _ = zemosaic_align_stack.stack_linear_fit_clip(
+            valid_aligned_images,
+            weight_method=stack_weight_method,
+            zconfig=zconfig,
+            sigma=stack_kappa_high,
+            stack_metadata=stack_metadata,
+            parallel_plan=current_parallel_plan,
+        )
+    else:
+        master_tile_stacked_HWC = zemosaic_align_stack.stack_aligned_images(
+            aligned_image_data_list=valid_aligned_images,
+            normalize_method=stack_norm_method,
+            weighting_method=stack_weight_method,
+            rejection_algorithm=stack_reject_algo,
+            final_combine_method=stack_final_combine,
+            sigma_clip_low=stack_kappa_low,
+            sigma_clip_high=stack_kappa_high,
+            winsor_limits=parsed_winsor_limits,
+            minimum_signal_adu_target=0.0,
+            apply_radial_weight=apply_radial_weight,
+            radial_feather_fraction=radial_feather_fraction,
+            radial_shape_power=radial_shape_power,
+            winsor_max_workers=winsor_pool_workers,
+            progress_callback=progress_callback,
+            zconfig=zconfig,
+            stack_metadata=stack_metadata,
+            parallel_plan=current_parallel_plan,
+        )
+    
+    del valid_aligned_images; gc.collect() # valid_aligned_images a été passé par valeur (copie de la liste)
+                                          # mais les arrays NumPy à l'intérieur sont passés par référence.
+                                          # stack_aligned_images travaille sur ces arrays.
+                                          # Il est bon de del ici.
 
     if master_tile_stacked_HWC is None:
         pcb_tile(f"{func_id_log_base}_error_stacking_failed", prog=None, lvl="ERROR", tile_id=tile_id)
@@ -10059,7 +9507,6 @@ def create_master_tile(
              # max_val=np.nanmax(master_tile_stacked_HWC),
              # mean_val=np.nanmean(master_tile_stacked_HWC))
 
-    stack_metadata["phase3_used_gpu"] = bool(used_gpu)
     rgb_eq_info = stack_metadata.get("rgb_equalization", {})
     try:
         gain_r = float(rgb_eq_info.get("gain_r", 1.0))
@@ -10135,7 +9582,7 @@ def create_master_tile(
                 )
 
     quality_crop_rect: tuple[int, int, int, int] | None = None
-    if quality_crop_enabled_tile:
+    if quality_crop_enabled:
         try:
             band_px = max(4, int(quality_crop_band_px))
         except Exception:
@@ -10261,7 +9708,7 @@ def create_master_tile(
             )
 
     pipeline_cfg = {
-        "quality_crop_enabled": quality_crop_enabled_tile,
+        "quality_crop_enabled": quality_crop_enabled,
         "quality_crop_band_px": quality_crop_band_px,
         "quality_crop_k_sigma": quality_crop_k_sigma,
         "quality_crop_margin_px": quality_crop_margin_px,
@@ -10300,7 +9747,7 @@ def create_master_tile(
     quality_gate_eval: Optional[dict[str, Any]] = _evaluate_quality_gate_metrics(
         tile_id,
         master_tile_stacked_HWC,
-        enabled=quality_gate_enabled_tile,
+        enabled=quality_gate_enabled,
         threshold=quality_gate_threshold,
         edge_band=quality_gate_edge_band_px,
         k_sigma=quality_gate_k_sigma,
@@ -10525,56 +9972,6 @@ def create_master_tile(
         if 'master_tile_stacked_HWC' in locals() and master_tile_stacked_HWC is not None: 
             del master_tile_stacked_HWC
         gc.collect()
-        # Restore any EXTREME_GROUP overrides applied to zconfig for this tile
-        try:
-            if '_extreme_group_originals' in locals() and isinstance(_extreme_group_originals, dict) and getattr(zconfig, None) is not None:
-                try:
-                    if 'stack_mem_preemptive_stream_enabled' in _extreme_group_originals:
-                        orig = _extreme_group_originals.get('stack_mem_preemptive_stream_enabled')
-                        if orig is None:
-                            try:
-                                delattr(zconfig, 'stack_mem_preemptive_stream_enabled')
-                            except Exception:
-                                pass
-                        else:
-                            try:
-                                setattr(zconfig, 'stack_mem_preemptive_stream_enabled', orig)
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-                try:
-                    if 'stack_memmap_enabled' in _extreme_group_originals:
-                        orig = _extreme_group_originals.get('stack_memmap_enabled')
-                        if orig is None:
-                            try:
-                                delattr(zconfig, 'stack_memmap_enabled')
-                            except Exception:
-                                pass
-                        else:
-                            try:
-                                setattr(zconfig, 'stack_memmap_enabled', orig)
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-                try:
-                    if 'winsor_max_frames_per_pass' in _extreme_group_originals:
-                        orig = _extreme_group_originals.get('winsor_max_frames_per_pass')
-                        if orig is None:
-                            try:
-                                delattr(zconfig, 'winsor_max_frames_per_pass')
-                            except Exception:
-                                pass
-                        else:
-                            try:
-                                setattr(zconfig, 'winsor_max_frames_per_pass', orig)
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-        except Exception:
-            pass
 
 
 
@@ -13059,16 +12456,6 @@ def run_second_pass_coverage_renorm(
         local_kwargs = dict(reproj_kwargs)
         try:
             chan_mosaic, chan_cov = _invoke_reproj(use_gpu_flag, local_kwargs)
-        except wcs_module.NoConvergence as conv_exc:
-            if logger:
-                logger.warning(
-                    "[TwoPass] WCS convergence failed on channel %d, creating empty patch: %s",
-                    ch_idx,
-                    conv_exc,
-                    exc_info=False,
-                )
-            chan_mosaic = np.full(shape_out_hw, np.nan, dtype=np.float32)
-            chan_cov = np.zeros(shape_out_hw, dtype=np.float32)
         except TypeError as type_err:
             if logger:
                 logger.warning("[TwoPass] GPU reprojection TypeError, attempting recovery: %s", type_err)
@@ -13094,16 +12481,6 @@ def run_second_pass_coverage_renorm(
             if chan_mosaic is None or chan_cov is None:
                 try:
                     chan_mosaic, chan_cov = _invoke_reproj(False, local_kwargs)
-                except wcs_module.NoConvergence as conv_exc_cpu:
-                    if logger:
-                        logger.warning(
-                            "[TwoPass] WCS convergence failed on channel %d (CPU fallback), creating empty patch: %s",
-                            ch_idx,
-                            conv_exc_cpu,
-                            exc_info=False,
-                        )
-                    chan_mosaic = np.full(shape_out_hw, np.nan, dtype=np.float32)
-                    chan_cov = np.zeros(shape_out_hw, dtype=np.float32)
                 except Exception as cpu_exc:
                     if logger:
                         logger.warning(
@@ -13117,16 +12494,6 @@ def run_second_pass_coverage_renorm(
             if use_gpu_flag:
                 try:
                     chan_mosaic, chan_cov = _invoke_reproj(False, local_kwargs)
-                except wcs_module.NoConvergence as conv_exc_cpu2:
-                    if logger:
-                        logger.warning(
-                            "[TwoPass] WCS convergence failed on channel %d (CPU fallback), creating empty patch: %s",
-                            ch_idx,
-                            conv_exc_cpu2,
-                            exc_info=False,
-                        )
-                    chan_mosaic = np.full(shape_out_hw, np.nan, dtype=np.float32)
-                    chan_cov = np.zeros(shape_out_hw, dtype=np.float32)
                 except Exception as cpu_exc:
                     if logger:
                         logger.warning(
@@ -13182,23 +12549,23 @@ def run_second_pass_coverage_renorm(
             if use_gpu_flag:
                 gpu_assigned = True
             channel_tasks.append((ch, use_gpu_flag))
-        max_channel_workers = max(1, min(n_channels, cpu_workers_hint or n_channels))
         reproj_failure = False
         done_channels = 0
-        with ThreadPoolExecutor(max_workers=max_channel_workers) as executor:
-            future_map = {
-                executor.submit(_process_channel, ch_idx, use_gpu_flag): ch_idx for ch_idx, use_gpu_flag in channel_tasks
-            }
-            for fut in as_completed(future_map):
-                try:
-                    ch_idx, chan_mosaic_np, chan_cov_np = fut.result()
-                    mosaic_channels[ch_idx] = chan_mosaic_np
-                    coverage_channels[ch_idx] = chan_cov_np
-                except Exception as exc:
-                    reproj_failure = True
-                    if logger:
-                        logger.warning("[TwoPass] Channel %d reprojection failed: %s", future_map.get(fut, -1), exc)
-                    break
+
+        # Process the GPU-designated channel synchronously to avoid thread-context issues.
+        gpu_channel_task: tuple[int, bool] | None = None
+        cpu_channel_tasks: list[tuple[int, bool]] = []
+        for task in channel_tasks:
+            if task[1] and gpu_channel_task is None:
+                gpu_channel_task = task
+            else:
+                cpu_channel_tasks.append((task[0], False))
+
+        if gpu_channel_task is not None:
+            try:
+                ch_idx, chan_mosaic_np, chan_cov_np = _process_channel(*gpu_channel_task)
+                mosaic_channels[ch_idx] = chan_mosaic_np
+                coverage_channels[ch_idx] = chan_cov_np
                 done_channels += 1
                 _emit_two_pass_stats(
                     tiles_total,
@@ -13207,6 +12574,37 @@ def run_second_pass_coverage_renorm(
                     force=False,
                     stage="reproject",
                 )
+            except Exception as exc:
+                reproj_failure = True
+                if logger:
+                    logger.warning("[TwoPass] GPU channel %d reprojection failed: %s", gpu_channel_task[0], exc)
+        if reproj_failure:
+            return None
+
+        if cpu_channel_tasks:
+            max_channel_workers = max(1, min(len(cpu_channel_tasks), cpu_workers_hint or len(cpu_channel_tasks)))
+            with ThreadPoolExecutor(max_workers=max_channel_workers) as executor:
+                future_map = {
+                    executor.submit(_process_channel, ch_idx, False): ch_idx for ch_idx, _ in cpu_channel_tasks
+                }
+                for fut in as_completed(future_map):
+                    try:
+                        ch_idx, chan_mosaic_np, chan_cov_np = fut.result()
+                        mosaic_channels[ch_idx] = chan_mosaic_np
+                        coverage_channels[ch_idx] = chan_cov_np
+                    except Exception as exc:
+                        reproj_failure = True
+                        if logger:
+                            logger.warning("[TwoPass] Channel %d reprojection failed: %s", future_map.get(fut, -1), exc)
+                        break
+                    done_channels += 1
+                    _emit_two_pass_stats(
+                        tiles_total,
+                        chunk_index=done_channels,
+                        chunk_total=reproj_chunk_total,
+                        force=False,
+                        stage="reproject",
+                    )
         if reproj_failure or any(m is None for m in mosaic_channels):
             return None
 
@@ -13370,7 +12768,6 @@ def run_hierarchical_mosaic(
     filter_overrides: dict | None = None,
     filtered_header_items: list[dict] | None = None,
     early_filter_enabled: bool | None = None,
-    final_mosaic_rgb_equalize_enabled_config: bool | None = None,
 ):
     """
     Orchestre le traitement de la mosaïque hiérarchique.
@@ -13396,9 +12793,12 @@ def run_hierarchical_mosaic(
     except Exception:
         zconfig = SimpleNamespace()
 
+    def pcb(msg_key, prog=None, lvl="INFO", **kwargs):
+        """Shortcut to emit log+callback events with the current progress callback."""
+        _log_and_callback(msg_key, prog, lvl, callback=progress_callback, **kwargs)
+
     def _coerce_bool_flag(value) -> bool | None:
         """Interpret various truthy/falsy representations coming from configs/UI."""
-
         if value is None:
             return None
         if isinstance(value, bool):
@@ -13417,75 +12817,6 @@ def run_hierarchical_mosaic(
             return bool(value)
         except Exception:
             return None
-
-    grid_rgb_equalize_source = "argument"
-    grid_rgb_equalize_flag = _coerce_bool_flag(poststack_equalize_rgb_config)
-    cfg_rgb = _coerce_bool_flag(worker_config_cache.get("grid_rgb_equalize"))
-    if cfg_rgb is None:
-        cfg_rgb = _coerce_bool_flag(worker_config_cache.get("poststack_equalize_rgb"))
-    if cfg_rgb is not None:
-        grid_rgb_equalize_source = "config"
-        grid_rgb_equalize_flag = cfg_rgb
-    if grid_rgb_equalize_flag is None:
-        grid_rgb_equalize_flag = True
-        grid_rgb_equalize_source = "default"
-    poststack_equalize_rgb_config = bool(grid_rgb_equalize_flag)
-    setattr(zconfig, "poststack_equalize_rgb", bool(grid_rgb_equalize_flag))
-
-    final_mosaic_rgb_equalize_enabled = _coerce_bool_flag(
-        final_mosaic_rgb_equalize_enabled_config
-    )
-    if final_mosaic_rgb_equalize_enabled is None:
-        final_mosaic_rgb_equalize_enabled = _coerce_bool_flag(
-            worker_config_cache.get("final_mosaic_rgb_equalize_enabled")
-        )
-    if final_mosaic_rgb_equalize_enabled is None:
-        final_mosaic_rgb_equalize_enabled = False
-    final_mosaic_rgb_equalize_enabled = bool(final_mosaic_rgb_equalize_enabled)
-    setattr(zconfig, "final_mosaic_rgb_equalize_enabled", final_mosaic_rgb_equalize_enabled)
-
-    if detect_grid_mode(input_folder):
-        if grid_mode and hasattr(grid_mode, "run_grid_mode"):
-            try:
-                logger.info(
-                    "[GRID] Invoking grid_mode.run_grid_mode(...) with "
-                    "grid_rgb_equalize=%s (source=%s), stack_norm=%s, stack_weight=%s, reject_algo=%s, combine=%s",
-                    grid_rgb_equalize_flag,
-                    grid_rgb_equalize_source,
-                    stack_norm_method,
-                    stack_weight_method,
-                    stack_reject_algo,
-                    stack_final_combine,
-                )
-                grid_mode.run_grid_mode(  # type: ignore[attr-defined]
-                    input_folder=input_folder,
-                    output_folder=output_folder,
-                    progress_callback=progress_callback,
-                    stack_norm_method=stack_norm_method,
-                    stack_weight_method=stack_weight_method,
-                    stack_reject_algo=stack_reject_algo,
-                    stack_kappa_low=stack_kappa_low,
-                    stack_kappa_high=stack_kappa_high,
-                    winsor_limits=parsed_winsor_limits,
-                    stack_final_combine=stack_final_combine,
-                    apply_radial_weight=apply_radial_weight_config,
-                    radial_feather_fraction=radial_feather_fraction_config,
-                    radial_shape_power=radial_shape_power_config,
-                    save_final_as_uint16=save_final_as_uint16_config,
-                    legacy_rgb_cube=legacy_rgb_cube_config,
-                    grid_rgb_equalize=grid_rgb_equalize_flag,
-                )
-                return
-            except Exception:
-                logger.error("[GRID] Grid/Survey mode failed; aborting without classic fallback", exc_info=True)
-                raise
-        error_msg = "[GRID] grid_mode module unavailable; aborting (no classic fallback)."
-        logger.error(error_msg)
-        raise RuntimeError(error_msg)
-
-    def pcb(msg_key, prog=None, lvl="INFO", **kwargs):
-        """Shortcut to emit log+callback events with the current progress callback."""
-        _log_and_callback(msg_key, prog, lvl, callback=progress_callback, **kwargs)
 
     global_wcs_plan = _prepare_global_wcs_plan(
         output_folder,
@@ -13609,49 +12940,6 @@ def run_hierarchical_mosaic(
         logger.info("Worker logging level set to %s", str(logging.getLevelName(lvl)))
     except Exception:
         pass
-
-    try:
-        batch_overlap_pct_config = float(worker_config_cache.get("batch_overlap_pct", 0.0))
-    except Exception:
-        batch_overlap_pct_config = 0.0
-    batch_overlap_pct_override = None
-    try:
-        if isinstance(filter_overrides, dict) and "batch_overlap_pct" in filter_overrides:
-            batch_overlap_pct_override = float(filter_overrides.get("batch_overlap_pct", batch_overlap_pct_config))
-    except Exception:
-        batch_overlap_pct_override = None
-    if batch_overlap_pct_override is not None:
-        batch_overlap_pct_config = batch_overlap_pct_override
-    overlap_fraction_config = max(0.0, min(0.7, float(batch_overlap_pct_config) / 100.0))
-
-    try:
-        min_safe_stack_config = int(worker_config_cache.get("min_safe_stack", 3) or 3)
-    except Exception:
-        min_safe_stack_config = 3
-    try:
-        target_stack_config = int(worker_config_cache.get("target_stack", 5) or 5)
-    except Exception:
-        target_stack_config = 5
-    allow_duplication_config = _coerce_bool_flag(worker_config_cache.get("allow_batch_duplication", True))
-    if allow_duplication_config is None:
-        allow_duplication_config = True
-    if isinstance(filter_overrides, dict):
-        if "min_safe_stack" in filter_overrides:
-            try:
-                min_safe_stack_config = int(filter_overrides.get("min_safe_stack", min_safe_stack_config))
-            except Exception:
-                pass
-        if "target_stack" in filter_overrides:
-            try:
-                target_stack_config = int(filter_overrides.get("target_stack", target_stack_config))
-            except Exception:
-                pass
-        if "allow_batch_duplication" in filter_overrides:
-            allow_override = _coerce_bool_flag(filter_overrides.get("allow_batch_duplication"))
-            if allow_override is not None:
-                allow_duplication_config = allow_override
-    min_safe_stack_config = max(1, min_safe_stack_config)
-    target_stack_config = max(min_safe_stack_config, target_stack_config)
 
     # --- Harmoniser les méthodes de pondération issues du GUI / CLI / fallback config ---
     requested_stack_weight_method = stack_weight_method
@@ -14755,9 +14043,6 @@ def run_hierarchical_mosaic(
     pcb("PHASE_UPDATE:2", prog=None, lvl="ETA_LEVEL")
     # Use order-invariant connected-components clustering for robustness
     preplan_groups_active = False
-    # If we successfully map preplanned group(s) from the Filter UI then
-    # we enable a strict mode which prevents automatic re-splitting.
-    preplan_groups_strict = False
     if preplan_groups_override_paths:
         try:
             path_lookup = {
@@ -14791,11 +14076,8 @@ def run_hierarchical_mosaic(
                     mapped_info_groups.append(leftovers)
                 seestar_stack_groups = mapped_info_groups
                 preplan_groups_active = True
-                # Respect preplanned groups strictly: avoid any automatic
-                # splitting or caps that would change the number of groups.
-                preplan_groups_strict = True
                 _log_and_callback(
-                    f"Phase 2: using {len(mapped_info_groups)} preplanned group(s) from filter UI (strict mode).",
+                    f"Phase 2: using {len(mapped_info_groups)} preplanned group(s) from filter UI.",
                     prog=None,
                     lvl="INFO_DETAIL",
                     callback=progress_callback,
@@ -15124,7 +14406,6 @@ def run_hierarchical_mosaic(
     if not seestar_stack_groups:
         pcb("run_error_phase2_no_groups", prog=(base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING), lvl="ERROR")
         return
-    auto_split_cap_value: int | None = None
     if (not preplan_groups_active) and auto_caps_info and seestar_stack_groups:
         try:
             cap_value = int(auto_caps_info.get("cap", 0))
@@ -15132,7 +14413,6 @@ def run_hierarchical_mosaic(
         except Exception:
             cap_value = 0
             min_value = 8
-        auto_split_cap_value = cap_value if cap_value > 0 else None
         if cap_value > 0:
             original_count = len(seestar_stack_groups)
             seestar_stack_groups = _auto_split_groups(
@@ -15179,42 +14459,6 @@ def run_hierarchical_mosaic(
                 limit=max_raw_per_master_tile_config,
             )
         seestar_stack_groups = new_groups
-    overlap_cap = None
-    if max_raw_per_master_tile_config and max_raw_per_master_tile_config > 0:
-        overlap_cap = int(max_raw_per_master_tile_config)
-    elif auto_split_cap_value:
-        overlap_cap = int(auto_split_cap_value)
-    if overlap_fraction_config > 0.0 and overlap_cap and seestar_stack_groups:
-        overlapping_groups: list[list[dict]] = []
-        effective_step = max(1, int(overlap_cap * (1.0 - overlap_fraction_config)))
-        for group in seestar_stack_groups:
-            ordered_group = _sort_group_for_overlap(group)
-            batches_idx = make_overlapping_batches(list(range(len(ordered_group))), overlap_cap, overlap_fraction_config)
-            if not batches_idx and ordered_group:
-                batches_idx = [list(range(len(ordered_group)))]
-            for batch_indices in batches_idx:
-                batch = [ordered_group[i] for i in batch_indices if 0 <= i < len(ordered_group)]
-                if batch:
-                    overlapping_groups.append(batch)
-        if overlapping_groups:
-            pcb(
-                "[Batching] cap overlap applied",
-                prog=None,
-                lvl="INFO_DETAIL",
-                cap=int(overlap_cap),
-                overlap=float(overlap_fraction_config),
-                step=int(effective_step),
-                batches=int(len(overlapping_groups)),
-            )
-            seestar_stack_groups = overlapping_groups
-        else:
-            pcb(
-                "[Batching] overlap skipped (no groups produced)",
-                prog=None,
-                lvl="DEBUG_DETAIL",
-                cap=int(overlap_cap),
-                overlap=float(overlap_fraction_config),
-            )
     cpu_total = os.cpu_count() or 1
     winsor_worker_limit = max(1, min(int(winsor_worker_limit_config), cpu_total))
     winsor_max_frames_per_pass = max(0, int(winsor_max_frames_per_pass_config))
@@ -15257,17 +14501,7 @@ def run_hierarchical_mosaic(
         and (cluster_target_groups_config is None or int(cluster_target_groups_config) <= 0)
         and not memmap_streaming_enabled
     )
-    if preplan_groups_strict and seestar_stack_groups:
-        # A preplan came from the Filter UI and mapped successfully. In
-        # strict mode we must not change the number or composition of the
-        # groups the user specified — skip auto-limit splitting.
-        _log_and_callback(
-            f"Phase 2: preplanned groups present (strict mode) — skipping runtime auto-limit splitting (groups kept = {len(seestar_stack_groups)})",
-            prog=None,
-            lvl="INFO_DETAIL",
-            callback=progress_callback,
-        )
-    elif allow_auto_limit and seestar_stack_groups:
+    if allow_auto_limit and seestar_stack_groups:
         try:
             sample_path = None
             for group in seestar_stack_groups:
@@ -15496,7 +14730,6 @@ def run_hierarchical_mosaic(
             "two_pass_sigma_px": two_pass_sigma_px,
             "two_pass_gain_clip": gain_clip_tuple,
             "two_pass_coverage_renorm": two_pass_coverage_renorm_config,
-            "final_mosaic_rgb_equalize_enabled": bool(final_mosaic_rgb_equalize_enabled),
             "use_gpu_phase5": use_gpu_phase5_flag,
             "assembly_process_workers": assembly_process_workers_config,
             "intertile_preview_size": intertile_preview_size_config,
@@ -15815,7 +15048,6 @@ def run_hierarchical_mosaic(
                         start_time_total_run=start_time_total_run,
                         progress_callback=progress_callback,
                         pcb=pcb,
-                        zconfig=zconfig,
                         logger=logger,
                     )
                     master_tiles_results_list = list(sds_tile_records)
@@ -16260,9 +15492,6 @@ def run_hierarchical_mosaic(
                     center_out_settings=center_out_settings if center_out_context else None,
                     center_out_rank=processing_rank,
                     parallel_plan=getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan")),
-                    allow_batch_duplication=bool(allow_duplication_config),
-                    target_stack_size=int(target_stack_config),
-                    min_safe_stack_size=int(min_safe_stack_config),
                 )
                 future_to_tile_id[future] = assigned_tile_id
                 pending_futures.add(future)
@@ -16611,7 +15840,6 @@ def run_hierarchical_mosaic(
                 start_time_total_run=start_time_total_run,
                 progress_callback=progress_callback,
                 pcb=pcb,
-                zconfig=zconfig,
                 logger=logger,
             )
             if final_mosaic_data_HWC is None:
@@ -16854,8 +16082,7 @@ def run_hierarchical_mosaic(
                         if np.any(mask_zero):
                             preview_view = np.array(preview_view, copy=True)
                             try:
-                                # Explicitly assign to all channels for the masked pixels
-                                preview_view[mask_zero] = [np.nan, np.nan, np.nan]
+                                preview_view[mask_zero[..., None]] = np.nan
                             except Exception as e_nan:
                                 logger.warning(
                                     "phase6: preview NaN masking failed: %s (shape preview=%s, alpha=%s)",
@@ -17193,62 +16420,26 @@ def run_hierarchical_mosaic_process(
             return
         progress_queue.put((message_key_or_raw, progress_value, level, cb_kwargs))
 
-    # Prepare arguments for run_hierarchical_mosaic from the incoming kwargs,
-    # as the GUI sends everything in kwargs.
-    final_kwargs = kwargs.copy()
-    final_kwargs['progress_callback'] = queue_callback
-    final_kwargs['solver_settings'] = solver_settings_dict
-
-    # 1. Rename keys from GUI config name to worker function argument name
-    rename_map = {
-        'input_dir': 'input_folder',
-        'output_dir': 'output_folder',
-        'astap_executable_path': 'astap_exe_path',
-        'astap_data_directory_path': 'astap_data_dir_param',
-        'astap_default_search_radius': 'astap_search_radius_config',
-        'astap_default_downsample': 'astap_downsample_config',
-        'astap_default_sensitivity': 'astap_sensitivity_config',
-        'stacking_normalize_method': 'stack_norm_method',
-        'stacking_weighting_method': 'stack_weight_method',
-        'stacking_rejection_algorithm': 'stack_reject_algo',
-        'stacking_final_combine_method': 'stack_final_combine',
-        'stacking_kappa_low': 'stack_kappa_low',
-        'stacking_kappa_high': 'stack_kappa_high',
-        'cluster_panel_threshold': 'cluster_threshold_config',
-        'cluster_target_groups': 'cluster_target_groups_config',
-        'cluster_orientation_split_deg': 'cluster_orientation_split_deg_config',
-    }
-    for old_key, new_key in rename_map.items():
-        if old_key in final_kwargs:
-            final_kwargs[new_key] = final_kwargs.pop(old_key)
-
-    # 2. Handle special parsing for winsor limits
-    if 'stacking_winsor_limits' in final_kwargs:
-        limits_str = final_kwargs.pop('stacking_winsor_limits')
-        try:
-            parts = [float(p.strip()) for p in str(limits_str).split(',')]
-            final_kwargs['parsed_winsor_limits'] = tuple(parts) if len(parts) == 2 else (0.05, 0.05)
-        except:
-            final_kwargs['parsed_winsor_limits'] = (0.05, 0.05)
-
-    # 3. Add '_config' suffix where it is the convention
-    sig_params = inspect.signature(run_hierarchical_mosaic).parameters
-    for key in list(final_kwargs.keys()):
-        config_key = f"{key}_config"
-        if config_key in sig_params and key not in sig_params:
-             final_kwargs[config_key] = final_kwargs.pop(key)
-
-    # 4. Filter out any keys that are not in the function signature
-    final_kwargs = {k: v for k, v in final_kwargs.items() if k in sig_params}
-
-    # Provide defaults for required arguments that may not be in the GUI config
-    if 'stack_ram_budget_gb_config' not in final_kwargs:
-        final_kwargs['stack_ram_budget_gb_config'] = 0.0
-    if 'num_base_workers_config' not in final_kwargs:
-        final_kwargs['num_base_workers_config'] = 0
-
+    # Insert the process queue callback in the expected position (after
+    # cluster threshold, target group count, and orientation split parameter).
+    # With the current signature, progress_callback is the 11th positional arg.
+    if len(args) > 10:
+        candidate = args[10]
+        if callable(candidate):
+            # Replace the provided callback without disturbing other
+            # positional arguments.
+            full_args = args[:10] + (queue_callback,) + args[11:]
+        else:
+            # No callback was supplied: insert ours in the expected slot so
+            # that subsequent parameters keep their intended positions.
+            full_args = args[:10] + (queue_callback,) + args[10:]
+    else:
+        # Safety fallback: if the caller did not provide enough positional
+        # arguments to reach the callback slot, append ours so the worker
+        # still runs (mainly for CLI/debug scenarios).
+        full_args = args + (queue_callback,)
     try:
-        run_hierarchical_mosaic(**final_kwargs)
+        run_hierarchical_mosaic(*full_args, solver_settings=solver_settings_dict, **kwargs)
     except Exception as e_proc:
         try:
             logger.exception("Worker process crashed before completion")
