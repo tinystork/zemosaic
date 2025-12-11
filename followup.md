@@ -1,34 +1,35 @@
-### 🧾 followup.md
+## followup.md
 
-**Résumé de la mission précédente**
+### Récapitulatif des modifications à vérifier
 
-* On a corrigé, dans `grid_mode.py` (commit de base : `121db2f7`), la **construction de `common_mask`** dans la boucle de photométrie inter-tuiles.
-* Avant :
+* [ ] **Mission 1 :**
 
-  * `coverage_mask` (2D) était combiné directement avec `mask_ref` et `mask_tgt` (potentiellement 3D), ce qui causait un **broadcast error**.
-* Maintenant :
+  * [ ] Une fonction `_reset_filter_log()` a été ajoutée dans `zemosaic_filter_gui_qt.py` (ou le point d’entrée du filtre).
+  * [ ] Cette fonction supprime `zemosaic_filter.log` au chargement du module, sans casser le démarrage en cas d’erreur.
+  * [ ] Aucun changement dans la config de logging, seuls les fichiers sont affectés.
 
-  * si `coverage_mask` est valide et non vide :
+* [ ] **Mission 2 :**
 
-    * on vérifie qu’il a la même géométrie `(H, W)` que les patches,
-    * on le **diffuse en 3D** si nécessaire pour matcher la forme de `mask_ref` / `mask_tgt`,
-    * on construit `common_mask` via un `AND` cohérent entre masques.
-  * si `coverage_mask` est absent, vide, ou de forme incompatible :
+  * [ ] `zemosaic_worker.py` importe désormais `_poststack_rgb_equalization` depuis `zemosaic_align_stack.py` via un `try/except` sécurisé.
+  * [ ] Un helper `_apply_final_mosaic_rgb_equalization(...)` a été ajouté dans `zemosaic_worker.py`, réutilisant `_poststack_rgb_equalization` pour la mosaïque finale.
+  * [ ] `run_hierarchical_mosaic(...)` appelle ce helper **uniquement** pour le flux mosaïque classique (condition `not sds_mode_phase5` ou équivalent).
+  * [ ] Le helper logge une ligne `[RGB-EQ] final mosaic: ...` lorsqu’un équilibrage est effectivement appliqué.
+  * [ ] Aucun changement n’a été apporté à `grid_mode.py`.
 
-    * on log un warning (pour trace),
-    * on retombe sur le masque simple `mask_ref & mask_tgt`.
+### Tests manuels à effectuer
 
-**À ne pas faire lors d’une mission ultérieure**
+1. **Log du filtre**
 
-* Ne pas re-toucher à cette logique tant qu’on ne redéfinit pas explicitement un **nouveau concept de normalisation** en Grid.
-* Ne pas modifier la signature ni le comportement de :
+   * [ ] Lancer le filtre Qt plusieurs fois, vérifier que `zemosaic_filter.log` repart bien de zéro à chaque ouverture.
 
-  * `_overlap_mask_from_coverage`,
-  * `compute_valid_mask`,
-  * `compute_tile_photometric_scaling`,
-  * `apply_tile_photometric_scaling`.
+2. **Flux classique**
 
-**Checklist**
+   * [ ] Lancer un run classique avec `poststack_equalize_rgb=True`.
+   * [ ] Vérifier dans `zemosaic_worker_cl.log` la présence de la ligne `[RGB-EQ] final mosaic: ...`.
+   * [ ] Inspecter la mosaïque finale : vérifier que la dominante verte est corrigée.
 
-* [x] Correction de `common_mask` dans `grid_mode.py` pour gérer les masques 2D/3D sans erreur de broadcasting.
+3. **Flux Grid mode**
+
+   * [ ] Lancer au moins un run Grid avec un dataset connu.
+   * [ ] Confirmer qu’il n’y a **aucune régression** : géométrie, couleurs, logs identiques à avant la modification.
 
