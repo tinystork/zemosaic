@@ -28,3 +28,7 @@
   * `compute_tile_photometric_scaling`,
   * `apply_tile_photometric_scaling`.
 
+**Checklist**
+
+* [x] Correction de `common_mask` dans `grid_mode.py` pour gérer les masques 2D/3D sans erreur de broadcasting.
+
