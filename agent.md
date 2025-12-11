@@ -65,7 +65,7 @@ common_mask = coverage_mask & mask_ref & mask_tgt
 
 #### Tâche à réaliser
 
-1. **Corriger la construction de `common_mask` dans le cas où `coverage_mask` est disponible**, pour :
+1. [x] **Corriger la construction de `common_mask` dans le cas où `coverage_mask` est disponible**, pour :
 
    * éviter tout **problème de broadcasting** entre `(H, W)` et `(H, W, 3)`,
    * conserver la **logique actuelle** :

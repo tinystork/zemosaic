@@ -2840,12 +2840,34 @@ def assemble_tiles(
                     )
                     common_mask = mask_ref & mask_tgt
                 else:
+                    coverage_mask = np.asarray(coverage_mask, dtype=bool)
                     _emit(
                         f"[GRID] Coverage overlap for tile {info.tile_id} vs ref {reference_info.tile_id}: pixels={int(np.sum(coverage_mask))}",
                         lvl="DEBUG",
                         callback=progress_callback,
                     )
-                    common_mask = coverage_mask & mask_ref & mask_tgt
+                    if (
+                        coverage_mask.shape[:2] != mask_ref.shape[:2]
+                        or coverage_mask.shape[:2] != mask_tgt.shape[:2]
+                    ):
+                        _emit(
+                            f"[GRID] Coverage shape mismatch for tile {info.tile_id}, using finite-pixel mask instead.",
+                            lvl="WARN",
+                            callback=progress_callback,
+                        )
+                        common_mask = mask_ref & mask_tgt
+                    else:
+                        coverage_mask_compatible = coverage_mask
+                        if coverage_mask_compatible.ndim == 2 and mask_ref.ndim == 3:
+                            coverage_mask_compatible = np.broadcast_to(
+                                coverage_mask_compatible[..., None], mask_ref.shape
+                            )
+                        elif coverage_mask_compatible.ndim == 2 and mask_tgt.ndim == 3:
+                            coverage_mask_compatible = np.broadcast_to(
+                                coverage_mask_compatible[..., None], mask_tgt.shape
+                            )
+
+                        common_mask = coverage_mask_compatible & mask_ref & mask_tgt
                 n_common = int(np.sum(common_mask))
                 _emit(
                     f"Photometry: tile {info.tile_id} overlap with ref {reference_info.tile_id} common pixels={n_common}",
