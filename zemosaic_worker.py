@@ -6761,20 +6761,21 @@ def _run_shared_phase45_phase5_pipeline(
     if collected_tiles_for_second_pass is not None:
         collected_tiles_for_second_pass.clear()
 
-    final_rgb_eq_info = None
-    if final_mosaic_data_HWC is not None and not sds_mode_phase5:
-        try:
-            final_mosaic_data_HWC, final_rgb_eq_info = _apply_final_mosaic_rgb_equalization(
-                final_mosaic_data_HWC,
-                zconfig=zconfig,
-                logger=logger,
-            )
-        except Exception as exc:
-            if logger:
-                logger.warning(
-                    "[RGB-EQ] Unexpected error during final mosaic RGB equalization: %s",
-                    exc,
-                )
+# commented out RGB equalization for now
+#    final_rgb_eq_info = None
+#    if final_mosaic_data_HWC is not None and not sds_mode_phase5:
+#        try:
+#            final_mosaic_data_HWC, final_rgb_eq_info = _apply_final_mosaic_rgb_equalization(
+#                final_mosaic_data_HWC,
+#                zconfig=zconfig,
+#                logger=logger,
+#            )
+#        except Exception as exc:
+#            if logger:
+#                logger.warning(
+#                    "[RGB-EQ] Unexpected error during final mosaic RGB equalization: %s",
+#                    exc,
+#                )
 
     alpha_final = _derive_final_alpha_mask(
         final_alpha_map,
