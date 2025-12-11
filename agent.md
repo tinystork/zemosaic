@@ -37,6 +37,17 @@ Objectif de cette mission :
 
 ---
 
+### Bug constaté / correctif à appliquer en priorité
+
+* `zemosaic_worker.log` contient `"[RGB-EQ] Unexpected error during final mosaic RGB equalization: name 'zconfig' is not defined"` → l’égalisation RGB finale n’est pas exécutée et la dominante verte persiste.
+* Source : `_run_shared_phase45_phase5_pipeline(...)` utilise `zconfig` alors que ce nom n’existe pas dans son scope.
+* Correctif attendu :
+  * Ajouter `zconfig` (kw-only, optionnel) dans la signature de `_run_shared_phase45_phase5_pipeline(...)` et passer la véritable instance depuis `run_hierarchical_mosaic(...)` (flux classique) ainsi que depuis le chemin SDS qui appelle ce helper.
+  * Utiliser ce `zconfig` local (fallback `SimpleNamespace()` si besoin) pour l’appel à `_apply_final_mosaic_rgb_equalization(...)` et pour les `setattr(..., "parallel_plan_phase5", ...)` déjà présents.
+* Validation : plus aucun warning `name 'zconfig' is not defined` et présence de `[RGB-EQ] final mosaic: ...` dans `zemosaic_worker_cl.log`.
+
+---
+
 ## Mission 1 – Réinitialiser `zemosaic_filter.log` au lancement
 
 ### But
