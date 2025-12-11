@@ -1661,6 +1661,32 @@ def _stack_weighted_patches(
     weight_stack = np.stack(weights, axis=0).astype(np.float32)
     data_stack = np.where(weight_stack > 0, data_stack, np.nan)
 
+    if stack_core:
+        try:
+            stack_config = {
+                "normalize_method": "none",
+                "rejection_algorithm": config.stack_reject_algo,
+                "final_combine_method": config.stack_final_combine,
+                "sigma_clip_low": config.stack_kappa_low,
+                "sigma_clip_high": config.stack_kappa_high,
+            }
+            stacked, rejected_pct, weight_sum = stack_core(
+                images=list(data_stack),
+                weights=weight_stack,
+                stack_config=stack_config,
+                backend="cpu",
+            )
+            outputs: list[np.ndarray | float] = [np.asarray(stacked, dtype=np.float32)]
+            if return_weight_sum:
+                outputs.append(np.asarray(weight_sum, dtype=np.float32))
+            if return_ref_median:
+                outputs.append(ref_median_used)
+            return outputs[0] if len(outputs) == 1 else tuple(outputs)  # type: ignore[return-value]
+        except Exception as exc:
+            _emit(
+                f"CPU stack_core failed ({exc}); falling back to legacy stack", lvl="WARN"
+            )
+
     rejection = config.stack_reject_algo.lower().strip()
     data_for_combine = data_stack
     if rejection in {"kappa_sigma", "kappa"} and _reject_outliers_kappa_sigma:
@@ -1963,6 +1989,35 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
     with np.errstate(divide="ignore", invalid="ignore"):
         stacked = running_sum / np.clip(running_weight, 1e-6, None)
     stacked = np.where(np.isfinite(stacked), stacked, 0.0).astype(np.float32)
+
+    if (
+        stacked.ndim == 3
+        and stacked.shape[-1] == 3
+        and equalize_rgb_medians_inplace is not None
+    ):
+        try:
+            equalize_rgb_medians_inplace(stacked)
+            _emit(
+                f"[GRID] Tile {tile.tile_id}: RGB equalization applied pre-mask/logging",
+                lvl="DEBUG",
+                callback=progress_callback,
+            )
+        except Exception:
+            _emit(
+                f"[GRID] Tile {tile.tile_id}: RGB equalization failed, proceeding without it",
+                lvl="WARN",
+                callback=progress_callback,
+            )
+
+    try:
+        tile_mask = compute_valid_mask(stacked)
+        if tile_mask.ndim == 3:
+            tile_mask_2d = np.any(tile_mask, axis=-1)
+        else:
+            tile_mask_2d = tile_mask
+    except Exception:
+        tile_mask = None
+        tile_mask_2d = None
     coverage_mask_alpha: np.ndarray | None = None
     try:
         coverage_mask_bool = (
@@ -1970,6 +2025,11 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
             if running_weight.ndim == 3
             else (running_weight > 0)
         )
+        if tile_mask_2d is not None:
+            try:
+                coverage_mask_bool = coverage_mask_bool & tile_mask_2d
+            except Exception:
+                pass
         coverage_mask_alpha = np.asarray(coverage_mask_bool, dtype=np.uint8) * 255
         _emit(
             f"[GRIDCOV] tile_id={tile.tile_id} coverage_mask pixels={int(np.sum(coverage_mask_bool))}",
@@ -2007,25 +2067,6 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
         lvl="INFO",
         callback=progress_callback,
     )
-
-    if (
-        stacked.ndim == 3
-        and stacked.shape[-1] == 3
-        and equalize_rgb_medians_inplace is not None
-    ):
-        try:
-            equalize_rgb_medians_inplace(stacked)
-            _emit(
-                f"[GRID] Tile {tile.tile_id}: RGB equalization applied post-stack",
-                lvl="DEBUG",
-                callback=progress_callback,
-            )
-        except Exception:
-            _emit(
-                f"[GRID] Tile {tile.tile_id}: RGB equalization failed, proceeding without it",
-                lvl="WARN",
-                callback=progress_callback,
-            )
 
     tiles_dir = output_dir / "tiles"
     try:
