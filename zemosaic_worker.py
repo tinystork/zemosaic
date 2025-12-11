@@ -6358,6 +6358,7 @@ def _run_shared_phase45_phase5_pipeline(
     start_time_total_run: float | None,
     progress_callback: Callable | None,
     pcb: Callable[..., None],
+    zconfig: Any | None = None,
     logger: logging.Logger,
 ) -> tuple[
     list[tuple[str | None, Any]],
@@ -6368,6 +6369,9 @@ def _run_shared_phase45_phase5_pipeline(
     float,
 ]:
     """Shared helper that runs Phase 4.5 + Phase 5 on a list of tiles."""
+
+    if zconfig is None:
+        zconfig = SimpleNamespace()
 
     master_tiles: list[tuple[str | None, Any]] = list(master_tiles_results_list or [])
     base_progress_phase4_5 = float(phase45_options.get("base_progress") or 0.0)
@@ -15772,6 +15776,7 @@ def run_hierarchical_mosaic(
                         start_time_total_run=start_time_total_run,
                         progress_callback=progress_callback,
                         pcb=pcb,
+                        zconfig=zconfig,
                         logger=logger,
                     )
                     master_tiles_results_list = list(sds_tile_records)
@@ -16567,6 +16572,7 @@ def run_hierarchical_mosaic(
                 start_time_total_run=start_time_total_run,
                 progress_callback=progress_callback,
                 pcb=pcb,
+                zconfig=zconfig,
                 logger=logger,
             )
             if final_mosaic_data_HWC is None:
