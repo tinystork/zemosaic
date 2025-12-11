@@ -5,12 +5,12 @@
 Projet : **ZeMosaic / ZeSeestarStacker**
 Objectif de cette mission :
 
-1. **Mission 1 – zemosaic_filter.log**
+1. [x] **Mission 1 – zemosaic_filter.log**
 
    * Le fichier `zemosaic_filter.log` grossit indéfiniment.
    * On veut **le supprimer au lancement** du filtre (GUI Qt) pour repartir d’un log propre à chaque ouverture.
 
-2. **Mission 2 – Dominante verte dans le flux classique**
+2. [x] **Mission 2 – Dominante verte dans le flux classique**
 
    * Les **master tiles** du flux classique sont correctement équilibrées en couleurs (poststack_equalize_rgb OK).
    * La **mosaïque finale classique** présente encore une **dominante verte**, qui apparaît après la Phase 5 (reprojection / coadd / renorm).

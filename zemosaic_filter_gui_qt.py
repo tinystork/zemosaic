@@ -61,7 +61,7 @@ import math
 import csv
 import threading
 import time
-from typing import Any, Callable, Iterable, Iterator, List, Sequence, Tuple
+from typing import Any, Callable, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -116,6 +116,21 @@ from PySide6.QtWidgets import (  # noqa: E402  - imported after availability che
     QHeaderView,
     QMenu,
 )
+
+
+def _reset_filter_log() -> None:
+    """Supprime le log du filtre au chargement pour repartir d'un fichier propre."""
+
+    try:
+        log_path = Path(__file__).with_name("zemosaic_filter.log")
+        if log_path.exists():
+            log_path.unlink()
+    except Exception:
+        # On ignore toute erreur : le démarrage de l'UI ne doit pas échouer pour un log.
+        pass
+
+
+_reset_filter_log()
 
 
 def _resolve_tristate_flag() -> Qt.ItemFlag:
