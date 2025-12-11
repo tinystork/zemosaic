@@ -158,6 +158,12 @@ except Exception:
     get_runtime_temp_dir = _fallback_runtime_temp_dir
 
 
+try:
+    from zemosaic_align_stack import _poststack_rgb_equalization
+except Exception:
+    _poststack_rgb_equalization = None
+
+
 UNALIGNED_DIRNAME = "unaligned_by_zemosaic"
 _UNALIGNED_LOCK = Lock()
 
@@ -1035,6 +1041,56 @@ def _apply_two_pass_coverage_renorm_if_requested(
         if logger:
             logger.exception("[TwoPass] renorm exception → keeping first-pass outputs")
     return final_mosaic_data, final_mosaic_coverage
+
+
+def _apply_final_mosaic_rgb_equalization(
+    final_mosaic_data: np.ndarray | None,
+    *,
+    zconfig=None,
+    logger: logging.Logger | None = None,
+):
+    """Apply final RGB equalization to the mosaic using the poststack helper."""
+
+    default_info = {
+        "enabled": False,
+        "applied": False,
+        "gain_r": 1.0,
+        "gain_g": 1.0,
+        "gain_b": 1.0,
+        "target_median": float("nan"),
+    }
+
+    if final_mosaic_data is None or not isinstance(final_mosaic_data, np.ndarray):
+        return final_mosaic_data, default_info
+
+    if _poststack_rgb_equalization is None:
+        if logger:
+            logger.debug("[RGB-EQ] final mosaic equalization skipped: helper unavailable")
+        return final_mosaic_data, default_info
+
+    try:
+        info = _poststack_rgb_equalization(final_mosaic_data, zconfig=zconfig, stack_metadata=None)
+    except Exception as exc:
+        if logger:
+            logger.warning("[RGB-EQ] final mosaic equalization failed: %s", exc)
+        return final_mosaic_data, default_info
+
+    if not isinstance(info, dict):
+        info = default_info
+    else:
+        for key, value in default_info.items():
+            info.setdefault(key, value)
+
+    if logger is not None and info.get("applied"):
+        logger.info(
+            "[RGB-EQ] final mosaic: applied=True, gains=(%.6f, %.6f, %.6f), target_median=%.2f",
+            info.get("gain_r", 1.0),
+            info.get("gain_g", 1.0),
+            info.get("gain_b", 1.0),
+            info.get("target_median", float("nan")),
+        )
+
+    return final_mosaic_data, info
 
 
 def _apply_phase5_post_stack_pipeline(
@@ -6700,6 +6756,21 @@ def _run_shared_phase45_phase5_pipeline(
     )
     if collected_tiles_for_second_pass is not None:
         collected_tiles_for_second_pass.clear()
+
+    final_rgb_eq_info = None
+    if final_mosaic_data_HWC is not None and not sds_mode_phase5:
+        try:
+            final_mosaic_data_HWC, final_rgb_eq_info = _apply_final_mosaic_rgb_equalization(
+                final_mosaic_data_HWC,
+                zconfig=zconfig,
+                logger=logger,
+            )
+        except Exception as exc:
+            if logger:
+                logger.warning(
+                    "[RGB-EQ] Unexpected error during final mosaic RGB equalization: %s",
+                    exc,
+                )
 
     alpha_final = _derive_final_alpha_mask(
         final_alpha_map,
