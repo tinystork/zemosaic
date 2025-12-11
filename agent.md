@@ -1,313 +1,205 @@
-## 🧾 agent.md
+## `agent.md`
 
-### Contexte
+### Mission
 
-Projet : **ZeMosaic / ZeSeestarStacker**
-Objectif de cette mission :
+Restaurer le comportement **classique** (hors Grid/SDS) de ZeMosaic pour les master tiles et la mosaïque finale :
 
-1. [x] **Mission 1 – zemosaic_filter.log**
+* les master tiles doivent repasser par **lecropper.py** (quality crop + alt-az cleanup + alpha) **exactement comme dans le worker “classique” qui donne une couleur correcte** ;
+* la mosaïque finale **ne doit plus subir de ré-égalisation RGB agressive** qui casse la chromie (gains R≈4.6, etc.) ;
+* Grid mode / SDS ne doivent pas être cassés.
 
-   * Le fichier `zemosaic_filter.log` grossit indéfiniment.
-   * On veut **le supprimer au lancement** du filtre (GUI Qt) pour repartir d’un log propre à chaque ouverture.
+Objectif visible côté utilisateur :
 
-2. [x] **Mission 2 – Dominante verte dans le flux classique**
-
-   * Les **master tiles** du flux classique sont correctement équilibrées en couleurs (poststack_equalize_rgb OK).
-   * La **mosaïque finale classique** présente encore une **dominante verte**, qui apparaît après la Phase 5 (reprojection / coadd / renorm).
-   * On veut ajouter une **étape d’égalisation RGB globale sur la mosaïque finale** (en utilisant la même logique que `poststack_equalize_rgb`), **sans toucher au flux Grid mode**.
-
-> ⚠️ **Crucial : ne pas modifier le flux Grid mode.**
->
-> * Ne pas éditer `grid_mode.py`.
-> * Ne pas changer les chemins d’exécution spécifiques Grid dans `zemosaic_stack_core.py` ou `zemosaic_worker.py`.
-> * Les changements de Mission 2 doivent s’appliquer **uniquement au flux mosaïque classique**, pas au script `grid_mode.py`.
+* en mode classique, la mosaïque finale doit avoir un histogramme RGB similaire aux master tiles et à Grid mode (courbes serrées, pas de dominante verte/rouge, pas de tuiles “fantômes” non croppées).
 
 ---
 
-### Fichiers concernés
+### Contexte technique (résumé)
 
-* `zemosaic_filter_gui_qt.py`  ✅ (Mission 1)
-* `zemosaic_worker.py`         ✅ (Mission 2, ajout de l’étape d’equalize sur la mosaïque finale)
-* `zemosaic_align_stack.py`    🔍 (Mission 2 : réutilisation de `_poststack_rgb_equalization` / `equalize_rgb_medians_inplace`, **sans** changer leur comportement)
+* Fichier central : `zemosaic_worker.py`.
 
-**À ne pas modifier :**
+* Le flux **Phase 3** (master tiles) effectue déjà :
 
-* `grid_mode.py`
-* Tout autre fichier lié uniquement au flux Grid (sauf import passif déjà existant).
+  * stacking + `poststack_equalize_rgb` (OK) ;
+  * `apply_center_out_normalization_p3` (OK) ;
+  * un bloc **quality crop + WCS shift** basé sur `lecropper.detect_autocrop_rgb` (présent, mais il faut s’assurer que la voie classique l’utilise toujours correctement) ;
+  * un appel à `_apply_lecropper_pipeline(...)` qui applique `quality_crop`, `altaz_cleanup`, et fabrique un **alpha mask normalisé**.
 
----
+* Un pipeline équivalent existe pour la mosaïque finale : `_apply_final_mosaic_quality_pipeline(...)` + `_apply_master_tile_crop_mask_to_mosaic(...)`. 
 
-### Bug constaté / correctif à appliquer en priorité
+* Un second étage, plus récent, applique une **égalisation RGB finale sur la mosaïque** via `_apply_final_mosaic_rgb_equalization(...)`, avec des gains extrêmes (ex. `gains=(4.6025, 0.9736, 1.0000)`), ce qui débalance complètement les canaux. C’est cette étape qu’on veut **neutraliser proprement** pour le moment.
 
-* `zemosaic_worker.log` contient `"[RGB-EQ] Unexpected error during final mosaic RGB equalization: name 'zconfig' is not defined"` → l’égalisation RGB finale n’est pas exécutée et la dominante verte persiste.
-* Source : `_run_shared_phase45_phase5_pipeline(...)` utilise `zconfig` alors que ce nom n’existe pas dans son scope.
-* Correctif attendu :
-  * Ajouter `zconfig` (kw-only, optionnel) dans la signature de `_run_shared_phase45_phase5_pipeline(...)` et passer la véritable instance depuis `run_hierarchical_mosaic(...)` (flux classique) ainsi que depuis le chemin SDS qui appelle ce helper.
-  * Utiliser ce `zconfig` local (fallback `SimpleNamespace()` si besoin) pour l’appel à `_apply_final_mosaic_rgb_equalization(...)` et pour les `setattr(..., "parallel_plan_phase5", ...)` déjà présents.
-* Validation : plus aucun warning `name 'zconfig' is not defined` et présence de `[RGB-EQ] final mosaic: ...` dans `zemosaic_worker_cl.log`.
+* Un worker “classique” sans Grid (fourni hors repo) montre que :
 
----
-
-## Mission 1 – Réinitialiser `zemosaic_filter.log` au lancement
-
-### But
-
-Au lancement du filtre via l’interface Qt, **supprimer le fichier `zemosaic_filter.log` s’il existe**, avant que le logger ne commence à écrire dedans, afin d’éviter qu’il ne grossisse indéfiniment.
-
-### Implémentation attendue
-
-1. Dans `zemosaic_filter_gui_qt.py` (c’est le point de référence principal pour cette mission) :
-
-   * Le module importe déjà `Path` depuis `pathlib`.
-   * Ajouter une fonction utilitaire **tout en haut du fichier, après les imports**, par exemple :
-
-   ```python
-   from pathlib import Path
-   # ... autres imports déjà présents ...
-
-   def _reset_filter_log() -> None:
-       """
-       Supprime le log zemosaic_filter.log au lancement de l'outil,
-       pour éviter qu'il ne grossisse indéfiniment.
-       """
-       try:
-           # Même dossier que le script ; adapter si le log est ailleurs
-           log_path = Path(__file__).with_name("zemosaic_filter.log")
-           if log_path.exists():
-               log_path.unlink()
-       except Exception:
-           # On ne bloque jamais le démarrage pour un problème de log
-           pass
-
-   # Appelé au chargement du module
-   _reset_filter_log()
-   ```
-
-2. Contraintes :
-
-   * **Ne pas modifier la configuration logging existante** : on ne touche pas aux handlers, formatters, etc.
-   * On se contente de **supprimer le fichier** avant que les handlers ne l’ouvrent.
-   * Le code doit être **robuste** :
-
-     * En cas d’exception (droits, verrouillage, etc.), on ignore l’erreur et on laisse le programme continuer.
-   * Ne pas introduire de dépendance circulaire.
-   * Ne pas dupliquer cette logique dans 15 endroits : un seul helper `_reset_filter_log()` suffit.
-
-3. Optionnel mais autorisé :
-
-   * Si, dans le code, le vrai “main” du filtre est dans `zemosaic_filter_gui.py`, le même helper peut être placé là **à la place** de `zemosaic_filter_gui_qt.py`, mais il doit être **appelé une seule fois au démarrage**.
-   * Dans tous les cas, documenter clairement dans un commentaire où et pourquoi on réinitialise le log.
+  * en laissant `poststack_equalize_rgb` + `center_out` + lecropper sur les master tiles,
+  * et **sans égalisation RGB finale** sur la mosaïque,
+  * la voie classique donne un rendu couleur propre (pas de dominante verte, pas de rouge saturé), avec des tuiles bien croppées.
 
 ---
 
-## Mission 2 – Equalize RGB sur la mosaïque finale (flux classique uniquement)
+### Scope
 
-### But
+**Fichiers à modifier :**
 
-* Les **master tiles** sont déjà équilibrées par `_poststack_rgb_equalization` (via `equalize_rgb_medians_inplace`).
-* Après la Phase 5 (reprojection / coadd / renormalisation inter-tuiles / two-pass coverage), la mosaïque finale du **flux classique** présente une pente verte.
-* On veut ajouter une **étape d’égalisation RGB globale sur la mosaïque finale**, juste avant l’écriture des fichiers (FITS/PNG/TIFF), avec logs propres, en **réutilisant la même logique que `_poststack_rgb_equalization`**.
+* `zemosaic_worker.py` (obligatoire)
+* éventuellement `zemosaic_config.py` si un flag de config propre est nécessaire pour activer/désactiver l’égalisation RGB finale.
 
-> ❗ Important :
->
-> * Cette étape doit dépendre du **même flag de config** que pour les master tiles (`poststack_equalize_rgb`).
-> * Elle ne doit **pas modifier le comportement du script `grid_mode.py`**.
+**Fichiers à NE PAS modifier :**
 
-### Points d’ancrage dans le code
+* `grid_mode.py` et tout ce qui concerne spécifiquement Grid mode.
+* Le code de la GUI (Tk / Qt).
+* `lecropper.py` (sauf bug bloquant évident, mais en principe inutile).
+* La logique de stacking GPU/CPU (sauf si un bug est directement lié à cette mission).
 
-* `zemosaic_align_stack.py`
+---
 
-  * Contient déjà :
+### Exigences fonctionnelles
 
-    * `equalize_rgb_medians_inplace(img: np.ndarray)`
-    * `_poststack_rgb_equalization(stacked, zconfig, stack_metadata=None)`
-      → c’est cette logique qu’on veut **réutiliser** pour la mosaïque finale.
+#### 1. Master tiles (Phase 3, voie classique)
 
-* `zemosaic_worker.py`
+1.1. **Garantie que le pipeline lecropper est appliqué à chaque master tile** dans la voie classique (hors SDS/Grid) :
 
-  * Contient les fonctions de Phase 5 :
+* À la fin de `create_master_tile(...)`, juste avant la sauvegarde FITS, on doit avoir *toujours* :
 
-    * `assemble_final_mosaic_incremental(...)`
-    * `assemble_final_mosaic_reproject_coadd(...)`
-    * `_apply_phase5_post_stack_pipeline(...)`
-    * `_apply_final_mosaic_quality_pipeline(...)`
-    * `_auto_crop_global_mosaic_if_requested(...)`
-    * `run_hierarchical_mosaic(...)` (orchestration principale du flux classique + SDS)
-  * C’est dans ce fichier qu’on doit **brancher l’égalisation RGB finale**.
+  * le bloc `quality_crop` basé sur `detect_autocrop_rgb` (si `quality_crop_enabled` est vrai), avec mise à jour de `wcs_for_master_tile` ;
+  * puis `pipeline_cfg = {...}` ;
+  * puis `master_tile_stacked_HWC, pipeline_alpha_mask = _apply_lecropper_pipeline(...)` ;
+  * puis `_normalize_alpha_mask(...)` et passage de `alpha_mask_out` à `zemosaic_utils.save_fits_image(...)`.
 
-### Stratégie d’implémentation
+* Si la voie Grid/SDS a des chemins conditionnels spécifiques, s’assurer que **la voie classique** continue à exécuter ce pipeline sans être court-circuitée :
 
-#### 2.1. Importer proprement `_poststack_rgb_equalization`
+  * pas de `if grid_mode: return ...` avant `_apply_lecropper_pipeline(...)` ;
+  * pas de condition qui met `quality_crop_enabled=False` en voie classique par erreur.
 
-En haut de `zemosaic_worker.py`, avec les autres imports conditionnels :
+1.2. **Compatibilité logs / GUI :**
 
-```python
-try:
-    from zemosaic_align_stack import _poststack_rgb_equalization
-except Exception:  # pragma: no cover - fallback si import cassé
-    _poststack_rgb_equalization = None
-```
+* Conserver les logs existants :
 
-> Ne pas changer `_poststack_rgb_equalization` lui-même, ni `equalize_rgb_medians_inplace`.
+  * `MT_CROP: quality-based rect=...` ;
+  * avertissements `MT_CROP: quality crop skipped ...` si le crop est jugé inutile ;
+* Ne pas modifier les clés `[CLÉ_POUR_GUI: ...]` ni la structure des callbacks.
 
-#### 2.2. Nouveau helper : égalisation RGB sur mosaïque finale
+#### 2. Mosaïque finale (Phase 5, voie classique)
 
-Toujours dans `zemosaic_worker.py`, ajouter un helper interne, par exemple juste avant `_apply_phase5_post_stack_pipeline` ou dans la même zone :
+2.1. **Désactiver l’égalisation RGB finale agressive** :
 
-```python
-def _apply_final_mosaic_rgb_equalization(
-    final_mosaic_data: np.ndarray | None,
-    zconfig: Any,
-    logger: logging.Logger | None = None,
-) -> tuple[np.ndarray | None, dict]:
-    """
-    Applique la même logique que `_poststack_rgb_equalization` sur la mosaïque finale.
+* Actuellement, le code applique `_apply_final_mosaic_rgb_equalization(...)` conditionnellement, typiquement :
 
-    - Respecte le flag de config `poststack_equalize_rgb`.
-    - Ne fait rien si la fonction d'origine est indisponible ou si l'image n'est pas RGB.
-    - Retourne (final_mosaic_data éventuellement modifiée, info_dict).
-    """
-    info: dict = {
-        "enabled": False,
-        "applied": False,
-        "gain_r": 1.0,
-        "gain_g": 1.0,
-        "gain_b": 1.0,
-        "target_median": float("nan"),
-    }
-
-    if final_mosaic_data is None or _poststack_rgb_equalization is None:
-        return final_mosaic_data, info
-
-    # On réutilise exactement la même fonction que pour les master tiles
-    metadata: dict = {}
-    try:
-        info = _poststack_rgb_equalization(final_mosaic_data, zconfig=zconfig, stack_metadata=metadata)
-    except Exception as exc:  # robustesse : ne jamais casser la Phase 5
-        if logger is not None:
-            logger.warning("[RGB-EQ] Final mosaic RGB equalization failed: %s", exc)
-        return final_mosaic_data, info
-
-    if logger is not None and info.get("applied"):
-        logger.info(
-            "[RGB-EQ] final mosaic: applied=True, gains=(%.6f, %.6f, %.6f), target_median=%.2f",
-            info.get("gain_r", 1.0),
-            info.get("gain_g", 1.0),
-            info.get("gain_b", 1.0),
-            info.get("target_median", float("nan")),
-        )
-
-    return final_mosaic_data, info
-```
-
-Contraintes :
-
-* Le helper doit être **no-op** si :
-
-  * `final_mosaic_data` est `None`,
-  * `_poststack_rgb_equalization` est indisponible,
-  * ou si `poststack_equalize_rgb` est désactivé (la fonction d’origine gère déjà ce cas).
-* Ne pas lever d’exception vers l’appelant en cas d’erreur (log + retour no-op).
-
-#### 2.3. Appeler le helper uniquement pour le flux classique
-
-Dans `run_hierarchical_mosaic(...)`, après que :
-
-* La Phase 5 a produit `final_mosaic_data_HWC`, `final_mosaic_coverage_HW`, `final_alpha_map`,
-* Les post-traitements communs type `_apply_phase5_post_stack_pipeline(...)` sont passés,
-* **Mais avant** :
-
-  * `_finalize_sds_global_mosaic` (pour SDS) ou toute écriture disque.
-
-Ajouter un appel au helper **uniquement pour la mosaïque finale du flux classique**.
-
-Idée de câblage (pseudo-code, à adapter au code réel) :
-
-```python
-# Après les appels à assemble_final_mosaic_* et à _apply_phase5_post_stack_pipeline
-# et avant la finalisation / écriture des fichiers.
-
-# On s'assure qu'on n'est pas dans une branche SDS/grid spécifique
-if final_mosaic_data_HWC is not None and not sds_mode_phase5:
-    try:
-        final_mosaic_data_HWC, final_rgb_info = _apply_final_mosaic_rgb_equalization(
-            final_mosaic_data_HWC,
-            zconfig=zconfig,
-            logger=logger,
-        )
-        # Optionnel : exposer les infos dans les callbacks ou la télémétrie
-        # (pas obligatoire, mais possible)
-    except Exception as exc:
-        logger.warning(
-            "[RGB-EQ] Unexpected error during final mosaic RGB equalization: %s",
-            exc,
-        )
-```
-
-Points importants :
-
-* **Conditionner** l’appel sur `not sds_mode_phase5` (ou flag équivalent dans le code courant) pour cibler le **flux mosaïque classique**.
-* **Ne pas appeler ce helper dans le script `grid_mode.py`**.
-* Ne pas modifier la signature publique des fonctions déjà appelées par `grid_mode.py`.
-
-  * Si une signature doit évoluer, vérifier que les appels Grid n’en dépendent pas.
-
-#### 2.4. Logging
-
-* Le helper logge déjà une ligne du type :
-
-  ```text
-  [RGB-EQ] final mosaic: applied=True, gains=(..., ..., ...), target_median=...
+  ```python
+  if final_mosaic_data_HWC is not None and not sds_mode_phase5:
+      final_mosaic_data_HWC, final_rgb_info = _apply_final_mosaic_rgb_equalization(...)
   ```
 
-* Ne pas multiplier les logs localisés via `pcb(...)` pour cette étape : un log direct sur `logger` est suffisant.
+* Objectif : **ne plus appliquer cette étape par défaut** en voie classique, pour éviter les gains extrêmes qui démolissent la chromie.
 
-* Vérifier que le logger utilisé est bien `logger = logging.getLogger("ZeMosaicWorker")` ou un de ses children.
+* Implémenter un flag explicite, par exemple :
+
+  * dans `zemosaic_config.py` : `final_mosaic_rgb_equalize_enabled: bool = False` (ou récupéré depuis la config utilisateur si elle existe déjà) ;
+  * dans `zemosaic_worker.py` :
+
+    * lire ce flag (ou valeur par défaut False) ;
+    * entourer l’appel à `_apply_final_mosaic_rgb_equalization(...)` avec :
+
+      ```python
+      if (
+          final_mosaic_rgb_equalize_enabled
+          and final_mosaic_data_HWC is not None
+          and not sds_mode_phase5
+      ):
+          ...
+      ```
+
+* **Par défaut** dans le repo : mettre ce flag à `False` (comportement sûr).
+
+2.2. **Conserver le pipeline qualité lecropper pour la mosaïque** :
+
+* Ne pas toucher à `_apply_final_mosaic_quality_pipeline(...)` ni `_apply_master_tile_crop_mask_to_mosaic(...)`, sauf pour corriger un bug avéré. 
+* Vérifier que ces fonctions sont toujours appelées à la fin de la Phase 5 pour la voie classique, afin que :
+
+  * les artefacts Alt-Az / bords soient bien nettoyés ;
+  * `final_alpha_map` soit cohérent avec `final_mosaic_coverage`.
+
+#### 3. Compatibilité Grid / SDS
+
+* Ne pas modifier la logique propre à Grid mode ou SDS (flags `grid_mode`, `sds_mode_phase5`, options SDS, etc.).
+* L’appel à `_apply_final_mosaic_rgb_equalization(...)` doit **rester désactivé en SDS** (comme actuellement) sauf si explicitement demandé par config (a priori non).
+* La restauration du pipeline lecropper sur master tiles ne doit pas casser :
+
+  * les chemins de stacking par super-tiles ;
+  * la gestion des caches intermédiaires.
+
+---
+
+### Plan d’action proposé
+
+- [x] **Analyser `create_master_tile(...)`** dans le `zemosaic_worker.py` actuel :
+
+  * repérer le bloc `poststack_equalize_rgb` + `apply_center_out_normalization_p3` ;
+  * confirmer la présence du bloc `quality_crop` + `_apply_lecropper_pipeline(...)` + alpha ;
+  * s’assurer que ce bloc est exécuté en voie classique (hors Grid/SDS) et non conditionné par des flags Grid/SDS inappropriés.
+
+- [ ] **Comparer avec le worker “classique” fourni (sans Grid)** :
+
+  * si des différences existent sur la partie lecropper (quality_crop/altaz/alpha), les harmoniser en faveur de la version qui fonctionne (celle du worker classique).
+
+- [x] **Isoler l’appel à `_apply_final_mosaic_rgb_equalization(...)`** :
+
+  * créer un flag de config `final_mosaic_rgb_equalize_enabled` (ou équivalent) ;
+  * désactiver l’appel par défaut (flag False) ;
+  * laisser le code de la fonction tel quel pour pouvoir la réactiver plus tard si besoin, mais **ne pas l’appeler en pratique**.
+
+- [x] **S’assurer que `_apply_final_mosaic_quality_pipeline(...)` et `_apply_master_tile_crop_mask_to_mosaic(...)` restent en place** :
+
+  * vérifier l’ordre d’appel en fin de Phase 5 ;
+  * garantir qu’ils ne sont pas conditionnés par le flag de RGB equalization (ce sont des pipelines orthogonaux).
+
+- [ ] **Mettre à jour les commentaires/docstrings** au besoin pour documenter :
+
+  * que la couleur finale repose sur `poststack_equalize_rgb` + `center_out` au niveau master tiles ;
+  * que l’égalisation RGB mosaïque est optionnelle et désactivée par défaut.
 
 ---
 
-### Contraintes générales
+### Tests / Validation attendus
 
-* **Ne pas modifier `grid_mode.py`.**
-* Ne pas changer le comportement de `poststack_equalize_rgb` sur les master tiles.
-* Ne pas toucher aux signatures publiques utilisées par d’autres modules, sauf si absolument nécessaire, et dans ce cas :
+1. **Test M106 voie classique (dataset déjà utilisé)** :
 
-  * Mettre des valeurs par défaut compatibles pour ne rien casser.
-* Toute nouvelle logique doit être **robuste aux erreurs** :
+   * lancer un run complet **hors Grid/SDS** ;
+   * vérifier dans le log :
 
-  * Try/except préventifs.
-  * Pas d’exception non gérée qui ferait tomber tout le run.
+     * présence de `[RGB-EQ] poststack_equalize_rgb ...` pour chaque master tile ;
+     * présence de lignes `MT_CROP: quality-based rect=...` (sauf si crop inutile) ;
+     * **absence** de ligne `[RGB-EQ] final mosaic: applied=True, gains=...` (ou équivalent) ;
+   * ouvrir la mosaïque finale dans un viewer :
 
----
+     * histogramme RGB proche de celui des master tiles ;
+     * pas de dominante verte ou rouge violente ;
+     * pas de bandes/carreaux non croppés autour des tuiles.
 
-## Tests attendus
+2. **Test Grid mode (M106 ou dataset simple)** :
 
-Après implémentation :
+   * lancer un run Grid mode ;
+   * confirmer que :
 
-1. **Mission 1 – zemosaic_filter.log**
+     * le comportement actuel de Grid n’est pas dégradé ;
+     * pas de crash ni de changement de couleur inattendu.
 
-   * Lancer `zemosaic_filter_gui_qt.py`.
-   * Vérifier que :
+3. **Test SDS (si facilement accessible)** :
 
-     * Si `zemosaic_filter.log` existait, il a été **supprimé puis recréé**.
-     * En relançant plusieurs fois, la taille du log repart bien de zéro à chaque démarrage.
+   * lancer un run SDS simple ;
+   * vérifier que les master tiles sont toujours croppées/masquées correctement ;
+   * pas de modification inattendue des logs ou du flux.
 
-2. **Mission 2 – mosaïque finale classique**
+4. **Régression rapide sur petit dataset mono** (si possible) :
 
-   * Utiliser un dataset de test classique (non Grid).
-   * Activer `poststack_equalize_rgb=True` dans la config.
-   * Lancer un run complet :
-
-     * Vérifier dans `zemosaic_worker_cl.log` :
-
-       * présence d’une ligne `[RGB-EQ] final mosaic: applied=True, gains=(...)`.
-     * Comparer la mosaïque finale :
-
-       * La **dominante verte doit être fortement réduite voire disparue**.
-   * Vérifier que :
-
-     * Les **master tiles** ont toujours l’air correctes.
-     * Le flux Grid mode (script `grid_mode.py`) fonctionne exactement comme avant (double-check au moins un dataset Grid).
+   * pour s’assurer que le pipeline lecropper gère toujours les cas mono-canal (pas uniquement RGB).
 
 ---
+
+### Contraintes / style
+
+* Ne pas introduire de nouvelles dépendances.
+* Conserver la compatibilité Python actuelle.
+* Garder les messages de log existants ; ajouter de nouveaux logs uniquement si utiles pour le debug.
+* Ne jamais lever une exception fatale si `lecropper` n’est pas dispo : dans ce cas, le pipeline doit se désactiver proprement (comportement déjà implémenté, à respecter).
 

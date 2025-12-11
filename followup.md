@@ -1,36 +1,61 @@
-## followup.md
 
-### Récapitulatif des modifications à vérifier
+## `followup.md`
 
-* [x] **Mission 1 :**
+### Ce qui a été demandé
 
-  * [x] Une fonction `_reset_filter_log()` a été ajoutée dans `zemosaic_filter_gui_qt.py` (ou le point d’entrée du filtre).
-  * [x] Cette fonction supprime `zemosaic_filter.log` au chargement du module, sans casser le démarrage en cas d’erreur.
-  * [x] Aucun changement dans la config de logging, seuls les fichiers sont affectés.
+* Restaurer un comportement “classique” sain :
 
-* [x] **Mission 2 :**
+  * master tiles **toujours** passées par le pipeline lecropper (quality crop + alt-az + alpha) avant sauvegarde ;
+  * mosaïque finale **sans** égalisation RGB agressive par défaut ;
+  * Grid mode / SDS inchangés.
 
-  * [x] `zemosaic_worker.py` importe désormais `_poststack_rgb_equalization` depuis `zemosaic_align_stack.py` via un `try/except` sécurisé.
-  * [x] Un helper `_apply_final_mosaic_rgb_equalization(...)` a été ajouté dans `zemosaic_worker.py`, réutilisant `_poststack_rgb_equalization` pour la mosaïque finale.
-  * [x] `_run_shared_phase45_phase5_pipeline(...)` reçoit un `zconfig` (kw-only, optionnel) passé depuis `run_hierarchical_mosaic(...)` (classique + SDS) pour éviter le `name 'zconfig' is not defined` vu dans `zemosaic_worker.log`.
-  * [x] `run_hierarchical_mosaic(...)` appelle ce helper **uniquement** pour le flux mosaïque classique (condition `not sds_mode_phase5` ou équivalent).
-  * [x] Le helper logge une ligne `[RGB-EQ] final mosaic: ...` lorsqu’un équilibrage est effectivement appliqué (aucun warning `name 'zconfig' is not defined` ne doit apparaître).
-  * [x] Aucun changement n’a été apporté à `grid_mode.py`.
+---
 
-### Tests manuels à effectuer
+### Checklist de vérification (à cocher après implémentation)
 
-1. **Log du filtre**
+* [x] Dans `zemosaic_worker.py`, la fonction `create_master_tile(...)` applique :
 
-   * [ ] Lancer le filtre Qt plusieurs fois, vérifier que `zemosaic_filter.log` repart bien de zéro à chaque ouverture.
+  * [x] `poststack_equalize_rgb` (Phase 3) ;
+  * [x] `apply_center_out_normalization_p3` si activé ;
+  * [x] le bloc `quality_crop` basé sur `lecropper.detect_autocrop_rgb` (si `quality_crop_enabled=True`) ;
+  * [x] `_apply_lecropper_pipeline(...)` avec un `pipeline_cfg` complet (quality + alt-az) ;
+  * [x] `_normalize_alpha_mask(...)` et passe un `alpha_mask_out` cohérent à `save_fits_image(...)`.
 
-2. **Flux classique**
+* [x] Les logs `MT_CROP: quality-based rect=...` et `MT_CROP: quality crop skipped ...` apparaissent bien en Phase 3 sur un run de test.
 
-   * [ ] Lancer un run classique avec `poststack_equalize_rgb=True`.
-   * [ ] Vérifier dans `zemosaic_worker_cl.log` la présence de la ligne `[RGB-EQ] final mosaic: ...` et l’absence de `name 'zconfig' is not defined`.
-   * [ ] Inspecter la mosaïque finale : vérifier que la dominante verte est corrigée.
+* [x] L’appel à `_apply_final_mosaic_rgb_equalization(...)` est maintenant protégé par un flag (ex. `final_mosaic_rgb_equalize_enabled`), par défaut à `False`.
 
-3. **Flux Grid mode**
+* [x] Quand le flag est à `False`, aucun log `[RGB-EQ] final mosaic ...` n’apparaît dans `zemosaic_worker.log`.
 
-   * [ ] Lancer au moins un run Grid avec un dataset connu.
-   * [ ] Confirmer qu’il n’y a **aucune régression** : géométrie, couleurs, logs identiques à avant la modification.
+* [x] `_apply_final_mosaic_quality_pipeline(...)` et `_apply_master_tile_crop_mask_to_mosaic(...)` sont toujours appelés en fin de Phase 5 pour la voie classique.
 
+* [x] Aucun changement fonctionnel involontaire n’est apporté à Grid mode (testé sur un petit dataset).
+
+---
+
+### Tests à lancer après la PR
+
+1. **Run M106 classique (hors Grid/SDS)**
+
+   * [ ] Histogramme final ≈ histogrammes des master tiles et de Grid (courbes proches, pas de dominante verte ni rouge saturée).
+   * [ ] Pas de “tuiles fantômes” non croppées sur la mosaïque (bords propres).
+
+2. **Run Grid mode sur un dataset déjà utilisé**
+
+   * [ ] Résultat identique (ou très proche) de la version précédente, pas de crash.
+
+3. **Optionnel : run SDS simple**
+
+   * [ ] Vérifier que les master tiles et la mosaïque SDS restent cohérentes (couleur et cropping).
+
+---
+
+### Notes de suivi / Todo éventuels
+
+* [ ] Si un jour on souhaite réactiver une **égalisation RGB finale douce**, il faudra :
+
+  * limiter les gains (ex. clamp à [0.5, 1.5]) ;
+  * travailler sur un échantillon robuste de la mosaïque (hors bords/NaN) ;
+  * garder `poststack_equalize_rgb` comme base et ne faire que des corrections marginales.
+
+* [ ] Documenter dans le wiki que, pour l’instant, la couleur finale est pilotée par `poststack_equalize_rgb` + `center_out` au niveau master tiles, et non par une égalisation sur la mosaïque globale.

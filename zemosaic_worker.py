@@ -6466,6 +6466,12 @@ def _run_shared_phase45_phase5_pipeline(
     parallel_caps_option = phase5_options.get("parallel_capabilities")
     telemetry_ctrl = phase5_options.get("telemetry")
     sds_mode_phase5 = bool(phase5_options.get("sds_mode"))
+    final_mosaic_rgb_equalize_enabled = bool(
+        phase5_options.get(
+            "final_mosaic_rgb_equalize_enabled",
+            getattr(zconfig, "final_mosaic_rgb_equalize_enabled", False),
+        )
+    )
 
     pcb("PHASE_UPDATE:5", prog=None, lvl="ETA_LEVEL")
     _log_memory_usage(
@@ -6738,13 +6744,21 @@ def _run_shared_phase45_phase5_pipeline(
 
         fallback_two_pass_loader = _load_tiles_for_two_pass_phase5
 
+    enable_final_lecropper = False
+    if final_quality_pipeline_cfg:
+        enable_final_lecropper = bool(
+            final_quality_pipeline_cfg.get("quality_crop_enabled")
+            or final_quality_pipeline_cfg.get("altaz_cleanup_enabled")
+        )
+    enable_final_master_crop = bool(apply_master_tile_crop_config and not quality_crop_enabled_config)
+
     final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = _apply_phase5_post_stack_pipeline(
         final_mosaic_data_HWC,
         final_mosaic_coverage_HW,
         final_alpha_map,
-        enable_lecropper_pipeline=False,
+        enable_lecropper_pipeline=enable_final_lecropper,
         pipeline_cfg=final_quality_pipeline_cfg,
-        enable_master_tile_crop=False,
+        enable_master_tile_crop=enable_final_master_crop,
         master_tile_crop_percent=master_tile_crop_percent_config,
         two_pass_enabled=bool(two_pass_enabled),
         two_pass_sigma_px=two_pass_sigma_px,
@@ -6761,21 +6775,24 @@ def _run_shared_phase45_phase5_pipeline(
     if collected_tiles_for_second_pass is not None:
         collected_tiles_for_second_pass.clear()
 
-# commented out RGB equalization for now
-#    final_rgb_eq_info = None
-#    if final_mosaic_data_HWC is not None and not sds_mode_phase5:
-#        try:
-#            final_mosaic_data_HWC, final_rgb_eq_info = _apply_final_mosaic_rgb_equalization(
-#                final_mosaic_data_HWC,
-#                zconfig=zconfig,
-#                logger=logger,
-#            )
-#        except Exception as exc:
-#            if logger:
-#                logger.warning(
-#                    "[RGB-EQ] Unexpected error during final mosaic RGB equalization: %s",
-#                    exc,
-#                )
+    final_rgb_eq_info = None
+    if (
+        final_mosaic_rgb_equalize_enabled
+        and final_mosaic_data_HWC is not None
+        and not sds_mode_phase5
+    ):
+        try:
+            final_mosaic_data_HWC, final_rgb_eq_info = _apply_final_mosaic_rgb_equalization(
+                final_mosaic_data_HWC,
+                zconfig=zconfig,
+                logger=logger,
+            )
+        except Exception as exc:
+            if logger:
+                logger.warning(
+                    "[RGB-EQ] Unexpected error during final mosaic RGB equalization: %s",
+                    exc,
+                )
 
     alpha_final = _derive_final_alpha_mask(
         final_alpha_map,
@@ -13346,6 +13363,7 @@ def run_hierarchical_mosaic(
     filter_overrides: dict | None = None,
     filtered_header_items: list[dict] | None = None,
     early_filter_enabled: bool | None = None,
+    final_mosaic_rgb_equalize_enabled_config: bool | None = None,
 ):
     """
     Orchestre le traitement de la mosaïque hiérarchique.
@@ -13406,6 +13424,18 @@ def run_hierarchical_mosaic(
         grid_rgb_equalize_source = "default"
     poststack_equalize_rgb_config = bool(grid_rgb_equalize_flag)
     setattr(zconfig, "poststack_equalize_rgb", bool(grid_rgb_equalize_flag))
+
+    final_mosaic_rgb_equalize_enabled = _coerce_bool_flag(
+        final_mosaic_rgb_equalize_enabled_config
+    )
+    if final_mosaic_rgb_equalize_enabled is None:
+        final_mosaic_rgb_equalize_enabled = _coerce_bool_flag(
+            worker_config_cache.get("final_mosaic_rgb_equalize_enabled")
+        )
+    if final_mosaic_rgb_equalize_enabled is None:
+        final_mosaic_rgb_equalize_enabled = False
+    final_mosaic_rgb_equalize_enabled = bool(final_mosaic_rgb_equalize_enabled)
+    setattr(zconfig, "final_mosaic_rgb_equalize_enabled", final_mosaic_rgb_equalize_enabled)
 
     if detect_grid_mode(input_folder):
         if grid_mode and hasattr(grid_mode, "run_grid_mode"):
@@ -15459,6 +15489,7 @@ def run_hierarchical_mosaic(
             "two_pass_sigma_px": two_pass_sigma_px,
             "two_pass_gain_clip": gain_clip_tuple,
             "two_pass_coverage_renorm": two_pass_coverage_renorm_config,
+            "final_mosaic_rgb_equalize_enabled": bool(final_mosaic_rgb_equalize_enabled),
             "use_gpu_phase5": use_gpu_phase5_flag,
             "assembly_process_workers": assembly_process_workers_config,
             "intertile_preview_size": intertile_preview_size_config,
