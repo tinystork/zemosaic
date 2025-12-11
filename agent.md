@@ -202,12 +202,12 @@ Make sure the project still runs and that the classic mosaic no longer has a str
 
 ## Acceptance criteria
 
-* [ ] In `zemosaic_worker.py`, the Phase 5 post-stack pipeline call for the classic / non-grid path uses:
+* [x] In `zemosaic_worker.py`, the Phase 5 post-stack pipeline call for the classic / non-grid path uses:
 
   * `enable_lecropper_pipeline=False`
   * `enable_master_tile_crop=False`
   * with all other arguments unchanged.
-* [ ] The final RGB equalisation call remains disabled.
+* [x] The final RGB equalisation call remains disabled.
 * [ ] The classic (non-grid) mosaic output no longer shows a strong green cast and visually matches (or is very close to) the reference behaviour of `zemosaic_worker_non grid_ok.py`.
 * [ ] Grid Mode and SDS modes continue to work without regression.
 

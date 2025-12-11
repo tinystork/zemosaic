@@ -71,20 +71,20 @@ Given that these stages include **background cleanup and multi-channel operation
 
 ## What remains to be done (for this mission)
 
-1. In `zemosaic_worker.py`, restrict the **Phase 5 post-stack pipeline call** on the final mosaic (classic / non-grid path) to use the **same effective options** as the reference worker:
+- [x] In `zemosaic_worker.py`, restrict the **Phase 5 post-stack pipeline call** on the final mosaic (classic / non-grid path) to use the **same effective options** as the reference worker:
 
-   * `enable_lecropper_pipeline=False`
-   * `enable_master_tile_crop=False`
+  * `enable_lecropper_pipeline=False`
+  * `enable_master_tile_crop=False`
 
-   while keeping the rest of the arguments intact (two-pass, WCS, coverage, etc.).
+  while keeping the rest of the arguments intact (two-pass, WCS, coverage, etc.).
 
-2. Ensure that any new variables like `enable_final_lecropper` / `enable_final_master_crop` are **not used** for that classic call site.
-   They can remain in the file if they are used for SDS / Grid Mode or other paths.
+- [x] Ensure that any new variables like `enable_final_lecropper` / `enable_final_master_crop` are **not used** for that classic call site.
+  They can remain in the file if they are used for SDS / Grid Mode or other paths.
 
-3. Confirm that:
+- [ ] Confirm that:
 
-   * Classic mode output recovers a sane colour balance (no green cast).
-   * Grid Mode and SDS outputs remain unchanged and functional.
+  * Classic mode output recovers a sane colour balance (no green cast).
+  * Grid Mode and SDS outputs remain unchanged and functional.
 
 ---
 
