@@ -43,13 +43,13 @@
 
 ### 4. Normalisation photométrique inter-tile
 
-- [ ] Identifier la tuile de référence utilisée pour la photométrie.
-- [ ] Vérifier que :
+- [x] Identifier la tuile de référence utilisée pour la photométrie.
+- [x] Vérifier que :
 
   - un `common_mask` correctement construit (intersection de masques valides) est utilisé,
   - si l’overlap est insuffisant → log WARN et pas de scaling.
 
-- [ ] Confirmer l’appel à :
+- [x] Confirmer l’appel à :
 
   ```python
   gains, offsets = compute_tile_photometric_scaling(ref_patch, tgt_patch, mask=common_mask)
@@ -57,7 +57,7 @@
   info.mask = compute_valid_mask(info.data) & info.mask
 ````
 
-* [ ] Vérifier que les logs `[GRID] Photometry` montrent des gains/offsets **finis** et raisonnables.
+* [x] Vérifier que les logs `[GRID] Photometry` montrent des gains/offsets **finis** et raisonnables.
 
 **Validation pratique :**
 
@@ -68,16 +68,16 @@
 
 ### 5. Assemblage des tuiles en mosaïque
 
-* [ ] Ouvrir `assemble_tiles(...)` dans `grid_mode.py`.
+* [x] Ouvrir `assemble_tiles(...)` dans `grid_mode.py`.
 
-* [ ] Vérifier que :
+* [x] Vérifier que :
 
   * la mosaïque globale est allouée avec `global_shape_hw`,
   * pour chaque tuile, on indexe `mosaic_data[y0:y1, x0:x1]` avec la `bbox`,
   * on cumule les contributions pondérées (poids = masque ou coverage),
   * à la fin, on divise par les poids là où ils sont > 0.
 
-* [ ] S’assurer qu’aucune reproject globale supplémentaire (type `reproject_interp` vers une nouvelle WCS) n’est faite à ce stade.
+* [x] S’assurer qu’aucune reproject globale supplémentaire (type `reproject_interp` vers une nouvelle WCS) n’est faite à ce stade.
 
 **Test visuel :**
 
@@ -88,9 +88,9 @@
 
 ### 6. Autocrop & CRPIX/NAXIS
 
-* [ ] Vérifier dans `zemosaic_worker.py` que l’autocrop global se fait via `_auto_crop_global_mosaic_if_requested` puis `_apply_autocrop_to_global_plan`.
-* [ ] S’assurer que `grid_mode.py` ne modifie pas lui-même `CRPIX1/2` ou `NAXIS1/2` après coup.
-* [ ] Confirmer que le plan retourné au worker contient la bonne largeur/hauteur après autocrop.
+* [x] Vérifier dans `zemosaic_worker.py` que l’autocrop global se fait via `_auto_crop_global_mosaic_if_requested` puis `_apply_autocrop_to_global_plan`.
+* [x] S’assurer que `grid_mode.py` ne modifie pas lui-même `CRPIX1/2` ou `NAXIS1/2` après coup.
+* [x] Confirmer que le plan retourné au worker contient la bonne largeur/hauteur après autocrop.
 
 **Test :**
 
@@ -101,18 +101,18 @@
 
 ### 7. Fallback & logs
 
-* [ ] Examiner le code Grid dans `zemosaic_worker.py` :
+* [x] Examiner le code Grid dans `zemosaic_worker.py` :
 
   * en cas de succès Grid → **pas** de fallback.
   * en cas d’échec (`run_grid_mode` lève) → fallback explicite avec log clair.
 
-* [ ] Ajouter si besoin un log type :
+* [x] Ajouter si besoin un log type :
 
   ```python
   logger.warning("[GRID] Fallback to classic pipeline: reason=%s", reason)
   ```
 
-* [ ] S’assurer qu’aucun fallback ne se déclenche sur un dataset sain.
+* [x] S’assurer qu’aucun fallback ne se déclenche sur un dataset sain.
 
 **Validation :**
 
