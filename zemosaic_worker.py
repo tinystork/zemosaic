@@ -6752,13 +6752,19 @@ def _run_shared_phase45_phase5_pipeline(
         )
     enable_final_master_crop = bool(apply_master_tile_crop_config and not quality_crop_enabled_config)
 
+    enable_final_lecropper_for_mosaic = enable_final_lecropper
+    enable_final_master_crop_for_mosaic = enable_final_master_crop
+    if not sds_mode_phase5:
+        enable_final_lecropper_for_mosaic = False
+        enable_final_master_crop_for_mosaic = False
+
     final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = _apply_phase5_post_stack_pipeline(
         final_mosaic_data_HWC,
         final_mosaic_coverage_HW,
         final_alpha_map,
-        enable_lecropper_pipeline=enable_final_lecropper,
+        enable_lecropper_pipeline=enable_final_lecropper_for_mosaic,
         pipeline_cfg=final_quality_pipeline_cfg,
-        enable_master_tile_crop=enable_final_master_crop,
+        enable_master_tile_crop=enable_final_master_crop_for_mosaic,
         master_tile_crop_percent=master_tile_crop_percent_config,
         two_pass_enabled=bool(two_pass_enabled),
         two_pass_sigma_px=two_pass_sigma_px,
