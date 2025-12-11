@@ -12,9 +12,9 @@
 
   * [x] `zemosaic_worker.py` importe désormais `_poststack_rgb_equalization` depuis `zemosaic_align_stack.py` via un `try/except` sécurisé.
   * [x] Un helper `_apply_final_mosaic_rgb_equalization(...)` a été ajouté dans `zemosaic_worker.py`, réutilisant `_poststack_rgb_equalization` pour la mosaïque finale.
-  * [ ] `_run_shared_phase45_phase5_pipeline(...)` reçoit un `zconfig` (kw-only, optionnel) passé depuis `run_hierarchical_mosaic(...)` (classique + SDS) pour éviter le `name 'zconfig' is not defined` vu dans `zemosaic_worker.log`.
+  * [x] `_run_shared_phase45_phase5_pipeline(...)` reçoit un `zconfig` (kw-only, optionnel) passé depuis `run_hierarchical_mosaic(...)` (classique + SDS) pour éviter le `name 'zconfig' is not defined` vu dans `zemosaic_worker.log`.
   * [x] `run_hierarchical_mosaic(...)` appelle ce helper **uniquement** pour le flux mosaïque classique (condition `not sds_mode_phase5` ou équivalent).
-  * [ ] Le helper logge une ligne `[RGB-EQ] final mosaic: ...` lorsqu’un équilibrage est effectivement appliqué (aucun warning `name 'zconfig' is not defined` ne doit apparaître).
+  * [x] Le helper logge une ligne `[RGB-EQ] final mosaic: ...` lorsqu’un équilibrage est effectivement appliqué (aucun warning `name 'zconfig' is not defined` ne doit apparaître).
   * [x] Aucun changement n’a été apporté à `grid_mode.py`.
 
 ### Tests manuels à effectuer
