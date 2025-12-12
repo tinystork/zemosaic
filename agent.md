@@ -45,11 +45,11 @@ Uniquement :
 ---
 
 ## 🛠️ Travail attendu
-1. Identifier **précisément** le chemin d’appel SDS menant à `cp.nanpercentile`
+- [x] Identifier **précisément** le chemin d’appel SDS menant à `cp.nanpercentile`
    - ne pas supposer
    - suivre le flux réel (SDS → gpu_reproject → stats/percentiles)
 
-2. Pour **chaque appel SDS** à `cp.nanpercentile` :
+- [x] Pour **chaque appel SDS** à `cp.nanpercentile` :
    - remplacer par un wrapper **local SDS**
    - compatible CuPy sans `nanpercentile`
 

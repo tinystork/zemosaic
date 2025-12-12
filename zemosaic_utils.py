@@ -3706,6 +3706,22 @@ def _xp_errstate(xp_module, **kwargs):
     return nullcontext()
 
 
+def _sds_cp_nanpercentile(arr_gpu, percentiles, *, axis=None):
+    """SDS-local CuPy percentile wrapper resilient to missing nanpercentile."""
+
+    import cupy as cp  # type: ignore
+
+    if hasattr(cp, "nanpercentile"):
+        return cp.nanpercentile(arr_gpu, percentiles, axis=axis)
+    if hasattr(cp, "nanquantile"):
+        if np.isscalar(percentiles):
+            q = float(percentiles) / 100.0
+        else:
+            q = cp.asarray(percentiles, dtype=cp.float32) / 100.0
+        return cp.nanquantile(arr_gpu, q, axis=axis)
+    raise RuntimeError("CuPy missing nanpercentile/nanquantile")
+
+
 def _winsorized_weighted_average_chunk(
     stack,
     weights,
@@ -3718,8 +3734,12 @@ def _winsorized_weighted_average_chunk(
     low_frac, high_frac = _sanitize_winsor_limits(winsor_limits)
     low_pct = max(0.0, min(100.0, low_frac * 100.0))
     high_pct = max(0.0, min(100.0, 100.0 - high_frac * 100.0))
-    lower = xp.nanpercentile(stack, low_pct, axis=0)
-    upper = xp.nanpercentile(stack, high_pct, axis=0)
+    if getattr(xp, "__name__", "") == "cupy":
+        lower = _sds_cp_nanpercentile(stack, low_pct, axis=0)
+        upper = _sds_cp_nanpercentile(stack, high_pct, axis=0)
+    else:
+        lower = xp.nanpercentile(stack, low_pct, axis=0)
+        upper = xp.nanpercentile(stack, high_pct, axis=0)
     clipped = xp.clip(stack, lower, upper)
     weighted = clipped * weights
     chunk_weight = xp.nansum(weights, axis=0)
