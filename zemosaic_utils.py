@@ -3719,7 +3719,45 @@ def _sds_cp_nanpercentile(arr_gpu, percentiles, *, axis=None):
         else:
             q = cp.asarray(percentiles, dtype=cp.float32) / 100.0
         return cp.nanquantile(arr_gpu, q, axis=axis)
-    raise RuntimeError("CuPy missing nanpercentile/nanquantile")
+
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug(
+            "CuPy lacks nanpercentile/nanquantile -> using SDS sort-based "
+            "nanpercentile fallback"
+        )
+
+    if axis is None:
+        flat = cp.ravel(arr_gpu)
+        finite = cp.isfinite(flat)
+        sorted_flat = cp.sort(cp.where(finite, flat, cp.inf))
+        cnt = cp.sum(finite)
+        max_idx = cp.maximum(cnt - 1, 0)
+        pct = cp.asarray(percentiles, dtype=cp.float32)
+        pct = cp.reshape(pct, (-1,))
+        k = cp.floor((cp.clip(pct, 0.0, 100.0) / 100.0) * max_idx).astype(cp.int64)
+        gathered = sorted_flat[k]
+        result = cp.where(cnt == 0, cp.float32(0.0), gathered.astype(cp.float32))
+        if pct.size == 1:
+            return result[0]
+        return result
+
+    arr_axis0 = cp.moveaxis(arr_gpu, axis, 0)
+    finite = cp.isfinite(arr_axis0)
+    sorted_vals = cp.sort(cp.where(finite, arr_axis0, cp.inf), axis=0)
+    cnt = cp.sum(finite, axis=0)
+    max_idx = cp.maximum(cnt - 1, 0)
+    pct = cp.asarray(percentiles, dtype=cp.float32)
+    pct = cp.reshape(pct, (-1,))
+    pct_scaled = cp.clip(pct, 0.0, 100.0) / 100.0
+    pct_scaled = cp.reshape(pct_scaled, (pct_scaled.size,) + (1,) * max_idx.ndim)
+    max_idx_exp = cp.expand_dims(max_idx, axis=0)
+    k = cp.floor(pct_scaled * max_idx_exp).astype(cp.int64)
+    gathered = cp.take_along_axis(sorted_vals, k, axis=0)
+    filled = cp.where(cp.expand_dims(cnt == 0, axis=0), cp.float32(0.0), gathered)
+    result = filled.astype(cp.float32)
+    if pct.size == 1:
+        return result[0]
+    return result
 
 
 def _winsorized_weighted_average_chunk(

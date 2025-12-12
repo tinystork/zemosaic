@@ -23,10 +23,10 @@ This must be fixed so the GPU helper route does not fail on systems where CuPy l
 On some installations, CuPy lacks both -> GPU helper raises -> worker falls back to CPU.
 
 ## Required fix
-Implement a **third fallback** in `_sds_cp_nanpercentile()`:
-- If both `nanpercentile` and `nanquantile` are missing, compute NaN-ignoring percentiles using CuPy primitives (no NumPy fallback).
-- Must support scalar percentile (float) and small percentile arrays (e.g., two values for winsorization).
-- Must support `axis=0` (this is the SDS winsorized path use case).
+- [x] Implement a **third fallback** in `_sds_cp_nanpercentile()`:
+  - If both `nanpercentile` and `nanquantile` are missing, compute NaN-ignoring percentiles using CuPy primitives (no NumPy fallback).
+  - Must support scalar percentile (float) and small percentile arrays (e.g., two values for winsorization).
+  - Must support `axis=0` (this is the SDS winsorized path use case).
 
 Suggested algorithm (NaN-safe percentile via sort):
 1. Let `x = arr_gpu`.
@@ -45,7 +45,7 @@ Edge cases:
 - Must not crash if `cp.errstate` is missing (use existing `_xp_errstate()` patterns elsewhere; do not introduce new cp.errstate usage).
 
 ## Files to modify
-- `zemosaic_utils.py` (only): implement the extra fallback in `_sds_cp_nanpercentile()`.
+- [x] `zemosaic_utils.py` (only): implement the extra fallback in `_sds_cp_nanpercentile()`.
 
 ## Acceptance criteria
 - SDS run no longer falls back to CPU due to nanpercentile/nanquantile missing.
@@ -63,4 +63,4 @@ Run the same example that currently triggers fallback and verify logs no longer 
 and verify GPU path is used.
 
 ## Deliverables
-- One commit with message: "Fix SDS GPU nanpercentile fallback"
+- [x] One commit with message: "Fix SDS GPU nanpercentile fallback"
