@@ -1,67 +1,92 @@
-# SDS GUI progress/ETA/counter fix — detailed checklist
+# Follow-up checklist: Grid mode progress + ETA (PySide)
 
-## 0) Guardrails
-- [x] Touch only GUI progress logic for SDS.
-- [x] Do NOT refactor worker pipeline, GPU helpers, stacking, or non-SDS progress computation.
-- [x] Keep progress monotonic (never goes backward).
+## Context
+Grid mode is invoked from the worker via `grid_mode.run_grid_mode(...)`.
+The Qt GUI already updates:
+- progress bar / stage label from `STAGE_PROGRESS`
+- ETA label from `ETA_UPDATE:...`
+- Tiles counter from `MASTER_TILE_COUNT_UPDATE:X/Y`
 
-## 1) Locate SDS progress logic (Qt + Tk)
-- [x] In zemosaic_gui_qt.py:
-  - find _maybe_detect_sds, _compute_sds_progress_fraction, _apply_sds_progress
-  - locate where “Tiles: X/Y” label is updated
-  - locate where ETA is computed / smoothed
-- [x] In zemosaic_gui.py: same functions (Tk version) and keep parity.
+Your job is ONLY to make `grid_mode.py` emit these messages at the right times.
 
-## 2) Fix total phases so 75% cap cannot happen
-- [x] Identify where _sds_total_phases is set (if anywhere).
-- [x] Ensure SDS uses 7 phases (1..7) unless a real 8th phase exists.
-  - If unknown, default SDS total phases to 7.
-  - Document in code comment: “SDS phases: 1=Preprocess, 2=Cluster, 3=MasterTiles?, 4=GlobalCoadd, 5=Polish, 6=Save, 7=Cleanup”.
+## Exact message formats to emit (do not invent new ones)
+Use `progress_callback(msg_key, prog=None, lvl="INFO", **kwargs)`.
 
-## 3) Extend _compute_sds_progress_fraction to account for phases beyond phase 1
-### Phase 1 (already OK)
-- [ ] Keep current behavior: files_done/files_total updates.
+1) Stage progress (drives progress bar):
+- msg_key = "STAGE_PROGRESS"
+- prog = stage_name (string)
+- lvl = current (int)
+- kwargs["total"] = total (int)
 
-### Phase 4 (global coadd progress)
-- [x] When SDS phase4 is active (p4_global_coadd_progress / _sds_phase_active):
-  - phase_progress = _sds_phase_done / _sds_phase_total
-  - ensure bounded in [0,1]
+Example:
+```py
+progress_callback("STAGE_PROGRESS", "GRID: tile stacking", 3, total=12)
+ETA updates:
 
-### Phase 5 (polish) — indeterminate
-- [x] Do NOT attempt time-based progress.
-- [x] While in phase 5:
-  - keep fraction monotonic but do not update ETA based on progress slope.
-  - set ETA label to “--:--:--” (or a consistent neutral display) until phase changes.
-- [x] Mark phase 5 complete when:
-  - receiving sds_global_finalize_done, OR
-  - receiving run_info_phase6_started (entering phase 6).
+msg_key = f"ETA_UPDATE:{eta_str}"
 
-### Phases 6 & 7
-- [x] Treat as deterministic short phases:
-  - phase 6 complete when run_success_mosaic_saved AND/OR run_success_preview_saved occurs.
-  - phase 7 complete when final “processing completed successfully” key is received.
+lvl = "ETA_LEVEL"
 
-## 4) Force 100% on completion
-- [x] When GUI receives the final success/completion event:
-  - set _sds_completed=True
-  - call _apply_sds_progress(1.0) so progress bar shows 100%
-  - set ETA “00:00:00”
+Example:
 
-## 5) Fix the misleading “Tiles” counter in SDS
-- [x] In SDS mode, override the top-right counter to show global raw progress:
-  - display_done = _sds_files_done
-  - display_total = _sds_files_total (e.g. 66)
-- [x] Do NOT show per-batch totals (6/6, 10/10) in that top-right slot.
-  - Keep per-batch in log only if needed.
+py
+Copier le code
+progress_callback("ETA_UPDATE:00:12:34", None, "ETA_LEVEL")
+Tiles counter:
 
-## 6) Regression safety
-- [ ] Confirm classic mode progress bar behavior unchanged.
-- [ ] Confirm grid mode progress bar behavior unchanged.
-- [x] Confirm no worker-side changes.
+msg_key = f"MASTER_TILE_COUNT_UPDATE:{done}/{total}"
 
-## 7) Quick manual validation steps
-- [ ] Run SDS on dataset with known total (e.g. 66):
-  - progress must reach 100%
-  - counter shows x/66
-  - phase 5 ETA neutral (“--:--:--”)
-  - completion sets ETA “00:00:00”
+Example:
+
+py
+Copier le code
+progress_callback("MASTER_TILE_COUNT_UPDATE:3/12")
+(Optionally) phase label:
+
+msg_key = "PHASE_UPDATE:<something>"
+But this is optional; stage_name from STAGE_PROGRESS is usually enough.
+
+Implementation steps (do them in order)
+ Add _GridProgressReporter in grid_mode.py (private helper).
+
+ Hook it into run_grid_mode:
+
+ Initial stage + initial ETA
+
+ Set tile_total once tiles are known; emit 0/N
+
+ Increment done tiles on each tile completion
+
+ Maintain overall progress units (stable global percent)
+
+ Emit ETA periodically (throttle)
+
+ Force final update at end (100% + 00:00:00)
+
+ Ensure all calls are guarded:
+
+if progress_callback is None or not callable => no-op
+
+ Throttle emissions:
+
+Aim <= ~5 updates/sec (0.2s) or even 0.5s; keep UI responsive
+
+ Do not change any algorithm outputs, file outputs, or logs.
+
+Quick sanity test (manual)
+Run any grid-mode dataset (stack_plan.csv present) and observe:
+
+Tiles counter goes 0/N ... N/N
+
+ETA changes over time
+
+Progress reaches 100%
+
+Non-goals
+Do NOT touch SDS
+
+Do NOT touch classic mode
+
+Do NOT touch any GUI files
+
+Do NOT change performance-critical loops except for throttled callbacks
