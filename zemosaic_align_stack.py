@@ -830,7 +830,16 @@ def _gpu_nanpercentile(values: np.ndarray, percentiles):
 
         _ensure_gpu_pool()
         arr_gpu = cp.asarray(values, dtype=cp.float32)
-        result_gpu = cp.nanpercentile(arr_gpu, percentiles)
+
+        if hasattr(cp, "nanpercentile"):
+            result_gpu = cp.nanpercentile(arr_gpu, percentiles)
+        else:
+            # nanquantile expects quantiles expressed in the range [0, 1]
+            if np.isscalar(percentiles):
+                q = float(percentiles) / 100.0
+            else:
+                q = cp.asarray(percentiles, dtype=cp.float32) / 100.0
+            result_gpu = cp.nanquantile(arr_gpu, q)
 
         if np.isscalar(percentiles):
             return float(result_gpu)
