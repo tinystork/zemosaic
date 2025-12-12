@@ -7,9 +7,9 @@
 - Keep behavior “batch size = 0” and “batch size > 1” untouched.
 
 ## Symptoms to fix (observed)
-1) In SDS runs, progress bar never reaches 100% (stuck ~75% even at P7 Cleanup).
-2) “Tiles: X/Y” is misleading in SDS: it shows per-super-tile frames (e.g. 6/6 or 10/10) instead of global raw count (e.g. 66).
-3) ETA becomes meaningless (especially during SDS phase 5 polish) because progress is not tracked within phases.
+- [x] In SDS runs, progress bar never reaches 100% (stuck ~75% even at P7 Cleanup).
+- [x] “Tiles: X/Y” is misleading in SDS: it shows per-super-tile frames (e.g. 6/6 or 10/10) instead of global raw count (e.g. 66).
+- [x] ETA becomes meaningless (especially during SDS phase 5 polish) because progress is not tracked within phases.
 
 ## Root cause (likely)
 GUI SDS global progress fraction only accounts for phase 1 files_done/files_total; other phases use phase_progress=0, so global_fraction saturates at (phase_index-1)/total_phases.
@@ -21,15 +21,15 @@ Also completion event never forces 100% in SDS.
 - zemosaic_gui.py     (Tk GUI)  [keep parity]
 
 ## Required behavior (Acceptance Criteria)
-A) In SDS mode, progress bar MUST hit 100% on successful completion (P7 done).
-B) In SDS mode, the top-right counter MUST display a consistent global counter aligned with other flows:
+- [x] In SDS mode, progress bar MUST hit 100% on successful completion (P7 done).
+- [x] In SDS mode, the top-right counter MUST display a consistent global counter aligned with other flows:
    - show “Files: done/total” or reuse “Tiles:” label but it must be global (e.g. 66 total),
      NOT the per-super-tile frames.
-C) ETA:
+- [x] ETA:
    - During phases where progress cannot be estimated (especially SDS Phase 5 polish),
      show a neutral ETA (e.g. “--:--:--”) and do not “count upward/negative”.
    - When run completes successfully, ETA must become 00:00:00.
-D) Non-SDS runs must remain identical.
+- [ ] Non-SDS runs must remain identical.
 
 ## Implementation plan (high-level)
 1) Identify SDS detection and tracking fields:
