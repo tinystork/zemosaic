@@ -5,9 +5,9 @@
 ## 🔍 Vérifications obligatoires
 
 ### 1️⃣ Analyse du diff
-- [ ] Tous les changements concernent exclusivement SDS
-- [ ] Aucun fichier partagé n’a été modifié “par confort”
-- [ ] Aucun appel global à cp.nanpercentile n’a été remplacé hors SDS
+- [x] Tous les changements concernent exclusivement SDS
+- [x] Aucun fichier partagé n’a été modifié “par confort”
+- [x] Aucun appel global à cp.nanpercentile n’a été remplacé hors SDS
 
 ### 2️⃣ Test fonctionnel SDS
 Lancer un run SDS avec GPU activé (dataset court accepté).
