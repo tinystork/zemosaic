@@ -13720,6 +13720,35 @@ def run_hierarchical_mosaic_classic_legacy(
     except Exception:
         zconfig = SimpleNamespace()
 
+    final_mosaic_black_point_equalize_enabled = _coerce_bool_flag(
+        final_mosaic_black_point_equalize_enabled
+    )
+    if final_mosaic_black_point_equalize_enabled is None:
+        final_mosaic_black_point_equalize_enabled = _coerce_bool_flag(
+            getattr(zconfig, "final_mosaic_black_point_equalize_enabled", None)
+        )
+    if final_mosaic_black_point_equalize_enabled is None:
+        final_mosaic_black_point_equalize_enabled = True
+    final_mosaic_black_point_equalize_enabled = bool(
+        final_mosaic_black_point_equalize_enabled
+    )
+
+    try:
+        final_mosaic_black_point_percentile = float(final_mosaic_black_point_percentile)
+    except (TypeError, ValueError):
+        final_mosaic_black_point_percentile = getattr(
+            zconfig, "final_mosaic_black_point_percentile", 0.1
+        )
+
+    if not (
+        isinstance(final_mosaic_black_point_percentile, (int, float))
+        and math.isfinite(final_mosaic_black_point_percentile)
+    ):
+        final_mosaic_black_point_percentile = 0.1
+    final_mosaic_black_point_percentile = float(
+        max(0.0, min(100.0, final_mosaic_black_point_percentile))
+    )
+
     def pcb(msg_key, prog=None, lvl="INFO", **kwargs):
         """Shortcut to emit log+callback events with the current progress callback."""
         _log_and_callback(msg_key, prog, lvl, callback=progress_callback, **kwargs)
