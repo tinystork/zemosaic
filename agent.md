@@ -55,9 +55,9 @@ Prouver noir sur blanc que la couleur est saine **avant toute mosaïque**.
 ### Points de log (DEBUG uniquement)
 Pour un petit échantillon de tiles (déjà sélectionné par `_select_debug_tile_ids`) :
 
-1. Avant `stack_core`
-2. Après `stack_core`
-3. Après `_poststack_rgb_equalization` (si appelée)
+- [x] Avant `stack_core`
+- [x] Après `stack_core`
+- [x] Après `_poststack_rgb_equalization` (si appelée)
 
 ### Labels à utiliser
 - `P3_pre_stack_core`
@@ -73,17 +73,17 @@ Détecter l’apparition du déséquilibre lors du passage tile → plan global.
 
 ### Points de log
 1. **Avant fusion**
-   - `P4_pre_merge_rgb`
+   - [x] `P4_pre_merge_rgb`
 
 2. **Après fusion brute**
-   - `P4_post_merge_rgb`
+   - [x] `P4_post_merge_rgb`
 
 3. **Après application coverage / NaN**
-   - `P4_post_merge_valid_rgb`
-   - fournir `coverage=final_mosaic_coverage`
+   - [x] `P4_post_merge_valid_rgb`
+   - [x] fournir `coverage=final_mosaic_coverage`
 
 4. **Moyenne pondérée par coverage**
-   - via `_dbg_rgb_stats` (si coverage présent)
+   - [x] via `_dbg_rgb_stats` (si coverage présent)
 
 ---
 
@@ -94,10 +94,10 @@ Identifier une normalisation RGB globale incorrecte.
 
 ### Points de log
 1. Avant toute égalisation globale
-   - `P5_pre_rgb_equalization`
+   - [x] `P5_pre_rgb_equalization`
 
 2. Après `_apply_final_mosaic_rgb_equalization`
-   - `P5_post_rgb_equalization`
+   - [x] `P5_post_rgb_equalization`
 
 ### Si une égalisation RGB est appliquée
 Logger explicitement :

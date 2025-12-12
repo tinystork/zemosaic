@@ -6914,7 +6914,7 @@ def _run_shared_phase45_phase5_pipeline(
             if sample_tile_path and _path_exists(sample_tile_path):
                 with fits.open(sample_tile_path, memmap=True, do_not_scale_image_data=True) as hdul_sample:
                     sample_data = np.asarray(hdul_sample[0].data)
-                _dbg_rgb_stats("P4_PRE_MOSAIC_FUSE", sample_data, logger=logger)
+                _dbg_rgb_stats("P4_pre_merge_rgb", sample_data, logger=logger)
         except Exception:
             pass
 
@@ -7150,10 +7150,8 @@ def _run_shared_phase45_phase5_pipeline(
 
     if logger.isEnabledFor(logging.DEBUG):
         _dbg_rgb_stats(
-            "P4_POST_MOSAIC_FUSE",
+            "P4_post_merge_rgb",
             final_mosaic_data_HWC,
-            coverage=final_mosaic_coverage_HW,
-            alpha=final_alpha_map,
             logger=logger,
         )
 
@@ -7177,6 +7175,16 @@ def _run_shared_phase45_phase5_pipeline(
         parallel_plan=parallel_plan,
         telemetry_ctrl=None if sds_mode_phase5 else telemetry_ctrl,
     )
+
+    if logger.isEnabledFor(logging.DEBUG):
+        _dbg_rgb_stats(
+            "P4_post_merge_valid_rgb",
+            final_mosaic_data_HWC,
+            coverage=final_mosaic_coverage_HW,
+            alpha=final_alpha_map,
+            logger=logger,
+        )
+
     if collected_tiles_for_second_pass is not None:
         collected_tiles_for_second_pass.clear()
 
@@ -7215,7 +7223,7 @@ def _run_shared_phase45_phase5_pipeline(
 
     if logger.isEnabledFor(logging.DEBUG):
         _dbg_rgb_stats(
-            "P5_PRE_GLOBAL_POST",
+            "P5_pre_rgb_equalization",
             final_mosaic_data_HWC,
             coverage=final_mosaic_coverage_HW,
             alpha=alpha_final,
@@ -7231,20 +7239,36 @@ def _run_shared_phase45_phase5_pipeline(
         and not sds_mode_phase5
     ):
         try:
-            final_mosaic_data_HWC, _ = equalize_black_point_rgb(
+            final_mosaic_data_HWC, rgb_black_eq_info = equalize_black_point_rgb(
                 final_mosaic_data_HWC,
                 alpha_mask=alpha_final,
                 coverage_hw=final_mosaic_coverage_HW,
                 percentile=final_mosaic_black_point_percentile,
                 logger=logger,
             )
+            if logger and isinstance(rgb_black_eq_info, dict):
+                if rgb_black_eq_info.get("applied"):
+                    logger.info(
+                        "[BlackPoint] Applied percentile=%.3f pedestals=(%.6f, %.6f, %.6f) samples=%d",
+                        rgb_black_eq_info.get("percentile", float("nan")),
+                        rgb_black_eq_info.get("pedestal_r", 0.0),
+                        rgb_black_eq_info.get("pedestal_g", 0.0),
+                        rgb_black_eq_info.get("pedestal_b", 0.0),
+                        int(rgb_black_eq_info.get("samples", 0)),
+                    )
+                else:
+                    logger.debug(
+                        "[BlackPoint] Skipped percentile=%.3f (samples=%d)",
+                        rgb_black_eq_info.get("percentile", float("nan")),
+                        int(rgb_black_eq_info.get("samples", 0)),
+                    )
         except Exception as exc_black:
             if logger:
                 logger.warning("[BlackPoint] Final mosaic pedestal equalization failed: %s", exc_black)
 
     if logger.isEnabledFor(logging.DEBUG):
         _dbg_rgb_stats(
-            "P5_POST_GLOBAL_POST",
+            "P5_post_rgb_equalization",
             final_mosaic_data_HWC,
             coverage=final_mosaic_coverage_HW,
             alpha=alpha_final,
@@ -10367,7 +10391,7 @@ def create_master_tile(
             pass
 
     if debug_tile and valid_aligned_images:
-        _dbg_rgb_stats("P3_PRE_STACK_CORE", valid_aligned_images[0], logger=logger)
+        _dbg_rgb_stats("P3_pre_stack_core", valid_aligned_images[0], logger=logger)
 
     pcb_tile(f"{func_id_log_base}_info_stacking_started", prog=None, lvl="DEBUG_DETAIL",
              num_to_stack=len(valid_aligned_images), tile_id=tile_id) # Les options sont loggées au début
@@ -10396,7 +10420,7 @@ def create_master_tile(
     )
 
     if debug_tile:
-        _dbg_rgb_stats("P3_POST_STACK_CORE", master_tile_stacked_HWC, logger=logger)
+        _dbg_rgb_stats("P3_post_stack_core", master_tile_stacked_HWC, logger=logger)
 
     try:
         del valid_aligned_images
@@ -10445,7 +10469,7 @@ def create_master_tile(
     )
 
     if debug_tile and poststack_equalize_rgb:
-        _dbg_rgb_stats("P3_PRE_POSTSTACK_EQ", master_tile_stacked_HWC, logger=logger)
+        _dbg_rgb_stats("P3_pre_poststack_rgb_eq", master_tile_stacked_HWC, logger=logger)
 
     pcb_tile(
         f"[RGB-EQ] poststack_equalize_rgb enabled={eq_enabled}, applied={eq_applied}, "
@@ -10455,7 +10479,7 @@ def create_master_tile(
     )
 
     if debug_tile and (poststack_equalize_rgb or eq_applied):
-        _dbg_rgb_stats("P3_POST_POSTSTACK_EQ", master_tile_stacked_HWC, logger=logger)
+        _dbg_rgb_stats("P3_post_poststack_rgb_eq", master_tile_stacked_HWC, logger=logger)
 
     norm_result = None
     norm_mode = "disabled"
@@ -23715,6 +23739,7 @@ def assemble_global_mosaic_first(
         cache_root=cache_root,
         parallel_plan=parallel_plan,
     )
+
 def _fallback_app_base_dir() -> Path:
     try:
         return Path(__file__).resolve().parent
