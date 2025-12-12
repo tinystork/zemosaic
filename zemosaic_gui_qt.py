@@ -709,6 +709,7 @@ class ZeMosaicQtWorker(QObject):
     def _handle_sds_phase_progress(self, payload: Dict[str, Any]) -> None:
         if not isinstance(payload, dict):
             return
+        self._sds_progress_active = True
         try:
             total_val = int(payload.get("total", 0))
         except (TypeError, ValueError):
@@ -734,6 +735,7 @@ class ZeMosaicQtWorker(QObject):
 
     def _handle_sds_phase_finish(self, payload: Dict[str, Any]) -> None:
         payload_dict = payload if isinstance(payload, dict) else {}
+        self._sds_progress_active = True
         total_val = self._sds_stage_total
         if total_val <= 0:
             try:
@@ -938,6 +940,14 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._eta_calc: ETACalculator | None = None
         self._cpu_eta_override_deadline: float | None = None
         self._weighted_progress_active = False
+        self._sds_progress_active = False
+        self._sds_total_phases = 7  # SDS pipeline emits 7 1-based phases
+        self._sds_current_phase_index = 0
+        self._sds_files_done = 0
+        self._sds_files_total = 0
+        self._sds_last_eta_str = ""
+        self._sds_global_progress_0_1 = 0.0
+        self._sds_completed = False
         self._sds_phase_active = False
         self._sds_phase_done = 0
         self._sds_phase_total = 0
@@ -4573,9 +4583,70 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._eta_seconds_smoothed = None
         self._cpu_eta_override_deadline = None
         self._weighted_progress_active = False
+        self._sds_progress_active = False
+        self._sds_current_phase_index = 0
+        self._sds_files_done = 0
+        self._sds_files_total = 0
+        self._sds_last_eta_str = ""
+        self._sds_global_progress_0_1 = 0.0
+        self._sds_completed = False
         self._sds_phase_active = False
         self._sds_phase_done = 0
         self._sds_phase_total = 0
+
+    def _maybe_detect_sds(self, payload: Dict[str, Any]) -> bool:
+        if self._sds_progress_active:
+            return True
+        if not isinstance(payload, dict):
+            return False
+        if bool(payload.get("sds_mode")):
+            self._sds_progress_active = True
+        else:
+            phase_name = str(payload.get("phase_name") or "")
+            if phase_name and any(tag in phase_name.lower() for tag in ("sds", "supadup")):
+                self._sds_progress_active = True
+        if self._sds_progress_active and self._sds_current_phase_index <= 0:
+            self._sds_current_phase_index = 1
+        return self._sds_progress_active
+
+    def _compute_sds_progress_fraction(
+        self,
+        phase_index: Optional[int],
+        files_done: Optional[int],
+        files_total: Optional[int],
+    ) -> float:
+        total_phases = self._sds_total_phases or 7
+        current_phase = self._sds_current_phase_index or 1
+        if isinstance(phase_index, int) and phase_index > 0:
+            current_phase = phase_index
+            self._sds_current_phase_index = current_phase
+
+        phase_progress = 0.0
+        if current_phase == 1:
+            total_val = files_total if isinstance(files_total, int) else self._sds_files_total
+            done_val = files_done if isinstance(files_done, int) else self._sds_files_done
+            if isinstance(total_val, int) and total_val > 0:
+                total_val_int = max(1, total_val)
+                done_val_int = max(0, int(done_val))
+                if done_val_int > total_val_int:
+                    done_val_int = total_val_int
+                self._sds_files_total = total_val_int
+                self._sds_files_done = done_val_int
+                phase_progress = done_val_int / float(total_val_int)
+
+        global_fraction = ((current_phase - 1) + phase_progress) / float(total_phases)
+        global_fraction = max(0.0, min(1.0, global_fraction))
+        return max(self._sds_global_progress_0_1, global_fraction)
+
+    def _apply_sds_progress(self, fraction: float) -> None:
+        bounded = max(self._sds_global_progress_0_1, max(0.0, min(1.0, fraction)))
+        self._sds_global_progress_0_1 = bounded
+        percent = bounded * 100.0
+        self._last_global_progress = percent
+        self.progress_bar.setValue(int(percent))
+        if self._sds_completed and percent >= 100.0:
+            self._eta_seconds_smoothed = 0.0
+            self._set_eta_display("00:00:00", force=True)
 
     def _set_processing_state(self, running: bool) -> None:
         self._stop_gpu_eta_override()
@@ -4704,7 +4775,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._append_log(translated_message, level=normalized_level, gpu_highlight=gpu_highlight)
 
     def _on_worker_progress_changed(self, percent: float) -> None:
-        if self._weighted_progress_active:
+        if self._weighted_progress_active or self._sds_progress_active:
             return
         bounded = int(max(0.0, min(100.0, percent)))
         self._last_global_progress = float(bounded)
@@ -4721,6 +4792,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._update_stage_progress(stage, current, total)
 
     def _update_stage_progress(self, stage: str, current: int, total: int) -> None:
+        if self._sds_progress_active:
+            return
         self._weighted_progress_active = True
         now = time.monotonic()
         stage_key = self._stage_aliases.get(stage, stage)
@@ -4842,6 +4915,11 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _on_worker_phase_changed(self, stage: str, payload: Dict[str, Any]) -> None:
         payload_dict = payload if isinstance(payload, dict) else {}
+        if self._sds_progress_active:
+            phase_id_raw = payload_dict.get("phase_id")
+            if isinstance(phase_id_raw, str) and phase_id_raw.strip().isdigit():
+                idx = int(phase_id_raw.strip())
+                self._apply_sds_progress(self._compute_sds_progress_fraction(idx, None, None))
         phase_id = payload_dict.get("phase_id")
         if isinstance(phase_id, str):
             normalized_id = phase_id.strip()
@@ -4875,6 +4953,17 @@ class ZeMosaicQtMainWindow(QMainWindow):
     def _on_worker_stats_updated(self, payload: Dict[str, Any]) -> None:
         if not isinstance(payload, dict):
             return
+        sds_active = self._maybe_detect_sds(payload)
+        if sds_active:
+            phase_idx_val = payload.get("phase_index")
+            phase_idx = int(phase_idx_val) if isinstance(phase_idx_val, int) else None
+            files_done = payload.get("files_done") if isinstance(payload.get("files_done"), int) else None
+            files_total = payload.get("files_total") if isinstance(payload.get("files_total"), int) else None
+            fraction = self._compute_sds_progress_fraction(phase_idx, files_done, files_total)
+            self._apply_sds_progress(fraction)
+            phase_name_raw = payload.get("phase_name")
+            if isinstance(phase_name_raw, str) and phase_name_raw.strip():
+                self.phase_value_label.setText(phase_name_raw.split(":", 1)[0].strip())
         files_done = payload.get("files_done")
         files_total = payload.get("files_total")
         if isinstance(files_done, int) and isinstance(files_total, int) and files_total >= 0:
@@ -4887,7 +4976,12 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self.tiles_value_label.setText(f"{tiles_done} / {tiles_total}")
         eta_seconds = payload.get("eta_seconds")
         if isinstance(eta_seconds, (int, float)) and eta_seconds >= 0:
-            self._set_eta_display(format_eta_hms(eta_seconds))
+            eta_text = format_eta_hms(eta_seconds)
+            if sds_active and not self._sds_completed:
+                self._sds_last_eta_str = eta_text
+                self._set_eta_display(eta_text)
+            elif not sds_active:
+                self._set_eta_display(eta_text)
 
         cpu_percent = payload.get("cpu_percent")
         ram_used_mb = payload.get("ram_used_mb")
@@ -4917,6 +5011,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
         if not text:
             placeholder = self._tr("qt_progress_placeholder", "—")
             self._set_eta_display(placeholder, force=True)
+            return
+        if self._sds_progress_active and not self._sds_completed:
+            self._sds_last_eta_str = text
+            self._set_eta_display(text)
             return
         self._set_eta_display(text)
 
@@ -4951,6 +5049,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
             cur = tot
         remaining = max(0, tot - cur)
         self.files_value_label.setText(str(remaining))
+        if self._sds_progress_active:
+            if self._sds_current_phase_index <= 0:
+                self._sds_current_phase_index = 1
+            fraction = self._compute_sds_progress_fraction(
+                self._sds_current_phase_index, cur, tot
+            )
+            self._apply_sds_progress(fraction)
 
     def _on_worker_master_tile_count_updated(self, current: int, total: int) -> None:
         try:
@@ -4998,6 +5103,10 @@ class ZeMosaicQtMainWindow(QMainWindow):
             return
 
         if success:
+            if self._sds_progress_active:
+                self._sds_completed = True
+                self._apply_sds_progress(1.0)
+                self._set_eta_display("00:00:00", force=True)
             completion_message = self._tr(
                 "qt_log_processing_completed", "Processing completed successfully."
             )

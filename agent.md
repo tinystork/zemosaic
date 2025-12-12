@@ -71,3 +71,6 @@ But prefer fixing GUI using existing STATS_UPDATE/PHASE_UPDATE if possible.
 - Minimal patch implementing SDS-only progress/ETA correctness for both GUI frontends.
 - No behavior change in classic mode.
 - Add a short inline comment explaining SDS phase_count=7 and why.
+
+## Status
+- [x] SDS progress and ETA wiring updated per mission scope.
