@@ -1,92 +1,79 @@
-# Follow-up checklist: Grid mode progress + ETA (PySide)
+# Implementation checklist
 
-## Context
-Grid mode is invoked from the worker via `grid_mode.run_grid_mode(...)`.
-The Qt GUI already updates:
-- progress bar / stage label from `STAGE_PROGRESS`
-- ETA label from `ETA_UPDATE:...`
-- Tiles counter from `MASTER_TILE_COUNT_UPDATE:X/Y`
+## 1) Create zemosaic_resource_telemetry.py
+- Copy (verbatim) from `zemosaic_worker.py`:
+  - `_sample_runtime_resources_for_telemetry()`
+  - `ResourceTelemetryController`
+- Keep dependencies light:
+  - psutil optional
+  - GPU sampling: CuPy if available (match worker behavior)
+- Keep the emitted event format identical:
+  - call `progress_callback("STATS_UPDATE", None, "INFO", **payload)`
+  - payload includes `timestamp_iso` (UTC ISO string)
 
-Your job is ONLY to make `grid_mode.py` emit these messages at the right times.
+## 2) Refactor zemosaic_worker.py (no behavior change)
+- Remove the in-file definitions you moved.
+- Replace with:
+  - `from zemosaic_resource_telemetry import ResourceTelemetryController`
+  - (If worker still uses `_sample_runtime_resources_for_telemetry` directly, import it too; otherwise keep it internal to the module.)
+- Run a quick lint/import check to ensure the worker still imports.
 
-## Exact message formats to emit (do not invent new ones)
-Use `progress_callback(msg_key, prog=None, lvl="INFO", **kwargs)`.
+## 3) Wire telemetry inside grid_mode.py
+### 3.1 Instantiate telemetry
+- Read config flags from `zconfig` similarly to worker:
+  - enable_resource_telemetry (bool)
+  - resource_telemetry_interval_sec (float, clamp to >= 0.5)
+  - resource_telemetry_log_to_csv (bool; default True)
+- If logging to CSV enabled and output_folder is set:
+  - csv_path = os.path.join(output_folder, "resource_telemetry.csv")
+- Create `telemetry = ResourceTelemetryController(enabled=..., interval_sec=..., callback=progress_callback, csv_path=csv_path)`
 
-1) Stage progress (drives progress bar):
-- msg_key = "STAGE_PROGRESS"
-- prog = stage_name (string)
-- lvl = current (int)
-- kwargs["total"] = total (int)
+### 3.2 Provide a context builder
+Add a small helper inside grid_mode.py:
 
-Example:
-```py
-progress_callback("STAGE_PROGRESS", "GRID: tile stacking", 3, total=12)
-ETA updates:
+- `_grid_telemetry_context(phase_index, phase_name, tiles_done, tiles_total, eta_seconds, files_done=None, files_total=None, extra=None) -> dict`
+- Always include:
+  - phase_index, phase_name, tiles_done, tiles_total
+- Include eta_seconds when available (float/int >= 0)
+- Include files_done/files_total if grid knows it; otherwise omit.
 
-msg_key = f"ETA_UPDATE:{eta_str}"
+### 3.3 Emit telemetry frequently but cheaply
+- Call `telemetry.maybe_emit_stats(ctx)`:
+  - at run start with phase_index=0, phase_name="Grid: Init"
+  - whenever grid updates progress/ETA (same cadence you already use for GUI updates)
+  - at each phase boundary with `force=True` via `telemetry.emit_stats(ctx, force=True)` if helpful
 
-lvl = "ETA_LEVEL"
+### 3.4 Ensure tiles counter is global and monotonic
+- If grid currently reports tiles per “super tile”, introduce a global counter:
+  - tiles_total = total master tiles expected for the run
+  - tiles_done increments when a tile is completed (persisted/saved)
+- Feed these values consistently in both:
+  - your progress/status emissions
+  - telemetry context
 
-Example:
+### 3.5 Ensure progress reaches 100%
+- At normal completion:
+  - emit a final progress update of 100.0
+  - emit telemetry with tiles_done == tiles_total and eta_seconds omitted or 0
+- At cancellation/error:
+  - do not force 100% unless the GUI expects a “finished” event; just ensure telemetry closes.
 
-py
-Copier le code
-progress_callback("ETA_UPDATE:00:12:34", None, "ETA_LEVEL")
-Tiles counter:
+### 3.6 Always close telemetry
+Wrap grid main routine with try/finally:
+- `finally: telemetry.close()` (guarded)
 
-msg_key = f"MASTER_TILE_COUNT_UPDATE:{done}/{total}"
+## 4) Validate with the Qt GUI expectations
+- Confirm the payload keys match what `zemosaic_gui_qt.py` consumes:
+  - cpu_percent, ram_used_mb, ram_total_mb, gpu_used_mb, gpu_total_mb, eta_seconds, tiles_done, tiles_total, phase_index, phase_name
 
-Example:
+## Notes / non-goals
+- Do not alter SDS phases or their progress math.
+- Do not modify classic pipeline progress/ETA.
+- Do not add new GUI signals; reuse existing `STATS_UPDATE` + existing progress updates.
 
-py
-Copier le code
-progress_callback("MASTER_TILE_COUNT_UPDATE:3/12")
-(Optionally) phase label:
-
-msg_key = "PHASE_UPDATE:<something>"
-But this is optional; stage_name from STAGE_PROGRESS is usually enough.
-
- Implementation steps (do them in order)
-- [x] Add _GridProgressReporter in grid_mode.py (private helper).
-
-- [x] Hook it into run_grid_mode:
-
-- [x] Initial stage + initial ETA
-
-- [x] Set tile_total once tiles are known; emit 0/N
-
-- [x] Increment done tiles on each tile completion
-
-- [x] Maintain overall progress units (stable global percent)
-
-- [x] Emit ETA periodically (throttle)
-
-- [x] Force final update at end (100% + 00:00:00)
-
-- [x] Ensure all calls are guarded:
-
-- [x] if progress_callback is None or not callable => no-op
-
-- [x] Throttle emissions:
-
-- [x] Aim <= ~5 updates/sec (0.2s) or even 0.5s; keep UI responsive
-
-- [x] Do not change any algorithm outputs, file outputs, or logs.
-
-Quick sanity test (manual)
-Run any grid-mode dataset (stack_plan.csv present) and observe:
-
-Tiles counter goes 0/N ... N/N
-
-ETA changes over time
-
-Progress reaches 100%
-
-Non-goals
-Do NOT touch SDS
-
-Do NOT touch classic mode
-
-Do NOT touch any GUI files
-
-Do NOT change performance-critical loops except for throttled callbacks
+# Quick manual test script
+- Enable telemetry checkbox in GUI
+- Run grid mode on a small dataset (fast)
+- Watch resource monitor label update
+- Ensure tiles counter increases globally and ends at total
+- Ensure progress hits 100%
