@@ -46,32 +46,32 @@ progress_callback("MASTER_TILE_COUNT_UPDATE:3/12")
 msg_key = "PHASE_UPDATE:<something>"
 But this is optional; stage_name from STAGE_PROGRESS is usually enough.
 
-Implementation steps (do them in order)
- Add _GridProgressReporter in grid_mode.py (private helper).
+ Implementation steps (do them in order)
+- [x] Add _GridProgressReporter in grid_mode.py (private helper).
 
- Hook it into run_grid_mode:
+- [x] Hook it into run_grid_mode:
 
- Initial stage + initial ETA
+- [x] Initial stage + initial ETA
 
- Set tile_total once tiles are known; emit 0/N
+- [x] Set tile_total once tiles are known; emit 0/N
 
- Increment done tiles on each tile completion
+- [x] Increment done tiles on each tile completion
 
- Maintain overall progress units (stable global percent)
+- [x] Maintain overall progress units (stable global percent)
 
- Emit ETA periodically (throttle)
+- [x] Emit ETA periodically (throttle)
 
- Force final update at end (100% + 00:00:00)
+- [x] Force final update at end (100% + 00:00:00)
 
- Ensure all calls are guarded:
+- [x] Ensure all calls are guarded:
 
-if progress_callback is None or not callable => no-op
+- [x] if progress_callback is None or not callable => no-op
 
- Throttle emissions:
+- [x] Throttle emissions:
 
-Aim <= ~5 updates/sec (0.2s) or even 0.5s; keep UI responsive
+- [x] Aim <= ~5 updates/sec (0.2s) or even 0.5s; keep UI responsive
 
- Do not change any algorithm outputs, file outputs, or logs.
+- [x] Do not change any algorithm outputs, file outputs, or logs.
 
 Quick sanity test (manual)
 Run any grid-mode dataset (stack_plan.csv present) and observe:

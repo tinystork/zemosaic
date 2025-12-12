@@ -53,6 +53,7 @@ import csv
 import logging
 import math
 import os
+import time
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -143,6 +144,127 @@ _DEGRADED_WCS_FRAMES: set[str] = set()
 
 
 ProgressCallback = Optional[Callable[[str, object, str], None]]
+
+
+class _GridProgressReporter:
+    """Helper to emit throttled GUI progress, ETA, and tile counters."""
+
+    def __init__(self, progress_callback: ProgressCallback, *, throttle_s: float = 0.3) -> None:
+        self._callback = progress_callback if callable(progress_callback) else None
+        self.tile_total = 0
+        self.tile_done = 0
+        self.overall_total_units = 1
+        self.overall_done_units = 0
+        self.stage_name = "GRID"
+        self._t0 = time.monotonic()
+        self._last_emit = self._t0
+        self._last_eta_emit = self._t0
+        self._throttle_s = max(0.0, float(throttle_s))
+        self._smoothed_rate: float | None = None
+
+    def set_tile_total(self, n: int) -> None:
+        self.tile_total = max(0, int(n))
+        self.tile_done = min(self.tile_done, self.tile_total)
+        self._emit_tile_count(force=True)
+
+    def set_overall_total(self, n_units: int) -> None:
+        self.overall_total_units = max(1, int(n_units))
+        if self.overall_done_units > self.overall_total_units:
+            self.overall_done_units = self.overall_total_units
+        self._emit_stage_progress(force=True)
+
+    def set_stage(self, name: str) -> None:
+        if name:
+            self.stage_name = str(name)
+        self._emit_stage_progress(force=True)
+
+    def advance(self, units: int = 1, *, force: bool = False) -> None:
+        self.overall_done_units = min(
+            self.overall_total_units, self.overall_done_units + max(0, int(units))
+        )
+        self._emit_stage_progress(force=force)
+
+    def tile_completed(self) -> None:
+        self.tile_done = min(self.tile_total, self.tile_done + 1)
+        self._emit_tile_count()
+
+    def emit_eta(self, *, force: bool = False) -> None:
+        if not self._callback:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_eta_emit) < self._throttle_s:
+            return
+
+        elapsed = max(0.0, now - self._t0)
+        eta_str = "--:--:--"
+        if self.overall_done_units > 0 and elapsed > 0:
+            instant_rate = self.overall_done_units / elapsed
+            if self._smoothed_rate is None:
+                self._smoothed_rate = instant_rate
+            else:
+                alpha = 0.25
+                self._smoothed_rate = (1 - alpha) * self._smoothed_rate + alpha * instant_rate
+            remaining_units = max(0, self.overall_total_units - self.overall_done_units)
+            if self._smoothed_rate > 0 and remaining_units > 0:
+                remaining_secs = remaining_units / self._smoothed_rate
+                eta_str = self._format_seconds(remaining_secs)
+            else:
+                eta_str = "00:00:00"
+
+        self._last_eta_emit = now
+        try:
+            self._callback(f"ETA_UPDATE:{eta_str}", None, "ETA_LEVEL")
+        except Exception:
+            pass
+
+    def finish(self) -> None:
+        self.overall_done_units = self.overall_total_units
+        self.tile_done = self.tile_total
+        self._emit_tile_count(force=True)
+        self._emit_stage_progress(force=True)
+        if self._callback:
+            try:
+                self._callback("ETA_UPDATE:00:00:00", None, "ETA_LEVEL")
+            except Exception:
+                pass
+
+    def _emit_tile_count(self, *, force: bool = False) -> None:
+        if not (self._callback and self.tile_total > 0):
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_emit) < self._throttle_s:
+            return
+        self._last_emit = now
+        try:
+            self._callback(
+                f"MASTER_TILE_COUNT_UPDATE:{self.tile_done}/{self.tile_total}", None, "INFO"
+            )
+        except Exception:
+            pass
+
+    def _emit_stage_progress(self, *, force: bool = False) -> None:
+        if not self._callback:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_emit) < self._throttle_s:
+            return
+        self._last_emit = now
+        try:
+            self._callback(
+                "STAGE_PROGRESS",
+                self.stage_name,
+                int(self.overall_done_units),
+                total=int(self.overall_total_units),
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _format_seconds(seconds: float) -> str:
+        seconds = max(0, int(round(seconds)))
+        h, rem = divmod(seconds, 3600)
+        m, s = divmod(rem, 60)
+        return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 def _emit(msg: str, *, lvl: str = "INFO", callback: ProgressCallback = None, **kwargs) -> None:
@@ -2492,7 +2614,8 @@ def assemble_tiles(
     legacy_rgb_cube: bool = False,
     grid_rgb_equalize: bool = True,
     progress_callback: ProgressCallback = None,
-    ) -> Path | None:
+    progress_reporter: _GridProgressReporter | None = None,
+) -> Path | None:
     """Assemble processed tiles into the final mosaic without global reprojection.
 
     Saves the science mosaic as float32 FITS with WEIGHT extension.
@@ -2930,6 +3053,12 @@ def assemble_tiles(
 
     overlaps = build_tile_overlap_graph(tile_infos, (H_m, W_m))
     _emit(f"Photometry: built overlap graph with {len(overlaps)} edges", callback=progress_callback)
+    if reporter:
+        tiles_for_progress = max(reporter.tile_total, len(tile_infos))
+        total_units = 1 + tiles_for_progress + len(overlaps) + tiles_for_progress + 1
+        reporter.set_overall_total(total_units)
+        reporter.set_stage("GRID: overlap regression")
+        reporter.emit_eta()
     info_by_id = {info.tile_id: info for info in tile_infos}
 
     overlap_fits: Dict[tuple[int, int], tuple[np.ndarray, np.ndarray, int]] = {}
@@ -2965,6 +3094,9 @@ def assemble_tiles(
         slope = np.nan_to_num(slope, nan=1.0, posinf=1.0, neginf=1.0)
         intercept = np.nan_to_num(intercept, nan=0.0, posinf=0.0, neginf=0.0)
         overlap_fits[(ov.tile_a, ov.tile_b)] = (slope, intercept, samples)
+        if reporter:
+            reporter.advance(1)
+            reporter.emit_eta()
     if regression_failures:
         _emit(f"Photometry: {regression_failures} overlap regressions fell back to neutral gains", lvl="WARN", callback=progress_callback)
 
@@ -3072,6 +3204,9 @@ def assemble_tiles(
                 callback=progress_callback,
             )
 
+    if reporter:
+        reporter.set_stage("GRID: blending")
+        reporter.emit_eta()
     overlap_union: Dict[int, np.ndarray] = {
         info.tile_id: np.zeros(info.data.shape[:2], dtype=bool) for info in tile_infos
     }
@@ -3125,54 +3260,62 @@ def assemble_tiles(
             callback=progress_callback,
         )
 
+    if reporter:
+        reporter.set_stage("GRID: assembly")
+        reporter.emit_eta()
     for info in tile_infos:
-        tx0, tx1, ty0, ty1 = info.bbox
-        x0 = max(0, min(tx0, W_m))
-        y0 = max(0, min(ty0, H_m))
-        x1 = max(0, min(tx1, W_m))
-        y1 = max(0, min(ty1, H_m))
-        _emit(f"Tile {info.tile_id} mosaic bbox: x={x0}-{x1}, y={y0}-{y1}", lvl="DEBUG", callback=progress_callback)
-        if x1 <= x0 or y1 <= y0:
-            _emit(
-                f"Assembly: tile {info.tile_id} bbox outside mosaic, skipping unique region",
-                lvl="DEBUG",
-                callback=progress_callback,
-            )
-            continue
-        h, w, c = info.data.shape
-        off_x = max(0, -tx0)
-        off_y = max(0, -ty0)
-        used_w = min(w - off_x, x1 - x0)
-        used_h = min(h - off_y, y1 - y0)
-        if used_h <= 0 or used_w <= 0:
-            _emit(
-                f"Assembly: tile {info.tile_id} has no overlap after clamping, skipping unique region",
-                lvl="DEBUG",
-                callback=progress_callback,
-            )
-            continue
-        data_crop = info.data[off_y : off_y + used_h, off_x : off_x + used_w, :]
-        mask_crop = info.mask[off_y : off_y + used_h, off_x : off_x + used_w, :]
-        overlap_mask_local = overlap_union[info.tile_id][off_y : off_y + used_h, off_x : off_x + used_w]
-        valid_mask_2d = np.any(mask_crop, axis=-1) if mask_crop.ndim == 3 else mask_crop
-        unique_mask = valid_mask_2d & (~overlap_mask_local)
-        n_valid_pixels = int(np.sum(valid_mask_2d))
-        n_overlap_pixels = int(np.sum(overlap_mask_local & valid_mask_2d))
-        n_unique_pixels = n_valid_pixels - n_overlap_pixels
-        _emit(f"Tile {info.tile_id} coverage: valid={n_valid_pixels}, overlap={n_overlap_pixels}, unique={n_unique_pixels}", callback=progress_callback)
-        global_valid_pixels += n_valid_pixels
-        global_overlap_pixels += n_overlap_pixels
-        global_unique_pixels += n_unique_pixels
-        if not np.any(unique_mask):
-            continue
-        channel_mask = mask_crop if mask_crop.ndim == 3 else np.repeat(mask_crop[..., np.newaxis], c, axis=2)
-        channel_mask = channel_mask & unique_mask[..., np.newaxis]
-        weight_crop = channel_mask.astype(np.float32)
-        slice_y = slice(y0, y0 + used_h)
-        slice_x = slice(x0, x0 + used_w)
-        mosaic_sum[slice_y, slice_x, :] += np.where(channel_mask, data_crop, 0.0) * weight_crop
-        weight_sum[slice_y, slice_x, :] += weight_crop
-        _emit(f"Assembly: placed tile {info.tile_id} unique area", lvl="DEBUG", callback=progress_callback)
+        try:
+            tx0, tx1, ty0, ty1 = info.bbox
+            x0 = max(0, min(tx0, W_m))
+            y0 = max(0, min(ty0, H_m))
+            x1 = max(0, min(tx1, W_m))
+            y1 = max(0, min(ty1, H_m))
+            _emit(f"Tile {info.tile_id} mosaic bbox: x={x0}-{x1}, y={y0}-{y1}", lvl="DEBUG", callback=progress_callback)
+            if x1 <= x0 or y1 <= y0:
+                _emit(
+                    f"Assembly: tile {info.tile_id} bbox outside mosaic, skipping unique region",
+                    lvl="DEBUG",
+                    callback=progress_callback,
+                )
+                continue
+            h, w, c = info.data.shape
+            off_x = max(0, -tx0)
+            off_y = max(0, -ty0)
+            used_w = min(w - off_x, x1 - x0)
+            used_h = min(h - off_y, y1 - y0)
+            if used_h <= 0 or used_w <= 0:
+                _emit(
+                    f"Assembly: tile {info.tile_id} has no overlap after clamping, skipping unique region",
+                    lvl="DEBUG",
+                    callback=progress_callback,
+                )
+                continue
+            data_crop = info.data[off_y : off_y + used_h, off_x : off_x + used_w, :]
+            mask_crop = info.mask[off_y : off_y + used_h, off_x : off_x + used_w, :]
+            overlap_mask_local = overlap_union[info.tile_id][off_y : off_y + used_h, off_x : off_x + used_w]
+            valid_mask_2d = np.any(mask_crop, axis=-1) if mask_crop.ndim == 3 else mask_crop
+            unique_mask = valid_mask_2d & (~overlap_mask_local)
+            n_valid_pixels = int(np.sum(valid_mask_2d))
+            n_overlap_pixels = int(np.sum(overlap_mask_local & valid_mask_2d))
+            n_unique_pixels = n_valid_pixels - n_overlap_pixels
+            _emit(f"Tile {info.tile_id} coverage: valid={n_valid_pixels}, overlap={n_overlap_pixels}, unique={n_unique_pixels}", callback=progress_callback)
+            global_valid_pixels += n_valid_pixels
+            global_overlap_pixels += n_overlap_pixels
+            global_unique_pixels += n_unique_pixels
+            if not np.any(unique_mask):
+                continue
+            channel_mask = mask_crop if mask_crop.ndim == 3 else np.repeat(mask_crop[..., np.newaxis], c, axis=2)
+            channel_mask = channel_mask & unique_mask[..., np.newaxis]
+            weight_crop = channel_mask.astype(np.float32)
+            slice_y = slice(y0, y0 + used_h)
+            slice_x = slice(x0, x0 + used_w)
+            mosaic_sum[slice_y, slice_x, :] += np.where(channel_mask, data_crop, 0.0) * weight_crop
+            weight_sum[slice_y, slice_x, :] += weight_crop
+            _emit(f"Assembly: placed tile {info.tile_id} unique area", lvl="DEBUG", callback=progress_callback)
+        finally:
+            if reporter:
+                reporter.advance(1)
+                reporter.emit_eta()
 
     _emit(f"Global coverage: valid={global_valid_pixels}, overlap={global_overlap_pixels}, unique={global_unique_pixels}", callback=progress_callback)
 
@@ -3314,6 +3457,10 @@ def assemble_tiles(
         mosaic = mosaic[..., 0]
         weight_sum = weight_sum[..., 0]
 
+    if reporter:
+        reporter.set_stage("GRID: final save")
+        reporter.emit_eta()
+
     header = None
     if _ASTROPY_AVAILABLE and fits:
         try:
@@ -3420,6 +3567,9 @@ def assemble_tiles(
             )
 
     _emit(f"Final mosaic saved to {output_path}", callback=progress_callback)
+    if reporter:
+        reporter.advance(1, force=True)
+        reporter.emit_eta(force=True)
     return output_path
 
 
@@ -3473,6 +3623,12 @@ def run_grid_mode(
     use_gpu: bool | None = None,
 ) -> None:
     """Main entry point for Grid/Survey mode."""
+
+    reporter = _GridProgressReporter(progress_callback)
+    reporter.set_stage("GRID: setup")
+    reporter.set_overall_total(1)
+    reporter.emit_eta(force=True)
+    reporter.advance(0, force=True)
 
     def _coerce_bool_flag(value: object) -> bool | None:
         """Interpret truthy/falsy flags from config, UI, or defaults."""
@@ -3597,6 +3753,11 @@ def run_grid_mode(
         _emit("Grid mode aborted: no grid tiles generated", lvl="ERROR", callback=progress_callback)
         raise RuntimeError("Grid mode failed: no tiles to process")
 
+    reporter.set_tile_total(len(grid.tiles))
+    base_total_units = 1 + max(1, len(grid.tiles)) * 2 + 1
+    reporter.set_overall_total(base_total_units)
+    reporter.advance(1)
+
     _emit(
         f"[GRID] DEBUG: grid_def received with {len(grid.tiles)} tile(s)",
         callback=progress_callback,
@@ -3614,6 +3775,8 @@ def run_grid_mode(
         callback=progress_callback,
     )
 
+    reporter.set_stage("GRID: tile stacking")
+
     num_workers = _get_effective_grid_workers(cfg_disk)
     _emit(f"Memory telemetry: grid_workers={num_workers}, stack_chunk_budget_mb={config.stack_chunk_budget_mb}", callback=progress_callback)
     with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
@@ -3625,11 +3788,15 @@ def run_grid_mode(
                 _emit(f"[GRID] Tile {tile.tile_id} completed", callback=progress_callback)
             except Exception as exc:
                 _emit(f"Tile {tile.tile_id} failed with error: {exc}", lvl="ERROR", callback=progress_callback)
+            reporter.tile_completed()
+            reporter.advance(1)
+            reporter.emit_eta()
             # Optional GC after each tile for memory safety (disabled by default)
             if os.environ.get("ZEMOSAIC_GRID_SAFE_GC", "").lower() in ("1", "true", "yes"):
                 import gc
                 gc.collect()
 
+    reporter.set_stage("GRID: photometry & blending")
     mosaic_path = assemble_tiles(
         grid,
         grid.tiles,
@@ -3638,10 +3805,12 @@ def run_grid_mode(
         legacy_rgb_cube=legacy_rgb_cube,
         grid_rgb_equalize=grid_rgb_equalize,
         progress_callback=progress_callback,
+        progress_reporter=reporter,
     )
 
     if mosaic_path is None:
         _emit("Grid mode aborted: assembly failed", lvl="ERROR", callback=progress_callback)
         raise RuntimeError("Grid mode failed during assembly")
 
+    reporter.finish()
     _emit("Grid/Survey mode completed", lvl="SUCCESS", callback=progress_callback)
