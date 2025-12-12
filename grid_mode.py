@@ -2683,6 +2683,8 @@ def assemble_tiles(
         )
         return None
 
+    reporter = progress_reporter
+
     def _combine_mask_with_coverage(mask: np.ndarray, coverage_mask: np.ndarray | None) -> np.ndarray:
         combined_mask = np.asarray(mask, dtype=bool)
         if coverage_mask is None:
