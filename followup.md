@@ -1,43 +1,55 @@
-# 🔬 Suivi — Diagnostic décalage vert (Classic)
+# Follow-up — Debug ciblé dominante verte (Classic)
 
-## Étapes à exécuter
+## Ce qui a été fait
+- [ ] GUI Qt : ajout/validation des options “Logging level” (Info/Debug) et propagation vers paramètres worker.
+- [ ] Worker : lecture du paramètre `worker_logging_level` et application réelle du niveau (logger + handlers).
+- [ ] Worker : logs DEBUG ciblés aux frontières P3/P4/P5 + export.
+- [ ] Ajout/extension utilitaire `_dbg_rgb_stats` pour stats global/valid-only/weighted.
 
-- [ ] Activer le niveau `DEBUG` dans le GUI Qt
-- [ ] Vérifier que ce niveau est bien propagé au logger du worker
-- [ ] Lancer exactement le même dataset en :
-   - mode Classic
-   - mode SDS (référence saine)
-- [ ] Comparer les blocs `[DBG_RGB]` dans les logs
+## Points précis à vérifier dans le code
 
----
+### A) Propagation du niveau de log (GUI → worker)
+- [ ] Le choix UI “Debug” donne bien `worker_logging_level="DEBUG"` dans les params.
+- [ ] Le worker imprime : `Worker logging level set to DEBUG`.
+- [ ] Le fichier `zemosaic_worker.log` contient des lignes `- DEBUG -`.
 
-## Points de comparaison clés
+### B) Logs Phase 3 (baseline)
+- [ ] Labels présents :
+  - `P3_pre_stack_core`
+  - `P3_post_stack_core` (si possible)
+  - `P3_post_poststack_rgb_eq` (si applicable)
+- [ ] Chacun loggue min/mean/median + ratios G/R G/B.
 
-Comparer **strictement** :
-- [ ] `P3_post_stack_core` (Classic vs SDS)
-- [ ] `P4_post_merge_valid_rgb`
-- [ ] `P5_pre_rgb_equalization`
-- [ ] `P5_post_rgb_equalization`
+### C) Logs Phase 4 (zone critique #1)
+- [ ] Labels présents :
+  - `P4_pre_fusion_mosaic`
+  - `P4_post_fusion_mosaic`
+- [ ] Stats “valid-only” utilisent `coverage > 0` (ou équivalent).
+- [ ] Weighted mean par coverage est calculée et logguée.
 
----
+### D) Logs Phase 5 (zone critique #2)
+- [ ] Labels présents :
+  - `P5_pre_postprocess`
+  - `P5_post_<etape>` pour chaque étape suspecte
+- [ ] Si égalisation RGB : log target + gains par canal.
 
-## Hypothèse principale (à confirmer)
+### E) Phase 6–7 export
+- [ ] Labels présents :
+  - `P6_pre_export`
+  - `P6_post_clamp`
+  - `P7_post_png`
+- [ ] dtype + clamp min/max + mention stretch auto.
 
-Une **normalisation RGB globale spécifique au mode Classic**
-est appliquée **après la mosaïque**, sans tenir compte :
-- du coverage
-- des NaN
-- du fond de ciel réel
+## Comment exploiter le résultat
+1) Lancer Classic en Debug et relever :
+- `ratio_G_R` / `ratio_G_B` à `P3_post_poststack_rgb_eq`
+- puis à `P4_post_fusion_mosaic`
+- puis à `P5_post_*`
 
-👉 Le vert devient la référence implicite.
+2) Le premier endroit où les ratios explosent = endroit du bug.
 
----
+## Non-objectifs (à respecter)
+- [ ] Pas de changement algorithmique (uniquement logs + propagation log level).
+- [ ] Ne pas modifier SDS / Grid logic.
+- [ ] Ne pas ajouter de nouveaux réglages utilisateur (sauf Debug dans combo si absent).
 
-## Prochaine action (APRÈS diagnostic)
-
-Uniquement si confirmé :
-- Restreindre la stat RGB aux pixels `coverage > 0`
-- ou désactiver l’égalisation globale Classic
-- ou aligner Classic sur la stratégie SDS
-
-⚠️ Aucun patch avant validation par logs.
