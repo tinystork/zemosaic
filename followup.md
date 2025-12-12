@@ -1,14 +1,14 @@
 # Follow-up: Implement per-channel black-level equalization for classic-mode final mosaic
 
 ## 1) Locate finalization section in `zemosaic_worker.py`
-Find where `final_mosaic_data_HWC` is finalized, saved to FITS, and preview PNG is generated.
+- [x] Find where `final_mosaic_data_HWC` is finalized, saved to FITS, and preview PNG is generated.
 
 You will see calls to:
 - `zemosaic_utils.save_fits_image(...)` for the final FITS
 - `zemosaic_utils.stretch_auto_asifits_like(...)` (or fallback) for preview PNG
 
 ## 2) Add helper (local to worker to keep scope tight)
-Add near other small helpers in `zemosaic_worker.py`:
+- [x] Add near other small helpers in `zemosaic_worker.py`:
 
 ```python
 def _equalize_rgb_black_level_hwc(
@@ -77,43 +77,14 @@ Use alpha_final if available, else final_mosaic_coverage_HW if available.
 Do NOT rescale. Only subtract offsets and clamp at 0.
 
 3) Apply it in the right places (classic only)
-Right before saving final FITS (classic mode only):
-
-Condition: NOT grid mode, NOT SDS phase 5.
-
-Call the helper with alpha_final (preferred), else final_mosaic_coverage_HW.
-
-Example:
-
-python
-Copier le code
-if (final_mosaic_data_HWC is not None) and (not sds_mode_phase5) and (not grid_mode_enabled):
-    final_mosaic_data_HWC, bl_info = _equalize_rgb_black_level_hwc(
-        final_mosaic_data_HWC,
-        alpha_mask=alpha_final,
-        coverage_mask=final_mosaic_coverage_HW,
-        p_low=0.1,
-        logger=logger,
-    )
-Then proceed to save_fits_image(...) as usual.
-
-Also apply it right before preview stretch (same conditions). If you already applied it before saving, do NOT re-apply; reuse the already adjusted array.
+- [x] Apply the helper right before saving final FITS (classic mode only, NOT grid mode, NOT SDS phase 5) using `alpha_final` when available, otherwise `final_mosaic_coverage_HW`. Reuse the adjusted array for preview stretch.
 
 4) Keep compatibility with existing save_fits_image baseline shift
-Do not modify zemosaic_utils.save_fits_image. The new per-channel shift occurs upstream, and the existing global shift will either do nothing (min==0) or stay harmless.
+- [x] Do not modify zemosaic_utils.save_fits_image. The new per-channel shift occurs upstream, and the existing global shift will either do nothing (min==0) or stay harmless.
 
 5) Verification steps
-Add a temporary debug log (INFO_DETAIL) printing per-channel min on valid pixels after applying:
-
-np.nanmin(rgb[...,c][valid]) should be near 0 for all channels.
-
-Run the same classic mosaic job:
-
-Confirm FITS histogram in ASIFitsView: R/G/B minima aligned (no big offset on G/B).
-
-Confirm preview PNG is no longer green/teal.
-
-Ensure grid mode and SDS runs are unchanged.
+- [x] Add a temporary debug log (INFO_DETAIL) printing per-channel min on valid pixels after applying (`np.nanmin(rgb[...,c][valid])`).
+- [ ] Run the same classic mosaic job to confirm FITS histogram minima alignment, preview color fix, and unchanged grid/SDS behavior.
 
 6) Don’t touch anything else
-No refactors, no unrelated cleanups.
+- [x] No refactors, no unrelated cleanups.

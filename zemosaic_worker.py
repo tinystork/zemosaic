@@ -1275,6 +1275,96 @@ def equalize_black_point_rgb(
     return arr, info
 
 
+def _equalize_rgb_black_level_hwc(
+    rgb_hwc: np.ndarray,
+    *,
+    alpha_mask: np.ndarray | None = None,
+    coverage_mask: np.ndarray | None = None,
+    p_low: float = 0.1,
+    logger: logging.Logger | None = None,
+):
+    info = {"applied": False, "p_low": float(p_low), "offsets": [0.0, 0.0, 0.0]}
+
+    if rgb_hwc is None or not isinstance(rgb_hwc, np.ndarray) or rgb_hwc.ndim != 3 or rgb_hwc.shape[-1] != 3:
+        return rgb_hwc, info
+
+    rgb = rgb_hwc.astype(np.float32, copy=False)
+
+    finite = np.isfinite(rgb).all(axis=-1)
+    valid = finite
+
+    if alpha_mask is not None:
+        a = np.asarray(alpha_mask)
+        if a.ndim > 2:
+            a = a[..., 0]
+        if a.shape[:2] == rgb.shape[:2]:
+            valid = valid & (a > 0)
+
+    if coverage_mask is not None:
+        cov = np.asarray(coverage_mask)
+        if cov.ndim > 2:
+            cov = cov[..., 0]
+        if cov.shape[:2] == rgb.shape[:2]:
+            valid = valid & np.isfinite(cov) & (cov > 0)
+
+    if not np.any(valid):
+        return rgb_hwc, info
+
+    offsets: list[float] = []
+    for c in range(3):
+        vals = rgb[..., c][valid]
+        try:
+            p = float(np.nanpercentile(vals, p_low))
+        except Exception:
+            p = float("nan")
+        if np.isfinite(p) and p > 0:
+            offsets.append(p)
+        else:
+            offsets.append(0.0)
+
+    valid_px = int(np.count_nonzero(valid))
+    if any(o > 0 for o in offsets):
+        out = rgb.copy()
+        for c, o in enumerate(offsets):
+            if o > 0:
+                out[..., c] -= np.float32(o)
+        out = np.maximum(out, 0.0)
+        info["applied"] = True
+        info["offsets"] = offsets
+        if logger:
+            try:
+                mins = [
+                    float(np.nanmin(out[..., c][valid])) if np.any(valid) else float("nan")
+                    for c in range(3)
+                ]
+            except Exception:
+                mins = []
+            if mins:
+                logger.info(
+                    "[RGB-BL] applied=True p_low=%.3f offsets=(%.3f, %.3f, %.3f) valid_min=(%.5f, %.5f, %.5f) valid_px=%d",
+                    p_low,
+                    offsets[0],
+                    offsets[1],
+                    offsets[2],
+                    mins[0],
+                    mins[1],
+                    mins[2],
+                    valid_px,
+                )
+            else:
+                logger.info(
+                    "[RGB-BL] applied=True p_low=%.3f offsets=(%.3f, %.3f, %.3f) valid_px=%d",
+                    p_low,
+                    offsets[0],
+                    offsets[1],
+                    offsets[2],
+                    valid_px,
+                )
+        return out, info
+
+    return rgb_hwc, info
+
+
 def _apply_phase5_post_stack_pipeline(
     final_mosaic_data: np.ndarray | None,
     final_mosaic_coverage: np.ndarray | None,
@@ -16725,8 +16815,23 @@ def run_hierarchical_mosaic_classic_legacy(
     final_header['ZMASMBMTH'] = (final_assembly_method_config, 'Final Assembly Method')
     final_header['ZM_WORKERS'] = (num_base_workers_config, 'GUI: Base workers config (0=auto)')
 
+    rgb_black_level_info: dict[str, Any] | None = None
+    if (
+        final_mosaic_black_point_equalize_enabled
+        and final_mosaic_data_HWC is not None
+        and not sds_mode_phase5
+    ):
+        coverage_for_bl = None if alpha_final is not None else final_mosaic_coverage_HW
+        final_mosaic_data_HWC, rgb_black_level_info = _equalize_rgb_black_level_hwc(
+            final_mosaic_data_HWC,
+            alpha_mask=alpha_final,
+            coverage_mask=coverage_for_bl,
+            p_low=final_mosaic_black_point_percentile,
+            logger=logger,
+        )
+
     try:
-        if not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils): 
+        if not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils):
             raise RuntimeError("zemosaic_utils non disponible pour sauvegarde FITS.")
         legacy_rgb_flag = bool(legacy_rgb_cube_config)
         # Ensure the final mosaic buffer is a contiguous, writeable ndarray for I/O
@@ -20715,8 +20820,23 @@ def run_hierarchical_mosaic(
     final_header['ZMASMBMTH'] = (final_assembly_method_config, 'Final Assembly Method')
     final_header['ZM_WORKERS'] = (num_base_workers_config, 'GUI: Base workers config (0=auto)')
 
+    rgb_black_level_info: dict[str, Any] | None = None
+    if (
+        final_mosaic_black_point_equalize_enabled
+        and final_mosaic_data_HWC is not None
+        and not sds_mode_phase5
+    ):
+        coverage_for_bl = None if alpha_final is not None else final_mosaic_coverage_HW
+        final_mosaic_data_HWC, rgb_black_level_info = _equalize_rgb_black_level_hwc(
+            final_mosaic_data_HWC,
+            alpha_mask=alpha_final,
+            coverage_mask=coverage_for_bl,
+            p_low=final_mosaic_black_point_percentile,
+            logger=logger,
+        )
+
     try:
-        if not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils): 
+        if not (ZEMOSAIC_UTILS_AVAILABLE and zemosaic_utils):
             raise RuntimeError("zemosaic_utils non disponible pour sauvegarde FITS.")
         legacy_rgb_flag = bool(legacy_rgb_cube_config)
         # Ensure the final mosaic buffer is a contiguous, writeable ndarray for I/O
