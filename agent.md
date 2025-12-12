@@ -1,8 +1,8 @@
 # Goal
 Connect **Grid Mode** to the PySide6 GUI status bar:
-- correct progress / tiles counter
-- correct ETA (in seconds)
-- propagate **resource telemetry** (CPU/RAM/GPU) already exposed by the Qt GUI
+- [x] correct progress / tiles counter
+- [x] correct ETA (in seconds)
+- [x] propagate **resource telemetry** (CPU/RAM/GPU) already exposed by the Qt GUI
 
 Do **not** change SDS behavior nor classic pipeline behavior.
 
@@ -14,15 +14,15 @@ The Qt GUI already understands telemetry events:
 Grid mode currently lacks this wiring because telemetry controller lives inside `zemosaic_worker.py` and grid_mode cannot import worker safely.
 
 # Strategy (safe / minimal)
-1) Create a new lightweight module `zemosaic_resource_telemetry.py` that contains:
+- [x] Create a new lightweight module `zemosaic_resource_telemetry.py` that contains:
    - `_sample_runtime_resources_for_telemetry()`
    - `ResourceTelemetryController`
    (Move code from zemosaic_worker.py with no behavioral changes.)
 
-2) Update `zemosaic_worker.py` to import `ResourceTelemetryController` from that new module.
+- [x] Update `zemosaic_worker.py` to import `ResourceTelemetryController` from that new module.
    - This is a refactor only. No behavior changes for classic/SDS.
 
-3) In `grid_mode.py`:
+- [x] In `grid_mode.py`:
    - instantiate a `ResourceTelemetryController` using zconfig flags:
      - enable_resource_telemetry
      - resource_telemetry_interval_sec
@@ -35,7 +35,7 @@ Grid mode currently lacks this wiring because telemetry controller lives inside 
      - gpu/cpu chunk knobs if grid has equivalents (optional)
    - ensure telemetry is closed at end (finally/try).
 
-4) Ensure Grid Mode progress ends at 100% and tiles counter is global and monotonic:
+- [x] Ensure Grid Mode progress ends at 100% and tiles counter is global and monotonic:
    - tiles_done must be “overall completed tiles” (not per super-tile)
    - tiles_total must be stable and correct for the run
    - ensure last progress update emits 100.0 and eta stops / becomes placeholder.

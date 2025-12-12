@@ -81,6 +81,11 @@ try:
 except Exception:
     grid_mode = None
 
+from zemosaic_resource_telemetry import (
+    ResourceTelemetryController,
+    _sample_runtime_resources_for_telemetry,
+)
+
 from core.path_helpers import (
     casefold_path,
     expand_to_path,
@@ -6537,54 +6542,6 @@ def _probe_system_resources(
 
     return info
 
-
-def _sample_runtime_resources_for_telemetry() -> dict:
-    """
-    Retourne un dict léger avec les informations de ressources courantes.
-    Toutes les valeurs sont optionnelles (None en cas d'échec).
-    """
-    info = {
-        "cpu_percent": None,
-        "ram_used_mb": None,
-        "ram_total_mb": None,
-        "ram_available_mb": None,
-        "gpu_used_mb": None,
-        "gpu_total_mb": None,
-        "gpu_free_mb": None,
-    }
-
-    try:
-        import psutil as _ps
-
-        vm = _ps.virtual_memory()
-        info["ram_total_mb"] = vm.total / (1024 * 1024)
-        info["ram_available_mb"] = vm.available / (1024 * 1024)
-        info["ram_used_mb"] = (vm.total - vm.available) / (1024 * 1024)
-        info["cpu_percent"] = _ps.cpu_percent(interval=None)
-    except Exception:
-        pass
-
-    try:
-        if CUPY_AVAILABLE:
-            import cupy  # type: ignore
-
-            try:
-                cupy.cuda.Device().use()
-                free_bytes, total_bytes = cupy.cuda.runtime.memGetInfo()
-                total_mb = total_bytes / (1024 * 1024)
-                free_mb = free_bytes / (1024 * 1024)
-                used_mb = total_mb - free_mb
-                info["gpu_total_mb"] = total_mb
-                info["gpu_free_mb"] = free_mb
-                info["gpu_used_mb"] = used_mb
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    return info
-
-
 def _emit_gpu_info_summary(progress_callback, resource_info: dict) -> None:
     """Log a GPU summary message when VRAM information is available."""
 
@@ -8083,128 +8040,6 @@ def _log_and_callback(
             # Peut-être afficher la trace pour le debug du callback lui-même
             # logger.debug("Traceback de l'erreur du callback:", exc_info=True)
 
-
-class ResourceTelemetryController:
-    _DEFAULT_FIELDS = [
-        "timestamp_iso",
-        "phase_index",
-        "phase_name",
-        "cpu_percent",
-        "ram_used_mb",
-        "ram_total_mb",
-        "ram_available_mb",
-        "gpu_used_mb",
-        "gpu_total_mb",
-        "gpu_free_mb",
-        "files_done",
-        "files_total",
-        "tiles_done",
-        "tiles_total",
-        "eta_seconds",
-        "cpu_workers",
-        "rows_per_chunk",
-        "gpu_rows_per_chunk",
-        "max_chunk_bytes",
-        "gpu_max_chunk_bytes",
-        "use_gpu",
-        "use_gpu_phase5",
-    ]
-
-    def __init__(self, enabled: bool, interval_sec: float, callback, csv_path: str | None = None):
-        self.enabled = bool(enabled)
-        self.interval_sec = float(interval_sec) if interval_sec and interval_sec > 0 else 1.5
-        if self.interval_sec < 0.5:
-            self.interval_sec = 0.5
-        self._callback = callback
-        self._csv_path = csv_path
-        self._last_sample = 0.0
-        self._csv_file = None
-        self._csv_writer = None
-        self._csv_header_written = False
-
-    def _open_csv_if_needed(self, fieldnames: list[str]) -> None:
-        if not self._csv_path or self._csv_writer is not None:
-            return
-        try:
-            import csv
-
-            dir_path = os.path.dirname(self._csv_path)
-            if dir_path:
-                os.makedirs(dir_path, exist_ok=True)
-            f = open(self._csv_path, "w", newline="", encoding="utf-8")
-            self._csv_file = f
-            self._csv_writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-            self._csv_writer.writeheader()
-            self._csv_header_written = True
-        except Exception:
-            self._csv_path = None
-            self._csv_file = None
-            self._csv_writer = None
-
-    def emit_stats(self, context: dict | None = None, *, force: bool = False) -> None:
-        if not self.enabled or self._callback is None:
-            return
-        import time as _time
-
-        now = _time.monotonic()
-        if (not force) and self._last_sample and (now - self._last_sample) < self.interval_sec:
-            return
-        self._last_sample = now
-
-        base_context = context.copy() if isinstance(context, dict) else {}
-        try:
-            resources = _sample_runtime_resources_for_telemetry()
-        except Exception:
-            resources = {}
-        payload = {}
-        payload.update(base_context)
-        payload.update(resources)
-        payload["timestamp_iso"] = datetime.utcnow().isoformat() + "Z"
-
-        try:
-            _log_and_callback(
-                "STATS_UPDATE",
-                progress_value=None,
-                level="INFO",
-                callback=self._callback,
-                **payload,
-            )
-        except Exception:
-            pass
-
-        if self._csv_path:
-            try:
-                import csv
-
-                if self._csv_writer is None:
-                    fieldnames = list(
-                        dict.fromkeys(self._DEFAULT_FIELDS + sorted(payload.keys()))
-                    )
-                    self._open_csv_if_needed(fieldnames)
-                if self._csv_writer is not None:
-                    self._csv_writer.writerow(payload)
-                    if self._csv_file is not None:
-                        self._csv_file.flush()
-            except Exception:
-                self._csv_path = None
-
-    def maybe_emit_stats(self, context: dict | None = None) -> None:
-        self.emit_stats(context, force=False)
-
-    def close(self) -> None:
-        try:
-            if self._csv_file is not None:
-                self._csv_file.close()
-        except Exception:
-            pass
-        self._csv_file = None
-        self._csv_writer = None
-
-    def __del__(self):
-        try:
-            self.close()
-        except Exception:
-            pass
 
 
 
@@ -13937,6 +13772,7 @@ def run_hierarchical_mosaic_classic_legacy(
         interval_sec=telemetry_interval,
         callback=progress_callback,
         csv_path=telemetry_csv_path,
+        log_and_callback=_log_and_callback,
     )
 
     def _telemetry_context(extra: dict | None = None) -> dict:
@@ -17577,6 +17413,7 @@ def run_hierarchical_mosaic(
                     save_final_as_uint16=save_final_as_uint16_config,
                     legacy_rgb_cube=legacy_rgb_cube_config,
                     grid_rgb_equalize=grid_rgb_equalize_flag,
+                    zconfig=zconfig,
                 )
                 return
             except Exception:
@@ -17924,6 +17761,7 @@ def run_hierarchical_mosaic(
         interval_sec=telemetry_interval,
         callback=progress_callback,
         csv_path=telemetry_csv_path,
+        log_and_callback=_log_and_callback,
     )
 
     def _telemetry_context(extra: dict | None = None) -> dict:
