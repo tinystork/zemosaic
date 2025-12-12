@@ -179,6 +179,122 @@ GLOBAL_COVERAGE_SUMMARY_THRESHOLD_FRAC = 0.0025
 GLOBAL_COVERAGE_SUMMARY_MIN_ABS = 1e-3
 
 
+def _dbg_rgb_stats(
+    label: str,
+    rgb: np.ndarray | None,
+    *,
+    coverage: np.ndarray | None = None,
+    alpha: np.ndarray | None = None,
+    logger: logging.Logger | None = None,
+) -> None:
+    """Emit compact RGB stats for debugging when DEBUG logging is enabled."""
+
+    if logger is None or not logger.isEnabledFor(logging.DEBUG):
+        return
+    if rgb is None:
+        return
+
+    try:
+        arr = np.asarray(rgb)
+        if arr.size == 0:
+            return
+        if arr.ndim == 2:
+            arr = arr[..., None]
+        if arr.ndim == 3 and arr.shape[-1] != 3:
+            if arr.shape[0] == 3 and arr.shape[-1] != 3:
+                arr = np.moveaxis(arr, 0, -1)
+            if arr.shape[-1] == 1:
+                arr = np.repeat(arr, 3, axis=-1)
+            elif arr.shape[-1] > 3:
+                arr = arr[..., :3]
+        arr = np.asarray(arr, dtype=np.float32, order="C")
+    except Exception:
+        return
+
+    if arr.ndim != 3 or arr.shape[-1] != 3:
+        return
+
+    h, w, _ = arr.shape
+    total_px = float(max(1, h * w))
+
+    valid_mask = np.all(np.isfinite(arr), axis=-1)
+
+    if alpha is not None:
+        try:
+            alpha_arr = np.asarray(alpha)
+            if alpha_arr.ndim >= 2:
+                alpha_hw = alpha_arr[..., 0] if alpha_arr.shape[-1] == 1 else alpha_arr
+                alpha_hw = np.asarray(alpha_hw, dtype=np.float32)
+                if alpha_hw.shape[:2] == valid_mask.shape:
+                    valid_mask &= alpha_hw > ALPHA_OPACITY_THRESHOLD
+        except Exception:
+            pass
+
+    cov_weights: np.ndarray | None = None
+    if coverage is not None:
+        try:
+            coverage_arr = np.asarray(coverage, dtype=np.float32)
+            if coverage_arr.ndim >= 2:
+                coverage_hw = coverage_arr[..., 0] if coverage_arr.shape[-1] == 1 else coverage_arr
+                if coverage_hw.shape[:2] == valid_mask.shape:
+                    cov_weights = coverage_hw
+                    valid_mask &= coverage_hw > 0
+        except Exception:
+            cov_weights = None
+
+    if not np.any(valid_mask):
+        logger.debug("[DBG_RGB] %s valid=0", label)
+        return
+
+    stats = []
+    medians = []
+    mins = []
+    means = []
+    for c in range(3):
+        channel = arr[..., c]
+        masked = np.where(valid_mask, channel, np.nan)
+        mins.append(float(np.nanmin(masked)))
+        means.append(float(np.nanmean(masked)))
+        medians.append(float(np.nanmedian(masked)))
+
+    valid_fraction = float(np.count_nonzero(valid_mask)) / total_px
+    eps = 1e-6
+    ratio_g_r = medians[1] / max(abs(medians[0]), eps)
+    ratio_g_b = medians[1] / max(abs(medians[2]), eps)
+
+    weighted_mean = None
+    if cov_weights is not None:
+        try:
+            weights = np.where(valid_mask, cov_weights, 0.0)
+            weight_sum = float(np.sum(weights))
+            if weight_sum > 0:
+                weighted_mean = [
+                    float(np.sum(arr[..., c] * weights) / weight_sum) for c in range(3)
+                ]
+        except Exception:
+            weighted_mean = None
+
+    def _fmt_triplet(values: list[float]) -> str:
+        return "[" + ",".join(f"{v:.6g}" for v in values) + "]"
+
+    stats.append(f"valid={valid_fraction:.3f}")
+    stats.append(f"min={_fmt_triplet(mins)}")
+    stats.append(f"mean={_fmt_triplet(means)}")
+    stats.append(f"median={_fmt_triplet(medians)}")
+    stats.append(f"ratio_G_R={ratio_g_r:.6g}")
+    stats.append(f"ratio_G_B={ratio_g_b:.6g}")
+    if weighted_mean is not None:
+        stats.append(f"cov_weighted_mean={_fmt_triplet(weighted_mean)}")
+
+    logger.debug(
+        "[DBG_RGB] %s shape=%s dtype=%s %s",
+        label,
+        tuple(arr.shape),
+        arr.dtype,
+        " ".join(stats),
+    )
+
+
 def _coerce_bool_flag(value) -> bool | None:
     """Interpret various truthy/falsy representations coming from configs/UI."""
 
@@ -200,6 +316,23 @@ def _coerce_bool_flag(value) -> bool | None:
         return bool(value)
     except Exception:
         return None
+
+
+def _select_debug_tile_ids(tile_order: list[int]) -> set[int]:
+    """Select a small sample of tile ids for debug instrumentation."""
+
+    if not tile_order:
+        return set()
+
+    indices = {0, len(tile_order) // 2, len(tile_order) - 1}
+    selected: set[int] = set()
+    for idx in indices:
+        if 0 <= idx < len(tile_order):
+            try:
+                selected.add(int(tile_order[idx]))
+            except Exception:
+                continue
+    return selected
 
 
 def _safe_basename(path: str | os.PathLike | None) -> str:
@@ -6775,6 +6908,16 @@ def _run_shared_phase45_phase5_pipeline(
     log_key_phase5_failed = ""
     log_key_phase5_finished = ""
 
+    if logger.isEnabledFor(logging.DEBUG):
+        try:
+            sample_tile_path = valid_master_tiles_for_assembly[0][0]
+            if sample_tile_path and _path_exists(sample_tile_path):
+                with fits.open(sample_tile_path, memmap=True, do_not_scale_image_data=True) as hdul_sample:
+                    sample_data = np.asarray(hdul_sample[0].data)
+                _dbg_rgb_stats("P4_PRE_MOSAIC_FUSE", sample_data, logger=logger)
+        except Exception:
+            pass
+
     reproject_coadd_available = (
         "assemble_final_mosaic_reproject_coadd" in globals()
         and callable(assemble_final_mosaic_reproject_coadd)
@@ -7005,6 +7148,15 @@ def _run_shared_phase45_phase5_pipeline(
         enable_final_lecropper_for_mosaic = False
         enable_final_master_crop_for_mosaic = False
 
+    if logger.isEnabledFor(logging.DEBUG):
+        _dbg_rgb_stats(
+            "P4_POST_MOSAIC_FUSE",
+            final_mosaic_data_HWC,
+            coverage=final_mosaic_coverage_HW,
+            alpha=final_alpha_map,
+            logger=logger,
+        )
+
     final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = _apply_phase5_post_stack_pipeline(
         final_mosaic_data_HWC,
         final_mosaic_coverage_HW,
@@ -7061,6 +7213,15 @@ def _run_shared_phase45_phase5_pipeline(
         logger,
     )
 
+    if logger.isEnabledFor(logging.DEBUG):
+        _dbg_rgb_stats(
+            "P5_PRE_GLOBAL_POST",
+            final_mosaic_data_HWC,
+            coverage=final_mosaic_coverage_HW,
+            alpha=alpha_final,
+            logger=logger,
+        )
+
     if (
         final_mosaic_black_point_equalize_enabled
         and final_mosaic_data_HWC is not None
@@ -7080,6 +7241,15 @@ def _run_shared_phase45_phase5_pipeline(
         except Exception as exc_black:
             if logger:
                 logger.warning("[BlackPoint] Final mosaic pedestal equalization failed: %s", exc_black)
+
+    if logger.isEnabledFor(logging.DEBUG):
+        _dbg_rgb_stats(
+            "P5_POST_GLOBAL_POST",
+            final_mosaic_data_HWC,
+            coverage=final_mosaic_coverage_HW,
+            alpha=alpha_final,
+            logger=logger,
+        )
 
     _emit_phase5_stats(tiles_total_phase5, tiles_total_phase5, force=True, stage="end")
     _log_memory_usage(progress_callback, "Fin Phase 5 (Assemblage)")
@@ -7687,6 +7857,36 @@ if not logger.handlers:
     fh.setFormatter(formatter)
     logger.addHandler(fh)
 logger.info("Logging pour ZeMosaicWorker initialisé. Logs écrits dans: %s", log_file_path)
+
+
+def _configure_worker_logging(logging_level_config: str | None, *, source_hint: str | None = None) -> None:
+    """Apply logging level from config or environment and emit a confirmation line."""
+
+    level_map = {
+        "ERROR": logging.ERROR,
+        "WARN": logging.WARNING,
+        "WARNING": logging.WARNING,
+        "INFO": logging.INFO,
+        "DEBUG": logging.DEBUG,
+    }
+
+    env_level = os.environ.get("ZEMOSAIC_LOG_LEVEL")
+    level_value = logging_level_config or env_level or "INFO"
+    level_name = str(level_value).upper()
+    lvl = level_map.get(level_name, logging.INFO)
+
+    logger.setLevel(lvl)
+    for handler in logger.handlers:
+        try:
+            handler.setLevel(lvl)
+        except Exception:
+            pass
+
+    src = source_hint or ("env" if env_level and not logging_level_config else "qt_gui_config" if logging_level_config else "default")
+    try:
+        logger.info("[LOGCFG] effective_level=%s source=%s", logging.getLevelName(lvl), src)
+    except Exception:
+        pass
 
 # --- Alignment Warning Tracking ---
 # These warnings come from zemosaic_align_stack when an image fails to align.
@@ -9854,6 +10054,7 @@ def create_master_tile(
     allow_batch_duplication: bool = True,
     target_stack_size: int = 5,
     min_safe_stack_size: int = 3,
+    dbg_tile_ids: set[int] | None = None,
 ):
     """
     Crée une "master tuile" à partir d'un groupe d'images.
@@ -9878,6 +10079,8 @@ def create_master_tile(
         zconfig = SimpleNamespace()
     if parallel_plan is not None:
         setattr(zconfig, "parallel_plan", parallel_plan)
+
+    debug_tile = bool(dbg_tile_ids) and tile_id in dbg_tile_ids
 
     # Ensure stacking GPU preference mirrors the Phase 5 GPU intent when not explicitly set.
     try:
@@ -10163,6 +10366,9 @@ def create_master_tile(
         except Exception:
             pass
 
+    if debug_tile and valid_aligned_images:
+        _dbg_rgb_stats("P3_PRE_STACK_CORE", valid_aligned_images[0], logger=logger)
+
     pcb_tile(f"{func_id_log_base}_info_stacking_started", prog=None, lvl="DEBUG_DETAIL",
              num_to_stack=len(valid_aligned_images), tile_id=tile_id) # Les options sont loggées au début
     master_tile_stacked_HWC, stack_metadata, used_gpu = _stack_master_tile_auto(
@@ -10188,6 +10394,9 @@ def create_master_tile(
         tile_id=tile_id,
         logger=logger,
     )
+
+    if debug_tile:
+        _dbg_rgb_stats("P3_POST_STACK_CORE", master_tile_stacked_HWC, logger=logger)
 
     try:
         del valid_aligned_images
@@ -10234,12 +10443,19 @@ def create_master_tile(
         f"RGB equalized per sub-stack (enabled={str(eq_enabled)}, applied={str(eq_applied)}): "
         f"gains=({gain_r:.6f},{gain_g:.6f},{gain_b:.6f}), target={target_str}"
     )
+
+    if debug_tile and poststack_equalize_rgb:
+        _dbg_rgb_stats("P3_PRE_POSTSTACK_EQ", master_tile_stacked_HWC, logger=logger)
+
     pcb_tile(
         f"[RGB-EQ] poststack_equalize_rgb enabled={eq_enabled}, applied={eq_applied}, "
         f"gains=({gain_r:.6f},{gain_g:.6f},{gain_b:.6f}), target={target_str}",
         prog=None,
         lvl="INFO" if eq_enabled else "DEBUG_DETAIL",
     )
+
+    if debug_tile and (poststack_equalize_rgb or eq_applied):
+        _dbg_rgb_stats("P3_POST_POSTSTACK_EQ", master_tile_stacked_HWC, logger=logger)
 
     norm_result = None
     norm_mode = "disabled"
@@ -13691,25 +13907,7 @@ def run_hierarchical_mosaic_classic_legacy(
     if cleanup_temp_artifacts_config is None:
         cleanup_temp_artifacts_config = True
 
-    # --- Apply logging level from GUI/config ---
-    try:
-        level_map = {
-            "ERROR": logging.ERROR,
-            "WARN": logging.WARNING,
-            "WARNING": logging.WARNING,
-            "INFO": logging.INFO,
-            "DEBUG": logging.DEBUG,
-        }
-        lvl = level_map.get(str(logging_level_config).upper(), logging.INFO)
-        logger.setLevel(lvl)
-        for h in logger.handlers:
-            try:
-                h.setLevel(lvl)
-            except Exception:
-                pass
-        logger.info("Worker logging level set to %s", str(logging.getLevelName(lvl)))
-    except Exception:
-        pass
+    _configure_worker_logging(logging_level_config, source_hint="qt_gui_config")
 
     # --- Harmoniser les méthodes de pondération issues du GUI / CLI / fallback config ---
     requested_stack_weight_method = stack_weight_method
@@ -16217,6 +16415,10 @@ def run_hierarchical_mosaic_classic_legacy(
             monitor_thread = threading.Thread(target=_rt_adapt_concurrency, name="ZeMosaic_Ph3_RTAdapt", daemon=True)
             monitor_thread.start()
 
+            dbg_tile_ids = _select_debug_tile_ids(tile_id_order)
+
+            dbg_tile_ids = _select_debug_tile_ids(tile_id_order)
+
             tiles_processed_count_ph3 = 0
             # Envoyer l'info initiale avant la boucle
             if num_seestar_stacks_to_process > 0:
@@ -16264,6 +16466,7 @@ def run_hierarchical_mosaic_classic_legacy(
                     center_out_settings=center_out_settings if center_out_context else None,
                     center_out_rank=processing_rank,
                     parallel_plan=getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan")),
+                    dbg_tile_ids=dbg_tile_ids,
                 )
                 future_to_tile_id[future] = assigned_tile_id
                 pending_futures.add(future)
@@ -16661,6 +16864,15 @@ def run_hierarchical_mosaic_classic_legacy(
     final_header['ZMASMBMTH'] = (final_assembly_method_config, 'Final Assembly Method')
     final_header['ZM_WORKERS'] = (num_base_workers_config, 'GUI: Base workers config (0=auto)')
 
+    if logger.isEnabledFor(logging.DEBUG):
+        _dbg_rgb_stats(
+            "P6_PRE_EXPORT",
+            final_mosaic_data_HWC,
+            coverage=final_mosaic_coverage_HW,
+            alpha=alpha_final,
+            logger=logger,
+        )
+
     rgb_black_level_info: dict[str, Any] | None = None
     if (
         final_mosaic_black_point_equalize_enabled
@@ -16779,12 +16991,21 @@ def run_hierarchical_mosaic_classic_legacy(
                 axis_order="HWC",
             )
             pcb("run_info_coverage_map_saved", prog=None, lvl="INFO_DETAIL", filename=_safe_basename(coverage_path))
-        
+
         logger.info("[Alpha] Final mosaic saved with ALPHA=%s", bool(alpha_final is not None))
 
         current_global_progress = base_progress_phase6 + PROGRESS_WEIGHT_PHASE6_SAVE
         pcb("run_success_mosaic_saved", prog=current_global_progress, lvl="SUCCESS", filename=_safe_basename(final_fits_path))
-    except Exception as e_save_m: 
+
+        if logger.isEnabledFor(logging.DEBUG):
+            _dbg_rgb_stats(
+                "P7_POST_EXPORT",
+                final_mosaic_data_HWC,
+                coverage=final_mosaic_coverage_HW,
+                alpha=alpha_final,
+                logger=logger,
+            )
+    except Exception as e_save_m:
         pcb("run_error_phase6_save_failed", prog=(base_progress_phase6 + PROGRESS_WEIGHT_PHASE6_SAVE), lvl="ERROR", error=str(e_save_m))
         logger.error("Erreur sauvegarde FITS final:", exc_info=True)
         # En cas d'échec de sauvegarde, on ne peut pas générer de preview car final_mosaic_data_HWC pourrait être le problème.
@@ -17637,25 +17858,7 @@ def run_hierarchical_mosaic(
     if cleanup_temp_artifacts_config is None:
         cleanup_temp_artifacts_config = True
 
-    # --- Apply logging level from GUI/config ---
-    try:
-        level_map = {
-            "ERROR": logging.ERROR,
-            "WARN": logging.WARNING,
-            "WARNING": logging.WARNING,
-            "INFO": logging.INFO,
-            "DEBUG": logging.DEBUG,
-        }
-        lvl = level_map.get(str(logging_level_config).upper(), logging.INFO)
-        logger.setLevel(lvl)
-        for h in logger.handlers:
-            try:
-                h.setLevel(lvl)
-            except Exception:
-                pass
-        logger.info("Worker logging level set to %s", str(logging.getLevelName(lvl)))
-    except Exception:
-        pass
+    _configure_worker_logging(logging_level_config, source_hint="qt_gui_config")
 
     try:
         batch_overlap_pct_config = float(worker_config_cache.get("batch_overlap_pct", 0.0))
@@ -20308,6 +20511,7 @@ def run_hierarchical_mosaic(
                     center_out_settings=center_out_settings if center_out_context else None,
                     center_out_rank=processing_rank,
                     parallel_plan=getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan")),
+                    dbg_tile_ids=dbg_tile_ids,
                     allow_batch_duplication=bool(allow_duplication_config),
                     target_stack_size=int(target_stack_config),
                     min_safe_stack_size=int(min_safe_stack_config),
@@ -20709,6 +20913,15 @@ def run_hierarchical_mosaic(
     final_header['ZMASMBMTH'] = (final_assembly_method_config, 'Final Assembly Method')
     final_header['ZM_WORKERS'] = (num_base_workers_config, 'GUI: Base workers config (0=auto)')
 
+    if logger.isEnabledFor(logging.DEBUG):
+        _dbg_rgb_stats(
+            "P6_PRE_EXPORT",
+            final_mosaic_data_HWC,
+            coverage=final_mosaic_coverage_HW,
+            alpha=alpha_final,
+            logger=logger,
+        )
+
     rgb_black_level_info: dict[str, Any] | None = None
     if (
         final_mosaic_black_point_equalize_enabled
@@ -20827,12 +21040,21 @@ def run_hierarchical_mosaic(
                 axis_order="HWC",
             )
             pcb("run_info_coverage_map_saved", prog=None, lvl="INFO_DETAIL", filename=_safe_basename(coverage_path))
-        
+
         logger.info("[Alpha] Final mosaic saved with ALPHA=%s", bool(alpha_final is not None))
 
         current_global_progress = base_progress_phase6 + PROGRESS_WEIGHT_PHASE6_SAVE
         pcb("run_success_mosaic_saved", prog=current_global_progress, lvl="SUCCESS", filename=_safe_basename(final_fits_path))
-    except Exception as e_save_m: 
+
+        if logger.isEnabledFor(logging.DEBUG):
+            _dbg_rgb_stats(
+                "P7_POST_EXPORT",
+                final_mosaic_data_HWC,
+                coverage=final_mosaic_coverage_HW,
+                alpha=alpha_final,
+                logger=logger,
+            )
+    except Exception as e_save_m:
         pcb("run_error_phase6_save_failed", prog=(base_progress_phase6 + PROGRESS_WEIGHT_PHASE6_SAVE), lvl="ERROR", error=str(e_save_m))
         logger.error("Erreur sauvegarde FITS final:", exc_info=True)
         # En cas d'échec de sauvegarde, on ne peut pas générer de preview car final_mosaic_data_HWC pourrait être le problème.
@@ -21261,6 +21483,13 @@ def run_hierarchical_mosaic_process(
     final_kwargs = kwargs.copy()
     final_kwargs['progress_callback'] = queue_callback
     final_kwargs['solver_settings'] = solver_settings_dict
+
+    try:
+        level_cfg = final_kwargs.get("logging_level") or final_kwargs.get("logging_level_config")
+        if level_cfg:
+            os.environ["ZEMOSAIC_LOG_LEVEL"] = str(level_cfg)
+    except Exception:
+        pass
 
     # 1. Rename keys from GUI config name to worker function argument name
     rename_map = {
