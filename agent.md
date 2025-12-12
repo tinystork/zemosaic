@@ -1,13 +1,13 @@
 # ZeMosaic — DEBUG instrumentation pipeline + propagation logging level (Qt GUI)
 
 ## Mission
-1) Ajouter une instrumentation DEBUG **ultra ciblée** (peu de logs mais très informatifs) pour isoler l’apparition d’un **green cast** dans le pipeline classic:
+- [x] Ajouter une instrumentation DEBUG **ultra ciblée** (peu de logs mais très informatifs) pour isoler l’apparition d’un **green cast** dans le pipeline classic:
 - Phase 3/3.x: baseline “tiles OK”
 - Phase 4/4.x: mosaïque (fusion + coverage)
 - Phase 5: post-processing global (RGB equalization/scaling)
 - Phase 6–7: export/clamp/conversions
 
-2) Vérifier et garantir que le **Logging level** choisi dans le **GUI Qt** est bien propagé au worker (y compris quand le worker tourne dans un process séparé).
+- [x] Vérifier et garantir que le **Logging level** choisi dans le **GUI Qt** est bien propagé au worker (y compris quand le worker tourne dans un process séparé).
 
 ⚠️ Contraintes strictes
 - NE PAS modifier la logique scientifique/algorithmes (stacking, reprojection, blending, equalization, normalization).

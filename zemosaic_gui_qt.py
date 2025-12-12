@@ -5317,6 +5317,12 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
         worker_kwargs = cfg.copy()
 
+        try:
+            level_val = str(worker_kwargs.get("logging_level", "INFO") or "INFO").upper()
+            os.environ["ZEMOSAIC_LOG_LEVEL"] = level_val
+        except Exception:
+            pass
+
         solver_settings_dict = self._build_solver_settings_dict()
         worker_kwargs["solver_settings_dict"] = solver_settings_dict
         
