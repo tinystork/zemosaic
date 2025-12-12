@@ -517,6 +517,14 @@ class ZeMosaicGUI:
         self._cpu_eta_override_deadline: Optional[float] = None
         self._gpu_eta_override = None
         self._gpu_helper_active = None
+        self._sds_progress_active = False
+        self._sds_total_phases = 7  # SDS pipeline emits 7 1-based phases
+        self._sds_current_phase_index = 0
+        self._sds_files_done = 0
+        self._sds_files_total = 0
+        self._sds_last_eta_str = ""
+        self._sds_global_progress_0_1 = 0.0
+        self._sds_completed = False
         self._sds_phase_active = False
         self._sds_phase_done = 0
         self._sds_phase_total = 0
@@ -2862,11 +2870,14 @@ class ZeMosaicGUI:
                 if hasattr(self, 'eta_var') and self.eta_var:
                     def update_eta_label():
                         if hasattr(self.eta_var,'set') and callable(self.eta_var.set):
-                            try: self.eta_var.set(eta_string_from_worker)
-                            except tk.TclError: pass 
-                    if self.root.winfo_exists():
-                        self.root.after_idle(update_eta_label)
-                    self._cpu_eta_override_deadline = time.monotonic() + CPU_HELPER_OVERRIDE_TTL
+                            try:
+                                if self._sds_progress_active and not self._sds_completed:
+                                    self._sds_last_eta_str = eta_string_from_worker
+                                self.eta_var.set(eta_string_from_worker)
+                            except tk.TclError: pass
+                if self.root.winfo_exists():
+                    self.root.after_idle(update_eta_label)
+                self._cpu_eta_override_deadline = time.monotonic() + CPU_HELPER_OVERRIDE_TTL
                 is_control_message = True
             elif message_key_or_raw == "CHRONO_START_REQUEST":
                 if self.root.winfo_exists(): self.root.after_idle(self._start_gui_chrono)
@@ -2875,7 +2886,32 @@ class ZeMosaicGUI:
                 if self.root.winfo_exists(): self.root.after_idle(self._stop_gui_chrono)
                 is_control_message = True
             elif message_key_or_raw.upper() == "STATS_UPDATE":
-                # Ignore resource telemetry in Tk UI (handled only in Qt)
+                payload = kwargs if isinstance(kwargs, dict) else {}
+                sds_active = self._maybe_detect_sds(payload)
+                try:
+                    files_done_val = payload.get("files_done")
+                    files_total_val = payload.get("files_total")
+                    if isinstance(files_done_val, int) and isinstance(files_total_val, int) and files_total_val >= 0:
+                        done = max(0, files_done_val)
+                        remaining = max(0, files_total_val - done)
+                        if hasattr(self, "file_count_var"):
+                            self.file_count_var.set(str(remaining))
+                    phase_idx_val = payload.get("phase_index") if isinstance(payload.get("phase_index"), int) else None
+                    files_done_int = files_done_val if isinstance(files_done_val, int) else None
+                    files_total_int = files_total_val if isinstance(files_total_val, int) else None
+                    if sds_active:
+                        fraction = self._compute_sds_progress_fraction(phase_idx_val, files_done_int, files_total_int)
+                        self._apply_sds_progress(fraction)
+                    phase_name_val = payload.get("phase_name")
+                    if sds_active and isinstance(phase_name_val, str) and phase_name_val.strip():
+                        self._set_phase_label_text(phase_name_val.split(":", 1)[0].strip())
+                    eta_seconds_val = payload.get("eta_seconds")
+                    if sds_active and isinstance(eta_seconds_val, (int, float)) and eta_seconds_val >= 0 and not self._sds_completed:
+                        eta_text = format_eta_hms(eta_seconds_val)
+                        self._sds_last_eta_str = eta_text
+                        self._set_eta_label(eta_text)
+                except Exception:
+                    pass
                 is_control_message = True
             # --- Overrides from filter UI launched in worker ---
             elif message_key_or_raw.startswith("CLUSTER_OVERRIDE:"):
@@ -2923,6 +2959,13 @@ class ZeMosaicGUI:
             # --- Indicateur de phase courante ---
             elif message_key_or_raw.startswith("PHASE_UPDATE:"):
                 phase_id = message_key_or_raw.split(":", 1)[1].strip()
+                if self._sds_progress_active and phase_id.isdigit():
+                    try:
+                        phase_idx = int(phase_id)
+                        fraction = self._compute_sds_progress_fraction(phase_idx, None, None)
+                        self._apply_sds_progress(fraction)
+                    except Exception:
+                        pass
                 def update_phase_label():
                     try:
                         phase_num = None
@@ -2957,11 +3000,14 @@ class ZeMosaicGUI:
                 files_count_string = message_key_or_raw.split(":", 1)[1]
                 # Convert "X/N" to remaining = N - X if possible
                 remaining_display = files_count_string
+                cur_val = None
+                tot_val = None
                 try:
                     cur, tot = files_count_string.split("/")
                     cur_i, tot_i = int(cur.strip()), int(tot.strip())
                     remain = max(0, tot_i - cur_i)
                     remaining_display = str(remain)
+                    cur_val, tot_val = cur_i, tot_i
                 except Exception:
                     pass
                 if hasattr(self, 'file_count_var') and self.file_count_var:
@@ -2970,6 +3016,13 @@ class ZeMosaicGUI:
                             try: self.file_count_var.set(remaining_display)
                             except tk.TclError: pass
                     if self.root.winfo_exists(): self.root.after_idle(update_files_count_label)
+                if self._sds_progress_active and cur_val is not None and tot_val is not None:
+                    if self._sds_current_phase_index <= 0:
+                        self._sds_current_phase_index = 1
+                    fraction = self._compute_sds_progress_fraction(
+                        self._sds_current_phase_index, cur_val, tot_val
+                    )
+                    self._apply_sds_progress(fraction)
                 is_control_message = True
             # --- FIN AJOUT ---
         
@@ -3061,6 +3114,8 @@ class ZeMosaicGUI:
 
             # Mise à jour de la barre de progression
             if progress_value is not None and hasattr(self, 'progress_bar_widget') and self.progress_bar_widget.winfo_exists():
+                if self._sds_progress_active:
+                    return
                 try:
                     current_progress = float(progress_value)
                     current_progress = max(0.0, min(100.0, current_progress))
@@ -3649,6 +3704,8 @@ class ZeMosaicGUI:
 
     def on_worker_progress(self, stage: str, current: int, total: int):
         """Handle progress updates for a specific processing stage."""
+        if self._sds_progress_active:
+            return
         now = time.monotonic()
         stage_key = self._stage_aliases.get(stage, stage)
 
@@ -3787,6 +3844,7 @@ class ZeMosaicGUI:
     def _handle_sds_global_coadd_progress(self, payload: MutableMapping[str, Any]) -> None:
         if not isinstance(payload, MutableMapping):
             return
+        self._sds_progress_active = True
         try:
             total_val = int(payload.get("total", 0))
         except (TypeError, ValueError):
@@ -3808,6 +3866,7 @@ class ZeMosaicGUI:
     def _handle_sds_global_coadd_finished(self, payload: MutableMapping[str, Any]) -> None:
         if not isinstance(payload, MutableMapping):
             payload = {}
+        self._sds_progress_active = True
         total_val = self._sds_phase_total
         try:
             images_val = int(payload.get("images", 0))
@@ -3824,6 +3883,63 @@ class ZeMosaicGUI:
         label = self._format_sds_phase_label(total_val, total_val)
         self._set_phase_label_text(label)
         self._sds_phase_active = False
+
+    def _maybe_detect_sds(self, payload: MutableMapping[str, Any]) -> bool:
+        if self._sds_progress_active:
+            return True
+        if not isinstance(payload, MutableMapping):
+            return False
+        if bool(payload.get("sds_mode")):
+            self._sds_progress_active = True
+        else:
+            phase_name = str(payload.get("phase_name") or "")
+            if phase_name and any(tag in phase_name.lower() for tag in ("sds", "supadup")):
+                self._sds_progress_active = True
+        if self._sds_progress_active and self._sds_current_phase_index <= 0:
+            self._sds_current_phase_index = 1
+        return self._sds_progress_active
+
+    def _compute_sds_progress_fraction(
+        self,
+        phase_index: Optional[int],
+        files_done: Optional[int],
+        files_total: Optional[int],
+    ) -> float:
+        total_phases = self._sds_total_phases or 7
+        current_phase = self._sds_current_phase_index or 1
+        if isinstance(phase_index, int) and phase_index > 0:
+            current_phase = phase_index
+            self._sds_current_phase_index = current_phase
+
+        phase_progress = 0.0
+        if current_phase == 1:
+            total_val = files_total if isinstance(files_total, int) else self._sds_files_total
+            done_val = files_done if isinstance(files_done, int) else self._sds_files_done
+            if isinstance(total_val, int) and total_val > 0:
+                total_val_int = max(1, total_val)
+                done_val_int = max(0, int(done_val))
+                if done_val_int > total_val_int:
+                    done_val_int = total_val_int
+                self._sds_files_total = total_val_int
+                self._sds_files_done = done_val_int
+                phase_progress = done_val_int / float(total_val_int)
+
+        global_fraction = ((current_phase - 1) + phase_progress) / float(total_phases)
+        global_fraction = max(0.0, min(1.0, global_fraction))
+        return max(self._sds_global_progress_0_1, global_fraction)
+
+    def _apply_sds_progress(self, fraction: float) -> None:
+        bounded = max(self._sds_global_progress_0_1, max(0.0, min(1.0, fraction)))
+        self._sds_global_progress_0_1 = bounded
+        percent = bounded * 100.0
+        self._last_global_progress = percent
+        try:
+            self.progress_bar_var.set(percent)
+        except tk.TclError:
+            pass
+        if self._sds_completed and percent >= 100.0:
+            self._eta_seconds_smoothed = 0.0
+            self._set_eta_label("00:00:00", force=True)
         
 
 
@@ -4262,6 +4378,13 @@ class ZeMosaicGUI:
         self._stage_totals.clear()
         for key in self._stage_order:
             self._stage_progress_values[key] = 0.0
+        self._sds_progress_active = False
+        self._sds_current_phase_index = 0
+        self._sds_files_done = 0
+        self._sds_files_total = 0
+        self._sds_last_eta_str = ""
+        self._sds_global_progress_0_1 = 0.0
+        self._sds_completed = False
         self._sds_phase_active = False
         self._sds_phase_done = 0
         self._sds_phase_total = 0
@@ -4702,6 +4825,10 @@ class ZeMosaicGUI:
                 self._cancel_requested = False
             else:
                 self._log_message("log_key_processing_finished", level="INFO")
+                if self._sds_progress_active:
+                    self._sds_completed = True
+                    self._apply_sds_progress(1.0)
+                    self._set_eta_label("00:00:00", force=True)
                 final_message = self._tr("msg_processing_completed")
                 messagebox.showinfo(self._tr("dialog_title_completed"), final_message, parent=self.root)
                 # Nettoyage du compteur master-tiles affiché
