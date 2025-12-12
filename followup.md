@@ -1,11 +1,11 @@
 # Follow-up checklist: SDS GPU nanpercentile fallback
 
 ## 1) Patch implementation (zemosaic_utils.py)
-- [ ] Locate `_sds_cp_nanpercentile(arr_gpu, percentiles, axis=None)`
-- [ ] Keep existing branches:
+- [x] Locate `_sds_cp_nanpercentile(arr_gpu, percentiles, axis=None)`
+- [x] Keep existing branches:
       - cp.nanpercentile if available
       - cp.nanquantile if available
-- [ ] Add third fallback:
+- [x] Add third fallback:
       - supports scalar p and small array/list p
       - supports axis=0 (primary use case)
       - ignores NaNs (do NOT treat NaNs as zeros)
@@ -13,14 +13,14 @@
       - handles cnt==0 safely
 
 ## 2) Correctness notes
-- [ ] Percentile definition: use floor-based index on sorted finite samples
-- [ ] For cnt==0: return 0.0 (float32) to match downstream nan_to_num behavior
-- [ ] Ensure output dtype is float32 where reasonable
+- [x] Percentile definition: use floor-based index on sorted finite samples
+- [x] For cnt==0: return 0.0 (float32) to match downstream nan_to_num behavior
+- [x] Ensure output dtype is float32 where reasonable
 
 ## 3) Guardrails
-- [ ] DO NOT touch other modules (no edits in worker, grid_mode, align_stack_cpu, etc.)
-- [ ] DO NOT change any algorithm knobs / defaults outside this function
-- [ ] No new dependencies
+- [x] DO NOT touch other modules (no edits in worker, grid_mode, align_stack_cpu, etc.)
+- [x] DO NOT change any algorithm knobs / defaults outside this function
+- [x] No new dependencies
 
 ## 4) Smoke test (minimal)
 - [ ] Add a tiny internal self-test block (optional) or run interactive snippet:
@@ -39,4 +39,4 @@ After patch:
 - global coadd finishes on helper route.
 
 ## 6) Commit
-- [ ] Commit message: "Fix SDS GPU nanpercentile fallback"
+- [x] Commit message: "Fix SDS GPU nanpercentile fallback"
