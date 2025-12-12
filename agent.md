@@ -1,210 +1,51 @@
-# Mission: Fix green cast in classic mode by restoring master-tile lecropper & disabling extra colour tweaks
+# Mission: Fix green/teal tint in classic mode final mosaic (RGB black-level mismatch)
 
 ## High-level goal
+Restore production-ready classic-mode output colors (no persistent green/teal cast) by fixing the root cause: per-channel baseline mismatch (R min ~ 0 while G/B min > 0) in the final mosaic FITS/preview generation.
 
-The current unified worker `zemosaic_worker.py` still produces a **green-tinted mosaic** in classic / non-grid mode, even after disabling the final RGB equalisation and simplifying Phase 5 options.
-
-We have a **known-good reference**:
-
-- `zemosaic_worker_non grid_ok.py` → classic mode, no grid, **clean colour** and proper master tiles.
-
-The mission is to:
-
-1. **Guarantee that master tiles in classic mode (non-SDS / non-Grid) go through the full lecropper pipeline**, exactly like in `zemosaic_worker_non grid_ok.py`.
-2. Keep the final mosaic free from aggressive, redundant colour operations (no extra RGB-EQ, no extra lecropper on the assembled mosaic).
-3. Reach a **production-ready classic mode** with clean background and no green cast, even if the root cause is not fully analysed.
-
-We focus only on the **classic pipeline**; Grid and SDS must not be broken.
-
----
+## Non-goals / must NOT change
+- Do NOT modify Grid Mode behavior.
+- Do NOT modify SDS mode behavior.
+- Do NOT remove or alter two-pass coverage renormalization logic.
+- Do NOT change clustering logic, tile selection logic, or matching logic except what is strictly required for the black-level fix.
+- Do NOT add heavy dependencies.
 
 ## Context
+`zemosaic_utils.save_fits_image` currently applies a *global* baseline shift for float outputs only when the global min > 0. This does not fix cases where R has true zeros but G/B are offset (common cause of green/teal tint under auto-stretch / auto-WB). The fix must be per-channel, computed on valid mosaic pixels only (alpha/coverage), then applied as a constant subtraction per channel.
 
-We already tried:
+## Implementation plan (minimal & safe)
+1. Add a helper to compute per-channel black offsets using a validity mask:
+   - Inputs: image HWC float32, optional alpha mask (uint8 0..255) and/or coverage mask (float/uint)
+   - Build `valid = finite(rgb).all(axis=-1)` AND (alpha>0 if provided else coverage>0 if provided else True)
+   - For each channel c, compute `p = nanpercentile(rgb[...,c][valid], p_low)` with p_low default 0.1 or 0.5
+   - If p is finite and > 0: subtract it from that channel
+   - Clip to >= 0 (float32)
+   - Return adjusted image + info dict (offsets)
 
-- Disabling final mosaic RGB equalisation by commenting out the call to `_apply_final_mosaic_rgb_equalization(...)`.
-- Aligning the Phase 5 call to `_apply_phase5_post_stack_pipeline(...)` with the reference worker, using:
-  - `enable_lecropper_pipeline=False`
-  - `enable_master_tile_crop=False`
-  for the classic / non-grid path.
+2. Apply this helper ONLY in classic mode finalization:
+   - Right before saving final FITS mosaic (so the FITS histogram is sane in viewers).
+   - Right before building preview PNG (so preview matches FITS and is no longer green/teal).
+   - Guard with config flag default ON for classic mode, but OFF for SDS/grid.
+   - If mask is empty (no valid pixels), skip safely.
 
-Despite that, the mosaic remains green.  
-Logs show that:
+3. Logging:
+   - Log offsets applied: per-channel p_low percentile values and whether applied.
+   - Keep logs INFO_DETAIL to avoid noise.
 
-- `poststack_equalize_rgb` is still executed on master tiles (good).
-- `MT_CROP: quality-based rect=...` is logged during Phase 3 (so quality crop is running).
-- The final mosaic still looks heavily green.
-
-This indicates that the **problem is rooted at the master-tile level** (background / gradients / alt-az artefacts) and/or that we are still doing **too many corrections** on top of each other.
-
-We will therefore:
-
-- **Strictly mirror** the master-tile lecropper/alt-az pipeline from `zemosaic_worker_non grid_ok.py`.
-- Ensure no extra colour manipulation occurs after Phase 3 for classic mode.
-
----
-
-## Files to edit
-
-1. `zemosaic_worker.py`  *(main target)*
-2. (read-only reference) `zemosaic_worker_non grid_ok.py`  *(do NOT modify; use for comparison only)*
-
----
-
-## Constraints
-
-- Do **not** touch:
-  - `grid_mode.py`
-  - Any Grid-specific or SDS-specific code paths
-  - `lecropper.py` implementation itself (unless a blatant bug is found, which is not expected for this mission)
-  - GUI files (`zemosaic_gui.py`, `zemosaic_gui_qt.py`, filter GUIs, etc.)
-
-- The only worker to be edited is `zemosaic_worker.py`, and only:
-  - in the **Phase 3 master-tile creation pipeline**, and
-  - the already-known **Phase 5 / RGB-EQ final hooks**.
-
-- Keep:
-  - Two-pass renorm infrastructure, GPU/CPU parallel plan, and telemetry intact.
-  - Existing log messages and `[CLÉ_POUR_GUI: ...]` keys.
-
----
-
-## Task 1 – Mirror master-tile lecropper pipeline from reference worker
-
-### Goal
-
-Ensure that, in classic / non-grid mode, **every master tile** is processed by `lecropper` exactly as in the reference worker.
-
-### Steps
-
-1. In `zemosaic_worker_non grid_ok.py`, locate the function `create_master_tile(...)` (or equivalent) where:
-   - A master tile `master_tile_stacked_HWC` is produced,
-   - Quality-based crop is computed (`MT_CROP: quality-based rect=...`),
-   - Then the lecropper pipeline is applied:
-
-   ```python
-   pipeline_cfg = {
-       "quality_crop_enabled": quality_crop_enabled,
-       "quality_crop_band_px": quality_crop_band_px,
-       "quality_crop_k_sigma": quality_crop_k_sigma,
-       "quality_crop_margin_px": quality_crop_margin_px,
-       "quality_crop_min_run": quality_crop_min_run,
-       "altaz_cleanup_enabled": altaz_cleanup_enabled,
-       "altaz_margin_percent": altaz_margin_percent,
-       "altaz_decay": altaz_decay,
-       "altaz_nanize": altaz_nanize,
-   }
-   master_tile_stacked_HWC, pipeline_alpha_mask = _apply_lecropper_pipeline(master_tile_stacked_HWC, pipeline_cfg)
-   ...
-   pipeline_alpha_u8 = _normalize_alpha_mask(...)
-   ...
-   alpha_mask_for_quality = pipeline_alpha_mask or alpha_mask_out
-   quality_gate_eval = _evaluate_quality_gate_metrics(..., alpha_mask=alpha_mask_for_quality, ...)
-````
-
-2. In `zemosaic_worker.py`, find the **corresponding block** (it should already look very similar, but with possible differences like `quality_crop_enabled_tile`, `quality_gate_enabled_tile`, etc.).
-
-3. For the **classic / non-grid path**:
-
-   * Ensure the `pipeline_cfg` keys and types match the reference worker:
-
-     * `quality_crop_enabled` must reflect the global config for classic mode (not accidentally forced to `False` by per-tile logic, except when it is intentionally disabled by the user).
-     * `altaz_cleanup_enabled` and related parameters must be passed through exactly as in the reference worker.
-
-   * Confirm that `_apply_lecropper_pipeline(...)` is **always called** for each master tile in classic mode, i.e.:
-
-     * There is no `if grid_mode` or `if sds_mode` or any early return that bypasses lecropper.
-     * No branch that resets `quality_crop_enabled_tile` to `False` for classic mode.
-
-   * Ensure that:
-
-     * `pipeline_alpha_mask` is normalised via `_normalize_alpha_mask(...)`,
-     * `alpha_mask_out` is computed and passed to the FITS save function,
-     * `quality_gate_eval` uses `alpha_mask_for_quality` like in the reference worker.
-
-4. Make sure that logs related to quality crop and lecropper remain intact:
-
-   * `MT_CROP: quality-based rect=...`
-   * warnings such as `MT_CROP: quality-based crop failed (...)` or `quality crop skipped (...)`.
-
-5. If there are **per-tile overrides** (e.g. `quality_crop_enabled_tile`, `quality_gate_enabled_tile`), verify that:
-
-   * They do not inadvertently **disable** the pipeline in classic mode unless explicitly requested.
-   * Their default behaviour for classic mode mimics `quality_crop_enabled` / `quality_gate_enabled` from the reference worker.
-
----
-
-## Task 2 – Keep post-master-tile colour stages minimal
-
-### Goal
-
-Avoid any extra colour transformations on the mosaic that might interact badly with master-tile processing.
-
-### Steps
-
-1. The final mosaic RGB equalisation (`_apply_final_mosaic_rgb_equalization(...)`) must remain **disabled by default**:
-
-   * Either the call site is commented out,
-   * Or it is guarded by a config flag `final_mosaic_rgb_equalize_enabled=False`.
-
-   For this mission, we assume the call is already disabled and **should remain so**.
-
-2. The Phase 5 call to `_apply_phase5_post_stack_pipeline(...)` for the **classic / non-grid** final mosaic should keep:
-
-   ```python
-   enable_lecropper_pipeline=False
-   enable_master_tile_crop=False
-   ```
-
-   with all other arguments (two-pass, WCS, coverage, telemetry, etc.) preserved.
-
-3. Do not add any **new** per-channel scaling or normalisation at the mosaic level.
-
----
-
-## Task 3 – Sanity checks + diagnosis hooks
-
-### Goal
-
-Help confirm that the green cast originates from master-tile background, not from Phase 5.
-
-### Steps
-
-1. Add (or keep) an info log at the end of `create_master_tile(...)` that clearly indicates:
-
-   * Whether the lecropper pipeline ran,
-   * Whether alt-az cleanup was enabled for that tile,
-   * The `quality_crop_enabled` state.
-
-   Example:
-
-   ```python
-   pcb_tile(
-       f"MT_PIPELINE: lecropper_applied=True, quality_crop={bool(quality_crop_enabled_tile)}, altaz_cleanup={bool(altaz_cleanup_enabled)}",
-       prog=None,
-       lvl="INFO_DETAIL",
-   )
-   ```
-
-2. Ensure these logs are present in `zemosaic_worker.log` for all tiles in a classic run.
-
-3. After running a classic mosaic on a known test project:
-
-   * Confirm that `MT_CROP: quality-based rect=...` and `MT_PIPELINE: lecropper_applied=True...` appear for each tile.
-   * Visually inspect the mosaic to verify that:
-
-     * The global green cast has disappeared or is significantly reduced,
-     * Background looks similar to the result produced by `zemosaic_worker_non grid_ok.py`.
-
----
+## Files to modify
+- `zemosaic_worker.py` (apply the helper before final FITS save + before preview stretch)
+- (Optional if cleaner) `zemosaic_utils.py` (place helper there), but prefer to keep minimal changes.
 
 ## Acceptance criteria
+- For a dataset that previously produced a green/teal final mosaic:
+  - The saved final FITS has per-channel minima aligned (close to 0 for R/G/B when measured on valid pixels).
+  - The preview PNG is no longer green/teal under default stretch.
+- No behavioral changes in grid mode or SDS mode.
+- No crashes if alpha/coverage is missing.
 
-* [x] In classic / non-grid mode, **every master tile** goes through `_apply_lecropper_pipeline(...)` with a `pipeline_cfg` equivalent to the reference worker.
-* [x] Alt-az cleanup + quality crop are correctly applied and logged for master tiles in classic mode.
-* [ ] Final mosaic RGB equalisation remains disabled (no `[RGB-EQ] final mosaic` logs).
-* [ ] Phase 5 for classic mode does **not** reapply lecropper or master-tile crop on the final mosaic.
-* [ ] The final classic mosaic has a **normal colour balance**, with no strong green cast, and visually matches the reference behaviour.
-* [ ] Grid Mode and SDS remain functional without regression.
-
-
+## Quick manual test
+Run the same classic mosaic job that currently outputs green/teal:
+- Compare “before/after” FITS histogram in ASIFitsView:
+  - Previously: R min ~0, G/B min >0
+  - After: R/G/B minima aligned (near 0) on valid pixels
+- Compare preview PNG: should match the “old good” color impression.

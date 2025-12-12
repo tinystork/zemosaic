@@ -9,9 +9,9 @@
 ║ Licence : GNU General Public License v3.0 (GPL-3.0)                               ║
 ║                                                                                   ║
 ║ Description :                                                                     ║
-║   Ce module fournit un cœur de stacking réutilisable pour CPU et GPU,            ║
-║   factorisant la logique commune entre Grid mode et pipeline classique.          ║
-║   Utilise duck typing pour abstraction CPU/GPU (numpy/cupy).                     ║
+║   Ce module fournit un cœur de stacking réutilisable pour CPU et GPU,             ║
+║   factorisant la logique commune entre Grid mode et pipeline classique.           ║
+║   Utilise duck typing pour abstraction CPU/GPU (numpy/cupy).                      ║
 ║                                                                                   ║
 ║ Avertissement :                                                                   ║
 ║   Aucune IA ni aucun couteau à beurre n’a été blessé durant le                    ║
