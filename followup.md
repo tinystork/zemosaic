@@ -1,69 +1,69 @@
 # Implementation checklist
 
 ## 1) Create zemosaic_resource_telemetry.py
-- Copy (verbatim) from `zemosaic_worker.py`:
+- [x] Copy (verbatim) from `zemosaic_worker.py`:
   - `_sample_runtime_resources_for_telemetry()`
   - `ResourceTelemetryController`
-- Keep dependencies light:
+- [x] Keep dependencies light:
   - psutil optional
   - GPU sampling: CuPy if available (match worker behavior)
-- Keep the emitted event format identical:
+- [x] Keep the emitted event format identical:
   - call `progress_callback("STATS_UPDATE", None, "INFO", **payload)`
   - payload includes `timestamp_iso` (UTC ISO string)
 
 ## 2) Refactor zemosaic_worker.py (no behavior change)
-- Remove the in-file definitions you moved.
-- Replace with:
+- [x] Remove the in-file definitions you moved.
+- [x] Replace with:
   - `from zemosaic_resource_telemetry import ResourceTelemetryController`
   - (If worker still uses `_sample_runtime_resources_for_telemetry` directly, import it too; otherwise keep it internal to the module.)
-- Run a quick lint/import check to ensure the worker still imports.
+- [x] Run a quick lint/import check to ensure the worker still imports.
 
 ## 3) Wire telemetry inside grid_mode.py
 ### 3.1 Instantiate telemetry
-- Read config flags from `zconfig` similarly to worker:
+- [x] Read config flags from `zconfig` similarly to worker:
   - enable_resource_telemetry (bool)
   - resource_telemetry_interval_sec (float, clamp to >= 0.5)
   - resource_telemetry_log_to_csv (bool; default True)
-- If logging to CSV enabled and output_folder is set:
+- [x] If logging to CSV enabled and output_folder is set:
   - csv_path = os.path.join(output_folder, "resource_telemetry.csv")
-- Create `telemetry = ResourceTelemetryController(enabled=..., interval_sec=..., callback=progress_callback, csv_path=csv_path)`
+- [x] Create `telemetry = ResourceTelemetryController(enabled=..., interval_sec=..., callback=progress_callback, csv_path=csv_path)`
 
 ### 3.2 Provide a context builder
 Add a small helper inside grid_mode.py:
 
-- `_grid_telemetry_context(phase_index, phase_name, tiles_done, tiles_total, eta_seconds, files_done=None, files_total=None, extra=None) -> dict`
-- Always include:
+- [x] `_grid_telemetry_context(phase_index, phase_name, tiles_done, tiles_total, eta_seconds, files_done=None, files_total=None, extra=None) -> dict`
+- [x] Always include:
   - phase_index, phase_name, tiles_done, tiles_total
-- Include eta_seconds when available (float/int >= 0)
-- Include files_done/files_total if grid knows it; otherwise omit.
+- [x] Include eta_seconds when available (float/int >= 0)
+- [x] Include files_done/files_total if grid knows it; otherwise omit.
 
 ### 3.3 Emit telemetry frequently but cheaply
-- Call `telemetry.maybe_emit_stats(ctx)`:
+- [x] Call `telemetry.maybe_emit_stats(ctx)`:
   - at run start with phase_index=0, phase_name="Grid: Init"
   - whenever grid updates progress/ETA (same cadence you already use for GUI updates)
   - at each phase boundary with `force=True` via `telemetry.emit_stats(ctx, force=True)` if helpful
 
 ### 3.4 Ensure tiles counter is global and monotonic
-- If grid currently reports tiles per “super tile”, introduce a global counter:
+- [x] If grid currently reports tiles per “super tile”, introduce a global counter:
   - tiles_total = total master tiles expected for the run
   - tiles_done increments when a tile is completed (persisted/saved)
-- Feed these values consistently in both:
+- [x] Feed these values consistently in both:
   - your progress/status emissions
   - telemetry context
 
 ### 3.5 Ensure progress reaches 100%
-- At normal completion:
+- [x] At normal completion:
   - emit a final progress update of 100.0
   - emit telemetry with tiles_done == tiles_total and eta_seconds omitted or 0
-- At cancellation/error:
+- [x] At cancellation/error:
   - do not force 100% unless the GUI expects a “finished” event; just ensure telemetry closes.
 
 ### 3.6 Always close telemetry
 Wrap grid main routine with try/finally:
-- `finally: telemetry.close()` (guarded)
+- [x] `finally: telemetry.close()` (guarded)
 
 ## 4) Validate with the Qt GUI expectations
-- Confirm the payload keys match what `zemosaic_gui_qt.py` consumes:
+- [x] Confirm the payload keys match what `zemosaic_gui_qt.py` consumes:
   - cpu_percent, ram_used_mb, ram_total_mb, gpu_used_mb, gpu_total_mb, eta_seconds, tiles_done, tiles_total, phase_index, phase_name
 
 ## Notes / non-goals

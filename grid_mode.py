@@ -61,6 +61,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from zemosaic_resource_telemetry import ResourceTelemetryController
 from zemosaic_utils import (
     debayer_image,
     load_and_validate_fits,
@@ -161,6 +162,7 @@ class _GridProgressReporter:
         self._last_eta_emit = self._t0
         self._throttle_s = max(0.0, float(throttle_s))
         self._smoothed_rate: float | None = None
+        self._last_eta_seconds: float | None = None
 
     def set_tile_total(self, n: int) -> None:
         self.tile_total = max(0, int(n))
@@ -176,6 +178,7 @@ class _GridProgressReporter:
     def set_stage(self, name: str) -> None:
         if name:
             self.stage_name = str(name)
+        self._last_eta_seconds = None
         self._emit_stage_progress(force=True)
 
     def advance(self, units: int = 1, *, force: bool = False) -> None:
@@ -197,6 +200,7 @@ class _GridProgressReporter:
 
         elapsed = max(0.0, now - self._t0)
         eta_str = "--:--:--"
+        eta_seconds: float | None = None
         if self.overall_done_units > 0 and elapsed > 0:
             instant_rate = self.overall_done_units / elapsed
             if self._smoothed_rate is None:
@@ -207,9 +211,12 @@ class _GridProgressReporter:
             remaining_units = max(0, self.overall_total_units - self.overall_done_units)
             if self._smoothed_rate > 0 and remaining_units > 0:
                 remaining_secs = remaining_units / self._smoothed_rate
+                eta_seconds = remaining_secs
                 eta_str = self._format_seconds(remaining_secs)
             else:
                 eta_str = "00:00:00"
+
+        self._last_eta_seconds = eta_seconds
 
         self._last_eta_emit = now
         try:
@@ -222,6 +229,7 @@ class _GridProgressReporter:
         self.tile_done = self.tile_total
         self._emit_tile_count(force=True)
         self._emit_stage_progress(force=True)
+        self._last_eta_seconds = 0.0
         if self._callback:
             try:
                 self._callback("ETA_UPDATE:00:00:00", None, "ETA_LEVEL")
@@ -259,6 +267,10 @@ class _GridProgressReporter:
         except Exception:
             pass
 
+    @property
+    def last_eta_seconds(self) -> float | None:
+        return self._last_eta_seconds
+
     @staticmethod
     def _format_seconds(seconds: float) -> str:
         seconds = max(0, int(round(seconds)))
@@ -284,6 +296,46 @@ def _emit(msg: str, *, lvl: str = "INFO", callback: ProgressCallback = None, **k
                 logger.debug("Progress callback failed for %s", tag, exc_info=True)
             except Exception:
                 pass
+
+
+def _grid_telemetry_context(
+    phase_index: int,
+    phase_name: str,
+    tiles_done: int,
+    tiles_total: int,
+    eta_seconds: float | None,
+    files_done: int | None = None,
+    files_total: int | None = None,
+    extra: dict | None = None,
+) -> dict:
+    ctx = {
+        "phase_index": int(phase_index),
+        "phase_name": str(phase_name),
+        "tiles_done": max(0, int(tiles_done)),
+        "tiles_total": max(0, int(tiles_total)),
+    }
+
+    if files_done is not None and files_total is not None:
+        try:
+            ctx["files_done"] = int(files_done)
+            ctx["files_total"] = int(files_total)
+        except Exception:
+            pass
+
+    if eta_seconds is not None:
+        try:
+            eta_val = float(eta_seconds)
+            if math.isfinite(eta_val) and eta_val >= 0:
+                ctx["eta_seconds"] = eta_val
+        except Exception:
+            pass
+
+    if extra:
+        for key, value in extra.items():
+            if value is not None:
+                ctx[key] = value
+
+    return {k: v for k, v in ctx.items() if v is not None}
 
 
 def _log_wcs_degraded(frame: FrameInfo, *, progress_callback: ProgressCallback = None) -> None:
@@ -3621,111 +3673,171 @@ def run_grid_mode(
     legacy_rgb_cube: bool = False,
     grid_rgb_equalize: bool | None = True,
     use_gpu: bool | None = None,
+    zconfig: object | None = None,
 ) -> None:
     """Main entry point for Grid/Survey mode."""
 
-    reporter = _GridProgressReporter(progress_callback)
-    reporter.set_stage("GRID: setup")
-    reporter.set_overall_total(1)
-    reporter.emit_eta(force=True)
-    reporter.advance(0, force=True)
-
-    def _coerce_bool_flag(value: object) -> bool | None:
-        """Interpret truthy/falsy flags from config, UI, or defaults."""
-
-        if value is None:
-            return None
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return value != 0
-        if isinstance(value, str):
-            normalized = value.strip().lower()
-            if not normalized:
-                return None
-            if normalized in {"1", "true", "yes", "on", "enable", "enabled"}:
-                return True
-            if normalized in {"0", "false", "no", "off", "disable", "disabled"}:
-                return False
+    enable_resource_telemetry = bool(
+        getattr(zconfig, "enable_resource_telemetry", False)
+    ) if zconfig is not None else False
+    telemetry_interval = getattr(zconfig, "resource_telemetry_interval_sec", 1.5)
+    try:
+        telemetry_interval = float(telemetry_interval)
+    except Exception:
+        telemetry_interval = 1.5
+    if telemetry_interval < 0.5:
+        telemetry_interval = 0.5
+    log_to_csv = True if zconfig is None else bool(
+        getattr(zconfig, "resource_telemetry_log_to_csv", True)
+    )
+    csv_path = None
+    if log_to_csv and output_folder:
         try:
-            return bool(value)
+            csv_path = str((Path(output_folder).expanduser() / "resource_telemetry.csv"))
         except Exception:
-            return None
+            csv_path = None
 
-    _emit("Grid/Survey mode activated (stack_plan.csv detected)", callback=progress_callback)
-    cfg_disk = _load_config_from_disk()
-    if use_gpu is None:
-        use_gpu = cfg_disk.get("use_gpu_grid", False)
-    _emit(f"GPU requested = {use_gpu}")
-    # Precedence: on-disk config (grid_rgb_equalize/poststack_equalize_rgb) →
-    # caller parameter → built-in default (True).
-    rgb_source = "default" if grid_rgb_equalize is None else "param"
-    try:
-        overlap_fraction = float(cfg_disk.get("batch_overlap_pct", 0.0)) / 100.0
-    except Exception:
-        overlap_fraction = 0.0
-    try:
-        grid_size_factor = float(cfg_disk.get("grid_size_factor", 1.0))
-    except Exception:
-        grid_size_factor = 1.0
-    try:
-        rgb_cfg = _coerce_bool_flag(cfg_disk.get("grid_rgb_equalize"))
-        if rgb_cfg is None:
-            rgb_cfg = _coerce_bool_flag(cfg_disk.get("poststack_equalize_rgb"))
-        if rgb_cfg is not None:
-            grid_rgb_equalize = rgb_cfg
-            rgb_source = "config"
-        if grid_rgb_equalize is None:
-            grid_rgb_equalize = True
-        else:
-            parsed_param = _coerce_bool_flag(grid_rgb_equalize)
-            if parsed_param is not None:
-                grid_rgb_equalize = parsed_param
-    except Exception:
-        grid_rgb_equalize = True if grid_rgb_equalize is None else bool(grid_rgb_equalize)
-
-    grid_rgb_equalize = bool(grid_rgb_equalize)
-    _emit(
-        f"Grid mode RGB equalization: enabled={grid_rgb_equalize} (source={rgb_source})",
-        lvl="INFO",
+    telemetry = ResourceTelemetryController(
+        enabled=enable_resource_telemetry,
+        interval_sec=telemetry_interval,
         callback=progress_callback,
+        csv_path=csv_path,
     )
-    chunk_budget_mb = 512.0
+
+    reporter = _GridProgressReporter(progress_callback)
+
+    def _emit_telemetry(
+        phase_index: int,
+        phase_name: str,
+        *,
+        eta: float | None = None,
+        files_done: int | None = None,
+        files_total: int | None = None,
+        force: bool = False,
+        extra: dict | None = None,
+    ) -> None:
+        ctx = _grid_telemetry_context(
+            phase_index,
+            phase_name,
+            reporter.tile_done,
+            reporter.tile_total,
+            reporter.last_eta_seconds if eta is None else eta,
+            files_done,
+            files_total,
+            extra,
+        )
+        if force:
+            telemetry.emit_stats(ctx, force=True)
+        else:
+            telemetry.maybe_emit_stats(ctx)
+
+    current_phase_index = 0
+    current_phase_name = "Grid: Init"
+
     try:
-        gb_val = cfg_disk.get("grid_chunk_ram_gb")
-        if gb_val is not None:
-            chunk_budget_mb = float(gb_val) * 1024.0
-    except Exception:
-        pass
-    try:
-        mb_val = cfg_disk.get("grid_chunk_ram_mb", cfg_disk.get("grid_chunk_ram"))
-        if mb_val is not None:
-            chunk_budget_mb = float(mb_val)
-    except Exception:
-        pass
-    if chunk_budget_mb <= 0:
+        reporter.set_stage("GRID: setup")
+        reporter.set_overall_total(1)
+        reporter.emit_eta(force=True)
+        reporter.advance(0, force=True)
+    
+        def _coerce_bool_flag(value: object) -> bool | None:
+            """Interpret truthy/falsy flags from config, UI, or defaults."""
+    
+            if value is None:
+                return None
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return value != 0
+            if isinstance(value, str):
+                normalized = value.strip().lower()
+                if not normalized:
+                    return None
+                if normalized in {"1", "true", "yes", "on", "enable", "enabled"}:
+                    return True
+                if normalized in {"0", "false", "no", "off", "disable", "disabled"}:
+                    return False
+            try:
+                return bool(value)
+            except Exception:
+                return None
+    
+        _emit_telemetry(current_phase_index, current_phase_name, force=True)
+
+        _emit("Grid/Survey mode activated (stack_plan.csv detected)", callback=progress_callback)
+        cfg_disk = _load_config_from_disk()
+        if use_gpu is None:
+            use_gpu = cfg_disk.get("use_gpu_grid", False)
+        _emit(f"GPU requested = {use_gpu}")
+        # Precedence: on-disk config (grid_rgb_equalize/poststack_equalize_rgb) →
+        # caller parameter → built-in default (True).
+        rgb_source = "default" if grid_rgb_equalize is None else "param"
+        try:
+            overlap_fraction = float(cfg_disk.get("batch_overlap_pct", 0.0)) / 100.0
+        except Exception:
+            overlap_fraction = 0.0
+        try:
+            grid_size_factor = float(cfg_disk.get("grid_size_factor", 1.0))
+        except Exception:
+            grid_size_factor = 1.0
+        try:
+            rgb_cfg = _coerce_bool_flag(cfg_disk.get("grid_rgb_equalize"))
+            if rgb_cfg is None:
+                rgb_cfg = _coerce_bool_flag(cfg_disk.get("poststack_equalize_rgb"))
+            if rgb_cfg is not None:
+                grid_rgb_equalize = rgb_cfg
+                rgb_source = "config"
+            if grid_rgb_equalize is None:
+                grid_rgb_equalize = True
+            else:
+                parsed_param = _coerce_bool_flag(grid_rgb_equalize)
+                if parsed_param is not None:
+                    grid_rgb_equalize = parsed_param
+        except Exception:
+            grid_rgb_equalize = True if grid_rgb_equalize is None else bool(grid_rgb_equalize)
+
+        grid_rgb_equalize = bool(grid_rgb_equalize)
+        _emit(
+            f"Grid mode RGB equalization: enabled={grid_rgb_equalize} (source={rgb_source})",
+            lvl="INFO",
+            callback=progress_callback,
+        )
         chunk_budget_mb = 512.0
+        try:
+            gb_val = cfg_disk.get("grid_chunk_ram_gb")
+            if gb_val is not None:
+                chunk_budget_mb = float(gb_val) * 1024.0
+        except Exception:
+            pass
+        try:
+            mb_val = cfg_disk.get("grid_chunk_ram_mb", cfg_disk.get("grid_chunk_ram"))
+            if mb_val is not None:
+                chunk_budget_mb = float(mb_val)
+        except Exception:
+            pass
+        if chunk_budget_mb <= 0:
+            chunk_budget_mb = 512.0
 
-    config = GridModeConfig(
-        grid_size_factor=grid_size_factor,
-        overlap_fraction=overlap_fraction,
-        stack_norm_method=stack_norm_method,
-        stack_weight_method=stack_weight_method,
-        stack_reject_algo=stack_reject_algo,
-        stack_kappa_low=stack_kappa_low,
-        stack_kappa_high=stack_kappa_high,
-        winsor_limits=winsor_limits,
-        stack_final_combine=stack_final_combine,
-        stack_chunk_budget_mb=chunk_budget_mb,
-        apply_radial_weight=apply_radial_weight,
-        radial_feather_fraction=radial_feather_fraction,
-        radial_shape_power=radial_shape_power,
-        save_final_as_uint16=save_final_as_uint16,
-        legacy_rgb_cube=legacy_rgb_cube,
-        use_gpu=use_gpu,
-    )
-
-    _emit(
+        config = GridModeConfig(
+            grid_size_factor=grid_size_factor,
+            overlap_fraction=overlap_fraction,
+            stack_norm_method=stack_norm_method,
+            stack_weight_method=stack_weight_method,
+            stack_reject_algo=stack_reject_algo,
+            stack_kappa_low=stack_kappa_low,
+            stack_kappa_high=stack_kappa_high,
+            winsor_limits=winsor_limits,
+            stack_final_combine=stack_final_combine,
+            stack_chunk_budget_mb=chunk_budget_mb,
+            apply_radial_weight=apply_radial_weight,
+            radial_feather_fraction=radial_feather_fraction,
+            radial_shape_power=radial_shape_power,
+            save_final_as_uint16=save_final_as_uint16,
+            legacy_rgb_cube=legacy_rgb_cube,
+            use_gpu=use_gpu,
+        )
+    
+        _emit(
         (
             "Stacking config: "
             f"norm={config.stack_norm_method}, weight={config.stack_weight_method}, "
@@ -3737,80 +3849,109 @@ def run_grid_mode(
         ),
         lvl="INFO",
         callback=progress_callback,
-    )
+        )
+    
+        csv_path = Path(input_folder).expanduser() / "stack_plan.csv"
+        frames = load_stack_plan(csv_path, progress_callback=progress_callback)
+        if not frames:
+            _emit("Grid mode aborted: no frames loaded", lvl="ERROR", callback=progress_callback)
+            raise RuntimeError("Grid mode failed: no frames loaded")
+    
+        grid = build_global_grid(frames, grid_size_factor, overlap_fraction, progress_callback=progress_callback)
+        if grid is None:
+            _emit("Grid mode aborted: unable to build grid", lvl="ERROR", callback=progress_callback)
+            raise RuntimeError("Grid mode failed: unable to build grid")
+        if not grid.tiles:
+            _emit("Grid mode aborted: no grid tiles generated", lvl="ERROR", callback=progress_callback)
+            raise RuntimeError("Grid mode failed: no tiles to process")
 
-    csv_path = Path(input_folder).expanduser() / "stack_plan.csv"
-    frames = load_stack_plan(csv_path, progress_callback=progress_callback)
-    if not frames:
-        _emit("Grid mode aborted: no frames loaded", lvl="ERROR", callback=progress_callback)
-        raise RuntimeError("Grid mode failed: no frames loaded")
+        reporter.set_tile_total(len(grid.tiles))
+        base_total_units = 1 + max(1, len(grid.tiles)) * 2 + 1
+        reporter.set_overall_total(base_total_units)
+        reporter.advance(1)
 
-    grid = build_global_grid(frames, grid_size_factor, overlap_fraction, progress_callback=progress_callback)
-    if grid is None:
-        _emit("Grid mode aborted: unable to build grid", lvl="ERROR", callback=progress_callback)
-        raise RuntimeError("Grid mode failed: unable to build grid")
-    if not grid.tiles:
-        _emit("Grid mode aborted: no grid tiles generated", lvl="ERROR", callback=progress_callback)
-        raise RuntimeError("Grid mode failed: no tiles to process")
+        current_phase_index = 1
+        current_phase_name = "Grid: Setup"
+        _emit_telemetry(current_phase_index, current_phase_name, force=True)
 
-    reporter.set_tile_total(len(grid.tiles))
-    base_total_units = 1 + max(1, len(grid.tiles)) * 2 + 1
-    reporter.set_overall_total(base_total_units)
-    reporter.advance(1)
+        _emit(
+            f"[GRID] DEBUG: grid_def received with {len(grid.tiles)} tile(s)",
+            callback=progress_callback,
+        )
 
-    _emit(
-        f"[GRID] DEBUG: grid_def received with {len(grid.tiles)} tile(s)",
-        callback=progress_callback,
-    )
+        assign_frames_to_tiles(frames, grid.tiles, progress_callback=progress_callback)
+        out_dir = Path(output_folder).expanduser()
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
 
-    assign_frames_to_tiles(frames, grid.tiles, progress_callback=progress_callback)
-    out_dir = Path(output_folder).expanduser()
-    try:
-        out_dir.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
+        _emit(
+            f"[GRID] DEBUG: starting tile processing over {len(grid.tiles)} tile(s)",
+            callback=progress_callback,
+        )
 
-    _emit(
-        f"[GRID] DEBUG: starting tile processing over {len(grid.tiles)} tile(s)",
-        callback=progress_callback,
-    )
+        reporter.set_stage("GRID: tile stacking")
 
-    reporter.set_stage("GRID: tile stacking")
+        current_phase_index = 2
+        current_phase_name = "Grid: tile stacking"
+        num_workers = _get_effective_grid_workers(cfg_disk)
+        _emit(
+            f"Memory telemetry: grid_workers={num_workers}, stack_chunk_budget_mb={config.stack_chunk_budget_mb}",
+            callback=progress_callback,
+        )
+        _emit_telemetry(
+            current_phase_index,
+            current_phase_name,
+            force=True,
+            extra={"cpu_workers": num_workers, "use_gpu": bool(config.use_gpu)},
+        )
 
-    num_workers = _get_effective_grid_workers(cfg_disk)
-    _emit(f"Memory telemetry: grid_workers={num_workers}, stack_chunk_budget_mb={config.stack_chunk_budget_mb}", callback=progress_callback)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-        futures = {executor.submit(process_tile, tile, out_dir, config, progress_callback=progress_callback): tile for tile in grid.tiles}
-        for future in concurrent.futures.as_completed(futures):
-            tile = futures[future]
-            try:
-                result = future.result()
-                _emit(f"[GRID] Tile {tile.tile_id} completed", callback=progress_callback)
-            except Exception as exc:
-                _emit(f"Tile {tile.tile_id} failed with error: {exc}", lvl="ERROR", callback=progress_callback)
-            reporter.tile_completed()
-            reporter.advance(1)
-            reporter.emit_eta()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(process_tile, tile, out_dir, config, progress_callback=progress_callback): tile for tile in grid.tiles}
+            for future in concurrent.futures.as_completed(futures):
+                tile = futures[future]
+                try:
+                    result = future.result()
+                    _emit(f"[GRID] Tile {tile.tile_id} completed", callback=progress_callback)
+                except Exception as exc:
+                    _emit(f"Tile {tile.tile_id} failed with error: {exc}", lvl="ERROR", callback=progress_callback)
+                reporter.tile_completed()
+                reporter.advance(1)
+                reporter.emit_eta()
+                _emit_telemetry(
+                    current_phase_index,
+                    current_phase_name,
+                    extra={"cpu_workers": num_workers, "use_gpu": bool(config.use_gpu)},
+                )
             # Optional GC after each tile for memory safety (disabled by default)
             if os.environ.get("ZEMOSAIC_GRID_SAFE_GC", "").lower() in ("1", "true", "yes"):
                 import gc
                 gc.collect()
+    
+        reporter.set_stage("GRID: photometry & blending")
+        current_phase_index = 3
+        current_phase_name = "Grid: photometry & blending"
+        _emit_telemetry(current_phase_index, current_phase_name, force=True)
+        mosaic_path = assemble_tiles(
+            grid,
+            grid.tiles,
+            out_dir / "mosaic_grid.fits",
+            save_final_as_uint16=save_final_as_uint16,
+            legacy_rgb_cube=legacy_rgb_cube,
+            grid_rgb_equalize=grid_rgb_equalize,
+            progress_callback=progress_callback,
+            progress_reporter=reporter,
+        )
 
-    reporter.set_stage("GRID: photometry & blending")
-    mosaic_path = assemble_tiles(
-        grid,
-        grid.tiles,
-        out_dir / "mosaic_grid.fits",
-        save_final_as_uint16=save_final_as_uint16,
-        legacy_rgb_cube=legacy_rgb_cube,
-        grid_rgb_equalize=grid_rgb_equalize,
-        progress_callback=progress_callback,
-        progress_reporter=reporter,
-    )
+        if mosaic_path is None:
+            _emit("Grid mode aborted: assembly failed", lvl="ERROR", callback=progress_callback)
+            raise RuntimeError("Grid mode failed during assembly")
 
-    if mosaic_path is None:
-        _emit("Grid mode aborted: assembly failed", lvl="ERROR", callback=progress_callback)
-        raise RuntimeError("Grid mode failed during assembly")
-
-    reporter.finish()
-    _emit("Grid/Survey mode completed", lvl="SUCCESS", callback=progress_callback)
+        reporter.finish()
+        current_phase_index = 4
+        current_phase_name = "Grid: Completed"
+        _emit_telemetry(current_phase_index, current_phase_name, eta=0.0, force=True)
+        _emit("Grid/Survey mode completed", lvl="SUCCESS", callback=progress_callback)
+    finally:
+        telemetry.close()
