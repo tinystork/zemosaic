@@ -1,79 +1,47 @@
-# Implementation checklist
+# Follow-up — Validation instrumentation + log level propagation (Qt)
 
-## 1) Create zemosaic_resource_telemetry.py
-- [x] Copy (verbatim) from `zemosaic_worker.py`:
-  - `_sample_runtime_resources_for_telemetry()`
-  - `ResourceTelemetryController`
-- [x] Keep dependencies light:
-  - psutil optional
-  - GPU sampling: CuPy if available (match worker behavior)
-- [x] Keep the emitted event format identical:
-  - call `progress_callback("STATS_UPDATE", None, "INFO", **payload)`
-  - payload includes `timestamp_iso` (UTC ISO string)
+## Checklist exécution
+- [ ] Lancer un run Classic en GUI Qt avec Logging level = INFO
+  - Attendu: pas de lignes `[DBG_RGB]`
+  - Attendu: une ligne `[LOGCFG] effective_level=INFO ...`
 
-## 2) Refactor zemosaic_worker.py (no behavior change)
-- [x] Remove the in-file definitions you moved.
-- [x] Replace with:
-  - `from zemosaic_resource_telemetry import ResourceTelemetryController`
-  - (If worker still uses `_sample_runtime_resources_for_telemetry` directly, import it too; otherwise keep it internal to the module.)
-- [x] Run a quick lint/import check to ensure the worker still imports.
+- [ ] Lancer un run Classic en GUI Qt avec Logging level = DEBUG
+  - Attendu: `[LOGCFG] effective_level=DEBUG source=...`
+  - Attendu: checkpoints `[DBG_RGB]` présents et seulement aux points prévus:
+    - P3_PRE_STACK_CORE / P3_POST_STACK_CORE
+    - P3_PRE_POSTSTACK_EQ / P3_POST_POSTSTACK_EQ (si appelé)
+    - P4_PRE_MOSAIC_FUSE / P4_POST_MOSAIC_FUSE
+    - P5_PRE_GLOBAL_POST / P5_POST_GLOBAL_POST
+    - P6_PRE_EXPORT (et P7_POST_EXPORT si implémenté)
+  - Attendu: logs compacts, 1 ligne par checkpoint (pas de spam par tuile)
 
-## 3) Wire telemetry inside grid_mode.py
-### 3.1 Instantiate telemetry
-- [x] Read config flags from `zconfig` similarly to worker:
-  - enable_resource_telemetry (bool)
-  - resource_telemetry_interval_sec (float, clamp to >= 0.5)
-  - resource_telemetry_log_to_csv (bool; default True)
-- [x] If logging to CSV enabled and output_folder is set:
-  - csv_path = os.path.join(output_folder, "resource_telemetry.csv")
-- [x] Create `telemetry = ResourceTelemetryController(enabled=..., interval_sec=..., callback=progress_callback, csv_path=csv_path)`
+## Grep patterns utiles
+- `\[LOGCFG\]`
+- `\[DBG_RGB\] P3_`
+- `\[DBG_RGB\] P4_`
+- `\[DBG_RGB\] P5_`
+- `ratio_G_R=`
+- `cov_weighted_mean=`
 
-### 3.2 Provide a context builder
-Add a small helper inside grid_mode.py:
+## Interprétation rapide (comment lire)
+- Si `ratio_G_R` et/ou `ratio_G_B` est ~1.0 en P3_* puis dérive en P4_*:
+  -> problème introduit au moment fusion/reprojection/coverage.
+- Si P4 est stable mais dérive en P5_POST_*:
+  -> problème introduit par equalization/scaling/global normalization.
+- Si P5 stable mais dérive en P6:
+  -> conversion/clamp/export.
 
-- [x] `_grid_telemetry_context(phase_index, phase_name, tiles_done, tiles_total, eta_seconds, files_done=None, files_total=None, extra=None) -> dict`
-- [x] Always include:
-  - phase_index, phase_name, tiles_done, tiles_total
-- [x] Include eta_seconds when available (float/int >= 0)
-- [x] Include files_done/files_total if grid knows it; otherwise omit.
+## Comparaison Classic vs SDS
+- [ ] Lancer SDS en DEBUG avec mêmes logs activés
+- [ ] Comparer la première phase où `ratio_G_R` explose en Classic mais pas en SDS
 
-### 3.3 Emit telemetry frequently but cheaply
-- [x] Call `telemetry.maybe_emit_stats(ctx)`:
-  - at run start with phase_index=0, phase_name="Grid: Init"
-  - whenever grid updates progress/ETA (same cadence you already use for GUI updates)
-  - at each phase boundary with `force=True` via `telemetry.emit_stats(ctx, force=True)` if helpful
+## Non-régression
+- [ ] Vérifier que les fichiers de sortie (FITS) sont bien produits comme avant.
+- [ ] Vérifier qu’aucun changement de pipeline n’a été fait (uniquement logs + log level).
+- [ ] Vérifier qu’aucun comportement “batch size=0” / “batch size>1” n’a été modifié.
 
-### 3.4 Ensure tiles counter is global and monotonic
-- [x] If grid currently reports tiles per “super tile”, introduce a global counter:
-  - tiles_total = total master tiles expected for the run
-  - tiles_done increments when a tile is completed (persisted/saved)
-- [x] Feed these values consistently in both:
-  - your progress/status emissions
-  - telemetry context
-
-### 3.5 Ensure progress reaches 100%
-- [x] At normal completion:
-  - emit a final progress update of 100.0
-  - emit telemetry with tiles_done == tiles_total and eta_seconds omitted or 0
-- [x] At cancellation/error:
-  - do not force 100% unless the GUI expects a “finished” event; just ensure telemetry closes.
-
-### 3.6 Always close telemetry
-Wrap grid main routine with try/finally:
-- [x] `finally: telemetry.close()` (guarded)
-
-## 4) Validate with the Qt GUI expectations
-- [x] Confirm the payload keys match what `zemosaic_gui_qt.py` consumes:
-  - cpu_percent, ram_used_mb, ram_total_mb, gpu_used_mb, gpu_total_mb, eta_seconds, tiles_done, tiles_total, phase_index, phase_name
-
-## Notes / non-goals
-- Do not alter SDS phases or their progress math.
-- Do not modify classic pipeline progress/ETA.
-- Do not add new GUI signals; reuse existing `STATS_UPDATE` + existing progress updates.
-
-# Quick manual test script
-- Enable telemetry checkbox in GUI
-- Run grid mode on a small dataset (fast)
-- Watch resource monitor label update
-- Ensure tiles counter increases globally and ends at total
-- Ensure progress hits 100%
+## Notes dev (si problème)
+- Si DEBUG ne sort pas malgré le dropdown Qt:
+  - vérifier que le worker est en process séparé -> env var doit être propagée
+  - vérifier que le handler/formatter du logger ne filtre pas au-dessus de DEBUG
+  - vérifier que `logger.propagate` et `root` n’écrasent pas le niveau
