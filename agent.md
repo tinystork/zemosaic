@@ -1,51 +1,91 @@
-# Mission: Fix green/teal tint in classic mode final mosaic (RGB black-level mismatch)
+# Mission — SDS GPU fallback fix (CuPy nanpercentile)
 
-## High-level goal
-Restore production-ready classic-mode output colors (no persistent green/teal cast) by fixing the root cause: per-channel baseline mismatch (R min ~ 0 while G/B min > 0) in the final mosaic FITS/preview generation.
+## 🎯 Objectif UNIQUE (strict)
+Corriger **exclusivement** le mode **SuperDupStack (SDS)** afin d’éliminer le fallback CPU causé par :
 
-## Non-goals / must NOT change
-- Do NOT modify Grid Mode behavior.
-- Do NOT modify SDS mode behavior.
-- Do NOT remove or alter two-pass coverage renormalization logic.
-- Do NOT change clustering logic, tile selection logic, or matching logic except what is strictly required for the black-level fix.
-- Do NOT add heavy dependencies.
+    AttributeError: module 'cupy' has no attribute 'nanpercentile'
 
-## Context
-`zemosaic_utils.save_fits_image` currently applies a *global* baseline shift for float outputs only when the global min > 0. This does not fix cases where R has true zeros but G/B are offset (common cause of green/teal tint under auto-stretch / auto-WB). The fix must be per-channel, computed on valid mosaic pixels only (alpha/coverage), then applied as a constant subtraction per channel.
+⚠️ Toute modification hors SDS sera considérée comme incorrecte.
 
-## Implementation plan (minimal & safe)
-- [x] Add a helper to compute per-channel black offsets using a validity mask:
-  - Inputs: image HWC float32, optional alpha mask (uint8 0..255) and/or coverage mask (float/uint)
-  - Build `valid = finite(rgb).all(axis=-1)` AND (alpha>0 if provided else coverage>0 if provided else True)
-  - For each channel c, compute `p = nanpercentile(rgb[...,c][valid], p_low)` with p_low default 0.1 or 0.5
-  - If p is finite and > 0: subtract it from that channel
-  - Clip to >= 0 (float32)
-  - Return adjusted image + info dict (offsets)
+---
 
-- [x] Apply this helper ONLY in classic mode finalization:
-  - Right before saving final FITS mosaic (so the FITS histogram is sane in viewers).
-  - Right before building preview PNG (so preview matches FITS and is no longer green/teal).
-  - Guard with config flag default ON for classic mode, but OFF for SDS/grid.
-  - If mask is empty (no valid pixels), skip safely.
+## 🧠 Contexte
+Lors d’un run SDS avec GPU activé, la route GPU échoue dans le helper :
 
-- [x] Logging:
-  - Log offsets applied: per-channel p_low percentile values and whether applied.
-  - Keep logs INFO_DETAIL to avoid noise.
+    helper = gpu_reproject
 
-## Files to modify
-- `zemosaic_worker.py` (apply the helper before final FITS save + before preview stretch)
-- (Optional if cleaner) `zemosaic_utils.py` (place helper there), but prefer to keep minimal changes.
+Le worker bascule ensuite sur la voie CPU avec le message :
 
-## Acceptance criteria
-- For a dataset that previously produced a green/teal final mosaic:
-  - The saved final FITS has per-channel minima aligned (close to 0 for R/G/B when measured on valid pixels).
-  - The preview PNG is no longer green/teal under default stretch.
-- No behavioral changes in grid mode or SDS mode.
-- No crashes if alpha/coverage is missing.
+    gpu_fallback_runtime_error: cupy has no attribute nanpercentile
 
-## Quick manual test
-Run the same classic mosaic job that currently outputs green/teal:
-- Compare “before/after” FITS histogram in ASIFitsView:
-  - Previously: R min ~0, G/B min >0
-  - After: R/G/B minima aligned (near 0) on valid pixels
-- Compare preview PNG: should match the “old good” color impression.
+Ce fallback **ne doit plus se produire**.
+
+---
+
+## 🚫 Interdictions absolues
+- ❌ Ne pas modifier le mode classique
+- ❌ Ne pas modifier le mode grid
+- ❌ Ne pas refactorer des utilitaires globaux “pour faire mieux”
+- ❌ Ne pas toucher à la photométrie, normalisation, assemblage
+- ❌ Ne pas modifier le comportement batch size = 0 / > 1
+- ❌ Ne pas faire de “grep & replace” global sur cp.nanpercentile
+
+👉 **Tout changement hors du chemin SDS est interdit.**
+
+---
+
+## 🧭 Périmètre autorisé
+Uniquement :
+- le chemin d’exécution **SDS**
+- les fonctions réellement appelées lorsque :
+  - mode = SuperDupStack
+  - helper = gpu_reproject
+  - GPU actif
+
+---
+
+## 🛠️ Travail attendu
+1. Identifier **précisément** le chemin d’appel SDS menant à `cp.nanpercentile`
+   - ne pas supposer
+   - suivre le flux réel (SDS → gpu_reproject → stats/percentiles)
+
+2. Pour **chaque appel SDS** à `cp.nanpercentile` :
+   - remplacer par un wrapper **local SDS**
+   - compatible CuPy sans `nanpercentile`
+
+### Wrapper attendu (exemple de comportement)
+```python
+def _sds_cp_nanpercentile(arr_gpu, percentiles, *, axis=None):
+    import cupy as cp
+    if hasattr(cp, "nanpercentile"):
+        return cp.nanpercentile(arr_gpu, percentiles, axis=axis)
+    if hasattr(cp, "nanquantile"):
+        if np.isscalar(percentiles):
+            q = float(percentiles) / 100.0
+        else:
+            q = cp.asarray(percentiles, dtype=cp.float32) / 100.0
+        return cp.nanquantile(arr_gpu, q, axis=axis)
+    raise RuntimeError("CuPy missing nanpercentile/nanquantile")
+📌 Le wrapper :
+
+doit être local à SDS
+
+ou utilisé uniquement dans la voie SDS
+
+ne doit pas modifier les autres modes
+
+✅ Résultat attendu
+Plus aucun fallback CPU lié à nanpercentile
+
+Le helper gpu_reproject reste sur la voie GPU en SDS
+
+Les autres modes produisent exactement les mêmes logs et résultats qu’avant
+
+📦 Livrable
+Un seul commit
+
+Message :
+
+Fix SDS GPU nanpercentile compatibility (no CPU fallback)
+Diff minimal, SDS only
+
