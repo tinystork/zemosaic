@@ -14,23 +14,23 @@ Restore production-ready classic-mode output colors (no persistent green/teal ca
 `zemosaic_utils.save_fits_image` currently applies a *global* baseline shift for float outputs only when the global min > 0. This does not fix cases where R has true zeros but G/B are offset (common cause of green/teal tint under auto-stretch / auto-WB). The fix must be per-channel, computed on valid mosaic pixels only (alpha/coverage), then applied as a constant subtraction per channel.
 
 ## Implementation plan (minimal & safe)
-1. Add a helper to compute per-channel black offsets using a validity mask:
-   - Inputs: image HWC float32, optional alpha mask (uint8 0..255) and/or coverage mask (float/uint)
-   - Build `valid = finite(rgb).all(axis=-1)` AND (alpha>0 if provided else coverage>0 if provided else True)
-   - For each channel c, compute `p = nanpercentile(rgb[...,c][valid], p_low)` with p_low default 0.1 or 0.5
-   - If p is finite and > 0: subtract it from that channel
-   - Clip to >= 0 (float32)
-   - Return adjusted image + info dict (offsets)
+- [x] Add a helper to compute per-channel black offsets using a validity mask:
+  - Inputs: image HWC float32, optional alpha mask (uint8 0..255) and/or coverage mask (float/uint)
+  - Build `valid = finite(rgb).all(axis=-1)` AND (alpha>0 if provided else coverage>0 if provided else True)
+  - For each channel c, compute `p = nanpercentile(rgb[...,c][valid], p_low)` with p_low default 0.1 or 0.5
+  - If p is finite and > 0: subtract it from that channel
+  - Clip to >= 0 (float32)
+  - Return adjusted image + info dict (offsets)
 
-2. Apply this helper ONLY in classic mode finalization:
-   - Right before saving final FITS mosaic (so the FITS histogram is sane in viewers).
-   - Right before building preview PNG (so preview matches FITS and is no longer green/teal).
-   - Guard with config flag default ON for classic mode, but OFF for SDS/grid.
-   - If mask is empty (no valid pixels), skip safely.
+- [x] Apply this helper ONLY in classic mode finalization:
+  - Right before saving final FITS mosaic (so the FITS histogram is sane in viewers).
+  - Right before building preview PNG (so preview matches FITS and is no longer green/teal).
+  - Guard with config flag default ON for classic mode, but OFF for SDS/grid.
+  - If mask is empty (no valid pixels), skip safely.
 
-3. Logging:
-   - Log offsets applied: per-channel p_low percentile values and whether applied.
-   - Keep logs INFO_DETAIL to avoid noise.
+- [x] Logging:
+  - Log offsets applied: per-channel p_low percentile values and whether applied.
+  - Keep logs INFO_DETAIL to avoid noise.
 
 ## Files to modify
 - `zemosaic_worker.py` (apply the helper before final FITS save + before preview stretch)
