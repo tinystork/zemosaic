@@ -2,22 +2,22 @@
 
 ## Étapes à exécuter
 
-1. Activer le niveau `DEBUG` dans le GUI Qt
-2. Vérifier que ce niveau est bien propagé au logger du worker
-3. Lancer exactement le même dataset en :
+- [ ] Activer le niveau `DEBUG` dans le GUI Qt
+- [ ] Vérifier que ce niveau est bien propagé au logger du worker
+- [ ] Lancer exactement le même dataset en :
    - mode Classic
    - mode SDS (référence saine)
-4. Comparer les blocs `[DBG_RGB]` dans les logs
+- [ ] Comparer les blocs `[DBG_RGB]` dans les logs
 
 ---
 
 ## Points de comparaison clés
 
 Comparer **strictement** :
-- `P3_post_stack_core` (Classic vs SDS)
-- `P4_post_merge_valid_rgb`
-- `P5_pre_rgb_equalization`
-- `P5_post_rgb_equalization`
+- [ ] `P3_post_stack_core` (Classic vs SDS)
+- [ ] `P4_post_merge_valid_rgb`
+- [ ] `P5_pre_rgb_equalization`
+- [ ] `P5_post_rgb_equalization`
 
 ---
 
