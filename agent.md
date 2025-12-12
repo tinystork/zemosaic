@@ -1,213 +1,210 @@
-# Mission: Restore stable "classic" (non-grid) Phase 5 behaviour in `zemosaic_worker.py`
+# Mission: Fix green cast in classic mode by restoring master-tile lecropper & disabling extra colour tweaks
 
 ## High-level goal
 
-Bring the **classic / non-grid pipeline** in `zemosaic_worker.py` back to a **stable, production-ready state**, matching the behaviour of the known-good reference file:
+The current unified worker `zemosaic_worker.py` still produces a **green-tinted mosaic** in classic / non-grid mode, even after disabling the final RGB equalisation and simplifying Phase 5 options.
 
-- `zemosaic_worker_non grid_ok.py`
+We have a **known-good reference**:
 
-The target is:
+- `zemosaic_worker_non grid_ok.py` → classic mode, no grid, **clean colour** and proper master tiles.
 
-- **No more green-tinted mosaics** in classic mode.
-- **No change** to Grid Mode or SDS phases.
-- Keep the newer Phase 5 infrastructure (two-pass renorm, GPU, telemetry) but with the **same functional behaviour** as the reference file for the **classic, non-grid path**.
+The mission is to:
 
-We do **not** need to re-invent the algorithm.  
-The mission is to **align the call site(s)** of the Phase 5 pipeline in `zemosaic_worker.py` with the logic that exists in `zemosaic_worker_non grid_ok.py`.
+1. **Guarantee that master tiles in classic mode (non-SDS / non-Grid) go through the full lecropper pipeline**, exactly like in `zemosaic_worker_non grid_ok.py`.
+2. Keep the final mosaic free from aggressive, redundant colour operations (no extra RGB-EQ, no extra lecropper on the assembled mosaic).
+3. Reach a **production-ready classic mode** with clean background and no green cast, even if the root cause is not fully analysed.
+
+We focus only on the **classic pipeline**; Grid and SDS must not be broken.
 
 ---
 
 ## Context
 
-- This project has **two workers**:
-  - `zemosaic_worker_non grid_ok.py` → older worker, classic mode, **chromatically correct** (no green cast). This is our **behavioural reference**.
-  - `zemosaic_worker.py` → current worker, supports **Grid Mode, SDS, GPU**, etc. In classic mode it still produces mosaics with a strong **green tint**.
+We already tried:
 
-- We already **disabled** the final RGB equalisation call in `zemosaic_worker.py`:
-  - The block around `_apply_final_mosaic_rgb_equalization(...)` (lines ~6778–6796) is **commented out** and must remain disabled in this mission.
-  - Despite that, the classic mosaic is still green → the problem is **not only** the final RGB eq.
+- Disabling final mosaic RGB equalisation by commenting out the call to `_apply_final_mosaic_rgb_equalization(...)`.
+- Aligning the Phase 5 call to `_apply_phase5_post_stack_pipeline(...)` with the reference worker, using:
+  - `enable_lecropper_pipeline=False`
+  - `enable_master_tile_crop=False`
+  for the classic / non-grid path.
 
-- The remaining functional difference between the “OK” worker and the “green” worker in Phase 5 is:
-  - In the reference file, the Phase 5 post-stack pipeline is called with:
-    - `enable_lecropper_pipeline=False`
-    - `enable_master_tile_crop=False`
-  - In the new worker, we added logic that re-derives:
-    - `enable_final_lecropper` and `enable_final_master_crop`
-    - and passes them to `_apply_phase5_post_stack_pipeline(...)` on the **final mosaic**.
+Despite that, the mosaic remains green.  
+Logs show that:
 
-- This leads to **replaying the quality pipeline** (lecropper, alt-az cleanup, master crop, etc.) on the **assembled mosaic**, possibly **several times** (Phase 5 + `_derive_final_alpha_mask`), on data that already had master-tile level processing applied.
+- `poststack_equalize_rgb` is still executed on master tiles (good).
+- `MT_CROP: quality-based rect=...` is logged during Phase 3 (so quality crop is running).
+- The final mosaic still looks heavily green.
 
-Result: the classic / non-grid mosaic shows a **strong green cast and ugly background**.
+This indicates that the **problem is rooted at the master-tile level** (background / gradients / alt-az artefacts) and/or that we are still doing **too many corrections** on top of each other.
 
-The fix is **not** to add more processing, but to **restore the same call parameters** as the known-good worker for the **classic, non-grid Phase 5 path**.
+We will therefore:
+
+- **Strictly mirror** the master-tile lecropper/alt-az pipeline from `zemosaic_worker_non grid_ok.py`.
+- Ensure no extra colour manipulation occurs after Phase 3 for classic mode.
 
 ---
 
 ## Files to edit
 
-1. `zemosaic_worker.py`  
-   - Main worker with Grid/SDS logic.
-2. (Read-only reference) `zemosaic_worker_non grid_ok.py`  
-   - Do **not** modify this file.  
-   - Use it only as a **behavioural reference**.
+1. `zemosaic_worker.py`  *(main target)*
+2. (read-only reference) `zemosaic_worker_non grid_ok.py`  *(do NOT modify; use for comparison only)*
 
 ---
 
 ## Constraints
 
-- **Do not modify**:
+- Do **not** touch:
   - `grid_mode.py`
   - Any Grid-specific or SDS-specific code paths
-  - FITS reading / writing logic
-  - Existing RGB **final** equalisation helper `_apply_final_mosaic_rgb_equalization` (its implementation can stay as is, but the call must remain disabled).
+  - `lecropper.py` implementation itself (unless a blatant bug is found, which is not expected for this mission)
+  - GUI files (`zemosaic_gui.py`, `zemosaic_gui_qt.py`, filter GUIs, etc.)
 
-- Keep the following intact:
-  - Two-pass renormalisation infrastructure in Phase 5.
-  - GPU/CPU parallel plan logic.
-  - Telemetry controls.
+- The only worker to be edited is `zemosaic_worker.py`, and only:
+  - in the **Phase 3 master-tile creation pipeline**, and
+  - the already-known **Phase 5 / RGB-EQ final hooks**.
 
-- Focus only on:
-  - The **classic / non-grid** Phase 5 path (after the final mosaic has been assembled).
+- Keep:
+  - Two-pass renorm infrastructure, GPU/CPU parallel plan, and telemetry intact.
+  - Existing log messages and `[CLÉ_POUR_GUI: ...]` keys.
 
 ---
 
-## Task 1 – Restore Phase 5 call parameters for classic mode
+## Task 1 – Mirror master-tile lecropper pipeline from reference worker
 
 ### Goal
 
-Make sure that, in **classic / non-grid mode** (non-SDS), the call to `_apply_phase5_post_stack_pipeline(...)` in `zemosaic_worker.py` uses the **same effective parameters** as in `zemosaic_worker_non grid_ok.py`, i.e.:
-
-- `enable_lecropper_pipeline=False`
-- `enable_master_tile_crop=False`
-
-…while still passing the current `final_quality_pipeline_cfg`, two-pass parameters, WCS, coverage, etc.
+Ensure that, in classic / non-grid mode, **every master tile** is processed by `lecropper` exactly as in the reference worker.
 
 ### Steps
 
-1. In `zemosaic_worker.py`, locate the **Phase 5 post-stack pipeline call** for the final mosaic, **outside** Grid Mode and **outside** SDS Phase 5:
-   - This is the call to `_apply_phase5_post_stack_pipeline(...)` that happens:
-     - After `assemble_final_mosaic_reproject_coadd(...)` or `assemble_final_mosaic_incremental(...)`,
-     - On variables like `final_mosaic_data_HWC`, `final_mosaic_coverage_HW`, `final_alpha_map`.
-
-2. You will find some logic similar to:
+1. In `zemosaic_worker_non grid_ok.py`, locate the function `create_master_tile(...)` (or equivalent) where:
+   - A master tile `master_tile_stacked_HWC` is produced,
+   - Quality-based crop is computed (`MT_CROP: quality-based rect=...`),
+   - Then the lecropper pipeline is applied:
 
    ```python
-   enable_final_lecropper = False
-   if final_quality_pipeline_cfg:
-       enable_final_lecropper = bool(
-           final_quality_pipeline_cfg.get("quality_crop_enabled")
-           or final_quality_pipeline_cfg.get("altaz_cleanup_enabled")
-       )
-
-   enable_final_master_crop = False
-   if final_quality_pipeline_cfg:
-       enable_final_master_crop = bool(
-           final_quality_pipeline_cfg.get("master_tile_crop_enabled")
-       )
-
-   final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = _apply_phase5_post_stack_pipeline(
-       final_mosaic_data_HWC,
-       final_mosaic_coverage_HW,
-       final_alpha_map,
-       enable_lecropper_pipeline=enable_final_lecropper,
-       pipeline_cfg=final_quality_pipeline_cfg,
-       enable_master_tile_crop=enable_final_master_crop,
-       ...
-   )
+   pipeline_cfg = {
+       "quality_crop_enabled": quality_crop_enabled,
+       "quality_crop_band_px": quality_crop_band_px,
+       "quality_crop_k_sigma": quality_crop_k_sigma,
+       "quality_crop_margin_px": quality_crop_margin_px,
+       "quality_crop_min_run": quality_crop_min_run,
+       "altaz_cleanup_enabled": altaz_cleanup_enabled,
+       "altaz_margin_percent": altaz_margin_percent,
+       "altaz_decay": altaz_decay,
+       "altaz_nanize": altaz_nanize,
+   }
+   master_tile_stacked_HWC, pipeline_alpha_mask = _apply_lecropper_pipeline(master_tile_stacked_HWC, pipeline_cfg)
+   ...
+   pipeline_alpha_u8 = _normalize_alpha_mask(...)
+   ...
+   alpha_mask_for_quality = pipeline_alpha_mask or alpha_mask_out
+   quality_gate_eval = _evaluate_quality_gate_metrics(..., alpha_mask=alpha_mask_for_quality, ...)
 ````
 
-3. For the **classic / non-grid path**, change this call so that it matches the reference worker’s behaviour:
+2. In `zemosaic_worker.py`, find the **corresponding block** (it should already look very similar, but with possible differences like `quality_crop_enabled_tile`, `quality_gate_enabled_tile`, etc.).
 
-   * Replace the dynamic `enable_final_lecropper` and `enable_final_master_crop` by **hard-coded `False`** for this specific call, just like in `zemosaic_worker_non grid_ok.py`.
+3. For the **classic / non-grid path**:
 
-   * The final call in the classic / non-grid path must look like:
+   * Ensure the `pipeline_cfg` keys and types match the reference worker:
+
+     * `quality_crop_enabled` must reflect the global config for classic mode (not accidentally forced to `False` by per-tile logic, except when it is intentionally disabled by the user).
+     * `altaz_cleanup_enabled` and related parameters must be passed through exactly as in the reference worker.
+
+   * Confirm that `_apply_lecropper_pipeline(...)` is **always called** for each master tile in classic mode, i.e.:
+
+     * There is no `if grid_mode` or `if sds_mode` or any early return that bypasses lecropper.
+     * No branch that resets `quality_crop_enabled_tile` to `False` for classic mode.
+
+   * Ensure that:
+
+     * `pipeline_alpha_mask` is normalised via `_normalize_alpha_mask(...)`,
+     * `alpha_mask_out` is computed and passed to the FITS save function,
+     * `quality_gate_eval` uses `alpha_mask_for_quality` like in the reference worker.
+
+4. Make sure that logs related to quality crop and lecropper remain intact:
+
+   * `MT_CROP: quality-based rect=...`
+   * warnings such as `MT_CROP: quality-based crop failed (...)` or `quality crop skipped (...)`.
+
+5. If there are **per-tile overrides** (e.g. `quality_crop_enabled_tile`, `quality_gate_enabled_tile`), verify that:
+
+   * They do not inadvertently **disable** the pipeline in classic mode unless explicitly requested.
+   * Their default behaviour for classic mode mimics `quality_crop_enabled` / `quality_gate_enabled` from the reference worker.
+
+---
+
+## Task 2 – Keep post-master-tile colour stages minimal
+
+### Goal
+
+Avoid any extra colour transformations on the mosaic that might interact badly with master-tile processing.
+
+### Steps
+
+1. The final mosaic RGB equalisation (`_apply_final_mosaic_rgb_equalization(...)`) must remain **disabled by default**:
+
+   * Either the call site is commented out,
+   * Or it is guarded by a config flag `final_mosaic_rgb_equalize_enabled=False`.
+
+   For this mission, we assume the call is already disabled and **should remain so**.
+
+2. The Phase 5 call to `_apply_phase5_post_stack_pipeline(...)` for the **classic / non-grid** final mosaic should keep:
 
    ```python
-   final_mosaic_data_HWC, final_mosaic_coverage_HW, final_alpha_map = _apply_phase5_post_stack_pipeline(
-       final_mosaic_data_HWC,
-       final_mosaic_coverage_HW,
-       final_alpha_map,
-       enable_lecropper_pipeline=False,
-       pipeline_cfg=final_quality_pipeline_cfg,
-       enable_master_tile_crop=False,
-       master_tile_crop_percent=master_tile_crop_percent_config,
-       two_pass_enabled=bool(two_pass_enabled),
-       two_pass_sigma_px=two_pass_sigma_px,
-       two_pass_gain_clip=gain_clip_tuple,
-       final_output_wcs=final_output_wcs,
-       final_output_shape_hw=final_output_shape_hw,
-       use_gpu_two_pass=use_gpu_phase5_flag,
-       logger=logger,
-       collected_tiles=collected_tiles_for_second_pass,
-       fallback_two_pass_loader=fallback_two_pass_loader,
-       parallel_plan=parallel_plan,
-       telemetry_ctrl=None if sds_mode_phase5 else telemetry_ctrl,
+   enable_lecropper_pipeline=False
+   enable_master_tile_crop=False
+   ```
+
+   with all other arguments (two-pass, WCS, coverage, telemetry, etc.) preserved.
+
+3. Do not add any **new** per-channel scaling or normalisation at the mosaic level.
+
+---
+
+## Task 3 – Sanity checks + diagnosis hooks
+
+### Goal
+
+Help confirm that the green cast originates from master-tile background, not from Phase 5.
+
+### Steps
+
+1. Add (or keep) an info log at the end of `create_master_tile(...)` that clearly indicates:
+
+   * Whether the lecropper pipeline ran,
+   * Whether alt-az cleanup was enabled for that tile,
+   * The `quality_crop_enabled` state.
+
+   Example:
+
+   ```python
+   pcb_tile(
+       f"MT_PIPELINE: lecropper_applied=True, quality_crop={bool(quality_crop_enabled_tile)}, altaz_cleanup={bool(altaz_cleanup_enabled)}",
+       prog=None,
+       lvl="INFO_DETAIL",
    )
    ```
 
-   Notes:
+2. Ensure these logs are present in `zemosaic_worker.log` for all tiles in a classic run.
 
-   * Keep all other arguments exactly as they currently are (two-pass, WCS, coverage, telemetry, etc.).
-   * You may keep the `enable_final_lecropper` / `enable_final_master_crop` variables if they are used elsewhere (e.g. for SDS or other modes), but **do not** use them for this specific call in the classic / non-grid path.
+3. After running a classic mosaic on a known test project:
 
-4. Do **not** change the call site(s) of `_apply_phase5_post_stack_pipeline` that are specific to **SDS** or **Grid Mode**, unless they already share this common code path and a change would clearly break their behaviour.
+   * Confirm that `MT_CROP: quality-based rect=...` and `MT_PIPELINE: lecropper_applied=True...` appear for each tile.
+   * Visually inspect the mosaic to verify that:
 
-5. Ensure that after this call, any `collected_tiles_for_second_pass` cleanup (like `.clear()`) still happens as in the current code.
-
----
-
-## Task 2 – Keep final RGB equalisation disabled
-
-### Goal
-
-Ensure that the final RGB equalisation step on the mosaic remains **disabled**.
-
-### Steps
-
-1. In `zemosaic_worker.py`, locate the block that calls `_apply_final_mosaic_rgb_equalization(...)` (around lines 6778–6796 in the user’s version).
-
-2. This block has already been commented out by the user.
-   Leave it **commented** / disabled.
-
-3. Do **not** add any new calls to `_apply_final_mosaic_rgb_equalization` in this mission.
-
-4. The helper function `_apply_final_mosaic_rgb_equalization` can stay in the file, untouched, for potential future use.
-
----
-
-## Task 3 – Sanity checks
-
-### Goal
-
-Make sure the project still runs and that the classic mosaic no longer has a strong green cast.
-
-### Steps
-
-1. Verify that `zemosaic_worker.py` imports still succeed (no unused-variable errors that break flake/mypy if such checks exist).
-
-2. Run a classic (non-grid) mosaic generation using the same project that previously produced a green-tinted image.
-
-3. Confirm:
-
-   * No `[RGB-EQ] final mosaic` logs are emitted (because the final RGB eq is disabled).
-   * Phase 5 logs still show the two-pass / coverage steps executing.
-   * The resulting mosaic has:
-
-     * Normal colour balance (no global green cast),
-     * Similar appearance to the output produced by `zemosaic_worker_non grid_ok.py`.
-
-4. If Grid Mode or SDS modes are exercised, they **must still work** as before.
+     * The global green cast has disappeared or is significantly reduced,
+     * Background looks similar to the result produced by `zemosaic_worker_non grid_ok.py`.
 
 ---
 
 ## Acceptance criteria
 
-* [x] In `zemosaic_worker.py`, the Phase 5 post-stack pipeline call for the classic / non-grid path uses:
+* [ ] In classic / non-grid mode, **every master tile** goes through `_apply_lecropper_pipeline(...)` with a `pipeline_cfg` equivalent to the reference worker.
+* [ ] Alt-az cleanup + quality crop are correctly applied and logged for master tiles in classic mode.
+* [ ] Final mosaic RGB equalisation remains disabled (no `[RGB-EQ] final mosaic` logs).
+* [ ] Phase 5 for classic mode does **not** reapply lecropper or master-tile crop on the final mosaic.
+* [ ] The final classic mosaic has a **normal colour balance**, with no strong green cast, and visually matches the reference behaviour.
+* [ ] Grid Mode and SDS remain functional without regression.
 
-  * `enable_lecropper_pipeline=False`
-  * `enable_master_tile_crop=False`
-  * with all other arguments unchanged.
-* [x] The final RGB equalisation call remains disabled.
-* [ ] The classic (non-grid) mosaic output no longer shows a strong green cast and visually matches (or is very close to) the reference behaviour of `zemosaic_worker_non grid_ok.py`.
-* [ ] Grid Mode and SDS modes continue to work without regression.
 
