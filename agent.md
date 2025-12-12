@@ -1,76 +1,73 @@
-# Mission: Fix ETA + Progress bar in SDS (SupADupStack) mode only
-
-## High-level goal
-In ZeMosaic GUI (Tk + Qt), fix the ETA display and the global progress bar behavior when running SDS (SupADupStack).
-Symptoms:
-- Progress bar can stay around ~75% even when the run is finishing (phase 6/7 or 7/7).
-- ETA can show 00:00:00 while the run is still active / not fully completed.
-- The log shows ETA_UPDATE and PHASE_UPDATE events are emitted, plus a structured STATS_UPDATE payload, but GUI does not reflect correct global progress/ETA.
+# Mission: Fix SDS (SupaDupStack) GUI progress/ETA/tile counter (Qt + Tk parity)
 
 ## Scope (STRICT)
-- Only fix SDS progress + ETA reporting.
-- Do NOT change the classic pipeline progress behavior.
-- Do NOT modify GPU/CPU compute paths, stacking logic, nor any photometric/color/crop logic.
-- No refactor “for style”. Minimal, surgical changes.
+- Only modify SDS/SupaDupStack progress tracking & display logic.
+- Do NOT change classic pipeline, grid mode, or any non-SDS progress behavior.
+- Do NOT change stacking, reprojection, GPU helpers, or worker compute logic: GUI-only fix.
+- Keep behavior “batch size = 0” and “batch size > 1” untouched.
 
-## Evidence from logs (do not ignore)
-Worker emits:
-- `PHASE_UPDATE:<int>` events, including phase 7 cleanup.  
-- `RAW_FILE_COUNT_UPDATE:<done>/<total>` during phase 1 preprocessing.
-- `ETA_UPDATE:HH:MM:SS` frequently during processing.
-- `[CLÉ_POUR_GUI: STATS_UPDATE] (Args: {... phase_index, phase_name, files_done, files_total, tiles_total, ...})`
-These appear in the SDS logs and should drive UI updates.
+## Symptoms to fix (observed)
+1) In SDS runs, progress bar never reaches 100% (stuck ~75% even at P7 Cleanup).
+2) “Tiles: X/Y” is misleading in SDS: it shows per-super-tile frames (e.g. 6/6 or 10/10) instead of global raw count (e.g. 66).
+3) ETA becomes meaningless (especially during SDS phase 5 polish) because progress is not tracked within phases.
 
-## Strategy
-Implement a robust SDS-specific "global progress fraction" computation using structured worker signals (prefer `STATS_UPDATE` and fallback to RAW_FILE_COUNT_UPDATE/PHASE_UPDATE if needed), then feed it to the GUI progress bar consistently.
-
-### Requirements
-1) Add/ensure a single normalized metric in GUI: `global_progress_0_1` in [0..1] for SDS runs.
-2) ETA label must display latest ETA_UPDATE value whenever received (except after completion).
-3) Progress bar must:
-   - increase monotonically (never go backwards unless a new run starts),
-   - reach 100% at successful completion event,
-   - not freeze at an arbitrary fraction.
-
-### SDS progress model (proposed)
-Use a phase-weight model based on SDS phases:
-- Phase 1: preprocessing files_done/files_total
-- Phase 2..5: internal processing (unknown fine-grain) -> use phase_index weighting only
-- Phase 6: save -> treat as near completion (e.g. 0.97..0.995 window)
-- Phase 7: cleanup -> final (0.995..1.0)
-
-Implement as:
-- If in phase 1 and files_total>0: phase_progress = files_done/files_total
-- Else: phase_progress = 0 for that phase unless we have a better per-phase metric
-- global_progress = (phase_index-1 + phase_progress) / total_phases
-Where `total_phases` for SDS must be 7 (not hardcoded to classic count).
-Then clamp [0,1] and apply monotonic smoothing in GUI:
-`global_progress = max(previous_global_progress, global_progress)`.
-
-Important: this model is SDS-only.
-
-### Completion handling
-When worker sends run success event (e.g. `run_success_processing_completed`), force progress bar to 100% and keep ETA at 00:00:00. Before that, ETA must not be forced to zero.
+## Root cause (likely)
+GUI SDS global progress fraction only accounts for phase 1 files_done/files_total; other phases use phase_progress=0, so global_fraction saturates at (phase_index-1)/total_phases.
+If total_phases=8 => phase7 shows 6/8=75%.
+Also completion event never forces 100% in SDS.
 
 ## Files to modify
-- zemosaic_gui_qt.py (Qt UI: progress bar + ETA label update)
-- zemosaic_gui.py (Tk UI: progress bar + ETA label update)
-OPTIONAL (only if needed, minimal):
-- zemosaic_worker.py: if GUI cannot reliably detect SDS phase_count, emit a dedicated SDS meta event once, e.g. `[CLÉ_POUR_GUI: SDS_META] (Args: {'total_phases': 7})`
-But prefer fixing GUI using existing STATS_UPDATE/PHASE_UPDATE if possible.
+- zemosaic_gui_qt.py  (Qt GUI)
+- zemosaic_gui.py     (Tk GUI)  [keep parity]
 
-## Tests
-1) Run a small SDS dataset (like the example 66 files). Confirm:
-   - progress increments during phase 1 using RAW_FILE_COUNT_UPDATE + STATS_UPDATE
-   - progress continues after phase 1 (phase updates advance progress)
-   - progress reaches 100% at completion
-   - ETA updates live from ETA_UPDATE and does not lock to 00:00:00 prematurely
-2) Run classic pipeline once to ensure unchanged behavior (sanity check only).
+## Required behavior (Acceptance Criteria)
+A) In SDS mode, progress bar MUST hit 100% on successful completion (P7 done).
+B) In SDS mode, the top-right counter MUST display a consistent global counter aligned with other flows:
+   - show “Files: done/total” or reuse “Tiles:” label but it must be global (e.g. 66 total),
+     NOT the per-super-tile frames.
+C) ETA:
+   - During phases where progress cannot be estimated (especially SDS Phase 5 polish),
+     show a neutral ETA (e.g. “--:--:--”) and do not “count upward/negative”.
+   - When run completes successfully, ETA must become 00:00:00.
+D) Non-SDS runs must remain identical.
 
-## Deliverables
-- Minimal patch implementing SDS-only progress/ETA correctness for both GUI frontends.
-- No behavior change in classic mode.
-- Add a short inline comment explaining SDS phase_count=7 and why.
+## Implementation plan (high-level)
+1) Identify SDS detection and tracking fields:
+   - _sds_progress_active, _sds_current_phase_index, _sds_files_done/_total,
+     _sds_phase_done/_total (phase4 global coadd), _sds_completed, etc.
 
-## Status
-- [x] SDS progress and ETA wiring updated per mission scope.
+2) Fix SDS total phase count:
+   - Ensure _sds_total_phases matches actual SDS phases (1..7) unless there is a real phase 0/8.
+   - Avoid 8-phases if it causes 75% cap.
+
+3) Make _compute_sds_progress_fraction handle multiple phases:
+   - Phase 1: keep current logic (files_done/files_total).
+   - Phase 4: when p4_global_coadd_progress is active, use _sds_phase_done/_sds_phase_total.
+   - Phase 5: treat as indeterminate:
+       - do not try to compute phase_progress from time.
+       - keep progress monotonic, but do not update ETA based on it.
+       - mark phase 5 complete when we enter phase 6 (run_info_phase6_started) or receive sds_global_finalize_done.
+   - Phase 6/7: treat as quick deterministic phases:
+       - mark phase complete on corresponding “finished”/success keys
+         (run_success_mosaic_saved, run_success_preview_saved, processing completed, etc.)
+
+4) Force completion:
+   - On the GUI event indicating success completion (whatever key already used),
+     set _sds_completed=True and call _apply_sds_progress(1.0) (100%).
+   - Also reset ETA display to 00:00:00.
+
+5) Fix counter display:
+   - When SDS is active, override the “Tiles:” display to show global files_done/files_total (e.g. 66),
+     not per-batch counts.
+   - Keep the existing per-batch info in the log area only (optional).
+
+6) Keep parity:
+   - Apply same conceptual fix to both Qt and Tk implementations.
+
+## Testing (manual)
+- Run SDS on sample with total raw frames = 66 and mega_tiles ~ 7.
+- Verify:
+  - progress reaches 100% at end;
+  - “Files/Tiles” counter shows x/66 throughout;
+  - ETA is stable; phase 5 shows “--:--:--” (or equivalent) and does not mislead;
+  - classic mode unchanged.
