@@ -44,7 +44,7 @@ Since changing Phase 5 and disabling final RGB-EQ had **no visible effect**, the
 
 ## What remains to be done
 
-1. **Align master-tile lecropper pipeline with the reference worker**, focusing on:
+1. [x] **Align master-tile lecropper pipeline with the reference worker**, focusing on:
 
    - `pipeline_cfg` contents (keys and types):
      - `quality_crop_enabled`
@@ -58,18 +58,18 @@ Since changing Phase 5 and disabling final RGB-EQ had **no visible effect**, the
      - `altaz_nanize`
    - Ensuring master tiles always call `_apply_lecropper_pipeline(...)` in classic mode, without accidental short-circuit.
 
-2. Ensure that any per-tile flags (`quality_crop_enabled_tile`, `quality_gate_enabled_tile`, etc.):
+2. [x] Ensure that any per-tile flags (`quality_crop_enabled_tile`, `quality_gate_enabled_tile`, etc.):
 
    - Default to the **global config** in classic mode,
    - Do not silently disable the lecropper pipeline unless explicitly required.
 
-3. Add a clear log line at the end of `create_master_tile(...)` summarising:
+3. [x] Add a clear log line at the end of `create_master_tile(...)` summarising:
 
    - `lecropper_applied` (True/False),
    - `quality_crop_enabled_tile`,
    - `altaz_cleanup_enabled`.
 
-4. After implementing this, run a classic test and confirm:
+4. [ ] After implementing this, run a classic test and confirm:
 
    - Logs show `lecropper_applied=True` for all master tiles.
    - The mosaic background / colour is back to a normal, neutral look.

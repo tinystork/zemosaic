@@ -9841,8 +9841,8 @@ def create_master_tile(
         pcb_tile(f"{func_id_log_base}_error_no_images_provided", prog=None, lvl="ERROR", tile_id=tile_id)
         return (None, None), failed_groups_to_retry
 
-    quality_crop_enabled_tile = bool(quality_crop_enabled)
-    quality_gate_enabled_tile = bool(quality_gate_enabled)
+    quality_crop_enabled_effective = bool(quality_crop_enabled)
+    quality_gate_enabled_effective = bool(quality_gate_enabled)
     min_safe_stack_effective = max(1, int(min_safe_stack_size))
     target_stack_effective = max(min_safe_stack_effective, int(target_stack_size))
 
@@ -10001,18 +10001,17 @@ def create_master_tile(
         return (None, None), failed_groups_to_retry
 
     n_used_for_stack = len(valid_aligned_images)
-    if n_used_for_stack < min_safe_stack_effective:
-        quality_gate_enabled_tile = False
-        quality_crop_enabled_tile = False
+    salvage_mode = n_used_for_stack < min_safe_stack_effective
+    if salvage_mode:
         pcb_tile(
-            f"Tile {tile_id}: salvage mode (n={n_used_for_stack}). Relaxing QC and crop.",
+            f"Tile {tile_id}: salvage mode (n={n_used_for_stack}). Proceeding with standard QC and crop.",
             prog=None,
             lvl="WARN",
         )
         try:
             if logger:
                 logger.warning(
-                    "Tile %s: salvage mode (n=%d). Relaxing QC and crop.",
+                    "Tile %s: salvage mode (n=%d). Proceeding with standard QC and crop.",
                     str(tile_id),
                     n_used_for_stack,
                 )
@@ -10141,7 +10140,7 @@ def create_master_tile(
                 )
 
     quality_crop_rect: tuple[int, int, int, int] | None = None
-    if quality_crop_enabled_tile:
+    if quality_crop_enabled_effective:
         try:
             band_px = max(4, int(quality_crop_band_px))
         except Exception:
@@ -10267,7 +10266,7 @@ def create_master_tile(
             )
 
     pipeline_cfg = {
-        "quality_crop_enabled": quality_crop_enabled_tile,
+        "quality_crop_enabled": quality_crop_enabled_effective,
         "quality_crop_band_px": quality_crop_band_px,
         "quality_crop_k_sigma": quality_crop_k_sigma,
         "quality_crop_margin_px": quality_crop_margin_px,
@@ -10306,7 +10305,7 @@ def create_master_tile(
     quality_gate_eval: Optional[dict[str, Any]] = _evaluate_quality_gate_metrics(
         tile_id,
         master_tile_stacked_HWC,
-        enabled=quality_gate_enabled_tile,
+        enabled=quality_gate_enabled_effective,
         threshold=quality_gate_threshold,
         edge_band=quality_gate_edge_band_px,
         k_sigma=quality_gate_k_sigma,
@@ -10315,6 +10314,19 @@ def create_master_tile(
         alpha_mask=alpha_mask_for_quality,
         alpha_soft_threshold=QUALITY_GATE_ALPHA_SOFT_THRESHOLD,
     )
+
+    try:
+        pcb_tile(
+            "MT_PIPELINE: lecropper_applied=True, "
+            f"quality_crop={bool(quality_crop_enabled_effective)}, "
+            f"altaz_cleanup={bool(altaz_cleanup_enabled)}, "
+            f"quality_gate={bool(quality_gate_enabled_effective)}, "
+            f"salvage_mode={bool(salvage_mode)}",
+            prog=None,
+            lvl="INFO_DETAIL",
+        )
+    except Exception:
+        pass
 
     # pcb_tile(f"{func_id_log_base}_info_saving_started", prog=None, lvl="DEBUG_DETAIL", tile_id=tile_id)
     output_temp_dir_path = Path(output_temp_dir).expanduser()
