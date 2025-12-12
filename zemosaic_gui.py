@@ -518,7 +518,7 @@ class ZeMosaicGUI:
         self._gpu_eta_override = None
         self._gpu_helper_active = None
         self._sds_progress_active = False
-        self._sds_total_phases = 7  # SDS pipeline emits 7 1-based phases
+        self._sds_total_phases = 7  # SDS phases: 1=Preprocess, 2=Cluster, 3=MasterTiles, 4=GlobalCoadd, 5=Polish, 6=Save, 7=Cleanup
         self._sds_current_phase_index = 0
         self._sds_files_done = 0
         self._sds_files_total = 0
@@ -528,6 +528,7 @@ class ZeMosaicGUI:
         self._sds_phase_active = False
         self._sds_phase_done = 0
         self._sds_phase_total = 0
+        self._sds_phase_progress: Dict[int, float] = {}
         gpu_eta_profiles = self.config.get("gpu_eta_profiles")
         if not isinstance(gpu_eta_profiles, dict):
             gpu_eta_profiles = {}
@@ -2868,9 +2869,14 @@ class ZeMosaicGUI:
             if message_key_or_raw.startswith("ETA_UPDATE:"):
                 eta_string_from_worker = message_key_or_raw.split(":", 1)[1]
                 if hasattr(self, 'eta_var') and self.eta_var:
+                    neutral_eta = False
+                    if self._sds_progress_active:
+                        neutral_eta = self._update_sds_eta_placeholder(self._sds_current_phase_index or 1)
                     def update_eta_label():
                         if hasattr(self.eta_var,'set') and callable(self.eta_var.set):
                             try:
+                                if neutral_eta:
+                                    return
                                 if self._sds_progress_active and not self._sds_completed:
                                     self._sds_last_eta_str = eta_string_from_worker
                                 self.eta_var.set(eta_string_from_worker)
@@ -2902,11 +2908,13 @@ class ZeMosaicGUI:
                     if sds_active:
                         fraction = self._compute_sds_progress_fraction(phase_idx_val, files_done_int, files_total_int)
                         self._apply_sds_progress(fraction)
+                        self._update_sds_tiles_counter()
                     phase_name_val = payload.get("phase_name")
                     if sds_active and isinstance(phase_name_val, str) and phase_name_val.strip():
                         self._set_phase_label_text(phase_name_val.split(":", 1)[0].strip())
                     eta_seconds_val = payload.get("eta_seconds")
-                    if sds_active and isinstance(eta_seconds_val, (int, float)) and eta_seconds_val >= 0 and not self._sds_completed:
+                    neutral_eta = self._update_sds_eta_placeholder(phase_idx_val or (self._sds_current_phase_index or 1))
+                    if sds_active and isinstance(eta_seconds_val, (int, float)) and eta_seconds_val >= 0 and not self._sds_completed and not neutral_eta:
                         eta_text = format_eta_hms(eta_seconds_val)
                         self._sds_last_eta_str = eta_text
                         self._set_eta_label(eta_text)
@@ -3023,6 +3031,7 @@ class ZeMosaicGUI:
                         self._sds_current_phase_index, cur_val, tot_val
                     )
                     self._apply_sds_progress(fraction)
+                    self._update_sds_tiles_counter()
                 is_control_message = True
             # --- FIN AJOUT ---
         
@@ -3035,6 +3044,17 @@ class ZeMosaicGUI:
 
         if is_control_message:
             return # Ne pas traiter plus loin ces messages de contrôle
+
+        if isinstance(message_key_or_raw, str):
+            normalized_key = message_key_or_raw.strip()
+            if normalized_key in {"sds_global_finalize_done", "run_info_phase6_started"}:
+                self._mark_sds_phase_complete(5, advance_to=6)
+            elif normalized_key == "run_success_mosaic_saved" or normalized_key.startswith("run_success_preview_saved"):
+                self._mark_sds_phase_complete(6, advance_to=7)
+            elif normalized_key == "run_success_processing_completed":
+                self._sds_completed = True
+                self._apply_sds_progress(1.0)
+                self._set_eta_label("00:00:00", force=True)
 
         if isinstance(message_key_or_raw, str):
             if message_key_or_raw == "global_coadd_info_helper_path":
@@ -3862,6 +3882,7 @@ class ZeMosaicGUI:
         self.on_worker_progress("phase4_grid", done_val, total_val)
         label = self._format_sds_phase_label(done_val, total_val)
         self._set_phase_label_text(label)
+        self._apply_sds_progress(self._compute_sds_progress_fraction(4, None, None))
 
     def _handle_sds_global_coadd_finished(self, payload: MutableMapping[str, Any]) -> None:
         if not isinstance(payload, MutableMapping):
@@ -3883,6 +3904,7 @@ class ZeMosaicGUI:
         label = self._format_sds_phase_label(total_val, total_val)
         self._set_phase_label_text(label)
         self._sds_phase_active = False
+        self._apply_sds_progress(self._compute_sds_progress_fraction(4, None, None))
 
     def _maybe_detect_sds(self, payload: MutableMapping[str, Any]) -> bool:
         if self._sds_progress_active:
@@ -3911,7 +3933,7 @@ class ZeMosaicGUI:
             current_phase = phase_index
             self._sds_current_phase_index = current_phase
 
-        phase_progress = 0.0
+        phase_progress = self._sds_phase_progress.get(current_phase, 0.0)
         if current_phase == 1:
             total_val = files_total if isinstance(files_total, int) else self._sds_files_total
             done_val = files_done if isinstance(files_done, int) else self._sds_files_done
@@ -3923,10 +3945,55 @@ class ZeMosaicGUI:
                 self._sds_files_total = total_val_int
                 self._sds_files_done = done_val_int
                 phase_progress = done_val_int / float(total_val_int)
+                self._sds_phase_progress[current_phase] = phase_progress
+        elif current_phase == 4:
+            total_val = self._sds_phase_total
+            done_val = self._sds_phase_done
+            if isinstance(total_val, int) and total_val > 0:
+                total_val_int = max(1, total_val)
+                done_val_int = max(0, min(int(done_val), total_val_int))
+                self._sds_phase_progress[current_phase] = done_val_int / float(total_val_int)
+                phase_progress = self._sds_phase_progress[current_phase]
+        else:
+            phase_progress = max(0.0, min(1.0, phase_progress))
 
         global_fraction = ((current_phase - 1) + phase_progress) / float(total_phases)
         global_fraction = max(0.0, min(1.0, global_fraction))
         return max(self._sds_global_progress_0_1, global_fraction)
+
+    def _mark_sds_phase_complete(self, phase_index: int, *, advance_to: Optional[int] = None) -> None:
+        if phase_index <= 0:
+            return
+        self._sds_progress_active = True
+        self._sds_phase_progress[phase_index] = 1.0
+        target_phase = advance_to if isinstance(advance_to, int) and advance_to > 0 else phase_index
+        if target_phase > (self._sds_current_phase_index or 0):
+            self._sds_current_phase_index = target_phase
+        fraction = self._compute_sds_progress_fraction(target_phase, None, None)
+        self._apply_sds_progress(fraction)
+
+    def _update_sds_eta_placeholder(self, current_phase: int) -> bool:
+        if self._sds_progress_active and not self._sds_completed and current_phase == 5:
+            neutral_eta = self._tr("initial_eta_value", "--:--:--")
+            self._set_eta_label(neutral_eta, force=True)
+            return True
+        return False
+
+    def _update_sds_tiles_counter(self) -> None:
+        if not self._sds_progress_active:
+            return
+        total_val = self._sds_files_total
+        done_val = self._sds_files_done
+        if isinstance(total_val, int) and total_val > 0:
+            done_val = max(0, min(done_val, total_val))
+            if hasattr(self, "master_tile_count_var"):
+                self.master_tile_count_var.set(f"{done_val} / {total_val}")
+        elif isinstance(done_val, int) and done_val > 0:
+            if hasattr(self, "master_tile_count_var"):
+                self.master_tile_count_var.set(str(done_val))
+        else:
+            if hasattr(self, "master_tile_count_var"):
+                self.master_tile_count_var.set(self._tr("qt_progress_count_placeholder", "0 / 0"))
 
     def _apply_sds_progress(self, fraction: float) -> None:
         bounded = max(self._sds_global_progress_0_1, max(0.0, min(1.0, fraction)))
