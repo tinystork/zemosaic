@@ -13699,6 +13699,8 @@ def run_hierarchical_mosaic_classic_legacy(
     filtered_header_items: list[dict] | None = None,
     early_filter_enabled: bool | None = None,
     final_mosaic_rgb_equalize_enabled_config: bool | None = None,
+    final_mosaic_black_point_equalize_enabled: bool | None = None,
+    final_mosaic_black_point_percentile: float | None = None,
 ):
     """
     Legacy classic (non-grid, non-SDS) hierarchical mosaic pipeline.
@@ -17424,6 +17426,8 @@ def run_hierarchical_mosaic(
     filtered_header_items: list[dict] | None = None,
     early_filter_enabled: bool | None = None,
     final_mosaic_rgb_equalize_enabled_config: bool | None = None,
+    final_mosaic_black_point_equalize_enabled_config: bool | None = None,
+    final_mosaic_black_point_percentile_config: float | None = None,
 ):
     """
     Orchestre le traitement de la mosaïque hiérarchique.
@@ -17496,6 +17500,43 @@ def run_hierarchical_mosaic(
         final_mosaic_rgb_equalize_enabled = False
     final_mosaic_rgb_equalize_enabled = bool(final_mosaic_rgb_equalize_enabled)
     setattr(zconfig, "final_mosaic_rgb_equalize_enabled", final_mosaic_rgb_equalize_enabled)
+
+    final_mosaic_black_point_equalize_enabled = _coerce_bool_flag(
+        final_mosaic_black_point_equalize_enabled_config
+    )
+    if final_mosaic_black_point_equalize_enabled is None:
+        final_mosaic_black_point_equalize_enabled = _coerce_bool_flag(
+            worker_config_cache.get("final_mosaic_black_point_equalize_enabled")
+        )
+    if final_mosaic_black_point_equalize_enabled is None:
+        final_mosaic_black_point_equalize_enabled = False
+    final_mosaic_black_point_equalize_enabled = bool(final_mosaic_black_point_equalize_enabled)
+    setattr(zconfig, "final_mosaic_black_point_equalize_enabled", final_mosaic_black_point_equalize_enabled)
+
+    try:
+        final_mosaic_black_point_percentile = float(
+            final_mosaic_black_point_percentile_config
+        )
+    except (ValueError, TypeError):
+        final_mosaic_black_point_percentile = None
+
+    if final_mosaic_black_point_percentile is None:
+        try:
+            final_mosaic_black_point_percentile = float(
+                worker_config_cache.get("final_mosaic_black_point_percentile")
+            )
+        except (ValueError, TypeError):
+            final_mosaic_black_point_percentile = 0.1
+
+    if not (
+        isinstance(final_mosaic_black_point_percentile, (int, float))
+        and math.isfinite(final_mosaic_black_point_percentile)
+    ):
+        final_mosaic_black_point_percentile = 0.1
+    final_mosaic_black_point_percentile = float(
+        max(0.0, min(100.0, final_mosaic_black_point_percentile))
+    )
+    setattr(zconfig, "final_mosaic_black_point_percentile", final_mosaic_black_point_percentile)
 
     grid_mode_detected = detect_grid_mode(input_folder)
     if grid_mode_detected:
@@ -17674,6 +17715,8 @@ def run_hierarchical_mosaic(
             filtered_header_items=filtered_header_items,
             early_filter_enabled=early_filter_enabled,
             final_mosaic_rgb_equalize_enabled_config=final_mosaic_rgb_equalize_enabled_config,
+            final_mosaic_black_point_equalize_enabled=final_mosaic_black_point_equalize_enabled,
+            final_mosaic_black_point_percentile=final_mosaic_black_point_percentile,
         )
 
     try:
