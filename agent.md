@@ -1,66 +1,73 @@
-# Mission: Fix SDS GPU fallback (CuPy missing nanpercentile/nanquantile) WITHOUT touching other pipelines
+# Mission: Fix ETA + Progress bar in SDS (SupADupStack) mode only
 
 ## High-level goal
-Restore GPU path for SDS / SupaDupStack (mega-tile pipeline) by removing the hard dependency on `cupy.nanpercentile` / `cupy.nanquantile`.
+In ZeMosaic GUI (Tk + Qt), fix the ETA display and the global progress bar behavior when running SDS (SupADupStack).
+Symptoms:
+- Progress bar can stay around ~75% even when the run is finishing (phase 6/7 or 7/7).
+- ETA can show 00:00:00 while the run is still active / not fully completed.
+- The log shows ETA_UPDATE and PHASE_UPDATE events are emitted, plus a structured STATS_UPDATE payload, but GUI does not reflect correct global progress/ETA.
 
-The current run falls back to CPU with:
-- "module 'cupy' has no attribute 'nanpercentile'"
-- then "CuPy missing nanpercentile/nanquantile"
-This must be fixed so the GPU helper route does not fail on systems where CuPy lacks these functions.
+## Scope (STRICT)
+- Only fix SDS progress + ETA reporting.
+- Do NOT change the classic pipeline progress behavior.
+- Do NOT modify GPU/CPU compute paths, stacking logic, nor any photometric/color/crop logic.
+- No refactor “for style”. Minimal, surgical changes.
 
-## Non-goals / strict constraints
-- DO NOT modify classic pipeline behavior.
-- DO NOT modify grid mode behavior.
-- DO NOT refactor unrelated code or change algorithms outside SDS helper compatibility.
-- Keep changes minimal and localized.
-- Do not change batch-size semantics (especially the known-good behavior “batch size = 0” and “batch size > 1”).
+## Evidence from logs (do not ignore)
+Worker emits:
+- `PHASE_UPDATE:<int>` events, including phase 7 cleanup.  
+- `RAW_FILE_COUNT_UPDATE:<done>/<total>` during phase 1 preprocessing.
+- `ETA_UPDATE:HH:MM:SS` frequently during processing.
+- `[CLÉ_POUR_GUI: STATS_UPDATE] (Args: {... phase_index, phase_name, files_done, files_total, tiles_total, ...})`
+These appear in the SDS logs and should drive UI updates.
 
-## Where the bug is
-`zemosaic_utils._sds_cp_nanpercentile()` currently:
-- uses `cp.nanpercentile` if present
-- else uses `cp.nanquantile` if present
-- else raises RuntimeError("CuPy missing nanpercentile/nanquantile")
-On some installations, CuPy lacks both -> GPU helper raises -> worker falls back to CPU.
+## Strategy
+Implement a robust SDS-specific "global progress fraction" computation using structured worker signals (prefer `STATS_UPDATE` and fallback to RAW_FILE_COUNT_UPDATE/PHASE_UPDATE if needed), then feed it to the GUI progress bar consistently.
 
-## Required fix
-- [x] Implement a **third fallback** in `_sds_cp_nanpercentile()`:
-  - If both `nanpercentile` and `nanquantile` are missing, compute NaN-ignoring percentiles using CuPy primitives (no NumPy fallback).
-  - Must support scalar percentile (float) and small percentile arrays (e.g., two values for winsorization).
-  - Must support `axis=0` (this is the SDS winsorized path use case).
+### Requirements
+1) Add/ensure a single normalized metric in GUI: `global_progress_0_1` in [0..1] for SDS runs.
+2) ETA label must display latest ETA_UPDATE value whenever received (except after completion).
+3) Progress bar must:
+   - increase monotonically (never go backwards unless a new run starts),
+   - reach 100% at successful completion event,
+   - not freeze at an arbitrary fraction.
 
-Suggested algorithm (NaN-safe percentile via sort):
-1. Let `x = arr_gpu`.
-2. Build `finite = cp.isfinite(x)`.
-3. Replace non-finite values with `+inf` so they sort to the end: `x2 = cp.where(finite, x, cp.inf)`.
-4. Sort along `axis=0`: `xs = cp.sort(x2, axis=axis)`.
-5. Count finite per pixel: `cnt = cp.sum(finite, axis=axis)`.
-6. Compute index k per pixel for percentile p:
-   - k = floor((p/100) * (cnt-1)) clipped to [0, max(cnt-1,0)]
-7. Use `cp.take_along_axis(xs, k[None,...], axis=0)` to gather.
-8. For `cnt==0`, return 0.0 (or cp.nan then later caller nan_to_num; pick what matches current behavior best).
+### SDS progress model (proposed)
+Use a phase-weight model based on SDS phases:
+- Phase 1: preprocessing files_done/files_total
+- Phase 2..5: internal processing (unknown fine-grain) -> use phase_index weighting only
+- Phase 6: save -> treat as near completion (e.g. 0.97..0.995 window)
+- Phase 7: cleanup -> final (0.995..1.0)
 
-Edge cases:
-- Works when cnt==1
-- Works when many NaNs
-- Must not crash if `cp.errstate` is missing (use existing `_xp_errstate()` patterns elsewhere; do not introduce new cp.errstate usage).
+Implement as:
+- If in phase 1 and files_total>0: phase_progress = files_done/files_total
+- Else: phase_progress = 0 for that phase unless we have a better per-phase metric
+- global_progress = (phase_index-1 + phase_progress) / total_phases
+Where `total_phases` for SDS must be 7 (not hardcoded to classic count).
+Then clamp [0,1] and apply monotonic smoothing in GUI:
+`global_progress = max(previous_global_progress, global_progress)`.
+
+Important: this model is SDS-only.
+
+### Completion handling
+When worker sends run success event (e.g. `run_success_processing_completed`), force progress bar to 100% and keep ETA at 00:00:00. Before that, ETA must not be forced to zero.
 
 ## Files to modify
-- [x] `zemosaic_utils.py` (only): implement the extra fallback in `_sds_cp_nanpercentile()`.
+- zemosaic_gui_qt.py (Qt UI: progress bar + ETA label update)
+- zemosaic_gui.py (Tk UI: progress bar + ETA label update)
+OPTIONAL (only if needed, minimal):
+- zemosaic_worker.py: if GUI cannot reliably detect SDS phase_count, emit a dedicated SDS meta event once, e.g. `[CLÉ_POUR_GUI: SDS_META] (Args: {'total_phases': 7})`
+But prefer fixing GUI using existing STATS_UPDATE/PHASE_UPDATE if possible.
 
-## Acceptance criteria
-- SDS run no longer falls back to CPU due to nanpercentile/nanquantile missing.
-- GPU helper route (gpu_reproject) completes at least on the provided small example (10 frames / 3 channels).
-- No behavior changes in classic mode and grid mode.
-
-## Logging (minimal)
-- If using third fallback, optionally log once at DEBUG level (guarded) like:
-  "CuPy lacks nanpercentile/nanquantile -> using SDS sort-based nanpercentile fallback"
-Do not spam per-chunk.
-
-## Manual test
-Run the same example that currently triggers fallback and verify logs no longer show:
-- gpu_fallback_runtime_error with nanpercentile/nanquantile
-and verify GPU path is used.
+## Tests
+1) Run a small SDS dataset (like the example 66 files). Confirm:
+   - progress increments during phase 1 using RAW_FILE_COUNT_UPDATE + STATS_UPDATE
+   - progress continues after phase 1 (phase updates advance progress)
+   - progress reaches 100% at completion
+   - ETA updates live from ETA_UPDATE and does not lock to 00:00:00 prematurely
+2) Run classic pipeline once to ensure unchanged behavior (sanity check only).
 
 ## Deliverables
-- [x] One commit with message: "Fix SDS GPU nanpercentile fallback"
+- Minimal patch implementing SDS-only progress/ETA correctness for both GUI frontends.
+- No behavior change in classic mode.
+- Add a short inline comment explaining SDS phase_count=7 and why.
