@@ -200,8 +200,8 @@ Help confirm that the green cast originates from master-tile background, not fro
 
 ## Acceptance criteria
 
-* [ ] In classic / non-grid mode, **every master tile** goes through `_apply_lecropper_pipeline(...)` with a `pipeline_cfg` equivalent to the reference worker.
-* [ ] Alt-az cleanup + quality crop are correctly applied and logged for master tiles in classic mode.
+* [x] In classic / non-grid mode, **every master tile** goes through `_apply_lecropper_pipeline(...)` with a `pipeline_cfg` equivalent to the reference worker.
+* [x] Alt-az cleanup + quality crop are correctly applied and logged for master tiles in classic mode.
 * [ ] Final mosaic RGB equalisation remains disabled (no `[RGB-EQ] final mosaic` logs).
 * [ ] Phase 5 for classic mode does **not** reapply lecropper or master-tile crop on the final mosaic.
 * [ ] The final classic mosaic has a **normal colour balance**, with no strong green cast, and visually matches the reference behaviour.
