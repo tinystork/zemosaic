@@ -13753,27 +13753,6 @@ def run_hierarchical_mosaic_classic_legacy(
         """Shortcut to emit log+callback events with the current progress callback."""
         _log_and_callback(msg_key, prog, lvl, callback=progress_callback, **kwargs)
 
-    def _coerce_bool_flag(value) -> bool | None:
-        """Interpret various truthy/falsy representations coming from configs/UI."""
-        if value is None:
-            return None
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            return value != 0
-        if isinstance(value, str):
-            normalized = value.strip().lower()
-            if not normalized:
-                return None
-            if normalized in {"1", "true", "yes", "on", "enable", "enabled"}:
-                return True
-            if normalized in {"0", "false", "no", "off", "disable", "disabled"}:
-                return False
-        try:
-            return bool(value)
-        except Exception:
-            return None
-
     global_wcs_plan = _prepare_global_wcs_plan(
         output_folder,
         worker_config_cache,
