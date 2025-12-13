@@ -4734,17 +4734,28 @@ def _stable_image_key(entry: Any) -> str:
 def _extract_center_tuple(entry: Any) -> Optional[tuple[float, float]]:
     """Extract an approximate 2D center (RA/DEC or XY) from an entry."""
 
+    def _coerce_pair(x_val: Any, y_val: Any) -> Optional[tuple[float, float]]:
+        try:
+            x_f = float(x_val)
+            y_f = float(y_val)
+            if math.isfinite(x_f) and math.isfinite(y_f):
+                return (x_f, y_f)
+        except Exception:
+            return None
+        return None
+
     if isinstance(entry, dict):
+        for key_x, key_y in (("center_ra_deg", "center_dec_deg"), ("center_ra", "center_dec")):
+            if key_x in entry or key_y in entry:
+                center = _coerce_pair(entry.get(key_x), entry.get(key_y))
+                if center is not None:
+                    return center
+
         ra = entry.get("RA") if "RA" in entry else entry.get("ra")
         dec = entry.get("DEC") if "DEC" in entry else entry.get("dec")
-        try:
-            if ra is not None and dec is not None:
-                ra_f = float(ra)
-                dec_f = float(dec)
-                if math.isfinite(ra_f) and math.isfinite(dec_f):
-                    return (ra_f, dec_f)
-        except Exception:
-            pass
+        center_pair = _coerce_pair(ra, dec)
+        if center_pair is not None:
+            return center_pair
 
         for key in ("center", "phase0_center"):
             center_obj = entry.get(key)
@@ -4825,12 +4836,16 @@ def apply_borrowing_v1(
         "border_candidate_images_total": 0,
         "per_group": [],
         "examples": [],
+        "valid_image_centers": 0,
+        "valid_group_centers": 0,
     }
 
     if not BORROW_ENABLE or not isinstance(final_groups, list) or len(final_groups) < 2:
         return final_groups or [], stats
 
     centers_lookup: dict[str, tuple[float, float]] = {}
+    valid_image_centers = 0
+    valid_group_centers = 0
     if isinstance(image_centers, dict):
         for key, center in image_centers.items():
             try:
@@ -4864,12 +4879,14 @@ def apply_borrowing_v1(
             center = _resolve_center(entry, key)
             member_payloads.append((key, entry, center))
             if center is not None:
+                valid_image_centers += 1
                 centers.append(center)
         group_center: Optional[tuple[float, float]] = None
         if centers:
             mean_x = sum(c[0] for c in centers) / len(centers)
             mean_y = sum(c[1] for c in centers) / len(centers)
             group_center = (mean_x, mean_y)
+            valid_group_centers += 1
         radius = eps
         if group_center is not None and len(centers) >= 2:
             distances = [math.dist(center, group_center) for center in centers]
@@ -4877,6 +4894,14 @@ def apply_borrowing_v1(
         group_meta.append({"id": gid, "center": group_center, "radius": radius})
         initial_sizes[gid] = len(sorted_members)
         members_by_group[gid] = member_payloads
+
+    stats["valid_image_centers"] = valid_image_centers
+    stats["valid_group_centers"] = valid_group_centers
+    logger.debug(
+        "Borrowing v1: valid_image_centers=%d valid_group_centers=%d",
+        valid_image_centers,
+        valid_group_centers,
+    )
 
     for meta in group_meta:
         center_g = meta.get("center")
