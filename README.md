@@ -34,6 +34,155 @@ It was born out of a need from an astrophotography Discord community called the 
 
 ---
 
+## How It Works: ZeAnalyser & Grid Mode
+
+### ZeAnalyser: Frame Quality Analysis and Selection
+
+ZeAnalyser is the analysis engine used by ZeMosaic to evaluate the quality of individual frames before stacking.
+Its goal is simple: keep signal, reject noise and pathological frames, without requiring calibration files or manual tuning.
+
+For each input frame, ZeAnalyser computes a set of objective image quality metrics, such as:
+
+*   Star detection and count (robust to noise and gradients)
+*   Star shape statistics (eccentricity / elongation indicators)
+*   Global sharpness / structure metrics
+*   Noise and background behavior
+*   Optional SNR-related estimations
+
+These metrics are combined to:
+
+*   Reject unusable frames (e.g., tracking errors, clouds, severe blur)
+*   Weight or filter frames consistently across large datasets
+*   Ensure homogeneous data quality before stacking
+
+ZeAnalyser operates fully automatically and is designed to scale efficiently to tens of thousands of frames, making it suitable for long multi-night Seestar and traditional imaging sessions.
+
+### Grid Mode: Mosaic-First Processing Strategy
+
+Grid Mode introduces a mosaic-first approach, specifically designed for wide fields, large sky coverage, and datasets with variable overlap.
+
+Instead of stacking everything into a single reference frame, the field of view is divided into a regular grid of tiles. Each tile is processed independently before being reassembled into the final mosaic.
+
+Key steps in Grid Mode:
+
+1.  **Spatial Partitioning**
+    The sky coverage is divided into overlapping grid tiles. Each input frame contributes only to the tiles it actually covers.
+
+2.  **Local Analysis with ZeAnalyser**
+    ZeAnalyser is applied per tile, not globally. This allows for local quality decisions: a frame may be rejected in one tile but accepted in another. Local seeing, tracking, or distortion issues are handled naturally.
+
+3.  **Independent Tile Stacking**
+    Each tile is stacked using only frames validated for that tile. This improves local sharpness and signal consistency, while reducing edge artifacts and uneven coverage.
+
+4.  **Tile Cropping and Normalization**
+    Invalid or low-coverage borders are automatically trimmed. Tile intensity and background are normalized prior to reprojection.
+
+5.  **Final Mosaic Assembly**
+    All tiles are reprojected using WCS information. The final mosaic is assembled with consistent geometry and color behavior.
+
+### Why Grid Mode Matters
+
+Grid Mode solves several classic problems of wide-field and mosaic stacking:
+
+*   Uneven frame overlap
+*   Local tracking distortions
+*   Field rotation and edge degradation
+*   Quality variations across large datasets
+
+By combining ZeAnalyser’s per-frame analysis with Grid Mode’s spatially aware stacking, ZeMosaic achieves:
+
+*   Better local sharpness
+*   Reduced ghosting and duplication artifacts
+*   More stable mosaics on large or imperfect datasets
+*   A processing strategy that remains robust as dataset size grows
+
+### Design Philosophy
+
+ZeAnalyser and Grid Mode are intentionally designed to be:
+
+*   **Automatic** – minimal user tuning required
+*   **Deterministic** – same input, same output
+*   **Scalable** – from a few hundred to tens of thousands of frames
+*   **Instrument-agnostic** – optimized for Seestar but not limited to it
+
+Together, they form the backbone of ZeMosaic’s modern stacking pipeline.
+
+---
+
+## Fonctionnement : ZeAnalyser et Mode Grille (Français)
+
+### ZeAnalyser : Analyse et Sélection de la Qualité des Images
+
+ZeAnalyser est le moteur d'analyse utilisé par ZeMosaic pour évaluer la qualité de chaque image individuelle avant l'empilement. Son objectif est simple : conserver le signal, rejeter le bruit et les images inutilisables, sans nécessiter de fichiers de calibration ou de réglages manuels.
+
+Pour chaque image, ZeAnalyser calcule un ensemble de métriques objectives de qualité, telles que :
+
+*   Détection et comptage d'étoiles (robuste au bruit et aux gradients)
+*   Statistiques sur la forme des étoiles (indicateurs d'excentricité / d'élongation)
+*   Métrique globale de netteté / structure
+*   Analyse du bruit et du comportement du fond de ciel
+*   Estimations optionnelles liées au rapport Signal/Bruit (SNR)
+
+Ces métriques sont combinées pour :
+
+*   Rejeter les images inexploitables (ex: erreurs de suivi, nuages, flou important)
+*   Pondérer ou filtrer les images de manière cohérente sur de grands ensembles de données
+*   Assurer une qualité de données homogène avant l'empilement
+
+ZeAnalyser fonctionne de manière entièrement automatique et est conçu pour traiter efficacement des dizaines de milliers d'images, le rendant adapté aux longues sessions d'imagerie multi-nuits avec un Seestar ou un équipement traditionnel.
+
+### Mode Grille : Stratégie de Traitement « Mosaïque d'Abord »
+
+Le Mode Grille (Grid Mode) introduit une approche centrée sur la mosaïque, spécialement conçue pour les grands champs, les vastes couvertures célestes et les ensembles de données avec un chevauchement variable.
+
+Au lieu d'empiler toutes les images en une seule trame de référence, le champ de vision est divisé en une grille régulière de tuiles. Chaque tuile est traitée indépendamment avant d'être réassemblée dans la mosaïque finale.
+
+Étapes clés du Mode Grille :
+
+1.  **Partitionnement Spatial**
+    La couverture céleste est divisée en tuiles de grille qui se chevauchent. Chaque image ne contribue qu'aux tuiles qu'elle recouvre réellement.
+
+2.  **Analyse Locale avec ZeAnalyser**
+    ZeAnalyser est appliqué à chaque tuile individuellement, et non globalement. Cela permet des décisions de qualité locales : une image peut être rejetée pour une tuile mais acceptée pour une autre. Les problèmes locaux de seeing, de suivi ou de distorsion sont ainsi gérés naturellement.
+
+3.  **Empilement Indépendant des Tuiles**
+    Chaque tuile est empilée en utilisant uniquement les images validées pour cette tuile spécifique. Cela améliore la netteté locale et la cohérence du signal, tout en réduisant les artefacts de bord et les couvertures inégales.
+
+4.  **Rognage et Normalisation des Tuiles**
+    Les bordures invalides ou à faible couverture sont automatiquement rognées. L'intensité et le fond de ciel de chaque tuile sont normalisés avant la reprojection.
+
+5.  **Assemblage Final de la Mosaïque**
+    Toutes les tuiles sont reprojetées en utilisant leurs informations WCS. La mosaïque finale est assemblée avec une géométrie et une colorimétrie cohérentes.
+
+### Pourquoi le Mode Grille est Important
+
+Le Mode Grille résout plusieurs problèmes classiques de l'empilement de grands champs et de mosaïques :
+
+*   Chevauchement inégal des images
+*   Distorsions de suivi locales
+*   Rotation de champ et dégradation des bords
+*   Variations de qualité sur de grands ensembles de données
+
+En combinant l'analyse par image de ZeAnalyser avec l'empilement spatialisé du Mode Grille, ZeMosaic obtient :
+
+*   Une meilleure netteté locale
+*   Une réduction des artefacts de « ghosting » (images fantômes) et de duplication
+*   Des mosaïques plus stables sur des ensembles de données volumineux ou imparfaits
+*   Une stratégie de traitement qui reste robuste à mesure que la taille de l'ensemble de données augmente
+
+### Philosophie de Conception
+
+ZeAnalyser et le Mode Grille sont intentionnellement conçus pour être :
+
+*   **Automatiques** – Réglages manuels minimaux requis
+*   **Déterministes** – Mêmes entrées, mêmes résultats
+*   **Évolutifs** (*Scalable*) – De quelques centaines à des dizaines de milliers d'images
+*   **Indépendants de l'instrument** – Optimisés pour le Seestar mais non limités à celui-ci
+
+Ensemble, ils forment la colonne vertébrale du pipeline d'empilement moderne de ZeMosaic.
+
+---
+
 ## 📷 Requirements
 
 ### Mandatory:
@@ -173,6 +322,26 @@ To try the Qt frontend:
 
 If PySide6 is unavailable or an import error occurs, ZeMosaic automatically
 falls back to the Tk interface without interrupting your workflow.
+
+#### Automatic ZeAnalyser / Beforehand Tool Discovery (Qt GUI)
+To enable the `Analyse` button, install a compatible analysis tool in the parent directory of `zemosaic/`. ZeMosaic auto-detects them at startup.
+
+**Discovery Rules & UI Behavior:**
+1.  It first checks for a `zeanalyser/` directory. If found, the **Analyse** button is enabled, using **ZeAnalyser** as the backend.
+2.  If not found, it looks for `seestar/beforehand/`. If this directory exists, the button is enabled, using the legacy **Beforehand** backend.
+3.  If neither is found, the `Analyse` button is not displayed, keeping the UI clean.
+
+The button's tooltip will always indicate which backend is active. If both are installed, ZeAnalyser takes priority.
+
+#### Découverte automatique des outils ZeAnalyser / Beforehand (IUG Qt)
+Pour activer le bouton `Analyser`, installez un outil d'analyse compatible dans le répertoire parent de `zemosaic/`. ZeMosaic les détecte automatiquement au démarrage.
+
+**Règles de découverte et comportement de l'interface :**
+1.  Le logiciel vérifie d'abord la présence d'un répertoire `zeanalyser/`. S'il est trouvé, le bouton **Analyser** est activé et utilise le moteur **ZeAnalyser**.
+2.  Sinon, il recherche `seestar/beforehand/`. Si ce répertoire existe, le bouton est activé et utilise le moteur historique **Beforehand**.
+3.  Si aucun des deux n'est trouvé, le bouton `Analyser` n'est pas affiché, gardant l'interface épurée.
+
+L'info-bulle du bouton indiquera toujours quel moteur est actif. Si les deux sont installés, ZeAnalyser est prioritaire.
 
 ### Force Seestar workflow checkbox
 
