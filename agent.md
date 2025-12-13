@@ -116,6 +116,6 @@ Do not introduce heavy dependencies.
 Optionally a small shared helper in `zemosaic_utils.py` (only if it reduces duplication cleanly).
 
 ## Deliverable
-- Implement Borrowing v1 in both Tk and Qt paths for coverage-first preplan.
-- Add baseline logs.
-- No other refactors.
+- [x] Implement Borrowing v1 in both Tk and Qt paths for coverage-first preplan.
+- [x] Add baseline logs.
+- [x] No other refactors.

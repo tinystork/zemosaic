@@ -475,6 +475,7 @@ except Exception:  # pragma: no cover - optional dependency guard
 try:  # pragma: no cover - optional dependency guard
     from zemosaic_utils import (  # type: ignore
         EXCLUDED_DIRS,
+        apply_borrowing_v1,
         get_app_base_dir,
         get_user_config_dir,
         ensure_user_config_dir,
@@ -501,6 +502,7 @@ except Exception:  # pragma: no cover - optional dependency guard
     parse_global_wcs_resolution_override = None  # type: ignore[assignment]
     resolve_global_wcs_output_paths = None  # type: ignore[assignment]
     write_global_wcs_files = None  # type: ignore[assignment]
+    apply_borrowing_v1 = None  # type: ignore[assignment]
 
 
 logger = logging.getLogger(__name__)
@@ -2939,6 +2941,13 @@ class FilterQtDialog(QDialog):
             for info in group:
                 if info.pop("_fallback_wcs_used", False):
                     info.pop("wcs", None)
+
+        if coverage_enabled and apply_borrowing_v1 is not None:
+            final_groups, _borrow_stats = apply_borrowing_v1(
+                final_groups,
+                None,
+                logger=logger,
+            )
 
         return {
             "final_groups": final_groups,
