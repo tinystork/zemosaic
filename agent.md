@@ -134,4 +134,9 @@ Implementation hint:
 * No new files unless strictly necessary.
 * Keep diffs tight.
 
+## Progress
+
+- [x] Patch A — GPU coverage matches CPU footprint semantics.
+- [x] Patch B — Two-Pass channels share a single backend (CPU/GPU) with coherent fallback.
+
 

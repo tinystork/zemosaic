@@ -1,9 +1,9 @@
 # Follow-up Checklist — Fix Two-Pass CPU/GPU Split + Coverage Semantics
 
 ## 0) Guardrails
-- [ ] Do NOT touch batch-size behavior (batch size = 0 vs >1 must remain unchanged).
-- [ ] Do NOT introduce any new logging system/handlers/files. The GUI already has a log-level dropdown; respect existing logger usage.
-- [ ] Keep changes limited to:
+- [x] Do NOT touch batch-size behavior (batch size = 0 vs >1 must remain unchanged).
+- [x] Do NOT introduce any new logging system/handlers/files. The GUI already has a log-level dropdown; respect existing logger usage.
+- [x] Keep changes limited to:
   - `zemosaic_utils.py` (`gpu_reproject_and_coadd_impl`)
   - `zemosaic_worker.py` (`run_second_pass_coverage_renorm`)
 
@@ -29,7 +29,7 @@ CPU `reproject_and_coadd` returns footprint/coverage in “sum of weights” uni
 GPU must return the same to prevent Two-Pass gain/renorm from applying different effective scaling per channel.
 
 #### Quick self-check
-- [ ] Grep to ensure no other normalization exists in GPU mean path.
+- [x] Grep to ensure no other normalization exists in GPU mean path.
 - [ ] Ensure winsor/kappa-sigma paths already return non-normalized coverage (leave them as-is).
 
 ---
@@ -73,16 +73,16 @@ Then:
 
 #### Logging expectations
 At DEBUG:
-- [ ] Per-channel log already prints `cov_stats(min,max)`; keep it.
+- [x] Per-channel log already prints `cov_stats(min,max)`; keep it.
 Add one summary line (DEBUG or INFO):
-- [ ] `[TwoPass] Two-pass reprojection backend: gpu_all=True` (or False)
+- [x] `[TwoPass] Two-pass reprojection backend: gpu_all=True` (or False)
 
 ---
 
 ## 3) Sanity checks (fast)
-- [ ] Run `python -m py_compile zemosaic_utils.py zemosaic_worker.py`
-- [ ] Search for the old “gpu_assigned” logic; ensure removed.
-- [ ] Search for the old GPU coverage normalization in mean path; ensure removed.
+- [x] Run `python -m py_compile zemosaic_utils.py zemosaic_worker.py`
+- [x] Search for the old “gpu_assigned” logic; ensure removed.
+- [x] Search for the old GPU coverage normalization in mean path; ensure removed.
 
 ---
 
