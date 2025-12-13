@@ -134,13 +134,21 @@ _reset_filter_log()
 
 
 def _ensure_filter_file_logger() -> None:
-    """Ensure a file handler is attached to the root logger for filter logs."""
+    """Ensure a file handler is attached to the root logger for filter logs.
 
+    Key points:
+    - Avoid duplicate FileHandlers pointing to the same file.
+    - Make sure INFO/DEBUG actually reach the file (set levels).
+    - Do not crash UI startup if logging setup fails.
+    """
     try:
         log_path = Path(__file__).with_name("zemosaic_filter.log")
-        root_logger = logging.getLogger()
         target_path = log_path.resolve()
-        for handler in root_logger.handlers:
+
+        root_logger = logging.getLogger()  # root
+
+        # If a FileHandler already targets this file, we're done.
+        for handler in list(root_logger.handlers):
             if not isinstance(handler, logging.FileHandler):
                 continue
             try:
@@ -149,13 +157,23 @@ def _ensure_filter_file_logger() -> None:
                 continue
             if handler_path == target_path:
                 return
+
         file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
-        formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+        # Ensure messages aren't filtered out by handler/root default levels.
+        file_handler.setLevel(logging.DEBUG)
+        if root_logger.level in (logging.NOTSET, 0) or root_logger.level > logging.DEBUG:
+            root_logger.setLevel(logging.DEBUG)
+
+        formatter = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+        )
         file_handler.setFormatter(formatter)
+
         root_logger.addHandler(file_handler)
-        root_logger.info("Filter log file handler enabled: %s", log_path)
+        root_logger.info("Filter log file handler enabled: %s", str(log_path))
     except Exception:
-        # Le démarrage de l'UI ne doit pas échouer si le log fichier échoue.
+        # UI startup must not fail if file logging fails
         pass
 
 
