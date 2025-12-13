@@ -5320,6 +5320,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
         try:
             level_val = str(worker_kwargs.get("logging_level", "INFO") or "INFO").upper()
             os.environ["ZEMOSAIC_LOG_LEVEL"] = level_val
+            worker_kwargs["worker_logging_level"] = level_val
+            worker_kwargs["logging_level"] = level_val
         except Exception:
             pass
 

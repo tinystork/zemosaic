@@ -1,16 +1,16 @@
 # Follow-up — Debug ciblé dominante verte (Classic)
 
 ## Ce qui a été fait
-- [ ] GUI Qt : ajout/validation des options “Logging level” (Info/Debug) et propagation vers paramètres worker.
-- [ ] Worker : lecture du paramètre `worker_logging_level` et application réelle du niveau (logger + handlers).
+- [x] GUI Qt : ajout/validation des options “Logging level” (Info/Debug) et propagation vers paramètres worker.
+- [x] Worker : lecture du paramètre `worker_logging_level` et application réelle du niveau (logger + handlers).
 - [ ] Worker : logs DEBUG ciblés aux frontières P3/P4/P5 + export.
 - [ ] Ajout/extension utilitaire `_dbg_rgb_stats` pour stats global/valid-only/weighted.
 
 ## Points précis à vérifier dans le code
 
 ### A) Propagation du niveau de log (GUI → worker)
-- [ ] Le choix UI “Debug” donne bien `worker_logging_level="DEBUG"` dans les params.
-- [ ] Le worker imprime : `Worker logging level set to DEBUG`.
+- [x] Le choix UI “Debug” donne bien `worker_logging_level="DEBUG"` dans les params.
+- [x] Le worker imprime : `Worker logging level set to DEBUG`.
 - [ ] Le fichier `zemosaic_worker.log` contient des lignes `- DEBUG -`.
 
 ### B) Logs Phase 3 (baseline)
@@ -52,4 +52,8 @@
 - [ ] Pas de changement algorithmique (uniquement logs + propagation log level).
 - [ ] Ne pas modifier SDS / Grid logic.
 - [ ] Ne pas ajouter de nouveaux réglages utilisateur (sauf Debug dans combo si absent).
+
+## Journal des changements
+- zemosaic_gui_qt.py : propagation explicite de `logging_level`/`worker_logging_level` vers le worker et synchronisation de l’ENV.
+- zemosaic_worker.py : harmonisation de la configuration du logger avec message `[LOGCFG]` et niveau appliqué au worker.
 
