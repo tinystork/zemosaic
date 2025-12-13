@@ -1,4 +1,12 @@
 ## Unreleased
+## Fixed
+- **Legacy stacking color cast (green tint)**  
+  Fixed a long-standing green color bias in legacy mode caused by **mixed CPU/GPU execution paths within the same RGB stack**.  
+  The issue occurred when different color channels were processed through different backends (CPU vs GPU), leading to subtle but cumulative normalization divergences.
+  ➤ The stacking pipeline is now **backend-consistent per stack**: a given stack is processed entirely on CPU or entirely on GPU.  
+  ➤ Partial CPU/GPU channel splitting is explicitly forbidden to guarantee photometric and color integrity.
+  This change restores color parity with historical legacy results and stabilizes RGB behavior across runs.
+
 ### Fixed
 * Robust FITS writing for ASTAP CLI (colour order normalised)
 * Filter window now opens once via the streaming scanner path in the GUI
