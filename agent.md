@@ -18,13 +18,13 @@ Mettre en place un mécanisme **de référence comptée** des caches `.npy` en P
 => suppression sûre même en exécution parallèle (ThreadPool), sans trous, sans garder tout jusqu’à la fin.
 
 ## Contraintes strictes
-- ✅ Changements minimaux, localisés
-- ✅ Pas de nouveaux fichiers
-- ✅ Pas de refactor global
-- ✅ Ne pas créer de nouveau système de logs (le GUI a déjà un dropdown niveau log)
-- ✅ Ne pas toucher au comportement batch size (0 vs >1) existant
-- ✅ SDS et grid_mode: ne pas modifier leur logique; seul l’aspect cache-retention Phase 3 est concerné
-- ✅ Ne pas changer l’API publique/config: utiliser `cache_retention_mode` existant
+- [x] Changements minimaux, localisés
+- [x] Pas de nouveaux fichiers
+- [x] Pas de refactor global
+- [x] Ne pas créer de nouveau système de logs (le GUI a déjà un dropdown niveau log)
+- [x] Ne pas toucher au comportement batch size (0 vs >1) existant
+- [x] SDS et grid_mode: ne pas modifier leur logique; seul l’aspect cache-retention Phase 3 est concerné
+- [x] Ne pas changer l’API publique/config: utiliser `cache_retention_mode` existant
   - Si `cache_retention_mode != "per_tile"` => comportement inchangé
   - Si `cache_retention_mode == "per_tile"` => appliquer refcount en lieu et place de suppression naïve
 

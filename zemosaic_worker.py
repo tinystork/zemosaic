@@ -14205,51 +14205,13 @@ def run_hierarchical_mosaic_classic_legacy(
         _log_and_callback("phase5_using_gpu", callback=progress_callback, lvl="INFO")
     else:
         _log_and_callback("phase5_using_cpu", callback=progress_callback, lvl="INFO")
-    def _cleanup_per_tile_cache(cache_paths: Iterable[str]) -> tuple[int, int]:
-        """Remove preprocessed cache files for a completed master tile."""
-
-        removed_count = 0
-        removed_bytes = 0
-        seen_paths: set[str] = set()
-
-        for path in cache_paths or ():
-            if path is None:
-                continue
-            try:
-                path_obj = Path(os.fspath(path)).expanduser()
-                try:
-                    resolved = path_obj.resolve(strict=False)
-                except Exception:
-                    resolved = path_obj
-                norm_path = str(resolved)
-            except Exception:
-                norm_path = None
-            if not norm_path or norm_path in seen_paths:
-                continue
-            seen_paths.add(norm_path)
-            if not norm_path.lower().endswith(".npy"):
-                continue
-            cache_path_obj = Path(norm_path)
-            if not cache_path_obj.is_file():
-                continue
-
-            file_size = 0
-            try:
-                file_size = cache_path_obj.stat().st_size
-            except OSError:
-                file_size = 0
-
-            try:
-                cache_path_obj.unlink()
-                removed_count += 1
-                removed_bytes += file_size
-                logger.debug("Removed per-tile cache file: %s", cache_path_obj)
-            except FileNotFoundError:
-                continue
-            except OSError as exc_remove:
-                logger.warning("Failed to remove per-tile cache file %s: %s", cache_path_obj, exc_remove)
-
-        return removed_count, removed_bytes
+    def _normalize_cache_path(cache_path: str | os.PathLike[str] | None) -> str | None:
+        if cache_path is None:
+            return None
+        try:
+            return os.path.normpath(os.fspath(cache_path))
+        except Exception:
+            return None
 
     def _compute_phase_workers(base_workers: int, num_tasks: int, ratio: float = DEFAULT_PHASE_WORKER_RATIO) -> int:
         workers = max(1, int(base_workers * ratio))
@@ -16472,11 +16434,92 @@ def run_hierarchical_mosaic_classic_legacy(
             executor_ph3 = ThreadPoolExecutor(max_workers=actual_num_workers_ph3, thread_name_prefix="ZeMosaic_Ph3_")
 
             future_to_tile_id: dict = {}
-            tile_input_cache_paths: dict[int, list[str]] = {}
+            tile_cache_paths_unique: dict[int, set[str]] = {}
+            cache_refcount: dict[str, int] = {}
+            shared_cache_detected = False
+            total_removed_cache_files = 0
+            total_removed_cache_bytes = 0
             pending_futures: set = set()
             next_dynamic_tile_id = num_seestar_stacks_to_process
 
+            def _register_tile_cache_paths(tile_id: int, group_info_list: list[dict]) -> None:
+                nonlocal shared_cache_detected
+
+                if cache_retention_mode != "per_tile":
+                    return
+
+                unique_paths: set[str] = set()
+                for raw_entry in group_info_list or []:
+                    if not isinstance(raw_entry, dict):
+                        continue
+                    cache_path = raw_entry.get('path_preprocessed_cache')
+                    norm_path = _normalize_cache_path(cache_path) if isinstance(cache_path, str) else None
+                    if not norm_path or not norm_path.lower().endswith(".npy"):
+                        continue
+                    unique_paths.add(norm_path)
+
+                if tile_id in tile_cache_paths_unique:
+                    return
+
+                tile_cache_paths_unique[tile_id] = unique_paths
+                for norm_path in unique_paths:
+                    prev = cache_refcount.get(norm_path, 0)
+                    if prev > 0 and not shared_cache_detected:
+                        shared_cache_detected = True
+                        logger.info("Phase3: shared cache detected across master tiles; refcount guard active.")
+                    cache_refcount[norm_path] = prev + 1
+
+            def _release_tile_cache_paths(tile_id: int) -> tuple[int, int]:
+                removed_count = 0
+                removed_bytes = 0
+
+                if cache_retention_mode != "per_tile":
+                    return removed_count, removed_bytes
+
+                unique_paths = tile_cache_paths_unique.pop(tile_id, set())
+                if not unique_paths:
+                    return removed_count, removed_bytes
+
+                for norm_path in unique_paths:
+                    current_count = cache_refcount.get(norm_path, 0)
+                    if current_count <= 0:
+                        cache_refcount[norm_path] = 0
+                        continue
+                    cache_refcount[norm_path] = current_count - 1
+                    if cache_refcount[norm_path] > 0:
+                        continue
+
+                    cache_path_obj = Path(norm_path)
+                    file_size = 0
+                    try:
+                        file_size = cache_path_obj.stat().st_size
+                    except OSError:
+                        file_size = 0
+
+                    try:
+                        cache_path_obj.unlink()
+                        removed_count += 1
+                        removed_bytes += file_size
+                        logger.debug("Removed per-tile cache file: %s", cache_path_obj)
+                    except FileNotFoundError:
+                        logger.debug("Per-tile cache already removed or missing: %s", cache_path_obj)
+                    except OSError as exc_remove:
+                        logger.debug("Failed to remove per-tile cache file %s: %s", cache_path_obj, exc_remove)
+
+                return removed_count, removed_bytes
+
+            if cache_retention_mode == "per_tile":
+                for proc_idx, sg_info_list in enumerate(seestar_stack_groups):
+                    assigned_tile_id = tile_id_order[proc_idx] if proc_idx < len(tile_id_order) else proc_idx
+                    _register_tile_cache_paths(assigned_tile_id, sg_info_list)
+                logger.info(
+                    "Phase3: per_tile cache retention uses refcount; safe deletion enabled (%d unique cache files tracked).",
+                    len(cache_refcount),
+                )
+
             def _submit_master_tile_group(group_info_list: list[dict], assigned_tile_id: int, processing_rank: int | None = None) -> None:
+                if cache_retention_mode == "per_tile" and assigned_tile_id not in tile_cache_paths_unique:
+                    _register_tile_cache_paths(assigned_tile_id, group_info_list)
                 future = executor_ph3.submit(
                     create_master_tile,
                     group_info_list,
@@ -16515,15 +16558,6 @@ def run_hierarchical_mosaic_classic_legacy(
                 )
                 future_to_tile_id[future] = assigned_tile_id
                 pending_futures.add(future)
-                if cache_retention_mode == "per_tile":
-                    cache_paths: list[str] = []
-                    for raw_entry in group_info_list or []:
-                        if not isinstance(raw_entry, dict):
-                            continue
-                        cache_path = raw_entry.get('path_preprocessed_cache')
-                        if isinstance(cache_path, str):
-                            cache_paths.append(cache_path)
-                    tile_input_cache_paths[assigned_tile_id] = cache_paths
 
             for proc_idx, sg_info_list in enumerate(seestar_stack_groups):
                 assigned_tile_id = tile_id_order[proc_idx] if proc_idx < len(tile_id_order) else proc_idx
@@ -16542,9 +16576,6 @@ def run_hierarchical_mosaic_classic_legacy(
                     if tile_id_for_future is None:
                         continue
                     tiles_processed_count_ph3 += 1
-                    cache_paths_for_tile: list[str] = []
-                    if cache_retention_mode == "per_tile":
-                        cache_paths_for_tile = tile_input_cache_paths.pop(tile_id_for_future, [])
 
                     pcb(f"MASTER_TILE_COUNT_UPDATE:{tiles_processed_count_ph3}/{num_seestar_stacks_to_process}", prog=None, lvl="ETA_LEVEL")
 
@@ -16577,26 +16608,6 @@ def run_hierarchical_mosaic_classic_legacy(
                         mt_result_path, mt_result_wcs = (main_result or (None, None))
                         if mt_result_path and mt_result_wcs:
                             master_tiles_results_list_temp[tile_id_for_future] = (mt_result_path, mt_result_wcs)
-                            if cache_retention_mode == "per_tile" and cache_paths_for_tile:
-                                removed_count, removed_bytes = _cleanup_per_tile_cache(cache_paths_for_tile)
-                                freed_mb = removed_bytes / (1024 * 1024) if removed_bytes else 0.0
-                                logger.debug(
-                                    "Per-tile cache cleanup for tile %s: removed %d file(s), freed %.3f MiB",
-                                    tile_id_for_future,
-                                    removed_count,
-                                    freed_mb,
-                                )
-                                try:
-                                    pcb(
-                                        "run_debug_cache_per_tile_cleanup",
-                                        prog=None,
-                                        lvl="DEBUG_DETAIL",
-                                        tile_id=int(tile_id_for_future),
-                                        removed=int(removed_count),
-                                        freed_mib=f"{freed_mb:.3f}",
-                                    )
-                                except Exception:
-                                    pass
                         else:
                             pcb(
                                 "run_warn_phase3_master_tile_creation_failed_thread",
@@ -16635,6 +16646,7 @@ def run_hierarchical_mosaic_classic_legacy(
                                 new_tile_id = next_dynamic_tile_id
                                 next_dynamic_tile_id += 1
                                 num_seestar_stacks_to_process += 1
+                                _register_tile_cache_paths(new_tile_id, filtered_retry_group)
                                 pcb(
                                     "run_info_phase3_retry_submitted",
                                     prog=None,
@@ -16676,6 +16688,19 @@ def run_hierarchical_mosaic_classic_legacy(
                         except Exception:
                             pass
 
+                    if cache_retention_mode == "per_tile":
+                        removed_count, removed_bytes = _release_tile_cache_paths(tile_id_for_future)
+                        total_removed_cache_files += removed_count
+                        total_removed_cache_bytes += removed_bytes
+                        if removed_count or removed_bytes:
+                            freed_mb = removed_bytes / (1024 * 1024) if removed_bytes else 0.0
+                            logger.debug(
+                                "Per-tile cache cleanup for tile %s: removed %d file(s), freed %.3f MiB",
+                                tile_id_for_future,
+                                removed_count,
+                                freed_mb,
+                            )
+
                     if tiles_processed_count_ph3 % max(1, num_seestar_stacks_to_process // 5) == 0 or tiles_processed_count_ph3 == num_seestar_stacks_to_process:
                          _log_memory_usage(progress_callback, f"Phase 3 - Traité {tiles_processed_count_ph3}/{num_seestar_stacks_to_process} tuiles")
 
@@ -16696,6 +16721,14 @@ def run_hierarchical_mosaic_classic_legacy(
             except Exception:
                 pass
             executor_ph3.shutdown(wait=True)
+
+            if cache_retention_mode == "per_tile":
+                remaining_tracked = sum(1 for _path, count in cache_refcount.items() if count > 0)
+                logger.info(
+                    "Phase3: refcount cleanup complete; removed %d files; remaining %d (if any).",
+                    total_removed_cache_files,
+                    remaining_tracked,
+                )
 
             if enable_poststack_anchor_review_config and master_tiles_results_list_temp:
                 post_review_cfg = {
@@ -18199,51 +18232,13 @@ def run_hierarchical_mosaic(
         _log_and_callback("phase5_using_gpu", callback=progress_callback, lvl="INFO")
     else:
         _log_and_callback("phase5_using_cpu", callback=progress_callback, lvl="INFO")
-    def _cleanup_per_tile_cache(cache_paths: Iterable[str]) -> tuple[int, int]:
-        """Remove preprocessed cache files for a completed master tile."""
-
-        removed_count = 0
-        removed_bytes = 0
-        seen_paths: set[str] = set()
-
-        for path in cache_paths or ():
-            if path is None:
-                continue
-            try:
-                path_obj = Path(os.fspath(path)).expanduser()
-                try:
-                    resolved = path_obj.resolve(strict=False)
-                except Exception:
-                    resolved = path_obj
-                norm_path = str(resolved)
-            except Exception:
-                norm_path = None
-            if not norm_path or norm_path in seen_paths:
-                continue
-            seen_paths.add(norm_path)
-            if not norm_path.lower().endswith(".npy"):
-                continue
-            cache_path_obj = Path(norm_path)
-            if not cache_path_obj.is_file():
-                continue
-
-            file_size = 0
-            try:
-                file_size = cache_path_obj.stat().st_size
-            except OSError:
-                file_size = 0
-
-            try:
-                cache_path_obj.unlink()
-                removed_count += 1
-                removed_bytes += file_size
-                logger.debug("Removed per-tile cache file: %s", cache_path_obj)
-            except FileNotFoundError:
-                continue
-            except OSError as exc_remove:
-                logger.warning("Failed to remove per-tile cache file %s: %s", cache_path_obj, exc_remove)
-
-        return removed_count, removed_bytes
+    def _normalize_cache_path(cache_path: str | os.PathLike[str] | None) -> str | None:
+        if cache_path is None:
+            return None
+        try:
+            return os.path.normpath(os.fspath(cache_path))
+        except Exception:
+            return None
 
     def _compute_phase_workers(base_workers: int, num_tasks: int, ratio: float = DEFAULT_PHASE_WORKER_RATIO) -> int:
         workers = max(1, int(base_workers * ratio))
@@ -20517,11 +20512,92 @@ def run_hierarchical_mosaic(
             executor_ph3 = ThreadPoolExecutor(max_workers=actual_num_workers_ph3, thread_name_prefix="ZeMosaic_Ph3_")
 
             future_to_tile_id: dict = {}
-            tile_input_cache_paths: dict[int, list[str]] = {}
+            tile_cache_paths_unique: dict[int, set[str]] = {}
+            cache_refcount: dict[str, int] = {}
+            shared_cache_detected = False
+            total_removed_cache_files = 0
+            total_removed_cache_bytes = 0
             pending_futures: set = set()
             next_dynamic_tile_id = num_seestar_stacks_to_process
 
+            def _register_tile_cache_paths(tile_id: int, group_info_list: list[dict]) -> None:
+                nonlocal shared_cache_detected
+
+                if cache_retention_mode != "per_tile":
+                    return
+
+                unique_paths: set[str] = set()
+                for raw_entry in group_info_list or []:
+                    if not isinstance(raw_entry, dict):
+                        continue
+                    cache_path = raw_entry.get('path_preprocessed_cache')
+                    norm_path = _normalize_cache_path(cache_path) if isinstance(cache_path, str) else None
+                    if not norm_path or not norm_path.lower().endswith(".npy"):
+                        continue
+                    unique_paths.add(norm_path)
+
+                if tile_id in tile_cache_paths_unique:
+                    return
+
+                tile_cache_paths_unique[tile_id] = unique_paths
+                for norm_path in unique_paths:
+                    prev = cache_refcount.get(norm_path, 0)
+                    if prev > 0 and not shared_cache_detected:
+                        shared_cache_detected = True
+                        logger.info("Phase3: shared cache detected across master tiles; refcount guard active.")
+                    cache_refcount[norm_path] = prev + 1
+
+            def _release_tile_cache_paths(tile_id: int) -> tuple[int, int]:
+                removed_count = 0
+                removed_bytes = 0
+
+                if cache_retention_mode != "per_tile":
+                    return removed_count, removed_bytes
+
+                unique_paths = tile_cache_paths_unique.pop(tile_id, set())
+                if not unique_paths:
+                    return removed_count, removed_bytes
+
+                for norm_path in unique_paths:
+                    current_count = cache_refcount.get(norm_path, 0)
+                    if current_count <= 0:
+                        cache_refcount[norm_path] = 0
+                        continue
+                    cache_refcount[norm_path] = current_count - 1
+                    if cache_refcount[norm_path] > 0:
+                        continue
+
+                    cache_path_obj = Path(norm_path)
+                    file_size = 0
+                    try:
+                        file_size = cache_path_obj.stat().st_size
+                    except OSError:
+                        file_size = 0
+
+                    try:
+                        cache_path_obj.unlink()
+                        removed_count += 1
+                        removed_bytes += file_size
+                        logger.debug("Removed per-tile cache file: %s", cache_path_obj)
+                    except FileNotFoundError:
+                        logger.debug("Per-tile cache already removed or missing: %s", cache_path_obj)
+                    except OSError as exc_remove:
+                        logger.debug("Failed to remove per-tile cache file %s: %s", cache_path_obj, exc_remove)
+
+                return removed_count, removed_bytes
+
+            if cache_retention_mode == "per_tile":
+                for proc_idx, sg_info_list in enumerate(seestar_stack_groups):
+                    assigned_tile_id = tile_id_order[proc_idx] if proc_idx < len(tile_id_order) else proc_idx
+                    _register_tile_cache_paths(assigned_tile_id, sg_info_list)
+                logger.info(
+                    "Phase3: per_tile cache retention uses refcount; safe deletion enabled (%d unique cache files tracked).",
+                    len(cache_refcount),
+                )
+
             def _submit_master_tile_group(group_info_list: list[dict], assigned_tile_id: int, processing_rank: int | None = None) -> None:
+                if cache_retention_mode == "per_tile" and assigned_tile_id not in tile_cache_paths_unique:
+                    _register_tile_cache_paths(assigned_tile_id, group_info_list)
                 future = executor_ph3.submit(
                     create_master_tile,
                     group_info_list,
@@ -20563,15 +20639,6 @@ def run_hierarchical_mosaic(
                 )
                 future_to_tile_id[future] = assigned_tile_id
                 pending_futures.add(future)
-                if cache_retention_mode == "per_tile":
-                    cache_paths: list[str] = []
-                    for raw_entry in group_info_list or []:
-                        if not isinstance(raw_entry, dict):
-                            continue
-                        cache_path = raw_entry.get('path_preprocessed_cache')
-                        if isinstance(cache_path, str):
-                            cache_paths.append(cache_path)
-                    tile_input_cache_paths[assigned_tile_id] = cache_paths
 
             for proc_idx, sg_info_list in enumerate(seestar_stack_groups):
                 assigned_tile_id = tile_id_order[proc_idx] if proc_idx < len(tile_id_order) else proc_idx
@@ -20590,9 +20657,6 @@ def run_hierarchical_mosaic(
                     if tile_id_for_future is None:
                         continue
                     tiles_processed_count_ph3 += 1
-                    cache_paths_for_tile: list[str] = []
-                    if cache_retention_mode == "per_tile":
-                        cache_paths_for_tile = tile_input_cache_paths.pop(tile_id_for_future, [])
 
                     pcb(f"MASTER_TILE_COUNT_UPDATE:{tiles_processed_count_ph3}/{num_seestar_stacks_to_process}", prog=None, lvl="ETA_LEVEL")
 
@@ -20625,26 +20689,6 @@ def run_hierarchical_mosaic(
                         mt_result_path, mt_result_wcs = (main_result or (None, None))
                         if mt_result_path and mt_result_wcs:
                             master_tiles_results_list_temp[tile_id_for_future] = (mt_result_path, mt_result_wcs)
-                            if cache_retention_mode == "per_tile" and cache_paths_for_tile:
-                                removed_count, removed_bytes = _cleanup_per_tile_cache(cache_paths_for_tile)
-                                freed_mb = removed_bytes / (1024 * 1024) if removed_bytes else 0.0
-                                logger.debug(
-                                    "Per-tile cache cleanup for tile %s: removed %d file(s), freed %.3f MiB",
-                                    tile_id_for_future,
-                                    removed_count,
-                                    freed_mb,
-                                )
-                                try:
-                                    pcb(
-                                        "run_debug_cache_per_tile_cleanup",
-                                        prog=None,
-                                        lvl="DEBUG_DETAIL",
-                                        tile_id=int(tile_id_for_future),
-                                        removed=int(removed_count),
-                                        freed_mib=f"{freed_mb:.3f}",
-                                    )
-                                except Exception:
-                                    pass
                         else:
                             pcb(
                                 "run_warn_phase3_master_tile_creation_failed_thread",
@@ -20683,6 +20727,7 @@ def run_hierarchical_mosaic(
                                 new_tile_id = next_dynamic_tile_id
                                 next_dynamic_tile_id += 1
                                 num_seestar_stacks_to_process += 1
+                                _register_tile_cache_paths(new_tile_id, filtered_retry_group)
                                 pcb(
                                     "run_info_phase3_retry_submitted",
                                     prog=None,
@@ -20724,6 +20769,19 @@ def run_hierarchical_mosaic(
                         except Exception:
                             pass
 
+                    if cache_retention_mode == "per_tile":
+                        removed_count, removed_bytes = _release_tile_cache_paths(tile_id_for_future)
+                        total_removed_cache_files += removed_count
+                        total_removed_cache_bytes += removed_bytes
+                        if removed_count or removed_bytes:
+                            freed_mb = removed_bytes / (1024 * 1024) if removed_bytes else 0.0
+                            logger.debug(
+                                "Per-tile cache cleanup for tile %s: removed %d file(s), freed %.3f MiB",
+                                tile_id_for_future,
+                                removed_count,
+                                freed_mb,
+                            )
+
                     if tiles_processed_count_ph3 % max(1, num_seestar_stacks_to_process // 5) == 0 or tiles_processed_count_ph3 == num_seestar_stacks_to_process:
                          _log_memory_usage(progress_callback, f"Phase 3 - Traité {tiles_processed_count_ph3}/{num_seestar_stacks_to_process} tuiles")
 
@@ -20744,6 +20802,14 @@ def run_hierarchical_mosaic(
             except Exception:
                 pass
             executor_ph3.shutdown(wait=True)
+
+            if cache_retention_mode == "per_tile":
+                remaining_tracked = sum(1 for _path, count in cache_refcount.items() if count > 0)
+                logger.info(
+                    "Phase3: refcount cleanup complete; removed %d files; remaining %d (if any).",
+                    total_removed_cache_files,
+                    remaining_tracked,
+                )
 
             if enable_poststack_anchor_review_config and master_tiles_results_list_temp:
                 post_review_cfg = {
