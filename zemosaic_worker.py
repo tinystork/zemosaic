@@ -7906,9 +7906,18 @@ def _configure_worker_logging(logging_level_config: str | None, *, source_hint: 
         except Exception:
             pass
 
-    src = source_hint or ("env" if env_level and not logging_level_config else "qt_gui_config" if logging_level_config else "default")
+    src = source_hint
+    if not src:
+        if logging_level_config:
+            src = "qt_gui_dropdown"
+        elif env_level:
+            src = "env"
+        else:
+            src = "default"
     try:
-        logger.info("[LOGCFG] effective_level=%s source=%s", logging.getLevelName(lvl), src)
+        level_name = logging.getLevelName(lvl)
+        logger.info("[LOGCFG] effective_level=%s source=%s", level_name, src)
+        logger.info("Worker logging level set to %s", level_name)
     except Exception:
         pass
 
@@ -13931,7 +13940,7 @@ def run_hierarchical_mosaic_classic_legacy(
     if cleanup_temp_artifacts_config is None:
         cleanup_temp_artifacts_config = True
 
-    _configure_worker_logging(logging_level_config, source_hint="qt_gui_config")
+    _configure_worker_logging(logging_level_config, source_hint="qt_gui_dropdown")
 
     # --- Harmoniser les méthodes de pondération issues du GUI / CLI / fallback config ---
     requested_stack_weight_method = stack_weight_method
@@ -17882,7 +17891,7 @@ def run_hierarchical_mosaic(
     if cleanup_temp_artifacts_config is None:
         cleanup_temp_artifacts_config = True
 
-    _configure_worker_logging(logging_level_config, source_hint="qt_gui_config")
+    _configure_worker_logging(logging_level_config, source_hint="qt_gui_dropdown")
 
     try:
         batch_overlap_pct_config = float(worker_config_cache.get("batch_overlap_pct", 0.0))
@@ -21509,9 +21518,15 @@ def run_hierarchical_mosaic_process(
     final_kwargs['solver_settings'] = solver_settings_dict
 
     try:
-        level_cfg = final_kwargs.get("logging_level") or final_kwargs.get("logging_level_config")
+        level_cfg = (
+            final_kwargs.get("worker_logging_level")
+            or final_kwargs.get("logging_level")
+            or final_kwargs.get("logging_level_config")
+        )
         if level_cfg:
             os.environ["ZEMOSAIC_LOG_LEVEL"] = str(level_cfg)
+            final_kwargs["worker_logging_level"] = str(level_cfg)
+            final_kwargs["logging_level"] = str(level_cfg)
     except Exception:
         pass
 
@@ -21537,6 +21552,9 @@ def run_hierarchical_mosaic_process(
     for old_key, new_key in rename_map.items():
         if old_key in final_kwargs:
             final_kwargs[new_key] = final_kwargs.pop(old_key)
+
+    if "worker_logging_level" in final_kwargs and "logging_level" not in final_kwargs:
+        final_kwargs["logging_level"] = final_kwargs.pop("worker_logging_level")
 
     # 2. Handle special parsing for winsor limits
     if 'stacking_winsor_limits' in final_kwargs:
