@@ -1,121 +1,120 @@
-# ZeMosaic — Borrowing v1 (coverage-first preplan) — Deterministic, no-gain
+# ZeMosaic — Patch ciblé (Qt) : Borrowing v1 réellement actif + log fichier restauré
 
 ## Mission
-Implement "Borrowing v1" as a *small deterministic post-process* on the auto-grouping result:
-- **No “gain”**, no optimization, no changes to clustering rules.
-- Only duplicate-assign some *border* images from a group `G` into a single best neighbor group `H`.
-- Must be **reproducible** run-to-run (stable ordering).
-- Must be **bounded** (quota) and must not create new UI controls.
-- Must reuse the existing logging system and existing log level dropdown (Qt).
 
-Scope:
-- Apply borrowing only to **coverage-first preplan** outputs (the path that logs "Coverage-first preplan ready").
-- Apply in both filter UIs:
-  - `zemosaic_filter_gui.py` (Tk)
-  - `zemosaic_filter_gui_qt.py` (Qt)
+Appliquer un patch **minimal et chirurgical** pour :
 
-Non-goals:
-- No “alpha” weighting, no adaptive quota, no multi-borrow to 2+ neighbors.
-- No footprint/overlap geometry, no WCS intersection checks.
-- No new logger, no new settings UI.
+1. rendre **Borrowing v1** réellement opérant en Qt (en lisant correctement les centres `center_ra_deg/center_dec_deg`),
+2. restaurer l’écriture du fichier **`zemosaic_filter.log`** par `zemosaic_filter_gui_qt.py` (FileHandler manquant),
+3. ajouter **2 compteurs de preuve** (debug) permettant de valider en un run que Borrowing v1 “voit” bien les données.
 
-## Why
-Some coverage-first groupings under-sample overlaps at group borders. Borrowing duplicates borderline frames into adjacent groups to improve overlap without changing clustering or downstream pipeline.
+## Contexte
 
-## Borrowing v1 — Rule (final)
-Parameters (internal constants, no UI):
-- `BORROW_ENABLE = True`
-- `BORROW_MAX_NEIGHBOR_PER_IMAGE = 1` (enforced by "img borrowed at most once")
-- `BORROW_IN_QUOTA_FRAC = 0.25`  (cap borrowed-in per destination group H, based on initial size)
-- `BORROW_BORDER_FRAC = 0.20`    (border images are those within the outer 20% of the robust radius)
-- `NEIGHBOR_K = 4`
-- `BORROW_RADIUS_PCTL = 90`      (robust radius = Pctl of distances to group center)
-- `BORROW_RADIUS_EPS = 1e-6`
-- Anti-pollution guard: only borrow if `dist(img, center(H)) < dist(img, center(G))`
+* Le hook d’appel à `apply_borrowing_v1(...)` est présent dans `zemosaic_filter_gui_qt.py`.
+* Le log du worker ne montre pas d’effet mesurable ; cause probable : `apply_borrowing_v1` n’extrait pas les centres des images lorsque les champs s’appellent `center_ra_deg` / `center_dec_deg`.
+* `zemosaic_filter_gui_qt.py` supprime `zemosaic_filter.log` au démarrage mais **ne configure pas de FileHandler**, donc aucun fichier n’est recréé.
 
-Required data per group `G` (computed from group members):
-- `center(G)` = mean of member image centers (2D)
-- `radius(G)` = percentile(BORROW_RADIUS_PCTL) of `dist(center(img), center(G))`
-- `neighbors(G)` = K nearest groups by distance between `center(G)` and `center(H)`
+## Contraintes (garde-fous)
 
-Border image definition:
-- `img` is border if `dist(center(img), center(G)) >= (1 - BORROW_BORDER_FRAC) * max(radius(G), BORROW_RADIUS_EPS)`
+* **Ne pas** toucher au worker, à `stack_core`, à la reprojection, ni au pipeline mosaïque.
+* **Ne pas** ajouter de nouveau système de logs : seulement un `FileHandler` standard Python logging.
+* **Ne pas** ajouter d’UI. Le dropdown de niveau de log existe déjà : on ne le recrée pas.
+* Patch limité aux fichiers :
 
-Borrowing:
-For each group `G`:
-- Take border images in deterministic order (sort by stable key, e.g. filepath string).
-- For each border image `img`:
-  - Choose `H` among `neighbors(G)` minimizing `dist(center(img), center(H))`.
-  - Borrow `img` into `H` if all conditions hold:
-    - `img` not already in `members(H)`
-    - `borrowed_in_count(H) < ceil(BORROW_IN_QUOTA_FRAC * initial_size(H))`
-    - `img` not already borrowed to any other group
-    - Anti-pollution guard: `dist(img, center(H)) < dist(img, center(G))`
-  - If OK: append `img` into `members(H)` and tag it `borrowed=True` (internal tag only).
+  * `zemosaic_utils.py`
+  * `zemosaic_filter_gui_qt.py`
 
-Important:
-- **Quota uses initial_size(H)**, not updated size.
-- Borrowing is **duplicate assignment**; do not remove from source group.
-- Stable ordering for groups and images.
+## Objectifs de preuve (doivent apparaître dans les logs)
 
-## Integration points (surgical)
-We do not touch downstream pipeline. We only mutate the auto-grouping payload just before it is applied/serialized into `preplan_master_groups`.
+* Une ligne `INFO` confirmant que le FileHandler est en place :
 
-### Tk: `zemosaic_filter_gui.py`
-Locate the auto-grouping code path that builds:
-- `final_groups`
-- `result_payload = {"final_groups": final_groups, ...}`
-Insert borrowing *just before* `result_payload` is created (or right after `final_groups` is finalized and before applying result), but only when coverage-first preplan is the chosen mode.
+  * `Filter log file handler enabled: <path>`
+* Une ligne `INFO` confirmant que Borrowing a été exécuté et avec quelles stats :
 
-### Qt: `zemosaic_filter_gui_qt.py`
-Locate `_compute_auto_groups(...)` producing `final_groups` and `result_payload`, then `_apply_auto_group_result(...)`.
-Insert borrowing in `_compute_auto_groups(...)` after final groups are computed and before the payload is returned/applied.
-No new UI; reuse existing controls and logger.
+  * `Borrowing v1 applied: groups=... borrowed_unique=... borrowed_total=...`
+* Deux compteurs `DEBUG` (ou `INFO_DETAIL` si tu as cette granularité) dans Borrowing :
 
-## Logging (baseline + small extras)
-Do NOT create a new logger. Reuse existing `logger` passed/available in these modules.
-Only log when borrowing is enabled and executed.
+  * nombre d’images ayant un centre valide
+  * nombre de groupes ayant un centre valide
 
-Minimum baseline logs:
-- Per destination group H: `initial_size`, `borrowed_in`, `final_size`
-- Global totals: `borrowed_unique_images`, `borrowed_total_assignments`
-- Top 5 sample: `img -> from_group -> to_group`
+## Tâches
 
-Add these low-cost extras:
-- `border_candidate_images_total`
-- `borrow_attempts_total`, `borrow_success_total`
-- Borrow distance stats: mean and p90 of `dist(img, center(H))` for successful borrows
+### 1) `zemosaic_utils.py` — rendre `_extract_center_tuple` compatible Qt
 
-These logs must respect the existing log level dropdown in Qt; no new toggle.
+Trouver la fonction `_extract_center_tuple(img)` (utilisée par `apply_borrowing_v1`).
 
-## Data structures
-Groups are lists of image identifiers/paths.
-Use a stable key for deterministic ordering:
-- Prefer full filepath string (normalized) or whatever the current grouping uses consistently.
+Ajouter la prise en charge des clés suivantes **sans casser l’existant** :
 
-Image center:
-- Use existing per-image center/footprint center when available in the auto-grouping context.
-- If only 2D XY centers are available, use them.
-- If only RA/Dec is available, use those as 2D.
+* `center_ra_deg` / `center_dec_deg`
+* `center_ra` / `center_dec` (si présentes)
 
-Do not introduce heavy dependencies.
+Règles :
 
-## Tests / Acceptance
-1) Run the filter twice on the same dataset:
-- Borrowing outputs identical group compositions (deterministic).
-2) Quota respected:
-- For every group H: borrowed_in <= ceil(frac * initial_size(H)).
-3) No duplicates inside a group.
-4) Borrowed image assigned to at most 1 neighbor.
-5) Anti-pollution guard prevents nonsensical borrows.
-6) When borrowing disabled or not coverage-first: behavior is unchanged.
+* Retourner un tuple `(float(x), float(y))` si possible.
+* Si valeurs manquantes/NaN/non castables : retourner `None`.
+* Conserver le comportement actuel pour les clés existantes (`RA/DEC`, `ra/dec`, etc.).
 
-## Files to modify
-- `zemosaic_filter_gui.py`
-- `zemosaic_filter_gui_qt.py`
-Optionally a small shared helper in `zemosaic_utils.py` (only if it reduces duplication cleanly).
+### 2) `zemosaic_utils.py` — 2 compteurs de preuve dans `apply_borrowing_v1`
 
-## Deliverable
-- [x] Implement Borrowing v1 in both Tk and Qt paths for coverage-first preplan.
-- [x] Add baseline logs.
-- [x] No other refactors.
+Dans `apply_borrowing_v1(...)`, ajouter des compteurs simples :
+
+* `valid_image_centers` = nombre d’images ayant un centre extractible
+* `valid_group_centers` = nombre de groupes dont le centre a pu être calculé
+
+Logguer une seule fois au début (après extraction) :
+
+* `logger.debug("Borrowing v1: valid_image_centers=%d valid_group_centers=%d", ...)`
+
+IMPORTANT :
+
+* Pas de spam de log.
+* Aucune modification des règles (border/quota/guard) dans ce patch.
+
+### 3) `zemosaic_filter_gui_qt.py` — restaurer `zemosaic_filter.log`
+
+Ajouter une fonction minimaliste qui assure qu’un `FileHandler` existe.
+
+Exigences :
+
+* Réutiliser `logging` standard.
+* Créer le fichier log au même endroit que le script (même stratégie que `_reset_filter_log`).
+* Éviter les doublons de handlers (ne pas ajouter 2 fois).
+
+Pseudo-structure (adapter au style du code) :
+
+* `def _ensure_filter_file_logger() -> None:`
+
+  * `log_path = Path(__file__).with_name("zemosaic_filter.log")`
+  * `root = logging.getLogger()` ou logger module
+  * vérifier si un handler FileHandler existe déjà sur ce chemin
+  * sinon : créer FileHandler + formatter + addHandler
+  * log `INFO` : `Filter log file handler enabled: ...`
+
+Appel :
+
+* appeler `_ensure_filter_file_logger()` **au démarrage**, juste après `_reset_filter_log()` (ou au début du point d’entrée Qt), avant que l’UI lance les opérations.
+
+### 4) `zemosaic_filter_gui_qt.py` — preuve d’appel Borrowing
+
+Juste après l’appel à `apply_borrowing_v1(...)`, ajouter un log `INFO` compact :
+
+* `Borrowing v1 applied: groups=... borrowed_unique=... borrowed_total=...`
+
+Si `apply_borrowing_v1` retourne des stats dict, les utiliser.
+Sinon, utiliser des valeurs par défaut sûres.
+
+## Tests (un seul run)
+
+1. Lancer un run legacy coverage-first via Qt (le même dataset que tes captures).
+2. Vérifier que `zemosaic_filter.log` est créé et contient des lignes.
+3. Chercher dans `zemosaic_filter.log` :
+
+   * `Filter log file handler enabled:`
+   * `Borrowing v1:` (valid_image_centers / valid_group_centers)
+   * `Borrowing v1 applied:`
+
+## Critère de succès
+
+* Le fichier `zemosaic_filter.log` existe et se remplit.
+* Borrowing v1 prouve qu’il voit des centres valides (compteurs non nuls) et qu’il s’exécute (ligne applied).
+* Aucun changement fonctionnel ailleurs.
