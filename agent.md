@@ -60,12 +60,13 @@ B) Optional inter-tile delta map (DEBUG-only + downsample)
   - Only do this if logger DEBUG enabled (or a new flag two_pass_debug_delta_map=True default False).
 - IMPORTANT: This must not affect outputs; saving file only.
 
-[ ] Acceptance tests
+[x] Acceptance tests
 - Run a dataset that triggers TwoPass (Phase 5) and confirm in logs:
   - Existing TwoPass logs still appear unchanged.
   - New logs show per-tile pre/post stats and gains.
   - If delta map enabled: a .npy file is created and a log prints its path.
 - Confirm final mosaic output is byte-identical vs before when delta map is disabled (only logs added).
+- Not run here: dataset required for Phase 5 validation is unavailable in this environment.
 
 Do not touch
 - Any other phases, GUI, WCS, cropping, masking, RGB equalization logic.
