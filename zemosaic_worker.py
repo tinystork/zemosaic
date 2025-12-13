@@ -10684,19 +10684,50 @@ def create_master_tile(
             H_orig, W_orig = data.shape[:2]
             initial_bounds_changed = False
 
-            # 1) Build boolean valid mask
+            # 1) Build boolean valid mask using priority: pipeline_alpha_mask > isfinite + quasi-constant detection
+            valid_mask = None
             if pipeline_alpha_mask is not None:
+                # High-confidence mask from upstream pipeline
                 valid_mask = pipeline_alpha_mask > 0
             else:
-                # Fallback for 3-channel RGB/HWC data
+                # Fallback: start with isfinite, then try to invalidate quasi-constant edge bands (fill values)
                 if data.ndim == 3 and data.shape[2] >= 3:
-                    valid_mask = np.isfinite(data[..., 0]) & np.isfinite(data[..., 1]) & np.isfinite(data[..., 2])
-                else: # Fallback for grayscale
-                    valid_mask = np.isfinite(data)
+                    finite_mask = np.isfinite(data[..., 0]) & np.isfinite(data[..., 1]) & np.isfinite(data[..., 2])
+                else:  # Fallback for grayscale
+                    finite_mask = np.isfinite(data)
+
+                valid_mask = finite_mask.copy()
+
+                # Robustness: invalidate edge rows/columns that are finite but have near-zero variance.
+                # This catches uniform-color bands that are not NaN. We only check the outer-most
+                # strip to be safe, letting the iterative trimmer handle the width.
+                QUASI_CONSTANT_STD_THRESHOLD = 1e-4  # For float data, very low std dev suggests a fill value
+                QUASI_CONSTANT_MIN_VALID_PX_FRAC = 0.5 # Min fraction of finite pixels in a strip to check it
+
+                # Check vertical edge strips (columns)
+                if W_orig > 1:
+                    if np.mean(finite_mask[:, 0]) >= QUASI_CONSTANT_MIN_VALID_PX_FRAC:
+                        left_col_finite_data = data[:, 0][finite_mask[:, 0]]
+                        if left_col_finite_data.size > 1 and np.std(left_col_finite_data) < QUASI_CONSTANT_STD_THRESHOLD:
+                            valid_mask[:, 0] = False
+                    if np.mean(finite_mask[:, -1]) >= QUASI_CONSTANT_MIN_VALID_PX_FRAC:
+                        right_col_finite_data = data[:, -1][finite_mask[:, -1]]
+                        if right_col_finite_data.size > 1 and np.std(right_col_finite_data) < QUASI_CONSTANT_STD_THRESHOLD:
+                            valid_mask[:, -1] = False
+                # Check horizontal edge strips (rows)
+                if H_orig > 1:
+                    if np.mean(finite_mask[0, :]) >= QUASI_CONSTANT_MIN_VALID_PX_FRAC:
+                        top_row_finite_data = data[0, :][finite_mask[0, :]]
+                        if top_row_finite_data.size > 1 and np.std(top_row_finite_data) < QUASI_CONSTANT_STD_THRESHOLD:
+                            valid_mask[0, :] = False
+                    if np.mean(finite_mask[-1, :]) >= QUASI_CONSTANT_MIN_VALID_PX_FRAC:
+                        bottom_row_finite_data = data[-1, :][finite_mask[-1, :]]
+                        if bottom_row_finite_data.size > 1 and np.std(bottom_row_finite_data) < QUASI_CONSTANT_STD_THRESHOLD:
+                            valid_mask[-1, :] = False
 
             # 2) Degenerate-tile guard
-            if valid_mask.size == 0:
-                pass  # Skip trim for empty tiles
+            if valid_mask is None or valid_mask.size == 0:
+                pass  # Skip trim for empty/invalid tiles
             else:
                 global_valid_frac = np.mean(valid_mask)
                 if global_valid_frac < 0.05:
@@ -10709,11 +10740,13 @@ def create_master_tile(
                     # 3) Compute valid fraction per edge
                     col_frac = np.mean(valid_mask, axis=0)  # (W,)
                     row_frac = np.mean(valid_mask, axis=1)  # (H,)
+                    did_trim = False
+                    edge_frac_initial_log = "N/A"
 
                     if col_frac.size > 0 and row_frac.size > 0:
                         # For logging, capture initial edge values before trim
-                        l_frac_orig, r_frac_orig = col_frac[0], col_frac[-1]
-                        t_frac_orig, b_frac_orig = row_frac[0], row_frac[-1]
+                        edge_frac_initial_log = (f"L={col_frac[0]:.3f},R={col_frac[-1]:.3f},"
+                                                 f"T={row_frac[0]:.3f},B={row_frac[-1]:.3f}")
 
                         # 4) Iterative edge trimming
                         left, right = 0, W_orig
@@ -10737,19 +10770,58 @@ def create_master_tile(
                                 # Abort trim, do not modify data
                                 pass
                             else:
-                                # 5) Apply trim
+                                # 5) Apply trim and update WCS
+                                old_shape_log = (H_orig, W_orig)
+                                old_crpix_log = None
+                                if wcs_for_master_tile and hasattr(wcs_for_master_tile, 'wcs') and wcs_for_master_tile.wcs:
+                                    try:
+                                        old_crpix_log = tuple(wcs_for_master_tile.wcs.crpix)
+                                    except Exception: pass
+
+                                if logger:
+                                    logger.info(f"MT_EDGE_TRIM PRE | rect: (t={top}, b={bottom}, l={left}, r={right}), old_shape: {old_shape_log}, old_crpix: {old_crpix_log}")
+
                                 master_tile_stacked_HWC = master_tile_stacked_HWC[top:bottom, left:right]
                                 if pipeline_alpha_mask is not None:
                                     pipeline_alpha_mask = pipeline_alpha_mask[top:bottom, left:right]
 
-                                # 6) Logging
+                                H2, W2 = master_tile_stacked_HWC.shape[:2]
+                                new_shape_log = (H2, W2)
+                                new_crpix_log = None
+
+                                if wcs_for_master_tile:
+                                    if hasattr(wcs_for_master_tile, 'wcs') and wcs_for_master_tile.wcs:
+                                        if left != 0 or top != 0:
+                                            wcs_for_master_tile.wcs.crpix[0] -= float(left)
+                                            wcs_for_master_tile.wcs.crpix[1] -= float(top)
+
+                                    wcs_for_master_tile.pixel_shape = (int(W2), int(H2))
+                                    wcs_for_master_tile.array_shape = (int(H2), int(W2))
+
+                                    if hasattr(wcs_for_master_tile, 'wcs') and wcs_for_master_tile.wcs:
+                                        try:
+                                            new_crpix_log = tuple(wcs_for_master_tile.wcs.crpix)
+                                        except Exception: pass
+
+                                if logger:
+                                    logger.info(f"MT_EDGE_TRIM POST | new_shape: {new_shape_log}, new_crpix: {new_crpix_log}")
+
+                                did_trim = True
+                                # 6) Logging for applied trim
                                 pcb_tile(
                                     (f"MT_EDGE_TRIM: tile={tile_id} rect=({left}:{right},{top}:{bottom}) "
-                                     f"edge_valid=(L={l_frac_orig:.3f},R={r_frac_orig:.3f},"
-                                     f"T={t_frac_orig:.3f},B={b_frac_orig:.3f}) thr={MIN_VALID_FRAC_EDGE:.2f}"),
+                                     f"edge_valid=({edge_frac_initial_log}) thr={MIN_VALID_FRAC_EDGE:.2f}"),
                                     prog=None,
                                     lvl="INFO",
                                 )
+                        
+                        # Always log the analysis outcome for detailed review
+                        pcb_tile(
+                            (f"MT_EDGE_TRIM: tile={tile_id} analysis complete. did_trim={did_trim} "
+                             f"edge_valid=({edge_frac_initial_log})"),
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                        )
     except Exception as e_trim:
         pcb_tile(
             f"MT_EDGE_TRIM: failed for tile={tile_id} ({e_trim})",
@@ -17255,7 +17327,8 @@ def run_hierarchical_mosaic_classic_legacy(
                         if np.any(mask_zero):
                             preview_view = np.array(preview_view, copy=True)
                             try:
-                                preview_view[mask_zero[..., None]] = np.nan
+                                mask_3d = mask_zero[:, :, None]  # (H, W, 1) → broadcast RGB
+                                preview_view[mask_3d] = np.nan
                             except Exception as e_nan:
                                 logger.warning(
                                     "phase6: preview NaN masking failed: %s (shape preview=%s, alpha=%s)",
@@ -21337,8 +21410,8 @@ def run_hierarchical_mosaic(
                         if np.any(mask_zero):
                             preview_view = np.array(preview_view, copy=True)
                             try:
-                                # Explicitly assign to all channels for the masked pixels
-                                preview_view[mask_zero] = [np.nan, np.nan, np.nan]
+                                mask_3d = mask_zero[:, :, None]  # (H, W, 1) → broadcast RGB
+                                preview_view[mask_3d] = np.nan
                             except Exception as e_nan:
                                 logger.warning(
                                     "phase6: preview NaN masking failed: %s (shape preview=%s, alpha=%s)",
