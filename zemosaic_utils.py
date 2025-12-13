@@ -4970,8 +4970,7 @@ def apply_borrowing_v1(
             if best_neighbor is None or best_distance is None:
                 continue
             stats["borrow_attempts_total"] += 1
-            if best_distance >= dist_to_g:
-                continue
+
             if key in borrowed_anywhere:
                 continue
             if best_neighbor not in member_sets:

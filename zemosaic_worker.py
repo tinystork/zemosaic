@@ -10671,6 +10671,93 @@ def create_master_tile(
         "altaz_nanize": altaz_nanize,
     }
     master_tile_stacked_HWC, pipeline_alpha_mask = _apply_lecropper_pipeline(master_tile_stacked_HWC, pipeline_cfg)
+
+    try:
+        if master_tile_stacked_HWC is not None:
+            # MT_EDGE_TRIM: Deterministic edge trim based on valid data fraction.
+            # This is a post-lecropper step to clean up thin invalid strips at the edges.
+            MIN_VALID_FRAC_EDGE = 0.90
+            MIN_W = 64
+            MIN_H = 64
+
+            data = master_tile_stacked_HWC
+            H_orig, W_orig = data.shape[:2]
+            initial_bounds_changed = False
+
+            # 1) Build boolean valid mask
+            if pipeline_alpha_mask is not None:
+                valid_mask = pipeline_alpha_mask > 0
+            else:
+                # Fallback for 3-channel RGB/HWC data
+                if data.ndim == 3 and data.shape[2] >= 3:
+                    valid_mask = np.isfinite(data[..., 0]) & np.isfinite(data[..., 1]) & np.isfinite(data[..., 2])
+                else: # Fallback for grayscale
+                    valid_mask = np.isfinite(data)
+
+            # 2) Degenerate-tile guard
+            if valid_mask.size == 0:
+                pass  # Skip trim for empty tiles
+            else:
+                global_valid_frac = np.mean(valid_mask)
+                if global_valid_frac < 0.05:
+                    pcb_tile(
+                        f"MT_EDGE_TRIM: tile={tile_id} skipped (degenerate, valid_frac={global_valid_frac:.3f})",
+                        prog=None,
+                        lvl="WARN",
+                    )
+                else:
+                    # 3) Compute valid fraction per edge
+                    col_frac = np.mean(valid_mask, axis=0)  # (W,)
+                    row_frac = np.mean(valid_mask, axis=1)  # (H,)
+
+                    if col_frac.size > 0 and row_frac.size > 0:
+                        # For logging, capture initial edge values before trim
+                        l_frac_orig, r_frac_orig = col_frac[0], col_frac[-1]
+                        t_frac_orig, b_frac_orig = row_frac[0], row_frac[-1]
+
+                        # 4) Iterative edge trimming
+                        left, right = 0, W_orig
+                        top, bottom = 0, H_orig
+
+                        while left < right and col_frac[left] < MIN_VALID_FRAC_EDGE:
+                            left += 1
+                        while left < right and col_frac[right - 1] < MIN_VALID_FRAC_EDGE:
+                            right -= 1
+                        while top < bottom and row_frac[top] < MIN_VALID_FRAC_EDGE:
+                            top += 1
+                        while top < bottom and row_frac[bottom - 1] < MIN_VALID_FRAC_EDGE:
+                            bottom -= 1
+
+                        initial_bounds_changed = (left > 0 or right < W_orig or top > 0 or bottom < H_orig)
+
+                        if initial_bounds_changed:
+                            new_w, new_h = right - left, bottom - top
+
+                            if new_w < MIN_W or new_h < MIN_H:
+                                # Abort trim, do not modify data
+                                pass
+                            else:
+                                # 5) Apply trim
+                                master_tile_stacked_HWC = master_tile_stacked_HWC[top:bottom, left:right]
+                                if pipeline_alpha_mask is not None:
+                                    pipeline_alpha_mask = pipeline_alpha_mask[top:bottom, left:right]
+
+                                # 6) Logging
+                                pcb_tile(
+                                    (f"MT_EDGE_TRIM: tile={tile_id} rect=({left}:{right},{top}:{bottom}) "
+                                     f"edge_valid=(L={l_frac_orig:.3f},R={r_frac_orig:.3f},"
+                                     f"T={t_frac_orig:.3f},B={b_frac_orig:.3f}) thr={MIN_VALID_FRAC_EDGE:.2f}"),
+                                    prog=None,
+                                    lvl="INFO",
+                                )
+    except Exception as e_trim:
+        pcb_tile(
+            f"MT_EDGE_TRIM: failed for tile={tile_id} ({e_trim})",
+            prog=None,
+            lvl="ERROR",
+        )
+
+
     if master_tile_stacked_HWC is None:
         raise RuntimeError("lecropper pipeline returned no data for master tile")
     alpha_mask_out: np.ndarray | None = None
