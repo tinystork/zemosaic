@@ -1,141 +1,206 @@
-# Mission — Debug ciblé “dominante verte” en mode Classic (sans refactor)
+# 📄 `agent.md` (version corrigée et verrouillée)
 
-Objectif : identifier *le premier endroit* où la dérive couleur apparaît dans le pipeline Classic
-(P3 → P4 → P5 → P6/7) en ajoutant des logs DEBUG très ciblés.
+```markdown
+# 🎯 Mission — Diagnostic du décalage vert (mode Classic)
+# 🔒 IMPORTANT : réutiliser le système de logging EXISTANT (GUI Qt)
 
-Contraintes :
-- NE PAS modifier l’algorithme de stacking/fusion/export.
-- NE PAS toucher au SDS / Grid mode (sauf si besoin strictement pour la propagation du niveau de log).
-- Ajouter uniquement du logging et le câblage “Logging level” du GUI Qt vers le worker.
-- Logs uniquement actifs quand le worker est en DEBUG (ou quand un flag debug est activé).
+## Contexte clé (à lire AVANT toute modification)
+⚠️ Le GUI Qt de ZeMosaic possède DÉJÀ un menu déroulant :
+- Section : "Logging / progress"
+- Champ : "Logging level"
+- Valeurs existantes : Info / Debug (au minimum)
+
+👉 Ce menu existe déjà.
+👉 Il fonctionne déjà côté GUI.
+👉 IL NE FAUT PAS créer un nouveau système de logging.
+👉 IL NE FAUT PAS ajouter un nouveau réglage utilisateur.
+👉 IL FAUT UNIQUEMENT PROPAGER la valeur EXISTANTE jusqu’au worker.
 
 ---
 
-## Contexte (preuves)
-- Phase 3 : on voit déjà des logs `[DBG_RGB] P3_pre_stack_core` puis `P3_post_poststack_rgb_eq` avec ratios 1.0 → P3 OK.
-- Le run Classic legacy affiche : “Worker logging level set to INFO” → le choix de niveau dans le GUI n’atteint pas le worker dans ce chemin.
+## Objectif
+Identifier précisément **à quelle phase du pipeline Classic**
+le canal vert commence à dériver par rapport à R et B.
+
+Pour cela :
+1) S’assurer que le **niveau de log sélectionné dans le GUI Qt**
+   est réellement appliqué au **logger du worker**
+2) Ajouter des logs DEBUG **ultra ciblés** aux frontières critiques
+   (P3 → P4 → P5 → export)
+
+Aucun changement algorithmique.
+Aucun refactor.
+Logs uniquement.
 
 ---
 
-## Changements demandés
+## 🚫 Interdictions strictes
+- ❌ Ne PAS créer un nouveau menu de logging
+- ❌ Ne PAS créer un nouveau flag debug
+- ❌ Ne PAS créer un logger parallèle
+- ❌ Ne PAS modifier la logique de calcul des images
+- ❌ Ne PAS modifier Grid ou SDS
 
-### 1) Propager le “Logging level” du GUI Qt vers le worker (vital)
-Fichier : `zemosaic_gui_qt.py`
+---
 
-- S’assurer que le combo “Logging level” propose au minimum :
-  - `Info` → worker level `INFO`
-  - `Debug` → worker level `DEBUG`
+## ✅ Ce qui DOIT être fait (et seulement ça)
 
-- Lors du lancement du worker (construction des paramètres de run), injecter un champ explicite :
-  - `worker_logging_level` = `"DEBUG"` ou `"INFO"` selon le choix
-  - (ou `logging_level`, mais utiliser le nom déjà attendu côté worker si existant)
+---
 
-But : quand je mets Debug dans le GUI, le fichier `zemosaic_worker.log` doit contenir des lignes DEBUG.
+## 1️⃣ Utiliser le dropdown "Logging level" EXISTANT (GUI Qt)
 
-### 2) Dans le worker : respecter le niveau de log demandé (notamment Classic legacy)
-Fichier : `zemosaic_worker.py`
+### Fichier : `zemosaic_gui_qt.py`
 
-- Au tout début du run (et aussi au début du chemin “classic legacy”), lire le paramètre reçu :
-  - `worker_logging_level` (prioritaire)
-  - fallback sur config existante si déjà en place
-- Appliquer :
-  - `logger.setLevel(logging.DEBUG/INFO)`
-  - s’assurer que les handlers suivent (setLevel sur handler si nécessaire)
+- Le dropdown **existe déjà**
+- Il fournit déjà une valeur logique (`"Info"`, `"Debug"`, etc.)
 
-- Ajouter un log INFO unique confirmant le niveau choisi :
-  - `Worker logging level set to DEBUG` ou `INFO`
+👉 Action demandée :
+- Récupérer la valeur ACTUELLE de ce dropdown
+- La transmettre telle quelle au worker
+- Sans transformation exotique
+- Sans créer de nouvelle option
 
-### 3) Logs DEBUG ciblés par phase (P3/P4/P5/P6-7)
+Par exemple (conceptuellement) :
+- `"Info"` → worker log level INFO
+- `"Debug"` → worker log level DEBUG
 
-#### A) Phase 3 / 3.x — Baseline “tuile saine”
-Objectif : figer noir sur blanc que la couleur est saine avant d’assembler la mosaïque.
+⚠️ Ne pas créer un nouveau champ UI.
+⚠️ Ne pas renommer le champ.
+⚠️ Ne pas ajouter de nouvelle clé de config utilisateur.
 
-À logger (DEBUG) **avant et après** :
-- `stack_core` (déjà partiellement loggé via `_dbg_rgb_stats` → garder, mais harmoniser les labels)
-- `_poststack_rgb_equalization` si appelé
+---
 
-Mesures requises :
-- min / mean / median par canal (R,G,B)
-- ratios `G/R` et `G/B`
-- idem **sur pixels valides uniquement** (si un masque existe à ce stade, sinon valid=1.0)
+## 2️⃣ Appliquer réellement ce niveau de log dans le worker
 
-=> Logs très courts : 2 à 4 lignes par tuile max.
+### Fichier : `zemosaic_worker.py`
 
-#### B) Phase 4 / 4.x — Assemblage mosaïque (ZONE CRITIQUE #1)
-Objectif : détecter si la dérive apparaît lors de la fusion + coverage + propagation NaN/alpha.
+Contexte important :
+- Le worker peut être lancé dans un process séparé
+- Le niveau de log par défaut est actuellement INFO
+- Le chemin "classic legacy" ne respecte pas toujours le niveau demandé
 
-Ajouter des logs DEBUG :
-- juste AVANT la fusion finale (ou début de la phase 4)
-- juste APRÈS la mosaïque assemblée (data + coverage prêts)
+👉 Action demandée :
+- Lire le **niveau de log transmis par le GUI Qt existant**
+- Appliquer ce niveau :
+  - au logger `ZeMosaicWorker`
+  - et à ses handlers si nécessaire
 
-Mesures :
-1) stats RGB “brutes” (comme P3)
-2) stats RGB **pixels valides uniquement**
-   - “valide” = `coverage > 0` (ou masque équivalent)
-3) moyenne RGB **pondérée par coverage**
-   - calcul : mean_weighted[c] = sum(data[c] * cov) / sum(cov) sur pixels cov>0
-4) ratios `G/R` et `G/B` sur (2) et (3)
+Ajouter UN log INFO (unique) au démarrage du worker :
+```
 
-Important :
-- Ne pas logguer à chaque tile (trop bruyant). Uniquement “pré-fusion” et “post-fusion”.
-- Si la phase 4 assemble par étapes (super-tiles), logguer seulement au niveau final.
+[LOGCFG] effective_level=DEBUG source=qt_gui_dropdown
 
-#### C) Phase 5 — Post-processing global (ZONE CRITIQUE #2)
-Objectif : vérifier si un traitement global “classic-only” crée la dominante verte.
+```
+ou
+```
+
+[LOGCFG] effective_level=INFO source=qt_gui_dropdown
+
+```
+
+But :
+- Pouvoir prouver que le choix du dropdown GUI est bien effectif côté worker
+
+---
+
+## 3️⃣ Logs DEBUG ciblés par phase (AUCUN autre log)
+
+Ces logs doivent être conditionnés par :
+```
+
+if logger.isEnabledFor(logging.DEBUG):
+
+```
+
+### 🔍 Phase 3 / 3.x — Stack des master tiles (baseline saine)
+
+Objectif :
+- Confirmer que la couleur est saine AVANT la mosaïque
 
 Ajouter logs DEBUG :
-- début phase 5 : stats mosaïque (brute + valid-only + weighted)
-- après chaque étape “suspecte” si présente :
-  - `_apply_final_mosaic_rgb_equalization` (si appelé)
-  - black point equalization / scaling / normalization historique
-  - toute correction per-channel
+- Avant `stack_core`
+- Après `stack_core`
+- Après `_poststack_rgb_equalization` (si appelée)
+
+Mesures à logger (1 ligne par point) :
+- min / mean / median par canal
+- ratio G/R et G/B
+- uniquement sur pixels valides
+
+Labels obligatoires :
+- `P3_pre_stack_core`
+- `P3_post_stack_core`
+- `P3_post_poststack_rgb_eq`
+
+---
+
+### 🔥 Phase 4 / 4.x — Assemblage mosaïque (ZONE CRITIQUE #1)
+
+Objectif :
+- Détecter si la dérive apparaît lors de la fusion + coverage
+
+Ajouter logs DEBUG :
+- Juste AVANT la fusion finale
+- Juste APRÈS la fusion finale
+
+Mesures :
+1) Stats RGB globales
+2) Stats RGB sur pixels valides uniquement
+   - valid = coverage > 0
+3) Moyenne RGB pondérée par coverage
+4) Ratios G/R et G/B pour (2) et (3)
+
+Labels obligatoires :
+- `P4_pre_fusion`
+- `P4_post_fusion`
+
+---
+
+### 🔥🔥 Phase 5 — Post-processing global (ZONE CRITIQUE #2)
+
+Objectif :
+- Identifier une normalisation RGB globale incorrecte (Classic-only)
+
+Ajouter logs DEBUG :
+- Avant tout traitement global
+- Après chaque étape suspecte :
+  - `_apply_final_mosaic_rgb_equalization`
+  - normalisation RGB
+  - scaling global
 
 Si une égalisation RGB est appliquée :
-- logguer :
-  - target (valeur cible)
-  - gains/facteurs appliqués par canal
-  - (si offsets) offsets par canal
+- Logger explicitement :
+  - cibles
+  - gains par canal
 
-#### D) Phase 6–7 — Export/clamp (secondaire)
+Labels :
+- `P5_pre_global_post`
+- `P5_post_<step_name>`
+
+---
+
+### ⚠️ Phase 6–7 — Export / clamp (secondaire)
+
 Ajouter logs DEBUG uniques :
-- dtype entrée
-- clamp min/max par canal avant conversion
-- dtype sortie
-- mention explicite si un stretch automatique est appliqué avant PNG
+- dtype avant export
+- min / max par canal avant clamp
+- dtype après conversion
 
-### 4) Utilitaire de stats (réutiliser l’existant)
-- Il existe déjà `_dbg_rgb_stats` dans `zemosaic_worker.py`.
-- L’étendre proprement (sans casser appels existants) pour accepter :
-  - `mask_valid: np.ndarray | None` (H,W bool) OU `coverage: np.ndarray | None`
-- Implémenter dans la fonction :
-  - stats globales
-  - stats sur valid-only (si mask fourni)
-  - weighted mean (si coverage fourni)
-
-⚠️ Performance :
-- Ne faire ces calculs QUE si `logger.isEnabledFor(DEBUG)`.
+Labels :
+- `P6_pre_export`
+- `P7_post_export`
 
 ---
 
-## Tests / Validation
-
-1) Dans le GUI Qt, sélectionner “Debug” puis lancer un run Classic.
-   - Attendu : `zemosaic_worker.log` contient des lignes DEBUG.
-   - Attendu : une ligne INFO confirme “Worker logging level set to DEBUG”.
-
-2) Comparer Classic vs SDS sur un même dataset :
-   - Relever les logs P4/P5 :
-   - Identifier le *premier label* où `ratio_G_R` ou `ratio_G_B` diverge significativement.
-
-3) S’assurer que :
-- aucun changement d’image (hors logs)
-- SDS/Grid inchangés fonctionnellement
-- pas de spam log (quelques lignes par phase seulement)
+## 4️⃣ Utilitaire de stats
+- Réutiliser `_dbg_rgb_stats` existant
+- L’étendre si nécessaire (coverage / mask)
+- AUCUN nouvel utilitaire parallèle
 
 ---
 
-## Fichiers concernés
-- `zemosaic_gui_qt.py`
-- `zemosaic_worker.py`
-(éventuellement `zemosaic_config.py` seulement si nécessaire pour stocker la préférence de niveau de log)
+## 🎯 Critère de succès
+Avec **UN SEUL RUN Classic en Debug**, on doit pouvoir dire :
+> “La dérive G/R apparaît pour la première fois en phase X, étape Y.”
 
+👉 Le correctif viendra APRÈS, dans une mission séparée.
