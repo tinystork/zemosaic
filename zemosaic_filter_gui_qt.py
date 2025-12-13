@@ -552,6 +552,12 @@ except Exception:  # pragma: no cover - optional dependency guard
     apply_borrowing_v1 = None  # type: ignore[assignment]
 
 
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
+
+
 logger = logging.getLogger(__name__)
 
 QT_FILTER_WINDOW_GEOMETRY_KEY = "qt_filter_window_geometry"
@@ -6156,13 +6162,32 @@ class FilterQtDialog(QDialog):
             self._rectangle_selector = None
         if canvas is not None:
             try:
+                canvas.setParent(None)
+            except Exception:
+                pass
+            try:
+                canvas.deleteLater()
+            except Exception:
+                pass
+            try:
                 canvas.hide()
             except Exception:
                 pass
 
     def _dispose_coverage_canvas(self) -> None:
+        canvas = self._coverage_canvas
         self._coverage_canvas = None
         self._coverage_axes = None
+        if canvas is not None:
+            try:
+                canvas.setParent(None)
+            except Exception:
+                pass
+            try:
+                canvas.deleteLater()
+            except Exception:
+                pass
+
 
     def _on_preview_canvas_destroyed(self, _obj: QObject | None = None) -> None:  # pragma: no cover - Qt signal glue
         self._dispose_preview_canvas()
@@ -6572,7 +6597,18 @@ class FilterQtDialog(QDialog):
         self._hide_processing_overlay()
         self._dispose_preview_canvas()
         self._dispose_coverage_canvas()
+        self._safe_shutdown_matplotlib()
         super().closeEvent(event)
+
+    def _safe_shutdown_matplotlib(self) -> None:
+        """Safely close all Matplotlib figures during shutdown."""
+        if plt is None:
+            return
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+
 
     def accept(self) -> None:  # noqa: D401 - inherit docstring
         self._accepted = True

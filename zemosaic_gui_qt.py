@@ -5440,6 +5440,13 @@ class ZeMosaicQtMainWindow(QMainWindow):
             except Exception as e:
                 print(f"[ZeMosaicQt] Error during GPU cleanup: {e}")
 
+        # Safely shut down matplotlib to prevent draw_idle calls on deleted canvases
+        try:
+            import matplotlib.pyplot as plt
+            plt.close("all")
+        except Exception:
+            pass
+
         super().closeEvent(event)
 
     # ------------------------------------------------------------------
