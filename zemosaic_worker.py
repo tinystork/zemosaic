@@ -13474,11 +13474,14 @@ def run_second_pass_coverage_renorm(
         except wcs_module.NoConvergence as conv_exc:
             if logger:
                 logger.warning(
-                    "[TwoPass] WCS convergence failed on channel %d, creating empty patch: %s",
+                    "[TwoPass] WCS convergence failed on channel %d%s: %s",
                     ch_idx,
+                    " (GPU)" if use_gpu_flag else "",
                     conv_exc,
                     exc_info=False,
                 )
+            if use_gpu_flag:
+                raise
             chan_mosaic = np.full(shape_out_hw, np.nan, dtype=np.float32)
             chan_cov = np.zeros(shape_out_hw, dtype=np.float32)
         except TypeError as type_err:
@@ -13494,15 +13497,18 @@ def run_second_pass_coverage_renorm(
                         removed.append(key)
                         retry_kwargs.pop(key, None)
                 if removed:
+                    chan_mosaic = chan_cov = None
                     try:
                         chan_mosaic, chan_cov = _invoke_reproj(True, retry_kwargs)
                     except Exception as retry_exc:
                         if logger:
                             logger.warning(
-                                "[TwoPass] GPU retry failed, switching to CPU: %s (removed=%s)",
+                                "[TwoPass] GPU retry failed: %s (removed=%s)",
                                 retry_exc,
                                 ",".join(removed),
                             )
+                if chan_mosaic is None or chan_cov is None:
+                    raise
             if chan_mosaic is None or chan_cov is None:
                 try:
                     chan_mosaic, chan_cov = _invoke_reproj(False, local_kwargs)
@@ -13526,38 +13532,15 @@ def run_second_pass_coverage_renorm(
                         )
                     raise
         except Exception as exc:
-            if use_gpu_flag:
-                try:
-                    chan_mosaic, chan_cov = _invoke_reproj(False, local_kwargs)
-                except wcs_module.NoConvergence as conv_exc_cpu2:
-                    if logger:
-                        logger.warning(
-                            "[TwoPass] WCS convergence failed on channel %d (CPU fallback), creating empty patch: %s",
-                            ch_idx,
-                            conv_exc_cpu2,
-                            exc_info=False,
-                        )
-                    chan_mosaic = np.full(shape_out_hw, np.nan, dtype=np.float32)
-                    chan_cov = np.zeros(shape_out_hw, dtype=np.float32)
-                except Exception as cpu_exc:
-                    if logger:
-                        logger.warning(
-                            "[TwoPass] Reprojection failed on channel %d (GPU+CPU): %s / %s",
-                            ch_idx,
-                            exc,
-                            cpu_exc,
-                            exc_info=True,
-                        )
-                    raise
-            else:
-                if logger:
-                    logger.warning(
-                        "[TwoPass] Reprojection failed on channel %d: %s",
-                        ch_idx,
-                        exc,
-                        exc_info=True,
-                    )
-                raise
+            if logger:
+                logger.warning(
+                    "[TwoPass] Reprojection failed on channel %d%s: %s",
+                    ch_idx,
+                    " (GPU)" if use_gpu_flag else "",
+                    exc,
+                    exc_info=True,
+                )
+            raise
         chan_mosaic_np = np.asarray(chan_mosaic, dtype=np.float32)
         chan_cov_np = np.asarray(chan_cov, dtype=np.float32)
         if logger:
@@ -13572,55 +13555,84 @@ def run_second_pass_coverage_renorm(
         return ch_idx, chan_mosaic_np, chan_cov_np
 
     reproj_chunk_total = n_channels
-    if n_channels == 1:
-        try:
-            ch_idx, chan_mosaic_np, chan_cov_np = _process_channel(0, use_gpu)
-        except Exception:
-            return None
-        mosaic_channels[0] = chan_mosaic_np
-        coverage_channels[0] = chan_cov_np
-        _emit_two_pass_stats(
-            tiles_total,
-            chunk_index=1,
-            chunk_total=reproj_chunk_total,
-            force=False,
-            stage="reproject",
-        )
-    else:
-        channel_tasks: list[tuple[int, bool]] = []
-        gpu_assigned = False
-        for ch in range(n_channels):
-            use_gpu_flag = bool(use_gpu and not gpu_assigned)
-            if use_gpu_flag:
-                gpu_assigned = True
-            channel_tasks.append((ch, use_gpu_flag))
-        max_channel_workers = max(1, min(n_channels, cpu_workers_hint or n_channels))
-        reproj_failure = False
+
+    def _run_channels(use_gpu_flag: bool) -> tuple[list[np.ndarray | None], list[np.ndarray | None]]:
+        local_mosaics: list[np.ndarray | None] = [None] * n_channels
+        local_covs: list[np.ndarray | None] = [None] * n_channels
         done_channels = 0
-        with ThreadPoolExecutor(max_workers=max_channel_workers) as executor:
-            future_map = {
-                executor.submit(_process_channel, ch_idx, use_gpu_flag): ch_idx for ch_idx, use_gpu_flag in channel_tasks
-            }
-            for fut in as_completed(future_map):
+        max_channel_workers = max(1, min(n_channels, cpu_workers_hint or n_channels))
+
+        def _record_result(ch_idx: int, chan_mosaic_np: np.ndarray, chan_cov_np: np.ndarray) -> None:
+            nonlocal done_channels
+            local_mosaics[ch_idx] = chan_mosaic_np
+            local_covs[ch_idx] = chan_cov_np
+            done_channels += 1
+            _emit_two_pass_stats(
+                tiles_total,
+                chunk_index=done_channels,
+                chunk_total=reproj_chunk_total,
+                force=False,
+                stage="reproject",
+            )
+
+        if use_gpu_flag or max_channel_workers == 1 or n_channels == 1:
+            for ch in range(n_channels):
+                ch_idx, chan_mosaic_np, chan_cov_np = _process_channel(ch, use_gpu_flag)
+                _record_result(ch_idx, chan_mosaic_np, chan_cov_np)
+        else:
+            failure_exc: Exception | None = None
+            with ThreadPoolExecutor(max_workers=max_channel_workers) as executor:
+                future_map = {
+                    executor.submit(_process_channel, ch_idx, use_gpu_flag): ch_idx for ch_idx in range(n_channels)
+                }
+                for fut in as_completed(future_map):
+                    try:
+                        ch_idx, chan_mosaic_np, chan_cov_np = fut.result()
+                        _record_result(ch_idx, chan_mosaic_np, chan_cov_np)
+                    except Exception as exc:
+                        failure_exc = exc
+                        break
+            if failure_exc:
+                raise failure_exc
+        if any(m is None for m in local_mosaics):
+            raise RuntimeError("[TwoPass] Missing mosaic output after reprojection")
+        return local_mosaics, local_covs
+
+    backend_used_gpu = False
+    try:
+        if n_channels == 1:
+            try:
+                mosaics, covs = _run_channels(use_gpu)
+                backend_used_gpu = bool(use_gpu)
+            except Exception:
+                if use_gpu:
+                    mosaics, covs = _run_channels(False)
+                    backend_used_gpu = False
+                else:
+                    raise
+        else:
+            if use_gpu:
                 try:
-                    ch_idx, chan_mosaic_np, chan_cov_np = fut.result()
-                    mosaic_channels[ch_idx] = chan_mosaic_np
-                    coverage_channels[ch_idx] = chan_cov_np
-                except Exception as exc:
-                    reproj_failure = True
+                    mosaics, covs = _run_channels(True)
+                    backend_used_gpu = True
+                except Exception as gpu_exc:
                     if logger:
-                        logger.warning("[TwoPass] Channel %d reprojection failed: %s", future_map.get(fut, -1), exc)
-                    break
-                done_channels += 1
-                _emit_two_pass_stats(
-                    tiles_total,
-                    chunk_index=done_channels,
-                    chunk_total=reproj_chunk_total,
-                    force=False,
-                    stage="reproject",
-                )
-        if reproj_failure or any(m is None for m in mosaic_channels):
-            return None
+                        logger.warning(
+                            "[TwoPass] GPU reprojection failed on one or more channels; rerunning all channels on CPU to avoid mixed backend (%s)",
+                            gpu_exc,
+                        )
+                    mosaics, covs = _run_channels(False)
+                    backend_used_gpu = False
+            else:
+                mosaics, covs = _run_channels(False)
+                backend_used_gpu = False
+    except Exception:
+        return None
+
+    mosaic_channels = mosaics
+    coverage_channels = covs
+    if logger:
+        logger.debug("[TwoPass] Two-pass reprojection backend: gpu_all=%s", backend_used_gpu)
 
     coverage_result: np.ndarray | None = None
     for cov in coverage_channels:

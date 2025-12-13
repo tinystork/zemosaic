@@ -4091,7 +4091,7 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
             del img_gpu, mask_gpu
         eps = cp.float32(1e-6)
         mosaic_gpu = cp.where(weight_sum_gpu > eps, mosaic_sum_gpu / cp.maximum(weight_sum_gpu, eps), 0.0)
-        coverage_gpu = cp.clip(weight_sum_gpu / float(max(1, n_inputs)), 0.0, 1.0)
+        coverage_gpu = cp.nan_to_num(weight_sum_gpu, nan=0.0, posinf=0.0, neginf=0.0)
         mosaic_gpu = _finalize_match_background(mosaic_gpu)
         return cp.asnumpy(mosaic_gpu).astype(np.float32), cp.asnumpy(coverage_gpu).astype(np.float32)
 
