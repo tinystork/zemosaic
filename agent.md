@@ -1,82 +1,81 @@
-# Mission — SDS Color Safety: Enforce CPU/GPU Backend Consistency
+# Mission — Phase 3 master tiles : cache .npy protégé par refcount (suppression sûre en parallèle)
 
-## Context
-A critical color regression (green tint) was fixed in legacy mode by identifying
-a CPU/GPU backend split during coverage-based renormalization (Two-Pass).
-Although SDS (grid / SDS mode) mainly applies normalization *between images*
-(e.g. linear_fit), similar risks exist whenever SDS executes:
+## Problème observé
+Des "trous" dans la mosaïque finale correspondent à des master tiles non produites, avec logs:
+- mastertile_warn_cache_file_missing
+- mastertile_error_no_valid_images_from_cache
+- run_warn_phase3_master_tile_creation_failed_thread
+et num_master_tiles < tiles_total.
 
-- statistical operations (coadd, rejection, weighting),
-- coverage / footprint usage,
-- reprojection with possible GPU fallback.
+Cause probable: suppression de caches `.npy` trop tôt (mode per_tile), alors que d’autres master tiles en ont encore besoin.
+Cela peut arriver même sans borrowing explicite (overlap/duplication/partage involontaire).
 
-Even when normalization is conceptually “between images”, backend mixing
-(CPU for some images/channels, GPU for others) can introduce subtle numerical
-differences leading to chromatic drift.
+## Objectif
+Mettre en place un mécanisme **de référence comptée** des caches `.npy` en Phase 3:
+- Construire un refcount global des `path_preprocessed_cache` utilisés par toutes les master tiles planifiées
+- À la fin de chaque master tile (future terminée), décrémenter le refcount pour les caches réellement utilisés par cette tile
+- Supprimer (unlink) un cache **uniquement quand son refcount atteint 0**
+=> suppression sûre même en exécution parallèle (ThreadPool), sans trous, sans garder tout jusqu’à la fin.
 
-This mission ensures SDS is **architecturally protected** against such issues.
+## Contraintes strictes
+- ✅ Changements minimaux, localisés
+- ✅ Pas de nouveaux fichiers
+- ✅ Pas de refactor global
+- ✅ Ne pas créer de nouveau système de logs (le GUI a déjà un dropdown niveau log)
+- ✅ Ne pas toucher au comportement batch size (0 vs >1) existant
+- ✅ SDS et grid_mode: ne pas modifier leur logique; seul l’aspect cache-retention Phase 3 est concerné
+- ✅ Ne pas changer l’API publique/config: utiliser `cache_retention_mode` existant
+  - Si `cache_retention_mode != "per_tile"` => comportement inchangé
+  - Si `cache_retention_mode == "per_tile"` => appliquer refcount en lieu et place de suppression naïve
 
-## Scope
-SDS pipeline only (grid / SDS code paths).
-Legacy / classic mode is explicitly out of scope (already fixed).
+## Portée / fichiers
+- Principal: `zemosaic_worker.py`
+- Aucun autre fichier sauf nécessité absolue (normalement aucune)
 
-## Key Rule (Invariant)
-For any SDS processing step that:
-- depends on statistics (mean, sigma-clip, winsorized, weights),
-- or uses coverage / footprint / weight_sum,
-- or applies normalization (e.g. linear_fit),
+## Design attendu (très précis)
+### 1) Normalisation des paths
+Construire les clés du refcount à partir d’un chemin normalisé:
+- `norm = os.path.normpath(str(path))`
+(Option: Path(path).resolve() seulement si pas trop coûteux / pas de surprise sur Windows)
 
-👉 **ALL RGB channels and ALL images involved in that step MUST use the same backend**:
-- either CPU for all,
-- or GPU for all.
+### 2) Pré-calcul refcount
+Avant de lancer les futures Phase 3:
+- Parcourir toutes les tuiles / groupes planifiés (group_info_list / raw_entries)
+- Pour chaque `raw_entry['path_preprocessed_cache']`:
+  - Ajouter au compteur global
+- Important: éviter de compter 2 fois le même path dans **la même tile**:
+  - Par tile: `unique_paths = set(norm_paths_for_tile)`
+  - Incrémenter le global avec ces uniques
 
-Backend mixing within a single step is strictly forbidden.
+### 3) Map tile -> unique_paths
+Conserver une structure:
+- `tile_cache_paths_unique[tile_id] = set(normalized_paths)` pour décrément ensuite
 
-## Required Changes
+### 4) À la complétion de chaque future
+Quand une master tile est "done":
+- Récupérer `paths = tile_cache_paths_unique[tile_id]` (set)
+- Pour chaque path:
+  - `refcount[path] -= 1`
+  - si `refcount[path] == 0`: supprimer le fichier (unlink)
+- En cas de suppression impossible (file missing / permission):
+  - log DEBUG (pas WARN spam), continuer
 
-### 1) Backend Policy: “All-or-Nothing” (SDS)
-For each SDS processing stage that can run on GPU:
-- If `use_gpu=True`:
-  - Attempt GPU for the entire stage.
-  - If any GPU error or fallback occurs:
-    - Abort the stage.
-    - Log a single warning.
-    - Rerun the stage entirely on CPU.
-- Never allow partial GPU usage (no per-image or per-channel split).
+### 5) Compatibilité avec erreurs
+Si une master tile échoue:
+- On décrémente quand même les paths de cette tile (car ce travail n’aura pas besoin d’être relancé dans le même run)
+- MAIS: ne jamais descendre < 0: clamp / assert debug si négatif
 
-This policy must be enforced even if GPU and CPU implementations are
-mathematically equivalent.
+### 6) Logging sobre
+- 1 log INFO au début Phase 3 (si per_tile actif):
+  "Phase3: per_tile cache retention uses refcount; safe deletion enabled (N unique cache files tracked)."
+- log INFO en fin Phase 3:
+  "Phase3: refcount cleanup complete; removed X files; remaining Y (if any)."
+  si refcount tracking détecte qu’un .npy est référencé par >1 tile, log INFO “shared cache detected” (une seule ligne),
 
-### 2) Explicit Backend Logging (Low Noise)
-Add **one concise log line per SDS stage** (INFO or DEBUG, existing logger only):
-
-- `[SDS] stage=<name> backend_policy=all_or_nothing gpu_all=True`
-- or, on fallback:
-  - `[SDS] stage=<name> GPU failed → rerun all CPU`
-
-No new logging system must be introduced.
-Respect the existing GUI log-level dropdown.
-
-### 3) No Algorithmic Changes
-- Do NOT change the math of:
-  - linear_fit normalization,
-  - rejection algorithms,
-  - weighting or stacking logic.
-- This mission is about **backend coherence**, not algorithm tuning.
-
-## Non-goals / Constraints
-- Do NOT touch legacy/classic mode.
-- Do NOT change batch-size semantics (batch size = 0 vs >1).
-- Do NOT introduce new config options or UI controls.
-- Do NOT add new normalization steps.
-
-## Acceptance Criteria
-- SDS never mixes CPU and GPU within a single processing stage.
-- Logs clearly indicate which backend was used for each SDS stage.
-- No color drift or green tint appears in SDS outputs.
-- CPU-only runs remain unchanged.
-- GPU-enabled runs either succeed fully on GPU or cleanly fallback to CPU.
-
-## Deliverables
-- Minimal code changes enforcing the backend invariant.
-- Tight diffs, no refactors.
+## Critères d'acceptation
+- Sur dataset reproduisant le trou:
+  - disparition des `mastertile_warn_cache_file_missing` causés par cleanup prématuré
+  - `num_master_tiles == tiles_total` (si données valides)
+  - plus de trou dans l'image finale
+- SDS et grid_mode: aucun changement fonctionnel observable hors disparition des trous
+- Diff minimal, lisible, centré Phase 3
