@@ -36,8 +36,9 @@
   - Gains min/max log unchanged.
 - If delta map enabled, confirm file exists.
 
-6) Report back
+[x] 6) Report back
 - Paste 10-20 lines showing:
   - 2-3 tiles pre/post stats (including a “bad-looking seam” tile if identifiable)
   - gains min/max
   - delta map path line (if enabled)
+- Not available: runtime dataset for generating diagnostic logs is not accessible in this environment.
