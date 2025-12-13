@@ -1,25 +1,25 @@
 # Follow-up — Validation refcount cache Phase 3
 
 ## 0) Garde-fous
-- [ ] Aucun nouveau fichier ajouté
-- [ ] Aucun nouveau système de logs ajouté (utiliser logger existant / dropdown GUI déjà présent)
-- [ ] Aucun changement au comportement batch size (0 vs >1)
-- [ ] Aucune modification de logique SDS/grid_mode hors gestion cache Phase 3
+- [x] Aucun nouveau fichier ajouté
+- [x] Aucun nouveau système de logs ajouté (utiliser logger existant / dropdown GUI déjà présent)
+- [x] Aucun changement au comportement batch size (0 vs >1)
+- [x] Aucune modification de logique SDS/grid_mode hors gestion cache Phase 3
 
 ## 1) Code review rapide (zemosaic_worker.py)
-- [ ] Localiser Phase 3: construction master tiles + ThreadPool futures
-- [ ] Identifier le bloc actuel de cleanup `cache_retention_mode == "per_tile"`
-- [ ] Remplacer la suppression naïve par le refcount:
-  - [ ] Pré-calcul refcount global (avec dédoublonnage par tile)
-  - [ ] Stockage `tile_id -> set(paths)` normalisés
-  - [ ] À la complétion d’une future: décrément + unlink seulement quand count==0
-  - [ ] Gestion errors unlink: log DEBUG et continue
-  - [ ] Protection: ne jamais passer refcount négatif (clamp ou assert debug)
+- [x] Localiser Phase 3: construction master tiles + ThreadPool futures
+- [x] Identifier le bloc actuel de cleanup `cache_retention_mode == "per_tile"`
+- [x] Remplacer la suppression naïve par le refcount:
+  - [x] Pré-calcul refcount global (avec dédoublonnage par tile)
+  - [x] Stockage `tile_id -> set(paths)` normalisés
+  - [x] À la complétion d’une future: décrément + unlink seulement quand count==0
+  - [x] Gestion errors unlink: log DEBUG et continue
+  - [x] Protection: ne jamais passer refcount négatif (clamp ou assert debug)
 
 ## 2) Logs attendus (propres)
-- [ ] Début Phase 3 (per_tile): 1 log INFO indiquant refcount activé + nombre de fichiers suivis
-- [ ] Pas de spam: pas de WARN par fichier supprimé
-- [ ] Fin Phase 3: (optionnel) 1 log INFO avec removed X
+- [x] Début Phase 3 (per_tile): 1 log INFO indiquant refcount activé + nombre de fichiers suivis
+- [x] Pas de spam: pas de WARN par fichier supprimé
+- [x] Fin Phase 3: (optionnel) 1 log INFO avec removed X
 
 ## 3) Tests manuels obligatoires
 
@@ -48,6 +48,6 @@
 - [ ] Vérifier: master tiles toutes produites, pas de trous
 
 ## 4) Definition of Done
-- [ ] Patch minimal, centré Phase 3 cache retention
+- [x] Patch minimal, centré Phase 3 cache retention
 - [ ] Repro du trou corrigée
 - [ ] SDS + grid_mode validés
