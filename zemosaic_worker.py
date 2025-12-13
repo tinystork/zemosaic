@@ -1174,6 +1174,191 @@ def _apply_two_pass_coverage_renorm_if_requested(
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
     """Run the coverage renormalization second pass if configured."""
 
+    def _log_two_pass_overlap_deltas(
+        tiles: list[np.ndarray],
+        tile_wcs_list: list[Any],
+        mosaic_data_arr: np.ndarray,
+        mosaic_cov_arr: np.ndarray,
+        output_wcs_obj: Any,
+    ) -> None:
+        """Emit DEBUG-only overlap delta stats between tiles and first-pass mosaic."""
+
+        if (
+            logger is None
+            or not logger.isEnabledFor(logging.DEBUG)
+            or not tiles
+            or not tile_wcs_list
+            or mosaic_data_arr is None
+            or mosaic_cov_arr is None
+            or output_wcs_obj is None
+            or not (REPROJECT_AVAILABLE and reproject_interp)
+        ):
+            return
+
+        downsample_factor = 8
+
+        def _to_luminance(arr: Any) -> np.ndarray | None:
+            try:
+                data = np.asarray(arr, dtype=np.float32)
+            except Exception:
+                return None
+            if data.ndim == 2:
+                return data
+            if data.ndim == 3:
+                channels_last = data
+                if data.shape[-1] not in (1, 3) and data.shape[0] in (1, 3):
+                    try:
+                        channels_last = np.moveaxis(data, 0, -1)
+                    except Exception:
+                        channels_last = data
+                channel_count = channels_last.shape[-1]
+                if channel_count == 1:
+                    return channels_last[..., 0]
+                if channel_count >= 3:
+                    return (
+                        0.25 * channels_last[..., 0]
+                        + 0.5 * channels_last[..., 1]
+                        + 0.25 * channels_last[..., 2]
+                    )
+                return channels_last[..., 0]
+            if data.ndim == 1:
+                return data
+            return None
+
+        def _downsample_2d(arr: np.ndarray, target_hw: tuple[int, int]) -> np.ndarray | None:
+            if target_hw[0] <= 0 or target_hw[1] <= 0:
+                return None
+            try:
+                arr2 = np.asarray(arr, dtype=np.float32)
+            except Exception:
+                return None
+            if arr2.ndim != 2:
+                return None
+            if arr2.shape == target_hw:
+                return arr2
+            try:
+                import cv2  # type: ignore
+
+                return cv2.resize(
+                    np.ascontiguousarray(arr2),
+                    (target_hw[1], target_hw[0]),
+                    interpolation=cv2.INTER_AREA,
+                )
+            except Exception:
+                src_h, src_w = arr2.shape
+                y_coords = np.linspace(0, max(src_h - 1, 0), target_hw[0])
+                x_coords = np.linspace(0, max(src_w - 1, 0), target_hw[1])
+                y_idx = np.clip(y_coords.astype(np.int64), 0, src_h - 1)
+                x_idx = np.clip(x_coords.astype(np.int64), 0, src_w - 1)
+                return arr2[np.ix_(y_idx, x_idx)]
+
+        def _make_lowres_wcs(src_wcs: Any, factor: float) -> Any:
+            if src_wcs is None:
+                return None
+            try:
+                lowres = copy.deepcopy(src_wcs)
+            except Exception:
+                return None
+            try:
+                wcs_obj = getattr(lowres, "wcs", None)
+                if wcs_obj is None:
+                    return lowres
+                if getattr(wcs_obj, "cd", None) is not None:
+                    cd = np.array(wcs_obj.cd, copy=True)
+                    if cd.shape[0] >= 2 and cd.shape[1] >= 2:
+                        cd[:2, :2] *= factor
+                        wcs_obj.cd = cd
+                elif getattr(wcs_obj, "cdelt", None) is not None:
+                    cdelt = np.array(wcs_obj.cdelt, copy=True)
+                    if cdelt.size >= 2:
+                        cdelt[:2] *= factor
+                        wcs_obj.cdelt = cdelt
+                crpix = getattr(wcs_obj, "crpix", None)
+                if crpix is not None:
+                    crpix_arr = np.array(crpix, dtype=np.float64, copy=True)
+                    if crpix_arr.size >= 2:
+                        crpix_arr[:2] = (crpix_arr[:2] + (factor - 1.0) / 2.0) / factor
+                        wcs_obj.crpix = crpix_arr
+                return lowres
+            except Exception:
+                return None
+
+        try:
+            coverage_arr = np.asarray(mosaic_cov_arr, dtype=np.float32)
+        except Exception:
+            return
+        coverage_arr = np.squeeze(coverage_arr)
+        if coverage_arr.ndim != 2:
+            return
+        mosaic_lum = _to_luminance(mosaic_data_arr)
+        if mosaic_lum is None:
+            return
+        if mosaic_lum.shape != coverage_arr.shape:
+            try:
+                mosaic_lum = mosaic_lum.reshape(coverage_arr.shape)
+            except Exception:
+                return
+        target_h = max(1, int(coverage_arr.shape[0] // downsample_factor))
+        target_w = max(1, int(coverage_arr.shape[1] // downsample_factor))
+        target_hw = (target_h, target_w)
+        if target_hw[0] == coverage_arr.shape[0] or target_hw[1] == coverage_arr.shape[1]:
+            # Skip if downsample factor does not reduce shape meaningfully.
+            if coverage_arr.shape[0] <= 0 or coverage_arr.shape[1] <= 0:
+                return
+        mosaic_lr = _downsample_2d(mosaic_lum, target_hw)
+        coverage_lr = _downsample_2d(coverage_arr, target_hw)
+        if mosaic_lr is None or coverage_lr is None:
+            return
+        total_pixels = int(mosaic_lr.size)
+        if total_pixels <= 0:
+            return
+        base_mask = np.isfinite(mosaic_lr) & np.isfinite(coverage_lr) & (coverage_lr > 0)
+        if not np.any(base_mask):
+            return
+        lowres_wcs = _make_lowres_wcs(output_wcs_obj, float(downsample_factor)) or output_wcs_obj
+        if lowres_wcs is None:
+            return
+        for idx, (tile_data, tile_wcs) in enumerate(zip(tiles, tile_wcs_list)):
+            if tile_data is None or tile_wcs is None:
+                continue
+            tile_lum = _to_luminance(tile_data)
+            if tile_lum is None:
+                continue
+            try:
+                tile_proj, footprint = reproject_interp(
+                    (tile_lum, tile_wcs),
+                    lowres_wcs,
+                    shape_out=target_hw,
+                    return_footprint=True,
+                )
+            except Exception as exc:
+                logger.debug("[TwoPassOverlap] idx=%d reprojection failed: %s", idx, exc)
+                continue
+            tile_proj_arr = np.asarray(tile_proj, dtype=np.float32)
+            overlap_mask = base_mask & np.isfinite(tile_proj_arr)
+            if footprint is not None:
+                try:
+                    footprint_arr = np.asarray(footprint, dtype=np.float32)
+                    overlap_mask &= footprint_arr > 0
+                except Exception:
+                    pass
+            valid_count = int(np.count_nonzero(overlap_mask))
+            overlap_fraction = valid_count / total_pixels if total_pixels else 0.0
+            if valid_count > 0:
+                diffs = np.abs(tile_proj_arr[overlap_mask] - mosaic_lr[overlap_mask])
+                median_abs = float(np.nanmedian(diffs))
+                mean_abs = float(np.nanmean(diffs))
+            else:
+                median_abs = float("nan")
+                mean_abs = float("nan")
+            logger.debug(
+                "[TwoPassOverlap] idx=%d overlap=%.3f med_abs=%.4f mean_abs=%.4f",
+                idx,
+                overlap_fraction,
+                median_abs,
+                mean_abs,
+            )
+
     if (
         not two_pass_enabled
         or final_mosaic_data is None
@@ -1212,6 +1397,18 @@ def _apply_two_pass_coverage_renorm_if_requested(
                 "[TwoPass] No tiles available for coverage renorm; keeping first-pass outputs"
             )
         return final_mosaic_data, final_mosaic_coverage
+
+    try:
+        _log_two_pass_overlap_deltas(
+            tiles_for_second_pass,
+            wcs_for_second_pass,
+            final_mosaic_data,
+            final_mosaic_coverage,
+            final_output_wcs,
+        )
+    except Exception:
+        if logger and logger.isEnabledFor(logging.DEBUG):
+            logger.debug("[TwoPassOverlap] diagnostic failed", exc_info=True)
 
     try:
         result = run_second_pass_coverage_renorm(
