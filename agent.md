@@ -1,206 +1,137 @@
-# 📄 `agent.md` (version corrigée et verrouillée)
-
-```markdown
-# 🎯 Mission — Diagnostic du décalage vert (mode Classic)
-# 🔒 IMPORTANT : réutiliser le système de logging EXISTANT (GUI Qt)
-
-## Contexte clé (à lire AVANT toute modification)
-⚠️ Le GUI Qt de ZeMosaic possède DÉJÀ un menu déroulant :
-- Section : "Logging / progress"
-- Champ : "Logging level"
-- Valeurs existantes : Info / Debug (au minimum)
-
-👉 Ce menu existe déjà.
-👉 Il fonctionne déjà côté GUI.
-👉 IL NE FAUT PAS créer un nouveau système de logging.
-👉 IL NE FAUT PAS ajouter un nouveau réglage utilisateur.
-👉 IL FAUT UNIQUEMENT PROPAGER la valeur EXISTANTE jusqu’au worker.
+Voici un couple **agent.md / followup.md** prêt à coller pour Codex. Objectif : **corriger définitivement le “vert” en mode legacy** en **unifiant CPU/GPU** sur la couverture (coverage) et en **empêchant le split GPU/CPU par canal** en Phase 5 (Two-Pass).
 
 ---
 
-## Objectif
-Identifier précisément **à quelle phase du pipeline Classic**
-le canal vert commence à dériver par rapport à R et B.
+## agent.md
 
-Pour cela :
-1) S’assurer que le **niveau de log sélectionné dans le GUI Qt**
-   est réellement appliqué au **logger du worker**
-2) Ajouter des logs DEBUG **ultra ciblés** aux frontières critiques
-   (P3 → P4 → P5 → export)
+````md
+# Mission — Fix “Green Tint” in Legacy Mode (Phase 5 Two-Pass) by Unifying CPU/GPU Coverage + Avoid Per-Channel Split
 
-Aucun changement algorithmique.
-Aucun refactor.
-Logs uniquement.
+## Context
+We have a persistent green tint regression in **legacy/classic mode** mosaics. Logs show the RGB balance is healthy before Two-Pass, then becomes strongly green after Two-Pass coverage renormalization (Phase 5). The root cause is a **CPU/GPU split per channel during Two-Pass reprojection**, combined with **inconsistent meaning/scaling of the returned `coverage` map between GPU and CPU paths**.
 
----
+Key evidence from logs:
+- Two-Pass channel reprojection uses **gpu=True for channel 1**, then **gpu=False for channels 2/3**.
+- GPU `coverage` max is ~0.70 while CPU `coverage` max is 12.0 → not the same unit/scale.
+- After Two-Pass, G/R ratio explodes (~4x), causing green tint.
 
-## 🚫 Interdictions strictes
-- ❌ Ne PAS créer un nouveau menu de logging
-- ❌ Ne PAS créer un nouveau flag debug
-- ❌ Ne PAS créer un logger parallèle
-- ❌ Ne PAS modifier la logique de calcul des images
-- ❌ Ne PAS modifier Grid ou SDS
+## Non-goals / Constraints
+- Do **NOT** create a new logging system. A GUI log-level dropdown already exists (PySide) and must be respected. Only use the existing logger and its levels.
+- Do **NOT** change anything outside the Two-Pass coverage logic and the GPU reproject coverage scaling.
+- Preserve existing behavior regarding “batch size = 0” and “batch size > 1” (do not touch).
+- Keep CPU fallback behavior, but make it *coherent across channels*.
 
----
+## Targets (files/functions)
+1) `/zemosaic_utils.py`
+   - `gpu_reproject_and_coadd_impl(...)`
+   - Ensure GPU coverage returned has the **same semantics** as CPU `reproject_and_coadd` footprint:
+     - CPU footprint is effectively the **sum of weights** (can exceed 1, e.g. 12 overlaps)
+     - GPU currently normalizes in mean path: `weight_sum / n_inputs` clipped to [0,1] (BAD)
 
-## ✅ Ce qui DOIT être fait (et seulement ça)
+2) `/zemosaic_worker.py`
+   - `run_second_pass_coverage_renorm(...)`
+   - Internal `_process_channel(ch_idx, use_gpu_flag)`
+   - Remove/avoid the “only first channel gets GPU” assignment. Two-Pass must use **one backend for all channels**:
+     - If GPU is selected: attempt **GPU for all channels sequentially**
+     - If any GPU failure/fallback happens: rerun **ALL channels on CPU** (not mixed)
 
----
+## Required Changes
+### Backend Safety Rule — Phase 5 (Two-Pass Coverage Renorm)
 
-## 1️⃣ Utiliser le dropdown "Logging level" EXISTANT (GUI Qt)
+Two-Pass coverage renormalization is **not backend-mix safe**.
 
-### Fichier : `zemosaic_gui_qt.py`
+Therefore, enforce the following invariant:
 
-- Le dropdown **existe déjà**
-- Il fournit déjà une valeur logique (`"Info"`, `"Debug"`, etc.)
+- During Phase 5, **all RGB channels MUST be processed with the same backend**
+  (GPU or CPU).
+- If `use_gpu=True` and any channel fails, falls back, or cannot use GPU:
+  - Abort the current Two-Pass attempt
+  - Log a single warning
+  - Rerun Phase 5 with **CPU for ALL channels**
+- Mixed backend execution (e.g. R/G on GPU and B on CPU) is **explicitly forbidden**
+  even if GPU and CPU coverage semantics are aligned.
 
-👉 Action demandée :
-- Récupérer la valeur ACTUELLE de ce dropdown
-- La transmettre telle quelle au worker
-- Sans transformation exotique
-- Sans créer de nouvelle option
+Rationale:
+- Two-Pass applies a coverage-based renormalization shared across channels.
+- Even small backend-dependent differences (interpolation, NaN handling,
+  accumulation order) can introduce chromatic drift.
+- Enforcing a single backend guarantees photometric coherence and long-term stability.
 
-Par exemple (conceptuellement) :
-- `"Info"` → worker log level INFO
-- `"Debug"` → worker log level DEBUG
+This rule applies **only** to Phase 5 (Two-Pass coverage renorm).
+Other pipeline phases may continue to use independent GPU/CPU logic as currently implemented.
 
-⚠️ Ne pas créer un nouveau champ UI.
-⚠️ Ne pas renommer le champ.
-⚠️ Ne pas ajouter de nouvelle clé de config utilisateur.
+### A) Unify GPU coverage semantics with CPU footprint
+In `zemosaic_utils.py`, inside `gpu_reproject_and_coadd_impl`, for the **mean/fast path**:
+- Replace the normalized coverage:
+  - current: `coverage_gpu = clip(weight_sum_gpu / max(1,n_inputs), 0..1)`
+- With: coverage being the raw weight sum (matching CPU footprint semantics):
+  - `coverage_gpu = weight_sum_gpu`
+- Also sanitize to finite float32 (nan/inf -> 0), similar to other GPU paths.
 
----
+This makes GPU coverage max reflect overlaps/weights (e.g. up to ~12), matching CPU.
 
-## 2️⃣ Appliquer réellement ce niveau de log dans le worker
+### B) Remove per-channel GPU assignment (no split CPU/GPU across channels)
+In `zemosaic_worker.py`, in `run_second_pass_coverage_renorm`:
+- Replace the logic that assigns GPU only to the first channel:
+  ```py
+  gpu_assigned = False
+  for ch in range(n_channels):
+      use_gpu_flag = bool(use_gpu and not gpu_assigned)
+      if use_gpu_flag:
+          gpu_assigned = True
+      channel_tasks.append((ch, use_gpu_flag))
+````
 
-### Fichier : `zemosaic_worker.py`
+* With a policy:
 
-Contexte important :
-- Le worker peut être lancé dans un process séparé
-- Le niveau de log par défaut est actuellement INFO
-- Le chemin "classic legacy" ne respecte pas toujours le niveau demandé
+  * If `use_gpu` is True:
 
-👉 Action demandée :
-- Lire le **niveau de log transmis par le GUI Qt existant**
-- Appliquer ce niveau :
-  - au logger `ZeMosaicWorker`
-  - et à ses handlers si nécessaire
+    * Process channels **sequentially** with `use_gpu_flag=True` for all channels.
+    * If any channel errors and falls back, abort and rerun all channels on CPU to avoid mixing.
+  * If `use_gpu` is False:
 
-Ajouter UN log INFO (unique) au démarrage du worker :
-```
+    * Process channels on CPU (you may keep threads, but ensure no GPU is used).
 
-[LOGCFG] effective_level=DEBUG source=qt_gui_dropdown
+Implementation hint:
 
-```
-ou
-```
+* Write a small helper:
 
-[LOGCFG] effective_level=INFO source=qt_gui_dropdown
+  * `_reproject_all_channels(use_gpu_flag: bool) -> (mosaic_channels, coverage_channels)`
+* If GPU attempt fails for any channel:
 
-```
+  * log a warning once (no spam)
+  * rerun `_reproject_all_channels(False)`
+* Ensure logs show per-channel `cov_stats(min,max)` and a summary line:
 
-But :
-- Pouvoir prouver que le choix du dropdown GUI est bien effectif côté worker
+  * `[TwoPass] Coverage backend: gpu_all=True` or `gpu_all=False`
 
----
+### C) Keep existing telemetry/log-level usage
 
-## 3️⃣ Logs DEBUG ciblés par phase (AUCUN autre log)
+* Use the existing logger (already configured).
+* Do not add new handlers/files.
+* Log only at DEBUG for detailed stats.
 
-Ces logs doivent être conditionnés par :
-```
+## Acceptance Criteria
 
-if logger.isEnabledFor(logging.DEBUG):
+* In Two-Pass, all channels use the same backend. No more “gpu=True then gpu=False” per channel.
+* GPU `coverage` stats can exceed 1 and resemble CPU (e.g. max ~12 when overlaps exist).
+* Post Two-Pass RGB ratios no longer explode (green tint gone in legacy mode).
+* No regression in CPU-only runs.
+* No changes to unrelated pipeline phases.
 
-```
+## Minimal Manual Test
 
-### 🔍 Phase 3 / 3.x — Stack des master tiles (baseline saine)
+1. Run a legacy/classic mosaic where Two-Pass is enabled and GPU is available.
+2. Confirm in logs:
 
-Objectif :
-- Confirmer que la couleur est saine AVANT la mosaïque
+   * Channel reprojection lines all show `gpu=True` OR all show `gpu=False`
+   * Coverage stats max are on comparable scale across channels
+3. Verify final mosaic no longer has strong green tint.
 
-Ajouter logs DEBUG :
-- Avant `stack_core`
-- Après `stack_core`
-- Après `_poststack_rgb_equalization` (si appelée)
+## Deliverables
 
-Mesures à logger (1 ligne par point) :
-- min / mean / median par canal
-- ratio G/R et G/B
-- uniquement sur pixels valides
+* Code changes in the two files above.
+* No new files unless strictly necessary.
+* Keep diffs tight.
 
-Labels obligatoires :
-- `P3_pre_stack_core`
-- `P3_post_stack_core`
-- `P3_post_poststack_rgb_eq`
 
----
-
-### 🔥 Phase 4 / 4.x — Assemblage mosaïque (ZONE CRITIQUE #1)
-
-Objectif :
-- Détecter si la dérive apparaît lors de la fusion + coverage
-
-Ajouter logs DEBUG :
-- Juste AVANT la fusion finale
-- Juste APRÈS la fusion finale
-
-Mesures :
-1) Stats RGB globales
-2) Stats RGB sur pixels valides uniquement
-   - valid = coverage > 0
-3) Moyenne RGB pondérée par coverage
-4) Ratios G/R et G/B pour (2) et (3)
-
-Labels obligatoires :
-- `P4_pre_fusion`
-- `P4_post_fusion`
-
----
-
-### 🔥🔥 Phase 5 — Post-processing global (ZONE CRITIQUE #2)
-
-Objectif :
-- Identifier une normalisation RGB globale incorrecte (Classic-only)
-
-Ajouter logs DEBUG :
-- Avant tout traitement global
-- Après chaque étape suspecte :
-  - `_apply_final_mosaic_rgb_equalization`
-  - normalisation RGB
-  - scaling global
-
-Si une égalisation RGB est appliquée :
-- Logger explicitement :
-  - cibles
-  - gains par canal
-
-Labels :
-- `P5_pre_global_post`
-- `P5_post_<step_name>`
-
----
-
-### ⚠️ Phase 6–7 — Export / clamp (secondaire)
-
-Ajouter logs DEBUG uniques :
-- dtype avant export
-- min / max par canal avant clamp
-- dtype après conversion
-
-Labels :
-- `P6_pre_export`
-- `P7_post_export`
-
----
-
-## 4️⃣ Utilitaire de stats
-- Réutiliser `_dbg_rgb_stats` existant
-- L’étendre si nécessaire (coverage / mask)
-- AUCUN nouvel utilitaire parallèle
-
----
-
-## 🎯 Critère de succès
-Avec **UN SEUL RUN Classic en Debug**, on doit pouvoir dire :
-> “La dérive G/R apparaît pour la première fois en phase X, étape Y.”
-
-👉 Le correctif viendra APRÈS, dans une mission séparée.
