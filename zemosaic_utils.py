@@ -4709,4 +4709,336 @@ def stretch_auto_asifits_like_gpu(img_hwc_adu,
 
 
 #####################################################################################################################
+# Borrowing v1 (coverage-first preplan)
+
+BORROW_ENABLE = True
+
+
+def _stable_image_key(entry: Any) -> str:
+    """Return a deterministic key for an image entry."""
+
+    if isinstance(entry, dict):
+        for field in ("path", "path_raw", "filename", "name"):
+            value = entry.get(field)
+            if value:
+                try:
+                    return str(value)
+                except Exception:
+                    continue
+    try:
+        return str(entry)
+    except Exception:
+        return repr(entry)
+
+
+def _extract_center_tuple(entry: Any) -> Optional[tuple[float, float]]:
+    """Extract an approximate 2D center (RA/DEC or XY) from an entry."""
+
+    def _coerce_pair(x_val: Any, y_val: Any) -> Optional[tuple[float, float]]:
+        try:
+            x_f = float(x_val)
+            y_f = float(y_val)
+            if math.isfinite(x_f) and math.isfinite(y_f):
+                return (x_f, y_f)
+        except Exception:
+            return None
+        return None
+
+    if isinstance(entry, dict):
+        for key_x, key_y in (("center_ra_deg", "center_dec_deg"), ("center_ra", "center_dec")):
+            if key_x in entry or key_y in entry:
+                center = _coerce_pair(entry.get(key_x), entry.get(key_y))
+                if center is not None:
+                    return center
+
+        ra = entry.get("RA") if "RA" in entry else entry.get("ra")
+        dec = entry.get("DEC") if "DEC" in entry else entry.get("dec")
+        center_pair = _coerce_pair(ra, dec)
+        if center_pair is not None:
+            return center_pair
+
+        for key in ("center", "phase0_center"):
+            center_obj = entry.get(key)
+            if center_obj is None:
+                continue
+            if isinstance(center_obj, (tuple, list)) and len(center_obj) >= 2:
+                try:
+                    x_val = float(center_obj[0])
+                    y_val = float(center_obj[1])
+                    if math.isfinite(x_val) and math.isfinite(y_val):
+                        return (x_val, y_val)
+                except Exception:
+                    continue
+            ra_attr = getattr(center_obj, "ra", None)
+            dec_attr = getattr(center_obj, "dec", None)
+            if ra_attr is not None and dec_attr is not None:
+                try:
+                    ra_deg = float(getattr(ra_attr, "to", lambda *_: ra_attr)(getattr(ra_attr, "unit", None)).value)
+                except Exception:
+                    try:
+                        ra_deg = float(getattr(ra_attr, "deg", ra_attr))
+                    except Exception:
+                        ra_deg = None
+                try:
+                    dec_deg = float(getattr(dec_attr, "to", lambda *_: dec_attr)(getattr(dec_attr, "unit", None)).value)
+                except Exception:
+                    try:
+                        dec_deg = float(getattr(dec_attr, "deg", dec_attr))
+                    except Exception:
+                        dec_deg = None
+                if ra_deg is not None and dec_deg is not None and math.isfinite(ra_deg) and math.isfinite(dec_deg):
+                    return (ra_deg, dec_deg)
+    return None
+
+
+def _percentile(values: list[float], percentile: float, default: float) -> float:
+    if not values:
+        return default
+    try:
+        return float(np.percentile(np.asarray(values, dtype=float), percentile))
+    except Exception:
+        sorted_vals = sorted(values)
+        if not sorted_vals:
+            return default
+        k = (len(sorted_vals) - 1) * (percentile / 100.0)
+        f = math.floor(k)
+        c = math.ceil(k)
+        if f == c:
+            return float(sorted_vals[int(k)])
+        d0 = sorted_vals[int(f)] * (c - k)
+        d1 = sorted_vals[int(c)] * (k - f)
+        return float(d0 + d1)
+
+
+def apply_borrowing_v1(
+    final_groups: list[list[Any]] | None,
+    image_centers: Optional[dict[str, tuple[float, float]]] = None,
+    *,
+    logger: logging.Logger,
+    neighbor_k: int = 4,
+    border_frac: float = 0.20,
+    quota_frac: float = 0.25,
+    radius_pctl: float = 90.0,
+    eps: float = 1e-6,
+) -> tuple[list[list[Any]], dict[str, Any]]:
+    """Apply Borrowing v1 to duplicate border images into neighbouring groups.
+
+    Returns the (possibly) updated ``final_groups`` and a stats dictionary suitable
+    for logging. Logging is performed inside the function when borrowing runs.
+    """
+
+    stats: dict[str, Any] = {
+        "executed": False,
+        "borrowed_total_assignments": 0,
+        "borrowed_unique_images": 0,
+        "borrow_attempts_total": 0,
+        "borrow_success_total": 0,
+        "border_candidate_images_total": 0,
+        "per_group": [],
+        "examples": [],
+        "valid_image_centers": 0,
+        "valid_group_centers": 0,
+    }
+
+    if not BORROW_ENABLE or not isinstance(final_groups, list) or len(final_groups) < 2:
+        return final_groups or [], stats
+
+    centers_lookup: dict[str, tuple[float, float]] = {}
+    valid_image_centers = 0
+    valid_group_centers = 0
+    if isinstance(image_centers, dict):
+        for key, center in image_centers.items():
+            try:
+                x_val = float(center[0])
+                y_val = float(center[1])
+                if math.isfinite(x_val) and math.isfinite(y_val):
+                    centers_lookup[str(key)] = (x_val, y_val)
+            except Exception:
+                continue
+
+    def _resolve_center(entry: Any, key: str) -> Optional[tuple[float, float]]:
+        if key in centers_lookup:
+            return centers_lookup[key]
+        center = _extract_center_tuple(entry)
+        if center is None:
+            return None
+        centers_lookup[key] = center
+        return center
+
+    group_meta: list[dict[str, Any]] = []
+    initial_sizes: dict[int, int] = {}
+    members_by_group: dict[int, list[tuple[str, Any, Optional[tuple[float, float]]]]] = {}
+    for gid, group in enumerate(final_groups):
+        if not isinstance(group, list):
+            continue
+        sorted_members = sorted(group, key=_stable_image_key)
+        member_payloads: list[tuple[str, Any, Optional[tuple[float, float]]]] = []
+        centers: list[tuple[float, float]] = []
+        for entry in sorted_members:
+            key = _stable_image_key(entry)
+            center = _resolve_center(entry, key)
+            member_payloads.append((key, entry, center))
+            if center is not None:
+                valid_image_centers += 1
+                centers.append(center)
+        group_center: Optional[tuple[float, float]] = None
+        if centers:
+            mean_x = sum(c[0] for c in centers) / len(centers)
+            mean_y = sum(c[1] for c in centers) / len(centers)
+            group_center = (mean_x, mean_y)
+            valid_group_centers += 1
+        radius = eps
+        if group_center is not None and len(centers) >= 2:
+            distances = [math.dist(center, group_center) for center in centers]
+            radius = max(eps, _percentile(distances, radius_pctl, eps))
+        group_meta.append({"id": gid, "center": group_center, "radius": radius})
+        initial_sizes[gid] = len(sorted_members)
+        members_by_group[gid] = member_payloads
+
+    stats["valid_image_centers"] = valid_image_centers
+    stats["valid_group_centers"] = valid_group_centers
+    logger.debug(
+        "Borrowing v1: valid_image_centers=%d valid_group_centers=%d",
+        valid_image_centers,
+        valid_group_centers,
+    )
+
+    for meta in group_meta:
+        center_g = meta.get("center")
+        if center_g is None:
+            meta["neighbors"] = []
+            continue
+        distances: list[tuple[float, int]] = []
+        for other in group_meta:
+            if other["id"] == meta["id"]:
+                continue
+            center_h = other.get("center")
+            if center_h is None:
+                continue
+            distances.append((math.dist(center_g, center_h), other["id"]))
+        distances.sort(key=lambda item: (item[0], item[1]))
+        meta["neighbors"] = [gid for _, gid in distances[: max(1, neighbor_k)]]
+
+    if not any(meta.get("neighbors") for meta in group_meta):
+        return final_groups, stats
+
+    stats["executed"] = True
+    borrowed_in_counts: dict[int, int] = {meta["id"]: 0 for meta in group_meta}
+    quota_limits: dict[int, int] = {
+        meta["id"]: math.ceil(max(0.0, float(quota_frac)) * float(initial_sizes.get(meta["id"], 0)))
+        for meta in group_meta
+    }
+    member_sets: dict[int, set[str]] = {
+        meta["id"]: {key for key, _, _ in members_by_group.get(meta["id"], [])}
+        for meta in group_meta
+    }
+    borrowed_anywhere: set[str] = set()
+    examples: list[tuple[str, int, int]] = []
+    success_distances: list[float] = []
+
+    for meta in group_meta:
+        gid = meta["id"]
+        center_g = meta.get("center")
+        radius_g = max(eps, float(meta.get("radius", eps)))
+        members = members_by_group.get(gid, [])
+        border_threshold = (1.0 - max(0.0, min(1.0, border_frac))) * radius_g
+        for key, entry, center in members:
+            if center is None or center_g is None:
+                continue
+            dist_to_g = math.dist(center, center_g)
+            if dist_to_g < border_threshold:
+                continue
+            stats["border_candidate_images_total"] += 1
+            neighbors = meta.get("neighbors") or []
+            if not neighbors:
+                continue
+            best_neighbor = None
+            best_distance = None
+            for neighbor_id in neighbors:
+                neighbor_meta = next((m for m in group_meta if m["id"] == neighbor_id), None)
+                if neighbor_meta is None:
+                    continue
+                center_h = neighbor_meta.get("center")
+                if center_h is None:
+                    continue
+                dist_to_h = math.dist(center, center_h)
+                if best_distance is None or dist_to_h < best_distance or (
+                    math.isclose(dist_to_h, best_distance or 0.0) and neighbor_id < (best_neighbor or neighbor_id)
+                ):
+                    best_neighbor = neighbor_id
+                    best_distance = dist_to_h
+            if best_neighbor is None or best_distance is None:
+                continue
+            stats["borrow_attempts_total"] += 1
+
+            if key in borrowed_anywhere:
+                continue
+            if best_neighbor not in member_sets:
+                continue
+            if key in member_sets[best_neighbor]:
+                continue
+            if borrowed_in_counts.get(best_neighbor, 0) >= quota_limits.get(best_neighbor, 0):
+                continue
+            borrowed_entry = dict(entry) if isinstance(entry, dict) else entry
+            try:
+                if isinstance(borrowed_entry, dict):
+                    borrowed_entry.setdefault("borrowed", True)
+            except Exception:
+                pass
+            final_groups[best_neighbor].append(borrowed_entry)
+            member_sets[best_neighbor].add(key)
+            borrowed_in_counts[best_neighbor] = borrowed_in_counts.get(best_neighbor, 0) + 1
+            borrowed_anywhere.add(key)
+            stats["borrow_success_total"] += 1
+            stats["borrowed_total_assignments"] += 1
+            success_distances.append(best_distance)
+            if len(examples) < 5:
+                examples.append((key, gid, best_neighbor))
+
+    stats["borrowed_unique_images"] = len(borrowed_anywhere)
+    stats["examples"] = examples
+
+    for meta in group_meta:
+        gid = meta["id"]
+        borrowed_in = borrowed_in_counts.get(gid, 0)
+        initial_size = initial_sizes.get(gid, 0)
+        final_size = len(final_groups[gid]) if gid < len(final_groups) else initial_size
+        stats["per_group"].append(
+            {
+                "group": gid,
+                "initial_size": initial_size,
+                "borrowed_in": borrowed_in,
+                "final_size": final_size,
+            }
+        )
+
+    if success_distances:
+        stats["dist_mean"] = sum(success_distances) / len(success_distances)
+        stats["dist_p90"] = _percentile(success_distances, 90.0, 0.0)
+
+    logger.info(
+        "Borrowing v1: candidates=%s attempts=%s success=%s unique_imgs=%s assignments=%s dist_mean=%.4f dist_p90=%.4f",
+        stats["border_candidate_images_total"],
+        stats["borrow_attempts_total"],
+        stats["borrow_success_total"],
+        stats["borrowed_unique_images"],
+        stats["borrowed_total_assignments"],
+        float(stats.get("dist_mean", 0.0)),
+        float(stats.get("dist_p90", 0.0)),
+    )
+    for group_stat in stats["per_group"]:
+        logger.info(
+            "Borrowing v1 group %s: initial=%s borrowed_in=%s final=%s",
+            group_stat.get("group"),
+            group_stat.get("initial_size"),
+            group_stat.get("borrowed_in"),
+            group_stat.get("final_size"),
+        )
+    for key, src_gid, dst_gid in examples:
+        logger.debug("Borrowing v1 sample: img=%s from=%s to=%s", key, src_gid, dst_gid)
+
+    return final_groups, stats
+
+
+#####################################################################################################################
 

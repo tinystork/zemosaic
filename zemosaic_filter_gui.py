@@ -71,6 +71,7 @@ from core.path_helpers import casefold_path, expand_to_path, safe_path_exists
 
 from zemosaic_utils import (
     EXCLUDED_DIRS,
+    apply_borrowing_v1,
     compute_global_wcs_descriptor,
     is_path_excluded,
     get_app_base_dir,
@@ -6066,6 +6067,13 @@ def launch_filter_interface(
                         for info in grp:
                             if info.pop("_fallback_wcs_used", False):
                                 info.pop("wcs", None)
+
+                    if coverage_enabled and final_groups:
+                        final_groups, _borrow_stats = apply_borrowing_v1(
+                            final_groups,
+                            None,
+                            logger=logger,
+                        )
 
                     result_payload = {
                         "final_groups": final_groups,

@@ -133,6 +133,53 @@ def _reset_filter_log() -> None:
 _reset_filter_log()
 
 
+def _ensure_filter_file_logger() -> None:
+    """Ensure a file handler is attached to the root logger for filter logs.
+
+    Key points:
+    - Avoid duplicate FileHandlers pointing to the same file.
+    - Make sure INFO/DEBUG actually reach the file (set levels).
+    - Do not crash UI startup if logging setup fails.
+    """
+    try:
+        log_path = Path(__file__).with_name("zemosaic_filter.log")
+        target_path = log_path.resolve()
+
+        root_logger = logging.getLogger()  # root
+
+        # If a FileHandler already targets this file, we're done.
+        for handler in list(root_logger.handlers):
+            if not isinstance(handler, logging.FileHandler):
+                continue
+            try:
+                handler_path = Path(getattr(handler, "baseFilename", "")).resolve()
+            except Exception:
+                continue
+            if handler_path == target_path:
+                return
+
+        file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+
+        # Ensure messages aren't filtered out by handler/root default levels.
+        file_handler.setLevel(logging.DEBUG)
+        if root_logger.level in (logging.NOTSET, 0) or root_logger.level > logging.DEBUG:
+            root_logger.setLevel(logging.DEBUG)
+
+        formatter = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+        )
+        file_handler.setFormatter(formatter)
+
+        root_logger.addHandler(file_handler)
+        root_logger.info("Filter log file handler enabled: %s", str(log_path))
+    except Exception:
+        # UI startup must not fail if file logging fails
+        pass
+
+
+_ensure_filter_file_logger()
+
+
 def _resolve_tristate_flag() -> Qt.ItemFlag:
     candidates = ("ItemIsTristate", "ItemIsAutoTristate", "ItemIsUserTristate")
     for name in candidates:
@@ -475,6 +522,7 @@ except Exception:  # pragma: no cover - optional dependency guard
 try:  # pragma: no cover - optional dependency guard
     from zemosaic_utils import (  # type: ignore
         EXCLUDED_DIRS,
+        apply_borrowing_v1,
         get_app_base_dir,
         get_user_config_dir,
         ensure_user_config_dir,
@@ -501,6 +549,13 @@ except Exception:  # pragma: no cover - optional dependency guard
     parse_global_wcs_resolution_override = None  # type: ignore[assignment]
     resolve_global_wcs_output_paths = None  # type: ignore[assignment]
     write_global_wcs_files = None  # type: ignore[assignment]
+    apply_borrowing_v1 = None  # type: ignore[assignment]
+
+
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
 
 
 logger = logging.getLogger(__name__)
@@ -2939,6 +2994,30 @@ class FilterQtDialog(QDialog):
             for info in group:
                 if info.pop("_fallback_wcs_used", False):
                     info.pop("wcs", None)
+
+        if coverage_enabled and apply_borrowing_v1 is not None:
+            final_groups, _borrow_stats = apply_borrowing_v1(
+                final_groups,
+                None,
+                logger=logger,
+            )
+            borrowed_unique = 0
+            borrowed_total = 0
+            if isinstance(_borrow_stats, dict):
+                try:
+                    borrowed_unique = int(_borrow_stats.get("borrowed_unique_images", 0))
+                except Exception:
+                    borrowed_unique = 0
+                try:
+                    borrowed_total = int(_borrow_stats.get("borrowed_total_assignments", 0))
+                except Exception:
+                    borrowed_total = 0
+            logger.info(
+                "Borrowing v1 applied: groups=%d borrowed_unique=%d borrowed_total=%d",
+                len(final_groups) if isinstance(final_groups, list) else 0,
+                borrowed_unique,
+                borrowed_total,
+            )
 
         return {
             "final_groups": final_groups,
@@ -6083,13 +6162,32 @@ class FilterQtDialog(QDialog):
             self._rectangle_selector = None
         if canvas is not None:
             try:
+                canvas.setParent(None)
+            except Exception:
+                pass
+            try:
+                canvas.deleteLater()
+            except Exception:
+                pass
+            try:
                 canvas.hide()
             except Exception:
                 pass
 
     def _dispose_coverage_canvas(self) -> None:
+        canvas = self._coverage_canvas
         self._coverage_canvas = None
         self._coverage_axes = None
+        if canvas is not None:
+            try:
+                canvas.setParent(None)
+            except Exception:
+                pass
+            try:
+                canvas.deleteLater()
+            except Exception:
+                pass
+
 
     def _on_preview_canvas_destroyed(self, _obj: QObject | None = None) -> None:  # pragma: no cover - Qt signal glue
         self._dispose_preview_canvas()
@@ -6499,7 +6597,18 @@ class FilterQtDialog(QDialog):
         self._hide_processing_overlay()
         self._dispose_preview_canvas()
         self._dispose_coverage_canvas()
+        self._safe_shutdown_matplotlib()
         super().closeEvent(event)
+
+    def _safe_shutdown_matplotlib(self) -> None:
+        """Safely close all Matplotlib figures during shutdown."""
+        if plt is None:
+            return
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+
 
     def accept(self) -> None:  # noqa: D401 - inherit docstring
         self._accepted = True
