@@ -133,6 +133,35 @@ def _reset_filter_log() -> None:
 _reset_filter_log()
 
 
+def _ensure_filter_file_logger() -> None:
+    """Ensure a file handler is attached to the root logger for filter logs."""
+
+    try:
+        log_path = Path(__file__).with_name("zemosaic_filter.log")
+        root_logger = logging.getLogger()
+        target_path = log_path.resolve()
+        for handler in root_logger.handlers:
+            if not isinstance(handler, logging.FileHandler):
+                continue
+            try:
+                handler_path = Path(getattr(handler, "baseFilename", "")).resolve()
+            except Exception:
+                continue
+            if handler_path == target_path:
+                return
+        file_handler = logging.FileHandler(log_path, mode="a", encoding="utf-8")
+        formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+        root_logger.info("Filter log file handler enabled: %s", log_path)
+    except Exception:
+        # Le démarrage de l'UI ne doit pas échouer si le log fichier échoue.
+        pass
+
+
+_ensure_filter_file_logger()
+
+
 def _resolve_tristate_flag() -> Qt.ItemFlag:
     candidates = ("ItemIsTristate", "ItemIsAutoTristate", "ItemIsUserTristate")
     for name in candidates:
@@ -2947,6 +2976,23 @@ class FilterQtDialog(QDialog):
                 final_groups,
                 None,
                 logger=logger,
+            )
+            borrowed_unique = 0
+            borrowed_total = 0
+            if isinstance(_borrow_stats, dict):
+                try:
+                    borrowed_unique = int(_borrow_stats.get("borrowed_unique_images", 0))
+                except Exception:
+                    borrowed_unique = 0
+                try:
+                    borrowed_total = int(_borrow_stats.get("borrowed_total_assignments", 0))
+                except Exception:
+                    borrowed_total = 0
+            logger.info(
+                "Borrowing v1 applied: groups=%d borrowed_unique=%d borrowed_total=%d",
+                len(final_groups) if isinstance(final_groups, list) else 0,
+                borrowed_unique,
+                borrowed_total,
             )
 
         return {
