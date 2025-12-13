@@ -179,6 +179,48 @@ GLOBAL_COVERAGE_SUMMARY_THRESHOLD_FRAC = 0.0025
 GLOBAL_COVERAGE_SUMMARY_MIN_ABS = 1e-3
 
 
+def _two_pass_tile_rgb_stats(arr: np.ndarray) -> dict:
+    """Computes RGB/mono stats for a single tile, ignoring non-finite values."""
+    stats = {
+        'valid_fraction': 0.0,
+        'min': [0.0, 0.0, 0.0],
+        'mean': [0.0, 0.0, 0.0],
+        'median': [0.0, 0.0, 0.0],
+    }
+    if arr is None or arr.size == 0:
+        return stats
+
+    if arr.ndim == 2:
+        arr = arr[..., np.newaxis]
+
+    if arr.ndim != 3:
+        return stats
+
+    num_channels = arr.shape[2]
+    if num_channels not in [1, 3]:
+        return stats
+
+    # Resize stats lists to match number of channels
+    stats['min'] = [0.0] * num_channels
+    stats['mean'] = [0.0] * num_channels
+    stats['median'] = [0.0] * num_channels
+
+    for i in range(num_channels):
+        channel_data = arr[..., i]
+        finite_mask = np.isfinite(channel_data)
+        valid_pixels = channel_data[finite_mask]
+
+        if valid_pixels.size == 0:
+            continue
+
+        stats['valid_fraction'] = valid_pixels.size / channel_data.size
+        stats['min'][i] = float(np.min(valid_pixels))
+        stats['mean'][i] = float(np.mean(valid_pixels))
+        stats['median'][i] = float(np.median(valid_pixels))
+
+    return stats
+
+
 def _dbg_rgb_stats(
     label: str,
     rgb: np.ndarray | None,
@@ -13529,6 +13571,33 @@ def run_second_pass_coverage_renorm(
             float(np.min(finite_gains)) if finite_gains else float("nan"),
             float(np.max(finite_gains)) if finite_gains else float("nan"),
         )
+    if logger and logger.isEnabledFor(logging.DEBUG):
+        for i, (tile, gain) in enumerate(zip(tiles, gains)):
+            stats_pre = _two_pass_tile_rgb_stats(tile)
+            
+            # Apply gain to a copy for stats
+            tile_scaled = (tile * gain).astype(tile.dtype)
+            
+            stats_post = _two_pass_tile_rgb_stats(tile_scaled)
+            
+            logger.debug(
+                "[TwoPassTile] idx=%d gain=%.6f pre  valid=%.3f median=[%s] mean=[%s] min=[%s]",
+                i,
+                gain,
+                stats_pre['valid_fraction'],
+                ",".join(f"{v:.4f}" for v in stats_pre['median']),
+                ",".join(f"{v:.4f}" for v in stats_pre['mean']),
+                ",".join(f"{v:.4f}" for v in stats_pre['min']),
+            )
+            logger.debug(
+                "[TwoPassTile] idx=%d gain=%.6f post valid=%.3f median=[%s] mean=[%s] min=[%s]",
+                i,
+                gain,
+                stats_post['valid_fraction'],
+                ",".join(f"{v:.4f}" for v in stats_post['median']),
+                ",".join(f"{v:.4f}" for v in stats_post['mean']),
+                ",".join(f"{v:.4f}" for v in stats_post['min']),
+            )
     _emit_two_pass_stats(
         tiles_total,
         chunk_index=tiles_total,
