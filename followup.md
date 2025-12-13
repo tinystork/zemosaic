@@ -1,44 +1,61 @@
-# Follow-up checklist — TwoPass diagnostics
+# Follow-up checklist — TwoPass definitive diagnostics
 
-[x] 1) Locate code
-- Open zemosaic_worker.py and find run_second_pass_coverage_renorm.
-- Identify where gains are computed (it currently logs: "[TwoPass] Computed gains count=... min=... max=...").
+1) Confirm location
+- Open zemosaic_worker.py
+- Identify:
+  - _apply_two_pass_coverage_renorm_if_requested
+  - run_second_pass_coverage_renorm
 
-[x] 2) Add helper
-- Add _two_pass_tile_rgb_stats(arr) near other debug helpers (e.g., near _dbg_rgb_stats).
-- Requirements:
-  - supports HWC RGB and HW mono
-  - uses finite mask only
-  - returns: valid_fraction, min/mean/median per channel
+2) Implement DEBUG-only diagnostics
+- Wrap all new code in:
+    if logger and logger.isEnabledFor(logging.DEBUG):
 
-[x] 3) Add per-tile logging
-- In run_second_pass_coverage_renorm:
-  - right after gains computed and before reprojection loop:
-    - for each tile:
-      - compute stats_pre
-      - apply existing gain code (do not modify)
-      - compute stats_post
-      - logger.debug lines:
-        - "[TwoPassTile] idx=%d gain=%.6f pre  valid=... median=[...,...,...] mean=[...] min=[...]"
-        - "[TwoPassTile] idx=%d gain=%.6f post valid=... median=[...,...,...] mean=[...] min=[...]"
+3) Add global context logs
+- Emit [TwoPassCfg] and [TwoPassCoverage] once at TwoPass entry.
 
-[x] 4) Optional delta map (only if implemented)
-- Ensure it is off by default.
-- Only runs under DEBUG (or explicit flag default False).
-- Downsample factor fixed (e.g., 8) for speed.
-- Save .npy and log a single line:
-  - "[TwoPassDelta] wrote delta map: <path> shape=<...> ds=<...>"
+4) Per-tile stats
+- Before gain:
+  - compute valid_frac
+  - median / MAD RGB
+  - log [TwoPassTileStats]
 
-[x] 5) Run test
-- Launch a run that triggers TwoPass Phase 5 and confirm:
-  - TwoPass start/prepared/reproject logs still present.
-  - New per-tile logs appear.
-  - Gains min/max log unchanged.
-- If delta map enabled, confirm file exists.
+5) Overlap diagnostics (core)
+- Downsample ref mosaic + coverage
+- Reproject tile luminance to low-res grid
+- Compute overlap_mask
+- Log [TwoPassOverlap] with:
+  overlap_frac, delta_med, abs_delta_med, delta_mad, slope, intercept, r
 
-[x] 6) Report back
-- Paste 10-20 lines showing:
-  - 2-3 tiles pre/post stats (including a “bad-looking seam” tile if identifiable)
-  - gains min/max
-  - delta map path line (if enabled)
-- Not available: runtime dataset for generating diagnostic logs is not accessible in this environment.
+6) Gain application check
+- After gain application:
+  - recompute overlap delta
+  - log [TwoPassApply] pre vs post
+
+7) Global summary
+- Sort by abs_delta_med
+- Log top 5 as [TwoPassWorst]
+- Log weighted global score as [TwoPassScore]
+
+8) Sanity logs
+- Emit warnings if:
+  - mask shape mismatch
+  - coverage rejects > X%
+  - reprojection NaN fraction high
+
+9) Test protocol
+- Run once with DEBUG enabled.
+- Confirm presence of:
+  [TwoPassCfg]
+  [TwoPassOverlap]
+  [TwoPassApply]
+  [TwoPassWorst]
+  [TwoPassScore]
+- Run once with INFO:
+  - confirm no new output.
+
+10) Report back
+- Paste:
+  - [TwoPassCfg]
+  - 3–5 representative [TwoPassOverlap]
+  - worst tile block
+  - [TwoPassScore]

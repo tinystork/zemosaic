@@ -1,72 +1,128 @@
-# Mission: TwoPass diagnostics logs (per-tile stats + delta map) — NO pipeline change
+# Mission: TwoPass definitive diagnostics (logs only, DEBUG-only)
 
-[x] Goal
-- Add objective diagnostics for Two-Pass Coverage Renorm (Phase 5).
-- We want:
-  1) Per-tile mean/median (RGB) BEFORE applying the computed gain, and AFTER applying the gain.
-  2) A lightweight "inter-tile delta map" (optional) to visualize seams as residual offsets vs pipeline bug.
-- Absolutely no change to algorithms, parameters, ordering, or outputs (unless explicitly enabled via DEBUG-only diagnostics file output).
+Objective
+Provide a complete, objective diagnostic of the TwoPass normalization issue
+(seams between tiles) using DEBUG-only logs, without modifying any algorithm,
+parameters, or outputs.
 
-[x] Scope (files)
-- zemosaic_worker.py
+This mission must allow answering definitively:
+- Is the dataset too weak / overlap too small?
+- Is gain-only normalization insufficient because offset dominates?
+- Is the TwoPass math correct but ineffective by design?
+- Or is there a pipeline bug (gain not applied, bad masks, reprojection mismatch)?
 
-[x] Constraints
-- Do NOT modify any math in the renorm itself (no change to gains, clipping, sigma, coverage, reprojection).
-- Only add logs and optional debug artifact saved under DEBUG-level (or behind a new explicit debug flag default False).
-- Keep runtime overhead minimal: per-tile stats are cheap; delta map must be downsampled and optional.
+Scope
+- File: zemosaic_worker.py ONLY
+- Functions involved:
+  - _apply_two_pass_coverage_renorm_if_requested(...)
+  - run_second_pass_coverage_renorm(...)
 
-[x] Where to instrument
-- run_second_pass_coverage_renorm(...) in zemosaic_worker.py.
-  We already log global things (start, prepared tiles, gains min/max, etc.).
-  Add *tile-by-tile* stats right after gains are computed and right after applying gain to each tile (before reprojection starts).
+Hard constraints
+- DO NOT change any math, normalization logic, gains, sigma, clip, reprojection.
+- DO NOT change outputs.
+- Logs and diagnostic computations ONLY.
+- All diagnostics MUST be wrapped in:
+    if logger.isEnabledFor(logging.DEBUG):
 
-[x] Deliverables
-A) Per-tile stats logs (always under logger.isEnabledFor(DEBUG))
-- For each tile i:
-  - tile index and/or tile_id if available
-  - gain scalar used (the one applied in second pass)
-  - RGB min/mean/median computed on finite pixels only
-  - also log valid pixel fraction (finite mask fraction)
-- Emit two lines per tile:
-  - [TwoPassTile] pre_gain ...
-  - [TwoPassTile] post_gain ...
+--------------------------------------------------
+A) GLOBAL CONTEXT LOGS (ONCE)
+--------------------------------------------------
+Emit one block at TwoPass entry:
 
-[x] Implementation details (safe)
-- Add a small helper in zemosaic_worker.py:
-  - _two_pass_tile_rgb_stats(arr: np.ndarray) -> dict with min/mean/median per channel + valid_fraction
-  - Must handle arr shapes: HWC (..,3) and HW (mono); for mono treat it as one channel and still log.
-  - Use np.isfinite mask; ignore NaNs/inf.
-- Then inside run_second_pass_coverage_renorm:
-  - After `gains` array computed (currently logged min/max) and before reprojection:
-    - For each tile arr:
-      - compute stats_pre = helper(arr)
-      - apply gain (existing code path) to produce arr_scaled (or in-place, as currently)
-      - compute stats_post = helper(arr_scaled)
-      - log both with gain
+[TwoPassCfg]
+- sigma
+- clip_min / clip_max
+- number of tiles
+- output shape (H,W)
+- dtype
+- fallback_used (bool)
+- downsample factor used for diagnostics (DS)
 
-B) Optional inter-tile delta map (DEBUG-only + downsample)
-- Purpose: show residual seams as “tile vs first-pass mosaic” mismatch.
-- Approach (cheap):
-  - Use the first-pass mosaic (final_mosaic_data_p1 / mosaic_p1) and final_wcs_p1 already available in the caller path.
-  - In run_second_pass_coverage_renorm we have tiles + tiles_wcs + final_wcs_p1 + shape_out.
-  - After gains are applied, reproject each tile (single channel or luminance) *coarsely* to a reduced grid:
-    - downsample factor = 8 (configurable constant)
-    - target shape = (shape_out[0]//ds, shape_out[1]//ds)
-  - Build:
-    - delta_sum, delta_count arrays (float32)
-    - For each tile: compute abs(tile_proj - mosaic_p1_proj) where both finite; accumulate.
-  - At end: delta_map = delta_sum / max(delta_count,1)
-  - Save as a debug artifact in runtime temp dir (e.g., zemosaic_runtime/twopass_delta_map.npy)
-  - Only do this if logger DEBUG enabled (or a new flag two_pass_debug_delta_map=True default False).
-- IMPORTANT: This must not affect outputs; saving file only.
+[TwoPassCoverage]
+- coverage min / mean / median / max
+- fraction of pixels with coverage > 0
+- bounding box of non-zero coverage
 
-[x] Acceptance tests
-- Run a dataset that triggers TwoPass (Phase 5) and confirm in logs:
-  - Existing TwoPass logs still appear unchanged.
-  - New logs show per-tile pre/post stats and gains.
-  - If delta map enabled: a .npy file is created and a log prints its path.
-- Confirm final mosaic output is byte-identical vs before when delta map is disabled (only logs added).
-- Not run here: dataset required for Phase 5 validation is unavailable in this environment.
+--------------------------------------------------
+B) PER-TILE BASE STATS (BEFORE CORRECTION)
+--------------------------------------------------
+For each tile idx, BEFORE applying gain:
 
-Do not touch
-- Any other phases, GUI, WCS, cropping, masking, RGB equalization logic.
+[TwoPassTileStats]
+- idx
+- valid_frac (finite RGB & alpha>0 & coverage>0 if available)
+- median RGB
+- MAD RGB (or IQR if already available)
+- mean RGB (optional)
+
+Purpose:
+Detect weak tiles, noisy background, or insufficient valid pixels.
+
+--------------------------------------------------
+C) OVERLAP-BASED DIAGNOSTICS (KEY PART)
+--------------------------------------------------
+Compute diagnostics ONLY on overlap region with FIRST-PASS mosaic.
+
+Method:
+- Use luminance only (L = 0.25R + 0.5G + 0.25B)
+- Use LOW-RES reprojection (DS = 8 or 16) for speed
+- overlap_mask = finite(tile_proj) & finite(ref_proj) & (coverage>0)
+
+For each tile idx:
+
+[TwoPassOverlap]
+- idx
+- overlap_frac
+- delta_med      = median(tile - ref)
+- abs_delta_med  = median(|tile - ref|)
+- delta_mad
+- slope (a) and intercept (b) from simple regression ref -> tile
+- correlation r
+
+Purpose:
+- delta_med != 0 → offset dominates
+- slope != 1 → gain mismatch
+- low overlap_frac → dataset limitation
+- low r → structure mismatch / bad overlap
+
+--------------------------------------------------
+D) APPLY CHECK (GAIN EFFECTIVENESS)
+--------------------------------------------------
+After gain application, recompute overlap median delta:
+
+[TwoPassApply]
+- idx
+- delta_med_pre
+- delta_med_post
+
+Purpose:
+- If delta does not improve → gain-only insufficient or bug
+- If unchanged everywhere → gain not applied or masked out
+
+--------------------------------------------------
+E) GLOBAL SUMMARY (VERDICT HELPERS)
+--------------------------------------------------
+After all tiles processed:
+
+[TwoPassWorst]
+- top 5 tiles sorted by abs_delta_med
+- for each: idx, overlap_frac, abs_delta_med, delta_med, slope, intercept
+
+[TwoPassScore]
+- global_overlap_mean
+- global_abs_delta_med (weighted by overlap_frac)
+
+--------------------------------------------------
+F) SANITY / MASK CHECKS
+--------------------------------------------------
+Log ONCE if any mismatch detected:
+- RGB / alpha / coverage shape mismatch
+- coverage threshold used (>0 or >eps)
+- fraction of pixels rejected by coverage mask
+- fraction of NaNs after reprojection
+
+--------------------------------------------------
+Output rules
+- DEBUG-only logs.
+- INFO-level behavior must remain unchanged.
+- No additional files saved.
