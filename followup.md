@@ -1,20 +1,23 @@
 # Follow-up — SDS CPU/GPU Consistency & Color Safety
 
 ## 0) Guardrails
-- [ ] Do not modify legacy/classic mode.
-- [ ] Do not alter normalization algorithms or math.
-- [ ] Do not add new logging handlers or files.
-- [ ] Respect existing GUI log-level control.
+- [x] Do not modify legacy/classic mode.
+- [x] Do not alter normalization algorithms or math.
+- [x] Do not add new logging handlers or files.
+- [x] Respect existing GUI log-level control.
 
 ---
 
 ## 1) Identify SDS Critical Stages
 Search SDS / grid code for stages that:
-- [ ] call `reproject_and_coadd` or GPU equivalents
+- [x] call `reproject_and_coadd` or GPU equivalents
 - [ ] compute statistics (mean, sigma, weights, coverage)
 - [ ] apply `linear_fit` or similar normalization
 
 Document stage names internally (no user-facing docs needed).
+
+Identified stage:
+- `sds_global_coadd` — `_assemble_global_mosaic_first_impl` (GPU helper path wraps `reproject_and_coadd`).
 
 ---
 

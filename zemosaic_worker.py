@@ -21721,6 +21721,8 @@ def _assemble_global_mosaic_first_impl(
                 plan_chunk_gpu_hint = None
 
     plan_mode = str(global_plan.get("mode") or "").strip().lower()
+    is_sds_plan = plan_mode == "sds"
+    sds_backend_logged = False
     plan_meta = global_plan.get("meta") if isinstance(global_plan.get("meta"), dict) else {}
     plan_meta = _coerce_to_builtin(plan_meta) if plan_meta else {}
     descriptor_payload = {
@@ -22516,6 +22518,13 @@ def _assemble_global_mosaic_first_impl(
         helper_attempt = _attempt_gpu_helper_route()
         if helper_attempt is not None:
             helper_image, helper_coverage, helper_alpha, helper_stats = helper_attempt
+            if is_sds_plan:
+                pcb(
+                    "[SDS] stage=sds_global_coadd backend_policy=all_or_nothing gpu_all=True",
+                    prog=None,
+                    lvl="INFO",
+                )
+                sds_backend_logged = True
             _emit_global_coadd_finished_event(
                 frames=int(helper_stats.get("frames", 0)),
                 channels=int(helper_stats.get("channels", 0)),
@@ -22539,6 +22548,12 @@ def _assemble_global_mosaic_first_impl(
             helper_progress_cap = 1.0
             helper_wait_fraction = 0.0
             helper_reason = "helper_failed"
+            if is_sds_plan:
+                pcb(
+                    "[SDS] stage=sds_global_coadd GPU failed → rerun all CPU",
+                    prog=None,
+                    lvl="INFO",
+                )
             pcb(
                 "global_coadd_warn_helper_fallback",
                 prog=None,
@@ -22551,6 +22566,14 @@ def _assemble_global_mosaic_first_impl(
                 discarded=bool(helper_partial_gpu_artifacts),
             )
             helper_partial_gpu_artifacts = False
+
+    if is_sds_plan and not sds_backend_logged:
+        pcb(
+            "[SDS] stage=sds_global_coadd backend_policy=all_or_nothing gpu_all=False",
+            prog=None,
+            lvl="INFO",
+        )
+        sds_backend_logged = True
 
     pcb(
         "global_coadd_info_cpu_path",
