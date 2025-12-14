@@ -3508,15 +3508,14 @@ def _build_affine_lookup_for_tiles(
     return lookup or None, None
 
 
-def _compose_global_anchor_shift(
-    affine_list: list[tuple[float, float]] | None,
-    total_tiles: int,
+def _normalize_anchor_shift(
     anchor_shift: tuple[float, float] | None,
-) -> tuple[list[tuple[float, float]] | None, bool]:
-    """Apply a global anchor shift to per-tile affine corrections."""
+) -> tuple[float, float] | None:
+    """Return a sanitized, non-trivial anchor shift tuple."""
 
     if not anchor_shift:
-        return affine_list, False
+        return None
+
     try:
         gain_shift = float(anchor_shift[0])
     except Exception:
@@ -3525,44 +3524,130 @@ def _compose_global_anchor_shift(
         offset_shift = float(anchor_shift[1])
     except Exception:
         offset_shift = 0.0
+
     if not np.isfinite(gain_shift):
         gain_shift = 1.0
     if not np.isfinite(offset_shift):
         offset_shift = 0.0
+
     if abs(gain_shift - 1.0) < 1e-6 and abs(offset_shift) < 1e-6:
+        return None
+
+    return (gain_shift, offset_shift)
+
+
+def _compose_global_anchor_shift(
+    affine_list: list[tuple[float, float]] | None,
+    total_tiles: int,
+    anchor_shift: tuple[float, float] | None,
+) -> tuple[list[tuple[float, float]] | None, bool]:
+    """Apply a global anchor shift to per-tile affine corrections."""
+
+    normalized_shift = _normalize_anchor_shift(anchor_shift)
+    if not normalized_shift:
         return affine_list, False
 
+    gain_shift, offset_shift = normalized_shift
     total_tiles = max(0, int(total_tiles))
-    if affine_list is None:
-        if total_tiles <= 0:
-            return None, False
-        composed = [(gain_shift, offset_shift)] * total_tiles
-    else:
-        composed: list[tuple[float, float]] = []
-        for idx in range(total_tiles):
-            if idx < len(affine_list):
-                raw = affine_list[idx]
-            else:
-                raw = (1.0, 0.0)
-            try:
-                g = float(raw[0])
-            except Exception:
-                g = 1.0
-            try:
-                o = float(raw[1])
-            except Exception:
-                o = 0.0
-            if not np.isfinite(g):
-                g = 1.0
-            if not np.isfinite(o):
-                o = 0.0
-            new_gain = g * gain_shift
-            new_offset = o * gain_shift + offset_shift
-            composed.append((float(new_gain), float(new_offset)))
-        composed.extend([(gain_shift, offset_shift)] * max(0, total_tiles - len(composed)))
+
+    if affine_list is None or total_tiles <= 0:
+        return None, False
+
+    composed: list[tuple[float, float]] = []
+    for idx in range(total_tiles):
+        if idx < len(affine_list):
+            raw = affine_list[idx]
+        else:
+            raw = (1.0, 0.0)
+        try:
+            g = float(raw[0])
+        except Exception:
+            g = 1.0
+        try:
+            o = float(raw[1])
+        except Exception:
+            o = 0.0
+        if not np.isfinite(g):
+            g = 1.0
+        if not np.isfinite(o):
+            o = 0.0
+        new_gain = g * gain_shift
+        new_offset = o * gain_shift + offset_shift
+        composed.append((float(new_gain), float(new_offset)))
+    composed.extend([(gain_shift, offset_shift)] * max(0, total_tiles - len(composed)))
     result = composed
     nontrivial = any(abs(g - 1.0) > 1e-6 or abs(o) > 1e-6 for g, o in result) if result else False
     return result, nontrivial
+
+
+def _log_affine_photometric_summary(
+    affine_lookup: dict[str, tuple[float, float]] | None,
+    *,
+    logger_obj: logging.Logger,
+    anchor_shift_applied: bool,
+    global_anchor_shift: tuple[float, float] | None,
+):
+    """Emit a compact diagnostic about inter-tile photometric corrections."""
+
+    if not affine_lookup:
+        return
+
+    gains: list[float] = []
+    offsets: list[float] = []
+    unique_pairs: set[tuple[float, float]] = set()
+    for gain_val, offset_val in affine_lookup.values():
+        try:
+            g = float(gain_val)
+        except Exception:
+            g = 1.0
+        try:
+            o = float(offset_val)
+        except Exception:
+            o = 0.0
+        if not math.isfinite(g):
+            g = 1.0
+        if not math.isfinite(o):
+            o = 0.0
+        gains.append(g)
+        offsets.append(o)
+        unique_pairs.add((round(g, 5), round(o, 5)))
+
+    if not gains:
+        return
+
+    gain_min = min(gains)
+    gain_max = max(gains)
+    offset_min = min(offsets)
+    offset_max = max(offsets)
+    unique_count = len(unique_pairs)
+    corrected_tiles = len(affine_lookup)
+
+    anchor_shift_only = False
+    normalized_anchor = _normalize_anchor_shift(global_anchor_shift)
+    if anchor_shift_applied and normalized_anchor and unique_count == 1:
+        rounded_anchor = (round(normalized_anchor[0], 5), round(normalized_anchor[1], 5))
+        only_pair = next(iter(unique_pairs))
+        if (
+            abs(only_pair[0] - rounded_anchor[0]) <= 1e-5
+            and abs(only_pair[1] - rounded_anchor[1]) <= 1e-5
+        ):
+            anchor_shift_only = True
+
+    logger_obj.info(
+        "apply_photometric_summary: tiles=%d unique_pairs=%d gain=[%.5f, %.5f] offset=[%.5f, %.5f] anchor_shift_only=%s",
+        corrected_tiles,
+        unique_count,
+        gain_min,
+        gain_max,
+        offset_min,
+        offset_max,
+        anchor_shift_only,
+    )
+
+    if unique_count <= 1:
+        logger_obj.warning(
+            "Intertile photometric degenerate: all tiles share same gain/offset -> cannot reduce seams"
+        )
 
 
 @dataclass
@@ -11960,6 +12045,10 @@ def assemble_final_mosaic_incremental(
     )
     if anchor_shift_applied:
         nontrivial_detected = True
+    elif _normalize_anchor_shift(global_anchor_shift) is not None and pending_affine_list is None:
+        logger.info(
+            "anchor_shift present but intertile affine_list is None => skipping anchor-only application"
+        )
 
     affine_log_indices = _select_affine_log_indices(pending_affine_list)
 
@@ -12589,6 +12678,38 @@ def assemble_final_mosaic_reproject_coadd(
         tile_weighting_active = False
     tile_weight_values: list[float] = []
 
+    if solver_settings is None:
+        solver_settings_dict: dict[str, Any] = {}
+    elif isinstance(solver_settings, dict):
+        solver_settings_dict = solver_settings
+    else:
+        try:
+            solver_settings_dict = dict(solver_settings)
+        except Exception:
+            solver_settings_dict = getattr(solver_settings, "__dict__", {}) or {}
+            if not isinstance(solver_settings_dict, dict):
+                solver_settings_dict = {}
+
+    try:
+        affine_offset_limit_adu = float(
+            solver_settings_dict.get("intertile_offset_limit_adu", 50.0)
+        )
+    except Exception:
+        affine_offset_limit_adu = 50.0
+    affine_offset_limit_adu = max(0.0, abs(affine_offset_limit_adu))
+
+    gain_limits_cfg = solver_settings_dict.get("intertile_gain_limits")
+    if isinstance(gain_limits_cfg, (list, tuple)) and len(gain_limits_cfg) == 2:
+        try:
+            gain_limit_min = float(gain_limits_cfg[0])
+            gain_limit_max = float(gain_limits_cfg[1])
+        except Exception:
+            gain_limit_min, gain_limit_max = 0.75, 1.25
+    else:
+        gain_limit_min, gain_limit_max = 0.75, 1.25
+    if gain_limit_min > gain_limit_max:
+        gain_limit_min, gain_limit_max = gain_limit_max, gain_limit_min
+
     def _extract_tile_weight(header_obj) -> float | None:
         if header_obj is None:
             return None
@@ -12846,6 +12967,10 @@ def assemble_final_mosaic_reproject_coadd(
     )
     if anchor_shift_applied:
         nontrivial_affine = True
+    elif _normalize_anchor_shift(global_anchor_shift) is not None and pending_affine_list is None:
+        logger.info(
+            "anchor_shift present but intertile affine_list is None => skipping anchor-only application"
+        )
 
     affine_by_id: dict[str, tuple[float, float]] | None = None
     if pending_affine_list:
@@ -12879,6 +13004,12 @@ def assemble_final_mosaic_reproject_coadd(
         pending_affine_list = None
 
     if pending_affine_list and affine_by_id:
+        _log_affine_photometric_summary(
+            affine_by_id,
+            logger_obj=logger,
+            anchor_shift_applied=anchor_shift_applied,
+            global_anchor_shift=global_anchor_shift,
+        )
         if use_gpu:
             nontrivial_affine = True
             for entry in effective_tiles:
@@ -12911,10 +13042,10 @@ def assemble_final_mosaic_reproject_coadd(
                         elif gain_to_apply > gain_limit_max:
                             gain_to_apply = gain_limit_max
                         if affine_offset_limit_adu > 0.0:
-                            if abs(offset_to_apply) > affine_offset_limit_adu:
-                                offset_to_apply = 0.0
-                            else:
-                                offset_to_apply = max(-affine_offset_limit_adu, min(offset_to_apply, affine_offset_limit_adu))
+                            offset_to_apply = max(
+                                -affine_offset_limit_adu,
+                                min(offset_to_apply, affine_offset_limit_adu),
+                            )
                         if gain_to_apply != gain_before or offset_to_apply != offset_before:
                             try:
                                 _pcb(
