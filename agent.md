@@ -25,7 +25,7 @@ Hard constraints
     if logger.isEnabledFor(logging.DEBUG):
 
 --------------------------------------------------
-A) GLOBAL CONTEXT LOGS (ONCE)
+A) [x] GLOBAL CONTEXT LOGS (ONCE)
 --------------------------------------------------
 Emit one block at TwoPass entry:
 
@@ -44,7 +44,7 @@ Emit one block at TwoPass entry:
 - bounding box of non-zero coverage
 
 --------------------------------------------------
-B) PER-TILE BASE STATS (BEFORE CORRECTION)
+B) [x] PER-TILE BASE STATS (BEFORE CORRECTION)
 --------------------------------------------------
 For each tile idx, BEFORE applying gain:
 
@@ -59,7 +59,7 @@ Purpose:
 Detect weak tiles, noisy background, or insufficient valid pixels.
 
 --------------------------------------------------
-C) OVERLAP-BASED DIAGNOSTICS (KEY PART)
+C) [x] OVERLAP-BASED DIAGNOSTICS (KEY PART)
 --------------------------------------------------
 Compute diagnostics ONLY on overlap region with FIRST-PASS mosaic.
 
@@ -86,7 +86,7 @@ Purpose:
 - low r → structure mismatch / bad overlap
 
 --------------------------------------------------
-D) APPLY CHECK (GAIN EFFECTIVENESS)
+D) [x] APPLY CHECK (GAIN EFFECTIVENESS)
 --------------------------------------------------
 After gain application, recompute overlap median delta:
 
@@ -100,7 +100,7 @@ Purpose:
 - If unchanged everywhere → gain not applied or masked out
 
 --------------------------------------------------
-E) GLOBAL SUMMARY (VERDICT HELPERS)
+E) [x] GLOBAL SUMMARY (VERDICT HELPERS)
 --------------------------------------------------
 After all tiles processed:
 
@@ -113,7 +113,7 @@ After all tiles processed:
 - global_abs_delta_med (weighted by overlap_frac)
 
 --------------------------------------------------
-F) SANITY / MASK CHECKS
+F) [x] SANITY / MASK CHECKS
 --------------------------------------------------
 Log ONCE if any mismatch detected:
 - RGB / alpha / coverage shape mismatch
