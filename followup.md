@@ -1,62 +1,37 @@
-# Follow-up checklist — TwoPass definitive diagnostics
+# Follow-up — GRID GPU OOM hardening (ZeMosaic)
 
-1) [x] Confirm location
-   - Open zemosaic_worker.py
-   - Identify:
-     - _apply_two_pass_coverage_renorm_if_requested
-     - run_second_pass_coverage_renorm
+## Patch attendu: uniquement `grid_mode.py`
 
-2) [x] Implement DEBUG-only diagnostics
-   - Wrap all new code in:
-       if logger and logger.isEnabledFor(logging.DEBUG):
+### 1) Vérifier le point d’entrée
+- Dans `grid_mode.py`, identifier `def _stack_weighted_patches_gpu(...)`.
+- Vérifier qu’il est appelé seulement quand `config.use_gpu` (caller fait déjà ce check).
 
-3) [x] Add global context logs
-   - Emit [TwoPassCfg] and [TwoPassCoverage] once at TwoPass entry.
+### 2) Import
+- Étendre l’import existant:
+  `from zemosaic_utils import (...)`
+  en y ajoutant `free_cupy_memory_pools`.
 
-4) [x] Per-tile stats
-   - Before gain:
-     - compute valid_frac
-     - median / MAD RGB
-     - log [TwoPassTileStats]
+### 3) Ajouter un pré-check VRAM (avant cp.asarray)
+- Utiliser `cp.cuda.runtime.memGetInfo()`.
+- Estimer bytes:
+  `base = sum(p.nbytes ...) + sum(w.nbytes ...)`
+  `est = base * 4.0 + 64*1024*1024`
+- Si `est > free_b * 0.85`:
+  - log INFO via `_emit`
+  - return `_stack_weighted_patches(...)` (CPU) immédiatement.
 
-5) [x] Overlap diagnostics (core)
-   - Downsample ref mosaic + coverage
-   - Reproject tile luminance to low-res grid
-   - Compute overlap_mask
-   - Log [TwoPassOverlap] with:
-     overlap_frac, delta_med, abs_delta_med, delta_mad, slope, intercept, r
+### 4) Encapsuler avec try/except/finally
+- `try`: code GPU actuel
+- `except`: log WARN (OOM vs generic) + fallback CPU
+- `finally`: appeler `free_cupy_memory_pools()` inconditionnellement
+  (optionnel DEBUG log)
 
-6) [x] Gain application check
-   - After gain application:
-     - recompute overlap delta
-     - log [TwoPassApply] pre vs post
+### 5) Vérifications rapides
+- Petit dataset grid_mode GPU: doit toujours fonctionner.
+- Gros dataset: plus de crash; si fallback, on doit le voir dans le log.
+- SDS/classic: aucun diff.
 
-7) [x] Global summary
-   - Sort by abs_delta_med
-   - Log top 5 as [TwoPassWorst]
-   - Log weighted global score as [TwoPassScore]
-
-8) [x] Sanity logs
-   - Emit warnings if:
-     - mask shape mismatch
-     - coverage rejects > X%
-     - reprojection NaN fraction high
-
-9) [ ] Test protocol
-   - Run once with DEBUG enabled.
-   - Confirm presence of:
-     [TwoPassCfg]
-     [TwoPassOverlap]
-     [TwoPassApply]
-     [TwoPassWorst]
-     [TwoPassScore]
-   - Run once with INFO:
-     - confirm no new output.
-   - Attempted `pytest tests/test_phase5_gpu.py` but collection failed because pytest's capture tempfiles vanished (FileNotFoundError). Needs rerun in stable environment.
-
-10) [ ] Report back
-   - Paste:
-     - [TwoPassCfg]
-     - 3–5 representative [TwoPassOverlap]
-     - worst tile block
-     - [TwoPassScore]
+## Done when
+- plus d’OOM en grid_mode,
+- VRAM ne “monte” plus sans limite (pool purgé entre chunks),
+- diff minimal.
