@@ -472,10 +472,29 @@ def detect_autocrop_rgb(
     eps_small = max(1e-6, float(np.nanpercentile(Ls, 0.5)))
 
     thrL = max(medL - k_sigma * max(sigL, 1e-6), float(np.nanpercentile(Ls, 5.0)), eps_small)
-    thrV = max(float(np.nanpercentile(Vs, 15.0)), float(np.nanpercentile(Vs, 1.0)) or 1e-6)
+    # NOTE (Mode B): Using variance (Vs) as a hard gate is too aggressive on smooth/gradient sky regions.
+    # It tends to keep only star-rich blocks and crops away valid background. We keep blocks based on
+    # luminance, and only reject blocks that look like *empty borders* (dim + flat).
+    thrL_dim = max(float(np.nanpercentile(Ls, 2.0)), eps_small)
+    thrV_flat = max(float(np.nanpercentile(Vs, 5.0)), float(np.nanpercentile(Vs, 1.0)) or 1e-6)
 
     nonblack_small = (Rs > eps_small) | (Gs > eps_small) | (Bs > eps_small)
-    base = np.isfinite(Ls) & nonblack_small & (Ls >= thrL) & (Vs >= thrV)
+    base = np.isfinite(Ls) & nonblack_small & (Ls >= thrL)
+
+    dimflat = np.isfinite(Vs) & (Ls <= thrL_dim) & (Vs <= thrV_flat)
+    if dimflat.any():
+        base[dimflat] = False
+
+    base_frac = float(np.mean(base))
+    logger.debug(
+        "QBC base: frac=%.3f thrL=%.4g thrL_dim=%.4g thrV_flat=%.4g",
+        base_frac, thrL, thrL_dim, thrV_flat
+    )
+    # If we ended up with an extremely sparse mask (rare field / strong gradients), relax slightly.
+    if base_frac < 0.03:
+        thrL2 = max(float(np.nanpercentile(Ls, 2.0)), eps_small)
+        base = np.isfinite(Ls) & nonblack_small & (Ls >= thrL2)
+        logger.debug("QBC base-relax: thrL2=%.4g frac=%.3f", thrL2, float(np.mean(base)))
 
     # --- 4) Rejet chroma générique en bordure ---
     Cmax = np.maximum(np.maximum(Rs, Gs), Bs)
@@ -495,9 +514,10 @@ def detect_autocrop_rgb(
     if mask_chroma.any():
         base[mask_chroma] = False
 
-    # --- 5) Érosion (deux passes) pour casser les ponts fins ---
+    # --- 5) Érosion (conservative): second pass only if mask is dense enough ---
     m_small = binary_erosion1(base)
-    m_small = binary_erosion1(m_small)
+    if float(np.mean(m_small)) > 0.25:
+        m_small = binary_erosion1(m_small)
 
     # --- 6) BBox sur grille réduite ---
     box_small = bbox_from_mask(m_small)
@@ -536,7 +556,24 @@ def detect_autocrop_rgb(
     after_color_trim = _trim_color_edges_fullres(R, G, B, before_color_trim, step=3, minsize=32, k=k_sigma)
     logger.debug("QBC color-trim: before=%s after=%s", before_color_trim, after_color_trim)
 
-    y0, x0, y1, x1 = after_color_trim
+    before_cast_trim = (int(after_color_trim[0]), int(after_color_trim[1]), int(after_color_trim[2]), int(after_color_trim[3]))
+    after_cast_trim = _trim_colorcast_edges_fullres(
+        R,
+        G,
+        B,
+        before_cast_trim,
+        step=3,
+        minsize=32,
+        guard_px=64,
+        abs_log_thr=0.12,
+        k_mad=6.0,
+        start_mul=2.5,
+        sat_abs_min=0.05,
+    )
+    if after_cast_trim != before_cast_trim:
+        logger.debug("QBC cast-trim: before=%s after=%s", before_cast_trim, after_cast_trim)
+
+    y0, x0, y1, x1 = after_cast_trim
     touches = (
         y0 <= margin_px or x0 <= margin_px or y1 >= (H - margin_px) or x1 >= (W - margin_px)
     )
@@ -947,6 +984,153 @@ def _trim_color_edges_fullres(R, G, B, rect, step=3, minsize=32, k=3.0):
         or over(B, b_med, b_mad, (slice(max(y1 - step, y0), y1), slice(x0, x1)))
     ):
         y1 -= step
+
+    return int(y0), int(x0), int(y1), int(x1)
+
+
+def _trim_colorcast_edges_fullres(
+    R,
+    G,
+    B,
+    rect,
+    step=3,
+    minsize=32,
+    guard_px=64,
+    abs_log_thr=0.12,
+    k_mad=6.0,
+    start_mul=2.5,
+    sat_abs_min=0.05,
+):
+    """Trim *narrow* color-cast edges (tinted borders) in full resolution.
+
+    Goal (Mode B): keep legitimate gradients, remove obvious overlap/coverage artefacts
+    like magenta/green edge bands.
+
+    We work in exposure-invariant log-ratio space:
+        rg = log((R+eps)/(G+eps)), bg = log((B+eps)/(G+eps))
+
+    We only *start* trimming a side if BOTH are true on the outermost strip:
+      1) cast is significant vs the interior core (|Δrg| or |Δbg| > threshold)
+      2) the strip is chromatic (median saturation > sat_abs_min and above core)
+
+    This prevents broad smooth gradients from triggering the cast trimmer.
+
+    Safety rails:
+      - guard_px capped to <= 10% of rect size (and <= provided guard_px)
+      - never shrink below minsize
+    """
+    y0, x0, y1, x1 = map(int, rect)
+    step = max(1, int(step))
+    minsize = max(8, int(minsize))
+
+    h = y1 - y0
+    w = x1 - x0
+    if h <= minsize * 2 or w <= minsize * 2:
+        return rect
+
+    guard_px = int(max(0, guard_px))
+    guard_px = min(guard_px, max(8, w // 10), max(8, h // 10))
+    if guard_px <= 0:
+        return rect
+
+    inner = (slice(y0 + minsize, y1 - minsize), slice(x0 + minsize, x1 - minsize))
+    if inner[0].start >= inner[0].stop or inner[1].start >= inner[1].stop:
+        return rect
+
+    eps = 1e-6
+    Rf = np.asarray(R, dtype=np.float32)
+    Gf = np.asarray(G, dtype=np.float32)
+    Bf = np.asarray(B, dtype=np.float32)
+
+    rg = np.log((Rf + eps) / (Gf + eps))
+    bg = np.log((Bf + eps) / (Gf + eps))
+    sat = np.maximum(np.maximum(Rf, Gf), Bf) - np.minimum(np.minimum(Rf, Gf), Bf)
+
+    rg_core = rg[inner]
+    bg_core = bg[inner]
+    sat_core = sat[inner]
+
+    rg_med = float(np.nanmedian(rg_core))
+    bg_med = float(np.nanmedian(bg_core))
+
+    rg_mad = float(np.nanmedian(np.abs(rg_core - rg_med))) + eps
+    bg_mad = float(np.nanmedian(np.abs(bg_core - bg_med))) + eps
+
+    thr_rg = max(float(abs_log_thr), float(k_mad) * rg_mad)
+    thr_bg = max(float(abs_log_thr), float(k_mad) * bg_mad)
+
+    sat_med = float(np.nanmedian(sat_core))
+    sat_mad = float(np.nanmedian(np.abs(sat_core - sat_med))) + eps
+    sat_thr = max(float(sat_abs_min), sat_med + 4.0 * sat_mad)
+
+    y0o, x0o, y1o, x1o = y0, x0, y1, x1
+
+    def strip_stats(sl):
+        rgv = float(np.nanmedian(rg[sl]))
+        bgv = float(np.nanmedian(bg[sl]))
+        satv = float(np.nanmedian(sat[sl]))
+        if not (np.isfinite(rgv) and np.isfinite(bgv) and np.isfinite(satv)):
+            return None
+        return rgv, bgv, satv
+
+    def is_casty(rgv, bgv):
+        return (abs(rgv - rg_med) > thr_rg) or (abs(bgv - bg_med) > thr_bg)
+
+    def should_start(sl):
+        st = strip_stats(sl)
+        if st is None:
+            return False
+        rgv, bgv, satv = st
+        cast = is_casty(rgv, bgv)
+        chroma = satv >= sat_thr
+        if not (cast and chroma):
+            return False
+        drg = abs(rgv - rg_med)
+        dbg = abs(bgv - bg_med)
+        return (drg > float(start_mul) * thr_rg) or (dbg > float(start_mul) * thr_bg)
+
+    def should_continue(sl):
+        st = strip_stats(sl)
+        if st is None:
+            return False
+        rgv, bgv, _ = st
+        return is_casty(rgv, bgv)
+
+    # Left
+    sl0 = (slice(y0, y1), slice(x0, min(x0 + step, x1)))
+    if should_start(sl0):
+        while (x1 - x0) > minsize and (x0 - x0o) < guard_px:
+            sl = (slice(y0, y1), slice(x0, min(x0 + step, x1)))
+            if not should_continue(sl):
+                break
+            x0 += step
+
+    # Right
+    sl0 = (slice(y0, y1), slice(max(x1 - step, x0), x1))
+    if should_start(sl0):
+        while (x1 - x0) > minsize and (x1o - x1) < guard_px:
+            sl = (slice(y0, y1), slice(max(x1 - step, x0), x1))
+            if not should_continue(sl):
+                break
+            x1 -= step
+
+    # Top
+    sl0 = (slice(y0, min(y0 + step, y1)), slice(x0, x1))
+    if should_start(sl0):
+        while (y1 - y0) > minsize and (y0 - y0o) < guard_px:
+            sl = (slice(y0, min(y0 + step, y1)), slice(x0, x1))
+            if not should_continue(sl):
+                break
+            y0 += step
+
+    # Bottom
+    sl0 = (slice(max(y1 - step, y0), y1), slice(x0, x1))
+    if should_start(sl0):
+        while (y1 - y0) > minsize and (y1o - y1) < guard_px:
+            sl = (slice(max(y1 - step, y0), y1), slice(x0, x1))
+            if not should_continue(sl):
+                break
+            y1 -= step
 
     return int(y0), int(x0), int(y1), int(x1)
 
