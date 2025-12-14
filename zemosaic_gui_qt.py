@@ -3677,7 +3677,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "radial_feather_fraction": 0.8,
             "min_radial_weight_floor": 0.0,
             "radial_shape_power": 2.0,
-            "cluster_panel_threshold": 0.05,
+            "cluster_panel_threshold": 0.03,
             "cluster_target_groups": 0,
             "cluster_orientation_split_deg": 0.0,
             "inter_master_merge_enable": False,
