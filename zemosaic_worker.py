@@ -13011,18 +13011,98 @@ def assemble_final_mosaic_reproject_coadd(
             global_anchor_shift=global_anchor_shift,
         )
         if use_gpu:
-            nontrivial_affine = True
-            for entry in effective_tiles:
-                tile_id = entry.get("tile_id")
-                if not tile_id:
+            # GPU path regression fix: apply computed affine gain/offset to tile data,
+            # mirroring the CPU branch behavior (including clamping + callback).
+            corrected_tiles = 0
+            for tile_entry in effective_tiles:
+                tile_id = tile_entry.get("tile_id")
+                if (not tile_id) or (tile_entry.get("data") is None):
                     continue
+
                 gain_val, offset_val = affine_by_id.get(tile_id, (1.0, 0.0))
+
+                # Keep existing log (computed values)
                 logger.info(
                     "apply_photometric: tile=%s gain=%.5f offset=%.5f",
                     tile_id,
                     gain_val,
                     offset_val,
                 )
+
+                try:
+                    arr_np = np.asarray(tile_entry["data"], dtype=np.float32, order="C")
+                    gain_to_apply = float(gain_val)
+                    offset_to_apply = float(offset_val)
+
+                    if match_bg:
+                        gain_before = gain_to_apply
+                        offset_before = offset_to_apply
+
+                        # clamp gain
+                        if gain_to_apply < gain_limit_min:
+                            gain_to_apply = gain_limit_min
+                        elif gain_to_apply > gain_limit_max:
+                            gain_to_apply = gain_limit_max
+
+                        # clamp / cancel offset
+                        if affine_offset_limit_adu > 0.0:
+                            if abs(offset_to_apply) > affine_offset_limit_adu:
+                                offset_to_apply = 0.0
+                            else:
+                                if offset_to_apply < -affine_offset_limit_adu:
+                                    offset_to_apply = -affine_offset_limit_adu
+                                elif offset_to_apply > affine_offset_limit_adu:
+                                    offset_to_apply = affine_offset_limit_adu
+
+                        # callback when clamped
+                        if (gain_to_apply != gain_before) or (offset_to_apply != offset_before):
+                            try:
+                                _pcb(
+                                    "assemble_warn_affine_clamped",
+                                    prog=None,
+                                    lvl="INFO_DETAIL",
+                                    tile_id=tile_id,
+                                    gain_before=gain_before,
+                                    gain_after=gain_to_apply,
+                                    offset_before=offset_before,
+                                    offset_after=offset_to_apply,
+                                )
+                            except Exception:
+                                pass
+
+                    # Apply affine in-place
+                    if gain_to_apply != 1.0:
+                        np.multiply(arr_np, gain_to_apply, out=arr_np, casting="unsafe")
+                    if offset_to_apply != 0.0:
+                        np.add(arr_np, offset_to_apply, out=arr_np, casting="unsafe")
+
+                    tile_entry["data"] = arr_np
+                    corrected_tiles += 1
+
+                    # Keep logging after applying (same format)
+                    logger.info(
+                        "apply_photometric: tile=%s gain=%.5f offset=%.5f",
+                        tile_id,
+                        gain_to_apply,
+                        offset_to_apply,
+                    )
+                except Exception:
+                    continue
+
+            if corrected_tiles:
+                try:
+                    _pcb(
+                        "assemble_info_intertile_photometric_applied",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                        num_tiles=corrected_tiles,
+                    )
+                except Exception:
+                    pass
+                nontrivial_affine = True
+            else:
+                nontrivial_affine = False
+                pending_affine_list = None
         else:
             corrected_tiles = 0
             for tile_entry in effective_tiles:

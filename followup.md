@@ -1,37 +1,41 @@
-# Follow-up — GRID GPU OOM hardening (ZeMosaic)
+# followup.md
 
-## Patch attendu: uniquement `grid_mode.py`
+## What changed (expected)
+- Grid Mode now supports `grid_tile_sizing_mode`:
+  - `global_divisions` (default): divides the global mosaic surface into a regular square grid.
+  - `frame_fov` (legacy): keeps the previous tile sizing logic.
+- Each tile now writes an `ALPHA` mask based on **full coverage** (hit-count threshold), not “any coverage”.
 
-### 1) Vérifier le point d’entrée
-- Dans `grid_mode.py`, identifier `def _stack_weighted_patches_gpu(...)`.
-- Vérifier qu’il est appelé seulement quand `config.use_gpu` (caller fait déjà ce check).
+## Quick verification checklist
+### 1) Confirm grid is “true grid”
+- In the log, find:
+  - `[GRID] tile_sizing_mode=global_divisions ... canvas=(H,W) tile_size_px=... step_px=... est_tiles=...`
+- Sanity:
+  - `tile_size_px ≈ max(H,W) / grid_size_factor`
+  - bboxes are consistent steps (regular grid).
 
-### 2) Import
-- Étendre l’import existant:
-  `from zemosaic_utils import (...)`
-  en y ajoutant `free_cupy_memory_pools`.
+### 2) Confirm full-coverage masking is active
+- In the log for several tiles:
+  - `[GRIDCOV] ... max_hits=... target_hits=... fullcov_px=... anycov_px=... kept_ratio=...`
+- Check at least one tile does NOT fallback.
+- Open one tile FITS:
+  - Must contain `ALPHA` HDU.
+  - ALPHA should be tighter than old `weight>0` (less marginal fringe).
 
-### 3) Ajouter un pré-check VRAM (avant cp.asarray)
-- Utiliser `cp.cuda.runtime.memGetInfo()`.
-- Estimer bytes:
-  `base = sum(p.nbytes ...) + sum(w.nbytes ...)`
-  `est = base * 4.0 + 64*1024*1024`
-- Si `est > free_b * 0.85`:
-  - log INFO via `_emit`
-  - return `_stack_weighted_patches(...)` (CPU) immédiatement.
+### 3) Confirm assembly respects ALPHA
+- In assembly logs:
+  - It reads ALPHA for tiles when present (already in code).
+- Final mosaic:
+  - The previous “red lines” / marginal seams should be strongly reduced.
 
-### 4) Encapsuler avec try/except/finally
-- `try`: code GPU actuel
-- `except`: log WARN (OOM vs generic) + fallback CPU
-- `finally`: appeler `free_cupy_memory_pools()` inconditionnellement
-  (optionnel DEBUG log)
+## Regression guard (do not break)
+- Classic mode and SDS mode must behave exactly the same (no changes).
+- No GUI changes required for sky preview / footprints.
+- `stack_plan.csv` remains internal/transparent (no new user-visible requirement).
 
-### 5) Vérifications rapides
-- Petit dataset grid_mode GPU: doit toujours fonctionner.
-- Gros dataset: plus de crash; si fallback, on doit le voir dans le log.
-- SDS/classic: aucun diff.
+## If seams remain
+- Lower `grid_fullcov_threshold` from 0.98 → 0.95 (keeps more pixels).
+- Increase `batch_overlap_pct` (e.g. 15 → 25) to give the blender more overlap.
+- Increase `grid_fullcov_erode_px` only if you still see “edge slivers”.
 
-## Done when
-- plus d’OOM en grid_mode,
-- VRAM ne “monte” plus sans limite (pool purgé entre chunks),
-- diff minimal.
+(Only adjust config keys; do not change algorithm again unless necessary.)
