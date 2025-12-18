@@ -4000,27 +4000,28 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
                 img = img * cp.float32(gain_val)
             if offset_val != 0.0:
                 img = img + cp.float32(offset_val)
+        # Build per-pixel alpha/weight mask BEFORE background matching so masked pixels do not bias median.
         mask = cp.isfinite(img).astype(cp.float32)
         if weight_map_gpu is not None:
             weight_map_gpu = cp.nan_to_num(weight_map_gpu, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
             weight_map_gpu = cp.maximum(weight_map_gpu, cp.float32(0.0))
             mask = mask * weight_map_gpu
-        valid_mask = mask > 0
+
         if match_background:
             offset_val = 0.0
             try:
-                if bool(int(cp.any(valid_mask).get())):
-                    offset_val = float(cp.nanmedian(img[valid_mask]).get())
+                tmp = cp.where(mask > cp.float32(0.0), img, cp.nan)
+                offset_val = float(cp.nanmedian(tmp).get())
             except Exception:
                 try:
-                    valid_cpu = cp.asnumpy(valid_mask)
-                    img_cpu = cp.asnumpy(img)
-                    if np.any(valid_cpu):
-                        offset_val = float(np.nanmedian(img_cpu[valid_cpu]))
+                    tmp_cpu = np.where(cp.asnumpy(mask) > 0.0, cp.asnumpy(img), np.nan)
+                    offset_val = float(np.nanmedian(tmp_cpu))
                 except Exception:
                     offset_val = 0.0
             if offset_val != 0.0 and np.isfinite(offset_val):
                 img = img - cp.float32(offset_val)
+
+        # IMPORTANT: pre-weight image by mask before resampling (correct weighted interpolation behavior).
         img = cp.nan_to_num(img, copy=False, nan=0.0)
         img = img * mask
         mask = cp.nan_to_num(mask, copy=False, nan=0.0)
@@ -4089,6 +4090,7 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
         sampled_weighted = map_coordinates(img_gpu, coords, order=1, mode="constant", cval=0.0)
         sampled_mask = map_coordinates(mask_gpu, coords, order=1, mode="constant", cval=0.0)
         valid_f = valid.astype(cp.float32)
+        # img_gpu is already pre-weighted (img *= mask), so DO NOT multiply by sampled_mask again.
         sampled_mask = sampled_mask * valid_f
         sampled_weighted = sampled_weighted * valid_f
         safe_mask = cp.maximum(sampled_mask, cp.float32(1e-6))
