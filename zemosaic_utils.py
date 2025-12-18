@@ -4455,15 +4455,28 @@ def _reproject_and_coadd_wrapper_impl(
         "tile_affine_corrections",
     }
     cpu_kwargs = {k: v for k, v in kwargs.items() if k not in gpu_only}
+    input_weights_from_call = cpu_kwargs.get("input_weights")
     if normalized_weights is not None:
         weight_maps = []
-        for arr, w in zip(data_list, normalized_weights):
+        for idx, (arr, w) in enumerate(zip(data_list, normalized_weights)):
             arr_np = np.asarray(arr, dtype=np.float32)
-            try:
-                weight_maps.append(np.full_like(arr_np, float(w), dtype=np.float32))
-            except Exception:
-                weight_maps.append(np.full(arr_np.shape, float(w), dtype=np.float32))
+            base_weight = None
+            if isinstance(input_weights_from_call, (list, tuple, np.ndarray)) and idx < len(input_weights_from_call):
+                base_weight = input_weights_from_call[idx]
+            if base_weight is not None:
+                base_arr = np.asarray(base_weight, dtype=np.float32)
+                try:
+                    weight_maps.append(np.multiply(base_arr, float(w), dtype=np.float32))
+                except Exception:
+                    weight_maps.append(base_arr.astype(np.float32, copy=False) * float(w))
+            else:
+                try:
+                    weight_maps.append(np.full_like(arr_np, float(w), dtype=np.float32))
+                except Exception:
+                    weight_maps.append(np.full(arr_np.shape, float(w), dtype=np.float32))
         cpu_kwargs["input_weights"] = weight_maps
+    elif input_weights_from_call is not None:
+        cpu_kwargs["input_weights"] = input_weights_from_call
     inputs = list(zip(data_list, wcs_list))
     output_proj = cpu_kwargs.pop("output_projection")
     def _run_reproject(inp, out_proj):
@@ -5041,4 +5054,3 @@ def apply_borrowing_v1(
 
 
 #####################################################################################################################
-
