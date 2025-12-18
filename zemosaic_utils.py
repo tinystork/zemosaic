@@ -3826,6 +3826,7 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
     progress_callback = kwargs.pop("progress_callback", None)
     tile_weights_param = kwargs.pop("tile_weights", None)
     tile_paths_param = kwargs.pop("tile_paths", None)
+    input_weights_param = kwargs.pop("input_weights", None)
     if not gpu_is_available():
         _log_gpu_event(
             "gpu_fallback_unavailable",
@@ -3860,6 +3861,45 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
     n_inputs = len(data_list)
     if len(wcs_list) != n_inputs:
         raise ValueError("data_list and wcs_list must have the same length")
+
+    def _normalize_weight_maps(weights_obj) -> list[np.ndarray | None]:
+        if weights_obj is None:
+            return [None] * n_inputs
+        normalized: list[np.ndarray | None] = []
+        try:
+            iterable = list(weights_obj)
+        except Exception:
+            iterable = [weights_obj]
+        for idx in range(n_inputs):
+            try:
+                raw = iterable[idx]
+            except Exception:
+                raw = None
+            if raw is None:
+                normalized.append(None)
+                continue
+            try:
+                arr = np.asarray(raw, dtype=np.float32)
+            except Exception:
+                normalized.append(None)
+                continue
+            if arr.ndim > 2:
+                arr = np.squeeze(arr)
+            arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+            arr = np.where(arr < 0.0, 0.0, arr)
+            expected_shape = np.asarray(data_list[idx]).shape
+            expected_hw = expected_shape[:2]
+            if arr.shape != expected_hw:
+                # If the weight map is the same shape as the full array, accept it.
+                if arr.shape == expected_shape:
+                    pass
+                else:
+                    normalized.append(None)
+                    continue
+            normalized.append(arr.astype(np.float32, copy=False))
+        if len(normalized) < n_inputs:
+            normalized.extend([None] * (n_inputs - len(normalized)))
+        return normalized
 
     def _normalize_tile_weights(weights_obj) -> list[float]:
         if weights_obj is None:
@@ -3939,9 +3979,21 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
     else:
         tile_affine = None
 
+    weight_maps_list = _normalize_weight_maps(input_weights_param)
+
     def _prepare_tile_arrays(idx: int) -> tuple[cp.ndarray, cp.ndarray]:
         arr = np.asarray(data_list[idx], dtype=np.float32)
         img = cp.asarray(arr)
+        weight_map_gpu = None
+        if weight_maps_list and idx < len(weight_maps_list):
+            w_map = weight_maps_list[idx]
+            if w_map is not None:
+                try:
+                    weight_map_gpu = cp.asarray(w_map, dtype=cp.float32)
+                    if weight_map_gpu.shape != img.shape:
+                        weight_map_gpu = None
+                except Exception:
+                    weight_map_gpu = None
         if tile_affine is not None:
             gain_val, offset_val = tile_affine[idx]
             if gain_val != 1.0:
@@ -3959,6 +4011,9 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
             if offset_val != 0.0 and np.isfinite(offset_val):
                 img = img - cp.float32(offset_val)
         mask = cp.isfinite(img).astype(cp.float32)
+        if weight_map_gpu is not None:
+            weight_map_gpu = cp.maximum(weight_map_gpu, cp.float32(0.0))
+            mask = mask * weight_map_gpu
         img = cp.nan_to_num(img, copy=False, nan=0.0)
         return img, mask
 

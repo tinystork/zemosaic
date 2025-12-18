@@ -12904,7 +12904,7 @@ def assemble_final_mosaic_reproject_coadd(
                 tile_header = None
             if "ALPHA" in hdul and hdul["ALPHA"].data is not None:
                 try:
-                    alpha_mask_arr = np.asarray(hdul["ALPHA"].data, dtype=np.float32, copy=False)
+                    alpha_mask_arr = np.asarray(hdul["ALPHA"].data)
                 except Exception:
                     alpha_mask_arr = None
 
@@ -13089,16 +13089,15 @@ def assemble_final_mosaic_reproject_coadd(
     alpha_weights_present = any(
         isinstance(entry, dict) and entry.get("alpha_weight2d") is not None for entry in effective_tiles
     )
-    if use_gpu and alpha_weights_present:
-        use_gpu = False
+    if alpha_weights_present and use_gpu:
         try:
             _pcb(
-                "[Alpha] Per-pixel alpha weights require CPU coadd; forcing CPU for Phase 5",
+                "[Alpha] Per-pixel alpha weights detected; GPU coadd will apply alpha masks",
                 prog=None,
                 lvl="INFO_DETAIL",
             )
         except Exception:
-            logger.info("[Alpha] Per-pixel alpha weights require CPU coadd; forcing CPU for Phase 5")
+            logger.info("[Alpha] Per-pixel alpha weights detected; GPU coadd will apply alpha masks")
 
     # Optional inter-tile photometric (gain/offset) calibration
     pending_affine_list, nontrivial_affine = _sanitize_affine_corrections(
@@ -13881,7 +13880,7 @@ def _load_master_tiles_for_two_pass(
                 data = hdul[0].data.astype(np.float32)
                 alpha_arr = None
                 if "ALPHA" in hdul and hdul["ALPHA"].data is not None:
-                    alpha_arr = np.asarray(hdul["ALPHA"].data, dtype=np.float32, copy=False)
+                    alpha_arr = np.asarray(hdul["ALPHA"].data)
         except Exception as exc:
             if logger:
                 logger.warning(
