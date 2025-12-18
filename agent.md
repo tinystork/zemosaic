@@ -15,7 +15,7 @@
 5) Keep existing logs; add one concise INFO_DETAIL log when alpha masks force CPU path (if needed).
 
 ## Implementation plan (surgical)
-### A) Stop using NaN-as-mask for the coadd path (Phase 5)
+### [x] A) Stop using NaN-as-mask for the coadd path (Phase 5)
 In `zemosaic_worker.py` inside `assemble_final_mosaic_reproject_coadd`, during the loop that builds `effective_tiles`:
 - Keep reading `data` and `alpha_mask_arr` as currently.
 - Build a per-pixel weight map from alpha:
@@ -27,14 +27,14 @@ In `zemosaic_worker.py` inside `assemble_final_mosaic_reproject_coadd`, during t
     - `data = data.copy(); data[~valid, :] = 0` (for RGB) or `data[~valid] = 0` (mono)
 - Store `weight2d` on the tile entry (e.g. `tile_entry["alpha_weight2d"] = weight2d`).
 
-### B) Pass per-pixel weights to reproject_and_coadd (CPU path)
+### [x] B) Pass per-pixel weights to reproject_and_coadd (CPU path)
 `astropy-reproject reproject_and_coadd` accepts `input_weights` per input image.
 - When assembling each channel (where you build `data_list` and `wcs_list_local` for `reproject_and_coadd_wrapper`), also build:
   - `weights_list = [tile_entry["alpha_weight2d"] for each tile]`
   - If a tile has no alpha, use `None` or all-ones weights for that tile.
 - Call `zemosaic_utils.reproject_and_coadd_wrapper(..., input_weights=weights_list, ...)` so CPU coadd ignores masked pixels.
 
-### C) GPU path compatibility: correctness first
+### [x] C) GPU path compatibility: correctness first
 The current GPU wrapper supports only scalar `tile_weights`, not per-pixel `input_weights`.
 For now:
 - If `use_gpu=True` and any tile has alpha_weight2d, force CPU for Phase 5 with a clear log:
@@ -42,7 +42,7 @@ For now:
   - Log: `"[Alpha] Per-pixel alpha weights require CPU coadd; forcing CPU for Phase 5"`
 This is a deliberate, minimal correctness fix. (Future work: add per-pixel weights to GPU coadd.)
 
-### D) Keep coverage consistent
+### [x] D) Keep coverage consistent
 - For coverage output, if alpha exists, coverage should be derived from `weight2d` (already the intent):
   - `coverage_mask_entry = weight2d`
 - If no alpha, keep current finite-based coverage.
@@ -59,7 +59,7 @@ This is a deliberate, minimal correctness fix. (Future work: add per-pixel weigh
 - Preserve current progress callbacks and logs.
 
 ## Validation checklist
-- Run a mosaic with alt-az cleanup enabled producing ALPHA.
-- Confirm final mosaic has filled areas where previous run showed black/empty slabs.
-- Confirm no NaN propagation in final mosaic stats (nanmin/nanmax finite on populated regions).
-- Confirm Phase 5 logs show alpha weights detected and CPU forced (only if use_gpu was requested).
+- [ ] Run a mosaic with alt-az cleanup enabled producing ALPHA.
+- [ ] Confirm final mosaic has filled areas where previous run showed black/empty slabs.
+- [ ] Confirm no NaN propagation in final mosaic stats (nanmin/nanmax finite on populated regions).
+- [ ] Confirm Phase 5 logs show alpha weights detected and CPU forced (only if use_gpu was requested).
