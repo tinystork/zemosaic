@@ -1,0 +1,73 @@
+diff --git a/zemosaic_worker.py b/zemosaic_worker.py
+index cbff3833efe100c0417ee66aae7392e1b200d840..086bf9bc199ef6afe5d5ad8f31727067709e059b 100644
+--- a/zemosaic_worker.py
++++ b/zemosaic_worker.py
+@@ -2876,50 +2876,68 @@ def load_image_with_optional_alpha(
+             except Exception:
+                 alpha = None
+ 
+     label = tile_label or _path_display_name(path)
+     data = _ensure_hwc_master_tile(primary, label)
+     data = np.asarray(data, dtype=np.float32, order="C", copy=False)
+ 
+     weights: np.ndarray | None = None
+     if alpha is not None:
+         alpha = np.squeeze(alpha)
+         if alpha.ndim != 2:
+             try:
+                 alpha = alpha.reshape(alpha.shape[-2], alpha.shape[-1])
+             except Exception:
+                 alpha = None
+         if alpha is not None:
+             alpha = np.clip(alpha, 0, 255).astype(np.uint8, copy=False)
+             weights = alpha.astype(np.float32) / 255.0
+             weights = np.clip(weights, 0.0, 1.0)
+             mask_zero = weights <= ALPHA_OPACITY_THRESHOLD
+             weights = np.where(mask_zero, 0.0, 1.0)
+             if data.ndim == 2 and weights.shape == data.shape:
+                 data = np.where(mask_zero, np.nan, data)
+             elif data.ndim == 3 and weights.shape == data.shape[:2]:
+                 data = np.where(mask_zero[..., None], np.nan, data)
++    if weights is None:
++        if data.ndim == 2:
++            finite_mask = np.isfinite(data)
++            invalid_mask = ~finite_mask
++        elif data.ndim == 3:
++            finite_mask = np.all(np.isfinite(data), axis=-1)
++            invalid_mask = ~finite_mask
++        else:
++            finite_mask = None
++            invalid_mask = None
++        if finite_mask is not None:
++            weights = finite_mask.astype(np.float32, copy=False)
++            if invalid_mask is not None and np.any(invalid_mask):
++                if data.ndim == 2:
++                    data = np.where(invalid_mask, np.nan, data)
++                else:
++                    data = np.where(invalid_mask[..., None], np.nan, data)
++    data = np.asarray(data, dtype=np.float32, order="C", copy=False)
+ 
+     return data, weights, alpha
+ 
+ 
+ def _resolve_global_mosaic_path(output_dir: str | Path, candidate: str | os.PathLike | None) -> str | None:
+     """Return an absolute filesystem path for *candidate* under *output_dir*."""
+ 
+     candidate_path = expand_to_path(candidate)
+     if candidate_path is None:
+         return None
+     base_dir = expand_to_path(output_dir) or Path(".")
+     if not isinstance(base_dir, Path):
+         base_dir = Path(".")
+     if not candidate_path.is_absolute():
+         candidate_path = base_dir / candidate_path
+     try:
+         return str(candidate_path.resolve(strict=False))
+     except Exception:
+         return str(candidate_path)
+ 
+ 
+ def _load_global_wcs_descriptor_safe(fits_path: str, json_path: str | None = None):
+     """Best-effort wrapper around zemosaic_utils.load_global_wcs_descriptor."""
+ 
+     if (
