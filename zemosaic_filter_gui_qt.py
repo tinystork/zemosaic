@@ -2683,6 +2683,92 @@ class FilterQtDialog(QDialog):
         self._apply_auto_group_result(result_payload)
         self._hide_processing_overlay()
 
+    def _extract_eqmode_from_entry(self, entry: dict[str, Any]) -> str | None:
+        if not isinstance(entry, dict):
+            return None
+        cached = entry.get("_eqmode_mode")
+        if isinstance(cached, str):
+            return cached
+        raw_value = entry.get("EQMODE")
+        header = entry.get("header") or entry.get("header_subset")
+        if raw_value is None:
+            path_val = None
+            for key in ("path", "path_raw", "path_preprocessed_cache", "file", "filename"):
+                candidate = entry.get(key)
+                if candidate:
+                    path_val = candidate
+                    break
+            if header is None and path_val:
+                header = self._load_header(str(path_val))
+                if header is not None:
+                    entry.setdefault("header", header)
+            if header is not None:
+                raw_value = header.get("EQMODE")
+        value_int: int | None = None
+        try:
+            value_int = int(raw_value)
+        except Exception:
+            try:
+                value_int = int(str(raw_value).strip())
+            except Exception:
+                value_int = None
+        mode: str | None
+        if value_int == 1:
+            mode = "EQ"
+        elif value_int == 0:
+            mode = "ALTZ"
+        else:
+            mode = None
+        if mode:
+            entry["_eqmode_mode"] = mode
+        return mode
+
+    def _split_group_by_eqmode(
+        self,
+        group: list[dict[str, Any]],
+        log_fn: Callable[[str], None] | None = None,
+    ) -> list[list[dict[str, Any]]]:
+        if not group:
+            return [group]
+        eq_bucket: list[dict[str, Any]] = []
+        altz_bucket: list[dict[str, Any]] = []
+        unknown_bucket: list[dict[str, Any]] = []
+        for entry in group:
+            mode = self._extract_eqmode_from_entry(entry)
+            if mode == "EQ":
+                eq_bucket.append(entry)
+            elif mode == "ALTZ":
+                altz_bucket.append(entry)
+            else:
+                unknown_bucket.append(entry)
+        if eq_bucket and altz_bucket:
+            message = (
+                "eqmode_split: group mixed (EQ=%d ALTZ=%d UNKNOWN=%d) -> split"
+                % (len(eq_bucket), len(altz_bucket), len(unknown_bucket))
+            )
+            logger.info(message)
+            if log_fn is not None:
+                log_fn(message)
+            return [bucket for bucket in (eq_bucket, altz_bucket, unknown_bucket) if bucket]
+        return [group]
+
+    def _group_eqmode_signature(self, group: Sequence[dict[str, Any]]) -> str:
+        has_eq = False
+        has_altz = False
+        for entry in group or []:
+            mode = self._extract_eqmode_from_entry(entry)
+            if mode == "EQ":
+                has_eq = True
+            elif mode == "ALTZ":
+                has_altz = True
+        if has_eq and has_altz:
+            return "MIXED"
+        if has_eq:
+            return "EQ"
+        if has_altz:
+            return "ALTZ"
+        return "UNKNOWN"
+
     def _compute_auto_groups(
         self,
         selected_indices: list[int],
@@ -2810,7 +2896,9 @@ class FilterQtDialog(QDialog):
             raise RuntimeError("Worker clustering returned no groups.")
 
         threshold_used = float(threshold_initial)
-        groups_used = groups_initial
+        groups_used: list[list[dict[str, Any]]] = []
+        for group in groups_initial:
+            groups_used.extend(self._split_group_by_eqmode(group, log_fn=messages.append))
         candidate_count = len(candidate_infos)
         ratio = (len(groups_initial) / float(candidate_count)) if candidate_count else 0.0
         pathological = candidate_count > 0 and (
@@ -2954,15 +3042,23 @@ class FilterQtDialog(QDialog):
             merge_fn = _tk_merge_small_groups or (
                 lambda groups, min_size, cap, **_: groups  # type: ignore[misc]
             )
-            final_groups = merge_fn(
-                groups_after_autosplit,
-                min_size=int(max(1, min_cap)),
-                cap=int(max(1, cap_effective)),
-                cap_allowance=cap_allowance,
-                compute_dispersion=_COMPUTE_MAX_SEPARATION,
-                max_dispersion_deg=max_dispersion,
-                log_fn=messages.append,
-            )
+            final_groups = []
+            signature_buckets: dict[str, list[list[dict[str, Any]]]] = {}
+            for group in groups_after_autosplit:
+                signature = self._group_eqmode_signature(group)
+                signature_buckets.setdefault(signature, []).append(group)
+            for grouped in signature_buckets.values():
+                final_groups.extend(
+                    merge_fn(
+                        grouped,
+                        min_size=int(max(1, min_cap)),
+                        cap=int(max(1, cap_effective)),
+                        cap_allowance=cap_allowance,
+                        compute_dispersion=_COMPUTE_MAX_SEPARATION,
+                        max_dispersion_deg=max_dispersion,
+                        log_fn=messages.append,
+                    )
+                )
             if coverage_enabled:
                 messages.append(
                     self._format_message(
