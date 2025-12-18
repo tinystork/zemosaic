@@ -4000,21 +4000,30 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
                 img = img * cp.float32(gain_val)
             if offset_val != 0.0:
                 img = img + cp.float32(offset_val)
+        mask = cp.isfinite(img).astype(cp.float32)
+        if weight_map_gpu is not None:
+            weight_map_gpu = cp.nan_to_num(weight_map_gpu, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+            weight_map_gpu = cp.maximum(weight_map_gpu, cp.float32(0.0))
+            mask = mask * weight_map_gpu
+        valid_mask = mask > 0
         if match_background:
+            offset_val = 0.0
             try:
-                offset_val = float(cp.nanmedian(img).get())
+                if bool(int(cp.any(valid_mask).get())):
+                    offset_val = float(cp.nanmedian(img[valid_mask]).get())
             except Exception:
                 try:
-                    offset_val = float(np.nanmedian(cp.asnumpy(img)))
+                    valid_cpu = cp.asnumpy(valid_mask)
+                    img_cpu = cp.asnumpy(img)
+                    if np.any(valid_cpu):
+                        offset_val = float(np.nanmedian(img_cpu[valid_cpu]))
                 except Exception:
                     offset_val = 0.0
             if offset_val != 0.0 and np.isfinite(offset_val):
                 img = img - cp.float32(offset_val)
-        mask = cp.isfinite(img).astype(cp.float32)
-        if weight_map_gpu is not None:
-            weight_map_gpu = cp.maximum(weight_map_gpu, cp.float32(0.0))
-            mask = mask * weight_map_gpu
         img = cp.nan_to_num(img, copy=False, nan=0.0)
+        img = img * mask
+        mask = cp.nan_to_num(mask, copy=False, nan=0.0)
         return img, mask
 
     def _build_world_chunk_grid(rows_per_chunk: int) -> list[tuple[int, int, np.ndarray, np.ndarray]]:
@@ -4077,11 +4086,14 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
             & (y_in_gpu <= (h_in - 0.5))
         )
         coords = cp.stack([y_in_gpu, x_in_gpu], axis=0)
-        sampled = map_coordinates(img_gpu, coords, order=1, mode="constant", cval=0.0)
+        sampled_weighted = map_coordinates(img_gpu, coords, order=1, mode="constant", cval=0.0)
         sampled_mask = map_coordinates(mask_gpu, coords, order=1, mode="constant", cval=0.0)
-        sampled = sampled * sampled_mask * valid.astype(cp.float32)
-        sampled_mask = sampled_mask * valid.astype(cp.float32)
-        return sampled, sampled_mask
+        valid_f = valid.astype(cp.float32)
+        sampled_mask = sampled_mask * valid_f
+        sampled_weighted = sampled_weighted * valid_f
+        safe_mask = cp.maximum(sampled_mask, cp.float32(1e-6))
+        sampled_intensity = cp.where(sampled_mask > 0, sampled_weighted / safe_mask, cp.float32(0.0))
+        return sampled_intensity, sampled_mask
 
     def _finalize_match_background(mosaic_gpu: cp.ndarray) -> cp.ndarray:
         if not match_background:
@@ -4141,7 +4153,8 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
                     dec_chunk,
                     tile_path_for_logging=path_for_log,
                 )
-                mosaic_sum_gpu[y0:y1, :] += sampled * weight_i
+                weighted_sample = sampled * sampled_mask
+                mosaic_sum_gpu[y0:y1, :] += weighted_sample * weight_i
                 weight_sum_gpu[y0:y1, :] += sampled_mask * weight_i
             del img_gpu, mask_gpu
         eps = cp.float32(1e-6)
@@ -4295,10 +4308,10 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
                     dec_chunk,
                     tile_path_for_logging=path_for_log,
                 )
-                weighted_sample = sampled * weight_i
                 weighted_mask = sampled_mask * weight_i
+                weighted_sample = sampled * weighted_mask
                 sum_grid[y0:y1, :] += weighted_sample.astype(cp.float64)
-                sumsq_grid[y0:y1, :] += (weighted_sample ** 2).astype(cp.float64)
+                sumsq_grid[y0:y1, :] += (cp.square(sampled) * weighted_mask).astype(cp.float64)
                 weight_grid[y0:y1, :] += weighted_mask
                 count_grid[y0:y1, :] += (sampled_mask > 0).astype(cp.float32)
             if tile_cache is None:
