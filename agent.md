@@ -55,7 +55,7 @@ Do NOT change existing batch size behaviors (batch size = 0 and batch size > 1 m
       This avoids the axis mismatch warning.
 
 # Minimal tests (no full dataset required)
-- [ ] Unit-ish: create a fake 3-channel mosaic array with some NaNs and a coverage map with zeros.
+- [x] Unit-ish: create a fake 3-channel mosaic array with some NaNs and a coverage map with zeros.
       Ensure _nanize_by_coverage produces NaNs where expected.
 - [ ] Smoke: run a short mosaic on a small dataset and verify:
       - log has no preview NaN masking warning
