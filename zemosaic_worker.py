@@ -661,6 +661,8 @@ def _apply_lecropper_pipeline(
 
     out = arr
     alpha_mask_norm: np.ndarray | None = None
+    altaz_masked_used = False
+    altaz_mask2d_used = False
     try:
         if q_enabled and hasattr(lecropper, "quality_crop"):
             out = lecropper.quality_crop(
@@ -692,10 +694,11 @@ def _apply_lecropper_pipeline(
                         fill_value=None,
                     )
                     mask2d = None
-                if mask2d is None:
+                if masked is not None:
                     out = masked
-                else:
-                    out = base_for_mask
+                    altaz_masked_used = True
+                if mask2d is not None:
+                    altaz_mask2d_used = True
             elif hasattr(lecropper, "altZ_cleanup"):
                 cleaned = lecropper.altZ_cleanup(
                     base_for_mask,
@@ -704,9 +707,14 @@ def _apply_lecropper_pipeline(
                     nanize=az_nanize,
                 )
                 if isinstance(cleaned, (tuple, list)) and len(cleaned) >= 2:
-                    out, mask2d = cleaned[:2]
+                    candidate, mask2d = cleaned[:2]
+                    if candidate is not None:
+                        out = candidate
+                        altaz_masked_used = True
+                    altaz_mask2d_used = mask2d is not None
                 else:
                     out = cleaned
+                    altaz_masked_used = out is not None
             elif hasattr(lecropper, "apply_altaz_cleanup"):
                 cleaned = lecropper.apply_altaz_cleanup(
                     base_for_mask,
@@ -715,20 +723,35 @@ def _apply_lecropper_pipeline(
                     nanize=az_nanize,
                 )
                 if isinstance(cleaned, (tuple, list)) and len(cleaned) >= 2:
-                    out, mask2d = cleaned[:2]
+                    candidate, mask2d = cleaned[:2]
+                    if candidate is not None:
+                        out = candidate
+                        altaz_masked_used = True
+                    altaz_mask2d_used = mask2d is not None
                 else:
                     out = cleaned
+                    altaz_masked_used = out is not None
 
             if mask2d is not None:
                 alpha_mask_norm = np.asarray(mask2d, dtype=np.float32, copy=False)
                 hard_threshold = 1e-3
                 mask_zero = alpha_mask_norm <= hard_threshold
-                if base_for_mask.ndim == 3:
+                target_for_mask = out if isinstance(out, np.ndarray) else base_for_mask
+                if isinstance(target_for_mask, np.ndarray) and target_for_mask.ndim == 3:
                     mask_zero = mask_zero[..., None]
                 if az_nanize:
-                    out = np.where(mask_zero, np.nan, base_for_mask)
+                    out = np.where(mask_zero, np.nan, target_for_mask)
                 else:
-                    out = np.where(mask_zero, 0.0, base_for_mask)
+                    out = np.where(mask_zero, 0.0, target_for_mask)
+                altaz_mask2d_used = True
+            try:
+                logger.info(
+                    "MT_PIPELINE: altaz_cleanup applied: masked_used=%s mask2d_used=%s",
+                    bool(altaz_masked_used),
+                    bool(altaz_mask2d_used),
+                )
+            except Exception:
+                pass
     except Exception as exc:
         try:
             logger.warning("lecropper pipeline skipped (err=%s)", exc)
@@ -774,6 +797,42 @@ def _apply_final_mosaic_quality_pipeline(
                     keep_mask > 0, final_mosaic_coverage, 0.0
                 ).astype(np.float32, copy=False)
     return final_mosaic_data, final_mosaic_coverage, final_alpha_map
+
+
+def _selftest_lecropper_mask_propagation() -> bool:
+    """Quick sanity check to ensure masked outputs propagate when mask2d is returned."""
+
+    class _FakeLecropper:
+        @staticmethod
+        def mask_altaz_artifacts(arr, **kwargs):
+            mask = np.ones(arr.shape[:2], dtype=np.float32)
+            mask[:, 0] = 0.0
+            return arr + 1.0, mask
+
+    sample = np.arange(27, dtype=np.float32).reshape(3, 3, 3)
+    global lecropper, _LECROPPER_AVAILABLE
+    prev_module = lecropper
+    prev_available = _LECROPPER_AVAILABLE
+    try:
+        lecropper = _FakeLecropper()
+        _LECROPPER_AVAILABLE = True
+        processed, mask = _apply_lecropper_pipeline(
+            sample.copy(),
+            {"altaz_cleanup_enabled": True},
+        )
+        success = (
+            processed is not None
+            and np.allclose(processed, sample + 1.0)
+            and mask is not None
+            and mask.shape == sample.shape[:2]
+        )
+        msg = f"lecropper_mask_propagation_selftest success={success}"
+        logger.info(msg)
+        print(msg)
+        return success
+    finally:
+        lecropper = prev_module
+        _LECROPPER_AVAILABLE = prev_available
 
 
 def _apply_master_tile_crop_mask_to_mosaic(
@@ -10890,6 +10949,7 @@ def create_master_tile(
         return (None, None), failed_groups_to_retry
 
     quality_crop_enabled_effective = bool(quality_crop_enabled)
+    altaz_cleanup_enabled_effective = bool(altaz_cleanup_enabled)
     quality_gate_enabled_effective = bool(quality_gate_enabled)
     min_safe_stack_effective = max(1, int(min_safe_stack_size))
     target_stack_effective = max(min_safe_stack_effective, int(target_stack_size))
@@ -11326,18 +11386,23 @@ def create_master_tile(
                 lvl="WARN",
             )
 
-    pipeline_cfg = {
-        "quality_crop_enabled": quality_crop_enabled_effective,
-        "quality_crop_band_px": quality_crop_band_px,
-        "quality_crop_k_sigma": quality_crop_k_sigma,
-        "quality_crop_margin_px": quality_crop_margin_px,
-        "quality_crop_min_run": quality_crop_min_run,
-        "altaz_cleanup_enabled": altaz_cleanup_enabled,
-        "altaz_margin_percent": altaz_margin_percent,
-        "altaz_decay": altaz_decay,
-        "altaz_nanize": altaz_nanize,
-    }
-    master_tile_stacked_HWC, pipeline_alpha_mask = _apply_lecropper_pipeline(master_tile_stacked_HWC, pipeline_cfg)
+    pipeline_alpha_mask: np.ndarray | None = None
+    lecropper_pipeline_requested = bool(quality_crop_enabled_effective or altaz_cleanup_enabled_effective)
+    lecropper_applied = False
+    if lecropper_pipeline_requested and _LECROPPER_AVAILABLE:
+        pipeline_cfg = {
+            "quality_crop_enabled": quality_crop_enabled_effective,
+            "quality_crop_band_px": quality_crop_band_px,
+            "quality_crop_k_sigma": quality_crop_k_sigma,
+            "quality_crop_margin_px": quality_crop_margin_px,
+            "quality_crop_min_run": quality_crop_min_run,
+            "altaz_cleanup_enabled": altaz_cleanup_enabled_effective,
+            "altaz_margin_percent": altaz_margin_percent,
+            "altaz_decay": altaz_decay,
+            "altaz_nanize": altaz_nanize,
+        }
+        master_tile_stacked_HWC, pipeline_alpha_mask = _apply_lecropper_pipeline(master_tile_stacked_HWC, pipeline_cfg)
+        lecropper_applied = True
 
     try:
         if master_tile_stacked_HWC is not None:
@@ -11537,9 +11602,9 @@ def create_master_tile(
 
     try:
         pcb_tile(
-            "MT_PIPELINE: lecropper_applied=True, "
+            f"MT_PIPELINE: lecropper_applied={bool(lecropper_applied)}, "
             f"quality_crop={bool(quality_crop_enabled_effective)}, "
-            f"altaz_cleanup={bool(altaz_cleanup_enabled)}, "
+            f"altaz_cleanup={bool(altaz_cleanup_enabled_effective)}, "
             f"quality_gate={bool(quality_gate_enabled_effective)}, "
             f"salvage_mode={bool(salvage_mode)}",
             prog=None,
@@ -14840,6 +14905,23 @@ def run_hierarchical_mosaic_classic_legacy(
         worker_config_cache,
         filter_overrides,
     )
+
+    quality_crop_requested_flag = bool(quality_crop_enabled_config)
+    altaz_cleanup_requested_flag = bool(altaz_cleanup_enabled_config)
+    lecropper_pipeline_flag = (
+        bool(_LECROPPER_AVAILABLE) and (quality_crop_requested_flag or altaz_cleanup_requested_flag)
+    )
+    pipeline_flags_msg = (
+        f"MT_PIPELINE_FLAGS: lecropper_enabled={lecropper_pipeline_flag}, "
+        f"quality_crop_enabled={quality_crop_requested_flag}, "
+        f"altaz_cleanup_enabled={altaz_cleanup_requested_flag}, "
+        f"lecropper_available={bool(_LECROPPER_AVAILABLE)}"
+    )
+    logger.info(pipeline_flags_msg)
+    try:
+        pcb(pipeline_flags_msg, prog=None, lvl="INFO_DETAIL")
+    except Exception:
+        pass
 
     config_sds_default = _coerce_bool_flag(worker_config_cache.get("sds_mode_default"))
     override_flag = None
@@ -22660,6 +22742,10 @@ def run_hierarchical_mosaic_process(
 if __name__ == "__main__":
     import argparse
     import json
+
+    if os.environ.get("ZEMOSAIC_SELFTEST_LECROPPER") == "1":
+        ok = _selftest_lecropper_mask_propagation()
+        raise SystemExit(0 if ok else 1)
 
     parser = argparse.ArgumentParser(description="ZeMosaic worker")
     parser.add_argument("input_folder", help="Folder with input FITS")

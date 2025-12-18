@@ -1,86 +1,65 @@
-# Mission: Ensure lecropper is actually applied to Master Tiles when enabled + propagate masked output
+# Mission: Make lecropper/ALPHA mask act as transparency during Phase-5 reproject+coadd
 
 ## Context
-In ZeMosaic, master tiles can be post-processed by `lecropper.py` through `_apply_lecropper_pipeline()` in `zemosaic_worker.py`.
+- Master tiles are written with an ALPHA extension (uint8 0..255) via zemosaic_utils.save_fits_image(..., alpha_mask=alpha_mask_out).
+- In Phase 5, zemosaic_worker loads each master tile + optional ALPHA and currently converts alpha to [0..1] and then *nanizes* masked pixels:
+  data[zero_mask[..., None]] = np.nan
+- This is NOT sufficient for `reproject_and_coadd(combine_function="mean")`: any NaN in a stack will contaminate the mean and can prevent overlap from filling masked zones.
+- Goal: masked zones must be treated as "no data" so overlap fills them.
 
-Current issue:
-- When `lecropper.mask_altaz_artifacts()` returns `(masked, mask2d)`, the worker sets `out = base_for_mask` (original) and only keeps `mask2d`, which can discard the actual cleaned image `masked`.
-- Users report that enabling the GUI option does not reliably guarantee that master tiles are truly modified by lecropper (especially in alt-az cleanup path).
+## Target behavior (Acceptance criteria)
+1) If a master tile has an ALPHA extension, masked pixels (alpha <= ALPHA_OPACITY_THRESHOLD) must contribute **zero weight** to the global coadd.
+2) Overlapping valid pixels from other tiles must fill those regions (no black slabs / no NaN propagation).
+3) Do not rewrite master tiles on disk (only interpret ALPHA at load time).
+4) Keep changes surgical: only touch the minimal code paths in zemosaic_worker.py and zemosaic_utils.py required for correctness.
+5) Keep existing logs; add one concise INFO_DETAIL log when alpha masks force CPU path (if needed).
 
-## Goal
-1) When the user enables the "lecropper / Alt-Az cleanup / MT pipeline" option in the GUI, the worker MUST pass every built Master Tile through `_apply_lecropper_pipeline()` (for applicable phases, i.e. after stacking a master tile but before it is persisted and used for final mosaic assembly).
-2) If `mask_altaz_artifacts()` returns `(masked, mask2d)`, the worker MUST propagate `masked` as the tile image output (so visual corrections are applied), while still returning / preserving `mask2d` for downstream masking/weighting logic.
+## Implementation plan (surgical)
+### A) Stop using NaN-as-mask for the coadd path (Phase 5)
+In `zemosaic_worker.py` inside `assemble_final_mosaic_reproject_coadd`, during the loop that builds `effective_tiles`:
+- Keep reading `data` and `alpha_mask_arr` as currently.
+- Build a per-pixel weight map from alpha:
+  - `alpha01 = clip(alpha_mask_arr, 0..1)` (already computed)
+  - `valid = (alpha01 > ALPHA_OPACITY_THRESHOLD)`
+  - `weight2d = valid.astype(float32)` (hard mask is fine)
+- Do NOT set `data[...] = np.nan` based on alpha.
+  - Instead, set masked pixels to 0 (optional but safe):
+    - `data = data.copy(); data[~valid, :] = 0` (for RGB) or `data[~valid] = 0` (mono)
+- Store `weight2d` on the tile entry (e.g. `tile_entry["alpha_weight2d"] = weight2d`).
 
-## Non-goals / constraints
-- Do NOT refactor pipeline design.
-- Do NOT change stacking logic, alignment logic, reproject logic, or tile clustering.
-- Do NOT touch batch-size special behavior ("batch size = 0" and "batch size > 1" behavior must remain unchanged).
-- `lecropper.py` must remain standalone and runnable outside ZeMosaic (no ZeMosaic-only imports inside lecropper).
-- Keep changes surgical and limited to: `zemosaic_worker.py` and GUI flag wiring (Qt and/or Tk depending on where the option lives).
-- Add logs only where needed for proof.
+### B) Pass per-pixel weights to reproject_and_coadd (CPU path)
+`astropy-reproject reproject_and_coadd` accepts `input_weights` per input image.
+- When assembling each channel (where you build `data_list` and `wcs_list_local` for `reproject_and_coadd_wrapper`), also build:
+  - `weights_list = [tile_entry["alpha_weight2d"] for each tile]`
+  - If a tile has no alpha, use `None` or all-ones weights for that tile.
+- Call `zemosaic_utils.reproject_and_coadd_wrapper(..., input_weights=weights_list, ...)` so CPU coadd ignores masked pixels.
 
-## Files in scope
-- `zemosaic_worker.py`
-- GUI: whichever file actually defines the option and passes config to the worker:
-  - Qt: `zemosaic_gui_qt.py` (and possibly `zemosaic_filter_gui_qt.py` if the option is there)
-  - Tk: `zemosaic_gui.py` (only if needed)
+### C) GPU path compatibility: correctness first
+The current GPU wrapper supports only scalar `tile_weights`, not per-pixel `input_weights`.
+For now:
+- If `use_gpu=True` and any tile has alpha_weight2d, force CPU for Phase 5 with a clear log:
+  - `use_gpu_effective = False` when alpha masks are present.
+  - Log: `"[Alpha] Per-pixel alpha weights require CPU coadd; forcing CPU for Phase 5"`
+This is a deliberate, minimal correctness fix. (Future work: add per-pixel weights to GPU coadd.)
 
-## Implementation tasks
+### D) Keep coverage consistent
+- For coverage output, if alpha exists, coverage should be derived from `weight2d` (already the intent):
+  - `coverage_mask_entry = weight2d`
+- If no alpha, keep current finite-based coverage.
 
-### Task A — Fix propagation semantics in `_apply_lecropper_pipeline`
-In `zemosaic_worker.py`:
-- Locate `_apply_lecropper_pipeline(...)`.
-- Current behavior (conceptually):
-  - if mask_altaz_artifacts returns `(masked, mask2d)`:
-    - out = base_for_mask (original)
-    - return out, mask2d
-- Required behavior:
-  - if `(masked, mask2d)`:
-    - set `out = masked` (NOT the original)
-    - still return `mask2d` unchanged
-  - Preserve existing fallbacks when `mask_altaz_artifacts` returns only `masked` or returns None.
-- Add a debug/info log line that proves which path was taken:
-  - Example: `MT_PIPELINE: altaz_cleanup applied: masked_used=True mask2d_used=True`
-  - Keep logs stable/greppable.
+## Files to edit
+- `/mnt/data/zemosaic_worker.py`
+- `/mnt/data/zemosaic_utils.py` (small: allow wrapper to forward `input_weights` to CPU safely if it filters kwargs)
 
-Acceptance:
-- When alt-az cleanup produces both masked and mask2d, the saved Master Tile data must reflect the masked output.
+## Notes / Constraints
+- Do NOT refactor or rename major functions.
+- Do NOT change lecropper.py behavior.
+- Do NOT change master tile writing format.
+- Keep the existing ALPHA extension logic.
+- Preserve current progress callbacks and logs.
 
-### Task B — Guarantee the option is honored end-to-end (GUI -> config -> worker)
-We need to ensure that when user checks the option in the GUI, the worker receives a config flag and uses it to call `_apply_lecropper_pipeline()` for each Master Tile.
-
-Steps:
-1. Identify the GUI checkbox / option name.
-2. Ensure it is persisted into the config object passed to the worker thread/process.
-3. In the worker, locate the Master Tile construction path (right after the tile stack is produced and before it is written/cached or used for mosaic).
-4. Gate the `_apply_lecropper_pipeline()` call on that flag.
-
-Add proof logs:
-- At start of run (once): log the boolean flags: `lecropper_enabled`, `quality_crop_enabled`, `altaz_cleanup_enabled`.
-- Per master tile (already exists partially): ensure log includes `lecropper_applied=True/False`.
-
-Acceptance:
-- When GUI option enabled, log must contain per-tile `MT_PIPELINE: lecropper_applied=True`.
-- When disabled, it must be `False` and worker must not call lecropper.
-
-### Task C — Minimal regression safety
-Add a tiny self-test helper (no heavy pytest harness needed):
-- A small function in `zemosaic_worker.py` guarded under `if __name__ == "__main__":` OR a lightweight internal test function callable from existing debug scripts.
-- It should simulate:
-  - `mask_altaz_artifacts` returning `(masked, mask2d)` where masked is visibly different (e.g., add +1 to array)
-  - Ensure returned `out` equals masked (not original)
-- Keep it optional and not run during normal GUI execution.
-
-If you do add a test file, keep it minimal and do not add new dependencies.
-
-## Deliverables
-- A git-ready patch (unified diff) that applies cleanly.
-- Brief commit message suggestion.
-
-## Verification checklist
-- Run ZeMosaic with lecropper option ON:
-  - confirm logs show `MT_PIPELINE: lecropper_applied=True`
-  - confirm `masked_used=True` when altaz returns mask2d
-- Run with option OFF:
-  - confirm `lecropper_applied=False`
-- Confirm no changes to batch-size behavior.
+## Validation checklist
+- Run a mosaic with alt-az cleanup enabled producing ALPHA.
+- Confirm final mosaic has filled areas where previous run showed black/empty slabs.
+- Confirm no NaN propagation in final mosaic stats (nanmin/nanmax finite on populated regions).
+- Confirm Phase 5 logs show alpha weights detected and CPU forced (only if use_gpu was requested).

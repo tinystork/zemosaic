@@ -1,42 +1,86 @@
-# Follow-up: How to verify the lecropper propagation fix
+# Follow-up: Patch details & exact code locations
 
-## 1) Quick log greps (Windows PowerShell)
-From the folder containing the ZeMosaic log:
+## 1) zemosaic_worker.py — Phase 5 tile preparation (assemble_final_mosaic_reproject_coadd)
 
-### Confirm option is actually enabled in the run
-Select-String -Path .\zemosaic.log -Pattern "lecropper_enabled|MT_PIPELINE"
+### Location
+Function: `assemble_final_mosaic_reproject_coadd(...)`
+Loop: `for idx, (tile_path, tile_wcs) in enumerate(master_tile_fits_with_wcs_list, 1):`
 
+### Change
+Replace the current “alpha -> NaN” application:
+
+- Remove / disable:
+  - `zero_mask = alpha_mask_arr <= ALPHA_OPACITY_THRESHOLD`
+  - `data[zero_mask[..., None]] = np.nan`
+
+- Add:
+  - `valid2d = (alpha_mask_arr > ALPHA_OPACITY_THRESHOLD)` after alpha normalization/clip.
+  - `alpha_weight2d = valid2d.astype(np.float32)`
+  - Optional safety: set masked pixels to 0 so interpolation never sees garbage:
+    - if `data.ndim == 3`: `data = data.copy(); data[~valid2d, :] = 0.0`
+    - else: `data = data.copy(); data[~valid2d] = 0.0`
+  - Store on tile_entry:
+    - `tile_entry["alpha_weight2d"] = alpha_weight2d`
+
+Coverage:
+- If alpha exists: `coverage_mask_entry = alpha_weight2d`
+- Else: keep existing finite-based coverage.
+
+## 2) zemosaic_worker.py — Phase 5 per-channel coadd call: pass input_weights
+
+### Location
+Still inside `assemble_final_mosaic_reproject_coadd`, later when you build per-channel `data_list` and `wcs_list_local` and call:
+- `zemosaic_utils.reproject_and_coadd_wrapper(...)`
+
+### Change
+Build a `weights_list` aligned with `data_list`:
+- If tile has `alpha_weight2d`, append it
+- Else append an all-ones array matching the plane shape (H,W)
+  - `np.ones_like(data_plane, dtype=np.float32)`
+
+Pass to wrapper as:
+- `input_weights=weights_list`
+
+Important: weights are 2D per plane, which matches reproject expectations.
+
+## 3) GPU forcing (correctness-first)
+
+### Location
+At the start of Phase 5 assembly (before channel loop) after `effective_tiles` is built.
+
+### Change
+Detect alpha weights:
+- `alpha_present = any(("alpha_weight2d" in t and t["alpha_weight2d"] is not None) for t in effective_tiles)`
+
+If `use_gpu` is True and `alpha_present` is True:
+- set `use_gpu = False` for this function scope (or use a local `use_gpu_effective`)
+- emit a single log/callback:
+  - logger.info or pcb INFO_DETAIL:
+    - `"[Alpha] Per-pixel alpha weights require CPU coadd; forcing CPU for Phase 5"`
+
+This avoids silent wrong mosaics.
+
+## 4) zemosaic_utils.py — ensure wrapper forwards input_weights to CPU
+
+### Location
+Function: `_reproject_and_coadd_wrapper_impl(...)`
+
+### Check
+It currently filters some GPU-only kwargs into `cpu_kwargs`, but `input_weights` is not filtered out — good.
+If you see any filtering that drops `input_weights`, ensure it is preserved.
+
+No algorithm change required.
+
+## 5) Quick sanity tests (no new unit framework)
+- Add a tiny debug log in Phase 5:
+  - for first tile with alpha, log:
+    - alpha min/max, valid fraction, weight shape vs data shape
+- Run one dataset where alt-az cleanup produces strong masks.
 Expected:
-- One run-level line showing flags (enabled/disabled)
-- Many per-tile lines with `MT_PIPELINE: lecropper_applied=True` when enabled
+- final mosaic no longer shows black/empty slabs in overlapping regions.
+- coverage behaves (masked pixels => low/zero coverage unless filled by other tiles).
 
-### Confirm masked output is used even when mask2d is present
-Select-String -Path .\zemosaic.log -Pattern "masked_used=True"
-
-Expected:
-- If alt-az cleanup is active and mask2d is produced, you should see `masked_used=True mask2d_used=True`.
-
-## 2) Visual sanity check (single tile)
-Pick one problematic Master Tile that previously had obvious alt-az edge artifacts.
-
-Run twice on same dataset:
-- Run A: lecropper OFF
-- Run B: lecropper ON
-
-Compare:
-- The saved master tiles (or intermediate outputs)
-- The final mosaic: edge artifacts should be reduced in Run B.
-
-## 3) Guardrails
-- Confirm there is no change in behavior for:
-  - batch size = 0
-  - batch size > 1
-- Confirm lecropper remains standalone (no new ZeMosaic imports in lecropper.py)
-
-## 4) If something still doesn’t propagate
-Add one extra debug line (only if necessary):
-- right before saving a master tile, log min/median/max for RGB channels (already there are helper stats functions in worker).
-- Use it to prove the array changed when lecropper is ON.
-
-## 5) Commit message suggestion
-"Fix: propagate lecropper masked output to master tiles and ensure GUI flag enables MT pipeline"
+## Deliverables
+- One commit with surgical changes.
+- No refactor, no signature changes.
+- Logs kept; add 1–2 INFO_DETAIL lines max.
