@@ -13514,16 +13514,54 @@ def assemble_final_mosaic_reproject_coadd(
             data_list = []
             wcs_list = []
             input_weights_list = []
+            weight_debug_logged = False
             for entry in valid_entries:
                 entry_data = entry.get("data")
                 data_plane = entry_data[..., ch]
                 data_list.append(data_plane)
                 wcs_list.append(entry.get("wcs"))
+                weight_source = "ones"
                 weight2d = entry.get("alpha_weight2d") if isinstance(entry, dict) else None
                 if weight2d is not None:
-                    input_weights_list.append(weight2d)
+                    weight_source = "alpha_weight2d"
                 else:
-                    input_weights_list.append(np.ones_like(data_plane, dtype=np.float32))
+                    coverage_mask = entry.get("coverage_mask") if isinstance(entry, dict) else None
+                    if coverage_mask is not None:
+                        try:
+                            weight_candidate = np.asarray(coverage_mask, dtype=np.float32, order="C", copy=False)
+                            if weight_candidate.shape == data_plane.shape:
+                                weight2d = np.clip(
+                                    np.nan_to_num(weight_candidate, nan=0.0, posinf=0.0, neginf=0.0),
+                                    0.0,
+                                    1.0,
+                                )
+                                weight_source = "coverage_mask"
+                        except Exception:
+                            weight2d = None
+                    if weight2d is None:
+                        weight2d = np.ones_like(data_plane, dtype=np.float32)
+                input_weights_list.append(weight2d)
+                if (
+                    not weight_debug_logged
+                    and logger.isEnabledFor(logging.DEBUG)
+                    and isinstance(weight2d, np.ndarray)
+                ):
+                    try:
+                        weight_min = float(np.nanmin(weight2d)) if weight2d.size else 0.0
+                        weight_max = float(np.nanmax(weight2d)) if weight2d.size else 0.0
+                        zero_frac = float(np.mean(weight2d <= 0.0)) if weight2d.size else 0.0
+                        logger.debug(
+                            "[Phase5] input_weights sample: channel=%d source=%s shape=%s min=%.4f max=%.4f zero_frac=%.4f",
+                            ch,
+                            weight_source,
+                            weight2d.shape,
+                            weight_min,
+                            weight_max,
+                            zero_frac,
+                        )
+                        weight_debug_logged = True
+                    except Exception:
+                        pass
             weights_for_entries = None
             if tile_weighting_applied:
                 weights_for_entries = [
@@ -13556,7 +13594,7 @@ def assemble_final_mosaic_reproject_coadd(
                     reproject_function=reproject_interp,
                     combine_function="mean",
                     progress_callback=_pcb,
-                    **local_kwargs,
+                    **invoke_kwargs,
                 )
 
             try:

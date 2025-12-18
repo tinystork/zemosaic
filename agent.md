@@ -24,43 +24,42 @@ Inside `assemble_final_mosaic_reproject_coadd()`:
 Also: `_invoke_reproject()` creates `invoke_kwargs` but mistakenly calls wrapper with `**local_kwargs` (so `tile_weights` is never passed). Fix that too (tiny).
 
 ## Implementation plan (surgical)
-### A) Use `coverage_mask` as input weights when present
-In the Phase5 channel loop where we build:
-- `data_list`
-- `wcs_list`
-- `input_weights_list`
+- [x] A) Use `coverage_mask` as input weights when present  
+  In the Phase5 channel loop where we build:
+  - `data_list`
+  - `wcs_list`
+  - `input_weights_list`
 
-Change the fallback branch:
-- If `entry.get("alpha_weight2d")` exists: keep it (unchanged).
-- Else if `entry.get("coverage_mask")` exists and matches the data plane shape `(H,W)`: use that as the weight map.
-- Else: fallback to `ones_like(data_plane)`.
+  Change the fallback branch:
+  - If `entry.get("alpha_weight2d")` exists: keep it (unchanged).
+  - Else if `entry.get("coverage_mask")` exists and matches the data plane shape `(H,W)`: use that as the weight map.
+  - Else: fallback to `ones_like(data_plane)`.
 
-Additionally:
-- Ensure weight map is float32 and clipped to [0,1].
-- If shape mismatch, keep safe fallback to ones_like (no crash).
+  Additionally:
+  - Ensure weight map is float32 and clipped to [0,1].
+  - If shape mismatch, keep safe fallback to ones_like (no crash).
 
-### B) Fix `_invoke_reproject` kwargs bug
-Current code:
-```py
-invoke_kwargs = dict(local_kwargs)
-if tile_weighting_applied ...:
-    invoke_kwargs["tile_weights"] = weights_for_entries
-return reproject_and_coadd_wrapper(..., **local_kwargs)
-````
+- [x] B) Fix `_invoke_reproject` kwargs bug  
+  Current code:
+  ```py
+  invoke_kwargs = dict(local_kwargs)
+  if tile_weighting_applied ...:
+      invoke_kwargs["tile_weights"] = weights_for_entries
+  return reproject_and_coadd_wrapper(..., **local_kwargs)
+  ````
 
-This ignores `invoke_kwargs`.
-Change wrapper call to `**invoke_kwargs`.
+  This ignores `invoke_kwargs`.
+  Change wrapper call to `**invoke_kwargs`.
 
-### C) Add MICRO debug logs (no spam)
+- [x] C) Add MICRO debug logs (no spam)  
+  Add one-time per channel (or only channel 0) debug payload:
 
-Add one-time per channel (or only channel 0) debug payload:
+  * Whether coverage_mask was used
+  * min/max of one sample weight map
+  * fraction of zeros (approx) for one sample tile
+    Keep it guarded by `logger.isEnabledFor(logging.DEBUG)` or a boolean `debug_logged`.
 
-* Whether coverage_mask was used
-* min/max of one sample weight map
-* fraction of zeros (approx) for one sample tile
-  Keep it guarded by `logger.isEnabledFor(logging.DEBUG)` or a boolean `debug_logged`.
-
-Do NOT add heavy loops over all tiles; sample at most 1–2 tiles.
+  Do NOT add heavy loops over all tiles; sample at most 1–2 tiles.
 
 ## Acceptance criteria
 
@@ -76,5 +75,4 @@ Do NOT add heavy loops over all tiles; sample at most 1–2 tiles.
 ## Suggested commit message
 
 "Phase5: use coverage_mask as input_weights + pass tile_weights correctly to reproject wrapper"
-
 
