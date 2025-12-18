@@ -5081,6 +5081,7 @@ def _run_phase4_5_inter_master_merge(
                 f"Phase 4.5: group {group_id} stacking ({reject_algo}/{final_combine})"
             )
             alpha_out = None
+            alpha_sources: list[str] = []
             weights_ready = any(isinstance(w, np.ndarray) for w in frame_weights)
             super_arr = None
             if weights_ready:
@@ -5100,6 +5101,7 @@ def _run_phase4_5_inter_master_merge(
                     den = np.nansum(weight_expanded, axis=0)
                     super_arr = np.where(den > 0, num / den, np.nan)
                     alpha_out = (np.nanmax(weight_stack, axis=0) * 255.0).astype(np.uint8)
+                    alpha_sources.append("stack_weights")
                     logger.debug("[P4.5][G%03d] Applied alpha-weighted stacking", group_id)
                 except Exception as exc:
                     alpha_out = None
@@ -5189,7 +5191,6 @@ def _run_phase4_5_inter_master_merge(
                 elif super_arr.shape[-1] > 3:
                     super_arr = super_arr[..., :3]
             super_arr = np.asarray(super_arr, dtype=np.float32, order="C")
-            np.nan_to_num(super_arr, copy=False)
             pipeline_cfg = {
                 "quality_crop_enabled": stack_cfg.get("quality_crop_enabled"),
                 "quality_crop_band_px": stack_cfg.get("quality_crop_band_px"),
@@ -5212,6 +5213,31 @@ def _run_phase4_5_inter_master_merge(
             )
             if pipeline_alpha_u8 is not None:
                 alpha_out = _combine_alpha_masks(alpha_out, pipeline_alpha_u8)
+                alpha_sources.append("pipeline")
+            if alpha_out is None:
+                try:
+                    finite_mask = (
+                        np.isfinite(super_arr)
+                        if super_arr.ndim == 2
+                        else np.all(np.isfinite(super_arr), axis=-1)
+                    )
+                    if isinstance(finite_mask, np.ndarray) and finite_mask.shape == super_arr.shape[:2]:
+                        alpha_out = np.where(finite_mask, 255, 0).astype(np.uint8, copy=False)
+                        alpha_sources.append("finite_mask")
+                except Exception:
+                    alpha_out = None
+            if alpha_out is not None and logger.isEnabledFor(logging.DEBUG):
+                try:
+                    zero_frac = float(np.mean(alpha_out <= ALPHA_OPACITY_THRESHOLD)) if alpha_out.size else 0.0
+                    logger.debug(
+                        "[P4.5][G%03d] Alpha present (sources=%s) shape=%s zero_frac=%.4f",
+                        group_id,
+                        "+".join(alpha_sources) if alpha_sources else "unknown",
+                        alpha_out.shape,
+                        zero_frac,
+                    )
+                except Exception:
+                    pass
             arr_shape = tuple(super_arr.shape)
             logger.debug(
                 "[P4.5][G%03d] Super array ready: shape=%s, dtype=%s",
@@ -13797,11 +13823,26 @@ def assemble_final_mosaic_reproject_coadd(
 
     if isinstance(coverage, np.ndarray):
         coverage = np.where(np.isfinite(coverage), coverage, 0.0).astype(np.float32, copy=False)
+    alpha_zero_mask = None
+    if isinstance(coverage, np.ndarray) and alpha_final is not None:
+        try:
+            alpha_arr = np.asarray(alpha_final)
+            if alpha_arr.ndim == 3 and alpha_arr.shape[-1] == 1:
+                alpha_arr = alpha_arr[..., 0]
+            alpha_arr = np.squeeze(alpha_arr)
+            if alpha_arr.ndim >= 2 and alpha_arr.shape[:2] == coverage.shape:
+                alpha_zero_mask = alpha_arr <= 0
+                if np.any(alpha_zero_mask):
+                    coverage = np.where(alpha_zero_mask, 0.0, coverage).astype(np.float32, copy=False)
+        except Exception:
+            alpha_zero_mask = None
     if mosaic_data is not None and coverage is not None:
         mosaic_data = np.asarray(mosaic_data, dtype=np.float32, copy=False)
         mosaic_data[~np.isfinite(mosaic_data)] = np.nan
         nanized_mask = coverage <= 0
-        if alpha_final is not None and alpha_final.shape[:2] == coverage.shape:
+        if alpha_zero_mask is not None:
+            nanized_mask = np.logical_or(nanized_mask, alpha_zero_mask)
+        elif alpha_final is not None and alpha_final.shape[:2] == coverage.shape:
             nanized_mask = np.logical_or(nanized_mask, alpha_final == 0)
         nanized_pixels = int(np.count_nonzero(nanized_mask))
         mosaic_data = _nanize_by_coverage(mosaic_data, coverage, alpha_u8=alpha_final)

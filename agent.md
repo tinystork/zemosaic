@@ -1,78 +1,46 @@
-# Mission: Fix NaN mask propagation during Phase5 reproject+coadd (GPU/CPU parity) — NO REFACTOR
+# Mission (surgical / no refactor)
+Fix alpha mask propagation during Phase 5 reproject & coadd: ALPHA extension exists (uint8 0/255) but is silently ignored because code reads it with np.asarray(... dtype=float32, copy=False), which fails when dtype conversion would require a copy.
 
-## Context
-Final mosaic shows nested dark/black rectangular frames: masked/invalid regions from master tiles are being treated as valid zeros after reproject/coadd.
-Master tiles contain NaNs (or coverage masks) but Phase5 currently builds per-tile input weights incorrectly (often all-ones), so reproject/coadd blends zeros instead of ignoring masked pixels.
+## Scope
+Only `zemosaic_worker.py`. No refactor, no behavior changes beyond making ALPHA actually load.
 
-This must be fixed in a minimal, surgical way.
+## Changes
+### 1) Phase 5 coadd loader
+File: `zemosaic_worker.py`
+Function: `assemble_final_mosaic_reproject_coadd`
+Find block:
+```py
+if "ALPHA" in hdul and hdul["ALPHA"].data is not None:
+    alpha_mask_arr = np.asarray(hdul["ALPHA"].data, dtype=np.float32, copy=False)
 
-## Scope (STRICT)
-- Modify ONLY: `zemosaic_worker.py`
-- Focus area: `assemble_final_mosaic_reproject_coadd()` Phase5 channel loop building `input_weights_list` and invoking `reproject_and_coadd_wrapper`.
-- No refactors, no renames, no moving code blocks, no formatting sweeps.
 
-## Primary goals
-1) Ensure that for each tile, per-pixel invalid regions (NaNs / masked) are converted into **input weights = 0** so they do not contribute to the coadd.
-2) Make GPU and CPU behave consistently: masked pixels should not appear as dark rectangles.
-3) Keep existing behavior for true ALPHA tiles; do not break the “alpha_weights_present => force CPU” logic.
+Replace the np.asarray(...) line with:
 
-## Key observations (current bug)
-Inside `assemble_final_mosaic_reproject_coadd()`:
-- The channel loop currently builds `input_weights_list` from `alpha_weight2d` only; otherwise it uses `ones_like()`.
-- But NaN masking (from lecropper) is stored in `entry["coverage_mask"]` (float32 0/1) and/or the data plane contains NaNs.
-- Therefore input_weights become ones → masked pixels are treated as valid → reproject/coadd can fill them as zeros → nested frames artifact.
-Also: `_invoke_reproject()` creates `invoke_kwargs` but mistakenly calls wrapper with `**local_kwargs` (so `tile_weights` is never passed). Fix that too (tiny).
+alpha_mask_arr = np.asarray(hdul["ALPHA"].data)
 
-## Implementation plan (surgical)
-- [x] A) Use `coverage_mask` as input weights when present  
-  In the Phase5 channel loop where we build:
-  - `data_list`
-  - `wcs_list`
-  - `input_weights_list`
 
-  Change the fallback branch:
-  - If `entry.get("alpha_weight2d")` exists: keep it (unchanged).
-  - Else if `entry.get("coverage_mask")` exists and matches the data plane shape `(H,W)`: use that as the weight map.
-  - Else: fallback to `ones_like(data_plane)`.
+Keep the existing normalization logic below (it already converts/scales).
 
-  Additionally:
-  - Ensure weight map is float32 and clipped to [0,1].
-  - If shape mismatch, keep safe fallback to ones_like (no crash).
+2) Two-pass loader
 
-- [x] B) Fix `_invoke_reproject` kwargs bug  
-  Current code:
-  ```py
-  invoke_kwargs = dict(local_kwargs)
-  if tile_weighting_applied ...:
-      invoke_kwargs["tile_weights"] = weights_for_entries
-  return reproject_and_coadd_wrapper(..., **local_kwargs)
-  ````
+File: zemosaic_worker.py
+Function: _load_master_tiles_for_two_pass
+Replace:
 
-  This ignores `invoke_kwargs`.
-  Change wrapper call to `**invoke_kwargs`.
+alpha_arr = np.asarray(hdul["ALPHA"].data, dtype=np.float32, copy=False)
 
-- [x] C) Add MICRO debug logs (no spam)  
-  Add one-time per channel (or only channel 0) debug payload:
 
-  * Whether coverage_mask was used
-  * min/max of one sample weight map
-  * fraction of zeros (approx) for one sample tile
-    Keep it guarded by `logger.isEnabledFor(logging.DEBUG)` or a boolean `debug_logged`.
+with:
 
-  Do NOT add heavy loops over all tiles; sample at most 1–2 tiles.
+alpha_arr = np.asarray(hdul["ALPHA"].data)
 
-## Acceptance criteria
+Expected outcome
 
-* Running the same dataset as the provided logs produces a final mosaic without nested dark rectangle frames.
-* CPU and GPU both ignore masked regions (masked areas remain transparent/absent; no black borders).
-* No regression in cases with real `alpha_weight2d` tiles; those still force CPU for Phase5 as before.
+Phase 5 detects per-pixel alpha weights (alpha_weights_present=True).
 
-## Deliverables
+If Phase 5 was GPU, it logs that it forces CPU due to alpha weights.
 
-* A single git-ready patch to `zemosaic_worker.py`
-* A short commit message suggestion
+assemble_reproject_coadd: input_weights sample ... weight_source=alpha_weight2d
 
-## Suggested commit message
-
-"Phase5: use coverage_mask as input_weights + pass tile_weights correctly to reproject wrapper"
+Final mosaic no longer shows black tile frames caused by masked pixels participating in coadd.
 

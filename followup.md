@@ -1,43 +1,20 @@
-# Follow-up: How to validate the Phase5 mask propagation fix
 
-## 1) Quick sanity checks (before running a full mosaic)
-- [x] Confirm the patch touched ONLY `zemosaic_worker.py`
-  - `git status`
-  - `git diff`
+## followup.md
+```md
+# Validation steps
+1) Run the same dataset with the same settings.
+2) In the log, confirm:
+   - Phase 5 starts with GPU allowed, but then prints the existing warning/info about forcing CPU because per-pixel alpha weights are present.
+   - A debug/info line like:
+     `assemble_reproject_coadd: input_weights sample ... weight_source=alpha_weight2d`
+     (not `coverage_mask`).
+3) Visually inspect final mosaic:
+   - black/zero bands at tile borders are gone,
+   - overlaps blend normally.
 
-- [x] Optional: run a quick search in the edited area to ensure:
-  - `coverage_mask` is used to populate `input_weights_list`
-  - `_invoke_reproject()` passes `**invoke_kwargs`
+# Regression checks
+- Run a dataset with no ALPHA extension: Phase 5 should stay GPU-capable and unchanged.
+- Confirm Two-Pass Coverage Renorm still runs and does not crash; coverage maps should now reflect ALPHA when present.
 
-## 2) Run the same reproduction dataset
-- [ ] Use the same command/config you used when producing:
-  - the “nested frames” final mosaic screenshot
-  - the `zemosaic_worker.log`
-
-- [ ] Run with GPU enabled (since the issue was clearly visible there).
-
-## 3) What to look for in logs
-- [ ] In Phase 5:
-  - You should NOT see a fallback that turns weights into all-ones silently.
-  - If DEBUG enabled, you should see one micro log per channel (or channel 0) like:
-    - "input_weights source=coverage_mask" for at least one tile
-    - a non-trivial fraction of zeros in the weight map sample
-
-## 4) Visual acceptance
-- [ ] Final mosaic should resemble the expected “clean” reference:
-  - No nested dark/black rectangles aligned to tile bounding boxes
-  - Masked regions behave as transparent / non-contributing
-
-## 5) Regression checks (important)
-- [ ] Test a dataset that includes true ALPHA extensions:
-  - Ensure Phase5 still forces CPU when `alpha_weight2d` is present (as before).
-- [ ] Test a dataset without NaNs/masks:
-  - Mosaic should remain unchanged.
-
-## 6) If it still fails
-- [ ] Collect:
-  - the new Phase5 log section (Phase5 started → finished)
-  - whether weights were reported as coming from coverage_mask
-  - one output coverage map FITS (if generated)
-- [ ] Then we’ll decide whether the GPU helper needs a footprint*weights multiplication (in gpu_reproject impl), but do NOT change that unless proven necessary.
-````
+# Notes
+This change is intentionally minimal: it only fixes ALPHA loading. No algorithm changes.

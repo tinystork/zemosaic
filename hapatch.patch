@@ -1,326 +1,76 @@
-diff --git a/agent.md b/agent.md
-index 89320bd964246ccb2ebd2ac86ab03ddaa469e8fd..85e137e3a2f27c846fa7faae72640fa84abbef4f 100644
---- a/agent.md
-+++ b/agent.md
-@@ -2,79 +2,77 @@
- 
- ## Context
- Final mosaic shows nested dark/black rectangular frames: masked/invalid regions from master tiles are being treated as valid zeros after reproject/coadd.
- Master tiles contain NaNs (or coverage masks) but Phase5 currently builds per-tile input weights incorrectly (often all-ones), so reproject/coadd blends zeros instead of ignoring masked pixels.
- 
- This must be fixed in a minimal, surgical way.
- 
- ## Scope (STRICT)
- - Modify ONLY: `zemosaic_worker.py`
- - Focus area: `assemble_final_mosaic_reproject_coadd()` Phase5 channel loop building `input_weights_list` and invoking `reproject_and_coadd_wrapper`.
- - No refactors, no renames, no moving code blocks, no formatting sweeps.
- 
- ## Primary goals
- 1) Ensure that for each tile, per-pixel invalid regions (NaNs / masked) are converted into **input weights = 0** so they do not contribute to the coadd.
- 2) Make GPU and CPU behave consistently: masked pixels should not appear as dark rectangles.
- 3) Keep existing behavior for true ALPHA tiles; do not break the “alpha_weights_present => force CPU” logic.
- 
- ## Key observations (current bug)
- Inside `assemble_final_mosaic_reproject_coadd()`:
- - The channel loop currently builds `input_weights_list` from `alpha_weight2d` only; otherwise it uses `ones_like()`.
- - But NaN masking (from lecropper) is stored in `entry["coverage_mask"]` (float32 0/1) and/or the data plane contains NaNs.
- - Therefore input_weights become ones → masked pixels are treated as valid → reproject/coadd can fill them as zeros → nested frames artifact.
- Also: `_invoke_reproject()` creates `invoke_kwargs` but mistakenly calls wrapper with `**local_kwargs` (so `tile_weights` is never passed). Fix that too (tiny).
- 
- ## Implementation plan (surgical)
--### A) Use `coverage_mask` as input weights when present
--In the Phase5 channel loop where we build:
--- `data_list`
--- `wcs_list`
--- `input_weights_list`
--
--Change the fallback branch:
--- If `entry.get("alpha_weight2d")` exists: keep it (unchanged).
--- Else if `entry.get("coverage_mask")` exists and matches the data plane shape `(H,W)`: use that as the weight map.
--- Else: fallback to `ones_like(data_plane)`.
--
--Additionally:
--- Ensure weight map is float32 and clipped to [0,1].
--- If shape mismatch, keep safe fallback to ones_like (no crash).
--
--### B) Fix `_invoke_reproject` kwargs bug
--Current code:
--```py
--invoke_kwargs = dict(local_kwargs)
--if tile_weighting_applied ...:
--    invoke_kwargs["tile_weights"] = weights_for_entries
--return reproject_and_coadd_wrapper(..., **local_kwargs)
--````
--
--This ignores `invoke_kwargs`.
--Change wrapper call to `**invoke_kwargs`.
--
--### C) Add MICRO debug logs (no spam)
--
--Add one-time per channel (or only channel 0) debug payload:
--
--* Whether coverage_mask was used
--* min/max of one sample weight map
--* fraction of zeros (approx) for one sample tile
--  Keep it guarded by `logger.isEnabledFor(logging.DEBUG)` or a boolean `debug_logged`.
--
--Do NOT add heavy loops over all tiles; sample at most 1–2 tiles.
-+- [x] A) Use `coverage_mask` as input weights when present  
-+  In the Phase5 channel loop where we build:
-+  - `data_list`
-+  - `wcs_list`
-+  - `input_weights_list`
-+
-+  Change the fallback branch:
-+  - If `entry.get("alpha_weight2d")` exists: keep it (unchanged).
-+  - Else if `entry.get("coverage_mask")` exists and matches the data plane shape `(H,W)`: use that as the weight map.
-+  - Else: fallback to `ones_like(data_plane)`.
-+
-+  Additionally:
-+  - Ensure weight map is float32 and clipped to [0,1].
-+  - If shape mismatch, keep safe fallback to ones_like (no crash).
-+
-+- [x] B) Fix `_invoke_reproject` kwargs bug  
-+  Current code:
-+  ```py
-+  invoke_kwargs = dict(local_kwargs)
-+  if tile_weighting_applied ...:
-+      invoke_kwargs["tile_weights"] = weights_for_entries
-+  return reproject_and_coadd_wrapper(..., **local_kwargs)
-+  ````
-+
-+  This ignores `invoke_kwargs`.
-+  Change wrapper call to `**invoke_kwargs`.
-+
-+- [x] C) Add MICRO debug logs (no spam)  
-+  Add one-time per channel (or only channel 0) debug payload:
-+
-+  * Whether coverage_mask was used
-+  * min/max of one sample weight map
-+  * fraction of zeros (approx) for one sample tile
-+    Keep it guarded by `logger.isEnabledFor(logging.DEBUG)` or a boolean `debug_logged`.
-+
-+  Do NOT add heavy loops over all tiles; sample at most 1–2 tiles.
- 
- ## Acceptance criteria
- 
- * Running the same dataset as the provided logs produces a final mosaic without nested dark rectangle frames.
- * CPU and GPU both ignore masked regions (masked areas remain transparent/absent; no black borders).
- * No regression in cases with real `alpha_weight2d` tiles; those still force CPU for Phase5 as before.
- 
- ## Deliverables
- 
- * A single git-ready patch to `zemosaic_worker.py`
- * A short commit message suggestion
- 
- ## Suggested commit message
- 
- "Phase5: use coverage_mask as input_weights + pass tile_weights correctly to reproject wrapper"
- 
--
-diff --git a/followup.md b/followup.md
-index a5db308978f30cbb809e96f76f9e01f0c6787322..2cc33fb19c2bf7f80c784dbeb18a7556b0bc7306 100644
---- a/followup.md
-+++ b/followup.md
-@@ -1,43 +1,43 @@
- # Follow-up: How to validate the Phase5 mask propagation fix
- 
- ## 1) Quick sanity checks (before running a full mosaic)
--- Confirm the patch touched ONLY `zemosaic_worker.py`
-+- [x] Confirm the patch touched ONLY `zemosaic_worker.py`
-   - `git status`
-   - `git diff`
- 
--- Optional: run a quick search in the edited area to ensure:
-+- [x] Optional: run a quick search in the edited area to ensure:
-   - `coverage_mask` is used to populate `input_weights_list`
-   - `_invoke_reproject()` passes `**invoke_kwargs`
- 
- ## 2) Run the same reproduction dataset
--Use the same command/config you used when producing:
--- the “nested frames” final mosaic screenshot
--- the `zemosaic_worker.log`
-+- [ ] Use the same command/config you used when producing:
-+  - the “nested frames” final mosaic screenshot
-+  - the `zemosaic_worker.log`
- 
--Run with GPU enabled (since the issue was clearly visible there).
-+- [ ] Run with GPU enabled (since the issue was clearly visible there).
- 
- ## 3) What to look for in logs
--In Phase 5:
--- You should NOT see a fallback that turns weights into all-ones silently.
--- If DEBUG enabled, you should see one micro log per channel (or channel 0) like:
--  - "input_weights source=coverage_mask" for at least one tile
--  - a non-trivial fraction of zeros in the weight map sample
-+- [ ] In Phase 5:
-+  - You should NOT see a fallback that turns weights into all-ones silently.
-+  - If DEBUG enabled, you should see one micro log per channel (or channel 0) like:
-+    - "input_weights source=coverage_mask" for at least one tile
-+    - a non-trivial fraction of zeros in the weight map sample
- 
- ## 4) Visual acceptance
--- Final mosaic should resemble the expected “clean” reference:
-+- [ ] Final mosaic should resemble the expected “clean” reference:
-   - No nested dark/black rectangles aligned to tile bounding boxes
-   - Masked regions behave as transparent / non-contributing
- 
- ## 5) Regression checks (important)
--- Test a dataset that includes true ALPHA extensions:
-+- [ ] Test a dataset that includes true ALPHA extensions:
-   - Ensure Phase5 still forces CPU when `alpha_weight2d` is present (as before).
--- Test a dataset without NaNs/masks:
-+- [ ] Test a dataset without NaNs/masks:
-   - Mosaic should remain unchanged.
- 
- ## 6) If it still fails
--Collect:
--- the new Phase5 log section (Phase5 started → finished)
--- whether weights were reported as coming from coverage_mask
--- one output coverage map FITS (if generated)
--Then we’ll decide whether the GPU helper needs a footprint*weights multiplication (in gpu_reproject impl), but do NOT change that unless proven necessary.
-+- [ ] Collect:
-+  - the new Phase5 log section (Phase5 started → finished)
-+  - whether weights were reported as coming from coverage_mask
-+  - one output coverage map FITS (if generated)
-+- [ ] Then we’ll decide whether the GPU helper needs a footprint*weights multiplication (in gpu_reproject impl), but do NOT change that unless proven necessary.
- ````
 diff --git a/zemosaic_worker.py b/zemosaic_worker.py
-index 086bf9bc199ef6afe5d5ad8f31727067709e059b..549b41511c33d35bc2b6d07d0dc258acd13c51a9 100644
+index 549b41511c33d35bc2b6d07d0dc258acd13c51a9..5e22477fb19a2b13f4a8e4fb1b988cc189b96662 100644
 --- a/zemosaic_worker.py
 +++ b/zemosaic_worker.py
-@@ -13492,93 +13492,131 @@ def assemble_final_mosaic_reproject_coadd(
-                 _pcb(
-                     f"ASM_REPROJ_COADD: GPU background match enabled (preview={reproj_kwargs.get('bg_preview_size','N/A')}, sky={reproj_kwargs.get('intertile_sky_percentile','N/A')}, clip={reproj_kwargs.get('intertile_robust_clip_sigma','N/A')})",
-                     lvl="DEBUG_DETAIL",
-                 )
-             except Exception:
-                 pass
-         for ch in range(n_channels):
-             valid_entries: list[dict[str, Any]] = []
-             for entry in effective_tiles:
-                 arr = entry.get("data") if isinstance(entry, dict) else None
-                 if arr is None:
-                     continue
-                 if arr.ndim != 3:
-                     raise ValueError(
-                         f"Master tile data must be HWC before channel slicing, got {arr.shape}"
-                     )
-                 if ch >= arr.shape[-1]:
-                     raise ValueError(
-                         f"Channel index {ch} out of bounds for tile shape {arr.shape}"
-                     )
-                 valid_entries.append(entry)
+@@ -13775,55 +13775,70 @@ def assemble_final_mosaic_reproject_coadd(
+         lvl="INFO",
+         shape=mosaic_data.shape if mosaic_data is not None else "N/A",
+     )
  
-             data_list = []
-             wcs_list = []
-             input_weights_list = []
-+            weight_debug_logged = False
-             for entry in valid_entries:
-                 entry_data = entry.get("data")
-                 data_plane = entry_data[..., ch]
-                 data_list.append(data_plane)
-                 wcs_list.append(entry.get("wcs"))
-+                weight_source = "ones"
-                 weight2d = entry.get("alpha_weight2d") if isinstance(entry, dict) else None
-                 if weight2d is not None:
--                    input_weights_list.append(weight2d)
-+                    weight_source = "alpha_weight2d"
-                 else:
--                    input_weights_list.append(np.ones_like(data_plane, dtype=np.float32))
-+                    coverage_mask = entry.get("coverage_mask") if isinstance(entry, dict) else None
-+                    if coverage_mask is not None:
-+                        try:
-+                            weight_candidate = np.asarray(coverage_mask, dtype=np.float32, order="C", copy=False)
-+                            if weight_candidate.shape == data_plane.shape:
-+                                weight2d = np.clip(
-+                                    np.nan_to_num(weight_candidate, nan=0.0, posinf=0.0, neginf=0.0),
-+                                    0.0,
-+                                    1.0,
-+                                )
-+                                weight_source = "coverage_mask"
-+                        except Exception:
-+                            weight2d = None
-+                    if weight2d is None:
-+                        weight2d = np.ones_like(data_plane, dtype=np.float32)
-+                input_weights_list.append(weight2d)
-+                if (
-+                    not weight_debug_logged
-+                    and logger.isEnabledFor(logging.DEBUG)
-+                    and isinstance(weight2d, np.ndarray)
-+                ):
-+                    try:
-+                        weight_min = float(np.nanmin(weight2d)) if weight2d.size else 0.0
-+                        weight_max = float(np.nanmax(weight2d)) if weight2d.size else 0.0
-+                        zero_frac = float(np.mean(weight2d <= 0.0)) if weight2d.size else 0.0
-+                        logger.debug(
-+                            "[Phase5] input_weights sample: channel=%d source=%s shape=%s min=%.4f max=%.4f zero_frac=%.4f",
-+                            ch,
-+                            weight_source,
-+                            weight2d.shape,
-+                            weight_min,
-+                            weight_max,
-+                            zero_frac,
-+                        )
-+                        weight_debug_logged = True
-+                    except Exception:
-+                        pass
-             weights_for_entries = None
-             if tile_weighting_applied:
-                 weights_for_entries = [
-                     float(entry.get("tile_weight", 1.0)) if isinstance(entry, dict) else 1.0
-                     for entry in valid_entries
-                 ]
- 
-             reproj_call_kwargs = dict(reproj_kwargs)
-             reproj_call_kwargs["input_weights"] = input_weights_list
-             if use_gpu:
-                 for unsupported_kw in ("intertile_global_recenter",):
-                     if unsupported_kw in reproj_call_kwargs:
-                         reproj_call_kwargs.pop(unsupported_kw, None)
-                         logger.debug(
-                             "[GPU Reproject] Ignoring unsupported kwarg: %s",
-                             unsupported_kw,
-                         )
- 
-             def _invoke_reproject(local_kwargs: dict):
-                 invoke_kwargs = dict(local_kwargs)
-                 if tile_weighting_applied and weights_for_entries is not None:
-                     invoke_kwargs["tile_weights"] = weights_for_entries
-                 return reproject_and_coadd_wrapper(
-                     data_list=data_list,
-                     wcs_list=wcs_list,
-                     shape_out=final_output_shape_hw,
-                     output_projection=output_header,
-                     use_gpu=use_gpu,
-                     cpu_func=reproject_and_coadd,
-                     reproject_function=reproject_interp,
-                     combine_function="mean",
-                     progress_callback=_pcb,
--                    **local_kwargs,
-+                    **invoke_kwargs,
-                 )
- 
-             try:
-                 chan_mosaic, chan_cov = _invoke_reproject(reproj_call_kwargs)
-             except TypeError as gpu_kw_err:
-                 if use_gpu:
-                     logger.warning(
-                         "[GPU Reproject] Unexpected kwargs triggered TypeError: %s",
-                         gpu_kw_err,
-                     )
-                     retry_kwargs = reproj_call_kwargs.copy()
-                     removed_after_error: list[str] = []
-                     err_msg = str(gpu_kw_err)
-                     for key in list(retry_kwargs.keys()):
-                         if f"'{key}'" in err_msg:
-                             retry_kwargs.pop(key, None)
-                             removed_after_error.append(key)
-                     if removed_after_error:
-                         logger.debug(
-                             "[GPU Reproject] Retrying without kwargs: %s",
-                             ", ".join(removed_after_error),
-                         )
-                         chan_mosaic, chan_cov = _invoke_reproject(retry_kwargs)
+     if mosaic_data is not None:
+         if mosaic_data.ndim != 3:
+             raise ValueError(f"Expected final mosaic in HWC order, got {mosaic_data.shape}")
+         logger.debug("Mosaic shape (HWC): %s", mosaic_data.shape)
+         if isinstance(coverage, np.ndarray) and logger.isEnabledFor(logging.DEBUG):
+             mask = coverage > 0
+             if np.any(mask):
+                 stats = []
+                 for c in range(mosaic_data.shape[-1]):
+                     vals = mosaic_data[..., c][mask]
+                     if vals.size:
+                         stats.append((float(np.mean(vals)), float(np.std(vals))))
                      else:
-                         raise
+                         stats.append((float("nan"), float("nan")))
+                 logger.debug(
+                     "Reproject overlap stats (mean/std per channel): %s",
+                     stats,
+                 )
+ 
+     if isinstance(coverage, np.ndarray):
+         coverage = np.where(np.isfinite(coverage), coverage, 0.0).astype(np.float32, copy=False)
++    alpha_zero_mask = None
++    if isinstance(coverage, np.ndarray) and alpha_final is not None:
++        try:
++            alpha_arr = np.asarray(alpha_final)
++            if alpha_arr.ndim == 3 and alpha_arr.shape[-1] == 1:
++                alpha_arr = alpha_arr[..., 0]
++            alpha_arr = np.squeeze(alpha_arr)
++            if alpha_arr.ndim >= 2 and alpha_arr.shape[:2] == coverage.shape:
++                alpha_zero_mask = alpha_arr <= 0
++                if np.any(alpha_zero_mask):
++                    coverage = np.where(alpha_zero_mask, 0.0, coverage).astype(np.float32, copy=False)
++        except Exception:
++            alpha_zero_mask = None
+     if mosaic_data is not None and coverage is not None:
+         mosaic_data = np.asarray(mosaic_data, dtype=np.float32, copy=False)
+         mosaic_data[~np.isfinite(mosaic_data)] = np.nan
+         nanized_mask = coverage <= 0
+-        if alpha_final is not None and alpha_final.shape[:2] == coverage.shape:
++        if alpha_zero_mask is not None:
++            nanized_mask = np.logical_or(nanized_mask, alpha_zero_mask)
++        elif alpha_final is not None and alpha_final.shape[:2] == coverage.shape:
+             nanized_mask = np.logical_or(nanized_mask, alpha_final == 0)
+         nanized_pixels = int(np.count_nonzero(nanized_mask))
+         mosaic_data = _nanize_by_coverage(mosaic_data, coverage, alpha_u8=alpha_final)
+         if nanized_pixels > 0:
+             logger.info(
+                 "assemble_reproject_coadd: nanized %d pixels where coverage/alpha == 0",
+                 nanized_pixels,
+             )
+ 
+     _update_eta(n_channels)
+ 
+     return (
+         mosaic_data.astype(np.float32),
+         coverage.astype(np.float32),
+         alpha_final,
+     )
+ 
+ def _load_master_tiles_for_two_pass(
+     master_tile_fits_with_wcs_list: list,
+     *,
+     apply_crop: bool,
+     crop_percent: float,
+     logger=None,
+ ):
+     """Load master tiles from disk for the coverage renormalization pass."""
