@@ -29,27 +29,27 @@ Keep existing orientation split logic intact and still applied for ALTZ clusters
 - Avoid heavy IO: prefer header-only reads (Astropy header read) where possible.
 
 ## Implementation Plan (Surgical)
-1) Add a small helper to extract EQMODE from an entry:
-   - Return "EQ" if EQMODE==1, "ALTZ" if EQMODE==0.
-   - Return None if absent/unreadable.
+- [x] Add a small helper to extract EQMODE from an entry:
+  - Return "EQ" if EQMODE==1, "ALTZ" if EQMODE==0.
+  - Return None if absent/unreadable.
 
-2) Add a group splitter:
-   - Input: `group: list[dict]` (entries/files)
-   - Partition into buckets: EQ / ALTZ / UNKNOWN (UNKNOWN = no EQMODE)
-   - If group contains BOTH EQ and ALTZ:
-       - Emit a log line: `eqmode_split: group mixed (EQ=%d ALTZ=%d UNKNOWN=%d) -> split`
-       - Return up to 3 groups (skip empty buckets)
-     Else:
-       - Return [group] unchanged.
+- [x] Add a group splitter:
+  - Input: `group: list[dict]` (entries/files)
+  - Partition into buckets: EQ / ALTZ / UNKNOWN (UNKNOWN = no EQMODE)
+  - If group contains BOTH EQ and ALTZ:
+      - Emit a log line: `eqmode_split: group mixed (EQ=%d ALTZ=%d UNKNOWN=%d) -> split`
+      - Return up to 3 groups (skip empty buckets)
+    Else:
+      - Return [group] unchanged.
 
-3) Insert this split at the correct stage:
-   - After initial cluster/group formation
-   - Before any "merge small groups" or "group rebalance" logic that could remix frames.
-   - Ensure downstream code processes the flattened list of groups.
+- [x] Insert this split at the correct stage:
+  - After initial cluster/group formation
+  - Before any "merge small groups" or "group rebalance" logic that could remix frames.
+  - Ensure downstream code processes the flattened list of groups.
 
-4) Keep orientation split:
-   - After eqmode split, run existing orientation split logic as currently done.
-   - Ensure it still triggers for ALTZ groups (and optionally UNKNOWN).
+- [x] Keep orientation split:
+  - After eqmode split, run existing orientation split logic as currently done.
+  - Ensure it still triggers for ALTZ groups (and optionally UNKNOWN).
 
 ## Acceptance Criteria
 A) Mixed dataset (Seestar only) with EQMODE 0 and 1 frames near same sky location:
