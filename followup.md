@@ -1,6 +1,6 @@
 # Follow-up: Patch details & exact code locations
 
-## [x] 1) zemosaic_worker.py — Phase 5 tile preparation (assemble_final_mosaic_reproject_coadd)
+## 1) zemosaic_worker.py — Phase 5 tile preparation (assemble_final_mosaic_reproject_coadd)
 
 ### Location
 Function: `assemble_final_mosaic_reproject_coadd(...)`
@@ -26,7 +26,7 @@ Coverage:
 - If alpha exists: `coverage_mask_entry = alpha_weight2d`
 - Else: keep existing finite-based coverage.
 
-## [x] 2) zemosaic_worker.py — Phase 5 per-channel coadd call: pass input_weights
+## 2) zemosaic_worker.py — Phase 5 per-channel coadd call: pass input_weights
 
 ### Location
 Still inside `assemble_final_mosaic_reproject_coadd`, later when you build per-channel `data_list` and `wcs_list_local` and call:
@@ -43,7 +43,7 @@ Pass to wrapper as:
 
 Important: weights are 2D per plane, which matches reproject expectations.
 
-## [x] 3) GPU forcing (correctness-first)
+## 3) GPU forcing (correctness-first)
 
 ### Location
 At the start of Phase 5 assembly (before channel loop) after `effective_tiles` is built.
@@ -60,7 +60,7 @@ If `use_gpu` is True and `alpha_present` is True:
 
 This avoids silent wrong mosaics.
 
-## [x] 4) zemosaic_utils.py — ensure wrapper forwards input_weights to CPU
+## 4) zemosaic_utils.py — ensure wrapper forwards input_weights to CPU
 
 ### Location
 Function: `_reproject_and_coadd_wrapper_impl(...)`
@@ -71,7 +71,7 @@ If you see any filtering that drops `input_weights`, ensure it is preserved.
 
 No algorithm change required.
 
-## [ ] 5) Quick sanity tests (no new unit framework)
+## 5) Quick sanity tests (no new unit framework)
 - Add a tiny debug log in Phase 5:
   - for first tile with alpha, log:
     - alpha min/max, valid fraction, weight shape vs data shape
