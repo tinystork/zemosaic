@@ -31,36 +31,36 @@ Do NOT change existing batch size behaviors (batch size = 0 and batch size > 1 m
 5) Keep existing logs; add one debug/info log indicating how many pixels were nanized by coverage/alpha (optional).
 
 # Implementation plan (worker)
-A) Add a small helper in zemosaic_worker.py (near global coadd helpers):
-   def _nanize_by_coverage(final_hwc, coverage_hw, *, alpha_u8=None):
-       - compute invalid = (coverage_hw <= 0) OR (alpha_u8==0 if provided)
-       - set final_hwc[invalid, :] = np.nan
-       - return final_hwc
+- [x] Add a small helper in zemosaic_worker.py (near global coadd helpers):
+      def _nanize_by_coverage(final_hwc, coverage_hw, *, alpha_u8=None):
+          - compute invalid = (coverage_hw <= 0) OR (alpha_u8==0 if provided)
+          - set final_hwc[invalid, :] = np.nan
+          - return final_hwc
 
-B) In global coadd finalize paths:
-   - Remove/avoid nan_to_num on the final image (and in chunked finalize).
-   - After computing chunk_result and chunk_weight:
-       - set chunk_result[chunk_weight<=0] = np.nan (per-pixel), before copying to final.
-       - keep coverage as float (0 where no contribution).
-   - After finalize (mean/kappa/chunked), call _nanize_by_coverage(final_image, coverage_map).
-   - You may still sanitize +/-inf to NaN (not 0).
+- [x] In global coadd finalize paths:
+      - Remove/avoid nan_to_num on the final image (and in chunked finalize).
+      - After computing chunk_result and chunk_weight:
+          - set chunk_result[chunk_weight<=0] = np.nan (per-pixel), before copying to final.
+          - keep coverage as float (0 where no contribution).
+      - After finalize (mean/kappa/chunked), call _nanize_by_coverage(final_image, coverage_map).
+      - You may still sanitize +/-inf to NaN (not 0).
 
-C) Phase6 export:
-   - DO NOT convert NaNs to 0 before save_fits_image for the main float FITS.
-   - If a "viewer uint16" is produced, it may convert NaNs to 0 (fine), but keep alpha extension.
+- [x] Phase6 export:
+      - DO NOT convert NaNs to 0 before save_fits_image for the main float FITS.
+      - If a "viewer uint16" is produced, it may convert NaNs to 0 (fine), but keep alpha extension.
 
-D) Preview masking fix:
-   Replace boolean indexing with a broadcasting-safe np.where:
-       preview_view = np.where(mask_zero[..., None], np.nan, preview_view)
-   This avoids the axis mismatch warning.
+- [x] Preview masking fix:
+      Replace boolean indexing with a broadcasting-safe np.where:
+          preview_view = np.where(mask_zero[..., None], np.nan, preview_view)
+      This avoids the axis mismatch warning.
 
 # Minimal tests (no full dataset required)
-1) Unit-ish: create a fake 3-channel mosaic array with some NaNs and a coverage map with zeros.
-   Ensure _nanize_by_coverage produces NaNs where expected.
-2) Smoke: run a short mosaic on a small dataset and verify:
-   - log has no preview NaN masking warning
-   - final mosaic float FITS contains NaNs (check with fits.open and np.isnan count)
-   - preview PNG has alpha channel (if alpha_final exists)
+- [ ] Unit-ish: create a fake 3-channel mosaic array with some NaNs and a coverage map with zeros.
+      Ensure _nanize_by_coverage produces NaNs where expected.
+- [ ] Smoke: run a short mosaic on a small dataset and verify:
+      - log has no preview NaN masking warning
+      - final mosaic float FITS contains NaNs (check with fits.open and np.isnan count)
+      - preview PNG has alpha channel (if alpha_final exists)
 
 # Files to edit
 - zemosaic_worker.py (primary)
