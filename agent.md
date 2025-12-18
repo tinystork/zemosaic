@@ -1,65 +1,69 @@
-# Mission: Make lecropper/ALPHA mask act as transparency during Phase-5 reproject+coadd
+# Goal
+Fix ZeMosaic "black rectangles" artifacts caused by masked/transparent regions being converted to zeros.
+Masked regions (from lecropper.py) must remain transparent for reproject/coadd by:
+- carrying NaNs (or equivalently weight=0) through coadd
+- preserving NaNs in final float FITS output where coverage==0 (and/or alpha==0)
+- ensuring preview masking does not error and produces a correct RGBA PNG
 
-## Context
-- Master tiles are written with an ALPHA extension (uint8 0..255) via zemosaic_utils.save_fits_image(..., alpha_mask=alpha_mask_out).
-- In Phase 5, zemosaic_worker loads each master tile + optional ALPHA and currently converts alpha to [0..1] and then *nanizes* masked pixels:
-  data[zero_mask[..., None]] = np.nan
-- This is NOT sufficient for `reproject_and_coadd(combine_function="mean")`: any NaN in a stack will contaminate the mean and can prevent overlap from filling masked zones.
-- Goal: masked zones must be treated as "no data" so overlap fills them.
+# Context (current bug)
+- lecropper pipeline can nanize masked pixels (good).
+- later in global coadd / finalize we call np.nan_to_num(... nan=0.0) which turns NaNs into 0 → black blocks in master tiles / final mosaic.
+- preview masking currently warns: "boolean index did not match ... axis 2 size 3 vs mask 1" and thus may not properly hide masked regions.
 
-## Target behavior (Acceptance criteria)
-1) If a master tile has an ALPHA extension, masked pixels (alpha <= ALPHA_OPACITY_THRESHOLD) must contribute **zero weight** to the global coadd.
-2) Overlapping valid pixels from other tiles must fill those regions (no black slabs / no NaN propagation).
-3) Do not rewrite master tiles on disk (only interpret ALPHA at load time).
-4) Keep changes surgical: only touch the minimal code paths in zemosaic_worker.py and zemosaic_utils.py required for correctness.
-5) Keep existing logs; add one concise INFO_DETAIL log when alpha masks force CPU path (if needed).
+# Scope
+Surgical changes in:
+- zemosaic_worker.py
+Optional minimal touch in:
+- zemosaic_utils.py only if required to keep NaNs in FITS write (but prefer worker-only).
 
-## Implementation plan (surgical)
-### A) Stop using NaN-as-mask for the coadd path (Phase 5) [x]
-In `zemosaic_worker.py` inside `assemble_final_mosaic_reproject_coadd`, during the loop that builds `effective_tiles`:
-- Keep reading `data` and `alpha_mask_arr` as currently.
-- Build a per-pixel weight map from alpha:
-  - `alpha01 = clip(alpha_mask_arr, 0..1)` (already computed)
-  - `valid = (alpha01 > ALPHA_OPACITY_THRESHOLD)`
-  - `weight2d = valid.astype(float32)` (hard mask is fine)
-- Do NOT set `data[...] = np.nan` based on alpha.
-  - Instead, set masked pixels to 0 (optional but safe):
-    - `data = data.copy(); data[~valid, :] = 0` (for RGB) or `data[~valid] = 0` (mono)
-- Store `weight2d` on the tile entry (e.g. `tile_entry["alpha_weight2d"] = weight2d`).
+Do NOT refactor algorithms.
+Do NOT change GUI behavior.
+Do NOT change existing batch size behaviors (batch size = 0 and batch size > 1 must remain intact).
 
-### B) Pass per-pixel weights to reproject_and_coadd (CPU path) [x]
-`astropy-reproject reproject_and_coadd` accepts `input_weights` per input image.
-- When assembling each channel (where you build `data_list` and `wcs_list_local` for `reproject_and_coadd_wrapper`), also build:
-  - `weights_list = [tile_entry["alpha_weight2d"] for each tile]`
-  - If a tile has no alpha, use `None` or all-ones weights for that tile.
-- Call `zemosaic_utils.reproject_and_coadd_wrapper(..., input_weights=weights_list, ...)` so CPU coadd ignores masked pixels.
+# Requirements / Acceptance criteria
+1) Final float FITS mosaic contains NaN in pixels where coverage_map == 0 (and/or alpha_final==0).
+2) No black rectangles due to NaN→0 conversion in the final mosaic (in FITS float).
+3) Preview generation:
+   - no "preview NaN masking failed" warning
+   - preview PNG is RGBA when alpha_final exists and has transparent background where alpha==0
+4) Coadd math remains stable:
+   - masked pixels do not contaminate sums (weight must be 0 where data is non-finite)
+5) Keep existing logs; add one debug/info log indicating how many pixels were nanized by coverage/alpha (optional).
 
-### C) GPU path compatibility: correctness first [x]
-The current GPU wrapper supports only scalar `tile_weights`, not per-pixel `input_weights`.
-For now:
-- If `use_gpu=True` and any tile has alpha_weight2d, force CPU for Phase 5 with a clear log:
-  - `use_gpu_effective = False` when alpha masks are present.
-  - Log: `"[Alpha] Per-pixel alpha weights require CPU coadd; forcing CPU for Phase 5"`
-This is a deliberate, minimal correctness fix. (Future work: add per-pixel weights to GPU coadd.)
+# Implementation plan (worker)
+A) Add a small helper in zemosaic_worker.py (near global coadd helpers):
+   def _nanize_by_coverage(final_hwc, coverage_hw, *, alpha_u8=None):
+       - compute invalid = (coverage_hw <= 0) OR (alpha_u8==0 if provided)
+       - set final_hwc[invalid, :] = np.nan
+       - return final_hwc
 
-### D) Keep coverage consistent [x]
-- For coverage output, if alpha exists, coverage should be derived from `weight2d` (already the intent):
-  - `coverage_mask_entry = weight2d`
-- If no alpha, keep current finite-based coverage.
+B) In global coadd finalize paths:
+   - Remove/avoid nan_to_num on the final image (and in chunked finalize).
+   - After computing chunk_result and chunk_weight:
+       - set chunk_result[chunk_weight<=0] = np.nan (per-pixel), before copying to final.
+       - keep coverage as float (0 where no contribution).
+   - After finalize (mean/kappa/chunked), call _nanize_by_coverage(final_image, coverage_map).
+   - You may still sanitize +/-inf to NaN (not 0).
 
-## Files to edit
-- `/mnt/data/zemosaic_worker.py`
-- `/mnt/data/zemosaic_utils.py` (small: allow wrapper to forward `input_weights` to CPU safely if it filters kwargs)
+C) Phase6 export:
+   - DO NOT convert NaNs to 0 before save_fits_image for the main float FITS.
+   - If a "viewer uint16" is produced, it may convert NaNs to 0 (fine), but keep alpha extension.
 
-## Notes / Constraints
-- Do NOT refactor or rename major functions.
-- Do NOT change lecropper.py behavior.
-- Do NOT change master tile writing format.
-- Keep the existing ALPHA extension logic.
-- Preserve current progress callbacks and logs.
+D) Preview masking fix:
+   Replace boolean indexing with a broadcasting-safe np.where:
+       preview_view = np.where(mask_zero[..., None], np.nan, preview_view)
+   This avoids the axis mismatch warning.
 
-## Validation checklist [ ]
-- Run a mosaic with alt-az cleanup enabled producing ALPHA.
-- Confirm final mosaic has filled areas where previous run showed black/empty slabs.
-- Confirm no NaN propagation in final mosaic stats (nanmin/nanmax finite on populated regions).
-- Confirm Phase 5 logs show alpha weights detected and CPU forced (only if use_gpu was requested).
+# Minimal tests (no full dataset required)
+1) Unit-ish: create a fake 3-channel mosaic array with some NaNs and a coverage map with zeros.
+   Ensure _nanize_by_coverage produces NaNs where expected.
+2) Smoke: run a short mosaic on a small dataset and verify:
+   - log has no preview NaN masking warning
+   - final mosaic float FITS contains NaNs (check with fits.open and np.isnan count)
+   - preview PNG has alpha channel (if alpha_final exists)
+
+# Files to edit
+- zemosaic_worker.py (primary)
+
+# Definition of done
+All acceptance criteria met, no new warnings in log, output FITS float no longer shows black rectangles from masked regions.
