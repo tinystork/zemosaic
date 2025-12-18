@@ -694,9 +694,10 @@ def _apply_lecropper_pipeline(
                         fill_value=None,
                     )
                     mask2d = None
-                if masked is not None:
-                    out = masked
-                    altaz_masked_used = True
+                # IMPORTANT:
+                # Do NOT replace `out` with `masked` here. `masked` is already base_for_mask * mask2d,
+                # and we also propagate mask2d downstream as alpha/weights. Using `masked` would
+                # effectively apply mask twice (w²) during reproject/coadd and creates dark borders.
                 if mask2d is not None:
                     altaz_mask2d_used = True
             elif hasattr(lecropper, "altZ_cleanup"):
@@ -736,7 +737,9 @@ def _apply_lecropper_pipeline(
                 alpha_mask_norm = np.asarray(mask2d, dtype=np.float32, copy=False)
                 hard_threshold = 1e-3
                 mask_zero = alpha_mask_norm <= hard_threshold
-                target_for_mask = out if isinstance(out, np.ndarray) else base_for_mask
+                # Always apply nanize/zeroize on the unattenuated base_for_mask,
+                # not on `out` (which could have been attenuated elsewhere).
+                target_for_mask = base_for_mask
                 if isinstance(target_for_mask, np.ndarray) and target_for_mask.ndim == 3:
                     mask_zero = mask_zero[..., None]
                 if az_nanize:
