@@ -1,72 +1,86 @@
-# Mission: Prevent mixing Seestar ALTZ and EQ frames inside the same master_tile groups (Qt filter stage)
+# Mission: Ensure lecropper is actually applied to Master Tiles when enabled + propagate masked output
 
-## Context / Problem
-Some datasets contain a mix of Seestar frames captured in Alt-Az mode and Equatorial mode.
-When these get clustered together (same sky location), the frames have incompatible orientation/field rotation
-and stacking produces severe artifacts (large colored wedges, gradients, etc.).
+## Context
+In ZeMosaic, master tiles can be post-processed by `lecropper.py` through `_apply_lecropper_pipeline()` in `zemosaic_worker.py`.
 
-Seestar FITS headers contain:
-- EQMODE = 1  -> Equatorial mode
-- EQMODE = 0  -> Alt-Az mode
+Current issue:
+- When `lecropper.mask_altaz_artifacts()` returns `(masked, mask2d)`, the worker sets `out = base_for_mask` (original) and only keeps `mask2d`, which can discard the actual cleaned image `masked`.
+- Users report that enabling the GUI option does not reliably guarantee that master tiles are truly modified by lecropper (especially in alt-az cleanup path).
 
-We already have an orientation-based split mechanism in the Qt filter GUI which is still useful,
-especially for Alt-Az clusters.
+## Goal
+1) When the user enables the "lecropper / Alt-Az cleanup / MT pipeline" option in the GUI, the worker MUST pass every built Master Tile through `_apply_lecropper_pipeline()` (for applicable phases, i.e. after stacking a master tile but before it is persisted and used for final mosaic assembly).
+2) If `mask_altaz_artifacts()` returns `(masked, mask2d)`, the worker MUST propagate `masked` as the tile image output (so visual corrections are applied), while still returning / preserving `mask2d` for downstream masking/weighting logic.
 
-## Goal (Transparent to user)
-Inside the Qt filter stage (before master_tiles are built), automatically split any cluster/group that mixes
-Seestar EQ and ALTZ frames, using the FITS header keyword EQMODE when available.
+## Non-goals / constraints
+- Do NOT refactor pipeline design.
+- Do NOT change stacking logic, alignment logic, reproject logic, or tile clustering.
+- Do NOT touch batch-size special behavior ("batch size = 0" and "batch size > 1" behavior must remain unchanged).
+- `lecropper.py` must remain standalone and runnable outside ZeMosaic (no ZeMosaic-only imports inside lecropper).
+- Keep changes surgical and limited to: `zemosaic_worker.py` and GUI flag wiring (Qt and/or Tk depending on where the option lives).
+- Add logs only where needed for proof.
 
-Fallback behavior:
-- If EQMODE is not present (non-Seestar images), do NOT change behavior: rely on existing orientation split only.
+## Files in scope
+- `zemosaic_worker.py`
+- GUI: whichever file actually defines the option and passes config to the worker:
+  - Qt: `zemosaic_gui_qt.py` (and possibly `zemosaic_filter_gui_qt.py` if the option is there)
+  - Tk: `zemosaic_gui.py` (only if needed)
 
-Keep existing orientation split logic intact and still applied for ALTZ clusters (and optionally UNKNOWN).
+## Implementation tasks
 
-## Scope / Constraints
-- **Modify only one file**: `zemosaic_filter_gui_qt.py`
-- No refactor, no new UI controls required.
-- Preserve existing pipeline behavior for non-Seestar datasets.
-- Add clear, minimal logging so users can understand when a split happens.
-- Avoid heavy IO: prefer header-only reads (Astropy header read) where possible.
+### Task A — Fix propagation semantics in `_apply_lecropper_pipeline`
+In `zemosaic_worker.py`:
+- Locate `_apply_lecropper_pipeline(...)`.
+- Current behavior (conceptually):
+  - if mask_altaz_artifacts returns `(masked, mask2d)`:
+    - out = base_for_mask (original)
+    - return out, mask2d
+- Required behavior:
+  - if `(masked, mask2d)`:
+    - set `out = masked` (NOT the original)
+    - still return `mask2d` unchanged
+  - Preserve existing fallbacks when `mask_altaz_artifacts` returns only `masked` or returns None.
+- Add a debug/info log line that proves which path was taken:
+  - Example: `MT_PIPELINE: altaz_cleanup applied: masked_used=True mask2d_used=True`
+  - Keep logs stable/greppable.
 
-## Implementation Plan (Surgical)
-- [x] Add a small helper to extract EQMODE from an entry:
-  - Return "EQ" if EQMODE==1, "ALTZ" if EQMODE==0.
-  - Return None if absent/unreadable.
+Acceptance:
+- When alt-az cleanup produces both masked and mask2d, the saved Master Tile data must reflect the masked output.
 
-- [x] Add a group splitter:
-  - Input: `group: list[dict]` (entries/files)
-  - Partition into buckets: EQ / ALTZ / UNKNOWN (UNKNOWN = no EQMODE)
-  - If group contains BOTH EQ and ALTZ:
-      - Emit a log line: `eqmode_split: group mixed (EQ=%d ALTZ=%d UNKNOWN=%d) -> split`
-      - Return up to 3 groups (skip empty buckets)
-    Else:
-      - Return [group] unchanged.
+### Task B — Guarantee the option is honored end-to-end (GUI -> config -> worker)
+We need to ensure that when user checks the option in the GUI, the worker receives a config flag and uses it to call `_apply_lecropper_pipeline()` for each Master Tile.
 
-- [x] Insert this split at the correct stage:
-  - After initial cluster/group formation
-  - Before any "merge small groups" or "group rebalance" logic that could remix frames.
-  - Ensure downstream code processes the flattened list of groups.
+Steps:
+1. Identify the GUI checkbox / option name.
+2. Ensure it is persisted into the config object passed to the worker thread/process.
+3. In the worker, locate the Master Tile construction path (right after the tile stack is produced and before it is written/cached or used for mosaic).
+4. Gate the `_apply_lecropper_pipeline()` call on that flag.
 
-- [x] Keep orientation split:
-  - After eqmode split, run existing orientation split logic as currently done.
-  - Ensure it still triggers for ALTZ groups (and optionally UNKNOWN).
+Add proof logs:
+- At start of run (once): log the boolean flags: `lecropper_enabled`, `quality_crop_enabled`, `altaz_cleanup_enabled`.
+- Per master tile (already exists partially): ensure log includes `lecropper_applied=True/False`.
 
-## Acceptance Criteria
-A) Mixed dataset (Seestar only) with EQMODE 0 and 1 frames near same sky location:
-   - No master_tile group contains a mix of EQMODE=0 and EQMODE=1 frames.
-   - Log shows at least one `eqmode_split:` line.
+Acceptance:
+- When GUI option enabled, log must contain per-tile `MT_PIPELINE: lecropper_applied=True`.
+- When disabled, it must be `False` and worker must not call lecropper.
 
-B) Non-Seestar dataset (no EQMODE keyword):
-   - No new splitting occurs because of EQMODE (behavior unchanged).
-   - Existing orientation split continues to work as before.
+### Task C — Minimal regression safety
+Add a tiny self-test helper (no heavy pytest harness needed):
+- A small function in `zemosaic_worker.py` guarded under `if __name__ == "__main__":` OR a lightweight internal test function callable from existing debug scripts.
+- It should simulate:
+  - `mask_altaz_artifacts` returning `(masked, mask2d)` where masked is visibly different (e.g., add +1 to array)
+  - Ensure returned `out` equals masked (not original)
+- Keep it optional and not run during normal GUI execution.
 
-C) Alt-Az only Seestar dataset (EQMODE=0):
-   - Orientation split behavior remains active and unchanged.
+If you do add a test file, keep it minimal and do not add new dependencies.
 
-D) No regressions:
-   - Pipeline completes; no crashes due to missing headers, unreadable FITS, or unexpected EQMODE values.
+## Deliverables
+- A git-ready patch (unified diff) that applies cleanly.
+- Brief commit message suggestion.
 
-## Notes
-- Treat EQMODE as authoritative when present.
-- Do not attempt to infer mount mode from other keywords.
-- Keep changes minimal: small helper functions + one insertion point + logs.
+## Verification checklist
+- Run ZeMosaic with lecropper option ON:
+  - confirm logs show `MT_PIPELINE: lecropper_applied=True`
+  - confirm `masked_used=True` when altaz returns mask2d
+- Run with option OFF:
+  - confirm `lecropper_applied=False`
+- Confirm no changes to batch-size behavior.

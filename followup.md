@@ -1,23 +1,42 @@
-# Follow-up Checklist (Codex)
+# Follow-up: How to verify the lecropper propagation fix
 
-## 1) Locate the correct insertion point
-- [x] In `zemosaic_filter_gui_qt.py`, find the pipeline section where initial clusters/groups are produced and optional splitting/merging happens; insert EQMODE split immediately after initial `groups` is built and before any merge/rebalance that might re-mix entries (e.g., `groups = [sub for g in groups for sub in split_group_by_eqmode(g)]`).
+## 1) Quick log greps (Windows PowerShell)
+From the folder containing the ZeMosaic log:
 
-## 2) Implement header-only EQMODE read (fast)
-- [x] Use astropy to read FITS header only (no image data), caching results if available; resolve path via entry keys (path/file/filename) and parse `EQMODE` safely, returning `"EQ"` for 1, `"ALTZ"` for 0, or `None` otherwise.
+### Confirm option is actually enabled in the run
+Select-String -Path .\zemosaic.log -Pattern "lecropper_enabled|MT_PIPELINE"
 
-## 3) Keep orientation split intact
-- [x] After EQMODE splitting, ensure the existing orientation split code still runs, at minimum for ALTZ groups (and optionally UNKNOWN) without restricting it to EQ only.
+Expected:
+- One run-level line showing flags (enabled/disabled)
+- Many per-tile lines with `MT_PIPELINE: lecropper_applied=True` when enabled
 
-## 4) Ensure merges do NOT remix EQ/ALTZ
-- [x] Guard later merge logic so groups from different EQMODE buckets are not merged; use a `group_eqmode_signature` helper returning `"EQ"` / `"ALTZ"` / `"MIXED"` / `"UNKNOWN"` and merge only when signatures match or both are UNKNOWN (apply only if there is a remix risk; keep surgical).
+### Confirm masked output is used even when mask2d is present
+Select-String -Path .\zemosaic.log -Pattern "masked_used=True"
 
-## 5) Logging
-- [x] Add 1–2 log lines when a mixed group is detected and split, optionally including resulting group counts (e.g., `logger.info("eqmode_split: mixed group -> EQ=%d ALTZ=%d UNKNOWN=%d (splitting)", n_eq, n_altz, n_unk)`).
+Expected:
+- If alt-az cleanup is active and mask2d is produced, you should see `masked_used=True mask2d_used=True`.
 
-## 6) Manual test protocol (must be done)
-- [ ] Dataset A: Seestar mixed EQMODE (0/1) that currently produces colored wedges. Expected: log shows split; resulting master tiles are coherent with no obvious “triangles”.
-- [ ] Dataset B: Non-Seestar images (no EQMODE). Expected: no eqmode logs; same group count behavior as before (except existing orientation split).
+## 2) Visual sanity check (single tile)
+Pick one problematic Master Tile that previously had obvious alt-az edge artifacts.
 
-## 7) Output
-- [x] Return a git diff for `zemosaic_filter_gui_qt.py` only and a short note pointing to the insertion point plus which keys were used for file paths in entries.
+Run twice on same dataset:
+- Run A: lecropper OFF
+- Run B: lecropper ON
+
+Compare:
+- The saved master tiles (or intermediate outputs)
+- The final mosaic: edge artifacts should be reduced in Run B.
+
+## 3) Guardrails
+- Confirm there is no change in behavior for:
+  - batch size = 0
+  - batch size > 1
+- Confirm lecropper remains standalone (no new ZeMosaic imports in lecropper.py)
+
+## 4) If something still doesn’t propagate
+Add one extra debug line (only if necessary):
+- right before saving a master tile, log min/median/max for RGB channels (already there are helper stats functions in worker).
+- Use it to prove the array changed when lecropper is ON.
+
+## 5) Commit message suggestion
+"Fix: propagate lecropper masked output to master tiles and ensure GUI flag enables MT pipeline"
