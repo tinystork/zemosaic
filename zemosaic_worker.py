@@ -998,6 +998,42 @@ def _emit_coverage_summary_log(
     return stats
 
 
+def _nanize_by_coverage(
+    final_hwc: np.ndarray | None,
+    coverage_hw: np.ndarray | None,
+    *,
+    alpha_u8: np.ndarray | None = None,
+) -> np.ndarray | None:
+    """Replace pixels with ``NaN`` wherever coverage (or alpha) indicates no data."""
+
+    if final_hwc is None or coverage_hw is None:
+        return final_hwc
+    try:
+        mosaic = np.asarray(final_hwc, dtype=np.float32, copy=False)
+        coverage = np.asarray(coverage_hw, dtype=np.float32, copy=False)
+    except Exception:
+        return final_hwc
+    if mosaic.ndim < 2 or coverage.shape[:2] != mosaic.shape[:2]:
+        return final_hwc
+    invalid = coverage <= 0
+    if alpha_u8 is not None:
+        try:
+            alpha_arr = np.asarray(alpha_u8, copy=False)
+            if alpha_arr.ndim == 3 and alpha_arr.shape[-1] == 1:
+                alpha_arr = alpha_arr[..., 0]
+            alpha_arr = np.squeeze(alpha_arr)
+            if alpha_arr.ndim >= 2 and alpha_arr.shape[:2] == mosaic.shape[:2]:
+                invalid = np.logical_or(invalid, alpha_arr == 0)
+        except Exception:
+            pass
+    try:
+        invalid_mask = invalid if mosaic.ndim == 2 else invalid[..., None]
+        mosaic = np.where(invalid_mask, np.nan, mosaic)
+    except Exception:
+        return mosaic
+    return np.asarray(mosaic, dtype=np.float32, copy=False)
+
+
 def _auto_crop_global_mosaic_if_requested(
     final_mosaic_data: np.ndarray | None,
     final_mosaic_coverage: np.ndarray | None,
@@ -2596,6 +2632,18 @@ def _finalize_sds_global_mosaic(
             _apply_autocrop_to_global_plan(global_plan, autocrop_meta)
 
     final_alpha_u8 = _derive_final_alpha_mask(final_alpha_map, mosaic_arr, coverage_arr, logger)
+    if coverage_arr is not None:
+        coverage_arr = np.where(np.isfinite(coverage_arr), coverage_arr, 0.0).astype(np.float32, copy=False)
+    if mosaic_arr is not None and coverage_arr is not None:
+        mosaic_arr = np.asarray(mosaic_arr, dtype=np.float32, copy=False)
+        mosaic_arr[~np.isfinite(mosaic_arr)] = np.nan
+        nanized_mask = coverage_arr <= 0
+        if final_alpha_u8 is not None and final_alpha_u8.shape[:2] == coverage_arr.shape:
+            nanized_mask = np.logical_or(nanized_mask, final_alpha_u8 == 0)
+        nanized_pixels = int(np.count_nonzero(nanized_mask))
+        mosaic_arr = _nanize_by_coverage(mosaic_arr, coverage_arr, alpha_u8=final_alpha_u8)
+        if nanized_pixels > 0:
+            logger.info("sds_global: nanized %d pixels via coverage/alpha", nanized_pixels)
     return mosaic_arr, coverage_arr, final_alpha_u8
 
 
@@ -13691,6 +13739,22 @@ def assemble_final_mosaic_reproject_coadd(
                     stats,
                 )
 
+    if isinstance(coverage, np.ndarray):
+        coverage = np.where(np.isfinite(coverage), coverage, 0.0).astype(np.float32, copy=False)
+    if mosaic_data is not None and coverage is not None:
+        mosaic_data = np.asarray(mosaic_data, dtype=np.float32, copy=False)
+        mosaic_data[~np.isfinite(mosaic_data)] = np.nan
+        nanized_mask = coverage <= 0
+        if alpha_final is not None and alpha_final.shape[:2] == coverage.shape:
+            nanized_mask = np.logical_or(nanized_mask, alpha_final == 0)
+        nanized_pixels = int(np.count_nonzero(nanized_mask))
+        mosaic_data = _nanize_by_coverage(mosaic_data, coverage, alpha_u8=alpha_final)
+        if nanized_pixels > 0:
+            logger.info(
+                "assemble_reproject_coadd: nanized %d pixels where coverage/alpha == 0",
+                nanized_pixels,
+            )
+
     _update_eta(n_channels)
 
     return (
@@ -18289,8 +18353,7 @@ def run_hierarchical_mosaic_classic_legacy(
                         if np.any(mask_zero):
                             preview_view = np.array(preview_view, copy=True)
                             try:
-                                mask_3d = mask_zero[:, :, None]  # (H, W, 1) → broadcast RGB
-                                preview_view[mask_3d] = np.nan
+                                preview_view = np.where(mask_zero[..., None], np.nan, preview_view)
                             except Exception as e_nan:
                                 logger.warning(
                                     "phase6: preview NaN masking failed: %s (shape preview=%s, alpha=%s)",
@@ -22372,8 +22435,7 @@ def run_hierarchical_mosaic(
                         if np.any(mask_zero):
                             preview_view = np.array(preview_view, copy=True)
                             try:
-                                mask_3d = mask_zero[:, :, None]  # (H, W, 1) → broadcast RGB
-                                preview_view[mask_3d] = np.nan
+                                preview_view = np.where(mask_zero[..., None], np.nan, preview_view)
                             except Exception as e_nan:
                                 logger.warning(
                                     "phase6: preview NaN masking failed: %s (shape preview=%s, alpha=%s)",
@@ -23692,13 +23754,22 @@ def _assemble_global_mosaic_first_impl(
             if len(final_channels) == 1
             else np.stack(final_channels, axis=-1)
         )
-        final_image = np.nan_to_num(final_image, nan=0.0, posinf=0.0, neginf=0.0)
-        coverage_map = np.nan_to_num(coverage_map, nan=0.0, posinf=0.0, neginf=0.0)
+        final_image = np.asarray(final_image, dtype=np.float32, copy=False)
+        final_image[~np.isfinite(final_image)] = np.nan
+        coverage_map = np.asarray(coverage_map, dtype=np.float32, copy=False)
+        coverage_map = np.where(np.isfinite(coverage_map), coverage_map, 0.0)
         alpha_map = None
         if np.any(coverage_map > 0):
             max_cov = float(np.nanmax(coverage_map))
             if max_cov > 0:
                 alpha_map = np.clip((coverage_map / max_cov) * 255.0, 0, 255).astype(np.uint8)
+        nanized_mask = coverage_map <= 0
+        if alpha_map is not None and alpha_map.shape[:2] == coverage_map.shape:
+            nanized_mask = np.logical_or(nanized_mask, alpha_map == 0)
+        nanized_pixels = int(np.count_nonzero(nanized_mask))
+        final_image = _nanize_by_coverage(final_image, coverage_map, alpha_u8=alpha_map)
+        if nanized_pixels > 0:
+            logger.info("global_coadd: nanized %d pixels via coverage/alpha (gpu helper)", nanized_pixels)
         if prefetched_frame is not None:
             del prefetched_frame
         _emit_progress(max(helper_seen, total_images), valid_frames_count=int(helper_valid))
@@ -23895,8 +23966,10 @@ def _assemble_global_mosaic_first_impl(
             weight_expanded = np.expand_dims(weight_grid, axis=-1)
             with np.errstate(invalid="ignore", divide="ignore"):
                 result = sum_grid / weight_expanded
-            result = np.nan_to_num(result, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
-            coverage = np.nan_to_num(weight_grid, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+            result = np.asarray(result, dtype=np.float32, copy=False)
+            result[~np.isfinite(result)] = np.nan
+            result = np.where(weight_grid[..., None] > 0, result, np.nan)
+            coverage = np.where(np.isfinite(weight_grid), weight_grid, 0.0).astype(np.float32, copy=False)
             return result, coverage
 
         def _finalize_kappa_sigma() -> tuple[np.ndarray, np.ndarray]:
@@ -23904,11 +23977,13 @@ def _assemble_global_mosaic_first_impl(
             with np.errstate(invalid="ignore", divide="ignore"):
                 mean_map = sum_grid / weight_expanded
                 second_moment = sumsq_grid / weight_expanded
-            mean_map = np.nan_to_num(mean_map, nan=0.0, posinf=0.0, neginf=0.0)
-            second_moment = np.nan_to_num(second_moment, nan=0.0, posinf=0.0, neginf=0.0)
+            mean_map = np.asarray(mean_map, dtype=np.float32, copy=False)
+            second_moment = np.asarray(second_moment, dtype=np.float32, copy=False)
+            mean_map[~np.isfinite(mean_map)] = np.nan
+            second_moment[~np.isfinite(second_moment)] = np.nan
             variance = np.maximum(second_moment - (mean_map ** 2), 0.0)
             std_map = np.sqrt(variance, dtype=np.float64)
-            std_map = np.nan_to_num(std_map, nan=0.0)
+            std_map = np.where(np.isfinite(std_map), std_map, 0.0)
             clip_sum = np.zeros_like(sum_grid, dtype=np.float64)
             clip_weight = np.zeros_like(weight_grid, dtype=np.float32)
             min_sigma = np.percentile(std_map[np.isfinite(std_map)], 5) if np.any(np.isfinite(std_map)) else 0.0
@@ -23940,8 +24015,11 @@ def _assemble_global_mosaic_first_impl(
                 clipped,
                 mean_map,
             )
-            coverage = np.where(clip_weight > 0, clip_weight, weight_grid)
-            return clipped.astype(np.float32, copy=False), coverage.astype(np.float32, copy=False)
+            clipped = np.asarray(clipped, dtype=np.float32, copy=False)
+            clipped[~np.isfinite(clipped)] = np.nan
+            coverage_base = np.where(clip_weight > 0, clip_weight, weight_grid)
+            coverage = np.where(np.isfinite(coverage_base), coverage_base, 0.0).astype(np.float32, copy=False)
+            return clipped, coverage
 
         def _compute_chunk_height() -> int:
             if height <= 0:
@@ -24006,8 +24084,12 @@ def _assemble_global_mosaic_first_impl(
                     chunk_weight = np.nansum(weight_stack, axis=0)
                     with np.errstate(invalid="ignore", divide="ignore"):
                         chunk_result = np.nansum(weighted, axis=0) / np.expand_dims(chunk_weight, axis=-1)
-                chunk_result = np.nan_to_num(chunk_result, nan=0.0).astype(np.float32, copy=False)
-                chunk_weight = np.nan_to_num(chunk_weight, nan=0.0).astype(np.float32, copy=False)
+                chunk_result = np.asarray(chunk_result, dtype=np.float32, copy=False)
+                chunk_result[~np.isfinite(chunk_result)] = np.nan
+                chunk_weight = np.where(np.isfinite(chunk_weight), chunk_weight, 0.0).astype(np.float32, copy=False)
+                invalid = chunk_weight <= 0
+                if np.any(invalid):
+                    chunk_result = np.where(invalid[..., None], np.nan, chunk_result)
                 final[y0:y1, :, :] = chunk_result
                 coverage[y0:y1, :] = chunk_weight
             return final, coverage
@@ -24022,13 +24104,22 @@ def _assemble_global_mosaic_first_impl(
         if final_image is None or coverage_map is None:
             return _fail("global_coadd_error_finalize_failed")
 
-        final_image = np.nan_to_num(final_image, nan=0.0, posinf=0.0, neginf=0.0)
-        coverage_map = np.nan_to_num(coverage_map, nan=0.0, posinf=0.0, neginf=0.0)
+        final_image = np.asarray(final_image, dtype=np.float32, copy=False)
+        final_image[~np.isfinite(final_image)] = np.nan
+        coverage_map = np.asarray(coverage_map, dtype=np.float32, copy=False)
+        coverage_map = np.where(np.isfinite(coverage_map), coverage_map, 0.0)
         alpha_map = None
         if np.any(coverage_map > 0):
             max_cov = float(np.nanmax(coverage_map))
             if max_cov > 0:
                 alpha_map = np.clip((coverage_map / max_cov) * 255.0, 0, 255).astype(np.uint8)
+        nanized_mask = coverage_map <= 0
+        if alpha_map is not None and alpha_map.shape[:2] == coverage_map.shape:
+            nanized_mask = np.logical_or(nanized_mask, alpha_map == 0)
+        nanized_pixels = int(np.count_nonzero(nanized_mask))
+        final_image = _nanize_by_coverage(final_image, coverage_map, alpha_u8=alpha_map)
+        if nanized_pixels > 0:
+            logger.info("global_coadd: nanized %d pixels via coverage/alpha (cpu)", nanized_pixels)
         computed_channels: int | None = channel_count
         if computed_channels is None and final_image is not None:
             computed_channels = final_image.shape[-1] if final_image.ndim >= 3 else 1
