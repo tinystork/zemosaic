@@ -1,41 +1,43 @@
-# Patch checklist (what to change exactly)
+# Follow-up: How to validate the Phase5 mask propagation fix
 
-## 1) Fix preview NaN masking (definite bug)
-- [x] In Phase6 preview section, replace the boolean mask assignment with:
-      preview_view = np.where(mask_zero[..., None], np.nan, preview_view)
-  to avoid the broadcast mismatch warning while keeping the try/except wrapper.
+## 1) Quick sanity checks (before running a full mosaic)
+- Confirm the patch touched ONLY `zemosaic_worker.py`
+  - `git status`
+  - `git diff`
 
-## 2) Preserve NaNs in coadd output (root cause of black rectangles)
-- [x] Remove/avoid conversions like:
-      chunk_result = np.nan_to_num(chunk_result, nan=0.0)
-      final_image = np.nan_to_num(final_image, nan=0.0, ...)
-  because they turn transparent/invalid regions into zeros.
-- [x] After computing chunk_weight, enforce:
-      invalid = (chunk_weight <= 0)
-      chunk_result[invalid, :] = np.nan
-- [x] For mean/kappa finalize results, ensure:
-      invalid = (coverage_map <= 0)
-      final_image[invalid, :] = np.nan
-- [x] Optionally sanitize inf with:
-      final_image[~np.isfinite(final_image)] = np.nan
-  without converting NaNs to zero.
+- Optional: run a quick search in the edited area to ensure:
+  - `coverage_mask` is used to populate `input_weights_list`
+  - `_invoke_reproject()` passes `**invoke_kwargs`
 
-## 3) Phase6 saving: do not "nan_to_num" the science mosaic
-- [x] Before calling zemosaic_utils.save_fits_image for the main float FITS, keep NaNs (float32 ok) and remove any pre-save nan_to_num in this path.
-- [x] Keep writing the ALPHA extension as now. Viewer FITS may clamp NaN to 0; the science FITS must preserve NaN.
+## 2) Run the same reproduction dataset
+Use the same command/config you used when producing:
+- the “nested frames” final mosaic screenshot
+- the `zemosaic_worker.log`
 
-## 4) Verify weight handling (avoid NaN polluting sums)
-- [x] Where accumulating sums, ensure patch_weight is 0 where patch_data is non-finite. If needed, gate both weight and data with a finite mask so NaNs do not reach sum_grid.
+Run with GPU enabled (since the issue was clearly visible there).
 
-## 5) Quick verification steps (local)
-- [ ] Run a small mosaic where lecropper creates masked pixels.
-- [ ] Confirm in log: no "preview NaN masking failed" warning and alpha extension written.
-- [ ] Open final float FITS and check np.isnan(data).sum() > 0 with masked areas as NaN (not 0).
-- [ ] Visually ensure black rectangles are gone; NaNs should not contribute to coadd and PNG preview should be transparent where alpha==0.
+## 3) What to look for in logs
+In Phase 5:
+- You should NOT see a fallback that turns weights into all-ones silently.
+- If DEBUG enabled, you should see one micro log per channel (or channel 0) like:
+  - "input_weights source=coverage_mask" for at least one tile
+  - a non-trivial fraction of zeros in the weight map sample
 
-## Notes / gotchas
-- FITS viewers: many ignore ALPHA extension → NaN is the reliable “transparent” signal in the main image.
-- Keep behavior unchanged for batch size mode logic.
-- Keep current logs; add one INFO like:
-  "global_coadd: nanized %d pixels where coverage==0"
-  (optional, but useful for debugging).
+## 4) Visual acceptance
+- Final mosaic should resemble the expected “clean” reference:
+  - No nested dark/black rectangles aligned to tile bounding boxes
+  - Masked regions behave as transparent / non-contributing
+
+## 5) Regression checks (important)
+- Test a dataset that includes true ALPHA extensions:
+  - Ensure Phase5 still forces CPU when `alpha_weight2d` is present (as before).
+- Test a dataset without NaNs/masks:
+  - Mosaic should remain unchanged.
+
+## 6) If it still fails
+Collect:
+- the new Phase5 log section (Phase5 started → finished)
+- whether weights were reported as coming from coverage_mask
+- one output coverage map FITS (if generated)
+Then we’ll decide whether the GPU helper needs a footprint*weights multiplication (in gpu_reproject impl), but do NOT change that unless proven necessary.
+````

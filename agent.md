@@ -1,69 +1,80 @@
-# Goal
-Fix ZeMosaic "black rectangles" artifacts caused by masked/transparent regions being converted to zeros.
-Masked regions (from lecropper.py) must remain transparent for reproject/coadd by:
-- carrying NaNs (or equivalently weight=0) through coadd
-- preserving NaNs in final float FITS output where coverage==0 (and/or alpha==0)
-- ensuring preview masking does not error and produces a correct RGBA PNG
+# Mission: Fix NaN mask propagation during Phase5 reproject+coadd (GPU/CPU parity) — NO REFACTOR
 
-# Context (current bug)
-- lecropper pipeline can nanize masked pixels (good).
-- later in global coadd / finalize we call np.nan_to_num(... nan=0.0) which turns NaNs into 0 → black blocks in master tiles / final mosaic.
-- preview masking currently warns: "boolean index did not match ... axis 2 size 3 vs mask 1" and thus may not properly hide masked regions.
+## Context
+Final mosaic shows nested dark/black rectangular frames: masked/invalid regions from master tiles are being treated as valid zeros after reproject/coadd.
+Master tiles contain NaNs (or coverage masks) but Phase5 currently builds per-tile input weights incorrectly (often all-ones), so reproject/coadd blends zeros instead of ignoring masked pixels.
 
-# Scope
-Surgical changes in:
-- zemosaic_worker.py
-Optional minimal touch in:
-- zemosaic_utils.py only if required to keep NaNs in FITS write (but prefer worker-only).
+This must be fixed in a minimal, surgical way.
 
-Do NOT refactor algorithms.
-Do NOT change GUI behavior.
-Do NOT change existing batch size behaviors (batch size = 0 and batch size > 1 must remain intact).
+## Scope (STRICT)
+- Modify ONLY: `zemosaic_worker.py`
+- Focus area: `assemble_final_mosaic_reproject_coadd()` Phase5 channel loop building `input_weights_list` and invoking `reproject_and_coadd_wrapper`.
+- No refactors, no renames, no moving code blocks, no formatting sweeps.
 
-# Requirements / Acceptance criteria
-1) Final float FITS mosaic contains NaN in pixels where coverage_map == 0 (and/or alpha_final==0).
-2) No black rectangles due to NaN→0 conversion in the final mosaic (in FITS float).
-3) Preview generation:
-   - no "preview NaN masking failed" warning
-   - preview PNG is RGBA when alpha_final exists and has transparent background where alpha==0
-4) Coadd math remains stable:
-   - masked pixels do not contaminate sums (weight must be 0 where data is non-finite)
-5) Keep existing logs; add one debug/info log indicating how many pixels were nanized by coverage/alpha (optional).
+## Primary goals
+1) Ensure that for each tile, per-pixel invalid regions (NaNs / masked) are converted into **input weights = 0** so they do not contribute to the coadd.
+2) Make GPU and CPU behave consistently: masked pixels should not appear as dark rectangles.
+3) Keep existing behavior for true ALPHA tiles; do not break the “alpha_weights_present => force CPU” logic.
 
-# Implementation plan (worker)
-- [x] Add a small helper in zemosaic_worker.py (near global coadd helpers):
-      def _nanize_by_coverage(final_hwc, coverage_hw, *, alpha_u8=None):
-          - compute invalid = (coverage_hw <= 0) OR (alpha_u8==0 if provided)
-          - set final_hwc[invalid, :] = np.nan
-          - return final_hwc
+## Key observations (current bug)
+Inside `assemble_final_mosaic_reproject_coadd()`:
+- The channel loop currently builds `input_weights_list` from `alpha_weight2d` only; otherwise it uses `ones_like()`.
+- But NaN masking (from lecropper) is stored in `entry["coverage_mask"]` (float32 0/1) and/or the data plane contains NaNs.
+- Therefore input_weights become ones → masked pixels are treated as valid → reproject/coadd can fill them as zeros → nested frames artifact.
+Also: `_invoke_reproject()` creates `invoke_kwargs` but mistakenly calls wrapper with `**local_kwargs` (so `tile_weights` is never passed). Fix that too (tiny).
 
-- [x] In global coadd finalize paths:
-      - Remove/avoid nan_to_num on the final image (and in chunked finalize).
-      - After computing chunk_result and chunk_weight:
-          - set chunk_result[chunk_weight<=0] = np.nan (per-pixel), before copying to final.
-          - keep coverage as float (0 where no contribution).
-      - After finalize (mean/kappa/chunked), call _nanize_by_coverage(final_image, coverage_map).
-      - You may still sanitize +/-inf to NaN (not 0).
+## Implementation plan (surgical)
+### A) Use `coverage_mask` as input weights when present
+In the Phase5 channel loop where we build:
+- `data_list`
+- `wcs_list`
+- `input_weights_list`
 
-- [x] Phase6 export:
-      - DO NOT convert NaNs to 0 before save_fits_image for the main float FITS.
-      - If a "viewer uint16" is produced, it may convert NaNs to 0 (fine), but keep alpha extension.
+Change the fallback branch:
+- If `entry.get("alpha_weight2d")` exists: keep it (unchanged).
+- Else if `entry.get("coverage_mask")` exists and matches the data plane shape `(H,W)`: use that as the weight map.
+- Else: fallback to `ones_like(data_plane)`.
 
-- [x] Preview masking fix:
-      Replace boolean indexing with a broadcasting-safe np.where:
-          preview_view = np.where(mask_zero[..., None], np.nan, preview_view)
-      This avoids the axis mismatch warning.
+Additionally:
+- Ensure weight map is float32 and clipped to [0,1].
+- If shape mismatch, keep safe fallback to ones_like (no crash).
 
-# Minimal tests (no full dataset required)
-- [ ] Unit-ish: create a fake 3-channel mosaic array with some NaNs and a coverage map with zeros.
-      Ensure _nanize_by_coverage produces NaNs where expected.
-- [ ] Smoke: run a short mosaic on a small dataset and verify:
-      - log has no preview NaN masking warning
-      - final mosaic float FITS contains NaNs (check with fits.open and np.isnan count)
-      - preview PNG has alpha channel (if alpha_final exists)
+### B) Fix `_invoke_reproject` kwargs bug
+Current code:
+```py
+invoke_kwargs = dict(local_kwargs)
+if tile_weighting_applied ...:
+    invoke_kwargs["tile_weights"] = weights_for_entries
+return reproject_and_coadd_wrapper(..., **local_kwargs)
+````
 
-# Files to edit
-- zemosaic_worker.py (primary)
+This ignores `invoke_kwargs`.
+Change wrapper call to `**invoke_kwargs`.
 
-# Definition of done
-All acceptance criteria met, no new warnings in log, output FITS float no longer shows black rectangles from masked regions.
+### C) Add MICRO debug logs (no spam)
+
+Add one-time per channel (or only channel 0) debug payload:
+
+* Whether coverage_mask was used
+* min/max of one sample weight map
+* fraction of zeros (approx) for one sample tile
+  Keep it guarded by `logger.isEnabledFor(logging.DEBUG)` or a boolean `debug_logged`.
+
+Do NOT add heavy loops over all tiles; sample at most 1–2 tiles.
+
+## Acceptance criteria
+
+* Running the same dataset as the provided logs produces a final mosaic without nested dark rectangle frames.
+* CPU and GPU both ignore masked regions (masked areas remain transparent/absent; no black borders).
+* No regression in cases with real `alpha_weight2d` tiles; those still force CPU for Phase5 as before.
+
+## Deliverables
+
+* A single git-ready patch to `zemosaic_worker.py`
+* A short commit message suggestion
+
+## Suggested commit message
+
+"Phase5: use coverage_mask as input_weights + pass tile_weights correctly to reproject wrapper"
+
+
