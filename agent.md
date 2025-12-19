@@ -1,90 +1,67 @@
 # Mission (surgical / no refactor)
-Add an "Alt-Az alpha soft threshold" parameter in the Advanced panel (GUI) + translations,
-and use it in the lecropper pipeline (worker) to decide which pixels are considered transparent
-when mask2d is returned (i.e., nanize/zeroize threshold on mask2d).
+Add a configurable threshold that controls how much of the ALT-AZ artifact feather mask gets converted to NaNs/zeros in master tiles (to remove large chromatic ramps near borders).
 
-## Why
-Currently zemosaic_worker hard-thresholds mask2d at 1e-3:
-    mask_zero = alpha_mask_norm <= 1e-3
-So feathered / partially transparent zones survive as valid pixels, often carrying ugly
-color casts (magenta/green). We want a user-tunable cutoff (recommended ~0.85) without refactoring.
+Currently ZeMosaic mainly uses lecropper.mask_altaz_artifacts() mask2d and then nanizes only where mask2d <= 1e-3, which keeps most of the feather ramp "valid" and can create strong magenta/green ramps.
 
-## Scope
-- [x] zemosaic_worker.py: only inside _apply_master_tile_quality_pipeline(), in the block `if mask2d is not None:`
-- [x] zemosaic_gui.py (Tk GUI): add a new setting in the Alt-Az Advanced row
-- [x] locales: update translations for EN/FR (json files)
-NO other refactors, NO algorithm rewrite.
+We want a user-facing parameter (Advanced tab) to choose a higher cutoff, e.g. 0.15..0.50, to treat more of the ramp as invalid.
 
-## New config key
-- [x] `altaz_alpha_soft_threshold` (float in [0..1])
-Meaning:
-- Pixels with mask2d <= threshold are treated as fully transparent (NaN or 0 depending on altaz_nanize).
-Recommended typical value: 0.85.
-Backward compatibility: if key missing, default keeps old behavior (1e-3).
+# Constraints
+- NO REFACTOR. Minimal code changes only.
+- Keep lecropper.py autonomous.
+- Do not change algorithm except the threshold used for final nanize/zeroize decision.
+- Default behavior must remain close to current unless the user changes the new parameter.
 
-## Implementation details
+# Scope
+Implement in:
+- Qt GUI: Advanced tab (where other lecropper/altaz parameters live)
+- Config wiring: store/load/persist
+- Worker pipeline: use new threshold instead of hardcoded 1e-3 when applying mask2d to the tile
 
-### 1) Worker: zemosaic_worker.py
-In `_apply_master_tile_quality_pipeline()`:
-- [x] read cfg value:
-    az_alpha_soft = float(cfg.get("altaz_alpha_soft_threshold", 1e-3))
-- [x] sanitize:
-    - if NaN/inf -> fallback 1e-3
-    - clamp into [0.0, 1.0]
-- [x] replace:
-    hard_threshold = 1e-3
-  with:
-    hard_threshold = az_alpha_soft
-- [x] keep rest identical
-- [x] extend existing log line to include the threshold value (keep existing message, just append `threshold=%g`).
+Likely files:
+- zemosaic_gui_qt.py (Advanced tab / settings UI)
+- zemosaic_config.py (config key defaults + load/save)
+- zemosaic_worker.py (where _apply_lecropper_pipeline converts mask2d into NaNs/zeros)
+- translations (where other Advanced strings are translated)
 
-### 2) GUI: zemosaic_gui.py (Advanced panel)
-Add:
-- [x] self.config.setdefault("altaz_alpha_soft_threshold", 1e-3)  (to preserve current default behavior)
-- [x] `self.altaz_alpha_soft_threshold_var = tk.DoubleVar(... value=self.config.get("altaz_alpha_soft_threshold", 1e-3))`
+# New parameter
+Name: "ALT-AZ nanize threshold"
+Key suggestion: altaz_nanize_threshold
+Type: float
+Range: [0.0, 1.0]
+Default: 0.001 (to match existing behavior)
 
-In the Alt-Az advanced row (where margin/decay/nanize are):
-- [x] add a label + spinbox after "Alt-Az decay" and before/near "Alt-Az → NaN"
-- [x] Spinbox range: 0.0 .. 1.0 step 0.01, width ~6
-- [x] store widgets:
-    self.translatable_widgets["altaz_alpha_soft_threshold_label"] = that label
-- [x] include the spinbox in `_altaz_inputs` so it is enabled/disabled with Alt-Az toggle
+Tooltip/help:
+"Pixels where the ALT-AZ artifact mask opacity is <= this threshold are treated as invalid (NaN/zero). Increase to remove more border ramps."
 
-When building the run config dict (the place where altaz_cleanup_enabled/margin/decay/nanize are injected):
-- [x] include:
-    "altaz_alpha_soft_threshold": float(self.altaz_alpha_soft_threshold_var.get())
+# Implementation details (worker)
+Find the code path where:
+- mask_altaz_artifacts returns (masked, mask2d)
+- ZeMosaic ignores 'masked' and later converts based on mask2d <= 1e-3
+Replace that 1e-3 with cfg.altaz_nanize_threshold (clamped to [0,1]).
+Keep existing behavior for the rest (same nan/zero handling as currently).
 
-- [x] Also ensure the value is persisted in self.config when launching / saving config.
+Add a log line once per tile (or once per master tile creation batch) like:
+"lecropper: altaz_nanize_threshold=%.3f"
 
-### 3) Translations
-Add translation keys for EN + FR:
-- [x] `altaz_alpha_soft_threshold_label`
-Suggested text:
-- EN: "Alt-Az alpha cutoff"
-- FR: "Seuil alpha Alt-Az"
+# GUI
+Add a QDoubleSpinBox:
+- decimals: 3
+- step: 0.01
+- min: 0.0
+- max: 1.0
+- default: 0.001
+Put it in Advanced section near ALT-AZ / Lecropper options.
 
-If you have tooltips system already, optionally add:
-- `altaz_alpha_soft_threshold_tooltip`
-EN: "Pixels with alpha below this value are treated as transparent (NaN/0). Try 0.85."
-FR: "Pixels avec alpha inférieur à cette valeur sont considérés transparents (NaN/0). Essayez 0.85."
-(Only if tooltips are already used in this panel; otherwise skip to stay surgical.)
+# Translations
+Add labels + tooltips in EN/FR (match existing translation scheme).
+Do not change unrelated strings.
 
-## Files to edit
-- [x] zemosaic_worker.py
-- [x] zemosaic_gui.py
-- [x] locales/en.json (or equivalent)
-- [x] locales/fr.json (or equivalent)
+# Acceptance criteria
+- When altaz_nanize_threshold=0.001, output matches previous behavior.
+- When altaz_nanize_threshold is increased (e.g. 0.20), the large chromatic ramps near borders become masked out (NaN/invalid) in master tiles, reducing magenta/green "veils".
+- No other behavior changes; pipeline still runs.
 
-## Test plan (manual)
-1) Run a small mosaic with Alt-Az cleanup enabled + mask2d path active.
-2) Baseline: threshold=1e-3 -> observe tinted feather zones may remain.
-3) Set threshold to 0.85 in Advanced.
-4) Re-run:
-   - logs show MT_PIPELINE altaz_cleanup applied ... threshold=0.85
-   - tinted border zones should become transparent (NaN/0) and stop polluting the mosaic.
-
-## Acceptance criteria
-- [x] New control appears in Advanced panel, translated in EN/FR
-- [x] Default behavior unchanged when key missing (1e-3)
-- [x] Worker uses the configured threshold for mask2d -> nanize/zeroize
-- [x] No other behavior changes / refactors
+# Quick manual test
+- Run a dataset that produces the chromatic ramps.
+- Compare master tiles with threshold 0.001 vs 0.20.
+- Verify that the circled areas become invalid/transparent rather than colored ramps.
