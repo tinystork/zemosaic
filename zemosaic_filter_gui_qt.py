@@ -3486,6 +3486,7 @@ class FilterQtDialog(QDialog):
             coords = self._gather_group_coordinates(group, path_map)
             center = self._compute_center_from_coords(coords)
             dispersion = self._compute_dispersion_for_coords(coords)
+            eqmode_sig = self._group_eqmode_signature(group)
             records.append(
                 {
                     "entries": list(group),
@@ -3493,6 +3494,7 @@ class FilterQtDialog(QDialog):
                     "center": center,
                     "size": len(group),
                     "dispersion": dispersion,
+                    "eqmode_sig": eqmode_sig,
                 }
             )
         return records
@@ -3632,12 +3634,17 @@ class FilterQtDialog(QDialog):
         source = records[idx]
         source_coords = list(source.get("coords") or [])
         source_center = source.get("center")
+        source_sig = str(source.get("eqmode_sig") or "UNKNOWN")
         if not source_coords or source_center is None:
             return None
         source_size = int(source.get("size", len(source_coords)))
         neighbors: list[tuple[float, int, int]] = []
         for other_idx, other in enumerate(records):
             if other_idx == idx:
+                continue
+            other_sig = str(other.get("eqmode_sig") or "UNKNOWN")
+            # Never merge across EQ/ALTZ boundaries (or any differing signature)
+            if other_sig != source_sig:
                 continue
             other_coords = other.get("coords") or []
             other_center = other.get("center")

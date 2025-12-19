@@ -1,18 +1,23 @@
 # Validation checklist (manual)
 
-## Perf instrumentation
-- [x] Le log contient "sky_preview_perf: ..." avec N, build_dt, artists_dt, draw_dt, redraws.
-- [ ] Sur dataset 5000 images, on observe clairement où le temps part.
+## 1) Vérifier perf log
+- [ ] Le log contient "sky_preview_perf: ..." à chaque refresh.
+- [ ] Sur gros dataset, on voit clairement collect/build/artists/draw.
 
-## Optimisation Matplotlib
-- [x] Le preview est rendu via LineCollection/PatchCollection (pas 5000 add_patch).
-- [x] redraws << avant (idéalement 1 draw final, ou quelques draws throttlés).
-- [ ] L’UI ne “freeze” plus pendant l’auto-organisation.
+## 2) Footprints en LineCollection (option C)
+- [ ] Quand footprint_radec est disponible, les footprints sont visibles.
+- [ ] Le code n’utilise pas Polygon + add_patch dans une boucle.
+- [ ] Une seule LineCollection est ajoutée (ou une par couche si séparation explicite).
 
-## Gros datasets
-- [x] Si N très grand, le preview passe en mode simplifié (centroids/lines) automatiquement.
-- [x] La légende est désactivée ou limitée (Top N + others) pour num_groups élevé.
+## 3) Centres vectorisés
+- [ ] Il n’y a plus un scatter par groupe (ou drastiquement moins).
+- [ ] Les points restent colorés comme avant (si colorize by group est actif).
 
-## Non-régression
-- [ ] Petits datasets: rendu identique ou visuellement acceptable.
-- [ ] Aucune exception Matplotlib.
+## 4) Légende
+- [ ] Si groups > LEGEND_MAX, pas de legend (pas de freeze).
+- [ ] Le hint UI indique que la legend est masquée.
+
+## 5) Non-régression
+- [ ] Petits datasets: rendu OK.
+- [ ] Aucun warning Matplotlib nouveau.
+- [ ] Pas de crash si footprint_radec absent / incomplet.
