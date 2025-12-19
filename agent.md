@@ -1,111 +1,218 @@
-Bonjour ! Il est très probable que le problème que vous rencontrez, à savoir la perte du masque alpha et l'apparition de bandes noires, soit lié à la manière dont les images sont traitées lors des étapes de découpe et d'assemblage. Analysons les causes possibles et les solutions que vous pouvez mettre en œuvre.
+Mission (surgical / no refactor): use tiles_coverage as weights in two-pass reprojection
 
-Pourquoi le masque alpha n'est pas conservé et pourquoi des bandes noires apparaissent-elles ?
-L'apparition de bandes noires sur votre mosaïque finale est un symptôme classique d'une mauvaise gestion du canal alpha (la couche de transparence) de vos images. Essentiellement, les zones qui devraient être transparentes sont interprétées comme noires.
+Context:
+Project: ZeMosaic
+File: zemosaic_worker.py
+Function to modify:
 
-Voici les raisons les plus probables pour lesquelles cela se produit :
+def run_second_pass_coverage_renorm(
+    tiles: list[np.ndarray],
+    tiles_wcs: list[Any],
+    final_wcs_p1: Any,
+    coverage_p1: np.ndarray,
+    shape_out: tuple[int, int],
+    *,
+    sigma_px: int,
+    gain_clip: tuple[float, float],
+    logger=None,
+    use_gpu_two_pass: bool | None = None,
+    tiles_coverage: list[np.ndarray | None] | None = None,
+    parallel_plan: ParallelPlan | None = None,
+    telemetry_ctrl: ResourceTelemetryController | None = None,
+    debug_diag: _TwoPassDiagnostics | None = None,
+) -> tuple[np.ndarray, np.ndarray] | None:
 
-Perte du canal alpha lors de la découpe : Il est possible que votre script lecropper.py ne conserve pas le canal alpha lorsqu'il découpe les images. De nombreuses bibliothèques de traitement d'images en Python, si on ne leur spécifie pas, travaillent par défaut avec des images à trois canaux (Rouge, Vert, Bleu - RVB) et ignorent le quatrième canal alpha (RVBA). Lors de la sauvegarde de l'image découpée, celle-ci pourrait être enregistrée en mode RVB, supprimant ainsi la transparence.
 
-Mauvaise gestion lors de l'assemblage : Même si le canal alpha est correctement conservé après la découpe, l'outil ou la fonction que vous utilisez pour créer la mosaïque ne l'utilise peut-être pas correctement. Pour assembler des images avec des zones transparentes, il ne suffit pas de les "coller" les unes à côté des autres. Il faut utiliser le canal alpha comme un masque pour déterminer quelles parties de chaque image doivent être visibles. Sans cela, les zones transparentes (qui ont souvent une valeur de pixel de 0 pour le rouge, le vert et le bleu) s'afficheront comme du noir.
+We already use tiles_coverage when computing gains via compute_per_tile_gains_from_coverage, but the second-pass reprojection itself does not use these coverage maps as weights. This makes the second-pass mosaic ignore per-tile masks/coverage (AltAz masks, edge trim, etc.), which leads to dark rectangular frames when two-pass is enabled, even though the first-pass mosaic is correct.
 
-Solutions possibles
-Sans connaître le code exact de lecropper.py et de votre script d'assemblage, voici des solutions générales basées sur les deux bibliothèques d'imagerie les plus populaires en Python : Pillow (PIL) et OpenCV.
+Goal:
+Patch run_second_pass_coverage_renorm so that, inside its per-channel reprojection, it passes a proper input_weights list to zemosaic_utils.reproject_and_coadd_wrapper, built from tiles_coverage. Also, add a small DEBUG log comparing coverage_p1 and second-pass chan_cov to help diagnose coverage mismatches.
 
-Si vous utilisez Pillow (PIL)
-Pillow est souvent plus intuitif pour la gestion des canaux alpha.
+Scope:
 
-1. Assurez-vous de conserver le canal alpha lors de la découpe :
+Only modify run_second_pass_coverage_renorm in zemosaic_worker.py.
 
-Lorsque vous ouvrez et sauvegardez des images, assurez-vous de travailler en mode RGBA.
+Do not change its signature.
 
-python
- Show full code block 
-from PIL import Image
+Do not touch any other function or file.
 
-# Ouvrir l'image en s'assurant qu'elle est en mode RGBA
-with Image.open("votre_image_originale.png").convert("RGBA") as img:
-    # Coordonnées de la découpe (gauche, haut, droite, bas)
-    zone_a_decouper = (10, 10, 100, 100)
-    image_decoupee = img.crop(zone_a_decouper)
+Do not refactor; only add the minimal logic needed.
 
-    # Sauvegarder l'image découpée en format PNG pour conserver la transparence
-    image_decoupee.save("image_decoupee.png", "PNG")
-2. Utilisez le canal alpha comme masque lors de l'assemblage :
+Keep existing logging style and diagnostics (_TwoPassDiagnostics).
 
-Pour créer la mosaïque, vous devez coller les images découpées sur une image de fond en utilisant leur propre canal alpha comme masque.
+1) Build per-tile 2D weight maps from tiles_coverage
 
-python
- Show full code block 
-from PIL import Image
+Inside run_second_pass_coverage_renorm, after we have:
 
-# Créer une image de fond transparente pour la mosaïque
-fond_mosaïque = Image.new("RGBA", (largeur_mosaïque, hauteur_mosaïque), (0, 0, 0, 0))
+corrected_tiles: list[np.ndarray] = [...]
+...
+shape_out_hw = tuple(map(int, shape_out))
 
-# Ouvrir une des images découpées (qui a un canal alpha)
-with Image.open("image_decoupee_1.png") as img1:
-    # Coller l'image en utilisant son canal alpha comme masque
-    fond_mosaïque.paste(img1, (position_x1, position_y1), img1)
 
-with Image.open("image_decoupee_2.png") as img2:
-    fond_mosaïque.paste(img2, (position_x2, position_y2), img2)
+and before _process_channel is defined, add code to prepare a list of 2D weights aligned with corrected_tiles:
 
-# Sauvegarder la mosaïque finale
-fond_mosaïque.save("mosaïque_finale.png", "PNG")
-Si vous utilisez OpenCV
-OpenCV peut être un peu moins direct car son format de couleur par défaut est BGR (Bleu, Vert, Rouge).
+If tiles_coverage is None or empty, leave weights as None and do not change behavior.
 
-1. Assurez-vous de lire et de conserver le canal alpha :
+Otherwise:
 
-Utilisez l'indicateur cv2.IMREAD_UNCHANGED pour lire l'image avec ses quatre canaux (BGRA).
+weights_2d_list: list[np.ndarray | None] | None = None
+if tiles_coverage is not None:
+    try:
+        weights_tmp: list[np.ndarray | None] = []
+        for cov_arr, tile_arr in zip(tiles_coverage, corrected_tiles):
+            if cov_arr is None:
+                # If no coverage map, fallback to ones over the tile slice
+                weights_tmp.append(None)
+                continue
+            cov_np = np.asarray(cov_arr, dtype=np.float32)
+            # Reduce any channel dimension: coverage is per-pixel, same for all channels
+            if cov_np.ndim == 3:
+                cov2d = cov_np[..., 0]
+            else:
+                cov2d = cov_np
+            # Sanity: match tile spatial shape, ignore if incompatible
+            tile_h, tile_w = tile_arr.shape[0], tile_arr.shape[1]
+            if cov2d.shape != (tile_h, tile_w):
+                if logger:
+                    logger.debug(
+                        "[TwoPass] tiles_coverage shape mismatch for tile: cov=%s tile=%s → ignoring coverage for this tile",
+                        cov2d.shape,
+                        (tile_h, tile_w),
+                    )
+                weights_tmp.append(None)
+                continue
+            # Convert to binary [0,1] weights: >0 means "valid"
+            weight2d = (cov2d > 0.0).astype(np.float32)
+            weights_tmp.append(weight2d)
+        # Only use weights if at least one tile has a non-None weight map
+        if any(w is not None for w in weights_tmp):
+            weights_2d_list = weights_tmp
+    except Exception:
+        weights_2d_list = None
+        if logger and logger.isEnabledFor(logging.DEBUG):
+            logger.debug("[TwoPass] failed to prepare tiles_coverage weights → skip", exc_info=True)
 
-python
- Show full code block 
-import cv2
-import numpy as np
 
-# Lire l'image en conservant le canal alpha
-img = cv2.imread('votre_image_originale.png', cv2.IMREAD_UNCHANGED)
+The idea: for each tile, derive a 2D weight map from tiles_coverage (coverage > 0 → weight 1, else 0), with the same spatial shape as corrected_tiles[i]. If a given tile has no coverage or inconsistent shape, we skip it (weight None → behaves as “no extra weighting” for that tile).
 
-# Découper l'image (c'est un simple découpage de tableau NumPy)
-# y:y+h, x:x+w
-image_decoupee = img[10:100, 10:100]
+2) Use weights_2d_list as input_weights in _process_channel
 
-# Sauvegarder l'image découpée
-cv2.imwrite('image_decoupee.png', image_decoupee)
-2. Gérez correctement le canal alpha lors de l'assemblage :
+Currently _process_channel looks like this (simplified):
 
-L'assemblage avec OpenCV nécessite de séparer les canaux de couleur et le canal alpha, puis de les combiner.
+def _process_channel(ch_idx: int, use_gpu_flag: bool) -> tuple[int, np.ndarray, np.ndarray]:
+    if logger:
+        logger.debug(
+            "[TwoPass] Reproject channel %d/%d with %d tiles (shape_out=%s, gpu=%s)",
+            ch_idx + 1,
+            n_channels,
+            len(corrected_tiles),
+            shape_out_hw,
+            use_gpu_flag,
+        )
+    data_list = [tile[..., ch_idx] if tile.ndim == 3 else tile[..., 0] for tile in corrected_tiles]
 
-python
- Show full code block 
-import cv2
-import numpy as np
+    def _invoke_reproj(use_gpu_local: bool, local_kwargs: dict[str, Any]):
+        return zemosaic_utils.reproject_and_coadd_wrapper(
+            data_list=data_list,
+            wcs_list=tiles_wcs,
+            shape_out=shape_out_hw,
+            use_gpu=use_gpu_local,
+            cpu_func=reproject_and_coadd,
+            **local_kwargs,
+        )
 
-# Créer une image de fond transparente pour la mosaïque
-fond_mosaïque = np.zeros((hauteur_mosaïque, largeur_mosaïque, 4), dtype=np.uint8)
+    local_kwargs = dict(reproj_kwargs)
+    try:
+        chan_mosaic, chan_cov = _invoke_reproj(use_gpu_flag, local_kwargs)
+    ...
 
-# Charger l'image découpée (BGRA)
-img1 = cv2.imread('image_decoupee_1.png', cv2.IMREAD_UNCHANGED)
-h, w, _ = img1.shape
 
-# Extraire le masque alpha et les canaux de couleur
-alpha = img1[:, :, 3] / 255.0
-couleurs = img1[:, :, :3]
+Modify _process_channel as follows:
 
-# Position où coller l'image
-y, x = position_y1, position_x1
+After data_list = [...], build a per-channel input_weights_list if weights_2d_list is available:
 
-# Mélanger les images
-for c in range(0, 3):
-    fond_mosaïque[y:y+h, x:x+w, c] = (alpha * couleurs[:, :, c] +
-                                     fond_mosaïque[y:y+h, x:x+w, c] * (1 - alpha))
+    input_weights_list = None
+    if weights_2d_list is not None:
+        try:
+            iw: list[np.ndarray | None] = []
+            for base_w, tile_arr in zip(weights_2d_list, corrected_tiles):
+                if base_w is None:
+                    iw.append(None)
+                    continue
+                # base_w is already 2D and aligned with tile spatial shape
+                # Just sanity-check against the slice for this channel
+                tile_slice = tile_arr[..., ch_idx] if tile_arr.ndim == 3 else tile_arr[..., 0]
+                if base_w.shape != tile_slice.shape:
+                    if logger and logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            "[TwoPass] input_weights shape mismatch for channel %d: w=%s slice=%s → ignoring weight",
+                            ch_idx + 1,
+                            base_w.shape,
+                            tile_slice.shape,
+                        )
+                    iw.append(None)
+                else:
+                    iw.append(base_w)
+            if any(w is not None for w in iw):
+                input_weights_list = iw
+        except Exception:
+            input_weights_list = None
+            if logger and logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "[TwoPass] failed to prepare input_weights for channel %d → skip weights",
+                    ch_idx + 1,
+                    exc_info=True,
+                )
 
-# Mettre à jour le canal alpha de la mosaïque
-fond_mosaïque[y:y+h, x:x+w, 3] = (alpha + (fond_mosaïque[y:y+h, x:x+w, 3]/255.0) * (1 - alpha)) * 255
 
-# Répéter pour les autres images...
+Before calling _invoke_reproj, inject input_weights_list into local_kwargs if it’s not None:
 
-# Sauvegarder la mosaïque finale
-cv2.imwrite('mosaïque_finale.png', fond_mosaïque)
-En résumé, le cœur du problème réside presque certainement dans la perte ou la non-utilisation du canal alpha. Je vous recommande de vérifier le code de lecropper.py et de votre script d'assemblage pour vous assurer que les images sont traitées en mode RGBA (avec Pillow) ou BGRA (avec OpenCV) à chaque étape du processus.
+    local_kwargs = dict(reproj_kwargs)
+    if input_weights_list is not None:
+        # Use the same key as in Phase 5 (assemble_final_mosaic_reproject_coadd)
+        local_kwargs["input_weights"] = input_weights_list
+
+
+Leave the rest of _process_channel unchanged (exception handling, NoConvergence fallback, etc.).
+
+This ensures that both CPU and GPU paths in reproject_and_coadd_wrapper see a proper input_weights list built from tiles_coverage, just like Phase 5 uses input_weights_list built from alpha/coverage.
+
+3) Add a DEBUG log comparing first-pass coverage and second-pass coverage
+
+Still in _process_channel, after we get chan_mosaic, chan_cov, add a small debug-only coverage comparison:
+
+    try:
+        chan_mosaic, chan_cov = _invoke_reproj(use_gpu_flag, local_kwargs)
+        if logger and logger.isEnabledFor(logging.DEBUG):
+            cov1 = np.asarray(coverage_p1, dtype=np.float32)
+            cov2 = np.asarray(chan_cov, dtype=np.float32)
+            if cov1.shape == cov2.shape:
+                bad_mask = (cov1 > 0.0) & (cov2 <= 0.0)
+                n_bad = int(np.count_nonzero(bad_mask))
+                logger.debug(
+                    "[TwoPass] channel %d coverage mismatch: cov1>0 & cov2==0 → %d pixels",
+                    ch_idx + 1,
+                    n_bad,
+                )
+            else:
+                logger.debug(
+                    "[TwoPass] channel %d coverage shape mismatch for debug: cov1=%s cov2=%s",
+                    ch_idx + 1,
+                    cov1.shape,
+                    cov2.shape,
+                )
+    except wcs_module.NoConvergence as conv_exc:
+        ...
+
+
+Do not change how exceptions are handled or how chan_mosaic / chan_cov are stored in mosaic_channels / coverage_channels.
+
+Success criteria
+
+No signature changes; no refactor outside run_second_pass_coverage_renorm.
+
+With two_pass_coverage_renorm enabled, reprojected second-pass mosaics must now use tiles_coverage as input_weights, so they respect the same per-tile masks/coverage as the first pass.
+
+Dark rectangular frames caused by two-pass should be significantly reduced or disappear on datasets where first-pass mosaic is already clean.
+
+In DEBUG logs, for a healthy run, coverage_p1>0 & chan_cov==0 counts should be low or zero, and coverage shapes should match.
