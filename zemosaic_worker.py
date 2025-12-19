@@ -1782,15 +1782,15 @@ def _apply_two_pass_coverage_renorm_if_requested(
 ) -> tuple[np.ndarray | None, np.ndarray | None]:
     """Run the coverage renormalization second pass if configured."""
 
-    diag_state: _TwoPassDiagnostics | None = None
-    fallback_used = not bool(collected_tiles) and fallback_tile_loader is not None
     if (
         not two_pass_enabled
         or final_mosaic_data is None
         or final_mosaic_coverage is None
         or final_output_wcs is None
-        or not final_output_shape_hw
+        or final_output_shape_hw is None
     ):
+        if logger:
+            logger.debug("[TwoPass] Second pass skipped (disabled or missing inputs)")
         return final_mosaic_data, final_mosaic_coverage
 
     if logger:
@@ -1801,14 +1801,26 @@ def _apply_two_pass_coverage_renorm_if_requested(
             getattr(final_mosaic_coverage, "shape", None),
         )
 
-    (
-        tiles_for_second_pass,
-        wcs_for_second_pass,
-        coverage_for_second_pass,
-    ) = _prepare_tiles_for_two_pass(
+    prepare_output = _prepare_tiles_for_two_pass(
         collected_tiles,
         fallback_tile_loader,
     )
+    fallback_used: bool
+    if isinstance(prepare_output, tuple) and len(prepare_output) >= 4:
+        (
+            tiles_for_second_pass,
+            wcs_for_second_pass,
+            coverage_for_second_pass,
+            fallback_used,
+        ) = prepare_output[:4]
+    else:
+        (
+            tiles_for_second_pass,
+            wcs_for_second_pass,
+            coverage_for_second_pass,
+        ) = prepare_output
+        fallback_used = not bool(collected_tiles) and fallback_tile_loader is not None
+
     if logger:
         logger.debug(
             "[TwoPass] Prepared %d tiles for second pass (collected=%s, fallback=%s)",
@@ -1823,6 +1835,7 @@ def _apply_two_pass_coverage_renorm_if_requested(
             )
         return final_mosaic_data, final_mosaic_coverage
 
+    diag_state: _TwoPassDiagnostics | None = None
     if logger and logger.isEnabledFor(logging.DEBUG):
         diag_state = _TwoPassDiagnostics(logger)
         try:
@@ -1860,17 +1873,115 @@ def _apply_two_pass_coverage_renorm_if_requested(
             debug_diag=diag_state,
         )
         if result is not None:
-            final_mosaic_data, final_mosaic_coverage = result
-            if logger:
-                logger.info(
-                    "[TwoPass] coverage-renorm OK (σ=%s, clip=[%.3f, %.3f])",
-                    two_pass_sigma_px,
-                    gain_clip_tuple[0],
-                    gain_clip_tuple[1],
-                )
+            mosaic2, coverage2 = result
+            base_data = final_mosaic_data
+            base_cov = final_mosaic_coverage
+
+            if base_data is None or base_cov is None:
+                final_mosaic_data = mosaic2
+                final_mosaic_coverage = coverage2
+                if logger:
+                    logger.info(
+                        "[TwoPass] coverage-renorm OK (σ=%s, clip=[%.3f, %.3f]) (no first-pass fallback available)",
+                        two_pass_sigma_px,
+                        gain_clip_tuple[0],
+                        gain_clip_tuple[1],
+                    )
+            else:
+                base_data = np.asarray(base_data, dtype=np.float32, copy=False)
+                base_cov = np.asarray(base_cov, dtype=np.float32, copy=False)
+                mosaic2 = np.asarray(mosaic2, dtype=np.float32, copy=False)
+                coverage2 = np.asarray(coverage2, dtype=np.float32, copy=False)
+
+                if (
+                    base_data.shape[:2] != mosaic2.shape[:2]
+                    or base_cov.shape != coverage2.shape
+                ):
+                    if logger:
+                        logger.warning(
+                            "[TwoPass] shape mismatch → keeping first-pass outputs "
+                            "(base_data=%s, m2=%s, base_cov=%s, c2=%s)",
+                            base_data.shape,
+                            mosaic2.shape,
+                            base_cov.shape,
+                            coverage2.shape,
+                        )
+                else:
+                    mask_valid = (base_cov > 0) & (coverage2 > 0)
+
+                    valid_count = int(np.count_nonzero(mask_valid))
+                    if valid_count == 0:
+                        if logger:
+                            logger.warning(
+                                "[TwoPass] no overlapping coverage between passes "
+                                "→ keeping first-pass outputs"
+                            )
+                    else:
+                        if base_data.ndim == 3:
+                            lum1 = base_data.mean(axis=2)
+                            lum2 = mosaic2.mean(axis=2)
+                        else:
+                            lum1 = base_data
+                            lum2 = mosaic2
+
+                        with np.errstate(invalid="ignore"):
+                            lum1_valid = lum1[mask_valid]
+
+                        if lum1_valid.size == 0:
+                            if logger:
+                                logger.warning(
+                                    "[TwoPass] empty luminance set on valid mask "
+                                    "→ keeping first-pass outputs"
+                                )
+                        else:
+                            low_percentile = float(np.nanpercentile(lum1_valid, 5))
+                            eps = max(low_percentile * 0.1, 1e-6)
+
+                            ratio = np.ones_like(lum1, dtype=np.float32)
+                            with np.errstate(divide="ignore", invalid="ignore"):
+                                ratio[mask_valid] = lum2[mask_valid] / (lum1[mask_valid] + eps)
+
+                            ratio_min = 0.4
+                            mask_use_two_pass = mask_valid & (ratio >= ratio_min)
+
+                            if not np.any(mask_use_two_pass):
+                                if logger:
+                                    logger.warning(
+                                        "[TwoPass] all ratios below threshold (ratio_min=%.3f) "
+                                        "→ keeping first-pass outputs",
+                                        ratio_min,
+                                    )
+                            else:
+                                if base_data.ndim == 3:
+                                    mask_use_two_pass_3d = mask_use_two_pass[..., None]
+                                else:
+                                    mask_use_two_pass_3d = mask_use_two_pass
+
+                                merged_data = np.where(
+                                    mask_use_two_pass_3d, mosaic2, base_data
+                                )
+                                merged_cov = np.where(
+                                    mask_use_two_pass, coverage2, base_cov
+                                )
+
+                                final_mosaic_data = merged_data
+                                final_mosaic_coverage = merged_cov
+
+                                if logger:
+                                    frac_two_pass = float(
+                                        np.count_nonzero(mask_use_two_pass)
+                                    ) / float(mask_use_two_pass.size)
+                                    logger.info(
+                                        "[TwoPass] coverage-renorm merged: σ=%s, clip=[%.3f, %.3f], "
+                                        "use_two_pass_fraction=%.4f",
+                                        two_pass_sigma_px,
+                                        gain_clip_tuple[0],
+                                        gain_clip_tuple[1],
+                                        frac_two_pass,
+                                    )
         else:
             if logger:
-                logger.warning("[TwoPass] renorm failed → keeping first-pass outputs")
+                logger.warning("[TwoPass] renorm returned None → keeping first-pass outputs")
     except Exception:
         if logger:
             logger.exception("[TwoPass] renorm exception → keeping first-pass outputs")
@@ -14154,16 +14265,31 @@ def _compute_tile_gain_task(args: tuple) -> tuple[int, float]:
         final_wcs,
         coverage_shape,
         coverage_arr,
+        coverage_blur,
         scale_map,
         gain_min,
         gain_max,
         coverage_src,
+        coverage_threshold,
+        min_valid_pixels,
+        min_valid_fraction,
     ) = args
     if tile is None or tile_wcs is None:
         return idx, 1.0
     shape = np.asarray(tile).shape
     if shape[0] <= 0 or shape[1] <= 0:
         return idx, 1.0
+    try:
+        coverage_global = np.asarray(coverage_arr, dtype=np.float32, copy=False)
+        coverage_blur_global = np.asarray(coverage_blur, dtype=np.float32, copy=False)
+    except Exception:
+        return idx, 1.0
+    if coverage_global.shape != tuple(coverage_shape) or coverage_blur_global.shape != tuple(coverage_shape):
+        try:
+            coverage_global = coverage_global.reshape(coverage_shape)
+            coverage_blur_global = coverage_blur_global.reshape(coverage_shape)
+        except Exception:
+            return idx, 1.0
     cov_arr = None
     if coverage_src is not None:
         cov_arr = np.asarray(coverage_src, dtype=np.float32, copy=False)
@@ -14189,10 +14315,23 @@ def _compute_tile_gain_task(args: tuple) -> tuple[int, float]:
         )
     except Exception:
         return idx, 1.0
-    valid = (reproj_mask > 1e-3) & (coverage_arr > 0.0)
-    if not np.any(valid):
+    tile_valid = reproj_mask > 1e-3
+    if coverage_blur_global.shape != tile_valid.shape or coverage_global.shape != tile_valid.shape:
         return idx, 1.0
-    med_gain = float(np.median(scale_map[valid]))
+    tile_pixels = int(np.count_nonzero(tile_valid))
+    if tile_pixels <= 0:
+        return idx, 1.0
+    valid = tile_valid & (coverage_global > 0.0) & (coverage_blur_global >= coverage_threshold)
+    valid_count = int(np.count_nonzero(valid))
+    min_required = max(
+        int(math.ceil(float(min_valid_pixels))),
+        int(math.ceil(float(min_valid_fraction) * tile_pixels)),
+    )
+    if valid_count < max(1, min_required):
+        return idx, 1.0
+    med_gain = float(np.nanmedian(scale_map[valid]))
+    if not np.isfinite(med_gain):
+        return idx, 1.0
     return idx, float(np.clip(med_gain, gain_min, gain_max))
 
 
@@ -14250,6 +14389,9 @@ def compute_per_tile_gains_from_coverage(
     coverage = np.asarray(coverage_p1, dtype=np.float32)
     if coverage.size == 0:
         raise ValueError("Coverage map is empty")
+    coverage = np.nan_to_num(coverage, nan=0.0, posinf=0.0, neginf=0.0)
+    coverage_valid = coverage > 0.0
+    coverage_nan = np.where(coverage_valid, coverage, np.nan)
     if logger:
         logger.debug(
             "[TwoPass] Coverage stats before blur: shape=%s, min=%.4f, max=%.4f, mean=%.4f",
@@ -14305,8 +14447,8 @@ def compute_per_tile_gains_from_coverage(
     def _blur_progress(chunk_idx: int, chunk_total: int, stage: str) -> None:
         _emit_progress(0, chunk_index=chunk_idx, chunk_total=chunk_total, stage=stage, force=False)
 
-    cov_blur, blur_source = _chunked_gaussian_blur(
-        coverage,
+    cov_blur_num, blur_source_num = _chunked_gaussian_blur(
+        np.nan_to_num(coverage_nan, nan=0.0),
         sigma_px,
         use_gpu=use_gpu,
         rows_per_chunk=row_chunk_size,
@@ -14314,17 +14456,32 @@ def compute_per_tile_gains_from_coverage(
         progress_hook=_blur_progress,
         logger=logger,
     )
+    cov_blur_den, blur_source_den = _chunked_gaussian_blur(
+        coverage_valid.astype(np.float32),
+        sigma_px,
+        use_gpu=use_gpu,
+        rows_per_chunk=row_chunk_size,
+        chunk_bytes=chunk_bytes_limit,
+        progress_hook=_blur_progress,
+        logger=logger,
+    )
+    with np.errstate(divide="ignore", invalid="ignore"):
+        cov_blur = np.where(cov_blur_den > 0, cov_blur_num / cov_blur_den, 0.0)
+    cov_blur = np.asarray(cov_blur, dtype=np.float32, copy=False)
     if logger:
         logger.debug(
-            "[TwoPass] Coverage blur applied with sigma=%d using %s (rows_per_chunk=%d, chunk_bytes=%s)",
+            "[TwoPass] Normalized coverage blur applied with sigma=%d using %s/%s (rows_per_chunk=%d, chunk_bytes=%s)",
             sigma_px,
-            blur_source,
+            blur_source_num,
+            blur_source_den,
             row_chunk_size,
             chunk_bytes_limit if chunk_bytes_limit is not None else "-",
         )
     eps = np.finfo(np.float32).eps
-    scale_map = cov_blur / np.maximum(coverage, eps)
-    scale_map = np.clip(scale_map, 0.5, 2.0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        scale_map = cov_blur / np.maximum(coverage, eps)
+    scale_map = np.where(coverage_valid, scale_map, 1.0)
+    scale_map = np.clip(scale_map.astype(np.float32, copy=False), 0.5, 2.0)
     if logger:
         logger.debug(
             "[TwoPass] Scale map stats: min=%.4f, max=%.4f, mean=%.4f",
@@ -14332,6 +14489,23 @@ def compute_per_tile_gains_from_coverage(
             float(np.nanmax(scale_map)),
             float(np.nanmean(scale_map)),
         )
+    coverage_threshold = 2.0
+    if plan_ref is not None:
+        candidate_threshold = None
+        try:
+            candidate_threshold = getattr(plan_ref, "two_pass_coverage_threshold", None)
+        except Exception:
+            candidate_threshold = None
+        if candidate_threshold is None and isinstance(plan_ref, dict):
+            candidate_threshold = plan_ref.get("two_pass_coverage_threshold") or plan_ref.get("coverage_threshold")
+        try:
+            if candidate_threshold is not None:
+                coverage_threshold = float(candidate_threshold)
+        except Exception:
+            coverage_threshold = 2.0
+    coverage_threshold = float(max(0.0, coverage_threshold))
+    min_valid_pixels = 64
+    min_valid_fraction = 0.001
     if not tiles or not tiles_wcs or len(tiles) != len(tiles_wcs):
         raise ValueError("Tile data and WCS lists must be aligned and non-empty")
     if tiles_total <= 0:
@@ -14372,10 +14546,14 @@ def compute_per_tile_gains_from_coverage(
                         final_wcs,
                         coverage.shape,
                         coverage,
+                        cov_blur,
                         scale_map,
                         gain_min,
                         gain_max,
                         coverage_src,
+                        coverage_threshold,
+                        min_valid_pixels,
+                        min_valid_fraction,
                     ),
                 )
                 future_to_idx[fut] = idx
@@ -14921,6 +15099,15 @@ def run_second_pass_coverage_renorm(
         force=True,
         stage="reproject_done",
     )
+    coverage_result = np.asarray(coverage_result, dtype=np.float32, copy=False)
+    coverage_result = np.where(np.isfinite(coverage_result), coverage_result, 0.0).astype(np.float32, copy=False)
+    mosaic = np.asarray(mosaic, dtype=np.float32, copy=False)
+    mosaic[~np.isfinite(mosaic)] = np.nan
+    nanized_mask = coverage_result <= 0
+    nanized_pixels = int(np.count_nonzero(nanized_mask))
+    mosaic = _nanize_by_coverage(mosaic, coverage_result, alpha_u8=None)
+    if logger and nanized_pixels > 0:
+        logger.info("[TwoPass] nanized %d pixels where coverage==0", nanized_pixels)
     return mosaic.astype(np.float32), coverage_result.astype(np.float32)
 
 
