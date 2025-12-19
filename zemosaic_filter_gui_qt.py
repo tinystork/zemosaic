@@ -61,6 +61,7 @@ import math
 import csv
 import threading
 import time
+import json
 from typing import Any, Callable, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -2683,6 +2684,23 @@ class FilterQtDialog(QDialog):
         self._apply_auto_group_result(result_payload)
         self._hide_processing_overlay()
 
+    def _coerce_eqmode_mode(self, raw_value: Any) -> tuple[str | None, int | None]:
+        if raw_value is None:
+            return None, None
+        value_int: int | None = None
+        try:
+            value_int = int(raw_value)
+        except Exception:
+            try:
+                value_int = int(str(raw_value).strip())
+            except Exception:
+                value_int = None
+        if value_int == 1:
+            return "EQ", 1
+        if value_int == 0:
+            return "ALTZ", 0
+        return None, None
+
     def _extract_eqmode_from_entry(self, entry: dict[str, Any]) -> str | None:
         if not isinstance(entry, dict):
             return None
@@ -2703,22 +2721,11 @@ class FilterQtDialog(QDialog):
                 if header is not None:
                     entry.setdefault("header", header)
             if header is not None:
-                raw_value = header.get("EQMODE")
-        value_int: int | None = None
-        try:
-            value_int = int(raw_value)
-        except Exception:
-            try:
-                value_int = int(str(raw_value).strip())
-            except Exception:
-                value_int = None
-        mode: str | None
-        if value_int == 1:
-            mode = "EQ"
-        elif value_int == 0:
-            mode = "ALTZ"
-        else:
-            mode = None
+                try:
+                    raw_value = header.get("EQMODE")
+                except Exception:
+                    raw_value = None
+        mode, _value_int = self._coerce_eqmode_mode(raw_value)
         if mode:
             entry["_eqmode_mode"] = mode
         return mode
@@ -2768,6 +2775,249 @@ class FilterQtDialog(QDialog):
         if has_altz:
             return "ALTZ"
         return "UNKNOWN"
+
+    def _prefetch_eqmode_for_candidates(
+        self,
+        candidate_infos: Sequence[dict[str, Any]],
+        messages: list[str | tuple[str, str]],
+    ) -> None:
+        if not candidate_infos:
+            return
+
+        start_time = time.perf_counter()
+
+        def _resolve_entry_path(entry_obj: dict[str, Any]) -> str | None:
+            for key in ("path", "path_raw", "path_preprocessed_cache", "file", "filename"):
+                candidate = entry_obj.get(key)
+                if candidate:
+                    return str(candidate)
+            return None
+
+        def _stat_file(path_value: str) -> tuple[int | None, float | None]:
+            size_val: int | None = None
+            mtime_val: float | None = None
+            try:
+                size_val = int(ospath.getsize(path_value))
+            except Exception:
+                size_val = None
+            try:
+                mtime_val = float(ospath.getmtime(path_value))
+            except Exception:
+                mtime_val = None
+            return size_val, mtime_val
+
+        def _prime_entry_mode(entry_obj: dict[str, Any]) -> bool:
+            cached_mode = entry_obj.get("_eqmode_mode")
+            if isinstance(cached_mode, str):
+                return True
+            mode_from_value, _mode_int = self._coerce_eqmode_mode(entry_obj.get("EQMODE"))
+            if mode_from_value:
+                entry_obj["_eqmode_mode"] = mode_from_value
+                return True
+            header_obj = entry_obj.get("header_subset") or entry_obj.get("header")
+            if header_obj is not None:
+                try:
+                    header_value = header_obj.get("EQMODE")  # type: ignore[attr-defined]
+                except Exception:
+                    header_value = None
+                mode_from_header, _ = self._coerce_eqmode_mode(header_value)
+                if mode_from_header:
+                    entry_obj["_eqmode_mode"] = mode_from_header
+                    return True
+            return False
+
+        def _resolve_cache_path(entries: Sequence[dict[str, Any]]) -> str | None:
+            directories: list[str] = []
+            for info in entries:
+                if not isinstance(info, dict):
+                    continue
+                candidate_path = _resolve_entry_path(info)
+                if not candidate_path:
+                    continue
+                try:
+                    directories.append(ospath.dirname(ospath.abspath(candidate_path)))
+                except Exception:
+                    continue
+            if not directories:
+                return None
+            common_dir: str | None = None
+            try:
+                common_dir = ospath.commonpath(directories)
+            except Exception:
+                common_dir = directories[0]
+            if not common_dir:
+                return None
+            return ospath.join(common_dir, ".zemosaic_eqmode_cache.json")
+
+        cache_path = _resolve_cache_path(candidate_infos)
+        cache_store: dict[str, dict[str, Any]] = {}
+        if cache_path and ospath.isfile(cache_path):
+            try:
+                with open(cache_path, "r", encoding="utf-8") as handle:
+                    loaded = json.load(handle)
+                if isinstance(loaded, dict):
+                    for key, payload in loaded.items():
+                        if isinstance(key, str) and isinstance(payload, dict):
+                            cache_store[key] = dict(payload)
+            except Exception:
+                cache_store = {}
+
+        cache_dirty = False
+        cache_hits = 0
+        cache_miss = 0
+        reads_header = 0
+        worker_count = 0
+
+        needs: list[dict[str, Any]] = []
+
+        for entry in candidate_infos:
+            if not isinstance(entry, dict):
+                continue
+            if _prime_entry_mode(entry):
+                continue
+            entry_path = _resolve_entry_path(entry)
+            if not entry_path:
+                continue
+            norm_path = casefold_path(entry_path)
+            size_val, mtime_val = _stat_file(entry_path)
+            cache_entry = cache_store.get(norm_path)
+            cache_valid = False
+            mode_from_cache = None
+            if cache_entry and size_val is not None and mtime_val is not None:
+                try:
+                    cached_size = int(cache_entry.get("size"))  # type: ignore[arg-type]
+                except Exception:
+                    cached_size = None
+                try:
+                    cached_mtime = float(cache_entry.get("mtime"))  # type: ignore[arg-type]
+                except Exception:
+                    cached_mtime = None
+                if cached_size == size_val and cached_mtime == mtime_val:
+                    cache_valid = True
+                    eq_value = cache_entry.get("eqmode")
+                    eq_int: int | None
+                    try:
+                        eq_int = int(eq_value)
+                    except Exception:
+                        eq_int = None
+                    if eq_int == 1:
+                        mode_from_cache = "EQ"
+                    elif eq_int == 0:
+                        mode_from_cache = "ALTZ"
+                else:
+                    cache_valid = False
+            if cache_valid:
+                cache_hits += 1
+                if mode_from_cache:
+                    entry["_eqmode_mode"] = mode_from_cache
+                continue
+            cache_miss += 1
+            if cache_entry and cache_path:
+                cache_store.pop(norm_path, None)
+                cache_dirty = True
+            needs.append(
+                {
+                    "entry": entry,
+                    "path": entry_path,
+                    "key": norm_path,
+                    "size": size_val,
+                    "mtime": mtime_val,
+                }
+            )
+
+        def _read_from_path(path_value: str) -> tuple[str | None, int | None]:
+            return self._read_eqmode_from_path(path_value)
+
+        if needs and fits is not None:
+            worker_count = min(16, max(4, int(os.cpu_count() or 8)))
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                future_map = {
+                    executor.submit(_read_from_path, payload["path"]): payload for payload in needs
+                }
+                for future in as_completed(future_map):
+                    payload = future_map[future]
+                    reads_header += 1
+                    mode_value: str | None = None
+                    mode_int: int | None = None
+                    try:
+                        mode_value, mode_int = future.result()
+                    except Exception:
+                        mode_value = None
+                        mode_int = None
+                    if mode_value:
+                        payload["entry"]["_eqmode_mode"] = mode_value
+                    if (payload["size"] is None or payload["mtime"] is None) and payload["path"]:
+                        payload["size"], payload["mtime"] = _stat_file(payload["path"])
+                    if cache_path and payload["size"] is not None and payload["mtime"] is not None:
+                        cache_store[payload["key"]] = {
+                            "eqmode": mode_int if mode_int in (0, 1) else None,
+                            "size": int(payload["size"]),
+                            "mtime": float(payload["mtime"]),
+                        }
+                        cache_dirty = True
+
+        if cache_path and cache_dirty:
+            try:
+                cache_dir = ospath.dirname(cache_path)
+                if cache_dir and not ospath.isdir(cache_dir):
+                    os.makedirs(cache_dir, exist_ok=True)
+                with open(cache_path, "w", encoding="utf-8") as handle:
+                    json.dump(cache_store, handle)
+            except Exception:
+                pass
+
+        eq_count = 0
+        altz_count = 0
+        unknown_count = 0
+        for entry in candidate_infos:
+            if not isinstance(entry, dict):
+                continue
+            mode = entry.get("_eqmode_mode")
+            if mode == "EQ":
+                eq_count += 1
+            elif mode == "ALTZ":
+                altz_count += 1
+            else:
+                unknown_count += 1
+
+        duration = time.perf_counter() - start_time
+        cache_label = cache_path or "none"
+        summary = (
+            "eqmode_summary: EQ=%d ALTZ=%d UNKNOWN=%d "
+            "(cache_hit=%d cache_miss=%d read=%d workers=%d dt=%.2fs) cache=%s"
+            % (
+                eq_count,
+                altz_count,
+                unknown_count,
+                cache_hits,
+                cache_miss,
+                reads_header,
+                worker_count,
+                duration,
+                cache_label,
+            )
+        )
+        logger.info(summary)
+        if isinstance(messages, list):
+            messages.append(summary)
+
+    def _read_eqmode_from_path(self, path: str) -> tuple[str | None, int | None]:
+        if not path or fits is None:
+            return None, None
+        raw_value: Any = None
+        try:
+            raw_value = fits.getval(path, "EQMODE", ext=0, ignore_missing_end=True)
+        except Exception:
+            try:
+                header = fits.getheader(path, ext=0, ignore_missing_end=True)
+            except Exception:
+                header = None
+            if header is not None:
+                try:
+                    raw_value = header.get("EQMODE")
+                except Exception:
+                    raw_value = None
+        return self._coerce_eqmode_mode(raw_value)
 
     def _compute_auto_groups(
         self,
@@ -2861,6 +3111,8 @@ class FilterQtDialog(QDialog):
             raise RuntimeError("No candidate entries were usable for grouping.")
         if WCS is None and SkyCoord is None:
             raise RuntimeError("Astropy is required to compute WCS-based clusters.")
+
+        self._prefetch_eqmode_for_candidates(candidate_infos, messages)
 
         threshold_override = self._resolve_cluster_threshold_override()
         threshold_heuristic = self._estimate_threshold_from_coords(coord_samples)
