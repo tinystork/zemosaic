@@ -1,23 +1,27 @@
-# Validation checklist (manual)
+# Follow-up checklist
 
-## 1) Vérifier perf log
-- [x] Le log contient "sky_preview_perf: ..." à chaque refresh.
-- [x] Sur gros dataset, on voit clairement collect/build/artists/draw.
+## Code changes verification
+- [ ] zemosaic_worker.py: threshold is now read from cfg key `altaz_alpha_soft_threshold`
+- [ ] value is sanitized (finite + clamped [0..1]) with fallback 1e-3
+- [ ] mask_zero uses `<= hard_threshold` with the new value (no other logic touched)
+- [ ] log line includes threshold value
 
-## 2) Footprints en LineCollection (option C)
-- [x] Quand footprint_radec est disponible, les footprints sont visibles.
-- [x] Le code n’utilise pas Polygon + add_patch dans une boucle.
-- [x] Une seule LineCollection est ajoutée (ou une par couche si séparation explicite).
+- [ ] zemosaic_gui.py: config default added (setdefault altaz_alpha_soft_threshold = 1e-3)
+- [ ] new tk.DoubleVar created and wired
+- [ ] new label + spinbox added to Alt-Az advanced row
+- [ ] spinbox included in `_altaz_inputs` so it gets enabled/disabled properly
+- [ ] run config includes `altaz_alpha_soft_threshold`
 
-## 3) Centres vectorisés
-- [x] Il n’y a plus un scatter par groupe (ou drastiquement moins).
-- [x] Les points restent colorés comme avant (si colorize by group est actif).
+## Translations
+- [ ] Add `altaz_alpha_soft_threshold_label` in EN
+- [ ] Add `altaz_alpha_soft_threshold_label` in FR
+- [ ] (Optional) tooltip key only if tooltips exist in this panel
 
-## 4) Légende
-- [x] Si groups > LEGEND_MAX, pas de legend (pas de freeze).
-- [x] Le hint UI indique que la legend est masquée.
+## Manual test run
+- [ ] Run with threshold=1e-3 => output matches previous behavior
+- [ ] Run with threshold=0.85 => feather/tinted zones are mostly removed (transparent)
+- [ ] Confirm logs include threshold value
+- [ ] Confirm config persists the value (reopen GUI, value is still there)
 
-## 5) Non-régression
-- [x] Petits datasets: rendu OK.
-- [x] Aucun warning Matplotlib nouveau.
-- [x] Pas de crash si footprint_radec absent / incomplet.
+## Notes
+Recommended user value to try first: 0.85 (aggressive cleanup). If it removes too much signal, back off to ~0.5–0.7.

@@ -1,67 +1,90 @@
 # Mission (surgical / no refactor)
-Accélérer le Sky preview dans zemosaic_filter_gui_qt.py en remplaçant le rendu "patch par patch / scatter par groupe"
-par du rendu batché (option C) via LineCollection + scatter vectorisé.
+Add an "Alt-Az alpha soft threshold" parameter in the Advanced panel (GUI) + translations,
+and use it in the lecropper pipeline (worker) to decide which pixels are considered transparent
+when mask2d is returned (i.e., nanize/zeroize threshold on mask2d).
 
-Contexte actuel (à vérifier dans le fichier):
-- Le sky preview est rendu dans _update_preview_plot().
-- Il fait actuellement un loop sur grouped_points et appelle axes.scatter(...) une fois par groupe (potentiellement 100+).
-- Les bounding-box de groupes utilisent déjà LineCollection (bien).
-- Le rectangle de sélection est un unique Rectangle patch (OK, garder tel quel).
+## Why
+Currently zemosaic_worker hard-thresholds mask2d at 1e-3:
+    mask_zero = alpha_mask_norm <= 1e-3
+So feathered / partially transparent zones survive as valid pixels, often carrying ugly
+color casts (magenta/green). We want a user-tunable cutoff (recommended ~0.85) without refactoring.
 
-Objectifs
-1) Option C pour footprints:
-   - Si des entries possèdent footprint_radec (liste de coins RA/DEC), dessiner ces footprints en une seule fois:
-     - construire une liste "segments" (chaque footprint = liste de (ra,dec) fermée),
-     - utiliser matplotlib.collections.LineCollection,
-     - ajouter 1 seule collection via axes.add_collection().
-   - Ne PAS créer de Polygon ni ax.add_patch en boucle.
-   - Appliquer couleur par groupe si disponible (sinon couleur défaut).
+## Scope
+- zemosaic_worker.py: only inside _apply_master_tile_quality_pipeline(), in the block `if mask2d is not None:`
+- zemosaic_gui.py (Tk GUI): add a new setting in the Alt-Az Advanced row
+- locales: update translations for EN/FR (json files)
+NO other refactors, NO algorithm rewrite.
 
-2) Scatter des centres: vectoriser
-   - Au lieu de scatter par groupe, faire un seul axes.scatter avec:
-     - x array (RA), y array (DEC),
-     - un array de couleurs (par point) basé sur group_idx,
-     - alpha, size identiques au rendu actuel.
-   - (Conserver la possibilité de désactiver le "colorize by group" si l’option existe déjà, sinon garder comportement actuel.)
+## New config key
+- `altaz_alpha_soft_threshold` (float in [0..1])
+Meaning:
+- Pixels with mask2d <= threshold are treated as fully transparent (NaN or 0 depending on altaz_nanize).
+Recommended typical value: 0.85.
+Backward compatibility: if key missing, default keeps old behavior (1e-3).
 
-3) Légende: garde-fou
-   - Ne pas afficher la légende si num_groups > LEGEND_MAX (ex 30).
-   - Si > LEGEND_MAX, afficher un hint dans _preview_hint_label: "Legend hidden (too many groups)".
+## Implementation details
 
-4) Instrumentation perf
-   - Ajouter un timer monotonic au début/fin de _update_preview_plot() et aux étapes:
-     - collect_points_dt (appel _collect_preview_points),
-     - build_arrays_dt (construction arrays/segments),
-     - add_artists_dt (add_collection/scatter),
-     - draw_dt (canvas draw),
-     - redraw_count (si tu peux compter les appels _safe_draw_preview_canvas).
-   - Logguer en logger.info et dans activity log:
-     "sky_preview_perf: N=%d groups=%d collect=%.3fs build=%.3fs artists=%.3fs draw=%.3fs"
-   - Ne pas spammer: un log par refresh.
+### 1) Worker: zemosaic_worker.py
+In `_apply_master_tile_quality_pipeline()`:
+- read cfg value:
+    az_alpha_soft = float(cfg.get("altaz_alpha_soft_threshold", 1e-3))
+- sanitize:
+    - if NaN/inf -> fallback 1e-3
+    - clamp into [0.0, 1.0]
+- replace:
+    hard_threshold = 1e-3
+  with:
+    hard_threshold = az_alpha_soft
+- keep rest identical
+- extend existing log line to include the threshold value (keep existing message, just append `threshold=%g`).
 
-Contraintes
-- Modifier uniquement zemosaic_filter_gui_qt.py
-- Ne pas changer la logique de clustering, seulement l’affichage.
-- Ne pas introduire de dépendances externes.
-- Compat Windows/Qt: ne pas bloquer l’UI plus que nécessaire.
+### 2) GUI: zemosaic_gui.py (Advanced panel)
+Add:
+- self.config.setdefault("altaz_alpha_soft_threshold", 1e-3)  (to preserve current default behavior)
+- `self.altaz_alpha_soft_threshold_var = tk.DoubleVar(... value=self.config.get("altaz_alpha_soft_threshold", 1e-3))`
 
-Détails techniques (rendu LineCollection footprints)
-- Importer LineCollection si pas déjà importé.
-- Pour chaque entry/point, si entry.footprint_radec existe:
-  - récupérer la séquence de (ra, dec),
-  - fermer le contour (répéter le premier point à la fin si nécessaire),
-  - ajouter à segments.
-- Couleurs:
-  - si group_idx est int: couleur via _resolve_group_color(group_idx),
-  - sinon couleur par défaut.
-- Créer:
-  coll = LineCollection(segments, colors=colors, linewidths=1.0, alpha=0.8, zorder=3)
-  axes.add_collection(coll)
+In the Alt-Az advanced row (where margin/decay/nanize are):
+- add a label + spinbox after "Alt-Az decay" and before/near "Alt-Az → NaN"
+- Spinbox range: 0.0 .. 1.0 step 0.01, width ~6
+- store widgets:
+    self.translatable_widgets["altaz_alpha_soft_threshold_label"] = that label
+- include the spinbox in `_altaz_inputs` so it is enabled/disabled with Alt-Az toggle
 
-Scatter vectorisé
-- Construire ra_list, dec_list, color_list (par point).
-- Faire un seul axes.scatter(ra_list, dec_list, c=color_list, s=24, alpha=0.85, edgecolors="none")
+When building the run config dict (the place where altaz_cleanup_enabled/margin/decay/nanize are injected):
+- include:
+    "altaz_alpha_soft_threshold": float(self.altaz_alpha_soft_threshold_var.get())
 
-Livrable
-- Diff git propre.
-- Le rendu doit rester correct (au minimum équivalent visuellement) et beaucoup plus rapide sur 5000 entrées.
+Also ensure the value is persisted in self.config when launching / saving config.
+
+### 3) Translations
+Add translation keys for EN + FR:
+- `altaz_alpha_soft_threshold_label`
+Suggested text:
+- EN: "Alt-Az alpha cutoff"
+- FR: "Seuil alpha Alt-Az"
+
+If you have tooltips system already, optionally add:
+- `altaz_alpha_soft_threshold_tooltip`
+EN: "Pixels with alpha below this value are treated as transparent (NaN/0). Try 0.85."
+FR: "Pixels avec alpha inférieur à cette valeur sont considérés transparents (NaN/0). Essayez 0.85."
+(Only if tooltips are already used in this panel; otherwise skip to stay surgical.)
+
+## Files to edit
+- zemosaic_worker.py
+- zemosaic_gui.py
+- locales/en.json (or equivalent)
+- locales/fr.json (or equivalent)
+
+## Test plan (manual)
+1) Run a small mosaic with Alt-Az cleanup enabled + mask2d path active.
+2) Baseline: threshold=1e-3 -> observe tinted feather zones may remain.
+3) Set threshold to 0.85 in Advanced.
+4) Re-run:
+   - logs show MT_PIPELINE altaz_cleanup applied ... threshold=0.85
+   - tinted border zones should become transparent (NaN/0) and stop polluting the mosaic.
+
+## Acceptance criteria
+- New control appears in Advanced panel, translated in EN/FR
+- Default behavior unchanged when key missing (1e-3)
+- Worker uses the configured threshold for mask2d -> nanize/zeroize
+- No other behavior changes / refactors
