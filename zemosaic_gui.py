@@ -351,6 +351,7 @@ class ZeMosaicGUI:
             _synchronize_legacy_gpu_flags(self.config)
 
         self.config.setdefault("altaz_nanize", True)
+        self.config.setdefault("altaz_alpha_soft_threshold", 1e-3)
 
         for key in (
             "astap_executable_path",
@@ -680,6 +681,10 @@ class ZeMosaicGUI:
         self.altaz_nanize_var = tk.BooleanVar(
             master=self.root,
             value=self.config.get("altaz_nanize", True),
+        )
+        self.altaz_alpha_soft_threshold_var = tk.DoubleVar(
+            master=self.root,
+            value=self.config.get("altaz_alpha_soft_threshold", 1e-3),
         )
         self.use_memmap_var = tk.BooleanVar(master=self.root, value=self.config.get("coadd_use_memmap", False))
         try:
@@ -1493,7 +1498,7 @@ class ZeMosaicGUI:
 
         altaz_row = ttk.Frame(self.quality_crop_advanced_frame)
         altaz_row.grid(row=1, column=0, sticky="ew")
-        for col_idx in range(6):
+        for col_idx in range(8):
             altaz_row.columnconfigure(col_idx, weight=0)
 
         self.altaz_cleanup_check = ttk.Checkbutton(
@@ -1533,17 +1538,32 @@ class ZeMosaicGUI:
         )
         self.altaz_decay_spinbox.grid(row=0, column=4, padx=5, pady=(6, 3), sticky="w")
 
+        altaz_alpha_soft_threshold_label = ttk.Label(altaz_row, text="")
+        altaz_alpha_soft_threshold_label.grid(row=0, column=5, padx=5, pady=(6, 3), sticky="w")
+        self.translatable_widgets["altaz_alpha_soft_threshold_label"] = altaz_alpha_soft_threshold_label
+        self.altaz_alpha_soft_threshold_spinbox = ttk.Spinbox(
+            altaz_row,
+            from_=0.0,
+            to=1.0,
+            increment=0.01,
+            format="%.2f",
+            textvariable=self.altaz_alpha_soft_threshold_var,
+            width=6,
+        )
+        self.altaz_alpha_soft_threshold_spinbox.grid(row=0, column=6, padx=5, pady=(6, 3), sticky="w")
+
         self.altaz_nan_check = ttk.Checkbutton(
             altaz_row,
             text=self._tr("altaz_nanize_label", "Alt-Az → NaN"),
             variable=self.altaz_nanize_var,
         )
-        self.altaz_nan_check.grid(row=0, column=5, padx=5, pady=(6, 3), sticky="w")
+        self.altaz_nan_check.grid(row=0, column=7, padx=5, pady=(6, 3), sticky="w")
         self.translatable_widgets["altaz_nanize_label"] = self.altaz_nan_check
 
         self._altaz_inputs = [
             self.altaz_margin_spinbox,
             self.altaz_decay_spinbox,
+            self.altaz_alpha_soft_threshold_spinbox,
             self.altaz_nan_check,
         ]
 
@@ -2739,6 +2759,7 @@ class ZeMosaicGUI:
                         "altaz_cleanup_enabled": bool(self.altaz_cleanup_enabled_var.get()),
                         "altaz_margin_percent": float(self.altaz_margin_percent_var.get()),
                         "altaz_decay": float(self.altaz_decay_var.get()),
+                        "altaz_alpha_soft_threshold": float(self.altaz_alpha_soft_threshold_var.get()),
                         "altaz_nanize": bool(self.altaz_nanize_var.get()),
                         "quality_gate_enabled": bool(self.quality_gate_enabled_var.get()),
                         "quality_gate_threshold": float(self.quality_gate_threshold_var.get()),
@@ -4106,6 +4127,16 @@ class ZeMosaicGUI:
             except Exception:
                 altaz_decay_val = float(self.config.get("altaz_decay", 0.15))
                 self.altaz_decay_var.set(altaz_decay_val)
+            try:
+                altaz_alpha_soft_threshold_val = float(self.altaz_alpha_soft_threshold_var.get())
+            except Exception:
+                altaz_alpha_soft_threshold_val = float(self.config.get("altaz_alpha_soft_threshold", 1e-3))
+                self.altaz_alpha_soft_threshold_var.set(altaz_alpha_soft_threshold_val)
+            altaz_alpha_soft_threshold_val = max(0.0, min(1.0, altaz_alpha_soft_threshold_val))
+            try:
+                self.altaz_alpha_soft_threshold_var.set(altaz_alpha_soft_threshold_val)
+            except Exception:
+                pass
             altaz_nanize_val = bool(self.altaz_nanize_var.get())
             quality_gate_enabled_val = bool(self.quality_gate_enabled_var.get())
             try:
@@ -4259,6 +4290,7 @@ class ZeMosaicGUI:
                             "altaz_cleanup_enabled": bool(self.altaz_cleanup_enabled_var.get()),
                             "altaz_margin_percent": float(self.altaz_margin_percent_var.get()),
                             "altaz_decay": float(self.altaz_decay_var.get()),
+                            "altaz_alpha_soft_threshold": float(self.altaz_alpha_soft_threshold_var.get()),
                             "altaz_nanize": bool(self.altaz_nanize_var.get()),
                             "astap_executable_path": astap_exe,
                             "astap_data_directory_path": astap_data,
@@ -4587,6 +4619,7 @@ class ZeMosaicGUI:
         self.config["altaz_cleanup_enabled"] = bool(altaz_cleanup_enabled_val)
         self.config["altaz_margin_percent"] = float(altaz_margin_val)
         self.config["altaz_decay"] = float(altaz_decay_val)
+        self.config["altaz_alpha_soft_threshold"] = float(altaz_alpha_soft_threshold_val)
         self.config["altaz_nanize"] = bool(altaz_nanize_val)
 
         inter_master_enable_val = bool(self.inter_master_merge_var.get())
@@ -4700,6 +4733,7 @@ class ZeMosaicGUI:
             bool(altaz_cleanup_enabled_val),
             float(altaz_margin_val),
             float(altaz_decay_val),
+            float(altaz_alpha_soft_threshold_val),
             bool(altaz_nanize_val),
             bool(quality_gate_enabled_val),
             float(quality_gate_threshold_val),
