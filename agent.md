@@ -10,13 +10,13 @@ So feathered / partially transparent zones survive as valid pixels, often carryi
 color casts (magenta/green). We want a user-tunable cutoff (recommended ~0.85) without refactoring.
 
 ## Scope
-- zemosaic_worker.py: only inside _apply_master_tile_quality_pipeline(), in the block `if mask2d is not None:`
-- zemosaic_gui.py (Tk GUI): add a new setting in the Alt-Az Advanced row
-- locales: update translations for EN/FR (json files)
+- [x] zemosaic_worker.py: only inside _apply_master_tile_quality_pipeline(), in the block `if mask2d is not None:`
+- [x] zemosaic_gui.py (Tk GUI): add a new setting in the Alt-Az Advanced row
+- [x] locales: update translations for EN/FR (json files)
 NO other refactors, NO algorithm rewrite.
 
 ## New config key
-- `altaz_alpha_soft_threshold` (float in [0..1])
+- [x] `altaz_alpha_soft_threshold` (float in [0..1])
 Meaning:
 - Pixels with mask2d <= threshold are treated as fully transparent (NaN or 0 depending on altaz_nanize).
 Recommended typical value: 0.85.
@@ -26,39 +26,39 @@ Backward compatibility: if key missing, default keeps old behavior (1e-3).
 
 ### 1) Worker: zemosaic_worker.py
 In `_apply_master_tile_quality_pipeline()`:
-- read cfg value:
+- [x] read cfg value:
     az_alpha_soft = float(cfg.get("altaz_alpha_soft_threshold", 1e-3))
-- sanitize:
+- [x] sanitize:
     - if NaN/inf -> fallback 1e-3
     - clamp into [0.0, 1.0]
-- replace:
+- [x] replace:
     hard_threshold = 1e-3
   with:
     hard_threshold = az_alpha_soft
-- keep rest identical
-- extend existing log line to include the threshold value (keep existing message, just append `threshold=%g`).
+- [x] keep rest identical
+- [x] extend existing log line to include the threshold value (keep existing message, just append `threshold=%g`).
 
 ### 2) GUI: zemosaic_gui.py (Advanced panel)
 Add:
-- self.config.setdefault("altaz_alpha_soft_threshold", 1e-3)  (to preserve current default behavior)
-- `self.altaz_alpha_soft_threshold_var = tk.DoubleVar(... value=self.config.get("altaz_alpha_soft_threshold", 1e-3))`
+- [x] self.config.setdefault("altaz_alpha_soft_threshold", 1e-3)  (to preserve current default behavior)
+- [x] `self.altaz_alpha_soft_threshold_var = tk.DoubleVar(... value=self.config.get("altaz_alpha_soft_threshold", 1e-3))`
 
 In the Alt-Az advanced row (where margin/decay/nanize are):
-- add a label + spinbox after "Alt-Az decay" and before/near "Alt-Az → NaN"
-- Spinbox range: 0.0 .. 1.0 step 0.01, width ~6
-- store widgets:
+- [x] add a label + spinbox after "Alt-Az decay" and before/near "Alt-Az → NaN"
+- [x] Spinbox range: 0.0 .. 1.0 step 0.01, width ~6
+- [x] store widgets:
     self.translatable_widgets["altaz_alpha_soft_threshold_label"] = that label
-- include the spinbox in `_altaz_inputs` so it is enabled/disabled with Alt-Az toggle
+- [x] include the spinbox in `_altaz_inputs` so it is enabled/disabled with Alt-Az toggle
 
 When building the run config dict (the place where altaz_cleanup_enabled/margin/decay/nanize are injected):
-- include:
+- [x] include:
     "altaz_alpha_soft_threshold": float(self.altaz_alpha_soft_threshold_var.get())
 
-Also ensure the value is persisted in self.config when launching / saving config.
+- [x] Also ensure the value is persisted in self.config when launching / saving config.
 
 ### 3) Translations
 Add translation keys for EN + FR:
-- `altaz_alpha_soft_threshold_label`
+- [x] `altaz_alpha_soft_threshold_label`
 Suggested text:
 - EN: "Alt-Az alpha cutoff"
 - FR: "Seuil alpha Alt-Az"
@@ -70,10 +70,10 @@ FR: "Pixels avec alpha inférieur à cette valeur sont considérés transparents
 (Only if tooltips are already used in this panel; otherwise skip to stay surgical.)
 
 ## Files to edit
-- zemosaic_worker.py
-- zemosaic_gui.py
-- locales/en.json (or equivalent)
-- locales/fr.json (or equivalent)
+- [x] zemosaic_worker.py
+- [x] zemosaic_gui.py
+- [x] locales/en.json (or equivalent)
+- [x] locales/fr.json (or equivalent)
 
 ## Test plan (manual)
 1) Run a small mosaic with Alt-Az cleanup enabled + mask2d path active.
@@ -84,7 +84,7 @@ FR: "Pixels avec alpha inférieur à cette valeur sont considérés transparents
    - tinted border zones should become transparent (NaN/0) and stop polluting the mosaic.
 
 ## Acceptance criteria
-- New control appears in Advanced panel, translated in EN/FR
-- Default behavior unchanged when key missing (1e-3)
-- Worker uses the configured threshold for mask2d -> nanize/zeroize
-- No other behavior changes / refactors
+- [x] New control appears in Advanced panel, translated in EN/FR
+- [x] Default behavior unchanged when key missing (1e-3)
+- [x] Worker uses the configured threshold for mask2d -> nanize/zeroize
+- [x] No other behavior changes / refactors

@@ -1,72 +1,909 @@
-diff --git a/zemosaic_filter_gui_qt.py b/zemosaic_filter_gui_qt.py
-index 0000000..0000000 100644
---- a/zemosaic_filter_gui_qt.py
-+++ b/zemosaic_filter_gui_qt.py
-@@ -3474,6 +3474,7 @@ class ZeMosaicFilterGuiQt(...):
-     def _build_auto_group_records(
-         self,
-         groups: list[list[dict[str, Any]]],
-         path_map: dict[str, _NormalizedItem],
-     ) -> list[dict[str, Any]]:
-         records: list[dict[str, Any]] = []
-         for group in groups or []:
-             if not group:
-                 continue
-             coords = self._gather_group_coordinates(group, path_map)
-             center = self._compute_center_from_coords(coords)
-             dispersion = self._compute_dispersion_for_coords(coords)
-+            eqmode_sig = self._group_eqmode_signature(group)
-             records.append(
-                 {
-                     "entries": list(group),
-                     "coords": coords,
-                     "center": center,
-                     "size": len(group),
-                     "dispersion": dispersion,
-+                    "eqmode_sig": eqmode_sig,
+diff --git a/agent.md b/agent.md
+index 2d790770796332691c4c9a28d1f3df0211ffdda4..67eb94a60994b78dc2152b7d9c551e5f7cf7df7c 100644
+--- a/agent.md
++++ b/agent.md
+@@ -1,90 +1,90 @@
+ # Mission (surgical / no refactor)
+ Add an "Alt-Az alpha soft threshold" parameter in the Advanced panel (GUI) + translations,
+ and use it in the lecropper pipeline (worker) to decide which pixels are considered transparent
+ when mask2d is returned (i.e., nanize/zeroize threshold on mask2d).
+ 
+ ## Why
+ Currently zemosaic_worker hard-thresholds mask2d at 1e-3:
+     mask_zero = alpha_mask_norm <= 1e-3
+ So feathered / partially transparent zones survive as valid pixels, often carrying ugly
+ color casts (magenta/green). We want a user-tunable cutoff (recommended ~0.85) without refactoring.
+ 
+ ## Scope
+-- zemosaic_worker.py: only inside _apply_master_tile_quality_pipeline(), in the block `if mask2d is not None:`
+-- zemosaic_gui.py (Tk GUI): add a new setting in the Alt-Az Advanced row
+-- locales: update translations for EN/FR (json files)
++- [x] zemosaic_worker.py: only inside _apply_master_tile_quality_pipeline(), in the block `if mask2d is not None:`
++- [x] zemosaic_gui.py (Tk GUI): add a new setting in the Alt-Az Advanced row
++- [x] locales: update translations for EN/FR (json files)
+ NO other refactors, NO algorithm rewrite.
+ 
+ ## New config key
+-- `altaz_alpha_soft_threshold` (float in [0..1])
++- [x] `altaz_alpha_soft_threshold` (float in [0..1])
+ Meaning:
+ - Pixels with mask2d <= threshold are treated as fully transparent (NaN or 0 depending on altaz_nanize).
+ Recommended typical value: 0.85.
+ Backward compatibility: if key missing, default keeps old behavior (1e-3).
+ 
+ ## Implementation details
+ 
+ ### 1) Worker: zemosaic_worker.py
+ In `_apply_master_tile_quality_pipeline()`:
+-- read cfg value:
++- [x] read cfg value:
+     az_alpha_soft = float(cfg.get("altaz_alpha_soft_threshold", 1e-3))
+-- sanitize:
++- [x] sanitize:
+     - if NaN/inf -> fallback 1e-3
+     - clamp into [0.0, 1.0]
+-- replace:
++- [x] replace:
+     hard_threshold = 1e-3
+   with:
+     hard_threshold = az_alpha_soft
+-- keep rest identical
+-- extend existing log line to include the threshold value (keep existing message, just append `threshold=%g`).
++- [x] keep rest identical
++- [x] extend existing log line to include the threshold value (keep existing message, just append `threshold=%g`).
+ 
+ ### 2) GUI: zemosaic_gui.py (Advanced panel)
+ Add:
+-- self.config.setdefault("altaz_alpha_soft_threshold", 1e-3)  (to preserve current default behavior)
+-- `self.altaz_alpha_soft_threshold_var = tk.DoubleVar(... value=self.config.get("altaz_alpha_soft_threshold", 1e-3))`
++- [x] self.config.setdefault("altaz_alpha_soft_threshold", 1e-3)  (to preserve current default behavior)
++- [x] `self.altaz_alpha_soft_threshold_var = tk.DoubleVar(... value=self.config.get("altaz_alpha_soft_threshold", 1e-3))`
+ 
+ In the Alt-Az advanced row (where margin/decay/nanize are):
+-- add a label + spinbox after "Alt-Az decay" and before/near "Alt-Az → NaN"
+-- Spinbox range: 0.0 .. 1.0 step 0.01, width ~6
+-- store widgets:
++- [x] add a label + spinbox after "Alt-Az decay" and before/near "Alt-Az → NaN"
++- [x] Spinbox range: 0.0 .. 1.0 step 0.01, width ~6
++- [x] store widgets:
+     self.translatable_widgets["altaz_alpha_soft_threshold_label"] = that label
+-- include the spinbox in `_altaz_inputs` so it is enabled/disabled with Alt-Az toggle
++- [x] include the spinbox in `_altaz_inputs` so it is enabled/disabled with Alt-Az toggle
+ 
+ When building the run config dict (the place where altaz_cleanup_enabled/margin/decay/nanize are injected):
+-- include:
++- [x] include:
+     "altaz_alpha_soft_threshold": float(self.altaz_alpha_soft_threshold_var.get())
+ 
+-Also ensure the value is persisted in self.config when launching / saving config.
++- [x] Also ensure the value is persisted in self.config when launching / saving config.
+ 
+ ### 3) Translations
+ Add translation keys for EN + FR:
+-- `altaz_alpha_soft_threshold_label`
++- [x] `altaz_alpha_soft_threshold_label`
+ Suggested text:
+ - EN: "Alt-Az alpha cutoff"
+ - FR: "Seuil alpha Alt-Az"
+ 
+ If you have tooltips system already, optionally add:
+ - `altaz_alpha_soft_threshold_tooltip`
+ EN: "Pixels with alpha below this value are treated as transparent (NaN/0). Try 0.85."
+ FR: "Pixels avec alpha inférieur à cette valeur sont considérés transparents (NaN/0). Essayez 0.85."
+ (Only if tooltips are already used in this panel; otherwise skip to stay surgical.)
+ 
+ ## Files to edit
+-- zemosaic_worker.py
+-- zemosaic_gui.py
+-- locales/en.json (or equivalent)
+-- locales/fr.json (or equivalent)
++- [x] zemosaic_worker.py
++- [x] zemosaic_gui.py
++- [x] locales/en.json (or equivalent)
++- [x] locales/fr.json (or equivalent)
+ 
+ ## Test plan (manual)
+ 1) Run a small mosaic with Alt-Az cleanup enabled + mask2d path active.
+ 2) Baseline: threshold=1e-3 -> observe tinted feather zones may remain.
+ 3) Set threshold to 0.85 in Advanced.
+ 4) Re-run:
+    - logs show MT_PIPELINE altaz_cleanup applied ... threshold=0.85
+    - tinted border zones should become transparent (NaN/0) and stop polluting the mosaic.
+ 
+ ## Acceptance criteria
+-- New control appears in Advanced panel, translated in EN/FR
+-- Default behavior unchanged when key missing (1e-3)
+-- Worker uses the configured threshold for mask2d -> nanize/zeroize
+-- No other behavior changes / refactors
++- [x] New control appears in Advanced panel, translated in EN/FR
++- [x] Default behavior unchanged when key missing (1e-3)
++- [x] Worker uses the configured threshold for mask2d -> nanize/zeroize
++- [x] No other behavior changes / refactors
+diff --git a/followup.md b/followup.md
+index f9f704653ad67aa58f29a7bf026eb1ace004fcf7..22d25d4f48ac5bb8fe300d450121c2f9c4e2994a 100644
+--- a/followup.md
++++ b/followup.md
+@@ -1,27 +1,27 @@
+ # Follow-up checklist
+ 
+ ## Code changes verification
+-- [ ] zemosaic_worker.py: threshold is now read from cfg key `altaz_alpha_soft_threshold`
+-- [ ] value is sanitized (finite + clamped [0..1]) with fallback 1e-3
+-- [ ] mask_zero uses `<= hard_threshold` with the new value (no other logic touched)
+-- [ ] log line includes threshold value
++- [x] zemosaic_worker.py: threshold is now read from cfg key `altaz_alpha_soft_threshold`
++- [x] value is sanitized (finite + clamped [0..1]) with fallback 1e-3
++- [x] mask_zero uses `<= hard_threshold` with the new value (no other logic touched)
++- [x] log line includes threshold value
+ 
+-- [ ] zemosaic_gui.py: config default added (setdefault altaz_alpha_soft_threshold = 1e-3)
+-- [ ] new tk.DoubleVar created and wired
+-- [ ] new label + spinbox added to Alt-Az advanced row
+-- [ ] spinbox included in `_altaz_inputs` so it gets enabled/disabled properly
+-- [ ] run config includes `altaz_alpha_soft_threshold`
++- [x] zemosaic_gui.py: config default added (setdefault altaz_alpha_soft_threshold = 1e-3)
++- [x] new tk.DoubleVar created and wired
++- [x] new label + spinbox added to Alt-Az advanced row
++- [x] spinbox included in `_altaz_inputs` so it gets enabled/disabled properly
++- [x] run config includes `altaz_alpha_soft_threshold`
+ 
+ ## Translations
+-- [ ] Add `altaz_alpha_soft_threshold_label` in EN
+-- [ ] Add `altaz_alpha_soft_threshold_label` in FR
++- [x] Add `altaz_alpha_soft_threshold_label` in EN
++- [x] Add `altaz_alpha_soft_threshold_label` in FR
+ - [ ] (Optional) tooltip key only if tooltips exist in this panel
+ 
+ ## Manual test run
+ - [ ] Run with threshold=1e-3 => output matches previous behavior
+ - [ ] Run with threshold=0.85 => feather/tinted zones are mostly removed (transparent)
+ - [ ] Confirm logs include threshold value
+ - [ ] Confirm config persists the value (reopen GUI, value is still there)
+ 
+ ## Notes
+ Recommended user value to try first: 0.85 (aggressive cleanup). If it removes too much signal, back off to ~0.5–0.7.
+diff --git a/locales/en.json b/locales/en.json
+index 631069e8e38ddcc397474b3d4a01d647a8aab0e9..a8fd91c9b9e5f63e8fb430959ef7c19e4e20f414 100644
+--- a/locales/en.json
++++ b/locales/en.json
+@@ -60,50 +60,51 @@
+     "crop_options_frame_title": "Master Tile Cropping Options",
+     "mt_crop_and_reject_frame_title": "Master Tile Cropping and Rejection Options",
+     "mt_quality_gate_group": "Master Tile Quality Gate (ZeQualityMT)",
+     "mt_quality_gate_enable": "Enable quality-based rejection",
+     "mt_quality_gate_threshold": "Threshold",
+     "mt_quality_gate_edge_band": "Edge band (px)",
+     "mt_quality_gate_k_sigma": "k-sigma",
+     "mt_quality_gate_erode": "Erode (px)",
+     "mt_quality_gate_move_rejects": "Move rejects to folder",
+     "mt_quality_gate_tip": "Reject weak or edge-dominated tiles using ZeQualityMT after each master tile is built.",
+     "mt_quality_gate_result": "ZeQualityMT: tile {tile_id} score={score} thr={threshold} → {status}",
+     "mt_quality_gate_moved": "ZeQualityMT: tile {tile_id} moved to {dst}",
+     "mt_quality_gate_unavailable": "ZeQualityMT unavailable ({error}); continuing without quality gate.",
+     "apply_master_tile_crop_label": "Crop Master Tile Edges:",
+     "master_tile_crop_percent_label": "Crop Percentage per Side (0-25%):",
+     "master_tile_crop_percent_note": "(0.0 = no crop)",
+     "quality_crop_toggle_label": "Quality-based crop (signal)",
+     "quality_crop_advanced": "Advanced",
+     "quality_crop_band_label": "Band (px)",
+     "quality_crop_ks_label": "k·sigma",
+     "quality_crop_margin_label": "Margin (px)",
+     "quality_crop_min_run_label": "Min run",
+     "altaz_cleanup_toggle_label": "Alt-Az cleanup",
+     "altaz_margin_percent_label": "AltAz margin %",
+     "altaz_decay_label": "AltAz decay",
++    "altaz_alpha_soft_threshold_label": "Alt-Az alpha cutoff",
+     "altaz_nanize_label": "Alt-Az → NaN",
+     "cfg_inter_master_enable": "Inter-Master merge (Phase 4.5)",
+     "cfg_inter_master_overlap": "Overlap ≥ (%)",
+     "cfg_inter_master_method": "Method",
+     "qt_group_phase45": "Phase 4.5 / Super-tiles",
+     "qt_checkbox_phase45_enable": "Enable inter-master merge",
+     "qt_field_phase45_overlap": "Overlap ≥ (%)",
+     "qt_field_phase45_method": "Stack method",
+     "qt_field_phase45_min_group": "Minimum group size",
+     "qt_field_phase45_max_group": "Maximum group size",
+     "qt_field_phase45_memmap": "Memmap policy",
+     "qt_field_phase45_local_scale": "Local scale",
+     "qt_field_phase45_intragroup": "Intra-group photometry",
+     "qt_field_phase45_intersuper": "Inter-super photometry",
+     "qt_field_phase45_clip_sigma": "Photometry clip σ",
+     "qt_phase45_method_winsor": "Winsorized",
+     "qt_phase45_method_mean": "Mean",
+     "qt_phase45_method_median": "Median",
+     "qt_phase45_memmap_auto": "Auto",
+     "qt_phase45_memmap_always": "Always",
+     "qt_phase45_memmap_never": "Never",
+     "qt_phase45_scale_final": "Final scale",
+     "qt_phase45_scale_native": "Native scale",
+     "qt_phase45_overlay_title": "Phase 4.5 overview",
+     "qt_phase45_overlay_toggle": "Show overlay",
+diff --git a/locales/fr.json b/locales/fr.json
+index 064d629515ff1cc3d1b582fad76ef50064f118a6..a050e82ef66b517d8467d5158860435f997de08f 100644
+--- a/locales/fr.json
++++ b/locales/fr.json
+@@ -63,50 +63,51 @@
+     "crop_options_frame_title": "Options de Rognage des Tuiles Maîtresses",
+     "mt_crop_and_reject_frame_title": "Options de rognage et rejet des Master Tiles",
+     "mt_quality_gate_group": "Filtre qualité des Master Tiles (ZeQualityMT)",
+     "mt_quality_gate_enable": "Activer le rejet basé sur la qualité",
+     "mt_quality_gate_threshold": "Seuil",
+     "mt_quality_gate_edge_band": "Bande de bord (px)",
+     "mt_quality_gate_k_sigma": "k-sigma",
+     "mt_quality_gate_erode": "Érosion (px)",
+     "mt_quality_gate_move_rejects": "Déplacer les rejets dans un dossier",
+     "mt_quality_gate_tip": "Rejeter les tuiles faibles ou dominées par le bord avec ZeQualityMT après la création de chaque Master Tile.",
+     "mt_quality_gate_result": "ZeQualityMT : tuile {tile_id} score={score} thr={threshold} → {status}",
+     "mt_quality_gate_moved": "ZeQualityMT : tuile {tile_id} déplacée vers {dst}",
+     "mt_quality_gate_unavailable": "ZeQualityMT indisponible ({error}) ; poursuite sans filtre qualité.",
+     "apply_master_tile_crop_label": "Rogner les Bords des Tuiles Maîtresses :",
+     "master_tile_crop_percent_label": "Pourcentage de Rognage par Côté (0-25%) :",
+     "master_tile_crop_percent_note": "(0.0 = pas de rognage)",
+     "quality_crop_toggle_label": "Rognage qualité (signal)",
+     "quality_crop_advanced": "Avancé",
+     "quality_crop_band_label": "Bande (px)",
+     "quality_crop_ks_label": "k·sigma",
+     "quality_crop_margin_label": "Marge (px)",
+     "quality_crop_min_run_label": "Min run",
+     "altaz_cleanup_toggle_label": "Nettoyage Alt-Az",
+     "altaz_margin_percent_label": "Marge AltAz %",
+     "altaz_decay_label": "Décroissance AltAz",
++    "altaz_alpha_soft_threshold_label": "Seuil alpha Alt-Az",
+     "altaz_nanize_label": "Alt-Az → NaN",
+     "cfg_inter_master_enable": "Fusion inter-maîtres (Phase 4.5)",
+     "cfg_inter_master_overlap": "Recouvrement ≥ (%)",
+     "cfg_inter_master_method": "Méthode",
+     "qt_group_phase45": "Phase 4.5 / Super-tuiles",
+     "qt_checkbox_phase45_enable": "Activer la fusion inter-maîtres",
+     "qt_field_phase45_overlap": "Recouvrement ≥ (%)",
+     "qt_field_phase45_method": "Méthode d'empilement",
+     "qt_field_phase45_min_group": "Taille minimale du groupe",
+     "qt_field_phase45_max_group": "Taille maximale du groupe",
+     "qt_field_phase45_memmap": "Politique memmap",
+     "qt_field_phase45_local_scale": "Échelle locale",
+     "qt_field_phase45_intragroup": "Photométrie intra-groupe",
+     "qt_field_phase45_intersuper": "Photométrie inter-super",
+     "qt_field_phase45_clip_sigma": "Clip σ photométrie",
+     "qt_phase45_method_winsor": "Winsorisé",
+     "qt_phase45_method_mean": "Moyenne",
+     "qt_phase45_method_median": "Médiane",
+     "qt_phase45_memmap_auto": "Auto",
+     "qt_phase45_memmap_always": "Toujours",
+     "qt_phase45_memmap_never": "Jamais",
+     "qt_phase45_scale_final": "Échelle finale",
+     "qt_phase45_scale_native": "Échelle native",
+     "qt_phase45_overlay_title": "Phase 4.5 – Aperçu",
+     "qt_phase45_overlay_toggle": "Afficher la superposition",
+diff --git a/zemosaic_gui.py b/zemosaic_gui.py
+index 2ec78aba9ee0e1b139edca5ba241a3eab489584a..7fb35c9051dd928866bad30e796b910effa6e262 100644
+--- a/zemosaic_gui.py
++++ b/zemosaic_gui.py
+@@ -329,50 +329,51 @@ class ZeMosaicGUI:
+                 "stacking_kappa_high": 3.0,
+                 "stacking_winsor_limits": "0.05,0.05",
+                 "stacking_final_combine_method": "mean",
+                 "poststack_equalize_rgb": True,
+                 # Logging
+                 "logging_level": "INFO",
+                 "apply_radial_weight": False,
+                 "radial_feather_fraction": 0.8,
+                 "radial_shape_power": 2.0,
+                 "min_radial_weight_floor": 0.0, # Ajouté lors du test du plancher radial
+                 "final_assembly_method": "reproject_coadd",
+                 "num_processing_workers": 0, # 0 pour auto, anciennement -1
+                 # Prétraitement GPU (facultatif) : suppression du gradient de fond
+                 # DÉSACTIVÉE par défaut pour conserver le rendu antérieur
+                 "preprocess_remove_background_gpu": True,
+                 "preprocess_background_sigma": 24.0,
+                 # Valeur par défaut alignée avec le worker (0.05°)
+                 "cluster_panel_threshold": 0.05,
+                 "cluster_target_groups": 0,
+                 "cluster_orientation_split_deg": 0.0
+             }
+ 
+             _synchronize_legacy_gpu_flags(self.config)
+ 
+         self.config.setdefault("altaz_nanize", True)
++        self.config.setdefault("altaz_alpha_soft_threshold", 1e-3)
+ 
+         for key in (
+             "astap_executable_path",
+             "astap_data_directory_path",
+             "coadd_memmap_dir",
+             "gpu_selector",
+         ):
+             value = self.config.get(key)
+             if isinstance(value, str) and value:
+                 expanded = _expand_to_path(value)
+                 if expanded:
+                     self.config[key] = str(expanded)
+ 
+         # Phase 4.5 (inter-master merge) stays in the codebase but must not be user-activable for this release.
+         # Force the flag off regardless of persisted config so the worker never receives an enabled state.
+         self.config["inter_master_merge_enable"] = False
+ 
+         # --- GPU Detection helper ---
+         def _detect_gpus():
+             """Return a list of detected GPUs as ``(display_name, index)`` tuples.
+ 
+             Detection tries multiple methods so it works on Windows, Linux and
+             macOS without requiring the optional ``wmi`` module.
+             """
+ 
+@@ -659,50 +660,54 @@ class ZeMosaicGUI:
+             master=self.root,
+             value=int(self.config.get("quality_gate_erode_px", 3)),
+         )
+         self.quality_gate_move_rejects_var = tk.BooleanVar(
+             master=self.root,
+             value=bool(self.config.get("quality_gate_move_rejects", True)),
+         )
+ 
+         # --- Alt-Az cleanup (lecropper altZ) ---
+         self.altaz_cleanup_enabled_var = tk.BooleanVar(
+             master=self.root,
+             value=self.config.get("altaz_cleanup_enabled", False),
+         )
+         self.altaz_margin_percent_var = tk.DoubleVar(
+             master=self.root,
+             value=self.config.get("altaz_margin_percent", 5.0),
+         )
+         self.altaz_decay_var = tk.DoubleVar(
+             master=self.root,
+             value=self.config.get("altaz_decay", 0.15),
+         )
+         self.altaz_nanize_var = tk.BooleanVar(
+             master=self.root,
+             value=self.config.get("altaz_nanize", True),
+         )
++        self.altaz_alpha_soft_threshold_var = tk.DoubleVar(
++            master=self.root,
++            value=self.config.get("altaz_alpha_soft_threshold", 1e-3),
++        )
+         self.use_memmap_var = tk.BooleanVar(master=self.root, value=self.config.get("coadd_use_memmap", False))
+         try:
+             self.quality_crop_enabled_var.trace_add("write", self._update_quality_crop_state)
+         except Exception:
+             pass
+         try:
+             self.quality_gate_enabled_var.trace_add("write", self._update_quality_gate_state)
+         except Exception:
+             pass
+         try:
+             self.altaz_cleanup_enabled_var.trace_add("write", self._update_altaz_state)
+         except Exception:
+             pass
+         self.mm_dir_var = tk.StringVar(master=self.root, value=self.config.get("coadd_memmap_dir", ""))
+         self.cleanup_memmap_var = tk.BooleanVar(master=self.root, value=self.config.get("coadd_cleanup_memmap", True))
+         self.cache_retention_var = tk.StringVar(
+             master=self.root,
+             value=self.config.get("cache_retention", "run_end"),
+         )
+         self.auto_limit_frames_var = tk.BooleanVar(master=self.root, value=self.config.get("auto_limit_frames_per_master_tile", True))
+         self.max_raw_per_tile_var = tk.IntVar(master=self.root, value=self.config.get("max_raw_per_master_tile", 0))
+         intertile_sky_cfg = self.config.get("intertile_sky_percentile", [30.0, 70.0])
+         if not (isinstance(intertile_sky_cfg, (list, tuple)) and len(intertile_sky_cfg) >= 2):
+             intertile_sky_cfg = [30.0, 70.0]
+         self.intertile_match_var = tk.BooleanVar(master=self.root, value=self.config.get("intertile_photometric_match", True))
+@@ -1471,101 +1476,116 @@ class ZeMosaicGUI:
+         )
+         self.quality_crop_min_run_spinbox.grid(row=0, column=5, padx=5, pady=3, sticky="w")
+ 
+         quality_margin_label = ttk.Label(params_row, text="")
+         quality_margin_label.grid(row=0, column=6, padx=5, pady=3, sticky="w")
+         self.translatable_widgets["quality_crop_margin_label"] = quality_margin_label
+         self.quality_crop_margin_spinbox = ttk.Spinbox(
+             params_row,
+             from_=0,
+             to=64,
+             increment=1,
+             textvariable=self.quality_crop_margin_var,
+             width=6,
+         )
+         self.quality_crop_margin_spinbox.grid(row=0, column=7, padx=5, pady=3, sticky="w")
+ 
+         self._quality_crop_inputs = [
+             self.quality_crop_band_spinbox,
+             self.quality_crop_ks_spinbox,
+             self.quality_crop_margin_spinbox,
+             self.quality_crop_min_run_spinbox,
+         ]
+ 
+         altaz_row = ttk.Frame(self.quality_crop_advanced_frame)
+         altaz_row.grid(row=1, column=0, sticky="ew")
+-        for col_idx in range(6):
++        for col_idx in range(8):
+             altaz_row.columnconfigure(col_idx, weight=0)
+ 
+         self.altaz_cleanup_check = ttk.Checkbutton(
+             altaz_row,
+             text="",
+             variable=self.altaz_cleanup_enabled_var,
+             command=self._update_altaz_state,
+         )
+         self.altaz_cleanup_check.grid(row=0, column=0, padx=5, pady=(6, 3), sticky="w")
+         self.translatable_widgets["altaz_cleanup_toggle_label"] = self.altaz_cleanup_check
+ 
+         altaz_margin_label = ttk.Label(altaz_row, text="")
+         altaz_margin_label.grid(row=0, column=1, padx=5, pady=(6, 3), sticky="w")
+         self.translatable_widgets["altaz_margin_percent_label"] = altaz_margin_label
+         self.altaz_margin_spinbox = ttk.Spinbox(
+             altaz_row,
+             from_=0.0,
+             to=50.0,
+             increment=0.5,
+             format="%.1f",
+             textvariable=self.altaz_margin_percent_var,
+             width=6,
+         )
+         self.altaz_margin_spinbox.grid(row=0, column=2, padx=5, pady=(6, 3), sticky="w")
+ 
+         altaz_decay_label = ttk.Label(altaz_row, text="")
+         altaz_decay_label.grid(row=0, column=3, padx=5, pady=(6, 3), sticky="w")
+         self.translatable_widgets["altaz_decay_label"] = altaz_decay_label
+         self.altaz_decay_spinbox = ttk.Spinbox(
+             altaz_row,
+             from_=0.0,
+             to=2.0,
+             increment=0.05,
+             format="%.2f",
+             textvariable=self.altaz_decay_var,
+             width=6,
+         )
+         self.altaz_decay_spinbox.grid(row=0, column=4, padx=5, pady=(6, 3), sticky="w")
+ 
++        altaz_alpha_soft_threshold_label = ttk.Label(altaz_row, text="")
++        altaz_alpha_soft_threshold_label.grid(row=0, column=5, padx=5, pady=(6, 3), sticky="w")
++        self.translatable_widgets["altaz_alpha_soft_threshold_label"] = altaz_alpha_soft_threshold_label
++        self.altaz_alpha_soft_threshold_spinbox = ttk.Spinbox(
++            altaz_row,
++            from_=0.0,
++            to=1.0,
++            increment=0.01,
++            format="%.2f",
++            textvariable=self.altaz_alpha_soft_threshold_var,
++            width=6,
++        )
++        self.altaz_alpha_soft_threshold_spinbox.grid(row=0, column=6, padx=5, pady=(6, 3), sticky="w")
++
+         self.altaz_nan_check = ttk.Checkbutton(
+             altaz_row,
+             text=self._tr("altaz_nanize_label", "Alt-Az → NaN"),
+             variable=self.altaz_nanize_var,
+         )
+-        self.altaz_nan_check.grid(row=0, column=5, padx=5, pady=(6, 3), sticky="w")
++        self.altaz_nan_check.grid(row=0, column=7, padx=5, pady=(6, 3), sticky="w")
+         self.translatable_widgets["altaz_nanize_label"] = self.altaz_nan_check
+ 
+         self._altaz_inputs = [
+             self.altaz_margin_spinbox,
+             self.altaz_decay_spinbox,
++            self.altaz_alpha_soft_threshold_spinbox,
+             self.altaz_nan_check,
+         ]
+ 
+         # --- Master Tile Quality Gate (ZeQualityMT) ---
+         quality_gate_frame = ttk.LabelFrame(crop_options_frame, text="")
+         quality_gate_frame.grid(row=crop_opt_row, column=0, columnspan=3, padx=5, pady=(0, 6), sticky="ew")
+         quality_gate_frame.columnconfigure(1, weight=1)
+         quality_gate_frame.columnconfigure(3, weight=1)
+         self.translatable_widgets["mt_quality_gate_group"] = quality_gate_frame
+ 
+         qgate_guard = {"locked": False}
+ 
+         def _update_qgate_value(var, key, fallback, *, min_value=None, max_value=None, cast=float):
+             if qgate_guard["locked"]:
+                 return
+             qgate_guard["locked"] = True
+             try:
+                 try:
+                     current_val = cast(var.get())
+                 except (tk.TclError, ValueError, TypeError):
+                     current_val = fallback
+                 value = current_val
+                 if min_value is not None:
+                     value = max(min_value, value)
+                 if max_value is not None:
+@@ -2717,50 +2737,51 @@ class ZeMosaicGUI:
+ 
+                 solver_cfg_payload = asdict(self.solver_settings)
+ 
+                 config_overrides = {
+                     "astap_executable_path": astap_exe,
+                     "astap_data_directory_path": astap_data,
+                     "astap_default_search_radius": astap_radius,
+                     "astap_default_downsample": astap_downsample,
+                     "astap_default_sensitivity": astap_sensitivity,
+                     "output_dir": output_dir_value,
                  }
+                 try:
+                     config_overrides.update({
+                         "auto_limit_frames_per_master_tile": bool(self.auto_limit_frames_var.get()),
+                         "max_raw_per_master_tile": int(self.max_raw_per_tile_var.get()),
+                         "apply_master_tile_crop": bool(self.apply_master_tile_crop_var.get()),
+                         "master_tile_crop_percent": float(self.master_tile_crop_percent_var.get()),
+                         "quality_crop_enabled": bool(self.quality_crop_enabled_var.get()),
+                         "quality_crop_band_px": int(self.quality_crop_band_var.get()),
+                         "quality_crop_k_sigma": float(self.quality_crop_ks_var.get()),
+                         "quality_crop_margin_px": int(self.quality_crop_margin_var.get()),
+                         "quality_crop_min_run": int(self.quality_crop_min_run_var.get()),
+                         "altaz_cleanup_enabled": bool(self.altaz_cleanup_enabled_var.get()),
+                         "altaz_margin_percent": float(self.altaz_margin_percent_var.get()),
+                         "altaz_decay": float(self.altaz_decay_var.get()),
++                        "altaz_alpha_soft_threshold": float(self.altaz_alpha_soft_threshold_var.get()),
+                         "altaz_nanize": bool(self.altaz_nanize_var.get()),
+                         "quality_gate_enabled": bool(self.quality_gate_enabled_var.get()),
+                         "quality_gate_threshold": float(self.quality_gate_threshold_var.get()),
+                         "quality_gate_edge_band_px": int(self.quality_gate_edge_band_var.get()),
+                         "quality_gate_k_sigma": float(self.quality_gate_k_sigma_var.get()),
+                         "quality_gate_erode_px": int(self.quality_gate_erode_var.get()),
+                         "quality_gate_move_rejects": bool(self.quality_gate_move_rejects_var.get()),
+                     })
+                 except Exception:
+                     pass
+             except Exception:
+                 solver_cfg_payload = asdict(self.solver_settings)
+                 config_overrides = None
+ 
+             result = launch_filter_interface(
+                 input_dir,
+                 _initial_overrides,
+                 stream_scan=True,
+                 scan_recursive=True,
+                 batch_size=200,
+                 preview_cap=1500,
+                 solver_settings_dict=solver_cfg_payload,
+                 config_overrides=config_overrides,
              )
-         return records
-
-@@ -3627,6 +3628,12 @@ class ZeMosaicFilterGuiQt(...):
-     def _find_auto_merge_partner(
-         self,
-         records: list[dict[str, Any]],
-         idx: int,
-         *,
-         cap_limit: int | None,
-         dispersion_limit: float,
-         desired_target: int,
-     ) -> tuple[int, list[tuple[float, float]], float] | None:
-         if idx < 0 or idx >= len(records):
-             return None
-         source = records[idx]
-         source_coords = list(source.get("coords") or [])
-         source_center = source.get("center")
-+        source_sig = str(source.get("eqmode_sig") or "UNKNOWN")
-         if not source_coords or source_center is None:
-             return None
-         source_size = int(source.get("size", len(source_coords)))
-         neighbors: list[tuple[float, int, int]] = []
-         for other_idx, other in enumerate(records):
-             if other_idx == idx:
-                 continue
-+            other_sig = str(other.get("eqmode_sig") or "UNKNOWN")
-+            # Never merge across EQ/ALTZ boundaries (or any differing signature)
-+            if other_sig != source_sig:
-+                continue
-             other_coords = other.get("coords") or []
-             other_center = other.get("center")
-             if not other_coords or other_center is None:
-                 continue
-             other_size = int(other.get("size", len(other_coords)))
-             combined_size = source_size + other_size
-             if cap_limit is not None and combined_size > cap_limit:
-                 continue
-             distance = self._angular_distance(source_center, other_center)
-             neighbors.append((distance, other_idx, combined_size))
-         if not neighbors:
-             return None
-         neighbors.sort(key=lambda item: item[0])
-         best_idx: int | None = None
-         best_coords: list[tuple[float, float]] | None = None
+         except Exception as e:
+@@ -4084,50 +4105,60 @@ class ZeMosaicGUI:
+                 quality_crop_k_sigma_val = float(self.quality_crop_ks_var.get())
+             except Exception:
+                 quality_crop_k_sigma_val = float(self.config.get("quality_crop_k_sigma", 2.0))
+                 self.quality_crop_ks_var.set(quality_crop_k_sigma_val)
+             try:
+                 quality_crop_margin_val = int(self.quality_crop_margin_var.get())
+             except Exception:
+                 quality_crop_margin_val = int(self.config.get("quality_crop_margin_px", 8))
+                 self.quality_crop_margin_var.set(quality_crop_margin_val)
+             try:
+                 quality_crop_min_run_val = int(self.quality_crop_min_run_var.get())
+             except Exception:
+                 quality_crop_min_run_val = int(self.config.get("quality_crop_min_run", 2))
+                 self.quality_crop_min_run_var.set(quality_crop_min_run_val)
+             altaz_cleanup_enabled_val = bool(self.altaz_cleanup_enabled_var.get())
+             try:
+                 altaz_margin_val = float(self.altaz_margin_percent_var.get())
+             except Exception:
+                 altaz_margin_val = float(self.config.get("altaz_margin_percent", 5.0))
+                 self.altaz_margin_percent_var.set(altaz_margin_val)
+             try:
+                 altaz_decay_val = float(self.altaz_decay_var.get())
+             except Exception:
+                 altaz_decay_val = float(self.config.get("altaz_decay", 0.15))
+                 self.altaz_decay_var.set(altaz_decay_val)
++            try:
++                altaz_alpha_soft_threshold_val = float(self.altaz_alpha_soft_threshold_var.get())
++            except Exception:
++                altaz_alpha_soft_threshold_val = float(self.config.get("altaz_alpha_soft_threshold", 1e-3))
++                self.altaz_alpha_soft_threshold_var.set(altaz_alpha_soft_threshold_val)
++            altaz_alpha_soft_threshold_val = max(0.0, min(1.0, altaz_alpha_soft_threshold_val))
++            try:
++                self.altaz_alpha_soft_threshold_var.set(altaz_alpha_soft_threshold_val)
++            except Exception:
++                pass
+             altaz_nanize_val = bool(self.altaz_nanize_var.get())
+             quality_gate_enabled_val = bool(self.quality_gate_enabled_var.get())
+             try:
+                 quality_gate_threshold_val = float(self.quality_gate_threshold_var.get())
+             except Exception:
+                 quality_gate_threshold_val = float(self.config.get("quality_gate_threshold", 0.48))
+             quality_gate_threshold_val = max(0.0, min(1.0, quality_gate_threshold_val))
+             try:
+                 self.quality_gate_threshold_var.set(quality_gate_threshold_val)
+             except Exception:
+                 pass
+             try:
+                 quality_gate_edge_band_val = int(self.quality_gate_edge_band_var.get())
+             except Exception:
+                 quality_gate_edge_band_val = int(self.config.get("quality_gate_edge_band_px", 64))
+             quality_gate_edge_band_val = max(0, quality_gate_edge_band_val)
+             try:
+                 self.quality_gate_edge_band_var.set(quality_gate_edge_band_val)
+             except Exception:
+                 pass
+             try:
+                 quality_gate_k_sigma_val = float(self.quality_gate_k_sigma_var.get())
+             except Exception:
+                 quality_gate_k_sigma_val = float(self.config.get("quality_gate_k_sigma", 2.5))
+             quality_gate_k_sigma_val = max(0.0, quality_gate_k_sigma_val)
+@@ -4237,50 +4268,51 @@ class ZeMosaicGUI:
+                         _initial_overrides = {
+                             "cluster_panel_threshold": float(self.cluster_threshold_var.get()) if hasattr(self, 'cluster_threshold_var') else float(self.config.get("cluster_panel_threshold", 0.05)),
+                             "cluster_target_groups": int(self.cluster_target_groups_var.get()) if hasattr(self, 'cluster_target_groups_var') else int(self.config.get("cluster_target_groups", 0)),
+                             "cluster_orientation_split_deg": float(self.cluster_orientation_split_var.get()) if hasattr(self, 'cluster_orientation_split_var') else float(self.config.get("cluster_orientation_split_deg", 0.0)),
+                         }
+                     except Exception:
+                         _initial_overrides = None
+ 
+                     # Forward solver/config payload like _open_filter_only does
+                     solver_cfg_payload = None
+                     config_overrides = None
+                     try:
+                         solver_cfg_payload = asdict(self.solver_settings)
+                         output_dir_value = self.output_dir_var.get().strip()
+                         config_overrides = {
+                             "apply_master_tile_crop": bool(self.apply_master_tile_crop_var.get()),
+                             "master_tile_crop_percent": float(self.master_tile_crop_percent_var.get()),
+                             "quality_crop_enabled": bool(self.quality_crop_enabled_var.get()),
+                             "quality_crop_band_px": int(self.quality_crop_band_var.get()),
+                             "quality_crop_k_sigma": float(self.quality_crop_ks_var.get()),
+                             "quality_crop_margin_px": int(self.quality_crop_margin_var.get()),
+                             "quality_crop_min_run": int(self.quality_crop_min_run_var.get()),
+                             "altaz_cleanup_enabled": bool(self.altaz_cleanup_enabled_var.get()),
+                             "altaz_margin_percent": float(self.altaz_margin_percent_var.get()),
+                             "altaz_decay": float(self.altaz_decay_var.get()),
++                            "altaz_alpha_soft_threshold": float(self.altaz_alpha_soft_threshold_var.get()),
+                             "altaz_nanize": bool(self.altaz_nanize_var.get()),
+                             "astap_executable_path": astap_exe,
+                             "astap_data_directory_path": astap_data,
+                             "quality_gate_enabled": bool(self.quality_gate_enabled_var.get()),
+                             "quality_gate_threshold": float(self.quality_gate_threshold_var.get()),
+                             "quality_gate_edge_band_px": int(self.quality_gate_edge_band_var.get()),
+                             "quality_gate_k_sigma": float(self.quality_gate_k_sigma_var.get()),
+                             "quality_gate_erode_px": int(self.quality_gate_erode_var.get()),
+                             "quality_gate_move_rejects": bool(self.quality_gate_move_rejects_var.get()),
+                             "output_dir": output_dir_value,
+                         }
+                     except Exception:
+                         # Fallback to minimal payload
+                         try:
+                             solver_cfg_payload = asdict(self.solver_settings)
+                         except Exception:
+                             solver_cfg_payload = None
+                         config_overrides = None
+ 
+                     try:
+                         try:
+                             import importlib  # noqa: F401  (only for parity with CLI test)
+                             import zemosaic_filter_gui as _zfg_dbg  # type: ignore
+                             self._log_message(
+                                 f"[ZGUI] Filter GUI module path: {_zfg_dbg.__file__}",
+@@ -4565,50 +4597,51 @@ class ZeMosaicGUI:
+ 
+         print(
+             f"[GUI] Stacking -> norm={self.config['stacking_normalize_method']}, "
+             f"weight={self.config['stacking_weighting_method']}, "
+             f"reject={self.config['stacking_rejection_algorithm']}, "
+             f"combine={self.config['stacking_final_combine_method']}, "
+             f"rgb_eq={self.config['poststack_equalize_rgb']}"
+         )
+ 
+         stack_ram_budget_val = 0.0
+         try:
+             stack_ram_budget_val = float(self.config.get("stack_ram_budget_gb", 0.0))
+         except Exception:
+             stack_ram_budget_val = 0.0
+         self.config["stack_ram_budget_gb"] = stack_ram_budget_val
+         self.config["apply_master_tile_crop"] = bool(apply_master_tile_crop_val)
+         self.config["master_tile_crop_percent"] = float(master_tile_crop_percent_val)
+         self.config["quality_crop_enabled"] = bool(quality_crop_enabled_val)
+         self.config["quality_crop_band_px"] = int(quality_crop_band_val)
+         self.config["quality_crop_k_sigma"] = float(quality_crop_k_sigma_val)
+         self.config["quality_crop_margin_px"] = int(quality_crop_margin_val)
+         self.config["quality_crop_min_run"] = int(quality_crop_min_run_val)
+         self.config["altaz_cleanup_enabled"] = bool(altaz_cleanup_enabled_val)
+         self.config["altaz_margin_percent"] = float(altaz_margin_val)
+         self.config["altaz_decay"] = float(altaz_decay_val)
++        self.config["altaz_alpha_soft_threshold"] = float(altaz_alpha_soft_threshold_val)
+         self.config["altaz_nanize"] = bool(altaz_nanize_val)
+ 
+         inter_master_enable_val = bool(self.inter_master_merge_var.get())
+         try:
+             overlap_pct_val = float(self.inter_master_overlap_var.get())
+         except Exception:
+             overlap_pct_val = float(self.config.get("inter_master_overlap_threshold", 0.60) * 100.0)
+             self.inter_master_overlap_var.set(overlap_pct_val)
+         overlap_pct_val = max(0.0, min(100.0, overlap_pct_val))
+         overlap_fraction = overlap_pct_val / 100.0
+         method_val = str(self.inter_master_method_var.get()).lower()
+         if method_val not in {"winsor", "mean", "median"}:
+             method_val = "winsor"
+             self.inter_master_method_var.set(method_val)
+ 
+         self.config["inter_master_merge_enable"] = inter_master_enable_val
+         self.config["inter_master_overlap_threshold"] = overlap_fraction
+         self.config["inter_master_stack_method"] = method_val
+ 
+         span_range_cfg = self.config.get("anchor_quality_span_range", [0.02, 6.0])
+         if not (isinstance(span_range_cfg, (list, tuple)) and len(span_range_cfg) >= 2):
+             span_range_cfg = [0.02, 6.0]
+         try:
+             span_range_cfg = [float(span_range_cfg[0]), float(span_range_cfg[1])]
+         except Exception:
+@@ -4678,50 +4711,51 @@ class ZeMosaicGUI:
+             bool(poststack_equalize_rgb_val),
+             apply_radial_weight_val,
+             radial_feather_fraction_val,
+             radial_shape_power_val,
+             min_radial_weight_floor_val,
+             final_assembly_method_val,
+             inter_master_enable_val,
+             overlap_fraction,
+             inter_master_min_group_val,
+             method_val,
+             inter_master_memmap_policy_val,
+             inter_master_local_scale_val,
+             inter_master_max_group_val,
+             num_base_workers_gui_val,
+             # --- NOUVEAUX ARGUMENTS POUR LE ROGNAGE ---
+             apply_master_tile_crop_val,
+             master_tile_crop_percent_val,
+             bool(quality_crop_enabled_val),
+             int(quality_crop_band_val),
+             float(quality_crop_k_sigma_val),
+             int(quality_crop_margin_val),
+             int(quality_crop_min_run_val),
+             bool(altaz_cleanup_enabled_val),
+             float(altaz_margin_val),
+             float(altaz_decay_val),
++            float(altaz_alpha_soft_threshold_val),
+             bool(altaz_nanize_val),
+             bool(quality_gate_enabled_val),
+             float(quality_gate_threshold_val),
+             int(quality_gate_edge_band_val),
+             float(quality_gate_k_sigma_val),
+             int(quality_gate_erode_px_val),
+             bool(quality_gate_move_rejects_val),
+             self.save_final_uint16_var.get(),
+             self.legacy_rgb_cube_var.get(),
+             self.use_memmap_var.get(),
+             memmap_dir,
+             self.cleanup_memmap_var.get(),
+             self.config.get("assembly_process_workers", 0),
+             self.auto_limit_frames_var.get(),
+             self.winsor_max_frames_var.get(),
+             self.winsor_workers_var.get(),
+             self.max_raw_per_tile_var.get(),
+             bool(self.intertile_match_var.get()),
+             int(self.intertile_preview_size_var.get()),
+             float(self.intertile_overlap_min_var.get()),
+             [
+                 float(self.intertile_sky_low_var.get()),
+                 float(self.intertile_sky_high_var.get()),
+             ],
+             float(self.intertile_clip_sigma_var.get()),
+diff --git a/zemosaic_worker.py b/zemosaic_worker.py
+index f8d1c20e8eb86dc9372f9d016f16891325341144..f718524b1fe5f162480a7283934862366c50260c 100644
+--- a/zemosaic_worker.py
++++ b/zemosaic_worker.py
+@@ -636,50 +636,59 @@ def _apply_lecropper_pipeline(
+     try:
+         margin_px = int(cfg.get("quality_crop_margin_px", 8))
+     except Exception:
+         margin_px = 8
+     try:
+         min_run = int(cfg.get("quality_crop_min_run", 2))
+     except Exception:
+         min_run = 2
+ 
+     try:
+         az_enabled = bool(cfg.get("altaz_cleanup_enabled", False))
+     except Exception:
+         az_enabled = False
+     try:
+         az_margin = float(cfg.get("altaz_margin_percent", 5.0))
+     except Exception:
+         az_margin = 5.0
+     try:
+         az_decay = float(cfg.get("altaz_decay", 0.15))
+     except Exception:
+         az_decay = 0.15
+     try:
+         az_nanize = bool(cfg.get("altaz_nanize", True))
+     except Exception:
+         az_nanize = True
++    try:
++        az_alpha_soft = float(cfg.get("altaz_alpha_soft_threshold", 1e-3))
++    except Exception:
++        az_alpha_soft = 1e-3
++    if not math.isfinite(az_alpha_soft):
++        az_alpha_soft = 1e-3
++    else:
++        az_alpha_soft = float(np.clip(az_alpha_soft, 0.0, 1.0))
++    hard_threshold = az_alpha_soft
+ 
+     out = arr
+     alpha_mask_norm: np.ndarray | None = None
+     altaz_masked_used = False
+     altaz_mask2d_used = False
+     try:
+         if q_enabled and hasattr(lecropper, "quality_crop"):
+             out = lecropper.quality_crop(
+                 out,
+                 band_px=band_px,
+                 k_sigma=k_sigma,
+                 margin_px=margin_px,
+                 min_run=min_run,
+             )
+ 
+         if az_enabled:
+             mask2d = None
+             mask_helper = getattr(lecropper, "mask_altaz_artifacts", None)
+             base_for_mask = out
+             if callable(mask_helper):
+                 try:
+                     masked, mask2d = mask_helper(
+                         base_for_mask,
+                         margin_percent=az_margin,
+                         decay_ratio=az_decay,
+@@ -713,67 +722,67 @@ def _apply_lecropper_pipeline(
+                         out = candidate
+                         altaz_masked_used = True
+                     altaz_mask2d_used = mask2d is not None
+                 else:
+                     out = cleaned
+                     altaz_masked_used = out is not None
+             elif hasattr(lecropper, "apply_altaz_cleanup"):
+                 cleaned = lecropper.apply_altaz_cleanup(
+                     base_for_mask,
+                     margin_percent=az_margin,
+                     decay=az_decay,
+                     nanize=az_nanize,
+                 )
+                 if isinstance(cleaned, (tuple, list)) and len(cleaned) >= 2:
+                     candidate, mask2d = cleaned[:2]
+                     if candidate is not None:
+                         out = candidate
+                         altaz_masked_used = True
+                     altaz_mask2d_used = mask2d is not None
+                 else:
+                     out = cleaned
+                     altaz_masked_used = out is not None
+ 
+             if mask2d is not None:
+                 alpha_mask_norm = np.asarray(mask2d, dtype=np.float32, copy=False)
+-                hard_threshold = 1e-3
+                 mask_zero = alpha_mask_norm <= hard_threshold
+                 # Always apply nanize/zeroize on the unattenuated base_for_mask,
+                 # not on `out` (which could have been attenuated elsewhere).
+                 target_for_mask = base_for_mask
+                 if isinstance(target_for_mask, np.ndarray) and target_for_mask.ndim == 3:
+                     mask_zero = mask_zero[..., None]
+                 if az_nanize:
+                     out = np.where(mask_zero, np.nan, target_for_mask)
+                 else:
+                     out = np.where(mask_zero, 0.0, target_for_mask)
+                 altaz_mask2d_used = True
+             try:
+                 logger.info(
+-                    "MT_PIPELINE: altaz_cleanup applied: masked_used=%s mask2d_used=%s",
++                    "MT_PIPELINE: altaz_cleanup applied: masked_used=%s mask2d_used=%s threshold=%g",
+                     bool(altaz_masked_used),
+                     bool(altaz_mask2d_used),
++                    hard_threshold,
+                 )
+             except Exception:
+                 pass
+     except Exception as exc:
+         try:
+             logger.warning("lecropper pipeline skipped (err=%s)", exc)
+         except Exception:
+             pass
+         return arr, None
+ 
+     return out, alpha_mask_norm
+ 
+ 
+ def _apply_final_mosaic_quality_pipeline(
+     final_mosaic_data: np.ndarray | None,
+     final_mosaic_coverage: np.ndarray | None,
+     final_alpha_map: np.ndarray | None,
+     pipeline_cfg: dict[str, Any] | None,
+ ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+     """Apply the lecropper-based quality pipeline to the final mosaic."""
+ 
+     if (
+         final_mosaic_data is None
+         or not pipeline_cfg
+         or not (

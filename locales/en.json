@@ -82,6 +82,7 @@
     "altaz_cleanup_toggle_label": "Alt-Az cleanup",
     "altaz_margin_percent_label": "AltAz margin %",
     "altaz_decay_label": "AltAz decay",
+    "altaz_alpha_soft_threshold_label": "Alt-Az alpha cutoff",
     "altaz_nanize_label": "Alt-Az → NaN",
     "cfg_inter_master_enable": "Inter-Master merge (Phase 4.5)",
     "cfg_inter_master_overlap": "Overlap ≥ (%)",

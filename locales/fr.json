@@ -85,6 +85,7 @@
     "altaz_cleanup_toggle_label": "Nettoyage Alt-Az",
     "altaz_margin_percent_label": "Marge AltAz %",
     "altaz_decay_label": "Décroissance AltAz",
+    "altaz_alpha_soft_threshold_label": "Seuil alpha Alt-Az",
     "altaz_nanize_label": "Alt-Az → NaN",
     "cfg_inter_master_enable": "Fusion inter-maîtres (Phase 4.5)",
     "cfg_inter_master_overlap": "Recouvrement ≥ (%)",

@@ -1,20 +1,20 @@
 # Follow-up checklist
 
 ## Code changes verification
-- [ ] zemosaic_worker.py: threshold is now read from cfg key `altaz_alpha_soft_threshold`
-- [ ] value is sanitized (finite + clamped [0..1]) with fallback 1e-3
-- [ ] mask_zero uses `<= hard_threshold` with the new value (no other logic touched)
-- [ ] log line includes threshold value
+- [x] zemosaic_worker.py: threshold is now read from cfg key `altaz_alpha_soft_threshold`
+- [x] value is sanitized (finite + clamped [0..1]) with fallback 1e-3
+- [x] mask_zero uses `<= hard_threshold` with the new value (no other logic touched)
+- [x] log line includes threshold value
 
-- [ ] zemosaic_gui.py: config default added (setdefault altaz_alpha_soft_threshold = 1e-3)
-- [ ] new tk.DoubleVar created and wired
-- [ ] new label + spinbox added to Alt-Az advanced row
-- [ ] spinbox included in `_altaz_inputs` so it gets enabled/disabled properly
-- [ ] run config includes `altaz_alpha_soft_threshold`
+- [x] zemosaic_gui.py: config default added (setdefault altaz_alpha_soft_threshold = 1e-3)
+- [x] new tk.DoubleVar created and wired
+- [x] new label + spinbox added to Alt-Az advanced row
+- [x] spinbox included in `_altaz_inputs` so it gets enabled/disabled properly
+- [x] run config includes `altaz_alpha_soft_threshold`
 
 ## Translations
-- [ ] Add `altaz_alpha_soft_threshold_label` in EN
-- [ ] Add `altaz_alpha_soft_threshold_label` in FR
+- [x] Add `altaz_alpha_soft_threshold_label` in EN
+- [x] Add `altaz_alpha_soft_threshold_label` in FR
 - [ ] (Optional) tooltip key only if tooltips exist in this panel
 
 ## Manual test run
