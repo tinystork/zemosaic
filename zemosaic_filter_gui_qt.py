@@ -297,6 +297,7 @@ try:  # pragma: no cover - optional dependency guard
     from matplotlib.collections import LineCollection
     from matplotlib.figure import Figure
     from matplotlib.colors import to_rgba
+    from matplotlib.lines import Line2D
     from matplotlib.patches import Rectangle
     from matplotlib.widgets import RectangleSelector
 except Exception:  # pragma: no cover - matplotlib optional
@@ -306,6 +307,7 @@ except Exception:  # pragma: no cover - matplotlib optional
     Rectangle = None  # type: ignore[assignment]
     RectangleSelector = None  # type: ignore[assignment]
     to_rgba = None  # type: ignore[assignment]
+    Line2D = None  # type: ignore[assignment]
 
 try:  # pragma: no cover - optional dependency guard
     from zemosaic_astrometry import (
@@ -6189,11 +6191,11 @@ class FilterQtDialog(QDialog):
             entry.original["footprint_radec"] = footprint
         return footprint
 
-    def _collect_preview_points(self) -> List[Tuple[float, float, int | None]]:
+    def _collect_preview_points(self) -> List[Tuple[int, float, float, int | None]]:
         if self._preview_canvas is None:
             return []
         limit = self._resolve_preview_cap()
-        points: list[Tuple[float, float, int | None]] = []
+        points: list[Tuple[int, float, float, int | None]] = []
         for row, entry in enumerate(self._normalized_items):
             if not self._entry_is_checked(row):
                 continue
@@ -6203,7 +6205,7 @@ class FilterQtDialog(QDialog):
             if ra_deg is None or dec_deg is None:
                 continue
             cluster_idx = entry.cluster_index if isinstance(entry.cluster_index, int) else None
-            points.append((ra_deg, dec_deg, cluster_idx))
+            points.append((row, ra_deg, dec_deg, cluster_idx))
             if limit is not None and len(points) >= limit:
                 break
         return points
@@ -6217,7 +6219,10 @@ class FilterQtDialog(QDialog):
         except Exception:
             return PREVIEW_HARD_LIMIT
 
-    def _build_preview_geometry(self) -> dict[str, Any]:
+    def _build_preview_geometry(
+        self,
+        collected_points: Sequence[tuple[int, float, float, int | None]] | None = None,
+    ) -> dict[str, Any]:
         colorize = self._should_color_footprints_by_group()
         preview_cap = self._resolve_preview_cap()
         hard_limit = self._resolve_preview_hard_limit()
@@ -6230,6 +6235,18 @@ class FilterQtDialog(QDialog):
         highlight_cap = preview_cap if preview_cap is not None else hard_limit
         footprint_mode = "footprints"
         selected_keys = set(self._selected_group_keys)
+        collected_by_row: dict[int, tuple[float, float, int | None]] = {}
+
+        if collected_points:
+            for row_idx, ra_deg, dec_deg, group_idx in collected_points:
+                try:
+                    ra_val = float(ra_deg)
+                    dec_val = float(dec_deg)
+                except Exception:
+                    continue
+                collected_by_row[int(row_idx)] = (ra_val, dec_val, group_idx)
+                points_by_group.setdefault(group_idx, []).append((ra_val, dec_val))
+                points_added += 1
 
         for row, entry in enumerate(self._normalized_items):
             if not self._entry_is_checked(row):
@@ -6239,20 +6256,27 @@ class FilterQtDialog(QDialog):
                 footprint_mode = "centroid_only"
                 footprints = []
                 footprint_colors = []
-            ra_deg, dec_deg = entry.center_ra_deg, entry.center_dec_deg
-            if ra_deg is None or dec_deg is None:
-                ra_deg, dec_deg = self._ensure_entry_coordinates(entry)
-            if ra_deg is None or dec_deg is None:
-                continue
-
-            group_idx = entry.cluster_index if isinstance(entry.cluster_index, int) else None
-            if preview_cap is None or points_added < preview_cap:
-                points_by_group.setdefault(group_idx, []).append((ra_deg, dec_deg))
-                points_added += 1
+            cached_coords = collected_by_row.get(row)
+            group_idx: int | None = None
+            if cached_coords is not None:
+                ra_deg, dec_deg, group_idx = cached_coords
+            else:
+                ra_deg, dec_deg = entry.center_ra_deg, entry.center_dec_deg
+                if ra_deg is None or dec_deg is None:
+                    ra_deg, dec_deg = self._ensure_entry_coordinates(entry)
+                if ra_deg is None or dec_deg is None:
+                    continue
+                group_idx = entry.cluster_index if isinstance(entry.cluster_index, int) else None
+                if preview_cap is None or points_added < preview_cap:
+                    points_by_group.setdefault(group_idx, []).append((ra_deg, dec_deg))
+                    points_added += 1
 
             if selected_keys and self._group_key_for_entry(entry) in selected_keys:
                 if highlight_cap is None or len(highlight_points) < highlight_cap:
-                    highlight_points.append((ra_deg, dec_deg))
+                    try:
+                        highlight_points.append((float(ra_deg), float(dec_deg)))
+                    except Exception:
+                        pass
 
             if footprint_mode == "centroid_only":
                 continue
@@ -6317,6 +6341,7 @@ class FilterQtDialog(QDialog):
         selection_bounds: tuple[float, float, float, float] | None,
         outline_bounds: list[_GroupOutline],
         should_draw_outlines: bool,
+        timing: dict[str, float] | None = None,
     ) -> dict[str, Any]:
         points_by_group: dict[int | None, list[Tuple[float, float]]] = geometry.get("points_by_group") or {}
         highlight_points: list[Tuple[float, float]] = geometry.get("highlight_points") or []
@@ -6326,6 +6351,9 @@ class FilterQtDialog(QDialog):
         preview_count = int(geometry.get("preview_count") or 0)
         total_entries = int(geometry.get("total_entries") or 0)
         group_count = int(geometry.get("group_count") or 0)
+        if timing is not None:
+            timing["build_arrays_dt"] = 0.0
+            timing["add_artists_dt"] = 0.0
 
         axes.clear()
         if self._group_outline_collection is not None:
@@ -6378,35 +6406,114 @@ class FilterQtDialog(QDialog):
         colorize = self._should_color_footprints_by_group()
         legend_cap = max(3, PREVIEW_LEGEND_MAX_GROUPS)
         legend_allowed = colorize and group_count > 0 and group_count <= legend_cap
-        legend_needed = False
+        legend_hidden_hint = colorize and group_count > legend_cap
         ra_values: list[float] = []
         dec_values: list[float] = []
-
+        scatter_ra: list[float] = []
+        scatter_dec: list[float] = []
+        scatter_colors: list[Any] = []
+        legend_labels: list[tuple[str, Any]] = []
+        outline_segments: list[list[tuple[float, float]]] = []
+        outline_colors: list[Any] = []
+        outline_corners: list[tuple[float, float]] = []
+        build_arrays_start = time.monotonic()
+        default_color = "#3f7ad6"
         for group_idx, coords in points_by_group.items():
             if not coords:
                 continue
-            try:
-                ra_values.extend(float(val[0]) for val in coords)
-                dec_values.extend(float(val[1]) for val in coords)
-            except Exception:
-                pass
-            color = self._resolve_group_color(group_idx) if colorize else "#3f7ad6"
-            label = None
-            if legend_allowed and isinstance(group_idx, int):
-                label_template = self._localizer.get("filter.preview.group_label", "Group {index}")
+            color = self._resolve_group_color(group_idx) if colorize else default_color
+            appended = 0
+            for coord in coords:
                 try:
-                    label = label_template.format(index=group_idx + 1)
+                    ra_val = float(coord[0])
+                    dec_val = float(coord[1])
                 except Exception:
-                    label = f"Group {group_idx + 1}"
-                legend_needed = True
-            elif legend_allowed and group_idx is None and len(points_by_group) > 1:
-                label = self._localizer.get("filter.preview.group_unassigned", "Unassigned")
-                legend_needed = True
+                    continue
+                scatter_ra.append(ra_val)
+                scatter_dec.append(dec_val)
+                scatter_colors.append(color)
+                ra_values.append(ra_val)
+                dec_values.append(dec_val)
+                appended += 1
+            if legend_allowed and appended:
+                label = None
+                if isinstance(group_idx, int):
+                    label_template = self._localizer.get("filter.preview.group_label", "Group {index}")
+                    try:
+                        label = label_template.format(index=group_idx + 1)
+                    except Exception:
+                        label = f"Group {group_idx + 1}"
+                elif len(points_by_group) > 1:
+                    label = self._localizer.get("filter.preview.group_unassigned", "Unassigned")
+                if label:
+                    legend_labels.append((label, color))
+        colorize_outlines = self._should_color_footprints_by_group()
+        default_outline_color: Any = to_rgba("red", 0.9) if to_rgba is not None else "#d64b3f"
+        if should_draw_outlines and outline_bounds:
+            for outline_entry in outline_bounds:
+                group_idx: int | None = None
+                coords: tuple[float, float, float, float] | None = None
+                if isinstance(outline_entry, (list, tuple)):
+                    if len(outline_entry) == 5:
+                        idx_candidate = outline_entry[0]
+                        if isinstance(idx_candidate, int):
+                            group_idx = idx_candidate
+                        try:
+                            ra_min = float(outline_entry[1])
+                            ra_max = float(outline_entry[2])
+                            dec_min = float(outline_entry[3])
+                            dec_max = float(outline_entry[4])
+                            coords = (ra_min, ra_max, dec_min, dec_max)
+                        except Exception:
+                            coords = None
+                    elif len(outline_entry) == 4:
+                        try:
+                            ra_min = float(outline_entry[0])
+                            ra_max = float(outline_entry[1])
+                            dec_min = float(outline_entry[2])
+                            dec_max = float(outline_entry[3])
+                            coords = (ra_min, ra_max, dec_min, dec_max)
+                        except Exception:
+                            coords = None
+                if coords is None:
+                    continue
+                ra_min, ra_max, dec_min, dec_max = coords
+                width = float(ra_max) - float(ra_min)
+                height = float(dec_max) - float(dec_min)
+                if width <= 0 or height <= 0:
+                    continue
+                corners = [
+                    (float(ra_min), float(dec_min)),
+                    (float(ra_max), float(dec_min)),
+                    (float(ra_max), float(dec_max)),
+                    (float(ra_min), float(dec_max)),
+                    (float(ra_min), float(dec_min)),
+                ]
+                outline_segments.append(corners)
+                outline_corners.extend(corners)
+                outline_color = default_outline_color
+                if colorize_outlines and isinstance(group_idx, int):
+                    outline_color = (
+                        to_rgba(self._resolve_group_color(group_idx), 0.95)
+                        if to_rgba is not None
+                        else self._resolve_group_color(group_idx)
+                    )
+                outline_colors.append(outline_color)
+        build_arrays_dt = time.monotonic() - build_arrays_start
+        if timing is not None:
+            timing["build_arrays_dt"] = build_arrays_dt
 
-            scatter_kwargs = dict(c=color, s=24, alpha=0.85, edgecolors="none")
-            if label:
-                scatter_kwargs["label"] = label
-            axes.scatter([coord[0] for coord in coords], [coord[1] for coord in coords], **scatter_kwargs)
+        add_artists_start = time.monotonic()
+        if scatter_ra and scatter_dec:
+            axes.scatter(
+                scatter_ra,
+                scatter_dec,
+                c=scatter_colors or default_color,
+                s=24,
+                alpha=0.85,
+                edgecolors="none",
+                zorder=2,
+            )
 
         if selection_bounds and Rectangle is not None:
             try:
@@ -6459,83 +6566,53 @@ class FilterQtDialog(QDialog):
             except Exception:
                 pass
 
-        outline_corners: list[tuple[float, float]] = []
-        if should_draw_outlines and outline_bounds:
-            outline_segments: list[list[tuple[float, float]]] = []
-            outline_colors: list[Any] = []
-            colorize_outlines = self._should_color_footprints_by_group()
-            default_outline_color: Any = (
-                to_rgba("red", 0.9) if to_rgba is not None else "#d64b3f"
+        if outline_segments and LineCollection is not None:
+            coll = LineCollection(
+                outline_segments,
+                colors=outline_colors or [default_outline_color],
+                linewidths=1.6,
+                linestyles="--",
+                alpha=0.9,
+                zorder=5,
             )
-            for outline_entry in outline_bounds:
-                group_idx: int | None = None
-                coords: tuple[float, float, float, float] | None = None
-                if isinstance(outline_entry, (list, tuple)):
-                    if len(outline_entry) == 5:
-                        idx_candidate = outline_entry[0]
-                        if isinstance(idx_candidate, int):
-                            group_idx = idx_candidate
-                        try:
-                            ra_min = float(outline_entry[1])
-                            ra_max = float(outline_entry[2])
-                            dec_min = float(outline_entry[3])
-                            dec_max = float(outline_entry[4])
-                            coords = (ra_min, ra_max, dec_min, dec_max)
-                        except Exception:
-                            coords = None
-                    elif len(outline_entry) == 4:
-                        try:
-                            ra_min = float(outline_entry[0])
-                            ra_max = float(outline_entry[1])
-                            dec_min = float(outline_entry[2])
-                            dec_max = float(outline_entry[3])
-                            coords = (ra_min, ra_max, dec_min, dec_max)
-                        except Exception:
-                            coords = None
-                if coords is None:
+            axes.add_collection(coll)
+            self._group_outline_collection = coll
+        else:
+            self._group_outline_collection = None
+
+        legend_shown = False
+        if legend_allowed and legend_labels and Line2D is not None:
+            handles: list[Any] = []
+            seen_labels: set[str] = set()
+            for label, color in legend_labels:
+                if label in seen_labels:
                     continue
-                ra_min, ra_max, dec_min, dec_max = coords
-                width = float(ra_max) - float(ra_min)
-                height = float(dec_max) - float(dec_min)
-                if width <= 0 or height <= 0:
-                    continue
-                corners = [
-                    (float(ra_min), float(dec_min)),
-                    (float(ra_max), float(dec_min)),
-                    (float(ra_max), float(dec_max)),
-                    (float(ra_min), float(dec_max)),
-                    (float(ra_min), float(dec_min)),
-                ]
-                outline_segments.append(corners)
-                outline_corners.extend(corners)
-                outline_color = default_outline_color
-                if colorize_outlines and isinstance(group_idx, int):
-                    outline_color = (
-                        to_rgba(self._resolve_group_color(group_idx), 0.95)
-                        if to_rgba is not None
-                        else self._resolve_group_color(group_idx)
+                seen_labels.add(label)
+                try:
+                    handles.append(
+                        Line2D(
+                            [0],
+                            [0],
+                            marker="o",
+                            linestyle="",
+                            markersize=6,
+                            markerfacecolor=color,
+                            markeredgecolor=color,
+                            alpha=0.85,
+                        )
                     )
-                outline_colors.append(outline_color)
-            if outline_segments and LineCollection is not None:
-                coll = LineCollection(
-                    outline_segments,
-                    colors=outline_colors or [default_outline_color],
-                    linewidths=1.6,
-                    linestyles="--",
-                    alpha=0.9,
-                    zorder=5,
-                )
-                axes.add_collection(coll)
-                self._group_outline_collection = coll
-            else:
-                self._group_outline_collection = None
+                except Exception:
+                    continue
+            if handles:
+                axes.legend(handles=handles, loc="upper right", fontsize="small")
+                legend_shown = True
+        add_artists_dt = time.monotonic() - add_artists_start
+        if timing is not None:
+            timing["add_artists_dt"] = add_artists_dt
 
         for ra_corner, dec_corner in outline_corners:
             ra_values.append(ra_corner)
             dec_values.append(dec_corner)
-
-        if legend_needed and legend_allowed:
-            axes.legend(loc="upper right", fontsize="small")
 
         if ra_values and dec_values:
             ra_min, ra_max = min(ra_values), max(ra_values)
@@ -6569,6 +6646,12 @@ class FilterQtDialog(QDialog):
             summary_text = f"{summary_text} – {cluster_formatted}"
         mode_fragment = f"mode={footprint_mode}"
         summary_text = f"{summary_text} [{mode_fragment}]"
+        if legend_hidden_hint:
+            legend_hint_text = self._localizer.get(
+                "filter.preview.legend_hidden_hint",
+                "Legend hidden (too many groups)",
+            )
+            summary_text = f"{summary_text} – {legend_hint_text}"
         try:
             self._preview_hint_label.setText(
                 summary_text.format(count=preview_count, cap=preview_cap_value or "∞")
@@ -6577,10 +6660,12 @@ class FilterQtDialog(QDialog):
             self._preview_hint_label.setText(summary_text)
 
         return {
-            "legend": legend_needed and legend_allowed,
+            "legend": legend_shown and legend_allowed,
+            "legend_hidden": legend_hidden_hint,
             "footprint_mode": footprint_mode,
             "preview_count": preview_count,
             "total_entries": total_entries,
+            "group_count": group_count,
         }
 
     def _on_preview_rectangle_selected(self, eclick, erelease) -> None:
@@ -7089,6 +7174,7 @@ class FilterQtDialog(QDialog):
         return math.hypot(dra, ddec)
 
     def _update_preview_plot(self) -> None:
+        total_start = time.monotonic()
         self._preview_refresh_pending = False
         self._preview_last_refresh = time.monotonic()
         if self._preview_axes is None or self._preview_canvas is None:
@@ -7096,41 +7182,58 @@ class FilterQtDialog(QDialog):
 
         axes = self._preview_axes
         start_draws = self._preview_draw_attempts
-        build_start = time.perf_counter()
-        geometry = self._build_preview_geometry()
+        collect_start = time.monotonic()
+        collected_points = self._collect_preview_points()
+        collect_dt = time.monotonic() - collect_start
+
+        build_start = time.monotonic()
+        geometry = self._build_preview_geometry(collected_points)
         outline_bounds = self._group_outline_bounds
         should_draw_outlines = self._should_draw_group_outlines()
-        build_dt = time.perf_counter() - build_start
+        build_dt = time.monotonic() - build_start
 
-        artists_start = time.perf_counter()
+        render_timing: dict[str, float] = {}
         render_result = self._render_sky_preview_fast(
             axes,
             geometry,
             selection_bounds=self._selection_bounds,
             outline_bounds=outline_bounds or [],
             should_draw_outlines=should_draw_outlines,
+            timing=render_timing,
         )
-        artists_dt = time.perf_counter() - artists_start
+        build_arrays_dt = build_dt + float(render_timing.get("build_arrays_dt", 0.0))
+        add_artists_dt = float(render_timing.get("add_artists_dt", 0.0))
 
-        draw_start = time.perf_counter()
+        draw_start = time.monotonic()
         force_draw = not getattr(self, "_auto_group_running", False)
         drew = self._throttled_preview_draw(force=force_draw)
-        draw_dt = time.perf_counter() - draw_start
+        draw_dt = time.monotonic() - draw_start
         redraw_delta = self._preview_draw_attempts - start_draws
         if not drew:
             delay_ms = int(max(0.0, float(self._preview_draw_throttle or 0.0)) * 1_000)
             QTimer.singleShot(delay_ms, lambda: self._throttled_preview_draw(force=True))
         try:
-            logger.info(
-                "sky_preview_perf: N=%s total=%s build=%.3fs artists=%.3fs draw=%.3fs redraws=%s mode=%s",
+            total_dt = time.monotonic() - total_start
+            perf_message = (
+                "sky_preview_perf: N=%s groups=%s collect=%.3fs build=%.3fs artists=%.3fs draw=%.3fs "
+                "total=%.3fs redraws=%s mode=%s"
+            ) % (
                 render_result.get("preview_count"),
-                render_result.get("total_entries"),
-                build_dt,
-                artists_dt,
+                render_result.get("group_count", geometry.get("group_count", 0)),
+                collect_dt,
+                build_arrays_dt,
+                add_artists_dt,
                 draw_dt,
+                total_dt,
                 redraw_delta,
                 render_result.get("footprint_mode", "footprints"),
             )
+            logger.info(
+                "%s total=%s",
+                perf_message,
+                render_result.get("total_entries"),
+            )
+            self._append_log(perf_message)
         except Exception:
             pass
 
