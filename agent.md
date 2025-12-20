@@ -2,7 +2,7 @@
 
 ## Context
 
-In ZeMosaic Grid mode, when a `stack_plan.csv` file is present, the pipeline bypasses
+In ZeMosaic Grid mode, when a `stack_plan.csv` file is present(there is one in this repo), the pipeline bypasses
 the classic clustering logic (including ALTZ vs EQ orientation separation).
 
 However, `stack_plan.csv` already contains a `mount` column with values like:
