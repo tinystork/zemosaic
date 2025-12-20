@@ -698,6 +698,8 @@
     "qt_field_altaz_enabled": "Enable Alt-Az cleanup",
     "qt_field_altaz_margin": "Margin (%)",
     "qt_field_altaz_nanize": "Convert Alt-Az gaps to NaN",
+    "qt_field_altaz_nanize_threshold": "ALT-AZ nanize threshold",
+    "qt_field_altaz_nanize_threshold_tooltip": "Pixels where the ALT-AZ mask opacity is <= this threshold are treated as invalid (NaN/0). Increase to remove more border ramps.",
     "qt_field_anchor_clip": "Anchor median clip σ",
     "qt_field_anchor_probe_limit": "Anchor probe limit",
     "qt_field_anchor_span": "Anchor span range",

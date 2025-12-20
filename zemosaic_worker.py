@@ -667,6 +667,14 @@ def _apply_lecropper_pipeline(
     else:
         az_alpha_soft = float(np.clip(az_alpha_soft, 0.0, 1.0))
     hard_threshold = az_alpha_soft
+    try:
+        az_nanize_threshold = float(cfg.get("altaz_nanize_threshold", hard_threshold))
+    except Exception:
+        az_nanize_threshold = hard_threshold
+    if not math.isfinite(az_nanize_threshold):
+        az_nanize_threshold = 1e-3
+    else:
+        az_nanize_threshold = float(np.clip(az_nanize_threshold, 0.0, 1.0))
 
     out = arr
     alpha_mask_norm: np.ndarray | None = None
@@ -743,8 +751,12 @@ def _apply_lecropper_pipeline(
                     altaz_masked_used = out is not None
 
             if mask2d is not None:
+                try:
+                    logger.info("lecropper: altaz_nanize_threshold=%.3f", az_nanize_threshold)
+                except Exception:
+                    pass
                 alpha_mask_norm = np.asarray(mask2d, dtype=np.float32, copy=False)
-                mask_zero = alpha_mask_norm <= hard_threshold
+                mask_zero = alpha_mask_norm <= az_nanize_threshold
                 # Always apply nanize/zeroize on the unattenuated base_for_mask,
                 # not on `out` (which could have been attenuated elsewhere).
                 target_for_mask = base_for_mask
@@ -760,7 +772,7 @@ def _apply_lecropper_pipeline(
                     "MT_PIPELINE: altaz_cleanup applied: masked_used=%s mask2d_used=%s threshold=%g",
                     bool(altaz_masked_used),
                     bool(altaz_mask2d_used),
-                    hard_threshold,
+                    az_nanize_threshold,
                 )
             except Exception:
                 pass

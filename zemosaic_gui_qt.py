@@ -1903,6 +1903,23 @@ class ZeMosaicQtMainWindow(QMainWindow):
             altaz_layout,
             self._tr("qt_field_altaz_nanize", "Convert Alt-Az gaps to NaN"),
         )
+        self._register_double_spinbox(
+            "altaz_nanize_threshold",
+            altaz_layout,
+            self._tr("qt_field_altaz_nanize_threshold", "ALT-AZ nanize threshold"),
+            minimum=0.0,
+            maximum=1.0,
+            single_step=0.01,
+            decimals=3,
+        )
+        binding = self._config_fields.get("altaz_nanize_threshold")
+        if binding and binding.get("widget"):
+            binding["widget"].setToolTip(
+                self._tr(
+                    "qt_field_altaz_nanize_threshold_tooltip",
+                    "Pixels where the ALT-AZ mask opacity is <= this threshold are treated as invalid (NaN/0). Increase to remove more border ramps.",
+                )
+            )
         layout.addWidget(altaz_group)
 
         quality_gate_group = QGroupBox(
@@ -3701,6 +3718,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "altaz_margin_percent": 5.0,
             "altaz_decay": 0.15,
             "altaz_nanize": True,
+            "altaz_nanize_threshold": 0.001,
             "quality_gate_enabled": False,
             "quality_gate_threshold": 0.48,
             "quality_gate_edge_band_px": 64,
@@ -5805,6 +5823,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "altaz_margin_percent": float(self.config.get("altaz_margin_percent", 5.0) or 5.0),
             "altaz_decay": float(self.config.get("altaz_decay", 0.15) or 0.15),
             "altaz_nanize": bool(self.config.get("altaz_nanize", True)),
+            "altaz_nanize_threshold": float(self.config.get("altaz_nanize_threshold", 0.001) or 0.001),
             "quality_gate_enabled": bool(self.config.get("quality_gate_enabled", False)),
             "quality_gate_threshold": float(self.config.get("quality_gate_threshold", 0.48) or 0.48),
             "quality_gate_edge_band_px": int(self.config.get("quality_gate_edge_band_px", 64) or 64),

@@ -685,6 +685,8 @@
     "qt_field_altaz_enabled": "Activer le nettoyage Alt-Az",
     "qt_field_altaz_margin": "Marge (%)",
     "qt_field_altaz_nanize": "Convertir les lacunes Alt-Az en NaN",
+    "qt_field_altaz_nanize_threshold": "Seuil de NaNisation ALT-AZ",
+    "qt_field_altaz_nanize_threshold_tooltip": "Les pixels dont l’opacité du masque ALT-AZ est <= à ce seuil sont considérés invalides (NaN/0). Augmentez pour supprimer davantage de rampes de bord.",
     "qt_field_anchor_clip": "Clip médian d'ancrage σ",
     "qt_field_anchor_probe_limit": "Limite de sondes d'ancrage",
     "qt_field_anchor_span": "Intervalle d'ancrage",
