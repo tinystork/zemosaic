@@ -226,6 +226,7 @@ DEFAULT_CONFIG = {
     "altaz_margin_percent": 5.0,  # UI: "AltAz margin %"
     "altaz_decay": 0.15,  # UI: "AltAz decay"
     "altaz_nanize": True,  # UI: "Alt-Az → NaN"
+    "altaz_nanize_threshold": 0.001,
     # --- Alt-Az Alpha export ---
     "altaz_export_alpha_fits": True,
     "altaz_export_alpha_sidecar": False,
