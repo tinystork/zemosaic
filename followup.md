@@ -2,19 +2,19 @@
 
 ## Functional Checks
 
-- [ ] Grid mode with stack_plan.csv **without** mount column behaves exactly as before
-- [ ] Grid mode with stack_plan.csv **with only EQ frames** produces a single mosaic
-- [ ] Grid mode with stack_plan.csv **with only ALTZ frames** produces a single mosaic
-- [ ] Grid mode with mixed EQ / ALTZ frames:
-  - [ ] Two distinct runs are executed
-  - [ ] Two output directories are created
-  - [ ] No reprojection or stacking occurs between EQ and ALTZ outputs
+- [x] Grid mode with stack_plan.csv **without** mount column behaves exactly as before
+- [x] Grid mode with stack_plan.csv **with only EQ frames** produces a single mosaic
+- [x] Grid mode with stack_plan.csv **with only ALTZ frames** produces a single mosaic
+- [x] Grid mode with mixed EQ / ALTZ frames:
+  - [x] Two distinct runs are executed
+  - [x] Two output directories are created
+  - [x] No reprojection or stacking occurs between EQ and ALTZ outputs
 
 ## Logging
 
-- [ ] Logs explicitly mention detection of mount-based segregation
-- [ ] Logs show frame counts per mode
-- [ ] Fallback to legacy behavior is clearly logged when applicable
+- [x] Logs explicitly mention detection of mount-based segregation
+- [x] Logs show frame counts per mode
+- [x] Fallback to legacy behavior is clearly logged when applicable
 
 ## Quality Expectations (Qualitative)
 
@@ -24,13 +24,13 @@
 
 ## Regression Safety
 
-- [ ] No changes to classic (non-grid) pipeline behavior
-- [ ] No changes to clustering logic
-- [ ] No changes to photometric normalization code
-- [ ] No changes to GUI
+- [x] No changes to classic (non-grid) pipeline behavior
+- [x] No changes to clustering logic
+- [x] No changes to photometric normalization code
+- [x] No changes to GUI
 
 ## Code Constraints
 
-- [ ] Changes limited to grid_mode-related files
-- [ ] No large-scale refactor
-- [ ] No new dependencies
+- [x] Changes limited to grid_mode-related files
+- [x] No large-scale refactor
+- [x] No new dependencies
