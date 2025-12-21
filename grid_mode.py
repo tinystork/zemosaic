@@ -53,14 +53,17 @@ import csv
 import logging
 import math
 import os
+import platform
 import threading
 import time
 import warnings
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+import psutil
 
 from zemosaic_resource_telemetry import ResourceTelemetryController
 from zemosaic_utils import (
@@ -1995,7 +1998,9 @@ def _stack_weighted_patches_gpu(
                     result = np.nanmedian(median_input, axis=0)
                     outputs = [cp.asarray(result, dtype=cp.float32)]
                 else:
-                    with cp.errstate(divide="ignore", invalid="ignore"):
+                    errstate = getattr(cp, "errstate", None)
+                    ctx = errstate(divide="ignore", invalid="ignore") if callable(errstate) else nullcontext()
+                    with ctx:
                         result = cp.sum(data_masked * weight_effective, axis=0) / cp.clip(weight_sum, 1e-6, None)
                     outputs = [result]
 
@@ -3691,28 +3696,103 @@ def _load_config_from_disk() -> dict:
         return {}
 
 
-def _get_effective_grid_workers(config: dict) -> int:
-    """Determine the effective number of workers for grid tile processing.
+def _get_effective_grid_workers(
+    config: dict,
+    *,
+    use_gpu: bool,
+    stack_chunk_budget_mb: float,
+    gpu_concurrency: int = 1,
+) -> int:
+    """Determine the effective number of workers for grid tile processing."""
 
-    If grid_workers > 0, use that value. Otherwise, compute auto_workers = max(1, os.cpu_count() - 2).
-    Can be forced to 1 for debugging with ZEMOSAIC_GRID_FORCE_SINGLE_THREAD.
-    """
     if os.environ.get("ZEMOSAIC_GRID_FORCE_SINGLE_THREAD", "").lower() in ("1", "true", "yes"):
         effective = 1
         _emit("Forcing single-thread mode for debugging (ZEMOSAIC_GRID_FORCE_SINGLE_THREAD set)")
+        _emit(f"using {effective} workers for tile processing")
+        return effective
+
+    grid_workers = config.get("grid_workers", 0)
+    if grid_workers > 0:
+        effective = int(grid_workers)
+        if use_gpu and platform.system().lower().startswith("windows") and effective > 4:
+            _emit(
+                (
+                    "grid_workers forced by user to "
+                    f"{effective} on Windows+GPU; this may freeze the OS (WDDM)"
+                ),
+                lvl="WARN",
+            )
+        _emit(f"using {effective} workers for tile processing")
+        return effective
+
+    cpu_count = os.cpu_count() or 1
+    base = max(1, cpu_count - 2)
+
+    parallel_autotune_enabled = bool(config.get("parallel_autotune_enabled", True))
+    parallel_target_ram_fraction = float(config.get("parallel_target_ram_fraction", 0.9) or 0.9)
+    parallel_max_cpu_workers = int(config.get("parallel_max_cpu_workers", 0) or 0)
+
+    if not parallel_autotune_enabled:
+        effective = base
+        _emit(f"using {effective} workers for tile processing")
+        return effective
+
+    if platform.system().lower().startswith("windows"):
+        cap_os = 4 if use_gpu else 12
+    elif platform.system().lower() in ("darwin", "macos"):
+        cap_os = 6 if use_gpu else 12
     else:
-        grid_workers = config.get("grid_workers", 0)
-        if grid_workers > 0:
-            effective = int(grid_workers)
-        else:
-            cpu_count = os.cpu_count() or 1
-            effective = max(1, cpu_count - 2)
+        cap_os = 6 if use_gpu else 12
+
+    cap_gpu = max(2, gpu_concurrency * 4) if use_gpu else base
+
+    try:
+        available_mb = float(psutil.virtual_memory().available) / (1024.0 ** 2)
+    except Exception:
+        available_mb = 0.0
+
+    per_worker_mb = max(
+        2500.0 if use_gpu else 1800.0,
+        float(stack_chunk_budget_mb) * (3.0 if use_gpu else 2.0),
+    )
+    ram_budget_mb = available_mb * min(0.98, parallel_target_ram_fraction)
+    cap_ram = max(1, int(math.floor(ram_budget_mb / per_worker_mb))) if per_worker_mb > 0 else 1
+
+    cap_cfg = parallel_max_cpu_workers if parallel_max_cpu_workers > 0 else float("inf")
+
+    effective = int(min(base, cap_os, cap_gpu, cap_ram, cap_cfg))
+
+    _emit(
+        (
+            "Auto-tune grid_workers "
+            f"base={base} cap_os={cap_os} cap_gpu={cap_gpu} "
+            f"cap_ram={cap_ram} cap_cfg={cap_cfg} result={effective}; "
+            f"available_mb={available_mb:.1f} per_worker_mb={per_worker_mb:.1f} "
+            f"stack_chunk_budget_mb={float(stack_chunk_budget_mb):.1f} "
+            f"gpu_concurrency={int(gpu_concurrency)}"
+        ),
+        lvl="INFO",
+    )
     _emit(f"using {effective} workers for tile processing")
     return effective
 
 
 def _compute_gpu_concurrency(stack_chunk_budget_mb: float) -> tuple[int, dict[str, float] | None]:
     """Return (concurrency, details) for GPU stacking based on current VRAM."""
+
+    env_override = os.environ.get("ZEMOSAIC_GRID_GPU_CONCURRENCY", "").strip()
+    if env_override:
+        try:
+            override_val = int(env_override)
+            if override_val > 0:
+                _emit(f"GPU concurrency forced by env to {override_val} (ZEMOSAIC_GRID_GPU_CONCURRENCY)", lvl="INFO")
+                return override_val, {"env_override": override_val}
+        except Exception:
+            _emit(f"Ignoring invalid ZEMOSAIC_GRID_GPU_CONCURRENCY={env_override!r}", lvl="WARN")
+
+    if platform.system().lower().startswith("windows"):
+        _emit("GPU concurrency on Windows forced to 1 (WDDM safety)", lvl="INFO")
+        return 1, {"reason": "windows_wddm"}
 
     if not (_CUPY_AVAILABLE and cp):
         return 1, None
@@ -3939,10 +4019,12 @@ def run_grid_mode(
             config = copy.deepcopy(base_config)
 
             gpu_stack_semaphore: threading.Semaphore | None = None
+            concurrency = 1
+            details = None
             if config.use_gpu:
                 concurrency, details = _compute_gpu_concurrency(config.stack_chunk_budget_mb)
                 gpu_stack_semaphore = threading.Semaphore(max(1, concurrency))
-                if details is not None:
+                if details is not None and {"free_mb", "total_mb", "per_worker_mb", "usable_mb", "auto_n"} <= set(details.keys()):
                     _emit(
                         (
                             "GPU concurrency limiter: "
@@ -3951,6 +4033,26 @@ def run_grid_mode(
                             f"per_worker_est_mb={details['per_worker_mb']:.1f}, "
                             f"usable_mb={details['usable_mb']:.1f}, "
                             f"chosen_concurrency={concurrency}"
+                        ),
+                        lvl="INFO",
+                        callback=progress_callback,
+                    )
+                elif details and "env_override" in details:
+                    _emit(
+                        (
+                            "GPU concurrency limiter: forced by env "
+                            f"ZEMOSAIC_GRID_GPU_CONCURRENCY={details['env_override']} "
+                            f"stack_chunk_budget_mb={config.stack_chunk_budget_mb:.1f} "
+                            f"chosen_concurrency={concurrency}"
+                        ),
+                        lvl="INFO",
+                        callback=progress_callback,
+                    )
+                elif details and details.get("reason") == "windows_wddm":
+                    _emit(
+                        (
+                            "GPU concurrency limiter: Windows WDDM safety -> concurrency=1; "
+                            f"stack_chunk_budget_mb={config.stack_chunk_budget_mb:.1f}"
                         ),
                         lvl="INFO",
                         callback=progress_callback,
@@ -4021,7 +4123,12 @@ def run_grid_mode(
 
             current_phase_index = 2
             current_phase_name = "Grid: tile stacking"
-            num_workers = _get_effective_grid_workers(cfg_disk)
+            num_workers = _get_effective_grid_workers(
+                cfg_disk,
+                use_gpu=bool(config.use_gpu),
+                stack_chunk_budget_mb=float(config.stack_chunk_budget_mb),
+                gpu_concurrency=int(concurrency),
+            )
             _emit(
                 f"Memory telemetry: grid_workers={num_workers}, stack_chunk_budget_mb={config.stack_chunk_budget_mb}",
                 callback=progress_callback,
