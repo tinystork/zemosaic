@@ -1,41 +1,37 @@
-# followup.md
-Patch checklist
+# Follow-up: Validate Qt GUI config sync
 
-A) zemosaic_config.py
-- [x] Add DEFAULT_CONFIG["astap_drizzled_fallback_enabled"]=False
+## What to check after patch
+### A) Live sync sanity
+1) Launch Qt GUI
+2) Open Advanced -> Quality crop
+3) Toggle `Enable quality crop` ON/OFF
+4) Without starting a run, trigger any action that reads config (optional):
+   - change theme mode (forces some config interactions)
+   - open filter dialog and cancel
+5) Start a run and confirm:
+   - Log contains `RUN CONFIG SNAPSHOT` and it matches the UI
 
-B) zemosaic_gui_qt.py
-- [x] In _build_solver_tab (ASTAP configuration group), add:
-  self._register_checkbox("astap_drizzled_fallback_enabled", astap_layout, self._tr("qt_field_astap_drizzled_fallback", "..."))
-- [x] In _build_solver_settings_dict():
-  - read enabled = bool(self.config.get("astap_drizzled_fallback_enabled", False))
-  - include "astap_drizzled_fallback_enabled": enabled in returned dict
-  - if SolverSettings exists: settings.astap_drizzled_fallback_enabled = enabled
+### B) Worker kwargs consistency
+- Confirm the worker log / exported config indicates the same values:
+  - `quality_crop_enabled`
+  - `apply_master_tile_crop`
+  - `master_tile_crop_percent`
+  - `altaz_cleanup_enabled`
+  - `altaz_nanize`
+  - `global_wcs_autocrop_enabled`
 
-C) solver_settings.py
-- [x] Add field in SolverSettings dataclass:
-  astap_drizzled_fallback_enabled: bool = False
+### C) Snapshot file (if implemented)
+- In output dir, verify `run_config_snapshot.json` exists and matches UI choices.
 
-D) zemosaic_astrometry.py
-- [x] Update solve_with_astap signature to accept astap_drizzled_fallback_enabled: bool = False
-- [x] When building cmd_list_astap, store a flag used_pxscale = True when "-pxscale" was added.
-- [x] Implement helper inside solve_with_astap:
-  def _make_fov0_cmd(cmd):
-      # remove -pxscale pair, remove -fov pair if any, append -fov 0
-- [x] In the ASTAP execution loop:
-  - if rc_astap==1 and astap_drizzled_fallback_enabled and used_pxscale and not tried_fallback:
-      tried_fallback=True
-      cmd_list_astap = fallback_cmd
-      log + progress_callback message
-      continue to next attempt
-  - if tried_fallback and rc_astap!=0: break / exit loop normally
+## Regression checks
+- GPU selector still works:
+  - enable/disable GPU checkbox toggles the combobox enabled state
+  - changing GPU selector updates both `gpu_selector` and `gpu_id_phase5`
+- Language switching rebuilds UI (`_refresh_translated_ui`) and does not break bindings
+- Filter window workflow unchanged:
+  - filter button -> filter dialog -> start processing still works
 
-E) locales
-- [x] Add translation key qt_field_astap_drizzled_fallback:
-  EN: "Stacked/drizzled datasets: retry with auto FOV on failure"
-  FR: "Données empilées/drizzlées : retenter en FOV auto si échec"
-
-F) Propagation
-- [x] Pass astap_drizzled_fallback_enabled into solve_with_astap from zemosaic_worker.py
-- [x] Pass astap_drizzled_fallback_enabled into solve_with_astap from zemosaic_filter_gui.py
-- [x] Pass astap_drizzled_fallback_enabled into solve_with_astap from zemosaic_filter_gui_qt.py
+## Expected outcome for the original SDS cropping confusion
+With correct propagation:
+- if UI shows `quality_crop_enabled=False` and `apply_master_tile_crop=False`, the config snapshot must reflect that.
+- Remaining “missing signal” will then be attributable to genuine coverage/alpha behavior or other preprocessing, not a stale config.
