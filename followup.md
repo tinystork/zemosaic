@@ -1,37 +1,54 @@
-# Follow-up: Validate Qt GUI config sync
+# followup.md — Test plan & validation
 
-## What to check after patch
-### A) Live sync sanity
-- [ ] Launch Qt GUI
-- [ ] Open Advanced -> Quality crop
-- [ ] Toggle `Enable quality crop` ON/OFF
-- [ ] Without starting a run, trigger any action that reads config (optional):
-  - change theme mode (forces some config interactions)
-  - open filter dialog and cancel
-- [ ] Start a run and confirm:
-  - Log contains `RUN CONFIG SNAPSHOT` and it matches the UI
+## Quick manual tests (Windows / Qt)
+### Test A — Happy path (existing master tiles)
+1) Prepare a folder containing a known-good set of master tiles:
+   - Example: copy `out/zemosaic_temp_master_tiles/master_tile_*.fits` from a previous successful run.
+2) Launch ZeMosaic Qt.
+3) Set **Input folder** to that folder.
+4) Set **Output folder** to a new empty folder.
+5) Enable: **“I’m using master tiles …”**
+6) Keep default assembly: `Reproject co-add`, keep intertile options ON if you want.
+7) Run.
 
-### B) Worker kwargs consistency
-- [ ] Confirm the worker log / exported config indicates the same values:
-  - `quality_crop_enabled`
-  - `apply_master_tile_crop`
-  - `master_tile_crop_percent`
-  - `altaz_cleanup_enabled`
-  - `altaz_nanize`
-  - `global_wcs_autocrop_enabled`
+Expected:
+- Log shows message that phases 0–3 are skipped due to existing master tiles.
+- No filter/clustering window is invoked.
+- Output final mosaic is produced and looks consistent with the source tiles.
+- Intermediate phase45 outputs (if any) go to the normal temp output area, not inside the input folder.
 
-### C) Snapshot file (if implemented)
-- [ ] In output dir, verify `run_config_snapshot.json` exists and matches UI choices.
+### Test B — Fallback path (invalid WCS)
+1) Use an input folder containing FITS without a valid celestial WCS (or remove WCS keywords).
+2) Enable “I’m using master tiles …”.
+3) Run.
 
-## Regression checks
-- [ ] GPU selector still works:
-  - enable/disable GPU checkbox toggles the combobox enabled state
-  - changing GPU selector updates both `gpu_selector` and `gpu_id_phase5`
-- [ ] Language switching rebuilds UI (`_refresh_translated_ui`) and does not break bindings
-- [ ] Filter window workflow unchanged:
-  - filter button -> filter dialog -> start processing still works
+Expected:
+- Warning appears: insufficient valid master tiles with WCS.
+- ZeMosaic continues in normal mode (phases 0–3 run).
+- No crash.
 
-## Expected outcome for the original SDS cropping confusion
-With correct propagation:
-- [ ] if UI shows `quality_crop_enabled=False` and `apply_master_tile_crop=False`, the config snapshot must reflect that.
-- [ ] Remaining “missing signal” will then be attributable to genuine coverage/alpha behavior or other preprocessing, not a stale config.
+### Test C — Regression (toggle off)
+1) Run a standard dataset with raws (your usual workflow).
+2) Toggle OFF.
+3) Compare logs and outputs with the previous behavior.
+
+Expected:
+- Identical behavior (no changes in clustering/master tile steps, same outputs).
+
+---
+
+## Developer checks
+- Confirm the new config key is present in `DEFAULT_CONFIG` and is saved/loaded.
+- Confirm `zemosaic_worker.py` receives `use_existing_master_tiles_config` and branches only when True.
+- Ensure WCS validation uses `validate_wcs_header()` and does not silently accept garbage headers.
+- Ensure any UI disabling/enabling doesn’t break layout or crash if groups are missing.
+
+---
+
+## What to include in your PR message
+Title: `Qt: Add "use existing master tiles" shortcut mode`
+
+Bullet points:
+- Adds GUI toggle to start pipeline from already-resolved master tiles
+- Validates WCS and falls back safely when invalid
+- No behavior change when toggle is off
