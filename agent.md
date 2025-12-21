@@ -21,7 +21,7 @@ tout en conservant un comportement transparent pour l’utilisateur.
 
 ## Tâches
 
-### 1) Fix bug CuPy `cp.errstate` (évite fallback CPU chaotique)
+### [x] Fix bug CuPy `cp.errstate` (évite fallback CPU chaotique)
 Dans `_stack_weighted_patches_gpu` (vers la division pondérée), remplacer:
 ```py
 with cp.errstate(divide="ignore", invalid="ignore"):
@@ -42,7 +42,7 @@ with ctx:
 
 => si `cp.errstate` n’existe pas, on n’échoue plus, et la division est déjà protégée via `cp.clip(weight_sum, 1e-6, None)`.
 
-### 2) Auto-tune GPU concurrency (Windows => 1 par défaut)
+### [x] Auto-tune GPU concurrency (Windows => 1 par défaut)
 
 Modifier `_compute_gpu_concurrency(stack_chunk_budget_mb)` pour:
 
@@ -59,7 +59,7 @@ Logging:
 * si Windows => log INFO: “GPU concurrency on Windows forced to 1 (WDDM safety)”
 * si override env => log INFO: “GPU concurrency forced by env …”
 
-### 3) Auto-tune `grid_workers` (uniquement si grid_workers==0)
+### [x] Auto-tune `grid_workers` (uniquement si grid_workers==0)
 
 Étendre `_get_effective_grid_workers(config: dict)` en signature:
 
@@ -107,7 +107,7 @@ Comportement:
     * base, cap_os, cap_gpu, cap_ram, cap_cfg, result
     * available_mb, per_worker_mb, stack_chunk_budget_mb, gpu_concurrency
 
-### 4) Adapter l’appel existant dans `run_grid_mode`
+### [x] Adapter l’appel existant dans `run_grid_mode`
 
 Dans `run_grid_mode`, lors de la création du `ThreadPoolExecutor`:
 
@@ -138,4 +138,3 @@ num_workers = _get_effective_grid_workers(
 
 * Ne pas toucher au reste du pipeline Grid (assign, stack, assemble).
 * Pas de nouveaux champs GUI.
-
