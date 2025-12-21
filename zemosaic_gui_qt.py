@@ -1514,6 +1514,14 @@ class ZeMosaicQtMainWindow(QMainWindow):
             minimum=1,
             maximum=astap_cap,
         )
+        self._register_checkbox(
+            "astap_drizzled_fallback_enabled",
+            astap_layout,
+            self._tr(
+                "qt_field_astap_drizzled_fallback",
+                "Stacked/drizzled datasets: retry with auto FOV on failure",
+            ),
+        )
 
         outer_layout.addWidget(astap_box)
 
@@ -5365,6 +5373,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
         astap_downsample = int(self.config.get("astap_default_downsample", 2) or 2)
         astap_sensitivity = int(self.config.get("astap_default_sensitivity", 100) or 100)
         astap_max_instances = self._resolve_astap_max_instances()
+        astap_drizzled_fallback_enabled = bool(
+            self.config.get("astap_drizzled_fallback_enabled", False)
+        )
         solver_choice = str(self.config.get("solver_method", "ASTAP") or "ASTAP")
         api_key = str(self.config.get("astrometry_api_key", "") or "")
 
@@ -5381,6 +5392,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 "astap_downsample": astap_downsample,
                 "astap_sensitivity": astap_sensitivity,
                 "astap_max_instances": astap_max_instances,
+                "astap_drizzled_fallback_enabled": astap_drizzled_fallback_enabled,
             }
 
         try:
@@ -5407,6 +5419,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         settings.astap_search_radius_deg = search_radius
         settings.astap_downsample = astap_downsample
         settings.astap_sensitivity = astap_sensitivity
+        settings.astap_drizzled_fallback_enabled = astap_drizzled_fallback_enabled
         payload = asdict(settings)
         payload["astap_max_instances"] = astap_max_instances
         return payload

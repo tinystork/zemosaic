@@ -697,6 +697,7 @@
     "qt_field_astap_executable": "Exécutable ASTAP",
     "qt_field_astap_search_radius": "Rayon de recherche par défaut (°)",
     "qt_field_astap_sensitivity": "Sensibilité par défaut",
+    "qt_field_astap_drizzled_fallback": "Données empilées/drizzlées : retenter en FOV auto si échec",
     "qt_field_astrometry_api_key": "Clé API",
     "qt_field_astrometry_downsample": "Downsample blind solve",
     "qt_field_astrometry_timeout": "Timeout (s)",

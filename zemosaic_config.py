@@ -80,6 +80,7 @@ DEFAULT_CONFIG = {
     "astap_default_downsample": 2,
     "astap_default_sensitivity": 100,
     "astap_max_instances": 1,
+    "astap_drizzled_fallback_enabled": False,
     "language": "en",
     "preferred_gui_backend": "tk",  # "tk" or "qt"
     "preferred_gui_backend_explicit": False,

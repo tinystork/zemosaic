@@ -10239,6 +10239,9 @@ def get_wcs_and_pretreat_raw_file(
     force_resolve_existing_wcs = bool(
         solver_settings.get("force_resolve_existing_wcs", force_resolve_existing_wcs_cfg)
     )
+    astap_drizzled_fallback_enabled = bool(
+        solver_settings.get("astap_drizzled_fallback_enabled", False)
+    )
     try:
         affine_offset_limit_adu = float(solver_settings.get("intertile_offset_limit_adu", 50.0))
     except Exception:
@@ -10512,6 +10515,7 @@ def get_wcs_and_pretreat_raw_file(
                         search_radius_deg=astap_search_radius,
                         downsample_factor=astap_downsample,
                         sensitivity=astap_sensitivity,
+                        astap_drizzled_fallback_enabled=astap_drizzled_fallback_enabled,
                         timeout_sec=astap_timeout_seconds,
                         update_original_header_in_place=True,
                         progress_callback=progress_callback,
@@ -10540,6 +10544,7 @@ def get_wcs_and_pretreat_raw_file(
                         search_radius_deg=astap_search_radius,
                         downsample_factor=astap_downsample,
                         sensitivity=astap_sensitivity,
+                        astap_drizzled_fallback_enabled=astap_drizzled_fallback_enabled,
                         timeout_sec=astap_timeout_seconds,
                         update_original_header_in_place=True,
                         progress_callback=progress_callback,
@@ -10559,6 +10564,7 @@ def get_wcs_and_pretreat_raw_file(
                     search_radius_deg=astap_search_radius,
                     downsample_factor=astap_downsample,
                     sensitivity=astap_sensitivity,
+                    astap_drizzled_fallback_enabled=astap_drizzled_fallback_enabled,
                     timeout_sec=astap_timeout_seconds,
                     update_original_header_in_place=True,
                     progress_callback=progress_callback,

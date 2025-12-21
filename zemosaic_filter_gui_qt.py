@@ -1341,6 +1341,9 @@ class _DirectoryScanWorker(QObject):
                     search_radius_deg=config.get("radius"),
                     downsample_factor=config.get("downsample"),
                     sensitivity=config.get("sensitivity"),
+                    astap_drizzled_fallback_enabled=config.get(
+                        "astap_drizzled_fallback_enabled", False
+                    ),
                     timeout_sec=timeout_val,
                     update_original_header_in_place=write_inplace,
                 )
@@ -1557,6 +1560,12 @@ class _DirectoryScanWorker(QObject):
             self._overrides.get("astap_timeout_sec"),
             default=180,
         )
+        fallback_enabled = self._overrides.get("astap_drizzled_fallback_enabled")
+        if fallback_enabled is None:
+            fallback_enabled = self._solver_settings.get(
+                "astap_drizzled_fallback_enabled", False
+            )
+        fallback_enabled = bool(fallback_enabled)
 
         concurrency = self._coerce_int(
             self._solver_settings.get("astap_max_instances"),
@@ -1579,6 +1588,7 @@ class _DirectoryScanWorker(QObject):
             "sensitivity": sensitivity,
             "timeout": timeout,
             "concurrency": concurrency_value,
+            "astap_drizzled_fallback_enabled": fallback_enabled,
         }
 
     @staticmethod

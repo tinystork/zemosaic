@@ -710,6 +710,7 @@
     "qt_field_astap_executable": "ASTAP executable",
     "qt_field_astap_search_radius": "Default search radius (°)",
     "qt_field_astap_sensitivity": "Default sensitivity",
+    "qt_field_astap_drizzled_fallback": "Stacked/drizzled datasets: retry with auto FOV on failure",
     "qt_field_astrometry_api_key": "API key",
     "qt_field_astrometry_downsample": "Blind-solve downsample",
     "qt_field_astrometry_timeout": "Timeout (s)",
