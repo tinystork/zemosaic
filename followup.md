@@ -1,43 +1,36 @@
-# followup.md — Validation & tests (manual)
+# followup.md
+Patch checklist
 
-## 1) Sanity checks (log)
-Lancer un run Grid mode en conditions “à problème” (GPU + dataset conséquent).
+A) zemosaic_config.py
+- Add DEFAULT_CONFIG["astap_drizzled_fallback_enabled"]=False
 
-Vérifier dans le log:
-- Absence de:
-  - `GPU stack failed, falling back to CPU: module 'cupy' has no attribute 'errstate'`
-- Présence de:
-  - `GPU concurrency ... forced to 1 (WDDM safety)` (Windows)
-  - `Auto-tune grid_workers ... base=..., cap_os=..., cap_gpu=..., cap_ram=..., result=...`
-  - `using X workers for tile processing` avec X raisonnable (<=4 Windows+GPU en auto)
+B) zemosaic_gui_qt.py
+- In _build_solver_tab (ASTAP configuration group), add:
+  self._register_checkbox("astap_drizzled_fallback_enabled", astap_layout, self._tr("qt_field_astap_drizzled_fallback", "..."))
+- In _build_solver_settings_dict():
+  - read enabled = bool(self.config.get("astap_drizzled_fallback_enabled", False))
+  - include "astap_drizzled_fallback_enabled": enabled in returned dict
+  - if SolverSettings exists: settings.astap_drizzled_fallback_enabled = enabled
 
-## 2) Tests de comportement utilisateur (transparence)
-### Cas A — utilisateur ne touche à rien
-- `grid_workers` absent ou 0 => autotune actif.
-- Attendu: workers capés automatiquement, pas de freeze OS.
+C) solver_settings.py
+- Add field in SolverSettings dataclass:
+  astap_drizzled_fallback_enabled: bool = False
 
-### Cas B — utilisateur force grid_workers
-- mettre `grid_workers=14` dans config
-- Attendu: workers=14 (respect), mais warning si Windows+GPU+>4.
+D) zemosaic_astrometry.py
+- Update solve_with_astap signature to accept astap_drizzled_fallback_enabled: bool = False
+- When building cmd_list_astap, store a flag used_pxscale = True when "-pxscale" was added.
+- Implement helper inside solve_with_astap:
+  def _make_fov0_cmd(cmd):
+      # remove -pxscale pair, remove -fov pair if any, append -fov 0
+- In the ASTAP execution loop:
+  - if rc_astap==1 and astap_drizzled_fallback_enabled and used_pxscale and not tried_fallback:
+      tried_fallback=True
+      cmd_list_astap = fallback_cmd
+      log + progress_callback message
+      continue to next attempt
+  - if tried_fallback and rc_astap!=0: break / exit loop normally
 
-### Cas C — désactiver l’autotune (compat)
-- mettre `parallel_autotune_enabled=false` dans config
-- Attendu: retour à la logique historique auto = cpu_count-2 (si grid_workers=0),
-  et GPU concurrency reprend la formule VRAM (sauf Windows rule si tu l’as laissée conditionnée à autotune).
-
-## 3) Overrides utiles (debug)
-- Forcer single thread:
-  - `ZEMOSAIC_GRID_FORCE_SINGLE_THREAD=1`
-- Forcer la GPU concurrency:
-  - `ZEMOSAIC_GRID_GPU_CONCURRENCY=1` (ou 2/3 pour tests)
-
-## 4) Validation “anti-freeze”
-Sur Windows:
-- lancer un run avec dataset lourd et laisser le PC utilisable (bouger fenêtres, ouvrir navigateur).
-- Attendu: pas de freeze de l’UI OS.
-
-## 5) Non-régression
-- Lancer un run CPU-only (use_gpu_grid=false):
-  - Attendu: pas de régression perf, et workers auto peuvent monter plus haut (dans la limite des caps).
-````
-
+E) locales
+- Add translation key qt_field_astap_drizzled_fallback:
+  EN: "Stacked/drizzled datasets: retry with auto FOV on failure"
+  FR: "Données empilées/drizzlées : retenter en FOV auto si échec"
