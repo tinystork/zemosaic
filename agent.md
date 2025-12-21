@@ -22,7 +22,7 @@ This can lead to UI showing a value (e.g. checkbox OFF) while the config passed 
 ## Implementation Plan
 
 ### 1) Add a single-key sync helper
-Add a method in the main window class:
+- [x] Add a method in the main window class:
 
 `def _sync_config_key_from_widget(self, key: str) -> None:`
 
@@ -37,11 +37,10 @@ It must:
 
 Optionally also provide:
 
-`def _sync_config_keys(self, keys: list[str]) -> None:`
-to sync multiple linked keys (GPU selector updates 2 keys).
+`def _sync_config_keys(self, keys: list[str]) -> None:` to sync multiple linked keys (GPU selector updates 2 keys).
 
 ### 2) Wire live-sync in the register helpers
-Modify these helper methods to connect widget signals so they call `_sync_config_key_from_widget(key)`:
+- [x] Modify these helper methods to connect widget signals so they call `_sync_config_key_from_widget(key)`:
 
 - `_register_checkbox`: connect `toggled` or `stateChanged`
 - `_register_spinbox`: connect `valueChanged`
@@ -54,7 +53,7 @@ Important: use lambdas capturing `key` safely:
 `checkbox.toggled.connect(lambda _=None, k=key: self._sync_config_key_from_widget(k))`
 
 ### 3) Make the worker use a deterministic snapshot
-In `_build_worker_invocation()`:
+- [x] In `_build_worker_invocation()`:
 - build `snapshot = self._serialize_config_for_save()` (already exists)
 - use `worker_kwargs = snapshot.copy()` (instead of `self.config.copy()`)
 
@@ -65,7 +64,7 @@ This ensures:
 Also ensure phase 4.5 disable guard remains applied.
 
 ### 4) Add a run snapshot log + optional JSON dump
-In `_start_processing()` after `_collect_config_from_widgets()` and before spawning worker:
+- [x] In `_start_processing()` after `_collect_config_from_widgets()` and before spawning worker:
 - compute `snapshot = self._serialize_config_for_save()`
 - log a short one-liner with the most error-prone keys, e.g.:
   - `quality_crop_enabled`
@@ -79,7 +78,7 @@ The log message must be plain (no localization changes required), e.g.
 `[INFO] RUN CONFIG SNAPSHOT: quality_crop_enabled=False, apply_master_tile_crop=False, ...`
 
 ### 5) Keep existing “collect on start” behavior
-Do not remove `_collect_config_from_widgets()`. Keep it as final safety net.
+- [x] Do not remove `_collect_config_from_widgets()`. Keep it as final safety net.
 
 ## Acceptance Criteria
 1. Toggling any checkbox (e.g. quality crop) immediately updates `self.config[key]`.

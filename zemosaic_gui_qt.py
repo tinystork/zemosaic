@@ -3277,6 +3277,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "widget": line_edit,
             "type": str,
         }
+        line_edit.editingFinished.connect(lambda k=key: self._sync_config_key_from_widget(k))  # type: ignore[arg-type]
 
     def _register_line_edit(
         self,
@@ -3320,6 +3321,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 if selected:
                     widget.setText(selected)
                     self.config[key] = selected
+                    self._sync_config_key_from_widget(key)
 
             browse_button.clicked.connect(_on_browse)  # type: ignore[arg-type]
             row_layout.addWidget(browse_button)
@@ -3337,6 +3339,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "widget": widget,
             "type": value_type,
         }
+        widget.editingFinished.connect(lambda k=key: self._sync_config_key_from_widget(k))  # type: ignore[arg-type]
 
     def _register_checkbox(self, key: str, layout: QFormLayout, label_text: str) -> QCheckBox:
         checkbox = QCheckBox(label_text)
@@ -3347,6 +3350,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "widget": checkbox,
             "type": bool,
         }
+        checkbox.toggled.connect(lambda _=None, k=key: self._sync_config_key_from_widget(k))  # type: ignore[arg-type]
         return checkbox
 
     def _register_spinbox(
@@ -3371,6 +3375,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "widget": spinbox,
             "type": int,
         }
+        spinbox.valueChanged.connect(lambda _=None, k=key: self._sync_config_key_from_widget(k))  # type: ignore[arg-type]
 
     def _register_double_spinbox(
         self,
@@ -3398,6 +3403,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "widget": spinbox,
             "type": float,
         }
+        spinbox.valueChanged.connect(lambda _=None, k=key: self._sync_config_key_from_widget(k))  # type: ignore[arg-type]
 
     def _register_double_pair(
         self,
@@ -3454,6 +3460,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 float(ss.value()),
             ],
         }
+        first_spin.valueChanged.connect(lambda _=None, k=key: self._sync_config_key_from_widget(k))  # type: ignore[arg-type]
+        second_spin.valueChanged.connect(lambda _=None, k=key: self._sync_config_key_from_widget(k))  # type: ignore[arg-type]
 
     def _register_gpu_selector(
         self,
@@ -3548,6 +3556,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "type": int,
             "value_getter": _gpu_id_getter,
         }
+        combo.currentIndexChanged.connect(lambda _=None: self._sync_config_keys(["gpu_selector", "gpu_id_phase5"]))  # type: ignore[arg-type]
+        combo.editTextChanged.connect(lambda _=None: self._sync_config_keys(["gpu_selector", "gpu_id_phase5"]))  # type: ignore[arg-type]
 
         def _update_enabled(state: bool) -> None:
             combo.setEnabled(state)
@@ -3615,6 +3625,66 @@ class ZeMosaicQtMainWindow(QMainWindow):
         if target is None:
             return
         target["inter_master_merge_enable"] = False
+
+    def _sync_config_key_from_widget(self, key: str) -> None:
+        binding = self._config_fields.get(key)
+        if not binding:
+            return
+        try:
+            kind = binding.get("kind")
+            widget = binding.get("widget")
+            expected_type = binding.get("type", str)
+            value_getter = binding.get("value_getter")
+            if callable(value_getter):
+                raw_value = value_getter()
+            elif kind == "checkbox":
+                raw_value = bool(widget.isChecked())
+            elif kind == "spinbox":
+                raw_value = int(widget.value())
+            elif kind == "double_spinbox":
+                raw_value = float(widget.value())
+            elif kind == "combobox":
+                data = widget.currentData()
+                raw_value = data if data is not None else widget.currentText()
+            else:
+                raw_text = ""
+                try:
+                    raw_text = widget.text().strip()
+                except Exception:
+                    raw_text = str(getattr(widget, "text", "") or "").strip()
+                if expected_type in {int, float}:
+                    try:
+                        raw_value = expected_type(raw_text)  # type: ignore[arg-type]
+                    except (TypeError, ValueError):
+                        raw_value = self.config.get(key)
+                elif expected_type is bool:
+                    normalized = raw_text.lower()
+                    if normalized in {"1", "true", "yes", "on"}:
+                        raw_value = True
+                    elif normalized in {"0", "false", "no", "off"}:
+                        raw_value = False
+                    else:
+                        raw_value = self.config.get(key, False)
+                else:
+                    raw_value = raw_text
+
+            postprocess = binding.get("postprocess")
+            if callable(postprocess):
+                try:
+                    raw_value = postprocess(raw_value)
+                except Exception:
+                    raw_value = self.config.get(key, raw_value)
+
+            self.config[key] = raw_value
+        except Exception:
+            self.config[key] = self.config.get(key)
+
+    def _sync_config_keys(self, keys: Sequence[str]) -> None:
+        for key in keys:
+            try:
+                self._sync_config_key_from_widget(str(key))
+            except Exception:
+                continue
 
     def _collect_config_from_widgets(self) -> None:
         for key, binding in self._config_fields.items():
@@ -5341,7 +5411,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
         cfg = self.config
         self._disable_phase45_config(cfg)
 
-        worker_kwargs = cfg.copy()
+        snapshot = self._serialize_config_for_save()
+        worker_kwargs = snapshot.copy()
 
         try:
             level_val = str(worker_kwargs.get("logging_level", "INFO") or "INFO").upper()
@@ -5365,6 +5436,43 @@ class ZeMosaicQtMainWindow(QMainWindow):
             worker_kwargs["early_filter_enabled"] = False
         
         return (), worker_kwargs
+
+    def _log_run_config_snapshot(self, snapshot: Dict[str, Any]) -> None:
+        keys_of_interest = [
+            "quality_crop_enabled",
+            "apply_master_tile_crop",
+            "master_tile_crop_percent",
+            "altaz_cleanup_enabled",
+            "altaz_nanize",
+            "global_wcs_autocrop_enabled",
+            "final_assembly_method",
+            "sds_mode_default",
+        ]
+        summary_parts = [f"{key}={snapshot.get(key)}" for key in keys_of_interest]
+        message = f"RUN CONFIG SNAPSHOT: {', '.join(summary_parts)}"
+        try:
+            self._append_log(message, level="info")
+        except Exception:
+            pass
+
+        output_dir = snapshot.get("output_dir")
+        if not output_dir:
+            return
+        try:
+            target_dir = Path(str(output_dir)).expanduser()
+        except Exception:
+            return
+        if not safe_path_isdir(target_dir):
+            try:
+                target_dir.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                return
+        target_path = target_dir / "run_config_snapshot.json"
+        try:
+            with target_path.open("w", encoding="utf-8") as handle:
+                json.dump(snapshot, handle, indent=2, ensure_ascii=False)
+        except Exception:
+            return
 
     def _build_solver_settings_dict(self) -> Dict[str, Any]:
         astap_exe = str(self.config.get("astap_executable_path", "") or "")
@@ -5539,6 +5647,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 else:
                     skip_filter_ui_for_run = True
 
+        run_snapshot = self._serialize_config_for_save()
+        self._log_run_config_snapshot(run_snapshot)
         self._save_config()
 
         try:
