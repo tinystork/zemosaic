@@ -53,6 +53,7 @@ import csv
 import logging
 import math
 import os
+import threading
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -2010,7 +2011,14 @@ def _stack_weighted_patches_gpu(
         )
 
 
-def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, progress_callback: ProgressCallback = None) -> Path | None:
+def process_tile(
+    tile: GridTile,
+    output_dir: Path,
+    config: GridModeConfig,
+    *,
+    progress_callback: ProgressCallback = None,
+    gpu_stack_semaphore: threading.Semaphore | None = None,
+) -> Path | None:
     """Process a single tile and write it to disk."""
 
     if not tile.frames:
@@ -2059,6 +2067,18 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
     reference_median: float | None = None
     chunk_failed = False
 
+    def _cleanup_gpu_memory() -> None:
+        if not (_CUPY_AVAILABLE and cp and config.use_gpu):
+            return
+        try:
+            cp.get_default_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+        try:
+            cp.get_default_pinned_memory_pool().free_all_blocks()
+        except Exception:
+            pass
+
     def flush_chunk() -> None:
         """Stack the current chunk and fold it into the running accumulator."""
 
@@ -2068,14 +2088,27 @@ def process_tile(tile: GridTile, output_dir: Path, config: GridModeConfig, *, pr
             weight_maps.clear()
             return
         if config.use_gpu:
-            res = _stack_weighted_patches_gpu(
-                aligned_patches,
-                weight_maps,
-                config,
-                reference_median=reference_median,
-                return_weight_sum=True,
-                return_ref_median=True,
-            )
+            def _stack_gpu() -> np.ndarray | tuple | None:
+                return _stack_weighted_patches_gpu(
+                    aligned_patches,
+                    weight_maps,
+                    config,
+                    reference_median=reference_median,
+                    return_weight_sum=True,
+                    return_ref_median=True,
+                )
+
+            if gpu_stack_semaphore is not None:
+                with gpu_stack_semaphore:
+                    try:
+                        res = _stack_gpu()
+                    finally:
+                        _cleanup_gpu_memory()
+            else:
+                try:
+                    res = _stack_gpu()
+                finally:
+                    _cleanup_gpu_memory()
         else:
             res = _stack_weighted_patches(
                 aligned_patches,
@@ -3678,6 +3711,33 @@ def _get_effective_grid_workers(config: dict) -> int:
     return effective
 
 
+def _compute_gpu_concurrency(stack_chunk_budget_mb: float) -> tuple[int, dict[str, float] | None]:
+    """Return (concurrency, details) for GPU stacking based on current VRAM."""
+
+    if not (_CUPY_AVAILABLE and cp):
+        return 1, None
+    try:
+        free_bytes, total_bytes = cp.cuda.runtime.memGetInfo()
+        free_mb = float(free_bytes) / (1024.0 ** 2)
+        total_mb = float(total_bytes) / (1024.0 ** 2)
+        safety_mult = 2.5
+        fixed_overhead_mb = 512.0
+        per_worker_mb = max(1.0, float(stack_chunk_budget_mb) * safety_mult + fixed_overhead_mb)
+        usable_mb = max(0.0, free_mb * 0.80)
+        auto_n = math.floor(usable_mb / per_worker_mb) if per_worker_mb > 0 else 1
+        concurrency = int(max(1, min(auto_n, 4)))
+        details = {
+            "free_mb": free_mb,
+            "total_mb": total_mb,
+            "per_worker_mb": per_worker_mb,
+            "usable_mb": usable_mb,
+            "auto_n": float(auto_n),
+        }
+        return concurrency, details
+    except Exception:
+        return 1, None
+
+
 def run_grid_mode(
     input_folder: str,
     output_folder: str,
@@ -3878,6 +3938,33 @@ def run_grid_mode(
 
             config = copy.deepcopy(base_config)
 
+            gpu_stack_semaphore: threading.Semaphore | None = None
+            if config.use_gpu:
+                concurrency, details = _compute_gpu_concurrency(config.stack_chunk_budget_mb)
+                gpu_stack_semaphore = threading.Semaphore(max(1, concurrency))
+                if details is not None:
+                    _emit(
+                        (
+                            "GPU concurrency limiter: "
+                            f"free_vram_mb={details['free_mb']:.1f}/{details['total_mb']:.1f}, "
+                            f"stack_chunk_budget_mb={config.stack_chunk_budget_mb:.1f}, "
+                            f"per_worker_est_mb={details['per_worker_mb']:.1f}, "
+                            f"usable_mb={details['usable_mb']:.1f}, "
+                            f"chosen_concurrency={concurrency}"
+                        ),
+                        lvl="INFO",
+                        callback=progress_callback,
+                    )
+                else:
+                    _emit(
+                        (
+                            "GPU concurrency limiter: defaulting to 1 (VRAM info unavailable); "
+                            f"stack_chunk_budget_mb={config.stack_chunk_budget_mb:.1f}"
+                        ),
+                        lvl="INFO",
+                        callback=progress_callback,
+                    )
+
             _emit(
             (
                 "Stacking config: "
@@ -3947,7 +4034,17 @@ def run_grid_mode(
             )
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
-                futures = {executor.submit(process_tile, tile, out_dir, config, progress_callback=progress_callback): tile for tile in grid.tiles}
+                futures = {
+                    executor.submit(
+                        process_tile,
+                        tile,
+                        out_dir,
+                        config,
+                        progress_callback=progress_callback,
+                        gpu_stack_semaphore=gpu_stack_semaphore,
+                    ): tile
+                    for tile in grid.tiles
+                }
                 for future in concurrent.futures.as_completed(futures):
                     tile = futures[future]
                     try:
