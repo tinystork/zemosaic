@@ -3005,8 +3005,14 @@ def stretch_auto_asifits_like(img_hwc_adu, p_low=0.5, p_high=99.8,
 
     for c in range(3):
         chan = img[..., c]
+        if not np.isfinite(chan).any():
+            out[..., c].fill(0.0)
+            continue
         # percentile returns python floats/float64; cast to float32 to avoid upcasting chan
-        vmin_f64, vmax_f64 = np.percentile(chan, [p_low, p_high])
+        vmin_f64, vmax_f64 = np.nanpercentile(chan, [p_low, p_high])
+        if not (np.isfinite(vmin_f64) and np.isfinite(vmax_f64)):
+            out[..., c].fill(0.0)
+            continue
         vmin = np.float32(vmin_f64)
         vmax = np.float32(vmax_f64)
         dv = vmax - vmin
@@ -4831,12 +4837,29 @@ def stretch_auto_asifits_like_gpu(img_hwc_adu,
             raise RuntimeError("GPU stretch: insufficient memory")
         for c in range(3):
             chan = cp.asarray(img[..., c])
-            vmin = cp.percentile(chan, p_low)
-            vmax = cp.percentile(chan, p_high)
-            if float(vmax - vmin) < 1e-3:
+            finite_mask = cp.isfinite(chan)
+            if not bool(finite_mask.any()):
                 out[..., c] = 0.0
                 continue
-            normed = cp.clip((chan - vmin) / cp.maximum(vmax - vmin, 1e-6), 0, 1)
+            nanpercentile = getattr(cp, "nanpercentile", None)
+            if nanpercentile is not None:
+                vmin = nanpercentile(chan, p_low)
+                vmax = nanpercentile(chan, p_high)
+            else:
+                chan_finite = chan[finite_mask]
+                if chan_finite.size == 0:
+                    out[..., c] = 0.0
+                    continue
+                vmin = cp.percentile(chan_finite, p_low)
+                vmax = cp.percentile(chan_finite, p_high)
+            if not (bool(cp.isfinite(vmin)) and bool(cp.isfinite(vmax))):
+                out[..., c] = 0.0
+                continue
+            dv = vmax - vmin
+            if float(dv) < 1e-3:
+                out[..., c] = 0.0
+                continue
+            normed = cp.clip((chan - vmin) / cp.maximum(dv, 1e-6), 0, 1)
             stretched = cp.arcsinh(normed / asinh_a) / cp.arcsinh(1.0 / asinh_a)
             if float(cp.nanmax(stretched)) < 0.05:
                 stretched = normed

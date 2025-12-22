@@ -1,63 +1,255 @@
+diff --git a/followup.md b/followup.md
+index 152204013a95c74766b98e8d15a19d4f6ac94c00..732c4b313f5a697b17a69a9c0b899777c8062ffd 100644
+--- a/followup.md
++++ b/followup.md
+@@ -1,41 +1,41 @@
+ ## Checklist d’implémentation (Codex)
+ 
+ ### 1) Preview noir : CPU
+-- [ ] Dans `zemosaic_utils.py / stretch_auto_asifits_like()`, remplacer `np.percentile` par une logique NaN-aware (nanpercentile + garde-fous).
+-- [ ] Vérifier qu’aucun gros temporaire float64 n’est introduit (rester en float32).
+-- [ ] Vérifier le comportement si le canal est 100% NaN → sortie canal = 0 (pas d’exception).
++- [x] Dans `zemosaic_utils.py / stretch_auto_asifits_like()`, remplacer `np.percentile` par une logique NaN-aware (nanpercentile + garde-fous).
++- [x] Vérifier qu’aucun gros temporaire float64 n’est introduit (rester en float32).
++- [x] Vérifier le comportement si le canal est 100% NaN → sortie canal = 0 (pas d’exception).
+ 
+ ### 2) Preview noir : GPU
+-- [ ] Dans `zemosaic_utils.py / stretch_auto_asifits_like_gpu()`, remplacer `cp.percentile` par `cp.nanpercentile` (si dispo) ou fallback sur valeurs finies.
+-- [ ] Ajouter garde-fous (canal vide / vmin-vmax trop faible) → sortie canal = 0.
+-- [ ] Ne pas modifier la logique de fallback CPU existante.
++- [x] Dans `zemosaic_utils.py / stretch_auto_asifits_like_gpu()`, remplacer `cp.percentile` par `cp.nanpercentile` (si dispo) ou fallback sur valeurs finies.
++- [x] Ajouter garde-fous (canal vide / vmin-vmax trop faible) → sortie canal = 0.
++- [x] Ne pas modifier la logique de fallback CPU existante.
+ 
+ ### 3) Pondération perdue : keywords
+-- [ ] Dans `zemosaic_worker.py`, dans `assemble_final_mosaic_reproject_coadd()` → `_extract_tile_weight()` :
+-  - [ ] ajouter `NRAWPROC`, `NRAWINIT` à la liste des keywords.
+-- [ ] Ne PAS modifier la construction de `input_weights_list` (éviter double pondération).
+-- [ ] Ne PAS toucher au mode “I'm using master tiles (skip clustering_master tile creation)”.
++- [x] Dans `zemosaic_worker.py`, dans `assemble_final_mosaic_reproject_coadd()` → `_extract_tile_weight()` :
++  - [x] ajouter `NRAWPROC`, `NRAWINIT` à la liste des keywords.
++- [x] Ne PAS modifier la construction de `input_weights_list` (éviter double pondération).
++- [x] Ne PAS toucher au mode “I'm using master tiles (skip clustering_master tile creation)”.
+ 
+ ---
+ 
+ ## Procédure de validation manuelle (sans changer d’autres fichiers)
+ 
+ ### A) Valider preview
+ 1) Lancer un run qui produit des master tiles / mosaïque avec alpha/NaN masking.
+ 2) Ouvrir le `*_preview.png` :
+    - Vérifier qu’il n’est plus noir (RGB non nuls) et que la transparence est conservée.
+ 
+ ### B) Valider pondération
+ 1) Prendre un FITS d’entrée (existing master tile) contenant `NRAWPROC` / `NRAWINIT`.
+ 2) Lancer l’assemblage final en mode “existing master tiles”.
+ 3) Vérifier dans les logs :
+    - ligne “Tile-weighting enabled — mode=N_FRAMES”
+    - summary min/max/mean ≠ 1.0 si les headers ont des valeurs > 1
+ 4) Vérifier que le rendu final n’est plus “écrasé” par des tuiles moins profondes (qualitativement, le signal doit mieux tenir).
+ 
+ ---
+ 
+ ## Anti-régressions (à surveiller)
+ - Preview : ne pas changer l’alpha, seulement rendre le stretch robuste aux NaN.
+ - Poids : ne pas doubler les poids (ne pas multiplier `input_weights` *et* passer `tile_weights`).
+ - Aucun impact sur le clustering, la création de master tiles, ni le pipeline non-existing-master-tiles.
+diff --git a/zemosaic_utils.py b/zemosaic_utils.py
+index 4f1282d5262e3e05f88bd4f6f53b96c63f8f858d..af3fca724a4162ac50a9024aab109ff6b5ac5173 100644
+--- a/zemosaic_utils.py
++++ b/zemosaic_utils.py
+@@ -2983,52 +2983,58 @@ def make_radial_weight_map(height: int, width: int,
+     
+     # Application du plancher de poids si spécifié et > 0
+     if min_weight_floor > 1e-6: # Utiliser un epsilon pour comparer les floats à zéro
+         _pcb_radial(f"RadialMap: Application d'un plancher de poids minimal de {min_weight_floor:.3f}.", lvl="DEBUG_DETAIL")
+         final_weight_map = np.maximum(weight_map_cos, min_weight_floor)
+     else:
+         final_weight_map = weight_map_cos
+         
+     return final_weight_map.astype(np.float32)
+ 
+ def stretch_auto_asifits_like(img_hwc_adu, p_low=0.5, p_high=99.8, 
+                               asinh_a=0.01, apply_wb=True):
+     """
+     Étirement type ASIFitsViewer avec asinh et auto balance RVB.
+     Fallback vers du linéaire si dynamique trop faible.
+     """
+     # Keep everything strictly in float32 to avoid huge float64 temporaries on large mosaics
+     img = np.asarray(img_hwc_adu, dtype=np.float32)
+     out = np.empty_like(img, dtype=np.float32)
+ 
+     a32 = np.float32(asinh_a) if asinh_a is not None else np.float32(0.01)
+     inv_asinh_den = np.float32(1.0) / np.arcsinh(np.float32(1.0) / a32)
+ 
+     for c in range(3):
+         chan = img[..., c]
++        if not np.isfinite(chan).any():
++            out[..., c].fill(0.0)
++            continue
+         # percentile returns python floats/float64; cast to float32 to avoid upcasting chan
+-        vmin_f64, vmax_f64 = np.percentile(chan, [p_low, p_high])
++        vmin_f64, vmax_f64 = np.nanpercentile(chan, [p_low, p_high])
++        if not (np.isfinite(vmin_f64) and np.isfinite(vmax_f64)):
++            out[..., c].fill(0.0)
++            continue
+         vmin = np.float32(vmin_f64)
+         vmax = np.float32(vmax_f64)
+         dv = vmax - vmin
+         if not np.isfinite(dv) or dv < np.float32(1e-3):
+             out[..., c].fill(0.0)
+             continue
+         # In-place normalize into out[..., c] to avoid an extra full-size array
+         dst = out[..., c]
+         np.subtract(chan, vmin, out=dst, dtype=np.float32)
+         np.divide(dst, dv, out=dst)
+         np.clip(dst, 0.0, 1.0, out=dst)
+         # asinh stretch in-place, keeping float32
+         # tmp = arcsinh(dst / a32) * inv_arcsinh(1/a)
+         np.divide(dst, a32, out=dst)
+         np.arcsinh(dst, out=dst)
+         dst *= inv_asinh_den
+         if not np.isfinite(np.nanmax(dst)) or np.nanmax(dst) < np.float32(0.05):
+             # fallback to linear (already in dst)
+             pass
+ 
+     if apply_wb:
+         avg_per_chan = np.mean(out, axis=(0, 1)).astype(np.float32)
+         norm = np.max(avg_per_chan)
+         if norm > 0:
+             avg_per_chan /= norm
+@@ -4809,56 +4815,73 @@ def estimate_background_map_gpu(image,
+         except Exception:
+             # As a last resort, return zeros so subtraction is a no-op
+             return np.zeros_like(image, dtype=np.float32)
+     finally:
+         free_cupy_memory_pools()
+ 
+ 
+ def stretch_auto_asifits_like_gpu(img_hwc_adu,
+                                   p_low: float = 0.5,
+                                   p_high: float = 99.8,
+                                   asinh_a: float = 0.01,
+                                   apply_wb: bool = True) -> np.ndarray:
+     """GPU variant of stretch_auto_asifits_like; falls back to CPU on error."""
+     try:
+         if not gpu_is_available():
+             raise RuntimeError("GPU not available")
+         import cupy as cp  # type: ignore
+         ensure_cupy_pool_initialized()
+         img = np.asarray(img_hwc_adu, dtype=np.float32)
+         out = np.empty_like(img, dtype=np.float32)
+         estimated_bytes = img.size * np.dtype(np.float32).itemsize * 4
+         if not gpu_memory_sufficient(int(estimated_bytes), safety_fraction=0.7):
+             raise RuntimeError("GPU stretch: insufficient memory")
+         for c in range(3):
+             chan = cp.asarray(img[..., c])
+-            vmin = cp.percentile(chan, p_low)
+-            vmax = cp.percentile(chan, p_high)
+-            if float(vmax - vmin) < 1e-3:
++            finite_mask = cp.isfinite(chan)
++            if not bool(finite_mask.any()):
++                out[..., c] = 0.0
++                continue
++            nanpercentile = getattr(cp, "nanpercentile", None)
++            if nanpercentile is not None:
++                vmin = nanpercentile(chan, p_low)
++                vmax = nanpercentile(chan, p_high)
++            else:
++                chan_finite = chan[finite_mask]
++                if chan_finite.size == 0:
++                    out[..., c] = 0.0
++                    continue
++                vmin = cp.percentile(chan_finite, p_low)
++                vmax = cp.percentile(chan_finite, p_high)
++            if not (bool(cp.isfinite(vmin)) and bool(cp.isfinite(vmax))):
++                out[..., c] = 0.0
++                continue
++            dv = vmax - vmin
++            if float(dv) < 1e-3:
+                 out[..., c] = 0.0
+                 continue
+-            normed = cp.clip((chan - vmin) / cp.maximum(vmax - vmin, 1e-6), 0, 1)
++            normed = cp.clip((chan - vmin) / cp.maximum(dv, 1e-6), 0, 1)
+             stretched = cp.arcsinh(normed / asinh_a) / cp.arcsinh(1.0 / asinh_a)
+             if float(cp.nanmax(stretched)) < 0.05:
+                 stretched = normed
+             out[..., c] = cp.asnumpy(stretched.astype(cp.float32))
+         if apply_wb:
+             avg = out.mean(axis=(0, 1))
+             m = float(np.max(avg)) if np.all(np.isfinite(avg)) else 0.0
+             if m > 0:
+                 avg /= m
+             else:
+                 avg = np.ones_like(avg)
+             for c in range(3):
+                 d = float(avg[c]) if np.isfinite(avg[c]) and avg[c] > 1e-8 else 1.0
+                 out[..., c] = out[..., c] / d
+         return np.clip(out, 0, 1).astype(np.float32)
+     except Exception:
+         return stretch_auto_asifits_like(img_hwc_adu, p_low=p_low, p_high=p_high, asinh_a=asinh_a, apply_wb=apply_wb)
+     finally:
+         free_cupy_memory_pools()
+ 
+ 
+ 
+ 
+ 
+ 
 diff --git a/zemosaic_worker.py b/zemosaic_worker.py
-index fe06e38fc6ba346638f29a36ae682cf166df3e6a..988ac51489d489a2d4c2027004fcf0fe5ce14e72 100644
+index 988ac51489d489a2d4c2027004fcf0fe5ce14e72..571752c2d96b2f2fdbb247556b8bf2f9818969ab 100644
 --- a/zemosaic_worker.py
 +++ b/zemosaic_worker.py
-@@ -13573,51 +13573,57 @@ def assemble_final_mosaic_reproject_coadd(
+@@ -13099,51 +13099,51 @@ def assemble_final_mosaic_reproject_coadd(
+ 
+     try:
+         affine_offset_limit_adu = float(
+             solver_settings_dict.get("intertile_offset_limit_adu", 50.0)
+         )
+     except Exception:
+         affine_offset_limit_adu = 50.0
+     affine_offset_limit_adu = max(0.0, abs(affine_offset_limit_adu))
+ 
+     gain_limits_cfg = solver_settings_dict.get("intertile_gain_limits")
+     if isinstance(gain_limits_cfg, (list, tuple)) and len(gain_limits_cfg) == 2:
+         try:
+             gain_limit_min = float(gain_limits_cfg[0])
+             gain_limit_max = float(gain_limits_cfg[1])
+         except Exception:
+             gain_limit_min, gain_limit_max = 0.75, 1.25
+     else:
+         gain_limit_min, gain_limit_max = 0.75, 1.25
+     if gain_limit_min > gain_limit_max:
+         gain_limit_min, gain_limit_max = gain_limit_max, gain_limit_min
+ 
+     def _extract_tile_weight(header_obj) -> float | None:
+         if header_obj is None:
+             return None
+         getter = header_obj.get if hasattr(header_obj, "get") else None
+-        for key in ("MT_NFRAMES", "ZMT_NALGN", "ZMT_NRAW"):
++        for key in ("MT_NFRAMES", "ZMT_NALGN", "ZMT_NRAW", "NRAWPROC", "NRAWINIT"):
+             try:
+                 value = getter(key) if getter else header_obj[key]  # type: ignore[index]
+             except Exception:
+                 value = None
+             if value is None:
                  continue
-             applied_channels = 0
-             for c in range(min(data_arr.shape[-1], gains.shape[0])):
-                 gain_val = float(gains[c])
-                 if not math.isfinite(gain_val):
-                     continue
-                 np.multiply(data_arr[..., c], gain_val, out=data_arr[..., c], casting="unsafe")
-                 applied_channels += 1
-             if applied_channels > 0:
-                 try:
-                     pcb_msg = "[ExistingMT] applied anchor gain"
-                     logger.info(
-                         "existing_master_tiles_mode: anchor gain applied to tile %d (overlap=%d, gains=%s)",
-                         idx_entry,
-                         overlap_count,
-                         ", ".join(f"{g:.3f}" for g in gains.tolist()),
-                     )
-                     _pcb(
-                         pcb_msg,
-                         prog=None,
-                         lvl="INFO_DETAIL",
-                     )
-                 except Exception:
-                     pass
+             try:
+                 value_f = float(value)
+             except Exception:
+                 continue
+             if math.isfinite(value_f) and value_f > 0:
+                 return value_f
+         return None
  
--    _best_effort_anchor_photometry()
-+    try:
-+        _best_effort_anchor_photometry()
-+    except Exception as anchor_exc:
-+        logger.info(
-+            "existing_master_tiles_mode: best-effort anchor failed; continuing without anchor",
-+            exc_info=logger.isEnabledFor(logging.DEBUG),
-+        )
  
-     # Optional inter-tile photometric (gain/offset) calibration
-     pending_affine_list, nontrivial_affine = _sanitize_affine_corrections(
-         tile_affine_corrections,
-         len(effective_tiles),
-     )
- 
-     if (
-         pending_affine_list is None
-         and intertile_photometric_match
-         and len(effective_tiles) >= 2
-     ):
-         tile_sources = []
-         for entry in effective_tiles:
-             mask = None
-             if isinstance(entry, dict):
-                 mask = entry.get("alpha_weight2d")
-                 if mask is None:
-                     mask = entry.get("coverage_mask")
-             tile_sources.append(
-                 _TileAffineSource(
-                     path=entry.get("path"),
-                     wcs=entry.get("wcs"),
-                     data=entry.get("data"),
-                     mask=mask,
+     effective_tiles: list[dict[str, Any]] = []
+     hdr_for_output = None
+     alpha_debug_logged = False
+     nonfinite_repaired_total = 0
+     nonfinite_tiles_touched = 0
+     zero_masked_total = 0
+     zero_masked_tiles = 0
+     zero_mask_fraction_threshold = 0.05
+     total_tiles_for_prep = len(master_tile_fits_with_wcs_list)
+     for idx, (tile_path, tile_wcs) in enumerate(master_tile_fits_with_wcs_list, 1):

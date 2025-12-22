@@ -13121,7 +13121,7 @@ def assemble_final_mosaic_reproject_coadd(
         if header_obj is None:
             return None
         getter = header_obj.get if hasattr(header_obj, "get") else None
-        for key in ("MT_NFRAMES", "ZMT_NALGN", "ZMT_NRAW"):
+        for key in ("MT_NFRAMES", "ZMT_NALGN", "ZMT_NRAW", "NRAWPROC", "NRAWINIT"):
             try:
                 value = getter(key) if getter else header_obj[key]  # type: ignore[index]
             except Exception:
