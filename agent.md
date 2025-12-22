@@ -29,54 +29,53 @@ Et ne pas laisser un alpha_union incohérent dégrader le rendu final.
 
 ## Plan d’implémentation
 
-### 1) Propager un bool "existing_master_tiles_mode" vers l’assembleur final
-- Ajouter un paramètre optionnel à `assemble_final_mosaic_reproject_coadd` :
-  - `existing_master_tiles_mode: bool = False`
-- Dans `run_hierarchical_mosaic_classic_legacy`, lors de l’appel à `assemble_final_mosaic_reproject_coadd`, passer :
-  - `existing_master_tiles_mode=use_existing_master_tiles_config` (ou l’équivalent déjà présent)
+- [x] Propager un bool "existing_master_tiles_mode" vers l’assembleur final
+  - Ajouter un paramètre optionnel à `assemble_final_mosaic_reproject_coadd` :
+    - `existing_master_tiles_mode: bool = False`
+  - Dans `run_hierarchical_mosaic_classic_legacy`, lors de l’appel à `assemble_final_mosaic_reproject_coadd`, passer :
+    - `existing_master_tiles_mode=use_existing_master_tiles_config` (ou l’équivalent déjà présent)
 
 ⚠️ Important : garder une valeur par défaut pour ne rien casser ailleurs.
 
-### 2) Rebuild alpha_final depuis coverage en mode existing master tiles
-Dans `assemble_final_mosaic_reproject_coadd`, à l’endroit où `alpha_union` est converti en `alpha_final` (phase6), insérer juste après l’obtention de `alpha_final` et avant toute logique “coverage/alpha == 0” :
+- [x] Rebuild alpha_final depuis coverage en mode existing master tiles
+  - Dans `assemble_final_mosaic_reproject_coadd`, à l’endroit où `alpha_union` est converti en `alpha_final` (phase6), insérer juste après l’obtention de `alpha_final` et avant toute logique “coverage/alpha == 0” :
 
-Pseudo-code :
+    Pseudo-code :
 
-```python
-if existing_master_tiles_mode and coverage is not None:
-    cov_mask = coverage > 0
-    if alpha_final is None:
-        alpha_final = (cov_mask.astype(np.uint8) * 255)
-        log("alpha_from_coverage: alpha_final was None -> rebuilt")
-    else:
-        # détecter mismatch : coverage>0 mais alpha==0
-        alpha0 = (alpha_final == 0)
-        mismatch = np.count_nonzero(cov_mask & alpha0)
-        if mismatch > 0:
-            total_cov = np.count_nonzero(cov_mask)
-            pct = (100.0 * mismatch / max(1, total_cov))
-            log(f"alpha_from_coverage: overriding alpha_final (mismatch={mismatch} px, {pct:.2f}% of covered)")
+    ```python
+    if existing_master_tiles_mode and coverage is not None:
+        cov_mask = coverage > 0
+        if alpha_final is None:
             alpha_final = (cov_mask.astype(np.uint8) * 255)
-````
+            log("alpha_from_coverage: alpha_final was None -> rebuilt")
+        else:
+            # détecter mismatch : coverage>0 mais alpha==0
+            alpha0 = (alpha_final == 0)
+            mismatch = np.count_nonzero(cov_mask & alpha0)
+            if mismatch > 0:
+                total_cov = np.count_nonzero(cov_mask)
+                pct = (100.0 * mismatch / max(1, total_cov))
+                log(f"alpha_from_coverage: overriding alpha_final (mismatch={mismatch} px, {pct:.2f}% of covered)")
+                alpha_final = (cov_mask.astype(np.uint8) * 255)
+    ````
 
-* Forcer dtype `uint8`, shape identique au coverage.
-* Conserver `alpha_union` tel quel pour les autres modes.
+    * Forcer dtype `uint8`, shape identique au coverage.
+    * Conserver `alpha_union` tel quel pour les autres modes.
 
-### 3) Logging / Observabilité
+- [x] Logging / Observabilité
 
-Ajouter un log INFO (et si tu veux un callback GUI type `[INFO] ...`) quand on override :
+  - Ajouter un log INFO (et si tu veux un callback GUI type `[INFO] ...`) quand on override :
 
-* nb pixels mismatch
-* % des pixels couverts impactés
-* mention claire “existing_master_tiles_mode”
+  * nb pixels mismatch
+  * % des pixels couverts impactés
+  * mention claire “existing_master_tiles_mode”
 
-### 4) Critères d’acceptation
+- [ ] Critères d’acceptation
 
-* En mode existing master tiles, plus de trou central si le coverage indique une couverture.
-* Les stats “nanized pixels where coverage/alpha == 0” ne doivent plus nanizer des pixels `coverage>0` à cause de l’alpha.
-* Hors de ce mode : comportement inchangé.
+  * En mode existing master tiles, plus de trou central si le coverage indique une couverture.
+  * Les stats “nanized pixels where coverage/alpha == 0” ne doivent plus nanizer des pixels `coverage>0` à cause de l’alpha.
+  * Hors de ce mode : comportement inchangé.
 
 ## Notes
 
 * Ce fix est volontairement conservateur : en mode existing master tiles, on privilégie la vérité “coverage” (résultat de l’assemblage) plutôt qu’un alpha potentiellement corrompu/inversé venant des fichiers en entrée.
-
