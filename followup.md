@@ -1,51 +1,52 @@
-# Follow-up — Validation & Repro steps
+# Follow-up — Qt GUI tooltip for existing master tiles photometry limitation
 
-## Progress
-- [x] Code changes for ALPHA handling and intertile masking implemented.
-- [ ] Validation on the repro dataset (with updated logging checks).
+## Goal
+Inform users **at the point of use** that photometric normalization is limited
+when using pre-existing master tiles.
 
-## Build / Run
-1) Use the same dataset / master tiles that currently reproduce the issue.
-2) Run ZeMosaic with:
-   - “I'm using master tiles (skip clustering_master tile creation)” ON
-   - inter-tile photometric match ON (match_background / intertile enabled)
-   - quality crop OFF (as in repro)
+Documentation is not sufficient; the GUI must carry this information.
 
-## What to check in logs
-### A) Alpha inversion detection
-If the ALPHA extension was inverted, you should see an INFO line similar to:
-- “[Alpha] existing_master_tiles: auto-inverted alpha mask … valid_frac=… inv_valid_frac=… nz_frac=…”
+## Scope
+- Qt GUI only (`zemosaic_gui_qt.py`)
+- Tooltip only (no modal dialog, no warning popup)
+- No behavior change
+- No Tk changes
 
-If no line appears, it means the heuristic decided the ALPHA is already consistent.
+## Implementation Details
 
-### B) Intertile gains sanity
-In the intertile summary and apply logs:
-- Gains should not be near 0 (no more 1e-5).
-- Gains should typically cluster around 1.0 and respect the configured clip behavior.
+### Target UI element
+Checkbox:
+- "I'm using master tiles (skip clustering_master tile creation)"
 
-## Visual checks
-- The final mosaic must not have the large flat black/purple rectangle.
-- The overlap zones should show real sky signal (stars/background), not constant fill.
+### Tooltip content (EN)
+"Photometric normalization is limited in this mode.
+Geometry will be correct, but residual brightness differences between tiles may remain.
+For best photometric quality, build master tiles inside ZeMosaic."
 
-## Quick sanity script (optional manual check)
-Open one problematic master_tile FITS and compare:
-- fraction of nonzero pixels in image (nz_frac)
-- fraction of alpha-valid pixels (valid_frac)
-If valid_frac is “complementary” to nz_frac, ALPHA is inverted.
+### Tooltip content (FR)
+"Dans ce mode, la normalisation photométrique est limitée.
+La géométrie sera correcte, mais des différences de luminosité peuvent subsister entre les tuiles.
+Pour une qualité photométrique optimale, générez les master tiles dans ZeMosaic."
 
-(Do not add new scripts to repo; use this only locally if needed.)
+### Localization
+- Use existing localization system
+- Add new localization keys if needed
+- Do NOT hardcode strings
 
-## Edge cases
-- If a master tile is legitimately mostly empty (heavy crop), ensure the heuristic doesn’t flip incorrectly.
-  - The “closest to nz_frac” scoring should handle this.
-  - Keep a small margin before flipping (e.g. require inv_score + 0.05 < score).
+### Visual behavior
+- Tooltip only
+- No icon
+- No color change
+- No warning triangle
+- Subtle and informative
 
-## Rollback plan
-If something goes wrong:
-- Disable the new mask support in compute_intertile_affine_calibration (keep NaN-masking in worker only).
-- Or keep compute_intertile mask support but disable the inversion heuristic (log-only) to isolate.
+## Non-goals
+- No README update
+- No online documentation link
+- No blocking warning
 
-## Done criteria
-- Repro dataset produces a continuous mosaic without the big rectangle.
-- No regression in non-master-tiles path (normal clustering/master tile creation).
-- No regression on CPU/GPU paths.
+## Success Criteria
+- Tooltip visible on hover
+- Clear expectation setting
+- No added friction to workflow
+- Zero impact on non-Qt GUI
