@@ -1,55 +1,41 @@
-# Follow-up — Qt GUI tooltip for existing master tiles photometry limitation
+## Checklist d’implémentation (Codex)
 
-## Status
-- [x] Tooltip added for existing master tiles mode in Qt GUI
+### 1) Preview noir : CPU
+- [ ] Dans `zemosaic_utils.py / stretch_auto_asifits_like()`, remplacer `np.percentile` par une logique NaN-aware (nanpercentile + garde-fous).
+- [ ] Vérifier qu’aucun gros temporaire float64 n’est introduit (rester en float32).
+- [ ] Vérifier le comportement si le canal est 100% NaN → sortie canal = 0 (pas d’exception).
 
-## Goal
-Inform users **at the point of use** that photometric normalization is limited
-when using pre-existing master tiles.
+### 2) Preview noir : GPU
+- [ ] Dans `zemosaic_utils.py / stretch_auto_asifits_like_gpu()`, remplacer `cp.percentile` par `cp.nanpercentile` (si dispo) ou fallback sur valeurs finies.
+- [ ] Ajouter garde-fous (canal vide / vmin-vmax trop faible) → sortie canal = 0.
+- [ ] Ne pas modifier la logique de fallback CPU existante.
 
-Documentation is not sufficient; the GUI must carry this information.
+### 3) Pondération perdue : keywords
+- [ ] Dans `zemosaic_worker.py`, dans `assemble_final_mosaic_reproject_coadd()` → `_extract_tile_weight()` :
+  - [ ] ajouter `NRAWPROC`, `NRAWINIT` à la liste des keywords.
+- [ ] Ne PAS modifier la construction de `input_weights_list` (éviter double pondération).
+- [ ] Ne PAS toucher au mode “I'm using master tiles (skip clustering_master tile creation)”.
 
-## Scope
-- Qt GUI only (`zemosaic_gui_qt.py`)
-- Tooltip only (no modal dialog, no warning popup)
-- No behavior change
-- No Tk changes
+---
 
-## Implementation Details
+## Procédure de validation manuelle (sans changer d’autres fichiers)
 
-### Target UI element
-Checkbox:
-- "I'm using master tiles (skip clustering_master tile creation)"
+### A) Valider preview
+1) Lancer un run qui produit des master tiles / mosaïque avec alpha/NaN masking.
+2) Ouvrir le `*_preview.png` :
+   - Vérifier qu’il n’est plus noir (RGB non nuls) et que la transparence est conservée.
 
-### Tooltip content (EN)
-"Photometric normalization is limited in this mode.
-Geometry will be correct, but residual brightness differences between tiles may remain.
-For best photometric quality, build master tiles inside ZeMosaic."
+### B) Valider pondération
+1) Prendre un FITS d’entrée (existing master tile) contenant `NRAWPROC` / `NRAWINIT`.
+2) Lancer l’assemblage final en mode “existing master tiles”.
+3) Vérifier dans les logs :
+   - ligne “Tile-weighting enabled — mode=N_FRAMES”
+   - summary min/max/mean ≠ 1.0 si les headers ont des valeurs > 1
+4) Vérifier que le rendu final n’est plus “écrasé” par des tuiles moins profondes (qualitativement, le signal doit mieux tenir).
 
-### Tooltip content (FR)
-"Dans ce mode, la normalisation photométrique est limitée.
-La géométrie sera correcte, mais des différences de luminosité peuvent subsister entre les tuiles.
-Pour une qualité photométrique optimale, générez les master tiles dans ZeMosaic."
+---
 
-### Localization
-- Use existing localization system
-- Add new localization keys if needed
-- Do NOT hardcode strings
-
-### Visual behavior
-- Tooltip only
-- No icon
-- No color change
-- No warning triangle
-- Subtle and informative
-
-## Non-goals
-- No README update
-- No online documentation link
-- No blocking warning
-
-## Success Criteria
-- Tooltip visible on hover
-- Clear expectation setting
-- No added friction to workflow
-- Zero impact on non-Qt GUI
+## Anti-régressions (à surveiller)
+- Preview : ne pas changer l’alpha, seulement rendre le stretch robuste aux NaN.
+- Poids : ne pas doubler les poids (ne pas multiplier `input_weights` *et* passer `tile_weights`).
+- Aucun impact sur le clustering, la création de master tiles, ni le pipeline non-existing-master-tiles.
