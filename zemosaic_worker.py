@@ -15351,6 +15351,7 @@ def run_hierarchical_mosaic_classic_legacy(
     logging_level_config: str = "INFO",
     solver_settings: dict | None = None,
     skip_filter_ui: bool = False,
+    use_existing_master_tiles_config: bool = False,
     # New optional integration points when filter ran in GUI
     filter_invoked: bool = False,
     filter_overrides: dict | None = None,
@@ -15864,1334 +15865,1435 @@ def run_hierarchical_mosaic_classic_legacy(
     except Exception:
         pass
 
-# --- Phase 1 (Prétraitement et WCS) ---
-    base_progress_phase1 = current_global_progress
-    _log_memory_usage(progress_callback, "Début Phase 1 (Prétraitement)")
-    pcb("run_info_phase1_started_cache", prog=base_progress_phase1, lvl="INFO")
-    pcb("PHASE_UPDATE:1", prog=None, lvl="ETA_LEVEL")
-    
-    fits_file_paths = []
-    # Prépare des exclusions supplémentaires: dossier de sortie et WCS global
-    try:
-        _output_abs_path = Path(output_folder).expanduser().resolve() if output_folder else None
-        _output_abs_norm = _normcase_path(_output_abs_path) if _output_abs_path else None
-    except Exception:
-        _output_abs_path = None
-        _output_abs_norm = None
-    try:
-        _wcs_out_base = _safe_basename((worker_config_cache or {}).get("global_wcs_output_path", "global_mosaic_wcs.fits")).strip().lower()
-    except Exception:
-        _wcs_out_base = "global_mosaic_wcs.fits"
-    # Scan des fichiers FITS dans le dossier d'entrée et ses sous-dossiers
-    for root_dir_iter, dirnames_iter, files_in_dir_iter in os.walk(input_folder):
-        root_path = Path(root_dir_iter)
-        # Exclure les dossiers interdits dès la descente
-        try:
-            filtered_dirs = []
-            for d in dirnames_iter:
-                child = root_path / d
-                # Exclusion via règle standard
-                if is_path_excluded(child, EXCLUDED_DIRS):
-                    continue
-                # Exclure aussi le sous-arbre du dossier de sortie
+    use_existing_master_tiles_mode = False
+    existing_master_tiles_results: list[tuple[str, Any]] = []
+    if use_existing_master_tiles_config and not sds_mode_flag:
+        if (
+            ASTROPY_AVAILABLE
+            and fits is not None
+            and ZEMOSAIC_UTILS_AVAILABLE
+            and zemosaic_utils
+            and hasattr(zemosaic_utils, "validate_wcs_header")
+        ):
+            input_path = Path(input_folder).expanduser()
+            if input_path.is_dir():
                 try:
-                    if _output_abs_norm:
+                    global_wcs_name = str(
+                        (worker_config_cache or {}).get(
+                            "global_wcs_output_path", "global_mosaic_wcs.fits"
+                        )
+                    ).strip().lower() or "global_mosaic_wcs.fits"
+                except Exception:
+                    global_wcs_name = "global_mosaic_wcs.fits"
+                excluded_names = {
+                    global_wcs_name,
+                    "global_mosaic_wcs.fits",
+                    "global_mosaic.wcs.fits",
+                }
+
+                def _exclude_master_tile(path_obj: Path) -> bool:
+                    name = path_obj.name.lower()
+                    if name in excluded_names:
+                        return True
+                    if "final_mosaic" in name or name.startswith("zemosaic_mt"):
+                        return True
+                    return False
+
+                candidates: list[Path] = []
+                try:
+                    candidates = [
+                        p for p in input_path.rglob("master_tile_*.fits") if p.is_file()
+                    ]
+                except Exception:
+                    candidates = []
+                if not candidates:
+                    for pattern in ("*.fits", "*.fit"):
                         try:
-                            child_norm = _normcase_path(child.resolve())
+                            candidates.extend(
+                                [p for p in input_path.rglob(pattern) if p.is_file()]
+                            )
                         except Exception:
-                            child_norm = _normcase_path(child)
-                        if child_norm.startswith(_output_abs_norm):
                             continue
-                except Exception:
-                    pass
-                filtered_dirs.append(d)
-            dirnames_iter[:] = filtered_dirs
-        except Exception:
-            dirnames_iter[:] = [
-                d
-                for d in dirnames_iter
-                if UNALIGNED_DIRNAME not in (root_path / d).parts
-            ]
 
-        # Assurer un ordre déterministe quelle que soit la plateforme/FS
-        try:
-            files_in_dir_iter = sorted(files_in_dir_iter, key=lambda s: s.lower())
-        except Exception:
-            files_in_dir_iter = list(files_in_dir_iter)
-
-        for file_name_iter in files_in_dir_iter:
-            if file_name_iter.lower().endswith((".fit", ".fits")):
-                full_path = root_path / file_name_iter
-                full_path_str = str(full_path)
-                try:
-                    if is_path_excluded(full_path, EXCLUDED_DIRS):
-                        continue
-                except Exception:
-                    if UNALIGNED_DIRNAME in full_path.parts:
-                        continue
-                # Ignorer l'artefact du WCS global si présent dans l'arbre d'entrée
-                try:
-                    if _wcs_out_base and file_name_iter.strip().lower() == _wcs_out_base:
-                        continue
-                except Exception:
-                    pass
-                fits_file_paths.append(full_path_str)
-    # Tri global déterministe
-    try:
-        fits_file_paths.sort(key=lambda p: p.lower())
-    except Exception:
-        fits_file_paths.sort()
-    
-    if not fits_file_paths: 
-        pcb("run_error_no_fits_found_input", prog=current_global_progress, lvl="ERROR")
-        return # Sortie anticipée si aucun fichier FITS n'est trouvé
-    
-    num_total_raw_files = len(fits_file_paths)
-    pcb("run_info_found_potential_fits", prog=base_progress_phase1, lvl="INFO_DETAIL", num_files=num_total_raw_files)
-
-    telemetry.maybe_emit_stats(
-        _telemetry_context(
-            {
-                "phase_name": "Phase 1: Preprocessing",
-                "phase_index": 1,
-                "files_total": num_total_raw_files,
-            }
-        )
-    )
-
-    # --- Parallel auto-tune plan (optional) ---
-    parallel_caps: ParallelCapabilities | None = None  # type: ignore[assignment]
-    global_parallel_plan: ParallelPlan | None = None  # type: ignore[assignment]
-    if PARALLEL_HELPERS_AVAILABLE:
-        try:
-            parallel_caps = detect_parallel_capabilities()
-        except Exception as exc_parallel_caps:
-            parallel_caps = None
-            logger.warning("Parallel capability detection failed: %s", exc_parallel_caps)
-        frame_h = 0
-        frame_w = 0
-        if isinstance(global_wcs_plan, dict):
-            try:
-                frame_h = int(global_wcs_plan.get("height") or 0)
-            except Exception:
-                frame_h = 0
-            try:
-                frame_w = int(global_wcs_plan.get("width") or 0)
-            except Exception:
-                frame_w = 0
-        frame_shape = (frame_h, frame_w) if (frame_h > 0 and frame_w > 0) else (frame_h, frame_w)
-        try:
-            global_parallel_plan = auto_tune_parallel_plan(
-                kind="global",
-                frame_shape=frame_shape,
-                n_frames=max(1, num_total_raw_files),
-                bytes_per_pixel=4,
-                config=worker_config_cache,
-                caps=parallel_caps,
-            )
-            worker_config_cache["parallel_plan"] = global_parallel_plan
-            setattr(zconfig, "parallel_plan", global_parallel_plan)
-            if parallel_caps is not None:
-                worker_config_cache["parallel_capabilities"] = parallel_caps
-                setattr(zconfig, "parallel_capabilities", parallel_caps)
-            try:
-                pcb(
-                    "parallel_plan_summary",
-                    prog=None,
-                    lvl="INFO_DETAIL",
-                    cpu_workers=int(getattr(global_parallel_plan, "cpu_workers", 0)),
-                    use_gpu=bool(getattr(global_parallel_plan, "use_gpu", False)),
-                    rows=int(getattr(global_parallel_plan, "rows_per_chunk", 0) or 0),
-                    gpu_rows=int(getattr(global_parallel_plan, "gpu_rows_per_chunk", 0) or 0),
-                    memmap=bool(getattr(global_parallel_plan, "use_memmap", False)),
-                    chunk_mb=float(
-                        getattr(global_parallel_plan, "max_chunk_bytes", 0) / (1024 ** 2)
-                        if getattr(global_parallel_plan, "max_chunk_bytes", 0)
-                        else 0.0
-                    ),
-                )
-            except Exception:
-                pass
-        except Exception as exc_parallel_plan:
-            logger.warning("Parallel auto-tune failed: %s", exc_parallel_plan)
-            global_parallel_plan = None
-
-    # Kick off a stage progress stream so the GUI progress bar animates
-    try:
-        if progress_callback and callable(progress_callback):
-            progress_callback("phase1_scan", 0, int(num_total_raw_files))
-        # Also update a dedicated raw files counter in the GUI
-        pcb(f"RAW_FILE_COUNT_UPDATE:0/{num_total_raw_files}", prog=None, lvl="ETA_LEVEL")
-    except Exception:
-        pass
-
-    # --- Phase 0 (Header-only scan + early filter) ---
-    # Preserve GUI-provided filter context arguments
-    filter_invoked_arg = filter_invoked
-    filter_overrides_arg = filter_overrides
-    filtered_header_items_arg = filtered_header_items
-
-    skip_filter_ui = bool(skip_filter_ui)
-    # Resolve early filter enable policy: explicit argument takes precedence,
-    # otherwise load from config, then apply skip_filter_ui override.
-    if early_filter_enabled is None:
-        early_filter_enabled = True
-        try:
-            if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
-                cfg0 = zemosaic_config.load_config() or {}
-                early_filter_enabled = bool(cfg0.get("enable_early_filter", True))
-        except Exception:
-            early_filter_enabled = True
-    else:
-        early_filter_enabled = bool(early_filter_enabled)
-
-    if skip_filter_ui:
-        early_filter_enabled = False
-        pcb("log_filter_ui_skipped", prog=None, lvl="INFO_DETAIL")
-
-    if ASTROPY_AVAILABLE and fits is not None:
-        header_items_for_filter: list[dict] = []
-        filtered_items: list[dict] | None = None
-        # If caller provided overrides or prior filter state, adopt them
-        filter_overrides = filter_overrides_arg if isinstance(filter_overrides_arg, dict) else None
-        filter_accepted = False
-        filter_invoked = bool(filter_invoked_arg)
-        streaming_filter_success = False
-
-        launch_filter_interface_fn = None
-        if early_filter_enabled:
-            try:
-                from zemosaic_filter_gui import launch_filter_interface as launch_filter_interface_fn  # type: ignore
-            except ImportError:
-                launch_filter_interface_fn = None
-                pcb("Phase 0: filter GUI not available", prog=None, lvl="DEBUG_DETAIL")
-
-        def _parse_filter_result(ret_obj):
-            filt_items = None
-            accepted_flag = False
-            overrides_obj = None
-            if isinstance(ret_obj, tuple) and len(ret_obj) >= 1:
-                filt_items = ret_obj[0]
-                if len(ret_obj) >= 2:
+                unique_candidates = {}
+                for candidate in candidates:
                     try:
-                        accepted_flag = bool(ret_obj[1])
+                        if _exclude_master_tile(candidate):
+                            continue
+                        unique_candidates[str(candidate)] = candidate
                     except Exception:
-                        accepted_flag = False
-                if len(ret_obj) >= 3:
-                    overrides_obj = ret_obj[2]
-            elif isinstance(ret_obj, list):
-                filt_items = ret_obj
-                accepted_flag = True
-            return filt_items, accepted_flag, overrides_obj
+                        continue
 
-        initial_filter_overrides = None
-        try:
-            initial_filter_overrides = {
-                "cluster_panel_threshold": float(cluster_threshold_config),
-                "cluster_target_groups": int(cluster_target_groups_config),
-                "cluster_orientation_split_deg": float(cluster_orientation_split_deg_config),
-            }
-        except Exception:
-            initial_filter_overrides = None
-
-        # If the GUI already provided a filtered list, adopt it directly and
-        # mark the streaming path as successful to avoid relaunching the UI.
-        if isinstance(filtered_header_items_arg, list) and filtered_header_items_arg:
-            try:
-                header_items_for_filter = filtered_header_items_arg
-            except Exception:
-                header_items_for_filter = list(filtered_header_items_arg)
-            filter_invoked = True
-            filter_accepted = True
-            streaming_filter_success = True
-            try:
-                filtered_items = list(header_items_for_filter)
-            except Exception:
-                filtered_items = header_items_for_filter
-
-        solver_payload_for_filter = solver_settings if isinstance(solver_settings, dict) else None
-        config_payload_for_filter = {
-            "astap_executable_path": astap_exe_path,
-            "astap_data_directory_path": astap_data_dir_param,
-            "astap_default_search_radius": astap_search_radius_config,
-            "astap_default_downsample": astap_downsample_config,
-            "astap_default_sensitivity": astap_sensitivity_config,
-        }
-
-        if launch_filter_interface_fn is not None:
-            try:
-                filter_invoked = True
-                filter_ret = launch_filter_interface_fn(
-                    input_folder,
-                    initial_filter_overrides,
-                    stream_scan=True,
-                    scan_recursive=True,
-                    batch_size=200,
-                    preview_cap=1500,
-                    solver_settings_dict=solver_payload_for_filter,
-                    config_overrides=config_payload_for_filter,
+                filtered_candidates = sorted(
+                    unique_candidates.values(), key=lambda p: str(p).lower()
                 )
-                filtered_items, filter_accepted, filter_overrides = _parse_filter_result(filter_ret)
-                # If the user cancelled from the filter UI, abort the run cleanly
-                if isinstance(filter_overrides, dict) and filter_overrides.get("filter_cancelled"):
-                    pcb("run_warn_phase0_filter_cancelled", prog=None, lvl="WARN")
-                    pcb("log_key_processing_cancelled", prog=None, lvl="WARN")
-                    return
-                # In streaming mode the UI returns the final filtered list, not
-                # the header pre-scan items. Consider the streaming path a success
-                # whenever the UI was invoked without raising.
-                streaming_filter_success = True
-                if isinstance(filtered_items, list):
-                    header_items_for_filter = filtered_items
-                pcb(
-                    "Phase 0: streaming filter UI completed",
-                    prog=None,
-                    lvl="INFO_DETAIL",
-                )
-            except Exception as e_filter:
-                # If we fail to invoke the streaming UI, fall back to header scan.
-                filter_invoked = False
-                header_items_for_filter = []
-                filtered_items = None
-                filter_overrides = None
-                filter_accepted = False
-                pcb(f"Phase 0 streaming filter failed: {e_filter}", prog=None, lvl="WARN")
+                for candidate in filtered_candidates:
+                    try:
+                        header = fits.getheader(candidate, 0)
+                    except Exception:
+                        continue
+                    try:
+                        ok, wcs_obj, _failure = zemosaic_utils.validate_wcs_header(
+                            header, require_footprint=True
+                        )
+                    except Exception:
+                        ok, wcs_obj = False, None
+                    if ok and wcs_obj is not None:
+                        existing_master_tiles_results.append((str(candidate), wcs_obj))
 
-        if not streaming_filter_success:
-            pcb("Phase 0: header scan start", prog=None, lvl="INFO_DETAIL")
-            t0_hscan = time.monotonic()
-            header_items_for_filter = []
-            num_scanned = 0
-            for idx_file, fpath in enumerate(fits_file_paths):
-                hdr = None
-                wcs0 = None
-                shp_hw = None
-                center_sc = None
-                try:
-                    hdr = fits.getheader(fpath, 0)
-                    try:
-                        nax1 = int(hdr.get("NAXIS1", 0))
-                        nax2 = int(hdr.get("NAXIS2", 0))
-                        if nax1 > 0 and nax2 > 0:
-                            shp_hw = (nax2, nax1)
-                    except Exception:
-                        shp_hw = None
-                    try:
-                        w = WCS(hdr, naxis=2, relax=True) if WCS is not None else None
-                        if w and getattr(w, "is_celestial", False):
-                            wcs0 = w
-                    except Exception:
-                        wcs0 = None
-                    if wcs0 is None:
-                        try:
-                            if (
-                                ZEMOSAIC_ASTROMETRY_AVAILABLE
-                                and zemosaic_astrometry
-                                and hasattr(zemosaic_astrometry, "extract_center_from_header")
-                            ):
-                                center_sc = zemosaic_astrometry.extract_center_from_header(hdr)
-                        except Exception:
-                            center_sc = None
-                    item = {
-                        "path": fpath,
-                        "header": hdr,
-                        "index": idx_file,
-                    }
-                    if shp_hw:
-                        item["shape"] = shp_hw
-                    if wcs0 is not None:
-                        item["wcs"] = wcs0
-                    if center_sc is not None:
-                        item["center"] = center_sc
-                    header_items_for_filter.append(item)
-                    num_scanned += 1
-                except Exception:
-                    header_items_for_filter.append({"path": fpath, "index": idx_file})
-                    num_scanned += 1
-            t1_hscan = time.monotonic()
-            avg_t = (t1_hscan - t0_hscan) / max(1, num_scanned)
+                if len(existing_master_tiles_results) >= 2:
+                    use_existing_master_tiles_mode = True
+                    pcb(
+                        "run_info_existing_master_tiles_mode",
+                        prog=None,
+                        lvl="INFO",
+                        num_tiles=len(existing_master_tiles_results),
+                    )
+                else:
+                    pcb(
+                        "run_warn_existing_master_tiles_insufficient",
+                        prog=None,
+                        lvl="WARN",
+                        num_tiles=len(existing_master_tiles_results),
+                    )
+                    existing_master_tiles_results = []
+        else:
             pcb(
-                f"Phase 0: header scan finished — files={num_scanned}, avg={avg_t:.4f}s/header",
+                "run_warn_existing_master_tiles_insufficient",
                 prog=None,
-                lvl="DEBUG",
+                lvl="WARN",
+                num_tiles=0,
             )
 
-            if launch_filter_interface_fn is not None and not filter_invoked:
+    if not use_existing_master_tiles_mode:
+        # --- Phase 1 (Prétraitement et WCS) ---
+        base_progress_phase1 = current_global_progress
+        _log_memory_usage(progress_callback, "Début Phase 1 (Prétraitement)")
+        pcb("run_info_phase1_started_cache", prog=base_progress_phase1, lvl="INFO")
+        pcb("PHASE_UPDATE:1", prog=None, lvl="ETA_LEVEL")
+        
+        fits_file_paths = []
+        # Prépare des exclusions supplémentaires: dossier de sortie et WCS global
+        try:
+            _output_abs_path = Path(output_folder).expanduser().resolve() if output_folder else None
+            _output_abs_norm = _normcase_path(_output_abs_path) if _output_abs_path else None
+        except Exception:
+            _output_abs_path = None
+            _output_abs_norm = None
+        try:
+            _wcs_out_base = _safe_basename((worker_config_cache or {}).get("global_wcs_output_path", "global_mosaic_wcs.fits")).strip().lower()
+        except Exception:
+            _wcs_out_base = "global_mosaic_wcs.fits"
+        # Scan des fichiers FITS dans le dossier d'entrée et ses sous-dossiers
+        for root_dir_iter, dirnames_iter, files_in_dir_iter in os.walk(input_folder):
+            root_path = Path(root_dir_iter)
+            # Exclure les dossiers interdits dès la descente
+            try:
+                filtered_dirs = []
+                for d in dirnames_iter:
+                    child = root_path / d
+                    # Exclusion via règle standard
+                    if is_path_excluded(child, EXCLUDED_DIRS):
+                        continue
+                    # Exclure aussi le sous-arbre du dossier de sortie
+                    try:
+                        if _output_abs_norm:
+                            try:
+                                child_norm = _normcase_path(child.resolve())
+                            except Exception:
+                                child_norm = _normcase_path(child)
+                            if child_norm.startswith(_output_abs_norm):
+                                continue
+                    except Exception:
+                        pass
+                    filtered_dirs.append(d)
+                dirnames_iter[:] = filtered_dirs
+            except Exception:
+                dirnames_iter[:] = [
+                    d
+                    for d in dirnames_iter
+                    if UNALIGNED_DIRNAME not in (root_path / d).parts
+                ]
+    
+            # Assurer un ordre déterministe quelle que soit la plateforme/FS
+            try:
+                files_in_dir_iter = sorted(files_in_dir_iter, key=lambda s: s.lower())
+            except Exception:
+                files_in_dir_iter = list(files_in_dir_iter)
+    
+            for file_name_iter in files_in_dir_iter:
+                if file_name_iter.lower().endswith((".fit", ".fits")):
+                    full_path = root_path / file_name_iter
+                    full_path_str = str(full_path)
+                    try:
+                        if is_path_excluded(full_path, EXCLUDED_DIRS):
+                            continue
+                    except Exception:
+                        if UNALIGNED_DIRNAME in full_path.parts:
+                            continue
+                    # Ignorer l'artefact du WCS global si présent dans l'arbre d'entrée
+                    try:
+                        if _wcs_out_base and file_name_iter.strip().lower() == _wcs_out_base:
+                            continue
+                    except Exception:
+                        pass
+                    fits_file_paths.append(full_path_str)
+        # Tri global déterministe
+        try:
+            fits_file_paths.sort(key=lambda p: p.lower())
+        except Exception:
+            fits_file_paths.sort()
+        
+        if not fits_file_paths: 
+            pcb("run_error_no_fits_found_input", prog=current_global_progress, lvl="ERROR")
+            return # Sortie anticipée si aucun fichier FITS n'est trouvé
+        
+        num_total_raw_files = len(fits_file_paths)
+        pcb("run_info_found_potential_fits", prog=base_progress_phase1, lvl="INFO_DETAIL", num_files=num_total_raw_files)
+    
+        telemetry.maybe_emit_stats(
+            _telemetry_context(
+                {
+                    "phase_name": "Phase 1: Preprocessing",
+                    "phase_index": 1,
+                    "files_total": num_total_raw_files,
+                }
+            )
+        )
+    
+        # --- Parallel auto-tune plan (optional) ---
+        parallel_caps: ParallelCapabilities | None = None  # type: ignore[assignment]
+        global_parallel_plan: ParallelPlan | None = None  # type: ignore[assignment]
+        if PARALLEL_HELPERS_AVAILABLE:
+            try:
+                parallel_caps = detect_parallel_capabilities()
+            except Exception as exc_parallel_caps:
+                parallel_caps = None
+                logger.warning("Parallel capability detection failed: %s", exc_parallel_caps)
+            frame_h = 0
+            frame_w = 0
+            if isinstance(global_wcs_plan, dict):
+                try:
+                    frame_h = int(global_wcs_plan.get("height") or 0)
+                except Exception:
+                    frame_h = 0
+                try:
+                    frame_w = int(global_wcs_plan.get("width") or 0)
+                except Exception:
+                    frame_w = 0
+            frame_shape = (frame_h, frame_w) if (frame_h > 0 and frame_w > 0) else (frame_h, frame_w)
+            try:
+                global_parallel_plan = auto_tune_parallel_plan(
+                    kind="global",
+                    frame_shape=frame_shape,
+                    n_frames=max(1, num_total_raw_files),
+                    bytes_per_pixel=4,
+                    config=worker_config_cache,
+                    caps=parallel_caps,
+                )
+                worker_config_cache["parallel_plan"] = global_parallel_plan
+                setattr(zconfig, "parallel_plan", global_parallel_plan)
+                if parallel_caps is not None:
+                    worker_config_cache["parallel_capabilities"] = parallel_caps
+                    setattr(zconfig, "parallel_capabilities", parallel_caps)
+                try:
+                    pcb(
+                        "parallel_plan_summary",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                        cpu_workers=int(getattr(global_parallel_plan, "cpu_workers", 0)),
+                        use_gpu=bool(getattr(global_parallel_plan, "use_gpu", False)),
+                        rows=int(getattr(global_parallel_plan, "rows_per_chunk", 0) or 0),
+                        gpu_rows=int(getattr(global_parallel_plan, "gpu_rows_per_chunk", 0) or 0),
+                        memmap=bool(getattr(global_parallel_plan, "use_memmap", False)),
+                        chunk_mb=float(
+                            getattr(global_parallel_plan, "max_chunk_bytes", 0) / (1024 ** 2)
+                            if getattr(global_parallel_plan, "max_chunk_bytes", 0)
+                            else 0.0
+                        ),
+                    )
+                except Exception:
+                    pass
+            except Exception as exc_parallel_plan:
+                logger.warning("Parallel auto-tune failed: %s", exc_parallel_plan)
+                global_parallel_plan = None
+    
+        # Kick off a stage progress stream so the GUI progress bar animates
+        try:
+            if progress_callback and callable(progress_callback):
+                progress_callback("phase1_scan", 0, int(num_total_raw_files))
+            # Also update a dedicated raw files counter in the GUI
+            pcb(f"RAW_FILE_COUNT_UPDATE:0/{num_total_raw_files}", prog=None, lvl="ETA_LEVEL")
+        except Exception:
+            pass
+    
+        # --- Phase 0 (Header-only scan + early filter) ---
+        # Preserve GUI-provided filter context arguments
+        filter_invoked_arg = filter_invoked
+        filter_overrides_arg = filter_overrides
+        filtered_header_items_arg = filtered_header_items
+    
+        skip_filter_ui = bool(skip_filter_ui)
+        # Resolve early filter enable policy: explicit argument takes precedence,
+        # otherwise load from config, then apply skip_filter_ui override.
+        if early_filter_enabled is None:
+            early_filter_enabled = True
+            try:
+                if ZEMOSAIC_CONFIG_AVAILABLE and zemosaic_config:
+                    cfg0 = zemosaic_config.load_config() or {}
+                    early_filter_enabled = bool(cfg0.get("enable_early_filter", True))
+            except Exception:
+                early_filter_enabled = True
+        else:
+            early_filter_enabled = bool(early_filter_enabled)
+    
+        if skip_filter_ui:
+            early_filter_enabled = False
+            pcb("log_filter_ui_skipped", prog=None, lvl="INFO_DETAIL")
+    
+        if ASTROPY_AVAILABLE and fits is not None:
+            header_items_for_filter: list[dict] = []
+            filtered_items: list[dict] | None = None
+            # If caller provided overrides or prior filter state, adopt them
+            filter_overrides = filter_overrides_arg if isinstance(filter_overrides_arg, dict) else None
+            filter_accepted = False
+            filter_invoked = bool(filter_invoked_arg)
+            streaming_filter_success = False
+    
+            launch_filter_interface_fn = None
+            if early_filter_enabled:
+                try:
+                    from zemosaic_filter_gui import launch_filter_interface as launch_filter_interface_fn  # type: ignore
+                except ImportError:
+                    launch_filter_interface_fn = None
+                    pcb("Phase 0: filter GUI not available", prog=None, lvl="DEBUG_DETAIL")
+    
+            def _parse_filter_result(ret_obj):
+                filt_items = None
+                accepted_flag = False
+                overrides_obj = None
+                if isinstance(ret_obj, tuple) and len(ret_obj) >= 1:
+                    filt_items = ret_obj[0]
+                    if len(ret_obj) >= 2:
+                        try:
+                            accepted_flag = bool(ret_obj[1])
+                        except Exception:
+                            accepted_flag = False
+                    if len(ret_obj) >= 3:
+                        overrides_obj = ret_obj[2]
+                elif isinstance(ret_obj, list):
+                    filt_items = ret_obj
+                    accepted_flag = True
+                return filt_items, accepted_flag, overrides_obj
+    
+            initial_filter_overrides = None
+            try:
+                initial_filter_overrides = {
+                    "cluster_panel_threshold": float(cluster_threshold_config),
+                    "cluster_target_groups": int(cluster_target_groups_config),
+                    "cluster_orientation_split_deg": float(cluster_orientation_split_deg_config),
+                }
+            except Exception:
+                initial_filter_overrides = None
+    
+            # If the GUI already provided a filtered list, adopt it directly and
+            # mark the streaming path as successful to avoid relaunching the UI.
+            if isinstance(filtered_header_items_arg, list) and filtered_header_items_arg:
+                try:
+                    header_items_for_filter = filtered_header_items_arg
+                except Exception:
+                    header_items_for_filter = list(filtered_header_items_arg)
+                filter_invoked = True
+                filter_accepted = True
+                streaming_filter_success = True
+                try:
+                    filtered_items = list(header_items_for_filter)
+                except Exception:
+                    filtered_items = header_items_for_filter
+    
+            solver_payload_for_filter = solver_settings if isinstance(solver_settings, dict) else None
+            config_payload_for_filter = {
+                "astap_executable_path": astap_exe_path,
+                "astap_data_directory_path": astap_data_dir_param,
+                "astap_default_search_radius": astap_search_radius_config,
+                "astap_default_downsample": astap_downsample_config,
+                "astap_default_sensitivity": astap_sensitivity_config,
+            }
+    
+            if launch_filter_interface_fn is not None:
                 try:
                     filter_invoked = True
-                    filter_ret = launch_filter_interface_fn(header_items_for_filter, initial_filter_overrides)
+                    filter_ret = launch_filter_interface_fn(
+                        input_folder,
+                        initial_filter_overrides,
+                        stream_scan=True,
+                        scan_recursive=True,
+                        batch_size=200,
+                        preview_cap=1500,
+                        solver_settings_dict=solver_payload_for_filter,
+                        config_overrides=config_payload_for_filter,
+                    )
                     filtered_items, filter_accepted, filter_overrides = _parse_filter_result(filter_ret)
+                    # If the user cancelled from the filter UI, abort the run cleanly
                     if isinstance(filter_overrides, dict) and filter_overrides.get("filter_cancelled"):
                         pcb("run_warn_phase0_filter_cancelled", prog=None, lvl="WARN")
                         pcb("log_key_processing_cancelled", prog=None, lvl="WARN")
                         return
+                    # In streaming mode the UI returns the final filtered list, not
+                    # the header pre-scan items. Consider the streaming path a success
+                    # whenever the UI was invoked without raising.
+                    streaming_filter_success = True
+                    if isinstance(filtered_items, list):
+                        header_items_for_filter = filtered_items
+                    pcb(
+                        "Phase 0: streaming filter UI completed",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                    )
                 except Exception as e_filter:
+                    # If we fail to invoke the streaming UI, fall back to header scan.
                     filter_invoked = False
+                    header_items_for_filter = []
                     filtered_items = None
                     filter_overrides = None
                     filter_accepted = False
-                    pcb(f"Phase 0 filter UI failed: {e_filter}", prog=None, lvl="WARN")
-            elif not early_filter_enabled:
-                pcb("Phase 0: header scan completed (filter UI disabled)", prog=None, lvl="DEBUG_DETAIL")
-
-        phase0_header_items = header_items_for_filter
-
-        if filter_invoked:
-            if filter_overrides:
-                try:
-                    if "cluster_panel_threshold" in filter_overrides:
-                        cluster_threshold_config = filter_overrides["cluster_panel_threshold"]
-                        pcb(
-                            "clusterstacks_info_override_threshold",
-                            prog=None,
-                            lvl="INFO_DETAIL",
-                            value=cluster_threshold_config,
-                        )
-                    if "cluster_target_groups" in filter_overrides:
-                        cluster_target_groups_config = filter_overrides["cluster_target_groups"]
-                        pcb(
-                            "clusterstacks_info_override_target_groups",
-                            prog=None,
-                            lvl="INFO_DETAIL",
-                            value=cluster_target_groups_config,
-                        )
-                    if "cluster_orientation_split_deg" in filter_overrides:
-                        cluster_orientation_split_deg_config = filter_overrides["cluster_orientation_split_deg"]
-                        pcb(
-                            "clusterstacks_info_override_orientation_split",
-                            prog=None,
-                            lvl="INFO_DETAIL",
-                            value=cluster_orientation_split_deg_config,
-                        )
-                except Exception:
-                    pass
-                try:
-                    raw_groups_override = (
-                        filter_overrides.get("preplan_master_groups")
-                        if isinstance(filter_overrides, dict)
-                        else None
-                    )
-                    if isinstance(raw_groups_override, list):
-                        mapped_groups: list[list[str]] = []
-                        for group in raw_groups_override:
-                            if not isinstance(group, (list, tuple)):
-                                continue
-                            normalized_group: list[str] = []
-                            for item in group:
-                                path_val = None
-                                if isinstance(item, dict):
-                                    path_val = item.get("path") or item.get("path_raw")
-                                elif isinstance(item, str):
-                                    path_val = item
-                                norm_path = _normalize_path_for_matching(path_val)
-                                if norm_path:
-                                    normalized_group.append(norm_path)
-                            if normalized_group:
-                                mapped_groups.append(normalized_group)
-                        if mapped_groups:
-                            preplan_groups_override_paths = mapped_groups
+                    pcb(f"Phase 0 streaming filter failed: {e_filter}", prog=None, lvl="WARN")
+    
+            if not streaming_filter_success:
+                pcb("Phase 0: header scan start", prog=None, lvl="INFO_DETAIL")
+                t0_hscan = time.monotonic()
+                header_items_for_filter = []
+                num_scanned = 0
+                for idx_file, fpath in enumerate(fits_file_paths):
+                    hdr = None
+                    wcs0 = None
+                    shp_hw = None
+                    center_sc = None
+                    try:
+                        hdr = fits.getheader(fpath, 0)
+                        try:
+                            nax1 = int(hdr.get("NAXIS1", 0))
+                            nax2 = int(hdr.get("NAXIS2", 0))
+                            if nax1 > 0 and nax2 > 0:
+                                shp_hw = (nax2, nax1)
+                        except Exception:
+                            shp_hw = None
+                        try:
+                            w = WCS(hdr, naxis=2, relax=True) if WCS is not None else None
+                            if w and getattr(w, "is_celestial", False):
+                                wcs0 = w
+                        except Exception:
+                            wcs0 = None
+                        if wcs0 is None:
+                            try:
+                                if (
+                                    ZEMOSAIC_ASTROMETRY_AVAILABLE
+                                    and zemosaic_astrometry
+                                    and hasattr(zemosaic_astrometry, "extract_center_from_header")
+                                ):
+                                    center_sc = zemosaic_astrometry.extract_center_from_header(hdr)
+                            except Exception:
+                                center_sc = None
+                        item = {
+                            "path": fpath,
+                            "header": hdr,
+                            "index": idx_file,
+                        }
+                        if shp_hw:
+                            item["shape"] = shp_hw
+                        if wcs0 is not None:
+                            item["wcs"] = wcs0
+                        if center_sc is not None:
+                            item["center"] = center_sc
+                        header_items_for_filter.append(item)
+                        num_scanned += 1
+                    except Exception:
+                        header_items_for_filter.append({"path": fpath, "index": idx_file})
+                        num_scanned += 1
+                t1_hscan = time.monotonic()
+                avg_t = (t1_hscan - t0_hscan) / max(1, num_scanned)
+                pcb(
+                    f"Phase 0: header scan finished — files={num_scanned}, avg={avg_t:.4f}s/header",
+                    prog=None,
+                    lvl="DEBUG",
+                )
+    
+                if launch_filter_interface_fn is not None and not filter_invoked:
+                    try:
+                        filter_invoked = True
+                        filter_ret = launch_filter_interface_fn(header_items_for_filter, initial_filter_overrides)
+                        filtered_items, filter_accepted, filter_overrides = _parse_filter_result(filter_ret)
+                        if isinstance(filter_overrides, dict) and filter_overrides.get("filter_cancelled"):
+                            pcb("run_warn_phase0_filter_cancelled", prog=None, lvl="WARN")
+                            pcb("log_key_processing_cancelled", prog=None, lvl="WARN")
+                            return
+                    except Exception as e_filter:
+                        filter_invoked = False
+                        filtered_items = None
+                        filter_overrides = None
+                        filter_accepted = False
+                        pcb(f"Phase 0 filter UI failed: {e_filter}", prog=None, lvl="WARN")
+                elif not early_filter_enabled:
+                    pcb("Phase 0: header scan completed (filter UI disabled)", prog=None, lvl="DEBUG_DETAIL")
+    
+            phase0_header_items = header_items_for_filter
+    
+            if filter_invoked:
+                if filter_overrides:
+                    try:
+                        if "cluster_panel_threshold" in filter_overrides:
+                            cluster_threshold_config = filter_overrides["cluster_panel_threshold"]
                             pcb(
-                                f"Phase 0 filter provided {len(mapped_groups)} preplanned group(s).",
+                                "clusterstacks_info_override_threshold",
                                 prog=None,
                                 lvl="INFO_DETAIL",
+                                value=cluster_threshold_config,
                             )
-                except Exception as e_preplan:
-                    pcb(
-                        f"Phase 0 filter preplan override failed: {e_preplan}",
-                        prog=None,
-                        lvl="DEBUG_DETAIL",
-                    )
-
-            if not filter_accepted:
-                pcb("run_warn_phase0_filter_cancelled", prog=None, lvl="WARN")
-                pcb("Phase 0: filter cancelled -> proceeding with all files", prog=None, lvl="INFO_DETAIL")
-            if filter_accepted and isinstance(filtered_items, list):
-                new_paths = [
-                    item.get("path")
-                    for item in filtered_items
-                    if isinstance(item, dict) and item.get("path")
-                ]
-                filtered_paths: list[str] = []
-                for candidate_path in new_paths:
-                    try:
-                        if is_path_excluded(candidate_path, EXCLUDED_DIRS):
-                            continue
-                    except Exception:
-                        if UNALIGNED_DIRNAME in _normpath_parts(candidate_path):
-                            continue
-                    filtered_paths.append(candidate_path)
-
-                fits_file_paths = filtered_paths
-                pcb(
-                    f"Phase 0: selection after filter = {len(fits_file_paths)} files",
-                    prog=None,
-                    lvl="INFO_DETAIL",
-                )
-                if fits_file_paths:
-                    try:
-                        fits_file_paths.sort(key=lambda p: p.lower())
-                    except Exception:
-                        fits_file_paths.sort()
-            elif filter_accepted and not filtered_items:
-                pcb("Phase 0: filter returned no items", prog=None, lvl="WARN")
-    else:
-        phase0_header_items = []
-        pcb("Phase 0: header scan unavailable (Astropy missing)", prog=None, lvl="WARN")
-
-    phase0_lookup = {item["path"]: item for item in phase0_header_items if isinstance(item, dict) and item.get("path")}
-    per_frame_info = _estimate_per_frame_cost_mb(phase0_header_items)
-    auto_caps_info = _compute_auto_tile_caps(
-        resource_probe_info,
-        per_frame_info,
-        policy_max=0,
-        policy_min=8,
-        user_max_override=int(max_raw_per_master_tile_config) if max_raw_per_master_tile_config else None,
-    )
-    try:
-        msg = (
-            "AutoCaps: per_frame≈{pf:.1f} MB, RAM_free≈{rf:.0f} MB → "
-            "frames_by_ram={fbr}, cap={cap}, memmap={mm}, GPUHint={gpu}, parallel={par}".format(
-                pf=auto_caps_info.get("per_frame_mb", 0.0),
-                rf=resource_probe_info.get("ram_available_mb", 0.0) or 0.0,
-                fbr=auto_caps_info.get("frames_by_ram", 0),
-                cap=auto_caps_info.get("cap"),
-                mm="on" if auto_caps_info.get("memmap") else "off",
-                gpu=auto_caps_info.get("gpu_batch_hint") or "n/a",
-                par=auto_caps_info.get("parallel_groups", 1),
-            )
-        )
-        _log_and_callback(msg, prog=None, lvl="INFO_DETAIL", callback=progress_callback)
-    except Exception:
-        pass
-    auto_resource_strategy = {
-        "cap": auto_caps_info.get("cap"),
-        "min_cap": auto_caps_info.get("min_cap"),
-        "memmap": auto_caps_info.get("memmap"),
-        "memmap_budget_mb": auto_caps_info.get("memmap_budget_mb"),
-        "gpu_batch_hint": auto_caps_info.get("gpu_batch_hint"),
-        "parallel_groups": auto_caps_info.get("parallel_groups"),
-        "per_frame_mb": auto_caps_info.get("per_frame_mb"),
-    }
-
-    
-    # --- Détermination du nombre de workers de BASE ---
-    effective_base_workers = 0
-    num_logical_processors = os.cpu_count() or 1 
-    
-    if num_base_workers_config <= 0: # Mode automatique (0 de la GUI)
-        desired_auto_ratio = 0.75
-        effective_base_workers = max(1, int(np.ceil(num_logical_processors * desired_auto_ratio)))
-        pcb(f"WORKERS_CONFIG: Mode Auto. Base de workers calculée: {effective_base_workers} ({desired_auto_ratio*100:.0f}% de {num_logical_processors} processeurs logiques)", prog=None, lvl="INFO_DETAIL")
-    else: # Mode manuel
-        effective_base_workers = min(num_base_workers_config, num_logical_processors)
-        if effective_base_workers < num_base_workers_config:
-             pcb(f"WORKERS_CONFIG: Demande GUI ({num_base_workers_config}) limitée à {effective_base_workers} (total processeurs logiques: {num_logical_processors}).", prog=None, lvl="WARN")
-        pcb(f"WORKERS_CONFIG: Mode Manuel. Base de workers: {effective_base_workers}", prog=None, lvl="INFO_DETAIL")
-    
-    if effective_base_workers <= 0: # Fallback
-        effective_base_workers = 1
-        pcb(f"WORKERS_CONFIG: AVERT - effective_base_workers était <= 0, forcé à 1.", prog=None, lvl="WARN")
-
-    # Calcul du nombre de workers pour la Phase 1
-    actual_num_workers_ph1 = _compute_phase_workers(
-        effective_base_workers,
-        num_total_raw_files,
-        DEFAULT_PHASE_WORKER_RATIO,
-    )
-    pcb(
-        f"WORKERS_PHASE1: Utilisation de {actual_num_workers_ph1} worker(s). (Base: {effective_base_workers}, Fichiers: {num_total_raw_files})",
-        prog=None,
-        lvl="INFO",
-    )  # Log mis à jour pour plus de clarté
-    
-    start_time_phase1 = time.monotonic()
-    all_raw_files_processed_info_dict = {} # Pour stocker les infos des fichiers traités avec succès
-    files_processed_count_ph1 = 0      # Compteur pour les fichiers soumis au ThreadPoolExecutor
-
-    with ThreadPoolExecutor(max_workers=actual_num_workers_ph1, thread_name_prefix="ZeMosaic_Ph1_") as executor_ph1:
-        batch_size = 200
-        for i in range(0, len(fits_file_paths), batch_size):
-            batch = fits_file_paths[i:i+batch_size]
-            future_to_filepath_ph1 = {
-                executor_ph1.submit(
-                    get_wcs_and_pretreat_raw_file,
-                    f_path,
-                    astap_exe_path,
-                    astap_data_dir_param,
-                    astap_search_radius_config,
-                    astap_downsample_config,
-                    astap_sensitivity_config,
-                    180,
-                    progress_callback,
-                    temp_image_cache_dir,
-                    solver_settings
-                ): f_path for f_path in batch
-            }
-
-            for future in as_completed(future_to_filepath_ph1):
-                file_path_original = future_to_filepath_ph1[future]
-                files_processed_count_ph1 += 1  # Incrémenter pour chaque future terminée
-
-                # Update GUI stage progress (files read / total)
-                try:
-                    if progress_callback and callable(progress_callback):
-                        progress_callback("phase1_scan", int(files_processed_count_ph1), int(num_total_raw_files))
-                    # Mirror the count so the GUI can show X/N files
-                    pcb(f"RAW_FILE_COUNT_UPDATE:{files_processed_count_ph1}/{num_total_raw_files}", prog=None, lvl="ETA_LEVEL")
-                except Exception:
-                    pass
-
-                telemetry.maybe_emit_stats(
-                    _telemetry_context(
-                        {
-                            "phase_name": "Phase 1: Preprocessing",
-                            "phase_index": 1,
-                            "files_done": files_processed_count_ph1,
-                            "files_total": num_total_raw_files,
-                        }
-                    )
-                )
-
-                prog_step_phase1 = base_progress_phase1 + int(
-                    PROGRESS_WEIGHT_PHASE1_RAW_SCAN * (files_processed_count_ph1 / max(1, num_total_raw_files))
-                )
-
-                try:
-                    # Récupérer le résultat de la tâche
-                    img_data_adu, wcs_obj_solved, header_obj_updated, hp_mask_path = future.result()
-
-                    # Si la tâche a réussi (ne retourne pas que des None)
-                    if (
-                        img_data_adu is not None
-                        and wcs_obj_solved is not None
-                        and header_obj_updated is not None
-                    ):
-                        # Sauvegarder les données prétraitées en .npy
-                        cache_file_basename = f"preprocessed_{Path(file_path_original).stem}_{files_processed_count_ph1}.npy"
-                        cached_image_path = Path(temp_image_cache_dir) / cache_file_basename
-                        try:
-                            np.save(str(cached_image_path), img_data_adu)
-                        except Exception as e_save_npy:
+                        if "cluster_target_groups" in filter_overrides:
+                            cluster_target_groups_config = filter_overrides["cluster_target_groups"]
                             pcb(
-                                "run_error_phase1_save_npy_failed",
-                                prog=prog_step_phase1,
-                                lvl="ERROR",
-                                filename=_safe_basename(file_path_original),
-                                error=str(e_save_npy),
+                                "clusterstacks_info_override_target_groups",
+                                prog=None,
+                                lvl="INFO_DETAIL",
+                                value=cluster_target_groups_config,
                             )
-                            logger.error(f"Erreur sauvegarde NPY pour {file_path_original}:", exc_info=True)
-                        else:
-                            # Stocker les informations pour les phases suivantes
-                            entry = {
-                                'path_raw': file_path_original,
-                                'path_preprocessed_cache': str(cached_image_path),
-                                'path_hotpix_mask': hp_mask_path,
-                                'wcs': wcs_obj_solved,
-                                'header': header_obj_updated,
-                                'preprocessed_shape': tuple(int(dim) for dim in getattr(img_data_adu, 'shape', []) or ()),
-                            }
-                            meta = phase0_lookup.get(file_path_original)
-                            if isinstance(meta, dict):
-                                if 'index' in meta:
-                                    entry['phase0_index'] = meta.get('index')
-                                if 'center' in meta:
-                                    entry['phase0_center'] = meta.get('center')
-                                if 'shape' in meta:
-                                    entry['phase0_shape'] = meta.get('shape')
-                                if 'wcs' in meta and 'wcs' not in entry:
-                                    entry['phase0_wcs'] = meta.get('wcs')
-                            all_raw_files_processed_info_dict[file_path_original] = entry
-                        finally:
-                            # Libérer la mémoire des données image dès que possible
-                            del img_data_adu
-                            gc.collect()
-                    else:
-                        # Le fichier a échoué (ex: WCS non résolu et déplacé)
-                        # get_wcs_and_pretreat_raw_file a déjà loggué l'échec spécifique.
-                        pcb(
-                            "run_warn_phase1_wcs_pretreat_failed_or_skipped_thread",
-                            prog=prog_step_phase1,
-                            lvl="WARN",
-                            filename=_safe_basename(file_path_original),
-                        )
-                        if img_data_adu is not None:
-                            del img_data_adu
-                            gc.collect()
-
-                except Exception as exc_thread:
-                    # Erreur imprévue dans la future elle-même
-                    pcb(
-                        "run_error_phase1_thread_exception",
-                        prog=prog_step_phase1,
-                        lvl="ERROR",
-                        filename=_safe_basename(file_path_original),
-                        error=str(exc_thread),
-                    )
-                    logger.error(
-                        f"Exception non gérée dans le thread Phase 1 pour {file_path_original}:",
-                        exc_info=True,
-                    )
-
-                # Log de mémoire et ETA
-                if (
-                    files_processed_count_ph1 % max(1, num_total_raw_files // 10) == 0
-                    or files_processed_count_ph1 == num_total_raw_files
-                ):
-                    _log_memory_usage(
-                        progress_callback,
-                        f"Phase 1 - Traité {files_processed_count_ph1}/{num_total_raw_files}",
-                    )
-
-                elapsed_phase1 = time.monotonic() - start_time_phase1
-                if files_processed_count_ph1 > 0:
-                    time_per_raw_file_wcs = elapsed_phase1 / files_processed_count_ph1
-                    eta_phase1_sec = (num_total_raw_files - files_processed_count_ph1) * time_per_raw_file_wcs
-                    current_progress_in_run_percent = base_progress_phase1 + (
-                        files_processed_count_ph1 / max(1, num_total_raw_files)
-                    ) * PROGRESS_WEIGHT_PHASE1_RAW_SCAN
-                    time_per_percent_point_global = (
-                        (time.monotonic() - start_time_total_run) / max(1, current_progress_in_run_percent)
-                        if current_progress_in_run_percent > 0
-                        else (time.monotonic() - start_time_total_run)
-                    )
-                    total_eta_sec = eta_phase1_sec + (
-                        100 - current_progress_in_run_percent
-                    ) * time_per_percent_point_global
-                    update_gui_eta(total_eta_sec)
-
-    # Construire la liste finale des informations des fichiers traités avec succès
-    all_raw_files_processed_info = [
-        all_raw_files_processed_info_dict[fp] 
-        for fp in fits_file_paths 
-        if fp in all_raw_files_processed_info_dict
-    ]
-    
-    if not all_raw_files_processed_info: 
-        pcb("run_error_phase1_no_valid_raws_after_cache", prog=(base_progress_phase1 + PROGRESS_WEIGHT_PHASE1_RAW_SCAN), lvl="ERROR")
-        return # Sortie anticipée si aucun fichier n'a pu être traité avec succès
-
-    current_global_progress = base_progress_phase1 + PROGRESS_WEIGHT_PHASE1_RAW_SCAN
-    _log_memory_usage(progress_callback, "Fin Phase 1 (Prétraitement)")
-    pcb("run_info_phase1_finished_cache", prog=current_global_progress, lvl="INFO", num_valid_raws=len(all_raw_files_processed_info))
-    # --- Optional interactive filtering between Phase 1 and Phase 2 ---
-    try:
-        raw_files_with_wcs = all_raw_files_processed_info
-        try:
-            raw_files_with_wcs = raw_files_with_wcs
-            # Keep the same variable name used by subsequent phases
-            all_raw_files_processed_info = raw_files_with_wcs
-        except ImportError:
-            # Optional module not present: silently skip
-            pass
-        except Exception as e_opt:
-            logger.warning(f"Filtrage facultatif désactivé suite à une erreur : {e_opt}")
-    except Exception as e_hook:
-        # Any unexpected issue in the hook wrapper: continue unchanged
-        logger.warning(f"Filtrage facultatif non appliqué: {e_hook}")
-    if time_per_raw_file_wcs: 
-        pcb(f"    Temps moyen/brute (P1): {time_per_raw_file_wcs:.2f}s", prog=None, lvl="DEBUG")
-
-    # --- Phase 2 (Clustering) ---
-    base_progress_phase2 = current_global_progress
-    _log_memory_usage(progress_callback, "Début Phase 2 (Clustering)")
-    pcb("run_info_phase2_started", prog=base_progress_phase2, lvl="INFO")
-    pcb("PHASE_UPDATE:2", prog=None, lvl="ETA_LEVEL")
-    # Use order-invariant connected-components clustering for robustness
-    preplan_groups_active = False
-    if preplan_groups_override_paths:
-        try:
-            path_lookup = {
-                _normalize_path_for_matching(info.get("path_raw") or info.get("path")): info
-                for info in all_raw_files_processed_info
-                if isinstance(info, dict)
-            }
-            used_paths: set[str] = set()
-            mapped_info_groups: list[list[dict]] = []
-            missing_preplan: list[str] = []
-            for group_paths in preplan_groups_override_paths:
-                current_group: list[dict] = []
-                for path_norm in group_paths:
-                    if not path_norm:
-                        continue
-                    info = path_lookup.get(path_norm)
-                    if info is not None:
-                        current_group.append(info)
-                        used_paths.add(path_norm)
-                    else:
-                        missing_preplan.append(path_norm)
-                if current_group:
-                    mapped_info_groups.append(current_group)
-            if mapped_info_groups:
-                leftovers = [
-                    info
-                    for info in all_raw_files_processed_info
-                    if _normalize_path_for_matching(info.get("path_raw") or info.get("path")) not in used_paths
-                ]
-                if leftovers:
-                    mapped_info_groups.append(leftovers)
-                seestar_stack_groups = mapped_info_groups
-                preplan_groups_active = True
-                _log_and_callback(
-                    f"Phase 2: using {len(mapped_info_groups)} preplanned group(s) from filter UI.",
-                    prog=None,
-                    lvl="INFO_DETAIL",
-                    callback=progress_callback,
-                )
-                if missing_preplan:
-                    try:
-                        preview = ", ".join(_safe_basename(p) for p in missing_preplan[:5] if p)
+                        if "cluster_orientation_split_deg" in filter_overrides:
+                            cluster_orientation_split_deg_config = filter_overrides["cluster_orientation_split_deg"]
+                            pcb(
+                                "clusterstacks_info_override_orientation_split",
+                                prog=None,
+                                lvl="INFO_DETAIL",
+                                value=cluster_orientation_split_deg_config,
+                            )
                     except Exception:
-                        preview = ""
-                    _log_and_callback(
-                        "Phase 2: some preplanned paths were not found after preprocessing: "
-                        + (preview if preview else str(len(missing_preplan))),
+                        pass
+                    try:
+                        raw_groups_override = (
+                            filter_overrides.get("preplan_master_groups")
+                            if isinstance(filter_overrides, dict)
+                            else None
+                        )
+                        if isinstance(raw_groups_override, list):
+                            mapped_groups: list[list[str]] = []
+                            for group in raw_groups_override:
+                                if not isinstance(group, (list, tuple)):
+                                    continue
+                                normalized_group: list[str] = []
+                                for item in group:
+                                    path_val = None
+                                    if isinstance(item, dict):
+                                        path_val = item.get("path") or item.get("path_raw")
+                                    elif isinstance(item, str):
+                                        path_val = item
+                                    norm_path = _normalize_path_for_matching(path_val)
+                                    if norm_path:
+                                        normalized_group.append(norm_path)
+                                if normalized_group:
+                                    mapped_groups.append(normalized_group)
+                            if mapped_groups:
+                                preplan_groups_override_paths = mapped_groups
+                                pcb(
+                                    f"Phase 0 filter provided {len(mapped_groups)} preplanned group(s).",
+                                    prog=None,
+                                    lvl="INFO_DETAIL",
+                                )
+                    except Exception as e_preplan:
+                        pcb(
+                            f"Phase 0 filter preplan override failed: {e_preplan}",
+                            prog=None,
+                            lvl="DEBUG_DETAIL",
+                        )
+    
+                if not filter_accepted:
+                    pcb("run_warn_phase0_filter_cancelled", prog=None, lvl="WARN")
+                    pcb("Phase 0: filter cancelled -> proceeding with all files", prog=None, lvl="INFO_DETAIL")
+                if filter_accepted and isinstance(filtered_items, list):
+                    new_paths = [
+                        item.get("path")
+                        for item in filtered_items
+                        if isinstance(item, dict) and item.get("path")
+                    ]
+                    filtered_paths: list[str] = []
+                    for candidate_path in new_paths:
+                        try:
+                            if is_path_excluded(candidate_path, EXCLUDED_DIRS):
+                                continue
+                        except Exception:
+                            if UNALIGNED_DIRNAME in _normpath_parts(candidate_path):
+                                continue
+                        filtered_paths.append(candidate_path)
+    
+                    fits_file_paths = filtered_paths
+                    pcb(
+                        f"Phase 0: selection after filter = {len(fits_file_paths)} files",
                         prog=None,
-                        lvl="WARN",
-                        callback=progress_callback,
+                        lvl="INFO_DETAIL",
                     )
-        except Exception as e_preplan_map:
-            _log_and_callback(
-                f"Phase 2: failed to map preplanned groups ({e_preplan_map}). Falling back to clustering.",
-                prog=None,
-                lvl="WARN",
-                callback=progress_callback,
-            )
-            preplan_groups_active = False
-
-    if not preplan_groups_active:
-        seestar_stack_groups = cluster_seestar_stacks_connected(
-            all_raw_files_processed_info,
-            SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG,
-            progress_callback,
-            orientation_split_threshold_deg=ORIENTATION_SPLIT_THRESHOLD_DEG,
+                    if fits_file_paths:
+                        try:
+                            fits_file_paths.sort(key=lambda p: p.lower())
+                        except Exception:
+                            fits_file_paths.sort()
+                elif filter_accepted and not filtered_items:
+                    pcb("Phase 0: filter returned no items", prog=None, lvl="WARN")
+        else:
+            phase0_header_items = []
+            pcb("Phase 0: header scan unavailable (Astropy missing)", prog=None, lvl="WARN")
+    
+        phase0_lookup = {item["path"]: item for item in phase0_header_items if isinstance(item, dict) and item.get("path")}
+        per_frame_info = _estimate_per_frame_cost_mb(phase0_header_items)
+        auto_caps_info = _compute_auto_tile_caps(
+            resource_probe_info,
+            per_frame_info,
+            policy_max=0,
+            policy_min=8,
+            user_max_override=int(max_raw_per_master_tile_config) if max_raw_per_master_tile_config else None,
         )
-        if STACK_RAM_BUDGET_BYTES > 0 and seestar_stack_groups:
-            seestar_stack_groups, ram_budget_adjustments = _apply_ram_budget_to_groups(
-                seestar_stack_groups,
-                STACK_RAM_BUDGET_BYTES,
-                float(SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG),
-                float(ORIENTATION_SPLIT_THRESHOLD_DEG),
-            )
-            for adj in ram_budget_adjustments:
-                method = adj.get("method")
-                if method == "recluster":
-                    _log_and_callback(
-                        "clusterstacks_warn_ram_budget_recluster",
-                        prog=None,
-                        lvl="WARN",
-                        callback=progress_callback,
-                        group_index=adj.get("group_index"),
-                        original_frames=adj.get("original_frames"),
-                        num_subgroups=adj.get("num_subgroups"),
-                        new_threshold_deg=adj.get("new_threshold_deg"),
-                        attempts=adj.get("attempts"),
-                        estimated_mb=adj.get("estimated_mb"),
-                        budget_mb=adj.get("budget_mb"),
-                    )
-                elif method == "split":
-                    _log_and_callback(
-                        "clusterstacks_warn_ram_budget_split",
-                        prog=None,
-                        lvl="WARN",
-                        callback=progress_callback,
-                        group_index=adj.get("group_index"),
-                        original_frames=adj.get("original_frames"),
-                        num_subgroups=adj.get("num_subgroups"),
-                        segment_size=adj.get("segment_size"),
-                        estimated_mb=adj.get("estimated_mb"),
-                        budget_mb=adj.get("budget_mb"),
-                    )
-                    if adj.get("still_over_budget"):
-                        _log_and_callback(
-                            "clusterstacks_warn_ram_budget_split_still_over",
-                            prog=None,
-                            lvl="WARN",
-                            callback=progress_callback,
-                            group_index=adj.get("group_index"),
-                            segment_size=adj.get("segment_size"),
-                            budget_mb=adj.get("budget_mb"),
-                        )
-                elif method == "single_over_budget":
-                    _log_and_callback(
-                        "clusterstacks_warn_ram_budget_single_over",
-                        prog=None,
-                        lvl="WARN",
-                        callback=progress_callback,
-                        group_index=adj.get("group_index"),
-                        estimated_mb=adj.get("estimated_mb"),
-                        budget_mb=adj.get("budget_mb"),
-                    )
-    # Diagnostic: nearest-neighbor separation percentiles to help tune eps
-    try:
-        panel_centers_sky_dbg = []
-        for info in all_raw_files_processed_info:
-            wcs_obj = info.get("wcs")
-            if not (wcs_obj and getattr(wcs_obj, "is_celestial", False)):
-                continue
-            try:
-                if getattr(wcs_obj, "pixel_shape", None):
-                    cx = wcs_obj.pixel_shape[0] / 2.0
-                    cy = wcs_obj.pixel_shape[1] / 2.0
-                    center_world = wcs_obj.pixel_to_world(cx, cy)
-                elif hasattr(wcs_obj, "wcs") and hasattr(wcs_obj.wcs, "crval"):
-                    center_world = SkyCoord(
-                        ra=float(wcs_obj.wcs.crval[0]) * u.deg,
-                        dec=float(wcs_obj.wcs.crval[1]) * u.deg,
-                        frame="icrs",
-                    )
-                else:
-                    continue
-                panel_centers_sky_dbg.append(center_world)
-            except Exception:
-                continue
-        if len(panel_centers_sky_dbg) >= 2:
-            coords_dbg = SkyCoord(ra=[c.ra for c in panel_centers_sky_dbg], dec=[c.dec for c in panel_centers_sky_dbg], frame="icrs")
-            try:
-                _, sep_nn, _ = coords_dbg.match_to_catalog_sky(coords_dbg, nthneighbor=1)
-                nn = np.asarray(sep_nn.deg, dtype=float)
-                p10 = float(np.nanpercentile(nn, 10.0))
-                p50 = float(np.nanpercentile(nn, 50.0))
-                p90 = float(np.nanpercentile(nn, 90.0))
-                _log_and_callback(
-                    f"Cluster NN stats (deg): P10={p10:.4f}, P50={p50:.4f}, P90={p90:.4f}",
-                    prog=None,
-                    lvl="DEBUG_DETAIL",
-                    callback=progress_callback,
-                )
-            except Exception:
-                pass
-    except Exception:
-        pass
-    # If clustering is pathologically conservative (almost one group per image),
-    # auto-relax the threshold based on nearest-neighbor distances to avoid
-    # producing hundreds of master tiles for tightly-dithered panels.
-    try:
-        total_inputs_for_cluster = len(all_raw_files_processed_info)
-        groups_initial = len(seestar_stack_groups)
-        if total_inputs_for_cluster > 2 and groups_initial >= max(3, int(0.9 * total_inputs_for_cluster)):
-            # Compute a robust suggested threshold from the 90th percentile of
-            # nearest-neighbor separations between panel centers.
-            # Rebuild centers the same way as clustering helpers do.
-            panel_centers_sky = []
-            for info in all_raw_files_processed_info:
-                wcs_obj = info.get("wcs")
-                if not (wcs_obj and getattr(wcs_obj, "is_celestial", False)):
-                    continue
-                try:
-                    if getattr(wcs_obj, "pixel_shape", None):
-                        cx = wcs_obj.pixel_shape[0] / 2.0
-                        cy = wcs_obj.pixel_shape[1] / 2.0
-                        center_world = wcs_obj.pixel_to_world(cx, cy)
-                    elif hasattr(wcs_obj, "wcs") and hasattr(wcs_obj.wcs, "crval"):
-                        center_world = SkyCoord(
-                            ra=float(wcs_obj.wcs.crval[0]) * u.deg,
-                            dec=float(wcs_obj.wcs.crval[1]) * u.deg,
-                            frame="icrs",
-                        )
-                    else:
-                        continue
-                    panel_centers_sky.append(center_world)
-                except Exception:
-                    continue
-
-            if len(panel_centers_sky) >= 2:
-                coords = SkyCoord(
-                    ra=[c.ra for c in panel_centers_sky],
-                    dec=[c.dec for c in panel_centers_sky],
-                    frame="icrs",
-                )
-                try:
-                    # Nearest neighbor (excluding self). Astropy handles wrap.
-                    _, sep2d, _ = coords.match_to_catalog_sky(coords, nthneighbor=1)
-                    nn_deg = np.asarray(sep2d.deg, dtype=float)
-                    # Robust high-quantile of dithers; add a small headroom.
-                    p90 = float(np.nanpercentile(nn_deg, 90.0)) if nn_deg.size else 0.0
-                    # Propose a relaxed threshold within sane bounds.
-                    thr_initial = float(SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG)
-                    thr_candidate = max(thr_initial, p90 * 1.2)
-                    thr_candidate = float(min(max(thr_candidate, 0.01), 1.0))  # clamp 0.01°..1.0°
-
-                    if thr_candidate > thr_initial:
-                        _log_and_callback(
-                            f"Cluster AUTO: threshold {thr_initial:.3f}° too conservative -> {groups_initial}/{total_inputs_for_cluster} groups.",
-                            prog=None,
-                            lvl="INFO_DETAIL",
-                            callback=progress_callback,
-                        )
-                        _log_and_callback(
-                            f"Cluster AUTO: relaxing to {thr_candidate:.3f}° (≈1.2×P90 NN={p90:.3f}°) and re-clustering...",
-                            prog=None,
-                            lvl="INFO_DETAIL",
-                            callback=progress_callback,
-                        )
-                        seestar_stack_groups = cluster_seestar_stacks_connected(
-                            all_raw_files_processed_info, thr_candidate, progress_callback
-                        )
-                        groups_after = len(seestar_stack_groups)
-                        _log_and_callback(
-                            f"Cluster AUTO: re-clustered into {groups_after} groups (was {groups_initial}).",
-                            prog=None,
-                            lvl="INFO_DETAIL",
-                            callback=progress_callback,
-                        )
-                except Exception as e_auto_relax:
-                    _log_and_callback(
-                        f"Cluster AUTO: failed to compute NN-based relax: {e_auto_relax}",
-                        prog=None,
-                        lvl="DEBUG_DETAIL",
-                        callback=progress_callback,
-                    )
-    except Exception as e_cluster_guard:
-        _log_and_callback(
-            f"Cluster AUTO: guard exception: {e_cluster_guard}", prog=None, lvl="DEBUG_DETAIL", callback=progress_callback
-        )
-
-    # Optional: drive clustering to a target number of groups by relaxing
-    # the threshold via a bounded search. Disabled when target <= 0.
-    try:
-        target_groups = int(cluster_target_groups_config or 0)
-    except Exception:
-        target_groups = 0
-    if (not preplan_groups_active) and target_groups > 0 and len(seestar_stack_groups) != target_groups:
         try:
-            # Build coordinates array
-            panel_centers_sky = []
-            for info in all_raw_files_processed_info:
-                wcs_obj = info.get("wcs")
-                if not (wcs_obj and getattr(wcs_obj, "is_celestial", False)):
-                    continue
-                try:
-                    if getattr(wcs_obj, "pixel_shape", None):
-                        cx = wcs_obj.pixel_shape[0] / 2.0
-                        cy = wcs_obj.pixel_shape[1] / 2.0
-                        center_world = wcs_obj.pixel_to_world(cx, cy)
-                    elif hasattr(wcs_obj, "wcs") and hasattr(wcs_obj.wcs, "crval"):
-                        center_world = SkyCoord(
-                            ra=float(wcs_obj.wcs.crval[0]) * u.deg,
-                            dec=float(wcs_obj.wcs.crval[1]) * u.deg,
-                            frame="icrs",
-                        )
-                    else:
-                        continue
-                    panel_centers_sky.append(center_world)
-                except Exception:
-                    continue
-
-            if len(panel_centers_sky) >= 2:
-                coords = SkyCoord(
-                    ra=[c.ra for c in panel_centers_sky],
-                    dec=[c.dec for c in panel_centers_sky],
-                    frame="icrs",
+            msg = (
+                "AutoCaps: per_frame≈{pf:.1f} MB, RAM_free≈{rf:.0f} MB → "
+                "frames_by_ram={fbr}, cap={cap}, memmap={mm}, GPUHint={gpu}, parallel={par}".format(
+                    pf=auto_caps_info.get("per_frame_mb", 0.0),
+                    rf=resource_probe_info.get("ram_available_mb", 0.0) or 0.0,
+                    fbr=auto_caps_info.get("frames_by_ram", 0),
+                    cap=auto_caps_info.get("cap"),
+                    mm="on" if auto_caps_info.get("memmap") else "off",
+                    gpu=auto_caps_info.get("gpu_batch_hint") or "n/a",
+                    par=auto_caps_info.get("parallel_groups", 1),
                 )
-                # Establish an upper bound big enough that all panels connect
-                # (max pairwise separation). Clamp to 5 degrees to avoid
-                # pathological values.
-                try:
-                    sep_mat_deg = coords.separation(coords).deg
-                    max_pair_deg = float(np.nanmax(sep_mat_deg)) if np.size(sep_mat_deg) else 0.5
-                except Exception:
-                    max_pair_deg = 0.5
-                thr_current = float(SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG)
-                def _count_groups(thr: float) -> tuple[int, list]:
-                    g = cluster_seestar_stacks_connected(
-                        all_raw_files_processed_info,
-                        float(thr),
-                        None,
-                        orientation_split_threshold_deg=ORIENTATION_SPLIT_THRESHOLD_DEG,
-                    )
-                    return len(g), g
-                cnt_cur = len(seestar_stack_groups)
-                # Direction: if too many groups, increase threshold; if too few, decrease.
-                if cnt_cur > target_groups:
-                    lo = thr_current
-                    hi = float(min(max(max_pair_deg, lo * 2.0, 0.05), 5.0))
-                    cnt_hi, groups_hi = _count_groups(hi)
-                    # Expand hi until we get <= target (fewer groups) or cap
-                    expand_iter = 0
-                    while cnt_hi > target_groups and hi < 5.0 and expand_iter < 8:
-                        hi = min(hi * 1.5 + 1e-6, 5.0)
-                        cnt_hi, groups_hi = _count_groups(hi)
-                        expand_iter += 1
-                    best_thr = hi
-                    best_groups = groups_hi
-                    for _ in range(14):
-                        mid = 0.5 * (lo + hi)
-                        cnt_mid, groups_mid = _count_groups(mid)
-                        if cnt_mid > target_groups:
-                            lo = mid
-                        else:
-                            hi = mid
-                            best_thr = mid
-                            best_groups = groups_mid
-                else:
-                    # Need more groups ⇒ lower the threshold
-                    hi = thr_current
-                    lo = max(1e-6, hi / 2.0)
-                    cnt_lo, groups_lo = _count_groups(lo)
-                    shrink_iter = 0
-                    while cnt_lo < target_groups and lo > 1e-6 and shrink_iter < 12:
-                        hi = lo
-                        lo = max(1e-6, lo / 1.5)
-                        cnt_lo, groups_lo = _count_groups(lo)
-                        shrink_iter += 1
-                    best_thr = lo
-                    best_groups = groups_lo
-                    # Binary search upward to approach target from the high side (more stable)
-                    for _ in range(14):
-                        mid = 0.5 * (lo + hi)
-                        cnt_mid, groups_mid = _count_groups(mid)
-                        if cnt_mid < target_groups:
-                            # still too few groups ⇒ lower threshold more
-                            hi = mid
-                        else:
-                            lo = mid
-                            best_thr = mid
-                            best_groups = groups_mid
-                _log_and_callback(
-                    f"Cluster AUTO Target: threshold -> {best_thr:.4f}° for ≈{len(best_groups)} groups (target {target_groups}).",
-                    prog=None,
-                    lvl="INFO_DETAIL",
-                    callback=progress_callback,
-                )
-                seestar_stack_groups = best_groups
-        except Exception as e_target:
-            _log_and_callback(
-                f"Cluster AUTO Target: search failed: {e_target}", prog=None, lvl="DEBUG_DETAIL", callback=progress_callback
             )
-    if not seestar_stack_groups:
-        pcb("run_error_phase2_no_groups", prog=(base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING), lvl="ERROR")
-        return
-    if (not preplan_groups_active) and auto_caps_info and seestar_stack_groups:
-        try:
-            cap_value = int(auto_caps_info.get("cap", 0))
-            min_value = int(auto_caps_info.get("min_cap", 8))
+            _log_and_callback(msg, prog=None, lvl="INFO_DETAIL", callback=progress_callback)
         except Exception:
-            cap_value = 0
-            min_value = 8
-        if cap_value > 0:
-            original_count = len(seestar_stack_groups)
-            seestar_stack_groups = _auto_split_groups(
-                seestar_stack_groups,
-                cap_value,
-                min_value,
-                progress_callback=progress_callback,
-            )
-            if len(seestar_stack_groups) != original_count:
-                try:
+            pass
+        auto_resource_strategy = {
+            "cap": auto_caps_info.get("cap"),
+            "min_cap": auto_caps_info.get("min_cap"),
+            "memmap": auto_caps_info.get("memmap"),
+            "memmap_budget_mb": auto_caps_info.get("memmap_budget_mb"),
+            "gpu_batch_hint": auto_caps_info.get("gpu_batch_hint"),
+            "parallel_groups": auto_caps_info.get("parallel_groups"),
+            "per_frame_mb": auto_caps_info.get("per_frame_mb"),
+        }
+    
+        
+        # --- Détermination du nombre de workers de BASE ---
+        effective_base_workers = 0
+        num_logical_processors = os.cpu_count() or 1 
+        
+        if num_base_workers_config <= 0: # Mode automatique (0 de la GUI)
+            desired_auto_ratio = 0.75
+            effective_base_workers = max(1, int(np.ceil(num_logical_processors * desired_auto_ratio)))
+            pcb(f"WORKERS_CONFIG: Mode Auto. Base de workers calculée: {effective_base_workers} ({desired_auto_ratio*100:.0f}% de {num_logical_processors} processeurs logiques)", prog=None, lvl="INFO_DETAIL")
+        else: # Mode manuel
+            effective_base_workers = min(num_base_workers_config, num_logical_processors)
+            if effective_base_workers < num_base_workers_config:
+                 pcb(f"WORKERS_CONFIG: Demande GUI ({num_base_workers_config}) limitée à {effective_base_workers} (total processeurs logiques: {num_logical_processors}).", prog=None, lvl="WARN")
+            pcb(f"WORKERS_CONFIG: Mode Manuel. Base de workers: {effective_base_workers}", prog=None, lvl="INFO_DETAIL")
+        
+        if effective_base_workers <= 0: # Fallback
+            effective_base_workers = 1
+            pcb(f"WORKERS_CONFIG: AVERT - effective_base_workers était <= 0, forcé à 1.", prog=None, lvl="WARN")
+    
+        # Calcul du nombre de workers pour la Phase 1
+        actual_num_workers_ph1 = _compute_phase_workers(
+            effective_base_workers,
+            num_total_raw_files,
+            DEFAULT_PHASE_WORKER_RATIO,
+        )
+        pcb(
+            f"WORKERS_PHASE1: Utilisation de {actual_num_workers_ph1} worker(s). (Base: {effective_base_workers}, Fichiers: {num_total_raw_files})",
+            prog=None,
+            lvl="INFO",
+        )  # Log mis à jour pour plus de clarté
+        
+        start_time_phase1 = time.monotonic()
+        all_raw_files_processed_info_dict = {} # Pour stocker les infos des fichiers traités avec succès
+        files_processed_count_ph1 = 0      # Compteur pour les fichiers soumis au ThreadPoolExecutor
+    
+        with ThreadPoolExecutor(max_workers=actual_num_workers_ph1, thread_name_prefix="ZeMosaic_Ph1_") as executor_ph1:
+            batch_size = 200
+            for i in range(0, len(fits_file_paths), batch_size):
+                batch = fits_file_paths[i:i+batch_size]
+                future_to_filepath_ph1 = {
+                    executor_ph1.submit(
+                        get_wcs_and_pretreat_raw_file,
+                        f_path,
+                        astap_exe_path,
+                        astap_data_dir_param,
+                        astap_search_radius_config,
+                        astap_downsample_config,
+                        astap_sensitivity_config,
+                        180,
+                        progress_callback,
+                        temp_image_cache_dir,
+                        solver_settings
+                    ): f_path for f_path in batch
+                }
+    
+                for future in as_completed(future_to_filepath_ph1):
+                    file_path_original = future_to_filepath_ph1[future]
+                    files_processed_count_ph1 += 1  # Incrémenter pour chaque future terminée
+    
+                    # Update GUI stage progress (files read / total)
+                    try:
+                        if progress_callback and callable(progress_callback):
+                            progress_callback("phase1_scan", int(files_processed_count_ph1), int(num_total_raw_files))
+                        # Mirror the count so the GUI can show X/N files
+                        pcb(f"RAW_FILE_COUNT_UPDATE:{files_processed_count_ph1}/{num_total_raw_files}", prog=None, lvl="ETA_LEVEL")
+                    except Exception:
+                        pass
+    
+                    telemetry.maybe_emit_stats(
+                        _telemetry_context(
+                            {
+                                "phase_name": "Phase 1: Preprocessing",
+                                "phase_index": 1,
+                                "files_done": files_processed_count_ph1,
+                                "files_total": num_total_raw_files,
+                            }
+                        )
+                    )
+    
+                    prog_step_phase1 = base_progress_phase1 + int(
+                        PROGRESS_WEIGHT_PHASE1_RAW_SCAN * (files_processed_count_ph1 / max(1, num_total_raw_files))
+                    )
+    
+                    try:
+                        # Récupérer le résultat de la tâche
+                        img_data_adu, wcs_obj_solved, header_obj_updated, hp_mask_path = future.result()
+    
+                        # Si la tâche a réussi (ne retourne pas que des None)
+                        if (
+                            img_data_adu is not None
+                            and wcs_obj_solved is not None
+                            and header_obj_updated is not None
+                        ):
+                            # Sauvegarder les données prétraitées en .npy
+                            cache_file_basename = f"preprocessed_{Path(file_path_original).stem}_{files_processed_count_ph1}.npy"
+                            cached_image_path = Path(temp_image_cache_dir) / cache_file_basename
+                            try:
+                                np.save(str(cached_image_path), img_data_adu)
+                            except Exception as e_save_npy:
+                                pcb(
+                                    "run_error_phase1_save_npy_failed",
+                                    prog=prog_step_phase1,
+                                    lvl="ERROR",
+                                    filename=_safe_basename(file_path_original),
+                                    error=str(e_save_npy),
+                                )
+                                logger.error(f"Erreur sauvegarde NPY pour {file_path_original}:", exc_info=True)
+                            else:
+                                # Stocker les informations pour les phases suivantes
+                                entry = {
+                                    'path_raw': file_path_original,
+                                    'path_preprocessed_cache': str(cached_image_path),
+                                    'path_hotpix_mask': hp_mask_path,
+                                    'wcs': wcs_obj_solved,
+                                    'header': header_obj_updated,
+                                    'preprocessed_shape': tuple(int(dim) for dim in getattr(img_data_adu, 'shape', []) or ()),
+                                }
+                                meta = phase0_lookup.get(file_path_original)
+                                if isinstance(meta, dict):
+                                    if 'index' in meta:
+                                        entry['phase0_index'] = meta.get('index')
+                                    if 'center' in meta:
+                                        entry['phase0_center'] = meta.get('center')
+                                    if 'shape' in meta:
+                                        entry['phase0_shape'] = meta.get('shape')
+                                    if 'wcs' in meta and 'wcs' not in entry:
+                                        entry['phase0_wcs'] = meta.get('wcs')
+                                all_raw_files_processed_info_dict[file_path_original] = entry
+                            finally:
+                                # Libérer la mémoire des données image dès que possible
+                                del img_data_adu
+                                gc.collect()
+                        else:
+                            # Le fichier a échoué (ex: WCS non résolu et déplacé)
+                            # get_wcs_and_pretreat_raw_file a déjà loggué l'échec spécifique.
+                            pcb(
+                                "run_warn_phase1_wcs_pretreat_failed_or_skipped_thread",
+                                prog=prog_step_phase1,
+                                lvl="WARN",
+                                filename=_safe_basename(file_path_original),
+                            )
+                            if img_data_adu is not None:
+                                del img_data_adu
+                                gc.collect()
+    
+                    except Exception as exc_thread:
+                        # Erreur imprévue dans la future elle-même
+                        pcb(
+                            "run_error_phase1_thread_exception",
+                            prog=prog_step_phase1,
+                            lvl="ERROR",
+                            filename=_safe_basename(file_path_original),
+                            error=str(exc_thread),
+                        )
+                        logger.error(
+                            f"Exception non gérée dans le thread Phase 1 pour {file_path_original}:",
+                            exc_info=True,
+                        )
+    
+                    # Log de mémoire et ETA
+                    if (
+                        files_processed_count_ph1 % max(1, num_total_raw_files // 10) == 0
+                        or files_processed_count_ph1 == num_total_raw_files
+                    ):
+                        _log_memory_usage(
+                            progress_callback,
+                            f"Phase 1 - Traité {files_processed_count_ph1}/{num_total_raw_files}",
+                        )
+    
+                    elapsed_phase1 = time.monotonic() - start_time_phase1
+                    if files_processed_count_ph1 > 0:
+                        time_per_raw_file_wcs = elapsed_phase1 / files_processed_count_ph1
+                        eta_phase1_sec = (num_total_raw_files - files_processed_count_ph1) * time_per_raw_file_wcs
+                        current_progress_in_run_percent = base_progress_phase1 + (
+                            files_processed_count_ph1 / max(1, num_total_raw_files)
+                        ) * PROGRESS_WEIGHT_PHASE1_RAW_SCAN
+                        time_per_percent_point_global = (
+                            (time.monotonic() - start_time_total_run) / max(1, current_progress_in_run_percent)
+                            if current_progress_in_run_percent > 0
+                            else (time.monotonic() - start_time_total_run)
+                        )
+                        total_eta_sec = eta_phase1_sec + (
+                            100 - current_progress_in_run_percent
+                        ) * time_per_percent_point_global
+                        update_gui_eta(total_eta_sec)
+    
+        # Construire la liste finale des informations des fichiers traités avec succès
+        all_raw_files_processed_info = [
+            all_raw_files_processed_info_dict[fp] 
+            for fp in fits_file_paths 
+            if fp in all_raw_files_processed_info_dict
+        ]
+        
+        if not all_raw_files_processed_info: 
+            pcb("run_error_phase1_no_valid_raws_after_cache", prog=(base_progress_phase1 + PROGRESS_WEIGHT_PHASE1_RAW_SCAN), lvl="ERROR")
+            return # Sortie anticipée si aucun fichier n'a pu être traité avec succès
+    
+        current_global_progress = base_progress_phase1 + PROGRESS_WEIGHT_PHASE1_RAW_SCAN
+        _log_memory_usage(progress_callback, "Fin Phase 1 (Prétraitement)")
+        pcb("run_info_phase1_finished_cache", prog=current_global_progress, lvl="INFO", num_valid_raws=len(all_raw_files_processed_info))
+        # --- Optional interactive filtering between Phase 1 and Phase 2 ---
+        try:
+            raw_files_with_wcs = all_raw_files_processed_info
+            try:
+                raw_files_with_wcs = raw_files_with_wcs
+                # Keep the same variable name used by subsequent phases
+                all_raw_files_processed_info = raw_files_with_wcs
+            except ImportError:
+                # Optional module not present: silently skip
+                pass
+            except Exception as e_opt:
+                logger.warning(f"Filtrage facultatif désactivé suite à une erreur : {e_opt}")
+        except Exception as e_hook:
+            # Any unexpected issue in the hook wrapper: continue unchanged
+            logger.warning(f"Filtrage facultatif non appliqué: {e_hook}")
+        if time_per_raw_file_wcs: 
+            pcb(f"    Temps moyen/brute (P1): {time_per_raw_file_wcs:.2f}s", prog=None, lvl="DEBUG")
+    
+        # --- Phase 2 (Clustering) ---
+        base_progress_phase2 = current_global_progress
+        _log_memory_usage(progress_callback, "Début Phase 2 (Clustering)")
+        pcb("run_info_phase2_started", prog=base_progress_phase2, lvl="INFO")
+        pcb("PHASE_UPDATE:2", prog=None, lvl="ETA_LEVEL")
+        # Use order-invariant connected-components clustering for robustness
+        preplan_groups_active = False
+        if preplan_groups_override_paths:
+            try:
+                path_lookup = {
+                    _normalize_path_for_matching(info.get("path_raw") or info.get("path")): info
+                    for info in all_raw_files_processed_info
+                    if isinstance(info, dict)
+                }
+                used_paths: set[str] = set()
+                mapped_info_groups: list[list[dict]] = []
+                missing_preplan: list[str] = []
+                for group_paths in preplan_groups_override_paths:
+                    current_group: list[dict] = []
+                    for path_norm in group_paths:
+                        if not path_norm:
+                            continue
+                        info = path_lookup.get(path_norm)
+                        if info is not None:
+                            current_group.append(info)
+                            used_paths.add(path_norm)
+                        else:
+                            missing_preplan.append(path_norm)
+                    if current_group:
+                        mapped_info_groups.append(current_group)
+                if mapped_info_groups:
+                    leftovers = [
+                        info
+                        for info in all_raw_files_processed_info
+                        if _normalize_path_for_matching(info.get("path_raw") or info.get("path")) not in used_paths
+                    ]
+                    if leftovers:
+                        mapped_info_groups.append(leftovers)
+                    seestar_stack_groups = mapped_info_groups
+                    preplan_groups_active = True
                     _log_and_callback(
-                        f"AutoSplit summary: {original_count} -> {len(seestar_stack_groups)} subgroup(s) (cap={cap_value})",
+                        f"Phase 2: using {len(mapped_info_groups)} preplanned group(s) from filter UI.",
                         prog=None,
                         lvl="INFO_DETAIL",
                         callback=progress_callback,
                     )
+                    if missing_preplan:
+                        try:
+                            preview = ", ".join(_safe_basename(p) for p in missing_preplan[:5] if p)
+                        except Exception:
+                            preview = ""
+                        _log_and_callback(
+                            "Phase 2: some preplanned paths were not found after preprocessing: "
+                            + (preview if preview else str(len(missing_preplan))),
+                            prog=None,
+                            lvl="WARN",
+                            callback=progress_callback,
+                        )
+            except Exception as e_preplan_map:
+                _log_and_callback(
+                    f"Phase 2: failed to map preplanned groups ({e_preplan_map}). Falling back to clustering.",
+                    prog=None,
+                    lvl="WARN",
+                    callback=progress_callback,
+                )
+                preplan_groups_active = False
+    
+        if not preplan_groups_active:
+            seestar_stack_groups = cluster_seestar_stacks_connected(
+                all_raw_files_processed_info,
+                SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG,
+                progress_callback,
+                orientation_split_threshold_deg=ORIENTATION_SPLIT_THRESHOLD_DEG,
+            )
+            if STACK_RAM_BUDGET_BYTES > 0 and seestar_stack_groups:
+                seestar_stack_groups, ram_budget_adjustments = _apply_ram_budget_to_groups(
+                    seestar_stack_groups,
+                    STACK_RAM_BUDGET_BYTES,
+                    float(SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG),
+                    float(ORIENTATION_SPLIT_THRESHOLD_DEG),
+                )
+                for adj in ram_budget_adjustments:
+                    method = adj.get("method")
+                    if method == "recluster":
+                        _log_and_callback(
+                            "clusterstacks_warn_ram_budget_recluster",
+                            prog=None,
+                            lvl="WARN",
+                            callback=progress_callback,
+                            group_index=adj.get("group_index"),
+                            original_frames=adj.get("original_frames"),
+                            num_subgroups=adj.get("num_subgroups"),
+                            new_threshold_deg=adj.get("new_threshold_deg"),
+                            attempts=adj.get("attempts"),
+                            estimated_mb=adj.get("estimated_mb"),
+                            budget_mb=adj.get("budget_mb"),
+                        )
+                    elif method == "split":
+                        _log_and_callback(
+                            "clusterstacks_warn_ram_budget_split",
+                            prog=None,
+                            lvl="WARN",
+                            callback=progress_callback,
+                            group_index=adj.get("group_index"),
+                            original_frames=adj.get("original_frames"),
+                            num_subgroups=adj.get("num_subgroups"),
+                            segment_size=adj.get("segment_size"),
+                            estimated_mb=adj.get("estimated_mb"),
+                            budget_mb=adj.get("budget_mb"),
+                        )
+                        if adj.get("still_over_budget"):
+                            _log_and_callback(
+                                "clusterstacks_warn_ram_budget_split_still_over",
+                                prog=None,
+                                lvl="WARN",
+                                callback=progress_callback,
+                                group_index=adj.get("group_index"),
+                                segment_size=adj.get("segment_size"),
+                                budget_mb=adj.get("budget_mb"),
+                            )
+                    elif method == "single_over_budget":
+                        _log_and_callback(
+                            "clusterstacks_warn_ram_budget_single_over",
+                            prog=None,
+                            lvl="WARN",
+                            callback=progress_callback,
+                            group_index=adj.get("group_index"),
+                            estimated_mb=adj.get("estimated_mb"),
+                            budget_mb=adj.get("budget_mb"),
+                        )
+        # Diagnostic: nearest-neighbor separation percentiles to help tune eps
+        try:
+            panel_centers_sky_dbg = []
+            for info in all_raw_files_processed_info:
+                wcs_obj = info.get("wcs")
+                if not (wcs_obj and getattr(wcs_obj, "is_celestial", False)):
+                    continue
+                try:
+                    if getattr(wcs_obj, "pixel_shape", None):
+                        cx = wcs_obj.pixel_shape[0] / 2.0
+                        cy = wcs_obj.pixel_shape[1] / 2.0
+                        center_world = wcs_obj.pixel_to_world(cx, cy)
+                    elif hasattr(wcs_obj, "wcs") and hasattr(wcs_obj.wcs, "crval"):
+                        center_world = SkyCoord(
+                            ra=float(wcs_obj.wcs.crval[0]) * u.deg,
+                            dec=float(wcs_obj.wcs.crval[1]) * u.deg,
+                            frame="icrs",
+                        )
+                    else:
+                        continue
+                    panel_centers_sky_dbg.append(center_world)
+                except Exception:
+                    continue
+            if len(panel_centers_sky_dbg) >= 2:
+                coords_dbg = SkyCoord(ra=[c.ra for c in panel_centers_sky_dbg], dec=[c.dec for c in panel_centers_sky_dbg], frame="icrs")
+                try:
+                    _, sep_nn, _ = coords_dbg.match_to_catalog_sky(coords_dbg, nthneighbor=1)
+                    nn = np.asarray(sep_nn.deg, dtype=float)
+                    p10 = float(np.nanpercentile(nn, 10.0))
+                    p50 = float(np.nanpercentile(nn, 50.0))
+                    p90 = float(np.nanpercentile(nn, 90.0))
+                    _log_and_callback(
+                        f"Cluster NN stats (deg): P10={p10:.4f}, P50={p50:.4f}, P90={p90:.4f}",
+                        prog=None,
+                        lvl="DEBUG_DETAIL",
+                        callback=progress_callback,
+                    )
                 except Exception:
                     pass
-            if min_value > 0:
-                seestar_stack_groups = _merge_small_groups(
-                    seestar_stack_groups,
-                    min_size=min_value,
-                    cap=cap_value,
-                )
-
-    # Do not subdivide groups if a target group count is set; respect clustering first.
-    if (
-        not preplan_groups_active
-        and (cluster_target_groups_config is None or int(cluster_target_groups_config) <= 0)
-        and max_raw_per_master_tile_config
-        and max_raw_per_master_tile_config > 0
-    ):
-        new_groups = []
-        for g in seestar_stack_groups:
-            for i in range(0, len(g), max_raw_per_master_tile_config):
-                new_groups.append(g[i:i + max_raw_per_master_tile_config])
-        if len(new_groups) != len(seestar_stack_groups):
-            pcb(
-                "clusterstacks_info_groups_split_manual_limit",
-                prog=None,
-                lvl="INFO_DETAIL",
-                original=len(seestar_stack_groups),
-                new=len(new_groups),
-                limit=max_raw_per_master_tile_config,
-            )
-        seestar_stack_groups = new_groups
-    cpu_total = os.cpu_count() or 1
-    winsor_worker_limit = max(1, min(int(winsor_worker_limit_config), cpu_total))
-    winsor_max_frames_per_pass = max(0, int(winsor_max_frames_per_pass_config))
-    global_wcs_plan["winsor_worker_limit"] = int(winsor_worker_limit)
-    global_wcs_plan["winsor_max_frames_per_pass"] = int(winsor_max_frames_per_pass)
-    global_wcs_plan["use_align_helpers"] = True
-    global_wcs_plan["prefer_gpu_helpers"] = bool(use_gpu_phase5_flag)
-    pcb(
-        f"Winsor worker limit set to {winsor_worker_limit}" + (
-            " (ProcessPoolExecutor enabled)" if winsor_worker_limit > 1 else ""
-        ),
-        prog=None,
-        lvl="INFO",
-    )
-    if winsor_max_frames_per_pass > 0:
-        pcb(
-            f"Winsor streaming limit set to {winsor_max_frames_per_pass} frame(s) per pass",
-            prog=None,
-            lvl="INFO_DETAIL",
-        )
-    sds_stack_params = {
-        "stack_reject_algo": stack_reject_algo,
-        "stack_weight_method": stack_weight_method,
-        "stack_norm_method": stack_norm_method,
-        "stack_kappa_low": stack_kappa_low,
-        "stack_kappa_high": stack_kappa_high,
-        "stack_final_combine": stack_final_combine,
-        "parsed_winsor_limits": parsed_winsor_limits,
-        "winsor_worker_limit": winsor_worker_limit,
-        "winsor_max_frames_per_pass": winsor_max_frames_per_pass,
-        "apply_radial_weight": apply_radial_weight_config,
-        "radial_feather_fraction": radial_feather_fraction_config,
-        "radial_shape_power": radial_shape_power_config,
-        "poststack_equalize_rgb": poststack_equalize_rgb_config,
-    }
-    manual_limit = max_raw_per_master_tile_config
-    memmap_streaming_enabled = bool(auto_caps_info and auto_caps_info.get("memmap"))
-    allow_auto_limit = (
-        auto_limit_frames_per_master_tile_config
-        and (cluster_target_groups_config is None or int(cluster_target_groups_config) <= 0)
-        and not memmap_streaming_enabled
-        and not preplan_groups_active
-    )
-    if allow_auto_limit and seestar_stack_groups:
+        except Exception:
+            pass
+        # If clustering is pathologically conservative (almost one group per image),
+        # auto-relax the threshold based on nearest-neighbor distances to avoid
+        # producing hundreds of master tiles for tightly-dithered panels.
         try:
-            sample_path = None
-            for group in seestar_stack_groups:
-                if group:
-                    sample_path = group[0].get('path_preprocessed_cache')
-                    if sample_path:
-                        break
-            if sample_path is None:
-                raise RuntimeError("auto-limit sample path unavailable")
-            sample_arr = np.load(sample_path, mmap_mode='r')
-            bytes_per_frame = sample_arr.nbytes
-            sample_shape = sample_arr.shape
-            sample_arr = None
-            available_bytes = psutil.virtual_memory().available
-            expected_workers = max(1, int(effective_base_workers * ALIGNMENT_PHASE_WORKER_RATIO))
-            # Be more conservative: align/stack create extra buffers; use a larger safety factor
-            limit = max(
-                1,
-                int(
-                    available_bytes // (expected_workers * bytes_per_frame * 12)
-                ),
+            total_inputs_for_cluster = len(all_raw_files_processed_info)
+            groups_initial = len(seestar_stack_groups)
+            if total_inputs_for_cluster > 2 and groups_initial >= max(3, int(0.9 * total_inputs_for_cluster)):
+                # Compute a robust suggested threshold from the 90th percentile of
+                # nearest-neighbor separations between panel centers.
+                # Rebuild centers the same way as clustering helpers do.
+                panel_centers_sky = []
+                for info in all_raw_files_processed_info:
+                    wcs_obj = info.get("wcs")
+                    if not (wcs_obj and getattr(wcs_obj, "is_celestial", False)):
+                        continue
+                    try:
+                        if getattr(wcs_obj, "pixel_shape", None):
+                            cx = wcs_obj.pixel_shape[0] / 2.0
+                            cy = wcs_obj.pixel_shape[1] / 2.0
+                            center_world = wcs_obj.pixel_to_world(cx, cy)
+                        elif hasattr(wcs_obj, "wcs") and hasattr(wcs_obj.wcs, "crval"):
+                            center_world = SkyCoord(
+                                ra=float(wcs_obj.wcs.crval[0]) * u.deg,
+                                dec=float(wcs_obj.wcs.crval[1]) * u.deg,
+                                frame="icrs",
+                            )
+                        else:
+                            continue
+                        panel_centers_sky.append(center_world)
+                    except Exception:
+                        continue
+    
+                if len(panel_centers_sky) >= 2:
+                    coords = SkyCoord(
+                        ra=[c.ra for c in panel_centers_sky],
+                        dec=[c.dec for c in panel_centers_sky],
+                        frame="icrs",
+                    )
+                    try:
+                        # Nearest neighbor (excluding self). Astropy handles wrap.
+                        _, sep2d, _ = coords.match_to_catalog_sky(coords, nthneighbor=1)
+                        nn_deg = np.asarray(sep2d.deg, dtype=float)
+                        # Robust high-quantile of dithers; add a small headroom.
+                        p90 = float(np.nanpercentile(nn_deg, 90.0)) if nn_deg.size else 0.0
+                        # Propose a relaxed threshold within sane bounds.
+                        thr_initial = float(SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG)
+                        thr_candidate = max(thr_initial, p90 * 1.2)
+                        thr_candidate = float(min(max(thr_candidate, 0.01), 1.0))  # clamp 0.01°..1.0°
+    
+                        if thr_candidate > thr_initial:
+                            _log_and_callback(
+                                f"Cluster AUTO: threshold {thr_initial:.3f}° too conservative -> {groups_initial}/{total_inputs_for_cluster} groups.",
+                                prog=None,
+                                lvl="INFO_DETAIL",
+                                callback=progress_callback,
+                            )
+                            _log_and_callback(
+                                f"Cluster AUTO: relaxing to {thr_candidate:.3f}° (≈1.2×P90 NN={p90:.3f}°) and re-clustering...",
+                                prog=None,
+                                lvl="INFO_DETAIL",
+                                callback=progress_callback,
+                            )
+                            seestar_stack_groups = cluster_seestar_stacks_connected(
+                                all_raw_files_processed_info, thr_candidate, progress_callback
+                            )
+                            groups_after = len(seestar_stack_groups)
+                            _log_and_callback(
+                                f"Cluster AUTO: re-clustered into {groups_after} groups (was {groups_initial}).",
+                                prog=None,
+                                lvl="INFO_DETAIL",
+                                callback=progress_callback,
+                            )
+                    except Exception as e_auto_relax:
+                        _log_and_callback(
+                            f"Cluster AUTO: failed to compute NN-based relax: {e_auto_relax}",
+                            prog=None,
+                            lvl="DEBUG_DETAIL",
+                            callback=progress_callback,
+                        )
+        except Exception as e_cluster_guard:
+            _log_and_callback(
+                f"Cluster AUTO: guard exception: {e_cluster_guard}", prog=None, lvl="DEBUG_DETAIL", callback=progress_callback
             )
-            # Clamp to a reasonable upper bound if no manual cap is set
-            if manual_limit <= 0:
-                limit = min(limit, 100)
-            if manual_limit > 0:
-                limit = min(limit, manual_limit)
-            winsor_worker_limit = min(winsor_worker_limit, limit)
+    
+        # Optional: drive clustering to a target number of groups by relaxing
+        # the threshold via a bounded search. Disabled when target <= 0.
+        try:
+            target_groups = int(cluster_target_groups_config or 0)
+        except Exception:
+            target_groups = 0
+        if (not preplan_groups_active) and target_groups > 0 and len(seestar_stack_groups) != target_groups:
+            try:
+                # Build coordinates array
+                panel_centers_sky = []
+                for info in all_raw_files_processed_info:
+                    wcs_obj = info.get("wcs")
+                    if not (wcs_obj and getattr(wcs_obj, "is_celestial", False)):
+                        continue
+                    try:
+                        if getattr(wcs_obj, "pixel_shape", None):
+                            cx = wcs_obj.pixel_shape[0] / 2.0
+                            cy = wcs_obj.pixel_shape[1] / 2.0
+                            center_world = wcs_obj.pixel_to_world(cx, cy)
+                        elif hasattr(wcs_obj, "wcs") and hasattr(wcs_obj.wcs, "crval"):
+                            center_world = SkyCoord(
+                                ra=float(wcs_obj.wcs.crval[0]) * u.deg,
+                                dec=float(wcs_obj.wcs.crval[1]) * u.deg,
+                                frame="icrs",
+                            )
+                        else:
+                            continue
+                        panel_centers_sky.append(center_world)
+                    except Exception:
+                        continue
+    
+                if len(panel_centers_sky) >= 2:
+                    coords = SkyCoord(
+                        ra=[c.ra for c in panel_centers_sky],
+                        dec=[c.dec for c in panel_centers_sky],
+                        frame="icrs",
+                    )
+                    # Establish an upper bound big enough that all panels connect
+                    # (max pairwise separation). Clamp to 5 degrees to avoid
+                    # pathological values.
+                    try:
+                        sep_mat_deg = coords.separation(coords).deg
+                        max_pair_deg = float(np.nanmax(sep_mat_deg)) if np.size(sep_mat_deg) else 0.5
+                    except Exception:
+                        max_pair_deg = 0.5
+                    thr_current = float(SEESTAR_STACK_CLUSTERING_THRESHOLD_DEG)
+                    def _count_groups(thr: float) -> tuple[int, list]:
+                        g = cluster_seestar_stacks_connected(
+                            all_raw_files_processed_info,
+                            float(thr),
+                            None,
+                            orientation_split_threshold_deg=ORIENTATION_SPLIT_THRESHOLD_DEG,
+                        )
+                        return len(g), g
+                    cnt_cur = len(seestar_stack_groups)
+                    # Direction: if too many groups, increase threshold; if too few, decrease.
+                    if cnt_cur > target_groups:
+                        lo = thr_current
+                        hi = float(min(max(max_pair_deg, lo * 2.0, 0.05), 5.0))
+                        cnt_hi, groups_hi = _count_groups(hi)
+                        # Expand hi until we get <= target (fewer groups) or cap
+                        expand_iter = 0
+                        while cnt_hi > target_groups and hi < 5.0 and expand_iter < 8:
+                            hi = min(hi * 1.5 + 1e-6, 5.0)
+                            cnt_hi, groups_hi = _count_groups(hi)
+                            expand_iter += 1
+                        best_thr = hi
+                        best_groups = groups_hi
+                        for _ in range(14):
+                            mid = 0.5 * (lo + hi)
+                            cnt_mid, groups_mid = _count_groups(mid)
+                            if cnt_mid > target_groups:
+                                lo = mid
+                            else:
+                                hi = mid
+                                best_thr = mid
+                                best_groups = groups_mid
+                    else:
+                        # Need more groups ⇒ lower the threshold
+                        hi = thr_current
+                        lo = max(1e-6, hi / 2.0)
+                        cnt_lo, groups_lo = _count_groups(lo)
+                        shrink_iter = 0
+                        while cnt_lo < target_groups and lo > 1e-6 and shrink_iter < 12:
+                            hi = lo
+                            lo = max(1e-6, lo / 1.5)
+                            cnt_lo, groups_lo = _count_groups(lo)
+                            shrink_iter += 1
+                        best_thr = lo
+                        best_groups = groups_lo
+                        # Binary search upward to approach target from the high side (more stable)
+                        for _ in range(14):
+                            mid = 0.5 * (lo + hi)
+                            cnt_mid, groups_mid = _count_groups(mid)
+                            if cnt_mid < target_groups:
+                                # still too few groups ⇒ lower threshold more
+                                hi = mid
+                            else:
+                                lo = mid
+                                best_thr = mid
+                                best_groups = groups_mid
+                    _log_and_callback(
+                        f"Cluster AUTO Target: threshold -> {best_thr:.4f}° for ≈{len(best_groups)} groups (target {target_groups}).",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                        callback=progress_callback,
+                    )
+                    seestar_stack_groups = best_groups
+            except Exception as e_target:
+                _log_and_callback(
+                    f"Cluster AUTO Target: search failed: {e_target}", prog=None, lvl="DEBUG_DETAIL", callback=progress_callback
+                )
+        if not seestar_stack_groups:
+            pcb("run_error_phase2_no_groups", prog=(base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING), lvl="ERROR")
+            return
+        if (not preplan_groups_active) and auto_caps_info and seestar_stack_groups:
+            try:
+                cap_value = int(auto_caps_info.get("cap", 0))
+                min_value = int(auto_caps_info.get("min_cap", 8))
+            except Exception:
+                cap_value = 0
+                min_value = 8
+            if cap_value > 0:
+                original_count = len(seestar_stack_groups)
+                seestar_stack_groups = _auto_split_groups(
+                    seestar_stack_groups,
+                    cap_value,
+                    min_value,
+                    progress_callback=progress_callback,
+                )
+                if len(seestar_stack_groups) != original_count:
+                    try:
+                        _log_and_callback(
+                            f"AutoSplit summary: {original_count} -> {len(seestar_stack_groups)} subgroup(s) (cap={cap_value})",
+                            prog=None,
+                            lvl="INFO_DETAIL",
+                            callback=progress_callback,
+                        )
+                    except Exception:
+                        pass
+                if min_value > 0:
+                    seestar_stack_groups = _merge_small_groups(
+                        seestar_stack_groups,
+                        min_size=min_value,
+                        cap=cap_value,
+                    )
+    
+        # Do not subdivide groups if a target group count is set; respect clustering first.
+        if (
+            not preplan_groups_active
+            and (cluster_target_groups_config is None or int(cluster_target_groups_config) <= 0)
+            and max_raw_per_master_tile_config
+            and max_raw_per_master_tile_config > 0
+        ):
             new_groups = []
             for g in seestar_stack_groups:
-                for i in range(0, len(g), limit):
-                    new_groups.append(g[i:i+limit])
+                for i in range(0, len(g), max_raw_per_master_tile_config):
+                    new_groups.append(g[i:i + max_raw_per_master_tile_config])
             if len(new_groups) != len(seestar_stack_groups):
                 pcb(
-                    "clusterstacks_info_groups_split_auto_limit",
+                    "clusterstacks_info_groups_split_manual_limit",
                     prog=None,
                     lvl="INFO_DETAIL",
                     original=len(seestar_stack_groups),
                     new=len(new_groups),
-                    limit=limit,
-                    shape=str(sample_shape),
+                    limit=max_raw_per_master_tile_config,
                 )
             seestar_stack_groups = new_groups
-            if manual_limit > 0 and limit != manual_limit:
-                logger.info(
-                    "Manual frame limit (%d) is lower than auto limit, using manual value.",
-                    manual_limit,
-                )
-        except Exception as e_auto:
-            pcb("clusterstacks_warn_auto_limit_failed", prog=None, lvl="WARN", error=str(e_auto))
-    current_global_progress = base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING
-    num_seestar_stacks_to_process = len(seestar_stack_groups)
-    telemetry.maybe_emit_stats(
-        _telemetry_context(
-            {
-                "phase_name": "Phase 2: Clustering",
-                "phase_index": 2,
-                "files_total": num_total_raw_files,
-                "tiles_total": num_seestar_stacks_to_process,
-            }
-        )
-    )
-    _log_memory_usage(progress_callback, "Fin Phase 2"); pcb("run_info_phase2_finished", prog=current_global_progress, lvl="INFO", num_groups=num_seestar_stacks_to_process)
-
-
-    # --- IO-aware adaptation (bench read speed on cache + write speed on output) ---
-    io_read_mbps, io_write_mbps = None, None
-    io_read_cat, io_write_cat = "unknown", "unknown"
-    try:
-        sample_cache_for_read = None
-        # Try to pick a representative cached image path from the first group
-        if seestar_stack_groups and seestar_stack_groups[0]:
-            sample_cache_for_read = seestar_stack_groups[0][0].get('path_preprocessed_cache')
-        if sample_cache_for_read and _path_exists(sample_cache_for_read):
-            io_read_mbps = _measure_sequential_read_mbps(sample_cache_for_read)
-            io_read_cat = _categorize_io_speed(io_read_mbps)
-        # Write speed on output folder
-        if output_folder and _path_isdir(output_folder):
-            io_write_mbps = _measure_sequential_write_mbps(output_folder)
-            io_write_cat = _categorize_io_speed(io_write_mbps)
+        cpu_total = os.cpu_count() or 1
+        winsor_worker_limit = max(1, min(int(winsor_worker_limit_config), cpu_total))
+        winsor_max_frames_per_pass = max(0, int(winsor_max_frames_per_pass_config))
+        global_wcs_plan["winsor_worker_limit"] = int(winsor_worker_limit)
+        global_wcs_plan["winsor_max_frames_per_pass"] = int(winsor_max_frames_per_pass)
+        global_wcs_plan["use_align_helpers"] = True
+        global_wcs_plan["prefer_gpu_helpers"] = bool(use_gpu_phase5_flag)
         pcb(
-            f"IO_BENCH: read {io_read_mbps:.1f} MB/s ({io_read_cat}), write {io_write_mbps:.1f} MB/s ({io_write_cat})"
-            if (io_read_mbps is not None and io_write_mbps is not None)
-            else f"IO_BENCH: read={io_read_mbps}, write={io_write_mbps}"
-            ,
+            f"Winsor worker limit set to {winsor_worker_limit}" + (
+                " (ProcessPoolExecutor enabled)" if winsor_worker_limit > 1 else ""
+            ),
             prog=None,
-            lvl="DEBUG",
+            lvl="INFO",
         )
-    except Exception as e_io_bench:
-        pcb(f"IO_BENCH: failed ({e_io_bench})", prog=None, lvl="WARN")
-
-    # Derive conservative caps from read speed (dominant in Phase 3) on Windows/slow disks
-    io_ph3_cap = None
-    io_cache_read_slots = None
-    new_winsor_limit = winsor_worker_limit
-    if os.name == 'nt':
-        if io_read_cat == "very_slow":
-            io_ph3_cap = 1
-            io_cache_read_slots = 1
-            new_winsor_limit = min(new_winsor_limit, 1)
-        elif io_read_cat == "slow":
-            io_ph3_cap = 2
-            io_cache_read_slots = 1
-            new_winsor_limit = min(new_winsor_limit, 1)
-        elif io_read_cat == "medium":
-            io_ph3_cap = 3
-            io_cache_read_slots = 2
-            new_winsor_limit = min(new_winsor_limit, 2)
-        elif io_read_cat == "fast":
-            io_ph3_cap = 4
-            io_cache_read_slots = 2
-            # Keep winsor limit as computed
-        # Apply winsor limit adjustment if changed
-        if new_winsor_limit != winsor_worker_limit:
+        if winsor_max_frames_per_pass > 0:
             pcb(
-                f"IO_ADAPT: winsor_worker_limit reduced {winsor_worker_limit} -> {new_winsor_limit} due to IO ({io_read_cat})",
+                f"Winsor streaming limit set to {winsor_max_frames_per_pass} frame(s) per pass",
                 prog=None,
                 lvl="INFO_DETAIL",
             )
-            winsor_worker_limit = new_winsor_limit
-        # Adjust cache IO semaphore (controls concurrent npy reads)
+        sds_stack_params = {
+            "stack_reject_algo": stack_reject_algo,
+            "stack_weight_method": stack_weight_method,
+            "stack_norm_method": stack_norm_method,
+            "stack_kappa_low": stack_kappa_low,
+            "stack_kappa_high": stack_kappa_high,
+            "stack_final_combine": stack_final_combine,
+            "parsed_winsor_limits": parsed_winsor_limits,
+            "winsor_worker_limit": winsor_worker_limit,
+            "winsor_max_frames_per_pass": winsor_max_frames_per_pass,
+            "apply_radial_weight": apply_radial_weight_config,
+            "radial_feather_fraction": radial_feather_fraction_config,
+            "radial_shape_power": radial_shape_power_config,
+            "poststack_equalize_rgb": poststack_equalize_rgb_config,
+        }
+        manual_limit = max_raw_per_master_tile_config
+        memmap_streaming_enabled = bool(auto_caps_info and auto_caps_info.get("memmap"))
+        allow_auto_limit = (
+            auto_limit_frames_per_master_tile_config
+            and (cluster_target_groups_config is None or int(cluster_target_groups_config) <= 0)
+            and not memmap_streaming_enabled
+            and not preplan_groups_active
+        )
+        if allow_auto_limit and seestar_stack_groups:
+            try:
+                sample_path = None
+                for group in seestar_stack_groups:
+                    if group:
+                        sample_path = group[0].get('path_preprocessed_cache')
+                        if sample_path:
+                            break
+                if sample_path is None:
+                    raise RuntimeError("auto-limit sample path unavailable")
+                sample_arr = np.load(sample_path, mmap_mode='r')
+                bytes_per_frame = sample_arr.nbytes
+                sample_shape = sample_arr.shape
+                sample_arr = None
+                available_bytes = psutil.virtual_memory().available
+                expected_workers = max(1, int(effective_base_workers * ALIGNMENT_PHASE_WORKER_RATIO))
+                # Be more conservative: align/stack create extra buffers; use a larger safety factor
+                limit = max(
+                    1,
+                    int(
+                        available_bytes // (expected_workers * bytes_per_frame * 12)
+                    ),
+                )
+                # Clamp to a reasonable upper bound if no manual cap is set
+                if manual_limit <= 0:
+                    limit = min(limit, 100)
+                if manual_limit > 0:
+                    limit = min(limit, manual_limit)
+                winsor_worker_limit = min(winsor_worker_limit, limit)
+                new_groups = []
+                for g in seestar_stack_groups:
+                    for i in range(0, len(g), limit):
+                        new_groups.append(g[i:i+limit])
+                if len(new_groups) != len(seestar_stack_groups):
+                    pcb(
+                        "clusterstacks_info_groups_split_auto_limit",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                        original=len(seestar_stack_groups),
+                        new=len(new_groups),
+                        limit=limit,
+                        shape=str(sample_shape),
+                    )
+                seestar_stack_groups = new_groups
+                if manual_limit > 0 and limit != manual_limit:
+                    logger.info(
+                        "Manual frame limit (%d) is lower than auto limit, using manual value.",
+                        manual_limit,
+                    )
+            except Exception as e_auto:
+                pcb("clusterstacks_warn_auto_limit_failed", prog=None, lvl="WARN", error=str(e_auto))
+        current_global_progress = base_progress_phase2 + PROGRESS_WEIGHT_PHASE2_CLUSTERING
+        num_seestar_stacks_to_process = len(seestar_stack_groups)
+        telemetry.maybe_emit_stats(
+            _telemetry_context(
+                {
+                    "phase_name": "Phase 2: Clustering",
+                    "phase_index": 2,
+                    "files_total": num_total_raw_files,
+                    "tiles_total": num_seestar_stacks_to_process,
+                }
+            )
+        )
+        _log_memory_usage(progress_callback, "Fin Phase 2"); pcb("run_info_phase2_finished", prog=current_global_progress, lvl="INFO", num_groups=num_seestar_stacks_to_process)
+    
+    
+        # --- IO-aware adaptation (bench read speed on cache + write speed on output) ---
+        io_read_mbps, io_write_mbps = None, None
+        io_read_cat, io_write_cat = "unknown", "unknown"
         try:
-            if io_cache_read_slots and io_cache_read_slots > 0:
-                global _CACHE_IO_SEMAPHORE
-                _CACHE_IO_SEMAPHORE = threading.Semaphore(int(io_cache_read_slots))
+            sample_cache_for_read = None
+            # Try to pick a representative cached image path from the first group
+            if seestar_stack_groups and seestar_stack_groups[0]:
+                sample_cache_for_read = seestar_stack_groups[0][0].get('path_preprocessed_cache')
+            if sample_cache_for_read and _path_exists(sample_cache_for_read):
+                io_read_mbps = _measure_sequential_read_mbps(sample_cache_for_read)
+                io_read_cat = _categorize_io_speed(io_read_mbps)
+            # Write speed on output folder
+            if output_folder and _path_isdir(output_folder):
+                io_write_mbps = _measure_sequential_write_mbps(output_folder)
+                io_write_cat = _categorize_io_speed(io_write_mbps)
+            pcb(
+                f"IO_BENCH: read {io_read_mbps:.1f} MB/s ({io_read_cat}), write {io_write_mbps:.1f} MB/s ({io_write_cat})"
+                if (io_read_mbps is not None and io_write_mbps is not None)
+                else f"IO_BENCH: read={io_read_mbps}, write={io_write_mbps}"
+                ,
+                prog=None,
+                lvl="DEBUG",
+            )
+        except Exception as e_io_bench:
+            pcb(f"IO_BENCH: failed ({e_io_bench})", prog=None, lvl="WARN")
+    
+        # Derive conservative caps from read speed (dominant in Phase 3) on Windows/slow disks
+        io_ph3_cap = None
+        io_cache_read_slots = None
+        new_winsor_limit = winsor_worker_limit
+        if os.name == 'nt':
+            if io_read_cat == "very_slow":
+                io_ph3_cap = 1
+                io_cache_read_slots = 1
+                new_winsor_limit = min(new_winsor_limit, 1)
+            elif io_read_cat == "slow":
+                io_ph3_cap = 2
+                io_cache_read_slots = 1
+                new_winsor_limit = min(new_winsor_limit, 1)
+            elif io_read_cat == "medium":
+                io_ph3_cap = 3
+                io_cache_read_slots = 2
+                new_winsor_limit = min(new_winsor_limit, 2)
+            elif io_read_cat == "fast":
+                io_ph3_cap = 4
+                io_cache_read_slots = 2
+                # Keep winsor limit as computed
+            # Apply winsor limit adjustment if changed
+            if new_winsor_limit != winsor_worker_limit:
                 pcb(
-                    f"IO_ADAPT: cache read slots set to {io_cache_read_slots}",
+                    f"IO_ADAPT: winsor_worker_limit reduced {winsor_worker_limit} -> {new_winsor_limit} due to IO ({io_read_cat})",
                     prog=None,
                     lvl="INFO_DETAIL",
                 )
-        except Exception:
-            pass
-
-
+                winsor_worker_limit = new_winsor_limit
+            # Adjust cache IO semaphore (controls concurrent npy reads)
+            try:
+                if io_cache_read_slots and io_cache_read_slots > 0:
+                    global _CACHE_IO_SEMAPHORE
+                    _CACHE_IO_SEMAPHORE = threading.Semaphore(int(io_cache_read_slots))
+                    pcb(
+                        f"IO_ADAPT: cache read slots set to {io_cache_read_slots}",
+                        prog=None,
+                        lvl="INFO_DETAIL",
+                    )
+            except Exception:
+                pass
+    
+    
     final_output_wcs = None
     final_output_shape_hw = None
     final_mosaic_data_HWC = None
@@ -17199,7 +17301,7 @@ def run_hierarchical_mosaic_classic_legacy(
     final_alpha_map = None
     sds_fallback_logged = False
     alpha_final: np.ndarray | None = None
-    master_tiles_results_list: list[tuple[str, Any]] = []
+    master_tiles_results_list: list[tuple[str, Any]] = list(existing_master_tiles_results)
     final_quality_pipeline_cfg = {
         "quality_crop_enabled": bool(quality_crop_enabled_config),
         "quality_crop_band_px": int(quality_crop_band_px_config),
@@ -17214,6 +17316,37 @@ def run_hierarchical_mosaic_classic_legacy(
 
     global_anchor_shift: tuple[float, float] | None = None
     sds_runtime_tile_dir: str | None = None
+
+    if use_existing_master_tiles_mode:
+        num_total_raw_files = 0
+        all_raw_files_processed_info_dict = {}
+        all_raw_files_processed_info = []
+        seestar_stack_groups = []
+        current_global_progress = (
+            PROGRESS_WEIGHT_PHASE1_RAW_SCAN
+            + PROGRESS_WEIGHT_PHASE2_CLUSTERING
+            + PROGRESS_WEIGHT_PHASE3_MASTER_TILES
+        )
+        if global_anchor_shift is None:
+            global_anchor_shift = (1.0, 0.0)
+        try:
+            Path(output_folder).expanduser().mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+        temp_master_tile_storage_dir = str(
+            Path(output_folder).expanduser() / "zemosaic_temp_master_tiles"
+        )
+        try:
+            os.makedirs(temp_master_tile_storage_dir, exist_ok=True)
+        except OSError as e_mkdir_mt:
+            pcb(
+                "run_error_phase3_mkdir_failed",
+                prog=current_global_progress,
+                lvl="ERROR",
+                directory=temp_master_tile_storage_dir,
+                error=str(e_mkdir_mt),
+            )
+            return
 
     def _build_phase45_options_dict(base_progress: float) -> dict[str, Any]:
         stack_cfg_phase45 = {
@@ -17650,6 +17783,15 @@ def run_hierarchical_mosaic_classic_legacy(
 
 
     if final_mosaic_data_HWC is None:
+        if use_existing_master_tiles_mode and not master_tiles_results_list:
+            pcb(
+                "run_warn_existing_master_tiles_insufficient",
+                prog=None,
+                lvl="WARN",
+                num_tiles=0,
+            )
+            use_existing_master_tiles_mode = False
+        if not use_existing_master_tiles_mode:
             if sds_mode_flag and not sds_fallback_logged:
                 pcb("sds_and_mosaic_first_failed_fallback_mastertiles", prog=None, lvl="WARN")
                 sds_fallback_logged = True
@@ -18366,116 +18508,116 @@ def run_hierarchical_mosaic_classic_legacy(
 
             
             
-            # --- Phase 4 (Calcul Grille Finale) ---
-            base_progress_phase4 = current_global_progress
-            _log_memory_usage(progress_callback, "Début Phase 4 (Calcul Grille)")
-            pcb("run_info_phase4_started", prog=base_progress_phase4, lvl="INFO")
-            pcb("PHASE_UPDATE:4", prog=None, lvl="ETA_LEVEL")
-            telemetry.maybe_emit_stats(
-                _telemetry_context(
-                    {
-                        "phase_name": "Phase 4: Final Grid",
-                        "phase_index": 4,
-                        "tiles_total": len(master_tiles_results_list),
-                    }
-                )
+        # --- Phase 4 (Calcul Grille Finale) ---
+        base_progress_phase4 = current_global_progress
+        _log_memory_usage(progress_callback, "Début Phase 4 (Calcul Grille)")
+        pcb("run_info_phase4_started", prog=base_progress_phase4, lvl="INFO")
+        pcb("PHASE_UPDATE:4", prog=None, lvl="ETA_LEVEL")
+        telemetry.maybe_emit_stats(
+            _telemetry_context(
+                {
+                    "phase_name": "Phase 4: Final Grid",
+                    "phase_index": 4,
+                    "tiles_total": len(master_tiles_results_list),
+                }
             )
-            wcs_list_for_final_grid = []; shapes_list_for_final_grid_hw = []
-            start_time_loop_ph4 = time.time(); last_time_loop_ph4 = start_time_loop_ph4; step_times_ph4 = []
-            total_steps_ph4 = len(master_tiles_results_list)
-            for idx_loop, (mt_path_iter,mt_wcs_iter) in enumerate(master_tiles_results_list, 1):
-                # ... (logique de récupération shape, inchangée) ...
-                if not (mt_path_iter and _path_exists(mt_path_iter) and mt_wcs_iter and mt_wcs_iter.is_celestial): pcb("run_warn_phase4_invalid_master_tile_for_grid", prog=None, lvl="WARN", path=_safe_basename(mt_path_iter)); continue
-                try:
-                    h_mt_loc,w_mt_loc=0,0
-                    if mt_wcs_iter.pixel_shape and mt_wcs_iter.pixel_shape[0] > 0 and mt_wcs_iter.pixel_shape[1] > 0 : h_mt_loc,w_mt_loc=mt_wcs_iter.pixel_shape[1],mt_wcs_iter.pixel_shape[0] 
-                    else: 
-                        with fits.open(mt_path_iter,memmap=True, do_not_scale_image_data=True) as hdul_mt_s:
-                            if hdul_mt_s[0].data is None: pcb("run_warn_phase4_no_data_in_tile_fits", prog=None, lvl="WARN", path=_safe_basename(mt_path_iter)); continue
-                            data_shape = hdul_mt_s[0].shape
-                            if len(data_shape) == 3:
-                                # data_shape == (height, width, channels)
-                                h_mt_loc,w_mt_loc = data_shape[0],data_shape[1]
-                            elif len(data_shape) == 2: h_mt_loc,w_mt_loc = data_shape[0],data_shape[1]
-                            else: pcb("run_warn_phase4_unhandled_tile_shape", prog=None, lvl="WARN", path=_safe_basename(mt_path_iter), shape=data_shape); continue 
-                            if mt_wcs_iter and mt_wcs_iter.is_celestial and mt_wcs_iter.pixel_shape is None:
-                                try: mt_wcs_iter.pixel_shape=(w_mt_loc,h_mt_loc)
-                                except Exception as e_set_ps: pcb("run_warn_phase4_failed_set_pixel_shape", prog=None, lvl="WARN", path=_safe_basename(mt_path_iter), error=str(e_set_ps))
-                    if h_mt_loc > 0 and w_mt_loc > 0: shapes_list_for_final_grid_hw.append((int(h_mt_loc),int(w_mt_loc))); wcs_list_for_final_grid.append(mt_wcs_iter)
-                    else: pcb("run_warn_phase4_zero_dimensions_tile", prog=None, lvl="WARN", path=_safe_basename(mt_path_iter))
-                    now = time.time(); step_times_ph4.append(now - last_time_loop_ph4); last_time_loop_ph4 = now
-                    if progress_callback:
-                        try:
-                            progress_callback("phase4_grid", idx_loop, total_steps_ph4)
-                        except Exception:
-                            pass
-                    telemetry.maybe_emit_stats(
-                        _telemetry_context(
-                            {
-                                "phase_name": "Phase 4: Final Grid",
-                                "phase_index": 4,
-                                "tiles_done": idx_loop,
-                                "tiles_total": total_steps_ph4,
-                            }
-                        )
+        )
+        wcs_list_for_final_grid = []; shapes_list_for_final_grid_hw = []
+        start_time_loop_ph4 = time.time(); last_time_loop_ph4 = start_time_loop_ph4; step_times_ph4 = []
+        total_steps_ph4 = len(master_tiles_results_list)
+        for idx_loop, (mt_path_iter,mt_wcs_iter) in enumerate(master_tiles_results_list, 1):
+            # ... (logique de récupération shape, inchangée) ...
+            if not (mt_path_iter and _path_exists(mt_path_iter) and mt_wcs_iter and mt_wcs_iter.is_celestial): pcb("run_warn_phase4_invalid_master_tile_for_grid", prog=None, lvl="WARN", path=_safe_basename(mt_path_iter)); continue
+            try:
+                h_mt_loc,w_mt_loc=0,0
+                if mt_wcs_iter.pixel_shape and mt_wcs_iter.pixel_shape[0] > 0 and mt_wcs_iter.pixel_shape[1] > 0 : h_mt_loc,w_mt_loc=mt_wcs_iter.pixel_shape[1],mt_wcs_iter.pixel_shape[0] 
+                else: 
+                    with fits.open(mt_path_iter,memmap=True, do_not_scale_image_data=True) as hdul_mt_s:
+                        if hdul_mt_s[0].data is None: pcb("run_warn_phase4_no_data_in_tile_fits", prog=None, lvl="WARN", path=_safe_basename(mt_path_iter)); continue
+                        data_shape = hdul_mt_s[0].shape
+                        if len(data_shape) == 3:
+                            # data_shape == (height, width, channels)
+                            h_mt_loc,w_mt_loc = data_shape[0],data_shape[1]
+                        elif len(data_shape) == 2: h_mt_loc,w_mt_loc = data_shape[0],data_shape[1]
+                        else: pcb("run_warn_phase4_unhandled_tile_shape", prog=None, lvl="WARN", path=_safe_basename(mt_path_iter), shape=data_shape); continue 
+                        if mt_wcs_iter and mt_wcs_iter.is_celestial and mt_wcs_iter.pixel_shape is None:
+                            try: mt_wcs_iter.pixel_shape=(w_mt_loc,h_mt_loc)
+                            except Exception as e_set_ps: pcb("run_warn_phase4_failed_set_pixel_shape", prog=None, lvl="WARN", path=_safe_basename(mt_path_iter), error=str(e_set_ps))
+                if h_mt_loc > 0 and w_mt_loc > 0: shapes_list_for_final_grid_hw.append((int(h_mt_loc),int(w_mt_loc))); wcs_list_for_final_grid.append(mt_wcs_iter)
+                else: pcb("run_warn_phase4_zero_dimensions_tile", prog=None, lvl="WARN", path=_safe_basename(mt_path_iter))
+                now = time.time(); step_times_ph4.append(now - last_time_loop_ph4); last_time_loop_ph4 = now
+                if progress_callback:
+                    try:
+                        progress_callback("phase4_grid", idx_loop, total_steps_ph4)
+                    except Exception:
+                        pass
+                telemetry.maybe_emit_stats(
+                    _telemetry_context(
+                        {
+                            "phase_name": "Phase 4: Final Grid",
+                            "phase_index": 4,
+                            "tiles_done": idx_loop,
+                            "tiles_total": total_steps_ph4,
+                        }
                     )
-                except Exception as e_read_tile_shape: pcb("run_error_phase4_reading_tile_shape", prog=None, lvl="ERROR", path=_safe_basename(mt_path_iter), error=str(e_read_tile_shape)); logger.error(f"Erreur lecture shape tuile {_safe_basename(mt_path_iter)}:", exc_info=True); continue
-            if not wcs_list_for_final_grid or not shapes_list_for_final_grid_hw or len(wcs_list_for_final_grid) != len(shapes_list_for_final_grid_hw): pcb("run_error_phase4_insufficient_tile_info", prog=(base_progress_phase4 + PROGRESS_WEIGHT_PHASE4_GRID_CALC), lvl="ERROR"); return
-            final_mosaic_drizzle_scale = 1.0 
-            final_output_wcs, final_output_shape_hw = _calculate_final_mosaic_grid(wcs_list_for_final_grid, shapes_list_for_final_grid_hw, final_mosaic_drizzle_scale, progress_callback)
-            if not final_output_wcs or not final_output_shape_hw: pcb("run_error_phase4_grid_calc_failed", prog=(base_progress_phase4 + PROGRESS_WEIGHT_PHASE4_GRID_CALC), lvl="ERROR"); return
-            current_global_progress = base_progress_phase4 + PROGRESS_WEIGHT_PHASE4_GRID_CALC
-            _log_memory_usage(progress_callback, "Fin Phase 4");
-            if step_times_ph4:
-                avg_step = sum(step_times_ph4) / len(step_times_ph4)
-                total_elapsed = time.time() - start_time_loop_ph4
-                pcb(
-                    "phase4_debug_timing",
-                    prog=None,
-                    lvl="DEBUG_DETAIL",
-                    avg=f"{avg_step:.2f}",
-                    total=f"{total_elapsed:.2f}",
                 )
-            pcb("run_info_phase4_finished", prog=current_global_progress, lvl="INFO", shape=final_output_shape_hw, crval=final_output_wcs.wcs.crval if final_output_wcs.wcs else 'N/A')
-
-            base_progress_phase4_5 = current_global_progress
-            phase45_options = _build_phase45_options_dict(base_progress_phase4_5)
-            base_progress_phase5 = base_progress_phase4_5 + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
-            phase5_options = _build_phase5_options_dict(base_progress_phase5)
-
-            telemetry.maybe_emit_stats(
-                _telemetry_context(
-                    {
-                        "phase_name": "Phase 5: Assembly",
-                        "phase_index": 5,
-                        "tiles_total": len(master_tiles_results_list),
-                    }
-                )
+            except Exception as e_read_tile_shape: pcb("run_error_phase4_reading_tile_shape", prog=None, lvl="ERROR", path=_safe_basename(mt_path_iter), error=str(e_read_tile_shape)); logger.error(f"Erreur lecture shape tuile {_safe_basename(mt_path_iter)}:", exc_info=True); continue
+        if not wcs_list_for_final_grid or not shapes_list_for_final_grid_hw or len(wcs_list_for_final_grid) != len(shapes_list_for_final_grid_hw): pcb("run_error_phase4_insufficient_tile_info", prog=(base_progress_phase4 + PROGRESS_WEIGHT_PHASE4_GRID_CALC), lvl="ERROR"); return
+        final_mosaic_drizzle_scale = 1.0 
+        final_output_wcs, final_output_shape_hw = _calculate_final_mosaic_grid(wcs_list_for_final_grid, shapes_list_for_final_grid_hw, final_mosaic_drizzle_scale, progress_callback)
+        if not final_output_wcs or not final_output_shape_hw: pcb("run_error_phase4_grid_calc_failed", prog=(base_progress_phase4 + PROGRESS_WEIGHT_PHASE4_GRID_CALC), lvl="ERROR"); return
+        current_global_progress = base_progress_phase4 + PROGRESS_WEIGHT_PHASE4_GRID_CALC
+        _log_memory_usage(progress_callback, "Fin Phase 4");
+        if step_times_ph4:
+            avg_step = sum(step_times_ph4) / len(step_times_ph4)
+            total_elapsed = time.time() - start_time_loop_ph4
+            pcb(
+                "phase4_debug_timing",
+                prog=None,
+                lvl="DEBUG_DETAIL",
+                avg=f"{avg_step:.2f}",
+                total=f"{total_elapsed:.2f}",
             )
-            (
-                master_tiles_results_list,
-                final_mosaic_data_HWC,
-                final_mosaic_coverage_HW,
-                final_alpha_map,
-                alpha_final,
-                current_global_progress,
-            ) = _run_shared_phase45_phase5_pipeline(
-                master_tiles_results_list,
-                final_output_wcs=final_output_wcs,
-                final_output_shape_hw=final_output_shape_hw,
-                temp_master_tile_storage_dir=temp_master_tile_storage_dir,
-                output_folder=output_folder,
-                cache_retention_mode=cache_retention_mode,
-                phase45_options=phase45_options,
-                phase5_options=phase5_options,
-                final_quality_pipeline_cfg=final_quality_pipeline_cfg,
-                start_time_total_run=start_time_total_run,
-                progress_callback=progress_callback,
-                pcb=pcb,
-                logger=logger,
+        pcb("run_info_phase4_finished", prog=current_global_progress, lvl="INFO", shape=final_output_shape_hw, crval=final_output_wcs.wcs.crval if final_output_wcs.wcs else 'N/A')
+
+        base_progress_phase4_5 = current_global_progress
+        phase45_options = _build_phase45_options_dict(base_progress_phase4_5)
+        base_progress_phase5 = base_progress_phase4_5 + PROGRESS_WEIGHT_PHASE4_5_INTER_MASTER
+        phase5_options = _build_phase5_options_dict(base_progress_phase5)
+
+        telemetry.maybe_emit_stats(
+            _telemetry_context(
+                {
+                    "phase_name": "Phase 5: Assembly",
+                    "phase_index": 5,
+                    "tiles_total": len(master_tiles_results_list),
+                }
             )
-            if final_mosaic_data_HWC is None:
-                return
+        )
+        (
+            master_tiles_results_list,
+            final_mosaic_data_HWC,
+            final_mosaic_coverage_HW,
+            final_alpha_map,
+            alpha_final,
+            current_global_progress,
+        ) = _run_shared_phase45_phase5_pipeline(
+            master_tiles_results_list,
+            final_output_wcs=final_output_wcs,
+            final_output_shape_hw=final_output_shape_hw,
+            temp_master_tile_storage_dir=temp_master_tile_storage_dir,
+            output_folder=output_folder,
+            cache_retention_mode=cache_retention_mode,
+            phase45_options=phase45_options,
+            phase5_options=phase5_options,
+            final_quality_pipeline_cfg=final_quality_pipeline_cfg,
+            start_time_total_run=start_time_total_run,
+            progress_callback=progress_callback,
+            pcb=pcb,
+            logger=logger,
+        )
+        if final_mosaic_data_HWC is None:
+            return
 
     # --- Phase 6 (Sauvegarde) ---
     base_progress_phase6 = current_global_progress
@@ -19142,6 +19284,7 @@ def run_hierarchical_mosaic(
     logging_level_config: str = "INFO",
     solver_settings: dict | None = None,
     skip_filter_ui: bool = False,
+    use_existing_master_tiles_config: bool = False,
     # New optional integration points when filter ran in GUI
     filter_invoked: bool = False,
     filter_overrides: dict | None = None,
@@ -19433,6 +19576,7 @@ def run_hierarchical_mosaic(
             logging_level_config=logging_level_config,
             solver_settings=solver_settings,
             skip_filter_ui=skip_filter_ui,
+            use_existing_master_tiles_config=use_existing_master_tiles_config,
             filter_invoked=filter_invoked,
             filter_overrides=filter_overrides,
             filtered_header_items=filtered_header_items,
@@ -21279,7 +21423,7 @@ def run_hierarchical_mosaic(
     final_alpha_map = None
     sds_fallback_logged = False
     alpha_final: np.ndarray | None = None
-    master_tiles_results_list: list[tuple[str, Any]] = []
+    master_tiles_results_list: list[tuple[str, Any]] = list(existing_master_tiles_results)
     final_quality_pipeline_cfg = {
         "quality_crop_enabled": bool(quality_crop_enabled_config),
         "quality_crop_band_px": int(quality_crop_band_px_config),

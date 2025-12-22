@@ -894,6 +894,8 @@ class ZeMosaicQtMainWindow(QMainWindow):
         self._splitter_states_restored = False
         self._intertile_group: QGroupBox | None = None
         self._poststack_group: QGroupBox | None = None
+        self._mosaic_group: QGroupBox | None = None
+        self._existing_master_tiles_checkbox: QCheckBox | None = None
 
         self._last_filter_overrides: Dict[str, Any] | None = None
         self._last_filtered_header_items: List[Any] | None = None
@@ -1056,6 +1058,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         outer_layout.addLayout(button_row)
 
         self._apply_saved_window_geometry()
+        self._apply_existing_master_tiles_mode()
 
     def _apply_saved_window_geometry(self) -> None:
         geometry_value = self.config.get(QT_MAIN_WINDOW_GEOMETRY_KEY)
@@ -1226,6 +1229,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         left_splitter.setChildrenCollapsible(False)
         folders_group = self._create_folders_group()
         mosaic_group = self._create_mosaic_group()
+        self._mosaic_group = mosaic_group
         instrument_group = self._create_instrument_group()
         intertile_group = self._intertile_group
         poststack_group = self._poststack_group
@@ -1375,12 +1379,43 @@ class ZeMosaicQtMainWindow(QMainWindow):
                 "qt_dialog_select_output_dir", "Select Output Folder"
             ),
         )
+        master_tiles_checkbox = self._register_checkbox(
+            "use_existing_master_tiles",
+            layout,
+            self._tr(
+                "qt_use_existing_master_tiles_label",
+                "I'm using master tiles (skip clustering & master tile creation)",
+            ),
+        )
+        master_tiles_checkbox.setToolTip(
+            self._tr(
+                "qt_use_existing_master_tiles_tip",
+                "Input folder must contain master tiles FITS with a valid WCS. "
+                "ZeMosaic will skip phases 0-3 and go directly to inter-tile normalization and reprojection.",
+            )
+        )
+        self._existing_master_tiles_checkbox = master_tiles_checkbox
+        master_tiles_checkbox.toggled.connect(self._on_existing_master_tiles_toggled)  # type: ignore[arg-type]
         self._register_line_edit(
             "global_wcs_output_path",
             layout,
             self._tr("qt_field_global_wcs_output", "Global WCS output path"),
         )
         return group
+
+    def _existing_master_tiles_enabled(self) -> bool:
+        return bool(self.config.get("use_existing_master_tiles", False))
+
+    def _apply_existing_master_tiles_mode(self, enabled: bool | None = None) -> None:
+        if enabled is None:
+            enabled = self._existing_master_tiles_enabled()
+        if self._mosaic_group is not None:
+            self._mosaic_group.setEnabled(not enabled)
+        if hasattr(self, "filter_button") and self.filter_button is not None:
+            self.filter_button.setEnabled((not enabled) and not self.is_processing)
+
+    def _on_existing_master_tiles_toggled(self, checked: bool) -> None:
+        self._apply_existing_master_tiles_mode(bool(checked))
 
     def _create_instrument_group(self) -> QGroupBox:
         group = QGroupBox(
@@ -3742,6 +3777,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
         fallback_defaults: Dict[str, Any] = {
             "input_dir": "",
             "output_dir": "",
+            "use_existing_master_tiles": False,
             "global_wcs_output_path": "global_mosaic_wcs.fits",
             "coadd_memmap_dir": "",
             "coadd_use_memmap": True,
@@ -4798,7 +4834,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             self._cpu_eta_override_deadline = None
         self.start_button.setEnabled(not running)
         self.stop_button.setEnabled(running)
-        self.filter_button.setEnabled(not running)
+        self.filter_button.setEnabled((not running) and (not self._existing_master_tiles_enabled()))
         if running:
             self.progress_bar.setValue(0)
             self.phase_value_label.setText(self._tr("qt_progress_placeholder", "Idle"))
@@ -5620,10 +5656,14 @@ class ZeMosaicQtMainWindow(QMainWindow):
             return
 
         self._collect_config_from_widgets()
+        use_existing_master_tiles = self._existing_master_tiles_enabled()
 
         skip_filter_ui_for_run = bool(predecided_skip_filter_ui) if predecided_skip_filter_ui is not None else False
 
-        if not skip_filter_prompt and predecided_skip_filter_ui is None:
+        if use_existing_master_tiles:
+            skip_filter_ui_for_run = True
+            self._clear_filter_results()
+        elif not skip_filter_prompt and predecided_skip_filter_ui is None:
             answer = QMessageBox.question(
                 self,
                 self._tr("qt_filter_prompt_title", "Filter range and set clustering?"),
@@ -5735,7 +5775,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
 
     def _handle_worker_start_failure(self, error_message: str | None) -> None:
         self.start_button.setEnabled(True)
-        self.filter_button.setEnabled(True)
+        self.filter_button.setEnabled(not self._existing_master_tiles_enabled())
         self.stop_button.setEnabled(False)
         self._eta_calc = None
         self._eta_seconds_smoothed = None

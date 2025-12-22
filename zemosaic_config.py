@@ -91,6 +91,7 @@ DEFAULT_CONFIG = {
     "qt_main_left_state": None,
     "input_dir": "",
     "output_dir": "",
+    "use_existing_master_tiles": False,
     "num_processing_workers": -1,  # -1 pour auto
     "grid_workers": 0,  # 0 = auto
     "stacking_normalize_method": "linear_fit",
