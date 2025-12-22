@@ -6229,6 +6229,7 @@ def _compute_intertile_affine_corrections_from_sources(
     progress_callback: Callable | None = None,
     intertile_global_recenter: bool = False,
     intertile_recenter_clip: tuple[float, float] | list[float] | None = None,
+    tile_weights: list[float] | None = None,
 ) -> tuple[list[tuple[float, float]] | None, bool, str, str | None]:
     """Common implementation for intertile gain/offset computation.
 
@@ -6407,6 +6408,7 @@ def _compute_intertile_affine_corrections_from_sources(
             use_auto_intertile=use_auto_intertile,
             logger=logger_obj,
             progress_callback=_intertile_progress_bridge,
+            tile_weights=tile_weights,
         )
     except Exception as exc:
         if logger_obj:
@@ -13615,12 +13617,21 @@ def assemble_final_mosaic_reproject_coadd(
         and len(effective_tiles) >= 2
     ):
         tile_sources = []
+        tile_weights_for_sources: list[float] = []
         for entry in effective_tiles:
             mask = None
+            weight_val = 1.0
             if isinstance(entry, dict):
                 mask = entry.get("alpha_weight2d")
                 if mask is None:
                     mask = entry.get("coverage_mask")
+                try:
+                    weight_val = float(entry.get("tile_weight", 1.0))
+                except Exception:
+                    weight_val = 1.0
+                if not math.isfinite(weight_val) or weight_val <= 0:
+                    weight_val = 1.0
+            tile_weights_for_sources.append(weight_val)
             tile_sources.append(
                 _TileAffineSource(
                     path=entry.get("path"),
@@ -13644,6 +13655,7 @@ def assemble_final_mosaic_reproject_coadd(
                 progress_callback=progress_callback,
                 intertile_global_recenter=bool(intertile_global_recenter),
                 intertile_recenter_clip=intertile_recenter_clip,
+                tile_weights=tile_weights_for_sources,
             )
         )
 
