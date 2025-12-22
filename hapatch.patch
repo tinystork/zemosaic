@@ -1,370 +1,733 @@
 diff --git a/agent.md b/agent.md
-index 06743c0f8dbd5ce41f4c7a26e16778f9ecfc2eab..3a88da75942ef497fb15f0e8131d92351456e58f 100644
+index 85b7a7d019234a66681ea32ecca26e8ea9c2b1d8..26841f7d4581cedebd3206bc4a36b889985efb74 100644
 --- a/agent.md
 +++ b/agent.md
-@@ -7,76 +7,75 @@ Le log indique :
- - phase6: alpha_union received -> alpha_final propagé
- - puis: nanized X pixels where coverage/alpha == 0
+@@ -4,50 +4,56 @@
+ When running with:
+ - GUI option: “I'm using master tiles (skip clustering_master tile creation)”
+ - inter-tile photometric match enabled (match_background / intertile)
  
- Hypothèse : dans ce mode seulement, l’alpha reprojeté (alpha_union) peut être incohérent (ex: 0 dans des zones couvertes), et comme on nanize en fonction de l’alpha, on “perce” un trou artificiel.
+ The final mosaic shows a huge flat black/purple rectangle even though coverage indicates tiles overlap.
  
- ## Objectif (Option B)
- Quand on est en mode "use_existing_master_tiles", dériver l’ALPHA FINAL à partir du coverage final :
- - alpha_final[u,v] = 255 si coverage[u,v] > 0
- - alpha_final[u,v] = 0 sinon
+ Log hints:
+ - intertile affine gains can be absurdly small (e.g. ~3e-5) -> suggests the affine fit is polluted by masked pixels stored as finite zeros.
+ - In existing-master-tiles mode, ALPHA extension is used to create weights and/or to zero masked pixels. If ALPHA semantics are inverted (0=valid, 1=invalid), weights become inverted and large regions become constant/flat in the final mosaic.
  
- Et ne pas laisser un alpha_union incohérent dégrader le rendu final.
+ ## Goal (Option B)
+ Fix the issue ONLY for the “existing master tiles” scenario by:
+ 1) Auto-detecting inverted ALPHA masks when loading master tiles, and invert them if needed.
+ 2) Ensuring intertile photometric calibration ignores masked pixels:
+    - Apply ALPHA mask by setting invalid pixels to NaN for preview/affine input.
+    - Extend compute_intertile_affine_calibration to accept optional per-tile masks and use them when sampling overlap.
  
- ## Contraintes
- - Patch chirurgical.
- - Ne pas changer le comportement normal hors de ce mode.
- - Ne pas refactorer l’architecture.
- - Zéro impact sur batch size, GPU/CPU, etc.
+ ## Constraints
+ - NO refactor, minimal surgical changes.
+ - Touch only:
+   - zemosaic_worker.py
+   - zemosaic_utils.py
+ - Keep existing default behaviors and performance characteristics as much as possible.
+ - Add INFO/DEBUG logs to confirm inversion detection, but don’t spam.
  
- ## Fichiers à modifier
- - `zemosaic_worker.py` uniquement (idéalement)
-   - `run_hierarchical_mosaic_classic_legacy(...)`
-   - `assemble_final_mosaic_reproject_coadd(...)`
- 
- ## Plan d’implémentation
- 
--### 1) Propager un bool "existing_master_tiles_mode" vers l’assembleur final
--- Ajouter un paramètre optionnel à `assemble_final_mosaic_reproject_coadd` :
--  - `existing_master_tiles_mode: bool = False`
--- Dans `run_hierarchical_mosaic_classic_legacy`, lors de l’appel à `assemble_final_mosaic_reproject_coadd`, passer :
--  - `existing_master_tiles_mode=use_existing_master_tiles_config` (ou l’équivalent déjà présent)
-+- [x] Propager un bool "existing_master_tiles_mode" vers l’assembleur final
-+  - Ajouter un paramètre optionnel à `assemble_final_mosaic_reproject_coadd` :
-+    - `existing_master_tiles_mode: bool = False`
-+  - Dans `run_hierarchical_mosaic_classic_legacy`, lors de l’appel à `assemble_final_mosaic_reproject_coadd`, passer :
-+    - `existing_master_tiles_mode=use_existing_master_tiles_config` (ou l’équivalent déjà présent)
- 
- ⚠️ Important : garder une valeur par défaut pour ne rien casser ailleurs.
- 
--### 2) Rebuild alpha_final depuis coverage en mode existing master tiles
--Dans `assemble_final_mosaic_reproject_coadd`, à l’endroit où `alpha_union` est converti en `alpha_final` (phase6), insérer juste après l’obtention de `alpha_final` et avant toute logique “coverage/alpha == 0” :
--
--Pseudo-code :
--
--```python
--if existing_master_tiles_mode and coverage is not None:
--    cov_mask = coverage > 0
--    if alpha_final is None:
--        alpha_final = (cov_mask.astype(np.uint8) * 255)
--        log("alpha_from_coverage: alpha_final was None -> rebuilt")
--    else:
--        # détecter mismatch : coverage>0 mais alpha==0
--        alpha0 = (alpha_final == 0)
--        mismatch = np.count_nonzero(cov_mask & alpha0)
--        if mismatch > 0:
--            total_cov = np.count_nonzero(cov_mask)
--            pct = (100.0 * mismatch / max(1, total_cov))
--            log(f"alpha_from_coverage: overriding alpha_final (mismatch={mismatch} px, {pct:.2f}% of covered)")
-+- [x] Rebuild alpha_final depuis coverage en mode existing master tiles
-+  - Dans `assemble_final_mosaic_reproject_coadd`, à l’endroit où `alpha_union` est converti en `alpha_final` (phase6), insérer juste après l’obtention de `alpha_final` et avant toute logique “coverage/alpha == 0” :
++## Status
++- [x] A) Auto-fix inverted ALPHA when loading existing master tiles.
++- [x] B) Intertile ALPHA mask ingestion and NaN application for previews.
++- [x] C) Optional mask support inside compute_intertile_affine_calibration.
++- [x] D) Safety rails applied where overlap pixels are insufficient.
 +
-+    Pseudo-code :
-+
-+    ```python
-+    if existing_master_tiles_mode and coverage is not None:
-+        cov_mask = coverage > 0
-+        if alpha_final is None:
-             alpha_final = (cov_mask.astype(np.uint8) * 255)
--````
-+            log("alpha_from_coverage: alpha_final was None -> rebuilt")
-+        else:
-+            # détecter mismatch : coverage>0 mais alpha==0
-+            alpha0 = (alpha_final == 0)
-+            mismatch = np.count_nonzero(cov_mask & alpha0)
-+            if mismatch > 0:
-+                total_cov = np.count_nonzero(cov_mask)
-+                pct = (100.0 * mismatch / max(1, total_cov))
-+                log(f"alpha_from_coverage: overriding alpha_final (mismatch={mismatch} px, {pct:.2f}% of covered)")
-+                alpha_final = (cov_mask.astype(np.uint8) * 255)
-+    ````
+ ## Implementation Tasks
  
--* Forcer dtype `uint8`, shape identique au coverage.
--* Conserver `alpha_union` tel quel pour les autres modes.
-+    * Forcer dtype `uint8`, shape identique au coverage.
-+    * Conserver `alpha_union` tel quel pour les autres modes.
+ ### A) zemosaic_worker.py — Auto-fix inverted ALPHA when loading existing master tiles
+ Where master tiles are loaded and alpha_weight2d is built (existing_master_tiles_mode path):
+ - After normalizing alpha to float32 [0..1] but BEFORE building valid2d:
+   - Compute `nz2d` from tile data (any channel abs>eps and finite).
+   - Compute:
+     - valid_frac = mean(alpha > ALPHA_OPACITY_THRESHOLD)
+     - inv_valid_frac = mean((1-alpha) > ALPHA_OPACITY_THRESHOLD)
+     - nz_frac = mean(nz2d)
+   - Choose orientation (alpha or 1-alpha) whose valid_frac is closest to nz_frac.
+   - Only flip if it’s clearly better (e.g. inv_score + margin < score).
+ - Log a single INFO line when a flip occurs:
+   - “[Alpha] existing_master_tiles: auto-inverted alpha mask …”
  
--### 3) Logging / Observabilité
-+- [x] Logging / Observabilité
+ Make sure:
+ - alpha_mask_arr used to create alpha_weight2d / coverage_mask_entry uses the corrected orientation.
+ - valid2d uses corrected alpha.
  
--Ajouter un log INFO (et si tu veux un callback GUI type `[INFO] ...`) quand on override :
-+  - Ajouter un log INFO (et si tu veux un callback GUI type `[INFO] ...`) quand on override :
- 
--* nb pixels mismatch
--* % des pixels couverts impactés
--* mention claire “existing_master_tiles_mode”
-+  * nb pixels mismatch
-+  * % des pixels couverts impactés
-+  * mention claire “existing_master_tiles_mode”
- 
--### 4) Critères d’acceptation
-+- [ ] Critères d’acceptation
- 
--* En mode existing master tiles, plus de trou central si le coverage indique une couverture.
--* Les stats “nanized pixels where coverage/alpha == 0” ne doivent plus nanizer des pixels `coverage>0` à cause de l’alpha.
--* Hors de ce mode : comportement inchangé.
-+  * En mode existing master tiles, plus de trou central si le coverage indique une couverture.
-+  * Les stats “nanized pixels where coverage/alpha == 0” ne doivent plus nanizer des pixels `coverage>0` à cause de l’alpha.
-+  * Hors de ce mode : comportement inchangé.
- 
- ## Notes
- 
- * Ce fix est volontairement conservateur : en mode existing master tiles, on privilégie la vérité “coverage” (résultat de l’assemblage) plutôt qu’un alpha potentiellement corrompu/inversé venant des fichiers en entrée.
--
+ ### B) zemosaic_worker.py — Intertile: load/apply ALPHA as NaN for previews + pass mask to utils
+ In `_compute_intertile_affine_corrections_from_sources`:
+ - When loading from FITS path:
+   - Also try to read an ALPHA extension if present (name “ALPHA”).
+   - Normalize to float [0..1] like elsewhere.
+   - Apply the same auto-inversion heuristic (using nz2d of tile_arr) if needed.
 diff --git a/followup.md b/followup.md
-index e6f3901291814dc531a81af11e5704ce73641256..6f2c6e470315512fdad9c74723cb7717b9430610 100644
+index dde6d40957753d66daba726fb21a138b7987e5cd..69825adaa3f25d0d99de6178993c6ab86def050b 100644
 --- a/followup.md
 +++ b/followup.md
-@@ -1,32 +1,31 @@
- # followup.md — Vérifs & Validation (alpha_from_coverage en mode existing master tiles)
+@@ -1,27 +1,31 @@
+ # Follow-up — Validation & Repro steps
  
- ## 1) Repro / Test manuel rapide (cas M31)
--- Utiliser exactement le dataset + config qui déclenche le problème (use_existing_master_tiles=true, quality_crop=false).
--- Lancer un run.
--- Attendus :
-+- [ ] Utiliser exactement le dataset + config qui déclenche le problème (use_existing_master_tiles=true, quality_crop=false).
-+- [ ] Lancer un run.
-+- [ ] Attendus :
-   - La preview PNG n’a plus de “gros trou” central.
-   - Le FITS final contient une extension ALPHA (si c’était déjà le cas), mais cette ALPHA doit maintenant correspondre au coverage.
++## Progress
++- [x] Code changes for ALPHA handling and intertile masking implemented.
++- [ ] Validation on the repro dataset (with updated logging checks).
++
+ ## Build / Run
+ 1) Use the same dataset / master tiles that currently reproduce the issue.
+ 2) Run ZeMosaic with:
+    - “I'm using master tiles (skip clustering_master tile creation)” ON
+    - inter-tile photometric match ON (match_background / intertile enabled)
+    - quality crop OFF (as in repro)
  
- ## 2) Check quantitatif simple (log)
--Attendre un log du type :
--- `alpha_from_coverage: overriding alpha_final (mismatch=..., ..% of covered)`
--ou
--- `alpha_from_coverage: alpha_final was None -> rebuilt`
--
--Et vérifier qu’il n’y a plus de “nanized pixels” induits par un alpha incohérent.
-+- [ ] Attendre un log du type :
-+  - `alpha_from_coverage: overriding alpha_final (mismatch=..., ..% of covered)`
-+  - ou
-+  - `alpha_from_coverage: alpha_final was None -> rebuilt`
-+- [ ] Et vérifier qu’il n’y a plus de “nanized pixels” induits par un alpha incohérent.
+ ## What to check in logs
+ ### A) Alpha inversion detection
+ If the ALPHA extension was inverted, you should see an INFO line similar to:
+ - “[Alpha] existing_master_tiles: auto-inverted alpha mask … valid_frac=… inv_valid_frac=… nz_frac=…”
  
- ## 3) Sanity check : cohérence alpha vs coverage
--Ajouter temporairement (ou via debug local) un petit calcul :
--- `mismatch_after = count((coverage>0) & (alpha_final==0))`
--Attendu : `mismatch_after == 0`
-+- [ ] Ajouter temporairement (ou via debug local) un petit calcul :
-+  - `mismatch_after = count((coverage>0) & (alpha_final==0))`
-+- [ ] Attendu : `mismatch_after == 0`
+ If no line appears, it means the heuristic decided the ALPHA is already consistent.
  
- ## 4) Non-régression (mode normal)
--- Lancer un run classique (sans existing master tiles).
--- Vérifier :
-+- [ ] Lancer un run classique (sans existing master tiles).
-+- [ ] Vérifier :
-   - pas de changement de comportement,
-   - alpha_union continue d’être propagé tel qu’avant,
-   - pas de nouveaux logs alpha_from_coverage.
+ ### B) Intertile gains sanity
+ In the intertile summary and apply logs:
+ - Gains should not be near 0 (no more 1e-5).
+ - Gains should typically cluster around 1.0 and respect the configured clip behavior.
  
- ## 5) Nettoyage
--- Garder les logs INFO (utiles).
--- Ne pas ajouter de dépendances.
-+- [ ] Garder les logs INFO (utiles).
-+- [ ] Ne pas ajouter de dépendances.
+ ## Visual checks
+ - The final mosaic must not have the large flat black/purple rectangle.
+ - The overlap zones should show real sky signal (stars/background), not constant fill.
+ 
+ ## Quick sanity script (optional manual check)
+ Open one problematic master_tile FITS and compare:
+diff --git a/zemosaic_utils.py b/zemosaic_utils.py
+index 42dfc17ea7f83cddda33f355bcc05f832849517a..4f1282d5262e3e05f88bd4f6f53b96c63f8f858d 100644
+--- a/zemosaic_utils.py
++++ b/zemosaic_utils.py
+@@ -2062,91 +2062,121 @@ def solve_global_affine(num_tiles: int, pair_entries, anchor_index: int = 0):
+     offsets = sol[num_tiles:]
+     result = {}
+     for idx in range(num_tiles):
+         g = float(gains[idx])
+         o = float(offsets[idx])
+         if not np.isfinite(g) or abs(g) < 1e-6:
+             g = 1.0
+         if not np.isfinite(o):
+             o = 0.0
+         result[idx] = (g, o)
+     return result
+ 
+ 
+ def compute_intertile_affine_calibration(
+     tile_data_with_wcs,
+     final_output_wcs,
+     final_output_shape_hw,
+     preview_size: int = 512,
+     min_overlap_fraction: float = 0.05,
+     sky_percentile: tuple[float, float] | list[float] = (30.0, 70.0),
+     robust_clip_sigma: float = 2.5,
+     use_auto_intertile: bool = False,
+     logger=None,
+     progress_callback=None,
+ ):
+-    """Calcule des corrections affine (gain/offset) inter-tuiles avant reprojection."""
++    """Calcule des corrections affine (gain/offset) inter-tuiles avant reprojection.
++
++    ``tile_data_with_wcs`` peut contenir des tuples ``(data, wcs)`` ou
++    ``(data, wcs, mask2d)`` pour injecter un masque (0..1) optionnel sur la zone
++    d'overlap.
++    """
+ 
+     if tile_data_with_wcs is None or len(tile_data_with_wcs) < 2:
+         return {}
+     if reproject_interp is None or not ASTROPY_AVAILABLE_IN_UTILS:
+         return {}
+     try:
+         header_full = final_output_wcs.to_header()
+     except Exception:
+         return {}
+ 
++    parsed_entries: list[tuple[np.ndarray, Any, np.ndarray | None]] = []
++    for entry in tile_data_with_wcs:
++        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
++            continue
++        data = entry[0]
++        wcs_obj = entry[1]
++        mask = entry[2] if len(entry) >= 3 else None
++        parsed_entries.append((data, wcs_obj, mask))
++
++    if len(parsed_entries) < 2:
++        return {}
++
+     try:
+         h_full = int(final_output_shape_hw[0])
+         w_full = int(final_output_shape_hw[1])
+     except Exception:
+         h_full = w_full = 0
+ 
+     sky_low, sky_high = 30.0, 70.0
+     try:
+         if isinstance(sky_percentile, (list, tuple)) and len(sky_percentile) >= 2:
+             sky_low = float(sky_percentile[0])
+             sky_high = float(sky_percentile[1])
+             if sky_low > sky_high:
+                 sky_low, sky_high = sky_high, sky_low
+     except Exception:
+         sky_low, sky_high = 30.0, 70.0
+ 
+-    wcs_list = [wcs for _data, wcs in tile_data_with_wcs]
++    wcs_list = [wcs for _data, wcs, _mask in parsed_entries]
+     shapes_hw = []
+     luminance_tiles = []
+-    for data, _wcs in tile_data_with_wcs:
++    mask_tiles: list[np.ndarray | None] = []
++    for data, _wcs, mask in parsed_entries:
+         arr = np.asarray(data)
+         if arr.ndim == 3 and arr.shape[-1] == 0:
+             luminance_tiles.append(None)
+             shapes_hw.append((0, 0))
++            mask_tiles.append(None)
+             continue
+         luminance = _extract_luminance_plane(arr)
+         luminance_tiles.append(luminance)
+         shapes_hw.append((luminance.shape[0], luminance.shape[1]))
++        mask_arr = None
++        if mask is not None:
++            try:
++                mask_arr = np.asarray(mask, dtype=np.float32)
++                if mask_arr.ndim == 3:
++                    mask_arr = mask_arr[..., 0]
++                if mask_arr.shape != luminance.shape[:2]:
++                    mask_arr = None
++            except Exception:
++                mask_arr = None
++        mask_tiles.append(mask_arr)
+ 
+-    num_tiles = len(tile_data_with_wcs)
++    num_tiles = len(parsed_entries)
+ 
+     try:
+         preview_size = int(preview_size)
+     except Exception:
+         preview_size = 512
+     preview_size = max(128, preview_size)
+ 
+     try:
+         min_overlap_fraction = float(min_overlap_fraction)
+     except Exception:
+         min_overlap_fraction = 0.05
+     if not math.isfinite(min_overlap_fraction):
+         min_overlap_fraction = 0.05
+     if min_overlap_fraction < 0:
+         min_overlap_fraction = 0.0
+ 
+     def _log_intertile(message: str, level: str = "INFO") -> None:
+         prefixed = message if message.startswith("[Intertile]") else f"[Intertile] {message}"
+         level_upper = str(level).upper()
+         if logger is not None:
+             try:
+                 if level_upper in {"WARN", "WARNING"}:
+                     logger.warning(prefixed)
+                 elif level_upper in {"ERROR", "CRITICAL"}:
+                     logger.error(prefixed)
+@@ -2225,148 +2255,189 @@ def compute_intertile_affine_calibration(
+     if not overlaps:
+         _log_intertile(
+             "No overlap pairs found after retries — applying GLOBAL fallback (median normalization).",
+             level="WARN",
+         )
+         try:
+             use_gpu = False
+             xp = np
+             cp = None
+             try:
+                 import cupy as _cp  # type: ignore
+ 
+                 if gpu_is_available():
+                     xp = _cp
+                     cp = _cp
+                     use_gpu = True
+                     _log_intertile(
+                         "CuPy GPU detected — normalization on GPU.",
+                         level="INFO_DETAIL",
+                     )
+             except Exception:
+                 xp = np
+                 use_gpu = False
+ 
+             medians = []
+-            for data, _ in tile_data_with_wcs:
++            for data, _wcs_obj, _mask in parsed_entries:
+                 if data is None:
+                     continue
+                 arr = xp.asarray(data, dtype=xp.float32)
+                 med = float(xp.median(arr).get() if use_gpu else np.median(arr))
+                 if np.isfinite(med) and med > 0:
+                     medians.append(med)
+ 
+             if not medians:
+                 _log_intertile("No valid medians found for normalization.", level="WARN")
+                 return {}
+ 
+             global_median = float(np.median(medians))
+             _log_intertile(
+                 f"Global normalization median reference = {global_median:.4f}",
+                 level="INFO_DETAIL",
+             )
+ 
+             new_tile_data = []
+-            for data, wcs_obj in tile_data_with_wcs:
++            for data, wcs_obj, mask in parsed_entries:
+                 if data is None:
+                     new_tile_data.append((data, wcs_obj))
+                     continue
+                 arr = xp.asarray(data, dtype=xp.float32)
+                 med = float(xp.median(arr).get() if use_gpu else np.median(arr))
+                 scale = (global_median / med) if med and np.isfinite(med) and med != 0 else 1.0
+                 scaled = arr * scale
+                 if use_gpu and cp is not None:
+                     scaled = cp.asnumpy(scaled)  # type: ignore
+-                new_tile_data.append((scaled, wcs_obj))
++                new_tile_data.append((scaled, wcs_obj, mask) if mask is not None else (scaled, wcs_obj))
+             tile_data_with_wcs[:] = new_tile_data
+ 
+             _log_intertile("Applied global normalization to all master tiles.", level="INFO")
+ 
+         except Exception as e_norm:
+             _log_intertile(f"Global normalization fallback failed: {e_norm}", level="ERROR")
+ 
+         return {}
+ 
+     min_overlap_fraction = effective_min_overlap
+     _log_intertile(
+         f"Using: preview={preview_size}, min_overlap={effective_min_overlap:.4f}, sky=({sky_low:.1f},{sky_high:.1f}), clip={robust_clip_sigma:.2f}, pairs={len(overlaps)}",
+         level="INFO",
+     )
+ 
+     try:
+         from astropy.wcs import WCS as _WCS
+     except Exception:
+         return {}
+ 
+     pair_entries = []
+-    connectivity = np.zeros(len(tile_data_with_wcs), dtype=np.float64)
++    connectivity = np.zeros(num_tiles, dtype=np.float64)
+     preview_size = max(128, int(preview_size))
+ 
+     for idx, overlap in enumerate(overlaps, 1):
+         i = overlap["i"]
+         j = overlap["j"]
+         bbox = overlap["bbox"]
+         weight = float(overlap.get("weight", 1.0))
+         if luminance_tiles[i] is None or luminance_tiles[j] is None:
+             continue
+         x0, x1, y0, y1 = bbox
+         sub_w = max(1, x1 - x0)
+         sub_h = max(1, y1 - y0)
+         header = header_full.copy()
+         header["NAXIS1"] = sub_w
+         header["NAXIS2"] = sub_h
+         if "CRPIX1" in header:
+             header["CRPIX1"] = float(header["CRPIX1"]) - x0
+         if "CRPIX2" in header:
+             header["CRPIX2"] = float(header["CRPIX2"]) - y0
+         try:
+             target_wcs = _WCS(header)
+         except Exception:
+             continue
+         try:
+             reproj_i, _ = reproject_interp(
+                 (luminance_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
+             )
+             reproj_j, _ = reproject_interp(
+                 (luminance_tiles[j], wcs_list[j]), target_wcs, shape_out=(sub_h, sub_w)
+             )
+         except Exception:
+             continue
+         if reproj_i is None or reproj_j is None:
+             continue
+         arr_i = np.asarray(reproj_i, dtype=np.float32)
+         arr_j = np.asarray(reproj_j, dtype=np.float32)
++        mask_i_reproj = None
++        mask_j_reproj = None
++        if mask_tiles[i] is not None:
++            try:
++                mask_i_reproj, _ = reproject_interp(
++                    (mask_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
++                )
++            except Exception:
++                mask_i_reproj = None
++        if mask_tiles[j] is not None:
++            try:
++                mask_j_reproj, _ = reproject_interp(
++                    (mask_tiles[j], wcs_list[j]), target_wcs, shape_out=(sub_h, sub_w)
++                )
++            except Exception:
++                mask_j_reproj = None
+         if arr_i.size == 0 or arr_j.size == 0:
+             continue
+         max_dim = max(arr_i.shape[0], arr_i.shape[1])
+         if max_dim > preview_size:
+             scale = preview_size / max_dim
+             new_w = max(8, int(round(arr_i.shape[1] * scale)))
+             new_h = max(8, int(round(arr_i.shape[0] * scale)))
+             arr_i = cv2.resize(arr_i, (new_w, new_h), interpolation=cv2.INTER_AREA)
+             arr_j = cv2.resize(arr_j, (new_w, new_h), interpolation=cv2.INTER_AREA)
++            if mask_i_reproj is not None:
++                mask_i_reproj = cv2.resize(mask_i_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
++            if mask_j_reproj is not None:
++                mask_j_reproj = cv2.resize(mask_j_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
++
++        def _mask_valid_pixels(mask_arr: np.ndarray | None) -> np.ndarray | None:
++            if mask_arr is None:
++                return None
++            mask_arr = np.asarray(mask_arr, dtype=np.float32)
++            if mask_arr.size == 0:
++                return None
++            finite_mask = np.isfinite(mask_arr)
++            try:
++                max_val = float(np.nanmax(mask_arr))
++            except Exception:
++                max_val = 0.0
++            threshold = 0.5 if max_val > 0.5 else 0.0
++            return finite_mask & (mask_arr > threshold)
++
+         valid = np.isfinite(arr_i) & np.isfinite(arr_j)
++        mask_i_valid = _mask_valid_pixels(mask_i_reproj)
++        mask_j_valid = _mask_valid_pixels(mask_j_reproj)
++        if mask_i_valid is not None:
++            valid &= mask_i_valid
++        if mask_j_valid is not None:
++            valid &= mask_j_valid
+         if not np.any(valid):
+             continue
+         sample_i = arr_i[valid]
+         sample_j = arr_j[valid]
+         if sample_i.size < 64:
+             continue
+         sky_proxy = 0.5 * (sample_i + sample_j)
+         try:
+             p_low = np.percentile(sky_proxy, sky_low)
+             p_high = np.percentile(sky_proxy, sky_high)
+         except Exception:
+             p_low = np.nanmin(sky_proxy)
+             p_high = np.nanmax(sky_proxy)
+         if not np.isfinite(p_low) or not np.isfinite(p_high):
+             continue
+         if p_high <= p_low:
+             p_low = np.nanmin(sky_proxy)
+             p_high = np.nanmax(sky_proxy)
+         mask = (sky_proxy >= p_low) & (sky_proxy <= p_high)
+         if mask.sum() < 32:
+             mask = np.ones_like(sky_proxy, dtype=bool)
+         x_samples = sample_i[mask]
+         y_samples = sample_j[mask]
+         fit = robust_affine_fit(x_samples, y_samples, clip_sigma=robust_clip_sigma)
+         if fit is None:
+@@ -2374,51 +2445,51 @@ def compute_intertile_affine_calibration(
+         a_ij, b_ij = fit
+         pair_entries.append((i, j, a_ij, b_ij, weight))
+ 
+         a_ij, b_ij = fit
+         pair_entries.append((i, j, a_ij, b_ij, weight))
+         connectivity[i] += weight
+         connectivity[j] += weight
+ 
+         # [ETA] Tick fin de traitement de la paire idx
+         if progress_callback:
+             try:
+                 progress_callback("phase5_intertile_pairs", int(idx), int(len(overlaps)))
+             except Exception:
+                 pass
+ 
+         if progress_callback and idx % 5 == 0:
+             try:
+                 progress_callback("phase5_intertile", idx, len(overlaps))
+             except Exception:
+                 pass
+ 
+     if not pair_entries:
+         return {}
+ 
+     anchor = int(np.argmax(connectivity)) if np.any(connectivity > 0) else 0
+-    solution = solve_global_affine(len(tile_data_with_wcs), pair_entries, anchor_index=anchor)
++    solution = solve_global_affine(num_tiles, pair_entries, anchor_index=anchor)
+     if progress_callback:
+         try:
+             progress_callback(
+                 "Ensuring match_background=True for final coadd.",
+                 None,
+                 "DEBUG_DETAIL",
+             )
+         except Exception:
+             pass
+ 
+     return solution
+ # Les filtres VerifyWarning sont maintenant dans le try/except d'Astropy ci-dessus.
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ # DANS zemosaic_utils.py
+ 
+ # (Les imports et la définition de ASTROPY_AVAILABLE_IN_UTILS, fits_module_for_utils restent les mêmes)
+ # ...
+ 
+ def load_and_validate_fits(filepath,
 diff --git a/zemosaic_worker.py b/zemosaic_worker.py
-index 8c81728db0544401c5ac2f19541248a86d7f666d..fd88dbda9b496056c8547df026449ebf24a5b5a6 100644
+index bb5ca5f5f0fb04a844f59405eb91e294a2d18118..e01898b52a11762dcec22566e444fc0b878c50e6 100644
 --- a/zemosaic_worker.py
 +++ b/zemosaic_worker.py
-@@ -8036,50 +8036,51 @@ def _run_shared_phase45_phase5_pipeline(
-                 match_bg=True,
-                 apply_crop=apply_crop_for_assembly,
-                 crop_percent=master_tile_crop_percent_config,
-                 use_gpu=effective_use_gpu,
-                 use_memmap=bool(coadd_use_memmap_config),
-                 memmap_dir=(coadd_memmap_dir_config or output_folder),
-                 cleanup_memmap=False,
-                 base_progress_phase5=base_progress_phase5,
-                 progress_weight_phase5=progress_weight_phase5,
-                 start_time_total_run=start_time_total,
-                 intertile_photometric_match=intertile_match_flag,
-                 intertile_preview_size=int(intertile_preview_size_config),
-                 intertile_overlap_min=float(intertile_overlap_min_config),
-                 intertile_sky_percentile=intertile_sky_percentile_tuple,
-                 intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
-                 intertile_global_recenter=bool(intertile_global_recenter_config),
-                 intertile_recenter_clip=intertile_recenter_clip_tuple,
-                 use_auto_intertile=bool(use_auto_intertile_config),
-                 collect_tile_data=collected_tiles_for_second_pass,
-                 global_anchor_shift=global_anchor_shift,
-                 phase45_enabled=phase45_active_flag,
-                 parallel_plan=parallel_plan_phase5,
-                 enable_tile_weighting=tile_weighting_enabled_flag,
-                 tile_weight_mode=tile_weight_mode,
-                 stats_callback=_emit_phase5_stats,
-+                existing_master_tiles_mode=bool(use_existing_master_tiles_mode),
-             )
-         except Exception as exc:
-             logger.exception("Reproject+Coadd assembly failed", exc_info=True)
-             final_mosaic_data_HWC = None
-         log_key_phase5_failed = "run_error_phase5_assembly_failed_reproject_coadd"
-         log_key_phase5_finished = "run_info_phase5_finished_reproject_coadd"
+@@ -157,50 +157,94 @@ except Exception:
+         import os
  
-     if final_mosaic_data_HWC is None:
-         pcb(
-             log_key_phase5_failed or "run_error_phase5_assembly_failed_unknown",
-             prog=base_progress_phase5 + progress_weight_phase5,
-             lvl="ERROR",
-         )
-         _emit_phase5_stats(0, tiles_total_phase5, force=True, stage="failed")
-         return master_tiles, None, None, None, None, base_progress_phase5 + progress_weight_phase5
+         parts = set(_normpath_parts(path))
+         dirs = set(excluded_dirs) if excluded_dirs else set()
+         return any(d in parts for d in (dirs or {"unaligned_by_zemosaic"}))
  
-     current_global_progress = base_progress_phase5 + progress_weight_phase5
+     get_runtime_temp_dir = _fallback_runtime_temp_dir
  
-     if USE_INCREMENTAL_ASSEMBLY:
-         def _load_tiles_for_two_pass_phase5():
-             return _load_master_tiles_for_two_pass(
-                 valid_master_tiles_for_assembly,
-                 apply_crop=apply_crop_for_assembly,
-                 crop_percent=master_tile_crop_percent_config,
-                 logger=logger,
-@@ -12745,50 +12746,51 @@ def assemble_final_mosaic_reproject_coadd(
-     cleanup_memmap: bool = True,
-     assembly_process_workers: int = 0,
-     re_solve_cropped_tiles: bool = False,
-     solver_settings: dict | None = None,
-     solver_instance=None,
-     use_gpu: bool = False,
-     base_progress_phase5: float | None = None,
-     progress_weight_phase5: float | None = None,
-     start_time_total_run: float | None = None,
-     intertile_photometric_match: bool = False,
-     intertile_preview_size: int = 512,
-     intertile_overlap_min: float = 0.05,
-     intertile_sky_percentile: tuple[float, float] | list[float] = (30.0, 70.0),
-     intertile_robust_clip_sigma: float = 2.5,
-     intertile_global_recenter: bool = True,
-     intertile_recenter_clip: tuple[float, float] | list[float] | None = (0.85, 1.18),
-     use_auto_intertile: bool = False,
-     collect_tile_data: list | None = None,
-     tile_affine_corrections: list[tuple[float, float]] | None = None,
-     global_anchor_shift: tuple[float, float] | None = None,
-     phase45_enabled: bool = False,
-     parallel_plan: ParallelPlan | None = None,
-     enable_tile_weighting: bool = False,
-     tile_weight_mode: str | None = None,
-     stats_callback: Callable[[int, int, bool], None] | None = None,
-+    existing_master_tiles_mode: bool = False,
- ):
-     """Assemble les master tiles en utilisant ``reproject_and_coadd``."""
-     _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
-         msg_key, prog, lvl, callback=progress_callback, **kwargs
-     )
  
-     _log_memory_usage(progress_callback, "Début assemble_final_mosaic_reproject_coadd")
-     _pcb(
-         f"ASM_REPROJ_COADD: Options de rognage - Appliquer: {apply_crop}, Pourcentage: {crop_percent if apply_crop else 'N/A'}",
-         lvl="DEBUG_DETAIL",
-     )
+ try:
+     from zemosaic_align_stack import _poststack_rgb_equalization
+ except Exception:
+     _poststack_rgb_equalization = None
  
-     explicit_workers = None
-     try:
-         if assembly_process_workers and int(assembly_process_workers) > 0:
-             explicit_workers = int(assembly_process_workers)
-             assembly_process_workers = explicit_workers
-     except Exception:
-         explicit_workers = None
  
-     start_time_phase = time.monotonic()
-     plan_rows_cpu_hint: int | None = None
-     plan_rows_gpu_hint: int | None = None
-     plan_chunk_cpu_hint: int | None = None
-     plan_chunk_gpu_hint: int | None = None
-@@ -13941,50 +13943,92 @@ def assemble_final_mosaic_reproject_coadd(
-         lvl="INFO",
-         shape=mosaic_data.shape if mosaic_data is not None else "N/A",
-     )
+ UNALIGNED_DIRNAME = "unaligned_by_zemosaic"
+ _UNALIGNED_LOCK = Lock()
  
-     if mosaic_data is not None:
-         if mosaic_data.ndim != 3:
-             raise ValueError(f"Expected final mosaic in HWC order, got {mosaic_data.shape}")
-         logger.debug("Mosaic shape (HWC): %s", mosaic_data.shape)
-         if isinstance(coverage, np.ndarray) and logger.isEnabledFor(logging.DEBUG):
-             mask = coverage > 0
-             if np.any(mask):
-                 stats = []
-                 for c in range(mosaic_data.shape[-1]):
-                     vals = mosaic_data[..., c][mask]
-                     if vals.size:
-                         stats.append((float(np.mean(vals)), float(np.std(vals))))
-                     else:
-                         stats.append((float("nan"), float("nan")))
-                 logger.debug(
-                     "Reproject overlap stats (mean/std per channel): %s",
-                     stats,
-                 )
+ ALPHA_OPACITY_THRESHOLD = 0.5  # Mask values >= threshold are treated as opaque
+ QUALITY_GATE_ALPHA_SOFT_THRESHOLD = 0.85  # Partially transparent pixels are ignored during quality gate
  
-     if isinstance(coverage, np.ndarray):
-         coverage = np.where(np.isfinite(coverage), coverage, 0.0).astype(np.float32, copy=False)
-+    if isinstance(coverage, np.ndarray) and existing_master_tiles_mode:
-+        try:
-+            cov_mask_bool = np.asarray(coverage, dtype=np.float32, order="C")
-+            cov_mask_bool = np.nan_to_num(cov_mask_bool, nan=0.0, posinf=0.0, neginf=0.0)
-+            cov_mask_bool = cov_mask_bool > 0.0
-+            alpha_target_shape = cov_mask_bool.shape
-+            override_message = None
-+            if alpha_final is None:
-+                alpha_final = np.ascontiguousarray(cov_mask_bool.astype(np.uint8) * 255)
-+                override_message = "alpha_final was None -> rebuilt"
-+            else:
-+                alpha_arr = np.asarray(alpha_final)
-+                if alpha_arr.ndim == 3 and alpha_arr.shape[-1] == 1:
-+                    alpha_arr = alpha_arr[..., 0]
-+                alpha_arr = np.squeeze(alpha_arr)
-+                if alpha_arr.shape != alpha_target_shape:
-+                    override_message = (
-+                        f"overriding alpha_final due to shape mismatch (alpha={alpha_arr.shape}, coverage={alpha_target_shape})"
-+                    )
-+                    alpha_final = np.ascontiguousarray(cov_mask_bool.astype(np.uint8) * 255)
-+                else:
-+                    alpha_zero = alpha_arr == 0
-+                    mismatch = int(np.count_nonzero(cov_mask_bool & alpha_zero))
-+                    if mismatch > 0:
-+                        total_cov = int(np.count_nonzero(cov_mask_bool))
-+                        pct = (100.0 * mismatch) / max(1, total_cov)
-+                        override_message = f"overriding alpha_final (mismatch={mismatch} px, {pct:.2f}% of covered)"
-+                        alpha_final = np.ascontiguousarray(cov_mask_bool.astype(np.uint8) * 255)
-+            if alpha_final is not None and alpha_final.shape == alpha_target_shape:
-+                mismatch_after = int(np.count_nonzero(cov_mask_bool & (np.asarray(alpha_final) == 0)))
-+                if mismatch_after != 0 and logger.isEnabledFor(logging.DEBUG):
-+                    logger.debug(
-+                        "alpha_from_coverage: mismatch_after=%d (existing_master_tiles_mode)",
-+                        mismatch_after,
-+                    )
-+            if override_message:
-+                logger.info(
-+                    "alpha_from_coverage (existing_master_tiles_mode): %s",
-+                    override_message,
+ GLOBAL_COVERAGE_SUMMARY_THRESHOLD_FRAC = 0.0025
+ GLOBAL_COVERAGE_SUMMARY_MIN_ABS = 1e-3
+ 
+ 
++def _auto_orient_alpha_mask(
++    alpha_mask_arr: np.ndarray,
++    data_arr: np.ndarray,
++    *,
++    logger_obj=None,
++    context_label: str = "existing_master_tiles",
++    flip_margin: float = 0.05,
++) -> tuple[np.ndarray, bool]:
++    """Detect inverted alpha masks and auto-flip when clearly beneficial."""
++
++    flipped = False
++    try:
++        alpha_arr = np.asarray(alpha_mask_arr, dtype=np.float32, order="C")
++        data = np.asarray(data_arr)
++        if data.ndim == 3:
++            nz2d = np.any((np.abs(data) > 1e-6) & np.isfinite(data), axis=-1)
++        else:
++            nz2d = (np.abs(data) > 1e-6) & np.isfinite(data)
++        nz_frac = float(np.mean(nz2d)) if nz2d.size else 0.0
++        valid_frac = float(np.mean(alpha_arr > ALPHA_OPACITY_THRESHOLD)) if alpha_arr.size else 0.0
++        inv_valid_frac = (
++            float(np.mean((1.0 - alpha_arr) > ALPHA_OPACITY_THRESHOLD)) if alpha_arr.size else 0.0
++        )
++        score = abs(valid_frac - nz_frac)
++        inv_score = abs(inv_valid_frac - nz_frac)
++        if inv_score + float(flip_margin) < score:
++            alpha_arr = 1.0 - alpha_arr
++            flipped = True
++            logger_target = logger_obj or logger
++            try:
++                logger_target.info(
++                    "[Alpha] %s: auto-inverted alpha mask valid_frac=%.3f inv_valid_frac=%.3f nz_frac=%.3f",
++                    context_label,
++                    valid_frac,
++                    inv_valid_frac,
++                    nz_frac,
 +                )
-+        except Exception as exc_alpha_cov:
-+            logger.debug("alpha_from_coverage: override skipped due to error: %s", exc_alpha_cov)
-     alpha_zero_mask = None
-     if isinstance(coverage, np.ndarray) and alpha_final is not None:
++            except Exception:
++                pass
++        return alpha_arr, flipped
++    except Exception:
++        return alpha_mask_arr, flipped
++
++
+ def _two_pass_tile_rgb_stats(arr: np.ndarray) -> dict:
+     """Computes RGB/mono stats for a single tile, ignoring non-finite values."""
+     stats = {
+         'valid_fraction': 0.0,
+         'min': [0.0, 0.0, 0.0],
+         'mean': [0.0, 0.0, 0.0],
+         'median': [0.0, 0.0, 0.0],
+     }
+     if arr is None or arr.size == 0:
+         return stats
+ 
+     if arr.ndim == 2:
+         arr = arr[..., np.newaxis]
+ 
+     if arr.ndim != 3:
+         return stats
+ 
+     num_channels = arr.shape[2]
+     if num_channels not in [1, 3]:
+         return stats
+ 
+     # Resize stats lists to match number of channels
+     stats['min'] = [0.0] * num_channels
+     stats['mean'] = [0.0] * num_channels
+     stats['median'] = [0.0] * num_channels
+@@ -6183,66 +6227,99 @@ def _compute_intertile_affine_corrections_from_sources(
+     logger_obj=None,
+     progress_callback: Callable | None = None,
+     intertile_global_recenter: bool = False,
+     intertile_recenter_clip: tuple[float, float] | list[float] | None = None,
+ ) -> tuple[list[tuple[float, float]] | None, bool, str, str | None]:
+     """Common implementation for intertile gain/offset computation.
+ 
+     Returns
+     -------
+     (list[(gain, offset)] | None, bool, str, str | None)
+         Sanitized affine list (or ``None``), flag indicating whether non-trivial
+         corrections were detected, status string (``\"ok\"``, ``\"skipped\"``,
+         ``\"preview_failed\"``, ``\"compute_failed\"``) and optional error message.
+     """
+ 
+     total_tiles = len(sources)
+     if total_tiles < 2:
+         return None, False, "skipped", None
+ 
+     if not (
+         ZEMOSAIC_UTILS_AVAILABLE
+         and hasattr(zemosaic_utils, "compute_intertile_affine_calibration")
+     ):
+         return None, False, "skipped", None
+ 
+-    tile_pairs: list[tuple[np.ndarray, Any]] = []
++    tile_pairs: list[tuple[np.ndarray, Any] | tuple[np.ndarray, Any, np.ndarray]] = []
+     preview_arrays: list[np.ndarray | None] = []
+ 
+     for idx, src in enumerate(sources, 1):
          try:
-             alpha_arr = np.asarray(alpha_final)
-             if alpha_arr.ndim == 3 and alpha_arr.shape[-1] == 1:
-                 alpha_arr = alpha_arr[..., 0]
-             alpha_arr = np.squeeze(alpha_arr)
-             if alpha_arr.ndim >= 2 and alpha_arr.shape[:2] == coverage.shape:
-                 alpha_zero_mask = alpha_arr <= 0
-                 if np.any(alpha_zero_mask):
-                     coverage = np.where(alpha_zero_mask, 0.0, coverage).astype(np.float32, copy=False)
-         except Exception:
-             alpha_zero_mask = None
-     if mosaic_data is not None and coverage is not None:
-         mosaic_data = np.asarray(mosaic_data, dtype=np.float32, copy=False)
-         mosaic_data[~np.isfinite(mosaic_data)] = np.nan
-         nanized_mask = coverage <= 0
-         if alpha_zero_mask is not None:
-             nanized_mask = np.logical_or(nanized_mask, alpha_zero_mask)
-         elif alpha_final is not None and alpha_final.shape[:2] == coverage.shape:
-             nanized_mask = np.logical_or(nanized_mask, alpha_final == 0)
-         nanized_pixels = int(np.count_nonzero(nanized_mask))
-         mosaic_data = _nanize_by_coverage(mosaic_data, coverage, alpha_u8=alpha_final)
-         if nanized_pixels > 0:
-             logger.info(
+             tile_arr: np.ndarray
++            mask2d_float: np.ndarray | None = None
++            alpha_mask_arr: np.ndarray | None = None
+             label = _safe_basename(src.path)
+             if src.data is not None:
+                 tile_arr = _ensure_hwc_master_tile(src.data, label)
+             else:
+                 if not src.path:
+                     raise ValueError("Tile data missing and no path provided.")
+                 with fits.open(src.path, memmap=False) as hdul:
+                     tile_arr = _ensure_hwc_master_tile(hdul[0].data, label)
++                    if "ALPHA" in hdul and hdul["ALPHA"].data is not None:
++                        try:
++                            alpha_mask_arr = np.asarray(hdul["ALPHA"].data)
++                        except Exception:
++                            alpha_mask_arr = None
+             tile_arr = np.asarray(tile_arr, dtype=np.float32, order="C")
+-            tile_pairs.append((tile_arr, src.wcs))
++            if alpha_mask_arr is not None:
++                alpha_mask_arr = np.squeeze(alpha_mask_arr)
++                if alpha_mask_arr.ndim == 3 and alpha_mask_arr.shape[0] == 1:
++                    alpha_mask_arr = alpha_mask_arr[0]
++                alpha_mask_arr = np.nan_to_num(alpha_mask_arr, nan=0.0, posinf=0.0, neginf=0.0)
++                max_alpha_val = float(np.nanmax(alpha_mask_arr)) if alpha_mask_arr.size else 0.0
++                if alpha_mask_arr.dtype.kind in {"i", "u"} and max_alpha_val > 1.0:
++                    alpha_mask_arr = alpha_mask_arr.astype(np.float32, copy=False) / 255.0
++                elif alpha_mask_arr.dtype.kind not in {"f"}:
++                    alpha_mask_arr = alpha_mask_arr.astype(np.float32, copy=False)
++                alpha_mask_arr = np.clip(alpha_mask_arr, 0.0, 1.0)
++                if alpha_mask_arr.shape != tile_arr.shape[:2]:
++                    alpha_mask_arr = None
++                else:
++                    alpha_mask_arr, _ = _auto_orient_alpha_mask(
++                        alpha_mask_arr,
++                        tile_arr,
++                        logger_obj=logger_obj or logger,
++                        context_label="existing_master_tiles_intertile",
++                    )
++                    valid2d = alpha_mask_arr > ALPHA_OPACITY_THRESHOLD
++                    mask2d_float = np.asarray(alpha_mask_arr, dtype=np.float32, order="C")
++                    if tile_arr.ndim == 3:
++                        tile_arr[~valid2d, :] = np.nan
++                    else:
++                        tile_arr[~valid2d] = np.nan
++            tile_pairs.append((tile_arr, src.wcs) if mask2d_float is None else (tile_arr, src.wcs, mask2d_float))
+             preview_entry = None
+             if intertile_global_recenter:
+                 try:
+                     preview_entry, _ = zemosaic_utils.create_downscaled_luminance_preview(
+                         tile_arr,
+                         src.wcs,
+                         preview_size,
+                     )
+                     if preview_entry is not None:
+                         preview_entry = np.asarray(preview_entry, dtype=np.float32)
+                 except Exception:
+                     preview_entry = None
+             preview_arrays.append(preview_entry)
+         except Exception as exc:
+             if logger_obj:
+                 logger_obj.warning(
+                     "Intertile data load failed for %s: %s",
+                     src.path or f"tile#{idx}",
+                     exc,
+                 )
+                 logger_obj.debug("Traceback (intertile data load):", exc_info=True)
+             tile_pairs.clear()
+             preview_arrays.clear()
+             return None, False, "preview_failed", str(exc)
+         finally:
+@@ -13054,50 +13131,57 @@ def assemble_final_mosaic_reproject_coadd(
+             if "ALPHA" in hdul and hdul["ALPHA"].data is not None:
+                 try:
+                     alpha_mask_arr = np.asarray(hdul["ALPHA"].data)
+                 except Exception:
+                     alpha_mask_arr = None
+ 
+         # Master tiles saved via ``save_fits_image`` use the ``HWC`` axis order
+         # which stores color images in ``C x H x W`` within the FITS file. When
+         # reading them back for final assembly we expect ``H x W x C``.
+         if data.ndim == 3 and data.shape[0] in (1, 3) and data.shape[-1] != data.shape[0]:
+             data = np.moveaxis(data, 0, -1)
+         if data.ndim == 2:
+             data = data[..., np.newaxis]
+ 
+         if alpha_mask_arr is not None:
+             alpha_mask_arr = np.squeeze(alpha_mask_arr)
+             if alpha_mask_arr.ndim == 3 and alpha_mask_arr.shape[0] == 1:
+                 alpha_mask_arr = alpha_mask_arr[0]
+             alpha_mask_arr = np.nan_to_num(alpha_mask_arr, nan=0.0, posinf=0.0, neginf=0.0)
+             max_alpha_val = float(np.nanmax(alpha_mask_arr)) if alpha_mask_arr.size else 0.0
+             if alpha_mask_arr.dtype.kind in {"i", "u"} and max_alpha_val > 1.0:
+                 alpha_mask_arr = alpha_mask_arr.astype(np.float32, copy=False) / 255.0
+             elif alpha_mask_arr.dtype.kind not in {"f"}:
+                 alpha_mask_arr = alpha_mask_arr.astype(np.float32, copy=False)
+             alpha_mask_arr = np.clip(alpha_mask_arr, 0.0, 1.0)
++            if existing_master_tiles_mode:
++                alpha_mask_arr, _ = _auto_orient_alpha_mask(
++                    alpha_mask_arr,
++                    data,
++                    logger_obj=logger,
++                    context_label="existing_master_tiles",
++                )
+ 
+         if (
+             apply_crop
+             and crop_percent > 1e-3
+             and ZEMOSAIC_UTILS_AVAILABLE
+             and hasattr(zemosaic_utils, "crop_image_and_wcs")
+         ):
+             try:
+                 original_hw = data.shape[:2]
+                 cropped, cropped_wcs = zemosaic_utils.crop_image_and_wcs(
+                     data,
+                     tile_wcs,
+                     crop_percent / 100.0,
+                     progress_callback=None,
+                 )
+                 if cropped is not None and cropped_wcs is not None:
+                     data = cropped
+                     tile_wcs = cropped_wcs
+                     if (
+                         alpha_mask_arr is not None
+                         and alpha_mask_arr.shape == original_hw
+                         and data.shape[:2] != original_hw
+                     ):
+                         dh = (original_hw[0] - data.shape[0]) // 2
+                         dw = (original_hw[1] - data.shape[1]) // 2

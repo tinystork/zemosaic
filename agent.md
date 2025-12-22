@@ -26,6 +26,12 @@ Fix the issue ONLY for the “existing master tiles” scenario by:
 - Keep existing default behaviors and performance characteristics as much as possible.
 - Add INFO/DEBUG logs to confirm inversion detection, but don’t spam.
 
+## Status
+- [x] A) Auto-fix inverted ALPHA when loading existing master tiles.
+- [x] B) Intertile ALPHA mask ingestion and NaN application for previews.
+- [x] C) Optional mask support inside compute_intertile_affine_calibration.
+- [x] D) Safety rails applied where overlap pixels are insufficient.
+
 ## Implementation Tasks
 
 ### A) zemosaic_worker.py — Auto-fix inverted ALPHA when loading existing master tiles
