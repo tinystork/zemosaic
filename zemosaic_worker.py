@@ -3588,6 +3588,7 @@ class _TileAffineSource:
     path: str | None
     wcs: Any
     data: np.ndarray | None = None
+    mask: np.ndarray | None = None
 
 
 def _apply_preview_quality_crop(
@@ -6271,7 +6272,35 @@ def _compute_intertile_affine_corrections_from_sources(
                         except Exception:
                             alpha_mask_arr = None
             tile_arr = np.asarray(tile_arr, dtype=np.float32, order="C")
-            if alpha_mask_arr is not None:
+            mask_source = getattr(src, "mask", None)
+            if mask_source is not None:
+                try:
+                    mask2d_float = np.asarray(mask_source, dtype=np.float32)
+                    if mask2d_float.ndim == 3:
+                        mask2d_float = mask2d_float[..., 0]
+                    if mask2d_float.shape != tile_arr.shape[:2]:
+                        mask2d_float = None
+                    else:
+                        mask2d_float = np.nan_to_num(
+                            mask2d_float, nan=0.0, posinf=0.0, neginf=0.0
+                        )
+                        max_mask_val = float(np.nanmax(mask2d_float)) if mask2d_float.size else 0.0
+                        if max_mask_val > 1.0:
+                            if mask2d_float.dtype.kind in {"i", "u"} and max_mask_val <= 255.0:
+                                mask2d_float = mask2d_float / 255.0
+                            elif max_mask_val > 0.0:
+                                mask2d_float = mask2d_float / max_mask_val
+                        mask2d_float = np.clip(mask2d_float, 0.0, 1.0)
+                        max_mask_val = float(np.nanmax(mask2d_float)) if mask2d_float.size else 0.0
+                        thresh = ALPHA_OPACITY_THRESHOLD if max_mask_val > ALPHA_OPACITY_THRESHOLD else 0.0
+                        valid2d = mask2d_float > thresh
+                        if tile_arr.ndim == 3:
+                            tile_arr[~valid2d, :] = np.nan
+                        else:
+                            tile_arr[~valid2d] = np.nan
+                except Exception:
+                    mask2d_float = None
+            if mask2d_float is None and alpha_mask_arr is not None:
                 alpha_mask_arr = np.squeeze(alpha_mask_arr)
                 if alpha_mask_arr.ndim == 3 and alpha_mask_arr.shape[0] == 1:
                     alpha_mask_arr = alpha_mask_arr[0]
@@ -13386,11 +13415,17 @@ def assemble_final_mosaic_reproject_coadd(
     ):
         tile_sources = []
         for entry in effective_tiles:
+            mask = None
+            if isinstance(entry, dict):
+                mask = entry.get("alpha_weight2d")
+                if mask is None:
+                    mask = entry.get("coverage_mask")
             tile_sources.append(
                 _TileAffineSource(
                     path=entry.get("path"),
                     wcs=entry.get("wcs"),
                     data=entry.get("data"),
+                    mask=mask,
                 )
             )
 
@@ -13475,6 +13510,7 @@ def assemble_final_mosaic_reproject_coadd(
         pending_affine_list = None
 
     if pending_affine_list and affine_by_id:
+        tile_affine_for_gpu = pending_affine_list
         _log_affine_photometric_summary(
             affine_by_id,
             logger_obj=logger,
@@ -13571,9 +13607,11 @@ def assemble_final_mosaic_reproject_coadd(
                 except Exception:
                     pass
                 nontrivial_affine = True
+                tile_affine_for_gpu = None
             else:
                 nontrivial_affine = False
                 pending_affine_list = None
+                tile_affine_for_gpu = None
         else:
             corrected_tiles = 0
             for tile_entry in effective_tiles:
@@ -13642,6 +13680,7 @@ def assemble_final_mosaic_reproject_coadd(
     else:
         nontrivial_affine = False
         pending_affine_list = None
+        tile_affine_for_gpu = None
 
     if collect_tile_data is not None:
         try:
@@ -13739,11 +13778,11 @@ def assemble_final_mosaic_reproject_coadd(
 
     # If we are going to use the GPU, pass the precomputed affine corrections down
     # so they are applied inside the GPU reprojection (parity with CPU path).
-    if use_gpu and pending_affine_list is not None:
-        reproj_kwargs["tile_affine_corrections"] = pending_affine_list
+    if use_gpu and tile_affine_for_gpu is not None:
+        reproj_kwargs["tile_affine_corrections"] = tile_affine_for_gpu
         try:
             _pcb(
-                f"ASM_REPROJ_COADD: Passing intertile affine corrections to GPU (n={len(pending_affine_list)})",
+                f"ASM_REPROJ_COADD: Passing intertile affine corrections to GPU (n={len(tile_affine_for_gpu)})",
                 lvl="DEBUG_DETAIL",
             )
         except Exception:
