@@ -1,20 +1,20 @@
 ## Checklist d’implémentation (Codex)
 
 ### 1) Preview noir : CPU
-- [ ] Dans `zemosaic_utils.py / stretch_auto_asifits_like()`, remplacer `np.percentile` par une logique NaN-aware (nanpercentile + garde-fous).
-- [ ] Vérifier qu’aucun gros temporaire float64 n’est introduit (rester en float32).
-- [ ] Vérifier le comportement si le canal est 100% NaN → sortie canal = 0 (pas d’exception).
+- [x] Dans `zemosaic_utils.py / stretch_auto_asifits_like()`, remplacer `np.percentile` par une logique NaN-aware (nanpercentile + garde-fous).
+- [x] Vérifier qu’aucun gros temporaire float64 n’est introduit (rester en float32).
+- [x] Vérifier le comportement si le canal est 100% NaN → sortie canal = 0 (pas d’exception).
 
 ### 2) Preview noir : GPU
-- [ ] Dans `zemosaic_utils.py / stretch_auto_asifits_like_gpu()`, remplacer `cp.percentile` par `cp.nanpercentile` (si dispo) ou fallback sur valeurs finies.
-- [ ] Ajouter garde-fous (canal vide / vmin-vmax trop faible) → sortie canal = 0.
-- [ ] Ne pas modifier la logique de fallback CPU existante.
+- [x] Dans `zemosaic_utils.py / stretch_auto_asifits_like_gpu()`, remplacer `cp.percentile` par `cp.nanpercentile` (si dispo) ou fallback sur valeurs finies.
+- [x] Ajouter garde-fous (canal vide / vmin-vmax trop faible) → sortie canal = 0.
+- [x] Ne pas modifier la logique de fallback CPU existante.
 
 ### 3) Pondération perdue : keywords
-- [ ] Dans `zemosaic_worker.py`, dans `assemble_final_mosaic_reproject_coadd()` → `_extract_tile_weight()` :
-  - [ ] ajouter `NRAWPROC`, `NRAWINIT` à la liste des keywords.
-- [ ] Ne PAS modifier la construction de `input_weights_list` (éviter double pondération).
-- [ ] Ne PAS toucher au mode “I'm using master tiles (skip clustering_master tile creation)”.
+- [x] Dans `zemosaic_worker.py`, dans `assemble_final_mosaic_reproject_coadd()` → `_extract_tile_weight()` :
+  - [x] ajouter `NRAWPROC`, `NRAWINIT` à la liste des keywords.
+- [x] Ne PAS modifier la construction de `input_weights_list` (éviter double pondération).
+- [x] Ne PAS toucher au mode “I'm using master tiles (skip clustering_master tile creation)”.
 
 ---
 
