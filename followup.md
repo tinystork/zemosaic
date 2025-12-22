@@ -1,5 +1,9 @@
 # Follow-up — Validation & Repro steps
 
+## Progress
+- [x] Code changes for ALPHA handling and intertile masking implemented.
+- [ ] Validation on the repro dataset (with updated logging checks).
+
 ## Build / Run
 1) Use the same dataset / master tiles that currently reproduce the issue.
 2) Run ZeMosaic with:

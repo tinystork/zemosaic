@@ -2084,7 +2084,12 @@ def compute_intertile_affine_calibration(
     logger=None,
     progress_callback=None,
 ):
-    """Calcule des corrections affine (gain/offset) inter-tuiles avant reprojection."""
+    """Calcule des corrections affine (gain/offset) inter-tuiles avant reprojection.
+
+    ``tile_data_with_wcs`` peut contenir des tuples ``(data, wcs)`` ou
+    ``(data, wcs, mask2d)`` pour injecter un masque (0..1) optionnel sur la zone
+    d'overlap.
+    """
 
     if tile_data_with_wcs is None or len(tile_data_with_wcs) < 2:
         return {}
@@ -2093,6 +2098,18 @@ def compute_intertile_affine_calibration(
     try:
         header_full = final_output_wcs.to_header()
     except Exception:
+        return {}
+
+    parsed_entries: list[tuple[np.ndarray, Any, np.ndarray | None]] = []
+    for entry in tile_data_with_wcs:
+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+            continue
+        data = entry[0]
+        wcs_obj = entry[1]
+        mask = entry[2] if len(entry) >= 3 else None
+        parsed_entries.append((data, wcs_obj, mask))
+
+    if len(parsed_entries) < 2:
         return {}
 
     try:
@@ -2111,20 +2128,33 @@ def compute_intertile_affine_calibration(
     except Exception:
         sky_low, sky_high = 30.0, 70.0
 
-    wcs_list = [wcs for _data, wcs in tile_data_with_wcs]
+    wcs_list = [wcs for _data, wcs, _mask in parsed_entries]
     shapes_hw = []
     luminance_tiles = []
-    for data, _wcs in tile_data_with_wcs:
+    mask_tiles: list[np.ndarray | None] = []
+    for data, _wcs, mask in parsed_entries:
         arr = np.asarray(data)
         if arr.ndim == 3 and arr.shape[-1] == 0:
             luminance_tiles.append(None)
             shapes_hw.append((0, 0))
+            mask_tiles.append(None)
             continue
         luminance = _extract_luminance_plane(arr)
         luminance_tiles.append(luminance)
         shapes_hw.append((luminance.shape[0], luminance.shape[1]))
+        mask_arr = None
+        if mask is not None:
+            try:
+                mask_arr = np.asarray(mask, dtype=np.float32)
+                if mask_arr.ndim == 3:
+                    mask_arr = mask_arr[..., 0]
+                if mask_arr.shape != luminance.shape[:2]:
+                    mask_arr = None
+            except Exception:
+                mask_arr = None
+        mask_tiles.append(mask_arr)
 
-    num_tiles = len(tile_data_with_wcs)
+    num_tiles = len(parsed_entries)
 
     try:
         preview_size = int(preview_size)
@@ -2247,7 +2277,7 @@ def compute_intertile_affine_calibration(
                 use_gpu = False
 
             medians = []
-            for data, _ in tile_data_with_wcs:
+            for data, _wcs_obj, _mask in parsed_entries:
                 if data is None:
                     continue
                 arr = xp.asarray(data, dtype=xp.float32)
@@ -2266,7 +2296,7 @@ def compute_intertile_affine_calibration(
             )
 
             new_tile_data = []
-            for data, wcs_obj in tile_data_with_wcs:
+            for data, wcs_obj, mask in parsed_entries:
                 if data is None:
                     new_tile_data.append((data, wcs_obj))
                     continue
@@ -2276,7 +2306,7 @@ def compute_intertile_affine_calibration(
                 scaled = arr * scale
                 if use_gpu and cp is not None:
                     scaled = cp.asnumpy(scaled)  # type: ignore
-                new_tile_data.append((scaled, wcs_obj))
+                new_tile_data.append((scaled, wcs_obj, mask) if mask is not None else (scaled, wcs_obj))
             tile_data_with_wcs[:] = new_tile_data
 
             _log_intertile("Applied global normalization to all master tiles.", level="INFO")
@@ -2298,7 +2328,7 @@ def compute_intertile_affine_calibration(
         return {}
 
     pair_entries = []
-    connectivity = np.zeros(len(tile_data_with_wcs), dtype=np.float64)
+    connectivity = np.zeros(num_tiles, dtype=np.float64)
     preview_size = max(128, int(preview_size))
 
     for idx, overlap in enumerate(overlaps, 1):
@@ -2335,6 +2365,22 @@ def compute_intertile_affine_calibration(
             continue
         arr_i = np.asarray(reproj_i, dtype=np.float32)
         arr_j = np.asarray(reproj_j, dtype=np.float32)
+        mask_i_reproj = None
+        mask_j_reproj = None
+        if mask_tiles[i] is not None:
+            try:
+                mask_i_reproj, _ = reproject_interp(
+                    (mask_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
+                )
+            except Exception:
+                mask_i_reproj = None
+        if mask_tiles[j] is not None:
+            try:
+                mask_j_reproj, _ = reproject_interp(
+                    (mask_tiles[j], wcs_list[j]), target_wcs, shape_out=(sub_h, sub_w)
+                )
+            except Exception:
+                mask_j_reproj = None
         if arr_i.size == 0 or arr_j.size == 0:
             continue
         max_dim = max(arr_i.shape[0], arr_i.shape[1])
@@ -2344,7 +2390,32 @@ def compute_intertile_affine_calibration(
             new_h = max(8, int(round(arr_i.shape[0] * scale)))
             arr_i = cv2.resize(arr_i, (new_w, new_h), interpolation=cv2.INTER_AREA)
             arr_j = cv2.resize(arr_j, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            if mask_i_reproj is not None:
+                mask_i_reproj = cv2.resize(mask_i_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            if mask_j_reproj is not None:
+                mask_j_reproj = cv2.resize(mask_j_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+        def _mask_valid_pixels(mask_arr: np.ndarray | None) -> np.ndarray | None:
+            if mask_arr is None:
+                return None
+            mask_arr = np.asarray(mask_arr, dtype=np.float32)
+            if mask_arr.size == 0:
+                return None
+            finite_mask = np.isfinite(mask_arr)
+            try:
+                max_val = float(np.nanmax(mask_arr))
+            except Exception:
+                max_val = 0.0
+            threshold = 0.5 if max_val > 0.5 else 0.0
+            return finite_mask & (mask_arr > threshold)
+
         valid = np.isfinite(arr_i) & np.isfinite(arr_j)
+        mask_i_valid = _mask_valid_pixels(mask_i_reproj)
+        mask_j_valid = _mask_valid_pixels(mask_j_reproj)
+        if mask_i_valid is not None:
+            valid &= mask_i_valid
+        if mask_j_valid is not None:
+            valid &= mask_j_valid
         if not np.any(valid):
             continue
         sample_i = arr_i[valid]
@@ -2396,7 +2467,7 @@ def compute_intertile_affine_calibration(
         return {}
 
     anchor = int(np.argmax(connectivity)) if np.any(connectivity > 0) else 0
-    solution = solve_global_affine(len(tile_data_with_wcs), pair_entries, anchor_index=anchor)
+    solution = solve_global_affine(num_tiles, pair_entries, anchor_index=anchor)
     if progress_callback:
         try:
             progress_callback(
