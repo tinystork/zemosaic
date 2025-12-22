@@ -1,733 +1,285 @@
 diff --git a/agent.md b/agent.md
-index 85b7a7d019234a66681ea32ecca26e8ea9c2b1d8..26841f7d4581cedebd3206bc4a36b889985efb74 100644
+index 3ec4699b4dc29f8f5cd34c892c93ce1f2b49b595..f6d27d42ea9a9e6cb478d9337b1783032fe6a4c5 100644
 --- a/agent.md
 +++ b/agent.md
-@@ -4,50 +4,56 @@
- When running with:
- - GUI option: “I'm using master tiles (skip clustering_master tile creation)”
- - inter-tile photometric match enabled (match_background / intertile)
+@@ -1,29 +1,29 @@
+ # Agent Task — Best-effort inter-tile photometric anchoring (existing master tiles)
  
- The final mosaic shows a huge flat black/purple rectangle even though coverage indicates tiles overlap.
+ ## Status
+-- [ ] Implement best-effort inter-tile photometric anchoring when using existing master tiles
++- [x] Implement best-effort inter-tile photometric anchoring when using existing master tiles
+ - [x] Add Qt GUI tooltip informing users about photometry limitations with existing master tiles
  
- Log hints:
- - intertile affine gains can be absurdly small (e.g. ~3e-5) -> suggests the affine fit is polluted by masked pixels stored as finite zeros.
- - In existing-master-tiles mode, ALPHA extension is used to create weights and/or to zero masked pixels. If ALPHA semantics are inverted (0=valid, 1=invalid), weights become inverted and large regions become constant/flat in the final mosaic.
+ ## Context
+ When the user enables **"I'm using master tiles (skip clustering_master tile creation)"**, ZeMosaic receives
+ pre-built master tiles that already embed photometric decisions (stacking, cropping, masking).
+ High-quality global photometric normalization is no longer possible.
  
- ## Goal (Option B)
- Fix the issue ONLY for the “existing master tiles” scenario by:
- 1) Auto-detecting inverted ALPHA masks when loading master tiles, and invert them if needed.
- 2) Ensuring intertile photometric calibration ignores masked pixels:
-    - Apply ALPHA mask by setting invalid pixels to NaN for preview/affine input.
-    - Extend compute_intertile_affine_calibration to accept optional per-tile masks and use them when sampling overlap.
+ The goal of this task is to implement a **best-effort inter-tile photometric anchoring**
+ that improves visual consistency **without pretending to recover lost information**.
  
- ## Constraints
- - NO refactor, minimal surgical changes.
- - Touch only:
-   - zemosaic_worker.py
-   - zemosaic_utils.py
- - Keep existing default behaviors and performance characteristics as much as possible.
- - Add INFO/DEBUG logs to confirm inversion detection, but don’t spam.
+ This must be:
+ - robust
+ - deterministic
+ - simple
+ - non-invasive
+ - explicitly limited in scope
  
-+## Status
-+- [x] A) Auto-fix inverted ALPHA when loading existing master tiles.
-+- [x] B) Intertile ALPHA mask ingestion and NaN application for previews.
-+- [x] C) Optional mask support inside compute_intertile_affine_calibration.
-+- [x] D) Safety rails applied where overlap pixels are insufficient.
-+
- ## Implementation Tasks
+ ## Scope (STRICT)
+ - Only applies when `use_existing_master_tiles == True`
+ - Only affects the **inter-tile normalization phase**
+ - No refactor
+ - No change to default behavior when master tiles are internally generated
  
- ### A) zemosaic_worker.py — Auto-fix inverted ALPHA when loading existing master tiles
- Where master tiles are loaded and alpha_weight2d is built (existing_master_tiles_mode path):
- - After normalizing alpha to float32 [0..1] but BEFORE building valid2d:
-   - Compute `nz2d` from tile data (any channel abs>eps and finite).
-   - Compute:
-     - valid_frac = mean(alpha > ALPHA_OPACITY_THRESHOLD)
-     - inv_valid_frac = mean((1-alpha) > ALPHA_OPACITY_THRESHOLD)
-     - nz_frac = mean(nz2d)
-   - Choose orientation (alpha or 1-alpha) whose valid_frac is closest to nz_frac.
-   - Only flip if it’s clearly better (e.g. inv_score + margin < score).
- - Log a single INFO line when a flip occurs:
-   - “[Alpha] existing_master_tiles: auto-inverted alpha mask …”
+ ## Technical Approach
  
- Make sure:
- - alpha_mask_arr used to create alpha_weight2d / coverage_mask_entry uses the corrected orientation.
- - valid2d uses corrected alpha.
- 
- ### B) zemosaic_worker.py — Intertile: load/apply ALPHA as NaN for previews + pass mask to utils
- In `_compute_intertile_affine_corrections_from_sources`:
- - When loading from FITS path:
-   - Also try to read an ALPHA extension if present (name “ALPHA”).
-   - Normalize to float [0..1] like elsewhere.
-   - Apply the same auto-inversion heuristic (using nz2d of tile_arr) if needed.
-diff --git a/followup.md b/followup.md
-index dde6d40957753d66daba726fb21a138b7987e5cd..69825adaa3f25d0d99de6178993c6ab86def050b 100644
---- a/followup.md
-+++ b/followup.md
-@@ -1,27 +1,31 @@
- # Follow-up — Validation & Repro steps
- 
-+## Progress
-+- [x] Code changes for ALPHA handling and intertile masking implemented.
-+- [ ] Validation on the repro dataset (with updated logging checks).
-+
- ## Build / Run
- 1) Use the same dataset / master tiles that currently reproduce the issue.
- 2) Run ZeMosaic with:
-    - “I'm using master tiles (skip clustering_master tile creation)” ON
-    - inter-tile photometric match ON (match_background / intertile enabled)
-    - quality crop OFF (as in repro)
- 
- ## What to check in logs
- ### A) Alpha inversion detection
- If the ALPHA extension was inverted, you should see an INFO line similar to:
- - “[Alpha] existing_master_tiles: auto-inverted alpha mask … valid_frac=… inv_valid_frac=… nz_frac=…”
- 
- If no line appears, it means the heuristic decided the ALPHA is already consistent.
- 
- ### B) Intertile gains sanity
- In the intertile summary and apply logs:
- - Gains should not be near 0 (no more 1e-5).
- - Gains should typically cluster around 1.0 and respect the configured clip behavior.
- 
- ## Visual checks
- - The final mosaic must not have the large flat black/purple rectangle.
- - The overlap zones should show real sky signal (stars/background), not constant fill.
- 
- ## Quick sanity script (optional manual check)
- Open one problematic master_tile FITS and compare:
-diff --git a/zemosaic_utils.py b/zemosaic_utils.py
-index 42dfc17ea7f83cddda33f355bcc05f832849517a..4f1282d5262e3e05f88bd4f6f53b96c63f8f858d 100644
---- a/zemosaic_utils.py
-+++ b/zemosaic_utils.py
-@@ -2062,91 +2062,121 @@ def solve_global_affine(num_tiles: int, pair_entries, anchor_index: int = 0):
-     offsets = sol[num_tiles:]
-     result = {}
-     for idx in range(num_tiles):
-         g = float(gains[idx])
-         o = float(offsets[idx])
-         if not np.isfinite(g) or abs(g) < 1e-6:
-             g = 1.0
-         if not np.isfinite(o):
-             o = 0.0
-         result[idx] = (g, o)
-     return result
- 
- 
- def compute_intertile_affine_calibration(
-     tile_data_with_wcs,
-     final_output_wcs,
-     final_output_shape_hw,
-     preview_size: int = 512,
-     min_overlap_fraction: float = 0.05,
-     sky_percentile: tuple[float, float] | list[float] = (30.0, 70.0),
-     robust_clip_sigma: float = 2.5,
-     use_auto_intertile: bool = False,
-     logger=None,
-     progress_callback=None,
- ):
--    """Calcule des corrections affine (gain/offset) inter-tuiles avant reprojection."""
-+    """Calcule des corrections affine (gain/offset) inter-tuiles avant reprojection.
-+
-+    ``tile_data_with_wcs`` peut contenir des tuples ``(data, wcs)`` ou
-+    ``(data, wcs, mask2d)`` pour injecter un masque (0..1) optionnel sur la zone
-+    d'overlap.
-+    """
- 
-     if tile_data_with_wcs is None or len(tile_data_with_wcs) < 2:
-         return {}
-     if reproject_interp is None or not ASTROPY_AVAILABLE_IN_UTILS:
-         return {}
-     try:
-         header_full = final_output_wcs.to_header()
-     except Exception:
-         return {}
- 
-+    parsed_entries: list[tuple[np.ndarray, Any, np.ndarray | None]] = []
-+    for entry in tile_data_with_wcs:
-+        if not isinstance(entry, (list, tuple)) or len(entry) < 2:
-+            continue
-+        data = entry[0]
-+        wcs_obj = entry[1]
-+        mask = entry[2] if len(entry) >= 3 else None
-+        parsed_entries.append((data, wcs_obj, mask))
-+
-+    if len(parsed_entries) < 2:
-+        return {}
-+
-     try:
-         h_full = int(final_output_shape_hw[0])
-         w_full = int(final_output_shape_hw[1])
-     except Exception:
-         h_full = w_full = 0
- 
-     sky_low, sky_high = 30.0, 70.0
-     try:
-         if isinstance(sky_percentile, (list, tuple)) and len(sky_percentile) >= 2:
-             sky_low = float(sky_percentile[0])
-             sky_high = float(sky_percentile[1])
-             if sky_low > sky_high:
-                 sky_low, sky_high = sky_high, sky_low
-     except Exception:
-         sky_low, sky_high = 30.0, 70.0
- 
--    wcs_list = [wcs for _data, wcs in tile_data_with_wcs]
-+    wcs_list = [wcs for _data, wcs, _mask in parsed_entries]
-     shapes_hw = []
-     luminance_tiles = []
--    for data, _wcs in tile_data_with_wcs:
-+    mask_tiles: list[np.ndarray | None] = []
-+    for data, _wcs, mask in parsed_entries:
-         arr = np.asarray(data)
-         if arr.ndim == 3 and arr.shape[-1] == 0:
-             luminance_tiles.append(None)
-             shapes_hw.append((0, 0))
-+            mask_tiles.append(None)
-             continue
-         luminance = _extract_luminance_plane(arr)
-         luminance_tiles.append(luminance)
-         shapes_hw.append((luminance.shape[0], luminance.shape[1]))
-+        mask_arr = None
-+        if mask is not None:
-+            try:
-+                mask_arr = np.asarray(mask, dtype=np.float32)
-+                if mask_arr.ndim == 3:
-+                    mask_arr = mask_arr[..., 0]
-+                if mask_arr.shape != luminance.shape[:2]:
-+                    mask_arr = None
-+            except Exception:
-+                mask_arr = None
-+        mask_tiles.append(mask_arr)
- 
--    num_tiles = len(tile_data_with_wcs)
-+    num_tiles = len(parsed_entries)
- 
-     try:
-         preview_size = int(preview_size)
-     except Exception:
-         preview_size = 512
-     preview_size = max(128, preview_size)
- 
-     try:
-         min_overlap_fraction = float(min_overlap_fraction)
-     except Exception:
-         min_overlap_fraction = 0.05
-     if not math.isfinite(min_overlap_fraction):
-         min_overlap_fraction = 0.05
-     if min_overlap_fraction < 0:
-         min_overlap_fraction = 0.0
- 
-     def _log_intertile(message: str, level: str = "INFO") -> None:
-         prefixed = message if message.startswith("[Intertile]") else f"[Intertile] {message}"
-         level_upper = str(level).upper()
-         if logger is not None:
-             try:
-                 if level_upper in {"WARN", "WARNING"}:
-                     logger.warning(prefixed)
-                 elif level_upper in {"ERROR", "CRITICAL"}:
-                     logger.error(prefixed)
-@@ -2225,148 +2255,189 @@ def compute_intertile_affine_calibration(
-     if not overlaps:
-         _log_intertile(
-             "No overlap pairs found after retries — applying GLOBAL fallback (median normalization).",
-             level="WARN",
-         )
-         try:
-             use_gpu = False
-             xp = np
-             cp = None
-             try:
-                 import cupy as _cp  # type: ignore
- 
-                 if gpu_is_available():
-                     xp = _cp
-                     cp = _cp
-                     use_gpu = True
-                     _log_intertile(
-                         "CuPy GPU detected — normalization on GPU.",
-                         level="INFO_DETAIL",
-                     )
-             except Exception:
-                 xp = np
-                 use_gpu = False
- 
-             medians = []
--            for data, _ in tile_data_with_wcs:
-+            for data, _wcs_obj, _mask in parsed_entries:
-                 if data is None:
-                     continue
-                 arr = xp.asarray(data, dtype=xp.float32)
-                 med = float(xp.median(arr).get() if use_gpu else np.median(arr))
-                 if np.isfinite(med) and med > 0:
-                     medians.append(med)
- 
-             if not medians:
-                 _log_intertile("No valid medians found for normalization.", level="WARN")
-                 return {}
- 
-             global_median = float(np.median(medians))
-             _log_intertile(
-                 f"Global normalization median reference = {global_median:.4f}",
-                 level="INFO_DETAIL",
-             )
- 
-             new_tile_data = []
--            for data, wcs_obj in tile_data_with_wcs:
-+            for data, wcs_obj, mask in parsed_entries:
-                 if data is None:
-                     new_tile_data.append((data, wcs_obj))
-                     continue
-                 arr = xp.asarray(data, dtype=xp.float32)
-                 med = float(xp.median(arr).get() if use_gpu else np.median(arr))
-                 scale = (global_median / med) if med and np.isfinite(med) and med != 0 else 1.0
-                 scaled = arr * scale
-                 if use_gpu and cp is not None:
-                     scaled = cp.asnumpy(scaled)  # type: ignore
--                new_tile_data.append((scaled, wcs_obj))
-+                new_tile_data.append((scaled, wcs_obj, mask) if mask is not None else (scaled, wcs_obj))
-             tile_data_with_wcs[:] = new_tile_data
- 
-             _log_intertile("Applied global normalization to all master tiles.", level="INFO")
- 
-         except Exception as e_norm:
-             _log_intertile(f"Global normalization fallback failed: {e_norm}", level="ERROR")
- 
-         return {}
- 
-     min_overlap_fraction = effective_min_overlap
-     _log_intertile(
-         f"Using: preview={preview_size}, min_overlap={effective_min_overlap:.4f}, sky=({sky_low:.1f},{sky_high:.1f}), clip={robust_clip_sigma:.2f}, pairs={len(overlaps)}",
-         level="INFO",
-     )
- 
-     try:
-         from astropy.wcs import WCS as _WCS
-     except Exception:
-         return {}
- 
-     pair_entries = []
--    connectivity = np.zeros(len(tile_data_with_wcs), dtype=np.float64)
-+    connectivity = np.zeros(num_tiles, dtype=np.float64)
-     preview_size = max(128, int(preview_size))
- 
-     for idx, overlap in enumerate(overlaps, 1):
-         i = overlap["i"]
-         j = overlap["j"]
-         bbox = overlap["bbox"]
-         weight = float(overlap.get("weight", 1.0))
-         if luminance_tiles[i] is None or luminance_tiles[j] is None:
-             continue
-         x0, x1, y0, y1 = bbox
-         sub_w = max(1, x1 - x0)
-         sub_h = max(1, y1 - y0)
-         header = header_full.copy()
-         header["NAXIS1"] = sub_w
-         header["NAXIS2"] = sub_h
-         if "CRPIX1" in header:
-             header["CRPIX1"] = float(header["CRPIX1"]) - x0
-         if "CRPIX2" in header:
-             header["CRPIX2"] = float(header["CRPIX2"]) - y0
-         try:
-             target_wcs = _WCS(header)
-         except Exception:
-             continue
-         try:
-             reproj_i, _ = reproject_interp(
-                 (luminance_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
-             )
-             reproj_j, _ = reproject_interp(
-                 (luminance_tiles[j], wcs_list[j]), target_wcs, shape_out=(sub_h, sub_w)
-             )
-         except Exception:
-             continue
-         if reproj_i is None or reproj_j is None:
-             continue
-         arr_i = np.asarray(reproj_i, dtype=np.float32)
-         arr_j = np.asarray(reproj_j, dtype=np.float32)
-+        mask_i_reproj = None
-+        mask_j_reproj = None
-+        if mask_tiles[i] is not None:
-+            try:
-+                mask_i_reproj, _ = reproject_interp(
-+                    (mask_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
-+                )
-+            except Exception:
-+                mask_i_reproj = None
-+        if mask_tiles[j] is not None:
-+            try:
-+                mask_j_reproj, _ = reproject_interp(
-+                    (mask_tiles[j], wcs_list[j]), target_wcs, shape_out=(sub_h, sub_w)
-+                )
-+            except Exception:
-+                mask_j_reproj = None
-         if arr_i.size == 0 or arr_j.size == 0:
-             continue
-         max_dim = max(arr_i.shape[0], arr_i.shape[1])
-         if max_dim > preview_size:
-             scale = preview_size / max_dim
-             new_w = max(8, int(round(arr_i.shape[1] * scale)))
-             new_h = max(8, int(round(arr_i.shape[0] * scale)))
-             arr_i = cv2.resize(arr_i, (new_w, new_h), interpolation=cv2.INTER_AREA)
-             arr_j = cv2.resize(arr_j, (new_w, new_h), interpolation=cv2.INTER_AREA)
-+            if mask_i_reproj is not None:
-+                mask_i_reproj = cv2.resize(mask_i_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
-+            if mask_j_reproj is not None:
-+                mask_j_reproj = cv2.resize(mask_j_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
-+
-+        def _mask_valid_pixels(mask_arr: np.ndarray | None) -> np.ndarray | None:
-+            if mask_arr is None:
-+                return None
-+            mask_arr = np.asarray(mask_arr, dtype=np.float32)
-+            if mask_arr.size == 0:
-+                return None
-+            finite_mask = np.isfinite(mask_arr)
-+            try:
-+                max_val = float(np.nanmax(mask_arr))
-+            except Exception:
-+                max_val = 0.0
-+            threshold = 0.5 if max_val > 0.5 else 0.0
-+            return finite_mask & (mask_arr > threshold)
-+
-         valid = np.isfinite(arr_i) & np.isfinite(arr_j)
-+        mask_i_valid = _mask_valid_pixels(mask_i_reproj)
-+        mask_j_valid = _mask_valid_pixels(mask_j_reproj)
-+        if mask_i_valid is not None:
-+            valid &= mask_i_valid
-+        if mask_j_valid is not None:
-+            valid &= mask_j_valid
-         if not np.any(valid):
-             continue
-         sample_i = arr_i[valid]
-         sample_j = arr_j[valid]
-         if sample_i.size < 64:
-             continue
-         sky_proxy = 0.5 * (sample_i + sample_j)
-         try:
-             p_low = np.percentile(sky_proxy, sky_low)
-             p_high = np.percentile(sky_proxy, sky_high)
-         except Exception:
-             p_low = np.nanmin(sky_proxy)
-             p_high = np.nanmax(sky_proxy)
-         if not np.isfinite(p_low) or not np.isfinite(p_high):
-             continue
-         if p_high <= p_low:
-             p_low = np.nanmin(sky_proxy)
-             p_high = np.nanmax(sky_proxy)
-         mask = (sky_proxy >= p_low) & (sky_proxy <= p_high)
-         if mask.sum() < 32:
-             mask = np.ones_like(sky_proxy, dtype=bool)
-         x_samples = sample_i[mask]
-         y_samples = sample_j[mask]
-         fit = robust_affine_fit(x_samples, y_samples, clip_sigma=robust_clip_sigma)
-         if fit is None:
-@@ -2374,51 +2445,51 @@ def compute_intertile_affine_calibration(
-         a_ij, b_ij = fit
-         pair_entries.append((i, j, a_ij, b_ij, weight))
- 
-         a_ij, b_ij = fit
-         pair_entries.append((i, j, a_ij, b_ij, weight))
-         connectivity[i] += weight
-         connectivity[j] += weight
- 
-         # [ETA] Tick fin de traitement de la paire idx
-         if progress_callback:
-             try:
-                 progress_callback("phase5_intertile_pairs", int(idx), int(len(overlaps)))
-             except Exception:
-                 pass
- 
-         if progress_callback and idx % 5 == 0:
-             try:
-                 progress_callback("phase5_intertile", idx, len(overlaps))
-             except Exception:
-                 pass
- 
-     if not pair_entries:
-         return {}
- 
-     anchor = int(np.argmax(connectivity)) if np.any(connectivity > 0) else 0
--    solution = solve_global_affine(len(tile_data_with_wcs), pair_entries, anchor_index=anchor)
-+    solution = solve_global_affine(num_tiles, pair_entries, anchor_index=anchor)
-     if progress_callback:
-         try:
-             progress_callback(
-                 "Ensuring match_background=True for final coadd.",
-                 None,
-                 "DEBUG_DETAIL",
-             )
-         except Exception:
-             pass
- 
-     return solution
- # Les filtres VerifyWarning sont maintenant dans le try/except d'Astropy ci-dessus.
- 
- 
- 
- 
- 
- 
- 
- # DANS zemosaic_utils.py
- 
- # (Les imports et la définition de ASTROPY_AVAILABLE_IN_UTILS, fits_module_for_utils restent les mêmes)
- # ...
- 
- def load_and_validate_fits(filepath,
 diff --git a/zemosaic_worker.py b/zemosaic_worker.py
-index bb5ca5f5f0fb04a844f59405eb91e294a2d18118..e01898b52a11762dcec22566e444fc0b878c50e6 100644
+index 323ad325fd7f0eabe8f2df2e4815b03a7e924831..fe06e38fc6ba346638f29a36ae682cf166df3e6a 100644
 --- a/zemosaic_worker.py
 +++ b/zemosaic_worker.py
-@@ -157,50 +157,94 @@ except Exception:
-         import os
+@@ -13380,50 +13380,245 @@ def assemble_final_mosaic_reproject_coadd(
+     )
+     if alpha_weights_present and use_gpu:
+         try:
+             _pcb(
+                 "[Alpha] Per-pixel alpha weights detected; GPU coadd will apply alpha masks",
+                 prog=None,
+                 lvl="INFO_DETAIL",
+             )
+         except Exception:
+             logger.info("[Alpha] Per-pixel alpha weights detected; GPU coadd will apply alpha masks")
  
-         parts = set(_normpath_parts(path))
-         dirs = set(excluded_dirs) if excluded_dirs else set()
-         return any(d in parts for d in (dirs or {"unaligned_by_zemosaic"}))
+     if existing_master_tiles_mode and nonfinite_repaired_total > 0:
+         logger.info(
+             "existing_master_tiles_mode: replaced %d non-finite pixels across %d master tiles before reproject",
+             nonfinite_repaired_total,
+             nonfinite_tiles_touched,
+         )
+     if existing_master_tiles_mode and zero_masked_total > 0:
+         logger.info(
+             "existing_master_tiles_mode: masked %d zero-valued pixels (>=%.1f%%) across %d master tiles for coverage weights",
+             zero_masked_total,
+             zero_mask_fraction_threshold * 100.0,
+             zero_masked_tiles,
+         )
  
-     get_runtime_temp_dir = _fallback_runtime_temp_dir
- 
- 
- try:
-     from zemosaic_align_stack import _poststack_rgb_equalization
- except Exception:
-     _poststack_rgb_equalization = None
- 
- 
- UNALIGNED_DIRNAME = "unaligned_by_zemosaic"
- _UNALIGNED_LOCK = Lock()
- 
- ALPHA_OPACITY_THRESHOLD = 0.5  # Mask values >= threshold are treated as opaque
- QUALITY_GATE_ALPHA_SOFT_THRESHOLD = 0.85  # Partially transparent pixels are ignored during quality gate
- 
- GLOBAL_COVERAGE_SUMMARY_THRESHOLD_FRAC = 0.0025
- GLOBAL_COVERAGE_SUMMARY_MIN_ABS = 1e-3
- 
- 
-+def _auto_orient_alpha_mask(
-+    alpha_mask_arr: np.ndarray,
-+    data_arr: np.ndarray,
-+    *,
-+    logger_obj=None,
-+    context_label: str = "existing_master_tiles",
-+    flip_margin: float = 0.05,
-+) -> tuple[np.ndarray, bool]:
-+    """Detect inverted alpha masks and auto-flip when clearly beneficial."""
++    def _best_effort_anchor_photometry() -> None:
++        if not existing_master_tiles_mode:
++            return
++        if len(effective_tiles) < 2:
++            return
++        if not (REPROJECT_AVAILABLE and reproject_interp and ASTROPY_AVAILABLE and fits):
++            logger.info("existing_master_tiles_mode: best-effort anchor skipped (reproject/Astropy unavailable)")
++            return
++        try:
++            preview_h, preview_w = map(int, final_output_shape_hw)
++        except Exception:
++            preview_h = preview_w = 0
++        if preview_h <= 0 or preview_w <= 0:
++            logger.info("existing_master_tiles_mode: best-effort anchor skipped (invalid final shape)")
++            return
 +
-+    flipped = False
-+    try:
-+        alpha_arr = np.asarray(alpha_mask_arr, dtype=np.float32, order="C")
-+        data = np.asarray(data_arr)
-+        if data.ndim == 3:
-+            nz2d = np.any((np.abs(data) > 1e-6) & np.isfinite(data), axis=-1)
-+        else:
-+            nz2d = (np.abs(data) > 1e-6) & np.isfinite(data)
-+        nz_frac = float(np.mean(nz2d)) if nz2d.size else 0.0
-+        valid_frac = float(np.mean(alpha_arr > ALPHA_OPACITY_THRESHOLD)) if alpha_arr.size else 0.0
-+        inv_valid_frac = (
-+            float(np.mean((1.0 - alpha_arr) > ALPHA_OPACITY_THRESHOLD)) if alpha_arr.size else 0.0
-+        )
-+        score = abs(valid_frac - nz_frac)
-+        inv_score = abs(inv_valid_frac - nz_frac)
-+        if inv_score + float(flip_margin) < score:
-+            alpha_arr = 1.0 - alpha_arr
-+            flipped = True
-+            logger_target = logger_obj or logger
++        max_preview = 1024
++        scale = min(1.0, max_preview / max(preview_h, preview_w)) if max(preview_h, preview_w) > 0 else 1.0
++        preview_shape = (max(32, int(preview_h * scale)), max(32, int(preview_w * scale)))
++        min_overlap_pixels = 256
++        gain_clip = (0.5, 2.0)
++
++        def _resolve_mask(entry: dict[str, Any]) -> np.ndarray | None:
++            mask = None
++            if isinstance(entry, dict):
++                mask = entry.get("alpha_weight2d")
++                if mask is None:
++                    mask = entry.get("coverage_mask")
++            if mask is None:
++                return None
 +            try:
-+                logger_target.info(
-+                    "[Alpha] %s: auto-inverted alpha mask valid_frac=%.3f inv_valid_frac=%.3f nz_frac=%.3f",
-+                    context_label,
-+                    valid_frac,
-+                    inv_valid_frac,
-+                    nz_frac,
++                mask_arr = np.asarray(mask, dtype=np.float32, order="C", copy=False)
++            except Exception:
++                return None
++            if mask_arr.ndim > 2:
++                mask_arr = np.squeeze(mask_arr)
++            return mask_arr
++
++        def _project_tile(entry: dict[str, Any]) -> tuple[np.ndarray, np.ndarray | None] | None:
++            tile_wcs = entry.get("wcs")
++            data = entry.get("data")
++            if tile_wcs is None or data is None:
++                return None
++            data_arr = np.asarray(data, dtype=np.float32, order="C", copy=False)
++            if data_arr.ndim != 3:
++                return None
++            mask_arr = _resolve_mask(entry)
++            projected_channels = []
++            mask_proj = None
++            for c in range(data_arr.shape[-1]):
++                try:
++                    reproj, footprint = reproject_interp(
++                        (data_arr[..., c], tile_wcs),
++                        final_output_wcs,
++                        shape_out=preview_shape,
++                        return_footprint=True,
++                    )
++                except Exception:
++                    return None
++                projected_channels.append(np.asarray(reproj, dtype=np.float32))
++                if mask_proj is None:
++                    if mask_arr is not None:
++                        try:
++                            mask_proj_raw, mask_fp = reproject_interp(
++                                (mask_arr.astype(np.float32, copy=False), tile_wcs),
++                                final_output_wcs,
++                                shape_out=preview_shape,
++                                return_footprint=True,
++                            )
++                            mask_proj = np.asarray(mask_proj_raw, dtype=np.float32)
++                            if mask_fp is not None:
++                                mask_proj = mask_proj * (np.asarray(mask_fp, dtype=np.float32) > 0)
++                        except Exception:
++                            mask_proj = None
++                    elif footprint is not None:
++                        try:
++                            mask_proj = (np.asarray(footprint, dtype=np.float32) > 0).astype(np.float32)
++                        except Exception:
++                            mask_proj = None
++            try:
++                projected = np.stack(projected_channels, axis=-1)
++            except Exception:
++                return None
++            return projected, mask_proj
++
++        def _anchor_candidate_area(entry: dict[str, Any]) -> int:
++            mask_arr = _resolve_mask(entry)
++            if mask_arr is None:
++                data_arr = np.asarray(entry.get("data"), dtype=np.float32, order="C") if isinstance(entry, dict) else None
++                if data_arr is None:
++                    return 0
++                if data_arr.ndim == 3:
++                    valid_mask = np.all(np.isfinite(data_arr), axis=-1)
++                else:
++                    valid_mask = np.isfinite(data_arr)
++            else:
++                valid_mask = mask_arr > 0
++            try:
++                return int(np.count_nonzero(valid_mask))
++            except Exception:
++                return 0
++
++        anchor_idx = None
++        largest_area = -1
++        for idx_entry, entry in enumerate(effective_tiles):
++            area = _anchor_candidate_area(entry)
++            if area > largest_area:
++                largest_area = area
++                anchor_idx = idx_entry
++        if anchor_idx is None:
++            logger.info("existing_master_tiles_mode: best-effort anchor skipped (no valid tiles)")
++            return
++
++        anchor_entry = effective_tiles[anchor_idx]
++        anchor_proj = _project_tile(anchor_entry)
++        if anchor_proj is None:
++            logger.info("existing_master_tiles_mode: best-effort anchor skipped (anchor reprojection failed)")
++            return
++        anchor_data, anchor_mask = anchor_proj
++        for idx_entry, entry in enumerate(effective_tiles):
++            if idx_entry == anchor_idx:
++                continue
++            tile_proj = _project_tile(entry)
++            if tile_proj is None:
++                logger.info(
++                    "existing_master_tiles_mode: skip photometric anchor (tile reprojection failed)",
 +                )
++                continue
++            tile_data, tile_mask = tile_proj
++            base_mask = np.isfinite(anchor_data).all(axis=-1) & np.isfinite(tile_data).all(axis=-1)
++            if anchor_mask is not None:
++                base_mask &= anchor_mask > 0
++            if tile_mask is not None:
++                base_mask &= tile_mask > 0
++            try:
++                anchor_nonzero = np.any(anchor_data != 0.0, axis=-1)
++                tile_nonzero = np.any(tile_data != 0.0, axis=-1)
++                base_mask &= anchor_nonzero & tile_nonzero
 +            except Exception:
 +                pass
-+        return alpha_arr, flipped
-+    except Exception:
-+        return alpha_mask_arr, flipped
 +
-+
- def _two_pass_tile_rgb_stats(arr: np.ndarray) -> dict:
-     """Computes RGB/mono stats for a single tile, ignoring non-finite values."""
-     stats = {
-         'valid_fraction': 0.0,
-         'min': [0.0, 0.0, 0.0],
-         'mean': [0.0, 0.0, 0.0],
-         'median': [0.0, 0.0, 0.0],
-     }
-     if arr is None or arr.size == 0:
-         return stats
- 
-     if arr.ndim == 2:
-         arr = arr[..., np.newaxis]
- 
-     if arr.ndim != 3:
-         return stats
- 
-     num_channels = arr.shape[2]
-     if num_channels not in [1, 3]:
-         return stats
- 
-     # Resize stats lists to match number of channels
-     stats['min'] = [0.0] * num_channels
-     stats['mean'] = [0.0] * num_channels
-     stats['median'] = [0.0] * num_channels
-@@ -6183,66 +6227,99 @@ def _compute_intertile_affine_corrections_from_sources(
-     logger_obj=None,
-     progress_callback: Callable | None = None,
-     intertile_global_recenter: bool = False,
-     intertile_recenter_clip: tuple[float, float] | list[float] | None = None,
- ) -> tuple[list[tuple[float, float]] | None, bool, str, str | None]:
-     """Common implementation for intertile gain/offset computation.
- 
-     Returns
-     -------
-     (list[(gain, offset)] | None, bool, str, str | None)
-         Sanitized affine list (or ``None``), flag indicating whether non-trivial
-         corrections were detected, status string (``\"ok\"``, ``\"skipped\"``,
-         ``\"preview_failed\"``, ``\"compute_failed\"``) and optional error message.
-     """
- 
-     total_tiles = len(sources)
-     if total_tiles < 2:
-         return None, False, "skipped", None
- 
-     if not (
-         ZEMOSAIC_UTILS_AVAILABLE
-         and hasattr(zemosaic_utils, "compute_intertile_affine_calibration")
-     ):
-         return None, False, "skipped", None
- 
--    tile_pairs: list[tuple[np.ndarray, Any]] = []
-+    tile_pairs: list[tuple[np.ndarray, Any] | tuple[np.ndarray, Any, np.ndarray]] = []
-     preview_arrays: list[np.ndarray | None] = []
- 
-     for idx, src in enumerate(sources, 1):
-         try:
-             tile_arr: np.ndarray
-+            mask2d_float: np.ndarray | None = None
-+            alpha_mask_arr: np.ndarray | None = None
-             label = _safe_basename(src.path)
-             if src.data is not None:
-                 tile_arr = _ensure_hwc_master_tile(src.data, label)
-             else:
-                 if not src.path:
-                     raise ValueError("Tile data missing and no path provided.")
-                 with fits.open(src.path, memmap=False) as hdul:
-                     tile_arr = _ensure_hwc_master_tile(hdul[0].data, label)
-+                    if "ALPHA" in hdul and hdul["ALPHA"].data is not None:
-+                        try:
-+                            alpha_mask_arr = np.asarray(hdul["ALPHA"].data)
-+                        except Exception:
-+                            alpha_mask_arr = None
-             tile_arr = np.asarray(tile_arr, dtype=np.float32, order="C")
--            tile_pairs.append((tile_arr, src.wcs))
-+            if alpha_mask_arr is not None:
-+                alpha_mask_arr = np.squeeze(alpha_mask_arr)
-+                if alpha_mask_arr.ndim == 3 and alpha_mask_arr.shape[0] == 1:
-+                    alpha_mask_arr = alpha_mask_arr[0]
-+                alpha_mask_arr = np.nan_to_num(alpha_mask_arr, nan=0.0, posinf=0.0, neginf=0.0)
-+                max_alpha_val = float(np.nanmax(alpha_mask_arr)) if alpha_mask_arr.size else 0.0
-+                if alpha_mask_arr.dtype.kind in {"i", "u"} and max_alpha_val > 1.0:
-+                    alpha_mask_arr = alpha_mask_arr.astype(np.float32, copy=False) / 255.0
-+                elif alpha_mask_arr.dtype.kind not in {"f"}:
-+                    alpha_mask_arr = alpha_mask_arr.astype(np.float32, copy=False)
-+                alpha_mask_arr = np.clip(alpha_mask_arr, 0.0, 1.0)
-+                if alpha_mask_arr.shape != tile_arr.shape[:2]:
-+                    alpha_mask_arr = None
-+                else:
-+                    alpha_mask_arr, _ = _auto_orient_alpha_mask(
-+                        alpha_mask_arr,
-+                        tile_arr,
-+                        logger_obj=logger_obj or logger,
-+                        context_label="existing_master_tiles_intertile",
-+                    )
-+                    valid2d = alpha_mask_arr > ALPHA_OPACITY_THRESHOLD
-+                    mask2d_float = np.asarray(alpha_mask_arr, dtype=np.float32, order="C")
-+                    if tile_arr.ndim == 3:
-+                        tile_arr[~valid2d, :] = np.nan
-+                    else:
-+                        tile_arr[~valid2d] = np.nan
-+            tile_pairs.append((tile_arr, src.wcs) if mask2d_float is None else (tile_arr, src.wcs, mask2d_float))
-             preview_entry = None
-             if intertile_global_recenter:
-                 try:
-                     preview_entry, _ = zemosaic_utils.create_downscaled_luminance_preview(
-                         tile_arr,
-                         src.wcs,
-                         preview_size,
-                     )
-                     if preview_entry is not None:
-                         preview_entry = np.asarray(preview_entry, dtype=np.float32)
-                 except Exception:
-                     preview_entry = None
-             preview_arrays.append(preview_entry)
-         except Exception as exc:
-             if logger_obj:
-                 logger_obj.warning(
-                     "Intertile data load failed for %s: %s",
-                     src.path or f"tile#{idx}",
-                     exc,
-                 )
-                 logger_obj.debug("Traceback (intertile data load):", exc_info=True)
-             tile_pairs.clear()
-             preview_arrays.clear()
-             return None, False, "preview_failed", str(exc)
-         finally:
-@@ -13054,50 +13131,57 @@ def assemble_final_mosaic_reproject_coadd(
-             if "ALPHA" in hdul and hdul["ALPHA"].data is not None:
-                 try:
-                     alpha_mask_arr = np.asarray(hdul["ALPHA"].data)
-                 except Exception:
-                     alpha_mask_arr = None
- 
-         # Master tiles saved via ``save_fits_image`` use the ``HWC`` axis order
-         # which stores color images in ``C x H x W`` within the FITS file. When
-         # reading them back for final assembly we expect ``H x W x C``.
-         if data.ndim == 3 and data.shape[0] in (1, 3) and data.shape[-1] != data.shape[0]:
-             data = np.moveaxis(data, 0, -1)
-         if data.ndim == 2:
-             data = data[..., np.newaxis]
- 
-         if alpha_mask_arr is not None:
-             alpha_mask_arr = np.squeeze(alpha_mask_arr)
-             if alpha_mask_arr.ndim == 3 and alpha_mask_arr.shape[0] == 1:
-                 alpha_mask_arr = alpha_mask_arr[0]
-             alpha_mask_arr = np.nan_to_num(alpha_mask_arr, nan=0.0, posinf=0.0, neginf=0.0)
-             max_alpha_val = float(np.nanmax(alpha_mask_arr)) if alpha_mask_arr.size else 0.0
-             if alpha_mask_arr.dtype.kind in {"i", "u"} and max_alpha_val > 1.0:
-                 alpha_mask_arr = alpha_mask_arr.astype(np.float32, copy=False) / 255.0
-             elif alpha_mask_arr.dtype.kind not in {"f"}:
-                 alpha_mask_arr = alpha_mask_arr.astype(np.float32, copy=False)
-             alpha_mask_arr = np.clip(alpha_mask_arr, 0.0, 1.0)
-+            if existing_master_tiles_mode:
-+                alpha_mask_arr, _ = _auto_orient_alpha_mask(
-+                    alpha_mask_arr,
-+                    data,
-+                    logger_obj=logger,
-+                    context_label="existing_master_tiles",
++            overlap_count = int(np.count_nonzero(base_mask))
++            if overlap_count < min_overlap_pixels:
++                logger.info(
++                    "existing_master_tiles_mode: skip photometric anchor (overlap too small: %d)",
++                    overlap_count,
 +                )
++                continue
++            anchor_vals = anchor_data[base_mask]
++            tile_vals = tile_data[base_mask]
++            try:
++                anchor_med = np.nanmedian(anchor_vals, axis=0)
++                tile_med = np.nanmedian(tile_vals, axis=0)
++            except Exception:
++                continue
++            if anchor_med.shape[0] == 0 or tile_med.shape[0] == 0:
++                continue
++            if not (np.all(np.isfinite(anchor_med)) and np.all(np.isfinite(tile_med))):
++                logger.info("existing_master_tiles_mode: skip photometric anchor (non-finite medians)")
++                continue
++            if np.any(np.abs(tile_med) < 1e-6):
++                logger.info("existing_master_tiles_mode: skip photometric anchor (tile median ~0)")
++                continue
++            gains = anchor_med / tile_med
++            gains = np.clip(gains, gain_clip[0], gain_clip[1])
++            try:
++                data_arr = np.asarray(entry["data"], dtype=np.float32, order="C", copy=False)
++            except Exception:
++                continue
++            applied_channels = 0
++            for c in range(min(data_arr.shape[-1], gains.shape[0])):
++                gain_val = float(gains[c])
++                if not math.isfinite(gain_val):
++                    continue
++                np.multiply(data_arr[..., c], gain_val, out=data_arr[..., c], casting="unsafe")
++                applied_channels += 1
++            if applied_channels > 0:
++                try:
++                    pcb_msg = "[ExistingMT] applied anchor gain"
++                    logger.info(
++                        "existing_master_tiles_mode: anchor gain applied to tile %d (overlap=%d, gains=%s)",
++                        idx_entry,
++                        overlap_count,
++                        ", ".join(f"{g:.3f}" for g in gains.tolist()),
++                    )
++                    _pcb(
++                        pcb_msg,
++                        prog=None,
++                        lvl="INFO_DETAIL",
++                    )
++                except Exception:
++                    pass
++
++    _best_effort_anchor_photometry()
++
+     # Optional inter-tile photometric (gain/offset) calibration
+     pending_affine_list, nontrivial_affine = _sanitize_affine_corrections(
+         tile_affine_corrections,
+         len(effective_tiles),
+     )
  
-         if (
-             apply_crop
-             and crop_percent > 1e-3
-             and ZEMOSAIC_UTILS_AVAILABLE
-             and hasattr(zemosaic_utils, "crop_image_and_wcs")
-         ):
-             try:
-                 original_hw = data.shape[:2]
-                 cropped, cropped_wcs = zemosaic_utils.crop_image_and_wcs(
-                     data,
-                     tile_wcs,
-                     crop_percent / 100.0,
-                     progress_callback=None,
+     if (
+         pending_affine_list is None
+         and intertile_photometric_match
+         and len(effective_tiles) >= 2
+     ):
+         tile_sources = []
+         for entry in effective_tiles:
+             mask = None
+             if isinstance(entry, dict):
+                 mask = entry.get("alpha_weight2d")
+                 if mask is None:
+                     mask = entry.get("coverage_mask")
+             tile_sources.append(
+                 _TileAffineSource(
+                     path=entry.get("path"),
+                     wcs=entry.get("wcs"),
+                     data=entry.get("data"),
+                     mask=mask,
                  )
-                 if cropped is not None and cropped_wcs is not None:
-                     data = cropped
-                     tile_wcs = cropped_wcs
-                     if (
-                         alpha_mask_arr is not None
-                         and alpha_mask_arr.shape == original_hw
-                         and data.shape[:2] != original_hw
-                     ):
-                         dh = (original_hw[0] - data.shape[0]) // 2
-                         dw = (original_hw[1] - data.shape[1]) // 2
