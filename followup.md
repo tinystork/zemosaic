@@ -1,5 +1,8 @@
 # Follow-up — Qt GUI tooltip for existing master tiles photometry limitation
 
+## Status
+- [x] Tooltip added for existing master tiles mode in Qt GUI
+
 ## Goal
 Inform users **at the point of use** that photometric normalization is limited
 when using pre-existing master tiles.

@@ -750,7 +750,7 @@
     "qt_field_max_raw_per_tile": "Max raw frames per master tile (0 = unlimited)",
     "qt_field_output_dir": "Output folder",
     "qt_use_existing_master_tiles_label": "I'm using master tiles (skip clustering & master tile creation)",
-    "qt_use_existing_master_tiles_tip": "Input folder must contain master tiles FITS with a valid WCS. ZeMosaic will skip phases 0-3 and go directly to inter-tile normalization and reprojection.",
+    "qt_use_existing_master_tiles_tip": "Photometric normalization is limited in this mode.\nGeometry will be correct, but residual brightness differences between tiles may remain.\nFor best photometric quality, build master tiles inside ZeMosaic.",
     "qt_field_poststack_clip": "Median clip σ",
     "qt_field_poststack_enable": "Enable post-stack review",
     "qt_field_poststack_min_improve": "Min. improvement",

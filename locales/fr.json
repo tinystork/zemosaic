@@ -737,7 +737,7 @@
     "qt_field_max_raw_per_tile": "Nombre max. de brutes par tuile maîtresse (0 = illimité)",
     "qt_field_output_dir": "Dossier de sortie",
     "qt_use_existing_master_tiles_label": "J’utilise déjà des master tiles (sauter clustering & création)",
-    "qt_use_existing_master_tiles_tip": "Le dossier d’entrée doit contenir des master tiles FITS avec un WCS valide. ZeMosaic sautera les phases 0–3 et ira directement à la normalisation inter-tuile puis à la reprojection.",
+    "qt_use_existing_master_tiles_tip": "Dans ce mode, la normalisation photométrique est limitée.\nLa géométrie sera correcte, mais des différences de luminosité peuvent subsister entre les tuiles.\nPour une qualité photométrique optimale, générez les master tiles dans ZeMosaic.",
     "qt_field_poststack_clip": "Clip médian σ",
     "qt_field_poststack_enable": "Activer la revue post-stack",
     "qt_field_poststack_min_improve": "Amélioration minimale",

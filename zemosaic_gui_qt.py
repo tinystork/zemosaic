@@ -1390,8 +1390,9 @@ class ZeMosaicQtMainWindow(QMainWindow):
         master_tiles_checkbox.setToolTip(
             self._tr(
                 "qt_use_existing_master_tiles_tip",
-                "Input folder must contain master tiles FITS with a valid WCS. "
-                "ZeMosaic will skip phases 0-3 and go directly to inter-tile normalization and reprojection.",
+                "Photometric normalization is limited in this mode.\n"
+                "Geometry will be correct, but residual brightness differences between tiles may remain.\n"
+                "For best photometric quality, build master tiles inside ZeMosaic.",
             )
         )
         self._existing_master_tiles_checkbox = master_tiles_checkbox
