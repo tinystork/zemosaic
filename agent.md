@@ -1,5 +1,9 @@
 # Agent Task — Best-effort inter-tile photometric anchoring (existing master tiles)
 
+## Status
+- [ ] Implement best-effort inter-tile photometric anchoring when using existing master tiles
+- [x] Add Qt GUI tooltip informing users about photometry limitations with existing master tiles
+
 ## Context
 When the user enables **"I'm using master tiles (skip clustering_master tile creation)"**, ZeMosaic receives
 pre-built master tiles that already embed photometric decisions (stacking, cropping, masking).
