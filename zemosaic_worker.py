@@ -7777,6 +7777,7 @@ def _run_shared_phase45_phase5_pipeline(
     parallel_plan = phase5_options.get("parallel_plan")
     tile_weighting_enabled_flag = bool(phase5_options.get("tile_weighting_enabled"))
     tile_weight_mode = str(phase5_options.get("tile_weight_mode") or "n_frames")
+    existing_master_tiles_mode = bool(phase5_options.get("existing_master_tiles_mode"))
     worker_config_cache = phase45_options.get("worker_config") or {}
     parallel_caps_option = phase5_options.get("parallel_capabilities")
     telemetry_ctrl = phase5_options.get("telemetry")
@@ -8058,6 +8059,7 @@ def _run_shared_phase45_phase5_pipeline(
                 enable_tile_weighting=tile_weighting_enabled_flag,
                 tile_weight_mode=tile_weight_mode,
                 stats_callback=_emit_phase5_stats,
+                existing_master_tiles_mode=existing_master_tiles_mode,
             )
         except Exception as exc:
             logger.exception("Reproject+Coadd assembly failed", exc_info=True)
@@ -12767,6 +12769,7 @@ def assemble_final_mosaic_reproject_coadd(
     enable_tile_weighting: bool = False,
     tile_weight_mode: str | None = None,
     stats_callback: Callable[[int, int, bool], None] | None = None,
+    existing_master_tiles_mode: bool = False,
 ):
     """Assemble les master tiles en utilisant ``reproject_and_coadd``."""
     _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
@@ -13031,6 +13034,11 @@ def assemble_final_mosaic_reproject_coadd(
     effective_tiles: list[dict[str, Any]] = []
     hdr_for_output = None
     alpha_debug_logged = False
+    nonfinite_repaired_total = 0
+    nonfinite_tiles_touched = 0
+    zero_masked_total = 0
+    zero_masked_tiles = 0
+    zero_mask_fraction_threshold = 0.05
     total_tiles_for_prep = len(master_tile_fits_with_wcs_list)
     for idx, (tile_path, tile_wcs) in enumerate(master_tile_fits_with_wcs_list, 1):
         tile_header = None
@@ -13170,6 +13178,33 @@ def assemble_final_mosaic_reproject_coadd(
             )
             coverage_mask_entry = valid_pixels.astype(np.float32)
 
+        if existing_master_tiles_mode:
+            try:
+                nonfinite_mask = ~np.isfinite(data)
+                if np.any(nonfinite_mask):
+                    data = np.array(data, copy=True)
+                    data[nonfinite_mask] = 0.0
+                    nonfinite_repaired_total += int(np.count_nonzero(nonfinite_mask))
+                    nonfinite_tiles_touched += 1
+            except Exception:
+                pass
+        if existing_master_tiles_mode and alpha_weight2d is None:
+            try:
+                if data.ndim == 3:
+                    zero_mask = np.all(data == 0, axis=-1)
+                else:
+                    zero_mask = data == 0
+                if zero_mask.size:
+                    zero_count = int(np.count_nonzero(zero_mask))
+                    zero_frac = float(zero_count) / float(zero_mask.size)
+                    if zero_frac >= zero_mask_fraction_threshold:
+                        coverage_mask_entry = np.asarray(coverage_mask_entry, dtype=np.float32, order="C")
+                        coverage_mask_entry[zero_mask] = 0.0
+                        zero_masked_total += zero_count
+                        zero_masked_tiles += 1
+            except Exception:
+                pass
+
         tile_weight_value = 1.0
         if tile_weighting_active and weight_mode_normalized == "n_frames":
             weight_candidate = _extract_tile_weight(tile_header)
@@ -13239,6 +13274,20 @@ def assemble_final_mosaic_reproject_coadd(
             )
         except Exception:
             logger.info("[Alpha] Per-pixel alpha weights detected; GPU coadd will apply alpha masks")
+
+    if existing_master_tiles_mode and nonfinite_repaired_total > 0:
+        logger.info(
+            "existing_master_tiles_mode: replaced %d non-finite pixels across %d master tiles before reproject",
+            nonfinite_repaired_total,
+            nonfinite_tiles_touched,
+        )
+    if existing_master_tiles_mode and zero_masked_total > 0:
+        logger.info(
+            "existing_master_tiles_mode: masked %d zero-valued pixels (>=%.1f%%) across %d master tiles for coverage weights",
+            zero_masked_total,
+            zero_mask_fraction_threshold * 100.0,
+            zero_masked_tiles,
+        )
 
     # Optional inter-tile photometric (gain/offset) calibration
     pending_affine_list, nontrivial_affine = _sanitize_affine_corrections(
@@ -13963,6 +14012,94 @@ def assemble_final_mosaic_reproject_coadd(
 
     if isinstance(coverage, np.ndarray):
         coverage = np.where(np.isfinite(coverage), coverage, 0.0).astype(np.float32, copy=False)
+    if isinstance(coverage, np.ndarray) and existing_master_tiles_mode:
+        try:
+            cov_mask_bool = np.asarray(coverage, dtype=np.float32, order="C")
+            cov_mask_bool = np.nan_to_num(cov_mask_bool, nan=0.0, posinf=0.0, neginf=0.0)
+            cov_mask_bool = cov_mask_bool > 0.0
+            alpha_target_shape = cov_mask_bool.shape
+            override_message = None
+            if alpha_final is None:
+                alpha_final = np.ascontiguousarray(cov_mask_bool.astype(np.uint8) * 255)
+                override_message = "alpha_final was None -> rebuilt"
+            else:
+                alpha_arr = np.asarray(alpha_final)
+                if alpha_arr.ndim == 3 and alpha_arr.shape[-1] == 1:
+                    alpha_arr = alpha_arr[..., 0]
+                alpha_arr = np.squeeze(alpha_arr)
+                if alpha_arr.shape != alpha_target_shape:
+                    override_message = (
+                        f"overriding alpha_final due to shape mismatch (alpha={alpha_arr.shape}, coverage={alpha_target_shape})"
+                    )
+                    alpha_final = np.ascontiguousarray(cov_mask_bool.astype(np.uint8) * 255)
+                else:
+                    alpha_zero = alpha_arr == 0
+                    mismatch = int(np.count_nonzero(cov_mask_bool & alpha_zero))
+                    if mismatch > 0:
+                        total_cov = int(np.count_nonzero(cov_mask_bool))
+                        pct = (100.0 * mismatch) / max(1, total_cov)
+                        override_message = f"overriding alpha_final (mismatch={mismatch} px, {pct:.2f}% of covered)"
+                        alpha_final = np.ascontiguousarray(cov_mask_bool.astype(np.uint8) * 255)
+            if alpha_final is not None and alpha_final.shape == alpha_target_shape:
+                mismatch_after = int(np.count_nonzero(cov_mask_bool & (np.asarray(alpha_final) == 0)))
+                if mismatch_after != 0 and logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "alpha_from_coverage: mismatch_after=%d (existing_master_tiles_mode)",
+                        mismatch_after,
+                    )
+            if override_message:
+                logger.info(
+                    "alpha_from_coverage (existing_master_tiles_mode): %s",
+                    override_message,
+                )
+        except Exception as exc_alpha_cov:
+            logger.debug("alpha_from_coverage: override skipped due to error: %s", exc_alpha_cov)
+    if existing_master_tiles_mode and mosaic_data is not None and isinstance(coverage, np.ndarray):
+        try:
+            data_arr = np.asarray(mosaic_data, dtype=np.float32, copy=False)
+            cov_mask_bool = np.asarray(coverage, dtype=np.float32, order="C")
+            cov_mask_bool = np.nan_to_num(cov_mask_bool, nan=0.0, posinf=0.0, neginf=0.0) > 0.0
+            if data_arr.ndim >= 2 and cov_mask_bool.shape == data_arr.shape[:2]:
+                if data_arr.ndim == 3:
+                    nonfinite_px = np.any(~np.isfinite(data_arr), axis=-1)
+                    fix_mask = cov_mask_bool & nonfinite_px
+                    if np.any(fix_mask):
+                        if not data_arr.flags.writeable:
+                            data_arr = np.array(data_arr, copy=True)
+                        for ch in range(data_arr.shape[-1]):
+                            chan = data_arr[..., ch]
+                            bad = fix_mask & ~np.isfinite(chan)
+                            if np.any(bad):
+                                chan[bad] = 0.0
+                        mosaic_data = data_arr
+                        total_cov = int(np.count_nonzero(cov_mask_bool))
+                        fix_count = int(np.count_nonzero(fix_mask))
+                        pct = (100.0 * fix_count) / max(1, total_cov)
+                        logger.info(
+                            "alpha_from_coverage (existing_master_tiles_mode): cleared %d non-finite pixels inside coverage (%.2f%%)",
+                            fix_count,
+                            pct,
+                        )
+                else:
+                    bad = cov_mask_bool & ~np.isfinite(data_arr)
+                    if np.any(bad):
+                        if not data_arr.flags.writeable:
+                            data_arr = np.array(data_arr, copy=True)
+                        data_arr[bad] = 0.0
+                        mosaic_data = data_arr
+                        total_cov = int(np.count_nonzero(cov_mask_bool))
+                        fix_count = int(np.count_nonzero(bad))
+                        pct = (100.0 * fix_count) / max(1, total_cov)
+                        logger.info(
+                            "alpha_from_coverage (existing_master_tiles_mode): cleared %d non-finite pixels inside coverage (%.2f%%)",
+                            fix_count,
+                            pct,
+                        )
+        except Exception as exc_nonfinite:
+            logger.debug(
+                "alpha_from_coverage: non-finite cleanup skipped due to error: %s",
+                exc_nonfinite,
+            )
     alpha_zero_mask = None
     if isinstance(coverage, np.ndarray) and alpha_final is not None:
         try:
@@ -17437,6 +17574,7 @@ def run_hierarchical_mosaic_classic_legacy(
             "sds_mode": bool(sds_mode_flag),
             "tile_weighting_enabled": tile_weighting_allowed,
             "tile_weight_mode": tile_weight_mode_config,
+            "existing_master_tiles_mode": bool(use_existing_master_tiles_mode),
         }
 
     def _ensure_plan_descriptor_loaded(plan: dict[str, Any]) -> None:

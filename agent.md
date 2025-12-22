@@ -1,82 +1,83 @@
-# agent.md — Fix trou central en mode "existing master tiles" via alpha_from_coverage (Option B)
+# ZeMosaic — Fix “black/purple square” in existing master-tiles mode (Option B)
 
-## Contexte / Symptôme
-En mode "I'm using master tiles (skip clustering_master tile creation)", l'image finale présente parfois un énorme trou (zone nan/opaque) alors que la carte de coverage montre un recouvrement correct.
+## Context / Symptom
+When running with:
+- GUI option: “I'm using master tiles (skip clustering_master tile creation)”
+- inter-tile photometric match enabled (match_background / intertile)
 
-Le log indique :
-- phase6: alpha_union received -> alpha_final propagé
-- puis: nanized X pixels where coverage/alpha == 0
+The final mosaic shows a huge flat black/purple rectangle even though coverage indicates tiles overlap.
 
-Hypothèse : dans ce mode seulement, l’alpha reprojeté (alpha_union) peut être incohérent (ex: 0 dans des zones couvertes), et comme on nanize en fonction de l’alpha, on “perce” un trou artificiel.
+Log hints:
+- intertile affine gains can be absurdly small (e.g. ~3e-5) -> suggests the affine fit is polluted by masked pixels stored as finite zeros.
+- In existing-master-tiles mode, ALPHA extension is used to create weights and/or to zero masked pixels. If ALPHA semantics are inverted (0=valid, 1=invalid), weights become inverted and large regions become constant/flat in the final mosaic.
 
-## Objectif (Option B)
-Quand on est en mode "use_existing_master_tiles", dériver l’ALPHA FINAL à partir du coverage final :
-- alpha_final[u,v] = 255 si coverage[u,v] > 0
-- alpha_final[u,v] = 0 sinon
+## Goal (Option B)
+Fix the issue ONLY for the “existing master tiles” scenario by:
+1) Auto-detecting inverted ALPHA masks when loading master tiles, and invert them if needed.
+2) Ensuring intertile photometric calibration ignores masked pixels:
+   - Apply ALPHA mask by setting invalid pixels to NaN for preview/affine input.
+   - Extend compute_intertile_affine_calibration to accept optional per-tile masks and use them when sampling overlap.
 
-Et ne pas laisser un alpha_union incohérent dégrader le rendu final.
+## Constraints
+- NO refactor, minimal surgical changes.
+- Touch only:
+  - zemosaic_worker.py
+  - zemosaic_utils.py
+- Keep existing default behaviors and performance characteristics as much as possible.
+- Add INFO/DEBUG logs to confirm inversion detection, but don’t spam.
 
-## Contraintes
-- Patch chirurgical.
-- Ne pas changer le comportement normal hors de ce mode.
-- Ne pas refactorer l’architecture.
-- Zéro impact sur batch size, GPU/CPU, etc.
+## Implementation Tasks
 
-## Fichiers à modifier
-- `zemosaic_worker.py` uniquement (idéalement)
-  - `run_hierarchical_mosaic_classic_legacy(...)`
-  - `assemble_final_mosaic_reproject_coadd(...)`
+### A) zemosaic_worker.py — Auto-fix inverted ALPHA when loading existing master tiles
+Where master tiles are loaded and alpha_weight2d is built (existing_master_tiles_mode path):
+- After normalizing alpha to float32 [0..1] but BEFORE building valid2d:
+  - Compute `nz2d` from tile data (any channel abs>eps and finite).
+  - Compute:
+    - valid_frac = mean(alpha > ALPHA_OPACITY_THRESHOLD)
+    - inv_valid_frac = mean((1-alpha) > ALPHA_OPACITY_THRESHOLD)
+    - nz_frac = mean(nz2d)
+  - Choose orientation (alpha or 1-alpha) whose valid_frac is closest to nz_frac.
+  - Only flip if it’s clearly better (e.g. inv_score + margin < score).
+- Log a single INFO line when a flip occurs:
+  - “[Alpha] existing_master_tiles: auto-inverted alpha mask …”
 
-## Plan d’implémentation
+Make sure:
+- alpha_mask_arr used to create alpha_weight2d / coverage_mask_entry uses the corrected orientation.
+- valid2d uses corrected alpha.
 
-### 1) Propager un bool "existing_master_tiles_mode" vers l’assembleur final
-- Ajouter un paramètre optionnel à `assemble_final_mosaic_reproject_coadd` :
-  - `existing_master_tiles_mode: bool = False`
-- Dans `run_hierarchical_mosaic_classic_legacy`, lors de l’appel à `assemble_final_mosaic_reproject_coadd`, passer :
-  - `existing_master_tiles_mode=use_existing_master_tiles_config` (ou l’équivalent déjà présent)
+### B) zemosaic_worker.py — Intertile: load/apply ALPHA as NaN for previews + pass mask to utils
+In `_compute_intertile_affine_corrections_from_sources`:
+- When loading from FITS path:
+  - Also try to read an ALPHA extension if present (name “ALPHA”).
+  - Normalize to float [0..1] like elsewhere.
+  - Apply the same auto-inversion heuristic (using nz2d of tile_arr) if needed.
+  - Build `valid2d = alpha > ALPHA_OPACITY_THRESHOLD` and set `tile_arr[~valid2d] = np.nan`
+- Build tile_pairs as (tile_arr, wcs, mask2d_float) instead of (tile_arr, wcs) when mask exists.
+  - mask2d_float: valid2d.astype(np.float32) or alpha itself clipped to [0..1].
+- Keep backward compatibility: if no alpha, keep current behavior.
 
-⚠️ Important : garder une valeur par défaut pour ne rien casser ailleurs.
+### C) zemosaic_utils.py — compute_intertile_affine_calibration: accept optional masks
+Modify `compute_intertile_affine_calibration(tile_data_with_wcs, ...)` to support:
+- entries of length 2: (data, wcs)  -> current behavior
+- entries of length 3: (data, wcs, mask2d) -> new behavior
 
-### 2) Rebuild alpha_final depuis coverage en mode existing master tiles
-Dans `assemble_final_mosaic_reproject_coadd`, à l’endroit où `alpha_union` est converti en `alpha_final` (phase6), insérer juste après l’obtention de `alpha_final` et avant toute logique “coverage/alpha == 0” :
+When computing overlap samples:
+- Reproject mask_i and mask_j to target (same as data)
+- Valid pixels require:
+  - finite(data_i) & finite(data_j)
+  - mask_i_reproj > 0.5 (or > 0.0 if mask is soft)
+  - mask_j_reproj > 0.5
+- Then proceed with sky percentile selection and robust affine fit on those valid pixels.
 
-Pseudo-code :
+### D) Safety rails (lightweight)
+- If after masking the overlap has too few valid pixels, skip that pair (already handled by existing min-samples checks).
+- No changes to other phases.
 
-```python
-if existing_master_tiles_mode and coverage is not None:
-    cov_mask = coverage > 0
-    if alpha_final is None:
-        alpha_final = (cov_mask.astype(np.uint8) * 255)
-        log("alpha_from_coverage: alpha_final was None -> rebuilt")
-    else:
-        # détecter mismatch : coverage>0 mais alpha==0
-        alpha0 = (alpha_final == 0)
-        mismatch = np.count_nonzero(cov_mask & alpha0)
-        if mismatch > 0:
-            total_cov = np.count_nonzero(cov_mask)
-            pct = (100.0 * mismatch / max(1, total_cov))
-            log(f"alpha_from_coverage: overriding alpha_final (mismatch={mismatch} px, {pct:.2f}% of covered)")
-            alpha_final = (cov_mask.astype(np.uint8) * 255)
-````
+## Expected Outcome
+- Existing master tiles mode no longer produces the big flat rectangle.
+- Intertile affine gains stay sane (close to 1, within recenter clip), no absurd tiny gains.
+- Coverage and mosaic visually consistent.
 
-* Forcer dtype `uint8`, shape identique au coverage.
-* Conserver `alpha_union` tel quel pour les autres modes.
-
-### 3) Logging / Observabilité
-
-Ajouter un log INFO (et si tu veux un callback GUI type `[INFO] ...`) quand on override :
-
-* nb pixels mismatch
-* % des pixels couverts impactés
-* mention claire “existing_master_tiles_mode”
-
-### 4) Critères d’acceptation
-
-* En mode existing master tiles, plus de trou central si le coverage indique une couverture.
-* Les stats “nanized pixels where coverage/alpha == 0” ne doivent plus nanizer des pixels `coverage>0` à cause de l’alpha.
-* Hors de ce mode : comportement inchangé.
-
-## Notes
-
-* Ce fix est volontairement conservateur : en mode existing master tiles, on privilégie la vérité “coverage” (résultat de l’assemblage) plutôt qu’un alpha potentiellement corrompu/inversé venant des fichiers en entrée.
-
+## Files changed
+- zemosaic_worker.py
+- zemosaic_utils.py

@@ -1,577 +1,370 @@
+diff --git a/agent.md b/agent.md
+index 06743c0f8dbd5ce41f4c7a26e16778f9ecfc2eab..3a88da75942ef497fb15f0e8131d92351456e58f 100644
+--- a/agent.md
++++ b/agent.md
+@@ -7,76 +7,75 @@ Le log indique :
+ - phase6: alpha_union received -> alpha_final propagé
+ - puis: nanized X pixels where coverage/alpha == 0
+ 
+ Hypothèse : dans ce mode seulement, l’alpha reprojeté (alpha_union) peut être incohérent (ex: 0 dans des zones couvertes), et comme on nanize en fonction de l’alpha, on “perce” un trou artificiel.
+ 
+ ## Objectif (Option B)
+ Quand on est en mode "use_existing_master_tiles", dériver l’ALPHA FINAL à partir du coverage final :
+ - alpha_final[u,v] = 255 si coverage[u,v] > 0
+ - alpha_final[u,v] = 0 sinon
+ 
+ Et ne pas laisser un alpha_union incohérent dégrader le rendu final.
+ 
+ ## Contraintes
+ - Patch chirurgical.
+ - Ne pas changer le comportement normal hors de ce mode.
+ - Ne pas refactorer l’architecture.
+ - Zéro impact sur batch size, GPU/CPU, etc.
+ 
+ ## Fichiers à modifier
+ - `zemosaic_worker.py` uniquement (idéalement)
+   - `run_hierarchical_mosaic_classic_legacy(...)`
+   - `assemble_final_mosaic_reproject_coadd(...)`
+ 
+ ## Plan d’implémentation
+ 
+-### 1) Propager un bool "existing_master_tiles_mode" vers l’assembleur final
+-- Ajouter un paramètre optionnel à `assemble_final_mosaic_reproject_coadd` :
+-  - `existing_master_tiles_mode: bool = False`
+-- Dans `run_hierarchical_mosaic_classic_legacy`, lors de l’appel à `assemble_final_mosaic_reproject_coadd`, passer :
+-  - `existing_master_tiles_mode=use_existing_master_tiles_config` (ou l’équivalent déjà présent)
++- [x] Propager un bool "existing_master_tiles_mode" vers l’assembleur final
++  - Ajouter un paramètre optionnel à `assemble_final_mosaic_reproject_coadd` :
++    - `existing_master_tiles_mode: bool = False`
++  - Dans `run_hierarchical_mosaic_classic_legacy`, lors de l’appel à `assemble_final_mosaic_reproject_coadd`, passer :
++    - `existing_master_tiles_mode=use_existing_master_tiles_config` (ou l’équivalent déjà présent)
+ 
+ ⚠️ Important : garder une valeur par défaut pour ne rien casser ailleurs.
+ 
+-### 2) Rebuild alpha_final depuis coverage en mode existing master tiles
+-Dans `assemble_final_mosaic_reproject_coadd`, à l’endroit où `alpha_union` est converti en `alpha_final` (phase6), insérer juste après l’obtention de `alpha_final` et avant toute logique “coverage/alpha == 0” :
+-
+-Pseudo-code :
+-
+-```python
+-if existing_master_tiles_mode and coverage is not None:
+-    cov_mask = coverage > 0
+-    if alpha_final is None:
+-        alpha_final = (cov_mask.astype(np.uint8) * 255)
+-        log("alpha_from_coverage: alpha_final was None -> rebuilt")
+-    else:
+-        # détecter mismatch : coverage>0 mais alpha==0
+-        alpha0 = (alpha_final == 0)
+-        mismatch = np.count_nonzero(cov_mask & alpha0)
+-        if mismatch > 0:
+-            total_cov = np.count_nonzero(cov_mask)
+-            pct = (100.0 * mismatch / max(1, total_cov))
+-            log(f"alpha_from_coverage: overriding alpha_final (mismatch={mismatch} px, {pct:.2f}% of covered)")
++- [x] Rebuild alpha_final depuis coverage en mode existing master tiles
++  - Dans `assemble_final_mosaic_reproject_coadd`, à l’endroit où `alpha_union` est converti en `alpha_final` (phase6), insérer juste après l’obtention de `alpha_final` et avant toute logique “coverage/alpha == 0” :
++
++    Pseudo-code :
++
++    ```python
++    if existing_master_tiles_mode and coverage is not None:
++        cov_mask = coverage > 0
++        if alpha_final is None:
+             alpha_final = (cov_mask.astype(np.uint8) * 255)
+-````
++            log("alpha_from_coverage: alpha_final was None -> rebuilt")
++        else:
++            # détecter mismatch : coverage>0 mais alpha==0
++            alpha0 = (alpha_final == 0)
++            mismatch = np.count_nonzero(cov_mask & alpha0)
++            if mismatch > 0:
++                total_cov = np.count_nonzero(cov_mask)
++                pct = (100.0 * mismatch / max(1, total_cov))
++                log(f"alpha_from_coverage: overriding alpha_final (mismatch={mismatch} px, {pct:.2f}% of covered)")
++                alpha_final = (cov_mask.astype(np.uint8) * 255)
++    ````
+ 
+-* Forcer dtype `uint8`, shape identique au coverage.
+-* Conserver `alpha_union` tel quel pour les autres modes.
++    * Forcer dtype `uint8`, shape identique au coverage.
++    * Conserver `alpha_union` tel quel pour les autres modes.
+ 
+-### 3) Logging / Observabilité
++- [x] Logging / Observabilité
+ 
+-Ajouter un log INFO (et si tu veux un callback GUI type `[INFO] ...`) quand on override :
++  - Ajouter un log INFO (et si tu veux un callback GUI type `[INFO] ...`) quand on override :
+ 
+-* nb pixels mismatch
+-* % des pixels couverts impactés
+-* mention claire “existing_master_tiles_mode”
++  * nb pixels mismatch
++  * % des pixels couverts impactés
++  * mention claire “existing_master_tiles_mode”
+ 
+-### 4) Critères d’acceptation
++- [ ] Critères d’acceptation
+ 
+-* En mode existing master tiles, plus de trou central si le coverage indique une couverture.
+-* Les stats “nanized pixels where coverage/alpha == 0” ne doivent plus nanizer des pixels `coverage>0` à cause de l’alpha.
+-* Hors de ce mode : comportement inchangé.
++  * En mode existing master tiles, plus de trou central si le coverage indique une couverture.
++  * Les stats “nanized pixels where coverage/alpha == 0” ne doivent plus nanizer des pixels `coverage>0` à cause de l’alpha.
++  * Hors de ce mode : comportement inchangé.
+ 
+ ## Notes
+ 
+ * Ce fix est volontairement conservateur : en mode existing master tiles, on privilégie la vérité “coverage” (résultat de l’assemblage) plutôt qu’un alpha potentiellement corrompu/inversé venant des fichiers en entrée.
+-
 diff --git a/followup.md b/followup.md
-index 808c104695d96d806de2e227c9c727541faced41..93d15d889288e79ad34b6298ec177e4ed0f43f0a 100644
+index e6f3901291814dc531a81af11e5704ce73641256..6f2c6e470315512fdad9c74723cb7717b9430610 100644
 --- a/followup.md
 +++ b/followup.md
-@@ -1,54 +1,54 @@
- # Step-by-step checklist
+@@ -1,32 +1,31 @@
+ # followup.md — Vérifs & Validation (alpha_from_coverage en mode existing master tiles)
  
- ## 1) Config: add default + persistence
--- In zemosaic_config.py (or wherever default settings live):
--  - Add `altaz_nanize_threshold` default = 0.001
--  - Ensure it is saved/loaded like other float settings.
-+- [x] In zemosaic_config.py (or wherever default settings live):
-+  - [x] Add `altaz_nanize_threshold` default = 0.001
-+  - [x] Ensure it is saved/loaded like other float settings.
+ ## 1) Repro / Test manuel rapide (cas M31)
+-- Utiliser exactement le dataset + config qui déclenche le problème (use_existing_master_tiles=true, quality_crop=false).
+-- Lancer un run.
+-- Attendus :
++- [ ] Utiliser exactement le dataset + config qui déclenche le problème (use_existing_master_tiles=true, quality_crop=false).
++- [ ] Lancer un run.
++- [ ] Attendus :
+   - La preview PNG n’a plus de “gros trou” central.
+   - Le FITS final contient une extension ALPHA (si c’était déjà le cas), mais cette ALPHA doit maintenant correspondre au coverage.
  
- ## 2) GUI: Advanced tab
--- In zemosaic_gui_qt.py:
--  - Add a labeled QDoubleSpinBox in Advanced tab:
--    - label: "ALT-AZ nanize threshold"
--    - tooltip: explain behavior
--    - min=0.0 max=1.0 step=0.01 decimals=3
--    - set value from config on load
--    - write back to config on apply/save
--- Ensure it appears with other Lecropper/ALT-AZ options.
-+- [x] In zemosaic_gui_qt.py:
-+  - [x] Add a labeled QDoubleSpinBox in Advanced tab:
-+    - [x] label: "ALT-AZ nanize threshold"
-+    - [x] tooltip: explain behavior
-+    - [x] min=0.0 max=1.0 step=0.01 decimals=3
-+    - [x] set value from config on load
-+    - [x] write back to config on apply/save
-+- [x] Ensure it appears with other Lecropper/ALT-AZ options.
+ ## 2) Check quantitatif simple (log)
+-Attendre un log du type :
+-- `alpha_from_coverage: overriding alpha_final (mismatch=..., ..% of covered)`
+-ou
+-- `alpha_from_coverage: alpha_final was None -> rebuilt`
+-
+-Et vérifier qu’il n’y a plus de “nanized pixels” induits par un alpha incohérent.
++- [ ] Attendre un log du type :
++  - `alpha_from_coverage: overriding alpha_final (mismatch=..., ..% of covered)`
++  - ou
++  - `alpha_from_coverage: alpha_final was None -> rebuilt`
++- [ ] Et vérifier qu’il n’y a plus de “nanized pixels” induits par un alpha incohérent.
  
- ## 3) Translations
--- Add EN/FR strings for:
--  - label
--  - tooltip
--- Keep existing translation pattern (same dict structure / keys).
-+- [x] Add EN/FR strings for:
-+  - [x] label
-+  - [x] tooltip
-+- [x] Keep existing translation pattern (same dict structure / keys).
+ ## 3) Sanity check : cohérence alpha vs coverage
+-Ajouter temporairement (ou via debug local) un petit calcul :
+-- `mismatch_after = count((coverage>0) & (alpha_final==0))`
+-Attendu : `mismatch_after == 0`
++- [ ] Ajouter temporairement (ou via debug local) un petit calcul :
++  - `mismatch_after = count((coverage>0) & (alpha_final==0))`
++- [ ] Attendu : `mismatch_after == 0`
  
- Suggested FR:
- - Label: "Seuil de NaNisation ALT-AZ"
- - Tooltip: "Les pixels dont l’opacité du masque ALT-AZ est <= à ce seuil sont considérés invalides (NaN/0). Augmentez pour supprimer davantage de rampes de bord."
+ ## 4) Non-régression (mode normal)
+-- Lancer un run classique (sans existing master tiles).
+-- Vérifier :
++- [ ] Lancer un run classique (sans existing master tiles).
++- [ ] Vérifier :
+   - pas de changement de comportement,
+   - alpha_union continue d’être propagé tel qu’avant,
+   - pas de nouveaux logs alpha_from_coverage.
  
- ## 4) Worker: use the threshold
--- In zemosaic_worker.py inside the lecropper pipeline:
--  - Locate the part where mask2d is used to convert pixels to NaN/zero with a hardcoded cutoff (currently 1e-3).
--  - Replace with:
--    - `thr = float(cfg.altaz_nanize_threshold)` (fallback 1e-3 if missing)
--    - clamp thr into [0.0, 1.0]
--  - Use `mask2d <= thr` as the invalid region.
--  - Keep everything else identical.
-+- [x] In zemosaic_worker.py inside the lecropper pipeline:
-+  - [x] Locate the part where mask2d is used to convert pixels to NaN/zero with a hardcoded cutoff (currently 1e-3).
-+  - [x] Replace with:
-+    - [x] `thr = float(cfg.altaz_nanize_threshold)` (fallback 1e-3 if missing)
-+    - [x] clamp thr into [0.0, 1.0]
-+  - [x] Use `mask2d <= thr` as the invalid region.
-+  - [x] Keep everything else identical.
- 
--- Add a log (info/debug) once per master-tile build:
--  - `logger.info("lecropper: altaz_nanize_threshold=%.3f", thr)`
-+- [x] Add a log (info/debug) once per master-tile build:
-+  - [x] `logger.info("lecropper: altaz_nanize_threshold=%.3f", thr)`
- 
- ## 5) Guard rails
--- If cfg value is NaN or None:
--  - fallback to 0.001
--- Do not alter lecropper.py behavior or API.
--- Do not change other thresholds (hard_threshold, decay_ratio, etc.)
-+- [x] If cfg value is NaN or None:
-+  - [x] fallback to 0.001
-+- [x] Do not alter lecropper.py behavior or API.
-+- [x] Do not change other thresholds (hard_threshold, decay_ratio, etc.)
- 
- ## 6) Manual validation
--- Run with threshold = 0.001 -> verify no regression.
--- Run with threshold = 0.20 -> verify the big magenta/green ramps are removed in master tiles (circled zones become invalid/transparent).
-+- [ ] Run with threshold = 0.001 -> verify no regression.
-+- [ ] Run with threshold = 0.20 -> verify the big magenta/green ramps are removed in master tiles (circled zones become invalid/transparent).
- 
- ## 7) Deliverables
--- Provide a git diff
--- Mention files changed
--- Mention the new config key and default
--- Include screenshots/log snippet showing threshold value
-+- [x] Provide a git diff
-+- [x] Mention files changed
-+- [x] Mention the new config key and default
-+- [x] Include screenshots/log snippet showing threshold value
-diff --git a/locales/en.json b/locales/en.json
-index a8fd91c9b9e5f63e8fb430959ef7c19e4e20f414..faf2f88819792049a2832f66650a1cc64ae1c715 100644
---- a/locales/en.json
-+++ b/locales/en.json
-@@ -676,50 +676,52 @@
-     "qt_cache_retention_run_end": "Release caches at run end",
-     "qt_center_anchor_auto": "Auto central quality",
-     "qt_center_anchor_central": "Central only",
-     "qt_dialog_select_astap_data_dir": "Select ASTAP Data Directory",
-     "qt_dialog_select_astap_executable": "Select ASTAP Executable",
-     "qt_dialog_select_directory": "Select Directory",
-     "qt_dialog_select_file": "Select File",
-     "qt_dialog_select_input_dir": "Select Input Folder (raw files)",
-     "qt_dialog_select_memmap_dir": "Select Memmap Folder",
-     "qt_dialog_select_output_dir": "Select Output Folder",
-     "qt_error_filter_launch": "The filter interface could not be opened.",
-     "qt_error_filter_unavailable": "Qt filter interface is not available.",
-     "qt_error_invalid_config_title": "Invalid configuration",
-     "qt_error_invalid_input_dir": "Please select a valid input folder before filtering.",
-     "qt_error_missing_paths": "Input and output folders must be configured before starting.",
-     "qt_error_no_fits": "No FITS files found in the selected input folder.",
-     "qt_error_prepare_worker": "Unable to prepare worker arguments.",
-     "qt_error_prepare_worker_title": "Worker preparation failed",
-     "qt_error_start_worker_title": "Unable to start worker",
-     "qt_error_worker_missing_message": "The processing backend is not available. Ensure zemosaic_worker is installed.",
-     "qt_error_worker_missing_title": "Worker unavailable",
-     "qt_field_altaz_decay": "Decay",
-     "qt_field_altaz_enabled": "Enable Alt-Az cleanup",
-     "qt_field_altaz_margin": "Margin (%)",
-     "qt_field_altaz_nanize": "Convert Alt-Az gaps to NaN",
-+    "qt_field_altaz_nanize_threshold": "ALT-AZ nanize threshold",
-+    "qt_field_altaz_nanize_threshold_tooltip": "Pixels where the ALT-AZ mask opacity is <= this threshold are treated as invalid (NaN/0). Increase to remove more border ramps.",
-     "qt_field_anchor_clip": "Anchor median clip σ",
-     "qt_field_anchor_probe_limit": "Anchor probe limit",
-     "qt_field_anchor_span": "Anchor span range",
-     "qt_field_apply_master_tile_crop": "Apply master tile crop",
-     "qt_field_assembly_workers": "Assembly workers (0 = auto)",
-     "qt_field_astap_data_dir": "ASTAP data directory",
-     "qt_field_astap_downsample": "Default downsample",
-     "qt_field_astap_executable": "ASTAP executable",
-     "qt_field_astap_search_radius": "Default search radius (°)",
-     "qt_field_astap_sensitivity": "Default sensitivity",
-     "qt_field_astrometry_api_key": "API key",
-     "qt_field_astrometry_downsample": "Blind-solve downsample",
-     "qt_field_astrometry_timeout": "Timeout (s)",
-     "qt_field_auto_limit_frames": "Auto-limit frames per master tile",
-     "qt_field_cache_retention": "Cache retention",
-     "qt_field_center_anchor_mode": "Anchor mode",
-     "qt_field_center_clip": "Robust clip σ",
-     "qt_field_center_out_enable": "Enable center-out normalization",
-     "qt_field_center_overlap": "Minimum overlap fraction",
-     "qt_field_center_preview": "Preview size (px)",
-     "qt_field_center_sky": "Sky percentile range",
-     "qt_field_cluster_orientation": "Orientation split (°)",
-     "qt_field_cluster_target": "Target groups",
-     "qt_field_cluster_threshold": "Cluster threshold",
-     "qt_field_coadd_cleanup": "Clean up memmap files after run",
-diff --git a/locales/fr.json b/locales/fr.json
-index a050e82ef66b517d8467d5158860435f997de08f..914df837c0ee0c5eaa59b2c1b5d6dfb517a59376 100644
---- a/locales/fr.json
-+++ b/locales/fr.json
-@@ -663,50 +663,52 @@
-     "qt_cache_retention_run_end": "Libérer les caches en fin d'exécution",
-     "qt_center_anchor_auto": "Qualité centrale automatique",
-     "qt_center_anchor_central": "Centre uniquement",
-     "qt_dialog_select_astap_data_dir": "Sélectionner le dossier de données ASTAP",
-     "qt_dialog_select_astap_executable": "Sélectionner l'exécutable ASTAP",
-     "qt_dialog_select_directory": "Sélectionner un dossier",
-     "qt_dialog_select_file": "Sélectionner un fichier",
-     "qt_dialog_select_input_dir": "Sélectionner le dossier d'entrée (brutes)",
-     "qt_dialog_select_memmap_dir": "Sélectionner le dossier Memmap",
-     "qt_dialog_select_output_dir": "Sélectionner le dossier de sortie",
-     "qt_error_filter_launch": "L'interface de filtrage n'a pas pu être ouverte.",
-     "qt_error_filter_unavailable": "L'interface de filtrage Qt n'est pas disponible.",
-     "qt_error_invalid_config_title": "Configuration invalide",
-     "qt_error_invalid_input_dir": "Veuillez sélectionner un dossier d'entrée valide avant le filtrage.",
-     "qt_error_missing_paths": "Les dossiers d'entrée et de sortie doivent être configurés avant de démarrer.",
-     "qt_error_no_fits": "Aucun fichier FITS trouvé dans le dossier d'entrée sélectionné.",
-     "qt_error_prepare_worker": "Impossible de préparer les arguments du worker.",
-     "qt_error_prepare_worker_title": "Préparation du worker échouée",
-     "qt_error_start_worker_title": "Impossible de démarrer le worker",
-     "qt_error_worker_missing_message": "Le backend de traitement est indisponible. Vérifiez que zemosaic_worker est installé.",
-     "qt_error_worker_missing_title": "Worker indisponible",
-     "qt_field_altaz_decay": "Décroissance",
-     "qt_field_altaz_enabled": "Activer le nettoyage Alt-Az",
-     "qt_field_altaz_margin": "Marge (%)",
-     "qt_field_altaz_nanize": "Convertir les lacunes Alt-Az en NaN",
-+    "qt_field_altaz_nanize_threshold": "Seuil de NaNisation ALT-AZ",
-+    "qt_field_altaz_nanize_threshold_tooltip": "Les pixels dont l’opacité du masque ALT-AZ est <= à ce seuil sont considérés invalides (NaN/0). Augmentez pour supprimer davantage de rampes de bord.",
-     "qt_field_anchor_clip": "Clip médian d'ancrage σ",
-     "qt_field_anchor_probe_limit": "Limite de sondes d'ancrage",
-     "qt_field_anchor_span": "Intervalle d'ancrage",
-     "qt_field_apply_master_tile_crop": "Appliquer le rognage des tuiles maîtresses",
-     "qt_field_assembly_workers": "Workers d'assemblage (0 = auto)",
-     "qt_field_astap_data_dir": "Dossier de données ASTAP",
-     "qt_field_astap_downsample": "Downsample par défaut",
-     "qt_field_astap_executable": "Exécutable ASTAP",
-     "qt_field_astap_search_radius": "Rayon de recherche par défaut (°)",
-     "qt_field_astap_sensitivity": "Sensibilité par défaut",
-     "qt_field_astrometry_api_key": "Clé API",
-     "qt_field_astrometry_downsample": "Downsample blind solve",
-     "qt_field_astrometry_timeout": "Timeout (s)",
-     "qt_field_auto_limit_frames": "Limiter automatiquement les images par tuile maîtresse",
-     "qt_field_cache_retention": "Conservation du cache",
-     "qt_field_center_anchor_mode": "Mode d'ancrage",
-     "qt_field_center_clip": "Clip robuste σ",
-     "qt_field_center_out_enable": "Activer la normalisation centre-vers-bords",
-     "qt_field_center_overlap": "Recouvrement minimal",
-     "qt_field_center_preview": "Taille d'aperçu (px)",
-     "qt_field_center_sky": "Plage de percentile du ciel",
-     "qt_field_cluster_orientation": "Séparation par orientation (°)",
-     "qt_field_cluster_target": "Groupes cibles",
-     "qt_field_cluster_threshold": "Seuil de clustering",
-     "qt_field_coadd_cleanup": "Nettoyer les fichiers memmap après l'exécution",
-diff --git a/zemosaic_config.py b/zemosaic_config.py
-index 80751a43ea25fa22f55eb60998f6c0005aa190eb..59b96560f363b6e944cf671c65de92a837a93239 100644
---- a/zemosaic_config.py
-+++ b/zemosaic_config.py
-@@ -204,50 +204,51 @@ DEFAULT_CONFIG = {
-     "intertile_recenter_clip": [0.85, 1.18],
-     "use_auto_intertile": False,
-     "match_background_for_final": True,
-     "incremental_feather_parity": False,
-     # Early GUI filter option (Phase 0 header-only scan)
-     "enable_early_filter": True,
-     # --- CLES POUR LE ROGNAGE DES MASTER TUILES ---
-     "apply_master_tile_crop": True,  # Désactivé par défaut
-     "master_tile_crop_percent": 3.0,  # Pourcentage par côté si activé (ex: 10%)
-     "quality_crop_enabled": False,
-     "quality_crop_band_px": 32,
-     "quality_crop_k_sigma": 2.0,
-     "quality_crop_margin_px": 8,
-     # --- Master Tile Quality Gate (ZeQualityMT) ---
-     "quality_gate_enabled": False,
-     "quality_gate_threshold": 0.48,
-     "quality_gate_edge_band_px": 64,
-     "quality_gate_k_sigma": 2.5,
-     "quality_gate_erode_px": 3,
-     "quality_gate_move_rejects": True,
-     # --- Alt-Az cleanup (lecropper altZ) ---
-     "altaz_cleanup_enabled": False,
-     "altaz_margin_percent": 5.0,  # UI: "AltAz margin %"
-     "altaz_decay": 0.15,  # UI: "AltAz decay"
-     "altaz_nanize": True,  # UI: "Alt-Az → NaN"
-+    "altaz_nanize_threshold": 0.001,
-     # --- Alt-Az Alpha export ---
-     "altaz_export_alpha_fits": True,
-     "altaz_export_alpha_sidecar": False,
-     "altaz_alpha_sidecar_format": "png",
-     # --- Qualité avancée ---
-     "quality_crop_min_run": 2,  # UI: "min run"
-     "crop_follow_signal": True,
-     # --- FIN CLES POUR LE ROGNAGE ---
- }
- 
- 
- def _home_path(*parts: str) -> str:
-     """Safely join parts under the current user's home directory."""
-     try:
-         return str(Path.home().joinpath(*parts))
-     except Exception:
-         return ""
- 
- 
- def _expand_user_path(candidate: Optional[str]) -> Optional[Path]:
-     """Return a ``Path`` expanded relative to the user's home directory."""
-     if not candidate:
-         return None
-     try:
-         return Path(candidate).expanduser()
-diff --git a/zemosaic_gui_qt.py b/zemosaic_gui_qt.py
-index 162cdea04d6c8be4d414467a3cde70df92ec9a02..b7105f7de8f6ab4b8a80f7cd14daf9d2febc26f7 100644
---- a/zemosaic_gui_qt.py
-+++ b/zemosaic_gui_qt.py
-@@ -1881,50 +1881,67 @@ class ZeMosaicQtMainWindow(QMainWindow):
-             self._tr("qt_field_altaz_enabled", "Enable Alt-Az cleanup"),
-         )
-         self._register_double_spinbox(
-             "altaz_margin_percent",
-             altaz_layout,
-             self._tr("qt_field_altaz_margin", "Margin (%)"),
-             minimum=0.0,
-             maximum=50.0,
-             single_step=0.5,
-             decimals=1,
-         )
-         self._register_double_spinbox(
-             "altaz_decay",
-             altaz_layout,
-             self._tr("qt_field_altaz_decay", "Decay"),
-             minimum=0.0,
-             maximum=2.0,
-             single_step=0.05,
-             decimals=2,
-         )
-         self._register_checkbox(
-             "altaz_nanize",
-             altaz_layout,
-             self._tr("qt_field_altaz_nanize", "Convert Alt-Az gaps to NaN"),
-         )
-+        self._register_double_spinbox(
-+            "altaz_nanize_threshold",
-+            altaz_layout,
-+            self._tr("qt_field_altaz_nanize_threshold", "ALT-AZ nanize threshold"),
-+            minimum=0.0,
-+            maximum=1.0,
-+            single_step=0.01,
-+            decimals=3,
-+        )
-+        binding = self._config_fields.get("altaz_nanize_threshold")
-+        if binding and binding.get("widget"):
-+            binding["widget"].setToolTip(
-+                self._tr(
-+                    "qt_field_altaz_nanize_threshold_tooltip",
-+                    "Pixels where the ALT-AZ mask opacity is <= this threshold are treated as invalid (NaN/0). Increase to remove more border ramps.",
-+                )
-+            )
-         layout.addWidget(altaz_group)
- 
-         quality_gate_group = QGroupBox(
-             self._tr("qt_group_quality_gate", "Master tile quality gate"),
-             group,
-         )
-         quality_gate_layout = QFormLayout(quality_gate_group)
-         quality_gate_layout.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
-         self._register_checkbox(
-             "quality_gate_enabled",
-             quality_gate_layout,
-             self._tr("qt_field_quality_gate_enabled", "Enable quality gate"),
-         )
-         self._register_checkbox(
-             "quality_gate_move_rejects",
-             quality_gate_layout,
-             self._tr("qt_field_quality_gate_move", "Move rejected frames to subfolder"),
-         )
-         self._register_double_spinbox(
-             "quality_gate_threshold",
-             quality_gate_layout,
-             self._tr("qt_field_quality_gate_threshold", "Threshold"),
-             minimum=0.0,
-             maximum=1.0,
-             single_step=0.01,
-@@ -3679,50 +3696,51 @@ class ZeMosaicQtMainWindow(QMainWindow):
-             "radial_shape_power": 2.0,
-             "cluster_panel_threshold": 0.03,
-             "cluster_target_groups": 0,
-             "cluster_orientation_split_deg": 0.0,
-             "inter_master_merge_enable": False,
-             "inter_master_overlap_threshold": 0.60,
-             "inter_master_stack_method": "winsor",
-             "inter_master_min_group_size": 2,
-             "inter_master_max_group": 64,
-             "inter_master_memmap_policy": "auto",
-             "inter_master_local_scale": "final",
-             "inter_master_photometry_intragroup": True,
-             "inter_master_photometry_intersuper": True,
-             "inter_master_photometry_clip_sigma": 3.0,
-             "cache_retention": "run_end",
-             "quality_crop_enabled": False,
-             "quality_crop_band_px": 32,
-             "quality_crop_k_sigma": 2.0,
-             "quality_crop_margin_px": 8,
-             "quality_crop_min_run": 2,
-             "crop_follow_signal": True,
-             "altaz_cleanup_enabled": False,
-             "altaz_margin_percent": 5.0,
-             "altaz_decay": 0.15,
-             "altaz_nanize": True,
-+            "altaz_nanize_threshold": 0.001,
-             "quality_gate_enabled": False,
-             "quality_gate_threshold": 0.48,
-             "quality_gate_edge_band_px": 64,
-             "quality_gate_k_sigma": 2.5,
-             "quality_gate_erode_px": 3,
-             "quality_gate_move_rejects": True,
-             "qt_main_window_geometry": None,
-             "qt_main_columns_state": None,
-             "qt_main_left_state": None,
-             "two_pass_coverage_renorm": False,
-             "two_pass_cov_sigma_px": 50,
-             "two_pass_cov_gain_clip": [0.85, 1.18],
-             "apply_master_tile_crop": True,
-             "master_tile_crop_percent": 3.0,
-             "match_background_for_final": True,
-             "enable_tile_weighting": True,
-             "tile_weight_mode": "n_frames",
-             "incremental_feather_parity": False,
-             "intertile_photometric_match": True,
-             "intertile_preview_size": 512,
-             "intertile_overlap_min": 0.05,
-             "intertile_sky_percentile": [30.0, 70.0],
-             "intertile_robust_clip_sigma": 2.5,
-             "intertile_global_recenter": True,
-             "intertile_recenter_clip": [0.85, 1.18],
-@@ -5783,50 +5801,51 @@ class ZeMosaicQtMainWindow(QMainWindow):
-             "output_dir": str(self.config.get("output_dir", "") or ""),
-             "auto_detect_seestar": bool(self.config.get("auto_detect_seestar", True)),
-             "force_seestar_mode": bool(self.config.get("force_seestar_mode", False)),
-             "sds_mode_default": bool(self.config.get("sds_mode_default", False)),
-             "global_coadd_method": str(self.config.get("global_coadd_method", "kappa_sigma") or "kappa_sigma"),
-             "global_coadd_k": global_coadd_k_value,
-             "global_wcs_output_path": str(
-                 self.config.get("global_wcs_output_path", "global_mosaic_wcs.fits")
-                 or "global_mosaic_wcs.fits"
-             ),
-             "global_wcs_pixelscale_mode": str(self.config.get("global_wcs_pixelscale_mode", "median") or "median"),
-             "global_wcs_padding_percent": global_wcs_padding_value,
-             "global_wcs_orientation": str(self.config.get("global_wcs_orientation", "north_up") or "north_up"),
-             "global_wcs_res_override": self.config.get("global_wcs_res_override"),
-             "apply_master_tile_crop": bool(self.config.get("apply_master_tile_crop", True)),
-             "master_tile_crop_percent": float(self.config.get("master_tile_crop_percent", 3.0) or 3.0),
-             "quality_crop_enabled": bool(self.config.get("quality_crop_enabled", False)),
-             "quality_crop_band_px": int(self.config.get("quality_crop_band_px", 32) or 32),
-             "quality_crop_k_sigma": float(self.config.get("quality_crop_k_sigma", 2.0) or 2.0),
-             "quality_crop_margin_px": int(self.config.get("quality_crop_margin_px", 8) or 8),
-             "quality_crop_min_run": int(self.config.get("quality_crop_min_run", 2) or 2),
-             "altaz_cleanup_enabled": bool(self.config.get("altaz_cleanup_enabled", False)),
-             "altaz_margin_percent": float(self.config.get("altaz_margin_percent", 5.0) or 5.0),
-             "altaz_decay": float(self.config.get("altaz_decay", 0.15) or 0.15),
-             "altaz_nanize": bool(self.config.get("altaz_nanize", True)),
-+            "altaz_nanize_threshold": float(self.config.get("altaz_nanize_threshold", 0.001) or 0.001),
-             "quality_gate_enabled": bool(self.config.get("quality_gate_enabled", False)),
-             "quality_gate_threshold": float(self.config.get("quality_gate_threshold", 0.48) or 0.48),
-             "quality_gate_edge_band_px": int(self.config.get("quality_gate_edge_band_px", 64) or 64),
-             "quality_gate_k_sigma": float(self.config.get("quality_gate_k_sigma", 2.5) or 2.5),
-             "quality_gate_erode_px": int(self.config.get("quality_gate_erode_px", 3) or 3),
-             "quality_gate_move_rejects": bool(self.config.get("quality_gate_move_rejects", True)),
-             "auto_limit_frames_per_master_tile": bool(self.config.get("auto_limit_frames_per_master_tile", True)),
-             "max_raw_per_master_tile": int(self.config.get("max_raw_per_master_tile", 0) or 0),
-         }
- 
-         try:
-             filter_result = launch_filter_interface_qt(
-                 str(input_dir_path),
-                 initial_overrides,
-                 stream_scan=True,
-                 scan_recursive=True,
-                 batch_size=200,
-                 preview_cap=1500,
-                 solver_settings_dict=solver_payload,
-                 config_overrides=config_overrides,
-             )
-         except Exception as exc:  # pragma: no cover - defensive guard
-             template = self._tr(
-                 "qt_log_filter_error", "Filter UI error: {error}"
-             )
+ ## 5) Nettoyage
+-- Garder les logs INFO (utiles).
+-- Ne pas ajouter de dépendances.
++- [ ] Garder les logs INFO (utiles).
++- [ ] Ne pas ajouter de dépendances.
 diff --git a/zemosaic_worker.py b/zemosaic_worker.py
-index f718524b1fe5f162480a7283934862366c50260c..9ec6c7cb0935a2d84a363e1c9b125489c648fc62 100644
+index 8c81728db0544401c5ac2f19541248a86d7f666d..fd88dbda9b496056c8547df026449ebf24a5b5a6 100644
 --- a/zemosaic_worker.py
 +++ b/zemosaic_worker.py
-@@ -645,50 +645,58 @@ def _apply_lecropper_pipeline(
-     try:
-         az_enabled = bool(cfg.get("altaz_cleanup_enabled", False))
-     except Exception:
-         az_enabled = False
-     try:
-         az_margin = float(cfg.get("altaz_margin_percent", 5.0))
-     except Exception:
-         az_margin = 5.0
-     try:
-         az_decay = float(cfg.get("altaz_decay", 0.15))
-     except Exception:
-         az_decay = 0.15
-     try:
-         az_nanize = bool(cfg.get("altaz_nanize", True))
-     except Exception:
-         az_nanize = True
-     try:
-         az_alpha_soft = float(cfg.get("altaz_alpha_soft_threshold", 1e-3))
-     except Exception:
-         az_alpha_soft = 1e-3
-     if not math.isfinite(az_alpha_soft):
-         az_alpha_soft = 1e-3
-     else:
-         az_alpha_soft = float(np.clip(az_alpha_soft, 0.0, 1.0))
-     hard_threshold = az_alpha_soft
-+    try:
-+        az_nanize_threshold = float(cfg.get("altaz_nanize_threshold", hard_threshold))
-+    except Exception:
-+        az_nanize_threshold = hard_threshold
-+    if not math.isfinite(az_nanize_threshold):
-+        az_nanize_threshold = 1e-3
-+    else:
-+        az_nanize_threshold = float(np.clip(az_nanize_threshold, 0.0, 1.0))
- 
-     out = arr
-     alpha_mask_norm: np.ndarray | None = None
-     altaz_masked_used = False
-     altaz_mask2d_used = False
-     try:
-         if q_enabled and hasattr(lecropper, "quality_crop"):
-             out = lecropper.quality_crop(
-                 out,
-                 band_px=band_px,
-                 k_sigma=k_sigma,
-                 margin_px=margin_px,
-                 min_run=min_run,
+@@ -8036,50 +8036,51 @@ def _run_shared_phase45_phase5_pipeline(
+                 match_bg=True,
+                 apply_crop=apply_crop_for_assembly,
+                 crop_percent=master_tile_crop_percent_config,
+                 use_gpu=effective_use_gpu,
+                 use_memmap=bool(coadd_use_memmap_config),
+                 memmap_dir=(coadd_memmap_dir_config or output_folder),
+                 cleanup_memmap=False,
+                 base_progress_phase5=base_progress_phase5,
+                 progress_weight_phase5=progress_weight_phase5,
+                 start_time_total_run=start_time_total,
+                 intertile_photometric_match=intertile_match_flag,
+                 intertile_preview_size=int(intertile_preview_size_config),
+                 intertile_overlap_min=float(intertile_overlap_min_config),
+                 intertile_sky_percentile=intertile_sky_percentile_tuple,
+                 intertile_robust_clip_sigma=float(intertile_robust_clip_sigma_config),
+                 intertile_global_recenter=bool(intertile_global_recenter_config),
+                 intertile_recenter_clip=intertile_recenter_clip_tuple,
+                 use_auto_intertile=bool(use_auto_intertile_config),
+                 collect_tile_data=collected_tiles_for_second_pass,
+                 global_anchor_shift=global_anchor_shift,
+                 phase45_enabled=phase45_active_flag,
+                 parallel_plan=parallel_plan_phase5,
+                 enable_tile_weighting=tile_weighting_enabled_flag,
+                 tile_weight_mode=tile_weight_mode,
+                 stats_callback=_emit_phase5_stats,
++                existing_master_tiles_mode=bool(use_existing_master_tiles_mode),
              )
+         except Exception as exc:
+             logger.exception("Reproject+Coadd assembly failed", exc_info=True)
+             final_mosaic_data_HWC = None
+         log_key_phase5_failed = "run_error_phase5_assembly_failed_reproject_coadd"
+         log_key_phase5_finished = "run_info_phase5_finished_reproject_coadd"
  
-         if az_enabled:
-             mask2d = None
-             mask_helper = getattr(lecropper, "mask_altaz_artifacts", None)
-             base_for_mask = out
-             if callable(mask_helper):
-                 try:
-                     masked, mask2d = mask_helper(
-                         base_for_mask,
-                         margin_percent=az_margin,
-                         decay_ratio=az_decay,
-@@ -721,68 +729,72 @@ def _apply_lecropper_pipeline(
-                     if candidate is not None:
-                         out = candidate
-                         altaz_masked_used = True
-                     altaz_mask2d_used = mask2d is not None
-                 else:
-                     out = cleaned
-                     altaz_masked_used = out is not None
-             elif hasattr(lecropper, "apply_altaz_cleanup"):
-                 cleaned = lecropper.apply_altaz_cleanup(
-                     base_for_mask,
-                     margin_percent=az_margin,
-                     decay=az_decay,
-                     nanize=az_nanize,
-                 )
-                 if isinstance(cleaned, (tuple, list)) and len(cleaned) >= 2:
-                     candidate, mask2d = cleaned[:2]
-                     if candidate is not None:
-                         out = candidate
-                         altaz_masked_used = True
-                     altaz_mask2d_used = mask2d is not None
-                 else:
-                     out = cleaned
-                     altaz_masked_used = out is not None
+     if final_mosaic_data_HWC is None:
+         pcb(
+             log_key_phase5_failed or "run_error_phase5_assembly_failed_unknown",
+             prog=base_progress_phase5 + progress_weight_phase5,
+             lvl="ERROR",
+         )
+         _emit_phase5_stats(0, tiles_total_phase5, force=True, stage="failed")
+         return master_tiles, None, None, None, None, base_progress_phase5 + progress_weight_phase5
  
-             if mask2d is not None:
-+                try:
-+                    logger.info("lecropper: altaz_nanize_threshold=%.3f", az_nanize_threshold)
-+                except Exception:
-+                    pass
-                 alpha_mask_norm = np.asarray(mask2d, dtype=np.float32, copy=False)
--                mask_zero = alpha_mask_norm <= hard_threshold
-+                mask_zero = alpha_mask_norm <= az_nanize_threshold
-                 # Always apply nanize/zeroize on the unattenuated base_for_mask,
-                 # not on `out` (which could have been attenuated elsewhere).
-                 target_for_mask = base_for_mask
-                 if isinstance(target_for_mask, np.ndarray) and target_for_mask.ndim == 3:
-                     mask_zero = mask_zero[..., None]
-                 if az_nanize:
-                     out = np.where(mask_zero, np.nan, target_for_mask)
-                 else:
-                     out = np.where(mask_zero, 0.0, target_for_mask)
-                 altaz_mask2d_used = True
-             try:
-                 logger.info(
-                     "MT_PIPELINE: altaz_cleanup applied: masked_used=%s mask2d_used=%s threshold=%g",
-                     bool(altaz_masked_used),
-                     bool(altaz_mask2d_used),
--                    hard_threshold,
-+                    az_nanize_threshold,
+     current_global_progress = base_progress_phase5 + progress_weight_phase5
+ 
+     if USE_INCREMENTAL_ASSEMBLY:
+         def _load_tiles_for_two_pass_phase5():
+             return _load_master_tiles_for_two_pass(
+                 valid_master_tiles_for_assembly,
+                 apply_crop=apply_crop_for_assembly,
+                 crop_percent=master_tile_crop_percent_config,
+                 logger=logger,
+@@ -12745,50 +12746,51 @@ def assemble_final_mosaic_reproject_coadd(
+     cleanup_memmap: bool = True,
+     assembly_process_workers: int = 0,
+     re_solve_cropped_tiles: bool = False,
+     solver_settings: dict | None = None,
+     solver_instance=None,
+     use_gpu: bool = False,
+     base_progress_phase5: float | None = None,
+     progress_weight_phase5: float | None = None,
+     start_time_total_run: float | None = None,
+     intertile_photometric_match: bool = False,
+     intertile_preview_size: int = 512,
+     intertile_overlap_min: float = 0.05,
+     intertile_sky_percentile: tuple[float, float] | list[float] = (30.0, 70.0),
+     intertile_robust_clip_sigma: float = 2.5,
+     intertile_global_recenter: bool = True,
+     intertile_recenter_clip: tuple[float, float] | list[float] | None = (0.85, 1.18),
+     use_auto_intertile: bool = False,
+     collect_tile_data: list | None = None,
+     tile_affine_corrections: list[tuple[float, float]] | None = None,
+     global_anchor_shift: tuple[float, float] | None = None,
+     phase45_enabled: bool = False,
+     parallel_plan: ParallelPlan | None = None,
+     enable_tile_weighting: bool = False,
+     tile_weight_mode: str | None = None,
+     stats_callback: Callable[[int, int, bool], None] | None = None,
++    existing_master_tiles_mode: bool = False,
+ ):
+     """Assemble les master tiles en utilisant ``reproject_and_coadd``."""
+     _pcb = lambda msg_key, prog=None, lvl="INFO_DETAIL", **kwargs: _log_and_callback(
+         msg_key, prog, lvl, callback=progress_callback, **kwargs
+     )
+ 
+     _log_memory_usage(progress_callback, "Début assemble_final_mosaic_reproject_coadd")
+     _pcb(
+         f"ASM_REPROJ_COADD: Options de rognage - Appliquer: {apply_crop}, Pourcentage: {crop_percent if apply_crop else 'N/A'}",
+         lvl="DEBUG_DETAIL",
+     )
+ 
+     explicit_workers = None
+     try:
+         if assembly_process_workers and int(assembly_process_workers) > 0:
+             explicit_workers = int(assembly_process_workers)
+             assembly_process_workers = explicit_workers
+     except Exception:
+         explicit_workers = None
+ 
+     start_time_phase = time.monotonic()
+     plan_rows_cpu_hint: int | None = None
+     plan_rows_gpu_hint: int | None = None
+     plan_chunk_cpu_hint: int | None = None
+     plan_chunk_gpu_hint: int | None = None
+@@ -13941,50 +13943,92 @@ def assemble_final_mosaic_reproject_coadd(
+         lvl="INFO",
+         shape=mosaic_data.shape if mosaic_data is not None else "N/A",
+     )
+ 
+     if mosaic_data is not None:
+         if mosaic_data.ndim != 3:
+             raise ValueError(f"Expected final mosaic in HWC order, got {mosaic_data.shape}")
+         logger.debug("Mosaic shape (HWC): %s", mosaic_data.shape)
+         if isinstance(coverage, np.ndarray) and logger.isEnabledFor(logging.DEBUG):
+             mask = coverage > 0
+             if np.any(mask):
+                 stats = []
+                 for c in range(mosaic_data.shape[-1]):
+                     vals = mosaic_data[..., c][mask]
+                     if vals.size:
+                         stats.append((float(np.mean(vals)), float(np.std(vals))))
+                     else:
+                         stats.append((float("nan"), float("nan")))
+                 logger.debug(
+                     "Reproject overlap stats (mean/std per channel): %s",
+                     stats,
                  )
-             except Exception:
-                 pass
-     except Exception as exc:
+ 
+     if isinstance(coverage, np.ndarray):
+         coverage = np.where(np.isfinite(coverage), coverage, 0.0).astype(np.float32, copy=False)
++    if isinstance(coverage, np.ndarray) and existing_master_tiles_mode:
++        try:
++            cov_mask_bool = np.asarray(coverage, dtype=np.float32, order="C")
++            cov_mask_bool = np.nan_to_num(cov_mask_bool, nan=0.0, posinf=0.0, neginf=0.0)
++            cov_mask_bool = cov_mask_bool > 0.0
++            alpha_target_shape = cov_mask_bool.shape
++            override_message = None
++            if alpha_final is None:
++                alpha_final = np.ascontiguousarray(cov_mask_bool.astype(np.uint8) * 255)
++                override_message = "alpha_final was None -> rebuilt"
++            else:
++                alpha_arr = np.asarray(alpha_final)
++                if alpha_arr.ndim == 3 and alpha_arr.shape[-1] == 1:
++                    alpha_arr = alpha_arr[..., 0]
++                alpha_arr = np.squeeze(alpha_arr)
++                if alpha_arr.shape != alpha_target_shape:
++                    override_message = (
++                        f"overriding alpha_final due to shape mismatch (alpha={alpha_arr.shape}, coverage={alpha_target_shape})"
++                    )
++                    alpha_final = np.ascontiguousarray(cov_mask_bool.astype(np.uint8) * 255)
++                else:
++                    alpha_zero = alpha_arr == 0
++                    mismatch = int(np.count_nonzero(cov_mask_bool & alpha_zero))
++                    if mismatch > 0:
++                        total_cov = int(np.count_nonzero(cov_mask_bool))
++                        pct = (100.0 * mismatch) / max(1, total_cov)
++                        override_message = f"overriding alpha_final (mismatch={mismatch} px, {pct:.2f}% of covered)"
++                        alpha_final = np.ascontiguousarray(cov_mask_bool.astype(np.uint8) * 255)
++            if alpha_final is not None and alpha_final.shape == alpha_target_shape:
++                mismatch_after = int(np.count_nonzero(cov_mask_bool & (np.asarray(alpha_final) == 0)))
++                if mismatch_after != 0 and logger.isEnabledFor(logging.DEBUG):
++                    logger.debug(
++                        "alpha_from_coverage: mismatch_after=%d (existing_master_tiles_mode)",
++                        mismatch_after,
++                    )
++            if override_message:
++                logger.info(
++                    "alpha_from_coverage (existing_master_tiles_mode): %s",
++                    override_message,
++                )
++        except Exception as exc_alpha_cov:
++            logger.debug("alpha_from_coverage: override skipped due to error: %s", exc_alpha_cov)
+     alpha_zero_mask = None
+     if isinstance(coverage, np.ndarray) and alpha_final is not None:
          try:
-             logger.warning("lecropper pipeline skipped (err=%s)", exc)
+             alpha_arr = np.asarray(alpha_final)
+             if alpha_arr.ndim == 3 and alpha_arr.shape[-1] == 1:
+                 alpha_arr = alpha_arr[..., 0]
+             alpha_arr = np.squeeze(alpha_arr)
+             if alpha_arr.ndim >= 2 and alpha_arr.shape[:2] == coverage.shape:
+                 alpha_zero_mask = alpha_arr <= 0
+                 if np.any(alpha_zero_mask):
+                     coverage = np.where(alpha_zero_mask, 0.0, coverage).astype(np.float32, copy=False)
          except Exception:
-             pass
-         return arr, None
- 
-     return out, alpha_mask_norm
- 
- 
- def _apply_final_mosaic_quality_pipeline(
-     final_mosaic_data: np.ndarray | None,
-     final_mosaic_coverage: np.ndarray | None,
-     final_alpha_map: np.ndarray | None,
-     pipeline_cfg: dict[str, Any] | None,
- ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
-     """Apply the lecropper-based quality pipeline to the final mosaic."""
- 
-     if (
-         final_mosaic_data is None
-         or not pipeline_cfg
-         or not (
+             alpha_zero_mask = None
+     if mosaic_data is not None and coverage is not None:
+         mosaic_data = np.asarray(mosaic_data, dtype=np.float32, copy=False)
+         mosaic_data[~np.isfinite(mosaic_data)] = np.nan
+         nanized_mask = coverage <= 0
+         if alpha_zero_mask is not None:
+             nanized_mask = np.logical_or(nanized_mask, alpha_zero_mask)
+         elif alpha_final is not None and alpha_final.shape[:2] == coverage.shape:
+             nanized_mask = np.logical_or(nanized_mask, alpha_final == 0)
+         nanized_pixels = int(np.count_nonzero(nanized_mask))
+         mosaic_data = _nanize_by_coverage(mosaic_data, coverage, alpha_u8=alpha_final)
+         if nanized_pixels > 0:
+             logger.info(
