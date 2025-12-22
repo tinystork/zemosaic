@@ -11,6 +11,15 @@ Target behavior:
 
 No refactor: surgical patch.
 
+## Progress
+- [x] Step 1) Identify the Phase 5 weight construction point
+- [x] Step 2) Apply tile_weight to GPU input_weights (alpha_weight2d*tile_weight)
+- [x] Step 3) Keep alpha union semantics unchanged
+- [x] Step 4) Make GPU and CPU Phase 5 behavior consistent
+- [x] Step 5) Update debug logging to confirm behavior
+- [ ] Step 6) Two-pass compatibility
+- [ ] Step 7) Validation / Tests
+
 ## Scope (minimal)
 Modify ONLY:
 - zemosaic_worker.py
