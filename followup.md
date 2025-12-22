@@ -1,41 +1,26 @@
-## Checklist d’implémentation (Codex)
+# followup.md
 
-### 1) Preview noir : CPU
-- [x] Dans `zemosaic_utils.py / stretch_auto_asifits_like()`, remplacer `np.percentile` par une logique NaN-aware (nanpercentile + garde-fous).
-- [x] Vérifier qu’aucun gros temporaire float64 n’est introduit (rester en float32).
-- [x] Vérifier le comportement si le canal est 100% NaN → sortie canal = 0 (pas d’exception).
+## What to run
+1) Re-run the same scenario that produced:
+- 3 master tiles, with group sizes like 502×1, 5×1, 3×1
+- a final mosaic where the deep tile appears “écrasé” by noisy tiles
 
-### 2) Preview noir : GPU
-- [x] Dans `zemosaic_utils.py / stretch_auto_asifits_like_gpu()`, remplacer `cp.percentile` par `cp.nanpercentile` (si dispo) ou fallback sur valeurs finies.
-- [x] Ajouter garde-fous (canal vide / vmin-vmax trop faible) → sortie canal = 0.
-- [x] Ne pas modifier la logique de fallback CPU existante.
+2) Capture `zemosaic_worker` log.
 
-### 3) Pondération perdue : keywords
-- [x] Dans `zemosaic_worker.py`, dans `assemble_final_mosaic_reproject_coadd()` → `_extract_tile_weight()` :
-  - [x] ajouter `NRAWPROC`, `NRAWINIT` à la liste des keywords.
-- [x] Ne PAS modifier la construction de `input_weights_list` (éviter double pondération).
-- [x] Ne PAS toucher au mode “I'm using master tiles (skip clustering_master tile creation)”.
+## What to look for in the log
+- A new line from intertile calibration similar to:
+  `[Intertile] Anchor selection biased: anchor=2 ... weight≈502 ...`
+- Then in `assemble_final_mosaic_reproject_coadd`:
+  - `apply_photometric_summary` should show corrections where the deepest tile is close to identity (gain≈1, offset≈0) compared to before.
+  - Shallow tiles may be adjusted more strongly (that’s expected).
 
----
+## Quick sanity checks
+- If connectivity is nonzero, anchor should NOT be a 5-frame/3-frame tile anymore when a 502-frame tile exists.
+- If tile_weights are missing/malformed, behavior must fall back to the previous anchor logic without crashing.
 
-## Procédure de validation manuelle (sans changer d’autres fichiers)
+## If it still looks noisy
+This patch addresses the “wrong anchor” failure mode. If the mosaic is noisy *outside overlaps*, that’s dataset reality (regions covered only by 3–5 frames will remain noisy). In that case the next step would be a UI warning:
+- “Some master tiles have extremely low frame count; expect noisy regions”
+and/or a filter option to exclude tiles below a minimum `tile_weight`.
 
-### A) Valider preview
-1) Lancer un run qui produit des master tiles / mosaïque avec alpha/NaN masking.
-2) Ouvrir le `*_preview.png` :
-   - Vérifier qu’il n’est plus noir (RGB non nuls) et que la transparence est conservée.
-
-### B) Valider pondération
-1) Prendre un FITS d’entrée (existing master tile) contenant `NRAWPROC` / `NRAWINIT`.
-2) Lancer l’assemblage final en mode “existing master tiles”.
-3) Vérifier dans les logs :
-   - ligne “Tile-weighting enabled — mode=N_FRAMES”
-   - summary min/max/mean ≠ 1.0 si les headers ont des valeurs > 1
-4) Vérifier que le rendu final n’est plus “écrasé” par des tuiles moins profondes (qualitativement, le signal doit mieux tenir).
-
----
-
-## Anti-régressions (à surveiller)
-- Preview : ne pas changer l’alpha, seulement rendre le stretch robuste aux NaN.
-- Poids : ne pas doubler les poids (ne pas multiplier `input_weights` *et* passer `tile_weights`).
-- Aucun impact sur le clustering, la création de master tiles, ni le pipeline non-existing-master-tiles.
+(But do not implement that in this patch.)
