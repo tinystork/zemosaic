@@ -2083,6 +2083,7 @@ def compute_intertile_affine_calibration(
     use_auto_intertile: bool = False,
     logger=None,
     progress_callback=None,
+    tile_weights=None,
 ):
     """Calcule des corrections affine (gain/offset) inter-tuiles avant reprojection.
 
@@ -2330,6 +2331,37 @@ def compute_intertile_affine_calibration(
     pair_entries = []
     connectivity = np.zeros(num_tiles, dtype=np.float64)
     preview_size = max(128, int(preview_size))
+    weight_scores = None
+    weights_for_anchor = None
+
+    if tile_weights is not None:
+        try:
+            weights_array = np.asarray(tile_weights, dtype=np.float64).reshape(-1)
+        except Exception:
+            weights_array = None
+        if weights_array is not None and len(weights_array) != num_tiles:
+            _log_intertile(
+                f"tile_weights ignored: expected {num_tiles}, got {len(weights_array)}",
+                level="WARN",
+            )
+            weights_array = None
+        if weights_array is not None:
+            with np.errstate(invalid="ignore"):
+                weights_array = np.where(np.isfinite(weights_array) & (weights_array > 0.0), weights_array, 1.0)
+            try:
+                positive = weights_array[weights_array > 0.0]
+                median_ref = float(np.median(positive)) if positive.size else 1.0
+            except Exception:
+                median_ref = 1.0
+            if not math.isfinite(median_ref) or median_ref <= 0.0:
+                median_ref = 1.0
+            with np.errstate(invalid="ignore", divide="ignore"):
+                normed = weights_array / median_ref
+                scores = np.sqrt(normed)
+            if scores is not None:
+                scores = np.where(np.isfinite(scores) & (scores > 0.0), scores, 1.0)
+            weight_scores = scores
+            weights_for_anchor = weights_array
 
     for idx, overlap in enumerate(overlaps, 1):
         i = overlap["i"]
@@ -2466,7 +2498,27 @@ def compute_intertile_affine_calibration(
     if not pair_entries:
         return {}
 
-    anchor = int(np.argmax(connectivity)) if np.any(connectivity > 0) else 0
+    if weight_scores is None:
+        anchor = int(np.argmax(connectivity)) if np.any(connectivity > 0) else 0
+    else:
+        if np.any(connectivity > 0):
+            score = connectivity * weight_scores
+            anchor = int(np.argmax(score))
+            selected_score = float(score[anchor])
+        else:
+            score = weight_scores
+            anchor = int(np.argmax(weight_scores))
+            selected_score = float(weight_scores[anchor])
+        selected_connectivity = float(connectivity[anchor])
+        selected_weight = float(weights_for_anchor[anchor]) if weights_for_anchor is not None else 1.0
+        try:
+            _log_intertile(
+                f"Anchor selection biased: anchor={anchor} connectivity={selected_connectivity:.4f} weight={selected_weight:.4f} score={selected_score:.4f}",
+                level="INFO",
+            )
+        except Exception:
+            pass
+
     solution = solve_global_affine(num_tiles, pair_entries, anchor_index=anchor)
     if progress_callback:
         try:
