@@ -1,541 +1,280 @@
 diff --git a/agent.md b/agent.md
-index af2dbd09fd2c116e5aee44278cb116e5b5cc00ac..298292d229469ecdf64e1590d3289dca0afeeecf 100644
+index 0d608c478edc64a02f8d071491dcd55153318c7a..45f66607005b31a73e2718e57070d574e7f3c0a1 100644
 --- a/agent.md
 +++ b/agent.md
-@@ -1,79 +1,35 @@
+@@ -1,38 +1,47 @@
  # agent.md
  
  ## Goal
- Fix the "deep master tile gets crushed by noisy tiles" scenario when inter-tile photometric calibration (gain/offset) selects an anchor tile purely based on overlap connectivity. When tile weights are highly unbalanced (e.g. 502 vs 5 vs 3), the anchor must prefer the highest-quality/deepest tile, otherwise the calibration drifts toward noisy tiles and the final mosaic looks dominated by noise.
+ Ensure Phase 5 GPU "reproject & coadd" properly applies per-tile scalar weighting (tile_weight, e.g. N_FRAMES=502 vs 5 vs 3)
+ in addition to per-pixel alpha masks. Without this, shallow/noisy master tiles contribute almost equally and can dominate
+ the mosaic.
  
- We keep this as a surgical patch (no refactor). We only add an OPTIONAL `tile_weights` plumbing from worker → utils and use it ONLY to bias the anchor choice (and fallback when connectivity is flat).
+ Target behavior:
+ - Effective weights for coadd must be: effective_weight2d = alpha_weight2d * tile_weight
+ - Output coverage/weight_sum must reflect weighted sums (max can reach ~sum(tile_weight) in overlaps).
  
- ## Scope
+ No refactor: surgical patch.
+ 
++## Progress
++- [x] Step 1) Identify the Phase 5 weight construction point
++- [x] Step 2) Apply tile_weight to GPU input_weights (alpha_weight2d*tile_weight)
++- [x] Step 3) Keep alpha union semantics unchanged
++- [x] Step 4) Make GPU and CPU Phase 5 behavior consistent
++- [x] Step 5) Update debug logging to confirm behavior
++- [ ] Step 6) Two-pass compatibility
++- [ ] Step 7) Validation / Tests
++
+ ## Scope (minimal)
  Modify ONLY:
- - `/mnt/data/zemosaic_worker.py`
- - `/mnt/data/zemosaic_utils.py`
+ - zemosaic_worker.py
+ - (optional) zemosaic_utils.py or GPU helper module only if strictly required by current architecture
  
- No other files. No behavior change when `tile_weights` is not provided.
+ Do not change GUI, settings schema, or unrelated phases.
  
- ## Background (what’s wrong)
- `zemosaic_utils.compute_intertile_affine_calibration()` currently selects:
- `anchor = argmax(connectivity)`
- where `connectivity` is computed from overlap pairs. With “existing master tiles” and weird coverage geometries, a noisy tile can have high connectivity and becomes anchor, forcing the deep tile to match it (perceived as “écrasement”).
+ ## Background
+ Logs show:
+ - Tile-weighting enabled (min=5 max=502) is computed.
+ - But Phase 5 logs input_weights sample source=alpha_weight2d with max=1.0, indicating tile_weight is not applied to GPU coadd.
+ 
+ CPU path already multiplies input_weights by tile_weight; GPU path must mirror it.
  
  ## Plan
  
--### 1) Pass tile_weights into intertile calibration (worker → utils)
--In `zemosaic_worker.py`, inside `assemble_final_mosaic_reproject_coadd`, when building `tile_sources` for `_compute_intertile_affine_corrections_from_sources`, also build a list:
--- `tile_weights_for_sources = [float(entry.get("tile_weight", 1.0)) for entry in effective_tiles]`
--This list must remain aligned with `tile_sources` order (same loop).
--
--Update the call:
--`_compute_intertile_affine_corrections_from_sources(..., tile_weights=tile_weights_for_sources, ...)`
--
--### 2) Extend `_compute_intertile_affine_corrections_from_sources` signature
--In `zemosaic_worker.py`, update:
--`def _compute_intertile_affine_corrections_from_sources(...):`
--to accept:
--`tile_weights: list[float] | None = None`
--
--Then pass it through to:
--`zemosaic_utils.compute_intertile_affine_calibration(..., tile_weights=tile_weights, ...)`
--
--Keep default `None` to preserve all old call sites.
--
--### 3) Bias anchor selection in `compute_intertile_affine_calibration`
--In `zemosaic_utils.py`, update signature:
--`def compute_intertile_affine_calibration(..., tile_weights=None, ...)`
--
--Implementation rules:
--- If `tile_weights is None`: keep existing behavior EXACTLY.
--- If provided:
--  - Validate length == num_tiles; otherwise ignore (log a warning and proceed without weights).
--  - Convert to float64 array, replace non-finite or <=0 with 1.0.
--  - Normalize gently to avoid insane dominance:
--    - `med = median(weights[weights>0])` (fallback 1.0)
--    - `w_norm = weights / med`
--    - Optional mild compression: `w_score = np.sqrt(w_norm)` (preferred) OR `np.log1p(w_norm)`; choose sqrt for simplicity.
--  - At anchor selection line (currently around `anchor = int(np.argmax(connectivity)) if np.any(connectivity > 0) else 0`):
--    - If any connectivity > 0:
--      - `score = connectivity * w_score`
--      - anchor = argmax(score)
--    - Else (no overlaps):
--      - anchor = argmax(w_score)
--
--Add an INFO/DEBUG log (short) e.g.:
--`[Intertile] Anchor selection biased: anchor=<idx> connectivity=<val> weight=<val> score=<val>`
--(Do not spam; one line.)
--
--### 4) Do NOT change the correction mapping
--Do NOT reorder tiles. We only change which index is fixed to (gain=1, offset=0) in the global solve. The returned correction list/dict mapping remains aligned with the original tile order.
--
--### 5) Tests / Validation
--Run the exact problematic dataset (3 master tiles; weights ~502,5,3). Verify in logs:
--- Intertile anchor chosen corresponds to the tile with weight ~502 (even if its connectivity is lower).
--- `apply_photometric` no longer drags the deep tile toward the shallow tiles.
--- Visual: deep tile’s signal is preserved; shallow tiles do not “wash out” the mosaic.
--
--Also verify a normal run where `tile_weights` not passed behaves unchanged.
-+- [x] Pass tile_weights into intertile calibration (worker → utils) by plumbing `tile_weights_for_sources` alongside `tile_sources` and forwarding it to `_compute_intertile_affine_corrections_from_sources(..., tile_weights=tile_weights_for_sources, ...)`.
-+- [x] Extend `_compute_intertile_affine_corrections_from_sources` signature to accept `tile_weights: list[float] | None = None` and forward it to `compute_intertile_affine_calibration(..., tile_weights=tile_weights, ...)` while keeping default `None`.
-+- [x] Bias anchor selection in `compute_intertile_affine_calibration` with optional `tile_weights`:
-+  - If `tile_weights is None`: keep existing behavior EXACTLY.
-+  - If provided, validate length, sanitize to float64 with non-finite/<=0 mapped to 1.0, normalize by median (>0 only), and use a mild `np.sqrt` compression for scores.
-+  - If any connectivity > 0: `score = connectivity * w_score`; anchor = argmax(score). Else: anchor = argmax(w_score).
-+  - Add a concise `[Intertile] Anchor selection biased: anchor=<idx> connectivity=<val> weight=<val> score=<val>` log.
-+- [x] Do NOT change the correction mapping; only the fixed anchor index changes while preserving tile order.
-+- [ ] Tests / Validation: rerun the problematic dataset (weights ~502,5,3) to confirm anchor selection and unchanged behavior when `tile_weights` is absent.
+ ### 1) Identify the Phase 5 weight construction point
+ In `assemble_final_mosaic_reproject_coadd()` locate the block that defines `input_weights` for each channel/tile.
+ It currently sets `input_weights` from per-pixel alpha (e.g. alpha_weight2d).
  
- ## Acceptance Criteria
- - Backward compatible (no error when tile_weights absent).
- - With tile_weights present and very unbalanced, anchor prefers the deep tile.
- - No refactor; minimal diff; only the two files listed.
+ Also locate the scalar per-tile weight (tile_weight) used by tile-weighting mode (N_FRAMES etc).
+ This likely exists as `tile_weight`, `tile_weights[idx]`, or `tile_entry["tile_weight"]`.
+ 
+ ### 2) Apply tile_weight to GPU input_weights (the core fix)
+ Right after `alpha_weight2d` / `input_weights` is prepared for a tile, and BEFORE calling any GPU reproject/coadd kernel:
 diff --git a/followup.md b/followup.md
-index c80be233249b55daec164a3e3897ec3622740148..9d0991d33bd3524188f4cef0091b7f362b0cf26c 100644
+index a4eff94970b6ed36a9647586188e3eb63fbd8644..de1239865bffacb69998175bf16d80e73622e7fe 100644
 --- a/followup.md
 +++ b/followup.md
-@@ -1,26 +1,25 @@
+@@ -1,27 +1,32 @@
  # followup.md
  
- ## What to run
--1) Re-run the same scenario that produced:
--- 3 master tiles, with group sizes like 502×1, 5×1, 3×1
--- a final mosaic where the deep tile appears “écrasé” by noisy tiles
--
--2) Capture `zemosaic_worker` log.
-+- [ ] Re-run the same scenario that produced:
-+  - 3 master tiles, with group sizes like 502×1, 5×1, 3×1
-+  - a final mosaic where the deep tile appears “écrasé” by noisy tiles
-+- [ ] Capture `zemosaic_worker` log.
- 
- ## What to look for in the log
--- A new line from intertile calibration similar to:
-+- [ ] A new line from intertile calibration similar to:
-   `[Intertile] Anchor selection biased: anchor=2 ... weight≈502 ...`
--- Then in `assemble_final_mosaic_reproject_coadd`:
-+- [ ] Then in `assemble_final_mosaic_reproject_coadd`:
-   - `apply_photometric_summary` should show corrections where the deepest tile is close to identity (gain≈1, offset≈0) compared to before.
-   - Shallow tiles may be adjusted more strongly (that’s expected).
- 
- ## Quick sanity checks
--- If connectivity is nonzero, anchor should NOT be a 5-frame/3-frame tile anymore when a 502-frame tile exists.
--- If tile_weights are missing/malformed, behavior must fall back to the previous anchor logic without crashing.
-+- [ ] If connectivity is nonzero, anchor should NOT be a 5-frame/3-frame tile anymore when a 502-frame tile exists.
-+- [ ] If tile_weights are missing/malformed, behavior must fall back to the previous anchor logic without crashing.
- 
- ## If it still looks noisy
- This patch addresses the “wrong anchor” failure mode. If the mosaic is noisy *outside overlaps*, that’s dataset reality (regions covered only by 3–5 frames will remain noisy). In that case the next step would be a UI warning:
- - “Some master tiles have extremely low frame count; expect noisy regions”
- and/or a filter option to exclude tiles below a minimum `tile_weight`.
- 
- (But do not implement that in this patch.)
-diff --git a/zemosaic_utils.py b/zemosaic_utils.py
-index af3fca724a4162ac50a9024aab109ff6b5ac5173..ee5b0ec1b9a995ea6fdb3ff0bbcb4183d85cf0a3 100644
---- a/zemosaic_utils.py
-+++ b/zemosaic_utils.py
-@@ -2061,50 +2061,51 @@ def solve_global_affine(num_tiles: int, pair_entries, anchor_index: int = 0):
-     gains = sol[:num_tiles]
-     offsets = sol[num_tiles:]
-     result = {}
-     for idx in range(num_tiles):
-         g = float(gains[idx])
-         o = float(offsets[idx])
-         if not np.isfinite(g) or abs(g) < 1e-6:
-             g = 1.0
-         if not np.isfinite(o):
-             o = 0.0
-         result[idx] = (g, o)
-     return result
- 
- 
- def compute_intertile_affine_calibration(
-     tile_data_with_wcs,
-     final_output_wcs,
-     final_output_shape_hw,
-     preview_size: int = 512,
-     min_overlap_fraction: float = 0.05,
-     sky_percentile: tuple[float, float] | list[float] = (30.0, 70.0),
-     robust_clip_sigma: float = 2.5,
-     use_auto_intertile: bool = False,
-     logger=None,
-     progress_callback=None,
-+    tile_weights=None,
- ):
-     """Calcule des corrections affine (gain/offset) inter-tuiles avant reprojection.
- 
-     ``tile_data_with_wcs`` peut contenir des tuples ``(data, wcs)`` ou
-     ``(data, wcs, mask2d)`` pour injecter un masque (0..1) optionnel sur la zone
-     d'overlap.
-     """
- 
-     if tile_data_with_wcs is None or len(tile_data_with_wcs) < 2:
-         return {}
-     if reproject_interp is None or not ASTROPY_AVAILABLE_IN_UTILS:
-         return {}
-     try:
-         header_full = final_output_wcs.to_header()
-     except Exception:
-         return {}
- 
-     parsed_entries: list[tuple[np.ndarray, Any, np.ndarray | None]] = []
-     for entry in tile_data_with_wcs:
-         if not isinstance(entry, (list, tuple)) or len(entry) < 2:
-             continue
-         data = entry[0]
-         wcs_obj = entry[1]
-         mask = entry[2] if len(entry) >= 3 else None
-         parsed_entries.append((data, wcs_obj, mask))
-@@ -2308,50 +2309,81 @@ def compute_intertile_affine_calibration(
-                     scaled = cp.asnumpy(scaled)  # type: ignore
-                 new_tile_data.append((scaled, wcs_obj, mask) if mask is not None else (scaled, wcs_obj))
-             tile_data_with_wcs[:] = new_tile_data
- 
-             _log_intertile("Applied global normalization to all master tiles.", level="INFO")
- 
-         except Exception as e_norm:
-             _log_intertile(f"Global normalization fallback failed: {e_norm}", level="ERROR")
- 
-         return {}
- 
-     min_overlap_fraction = effective_min_overlap
-     _log_intertile(
-         f"Using: preview={preview_size}, min_overlap={effective_min_overlap:.4f}, sky=({sky_low:.1f},{sky_high:.1f}), clip={robust_clip_sigma:.2f}, pairs={len(overlaps)}",
-         level="INFO",
-     )
- 
-     try:
-         from astropy.wcs import WCS as _WCS
-     except Exception:
-         return {}
- 
-     pair_entries = []
-     connectivity = np.zeros(num_tiles, dtype=np.float64)
-     preview_size = max(128, int(preview_size))
-+    weight_scores = None
-+    weights_for_anchor = None
++## Progress
++- [x] Step 1) Anchor selection
++- [x] Step 2) Apply tile_weight to GPU Phase 5 weights
++- [ ] Quick sanity run (CPU vs GPU)
 +
-+    if tile_weights is not None:
-+        try:
-+            weights_array = np.asarray(tile_weights, dtype=np.float64).reshape(-1)
-+        except Exception:
-+            weights_array = None
-+        if weights_array is not None and len(weights_array) != num_tiles:
-+            _log_intertile(
-+                f"tile_weights ignored: expected {num_tiles}, got {len(weights_array)}",
-+                level="WARN",
-+            )
-+            weights_array = None
-+        if weights_array is not None:
-+            with np.errstate(invalid="ignore"):
-+                weights_array = np.where(np.isfinite(weights_array) & (weights_array > 0.0), weights_array, 1.0)
-+            try:
-+                positive = weights_array[weights_array > 0.0]
-+                median_ref = float(np.median(positive)) if positive.size else 1.0
-+            except Exception:
-+                median_ref = 1.0
-+            if not math.isfinite(median_ref) or median_ref <= 0.0:
-+                median_ref = 1.0
-+            with np.errstate(invalid="ignore", divide="ignore"):
-+                normed = weights_array / median_ref
-+                scores = np.sqrt(normed)
-+            if scores is not None:
-+                scores = np.where(np.isfinite(scores) & (scores > 0.0), scores, 1.0)
-+            weight_scores = scores
-+            weights_for_anchor = weights_array
+ ## How to apply step 2 (practical)
+ You already did step 1 (anchor selection). Step 2 is independent and should be applied in Phase 5 only:
  
-     for idx, overlap in enumerate(overlaps, 1):
-         i = overlap["i"]
-         j = overlap["j"]
-         bbox = overlap["bbox"]
-         weight = float(overlap.get("weight", 1.0))
-         if luminance_tiles[i] is None or luminance_tiles[j] is None:
-             continue
-         x0, x1, y0, y1 = bbox
-         sub_w = max(1, x1 - x0)
-         sub_h = max(1, y1 - y0)
-         header = header_full.copy()
-         header["NAXIS1"] = sub_w
-         header["NAXIS2"] = sub_h
-         if "CRPIX1" in header:
-             header["CRPIX1"] = float(header["CRPIX1"]) - x0
-         if "CRPIX2" in header:
-             header["CRPIX2"] = float(header["CRPIX2"]) - y0
-         try:
-             target_wcs = _WCS(header)
-         except Exception:
-             continue
-         try:
-             reproj_i, _ = reproject_interp(
-                 (luminance_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
-@@ -2444,51 +2476,71 @@ def compute_intertile_affine_calibration(
-             continue
-         a_ij, b_ij = fit
-         pair_entries.append((i, j, a_ij, b_ij, weight))
+ 1) Find where Phase 5 prepares `alpha_weight2d` / `input_weights` (the log shows it currently labels them as `source=alpha_weight2d`).
+ 2) Find the scalar `tile_weight` computed from N_FRAMES (or equivalent).
+ 3) Multiply the weights used for coadd by `tile_weight`:
+    - effective weights = alpha_weight2d * tile_weight
+ 4) Make sure this multiplication happens ONCE per tile (avoid triple-multiplying if weight arrays are shared across channels).
+ 5) Keep alpha_union unchanged.
  
-         a_ij, b_ij = fit
-         pair_entries.append((i, j, a_ij, b_ij, weight))
-         connectivity[i] += weight
-         connectivity[j] += weight
+ ## What to look for in logs (must-have)
+ - Before patch (current):
+   `[Phase5] input_weights sample ... source=alpha_weight2d ... max=1.0000`
+ - After patch:
+   `[Phase5] input_weights sample ... source=alpha_weight2d*tile_weight ... max≈502 (or your tile weight)`
  
-         # [ETA] Tick fin de traitement de la paire idx
-         if progress_callback:
-             try:
-                 progress_callback("phase5_intertile_pairs", int(idx), int(len(overlaps)))
-             except Exception:
-                 pass
+ Also look for a single line per tile:
+ `tile_weight applied ... tw=...`
  
-         if progress_callback and idx % 5 == 0:
-             try:
-                 progress_callback("phase5_intertile", idx, len(overlaps))
-             except Exception:
-                 pass
+ ## Quick sanity run
+ Run the same dataset twice:
+ - GPU Phase 5 OFF
+ - GPU Phase 5 ON
  
-     if not pair_entries:
-         return {}
- 
--    anchor = int(np.argmax(connectivity)) if np.any(connectivity > 0) else 0
-+    if weight_scores is None:
-+        anchor = int(np.argmax(connectivity)) if np.any(connectivity > 0) else 0
-+    else:
-+        if np.any(connectivity > 0):
-+            score = connectivity * weight_scores
-+            anchor = int(np.argmax(score))
-+            selected_score = float(score[anchor])
-+        else:
-+            score = weight_scores
-+            anchor = int(np.argmax(weight_scores))
-+            selected_score = float(weight_scores[anchor])
-+        selected_connectivity = float(connectivity[anchor])
-+        selected_weight = float(weights_for_anchor[anchor]) if weights_for_anchor is not None else 1.0
-+        try:
-+            _log_intertile(
-+                f"Anchor selection biased: anchor={anchor} connectivity={selected_connectivity:.4f} weight={selected_weight:.4f} score={selected_score:.4f}",
-+                level="INFO",
-+            )
-+        except Exception:
-+            pass
-+
-     solution = solve_global_affine(num_tiles, pair_entries, anchor_index=anchor)
-     if progress_callback:
-         try:
-             progress_callback(
-                 "Ensuring match_background=True for final coadd.",
-                 None,
-                 "DEBUG_DETAIL",
-             )
-         except Exception:
-             pass
- 
-     return solution
- # Les filtres VerifyWarning sont maintenant dans le try/except d'Astropy ci-dessus.
- 
- 
- 
- 
- 
- 
- 
- # DANS zemosaic_utils.py
- 
- # (Les imports et la définition de ASTROPY_AVAILABLE_IN_UTILS, fits_module_for_utils restent les mêmes)
- # ...
- 
+ Compare:
 diff --git a/zemosaic_worker.py b/zemosaic_worker.py
-index 571752c2d96b2f2fdbb247556b8bf2f9818969ab..1fe3ee7ab8b42d5c3bcd9b4bffc11c0917fca947 100644
+index 1fe3ee7ab8b42d5c3bcd9b4bffc11c0917fca947..8e3d1942de94f49b98d6d681a784ce0f4e37d213 100644
 --- a/zemosaic_worker.py
 +++ b/zemosaic_worker.py
-@@ -6207,50 +6207,51 @@ def _select_quality_anchor(
-     _log_and_callback(
-         "center_anchor_selected",
-         lvl="INFO",
-         callback=progress_callback,
-         tile=int(best_entry["tile_id"]),
-         dist_deg=best_entry.get("distance"),
-         score=best_score,
-     )
- 
-     return int(best_entry["tile_id"])
- 
- 
- def _compute_intertile_affine_corrections_from_sources(
-     sources: list[_TileAffineSource],
-     final_output_wcs,
-     final_output_shape_hw: tuple[int, int],
-     preview_size: int,
-     min_overlap_fraction: float,
-     sky_percentile: tuple[float, float] | list[float],
-     robust_clip_sigma: float,
-     use_auto_intertile: bool,
-     logger_obj=None,
-     progress_callback: Callable | None = None,
-     intertile_global_recenter: bool = False,
-     intertile_recenter_clip: tuple[float, float] | list[float] | None = None,
-+    tile_weights: list[float] | None = None,
- ) -> tuple[list[tuple[float, float]] | None, bool, str, str | None]:
-     """Common implementation for intertile gain/offset computation.
- 
-     Returns
-     -------
-     (list[(gain, offset)] | None, bool, str, str | None)
-         Sanitized affine list (or ``None``), flag indicating whether non-trivial
-         corrections were detected, status string (``\"ok\"``, ``\"skipped\"``,
-         ``\"preview_failed\"``, ``\"compute_failed\"``) and optional error message.
-     """
- 
-     total_tiles = len(sources)
-     if total_tiles < 2:
-         return None, False, "skipped", None
- 
-     if not (
-         ZEMOSAIC_UTILS_AVAILABLE
-         and hasattr(zemosaic_utils, "compute_intertile_affine_calibration")
-     ):
-         return None, False, "skipped", None
- 
-     tile_pairs: list[tuple[np.ndarray, Any] | tuple[np.ndarray, Any, np.ndarray]] = []
-     preview_arrays: list[np.ndarray | None] = []
- 
-     for idx, src in enumerate(sources, 1):
-@@ -6385,50 +6386,51 @@ def _compute_intertile_affine_corrections_from_sources(
-                     _log_and_callback(f"ETA_UPDATE:{h:02d}:{m:02d}:{s:02d}", None, "ETA_LEVEL", callback=progress_callback)
-                 except Exception:
-                     pass
-         except Exception:
-             pass
-         # Relais vers le callback GUI d'origine pour l'affichage + ETA fine (via on_worker_progress)
-         if progress_callback:
+@@ -14024,140 +14024,180 @@ def assemble_final_mosaic_reproject_coadd(
+             coverage_memmap = np.memmap(str(coverage_mm_path), dtype=np.float32, mode='w+', shape=(h, w))
+             _pcb(
+                 "assemble_debug_memmap_paths",
+                 prog=None,
+                 lvl="DEBUG_DETAIL",
+                 mosaic_path=str(mosaic_mm_path),
+                 coverage_path=str(coverage_mm_path),
+             )
+         except Exception as e_mm:
+             mosaic_memmap = None
+             coverage_memmap = None
+             _pcb("assemble_warn_memmap_create_failed", prog=None, lvl="WARN", error=str(e_mm))
+     try:
+         total_steps = n_channels
+         start_time_loop = time.time()
+         last_time = start_time_loop
+         step_times = []
+         if use_gpu:
              try:
-                 progress_callback(message_or_stage, current, level, **kwargs)
+                 _pcb(
+                     f"ASM_REPROJ_COADD: GPU background match enabled (preview={reproj_kwargs.get('bg_preview_size','N/A')}, sky={reproj_kwargs.get('intertile_sky_percentile','N/A')}, clip={reproj_kwargs.get('intertile_robust_clip_sigma','N/A')})",
+                     lvl="DEBUG_DETAIL",
+                 )
              except Exception:
                  pass
- 
-     try:
-         corrections = zemosaic_utils.compute_intertile_affine_calibration(
- 
-             tile_pairs,
-             final_output_wcs,
-             final_output_shape_hw,
-             preview_size=preview_size,
-             min_overlap_fraction=min_overlap_fraction,
-             sky_percentile=sky_percentile,
-             robust_clip_sigma=robust_clip_sigma,
-             use_auto_intertile=use_auto_intertile,
-             logger=logger_obj,
-             progress_callback=_intertile_progress_bridge,
-+            tile_weights=tile_weights,
-         )
-     except Exception as exc:
-         if logger_obj:
-             logger_obj.warning(
-                 "Intertile photometric calibration failed: %s",
-                 exc,
-             )
-             logger_obj.debug("Traceback (intertile failure):", exc_info=True)
-         return None, False, "compute_failed", str(exc)
-     finally:
-         tile_pairs.clear()
- 
-     sanitized, nontrivial = _sanitize_affine_corrections(corrections, total_tiles)
- 
-     if sanitized and intertile_global_recenter and preview_arrays:
-         clip_cfg = intertile_recenter_clip if isinstance(intertile_recenter_clip, (list, tuple)) else None
-         if not clip_cfg or len(clip_cfg) < 2:
-             clip_cfg = (0.85, 1.18)
-         try:
-             clip_low = float(clip_cfg[0])
-         except Exception:
-             clip_low = 0.85
-         try:
-             clip_high = float(clip_cfg[1])
-         except Exception:
-@@ -13593,79 +13595,89 @@ def assemble_final_mosaic_reproject_coadd(
-                         lvl="INFO_DETAIL",
++        weight_array_scaled_ids: set[int] = set()
++        tile_weight_log_ids: set[str] = set()
++        weights_embedded_with_tile = False
+         for ch in range(n_channels):
+             valid_entries: list[dict[str, Any]] = []
+             for entry in effective_tiles:
+                 arr = entry.get("data") if isinstance(entry, dict) else None
+                 if arr is None:
+                     continue
+                 if arr.ndim != 3:
+                     raise ValueError(
+                         f"Master tile data must be HWC before channel slicing, got {arr.shape}"
                      )
-                 except Exception:
-                     pass
+                 if ch >= arr.shape[-1]:
+                     raise ValueError(
+                         f"Channel index {ch} out of bounds for tile shape {arr.shape}"
+                     )
+                 valid_entries.append(entry)
  
-     try:
-         _best_effort_anchor_photometry()
-     except Exception as anchor_exc:
-         logger.info(
-             "existing_master_tiles_mode: best-effort anchor failed; continuing without anchor",
-             exc_info=logger.isEnabledFor(logging.DEBUG),
-         )
+             data_list = []
+             wcs_list = []
+             input_weights_list = []
+             weight_debug_logged = False
+-            for entry in valid_entries:
++            for idx_entry, entry in enumerate(valid_entries):
+                 entry_data = entry.get("data")
+                 data_plane = entry_data[..., ch]
+                 data_list.append(data_plane)
+                 wcs_list.append(entry.get("wcs"))
+-                weight_source = "ones"
++                weight_source_base = "ones"
+                 weight2d = entry.get("alpha_weight2d") if isinstance(entry, dict) else None
+                 if weight2d is not None:
+-                    weight_source = "alpha_weight2d"
++                    weight_source_base = "alpha_weight2d"
+                 else:
+                     coverage_mask = entry.get("coverage_mask") if isinstance(entry, dict) else None
+                     if coverage_mask is not None:
+                         try:
+                             weight_candidate = np.asarray(coverage_mask, dtype=np.float32, order="C", copy=False)
+                             if weight_candidate.shape == data_plane.shape:
+                                 weight2d = np.clip(
+                                     np.nan_to_num(weight_candidate, nan=0.0, posinf=0.0, neginf=0.0),
+                                     0.0,
+                                     1.0,
+                                 )
+-                                weight_source = "coverage_mask"
++                                weight_source_base = "coverage_mask"
+                         except Exception:
+                             weight2d = None
+                     if weight2d is None:
+                         weight2d = np.ones_like(data_plane, dtype=np.float32)
++                weight_source = weight_source_base
++                if tile_weighting_applied:
++                    try:
++                        tw_raw = entry.get("tile_weight", 1.0) if isinstance(entry, dict) else 1.0
++                        tw_value = float(tw_raw)
++                    except Exception:
++                        tw_value = 1.0
++                    if not math.isfinite(tw_value) or tw_value <= 0.0:
++                        tw_value = 1.0
++                    weights_embedded_with_tile = True
++                    if isinstance(weight2d, np.ndarray):
++                        weight_arr = np.asarray(weight2d, dtype=np.float32, order="C", copy=False)
++                        weight_id = id(weight_arr)
++                        if weight_id not in weight_array_scaled_ids:
++                            weight_array_scaled_ids.add(weight_id)
++                            np.multiply(weight_arr, tw_value, out=weight_arr, casting="unsafe")
++                        weight2d = weight_arr
++                        if isinstance(entry, dict) and weight_source_base == "alpha_weight2d":
++                            entry["alpha_weight2d"] = weight_arr
++                    weight_source = f"{weight_source_base}*tile_weight"
++                    tile_label = (
++                        entry.get("tile_id")
++                        or entry.get("path")
++                        or f"tile_{idx_entry}"
++                    )
++                    if tile_label not in tile_weight_log_ids:
++                        logger.info(
++                            "[Phase5] tile_weight applied: tile=%s tw=%.3f weights_source=%s",
++                            tile_label,
++                            tw_value,
++                            weight_source,
++                        )
++                        tile_weight_log_ids.add(str(tile_label))
+                 input_weights_list.append(weight2d)
+                 if (
+                     not weight_debug_logged
+                     and logger.isEnabledFor(logging.DEBUG)
+                     and isinstance(weight2d, np.ndarray)
+                 ):
+                     try:
+                         weight_min = float(np.nanmin(weight2d)) if weight2d.size else 0.0
+                         weight_max = float(np.nanmax(weight2d)) if weight2d.size else 0.0
+                         zero_frac = float(np.mean(weight2d <= 0.0)) if weight2d.size else 0.0
+                         logger.debug(
+                             "[Phase5] input_weights sample: channel=%d source=%s shape=%s min=%.4f max=%.4f zero_frac=%.4f",
+                             ch,
+                             weight_source,
+                             weight2d.shape,
+                             weight_min,
+                             weight_max,
+                             zero_frac,
+                         )
+                         weight_debug_logged = True
+                     except Exception:
+                         pass
+             weights_for_entries = None
+             if tile_weighting_applied:
+                 weights_for_entries = [
+                     float(entry.get("tile_weight", 1.0)) if isinstance(entry, dict) else 1.0
+                     for entry in valid_entries
+                 ]
  
-     # Optional inter-tile photometric (gain/offset) calibration
-     pending_affine_list, nontrivial_affine = _sanitize_affine_corrections(
-         tile_affine_corrections,
-         len(effective_tiles),
-     )
+             reproj_call_kwargs = dict(reproj_kwargs)
+             reproj_call_kwargs["input_weights"] = input_weights_list
+             if use_gpu:
+                 for unsupported_kw in ("intertile_global_recenter",):
+                     if unsupported_kw in reproj_call_kwargs:
+                         reproj_call_kwargs.pop(unsupported_kw, None)
+                         logger.debug(
+                             "[GPU Reproject] Ignoring unsupported kwarg: %s",
+                             unsupported_kw,
+                         )
  
-     if (
-         pending_affine_list is None
-         and intertile_photometric_match
-         and len(effective_tiles) >= 2
-     ):
-         tile_sources = []
-+        tile_weights_for_sources: list[float] = []
-         for entry in effective_tiles:
-             mask = None
-+            weight_val = 1.0
-             if isinstance(entry, dict):
-                 mask = entry.get("alpha_weight2d")
-                 if mask is None:
-                     mask = entry.get("coverage_mask")
-+                try:
-+                    weight_val = float(entry.get("tile_weight", 1.0))
-+                except Exception:
-+                    weight_val = 1.0
-+                if not math.isfinite(weight_val) or weight_val <= 0:
-+                    weight_val = 1.0
-+            tile_weights_for_sources.append(weight_val)
-             tile_sources.append(
-                 _TileAffineSource(
-                     path=entry.get("path"),
-                     wcs=entry.get("wcs"),
-                     data=entry.get("data"),
-                     mask=mask,
+             def _invoke_reproject(local_kwargs: dict):
+                 invoke_kwargs = dict(local_kwargs)
+-                if tile_weighting_applied and weights_for_entries is not None:
++                if (
++                    tile_weighting_applied
++                    and weights_for_entries is not None
++                    and not weights_embedded_with_tile
++                ):
+                     invoke_kwargs["tile_weights"] = weights_for_entries
+-                return reproject_and_coadd_wrapper(
++                return zemosaic_utils.reproject_and_coadd_wrapper(
+                     data_list=data_list,
+                     wcs_list=wcs_list,
+                     shape_out=final_output_shape_hw,
+                     output_projection=output_header,
+                     use_gpu=use_gpu,
+                     cpu_func=reproject_and_coadd,
+                     reproject_function=reproject_interp,
+                     combine_function="mean",
+                     progress_callback=_pcb,
+                     **invoke_kwargs,
                  )
-             )
  
-         pending_affine_list, nontrivial_affine, affine_status, affine_error = (
-             _compute_intertile_affine_corrections_from_sources(
-                 sources=tile_sources,
-                 final_output_wcs=final_output_wcs,
-                 final_output_shape_hw=final_output_shape_hw,
-                 preview_size=int(intertile_preview_size),
-                 min_overlap_fraction=float(intertile_overlap_min),
-                 sky_percentile=intertile_sky_percentile,
-                 robust_clip_sigma=float(intertile_robust_clip_sigma),
-                 use_auto_intertile=use_auto_intertile,
-                 logger_obj=logger,
-                 progress_callback=progress_callback,
-                 intertile_global_recenter=bool(intertile_global_recenter),
-                 intertile_recenter_clip=intertile_recenter_clip,
-+                tile_weights=tile_weights_for_sources,
-             )
-         )
- 
-         if affine_status == "preview_failed":
-             _pcb(
-                 "assemble_warn_intertile_photometric_failed",
-                 prog=None,
-                 lvl="WARN",
-                 error="preview_failed",
-             )
-             pending_affine_list = None
-             nontrivial_affine = False
-         elif affine_status == "compute_failed":
-             _pcb(
-                 "assemble_warn_intertile_photometric_failed",
-                 prog=None,
-                 lvl="WARN",
-                 error=str(affine_error),
-             )
-             pending_affine_list = None
-             nontrivial_affine = False
- 
-     total_tiles_prepared = len(effective_tiles)
-     pending_affine_list, anchor_shift_applied = _compose_global_anchor_shift(
-         pending_affine_list,
+             try:
+                 chan_mosaic, chan_cov = _invoke_reproject(reproj_call_kwargs)
+             except TypeError as gpu_kw_err:
+                 if use_gpu:
+                     logger.warning(
+                         "[GPU Reproject] Unexpected kwargs triggered TypeError: %s",
+                         gpu_kw_err,
+                     )
+                     retry_kwargs = reproj_call_kwargs.copy()
+                     removed_after_error: list[str] = []
+                     err_msg = str(gpu_kw_err)
+                     for key in list(retry_kwargs.keys()):
+                         if f"'{key}'" in err_msg:

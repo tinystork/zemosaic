@@ -14046,6 +14046,9 @@ def assemble_final_mosaic_reproject_coadd(
                 )
             except Exception:
                 pass
+        weight_array_scaled_ids: set[int] = set()
+        tile_weight_log_ids: set[str] = set()
+        weights_embedded_with_tile = False
         for ch in range(n_channels):
             valid_entries: list[dict[str, Any]] = []
             for entry in effective_tiles:
@@ -14066,15 +14069,15 @@ def assemble_final_mosaic_reproject_coadd(
             wcs_list = []
             input_weights_list = []
             weight_debug_logged = False
-            for entry in valid_entries:
+            for idx_entry, entry in enumerate(valid_entries):
                 entry_data = entry.get("data")
                 data_plane = entry_data[..., ch]
                 data_list.append(data_plane)
                 wcs_list.append(entry.get("wcs"))
-                weight_source = "ones"
+                weight_source_base = "ones"
                 weight2d = entry.get("alpha_weight2d") if isinstance(entry, dict) else None
                 if weight2d is not None:
-                    weight_source = "alpha_weight2d"
+                    weight_source_base = "alpha_weight2d"
                 else:
                     coverage_mask = entry.get("coverage_mask") if isinstance(entry, dict) else None
                     if coverage_mask is not None:
@@ -14086,11 +14089,44 @@ def assemble_final_mosaic_reproject_coadd(
                                     0.0,
                                     1.0,
                                 )
-                                weight_source = "coverage_mask"
+                                weight_source_base = "coverage_mask"
                         except Exception:
                             weight2d = None
                     if weight2d is None:
                         weight2d = np.ones_like(data_plane, dtype=np.float32)
+                weight_source = weight_source_base
+                if tile_weighting_applied:
+                    try:
+                        tw_raw = entry.get("tile_weight", 1.0) if isinstance(entry, dict) else 1.0
+                        tw_value = float(tw_raw)
+                    except Exception:
+                        tw_value = 1.0
+                    if not math.isfinite(tw_value) or tw_value <= 0.0:
+                        tw_value = 1.0
+                    weights_embedded_with_tile = True
+                    if isinstance(weight2d, np.ndarray):
+                        weight_arr = np.asarray(weight2d, dtype=np.float32, order="C", copy=False)
+                        weight_id = id(weight_arr)
+                        if weight_id not in weight_array_scaled_ids:
+                            weight_array_scaled_ids.add(weight_id)
+                            np.multiply(weight_arr, tw_value, out=weight_arr, casting="unsafe")
+                        weight2d = weight_arr
+                        if isinstance(entry, dict) and weight_source_base == "alpha_weight2d":
+                            entry["alpha_weight2d"] = weight_arr
+                    weight_source = f"{weight_source_base}*tile_weight"
+                    tile_label = (
+                        entry.get("tile_id")
+                        or entry.get("path")
+                        or f"tile_{idx_entry}"
+                    )
+                    if tile_label not in tile_weight_log_ids:
+                        logger.info(
+                            "[Phase5] tile_weight applied: tile=%s tw=%.3f weights_source=%s",
+                            tile_label,
+                            tw_value,
+                            weight_source,
+                        )
+                        tile_weight_log_ids.add(str(tile_label))
                 input_weights_list.append(weight2d)
                 if (
                     not weight_debug_logged
@@ -14133,9 +14169,13 @@ def assemble_final_mosaic_reproject_coadd(
 
             def _invoke_reproject(local_kwargs: dict):
                 invoke_kwargs = dict(local_kwargs)
-                if tile_weighting_applied and weights_for_entries is not None:
+                if (
+                    tile_weighting_applied
+                    and weights_for_entries is not None
+                    and not weights_embedded_with_tile
+                ):
                     invoke_kwargs["tile_weights"] = weights_for_entries
-                return reproject_and_coadd_wrapper(
+                return zemosaic_utils.reproject_and_coadd_wrapper(
                     data_list=data_list,
                     wcs_list=wcs_list,
                     shape_out=final_output_shape_hw,

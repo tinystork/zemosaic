@@ -1,5 +1,10 @@
 # followup.md
 
+## Progress
+- [x] Step 1) Anchor selection
+- [x] Step 2) Apply tile_weight to GPU Phase 5 weights
+- [ ] Quick sanity run (CPU vs GPU)
+
 ## How to apply step 2 (practical)
 You already did step 1 (anchor selection). Step 2 is independent and should be applied in Phase 5 only:
 
