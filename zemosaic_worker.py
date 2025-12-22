@@ -13595,7 +13595,13 @@ def assemble_final_mosaic_reproject_coadd(
                 except Exception:
                     pass
 
-    _best_effort_anchor_photometry()
+    try:
+        _best_effort_anchor_photometry()
+    except Exception as anchor_exc:
+        logger.info(
+            "existing_master_tiles_mode: best-effort anchor failed; continuing without anchor",
+            exc_info=logger.isEnabledFor(logging.DEBUG),
+        )
 
     # Optional inter-tile photometric (gain/offset) calibration
     pending_affine_list, nontrivial_affine = _sanitize_affine_corrections(
