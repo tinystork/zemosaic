@@ -1,25 +1,40 @@
 # followup.md
 
-## What to run
-- [ ] Re-run the same scenario that produced:
-  - 3 master tiles, with group sizes like 502×1, 5×1, 3×1
-  - a final mosaic where the deep tile appears “écrasé” by noisy tiles
-- [ ] Capture `zemosaic_worker` log.
+## How to apply step 2 (practical)
+You already did step 1 (anchor selection). Step 2 is independent and should be applied in Phase 5 only:
 
-## What to look for in the log
-- [ ] A new line from intertile calibration similar to:
-  `[Intertile] Anchor selection biased: anchor=2 ... weight≈502 ...`
-- [ ] Then in `assemble_final_mosaic_reproject_coadd`:
-  - `apply_photometric_summary` should show corrections where the deepest tile is close to identity (gain≈1, offset≈0) compared to before.
-  - Shallow tiles may be adjusted more strongly (that’s expected).
+1) Find where Phase 5 prepares `alpha_weight2d` / `input_weights` (the log shows it currently labels them as `source=alpha_weight2d`).
+2) Find the scalar `tile_weight` computed from N_FRAMES (or equivalent).
+3) Multiply the weights used for coadd by `tile_weight`:
+   - effective weights = alpha_weight2d * tile_weight
+4) Make sure this multiplication happens ONCE per tile (avoid triple-multiplying if weight arrays are shared across channels).
+5) Keep alpha_union unchanged.
 
-## Quick sanity checks
-- [ ] If connectivity is nonzero, anchor should NOT be a 5-frame/3-frame tile anymore when a 502-frame tile exists.
-- [ ] If tile_weights are missing/malformed, behavior must fall back to the previous anchor logic without crashing.
+## What to look for in logs (must-have)
+- Before patch (current):
+  `[Phase5] input_weights sample ... source=alpha_weight2d ... max=1.0000`
+- After patch:
+  `[Phase5] input_weights sample ... source=alpha_weight2d*tile_weight ... max≈502 (or your tile weight)`
 
-## If it still looks noisy
-This patch addresses the “wrong anchor” failure mode. If the mosaic is noisy *outside overlaps*, that’s dataset reality (regions covered only by 3–5 frames will remain noisy). In that case the next step would be a UI warning:
-- “Some master tiles have extremely low frame count; expect noisy regions”
-and/or a filter option to exclude tiles below a minimum `tile_weight`.
+Also look for a single line per tile:
+`tile_weight applied ... tw=...`
 
-(But do not implement that in this patch.)
+## Quick sanity run
+Run the same dataset twice:
+- GPU Phase 5 OFF
+- GPU Phase 5 ON
+
+Compare:
+- The overlap region should no longer look like "noise wins".
+- Coverage/weight_sum maximum should reflect weighted sums (can reach hundreds in overlaps).
+
+## If something goes wrong (common traps)
+- Double weighting because the same numpy array instance is reused for channels:
+  Fix: de-duplicate by `id()` before doing in-place multiply.
+- dtype issues (uint8 alpha):
+  Fix: cast once to float32 before multiplying.
+- two-pass still uses unweighted "tile-count" coverage:
+  Fix: pass the weighted `weight_sum` coverage from Phase 5 into two-pass.
+
+## Minimal rollback
+If GPU path becomes unstable, temporarily disable GPU Phase 5 in config to keep CPU behavior correct while debugging.
