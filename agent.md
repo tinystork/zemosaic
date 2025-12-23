@@ -1,40 +1,38 @@
-# Mission — “Winsor worker limit: 0 = auto” (patch minimal, user-friendly)
+# Mission: GPU safety — chunk cap that scales with VRAM (safe_mode)
 
-Objectif:
-- Rendre le paramètre `winsor_worker_limit` cohérent avec les autres champs UI:
-  - `winsor_worker_limit = 0` => mode AUTO
-  - `winsor_worker_limit > 0` => limite manuelle
-- Patch MINIMAL: pas de nouvelles options/config, pas de refactor.
+## Context
+Currently, zemosaic_gpu_safety._clamp_gpu_chunks() forces a fixed safe_mode ceiling of 256 MB, and then applies min(...) with VRAM total/free. This means even "real" NVIDIA GPUs with large VRAM are hard-capped to 256 MB when safe_mode triggers (e.g., Windows laptop + hybrid + battery).
 
-## Constat (code actuel)
-Dans `zemosaic_worker.py`, plusieurs endroits font:
-- winsor_worker_limit = max(1, min(int(cfg), cpu_total))
-=> 0 devient 1 (donc pas d’auto).
-Or `zemosaic_align_stack.py` supporte déjà implicitement:
-- winsor_max_workers = current_workers or plan_cpu_workers
-=> si on passe 0, l’auto fonctionne.
+We want to keep safety, but allow the cap to scale upward on large VRAM GPUs, while still honoring VRAM free and keeping a reasonable hard max.
 
-## Fichiers à modifier (minimum)
-- /mnt/data/zemosaic_worker.py (obligatoire)
+## Scope / Constraints
+- **No refactor**
+- Touch **only**: `zemosaic_gpu_safety.py`
+- Keep existing behavior when VRAM is unknown.
+- Preserve minimum chunk bytes floor (32 MB).
+- Preserve existing logging format (can add more info but don’t break).
+- Do NOT change the meaning of safe_mode detection in this patch.
 
-Optionnel (ne pas faire sauf si nécessaire):
-- /mnt/data/zemosaic_align_stack.py (a priori inutile)
+## Implementation plan
+1. In `_clamp_gpu_chunks(plan, ctx)`:
+   - Replace fixed `cap_bytes = 256 MB` logic with:
+     - `base_cap = 256MB` by default
+     - if `ctx.vram_total_bytes` is known:
+       - `scaled = int(ctx.vram_total_bytes * 0.10)`  (10% of total VRAM)
+       - `base_cap = max(256MB, scaled)`
+       - `base_cap = min(base_cap, 2GB)` (hard cap)
+     - if `ctx.vram_free_bytes` is known:
+       - `base_cap = min(base_cap, int(ctx.vram_free_bytes * 0.80))`
+     - `cap_bytes = max(base_cap, 32MB)` (floor)
+   - Then clamp `plan.gpu_max_chunk_bytes` to `cap_bytes` (same semantics as today).
+2. Keep the existing `gpu_rows_per_chunk` clamp behavior unchanged in this patch.
+3. Ensure logging still prints `gpu_chunk_mb=...` and add optional debug comment lines only if needed (avoid noisy logs).
 
-## Règles de comportement attendues
-- [x] Phase 4.5 (stacking local via `stack_kwargs["winsor_max_workers"]`):
-   - Si cfg == 0: passer 0 tel quel (AUTO géré par zemosaic_align_stack via parallel_plan)
-   - Sinon: passer max(1, cfg)
+## Acceptance criteria
+- In safe_mode on a GPU with >8 GB VRAM, `gpu_max_chunk_bytes` can be >256 MB (up to 2 GB), but never exceeds 80% of free VRAM.
+- On systems with unknown VRAM: behavior remains essentially the same (defaults to 256 MB then floored to 32 MB).
+- No other modules changed.
 
-- [x] Global/SDS stacking params (là où on stocke `winsor_worker_limit` dans des dicts type global_wcs_plan / sds_stack_params):
-   - Si cfg <= 0: calculer une valeur effective >= 1 (AUTO) et stocker cette valeur.
-   - Sinon: clamp normal (1..cpu_total).
-   Raisons: certains endroits utilisent cette valeur comme un cap numérique direct, et 0 casserait la logique.
-
-## Définition de “AUTO” (simple et robuste)
-AUTO doit privilégier les workers déjà auto-tunés:
-- si `global_parallel_plan` existe et `global_parallel_plan.cpu_workers > 0` => utiliser ça
-- sinon fallback sur `effective_base_workers` (déjà calculé par le worker)
-- sinon fallback sur `cpu_total`
-puis clamp [1..cpu_total].
-
-## Logging (minimal mais uti
+## Quick test (manual)
+- Run any pipeline that triggers apply_gpu_safety_to_parallel_plan() with safe_mode enabled.
+- Confirm in logs: `[GPU_SAFETY] ... gpu_chunk_mb=` reflects a value >256 on large VRAM GPUs (if free VRAM allows).
