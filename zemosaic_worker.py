@@ -8307,15 +8307,34 @@ def _run_shared_phase45_phase5_pipeline(
                     except Exception:
                         pass # Plan might be immutable
                     
-                    vram_free_mb_str = f"{vram_free_bytes / (1024*1024):.0f}MB" if vram_free_bytes else "unknown"
-                    logger.info(
-                        "Phase5 chunk %s: applied=%.0fMB (cap=%.0fMB, vram_free=%s, reasons=[%s])",
-                        log_source,
-                        applied_chunk_bytes / (1024*1024),
-                        hard_cap_bytes / (1024*1024),
-                        vram_free_mb_str,
-                        ", ".join(log_reason),
+                    base_chunk_mb = float(current_chunk_bytes or 0) / (1024.0 * 1024.0)
+                    applied_chunk_mb = float(applied_chunk_bytes or 0) / (1024.0 * 1024.0)
+                    vram_free_mb_str = (
+                        f"{vram_free_bytes / (1024.0 * 1024.0):.0f}MB" if vram_free_bytes else "unknown"
                     )
+                    reasons_str = ",".join(log_reason)
+                    if log_source == "AUTO":
+                        logger.info(
+                            "Phase5 chunk AUTO: applied=%.0fMB (base=%.0fMB, vram_free=%s, power_plugged=%s, on_battery=%s, hybrid=%s, reasons=[%s])",
+                            applied_chunk_mb,
+                            base_chunk_mb,
+                            vram_free_mb_str,
+                            power_plugged,
+                            on_battery,
+                            is_hybrid,
+                            reasons_str,
+                        )
+                    else:
+                        logger.info(
+                            "Phase5 chunk USER: applied=%.0fMB (cap=%.0fMB, vram_free=%s, power_plugged=%s, on_battery=%s, hybrid=%s, reasons=[%s])",
+                            applied_chunk_mb,
+                            float(hard_cap_bytes or 0) / (1024.0 * 1024.0),
+                            vram_free_mb_str,
+                            power_plugged,
+                            on_battery,
+                            is_hybrid,
+                            reasons_str,
+                        )
                 # End of plugged-aware logic
                 
                 if gpu_safety_ctx_phase5 is not None:

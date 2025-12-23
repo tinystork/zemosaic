@@ -24,25 +24,25 @@ Contexte observé dans les logs actuels:
   => chemin manuel OK, c’est Auto + Safety qui doit être branché-aware.
 
 Deliverables:
-1) zemosaic_gpu_safety.py
-   - Modifier la logique safe-mode clamp:
-     - clamp "on_battery" => oui (agressif)
-     - clamp "hybrid_graphics" => agressif seulement si NOT power_plugged
-     - si hybrid_graphics mais power_plugged=True: autoriser un budget par défaut plus large (ex 256MB) avant cap VRAM.
-   - Modifier les "reasons" loguées pour ne plus écrire battery_detected/battery_present comme s’il y avait limitation:
-     - si has_battery mais power_plugged=True et on_battery=False => reason "battery_present" (info) mais PAS de clamp spécifique batterie
-     - si on_battery=True => reason "on_battery_clamp"
-     - si hybrid && !power_plugged => reason "hybrid_unplugged_clamp"
-     - si safe_mode clamp général => reason "safe_mode_clamp"
-   - Ajouter un log clair (INFO) récapitulatif: power_plugged, on_battery, has_battery, hybrid, budget_bytes final + reasons.
+1) [x] zemosaic_gpu_safety.py
+   - [x] Modifier la logique safe-mode clamp:
+     - [x] clamp "on_battery" => oui (agressif)
+     - [x] clamp "hybrid_graphics" => agressif seulement si NOT power_plugged
+     - [x] si hybrid_graphics mais power_plugged=True: autoriser un budget par défaut plus large (ex 256MB) avant cap VRAM.
+   - [x] Modifier les "reasons" loguées pour ne plus écrire battery_detected/battery_present comme s’il y avait limitation:
+     - [x] si has_battery mais power_plugged=True et on_battery=False => reason "battery_present" (info) mais PAS de clamp spécifique batterie
+     - [x] si on_battery=True => reason "on_battery_clamp"
+     - [x] si hybrid && !power_plugged => reason "hybrid_unplugged_clamp"
+     - [x] si safe_mode clamp général => reason "safe_mode_clamp"
+   - [x] Ajouter un log clair (INFO) récapitulatif: power_plugged, on_battery, has_battery, hybrid, budget_bytes final + reasons.
 
-2) zemosaic_worker.py (Phase 5)
-   - Dans le chemin "Auto (recommended)" du chunk Phase 5:
-     - s’appuyer sur apply_gpu_safety_to_parallel_plan(...) / ctx pour obtenir power_plugged & on_battery.
-     - logguer un message unique et stable:
+2) [x] zemosaic_worker.py (Phase 5)
+   - [x] Dans le chemin "Auto (recommended)" du chunk Phase 5:
+     - [x] s’appuyer sur apply_gpu_safety_to_parallel_plan(...) / ctx pour obtenir power_plugged & on_battery.
+     - [x] logguer un message unique et stable:
        "Phase5 chunk AUTO: applied=<X>MB (base=<Y>MB, vram_free=<Z>MB, power_plugged=<T>, on_battery=<F>, hybrid=<H>, reasons=[...])"
-     - Ne pas casser la logique existante "USER chunk" (qui log déjà).
-   - But: quand branché, Auto ne doit plus rester bloqué à 128MB uniquement parce que hybrid_graphics=True.
+     - [x] Ne pas casser la logique existante "USER chunk" (qui log déjà).
+   - [x] But: quand branché, Auto ne doit plus rester bloqué à 128MB uniquement parce que hybrid_graphics=True.
 
 Validation / tests:
 - Test A (secteur): lancer un run Phase 5 Auto, vérifier log:

@@ -215,12 +215,22 @@ def probe_gpu_runtime_context(
 
     reasons: list[str] = []
     safe_mode = False
-    if is_windows and on_battery is True:
-        safe_mode = True
-        reasons.append("on_battery")
-    if is_windows and is_hybrid is True:
-        safe_mode = True
-        reasons.append("hybrid_graphics")
+    if is_windows:
+        if on_battery:
+            safe_mode = True
+            reasons.append("on_battery_clamp")
+        
+        if is_hybrid:
+            if not power_plugged:
+                safe_mode = True
+                reasons.append("hybrid_unplugged_clamp")
+            else:
+                reasons.append("hybrid_graphics")
+        
+        if has_battery and power_plugged and not on_battery:
+            if "battery_present" not in reasons:
+                reasons.append("battery_present")
+
     if vendor == "intel" and (is_hybrid is False or is_hybrid is None):
         reasons.append("intel_only_gpu")
     if vendor == "unknown" and gpu_available:
@@ -252,16 +262,24 @@ def _clamp_gpu_chunks(plan: ParallelPlan, ctx: GpuRuntimeContext) -> bool:
         use_gpu = bool(getattr(plan, "use_gpu", False))
     except Exception:
         use_gpu = False
-    if not use_gpu or not ctx.safe_mode:
+    if not use_gpu:
         return False
 
-    budget_bytes = 256 * 1024 * 1024
-    if ctx.safe_mode and (ctx.on_battery or ctx.is_hybrid_graphics):
-        budget_bytes = max(64 * 1024 * 1024, min(budget_bytes, 128 * 1024 * 1024))
+    # This function is now only for applying an aggressive clamp.
+    # The worker can decide to apply a more generous budget for non-safe-mode
+    # cases like plugged-in hybrid graphics.
+    if not ctx.safe_mode:
+        return False
 
+    budget_bytes = 128 * 1024 * 1024
+    
     if ctx.vram_free_bytes:
         try:
-            budget_bytes = min(budget_bytes, int(ctx.vram_free_bytes * 0.33))
+            # A hard VRAM cap is still useful.
+            vram_cap = int(ctx.vram_free_bytes * 0.4)
+            budget_bytes = min(budget_bytes, vram_cap)
+            if "vram_cap" not in ctx.reasons:
+                ctx.reasons.append("vram_cap")
         except Exception:
             pass
     budget_bytes = max(budget_bytes, 32 * 1024 * 1024)
@@ -330,7 +348,7 @@ def _clamp_gpu_chunks(plan: ParallelPlan, ctx: GpuRuntimeContext) -> bool:
     budget_mib = float(new_chunk_bytes) / (1024.0 ** 2)
     vram_free_mib = (float(ctx.vram_free_bytes) / (1024.0 ** 2)) if ctx.vram_free_bytes else None
     try:
-        LOGGER.info(
+        LOGGER.debug(
             "GPU_SAFETY: chosen gpu_rows_per_chunk=%s (budget=%.1f MiB, bytes_per_row=%s, vram_free=%s MiB, safe_mode=%s, on_battery=%s)",
             rows,
             budget_mib,
@@ -357,19 +375,9 @@ def apply_gpu_safety_to_parallel_plan(
     _ = config  # Reserved for future per-config overrides
     log = logger or LOGGER
     ctx = probe_gpu_runtime_context(caps=caps)
-    reasons = list(ctx.reasons)
-
-    try:
-        log.info(
-            "[GPU_SAFETY] power_plugged=%s on_battery=%s (has_battery=%s)",
-            ctx.power_plugged,
-            ctx.on_battery,
-            ctx.has_battery,
-        )
-    except Exception:
-        pass
-
+    
     if plan is None:
+        # Still log context even if there's no plan to modify
         summary = (
             "[GPU_SAFETY] operation=%s safe_mode=%d vendor=%s hybrid=%s battery=%s power_plugged=%s on_battery=%s plan=None reasons=%s"
             % (
@@ -380,7 +388,7 @@ def apply_gpu_safety_to_parallel_plan(
                 ctx.has_battery,
                 ctx.power_plugged,
                 ctx.on_battery,
-                ",".join(reasons),
+                ",".join(ctx.reasons),
             )
         )
         try:
@@ -392,10 +400,10 @@ def apply_gpu_safety_to_parallel_plan(
     disable_gpu = False
     if ctx.gpu_vendor == "intel" and not ctx.is_hybrid_graphics:
         disable_gpu = True
-        reasons.append("disable_intel_only_gpu")
+        ctx.reasons.append("disable_intel_only_gpu")
     if not ctx.gpu_available:
         disable_gpu = True
-        reasons.append("gpu_unavailable")
+        ctx.reasons.append("gpu_unavailable")
 
     if disable_gpu:
         try:
@@ -405,27 +413,36 @@ def apply_gpu_safety_to_parallel_plan(
 
     clamped = _clamp_gpu_chunks(plan, ctx)
     if clamped:
-        reasons.append("safe_mode_clamp")
-
-    ctx.reasons = list(dict.fromkeys(reasons))
+        if "safe_mode_clamp" not in ctx.reasons:
+             ctx.reasons.append("safe_mode_clamp")
+    
+    ctx.reasons = list(dict.fromkeys(ctx.reasons))
     summary = (
-        "[GPU_SAFETY] operation=%s safe_mode=%d vendor=%s hybrid=%s battery=%s power_plugged=%s on_battery=%s "
-        "plan_gpu=%d gpu_rows=%s gpu_chunk_mb=%.1f reasons=%s"
+        "[GPU_SAFETY] op=%s safe_mode=%d power_plugged=%s on_battery=%s hybrid=%s plan_gpu=%d chunk_mb=%.1f reasons=%s"
     ) % (
         operation,
         1 if ctx.safe_mode else 0,
-        ctx.gpu_vendor,
-        ctx.is_hybrid_graphics,
-        ctx.has_battery,
         ctx.power_plugged,
         ctx.on_battery,
+        ctx.is_hybrid_graphics,
         1 if getattr(plan, "use_gpu", False) else 0,
-        getattr(plan, "gpu_rows_per_chunk", None),
         float(getattr(plan, "gpu_max_chunk_bytes", 0) or 0) / (1024.0 ** 2),
         ",".join(ctx.reasons),
     )
     try:
         log.info(summary)
+    except Exception:
+        pass
+    try:
+        log.info(
+            "[GPU_SAFETY] summary power_plugged=%s on_battery=%s has_battery=%s hybrid=%s budget_bytes=%s reasons=%s",
+            ctx.power_plugged,
+            ctx.on_battery,
+            ctx.has_battery,
+            ctx.is_hybrid_graphics,
+            int(getattr(plan, "gpu_max_chunk_bytes", 0) or 0),
+            ",".join(ctx.reasons),
+        )
     except Exception:
         pass
     return plan, ctx
