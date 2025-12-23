@@ -2203,6 +2203,17 @@ def compute_intertile_affine_calibration(
             level="INFO",
         )
 
+    if preview_size >= 1024 and min_overlap_fraction <= 0.015:
+        prev_preview = preview_size
+        prev_overlap = min_overlap_fraction
+        preview_size = 512
+        min_overlap_fraction = max(min_overlap_fraction, 0.03)
+        _log_intertile(
+            f"INTERTILE_AUTOTUNE_GUARDRAIL: adjusted preview={preview_size} min_overlap={min_overlap_fraction:.4f} "
+            f"(was preview={prev_preview} min_overlap={prev_overlap:.4f})",
+            level="INFO",
+        )
+
     base_min_overlap = float(min_overlap_fraction)
 
     candidates: list[float] = []

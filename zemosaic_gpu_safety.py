@@ -13,7 +13,7 @@ import logging
 import os
 import platform
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Mapping, Tuple
 
 try:  # pragma: no cover - optional dependency
     import psutil  # type: ignore
@@ -47,6 +47,8 @@ class GpuRuntimeContext:
     vram_total_bytes: int | None
     vram_free_bytes: int | None
     has_battery: bool | None
+    power_plugged: bool | None
+    on_battery: bool
     is_windows: bool
     is_hybrid_graphics: bool | None
     safe_mode: bool
@@ -75,25 +77,33 @@ def _detect_vendor(name: str | bytes | None) -> str:
     return "unknown"
 
 
-def _probe_battery() -> bool | None:
-    """Return True if a battery is present, False if explicitly absent, None if unknown."""
+def _probe_battery_status() -> Tuple[bool | None, bool | None, bool]:
+    """Return ``(has_battery, power_plugged, on_battery)`` best effort."""
+
+    has_battery: bool | None = None
+    power_plugged: bool | None = None
+    on_battery = False
 
     if psutil is not None:
         try:
             info = psutil.sensors_battery()
             if info is not None:
-                return True
+                has_battery = True
+                power_plugged = getattr(info, "power_plugged", None)
+                on_battery = power_plugged is False
         except Exception:
             pass
-    if wmi is not None and platform.system().lower().startswith("windows"):
+
+    if has_battery is None and wmi is not None and platform.system().lower().startswith("windows"):
         try:
             conn = wmi.WMI()  # type: ignore
             batteries = conn.Win32_Battery()  # type: ignore[attr-defined]
             if batteries is not None:
-                return len(batteries) > 0
+                has_battery = len(batteries) > 0
         except Exception:
             pass
-    return None
+
+    return has_battery, power_plugged, on_battery
 
 
 def _probe_hybrid_graphics() -> bool | None:
@@ -150,7 +160,7 @@ def probe_gpu_runtime_context(
     gpu_available = bool(getattr(capabilities, "gpu_available", False)) if capabilities is not None else False
 
     vendor = _detect_vendor(gpu_name)
-    has_battery = _probe_battery()
+    has_battery, power_plugged, on_battery = _probe_battery_status()
     is_hybrid = _probe_hybrid_graphics()
 
     reasons: list[str] = []
@@ -175,6 +185,8 @@ def probe_gpu_runtime_context(
         vram_total_bytes=vram_total,
         vram_free_bytes=vram_free,
         has_battery=has_battery,
+        power_plugged=power_plugged,
+        on_battery=on_battery,
         is_windows=is_windows,
         is_hybrid_graphics=is_hybrid,
         safe_mode=safe_mode,
@@ -193,57 +205,90 @@ def _clamp_gpu_chunks(plan: ParallelPlan, ctx: GpuRuntimeContext) -> bool:
     if not use_gpu or not ctx.safe_mode:
         return False
 
-    # Safe mode GPU chunk budget:
-    # - default conservative base: 256 MB
-    # - scale up on "real" GPUs: 10% of total VRAM (min 256 MB), hard-capped to 2 GB
-    # - never exceed 80% of free VRAM
-    # - absolute floor: 32 MB
-    cap_bytes = 256 * 1024 * 1024
-    if ctx.vram_total_bytes:
-        try:
-            scaled = int(ctx.vram_total_bytes * 0.10)
-            cap_bytes = max(cap_bytes, scaled)
-        except Exception:
-            pass
-        cap_bytes = min(cap_bytes, 2 * 1024 * 1024 * 1024)
+    budget_bytes = 256 * 1024 * 1024
+    if ctx.safe_mode and (ctx.on_battery or ctx.is_hybrid_graphics):
+        budget_bytes = max(64 * 1024 * 1024, min(budget_bytes, 128 * 1024 * 1024))
+
     if ctx.vram_free_bytes:
         try:
-            cap_bytes = min(cap_bytes, int(ctx.vram_free_bytes * 0.8))
+            budget_bytes = min(budget_bytes, int(ctx.vram_free_bytes * 0.33))
         except Exception:
             pass
-    cap_bytes = max(cap_bytes, 32 * 1024 * 1024)
+    budget_bytes = max(budget_bytes, 32 * 1024 * 1024)
+
+    def _estimate_bytes_per_row() -> int | None:
+        candidates = []
+        try:
+            chunk = getattr(plan, "gpu_max_chunk_bytes", None)
+            rows_hint = getattr(plan, "gpu_rows_per_chunk", None)
+            if chunk and rows_hint:
+                candidates.append(chunk / float(rows_hint))
+        except Exception:
+            pass
+
+        try:
+            chunk_cpu = getattr(plan, "max_chunk_bytes", None)
+            rows_cpu = getattr(plan, "rows_per_chunk", None)
+            if chunk_cpu and rows_cpu:
+                candidates.append(chunk_cpu / float(rows_cpu))
+        except Exception:
+            pass
+
+        for candidate in candidates:
+            try:
+                if candidate and candidate > 0:
+                    return int(candidate)
+            except Exception:
+                continue
+        return None
+
+    bytes_per_row = _estimate_bytes_per_row()
 
     try:
         current_bytes = getattr(plan, "gpu_max_chunk_bytes", None)
     except Exception:
         current_bytes = None
     if current_bytes is None or current_bytes <= 0:
-        new_chunk_bytes = cap_bytes
-    else:
+        current_bytes = getattr(plan, "max_chunk_bytes", None)
+
+    new_chunk_bytes = budget_bytes
+    if current_bytes:
         try:
-            new_chunk_bytes = int(min(current_bytes, cap_bytes))
+            new_chunk_bytes = min(new_chunk_bytes, int(current_bytes))
         except Exception:
-            new_chunk_bytes = cap_bytes
+            pass
     new_chunk_bytes = max(new_chunk_bytes, 32 * 1024 * 1024)
 
     try:
-        setattr(plan, "gpu_max_chunk_bytes", new_chunk_bytes)
+        setattr(plan, "gpu_max_chunk_bytes", int(new_chunk_bytes))
     except Exception:
         pass
 
+    if bytes_per_row is None or bytes_per_row <= 0:
+        rows = 256
+    else:
+        try:
+            rows = max(1, int(new_chunk_bytes // max(1, bytes_per_row)))
+        except Exception:
+            rows = 256
+    rows = max(32, min(2048, rows))
     try:
-        rows = getattr(plan, "gpu_rows_per_chunk", None)
+        setattr(plan, "gpu_rows_per_chunk", int(rows))
     except Exception:
-        rows = None
-    if rows is None or rows <= 0:
-        rows = 128
+        pass
+
+    budget_mib = float(new_chunk_bytes) / (1024.0 ** 2)
+    vram_free_mib = (float(ctx.vram_free_bytes) / (1024.0 ** 2)) if ctx.vram_free_bytes else None
     try:
-        rows = int(rows)
-    except Exception:
-        rows = 128
-    rows = max(32, min(128, rows))
-    try:
-        setattr(plan, "gpu_rows_per_chunk", rows)
+        LOGGER.info(
+            "GPU_SAFETY: chosen gpu_rows_per_chunk=%s (budget=%.1f MiB, bytes_per_row=%s, vram_free=%s MiB, safe_mode=%s, on_battery=%s)",
+            rows,
+            budget_mib,
+            bytes_per_row if bytes_per_row is not None else "unknown",
+            f"{vram_free_mib:.1f}" if vram_free_mib is not None else "unknown",
+            ctx.safe_mode,
+            ctx.on_battery,
+        )
     except Exception:
         pass
 
@@ -264,15 +309,27 @@ def apply_gpu_safety_to_parallel_plan(
     ctx = probe_gpu_runtime_context(caps=caps)
     reasons = list(ctx.reasons)
 
+    try:
+        log.info(
+            "[GPU_SAFETY] power_plugged=%s on_battery=%s (has_battery=%s)",
+            ctx.power_plugged,
+            ctx.on_battery,
+            ctx.has_battery,
+        )
+    except Exception:
+        pass
+
     if plan is None:
         summary = (
-            "[GPU_SAFETY] operation=%s safe_mode=%d vendor=%s hybrid=%s battery=%s plan=None reasons=%s"
+            "[GPU_SAFETY] operation=%s safe_mode=%d vendor=%s hybrid=%s battery=%s power_plugged=%s on_battery=%s plan=None reasons=%s"
             % (
                 operation,
                 1 if ctx.safe_mode else 0,
                 ctx.gpu_vendor,
                 ctx.is_hybrid_graphics,
                 ctx.has_battery,
+                ctx.power_plugged,
+                ctx.on_battery,
                 ",".join(reasons),
             )
         )
@@ -302,7 +359,7 @@ def apply_gpu_safety_to_parallel_plan(
 
     ctx.reasons = list(dict.fromkeys(reasons))
     summary = (
-        "[GPU_SAFETY] operation=%s safe_mode=%d vendor=%s hybrid=%s battery=%s "
+        "[GPU_SAFETY] operation=%s safe_mode=%d vendor=%s hybrid=%s battery=%s power_plugged=%s on_battery=%s "
         "plan_gpu=%d gpu_rows=%s gpu_chunk_mb=%.1f reasons=%s"
     ) % (
         operation,
@@ -310,6 +367,8 @@ def apply_gpu_safety_to_parallel_plan(
         ctx.gpu_vendor,
         ctx.is_hybrid_graphics,
         ctx.has_battery,
+        ctx.power_plugged,
+        ctx.on_battery,
         1 if getattr(plan, "use_gpu", False) else 0,
         getattr(plan, "gpu_rows_per_chunk", None),
         float(getattr(plan, "gpu_max_chunk_bytes", 0) or 0) / (1024.0 ** 2),
