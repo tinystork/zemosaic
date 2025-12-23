@@ -1,53 +1,56 @@
-# Mission (chirurgical): GPU safety batterie + Phase 5 Auto "plugged-aware" (no refactor)
+# Mission (chirurgicale) — Plugged-aware Phase 5 Auto chunk + logs
 
-## Problème
-Sur Windows laptop hybride:
-- `has_battery=True` (batterie présente) déclenche un clamp agressif même quand `on_battery=False` (sur secteur),
-  ce qui bride inutilement `gpu_max_chunk_bytes` en Phase 5 (global_reproject).
-- Résultat: micro-chunking, overhead et faible occupation GPU.
+Objectif:
+- Corriger la logique "battery" de zemosaic_gpu_safety.py pour distinguer:
+  - batterie présente (has_battery)
+  - réellement sur batterie (on_battery)
+  - secteur branché (power_plugged)
+- Rendre la Phase 5 (Reproject) en mode Auto "plugged-aware" (budget chunk GPU plus large quand branché),
+  tout en conservant le Safe Mode (pas de refactor, patch minimal).
 
-## Objectifs
-- [X] 1) zemosaic_gpu_safety.py
-   - [X] Distinguer clairement:
-     - battery_present (has_battery)
-     - on_battery (ACLineStatus==0)
-     - power_plugged (ACLineStatus==1)
-   - [X] La "raison" batterie ne doit être ajoutée QUE si `on_battery=True`.
-   - [X] Ne pas activer un clamp "batterie" juste parce que battery_present=True.
-   - [X] Logs: afficher battery_present, on_battery, power_plugged + reasons propres
-     (ex: reasons=["hybrid_graphics","on_battery"] ou ["hybrid_graphics","plugged_relax"]).
+Contraintes:
+- Toucher uniquement:
+  - zemosaic_gpu_safety.py
+  - zemosaic_worker.py (logique Phase 5 chunk Auto + logs)
+- Pas de refactor, pas de renommage massif, pas de nouvelles dépendances.
+- Ajouter des logs de validation: chunk choisi + raison (incluant power_plugged/on_battery/hybrid).
 
-- [X] 2) Phase 5 (global_reproject)
-   - [X] En mode Auto (pas d'override utilisateur):
-     - [X] Si `on_battery=True`: garder clamp strict (conservateur).
-     - [X] Si `power_plugged=True` et `safe_mode` dû à hybrid_graphics:
-       -> relâcher le clamp pour global_reproject (Auto "plugged-aware")
-       -> viser un cap Auto plus généreux (ex 256/512MB selon VRAM free) sans dépasser des bornes sûres.
-   - [X] En mode override utilisateur:
-     - [X] Respecter la valeur utilisateur, mais appliquer un "hard cap" seulement si `on_battery=True`
-       (ou si VRAM free insuffisante), et logguer explicitement le cap.
+Contexte observé dans les logs actuels:
+- En Phase 5 reproject, on voit:
+  - power_plugged=True, on_battery=False
+  - MAIS gpu_chunk_mb reste clamp à 128MB avec reasons=hybrid_graphics,safe_mode_clamp
+  => clamp trop agressif même branché.
+- Quand l’utilisateur force un chunk (ex 1024), on voit un cap VRAM "hard_cap_vram" (ex 712MB) et bump rows_per_chunk.
+  => chemin manuel OK, c’est Auto + Safety qui doit être branché-aware.
 
-- [X] 3) Logs de validation (obligatoire)
-   - [X] À l’application du plan global_reproject:
-     - [X] log final: selected_chunk_bytes + source (AUTO vs USER) + cap_reason
-     - ex:
-       "Phase5 chunk AUTO: target=512MB, cap=512MB (plugged_relax, hybrid_graphics, vram_free=xxxxMB)"
-       "Phase5 chunk USER: requested=1024MB, applied=512MB (on_battery clamp)"
-       "Phase5 chunk AUTO: applied=128MB (on_battery clamp)"
+Deliverables:
+1) zemosaic_gpu_safety.py
+   - Modifier la logique safe-mode clamp:
+     - clamp "on_battery" => oui (agressif)
+     - clamp "hybrid_graphics" => agressif seulement si NOT power_plugged
+     - si hybrid_graphics mais power_plugged=True: autoriser un budget par défaut plus large (ex 256MB) avant cap VRAM.
+   - Modifier les "reasons" loguées pour ne plus écrire battery_detected/battery_present comme s’il y avait limitation:
+     - si has_battery mais power_plugged=True et on_battery=False => reason "battery_present" (info) mais PAS de clamp spécifique batterie
+     - si on_battery=True => reason "on_battery_clamp"
+     - si hybrid && !power_plugged => reason "hybrid_unplugged_clamp"
+     - si safe_mode clamp général => reason "safe_mode_clamp"
+   - Ajouter un log clair (INFO) récapitulatif: power_plugged, on_battery, has_battery, hybrid, budget_bytes final + reasons.
 
-## Contraintes
-- No refactor: patch minimal, localisé.
-- Ne pas modifier les autres opérations GPU (sauf si la logique existante est partagée et qu'un if op=="global_reproject" suffit).
-- Ne pas toucher au comportement batch size=0 vs >1.
-- Ne pas changer l'autotune intertiles (preview=512 guardrail etc.) — hors scope.
+2) zemosaic_worker.py (Phase 5)
+   - Dans le chemin "Auto (recommended)" du chunk Phase 5:
+     - s’appuyer sur apply_gpu_safety_to_parallel_plan(...) / ctx pour obtenir power_plugged & on_battery.
+     - logguer un message unique et stable:
+       "Phase5 chunk AUTO: applied=<X>MB (base=<Y>MB, vram_free=<Z>MB, power_plugged=<T>, on_battery=<F>, hybrid=<H>, reasons=[...])"
+     - Ne pas casser la logique existante "USER chunk" (qui log déjà).
+   - But: quand branché, Auto ne doit plus rester bloqué à 128MB uniquement parce que hybrid_graphics=True.
 
-## Fichiers attendus
-- zemosaic_gpu_safety.py
-- zemosaic_worker.py (ou le fichier qui prépare le plan Phase 5 / operation="global_reproject")
-- (optionnel) solver_settings.py uniquement si le plan est construit là, mais éviter si possible.
+Validation / tests:
+- Test A (secteur): lancer un run Phase 5 Auto, vérifier log:
+  - power_plugged=True on_battery=False
+  - chunk Auto appliqué > 128MB (si vram_free le permet) et reasons reflètent "plugged"
+- Test B (sur batterie): simuler ou forcer on_battery=True (si possible) et vérifier chunk Auto clamp (<=128MB) + reason on_battery_clamp.
+- Test C (hybrid unplugged): power_plugged=False + hybrid=True => clamp agressif et reason hybrid_unplugged_clamp.
+- Aucun changement de résultats d’image attendu, uniquement perf/stabilité.
 
-## Definition de "plugged-aware" (simple)
-- clamp strict seulement si on_battery=True
-- si power_plugged=True:
-  - autoriser Auto à monter (ex: 256MB ou 512MB) en hybrid mode, selon VRAM libre
-  - rester dans des bornes raisonnables (ex: 64MB..1024MB)
+Notes:
+- Garder le comportement "batch size = 0" et ">1" intact (ne pas toucher à ça).
