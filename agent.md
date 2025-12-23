@@ -1,62 +1,73 @@
-# Mission — Phase 5 Intertile trop lente : reconnecter le multithread existant (sans ajouter de knobs)
+# Mission: Phase 5 "global_reproject" — remonter gpu_rows_per_chunk quand pas sur batterie (no-refactor)
 
 ## Contexte
-Depuis l’intégration GPU safety, la Phase 5 "Intertile Pairs" est devenue anormalement lente.
-Le reproject Phase 5 semble OK, mais l’étape Intertile (photometric match between tiles) rame fortement.
-On veut éviter tout ajout de paramètres GUI : un mécanisme de workers existe déjà (processing_threads / auto workers),
-mais l’Intertile ne semble pas l’utiliser.
+En Phase 5 (Reproject & Coadd), le GPU est activé mais l'exécution reste à faible charge car le plan GPU est clampé à
+`gpu_max_chunk_bytes=128MB` et surtout `gpu_rows_per_chunk` très bas (ex: ~69), entraînant beaucoup de micro-chunks
+et donc un overhead (boucle Python + launches + copies). Résultat: GPU/CPU à quelques %.
+
+La safety logic détecte Windows/laptop/hybride et force un mode safe. On veut garder le *budget bytes* (anti-freeze),
+mais réduire le nombre de chunks en augmentant `gpu_rows_per_chunk` **uniquement** pour l'opération
+`operation="global_reproject"` quand l'alimentation secteur est présente (pas sur batterie).
 
 ## Objectif
-Accélérer la Phase 5 Intertile en réutilisant le mécanisme de workers existant (processing_threads / auto),
-en évitant de créer du “nouveau code pour le plaisir”.
+Patch minimal, localisé à Phase 5 reproject:
+- Après l'appel à `apply_gpu_safety_to_parallel_plan(..., operation="global_reproject")`,
+  si `safe_mode==1` ET `on_battery == False` (ou `power_plugged == True`), recalculer un `gpu_rows_per_chunk`
+  plus grand, borné prudemment (ex: <= 256) et >= valeur actuelle.
+- Ne pas toucher aux autres phases.
+- Ne pas changer le comportement "batch size = 0" vs "> 1".
 
-## Fichiers ciblés
-- zemosaic_worker.py
-- zemosaic_utils.py (fonction compute_intertile_affine_calibration + helpers)
+## Fichiers probables
+- `zemosaic_worker.py` (ou fichier équivalent orchestration Phase 5)
+- éventuellement `solver_settings.py` si le plan est défini là, mais privilégier un patch dans le worker au moment
+  où le plan est finalisé (Phase 5).
+- Ne pas modifier `zemosaic_gpu_safety.py` (sauf si impossible), objectif: patch le plus local possible.
 
-## Contraintes
-- NO REFACTOR : patch chirurgical.
-- Ne pas ajouter de nouveaux paramètres GUI.
-- Ne pas toucher au comportement “batch size = 0” et “batch size > 1”.
-- Conserver les résultats (différences numériques minimes tolérées, mais pas de changement visible/structurel).
+## Spécification de calcul (simple & conservatrice)
+Estimer un coût "bytes par ligne" pour la reprojection GPU:
+- Hypothèse conservatrice: on manipule au moins 2 buffers float32 (accumulateur + poids),
+  et on itère sur N tiles.
+- bytes_per_row ≈ out_w * 4 (float32) * buffers_per_tile_effective * n_tiles_scale
+  On n'a pas besoin d'être exact, seulement éviter des valeurs trop grandes.
 
-## Diagnostic à faire en premier (obligatoire)
-1) Ouvrir `zemosaic_utils.py` et localiser `compute_intertile_affine_calibration`.
-2) Vérifier s’il existe DÉJÀ un mécanisme de parallélisation (ThreadPool/ProcessPool/parallel_utils).
-   - S’il existe mais est “orphelin” (workers forcés à 1 / param jamais alimenté), le reconnecter.
-   - S’il n’existe pas, en ajouter un MINIMAL (ThreadPool) autour de la boucle des paires, piloté par un param `cpu_workers`.
+Proposition robuste (sans connaître tous les détails internes):
+- `bytes_per_row = max(1, out_w * 4 * max(2, buffers))`
+- puis diviser le budget par `max(1, n_tiles)` pour rester conservateur côté mémoire "par tile"
+  (même si l'impl GPU ne garde pas tout simultanément).
+- `rows_budget = gpu_max_chunk_bytes // (bytes_per_row * max(1, n_tiles))`
+- `new_rows = clamp(rows_budget, min_rows=current_rows, max_rows=256)`
+- Ajouter un plancher raisonnable (ex: 96) si ça ne dépasse pas le current.
 
-## Patch attendu (plan)
-### A) Reconnecter le nombre de workers existant côté worker
-Dans `zemosaic_worker.py`, au moment où on appelle `_compute_intertile_affine_corrections_from_sources(...)`,
-dériver un `intertile_workers` à partir de la logique déjà utilisée plus bas pour le reproject :
-- si `processing_threads > 0` => utiliser cette valeur
-- sinon auto => `min(os.cpu_count() or 1, <borne raisonnable>)` (borne raisonnable = 8/16)  
+Si des infos plus précises existent déjà (ex: taille réelle des buffers ou estimateur interne),
+les utiliser à la place (mais sans refactor).
 
-Puis :
-- ajouter un param optionnel `cpu_workers` à `_compute_intertile_affine_corrections_from_sources`
-- le forwarder vers `zemosaic_utils.compute_intertile_affine_calibration(...)`
-  (adapter le nom exact du param si la fonction l’a déjà sous un autre nom)
+## Étapes
+1. Localiser dans le code le point Phase 5 où:
+   - le plan est créé
+   - `apply_gpu_safety_to_parallel_plan(... operation="global_reproject")` est appelé
+2. Ajouter juste après ce call un petit ajustement conditionnel:
+   - uniquement si `operation == "global_reproject"`
+   - uniquement si `safe_mode == 1`
+   - uniquement si `on_battery == False` (ou `power_plugged == True`)
+3. Recalculer `gpu_rows_per_chunk` selon une estimation simple basée sur:
+   - `plan.gpu_max_chunk_bytes` (ou param correspondant)
+   - `out_w` (largeur de sortie) accessible depuis le contexte Phase 5
+   - `n_tiles` (nombre de master tiles en input) accessible depuis la phase
+4. Ajouter un log INFO clair:
+   - "Phase5: reproject rows_per_chunk bumped from X to Y (not on battery), max_chunk_bytes=..."
+5. S'assurer que si des champs manquent (out_w/n_tiles), on n'échoue pas:
+   - fallback: ne rien changer
 
-### B) Dans zemosaic_utils : utiliser cpu_workers si présent
-Dans `compute_intertile_affine_calibration` :
-- Si un mécanisme parallèle existe déjà : l’alimenter avec `cpu_workers` (au lieu d’un défaut à 1 / None).
-- Sinon : paralléliser UNIQUEMENT la partie “par paire” (la boucle des overlap pairs) via ThreadPoolExecutor.
-  *Important* : garder le `progress_callback` appelé depuis le thread principal (agréger les résultats de futures).
+## Critères d'acceptation
+- Sur un run secteur (pas sur batterie), `gpu_rows_per_chunk` augmente (ex: 69 → ~200),
+  nombre de chunks réduit sensiblement, meilleure occupation GPU, sans dépassement mémoire.
+- Sur batterie, comportement inchangé.
+- Aucun changement de résultat scientifique attendu (juste la granularité).
+- Aucune régression sur les autres phases.
 
-### C) Logging minimal pour confirmer
-Ajouter un log du style :
-`[Intertile] Parallel: threadpool workers=<N> pairs=<M> preview=<P>`
-afin qu’on puisse valider immédiatement dans le log si on est multi-thread ou pas.
-
-## Critères d’acceptation
-- Sur un run type (ex: 27 tiles, 245 pairs, preview=1024), la durée entre :
-  `[Intertile] Using: ... pairs=...`
-  et la fin de l’étape Intertile baisse significativement (objectif pratique: ~x2 si CPU dispo).
-- Le GUI continue d’afficher la progression (pairs done / total) sans freeze.
-- Aucune régression sur Phase 5 reproject/coadd.
-- Pas de nouveau réglage utilisateur.
-
-## Notes d’implémentation (garde-fous)
-- Si `cpu_workers <= 1` ou `pairs < 4` => rester en séquentiel (éviter overhead).
-- Éviter ProcessPool pour l’Intertile (pickling WCS/arrays = risque + lent) : ThreadPool recommandé.
+## Tests (léger)
+- Ajouter un mini test unitaire si la suite existe:
+  - Simuler un plan avec gpu_max_chunk_bytes=128MB, out_w=2282, n_tiles=30, current_rows=69
+  - Vérifier que new_rows > current_rows et <= 256 quand on_battery=False
+  - Vérifier new_rows == current_rows quand on_battery=True
+Si la repo n'a pas de tests, au minimum ajouter un "self-check" dans log (pas de test framework).
