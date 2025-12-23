@@ -7,29 +7,29 @@ Sur Windows laptop hybride:
 - Résultat: micro-chunking, overhead et faible occupation GPU.
 
 ## Objectifs
-1) zemosaic_gpu_safety.py
-   - Distinguer clairement:
+- [X] 1) zemosaic_gpu_safety.py
+   - [X] Distinguer clairement:
      - battery_present (has_battery)
      - on_battery (ACLineStatus==0)
      - power_plugged (ACLineStatus==1)
-   - La "raison" batterie ne doit être ajoutée QUE si `on_battery=True`.
-   - Ne pas activer un clamp "batterie" juste parce que battery_present=True.
-   - Logs: afficher battery_present, on_battery, power_plugged + reasons propres
+   - [X] La "raison" batterie ne doit être ajoutée QUE si `on_battery=True`.
+   - [X] Ne pas activer un clamp "batterie" juste parce que battery_present=True.
+   - [X] Logs: afficher battery_present, on_battery, power_plugged + reasons propres
      (ex: reasons=["hybrid_graphics","on_battery"] ou ["hybrid_graphics","plugged_relax"]).
 
-2) Phase 5 (global_reproject)
-   - En mode Auto (pas d'override utilisateur):
-     - Si `on_battery=True`: garder clamp strict (conservateur).
-     - Si `power_plugged=True` et `safe_mode` dû à hybrid_graphics:
+- [X] 2) Phase 5 (global_reproject)
+   - [X] En mode Auto (pas d'override utilisateur):
+     - [X] Si `on_battery=True`: garder clamp strict (conservateur).
+     - [X] Si `power_plugged=True` et `safe_mode` dû à hybrid_graphics:
        -> relâcher le clamp pour global_reproject (Auto "plugged-aware")
        -> viser un cap Auto plus généreux (ex 256/512MB selon VRAM free) sans dépasser des bornes sûres.
-   - En mode override utilisateur:
-     - Respecter la valeur utilisateur, mais appliquer un "hard cap" seulement si `on_battery=True`
+   - [X] En mode override utilisateur:
+     - [X] Respecter la valeur utilisateur, mais appliquer un "hard cap" seulement si `on_battery=True`
        (ou si VRAM free insuffisante), et logguer explicitement le cap.
 
-3) Logs de validation (obligatoire)
-   - À l’application du plan global_reproject:
-     - log final: selected_chunk_bytes + source (AUTO vs USER) + cap_reason
+- [X] 3) Logs de validation (obligatoire)
+   - [X] À l’application du plan global_reproject:
+     - [X] log final: selected_chunk_bytes + source (AUTO vs USER) + cap_reason
      - ex:
        "Phase5 chunk AUTO: target=512MB, cap=512MB (plugged_relax, hybrid_graphics, vram_free=xxxxMB)"
        "Phase5 chunk USER: requested=1024MB, applied=512MB (on_battery clamp)"

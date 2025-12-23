@@ -8242,32 +8242,82 @@ def _run_shared_phase45_phase5_pipeline(
                 phase5_chunk_auto_flag = _coerce_bool_flag(phase5_chunk_auto_cfg)
                 if phase5_chunk_auto_flag is None:
                     phase5_chunk_auto_flag = True
-                if not phase5_chunk_auto_flag:
-                    try:
-                        forced_mb = int(worker_config_cache.get("phase5_chunk_mb", 128))
-                    except Exception:
-                        forced_mb = 128
-                    forced_mb = max(64, min(1024, forced_mb))
-                    forced_bytes = int(forced_mb) * 1024 * 1024
-                    applied_override = False
-                    try:
-                        setattr(parallel_plan_phase5, "gpu_max_chunk_bytes", forced_bytes)
-                        applied_override = True
-                    except Exception:
-                        pass
-                    if isinstance(parallel_plan_phase5, dict):
-                        parallel_plan_phase5["gpu_max_chunk_bytes"] = forced_bytes
-                        applied_override = True
-                    if applied_override:
-                        logger.info(
-                            "Phase5 GPU chunk override: %d MB (%d bytes) for global_reproject",
-                            forced_mb,
-                            forced_bytes,
-                        )
+
+                # Start of plugged-aware logic for Phase 5 chunk sizing
+                if parallel_plan_phase5 is not None and gpu_safety_ctx_phase5 is not None:
+                    on_battery = getattr(gpu_safety_ctx_phase5, "on_battery", False)
+                    power_plugged = getattr(gpu_safety_ctx_phase5, "power_plugged", True)
+                    is_hybrid = getattr(gpu_safety_ctx_phase5, "is_hybrid_graphics", False)
+                    vram_free_bytes = getattr(gpu_safety_ctx_phase5, "vram_free_bytes", None)
+                    current_chunk_bytes = getattr(parallel_plan_phase5, "gpu_max_chunk_bytes", 0)
+                    
+                    # Define a simple VRAM-based hard cap
+                    hard_cap_bytes = 1024 * 1024 * 1024  # 1GB default
+                    if vram_free_bytes is not None and vram_free_bytes > 0:
+                        hard_cap_bytes = min(hard_cap_bytes, max(128 * 1024 * 1024, int(0.10 * vram_free_bytes)))
+                    elif on_battery:
+                        hard_cap_bytes = 128 * 1024 * 1024
                     else:
-                        logger.debug(
-                            "Phase5 GPU chunk override skipped: gpu_max_chunk_bytes not present"
-                        )
+                        hard_cap_bytes = 512 * 1024 * 1024
+
+                    applied_chunk_bytes = current_chunk_bytes
+                    log_reason = []
+                    log_source = "AUTO"
+
+                    if not phase5_chunk_auto_flag:
+                        # USER override mode
+                        log_source = "USER"
+                        try:
+                            requested_mb = int(worker_config_cache.get("phase5_chunk_mb", 128))
+                        except Exception:
+                            requested_mb = 128
+                        requested_mb = max(64, min(1024, requested_mb))
+                        requested_bytes = requested_mb * 1024 * 1024
+                        applied_chunk_bytes = requested_bytes
+                        log_reason.append(f"requested={requested_mb}MB")
+
+                        if on_battery:
+                            applied_chunk_bytes = min(applied_chunk_bytes, 128 * 1024 * 1024)
+                            log_reason.append("on_battery_clamp")
+                        else:
+                            if applied_chunk_bytes > hard_cap_bytes:
+                                applied_chunk_bytes = hard_cap_bytes
+                                log_reason.append("hard_cap_vram")
+
+                    else:
+                        # AUTO mode
+                        if on_battery:
+                            applied_chunk_bytes = min(current_chunk_bytes, 128 * 1024 * 1024)
+                            log_reason.append("on_battery_clamp")
+                        elif power_plugged and is_hybrid:
+                            # "plugged-aware" relaxation for hybrid graphics on AC power
+                            target_bytes = max(current_chunk_bytes, 256 * 1024 * 1024)
+                            if vram_free_bytes is not None and vram_free_bytes > 2 * 1024 * 1024 * 1024:
+                                target_bytes = max(target_bytes, 512 * 1024 * 1024)
+                            
+                            applied_chunk_bytes = min(target_bytes, hard_cap_bytes)
+                            log_reason.append("plugged_relax_hybrid")
+                        else:
+                            # Desktop or other non-hybrid cases, trust autotune/safety defaults
+                            log_reason.append("default")
+                    
+                    # Apply the final calculated chunk size
+                    try:
+                        setattr(parallel_plan_phase5, "gpu_max_chunk_bytes", int(applied_chunk_bytes))
+                    except Exception:
+                        pass # Plan might be immutable
+                    
+                    vram_free_mb_str = f"{vram_free_bytes / (1024*1024):.0f}MB" if vram_free_bytes else "unknown"
+                    logger.info(
+                        "Phase5 chunk %s: applied=%.0fMB (cap=%.0fMB, vram_free=%s, reasons=[%s])",
+                        log_source,
+                        applied_chunk_bytes / (1024*1024),
+                        hard_cap_bytes / (1024*1024),
+                        vram_free_mb_str,
+                        ", ".join(log_reason),
+                    )
+                # End of plugged-aware logic
+                
                 if gpu_safety_ctx_phase5 is not None:
                     try:
                         use_gpu_phase5_flag = apply_gpu_safety_to_phase5_flag(

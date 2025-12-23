@@ -215,8 +215,6 @@ def probe_gpu_runtime_context(
 
     reasons: list[str] = []
     safe_mode = False
-    if is_windows and has_battery is True:
-        reasons.append("battery_present")
     if is_windows and on_battery is True:
         safe_mode = True
         reasons.append("on_battery")
