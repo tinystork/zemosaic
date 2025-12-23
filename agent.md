@@ -13,19 +13,19 @@ Dans `zemosaic_filter_gui_qt.py`, fiabiliser et rendre lisible l’étape “Pre
 - Conserver l’usage de `self._localizer.get(key, fallback)` (pas besoin d’ajouter de fichier de traduction).
 
 ## Travail demandé
-### A) Robustesse overlay (stop garanti)
+### [x] A) Robustesse overlay (stop garanti)
 - Entourer `_handle_auto_group_finished(...)` d’un `try/except/finally` :
   - `finally`: stop timer + `self._hide_processing_overlay()` quoi qu’il arrive.
   - `except`: log erreur dans l’activity log + status label clair.
 
-### B) Feedback “vivant” pendant l’auto-group (pas juste un GIF)
+### [x] B) Feedback “vivant” pendant l’auto-group (pas juste un GIF)
 - Ajouter un **elapsed timer** (QTimer) qui met à jour `self._status_label` toutes les ~1s :
   - `"{stage} (elapsed: 37s)"`
 - Ajouter un **signal stage** thread-safe (ex: `_auto_group_stage_signal = Signal(str)`) :
   - Le thread de fond émet “Clustering…”, “Coverage-first…”, “Borrowing…”, “Auto-optimiser…”
   - Le UI thread reçoit et met à jour le `stage` utilisé par le timer.
 
-### C) Logs/progress thread-safe
+### [x] C) Logs/progress thread-safe
 - Dans le thread de fond, émettre quelques logs “progress” via `_async_log_signal.emit(msg, level)` (INFO).
 - Supprimer/adapter toute écriture directe dans widgets Qt depuis le thread :
   - Dans `_compute_auto_groups`, remplacer `self._append_log(...)` par :
