@@ -16,7 +16,7 @@
 - (optionnel et très léger) `zemosaic_worker.py` si besoin d’exposer 1-2 infos de debug (pas de restructuration)
 
 ## Tâches
-### T1 — Battery detection correcte (Windows surtout)
+### [x] T1 — Battery detection correcte (Windows surtout)
 Actuel: `battery=True` peut signifier "la machine a une batterie", pas "elle tourne sur batterie".
 - Utiliser `psutil.sensors_battery()` si dispo:
   - si `battery is None` → `on_battery = False`
@@ -25,7 +25,7 @@ Actuel: `battery=True` peut signifier "la machine a une batterie", pas "elle tou
 - Loguer un message clair:
   - `GPU_SAFETY: power_plugged=<bool|None> on_battery=<bool>`
 
-### T2 — Clamp gpu_rows_per_chunk: remplacer le hard-cap 128 par un cap adaptatif
+### [x] T2 — Clamp gpu_rows_per_chunk: remplacer le hard-cap 128 par un cap adaptatif
 But: garder safe-mode, mais permettre des chunks raisonnables sur GPU Nvidia dédiés.
 - Règle proposée (simple, robuste):
   - Déterminer `rows_cap` en fonction de la VRAM libre (si GPU backend peut la fournir), sinon fallback.
@@ -40,7 +40,7 @@ But: garder safe-mode, mais permettre des chunks raisonnables sur GPU Nvidia dé
 - Loguer:
   - `GPU_SAFETY: chosen gpu_rows_per_chunk=<n> (budget=<MiB>, bytes_per_row=<n>, vram_free=<MiB>, safe_mode=<...>)`
 
-### T3 — Guardrails sur intertile auto-tune pour éviter l’explosion des paires
+### [x] T3 — Guardrails sur intertile auto-tune pour éviter l’explosion des paires
 But: empêcher l’auto-tune de choisir une combinaison "explosive" par défaut.
 - Si auto-tune propose:
   - `preview >= 1024` ET `min_overlap <= 0.015` → appliquer un garde-fou:
