@@ -1,45 +1,36 @@
-# followup.md
+# Follow-up — Étape 2: Validation tile_weight dans GPU coadd
 
-## Progress
-- [x] Step 1) Anchor selection
-- [x] Step 2) Apply tile_weight to GPU Phase 5 weights
-- [ ] Quick sanity run (CPU vs GPU)
+## 1) Vérifs rapides dans les logs (run réel)
+Lancer un run identique à ton cas "3 master tiles très déséquilibrées".
 
-## How to apply step 2 (practical)
-You already did step 1 (anchor selection). Step 2 is independent and should be applied in Phase 5 only:
+Attendus dans le log:
+- Un bloc DEBUG "tile_weights summary" en Phase 5:
+  - min/median/max + ratio
+- Un bloc DEBUG côté GPU "gpu_coadd: tile i uses weight ..."
+- Les lignes Phase 5 ne doivent plus indiquer `weights_source=alpha_weight2d*tile_weight`
+  (ça doit devenir `weights_source=alpha_weight2d` ou similaire),
+  puisque tile_weight passe via `tile_weights=`.
 
-1) Find where Phase 5 prepares `alpha_weight2d` / `input_weights` (the log shows it currently labels them as `source=alpha_weight2d`).
-2) Find the scalar `tile_weight` computed from N_FRAMES (or equivalent).
-3) Multiply the weights used for coadd by `tile_weight`:
-   - effective weights = alpha_weight2d * tile_weight
-4) Make sure this multiplication happens ONCE per tile (avoid triple-multiplying if weight arrays are shared across channels).
-5) Keep alpha_union unchanged.
+Si un WARN "double weighting probable" apparaît:
+- C’est qu’on envoie encore des input_weights déjà scalés + tile_weights séparés -> à corriger.
 
-## What to look for in logs (must-have)
-- Before patch (current):
-  `[Phase5] input_weights sample ... source=alpha_weight2d ... max=1.0000`
-- After patch:
-  `[Phase5] input_weights sample ... source=alpha_weight2d*tile_weight ... max≈502 (or your tile weight)`
+## 2) Tests synthétiques CPU vs GPU
+Exécuter:
+- `python -m pytest -q` si pytest dispo
+ou
+- `python tests/test_tile_weight_gpu_coadd.py`
 
-Also look for a single line per tile:
-`tile_weight applied ... tw=...`
+Attendu:
+- Test mean: overlap dominé par la tuile la plus pondérée
+- Test winsorized: même dominance
+- GPU ~ CPU (tolérance float32)
 
-## Quick sanity run
-Run the same dataset twice:
-- GPU Phase 5 OFF
-- GPU Phase 5 ON
+## 3) Contrôle visuel (cas astro)
+Sur une mosaïque où une tuile est très profonde:
+- En zone de recouvrement, la texture/bruit doit ressembler majoritairement à la tuile profonde
+- Les tuiles faibles ne doivent plus “salir” l’overlap (elles ne doivent contribuer que là où la tuile profonde manque)
 
-Compare:
-- The overlap region should no longer look like "noise wins".
-- Coverage/weight_sum maximum should reflect weighted sums (can reach hundreds in overlaps).
-
-## If something goes wrong (common traps)
-- Double weighting because the same numpy array instance is reused for channels:
-  Fix: de-duplicate by `id()` before doing in-place multiply.
-- dtype issues (uint8 alpha):
-  Fix: cast once to float32 before multiplying.
-- two-pass still uses unweighted "tile-count" coverage:
-  Fix: pass the weighted `weight_sum` coverage from Phase 5 into two-pass.
-
-## Minimal rollback
-If GPU path becomes unstable, temporarily disable GPU Phase 5 in config to keep CPU behavior correct while debugging.
+## 4) Si le problème persiste malgré des poids OK
+Alors ce n’est plus le coadd: regarder en priorité l’inter-tile photometric match:
+- gains aberrants + clamp (ex: gain ~ 1e-5) => fit instable / mauvais overlap / stats trop fragiles.
+- Action suivante: sécuriser le solve photométrique (robust stats / contraintes / fallback offset-only).

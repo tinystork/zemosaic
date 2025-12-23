@@ -1,111 +1,81 @@
-# agent.md
+# Mission: Étape 2 — Propager correctement tile_weight dans le GPU coadd (Phase5 + TwoPass), avec parité CPU/GPU
 
-## Goal
-Ensure Phase 5 GPU "reproject & coadd" properly applies per-tile scalar weighting (tile_weight, e.g. N_FRAMES=502 vs 5 vs 3)
-in addition to per-pixel alpha masks. Without this, shallow/noisy master tiles contribute almost equally and can dominate
-the mosaic.
+## Contexte
+On a des master tiles très déséquilibrées en profondeur (ex: tile_002 très profonde, tile_000/001 très faibles).
+Objectif: en zones de recouvrement, la mosaïque doit être dominée par la tuile la plus profonde (meilleur SNR),
+et le comportement doit être cohérent entre CPU et GPU.
 
-Target behavior:
-- Effective weights for coadd must be: effective_weight2d = alpha_weight2d * tile_weight
-- Output coverage/weight_sum must reflect weighted sums (max can reach ~sum(tile_weight) in overlaps).
+Le code a déjà des notions de:
+- input_weights (alpha/coverage 2D)
+- tile_weights (scalaire par tuile)
+- deux chemins: assemble_final_mosaic_reproject_coadd (Phase 5) + run_second_pass_coverage_renorm (TwoPass)
 
-No refactor: surgical patch.
+Le but de ce patch est de s'assurer que:
+1) GPU coadd utilise réellement tile_weight (pas seulement CPU),
+2) Phase 5 ET TwoPass passent les mêmes infos au backend,
+3) pas de double-application involontaire (tile_weight intégré dans input_weights + tile_weights en même temps),
+4) tests CPU vs GPU.
 
-## Progress
-- [x] Step 1) Identify the Phase 5 weight construction point
-- [x] Step 2) Apply tile_weight to GPU input_weights (alpha_weight2d*tile_weight)
-- [x] Step 3) Keep alpha union semantics unchanged
-- [x] Step 4) Make GPU and CPU Phase 5 behavior consistent
-- [x] Step 5) Update debug logging to confirm behavior
-- [ ] Step 6) Two-pass compatibility
-- [ ] Step 7) Validation / Tests
+## Contraintes
+- Patch chirurgical ("no refactor")
+- Ne pas changer le comportement batch_size=0 vs >1
+- Ne pas casser perf/mémoire GPU
+- Ajout de logs DEBUG ciblés OK
 
-## Scope (minimal)
-Modify ONLY:
-- zemosaic_worker.py
-- (optional) zemosaic_utils.py or GPU helper module only if strictly required by current architecture
+## Plan (à implémenter)
 
-Do not change GUI, settings schema, or unrelated phases.
+### A) Worker: passer tile_weights séparément, garder input_weights "purs" (alpha/coverage seulement)
+Fichiers: `zemosaic_worker.py`
 
-## Background
-Logs show:
-- Tile-weighting enabled (min=5 max=502) is computed.
-- But Phase 5 logs input_weights sample source=alpha_weight2d with max=1.0, indicating tile_weight is not applied to GPU coadd.
+1) Dans `assemble_final_mosaic_reproject_coadd` (Phase 5):
+   - Construire `tile_weights = [float(entry.get("tile_weight", 1.0)) ...]` aligné avec data_list/wcs_list.
+   - Construire `input_weights_list` à partir du masque (alpha_weight2d / coverage) SANS multiplier par tile_weight.
+   - Appeler `reproject_and_coadd_wrapper(..., input_weights=input_weights_list, tile_weights=tile_weights, ...)`.
+   - Ajouter un log DEBUG unique:
+     - min/median/max des tile_weights + ratio max/min
+     - vérifier si input_weights a des max > 1.5 et tile_weights != None -> warning "possible double weighting".
 
-CPU path already multiplies input_weights by tile_weight; GPU path must mirror it.
+2) Dans `run_second_pass_coverage_renorm` / `_process_channel` (TwoPass reprojection):
+   - Même logique: `tile_weights` transmis au coadd wrapper GPU.
+   - `input_weights` = poids 2D (alpha/coverage/scale-map) sans tile_weight.
 
-## Plan
+### B) Backend GPU: vérifier l’utilisation effective de tile_weights
+Fichier: `zemosaic_utils.py`
 
-### 1) Identify the Phase 5 weight construction point
-In `assemble_final_mosaic_reproject_coadd()` locate the block that defines `input_weights` for each channel/tile.
-It currently sets `input_weights` from per-pixel alpha (e.g. alpha_weight2d).
+1) Dans `gpu_reproject_and_coadd_impl`:
+   - Vérifier que `tile_weights_param` est bien lu et converti en `tile_weights_gpu`.
+   - S’assurer que `tile_weight` multiplie effectivement la contribution lors de l’accumulation
+     (mean / winsorized / kappa-sigma).
+   - Ajouter un log DEBUG (une fois) listant les poids normalisés utilisés côté GPU.
 
-Also locate the scalar per-tile weight (tile_weight) used by tile-weighting mode (N_FRAMES etc).
-This likely exists as `tile_weight`, `tile_weights[idx]`, or `tile_entry["tile_weight"]`.
+2) Dans le wrapper `reproject_and_coadd_wrapper`:
+   - Ne pas changer la logique globale,
+   - mais ajouter une protection (DEBUG/WARN) si:
+     - `input_weights` semble déjà intégrer des poids > 1 (ex: max >> 1) ET tile_weights fourni.
+     - -> log: "double application probable".
 
-### 2) Apply tile_weight to GPU input_weights (the core fix)
-Right after `alpha_weight2d` / `input_weights` is prepared for a tile, and BEFORE calling any GPU reproject/coadd kernel:
+### C) Tests CPU vs GPU (mini test synthétique)
+Créer `tests/test_tile_weight_gpu_coadd.py` (ou un script de test si pas de pytest dans le repo).
 
-- Compute:
-  - `tw = float(tile_weight)` with sanity: if not finite or <=0 -> 1.0
-- Multiply:
-  - `input_weights *= tw`  (in float32)
+Test 1 (mean):
+- Deux tuiles partiellement recouvrantes (même WCS ou WCS identique + simple décalage pixel).
+- Tuile A: bruit (random) moyenne ~0
+- Tuile B: signal constant (ex: +100) + petit bruit
+- tile_weights: A=1, B=100
+- Résultat attendu en zone overlap: proche de tuile B (erreur faible), et GPU≈CPU.
 
-IMPORTANT: avoid multiplying multiple times if the same numpy array instance is reused for multiple channels.
-Implement a "unique array" guard:
-- If input_weights is a list/tuple of arrays, de-duplicate by `id()` and multiply each unique object once.
+Test 2 (winsorized):
+- Même setup mais `combine_function="mean"` + `stack_reject_algo="winsorized"` (ou combine="winsorized" selon API).
+- Attendu: même dominance de la tuile B.
 
-Example logic (conceptual):
-- if isinstance(input_weights, (list, tuple)):
-    - seen=set()
-    - for w in input_weights:
-        - if id(w) in seen: continue
-        - seen.add(id(w))
-        - w *= tw   # in-place
-  else:
-    - input_weights *= tw
+Critères:
+- Dans l’overlap, moyenne(result - B) < 1% du signal (tolérance à ajuster)
+- GPU vs CPU: différence RMS faible (tolérance ~1e-3 à 1e-2 selon float32)
 
-Ensure dtype stays float32 (cast once before in-place multiply if needed).
-
-### 3) Keep alpha union semantics unchanged
-`alpha_union` / `alpha_final` should remain a union mask (0/1 or 0/255) for transparency.
-Do NOT weight alpha_union by tile_weight.
-
-Only the coadd weights / coverage/weight_sum should become weighted.
-
-### 4) Make GPU and CPU Phase 5 behavior consistent
-If there is a CPU branch (use_gpu_phase5=False) that already multiplies by tile_weight, ensure the GPU branch does exactly the same.
-If CPU branch also uses `input_weights` list reuse, apply the same de-dup guard there too (to avoid double-weighting bugs).
-
-### 5) Update debug logging to confirm behavior
-Where logs currently say:
-`[Phase5] input_weights sample: channel=0 source=alpha_weight2d ... max=1.0000`
-Change `source` to:
-`alpha_weight2d*tile_weight`
-and ensure max becomes ~tile_weight (e.g. 502) for tiles with full alpha.
-
-Log one extra line per tile:
-`[Phase5] tile_weight applied: tile=<id> tw=<float> weights_source=alpha_weight2d*tile_weight`
-Do not spam per-pixel.
-
-### 6) Two-pass compatibility
-Two-pass uses a `coverage` map. If it is derived from Phase 5 weight_sum/coverage, it will automatically become weighted after this fix.
-If two-pass is instead using an unweighted tile-count coverage somewhere, adjust it to use the weighted `weight_sum` produced by Phase 5.
-
-DO NOT change two-pass algorithm beyond choosing the correct "coverage" input (weighted vs count).
-
-### 7) Validation / Tests
-Run the same dataset that exhibits the issue (3 master tiles with weights ~502,5,3), twice:
-A) use_gpu_phase5=False
-B) use_gpu_phase5=True
-
-Acceptance checks:
-- In logs, Phase 5 input_weights source must show `alpha_weight2d*tile_weight`.
-- Max of input_weights sample should be ~tile_weight (e.g. 502) for the heavy tile.
-- Final mosaic statistics (mean/median per channel) should be close between CPU and GPU runs (tolerance ~1e-3 to 1e-2 depending on float math).
-- Visual: heavy tile signal is preserved; noisy tiles no longer dominate overlaps.
-
-## Constraints
-- No refactor, no API redesign.
-- Keep memory footprint stable: prefer in-place multiply and avoid creating per-channel copies.
-- If any failure occurs in GPU path due to dtype/contiguity, fall back to safe conversion once (float32 contiguous) BEFORE multiplying.
+## Livraison attendue
+- Patch git sur `zemosaic_worker.py` + `zemosaic_utils.py`
+- Test(s) + instructions de lancement
+- Logs de run montrant:
+  - tile_weights summary
+  - confirmation GPU tile_weights utilisés
+  - plus aucune ambiguïté "tile_weight intégré dans input_weights"
