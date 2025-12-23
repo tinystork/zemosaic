@@ -6255,6 +6255,7 @@ def _compute_intertile_affine_corrections_from_sources(
     intertile_global_recenter: bool = False,
     intertile_recenter_clip: tuple[float, float] | list[float] | None = None,
     tile_weights: list[float] | None = None,
+    cpu_workers: int | None = None,
 ) -> tuple[list[tuple[float, float]] | None, bool, str, str | None]:
     """Common implementation for intertile gain/offset computation.
 
@@ -6275,6 +6276,13 @@ def _compute_intertile_affine_corrections_from_sources(
         and hasattr(zemosaic_utils, "compute_intertile_affine_calibration")
     ):
         return None, False, "skipped", None
+
+    try:
+        cpu_workers = int(cpu_workers) if cpu_workers is not None else None
+    except Exception:
+        cpu_workers = None
+    if cpu_workers is not None and cpu_workers < 1:
+        cpu_workers = 1
 
     tile_pairs: list[tuple[np.ndarray, Any] | tuple[np.ndarray, Any, np.ndarray]] = []
     preview_arrays: list[np.ndarray | None] = []
@@ -6434,6 +6442,7 @@ def _compute_intertile_affine_corrections_from_sources(
             logger=logger_obj,
             progress_callback=_intertile_progress_bridge,
             tile_weights=tile_weights,
+            cpu_workers=cpu_workers,
         )
     except Exception as exc:
         if logger_obj:
@@ -12490,6 +12499,11 @@ def assemble_final_mosaic_incremental(
                 progress_callback=progress_callback,
                 intertile_global_recenter=bool(intertile_global_recenter),
                 intertile_recenter_clip=intertile_recenter_clip,
+                cpu_workers=(
+                    int(processing_threads)
+                    if processing_threads and int(processing_threads) > 0
+                    else min(os.cpu_count() or 1, 8)
+                ),
             )
         )
         if affine_status == "preview_failed":
@@ -13742,6 +13756,11 @@ def assemble_final_mosaic_reproject_coadd(
                 intertile_global_recenter=bool(intertile_global_recenter),
                 intertile_recenter_clip=intertile_recenter_clip,
                 tile_weights=tile_weights_for_sources,
+                cpu_workers=(
+                    int(assembly_process_workers)
+                    if assembly_process_workers and int(assembly_process_workers) > 0
+                    else min(os.cpu_count() or 1, 8)
+                ),
             )
         )
 

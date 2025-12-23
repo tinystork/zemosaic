@@ -1,416 +1,757 @@
-diff --git a/agent.md b/agent.md
-index 71e5520a2e9e3f122d8711397583ed4d84c3eb4d..79cfb7a83ff25c49eb265f511a16a857b17bb9a6 100644
---- a/agent.md
-+++ b/agent.md
-@@ -1,40 +1,40 @@
- # Mission — “Winsor worker limit: 0 = auto” (patch minimal, user-friendly)
+diff --git a/zemosaic_utils.py b/zemosaic_utils.py
+index 94d9e70ce98332fecfae8d06a05d45242628a57e..9b9258112e5d9072eb86567f3c62c41dc3b7e67f 100644
+--- a/zemosaic_utils.py
++++ b/zemosaic_utils.py
+@@ -32,50 +32,51 @@
+ ║                                                                                   ║
+ ║ Description:                                                                      ║
+ ║   This program was forged under the sacred light of pixels and                    ║
+ ║   caffeine, with the noble intent of turning clouds of photons into               ║
+ ║   astronomical art. If you use it, please consider saying “thanks,”               ║
+ ║   gazing at the stars, or crediting Tinystork and J.A.R.V.I.S. —                  ║
+ ║   developer karma depends on it.                                                  ║
+ ║                                                                                   ║
+ ║ Disclaimer:                                                                       ║
+ ║   No AIs or butter knives were harmed in the making of this code.                 ║
+ ╚═══════════════════════════════════════════════════════════════════════════════════╝
+ """
  
- Objectif:
- - Rendre le paramètre `winsor_worker_limit` cohérent avec les autres champs UI:
-   - `winsor_worker_limit = 0` => mode AUTO
-   - `winsor_worker_limit > 0` => limite manuelle
- - Patch MINIMAL: pas de nouvelles options/config, pas de refactor.
  
- ## Constat (code actuel)
- Dans `zemosaic_worker.py`, plusieurs endroits font:
- - winsor_worker_limit = max(1, min(int(cfg), cpu_total))
- => 0 devient 1 (donc pas d’auto).
- Or `zemosaic_align_stack.py` supporte déjà implicitement:
- - winsor_max_workers = current_workers or plan_cpu_workers
- => si on passe 0, l’auto fonctionne.
+ # --- Standard Library Imports ---
+ import os
+ import math
+ import copy
+ import json
+ import logging
+ import re
+ import time
+ import sys
+ import platform
+ import tempfile
++from concurrent.futures import ThreadPoolExecutor, as_completed
+ from functools import lru_cache
+ from contextlib import nullcontext
+ from pathlib import Path
+ from typing import Any, Callable, Iterable, Optional, Sequence
+ import numpy as np
+ # L'import de astropy.io.fits est géré ci-dessous pour définir le flag
+ import cv2
  
- ## Fichiers à modifier (minimum)
- - /mnt/data/zemosaic_worker.py (obligatoire)
+ import warnings
+ import traceback
+ import gc
+ import importlib.util
  
- Optionnel (ne pas faire sauf si nécessaire):
- - /mnt/data/zemosaic_align_stack.py (a priori inutile)
+ # --- Optional Astropy WCS import (lightweight, guarded) ----------------------
+ ASTROPY_WCS_AVAILABLE_IN_UTILS = False
+ AstropyWCS = None
+ proj_plane_pixel_scales = None
+ try:  # pragma: no cover - optional dependency path
+     from astropy.wcs import WCS as AstropyWCS  # type: ignore
+     from astropy.wcs.utils import proj_plane_pixel_scales  # type: ignore
  
- ## Règles de comportement attendues
--1) Phase 4.5 (stacking local via `stack_kwargs["winsor_max_workers"]`):
-+- [x] Phase 4.5 (stacking local via `stack_kwargs["winsor_max_workers"]`):
-    - Si cfg == 0: passer 0 tel quel (AUTO géré par zemosaic_align_stack via parallel_plan)
-    - Sinon: passer max(1, cfg)
+     ASTROPY_WCS_AVAILABLE_IN_UTILS = True
+ except Exception:
+     AstropyWCS = None
+     proj_plane_pixel_scales = None
+@@ -2062,50 +2063,51 @@ def solve_global_affine(num_tiles: int, pair_entries, anchor_index: int = 0):
+     offsets = sol[num_tiles:]
+     result = {}
+     for idx in range(num_tiles):
+         g = float(gains[idx])
+         o = float(offsets[idx])
+         if not np.isfinite(g) or abs(g) < 1e-6:
+             g = 1.0
+         if not np.isfinite(o):
+             o = 0.0
+         result[idx] = (g, o)
+     return result
  
--2) Global/SDS stacking params (là où on stocke `winsor_worker_limit` dans des dicts type global_wcs_plan / sds_stack_params):
-+- [x] Global/SDS stacking params (là où on stocke `winsor_worker_limit` dans des dicts type global_wcs_plan / sds_stack_params):
-    - Si cfg <= 0: calculer une valeur effective >= 1 (AUTO) et stocker cette valeur.
-    - Sinon: clamp normal (1..cpu_total).
-    Raisons: certains endroits utilisent cette valeur comme un cap numérique direct, et 0 casserait la logique.
  
- ## Définition de “AUTO” (simple et robuste)
- AUTO doit privilégier les workers déjà auto-tunés:
- - si `global_parallel_plan` existe et `global_parallel_plan.cpu_workers > 0` => utiliser ça
- - sinon fallback sur `effective_base_workers` (déjà calculé par le worker)
- - sinon fallback sur `cpu_total`
- puis clamp [1..cpu_total].
+ def compute_intertile_affine_calibration(
+     tile_data_with_wcs,
+     final_output_wcs,
+     final_output_shape_hw,
+     preview_size: int = 512,
+     min_overlap_fraction: float = 0.05,
+     sky_percentile: tuple[float, float] | list[float] = (30.0, 70.0),
+     robust_clip_sigma: float = 2.5,
+     use_auto_intertile: bool = False,
+     logger=None,
+     progress_callback=None,
+     tile_weights=None,
++    cpu_workers: int | None = None,
+ ):
+     """Calcule des corrections affine (gain/offset) inter-tuiles avant reprojection.
  
- ## Logging (minimal mais uti
-diff --git a/followup.md b/followup.md
-index c1fa3deb827b03ab853a4749be8fddfced1ad659..e8aca3e51a32dd4ee9b35898aabe68aa86e0d459 100644
---- a/followup.md
-+++ b/followup.md
-@@ -60,74 +60,45 @@ AUTO doit privilégier les workers déjà auto-tunés:
- - sinon fallback sur `effective_base_workers` (déjà calculé par le worker)
- - sinon fallback sur `cpu_total`
- puis clamp [1..cpu_total].
+     ``tile_data_with_wcs`` peut contenir des tuples ``(data, wcs)`` ou
+     ``(data, wcs, mask2d)`` pour injecter un masque (0..1) optionnel sur la zone
+     d'overlap.
+     """
  
- ## Logging (minimal mais utile)
- - Quand cfg <= 0, loguer une ligne INFO_DETAIL du style:
-   "Winsor worker limit: AUTO (cfg=0) -> resolved=<N> (cpu_total=<M>)"
- - En Phase 4.5, si on laisse passer 0, éviter de loguer "workers=0" de manière trompeuse:
-   loguer "workers=AUTO(0)" ou similaire.
+     if tile_data_with_wcs is None or len(tile_data_with_wcs) < 2:
+         return {}
+     if reproject_interp is None or not ASTROPY_AVAILABLE_IN_UTILS:
+         return {}
+     try:
+         header_full = final_output_wcs.to_header()
+     except Exception:
+         return {}
  
- ## Contraintes
- - Ne pas changer les algorithmes scientifiques.
- - Ne pas toucher à la GUI.
- - Ne pas introduire de nouvelle variable de config.
- - Patch localisé et lisible.
- ```
- 
- ---
- 
- ## followup.md
- 
- ```markdown
- # Plan d’exécution (Codex)
- 
- ## Étape 1 — Identifier les 3 endroits clés dans zemosaic_worker.py
--1) Phase 4.5 stack_kwargs:
--   Actuel: "winsor_max_workers": max(1, worker_limit_val)
--   -> À changer pour laisser passer 0:
--      if worker_limit_val <= 0: winsor_max_workers = 0
--      else: winsor_max_workers = max(1, worker_limit_val)
--
--2) Deux blocs “winsor_worker_limit = max(1, min(int(winsor_worker_limit_config), cpu_total))”
--   (il y en a 2 occurrences dans le fichier)
--   -> Remplacer par une résolution AUTO effective:
--      - cpu_total = os.cpu_count() or 1
--      - cfg = int(winsor_worker_limit_config) (guard try/except)
--      - if cfg <= 0:
--          candidate = global_parallel_plan.cpu_workers si dispo (>0)
--          sinon candidate = effective_base_workers si dispo (>0)
--          sinon candidate = cpu_total
--        else:
--          candidate = cfg
--      - winsor_worker_limit = max(1, min(int(candidate), cpu_total))
--
--   Important: ici on STOCKE une valeur >=1 dans global_wcs_plan / sds_stack_params.
-+- [x] Phase 4.5 stack_kwargs: laisser passer 0 → winsor_max_workers = 0, sinon clamp à >=1.
-+- [x] Deux blocs “winsor_worker_limit = max(1, min(int(winsor_worker_limit_config), cpu_total))” remplacés par une résolution AUTO effective (global_parallel_plan > effective_base_workers > cpu_total) et stockage clampé >=1.
- 
- ## Étape 2 — Logging minimal
--- Au moment où winsor_worker_limit est fixé pour global_wcs_plan:
--  - Si cfg <= 0, loguer "AUTO cfg=0 -> resolved=N"
--  - Sinon conserver le message existant (ou ajouter "(manual)").
--
--- Pour Phase 4.5:
--  - Si worker_limit_val <= 0, loguer workers="AUTO(0)" au lieu de 0.
-+- [x] cfg <= 0 dans global_wcs_plan: log INFO_DETAIL "AUTO cfg=0 -> resolved=N".
-+- [x] Phase 4.5: workers loggué en "AUTO(0)" quand on laisse passer 0.
- 
- ## Étape 3 — Vérifs rapides
--1) py_compile:
--   python -m py_compile zemosaic_worker.py
--
--2) Test fonctionnel simple:
--   - Mettre winsor_worker_limit=0 dans la config/GUI
--   - Vérifier dans les logs:
--     - une ligne "AUTO ... resolved=<N>"
--     - Phase 4.5 n’affiche pas un workers=0 ambigu
--   - Vérifier que le run n’active pas une explosion de workers: N doit rester borné par cpu_total et idéalement proche du parallel plan.
-+- [x] py_compile: `python -m py_compile zemosaic_worker.py`
-+- [ ] Test fonctionnel simple (config GUI winsor_worker_limit=0, vérifier logs et bornage workers)
- 
- ## Notes importantes
- - Ne PAS propager 0 dans global_wcs_plan / sds_stack_params (risque de cap=0 ailleurs).
- - Par contre, laisser passer 0 dans stack_kwargs (Phase 4.5) est OK car `zemosaic_align_stack.py` sait résoudre 0 via parallel_plan.
- - Ne pas modifier zemosaic_align_stack.py (il est déjà compatible).
- ```
- 
- ---
- 
- Si tu veux, je peux aussi te donner un **mini diff “à la main”** (3 micro-changements) pour vérifier que Codex ne part pas en sucette — mais tel quel, ce brief est normalement assez cadré pour un patch chirurgical.
-diff --git a/zemosaic_worker.py b/zemosaic_worker.py
-index 90199e19fc27e7ac164816bf19c40d0434fbd184..6cbf4c3310e814bf1a70e8a33a96504cb14cac61 100644
---- a/zemosaic_worker.py
-+++ b/zemosaic_worker.py
-@@ -4613,55 +4613,56 @@ def _run_phase4_5_inter_master_merge(
- 
-             chunk_affine_corrections: list[tuple[float, float] | None] = [None] * len(chunk_tiles)
-             chunk_photometry_done = False
- 
+     parsed_entries: list[tuple[np.ndarray, Any, np.ndarray | None]] = []
+     for entry in tile_data_with_wcs:
+         if not isinstance(entry, (list, tuple)) or len(entry) < 2:
+             continue
+         data = entry[0]
+         wcs_obj = entry[1]
+         mask = entry[2] if len(entry) >= 3 else None
+         parsed_entries.append((data, wcs_obj, mask))
+@@ -2141,50 +2143,57 @@ def compute_intertile_affine_calibration(
+             mask_tiles.append(None)
+             continue
+         luminance = _extract_luminance_plane(arr)
+         luminance_tiles.append(luminance)
+         shapes_hw.append((luminance.shape[0], luminance.shape[1]))
+         mask_arr = None
+         if mask is not None:
              try:
-                 kappa_val = float(stack_cfg.get("kappa_low", 3.0))
+                 mask_arr = np.asarray(mask, dtype=np.float32)
+                 if mask_arr.ndim == 3:
+                     mask_arr = mask_arr[..., 0]
+                 if mask_arr.shape != luminance.shape[:2]:
+                     mask_arr = None
              except Exception:
-                 kappa_val = 3.0
-             limits_val = stack_cfg.get("winsor_limits", (0.05, 0.05))
+                 mask_arr = None
+         mask_tiles.append(mask_arr)
+ 
+     num_tiles = len(parsed_entries)
+ 
+     try:
+         preview_size = int(preview_size)
+     except Exception:
+         preview_size = 512
+     preview_size = max(128, preview_size)
+ 
++    try:
++        cpu_workers = int(cpu_workers) if cpu_workers is not None else None
++    except Exception:
++        cpu_workers = None
++    if cpu_workers is not None and cpu_workers < 1:
++        cpu_workers = 1
++
+     try:
+         min_overlap_fraction = float(min_overlap_fraction)
+     except Exception:
+         min_overlap_fraction = 0.05
+     if not math.isfinite(min_overlap_fraction):
+         min_overlap_fraction = 0.05
+     if min_overlap_fraction < 0:
+         min_overlap_fraction = 0.0
+ 
+     def _log_intertile(message: str, level: str = "INFO") -> None:
+         prefixed = message if message.startswith("[Intertile]") else f"[Intertile] {message}"
+         level_upper = str(level).upper()
+         if logger is not None:
              try:
-                 limits_val = (
-                     float(limits_val[0]),
-                     float(limits_val[1]),
+                 if level_upper in {"WARN", "WARNING"}:
+                     logger.warning(prefixed)
+                 elif level_upper in {"ERROR", "CRITICAL"}:
+                     logger.error(prefixed)
+                 elif level_upper in {"DEBUG", "DEBUG_DETAIL"}:
+                     logger.debug(prefixed)
+                 else:
+                     logger.info(prefixed)
+             except Exception:
+                 pass
+         if progress_callback:
+@@ -2352,181 +2361,223 @@ def compute_intertile_affine_calibration(
+             weights_array = None
+         if weights_array is not None and len(weights_array) != num_tiles:
+             _log_intertile(
+                 f"tile_weights ignored: expected {num_tiles}, got {len(weights_array)}",
+                 level="WARN",
+             )
+             weights_array = None
+         if weights_array is not None:
+             with np.errstate(invalid="ignore"):
+                 weights_array = np.where(np.isfinite(weights_array) & (weights_array > 0.0), weights_array, 1.0)
+             try:
+                 positive = weights_array[weights_array > 0.0]
+                 median_ref = float(np.median(positive)) if positive.size else 1.0
+             except Exception:
+                 median_ref = 1.0
+             if not math.isfinite(median_ref) or median_ref <= 0.0:
+                 median_ref = 1.0
+             with np.errstate(invalid="ignore", divide="ignore"):
+                 normed = weights_array / median_ref
+                 scores = np.sqrt(normed)
+             if scores is not None:
+                 scores = np.where(np.isfinite(scores) & (scores > 0.0), scores, 1.0)
+             weight_scores = scores
+             weights_for_anchor = weights_array
+ 
+-    for idx, overlap in enumerate(overlaps, 1):
+-        i = overlap["i"]
+-        j = overlap["j"]
+-        bbox = overlap["bbox"]
+-        weight = float(overlap.get("weight", 1.0))
+-        if luminance_tiles[i] is None or luminance_tiles[j] is None:
+-            continue
+-        x0, x1, y0, y1 = bbox
+-        sub_w = max(1, x1 - x0)
+-        sub_h = max(1, y1 - y0)
+-        header = header_full.copy()
+-        header["NAXIS1"] = sub_w
+-        header["NAXIS2"] = sub_h
+-        if "CRPIX1" in header:
+-            header["CRPIX1"] = float(header["CRPIX1"]) - x0
+-        if "CRPIX2" in header:
+-            header["CRPIX2"] = float(header["CRPIX2"]) - y0
++    preview_size = max(128, int(preview_size))
++
++    def _mask_valid_pixels(mask_arr: np.ndarray | None) -> np.ndarray | None:
++        if mask_arr is None:
++            return None
++        mask_arr = np.asarray(mask_arr, dtype=np.float32)
++        if mask_arr.size == 0:
++            return None
++        finite_mask = np.isfinite(mask_arr)
+         try:
+-            target_wcs = _WCS(header)
++            max_val = float(np.nanmax(mask_arr))
+         except Exception:
+-            continue
++            max_val = 0.0
++        threshold = 0.5 if max_val > 0.5 else 0.0
++        return finite_mask & (mask_arr > threshold)
++
++    def _process_overlap_pair(idx_overlap: int, overlap_entry: dict) -> tuple[list[tuple[int, int, float, float, float]] | None, tuple[int, int, float] | None]:
+         try:
+-            reproj_i, _ = reproject_interp(
+-                (luminance_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
+-            )
+-            reproj_j, _ = reproject_interp(
+-                (luminance_tiles[j], wcs_list[j]), target_wcs, shape_out=(sub_h, sub_w)
+-            )
+-        except Exception:
+-            continue
+-        if reproj_i is None or reproj_j is None:
+-            continue
+-        arr_i = np.asarray(reproj_i, dtype=np.float32)
+-        arr_j = np.asarray(reproj_j, dtype=np.float32)
+-        mask_i_reproj = None
+-        mask_j_reproj = None
+-        if mask_tiles[i] is not None:
++            i = overlap_entry["i"]
++            j = overlap_entry["j"]
++            bbox = overlap_entry["bbox"]
++            weight = float(overlap_entry.get("weight", 1.0))
++            if luminance_tiles[i] is None or luminance_tiles[j] is None:
++                return None, None
++            x0, x1, y0, y1 = bbox
++            sub_w = max(1, x1 - x0)
++            sub_h = max(1, y1 - y0)
++            header = header_full.copy()
++            header["NAXIS1"] = sub_w
++            header["NAXIS2"] = sub_h
++            if "CRPIX1" in header:
++                header["CRPIX1"] = float(header["CRPIX1"]) - x0
++            if "CRPIX2" in header:
++                header["CRPIX2"] = float(header["CRPIX2"]) - y0
+             try:
+-                mask_i_reproj, _ = reproject_interp(
+-                    (mask_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
+-                )
++                target_wcs = _WCS(header)
+             except Exception:
+-                mask_i_reproj = None
+-        if mask_tiles[j] is not None:
++                return None, None
+             try:
+-                mask_j_reproj, _ = reproject_interp(
+-                    (mask_tiles[j], wcs_list[j]), target_wcs, shape_out=(sub_h, sub_w)
++                reproj_i, _ = reproject_interp(
++                    (luminance_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
++                )
++                reproj_j, _ = reproject_interp(
++                    (luminance_tiles[j], wcs_list[j]), target_wcs, shape_out=(sub_h, sub_w)
                  )
              except Exception:
-                 limits_val = (0.05, 0.05)
+-                mask_j_reproj = None
+-        if arr_i.size == 0 or arr_j.size == 0:
+-            continue
+-        max_dim = max(arr_i.shape[0], arr_i.shape[1])
+-        if max_dim > preview_size:
+-            scale = preview_size / max_dim
+-            new_w = max(8, int(round(arr_i.shape[1] * scale)))
+-            new_h = max(8, int(round(arr_i.shape[0] * scale)))
+-            arr_i = cv2.resize(arr_i, (new_w, new_h), interpolation=cv2.INTER_AREA)
+-            arr_j = cv2.resize(arr_j, (new_w, new_h), interpolation=cv2.INTER_AREA)
+-            if mask_i_reproj is not None:
+-                mask_i_reproj = cv2.resize(mask_i_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
+-            if mask_j_reproj is not None:
+-                mask_j_reproj = cv2.resize(mask_j_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
+-
+-        def _mask_valid_pixels(mask_arr: np.ndarray | None) -> np.ndarray | None:
+-            if mask_arr is None:
+-                return None
+-            mask_arr = np.asarray(mask_arr, dtype=np.float32)
+-            if mask_arr.size == 0:
+-                return None
+-            finite_mask = np.isfinite(mask_arr)
++                return None, None
++            if reproj_i is None or reproj_j is None:
++                return None, None
++            arr_i = np.asarray(reproj_i, dtype=np.float32)
++            arr_j = np.asarray(reproj_j, dtype=np.float32)
++            mask_i_reproj = None
++            mask_j_reproj = None
++            if mask_tiles[i] is not None:
++                try:
++                    mask_i_reproj, _ = reproject_interp(
++                        (mask_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
++                    )
++                except Exception:
++                    mask_i_reproj = None
++            if mask_tiles[j] is not None:
++                try:
++                    mask_j_reproj, _ = reproject_interp(
++                        (mask_tiles[j], wcs_list[j]), target_wcs, shape_out=(sub_h, sub_w)
++                    )
++                except Exception:
++                    mask_j_reproj = None
++            if arr_i.size == 0 or arr_j.size == 0:
++                return None, None
++            max_dim = max(arr_i.shape[0], arr_i.shape[1])
++            if max_dim > preview_size:
++                scale = preview_size / max_dim
++                new_w = max(8, int(round(arr_i.shape[1] * scale)))
++                new_h = max(8, int(round(arr_i.shape[0] * scale)))
++                arr_i = cv2.resize(arr_i, (new_w, new_h), interpolation=cv2.INTER_AREA)
++                arr_j = cv2.resize(arr_j, (new_w, new_h), interpolation=cv2.INTER_AREA)
++                if mask_i_reproj is not None:
++                    mask_i_reproj = cv2.resize(mask_i_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
++                if mask_j_reproj is not None:
++                    mask_j_reproj = cv2.resize(mask_j_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
++
++            valid = np.isfinite(arr_i) & np.isfinite(arr_j)
++            mask_i_valid = _mask_valid_pixels(mask_i_reproj)
++            mask_j_valid = _mask_valid_pixels(mask_j_reproj)
++            if mask_i_valid is not None:
++                valid &= mask_i_valid
++            if mask_j_valid is not None:
++                valid &= mask_j_valid
++            if not np.any(valid):
++                return None, None
++            sample_i = arr_i[valid]
++            sample_j = arr_j[valid]
++            if sample_i.size < 64:
++                return None, None
++            sky_proxy = 0.5 * (sample_i + sample_j)
              try:
-                 max_pass_val = int(stack_cfg.get("winsor_max_frames_per_pass", 0))
+-                max_val = float(np.nanmax(mask_arr))
++                p_low = np.percentile(sky_proxy, sky_low)
++                p_high = np.percentile(sky_proxy, sky_high)
              except Exception:
-                 max_pass_val = 0
-             try:
-                 worker_limit_val = int(stack_cfg.get("winsor_worker_limit", 1))
-             except Exception:
-                 worker_limit_val = 1
-             current_parallel_plan = getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan"))
-+            winsor_max_workers_val = 0 if worker_limit_val <= 0 else max(1, worker_limit_val)
-             stack_kwargs = {
-                 "kappa": kappa_val,
-                 "winsor_limits": limits_val,
-                 "winsor_max_frames_per_pass": max_pass_val,
--                "winsor_max_workers": max(1, worker_limit_val),
-+                "winsor_max_workers": winsor_max_workers_val,
-             }
-             super_arr = None
-             # --- Phase 4.5 (améliorée) : 2.1 → 3.1 à l’intérieur de 4.5 ---
-             # Réutiliser les options choisies dans le GUI :
-             #   normalize_method, weight_method, reject_algo, final_combine,
-             #   kappa/winsor/workers déjà présents dans stack_cfg/stack_kwargs.
-             try:
-                 norm_method = str(
-                     stack_cfg.get(
-                         "stacking_normalize_method",
-                         stack_cfg.get(
-                             "normalize_method",
-                             stack_cfg.get("stack_norm_method", "none"),
-                         ),
-                     )
-                 ).lower()
-             except Exception:
-                 norm_method = "none"
-             try:
-                 weight_method = str(stack_cfg.get("weight_method", stack_cfg.get("stack_weight_method", "none"))).lower()
-             except Exception:
-                 weight_method = "none"
-             try:
-                 reject_algo = str(stack_cfg.get("reject_algo", stack_cfg.get("stack_reject_algo", "winsorized_sigma_clip"))).lower()
-             except Exception:
-@@ -5250,57 +5251,57 @@ def _run_phase4_5_inter_master_merge(
-                                 ref_vals = ref_chan[ref_mask]
-                                 src_vals = src_chan[src_mask]
-                                 ref_range = np.nanpercentile(ref_vals, [sky_low, sky_high])
-                                 src_range = np.nanpercentile(src_vals, [sky_low, sky_high])
-                                 ref_sel = (ref_vals >= ref_range[0]) & (ref_vals <= ref_range[1])
-                                 src_sel = (src_vals >= src_range[0]) & (src_vals <= src_range[1])
-                                 ref_clip = ref_vals[ref_sel] if np.any(ref_sel) else ref_vals
-                                 src_clip = src_vals[src_sel] if np.any(src_sel) else src_vals
-                                 if ref_clip.size == 0 or src_clip.size == 0:
-                                     continue
-                                 bg_ref = float(np.nanmedian(ref_clip))
-                                 bg_src = float(np.nanmedian(src_clip))
-                                 if not (math.isfinite(bg_ref) and math.isfinite(bg_src)):
-                                     continue
-                                 delta = bg_ref - bg_src
-                                 src_chan[src_mask] = src_chan[src_mask] + delta
-                 except Exception:
-                     logger.debug(
-                         "[P4.5][G%03d] Chunk photometric normalization skipped (error)",
-                         group_id,
-                         exc_info=True,
-                     )
+-                max_val = 0.0
+-            threshold = 0.5 if max_val > 0.5 else 0.0
+-            return finite_mask & (mask_arr > threshold)
+-
+-        valid = np.isfinite(arr_i) & np.isfinite(arr_j)
+-        mask_i_valid = _mask_valid_pixels(mask_i_reproj)
+-        mask_j_valid = _mask_valid_pixels(mask_j_reproj)
+-        if mask_i_valid is not None:
+-            valid &= mask_i_valid
+-        if mask_j_valid is not None:
+-            valid &= mask_j_valid
+-        if not np.any(valid):
+-            continue
+-        sample_i = arr_i[valid]
+-        sample_j = arr_j[valid]
+-        if sample_i.size < 64:
+-            continue
+-        sky_proxy = 0.5 * (sample_i + sample_j)
+-        try:
+-            p_low = np.percentile(sky_proxy, sky_low)
+-            p_high = np.percentile(sky_proxy, sky_high)
++                p_low = np.nanmin(sky_proxy)
++                p_high = np.nanmax(sky_proxy)
++            if not np.isfinite(p_low) or not np.isfinite(p_high):
++                return None, None
++            if p_high <= p_low:
++                p_low = np.nanmin(sky_proxy)
++                p_high = np.nanmax(sky_proxy)
++            mask = (sky_proxy >= p_low) & (sky_proxy <= p_high)
++            if mask.sum() < 32:
++                mask = np.ones_like(sky_proxy, dtype=bool)
++            x_samples = sample_i[mask]
++            y_samples = sample_j[mask]
++            fit = robust_affine_fit(x_samples, y_samples, clip_sigma=robust_clip_sigma)
++            if fit is None:
++                return None, None
++            a_ij, b_ij = fit
++            # Preserve legacy duplicate append behavior.
++            pairs_local = [(i, j, a_ij, b_ij, weight), (i, j, a_ij, b_ij, weight)]
++            return pairs_local, (i, j, weight)
+         except Exception:
+-            p_low = np.nanmin(sky_proxy)
+-            p_high = np.nanmax(sky_proxy)
+-        if not np.isfinite(p_low) or not np.isfinite(p_high):
+-            continue
+-        if p_high <= p_low:
+-            p_low = np.nanmin(sky_proxy)
+-            p_high = np.nanmax(sky_proxy)
+-        mask = (sky_proxy >= p_low) & (sky_proxy <= p_high)
+-        if mask.sum() < 32:
+-            mask = np.ones_like(sky_proxy, dtype=bool)
+-        x_samples = sample_i[mask]
+-        y_samples = sample_j[mask]
+-        fit = robust_affine_fit(x_samples, y_samples, clip_sigma=robust_clip_sigma)
+-        if fit is None:
+-            continue
+-        a_ij, b_ij = fit
+-        pair_entries.append((i, j, a_ij, b_ij, weight))
+-
+-        a_ij, b_ij = fit
+-        pair_entries.append((i, j, a_ij, b_ij, weight))
+-        connectivity[i] += weight
+-        connectivity[j] += weight
+-
+-        # [ETA] Tick fin de traitement de la paire idx
+-        if progress_callback:
+-            try:
+-                progress_callback("phase5_intertile_pairs", int(idx), int(len(overlaps)))
+-            except Exception:
+-                pass
++            return None, None
  
-             # 4.5.c — empilement selon les réglages GUI
-             logger.debug(
--                "[P4.5][G%03d] Stack params: reject=%s, combine=%s, kappa=%.2f, winsor_limits=%s, workers=%d, weight=%s",
-+                "[P4.5][G%03d] Stack params: reject=%s, combine=%s, kappa=%.2f, winsor_limits=%s, workers=%s, weight=%s",
-                 group_id,
-                 reject_algo,
-                 final_combine,
-                 kappa_val,
-                 limits_val,
--                stack_kwargs["winsor_max_workers"],
-+                "AUTO(0)" if winsor_max_workers_val <= 0 else str(stack_kwargs["winsor_max_workers"]),
-                 weight_method,
+-        if progress_callback and idx % 5 == 0:
+-            try:
+-                progress_callback("phase5_intertile", idx, len(overlaps))
+-            except Exception:
+-                pass
++    total_pairs = len(overlaps)
++    use_parallel = cpu_workers is not None and cpu_workers > 1 and total_pairs >= 4
++    if use_parallel:
++        workers = min(cpu_workers, 16) if cpu_workers is not None else 1
++        workers = max(1, workers)
++        _log_intertile(
++            f"Parallel: threadpool workers={workers} pairs={total_pairs} preview={preview_size}",
++            level="INFO",
++        )
++        with ThreadPoolExecutor(max_workers=workers) as executor:
++            future_map = {
++                executor.submit(_process_overlap_pair, idx, overlap): idx
++                for idx, overlap in enumerate(overlaps, 1)
++            }
++            for future in as_completed(future_map):
++                idx = future_map[future]
++                pairs_local, connectivity_entry = future.result()
++                if pairs_local:
++                    pair_entries.extend(pairs_local)
++                if connectivity_entry:
++                    i_conn, j_conn, w_conn = connectivity_entry
++                    connectivity[i_conn] += w_conn
++                    connectivity[j_conn] += w_conn
++                if progress_callback:
++                    try:
++                        progress_callback("phase5_intertile_pairs", int(idx), int(total_pairs))
++                    except Exception:
++                        pass
++                    if idx % 5 == 0:
++                        try:
++                            progress_callback("phase5_intertile", idx, total_pairs)
++                        except Exception:
++                            pass
++    else:
++        for idx, overlap in enumerate(overlaps, 1):
++            pairs_local, connectivity_entry = _process_overlap_pair(idx, overlap)
++            if pairs_local:
++                pair_entries.extend(pairs_local)
++            if connectivity_entry:
++                i_conn, j_conn, w_conn = connectivity_entry
++                connectivity[i_conn] += w_conn
++                connectivity[j_conn] += w_conn
++            if progress_callback:
++                try:
++                    progress_callback("phase5_intertile_pairs", int(idx), int(total_pairs))
++                except Exception:
++                    pass
++                if idx % 5 == 0:
++                    try:
++                        progress_callback("phase5_intertile", idx, total_pairs)
++                    except Exception:
++                        pass
+ 
+     if not pair_entries:
+         return {}
+ 
+     if weight_scores is None:
+         anchor = int(np.argmax(connectivity)) if np.any(connectivity > 0) else 0
+     else:
+         if np.any(connectivity > 0):
+             score = connectivity * weight_scores
+             anchor = int(np.argmax(score))
+             selected_score = float(score[anchor])
+         else:
+             score = weight_scores
+             anchor = int(np.argmax(weight_scores))
+             selected_score = float(weight_scores[anchor])
+         selected_connectivity = float(connectivity[anchor])
+         selected_weight = float(weights_for_anchor[anchor]) if weights_for_anchor is not None else 1.0
+         try:
+             _log_intertile(
+                 f"Anchor selection biased: anchor={anchor} connectivity={selected_connectivity:.4f} weight={selected_weight:.4f} score={selected_score:.4f}",
+                 level="INFO",
              )
-             _phase45_gui_message(
-                 f"Phase 4.5: group {group_id} stacking ({reject_algo}/{final_combine})"
-             )
-             alpha_out = None
-             alpha_sources: list[str] = []
-             weights_ready = any(isinstance(w, np.ndarray) for w in frame_weights)
-             super_arr = None
-             if weights_ready:
+         except Exception:
+             pass
+ 
+diff --git a/zemosaic_worker.py b/zemosaic_worker.py
+index 6cbf4c3310e814bf1a70e8a33a96504cb14cac61..2a39fddbc262cb3e9c758df7c46470d706e9ce9c 100644
+--- a/zemosaic_worker.py
++++ b/zemosaic_worker.py
+@@ -6233,71 +6233,79 @@ def _select_quality_anchor(
+         "center_anchor_selected",
+         lvl="INFO",
+         callback=progress_callback,
+         tile=int(best_entry["tile_id"]),
+         dist_deg=best_entry.get("distance"),
+         score=best_score,
+     )
+ 
+     return int(best_entry["tile_id"])
+ 
+ 
+ def _compute_intertile_affine_corrections_from_sources(
+     sources: list[_TileAffineSource],
+     final_output_wcs,
+     final_output_shape_hw: tuple[int, int],
+     preview_size: int,
+     min_overlap_fraction: float,
+     sky_percentile: tuple[float, float] | list[float],
+     robust_clip_sigma: float,
+     use_auto_intertile: bool,
+     logger_obj=None,
+     progress_callback: Callable | None = None,
+     intertile_global_recenter: bool = False,
+     intertile_recenter_clip: tuple[float, float] | list[float] | None = None,
+     tile_weights: list[float] | None = None,
++    cpu_workers: int | None = None,
+ ) -> tuple[list[tuple[float, float]] | None, bool, str, str | None]:
+     """Common implementation for intertile gain/offset computation.
+ 
+     Returns
+     -------
+     (list[(gain, offset)] | None, bool, str, str | None)
+         Sanitized affine list (or ``None``), flag indicating whether non-trivial
+         corrections were detected, status string (``\"ok\"``, ``\"skipped\"``,
+         ``\"preview_failed\"``, ``\"compute_failed\"``) and optional error message.
+     """
+ 
+     total_tiles = len(sources)
+     if total_tiles < 2:
+         return None, False, "skipped", None
+ 
+     if not (
+         ZEMOSAIC_UTILS_AVAILABLE
+         and hasattr(zemosaic_utils, "compute_intertile_affine_calibration")
+     ):
+         return None, False, "skipped", None
+ 
++    try:
++        cpu_workers = int(cpu_workers) if cpu_workers is not None else None
++    except Exception:
++        cpu_workers = None
++    if cpu_workers is not None and cpu_workers < 1:
++        cpu_workers = 1
++
+     tile_pairs: list[tuple[np.ndarray, Any] | tuple[np.ndarray, Any, np.ndarray]] = []
+     preview_arrays: list[np.ndarray | None] = []
+ 
+     for idx, src in enumerate(sources, 1):
+         try:
+             tile_arr: np.ndarray
+             mask2d_float: np.ndarray | None = None
+             alpha_mask_arr: np.ndarray | None = None
+             label = _safe_basename(src.path)
+             if src.data is not None:
+                 tile_arr = _ensure_hwc_master_tile(src.data, label)
+             else:
+                 if not src.path:
+                     raise ValueError("Tile data missing and no path provided.")
+                 with fits.open(src.path, memmap=False) as hdul:
+                     tile_arr = _ensure_hwc_master_tile(hdul[0].data, label)
+                     if "ALPHA" in hdul and hdul["ALPHA"].data is not None:
+                         try:
+                             alpha_mask_arr = np.asarray(hdul["ALPHA"].data)
+                         except Exception:
+                             alpha_mask_arr = None
+             tile_arr = np.asarray(tile_arr, dtype=np.float32, order="C")
+             mask_source = getattr(src, "mask", None)
+             if mask_source is not None:
                  try:
-                     frames_np = np.stack(frames, axis=0).astype(np.float32, copy=False)
-                     reference_shape = frames_np.shape[1:3]
-                     weight_stack_list: list[np.ndarray] = []
-                     for wmap in frame_weights:
-                         if isinstance(wmap, np.ndarray) and wmap.shape == reference_shape:
-                             weight_stack_list.append(wmap.astype(np.float32, copy=False))
-                         else:
-                             weight_stack_list.append(np.ones(reference_shape, dtype=np.float32))
-                     weight_stack = np.stack(weight_stack_list, axis=0)
-                     weight_stack = np.clip(np.nan_to_num(weight_stack, nan=0.0), 0.0, 1.0)
-                     weight_expanded = weight_stack[..., None]
-                     num = np.nansum(frames_np * weight_expanded, axis=0)
-                     den = np.nansum(weight_expanded, axis=0)
-                     super_arr = np.where(den > 0, num / den, np.nan)
-@@ -17787,59 +17788,80 @@ def run_hierarchical_mosaic_classic_legacy(
-                     seestar_stack_groups = _merge_small_groups(
-                         seestar_stack_groups,
-                         min_size=min_value,
-                         cap=cap_value,
-                     )
-     
-         # Do not subdivide groups if a target group count is set; respect clustering first.
-         if (
-             not preplan_groups_active
-             and (cluster_target_groups_config is None or int(cluster_target_groups_config) <= 0)
-             and max_raw_per_master_tile_config
-             and max_raw_per_master_tile_config > 0
-         ):
-             new_groups = []
-             for g in seestar_stack_groups:
-                 for i in range(0, len(g), max_raw_per_master_tile_config):
-                     new_groups.append(g[i:i + max_raw_per_master_tile_config])
-             if len(new_groups) != len(seestar_stack_groups):
-                 pcb(
-                     "clusterstacks_info_groups_split_manual_limit",
-                     prog=None,
-                     lvl="INFO_DETAIL",
-                     original=len(seestar_stack_groups),
-                     new=len(new_groups),
-                     limit=max_raw_per_master_tile_config,
--                )
-+            )
-             seestar_stack_groups = new_groups
-         cpu_total = os.cpu_count() or 1
--        winsor_worker_limit = max(1, min(int(winsor_worker_limit_config), cpu_total))
-+        try:
-+            winsor_worker_limit_cfg = int(winsor_worker_limit_config)
-+        except Exception:
-+            winsor_worker_limit_cfg = 1
-+        winsor_auto = winsor_worker_limit_cfg <= 0
-+        if winsor_auto:
-+            candidate = 0
-+            if global_parallel_plan and getattr(global_parallel_plan, "cpu_workers", 0) > 0:
-+                candidate = int(getattr(global_parallel_plan, "cpu_workers", 0))
-+            elif effective_base_workers and effective_base_workers > 0:
-+                candidate = int(effective_base_workers)
-+            else:
-+                candidate = cpu_total
-+        else:
-+            candidate = winsor_worker_limit_cfg
-+        winsor_worker_limit = max(1, min(int(candidate), cpu_total))
-         winsor_max_frames_per_pass = max(0, int(winsor_max_frames_per_pass_config))
-         global_wcs_plan["winsor_worker_limit"] = int(winsor_worker_limit)
-         global_wcs_plan["winsor_max_frames_per_pass"] = int(winsor_max_frames_per_pass)
-         global_wcs_plan["use_align_helpers"] = True
-         global_wcs_plan["prefer_gpu_helpers"] = bool(use_gpu_phase5_flag)
-+        if winsor_auto:
-+            pcb(
-+                f"Winsor worker limit: AUTO (cfg={winsor_worker_limit_cfg}) -> resolved={winsor_worker_limit} (cpu_total={cpu_total})",
-+                prog=None,
-+                lvl="INFO_DETAIL",
-+            )
-         pcb(
-             f"Winsor worker limit set to {winsor_worker_limit}" + (
-                 " (ProcessPoolExecutor enabled)" if winsor_worker_limit > 1 else ""
-             ),
+@@ -6412,50 +6420,51 @@ def _compute_intertile_affine_corrections_from_sources(
+                 except Exception:
+                     pass
+         except Exception:
+             pass
+         # Relais vers le callback GUI d'origine pour l'affichage + ETA fine (via on_worker_progress)
+         if progress_callback:
+             try:
+                 progress_callback(message_or_stage, current, level, **kwargs)
+             except Exception:
+                 pass
+ 
+     try:
+         corrections = zemosaic_utils.compute_intertile_affine_calibration(
+ 
+             tile_pairs,
+             final_output_wcs,
+             final_output_shape_hw,
+             preview_size=preview_size,
+             min_overlap_fraction=min_overlap_fraction,
+             sky_percentile=sky_percentile,
+             robust_clip_sigma=robust_clip_sigma,
+             use_auto_intertile=use_auto_intertile,
+             logger=logger_obj,
+             progress_callback=_intertile_progress_bridge,
+             tile_weights=tile_weights,
++            cpu_workers=cpu_workers,
+         )
+     except Exception as exc:
+         if logger_obj:
+             logger_obj.warning(
+                 "Intertile photometric calibration failed: %s",
+                 exc,
+             )
+             logger_obj.debug("Traceback (intertile failure):", exc_info=True)
+         return None, False, "compute_failed", str(exc)
+     finally:
+         tile_pairs.clear()
+ 
+     sanitized, nontrivial = _sanitize_affine_corrections(corrections, total_tiles)
+ 
+     if sanitized and intertile_global_recenter and preview_arrays:
+         clip_cfg = intertile_recenter_clip if isinstance(intertile_recenter_clip, (list, tuple)) else None
+         if not clip_cfg or len(clip_cfg) < 2:
+             clip_cfg = (0.85, 1.18)
+         try:
+             clip_low = float(clip_cfg[0])
+         except Exception:
+             clip_low = 0.85
+         try:
+             clip_high = float(clip_cfg[1])
+         except Exception:
+@@ -12468,50 +12477,55 @@ def assemble_final_mosaic_incremental(
+         affine_start = time.monotonic()
+         pcb_asm(
+             "run_info_incremental_affine_start",
              prog=None,
              lvl="INFO",
+             num_tiles=total_tiles,
          )
-         if winsor_max_frames_per_pass > 0:
-             pcb(
-                 f"Winsor streaming limit set to {winsor_max_frames_per_pass} frame(s) per pass",
-                 prog=None,
-                 lvl="INFO_DETAIL",
+         tile_sources = [
+             _TileAffineSource(path=tile_path, wcs=tile_wcs)
+             for tile_path, tile_wcs in master_tile_fits_with_wcs_list
+         ]
+         pending_affine_list, nontrivial_detected, affine_status, affine_error = (
+             _compute_intertile_affine_corrections_from_sources(
+                 sources=tile_sources,
+                 final_output_wcs=final_output_wcs,
+                 final_output_shape_hw=final_output_shape_hw,
+                 preview_size=int(intertile_preview_size),
+                 min_overlap_fraction=float(intertile_overlap_min),
+                 sky_percentile=intertile_sky_percentile,
+                 robust_clip_sigma=float(intertile_robust_clip_sigma),
+                 use_auto_intertile=use_auto_intertile,
+                 logger_obj=logger,
+                 progress_callback=progress_callback,
+                 intertile_global_recenter=bool(intertile_global_recenter),
+                 intertile_recenter_clip=intertile_recenter_clip,
++                cpu_workers=(
++                    int(processing_threads)
++                    if processing_threads and int(processing_threads) > 0
++                    else min(os.cpu_count() or 1, 8)
++                ),
              )
-         sds_stack_params = {
-             "stack_reject_algo": stack_reject_algo,
-             "stack_weight_method": stack_weight_method,
-             "stack_norm_method": stack_norm_method,
-             "stack_kappa_low": stack_kappa_low,
-             "stack_kappa_high": stack_kappa_high,
-             "stack_final_combine": stack_final_combine,
-             "parsed_winsor_limits": parsed_winsor_limits,
-             "winsor_worker_limit": winsor_worker_limit,
-             "winsor_max_frames_per_pass": winsor_max_frames_per_pass,
-             "apply_radial_weight": apply_radial_weight_config,
-             "radial_feather_fraction": radial_feather_fraction_config,
-@@ -21930,56 +21952,77 @@ def run_hierarchical_mosaic(
-                 batches_idx = [list(range(len(ordered_group)))]
-             for batch_indices in batches_idx:
-                 batch = [ordered_group[i] for i in batch_indices if 0 <= i < len(ordered_group)]
-                 if batch:
-                     overlapping_groups.append(batch)
-         if overlapping_groups:
-             pcb(
-                 "[Batching] cap overlap applied",
-                 prog=None,
-                 lvl="INFO_DETAIL",
-                 cap=int(overlap_cap),
-                 overlap=float(overlap_fraction_config),
-                 step=int(effective_step),
-                 batches=int(len(overlapping_groups)),
-             )
-             seestar_stack_groups = overlapping_groups
-         else:
-             pcb(
-                 "[Batching] overlap skipped (no groups produced)",
-                 prog=None,
-                 lvl="DEBUG_DETAIL",
-                 cap=int(overlap_cap),
-                 overlap=float(overlap_fraction_config),
-             )
-     cpu_total = os.cpu_count() or 1
--    winsor_worker_limit = max(1, min(int(winsor_worker_limit_config), cpu_total))
-+    try:
-+        winsor_worker_limit_cfg = int(winsor_worker_limit_config)
-+    except Exception:
-+        winsor_worker_limit_cfg = 1
-+    winsor_auto = winsor_worker_limit_cfg <= 0
-+    if winsor_auto:
-+        candidate = 0
-+        if global_parallel_plan and getattr(global_parallel_plan, "cpu_workers", 0) > 0:
-+            candidate = int(getattr(global_parallel_plan, "cpu_workers", 0))
-+        elif effective_base_workers and effective_base_workers > 0:
-+            candidate = int(effective_base_workers)
-+        else:
-+            candidate = cpu_total
-+    else:
-+        candidate = winsor_worker_limit_cfg
-+    winsor_worker_limit = max(1, min(int(candidate), cpu_total))
-     winsor_max_frames_per_pass = max(0, int(winsor_max_frames_per_pass_config))
-     global_wcs_plan["winsor_worker_limit"] = int(winsor_worker_limit)
-     global_wcs_plan["winsor_max_frames_per_pass"] = int(winsor_max_frames_per_pass)
-     global_wcs_plan["use_align_helpers"] = True
-     global_wcs_plan["prefer_gpu_helpers"] = bool(use_gpu_phase5_flag)
-+    if winsor_auto:
-+        pcb(
-+            f"Winsor worker limit: AUTO (cfg={winsor_worker_limit_cfg}) -> resolved={winsor_worker_limit} (cpu_total={cpu_total})",
-+            prog=None,
-+            lvl="INFO_DETAIL",
-+        )
-     pcb(
-         f"Winsor worker limit set to {winsor_worker_limit}" + (
-             " (ProcessPoolExecutor enabled)" if winsor_worker_limit > 1 else ""
-         ),
-         prog=None,
-         lvl="INFO",
-     )
-     if winsor_max_frames_per_pass > 0:
-         pcb(
-             f"Winsor streaming limit set to {winsor_max_frames_per_pass} frame(s) per pass",
-             prog=None,
-             lvl="INFO_DETAIL",
          )
-     sds_stack_params = {
-         "stack_reject_algo": stack_reject_algo,
-         "stack_weight_method": stack_weight_method,
-         "stack_norm_method": stack_norm_method,
-         "stack_kappa_low": stack_kappa_low,
-         "stack_kappa_high": stack_kappa_high,
-         "stack_final_combine": stack_final_combine,
-         "parsed_winsor_limits": parsed_winsor_limits,
-         "winsor_worker_limit": winsor_worker_limit,
-         "winsor_max_frames_per_pass": winsor_max_frames_per_pass,
-         "apply_radial_weight": apply_radial_weight_config,
-         "radial_feather_fraction": radial_feather_fraction_config,
+         if affine_status == "preview_failed":
+             pcb_asm(
+                 "assemble_warn_intertile_photometric_failed",
+                 prog=None,
+                 lvl="WARN",
+                 error="preview_failed",
+             )
+             pending_affine_list = None
+             nontrivial_detected = False
+         elif affine_status == "compute_failed":
+             pcb_asm(
+                 "assemble_warn_intertile_photometric_failed",
+                 prog=None,
+                 lvl="WARN",
+                 error=str(affine_error),
+             )
+             pending_affine_list = None
+             nontrivial_detected = False
+         affine_elapsed = time.monotonic() - affine_start
+         if nontrivial_detected:
+             try:
+                 pcb_asm(
+                     "assemble_info_intertile_photometric_applied",
+@@ -13720,50 +13734,55 @@ def assemble_final_mosaic_reproject_coadd(
+             tile_weights_for_sources.append(weight_val)
+             tile_sources.append(
+                 _TileAffineSource(
+                     path=entry.get("path"),
+                     wcs=entry.get("wcs"),
+                     data=entry.get("data"),
+                     mask=mask,
+                 )
+             )
+ 
+         pending_affine_list, nontrivial_affine, affine_status, affine_error = (
+             _compute_intertile_affine_corrections_from_sources(
+                 sources=tile_sources,
+                 final_output_wcs=final_output_wcs,
+                 final_output_shape_hw=final_output_shape_hw,
+                 preview_size=int(intertile_preview_size),
+                 min_overlap_fraction=float(intertile_overlap_min),
+                 sky_percentile=intertile_sky_percentile,
+                 robust_clip_sigma=float(intertile_robust_clip_sigma),
+                 use_auto_intertile=use_auto_intertile,
+                 logger_obj=logger,
+                 progress_callback=progress_callback,
+                 intertile_global_recenter=bool(intertile_global_recenter),
+                 intertile_recenter_clip=intertile_recenter_clip,
+                 tile_weights=tile_weights_for_sources,
++                cpu_workers=(
++                    int(assembly_process_workers)
++                    if assembly_process_workers and int(assembly_process_workers) > 0
++                    else min(os.cpu_count() or 1, 8)
++                ),
+             )
+         )
+ 
+         if affine_status == "preview_failed":
+             _pcb(
+                 "assemble_warn_intertile_photometric_failed",
+                 prog=None,
+                 lvl="WARN",
+                 error="preview_failed",
+             )
+             pending_affine_list = None
+             nontrivial_affine = False
+         elif affine_status == "compute_failed":
+             _pcb(
+                 "assemble_warn_intertile_photometric_failed",
+                 prog=None,
+                 lvl="WARN",
+                 error=str(affine_error),
+             )
+             pending_affine_list = None
+             nontrivial_affine = False
+ 
+     total_tiles_prepared = len(effective_tiles)
+     pending_affine_list, anchor_shift_applied = _compose_global_anchor_shift(
+         pending_affine_list,
