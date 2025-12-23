@@ -193,12 +193,19 @@ def _clamp_gpu_chunks(plan: ParallelPlan, ctx: GpuRuntimeContext) -> bool:
     if not use_gpu or not ctx.safe_mode:
         return False
 
-    cap_bytes = 256 * 1024 * 1024  # 256 MB default ceiling in safe mode
+    # Safe mode GPU chunk budget:
+    # - default conservative base: 256 MB
+    # - scale up on "real" GPUs: 10% of total VRAM (min 256 MB), hard-capped to 2 GB
+    # - never exceed 80% of free VRAM
+    # - absolute floor: 32 MB
+    cap_bytes = 256 * 1024 * 1024
     if ctx.vram_total_bytes:
         try:
-            cap_bytes = min(cap_bytes, int(ctx.vram_total_bytes * 0.6))
+            scaled = int(ctx.vram_total_bytes * 0.10)
+            cap_bytes = max(cap_bytes, scaled)
         except Exception:
             pass
+        cap_bytes = min(cap_bytes, 2 * 1024 * 1024 * 1024)
     if ctx.vram_free_bytes:
         try:
             cap_bytes = min(cap_bytes, int(ctx.vram_free_bytes * 0.8))

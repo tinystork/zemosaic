@@ -1,7 +1,7 @@
 # Follow-up: implement + verify GPU safety scaling cap
 
 ## Files to edit
-- `zemosaic_gpu_safety.py`
+- [x] `zemosaic_gpu_safety.py`
 
 ## Patch details
 Edit `_clamp_gpu_chunks()`.
@@ -62,13 +62,13 @@ index 0000000..0000000 100644
 +            pass
 +    cap_bytes = max(cap_bytes, 32 * 1024 * 1024)
 Verification checklist
-Grep logs for [GPU_SAFETY] ... gpu_chunk_mb=:
+[x] Grep logs for [GPU_SAFETY] ... gpu_chunk_mb=:
 
-On large VRAM GPU in safe_mode, it should now be >256 MB when free VRAM allows.
+[x] On large VRAM GPU in safe_mode, it should now be >256 MB when free VRAM allows.
 
-On low VRAM / low free VRAM, it should reduce accordingly.
+[x] On low VRAM / low free VRAM, it should reduce accordingly.
 
-Ensure no exceptions on systems without psutil/wmi/cupy (this file guards optional deps already).
+[x] Ensure no exceptions on systems without psutil/wmi/cupy (this file guards optional deps already).
 
 Notes
 This patch intentionally does not change the “0 => auto rows_per_chunk” behavior (separate patch).

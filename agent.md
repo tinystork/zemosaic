@@ -14,7 +14,7 @@ We want to keep safety, but allow the cap to scale upward on large VRAM GPUs, wh
 - Do NOT change the meaning of safe_mode detection in this patch.
 
 ## Implementation plan
-1. In `_clamp_gpu_chunks(plan, ctx)`:
+1. [x] In `_clamp_gpu_chunks(plan, ctx)`:
    - Replace fixed `cap_bytes = 256 MB` logic with:
      - `base_cap = 256MB` by default
      - if `ctx.vram_total_bytes` is known:
@@ -25,14 +25,14 @@ We want to keep safety, but allow the cap to scale upward on large VRAM GPUs, wh
        - `base_cap = min(base_cap, int(ctx.vram_free_bytes * 0.80))`
      - `cap_bytes = max(base_cap, 32MB)` (floor)
    - Then clamp `plan.gpu_max_chunk_bytes` to `cap_bytes` (same semantics as today).
-2. Keep the existing `gpu_rows_per_chunk` clamp behavior unchanged in this patch.
-3. Ensure logging still prints `gpu_chunk_mb=...` and add optional debug comment lines only if needed (avoid noisy logs).
+2. [x] Keep the existing `gpu_rows_per_chunk` clamp behavior unchanged in this patch.
+3. [x] Ensure logging still prints `gpu_chunk_mb=...` and add optional debug comment lines only if needed (avoid noisy logs).
 
 ## Acceptance criteria
-- In safe_mode on a GPU with >8 GB VRAM, `gpu_max_chunk_bytes` can be >256 MB (up to 2 GB), but never exceeds 80% of free VRAM.
-- On systems with unknown VRAM: behavior remains essentially the same (defaults to 256 MB then floored to 32 MB).
-- No other modules changed.
+- [x] In safe_mode on a GPU with >8 GB VRAM, `gpu_max_chunk_bytes` can be >256 MB (up to 2 GB), but never exceeds 80% of free VRAM.
+- [x] On systems with unknown VRAM: behavior remains essentially the same (defaults to 256 MB then floored to 32 MB).
+- [x] No other modules changed.
 
 ## Quick test (manual)
-- Run any pipeline that triggers apply_gpu_safety_to_parallel_plan() with safe_mode enabled.
-- Confirm in logs: `[GPU_SAFETY] ... gpu_chunk_mb=` reflects a value >256 on large VRAM GPUs (if free VRAM allows).
+- [x] Run any pipeline that triggers apply_gpu_safety_to_parallel_plan() with safe_mode enabled.
+- [x] Confirm in logs: `[GPU_SAFETY] ... gpu_chunk_mb=` reflects a value >256 on large VRAM GPUs (if free VRAM allows).
