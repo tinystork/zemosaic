@@ -1,757 +1,433 @@
-diff --git a/zemosaic_utils.py b/zemosaic_utils.py
-index 94d9e70ce98332fecfae8d06a05d45242628a57e..9b9258112e5d9072eb86567f3c62c41dc3b7e67f 100644
---- a/zemosaic_utils.py
-+++ b/zemosaic_utils.py
-@@ -32,50 +32,51 @@
- ║                                                                                   ║
- ║ Description:                                                                      ║
- ║   This program was forged under the sacred light of pixels and                    ║
- ║   caffeine, with the noble intent of turning clouds of photons into               ║
- ║   astronomical art. If you use it, please consider saying “thanks,”               ║
- ║   gazing at the stars, or crediting Tinystork and J.A.R.V.I.S. —                  ║
- ║   developer karma depends on it.                                                  ║
- ║                                                                                   ║
- ║ Disclaimer:                                                                       ║
- ║   No AIs or butter knives were harmed in the making of this code.                 ║
- ╚═══════════════════════════════════════════════════════════════════════════════════╝
- """
+diff --git a/agent.md b/agent.md
+index 9db0d2cf24d6661d11bd3086ea489e279c2477b1..20cf86d038cefec25628461e255207a4c2bbfbf1 100644
+--- a/agent.md
++++ b/agent.md
+@@ -20,54 +20,54 @@ Patch minimal, localisé à Phase 5 reproject:
+ ## Fichiers probables
+ - `zemosaic_worker.py` (ou fichier équivalent orchestration Phase 5)
+ - éventuellement `solver_settings.py` si le plan est défini là, mais privilégier un patch dans le worker au moment
+   où le plan est finalisé (Phase 5).
+ - Ne pas modifier `zemosaic_gpu_safety.py` (sauf si impossible), objectif: patch le plus local possible.
  
+ ## Spécification de calcul (simple & conservatrice)
+ Estimer un coût "bytes par ligne" pour la reprojection GPU:
+ - Hypothèse conservatrice: on manipule au moins 2 buffers float32 (accumulateur + poids),
+   et on itère sur N tiles.
+ - bytes_per_row ≈ out_w * 4 (float32) * buffers_per_tile_effective * n_tiles_scale
+   On n'a pas besoin d'être exact, seulement éviter des valeurs trop grandes.
  
- # --- Standard Library Imports ---
- import os
- import math
- import copy
- import json
- import logging
- import re
- import time
+ Proposition robuste (sans connaître tous les détails internes):
+ - `bytes_per_row = max(1, out_w * 4 * max(2, buffers))`
+ - puis diviser le budget par `max(1, n_tiles)` pour rester conservateur côté mémoire "par tile"
+   (même si l'impl GPU ne garde pas tout simultanément).
+ - `rows_budget = gpu_max_chunk_bytes // (bytes_per_row * max(1, n_tiles))`
+ - `new_rows = clamp(rows_budget, min_rows=current_rows, max_rows=256)`
+ - Ajouter un plancher raisonnable (ex: 96) si ça ne dépasse pas le current.
+ 
+ Si des infos plus précises existent déjà (ex: taille réelle des buffers ou estimateur interne),
+ les utiliser à la place (mais sans refactor).
+ 
+ ## Étapes
+-1. Localiser dans le code le point Phase 5 où:
+-   - le plan est créé
+-   - `apply_gpu_safety_to_parallel_plan(... operation="global_reproject")` est appelé
+-2. Ajouter juste après ce call un petit ajustement conditionnel:
+-   - uniquement si `operation == "global_reproject"`
+-   - uniquement si `safe_mode == 1`
+-   - uniquement si `on_battery == False` (ou `power_plugged == True`)
+-3. Recalculer `gpu_rows_per_chunk` selon une estimation simple basée sur:
+-   - `plan.gpu_max_chunk_bytes` (ou param correspondant)
+-   - `out_w` (largeur de sortie) accessible depuis le contexte Phase 5
+-   - `n_tiles` (nombre de master tiles en input) accessible depuis la phase
+-4. Ajouter un log INFO clair:
+-   - "Phase5: reproject rows_per_chunk bumped from X to Y (not on battery), max_chunk_bytes=..."
+-5. S'assurer que si des champs manquent (out_w/n_tiles), on n'échoue pas:
+-   - fallback: ne rien changer
++- [x] Localiser dans le code le point Phase 5 où:
++  - le plan est créé
++  - `apply_gpu_safety_to_parallel_plan(... operation="global_reproject")` est appelé
++- [x] Ajouter juste après ce call un petit ajustement conditionnel:
++  - uniquement si `operation == "global_reproject"`
++  - uniquement si `safe_mode == 1`
++  - uniquement si `on_battery == False` (ou `power_plugged == True`)
++- [x] Recalculer `gpu_rows_per_chunk` selon une estimation simple basée sur:
++  - `plan.gpu_max_chunk_bytes` (ou param correspondant)
++  - `out_w` (largeur de sortie) accessible depuis le contexte Phase 5
++  - `n_tiles` (nombre de master tiles en input) accessible depuis la phase
++- [x] Ajouter un log INFO clair:
++  - "Phase5: reproject rows_per_chunk bumped from X to Y (not on battery), max_chunk_bytes=..."
++- [x] S'assurer que si des champs manquent (out_w/n_tiles), on n'échoue pas:
++  - fallback: ne rien changer
+ 
+ ## Critères d'acceptation
+ - Sur un run secteur (pas sur batterie), `gpu_rows_per_chunk` augmente (ex: 69 → ~200),
+   nombre de chunks réduit sensiblement, meilleure occupation GPU, sans dépassement mémoire.
+ - Sur batterie, comportement inchangé.
+ - Aucun changement de résultat scientifique attendu (juste la granularité).
+ - Aucune régression sur les autres phases.
+ 
+ ## Tests (léger)
+-- Ajouter un mini test unitaire si la suite existe:
++- [x] Ajouter un mini test unitaire si la suite existe:
+   - Simuler un plan avec gpu_max_chunk_bytes=128MB, out_w=2282, n_tiles=30, current_rows=69
+   - Vérifier que new_rows > current_rows et <= 256 quand on_battery=False
+   - Vérifier new_rows == current_rows quand on_battery=True
+ Si la repo n'a pas de tests, au minimum ajouter un "self-check" dans log (pas de test framework).
+diff --git a/followup.md b/followup.md
+index 119e2b614d79e09af4464be8912946ec680db505..9a78a20471dc450c8c99d7a27a7ebe56c266e047 100644
+--- a/followup.md
++++ b/followup.md
+@@ -1,68 +1,68 @@
+ # Follow-up: Implémentation & vérifications (Phase 5 rows_per_chunk bump)
+ 
+ ## 1) Localisation exacte
+-- Ouvrir `zemosaic_worker.py` et trouver la section Phase 5 "Reproject & Coadd".
+-- Repérer l'appel à `apply_gpu_safety_to_parallel_plan(..., operation="global_reproject")`.
+-- Repérer où sont disponibles:
++- [x] Ouvrir `zemosaic_worker.py` et trouver la section Phase 5 "Reproject & Coadd".
++- [x] Repérer l'appel à `apply_gpu_safety_to_parallel_plan(..., operation="global_reproject")`.
++- [x] Repérer où sont disponibles:
+   - `out_w` (ou une shape/width équivalente de l'image/canvas de sortie)
+   - `n_tiles` (len(master_tiles) / tiles list / inputs)
+   - flags d'alimentation (`on_battery`, `power_plugged`) si déjà loggés / détectés.
+ 
+ ## 2) Patch minimal (juste après le safety)
+-Ajouter un bloc du style (adapter aux noms réels, sans refactor):
++- [x] Ajouter un bloc du style (adapter aux noms réels, sans refactor):
+ 
+ - Conditions:
+   - `operation == "global_reproject"`
+   - `getattr(safety, "safe_mode", 0) == 1` OU `plan.safe_mode == 1` (selon où c'est stocké)
+   - `on_battery is False` (ou `power_plugged is True`)
+ - Valeurs:
+   - `current = plan.gpu_rows_per_chunk` (si absent: ne rien faire)
+   - `max_bytes = plan.gpu_max_chunk_bytes` (sinon: ne rien faire)
+   - `out_w = ...`
+   - `n_tiles = ...`
+ 
+ - Estimation conservative:
+   - `buffers = 2` (accum + weight)
+   - `bytes_per_row = max(1, out_w * 4 * buffers)`
+   - `den = max(1, n_tiles)`
+   - `rows_budget = max_bytes // (bytes_per_row * den)`
+   - `candidate = int(rows_budget)`
+   - `new_rows = min(256, max(current, candidate))`
+   - Optionnel: `new_rows = max(new_rows, min(96, 256))` uniquement si `new_rows > current` sinon rien
+   - Si `new_rows > current`: assigner et logguer.
+ 
+ Important: si `candidate` est absurde (0 ou < current), ne rien changer.
+ 
+ ## 3) Logging
+-Ajouter une ligne INFO (même logger que le worker):
++- [x] Ajouter une ligne INFO (même logger que le worker):
+ - Avant/après + contexte:
+   - safe_mode, on_battery/power_plugged, max_chunk_bytes, out_w, n_tiles
+ 
+ Ex:
+ "Phase5 GPU: bump rows_per_chunk 69 -> 224 (plugged), max_chunk=128MB, out_w=2282, n_tiles=30"
+ 
+ ## 4) Robustesse
+-- Aucun import nouveau lourd.
+-- Pas d'exception si attributs manquent:
++- [x] Aucun import nouveau lourd.
++- [x] Pas d'exception si attributs manquent:
+   - utiliser `getattr(...)` + early return.
+-- Ne pas toucher au multi-threading.
+-- Ne pas changer la logique batch size (0 vs >1).
++- [x] Ne pas toucher au multi-threading.
++- [x] Ne pas changer la logique batch size (0 vs >1).
+ 
+ ## 5) Tests rapides
+ ### Option A: pytest (si présent)
+-Créer/compléter un test simple qui appelle la fonction/helper si tu en crées une mini locale,
++- [x] Créer/compléter un test simple qui appelle la fonction/helper si tu en crées une mini locale,
+ ou bien tester via un petit "plan" factice (dataclass/dict) si c'est déjà le style du repo.
+ 
+ Cas:
+-- plugged: augmente et <=256
+-- on_battery: inchangé
++- [x] plugged: augmente et <=256
++- [x] on_battery: inchangé
+ 
+ ### Option B: smoke run (si pas de tests)
+ - Lancer un run court (ex: 10–20 tuiles) en secteur.
+ - Vérifier dans le log que `rows_per_chunk` est bump.
+ - Observer que la phase reproject fait moins d'itérations/chunks.
+ 
+ ## 6) Résultat attendu
+ - Moins de micro-chunks → moins d'overhead.
+ - GPU davantage sollicité (sans chercher 100%, mais au moins une montée perceptible).
+ - Pas de freeze, car `gpu_max_chunk_bytes` reste identique (128MB).
+diff --git a/tests/test_phase5_gpu.py b/tests/test_phase5_gpu.py
+index 9fe07aabd2c519aea684c6b48cbe1d7e3d483bd4..f5f1fa4aeda46ea16d9a03e1b0c2521d37fa4a84 100644
+--- a/tests/test_phase5_gpu.py
++++ b/tests/test_phase5_gpu.py
+@@ -1,57 +1,89 @@
++import logging
  import sys
- import platform
- import tempfile
-+from concurrent.futures import ThreadPoolExecutor, as_completed
- from functools import lru_cache
- from contextlib import nullcontext
  from pathlib import Path
- from typing import Any, Callable, Iterable, Optional, Sequence
+ from types import SimpleNamespace
+ 
  import numpy as np
- # L'import de astropy.io.fits est géré ci-dessous pour définir le flag
- import cv2
+ import pytest
  
- import warnings
- import traceback
- import gc
- import importlib.util
+ REPO_ROOT = Path(__file__).resolve().parents[1]
+ if str(REPO_ROOT) not in sys.path:
+     sys.path.insert(0, str(REPO_ROOT))
  
- # --- Optional Astropy WCS import (lightweight, guarded) ----------------------
- ASTROPY_WCS_AVAILABLE_IN_UTILS = False
- AstropyWCS = None
- proj_plane_pixel_scales = None
- try:  # pragma: no cover - optional dependency path
-     from astropy.wcs import WCS as AstropyWCS  # type: ignore
-     from astropy.wcs.utils import proj_plane_pixel_scales  # type: ignore
- 
-     ASTROPY_WCS_AVAILABLE_IN_UTILS = True
- except Exception:
-     AstropyWCS = None
-     proj_plane_pixel_scales = None
-@@ -2062,50 +2063,51 @@ def solve_global_affine(num_tiles: int, pair_entries, anchor_index: int = 0):
-     offsets = sol[num_tiles:]
-     result = {}
-     for idx in range(num_tiles):
-         g = float(gains[idx])
-         o = float(offsets[idx])
-         if not np.isfinite(g) or abs(g) < 1e-6:
-             g = 1.0
-         if not np.isfinite(o):
-             o = 0.0
-         result[idx] = (g, o)
-     return result
+ import zemosaic_worker as zw
  
  
- def compute_intertile_affine_calibration(
-     tile_data_with_wcs,
-     final_output_wcs,
-     final_output_shape_hw,
-     preview_size: int = 512,
-     min_overlap_fraction: float = 0.05,
-     sky_percentile: tuple[float, float] | list[float] = (30.0, 70.0),
-     robust_clip_sigma: float = 2.5,
-     use_auto_intertile: bool = False,
-     logger=None,
-     progress_callback=None,
-     tile_weights=None,
-+    cpu_workers: int | None = None,
- ):
-     """Calcule des corrections affine (gain/offset) inter-tuiles avant reprojection.
+ def test_should_use_gpu_helper_respects_plan(monkeypatch):
+     """should_use_gpu_for_reproject honours config, plan, and GPU availability."""
  
-     ``tile_data_with_wcs`` peut contenir des tuples ``(data, wcs)`` ou
-     ``(data, wcs, mask2d)`` pour injecter un masque (0..1) optionnel sur la zone
-     d'overlap.
-     """
+     monkeypatch.setattr(zw, "gpu_is_available", lambda: True)
+     zw.reset_phase5_gpu_runtime_state()
+     config = {"use_gpu_phase5": True}
+     plan = type("Plan", (), {"use_gpu": True})()
+     assert zw.should_use_gpu_for_reproject("phase5_reproject_coadd", config, plan)
  
-     if tile_data_with_wcs is None or len(tile_data_with_wcs) < 2:
-         return {}
-     if reproject_interp is None or not ASTROPY_AVAILABLE_IN_UTILS:
-         return {}
-     try:
-         header_full = final_output_wcs.to_header()
-     except Exception:
-         return {}
+     plan.use_gpu = False
+     assert not zw.should_use_gpu_for_reproject("phase5_reproject_coadd", config, plan)
  
-     parsed_entries: list[tuple[np.ndarray, Any, np.ndarray | None]] = []
-     for entry in tile_data_with_wcs:
-         if not isinstance(entry, (list, tuple)) or len(entry) < 2:
-             continue
-         data = entry[0]
-         wcs_obj = entry[1]
-         mask = entry[2] if len(entry) >= 3 else None
-         parsed_entries.append((data, wcs_obj, mask))
-@@ -2141,50 +2143,57 @@ def compute_intertile_affine_calibration(
-             mask_tiles.append(None)
-             continue
-         luminance = _extract_luminance_plane(arr)
-         luminance_tiles.append(luminance)
-         shapes_hw.append((luminance.shape[0], luminance.shape[1]))
-         mask_arr = None
-         if mask is not None:
-             try:
-                 mask_arr = np.asarray(mask, dtype=np.float32)
-                 if mask_arr.ndim == 3:
-                     mask_arr = mask_arr[..., 0]
-                 if mask_arr.shape != luminance.shape[:2]:
-                     mask_arr = None
-             except Exception:
-                 mask_arr = None
-         mask_tiles.append(mask_arr)
+     plan.use_gpu = True
+     config["use_gpu_phase5"] = False
+     assert not zw.should_use_gpu_for_reproject("phase5_reproject_coadd", config, plan)
+     zw.reset_phase5_gpu_runtime_state()
  
-     num_tiles = len(parsed_entries)
  
-     try:
-         preview_size = int(preview_size)
-     except Exception:
-         preview_size = 512
-     preview_size = max(128, preview_size)
- 
-+    try:
-+        cpu_workers = int(cpu_workers) if cpu_workers is not None else None
-+    except Exception:
-+        cpu_workers = None
-+    if cpu_workers is not None and cpu_workers < 1:
-+        cpu_workers = 1
++def test_phase5_rows_per_chunk_bumps_when_plugged(caplog):
++    plan = SimpleNamespace(
++        gpu_rows_per_chunk=69,
++        gpu_max_chunk_bytes=128 * 1024 * 1024,
++        use_gpu=True,
++    )
++    ctx = SimpleNamespace(safe_mode=1, on_battery=False, power_plugged=True)
 +
-     try:
-         min_overlap_fraction = float(min_overlap_fraction)
-     except Exception:
-         min_overlap_fraction = 0.05
-     if not math.isfinite(min_overlap_fraction):
-         min_overlap_fraction = 0.05
-     if min_overlap_fraction < 0:
-         min_overlap_fraction = 0.0
- 
-     def _log_intertile(message: str, level: str = "INFO") -> None:
-         prefixed = message if message.startswith("[Intertile]") else f"[Intertile] {message}"
-         level_upper = str(level).upper()
-         if logger is not None:
-             try:
-                 if level_upper in {"WARN", "WARNING"}:
-                     logger.warning(prefixed)
-                 elif level_upper in {"ERROR", "CRITICAL"}:
-                     logger.error(prefixed)
-                 elif level_upper in {"DEBUG", "DEBUG_DETAIL"}:
-                     logger.debug(prefixed)
-                 else:
-                     logger.info(prefixed)
-             except Exception:
-                 pass
-         if progress_callback:
-@@ -2352,181 +2361,223 @@ def compute_intertile_affine_calibration(
-             weights_array = None
-         if weights_array is not None and len(weights_array) != num_tiles:
-             _log_intertile(
-                 f"tile_weights ignored: expected {num_tiles}, got {len(weights_array)}",
-                 level="WARN",
-             )
-             weights_array = None
-         if weights_array is not None:
-             with np.errstate(invalid="ignore"):
-                 weights_array = np.where(np.isfinite(weights_array) & (weights_array > 0.0), weights_array, 1.0)
-             try:
-                 positive = weights_array[weights_array > 0.0]
-                 median_ref = float(np.median(positive)) if positive.size else 1.0
-             except Exception:
-                 median_ref = 1.0
-             if not math.isfinite(median_ref) or median_ref <= 0.0:
-                 median_ref = 1.0
-             with np.errstate(invalid="ignore", divide="ignore"):
-                 normed = weights_array / median_ref
-                 scores = np.sqrt(normed)
-             if scores is not None:
-                 scores = np.where(np.isfinite(scores) & (scores > 0.0), scores, 1.0)
-             weight_scores = scores
-             weights_for_anchor = weights_array
- 
--    for idx, overlap in enumerate(overlaps, 1):
--        i = overlap["i"]
--        j = overlap["j"]
--        bbox = overlap["bbox"]
--        weight = float(overlap.get("weight", 1.0))
--        if luminance_tiles[i] is None or luminance_tiles[j] is None:
--            continue
--        x0, x1, y0, y1 = bbox
--        sub_w = max(1, x1 - x0)
--        sub_h = max(1, y1 - y0)
--        header = header_full.copy()
--        header["NAXIS1"] = sub_w
--        header["NAXIS2"] = sub_h
--        if "CRPIX1" in header:
--            header["CRPIX1"] = float(header["CRPIX1"]) - x0
--        if "CRPIX2" in header:
--            header["CRPIX2"] = float(header["CRPIX2"]) - y0
-+    preview_size = max(128, int(preview_size))
++    with caplog.at_level(logging.INFO):
++        zw._maybe_bump_phase5_gpu_rows_per_chunk(plan, ctx, (100, 2282), 30, logging.getLogger(__name__))
 +
-+    def _mask_valid_pixels(mask_arr: np.ndarray | None) -> np.ndarray | None:
-+        if mask_arr is None:
-+            return None
-+        mask_arr = np.asarray(mask_arr, dtype=np.float32)
-+        if mask_arr.size == 0:
-+            return None
-+        finite_mask = np.isfinite(mask_arr)
-         try:
--            target_wcs = _WCS(header)
-+            max_val = float(np.nanmax(mask_arr))
-         except Exception:
--            continue
-+            max_val = 0.0
-+        threshold = 0.5 if max_val > 0.5 else 0.0
-+        return finite_mask & (mask_arr > threshold)
++    assert plan.gpu_rows_per_chunk > 69
++    assert plan.gpu_rows_per_chunk <= 256
++    assert any("Phase5 GPU: bump rows_per_chunk" in msg for msg in caplog.messages)
 +
-+    def _process_overlap_pair(idx_overlap: int, overlap_entry: dict) -> tuple[list[tuple[int, int, float, float, float]] | None, tuple[int, int, float] | None]:
-         try:
--            reproj_i, _ = reproject_interp(
--                (luminance_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
--            )
--            reproj_j, _ = reproject_interp(
--                (luminance_tiles[j], wcs_list[j]), target_wcs, shape_out=(sub_h, sub_w)
--            )
--        except Exception:
--            continue
--        if reproj_i is None or reproj_j is None:
--            continue
--        arr_i = np.asarray(reproj_i, dtype=np.float32)
--        arr_j = np.asarray(reproj_j, dtype=np.float32)
--        mask_i_reproj = None
--        mask_j_reproj = None
--        if mask_tiles[i] is not None:
-+            i = overlap_entry["i"]
-+            j = overlap_entry["j"]
-+            bbox = overlap_entry["bbox"]
-+            weight = float(overlap_entry.get("weight", 1.0))
-+            if luminance_tiles[i] is None or luminance_tiles[j] is None:
-+                return None, None
-+            x0, x1, y0, y1 = bbox
-+            sub_w = max(1, x1 - x0)
-+            sub_h = max(1, y1 - y0)
-+            header = header_full.copy()
-+            header["NAXIS1"] = sub_w
-+            header["NAXIS2"] = sub_h
-+            if "CRPIX1" in header:
-+                header["CRPIX1"] = float(header["CRPIX1"]) - x0
-+            if "CRPIX2" in header:
-+                header["CRPIX2"] = float(header["CRPIX2"]) - y0
-             try:
--                mask_i_reproj, _ = reproject_interp(
--                    (mask_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
--                )
-+                target_wcs = _WCS(header)
-             except Exception:
--                mask_i_reproj = None
--        if mask_tiles[j] is not None:
-+                return None, None
-             try:
--                mask_j_reproj, _ = reproject_interp(
--                    (mask_tiles[j], wcs_list[j]), target_wcs, shape_out=(sub_h, sub_w)
-+                reproj_i, _ = reproject_interp(
-+                    (luminance_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
-+                )
-+                reproj_j, _ = reproject_interp(
-+                    (luminance_tiles[j], wcs_list[j]), target_wcs, shape_out=(sub_h, sub_w)
-                 )
-             except Exception:
--                mask_j_reproj = None
--        if arr_i.size == 0 or arr_j.size == 0:
--            continue
--        max_dim = max(arr_i.shape[0], arr_i.shape[1])
--        if max_dim > preview_size:
--            scale = preview_size / max_dim
--            new_w = max(8, int(round(arr_i.shape[1] * scale)))
--            new_h = max(8, int(round(arr_i.shape[0] * scale)))
--            arr_i = cv2.resize(arr_i, (new_w, new_h), interpolation=cv2.INTER_AREA)
--            arr_j = cv2.resize(arr_j, (new_w, new_h), interpolation=cv2.INTER_AREA)
--            if mask_i_reproj is not None:
--                mask_i_reproj = cv2.resize(mask_i_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
--            if mask_j_reproj is not None:
--                mask_j_reproj = cv2.resize(mask_j_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
--
--        def _mask_valid_pixels(mask_arr: np.ndarray | None) -> np.ndarray | None:
--            if mask_arr is None:
--                return None
--            mask_arr = np.asarray(mask_arr, dtype=np.float32)
--            if mask_arr.size == 0:
--                return None
--            finite_mask = np.isfinite(mask_arr)
-+                return None, None
-+            if reproj_i is None or reproj_j is None:
-+                return None, None
-+            arr_i = np.asarray(reproj_i, dtype=np.float32)
-+            arr_j = np.asarray(reproj_j, dtype=np.float32)
-+            mask_i_reproj = None
-+            mask_j_reproj = None
-+            if mask_tiles[i] is not None:
-+                try:
-+                    mask_i_reproj, _ = reproject_interp(
-+                        (mask_tiles[i], wcs_list[i]), target_wcs, shape_out=(sub_h, sub_w)
-+                    )
-+                except Exception:
-+                    mask_i_reproj = None
-+            if mask_tiles[j] is not None:
-+                try:
-+                    mask_j_reproj, _ = reproject_interp(
-+                        (mask_tiles[j], wcs_list[j]), target_wcs, shape_out=(sub_h, sub_w)
-+                    )
-+                except Exception:
-+                    mask_j_reproj = None
-+            if arr_i.size == 0 or arr_j.size == 0:
-+                return None, None
-+            max_dim = max(arr_i.shape[0], arr_i.shape[1])
-+            if max_dim > preview_size:
-+                scale = preview_size / max_dim
-+                new_w = max(8, int(round(arr_i.shape[1] * scale)))
-+                new_h = max(8, int(round(arr_i.shape[0] * scale)))
-+                arr_i = cv2.resize(arr_i, (new_w, new_h), interpolation=cv2.INTER_AREA)
-+                arr_j = cv2.resize(arr_j, (new_w, new_h), interpolation=cv2.INTER_AREA)
-+                if mask_i_reproj is not None:
-+                    mask_i_reproj = cv2.resize(mask_i_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
-+                if mask_j_reproj is not None:
-+                    mask_j_reproj = cv2.resize(mask_j_reproj, (new_w, new_h), interpolation=cv2.INTER_AREA)
 +
-+            valid = np.isfinite(arr_i) & np.isfinite(arr_j)
-+            mask_i_valid = _mask_valid_pixels(mask_i_reproj)
-+            mask_j_valid = _mask_valid_pixels(mask_j_reproj)
-+            if mask_i_valid is not None:
-+                valid &= mask_i_valid
-+            if mask_j_valid is not None:
-+                valid &= mask_j_valid
-+            if not np.any(valid):
-+                return None, None
-+            sample_i = arr_i[valid]
-+            sample_j = arr_j[valid]
-+            if sample_i.size < 64:
-+                return None, None
-+            sky_proxy = 0.5 * (sample_i + sample_j)
-             try:
--                max_val = float(np.nanmax(mask_arr))
-+                p_low = np.percentile(sky_proxy, sky_low)
-+                p_high = np.percentile(sky_proxy, sky_high)
-             except Exception:
--                max_val = 0.0
--            threshold = 0.5 if max_val > 0.5 else 0.0
--            return finite_mask & (mask_arr > threshold)
--
--        valid = np.isfinite(arr_i) & np.isfinite(arr_j)
--        mask_i_valid = _mask_valid_pixels(mask_i_reproj)
--        mask_j_valid = _mask_valid_pixels(mask_j_reproj)
--        if mask_i_valid is not None:
--            valid &= mask_i_valid
--        if mask_j_valid is not None:
--            valid &= mask_j_valid
--        if not np.any(valid):
--            continue
--        sample_i = arr_i[valid]
--        sample_j = arr_j[valid]
--        if sample_i.size < 64:
--            continue
--        sky_proxy = 0.5 * (sample_i + sample_j)
--        try:
--            p_low = np.percentile(sky_proxy, sky_low)
--            p_high = np.percentile(sky_proxy, sky_high)
-+                p_low = np.nanmin(sky_proxy)
-+                p_high = np.nanmax(sky_proxy)
-+            if not np.isfinite(p_low) or not np.isfinite(p_high):
-+                return None, None
-+            if p_high <= p_low:
-+                p_low = np.nanmin(sky_proxy)
-+                p_high = np.nanmax(sky_proxy)
-+            mask = (sky_proxy >= p_low) & (sky_proxy <= p_high)
-+            if mask.sum() < 32:
-+                mask = np.ones_like(sky_proxy, dtype=bool)
-+            x_samples = sample_i[mask]
-+            y_samples = sample_j[mask]
-+            fit = robust_affine_fit(x_samples, y_samples, clip_sigma=robust_clip_sigma)
-+            if fit is None:
-+                return None, None
-+            a_ij, b_ij = fit
-+            # Preserve legacy duplicate append behavior.
-+            pairs_local = [(i, j, a_ij, b_ij, weight), (i, j, a_ij, b_ij, weight)]
-+            return pairs_local, (i, j, weight)
-         except Exception:
--            p_low = np.nanmin(sky_proxy)
--            p_high = np.nanmax(sky_proxy)
--        if not np.isfinite(p_low) or not np.isfinite(p_high):
--            continue
--        if p_high <= p_low:
--            p_low = np.nanmin(sky_proxy)
--            p_high = np.nanmax(sky_proxy)
--        mask = (sky_proxy >= p_low) & (sky_proxy <= p_high)
--        if mask.sum() < 32:
--            mask = np.ones_like(sky_proxy, dtype=bool)
--        x_samples = sample_i[mask]
--        y_samples = sample_j[mask]
--        fit = robust_affine_fit(x_samples, y_samples, clip_sigma=robust_clip_sigma)
--        if fit is None:
--            continue
--        a_ij, b_ij = fit
--        pair_entries.append((i, j, a_ij, b_ij, weight))
--
--        a_ij, b_ij = fit
--        pair_entries.append((i, j, a_ij, b_ij, weight))
--        connectivity[i] += weight
--        connectivity[j] += weight
--
--        # [ETA] Tick fin de traitement de la paire idx
--        if progress_callback:
--            try:
--                progress_callback("phase5_intertile_pairs", int(idx), int(len(overlaps)))
--            except Exception:
--                pass
-+            return None, None
++def test_phase5_rows_per_chunk_skips_on_battery(caplog):
++    plan = SimpleNamespace(
++        gpu_rows_per_chunk=69,
++        gpu_max_chunk_bytes=128 * 1024 * 1024,
++        use_gpu=True,
++    )
++    ctx = SimpleNamespace(safe_mode=1, on_battery=True, power_plugged=False)
++
++    with caplog.at_level(logging.INFO):
++        zw._maybe_bump_phase5_gpu_rows_per_chunk(plan, ctx, (100, 2282), 30, logging.getLogger(__name__))
++
++    assert plan.gpu_rows_per_chunk == 69
++    assert not any("Phase5 GPU: bump rows_per_chunk" in msg for msg in caplog.messages)
++
++
+ def test_two_pass_gpu_error_falls_back_to_cpu(monkeypatch):
+     """Simulate a GPU failure and ensure CPU fallback completes."""
  
--        if progress_callback and idx % 5 == 0:
--            try:
--                progress_callback("phase5_intertile", idx, len(overlaps))
--            except Exception:
--                pass
-+    total_pairs = len(overlaps)
-+    use_parallel = cpu_workers is not None and cpu_workers > 1 and total_pairs >= 4
-+    if use_parallel:
-+        workers = min(cpu_workers, 16) if cpu_workers is not None else 1
-+        workers = max(1, workers)
-+        _log_intertile(
-+            f"Parallel: threadpool workers={workers} pairs={total_pairs} preview={preview_size}",
-+            level="INFO",
-+        )
-+        with ThreadPoolExecutor(max_workers=workers) as executor:
-+            future_map = {
-+                executor.submit(_process_overlap_pair, idx, overlap): idx
-+                for idx, overlap in enumerate(overlaps, 1)
-+            }
-+            for future in as_completed(future_map):
-+                idx = future_map[future]
-+                pairs_local, connectivity_entry = future.result()
-+                if pairs_local:
-+                    pair_entries.extend(pairs_local)
-+                if connectivity_entry:
-+                    i_conn, j_conn, w_conn = connectivity_entry
-+                    connectivity[i_conn] += w_conn
-+                    connectivity[j_conn] += w_conn
-+                if progress_callback:
-+                    try:
-+                        progress_callback("phase5_intertile_pairs", int(idx), int(total_pairs))
-+                    except Exception:
-+                        pass
-+                    if idx % 5 == 0:
-+                        try:
-+                            progress_callback("phase5_intertile", idx, total_pairs)
-+                        except Exception:
-+                            pass
-+    else:
-+        for idx, overlap in enumerate(overlaps, 1):
-+            pairs_local, connectivity_entry = _process_overlap_pair(idx, overlap)
-+            if pairs_local:
-+                pair_entries.extend(pairs_local)
-+            if connectivity_entry:
-+                i_conn, j_conn, w_conn = connectivity_entry
-+                connectivity[i_conn] += w_conn
-+                connectivity[j_conn] += w_conn
-+            if progress_callback:
-+                try:
-+                    progress_callback("phase5_intertile_pairs", int(idx), int(total_pairs))
-+                except Exception:
-+                    pass
-+                if idx % 5 == 0:
-+                    try:
-+                        progress_callback("phase5_intertile", idx, total_pairs)
-+                    except Exception:
-+                        pass
+     monkeypatch.setattr(zw, "REPROJECT_AVAILABLE", True)
+     monkeypatch.setattr(zw, "ASTROPY_AVAILABLE", True)
+     monkeypatch.setattr(zw, "reproject_and_coadd", lambda *args, **kwargs: None)
+     monkeypatch.setattr(
+         zw,
+         "reproject_interp",
+         lambda *args, **kwargs: (np.ones((2, 2), dtype=np.float32), np.ones((2, 2), dtype=np.float32)),
+     )
+     zw.reset_phase5_gpu_runtime_state()
  
-     if not pair_entries:
-         return {}
+     call_log: list[bool] = []
  
-     if weight_scores is None:
-         anchor = int(np.argmax(connectivity)) if np.any(connectivity > 0) else 0
-     else:
-         if np.any(connectivity > 0):
-             score = connectivity * weight_scores
-             anchor = int(np.argmax(score))
-             selected_score = float(score[anchor])
-         else:
-             score = weight_scores
-             anchor = int(np.argmax(weight_scores))
-             selected_score = float(weight_scores[anchor])
-         selected_connectivity = float(connectivity[anchor])
-         selected_weight = float(weights_for_anchor[anchor]) if weights_for_anchor is not None else 1.0
-         try:
-             _log_intertile(
-                 f"Anchor selection biased: anchor={anchor} connectivity={selected_connectivity:.4f} weight={selected_weight:.4f} score={selected_score:.4f}",
-                 level="INFO",
-             )
-         except Exception:
-             pass
+     def fake_reproject_wrapper(*args, **kwargs):
+         use_gpu = kwargs.get("use_gpu", False)
+         call_log.append(bool(use_gpu))
+         if use_gpu:
+             raise RuntimeError("gpu boom")
+         shape_out = kwargs.get("shape_out") or (2, 2)
+         mosaic = np.full(shape_out, 5.0, dtype=np.float32)
+         coverage = np.ones(shape_out, dtype=np.float32)
+         return mosaic, coverage
  
 diff --git a/zemosaic_worker.py b/zemosaic_worker.py
-index 6cbf4c3310e814bf1a70e8a33a96504cb14cac61..2a39fddbc262cb3e9c758df7c46470d706e9ce9c 100644
+index 2a39fddbc262cb3e9c758df7c46470d706e9ce9c..c8aa032f07a4766a80fcf0f738e0493c0f1faf52 100644
 --- a/zemosaic_worker.py
 +++ b/zemosaic_worker.py
-@@ -6233,71 +6233,79 @@ def _select_quality_anchor(
-         "center_anchor_selected",
-         lvl="INFO",
-         callback=progress_callback,
-         tile=int(best_entry["tile_id"]),
-         dist_deg=best_entry.get("distance"),
-         score=best_score,
-     )
- 
-     return int(best_entry["tile_id"])
- 
- 
- def _compute_intertile_affine_corrections_from_sources(
-     sources: list[_TileAffineSource],
-     final_output_wcs,
-     final_output_shape_hw: tuple[int, int],
-     preview_size: int,
-     min_overlap_fraction: float,
-     sky_percentile: tuple[float, float] | list[float],
-     robust_clip_sigma: float,
-     use_auto_intertile: bool,
-     logger_obj=None,
-     progress_callback: Callable | None = None,
-     intertile_global_recenter: bool = False,
-     intertile_recenter_clip: tuple[float, float] | list[float] | None = None,
-     tile_weights: list[float] | None = None,
-+    cpu_workers: int | None = None,
- ) -> tuple[list[tuple[float, float]] | None, bool, str, str | None]:
-     """Common implementation for intertile gain/offset computation.
- 
-     Returns
-     -------
-     (list[(gain, offset)] | None, bool, str, str | None)
-         Sanitized affine list (or ``None``), flag indicating whether non-trivial
-         corrections were detected, status string (``\"ok\"``, ``\"skipped\"``,
-         ``\"preview_failed\"``, ``\"compute_failed\"``) and optional error message.
-     """
- 
-     total_tiles = len(sources)
-     if total_tiles < 2:
-         return None, False, "skipped", None
- 
-     if not (
-         ZEMOSAIC_UTILS_AVAILABLE
-         and hasattr(zemosaic_utils, "compute_intertile_affine_calibration")
-     ):
-         return None, False, "skipped", None
- 
-+    try:
-+        cpu_workers = int(cpu_workers) if cpu_workers is not None else None
-+    except Exception:
-+        cpu_workers = None
-+    if cpu_workers is not None and cpu_workers < 1:
-+        cpu_workers = 1
-+
-     tile_pairs: list[tuple[np.ndarray, Any] | tuple[np.ndarray, Any, np.ndarray]] = []
-     preview_arrays: list[np.ndarray | None] = []
- 
-     for idx, src in enumerate(sources, 1):
-         try:
-             tile_arr: np.ndarray
-             mask2d_float: np.ndarray | None = None
-             alpha_mask_arr: np.ndarray | None = None
-             label = _safe_basename(src.path)
-             if src.data is not None:
-                 tile_arr = _ensure_hwc_master_tile(src.data, label)
+@@ -2361,50 +2361,116 @@ def _equalize_rgb_black_level_hwc(
+                 logger.info(
+                     "[RGB-BL] applied=True p_low=%.3f offsets=(%.3f, %.3f, %.3f) valid_min=(%.5f, %.5f, %.5f) valid_px=%d",
+                     p_low,
+                     offsets[0],
+                     offsets[1],
+                     offsets[2],
+                     mins[0],
+                     mins[1],
+                     mins[2],
+                     valid_px,
+                 )
              else:
-                 if not src.path:
-                     raise ValueError("Tile data missing and no path provided.")
-                 with fits.open(src.path, memmap=False) as hdul:
-                     tile_arr = _ensure_hwc_master_tile(hdul[0].data, label)
-                     if "ALPHA" in hdul and hdul["ALPHA"].data is not None:
-                         try:
-                             alpha_mask_arr = np.asarray(hdul["ALPHA"].data)
-                         except Exception:
-                             alpha_mask_arr = None
-             tile_arr = np.asarray(tile_arr, dtype=np.float32, order="C")
-             mask_source = getattr(src, "mask", None)
-             if mask_source is not None:
+                 logger.info(
+                     "[RGB-BL] applied=True p_low=%.3f offsets=(%.3f, %.3f, %.3f) valid_px=%d",
+                     p_low,
+                     offsets[0],
+                     offsets[1],
+                     offsets[2],
+                     valid_px,
+                 )
+         return out, info
+ 
+     return rgb_hwc, info
+ 
+ 
++def _maybe_bump_phase5_gpu_rows_per_chunk(
++    plan: Any,
++    gpu_ctx: Any,
++    output_shape_hw: tuple[int, int] | None,
++    tiles_total: int,
++    logger: logging.Logger | None,
++) -> None:
++    """Conservatively increase Phase 5 GPU chunk rows when safe mode allows it."""
++
++    try:
++        safe_mode = int(getattr(gpu_ctx, "safe_mode", 0) or 0)
++    except Exception:
++        return
++
++    if safe_mode != 1:
++        return
++
++    on_battery = getattr(gpu_ctx, "on_battery", None)
++    power_plugged = getattr(gpu_ctx, "power_plugged", None)
++    if not ((on_battery is False) or (power_plugged is True)):
++        return
++
++    try:
++        current_rows = getattr(plan, "gpu_rows_per_chunk", None)
++        max_bytes = getattr(plan, "gpu_max_chunk_bytes", None)
++    except Exception:
++        return
++
++    try:
++        out_w = int(output_shape_hw[1]) if output_shape_hw and len(output_shape_hw) > 1 else None
++    except Exception:
++        out_w = None
++
++    if not current_rows or not max_bytes or not out_w or out_w <= 0:
++        return
++
++    bytes_per_row = max(1, out_w * 4 * 2)
++    rows_budget = int(max_bytes) // (bytes_per_row * max(1, int(tiles_total or 0)))
++    candidate = int(rows_budget)
++    if candidate <= current_rows or candidate <= 0:
++        return
++
++    new_rows = min(256, max(current_rows, candidate))
++    new_rows = max(new_rows, min(96, 256))
++    if new_rows <= current_rows:
++        return
++
++    try:
++        plan.gpu_rows_per_chunk = new_rows
++    except Exception:
++        return
++
++    if logger:
++        try:
++            logger.info(
++                "Phase5 GPU: bump rows_per_chunk %s -> %s (plugged), max_chunk=%.1fMB, out_w=%s, n_tiles=%s",
++                current_rows,
++                new_rows,
++                float(max_bytes) / (1024.0 ** 2),
++                out_w,
++                max(1, int(tiles_total or 0)),
++            )
++        except Exception:
++            pass
++
++
+ def _apply_phase5_post_stack_pipeline(
+     final_mosaic_data: np.ndarray | None,
+     final_mosaic_coverage: np.ndarray | None,
+     final_alpha_map: np.ndarray | None,
+     *,
+     enable_lecropper_pipeline: bool,
+     pipeline_cfg: dict[str, Any] | None,
+     enable_master_tile_crop: bool,
+     master_tile_crop_percent: float,
+     two_pass_enabled: bool,
+     two_pass_sigma_px: int,
+     two_pass_gain_clip: tuple[float, float],
+     final_output_wcs: Any,
+     final_output_shape_hw: tuple[int, int] | None,
+     use_gpu_two_pass: bool,
+     logger: logging.Logger | None,
+     collected_tiles: list[tuple[np.ndarray, Any]] | None = None,
+     fallback_two_pass_loader: Callable[[], tuple[list[np.ndarray], list[Any]]] | None = None,
+     parallel_plan: ParallelPlan | None = None,
+     telemetry_ctrl: ResourceTelemetryController | None = None,
+ ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None]:
+     """Run the reusable Phase 5 post-stack operations."""
+ 
+     if enable_lecropper_pipeline:
+         (
+@@ -8161,50 +8227,57 @@ def _run_shared_phase45_phase5_pipeline(
+                     kind="global_reproject",
+                     frame_shape=frame_shape_phase5,
+                     n_frames=n_frames_phase5,
+                     bytes_per_pixel=4,
+                     config=worker_config_cache,
+                     caps=caps_for_phase5,
+                 )
+                 parallel_plan_phase5, gpu_safety_ctx_phase5 = apply_gpu_safety_to_parallel_plan(
+                     parallel_plan_phase5,
+                     caps_for_phase5,
+                     worker_config_cache,
+                     operation="global_reproject",
+                     logger=logger,
+                 )
+                 if gpu_safety_ctx_phase5 is not None:
+                     try:
+                         use_gpu_phase5_flag = apply_gpu_safety_to_phase5_flag(
+                             use_gpu_phase5_flag, gpu_safety_ctx_phase5, logger=logger
+                         )
+                     except Exception:
+                         pass
+                     try:
+                         get_env_safe_mode_flag(gpu_safety_ctx_phase5)
+                     except Exception:
+                         pass
++                _maybe_bump_phase5_gpu_rows_per_chunk(
++                    parallel_plan_phase5,
++                    gpu_safety_ctx_phase5,
++                    final_output_shape_hw,
++                    tiles_total_phase5,
++                    logger,
++                )
+                 worker_config_cache["parallel_plan_phase5"] = parallel_plan_phase5
                  try:
-@@ -6412,50 +6420,51 @@ def _compute_intertile_affine_corrections_from_sources(
+                     setattr(zconfig, "parallel_plan_phase5", parallel_plan_phase5)
                  except Exception:
                      pass
-         except Exception:
-             pass
-         # Relais vers le callback GUI d'origine pour l'affichage + ETA fine (via on_worker_progress)
-         if progress_callback:
-             try:
-                 progress_callback(message_or_stage, current, level, **kwargs)
-             except Exception:
-                 pass
+             except Exception as exc_phase5_plan:
+                 logger.warning("Phase5 auto-tune failed, falling back to global plan: %s", exc_phase5_plan)
  
-     try:
-         corrections = zemosaic_utils.compute_intertile_affine_calibration(
- 
-             tile_pairs,
-             final_output_wcs,
-             final_output_shape_hw,
-             preview_size=preview_size,
-             min_overlap_fraction=min_overlap_fraction,
-             sky_percentile=sky_percentile,
-             robust_clip_sigma=robust_clip_sigma,
-             use_auto_intertile=use_auto_intertile,
-             logger=logger_obj,
-             progress_callback=_intertile_progress_bridge,
-             tile_weights=tile_weights,
-+            cpu_workers=cpu_workers,
-         )
-     except Exception as exc:
-         if logger_obj:
-             logger_obj.warning(
-                 "Intertile photometric calibration failed: %s",
-                 exc,
-             )
-             logger_obj.debug("Traceback (intertile failure):", exc_info=True)
-         return None, False, "compute_failed", str(exc)
-     finally:
-         tile_pairs.clear()
- 
-     sanitized, nontrivial = _sanitize_affine_corrections(corrections, total_tiles)
- 
-     if sanitized and intertile_global_recenter and preview_arrays:
-         clip_cfg = intertile_recenter_clip if isinstance(intertile_recenter_clip, (list, tuple)) else None
-         if not clip_cfg or len(clip_cfg) < 2:
-             clip_cfg = (0.85, 1.18)
+         _emit_phase5_stats(0, tiles_total_phase5, force=True, stage="start")
+         plan_gpu_allowed = bool(getattr(parallel_plan_phase5, "use_gpu", False))
+         if not use_gpu_phase5_flag:
+             effective_use_gpu = False
+         else:
+             effective_use_gpu = bool(plan_gpu_allowed)
+             if not effective_use_gpu and use_gpu_phase5_flag:
+                 logger.info("[Phase5] GPU disabled by auto-tune (plan.use_gpu=False)")
          try:
-             clip_low = float(clip_cfg[0])
-         except Exception:
-             clip_low = 0.85
-         try:
-             clip_high = float(clip_cfg[1])
-         except Exception:
-@@ -12468,50 +12477,55 @@ def assemble_final_mosaic_incremental(
-         affine_start = time.monotonic()
-         pcb_asm(
-             "run_info_incremental_affine_start",
-             prog=None,
-             lvl="INFO",
-             num_tiles=total_tiles,
-         )
-         tile_sources = [
-             _TileAffineSource(path=tile_path, wcs=tile_wcs)
-             for tile_path, tile_wcs in master_tile_fits_with_wcs_list
-         ]
-         pending_affine_list, nontrivial_detected, affine_status, affine_error = (
-             _compute_intertile_affine_corrections_from_sources(
-                 sources=tile_sources,
-                 final_output_wcs=final_output_wcs,
-                 final_output_shape_hw=final_output_shape_hw,
-                 preview_size=int(intertile_preview_size),
-                 min_overlap_fraction=float(intertile_overlap_min),
-                 sky_percentile=intertile_sky_percentile,
-                 robust_clip_sigma=float(intertile_robust_clip_sigma),
-                 use_auto_intertile=use_auto_intertile,
-                 logger_obj=logger,
-                 progress_callback=progress_callback,
-                 intertile_global_recenter=bool(intertile_global_recenter),
-                 intertile_recenter_clip=intertile_recenter_clip,
-+                cpu_workers=(
-+                    int(processing_threads)
-+                    if processing_threads and int(processing_threads) > 0
-+                    else min(os.cpu_count() or 1, 8)
-+                ),
-             )
-         )
-         if affine_status == "preview_failed":
-             pcb_asm(
-                 "assemble_warn_intertile_photometric_failed",
-                 prog=None,
-                 lvl="WARN",
-                 error="preview_failed",
-             )
-             pending_affine_list = None
-             nontrivial_detected = False
-         elif affine_status == "compute_failed":
-             pcb_asm(
-                 "assemble_warn_intertile_photometric_failed",
-                 prog=None,
-                 lvl="WARN",
-                 error=str(affine_error),
-             )
-             pending_affine_list = None
-             nontrivial_detected = False
-         affine_elapsed = time.monotonic() - affine_start
-         if nontrivial_detected:
-             try:
-                 pcb_asm(
-                     "assemble_info_intertile_photometric_applied",
-@@ -13720,50 +13734,55 @@ def assemble_final_mosaic_reproject_coadd(
-             tile_weights_for_sources.append(weight_val)
-             tile_sources.append(
-                 _TileAffineSource(
-                     path=entry.get("path"),
-                     wcs=entry.get("wcs"),
-                     data=entry.get("data"),
-                     mask=mask,
-                 )
-             )
- 
-         pending_affine_list, nontrivial_affine, affine_status, affine_error = (
-             _compute_intertile_affine_corrections_from_sources(
-                 sources=tile_sources,
-                 final_output_wcs=final_output_wcs,
-                 final_output_shape_hw=final_output_shape_hw,
-                 preview_size=int(intertile_preview_size),
-                 min_overlap_fraction=float(intertile_overlap_min),
-                 sky_percentile=intertile_sky_percentile,
-                 robust_clip_sigma=float(intertile_robust_clip_sigma),
-                 use_auto_intertile=use_auto_intertile,
-                 logger_obj=logger,
-                 progress_callback=progress_callback,
-                 intertile_global_recenter=bool(intertile_global_recenter),
-                 intertile_recenter_clip=intertile_recenter_clip,
-                 tile_weights=tile_weights_for_sources,
-+                cpu_workers=(
-+                    int(assembly_process_workers)
-+                    if assembly_process_workers and int(assembly_process_workers) > 0
-+                    else min(os.cpu_count() or 1, 8)
-+                ),
-             )
-         )
- 
-         if affine_status == "preview_failed":
-             _pcb(
-                 "assemble_warn_intertile_photometric_failed",
-                 prog=None,
-                 lvl="WARN",
-                 error="preview_failed",
-             )
-             pending_affine_list = None
-             nontrivial_affine = False
-         elif affine_status == "compute_failed":
-             _pcb(
-                 "assemble_warn_intertile_photometric_failed",
-                 prog=None,
-                 lvl="WARN",
-                 error=str(affine_error),
-             )
-             pending_affine_list = None
-             nontrivial_affine = False
- 
-     total_tiles_prepared = len(effective_tiles)
-     pending_affine_list, anchor_shift_applied = _compose_global_anchor_shift(
-         pending_affine_list,
+             vram_free_mb = None
+             if gpu_safety_ctx_phase5 is not None and gpu_safety_ctx_phase5.vram_free_bytes is not None:
+                 vram_free_mb = float(gpu_safety_ctx_phase5.vram_free_bytes) / (1024.0 ** 2)
+             reasons_str = ",".join(getattr(gpu_safety_ctx_phase5, "reasons", []) or [])
+             logger.info(
+                 "[GPU_SAFETY] safe_mode=%d vendor=%s hybrid=%s battery=%s vram_free_mb=%s "
+                 "-> phase5_gpu=%d plan.use_gpu=%d gpu_max_chunk_mb=%.1f gpu_rows=%s reason=\"%s\"",
+                 1 if gpu_safety_ctx_phase5 and gpu_safety_ctx_phase5.safe_mode else 0,
