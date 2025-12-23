@@ -21,11 +21,11 @@ Optionnel (ne pas faire sauf si nécessaire):
 - /mnt/data/zemosaic_align_stack.py (a priori inutile)
 
 ## Règles de comportement attendues
-1) Phase 4.5 (stacking local via `stack_kwargs["winsor_max_workers"]`):
+- [x] Phase 4.5 (stacking local via `stack_kwargs["winsor_max_workers"]`):
    - Si cfg == 0: passer 0 tel quel (AUTO géré par zemosaic_align_stack via parallel_plan)
    - Sinon: passer max(1, cfg)
 
-2) Global/SDS stacking params (là où on stocke `winsor_worker_limit` dans des dicts type global_wcs_plan / sds_stack_params):
+- [x] Global/SDS stacking params (là où on stocke `winsor_worker_limit` dans des dicts type global_wcs_plan / sds_stack_params):
    - Si cfg <= 0: calculer une valeur effective >= 1 (AUTO) et stocker cette valeur.
    - Sinon: clamp normal (1..cpu_total).
    Raisons: certains endroits utilisent cette valeur comme un cap numérique direct, et 0 casserait la logique.

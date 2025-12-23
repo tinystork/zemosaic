@@ -1,1434 +1,416 @@
 diff --git a/agent.md b/agent.md
-index 52b1d4c043e9775696fc0c3dbf5c0187a38aaa87..d06f21223d8291625b0334ca4e5e7f45a19f713f 100644
+index 71e5520a2e9e3f122d8711397583ed4d84c3eb4d..79cfb7a83ff25c49eb265f511a16a857b17bb9a6 100644
 --- a/agent.md
 +++ b/agent.md
-@@ -6,76 +6,76 @@ Objectif: en zones de recouvrement, la mosaïque doit être dominée par la tuil
- et le comportement doit être cohérent entre CPU et GPU.
+@@ -1,40 +1,40 @@
+ # Mission — “Winsor worker limit: 0 = auto” (patch minimal, user-friendly)
  
- Le code a déjà des notions de:
- - input_weights (alpha/coverage 2D)
- - tile_weights (scalaire par tuile)
- - deux chemins: assemble_final_mosaic_reproject_coadd (Phase 5) + run_second_pass_coverage_renorm (TwoPass)
+ Objectif:
+ - Rendre le paramètre `winsor_worker_limit` cohérent avec les autres champs UI:
+   - `winsor_worker_limit = 0` => mode AUTO
+   - `winsor_worker_limit > 0` => limite manuelle
+ - Patch MINIMAL: pas de nouvelles options/config, pas de refactor.
  
- Le but de ce patch est de s'assurer que:
- 1) GPU coadd utilise réellement tile_weight (pas seulement CPU),
- 2) Phase 5 ET TwoPass passent les mêmes infos au backend,
- 3) pas de double-application involontaire (tile_weight intégré dans input_weights + tile_weights en même temps),
- 4) tests CPU vs GPU.
+ ## Constat (code actuel)
+ Dans `zemosaic_worker.py`, plusieurs endroits font:
+ - winsor_worker_limit = max(1, min(int(cfg), cpu_total))
+ => 0 devient 1 (donc pas d’auto).
+ Or `zemosaic_align_stack.py` supporte déjà implicitement:
+ - winsor_max_workers = current_workers or plan_cpu_workers
+ => si on passe 0, l’auto fonctionne.
  
- ## Contraintes
- - Patch chirurgical ("no refactor")
- - Ne pas changer le comportement batch_size=0 vs >1
- - Ne pas casser perf/mémoire GPU
- - Ajout de logs DEBUG ciblés OK
+ ## Fichiers à modifier (minimum)
+ - /mnt/data/zemosaic_worker.py (obligatoire)
  
- ## Plan (à implémenter)
+ Optionnel (ne pas faire sauf si nécessaire):
+ - /mnt/data/zemosaic_align_stack.py (a priori inutile)
  
- ### A) Worker: passer tile_weights séparément, garder input_weights "purs" (alpha/coverage seulement)
- Fichiers: `zemosaic_worker.py`
+ ## Règles de comportement attendues
+-1) Phase 4.5 (stacking local via `stack_kwargs["winsor_max_workers"]`):
++- [x] Phase 4.5 (stacking local via `stack_kwargs["winsor_max_workers"]`):
+    - Si cfg == 0: passer 0 tel quel (AUTO géré par zemosaic_align_stack via parallel_plan)
+    - Sinon: passer max(1, cfg)
  
- 1) Dans `assemble_final_mosaic_reproject_coadd` (Phase 5):
--   - Construire `tile_weights = [float(entry.get("tile_weight", 1.0)) ...]` aligné avec data_list/wcs_list.
--   - Construire `input_weights_list` à partir du masque (alpha_weight2d / coverage) SANS multiplier par tile_weight.
--   - Appeler `reproject_and_coadd_wrapper(..., input_weights=input_weights_list, tile_weights=tile_weights, ...)`.
--   - Ajouter un log DEBUG unique:
-+   - [x] Construire `tile_weights = [float(entry.get("tile_weight", 1.0)) ...]` aligné avec data_list/wcs_list.
-+   - [x] Construire `input_weights_list` à partir du masque (alpha_weight2d / coverage) SANS multiplier par tile_weight.
-+   - [x] Appeler `reproject_and_coadd_wrapper(..., input_weights=input_weights_list, tile_weights=tile_weights, ...)`.
-+   - [x] Ajouter un log DEBUG unique:
-      - min/median/max des tile_weights + ratio max/min
-      - vérifier si input_weights a des max > 1.5 et tile_weights != None -> warning "possible double weighting".
+-2) Global/SDS stacking params (là où on stocke `winsor_worker_limit` dans des dicts type global_wcs_plan / sds_stack_params):
++- [x] Global/SDS stacking params (là où on stocke `winsor_worker_limit` dans des dicts type global_wcs_plan / sds_stack_params):
+    - Si cfg <= 0: calculer une valeur effective >= 1 (AUTO) et stocker cette valeur.
+    - Sinon: clamp normal (1..cpu_total).
+    Raisons: certains endroits utilisent cette valeur comme un cap numérique direct, et 0 casserait la logique.
  
- 2) Dans `run_second_pass_coverage_renorm` / `_process_channel` (TwoPass reprojection):
--   - Même logique: `tile_weights` transmis au coadd wrapper GPU.
--   - `input_weights` = poids 2D (alpha/coverage/scale-map) sans tile_weight.
-+   - [x] Même logique: `tile_weights` transmis au coadd wrapper GPU.
-+   - [x] `input_weights` = poids 2D (alpha/coverage/scale-map) sans tile_weight.
+ ## Définition de “AUTO” (simple et robuste)
+ AUTO doit privilégier les workers déjà auto-tunés:
+ - si `global_parallel_plan` existe et `global_parallel_plan.cpu_workers > 0` => utiliser ça
+ - sinon fallback sur `effective_base_workers` (déjà calculé par le worker)
+ - sinon fallback sur `cpu_total`
+ puis clamp [1..cpu_total].
  
- ### B) Backend GPU: vérifier l’utilisation effective de tile_weights
- Fichier: `zemosaic_utils.py`
- 
- 1) Dans `gpu_reproject_and_coadd_impl`:
--   - Vérifier que `tile_weights_param` est bien lu et converti en `tile_weights_gpu`.
--   - S’assurer que `tile_weight` multiplie effectivement la contribution lors de l’accumulation
-+   - [x] Vérifier que `tile_weights_param` est bien lu et converti en `tile_weights_gpu`.
-+   - [x] S’assurer que `tile_weight` multiplie effectivement la contribution lors de l’accumulation
-      (mean / winsorized / kappa-sigma).
--   - Ajouter un log DEBUG (une fois) listant les poids normalisés utilisés côté GPU.
-+   - [x] Ajouter un log DEBUG (une fois) listant les poids normalisés utilisés côté GPU.
- 
- 2) Dans le wrapper `reproject_and_coadd_wrapper`:
--   - Ne pas changer la logique globale,
--   - mais ajouter une protection (DEBUG/WARN) si:
-+   - [x] Ne pas changer la logique globale,
-+   - [x] mais ajouter une protection (DEBUG/WARN) si:
-      - `input_weights` semble déjà intégrer des poids > 1 (ex: max >> 1) ET tile_weights fourni.
-      - -> log: "double application probable".
- 
- ### C) Tests CPU vs GPU (mini test synthétique)
- Créer `tests/test_tile_weight_gpu_coadd.py` (ou un script de test si pas de pytest dans le repo).
- 
- Test 1 (mean):
--- Deux tuiles partiellement recouvrantes (même WCS ou WCS identique + simple décalage pixel).
--- Tuile A: bruit (random) moyenne ~0
--- Tuile B: signal constant (ex: +100) + petit bruit
--- tile_weights: A=1, B=100
--- Résultat attendu en zone overlap: proche de tuile B (erreur faible), et GPU≈CPU.
-+- [x] Deux tuiles partiellement recouvrantes (même WCS ou WCS identique + simple décalage pixel).
-+- [x] Tuile A: bruit (random) moyenne ~0
-+- [x] Tuile B: signal constant (ex: +100) + petit bruit
-+- [x] tile_weights: A=1, B=100
-+- [x] Résultat attendu en zone overlap: proche de tuile B (erreur faible), et GPU≈CPU.
- 
- Test 2 (winsorized):
--- Même setup mais `combine_function="mean"` + `stack_reject_algo="winsorized"` (ou combine="winsorized" selon API).
--- Attendu: même dominance de la tuile B.
-+- [x] Même setup mais `combine_function="mean"` + `stack_reject_algo="winsorized"` (ou combine="winsorized" selon API).
-+- [x] Attendu: même dominance de la tuile B.
- 
- Critères:
--- Dans l’overlap, moyenne(result - B) < 1% du signal (tolérance à ajuster)
--- GPU vs CPU: différence RMS faible (tolérance ~1e-3 à 1e-2 selon float32)
-+- [x] Dans l’overlap, moyenne(result - B) < 1% du signal (tolérance à ajuster)
-+- [x] GPU vs CPU: différence RMS faible (tolérance ~1e-3 à 1e-2 selon float32)
- 
- ## Livraison attendue
- - Patch git sur `zemosaic_worker.py` + `zemosaic_utils.py`
- - Test(s) + instructions de lancement
- - Logs de run montrant:
-   - tile_weights summary
-   - confirmation GPU tile_weights utilisés
-   - plus aucune ambiguïté "tile_weight intégré dans input_weights"
+ ## Logging (minimal mais uti
 diff --git a/followup.md b/followup.md
-index 9e4e659268757cdde85d5368352428fe729208c5..581a958a930a6fe4d693316287393747be4c0bf8 100644
+index c1fa3deb827b03ab853a4749be8fddfced1ad659..e8aca3e51a32dd4ee9b35898aabe68aa86e0d459 100644
 --- a/followup.md
 +++ b/followup.md
-@@ -1,36 +1,36 @@
- # Follow-up — Étape 2: Validation tile_weight dans GPU coadd
+@@ -60,74 +60,45 @@ AUTO doit privilégier les workers déjà auto-tunés:
+ - sinon fallback sur `effective_base_workers` (déjà calculé par le worker)
+ - sinon fallback sur `cpu_total`
+ puis clamp [1..cpu_total].
  
- ## 1) Vérifs rapides dans les logs (run réel)
- Lancer un run identique à ton cas "3 master tiles très déséquilibrées".
+ ## Logging (minimal mais utile)
+ - Quand cfg <= 0, loguer une ligne INFO_DETAIL du style:
+   "Winsor worker limit: AUTO (cfg=0) -> resolved=<N> (cpu_total=<M>)"
+ - En Phase 4.5, si on laisse passer 0, éviter de loguer "workers=0" de manière trompeuse:
+   loguer "workers=AUTO(0)" ou similaire.
  
- Attendus dans le log:
--- Un bloc DEBUG "tile_weights summary" en Phase 5:
-+- [ ] Un bloc DEBUG "tile_weights summary" en Phase 5:
-   - min/median/max + ratio
--- Un bloc DEBUG côté GPU "gpu_coadd: tile i uses weight ..."
--- Les lignes Phase 5 ne doivent plus indiquer `weights_source=alpha_weight2d*tile_weight`
-+- [ ] Un bloc DEBUG côté GPU "gpu_coadd: tile i uses weight ..."
-+- [ ] Les lignes Phase 5 ne doivent plus indiquer `weights_source=alpha_weight2d*tile_weight`
-   (ça doit devenir `weights_source=alpha_weight2d` ou similaire),
-   puisque tile_weight passe via `tile_weights=`.
+ ## Contraintes
+ - Ne pas changer les algorithmes scientifiques.
+ - Ne pas toucher à la GUI.
+ - Ne pas introduire de nouvelle variable de config.
+ - Patch localisé et lisible.
+ ```
  
- Si un WARN "double weighting probable" apparaît:
--- C’est qu’on envoie encore des input_weights déjà scalés + tile_weights séparés -> à corriger.
-+- [ ] C’est qu’on envoie encore des input_weights déjà scalés + tile_weights séparés -> à corriger.
+ ---
  
- ## 2) Tests synthétiques CPU vs GPU
- Exécuter:
--- `python -m pytest -q` si pytest dispo
-+- [x] `python -m pytest -q` si pytest dispo
- ou
--- `python tests/test_tile_weight_gpu_coadd.py`
-+- [x] `python tests/test_tile_weight_gpu_coadd.py`
+ ## followup.md
  
- Attendu:
--- Test mean: overlap dominé par la tuile la plus pondérée
--- Test winsorized: même dominance
--- GPU ~ CPU (tolérance float32)
-+- [x] Test mean: overlap dominé par la tuile la plus pondérée
-+- [x] Test winsorized: même dominance
-+- [x] GPU ~ CPU (tolérance float32)
+ ```markdown
+ # Plan d’exécution (Codex)
  
- ## 3) Contrôle visuel (cas astro)
- Sur une mosaïque où une tuile est très profonde:
--- En zone de recouvrement, la texture/bruit doit ressembler majoritairement à la tuile profonde
--- Les tuiles faibles ne doivent plus “salir” l’overlap (elles ne doivent contribuer que là où la tuile profonde manque)
-+- [ ] En zone de recouvrement, la texture/bruit doit ressembler majoritairement à la tuile profonde
-+- [ ] Les tuiles faibles ne doivent plus “salir” l’overlap (elles ne doivent contribuer que là où la tuile profonde manque)
+ ## Étape 1 — Identifier les 3 endroits clés dans zemosaic_worker.py
+-1) Phase 4.5 stack_kwargs:
+-   Actuel: "winsor_max_workers": max(1, worker_limit_val)
+-   -> À changer pour laisser passer 0:
+-      if worker_limit_val <= 0: winsor_max_workers = 0
+-      else: winsor_max_workers = max(1, worker_limit_val)
+-
+-2) Deux blocs “winsor_worker_limit = max(1, min(int(winsor_worker_limit_config), cpu_total))”
+-   (il y en a 2 occurrences dans le fichier)
+-   -> Remplacer par une résolution AUTO effective:
+-      - cpu_total = os.cpu_count() or 1
+-      - cfg = int(winsor_worker_limit_config) (guard try/except)
+-      - if cfg <= 0:
+-          candidate = global_parallel_plan.cpu_workers si dispo (>0)
+-          sinon candidate = effective_base_workers si dispo (>0)
+-          sinon candidate = cpu_total
+-        else:
+-          candidate = cfg
+-      - winsor_worker_limit = max(1, min(int(candidate), cpu_total))
+-
+-   Important: ici on STOCKE une valeur >=1 dans global_wcs_plan / sds_stack_params.
++- [x] Phase 4.5 stack_kwargs: laisser passer 0 → winsor_max_workers = 0, sinon clamp à >=1.
++- [x] Deux blocs “winsor_worker_limit = max(1, min(int(winsor_worker_limit_config), cpu_total))” remplacés par une résolution AUTO effective (global_parallel_plan > effective_base_workers > cpu_total) et stockage clampé >=1.
  
- ## 4) Si le problème persiste malgré des poids OK
- Alors ce n’est plus le coadd: regarder en priorité l’inter-tile photometric match:
--- gains aberrants + clamp (ex: gain ~ 1e-5) => fit instable / mauvais overlap / stats trop fragiles.
--- Action suivante: sécuriser le solve photométrique (robust stats / contraintes / fallback offset-only).
-+- [ ] gains aberrants + clamp (ex: gain ~ 1e-5) => fit instable / mauvais overlap / stats trop fragiles.
-+- [ ] Action suivante: sécuriser le solve photométrique (robust stats / contraintes / fallback offset-only).
-diff --git a/tests/test_phase5_gpu.py b/tests/test_phase5_gpu.py
-index f1af12681cdb9644bf1284800b346f354760515d..9fe07aabd2c519aea684c6b48cbe1d7e3d483bd4 100644
---- a/tests/test_phase5_gpu.py
-+++ b/tests/test_phase5_gpu.py
-@@ -103,87 +103,87 @@ def test_gpu_collects_normalized_tiles_like_cpu(tmp_path, monkeypatch):
+ ## Étape 2 — Logging minimal
+-- Au moment où winsor_worker_limit est fixé pour global_wcs_plan:
+-  - Si cfg <= 0, loguer "AUTO cfg=0 -> resolved=N"
+-  - Sinon conserver le message existant (ou ajouter "(manual)").
+-
+-- Pour Phase 4.5:
+-  - Si worker_limit_val <= 0, loguer workers="AUTO(0)" au lieu de 0.
++- [x] cfg <= 0 dans global_wcs_plan: log INFO_DETAIL "AUTO cfg=0 -> resolved=N".
++- [x] Phase 4.5: workers loggué en "AUTO(0)" quand on laisse passer 0.
  
-     monkeypatch.setattr(zw.zemosaic_utils, "reproject_and_coadd_wrapper", fake_reproject_and_coadd_wrapper)
-     monkeypatch.setattr(zw, "_build_alpha_union_map", lambda *args, **kwargs: None)
+ ## Étape 3 — Vérifs rapides
+-1) py_compile:
+-   python -m py_compile zemosaic_worker.py
+-
+-2) Test fonctionnel simple:
+-   - Mettre winsor_worker_limit=0 dans la config/GUI
+-   - Vérifier dans les logs:
+-     - une ligne "AUTO ... resolved=<N>"
+-     - Phase 4.5 n’affiche pas un workers=0 ambigu
+-   - Vérifier que le run n’active pas une explosion de workers: N doit rester borné par cpu_total et idéalement proche du parallel plan.
++- [x] py_compile: `python -m py_compile zemosaic_worker.py`
++- [ ] Test fonctionnel simple (config GUI winsor_worker_limit=0, vérifier logs et bornage workers)
  
-     def _make_wcs():
-         w = WCS(naxis=2)
-         w.wcs.crpix = [2.0, 2.0]
-         w.wcs.cdelt = np.array([-0.1, 0.1])
-         w.wcs.crval = [0.0, 0.0]
-         w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
-         w.pixel_shape = (4, 4)
-         return w
+ ## Notes importantes
+ - Ne PAS propager 0 dans global_wcs_plan / sds_stack_params (risque de cap=0 ailleurs).
+ - Par contre, laisser passer 0 dans stack_kwargs (Phase 4.5) est OK car `zemosaic_align_stack.py` sait résoudre 0 via parallel_plan.
+ - Ne pas modifier zemosaic_align_stack.py (il est déjà compatible).
+ ```
  
-     def _write_tile(value: float, name: str):
-         arr_hwc = np.full((4, 4, 3), value, dtype=np.float32)
-         fits_data = np.moveaxis(arr_hwc, -1, 0)
-         path = tmp_path / f"{name}.fits"
-         fits.writeto(path, fits_data, header=_make_wcs().to_header(), overwrite=True)
-         return str(path), _make_wcs()
+ ---
  
-     tile1, wcs1 = _write_tile(1.0, "tile1")
-     tile2, wcs2 = _write_tile(10.0, "tile2")
-     final_wcs = _make_wcs()
- 
-     affine = [(1.0, 0.0), (0.1, 0.0)]  # Tile 2 must be scaled down to match tile 1.
--    cpu_cache: list[tuple[np.ndarray, object, np.ndarray | None]] = []
--    gpu_cache: list[tuple[np.ndarray, object, np.ndarray | None]] = []
-+    cpu_cache: list[tuple[np.ndarray, object, np.ndarray | None, float]] = []
-+    gpu_cache: list[tuple[np.ndarray, object, np.ndarray | None, float]] = []
- 
-     cpu_result = zw.assemble_final_mosaic_reproject_coadd(
-         master_tile_fits_with_wcs_list=[(tile1, wcs1), (tile2, wcs2)],
-         final_output_wcs=final_wcs,
-         final_output_shape_hw=(4, 4),
-         progress_callback=None,
-         n_channels=3,
-         match_bg=True,
-         use_gpu=False,
-         collect_tile_data=cpu_cache,
-         tile_affine_corrections=affine,
-         intertile_photometric_match=False,
-     )
- 
-     gpu_result = zw.assemble_final_mosaic_reproject_coadd(
-         master_tile_fits_with_wcs_list=[(tile1, wcs1), (tile2, wcs2)],
-         final_output_wcs=final_wcs,
-         final_output_shape_hw=(4, 4),
-         progress_callback=None,
-         n_channels=3,
-         match_bg=True,
-         use_gpu=True,
-         collect_tile_data=gpu_cache,
-         tile_affine_corrections=affine,
-         intertile_photometric_match=False,
-     )
- 
-     cpu_mosaic, _, _ = cpu_result
-     gpu_mosaic, _, _ = gpu_result
- 
-     assert np.allclose(cpu_mosaic, gpu_mosaic)
-     assert call_records[0][0] is False and call_records[-1][0] is True
-     assert len(cpu_cache) == len(gpu_cache) == 2
-     # Tile 2 should be normalized to the same scale as tile 1 in both caches.
--    for (arr_cpu, _, _), (arr_gpu, _, _) in zip(cpu_cache, gpu_cache):
-+    for (arr_cpu, _, _, _), (arr_gpu, _, _, _) in zip(cpu_cache, gpu_cache):
-         assert np.allclose(arr_cpu, arr_gpu)
-     assert np.allclose(cpu_cache[1][0], np.full((4, 4, 3), 1.0, dtype=np.float32))
- 
- 
- def test_two_pass_gpu_rms_matches_cpu(monkeypatch):
-     """GPU two-pass coverage renorm should match CPU output within 1% RMS."""
- 
-     pytest.importorskip("astropy")
-     pytest.importorskip("reproject")
-     cupy = pytest.importorskip("cupy")
-     if not cupy.is_available():
-         pytest.skip("CuPy GPU unavailable")
- 
-     # Allow GPU path on non-Windows platforms during the test run.
-     monkeypatch.setattr(zw, "CUPY_AVAILABLE", True, raising=False)
- 
-     from astropy.wcs import WCS
- 
-     def _make_wcs():
-         w = WCS(naxis=2)
-         w.wcs.crpix = [2.0, 2.0]
-         w.wcs.cdelt = np.array([-0.5, 0.5])
-         w.wcs.crval = [0.0, 0.0]
-         w.wcs.ctype = ["RA---TAN", "DEC--TAN"]
-         w.pixel_shape = (4, 4)
-diff --git a/tests/test_tile_weight_gpu_coadd.py b/tests/test_tile_weight_gpu_coadd.py
-new file mode 100644
-index 0000000000000000000000000000000000000000..5552837f3388704c51125b5b502ee790651e7d08
---- /dev/null
-+++ b/tests/test_tile_weight_gpu_coadd.py
-@@ -0,0 +1,217 @@
-+import sys
-+from pathlib import Path
-+
-+import numpy as np
-+
-+REPO_ROOT = Path(__file__).resolve().parents[1]
-+if str(REPO_ROOT) not in sys.path:
-+    sys.path.insert(0, str(REPO_ROOT))
-+
-+import zemosaic_utils as zu
-+
-+
-+def _weighted_coadd(data_list, input_weights, tile_weights, mode: str = "mean"):
-+    arrays = [np.asarray(arr, dtype=np.float32) for arr in data_list]
-+    base_weights: list[np.ndarray] = []
-+    if input_weights is None:
-+        base_weights = [np.ones_like(arr, dtype=np.float32) for arr in arrays]
-+    else:
-+        for idx, arr in enumerate(arrays):
-+            try:
-+                w = np.asarray(input_weights[idx], dtype=np.float32)
-+            except Exception:
-+                w = np.ones_like(arr, dtype=np.float32)
-+            if w.shape != arr.shape:
-+                w = np.ones_like(arr, dtype=np.float32)
-+            base_weights.append(np.where(np.isfinite(w), w, 0.0).astype(np.float32))
-+
-+    weights = base_weights
-+    if tile_weights is not None:
-+        weights = []
-+        for idx, base in enumerate(base_weights):
-+            try:
-+                tw = float(tile_weights[idx]) if idx < len(tile_weights) else 1.0
-+            except Exception:
-+                tw = 1.0
-+            weights.append(base * tw)
-+
-+    stack = np.stack(arrays, axis=0)
-+    weight_stack = np.stack(weights, axis=0)
-+    coverage = np.sum(weight_stack, axis=0)
-+
-+    if mode in {"winsorized", "winsorized_sigma_clip", "winsor"}:
-+        limits = (0.05, 0.05)
-+        mosaic = np.zeros_like(arrays[0], dtype=np.float32)
-+        flat_vals = stack.reshape(stack.shape[0], -1)
-+        flat_w = weight_stack.reshape(weight_stack.shape[0], -1)
-+        out_flat = mosaic.reshape(-1)
-+        cov_flat = coverage.reshape(-1)
-+        for i in range(flat_vals.shape[1]):
-+            vals = flat_vals[:, i]
-+            wts = flat_w[:, i]
-+            valid = wts > 0
-+            if not np.any(valid):
-+                out_flat[i] = 0.0
-+                cov_flat[i] = 0.0
-+                continue
-+            vals_use = vals[valid]
-+            w_use = wts[valid]
-+            total_w = float(np.sum(w_use))
-+            if total_w <= 0.0:
-+                out_flat[i] = 0.0
-+                cov_flat[i] = 0.0
-+                continue
-+            order = np.argsort(vals_use)
-+            vals_sorted = vals_use[order]
-+            w_sorted = w_use[order]
-+            cumsum = np.cumsum(w_sorted)
-+            lower_idx = np.searchsorted(cumsum, limits[0] * total_w)
-+            upper_idx = np.searchsorted(cumsum, max(total_w * (1.0 - limits[1]), 0.0))
-+            lower_idx = min(lower_idx, len(vals_sorted) - 1)
-+            upper_idx = min(upper_idx, len(vals_sorted) - 1)
-+            lower = float(vals_sorted[lower_idx])
-+            upper = float(vals_sorted[upper_idx])
-+            clipped = np.clip(vals_use, lower, upper)
-+            out_flat[i] = float(np.average(clipped, weights=w_use))
-+            cov_flat[i] = float(np.sum(w_use))
-+        mosaic = out_flat.reshape(arrays[0].shape).astype(np.float32)
-+        coverage = cov_flat.reshape(arrays[0].shape).astype(np.float32)
-+    else:
-+        weighted_sum = np.sum(stack * weight_stack, axis=0)
-+        mosaic = np.where(coverage > 0.0, weighted_sum / np.maximum(coverage, 1e-6), 0.0).astype(np.float32)
-+
-+    return mosaic, coverage.astype(np.float32)
-+
-+
-+def _max_weight_entry(weight_list) -> float:
-+    if weight_list is None:
-+        return 0.0
-+    max_val = 0.0
-+    for entry in weight_list:
-+        if entry is None:
-+            continue
-+        arr = np.asarray(entry, dtype=np.float32)
-+        if arr.size == 0:
-+            continue
-+        try:
-+            local = float(np.nanmax(arr))
-+        except Exception:
-+            local = 0.0
-+        if np.isfinite(local):
-+            max_val = max(max_val, local)
-+    return max_val
-+
-+
-+def test_tile_weight_gpu_coadd_mean_dominates_deep_tile(monkeypatch):
-+    """GPU coadd should honor tile_weights without inflating input weight maps."""
-+
-+    rng = np.random.default_rng(123)
-+    tile_a = rng.normal(loc=0.0, scale=1.0, size=(16, 16)).astype(np.float32)
-+    tile_b = np.full((16, 16), 100.0, dtype=np.float32) + rng.normal(scale=0.5, size=(16, 16)).astype(np.float32)
-+
-+    base_weights = [np.ones_like(tile_a, dtype=np.float32), np.ones_like(tile_b, dtype=np.float32)]
-+    tile_weights = [1.0, 100.0]
-+
-+    def cpu_stub(inputs, output_proj, shape_out, **kwargs):
-+        data_only = [arr for arr, _ in inputs]
-+        weights = kwargs.get("input_weights")
-+        return _weighted_coadd(data_only, weights, None, mode=str(kwargs.get("stack_reject_algo") or "mean"))
-+
-+    def gpu_stub(data_list, wcs_list, shape_out, **kwargs):
-+        iw = kwargs.get("input_weights")
-+        tw = kwargs.get("tile_weights")
-+        assert _max_weight_entry(iw) <= 1.5
-+        mosaic, cov = _weighted_coadd(
-+            data_list,
-+            iw,
-+            tw,
-+            mode=str(kwargs.get("stack_reject_algo") or kwargs.get("combine_function") or "mean"),
-+        )
-+        return mosaic, cov
-+
-+    monkeypatch.setattr(zu, "gpu_is_available", lambda: True)
-+    monkeypatch.setattr(zu, "gpu_reproject_and_coadd_impl", gpu_stub)
-+
-+    cpu_mosaic, cpu_cov = zu.reproject_and_coadd_wrapper(
-+        data_list=[tile_a, tile_b],
-+        wcs_list=[object(), object()],
-+        shape_out=tile_a.shape,
-+        output_projection="proj",
-+        use_gpu=False,
-+        cpu_func=cpu_stub,
-+        input_weights=base_weights,
-+        tile_weights=tile_weights,
-+    )
-+    gpu_mosaic, gpu_cov = zu.reproject_and_coadd_wrapper(
-+        data_list=[tile_a, tile_b],
-+        wcs_list=[object(), object()],
-+        shape_out=tile_a.shape,
-+        output_projection="proj",
-+        use_gpu=True,
-+        cpu_func=cpu_stub,
-+        input_weights=base_weights,
-+        tile_weights=tile_weights,
-+    )
-+
-+    assert np.allclose(cpu_cov, gpu_cov)
-+    assert np.allclose(cpu_mosaic, gpu_mosaic, atol=1e-4)
-+    np.testing.assert_allclose(np.nanmedian(gpu_cov), sum(tile_weights), rtol=0.05)
-+    assert np.abs(np.nanmean(cpu_mosaic - tile_b)) < 1.0
-+
-+
-+def test_tile_weight_gpu_coadd_winsorized_respects_weights(monkeypatch):
-+    """Winsorized combine on GPU must still honor per-tile weights."""
-+
-+    rng = np.random.default_rng(321)
-+    noise_tile = rng.normal(loc=0.0, scale=2.0, size=(12, 12)).astype(np.float32)
-+    signal_tile = np.full((12, 12), 80.0, dtype=np.float32) + rng.normal(scale=0.3, size=(12, 12)).astype(np.float32)
-+
-+    base_weights = [np.ones_like(noise_tile, dtype=np.float32), np.ones_like(signal_tile, dtype=np.float32)]
-+    tile_weights = [1.0, 120.0]
-+
-+    def cpu_stub(inputs, output_proj, shape_out, **kwargs):
-+        data_only = [arr for arr, _ in inputs]
-+        weights = kwargs.get("input_weights")
-+        return _weighted_coadd(data_only, weights, None, mode=str(kwargs.get("stack_reject_algo") or "winsorized"))
-+
-+    def gpu_stub(data_list, wcs_list, shape_out, **kwargs):
-+        iw = kwargs.get("input_weights")
-+        tw = kwargs.get("tile_weights")
-+        assert _max_weight_entry(iw) <= 1.5
-+        return _weighted_coadd(
-+            data_list,
-+            iw,
-+            tw,
-+            mode=str(kwargs.get("stack_reject_algo") or kwargs.get("combine_function") or "winsorized"),
-+        )
-+
-+    monkeypatch.setattr(zu, "gpu_is_available", lambda: True)
-+    monkeypatch.setattr(zu, "gpu_reproject_and_coadd_impl", gpu_stub)
-+
-+    cpu_mosaic, cpu_cov = zu.reproject_and_coadd_wrapper(
-+        data_list=[noise_tile, signal_tile],
-+        wcs_list=[object(), object()],
-+        shape_out=noise_tile.shape,
-+        output_projection="proj",
-+        use_gpu=False,
-+        cpu_func=cpu_stub,
-+        input_weights=base_weights,
-+        tile_weights=tile_weights,
-+        stack_reject_algo="winsorized",
-+    )
-+    gpu_mosaic, gpu_cov = zu.reproject_and_coadd_wrapper(
-+        data_list=[noise_tile, signal_tile],
-+        wcs_list=[object(), object()],
-+        shape_out=noise_tile.shape,
-+        output_projection="proj",
-+        use_gpu=True,
-+        cpu_func=cpu_stub,
-+        input_weights=base_weights,
-+        tile_weights=tile_weights,
-+        stack_reject_algo="winsorized",
-+    )
-+
-+    assert np.allclose(cpu_cov, gpu_cov)
-+    assert np.allclose(cpu_mosaic, gpu_mosaic, atol=1e-4)
-+    np.testing.assert_allclose(np.nanmedian(gpu_cov), sum(tile_weights), rtol=0.05)
-+    assert np.abs(np.nanmean(gpu_mosaic - signal_tile)) < 1.0
-diff --git a/zemosaic_utils.py b/zemosaic_utils.py
-index ee5b0ec1b9a995ea6fdb3ff0bbcb4183d85cf0a3..b39c0730c3bf7eb0236c3b55e91766d9ad1be191 100644
---- a/zemosaic_utils.py
-+++ b/zemosaic_utils.py
-@@ -4034,50 +4034,69 @@ def gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **kwargs):
-         if weights_obj is None:
-             return [1.0] * n_inputs
-         normalized: list[float] = []
-         try:
-             iterable = list(weights_obj)
-         except Exception:
-             iterable = [weights_obj]
-         for idx in range(n_inputs):
-             try:
-                 raw = iterable[idx]
-             except Exception:
-                 raw = 1.0
-             try:
-                 value = float(raw)
-             except Exception:
-                 value = 1.0
-             if not math.isfinite(value) or value <= 0:
-                 value = 1.0
-             normalized.append(value)
-         if len(normalized) < n_inputs:
-             normalized.extend([1.0] * (n_inputs - len(normalized)))
-         return normalized
- 
-     tile_weights_list = _normalize_tile_weights(tile_weights_param)
-     tile_weighting_active = tile_weights_param is not None
-+    if tile_weighting_active and logger.isEnabledFor(logging.DEBUG):
-+        try:
-+            weights_np = np.asarray(tile_weights_list, dtype=np.float64)
-+            finite_weights = weights_np[np.isfinite(weights_np)]
-+            if finite_weights.size:
-+                tw_min = float(np.min(finite_weights))
-+                tw_med = float(np.median(finite_weights))
-+                tw_max = float(np.max(finite_weights))
-+                ratio = float(tw_max / tw_min) if tw_min > 0 else float("inf")
-+                logger.debug(
-+                    "[DEBUG] gpu_coadd tile_weights: min=%.6f median=%.6f max=%.6f ratio=%.6f count=%d",
-+                    tw_min,
-+                    tw_med,
-+                    tw_max,
-+                    ratio,
-+                    len(tile_weights_list),
-+                )
-+        except Exception:
-+            pass
-     try:
-         tile_weights_gpu = cp.asarray(tile_weights_list, dtype=cp.float32)
-     except Exception:
-         tile_weights_gpu = None
-     if tile_weighting_active and logger.isEnabledFor(logging.DEBUG):
-         for idx, w_val in enumerate(tile_weights_list):
-             try:
-                 logger.debug("[DEBUG] gpu_coadd: tile %d uses weight %.6f", idx, float(w_val))
-             except Exception:
-                 pass
- 
-     combine_function = str(kwargs.get("combine_function") or "mean").strip().lower()
-     stack_reject_algo = str(kwargs.get("stack_reject_algo") or combine_function).strip().lower()
-     if combine_function == "median":
-         combine_mode = "median"
-     elif combine_function == "kappa_sigma":
-         combine_mode = "kappa_sigma"
-     elif combine_function == "winsorized" or stack_reject_algo in {"winsorized", "winsor", "winsorized_sigma_clip"}:
-         combine_mode = "winsorized"
-     else:
-         combine_mode = "mean"
- 
-     winsor_limits = _sanitize_winsor_limits(kwargs.get("winsor_limits", (0.05, 0.05)) or (0.05, 0.05))
-     kappa_sigma_k = float(kwargs.get("coadd_k", kwargs.get("kappa_sigma_k", 2.0)) or 2.0)
-     match_background = bool(kwargs.get("match_background", kwargs.get("match_bg", False)))
-@@ -4589,51 +4608,89 @@ def _reproject_and_coadd_wrapper_impl(
- 
-     def _normalize_tile_weights(weights_obj, n_expected: int) -> list[float] | None:
-         if weights_obj is None:
-             return None
-         normalized: list[float] = []
-         try:
-             iterable = list(weights_obj)
-         except Exception:
-             iterable = [weights_obj]
-         for idx in range(n_expected):
-             try:
-                 raw = iterable[idx]
-             except Exception:
-                 raw = 1.0
-             try:
-                 value = float(raw)
-             except Exception:
-                 value = 1.0
-             if not math.isfinite(value) or value <= 0:
-                 value = 1.0
-             normalized.append(value)
-         if len(normalized) < n_expected:
-             normalized.extend([1.0] * (n_expected - len(normalized)))
-         return normalized
- 
-+    def _max_input_weight(weights_obj) -> float | None:
-+        try:
-+            iterable = list(weights_obj)
-+        except Exception:
-+            iterable = None
-+        if iterable is None:
-+            return None
-+        max_val: float = 0.0
-+        seen = False
-+        for entry in iterable:
-+            if entry is None:
-+                continue
-+            try:
-+                arr = np.asarray(entry, dtype=np.float32)
-+            except Exception:
-+                continue
-+            if arr.size == 0:
-+                continue
-+            try:
-+                local_max = float(np.nanmax(arr))
-+            except Exception:
-+                local_max = 0.0
-+            if math.isfinite(local_max):
-+                seen = True
-+                if local_max > max_val:
-+                    max_val = local_max
-+        return max_val if seen else None
-+
-+    input_weights_raw = kwargs.get("input_weights")
-+    input_weight_max = _max_input_weight(input_weights_raw)
-     normalized_weights = _normalize_tile_weights(tile_weights, len(data_list))
-+    if normalized_weights is not None and input_weight_max is not None and input_weight_max > 1.5:
-+        try:
-+            logger.warning(
-+                "[Reproject] double application probable: input_weights max=%.3f with tile_weights provided",
-+                input_weight_max,
-+            )
-+        except Exception:
-+            pass
-     gpu_kwargs = dict(kwargs)
-     if progress_callback is not None:
-         gpu_kwargs["progress_callback"] = progress_callback
-     if normalized_weights is not None:
-         gpu_kwargs["tile_weights"] = normalized_weights
-     if use_gpu:
-         if not gpu_is_available():
-             _log_gpu_event(
-                 "gpu_fallback_unavailable",
-                 "WARN",
-                 progress_callback,
-                 helper="gpu_reproject",
-                 reason="gpu_unavailable",
-             )
-             if not allow_cpu_fallback:
-                 raise RuntimeError("gpu_unavailable")
-         else:
-             try:
-                 return gpu_reproject_and_coadd_impl(data_list, wcs_list, shape_out, **gpu_kwargs)
-             except Exception as e:  # pragma: no cover - GPU failures
-                 _log_gpu_event(
-                     "gpu_fallback_runtime_error",
-                     "WARN",
-                     progress_callback,
-                     helper="gpu_reproject",
+ Si tu veux, je peux aussi te donner un **mini diff “à la main”** (3 micro-changements) pour vérifier que Codex ne part pas en sucette — mais tel quel, ce brief est normalement assez cadré pour un patch chirurgical.
 diff --git a/zemosaic_worker.py b/zemosaic_worker.py
-index 8e3d1942de94f49b98d6d681a784ce0f4e37d213..ba3d2dffa1293995ee52e739a88fec04ee1adb03 100644
+index 90199e19fc27e7ac164816bf19c40d0434fbd184..6cbf4c3310e814bf1a70e8a33a96504cb14cac61 100644
 --- a/zemosaic_worker.py
 +++ b/zemosaic_worker.py
-@@ -1227,118 +1227,142 @@ def _apply_autocrop_to_global_plan(
-             "y0": y0,
-             "width": width,
-             "height": height,
-         }
-         header_obj = descriptor.get("header")
-         if header_obj is not None:
+@@ -4613,55 +4613,56 @@ def _run_phase4_5_inter_master_merge(
+ 
+             chunk_affine_corrections: list[tuple[float, float] | None] = [None] * len(chunk_tiles)
+             chunk_photometry_done = False
+ 
              try:
-                 header_obj["NAXIS1"] = width
-                 header_obj["NAXIS2"] = height
-                 header_obj["CRPIX1"] = float(header_obj.get("CRPIX1", 0.0)) - float(x0)
-                 header_obj["CRPIX2"] = float(header_obj.get("CRPIX2", 0.0)) - float(y0)
+                 kappa_val = float(stack_cfg.get("kappa_low", 3.0))
              except Exception:
-                 pass
-     plan["autocrop_offsets"] = {
-         "x0": x0,
-         "y0": y0,
-         "width": width,
-         "height": height,
-     }
-     plan["autocrop_applied"] = True
- 
- 
- def _prepare_tiles_for_two_pass(
-     collected_tiles: list[tuple] | None,
-     fallback_loader: Callable[[], tuple] | None,
--) -> tuple[list[np.ndarray], list[Any], list[np.ndarray | None]]:
-+) -> tuple[list[np.ndarray], list[Any], list[np.ndarray | None], list[float]]:
-     """Build the tile, WCS, and coverage lists used during the second pass."""
- 
-     tiles: list[np.ndarray] = []
-     wcs_list: list[Any] = []
-     coverage_list: list[np.ndarray | None] = []
-+    tile_weights: list[float] = []
- 
-     def _coerce_tile_payload(
-         tile_entry,
--    ) -> tuple[np.ndarray | None, Any | None, np.ndarray | None]:
-+    ) -> tuple[np.ndarray | None, Any | None, np.ndarray | None, float]:
-         try:
-             if isinstance(tile_entry, (list, tuple)):
-                 arr = tile_entry[0] if len(tile_entry) >= 1 else None
-                 twcs = tile_entry[1] if len(tile_entry) >= 2 else None
-                 cov = tile_entry[2] if len(tile_entry) >= 3 else None
--                return arr, twcs, cov
-+                try:
-+                    tw_val = float(tile_entry[3]) if len(tile_entry) >= 4 else 1.0
-+                except Exception:
-+                    tw_val = 1.0
-+                return arr, twcs, cov, tw_val
-         except Exception:
-             pass
--        return None, None, None
-+        return None, None, None, 1.0
- 
-     if collected_tiles:
-         for entry in collected_tiles:
--            arr, twcs, cov = _coerce_tile_payload(entry)
-+            arr, twcs, cov, tile_weight = _coerce_tile_payload(entry)
-             if arr is None or twcs is None:
-                 continue
-             arr_np = np.asarray(arr, dtype=np.float32)
-             tiles.append(arr_np)
-             wcs_list.append(twcs)
-+            try:
-+                tw_val = float(tile_weight)
-+            except Exception:
-+                tw_val = 1.0
-+            if not math.isfinite(tw_val) or tw_val <= 0.0:
-+                tw_val = 1.0
-+            tile_weights.append(tw_val)
-             if cov is not None:
-                 cov_np = np.asarray(cov, dtype=np.float32, copy=False)
-                 if cov_np.ndim > 2:
-                     cov_np = np.squeeze(cov_np)
-                 coverage_list.append(np.nan_to_num(cov_np, nan=0.0, posinf=0.0, neginf=0.0))
-             else:
-                 if arr_np.ndim >= 3:
-                     mask = np.any(np.isfinite(arr_np), axis=-1)
-                 else:
-                     mask = np.isfinite(arr_np)
-                 coverage_list.append(mask.astype(np.float32))
-     elif fallback_loader is not None:
-         try:
-             loader_payload = fallback_loader()
-         except Exception:
-             loader_payload = ([], [], [])
-         tiles_from_loader: list[np.ndarray] = []
-         wcs_from_loader: list[Any] = []
-         coverage_from_loader: list[np.ndarray | None] = []
-+        tile_weights_from_loader: list[float] = []
-         if isinstance(loader_payload, tuple) and len(loader_payload) >= 2:
-             tiles_from_loader = list(loader_payload[0] or [])
-             wcs_from_loader = list(loader_payload[1] or [])
-             if len(loader_payload) >= 3:
-                 coverage_from_loader = list(loader_payload[2] or [])
-+            if len(loader_payload) >= 4:
-+                tile_weights_from_loader = list(loader_payload[3] or [])
-         for idx, arr in enumerate(tiles_from_loader):
-             twcs = wcs_from_loader[idx] if idx < len(wcs_from_loader) else None
-             if arr is None or twcs is None:
-                 continue
-             tiles.append(np.asarray(arr, dtype=np.float32))
-             wcs_list.append(twcs)
-+            try:
-+                tw_val = float(tile_weights_from_loader[idx]) if idx < len(tile_weights_from_loader) else 1.0
-+            except Exception:
-+                tw_val = 1.0
-+            if not math.isfinite(tw_val) or tw_val <= 0.0:
-+                tw_val = 1.0
-+            tile_weights.append(tw_val)
-             cov = coverage_from_loader[idx] if idx < len(coverage_from_loader) else None
-             if cov is None:
-                 coverage_list.append(None)
-             else:
-                 cov_np = np.asarray(cov, dtype=np.float32, copy=False)
-                 if cov_np.ndim > 2:
-                     cov_np = np.squeeze(cov_np)
-                 coverage_list.append(np.nan_to_num(cov_np, nan=0.0, posinf=0.0, neginf=0.0))
- 
--    return tiles, wcs_list, coverage_list
-+    if len(tile_weights) < len(tiles):
-+        tile_weights.extend([1.0] * (len(tiles) - len(tile_weights)))
-+    return tiles, wcs_list, coverage_list, tile_weights
- 
- 
- class _TwoPassDiagnostics:
-     """Collect and emit DEBUG-only diagnostics for the TwoPass pipeline."""
- 
-     def __init__(self, logger: logging.Logger | None):
-         self.logger = logger
-         self.downsample_factor = 8
-         self.lowres_shape: tuple[int, int] | None = None
-         self.total_lr_pixels = 0
-         self.overlap_records: list[dict[str, Any]] = []
-         self.gains: list[float] | None = None
-         self.sanity_flags: set[str] = set()
-         self.coverage_threshold = 0.0
-         self.fallback_used = False
-         self.tile_total = 0
- 
-     def _enabled(self) -> bool:
-         return bool(self.logger and self.logger.isEnabledFor(logging.DEBUG))
- 
-     def _log_sanity_once(self, key: str, message: str) -> None:
-         if not self._enabled() or key in self.sanity_flags:
-             return
-         self.sanity_flags.add(key)
-         assert self.logger is not None
-@@ -1844,117 +1868,109 @@ def _apply_two_pass_coverage_renorm_if_requested(
-     fallback_tile_loader: Callable[[], tuple[list[np.ndarray], list[Any]]] | None = None,
-     parallel_plan: ParallelPlan | None = None,
-     telemetry_ctrl: ResourceTelemetryController | None = None,
- ) -> tuple[np.ndarray | None, np.ndarray | None]:
-     """Run the coverage renormalization second pass if configured."""
- 
-     if (
-         not two_pass_enabled
-         or final_mosaic_data is None
-         or final_mosaic_coverage is None
-         or final_output_wcs is None
-         or final_output_shape_hw is None
-     ):
-         if logger:
-             logger.debug("[TwoPass] Second pass skipped (disabled or missing inputs)")
-         return final_mosaic_data, final_mosaic_coverage
- 
-     if logger:
-         logger.info(
-             "[TwoPass] Second pass requested (sigma=%s, clip=%s); coverage shape=%s",
-             two_pass_sigma_px,
-             gain_clip_tuple,
-             getattr(final_mosaic_coverage, "shape", None),
-         )
- 
--    prepare_output = _prepare_tiles_for_two_pass(
-+    (
-+        tiles_for_second_pass,
-+        wcs_for_second_pass,
-+        coverage_for_second_pass,
-+        tile_weights_for_second_pass,
-+    ) = _prepare_tiles_for_two_pass(
-         collected_tiles,
-         fallback_tile_loader,
-     )
--    fallback_used: bool
--    if isinstance(prepare_output, tuple) and len(prepare_output) >= 4:
--        (
--            tiles_for_second_pass,
--            wcs_for_second_pass,
--            coverage_for_second_pass,
--            fallback_used,
--        ) = prepare_output[:4]
--    else:
--        (
--            tiles_for_second_pass,
--            wcs_for_second_pass,
--            coverage_for_second_pass,
--        ) = prepare_output
--        fallback_used = not bool(collected_tiles) and fallback_tile_loader is not None
-+    fallback_used: bool = not bool(collected_tiles) and fallback_tile_loader is not None
- 
-     if logger:
-         logger.debug(
-             "[TwoPass] Prepared %d tiles for second pass (collected=%s, fallback=%s)",
-             len(tiles_for_second_pass),
-             bool(collected_tiles),
-             fallback_tile_loader is not None,
-         )
-     if not tiles_for_second_pass or not wcs_for_second_pass:
-         if logger:
-             logger.warning(
-                 "[TwoPass] No tiles available for coverage renorm; keeping first-pass outputs"
-             )
-         return final_mosaic_data, final_mosaic_coverage
- 
-     diag_state: _TwoPassDiagnostics | None = None
-     if logger and logger.isEnabledFor(logging.DEBUG):
-         diag_state = _TwoPassDiagnostics(logger)
-         try:
-             diag_state.run_pre_diagnostics(
-                 tiles=tiles_for_second_pass,
-                 tile_wcs_list=wcs_for_second_pass,
-                 tiles_coverage=coverage_for_second_pass,
-                 mosaic_data_arr=final_mosaic_data,
-                 mosaic_cov_arr=final_mosaic_coverage,
-                 output_wcs_obj=final_output_wcs,
-                 output_shape_hw=final_output_shape_hw,
-                 sigma_px=two_pass_sigma_px,
-                 gain_clip=gain_clip_tuple,
-                 fallback_used=fallback_used,
-             )
-         except Exception:
-             diag_state = None
-             logger.debug("[TwoPassDiag] pre diagnostics failed", exc_info=True)
- 
-     result: tuple[np.ndarray, np.ndarray] | None = None
-     try:
-         result = run_second_pass_coverage_renorm(
-             tiles_for_second_pass,
-             wcs_for_second_pass,
-             final_output_wcs,
-             final_mosaic_coverage,
-             final_output_shape_hw,
-             sigma_px=two_pass_sigma_px,
-             gain_clip=gain_clip_tuple,
-             logger=logger,
-             use_gpu_two_pass=use_gpu_two_pass,
-             tiles_coverage=coverage_for_second_pass,
-+            tile_weights=tile_weights_for_second_pass,
-             parallel_plan=parallel_plan,
-             telemetry_ctrl=telemetry_ctrl,
-             debug_diag=diag_state,
-         )
-         if result is not None:
-             mosaic2, coverage2 = result
-             base_data = final_mosaic_data
-             base_cov = final_mosaic_coverage
- 
-             if base_data is None or base_cov is None:
-                 final_mosaic_data = mosaic2
-                 final_mosaic_coverage = coverage2
-                 if logger:
-                     logger.info(
-                         "[TwoPass] coverage-renorm OK (σ=%s, clip=[%.3f, %.3f]) (no first-pass fallback available)",
-                         two_pass_sigma_px,
-                         gain_clip_tuple[0],
-                         gain_clip_tuple[1],
-                     )
-             else:
-                 base_data = np.asarray(base_data, dtype=np.float32, copy=False)
-                 base_cov = np.asarray(base_cov, dtype=np.float32, copy=False)
-                 mosaic2 = np.asarray(mosaic2, dtype=np.float32, copy=False)
-                 coverage2 = np.asarray(coverage2, dtype=np.float32, copy=False)
- 
-@@ -13882,66 +13898,74 @@ def assemble_final_mosaic_reproject_coadd(
-                         "assemble_info_intertile_photometric_applied",
-                         prog=None,
-                         lvl="INFO_DETAIL",
-                         num_tiles=corrected_tiles,
-                     )
-                 except Exception:
-                     pass
-                 nontrivial_affine = True
-             else:
-                 nontrivial_affine = False
-                 pending_affine_list = None
-     else:
-         nontrivial_affine = False
-         pending_affine_list = None
-         tile_affine_for_gpu = None
- 
-     if collect_tile_data is not None:
-         try:
-             collect_tile_data.clear()
-         except Exception:
-             collect_tile_data[:] = []
-         for entry in effective_tiles:
-             arr = entry.get("data") if isinstance(entry, dict) else None
-             tile_wcs = entry.get("wcs") if isinstance(entry, dict) else None
-             coverage_mask = entry.get("coverage_mask") if isinstance(entry, dict) else None
-+            tile_weight_val = 1.0
-+            if isinstance(entry, dict):
-+                try:
-+                    tile_weight_val = float(entry.get("tile_weight", 1.0))
-+                except Exception:
-+                    tile_weight_val = 1.0
-+                if not math.isfinite(tile_weight_val) or tile_weight_val <= 0.0:
-+                    tile_weight_val = 1.0
-             if arr is None or tile_wcs is None:
-                 continue
+                 kappa_val = 3.0
+             limits_val = stack_cfg.get("winsor_limits", (0.05, 0.05))
              try:
-                 arr_copy = np.array(arr, copy=True)
-             except Exception:
-                 try:
-                     arr_copy = arr.copy()
-                 except Exception:
-                     arr_copy = np.asarray(arr, dtype=np.float32)
-             cov_copy = None
-             if coverage_mask is not None:
-                 try:
-                     cov_copy = np.array(coverage_mask, copy=True)
-                 except Exception:
-                     cov_copy = np.asarray(coverage_mask, dtype=np.float32)
--            collect_tile_data.append((arr_copy, tile_wcs, cov_copy))
-+            collect_tile_data.append((arr_copy, tile_wcs, cov_copy, tile_weight_val))
- 
- 
-     # Build kwargs dynamically to remain compatible with different reproject versions
-     reproj_kwargs = {}
-     process_workers_supported = False
-     try:
-         import inspect
-         sig = inspect.signature(reproject_and_coadd)
-         if "match_background" in sig.parameters:
-             reproj_kwargs["match_background"] = match_bg
-         elif "match_bg" in sig.parameters:
-             reproj_kwargs["match_bg"] = match_bg
-         if "process_workers" in sig.parameters:
-             process_workers_supported = True
-             reproj_kwargs["process_workers"] = assembly_process_workers
-         if "use_memmap" in sig.parameters:
-             reproj_kwargs["use_memmap"] = use_memmap
-         elif "intermediate_memmap" in sig.parameters:
-             reproj_kwargs["intermediate_memmap"] = use_memmap
-         if "memmap_dir" in sig.parameters:
-             reproj_kwargs["memmap_dir"] = memmap_dir
-         if "cleanup_memmap" in sig.parameters:
-             reproj_kwargs["cleanup_memmap"] = False
-     except Exception:
-         # If introspection fails just fall back to basic arguments
-@@ -14024,179 +14048,179 @@ def assemble_final_mosaic_reproject_coadd(
-             coverage_memmap = np.memmap(str(coverage_mm_path), dtype=np.float32, mode='w+', shape=(h, w))
-             _pcb(
-                 "assemble_debug_memmap_paths",
-                 prog=None,
-                 lvl="DEBUG_DETAIL",
-                 mosaic_path=str(mosaic_mm_path),
-                 coverage_path=str(coverage_mm_path),
-             )
-         except Exception as e_mm:
-             mosaic_memmap = None
-             coverage_memmap = None
-             _pcb("assemble_warn_memmap_create_failed", prog=None, lvl="WARN", error=str(e_mm))
-     try:
-         total_steps = n_channels
-         start_time_loop = time.time()
-         last_time = start_time_loop
-         step_times = []
-         if use_gpu:
-             try:
-                 _pcb(
-                     f"ASM_REPROJ_COADD: GPU background match enabled (preview={reproj_kwargs.get('bg_preview_size','N/A')}, sky={reproj_kwargs.get('intertile_sky_percentile','N/A')}, clip={reproj_kwargs.get('intertile_robust_clip_sigma','N/A')})",
-                     lvl="DEBUG_DETAIL",
+                 limits_val = (
+                     float(limits_val[0]),
+                     float(limits_val[1]),
                  )
              except Exception:
-                 pass
--        weight_array_scaled_ids: set[int] = set()
--        tile_weight_log_ids: set[str] = set()
--        weights_embedded_with_tile = False
-+        tile_weight_summary_logged = False
-         for ch in range(n_channels):
-             valid_entries: list[dict[str, Any]] = []
-             for entry in effective_tiles:
-                 arr = entry.get("data") if isinstance(entry, dict) else None
-                 if arr is None:
-                     continue
-                 if arr.ndim != 3:
-                     raise ValueError(
-                         f"Master tile data must be HWC before channel slicing, got {arr.shape}"
-                     )
-                 if ch >= arr.shape[-1]:
-                     raise ValueError(
-                         f"Channel index {ch} out of bounds for tile shape {arr.shape}"
-                     )
-                 valid_entries.append(entry)
- 
-             data_list = []
-             wcs_list = []
-             input_weights_list = []
-             weight_debug_logged = False
-+            tile_weights_for_entries: list[float] = []
-+            input_weight_max = 0.0
-             for idx_entry, entry in enumerate(valid_entries):
-                 entry_data = entry.get("data")
-                 data_plane = entry_data[..., ch]
-                 data_list.append(data_plane)
-                 wcs_list.append(entry.get("wcs"))
-                 weight_source_base = "ones"
-                 weight2d = entry.get("alpha_weight2d") if isinstance(entry, dict) else None
-                 if weight2d is not None:
-                     weight_source_base = "alpha_weight2d"
-                 else:
-                     coverage_mask = entry.get("coverage_mask") if isinstance(entry, dict) else None
-                     if coverage_mask is not None:
-                         try:
-                             weight_candidate = np.asarray(coverage_mask, dtype=np.float32, order="C", copy=False)
-                             if weight_candidate.shape == data_plane.shape:
-                                 weight2d = np.clip(
-                                     np.nan_to_num(weight_candidate, nan=0.0, posinf=0.0, neginf=0.0),
-                                     0.0,
-                                     1.0,
-                                 )
-                                 weight_source_base = "coverage_mask"
-                         except Exception:
-                             weight2d = None
-                     if weight2d is None:
-                         weight2d = np.ones_like(data_plane, dtype=np.float32)
--                weight_source = weight_source_base
-                 if tile_weighting_applied:
-                     try:
-                         tw_raw = entry.get("tile_weight", 1.0) if isinstance(entry, dict) else 1.0
-                         tw_value = float(tw_raw)
-                     except Exception:
-                         tw_value = 1.0
-                     if not math.isfinite(tw_value) or tw_value <= 0.0:
-                         tw_value = 1.0
--                    weights_embedded_with_tile = True
--                    if isinstance(weight2d, np.ndarray):
--                        weight_arr = np.asarray(weight2d, dtype=np.float32, order="C", copy=False)
--                        weight_id = id(weight_arr)
--                        if weight_id not in weight_array_scaled_ids:
--                            weight_array_scaled_ids.add(weight_id)
--                            np.multiply(weight_arr, tw_value, out=weight_arr, casting="unsafe")
--                        weight2d = weight_arr
--                        if isinstance(entry, dict) and weight_source_base == "alpha_weight2d":
--                            entry["alpha_weight2d"] = weight_arr
--                    weight_source = f"{weight_source_base}*tile_weight"
--                    tile_label = (
--                        entry.get("tile_id")
--                        or entry.get("path")
--                        or f"tile_{idx_entry}"
--                    )
--                    if tile_label not in tile_weight_log_ids:
--                        logger.info(
--                            "[Phase5] tile_weight applied: tile=%s tw=%.3f weights_source=%s",
--                            tile_label,
--                            tw_value,
--                            weight_source,
--                        )
--                        tile_weight_log_ids.add(str(tile_label))
-+                    tile_weights_for_entries.append(tw_value)
-                 input_weights_list.append(weight2d)
-                 if (
-                     not weight_debug_logged
-                     and logger.isEnabledFor(logging.DEBUG)
-                     and isinstance(weight2d, np.ndarray)
-                 ):
-                     try:
-                         weight_min = float(np.nanmin(weight2d)) if weight2d.size else 0.0
-                         weight_max = float(np.nanmax(weight2d)) if weight2d.size else 0.0
-                         zero_frac = float(np.mean(weight2d <= 0.0)) if weight2d.size else 0.0
-                         logger.debug(
-                             "[Phase5] input_weights sample: channel=%d source=%s shape=%s min=%.4f max=%.4f zero_frac=%.4f",
-                             ch,
--                            weight_source,
-+                            weight_source_base,
-                             weight2d.shape,
-                             weight_min,
-                             weight_max,
-                             zero_frac,
-                         )
-                         weight_debug_logged = True
-                     except Exception:
-                         pass
--            weights_for_entries = None
--            if tile_weighting_applied:
--                weights_for_entries = [
--                    float(entry.get("tile_weight", 1.0)) if isinstance(entry, dict) else 1.0
--                    for entry in valid_entries
--                ]
-+                try:
-+                    local_max = float(np.nanmax(weight2d)) if isinstance(weight2d, np.ndarray) and weight2d.size else 0.0
-+                except Exception:
-+                    local_max = 0.0
-+                input_weight_max = max(input_weight_max, local_max)
-+
-+            tile_weights_arg: list[float] | None = None
-+            if tile_weighting_applied and tile_weights_for_entries:
-+                tile_weights_arg = tile_weights_for_entries
-+                if not tile_weight_summary_logged:
-+                    try:
-+                        weights_arr = np.asarray(tile_weights_for_entries, dtype=np.float64)
-+                        finite_weights = weights_arr[np.isfinite(weights_arr)]
-+                        if finite_weights.size:
-+                            tw_min = float(np.min(finite_weights))
-+                            tw_med = float(np.median(finite_weights))
-+                            tw_max = float(np.max(finite_weights))
-+                            ratio = float(tw_max / tw_min) if tw_min > 0 else float("inf")
-+                            logger.debug(
-+                                "[Phase5] tile_weights summary: min=%.4f median=%.4f max=%.4f ratio=%.4f entries=%d",
-+                                tw_min,
-+                                tw_med,
-+                                tw_max,
-+                                ratio,
-+                                len(tile_weights_for_entries),
-+                            )
-+                        tile_weight_summary_logged = True
-+                    except Exception:
-+                        pass
-+            if tile_weights_arg is not None and input_weight_max > 1.5:
-+                logger.warning(
-+                    "[Phase5] possible double weighting: input_weights max=%.3f with tile_weights enabled",
-+                    input_weight_max,
-+                )
- 
-             reproj_call_kwargs = dict(reproj_kwargs)
-             reproj_call_kwargs["input_weights"] = input_weights_list
-             if use_gpu:
-                 for unsupported_kw in ("intertile_global_recenter",):
-                     if unsupported_kw in reproj_call_kwargs:
-                         reproj_call_kwargs.pop(unsupported_kw, None)
-                         logger.debug(
-                             "[GPU Reproject] Ignoring unsupported kwarg: %s",
-                             unsupported_kw,
-                         )
- 
-             def _invoke_reproject(local_kwargs: dict):
-                 invoke_kwargs = dict(local_kwargs)
--                if (
--                    tile_weighting_applied
--                    and weights_for_entries is not None
--                    and not weights_embedded_with_tile
--                ):
--                    invoke_kwargs["tile_weights"] = weights_for_entries
-+                if tile_weights_arg is not None:
-+                    invoke_kwargs["tile_weights"] = tile_weights_arg
-                 return zemosaic_utils.reproject_and_coadd_wrapper(
-                     data_list=data_list,
-                     wcs_list=wcs_list,
-                     shape_out=final_output_shape_hw,
-                     output_projection=output_header,
-                     use_gpu=use_gpu,
-                     cpu_func=reproject_and_coadd,
-                     reproject_function=reproject_interp,
-                     combine_function="mean",
-                     progress_callback=_pcb,
-                     **invoke_kwargs,
-                 )
- 
+                 limits_val = (0.05, 0.05)
              try:
-                 chan_mosaic, chan_cov = _invoke_reproject(reproj_call_kwargs)
-             except TypeError as gpu_kw_err:
-                 if use_gpu:
-                     logger.warning(
-                         "[GPU Reproject] Unexpected kwargs triggered TypeError: %s",
-                         gpu_kw_err,
-                     )
-                     retry_kwargs = reproj_call_kwargs.copy()
-                     removed_after_error: list[str] = []
-                     err_msg = str(gpu_kw_err)
-                     for key in list(retry_kwargs.keys()):
-@@ -15116,50 +15140,51 @@ def compute_per_tile_gains_from_coverage(
- 
-     try:
-         gains = _execute(executor_cls)
-     except Exception as exc_pool:
-         if not use_gpu and executor_cls is ProcessPoolExecutor:
-             if logger:
-                 logger.warning("[TwoPass] Process pool failed, retrying gain computation with threads: %s", exc_pool)
-             gains = _execute(ThreadPoolExecutor)
-         else:
-             raise
-     return gains
- 
- 
- def run_second_pass_coverage_renorm(
-     tiles: list[np.ndarray],
-     tiles_wcs: list[Any],
-     final_wcs_p1: Any,
-     coverage_p1: np.ndarray,
-     shape_out: tuple[int, int],
-     *,
-     sigma_px: int,
-     gain_clip: tuple[float, float],
-     logger=None,
-     use_gpu_two_pass: bool | None = None,
-     tiles_coverage: list[np.ndarray | None] | None = None,
-+    tile_weights: list[float] | None = None,
-     parallel_plan: ParallelPlan | None = None,
-     telemetry_ctrl: ResourceTelemetryController | None = None,
-     debug_diag: _TwoPassDiagnostics | None = None,
- ) -> tuple[np.ndarray, np.ndarray] | None:
-     """Apply coverage-based gains to tiles and reproject them for a second pass."""
-     if logger:
-         logger.debug(
-             "[TwoPass] run_second_pass_coverage_renorm start: tiles=%d, wcs=%d, coverage_shape=%s, sigma=%s, clip=%s",
-             len(tiles) if tiles else 0,
-             len(tiles_wcs) if tiles_wcs else 0,
-             getattr(coverage_p1, "shape", None),
-             sigma_px,
-             gain_clip,
-         )
-     if not tiles or not tiles_wcs or coverage_p1 is None:
-         if logger:
-             logger.warning(
-                 "[TwoPass] Missing inputs for second pass (tiles=%s, wcs=%s, coverage=%s)",
-                 bool(tiles),
-                 bool(tiles_wcs),
-                 coverage_p1 is not None,
-             )
-         return None
-     if not (REPROJECT_AVAILABLE and reproject_and_coadd and reproject_interp):
-         if logger:
-@@ -15440,105 +15465,168 @@ def run_second_pass_coverage_renorm(
-                     continue
-                 cov_np = np.asarray(cov_arr, dtype=np.float32)
-                 if cov_np.ndim == 3:
-                     cov2d = cov_np[..., 0]
-                 else:
-                     cov2d = cov_np
-                 tile_h, tile_w = tile_arr.shape[0], tile_arr.shape[1]
-                 if cov2d.shape != (tile_h, tile_w):
-                     if logger:
-                         logger.debug(
-                             "[TwoPass] tiles_coverage shape mismatch for tile: cov=%s tile=%s → ignoring coverage for this tile",
-                             cov2d.shape,
-                             (tile_h, tile_w),
-                         )
-                     weights_tmp.append(None)
-                     continue
-                 weight2d = (cov2d > 0.0).astype(np.float32)
-                 weights_tmp.append(weight2d)
-             if any(w is not None for w in weights_tmp):
-                 weights_2d_list = weights_tmp
-         except Exception:
-             weights_2d_list = None
-             if logger and logger.isEnabledFor(logging.DEBUG):
-                 logger.debug("[TwoPass] failed to prepare tiles_coverage weights → skip", exc_info=True)
- 
-+    def _normalize_tile_weights(weights_obj: list[float] | None, expected: int) -> list[float] | None:
-+        if weights_obj is None:
-+            return None
-+        normalized: list[float] = []
-+        try:
-+            iterable = list(weights_obj)
-+        except Exception:
-+            iterable = [weights_obj]
-+        for idx in range(expected):
-+            try:
-+                raw = iterable[idx]
-+            except Exception:
-+                raw = 1.0
-+            try:
-+                val = float(raw)
-+            except Exception:
-+                val = 1.0
-+            if not math.isfinite(val) or val <= 0.0:
-+                val = 1.0
-+            normalized.append(val)
-+        if len(normalized) < expected:
-+            normalized.extend([1.0] * (expected - len(normalized)))
-+        return normalized
-+
-+    tile_weights_norm = _normalize_tile_weights(tile_weights, len(corrected_tiles))
-+    if tile_weights_norm and logger and logger.isEnabledFor(logging.DEBUG):
-+        try:
-+            weights_arr = np.asarray(tile_weights_norm, dtype=np.float64)
-+            finite_weights = weights_arr[np.isfinite(weights_arr)]
-+            if finite_weights.size:
-+                tw_min = float(np.min(finite_weights))
-+                tw_med = float(np.median(finite_weights))
-+                tw_max = float(np.max(finite_weights))
-+                ratio = float(tw_max / tw_min) if tw_min > 0 else float("inf")
-+                logger.debug(
-+                    "[TwoPass] tile_weights summary: min=%.4f median=%.4f max=%.4f ratio=%.4f entries=%d",
-+                    tw_min,
-+                    tw_med,
-+                    tw_max,
-+                    ratio,
-+                    len(tile_weights_norm),
-+                )
-+        except Exception:
-+            pass
-+
-     def _process_channel(ch_idx: int, use_gpu_flag: bool) -> tuple[int, np.ndarray, np.ndarray]:
-         if logger:
-             logger.debug(
-                 "[TwoPass] Reproject channel %d/%d with %d tiles (shape_out=%s, gpu=%s)",
-                 ch_idx + 1,
-                 n_channels,
-                 len(corrected_tiles),
-                 shape_out_hw,
-                 use_gpu_flag,
-             )
-         data_list = [tile[..., ch_idx] if tile.ndim == 3 else tile[..., 0] for tile in corrected_tiles]
-         input_weights_list = None
-+        input_weight_max = 0.0
-         if weights_2d_list is not None:
-             try:
-                 iw: list[np.ndarray | None] = []
-                 for base_w, tile_arr in zip(weights_2d_list, corrected_tiles):
-                     if base_w is None:
-                         iw.append(None)
-                         continue
-                     tile_slice = tile_arr[..., ch_idx] if tile_arr.ndim == 3 else tile_arr[..., 0]
-                     if base_w.shape != tile_slice.shape:
-                         if logger and logger.isEnabledFor(logging.DEBUG):
-                             logger.debug(
-                                 "[TwoPass] input_weights shape mismatch for channel %d: w=%s slice=%s → ignoring weight",
-                                 ch_idx + 1,
-                                 base_w.shape,
-                                 tile_slice.shape,
-                             )
-                         iw.append(None)
-                     else:
-                         iw.append(base_w)
-                 if any(w is not None for w in iw):
-                     input_weights_list = iw
+                 max_pass_val = int(stack_cfg.get("winsor_max_frames_per_pass", 0))
              except Exception:
-                 input_weights_list = None
-                 if logger and logger.isEnabledFor(logging.DEBUG):
+                 max_pass_val = 0
+             try:
+                 worker_limit_val = int(stack_cfg.get("winsor_worker_limit", 1))
+             except Exception:
+                 worker_limit_val = 1
+             current_parallel_plan = getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan"))
++            winsor_max_workers_val = 0 if worker_limit_val <= 0 else max(1, worker_limit_val)
+             stack_kwargs = {
+                 "kappa": kappa_val,
+                 "winsor_limits": limits_val,
+                 "winsor_max_frames_per_pass": max_pass_val,
+-                "winsor_max_workers": max(1, worker_limit_val),
++                "winsor_max_workers": winsor_max_workers_val,
+             }
+             super_arr = None
+             # --- Phase 4.5 (améliorée) : 2.1 → 3.1 à l’intérieur de 4.5 ---
+             # Réutiliser les options choisies dans le GUI :
+             #   normalize_method, weight_method, reject_algo, final_combine,
+             #   kappa/winsor/workers déjà présents dans stack_cfg/stack_kwargs.
+             try:
+                 norm_method = str(
+                     stack_cfg.get(
+                         "stacking_normalize_method",
+                         stack_cfg.get(
+                             "normalize_method",
+                             stack_cfg.get("stack_norm_method", "none"),
+                         ),
+                     )
+                 ).lower()
+             except Exception:
+                 norm_method = "none"
+             try:
+                 weight_method = str(stack_cfg.get("weight_method", stack_cfg.get("stack_weight_method", "none"))).lower()
+             except Exception:
+                 weight_method = "none"
+             try:
+                 reject_algo = str(stack_cfg.get("reject_algo", stack_cfg.get("stack_reject_algo", "winsorized_sigma_clip"))).lower()
+             except Exception:
+@@ -5250,57 +5251,57 @@ def _run_phase4_5_inter_master_merge(
+                                 ref_vals = ref_chan[ref_mask]
+                                 src_vals = src_chan[src_mask]
+                                 ref_range = np.nanpercentile(ref_vals, [sky_low, sky_high])
+                                 src_range = np.nanpercentile(src_vals, [sky_low, sky_high])
+                                 ref_sel = (ref_vals >= ref_range[0]) & (ref_vals <= ref_range[1])
+                                 src_sel = (src_vals >= src_range[0]) & (src_vals <= src_range[1])
+                                 ref_clip = ref_vals[ref_sel] if np.any(ref_sel) else ref_vals
+                                 src_clip = src_vals[src_sel] if np.any(src_sel) else src_vals
+                                 if ref_clip.size == 0 or src_clip.size == 0:
+                                     continue
+                                 bg_ref = float(np.nanmedian(ref_clip))
+                                 bg_src = float(np.nanmedian(src_clip))
+                                 if not (math.isfinite(bg_ref) and math.isfinite(bg_src)):
+                                     continue
+                                 delta = bg_ref - bg_src
+                                 src_chan[src_mask] = src_chan[src_mask] + delta
+                 except Exception:
                      logger.debug(
-                         "[TwoPass] failed to prepare input_weights for channel %d → skip weights",
-                         ch_idx + 1,
+                         "[P4.5][G%03d] Chunk photometric normalization skipped (error)",
+                         group_id,
                          exc_info=True,
                      )
-+        if input_weights_list is not None:
-+            try:
-+                for weight_entry in input_weights_list:
-+                    if weight_entry is None:
-+                        continue
-+                    weight_arr = np.asarray(weight_entry, dtype=np.float32)
-+                    local_max = float(np.nanmax(weight_arr)) if weight_arr.size else 0.0
-+                    input_weight_max = max(input_weight_max, local_max)
-+            except Exception:
-+                input_weight_max = 0.0
  
-         def _invoke_reproj(use_gpu_local: bool, local_kwargs: dict[str, Any]):
-             return zemosaic_utils.reproject_and_coadd_wrapper(
-                 data_list=data_list,
-                 wcs_list=tiles_wcs,
-                 shape_out=shape_out_hw,
-                 use_gpu=use_gpu_local,
-                 cpu_func=reproject_and_coadd,
-                 **local_kwargs,
+             # 4.5.c — empilement selon les réglages GUI
+             logger.debug(
+-                "[P4.5][G%03d] Stack params: reject=%s, combine=%s, kappa=%.2f, winsor_limits=%s, workers=%d, weight=%s",
++                "[P4.5][G%03d] Stack params: reject=%s, combine=%s, kappa=%.2f, winsor_limits=%s, workers=%s, weight=%s",
+                 group_id,
+                 reject_algo,
+                 final_combine,
+                 kappa_val,
+                 limits_val,
+-                stack_kwargs["winsor_max_workers"],
++                "AUTO(0)" if winsor_max_workers_val <= 0 else str(stack_kwargs["winsor_max_workers"]),
+                 weight_method,
              )
- 
-         local_kwargs = dict(reproj_kwargs)
-         if input_weights_list is not None:
-             local_kwargs["input_weights"] = input_weights_list
-+        if tile_weights_norm is not None:
-+            local_kwargs["tile_weights"] = tile_weights_norm
-+        if tile_weights_norm is not None and input_weight_max > 1.5 and logger:
-+            logger.warning(
-+                "[TwoPass] possible double weighting: input_weights max=%.3f with tile_weights enabled",
-+                input_weight_max,
+             _phase45_gui_message(
+                 f"Phase 4.5: group {group_id} stacking ({reject_algo}/{final_combine})"
+             )
+             alpha_out = None
+             alpha_sources: list[str] = []
+             weights_ready = any(isinstance(w, np.ndarray) for w in frame_weights)
+             super_arr = None
+             if weights_ready:
+                 try:
+                     frames_np = np.stack(frames, axis=0).astype(np.float32, copy=False)
+                     reference_shape = frames_np.shape[1:3]
+                     weight_stack_list: list[np.ndarray] = []
+                     for wmap in frame_weights:
+                         if isinstance(wmap, np.ndarray) and wmap.shape == reference_shape:
+                             weight_stack_list.append(wmap.astype(np.float32, copy=False))
+                         else:
+                             weight_stack_list.append(np.ones(reference_shape, dtype=np.float32))
+                     weight_stack = np.stack(weight_stack_list, axis=0)
+                     weight_stack = np.clip(np.nan_to_num(weight_stack, nan=0.0), 0.0, 1.0)
+                     weight_expanded = weight_stack[..., None]
+                     num = np.nansum(frames_np * weight_expanded, axis=0)
+                     den = np.nansum(weight_expanded, axis=0)
+                     super_arr = np.where(den > 0, num / den, np.nan)
+@@ -17787,59 +17788,80 @@ def run_hierarchical_mosaic_classic_legacy(
+                     seestar_stack_groups = _merge_small_groups(
+                         seestar_stack_groups,
+                         min_size=min_value,
+                         cap=cap_value,
+                     )
+     
+         # Do not subdivide groups if a target group count is set; respect clustering first.
+         if (
+             not preplan_groups_active
+             and (cluster_target_groups_config is None or int(cluster_target_groups_config) <= 0)
+             and max_raw_per_master_tile_config
+             and max_raw_per_master_tile_config > 0
+         ):
+             new_groups = []
+             for g in seestar_stack_groups:
+                 for i in range(0, len(g), max_raw_per_master_tile_config):
+                     new_groups.append(g[i:i + max_raw_per_master_tile_config])
+             if len(new_groups) != len(seestar_stack_groups):
+                 pcb(
+                     "clusterstacks_info_groups_split_manual_limit",
+                     prog=None,
+                     lvl="INFO_DETAIL",
+                     original=len(seestar_stack_groups),
+                     new=len(new_groups),
+                     limit=max_raw_per_master_tile_config,
+-                )
 +            )
-         try:
-             chan_mosaic, chan_cov = _invoke_reproj(use_gpu_flag, local_kwargs)
-             if logger and logger.isEnabledFor(logging.DEBUG):
-                 cov1 = np.asarray(coverage_p1, dtype=np.float32)
-                 cov2 = np.asarray(chan_cov, dtype=np.float32)
-                 if cov1.shape == cov2.shape:
-                     bad_mask = (cov1 > 0.0) & (cov2 <= 0.0)
-                     n_bad = int(np.count_nonzero(bad_mask))
-                     logger.debug(
-                         "[TwoPass] channel %d coverage mismatch: cov1>0 & cov2==0 → %d pixels",
-                         ch_idx + 1,
-                         n_bad,
-                     )
-                 else:
-                     logger.debug(
-                         "[TwoPass] channel %d coverage shape mismatch for debug: cov1=%s cov2=%s",
-                         ch_idx + 1,
-                         cov1.shape,
-                         cov2.shape,
-                     )
-         except wcs_module.NoConvergence as conv_exc:
-             if logger:
-                 logger.warning(
-                     "[TwoPass] WCS convergence failed on channel %d%s: %s",
-                     ch_idx,
+             seestar_stack_groups = new_groups
+         cpu_total = os.cpu_count() or 1
+-        winsor_worker_limit = max(1, min(int(winsor_worker_limit_config), cpu_total))
++        try:
++            winsor_worker_limit_cfg = int(winsor_worker_limit_config)
++        except Exception:
++            winsor_worker_limit_cfg = 1
++        winsor_auto = winsor_worker_limit_cfg <= 0
++        if winsor_auto:
++            candidate = 0
++            if global_parallel_plan and getattr(global_parallel_plan, "cpu_workers", 0) > 0:
++                candidate = int(getattr(global_parallel_plan, "cpu_workers", 0))
++            elif effective_base_workers and effective_base_workers > 0:
++                candidate = int(effective_base_workers)
++            else:
++                candidate = cpu_total
++        else:
++            candidate = winsor_worker_limit_cfg
++        winsor_worker_limit = max(1, min(int(candidate), cpu_total))
+         winsor_max_frames_per_pass = max(0, int(winsor_max_frames_per_pass_config))
+         global_wcs_plan["winsor_worker_limit"] = int(winsor_worker_limit)
+         global_wcs_plan["winsor_max_frames_per_pass"] = int(winsor_max_frames_per_pass)
+         global_wcs_plan["use_align_helpers"] = True
+         global_wcs_plan["prefer_gpu_helpers"] = bool(use_gpu_phase5_flag)
++        if winsor_auto:
++            pcb(
++                f"Winsor worker limit: AUTO (cfg={winsor_worker_limit_cfg}) -> resolved={winsor_worker_limit} (cpu_total={cpu_total})",
++                prog=None,
++                lvl="INFO_DETAIL",
++            )
+         pcb(
+             f"Winsor worker limit set to {winsor_worker_limit}" + (
+                 " (ProcessPoolExecutor enabled)" if winsor_worker_limit > 1 else ""
+             ),
+             prog=None,
+             lvl="INFO",
+         )
+         if winsor_max_frames_per_pass > 0:
+             pcb(
+                 f"Winsor streaming limit set to {winsor_max_frames_per_pass} frame(s) per pass",
+                 prog=None,
+                 lvl="INFO_DETAIL",
+             )
+         sds_stack_params = {
+             "stack_reject_algo": stack_reject_algo,
+             "stack_weight_method": stack_weight_method,
+             "stack_norm_method": stack_norm_method,
+             "stack_kappa_low": stack_kappa_low,
+             "stack_kappa_high": stack_kappa_high,
+             "stack_final_combine": stack_final_combine,
+             "parsed_winsor_limits": parsed_winsor_limits,
+             "winsor_worker_limit": winsor_worker_limit,
+             "winsor_max_frames_per_pass": winsor_max_frames_per_pass,
+             "apply_radial_weight": apply_radial_weight_config,
+             "radial_feather_fraction": radial_feather_fraction_config,
+@@ -21930,56 +21952,77 @@ def run_hierarchical_mosaic(
+                 batches_idx = [list(range(len(ordered_group)))]
+             for batch_indices in batches_idx:
+                 batch = [ordered_group[i] for i in batch_indices if 0 <= i < len(ordered_group)]
+                 if batch:
+                     overlapping_groups.append(batch)
+         if overlapping_groups:
+             pcb(
+                 "[Batching] cap overlap applied",
+                 prog=None,
+                 lvl="INFO_DETAIL",
+                 cap=int(overlap_cap),
+                 overlap=float(overlap_fraction_config),
+                 step=int(effective_step),
+                 batches=int(len(overlapping_groups)),
+             )
+             seestar_stack_groups = overlapping_groups
+         else:
+             pcb(
+                 "[Batching] overlap skipped (no groups produced)",
+                 prog=None,
+                 lvl="DEBUG_DETAIL",
+                 cap=int(overlap_cap),
+                 overlap=float(overlap_fraction_config),
+             )
+     cpu_total = os.cpu_count() or 1
+-    winsor_worker_limit = max(1, min(int(winsor_worker_limit_config), cpu_total))
++    try:
++        winsor_worker_limit_cfg = int(winsor_worker_limit_config)
++    except Exception:
++        winsor_worker_limit_cfg = 1
++    winsor_auto = winsor_worker_limit_cfg <= 0
++    if winsor_auto:
++        candidate = 0
++        if global_parallel_plan and getattr(global_parallel_plan, "cpu_workers", 0) > 0:
++            candidate = int(getattr(global_parallel_plan, "cpu_workers", 0))
++        elif effective_base_workers and effective_base_workers > 0:
++            candidate = int(effective_base_workers)
++        else:
++            candidate = cpu_total
++    else:
++        candidate = winsor_worker_limit_cfg
++    winsor_worker_limit = max(1, min(int(candidate), cpu_total))
+     winsor_max_frames_per_pass = max(0, int(winsor_max_frames_per_pass_config))
+     global_wcs_plan["winsor_worker_limit"] = int(winsor_worker_limit)
+     global_wcs_plan["winsor_max_frames_per_pass"] = int(winsor_max_frames_per_pass)
+     global_wcs_plan["use_align_helpers"] = True
+     global_wcs_plan["prefer_gpu_helpers"] = bool(use_gpu_phase5_flag)
++    if winsor_auto:
++        pcb(
++            f"Winsor worker limit: AUTO (cfg={winsor_worker_limit_cfg}) -> resolved={winsor_worker_limit} (cpu_total={cpu_total})",
++            prog=None,
++            lvl="INFO_DETAIL",
++        )
+     pcb(
+         f"Winsor worker limit set to {winsor_worker_limit}" + (
+             " (ProcessPoolExecutor enabled)" if winsor_worker_limit > 1 else ""
+         ),
+         prog=None,
+         lvl="INFO",
+     )
+     if winsor_max_frames_per_pass > 0:
+         pcb(
+             f"Winsor streaming limit set to {winsor_max_frames_per_pass} frame(s) per pass",
+             prog=None,
+             lvl="INFO_DETAIL",
+         )
+     sds_stack_params = {
+         "stack_reject_algo": stack_reject_algo,
+         "stack_weight_method": stack_weight_method,
+         "stack_norm_method": stack_norm_method,
+         "stack_kappa_low": stack_kappa_low,
+         "stack_kappa_high": stack_kappa_high,
+         "stack_final_combine": stack_final_combine,
+         "parsed_winsor_limits": parsed_winsor_limits,
+         "winsor_worker_limit": winsor_worker_limit,
+         "winsor_max_frames_per_pass": winsor_max_frames_per_pass,
+         "apply_radial_weight": apply_radial_weight_config,
+         "radial_feather_fraction": radial_feather_fraction_config,

@@ -4635,11 +4635,12 @@ def _run_phase4_5_inter_master_merge(
             except Exception:
                 worker_limit_val = 1
             current_parallel_plan = getattr(zconfig, "parallel_plan", worker_config_cache.get("parallel_plan"))
+            winsor_max_workers_val = 0 if worker_limit_val <= 0 else max(1, worker_limit_val)
             stack_kwargs = {
                 "kappa": kappa_val,
                 "winsor_limits": limits_val,
                 "winsor_max_frames_per_pass": max_pass_val,
-                "winsor_max_workers": max(1, worker_limit_val),
+                "winsor_max_workers": winsor_max_workers_val,
             }
             super_arr = None
             # --- Phase 4.5 (améliorée) : 2.1 → 3.1 à l’intérieur de 4.5 ---
@@ -5272,13 +5273,13 @@ def _run_phase4_5_inter_master_merge(
 
             # 4.5.c — empilement selon les réglages GUI
             logger.debug(
-                "[P4.5][G%03d] Stack params: reject=%s, combine=%s, kappa=%.2f, winsor_limits=%s, workers=%d, weight=%s",
+                "[P4.5][G%03d] Stack params: reject=%s, combine=%s, kappa=%.2f, winsor_limits=%s, workers=%s, weight=%s",
                 group_id,
                 reject_algo,
                 final_combine,
                 kappa_val,
                 limits_val,
-                stack_kwargs["winsor_max_workers"],
+                "AUTO(0)" if winsor_max_workers_val <= 0 else str(stack_kwargs["winsor_max_workers"]),
                 weight_method,
             )
             _phase45_gui_message(
@@ -17809,15 +17810,36 @@ def run_hierarchical_mosaic_classic_legacy(
                     original=len(seestar_stack_groups),
                     new=len(new_groups),
                     limit=max_raw_per_master_tile_config,
-                )
+            )
             seestar_stack_groups = new_groups
         cpu_total = os.cpu_count() or 1
-        winsor_worker_limit = max(1, min(int(winsor_worker_limit_config), cpu_total))
+        try:
+            winsor_worker_limit_cfg = int(winsor_worker_limit_config)
+        except Exception:
+            winsor_worker_limit_cfg = 1
+        winsor_auto = winsor_worker_limit_cfg <= 0
+        if winsor_auto:
+            candidate = 0
+            if global_parallel_plan and getattr(global_parallel_plan, "cpu_workers", 0) > 0:
+                candidate = int(getattr(global_parallel_plan, "cpu_workers", 0))
+            elif effective_base_workers and effective_base_workers > 0:
+                candidate = int(effective_base_workers)
+            else:
+                candidate = cpu_total
+        else:
+            candidate = winsor_worker_limit_cfg
+        winsor_worker_limit = max(1, min(int(candidate), cpu_total))
         winsor_max_frames_per_pass = max(0, int(winsor_max_frames_per_pass_config))
         global_wcs_plan["winsor_worker_limit"] = int(winsor_worker_limit)
         global_wcs_plan["winsor_max_frames_per_pass"] = int(winsor_max_frames_per_pass)
         global_wcs_plan["use_align_helpers"] = True
         global_wcs_plan["prefer_gpu_helpers"] = bool(use_gpu_phase5_flag)
+        if winsor_auto:
+            pcb(
+                f"Winsor worker limit: AUTO (cfg={winsor_worker_limit_cfg}) -> resolved={winsor_worker_limit} (cpu_total={cpu_total})",
+                prog=None,
+                lvl="INFO_DETAIL",
+            )
         pcb(
             f"Winsor worker limit set to {winsor_worker_limit}" + (
                 " (ProcessPoolExecutor enabled)" if winsor_worker_limit > 1 else ""
@@ -21952,12 +21974,33 @@ def run_hierarchical_mosaic(
                 overlap=float(overlap_fraction_config),
             )
     cpu_total = os.cpu_count() or 1
-    winsor_worker_limit = max(1, min(int(winsor_worker_limit_config), cpu_total))
+    try:
+        winsor_worker_limit_cfg = int(winsor_worker_limit_config)
+    except Exception:
+        winsor_worker_limit_cfg = 1
+    winsor_auto = winsor_worker_limit_cfg <= 0
+    if winsor_auto:
+        candidate = 0
+        if global_parallel_plan and getattr(global_parallel_plan, "cpu_workers", 0) > 0:
+            candidate = int(getattr(global_parallel_plan, "cpu_workers", 0))
+        elif effective_base_workers and effective_base_workers > 0:
+            candidate = int(effective_base_workers)
+        else:
+            candidate = cpu_total
+    else:
+        candidate = winsor_worker_limit_cfg
+    winsor_worker_limit = max(1, min(int(candidate), cpu_total))
     winsor_max_frames_per_pass = max(0, int(winsor_max_frames_per_pass_config))
     global_wcs_plan["winsor_worker_limit"] = int(winsor_worker_limit)
     global_wcs_plan["winsor_max_frames_per_pass"] = int(winsor_max_frames_per_pass)
     global_wcs_plan["use_align_helpers"] = True
     global_wcs_plan["prefer_gpu_helpers"] = bool(use_gpu_phase5_flag)
+    if winsor_auto:
+        pcb(
+            f"Winsor worker limit: AUTO (cfg={winsor_worker_limit_cfg}) -> resolved={winsor_worker_limit} (cpu_total={cpu_total})",
+            prog=None,
+            lvl="INFO_DETAIL",
+        )
     pcb(
         f"Winsor worker limit set to {winsor_worker_limit}" + (
             " (ProcessPoolExecutor enabled)" if winsor_worker_limit > 1 else ""
