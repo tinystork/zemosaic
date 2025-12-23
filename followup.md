@@ -1,68 +1,94 @@
-# Follow-up: Implémentation & vérifications (Phase 5 rows_per_chunk bump)
+# Follow-up: Implémentation détaillée
 
-## 1) Localisation exacte
-- [x] Ouvrir `zemosaic_worker.py` et trouver la section Phase 5 "Reproject & Coadd".
-- [x] Repérer l'appel à `apply_gpu_safety_to_parallel_plan(..., operation="global_reproject")`.
-- [x] Repérer où sont disponibles:
-  - `out_w` (ou une shape/width équivalente de l'image/canvas de sortie)
-  - `n_tiles` (len(master_tiles) / tiles list / inputs)
-  - flags d'alimentation (`on_battery`, `power_plugged`) si déjà loggés / détectés.
+## 1) GUI (zemosaic_gui_qt.py)
+### 1.1 Localiser l'onglet "System"
+- Repérer la zone qui contient les paramètres système / GPU safety / workers.
+- Ajouter un petit groupbox "Phase 5 (Reproject)" ou une ligne dans la section GPU.
 
-## 2) Patch minimal (juste après le safety)
-- [x] Ajouter un bloc du style (adapter aux noms réels, sans refactor):
+### 1.2 Widgets
+- QCheckBox: "Auto (recommended)"
+  - objectName (ex): `chk_phase5_chunk_auto`
+  - default checked = True
+- QSpinBox:
+  - label: "Phase 5 chunk (MB)"
+  - objectName (ex): `spin_phase5_chunk_mb`
+  - min=64, max=1024, singleStep=64
+  - defaultValue=128
+  - enabled = False si Auto checked
+- Side note (discret):
+  - soit QLabel en small font (style "muted") OU tooltip sur le label/spinbox
+  - texte: "⚠ May cause instability on some laptops / hybrid GPUs. Use with caution."
 
-- Conditions:
-  - `operation == "global_reproject"`
-  - `getattr(safety, "safe_mode", 0) == 1` OU `plan.safe_mode == 1` (selon où c'est stocké)
-  - `on_battery is False` (ou `power_plugged is True`)
-- Valeurs:
-  - `current = plan.gpu_rows_per_chunk` (si absent: ne rien faire)
-  - `max_bytes = plan.gpu_max_chunk_bytes` (sinon: ne rien faire)
-  - `out_w = ...`
-  - `n_tiles = ...`
+### 1.3 Connexions
+- `chk_phase5_chunk_auto.toggled.connect(spin.setDisabled/Enabled)`
+  - logique: si Auto True -> spin disabled, sinon enabled
+- À la sauvegarde des settings:
+  - lire checkbox + spinbox et stocker dans la config
+- Au chargement:
+  - initialiser checkbox/spinbox depuis config
+  - appliquer enabled/disabled
 
-- Estimation conservative:
-  - `buffers = 2` (accum + weight)
-  - `bytes_per_row = max(1, out_w * 4 * buffers)`
-  - `den = max(1, n_tiles)`
-  - `rows_budget = max_bytes // (bytes_per_row * den)`
-  - `candidate = int(rows_budget)`
-  - `new_rows = min(256, max(current, candidate))`
-  - Optionnel: `new_rows = max(new_rows, min(96, 256))` uniquement si `new_rows > current` sinon rien
-  - Si `new_rows > current`: assigner et logguer.
+### 1.4 i18n
+- Si le projet utilise un helper `tr()` / dictionnaire de traductions:
+  - ajouter les clés FR/EN correspondantes:
+    - "Auto (recommended)" -> "Auto (recommandé)"
+    - "Phase 5 chunk (MB)" -> "Chunk Phase 5 (Mo)"
+    - warning -> "⚠ Peut provoquer des instabilités sur certains laptops / GPU hybrides. À utiliser avec prudence."
+- Si pas d'i18n centralisé: garder en anglais OU suivre le pattern existant du fichier.
 
-Important: si `candidate` est absurde (0 ou < current), ne rien changer.
+## 2) Config (zemosaic_config.py)
+### 2.1 Ajouter les champs par défaut
+- `phase5_chunk_auto = True`
+- `phase5_chunk_mb = 128`
+Où sont définis les defaults (dataclass/dict), suivre le style existant.
 
-## 3) Logging
-- [x] Ajouter une ligne INFO (même logger que le worker):
-- Avant/après + contexte:
-  - safe_mode, on_battery/power_plugged, max_chunk_bytes, out_w, n_tiles
+### 2.2 Load/save
+- Lors du chargement d'un ancien config, assurer fallback sur defaults (get(..., default))
+- Lors de la sauvegarde, écrire les deux champs.
 
-Ex:
-"Phase5 GPU: bump rows_per_chunk 69 -> 224 (plugged), max_chunk=128MB, out_w=2282, n_tiles=30"
+## 3) Worker (zemosaic_worker.py)
+### 3.1 Localiser Phase 5 plan
+Dans la section Phase 5 (global reproject):
+- Identifier le plan/obj qui contient `gpu_max_chunk_bytes` (ou équivalent)
+- Identifier l'opération/label: `operation="global_reproject"`
 
-## 4) Robustesse
-- [x] Aucun import nouveau lourd.
-- [x] Pas d'exception si attributs manquent:
-  - utiliser `getattr(...)` + early return.
-- [x] Ne pas toucher au multi-threading.
-- [x] Ne pas changer la logique batch size (0 vs >1).
+### 3.2 Appliquer override (après safety ou avant ?)
+Recommandation:
+- Appliquer override **après** `apply_gpu_safety_to_parallel_plan(..., operation="global_reproject")`
+  pour que:
+  - safety fixe les autres paramètres
+  - l'utilisateur force uniquement le budget bytes final
 
-## 5) Tests rapides
-### Option A: pytest (si présent)
-- [x] Créer/compléter un test simple qui appelle la fonction/helper si tu en crées une mini locale,
-ou bien tester via un petit "plan" factice (dataclass/dict) si c'est déjà le style du repo.
+Pseudo:
+- lire config:
+  - `auto = cfg.phase5_chunk_auto`
+  - `mb = cfg.phase5_chunk_mb`
+- si `not auto`:
+  - `forced_bytes = int(mb) * 1024 * 1024`
+  - clamp: `forced_bytes = max(64MB, min(1024MB, forced_bytes))` (mêmes bornes que UI)
+  - si `hasattr(plan, "gpu_max_chunk_bytes")`: set
+  - log INFO:
+    "Phase5 GPU chunk override: {mb} MB ({forced_bytes} bytes) for global_reproject"
+- sinon: ne rien faire
 
-Cas:
-- [x] plugged: augmente et <=256
-- [x] on_battery: inchangé
+### 3.3 Robustesse
+- Si le champ n'existe pas, log DEBUG et ne pas planter.
+- Ne pas modifier les autres opérations.
+- Ne pas toucher `gpu_rows_per_chunk` ici (ça reste géré par autotune/safety). (On pourra le faire ensuite si besoin.)
 
-### Option B: smoke run (si pas de tests)
-- Lancer un run court (ex: 10–20 tuiles) en secteur.
-- Vérifier dans le log que `rows_per_chunk` est bump.
-- Observer que la phase reproject fait moins d'itérations/chunks.
+## 4) Tests rapides
+### 4.1 Test manuel GUI
+- Lancer app
+- Vérifier:
+  - Auto coché -> spinbox grisé
+  - décocher -> spinbox activé
+  - changer valeur -> sauvegarder -> relancer -> valeur persistée
 
-## 6) Résultat attendu
-- Moins de micro-chunks → moins d'overhead.
-- GPU davantage sollicité (sans chercher 100%, mais au moins une montée perceptible).
-- Pas de freeze, car `gpu_max_chunk_bytes` reste identique (128MB).
+### 4.2 Test run
+- Avec override (ex 256MB), lancer un run court
+- Vérifier présence du log "Phase5 GPU chunk override: 256 MB"
+- Comparer le nombre de chunks / durée Phase 5 (optionnel)
+
+## 5) Notes
+- Ne pas renommer/retoucher d'autres paramètres existants.
+- Garder l'UI sobre: une ligne, un tooltip, pas plus.
