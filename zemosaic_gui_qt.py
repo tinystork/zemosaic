@@ -2547,7 +2547,7 @@ class ZeMosaicQtMainWindow(QMainWindow):
             "winsor_worker_limit",
             general_layout,
             self._tr("qt_field_winsor_worker_limit", "Winsor worker limit"),
-            minimum=1,
+            minimum=0,
             maximum=64,
         )
         self._register_spinbox(

@@ -1345,7 +1345,7 @@ class ZeMosaicGUI:
 
         self.winsor_workers_spinbox = ttk.Spinbox(
             perf_options_frame,
-            from_=1,
+            from_=0,
             to=16,
             increment=1,
             textvariable=self.winsor_workers_var,
